@@ -159,10 +159,10 @@ enum Command {
     /// tree and the commit object. If signing options name keys, it signs the
     /// commit. Then it points the --branch ref at the new commit.
     ///
-    /// The command needs --branch or --orphan. Without --parent, the current
-    /// tip of the branch is the parent. On success, standard output carries
-    /// the commit checksum, or the --table-output block. If the command
-    /// refuses its input, it exits 1 and moves no ref.
+    /// The command needs --branch or --orphan. Without --parent, the parent
+    /// is the branch name resolved as a revision. On success, standard output
+    /// carries the commit checksum, or the --table-output block. If the
+    /// command refuses its input, it exits 1 and moves no ref.
     Commit(CommitArgs),
     /// Check a commit out onto the file system, or write its composefs image.
     ///
@@ -555,8 +555,11 @@ struct InitArgs {
 struct CommitArgs {
     /// The parent commit (a checksum or a ref), or `none` for a root commit.
     ///
-    /// Without this option, the current tip of the branch is the parent,
-    /// unless --orphan is given. A branch that names no ref gives a root
+    /// Without this option, the parent is the branch name resolved as a
+    /// revision, unless --orphan is given: the commit that a short lowercase
+    /// hexadecimal name abbreviates, or else the current tip of the branch.
+    /// The command refuses a name that abbreviates more than one commit. A
+    /// branch that names no ref and abbreviates no commit gives a root
     /// commit. Only the lowercase `none` asks for a root commit, and each
     /// other value is a revision.
     #[arg(long)]
@@ -791,8 +794,10 @@ struct CommitArgs {
     /// Store the composefs image digest of the tree in the commit metadata.
     ///
     /// The key is `ostree.composefs.digest.v0`, and the value is the fs-verity
-    /// digest of the image as a byte array. The value depends on the tree
-    /// alone, so each repository mode gives the same digest. It replaces a
+    /// digest of the image as a byte array. The value depends on the
+    /// committed tree alone. `archive`, `bare`, and `bare-user` commit the
+    /// same tree and give the same digest. `bare-user-only` canonicalizes the
+    /// tree, so it can give another digest. It replaces a
     /// value that --add-metadata-string, --add-metadata, or --keep-metadata
     /// gives for the same key.
     #[arg(long)]
@@ -5472,12 +5477,15 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
         // `--orphan` suppresses only the implicit parent, so an explicit
         // `--parent` with it still gives the commit a parent.
         None if args.orphan => None,
-        // The current tip of the branch is the implicit parent. The tip comes
-        // from the ref file, and its commit object is not loaded. A branch that
-        // names no ref then gives a root commit, and the commit inherits a ref
-        // over an absent object with no read. If the match guard refuses a
-        // name, its tip is not read. The checksum guard and the ref-name rule
-        // refuse such a name after the commit is written.
+        // The implicit parent is the branch name resolved as a revision. A name
+        // of lowercase hex that prefixes one commit gives that commit, and a
+        // name that prefixes more than one commit is refused. Any other name
+        // gives the tip from the ref file, and its commit object is not loaded.
+        // A branch that names no ref and prefixes no commit then gives a root
+        // commit, and the commit inherits a ref over an absent object with no
+        // read. If the match guard refuses a name, its tip is not read. The
+        // checksum guard and the ref-name rule refuse such a name after the
+        // commit is written.
         None => match args.branch.as_deref() {
             Some(branch)
                 if shadowed_branch_name(branch).is_none() && validate_refspec(branch).is_ok() =>

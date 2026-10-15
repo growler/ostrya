@@ -39,8 +39,8 @@ use crate::write::flat_name;
 
 /// The detached-metadata key of GPG signatures. The `ostree` command writes
 /// the summary signatures of this key first in `summary.sig`, and ostrya does
-/// the same. `docs/format-reference.md`, "Summary signature", records this
-/// order.
+/// the same. `docs/format-reference.md`, "Summary signature -- `a{sv}`",
+/// records this order.
 const GPG_KEY: &str = "ostree.gpgsigs";
 
 type Checked<T> = std::result::Result<T, Failure>;

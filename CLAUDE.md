@@ -161,11 +161,26 @@ The design lives in `docs/` and is the source of truth. Keep it in sync with the
 code in the same change that alters behavior.
 
 - `docs/format-reference.md` -- the byte-exact on-disk format. The correctness
-  gate for every phase.
+  gate for every phase. Its part "Port extensions" specifies the formats and
+  the protocols of the port alone. Examples are the push and pull protocols,
+  the endpoints of `ostrya serve`, and the credential files. Each config key
+  is in `ostrya-config(1)`.
+- `docs/conformance/cli-behavior.md` -- the observed CLI behavior of the
+  `ostree` command. It records the tree that a checkout writes, the tar
+  options, the request order of a pull, and the `--fsync` vocabulary. It also
+  records the output, the error text, and the exit status of each command in
+  its section "CLI output formats".
+- `docs/conformance/cli-surface.md` -- the CLI surface that the conformance
+  matrix needs, and each difference between the `ostree` command and the
+  port.
 - `docs/port-plan.md` -- architecture, testing strategy, the phased roadmap, and
   the locked decisions.
 - The rustdoc of each crate -- the public Rust API. The design principles
   of the API are in `crates/ostrya/README.md`, "Design".
+
+The `spec:` values of the conformance records name headings of these
+documents. `ostrya-conformance check` reports a value that names no heading,
+so a change to a heading changes those values in the same commit.
 
 ## Requirement: package README files follow the crate docs
 

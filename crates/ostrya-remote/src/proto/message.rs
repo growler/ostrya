@@ -61,8 +61,8 @@ pub struct HelloReply {
     pub collection_id: Option<String>,
     /// The frame limit that the server announces, under the key `max-frame`.
     ///
-    /// Encode and decode return [`Error::Protocol`] for a value out of the
-    /// range that the [frame rules](crate::proto#frames) give.
+    /// Encode and decode return [`Error::Protocol`] for a value outside
+    /// [`MIN_FRAME_LIMIT`](super::MIN_FRAME_LIMIT)`..=`[`MAX_FRAME_LIMIT`](super::MAX_FRAME_LIMIT).
     pub max_frame: u32,
     /// The maximum number of entries in one `Have`, under the key `max-have`.
     ///
@@ -238,14 +238,14 @@ pub struct PullHelloReply {
 pub struct GetReply {
     /// The flag that is `true` if the server serves the path or the listing.
     ///
-    /// If `found` is `true`, a [body](super#pull) follows the reply.
+    /// If `found` is `true`, a body of chunks follows the reply, as
+    /// [Object stream](super#object-stream) states.
     pub found: bool,
     /// The length of the body, if the server knows it.
     ///
-    /// A reply to a `ListRefs` must hold it, as the
-    /// [ref listing](super#ref-listing) rules state. If `found` is `false`
-    /// and the length is present, encode and decode
-    /// return [`Error::Protocol`].
+    /// A reply to a `ListRefs` must hold it, as the specification of
+    /// [`ListRefs`](https://github.com/growler/ostrya/blob/main/docs/format-reference.md#listrefs) states. If `found` is `false` and the length
+    /// is present, encode and decode return [`Error::Protocol`].
     pub len: Option<u64>,
 }
 
@@ -293,8 +293,12 @@ pub enum Message {
     ///
     /// Each entry is a ref pattern of a
     /// [`RefSelector`](ostrya_core::RefSelector), with an optional leading
-    /// `!`. The codec does not check the entries. The
-    /// [ref listing](super#ref-listing) rules give the limits and the reply.
+    /// `!`. The codec does not check the entries.
+    /// [`MAX_REF_PATTERNS`](super::MAX_REF_PATTERNS),
+    /// [`MAX_REF_ENTRY_PARTS`](super::MAX_REF_ENTRY_PARTS), and
+    /// [`MAX_REF_ENTRY_LEN`](super::MAX_REF_ENTRY_LEN) are the limits of a
+    /// request. The specification of [`ListRefs`](https://github.com/growler/ostrya/blob/main/docs/format-reference.md#listrefs)
+    /// states the reply.
     ListRefs(Vec<String>),
 }
 
@@ -497,8 +501,10 @@ impl Message {
     /// The decoder borrows strings and byte arrays from `body` and reads each
     /// array one entry at a time. It allocates the decoded message. For a
     /// dict value under a key that it does not know, it allocates a value
-    /// tree, checks it for normal form, and then drops it.
-    /// [`MAX_FRAME`](super::MAX_FRAME) states the measured peaks.
+    /// tree, checks it for normal form, and then drops it. If a dict holds a
+    /// key two times, the first value counts, and the decoder checks each
+    /// later value for normal form alone. [`MAX_FRAME`](super::MAX_FRAME)
+    /// states the measured peaks.
     ///
     /// # Errors
     ///

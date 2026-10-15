@@ -90,7 +90,8 @@ impl Report {
 /// # Spec anchors
 ///
 /// A `spec:` value is `<document>#<anchor>`. The document name resolves first
-/// in the matrix directory, which holds `cli-surface.md` and `harness.md`.
+/// in the matrix directory, which holds `cli-behavior.md`, `cli-surface.md`,
+/// and `harness.md`.
 /// Then it resolves in the parent directory, which holds `format-reference.md`
 /// and `port-plan.md`.
 ///

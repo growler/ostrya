@@ -1,10 +1,11 @@
 # Ostrya -- Phased Plan
 
 Ostrya is a from-scratch reimplementation of libostree as a pure-Rust, async
-library. This
-plan targets the on-disk format and observable behavior specified in
-`format-reference.md`. The rustdoc of each crate documents the API. Each phase is
-scoped to be independently reviewable, with explicit success criteria.
+library. This plan targets the on-disk format specified in
+`format-reference.md` and the observed behavior recorded in
+`conformance/cli-behavior.md`. The rustdoc of each crate documents the API.
+Each phase is scoped to be independently reviewable, with explicit success
+criteria.
 
 Provenance: this is a clean-room reimplementation. Its design is grounded only
 in the public ostree documentation (https://ostreedev.github.io/ostree/) and the
@@ -220,8 +221,8 @@ bounded:
   its policy and its hooks. The server implements it with the
   crate-private `FileAuth`, which authorizes each request with a bearer
   token or a Basic credential, which it matches against the push
-  credential file (`format-reference.md`, "Port extension: the push
-  credential file"), with a client certificate, or as an anonymous push.
+  credential file (`format-reference.md`, "The push credential file of a
+  server"), with a client certificate, or as an anonymous push.
   `FileAuth` gives no hooks. `FileAuth` compares the digests in constant
   time with a hand-rolled compare and no dependency. The server refuses to
   start with no method, and over plain HTTP with the credential file as its
@@ -557,7 +558,8 @@ Design thread across phases:
   responsibility. `deltas/` and `delta-indexes/` are outside the rule. Size
   generation is archive-only, so a request in this mode is a no-op.
 - Phase 8: copy-based checkout (reflink where the filesystem supports it)
-  applying the `user.ostreemeta` mode; hardlink checkout refused.
+  applying the `user.ostreemeta` mode; `--require-hardlinks` refuses a regular
+  file of non-zero length.
 - Phase 9: composefs export builds the EROFS metadata from `user.ostreemeta`
   and redirects each regular file to its `.file` loose path; ownership is
   presented via composefs uid mapping at mount.
@@ -909,7 +911,7 @@ with no lock file, because the tool's rule removes the staging directory of a
 live transaction that runs longer than `tmp-expiry-secs`; the port reaps at
 transaction start where the tool reaps at transaction end; and the tool reuses
 a staging directory of the current boot where the port creates a new one for
-each transaction. `format-reference.md`, "Object store layout" states both
+each transaction. `format-reference.md`, "Old entries in `tmp/`", states both
 rules. The temp entries of ref writes and detached-metadata writes in `tmp/`
 take the age test. With a very small or negative `tmp-expiry-secs`, a reap can
 unlink such an entry before its rename: the write then fails with `ENOENT`, and
@@ -973,12 +975,12 @@ iteration), offloaded through `rt::unblock` at per-object granularity;
 hashing is a `Sha256` digester of `sha2`; archive compression
 is a streaming raw-DEFLATE encoder over `miniz_oxide`.
 
-Format facts the write path needs that `format-reference.md` does not yet
-state -- the inode modes the tool gives loose metadata objects, the exact
-canonical-permissions rule, consume/adopt behavior, the per-object-fsync
-syscall pattern -- are recovered by black-box observation in the sub-phase
-that reaches them and recorded in `format-reference.md` in the same
-change.
+The format facts the write path needs -- the inode modes the tool gives loose
+metadata objects, the exact canonical-permissions rule, consume/adopt behavior,
+the per-object-fsync syscall pattern -- were recovered by black-box
+observation in the sub-phase that reached them. `format-reference.md`, "Write
+path: loose-object inode modes and durability" and "Commit modifier: canonical
+permissions, consume, and devino", records them.
 
 ### Phase 7a -- Object writers: content and metadata (DONE)
 
@@ -1045,7 +1047,8 @@ Definition:
   object in the commit -- content objects and the dirtree/dirmeta metadata
   objects alike -- so a record is kept for metadata as well as content, and
   each carries its own object-type byte (recovered by observation; see
-  `format-reference.md`, "Commit -- the ostree.sizes key").
+  `format-reference.md`, "Commit -- `(a{sv}aya(say)sstayay)`", the
+  `ostree.sizes` paragraph).
 - Object publication in `Transaction::commit()`, the object half of the
   durability contract: `syncfs` on the repo fd, rename staged objects
   into `objects/xx/` (fanout directories created on demand at 0777 reduced by
@@ -1154,10 +1157,10 @@ Definition:
   hashing, so an already-known file skips ingestion; populated by
   checkout in Phase 8, consulted here, hits counted in the stats.
   DEVINO_CANONICAL semantics are recovered by observation alongside it.
-- CONSUME: each ingested source file is deleted as it is consumed;
-  where the source inode already satisfies the target mode's on-disk
-  form the ingest adopts it by rename instead of copying. The conditions
-  under which the tool adopts are recovered by observation and recorded.
+- CONSUME: each ingested source file is deleted as it is consumed. The
+  ingest copies the file and then unlinks the source; adoption by rename has
+  no on-disk effect, so the port does not adopt (`format-reference.md`,
+  "Commit modifier: canonical permissions, consume, and devino").
 - GENERATE_SIZES marks the transaction so 7d emits `ostree.sizes`
   (archive-only; elsewhere the request is the documented silent no-op).
 
@@ -1544,7 +1547,7 @@ Scope decisions taken with the maintainer, recorded there:
   design.
 - The port emits `SCHILY.xattr.*` records for xattr-bearing entries so trees
   round-trip losslessly. The observed 2026.1 tool export emitted none; the
-  divergence is recorded in `format-reference.md`.
+  divergence is recorded in `conformance/cli-surface.md`, "P2", `export`.
 - `smol-tar` was made additive-safe upstream (its `smol`/`tokio` features gained
   tokio precedence rather than a hard mutual-exclusion), matching `ostrya-rt`.
 
@@ -1586,7 +1589,7 @@ Phase 17. Subcommands:
   a tar stream (Phase 10 export).
 
 `<commit>` and `--parent` accept a checksum or a ref. The current `commit`
-parenting surface, `--orphan` included, is recorded in `format-reference.md`,
+parenting surface, `--orphan` included, is recorded in `conformance/cli-behavior.md`,
 "CLI output formats", under `commit`. Further subcommands arrive with the
 phases that provide their machinery. Argument and option parsing uses `clap`
 (derive), scoped to the `ostrya-cli` crate, which also depends on `ostrya-rt`
@@ -1879,10 +1882,10 @@ recovery-by-observation and the `ostree sign --verify --sign-type=spki`
 cross-verification cannot run. Per the maintainer's decision the engine targets
 the documented containers and the standard OpenSSL/RFC forms, cross-checked
 against `openssl` (a general tool, run as a black box) in both directions in
-place of the tool. The spki facts in `format-reference.md` are marked "design
-target, tool cross-verification pending"; the `spki_tool_cross_verify_pending`
-test skips when the tool lacks spki and performs the real check once a
-spki-capable build is available.
+place of the tool. `format-reference.md`, "Signing details", marks the spki
+facts as the design target, not yet cross-verified against an spki-capable
+`ostree`; the `spki_tool_cross_verify_pending` test skips when the tool lacks
+spki and performs the real check once a spki-capable build is available.
 
 Definition:
 
@@ -2511,8 +2514,9 @@ engine, `DeltaOptions::signers` signs the superblock before it is written, and
 and `--reindex`, and
 `ostrya static-delta reindex` the index pass. Newly recovered format facts -- the
 meta-entry `size`/`usize` accounting, the fallback entry's two sizes, the part
-packing rule, the index file's `a{sv}` shape, and the tool's offline-application
-limits -- are in `format-reference.md`.
+packing rule, and the index file's `a{sv}` shape -- are in
+`format-reference.md`. The tool's offline-application limits are in
+`conformance/cli-surface.md`, "P2", `static-delta`.
 
 Each object takes one of four routes, decided per object: a loose fallback past
 `min_fallback_size`; a rollsum copy-from-source stream (`o`, then `r`/`w`/`R`
@@ -2672,8 +2676,10 @@ does:
   starts a new part. The default packs about 31 one-megabyte objects per part and
   splits at the 32nd; `--max-chunk-size=8` splits at the eighth, confirming the
   decimal-megabyte unit. The port decides with the incoming object's content size,
-  an upper bound for a diffed object, and decides before appending it, so a part's
-  payload never passes the ceiling and a diffed object that comes out small still
+  an upper bound for a diffed object, and decides before appending it. The
+  operation bytes of that object and the tables are outside the estimate, so a
+  part can pass the ceiling by those bytes, a part that holds one object larger
+  than the ceiling can pass it, and a diffed object that comes out small still
   closes the part it would have fit in.
 
 Verify: the tool applies the port's deltas and `fsck` validates the objects it
@@ -4361,9 +4367,9 @@ observation of the `ostree` tool, executed by the record-driven runner
 
 The command-surface scope is stated in `conformance/cli-surface.md`, which
 lists the absent commands, the missing options on the commands that exist,
-the global option conventions, and the output formats still to be recovered,
-ordered by what each unblocks. `init` is the one gap that blocks the
-interoperability harness outright.
+and the global option conventions, ordered by what each unblocks.
+`conformance/cli-behavior.md` records the output formats of the tool. `init` is
+the one gap that blocks the interoperability harness outright.
 
 The phase is split into sub-phases so each is independently reviewable; the
 split follows `cli-surface.md`'s own ordering, with the matrix and its runner
@@ -4500,7 +4506,8 @@ carrying a `collection-id`, with the config untouched.
 
 The three subcommands, over `Repo::list_refs`, `Repo::list_mirror_refs`, and
 `Repo::resolve_rev`, with their exact output text recovered by observation and
-recorded in `format-reference.md`, "CLI output formats".
+recorded in `conformance/cli-behavior.md`, "CLI output formats", `refs`,
+`rev-parse`, and `cat`.
 
 - `refs`: the default listing, `--list`, `--delete`, `--create=NEWREF`,
   `-r/--revision`, `-A/--alias`, `-c/--collections`, `--force`, and the
@@ -4558,7 +4565,7 @@ reads a 64-character name as a checksum in lowercase hex alone, through
 a refspec, which is the tool's own split at every site a revision or a NEWREF is
 taken; the lenient `Checksum::from_hex` stays where a checksum arrives as stored
 bytes, which is ref file content and delta metadata
-(`format-reference.md`, "Revision syntax");
+(`format-reference.md`, "Ref files");
 `Repo::list_remote_refs` and `Repo::list_ref_aliases` list what `list_refs`
 does not reach; `Repo::check_refs_path` probes the path a listing prefix names
 below `refs/`, one fd-relative `statat` reporting the `ENOTDIR` the CLI renders;
@@ -4572,7 +4579,7 @@ belongs to the caller. Every ref mutation settles its name as
 well as its content: under `[core] fsync` the directory holding the ref is
 `fsync`-ed after a write's rename, after an alias rename, and after a removal's
 unlink, where the tool syncs the ref file alone
-(`format-reference.md`, "Object store layout").
+(`format-reference.md`, "Ref durability").
 The CLI's shared `resolve` helper now reports a resolution failure in the
 tool's own words (`Refspec '<rev>' not found`, `Commit <checksum> has no
 parent`), which every subcommand taking a revision inherits. A revision that
@@ -4599,7 +4606,8 @@ name '<name>' looks like a checksum`, and one ending in `^` with `Invalid
 refspec <name>`, the words `refs --create` gives that same shape, since
 resolution reads the first as a checksum and the second as ancestry, and no
 revision would reach the commit either ref holds (`format-reference.md`,
-"Revision syntax"). Both run at the ref write, after `--parent` resolves and
+"Branch names no revision reaches"). Both run at the ref write, after
+`--parent` resolves and
 after the tree is read, and abort the transaction, so the port publishes
 nothing. The tool refuses the checksum shape at that same step and the ancestry
 shape a step earlier, reading the branch name as a revision ahead of the tree
@@ -4675,18 +4683,14 @@ character '<byte>' in rev '<content>'`, where the port's reader takes either cas
 and resolves it, and only an out-of-band write puts such content there, both
 implementations writing the lowercase form; an
 abbreviated commit checksum resolves anywhere a revision is taken, which the port
-adopted in Phase 17f as item `X1` and no longer diverges on; and a ref
-name is validated against a character class narrower than the port's, so a name
-of that shape draws `Invalid refspec <name>` from the tool wherever it is taken
-as a revision or a NEWREF and `Refspec '<name>' not found` from the port at a
-resolution site, which is
-what `rev-parse <name>~1` and `rev-parse <name>^2` report, the tool's ref
-enumeration skips such a name without a word, so its `prune --refs-only` deletes
-the commit that ref holds, and the tool holds such a name to name no ref as an
-`-A --create` target, where the port writes the alias. Both were resolution
-behaviors that change every subcommand at once, so they
-belonged with a phase that reviews those paths; the ref-name character class is
-the one still open. Building the fixtures also found
+adopted in Phase 17f as item `X1` and no longer diverges on; and the tool's ref
+enumeration skips a ref whose name fails the ref-name rule without a word, so
+its `prune --refs-only` deletes the commit that ref holds, where the port
+enumerates the name and keeps the commit. Both were resolution behaviors that
+change every subcommand at once, so they belonged with a phase that reviews
+those paths. The ref-name character class is closed: every name that the port
+accepts is a name that the tool accepts (`format-reference.md`, "Ref name
+validation"). Building the fixtures also found
 three `commit` divergences recorded under "P2": the parent `ostree commit -b
 BRANCH` takes from the branch tip, which Phase 17b1 below reproduces; the
 checksum arm of the branch-name guard leaves the tool's
@@ -4774,10 +4778,9 @@ class the guard stands for: over a ref of the refused shape, which an
 out-of-band write now places, the tool's `refs` prints nothing and its `prune
 --refs-only` removes the commit that ref holds. The refused-name test also holds the alias
 target: ten shapes the ref rule refuses draw the tool's own non-existence line in
-both implementations, a target whose path runs through a ref file and one naming
-a directory draw that line from the tool and the port's i/o message, and a target
-the tool's character class refuses leaves the port writing the alias where the
-tool refuses. The two prefix-refusal tests assert
+both implementations, and a target whose path runs through a ref file and one
+naming a directory draw that line from the tool and the port's i/o message.
+The two prefix-refusal tests assert
 each side's own message, the two wording them differently, and compare the exit
 status, the standard output, and the refs tree.
 `cat_streams_a_large_payload_in_every_mode` commits a 5 MB
@@ -4800,18 +4803,20 @@ the cells that cite it silently either: the workflow runs
 #### Phase 17b1 -- `commit` parenting (DONE)
 
 A behavior fix rather than an option gap, found while building the Phase 17b
-fixtures. `ostree commit -b BRANCH` parents the new commit on that branch's
-current tip, which `rev-parse REV^` reads today and `log` (17d) reads next. The
-whole behavior is recorded in `format-reference.md`, "CLI output formats", under
-`commit`; the values `--parent` takes still part the two implementations and stay
-in `cli-surface.md`, "P2".
+fixtures. `ostree commit -b BRANCH` parents the new commit on what BRANCH
+resolves to as a revision, which `rev-parse REV^` reads today and `log` (17d)
+reads next. The whole behavior is recorded in `conformance/cli-behavior.md`,
+"CLI output formats", under `commit`; the values `--parent` takes still part the
+two implementations and stay in `cli-surface.md`, "P2".
 
 Observed with `ostree` 2026.1, and reproduced:
 
-- `-b BRANCH` with no `--parent` takes that branch's current tip as the
-  parent. A branch that does not exist yet gives a root commit, so the first
-  commit onto a fresh branch is unchanged. The tip is read from the ref file and
-  not loaded, so a ref standing over an absent commit object is inherited unread.
+- `-b BRANCH` with no `--parent` takes what BRANCH resolves to as a revision
+  as the parent: the commit a lowercase hex BRANCH prefixes, or else the
+  branch's current tip (Phase 17f, `F10a`). A branch that does not exist yet
+  gives a root commit, so the first commit onto a fresh branch is unchanged.
+  The tip is read from the ref file and not loaded, so a ref standing over an
+  absent commit object is inherited unread.
 - `--parent=none` asks for a root commit on a branch that has a tip. The ref
   still moves to the new commit.
 - `--orphan` gives a root commit the same way, and additionally permits a
@@ -4850,10 +4855,11 @@ inherits is the one its own ref write then replaces. A branch name the guard
 refuses is not read as a tip at all, which leaves that refusal the message and
 the position 17b gave it: the ref write, after the tree.
 
-Deliverables: the implicit parent in `ostrya commit`, `--parent=none`, `--orphan`,
-the `-b`-or-`--orphan` requirement, the `ostree.ref-binding` array a commit that
-names no branch carries, the observations folded into `format-reference.md`, "CLI
-output formats", and `m10` records for each.
+Deliverables: the implicit parent in `ostrya commit`, `--parent=none`,
+`--orphan`, the `-b`-or-`--orphan` requirement, the `ostree.ref-binding` array a
+commit that names no branch carries, the observations folded into
+`conformance/cli-behavior.md`, "CLI output formats", `commit`, and `m10` records
+for each.
 
 Three of the tool's options read the parent as well and stay with the phases
 that own them:
@@ -4922,7 +4928,8 @@ tree-shaping options reach the tar stream `commit` reads from standard input;
 `F4`, which converged the port's stdin form with the tool's `--tree=tar=PATH`.
 
 Each option's accepted values and refusals are the tool's, recovered by
-observation and recorded in `format-reference.md`, "CLI output formats":
+observation and recorded in `conformance/cli-behavior.md`, "CLI output
+formats", `commit`:
 
 - the declared ids read as a C `int` with the base taken from the text, so
   `0x2a`, `053`, and `42` are ids and `abc`, `5x`, and a trailing space are not;
@@ -5011,12 +5018,12 @@ every `show --print-*` form, and `summary --raw`. It belongs in
 is GVariant's own rather than ostree-specific, matching that crate's
 "no ostree knowledge" charter. Recovered fact by fact against the tool's
 output across every metadata object type in the fixture set, with the
-recovered rules landing in `format-reference.md`.
+recovered rules landing in `conformance/cli-behavior.md`.
 
 `show --print-variant-type=TYPE` reads any file as a value of a named type, which
 made the tool a byte-exact oracle for the printer: one hand-written serialized
 value per rule of the form, rather than only the metadata objects a repository
-holds. The recovered rules are in `format-reference.md`, "The GVariant text
+holds. The recovered rules are in `conformance/cli-behavior.md`, "The GVariant text
 form". Two of them were not in the plan's picture. A byte array whose last byte
 is the only NUL it holds prints as a bytestring literal, `b'user.foo'`, with C
 escaping and octal for every byte outside printable ASCII, where every other byte
@@ -5061,7 +5068,7 @@ dependency to unpack the entries itself.
 
 Deliverables: the GVariant printer and `Value::byteswapped`
 (`ostrya-gvariant`), `Repo::commit_sizes`, `show`, `log`, `ls`, `config get`,
-and their output-format recovery folded into `format-reference.md`.
+and their output-format recovery folded into `conformance/cli-behavior.md`.
 
 Three tool behaviors are observed and deliberately not reproduced, each recorded
 in `cli-surface.md`, "P1": a variant type outside the codec's set, a second
@@ -5159,13 +5166,13 @@ had been dropping: `Summary::refs` is a `SummaryRef` per entry, carrying the
 commit size and the per-ref metadata dict beside the name and the checksum,
 and `Summary::collection_map` reads the refs of every collection
 `ostree.summary.collection-map` lists. The report's byte order is per field,
-not per document: `Last-Modified` and each `Timestamp` are stored big-endian
-and are converted, and every other metadata value prints as stored, so a `t`
-a caller set through `--add-metadata` reads as the number it holds. `--raw`
-and `--print-metadata-key` take the blanket byteswap `show --raw` takes
+not per document: `Last-Modified`, `Expires`, and each `Timestamp` are stored
+big-endian and are converted, and every other metadata value prints as stored,
+so a `t` a caller set through `--add-metadata` reads as the number it holds.
+`--raw` and `--print-metadata-key` take the blanket byteswap `show --raw` takes
 instead, which is why one summary reports `uint64 8502796096475496448` for a
-118-byte commit in `--raw` and `Latest Commit (118 bytes)` in the report.
-The report prints an unannotated value where `--print-metadata-key` prints an
+118-byte commit in `--raw` and `Latest Commit (118 bytes)` in the report. The
+report prints an unannotated value where `--print-metadata-key` prints an
 annotated one, so `ostrya-gvariant` gained `to_text_unannotated` beside
 `to_text`.
 
@@ -5183,13 +5190,14 @@ than the file system accepts has no keyring file, so `remote delete` removes
 the section of that remote and exits 0.
 
 Four facts the option help does not state came out of the comparison, and are
-recorded in `format-reference.md`, "CLI output formats": `--no-sign-verify`
-writes `gpg-verify=false` as well as `sign-verify=false`; a remote name takes
-an alphanumeric or `_` first and then alphanumerics and `-`, `_`, `.`, so `_`
-is a name and `-`, `.`, and `..` are not; `remote list` sorts by name whatever
-order the sections appear in, and `-u` pads each name to the longest name of
-the whole list plus two, counted in bytes; and the `metalink=` URL prefix
-names its own key while a `mirrorlist=` prefix stays in the `url` value.
+recorded in `conformance/cli-behavior.md`, "CLI output formats", `remote`:
+`--no-sign-verify` writes `gpg-verify=false` as well as `sign-verify=false`; a
+remote name takes an alphanumeric or `_` first and then alphanumerics and `-`,
+`_`, `.`, so `_` is a name and `-`, `.`, and `..` are not; `remote list` sorts
+by name whatever order the sections appear in, and `-u` pads each name to the
+longest name of the whole list plus two, counted in bytes; and the `metalink=`
+URL prefix names its own key while a `mirrorlist=` prefix stays in the `url`
+value.
 
 Ten divergences are recorded in `cli-surface.md`, "P3": the tool's `remote`
 container accepts no `--repo` of its own where the port accepts one in every
@@ -5302,7 +5310,7 @@ serializer, the parser, and the printer. `commit --add-metadata` is what reaches
 them, and the widening closes the `show --print-variant-type` type-set
 divergence `cli-surface.md` recorded at Phase 17d. The commit metadata dict's
 entry order is part of the commit checksum, and the rule the three items share
-is stated once in `format-reference.md`, "CLI output formats", `commit`: derived
+is stated once in `conformance/cli-behavior.md`, "CLI output formats", `commit`: derived
 keys the tree walk produces, then the user keys group by group, then the binding
 keys, then the derived keys the commit assembly appends. Item `F9` fills that
 rule's first and last group with the keys it derives. The conformance run reports
@@ -5364,8 +5372,10 @@ the port; and `--table-output` beside `--skip-if-unchanged`, which prints
 uninitialized counters from the tool, so the port prints the parent's checksum
 and zero for each counter and no cell states the combination. Both control files
 must hold UTF-8 in both implementations, and a byte that is not, or a NUL,
-reports `error: Invalid UTF-8` ahead of everything else the command does. The
-conformance run reported 561 cells and 220 passes after the two items.
+reports `error: Invalid UTF-8` after the declared ids, the fsync policy, and the
+repository open, and for the `--skip-list` file after the `--statoverride` file
+is read and parsed. The conformance run reported 561 cells and 220 passes after
+the two items.
 
 `F9` closes `commit`'s derived metadata: `--generate-sizes`, `--bootable`, and
 `--generate-composefs-metadata`. Three library additions carry it.
@@ -5529,7 +5539,7 @@ selector is ambiguous. The selector stands after a `--`
 terminator, so gpg reads it as a key name. Without the terminator gpg reads an
 option-shaped selector as one of its own options, and `--gpg-sign=--homedir=PATH`
 moves the lookup to `PATH` and creates a keybox and a trust database there, as a
-side effect of a read. `format-reference.md`, "Signing" states the outcome the
+side effect of a read. `conformance/cli-behavior.md`, "Signing" states the outcome the
 terminator holds the lookup to.
 
 `--add-detached-metadata-string` and the signing options meet in the same dict,
@@ -5589,7 +5599,8 @@ commit on that commit in both implementations, where the port wrote a root commi
 before. A further commit on that branch parents on the prefix match again rather
 than on the tip the ref file now holds, so it reproduces the first commit byte for
 byte, which is the oracle that tells the two parents apart. The rule and its
-sites are in `format-reference.md`, "Revision syntax"; `cli-surface.md`, "P1"
+sites are in `format-reference.md`, "Abbreviated checksums";
+`cli-surface.md`, "P1"
 records the resolution as shared and no longer as a divergence, and the
 `--parent` divergence there widened, the tool refusing at that one site the
 abbreviated checksum it resolves everywhere else. The conformance run reported
@@ -5601,7 +5612,7 @@ abbreviated checksum it resolves everywhere else. The conformance run reported
 and `per-object-fsync` pair in the write paths -- are parsed ahead of the edit,
 so a value their reader refuses is reported with the editor unstarted, as it is
 in the tool. The fsync pair is read there whatever `--fsync` says, because the
-option narrows the configured policy and so reads it (`format-reference.md`,
+option narrows the configured policy and so reads it (`conformance/cli-behavior.md`,
 "The fsync vocabulary"). The transaction opens once the editor has returned,
 which puts the repository lock, the staging directory, and the free-space budget
 behind the editing session. An exclusive operation on the same repository,
@@ -5630,13 +5641,13 @@ byte-level oracle is `--no-xattrs`, whose stream carries every fact an ostree
 tree holds in a dialect both implementations read: each side's archive imports
 into one commit checksum under either importer, over the whole tree, over a
 `--subpath` subtree, and under `--prefix=./`. Eight divergences stand, all in
-`cli-surface.md`, "export": the member order and the hardlink direction that
-follows from it, where a content-sharing group spanning two directories
+`cli-surface.md`, "P2", `export`: the member order and the hardlink direction
+that follows from it, where a content-sharing group spanning two directories
 coalesces the opposite way; the xattr records, which Phase 10 already recorded
 and which `--no-xattrs` removes; the value dialect `--subpath` takes, on the
 terms `checkout --subpath` already parts on; a `--subpath` naming a file or a
-symlink, which ends the reference build on SIGABRT and which the port refuses
-at exit 1; an empty `-o` value, which the tool reads as standard output and the
+symlink, which ends the reference build on SIGABRT and which the port refuses at
+exit 1; an empty `-o` value, which the tool reads as standard output and the
 port refuses; a repeated `--no-xattrs`, which the tool takes and the port
 refuses, as it refuses every repeated boolean flag; what a destination holds
 after a refusal, where both truncate it and the tool leaves the two trailing
@@ -5665,9 +5676,9 @@ standing at any directory name, the destination root and every directory name
 inside the tree, and writes into the directory the link resolves to, wherever
 that is; the default mode refuses it. No new dependency.
 
-Four divergences stand, all four in `cli-surface.md`, "checkout": the reach of
-`--allow-noent`, which the tool honors only on command lines holding none of
-`-H`, `-C`, `-M`, `--union-add`, `--disable-cache`, `--whiteouts`,
+Four divergences stand, all four in `cli-surface.md`, "P2", `checkout`: the
+reach of `--allow-noent`, which the tool honors only on command lines holding
+none of `-H`, `-C`, `-M`, `--union-add`, `--disable-cache`, `--whiteouts`,
 `--process-passthrough-whiteouts`, and `--skip-list`, and which the port honors
 uniformly, neither side writing anything either way; a `--subpath` naming a file
 whose loose content object was deleted out of band, which the tool suppresses
@@ -5718,11 +5729,11 @@ union-files, so the whiteout device keeps its refusal over a destination
 directory and the destination directory a file subpath needs keeps the
 symlink-following rule. The removal reuses the iterative subtree removal the
 file already carries. Two divergences stand, both in `cli-surface.md`,
-"checkout": the wording of the three refusals a marker reaches; and either
+"P2", `checkout`: the wording of the three refusals a marker reaches; and either
 switch given twice, which the tool takes and the port refuses as it refuses
 every repeated boolean flag. The `--allow-noent` reach divergence already
 named both switches and the item measured them, adding two arms to its citing
-test. `format-reference.md`, "Checkout" states the marker set, the two
+test. `conformance/cli-behavior.md`, "Checkout" states the marker set, the two
 orderings, the type test per marker, the device's metadata and the order it is
 applied in, the disposition table, the widening, and the two refusals, and its
 `CAP_MKNOD` claim is struck. The conformance run reported 725 cells and 289
@@ -5779,20 +5790,20 @@ bytes, the largest input the bound accepts and one record per byte, runs under
 an address-space limit of one gibibyte, which
 `ostrya_cli::cli::checkout_batch_stream_holds_no_more_than_the_stream` pins.
 
-Four divergences stand, all in `cli-surface.md`, "checkout": the `Processing
-tree <checksum>: ` prefix the tool puts in front of every refusal a batch pair
-reaches, where the port reports its own message and both leave the same
-destination state; the path a `--from-file` open failure names, where the tool
-gives the lexically absolute path and the port the value as the command line
-spelled it; the 128-mebibyte bound; and a third and later positional, which the
-tool ignores and the port refuses. Two standing divergences widened: a repeated
-`--from-stdin`, which joins the repeated-boolean-flag sentence, and the reach of
-`--allow-noent`, whose keeping set gains `--from-stdin` while `--skip-list` was
-already in the dropping set. A pair's subpath record is a `--subpath` value, so
-the two `--subpath` value divergences reach it unchanged, an explicitly empty
-record among them. `format-reference.md`, "Checkout" states the list's match
-rule, the filter's reach, and the stream's record format. The conformance run
-reports 769 cells and 303 passes.
+Four divergences stand, all in `cli-surface.md`, "P2", `checkout`: the
+`Processing tree <checksum>: ` prefix the tool puts in front of every refusal a
+batch pair reaches, where the port reports its own message and both leave the
+same destination state; the path a `--from-file` open failure names, where the
+tool gives the lexically absolute path and the port the value as the command
+line spelled it; the 128-mebibyte bound; and a third and later positional, which
+the tool ignores and the port refuses. Two standing divergences widened: a
+repeated `--from-stdin`, which joins the repeated-boolean-flag sentence, and the
+reach of `--allow-noent`, whose keeping set gains `--from-stdin` while
+`--skip-list` was already in the dropping set. A pair's subpath record is a
+`--subpath` value, so the two `--subpath` value divergences reach it unchanged,
+an explicitly empty record among them. `conformance/cli-behavior.md`, "Checkout"
+states the list's match rule, the filter's reach, and the stream's record
+format. The conformance run reports 769 cells and 303 passes.
 
 Three more `checkout` options land next: `-H/--require-hardlinks`, which the
 CLI accepted and read nowhere, `-M/--bareuseronly-dirs`, and
@@ -5812,7 +5823,7 @@ made, and every directory the walk enters reaches the check -- the destination
 root and every directory below it, fresh or reused. A `--subpath` naming a file
 or a symlink reaches no directory walk and takes no such check, so a zero-length
 regular file is written there at exit 0 and a shape the mode pair hardlinks is
-refused at the link. `format-reference.md`, "Checkout" states the tables, the
+refused at the link. `conformance/cli-behavior.md`, "Checkout" states the tables, the
 two exemptions, and the device refusal, and records what each was recovered
 from.
 
@@ -5854,16 +5865,16 @@ stops it reading one. The port keeps no such cache, so the switch changes no
 destination byte and decides nothing. `-M` is checkout-only, `commit` carrying
 no equivalent.
 
-Two divergences stand, both in `cli-surface.md`, "checkout": the wording of the
-three `-H` refusals, which the standing wording rule covers and each refusal
-cell states per side; and `-H`, `-M`, or `--disable-cache` given twice, which
-the tool takes and the port refuses as it refuses every repeated boolean flag.
-One divergence shrank: the tool refuses `-H`, `-C`, `-M`, and `--disable-cache`
-alongside a composefs switch, and the port now refuses all four there, so the
-composefs incompatibility divergence names the two union options alone. The
-`--allow-noent` reach divergence already named `-H`, `-M`, and
-`--disable-cache`; observation confirmed all three and its citing test grew two
-arms.
+Two divergences stand, both in `cli-surface.md`, "P2", `checkout`: the wording
+of the three `-H` refusals, which the standing wording rule covers and each
+refusal cell states per side; and `-H`, `-M`, or `--disable-cache` given twice,
+which the tool takes and the port refuses as it refuses every repeated boolean
+flag. One divergence shrank: the tool refuses `-H`, `-C`, `-M`, and
+`--disable-cache` alongside a composefs switch, and the port now refuses all
+four there, so the composefs incompatibility divergence names the two union
+options alone. The `--allow-noent` reach divergence already named `-H`, `-M`,
+and `--disable-cache`; observation confirmed all three and its citing test grew
+two arms.
 
 A destination directory below the root is reached without privilege: a
 destination symlink into a second filesystem, which a union mode follows. The
@@ -5872,10 +5883,11 @@ among them, and the port now agrees on the exit status and on the destination in
 every shape measured.
 
 `checkout` writes no line of its own, so the item adds no "CLI output formats"
-subsection; the shared gate's `format-reference.md` clause is met by that file's
-"Checkout" section, which gained a "Requiring a hardlink." block, a "Directory
-mode mask." block, the zero-length exception, and the cache correction on the
-`archive` hardlink bullet. The conformance run reports 794 cells and 321 passes.
+subsection. The item meets the documentation clause of the shared gate in
+`conformance/cli-behavior.md`, "Checkout". The section holds "Required
+hardlinks", "Directory mode mask", the zero-length exception, and the cache
+correction on the `archive` hardlink bullet. The conformance run reports 794
+cells and 321 passes.
 
 `checkout --fsync=POLICY` is one CLI option and no library code. The library
 already carried `CheckoutOptions.enable_fsync`, honored at three write sites --
@@ -5902,18 +5914,18 @@ holding a `[core] fsync` value the reader refuses now refuses every
 included, which moves the port toward the tool. A `--composefs` line reaches no
 such read, since the export decision stands ahead of it, so that one line takes
 such a repository and exports the image at exit 0 where the tool refuses it at
-exit 1. `cli-surface.md`, "checkout", records that as a divergence, and
+exit 1. `cli-surface.md`, "P2", `checkout`, records that as a divergence, and
 `checkout_refuses_a_bad_configured_fsync_under_every_override` holds both
 halves.
 
-The counts part, and `format-reference.md`, "The fsync vocabulary" records both:
+The counts part, and `conformance/cli-behavior.md`, "The fsync vocabulary" records both:
 the tool syncs the temporary files of the uncompressed object cache it keeps
 under the repository and syncs no part of the destination, and the port, which
 keeps no such cache, syncs the destination. Over corpus `C0` in `archive` mode
 that is 2 calls for the tool and 5 for the port, and the three rows whose
 resolved policy is off issue none in either.
 
-Three divergences stand, all three in `cli-surface.md`, "checkout":
+Three divergences stand, all three in `cli-surface.md`, "P2", `checkout`:
 `--disable-fsync`, which both refuse and whose words part; `--fsync` given
 twice, which the tool takes, reading the last value, and the port refuses, as it
 refuses a repeated `commit --fsync`; and a `[core] fsync` value the reader
@@ -5922,7 +5934,8 @@ conformance run reports 805 cells and 329 passes.
 
 Open item for the maintainer, and the standing behavior until it is decided.
 The two implementations pay their sync calls on different schedules, and the
-counts in `format-reference.md` are stated at the scale of corpus `C0`, where
+counts in `conformance/cli-behavior.md`, "The fsync vocabulary", are stated
+at the scale of corpus `C0`, where
 the schedules look alike. At the scale of a tree they part. The tool's calls
 target the uncompressed object cache under the repository, which persists, so a
 second `archive` checkout of the same commit pays none and a `bare-user`
@@ -5946,7 +5959,7 @@ model.
 `F18` completes `prune`. The CLI gained `--keep-younger-than=DATE`,
 `--static-deltas-only`, `--retain-branch-depth=BRANCH=DEPTH`,
 `--only-branch=BRANCH`, and `--commit-only`, and the command's totals text is
-recovered and recorded in `format-reference.md`, "CLI output formats", `prune`:
+recovered and recorded in `conformance/cli-behavior.md`, "CLI output formats", `prune`:
 two lines, the count of the loose objects the run read and the outcome, with the
 freed bytes rendered as a decimal (SI) quantity above 1000 bytes, the unit
 chosen from the byte count and not from the rounded value and separated from it
@@ -6017,13 +6030,13 @@ there in place of the bound the arrival carried. The ref's bound stands whole:
 a ref at the global depth 3, reached with one parent hop left, keeps three more
 parents. So a branch cut short cuts every history running through its head. Where two refs name one commit, both seeds
 stand and the commit is walked under each of the two bounds, so it keeps what
-either of them reaches; `cli-surface.md`, "prune" records that corner as one no
-black-box observation settles, and no matrix cell states it.
+either of them reaches; `cli-surface.md`, "P2", `prune` records that corner as
+one no black-box observation settles, and no matrix cell states it.
 
 `--keep-younger-than` settles item `X7`: the port reads the one date reader its
 CLI carries, the reader `commit --timestamp` takes, so the accepted set, the
 refused set, and the refusal text are the same at both sites. Six divergences
-stand, all in `cli-surface.md`, "prune": the `--keep-younger-than` value
+stand, all in `cli-surface.md`, "P2", `prune`: the `--keep-younger-than` value
 dialect, where the port refuses the tool's local-time, relative, and empty forms
 in the tool's own `Could not parse '<value>'` words; the `--retain-branch-depth`
 depth dialect, where the tool reads a leading run of digits and drops the rest of
@@ -6047,7 +6060,7 @@ passes.
 `F19` completes `fsck`. The CLI gained `--add-tombstones`, `-q/--quiet`,
 `-a/--all`, `--delete`, `--verify-bindings`, and `--verify-back-refs`, and the
 command's whole output format is recovered and recorded in
-`format-reference.md`, "CLI output formats", `fsck`: four phase lines, three
+`conformance/cli-behavior.md`, "CLI output formats", `fsck`: four phase lines, three
 summary forms, the finding sentences with their `In commits <list>` prefix,
 the six binding sentences, the exit statuses, and the tool's progress line,
 whose percentage is `floor(n * 100 / total)` and which the port does not
@@ -6134,12 +6147,12 @@ every fault it reaches and marks every commit an absent object leaves
 incomplete, where the tool ends at its first fault unless `-a` or `--delete`
 carries it on. A run still ends early at the three conditions that stop the
 port reading what it must read next -- a ref over an absent commit object, an
-absent dirtree, and a binding failure -- and `cli-surface.md`, "fsck", states
-the reason for each arm. The findings a run reports are therefore a superset
-of the tool's and follow no walk order. The one step that writes to the
-repository past the walk, `--add-tombstones`, is held to the walk the tool
-holds it to: `all` or `delete` releases it after a walk that found a corrupt
-object, so the repository the two leave agrees in every arm.
+absent dirtree, and a binding failure -- and `cli-surface.md`, "P2", `fsck`,
+states the reason for each arm. The findings a run reports are therefore a
+superset of the tool's and follow no walk order. The one step that writes to the
+repository past the walk, `--add-tombstones`, is held to the walk the tool holds
+it to: `all` or `delete` releases it after a walk that found a corrupt object,
+so the repository the two leave agrees in every arm.
 
 Two observations corrected the plan the item was written from. The tool's
 `Validating refs in collections...` phase loads and checksums the commit each
@@ -6150,30 +6163,29 @@ exist. And a ref whose own commit object fails its checksum is reported by the
 ref phase, without the `In commits <list>` prefix, and under `--delete` that
 object is unlinked and the run then ends on the ref it can no longer load.
 
-Eight divergences stand, all in `cli-surface.md`, "fsck": the progress line,
-which the tool writes and repaints on a tty and the port does not write at
+Eight divergences stand, all in `cli-surface.md`, "P2", `fsck`: the progress
+line, which the tool writes and repaints on a tty and the port does not write at
 all; the order of the findings and of the commits inside one, which is the
 hash-container carve-out and reaches which commit a back-reference failure
-names; a faulty repository run with neither `-a` nor `--delete`, where the
-port reports every fault and closes with its own `error: ` line and the tool
-reports the first its walk order reaches and prefixes that one; what `-a`
-selects, which in the tool is where a run ends and in the port is the
-permission the tombstone step needs after a walk that found a corrupt object;
-an object whose own framing is broken,
-where the two readers part -- the port takes normal-form GVariant alone and
-leaves such an object where it stands, and the tool reads the non-normal
-bytes and acts on what its defaults yield; a dangling ref whose name the
-tool's ref enumeration skips, which ends the port's run alone and is the
+names; a faulty repository run with neither `-a` nor `--delete`, where the port
+reports every fault and closes with its own `error: ` line and the tool reports
+the first its walk order reaches and prefixes that one; what `-a` selects, which
+in the tool is where a run ends and in the port is the permission the tombstone
+step needs after a walk that found a corrupt object; an object whose own framing
+is broken, where the two readers part -- the port takes normal-form GVariant
+alone and leaves such an object where it stands, and the tool reads the
+non-normal bytes and acts on what its defaults yield; a dangling ref whose name
+the tool's ref enumeration skips, which ends the port's run alone and is the
 ref-name character class of "P1" reaching a second command; a positional
 argument, which the tool ignores and the port refuses; and a repeated boolean
 flag, which the tool takes and the port refuses. The item adds 35 `m10` cells,
-of which 8 are executable and all 8 pass; the conformance run reports 891
-cells and 358 passes.
+of which 8 are executable and all 8 pass; the conformance run reports 891 cells
+and 358 passes.
 
 `F20` completes `diff`: the five options `--stats`, `--fs-diff`, `--no-xattrs`,
 `--owner-uid=UID`, and `--owner-gid=GID`, the whole output format, the print
 order, the one-argument form, and the side that names a directory on the
-filesystem. `format-reference.md`, "CLI output formats", `diff`, states the
+filesystem. `conformance/cli-behavior.md`, "CLI output formats", `diff`, states the
 recovered format, which was unrecorded before the item.
 
 The library gained the comparison surface the options need. `Repo::diff` takes
@@ -6251,7 +6263,7 @@ the conformance run reports 934 cells and 383 passes.
 
 `F21` completes `summary`'s reading half: the four options `-v/--view`,
 `--raw`, `--list-metadata-keys`, and `--print-metadata-key=KEY`, the precedence
-among them, and the report format. `format-reference.md`, "CLI output formats",
+among them, and the report format. `conformance/cli-behavior.md`, "CLI output formats",
 `summary`, states the recovered format.
 
 The library half of the item is `Repo::read_summary`, which returns the file
@@ -6271,7 +6283,7 @@ lets the CLI word its own refusal for an absent file.
 
 The one defect the item found is in the shared report printer. A string value
 whose key carries no label printed bare where the tool prints it in the text
-form, quotes included; `format-reference.md`, "`remote`", already stated the
+form, quotes included; `conformance/cli-behavior.md`, "`remote`", already stated the
 rule the printer missed. The fix reaches `remote summary` in the same stroke,
 the two commands sharing one printer.
 
@@ -6302,8 +6314,9 @@ passes.
 `--sign=KEY-ID` and its interaction with `--sign-type`, `F22b` lands
 `-m/--add-metadata=KEY=VALUE`, and `F22c` lands `--gpg-sign=KEY-ID` beside the
 `--gpg-homedir` the port already carried. The three are read with `-u` alone.
-`format-reference.md`, "CLI output formats", `summary`, states the recovered
-rules, and "Summary signature" states where each signature goes.
+`conformance/cli-behavior.md`, "CLI output formats", `summary`, states
+the recovered rules, and `format-reference.md`, "Summary signature --
+`a{sv}`", states where each signature goes.
 
 The tool checks every writing option before it regenerates, so a refusal leaves
 `summary` and `summary.sig` as they stood and a ref added since is not listed.
@@ -6394,8 +6407,9 @@ pass; the conformance run reports 983 cells and 405 passes.
 
 `static-delta show` and `static-delta indexes` land, together with the public
 surface the other `static-delta` subcommands read a delta through.
-`format-reference.md`, "CLI output formats", `static-delta`, states the
-recovered formats, and "Static delta wire format" states the payload framing
+`conformance/cli-behavior.md`, "CLI output formats", `static-delta`, states
+the recovered formats, and `format-reference.md`, "Static delta wire format",
+states the payload framing
 and the four size fields the endianness byte swaps.
 
 The superblock types become public as `DeltaSuperblock`, `DeltaPart`, and
@@ -6527,8 +6541,9 @@ in that order. With neither, the last `--keys-dir`, or the system key
 directories, supply the trusted and the revoked sets through
 `load_sign_keys_from`. `no keys loaded` is judged on the trusted set before
 revocation, and a store whose every trusted key is revoked reports `no
-signatures found`. A key decodes with the lenient base64 reader of `commit
---sign`. The `--keys-file` must be a regular file, which a `metadata` check
+signatures found`. A positional key and a line of `--keys-file` decode with
+the lenient base64 reader of `commit --sign`. A line of the key store decodes
+strictly. The `--keys-file` must be a regular file, which a `metadata` check
 states before the open, so a FIFO is refused and not waited on; the file is
 read up to 1 MiB. A line empty once a trailing `\r` is removed is skipped, and
 a line of whitespace is a key of 0 bytes. The failure line names the effective
@@ -6919,7 +6934,7 @@ per second fails after 30 seconds. The tool samples the rate once a second
 over the last five seconds, and a transfer fails only when the rate stays below
 the limit for the time: bursts of 2000 bytes every 1.9 seconds complete under
 a limit of 1000 for one second, though no byte arrives in some whole seconds.
-`format-reference.md`, "CLI output formats", `pull`, gives the measurements.
+`conformance/cli-behavior.md`, "CLI output formats", `pull`, gives the measurements.
 The tool retries a 503, a cut body, and a transfer below the rate from one
 count, and repeats at once: 6 requests by
 default, 2 with `--network-retries=1`, and 1 with `--network-retries=0` or the
@@ -6981,8 +6996,9 @@ and into `bare-user` 15. `--disable-fsync` and `[core] fsync=false` each make
 0, beside `--per-object-fsync` too, and a `--mirror` pull under
 `--disable-fsync` syncs no summary. The tool discards an `=VALUE` suffix on
 both switches, so `--disable-fsync=false` disables fsync, and takes a repeat of
-either. `format-reference.md`, "Durability and staging" and "The fsync
-vocabulary", gives the measurements. Measured with `strace -f -c -e
+either. `format-reference.md`, "Durability and staging", and
+`conformance/cli-behavior.md`, "The fsync vocabulary", give the measurements.
+Measured with `strace -f -c -e
 trace=fsync,fdatasync,syncfs` over an HTTP pull of `C0` into `archive` under
 `--per-object-fsync`, the port makes 17 calls and the tool 15. Under
 `--disable-fsync` both make 0.
@@ -7054,7 +7070,7 @@ destination holding the commit object partial takes no delta. A relative
 or empty value ends the tool on an assertion with nothing written.
 `--untrusted` restores the check `--http-trusted` skips. The tool discards an
 `=VALUE` suffix on both switches and takes a repeat of either.
-`format-reference.md`, "HTTP pull surface", gives the rules.
+`conformance/cli-behavior.md`, "HTTP pull surface", gives the rules.
 
 Three decisions stand, each taken without the maintainer and open to reversal.
 `--http-trusted` is accepted and the check is kept, so the port writes no
@@ -7107,7 +7123,7 @@ request count as metadata fetched, even when the remote answers 404, and a
 `.commitmeta` counts only when served. The transferred figure leaves out the
 summary, the config, and the ref files, and rounds down to whole KiB. A pull
 that reads no body byte after them drops the transfer clause. A delta whose
-parts are all inline takes the loose form. `format-reference.md`, "`pull`",
+parts are all inline takes the loose form. `conformance/cli-behavior.md`, "`pull`",
 gives the rules.
 
 A review round found three defects and fixed them. The transferred figure
@@ -7250,8 +7266,9 @@ The extension serves three scenarios:
   commit object with `ostrya-core` and signs it with its own keys. With the
   same inputs, over a tree the walker accepts, the commit is byte-identical to
   the commit `ostree commit --no-xattrs` builds from the same directory
-  (`format-reference.md`, "commit"). The client library compiles on Linux,
-  macOS, and Windows. `ostrya push-tree` is the command form.
+  (`format-reference.md`, "The commit of `push-tree`"). The client library
+  compiles on Linux, macOS, and Windows. `ostrya push-tree` is the command
+  form.
 - Commit push -- `ostrya push` sends one or more commits from a local
   repository and updates refs on the remote.
 - One-way stream -- a library caller writes commits of a local repository
@@ -7303,7 +7320,7 @@ of a remote section, `push-url`, `ssh-command`, `receive-command`,
 `push-token-file`, and `push-user`, are read through `Remote` in every build.
 `resolve_push` applies the keys of the transport of the push address alone,
 and refuses `tls-permissive=true` for an `https://` address
-(`format-reference.md`, "Port extension: the push and pull keys of a remote"). `ostrya-cli` has the feature
+(`ostrya-config(1)`, "REMOTE KEYS"). `ostrya-cli` has the feature
 `push = ["ostrya/push"]` in its default set, which builds `ostrya push` and
 `ostrya push-tree`, beside `receive = ["ostrya/receive"]`, which builds
 `ostrya receive`, and `send = []`, which builds `ostrya send`.
@@ -7383,10 +7400,10 @@ alone, and refuses an ssh address in the key `url`. `resolve_pull` reads the
 key `ssh-command` into `SshOptions::config_command`. It reads the key
 `send-command` into `SshOptions::remote_command` when
 `EndpointOverrides::remote_command` is `None`. It reads `Remote::pull_url` and
-`Remote::send_command` in every build (`format-reference.md`, "Port extension:
-the push and pull keys of a remote"). `ostrya pull`, `ostrya remote refs`, and
+`Remote::send_command` in every build (`ostrya-config(1)`, "REMOTE KEYS", and
+the rustdoc of `resolve_pull`). `ostrya pull`, `ostrya remote refs`, and
 `ostrya remote summary` work for a remote whose `pull-url` is an ssh address
-(`docs/conformance/cli-surface.md`, "pull"). A pull between two port
+(`docs/conformance/cli-surface.md`, "P2", `pull`). A pull between two port
 repositories over ssh to localhost gives a repository that passes `ostree
 fsck`, and `ostree rev-parse` resolves the pulled ref to the source commit
 (`crates/ostrya-cli/tests/pull_ssh.rs`).
@@ -7692,17 +7709,20 @@ with a hand-written `Debug`, so `PullOptions` keeps its `Debug`, `Clone`, and
 two keys that put E2 and E3 under repository policy. `gc-root-metadata-keys`
 holds the metadata keys a prune reads for further reachable commits.
 `detached-metadata-exclude` holds the detached-metadata keys the repository does
-not store when it receives a commit, and does not send when it serves one. Each
+not store when it receives a commit, and that `ostrya push` does not send. Each
 is a `;`-separated list, empty when the key is absent, read on demand through
 `RepoConfig::gc_root_metadata_keys` and `RepoConfig::detached_metadata_exclude`.
 A value the key-file syntax cannot split is reported when the accessor runs, not
 when the repository opens, which is the style of every other tunable.
 `DetachedMetadataFilter::excluding` builds the filter the second key describes.
 
-The library reads neither key. `Repo::prune` and the pull drivers act on the
-options they are given, and every default is what it was:
-`PruneOptions::default` is still the tool's prune. `ostrya-cli` is the one
-reader, at its `prune`, `pull`, and `pull-local` sites.
+The library reads `detached-metadata-exclude` in one place, the receive policy
+of `ostrya receive` and `ostrya serve`, and does not read
+`gc-root-metadata-keys`. `Repo::prune` and the pull drivers act on the options
+they are given, and every default is what it was: `PruneOptions::default` is
+still the tool's prune. `ostrya-cli` reads `gc-root-metadata-keys` at its
+`prune` site and `detached-metadata-exclude` at its `pull`, `pull-local`, and
+`push` sites.
 
 Five properties hold over the two keys:
 
@@ -8342,7 +8362,7 @@ tool-agreement direction is measured both ways: `commit --tree=tar=-` holds the
 tool's lock for an interval the test controls, because the tool takes the lock
 before it reads the first byte of the tar, and the editor route holds nothing,
 because the tool takes its lock after the editor returns. `cli-surface.md`,
-"prune", carries the observation the agreement rests on.
+"P2", `prune`, carries the observation the agreement rests on.
 
 `25b` -- weak refs over local refs (DONE). `WeakRefFilter` wraps a
 `WeakRefFilterFn`, an `Arc<dyn Fn(&str, &Checksum) -> bool + Send + Sync>`. It
@@ -8442,12 +8462,12 @@ line to standard error, in its own name, where the repository config sets
 another writer can change the repository while it runs. The read stands after
 the options are assembled, so it leaves the place an `[ex-ostrya]
 gc-root-metadata-keys` refusal lands unmoved. One divergence stands, and
-`cli-surface.md`, "prune", records it: with that key set the tool takes no lock
-either, prunes beside a held foreign lock, exits 0, and writes nothing to
+`cli-surface.md`, "P2", `prune`, records it: with that key set the tool takes no
+lock either, prunes beside a held foreign lock, exits 0, and writes nothing to
 standard error. 25a closed a difference that stood between the two
-implementations, and it opened none; `cli-surface.md`, "prune", now carries the
-observation both implementations are measured against. No matrix cell reaches
-the line, because no harness setup edits `config`
+implementations, and it opened none; `cli-surface.md`, "P2", `prune`, now
+carries the observation both implementations are measured against. No matrix
+cell reaches the line, because no harness setup edits `config`
 (`conformance/harness.md`, "Constraints").
 
 Six decisions the phase carries:

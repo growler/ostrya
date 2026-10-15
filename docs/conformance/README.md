@@ -15,10 +15,11 @@ The goal is full interoperability wherever it is possible:
 Scope is repository and commit management. The sysroot and deployment surface
 (`ostree admin`) is out of scope, in line with Phase 20 of `../port-plan.md`.
 
-Two companion documents sit beside the record files. `harness.md` specifies the
-program that executes the records and reports what each cell proved.
+Three companion documents sit beside the record files. `harness.md` specifies
+the program that executes the records and reports what each cell proved.
 `cli-surface.md` lists the CLI capabilities that execution needs, ordered by
-what each one unblocks.
+what each one unblocks. `cli-behavior.md` records the observed CLI behavior of
+the `ostree` command.
 
 ## Axes
 
@@ -228,15 +229,15 @@ Recognized descriptive fields: `family`, `corpus`, `op`, `modes`, `src-mode`,
 `cli-gap`, `subcommand`, `note`.
 
 The `spec:` field holds one or more `<document>#<anchor>` values. The document
-name resolves in this directory, which holds `cli-surface.md` and
-`harness.md`, and then in `../`, which holds `format-reference.md` and
-`port-plan.md`. The anchor is the fragment GitHub derives from the heading
-text: the text lowercased, with every character outside letters, digits,
-hyphens, and underscores dropped, and every space turned into a hyphen. A
-heading of the form `P2 -- options missing from commands that exist` therefore
-carries the anchor `p2----options-missing-from-commands-that-exist`. `check`
-reports a value that names no document and a value that names no heading of
-its document. A run whose record directory sits apart from the design
+name resolves in this directory, which holds `cli-behavior.md`,
+`cli-surface.md`, and `harness.md`, and then in `../`, which holds
+`format-reference.md` and `port-plan.md`. The anchor is the fragment GitHub
+derives from the heading text: the text lowercased, with every character outside
+letters, digits, hyphens, and underscores dropped, and every space turned into a
+hyphen. A heading of the form `P2 -- options missing from commands that exist`
+therefore carries the anchor `p2----options-missing-from-commands-that-exist`.
+`check` reports a value that names no document and a value that names no heading
+of its document. A run whose record directory sits apart from the design
 documents leaves the field unchecked.
 
 A record carries executable fields as well once its claim is observed:

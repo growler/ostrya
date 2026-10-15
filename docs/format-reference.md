@@ -1,46 +1,71 @@
 # OSTree On-Disk Format Reference
 
-This document specifies the on-disk repository format that the Rust port must
-reproduce byte-for-byte. It is an interoperability specification: every field
-width, endianness note, and sort order here is a hard compatibility requirement,
-because the object checksum is computed over these exact serialized bytes.
+This document specifies the on-disk repository format that the Rust port
+reproduces byte for byte. Each field width, byte order, and sort order is a
+compatibility requirement, because the object checksum covers the serialized
+bytes. The part "Port extensions" specifies the formats and the protocols that
+only the port writes.
 
-Provenance: this specification is established from the public ostree
-documentation (https://ostreedev.github.io/ostree/) and by inspecting the
-objects and output the `ostree` tool produces, run as a black box. It does not
-derive from the LGPL source (see CLAUDE.md, "Licensing and clean-room
-discipline"). Each fact stated here is verifiable by creating a repository with
-the tool and examining the bytes it writes; the GVariant serialization it builds
-on is GLib's publicly documented format.
+The facts come from the public ostree documentation
+(https://ostreedev.github.io/ostree/) and from the objects and output of the
+`ostree` tool. No fact derives from the LGPL source (see CLAUDE.md,
+"Licensing and clean-room discipline"). The GVariant serialization is the
+format that GLib documents. `conformance/cli-behavior.md` records the CLI
+behavior of the tool. `conformance/cli-surface.md` records each difference
+between the tool and the port.
+
+Three labels give the source of a statement:
+
+- Observed behavior: `ostree` 2026.1, run as a black box. A run of the tool
+  and a check of the bytes that it writes can verify the fact.
+- Not observed: no run of the tool records the fact. The text states the
+  port alone.
+- Design target: the fact comes from the documentation and the standards. No
+  run of the tool confirms it.
 
 ## Foundational constants
 
-- SHA-256 digest: 32 raw bytes, 64 lowercase hex chars (`[0-9a-f]`).
-- Metadata size cap: 128 MiB (limit on fetched/loaded metadata).
-- Stored-file mtime: 0. Files stored and checked out carry mtime 0; file
-  timestamps are not part of the content model.
+- SHA-256 digest: 32 raw bytes, 64 lowercase hex characters (`[0-9a-f]`).
+- Metadata size cap: 128 MiB (limit on fetched or loaded metadata).
+- File mtime: the content model holds no timestamp. No file header and no
+  dirmeta holds an mtime. The port sets no mtime on a stored object or on a
+  checkout file. A composefs image gives each inode mtime 0 ("composefs"). A
+  tar export gives each member the commit timestamp, except a hardlink member,
+  which gets mtime 0 ("tar"). Not observed: the mtime that the tool gives a
+  stored object, a checkout file, and a tar hardlink member.
 
 ## GVariant serialization rule (applies to every metadata object)
 
-Metadata objects are stored as GVariant in normal form. There is no
-whole-variant byte swap anywhere in ostree. Two separate concerns:
+The writer stores each metadata object as normal-form GVariant. It converts
+each big-endian field at the value level, so the stored bytes have no
+whole-variant byte swap. The raw text reports (`summary --raw`, `show` without
+`-B`, `log --raw`) byte-swap the whole loaded variant for display
+(`conformance/cli-behavior.md`, "CLI output formats", "The GVariant text form",
+"Byte order").
 
-- Container framing (element offsets, framing bytes) is written in native byte
-  order, which is the standard GVariant normal-form encoding. In practice all
-  targets are little-endian.
-- Individual scalar integer fields (uid, gid, mode, rdev, timestamps, sizes)
-  are converted to big-endian at the value level before being placed in the
-  variant, and read back from big-endian.
+- Container framing (element offsets and framing bytes) is little-endian. Each
+  scalar that the next item does not name is also little-endian. This is the
+  GVariant normal form on a little-endian host, and the port writes it on
+  every host.
+- These scalar integer fields are big-endian: uid, gid, mode, rdev, the
+  timestamps, and the uncompressed size `t` of the archive header. The writer
+  converts each one to big-endian before it puts the value in the variant, and
+  the reader converts it back.
+- Other size fields have their own rules. The per-ref commit size in the
+  summary is little-endian (host order). The `ostree.sizes` values are LEB128
+  varints. The size fields of a static-delta superblock follow its
+  `ostree.endianness` byte ("Static delta wire format").
 
-For the port: store the numeric fields as already-big-endian `u32`/`u64`
-values, then emit standard normal-form GVariant. A Rust GVariant serializer
-must produce byte-identical normal-form output, because the checksum is taken
-over those bytes. Values are written in GVariant normal form before hashing.
+The object structs of the port hold host-order values. Each serialize site and
+each parse site converts the big-endian fields, and the encoder then writes
+standard normal-form GVariant. The checksum covers these bytes, so the output
+must be byte-identical normal form.
 
 ## Object types
 
-Object-type numeric values are wire-significant (used in the `(su)` object-name
-serialization and in `ostree.sizes`).
+The numeric value of an object type is wire-significant. One byte holds the
+type in an `ostree.sizes` entry, in each object entry of a static-delta
+superblock meta-entry, and in a superblock fallback entry.
 
 - 1 `FILE` -- `.file` / `.filez` -- content: header plus payload.
 - 2 `DIR_TREE` -- `.dirtree` -- sorted lists of child files and subdirs.
@@ -54,12 +79,16 @@ serialization and in `ostree.sizes`).
 - 9 `FILE_XATTRS_LINK` -- `.file-xattrs-link` -- hardlink to a `.file-xattrs`,
   keyed by the `.file` checksum.
 
-A `.tombstone-commit` object marks a commit a prune removed. It holds an
-`a{sv}` carrying one entry, whose key is `commit` and whose value is a variant
-of type `ay` holding the commit checksum in 64 lowercase hex characters
-followed by one NUL. The object is 78 bytes for every commit, and its
-permission bits are `0644`, the bits every metadata object carries. The bytes
-of the marker for commit
+The is-meta predicate is `t` in 2..=6, and the checksum rules use it ("Checksum
+computation"). Types 7, 8, and 9 are auxiliary types outside the metadata set.
+The string form of an object name is `<hexchecksum>.<typestr>`. "Repository
+modes and on-disk storage" states which objects take the `z` suffix.
+
+A `.tombstone-commit` object marks a commit that a prune removed. It holds an
+`a{sv}` with one entry. The key is `commit`. The value is a variant of type
+`ay` that holds the commit checksum in 64 lowercase hex characters and one
+NUL. The object is 78 bytes for every commit. Its permission bits are `0644`,
+as for every metadata object. The marker for commit
 `5a7db91c4984baa542cb29238cd86a54497303c82cbed2f0af3c44606c0d482f`:
 
 ```
@@ -70,28 +99,18 @@ of the marker for commit
 00000040: 3663 3064 3438 3266 0000 6179 074d       6c0d482f..ay.M
 ```
 
-The framing reads: the dict entry's key ends at offset 7, which the `0x07`
-offset byte at 76 states; the variant's separator NUL sits at 73 with the type
-string `ay` at 74; and the array's one element ends at offset 77, which the
-`0x4d` offset byte at 77 states. `fsck` over a repository holding these reports
-no error, and `log` does not read them.
+The `0x07` offset byte at 76 states that the key of the dict entry ends at
+offset 7. The separator NUL of the variant is at 73, and the type string `ay`
+is at 74. The `0x4d` offset byte at 77 states that the one element of the
+array ends at offset 77.
 
-A prune writes the marker for every commit it removes where the command line
-carries `--delete-commit` or the repository config sets
-`[core] tombstone-commits`. A marker is never pruned itself and is counted in
-neither number a prune reports. `fsck --add-tombstones` writes the same bytes
-for every commit whose parent commit object is absent, removing that commit
-object in the same step and needing no config key ("CLI output formats",
-`fsck`).
-
-The is-meta predicate is `t` in 2..=6. Types 7/8/9 are not "meta" despite being
-auxiliary. The checksum rules key off the is-meta predicate. The `z` loose-path
-suffix applies only to a `FILE` object (type 1) in archive mode, stored
-zlib-compressed as `.filez`. The auxiliary non-meta objects carry no suffix:
-`.payload-link` is a symlink, `.file-xattrs` holds an uncompressed GVariant
-blob, and `.file-xattrs-link` is a hardlink. Object string form is
-`<hexchecksum>.<typestr>`. Object-name GVariant is `(su)` = (hex-string,
-objtype-as-u32).
+A prune writes the marker for every commit that it removes when the command line
+has `--delete-commit` or the config sets `[core] tombstone-commits`. A prune
+never removes a marker. `conformance/cli-behavior.md`, "CLI output formats",
+`prune`, states what the counts of a prune cover. `fsck --add-tombstones` writes
+the same bytes (`conformance/cli-behavior.md`, "CLI output formats", `fsck`).
+Observed behavior: `fsck` reports no error over a repository that holds markers,
+and `log` does not read them.
 
 ## Metadata object formats (GVariant type strings, verbatim)
 
@@ -106,112 +125,112 @@ objtype-as-u32).
 6. `ay` root dirtree checksum, 32 raw bytes.
 7. `ay` root dirmeta checksum, 32 raw bytes.
 
-The metadata dict is an array of key-value tuples, and it holds the order its
-writer produced. That order is part of the commit checksum, so the port
-serializes the dict in insertion order and a caller reproducing a tool commit
-supplies the keys in the order the tool supplies them (see "CLI output
-formats", `commit`). A reader addresses the dict by name: it reaches a key
-whatever slot the entry stands in. A name may stand twice, and a lookup by that
-name reaches the entry standing first.
-The `conformance/m10-cli-behavior.matrix` cells state this over commits both
-implementations write. `commit/metadata-group-order` and
-`commit/metadata-duplicate-key` reach the tool's own checksum over dicts whose
-stored order follows neither the command line nor a sort.
-`commit/metadata-nonsorted-read-back` reads every key of such a dict back by
-name, and the duplicate-key cell reads a repeated name back to its first
-entry.
+The metadata dict is an array of key-value tuples. It holds the entries in the
+order that its writer produced, and this order is part of the commit checksum.
+The port serializes the dict in insertion order. A caller that reproduces a
+tool commit gives the keys in the order of the tool
+(`conformance/cli-behavior.md`, "CLI output formats", `commit`, "The commit
+metadata"). A reader finds
+a key by name, in any slot. A name can occur twice, and a lookup by that name
+finds the first entry.
 
-Well-known metadata keys: `version` (`s`, the only key without the `ostree.`
-prefix), `ostree.architecture` (`s`), `ostree.ref-binding` (`as`),
-`ostree.collection-binding` (`s`), `ostree.endoflife` /
-`ostree.endoflife-rebase` (`s`), `ostree.source-title` (`s`), `ostree.linux`
-(`s`) and `ostree.bootable` (`b`) (see below), `ostree.composefs.digest.v0`
-(`ay`, see "composefs"), and `ostree.sizes` (see below). Ref and collection
-bindings are added by higher-level operations, not by the base commit metadata.
+These metadata keys are well known:
 
-`ostree.linux` and `ostree.bootable` mark a commit that carries a kernel.
-`ostree.linux` is an `s` holding the name of the directory under
-`/usr/lib/modules` that holds the kernel, and `ostree.bootable` is a `b` holding
-true. The tool writes the pair together, under `commit --bootable`; the search
-that produces the name is recorded in "CLI output formats", `commit`.
+- `version` (`s`), the only key without the `ostree.` prefix.
+- `ostree.architecture` (`s`).
+- `ostree.ref-binding` (`as`) and `ostree.collection-binding` (`s`).
+- `ostree.endoflife` and `ostree.endoflife-rebase` (`s`).
+- `ostree.source-title` (`s`).
+- `ostree.linux` (`s`) and `ostree.bootable` (`b`).
+- `ostree.composefs.digest.v0` (`ay`, see "composefs").
+- `ostree.sizes` (`aay`).
 
-`ostree.sizes` value type is `aay`; each entry is a packed byte buffer sorted
-by ASCII checksum:
+The commit write of the port adds neither binding key. The caller supplies
+them as normal metadata entries. For example, `commit -b` writes
+`ostree.ref-binding`.
+
+`ostree.linux` and `ostree.bootable` mark a commit that holds a kernel.
+`ostree.linux` holds the name of the directory under `/usr/lib/modules` that
+holds the kernel, and `ostree.bootable` holds true. `commit --bootable` writes
+the two together (`conformance/cli-behavior.md`, "CLI output formats",
+`commit`).
+
+#### The `ostree.sizes` key
+
+The value type is `aay`. Each entry is a packed byte buffer:
 
 ```
 [32 bytes checksum][varuint64 compressed size][varuint64 unpacked size][1 byte objtype]
 ```
 
-The varuint64 is protobuf-style LEB128 (little-endian base-128, high bit is
-the continuation flag). The encoding is canonical: each value has one minimal
-form, so a multi-byte sequence whose terminating byte is `0x00` (contributing
-no value bits) is not accepted. Rejecting non-minimal forms keeps
-unpack-then-pack of an entry byte-identical. The trailing objtype byte is
-present on newer commits; parsers tolerate its absence.
+The entries are sorted by the raw 32-byte checksum, read as a byte string. The
+hex form gives the same order. Each varuint64 is protobuf-style LEB128
+(little-endian base-128, the high bit is the continuation flag). The encoding
+is canonical: each value has one minimal form. A reader refuses a multi-byte
+form whose last byte is `0x00`, which adds no value bits, so unpack-then-pack
+of an entry is byte-identical. Some commits hold entries without the objtype
+byte. A reader accepts such an entry.
 
-The key holds an entry for every object reachable in the commit, not only
-content objects. Recovered by decoding a `commit --generate-sizes` commit on
-ostree 2026.1: the entries cover the content objects and the dirtree and
-dirmeta metadata objects, sorted together by ASCII checksum, and each entry's
-trailing byte carries that object's own type (`File`=1, `DirTree`=2,
-`DirMeta`=3). The commit object itself is absent, as it does not exist when the
-key is computed. The compressed size is the object's on-disk size (a content
-object's `.filez` storage size, a metadata object's serialized byte length);
-the unpacked size is the object's logical `st_size` -- a regular file's payload
-length, a symlink's target length, and a metadata object's serialized byte
-length -- so for a metadata object, stored uncompressed, the compressed and
-unpacked sizes are equal. When the commit carries caller-supplied metadata,
-`ostree.sizes` is appended after it (observed: a branch commit's
-`ostree.ref-binding` precedes the `ostree.sizes` the tool adds).
+Over a single tree source, the key holds an entry for each object that the
+commit reaches. These are the content objects, the dirtree objects, and the
+dirmeta objects. The trailing byte of each entry holds the type of its object
+(`File`=1, `DirTree`=2, `DirMeta`=3). The commit object has no entry, because
+it does not exist when the key is computed. The writer appends the key after
+every other entry of the dict. `conformance/cli-behavior.md`, "CLI output
+formats", `commit`, states which objects the key holds over a source list, and
+the order of the keys in the dict.
 
-The sort key is the raw 32-byte checksum read as a byte string, which is the
-order the hex form gives as well. A decoded key, from a `commit
---generate-sizes` of a tree holding four directories, one symlink, and three
-regular files, with each entry's length in bytes:
+Each entry holds two sizes:
+
+- The compressed size is the size of the file of the object under `objects/`.
+  For a content object, this is the `.filez` size.
+- The uncompressed size (the second varuint64) is the logical `st_size`. This
+  is the payload length of a regular file and the target length of a symlink.
+
+For a metadata object, each size is its serialized length. The two sizes are
+equal, because a metadata object is stored uncompressed ("Repository modes and
+on-disk storage"). The compressed size of a content object can be larger than
+its uncompressed size.
+
+This is a decoded key from `commit --generate-sizes` over a tree of four
+directories, one symlink, and three regular files. The last column gives the
+length of each entry in bytes. The 20000-byte file of random bytes stores 20044
+bytes:
 
 ```
-checksum (first 8 bytes)   archived  unpacked  type          length
-0cad59c0775ee80f...        80        80        2 dirtree     35
-1b6ba70951395486...        12        12        3 dirmeta     35
-1c16bd4554d0fb08...        41        51        1 file        35
-6e340b9c...                1         1         2 dirtree     35
-6e4aa995...                145       145       2 dirtree     37
-8c7b8dd4...                36        2         1 file        35
-8d81d4ff...                148       148       2 dirtree     37
-abadce0d...                48        12        1 file        35
-fe657422...                20044     20000     1 file        39
+checksum (first 8 bytes)   compressed  unpacked  type          length
+0cad59c0775ee80f...        80          80        2 dirtree     35
+1b6ba70951395486...        12          12        3 dirmeta     35
+1c16bd4554d0fb08...        41          51        1 file        35
+6e340b9c...                1           1         2 dirtree     35
+6e4aa995...                145         145       2 dirtree     37
+8c7b8dd4...                36          2         1 file        35
+8d81d4ff...                148         148       2 dirtree     37
+abadce0d...                48          12        1 file        35
+fe657422...                20044       20000     1 file        39
 ```
 
-The first entry reads, byte for byte:
+The bytes of the first entry:
 
 ```
 0c ad 59 c0 77 5e e8 0f 24 1e c8 58 2d 9c 1e 64
 6b 4f b5 59 8c 1a 6e 7a 9e 09 7a 61 20 d4 41 b5   32 checksum bytes
-50                                                archived  = 80
-50                                                unpacked  = 80
+50                                                compressed = 80
+50                                                unpacked   = 80
 02                                                dirtree
 ```
 
-Every archived value equals the size of the object's file under `objects/`, so
-an entry's first size field grows past the second where the payload inflates
-under compression (the 20000-byte random file above stores 20044 bytes).
+Only an archive-mode repository writes `ostree.sizes`. The compressed size is
+the `.filez` size, so the key is the only commit-metadata field that depends on
+the storage. Observed behavior: in a bare or bare-user repository,
+`commit --generate-sizes` writes no key and no warning. The commit checksum is
+then the same as without the option. In an archive repository the option adds
+the key and changes the commit checksum. A commit thus has one checksum in all
+modes only when the archive side has size generation off.
 
-`ostree.sizes` is written only by archive-mode repositories; the compressed
-size is the `.filez` storage size, which makes it the only storage-dependent
-commit-metadata field. Observed on ostree 2026.1: requesting size generation
-(`commit --generate-sizes`) in a bare or bare-user repository is a silent
-no-op -- no key is written, no warning is emitted, and the commit checksum is
-byte-identical to the same commit without the request -- while in an archive
-repository it adds the key and changes the commit checksum. Cross-mode commit
-identity therefore holds exactly when size generation is off on the archive
-side.
-
-Because the archived size is the stored size, the key records what the writing
-implementation's DEFLATE encoder produced. Two implementations agree on the key
-exactly where their compressed payloads have equal length. The port and the tool
-reach two lengths for most payloads, so the key parts over a real tree;
-`conformance/cli-surface.md`, "P2" records the measured frequency and the named
-payloads.
+The compressed size records the output of the writer's DEFLATE encoder. Two
+writers agree on the key only where their compressed payloads have equal
+lengths (`conformance/cli-surface.md`, "P2", `commit`).
 
 ### Dirtree -- `(a(say)a(sayay))`
 
@@ -220,17 +239,19 @@ payloads.
 1. `a(sayay)` dirs: (dirname `s`, dirtree checksum `ay`=32, dirmeta checksum
    `ay`=32), sorted by dirname with byte-wise comparison.
 
-Sort order is mandatory for reproducible checksums. Each filename is validated
-(not `.`, not `..`, no `/`, valid UTF-8): this is the path-traversal defense.
+The sort order is mandatory for reproducible checksums. Each list is strictly
+sorted, so a name occurs at most once in one list. The two lists are
+independent, so the format lets one name occur in both lists. The port
+refuses these dirtrees:
 
-The two lists are independent, so a name can appear in both. The tool does not
-guard against this: observed by injecting a root dirtree that carries one name
-in both lists (built with the port's encoder so framing and per-list sort stay
-valid, then spliced into the commit and ref), `ostree fsck` reports no errors
-and `ostree ls` prints both entries, and `ostree ls -R` aborts on an internal
-assertion when it resolves the name as a directory. The port never mints such
-an object: the write path and the owned-parse path reject a name shared between
-the two lists, while the borrowed read iterators stay per-list.
+- A list that is not strictly sorted.
+- A name that is empty, `.`, or `..`, that holds `/`, or that is not valid
+  UTF-8. This is the path-traversal defense.
+- A name in both lists. The write path and the owned parse refuse it. The
+  borrowed read iterators read each list alone.
+
+`conformance/cli-surface.md`, "P1", records how the tool reads a name in both
+lists.
 
 ### Dirmeta -- `(uuua(ayay))`
 
@@ -239,24 +260,23 @@ the two lists, while the borrowed read iterators stay per-list.
 2. `u` mode, full `st_mode` including `S_IFDIR` (big-endian).
 3. `a(ayay)` xattrs, sorted by name.
 
-No rdev, no symlink field.
+A dirmeta has no rdev field and no symlink field.
 
 ### File content object header
 
-Content objects (`.file`/`.filez`) are a header GVariant followed by payload.
+A content object (`.file` or `.filez`) is a header GVariant and a payload.
 
-Uncompressed stream header `(uuuusa(ayay))`, used for bare-mode streams and for
-checksum computation:
+Uncompressed stream header `(uuuusa(ayay))`, for bare-mode streams and for the
+checksum: 0. `u` uid (BE), 1. `u` gid (BE), 2. `u` mode (BE), 3. `u` rdev (must
+be 0), 4. `s` symlink target (empty for an object that is not a symlink), 5.
+`a(ayay)` xattrs (sorted).
 
-0. `u` uid (BE), 1. `u` gid (BE), 2. `u` mode (BE), 3. `u` rdev (must be 0),
-4. `s` symlink target (empty for non-symlinks), 5. `a(ayay)` xattrs (sorted).
+Compressed archive header `(tuuuusa(ayay))`, stored on disk in archive mode.
+Its field 0 is `t`, the uncompressed size (BE). Fields 1 to 6 hold the six
+fields of the uncompressed header, in the same order.
 
-Compressed archive header `(tuuuusa(ayay))`, stored on disk in archive mode:
-
-0. `t` uncompressed size (BE), 1. `u` uid (BE), 2. `u` gid (BE), 3. `u` mode
-(BE), 4. `u` rdev (must be 0), 5. `s` symlink target, 6. `a(ayay)` xattrs.
-
-On parse, rdev != 0 and non-REG/non-LNK modes are rejected.
+A parse refuses an rdev that is not 0 and a mode that is not a regular file or
+a symlink.
 
 On-disk framing of a content stream (the length-prefixed header):
 
@@ -264,177 +284,178 @@ On-disk framing of a content stream (the length-prefixed header):
 [4 bytes BE u32: variant length][4 bytes 0x00 padding to 8-byte align][header variant bytes]
 ```
 
-For regular files the raw payload follows immediately (archive: raw-deflate
-compressed; bare on-disk: the payload is stored without this framing -- the
-framing is used transiently and for checksum). The 4-byte NUL pad aligns the
-variant for mmap.
+The 4-byte NUL pad aligns the variant to 8 bytes for a memory map.
+
+The raw payload of a regular file comes directly after the framed header. In
+archive mode the payload is raw DEFLATE. A bare-mode object stores the payload
+alone, with no framing. The framing exists in a stream and in the checksum
+input.
 
 ### bare-user metadata xattr -- `(uuua(ayay))`
 
-Value stored in the `user.ostreemeta` xattr on `.file` objects in bare-user
-mode. Same layout as dirmeta.
+The value of the `user.ostreemeta` xattr on a `.file` object in bare-user
+mode. The layout is the dirmeta layout.
 
 ### Detached commit metadata (`.commitmeta`) -- `a{sv}`
 
-A bare dict, not wrapped in a tuple. Not part of the commit checksum: stored in
-a separate loose-path file, mutable, holds signatures. Writing with no metadata
-produces a zero-length file (deletion). Signature keys, all value type `aay`
-(array of signature blobs, append-only):
-
-- `ostree.gpgsigs` -- OpenPGP detached-signature blobs over the commit bytes.
-- `ostree.sign.ed25519` -- raw 64-byte ed25519 signatures.
-- `ostree.sign.spki` -- SPKI/ECDSA signatures (OpenSSL-only in the reference
-  tool).
-- `ostree.sign.dummy` -- test engine.
+A bare dict, with no tuple around it. It is not part of the commit checksum. It
+is a separate loose file, it is mutable, and it holds the signatures. A write
+with no metadata gives a zero-length file, which deletes the metadata.
+"Signing details" lists the signature keys and their values.
 
 ## Summary and summary signature
 
 ### Summary -- `(a(s(taya{sv}))a{sv})`
 
-Lives at repo root as `summary`. Outer tuple `(refs, global_metadata)`.
+The file `summary` at the repository root. The outer tuple is
+`(refs, global_metadata)`.
 
-Field 0 `a(s(taya{sv}))` ref array holds the local refs (`refs/heads`), sorted
-by ref name with byte-wise comparison; remote refs are excluded. Each entry
-`(s, (t, ay, a{sv}))`:
+Field 0, `a(s(taya{sv}))`, is the ref array. It holds the local refs
+(`refs/heads`), sorted by ref name with byte-wise comparison. It holds no
+remote ref. Each entry is `(s, (t, ay, a{sv}))`:
 
 - `s` ref name.
-- `t` size of the commit object in bytes, written host-order (NOT
-  byte-swapped). This is the one asymmetry versus the big-endian timestamps.
-  The commit object is stored uncompressed, so this equals its on-disk length.
+- `t` size of the commit object in bytes, in host order, which is its on-disk
+  length.
 - `ay` commit checksum, 32 raw bytes.
 - `a{sv}` per-ref metadata, in insertion order: `ostree.commit.version` (`s`),
-  present only when the commit records a `version` metadata key, then
+  present only when the commit has a `version` metadata key, then
   `ostree.commit.timestamp` (`t`, big-endian), always present.
 
-Field 1 `a{sv}` global metadata, written in this insertion order (a key is
-absent when its condition does not hold; GVariant does not re-sort dicts, so
-insertion order is the on-disk order):
+Field 1, `a{sv}`, is the global metadata. GVariant does not sort a dict again,
+so the insertion order is the on-disk order. The writer writes the keys in
+this order, and a key is absent when its condition is false:
 
 - `ostree.summary.mode` -> `s`, the repository mode string (for example
   `archive-z2`, `bare`, `bare-user`).
 - `ostree.summary.last-modified` -> `t` big-endian, the generation time. It is
-  wall-clock and is NOT pinned by `SOURCE_DATE_EPOCH`.
+  wall-clock time, and `SOURCE_DATE_EPOCH` does not set it.
 - `ostree.summary.tombstone-commits` -> `b`, the `[core] tombstone-commits`
-  value (default false); always emitted.
-- `ostree.static-deltas` -> `a{sv}`: delta-name (`FROM-TO` or `TO`) -> `ay`
-  32-byte superblock digest. Present only when the repository has static deltas.
-  Observed here, between `tombstone-commits` and `indexed-deltas`, by running
-  `ostree summary -u` on a repository holding one from-scratch and one from-to
-  delta. Its order relative to `ostree.summary.collection-map` is not yet
-  observed, since that needs a collection repository carrying deltas. The map's
-  own entry order is a hash-table order. It follows the set of delta names and,
-  for some names, the order the writer read `deltas/`. It is not a sort, and it
-  is stable across runs over one tree. For some sets it comes out in name order
-  by chance, and the port's map then has the same order. Seven deltas into one target, made in three orders, gave three summary
-  orders, and removing two deltas swapped the relative order of two others. An
-  index file lists the same set in an order of its own. The port writes the
-  entries in name order in the summary and in each index file
-  (`conformance/cli-surface.md`, "P2", static-delta and summary). The digest is
-  the SHA-256 of the delta's `superblock` file, confirmed against `sha256sum`.
-  `ostree summary -u` does not write or refresh `delta-indexes/`, so a repository
-  can advertise deltas in its summary while serving no index at all.
+  value (default false). Always present.
+- `ostree.static-deltas` -> `a{sv}`: delta name (`FROM-TO` or `TO`, in hex) ->
+  `ay`, the SHA-256 of the `superblock` file of the delta (32 bytes). Present
+  only when the repository has static deltas. The port writes the entries in
+  name order (`conformance/cli-surface.md`, "P2", `summary`, records the order
+  of the tool). Observed behavior: the tool writes the key between
+  `tombstone-commits` and `indexed-deltas`. Not observed: the order of the key
+  relative to `ostree.summary.collection-map` in the tool.
 - `ostree.summary.collection-map` -> `a{sa(s(taya{sv}))}`, present only when
   the repository holds mirror refs (`refs/mirrors/<collection>/<ref>`). It maps
-  each collection id to a ref array shaped exactly like field 0. Both levels are
+  each collection id to a ref array with the shape of field 0. Both levels are
   byte-wise sorted.
 - `ostree.summary.indexed-deltas` -> `b`, the `[core] indexed-deltas` value
-  (default true); always emitted.
+  (default true). Always present.
 - `ostree.summary.collection-id` -> `s`, present only when
   `[core] collection-id` is set.
-- `ostree.summary.expires` -> `t` big-endian. Emitted only when an expiry is
-  requested.
+- `ostree.summary.expires` -> `t` big-endian, which the summary reports read.
+  The port's writer does not write it. A caller gives it with
+  `summary -m`, as a caller key. A caller value is stored in host order, so a
+  caller gives the byte-swapped number to store a big-endian value.
 
-Keys a caller adds with `summary -m` follow. A caller key that names a key the
-writer writes in the same run gives way to the writer's value: the four keys
-always written, and `ostree.static-deltas`, `ostree.summary.collection-map`, and
-`ostree.summary.collection-id` in a run that writes them. A caller key the
-writer does not write in the run is kept, whatever its name, and the empty key
-is kept too. A repeated caller key is stored once, with its last value. The
-value is the GVariant text form, stored in host order. The tool stores the whole
-dict in the order of a hash table once any caller key is present; the port keeps
-the order above and appends the caller keys in the order of their first
-occurrence (`conformance/cli-surface.md`, "summary"). In a repository with a
-collection id the tool also adds the caller keys to the anchor commit, and the
-port refuses them ("The `ostree-metadata` anchor commit" below).
+A regeneration of the summary does not write or refresh `delta-indexes/`
+("Static delta index files"). A repository can thus list deltas in its summary
+and serve no index.
 
-Endianness summary: all `t` timestamps and `expires` are big-endian; the
-per-ref commit-object size `t` is host-order.
+The keys that a caller adds with `summary -m` come after the keys of the
+writer. When the writer writes a key in the same run, its value has precedence
+over the caller value. These keys are the four keys that are always present,
+and `ostree.static-deltas`, `ostree.summary.collection-map`, and
+`ostree.summary.collection-id` in a run that writes them. The writer keeps each
+other caller key, whatever its name, and the empty key.
+
+A repeated caller key is stored once, with its last value. The value is the
+GVariant text form. The port appends the caller keys in the order of their
+first occurrence (`conformance/cli-surface.md`, "P2", `summary`, records the
+order of the tool).
+
+For a repository with a collection id, see "The `ostree-metadata` anchor
+commit".
 
 ### The `ostree-metadata` anchor commit
 
-When `[core] collection-id` is set, regenerating the summary first refreshes an
-anchor commit on `refs/heads/ostree-metadata`. The anchor is an empty-tree
-commit: root dirtree `6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d`
-(no entries) and root dirmeta
-`446a0ef11b7cc167f3b603e585c7eeeeb675faa412d5ec73f62988eb0b6c5488`
-(uid 0, gid 0, mode `040755`, no xattrs). Its metadata dict carries, in this
-order, `ostree.collection-binding` (`s`, the repository's collection id) and
-`ostree.ref-binding` (`as`, the single element `ostree-metadata`); subject and
-body are empty. The timestamp resolves like any commit (explicit,
-`SOURCE_DATE_EPOCH`, then the current time). Each regeneration commits a new
-anchor with the previous anchor as its parent, so the checksum advances on every
-run; the first generation on a fresh repository is parentless and reproducible.
-The anchor ref appears in field 0 by name like any other local ref.
+When `[core] collection-id` is set, a regeneration of the summary first
+refreshes an anchor commit on `refs/heads/ostree-metadata`. The anchor is an
+empty-tree commit:
 
-`summary -m` in the tool adds the caller keys to the anchor metadata too. The
-bindings win over a caller key of the same name, a repeated caller key takes
-its last value, and any other caller key is kept, `ostree.summary.mode` among
-them. With a caller key present, the tool stores the anchor dict in the order
-of a hash table, even for one key: `-m k=1` stores `ostree.collection-binding`,
-`k`, `ostree.ref-binding`, and `-m b=1 -m n=2` stores `n`, `b`,
-`ostree.collection-binding`, `ostree.ref-binding`. The anchor checksum follows
-that order. The port does not rebuild a hash-table order, so it refuses any
-caller key in a repository with a collection id, before the anchor advances
-and before any write (`conformance/cli-surface.md`, "summary").
+- Root dirtree
+  `6e340b9cffb37a989ca544e6bb780a2c78901d3fb33738768511a30617afa01d` (no
+  entries).
+- Root dirmeta
+  `446a0ef11b7cc167f3b603e585c7eeeeb675faa412d5ec73f62988eb0b6c5488` (uid 0,
+  gid 0, mode `040755`, no xattrs).
+- Metadata dict, in this order: `ostree.collection-binding` (`s`, the
+  collection id of the repository), then `ostree.ref-binding` (`as`, the
+  single element `ostree-metadata`).
+- Empty subject and body.
+
+The timestamp resolves as for any commit: the explicit value, then
+`SOURCE_DATE_EPOCH`, then the current time. Each regeneration commits a new
+anchor with the previous anchor as its parent, so the checksum changes on each
+run. The first generation on a new repository has no parent and is
+reproducible. The anchor ref is in field 0 by name, as any other local ref.
+
+The port adds no caller key to the anchor. In a repository with a collection
+id it refuses any caller key before the anchor advances and before any write
+(`conformance/cli-surface.md`, "P2", `summary`).
 
 ### Summary signature -- `a{sv}`
 
-File `summary.sig` at repo root, a bare `a{sv}` with the same signature keys as
-detached commit metadata. The signed payload is the exact byte content of the
-`summary` file. Regenerating the summary removes any existing `summary.sig`,
-since a new summary invalidates the old signature; a caller that wants a signed
-summary regenerates and then signs.
+The file `summary.sig` at the repository root, a bare `a{sv}` with the
+signature keys that "Signing details" lists. The signed payload is the exact
+byte content of the `summary` file. A regeneration of the summary removes
+`summary.sig`, because the old signature does not cover the new summary. A
+caller that wants a signed summary regenerates it and then signs it.
 
 `summary -u` writes its signatures after the regeneration: every `--gpg-sign`
 signature under `ostree.gpgsigs` first, then every `--sign` signature under
-`ostree.sign.<type>`, so a file holding both engines stores `ostree.gpgsigs`
-first whatever the command-line order. Inside each array the signatures follow
+`ostree.sign.<type>`. A file with both engines thus stores `ostree.gpgsigs`
+first, whatever the command-line order. In each array the signatures follow
 the command-line order, and a key given twice signs twice. A GPG signature
-carries its creation instant, so two runs of one GPG key write different bytes;
-two runs of one ed25519 key over one `summary` write the same bytes. The port
-makes every signature of the run and then replaces `summary.sig` in one write,
-so a signer that fails leaves `summary.sig` in the state the regeneration left.
+holds its creation instant, so two runs with one GPG key write different
+bytes. Two runs with one ed25519 key over one `summary` write the same bytes.
+
+The port makes every signature of the run and then replaces `summary.sig` in
+one write. A signer that fails thus leaves `summary.sig` in the state that the
+regeneration left.
 
 ## Checksum computation
 
-Object ID is SHA-256 over specific bytes, as a 64-char lowercase hex string.
+The object checksum is the SHA-256 of specific bytes, as a 64-character
+lowercase hex string.
 
-- Metadata objects (dirtree, dirmeta, commit, tombstone, commitmeta): hash the
-  canonical normal-form GVariant serialization bytes and nothing else.
-- File content objects: hash = SHA-256( uncompressed-file-header bytes ||
-  raw-payload bytes ). The header bytes fed to the hasher include the 4-byte BE
-  length prefix and 4-byte NUL padding produced by the length-prefix framing.
-  The payload is the uncompressed content. In archive mode the on-disk `.filez`
-  is compressed, so the stored bytes do not match the object name.
-- Symlinks: header carries the target in the `s` field, no payload; hash is the
-  framed header bytes.
+- Metadata objects (dirtree, dirmeta, commit): the hash of the canonical
+  normal-form GVariant serialization bytes and nothing else. A
+  `.tombstone-commit` and a `.commitmeta` take the checksum of their commit.
+- File content objects: SHA-256( uncompressed-file-header bytes ||
+  raw-payload bytes ). The header bytes include the 4-byte BE length prefix and
+  the 4-byte NUL padding of the framing. The payload is the uncompressed
+  content. In archive mode the `.filez` file is compressed, so its stored
+  bytes do not hash to the object name.
+- Symlinks: the header holds the target in the `s` field, and there is no
+  payload. The hash covers the framed header bytes.
 
-Checksum variants: one omits xattrs from the header; one zeroes uid/gid and
-canonicalizes mode (used for bare-user).
+The `bare-user-only` mode records a reduced header. The reduced header has
+uid 0, gid 0, and no xattrs. It reduces the permission bits of a regular file
+or directory to `perm & 0o755`. A symlink keeps its mode. The object checksum
+covers that reduced header. Each other mode hashes the header unchanged.
 
 The commit content checksum is SHA-256( root-dirtree-csum-binary ||
-root-dirmeta-csum-binary ): a content identity independent of commit metadata
-and timestamp.
+root-dirmeta-csum-binary ). It is a content identity that does not depend on
+the commit metadata or the timestamp.
 
-Representations: hex (64 chars), binary (32 bytes), GVariant `ay` (32-element),
-and modified-base64 (standard base64 with `/` replaced by `_` and trailing `=`
-dropped, 43 chars) used only for static-delta directory names.
+A checksum has four representations: hex (64 characters), binary (32 bytes),
+GVariant `ay` (32 elements), and modified base64. Modified base64 is standard
+base64 with `_` in place of `/` and without the trailing `=`, 43 characters.
+Only the static-delta directory names use modified base64.
 
-Base64 decoding of a checksum is strict and per-alphabet, so each digest has
-exactly one accepted spelling: the length is exact (44 characters ending in one
-`=` for the standard form, 43 for the modified form), the `/` and `_` glyphs at
-index 63 are accepted only for their own alphabet, and the two unused low bits
-of the final significant sextet must be zero.
+The port decodes a base64 checksum strictly and per alphabet, so each digest
+has exactly one accepted spelling:
+
+- The length is exact: 44 characters that end in one `=` for the standard
+  form, 43 for the modified form.
+- The `/` glyph and the `_` glyph at index 63 are valid only in their own
+  alphabet.
+- The two unused low bits of the last significant sextet must be zero.
 
 ## Repository modes and on-disk storage
 
@@ -442,37 +463,32 @@ Mode strings: `bare`, `bare-user`, `bare-user-only`, `archive-z2` (alias
 `archive`), `bare-split-xattrs`, and the port extension `bare-user-shared`.
 ARCHIVE always serializes back as `archive-z2`.
 
-- bare: real files, real uid/gid/mode/xattrs on the inode; root-only for
-  faithful writes; checkout hardlinks directly.
-- bare-user: metadata in `user.ostreemeta` xattr; inode is root-owned with mode
-  forced to `(mode & (S_IFREG|0775)) | S_IRUSR`; symlinks stored as regular
-  files; writable unprivileged.
-- bare-user-only: no xattr metadata; uid/gid discarded (read back as 0);
-  canonical mode on the inode, regular-file bits limited to 0775; works on
-  filesystems without xattr support; user-checkout only.
-- bare-split-xattrs: bare inode storage (a regular file's payload on the inode,
-  the logical uid/gid/mode on the inode, symlinks as real symlinks, no
-  `user.ostreemeta`) with the logical xattrs relocated to separate objects. The
-  inode carries no xattrs; the set lives in a `.file-xattrs` object reached
-  through a `.file-xattrs-link` object keyed by the `.file` checksum. The tool
-  reads this mode fully; its write support is experimental, gated, and
-  incomplete. The port reads this mode and does not write it. Recovered shape
-  is in the dedicated section below.
-- archive (archive-z2): content zlib-RAW-compressed as `.filez`; header holds
-  uid/gid/mode/xattrs; object file itself is chmod 0644; HTTP-servable;
-  never hardlinked on checkout.
-- bare-user-shared (port extension, development-only): `bare-user` storage
-  with a fixed inode mode 0644, for group-shared repositories. See the
-  dedicated section at the end.
+- `bare`: real files with the logical uid, gid, mode, and xattrs on the inode.
+  A write that puts the logical uid and gid on the inode needs root.
+- `bare-user`: the logical metadata is in the `user.ostreemeta` xattr, and a
+  symlink is stored as a regular file. An unprivileged user can write it.
+- `bare-user-only`: no xattr metadata. The uid and gid are discarded and read
+  back as 0, and the checksum has its own variant ("Checksum computation"). It
+  works on a filesystem without xattr support.
+- `bare-split-xattrs`: bare inode storage, with the xattrs in separate objects.
+  "bare-split-xattrs mode" states which implementation reads and writes it.
+- `archive` (`archive-z2`): content raw-DEFLATE-compressed as `.filez`, with
+  uid, gid, mode, and xattrs in the header. An HTTP server can serve it. A
+  checkout never hardlinks its objects.
+- `bare-user-shared`: a development-only port extension. It is `bare-user`
+  storage with a fixed inode mode 0644, for group-shared repositories
+  ("bare-user-shared mode").
+
+"Write path: loose-object inode modes and durability" states the inode mode
+and the owner in each mode. `conformance/cli-behavior.md`, "Checkout",
+"Hardlink and copy", states when a checkout hardlinks an object.
 
 Metadata objects are always stored uncompressed. The `z` suffix applies only to
-a `File` content object in archive mode (`.filez`). The auxiliary non-meta
-objects (`.payload-link`, `.file-xattrs`, `.file-xattrs-link`) are stored
-uncompressed and never carry it. Observed by driving the tool as a black box:
-an archive repo populated by commit, and by `pull-local` from bare and archive
-sources, holds only `.filez` content objects alongside uncompressed metadata;
-`.file-xattrs`/`.file-xattrs-link` belong to `bare-split-xattrs` mode, into
-which the tool refuses every write ("Not allowed due to repo mode").
+a `File` content object in archive mode (`.filez`). The auxiliary objects
+(`.payload-link`, `.file-xattrs`, `.file-xattrs-link`) are stored uncompressed
+and never take the suffix. Observed behavior: an archive repository that
+`commit` fills, and that `pull-local` fills from bare and archive sources,
+holds only `.filez` content objects and uncompressed metadata.
 
 ## Object store layout
 
@@ -484,7 +500,7 @@ which the tool refuses every write ("Not allowed due to repo mode").
   objects/<c0c1>/<c2..c63>.<ext>[z]   loose objects
   refs/heads/<ref>                local refs (ref may contain '/')
   refs/remotes/<remote>/<ref>     remote refs
-  refs/mirrors/<collection>/<ref> collection refs (lazy)
+  refs/mirrors/<collection>/<ref> collection refs (<collection>/ lazy)
   state/<checksum>.commitpartial  incomplete-commit markers
   tmp/                            staging (staging-<bootid>-XXXXXX + -lock), cache/
   tmp/.ostrya-ref-<pid>-<n>-XXXXXX  port temp entry of a ref or alias write
@@ -498,2440 +514,968 @@ which the tool refuses every write ("Not allowed due to repo mode").
   summary.sig                     (lazy)
 ```
 
-Loose object path: `objects/<first 2 hex>/<remaining 62 hex>.<typestr>` with a
-trailing `z` only on a `File` content object in archive mode. Checksum must be
-exactly 64 hex chars.
+Loose object path: `objects/<first 2 hex>/<remaining 62 hex>.<typestr>`, with
+the `z` suffix that "Repository modes and on-disk storage" states. The checksum
+must be exactly 64 hex characters.
 
-Ref file format: 64 lowercase hex chars plus a single `\n` (65 bytes). A NULL rev deletes;
-an alias is written as a relative symlink. Refspec `remote:ref` maps to
-`refs/remotes/remote/ref`; a bare `ref` maps to `refs/heads/ref`. Every ref is
-an individual loose file; there is no packed-refs mechanism.
+### Ref files
 
-Ref name validation. A ref name is one or more `/`-separated components. Each
-component is non-empty, does not begin with `-` or `.`, and holds only
-ASCII alphanumerics, `-`, `.`, `_`, and the non-ASCII characters that this
-paragraph states. One optional `:`
-separates a remote name from the ref name, and a second `:` is invalid.
-Recovered by feeding `ostree rev-parse` one candidate name per ASCII
-punctuation character: the tool accepts `a-b`, `a.b`, `a_b`, `a..b`, `a.`,
-`0ab`, and `té`, and rejects each of ``! " # $ % & ' ( ) * + , ; < = > ? @ [ \ ]
-^ ` { | } ~`` and space in a component, `-a` and `.a` and `~a` and `+a` at the
-start of one, an empty component (`a//b`, `/a`, `a/`), and `a:b:c`, each with
-`error: Invalid refspec <name>` and exit 1. The remote follows the rule of a
-component: `o r:main`, `o*:main`, `-o:main`, `.o:main`, and `o~:main` are
-refused, and `é:main`, `o.:main`, and `_o:main` are accepted. The remote is one
-component, so `a/b:x` is refused too. The port applies the same rule to the
-remote and to the name part of every ref name and refspec, and refuses an empty
-name and a name part with a `:`. The collection id is one component that is
-not empty, is not `.` or `..`, and holds no `/` and no NUL.
+A ref file holds 64 lowercase hex characters and a single `\n` (65 bytes). Each
+ref is an individual loose file, and the format has no packed-refs mechanism.
+The refspec `remote:ref` maps to `refs/remotes/remote/ref`, and a bare `ref`
+maps to `refs/heads/ref`. A NULL rev deletes the ref. An alias is a relative
+symlink.
 
-The non-ASCII part of the rule was recovered by feeding `ostree refs
---create=NAME` a name with one character, for each non-ASCII character for
-which Rust `char::is_alphanumeric` is true. The tool accepts letters, numbers,
-and nonspacing combining marks (Unicode category Mn), and non-ASCII connector
-punctuation (category Pc). It refuses controls, spaces, format characters,
-symbols, other punctuation, private use characters, `U+FFFD`, emoji, spacing
-combining marks (category Mc), enclosing marks (category Me), circled and
-enclosed letters, and characters that its Unicode tables do not hold.
+Both implementations write the 64 lowercase hex characters, and the port reads a
+ref file in either case. Only an out-of-band write puts other content in a ref
+file. `conformance/cli-surface.md`, "P1", records how the tool reads it, and
+"P2" records the same reader at `commit --parent`.
+
+A write of a ref whose file is an alias symlink replaces the symlink with a
+regular ref file, and the alias target stays unchanged. Both implementations
+rename a new temp file over the ref name, and the rename replaces the symlink at
+that name. Example: `refs/heads/foo` is a relative symlink to the sibling `bar`.
+A commit onto `foo`, or `ostree refs --create --force` on it, makes
+`refs/heads/foo` a 65-byte regular file that holds the new checksum.
+`refs/heads/bar` keeps its old checksum.
+
+### Ref name validation
+
+A ref name is one or more `/`-separated components. A component is not empty and
+does not begin with `-` or `.`. It holds only ASCII alphanumerics, `-`, `.`,
+`_`, and the non-ASCII characters that this section states. One optional `:`
+separates a remote name from the ref name, and a second `:` is invalid. The
+remote is one component and follows the rule of a component.
+
+The tool accepts `a-b`, `a.b`, `a_b`, `a..b`, `a.`, `0ab`, and `té`, and the
+remotes of `é:main`, `o.:main`, and `_o:main`. It refuses these names with
+`error: Invalid refspec <name>` and exit 1:
+
+- a component that holds a space or one of
+  ``! " # $ % & ' ( ) * + , ; < = > ? @ [ \ ] ^ ` { | } ~``;
+- a component that starts with `-`, `.`, `~`, or `+`: `-a`, `.a`, `~a`, `+a`;
+- an empty component (`a//b`, `/a`, `a/`), and a second `:` (`a:b:c`);
+- the remotes of `o r:main`, `o*:main`, `-o:main`, `.o:main`, `o~:main`, and
+  `a/b:x`.
+
+The port applies the same rule to the remote and to the name part of every ref
+name and refspec. It refuses an empty name and a name part with a `:`. The ref
+store takes a collection id that is one path component. The id is not empty, is
+neither `.` nor `..`, and holds no `/` and no NUL. `refs -c --create` first
+applies the collection-id rule of the tool, which is stricter
+(`conformance/cli-behavior.md`, "CLI output formats", `refs`).
+
+For non-ASCII characters, the tool accepts letters, numbers, nonspacing
+combining marks (Unicode category Mn), and non-ASCII connector punctuation
+(category Pc). It refuses controls, spaces, format characters, symbols, other
+punctuation, private use characters, `U+FFFD`, and emoji. It also refuses
+spacing combining marks (category Mc), enclosing marks (category Me), circled
+and enclosed letters, and characters that its Unicode tables do not hold.
 `U+00E9`, `U+00B5`, `U+02D0`, `U+4E2D`, `U+00B2`, `U+2160`, `U+0660`, `U+00AA`,
 `U+00BA`, and `U+00BC` are accepted. `U+0080`, `U+0085`, `U+00A0`, `U+00AD`,
 `U+00D7`, `U+2013`, `U+200B`, `U+20AC`, `U+FEFF`, `U+E000`, `U+1F600`, and
-`U+FFFD` are refused. The port accepts a non-ASCII character if
-`char::is_alphanumeric` is true for it and it is not one of the 571 such
-characters that the tool refuses, which are spacing combining marks, circled
-and enclosed letters, and letters that the tool does not know. The port
-refuses each other non-ASCII character, so it also refuses the characters of
-category Mn and category Pc that the tool accepts. Every name that the port
-accepts is a name that the tool accepts. The port reads a name as UTF-8. The
-tool refuses an argument that is not valid UTF-8 with exit 1 and writes no ref.
-The port refuses it at the decoding of the arguments, with exit 1 and no ref.
+`U+FFFD` are refused.
 
-Both implementations report a name they refuse as `error: Invalid refspec
-<refspec>` and exit 1, wherever the name is taken: a revision, a NEWREF, or the
-`-b` branch of a commit. The refspec is reported as given, holding the
-`<remote>:` or `<collection-id>:` prefix and dropping a trailing run of `^`, so
-`rev-parse a/../b^` and `rev-parse a/../b` report the same line. The target of
-`refs -A --create` is the one site the rule does not report at, an existence
-check standing ahead of it there, so a refused name is reported as a name no ref
-holds, in the words "refs" below states.
+The port accepts a non-ASCII character if `char::is_alphanumeric` is true for
+it, except for 571 of these characters. The 571 characters are spacing combining
+marks, circled and enclosed letters, and letters outside the Unicode tables of
+the tool. The port refuses each other non-ASCII character
+(`conformance/cli-surface.md`, "P1", records the characters that the tool
+accepts and the port refuses). The port reads a name as UTF-8. Both
+implementations refuse an argument that is not valid UTF-8 with exit 1 and write
+no ref. The port refuses it when it decodes the arguments.
 
-A ref name that passes the rule also names a path below `refs/`, and that path
-is opened where the name is resolved or written. A path running through a ref
-file ends the invocation with exit 1 in both implementations, and neither writes
-a ref: `rev-parse <name>`, `cat <name> PATH`, the positional revision of `refs
---create`, `refs --create=<name>`, and `refs -A --create=<name>`. The tool names
-the path below the repository and the syscall -- `error:
-openat(refs/heads/plain/x): Not a directory` for the name `plain/x` over the ref
-`plain`, the same line for a name reaching the ref file through an alias
-symlink, and `error: openat(refs/remotes/origin/rr/x/y): Not a directory` for
-`origin:rr/x/y` over the remote ref `origin:rr/x`. Under `-c
---create=<id>:<ref>` the existence check reads the absent
-`refs/remotes/<id>/<ref>` and the write reaches the mirror path, so the tool
-reports `error: open(O_TMPFILE): Not a directory` and names no path. The port
-reports `error: i/o error: Not a directory (os error 20)` at every one of those
-sites, the one message it gives that condition. The target of `refs -A --create`
-is answered by the existence check ahead of the rule, so the tool reports the
-target as a name no ref holds there and the port reports its own `Not a
-directory` line (`conformance/cli-surface.md`, "P1").
+Both implementations report a refused name as `error: Invalid refspec <refspec>`
+and exit 1. This applies at each site that takes a name: a revision, a NEWREF,
+and the `-b` branch of a commit. The message holds the refspec as given, with
+its `<remote>:` or `<collection-id>:` prefix, and without a trailing run of `^`.
+So `rev-parse a/../b^` and `rev-parse a/../b` report the same line. At the
+target of `refs -A --create`, an existence check comes before the rule. There a
+refused name is reported as a name that no ref holds
+(`conformance/cli-behavior.md`, "CLI output formats", `refs`).
 
-A ref name that names a directory under `refs/` is refused at those same sites in
-the port, with `error: i/o error: Is a directory (os error 21)`. The tool refuses
-it where the name is resolved and where `-A --create` writes a link, in three
-messages of its own, and its plain `--create` refuses a directory under
-`refs/heads` that holds a ref below the name: `refs --create=deep plain` over the
-ref `deep/nest/ing` reports `error: Conflict: nest/ing exists under deep when
-attempting write`, with `--force` and without it
-(`conformance/cli-surface.md`, "P1"). Where that scan reaches no ref below the
-name, the tool's write replaces the directory, removes what stood below it, and
-exits 0 printing nothing. Four shapes take that path:
+A name that passes the rule also names a path below `refs/`. An implementation
+opens that path where it resolves or writes the name: `rev-parse <name>`, `cat
+<name> PATH`, the positional revision of `refs --create`, `refs
+--create=<name>`, and `refs -A --create=<name>`. If the path runs through a ref
+file, both implementations exit 1 and write no ref. The port reports `error: i/o
+error: Not a directory (os error 20)` at each site. If the name names a
+directory under `refs/`, the port refuses it at each site with `error: i/o
+error: Is a directory (os error 21)` and writes nothing.
 
-- an empty directory, which `refs --delete` leaves behind in both implementations
-  when it removes a directory's last ref, so `refs --delete deep/nest/ing` and
-  then `refs --create=deep/nest plain` writes the ref file over
-  `refs/heads/deep/nest`;
-- a directory holding directories alone, so after that same delete
-  `refs --create=deep plain` replaces `deep` and removes `nest`;
-- any directory under `refs/remotes`, so `refs --create=origin:rr plain` over the
-  refs `origin:rr/x` and `origin:rr/deep/y` leaves the ref file
-  `refs/remotes/origin/rr` alone in their place;
-- any directory under `refs/mirrors`, which `-c --create=<id>:<name>` reaches the
-  same way.
+`refs --delete` leaves an empty directory behind in both implementations when it
+removes the last ref of a directory. `conformance/cli-surface.md`, "P1", records
+the messages of the tool, and the four directory shapes that the write of the
+tool replaces. The `PREFIX` form of the path rule is in
+`conformance/cli-behavior.md`, "CLI output formats", `refs`.
 
-The port refuses all four and writes nothing. A directory named as the target of
-`refs -A --create` reaches the same existence check, so the tool reports the
-target as a name no ref holds and the port reports its `Is a directory` line
-(`conformance/cli-surface.md`, "P1"). The `PREFIX` form of the path rule is under
-"CLI output formats", "refs".
+### Revision syntax
 
-An empty revision is the zero-length case of the abbreviated-checksum scan
-below: every commit object carries the empty prefix. The tool resolves it to
-the repository's one commit where exactly one commit exists, reports
-`error: Refspec  not unique` where more than one does, and falls through to the
-ref store in a repository holding no commit, where the empty name fails the
-refspec rule and reports `error: Invalid refspec `. The count is of commits and
-not of refs, recovered by resolving the empty revision in a repository holding
-three refs and one commit, which resolves, and in one holding one ref and two
-commits, which reports the not-unique line. The port refuses the empty name in
-every repository (`conformance/cli-surface.md`, "P1 -- reading and resolution").
+A revision names a commit in four ways:
 
-Revision syntax. A revision names a commit four ways: a 64-character lowercase
-hex checksum, an abbreviated checksum, a refspec, or any of those followed by
-one or more `^` characters, each stepping one generation back along the
-commit's `parent` field. `~N` and `^N` are not revision syntax: `ostree
-rev-parse test/main~1` and `test/main^2` each report `error: Invalid refspec
-<rev>`. The ref-name rule refuses `~` and `^` inside a name, so the port
-reads the whole revision as a refspec and reports the same line, wherever a
-revision is taken: `rev-parse`, `cat`, and the positional of `refs --create`. A
-checksum carrying either suffix takes that same path, the name holding more
-than 64 characters. Both implementations exit 1 and write nothing. Walking past
-a root commit reports
-`error: Commit <checksum> has no parent` and exits 1.
+- a 64-character lowercase hex checksum;
+- an abbreviated checksum ("Abbreviated checksums");
+- a refspec;
+- one of these three, followed by one or more `^` characters.
 
-An abbreviated checksum is a run of one to 63 lowercase hex characters, and it
-names the one commit object whose checksum starts with it. Both implementations
-resolve one, under one rule:
+Each `^` steps one generation back along the `parent` field of the commit. A
+walk past a root commit reports `error: Commit <checksum> has no parent` and
+exits 1.
 
-- the match set holds commit objects alone. A prefix carried by a dirtree, a
-  dirmeta, or a file object and by no commit matches nothing and takes the
-  refspec path, and such an object sharing a prefix with a commit leaves that
-  commit's prefix resolvable (recovered by resolving the prefixes of every loose
-  object in a two-commit `archive` repository, and again over the `file` objects
-  of a `bare-user` one);
-- exactly one commit matching resolves to it, at any length from one character up
-  to 63;
-- the tool takes the zero-length prefix through the same scan, so an empty
-  revision resolves where the repository holds one commit. The port's rule
-  starts at one character and refuses the empty name in every repository, the
-  divergence the paragraph above records;
-- more than one commit matching reports `error: Refspec <prefix> not unique` at
-  exit 1, the prefix unquoted, and resolves to nothing thereafter -- the failure
-  stands wherever the revision was taken, `commit -b` included, and a following
-  `^` reports it too, nothing having resolved to walk back from;
-- the scan stands ahead of the ref store. A name the store carries as a ref
-  resolves to the commit it prefixes rather than to that ref's own target, so a
-  branch whose name prefixes a commit is unreachable by name as a revision, and
-  the ambiguous case stops there as well rather than falling back to the ref;
-- a prefix no commit carries falls through to the ref store, so a hex name is an
-  ordinary ref name for as long as no commit begins with it. `refs
-  --create=dddd <rev>` writes such a ref and `rev-parse dddd` reads it back;
-- the case rule of a full checksum holds: one uppercase character makes the name
-  a refspec, so `rev-parse <UPPER-PREFIX>` reports the not-found line;
-- the existence check of `refs --create=NEWREF` resolves NEWREF, so a NEWREF
-  prefixing a commit reports `error: --create specified but ref <NEWREF> already
-  exists`, the line a 64-character NEWREF draws below;
-- `refs -A --create` takes a ref name and not a revision, so a prefix there
-  reports `error: Cannot create alias to non-existent ref: <prefix>`, and a
-  `PREFIX` argument is matched rather than resolved.
+`~N` and `^N` are not revision syntax. `ostree rev-parse test/main~1` and
+`test/main^2` each report `error: Invalid refspec <rev>`. The ref-name rule
+refuses `~` and `^` inside a name, so the port reads the whole revision as a
+refspec and reports the same line. This applies at `rev-parse`, at `cat`, and at
+the positional of `refs --create`. A checksum with either suffix takes the same
+path, because the name holds more than 64 characters. Both implementations exit
+1 and write nothing.
 
-The branch-name guard below does not reach this shape: both implementations write
-a branch whose name prefixes a commit, leaving a ref no revision reaches, where
-they refuse a name of 64 lowercase hex characters outright. What a hex name
-shadows depends on the commits the store holds at the time, so the guard would
-refuse a name that is free today and shadowed after the next commit.
-
-The consequence at `commit -b BRANCH` is the parenting rule below: the implicit
-parent is what BRANCH resolves to as a revision, so a BRANCH naming no ref and
-prefixing a commit parents the new commit on that commit, and a further commit on
-that branch parents on it again rather than on the tip the ref file holds.
-
-The case of those 64 characters is part of the rule: a name is a checksum in
-lowercase hex alone, and one uppercase character makes it a ref name. Both
-implementations therefore report `error: Refspec '<rev>' not found` for
+The case of the 64 characters is part of the rule. A name is a checksum in
+lowercase hex alone, and one uppercase character makes it a ref name. So both
+implementations report `error: Refspec '<rev>' not found` for
 `rev-parse <UPPER>`, `cat <UPPER> PATH`, `checkout <UPPER> DEST`, and
-`rev-parse <UPPER>^`, where the same 64 characters in lowercase resolve, and a
-name holding one raised character reads as the uppercase one does. The split runs
-wherever a 64-character name is taken:
+`rev-parse <UPPER>^`, where the same 64 characters in lowercase resolve. A name
+that holds one uppercase character reads as the all-uppercase name does. The
+positional revision of `refs --create` reports the same not-found line, so
+`refs --create=fresh <UPPER>` writes nothing. Three sites of `refs` apply the
+case rule in their own way:
 
-- the positional revision of `refs --create` reports the not-found line, so
-  `refs --create=fresh <UPPER>` writes nothing;
-- the existence check of `refs --create=NEWREF` resolves NEWREF, so a NEWREF of
-  64 lowercase hex characters is a checksum and reports `error: --create
-  specified but ref <NEWREF> already exists` whether or not the store holds that
-  commit, and an uppercase NEWREF is a free ref name whose write lands at
-  `refs/heads/<NEWREF>`. A revision of that name then resolves through the ref
-  file, `refs -A --create` records an alias to it, and `refs --delete` guards it
-  under the name the alias body carries;
-- `refs -A --create` holds a lowercase name to name no ref, reporting `error:
-  Cannot create alias to non-existent ref: <rev>`;
-- a `PREFIX` is matched and not resolved, so neither case matches a ref there;
-- `commit -b` refuses a branch name of 64 lowercase hex characters with `error:
-  Rev name '<name>' looks like a checksum`, naming the branch as given. The rule
-  guards the one name this case rule shadows: a ref of that shape is read as a
-  checksum wherever a revision is taken, so no revision reaches the commit
-  behind it. Every other name of that length is written -- one character short
-  or long, one outside the hex class, an uppercase rendering, and one holding a
-  single raised character. The refusal runs at the ref write, so a fault ahead of
-  it is reported instead: an unresolvable `--parent` and a tree path that does
-  not open each end the invocation first, in each implementation's own words
-  (`conformance/cli-surface.md`, "P2"). `--orphan` leaves the refusal standing in
-  both implementations, since `-b` writes the ref under it too.
+- The existence check of `refs --create=NEWREF` resolves NEWREF. A NEWREF of 64
+  lowercase hex characters is a checksum and reports `error: --create specified
+  but ref <NEWREF> already exists`, whether or not the store holds that commit.
+  A NEWREF that prefixes a commit reports the same line. An uppercase NEWREF is
+  a free ref name, and the write lands at `refs/heads/<NEWREF>`. A revision of
+  that name then resolves through the ref file. `refs -A --create` records an
+  alias to it, and `refs --delete` guards it under the name that the alias body
+  holds.
+- `refs -A --create` takes a ref name. A lowercase 64-character target reports
+  `error: Cannot create alias to non-existent ref: <rev>`, and a hex prefix
+  reports `error: Cannot create alias to non-existent ref: <prefix>`.
+- A `PREFIX` argument is matched and not resolved, so neither case of a
+  64-character name matches a ref there.
 
-The revision syntax shadows two branch-name shapes. Beside the checksum shape
-above stands a name ending in `^`, which resolution reads as ancestry, so no
-revision reaches the commit a ref of that name holds. The ref-name rule refuses
-every name that holds a `^`. The port refuses the name with `error: Invalid
-refspec <name>`, the message it gives that same shape at `refs --create`, at
-the step the checksum guard runs at: the ref write, after the tree is read, so
-an error of the tree, such as a path that does not open, can come first. A
-branch name the ref-name rule refuses is not read as the implicit parent, so
-the refusal comes after the commit is written, and the port aborts the
-transaction. The tool refuses it a step earlier, reading the branch name as a
-revision before it commits the tree, and reports what that walk found. Three
-outcomes follow from the base the suffix names:
+A revision resolves whether or not the store holds the commit that it names. An
+absent commit is reported where the commit is read: at `cat`, `checkout`, and
+`export`. A revision with a `^` suffix also reads it, because the walk loads the
+base commit. Both implementations exit 1 and write nothing there, and
+`conformance/cli-surface.md`, "P1", records the two messages.
 
-- a base resolving to a commit that has a parent: `error: Invalid refspec
-  <name>`, exit 1, which is the port's own line;
-- a base resolving to a root commit: `error: Commit <checksum> has no parent`,
-  exit 1;
-- a base naming no ref: the tool dies on a signal
-  (`conformance/cli-surface.md`, "P2").
+These sites take a checksum, do not read the commit, and accept an absent one
+at exit 0:
 
-An empty base is the zero-length case of the abbreviated-checksum scan, and the
-count that decides it is of commits. Against a repository holding no commit the
-empty name reaches the ref store, fails the refspec rule, and `-b '^'` reports
-`error: Invalid refspec `, naming the empty base. Against one holding a single
-commit the base resolves to that commit, a root commit, so the trailing `^`
-walks past it and `-b '^'` reports the walk's own line. Since the tool reads
-the name before the tree, a tree path that does not open is reported by the
-port and reached by the tool only after the name it already refused, and
-neither implementation publishes an object for the refusal, where the checksum
-guard leaves the tool's tree and commit objects in `objects/`.
-Both implementations refuse `a^b` as a ref name whatever the store holds, and
+- `rev-parse <checksum>` prints it.
+- The positional revision of `refs --create` writes a ref file that holds it.
+- `commit --parent=<checksum>` writes a commit that names it.
+
+So a ref that points at an absent commit can come from either CLI. A revision
+read through that ref reports the same two messages.
+
+### Abbreviated checksums
+
+An abbreviated checksum is a run of one to 63 lowercase hex characters. It names
+the one commit object whose checksum starts with it. Both implementations
+resolve it by one rule:
+
+- The match set holds commit objects alone. A prefix that only a dirtree, a
+  dirmeta, or a file object carries matches nothing and takes the refspec path.
+  Such an object does not stop a commit with the same prefix from resolving.
+- If exactly one commit matches, the prefix resolves to it, at each length from
+  one character to 63.
+- If more than one commit matches, the prefix reports `error: Refspec <prefix>
+  not unique` at exit 1, with the prefix unquoted. The failure stands at each
+  site that takes the revision, `commit -b` included. A following `^` reports
+  the same line, because nothing resolved to walk back from.
+- The scan comes before the ref store. A ref name that prefixes a commit
+  resolves to that commit, and the target of the ref is not read. The ambiguous
+  case also stops at the scan.
+- A prefix that no commit carries goes to the ref store. So a hex name is an
+  ordinary ref name while no commit begins with it. `refs --create=dddd <rev>`
+  writes such a ref, and `rev-parse dddd` reads it back.
+- One uppercase character makes the name a refspec, so `rev-parse
+  <UPPER-PREFIX>` reports the not-found line.
+
+The rule starts at one character. The port refuses the empty name in every
+repository with `error: Invalid refspec ` (`conformance/cli-surface.md`, "P1",
+records how the tool reads an empty revision).
+
+### Branch names no revision reaches
+
+`commit -b` refuses a branch name of 64 lowercase hex characters with `error:
+Rev name '<name>' looks like a checksum`, and names the branch as given. Each
+site that takes a revision reads a ref of that shape as a checksum, so no
+revision reaches the commit behind it. The guard refuses this one shape. A name
+one character shorter or longer is written. A name of that length with a
+character outside the hex class, in uppercase, or with a single uppercase
+character is written too.
+
+The refusal runs at the ref write, so a fault before it is reported first. An
+unresolvable `--parent` and a tree path that does not open each end the
+invocation, in the words of each implementation (`conformance/cli-surface.md`,
+"P2"). `--orphan` keeps the refusal in both implementations, because `-b` also
+writes the ref under it.
+
+Both implementations write a branch whose name prefixes a commit, and no
+revision reaches that ref. The guard does not cover this shape, because what a
+hex name hides depends on the commits that the store holds at that time. A guard
+for this shape must refuse a name that is free now, because the next commit can
+hide it. The implicit parent of `commit -b BRANCH` is what BRANCH resolves to as
+a revision. So each commit onto such a branch takes the prefixed commit as its
+parent (`conformance/cli-behavior.md`, "CLI output formats", `commit`, "The
+parent").
+
+A branch name that ends in `^` is the second hidden shape. Resolution reads the
+suffix as ancestry, so no revision reaches the commit that a ref of that name
+holds. The ref-name rule refuses every name that holds a `^`. Both
+implementations refuse `a^b` as a ref name, whatever the store holds, and
 report `error: Invalid refspec a^b`.
 
+The port refuses a branch name that ends in `^` with `error: Invalid refspec
+<name>`, the message it gives that shape at `refs --create`. It refuses at the
+ref write, after it reads the tree. So a tree error, such as a path that does
+not open, can come first. A branch name that the rule refuses is not read as
+the implicit parent. The port thus refuses the name after it writes the commit,
+and it aborts the transaction (`conformance/cli-surface.md`, "P2", `commit`,
+records the order of the tool).
+
 A push guards the checksum shape at each site where it writes a commit to a
-target ref. `push` refuses a `DST` of that shape after a `SRC` with `error:
-Invalid refspec <name>` before the transport starts, and `push-tree -b` refuses
-it with the `commit -b` message above. In the library, `Repo::push`,
-`Repo::export_stream`, and `push_tree` refuse the name before they send a byte,
-and the receiver of a push session or of a one-way stream refuses an update
-that writes a commit to it at `Commit` with the wire error `invalid-ref`.
+target ref:
+
+- `push` refuses a `DST` of that shape after a `SRC` with `error: Invalid
+  refspec <name>` before the transport starts.
+- `push-tree -b` refuses it with `error: Rev name '<name>' looks like a
+  checksum`.
+- In the library, `Repo::push`, `Repo::export_stream`, and `push_tree` refuse
+  the name before they send a byte.
+- The server of a push session or of a one-way stream refuses an update that
+  writes a commit to such a ref at `Commit` ("Commit and CommitReply").
+
 `Hello` names the refs of a session and does not tell a write from a delete, so
-the receiver does not check the shape at `Hello`. A push delete (`:<name>`) of
-a ref of that shape passes the client and the receiver, and the receiver
-removes the ref where its rule allows the delete. A remote ref `REMOTE:<name>`
+the server does not check the shape at `Hello`. The client passes a push delete
+(`:<name>`) of a ref of that shape. Check 1 of "Commit and CommitReply" states
+the server side. A remote ref `REMOTE:<name>`
 is not 64 characters, so a revision reads it as a refspec, and each push site
 takes it. Ref reads, local ref deletes, pull, and prune do not apply the guard.
 
-A ref of either refused shape can arrive in these ways:
+A ref of either hidden shape can arrive in these ways:
 
 - a direct ref write of the library: `Transaction::set_ref` and
   `Repo::set_ref_immediate` write both shapes;
-- a pull of every ref of a source that holds a ref of the checksum shape: the
-  port copies the ref, as the next paragraph records;
+- a pull of every ref of a source that holds a ref of the checksum shape, which
+  the port copies (`conformance/cli-surface.md`, "P2");
 - an out-of-band write into `refs/`.
 
-Where a checksum-shaped one stands, the tool's listings enumerate it, its `fsck`
-validates it, and its `prune --refs-only` reads the commit that ref holds as
-reachable and keeps it, while its `pull-local` over that source reads the ref
-name as a checksum and reports `error: Importing <name>.commit: linkat: No such
-file or directory`, where the port copies the ref. Where an ancestry-shaped one
-stands, the tool's ref enumeration skips it without a word, so `refs` prints
-nothing and `prune --refs-only` reads the commit as unreachable and deletes it,
-leaving the ref file over an absent object; the port enumerates the name. That
-is the same destructive class that a name outside the ref-name rule carries
-(`conformance/cli-surface.md`, "P1").
+Over a ref of the checksum shape, the tool lists the ref and its `fsck`
+validates it. Its `prune --refs-only` reads the commit of the ref as reachable
+and keeps it. The port enumerates a ref of either shape.
+`conformance/cli-surface.md`, "P1", records how the tool lists, checks, and
+prunes a ref of the ancestry shape.
 
-Ref file content is read by a parser that takes either case. Both
-implementations write the 64 lowercase hex characters, and the tool refuses a
-file holding any other rendering with `error: Invalid character '<byte>' in rev
-'<content>'`, naming the first character it refuses by byte value, where the
-port's reader resolves it (`conformance/cli-surface.md`, "P1"). Only an
-out-of-band write puts such content in a ref file. The tool's `commit --parent`
-reads its value with that same parser, so `--parent=<UPPER>` reports that line
-where the port reads the value as a revision and reports the ref as missing
-(`conformance/cli-surface.md`, "P2").
+### Ref durability
 
-A revision resolves whether or not the commit it names is in the store, so an
-absent commit is reported where the commit is read. The tool names the loose
-object file it looked for, `error: No such metadata object <checksum>.commit`,
-and the port names the object type the library looked up, `error: object not
-found: Commit <checksum>`; both exit 1 and write nothing
-(`conformance/cli-surface.md`, "P1"). The sites that read the commit are `cat`,
-`checkout`, and `export`, and a revision carrying a `^` suffix, whose walk loads
-the base commit. The sites that take a checksum without reading it accept an
-absent one at exit 0: `rev-parse <checksum>` prints it, the positional revision
-of `refs --create` writes a ref file holding it, and `commit
---parent=<checksum>` writes a commit naming it. A ref pointing at an absent
-commit therefore arrives through either CLI, and reading a revision through that
-ref reports the same two messages the checksum reports.
+The tool writes a ref in one sequence for `refs --create` and for the ref write
+of a commit. It creates a temp file in the directory that holds the ref, runs
+`fdatasync` on it, and runs `renameat` over the ref name. It syncs no directory.
+This includes the parent of the ref, `refs/heads`, and the repository root.
+`fsync=false` removes the `fdatasync` and keeps the rename. An alias write
+(`refs -A --create`) runs `symlinkat` into `<repo>/tmp` and `renameat` over the
+ref name, with no sync. `refs --delete` runs `unlinkat` alone.
 
-Writing a ref whose file is an alias symlink replaces the symlink with a regular
-ref file; the alias target is left unchanged. Observed with the tool by
-committing onto an alias and by `ostree refs --create --force`: in both cases
-`refs/heads/foo` (a relative symlink to sibling `bar`) became a 65-byte regular
-file holding the new checksum, and `refs/heads/bar` kept its old checksum. The
-tool writes the ref by renaming a fresh temp file over the target name, and the
-rename replaces the symlink at that name instead of following it.
+The port creates the temp file of a ref write, and the symlink of an alias
+write, in `<repo>/tmp`. It creates `<repo>/tmp` if it is absent. It runs
+`fdatasync` on the temp file of a ref write, and renames the temp entry over the
+ref name. Then it runs `fsync` on the directory that holds the ref. A ref
+removal does not use `tmp/`, and the port runs the same directory `fsync` after
+it.
 
-Ref durability (traced). The tool's ref write creates its temp file in the
-directory that holds the ref. It issues `fdatasync` of the temp file, then
-`renameat` over the ref name, and no directory sync anywhere: not of the ref's
-own parent, of `refs/heads`, or of the repository root. This is the
-same sequence for `refs --create` and for a commit's ref write, and
-`fsync=false` drops the `fdatasync`, leaving the rename alone. An alias write
-(`refs -A --create`) issues `symlinkat` into `<repo>/tmp` and `renameat` over
-the ref name, with no sync at all, and `refs --delete` issues `unlinkat` alone.
-The port creates the temp file of a ref write and the symlink of an alias write
-in `<repo>/tmp`, and renames each over the ref name. A ref listing reads every
-entry under `refs/`, so the port keeps no temp entry there. The port creates
-`<repo>/tmp` where it is absent. When `<repo>/tmp` is on a different filesystem
-from the ref, the rename fails with `EXDEV`: the write fails, the port removes
-the temp entry, and the ref stays unchanged. A ref removal does not use `tmp/`.
-The port `fdatasync`-es the ref file the same way and adds an `fsync` of the
-directory holding the ref after the rename, after an alias rename, and after a
-removal, so the name the operation created or removed survives a crash and not
-only the file's content.
+A ref listing reads every entry under `refs/`, so the port keeps no temp entry
+there. If `<repo>/tmp` is on a different filesystem from the ref, the rename
+fails with `EXDEV`. The write then fails, the port removes the temp entry, and
+the ref stays unchanged.
 
-A ref name carrying `/` needs one more rule, because the write creates the
-directories the name passes through. A `mkdirat` records a name in the directory
-it is called in, so the directory made durable for a created
-`refs/heads/deep/nest` is `refs/heads/deep`, the one that holds the `nest` entry.
-The port therefore `fsync`-es the directory holding each parent directory the
-write created, after the `fsync` of the directory holding the ref, deepest
-first. The order is child before parent, the order the object fanout uses: a
-crash part way through leaves a prefix of the path recorded and never a
-directory entry naming a directory whose own contents are unrecorded. A
-directory the write found already in place is not synced, since its name is
-already durable. A single-component name creates no directory and issues this
-`fsync` not at all, so the count of directory syncs a ref write makes is one
-plus the number of directories it created.
+A ref name with a `/` can make the write create directories. A `mkdirat` records
+a name in the directory where it is called, so for a created
+`refs/heads/deep/nest` the directory to sync is `refs/heads/deep`. The port
+syncs the directory that holds the ref first. Then it runs `fsync` on the
+directory that holds each parent directory that the write created, deepest
+first. This is the child-before-parent order of the object fanout.
 
-A transaction that writes several refs renames every ref file first and then
-`fsync`s each directory that gained or lost a name once, deepest first, before
-its commit returns. Two refs in one directory therefore share one directory
-sync. Each ref file is `fdatasync`-ed before its rename, and the objects and
-the detached metadata the refs name are durable before the first rename, so
-the order guarantee is the same as for one ref.
+A crash part way through leaves a prefix of the path recorded. It never leaves a
+directory entry that names a directory whose own contents are not recorded.
+The write does not sync a directory that it found in place, unless that
+directory holds an entry that the write created. The name of a directory found
+in place is already durable.
 
-`fsync=false` turns all of that into a no-op. The syscall sequence carries no
+A write whose parent directories all exist, such as a single-component
+local ref, creates no directory. The first ref of a remote creates
+`refs/remotes/<remote>`, and the first ref of a collection creates
+`refs/mirrors/<collection>`. A ref write runs one directory sync plus one for
+each directory that it created.
+
+A transaction that writes several refs renames every ref file first. Then,
+before its commit returns, it runs `fsync` once on each directory that gained or
+lost a name, deepest first. So two refs in one directory share one sync. Each
+ref file gets `fdatasync` before its rename. The objects and the detached
+metadata that the refs name are durable before the first rename. So the order
+guarantee is the same as for one ref.
+
+`fsync=false` makes all of these syncs no-ops. The syscall sequence carries no
 byte-exact requirement, and the ref bytes are identical either way.
+`conformance/cli-surface.md`, "P2", `commit`, records the directory `fsync` of
+the port.
 
-Repository lock and staging (recovered by tracing the tool). The tool opens
-`<repo>/.lock` `O_RDWR|O_CREAT` mode `0660` and takes an `fcntl` OFD lock on it,
-shared (`F_RDLCK`) for the duration of a commit and exclusive (`F_WRLCK`) for
-destructive maintenance, releasing it (`F_UNLCK`) at the end. A transaction
-stages objects in `tmp/staging-<bootid>-XXXXXX` (mode `0775`), where `<bootid>`
-is `/proc/sys/kernel/random/boot_id` verbatim, dashes kept, and `XXXXXX` is a
-six-character `mkdtemp` suffix. A sibling file `tmp/staging-<bootid>-XXXXXX-lock`
-(mode `0600`) is held with an exclusive OFD lock while the staging directory is
-in use, so a later transaction can tell a live staging directory from one left
-by a dead transaction. These locks are advisory and cross-process; the checksums
-and object bytes do not depend on them.
+### Repository lock and staging
 
-The file `<repo>/.update.lock` holds the update lock of the port. The port
-takes an exclusive `fcntl` record lock on it, after it takes the repository
-lock shared. The lock serializes every port write of refs and ref aliases,
-`config` and the remote keyrings, `summary` and `summary.sig`, and
-`.commitmeta` files: the writes of an update guard (`Repo::begin_update`),
-the step of a transaction commit that writes detached metadata and refs, and
-each writer outside a transaction. A transaction publishes its objects before
-it takes the lock, and a transaction that writes no ref and no detached
-metadata takes no lock. Two port processes that sign one commit at the same
-time therefore keep both signatures. The port creates the file on the first
-acquire with the rules of `.lock` and never unlinks it. A file that already
-exists keeps its mode. The update lock ignores `[core] locking=false`. The tool
-never opens this file, so the lock excludes port processes alone.
+The tool opens `<repo>/.lock` with `O_RDWR|O_CREAT` and mode `0660`. It takes an
+`fcntl` OFD lock on the file: shared (`F_RDLCK`) for the duration of a commit,
+and exclusive (`F_WRLCK`) for destructive maintenance. It releases the lock
+(`F_UNLCK`) at the end.
 
-`[core] lock-timeout-secs` bounds the wait for `.lock`. Observed with `ostree`
-2026.1 on `prune --refs-only` while another process holds `.lock` with an
-exclusive record lock: with a positive value the tool requests the lock with
-`F_OFD_SETLK` about once each second and fails at the timeout; with `0` it makes
-one attempt; with `-1` it requests the lock with `F_OFD_SETLKW`, which blocks
-until the holder releases the lock; with `-2`, `-3`, or `-100` it does not open
-`.lock`, takes no lock, and completes while the holder still holds the lock. The
-port reads `-1` as no limit and retries a non-blocking request every 100 ms with
-no deadline. It never makes a blocking lock request. The port refuses a value
-below `-1`, because it does not run a repository write with no lock. The port removes its staging directory
-and the lock sibling on every path out of a transaction, the refusals included,
-so a run that exits non-zero leaves `tmp/` holding no `staging-` entry
-(`conformance/cli-surface.md`, "P2"). A transaction that commits, aborts, or
-drops removes the pair itself; a process that ends without unwinding removes the
-pair of every transaction it still holds immediately ahead of the exit.
+A transaction stages objects in `tmp/staging-<bootid>-XXXXXX` (mode `0775`).
+`<bootid>` is `/proc/sys/kernel/random/boot_id` verbatim, dashes kept, and
+`XXXXXX` is a six-character `mkdtemp` suffix. The transaction holds an exclusive
+OFD lock on a sibling file `tmp/staging-<bootid>-XXXXXX-lock` (mode `0600`)
+while it uses the staging directory. So a later transaction can tell a live
+staging directory from one that a dead transaction left. The port requests the
+same names and modes. In `bare-user-shared` it then sets the modes that
+"bare-user-shared mode" states. These locks are advisory and
+cross-process, and the checksums and the object bytes do not depend on them.
 
-Commit-state markers live at `state/<checksum>.commitpartial`. The reader only
-tests the marker's presence, which makes a commit `Partial`. When `fsck` finds a
-commit missing a referenced object it writes the marker as a single byte `0x66`
-(recovered by observation: feeding the tool a repository with a deleted
-referenced object and inspecting the marker it writes shows a 1-byte file
-holding `0x66`). A pull writes the marker zero-length instead, and removes it
-once the commit's objects are published (observed by running the tool's
-`pull-local --commit-metadata-only`, which leaves a 0-byte marker, and then
-completing the pull, which removes it; a pull that fails part way leaves the
-marker behind). A marker already present is not rewritten: a pull over a commit
-`fsck` marked keeps the one-byte state (observed by running `fsck` on a
-repository with a deleted referenced object, then `pull-local` from a source
-missing that same object, after which the marker still holds `0x66`). A pull
-with `--subpath` keeps the zero-length marker of every commit it reaches, since
-it fetched part of the tree, and a later pull of the commit without `--subpath`
-removes it (observed by running the tool's `pull --subpath=/sub`, which leaves a
-0-byte marker, and then a pull without the option). The marker is local state
-and does not enter any checksum.
+`[core] lock-timeout-secs` sets the limit of the wait for `.lock`. The port
+reads the value in this way:
+
+- a positive value: it retries a non-blocking request every 100 ms, and fails
+  at the timeout;
+- `0`: it makes one attempt;
+- `-1`: it retries with no deadline, and it never makes a blocking lock request;
+- a value less than `-1`: it refuses the value, because it does not run a
+  repository write with no lock.
+
+`conformance/cli-surface.md`, "P2", `prune`, records how the tool reads the
+value.
+
+The port removes its staging directory and the lock sibling on every path out of
+a transaction, the refusals included. So a run that exits non-zero leaves `tmp/`
+with no `staging-` entry (`conformance/cli-surface.md`, "P2"). A transaction
+that commits, aborts, or drops removes the pair itself. A process that ends
+without unwinding removes the pair of every transaction that it still holds
+immediately before the exit.
+
+### The update lock
+
+The file `<repo>/.update.lock` holds the update lock of the port. The port takes
+an exclusive `fcntl` record lock on it, after it takes the repository lock
+shared. Under `[core] locking=false` it takes the update lock alone, because the
+update lock ignores that key. The lock serializes every port write of refs and
+ref aliases, `config` and the remote keyrings, `summary` and `summary.sig`, and
+`.commitmeta` files. The writers are an update guard (`Repo::begin_update`),
+each writer outside a transaction, and the step of a transaction commit that
+writes detached metadata and refs.
+
+A transaction commit outside a receive publishes its objects before it takes
+the lock. A receive takes the lock before its transaction commit ("Locks and
+on-disk state of a receive"). A transaction that writes no ref and no detached
+metadata takes no lock. So two port processes that
+sign one commit at the same time keep both signatures. The port creates the file
+on the first acquire with the rules of `.lock`, and never unlinks it. A file
+that already exists keeps its mode. The tool never opens this file, so the lock
+excludes port processes alone.
+
+### Commit-state markers
+
+A commit-state marker is the file `state/<checksum>.commitpartial`. The reader
+only tests that the marker is present, which makes the commit `Partial`. The
+marker is local state and does not enter any checksum.
+
+- `fsck` writes the marker as a single byte `0x66` when it finds a commit that
+  misses a referenced object.
+- A pull writes the marker zero-length, and removes it when the objects of the
+  commit are published. `pull-local --commit-metadata-only` keeps the 0-byte
+  marker, and a later full pull removes it.
+- A pull with `--subpath` keeps the zero-length marker of each commit that it
+  reaches, because it fetched part of the tree. A later pull of the commit
+  without `--subpath` removes the marker.
+- A pull does not write over a marker that is present. A pull over a commit that
+  `fsck` marked keeps the one-byte state.
+
+`conformance/cli-surface.md`, "P2", `pull`, records the markers that a failed
+pull leaves.
 
 No writer syncs a marker or the `state/` directory. A pull creates every marker
-before its transaction stages an object, so the `syncfs` that opens publication
-makes the marker durable ahead of the first object rename; the removal is the
-pull's last operation and no barrier follows it, so a crash immediately after a
-successful pull can restore the marker of a commit that is complete. An `fsck`
-marker is written with no barrier at all, and re-running `fsck` writes it again.
-Recovered by tracing the tool's syscalls: `pull-local` issues
-`openat(state/<checksum>.commitpartial, O_WRONLY|O_CREAT|O_EXCL, 0644)`,
-`syncfs` of the repository, the object renames into `objects/`, an `fsync` of
-each touched fanout and of `objects/`, the ref write, then `unlinkat` of the
-marker as its last syscall, with no `fsync` of the marker or of `state/`
-anywhere; `ostree fsck` writing a marker issues no `fsync`, `fdatasync`, or
-`syncfs` in the entire run.
+before its transaction stages an object. So the `syncfs` at the start of
+publication makes the marker durable before the first object rename. The removal
+is the last operation of the pull, and no barrier follows it. So a crash
+immediately after a successful pull can restore the marker of a complete commit.
+`fsck` writes its marker with no barrier, and a new `fsck` run writes it again.
+The tool `pull-local` runs these syscalls in this order:
+
+1. `openat(state/<checksum>.commitpartial, O_WRONLY|O_CREAT|O_EXCL, 0644)`;
+2. a `syncfs` of the repository;
+3. the object renames into `objects/`;
+4. an `fsync` of each touched fanout and of `objects/`;
+5. the ref write;
+6. the `unlinkat` of the marker, as its last syscall.
+
+The tool `fsck` runs no `fsync`, `fdatasync`, or `syncfs` in a run that writes a
+marker.
+
+### Old entries in `tmp/`
 
 The tool reaps `tmp/` at the end of each transaction, after it removes its own
-staging directory, on a commit and on an abort. `commit`, `reset`,
-`pull-local`, `summary -u` over a repository with a collection id, and
-`static-delta apply-offline` reap; `prune`, `fsck`, `summary -u` over a
-repository with no collection id, `refs`, `checkout`, and `static-delta
-generate` do not. The pass reads the top level of `tmp/` and does an `lstat` of
-each entry:
+staging directory, on a commit and on an abort. `commit`, `reset`, `pull-local`,
+`summary -u` over a repository with a collection id, and `static-delta
+apply-offline` reap. `prune`, `fsck`, `summary -u` over a repository with no
+collection id, `refs`, `checkout`, and `static-delta generate` do not. The reap
+reads the top level of `tmp/` and runs `lstat` on each entry:
 
-- It skips `cache` by name and touches nothing below it, whatever the age.
-- For a directory whose name starts with `staging-`, it opens `<name>-lock`
-  `O_RDWR|O_CREAT` and tries an exclusive OFD lock. When it gets the lock, it
-  removes the directory tree and the lock file at any age. A staging directory
-  with no lock file is therefore removed at any age. When another process
-  holds the lock, the directory stays at any age. An `flock` hold does not
-  protect it.
-- Every other entry, a `staging-*-lock` file and a `staging-*` entry that is not
-  a directory included, is removed when its age exceeds `tmp-expiry-secs`. The
-  age is the current time minus `st_mtime`: an old atime does not remove an
-  entry, and a new ctime does not keep it. A directory goes as a whole tree,
-  judged by its own mtime alone, so an old directory with a fresh child is
-  removed and a fresh directory with old children stays. Any other entry, a
-  fifo and a symlink included, goes with one `unlinkat`, so the target of a
-  symlink stays.
+- It skips `cache` by name, and touches nothing below it, at any age.
+- For a directory whose name starts with `staging-`, it opens `<name>-lock` with
+  `O_RDWR|O_CREAT` and tries an exclusive OFD lock. If it gets the lock, it
+  removes the directory tree and the lock file at any age. So the reap removes
+  a staging directory with no lock file at any age. If another process holds the
+  lock, the directory stays at any age. An `flock` hold does not protect it.
+- It removes each other entry, a `staging-*-lock` file and a `staging-*` entry
+  that is not a directory included, when its age is more than `tmp-expiry-secs`.
 
-The age test is strict on whole seconds: at `tmp-expiry-secs=0` an entry
-created in the current second survives and entries one second old or more are
-removed, and at `tmp-expiry-secs=5` entries aged up to five seconds survive
-while one aged six seconds is removed. At transaction start the tool also
-reuses a staging directory of the current boot whose lock it can take, and
-sets its times with `utimensat`. Recovered by tracing the tool's syscalls over
-`tmp/` entries of each kind and age, and over staging directories whose lock
-files another process held with POSIX, OFD, and `flock` locks. A held lock file
-older than `tmp-expiry-secs` is unlinked by the age test, and the next
-transaction then takes the lockless staging directory for its own.
+The age is the current time minus `st_mtime`. An old atime does not remove an
+entry, and a new ctime does not keep it. The reap removes a directory as a
+whole tree, and only its own mtime counts. So an old directory with a new child
+is removed, and a new directory with old children stays. The reap removes each
+other entry, a fifo and a symlink included, with one `unlinkat`, so the target
+of a symlink stays.
 
-The port reaps `tmp/` at the start of each transaction, on the same top-level
-read. It skips `cache`, and it applies the tool's age test, removal of a
-directory as a whole tree, and removal of a symlink as the link to every entry
-that is not a `staging-*` directory or a `staging-*-lock` file. It exempts a
-staging lock file from the age test, because the lock of a transaction that
-lives past `tmp-expiry-secs` is still held. It removes a `staging-*` directory
-when its lock can be taken, and a staging directory with no lock file only once
-its age exceeds `tmp-expiry-secs`, because another process can be between the
-directory create and the lock create. The port does not reuse a staging
-directory: each transaction creates a new one. `conformance/cli-surface.md`,
-"Global conventions" records the divergences.
+The age test counts whole seconds. At `tmp-expiry-secs=0` an entry created in
+the current second stays, and an entry one second old or more is removed. At
+`tmp-expiry-secs=5` an entry up to five seconds old stays, and an entry six
+seconds old is removed.
 
-The temp entries `.ostrya-ref-*` and `.ostrya-meta-*` of a ref write, an alias
-write, and a `.commitmeta` or `.tombstone-commit` write take the age test like
-any other entry. With a very small or negative `tmp-expiry-secs`, the reap of
-another transaction can unlink such an entry before its rename. The write then
-fails with `ENOENT`, and the ref or the object stays unchanged.
+At the start of a transaction, the tool also reuses a
+staging directory of the current boot whose lock it can take. It sets the times
+of that directory with `utimensat`. The age test unlinks a held lock file that
+is older than `tmp-expiry-secs`. The next transaction then takes that staging
+directory, which now has no lock file, for its own.
 
-Static delta directories use base64-checksum fanout. From-scratch:
-`deltas/<to_b64[0:2]>/<to_b64[2:]>/<target>`. From->to:
-`deltas/<from_b64[0:2]>/<from_b64[2:]>-<to_b64>/<target>`. Targets are
-`superblock` and one numeric part file per part, `0`, `1`, ..., and nothing else:
-the listing holds exactly those names for a from-scratch delta, a from->to
-delta, a four-part delta (`--max-chunk-size=0.1`), and a delta whose largest
-object went to a fallback (`--min-fallback-size=1`). Fallback objects are
-fetched loose from the repository and add no file here. Indexes live at
-`delta-indexes/<to_b64[0:2]>/<to_b64[2:]>.index`.
+The port reaps `tmp/` at the start of each transaction, with the same top-level
+read:
 
-The `superblock`, each part file, and each index file have mode 0644 whatever
-the umask is. This applies at the repository location and in a `--filename`
-directory, and to `reindex` with and without `--to`. The directories the
-writer creates take mode 0755 reduced by the umask. Observed by running
-`static-delta generate` and `static-delta reindex` under umask 077: each file
-had mode 0644 and each directory mode 0700.
+- It skips `cache`.
+- It applies three rules of the tool to each entry that is not a `staging-*`
+  directory or a `staging-*-lock` file:
+  - the age test;
+  - the removal of a directory as a whole tree;
+  - the removal of a symlink as the link.
+- It does not apply the age test to a staging lock file. The lock of a
+  transaction that lives longer than `tmp-expiry-secs` is still held.
+- It removes a `staging-*` directory when it can take its lock.
+- It removes a staging directory with no lock file only when its age is more
+  than `tmp-expiry-secs`. Another process can be between the directory create
+  and the lock create.
 
-An index file is an `a{sv}` holding one entry, `ostree.static-deltas`, whose
-variant is the `a{sv}` map the summary carries under the same key: delta name
-(`TO` or `FROM-TO`, in hex) to a 32-byte `ay`, the SHA-256 of that delta's
-`superblock` file. One index file per target commit lists every delta producing
-it. Recovered by running `ostree static-delta reindex` on a repository with two
-deltas and decoding the files it wrote; the digests match `sha256sum` over the
-superblocks. `static-delta generate` does not write or refresh an index --
-`reindex` does, and `ostree static-delta indexes` lists the indexed targets, one
-commit hex per line.
+Each transaction creates a new staging directory, and the port reuses none.
+`conformance/cli-surface.md`, "Global conventions", records the differences
+between the two reaps.
 
-`reindex` rebuilds the cache from the deltas present: after one of two delta
-directories is deleted, the pass removes that target's `.index` file and
-`static-delta indexes` lists only the remaining target. The fanout directory the
-removal empties stays in place. `static-delta delete` does not refresh the
-cache, so the target of a removed delta stays listed until the next
-`reindex`.
+The port writes a ref, an alias, a `.commitmeta`, and a `.tombstone-commit`
+through the temp entries `.ostrya-ref-*` and `.ostrya-meta-*`. These entries get
+the age test like each other entry. With a very small or negative
+`tmp-expiry-secs`, the reap of another transaction can unlink such an entry
+before its rename. The write then fails with `ENOENT`, and the ref or the object
+stays unchanged.
 
-The entries of an index file that lists two or more deltas are in a hash-table
-order, the same class of order as the summary map, and the two orders can
-differ for one set. The port writes the entries in name order. For some sets
-the tool's order is name order by chance, and the two files are then
-byte-identical. An index file of one entry is byte-identical between the two
-writers, and the tool pulls
-with `--require-static-deltas` from a repository whose index files and summary
-the port wrote.
+### Static delta directories
 
-`reindex --to=REV` rewrites the index file of REV alone, from the deltas into
-REV that hold a `superblock`. With no such delta it removes the index file of
-REV, and the fanout directory the removal empties stays. The index files of
-other targets stay as they are, stale ones included. The file it writes is
-byte-identical to the file of REV that the full pass writes.
+Static delta directories use a fanout of the modified-base64 checksum (see
+"Checksum computation"). A from-scratch delta is at
+`deltas/<to_b64[0:2]>/<to_b64[2:]>/<target>`, and a from->to delta at
+`deltas/<from_b64[0:2]>/<from_b64[2:]>-<to_b64>/<target>`. The targets are
+`superblock` and one numeric part file per part, `0`, `1`, ..., and nothing
+else. This holds for a from-scratch delta, a from->to delta, a four-part delta
+(`--max-chunk-size=0.1`), and a delta with a fallback object
+(`--min-fallback-size=1`). A fallback object adds no file here ("Object
+delivery").
 
-### HTTP pull surface
+The `superblock`, each part file, and each index file have mode 0644 at any
+umask. This applies at the repository location and in a `--filename` directory,
+and to `reindex` with and without `--to`. The directories that the writer
+creates get mode 0755, reduced by the umask.
 
-A repository published over HTTP is served as the directory tree above. What a
-pull requests, and in what order, was recovered by running `ostree` 2026.1
-against a static HTTP server over a tool-built archive repository and reading the
-server's request log.
+### Static delta index files
 
-One pull of one ref, with a summary present on the remote:
+An index file is at `delta-indexes/<to_b64[0:2]>/<to_b64[2:]>.index`. It is an
+`a{sv}` with one entry, `ostree.static-deltas`, whose variant is the `a{sv}` map
+that the summary holds under the same key ("Summary --
+`(a(s(taya{sv}))a{sv})`"). One index file per
+target commit lists every delta into that commit.
 
-```
-summary.sig
-summary
-config
-delta-indexes/<to_b64[0:2]>/<to_b64[2:]>.index
-objects/<commit>.commitmeta
-objects/<commit>.commit
-objects/<...>.dirtree, .dirmeta, .filez, .filez, .dirtree, .filez
-```
+`static-delta generate` does not write or refresh an index, and `reindex` writes
+the index files. `reindex` with no option rebuilds the index files from the
+deltas present. It writes one index file per target and removes the index file
+of a target with no delta left. The fanout directory that the removal empties
+stays. `conformance/cli-behavior.md`, "CLI output formats", `static-delta`,
+states `reindex --to`, `indexes`, and `delete`. `static-delta delete` does not
+refresh the index files.
 
-- `summary.sig` is requested before `summary`, and both before `config`.
-- With no summary on the remote, `summary` answers 404 and `refs/heads/<ref>` is
-  fetched in its place. The delta probe becomes `deltas/<b64>/superblock` rather
-  than the index, so a summary advertising `indexed-deltas` is what selects the
-  index path.
-
-Two pulls of one ref from an archive remote with no summary and no file under
-`delta-indexes/`, into a `bare-user` client, recovered the same way (observed
-with `ostree` 2026.1 on 2026-10-05). The first pull, with no ref on the client,
-made these requests, in this order, with these statuses:
-
-```
-summary.sig                                         404
-summary                                             404
-refs/heads/<ref>                                    200
-deltas/<to_b64[0:2]>/<to_b64[2:]>/superblock        404
-objects/<to>.commitmeta                             404
-objects/<to>.commit                                 200
-objects/<...>.dirtree, .dirmeta, .filez, .filez     200
-```
-
-For the second pull, the remote held a new commit `to`, with the commit `from`
-of the first pull as its parent, and the delta `<from>-<to>` that
-`static-delta generate --from=<from> --to=<to>` wrote. The ref of the client
-named `from`, held complete. The second pull made these requests:
-
-```
-summary.sig                                                404
-summary                                                    404
-refs/heads/<ref>                                           200
-deltas/<from_b64[0:2]>/<from_b64[2:]>-<to_b64>/superblock  200
-deltas/<from_b64[0:2]>/<from_b64[2:]>-<to_b64>/0           200
-objects/<to>.commitmeta                                    404
-```
-
-A delta-accelerated pull, recovered the same way -- one static file server, one
-request log -- against a client holding the ref's previous commit:
-
-```
-summary.sig
-summary
-config
-delta-indexes/<to_b64[0:2]>/<to_b64[2:]>.index
-deltas/<from_b64[0:2]>/<from_b64[2:]>-<to_b64>/superblock
-objects/<fallback>.filez          (only where the delta names fallbacks)
-deltas/<from_b64[0:2]>/<from_b64[2:]>-<to_b64>/0
-objects/<commit>.commitmeta
-```
-
-- The delta taken is `<from>-<to>` for a commit `from` the client holds
-  complete, whether a ref names that commit or not, and the from-scratch `<to>`
-  where the client holds no ref for the branch being pulled. A client whose ref
-  names a commit, against a remote advertising the from-scratch delta and no
-  from-to delta from a commit the client holds, fetches every object loose, and
-  so does a fresh client against a remote advertising only a from-to delta. The
-  tool reads the ref alone there: a ref naming a commit the client holds
-  partial, or does not hold, also leaves the from-scratch delta alone.
-- A client that holds the target commit complete takes no delta for it. A
-  client that holds the target commit object partial looks for a delta as for
-  a commit it does not hold. After `--commit-metadata-only` or a `--subpath`
-  pull the ref names that commit, so a later pull of the same commit requests
-  the delta index, takes no superblock where the index names only the
-  from-scratch delta, and fetches the missing objects loose. It takes a from-to
-  delta from another commit it holds complete. From a remote with no summary it
-  requests the from-scratch superblock by name and applies the delta, also
-  under `--subpath` into `bare-user`, which keeps the marker.
-- The index is requested whenever a summary is present. Where it answers 404 the
-  pull reads the summary's own `ostree.static-deltas` map instead and fetches the
-  superblock the map names. Where neither names the delta, no superblock is
-  requested.
-- No `objects/<commit>.commit` request follows a delta: the target commit rides in
-  the superblock. The `.commitmeta` is still fetched, after the parts rather than
-  before the commit.
-- The objects a delta hands over as fallbacks are fetched loose as
-  `objects/<..>.filez`, queued as soon as the superblock is read. No dirtree,
-  dirmeta, or content object of the delta's own contents is requested, so the tool
-  does not walk the target commit's tree after applying a delta.
-- A superblock whose bytes do not hash to the digest the summary advertised fails
-  the pull: `error: Invalid checksum for static delta <name>`, with no part
-  requested. A superblock the remote does not hold answers 404 and the pull
-  continues with loose objects, with no error, unless the pull requires static
-  deltas. A remote that answers 404 for every path under `deltas/` and
-  `delta-indexes/`, with a summary that names the delta, takes this path: the
-  pull reads the delta from the summary map, gets 404 for the superblock, and
-  fetches the objects loose (observed with `ostree` 2026.1 on 2026-10-02, and
-  repeated with `ostree` 2026.2).
-- A part that answers 404 after its superblock fails the pull: `error: While
-  fetching <url>/deltas/<name>/0: Server returned HTTP 404`. The pull fetches no
-  object loose in its place and does not move the ref. This holds for a from-to
-  delta and a from-scratch delta that the index names, with and without the
-  summary map naming it.
-- `--require-static-deltas` refuses a remote that serves no summary: `error:
-  Fetch configured to require static deltas, but no summary deltas or delta
-  index found`, with no delta probe, also where the client holds the commit and
-  under `--commit-metadata-only`. With a summary, it refuses a commit the client
-  does not hold complete where no delta the index or the summary names can be
-  taken, and where the superblock of the delta taken is absent: `error: Static
-  deltas required, but none found for <ref> to <commit>`. In the second case the
-  tool writes the checksum of the commit the delta starts from in place of
-  `<ref>`, and `(null)` for a from-scratch delta (observed with `ostree` 2026.1
-  on 2026-10-02). The port writes the ref name in both cases. A remote naming a
-  from-scratch delta that the pull leaves alone, because the client's ref names
-  a commit, satisfies the switch, and that pull fetches loose. A commit the
-  client already holds complete is not refused.
-- `--disable-static-deltas` requests no delta index and no superblock, and the
-  pull fetches every object loose.
-- An archive client takes no delta. A plain pull requests no delta index and
-  fetches every object loose, and `--require-static-deltas` refuses with `error:
-  Can't use static deltas in an archive repo` before any request is made.
-- A content object is always requested as `objects/<..>.filez`, whatever mode the
-  remote actually stores. Metadata keeps `.commit`, `.dirtree`, and `.dirmeta`.
-  Detached metadata is `.commitmeta`, requested before the commit object it
-  belongs to, with a 404 treated as the commit carrying none.
-- `config` is requested only after a summary arrives, and its `[core] mode`
-  decides whether the pull proceeds: a `bare-user` remote produces `error: Can't
-  pull from archives with mode "bare-user"`. The same remote with no summary,
-  where no config is fetched, instead fails on a 404 for an
-  `objects/<...>.filez` request. An archive remote with no summary pulls with no
-  error when its `config` is absent, does not parse, or states `mode=bare-user`.
-  `ostree remote refs` and `ostree remote summary` request no `config`. After a
-  summary, a `config` that answers 404 fails the pull with no request after it:
-  `error: While fetching <url>/config: Server returned HTTP 404`.
-- The pull reads `[core] mode` alone from the remote `config`. Observed with
-  `ostree` 2026.1 on 2026-10-02 against a static server over an archive
-  repository with a summary, with a different `config` served in each run.
-  `ostree` 2026.2 gave the same result for the runs it repeated: `mode=archive`,
-  `mode=bare-user`, `mode=bogus`, no `mode` key, no `[core]` group, a file that
-  does not parse, `repo_version` absent and `abc`, the extra `[core]` keys
-  other than `parent`, the extra groups, `indexed-deltas=false`, and a
-  `collection-id` different from that of the summary. With no summary it
-  repeated the absent `config` and `mode=bare-user`, and after a summary the
-  `config` that answers 404.
-  - `mode=archive-z2` and `mode=archive` proceed. `mode=bare`, `bare-user`,
-    `bare-user-only`, and `bare-split-xattrs` are refused before the first
-    object request: `error: Can't pull from archives with mode "<mode>"`.
-  - A `config` with no `mode` key, with no `[core]` group, or with no bytes reads
-    as mode `bare` and is refused: `error: Can't pull from archives with mode
-    "bare"`.
-  - An unknown mode is refused: `error: Invalid mode 'bogus' in repository
-    configuration`. A file that does not parse is refused: `error: Parsing
-    config: Key file contains line “this is not a key file” which is not a
-    key-value pair, group, or comment`.
-  - `repo_version` is not checked: absent, `0`, `2`, and `abc` all proceed.
-  - No other key and no other group changes the requests or the result. The
-    runs covered the `[core]` keys `min-free-space-percent`,
-    `min-free-space-size`, `fsync`, `add-remotes-config-dir`,
-    `lock-timeout-secs`, `zlib-level`, `payload-link-threshold`, and `parent`;
-    `indexed-deltas` `true`, `false`, and absent, which leave the index request
-    of a summary that states `indexed-deltas` true as it is; `collection-id`
-    present, absent, and different from that of the summary; and the groups
-    `[remote "x"]`, `[ex-ostrya]`, and `[sysroot]`.
-  - A collection id fails a pull only through the remote of the client, checked
-    against the binding of the commit: `error: Commit <c>: Commit has collection
-    ID ‘<bound>’ in collection binding metadata, while the remote it came from
-    has collection ID ‘<found>’`, and, for a commit with no binding, `error:
-    Commit <c>: Expected commit metadata to have collection ID binding
-    information, found none`.
-
-  The port requests `config` in every pull, with or without a summary, and
-  refuses a remote whose mode is not an archive mode with an error that names
-  the mode. It reads a `config` that answers 404 as an archive repository and
-  proceeds.
-- An empty ref list resolves differently per mode. A plain pull uses the remote's
-  `branches` config key and fails with `error: No configured branches for remote
-  origin` when it is absent. A mirror pull takes every ref the summary lists and
-  fails with `error: Fetching all refs was requested in mirror mode, but remote
-  repository does not have a summary`.
-- `--mirror` writes `refs/heads/<ref>`; a plain pull writes
-  `refs/remotes/<remote>/<ref>`.
-- A mirror pull that fetched every ref copies the remote summary bytes verbatim
-  to `<repo>/summary`, confirmed byte-identical with `cmp`, and copies the remote
-  `summary.sig` bytes to `<repo>/summary.sig` the same way. Where the remote
-  holds no `summary.sig`, the pull writes `<repo>/summary` alone and leaves a
-  `<repo>/summary.sig` an earlier pull wrote as it stands. A mirror pull of named
-  refs writes neither file, and a plain pull writes neither.
-- A repeat pull of an unchanged ref re-fetches `summary.sig`, `summary`,
-  `config`, the delta index, and `.commitmeta`, then stops.
-- `-T` fails only on a strictly older timestamp; an equal timestamp passes.
-  `--timestamp-check-from-rev=REV` compares against REV and implies the check.
-  The message names both revisions and both timestamps.
-- An HTTP pull verifies the checksum of every object it fetches by default. The
-  tool's `--untrusted` help reads "Verify checksums of local sources (always
-  enabled for HTTP pulls)", and over HTTP the switch changes nothing: a corrupt
-  `.filez` fails the pull with and without it.
-- `--http-trusted` (help: "Do not verify checksums of HTTP sources (mostly useful
-  when mirroring)") skips the check under `--mirror` into an `archive`
-  destination alone. There the tool stores a corrupt `.filez` verbatim, writes
-  the ref, and exits 0, and a later `fsck` fails with `Corrupted file object`.
-  Without `--mirror`, into a `bare-user` destination, or with `--untrusted`
-  beside it, the corrupt object fails the pull with `Writing content object:
-  Corrupted file object` and no ref is written. `pull-local` takes neither
-  `--subpath` nor `--http-trusted` (`Unknown option`). The port accepts
-  `--http-trusted` and verifies every object all the same, so under `--mirror`
-  into `archive` it refuses the corrupt object at exit 1 and writes no object
-  and no ref.
-- `--subpath=PATH`, repeatable, fetches part of each commit's tree. The value is
-  split on `/` after its leading `/`, each component kept, empty ones included.
-  The commit and the root dirtree and dirmeta are always fetched. A directory a
-  component names that is not the path's last is fetched as its dirtree and
-  dirmeta, and the walk goes on inside it; the entry the last component names is
-  fetched whole, a file or a directory with everything under it. Nothing else is
-  fetched: no sibling, no sibling's dirmeta, and no file of a directory the path
-  passes through. `/sub/f1/x` with `f1` a file fetches the `sub` dirtree and
-  dirmeta alone. `/nonexist`, `/`, `/a/` with `a` a file, `//sub`, and `/./sub`
-  fetch the root alone, since no entry holds an empty name, `.`, or `..`, and
-  `/sub/` fetches the `sub` dirtree and dirmeta with nothing in them. Several
-  values fetch the union. A dirtree reached at two positions is walked once, under
-  the first walk to reach it, so what the tool fetches then follows the order its
-  fetches complete in. Over `python3 -m http.server` it followed the directory
-  that sorts first in the tree, whatever the order of the values, and was stable
-  over repeated runs; over another server `/other/x/` beside `/sub/x` fetched
-  the file of `x`, where that rule fetches none. The port walks the dirtree under
-  both positions. The ref is
-  written, under `refs/heads` for `--mirror`. Every commit the pull reaches keeps
-  a zero-length `state/<checksum>.commitpartial`, under `--depth` each parent
-  too, and a later pull without `--subpath` completes the commit and removes the
-  marker. A subpath pull of a commit already complete writes no marker. With
-  `--commit-metadata-only` the commit alone is fetched. Into `bare-user` the
-  tool applies a delta whole, from-scratch or from-to, for a commit it does not
-  hold, and still leaves the marker; into `archive`, where it takes no delta, it
-  fetches the subpath loose, and so does the port. A value that does not
-  start with `/`, the empty value included, ends the tool on an assertion
-  (`SIGABRT`, exit 134 from a shell) with nothing written; the port refuses it
-  at exit 1 before the first request.
-
-`pull-local` reads no delta by default: a source whose `deltas/` directory is
-corrupt or unreadable pulls as it does with `--disable-static-deltas`. With
-`--require-static-deltas` it reads the source as a fetch reads a remote, and
-the rules above hold, the file of each request read from the source directory.
-The source must be an `archive` repository with a summary. With no summary it
-refuses with `error: Fetch configured to require static deltas, but no summary
-deltas or delta index found`, and a source in another mode, with a summary,
-refuses with `error: Can't pull from archives with mode "<mode>"`. Where
-several refusals apply, the tool refuses in this order, and the port refuses
-in the same order: the summary signature checks, a source with no summary, a
-source in another mode, a ref the source does not hold (`error: No such branch
-'<ref>' in repository summary`), the none-found refusal, and then the commit
-signature checks. The delta taken is applied, the objects it produces equal those a plain `pull-local`
-imports, and the objects and `.commitmeta` it leaves out are imported loose.
-The parents `--depth` reaches are imported loose. `--require-static-deltas`
-and `--disable-static-deltas` together end the tool on an assertion
-(`ostree_repo_pull_with_options: assertion '!(pull_data->disable_static_deltas
-&& pull_data->require_static_deltas)' failed`, `SIGABRT`, exit 134 from a
-shell) with nothing written, on `pull-local` and on `pull`.
-
-A `--depth` below `-1` ends the tool on an assertion
-(`ostree_repo_pull_with_options: assertion 'pull_data->maxdepth >= -1'
-failed`, then `ostree_run: assertion failed: (success || error)`, `SIGABRT`,
-exit 134 from a shell), on `pull-local` and on `pull`. The tool sends no
-request and writes no object and no ref. A remote that the repository does
-not configure gives the same abort. Observed with `ostree` 2026.1 on
-2026-09-30 with `--depth=-2`. The port refuses the value with `error: invalid
-input: depth <depth> is below -1` at exit 1, and writes no object and no ref.
-`pull` refuses it before it sends a request. `pull-local` opens the source
-repository and each `--localcache-repo` first, and then refuses the value
-before it reads a ref or an object of the source.
-
-#### The archive view
-
-`ostrya serve` and `ArchiveView` of `ostrya` serve a repository of any mode
-as an archive repository, for a pull of the tool:
-
-- `config` is built: `[core]\nrepo_version=1\nmode=archive-z2\n`, followed
-  by `collection-id=ID\n` and then `indexed-deltas=VALUE\n` when the
-  repository config sets them, each with the value as the repository config
-  writes it. No other key and no other group is served. A change of the
-  repository config shows in the next answer.
-- `summary`, `summary.sig`, the files under `refs/` and `extensions/`, and the
-  `.commit`, `.dirtree`, `.dirmeta`, and `.commitmeta` objects are served as
-  stored. In an `archive` repository the `.filez` objects and the files under
-  `deltas/` and `delta-indexes/` are served as stored too.
-- In every other mode a `.filez` object is built on request: the framed
-  archive header of the logical metadata the mode stores, then the payload in
-  raw DEFLATE at `[archive] zlib-level`. For the same object at the same level
-  the bytes equal those of the `.filez` that an `archive` repository of the
-  port stores. A symlink object is the header alone. A stored file that
-  holds another size than the header states fails the response. `deltas/` and
-  `delta-indexes/` get 404 in these modes, and a summary that names a delta
-  is served unchanged. The pull then fetches the objects loose, as the delta
-  rules above state.
-- A ref alias under `refs/` is served as the ref it names, when that ref is a
-  regular file under `refs/`. A pull with no summary of an alias succeeds. An
-  alias of an alias, an alias whose target leaves `refs/` or holds an empty
-  component, as a trailing `/` gives, and a symlink anywhere else on a path
-  get 404. The walk starts at the `objects/` directory the repository handle
-  opened, so a symlink at `objects/` itself is part of the repository layout
-  and is followed.
-- `.lock`, `.update.lock`, `tmp/`, `state/`, every path with an empty
-  component or a component that starts with `.`, a `.file` path, and every
-  path outside the families above get 404, and so does a name longer than
-  the kernel accepts. A refused path and an absent path get the same
-  response. A directory on the path that the server cannot search gets 500.
-- A `HEAD` gets the status and the `Content-Length` of a `GET`. For a
-  `.filez` built on request it reads no xattr and no byte of the object, so
-  a `bare-split-xattrs` object whose xattrs do not parse answers a `HEAD`
-  with 200 and a `GET` with 500.
-- The summary of a `bare-user-shared` repository states that mode in
-  `ostree.summary.mode`. Observed with `ostree` 2026.1 on 2026-10-02: a pull
-  that gets this summary fails with `error: Invalid mode 'bare-user-shared'
-  in repository configuration`. A pull from the same repository with no
-  summary succeeds. The port keeps this summary and records the gap.
-
-`ostrya send` serves the same view over ssh. It answers a path that the view
-refuses with the reply of a path that is not found.
-
-### Signature verification during a pull
-
-Recovered by running `ostree` 2026.1 against a static HTTP server over a
-tool-built archive repository, with the destination's remote section written by
-`ostree remote add` and by `ostree config set`. Every refusal below leaves the
-destination with no ref and no object.
-
-What each configuration key selects:
-
-- `gpg-verify`, default true. Every commit the pull carries has to have a GPG
-  signature from the remote's trusted keyrings. A commit with none:
-  `error: Commit <hex>: GPG verification enabled, but no signatures found (use
-  gpg-verify=false in remote config to disable)`. A commit signed by a key the
-  keyrings do not hold: `error: Commit <hex>: Signature made <date> using EdDSA
-  key ID <keyid>` followed by `Can't check signature: public key not found`.
-- `gpg-verify-summary`, default false. `summary.sig` has to hold a valid GPG
-  signature over the summary bytes. A remote serving no summary: `error: GPG
-  verification enabled, but no summary found`. One serving a summary and no
-  `summary.sig`, or a `summary.sig` holding no GPG signature: `error: GPG
-  verification enabled, but no signatures found`.
-- `sign-verify`, default off. Either a boolean or a list of engine names split
-  on `,` and `;`. `ostree remote add --sign-verify=ed25519=inline:<key>` writes
-  `verification-ed25519-key=<key>` and `sign-verify=ed25519`; the `file:` form
-  writes `verification-ed25519-file=<path>`; `--no-sign-verify` writes
-  `sign-verify=false`; the same engine given twice writes it twice
-  (`sign-verify=ed25519,ed25519`), which is accepted. A name is not trimmed:
-  `sign-verify=ed25519, ed25519` fails with `error: Requested signature type is
-  not implemented`, as does any name no engine answers to. A commit with no
-  signature under the named engines: `error: Can't verify commit: No signatures
-  found`. One signed by an untrusted key: `error: Can't verify commit: ed25519:
-  Signature couldn't be verified with: key '<hex of the trusted key>'`.
-- `sign-verify-summary`, default off, and read on its own: `sign-verify=false`
-  alongside it still verifies the summary. A `summary.sig` the trusted keys do
-  not verify fails with the engine message above and no `Can't verify commit`
-  prefix. No `summary.sig` at all: `error: Signatures verification enabled, but
-  no summary.sig found (use sign-verify-summary=false in remote config to
-  disable)`, which is also what a remote serving no summary produces.
-- `verification-<engine>-key` holds one key. A list under either separator fails
-  with `error: Failed loading 'ed25519' keys from inline verification-key`.
-  `verification-<engine>-file` holds one key per line and accepts the commit any
-  line's key signed.
-- `gpgkeypath` is a `;`-separated list of keyring files and directories, added
-  to the trusted set rather than replacing it: a remote with an imported
-  `<remote>.trustedkeys.gpg` and a `gpgkeypath` naming an empty directory still
-  accepts the imported key's commit. An entry that does not exist fails the pull
-  with `error: Commit <hex>: opendir(<entry>): No such file or directory`.
-
-Behavior common to the axes:
-
-- The axes are independent and both apply: a remote with `gpg-verify` left at its
-  default and `sign-verify=ed25519` configured with the right key still fails on
-  GPG. Within `sign-verify` one engine is enough: `sign-verify=ed25519;dummy`
-  with a key for each accepts a commit signed by ed25519 alone.
-- An engine named by hand with no key fails with `error: No keys found for
-  required signapi type <engine>`, while `sign-verify=true` with no key for any
-  engine fails with `error: Can't verify commit: signature: ed25519: no keys
-  loaded`.
-- `verification-<engine>-key` alone verifies nothing: the check runs only where
-  `sign-verify` or `sign-verify-summary` asks for it.
-- Every commit the pull carries is checked, the parents `--depth` follows
-  included, and a commit the destination already holds is checked again on a
-  repeat pull.
-- `pull-local` makes no check unless asked: it has `--gpg-verify` and
-  `--gpg-verify-summary` flags, each needing `--remote` (`error: Must specify
-  remote name to enable gpg verification`), and the named remote's own
-  `gpg-verify=true` does not turn a check on by itself. A remote the
-  configuration does not describe holds no key, so its name satisfies the
-  switch and every signature is refused. The summary check reads the source
-  repository's `summary` and `summary.sig`. The refusals are `error: Commit
-  <c>: GPG verification enabled, but no signatures found (use gpg-verify=false
-  in remote config to disable)` for an unsigned commit, `Can't check
-  signature: public key not found` for a signature from a key the remote does
-  not hold, and `error: GPG verification enabled, but no summary.sig found
-  (use gpg-verify-summary=false in remote config to disable)` and `... but no
-  summary found ...` for a source missing either file. The tool reads and
-  discards a value given to either switch, so `--gpg-verify=false` turns the
-  check on. Each refusal writes no object and no ref.
-- A static delta carries a copy of the target commit's detached metadata in its
-  superblock metadata dict, under the key `deltas/<fanout>/<rest>/commitmeta`
-  holding the same `a{sv}` the `.commitmeta` file holds. A delta pull checks the
-  commit against that copy while storing the `.commitmeta` it fetched: a delta
-  generated while the commit carried an older signature fails the pull under a
-  policy the current `.commitmeta` satisfies.
-- `ostree` 2026.1 cannot pull a signed delta. A from-scratch and a from-to delta
-  signed with `static-delta generate --sign` both fail the pull with `error:
-  Invalid checksum of length 0 expected 32`, with verification configured or off,
-  while `static-delta apply-offline` applies the same delta and
-  `static-delta show` reports `Signed: yes`.
+The port writes the entries of an index file in name order. An index file of one
+entry is byte-identical between the two writers. `conformance/cli-surface.md`,
+"P2", records the order of an index file with two or more entries.
 
 ### Config file (`<repo>/config`, GKeyFile / INI)
 
-Created with `[core]` `repo_version=1`, `mode=<mode>`, optional
-`collection-id`. Selected `[core]` keys: `repo_version` (must be 1), `mode`,
-`min-free-space-percent` (default 3) / `min-free-space-size` (regex
-`^([0-9]+)(G|M|T)B$`, size wins over percent), `fsync` (default true),
-`per-object-fsync` (default false), `locking` (default true),
-`lock-timeout-secs` (default 300), `tmp-expiry-secs` (default 86400),
-`disable-xattrs`, `collection-id`, `parent`, `default-repo-finders` (default
-`config;mount`), `auto-update-summary` and its deprecated alias
-`commit-update-summary` (both default false). `[archive] zlib-level` (1-9, default 6). Remote sections are
-`[remote "<name>"]` with keys `url`, `contenturl`, `metalink`, `gpg-verify`
-(default true), `gpg-verify-summary` (default false), `gpgkeypath`, TLS keys,
-`collection-id`, `sign-verify`, `sign-verify-summary` (both default off),
-`verification-<engine>-key` / `verification-<engine>-file`. What the
-verification keys select, and how each value is spelled, is in "Signature
-verification during a pull". A remote section can also hold the push and
-pull keys of the port, `push-url`, `ssh-command`, `receive-command`,
-`push-token-file`, `push-user`, `pull-url`, and `send-command` (see "Port
-extension: the push and pull keys of a remote").
+The file `config` is a key file. A new repository gets a `[core]` group with
+`repo_version=1`, `mode=<mode>`, and an optional `collection-id`. The `config`
+of a new archive repository is exactly
+`[core]\nrepo_version=1\nmode=archive-z2\n`.
 
-The port reads at most 1048576 bytes of `config`, and refuses a larger file
-with `config exceeds the 1048576-byte size cap`, when it opens a repository
-and at each later read of the file. The tool reads a file of any size. This is
-a port divergence.
+`ostrya-config(1)` lists each key of `config`, its type, and its default. The
+list includes the keys of the port and the receive policy groups.
+`conformance/cli-behavior.md`, "Signature verification during a pull", states
+what the verification keys of a remote select and how each value is spelled.
+`conformance/cli-surface.md`, "Global conventions", records the size cap that
+the port applies to `config`.
 
-Parsing rules, recovered by feeding crafted config files to the tool, reading
-back with `ostree config get` and commands that consume config, and inspecting
-the bytes `ostree config set` writes:
+`RepoConfig::auto_update_summary` reads `auto-update-summary` and
+`commit-update-summary` together. Its callers in the port are the receive
+policy readers, `ReceivePolicy::from_config` and `ReceivePolicy::from_file`.
+`conformance/cli-surface.md`, "P2", `commit`, records the effect of the two
+keys on a commit.
 
-- Lines split on newlines; a trailing carriage return is stripped, so CRLF
-  input is accepted.
-- Whitespace handling uses ASCII space and tab only. A leading space or tab on
-  a line is ignored before the line is classified, a line of only spaces or
-  tabs is treated as blank, and a space or tab around a key is trimmed. A
-  non-breaking space (U+00A0) or other non-ASCII whitespace is kept: it is
-  never trimmed, and a line whose only content is such a character is a parse
-  error that fails the whole file.
+Observed behavior: the tool reads and writes `config` by these rules.
+
+- The reader splits the file into lines at each newline. It removes a trailing
+  carriage return, so it accepts CRLF input.
+- White space is ASCII space and tab alone. The reader ignores a leading space
+  or tab before it classifies a line. A line of only spaces and tabs is blank.
+  The reader trims a space or tab around a key. It never trims a non-breaking
+  space (U+00A0) or other non-ASCII white space. A line whose only content is
+  such a character is a parse error, and the whole file fails.
 - A line whose first non-blank character is `#` is a comment. `;` does not
-  start a comment; a line that begins with `;` and is not a `key=value` pair
+  start a comment. A line that starts with `;` and is not a `key=value` pair
   is a parse error.
-- A blank line is ignored.
-- A group header starts with `[`; a leading space or tab before `[` is
-  allowed. The name runs from `[` to the first `]`, and only whitespace may
-  follow that `]`; text after it (as in `[a]b]`) fails the whole file. The
-  name may not be empty (`[]` fails the whole file) and may not contain `[`
-  (as in `[a[b]`, reported as an invalid group name). A repeated header merges
-  into the existing group.
-- A `key=value` entry splits on the first `=`. The key is trimmed of
-  surrounding space and tab. In the value, leading space and tab are removed
-  and trailing whitespace is kept. A `#` inside a value is literal; there are
-  no inline comments. A repeated key takes the last value.
-- `auto-update-summary` and `commit-update-summary` are read together, and
-  either one true regenerates the summary after a ref changes. Observed with
-  `ostree` 2026.1 through `ostree commit -b x` into an archive repository, for
-  each of the nine combinations of each key absent, `true`, and `false`: the
-  commit writes `summary` exactly when one of the two keys is `true`, so
-  `auto-update-summary=false` with `commit-update-summary=true` writes it, and
-  so does the reverse. A value that is not a boolean in either key, `yes` for
-  example, makes the commit exit 1 with `error: Key file contains key
-  “auto-update-summary” which has a value that cannot be interpreted.`, also
-  when the other key is `true`; the ref is written and the summary is not.
-  `RepoConfig::auto_update_summary` reads the two keys by the same rule and
-  refuses a malformed value in either one. `ReceivePolicy::from_config` is
-  its one caller in the port: `ostrya commit` and `ostrya pull` do not
-  regenerate the summary.
-- A boolean is one of `true`, `false`, `1`, `0`. Any other spelling (`yes`,
-  `no`, `on`, `off`, mixed case such as `True`, an out-of-range number such as
-  `2`, or the empty string) is rejected with a "value that cannot be
-  interpreted" error. A run of trailing space, tab, or form feed is ignored
-  before the match, so `fsync=true ` reads as `true` while `ostree config get
-  core.fsync` still prints the trailing byte. A trailing vertical tab is not
-  ignored and fails the match. The port matches the four
-  literals against the value as written and refuses a value carrying any
-  trailing byte (`conformance/cli-surface.md`, "Global conventions").
-- An integer takes the leading run of decimal digits with an optional `-` sign
-  and ignores whatever follows: `101x`, `101 x`, and `101.9` all read as `101`,
-  measured through `min-free-space-percent`, whose out-of-range refusal quotes
-  the value as written. A value with no leading digit (`bogus`, `x101`,
-  `+101`, the empty string) reads as no value at all and the key's default
-  applies, silently: `lock-timeout-secs=bogus` and `tmp-expiry-secs=bogus` both
-  open. The port reads an integer key as a whole decimal value and refuses
-  anything else (`conformance/cli-surface.md`, "Global conventions").
-- `min-free-space-size` is read from the value as written, with no trailing
-  trim: `min-free-space-size=1MB ` is refused with `error: opening repo:
-  Invalid min-free-space-size '1MB '`. The port refuses it too.
-- Writing a string value escapes a backslash as `\\`, a newline as `\n`, and a
-  carriage return as `\r` anywhere in the value; within the leading whitespace
-  run each space becomes `\s` and each tab `\t`. A space or tab elsewhere, a
-  trailing space or tab, and a `;` are written literally. Groups are written as
-  `[name]` followed by `key=value` lines, a blank line between groups, and no
-  spaces around `=`. A freshly initialized archive repo config is exactly
-  `[core]\nrepo_version=1\nmode=archive-z2\n`.
+- The reader ignores a blank line.
+- A group header starts with `[`, and a leading space or tab can come before
+  it. The name runs from `[` to the first `]`. Only white space can follow that
+  `]`, so text after it, as in `[a]b]`, fails the whole file. An empty name
+  (`[]`) fails the whole file. A name that holds `[`, as in `[a[b]`, is
+  reported as an invalid group name. A name with a control character fails the
+  whole file with `Invalid group name: <name>`. A `"` in a group name has no
+  special meaning. A repeated header merges into the existing group.
+- A `key=value` entry splits at the first `=`. The reader trims space and tab
+  around the key. In the value, it removes leading space and tab, and it keeps
+  trailing white space. A `#` in a value is literal, so a value has no inline
+  comment. A repeated key takes the last value.
+- A boolean is one of `true`, `false`, `1`, and `0`. The reader refuses each
+  other spelling with a "value that cannot be interpreted" error: `yes`, `no`,
+  `on`, `off`, mixed case such as `True`, an out-of-range number such as `2`,
+  and the empty string. Before the match, the reader ignores a run of trailing
+  space, tab, or form feed. So `fsync=true ` reads as `true`, and
+  `ostree config get core.fsync` still prints the trailing byte. A trailing
+  vertical tab fails the match.
+- An integer is the leading run of decimal digits, with an optional `-` sign.
+  The reader ignores the bytes that follow, so `101x`, `101 x`, and `101.9`
+  all read as `101`. The out-of-range refusal of `min-free-space-percent`
+  quotes the value as written, and it shows this rule. A value with no leading
+  digit (`bogus`, `x101`, `+101`, the empty string) reads as no value. Then the
+  default of the key applies, and the tool writes no diagnostic:
+  `lock-timeout-secs=bogus` and `tmp-expiry-secs=bogus` both open.
+- The value of `min-free-space-size` must match `^([0-9]+)(G|M|T)B$`. The
+  reader takes the value as written, with no trim of trailing bytes. So
+  `min-free-space-size=1MB ` is refused with `error: opening repo: Invalid
+  min-free-space-size '1MB '`. The port refuses the same value.
+- The reader unescapes a string value. `\s` becomes a space, `\n` a newline,
+  `\t` a tab, `\r` a carriage return, `\\` a backslash, and `\;` a `;`.
+- The writer escapes a backslash as `\\`, a newline as `\n`, and a carriage
+  return as `\r` anywhere in a string value. In the leading run of white space,
+  it writes each space as `\s` and each tab as `\t`. It writes a space or tab
+  in another place, a trailing space or tab, and a `;` as they are.
+- The writer puts each group as `[name]`, followed by its `key=value` lines. It
+  puts a blank line between groups and no spaces around `=`.
+
+`conformance/cli-surface.md`, "Global conventions", states how the port reads a
+boolean and an integer.
 
 ## Write path: loose-object inode modes and durability
 
-The bytes an object hashes to are mode-independent, but the permission bits and
-ownership the tool puts on the loose object's inode, and the syscall sequence it
-uses to publish objects durably, are recovered by black-box observation:
-committing files of assorted modes and a symlink with the tool and inspecting
-the resulting objects, and tracing the commit's syscalls.
+The checksum of an object does not depend on the repository mode, except in
+`bare-user-only` ("Checksum computation"). The inode of a loose object does: its
+permission bits, its owner, and the syscalls that make it durable. This section
+gives these rules.
 
-Loose-object inode permission bits, by object class and repository mode:
+Inode permission bits, by object class and repository mode:
 
-- Metadata objects (`.dirtree`, `.dirmeta`, `.commit`, and by construction the
-  other metadata types) carry mode 0644 in every repository mode.
-- `archive`: every content object (`.filez`) is 0644.
-- `bare`: a content object's inode carries the full logical uid, gid, mode, and
-  xattrs; a symlink is a real symlink owned by the logical uid/gid. The port
-  applies the owner first, then the xattrs, then the mode. A chown of a regular
-  file removes `security.capability` and clears the setuid bit, and the setgid
-  bit when group execute is set, also when the ids do not change. A mode change
-  keeps `security.capability`. The kernel checks a `user.*` xattr against the
-  inode's write permission, which a logical mode with no owner-write bit (0444,
-  0555) does not grant, so the mode goes on last. The tool keeps `security.capability` on a bare object. This was
-  observed on btrfs, kernel 6.18.52, ostree 2026.1, as root in a user
-  namespace: a file with `cap_net_raw=ep` committed into bare, with its own
-  owner and with `--owner-uid=1234 --owner-gid=5678`, gives a `.file` object
-  with the same `security.capability` value, and the port's commit gives the
-  same commit checksum.
-- `bare-user`: a regular-file content object's inode mode is
-  `(logical_perm & 0o775) | 0o400` -- owner bits and the group/other read and
-  execute bits are kept, owner-read is forced on, and other-write is dropped
-  (`0666` stores as `0664`, `0777` as `0775`). A symlink is stored as a regular
-  file whose inode is 0644. The inode is owned by the writing process; the
-  logical uid/gid live in `user.ostreemeta`. A logical mode with no owner-write
-  bit (0444, 0555) leaves that inode without write permission, and the kernel
-  checks a `user.*` xattr against it, so `user.ostreemeta` is written before the
-  mode is applied.
-- `bare-user-shared`: every content object's inode is a fixed 0644.
-- `bare-user-only`: a regular-file content object's inode mode is the canonical
-  `logical_perm & 0o755` -- group-write and other-write are dropped and no
-  special bits are kept (`0664` stores as `0644`, `0666` as `0644`, `0775` as
-  `0755`). uid/gid are discarded and no xattrs are stored. A symlink is a real
-  symlink, and its mode stays `S_IFLNK | 0o777`.
+- Metadata objects (`.dirtree`, `.dirmeta`, `.commit`, and the other metadata
+  types) are 0644 in every repository mode.
+- `archive`: every content object (`.filez`) is 0644. The `.filez` header holds
+  the logical uid, gid, mode, and xattrs.
+- `bare`: the inode of a content object carries the full logical uid, gid,
+  mode, and xattrs. A symlink is a real symlink that the logical uid/gid own.
+  The port applies the owner first, then the xattrs, then the mode:
+  - A chown of a regular file removes `security.capability` and clears the
+    setuid bit, also when the ids do not change. When group execute is set, it
+    also clears the setgid bit.
+  - A mode change keeps `security.capability`.
+  - The kernel checks a `user.*` xattr against the write permission of the
+    inode. A logical mode with no owner-write bit (0444, 0555) does not give
+    that permission, so the mode goes on last.
 
-  This mode stores no header, so a write into it records the header it can
-  store -- uid 0, gid 0, no xattrs, and a non-symlink's permission bits reduced as
-  above -- and an object's identity covers that recorded header rather than the one
-  the writer supplied. A directory's metadata is recorded the same way, so a
-  commit's dirmeta and dirtree checksums follow from the reduced form too. An
-  entry already in that form keeps the identity it has in the other modes; any
-  other entry takes a different one.
+  Observed behavior: the tool keeps the `security.capability` value of a file
+  on its `bare` object, with and without `--owner-uid` and `--owner-gid`. The
+  port gives the same commit checksum.
+- `bare-user`: the inode mode of a regular-file content object is
+  `(logical_perm & 0o775) | 0o400`. The owner bits and the group and other read
+  and execute bits stay, owner read is set, and other write is removed (`0666`
+  stores as `0664`, `0777` as `0775`). A symlink is a regular file whose inode
+  is 0644. The writing process owns the inode. `user.ostreemeta` holds the
+  logical uid, gid, mode, and xattrs. A logical mode with no owner-write bit
+  (0444, 0555) gives an inode with no write permission. The kernel checks a
+  `user.*` xattr against that permission, so `user.ostreemeta` goes on before
+  the mode.
+- `bare-user-shared`: `bare-user` storage, with every content inode at a fixed
+  0644 ("bare-user-shared mode").
+- `bare-user-only`: the inode mode of a regular-file content object is the
+  canonical `logical_perm & 0o755`. Group write and other write are removed,
+  and no special bit stays (`0664` stores as `0644`, `0666` as `0644`, `0775`
+  as `0755`). The uid/gid are discarded and no xattrs are stored. A symlink is
+  a real symlink, and its mode stays `S_IFLNK | 0o777`.
 
-  Observed: a tree holding a 0777 file carrying a `user.demo` xattr, a 04755
-  file, a 0640 file, and a 0777 subdirectory, committed by a non-root user with
-  no ownership options, produces in `bare-user-only` exactly the content,
-  dirmeta, and dirtree checksums the same tree produces in `bare-user` when its
-  modes are already canonical and it is committed 0:0 -- the 0777 file lands as
-  0755 under the 0755 file's checksum, and the xattr-bearing file lands under the
-  checksum of the same file without the xattr. Committing that tree with and
-  without `--owner-uid`/`--owner-gid` gives identical checksums, which is the
-  discarded ownership.
+  This mode stores no header. The identity of an object covers the reduced
+  header that "Checksum computation" states, and the dirmeta of a directory
+  takes the same reduction. An entry already in that form keeps the identity
+  it has in the other modes. Any other entry gets a different identity.
 
-Symlink storage detail (confirmed for `bare-user`): a symlink is a regular file
-whose content is the target bytes followed by one NUL; its `user.ostreemeta` is
-the `(uuua(ayay))` stat form with the symlink's uid/gid, mode `S_IFLNK | 0o777`
-(`0o120777`), and xattr set; the inode is 0644.
+  Observed behavior: a tree holds a 0777 file with a `user.demo` xattr, a 04755
+  file, a 0640 file, and a 0777 subdirectory. The tree is committed in
+  `bare-user-only` with no ownership options. This commit gives the content,
+  dirmeta, and dirtree checksums of a `bare-user` commit of the tree with
+  canonical modes and owner 0:0. The 0777 file gets the checksum of the 0755
+  file, and the file with the xattr gets the checksum of the same file without
+  it. The checksums are the same with and without `--owner-uid`/`--owner-gid`,
+  because the mode discards the ownership.
 
-Archive `.filez` layout (extends "File content object header"):
+Observed behavior: in `bare-user`, a symlink object stored as a regular file
+holds the target bytes followed by one NUL. The `user.ostreemeta` value is
+the `(uuua(ayay))` stat form with the uid/gid of the symlink, the mode
+`S_IFLNK | 0o777` (`0o120777`), and its xattr set.
+
+Archive `.filez` layout (the framing is in "File content object header"):
 
 - A regular file is the framed archive header `(tuuuusa(ayay))` followed by the
-  raw-DEFLATE payload. An empty payload compresses to the two-byte empty DEFLATE
-  stream `03 00`.
-- A symlink is the framed archive header alone (target in field 5, uncompressed
-  size 0); no payload bytes follow, not even the empty-DEFLATE stream.
-- The raw-DEFLATE bytes the port emits (via miniz_oxide) match the tool's zlib
-  output byte-for-byte for the small fixture payloads at every level 1-9. Over a
-  real tree most payloads reach two encodings of two lengths (`conformance/
-  cli-surface.md`, "P2"). The object identity is over the uncompressed bytes, so
-  byte-identity of the stored compressed payload is not required for
-  interoperability.
-- Golden SHA-256 vectors pin the bytes the port's encoder emits, one vector per
-  level 1-9, over a payload of one and a half output chunks
-  (`crates/ostrya-core/src/deflate.rs`, `tests`). The nine vectors differ, so a
-  change to the map from `[archive] zlib-level` to the encoder's parameters
-  fails the gate. A tenth vector holds the stream a caller who flushes in the
-  middle of a payload writes: a flush ends the DEFLATE block, which changes the
-  stored bytes and leaves the object checksum the same. The same vectors hold
-  for a sink that `reset` started on a new stream, so a caller that reuses one
-  sink for many objects stores the same bytes.
-- Observed at level 1 on a 160 KiB payload: one write of the whole payload
-  produces different bytes than 64 KiB writes of the same payload. The ingest
-  path streams through a 64 KiB copy buffer, so the stored bytes follow the
-  level alone for a payload that arrives that way. A caller that gives
-  `write_regfile_inline` one buffer larger than that can store the second
-  form.
+  raw-DEFLATE payload. An empty payload compresses to the two-byte empty
+  DEFLATE stream `03 00`.
+- A symlink is the framed archive header alone: the target is in field 5 and
+  the uncompressed size is 0. No payload byte follows, and there is no empty
+  DEFLATE stream.
+- The object checksum covers the uncompressed bytes, so the stored compressed
+  bytes can differ between writers. For the small fixture payloads, the
+  raw-DEFLATE bytes of the port (miniz_oxide) are the bytes of the tool's zlib
+  at each level 1-9. `conformance/cli-surface.md`, "P2", records the stored
+  lengths over a real tree.
+- Golden SHA-256 vectors pin the bytes of the port's encoder
+  (`crates/ostrya-core/src/deflate.rs`, `tests`). There is one vector per level
+  1-9, over a payload of one and a half output chunks. The nine vectors differ,
+  so a change to the map from `[archive] zlib-level` to the encoder parameters
+  fails the gate. A tenth vector holds a flush in the middle of a payload. The
+  flush ends the DEFLATE block, so the stored bytes change and the object
+  checksum does not. The vectors also hold for a sink that `reset` started on a
+  new stream. They hold for writes of one byte, of 4093 bytes, and of the
+  whole payload, so the write size does not change the stored bytes. The ingest
+  path streams through a 64 KiB copy buffer, and one larger buffer given to
+  `write_regfile_inline` stores the same bytes.
 
-Object store fanout directories `objects/<xx>/` are created with request mode
-0777 (reduced by the umask); `objects/` itself is 0775. This is the same in
-every mode the tool writes. In `bare-user-shared`, the port extension, each
-directory the port creates is forced to 02770 with an `fchmod` after the
-create, independent of the umask (see the bare-user-shared section).
+The fanout directories `objects/<xx>/` are created with the request mode 0777,
+which the umask reduces. `objects/` itself is 0775. This is the same in every
+mode the tool writes. In `bare-user-shared` the port sets each directory it
+creates to 02770 with an `fchmod` after the create, whatever the umask
+("bare-user-shared mode").
 
-Durability and staging (traced): the tool ingests each object into an unnamed
-temp file (`O_TMPFILE` in the staging directory) and materializes it with
-`linkat("/proc/self/fd/N", ..., AT_SYMLINK_FOLLOW)`.
+### Durability and staging
 
-- Default (`fsync=true`, `per-object-fsync=false`): objects are linked into the
-  staging directory under their loose path, then `syncfs(repo)` runs once, then
-  each object is `renameat`-ed into `objects/<xx>/`, then each touched
-  `objects/<xx>` and `objects/` is `fsync`-ed.
-- `per-object-fsync=true`: the temp file of each content object is `fsync`-ed
-  at ingest. A metadata object is not synced at ingest. An object linked from
-  another repository by `pull-local` is not synced. The `syncfs(repo)` and
-  directory `fsync`s still run at publication. The switch `--per-object-fsync`
-  on `pull` and `pull-local` has the scope of the key.
-- `fsync=false`: no `syncfs`, `fsync`, or `fdatasync` is issued.
+Observed behavior: the tool ingests each object into an unnamed temp file
+(`O_TMPFILE` in the staging directory). It then links the file with
+`linkat("/proc/self/fd/N", ..., AT_SYMLINK_FOLLOW)`. The keys `[core] fsync`
+and `[core] per-object-fsync` set the syncs:
 
-The port always stages then renames (the default path) and honors the two
-settings for the syncs it issues: `fsync=false` makes every sync a no-op,
-`per-object-fsync=true` `fsync`s the file of each content object at ingest and
-no metadata object, and otherwise a single `syncfs` precedes the renames with
-directory `fsync`s after. A content object the port stores as a symlink inode
-(a symlink in `bare` and `bare-user-only`) and an object it hardlinks from
-another repository are not synced at ingest. The `syncfs` that opens
-publication makes every staged object durable, metadata included. A receiving
-push session runs that `syncfs` before it takes the update lock. With fsync
-on, it then `fsync`s the file of each metadata object it stages under the lock,
-and its publication runs no second `syncfs`. Any other transaction publishes
-before it takes the update lock. It takes the lock only to write detached
-metadata and refs, after the directory `fsync`s of publication. A pull stages
-the `.commitmeta` it copies as a file in the staging directory, with no sync of
-its own, and renames it into `objects/<xx>/` at that step. With fsync on, the
-`syncfs` that opens publication makes the staged file durable, and where
-publication runs no `syncfs` the step runs one before the rename. After the
-renames the step `fsync`s each fanout directory that gained a `.commitmeta`
-once, and `objects/` once when it created a fanout directory. Every other
-`.commitmeta` write, and each `.tombstone-commit` write, creates a temp file in
-`tmp/` and renames it into `objects/<xx>/`. When `tmp/` is on a different
-filesystem from `objects/`, the rename fails with `EXDEV` and the write fails.
-The staging directory layout is transient and is not part of the on-disk
-format.
+- Default (`fsync=true`, `per-object-fsync=false`): the objects are linked into
+  the staging directory under their loose path. Then `syncfs(repo)` runs once.
+  Then the tool runs `renameat` on each object into `objects/<xx>/`. Then each
+  touched `objects/<xx>` and `objects/` gets an `fsync`.
+- `per-object-fsync=true`: the temp file of each content object gets an
+  `fsync` at ingest. A metadata object gets no sync at ingest, and neither does
+  an object that `pull-local` links from another repository. The
+  `syncfs(repo)` and the directory `fsync`s still run at publication.
+- `fsync=false`: the tool issues no `syncfs`, `fsync`, or `fdatasync`.
+
+`conformance/cli-behavior.md`, "The fsync vocabulary", gives the command
+switches of the two keys and the sync counts.
+
+The port always stages and then renames, and it applies these three rules to
+the syncs it issues. At ingest it does not sync an object that it hardlinks
+from another repository. It also does not sync a content object that it stores
+as a symlink inode (a symlink in `bare` and `bare-user-only`). The `syncfs`
+that starts publication makes every staged object durable, metadata included.
+
+A push session that receives objects runs that `syncfs` before it takes the
+update lock ("The update lock"). When fsync is on, it then syncs the file of
+each metadata object that it stages under the lock. Its publication runs no
+second `syncfs`. Every other transaction takes the update lock after
+publication ("The update lock").
+
+A pull stages each `.commitmeta` that it copies as a file in the staging
+directory, with no sync of its own. At the step that writes detached metadata
+and refs, it renames the file into `objects/<xx>/`. When fsync is on, the
+`syncfs` that starts publication makes the staged file durable. Where
+publication runs no `syncfs`, the step runs one before the rename. After the
+renames, the step syncs each fanout directory that gained a `.commitmeta` once,
+and `objects/` once if the step created a fanout directory.
+
+Every other `.commitmeta` write, and each `.tombstone-commit` write, creates a
+temp file in `tmp/` and renames it into `objects/<xx>/`
+(`conformance/cli-surface.md`, "Global conventions"). If `tmp/` is on a
+different filesystem from `objects/`, the rename fails with `EXDEV` and the
+write fails.
+
+The layout of the staging directory is transient and is not part of the
+on-disk format ("Repository lock and staging" gives its place).
 
 ## Write path: fs-verity (ex-integrity)
 
-A repository can seal its loose objects with fs-verity as they are written. The
-behavior was recovered by tracing `ostree` 2026.1 (built with `ex-fsverity`) on
-a btrfs repository, probing objects on a verity-capable and a non-capable
-filesystem, and cross-checking the kernel's measured digest against the port's
-`FsVerityHasher`. fs-verity enablement seals an inode against modification and
-gives the kernel a digest it can enforce on reads; the object bytes and their
-checksums are unchanged, so a verity repository is byte-for-byte a normal
-repository whose regular-file objects happen to be sealed.
+A repository can seal its loose objects with fs-verity when it writes them. A
+seal makes the inode immutable and gives the kernel a digest that it enforces
+on reads. The object bytes and the checksums do not change. A verity
+repository is thus a normal repository whose regular-file objects are sealed.
 
-Config. The `[ex-integrity]` group carries two tri-state keys, each spelled
-`no`, `maybe`, or `yes`:
+The keys `fsverity` and `composefs` of the group `[ex-integrity]` set the
+policy: `no`, `maybe`, or `yes`. `ostrya-config(1)`, "INTEGRITY KEYS", gives
+the keys, their defaults, and the refused values. In the tool, `composefs` also
+controls deployments.
 
-- `fsverity` -- whether loose objects are sealed. Defaults to `no`.
-- `composefs` -- governs deployment behavior elsewhere; here it is read only for
-  its effect on the `fsverity` default. `composefs` set to `yes` or `maybe`
-  raises the `fsverity` default to `maybe`.
+The write seals each loose object that is a regular file, in every repository
+mode, `archive-z2` included:
 
-An explicit `fsverity` value overrides the composefs-derived default. A value
-that is not `no`/`maybe`/`yes` is a malformed-config error.
+- content objects: `.file` (bare family) and `.filez` (archive);
+- metadata objects: `.dirtree`, `.dirmeta`, and `.commit`;
+- symlink objects stored as regular files: `bare-user`, `bare-user-shared`, and
+  `archive` keep the content of a symlink in a regular file, so these objects
+  are sealed.
 
-Scope. Verity is enabled on every loose object stored as a regular file, in
-every repository mode including archive-z2:
+fs-verity applies to regular files, so the write skips the real symlink
+objects of `bare` and `bare-user-only`. A deduplicated write (the object is
+already in `objects/`) does not touch the object. fs-verity is a property of
+the inode, and a seal of a hardlinked object also seals the copy in the source
+repository. The port does not hardlink an object that it imports into a
+repository whose effective `fsverity` is not `no`. It copies the object and
+seals the copy (`conformance/cli-surface.md`, "P2", `pull-local`).
 
-- content objects: `.file` (bare family) and `.filez` (archive),
-- metadata objects: `.dirtree`, `.dirmeta`, and `.commit`,
-- symlink objects stored as regular files: bare-user, bare-user-shared, and
-  archive keep a symlink's content in a regular file, so those objects are
-  sealed.
+Under `no`, the write seals nothing, and the staging path does not change. On a
+filesystem without verity, `FS_IOC_ENABLE_VERITY` returns `ENOTTY`. Under
+`maybe`, a commit then completes with unsealed objects. Under `yes`, the write
+fails. The tool then reports that fs-verity is required and that the
+filesystem does not support it.
 
-Only real symlink objects are skipped, because fs-verity applies to regular
-files. Real symlink objects occur in `bare` and `bare-user-only`. A deduplicated
-write (the object already present in `objects/`) is left untouched.
+`FS_IOC_ENABLE_VERITY` needs write permission on the inode, also through a
+read-only descriptor. Without it the kernel returns `EACCES`. A caller with
+`CAP_DAC_OVERRIDE` passes the check. For a content object with the logical
+mode 0444, 0555, or 0400, the order of the mode and the seal thus decides the
+result (`conformance/cli-surface.md`, "P2", `commit`).
 
-The scope above is what the tool's write path does. Its local-import path leaves
-sealing out: `ostree pull-local` into a repository carrying `fsverity=yes`
-hardlinks the source's objects and seals none of them, while a commit written into
-that same repository is sealed (observed on btrfs with `ostree` 2026.1 built with
-`ex-fsverity`). fs-verity is a per-inode property, so a hardlinked object cannot
-be sealed without sealing the source repository's copy. The port applies the scope
-to every write including an import, which means it copies where the tool links;
-see `port-plan.md`, Phase 16b.
+The argument of `FS_IOC_ENABLE_VERITY` is `fsverity_enable_arg { version 1,
+hash_algorithm 1 (SHA-256), block_size 4096, salt_size 0 }`. It is a 128-byte
+struct with the other fields zero. "fs-verity digest" (under "composefs")
+gives the digest. The kernel's `FS_IOC_MEASURE_VERITY` result for a sealed
+object equals the `FsVerityHasher` digest of the on-disk bytes of that object.
+A `.file` outside `archive` holds the raw payload, so its measured digest is
+the digest that the composefs export records ("File backing"). An `archive`
+`.filez` holds compressed bytes, so its measured digest is a different value.
 
-Semantics.
+Observed behavior: the tool writes each object in this order, while the inode
+is still an anonymous `O_TMPFILE` staging file:
 
-- `no`: nothing is sealed; the staging path is unchanged.
-- `maybe`: best effort. Every `FS_IOC_ENABLE_VERITY` failure is swallowed, so a
-  filesystem without verity (which returns `ENOTTY`) commits normally with
-  objects left unsealed.
-- `yes`: required. An enable failure fails the write, matching the tool, which
-  reports that fsverity is required but the filesystem does not support it.
-
-`FS_IOC_ENABLE_VERITY` requires write permission on the inode, also when the
-descriptor is read-only. Without it the kernel returns `EACCES`. A caller with
-`CAP_DAC_OVERRIDE` passes the check. The tool applies the logical mode before
-the seal, so an unprivileged writer to a `fsverity=yes` repository gets this
-error for a content object with the logical mode 0444, 0555, or 0400:
-
-```
-error: Writing content object: fsverity: ioctl(FS_IOC_ENABLE_VERITY): Permission denied
-```
-
-Observed on btrfs, kernel 6.18.52, with `ostree` 2026.1.
-
-Digest parameters. SHA-256, 4096-byte blocks, and a zero-length salt. The
-enable argument is `fsverity_enable_arg { version 1, hash_algorithm 1 (SHA-256),
-block_size 4096, salt_size 0 }`, a 128-byte struct with the remaining fields
-zero. The kernel's `FS_IOC_MEASURE_VERITY` result for a sealed object equals the
-`FsVerityHasher` digest of that object's on-disk bytes, which is the same value
-the composefs export records per backing file. For a bare-user or
-bare-user-shared `.file`, whose on-disk bytes are the raw payload, that digest
-is the fs-verity digest of the payload.
-
-Write-path order of the tool, per object, while the inode is still an anonymous
-`O_TMPFILE` staging file:
-
-1. open `O_TMPFILE|O_WRONLY` in the staging directory,
-2. write or reflink the payload,
-3. apply `fchmod`/`fchown` and xattrs,
-4. reopen the inode read-only through `/proc/self/fd/N`,
+1. open `O_TMPFILE|O_WRONLY` in the staging directory;
+2. write or reflink the payload;
+3. apply `fchmod`/`fchown` and the xattrs;
+4. reopen the inode read-only through `/proc/self/fd/N`;
 5. close the writable descriptor (the kernel refuses `FS_IOC_ENABLE_VERITY`
-   while any writable descriptor to the inode is open),
-6. `ioctl(ro_fd, FS_IOC_ENABLE_VERITY)`,
+   while a writable descriptor to the inode is open);
+6. `ioctl(ro_fd, FS_IOC_ENABLE_VERITY)`;
 7. `linkat` the read-only descriptor into the staging directory.
 
-A named temp file (used where the filesystem refuses `O_TMPFILE`, and for the
-small caller-held bodies of symlink and metadata objects) follows the same
-close-reopen-seal ordering and is then renamed into place rather than linked.
-Publication into `objects/` is unchanged.
-
-The port uses a different order for a regular-file content object. Before the
-seal, it applies `user.ostreemeta` in bare-user, the fixed mode 0644 in archive,
-and the fixed mode 0644 and `user.ostreemeta` in bare-user-shared. In bare,
-bare-user, and bare-user-only, when the temp's create mode lacks owner read or
-owner write, it first sets the temp to 0600. After the seal, on the read-only
-descriptor and before the link, it applies the owner, then the logical xattrs,
-then the logical mode in bare, and the canonical mode in bare-user and
-bare-user-only. The stored object is the object the tool writes when its write
-succeeds. See `port-plan.md`, Phase pre13.
-
-Closing the writable descriptor is not by itself enough to guarantee the enable
-succeeds: `fork` copies the file descriptor table, so a child process carries a
-copy of the writable staging descriptor until its `exec` closes it, and the
-kernel refuses the enable with `ETXTBSY` while that copy lives. Any process that
-spawns children from one thread while another stages objects meets this window.
-The port retries an `ETXTBSY` enable for up to 50 ms, which outlasts a
-fork-to-exec gap; every other error is reported on the first attempt.
-
-The `FS_IOC_ENABLE_VERITY` and `FS_IOC_MEASURE_VERITY` ioctls are the only
-syscalls in the write path that require `unsafe`; they live in the audited
-`ostrya-sys` crate.
-
-## Port extension: the ex-ostrya config group
-
-The `[ex-ostrya]` group is an ostrya extension. The `ostree` tool defines no key
-in it and reads none. A list key is split on `;` by the key-file list rule, is
-empty when the key is absent, and takes a trailing `;` with no empty element. A
-boolean key takes `true`, `false`, `1`, or `0`, and is false when absent.
-
-The prune and transfer keys:
-
-- `gc-root-metadata-keys` -- a list: the metadata keys a prune reads for
-  further reachable commits. The value of each key, in a commit's own metadata
-  and in its detached metadata, is an `aay` of 32-byte commit checksums, and
-  each checksum is a root of the walk. See `port-plan.md`, Phase 22.
-- `detached-metadata-exclude` -- a list: the detached-metadata keys the
-  repository does not store when it receives a commit, and does not send when
-  it serves one. A pull drops each key the list names from the `.commitmeta` it
-  stores. The receive policy readers put the list into the filter of the
-  receive policy.
-
-The receive groups state the policy a repository applies to the commits and
-ref updates it receives. They are key-file groups of their own, beside
-`[ex-ostrya]`, and `ReceivePolicy::from_config` reads them. The groups are
-parsed strictly: an unknown key, a group name that starts with `ex-ostrya `
-and has no shape of this list, a reference to a group that does not exist,
-and a key that has no effect are each refused.
-
-- `[ex-ostrya receive]` -- the default rule, and the session keys.
-- `[ex-ostrya receive "PATTERN"]` -- the rule of the refs `PATTERN` matches.
-- `[ex-ostrya trust "NAME"]` -- a set of trusted keys and the axes it
-  requires.
-- `[ex-ostrya key "NAME"]` -- one signing key that the server holds.
-
-The tool gives quotes no meaning in a group name, so the port splits the name
-itself. `ex-ostrya receive`, `ex-ostrya trust "`, and `ex-ostrya key "` are
-literal prefixes with one space between the words. The quoted part ends the
-name, is not empty, and holds no `"` and no control character.
-
-`PATTERN` has an optional remote part and a name part. The name part is a
-path of parts split at `/`. Each part is a literal, `*`, or `**`. `*` selects
-exactly one part of a name, and `**` selects one or more parts. `*` and `**`
-are valid only as a whole part. `PATTERN` has one of these forms:
-
-- `NAME` -- the plain refs that the name part `NAME` matches.
-- `REMOTE:NAME` -- the remote refs of the remote `REMOTE` that `NAME`
-  matches.
-- `*:NAME` -- the remote refs of every remote that `NAME` matches.
-
-For example, `apps/*` selects `apps/web` and does not select `apps` or
-`apps/web/db`. `apps/**` selects `apps/web` and `apps/web/db`, and does not
-select `apps`. `central:**` selects every ref of the remote `central`.
-
-A literal part is a component of a ref name, and `REMOTE` is one component of
-a ref path with no `*`. A `!` at the start of a pattern or in the name part,
-a `*` in another place, an empty part, and a `:` in the name part are
-refused. The server selects one rule for
-each ref update:
-
-1. A remote ref matches only a pattern with a remote part, and a plain ref
-   only a pattern without one.
-2. A literal remote part wins over `*:`.
-3. The parts of the name part compare from the left. At the first part where
-   two patterns differ in kind, a literal wins over `*`, and `*` wins over
-   `**`. If one pattern is a leading run of the other, the longer pattern
-   wins. If the kinds of all parts are equal, the first rule in the file wins.
-4. A plain ref that no pattern matches gets the default rule. A remote ref
-   that no pattern matches is refused.
-
-The rule keys are valid in each receive group. A pattern rule takes no key
-from the default rule:
-
-- `accept` -- boolean, default true. `false` refuses each update of a
-  matching ref. A rule with `accept=false` that states `verify`, `sign`,
-  `allow-non-fast-forward`, or `allow-delete` is refused, because the key has
-  no effect.
-- `verify` -- `off` (the default), `trust:NAME` for the keys of
-  `[ex-ostrya trust "NAME"]`, or `remote:NAME` for the keys a pull from
-  `[remote "NAME"]` trusts for a commit. The `NAME` of `remote:NAME` is one
-  path component: it is not `.` or `..`, and it holds no `/` and no control
-  character.
-- `allow-non-fast-forward` -- boolean: accept a ref update whose new commit
-  does not descend from the current one.
-- `allow-delete` -- boolean: accept a ref delete.
-- `sign` -- a list of key group names: the keys the server signs each new
-  commit of a matching ref with. A name given twice counts once.
-
-The session keys are valid in `[ex-ostrya receive]` alone:
-
-- `allow-privileged` -- boolean: accept a setuid or setgid mode bit, and the
-  `security.capability` and `security.selinux` extended attributes, in a
-  `bare` repository. The rule applies to each content object and each dirmeta
-  object a session receives, also to one the repository already holds. A
-  session on a `bare` repository needs a server that runs as root.
-- `sign-summary` -- a list of key group names: the keys that sign the
-  regenerated summary.
-
-A trust group takes the key names and the value forms of a remote section:
-
-- `gpg-verify` -- boolean, default false. It turns on the GPG axis.
-- `gpgkeypath` -- `;`-separated keyring files and directories of `*.gpg`
-  keyrings. The GPG axis needs one entry at least. An entry that names
-  neither a file nor a directory is refused, and so are keyrings that hold no
-  certificate among them.
-- `sign-verify` -- a list of engine names, split on `,` and `;`, or a
-  boolean. The engines are `ed25519` and `spki`. `true` takes every engine
-  of the build that has a key, and skips an engine that has none, as a pull
-  does. A list of engine names needs a key for each engine it names.
-- `verification-ENGINE-key` and `verification-ENGINE-file` -- the trusted
-  keys of one engine, in the forms of the remote keys.
-
-A trust group that turns on no axis is refused. A key that no axis reads is
-refused: `gpgkeypath` without `gpg-verify=true`, and a `verification-*` key of
-an engine that `sign-verify` does not select. `gpg-verify-summary` and
-`sign-verify-summary` are refused. A trust group trusts the keys it names
-alone: no system sign-api key store, no revoked set, no per-remote keyring,
-and no global trusted keyring directory takes part.
-
-`remote:NAME` reads the remote section as a pull reads it, and trusts what a
-pull from the remote trusts for a commit: `gpg-verify` (default true),
-`gpgkeypath`, `<repo>/NAME.trustedkeys.gpg`,
-`/etc/ostree/remotes.d/NAME.trustedkeys.gpg`, the global trusted keyring
-directory, `sign-verify`, the `verification-*` keys, and the system sign-api
-key store minus its revoked set. A remote section that turns on no axis is
-refused.
-
-A key group holds one signing key:
-
-- `type` -- `ed25519`, `spki`, or `gpg`. Required. `dummy` is refused.
-- `secret-key-file` -- for `ed25519` and `spki`: a regular file of at most
-  1 MiB that holds exactly one non-empty line, a base64 secret key. For
-  `ed25519` the key is the 64-byte seed and public key, and for `spki` it is
-  a key form `ostree sign` takes.
-- `gpg-key` -- for `gpg`: one selector that names exactly one secret key.
-- `gpg-homedir` -- for `gpg`, optional: the GnuPG home directory.
-
-A key that does not belong to the type is refused. The reader builds each key
-group and each trust group once, also one that no rule names, so a key source
-that cannot be read fails the read of the policy.
-
-`ReceivePolicy::from_file` reads the receive groups and the remote sections
-from a policy file alone. A remote section in the file can be one that no
-rule names. The file holds no other group.
-The receive groups of `<repo>/config` are then not read, and a `remote:`
-reference does not read `<repo>/NAME.trustedkeys.gpg`. Both readers take
-`detached-metadata-exclude` and `[core] auto-update-summary` (see "Config
-file") from `<repo>/config`.
-
-The group carries no repository fact. Detached metadata sits outside the commit
-checksum, so a repository that sets any of these keys holds the same object
-bytes and the same checksums as one that sets none. The library reads
-`gc-root-metadata-keys` nowhere and reads `detached-metadata-exclude` for a
-pull nowhere: the `ostrya` CLI puts them into the options it supplies. The
-receive path reads its groups through `ReceivePolicy::from_config` and
-`ReceivePolicy::from_file`.
-
-The tool tolerates the group. Observed with `ostree` 2026.1 against an archive
-repository whose `config` holds these two lines:
-
-```
-[ex-ostrya]
-gc-root-metadata-keys=app.roots;app.other;
-```
-
-- `ostree commit` and `ostree prune --refs-only` both exit 0 and behave as they
-  do without the group;
-- `ostree config get ex-ostrya.gc-root-metadata-keys` prints the raw value
-  `app.roots;app.other;` and exits 0;
-- `ostree config set core.mode archive-z2` rewrites `config` and preserves the
-  group and its key verbatim.
-
-Observed with `ostree` 2026.1 against an archive repository with one commit
-on `x` whose `config` holds a group of each receive shape, with patterns that
-hold `/`, `*`, `**`, `:`, and `.`. The paths the keys name do not exist:
-
-```
-[ex-ostrya receive]
-accept=false
-sign-summary=central-ed
-
-[ex-ostrya receive "apps/**"]
-verify=trust:release
-sign=central-ed
-
-[ex-ostrya receive "central:**"]
-verify=remote:central
-
-[ex-ostrya receive "*:apps/x.y"]
-allow-delete=true
-
-[ex-ostrya trust "release"]
-sign-verify=ed25519
-verification-ed25519-key=AAAA
-
-[ex-ostrya key "central-ed"]
-type=ed25519
-secret-key-file=/nonexistent/central.ed25519.key
-```
-
-- `ostree refs`, `ostree fsck`, and `ostree summary -u` each exit 0 and write
-  nothing to standard error. `summary -u` writes `summary`.
-- `config get` (dotted and with `--group`), `remote list`, and
-  `remote list -u` exit 0, `config set` keeps each group header and its keys
-  in order, and no receive group is listed as a remote. Dotted `config get`
-  splits `GROUP.KEY` at the first `.`, so a group whose pattern holds a `.` is
-  read with `config --group=GROUP get KEY`.
-- A group name with a control character fails the whole file with
-  `Invalid group name: <name>`.
-
-## Port extension: the push and pull keys of a remote
-
-A `[remote "NAME"]` section can hold five keys that a push of the port reads,
-and two keys that a pull of the port reads. The `ostree` tool defines none of
-them and reads none.
-
-- `push-url` -- the push address: `ssh://[USER@]HOST[:PORT]/PATH`, the scp
-  form `[USER@]HOST:PATH`, or an `http://` or `https://` URL. When the key is
-  absent, a `url` that starts with `http://` or `https://` is the push address.
-  A `url` of another form, for example `file://`, `metalink=`, or
-  `mirrorlist=`, is no push address. Without `push-url`, a push to such a
-  remote fails.
-- `ssh-command` -- the ssh command line of a push. The push splits it at ASCII
-  whitespace, with no quoting rule. The `OSTRYA_SSH_COMMAND` environment
-  variable and the ssh command of the push options have precedence over it.
-- `receive-command` -- the command that the remote side runs. The remote shell
-  parses it. The default is `ostrya receive`. The receive command of the push
-  options has precedence over it.
-- `push-token-file` -- the path to a file that holds the token of a push over
-  HTTP. The token file of the push options has precedence over it.
-- `push-user` -- the name of a Basic credential. The push sends the token as
-  the password of a Basic credential with this name. When no name is set, the
-  push sends the token as a bearer token. The name of the push options has
-  precedence over it. A name that is empty or holds `:` is refused, and so is
-  a name with no token file.
-
-The pull keys:
-
-- `pull-url` -- the pull address of the port: `ssh://[USER@]HOST[:PORT]/PATH`,
-  the scp form `[USER@]HOST:PATH`, or an `http://` or `https://` base URL.
-  The push reads the same address forms. The address of the pull options
-  has precedence over it, and it has precedence over `url`. A value that
-  starts with `ssh://`, or that holds no `://`, is an ssh address. A value
-  with another scheme goes to the HTTP fetcher, which refuses a scheme other
-  than `http` and `https`. The port reads no ssh address from `url`, and a
-  pull whose address comes from an ssh `url` fails.
-- `send-command` -- the command that the remote side runs for a pull over
-  ssh. The remote shell parses it. The default is `ostrya send`. The send
-  command of the pull options has precedence over it.
-
-A pull over ssh reads `ssh-command` too, with the precedence of a push: the
-ssh command of the pull options, then `OSTRYA_SSH_COMMAND`, then the key.
-Each of `ssh-command` and `send-command` applies only when the pull options
-do not set the same value. It ignores the keys that apply to HTTP alone:
-`contenturl`, `metalink`, `proxy`, the TLS keys, `push-token-file`, and
-`push-user`.
-A pull over HTTP ignores `ssh-command` and `send-command`.
-
-The port reads the seven keys as strings, as written. The tool reads `url` to
-pull, so an ssh address stands in `push-url` or `pull-url` alone.
-
-The keys of a section apply to the transport of the push address. For an ssh
-address the push reads `ssh-command` and `receive-command`, and ignores the
-other keys of this list and the TLS keys. For an `http://` or `https://`
-address the push reads `push-token-file`, `push-user`, and these TLS and
-proxy keys of the pull, and ignores `ssh-command` and `receive-command`:
-
-- `tls-ca-path` -- a PEM file of the CA certificates that verify the server,
-  in place of the trust store of the host.
-- `tls-client-cert-path` and `tls-client-key-path` -- the PEM files of a
-  client certificate and its private key. The two come together. A key that
-  needs a passphrase is refused.
-- `tls-permissive` -- for an `https://` address, the push refuses
-  `tls-permissive=true` before any request. A push verifies the certificate
-  chain of the server. An `http://` address uses no TLS, and the push does
-  not read the key. For such an address, the push also reads no file that
-  `tls-ca-path`, `tls-client-cert-path`, or `tls-client-key-path` names.
-- `proxy` -- the `http://` proxy URL of the push, by the rules of the pull.
-  An empty or absent key gives the proxy environment variables. A value with
-  white space at its start or end fails the push before any request.
-
-The push reads each file once, before the session opens. It reads at most
-1 MiB and one byte of a TLS file, and refuses a TLS file of more than
-1 MiB. A relative path in `push-token-file`, `tls-ca-path`,
-`tls-client-cert-path`, or `tls-client-key-path` is relative to the current
-directory of the process, as a pull reads the TLS keys. The push does not
-expand `~`. A file that the push cannot read fails the push with an I/O
-error whose message names the key and the path, and holds no byte of the
-file. Each key
-resolves on its own, and an option of the push wins over its key. No key lets a push send a token over `http://`. Only the push
-options do that.
-
-The token file holds the token on its first line:
-
-- The push reads the file up to the first LF (0x0a), and takes the bytes
-  before it. With no LF, the token is the whole file. A first line of more
-  than 1 MiB is refused, and the push reads at most 1 MiB and one byte of
-  it.
-- The push refuses the token when it holds a CR (0x0d), when it is empty,
-  when it is not UTF-8, and when it is not token68: one or more ASCII
-  letters, digits, `-`, `.`, `_`, `~`, `+`, or `/`, then zero or more `=`.
-- The push ignores the bytes after the first LF.
-- No message of the push holds the token. The push checks no permission of
-  the file.
-
-Example:
-
-```text
-[remote "origin"]
-url=https://ostree.example.com/repo
-push-token-file=/etc/ostrya/push-token
-push-user=builder-1
-tls-ca-path=/etc/ostrya/ca.pem
-```
-
-The keys carry no repository fact. The tool tolerates them. Observed with
-`ostree` 2026.1 against an archive repository whose `[remote "origin"]`
-section holds `url=https://example.com/repo` and these three lines:
-
-```
-push-url=ssh://user@host/srv/repo
-ssh-command=ssh -o BatchMode=yes
-receive-command=/usr/local/bin/ostrya receive
-```
-
-- `ostree remote list -u` prints `origin  https://example.com/repo` and exits
-  0.
-- `ostree remote show-url origin` prints `https://example.com/repo` and exits
-  0.
-- `ostree config get 'remote "origin".push-url'`, and `config
-  --group='remote "origin"' get` of `ssh-command` and of `receive-command`,
-  print each value as written and exit 0.
-- `ostree config set core.fsync true` rewrites `config` and keeps the three
-  keys in order.
-
-Observed with `ostree` 2026.1 against an archive repository whose
-`[remote "origin"]` section holds `url=http://127.0.0.1:PORT/`,
-`gpg-verify=false`, and these two lines, with an `ostrya serve --read-only`
-server at the URL:
-
-```
-push-user=alice
-push-token-file=/some/path
-```
-
-- `ostree remote list -u` prints `origin  http://127.0.0.1:PORT/` and exits
-  0.
-- `ostree remote show-url origin` prints `http://127.0.0.1:PORT/` and exits
-  0.
-- `ostree config get 'remote "origin".push-user'` prints `alice`, and `config
-  --group='remote "origin"' get push-token-file` prints `/some/path`. Each
-  exits 0.
-- `ostree config set core.fsync true` rewrites `config`, and keeps the two
-  keys in order and as written.
-- `ostree pull origin main` fetches the commit and exits 0. `ostree fsck`
-  then passes, and the config keeps the two keys.
-- No command writes a diagnostic to standard error.
-- Under `strace -f`, no system call of `remote list -u`, `remote show-url`,
-  or `pull` names `/some/path`.
-
-Observed with `ostree` 2026.1 on 2026-10-03, with the proxy variables of the
-environment removed, against a `bare-user` repository whose `[remote
-"origin"]` section holds `url=http://127.0.0.1:PORT/`, `gpg-verify=false`,
-and these two lines, with an `ostrya serve --read-only` server of an
-`archive` repository at the URL:
-
-```
-pull-url=ssh://u@h/srv/repo
-send-command=ostrya send
-```
-
-- `ostree remote list -u` prints `origin  http://127.0.0.1:PORT/`, and
-  `ostree remote show-url origin` prints `http://127.0.0.1:PORT/`. Each
-  exits 0.
-- `ostree config get 'remote "origin".pull-url'`, and `config
-  --group='remote "origin"' get` of `pull-url` and of `send-command`, print
-  each value as written and exit 0.
-- `ostree config set core.fsync true` rewrites `config`, and keeps the two
-  keys in order and as written.
-- `ostree pull origin main` fetches the commit from `url` and exits 0.
-  `ostree fsck` then passes. `ostree remote refs origin` and `ostree remote
-  summary origin` exit 0.
-- No command writes a diagnostic to standard error.
-- Under `strace -f -e trace=%file,%network,execve`, no system call of
-  `remote list -u`, `remote show-url`, or `pull` names the ssh address or
-  `ostrya send`, and the pull runs no other program. The filter leaves out
-  the `read` of `config`, which holds the two values.
-- The scp form `pull-url=u@h:/srv/repo` gives the same results.
-
-The tool fails on a remote that holds `pull-url` and no `url`. Observed on
-2026-10-03 with the same tool and repository, after `ostree config unset
-'remote "origin".url'`:
-
-- `ostree remote list` prints `origin` and exits 0.
-- `ostree remote list -u`, `ostree remote show-url origin`, `ostree pull
-  origin main`, `ostree remote refs origin`, and `ostree remote summary
-  origin` each exit 1 and write this line to standard error:
-
-  ```
-  error: No "url" option in remote "origin"
-  ```
-
-- `ostree remote list -u` prints, in sorted order, the remotes whose names
-  sort before the remote with no `url`, and then stops with the error.
-  With nine remotes written to `config` in the order `zzz`, `aaa`, `mmm`,
-  `bbb`, `nnn`, `ppp`, `ccc`, `yyy`, `origin`, and no `url` in `origin`,
-  `ostree remote list` prints the nine names in sorted order, and `ostree
-  remote list -u` prints `aaa`, `bbb`, `ccc`, `mmm`, and `nnn`, each with
-  its URL, and then the error.
-
-So a remote that the tool also reads keeps an HTTP `url` beside `pull-url`.
-
-The tool does not pull from an ssh address in `url`. Observed on 2026-10-03
-with the same tool, against a remote added with `url=ssh://h/srv/repo`:
-
-- `ostree remote list -u` prints `origin  ssh://h/srv/repo` and exits 0.
-- `ostree pull origin main`, `ostree remote refs origin`, and `ostree remote
-  summary origin` each exit 1 with `error: Invalid URI scheme in
-  ssh://h/srv/repo`. Under `strace -f -e trace=%network,execve`, none of
-  the three makes a `connect` call.
-- With `url=h:/srv/repo`, `ostree pull origin main` exits 1 with `error:
-  Invalid URI scheme in h:/srv/repo`.
-
-## Port extension: the push credential file
-
-`ostrya serve --push-credentials=FILE` reads the credentials of push over
-HTTP from `FILE`. The tool has no such file. The file is outside the
-repository, and the server reads it once, at start.
-
-The file is UTF-8 text. A LF ends each line, and the last line can have no
-LF. Each line is one of these:
-
-- An empty line. The server skips it.
-- A comment: a line that starts with `#`. The server skips it.
-- A credential: `NAME:HEX`.
-  - `NAME` is one or more visible ASCII characters (0x21 to 0x7e) other
-    than `:`.
-  - `HEX` is the SHA-256 digest of the token, in 64 lowercase hex digits.
-    `printf %s "$TOKEN" | sha256sum` gives it.
-
-Example:
-
-```text
-# the push credentials of the build hosts
-builder-1:3c469e9d6c5875d37a43f353d4f88e61fcf812c66eee3457465a40b0da4153e0
-```
-
-The server refuses the file at start when a line is malformed:
-
-- A line holds a CR (0x0d). This rule applies to comments and empty lines
-  too, so a file with CRLF line ends is refused.
-- A line is not valid UTF-8.
-- A credential line holds a space.
-- A credential line holds no `:`, or its `NAME` is empty.
-- A `NAME` holds a character other than visible ASCII.
-- A `HEX` is not 64 lowercase hex digits.
-- Two lines have the same `NAME`, or the same `HEX`.
-
-The error names the number of the line, from 1, and holds no byte of the
-line. A file larger than 1 MiB is refused. A file with no credential line
-gives no authentication method, and a server with no other method refuses to
-start. A server with no TLS whose one method is the file also refuses to
-start, unless it takes credentials over plain HTTP.
-
-A bearer token matches a line when the SHA-256 digest of the token equals
-`HEX`. A Basic credential `NAME:TOKEN` matches the line with that `NAME`
-when the digest of `TOKEN` equals its `HEX`. A bearer token and a Basic
-credential that match one line give the same session owner. An empty token
-matches no line.
-
-## Port extension: the commit of `push-tree`
-
-`ostrya push-tree` builds one commit over a local directory on the client
-and sends it to the server. The tool has no such command. The commit object
-has the format of every other commit, and its bytes follow the rules below.
-
-- On success the command writes the commit checksum to standard output: 64
-  lowercase hex characters and a newline. Standard output holds nothing
-  else.
-- The metadata dict holds the caller groups of `ostrya commit`, in the
-  same order: every `--add-metadata-string` entry in command-line order,
-  then every `--add-metadata` entry in command-line order. The command has
-  no `--keep-metadata`, so no entry comes from a parent.
-- `ostree.ref-binding` follows the caller entries. It is an `as` that
-  holds every `-b` name, sorted.
-- `ostree.collection-binding` follows it, with the collection id that the
-  server reports for its repository. When the server has no collection id,
-  the key is absent. The collection id of a local repository has no effect.
-  `--no-bindings` writes neither key.
-- `--owner-uid`, `--owner-gid`, and `--canonical-permissions` apply to each
-  entry of the walk, the root directory included, so they change the root
-  dirmeta too. The canonical rule comes first: owner 0:0, no extended
-  attributes, and the mode `type | (perm & 0o755)` for each entry other than
-  a symlink. Each declared owner id comes after it. The tool applies the
-  options to the root dirmeta in the same way.
-- The walk reads no extended attributes. With the same tree, owner, modes,
-  subject, body, metadata options, timestamp, and parent, the commit
-  checksum equals the checksum of `ostree commit --no-xattrs -b R1`. With
-  two refs it equals the checksum of `ostree commit --no-xattrs -b R1
-  --bind-ref R2`. `crates/ostrya-cli/tests/push_ssh.rs` checks both with
-  `SOURCE_DATE_EPOCH=1700000000` on both sides, and it also checks
-  `--canonical-permissions`, `--owner-uid=0 --owner-gid=0`, `--body-file`
-  alone and beside `-m`, `--parent=none`, `--parent` with a commit,
-  `--no-bindings`, and an explicit `--timestamp`.
-- With `--add-detached-metadata-string` and distinct ed25519 keys from
-  `--sign` and `--sign-from-file`, the `.commitmeta` bytes on the server
-  equal the bytes of `ostree commit` with the same options. The detached
-  dict holds the entries of the caller, then the signatures in the order
-  of `commit`.
+The tool uses a named temp file where the filesystem refuses `O_TMPFILE`. It
+also uses one for the small bodies of symlink and metadata objects that the
+caller holds. The
+named temp file follows the same close, reopen, and seal steps. The tool then
+renames it into place.
+Publication into `objects/` does not change.
+
+The port writes a regular-file content object in this order:
+
+1. Before the seal, on the writable descriptor: `user.ostreemeta` in
+   `bare-user`, the fixed mode 0644 in `archive`, and the fixed mode 0644 and
+   `user.ostreemeta` in `bare-user-shared`. In `bare`, `bare-user`, and
+   `bare-user-only`, the port first sets the temp to 0600 if its create mode
+   has no owner read or no owner write.
+2. The seal, on a read-only reopen, after the writable descriptor closes.
+3. After the seal, on the read-only descriptor and before the link:
+   - in `bare`: the owner, then the logical xattrs, then the logical mode;
+   - in `bare-user` and `bare-user-only`: the canonical mode.
+
+`fork` copies the file descriptor table. A child process thus holds a copy of
+the writable staging descriptor until its `exec` closes it. While that copy is
+open, the kernel refuses `FS_IOC_ENABLE_VERITY` with `ETXTBSY`, also after the
+writer closes its own descriptor. A process that spawns children from one
+thread while another thread stages objects meets this window. The port retries
+a seal that fails with `ETXTBSY` for up to 50 ms, which is longer than a
+fork-to-exec gap. It
+reports every other error on the first attempt.
+
+The `FS_IOC_ENABLE_VERITY` ioctl is the one syscall in the write path that
+needs `unsafe`. It is in the audited `ostrya-sys` crate. This crate also holds
+`FS_IOC_MEASURE_VERITY` and `FS_IOC_READ_VERITY_METADATA` for the read path,
+and the read-only memory map that static-delta apply uses.
 
 ## Commit modifier: canonical permissions, consume, and devino
 
-A filesystem tree is ingested into a repository under a set of options the
-tool exposes on `ostree commit` and the port models as a commit modifier.
-Two of these options change the object bytes and are recovered by black-box
-observation; the rest are ingest mechanics with no on-disk effect.
+The tool's `ostree commit` options shape the tree that a commit ingests. The
+port models them as a commit modifier. Two of these options change the object
+bytes. The others are ingest mechanics with no effect on disk.
 
-Canonical permissions. The tool's `--canonical-permissions` option (the port's
-`CANONICAL_PERMISSIONS`) forces owner 0:0, reduces each permission set to a
-canonical form, and records no extended attributes. Recovered by committing files
-and directories of assorted modes and xattr sets with and without the option into
-an archive repository, reading the modes back with `ostree ls -R`, and comparing
-object checksums:
+### Canonical permissions
+
+The tool's `--canonical-permissions` option (the port's `CANONICAL_PERMISSIONS`)
+sets the owner to 0:0 and reduces each permission set to a canonical form.
+Over a filesystem walk, the option records no xattrs. Observed behavior: the
+tool records these results. Not observed: the xattrs that the tool records
+under the option over a `tar=` source. `conformance/cli-surface.md`, "P2",
+`commit`, states the port rule over a `tar=` source.
 
 - uid and gid become 0. The tool refuses a non-zero `--owner-uid`/`--owner-gid`
-  together with `--canonical-permissions`, so canonical ingest always owns
+  together with `--canonical-permissions`, so canonical ingest always owns the
   objects 0:0.
-- A regular file's or directory's permission bits become `perm & 0o755`: the
-  owner bits and the group and other read and execute bits are kept, the group
-  and other write bits are dropped, and the setuid, setgid, and sticky bits are
-  dropped. Observed regular-file mappings: `0664`, `0666`, `01644`, and `02644`
-  all become `0644`; `0775`, `0777`, and `04755` become `0755`; `0640` stays
-  `0640`; `0600`, `0644`, `0700`, and `0755` are unchanged. Directory mappings
-  match: `0775`, `0777`, and `02755` become `0755`; `0700` stays `0700`.
-- A symlink's mode is left as the reduction found it. The walk finds a symlink
-  at `S_IFLNK | 0o777` and records that. Where a `--statoverride` entry over the
-  same symlink ran first, the reduction keeps the mode the entry left, the bits
-  it drops from a regular file included: `=448 /link` gives `l00700` and
-  `2048 /link` gives `l04777`.
-- The file-type bits the reduction records are the ones the walk found the entry
-  with, so an entry whose mode names another type by the time the reduction runs
-  goes back to being the kind it is. This is reachable through `--statoverride`,
-  which is the one modifier that can state file-type bits: over a 0644 regular
-  file, each of `=4096`, `=16384`, `=40960`, `=49152`, and `=32768` beside
-  `--canonical-permissions` reaches the same commit, whose `/plain.txt` is
-  `-00000`; over a 0700 directory each of them reaches one commit whose `/dir1`
-  is `d00000`, and `=33261` reaches `d00755`.
-- The recorded xattr set is empty. Observed on a 0644 file carrying
-  `user.demo=1`: its checksum is `a5ee0b1b...` under
-  `--owner-uid=0 --owner-gid=0` and `fe042781...` under
-  `--canonical-permissions`, and `fe042781...` is the checksum the same file
-  without the xattr takes under `--owner-uid=0 --owner-gid=0`. A directory's
-  xattr goes the same way: the dirmeta is `6c9fefc6...` with the xattr kept and
-  the canonical `446a0ef1...` under the option.
+- The permission bits of a regular file or a directory become `perm & 0o755`.
+  The owner bits and the group and other read and execute bits stay. The group
+  and other write bits, and the setuid, setgid, and sticky bits, are removed.
+  For regular files, `0664`, `0666`, `01644`, and `02644` become `0644`.
+  `0775`, `0777`, and `04755` become `0755`. `0640`, `0600`, `0644`, `0700`,
+  and `0755` do not change. For directories, `0775`, `0777`, and `02755` become
+  `0755`, and `0700` does not change.
+- The reduction does not change the mode of a symlink. The walk finds a symlink
+  at `S_IFLNK | 0o777` and records that. If a `--statoverride` entry for the
+  symlink ran first, the symlink keeps the mode that the entry set. This
+  includes the bits that the reduction removes from a regular file: `=448 /link`
+  gives `l00700` and `2048 /link` gives `l04777`. `conformance/cli-behavior.md`,
+  "CLI output formats", `commit`, "The mode modifiers", gives the order of the
+  mode modifiers.
+- The reduction records the file type that the walk found. `--statoverride` is
+  the one modifier that can set file-type bits. When an entry changes the
+  file type of a mode, the reduction puts back the type that the walk found.
+  Over a 0644 regular file, each of `=4096`, `=16384`, `=40960`, `=49152`, and
+  `=32768` beside `--canonical-permissions` gives the same commit, whose
+  `/plain.txt` is `-00000`. Over a 0700 directory each of them gives one commit
+  whose `/dir1` is `d00000`, and `=33261` gives `d00755`.
+- The recorded xattr set is empty. A 0644 file with `user.demo=1` has the
+  checksum `a5ee0b1b...` under `--owner-uid=0 --owner-gid=0` and `fe042781...`
+  under `--canonical-permissions`. `fe042781...` is the checksum of the same
+  file without the xattr under `--owner-uid=0 --owner-gid=0`. The xattr of a
+  directory is removed in the same way: the dirmeta is `6c9fefc6...` with the
+  xattr and the canonical `446a0ef1...` under the option.
 
-This is the ownership, permission, and xattr rule `bare-user-only` applies to
-everything it records, with or without the option (see the loose-object
-inode-mode notes above). Because the canonicalized header enters the
-file-content header and the dirmeta, canonical ingest changes an object's
-identity, and therefore the dirtree and commit checksums, whenever an input entry
-is not already in that form (confirmed: the canonical commit checksum differs
-from the same tree committed 0:0 without the option).
+`bare-user-only` applies this ownership, permission, and xattr rule to all that
+it records, with or without the option ("Write path: loose-object inode modes
+and durability"). The canonical header goes into the file-content header and
+the dirmeta. Canonical ingest thus changes the identity of each input entry
+that is not already in that form, and with it the dirtree and commit
+checksums. Observed behavior: the canonical commit checksum differs from the
+checksum of the same tree committed 0:0 without the option.
 
-Consume. The tool's `--consume` option (the port's `CONSUME`) deletes the
-source content after it is committed. Recovered by committing `--consume base/src`:
-each file is removed as it is ingested and each directory is removed once its
-entries are gone, bottom-up, including the walk-root directory itself; the
-parent of the walk root is left in place. The tool adopts a source inode by
-rename into the object store where the inode already satisfies the target
-mode's on-disk form and the source shares a filesystem with the store, which
-avoids a copy; adoption is a performance optimization with no on-disk effect,
-so the port ingests by copy and then unlinks the source, producing byte-identical
-objects.
+### Consume
 
-Devino cache. The tool's `--link-checkout-speedup` builds a `(device, inode)` to
-checksum map so a source entry that is a hardlink to one of the repository's own
-objects is resolved by its inode without being read, and `--devino-canonical`
-(`-I`, which implies the speedup) takes a resolved object as the entry's whole
-identity. Recovered by committing a tree, checking it out in each variant each
-repository mode accepts, recommitting the checkout three ways, and comparing the
-commit checksums and the `ostree ls -R -X` listings:
+The tool's `--consume` option (the port's `CONSUME`) deletes the source content
+after the commit ingests it. Observed behavior: under `--consume base/src`,
+the commit deletes each file when it ingests it. It deletes each directory when
+its entries are deleted, bottom up. The parent of the walk root stays.
+`conformance/cli-behavior.md`, "The tree sources", gives the walk-root rule,
+the entries that a walk filter skips, and the failures.
 
-- The cache is built from the repository `--repo` names, at commit time, by the
-  process that runs the commit. A checkout made by an earlier process resolves
-  through it, and no checkout in the same process is needed. The build reads
-  every fanout directory under `objects/` and stats each `.file` entry it
-  holds, so both options cost one pass over the repository's loose content
-  objects before any source is read.
-- It keys on `(st_dev, st_ino)`. A `cp -al` copy of a checkout resolves; a `cp
-  -a` copy of the same tree, with the same modes and the same content, does not.
-- It is scoped to that repository. A tree hardlinked into repository A's objects
-  and committed into repository B resolves nothing.
-- An `archive` repository stores every content object compressed, and no
-  checkout hardlinks a `.filez`, so both options are no-ops there. The
-  decompressed copies an archive checkout leaves in
-  `<repo>/uncompressed-objects-cache` are outside `objects/` and are not part of
-  the mapping. The port attaches no commit modifier for a cache that comes back
-  empty, so `--link-checkout-speedup` alone leaves a `ref` source on the
-  checksum-copy overlay path.
+The tool can adopt a source inode by a rename into the object store. It does
+so when the inode already has the on-disk form of the target mode and the
+source is on the filesystem of the store. The port copies the content and
+then unlinks the source. The objects are the same with and without the
+adoption.
+
+### Devino cache
+
+The tool's `--link-checkout-speedup` builds a map from `(device, inode)` to
+checksum. A source entry that is a hardlink to an object of the repository
+then resolves by its inode, and the commit does not read it.
+`--devino-canonical` (`-I`, which implies the speedup) takes a resolved object
+as the whole identity of the entry. Observed behavior: the tool gives these
+results.
+
+- The commit builds the cache from the repository that `--repo` names, at commit
+  time, in the process that runs the commit. A checkout from an earlier process
+  resolves through it, and no checkout in the same process is necessary. The
+  build reads each fanout directory under `objects/` and does a stat of each
+  `.file` entry in it. Both options thus cost one pass over the loose content
+  objects of the repository before the commit reads a source.
+- The key is `(st_dev, st_ino)`. A `cp -al` copy of a checkout resolves. A
+  `cp -a` copy of the same tree, with the same modes and content, does not.
+- The cache holds that repository alone. A tree hardlinked into the objects of
+  repository A and committed into repository B resolves nothing.
+- An `archive` repository stores each content object compressed, and no
+  checkout hardlinks a `.filez`, so both options do nothing there. The
+  decompressed copies of an archive checkout in
+  `<repo>/uncompressed-objects-cache` are outside `objects/` and are not in the
+  map. The port attaches no commit modifier for an empty cache. Under
+  `--link-checkout-speedup` alone the port thus merges a `ref` source with no
+  modifier: the merge records the committed checksums and reads no file object.
 - A directory never resolves. A symlink resolves where the repository stores
-  symlink objects as symlinks and the checkout hardlinked them, which is a
-  `bare` repository: there `-I --owner-uid=7` leaves the symlink at its stored
-  ownership and moves the directories to 7.
+  symlink objects as symlinks and the checkout hardlinked them, that is, in a
+  `bare` repository. There `-I --owner-uid=7` keeps the stored ownership of the
+  symlink and gives the directories owner 7.
 - A resolved entry is taken whole: content and metadata come from the stored
-  object and what is on disk is not read. Rewriting a hardlinked file in place,
-  or changing its mode, its size, or its mtime, changes nothing for either
-  option.
+  object, and the commit does not read the file on disk. A rewrite of a
+  hardlinked file in place, or a change of its mode, size, or mtime, changes
+  nothing for either option.
 
-The two options part on whether the commit modifiers reach a resolved entry.
-Under `--link-checkout-speedup` the stored object supplies the metadata and the
-modifiers -- `--owner-uid`, `--owner-gid`, `--statoverride`,
-`--mode-ro-executables`, `--canonical-permissions`, `--no-xattrs` -- apply over
-it, so the object is rewritten from the stored payload where the shaped metadata
-differs from the stored metadata. Under `-I` the object is committed verbatim and
-the filter and the modifiers are skipped for that entry: a `--statoverride` or
-`--skip-list` entry naming a resolved path goes unmatched, and `--owner-uid`
-reaches only the entries that resolved nothing.
+The two options differ in whether the commit modifiers reach a resolved entry.
+Under `--link-checkout-speedup` the stored object supplies the metadata, and
+the modifiers apply over it: `--owner-uid`, `--owner-gid`, `--statoverride`,
+`--mode-ro-executables`, `--canonical-permissions`, and `--no-xattrs`. Where the
+shaped metadata differs from the stored metadata, the commit writes the object
+again from the stored payload. Under `-I` the commit takes the object as it is
+and skips the filter and the modifiers for that entry. A `--statoverride` or
+`--skip-list` entry for a resolved path stays unmatched, and `--owner-uid`
+reaches only the entries that resolve nothing. A resolved regular file writes no
+content object under `-I`, so `-I` also masks a failure of the content write
+(`conformance/cli-surface.md`, "P2", `commit`).
 
-Because a resolved regular file writes no content object under `-I`, that option
-also masks a write the other two hit. `--owner-uid=0` against a `bare`
-repository as a non-root user fails plainly and under
-`--link-checkout-speedup` -- `error: Writing content object: fchown: Operation
-not permitted`, exit 1 -- and succeeds under `-I`. `--canonical-permissions`
-behaves the same way.
-
-Neither option changes a commit's checksum in twelve of the fourteen checkout
-variants across `archive`, `bare-user`, and `bare`. The two that differ are a
-`bare-user` repository checked out with `-U`, with or without `-H`. That checkout
-hardlinks the stored objects, which carry the repository's own `user.ostreemeta`
-xattr, and the plain walk reads that xattr as a real xattr of the source file and
-commits it, so every file object and every dirtree changes. There the flagged
-commit is the faithful one: it reaches the checksum the source tree itself
-reaches, and `--no-xattrs` on the plain walk reaches the same. The xattr's
-12-byte payload is `uid(be32) gid(be32) mode(be32)`.
-
-## Checkout
-
-Checkout materializes a commit's tree onto a filesystem. The destination is
-arbitrary and is not part of the on-disk format, so the durability choices
-(whether to fsync) carry no byte-exact requirement. The metadata each checkout
-writes, and the decision to hardlink a loose object rather than copy it, are
-recovered by black-box observation: checking out tool-created commits of assorted
-modes with `ostree checkout`, `ostree checkout -U`, and `ostree checkout -C`, and
-inspecting the destination trees (`stat`, `getfattr`, `readlink`) and the object
-inodes' link counts.
-
-Checkout modes. The faithful checkout (`ostree checkout`) restores full metadata;
-the unprivileged checkout (`ostree checkout -U`) restores no ownership and no
-xattrs.
-
-- Faithful: a regular file is chowned to the logical uid/gid, chmodded to the
-  full logical permission bits (`mode & 0o7777`), and given the logical xattrs. A
-  symlink is a real symlink lchowned to the logical uid/gid with the logical link
-  xattrs. A directory is chowned to the logical uid/gid, chmodded to the full
-  logical mode (`mode & 0o7777`), and given the logical xattrs. For a regular
-  file it writes, the port applies the owner, then the xattrs, then the mode,
-  because a chown of a regular file removes `security.capability` and clears
-  the setuid bit, and the setgid bit when group execute is set. A chown of a
-  directory removes no xattr and keeps the special bits. The tool's checkout
-  keeps `security.capability` on a file it writes. This was observed on btrfs, kernel 6.18.52, ostree 2026.1, as root
-  in a user namespace: a checkout from an archive repository and a `-C`
-  checkout from a bare repository both keep a `cap_net_raw=ep` value, and a
-  file recorded at 04755, owner 1234:5678, with a capability and a `user.*`
-  xattr, keeps its mode, owner, and both xattrs.
-- Unprivileged: no chown and no xattrs. A regular file the checkout writes takes
-  `mode & 0o1777`, so the setuid and setgid bits are dropped, and the sticky bit
-  and the rwx bits including group- and other-write are kept (`4755` and `6755`
-  become `0755`, `1755` and `7755` become `1755`, `1644` stays `1644`, `0666`
-  stays `0666`). A directory's mode is the full `mode & 0o7777`, so all three
-  special bits are kept (`2755` stays `2755`, `1644` stays `1644`). A symlink is a
-  real symlink with no chown and no xattrs.
-
-The mask applies to a regular file the checkout writes. A regular file it
-hardlinks instead adopts the object inode's mode as it stands, which in
-`bare-user` carries no special bit, so the sticky bit of a `bare-user` object is
-absent from an unprivileged checkout that hardlinks and present in the same
-checkout forced to copy. Recovered by checking a tree of the modes `1644`, `1755`,
-`2755`, `4755`, `6755`, `7755`, and `3755` -- on files and on directories --
-out of `archive`, `bare`, `bare-user`, and `bare-user-only` repositories, with
-`ostree checkout`, `ostree checkout -U`, and `ostree checkout -U -C`, and reading
-the destination modes back. The `-U -C` result is the mask above in every mode.
-
-Observed further on a `bare` repository holding a tree of assorted modes: `f0666`
-checks out `0666` under both modes; `f4755` checks out `4755` faithful and `0755`
-unprivileged; `d2755` checks out `2755` under both; a `user.demo` xattr on a file
-is present after a faithful checkout and absent after an unprivileged one.
-
-Hardlink versus copy. The tool hardlinks the loose object directly into the
-destination -- raising the object inode's link count -- exactly when the object's
-stored inode form is already byte-identical to what the checkout would otherwise
-write; otherwise it copies. Regular files, by storage mode and checkout mode:
-
-- `bare` + faithful: hardlink. `bare` + unprivileged: copy.
-- `bare-user` + faithful: copy. `bare-user` + unprivileged: hardlink. The
-  hardlinked file carries `user.ostreemeta` as a side effect of sharing the
-  object inode, which is why a byte-exact unprivileged checkout of a `bare-user`
-  repository requires the hardlink: a copy would omit that xattr.
-- `bare-user-only` + faithful or unprivileged: hardlink. The object carries no
-  ownership and no xattrs and its inode mode is the canonical `perm & 0o755`, so
-  the tool never chowns the checked-out file (it stays owned by the object
-  writer, not 0:0), and a faithful and an unprivileged checkout of a
-  `bare-user-only` repository produce identical trees. Checkout therefore treats
-  `bare-user-only` storage as forcing unprivileged semantics regardless of the
-  requested mode.
-- `bare-user-shared`: copy under both modes. The object inode is a fixed 0644
-  that matches no checkout form, so it never hardlinks; the copy applies the
-  logical mode from `user.ostreemeta`.
-- `archive`: copy under both modes. Under unprivileged checkout the tool
-  hardlinks from an `uncompressed-objects-cache/` it maintains outside the
-  on-disk format; a checkout that does not maintain that cache copies instead and
-  differs from the tool only in the object's link count, never in content or
-  metadata. The cache is a directory at the top level of the repository, laid
-  out in the loose fanout and holding one uncompressed `.file` per content
-  object. The tool creates it for an `archive` repository checked out with `-U`
-  and for no other repository mode and no other checkout mode.
-  `ostree checkout --disable-cache` stops it writing one and stops it reading
-  one, so each destination file gets an inode of its own; the destination's
-  bytes and metadata are the same either way. The port keeps no such cache, so
-  its default is what the switch asks for.
-
-Symlinks are hardlinked only under `bare` + faithful (destination link count 2
-observed). Everywhere else the symlink is recreated fresh (link count 1),
-including `bare-user-only`, whose object is a real symlink. `bare-user` and
-`bare-user-shared` store symlinks as regular files, so a real destination symlink
-cannot share their inode.
-
-The unifying rule is: hardlink iff the object inode is already exactly the target
-inode. Forcing a copy (`ostree checkout -C`) suppresses every hardlink; the copy
-path still attempts a reflink. A hardlink that would cross a filesystem (`EXDEV`)
-falls back to a copy.
-
-A zero-length regular file is the one exception. The tool writes it fresh in
-every repository mode and under both checkout modes, so its destination carries
-its own inode at link count 1. Recovered by checking a tree holding a
-zero-length file at 0644, a zero-length file at 0600, a one-byte file, a
-100-byte file, and a 100-kibibyte file out of a `bare` repository with
-`ostree checkout -H`: the two zero-length destinations came out at link count 1
-on inodes of their own, and the other three at link count 2 on the loose
-objects' inodes. Nothing of the destination's content or metadata turns on it.
-
-Requiring a hardlink. `ostree checkout -H/--require-hardlinks` refuses an entry
-the checkout would materialize by a copy, rather than falling back to one. The
-refusal is raised at the entry, so a commit holding no such entry is written
-whole at exit 0 in every repository mode, an empty commit and a commit of
-directories alone among them. The refusal stands ahead of the destination
-disposition, so an entry `--union-add` would keep and an entry
-`--union-identical` would call identical are refused all the same; it stands
-behind the whiteout verdict, so a marker that removes a name and a marker that
-writes a character device are both taken; and a `--skip-list` entry that prunes
-an entry, or a `--subpath` that does not select it, keeps the walk clear of it.
-The shapes:
-
-- a directory never refuses, in any mode;
-- a zero-length regular file never refuses, in any mode, the rule above writing
-  it fresh rather than copying an inode;
-- a regular file of non-zero length refuses wherever the hardlink table above
-  gives a copy: `archive` under both checkout modes, `bare` under the
-  unprivileged checkout, `bare-user` under the faithful checkout, and
-  `bare-user-shared` and `bare-split-xattrs` under both. The last two have no
-  observation, the tool carrying neither mode; each stores a regular file the
-  hardlink table gives a copy of, so each refuses;
-- a symlink refuses in `archive` under both checkout modes and in `bare` under
-  the unprivileged checkout, and refuses nowhere else. This is not the symlink
-  hardlink rule above: `bare-user` recreates a symlink fresh under both checkout
-  modes and refuses neither, and so does `bare-user-only`. `bare-user-shared`
-  and `bare-split-xattrs` have no observation, the tool carrying neither mode;
-  each stores a symlink the way `bare-user` does, so each follows `bare-user`
-  here.
-
-Recovered by checking four single-shape commits -- one directory, one
-zero-length file, one one-byte file, and one symlink -- out of an `archive`, a
-`bare`, a `bare-user`, and a `bare-user-only` repository, under both checkout
-modes, and reading the exit status of each of the thirty-two invocations.
-
-A destination directory on another filesystem than the repository is refused
-before any entry of it is written, whatever the subtree holds, and the check
-stands after the directory is created. Recovered by checking a directory-only
-commit out of a repository on one filesystem into a destination on another: the
-tool exits 1 with `Unable to do hardlink checkout across devices (src=<dev>
-destination=<dev>)` and leaves the destination directory created and empty. The
-check stands ahead of the per-entry refusal, an `archive` repository checked out
-across devices reporting the device refusal.
-
-The check is repeated at every destination directory the walk enters, the
-destination root and every directory below it, fresh or reused. Recovered by
-putting a subtree behind a destination symlink to a second filesystem and
-checking it out under a union mode, which follows the symlink: the tool refuses
-whatever the subtree holds -- one empty directory, one zero-length file, one
-symlink, one regular file, and a mixture of a zero-length and a regular file all
-give the device refusal -- and writes nothing into the directory on the second
-filesystem. The refusal is raised where the directory is entered, so it stands
-behind a per-entry refusal in a directory the walk reads first and ahead of one
-in a directory it reads later: a commit holding `aa/real` and `zz/sub` with the
-destination's `zz` on the second filesystem reports the per-entry refusal, and
-the same commit with `aa` on the second filesystem reports the device refusal.
-The refusal does not read the repository mode: `archive`, `bare`, `bare-user`,
-and `bare-user-only` each give it.
-
-A `--subpath` naming a file or a symlink reaches no directory walk and takes no
-such check. The tool creates the destination directory, attempts the link, and
-reports `Hardlinking <object> to <name>: Invalid cross-device link` at exit 1
-where the mode pair hardlinks the shape. A zero-length regular file, which no
-mode hardlinks, is written into the destination at exit 0. Recovered in a `bare`
-repository under the faithful checkout, which hardlinks both a regular file and
-a symlink, with the destination directory on a second filesystem: the
-zero-length file gave exit 0 and the file it names, and the regular file and the
-symlink each gave exit 1 and an empty destination directory.
-
-A refusal reached part-way through a walk leaves the entries the walk already
-wrote. Recovered by checking a commit holding `a/empty`, `a/link`, and `b/real`
-out of a `bare` repository with `-U -H`: the destination held `a` and `a/empty`
-and the walk stopped at the symlink.
-
-The copy path writes into a temp file in the destination directory, applies the
-checkout-mode metadata, and materializes it under the destination name. For a
-non-archive regular file, whose on-disk bytes are exactly the raw payload
-(`bare`, `bare-user`, `bare-user-shared`, `bare-user-only`), the copy attempts a
-`FICLONE` reflink of the object's extents before falling back to a streamed byte
-copy; an archive object is always streamed through its inflating reader. A
-hardlink applies no metadata, since it shares the object inode by construction.
-
-Destination directories. A directory is always created fresh, never hardlinked,
-and receives its full logical mode under both checkout modes; the metadata is
-applied after the directory's children are materialized, so a restrictive mode
-does not block writing them. The destination root receives the checked-out
-(sub)tree root's dirmeta: committing a root at mode `0750` and checking it out
-yields a destination root at `0750`; a subpath to a directory at `0755` yields a
-destination root at `0755`.
-
-Directory mode mask. `ostree checkout -M/--bareuseronly-dirs` reduces the mode
-of every directory the checkout creates to `mode & 0o775`. The mask reaches the
-destination root and every directory below it, in every repository mode and
-under both checkout modes. A directory the checkout reuses under a union mode
-keeps its own mode, with the switch and without it. A regular file and a symlink
-are unaffected, and the process umask reduces nothing further, the mode being
-applied explicitly. The switch is a no-op in `bare-user-only`, whose directory
-modes are already below the mask at commit time. Recovered by checking a tree of
-thirteen directory modes out under the switch and reading the destination modes
-back: `0666` gave `0664`, `0700` gave `0700`, `0705` gave `0705`, `0774` gave
-`0774`, `0775` gave `0775`, `0776` gave `0774`, `0777` gave `0775`, `1755` gave
-`0755`, `2755` gave `0755`, `3775` gave `0775`, `4755` gave `0755`, `6755` gave
-`0755`, and `7777` gave `0775`. Every result equals `mode & 0o775`. The switch
-changes nothing in the repository, and `commit` carries no equivalent.
-
-Overwrite policy over an existing destination:
-
-- Default (`ostree checkout`): the destination itself must not exist, and an
-  existing destination directory is an error (`mkdirat: File exists`) whether or
-  not it is empty. Each subdirectory is created with `mkdirat`, and an existing
-  one is an error. The three union modes take an existing destination and create
-  an absent one; a destination created by any mode takes the checked-out tree
-  root's dirmeta, and one that already existed keeps its own metadata. A
-  destination whose parent does not exist is an error in every mode
-  (`mkdirat: No such file or directory`). A symlink to a directory is followed
-  by the three union modes at every directory name, the destination itself and
-  every directory name inside the tree, which write into the target and leave
-  the link in place. The link is followed wherever it points, so a union
-  checkout writes outside the destination tree where a symlink inside the
-  destination leads there: over a commit carrying `d/g`, a destination holding
-  an absolute symlink `d` to a directory elsewhere on the filesystem exits 0 and
-  creates `g` in that directory. A symlink resolving to nothing, to a
-  non-directory, or to itself ends the checkout at exit 1 with the open's own
-  error (`opendir(d): No such file or directory`,
-  `opendir(d): Not a directory`, and
-  `opendir(d): Too many levels of symbolic links`). Under the default mode a
-  symlink at the destination is an error (`mkdirat: File exists`) like any
-  other existing destination. Under union files with `--whiteouts` the link is
-  removed and a directory is created in its place, which the "Whiteouts."
-  paragraphs below state.
-- Union files (`ostree checkout --union`): an existing directory is reused
-  without re-applying its metadata, an existing file or symlink is overwritten
-  whatever its content, mode, or target, new entries are added, and existing
-  entries not in the commit are left in place. An existing directory where the
-  commit carries a regular file or a symlink is an error.
-- Add files (`ostree checkout --union-add`): only entries that do not already
-  exist are written. An existing entry of any type is kept, including a
-  directory where the commit carries a regular file, and including an entry the
-  commit does not carry. An existing regular file or symlink where the commit
-  carries a directory is still an error, since the walk descends into the name.
-- Union identical (`ostree checkout --union-identical`): new entries are added,
-  an existing entry that is what the checkout would put there is left in place,
-  and a differing existing entry is an error. The tool takes the option only
-  together with `--require-hardlinks`, whatever the repository mode, so the
-  checkout that runs under it is a hardlinking one; without the switch it exits
-  1 having written nothing. A regular file is what the checkout would put there
-  when its `(st_dev, st_ino)` equals the loose object's, or when both its
-  file-object checksum -- computed over content bytes, uid, gid, permission
-  bits, and extended attributes, reduced the way the repository mode reduces an
-  ingested entry -- equals the object's checksum and its permission bits equal
-  the loose object inode's permission bits. Neither the modification time nor
-  the link count is read. The second conjunct is what makes an object identical
-  to nothing in `bare-user` when its logical mode carries a bit the inode rule
-  `(logical_perm & 0o775) | 0o400` drops: `0666`, `0777`, and every mode
-  carrying a setuid, setgid, or sticky bit. In `bare` the inode carries the full
-  logical mode, so the second conjunct is implied by the first and a setuid
-  object is identical to a setuid destination. In `bare-user-only` the reduction
-  drops ownership and extended attributes and masks the permission bits, so a
-  destination owned by the invoking user and carrying an unrelated extended
-  attribute is identical while one whose raw permission bits differ from the
-  object inode's is not. A symlink is compared by its target alone, whatever the
-  object's ownership. A directory is reused with no comparison, as under the
-  other union modes. Checkout requires a hardlink-eligible repository mode and
-  checkout mode with no forced copy for this policy, and rejects it up front
-  otherwise.
-
-  Recovered by checking out against destinations built by hand, one variable at
-  a time, in `bare`, `bare-user`, and `bare-user-only`: the content bytes, the
-  permission bits, the uid, the gid, and the extended-attribute set each make
-  the entry differ; the modification time, the inode, and the link count do not;
-  and each logical mode from `0400` through `04755` was checked against a
-  destination of the same mode and of `0755`.
-
-A type conflict between the destination and the commit stops the checkout, and
-no mode changes an entry's type. `--whiteouts` is the one exception, and the
-"Whiteouts." paragraphs below state what it widens. The conflicts:
-
-- A destination name held by a regular file when the commit carries a directory
-  of that name is a conflict in every mode. The tool errors
-  (`opendir(<name>): Not a directory`), since it descends into the existing name
-  to merge the committed directory's children. A name held by a symlink is
-  followed by the three union modes, and the outcome is the one the destination
-  bullet above states.
-- A destination directory when the commit carries a non-directory of that name is
-  a conflict under the default, union-files, and union-identical modes; the tool
-  errors (`renameat(...): Is a directory` under union-files). Under add-files the
-  existing directory is kept and nothing is written for that name.
-
-Whiteouts. Three marker names are read, by two independent options. Each option
-reads its own names and no others, and with both options off every marker checks
-out as an ordinary entry under its own name and nothing is removed.
-
-`ostree checkout --whiteouts` reads two Docker-style names:
-
-- `.wh.<name>` removes `<name>` from the destination directory and is not
-  materialized. The removal reaches an entry of any type and recurses into a
-  directory, taking the whole subtree. A target the destination does not hold is
-  a no-op at exit 0.
-- `.wh..wh..opq` clears the destination directory before any of the directory's
-  entries is written, and is not materialized.
-
-`ostree checkout --process-passthrough-whiteouts` reads one overlayfs name,
-`.ostree-wh.<name>`, which becomes a character device with device number 0:0 at
-`<name>` and is not materialized under its own name. The marker's content is
-ignored. `.ovl.wh.`, `.overlay.wh.`, and `.ostree.wh.` are ordinary name
-prefixes and carry no meaning.
-
-The removal order and the clear order differ. The clear is a pre-pass over the
-destination directory, decided by the name across the whole file-entry list, so
-an entry the commit also carries at a cleared name arrives fresh whatever the
-union mode would otherwise keep. The per-name removal runs in order among the
-directory's file entries, so a marker sorting after its target removes the entry
-the same checkout wrote, and a marker sorting before it leaves the target the
-checkout writes afterwards. File entries are materialized before directory
-entries, so a marker never removes a directory the same tree writes at the
-marker's target name.
-
-The type test differs per marker. The per-name marker and the passthrough marker
-act on a regular-file entry alone: a symlink or a directory carrying such a name
-is materialized verbatim and acts on nothing. The opaque clear is decided by the
-name alone, and the marker's own materialization by its type: a symlink named
-`.wh..wh..opq` clears the directory and is then materialized, a regular file
-clears it and is not materialized, and a directory clears nothing and is
-materialized.
-
-The whiteout device takes the marker's permission bits. The bits reach `mknod`,
-so the process umask reduces them; a checkout outside `-U` then applies the
-recorded mode in full, together with the marker's ownership and its extended
-attributes. The order is the attributes, then the ownership, then the mode. A
-`chown` on a device node clears the setuid bit, and the setgid bit when group
-execute is set, also for root and also where the ids do not change, so a marker
-recorded at 04755 or 02755 carries its bits only where the mode is applied after
-the ownership. The chown after the attributes also removes `security.capability`
-from the device, which gets no use from a file capability. Creating a character
-device with device number 0:0 needs no capability, so the whole mechanism runs
-unprivileged. A `user.*` extended attribute on a marker is a
-refusal on every kernel outside `-U`, since the `user.` namespace is not
-permitted on a device node. The device then stands where it was created at the
-mode `mknod` gave it, the umask included and the recorded mode not yet applied,
-which places the attributes ahead of the mode. The tool reports its own `GError`
-misuse on `stderr` ahead of that refusal, which no reader should treat as part
-of the message.
-
-The destination disposition the device takes per union mode: union-files unlinks
-an existing regular file, symlink, or device and creates the device, and refuses
-an existing directory (`unlink(<name>): Is a directory`); add-files keeps an
-existing entry of any type; union-identical keeps an existing entry of any type
-with no comparison, which is the one place its identity rule does not run. With
-no union option a destination directory that already exists is refused before
-any entry is reached, so the default mode's disposition at a marker's target
-name is not observable. The per-name removal and the opaque clear ignore the
-union mode altogether.
-
-`--whiteouts` widens the union-files disposition over a type conflict, for every
-entry and not only for a marker. Under `--union` with the switch, a destination
-entry whose type is not the type the tree carries at that name is removed and
-the entry is written: a directory and its whole subtree, empty or populated,
-where the tree carries a regular file or a symlink, and a regular file, a
-symlink of any kind, a fifo, a device, or a socket where the tree carries a
-directory. A symlink loses the link alone, so a link to a directory the
-checkout would otherwise follow is unlinked and the directory it resolved to
-stays as it stands and receives nothing. A directory the widening creates takes
-the tree's own dirmeta, as a directory the checkout creates in an empty
-destination does. With the switch absent the same conflict ends the checkout,
-apart from the link to a directory the checkout follows.
-
-The widening reaches the destination root and every depth below it, so a
-destination path holding a regular file, a symlink of any kind, or a fifo
-becomes the checkout's own directory. It is independent of the checkout mode,
-the repository mode, and `--subpath`. The destination directory a `--subpath`
-naming a file or a symlink needs stands outside it: a destination that is not a
-directory is refused there under either switch.
-
-`--process-passthrough-whiteouts` widens nothing, the whiteout device refusing a
-destination directory under either switch, and `--union-add` and
-`--union-identical` are not widened. With no union option a destination that
-already exists is refused before any entry is reached, so no type conflict is
-reachable there.
-
-A `--subpath` naming a marker file reaches the same rules, so the marker is not
-materialized under its own name because a subpath selected it: `.wh.<name>`
-removes `<name>` from the destination the subpath writes into, and
-`.ostree-wh.<name>` writes the device there. The opaque marker's clear is the
-directory's own pre-pass, so a subpath naming `.wh..wh..opq` drops the entry and
-clears nothing.
-
-Two names are refused at exit 1. A regular file named exactly `.wh.` under
-`--whiteouts` refuses (`Invalid empty whiteout ''`), and a regular file named
-exactly `.ostree-wh.` under `--process-passthrough-whiteouts` refuses (`Invalid
-empty overlayfs whiteout ''`). Each refusal answers to its own switch alone, and
-a symlink so named is materialized under either switch. The refusal comes
-mid-walk, after the directory's opaque clear, so the destination directory stands
-and holds what the walk had already written.
-
-Both options are independent of the repository mode, of `-U`, of `-H`, and of
-`-C`. Neither option is taken alongside `--composefs` or `--composefs-noverity`:
-the pair is refused at exit 1 (`Specified options are incompatible with
---composefs`) and no image is written.
-
-Subpath. A subpath resolves a node within the commit tree and checks that node
-out as the destination root. A subpath to a directory makes its dirmeta the
-destination root's metadata and materializes its children. A subpath to a regular
-file or symlink creates the destination directory (a default `0700` observed) and
-places the single object inside it under its name. A missing subpath is an error.
-
-The spellings the tool accepts and refuses, recovered with
-`ostree checkout --subpath` against a commit holding `file.txt`, `dir/`, and
-`dir/link`: the leading slash is optional (`/dir` and `dir` name the same node),
-`/` names the whole tree, and a nested path resolves through its directories. A
-value the tool cannot resolve ends the checkout at exit 1 with no destination
-created: `error: No such file or directory: <path>`, naming the path with a
-leading slash the tool adds, and `error: Not a directory` where the path runs
-through a regular file. The tool looks the value up as given, so `.` is refused
-(`No such file or directory: /.`) and a trailing slash is refused
-(`No such file or directory: /sub/`).
-
-`--allow-noent` turns the absent-subpath refusal into exit 0 with nothing
-written: no destination is created, and a destination that already existed is
-left as it was. Over a well-formed repository that is the one refusal it
-reaches: an unresolvable COMMIT and a subpath running through an entry that is
-not a directory keep their refusals and their exit status. Where the loose
-content object a `--subpath` names has been deleted out of band, the tool
-suppresses that refusal as well and exits 0 creating no destination, while the
-same commit checked out whole keeps the refusal.
-`conformance/cli-surface.md`, "P2", records the command lines on which the tool
-does not honor the switch, and the port's own reach beside them.
-
-Path selection. A per-path filter decides which entries a checkout writes.
-`ostree checkout --skip-list=FILE` supplies one from a file: the file holds one
-path per line, blank lines are ignored, a final line needs no newline, and
-nothing else is stripped or normalized. The file must hold UTF-8
-with no NUL byte, and a byte that is not refuses the command at exit 1 with
-`Invalid UTF-8` and creates no destination. Nothing is reported for a line that
-matches no entry.
-
-The filter's key is the entry's path rooted at the checkout root, which is the
-`--subpath` root where one is given, with a leading slash. A directory carries a
-trailing slash, the root is `/`, and a file and a symlink carry none. The match
-is an exact string comparison, so `/a/` prunes the directory `a` and its whole
-subtree while `/a`, `//a/`, `/a//`, ` /a/ `, and `./a/` match nothing, and `/f1`
-prunes the file `f1` while `f1` and `/f1/` match nothing. Recovered by checking
-one commit out under each spelling and walking the destination.
-
-The filter decides the checkout root before the destination path is touched, so
-a pruned root writes nothing and creates no destination, and under a union mode
-it leaves an existing destination as it stands. The destination's own parent
-directory is not read either, so a pruned root exits 0 where that parent does
-not exist. It decides a whiteout
-marker on the marker's own tree path and before either whiteout switch reads it,
-so a pruned `.wh.<name>` performs no removal and a pruned `.ostree-wh.<name>`
-writes no device. It does not decide the opaque clear, which is the directory
-walk's own pre-pass over the destination's names, and it does not decide the
-single object a file or symlink subpath names. Recovered by checking a commit
-holding the three markers out over a populated destination, once per marker
-path, by checking a file subpath out under each spelling of its path, and by
-checking a pruned root out into a destination under a directory that does not
-exist.
-
-The two commands that take a `--skip-list` read a directory entry under
-different conventions. `ostree commit --skip-list` prunes a directory under
-`/a` and under `/a/` alike. `ostree checkout --skip-list` takes the
-trailing-slash spelling alone.
-
-Batch checkouts. `ostree checkout --from-stdin` and
-`ostree checkout --from-file=FILE` read a stream of NUL-separated records, taken
-two at a time as `(REFSPEC, SUBPATH)` pairs. A final record with no terminator
-is a record, so a stream ending in NUL carries no trailing empty record. An
-empty record in the refspec position ends the stream. A refspec record with no
-record after it carries no subpath and names the whole tree, and an empty record
-in the subpath position is an empty subpath value.
-
-One trailing `\n` is dropped from a refspec record, and then one trailing `\r`.
-Nothing is dropped from a subpath record, and no whitespace is stripped from
-either. Neither record is validated as UTF-8: a subpath record reaches the tree
-lookup as the bytes it holds.
-
-The refspec takes every form the `COMMIT` positional takes: a branch name, a
-full checksum, an abbreviated checksum, and a `^` ancestry suffix. The subpath
-record is a `--subpath` value and follows the rules above.
-
-Every pair checks out into one destination, which the invocation's first
-positional names, under the invocation's own overwrite mode. So pairs layer
-under `--union` and a second pair over the same name is a collision without one.
-A `--subpath` on the command line decides nothing under a batch option, and a
-`--skip-list` applies to each pair, rooted at that pair's subpath. The skip list
-is opened inside the per-pair scope, so a stream that carries no pair leaves the
-file unread. The refusals the command line carries into one checkout stand
-inside that scope as well -- the union-option pair, the composefs
-incompatibility, and the `--union-identical` requirement -- so a stream that
-carries no pair reaches none of them and exits 0. A destination value of no
-bytes takes the same rule: a pair creates a path, so a pair refuses the empty
-value and an empty stream exits 0. `--allow-noent` acts per pair and
-the stream continues; without it the run stops at the first failing pair and the
-pairs already written stay. A composefs switch is taken with a batch option, and
-each pair writes the image of its own revision, the pair's subpath deciding
-nothing.
+Neither option changes the commit checksum in twelve of the fourteen checkout
+variants of `archive`, `bare-user`, and `bare`. The two others are a
+`bare-user` checkout with `-U`, with or without `-H`. That checkout hardlinks
+the stored objects, which carry the `user.ostreemeta` xattr of the repository.
+The plain walk reads this xattr as a real xattr of the source file and commits
+it, so each file object and each dirtree changes. There the commit with either
+option gives the checksum of the source tree. `--no-xattrs` on the plain walk
+gives a third checksum: it drops the xattr and keeps the permission bits of the
+inode, `(logical_perm & 0o775) | 0o400`. The xattr payload is `(uuua(ayay))`:
+`uid(be32) gid(be32) mode(be32)` and the xattr array, 12 bytes when the array
+is empty.
 
 ## Extended attributes
 
-Storage form is GVariant `a(ayay)`: array of (name-bytes, value-bytes). A
-stored name includes the namespace prefix and a single terminating NUL, with a
-non-empty prefix and no interior NUL. Confirmed by committing a file bearing a
-`user.demo` xattr into a bare-user repo and reading its `user.ostreemeta`
-blob: the name bytes `user.demo` are followed by one `\0`. Canonicalization
-sorts by name with byte-wise comparison and is applied before every
-serialization and hash; duplicate names and names not in this stored form are
-rejected. Per-mode disposition: bare on the inode, bare-user and
-bare-user-shared inside `user.ostreemeta`, bare-user-only discarded,
-bare-split-xattrs in separate `.file-xattrs` objects reached through
-`.file-xattrs-link`, archive inside the `.filez` header.
-During commit an existing `security.selinux` xattr is dropped and re-applied
-from the SELinux policy so it is not double-counted in the checksum.
+The storage form is the GVariant `a(ayay)`: an array of (name bytes, value
+bytes). A stored name holds the namespace prefix and one terminating NUL. The
+name before the NUL is not empty and holds no NUL. Observed behavior: a file
+with a `user.demo` xattr is committed into a `bare-user` repository. In its
+`user.ostreemeta` blob, the name bytes `user.demo` are followed by one `\0`.
+
+Canonicalization sorts the names by byte-wise comparison. It runs before each
+serialization and each hash. It refuses a duplicate name and a name that is not
+in the stored form. "Write path: loose-object inode modes and durability" and
+"bare-split-xattrs mode" give the place of the xattrs in each repository mode.
+
+When a commit modifier carries a label callback, the commit removes an existing
+`security.selinux` xattr and applies the label that the callback returns. The
+checksum thus counts the label once. With no label callback, the commit records
+a `security.selinux` xattr read from disk as it is. The port has no SELinux
+policy backend (`conformance/cli-surface.md`, "P2", `commit`).
 
 ## Static delta wire format
 
@@ -2952,456 +1496,462 @@ SIGNED_FORMAT           (taya{sv})
     magic t (0x4F535453474E4454 "OSTSGNDT"), superblock bytes ay, signatures a{sv}
 ```
 
-On-disk framing of a part file before decompression is `(y@ay)` = compression
-byte plus body. Compression: 0 = none, `x` = xz/lzma (the only real
-compression written; the reader accepts only 0 and `x`).
+### Part framing
 
-A part payload `PART_PAYLOAD_FORMAT_V0` of `n` bytes ends with three framing
-offsets, each `z` bytes wide, where `z` is the offset width a GVariant container
-of `n` bytes takes (1, 2, 4, or 8). Read from the end, the last `z` bytes state
-the end of the mode table, the `z` bytes before them the end of the xattr table,
-and the `z` bytes before those the end of the data-source blob. The operation
-stream runs from the end of the blob to `n - 3z`. From these ends:
+A part file is `(y@ay)` before decompression: one compression byte, then the
+body. The byte is 0 for none or `x` for xz (lzma). `x` is the only compression
+a writer uses, and a reader accepts 0 and `x` alone.
 
-- the mode count is the end of the mode table divided by 12;
-- the blob size is the end of the blob less the end of the xattr table;
-- the operation size is `n - 3z` less the end of the blob;
-- the xattr count is 0 for an empty table. For a table of `x` bytes, with
-  offset width `w` for `x` bytes, the last `w` bytes of the table state where
-  its own framing starts, and the count is `x` less that value, divided by `w`.
+A `PART_PAYLOAD_FORMAT_V0` payload of `n` bytes ends with three framing offsets
+of `z` bytes each. `z` is the offset width of a GVariant container of `n` bytes
+(1, 2, 4, or 8). Read from the end, the offsets state the end of the mode
+table, of the xattr table, and of the data-source blob. The operation stream
+runs from the end of the blob to `n - 3z`.
 
-Recovered by decoding two parts the tool wrote and comparing the counts with
-`static-delta show`: a part of 2 modes, 1 xattr set, a 300,130-byte blob, and a
-26-byte operation stream, and a part of 1 mode, 1 xattr set, a 9,477-byte blob,
-and a 245-byte operation stream. The framing sits at the end of the payload, so
-a reader that streams the payload reads it to the end to find the framing, and
-reads again the parts of the tables and the operations it did not keep.
+The mode count is the end of the mode table divided by 12. The blob size is the
+end of the blob less the end of the xattr table. The operation size is `n - 3z`
+less the end of the blob. The xattr count is 0 for an empty table. For a table
+of `x` bytes, take the offset width `w` for `x` bytes. The last `w` bytes of
+the table state where its own framing starts, and the count is `x` less that
+value, divided by `w`.
 
-Constants: objtype+csum stride is 33 bytes (1 objtype + 32 csum). Part max size
-16 MiB (advisory). Delta part version 0. The `SIGNED_FORMAT` magic is the eight
-ASCII bytes `OSTSGNDT`; read as a little-endian `t` that is `0x54444E475354534F`,
-read big-endian it is `0x4F535453474E4454`. A superblock file that begins with
-those eight bytes is a signed envelope: the `ay` it wraps is the raw
-`SUPERBLOCK_FORMAT` bytes (the payload the signatures cover), and the trailing
-`a{sv}` holds signatures under the per-engine keys (for example
-`ostree.sign.ed25519 -> aay`), the same framing commit and summary signing use.
-An unsigned delta stores the raw `SUPERBLOCK_FORMAT` bytes directly.
+A reader that streams the payload reads it to the end to find the framing. Then
+it reads again the parts of the tables and the operations that it did not keep.
 
-The superblock's leading `a{sv}` carries `ostree.endianness` and, where the
-target commit has detached metadata, a copy of it under the key
-`deltas/<fanout>/<rest>/commitmeta` -- the delta's own relative directory with
-`/commitmeta` appended -- holding the same `a{sv}` the `.commitmeta` file holds.
-Recovered by signing a commit and reading the superblock the tool then generated:
-its bytes carry `ostree.sign.ed25519` inside that key. A tool pull checks a
-delta-delivered commit against this copy rather than against the `.commitmeta`
-it fetches and stores.
+### Superblock fields
 
-Inline parts. `static-delta generate --inline` puts each part into the same
-dict, under the key `deltas/<fanout>/<rest>/<i>` -- the delta's own relative
-directory with the part number appended -- as a variant of type `(yay)`. The
-value holds the exact bytes of the part file: the compression byte and the
-body. A meta-entry's `size` is the length of those bytes, as it is for a part
-file. The key is the repository-relative name also under `--filename`, and the
-tool writes no part file, under the repository location and under
-`--filename`. The dict entries are in this order: `ostree.endianness`, then the
-inline parts in part order (`/0` to `/12` over a 13-part delta, in insertion
-order and not string order), then `<rest>/commitmeta`. Recovered by generating
-one delta with `--inline` and one without, with `--min-fallback-size=0`: the
-part file's bytes occur whole in the inline superblock, and both forms state
-`size=300393`.
+The metadata dict starts with the `ostree.endianness` byte, `l` on a
+little-endian host (see "Endianness"). The inline parts follow in part order
+(see "Inline parts"). Last, where the target commit has detached metadata, a
+copy of it follows under the key `deltas/<fanout>/<rest>/commitmeta`. The key
+is the relative directory of the delta with `/commitmeta` appended, and the
+value is the `a{sv}` of the `.commitmeta` file. Observed behavior: a tool pull
+checks a commit that a delta delivers against this copy. It does not check the
+commit against the `.commitmeta` that it fetches and stores.
 
-On apply, an inline part is used also where a part file of the same number is
-present: the tool applies an inline superblock beside a garbage `0` file at exit
-0, and its `fsck` passes. The tool also pulls an inline delta over HTTP and
-requests the superblock alone. The port reads an inline part on the same terms,
-in `apply-offline`, in a pull, and in `show`, and checks it against its
-meta-entry's size and checksum before it decompresses it, as it checks a part
-file. The port refuses a value under a part key that is not a `(yay)` variant.
+The tool writes the wall-clock time of the generation as the timestamp, and
+`SOURCE_DATE_EPOCH` does not pin it. The port writes the current time unless the
+caller gives `DeltaOptions::timestamp`. `from` is an empty `ay` for a
+from-scratch delta. The version field of a meta-entry, the delta part version,
+is 0. The objtype+csum stride is 33 bytes: 1 objtype byte and 32 checksum bytes.
 
-Inline parts make the superblock as large as the parts. The tool writes a
-140,007,544-byte inline superblock and applies it offline. The port reads and
-writes a superblock of 128 MiB at most, and refuses a larger one
-(`conformance/cli-surface.md`, "P2", `static-delta`).
+The `SIGNED_FORMAT` magic is the eight ASCII bytes `OSTSGNDT`:
+`0x54444E475354534F` read as a little-endian `t`, and `0x4F535453474E4454` read
+big-endian. A superblock file that starts with the magic is a signed envelope.
+The `ay` it wraps holds the raw `SUPERBLOCK_FORMAT` bytes, the payload that the
+signatures cover. The trailing `a{sv}` holds the signatures under the key of
+each engine, for example `ostree.sign.ed25519 -> aay`, as in commit and summary
+signing. An unsigned delta stores the raw `SUPERBLOCK_FORMAT` bytes.
 
-Object delivery. The target commit object is embedded whole in the superblock
-(the `(a{sv}aya(say)sstayay)` field); it is not carried in any part, and
-re-serializing it hashes to the `to` checksum. Every other object is produced by
-a part. A part's meta-entry carries the ordered objtype+csum array; the
-operation stream produces objects in that order, and the object type at the
-current position selects how an operation is decoded. The `part-checksum` is the
-SHA-256 of the on-disk part file (the `(y@ay)` framing bytes). Fallback objects
-are delivered outside the parts as plain loose objects.
+### Inline parts
 
-Fallback selection (generation-side; recovered by observing the tool). An object
-is delivered as a fallback when the size compared against `--min-fallback-size`
-is at least the threshold, and is packed into a part otherwise. The unit is
-decimal megabytes (a factor of 1,000,000, not 1,048,576) and the default is 4, so
-the default threshold is 4,000,000 bytes, and an object whose size equals the
-threshold is a fallback. The value is read as a whole number of megabytes:
-`--min-fallback-size=0.1` over a commit holding one 5,000,000-byte object reports
-`Number of fallback entries: 0`, where `--min-fallback-size=1` over the same
-commit reports 1. A threshold of 0 turns fallbacks off: `--min-fallback-size=0`
-over that commit packs the object (`PartMeta0: nobjects=3 size=5000405
-usize=5000055`).
+`static-delta generate --inline` puts each part into the metadata dict, under
+the key `deltas/<fanout>/<rest>/<i>`. The key is the relative directory of the
+delta with the part number appended. The value is a `(yay)` variant that holds
+the exact bytes of the part file, the compression byte and the body. The `size`
+of the meta-entry is the length of these bytes. Under `--filename` the key is
+also the repository-relative name. The tool writes no part file, at the
+repository location and under `--filename`.
 
-The size compared is the object's file header variant, seven bytes, and the
-content -- not the content alone. Recovered by finding the content size at which
-an object switches sides. At a 4,000,000-byte threshold the largest packed content
-is 3,999,974 bytes and 3,999,975 becomes a fallback, an overhead of 25 bytes over
-the 18-byte header of a `uid=gid=0` no-xattr regular file, and the same offset
-holds at other thresholds (for example 2,000,000). At a 1,000,000-byte threshold
-over three header shapes: 999,974/999,975 for that same 18-byte header, an
-overhead of 25; 999,953/999,954 for a file carrying one 8-byte xattr, whose header
-is 39 bytes, an overhead of 46; and 999,658/999,659 for one carrying a 300-byte
-xattr, whose 334-byte header crosses the GVariant offset-width boundary, an
-overhead of 341. The overhead is seven bytes over the header variant in every
-case, so the header's own offset table counts and the constant does not move with
-the header's size. The on-disk content-stream framing is eight bytes (a big-endian
-`u32` length and four NUL bytes), one more than the count compared here.
+The parts are in insertion order with no string sort: `/0` to `/12` over a
+13-part delta. An inline part applies also where a part file of the same number
+is present. Observed behavior: the tool applies an inline superblock beside a
+`0` file of arbitrary bytes at exit 0, and its `fsck` passes. The tool pulls an
+inline delta over HTTP and requests the superblock alone.
 
-Applying a delta does not use this threshold: the reader delivers whatever the
-superblock's fallback array lists and requires those objects to be present
-already. The port compares the same size (`FALLBACK_FRAMING` in `deltagen.rs`), so
-it classifies every object as the tool does, including one sitting exactly on the
-threshold: `the_fallback_threshold_classifies_an_object_as_the_tool_does` runs the
-tool's own generation over both sides of the boundary and compares the fallback
-count.
+The port reads an inline part in `apply-offline`, in a pull, and in `show`. It
+checks the part against the size and the checksum of its meta-entry before it
+decompresses it. It refuses a value under a part key that is not a `(yay)`
+variant. An inline superblock is as large as its parts, and the port reads and
+writes a superblock of 128 MiB at most (`conformance/cli-surface.md`, "P2",
+`static-delta`).
 
-A fallback entry's two sizes (recovered by generating a delta over a 5,000,000-
-byte object and reading `static-delta show`): the compressed size is the loose
-object's on-disk size in the source repository (5,001,564 bytes for the `.filez`
-of that object in an archive repo, matching the file), and the uncompressed size
-is the content size alone (5,000,000), with no header included.
+### Object delivery
 
-Part meta-entry sizes. `size` is the part file's on-disk byte size, compression
-byte included. `usize` is the uncompressed payload the part delivers, summed over
-its objects: a metadata object's serialized length and a regular file's content
-length. A symlink's target length and the file header are not counted: a
+The superblock embeds the target commit object whole, in the
+`(a{sv}aya(say)sstayay)` field. No part carries it, and its serialization
+hashes to the `to` checksum. A part produces each other object, except a
+fallback object. The meta-entry of a part carries the ordered objtype+csum
+array. The operation stream produces the objects in that order. The object type
+at the current position selects how an operation decodes.
+
+The `part-checksum` is the SHA-256 of the part file on disk, the `(y@ay)`
+framing bytes. A fallback object travels outside the parts as a plain loose
+object. A reader takes the fallback array as the superblock lists it, with no
+threshold. An offline application requires each fallback object to be present
+already. `conformance/cli-surface.md`, "P2", `static-delta`, records the limits
+of the tool's `apply-offline`.
+
+### Fallback selection
+
+The generator makes an object a fallback when its compared size is at least the
+threshold of `--min-fallback-size`. It puts the object into a part otherwise.
+The unit is the decimal megabyte, 1,000,000 bytes. The default is 4, so the
+default threshold is 4,000,000 bytes. An object whose size equals the threshold
+is a fallback. The value is read as a whole number of megabytes, and 0 turns
+fallbacks off.
+
+Observed behavior: over a commit that holds one 5,000,000-byte object,
+`--min-fallback-size=0.1` reports `Number of fallback entries: 0`, and
+`--min-fallback-size=1` reports 1. `--min-fallback-size=0` packs the object:
+`PartMeta0: nobjects=3 size=5000405 usize=5000055`.
+
+The compared size is the file header variant of the object, plus seven bytes,
+plus the content. The seven bytes are the same for each header shape. Thus the
+offset table of the header counts, and the constant does not change with the
+header size. The on-disk content-stream framing is eight bytes, a big-endian
+`u32` length and four NUL bytes. This is one more than the count compared here.
+
+Observed behavior: at a 4,000,000-byte threshold, 3,999,974 bytes of content is
+packed and 3,999,975 is a fallback. The overhead, the threshold less 3,999,975,
+is 25 bytes. This is the 18-byte header of a `uid=gid=0` regular file with no
+xattr, plus 7. The same offset holds at other thresholds, for example 2,000,000.
+At a 1,000,000-byte threshold the switch points are 999,974/999,975 for the same
+18-byte header, an overhead of 25. They are 999,953/999,954 for a file with one
+8-byte xattr and a 39-byte header, an overhead of 46. They are 999,658/999,659
+for a file with a 300-byte xattr, an overhead of 341: its 334-byte header
+crosses the GVariant offset-width boundary.
+
+The port compares the same size (`FALLBACK_FRAMING` in `deltagen.rs`). The test
+`the_fallback_threshold_classifies_an_object_as_the_tool_does` compares the
+fallback count of the two generators on the two sides of the boundary.
+
+The compressed size of a fallback entry is the on-disk size of the loose object
+in the source repository. The uncompressed size is the content size alone, with
+no header. Observed behavior: for a 5,000,000-byte object in an archive
+repository, the entry states 5,001,564 bytes (the size of the `.filez` file)
+and 5,000,000.
+
+### Part meta-entry sizes
+
+The generator of the tool leaves the target of a symlink and the file header out
+of `usize`. `usize` is the uncompressed payload of the part, summed over its
+objects. A metadata object adds its serialized length, and a regular file its
+content length. The generator of the port also counts the target length of each
+symlink (`conformance/cli-surface.md`, "P2", `static-delta generate`). `size` is
+the on-disk byte size of the part file, compression byte included. It is the
+length that the part checksum covers, and the field that bounds a part.
+
+For a part of splices alone, the `usize` of the tool is the size of the
+data-source blob less the symlink targets in it. For a rollsum or bspatch part
+this is not true, because the blob holds patch streams. Observed behavior: a
 from-scratch part of a 300,000-byte file, a 6-byte file, a 1-byte symlink
-target, and two metadata objects reports `usize=300129` and `blobsize=300130`.
-The port's generator differs: it counts the symlink target, and reports
-`usize=300130` for the same part (`conformance/cli-surface.md`, "P2",
-`static-delta generate`). Recovered by
-comparing `static-delta show` against the objects a part carries: a part
-delivering one 8,192-byte file plus its one-entry dirtree (41 bytes, with dirmeta
-12) reports `usize=8233`, and a part of two 1,000,000-byte splices reports
-`usize=2000000`. For an all-splice part this equals the data-source blob size,
-which is why the two coincide there; for a rollsum or bspatch part it does not,
-since the blob then holds patch streams rather than content.
+target, and two metadata objects reports `usize=300129` and `blobsize=300130`. A
+part with one 8,192-byte file and its one-entry dirtree (41 bytes, with dirmeta
+12) reports `usize=8233`. A part of two 1,000,000-byte splices reports
+`usize=2000000`.
 
-`usize` states what the part's objects add up to, which is under the size of the
-part payload that carries them: a from-scratch part of three files (8,192, 20,000
-and 6 bytes), one symlink and three metadata objects reports `usize=28453` where
-its payload decompresses to 28,531 bytes -- the data-source blob (28,462, which
-holds the 9-byte symlink target `usize` leaves out), the operation stream (38),
-the mode table (24), the xattr table, and the tuple framing. `size` is the field
-that bounds a part: it is the length of the file the part checksum is taken over.
+The `usize` of the tool is less than the size of the part payload. Observed
+behavior: a from-scratch part of three files (8,192, 20,000 and 6 bytes), one
+symlink, and three metadata objects reports `usize=28453`. Its payload
+decompresses to 28,531 bytes. These are the data-source blob (28,462, which
+holds the 9-byte symlink target), the operation stream (38), the mode table
+(24), the xattr table, and the tuple framing.
 
-Part packing. Objects accumulate into one part until adding the next would push
-the payload past `--max-chunk-size` (decimal megabytes, default 32), then a new
-part starts; metadata objects come before content objects. Observed with
-`--max-chunk-size=2` over five 1,000,000-byte objects: payloads of 1,000,218
-(the two metadata objects plus one file), 2,000,000, and 2,000,000.
+### Part packing
 
-The port applies the rule with the incoming object's content size as the estimate,
-which is exact for a spliced object and an upper bound for a diffed one, and
-decides before the object is appended, so a part's payload never passes the
-ceiling. A diffed object whose payload comes out small therefore still closes the
-part it would have fit in, costing one extra xz stream and one extra pair of mode
-and xattr tables, and the port's part boundaries differ from the tool's for such an
-object. Both layouts are valid: a part's contents are named by its meta-entry, so
-where the boundaries fall decides a delta's size, not whether it applies.
+The tool starts a new part where the next object pushes the payload past
+`--max-chunk-size`, in decimal megabytes, default 32 (32,000,000 bytes).
+Metadata objects come before content objects. Observed behavior:
+`--max-chunk-size=2` over five 1,000,000-byte objects gives payloads of
+1,000,218 (the two metadata objects and one file), 2,000,000, and 2,000,000. A
+meta-entry names the contents of its part, so a delta applies with any part
+boundaries, and the boundaries change its size alone. The part boundaries of
+the port are in `conformance/cli-surface.md`, "P2", `static-delta generate`.
 
-Superblock fields the tool writes. The metadata dict holds `ostree.endianness`
-as a byte (`l` on a little-endian host), then any inline parts, then the
-`commitmeta` copy where the target commit has detached metadata. The timestamp
-is the generation wall-clock time, big-endian. `SOURCE_DATE_EPOCH` does not pin
-it. `from` is an empty `ay` for a
-from-scratch delta. The recursion array is always empty. A meta-entry's version
-field is 0.
+### Diff-source pairing
 
-Diff-source pairing (generation-side). The tool pairs a modified content object
-with the object at the same path in the source commit: a file that was renamed
-and edited is not paired (`modified: 0`) and travels whole. Pairing is also
-skipped when the two sizes differ substantially -- a 40,000-byte object paired
-after growing to 40,800 or 56,000 bytes, but not after growing to 59,600 or
-shrinking to 26,800. When a pair is found, the tool prefers rollsum chunking
-whenever chunking finds any shared chunk at all, however little: an 8,192-byte
-object whose chunking matched 1,133 bytes still went to rollsum. bsdiff appears
-only where chunking finds nothing, such as a 1,024-byte object with a small edit.
+The tool pairs a modified content object with the object at the same path in
+the source commit. A file that was renamed and edited is not paired
+(`modified: 0`) and travels whole. The tool also skips the pair when the two
+sizes differ by a large ratio. For a pair, the tool uses rollsum chunking where
+chunking finds any shared chunk, and bsdiff only where chunking finds nothing.
 
-The port pairs by path alone and does not reproduce the size-ratio rule. Pairing
-decides how large a delta is, not whether it is valid: a pair the ratio rule
-would have skipped costs a diff attempt whose result is discarded, and the object
-then travels whole exactly as it would have. This is the port's own choice in the
-same sense as the chunker's parameters. What the port bounds instead is the diff
-attempt itself, by the chunker's maximum chunk size, so an unrelated same-path
-rewrite of a large object is spliced without paying for a suffix sort first.
+Observed behavior: a 40,000-byte object pairs after it grows to 40,800 or
+56,000 bytes. It does not pair after it grows to 59,600 or shrinks to 26,800.
+An 8,192-byte object whose chunking matches 1,133 bytes uses rollsum. A
+1,024-byte object with a small edit uses bsdiff.
+`conformance/cli-surface.md`, "P2", `static-delta generate`, records the
+pairing of the port.
 
-Offline application limits in the tool (observed while applying port-generated
-deltas). `ostree static-delta apply-offline` refuses any delta whose fallback
-array is non-empty: "Cannot execute delta offline: contains nonempty http
-fallback entries" -- fallbacks are a pull-time mechanism. Its `open` opcode
-dispatch also asserts a bare-family repository, so a delta carrying rollsum or
-bspatch objects applies offline only into `bare`, `bare-user`, or
-`bare-user-only`, not into `archive`; a splice-only delta applies into any mode.
-The port's reader has neither restriction: it applies rollsum and bspatch
-deltas into an archive repository, and fallbacks apply as long as the objects
-they name are already present.
+### Opcodes
 
-Opcodes (ASCII): `S` open-splice-and-close, `o` open, `w` write, `r`
-set-read-source, `R` unset-read-source, `c` close, `B` bspatch. Operands are
-LEB128 varints; offsets are absolute byte offsets into the part's
-raw-data-source blob. The `c` (close) opcode takes no operand and asserts the
-produced object's SHA-256 equals the expected checksum: this is the end-to-end
-integrity gate.
+The opcodes are ASCII bytes: `S` open-splice-and-close, `o` open, `w` write,
+`r` set-read-source, `R` unset-read-source, `c` close, `B` bspatch. The
+operands are LEB128 varints. An offset is an absolute byte offset into the
+raw-data-source blob of the part. The exception is the offset of a `w` while a
+read source is set (between `r` and `R`), which reads the read-source object.
+The `c` (close) opcode takes no operand and asserts that the SHA-256 of the
+produced object equals the expected checksum.
+The operands, as the tool writes them:
 
-Operand grammar (recovered by observing the tool):
-
-- `S` for a metadata object (dirtree/dirmeta): `(length, offset)` -- splice
-  `length` bytes at `offset` in the data source as the object's serialized
-  bytes, and close.
-- `S` for a content object (file/symlink): `(mode-index, xattr-index, length,
-  offset)` -- the mode and xattr tables supply the object's metadata; a symlink
-  (mode `S_IFLNK`) takes the spliced bytes as its target, a regular file as its
-  content.
-- `o` (open) for a content object: `(mode-index, xattr-index, output-size)`.
-- `r` (set-read-source): `(offset)` -- at `offset` in the data source lie the 32
-  bytes of a source object's checksum; that object's content becomes the read
-  source for the following `B` or `w` ops.
-- The tool emits one `r`/`R` pair per contiguous run it copies out of a source
-  object, so an object reconstructed from scattered runs names the same source
-  checksum once per run: a 4 MiB object with forty scattered 512-byte edits
-  carries 41 `r` ops and 41 `R` ops against one source object.
-- `R` (unset-read-source): no operand.
-- `B` (bspatch): `(stream-offset, stream-length)` -- the bspatch stream is
-  `stream-length` bytes at `stream-offset` (which is the preceding `r` offset
-  plus 32), applied against the read source to fill the open object; `c` then
+- `S` for a metadata object (dirtree/dirmeta): `(length, offset)`. It splices
+  `length` bytes at `offset` in the data source as the serialized object, and
   closes it.
-- `w` (write, rollsum): `(length, offset)` -- append `length` bytes to the open
-  object, read at `offset` in the current source: the read-source object when a
-  preceding `r` set one, the part's data source otherwise. The output is written
-  strictly forward, so the destination is the implicit output cursor and only the
-  read offset is carried. Emitted for from->to deltas of larger objects, where
-  the tool prefers rollsum chunking to bsdiff (smaller objects still use bsdiff
-  or splice): a run of `w` ops with a read source set copies the unchanged
-  content-defined chunks out of the source object, and a `w` with no read source
-  writes the changed run from the payload. A rollsum object's stream is `o`, then
-  `r`/`w`.../`R` groups interleaved with payload `w` ops, then `c`.
+- `S` for a content object (file/symlink):
+  `(mode-index, xattr-index, length, offset)`. The mode and xattr tables supply
+  the metadata of the object. A symlink (mode `S_IFLNK`) takes the spliced
+  bytes as its target, and a regular file as its content.
+- `o` (open) for a content object: `(mode-index, xattr-index, output-size)`.
+- `r` (set-read-source): `(offset)`. The 32 bytes at `offset` in the data
+  source are the checksum of a source object. The content of that object is the
+  read source for the next `B` or `w` operations.
+- `R` (unset-read-source): no operand.
+- `B` (bspatch): `(stream-offset, stream-length)`. The bspatch stream is
+  `stream-length` bytes at `stream-offset`, which is the preceding `r` offset
+  plus 32. It applies against the read source to fill the open object, and `c`
+  then closes it.
+- `w` (write, rollsum): `(length, offset)`. It appends `length` bytes to the
+  open object, read at `offset` in the current source. The current source is
+  the read-source object when a preceding `r` set one, and the data source of
+  the part otherwise. The output is written forward only, so the destination is
+  the implicit output cursor, and only the read offset is carried. A `w` with a
+  read source set copies an unchanged content-defined chunk out of the source
+  object. A `w` with no read source writes a changed run from the payload.
 
-bspatch stream. The embedded bspatch stream is the classic bsdiff patch with its
-three streams interleaved and stored uncompressed (the enclosing part is xz'd as
-a whole). It is a sequence of blocks, consumed until the output reaches the
-opened object's size, each: a 24-byte control block of three signed 64-bit
-integers in bsdiff `offtin` sign-magnitude little-endian encoding (`diff-length`,
-`extra-length`, source `seek`); `diff-length` bytes each added, wrapping, to the
-source bytes at the current source position; then `extra-length` verbatim bytes;
-after which the source position advances by `diff-length` and then by `seek`.
+The tool emits `w` for from->to deltas of larger objects. The stream of a
+rollsum object is `o`, then `r`/`w`.../`R` groups interleaved with payload `w`
+operations, then `c`. The tool emits one `r`/`R` pair for each contiguous run
+that it copies out of a source object. An object made from scattered runs thus
+names the same source checksum once for each run. Example: a 4 MiB object with
+forty scattered 512-byte edits carries 41 `r` operations and 41 `R` operations
+against one source object.
 
-Endianness hazard: the `u`/`t` fields in meta entries, fallbacks, and fallback
-headers are host byte order gated by an `ostree.endianness` byte (`l`/`B`) in
-superblock metadata (a historical inconsistency, with a size-ratio heuristic
-fallback when the byte is missing). The superblock timestamp is always BE; the
-`(uuu)` mode triple is always BE regardless of that byte. Under `B` the tool
-swaps four size fields: a meta entry's `size` and `usize`, and a fallback's two
-sizes. Recovered by generating a delta with `--set-endianness=B` over a
-5,000,000-byte fallback object: the superblock holds 5,001,564 and 5,000,000 as
-big-endian `u64` values, and `static-delta show` prints 5001564 and 5000000.
-Under `B` nothing else changes: `cmp -l` of the `l` and the `B` superblock of
-one delta shows the endianness byte and the four fields, each byte-reversed.
-The timestamp is the same, and part `0` of the two deltas is identical. The
-port's generator writes the byte and swaps the same four fields under
-`DeltaEndianness::Big`.
-Applying a delta reads one of the four, a meta-entry's `size`, which is the
-ceiling a part is read under, and `static-delta show` reads all four: the port
-swaps each where the byte states `B` and reads each as little-endian where the
-byte is absent or states another value. Nothing else turns on the byte -- parts
-are read by name and checked by their SHA-256, the modes are swapped from their
-fixed big-endian form, and the embedded commit is normal-form little-endian --
-so a big-endian delta applies through the same path.
+The embedded bspatch stream is in the bsdiff patch format, with its three
+streams interleaved and stored uncompressed. xz compresses the enclosing part as
+a whole. The stream is a sequence of blocks, read until the output reaches the
+size of the opened object. Each block holds a 24-byte control block, then
+`diff-length` bytes, then `extra-length` verbatim bytes. The control block is
+three signed 64-bit integers in bsdiff `offtin` sign-magnitude little-endian
+encoding: `diff-length`, `extra-length`, and the source `seek`. Each
+`diff-length` byte is added, with wrap, to the source byte at the current source
+position. After the block, the source position advances by `diff-length` and
+then by `seek`.
+
+### Endianness
+
+The `t` size fields of the meta-entries and the fallbacks are in host byte
+order. The `ostree.endianness` byte (`l`/`B`) in the superblock metadata states
+that order. Where the byte is missing, the tool finds the order with a
+size-ratio heuristic. The superblock timestamp and the `(uuu)` mode triple are
+always big-endian, whatever the byte states.
+
+Under `B` the tool swaps four size fields: the `size` and `usize` of a
+meta-entry, and the two sizes of a fallback. Nothing else changes. Observed
+behavior: a delta generated with `--set-endianness=B` over a 5,000,000-byte
+fallback object holds 5,001,564 and 5,000,000 as big-endian `u64` values.
+`static-delta show` prints 5001564 and 5000000. The `l` and the `B`
+superblock of one delta differ in the endianness byte and in the four fields,
+each byte-reversed. The timestamp and part `0` of the two deltas are
+the same.
+
+The port's generator writes the byte and swaps the same four fields under
+`DeltaEndianness::Big`. An application reads one of the four, the `size` of a
+meta-entry, as the ceiling a part is read under. `static-delta show` reads all
+four, and the port swaps each where the byte states `B`, and reads it as
+little-endian otherwise (`conformance/cli-surface.md`, "P2", `static-delta`).
+No other read depends on the byte, so a big-endian delta applies through the
+same path. An application reads the parts by name and checks the SHA-256 of
+each. The modes
+have a fixed big-endian form, and the embedded commit is normal-form
+little-endian.
 
 ## Signing details
 
-The signing engines share commit/summary framing. What is signed:
+The signing engines share one framing for commits and summaries. The signed
+payload of a commit is the canonical serialized commit GVariant bytes. These
+are the bytes of the normal-form commit object, which hash to the commit
+checksum. The signed payload of a summary is the raw byte content of the
+`summary` file, read as opaque bytes. GPG and the sign-api engines are
+independent, and both can sign one commit.
 
-- Commit: the canonical serialized commit GVariant bytes (the normal-form
-  commit object -- the same bytes that hash to the commit checksum).
-- Summary: the raw byte content of the `summary` file (treated as opaque).
+A signature is one `ay` element, appended to the `aay` of its engine in the
+`a{sv}` dict. The value of each signature key is thus an append-only array of
+signature blobs:
 
-Signatures accumulate by appending an `ay` element to the per-engine `aay` in
-the `a{sv}` dict. GPG and the sign-api engines are independent and can both
-apply to one commit.
+- `ostree.gpgsigs` -- OpenPGP detached-signature blobs over the commit bytes.
+- `ostree.sign.ed25519` -- raw 64-byte ed25519 signatures.
+- `ostree.sign.spki` -- SPKI/ECDSA signatures. The tool carries this engine
+  only in a build with OpenSSL.
+- `ostree.sign.dummy` -- the test engine.
 
-A signature produced while a commit is being written stands before the ref that
-names the commit. The sequence is: stage the tree and the commit object; produce
-every signature the invocation asks for; publish the staged objects into
-`objects/` and write the `.commitmeta` beside the commit; write the ref. A
-signature that cannot be produced therefore leaves no object in `objects/`, no
-`.commitmeta`, and the ref where it stood, and a run naming several keys is all
-or nothing. A ref write that cannot happen leaves the commit and its
-`.commitmeta` durable with no ref pointing at them.
+### Signing sequence
 
-The keys of the `a{sv}` dict hold the order the writer stored them in, which is
-not the order `ostree show --list-detached-metadata-keys` prints: that listing
-sorts. The port stores insertion order, and the insertion order a `commit`
-invocation produces is fixed and does not follow the command line -- the
-caller's own detached-metadata keys in command-line order, then
-`ostree.sign.<type>`, then `ostree.gpgsigs`. The reference tool stores that same
-order over most key sets and a name-dependent order over some of them, which
-`../conformance/cli-surface.md` records under "P2". The stored order carries no
-meaning: the dict is a mapping and every reader looks keys up by name.
+A signature that a commit write produces stands before the ref that names the
+commit. The writer stages the tree and the commit object, then produces each
+signature that the invocation asks for. Then it publishes the staged objects
+into `objects/`, writes the `.commitmeta` beside the commit, and last writes
+the ref. If a signature cannot be produced, no object goes into `objects/` and
+no `.commitmeta` is written. The ref stays where it was, so a run that names
+several keys is all or nothing. If the ref write fails, the commit and its
+`.commitmeta` stay durable, and no ref points at them.
 
-Adding a detached-metadata key and signing differ in what they do to the dict
-already stored for a commit checksum. A detached-metadata key replaces the whole
-stored dict; a signature appends to whatever stands at that moment. Committing
-the same checksum twice with one signing key each therefore leaves two elements
-in the engine's array, and a run naming both a detached-metadata key and a
-signing key writes the caller's key over the stored dict and appends the
-signature to that new dict, dropping any signature an earlier run left. A run
-that skips its write -- an unchanged tree under `--skip-if-unchanged` -- signs
-nothing and leaves the stored dict untouched.
+### Detached-metadata key order
 
-ed25519: 32-byte public key, 64-byte signature, 64-byte secret key (32-byte
-seed followed by 32-byte public key). Keys are passed as base64 strings or raw
-`ay`. Key files hold one base64 key per line. System key directories are
-`/etc/ostree` and `<datadir>/ostree`, files `trusted.ed25519` and
-`trusted.ed25519.d/`, plus `revoked.ed25519` and `revoked.ed25519.d/`. A key
-present in both the trusted and revoked sets is rejected: the effective trusted
-set is the trusted set minus the revoked set.
+The keys of the `a{sv}` dict keep the order in which the writer stored them.
+`ostree show --list-detached-metadata-keys` sorts them. The port stores
+insertion order. A `commit` inserts in a fixed order, whatever the command
+line: the detached-metadata keys of the caller in command-line order, then
+`ostree.sign.<type>`, then `ostree.gpgsigs`. The stored order carries no
+meaning, because each reader looks up keys by name. The order the tool stores
+is in `conformance/cli-surface.md`, "P2", `commit`.
 
-spki (signature key `ostree.sign.spki`). ECDSA over NIST P-256 with SHA-256.
-The signed payload is the same commit bytes as the other engines; the engine
-hashes them with SHA-256 and produces a DER-encoded ECDSA signature (an ASN.1
-`SEQUENCE` of the two integers `r` and `s`, roughly 70 to 72 bytes). Public keys
-are the X.509 SubjectPublicKeyInfo DER, the base64 body of a PEM `PUBLIC KEY`
-block. Secret keys are base64; the decoded bytes are a PKCS#8 `PrivateKeyInfo`
-DER, a SEC1 `ECPrivateKey` DER, or a raw 32-byte scalar. The key store mirrors
-ed25519: files `trusted.spki` and `revoked.spki` and their `.d` directories
-under `/etc/ostree` and `<datadir>/ostree`, one base64 SubjectPublicKeyInfo per
-line, and the effective trusted set is the trusted set minus the revoked set.
+A detached-metadata key replaces the whole dict stored for a commit checksum. A
+signature appends to the dict that stands at that moment. Two commits of one
+checksum with one signing key each thus leave two elements in the array of the
+engine. A run with a detached-metadata key and a signing key writes the caller
+key over the stored dict. Then it appends the signature to the new dict, and a
+signature of an earlier run is lost. A run that skips its write (an unchanged
+tree under `--skip-if-unchanged`) signs nothing and leaves the dict as it is.
 
-The reference tool gates spki on OpenSSL and the build under observation
-(libostree 2026.1) was compiled without it, so these spki facts are the design
-target: the public key container and the key-store layout are from the public
-ostree documentation, and the curve, hash, DER signature encoding, and key DER
-containers are the standard OpenSSL/RFC forms confirmed against `openssl`
-(a general tool, run as a black box) but not yet cross-verified against an
-spki-capable `ostree`. When such a build is available, generate a key pair with
-the tool, sign a commit, inspect the PEM and the signature bytes, and reconcile
-any difference here.
+### ed25519
 
-GPG (signature key `ostree.gpgsigs`). Each `ay` element is one detached
-OpenPGP signature: the binary signature packet stream, unarmored. A blob may
-hold more than one signature packet, and each packet is verified
+The public key is 32 bytes, and the signature is 64 bytes. The secret key is 64
+bytes: the 32-byte seed, then the 32-byte public key. A key is given as a
+base64 string or as raw `ay`, and a key file holds one base64 key per line. The
+system key directories are `/etc/ostree` and `<datadir>/ostree`. They hold the
+files `trusted.ed25519` and `trusted.ed25519.d/`, plus `revoked.ed25519` and
+`revoked.ed25519.d/`. The effective trusted set is the trusted set minus the
+revoked set, so a key in both sets is refused.
+
+### spki
+
+The signature key is `ostree.sign.spki`, and the algorithm is ECDSA over NIST
+P-256 with SHA-256, over the commit bytes of the other engines. The signature
+is DER-encoded ECDSA: an ASN.1 `SEQUENCE` of the two integers `r` and `s`,
+about 70 to 72 bytes. A public key is the X.509 SubjectPublicKeyInfo DER, the
+base64 body of a PEM `PUBLIC KEY` block. A secret key is base64, and the
+decoded bytes are a PKCS#8 `PrivateKeyInfo` DER, a SEC1 `ECPrivateKey` DER, or
+a raw 32-byte scalar. The key store has the form of the ed25519 store:
+`trusted.spki`, `revoked.spki`, and their `.d` directories under `/etc/ostree`
+and `<datadir>/ostree`, with one base64 SubjectPublicKeyInfo per line. Its
+effective trusted set is also the trusted set minus the revoked set.
+
+Design target: the public ostree documentation gives the public key container
+and the key store layout. The curve, the hash, the DER signature encoding, and
+the key DER containers are the standard OpenSSL and RFC forms.
+
+### GPG
+
+The signature key is `ostree.gpgsigs`. Each `ay` element is one detached
+OpenPGP signature: the binary signature packet stream, with no armor. A blob
+can hold more than one signature packet, and each packet is verified
 independently. The port signs through the system GnuPG installation
 (`gpg --detach-sign`, driven over the machine-readable `--status-fd`
-interface) and verifies in the process over the `pgp` crate (rPGP), so the
-stored blobs are the OpenPGP interchange form GnuPG itself produces and
-consumes. A signature is reported valid only where it verifies against a
-trusted key whose bindings hold; a signature by an expired, revoked, or
-unknown key is invalid, with the state surfaced per signature: the
-signing-key and primary-key fingerprints, the creation and expiry timestamps,
-the key's expiry time when it has passed, the expired/revoked/missing flags,
-the public-key and digest algorithm names, and the signer's user id split into
-name and email.
-Trust is membership in the supplied keyrings; GnuPG's ownertrust model does
-not participate.
+interface). It verifies in the process with the `pgp` crate (rPGP). The stored
+blobs are thus the OpenPGP interchange form that GnuPG produces and reads.
 
-GPG keyrings are binary or ASCII-armored, each holding one or more
-certificates, all merged into one trusted set. A key the trusted set holds
-several certificates for keeps every one of them, and the verdict reads all the
-certificates that answer for a signature's issuer. A revocation any of them
-carries refuses the signature. Two exports of one certificate are read as one
-certificate, so the key expiry the newest self-signature of either export
-states answers; across certificates holding different primary keys the key
-expires at the earliest instant any of them states. The keyring load order
-decides none of the three. A self-signature whose own expiration time has
-passed states no key expiry, binds no subkey, and ranks no user id. The first
-certificate that answers supplies the reported fingerprints and user id. The
-keyring trusted for a remote is `<remote>.trustedkeys.gpg` in the repo or under
-`/etc/ostree/remotes.d/`; every `*.gpg` keyring in the global trusted-keyring
-directory is trusted for all remotes. That directory is
-`<datadir>/ostree/trusted.gpg.d/`
-(`/usr/share/ostree/trusted.gpg.d/`), and the `OSTREE_GPG_HOME` environment
-variable overrides it with the directory it names, observed by running `ostree
-show` on a signed commit with `OSTREE_GPG_HOME` set to a directory holding the
-exported keyring.
-End-to-end cross-verification against the tool runs in the conformance record
-`commit/gpg-sign-round-trip`: each implementation's `--gpg-sign` signature
-verifies through the other's `show --gpg-verify-remote` over a remote holding
-the exported public keyring, in all four pairings.
+A signature is valid only where it verifies against a trusted key whose
+bindings hold. A signature by an expired, revoked, or unknown key is invalid.
+Trust is membership in the given keyrings, and the ownertrust model of GnuPG
+has no part in it. The result of each signature states the fingerprints of the
+signing key and of the primary key, and the creation and expiry timestamps. It
+also states the expiry time of the key when it has passed, and the expired,
+revoked, and missing flags. Last, it states the names of the public-key and
+digest algorithms, and the user id of the signer, split into name and email.
 
-Dummy engine (test only). Signature key `ostree.sign.dummy`, value `aay` like
-the other engines. The engine is gated in the tool behind the
-`OSTREE_DUMMY_SIGN_ENABLED` environment variable; with the variable unset the
-tool refuses every dummy operation with "dummy signature type is only for
-ostree testing". A dummy signature is the raw bytes of the key identifier: the
-secret key and the public key are the same byte string, signing appends those
-bytes verbatim as one `ay` signature blob, and the signed payload is ignored.
-Verification succeeds when any stored signature blob equals a trusted
-public-key byte string. These bytes were recovered by signing a commit with the
-tool (`ostree sign --sign-type=dummy COMMIT KEY-ID`) and reading the
-`.commitmeta` object: the blob for key `mysecretkey` is exactly the 11 ASCII
-bytes `mysecretkey`, with no trailing NUL, independent of the commit.
+A GPG keyring is binary or ASCII-armored and holds one or more certificates.
+All keyrings merge into one trusted set. Where the set holds several
+certificates for one key, it keeps each of them. The verdict reads each
+certificate that answers for the issuer of a signature, whatever the load order
+of the keyrings:
+
+- A revocation in any of them refuses the signature.
+- Two exports of one certificate are read as one certificate. The key expiry
+  that the newest self-signature of either export states applies.
+- Across certificates with different primary keys, the key expires at the
+  earliest instant that any of them states.
+
+A self-signature whose own expiration time has passed states no key expiry,
+binds no subkey, and ranks no user id. The first certificate that answers
+supplies the reported fingerprints and user id.
+
+The keyring trusted for a remote is `<remote>.trustedkeys.gpg` in the repo or
+under `/etc/ostree/remotes.d/`. Each `*.gpg` keyring in the global
+trusted-keyring directory is trusted for all remotes. That directory is
+`<datadir>/ostree/trusted.gpg.d/` (`/usr/share/ostree/trusted.gpg.d/`). The
+`OSTREE_GPG_HOME` environment variable replaces it with the directory that it
+names.
+
+Observed behavior: the `--gpg-sign` signature of each implementation verifies
+through `show --gpg-verify-remote` of the other, with the exported public
+keyring on the remote. All four pairings pass (conformance record
+`commit/gpg-sign-round-trip`).
+
+### Dummy engine
+
+The dummy engine is for tests only. Its signature key is `ostree.sign.dummy`,
+with the value type `aay`. The tool signs with the engine when the
+`OSTREE_DUMMY_SIGN_ENABLED` environment variable is set. With the variable
+unset, `commit` and `summary -u` refuse `--sign-type=dummy` with "dummy
+signature type is only for ostree testing". With the variable unset,
+`static-delta apply-offline --sign-type=dummy` applies a delta at exit 0.
+`static-delta verify --sign-type=dummy` reports `Verification fails` at exit 1,
+with the reason `no signature for 'ostree.sign.dummy' in static-delta
+superblock` (`conformance/cli-surface.md`, "P2", `static-delta`).
+
+A dummy signature is the raw bytes of the key identifier, and the secret key
+and the public key are the same byte string. Signing appends these bytes as one
+`ay` signature blob and ignores the signed payload. Verification succeeds when
+a stored signature blob equals a trusted public-key byte string. Observed
+behavior: `ostree sign --sign-type=dummy COMMIT KEY-ID` with the key
+`mysecretkey` stores a blob of exactly the 11 ASCII bytes `mysecretkey`, with
+no trailing NUL, for each commit.
 
 ## composefs
 
-ostree built with composefs exports a commit's tree to an EROFS image in the
-composefs project's format (EROFS, format version 0). The deployed image
-filename is `.ostree.cfs`. A pure-Rust port reproduces this output byte-for-byte
-because the image's fs-verity digest is stored in commit metadata under
-`ostree.composefs.digest.v0` (type `ay`, 32 bytes) and verified at boot.
+`ostree` built with composefs exports the tree of a commit to an EROFS image in
+the composefs format (EROFS, format version 0). The deployed image has the file
+name `.ostree.cfs`. The commit metadata stores the fs-verity digest of the
+image under `ostree.composefs.digest.v0` (type `ay`, 32 bytes), and the target
+machine verifies it at boot. Thus the port must write the image byte-for-byte.
 
-The EROFS and composefs on-disk formats are defined by the EROFS and composefs
-projects, not by ostree's documentation. The layout recorded here is recovered
-by observing the images the `ostree` tool produces (composefs 1.0.8 under ostree
-2026.1), reading them back with `composefs-info`, and inspecting the raw bytes.
-The checked-in golden image is the authoritative byte contract; the field-level
-notes below describe what that image contains.
+The EROFS and composefs projects define the EROFS and composefs formats. The
+golden images come from `ostree` built with composefs 1.0.8, and they are the
+byte contract ("Golden fixtures"). The subsections that follow describe what
+these images hold.
 
 ### Export path
 
 `ostree checkout --composefs COMMIT DESTINATION` writes the image at
 DESTINATION. `--composefs-noverity` writes the same structure without the
-per-file fs-verity digests. `ostree commit --generate-composefs-metadata` stores
-the image's fs-verity digest in the commit's `ostree.composefs.digest.v0` key.
-The image is derived from the commit's tree alone: it is byte-identical whether
-or not the commit carries that metadata, and whatever mode the repository holding
-the tree uses. Observed over one tree committed with
-`--generate-composefs-metadata` into `archive`, `bare`, and `bare-user`, which
-reach one commit checksum and so one digest; `bare-user-only` canonicalizes the
-tree and reaches another.
+fs-verity digests of the files. `ostree commit --generate-composefs-metadata`
+stores the digest of the image in the commit ("fs-verity digest").
 
-`ostree checkout --composefs` and `--composefs-noverity` export from every
-repository mode. Observed with ostree 2026.1 over one tree committed into
-`bare-user`, `archive`, `bare`, and `bare-user-only`: each checkout exits 0,
-and the `archive` and `bare` images are byte-identical to the `bare-user` image
-under both switches. The tool refuses a commit into `bare-split-xattrs`
-(`Writing content object: Not allowed due to repo mode`), so that mode is
-observed over a repository built by hand, which the tool exports from and
-whose image the port reproduces
-(`ostrya::read_split_xattrs::composefs_export_matches_the_tool`).
+The image depends on the commit tree alone. The `ostree.composefs.digest.v0` key
+and the repository mode change no byte of it. Each composefs switch exports from
+every repository mode. The file backing is the same in every mode ("File
+backing"). Observed behavior: one tree committed into `archive`, `bare`, and
+`bare-user` gives one commit checksum, one digest, and under each switch one
+image. `bare-user-only` canonicalizes the tree, so it gives another commit and
+another digest. A `bare-split-xattrs` repository exports the same image (see
+"bare-split-xattrs mode").
 
-The tool builds the image in an anonymous temporary file (`O_TMPFILE`) opened
-relative to the current directory and links it into place next to the
-destination, so the export runs with a working directory on the destination's
-filesystem. The image at the destination has mode 0644, whatever the process
-umask and whatever mode a destination that already existed held.
+The image file at the destination has mode 0644, whatever the process umask
+and whatever mode an earlier file at the destination held.
+`conformance/cli-surface.md`, "P2", `checkout`, records the temporary file
+that each side writes the image through.
 
 ### fs-verity digest
 
 The digest is fs-verity with SHA-256, 4096-byte blocks, and a zero-length salt.
-`composefs-info measure-file <image>` reports it, and it equals the
-`ostree.composefs.digest.v0` value the tool stores. For the golden fixture (the
-deterministic source tree) it is
+`composefs-info measure-file <image>` reports it. A commit records the digest
+of the verity image, which `--composefs` writes. The noverity image has its own
+digest, and no commit records it. For the golden fixture (the deterministic
+source tree) the recorded digest is
 `c91bad0285efab4453562cadf7a22f2dc3714dee81dbe002ded71318e18384d9`.
 
-The digest is a Merkle tree over the data. Each 4096-byte block is hashed with
-SHA-256, the final block zero-padded to 4096. Block hashes are concatenated,
-grouped into 4096-byte parent blocks (128 SHA-256 hashes per block, the tail
-parent zero-padded), and hashed again, up to a single root hash. Data of one
-block or less has that block's hash as the root; empty data has an all-zero
-root. The digest is the SHA-256 of a 256-byte little-endian descriptor:
+The digest is a Merkle tree over the data:
+
+- Each 4096-byte block is hashed with SHA-256. The final block is zero-padded
+  to 4096 bytes.
+- The block hashes are concatenated and grouped into 4096-byte parent blocks
+  (128 SHA-256 hashes per block, the tail parent zero-padded). The parent
+  blocks are hashed again, up to a single root hash.
+- For data of one block or less, the root is the hash of that block. For empty
+  data, the root is all zero.
+
+The digest is the SHA-256 of a 256-byte little-endian descriptor:
 
 - version byte 1, hash-algorithm byte 1 (SHA-256), log2-block-size byte 12,
   salt-size byte 0;
@@ -3412,15 +1962,12 @@ root. The digest is the SHA-256 of a 256-byte little-endian descriptor:
 - 32 zero salt bytes;
 - 144 reserved bytes 0.
 
-The same primitive computes the digest of each backing object, over the raw
-object bytes.
-
 ### Injected top-level directories
 
-The image root holds, alongside the commit's own entries, five empty directories
-the tool injects: `boot`, `etc`, `sysroot`, `usr`, `var`, each mode 040755 with
-owner 0:0. They are absent from the commit tree (`ostree ls` does not list them)
-and present in every exported image.
+The image root holds the entries of the commit and five empty directories that
+the tool injects: `boot`, `etc`, `sysroot`, `usr`, and `var`. Each has mode
+040755 and owner 0:0. The commit tree does not hold them (`ostree ls` does not
+list them), and every exported image holds them.
 
 ### Image layout and the composefs header
 
@@ -3434,4187 +1981,2031 @@ header, zero-padded to 1024:
 - composefs version 0, 4 bytes;
 - 16 reserved bytes 0.
 
-The regions follow in order: the composefs header and its padding, the EROFS
-superblock, the inode table, the shared-xattr area, and the directory and file
-data blocks. Node ids are byte offset divided by 32.
+The regions follow in this order:
+
+1. the composefs header and its padding;
+2. the EROFS superblock;
+3. the inode table;
+4. the shared-xattr area;
+5. the directory and file data blocks.
+
+A node id is the byte offset divided by 32.
 
 ### EROFS superblock
 
-The superblock sits at byte offset 1024 and is 128 bytes. Observed fields:
+The superblock is at byte offset 1024 and is 128 bytes. Its fields:
 
 - magic, 4 bytes, `e2 e1 f5 e0` (little-endian `0xE0F5E1E2`);
 - checksum 0 (unused);
 - feature_compat `0x06` (MTIME `0x02` and XATTR_FILTER `0x04`);
 - blkszbits 12 (block size 4096), extra superblock slots 0;
 - root_nid, the node id of the root inode;
-- inos, the total inode count, including the overlay whiteout stubs;
-- build_time and build-time nanoseconds, the minimum inode mtime, 0 for an
-  exported commit (the tool sets every inode mtime to 0);
+- inos, the total inode count, the overlay whiteout stubs included;
+- build_time and build-time nanoseconds, the minimum inode mtime. For an
+  exported commit this is 0, because every inode mtime is 0;
 - blocks, the image size in 4096-byte blocks;
-- meta_blkaddr 0, xattr_blkaddr the block holding the shared-xattr area (the
-  block that contains the end of the inode table);
+- meta_blkaddr 0, xattr_blkaddr the block that holds the shared-xattr area
+  (the block that contains the end of the inode table);
 - UUID all zero.
 
-The zero UUID and zero build times make the image deterministic for a fixed
+The zero UUID and the zero build times make the image deterministic for a fixed
 input tree and composefs version.
 
 ### Inodes
 
-Inodes are collected breadth-first from the root: the root first, then every
-directory's children in name-sorted order, each directory's children before the
-next directory's. The `i_ino` field is the collection index (root 0). Inodes
-are written in that order, so node id increases with `i_ino`.
+The writer collects the inodes breadth-first from the root. The root comes
+first, then the children of each directory in name-sorted order. The children of
+one directory come before those of the next. The `i_ino` field is the collection
+index (root 0). The inodes are written in that order, so the node id increases
+with `i_ino`.
 
 An inode is compact (32 bytes) when its mtime equals the superblock build_time,
-its nlink and ownership fit 16 bits, and its size fits 32 bits; otherwise it is
-extended (64 bytes). An exported commit uses compact inodes throughout unless an
-id exceeds 16 bits or a file exceeds 4 GiB. The format field's low bit selects
-compact (0) or extended (1); bits 1..3 hold the datalayout: 0 flat-plain, 4
-flat-inline, 8 chunk-based. Inode mode is the EROFS file-type bits combined with
-the logical permission bits.
+its nlink and ownership fit 16 bits, and its size fits 32 bits. Otherwise it is
+extended (64 bytes). An exported commit uses compact inodes throughout, unless
+an id is more than 16 bits or a file is more than 4 GiB. The low bit of the
+format field selects compact (0) or extended (1). Bits 1..3 hold the datalayout:
+0 flat-plain, 2 flat-inline, 4 chunk-based, which puts 0, 4, or 8 into the
+format field. The inode mode is the EROFS file-type bits combined with the
+logical permission bits.
 
-Directory inodes are flat-inline when their entries fit within one block after
-the inode header and xattrs, and flat-plain when the entries occupy one or more
-whole blocks. Empty regular files are flat-plain with size 0. Symlinks are
-flat-inline with the target stored inline. Whiteout stubs are character devices,
-flat-plain, `i_u` 0.
+A directory inode is flat-inline when its entries leave an inline tail
+("Directory blocks and dirents") after zero or more whole blocks. It is
+flat-plain when the entries are all in whole blocks and leave no inline tail.
+An empty regular file is flat-plain with size 0. A symlink is flat-inline with
+the target stored inline. A whiteout stub is a character device, flat-plain,
+with `i_u` 0.
 
-A symlink target shares its inode's block with the inode header and the inode's
-extended attributes, so the target is at most 4096 bytes less those two. A
-header is 32 bytes, or 64 bytes for an inode the compact form does not hold,
-which puts a target carrying no attributes at 4063 bytes. The tool aborts on a
-longer one. Measured against libostree 2026.1 over one symlink and no
-attributes: at 4063 bytes `checkout --composefs` writes the image, and at 4064
-and at 4095 bytes it exits on
-`lcfs_write_erofs_to: Assertion 'ctx_erofs->current_end == ctx->bytes_written'
-failed` and writes nothing. 4064 bytes is where the header and the target first
-fill a block. The port refuses the same trees with `Error::Unsupported`, so no
-composefs image either side writes holds a symlink target outside its inode's
-block. `PATH_MAX` is 4096, so a checkout produces no tree that reaches the
-bound; a tar import does.
+The target of a symlink shares the block of its inode with the inode header
+and the extended attributes of the inode. The header, the attributes, and the
+target together stay less than 4096 bytes, so the target is at most 4095 bytes
+less those two. A header is 32 bytes, or 64 bytes for an inode that the compact
+form does not hold. Thus a target with no attributes holds at most 4063 bytes.
+At 4064 bytes the header and the target first fill a block. No image holds a
+symlink target outside the block of its inode.
+
+No export writes an image for a tree with a longer target. Observed behavior:
+the tool writes the image at 4063 bytes and writes nothing at 4064 and 4095
+bytes. `conformance/cli-surface.md`, "P2", `checkout`, records how each side
+fails. `PATH_MAX` is 4096, so a checkout produces no tree that reaches the
+bound. A tar import can produce one.
 
 ### Overlay whiteout table
 
-The image writer adds a 256-entry overlay whiteout table to the root: one
-character-device inode, device 0:0, mode 0644, owned like the root and sharing
-its mtime, for each two-digit lowercase hex name `00` through `ff`. Any name
-already present in the root is skipped. It also sets `trusted.overlay.opaque` to
-`y` on the root. `composefs-info dump` hides these entries, so they do not
-appear in `tree.dump`, but they are inodes and root directory entries in the
-image, and the superblock `inos` counts them.
+The image writer adds a 256-entry overlay whiteout table to the root. It is one
+character-device inode for each two-digit lowercase hex name `00` through
+`ff`. Each inode has device 0:0 and mode 0644, the owner of the root, and the
+mtime of the root.
+The writer skips a name that the root already holds. It also sets
+`trusted.overlay.opaque` to `y` on the root. `composefs-info dump` hides these
+entries, so `tree.dump` does not show them. They are inodes and entries of the
+root directory in the image, and the superblock `inos` counts them.
 
 ### Directory blocks and dirents
 
-A directory's entries include `.` (the directory) and `..` (the parent), then
-the children, sorted by name as raw bytes. Entries are packed into 4096-byte
-blocks: whole blocks are emitted as data blocks, and a tail of 2048 bytes or
-less is stored inline after the inode; a larger tail is promoted to its own data
-block. A directory's size is the whole-block byte count plus the inline tail.
-Its nlink is the count of directory-typed entries, which is 2 plus the number of
-child subdirectories.
+The entries of a directory are `.` (the directory), `..` (the parent), and the
+children. They are sorted together by name as raw bytes. The port sorts a child
+name that starts with a byte less than `0x2E` before `.`. Not observed: the
+order that the tool gives such a name.
 
-Within a block, the fixed-size dirent headers come first, then the names with no
+The entries are packed into 4096-byte blocks. Whole blocks are written as data
+blocks. A tail of 2048 bytes or less is stored inline after the inode, and a
+larger tail gets its own data block. The size of a directory is the byte count
+of its whole blocks plus the inline tail. Its nlink is the count of entries of
+directory type, which is 2 plus the number of child subdirectories.
+
+In a block, the fixed-size dirent headers come first, then the names with no
 separators. Each dirent header is 12 bytes:
 
 - node id, 8 bytes;
-- name offset within the block, 2 bytes;
+- name offset in the block, 2 bytes;
 - file type, 1 byte (1 regular, 2 directory, 3 character device, 7 symlink);
 - 1 reserved byte.
 
-The first dirent's name offset divided by 12 gives the entry count.
+The name offset of the first dirent divided by 12 gives the entry count.
 
-A child name is at most 255 bytes. Measured against libostree 2026.1 over trees
-committed from a tar archive whose member name comes from a pax `path` record:
-at 255 bytes `checkout --composefs`, `checkout --composefs-noverity`, and
-`commit --generate-composefs-metadata` write the image or the commit, and at 256
-bytes each exits 1 on `File name too long` and writes no image, no commit, and
-no ref. The bound holds for a regular file, a directory, a symlink, and an entry
-in a subdirectory. `composefs-info ls` refuses an image holding a name of 256
-bytes or more with `File name too long`. `fsck`, `ls`, and a plain `commit`
-take such a tree. The port refuses the same trees with `Error::Unsupported`,
-and at 255 bytes its image is byte-identical to the tool's. A Linux filesystem
-stores no name above 255 bytes, so a checkout produces no tree that reaches the
-bound; a tar import does.
+A child name is at most 255 bytes. The bound holds for a regular file, a
+directory, a symlink, and an entry in a subdirectory. Each composefs switch and
+`commit --generate-composefs-metadata` refuse a longer name and write no image,
+no commit, and no ref (`conformance/cli-surface.md`, "P2", `checkout`). At 255
+bytes the port image is byte-identical to the tool image. The object store holds
+a longer name: `fsck`, `ls`, and a plain `commit` take such a tree. A Linux
+filesystem stores no name of more than 255 bytes, so a checkout produces no tree
+that reaches the bound. A tar import can produce one, from a pax `path` record.
 
-`composefs-info ls` and `composefs-info dump` refuse an image holding an empty
-child name: each exits 1 on `Failed to load '<image>': Invalid argument`.
+`composefs-info ls` refuses an image that holds a name of 256 bytes or more
+with `File name too long`. `composefs-info ls` and `composefs-info dump` refuse
+an image that holds an empty child name: each exits 1 on `Failed to load
+'<image>': Invalid argument`.
 
 ### Inode extended attributes and the name filter
 
-An inode's xattr area, present only when the inode has at least one xattr,
-follows the inode header:
+The xattr area of an inode follows the inode header. It is present only when
+the inode has at least one xattr:
 
 - a 12-byte header: a 4-byte name filter, a shared-count byte, 7 reserved bytes;
 - shared-xattr references, 4 bytes each;
-- inline entries, sorted by full name then by value length then by value bytes.
+- inline entries, sorted by full name, then by value length, then by value
+  bytes.
 
-`i_xattr_icount` encodes the area size: 0 when absent, otherwise
+`i_xattr_icount` encodes the area size: 0 when the area is absent, otherwise
 `1 + (size - 12) / 4`. Each inline entry is a 4-byte header (name-length byte,
 name-index byte, 2-byte value size), then the name suffix, then the value,
 padded to a 4-byte boundary. The value size is 2 bytes, so an entry holds at
 most 65535 bytes of value. The name length is 1 byte, so an entry holds at most
-255 bytes of name suffix. Both widths are readable in the golden images.
+255 bytes of name suffix.
 
-An inode holds at most 128 shared-xattr references. Its repeated attributes are
-taken in ascending full-key order until the inode holds 128 of them, and the
-rest stay inline. The shared table itself holds every repeated entry, including
-entries no inode ends up referencing. Measured against libostree 2026.1 over
-two files carrying the same 10, 100, 127, 128, 129, 200, and 256 attributes:
-the count field reads back the attribute count up to 128 and 128 from there on,
-and the inode's area grows by one inline entry for each attribute past 128. The
-ordering was measured over three further trees. Two files carrying 300
-attributes of which the even-numbered 150 repeat: the 128 lowest even keys are
-shared and the 22 highest even keys join the odd ones inline. Three files where
-100 `user.t*` keys repeat three times and 100 `user.d*` keys repeat twice: the
-inode carrying both shares all 100 `user.d*` keys and the 28 lowest `user.t*`
-keys, so the repeat count does not decide the order and the key does. And a
-`--composefs-noverity` export of two files carrying 200 repeated attributes,
-where the empty `trusted.overlay.metacopy` value repeats across the backed
-inodes and sorts below `user.`, taking one of the 128 and moving one more key
-inline. `tree-rich.cfs` holds the case and the port reproduces all six trees
-byte-for-byte.
+An xattr, name and value together, that more than one inode holds moves to the
+shared-xattr area after the inode table. The inode holds a reference in place
+of the inline entry. An inode holds at most 128 shared-xattr references. The
+writer takes the repeated attributes of the inode in ascending full-key order.
+It stops when the inode holds 128 of them, and the rest stay inline. The key
+decides the order, and the repeat count does not. The shared table holds every
+repeated entry, also an entry that no inode references.
 
-The tool binds an inode's attributes well under the value field. Each attribute
-spends its full name, its value, and 7 bytes from a budget of 32755 bytes for
-the inode. Past the budget the tool writes no image, records no digest, and
-exits non-zero. Measured against libostree 2026.1 over one attribute at name
-lengths 6, 8, 37, and 200; over 2, 3, 8, and 100 attributes; over a directory
-as well as a regular file; and over `system.posix_acl_access`, whose 22-byte
-name shows that the budget counts the full name and not the prefix-stripped
-suffix. A regular file is held to the same 32755 bytes as a directory, so the
-`trusted.overlay.redirect` and `trusted.overlay.metacopy` attributes the export
-adds to a backed inode sit outside the budget. At the budget the tool and the
-port write the same image.
+In a `--composefs-noverity` export, the empty `trusted.overlay.metacopy` value
+repeats across the backed inodes. It sorts before `user.`, so it takes one of
+the 128 references. The `tree-rich` pair holds the case ("Golden fixtures").
 
-The budget leaves the name-length field unbound: 255 bytes of name sit inside
-32755 bytes. The port holds a name to that width as well, refusing past it, so
-no field is written behind a truncated length. Whether the tool refuses the
-same trees is unobserved. A name above 255 bytes is outside what a Linux
-filesystem stores, since the kernel caps an attribute name at 255 bytes.
+Observed behavior: two files that carry the same 10, 100, 127, 128, 129, 200,
+or 256 attributes, and three trees that set key order against repeat count,
+follow these rules in the tool image. The port writes the image bytes of the
+tool for `tree-rich.cfs` and `tree-rich-noverity.cfs` ("Golden fixtures").
 
-Names are stored with a prefix index and the remaining suffix. The prefixes are:
-0 empty (full name in the suffix), 1 `user.`, 2 `system.posix_acl_access`, 3
-`system.posix_acl_default`, 4 `trusted.`, 6 `security.`. Index 5 (`lustre.`) is
-absent from the version-0 prefix table, so `lustre.` names use prefix 0. The
-longest matching prefix wins. A name beginning with `trusted.overlay.` is
+The tool holds the attributes of an inode to a budget that is smaller than the
+limit of the value field. Each attribute spends its full name, its value, and 7
+bytes from a budget of 32755 bytes for the inode. The budget counts the full
+name, prefix included: `system.posix_acl_access` spends 22 bytes of name. A
+regular file has the same budget as a directory. The `trusted.overlay.redirect`
+and `trusted.overlay.metacopy` attributes that the export adds to a backed inode
+are outside the budget. Past the budget, an export writes no image and a commit
+records no digest (`conformance/cli-surface.md`, "P2", `checkout`). At the
+budget, the tool and the port write the same image. Observed behavior: the tool
+holds to this budget in each of these cases:
+
+- one attribute with a name of 6, 8, 37, or 200 bytes;
+- 2, 3, 8, and 100 attributes;
+- a directory and a regular file.
+
+The budget does not bind the name-length field: 255 bytes of name fit in 32755
+bytes. The port holds the full name, prefix included, to 255 bytes and refuses
+a longer name, so it writes no field behind a truncated length. Not observed:
+the tool with an attribute name of more than 255 bytes. The kernel caps an
+attribute name at 255 bytes. A Linux filesystem thus stores no attribute name
+of more than 255 bytes.
+
+A name is stored as a prefix index and the remaining suffix. The prefixes are: 0
+empty (full name in the suffix), 1 `user.`, 2 `system.posix_acl_access`, 3
+`system.posix_acl_default`, 4 `trusted.`, 6 `security.`. The version-0 prefix
+table has no index 5 (`lustre.`), so a `lustre.` name uses prefix 0. The writer
+uses the longest matching prefix. A name that begins with `trusted.overlay.` is
 escaped to `trusted.overlay.overlay.` before indexing.
 
-The name filter is a 32-bit Bloom filter over the inode's xattr names. Each name
-sets the bit `xxh32(suffix, seed) % 32`, where `suffix` is the name after its
-prefix and `seed` is `0x25BBE08F` plus the prefix index. The stored word is the
-bitwise complement of the filter, so a cleared bit means the name is present.
-An xattr value shared by more than one inode is moved to the shared-xattr area
-after the inode table; the inode holds a reference in place of the inline entry.
+The name filter is a 32-bit Bloom filter over the xattr names of the inode.
+Each name sets the bit `xxh32(suffix, seed) % 32`, where `suffix` is the name
+after its prefix and `seed` is `0x25BBE08F` plus the prefix index. The stored
+word is the bitwise complement of the filter, so a cleared bit means that the
+name is present.
 
 ### File backing
 
-A regular file with content is backed by a bare loose object referenced through
-overlay xattrs (name index 4, the `trusted.` prefix). The inode is chunk-based:
-the datalayout is 8, the size is the logical file size, and `i_u` holds the
-chunk format derived from the size. The inline data is one 4-byte chunk index of
-`0xffffffff` per chunk (one chunk for a file of 4096 bytes or less). The xattrs
-are:
+A regular file with content is backed by a bare loose object, through overlay
+xattrs (name index 4, the `trusted.` prefix). The inode is chunk-based. The
+datalayout is 4 (format-field value 8), the size is the logical file size, and
+`i_u` holds the chunk format derived from the size. The inline data is one
+4-byte chunk index of `0xffffffff` per chunk. The chunk size is the file size
+rounded up to a power of two, at least 4096 bytes and at most 2^43 bytes. Thus
+a file of up to 8 TiB has one chunk. The xattrs are:
 
-- `trusted.overlay.redirect`, the backing object's loose path with a leading
-  slash, `/<xx>/<rest>.file` (for example
-  `/cf/ffd52f38d14c87cf46e18d5260074421ba5961f0895954e9921f165f9c91db.file`).
-  The `.file` form is what the image names whatever mode the source repository
-  holds, an `archive` repository storing that object as `.filez` included;
-- `trusted.overlay.metacopy`, a 36-byte record in the verity image: version
-  byte 0, length byte 36, flags byte 0, digest-algorithm byte 1 (SHA-256), then
-  the 32-byte fs-verity digest of the backing object.
-  `composefs-info measure-file <object>.file` reports the same 32 bytes. The
-  digest covers the file's content, so an `archive` repository, which stores
-  that content compressed, records the same 32 bytes as a `bare-user` one.
+- `trusted.overlay.redirect`, the loose path of the backing object with a
+  leading slash, `/<xx>/<rest>.file`, in every repository mode (for example
+  `/cf/ffd52f38d14c87cf46e18d5260074421ba5961f0895954e9921f165f9c91db.file`);
+- `trusted.overlay.metacopy`. In the verity image it is a 36-byte record. The
+  record holds version byte 0, length byte 36, flags byte 0, and
+  digest-algorithm byte 1 (SHA-256). Then it holds the 32-byte fs-verity digest
+  of the content payload of the backing object, in every repository mode,
+  `archive` included. The digest
+  parameters are those of "fs-verity digest".
+  `composefs-info measure-file <object>.file` reports the same 32 bytes. In the
+  noverity image it is a zero-length value on every backed file.
 
-The metacopy xattr is present in both images. `--composefs` gives it the
-36-byte record above. `--composefs-noverity` gives it a zero-length value on
-every backed file.
+The sharing rule of "Inode extended attributes and the name filter" applies to
+the metacopy value. A verity record is common to the files with identical
+content and stays local otherwise. Thus the verity image of a tree of distinct
+file contents carries one record per backed inode. The one empty value is common
+to every backed file, so a tree with two or more backed files shares it. The
+sharing changes the offsets of the inodes and of the xattr areas.
+`composefs-info dump` prints the digest column as `-` for a file in the noverity
+image.
 
-The value decides the xattr layout. A metacopy value held by more than one inode
-moves into the shared-xattr area, and each of those inodes holds a reference in
-its place. A verity record is common to the files whose content is identical and
-stays local otherwise, so the verity image of a tree of distinct file contents
-carries one record per backed inode. The one empty value is common to every
-backed file, so a tree with two or more backed files shares it. The inode and
-xattr offsets shift accordingly. `composefs-info dump` prints the digest column
-as `-` for a file in the noverity image.
-
-The noverity image has its own fs-verity digest, and it differs from the value
-a commit records under `ostree.composefs.digest.v0`. The recorded value is the
-digest of the verity image, the artifact a target machine reproduces at boot.
-
-Empty regular files carry no overlay xattrs and no backing object. Symlinks
-store their target inline (mode 0120777) and are not redirected.
+An empty regular file carries no overlay xattrs and has no backing object. A
+symlink stores its target inline (mode 0120777) and has no redirect.
 `composefs-info objects <image>` lists exactly the backing `.file` paths, one
 per distinct redirected content object.
 
 ### Golden fixtures
 
-`tests/fixtures/generated/composefs/tree.cfs` is the verity image of the
-deterministic source tree, and `tree.dump` is its `composefs-info dump`. The
-MANIFEST records `composefs_commit` (the commit made with
-`--generate-composefs-metadata`) and `composefs_digest` (the image's fs-verity
-digest, equal to that commit's stored `ostree.composefs.digest.v0`).
+`tests/fixtures/generated/composefs/` holds four images, each with its
+`composefs-info dump` text:
 
-`tree-noverity.cfs` is the same commit exported with
-`checkout --composefs-noverity`, and `tree-noverity.dump` is its
-`composefs-info dump`. The MANIFEST records `composefs_noverity_digest`, the
-image's own fs-verity digest, which is unrelated to the commit's stored
-`ostree.composefs.digest.v0`.
+- `tree.cfs` and `tree.dump`: the verity image of the deterministic source
+  tree. The MANIFEST records `composefs_commit` (the commit made with
+  `--generate-composefs-metadata`) and `composefs_digest` (the digest of the
+  image that the commit records, "fs-verity digest").
+- `tree-noverity.cfs` and `tree-noverity.dump`: the same commit exported with
+  `checkout --composefs-noverity`. The MANIFEST records
+  `composefs_noverity_digest`, the fs-verity digest of this image.
+- `tree-rich.cfs` and `tree-rich.dump`: a second verity image, of a source tree
+  that carries user xattrs. The dump shows the xattrs as trailing `name=value`
+  tokens. Its commit is made without `--no-xattrs`, so it is generated on a
+  host that applies no SELinux labels. The MANIFEST records
+  `composefs_rich_commit` and `composefs_rich_digest`.
+- `tree-rich-noverity.cfs` and `tree-rich-noverity.dump`: the noverity export of
+  that tree. The MANIFEST records `composefs_rich_noverity_digest`.
 
-`tree-rich.cfs` is a second verity image whose source tree carries user xattrs,
-and `tree-rich.dump` is its `composefs-info dump` (xattrs appear as trailing
-`name=value` tokens). Its commit is made without `--no-xattrs`, so it is
-generated on a host that applies no SELinux labels. The MANIFEST records
-`composefs_rich_commit` and `composefs_rich_digest`. The tree exercises
-shared-xattr promotion (`user.shared` on six inodes), inline xattrs, an inode
-past the 128-reference cap (`user.m000` through `user.m149` on both files under
-`manyshared/`), a multi-block directory with an inline dirent tail, xattr
-values of varied length, and a 4063-byte inline symlink, the longest target an
-inode carrying no attributes holds.
-`tree-rich-noverity.cfs` and `tree-rich-noverity.dump` are that tree's noverity
-export, and the MANIFEST records `composefs_rich_noverity_digest`. The pair
-holds the mixed case of the sharing rule. `tree-rich.cfs` carries 314 backed
-inodes over eleven distinct verity records: two are shared, by 300 inodes and
-by 5, and nine are local to one inode each. All 314 reference the one empty
-value in `tree-rich-noverity.cfs`, so the nine local records move into the
-shared area and the shared area holds one metacopy entry in place of two. The
-minimal pair holds the plain case: `tree.cfs` has two local records and no
-shared metacopy entry, and `tree-noverity.cfs` has one shared entry and none
-local.
+The rich tree holds:
+
+- shared-xattr promotion (`user.shared` on six inodes) and inline xattrs;
+- an inode past the 128-reference cap (`user.m000` through `user.m149` on both
+  files under `manyshared/`);
+- a multi-block directory with an inline dirent tail;
+- xattr values of varied length;
+- a 4063-byte inline symlink, the longest target of an inode with no
+  attributes.
+
+The two pairs hold the two cases of the metacopy sharing rule:
+
+- The mixed case. `tree-rich.cfs` carries 314 backed inodes over eleven
+  distinct verity records. Two records are shared, by 300 inodes and by 5, and
+  nine are local to one inode each. All 314 inodes reference the one empty
+  value in `tree-rich-noverity.cfs`. Thus the nine local records move into the
+  shared area, and the shared area holds one metacopy entry in place of two.
+- The plain case. `tree.cfs` has two local records and no shared metacopy
+  entry. `tree-noverity.cfs` has one shared entry and no local one.
 
 ## tar
 
-The `ostree export` command produces a plain filesystem tar of a commit's tree,
-not an object-embedding format. The "ostree-in-tar" OCI format is a separate
-`ostree-ext` (Rust) construct and is out of scope here.
+`ostree export` writes a plain filesystem tar of the tree of a commit. The
+stream embeds no repository objects. The "ostree-in-tar" OCI format is a
+separate `ostree-ext` (Rust) construct and is out of scope here.
 
-Tar is a transport interface, not a content-addressed store: the correctness
-contract is interoperability -- GNU tar and the `ostree` tool read what the port
-writes, and the port reads what they write -- and round-trip stability, not
-byte-identity of the tar stream. The tool and the port differ in tar dialect
-(see below), so the same tree yields different bytes through each.
+Tar is a transport interface. Its contract is interoperability and round-trip
+stability: GNU tar and the `ostree` tool read what the port writes, and the
+port reads what they write. The bytes of the stream are outside the contract
+(`conformance/cli-surface.md`, "P2", `export`).
 
-Observed `ostree export` output (tool version 2026.1, black-box):
+Observed behavior: the stream of `ostree export` has these properties.
 
-- The archive is old-GNU-format tar: the header magic field at offset 257 is
-  `ustar\x20\x20\x00` (`ustar` followed by two spaces and a NUL), not the POSIX
-  `ustar\x00` plus `00` version.
-- The tree root is the member `./`. Every other member is a bare relative path
-  with no `./` prefix; directories carry a trailing slash.
-- uid and gid are numeric; the octal mode field holds the permission bits only
-  (the type is the tar typeflag). Every member's mtime is the commit timestamp,
-  with a zero nanosecond part.
-- Identical content is coalesced into hardlinks: the first member for a given
-  content object is written in full (typeflag `0`), and a later member with the
-  same content is a hardlink (typeflag `1`) whose link name is the first member.
-  Symlinks are typeflag `2` with the target in the link name.
-- This version emitted no PAX extended headers and no xattrs, even for a file
-  that carried a `user.demo` xattr committed without `--no-xattrs`: the exported
-  stream contained no `SCHILY.xattr.*` record by any encoding.
-- Standard output is padded up to a multiple of 10240 bytes (more than the two
-  trailing zero blocks POSIX requires): 8192 bytes of members reached 10240, and
-  41472 bytes of members reached 51200. A `-o` destination carries the members
-  followed by the two zero blocks alone, with no record padding: the same two
-  archives reached 9216 and 42496 bytes. The shorter stream is the longer one
-  with fewer trailing NUL bytes.
-- Within a directory the non-directory entries come first in name order, then
-  the subdirectories in name order, each subdirectory's own members following
-  it. The first member the walk reaches for a content object is the one written
+- The archive is old-GNU-format tar. The header magic field at offset 257 is
+  `ustar\x20\x20\x00` (`ustar`, two spaces, and a NUL). The POSIX form is
+  `ustar\x00` and the version `00`.
+- The tree root is the member `./`. Each other member is a bare relative path
+  with no `./` prefix. A directory member has a trailing slash.
+- uid and gid are numeric. The octal mode field holds the permission bits
+  alone, and the tar typeflag gives the type.
+- Each member other than a hardlink member has the commit timestamp as its
+  mtime, with a zero nanosecond part. Not observed: the mtime, the mode, and
+  the owner in the header of a hardlink member.
+- Identical content becomes hardlinks. The first member for a content object
+  is written in full (typeflag `0`). A later member with the same content is a
+  hardlink (typeflag `1`), and its link name is the first member. A symlink is
+  typeflag `2`, with the target in the link name.
+- The stream holds no PAX extended header and no xattr. A file that carries a
+  `user.demo` xattr, committed without `--no-xattrs`, gives no `SCHILY.xattr.*`
+  record in any encoding.
+- On standard output the stream is padded up to a multiple of 10240 bytes,
+  more than the two trailing zero blocks that POSIX requires. 8192 bytes of
+  members give 10240 bytes, and 41472 bytes of members give 51200. A `-o`
+  destination holds the members and the two zero blocks alone, with no record
+  padding: the same two archives give 9216 and 42496 bytes. The shorter stream
+  is the longer one with fewer trailing NUL bytes.
+- In a directory, the non-directory entries come first in name order, then the
+  subdirectories in name order. The members of each subdirectory follow it. The
+  first member that the walk reaches for a content object is the one written
   in full.
 
-### The tar export options
+`conformance/cli-behavior.md`, "The tar export options", states the four
+options that shape this stream.
 
-Four options shape the stream, and none of them changes the member order.
+`Repo::export_tar` writes POSIX ustar and pax through the `smol-tar` writer. It
+uses the member naming of `ostree export` (`./` root, bare relative names, a
+trailing slash on a directory), numeric ownership, and the commit timestamp as
+the mtime. It writes a regular file as a hardlink when an earlier member has
+the same content checksum. It never writes a symlink as a hardlink. A hardlink
+member header carries mtime 0, mode 0, and owner 0:0.
 
-`--no-xattrs` skips the extended attributes. This version emits none in any
-case, so the option leaves the stream it writes byte for byte the same.
+The export writes each extended attribute of an entry as a `SCHILY.xattr.<name>`
+PAX record with the exact value bytes. Thus an xattr-bearing tree survives an
+export and an import. The record drops the terminating NUL of a stored xattr
+name, and the import adds it again. The `ostree` tool imports a port export into
+a byte-identical tree (the same dirtree and dirmeta objects).
 
-`--subpath=PATH` makes the directory `PATH` names the archive root: that
-directory's own dirmeta becomes the `./` member's metadata, and every member
-below it takes a name relative to it. A leading `/` is optional, and `/` names
-the whole tree. Each `/`-separated span of the value is read as a child name to
-look up, so a span that no directory holds as a name refuses the export at exit
-1 with `error: No such file or directory: <path>`, where `<path>` carries a
-leading slash the tool adds. This covers a trailing `/` (`--subpath=/dir/`
-reports `/dir/`), the empty value (which reports `/`), and the spans `.` and
-`..` wherever they stand: `--subpath=.` reports `/.`, `--subpath=..` reports
-`/..`, `--subpath=/./dir` reports `/.`, and `--subpath=/dir/..` reports
-`/dir/..`. A `PATH` naming a regular file or a symlink ends the process on
-SIGABRT with `ostree_repo_file_tree_query_child: assertion failed:
-(self->tree_contents)`, printing that text on standard error and a `Bail out!`
-line carrying the same text on standard output.
+`TarExportOptions` carries `subpath`, `prefix`, and `skip_xattrs`.
+`skip_xattrs` drops every xattr record. The CLI adds `-o`.
+`conformance/cli-surface.md`, "P2", `export`, records where the stream and the
+option values of the port part from the tool.
 
-`--prefix=PATH` puts `PATH` in front of every member name. The root member's
-name is `PATH` with one `/` appended where `PATH` does not already end in one,
-and every other member's name is `PATH` joined to the member's own relative
-path with no separator between them. So `--prefix=pre` names the root `pre/`
-and a root file `prefile.txt`, where `--prefix=pre/` names them `pre/` and
-`pre/file.txt`. A hardlink's link name carries the prefix; a symlink's target
-is the stored target and carries none. An empty value leaves the `./` root and
-the bare relative names. The option names the members `--subpath` rerooted, so
-the two compose in one order.
-
-`-o PATH`, spelled `--output=PATH` as well, writes the stream to `PATH` and
-writes nothing to standard output. The destination is opened with create and
-truncate after the repository resolves and before the revision does, so an
-existing destination keeps its inode and its mode and is truncated whether or
-not the export proceeds, and a fresh one takes `0o666` reduced by the umask. A
-refusal that comes after that open leaves the two trailing zero blocks at the
-destination and no tar member: 1024 NUL bytes in a `-o` file, and 10240 on
-standard output, where those blocks are padded to one record. A destination
-that does not open reports `error: Failed to open '<path>'` at exit 1, which
-covers a path whose parent directory is absent and a path naming a directory;
-the parent is not created. The value `-` names a file called `-`, and the empty
-value names standard output. A missing positional is refused before the open,
-so `export -o PATH` with no revision creates nothing.
-
-Each of `--subpath`, `--prefix`, and `-o` takes the last occurrence where the
-command line names it more than once: `--prefix=a --prefix=b` names the root
-`b/`, `--subpath=/nope --subpath=/` exports the whole tree at exit 0, and
-`-o o1.tar -o o2.tar` writes `o2.tar` and creates no `o1.tar`. A repeated
-`--no-xattrs` is accepted.
-
-`ostree` import (`ostree commit --tree=tar=FILE`) commits an arbitrary
-filesystem tar into the repository, deferring hardlink resolution to the end and
-optionally applying the `/etc` -> `/usr/etc` convention.
+`ostree commit --tree=tar=FILE` commits an arbitrary filesystem tar into the
+repository. It resolves the hardlinks at the end of the import, and it can
+apply the `/etc` -> `/usr/etc` convention.
 
 ### The tar import
 
-The name a member is imported under drops one leading `./` and one leading `/`.
-A directory member keeps its trailing `/`, and the archive's own root member
-(`./`, or `/` before the strip) is the empty string. That name is what
-`--tar-pathname-filter` receives and what the member is placed by.
+The import name of a member drops one leading `./` and one leading `/`. A
+directory member keeps its trailing `/`. The root member of the archive (`./`,
+or `/` before the strip) gets the empty string. `--tar-pathname-filter` receives
+this name, and the import places the member by it.
 
-Each member is placed under the directory the tree already holds, whether an
-earlier member of the same archive or an earlier source in the list created it.
-A member whose parent directory is absent is refused with
-`error: No such file or directory: <name>`, naming the first absent ancestor by
-its own name. The tree's root is not one of those ancestors: an archive naming
-no root member leaves the root without metadata, which the commit reports as
-`error: Can't commit an empty tree` where no other source supplied one, and
-which is no error at all where one did.
+The import places each member under the directory that the tree already holds.
+An earlier member of the same archive or an earlier source in the list can
+create this directory. A member whose parent directory is absent is refused
+with `error: No such file or directory: <name>`. The name is the own name of
+the first absent ancestor. The tree root is not one of these ancestors. An
+archive with no root member supplies no root metadata.
+`conformance/cli-behavior.md`, "The tree sources", states when the commit then
+refuses.
 
-Every member records the numeric ownership its header carries and the low 12
-bits of its octal mode field, `mode & 0o7777`, under the file type the typeflag
-states. Bits above those 12 are dropped, so a mode field holding a full
-`st_mode` records the permission part alone: `0120777` gives `0777`, `0100644`
-gives `0644`, and `0040755` gives `0755`. The setuid, setgid, and sticky bits
-are kept.
+Each member records the numeric ownership of its header. It also records the low
+12 bits of its octal mode field, `mode & 0o7777`, under the file type that the
+typeflag states. The import drops the higher bits, so a mode field that holds a
+full `st_mode` records the permission part alone: `0120777` gives `0777`,
+`0100644` gives `0644`, and `0040755` gives `0755`. The setuid, setgid, and
+sticky bits are kept.
 
-A symlink member is read the same way. Its mode is the header's own permission
-bits under `S_IFLNK`: header mode `0000` gives `l00000`, `0600` gives `l00600`,
-`0755` gives `l00755`, `04777` gives `l04777`, and `07777` gives `l07777`. GNU
-tar writes `0777` for every symlink member it packs, so an archive from that
-writer carries that one value. The old-GNU, ustar, and pax header forms are
-read alike: the same archive written in the three formats commits to one tree
-checksum.
-`--canonical-permissions` leaves a symlink's mode as the member left it,
-matching the filesystem walk, so all of the values above survive the reduction
-unchanged.
+A symlink member follows the same rule. Its mode is the permission bits of the
+header under `S_IFLNK`: header mode `0000` gives `l00000`, `0600` gives
+`l00600`, `0755` gives `l00755`, `04777` gives `l04777`, and `07777` gives
+`l07777`. GNU tar writes `0777` for every symlink member it packs, so an
+archive from that writer carries that one value. The import reads the old-GNU,
+ustar, and pax header forms alike: one archive written in the three formats
+commits to one tree checksum. `--canonical-permissions` leaves the mode of a
+symlink as the member set it, as the filesystem walk does, so each of these
+values stays unchanged.
 
-`--tar-autocreate-parents` supplies those directories instead of refusing:
-
-- A missing intermediate parent is created with mode `0755`, empty extended
-  attributes, and the ownership of the member whose import created it. Creating
-  one rewrites the tree root's own metadata to the same mode and ownership,
-  whatever the archive's root member recorded, and the last member to trigger a
-  creation wins for every ancestor they share.
-- A missing root with no such member is created with mode `0755`, owner `0:0`,
-  and empty extended attributes.
-- A synthesized directory takes no part in the commit modifiers, so
-  `--owner-uid` shapes the member and not the parent its import created.
-
-`--tar-pathname-filter=REGEX,REPLACEMENT` splits its value at the first comma:
-everything before it is the expression, everything after it, further commas
-included, is the replacement. The replacement is global -- every match in the
-name is replaced -- and a member the expression does not match is imported
-unchanged, so the option renames and never drops. A hardlink member's link name
-is another member's name and goes through the filter too; a symlink's target is
-not a member name and is left as it stands. Given more than once the last value
-wins, and the value is read as an archive is loaded, so a command line naming no
-`tar=` source carries a value neither reader accepts at exit 0. A value with no
-comma reports `error: Missing ',' in --tar-pathname-filter` and an expression
-that does not compile reports
-`error: --tar-pathname-filter: Error while compiling regular expression
-'<expression>' at char N: <reason>`, both at exit 1. The tool counts `N` in
-characters and the port in code units, which `conformance/cli-surface.md`,
-"P2", records.
-
-The expression is a PCRE2 pattern, compiled with UTF and UCP on and the newline
-convention set to `any`, and every other compile option at PCRE2's default. The
-replacement is GLib's syntax: `\0` to `\9`, `\g<name>`, `\g<number>`, `\\`, the
-seven control escapes `\n`, `\t`, `\r`, `\a`, `\b`, `\f`, and `\v`, and `$` as a
-literal. A group the expression does not declare contributes nothing, and any
-other replacement escape is refused. An empty match advances past one whole
-character, which leaves that character in the name.
-(`conformance/cli-surface.md`, "P2", states the dialect in full, together with
-the four places the two implementations part.)
-
-The commit modifiers reach an archive the way they reach a filesystem walk, with
-one difference: `--canonical-permissions` records owner `0:0` and
-`mode & 0o755` and leaves the extended attributes the archive carries, where the
-filesystem walk drops them. `--no-xattrs` drops them for both.
-
-Port import (`Repo::import_tar_into`) follows every rule above and reads into a
-tree an earlier source already filled, so one archive composes with a filesystem
+`Repo::import_tar_into` follows each rule of this section. It reads into a
+tree that an earlier source filled. So one archive composes with a filesystem
 source and with a committed tree under one modifier.
-
-Port export (`Repo::export_tar`) writes POSIX ustar/pax through the `smol-tar`
-writer. It reproduces the tool's member naming (`./` root, bare relative names,
-trailing slash on directories), numeric ownership, commit-timestamp mtimes, and
-content-checksum hardlink coalescing (regular files only; symlinks are never
-coalesced). It additionally emits each entry's extended attributes as
-`SCHILY.xattr.<name>` PAX records with byte-exact values, so an xattr-bearing
-tree survives an export/import round trip; a stored xattr name drops its
-terminating NUL for the record and regains it on import. The `ostree` tool
-re-imports a port export into a byte-identical tree (same dirtree and dirmeta
-objects). Members the ostree object model cannot represent -- device nodes and
-FIFOs -- are rejected on import, since a tree stores only regular files,
-symlinks, and directories.
-
-`TarExportOptions` carries the four options. `subpath` and `prefix` reproduce
-the member naming above, `skip_xattrs` drops every xattr record, and the CLI's
-`-o` opens the destination the way the tool opens it. Three facts of the port's
-own stream part from the tool's, and `conformance/cli-surface.md`, "export"
-records them with the rest: every entry of a directory is emitted in one name
-order, so a content-sharing group spanning two directories coalesces in the
-opposite direction and a hardlink member's header carries zeros; `subpath` is a
-path, where the tool reads a list of child names, and a subpath naming a file
-or a symlink is refused at exit 1 with
-`tar: subpath is not a directory: <path>`; and standard output carries the two
-trailing zero blocks alone, the way a `-o` destination does, with no padding up
-to a 10240-byte record. The port reads `subpath` as a path. A `.` component
-falls away, a trailing slash falls away, and a value that carries no name
-component names the whole tree. The tool refuses a `.` component and a trailing
-slash. Of the values that carry no name component, the tool takes `/` alone.
-The two agree on a `..` component in a value that carries a name component:
-both refuse it at exit 1.
+`TarImportOptions::owner_uid` and `owner_gid` also set the owner of a parent
+that the import creates and of the created root. `ostrya commit --owner-uid`
+goes through the commit modifier and leaves these fields unset. The import
+refuses a device node and a FIFO member, because a tree stores regular files,
+symlinks, and directories alone.
 
 ## bare-split-xattrs mode
 
-The public documentation states that in this mode xattrs are stored as separate
-repository objects and are not reflected to the filesystem, which serves
-transport through lossy environments (tar streams, containers) and carries
-security-sensitive xattrs (SELinux labels) out of band. The byte-level layout
-below is recovered by observation: the `ostree` tool refuses to write this mode,
-so a candidate repository is built by hand and confirmed by `ostree fsck`,
-`ostree ls -X`, and `ostree checkout` accepting it and reproducing the xattrs.
+The public documentation states that this mode stores the xattrs as separate
+repository objects and does not reflect them to the filesystem. The mode serves
+transport through lossy environments (tar streams, containers). It carries
+security-sensitive xattrs (SELinux labels) out of band.
 
-Object identity is unchanged from every other mode:
-`SHA256(6-field header ‖ payload)`, where the header
+The `ostree` tool reads this mode and refuses a commit into it
+(`Writing content object: Not allowed due to repo mode`). The port reads this
+mode and does not write it. Observed behavior: `ostree fsck`, `ostree ls -X`,
+and `ostree checkout` accept the layout of this section and reproduce the
+xattrs. The tool exports a composefs image from it, and the port writes the same
+image (`ostrya::read_split_xattrs::composefs_export_matches_the_tool`).
+
+The object identity is the same as in every other mode:
+`SHA256(6-field header ‖ payload)`. The header
 `(uid, gid, mode, rdev=0, symlink-target, xattrs)` carries the logical xattrs.
-The split is a storage layout, not a new identity.
+The split changes the storage alone.
 
 Storage:
 
 - `.file`: bare inode storage. A regular file holds the raw payload on an inode
-  bearing the logical uid, gid, and mode; a symlink is a real symlink. The inode
-  carries no xattrs, and there is no `user.ostreemeta`. Because the inode carries
-  the identity's uid/gid/mode, faithful writes need the ownership the identity
-  encodes, as with `bare`.
-- `.file-xattrs`: the GVariant `a(ayay)` xattr array in normal form -- the same
-  bytes the identity header embeds -- named `SHA256` of those bytes. The empty
-  set serializes to zero bytes, so its shared object is named
+  with the logical uid, gid, and mode. A symlink is a real symlink. The inode
+  carries no xattrs, and there is no `user.ostreemeta`. The inode carries the
+  uid, gid, and mode of the identity. So a write that keeps the identity on the
+  inode needs the ownership that the identity encodes, as with `bare`.
+- `.file-xattrs`: the GVariant `a(ayay)` xattr array in normal form, the same
+  bytes that the identity header embeds. Its name is the `SHA256` of these
+  bytes. The empty set serializes to zero bytes, so its shared object is named
   `e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855`
   (`SHA256` of the empty input).
-- `.file-xattrs-link`: named by the `.file` checksum, a hardlink to the file's
-  `.file-xattrs` object. Present for every `.file`, including symlinks and files
-  with no xattrs, which link to the shared empty-set object. The link is
-  mandatory: removing it from an otherwise self-consistent commit makes
-  `ostree fsck` mark the commit partial and fail (`Repository corruption
-  encountered`) and `ostree ls -X` fail opening the object, so a missing link
-  is a corrupt repository, not an empty xattr set. A reader treats its absence
-  as a format error.
+- `.file-xattrs-link`: a hardlink to the `.file-xattrs` object of the file,
+  named by the `.file` checksum. Each `.file` has one, symlinks and files with
+  no xattrs included, which link to the shared empty-set object. The link is
+  mandatory: a missing link is a corrupt repository, and a reader treats its
+  absence as a format error. Observed behavior: over an otherwise
+  self-consistent commit with the link removed, `ostree fsck` marks the commit
+  partial and fails (`Repository corruption encountered`). `ostree ls -X` fails
+  to open the object.
 
-Reading recovers uid, gid, mode, and kind from the inode, and the xattrs from
-the bytes at `<file-checksum>.file-xattrs-link` parsed as `a(ayay)`. Reading the
-bytes at the link name needs no knowledge of the hardlink topology.
+A read recovers the uid, gid, mode, and kind from the inode, and the xattrs
+from the bytes at `<file-checksum>.file-xattrs-link`, parsed as `a(ayay)`. A
+read of the bytes at the link name needs no knowledge of the hardlink topology.
 
-## Port extension: bare-user-shared mode
+# Port extensions
 
-A development-only repository mode introduced by this port; it is not present
-upstream. Production repositories (`/sysroot/ostree`) stay `bare`. This mode
-supports building images in a group-shared repository on a multi-user build
-host and serving as a composefs backing store.
+This part specifies the formats and the protocols that the port alone writes
+or speaks. The `ostree` tool has none of them. A run of the port and a check of
+the bytes on the wire or on disk can verify each fact.
 
-Motivation. In `bare-user`, a stored object's inode permission bits are
-derived from the file's logical mode (`(mode & (S_IFREG|0775)) | S_IRUSR`), so
-a file with a restrictive logical mode (for example `/etc/shadow`, 0600)
-produces an object other users sharing the repository cannot read: an object
-one user commits cannot be loaded by the next, and the shared build fails.
-This mode decouples the repository's at-rest permissions from the file's
-logical permissions.
+The part holds these items:
 
-Storage. Identical to `bare-user` in every byte that carries identity:
+- the config keys of the port;
+- the ref patterns of the receive policy and of the ref listing;
+- the push protocol and the pull protocol, over HTTP and over a byte stream;
+- the ref listing;
+- the endpoints of `ostrya serve`;
+- the credential files of a push over HTTP;
+- the ssh transport;
+- the commit of `push-tree`;
+- the mode `bare-user-shared`.
 
-- Object content is the raw payload. The logical uid, gid, mode, and xattrs
-  live in the `user.ostreemeta` xattr as `(uuua(ayay))` (uid BE, gid BE, mode
-  BE, xattrs sorted), as in `bare-user`.
-- A symlink is stored as a regular file (content: target plus one NUL, as in
-  `bare-user`). This representation is forced: Linux permits `user.*` xattrs
-  only on regular files and directories (xattr(7)), so a real symlink cannot
-  carry `user.ostreemeta`.
-- Object identity is `SHA256(6-field header ‖ payload)`, unchanged from every
-  other mode, so dirtree and commit hashes are byte-identical to `bare`, and
-  a commit built in this mode and pulled into a bare production repository is
-  the same commit.
+The push protocol and the pull protocol each have a version number. Both
+versions are 1. The two numbers are separate, and each one changes on its own.
+Over HTTP, the paths `/_ostrya/receive/v1/` and `/_ostrya/refs/v1` hold the
+version. The pull over HTTP sends no version message.
 
-The single behavioral difference from `bare-user`: the logical mode is never
-applied to the inode. Objects are written with a fixed mode 0644 via explicit
-`fchmod` (never trusting umask). A `.commitmeta` takes 0644 the same way,
-also one a pull stages in the staging directory before the rename into
-`objects/`.
+## Configuration keys of the port
 
-The port forces the permission bits of every directory and every lock file it
-creates inside the repository, with an `fchmod` after the create, so the
-process file-creation mask does not reach them:
+The `[ex-ostrya]` group, the receive groups, and seven keys of a
+`[remote "NAME"]` group are extensions of the port. The seven keys are
+`push-url`, `ssh-command`, `receive-command`, `push-token-file`, `push-user`,
+`pull-url`, and `send-command`. The `ostree` tool defines none of them and
+reads none. `ostrya-config(1)` states each key, its type, its default, its
+precedence, each refusal, and the operations that read it. "EXTENSION KEYS"
+and "RECEIVE POLICY" state the groups, and "REMOTE KEYS" states the keys of a
+remote. "The push token file of a client" states the grammar of the file that
+`push-token-file` names.
 
-- Directories take 02770: the repository root and each layout directory at
-  `init`, the `objects/<xx>` fanout directories, the `refs/` parent
-  directories, `tmp/`, and each per-transaction staging directory. Every
-  member of the repository group can therefore read, deduplicate, and write
-  objects, and can publish a ref. The setgid bit is part of the forced mode,
-  so the group descends to each directory created below. The sticky bit stays
-  off, because the stale-staging reaper removes staging trees that other
-  members own. A ref file, an alias symlink, a `.commitmeta`, and a
-  `.tombstone-commit` start as a temp entry in `tmp/` or in a staging
-  directory, so each takes the group of that directory.
-- `.lock`, `.update.lock`, and each per-transaction staging sibling lock
-  take 0660, so every group member opens them `O_RDWR`, takes the repository
-  lock and the update lock, and reaps a staging tree whose owner has died.
-- The `state/<commit>.commitpartial` marker takes 0644.
+The receive path of a server reads the receive groups from `<repo>/config`, or
+from a policy file. In both cases, it reads
+`[ex-ostrya] detached-metadata-exclude` and `[core] auto-update-summary` from
+`<repo>/config`.
 
-Forcing applies on the arm of a create where the port made the entry. An entry
-that already stands keeps the mode and the group it has, the repository root
-included: the group and the mode of a root the port did not create are the
-caller's responsibility. The port sets no group ownership.
+The tool gives a quote no meaning in a group name, so the port splits the name
+of a receive group itself. The default group has the exact name
+`ex-ostrya receive`. The name of each other receive group starts with one of
+the literal prefixes `ex-ostrya receive "`, `ex-ostrya trust "`, and
+`ex-ostrya key "`, with one space between the words. After the prefix, the
+quoted part and a `"` end the name. `ostrya-config(1)`, "RECEIVE POLICY",
+states the refusals of a group name. "Receive patterns" states the grammar of
+the pattern of a receive group.
 
-02770 gives no bits to others. A repository whose objects are world-readable at
-0644 relies on the directory to hold the boundary.
+No key changes the encoding or the checksum of an object. Some keys change
+which bytes a repository holds:
 
-The directories and the files under `deltas/` and `delta-indexes/` are outside
-this rule, and take the modes they take in every other mode. The directories
-keep the umask-reduced mode, and the files take 0644 whatever the umask is
-("Object store layout").
+- `detached-metadata-exclude` and the rule key `sign` of a receive group
+  change the bytes of a `.commitmeta` file.
+- `gc-root-metadata-keys` changes which objects a prune keeps.
 
-Mode string. `[core] mode=bare-user-shared`. The distinct string is a safety
-fence: under a literal `bare-user` string the upstream tool would accept the
-repository, and its hardlink checkout would propagate the fixed 0644 inode
-mode in place of the logical mode; the unrecognized string makes the tool
-refuse the repository outright.
-
-Confidentiality. The repository does not preserve file confidentiality through
-unix permissions at rest: any user with repository access can read any object.
-The restrictive logical permissions are restored on materialization, and
-outside access is gated at the repository root directory. This is an accepted
-property of a shared development repository.
-
-`ostree.sizes`. As in `bare-user`: never written. Size generation is an
-archive-only mechanism (see the `ostree.sizes` notes in the commit-metadata
-section), so cross-mode commit identity needs no mode-specific handling.
-
-Checkout. Copy-based, with reflink (`FICLONE`) where the filesystem supports
-it: a fresh copy is made and the `user.ostreemeta` mode is applied to it.
-Hardlink checkout is refused, because the inode deliberately does not carry
-the logical mode.
-
-Integrity (fsck) and reachability (prune). As `bare-user`:
-`SHA256(header-from-xattr ‖ payload) == object name`; no auxiliary objects
-and no extra reachability edges. The inode mode is not authoritative and is
-not checked.
-
-composefs. This mode is the intended composefs backing store. Its `.file`
-objects hold the raw payload at the loose paths each image redirect names, so
-the repository serves as the lower layer of an image exported from any mode
-holding the same tree. Per-file fs-verity is computed over the payload.
-Ownership is presented
-through composefs uid mapping at mount time, so the real root-owned metadata
-is correct even inside a rootless, non-root container.
-
-## CLI output formats
-
-The reading commands write to standard output, so their format is part of the
-interoperability surface a script depends on, and `commit` states the commit it
-made the same way. Each format below was recovered by running `ostree` 2026.1 as
-a black box against repositories built for the purpose, and
-`conformance/m10-cli-behavior.matrix` states the cells that hold the port's
-output to the tool's. `conformance/cli-surface.md` lists the commands whose
-formats are still to be recovered.
-
-### The fsync vocabulary
-
-One durability switch carries two spellings, and every command that takes
-either one reads the rule stated here.
-
-The valued spelling is `--fsync=POLICY`. `POLICY` is a boolean word, matched
-without regard to case: `true`, `yes`, and `1` turn fsync on, and `false`, `no`,
-and `0` turn it off. Every other value reports `error: Invalid boolean argument
-'<value>'` on standard error and exits 1, quoting the value verbatim and the
-empty value with it. The boolean spellings outside that set are refused as well:
-`on`, `off`, and the single letters `t`, `f`, `y`, and `n`. The option requires a
-value, so `--fsync` given none takes the next word on the command line as its
-value and refuses that word. Where that word is itself an option, every word
-after it shifts one position and the rest of the line is read in the shifted
-positions; both readers reach the value reader all the same and name the
-swallowed word, whether that word is an option the command holds
-(`--orphan`, `--table-output`, `-I`), an option it does not hold (`--nosuch`,
-`-Z`), or an option carrying a value (`--timestamp=@1700000000`,
-`--owner-uid=abc`).
-
-The option narrows the configured policy and never widens it. A repository
-holding `[core] fsync=false` performs no `fsync`, `fdatasync`, or `syncfs` call
-under `--fsync=true`; the resolved policy is the configured value and the option
-value ANDed.
-
-The counts below were measured with
-`strace -y -f -e trace=fsync,fdatasync,syncfs` over a `commit` of corpus `C0`
-into a fresh `archive` repository, under the single-component branch name
-`main`. `C0` is the tree `corpus::basic` builds in
-`crates/ostrya-conformance/src/corpus.rs`, and `conformance/README.md` lists
-it: a 0644 regular file, a 0644 empty file, a 0755 directory holding one 0644
-regular file, and a symlink. The commit writes 8 objects, which land in 8
-distinct fanout directories. The tool's own counts:
-
-```
-[core] fsync   option           sync calls
-unset (on)     --fsync=true     11  (9 fsync, 1 fdatasync, 1 syncfs)
-true           --fsync=false     0
-false          (none)            0
-false          --fsync=true      0
-```
-
-The nine `fsync` calls are one per fanout directory the commit wrote into plus
-one of `objects/`, so the count on the one row that syncs follows the corpus
-and is a property of the writer and not of the format. The `fdatasync` is of
-the ref's temp file, and the tool syncs no directory for the ref.
-
-The port issues that same `syncfs`, those same fanout and `objects/` syncs, and
-that same ref `fdatasync`, of the port's temp file under `tmp/`, and adds the
-directory syncs a ref write needs: one `fsync` of the directory holding the
-ref, plus one per directory the ref write created for a `/`-bearing name,
-deepest first (see "Ref durability" above).
-Under `main` the write creates no directory, so the port's count on the syncing
-row is 12 (10 fsync, 1 fdatasync, 1 syncfs). Under `deep/nest/leaf` the write
-creates `deep` and `nest`, which makes three directory syncs and a count of 14
-(12 fsync, 1 fdatasync, 1 syncfs). The three rows that sync nothing are the
-rule, and the port matches them exactly.
-
-The same measurement over `checkout -U main DEST` of that commit into a fresh
-destination, out of an `archive` repository holding it, gives these counts. The
-`tool` column holds the tool's calls and the `port` column holds the port's:
-
-```
-[core] fsync   option           tool   port
-unset (on)     --fsync=true      2      5
-unset (on)     (none)            2      5
-true           --fsync=false     0      0
-false          --fsync=true      0      0
-```
-
-The tool's two calls are `fsync` of the temporary files its uncompressed object
-cache writes under `tmp/` in the repository, one per regular file carrying
-content. `--disable-cache` takes the count to 0, and a `bare-user` repository,
-which keeps no such cache, gives 0 on every row. The tool syncs no file and no
-directory of the destination.
-
-The port keeps no uncompressed object cache, and it syncs the destination. It
-issues one `fsync` of the temporary inode of each file it copies, taken before
-the inode is linked into place, and one `fsync` of each directory it writes,
-taken after that directory's entries. Over corpus `C0` that is the 5 calls the
-table records for `archive` mode, where every regular file is copied, and 3 in
-`bare-user` mode under `-U`, where the two files carrying content are
-hardlinked and the zero-length file is written fresh. The three rows that sync
-nothing are the rule, and the port matches them exactly.
-
-The two counts on the syncing rows are alike at the scale of corpus `C0` and
-part at the scale of a tree. The target and the lifetime of a call are the
-reason:
-
-- the tool's calls target the uncompressed object cache under the repository,
-  and that cache persists. The first `archive` checkout of a commit pays one
-  call per regular file carrying content, and a second checkout of the same
-  commit out of the same repository pays none. A `bare-user` checkout pays none
-  on any run, since that mode keeps no such cache;
-- the port's calls target the destination, which each checkout writes afresh,
-  so every checkout pays the full count. The count is one per file the copy
-  path writes plus one per directory the checkout writes.
-
-Measured on one host with `strace -f -e trace=fsync,fdatasync,syncfs`, over a
-tree of 5000 regular files in one directory (2 directories in all) out of an
-`archive` repository: the port issues 5002 calls on every run, and the tool
-issues 5000 on the first run and 0 on the second. Over a tree of 520 regular
-files in 22 directories out of a `bare-user` repository, where the checkout
-hardlinks every file: the port issues 22 calls on every run, one per directory,
-and the tool issues 0 on every run. `port-plan.md`, Phase 17f, carries the
-wall-clock figures and holds the item open.
-
-The valueless spelling is `--disable-fsync`, which equals `--fsync=false`. It
-takes no argument, so an `=VALUE` suffix is read and discarded:
-`--disable-fsync=false` disables fsync.
-
-Both spellings default to fsync on. Neither changes a byte the command writes to
-the repository. The same commit under `--fsync=true` and under `--fsync=false`
-reaches one checksum and one object store; the count of `fsync`, `fdatasync`,
-and `syncfs` calls is the whole observable difference.
-
-Which command takes which spelling:
-
-- `commit` and `checkout` document `--fsync=POLICY` and share the value set and
-  the refusal text. `commit` also accepts `--disable-fsync`, which its `--help`
-  does not list. `checkout` refuses `--disable-fsync` with `error: Unknown
-  option --disable-fsync` at exit 1.
-- `pull` and `pull-local` document `--disable-fsync` and refuse `--fsync` with
-  `error: Unknown option --fsync=<value>` at exit 1.
-- `--per-object-fsync` is a separate valueless flag on `pull` and `pull-local`,
-  covering write scheduling and standing outside this vocabulary. It turns the
-  per-object sync of `[core] per-object-fsync` on, whatever the key says, with
-  the scope of the key: the file of each content object the pull stages, and
-  no metadata object. It takes no value, and the tool reads and discards an
-  `=VALUE` suffix, so `--per-object-fsync=bogus` is accepted. It cannot turn a
-  configured `per-object-fsync=true` off. `[core] fsync=false` and
-  `--disable-fsync` each win over it. `commit` refuses it with `error: Unknown
-  option --per-object-fsync` at exit 1.
-
-The option value is read after the configured value, so an option value never
-conceals a configured one the reader refuses. A repository holding a `[core]
-fsync` value that is not a key-file boolean is refused at exit 1 under
-`--fsync=true`, under `--fsync=false`, and under no option at all, with no
-object and no ref written. The narrowing above applies to the value the reader
-returns, which requires that reader to run every time.
-
-The port accepts `--fsync=POLICY` on `commit` with that value set, that refusal
-text, and that narrowing rule; the resolved policy reaches the per-object
-writes, the publication step, and the ref write alike. It reads the configured
-`[core] fsync` under every state of the option, the way the tool does, and it
-reads it while the other `[core]` keys are read, ahead of the editor and ahead
-of the repository lock. It declines the undocumented `commit --disable-fsync`
-(`conformance/cli-surface.md`, "P2").
-
-The port accepts `--fsync=POLICY` on `checkout` with that same value set, that
-same refusal text, and that same narrowing rule, and the value is read while
-the options are read, ahead of the repository, ahead of the revision, and ahead
-of the port's own `error: DESTINATION must be specified`, which a batch option
-raises on an empty destination value. The argument-count check `clap` makes
-stands ahead of the value reader, so a plain-path line that omits DESTINATION
-altogether names a different fault in each: the tool reports the value and the
-port reports the missing positional. Both exit 1 and create nothing
-(`conformance/cli-surface.md`, "checkout"). The resolved policy reaches the
-file syncs of the copy path and the directory syncs alike, and every checkout
-of a `--from-stdin` or `--from-file` batch runs under the one value. The port
-reads the configured `[core] fsync` under every state of the option, and it
-reads it where it is used: after the composefs export decision, which applies
-no such policy, and ahead of the first checkout. A `--composefs` export
-therefore reaches no such read, and a repository holding a `[core] fsync` value
-the reader refuses exports the image at exit 0 in the port where the tool
-refuses the repository at exit 1
-(`conformance/cli-surface.md`, "checkout"). It refuses `--disable-fsync` on
-`checkout`, which the tool refuses too, and takes the option once, where the
-tool takes the last of a repeat. Neither policy changes a byte of the
-destination.
-
-The syscall counts a policy produces are the whole observable difference, and
-the conformance matrix reads standard output, standard error, the exit status,
-and the repository bytes alone, so no `run:` line can state them. Cell
-`commit/fsync-syscalls` cites `commit_fsync_policy_controls_the_syscalls`
-(`crates/ostrya-cli/tests/cli.rs`) instead, which measures the calls of both
-binaries over the four rows above with `strace -y`. It holds the three quiet
-rows to zero calls and the syncing row to the target of every call and to the
-total this table records, 11 for the tool and 12 for the port, so the table and
-the test stay one record. It asserts where `strace` is installed.
-
-Cell `checkout/fsync-syscalls` states the same claim for `checkout`, citing
-`checkout_fsync_policy_controls_the_syscalls` in the same file. It measures the
-four `checkout` rows above for both binaries, holds the three quiet rows to
-zero calls, and holds the syncing row to the totals this table records, 2 for
-the tool and 5 for the port, with every one of the port's targets under the
-destination and every one of the tool's under the repository.
-
-The same test states which occurrence of a repeated `--fsync` the tool reads,
-which no exit status shows, since both orders exit 0. It is the last one:
-`--fsync=false --fsync=true` gives the syncing row's 2 calls and
-`--fsync=true --fsync=false` gives 0. Each order is measured over a repository
-the run creates for itself, because the uncompressed object cache a first
-`archive` checkout fills would take a second measurement in the same repository
-to 0 whatever the policy resolves to.
-
-The same measurement over a `pull` of corpus `C0` gives the counts below. The
-remote is an `archive` repository holding the commit on `main` and a summary,
-served over HTTP, and the pull writes `refs/remotes/origin/main` into a fresh
-destination. The counts are the same in an `archive` and in a `bare-user`
-destination:
-
-```
-switch or [core] key                         tool   port
-(none)                                        11     13
---per-object-fsync                            15     17
-per-object-fsync=true                         15     17
---disable-fsync                                0      0
---per-object-fsync --disable-fsync             0      0
-fsync=false with --per-object-fsync            0      0
-```
-
-The tool's 11 calls are the 11 of the `commit` table: one `fsync` per fanout
-directory and one of `objects/`, the `fdatasync` of the ref's temp file, and the
-`syncfs`. The per-object rows add one `fsync` per content object, on its staged
-file under `tmp/`, and none for a metadata object: 4 over `C0`. The port adds
-two directory syncs for the ref ("Ref durability" above). `init` creates
-`refs/remotes`, and the ref write creates `refs/remotes/origin`, so the port
-syncs `refs/remotes/origin`, which holds the ref, and `refs/remotes`, which
-holds the created `origin` entry. A later pull from the same remote finds
-`refs/remotes/origin` in place and syncs it alone. A `--mirror` pull of every
-ref copies the remote's summary: the tool makes 11 calls and syncs no summary
-file. The port makes 14: the tool's 11, an `fsync` of `refs/heads`, an
-`fdatasync` of the summary's temp file, and an `fsync` of the repository root.
-Under `--disable-fsync` both make 0.
-
-A pulled commit that carries detached metadata adds a `.commitmeta` to the
-pull. The tool makes no sync call for it, and its counts stay 11 on
-`pull-local`, on `pull`, and on a `--mirror` pull of `C0` committed with
-`--add-detached-metadata-string` into `archive`. The port stages the
-`.commitmeta` before publication with no sync call of its own: the `syncfs`
-that opens publication makes the staged file durable. After publication it
-renames the file into `objects/<xx>/` with an `fsync` of the fanout directory.
-Publication created that fanout directory for the commit object and synced
-`objects/`, so the rename adds no `fsync` of `objects/`. The port makes 13, 14,
-and 15 calls. Under `--disable-fsync` both make 0.
-
-Over `pull-local` of the same commit out of an `archive` source:
-
-```
-switch or [core] key                  archive dest    bare-user dest
-                                      tool   port     tool   port
-(none)                                 11     12       11     12
---per-object-fsync                     11     12       15     16
-per-object-fsync=true                  11     12       15     16
---disable-fsync                         0      0        0      0
-fsync=false with --per-object-fsync     0      0        0      0
-```
-
-Into `archive` every object is hardlinked from the source, so no object is
-synced on any row. Into `bare-user` the content objects are ingested again and
-the metadata objects are hardlinked, so the per-object rows add one sync per
-content object. The port adds one `fsync` of `refs/heads`, the directory holding
-the ref. Under the port's `--force-copy --per-object-fsync` into `archive`, every
-object is copied and the port makes 16 calls: the 4 content objects are synced
-and the 4 metadata objects are not.
-
-`commit` under `[core] per-object-fsync=true` follows the same scope. Over `C0`
-the tool makes 15 calls in `archive` and in `bare-user` and 14 in `bare`, where
-the symlink object is a symlink inode. The port makes 16, 16, and 15.
-
-The port accepts `--disable-fsync` and `--per-object-fsync` on `pull` and on
-`pull-local`. `--disable-fsync` turns off every sync of the pull: the per-object
-syncs, the publication step, the detached metadata of each pulled commit, the
-ref writes, and the summary a mirror pull copies. `--per-object-fsync` turns the
-per-object sync on for the content objects the pull stages. The port reads the
-configured `[core] fsync` and `[core] per-object-fsync` under every state of the
-two switches, so a value the reader refuses is refused at exit 1 under each,
-with no object and no ref written, as the tool refuses it. Neither switch
-changes a byte the pull writes. The port refuses an `=VALUE` suffix on either
-switch and a repeat of either at exit 1, with no object and no ref written,
-where the tool discards the suffix and accepts the repeat
-(`conformance/cli-surface.md`, "P2").
-
-### `commit`
-
-Prints the new commit's 64-character checksum and a newline, and writes nothing
-to standard error, at exit 0.
-
-A commit names a branch with `-b BRANCH` or carries `--orphan`, which permits a
-commit that names none. A commit carrying neither reports `error: A branch must
-be specified with --branch, or use --orphan` and exits 1. The check stands ahead
-of `--parent`, ahead of the tree, and ahead of any object publication, so the same
-line answers a commit whose `--parent` does not resolve and one whose tree path
-does not open. A commit that names a branch writes the ref that name resolves
-to: `refs/heads/BRANCH` for a bare name and `refs/remotes/REMOTE/NAME` for a
-`REMOTE:NAME` value. A commit that names none writes no ref.
-
-The parent:
-
-- `-b BRANCH` with no `--parent` takes that branch's current tip. A branch that
-  names no ref has no tip, so the first commit onto a fresh branch is a root
-  commit. The tip is read from the ref file and not loaded, so a ref standing over
-  an absent commit object is inherited unread.
-- The tip is read before the transaction publishes, so the tip a commit inherits
-  is the one its own ref write then replaces.
-- `--parent=none` asks for a root commit on a branch that has a tip. The ref still
-  moves to the new commit.
-- `--orphan` suppresses the implicit parent the same way. With `-b` given the ref
-  still moves, so the suppressed parent is the whole observable effect there. An
-  explicit `--parent` alongside `--orphan` parents the commit on the value given.
-- `--parent` takes a 64-character lowercase checksum or the literal `none`, and
-  the checksum's existence is not checked: a `--parent` naming no object commits
-  successfully. `none` is a literal in lowercase alone, so `NONE` is a revision.
-- The tool refuses every other `--parent` value with the reader that takes a
-  checksum: an abbreviated checksum, a refspec, and an empty value each report
-  `error: Invalid rev <value>`, a checksum carrying an ancestry suffix reports its
-  base (`--parent=<checksum>^` gives `error: Invalid rev <checksum>`), and a
-  non-lowercase rendering reports `error: Invalid character '<byte>' in rev
-  '<value>'`, naming the first byte it refuses by decimal value. The port resolves
-  any revision there, which is a superset of that syntax, so a value the tool
-  refuses is either resolved by the port or reported in the port's own resolution
-  words (`conformance/cli-surface.md`, "P2").
-
-The subject and the body are commit-object fields, so each form below reaches the
+The commit checksum does not cover detached metadata, so these keys change no
 commit checksum.
 
-- `-s/--subject=SUBJECT` sets the subject and `-m/--body=BODY` the body. Each is
-  stored verbatim: no trimming, no newline normalization, and embedded newlines
-  survive. Given more than once, the last value wins. A commit carrying a body
-  and no subject is accepted, the subject field holding the empty string.
-- `-F/--body-file=FILE` reads the whole file as the body, byte for byte, with no
-  trailing-newline strip and no comment strip. An empty file gives an empty body.
-  `-F` and `-m` together are accepted and `-F` wins, whichever comes first.
-  `-F -` names a file called `-` rather than standard input. A path that does not
-  open reports `error: openat(<path>): <reason>`, naming the path as it was
-  given; a directory opens and then fails to read, so the reason stands alone,
-  `error: Is a directory`; and content that is not UTF-8 or holds a NUL reports
-  `error: Invalid UTF-8`. Each exits 1.
-- `-e/--editor` writes a template to a temporary file, runs an editor over it,
-  and takes the subject and the body from what the editor left. It replaces both
-  outright, so `-m` and `-F` are discarded and `-F` is not even read; only `-s`
-  reaches the template, as a prefill.
-
-The editor is the first of `OSTREE_EDITOR`, `VISUAL`, and `EDITOR` that is set,
-an empty value included, and `vi` where none is. `GIT_EDITOR` is not consulted.
-The value is a shell command line rather than a program path: the temporary
-file's path is appended to it shell-quoted and the whole line runs under
-`/bin/sh -c`, so the shell expands variables and globs in it and reports its own
-faults. The temporary file lives in `TMPDIR` (`/tmp` by default), is named `.`
-and six characters, and is removed after the run. It is created readable and
-writable by its owner alone, mode 0600, so no other local user can read the
-message while it is being edited. The editor runs after the branch check, after
-`--parent` resolution and after the metadata options are read, and before the
-tree opens and before the timestamp is read.
-
-The template, for a commit naming branch `BR`:
-
-```
-\n
-# Please enter the commit message for your changes. The first line will\n
-# become the subject, and the remainder the body. Lines starting\n
-# with '#' will be ignored, and an empty message aborts the commit.\n
-#\n
-# Branch: BR\n
-```
-
-Under `--orphan` the last two lines are absent and the file ends after
-`commit.\n`. A `-s` value and one newline are appended after the block, so the
-prefilled subject sits at the end of the file.
-
-The file the editor leaves is read under the rules `-F/--body-file` states: a
-byte that is not UTF-8 and a NUL both report `error: Invalid UTF-8`, and a file
-the editor removed reports `error: openat(<path>): <reason>`, naming the
-temporary file. Each exits 1.
-
-The edited text is read by these rules, in this order: every line loses its
-trailing whitespace; a line whose first character is `#` is dropped, so a `#`
-behind leading whitespace is not a comment; the leading blank lines go and the
-first line left is the subject; and the lines after it, less their own leading
-and trailing blank lines, are the body, joined by newlines, with the interior
-blank lines kept. An empty subject reports `error: Aborting commit due to empty
-commit subject.` and exits 1, which is what an unmodified template and a
-whitespace-only message both reach.
-
-A non-zero editor exit aborts the commit and discards what the editor wrote, so
-no ref and no commit object are produced. The message carries no separator
-between the quoted editor value and the reason, which is the tool's own wording:
-
-```
-error: There was a problem with the editor '<EDITOR>'Child process exited with code <N>
-```
-
-The process exits 1 whatever `<N>` is.
-
-The commit metadata dict is an `a{sv}`, and its entry order is part of the
-commit checksum, the dict being serialized in insertion order rather than
-sorted. The order is fixed and does not follow the command line:
-
-1. the keys the tree walk derives before the commit is assembled, `ostree.linux`
-   then `ostree.bootable`;
-2. the user keys, group by group: every `--add-metadata-string` in command-line
-   order, then every `--add-metadata`, then every `--keep-metadata`;
-3. the binding keys, `ostree.ref-binding` then `ostree.collection-binding`;
-4. the keys the commit assembly appends, `ostree.composefs.digest.v0` then
-   `ostree.sizes`.
-
-A key given twice is written twice: the dict really carries two entries of that
-name, and a user key may carry a name a binding key uses, which puts the two
-side by side. Two of the derived keys are exceptions:
-
-- `--bootable` removes every entry the command line supplied under
-  `ostree.linux` or `ostree.bootable`, so a commit carrying `--bootable
-  --add-metadata-string=ostree.linux=9.9.9` reaches the same object as one
-  carrying `--bootable` alone.
-- `--generate-composefs-metadata` stores the digest in the slot an entry named
-  `ostree.composefs.digest.v0` already stands in, whichever of groups 2 and 3
-  put it there, and removes every later entry of that name. The dict therefore
-  holds the derived digest once, ahead of the binding keys, and group 4 gets the
-  entry only where nothing else supplied the name. A supplied value reaches this
-  through any of `--add-metadata-string`, `--add-metadata`, and
-  `--keep-metadata`.
-
-`ostree.sizes` takes no such treatment: `--generate-sizes` appends its entry
-whatever the dict holds, so a commit naming both the option and
-`--add-metadata-string=ostree.sizes=...` carries two entries of that name.
-
-The tool holds the dict in a hash-ordered container while `--bootable` or
-`--generate-composefs-metadata` is given, so with either of those the order of
-the whole dict follows the key set rather than the list above. The port keeps
-the list above in every case; `conformance/cli-surface.md`, "P2" records the
-divergence and the key sets that expose it.
-
-- `--add-metadata-string=KEY=VALUE` splits at the first `=`, so a value may hold
-  further ones, and stores the value as an `s`. An empty value is accepted.
-- `--add-metadata=KEY=VALUE` splits the same way and reads the value in the
-  GVariant text form (see "The GVariant text form" above). The parsed value is
-  stored in host byte order and is not converted, so a numeric value reads back
-  byteswapped through `show --raw` and `show --print-metadata-key` and correctly
-  under `-B`.
-- `--keep-metadata=KEY` carries a key over from the resolved parent, byte for
-  byte. The resolved parent is `--parent` where it is given, `--orphan
-  --parent=<checksum>` included, and the branch tip otherwise.
-- `--add-detached-metadata-string=KEY=VALUE` writes an `a{sv}` to the commit's
-  `.commitmeta` file, in command-line order and with duplicates kept. It leaves
-  the commit checksum alone, so the same tree under it and without it reaches one
-  object.
-
-The refusals, each at exit 1:
-
-- an argument holding no `=` reports `error: Missing '=' in KEY=VALUE metadata
-  '<argument>'`, from all three options;
-- an empty key reports `error: Empty metadata key`, from
-  `--add-metadata-string` and `--add-metadata`. An empty key is accepted by
-  `--add-detached-metadata-string`;
-- a value the GVariant text reader refuses reports `error: Parsing
-  <KEY>=<VALUE>: <spans>:<reason>`, naming the whole argument and reporting
-  offsets into the value alone;
-- a `--keep-metadata` key the parent does not hold reports `error: Missing
-  metadata key '<key>' from commit '<checksum>'`;
-- a `--keep-metadata` with no resolved parent reports `error: Either --branch or
-  --parent must be specified when using --keep-metadata`, whether the parent is
-  absent because no branch was named, because the branch has no tip, or because
-  `--parent=none` was given.
-
-Their order, each fault observed alone and in pairs, is: the branch check; the
-declared-id conflict; `--parent` resolution; the `--keep-metadata` missing-parent
-check; the `--add-metadata-string` missing `=`; the `--add-metadata` missing `=`
-and its value parse; the `--add-detached-metadata-string` missing `=`; the
-`--keep-metadata` missing key; the body file; the editor; the tree; the
-timestamp; and last the empty-key check, which the dict assembly makes.
-
-`ostree.ref-binding` is an `as` holding the branch `-b` named together with
-every `--bind-ref=BRANCH` value, sorted byte-wise ascending with duplicates kept.
-The sort is over bytes rather than a locale collation, so uppercase sorts ahead
-of lowercase and `10` ahead of `2`. A commit that names no branch carries the
-empty array, and the key is present in that case too. No character-class check
-reaches a `--bind-ref` value: a name holding a space, a double slash, a leading
-`-`, a caret, a leading dot, a trailing slash, a tab, the empty name, and the 64
-lowercase hex characters `-b` refuses are all recorded as they stand, so the
-branch-name guard covers the ref the command writes and not the name it records.
-`--bind-ref` is accepted beside `--orphan`, where the array holds the bound names
-alone; `--bind-ref` alone names no branch, so a commit carrying it and neither
-`-b` nor `--orphan` draws the missing-branch line.
-
-`--no-bindings` writes no binding key at all -- an absent key rather than one
-holding an empty array -- and removes `ostree.collection-binding` with it. It
-overrides `--bind-ref`, so `commit -b X --no-bindings`,
-`commit --orphan --no-bindings`, and `commit -b X --no-bindings --bind-ref=Y`
-over one tree at one timestamp reach one commit object. It suppresses the
-automatic key alone: a binding added by `--add-metadata-string` or carried by
-`--keep-metadata` survives it.
-
-`ostree.collection-binding` is an `s` holding the repository's `[core]
-collection-id`, written after `ostree.ref-binding` in a repository that has one.
-`--bind-ref` does not touch it.
-
-The declared ownership. `--owner-uid=UID` and `--owner-gid=GID` replace the
-ownership every ingested entry records, independently of each other: the tree
-root's own metadata, every nested directory, every regular file, and every
-symlink. The permission bits and the xattr set are untouched. Each value is read
-as a C `int` with the base taken from its text -- a `0x` prefix hexadecimal, a
-leading `0` octal, decimal otherwise -- after optional leading whitespace and an
-optional sign, and the whole text must be consumed. The default for both is `-1`,
-so a negative value declares nothing and the source's own ownership stands
-(`--owner-uid=-1` and `--owner-uid=-2` alike; `-0` is the id zero). Recovered by
-committing one tree under each form and comparing commit checksums: `0x2a` and
-`053` are the ids `42` and `43`, `010` is `8`, and a declared id reaches the
-checksum in every repository mode, `bare-user-only` included, which stores no
-ownership yet hashes what was declared.
-
-A value no C `int` holds is refused while the options are read, ahead of the
-repository and ahead of every check the subcommand makes, at exit 1: `error:
-Cannot parse integer value “<value>” for --owner-uid` for a syntax the reader
-cannot hold (`abc`, an empty value, `5x`, a trailing space, `0x`, `--5`), and
-`error: Integer value “<value>” for --owner-gid out of range` above `2147483647`
-or below `-2147483648`. Both messages quote the value in typographic quotes
-(U+201C and U+201D).
-
-`--no-xattrs` records the empty xattr set for every entry, the tree root
-included, whatever the source carries.
-
-`--timestamp=TIMESTAMP` sets the commit timestamp, and wins over
-`SOURCE_DATE_EPOCH`, which the tool otherwise honors. The tool reads the value
-with a full natural-language date reader; the forms recovered by commit-checksum
-comparison are `@SECONDS` since the epoch (an optional sign and an optional
-fractional part, which is dropped: `@1234567890`, `@-1`, `@0.5`, `@ 0`, `@+5`),
-an absolute date and time in ISO 8601 or a space-separated rendering with or
-without a UTC offset (a value without one naming the tool's own local time), a
-ctime-style rendering, a relative expression (`now`, `yesterday`), and an empty
-value, which is today's midnight. A bare count of seconds is refused
-(`--timestamp=1234567890`), as is `@` alone and `@1e3`. A refused value reports
-`error: Could not parse '<value>'` at exit 1, in single quotes rather than the
-typographic pair the integer messages use. A pre-epoch instant is recorded as the
-unsigned timestamp field's two's-complement form, so `@-1` and
-`1969-12-31T23:59:59Z` are one commit.
-
-`--fsync=POLICY` sets the durability of the writes the commit makes, and takes
-the vocabulary above. The policy reaches the per-object writes, the publication
-step, and the ref write, and it changes no byte the repository stores, so a
-commit made under either policy prints one checksum and leaves one object store.
-
-`--table-output` replaces the checksum line with a seven-line `KEY: VALUE` block
-on standard output. The field names, their order, and their count are fixed. A
-field carries one space after its colon, no padding, and no unit; every line
-ends with a newline and no trailing space. Standard error stays empty and the
-exit status is 0. Corpus `C0` committed into an empty `bare` repository with
-`-b conformance -s x --timestamp=@1700000000`:
-
-```
-Commit: 7f00c81575e97a12c9d34d44c232e56236d40be76fd457abd2d6d829d7f05592
-Metadata Total: 5
-Metadata Written: 4
-Content Total: 4
-Content Written: 4
-Content Cache Hits: 0
-Content Bytes Written: 45
-```
-
-That corpus holds two directories that share one dirmeta, three regular files of
-23, 0, and 22 bytes, and one symlink. Corpus `C0` is described in
-`conformance/README.md`. The fields:
-
-- `Commit` -- the new commit's checksum, the value the plain form prints alone.
-- `Metadata Total` -- the metadata objects the commit offered to the object
-  store, counted before dedup, with each directory's dirmeta counted for that
-  directory: two dirtree, two dirmeta, and the commit object.
-- `Metadata Written` -- the metadata objects stored. The two directories share
-  one dirmeta, so the count is two dirtree, one dirmeta, and the commit object.
-- `Content Total` -- the content objects the commit offered, counted before
-  dedup. An object a devino-cache hit resolves is never offered, so it leaves
-  this count.
-- `Content Written` -- the content objects stored.
-- `Content Cache Hits` -- the content objects a devino-cache hit resolved.
-- `Content Bytes Written` -- the payload byte counts of the stored regular
-  files, summed before any compression the mode applies: 23 + 0 + 22 here. A
-  symlink contributes nothing, and the count is the payload length rather than
-  the stored `.filez` length, which for a random payload runs larger.
-
-A second commit of a tree the repository already holds keeps both totals, prints
-`Metadata Written: 1` for the commit object, and prints zero for every content
-field. The block's shape holds across `archive`, `bare`, and `bare-user`.
-
-`--statoverride=PATH` names a file of mode changes, one entry per line:
-
-```
-[=]<decimal mode><one space><absolute in-tree path>
-```
-
-A sample, and what it does to a tree holding `/plain.txt` at 0644, `/dir2/b.txt`
-at 0644, `/grpx` at 0754, and `/dir1` at 0700:
-
-```
-=384 /plain.txt
-=448 /dir2/b.txt
-8 /grpx
-=511 /dir1
-```
-
-`/plain.txt` becomes 0600, `/dir2/b.txt` becomes 0700, `/grpx` stays 0754
-(decimal 8 is 0o10, which its mode already carries), and `/dir1` becomes 0777.
-The reading rules:
-
-- The mode is read in base 10, with an optional leading sign. A leading `=`
-  states the permission bits, giving `(mode & S_IFMT) | value`; without it the
-  value is ORed into the mode, giving `mode | value`. The file-type bits
-  therefore survive both forms, and a value carrying bits inside the file-type
-  field renames the type the mode holds.
-- The tool reads the field through a C `double` reader, so it also takes a
-  hexadecimal literal (`0x1ff` gives decimal 511, which is 0777), a decimal
-  point and an exponent (`1e3` gives decimal 1000 and `.7e3` gives decimal 700,
-  which over a 0644 file reach 01754 and 01674), and turns a
-  value past the 32-bit range into `0x80000000` (`inf`, `nan`, `1e100`,
-  `4294967296`, and `4294967295` all give mode 020000000644 over a 0644 file).
-  Those forms sit outside the documented format, which is a mode in decimal, and
-  the out-of-range conversion is platform-defined. The port reads decimal alone;
-  the difference is recorded in `conformance/cli-surface.md`, "P2".
-- The separator is exactly one space (0x20). Everything after it is the path,
-  further spaces included. A tab is not a separator.
-- The path is absolute and rooted at the committed tree, with no trailing slash.
-  `/`, `/plain.txt`, and `/dir1/sub/deep.txt` all match; `plain.txt`,
-  `./plain.txt`, and `/dir1/` never do.
-- An entry applies to exactly one entry of the tree and is not recursive. The
-  `=` form applies to regular files, to directories, to symlinks, and to the
-  walk root, and it applies in every source that offers the path.
-- The OR form reaches one entry of the tree per run. The first entry any source
-  offers under the path spends the entry, and a later source under that path
-  keeps the mode it brought. A directory below the walk root spends the entry
-  and takes no value from it, leaving the mode as the source found it; an
-  archive member is the exception, where the OR value reaches a directory as
-  well. Over `/dir1` at 0700, `16 /dir1` gives 0700 from a `dir=` walk and from
-  a `ref=` source, 0720 from a `tar=` source, and `=8 /dir1` gives 0010 from all
-  three. Over two sources that both hold `/dir1` at 0700, `16 /dir1` with
-  `--tree=dir=A --tree=tar=B` gives 0700, the walk having spent the entry before
-  the archive offered the path, and with `--tree=dir=C --tree=tar=B`, where `C`
-  holds no `/dir1`, gives 0720. A spent entry counts as reached, so it draws no
-  unmatched report.
-- A mode field holding no digit is the value zero, so `abc /plain.txt` changes
-  nothing and `= /plain.txt` gives mode 0.
-- Blank lines are ignored, a missing final newline is accepted, and there is no
-  comment syntax.
-- A path may be named more than once. Each form keeps one entry per path, the
-  value of the last line naming the path, and the OR form stands ahead of the
-  `=` form: where a path carries an entry of each form, the OR value alone
-  reaches the mode, whichever order the file states the two lines in. Over a
-  0644 file: `8 /f` then `16 /f` gives 0664, `=448 /f` then `=511 /f` gives
-  0777, `448 /f` then `=511 /f` gives 0744, `=511 /f` then `448 /f` gives 0744,
-  `=511 /f` then `0 /f` gives 0644, and `1 /f`, `=448 /f`, `2 /f` gives 0646.
-  Over a directory below the walk root of a `dir=` walk or of a `ref=` source
-  the OR form states no mode, so the `=` entry reaches it: over `/dir1` at 0700,
-  `16 /dir1` then `=8 /dir1` gives 0010. Over an archive member the OR form
-  states a mode, so it stands ahead as it does elsewhere and the same pair gives
-  0720.
-- The option given more than once takes the last value; the earlier files are
-  not read at all.
-
-`--skip-list=PATH` names a file of paths to leave out, one absolute in-tree path
-per line:
-
-```
-/plain.txt
-/dir2
-```
-
-A listed directory prunes its whole subtree, so `/dir2` removes `/dir2/b.txt`
-with it. A symlink can be listed. Blank lines are ignored, and the option given
-more than once takes the last value. A path may be named more than once and
-counts as one entry, which the unmatched report below states once. The path
-spelling is exact: a trailing space, a missing leading slash, and a trailing
-slash all match nothing. Listing every child of the root gives a commit whose
-tree holds the root alone. Listing `/` prunes the walk root, which leaves nothing
-to commit, and reports `error: Can't commit an empty tree` at exit 1. With
-`--base` the base is still the bottom layer under a pruned walk root, so the
-commit is written and holds the base tree unchanged. The pruned walk accounts no
-object, so such a commit carries no `ostree.sizes` key even under
-`--generate-sizes`. The tool carries two steps under the pruned walk that the
-port leaves out: `--consume`
-attempts the source removal, which takes an empty source directory away and over
-one holding an entry reports `error: unlinkat(<path>): Directory not empty`; and
-a `tar=` source is read, so a file that is not an archive reports `error:
-archive_read_open_filename: Unrecognized archive format`. Both are recorded in
-`conformance/cli-surface.md`, "P2".
-
-Both files are checked for entries the walk never reached. Every `--skip-list`
-entry is checked; only the `--statoverride` entries without a `=` are, so an `=`
-entry matching nothing is ignored. A path the skip list prunes counts as
-reached, the walk reaching the entry and pruning it there: over a skip list
-holding `/dir1`, both that entry and a `16 /dir1` statoverride entry are
-matched. A path inside a directory the skip list pruned counts as unmatched, the
-walk never having descended into it: over the same skip list, `/dir1/a.txt`,
-`/dir1/sub`, and `/dir1/sub/deep.txt` are unmatched in either file. A path
-neither file's walk reaches at all is unmatched, so a path both files name that
-the tree does not hold draws a report. The walk root counts as reached, so over
-a skip list holding `/` a `16 /` statoverride entry is matched and the
-empty-tree refusal is left alone to report. The order the command line gives the
-two options changes none of this. The report is one line per unmatched path and
-then a summary line, on standard error, at exit 1, with standard output empty
-and no ref written:
-
-```
-Unmatched statoverride path: /nope.txt
-error: Unmatched statoverride paths
-```
-
-```
-Unmatched skip-list path: /nope.txt
-error: Unmatched skip-list paths
-```
-
-The `<path>` is the raw text after the first space, so ` 448 /plain.txt` reports
-`Unmatched statoverride path: 448 /plain.txt`. A path named more than once by
-either file gets one line, and an `=` entry over a path an OR entry also names
-adds no line of its own. The statoverride check stands ahead of the skip-list
-check whichever order the command line gives the two options, and both stand
-ahead of the empty-tree refusal. The tool emits the per-path lines in a hash
-order rather than the file order, which `conformance/cli-surface.md`, "P2"
-records as a divergence.
-
-A statoverride line with no space is refused before the walk with `error:
-Malformed statoverride file (no space found)`. A control file that does not open
-is refused with `error: openat(<path>): <reason>`, naming the path as the command
-line spelled it, and a directory with `error: Is a directory`, which carries no
-path. An empty file of either kind is accepted and changes nothing.
-
-Either control file must hold UTF-8, and a NUL byte counts as invalid. A single
-invalid byte anywhere in the file reports `error: Invalid UTF-8` at exit 1, and
-that check stands ahead of everything else the command does: ahead of the walk,
-ahead of the unmatched-entry report of the other control file, and ahead of a
-tree path that does not open. Both files are checked, and the report names
-neither the file nor the line.
-
-The walk of a filesystem source reads each directory in the order the
-filesystem lists it, and it enters a subdirectory when it reaches it. The first
-entry that fails in that order decides the refusal. For each entry the tool
-runs these steps in this order, each observed with an entry that fails it:
-
-1. It reads the entry with `fstatat`, no-follow. A failure reports `error:
-   fstatat(<name>): <reason>`. A directory with read permission and no search
-   permission, mode 0644, therefore stops at its first entry, and a skip list
-   that names that entry alone does not prevent the refusal.
-2. It checks the type. A fifo and a unix socket report `error: Not a regular
-   file or symlink: <name>`. A skip list that names the entry does not prevent
-   the refusal. No device node was observed, because a device node needs real
-   root.
-3. It applies `--skip-list`. The tool does not open an entry the skip list
-   names.
-4. It opens the entry. A regular file that does not open reports `error:
-   openat(<name>): <reason>`, and a directory that does not open reports
-   `error: opendir(<name>): <reason>`. A walk root that does not open
-   reports `error: opendir(<path>): <reason>`.
-
-`<name>` is the entry's own name and not its path, so `sub/d/y` reports `y`.
-Each refusal exits 1 with standard output empty, no object in `objects/`, and no
-ref written. A regular file at mode 0000, an empty file at mode 0000, and a
-file at mode 0200 each report `openat(<name>): Permission denied`, and
-`--no-xattrs`, `--canonical-permissions`, and `--owner-uid=0 --owner-gid=0` do
-not change this. A directory at mode 0000, empty or not, and a directory at
-mode 0311 each report `opendir(<name>): Permission denied`. A skip list that
-names the file at mode 0000, the directory at mode 0000, the directory at mode
-0311, or the directory at mode 0644 gives a commit at exit 0, and the commit
-checksum is that of the tree without the entry. Observed with `ostree` 2026.1
-as uid 1000 in `archive`, `bare`, `bare-user`, and `bare-user-only`. In `bare`
-as a user other than root, `--canonical-permissions` and `--owner-uid=0` fail
-first on the owner change of an earlier object, with `error: Writing content
-object: fchown: Operation not permitted`.
-
-A symlink whose target is not valid UTF-8 is committed by the tool at exit 0.
-The tool writes `g_variant_new_string(): requires valid UTF-8` to standard
-error on a `GLib-CRITICAL` line, twice in `archive` and once in `bare`,
-`bare-user`, and `bare-user-only`, and it hashes the target as the 15-byte
-string `[Invalid UTF-8]`. In each of the four modes the commit checksum is
-therefore that of the same tree with the literal target `[Invalid UTF-8]`. In
-`archive` the stored object holds that string, so a checkout gives a symlink
-to `[Invalid UTF-8]`. In `bare`, `bare-user`, and `bare-user-only` the object
-stored under that name holds the original target bytes: `ostree ls` reads the
-original target back, and a checkout gives a symlink to it. `ostree fsck`
-passes in each mode. The port refuses such a target with `error: invalid
-format: symlink target is not valid UTF-8` at exit 1 and writes no object and
-no ref (`conformance/cli-surface.md`, "P2").
-
-The port reads each entry with `fstatat` and checks its type ahead of
-`--skip-list`, as the tool does. It refuses a fifo and a socket with `error:
-unsupported: unsupported file type for entry "<name>"`, and it reports an entry
-that does not open with `error: i/o error: <reason> (os error <n>)`, which names
-no path. It lists a whole directory before it enters a subdirectory, so over a
-tree with more than one failing entry the two implementations can report
-different entries. The port differs in one outcome. Without `--no-xattrs` it
-reads the extended attributes of each entry when it lists the directory, ahead
-of the skip list, and that read opens the entry. So a skip list that names a
-regular file or a directory that does not open does not prevent the refusal:
-the port reports `error: i/o error: Permission denied (os error 13)` at exit 1
-where the tool commits. A directory at mode 0644 opens, so a skip list that
-names one gives a commit in both. With `--no-xattrs` the port opens no entry
-the skip list names, and it commits in each case with the commit checksum of
-the tool (`conformance/cli-surface.md`, "P2").
-
-`--mode-ro-executables` clears the write bits of every executable regular file:
-where `mode & 0o111` is non-zero, `mode &= ~0o222`. Any one of the three execute
-bits triggers it and all three write bits go, so 0766 becomes 0544 and 0621
-becomes 0401. The setuid, setgid, and sticky bits survive: 04755 becomes 04555
-and 01777 becomes 01555. A regular file with no execute bit is untouched, and so
-are directories, a world-writable one included, and symlinks.
-
-The three mode modifiers run in a fixed order: `--mode-ro-executables`, then
-`--statoverride`, then the `--canonical-permissions` reduction. The first two
-commute with each other, one being an AND mask and the other testing bits the
-mask keeps; `--statoverride` is the one that assigns or ORs, so it is the pair
-with the reduction that shows the order. Over a tree holding `/f0644` at 0644,
-`/f0700` at 0700, `/f0555` at 0555, and `/dir1` at 0700, beside
-`--canonical-permissions`:
-
-- `=511 /f0644` gives `-00755`, the reduction masking the 0777 the entry states.
-- `=2048 /f0700` gives `-00000`, the setuid bit the entry states not surviving
-  the mask.
-- `146 /f0555` (decimal 146 is 0o222) gives `-00755`.
-- `=511 /` gives `d00755` for the root, and `=511 /dir1` gives `d00755`.
-
-The reverse order would give 0777, 04000, 0777, and 0777. Without
-`--canonical-permissions`, `--statoverride` holding `146 /roexec` over a 0555
-file reaches 0777 rather than the 0555 the reverse order against
-`--mode-ro-executables` would give.
-
-`--skip-if-unchanged` compares the walked tree against the resolved parent -- the
-commit `--parent` names, else the tip of `--branch`. Both the root contents
-checksum and the root metadata checksum take part; the commit's own metadata does
-not, so a different `-s` or an added `--add-metadata-string` over an unchanged
-tree is still skipped. Where the two match, the parent's checksum is printed on
-standard output with a trailing newline, standard error stays empty, the exit
-status is 0, and no ref is written: a ref that existed stays where it stood and
-one that did not is not created. Where there is no parent -- a fresh branch,
-`--parent=none`, or `--orphan` -- the commit is written as usual. The walk runs
-either way, so an unmatched `--statoverride` entry still fails the command at
-exit 1.
-
-The derived metadata. Three options read the tree the commit carries and store
-what they find in the commit's own metadata dict.
-
-`--generate-sizes` writes `ostree.sizes` (see "Metadata object formats"). An
-archive repository alone holds the key; in `bare`, `bare-user`, and
-`bare-user-only` the option is accepted, writes no key, prints nothing on
-standard error, exits 0, and leaves the commit checksum equal to the same commit
-without it. Over a single source the key covers the whole tree, so a second
-commit onto a branch lists the objects that deduplicated against the first as
-well. The option reaches the tar form too: `--tree=tar=PATH` produces the key the
-same way.
-
-Over a source list the key is scoped, and the scope is what a multi-source
-commit's checksum turns on. Recovered by reading the key back over ten source
-lists, each entry matched against the objects `ls -R -C` reports for the tree:
-
-- a content object counts where the LAST `--tree` source contributed it. A
-  content object an earlier source contributed leaves the key even where it
-  survives into the committed tree, so `--tree=dir=t1 --tree=dir=t2` lists only
-  `t2`'s files and `--tree=dir=t1 --tree=dir=<empty directory>` lists no file at
-  all;
-- a directory object counts where any source contributed it or the tree
-  serialization wrote it, and it stays as later sources open;
-- a `--base` layer contributes nothing, so a subtree that reaches the commit
-  from the base unread is absent from the key;
-- a `ref=` source contributes every object of its own tree, whether the overlay
-  reads it or reuses the stored checksum;
-- the key is then narrowed to the objects the committed root reaches, so an
-  object a later source replaced is absent whatever contributed it.
-
-The port carries this as `Transaction::begin_tree_source`, called once per
-`--tree` source.
-
-`--bootable` writes `ostree.linux` and `ostree.bootable`. The value of
-`ostree.linux` is the name of the one directory under `/usr/lib/modules` in the
-committed tree that holds an entry named `vmlinuz`. The rule, each shape
-observed:
-
-- the search is exactly one level deep: a `vmlinuz` directly under
-  `/usr/lib/modules`, and one nested a further level down, are both unseen;
-- the entry's type is not read: a regular file, a symlink whose target the tree
-  does not hold, and a directory named `vmlinuz` each count as a kernel;
-- an entry under `/usr/lib/modules` that is not a directory takes no part, so a
-  stray file there and a symlink to a kernel directory are both ignored;
-- an initramfs is neither required nor consulted.
-
-The tree the option reads is the committed tree, so `--skip-list` pruning
-`/usr/lib/modules` leaves no kernel to find. The five refusals, each on standard
-error at exit 1 with standard output empty and no object published:
-
-```
-error: No such file or directory: /usr
-error: No such file or directory: /usr/lib
-error: No such file or directory: /usr/lib/modules
-error: No kernel found in /usr/lib/modules
-error: Multiple kernels found in /usr/lib/modules
-```
-
-The first three name the first component of the path the tree does not hold. A
-component the tree holds as something other than a directory reports `error: Not
-a directory`, which carries no path. Reference build 2026.1 reaches that message
-for `/usr` and `/usr/lib` and dies on an assertion where `/usr/lib/modules`
-itself is the non-directory, a regular file and a symlink alike
-(`conformance/cli-surface.md`, "P2").
-
-`--generate-composefs-metadata` writes `ostree.composefs.digest.v0`, an `ay`
-holding the 32-byte fs-verity digest of the tree's composefs image (see
-"composefs"). The image derives from the committed tree alone, so a repository in
-`archive`, `bare`, or `bare-user` holding one tree reaches one digest and one
-commit checksum; `bare-user-only` canonicalizes the tree and so reaches another.
-
-The three stand after the walk. Their order against the rest, each fault observed
-alone and in pairs: the control-file reports, the empty-tree refusal, and
-`--skip-if-unchanged` all stand ahead of the kernel search, so an unchanged tree
-under `--bootable --skip-if-unchanged` prints the parent's checksum and exits 0
-whether or not the tree holds a kernel. The kernel search stands ahead of the
-timestamp and ahead of the empty-key check.
-
-#### The tree sources
-
-The tree a commit records is built from an ordered source list:
-
-1. `--base=REV`, where one is given, is the bottom layer.
-2. Each `--tree=KIND=VALUE` in command-line order overlays the result.
-3. Where no `--tree` is given, the positional `PATH` is the one source.
-
-A positional `PATH` beside any `--tree` is ignored: it is not opened, not
-stat'ed, and the command exits 0. Every positional after the first is ignored
-the same way.
-
-`--tree` splits its value at the first `=`. The part before it names the kind
-and the part after it is the value:
-
-- `dir=PATH` -- a directory on the filesystem, opened no-follow, so a symlink
-  naming a directory is refused. A trailing slash is accepted.
-- `tar=PATH` -- an archive. `-` and `/dev/stdin` name standard input.
-- `ref=REV` -- any revision a `rev-parse` reads: a ref name, a checksum, or
-  either with a `^` ancestry suffix. The `REF:/path` subtree syntax is not a
-  revision and is refused as an invalid refspec.
-
-Overlaying is a recursive per-path merge, and the later source wins:
-
-- Directory over directory: the children union, so a child only the earlier
-  source held survives.
-- Directory metadata: the later source's dirmeta replaces the earlier one
-  whole. The extended attributes are replaced with it and are never unioned.
-- File over file: the later file replaces the earlier one whole.
-- A name that is a directory in one source and a file in another is refused:
-  `error: Can't replace directory with file: <name>` where the later source
-  holds the file, and `error: Can't replace file with directory: <name>` where
-  it holds the directory. The name is the entry's own name and not its path, so
-  `n1/a/b/p` against `n2/a/b/p` reports `p`. Both exit 1 and write no commit.
-
-`--base=REV` differs from `--tree=ref=REV` in one way: no commit modifier
-reaches an entry that survives from the base, so such an entry keeps the mode,
-the ownership, and the extended attributes the base recorded, where an entry
-from any `--tree` -- `ref=` included -- is shaped by `--owner-uid`,
-`--owner-gid`, `--canonical-permissions`, `--no-xattrs`, `--statoverride`,
-`--skip-list`, and `--mode-ro-executables`. `--base` is applied first whatever
-its position on the command line, given more than once keeps the last value,
-and is legal with no `--tree` beside it.
-
-`--consume` empties each filesystem source as that source is walked, before the
-commit object is written and before the ref moves, so a later failure leaves the
-files gone and no commit made. It removes the source directory itself as well,
-unless the path is spelled exactly `.`; the test is on the text the value
-carries, so `./` and an absolute path naming the working directory are both
-removed. It empties the source whatever a walk filter kept out of the commit: a
-path `--skip-list` names is removed with the rest, and the tree it sits in is
-removed too, so the commit is written and the whole source is gone. A removal
-that fails aborts the commit and reports the entry's own name as
-`unlinkat(<name>): <reason>`, so a source holding a mode-0500 directory reports
-`unlinkat(<entry inside it>): Permission denied` at exit 1, `--consume .` from
-the parent directory succeeds, and `--consume ./` from inside the directory
-reports `unlinkat(./): Invalid argument` at exit 1. The option has no effect on a
-`ref=` or a `tar=` source, which are left as they stand.
-
-A source list that supplies no root directory leaves nothing to write and
-reports `error: Can't commit an empty tree` at exit 1.
-
-The fault order among these options, each fault observed alone and in pairs: the
-declared ids and the fsync policy are read first, ahead of the repository and
-ahead of the missing-branch check; then the `--statoverride` file and the
-`--skip-list` file, in that order, whose open, read, and syntax faults all stand
-here; then the missing-branch check; then the
-refusal of a non-zero declared id beside `--canonical-permissions` (`error:
-Cannot specify both --canonical-permissions and non-zero --owner-uid`, naming
-`--owner-uid` where both are non-zero, and accepting a declared zero); then
-`--parent` resolution; then the metadata options and the body file; then
-`--base` resolution; then the sources, one at a time and in order, each opened
-as it is reached, so a source `--consume` has already emptied stays gone when a
-later one does not open; then the timestamp. A refused timestamp publishes no
-object, so the object store is empty afterwards, unlike the branch-name guard,
-which stands after the tree is written. A refused timestamp does not put back
-what `--consume` removed. Inside the first step the tool reads the options in
-command-line order, so an invocation carrying both a refusable id and a
-refusable policy reports the leftmost of the two.
-
-#### Signing
-
-Five options sign the commit the invocation writes. Their signatures land in the
-commit's detached metadata under the rules "Signing details" states, before the
-ref moves.
-
-- `--gpg-sign=KEY-ID` adds one `ostree.gpgsigs` element per occurrence, in
-  command-line order, with no deduplication. The key id is resolved by the
-  GnuPG installation, in the home directory `--gpg-homedir` names or the one
-  GnuPG resolves for itself, which honors `GNUPGHOME`. The selector must be at
-  least eight bytes long and must name exactly one secret key; the three
-  outcomes each carry their own line, below.
-- `--gpg-homedir=HOMEDIR` names the home directory `--gpg-sign` resolves its
-  keys in, and it wins over `GNUPGHOME`. In the port it names the same
-  directory for `--sign` and `--sign-from-file` under `--sign-type=gpg`, an
-  engine this tool build does not carry
-  (`../conformance/cli-surface.md`, "P2"). Alone, with no key to resolve, it is
-  accepted and changes nothing.
-- `--sign=KEY_ID` adds one signature per occurrence under the engine
-  `--sign-type` names, in command-line order, with no deduplication. For
-  `ed25519` the value is the base64 of the 64-byte secret key. In the port,
-  under `--sign-type=gpg`, a `--sign` and a `--sign-from-file` key are
-  selectors with the rules of a `--gpg-sign` selector. The port resolves
-  each of them before the first signature, and it signs with the
-  fingerprint that the lookup gives.
-- `--sign-from-file=PATH` adds one signature per occurrence, its key read from
-  the first line of the file. The rest of the file is ignored, a trailing
-  newline is optional, and surrounding whitespace is skipped by the decode.
-- `--sign-type=NAME` names the engine `--sign` and `--sign-from-file` use. It
-  defaults to `ed25519`, the match is exact and case sensitive with no
-  trimming, and the last occurrence wins. It does not reach `--gpg-sign`, whose
-  engine is fixed.
-
-`--sign` and `--sign-from-file` are two lists, not one. Every `--sign` key signs
-first and every `--sign-from-file` key after it, whatever the command line's
-order, and both stand before the `--gpg-sign` keys.
-
-The base64 decode a `--sign` value goes through skips every character outside
-the alphabet, so a value holding prose decodes to some byte count rather than
-failing as text. A padding character counts toward its group and carries the
-value zero. Three bytes come out of each complete four-character group, and each
-of that group's last two characters that is a padding character removes one of
-them again; a trailing group short of four characters contributes nothing.
-Padding therefore acts per group and per position:
-
-- `AAAA=` decodes to three bytes, the padding character opening an incomplete
-  group.
-- `AAA=` decodes to two and `AA==` to one.
-- `AA=A` decodes to two, the padding character sitting third in a complete
-  group, and `A=AA` to three, it sitting second.
-- `AA==AA==` decodes to two, one byte from each of its two groups.
-- `AAAAAAA====` decodes to five.
-
-A decoded length other than 64 reports `error: Invalid ed25519 secret key:
-Ill-formed input: expected 64 bytes, got N bytes`, naming the length it reached,
-so `--sign=zzz` reports zero bytes and `--sign=not-base64!!!` reports six. One
-stray character appended to a pasted 88-character key opens an incomplete group,
-so the key still decodes to 64 bytes and signs.
-
-`--sign-from-file` reads the first line as bytes and places no encoding
-requirement on it, so a line holding a byte sequence that is not UTF-8 reaches
-the decode and its alphabet characters carry the result. A NUL byte ends the
-line ahead of the newline: a file whose first line is `AAAA\0BBBB` yields the
-key `AAAA` and reports three bytes.
-
-The other refusals, all at exit 1 with standard output empty and no object
-published:
-
-```
-error: Requested signature type is not implemented
-error: dummy signature type is only for ostree testing
-error: Unable to lookup key ID <KEY-ID>: GPGME: Invalid value
-error: No gpg key found with ID <KEY-ID> (homedir: <path>)
-error: gpg key id <KEY-ID> ambiguous (homedir: <path>). Try the fingerprint instead
-error: Error opening file <path>: No such file or directory
-error: Error opening file <path>: Is a directory
-error: Operation not supported
-```
-
-The three GPG lines answer the three `--gpg-sign` outcomes. A selector under
-eight bytes draws the "Invalid value" line without a key lookup, whatever it
-would have named, so `--gpg-sign=` and a short user-id substring both draw it. A
-selector of eight bytes or more goes to the key lookup, which accepts every
-spelling GnuPG accepts -- a short key id, a long key id, a fingerprint in either
-case, a `0x` prefix, a trailing `!`, a bare email, a `<email>` or `=uid` exact
-form, and a user-id substring. A selector naming no secret key draws the "No gpg
-key found" line, and one naming more than one draws the "ambiguous" line. A
-selector shaped like a GnuPG option is a key selector like any other: it names no
-secret key and draws the "No gpg key found" line, and the home directory such a
-selector spells out is not opened and gains no keybox and no trust database. The
-port reaches the same outcome by passing the selector after a `--` terminator,
-which is what holds it to a key name.
-
-The homedir term of the two lookup lines is the `--gpg-homedir` path, or the
-literal `<default>` where the option is absent. A home directory that does not
-exist, one that cannot be read, and one holding no matching key all draw the
-"No gpg key found" line. The last line answers `--sign-from-file=` with an
-empty path. The `<path>` term of the two file-open lines is the absolute path in
-the tool and the path as the command line gave it in the port
-(`../conformance/cli-surface.md`, "P2").
-
-The signing step's own fault order, each fault observed alone and in pairs:
-`--sign-type` is read first, then every `--sign` key in order, then every
-`--sign-from-file` path in order, then every `--gpg-sign` key in order.
-`--sign-type` is read only where `--sign` or `--sign-from-file` names a key, so
-a name no engine carries commits successfully in a run that signs nothing, and
-`--gpg-sign` alone is unaffected by it.
-
-The step as a whole stands after the tree is written and after the branch-name
-guard, and before the ref write and the publication. So a tree path that does
-not open, a refused timestamp, and a branch name the guard refuses each win over
-a key that cannot sign, and a key that cannot sign wins over a ref write that
-cannot happen. The branch-name term is observable over a name the ref-name rule
-refuses, `bad//name`, a name with a space, and a name with a caret among them;
-both implementations apply the same rule.
-
-### `refs`
-
-The default form prints one refspec per line. The listing covers `refs/heads`,
-named by the ref name, and `refs/remotes`, named `remote:name`; `refs/mirrors`
-is excluded. A ref stored as an alias is listed by its own name, resolved
-through the link. The whole set is sorted by refspec, so `alias1`,
-`deep/nest/ing`, `origin:test/main`, `other`, and `test/main` print in that
-order: one plain byte-wise ordering over the refspec strings, with no grouping
-by ref root.
-
-A `PREFIX` argument keeps the refs equal to it or nested under it, and the
-printed name drops the prefix and the `/` after it. An exact match prints the
-whole refspec: `refs test` prints `main` for `test/main`, and `refs test/main`
-prints `test/main`. A remote's refspec keeps its `remote:` part while the ref
-name below it is stripped, so `refs origin:rr` prints `origin:x` for
-`origin:rr/x` and `origin:deep/y` for `origin:rr/deep/y` -- neither of which
-names a ref. `--list` suppresses the stripping and prints the whole refspec.
-
-More than one `PREFIX` is accepted. The output is grouped by prefix in the order
-the prefixes were given, sorted within each group, and a ref two prefixes match
-prints once per match: `refs mid zulu alpha` prints `one`, `two`, `zulu`,
-`alpha`, and `refs mid mid` prints `one`, `two`, `one`, `two`. The prefix that
-stripped a name is the one that selected that row, not the first one matching
-it, so `refs test test/main` prints `main` and then `test/main`. A prefix
-matching nothing prints nothing and exits 0.
-
-Each `PREFIX` is validated as a refspec, in the default listing, `--list`, `-r`,
-`-A`, and `--delete`. A name the ref rule refuses ends the invocation with exit
-1: the tool reports `error: Listing refs: Invalid refspec <PREFIX>`, and the port
-reports `error: Invalid refspec <PREFIX>`, the one message it gives that rule
-wherever a name reaches it. The refusals observed are `test/`, `/test`, `a//b`,
-`.`, `..`, `test/main/`, `test/../main`, an empty argument, `:`, `:rr`,
-`origin:rr/`, `origin:..`, and a remote half holding a `/` such as `or/igin:rr`.
-Both apply the ref-name rule "Ref name validation" above records, so both also
-refuse `tes~t`, `te st`, `.test`, `a*`, `-a`, and `origin::rr`.
-
-The check runs where each prefix is taken, so a valid prefix ahead of a refused
-one keeps its effect: `refs test 'bad/'` prints the rows `test` matched and then
-the refusal, and `refs --delete deep 'bad/'` removes what `deep` matched and
-leaves the rest.
-
-A `PREFIX` also names a path below `refs/`: the ref name under `refs/heads`, the
-ref name under `refs/remotes/<remote>`, or the remote's own directory for a
-whole-remote prefix. That path is the directory a listing enumerates, and it is
-read before the prefix filters anything, in the default listing, `--list`, `-r`,
-`-A`, and `--delete`. A path that runs through a ref file ends the invocation
-with exit 1: the tool reports `error: Listing refs: fstatat(<path>): Not a
-directory`, naming the path below the repository, and the port reports `error:
-i/o error: Not a directory (os error 20)`, the one message it gives that
-condition (`conformance/cli-surface.md`, "P1"). Both print the same standard
-output and leave the same refs tree. The refusals observed are a prefix whose
-last component sits under a ref file (`plain/x` over the ref `plain`), one whose
-inner component does (`plain/x/y`), one reaching the ref file through an alias
-symlink (`al/x`, where `refs/heads/al` links to `test/main`), and the same forms
-under `refs/remotes/<remote>` (`origin:rr/x/y` over the ref `origin:rr/x`). A
-path naming nothing prints nothing and exits 0, which is what a prefix matching
-no ref does. This check runs per prefix too, and after the refspec rule, so
-`refs test plain/x` prints the `test` rows and then the refusal, and `plain/x/`
-reports the refspec refusal in both.
-
-With `-c` a positional argument is a collection id, so no path is read.
-
-A whole-remote prefix -- a `<remote>:` prefix whose ref half is empty or `.` --
-names every ref of that remote, so `refs origin:` and `refs origin:.` each print
-every ref of `origin`. The ref half stands for the remote's root, so no ref name
-is stripped and every row keeps its whole refspec. A whole-remote prefix matching
-no ref prints nothing and exits 0.
-
-Under `--delete` each prefix is matched against the ref set as the prefixes ahead
-of it left it: `refs --delete origin:rr origin:` empties the remote with the first
-prefix, so the whole-remote prefix matches nothing and the invocation exits 0,
-while `refs --delete origin:rr/deep origin:` leaves `origin:rr/x` for the
-whole-remote prefix to match and is refused.
-
-For such a prefix the tool builds each name it prints or deletes by joining the
-ref half with the name below it, and the `.` of that join stays in the name:
-`refs --list origin:` prints `origin:./rr/x`, `refs -A origin:` prints
-`./rr/remal`, and `refs --delete origin:` reports `error: Invalid refspec
-origin:./rr/x` and exits 1 after removing nothing, naming one matched ref in its
-own directory order. The port prints the refspec `origin:rr/x` in both listings,
-and refuses the same delete naming the prefix as given (`error: Invalid refspec
-origin:`), which leaves the refs tree the tool leaves
-(`conformance/cli-surface.md`, "P1").
-
-With `-c` a positional argument is a collection id, and the tool validates it
-under the collection-id rule instead (`error: Listing refs: Invalid collection ID
-<id>`).
-
-`-r`/`--revision` appends a single tab and the 64-character commit checksum to
-each line.
-
-`-A`/`--alias` lists the aliases alone, as `<name> -> <target>`. The target is
-the symlink body with its leading `../` components removed, so an alias at
-`refs/heads/test/al2` pointing at `../zulu` prints `zulu` and one pointing at
-`sub/deep` prints `sub/deep`. The name is never stripped, and `-r` adds nothing.
-
-A `PREFIX` that names a ref exactly is answered by that one ref, printed as
-`<PREFIX> -> <commit checksum>`, for every kind of ref: `refs -A al` prints
-`al -> <checksum>` for an alias, and `refs -A test/main` and
-`refs -A origin:rr/x` print the same shape for a plain ref and for a remote ref,
-neither of which is an alias. A bare 64-character checksum resolves to no ref
-here, so it prints nothing. Every other prefix filters, keeping the aliases
-nested under it: with an alias at `grp/deep/z`, both `refs -A grp` and
-`refs -A grp/deep` print `grp/deep/z -> test/other`. A prefix naming an alias
-whose target ref is missing resolves to no ref and holds no alias below itself,
-so it prints nothing.
-
-The tool names an alias under `refs/remotes/<remote>/` by its path below the
-remote, so an alias at `refs/remotes/origin/rr/remal` prints as `rr/remal`,
-dropping the remote and producing a name that resolves to nothing; the port
-prints the `origin:rr/remal` refspec instead. Such an alias arrives by
-out-of-band mutation alone, since `-A --create` refuses a NEWREF naming a remote
-in both implementations.
-
-The port applies that rule to the target as well, once the link leaves the
-alias's own ref root -- `refs/heads` for a local alias,
-`refs/remotes/<remote>` for a remote one -- and prints the target ref's refspec:
-an alias at `refs/heads/xal` pointing at `../remotes/origin/rr/x` prints
-`origin:rr/x`, where the stripped body `remotes/origin/rr/x` names no ref. A link
-that stays inside its own root keeps the stripped body under both
-implementations. Each implementation writing such an alias with
-`refs -A --create` and reading its own repository back prints `xal ->
-origin:rr/x`.
-
-`-c`/`--collections` lists the collection refs as `(<collection-id>, <ref>)`,
-sorted by collection id and then by ref name. The set is the repository's own
-refs under `refs/heads` qualified by its `[core] collection-id`, plus every ref
-under `refs/mirrors` qualified by the collection component of its path;
-`refs/remotes` is excluded, and a repository with no `collection-id` lists its
-mirror refs alone. With `-c`, a positional argument is a collection id and not a
-ref-name prefix. `-c` wins over `-A`: the two together list collection refs.
-
-`--create=NEWREF` points a new ref at the commit the single positional argument
-names, and writes `refs/heads/<NEWREF>` (or `refs/remotes/<remote>/<name>` for
-a `remote:name` NEWREF), creating the parent directories. With `-A` it writes a
-relative symlink instead. For a target under `refs/heads` the link body is the
-path from the alias's own directory to the target ref's file, so `--create=p/q`
-aliasing `one` writes `../one` and `--create=al` aliasing `test/main` writes
-`test/main`. For a target under `refs/remotes` the tool writes the `remote:name`
-refspec verbatim, so `--create=xal` aliasing `origin:rr/x` writes
-`refs/heads/xal -> origin:rr/x`, a body naming no file under `refs/heads`: the
-tool's own `rev-parse xal` then reports `error: Refspec 'xal' not found` and its
-own default listing stops on the link with `error: Listing refs: openat(xal): No
-such file or directory`. The port writes the path to the target ref's file for
-every target, so the same invocation writes `../remotes/origin/rr/x`, which
-resolves under both implementations. `--create` wins over `--delete` when both
-are given. The errors, each exit 1:
-
-- no positional argument -- `error: You must specify a revision when creating a
-  new ref`;
-- more than one -- `error: You must specify only 1 existing ref when creating a
-  new ref`;
-- an unresolvable positional -- `error: Refspec '<rev>' not found`;
-- an existing NEWREF without `--force` -- `error: --create specified but ref
-  <NEWREF> already exists`;
-- with `-A`, a NEWREF naming a remote -- `error: Cannot create alias to remote
-  ref: <remote>`. The message names the remote half alone, so `--create=origin:al`
-  and `--create=origin:rr/al` both report `origin`, and it names that half as
-  given whether the repository holds refs for the remote or none;
-- with `-A`, a positional that names anything other than an existing ref --
-  `error: Cannot create alias to non-existent ref: <rev>`. The check that reports
-  it stands ahead of ref-name validation at this one site, so it answers for a
-  bare checksum, an ancestry suffix, a name no ref holds, and every name the ref
-  rule refuses: `a/../b`, `a//b`, `.`, `..`, the empty argument, `origin:`,
-  `a:b:c`, `a/b:x`, `te st`, `.test`, `origin::rr`, and `tes~t` each report the
-  target as given. The tool answers the two i/o conditions with that same line,
-  where the port reports the message it gives each of them.
-
-A NEWREF whose path under `refs/` runs through a ref file, or names a directory,
-and a positional revision of either shape, are refused before anything is
-written, in the words "Ref name validation" above records, which also states the
-directory shapes the tool's own write replaces.
-
-NEWREF is checked in three steps, and all three precede the resolution of the
-positional, so a NEWREF fault is reported over an unresolvable revision. The
-first step is the positional count. The second is the existence check, which
-resolves NEWREF as a revision in every case; `--force` suppresses the refusal a
-resolved NEWREF draws and leaves the resolution itself in place. That resolution
-takes the case rule "Revision syntax" above states, so a NEWREF of 64 lowercase
-hex characters is read as a checksum and reported as an existing ref, while an
-uppercase one is looked up as a ref name and written. That step reads
-a trailing `^` as ancestry, so `--create=NAME^` reports `error: --create
-specified but ref NAME^ already exists` where the base resolves to a commit
-holding a parent, and `error: Commit <checksum> has no parent` where the base is
-a root commit; `--create=NAME^ --force` reports that same `has no parent` line
-where the base is a root commit. The third step validates NEWREF as a ref name,
-by the rule "Ref name validation" above states, and the rule refuses a `^` in
-it: `--create=NAME^ --force` reports `error: Invalid refspec NAME^` where the
-ancestry resolves, and `--create=a/../b --force nosuch` reports `error: Invalid
-refspec a/../b` rather than the unresolvable positional -- a name a traversal
-component makes invalid draws those same words from the second step, so which of
-the two answers it is not observable.
-A `^` inside the name carries the same message with and without `--force`, since
-the second step reads no ancestry there: `--create=a^b` reports `error: Invalid
-refspec a^b`. `-A` takes the same three steps in the same order and adds a fourth
-of its own, the remote refusal, which also precedes the resolution of the
-positional: `-A --create=origin:al nosuch` reports `error: Cannot create alias to
-remote ref: origin` and `-A --create=origin:rr/x --force test/main` reports it
-where the existence check `--force` suppressed would have named the ref, while
-`-A --create=origin:bad/ test/main` stops one step earlier with `error: Invalid
-refspec origin:bad/`. With `-c` the fourth step is absent, `-c` winning over `-A`,
-so `-c -A --create=<id>:<ref>` writes a collection ref in either flag order. A
-NEWREF holding a second `:` stops at the third step in both implementations, so
-`-A --create=a:b:c` reports `error: Invalid refspec a:b:c` from each; both exit
-1 and write nothing. The port refuses a NEWREF that holds a `^` with that
-message, by the ref-name rule.
-
-Under `-A` the target is checked in a fifth step, after the remote refusal: the
-existence check that reports `error: Cannot create alias to non-existent ref:
-<rev>`. That check stands ahead of ref-name validation, which is why the target is
-the one site a refused name draws no `Invalid refspec` line, and it is reached
-last, so a NEWREF fault is reported over a refused target:
-`-A --create=origin:al a/../b` names the remote and `-A --create=a/../b a/../b`
-names the NEWREF.
-
-With `-c`, `--create=NEWREF` writes a collection ref: NEWREF is a
-`<collection-id>:<ref>` pair and the write lands at
-`refs/mirrors/<collection-id>/<ref>`, with the parent directories created. `-c`
-wins over `-A` here as it does in a listing, so the two together write a ref
-file. The steps are the positional count, the existence check, the pair shape,
-the resolution of the positional, and the collection id, in that order, which
-puts the shape before the revision and the collection id after it:
-
-- a NEWREF holding no `:` names no ref, and the whole argument is read as the
-  collection id -- `--create=fresh` reports `error: Invalid collection ID
-  fresh`, and `--create=org.example.Foo`, whose text is a collection id,
-  reports `error: Invalid ref name (null)`;
-- a pair with an empty half, a second `:`, a `^` in either half, or a ref half
-  that fails ref-name validation reports `error: Invalid refspec <NEWREF>`,
-  before the positional resolves. The whole pair is the name the message
-  carries, so `--create=<id>:a/../b` names both halves;
-- a collection id is two or more `.`-separated elements, each starting with an
-  ASCII letter or `_` and continuing with ASCII letters, digits, or `_`. So
-  `a.b`, `A.b`, `_a.b`, `a._b`, `a_b.c`, and `a.b.c.d` are written, and
-  `fresh`, `a..b`, `a.b.`, `1a.b`, `a.1b`, `a-b.c`, and `a.b-c` report `error:
-  Invalid collection ID <id>`. The length is bounded by the filesystem alone,
-  the id being one path component;
-- the existence check reads NEWREF as an ordinary refspec, so `<id>:<ref>` is
-  looked up under `refs/remotes/<id>/<ref>` and a collection ref of the same
-  spelling does not count as existing. `--create=<id>:<ref>` therefore repeats
-  without `--force`, while a remote ref of that spelling reports `error:
-  --create specified but ref <NEWREF> already exists`.
-
-`--force` replaces an existing ref, including replacing a regular ref file with
-an alias symlink and the reverse.
-
-`--delete` removes every ref its prefixes match, prints nothing, and exits 0
-even when a prefix matches nothing. With `-c` the prefixes are collection ids
-and the whole collection's refs are removed. The parent directories a removal
-empties are left in place. With no prefix it reports `error: At least one PREFIX
-is required when deleting refs` and exits 1. A whole-remote prefix matching a ref
-is refused by both implementations and removes nothing, as "refs" above records.
-
-Under `-c`, the id equal to the repository's own `[core] collection-id` removes
-the refs under `refs/heads` alone and keeps the mirror refs carrying that id, so
-`refs -c --delete org.example.Coll` over a repository whose `collection-id` is
-`org.example.Coll` leaves `refs/mirrors/org.example.Coll/mm` in place. A foreign
-id removes the mirror refs of that id, and a repository with no `collection-id`
-owns no id, so every mirror ref a prefix names is removed. The `-c` listing
-prints both sets for either id, so the two ids share one selection and differ in
-the removal. An id equal to the own id where the local refs are absent removes
-nothing and exits 0, and a local ref carrying a mirror ref's name is removed
-while the mirror ref of that name stands.
-
-With `-A` the set each prefix removes is the set a `-A` listing prints for it:
-the ref the prefix names exactly, or the aliases nested under it. So against the
-refs `test/main` and `test/other` and the alias `test/al`, `refs -A --delete
-test` removes `test/al` and leaves both refs, where `refs --delete test` removes
-all three. A prefix naming a ref exactly removes that one ref for every kind of
-ref, the way the listing answers such a prefix: `refs -A --delete test/al`
-removes the alias, and `refs -A --delete other` and
-`refs -A --delete origin:rr/x` remove a plain ref and a remote ref, neither of
-which is an alias. A prefix holding no alias below itself removes nothing and
-exits 0, so `refs -A --delete deep` leaves `deep/nest/ing` in place. The prefix
-rules, the whole-remote refusal, and the alias guard all read whichever set the
-prefix selected, and each prefix reads the aliases as the prefixes ahead of it
-left them. With no prefix the message is the one the plain form gives. `-c` wins
-over `-A` here as it does in a listing, in either flag order.
-
-The tool removes each alias nested under a prefix by the name it prints for that
-alias, and for an alias under `refs/remotes` that name drops the remote, so
-`refs -A --delete origin:rr` removes no alias of `origin` and instead removes a
-local ref carrying that name where one exists: against the remote alias
-`refs/remotes/origin/zz/q` and the local ref `refs/heads/zz/q`, the tool removes
-the local ref and keeps the alias. The port removes the alias its own listing
-names (`conformance/cli-surface.md`, "P1"). A whole-remote prefix holding an
-alias is refused by both, the tool on the joined name (`error: Invalid refspec
-./rr/remal`) and the port on the prefix as given, and neither removes anything.
-
-An alias holds the ref it names in place. A prefix matching a ref under
-`refs/heads` that an alias names ends the invocation with `error: Ref '<refspec>'
-has an active alias: '<alias>'` and exit 1. In the port that prefix removes
-nothing, in the plain form and in the `-A` form alike. The tool removes the
-members of the selected set its own removal order reached ahead of the guarded
-one, so the two leave different refs trees wherever that order puts an unguarded
-member first (`conformance/cli-surface.md`, "P1"). A guarded member stands in
-both. The guard runs per prefix, so `refs --delete deep test` removes what `deep`
-matched and then reports the refusal for `test`. An alias names its target by the
-link body with the leading `../` components removed, read from the `refs/heads`
-root: an alias at `refs/heads/test/al2` whose body is `other` names the ref
-`other`, where the link itself resolves to `refs/heads/test/other`, so
-`refs --delete other` is refused and `refs --delete test/other` removes the ref.
-A matched ref that is an alias itself is guarded the same way, so
-`refs --delete test/al` is refused where `refs/heads/alal` links to `test/al`.
-Removing an alias that no alias names succeeds, and each prefix reads the aliases
-as the prefixes ahead of it left them, so `refs --delete alal test/al` removes
-both.
-
-Outside `refs/heads` the removal proceeds: a ref under `refs/remotes` is removed
-with an alias naming it, in the port's body form (`ral ->
-../remotes/origin/rr/x`) and in the tool's refspec form (`ral -> origin:rr/x`)
-alike, and an alias under `refs/remotes` or `refs/mirrors` names nothing for the
-guard. With `-c` the guard does not apply, so `refs -c --delete <collection-id>`
-removes the refs of that collection with the aliases among them. Where a prefix
-matches more than one guarded ref, or more than one alias names one matched ref,
-each implementation names the pair its own enumeration reaches first
-(`conformance/cli-surface.md`, "P1").
-
-Five tool behaviors here are not reproduced. A NEWREF ending in `^` whose base
-names no ref kills the tool with a signal before it writes anything (recovered
-with `--create='nosuch^'` against a repository holding no `nosuch`, with and
-without `--force`, and with and without `-A`, and with `-c` as
-`--create='<id>:<ref>^'`); the port reports `error: Invalid refspec <NEWREF>`,
-the words the tool gives that name at its third step, and writes nothing. A
-dangling alias -- a symlink under `refs/` whose target ref does not exist --
-makes the tool fail every invocation whose enumeration reaches it, with `error:
-Listing refs: openat(<path>): No such file or directory` and exit 1, where
-`<path>` is the link's path below `refs/heads` or below `refs/remotes/<remote>`:
-the default listing, `--list`, and `-r`; a `PREFIX` naming a directory that
-holds the link, in a listing and in a `--delete`, which then removes nothing;
-and `--create`, `--create --force`, and `-A --create`, each of which writes no
-ref. A link under `refs/mirrors` reaches the `-c` listing alone, leaving the
-default listing and `--create` unaffected, and `-c --create=<id>:<ref>`
-completes over a link under `refs/heads`. `-A` lists the dangling alias, and
-`-A` with a `PREFIX` naming it exactly prints nothing. `--delete` naming the
-link itself exits 0 and leaves the link in place. The port skips the dangling
-entry everywhere else: it lists the rest, writes every `--create` form, and
-removes what a prefix matched.
-
-A symlink under `refs/` that names a directory makes the tool report `error:
-Listing refs: Is a directory` and exit 1 from the default listing, `--list`,
-`-r`, `fsck`, `summary -u`, and `prune --refs-only`. The tool's prefix-scoped
-forms complete over the same link: a `PREFIX` naming the link enumerates the
-directory it points at, so `refs lnk` prints `nest/ing` where `refs/heads/lnk`
-links to `deep` and `deep/nest/ing` is a ref; a `--delete PREFIX` matching other
-refs removes them and exits 0; a `--delete` naming the link reports `error:
-Listing refs: opendir(lnk): Not a directory` and exits 1; and the default
-`prune`, which reads no ref, exits 0. The port reads every symlink under `refs/`
-as an alias and descends into a real directory alone, so reading the link fails
-with `EISDIR` wherever an enumeration reaches it: `error: i/o error: Is a
-directory (os error 21)` and exit 1 from every listing form, from `--delete`
-whatever the prefix matches, and from `fsck`, `prune`, and `summary -u`. `-A`
-lists the link on both sides, as `lnk -> deep`. A link naming its own directory
-(`refs/heads/selfdir -> .`) takes the same path on both sides. Such a link
-arrives by out-of-band mutation alone, since `refs -A --create` validates its
-target as a ref in both implementations.
-
-A collection directory under `refs/mirrors` whose
-name is not a valid collection
-id aborts the tool on a GLib assertion (`ostree_collection_ref_new: assertion
-'collection_id == NULL || ostree_validate_collection_id (collection_id, NULL)'
-failed`, killed by a signal), and a collection id given as a positional
-argument is validated (`error: Listing refs: Invalid collection ID <id>`, exit
-1); the port validates a collection id where `-c --create` writes one and lists
-what the path holds. On the missing ref name of `-c --create=<id>` the tool
-prints a GLib assertion line (`g_regex_match_full: assertion 'string != NULL'
-failed`) before its own `error: Invalid ref name (null)`; the port prints the
-error line alone.
-
-### `rev-parse`
-
-Prints the resolved 64-character commit checksum and a newline, one line per
-`REV` argument, in the order given. The first argument that does not resolve
-reports `error: Refspec '<rev>' not found` and exits 1, after the checksums
-before it were already printed. With no argument the command prints its usage
-text to standard error, then `error: REV must be specified`, and exits 1. A
-`REV` whose path under `refs/` runs through a ref file, or names a directory,
-is refused in the words "Ref name validation" above records.
-
-`-S`/`--single` takes no argument and prints the repository's one commit
-checksum. An empty repository reports `error: No commit objects found`, a
-repository holding more than one commit reports `error: Multiple commit objects
-found`, and an argument alongside `-S` reports the usage text and `error: Cannot
-specify arguments with --single`; each exits 1. The count is over the commit
-objects present in `objects/`, not over the refs.
-
-### `cat`
-
-Writes each named file's content to standard output in the order the paths were
-given, with nothing between them and nothing added. A leading `/` on a path is
-optional.
-
-Path resolution splits the path on `/` and looks up each component in the
-commit's tree literally: `.`, `..`, and an empty component each name nothing, so
-`cat REV /./a.txt` reports `error: No such file or directory: /.` and
-`cat REV //a.txt` reports `error: No such file or directory: /`. The reported
-path is absolute whether or not the argument was, and names the prefix that
-failed rather than the whole argument.
-
-An empty argument reaches no component and reports the commit root as absent:
-`cat REV ''` reports `error: No such file or directory: /`. The argument `/`
-reaches the root and gets the directory refusal instead.
-
-A symlink in the final position is followed, its target resolved against the
-link's own directory, or against the commit root when the target is absolute.
-The target's components are looked up literally too, so a target holding `..`
-fails: a symlink at `/sub/rel` pointing at `../a.txt` reports `error: No such
-file or directory: /sub/..`. A symlink in any other position is not followed:
-`cat REV /dlink/b.txt`, where `dlink` links to the directory `sub`, reports
-`error: Not a directory`. A chain of symlinks is followed to its end. The tool
-bounds the depth nowhere: a chain 20000 links deep resolves, and one 100000
-links deep kills it with a signal (exit 139). The port follows 256 links, above
-the depth any real tree holds, and refuses a chain deeper than that.
-
-The errors, each exit 1: a path naming a directory, or the commit root, reports
-`error: Can't open directory`; a missing path reports `error: No such file or
-directory: <absolute path>`; a non-final component that is a file reports
-`error: Not a directory`; an unresolvable `COMMIT` reports `error: Refspec
-'<rev>' not found`; a `COMMIT` that resolves to a commit the store does not hold
-is refused in each implementation's own words, `error: No such metadata object
-<checksum>.commit` from the tool and `error: object not found: Commit
-<checksum>` from the port, in the words "Revision syntax" above records; a
-`COMMIT` whose path under `refs/` runs through a ref file,
-or names a directory, is refused before the tree is read, in the words "Ref name
-validation" above records; a missing `COMMIT` or an empty path list prints the
-usage text and `error: A COMMIT and at least one PATH argument are required`. A
-self-referencing symlink kills the tool with a signal (recovered with a link
-whose target is its own name); the port reaches its 256-link bound and reports
-`error: Too many levels of symbolic links`, which is also the message a chain of
-257 distinct links gets.
-
-### The GVariant text form
-
-The reading commands render a metadata value as text with GLib's own printer, so
-the convention belongs to GVariant rather than to ostree and lives in
-`ostrya-gvariant` beside the value type. It is the form `show --raw`,
-`show --print-metadata-key`, `show --print-detached-metadata-key`,
-`show --print-variant-type`, `ls -X`, and `summary --raw` all write. Recovered
-by giving the tool one hand-written serialized value per rule through
-`show --print-variant-type=TYPE`, which reads any file as a value of a named
-type:
-
-- A value whose literal does not state its own type carries a type annotation:
-  `byte 0x2a`, `int16 -5`, `uint16 5`, `uint32 42`, `int64 -5`, `uint64 42`,
-  `handle 5`, `objectpath '/a/b'`, `signature 'ay'`. A byte is two lowercase hex
-  digits behind `0x`. A boolean prints `true` or `false`, a string prints quoted,
-  an `i` prints as the bare number, and a `d` prints as the bare `%.17g`
-  rendering of the double with `.0` appended where that rendering holds no `.`,
-  no exponent, and no `nan`: `1.5`, `1000.0`, `-0.0`,
-  `0.10000000000000001`, `1.7976931348623157e+308`. None of the four carries an
-  annotation.
-- A maybe states no type in either literal it has, so an annotated one carries
-  its whole signature and its child then prints bare: `@ms 'just'`,
-  `@ms nothing`, `@mi 5`. Unannotated it prints the child alone, or `nothing`.
-- A chain of nested maybes prints the value alone when every level of the chain
-  is set, since the type states the level count: `@mmi 5` names a chain of two
-  set levels over `5`, and `@mmmv <'x'>` a chain of three over a variant. A
-  chain that ends at `nothing` states its own set levels instead, one `just `
-  for each: `@mmi just nothing` has the outer level set and the inner one unset,
-  `@mmi nothing` has neither set, and the count runs to the depth of the type in
-  `@mmmi just just nothing` and `@mmmmi just just just nothing`. The prefixes
-  belong to the value, so they stay where the annotation is dropped:
-  `[@mmi just nothing, nothing, 5]` and
-  `{'a': @mmi just nothing, 'b': nothing, 'c': 5}`. This is what makes the
-  printed text read back as the value it came from.
-- A container holding at least one element delegates its annotation to its first
-  element, and the elements after it print unannotated: `aay` holding two byte
-  arrays prints `[[byte 0x63], [0x62]]`. A tuple annotates every member, whose
-  types do not follow one another: `(byte 0x01, byte 0x02)`. A one-member tuple
-  keeps a trailing comma, `(byte 0x01,)`, and the empty tuple prints `()`.
-- A container holding no element has nowhere to delegate to, so it carries its
-  own signature: `@ay []`, `@a(say) []`, `@a{sv} {}`. An empty container in an
-  unannotated position prints the bare literal, so `aay` holding a byte array and
-  then an empty one prints `[[byte 0x63], []]`.
-- An array of dict entries prints as one brace-enclosed list of `key: value`
-  pairs rather than a list of entries: `{'a': byte 0x01, 'b': 0x02}`. A dict
-  entry outside an array prints `{key, value}`, with a comma.
-- A variant prints `<child>`, and the child is always annotated, since a variant
-  states no child type of its own: `<byte 0x2a>`.
-- A byte array whose last byte is the only NUL it holds prints as a bytestring
-  literal, `b'user.foo'`, which states its own type and carries no annotation.
-  Every other byte array prints as the element list, `[byte 0x01, 0x02, 0xff]`;
-  the empty one has no trailing NUL and so prints `@ay []`. The rule reaches real
-  metadata: an xattr name is stored NUL-terminated and prints as a bytestring
-  while its value does not, and a 64-byte ed25519 signature whose last byte
-  happens to be zero prints as one too.
-
-The two literal forms escape differently, which one string holding the same
-bytes shows: as a string it is `'a"b'` and as a bytestring `b'a\"b'`.
-
-- A string is written in single quotes, or in double quotes when it holds a
-  single quote, so the quote it holds needs no escape. Only the quote in use is
-  escaped, so `"` stays literal inside single quotes. `\a`, `\b`, `\f`, `\n`,
-  `\r`, `\t`, `\v`, and `\\` take their short escape; every other C0 control and
-  DEL takes `\uXXXX` in four lowercase hex digits; and every other character,
-  ASCII or not, is written through, so UTF-8 stays readable.
-- A bytestring is written in single quotes, or in double quotes when its content
-  holds a single quote. A backslash and a double quote are always escaped, even
-  inside single quotes. `\b`, `\f`, `\n`, `\r`, `\t`, and `\v` take their short
-  escape, and every byte outside printable ASCII takes a three-digit octal
-  escape: `b'\377'`, `b'h\303\251'`.
-
-Byte order. The on-disk format places its numeric fields in the variant already
-big-endian while the framing stays little-endian, so a value parsed from those
-bytes holds each numeric field byte-reversed. One byteswap of the whole value
-tree recovers the numbers the fields state, and that is what the default report
-does: the commit whose stored timestamp field is `1700000000` big-endian reports
-`uint64 1700000000`, and `-B` reports the stored form, `uint64
-67927162644070400`. The swap reaches a numeric field inside a variant, so a
-`t`-valued metadata key written natively reports byteswapped. It reaches
-`--print-metadata-key` and `--print-detached-metadata-key` as well, and not
-`--print-variant-type`, whose report is byteswapped whether or not `-B` is given.
-
-#### Reading the text form back
-
-`commit --add-metadata=KEY=VALUE` takes a value in this form, so the port reads
-it as well as writes it (`ostrya-gvariant`, `from_text`). The reading rules,
-recovered by giving the tool one value per rule and reading the stored variant
-back with `show -B --print-metadata-key`:
-
-- A quoted literal is a string; single and double quotes both open one, and the
-  quote in use is the one that needs escaping. `\a`, `\b`, `\f`, `\n`, `\r`,
-  `\t`, `\v`, and `\\` take their short escape, `\uXXXX` and `\UXXXXXXXX` name a
-  character by code point, and every other escape drops the backslash and keeps
-  the character, so `'\x41'` is the three characters `x41`. A backslash before a
-  line feed is a line continuation: both characters leave the value, so
-  `'a\<LF>b'` is the two characters `ab`. The rule holds in a bytestring too.
-- A `\u` or `\U` escape naming U+0000 is refused, because a string value carries
-  no NUL. The refusal is `invalid 4-character unicode escape` for `\u` and
-  `invalid 8-character unicode escape` for `\U`, at the offset of the digits, so
-  `'\u0000'` gives `3-7:invalid 4-character unicode escape` and `'\U00000000'`
-  gives `3-11:invalid 8-character unicode escape`. The refusal comes from the
-  reader, so the offset follows the literal wherever it stands and the type
-  around it makes no difference: `@o '/a\u0000b'` gives `8-12`, `@g '\u0000'`
-  gives `6-10`, and `{'\u0000': 1}` gives `4-8`. A raw NUL byte in a string
-  literal is refused the same way, at the byte, with `NUL byte in string
-  constant`; the tool takes its value through `argv`, which carries no NUL, so
-  this refusal has no counterpart to compare against.
-- `b'...'` and `b"..."` are bytestrings, which name a NUL-terminated `ay`. An
-  octal escape of up to three digits names one byte, and the value ends at the
-  first NUL those escapes produce, so `b'\0'`, `b'\400'` and `b'\0001'` are all
-  the one-byte array holding the terminator alone. A bytestring has no `\u` or
-  `\U` escape, so `b'\u0000'` is the six-byte array holding `u0000` and the
-  terminator. A raw NUL byte in a bytestring literal ends the value the way an
-  octal escape naming it does.
-- A number is hexadecimal behind `0x`, binary behind `0b`, octal behind a
-  leading `0`, and decimal otherwise; both prefix letters take either case. The
-  reader a literal goes to when no type states one is the double reader for a
-  body carrying a decimal point, for a body carrying a lower-case `e` outside a
-  hexadecimal one, and for the words `nan` and `inf`; every other body goes to
-  the integer reader. So `1e3` is 1000.0, `1E3` is refused at the `E`, `0x1e5`
-  is 485, and `0x1.8p1` is 3.0. An integer literal with no other context is an
-  `i`.
-- The type a literal lands in picks the reader again, so the same text can carry
-  two values: `@d 017` is 17.0 where `017` alone is 15, and an integer type over
-  a literal the double reader would take reports the character the integer
-  reader stopped at, `byte 1.5` giving `6-7:invalid character in number`.
-- `nan`, `inf`, `-inf` and `-infinity` are doubles; the spelling is lower case
-  and a sign is needed for `infinity`. A magnitude the double range cannot hold
-  is refused as out of range, and so is a value that rounds to a subnormal the
-  literal does not state exactly, so `5e-324` and `1e-308` are refused where
-  `1e-400` is 0.0 and `2.2250738585072014e-308` is kept. The exact decimal form
-  of a subnormal needs at least 716 significant digits, which is where the port
-  parts from the tool (`conformance/cli-surface.md`, `commit`).
-- A hexadecimal body states its value in binary, and the reader rounds it to the
-  nearest double, ties to even, over a mantissa of any length:
-  `0xffffffffffffffffffffffffffffffffffffffffp0` is 1.461501637330903e+48 and
-  `0x1.0000000000000000000000000000000000001p0` is 1.0. The subnormal such a
-  body states exactly is kept, so `0x1p-1023` is 1.1125369292536007e-308 and
-  `0x1p-1074` is 4.9406564584124654e-324, where `0x1.8p-1074` and
-  `0x1.0000000000001p-1030` round to a subnormal they do not state and are
-  refused. `0x1p-1075` sits at the tie the rounding takes to even, so it is 0.0,
-  and every smaller magnitude is 0.0 as well. A zero mantissa is 0.0 under any
-  exponent, `0x0.0p2147483647` and `0x0.0p-9999999999` included. At the top of
-  the range `0x1.fffffffffffff7ffffffffp1023` rounds down to the largest double
-  and is kept, where `0x1p1024` and `0x1.fffffffffffff8p1023` are refused.
-- A leading `-` is read ahead of the body, and the body may carry a sign of its
-  own. `-` alone is zero, `-+5` is -5, and `--5` is the magnitude 2**64-5 with a
-  negative sign, which no target type holds.
-- `true` and `false` are booleans, `nothing` and `just <value>` are maybes,
-  `[...]` is an array, `{key: value, ...}` an array of dict entries,
-  `{key, value}` one dict entry, `(...)` a tuple, and `<value>` a variant. A
-  one-member tuple is `(x,)`; the comma is required and `(x)` is refused with
-  `expected ',' after first tuple element`. A trailing comma closes that one
-  member alone, so `(1,2,)` reports `expected value`.
-- A type keyword (`boolean`, `byte`, `int16`, `uint16`, `int32`, `handle`,
-  `uint32`, `int64`, `uint64`, `double`, `string`, `objectpath`, `signature`) or
-  a `@<signature>` declaration gives the value that follows it its type. A
-  keyword token is two or more characters long, starts with two letters, and
-  starts in lowercase; every other token that is not a literal is a place a
-  value was expected.
-- A `@` declaration runs to the first character that could close something
-  around it -- whitespace, `,`, `:`, `>`, `]`, and a `)` or `}` that matches no
-  `(` or `{` inside the declaration -- so `@i5` and `@**` are read whole and
-  reported as one bad declaration where `@i)` ends at the bracket. A declaration
-  naming one complete but indefinite type reports `type declarations must be
-  definite`; every other bad one reports `invalid type declaration`.
-- A declaration is read in three steps, each reporting ahead of the next. The
-  signature must spell one complete type, which takes 129 levels: a leaf is one
-  level, `m`, `a`, a tuple and a dict entry each add one over their deepest
-  member, and a signature past that is `invalid type declaration`. The type
-  must then fit in the nesting left where the declaration stands, which is 128
-  levels in all, counting the levels the type carries from the level the
-  declaration sits at; past that the report is `type declaration recurses too
-  deeply`. The type must then be definite. So `@<128 array codes>y` is refused
-  for its depth and `@<129 array codes>y` as an invalid signature, and the same
-  two counts with a trailing `r` in place of the `y` report the depth rather
-  than the definiteness. Under the depth rule the empty tuple carries no level
-  of its own, so `@<128 array codes>()` is accepted where `@<128 array
-  codes>y` is not, and a dict entry is measured by its value alone, so
-  `@<127 array codes>{s()}` is accepted where `@<127 array codes>{sy}` is not.
-  A declaration inside containers counts from their level, so
-  `[@<127 array codes>y []]` is refused where the same declaration alone is
-  accepted. The value beside the declaration takes one level, whatever the
-  levels the declared type carries.
-- An `o` value must be a valid object path: `/`, or `/` and one or more elements
-  of letters, digits and underscores separated by single slashes. A `g` value
-  must be zero or more complete D-Bus types, which excludes the maybe and the
-  indefinite characters, so `signature 'ii'` is accepted and `signature 'ms'` is
-  not. Each of those types takes the same 129 levels a declaration's signature
-  takes, so `signature '<128 array codes>y'` is accepted and one array code
-  more is `not a valid signature`. The levels are inside the string, so the
-  level the signature value stands at does not narrow them.
-- A container with no declaration takes one common type over its elements, so
-  `[2, 1.5]` is an array of doubles and `['a', @ms 'b']` an array of maybe
-  strings, the maybe absorbing the bare string beside it. A literal that states
-  no type and has no context -- `[]`, `{}`, `nothing` -- is refused, and the
-  refusal names the whole value being typed rather than the literal inside it.
-  A variant's child is a whole value of its own, so `[<[]>]` names the `[]`.
-- A declaration drives the check downwards instead: `@as [1]` names the element
-  `1` against `s`. Two members of an undeclared container that do not meet are
-  both named, `['a', 5]` reporting the two spans, and the keys of an undeclared
-  dictionary are checked that way.
-- The first entry of an undeclared dictionary settles the value type on its own,
-  and every later value is read against that type the way a declaration drives
-  the check downwards. `{'a': 1, 'b': uint32 2}` is `a{si}` and
-  `{'a': uint32 2, 'b': 1}` is `a{su}`. A later value that does not fit is named
-  against the settled type: `{'a': 1, 'b': just 2}` gives `14-20:can not parse
-  as value of type 'i'`, `{'a': 1, 'b': 1.5}` gives `15-16:invalid character in
-  number` at the character the integer reader stops on, and
-  `{'a': 1, 'b': ['x', 5]}` gives `14-22:can not parse as value of type 'i'`,
-  which names the whole array.
-  A first value that states no type is named against the whole value
-  being typed, and a later entry leaves it that way, so `{'a': [], 'b': 5}` is
-  `0-17:unable to infer type` and `{'a': nothing, 'b': 'y'}` is
-  `0-24:unable to infer type`. A key that does not meet the settled key type is
-  reported ahead of the value type, which then stays unresolved:
-  `{'a': [], [1]: 5}` gives `1-4,10-13:unable to find a common type`.
-- A type already in force takes the value beside a declaration and drops the
-  declaration. `@as [@o '/a']` stores a string, `{'a': 'x', 'b': @o '/y'}` is
-  `a{ss}`, and `{'a': 'x', 'b': @o 'notapath'}` is accepted, the object-path
-  check that `@o` alone runs staying out of the way. The value beside the
-  declaration is read against the type in force, so `@as [@i 5]` names the `5`
-  with `8-9:can not parse as value of type 's'` and
-  `{'a': 'x', 'b': @ms nothing}` names the `nothing` with `20-27:can not parse
-  as value of type 's'`.
-- A value nests inside at most 127 containers. A `[`, `(`, `{`, `<`, a `just`, a
-  type keyword and a `@` declaration each add one level, and the value at level
-  128 is refused with `variant nested too deeply`, the offset naming the token
-  at that level. A `@` declaration is held to the levels its own type carries
-  as well (see the declaration rule above).
-
-A refusal reports `<spans>:<reason>`, where a span is one byte offset for a
-place a value was expected and `<start>-<end>` for a token, and two spans
-separated by a comma where the reason names two: `0-2:unable to infer type`,
-`0:expected value`, `0-7:unknown keyword`, `1-2:invalid character in number`,
-`0-13:unterminated string constant`, `4:expected ',' or ')' to follow tuple
-element`, `4:expected ':' or ',' to follow dictionary entry key`,
-`3:expected end of input`, `0-1:invalid type declaration`,
-`3-8:can not parse as value of type 'i'`, `0-10:number out of range for type
-'i'`, `7-27:integer too big for any type`, `1-4,6-7:unable to find a common
-type`, `11-21:not a valid object path`, `10-14:not a valid signature`, and
-`0-10:dictionary keys must have basic types`. The offsets are into
-the value alone; `commit` prefixes the whole `KEY=VALUE` argument
-(see "`commit`" below).
-
-The whole value is parsed, typed and built before the text is checked for
-trailing input, so `@i 'x' 5` reports the member that does not fit and
-`nothing 5` the type it could not infer, each ahead of the trailing `5`.
-
-Four divergences stand between the two implementations here. The first two were
-measured over 776 value texts given to both through `commit --add-metadata`, of
-which 749 reach the same commit checksum or the same refusal; the last two over
-the 366 values both accept, read back in four modes:
-
-- A `\u` or `\U` escape naming a surrogate or a code point past U+10FFFF is
-  accepted by the tool, which then builds a string that is not UTF-8, prints
-  `GLib-CRITICAL **: g_variant_new_string(): requires valid UTF-8` and aborts
-  with a signal, writing no commit. `'\uD800'` and `'\U00110000'` both reach
-  that. The port refuses the escape with `3-7:invalid 4-character unicode
-  escape` and `3-11:invalid 8-character unicode escape` at exit 1.
-- The offset the nesting refusal carries agrees for `[`, `(` and `{`, where both
-  name the token at level 128. For `<`, for `just`, for a type keyword and for a
-  `@` declaration the tool prints an offset out of any relation to the text --
-  `18446646599957580430` for one input and `18446642783772371598` for another,
-  so the value is not reproducible -- where the port names the token as it does
-  for the brackets. The reason text and the exit status are the same on both
-  sides.
-- A string holding a code point GLib does not count as printable -- an
-  unassigned one, a non-character, or a control -- is printed by the tool as a
-  `\uXXXX` or `\UXXXXXXXX` escape and by the port as the character itself.
-  `'\uffff'`, `'\ud7ff'` and `'\U0010ffff'` from the tool are the three
-  measured. Both store the same bytes, so the commit checksum agrees and the
-  divergence is in the printed text alone.
-- The deepest nesting the two carry through a commit differs, the port's codec
-  holding a value-depth budget of 128 levels counted from the commit object and
-  the tool counting from the metadata value. Measured with `--add-metadata=k=`
-  and an array nested to each depth: through 123 the two write the same commit
-  and read the same text back; at 124 and 125 the commits still agree and the
-  read-back parts, the tool printing `()` for the value where the port prints
-  the value at 124 and reports `error: gvariant: container nesting exceeds the
-  supported depth` at 125; at 126 and 127 the tool writes the commit and the
-  port reports that same line at exit 1; and at 128 and past it both readers
-  refuse in the same words.
-
-### `show`
-
-The reporting modes are mutually exclusive, and where more than one is given the
-highest of this order wins, each printing and exiting 0. The order was recovered
-by giving the tool each pair:
-
-1. `--print-detached-metadata-key=KEY`
-2. `--print-metadata-key=KEY`
-3. `--list-detached-metadata-keys`
-4. `--list-metadata-keys`
-5. `--print-related`
-6. `--print-variant-type=TYPE`
-7. `--print-sizes`
-8. the object's own report, which `--raw` and `-B` extend
-
-The object argument. A 64-character lowercase checksum names an object whose type
-is recovered by probing the store in the order commit, dirtree, dirmeta, file, so
-the argument carries no type; anything else is a revision, resolved to a commit.
-A checksum naming nothing reports the last probe's failure, `error: Couldn't find
-file object '<checksum>'`, at exit 1. A revision that resolves to nothing reports
-`error: Refspec '<rev>' not found`. With no argument the usage text and `error: An
-object argument is required` go to standard error at exit 1.
-
-A metadata object reports its type and checksum on one line, `commit
-<checksum>`, `dirtree <checksum>`, or `dirmeta <checksum>`. `--raw` adds the
-value in the text form on the line below it and reports nothing more, so a
-commit's own report is suppressed. `-B` adds the same line with the numeric
-fields as stored, and a commit's own report still follows it, whether or not
-`--raw` was given as well.
-
-A commit's own report, in order, one line each: `Parent:  <checksum>` when the
-commit has a parent; `ContentChecksum:  <checksum>`, the SHA-256 over the two
-root checksums "Checksum computation" above defines; `Date:  <YYYY-MM-DD
-HH:MM:SS +0000>`, the timestamp in UTC, read as a signed count of seconds so a
-pre-epoch instant stored as the unsigned field's two's-complement form reports
-`1969-12-31 23:59:59 +0000`; and `Version: <value>` when the commit metadata
-carries a `version` key, with one space after the colon where the three lines
-above it carry two. Then the subject: a blank line, then each of its lines
-indented four spaces; an empty subject reports `(no subject)` with no blank line
-before it. Then the body, when it is not empty: a blank line, then each of its
-lines indented four spaces. Then one blank line, which closes the report.
-
-A file object reports its header instead, one field per line: `Object:
-<checksum>`, `Type: file`, `File Type: regular` with `Size: <bytes>` or `File
-Type: symlink` with `Target: <target>`, `Mode: 0<octal st_mode>` (the full mode
-including the file-type bits, behind a literal `0`), `Uid: <id>`, `Gid: <id>`,
-and `Extended Attributes: { <a(ayay) in the text form> }`. `--raw` and `-B`
-change nothing here.
-
-`--print-related` prints one line per entry of the commit's related-objects
-array, `<ref> <checksum>`. No `commit` option writes such an entry, so the array
-is empty on every commit either implementation produces and the mode prints
-nothing at exit 0; the line shape was recovered by assembling a commit that
-carries two entries and reading it back.
-
-`--list-metadata-keys` and `--list-detached-metadata-keys` print one key per
-line, sorted, rather than in the order the dict stores them. A commit with no
-`.commitmeta` reports `error: No detached metadata for commit <checksum>` at exit
-1 under either detached mode.
-
-`--print-metadata-key=KEY` and `--print-detached-metadata-key=KEY` print the
-value the key holds, unwrapped from its `v` and annotated as a value of its own
-type. A key the dict does not hold reports `error: No such metadata key '<key>'`
-at exit 1. Where the same option is given more than once the last wins.
-
-A checksum naming no object at all reports the file probe's failure, and the line
-carries a prefix naming the open in every mode that stores the payload in the
-object file itself: `error: Opening content object <checksum>: Couldn't find file
-object '<checksum>'` in `bare` and `bare-user`, and the bare refusal alone in
-`archive`, whose object carries its own header.
-
-`--print-hex` applies to a key whose value type is exactly `ay`: the bytes print
-as unquoted lowercase hex with no separator, and an empty array prints an empty
-line. A value of any other type, `aay` included, ignores the switch.
-
-`--print-sizes` totals the commit's `ostree.sizes` metadata over three lines:
+Observed behavior: the tool keeps the `[ex-ostrya]` group and the receive
+groups, and ignores them.
+
+- `commit` and `prune --refs-only` exit 0 and act as they do without the
+  groups.
+- `refs`, `fsck`, and `summary -u` exit 0 and write nothing to standard error.
+  `summary -u` writes `summary`.
+- `config get` (dotted and with `--group`), `config set`, `remote list`, and
+  `remote list -u` exit 0. `config get` prints a value as written, for example
+  the list `app.roots;app.other;`. `config set` keeps each group and its keys in
+  order. `remote list` shows no receive group as a remote.
+- Dotted `config get` splits `GROUP.KEY` at the first `.`
+  (`conformance/cli-behavior.md`, "`config get`"). So
+  `config --group=GROUP get KEY` reads a key of a group whose pattern holds a
+  `.`.
+
+Observed behavior: the tool keeps the push and pull keys of a remote, and
+ignores them. The keys form three sets:
+
+- the ssh push keys: `push-url`, `ssh-command`, and `receive-command`;
+- the token keys: `push-user` and `push-token-file`;
+- the pull keys: `pull-url` in the ssh form or the scp form, and
+  `send-command`.
+
+In each observation, the remote also has an HTTP `url`:
+
+- With each set, `remote list -u` and `remote show-url` print the `url`.
+  `config get` prints each key as written. `config set` rewrites `config` and
+  keeps the keys in order. Each of these commands exits 0.
+- With the token keys or the pull keys, `config set` also keeps the keys as
+  written. `pull` fetches the commit from `url`, and `fsck` then passes. With
+  the pull keys, `remote refs` and `remote summary` also exit 0. No command
+  writes a diagnostic to standard error.
+- With the token keys, no system call of `remote list -u`, `remote show-url`,
+  or `pull` names the token file.
+- With the pull keys, no system call of `remote list -u`, `remote show-url`,
+  or `pull` names the ssh address or the `send-command` value. The pull runs
+  no other program.
+
+`conformance/cli-surface.md`, "P2", `pull`, records how the tool and the port
+treat a remote with `pull-url` and no `url`, and an ssh address in `url`.
+`conformance/cli-behavior.md`, "`remote`", states how `remote list -u` stops
+at a remote with no `url`.
+
+## Ref patterns
+
+The port selects refs by name with two grammars. A receive pattern names the
+refs of one receive rule. A ref selector selects the refs of a ref listing. The
+two grammars share the part grammar. A receive pattern has no negative form:
+it refuses `!` at its start and in its name part. An entry of a ref selector
+takes one leading `!`.
+
+### The part grammar
+
+A pattern is split at `/` into parts. Each part is one of these:
+
+- A literal. It is a component of a ref name ("Ref name validation"), and it
+  matches a part of a name that is equal to it.
+- `*`. It matches exactly one part of a name.
+- `**`. It matches one or more parts of a name.
+
+`*` and `**` are valid only as a whole part, so the parser refuses `b*c`, `x**`,
+and `***`. A pattern is not empty and has no empty part. A pattern holds no `!`.
+A name matches a pattern when the parts of the pattern, in order, cover all
+parts of the name.
+
+For example, `apps/*` matches `apps/web` and does not match `apps` or
+`apps/web/db`. `apps/**` matches `apps/web` and `apps/web/db`, and does not
+match `apps`. `apps/**/db` matches `apps/web/db` and `apps/a/b/db`, and does
+not match `apps/db`.
+
+A match compares parts. It does not check that the name passes the ref-name
+rule. The cost of one match is at most the number of pattern parts times the
+number of name parts.
+
+### Receive patterns
+
+`PATTERN` of a receive group has an optional remote part and a name part. The
+name part follows "The part grammar". `PATTERN` has one of these forms:
+
+- `NAME` -- the local refs that the name part `NAME` matches.
+- `REMOTE:NAME` -- the remote refs of the remote `REMOTE` that `NAME`
+  matches.
+- `*:NAME` -- the remote refs of every remote that `NAME` matches.
+
+For example, `central:**` selects every ref of the remote `central`.
+
+`REMOTE` is one component of a path. It is not empty, it is not `.` or `..`,
+and it holds no `/`, no NUL, and no `*`. The reader refuses these patterns:
+
+- a pattern with a `!` at the start or in the name part;
+- a pattern with a `*` in the remote part other than the whole part `*`;
+- a pattern with a `*` in the name part other than a whole part `*` or `**`;
+- an empty pattern, a pattern with an empty part, and a pattern with a `:` in
+  the name part;
+- a pattern with a control character;
+- a pattern with a literal part that fails the ref-name rule, for example a
+  part with a space or a part that starts with `-`.
+
+A `!` in the remote part, at a place other than the start of the pattern,
+follows the component rule of the remote part.
+
+The pattern splits at its first `:`, so the remote part holds no `:`. The
+reader accepts a remote part that the ref-name rule refuses, for example `o r`.
+A rule with such a remote part matches no update, because the server refuses
+the ref name of the update first ("Commit and CommitReply", check 1).
+
+The server selects one rule for each ref update:
+
+1. A remote ref matches only a pattern with a remote part, and a local ref
+   only a pattern without one.
+2. A literal remote part has precedence over `*:`.
+3. The kinds of the parts of the name part compare from the left. At the first
+   part where two patterns differ in kind, a literal has precedence over `*`,
+   and `*` has precedence over `**`. If the kind list of one pattern is a
+   leading run of the kind list of the other, the longer pattern has
+   precedence. The text of a literal part has no effect on precedence. If the
+   two kind lists are equal, the first rule in the file applies.
+4. A local ref that no pattern matches gets the default rule. The server
+   refuses a remote ref that no pattern matches with `ref-denied`.
+
+For example, on the ref `p/x/y`, the kind list of `**/y` is `**`, literal. The
+kind list of `**/x/**` is `**`, literal, `**`. The first list is a leading run
+of the second, so `**/x/**` has precedence.
+
+### Ref selectors
+
+An entry of a ref selector is a pattern with an optional first character `!`.
+An entry with the `!` is a negative entry, and each other entry is a positive
+entry. A selector selects a name when both of these conditions are true:
+
+- The selector has no positive entry, or a positive entry matches the name.
+- No negative entry matches the name.
+
+The order of the entries has no effect. So `["!a/**", "a/b"]` does not select
+`a/b`. An empty list selects every name. The parser refuses an entry with a
+second `!`, such as `!!a`.
+
+A request for a ref listing holds at most 256 entries. Positive and negative
+entries count together. A server counts each entry of the request, also an
+entry that the request holds more than one time. An entry has at most 256
+parts and 4096 bytes. A part is one element of the entry split at each `/`.
+The `!` of a negative entry counts as one byte and adds no part. A server
+checks the limits of an entry before it parses the entry.
+
+## Wire conventions
+
+The push sends frames over a byte stream or over HTTP. The pull sends frames
+over a byte stream ("The pull over HTTP and over a stream"). These rules apply
+to each message:
+
+- The frame length and the chunk length are big-endian `u32` values.
+- A message body is a GVariant in normal form. Each integer in a body is
+  little-endian, whatever the byte order of the machine. The protocol applies
+  no byte swap to a value.
+- Each checksum in a body is an `ay` of exactly 32 bytes. A checksum of
+  another length is `protocol`.
+- A ref name in a message is `NAME` for a local ref and `REMOTE:NAME` for a
+  remote ref.
+- An object type is one byte. The values are 1 for a file, 2 for a dirtree,
+  3 for a dirmeta, 4 for a commit, and 6 for detached metadata.
+- An encoding is one byte: 0 for `raw` and 1 for `deflate`. In the
+  `encodings` list of `HelloReply`, the names are `raw` and `deflate`.
+
+In this part, the reader of a message is the side that reads it, a server or
+a client. A word in code font that names an error code, such as `protocol`,
+means that the reader refuses the message with that code ("Error codes"). A
+server that refuses a message sends an `Error` with the code. An `Error` goes
+from a server to a client alone, so a client that refuses a message ends the
+session and sends no `Error`.
+
+These rules apply to each dict (`a{sv}`) in a body:
+
+- A reader ignores a key that it does not know. The value of that key must
+  still be in normal form.
+- A known key whose value has another type is `protocol`.
+- If a key occurs two times, the first one counts. The reader checks a later
+  duplicate for normal form alone.
+- The order of the keys has no effect.
+
+## Frames and the object stream
+
+### Frame layout
+
+A frame has this layout:
 
 ```text
-Compressed size (needed/total): <n> bytes/<n> bytes
-Unpacked size (needed/total): <n> bytes/<n> bytes
-Number of objects (needed/total): <n>/<n>
+u32   length, big-endian, of the bytes that follow (kind byte + body)
+u8    message kind
+...   GVariant body, normal form, of the type that the kind names
 ```
 
-The "needed" figures cover the recorded objects absent from the local store, so
-they are zero in a complete repository and count the missing objects otherwise. A
-commit that carries no such key reports `error: No metadata key ostree.sizes in
-commit` at exit 1.
+A frame holds at least the kind byte, so a frame length of 0 is `protocol`. A
+frame length greater than the current limit ("Frame limits") is
+`limit-exceeded`. The reader checks the length before it reads the body.
 
-`--print-variant-type=TYPE` reads the object argument as a filename rather than a
-revision and reports the file's bytes as a value of that type. A path that does
-not open reports `error: openat(<path>): <reason>` at exit 1.
+Each of these is `protocol`:
 
-A commit carrying GPG signatures reports them after its own report: a blank
-line, `Found <n> signature:` (or `signatures:` for more than one), then per
-signature a blank line and two indented lines, `  Signature made <date> using
-<algorithm> key ID <the fingerprint's last sixteen hex digits>` and one of
-`  Good signature from "<user id>"`, `  BAD signature from "<user id>"`, or
-`  Can't check signature: public key not found`. The exit status stays 0 whatever
-the verdict. The keyring is the repository's own `gpgkeys.gpg`;
-`--gpg-verify-remote=REMOTE` reads that remote's trusted set instead, and
-`--gpg-homedir=HOMEDIR` adds the keyrings in the named directory.
+- a kind that "Messages" does not list;
+- a body that is not in normal form for the type of its kind;
+- a body with bytes after its value;
+- an `ObjectsEnd` body that is not empty;
+- an `Abort` body other than the one byte `0x00`.
 
-### `log`
+### Chunks and the abandon marker
 
-Walks the parent chain from the given revision, newest first, and reports each
-commit exactly as `show` does: `commit <checksum>` and then the commit's own
-report. `--raw` reports `commit <checksum>` and the value in the text form for
-each commit and nothing else, the same suppression `show --raw` makes. A parent
-whose commit object is absent ends the walk with `<< History beyond this commit
-not fetched >>` on its own line, at exit 0, so a partial history reports what it
-holds; a `.commitpartial` marker changes nothing. A revision that resolves to
-nothing reports `error: Refspec '<rev>' not found` at exit 1, and with no
-argument the usage text and `error: A rev argument is required` go to standard
-error at exit 1.
-
-### `ls`
-
-Prints one line per entry:
+A body of bytes follows two kinds of frame: an `ObjectHeader` of the push, and
+a `GetReply` of the pull whose `found` is true. The body is a sequence of
+chunks. A chunk has no kind byte. It has this layout:
 
 ```text
-<type><mode> <uid> <gid> <size>[ <checksum>...][ { <xattrs> }] <path>[ -> <target>]
+u32   length, big-endian
+...   that number of bytes
 ```
 
-The type is `d` for a directory, `-` for a regular file, and `l` for a symlink.
-The mode is the permission bits alone (`mode & 07777`) in five octal digits, so
-`00755`, `00644`, and a symlink's `00777`. The uid and gid are decimal with no
-padding. The size is right-aligned in six columns: the payload size of a regular
-file, and zero for a directory and for a symlink. The path is absolute, and a
-symlink adds ` -> ` and its target.
-
-`-C`/`--checksum` inserts the checksums after the size: one for a file, its
-content checksum, and two for a directory, its dirtree and then its dirmeta.
-`-X`/`--xattrs` inserts the entry's `a(ayay)` xattr set after them, wrapped in
-`{ ` and ` }`, so an entry with none reports `{ @a(ayay) [] }`.
-`--nul-filenames-only` prints the paths alone, each followed by a NUL, with no
-columns, no target, and no newline; it overrides `-C` and `-X`.
-
-Order and recursion. A directory reports itself and then its entries: its files
-in name order, then its subdirectories in name order, which is the order the
-dirtree stores them in rather than one merged sort, so a directory `aaa` follows a
-file `zzz`. `-R`/`--recursive` follows each subdirectory's contents immediately
-after the line naming it. `-d`/`--dironly` reports the directory alone.
-
-With no `PATH` the tree root is the directory listed. Each `PATH` is listed in
-turn, a leading `/` optional, and a `PATH` naming a file reports that one line. A
-`PATH` naming nothing reports `error: Inspecting path '<argument>': No such file
-or directory: <absolute path>` at exit 1, quoting the argument as given and
-naming the absolute path it resolved to. An empty `PATH` resolves to the root and
-is refused all the same, `error: Inspecting path '': No such file or directory:
-/`. With no `COMMIT` the usage text and `error: An COMMIT argument is required`
-go to standard error at exit 1, the tool's own wording.
-
-### `config get`
-
-Prints the value and a newline at exit 0. The key is `sectionname.keyname`, split
-on its first `.`, so `config get a.b.c` reads the key `b.c` in the group `a`.
-`--group=GROUP` names the section instead and the argument is then a whole key
-name, dots included.
-
-The value is unescaped as GKeyFile defines: `\n`, `\t`, and `\\` become the
-characters they name. Whitespace after the `=` is dropped and trailing whitespace
-is kept. A `;` is an ordinary character, a `"` is not a quote, and a value with
-nothing after the `=` prints an empty line.
-
-The refusals, each exit 1 with no usage text: a key holding no `.` with no
-`--group` reports `error: Key must be of the form "sectionname.keyname"`, in
-ASCII double quotes; a group the file does not hold reports `error: Key file does
-not have group “<group>”`; a key the group does not hold reports `error: Key file
-does not have key “<key>” in group “<group>”`; no key at all reports `error: KEY
-must be specified`, or `error: Group name and key must be specified` when
-`--group` was given; and an operation that is not `get`, `set`, or `unset`
-reports `error: Unknown operation <operation>`. The two messages naming a group
-or a key quote it in typographic quotes (U+201C and U+201D), the pair GLib uses.
-
-Two checks stand ahead of the operation name, each printing the usage text and
-then its error line at exit 1, and both after the repository resolves. With no
-operation at all: `error: OPERATION must be specified`. With more operands than
-the operation takes: `error: Too many arguments given`. The allowance is one
-operand beside the operation, and two for `set`, which takes a key and a value, so
-`get KEY EXTRA`, `unset KEY EXTRA`, and `set KEY VALUE EXTRA` are each refused
-while `set KEY VALUE` is not. An operation the tool does not know gets the
-one-operand allowance, so `<unknown> KEY EXTRA` reports the count and
-`<unknown> KEY` reports the unknown operation.
-
-### `config set` and `config unset`
-
-Both write the whole document back and print nothing at exit 0. The key is read
-the way `config get` reads it: `sectionname.keyname` split on its first `.`, or a
-whole key name under `--group=GROUP`.
-
-`set` takes a key and a value. A group the document does not hold is appended
-after a blank line; a key its group does not hold is appended at the end of that
-group; a key already there keeps its position and takes the new value. The value
-is escaped as GKeyFile defines on write: a backslash becomes `\\`, a newline
-`\n`, and a carriage return `\r` anywhere in the value, and within the leading
-whitespace run each space becomes `\s` and each tab `\t`. A space or tab
-elsewhere, and a `;`, are written literally.
-
-`unset` takes a key. Removing a group's last key leaves the group header in the
-file with no entries. A key the document does not hold, and a group it does not
-hold, are both success and leave the file untouched.
-
-The rewritten document keeps the groups and keys the operation did not touch, in
-the order it read them, and drops the comment and blank lines the input carried.
-The file is replaced atomically at mode `0644`.
-
-The refusals, each exit 1 with no usage text: `set` with fewer than two operands
-reports `error: KEY and VALUE must be specified`, or `error: GROUP name, KEY and
-VALUE must be specified` when `--group` was given; `unset` with no operand
-reports `error: KEY must be specified`, or `error: Group name and key must be
-specified` under `--group`; and a key holding no `.` with no `--group` reports
-`error: Key must be of the form "sectionname.keyname"`. The operand-count check
-and the missing-operation check of `config get` stand ahead of all of these.
-
-### `remote`
-
-`remote` takes a nested subcommand. A missing one reports the subcommand's usage
-text and `error: No "remote" subcommand specified` at exit 1, before any
-repository is resolved.
-
-`remote add NAME URL [BRANCH...]` writes the `[remote "NAME"]` section and prints
-nothing at exit 0. The keys are written in this order:
-
-- `url`, or `metalink` when the URL carries the `metalink=` prefix, which is
-  stripped. A `mirrorlist=` prefix is not stripped and stays in the `url` value.
-- `branches`, when branches were given: each followed by `;`, the last one
-  included.
-- `contenturl`, from `--contenturl=URL`.
-- `custom-backend`, from `--custom-backend=NAME`.
-- each `--set=KEY=VALUE` pair, in the order given.
-- `gpg-verify=false`, from `--no-gpg-verify` and from `--no-sign-verify`, which
-  turns both checks off.
-- `sign-verify=false`, from `--no-sign-verify`.
-- `verification-<engine>-key` or `verification-<engine>-file` per
-  `--sign-verify=KEYTYPE=inline:PUBKEY` or `--sign-verify=KEYTYPE=file:PATH`,
-  followed by `sign-verify` naming the engines, comma separated, in the order
-  given.
-- `collection-id`, from `--collection-id=ID`.
-
-A remote name is at least one character; every character is alphanumeric or one
-of `-`, `_`, `.`; and the first is alphanumeric or `_`. So `_`, `1o`, `a..b`, and
-a non-ASCII letter are names, and ``, `-`, `.`, `..`, `a b`, `a/b`, and `a+b` are
-not. A refused name reports `error: Invalid remote name <name>` at exit 1 and
-writes nothing. `add` and `delete` hold their operand to this rule; the reading
-subcommands do not, so a name of any shape simply names no section.
-
-A section already there reports `error: Remote configuration for "<name>" already
-exists: (in config)` at exit 1. `--if-not-exists` leaves it as it stands at exit
-0, `--force` replaces the section whole, and naming both reports the usage text
-and `error: Can only specify one of --if-not-exists and --force`. A `--set` value
-holding no `=` reports `error: Missing '=' in KEY=VALUE for --set`, and a
-`--sign-verify` value that is not `KEYTYPE=inline:DATA` or `KEYTYPE=file:DATA`
-reports `error: Failed to parse KEYTYPE=[inline|file]:DATA in <value>`, both at
-exit 1 with no usage text. A missing NAME or URL reports the usage text and
-`error: NAME and URL must be specified`.
-
-`remote delete NAME` removes the section and the remote's
-`<remote>.trustedkeys.gpg` keyring, and prints nothing at exit 0. A section the
-document does not hold reports `error: Remote "<name>" not found` at exit 1,
-which `--if-exists` turns into exit 0. The port removes the keyring before it
-writes `config`, so a failed write of `config` leaves the section with no
-keyring.
-
-`remote list` prints one name per line, sorted by name, whatever order the
-sections appear in. `-u`/`--show-urls` prints each name padded with spaces to the
-longest name of the whole list plus two, counted in bytes, followed by the
-remote's `url`. A section stating no `url` -- a metalink remote, for one --
-reports `error: No "url" option in remote "<name>"` at exit 1 where its turn
-comes, so the names before it are already printed.
-
-`remote show-url NAME` prints the `url` value and a newline, and reports the same
-two refusals: `error: Remote "<name>" not found` and `error: No "url" option in
-remote "<name>"`.
-
-`remote refs NAME` fetches the remote's summary and prints one `NAME:REF` line
-per ref the summary lists, in the order it lists them. `-r`/`--revision` adds a
-tab and the commit checksum to each line. A remote publishing no summary reports
-`error: Remote refs not available; server has no summary file` at exit 1.
-
-`remote summary NAME` fetches the same summary and reports it. `--raw` prints the
-whole document in the GVariant text form, with the big-endian fields converted;
-`--list-metadata-keys` prints the global metadata keys, sorted;
-`--print-metadata-key=KEY` prints one value in the annotated text form, with the
-same conversion, and reports `error: No such metadata key '<key>'` at exit 1 for
-a key the dict does not hold. A remote publishing no summary reports `error:
-Remote server has no summary file`.
-
-The default report prints each ref of field 0, then the refs of every collection
-`ostree.summary.collection-map` lists, then the global metadata. One ref reads:
-
-```
-* main
-    Latest Commit (150 bytes):
-      21386ebf0c349ce54f2196fb4ec77f5a4dc57d03d4a4d5a97c61a9542c9e5e23
-    Version (ostree.commit.version): 1.2.3
-    Timestamp (ostree.commit.timestamp): 2023-11-14T22:30:00+00
-```
-
-A blank line follows each ref. A summary stating `ostree.summary.collection-id`
-names every ref of field 0 as a pair, `* (org.example.C, main)`, and each
-collection-map ref is named as a pair with its own collection. The `Version` line
-appears only where the ref metadata carries the key, and its string prints
-unquoted. The `Timestamp` line converts the stored big-endian field and renders
-it as `YYYY-MM-DDTHH:MM:SS` and a UTC offset.
-
-`summary -m` can store any value under `ostree.summary.collection-map`, so the
-report reads the map with no refusal. A value of type `a{sa(s(taya{sv}))}`
-lists its refs. A value of any other type lists no refs, and the metadata line
-still prints `(printed above)`. A commit checksum in the map that is not 32
-bytes prints `Invalid checksum of length <n> expected 32` in place of the hex,
-and the other lines of the ref print as usual.
-
-The global metadata prints in the order the summary stores it, one line per
-entry, with a label for each key the format defines:
-
-```
-Repository Mode (ostree.summary.mode): archive-z2
-Last-Modified (ostree.summary.last-modified): 2026-08-05T19:40:49+00
-Has Tombstone Commits (ostree.summary.tombstone-commits): No
-Static Deltas (ostree.static-deltas): {'<from>-<to>': <[byte 0xeb, 0x57]>}
-Collection Map (ostree.summary.collection-map): (printed above)
-Collection ID (ostree.summary.collection-id): org.example.C
-Expires (ostree.summary.expires): 2023-11-14T22:13:20+00
-ostree.summary.indexed-deltas: true
-```
-
-`Last-Modified` and `Expires` convert their big-endian field the way a
-`Timestamp` line does. The three read the field as a signed count of seconds
-and write the year with no zero padding, so the first second of year 1 reads
-`1-01-01T00:00:00+00`. An instant before year 1 or after year 9999 prints
-`invalid`. `Has Tombstone Commits` prints `Yes` or `No`. `Collection Map` prints
-`(printed above)`, its refs having been reported with the others. A key the
-format does not define, `ostree.summary.indexed-deltas` among them, prints its
-own name and its value; a string value prints unquoted where the key carries a
-label and quoted where it does not. `Static Deltas` is read as a whole value,
-so a string stored under its key prints quoted too. Every value outside the
-labeled set prints in the GVariant text form with no type annotation and no
-byte-order conversion, so a `t` value stored little-endian reads as the number
-it holds.
-
-`remote gpg-import NAME [KEY-ID...]` adds the keys of each `-k`/`--keyring=FILE`,
-or of standard input under `--stdin`, to the remote's `<remote>.trustedkeys.gpg`
-keyring, and prints `Imported <n> GPG key to remote "<name>"` -- `keys` for any
-count but one. The count is the keys the keyring did not already hold, so a
-repeated import reports `0`. The keyring the port writes keeps the packets it
-held and carries the packets of each added certificate, with the Trust packets
-of the offered stream dropped. A certificate offered for a key the keyring
-already holds changes nothing, with two exceptions, each of which replaces the
-held certificate, rewrites the keyring, and drops the Trust packets it carried:
-one carrying a key revocation signature that verifies under the key it revokes,
-and one stating a key expiry later than the held certificate states, an absent
-expiry counting as later than any instant. That key is still counted as one the
-keyring already held, so such an import reports `0` and writes a keyring
-holding the offered certificate. The offered stream and the keyring the remote
-already holds reach one keyring reader, so a keyring carrying bytes past its
-last framed packet takes no import: such an import is refused by the name of
-the keyring and writes no keyring. A `KEY-ID` selects the
-keys it names out of the
-source: a fingerprint, a key id, or a user id substring, with
-`../conformance/cli-surface.md`, "P3", recording where the two dialects part
-and what the tool's own keyring holds instead.
-Naming both sources reports the
-usage text and `error: --keyring and --stdin are mutually exclusive`; a
-`--keyring` naming no file reports `error: Error opening file <path>: <reason>`,
-which is read before the remote is looked up; and a remote the configuration does
-not describe reports `error: GPG: Remote "<name>" not found`, the one message at
-this site carrying the prefix.
-
-`remote gpg-list-keys NAME` reports each key of the remote's keyring:
-
-```
-Key: FA2B2317C9966572B5D729EDCA965442280A3BB5
-  Created: 2026-08-05 20:04:00 +0000
-  UID: Ostrya Test <test@example.invalid>
-```
-
-A key with more than one user id carries one `UID` line per id, and a keyring
-that is absent or holds no key prints nothing at exit 0. The tool follows each
-`UID` line with an `Advanced update URL` and a `Direct update URL` line naming
-the key's Web Key Directory location, and renders `Created` in the host locale
-and time zone; `../conformance/cli-surface.md`, "P3", records both.
-
-### `export`
-
-The command writes the tar stream and no line of its own. The stream's member
-naming, its metadata conventions, its member order, and the four options that
-shape it are stated under "tar" above, together with what `-o` does to its
-destination.
-
-### `prune`
-
-The command writes two lines to standard output and nothing to standard error.
-`-v` adds `OT: ` trace lines on standard error and leaves standard output
-unchanged. Over a repository whose config sets `[core] locking` false the port
-writes one line of its own to standard error before the run, which the tool does
-not (`conformance/cli-surface.md`, "prune").
-
-The first line states how many objects the run considered.
-
-```
-Total objects: <count>
-```
-
-Under `--commit-only` the first line names the restriction and counts commit
-objects alone.
-
-```
-Total (commit only) objects: <count>
-```
-
-The count covers the loose objects the run read. Detached commit metadata
-(`.commitmeta`), tombstone markers (`.tombstone-commit`), and static deltas are
-outside it. The count is taken after `--delete-commit` has removed its target,
-so deleting one commit lowers it by one.
-
-The second line states the outcome.
-
-```
-No unreachable objects
-Deleted <count> objects, <size> freed
-Would delete: <count> objects, freeing <size>
-```
-
-The first form is written where the run deletes nothing, whether or not
-`--no-prune` was given. The third is written under `--no-prune`, and the second
-otherwise. `<count>` is never pluralized: a run deleting one object writes
-`Deleted 1 objects`.
-
-`<size>` is a decimal (SI) rendering of the bytes the deleted objects occupied
-on disk. Below 1000 bytes it is the byte count, a space, and the word `byte` or
-`bytes`, singular at exactly 1. At 1000 bytes and above it is the count divided
-by the largest power of 1000 that leaves it at or above 1, printed with one
-fractional digit, then U+00A0 NO-BREAK SPACE, then the unit `kB`, `MB`, `GB`,
-`TB`, `PB`, or `EB`. The unit is chosen from the byte count and not from the
-rounded value, so 999999 bytes render as `1000.0 kB` and 1000000 as `1.0 MB`.
-
-```
-0          -> 0 bytes
-1          -> 1 byte
-673        -> 673 bytes
-999        -> 999 bytes
-1000       -> 1.0 kB
-1073       -> 1.1 kB
-1172       -> 1.2 kB
-100172     -> 100.2 kB
-999999     -> 1000.0 kB
-1000000    -> 1.0 MB
-1500173    -> 1.5 MB
-1000000173 -> 1.0 GB
-```
-
-The bytes a deleted `.commitmeta` freed are not in the sum, the object not
-being in the count. Every measurement here was taken under `LC_ALL=C.UTF-8`,
-which renders the decimal separator as `.`
-(`conformance/cli-surface.md`, "prune").
-
-### `fsck`
-
-The command writes its phase lines and its summary lines to standard output,
-and every finding and every `error: ` line to standard error. The tool writes
-a progress line to standard output as well, which the port does not
-(`../conformance/cli-surface.md`, "fsck").
-
-#### The phase lines
-
-A run writes four phase lines, in this order, one as it enters each phase.
-
-```
-Validating refs...
-Validating refs in collections...
-Enumerating commits...
-Verifying content integrity of <N> commit objects...
-```
-
-A run that ends inside a phase writes the lines up to and including that
-phase. `-q`/`--quiet` suppresses these four lines and nothing else: the
-tombstone lines, the partial-commit line, the summary line, and every finding
-are still written.
-
-`<N>` is the number of commit objects in the store that carry no
-`state/<commit>.commitpartial` marker.
-
-Phase 1 reads every ref under `refs/heads` and `refs/remotes` and loads the
-commit object each names. Phase 2 reads every collection-qualified ref -- the
-local refs qualified by the repository's own `[core] collection-id`, plus the
-refs under `refs/mirrors/<collection-id>/` -- and loads the same way. Both
-phases verify the commit object's checksum. Phase 3 lists the commit objects
-and separates the ones already marked partial. Phase 4 walks the objects the
-verified commits reference and verifies each.
-
-#### The progress line
-
-The tool writes a progress line to standard output. The port writes none: its
-report carries the object count and its terminal output reports no progress
-(`../conformance/cli-surface.md`, "fsck").
-
-```
-fsck objects (<n>/<total>) <pct>%
-```
-
-`<n>` is the count of objects verified, `<total>` the count of distinct
-objects the verified commits reference, and `<pct>` is
-`floor(n * 100 / total)`. The tool writes the first update, the last one, and
-about one more a second between them, so a short run writes two lines and a
-long run writes more. A run that ends before it verifies an object writes
-none, and a run over a store of zero objects writes none either.
-
-`<total>` counts the objects the verified commits reach, present or absent,
-and not the loose objects on disk. An object reachable only from a commit the
-run skipped is outside it, an object that is referenced and absent is inside
-it, detached commit metadata (`.commitmeta`) is outside it, and a static delta
-is outside it. `FsckReport::objects_checked` is the port's own count over the
-same set.
-
-#### The summary lines
-
-```
-object fsck of <N> commits completed successfully - no errors found.
-<N> partial commits not verified
-```
-
-The first line closes a run that found no fault and skipped no commit, and
-goes to standard output at exit 0. The second states the commits phase 3
-skipped, goes to standard output, and is paired with
-`error: <N> partial commits from fsck-detected corruption` on standard error
-at exit 1. `--add-tombstones` suppresses the standard-output line and keeps
-the error line.
-
-#### The findings
-
-A faulty object draws one line naming the commits that reach it.
-
-```
-In commits <c>, <c>: fsck content object <checksum>: Corrupted file object; checksum expected='<name>' actual='<computed>'
-In commits <c>, <c>: fsck <checksum>.<type>: Corrupted <type> object; checksum expected='<name>' actual='<computed>'
-Object missing in commits <c>, <c>: <checksum>.<type>
-```
-
-`<type>` is the mode-independent type string, so a content object is `file`
-even in an `archive` repository, where the loose object is a `.filez`. A
-commit object a ref names is read by phase 1 or phase 2, which reaches no
-commit through it, so its finding drops the `In commits <list>: ` prefix.
-
-The tool's run carrying neither `-a/--all` nor `--delete` ends at the first
-object whose checksum does not match and writes that finding as its own
-`error: ` line. Every other run of the tool, and every run of the port, writes
-each finding plain and closes with `error: Repository corruption encountered`.
-An object that is absent never ends a run, whatever the switches: it is
-reported and the walk goes on. Every commit that reaches an absent object is
-marked partial, each marking drawing
-
-```
-Marking commit as partial: <commit>
-```
-
-A checksum mismatch marks no commit by itself. Under `--delete` the object is
-unlinked and the commits that reach it are then marked.
-
-A metadata object whose bytes do not read as the type its name gives it is
-outside that. The port reports the mismatch, unlinks nothing, and marks
-nothing: an object it cannot read at its own type is an object it cannot say
-the repository is better without. The tool reads such an object under
-GVariant's own rules for data that is not in normal form, and what it does
-next follows what those rules yield (`../conformance/cli-surface.md`,
-"fsck").
-
-The port's run never ends at a fault it can read past, so it reports every
-faulty object one walk reaches and marks every commit an absent object leaves
-incomplete. It ends a run where it cannot read what it must read next -- a ref
-over an absent commit object and an absent dirtree -- and where a binding check
-fails (`../conformance/cli-surface.md`, "fsck").
-
-A dirtree that is absent ends the run, the subtree beneath it being
-unreadable, and marks nothing:
-
-```
-error: No such metadata object <checksum>.dirtree
-```
-
-A ref over a commit object the store does not hold ends the run in the phase
-that read the ref:
-
-```
-Object missing: <checksum>.commit
-error: Loading commit for ref <name>: No such metadata object <checksum>.commit
-```
-
-`<name>` is the bare ref name for a ref under `refs/heads` or `refs/remotes`,
-the remote prefix dropped, and `(<collection-id>, <name>)` for a ref under
-`refs/mirrors`.
-
-#### The binding checks
-
-`--verify-bindings` adds one check to each of the two ref phases, and each
-ends the run at its first failure whatever the other switches say. A commit
-carrying no `ostree.ref-binding` key passes.
-
-```
-error: Commit <c>: Commit has no requested ref ‘<ref>’ in ref binding metadata (‘a’, ‘b’)
-error: Commit <c>: Commit has collection ID ‘<bound>’ in collection binding metadata, while the remote it came from has collection ID ‘<found>’
-```
-
-The parenthetical lists the stored bindings in stored order, each in U+2018
-and U+2019 quotes, separated by `, `, and reads `(no refs)` for an empty list.
-
-`--verify-back-refs` adds a per-commit check to the enumerate phase, over
-every commit object in the store. Each name in a commit's
-`ostree.ref-binding` must name a ref that resolves to that commit, the refs
-under `refs/remotes` counting by their bare names, and where the commit
-carries an `ostree.collection-binding` the collection ref `(binding, name)`
-must exist and resolve to it as well.
-
-```
-error: Ref ‘<name>’ in bindings for commit <c> does not exist
-error: Ref ‘<name>’ in bindings for commit <c> does not resolve to that commit
-error: Collection–ref (<id>, <name>) in bindings for commit <c> does not exist
-error: Collection–ref (<id>, <name>) in bindings for commit <c> does not resolve to that commit
-```
-
-The dash in `Collection–ref` is U+2013 EN DASH. The check fails on any branch
-carrying more than one commit, the parent holding the branch name its tip
-resolves to.
-
-The two options are independent. Naming `--verify-back-refs` alone runs the
-back-reference check alone, and the order the two are written in makes no
-difference, the bindings check running first because its phase runs first.
-
-#### `--add-tombstones`
-
-The option acts on a commit object whose `parent` names a commit object the
-store does not hold. It deletes that commit object, writes the
-`.tombstone-commit` naming it, and writes one line after the object walk:
-
-```
-Adding tombstone for commit <commit>
-```
-
-The step runs after the object walk. The tool's run that ended at its first
-fault never reaches it and writes no tombstone, and `-a` and `--delete` carry
-that walk to its end so the step then runs beside the findings. The port's walk
-always reaches its end, so the port holds the step to the same condition
-directly: it acts after a walk that found a corrupt object under `-a` or
-`--delete` alone. An absent object ends no walk, so the step runs beside one
-under neither switch (`../conformance/cli-surface.md`, "fsck").
-
-The absence is read against the object listing the run took at its start, so
-one run removes one generation, and a branch whose history is broken loses one
-commit per run. The run exits 0: an absent parent commit is not a fault, and a
-run with no option over the same repository reports nothing. The option needs
-no `[core] tombstone-commits` setting, and an existing tombstone for the
-absent parent does not suppress the action. The branch ref is left standing
-over the deleted commit, so the next run ends in the ref phase.
-
-#### Exit status
-
-- 0 -- the repository is sound, or the only condition found is an absent
-  parent commit.
-- 1 -- any faulty object, any commit skipped as already partial, any ref over
-  an absent commit, any absent dirtree, and any binding failure.
-
-`-q` never changes an exit status. In the tool, `--delete` continues past the
-first fault whether or not `-a` is given, and `-a` carries the ref phase and
-the collection phase past a commit object whose checksum does not match, as it
-carries the object walk. It carries nothing past a ref over an absent commit
-object, a `--verify-bindings` failure, or a `--verify-back-refs` failure: each
-of those ends the run where it stands. The port's walk runs to the end whatever
-the switches say, so it reads `-a` as the permission `--add-tombstones` needs
-to act after a walk that found a corrupt object, and it ends a run at the same
-three conditions. `-a` changes no exit status in either implementation.
-
-### `diff`
-
-The command compares two sides and writes the paths that changed. A side is a
-commit in the repository or a directory on the filesystem.
-
-The per-path lines and the stats block go to standard output, and every
-`error: ` line goes to standard error. A run that compares two readable sides
-exits 0, whether or not it found a difference.
-
-#### The per-path line
-
-```
-<prefix><four spaces><path>
-```
-
-The prefix is one of three characters, and there is no fourth.
-
-- `A` -- the path is on the second side alone.
-- `D` -- the path is on the first side alone.
-- `M` -- the path is on both sides and its stored form differs.
-
-#### What a change is
-
-`M` covers a content change, a mode change, an ownership change, an extended
-attribute change, a symlink target change, a directory metadata change, and a
-name whose type differs between the two sides. Modification time is outside the
-comparison.
-
-For a commit side the comparison reads the checksums the directory tree objects
-hold, so no payload is read.
-
-- A regular file or a symlink differs where its content object checksum
-  differs. That checksum covers the uid, the gid, the mode, the extended
-  attributes, the symlink target, and the payload.
-- A directory differs where its directory metadata checksum differs. That
-  checksum covers the uid, the gid, the mode, and the extended attributes.
-- A device node, a fifo, and a socket carry no prefix of their own. Such an
-  entry is `A` where it is on one side alone, and `M` where the other side
-  holds a regular file or a symlink of the same name. Two of them of one name
-  differ where their mode differs. The kernel takes a `user.*` extended
-  attribute on a regular file and a directory alone, and a uid and a gid need
-  privilege to set, so the mode is the one field of such a pair an unprivileged
-  run varies and the one this reference states.
-- A name held by a directory on one side and by a file on the other differs,
-  and the comparison does not descend into it.
-
-The root directory's own metadata is outside the comparison.
-
-A directory side is read as the filesystem holds it, so a repository whose mode
-reduces what a commit records -- `bare-user-only` -- compares its reduced
-objects against the full form the directory carries.
-
-A directory side names an entry with the bytes the directory returned, so a
-name that is not valid UTF-8 is listed, descended into, and written to standard
-output as those bytes. A symlink target that is not valid UTF-8 reaches the
-comparison as one value, so two such targets of one name compare equal and a
-valid target differs from every one of them.
-
-#### The groups and the order
-
-A run collects three lists and prints them in the order `M`, `D`, `A`. Within
-one list the order is the order the walk found the entries.
-
-The walk starts at the two root directories and, at each pair of directories of
-one name, runs two passes.
-
-1. The first pass reads the first side's entries in that side's own order. An
-   entry the second side does not hold is `D`, and a removed directory's former
-   children are not listed. An entry both sides hold whose stored form differs
-   is `M`. Where both sides hold a directory of that name, the pass descends
-   into the pair where it stands, before it reads the first side's next entry.
-2. The second pass reads the second side's entries in that side's own order. An
-   entry the first side does not hold is `A`. An added directory lists itself,
-   then its own entries in that side's order, descending into each
-   subdirectory where it stands.
-
-A side's own order is:
-
-- for a commit side, the files of the directory in stored order, then the
-  subdirectories of the directory in stored order. Both arrays a directory tree
-  object holds are sorted by name, so the order is the file names sorted
-  followed by the subdirectory names sorted;
-- for a directory side, the order the directory returns its entries in, with
-  files and subdirectories interleaved as the directory returns them.
-
-#### How a path prints
-
-An `M` or a `D` path is named the way the first side names it. An `A` path is
-named the way the second side names it. A commit side names a path with a
-leading `/`. A directory side names a path relative to the directory the
-argument gave, with no leading separator.
-
-#### The stats block
-
-```
-[A] Object Count: <count>
-[B] Object Count: <count>
-Common Object Count: <count>
-Common Object Size: <size>
-```
-
-`[A]` and `[B]` are literal. The first two counts are the size of each commit's
-own object set. That set holds the commit object, the root directory metadata
-object, every directory tree object, every further directory metadata object,
-and every content object the commit's tree reaches. It holds neither the
-commit's parents nor its detached metadata object.
-
-`Common Object Count` is the size of the intersection of the two sets.
-`Common Object Size` is the sum of the on-disk sizes of the loose object files
-of that intersection, so an `archive` repository counts the compressed size and
-a `bare` repository counts the payload size. The rendering is the one the
-`prune` totals line uses, stated under `prune` above: below 1000 bytes the
-count, a space, and `byte` or `bytes`; at 1000 and above the count divided by
-the largest power of 1000 that leaves it at or above 1, one fractional digit,
-U+00A0, and the unit. An empty intersection prints `0 bytes`.
-
-#### The arguments
-
-The command takes one or two positional arguments.
-
-An argument is a directory on the filesystem where it begins with `/` or with
-`./`, and a revision otherwise. The rule reads the argument's spelling alone, so
-an existing directory named by a relative path without `./` is read as a
-revision, and `.` and `..` are revisions.
-
-With one argument, the first side is that argument with `^` appended and the
-second side is the argument as given. The classification rule above is applied
-to the appended form.
-
-`--stats` reads both arguments as revisions, whatever their spelling, so a
-directory side is refused there. The per-path block is written in full before
-the stats pass runs, so a run carrying both `--fs-diff` and a directory side
-writes the block and then the refusal.
-
-#### The options
-
-- `--stats` -- print the stats block.
-- `--fs-diff` -- print the per-path block.
-- `--no-xattrs` -- read no extended attributes from a directory side. It
-  reaches both directory sides and neither commit side.
-- `--owner-uid=UID` -- give the entries of the second side the user id `UID`,
-  where that side is a directory. It reaches neither the first side nor a
-  commit side. A negative value declares nothing. The value is read as a C
-  `int`, the reader `commit` above states in full.
-- `--owner-gid=GID` -- the same for the group id.
-
-With neither `--stats` nor `--fs-diff`, the per-path block prints. With
-`--stats` and no `--fs-diff`, it does not. With `--stats`, the stats block
-prints after the per-path block, whatever order the two flags were given in.
-
-#### Exit status
-
-- 0 -- both sides were read, whether or not a difference was found.
-- 1 -- a side that cannot be read, a revision that does not resolve, and an
-  object the store cannot supply.
-
-### `sign`
-
-`sign --verify COMMIT [KEY-ID...]` checks the signatures of one commit. The
-options are `-s`/`--sign-type=NAME`, `--keys-file=PATH`, and
-`--keys-dir=PATH`.
-
-Under the `ed25519` and `spki` engines, the key sources are the ones
-"`static-delta`", "`verify`", states:
-
-- Each positional KEY-ID and each line of the last `--keys-file` are trusted.
-  An earlier `--keys-file` is not read.
-- With a KEY-ID or a `--keys-file`, `--keys-dir` and the system key
-  directories are not read, and no key is revoked.
-- With neither, the last `--keys-dir` supplies the trusted and revoked keys.
-  Without `--keys-dir`, the system key directories supply them. An empty
-  `--keys-dir` names the working directory.
-- No trusted key reports `error: signature: <type>: no keys loaded`. The check
-  comes before revocation.
-- A key is decoded with the lenient base64 reader, and a `--keys-file` is read
-  under the rules of that section: a regular file, symlinks followed, up to
-  1 MiB.
-
-Every key source loads before a signature is read. A key source that does not
-load refuses the run at exit 1 with nothing on standard output: `no keys
-loaded`, `File object '<path>' is not a regular file`, `no valid keys in file
-'<path>'`, and `Invalid ed25519 public key: Ill-formed input: expected 32
-bytes, got <n> bytes`.
-
-Under the `gpg` engine, a port engine on `sign`, each `--keys-file` is a
-keyring, and every keyring given is read. The engine refuses `--keys-dir`.
-
-The port's report writes one line for each signature, `signature <n>: good`,
-`signature <n>: no public key`, or `signature <n>: BAD`, then `verification
-OK` at exit 0 or `verification FAILED` at exit 1. A commit with no signature
-of the engine writes `no signatures found` at exit 1. All of these lines go to
-standard output. The tool words the report differently, which
-`../conformance/cli-surface.md`, "P2", `sign`, records.
-
-Signing and `-d`/`--delete` read every `--keys-file` given.
-
-### `summary`
-
-`summary` writes the repository summary, signs it, or reads it. The writing
-options are `-m`/`--add-metadata=KEY=VALUE`, `--sign=KEY-ID`,
-`--gpg-sign=KEY-ID`, and `--sign-type`, all read with `-u` alone. The four
-reading options are `-v`/`--view`, `--raw`, `--list-metadata-keys`, and
-`--print-metadata-key=KEY`. All of them read `<repo>/summary` and nothing else;
-`summary.sig` is never opened by a reading option, so a signed summary and an
-unsigned one report the same text.
-
-The precedence is fixed and does not follow the order the switches are written
-in:
-
-1. `--verify` reports the signatures and returns. The option is a port
-   extension the tool does not carry. The key sources are the ones `sign
-   --verify` takes ("`sign`"), and the report is the port's `sign --verify`
-   report.
-2. `-u`/`--update` checks the writing options, regenerates the summary, signs
-   it, returns, and writes no report.
-3. A signing key given as a positional argument or with `--keys-file` signs the
-   summary that stands and returns. The two are port extensions, and the arm is
-   the divergence `cli-surface.md`, "summary", records.
-4. `--raw`.
-5. `-v`/`--view`.
-6. `--list-metadata-keys`.
-7. `--print-metadata-key=KEY`.
-
-Arms 1 and 3 are the port's own. Arms 2 and 4 through 7 are the order the tool
-takes, measured by giving it each competing pair in both orders.
-
-With no option at all the command refuses at exit 1. Without `-u` the writing
-options are read by nothing: beside a reading option they are inert, and the
-report is written, and alone they draw the no-option refusal before any value
-is read. The port draws that refusal before it reads a positional key. A
-repository holding no `summary` file refuses every reading option at exit 1
-with nothing on standard output.
-
-Under `-u` every check runs before the regeneration, in this order, so a
-refusal leaves `summary` and `summary.sig` as they stood and a ref added since
-is not listed:
-
-1. Each `-m` argument, in command-line order. The argument splits at its first
-   `=`, and a missing `=` reports `error: Missing '=' in KEY=VALUE metadata
-   '<arg>'`. The value is then parsed in the GVariant text form before the next
-   argument is read, and a parse failure reports `error: Error parsing variant
-   ‘<value>’: : <offsets>:<reason>`, with U+2018 and U+2019 around the value.
-   The empty key is accepted.
-2. Each `--gpg-sign` lookup, in command-line order, in the home directory
-   `--gpg-homedir` names. A selector under eight bytes reports `error: Unable to
-   lookup key ID <sel>: GPGME: Invalid value`, one naming no key reports
-   `error: No gpg key found with ID <sel> (homedir: <path>)`, and one naming
-   several reports `error: gpg key id <sel> ambiguous (homedir: <path>). Try
-   the fingerprint instead`. The homedir term is the literal `<default>` where
-   `--gpg-homedir` is absent. `--gpg-homedir` with no `--gpg-sign` is not
-   opened.
-3. `--sign-type`, read only where `--sign` names a key. The last occurrence
-   decides. `dummy` reports `error: dummy signature type is only for ostree
-   testing`, and a name no engine carries reports `error: Requested signature
-   type is not implemented`. With no key the name is not read.
-4. Each `--sign` key, in command-line order. A key that is not a 64-byte
-   ed25519 secret reports `error: Invalid ed25519 secret key: Ill-formed input:
-   expected 64 bytes, got <n> bytes`. The port also refuses a 64-byte value
-   whose trailing 32 bytes are not the public key of the leading 32-byte seed,
-   64 zero bytes among them, with `error: signature: ed25519 secret key:
-   signature error: Mismatched Keypair detected`. The tool signs with such a
-   value, which is the divergence `cli-surface.md`, "summary", records. The
-   port's gpg engine, which the tool's build does not carry for `--sign`, looks
-   up each key here with the refusals of check 2.
-5. In the port, the positional and `--keys-file` keys, under the same engine. A
-   gpg selector is looked up here with the refusals of check 2.
-6. In the port, any `-m` key in a repository with a collection id, refused with
-   `error: unsupported: summary metadata keys in a repository with a collection
-   id`. The tool takes the keys and adds them to the anchor commit ("The
-   `ostree-metadata` anchor commit").
-
-The regeneration then removes `summary.sig`, and the signatures are written in
-the order "Summary signature" states, in one write of `summary.sig`.
-
-`-v`/`--view` writes the report `remote summary` writes, byte for byte: each
-ref of field 0, then the refs of every collection `ostree.summary.collection-map`
-lists, then the global metadata in stored order. The ref block, the label set,
-the `(printed above)` line, and the quoting rule for a string value are the
-rules "`remote`" above states.
-
-`--raw` writes one line: the whole document in the annotated GVariant text form
-with the big-endian fields converted, followed by one newline.
-
-`--list-metadata-keys` writes the global metadata keys, one per line, sorted
-rather than in stored order.
-
-`--print-metadata-key=KEY` writes one value, unwrapped from its `v`, in the
-annotated text form with the same conversion. A key the dict does not hold, and
-an empty key, report `error: No such metadata key '<key>'` at exit 1 with
-nothing on standard output.
-
-The report and the two annotated forms read one value two ways. `--raw` and
-`--print-metadata-key` read the whole document as a big-endian GVariant, which
-is the format's own convention. The report converts a labeled `t` field per
-field and reads every other value in host order, which is the rule "`remote`"
-above states. A value supplied with `-m`/`--add-metadata` is stored in host
-order, while the format's own `t` fields are big-endian, so the two reports
-state different numbers for such a value and each is right about a different
-thing. A summary carrying `zzz.last` as the `u` value 42 reports `zzz.last: 42`
-in the report and `uint32 704643072` under `--raw` on a little-endian host.
-
-#### Exit status
-
-- 0 -- the summary was written, signed, or reported.
-- 1 -- no option given, a writing option given without `-u` and without a
-  reading option, an absent `summary` file, a key the metadata dict does not
-  hold, and every refusal of a `-u` check above.
-
-A `summary` file whose bytes are not a document of the summary type reaches a
-repository only through a write that is neither implementation's. The tool
-reads such a file as an empty document and the port refuses it, which
-`cli-surface.md`, "summary", records.
-
-### `static-delta`
-
-`static-delta show DELTA` reports one delta's superblock and what each of its
-parts holds. `static-delta list` lists the deltas under `deltas/`, and
-`static-delta indexes` lists the `delta-indexes/` cache. The three read and
-write nothing else. `static-delta delete DELTA` removes one delta.
-`static-delta verify DELTA [KEY-ID...]` checks the signatures of one delta's
-superblock and writes nothing. The repository resolves before the argument is
-read, so `Command requires a --repo argument` stands ahead of a missing
-`DELTA`. `static-delta generate [TO]` writes one delta, and the same rule puts
-`Command requires a --repo argument` ahead of a missing `TO`.
-`static-delta apply-offline PATH [KEY-ID...]` applies one delta into the
-repository and prints nothing. `static-delta reindex [--to=REV]` rewrites the
-`delta-indexes/` cache, or the index file of one target, and prints nothing.
-
-#### The arguments
-
-The rules in this section hold for `show`, `delete`, and `verify`.
-`apply-offline` takes a path alone, and its own section states how it reads
-the path.
-
-An argument that holds a `/` is the path of a superblock file, relative to the
-working directory or absolute. Any other argument is a delta name, also where a
-file of that name exists in the working directory: `show sbfile` reports
-`error: Invalid rev sbfile`, and `show dd` for a directory `dd` holding a
-`superblock` reports `error: Invalid rev dd`.
-
-A name is `TO` or `FROM-TO`, split at the first `-`. Each half must be 64
-lowercase hex characters:
-
-- A half whose byte length is not 64 reports `error: Invalid rev <half>`, the
-  half cut to its first 64 bytes. The empty half of `C-` and `-C` reports
-  `error: Invalid rev ` with nothing after the space, and the `TO` half of
-  `C1-C2-C2` reports the first 64 bytes, `C2`.
-- A half of 64 bytes that holds a byte outside `[0-9a-f]` reports `error:
-  Invalid character '<n>' in rev '<half>'`, where `<n>` is the decimal value of
-  the first such byte: `70` for `F`, `71` for `G`.
-
-A name in the valid form reads `deltas/<fanout>/<rest>/superblock` in the
-repository, the directory "Object store layout" states. An absent delta reports
-`error: openat(deltas/<fanout>/<rest>/superblock): No such file or directory`.
-A path reports `error: openat(<path>): No such file or directory` where it is
-absent, and `error: Is a directory` where it names a directory.
-
-The part files a name reads are `deltas/<fanout>/<rest>/<i>`. The part files a
-path reads differ between the two implementations. The port reads them from the
-directory that holds the superblock file. The tool reads them from the
-repository, at `deltas/<fanout>/<rest>/<i>` for the source and target the
-superblock itself names, and opens no file beside the path.
-
-A part the superblock carries inline, in its metadata dict under the key
-`deltas/<fanout>/<rest>/<i>`, is read from the dict by the port in both forms.
-The tool reads no inline part: it opens the part file in both forms, and
-refuses where the repository holds none.
-
-#### `show`
-
-`show` writes these lines, one field per line, in this order:
-
-```
-Delta: <argument as given>
-Signed: no|yes
-From <scratch>            or   From: <hex>
-To: <hex>
-Endianness: little|big   (the tool also prints invalid or big (heuristic))
-Timestamp: <n>
-Number of parents: <n>
-Number of fallback entries: <n>
-  <fallback checksum>     (one line each, two-space indent)
-Total Fallback Size: <n> (<size>)
-Total Fallback Uncompressed Size: <n> (<size>)
-Number of parts: <n>
-PartMeta<i>: nobjects=<n> size=<n> usize=<n>
-PartPayload<i>: nmodes=<n> nxattrs=<n> blobsize=<n> opsize=<n>
-PartPayloadOps<i>: openspliceclose=<n> open=<n> write=<n> setread=<n> unsetread=<n> close=<n> bspatch=<n>
-Total Part Size: <n> (<size>)
-Total Part Uncompressed Size: <n> (<size>)
-Total Size: <n> (<size>)
-Total Uncompressed Size: <n> (<size>)
-```
-
-`From <scratch>` carries no colon; `From: <hex>` carries one. The three
-`Part` lines repeat for each part, in part order. Each field comes from the
-superblock, "Static delta wire format":
-
-- `Signed` is `yes` for a superblock in the signed envelope.
-- `Endianness` is `big` where the `ostree.endianness` byte is `B`, and `little`
-  where it is `l`. The tool prints `invalid` where the key is absent over a
-  delta whose sizes are little-endian, and where the byte is another value
-  such as `x`. It prints `big (heuristic)` where the key is absent over a
-  delta written under `B`, and then swaps the sizes. The port prints `little`
-  in these three cases.
-- `Timestamp` is field 1, read big-endian whatever the endianness byte states.
-- `Number of parents` is the byte length of field 5, the recursion array,
-  divided by 64 and rounded down. The tool writes field 5 empty.
-- The fallback line prints each fallback checksum. The two fallback totals sum
-  the compressed and the uncompressed size of each fallback.
-- `PartMeta<i>` prints the object count, `size`, and `usize` of meta entry `i`.
-- `PartPayload<i>` and `PartPayloadOps<i>` read part `i`: the table counts and
-  the member sizes the payload framing states, and the count of each opcode in
-  the operation stream (`S`, `o`, `w`, `r`, `R`, `c`, `B`).
-- `Total Part Size` sums the `size` of each part, and `Total Part Uncompressed
-  Size` sums the `usize`. `Total Size` is the part size plus the fallback size,
-  and `Total Uncompressed Size` is the part `usize` plus the fallback
-  uncompressed size.
-
-Under `B` each size field is swapped before it is printed. A 4-part delta with
-one 5,000,000-byte fallback prints `Total Size: 8602260 (8.6 MB)` and `Total
-Uncompressed Size: 8600163 (8.6 MB)`, the space before `MB` being U+00A0.
-
-The lines are written one at a time, so the lines before a refusal reach
-standard output. A missing part refuses after its `PartMeta<i>` line.
-
-The port checks each part against the size and the checksum its meta entry
-declares, before it decompresses a byte of it, and refuses a part that fails
-with `error: invalid format: static delta part checksum mismatch` or `error:
-invalid format: static delta: a stream passed the <n> byte(s) declared for it`
-after the `PartMeta<i>` line. The tool checks neither: where the part still
-decodes, it prints the counts of what it decodes.
-
-Both refuse an operation stream holding an unknown opcode, a stream that ends
-inside an operation, an `S` range past the data-source blob, or an `r` range
-past the blob. The tool prints the `PartPayload<i>` line first, and the port
-prints no `PartPayload<i>` line. Neither checks the range of a `w` with no read
-source set or of a `B`: both count the operation. An `o` whose mode or xattr
-index is outside its table makes the tool abort on `SIGABRT` after the
-`PartPayload<i>` line. The port counts it at exit 0.
-
-The port reads a part in up to three passes. It keeps the last 1 MiB of the
-payload as it finds the framing, and reads the payload again only for what
-that tail does not hold. It holds one fixed-size buffer, the tail, and the xz
-decoder's state, whatever the payload size. The decoder takes at most 128 MiB,
-and the port refuses a part whose xz stream states a dictionary that needs
-more, with `error: invalid format: static delta: part payload needs more than
-128 MiB of xz decoder memory`. The tool allocates what the stream states.
-
-#### The size wording
-
-The `<size>` term is a byte count in words:
-
-- `0 bytes`, `1 byte`, and `<n> bytes` below 1000, with an ASCII space.
-- From 1000, the unit is the largest of `kB`, `MB`, `GB`, `TB`, `PB`, and `EB`
-  whose factor, a power of 1000, the raw count reaches. The count divided by
-  that factor is printed to one decimal place, rounded from the exact double
-  with ties to even, then U+00A0 (bytes `C2 A0`) and the unit.
-
-Examples: 1000 prints `1.0 kB`, 1250 `1.2 kB`, 1750 `1.8 kB`, 999950 and 999999
-`1000.0 kB`, 1000000 `1.0 MB`, and 18446744073709551615 `18.4 EB`, each with
-U+00A0 before the unit. The wording is the same under `LC_ALL=C` and
-`C.UTF-8`. The tool formats through the C library's locale; the port always
-writes `.` as the decimal separator.
-
-#### `indexes`
-
-`indexes` prints the target commit of each index file, one per line, in full
-hex. With none it prints `(No static deltas indexes)`, also where
-`delta-indexes/` is absent.
-
-An entry is an index file when it is a regular file, not a symlink, named with
-41 bytes and `.index`, in a directory, not a symlink, named with 2 bytes directly
-under `delta-indexes/`. Every other entry is skipped: a fanout of 1, 3, or 44
-bytes, a stem of 40 or 42 bytes, the suffixes `.INDEX`, `.index.index`,
-`.index~`, and `.idx`, a directory named `*.index`, a symlink, a regular file
-used as a fanout, and a file at the top. No delta directory is read, so a target
-is listed whether or not a delta for it exists.
-
-The two implementations differ in two rules. The tool prints the targets in the
-order the directory returns them, and the port sorts them. The tool does not
-check the characters of a name: a name outside the modified-base64 alphabet, or
-whose last character carries nonzero low bits, is listed from a lenient decode,
-and for some such names the tool prints bytes the name does not determine. The
-port lists a name only where it decodes as a checksum.
-
-`delta-indexes` that is a regular file refuses at exit 1: the tool reports
-`error: opendirat: Not a directory`, and the port `error: i/o error: Not a
-directory (os error 20)`. A fanout that does not open refuses at exit 1 in both.
-
-#### `list`
-
-`list` prints the name of each delta, one per line: the target commit in full
-hex for a delta from scratch, and `<from-hex>-<to-hex>` for a delta from a
-source commit. With none it prints `(No static deltas)` at exit 0, also where
-`deltas/` is absent and where a fanout directory is empty.
-
-An entry `deltas/<fanout>/<rest>` is a delta when `<fanout>` and `<rest>` are
-directories and `<rest>/superblock` resolves. No symlink at `<fanout>` or at
-`<rest>` is followed, and a symlink at `superblock` is followed. The superblock
-is not read, so an empty file or a directory named `superblock` counts. Every
-other entry is skipped: an empty directory, a directory that holds parts and no
-superblock, a regular file, a directory whose `superblock` is a dangling
-symlink, and a symlink at `<fanout>` or at `<rest>`, also where it points to a
-directory that holds deltas or where it is a loop. A regular file directly
-under `deltas/` is skipped too. A symlink at `deltas` itself is followed, also
-where it points to a directory outside the repository, and a dangling symlink
-at `deltas` holds no delta. `show`, `verify`, `delete`, and `generate` follow
-it too, and `generate` writes the new delta below its target. A `superblock`
-that is a symlink loop refuses at exit 1: the tool reports `error:
-fstatat(<rest>/superblock): Too many levels of symbolic links`, and the port
-`error: i/o error: Too many levels of symbolic links (os error 40)`. An entry
-that cannot be searched refuses at exit 1: the tool reports `error:
-fstatat(<rest>/superblock): Permission denied`, and the port `error: i/o error:
-Permission denied (os error 13)`. `deltas` that is a regular file refuses at
-exit 1: the tool reports `error: opendirat: Not a directory`, and the port
-`error: i/o error: Not a directory (os error 20)`.
-
-The two implementations differ in two rules:
-
-- The tool prints the names in the order the directories return them, and the
-  port sorts them.
-- A name that does not decode, where the entry holds a superblock, is listed by
-  the tool from a lenient decode, with bytes the name does not determine. The
-  port refuses the listing at exit 1. Where such an entry holds no superblock,
-  both skip it.
-
-The same rule selects the deltas that `reindex`, a summary's
-`ostree.static-deltas` map, and a prune read. A prune leaves a delta directory
-that holds no superblock, also where its commit is the one the prune deletes,
-and it leaves the deltas behind a symlink at `<fanout>` or at `<rest>`, which
-is what the tool's prune leaves. A prune follows a symlink at `deltas` and
-removes the deltas behind it that it selects. The link stays. The port's prune
-skips a name that does not decode, also where the entry holds a superblock, and
-leaves the entry. Where it is not a `--static-deltas-only` run, it also selects
-each delta whose target commit is absent from the store. Both are port
-behaviors (`port-plan.md`, "Prune sweep order").
-
-#### `delete`
-
-`delete` takes a delta name alone. The name rules above apply, and an argument
-that holds a `/` is read as a name too, so `delete ./x` reports `error: Invalid
-rev ./x` and the path of a superblock file is refused the same way.
-
-The existence check reads `deltas/<fanout>/<rest>` and follows symlinks. Where
-nothing resolves there, `delete` reports `error: Can't find delta <name>`, the
-name in full hex. A missing `deltas/`, a missing fanout, and a dangling symlink
-at the path report this text, and the dangling symlink stays.
-
-`delete` removes the entry at `deltas/<fanout>/<rest>` and everything below it:
-
-- a delta directory, nested directories included;
-- a regular file, or a directory with no superblock;
-- a symlink, which is removed as a link, and its target stays.
-
-A directory at or below the path is read with read permission alone. An empty
-directory with no search permission is removed, and a directory with no search
-permission that holds an entry fails the removal, as does a directory with no
-read permission.
-
-No symlink below the path is followed. A symlink in the fanout position and a
-symlink at `deltas` are followed, as for every other read of the path, so the
-delta behind a symlink at `deltas` is removed and the link stays. The fanout
-directory stays, also where it becomes empty. `delta-indexes/` and `summary`
-stay as they are, so they can still name the removed delta and `indexes` still
-lists its target. A `reindex` and a new summary refresh them. `delete` writes
-nothing to either stream, and takes no repository lock.
-
-A removal that fails stops where it failed and leaves the entries it did not
-reach. The tool reports `error: fstatat(<path>): <reason>` for a failed
-existence check, `error: open(<path>): <reason>` for a directory it cannot
-open, and `error: Removing <path>: unlinkat(<name>): <reason>` for an entry it
-cannot remove. The port reports each as `error: i/o error: <reason> (os error
-<n>)`.
-
-#### `verify`
-
-`verify` takes a delta name or a superblock path, under the rules above, and
-reads the superblock alone. It opens no part, so a copy of a superblock under
-any file name, away from its parts, verifies. The options are
-`--sign-type=NAME`, `--keys-file=PATH`, and `--keys-dir=PATH`. Each keeps its
-last value when given more than once.
-
-Standard output holds one line: `Verification OK` at exit 0, or `Verification
-fails` at exit 1 with the reason on standard error. The checks run in this
-order. A refusal before step 4 writes nothing to standard output, except the
-`Sign-type not supported` line of step 2:
-
-1. No `DELTA` reports `error: DELTA must be specified`. This check comes before
-   the sign type.
-2. The sign type. `ed25519` is the default. The port also takes `spki` in a
-   build that carries the engine, the rule `../conformance/cli-surface.md`,
-   "P2", states for `commit --sign-type`. `gpg`, the empty name, and every name no engine carries
-   print `Sign-type not supported` on standard output and report `error:
-   Requested signature type is not implemented`. The port refuses `dummy` with
-   `error: dummy signature type is only for ostree testing` and nothing on
-   standard output.
-3. The keys load, under the rules below. A key of the wrong length, a keys file
-   that is not a regular file, a keys file with no key, and no trusted key
-   each refuse here. An invalid name with no key source reports `no keys
-   loaded`, since the keys load before the argument resolves.
-4. The argument resolves and the superblock reads. `Invalid rev`, `Invalid
-   character`, `openat(<path>): <reason>`, and `Is a directory` follow
-   `Verification fails`.
-5. The signatures. A superblock with no signed envelope reports `error: no
-   signatures in static-delta`. An envelope with no signature under the
-   engine's key reports `error: no signature for 'ostree.sign.<type>' in
-   static-delta superblock`. Where no signature verifies, the line is
-   `error: <type>: Signature couldn't be verified with: key '<hex>'`, one `key
-   '<hex>'` for each effective key joined by `; `, in reverse load order. A
-   key loaded more than once is named once, at its first place in load order,
-   before the order is reversed. Where
-   the revoked set removed every trusted key, the line is `error: <type>: no
-   signatures found`.
-
-The key sources:
-
-- Each positional KEY-ID and each line of the last `--keys-file` are trusted,
-  in that load order.
-- With a KEY-ID or a `--keys-file`, `--keys-dir` and the system key
-  directories are not read, and no key is revoked.
-- With neither, the last `--keys-dir` supplies `trusted.<type>` and
-  `revoked.<type>` and their `.d` directories, the key store "Signing details"
-  states. Without `--keys-dir`, the system key directories supply them.
-  An empty `--keys-dir` names the working directory.
-- No trusted key reports `error: signature: <type>: no keys loaded`. The check
-  comes before revocation, so a store whose trusted keys are all revoked
-  reaches step 5 and reports `no signatures found`.
-
-A key is decoded with the lenient base64 reader `commit --sign` uses: a byte
-outside the alphabet is skipped, so surrounding whitespace and a stray
-character decode. A line that is not UTF-8 decodes to no byte. An ed25519 key
-of another length than 32 bytes reports `error: Invalid ed25519 public key:
-Ill-formed input: expected 32 bytes, got <n> bytes`.
-
-A `--keys-file` must be a regular file, symlinks followed. A missing path, a
-directory, a FIFO, and the empty path report `error: File object '<path>' is
-not a regular file`. Each line is one key, with a trailing `\r` removed. The
-port skips a line that is then empty and reads the file up to 1 MiB. A line of
-whitespace is a key of 0 bytes and refuses the run. A file with no key line
-reports `error: signature: <type>: no valid keys in file '<path>'`.
-
-#### `apply-offline`
-
-`apply-offline PATH [KEY-ID...]` applies one delta into the repository. PATH
-is a path in all forms, and a delta name is read as a path:
-
-- A directory, symlinks followed, holds `superblock` and the part files `0`,
-  `1`, and so on.
-- Any other file is a superblock under any name. The part files are read from
-  the directory that holds it, and from the working directory for a bare name.
-
-PATH is folded as text before it is opened. Empty components, `.`
-components, and a trailing `/` are removed. Each `..` removes the component
-before it, also where that component is a symlink or a file. A `..` at the
-start of a relative path stays, and a `..` directly after the root of an
-absolute path is removed. A PATH that folds to nothing names the working
-directory. Thus `<link>/../<dir>` names `<dir>` in the directory that holds
-the link, `<dir>/superblock/..` and `<dir>/superblock/.` name `<dir>`,
-`<dir>/superblock/` names the superblock file, and `/..` names `/`. The
-directory of the part files is taken from the folded PATH.
-
-A part the superblock carries inline is read from the superblock in both
-forms. The options are `--sign-type=NAME`, `--keys-file=PATH`, and
-`--keys-dir=PATH`, as for `verify`. Each keeps its last value when given more
-than once.
-
-On success, both streams are empty and the exit status is 0. The objects of
-the target commit are in the repository, and no ref is written. The checks run
-in this order, and each refusal writes no object and no ref:
-
-1. No PATH reports `error: PATH must be specified`. The repository resolves
-   before this check.
-2. The sign type, also with no key source. `ed25519` is the default, and
-   `ed25519` with no key source checks nothing. The port also takes `spki` in
-   a build that carries the engine. `gpg`, the empty name, and every name no
-   engine carries report `error: Requested signature type is not implemented`
-   with nothing on standard output. The tool writes a GLib warning block on
-   standard error before that line. The port refuses `dummy` with `error:
-   dummy signature type is only for ostree testing`.
-3. The keys load where a key source is given. A key source is a positional
-   KEY-ID, a `--keys-file`, or a `--keys-dir`. The keys load under the rules
-   of `verify`, and each refusal of `verify` step 3 refuses here with the same
-   text, also for an unsigned delta. With no key source, no key file and no
-   system key directory is read.
-4. The path resolves. A path that is absent reports `error:
-   openat(O_DIRECTORY): <reason>`. A directory with no `superblock` reports
-   `error: openat(superblock): <reason>`.
-5. The superblock reads and parses. A superblock file that does not open
-   reports `error: openat(<name>): <reason>`, where `<name>` is the last
-   component of the folded PATH.
-6. With a key source, the signatures of a signed superblock are checked
-   before any object is written. The failure lines are those of `verify` step
-   5 with no `Verification fails` line: `error: no signature for
-   'ostree.sign.<type>' in static-delta superblock`, `error: <type>:
-   Signature couldn't be verified with: key '<hex>'`, and `error: <type>: no
-   signatures found`. An unsigned superblock applies with no check, so under
-   a key source `apply-offline` authenticates a signed delta only.
-7. The delta applies. The superblock is read once, so the bytes that verify
-   are the bytes that apply. A part file that does not open refuses.
-
-#### `generate`
-
-`generate` writes the delta from FROM to TO. The options both implementations
-carry are:
-
-- `--from=REV` -- the source commit.
-- `--empty` -- a delta from scratch.
-- `--to=REV` -- the target commit. It wins over the positional `TO`. The tool
-  ignores a second positional, and the port refuses it.
-- `-n`, `--if-not-exists` -- generate only where the delta is absent.
-- `--filename=PATH` -- the superblock file.
-- `--min-fallback-size=MB`, `--max-bsdiff-size=MB`, `--max-chunk-size=MB` --
-  the three size thresholds, default 4, 64, and 32.
-- `--disable-bsdiff`, `--sign=KEY`, `--sign-type=NAME`, and
-  `--keys-file=PATH`.
-- `--inline` -- the parts go into the superblock, and no part file is written
-  ("Static delta wire format").
-- `--set-endianness=l|B` and `--swap-endianness` -- the `ostree.endianness`
-  byte and the order of the four size fields.
-
-With neither `--from` nor `--empty`, FROM is the parent of TO. A revision takes
-the forms `rev-parse` takes: a ref, a checksum or its abbreviation, and a
-trailing `^`.
-
-The checks run in this order:
-
-1. No TO reports `error: TO revision must be specified`, also with `--empty`
-   and `--from`.
-2. `--empty` with `--from` reports `error: Cannot specify both --empty and
-   --from=REV`. No revision resolves before this check.
-3. The revisions resolve. An absent ref reports `error: Refspec '<rev>' not
-   found`.
-4. A TO with no parent, where FROM is the default, reports `error: Commit
-   <hex> has no parent`.
-5. The `-n` check.
-6. An endianness value other than `l` or `B` reports `error: Invalid
-   endianness '<value>'`, and nothing is written.
-7. Standard output receives the block below.
-8. The delta is generated. Every later failure comes after the block, so a
-   run that fails there prints the block too.
-
-```
-Generating static delta:
-  From: <hex>|empty
-  To:   <hex>
+The length of a chunk has these meanings:
+
+- 0 ends the body. Then frames follow again.
+- `0xFFFFFFFF` is the abandon marker. It ends a body that the sender cannot
+  complete. After the marker, the next frame must be `Abort` in the push and
+  `Error` in the pull. Each other frame is `protocol`. "Abort, abandon, and
+  end of input" states the answer of the server to the marker in the push.
+- Each other length greater than the current limit is `limit-exceeded`. The
+  chunk limit and the frame limit are the same number.
+
+The sender selects the length of each chunk, up to the limit. In the push,
+after the end chunk of an object, the next frame is one of these:
+
+- the `ObjectHeader` of the next object;
+- `ObjectsEnd`, which closes the object stream;
+- `Abort` ("Abort, abandon, and end of input").
+
+### Frame limits
+
+- Before an announcement, the frame limit is 1 MiB (1,048,576 bytes) in both
+  directions.
+- The server of a push session announces its limit in the key `max-frame` of
+  `HelloReply`. The announced limit applies to each frame and each chunk that
+  the client then sends.
+- The value of `max-frame` is from 1 MiB to `0xFFFFFFFE`, both included. A
+  value out of this range is `protocol`. `0xFFFFFFFE` is one less than the
+  abandon marker, so a chunk length that a limit allows never equals the
+  marker.
+- An ostrya server announces 1 MiB, and it sends frames of at most 1 MiB.
+- A one-way stream and a pull session carry no announcement. The frame limit
+  and the chunk limit of a one-way stream are 1 MiB. In a pull session, they
+  are 1 MiB in both directions.
+
+An `ObjectHeader` frame is always 40 bytes: the length, the kind, and a body
+of 35 bytes. A `GetReply` frame is 21 bytes with a `len` and 13 bytes with no
+`len`.
+
+## Messages
+
+Each message kind has a number, a direction, a protocol, and a body type:
+
+- 1 `Hello` -- client to server, push, `(ua{sv}as)`.
+- 2 `HelloReply` -- server to client, push, `(ua{sv}a(smay))`.
+- 3 `Have` -- client to server, push, `a(yay)`.
+- 4 `HaveReply` -- server to client, push, `ay`.
+- 5 `ObjectHeader` -- client to server, push, `(yayy)`.
+- 6 `ObjectsEnd` -- client to server, push, a body of zero bytes with no
+  GVariant type.
+- 7 `ObjectsReply` -- server to client, push, `(ut)`.
+- 8 `Commit` -- client to server, push, `(a(symaymay)a{sv})`.
+- 9 `CommitReply` -- server to client, push, `a(smaymay)`.
+- 10 `Error` -- server to client, push and pull, `(ssa{sv})`.
+- 11 `Abort` -- client to server, push, `()`, which is the one byte `0x00` in
+  normal form.
+- 12 `PullHello` -- client to server, pull, `(ua{sv})`.
+- 13 `PullHelloReply` -- server to client, pull, `(ua{sv})`.
+- 14 `Get` -- client to server, pull, `s`.
+- 15 `GetReply` -- server to client, pull, `(bmt)`.
+- 16 `ListRefs` -- client to server, pull, `as`.
+
+A session refuses a kind of the other protocol with `protocol`.
+
+`Hello` holds the protocol version, a dict, and the ref names of the session.
+The dict holds these keys:
+
+- `agent` (`s`, optional): the name and the version of the client.
+- `one-way` (`b`, optional): true for a one-way stream. A writer puts the key
+  in the dict only when its value is true.
+
+`HelloReply` holds the protocol version, a dict, and one `(name, commit)`
+entry for each ref of `Hello`, in the order of `Hello`. An absent commit is an
+absent ref. The dict holds these keys:
+
+- `mode` (`s`, required): the mode of the repository.
+- `collection-id` (`s`, optional): the collection id of the repository.
+- `max-frame` (`u`, required): the frame limit ("Frame limits").
+- `max-have` (`u`, required): the most entries of one `Have`.
+- `encodings` (`as`, required): the encodings that the server accepts.
+- `parallel-uploads` (`u`, required): the most object streams that run at the
+  same time in one session over HTTP.
+
+A `HelloReply` with no value for a required key is `protocol`. A `max-have` or
+a `parallel-uploads` of 0 is `protocol`. A client drops an encoding name that
+it does not know.
+
+`Have` is a list of object names: the object type (1 to 4) and the checksum.
+Another type is `protocol`. `HaveReply` is a bitmap with one bit for each entry
+of the `Have`:
+
+- Bit `i` is bit `i % 8` of byte `i / 8`, with bit 0 the least significant.
+- A set bit means that the server needs the object.
+- For `n` entries, the bitmap has `ceil(n / 8)` bytes, and each bit after the
+  last entry is zero.
+
+A client refuses a `HaveReply` of another length, or with a set bit after the
+last entry, with `protocol`.
+
+`ObjectHeader` holds the object type, the checksum, and the encoding. For type
+6, the checksum is the checksum of the commit that the detached metadata
+belongs to. Only type 1 can have the encoding `deflate`. These headers are
+`protocol`:
+
+- a type other than 1, 2, 3, 4, and 6;
+- an encoding byte other than 0 and 1;
+- the encoding `deflate` with a type other than 1.
+
+The body of the object follows as chunks:
+
+- `raw` -- for a file, the framed header and the payload of "File content
+  object header". For each other type, the bytes of the object.
+- `deflate` -- the framed archive header and the payload in raw DEFLATE, as a
+  `.filez` object stores them.
+
+`ObjectsReply` holds two counts of one object stream: `objects` (`u`) and
+`payload_bytes` (`t`). "Object streams" states what they count.
+
+`Commit` holds a list of ref updates and a dict. Each update is
+`(name, state, expected, new)`:
+
+- `state` 0: the ref must be absent. `expected` is absent.
+- `state` 1: the ref must point at the commit `expected`.
+- `state` 2: the ref can be in any state. `expected` is absent.
+- `new` is the new commit. An absent `new` deletes the ref.
+
+A `state` greater than 2, and an `expected` that does not agree with its
+`state`, are `protocol`. The dict holds the key `force` (`b`). A writer puts the
+key in the dict only when its value is true.
+
+`CommitReply` holds one `(name, old, new)` entry for each update, in the order
+of `Commit`. `old` is the commit of the ref before the write, and `new` is the
+commit after it. An absent commit is an absent ref.
+
+`Error` holds the code, a message for a person, and a dict of details:
+
+- `missing` (`a(yay)`): the objects that a `missing-objects` error names, of
+  the types 1 to 4. An entry of another type is `protocol`.
+- `ref` (`s`) and `current` (`may`): the name and the current commit of the
+  ref of a `ref-mismatch` error.
+
+`ref` and `current` come together. One of them alone is `protocol`, and a
+`ref-mismatch` without them is `protocol`.
+
+`PullHello` holds the highest pull version of the client and a dict with the
+optional key `agent` (`s`). `PullHelloReply` holds the version of the session
+and a dict. In version 1 the dict of `PullHelloReply` is empty.
+
+`Get` holds a path. `ListRefs` holds the entries of a ref selector ("Ref
+selectors"). `GetReply` holds `found` and `len`. `len` is the length of the
+body, and it is absent when the server does not know the length. A `GetReply`
+with `found` false and a `len` is `protocol`.
+
+## Error codes
+
+An `Error` message carries one of these codes. Each entry gives the main
+causes of the code. "The push session" and "The pull session over a stream"
+give the condition of each refusal.
+
+- `version-unsupported` -- the server does not speak the protocol version of
+  the client.
+- `locking-disabled` -- the repository of the server sets
+  `[core] locking=false`.
+- `unauthorized` -- the server refuses the credential of an HTTP request.
+- `protocol` -- a frame is malformed, a kind is unknown, a message comes out
+  of order, or a message breaks a rule of the session.
+- `limit-exceeded` -- a frame, a chunk, a batch, a reply, a metadata object,
+  a listing, or a session is over its limit.
+- `checksum-mismatch` -- the bytes of an object do not hash to its name.
+- `mode-refused` -- the repository mode cannot store the content, or the
+  policy does not allow privileged content.
+- `missing-objects` -- a commit reaches objects that the server does not hold.
+- `ref-mismatch` -- a ref is not in the state that its update expects.
+- `non-fast-forward` -- the new commit does not descend from the commit of the
+  ref, and the rule does not allow it.
+- `delete-denied` -- the rule does not allow the delete of a ref.
+- `invalid-ref` -- the server refuses a ref name.
+- `ref-denied` -- no rule of the receive policy accepts a ref update.
+- `signature-required` -- a commit has no trusted signature that verifies, and
+  the rule requires one.
+- `binding-mismatch` -- the ref binding of a commit does not name its target
+  ref, or its collection binding does not name the server collection id.
+- `internal` -- a failure on the server side, for example an I/O error.
+
+An unknown code in a received `Error` is `protocol`. A server error with no
+wire code goes out as `internal` with the text of the error. "Abort, abandon,
+and end of input" states the exceptions.
+
+Over HTTP, the code of an `Error` sets the status of the response:
+
+- `ref-mismatch` and `non-fast-forward` get 409.
+- `internal` gets 500.
+- `unauthorized` gets 403. A refusal of the authentication gets 401 or 403
+  ("Authentication of the receive endpoint").
+- Each other code gets 422.
+- A `session` request that the endpoint cannot take, because the most
+  sessions are open or the endpoint stops, gets 503 with `limit-exceeded`.
+
+A ref listing over HTTP sends no `Error` message. "GET /_ostrya/refs/v1"
+states its statuses.
+
+## The push session
+
+A push session has this sequence:
+
+1. `Hello`, which the server answers with `HelloReply`.
+2. Any number of `Have` messages and object streams, in any order. The server
+   answers each `Have` with `HaveReply` and each object stream with
+   `ObjectsReply`.
+3. `Commit`, which the server answers with `CommitReply`, or `Abort`.
+
+A first message other than `Hello` is `protocol`. An object stream is one or
+more objects, each one an `ObjectHeader` and its chunks, then `ObjectsEnd`. An
+empty object stream, `ObjectsEnd` alone, gets an `ObjectsReply` with the
+counts 0 and 0.
+
+The server enforces these rules, or depends on them, so a client must keep
+them:
+
+- The refs of `Commit` are a subset of the refs of `Hello`. The subset is not
+  empty and names no ref two times.
+- `Have` and `missing` name objects of the types 1 to 4.
+- An object has the encoding `deflate` only if it is a file and `HelloReply`
+  lists `deflate`.
+- A `Have` holds at most `max-have` entries, and its frame fits in
+  `max-frame`.
+- A session sends at most one detached metadata dict for each commit. The
+  commit is a commit that the session sends, or the new commit of an update.
+- Before `Commit`, a session sends each object that the tree of a commit of
+  the session reaches, unless the server holds the object. The commits of the
+  session are the commits that it sends and the new commits of the updates.
+  The session does not need to send the parent commits.
+- To cancel an object, a client sends the abandon marker and then `Abort`.
+- On a stream, a client sends one request and reads its reply before it sends
+  the next one.
+
+### Hello and HelloReply
+
+The server runs these checks of `Hello` in this order. The checks do no I/O:
+
+1. `one-way` true is `protocol`. A one-way stream starts with that `Hello`
+   ("The one-way stream").
+2. A version other than 1 is `version-unsupported`. The server offers no
+   lower version.
+3. A repository in the mode `bare-split-xattrs` is `mode-refused`.
+4. A repository with `[core] locking=false` is `locking-disabled`. A
+   malformed `[core] locking` value is `internal`.
+5. A ref name that fails the refspec rule ("Ref name validation") is
+   `invalid-ref`.
+6. A `HelloReply` with a commit for each ref that needs a frame over 1 MiB is
+   `limit-exceeded`.
+
+A `Hello` with no ref, and a `Hello` that names one ref two times, pass these
+checks. A session whose `Hello` names no ref cannot commit, because `Commit`
+names refs of `Hello` alone (check 1 of "Commit and CommitReply").
+
+Then the server opens the transaction of the session, and the transaction
+takes the repository lock shared ("Locks and on-disk state of a receive"). A
+wait for the lock past its time limit is `internal`. These steps follow, in
+this order:
+
+1. The server reads `[core] lock-timeout-secs`, `[core] tmp-expiry-secs`,
+   `[core] min-free-space-percent`, and `[core] min-free-space-size`. A
+   malformed value is `internal`.
+2. The server reads `[core] fsync`, `[core] per-object-fsync`,
+   `[ex-integrity] fsverity`, and, in an `archive` repository,
+   `[archive] zlib-level`. A malformed value is `internal`.
+3. In a `bare` repository, a new file in the staging directory must get the
+   owner uid 0. Only root can store the owner of each file. Else the session
+   is `mode-refused`.
+4. The server reads the ref of each name of `Hello`. A failed read, and a ref
+   file that does not parse, are `internal`.
+
+An ostrya server announces these values in `HelloReply`:
+
+- version 1;
+- `mode`: the mode of the repository, with `archive` sent as `archive-z2`;
+- `collection-id`: the collection id of the repository, when it has one;
+- `max-frame`: 1 MiB;
+- `max-have`: 16384;
+- `encodings`: `raw` and `deflate`, in every mode;
+- `parallel-uploads`: 1 on a stream, and the `parallel-uploads` setting of
+  the endpoint over HTTP ("The receive endpoint");
+- the refs: the current commit of each ref of `Hello`, in the order of
+  `Hello`, with one entry for each name that `Hello` repeats. A ref name that
+  names a directory, or a path through a file, reads as absent. An alias gets
+  the commit of its target.
+
+### Have and HaveReply
+
+A `Have` of more than 16384 entries is `limit-exceeded`. The server sets the
+bit of an object when the session did not stage the object and `objects/`
+does not hold it. Each entry gets its own bit, also an entry that the `Have`
+holds two times. An empty `Have` gets an empty bitmap.
+
+### Object streams
+
+The server reads, hashes, and checks each object of a stream, also an object
+that the repository or the session holds already. It stages an object that it
+does not hold, and it drops the other objects. These conditions refuse an
+object:
+
+- A dirtree, dirmeta, or commit object larger than 128 MiB is
+  `limit-exceeded`.
+- The dirtree, dirmeta, and commit objects that the streams of a session read
+  at the same time share one budget of 128 MiB. The bytes of an object count
+  from its arrival to its stage step. The read that takes the session past
+  the budget is `limit-exceeded`.
+- An object of the types 1 to 4 whose bytes do not hash to its checksum is
+  `checksum-mismatch`.
+- The framed header of a file holds a length and 4 zero bytes ("File content
+  object header"). A non-zero pad byte is `protocol`, and a header larger
+  than 1 MiB is `limit-exceeded`. A file object that ends inside its header,
+  or whose header does not parse, is `protocol`.
+- These are `protocol`:
+  - a symlink with a payload;
+  - a corrupt DEFLATE stream;
+  - a payload of another size than the header states;
+  - bytes after the end of an object;
+  - a `deflate` payload of more than `D + D / 1024 + 65536` compressed bytes,
+    where `D` is the payload size that the header states, with integer
+    division.
+- In a `bare` repository, these are `mode-refused`:
+  - a file with the setuid or setgid bit;
+  - a file or a dirmeta with a `security.capability` or `security.selinux`
+    xattr.
+
+  The session key `allow-privileged` of `[ex-ostrya receive]` turns this
+  check off (`ostrya-config(1)`, "Session keys").
+- In a `bare-user-only` repository, a file that the canonical rule of the mode
+  does not allow is `mode-refused` ("Repository modes and on-disk storage").
+- An I/O error of the operating system is `internal`. An object that the
+  free-space reserve of the repository refuses (`[core] min-free-space-*`) is
+  `internal` too.
+
+In an `archive` repository the server stores a `deflate` body as sent. In each
+other mode it inflates the body.
+
+A detached metadata object (type 6) follows these rules:
+
+- A second dict for one commit is `protocol`, also from another stream.
+- All detached metadata of a session has one cap of 128 MiB. The read that
+  takes the session past the cap is `limit-exceeded`. This cap is separate
+  from the budget of the other metadata objects.
+- The dict is an `a{sv}` in normal form that holds each key once. The value
+  under `ostree.gpgsigs`, `ostree.sign.ed25519`, `ostree.sign.spki`, and
+  `ostree.sign.dummy` is an `aay`. Each other dict is `protocol`.
+
+The server writes no object and no dict to `objects/` before `Commit`.
+
+`ObjectsReply` counts the objects of one stream that the server staged and
+the dicts that it kept. `payload_bytes` counts the body bytes of these
+objects, with the chunk framing removed, in the encoding of the wire. An
+object that the server held already does not count. Over HTTP, an object that
+two `objects` requests send at the same time can count in both replies.
+
+### Commit and CommitReply
+
+The server runs these checks of `Commit` in this order. Each failed check ends
+the session, and the session writes nothing:
+
+1. Each ref name passes the refspec rule ("Ref name validation"). An update
+   that writes a commit to a name of 64 lowercase hex characters fails this
+   check too. A delete of such a name passes. A failure is `invalid-ref`.
+   Then a request with no update, an update of a ref that `Hello` does not
+   name, and two updates of one ref are `protocol`.
+2. A `CommitReply` with a commit in each `old`, and the `new` of each
+   update, that needs a frame over 1 MiB is `limit-exceeded`.
+3. A detached metadata dict for a commit that the session did not stage and
+   that no update names as `new` is `protocol`.
+4. The server selects the rule of each update ("Receive patterns"). These
+   updates are `ref-denied`:
+   - an update of `ostree-metadata` in a repository with a collection id;
+   - an update whose rule has `accept=false`;
+   - an update of a remote ref that no pattern matches.
+5. The server reads the new commits in the order of the updates. A staged
+   commit that does not parse is `protocol`, and a stored one is `internal`.
+   Such a commit fails the check at once. A `new` commit that the session did
+   not stage and that the repository does not hold is `missing-objects`. The
+   absent commits fail together, after the read of the other commits.
+6. Each object that the tree of a commit of the session reaches must be
+   staged or present, else `missing-objects`. The parents of a commit are not
+   required. The `missing` detail names at most 16384 objects. A staged
+   dirtree that does not parse is `protocol`, and a stored one is
+   `internal`.
+7. The bindings of each new commit must agree with the session, else
+   `binding-mismatch`:
+   - A non-empty `ostree.ref-binding` must hold the name of each ref that the
+     commit is the new value of. For a remote ref, the name is the part after
+     `REMOTE:`.
+   - If the repository has a collection id and the commit has
+     `ostree.collection-binding`, the value must be that id.
+   - The server does not check a binding key that the commit does not have.
+8. A new commit must pass the signature verification of the rule of each
+   update that names it, else `signature-required`. The verification reads
+   the stored detached metadata of the commit and the incoming dict together,
+   before the `detached-metadata-exclude` filter of step 9.
+9. The server applies the `detached-metadata-exclude` filter, makes the
+   staged objects durable, and signs each new commit with the keys of the
+   rule key `sign`. It walks the history of each update that needs the
+   fast-forward check. A host application is a program that embeds the
+   receive path of the port. Its hook before the update can refuse with
+   `ref-denied` or `internal`.
+10. The server takes the update lock and reads the refs again. These are
+    `ref-denied`:
+    - a ref that is an alias;
+    - a ref path that a ref write cannot replace;
+    - two updates that write a commit, where one names a directory of the
+      other.
+11. For each update: a ref that is not in the expected state is
+    `ref-mismatch`, with `ref` and `current`. A delete of a ref that is
+    present is `delete-denied` unless the rule has `allow-delete`. A new
+    commit that does not descend from the commit of the ref is
+    `non-fast-forward`. With `force` in the request and
+    `allow-non-fast-forward` in the rule, this last check does not run.
+12. A merged detached metadata dict larger than 128 MiB is `limit-exceeded`.
+    The hooks of a host application can add entries to the dict. Their merge
+    can give this error before the update lock, at step 9. Then the server
+    commits the transaction.
+
+`CommitReply` has one entry for each update, in the order of `Commit`.
+"Locks and on-disk state of a receive" states when the server sends it.
+
+### Abort, abandon, and end of input
+
+On a stream, these events end a session, and the server sends no `Error`:
+
+- `Abort` between two messages;
+- the abandon marker in an object, and then `Abort`;
+- an end of the input before `Commit`, at a frame boundary or inside a frame
+  or a chunk;
+- a read error or a write error of the stream.
+
+Over HTTP, `DELETE` takes the place of `Abort`. An `Abort` frame and an early
+end in the body of an `objects` request get an `Error` with `protocol` ("The
+receive endpoint").
+
+Each other failure ends the session after one `Error` frame. The server then
+drops the transaction. The server reads no more input of the session after
+the `Error` frame.
+
+A failure before the transaction commit does not change the repository. A
+failure in the transaction commit can leave objects, detached metadata, and
+some refs written. An error of the hook after the update comes after the
+server wrote the refs ("Locks and on-disk state of a receive").
+
+### Locks and on-disk state of a receive
+
+"Repository lock and staging", "The update lock", "Commit-state markers",
+"Ref durability", and "The `ostree-metadata` anchor commit" state the files
+that a receive uses. A receive uses them in this order:
+
+1. The transaction of the session opens after the `Hello` checks. It takes
+   the repository lock shared, and it holds the lock to the end of the
+   transaction commit. Under `[core] locking=false`, a one-way stream takes
+   no repository lock.
+2. At `Commit`, after check 9, the server takes the update lock. Under the
+   lock it reads the refs again and runs checks 10 to 12.
+3. The server queues the detached metadata and the ref writes in the
+   transaction. The policy regenerates the summary when
+   `[core] auto-update-summary` is true ("Config file (`<repo>/config`,
+   GKeyFile / INI)"). The server can also stage the anchor commit of
+   `ostree-metadata` in the transaction. It does so if the policy regenerates
+   the summary, a ref changes, and the repository has a collection id. The
+   server reads the tip of `ostree-metadata` under the update lock. A failure
+   of the anchor commit is `internal`, and the server publishes nothing.
+4. The server commits the transaction. The transaction releases the
+   repository lock at the end of this step.
+5. The server removes `state/<commit>.commitpartial` of each commit of the
+   session.
+6. If the policy regenerates the summary and a ref changed, the server builds
+   the summary. It signs the summary with each key of the session key
+   `sign-summary` of `[ex-ostrya receive]`, GPG keys first. Then it removes
+   `summary.sig`, writes `summary`, and writes `summary.sig` if
+   `sign-summary` names keys. A failed build or signature leaves the old
+   `summary` and `summary.sig`.
+7. The server releases the update lock. In a session with the hooks of a host
+   application, the hook after the update runs next. Then the server sends
+   `CommitReply`.
+
+A failure in step 5 or 6 does not fail the commit. The server reports it as a
+warning, and the warning does not go on the wire.
+
+The server holds no lock for each ref. Two sessions that update one ref
+serialize at step 2: each one reads the refs again and checks the expected
+state under the update lock. The transaction commit is not atomic as a whole.
+A failure in it can leave the detached metadata and some refs written.
+
+If the send of `CommitReply` fails, the refs stay written, and the report of
+the server holds the warning `reply-not-delivered`. If the hook after the
+update returns an error, the server sends `internal` in place of
+`CommitReply`, and the refs stay written.
+
+## The one-way stream
+
+A one-way stream carries a push in one direction, from a client to a server.
+The server sends no message. The stream holds these parts, in this order:
+
+1. one `Hello` with `one-way` true;
+2. zero or more object streams, each one closed by `ObjectsEnd`;
+3. one `Commit`;
+4. the end of the input.
+
+"Frame limits" states the frame limit and the chunk limit. These are
+`protocol`:
+
+- a first message other than a `Hello` with `one-way` true;
+- a `Have`, and each other message out of this order;
+- an `Abort` frame between two objects;
+- a byte after `Commit`;
+- an update whose state is 1, and an update with no `new`. The server refuses
+  them when it reads `Commit`.
+
+If a client cannot complete an object, it sends the abandon marker and then
+`Abort` ("Abort, abandon, and end of input"). The server then ends the session
+with no change.
+
+The server runs `Hello` checks 2, 3, and 5 of a push session ("Hello and
+HelloReply"). In place of check 1, a `Hello` with no `one-way` true is
+`protocol`. The server then opens the transaction as in a push session, with
+the same config reads and the same `bare` owner check. It reads no ref of
+`Hello` and sends no `HelloReply`.
+
+The server accepts a repository with `[core] locking=false`. It then takes no
+repository lock, and `Commit` still takes the update lock ("The update lock").
+
+The size check of `CommitReply` (check 2 of "Commit and CommitReply")
+applies. The server runs the other `Commit` checks after the end of the
+input. A one-way stream adds no server signature, writes no anchor commit,
+and does not regenerate the summary. It calls no hook of a host application.
+
+## The pull session over a stream
+
+A pull session over a stream gets files of the archive view and ref listings.
+The server reads one request, answers it to the end of its body, and then
+reads the next request. A reply carries no request id, so the replies come in
+the order of the requests.
+
+A client can send a request before the reply to the request before it
+arrives. The server flushes its output before each read that can wait, that
+is, when its input holds no whole frame.
+
+### PullHello and the version
+
+The first frame of the client must be `PullHello`, else `protocol`. An end of
+the input at a frame boundary ends the session with no error, also before
+`PullHello`. These ends of the input send an `Error`, and the session ends:
+
+- an end inside a frame is `protocol`;
+- a read error of the input is `internal`.
+
+A `PullHello` with version 0 is `version-unsupported`. For each other version,
+the server answers with a `PullHelloReply` that holds the lower of the version
+of the client and 1. Each side ignores a key of the dict that it does not
+know.
+
+Then the client sends any mix of `Get` and `ListRefs`. Each other kind is
+`protocol`.
+
+### Get and GetReply
+
+The path of `Get` is relative to the repository root, with no leading `/`.
+The server does not percent-decode it. The server answers it as "The archive
+view" states:
+
+- An absent path and a refused path get a `GetReply` with `found` false. The
+  session goes on.
+- A path that the view serves gets a `GetReply` with `found` true, then the
+  body as chunks, then a chunk of length 0. `len` is the length of the body.
+  A `.filez` built on request has no `len`.
+- If the view fails before the reply, the server sends `Error` with
+  `internal` in place of the reply, and the session ends.
+- If the body fails after the reply, the server ends the body with the
+  abandon marker. Then it sends `Error` with `internal` and ends the session.
+  A read error, and a stored file that holds fewer or more bytes than `len`,
+  are examples. A `.filez` built on request can fail in the same way.
+
+`Get _ostrya/refs/v1` is an absent path. A client gets a ref listing with
+`ListRefs`.
+
+### ListRefs
+
+The server answers a `ListRefs` with a `GetReply` with `found` true and
+`len`, and then the listing as chunks. The listing has the same bytes as the
+body of `GET /_ostrya/refs/v1` for the same entries. A reply to a `ListRefs`
+with `found` false or with no `len` is `protocol`.
+
+In these cases, the server sends an `Error` in place of the reply, and the
+session ends:
+
+- `protocol`: more than 256 entries, an entry over the limits of one entry,
+  or an entry that is not a selector entry ("Ref selectors").
+- `limit-exceeded`: a listing larger than 128 MiB.
+- `internal`: each other failure of the build of the listing.
+
+"Ref selectors" states how the server counts the entries.
+
+### The pull over HTTP and over a stream
+
+The pull over HTTP sends no frame. A client gets a file with a `GET` of the
+archive view, and a ref listing with a `GET` of `/_ostrya/refs/v1`. The
+response bodies hold the same bytes as the stream bodies. The answers map in
+this way:
+
+- 404 is a `GetReply` with `found` false.
+- 500 is an `Error` with `internal`. For a ref listing larger than 128 MiB,
+  500 is an `Error` with `limit-exceeded`.
+- `Content-Length` is `len`.
+- 400 is an `Error` with `protocol`.
+- 405 and 503 have no counterpart on a stream.
+
+Over HTTP, the server keeps one copy of an entry that the query repeats ("GET
+/_ostrya/refs/v1"). The selection and the bytes of the listing are the same.
+
+## The ref listing
+
+A ref listing is a summary GVariant `(a(s(taya{sv}))a{sv})` with no signature.
+The server builds it for each request, from the refs that the entries of the
+request select ("Ref selectors"). The format is that of "Summary --
+`(a(s(taya{sv}))a{sv})`".
+
+- The listing holds refs under `refs/heads` alone, sorted byte-wise by name,
+  each one time. It holds no remote ref and no mirror ref.
+- An alias is in the listing under its own name, with the commit of its
+  target.
+- An alias whose target is absent, and a ref file that a write removes during
+  the walk, are not in the listing.
+- These refs fail the whole listing, and the server leaves out no ref for
+  these causes:
+  - a ref file that is not UTF-8, or that holds no checksum;
+  - a ref whose commit is not in the object store, or does not parse;
+  - an alias that names a directory.
+- Each entry has the bytes of the entry of the same ref in a summary of the
+  same repository state.
+
+The global metadata dict holds these entries, in this order:
+
+1. `ostree.summary.mode`: the mode of the repository.
+2. `ostree.static-deltas`: when the walk below finds a delta.
+3. `ostree.summary.collection-id`: when the repository has a collection id.
+
+The dict holds no `ostree.summary.last-modified` and no
+`ostree.summary.collection-map`.
+
+The deltas come from the index files under `delta-indexes/` ("Static delta
+index files"). The server reads the index file of each listed commit. Then it
+reads the index file of each source commit that an index file names, until it
+finds no new commit. The map is sorted by delta name. These index files fail
+the listing:
+
+- an index file that does not decode, or that is larger than 128 MiB;
+- an index file with no `ostree.static-deltas` map;
+- an index file that names a delta to another commit.
+
+A `delta-indexes` path that is not a directory also fails the listing. An
+absent `delta-indexes/` gives no delta. A commit with no index file adds no
+delta, and an index path that is not a regular file counts as no index file.
+If an index file names one delta two times, the first entry applies.
+
+A listing is at most 128 MiB. The server refuses a larger listing and never
+cuts it short.
+
+## The endpoints of `ostrya serve`
+
+`ostrya serve` answers HTTP requests with three endpoints: the archive view,
+the ref listing at `/_ostrya/refs/v1`, and the receive endpoint of a push
+under `/_ostrya/receive/v1/`. No repository layout uses a path under
+`/_ostrya/`.
+
+### Routing
+
+The server routes a request by these rules, in this order:
+
+1. With a receive endpoint, a request whose raw path starts with
+   `/_ostrya/receive/v1/` goes to the receive endpoint, if its method is not
+   `GET` or `HEAD`.
+2. A request whose raw path is `/_ostrya/refs/v1` goes to the ref listing, for
+   each method.
+3. Each other request goes to the archive view. A method other than `GET` and
+   `HEAD` gets 405 with `Allow: GET, HEAD` and `Content-Length: 0`.
+
+The first two rules compare the raw path, with no percent-decoding. A path
+under `/_ostrya/` that matches neither rule gets the rules of the archive
+view, for example `/_ostrya/receive/v2/session`.
+
+A `GET` and a `HEAD` under `/_ostrya/receive/v1/` go to the archive view and
+get 404. With `--read-only` the server has no receive endpoint, so a `POST`
+and a `DELETE` under that prefix go to the archive view and get 405.
+
+A host application can mount the receive endpoint in a router of its own
+("Commit and CommitReply", check 9, defines the term). There, each method
+other than the method of a known route of the endpoint, `GET` and `HEAD`
+included, gets 405 with `Allow: POST` or `Allow: DELETE`.
+
+### The archive view
+
+`ostrya serve` serves a repository of any mode as an archive repository, so
+that the tool can pull from it. `ostrya send` serves the same view over a
+stream ("Get and GetReply"). The view answers a path relative to the
+repository root in this way:
+
+- The view builds `config`: `[core]\nrepo_version=1\nmode=archive-z2\n`, then
+  `collection-id=ID\n` and then `indexed-deltas=VALUE\n` when the repository
+  config sets them. Each value is as the repository config writes it. The
+  view serves no other key and no other group. The view parses the
+  repository config again when its inode number, size, modification time, or
+  change time differs from the last parse. The next answer then shows the
+  change.
+- The view serves these files as stored: `summary`, `summary.sig`, the files
+  under `refs/` and `extensions/`, and the `.commit`, `.dirtree`, `.dirmeta`,
+  and `.commitmeta` objects. In an `archive` repository, it also serves the
+  `.filez` objects and the files under `deltas/` and `delta-indexes/` as
+  stored.
+- In each other mode, the view builds a `.filez` object on request. The
+  object is the framed archive header of the logical metadata that the mode
+  stores, then the payload in raw DEFLATE at `[archive] zlib-level`. An
+  `archive` repository of the port stores the same bytes for the same object
+  at the same level. A symlink object is the header alone.
+- The file of a built `.filez` can hold another size than its header states.
+  Then the body fails during the transfer, after the status and the headers
+  went out.
+- In these modes, `deltas/` and `delta-indexes/` are absent, and the view
+  serves a summary that names a delta unchanged. A pull then fetches the
+  objects loose (`conformance/cli-behavior.md`, "HTTP pull surface").
+- The view serves a ref alias under `refs/` as the ref that it names, when
+  that ref is a regular file under `refs/`. The view resolves `.` and `..` in
+  the alias body by name, from the directory of the alias, with no lookup in
+  the file system. These paths are absent:
+  - an alias of an alias;
+  - an alias with an absolute body, also one that names a file under
+    `refs/`;
+  - an alias body that is not UTF-8;
+  - an alias body with a `..` that goes above `refs/` at any step, also when
+    the end result is under `refs/`;
+  - an alias body with an empty component, as a trailing `/` gives;
+  - an alias body with a component that the view refuses by name, for example
+    a component that starts with `.`, other than `.` and `..`;
+  - a symlink at another place on a path.
+
+  The walk starts at the `objects/` directory that the repository handle
+  opened, so the view follows a symlink at `objects/` itself.
+- The view refuses these paths:
+  - `.lock` and `.update.lock`;
+  - `tmp` and `state`, and each path under them;
+  - each path with an empty component or with a component that starts with
+    `.`;
+  - a `.file` path, and each path outside the families above;
+  - a name longer than the kernel accepts.
+
+  A refused path and an absent path get the same answer.
+- A directory on the path that the server cannot search, and a file that the
+  server cannot open, are errors of the view.
+
+Observed behavior: with no summary, a pull of an alias name succeeds when the
+commit has no ref binding.
+
+One view deflates at most 16 `.filez` objects at the same time. The payload
+of another built `.filez` waits until a compressor is free. `ostrya serve`
+has one view. Each `ostrya send` session has its own view.
+
+Over HTTP, `ostrya serve` applies these rules:
+
+- The server removes the leading `/` of the request path and percent-decodes
+  the rest. An escape takes hex digits in either case, and `+` stays `+`. A
+  path with a bad escape, a NUL, or bytes that are not UTF-8 gets 404. A
+  request path with no leading `/` gets 404.
+- The server ignores the query and `Authorization`.
+- A path that the view serves gets 200 with its bytes. The response carries
+  `Content-Length` when the view knows the length. A `.filez` built on
+  request has no `Content-Length`.
+- An absent path and a refused path get 404 with an empty body and
+  `Content-Length: 0`. An error of the view gets 500 with an empty body and
+  `Content-Length: 0`.
+- No response of the view carries `Content-Type`.
+
+A `HEAD` gets the status and the `Content-Length` of a `GET`, with no body.
+For a `.filez` built on request, a `HEAD` reads no byte of the object, no
+xattr, and no `config`. So the two methods give different statuses in these
+cases:
+
+- In a `bare-split-xattrs` repository, a `HEAD` checks the
+  `.file-xattrs-link` entry before the object. A `GET` checks the object
+  first. A missing object in a fan-out directory that exists gets 500 for
+  `HEAD` and 404 for `GET`. A present object with no `.file-xattrs-link`
+  entry gets 500 for both methods.
+- These cases get 200 for `HEAD` and 500 for `GET`:
+  - xattrs of a `bare-split-xattrs` object that do not parse;
+  - an object whose metadata does not parse, or whose archive header the
+    view cannot write;
+  - a `config` that the server cannot read as a repository config;
+  - an `[archive] zlib-level` value that is not a signed 64-bit decimal
+    integer, a value with a leading `+` included. The view clamps a value in
+    that range to the range 1 to 9.
+
+For a built `.filez`, the result of the `config` read of a `GET` has
+precedence over the result of the object lookup. So a missing object in a
+repository with a bad `config` or `zlib-level` gets 404 for `HEAD` and 500
+for `GET`.
+
+The summary of a `bare-user-shared` repository states that mode in
+`ostree.summary.mode`. `conformance/cli-surface.md`, "P2", `serve`, records
+the pull of the tool from this summary.
+
+### GET /_ostrya/refs/v1
+
+A `GET` of `/_ostrya/refs/v1` gets a ref listing ("The ref listing"). The
+server serves it with and without `--read-only`, and it ignores
+`Authorization`. The version of the listing is the `v1` in the path, and no
+request negotiates it.
+
+The query holds the entries of a ref selector ("Ref selectors"):
+
+- `&` splits the query into pairs.
+- Each pair is `pattern=VALUE`. The key is the raw bytes `pattern`, with no
+  decoding, and the case counts. The pair splits at its first `=`.
+- The value is percent-decoded as a path is ("The archive view"), so `+`
+  stays `+`. The decoded value is one entry.
+- No query and an empty query give an empty selector, which selects every
+  ref.
+- The server keeps one copy of an entry that more than one pair gives. Each
+  pair counts toward the limit of 256 entries ("Ref selectors").
+
+The HTTP layer of the server can refuse a request with a long target before
+these checks. The rustdoc of `Server` in `ostrya-server`, "HTTP behavior",
+states the limits of the HTTP layer. The server checks a request in this
+order:
+
+1. A method other than `GET`, `HEAD` included, gets 405 with `Allow: GET`.
+2. A bad query gets 400. A query is bad when it holds one of these:
+   - an empty pair, a pair with no `=`, or a pair with another key;
+   - a raw value larger than 12288 bytes, or a value that does not decode;
+   - more than 256 pairs, or an entry over the limits of "Ref selectors";
+   - an entry that is not a selector entry.
+
+   The server refuses the 257th pair before it decodes it.
+3. If 4 listings are in flight over all connections, the request gets 503
+   with `Retry-After: 1`. A listing is in flight from the start of its build
+   until its response body drops.
+4. Each error of the build gets 500, a listing larger than 128 MiB included.
+
+A listing gets 200 with `Content-Length`. The body is the raw listing, with
+no frame. A 400, a 405, a 500, and a 503 have an empty body and
+`Content-Length: 0`. No response carries `Content-Type`.
+
+### The receive endpoint
+
+Each request under the raw path prefix `/_ostrya/receive/v1/` is one step of a
+push session. The endpoint does not percent-decode the path, and it ignores
+the query. The routes are these:
+
+- `POST session` opens a session. The body is one `Hello` frame. The answer
+  is 200 with the `HelloReply` frame and the header `ostrya-session`, which
+  holds the session id.
+- `POST session/ID/have`: the body is one `Have` frame. The answer is 200 with
+  `HaveReply`.
+- `POST session/ID/objects`: the body is one object stream. The answer is 200
+  with `ObjectsReply`.
+- `POST session/ID/commit`: the body is one `Commit` frame. The answer is 200
+  with `CommitReply`.
+- `DELETE session/ID` ends the session and its requests in flight. The answer
+  is 204 with no body and no `Content-Length`.
+
+The steps of a session map to the messages of a push session over a stream.
+`DELETE` takes the place of `Abort`, and the status of an error follows its
+code ("Error codes").
+
+A session id is 32 bytes from the random source of the operating system,
+written as 64 lowercase hex digits. The endpoint accepts an id in that form
+alone. If the random source fails, `POST session` gets 500 with `internal`.
+
+`POST session` runs these steps in this order:
+
+1. It reads the `Hello` frame. The whole body must arrive within the idle
+   time of the endpoint, else the request gets 422 with `protocol`.
+2. A `Hello` with `one-way` true gets 422 with `protocol`.
+3. It runs the `Hello` checks of "Hello and HelloReply".
+4. It takes a place in the session table. The open sessions, the sessions
+   that open now, and the sessions that commit count toward the session
+   limit of the endpoint. If they reach the limit, or if the endpoint stops,
+   the request gets 503 with `limit-exceeded`.
+5. It makes the session id.
+6. It gets the setup of the session from the authentication of the
+   endpoint. A refusal gets 401 or 403 with `unauthorized`, and the place in
+   the table becomes free.
+7. It opens the session transaction, as "Hello and HelloReply" states. If
+   the endpoint stopped during these steps, the request gets 503 with
+   `limit-exceeded`.
+
+The idle time, the session limit, and `parallel-uploads` are settings of the
+endpoint. `ostrya-serve(1)` states the options that set them for
+`ostrya serve`, with their defaults.
+
+These requests get 404 with an empty body:
+
+- a path under the prefix that names no route;
+- an id that is not a session of the owner of the request
+  ("Authentication of the receive endpoint");
+- a session that ended.
+
+These events end a session:
+
+- a commit, a failed step, and a `DELETE`;
+- a request that ends before its response;
+- a request body that sends no byte for the idle time;
+- the idle time with no request in progress;
+- a stop of the endpoint.
+
+A known route with another method that reaches the endpoint gets 405 with an
+empty body and `Allow: POST` or `Allow: DELETE`. Under `ostrya serve`, a `GET`
+and a `HEAD` do not reach the endpoint ("Routing").
+
+The body of `session`, `have`, and `commit` is exactly one frame of at most
+1 MiB. An empty body, a short body, a frame length of 0, bytes after the
+frame, and a frame of another kind get 422 with `protocol`. A larger frame
+gets 422 with `limit-exceeded`. The body of `objects` is one object stream,
+from the first `ObjectHeader` or `ObjectsEnd` to `ObjectsEnd`, and then the
+end of the body. These bodies of `objects` get 422 with `protocol`, and the
+session ends:
+
+- a body that ends before `ObjectsEnd`;
+- a byte after `ObjectsEnd`;
+- an `Abort` frame in the body, with or without the abandon marker before it.
+
+A request body that fails, for example with a malformed chunked encoding,
+gets 500 with `internal`. The session ends as for a request that ends before
+its response.
+
+Each response body that is not empty is one frame, and the response carries
+`Content-Length`. The endpoint adds no `Content-Type` and no `Retry-After` to
+a response. An `Error` frame larger than 1 MiB is replaced with a short
+`internal` frame and the status 500.
+
+The endpoint drains the request body before some answers: a 404, a 405, a
+refusal of the authentication, and the answer to a `DELETE`. It reads and
+drops the body until the body ends, until more than 1 MiB has arrived, or
+until a time limit ends. A failed step answers at once, with no drain, so
+bytes of the request can stay unread.
+
+One session runs its steps by these rules:
+
+- Up to `parallel-uploads` `objects` requests run at the same time. One more
+  gets 422 with `limit-exceeded`, and the session ends.
+- One `have` request runs next to them. A second one gets 422 with
+  `limit-exceeded`, and the session ends.
+- A `commit` request needs no other request of the session in flight. Else
+  it gets 422 with `protocol`, and the session ends.
+- An `objects` request counts from its start. A `have` request counts from
+  the end of its body. A `DELETE` does not count.
+- A failed step ends the session, unless the session commits. Each other
+  request of the session in flight then gets 422 with `protocol` and the
+  message `the session was aborted: CAUSE`.
+- A request that ends before its response ends the session, unless the
+  session commits.
+- The endpoint aborts a session with no request in progress for the idle time
+  of the endpoint. It also aborts a session whose request body sends no byte
+  for that time.
+
+The commit runs in a task of its own. A `DELETE`, a disconnect, and the idle
+time do not stop it. A host application that stops the endpoint and keeps
+its process running lets the commit go on to its end. `ostrya serve` has no
+graceful shutdown: when its process ends, a commit in progress ends with it.
+While the commit runs, each other request of the session gets 422 with
+`protocol`, and the commit goes on. These requests are a `have`, an
+`objects`, a second `commit`, and a `DELETE`. After the commit, each request
+of the session and a `DELETE` get 404.
+
+### Authentication of the receive endpoint
+
+The endpoint checks the route and the method before it authenticates a
+request. So a client with no credential gets 404 or 405 for a bad route or
+method. The endpoint authenticates a request before it reads a byte of the
+body.
+
+`ostrya serve` authenticates a request by these rules, in this order:
+
+1. A request with more than one `Authorization` header gets 401.
+2. The server splits `Authorization` at its first space, and removes the
+   ASCII white space at the start of the rest. The scheme compares with no
+   regard to case.
+3. Over plain HTTP, a `Bearer` or `Basic` credential gets 403, unless
+   `--allow-cleartext-credentials` is given. This rule also applies when
+   anonymous push is on.
+4. A `Bearer` or `Basic` credential that matches no line of the push
+   credential file gets 401, also when the request has a client certificate.
+   "The push credential file of a server" states the match. A header with
+   another scheme gets 401.
+5. A request with no `Authorization` header gets the first result that
+   applies:
+   - the owner of its client certificate, when the server has a client CA
+     and the request has a certificate;
+   - the owner `anonymous`, with `--allow-anonymous-push`;
+   - 401, when the server has credential lines;
+   - 403.
+
+With `--client-ca`, the TLS handshake verifies a client certificate against
+the CA. A client with no certificate also connects.
+
+Each 401 of `ostrya serve` carries two headers:
+`WWW-Authenticate: Bearer realm="ostrya"` and
+`WWW-Authenticate: Basic realm="ostrya"`. The server compares the digest of a
+request with the digest of each line in constant time, and it does not stop
+at a match.
+
+The owner key of a request has a prefix for each method:
+
+- `token:NAME` for a bearer token or a Basic credential. `NAME` is the name
+  of its credential line.
+- `cert:HEX` for a client certificate. `HEX` is the SHA-256 digest of the DER
+  bytes of the end-entity certificate, in lowercase hex.
+- `anonymous` for anonymous push.
+
+The endpoint gives a session to its owner alone. A request of another owner
+gets 404 for that session id. All anonymous clients share one owner key, so
+each anonymous client that knows a session id reaches the session.
+
+A refusal of the authentication gets its status, 401 or 403, and an `Error`
+frame with `unauthorized`. A host application can mount the endpoint with an
+authentication of its own. That authentication sets the status of a refusal,
+401 or 403, its message, and its headers. The endpoint keeps these headers,
+also a `Content-Type` or a `Retry-After`. It drops `Content-Length`,
+`Transfer-Encoding`, and `Connection`, because it sets the framing and the
+connection state itself. It cuts the message of the refusal to 4096 bytes at
+a character boundary.
+
+## Credential files
+
+### The push credential file of a server
+
+`ostrya serve --push-credentials=FILE` reads the credentials of a push over
+HTTP from `FILE`. The file is outside the repository, and the server reads it
+one time, at start.
+
+The file is UTF-8 text. A LF ends each line, and the last line can have no
+LF. Each line is one of these:
+
+- An empty line. The server skips it.
+- A comment: a line whose first byte is `#`. The server skips it.
+- A credential: each other line, in the form `NAME:HEX`.
+  - `NAME` is one or more visible ASCII characters (0x21 to 0x7e) other
+    than `:`.
+  - `HEX` is the SHA-256 digest of the token, in 64 lowercase hex digits.
+    The first field of the output of `printf %s "$TOKEN" | sha256sum` gives
+    it.
+
+A line of spaces, and a line with a space before its `#`, are credential
+lines. So the server refuses them.
+
+Example:
+
+```text
+# the push credentials of the build hosts
+builder-1:3c469e9d6c5875d37a43f353d4f88e61fcf812c66eee3457465a40b0da4153e0
 ```
 
-`-n` reads the repository's `deltas/<fanout>/<rest>/superblock` for the delta,
-symlinks followed, whatever location the run writes to. Where the file exists,
-standard output holds `Delta <name> already exists.`, with `<name>` as `list`
-prints it, and the run exits 0 and writes nothing. A delta directory that holds
-parts and no superblock counts as absent. Without `-n` the delta is written
-again over the one present.
+The server refuses the file at start when a line is malformed:
 
-The byte order starts from the host order. `--set-endianness` replaces it, and
-the last value wins where the option is given more than once. The value also
-takes the separate-argument form `--set-endianness B`. `--swap-endianness`
-then swaps the order once, where it stands on the command line and however
-many times it is given. On a little-endian host, `--swap-endianness` alone
-writes `B`, and `--swap-endianness --set-endianness=B` writes `l`. The value is
-compared as given: `b`, `L`, `little`, `big`, `Bx`, and the empty value are
-refused. The value is checked after `-n` and after the default parent, so `-n`
-over a delta that exists exits 0 whatever the value, and before the
-`--filename` directory is opened. Only a little-endian host is observed.
+- A line holds a CR (0x0d). This rule applies to comments and empty lines
+  too, so the server refuses a file with CRLF line ends.
+- A line is not valid UTF-8.
+- A credential line holds a space.
+- A credential line holds no `:`, or its `NAME` is empty.
+- A `NAME` holds a character other than visible ASCII.
+- A `HEX` is not 64 lowercase hex digits.
+- Two lines have the same `NAME`, or the same `HEX`.
 
-The tool writes statistics to standard error on every run that reaches step 8:
+The server stops at the first malformed line. The error names the number of
+that line, from 1. For a repeated `NAME` or `HEX`, the error also names the
+first line. The error holds no byte of a line. The server refuses a file
+larger than 1 MiB. A file with no credential line gives no authentication
+method, and a server with no other method does not start. A server with no
+TLS whose one method is the file does not start either, unless it takes
+credentials over plain HTTP.
 
+A bearer token matches a line when the SHA-256 digest of the token is equal
+to `HEX`. A Basic credential `NAME:TOKEN` matches the line with that `NAME`
+when the digest of `TOKEN` is equal to its `HEX`. `NAME` runs to the first
+`:`, so `TOKEN` can hold `:`. A bearer token and a Basic credential that match
+one line give the same session owner.
+
+These credentials match no line:
+
+- an empty token, also `Bearer` with no space after it;
+- a Basic value that is not base64, for example with white space at its end;
+- a Basic credential with no `:` or with an empty `TOKEN`;
+- a Basic credential whose `NAME` is not UTF-8.
+
+The padding of the base64 is optional.
+
+### The push token file of a client
+
+The key `push-token-file` of a remote and the option `--push-token-file` name
+a file that holds the token of a push over HTTP. The token is on the first
+line of the file:
+
+- The push takes the bytes before the first LF (0x0a). With no LF, the token
+  is the whole file. The push reads at most 1 MiB and one byte of the file,
+  and it refuses a first line of more than 1 MiB.
+- The push refuses the token in these cases:
+  - it holds a CR (0x0d);
+  - it is empty;
+  - it is not UTF-8;
+  - it is not token68.
+- A token68 value is one or more ASCII letters, digits, `-`, `.`, `_`, `~`,
+  `+`, or `/`, then zero or more `=`.
+- The push ignores the bytes after the first LF.
+- No message of the push holds the token. The push checks no permission of
+  the file.
+
+## Stream transports
+
+### The remote command over ssh
+
+A push or a pull to an ssh address runs the ssh client with this command
+line:
+
+```text
+SSH_COMMAND... [-p PORT] [USER@]HOST "REMOTE_COMMAND --repo=QUOTED_PATH"
 ```
-modified: 0
-new reachable: metadata=2 content regular=1 symlink=0
-rollsum for 0/0 modified
-part 1 n:2 compressed:169 uncompressed:83
-uncompressed=83 compressed=169 loose=119
-rollsum=0 objects, 0 bytes
-bsdiff=0 objects
-```
 
-The port writes nothing to standard error on success.
+- The last argument is one string, and the remote shell parses it.
+  `QUOTED_PATH` is the path in POSIX single quotes, and each `'` in the path
+  is written as `'\''`. So the path gets no expansion.
+- The standard input and the standard output of the ssh client are pipes of
+  the session. Its standard error is the standard error of the client.
+- `REMOTE_COMMAND` is `ostrya receive` for a push and `ostrya send` for a
+  pull by default. `SSH_COMMAND` is `ssh` by default. `ostrya-config(1)`,
+  "REMOTE KEYS" and "ENVIRONMENT", states the keys and the environment
+  variable that replace them. The man page of each command states its
+  options.
 
-The three size options are decimal megabytes, the factor 1,000,000. The tool
-reads a value leniently: `abc` reads as 0, and `1.5`, `-1`, ` 3`, `+3`, `3x`,
-and values past the largest byte count are accepted. The port takes ASCII
-digits alone, refuses every other value at exit 1 before the repository
-reads, and refuses a value whose byte count is past `u64::MAX`. The tool
-takes `--max-chunk-size=0` as one object for each part, and the port refuses
-it after the block.
+A user holds only ASCII letters, digits, `.`, `-`, and `_`. A host holds the
+same characters, or it is a host in brackets. A host in brackets holds only
+hex digits, `:`, and `.`, then an optional `%ZONE` of ASCII letters and
+digits. The client does not check the IPv6 syntax. A user and a host do not
+start with `-`. The client gives a host in brackets to ssh without the
+brackets.
 
-`--filename=PATH` writes the superblock to PATH and the part files to the
-directory that holds it, the working directory where PATH holds no `/`. The
-directory is not created. The tool opens the directory before it writes a
-part, so a missing parent reports `error: opendir(<dir>): No such file or
-directory`. The tool takes the directory and the name from the text of PATH,
-so for `X/.` it opens `X`: where `X` is absent or is not a directory, the
-tool reports `error: opendir(X): <reason>` and writes nothing. A PATH that is
-a directory, that ends in `/`, or whose last component is `.` or `..` after a
-directory fails in the tool at the final rename, after part `0` is written:
-`error: renameat(<temp>, <name>): <reason>`, with `Is a directory` or
-`Device or resource busy` as the reason. A PATH whose name is a part file
-name, `0` for example, is accepted by the tool, and the superblock replaces
-that part, which gives a delta that `show` and `apply-offline` refuse. The
-port refuses each of these before it writes a file. It reads the last
-component from the bytes of PATH, refuses it where it is empty, `.`, or `..`,
-and refuses a PATH that names a directory without following a symlink. An
-empty PATH reports `error: Invalid 'filename' parameter` in the tool after the
-block, and `clap` refuses it in the port before the block. The tool accepts a
-name that is not UTF-8, and the port refuses it. A file already at
-PATH is replaced only by the final rename in both, so a run that fails leaves
-it as it was.
+The address maps to the `--repo` value in this way:
 
-The tool writes the parts, then reads the signing keys, then writes the
-superblock. A bad key therefore leaves the parts and writes no superblock. At a
-location that holds no delta, `list` does not show the delta. At a location
-that holds one, the tool keeps the earlier superblock beside the parts it wrote
-again, and `list` shows it. An ed25519 key of the wrong length reports `error:
-Invalid ed25519 secret key: Ill-formed input: expected 64 bytes, got <n>
-bytes`. The port reads the keys before it writes a part and signs the
-superblock before it writes it, so a bad ed25519 or SPKI key writes no file. A
-`--sign-type=gpg` key, which the tool does not carry, is proved only when it
-signs, after the parts are written. A failure there writes no superblock, and
-at the repository's own location the earlier superblock is gone too, since the
-port unlinks it before the first part. Each `--sign` value signs. The key is
-decoded with the lenient base64 reader `commit --sign` uses.
+- `ssh://[USER@]HOST[:PORT]/ABSOLUTE/PATH` gives `--repo='/ABSOLUTE/PATH'`.
+- `ssh://[USER@]HOST[:PORT]/~/RELATIVE/PATH` gives `--repo='RELATIVE/PATH'`,
+  which the remote side reads from its home directory.
+- In the scp form `[USER@]HOST:PATH`, a `PATH` that starts with `~/` or `/~/`,
+  or with neither `/` nor `~`, is relative to the home directory. Each other
+  `PATH` that starts with `/` is absolute.
+- After a `~/` or `/~/` prefix, the client removes each further leading `/`
+  of the path, so `~//r` gives `--repo='r'`.
+- The client refuses a path that starts with `/~` and not with `/~/`, for
+  example `/~USER/r`. In the scp form, it also refuses a path that starts
+  with `~` and not with `~/`.
+- The client refuses a `USER:PASSWORD@` user in the `ssh://` form. In the scp
+  form, the first `:` outside brackets ends the host, so `u:p@host:path` gives
+  the host `u`.
+- The client decodes no percent escape.
 
-#### `reindex`
+The client refuses other malformed addresses too, for example an address
+with an empty path or a port out of the range 1 to 65535. The rustdoc of
+`SshAddress::parse` in `ostrya-remote` lists each refusal.
 
-`reindex` with no option runs the full pass that "Object store layout"
-states: one index file per target of the deltas under `deltas/`, and the
-index file of a target with no delta left removed. `reindex --to=REV` rewrites
-the index file of REV alone by the same scan rule. A delta directory that holds
-no `superblock` does not count. With no delta into REV, the index file of REV
-is removed, and the fanout directory the removal empties stays. The index files
-of other targets stay as they are, stale ones included, also one whose deltas
-are all gone. A target with no delta and no index file changes nothing. A
-repository with no `deltas/` gets no `delta-indexes/`. The file `--to` writes
-has mode 0644 whatever the umask is, and is byte-identical to the file of REV
-the full pass writes.
+### Standard streams and exit status
 
-On success, both streams are empty and the exit status is 0. The repository
-resolves first: an absent `--repo` path reports the error of the repository
-open, and no repository reports the usage text and `Command requires a --repo
-argument`. REV is read by the rule of one half of a delta name in "The
-arguments", on standard error alone at exit 1:
+On the remote side, the standard output of `ostrya receive` and of
+`ostrya send` holds the frames of the session alone. Standard error holds an
+`error: MESSAGE` line for a failure. For each warning of a session that
+committed, `ostrya receive` writes one `warning: STEP: MESSAGE` line.
 
-- `--to=main` reports `error: Invalid rev main`, and `--to=^main` reports
-  `error: Invalid rev ^main`. A ref name is not resolved.
-- A value of 10 or 63 hex characters reports `error: Invalid rev <value>`. An
-  empty value reports `error: Invalid rev ` with nothing after the space. A
-  value of 65 characters and the delta name `C1-C2` report the first 64 bytes,
-  `error: Invalid rev <C1>`.
-- A value of 64 bytes with a byte outside `[0-9a-f]` reports `error: Invalid
-  character '<n>' in rev '<value>'`: `65` for 64 `A` characters, `103` for 63
-  hex characters and `g`.
+- `ostrya receive` exits 0 after a session that committed, also with
+  warnings. It exits 1 in each other case.
+- `ostrya send` exits 0 when its input ends at a frame boundary. It exits 1
+  in each other case.
 
-REV is not checked for a commit object, so the 64 zeros of a target the
-repository does not hold exit 0 and change nothing. Given more than once, the
-last `--to` wins: `--to=C2 --to=C3` touches the index file of C3 alone,
-`--to=bad --to=C2` exits 0, and `--to=C2 --to=bad` refuses with `error:
-Invalid rev bad`. A `--to` with no value refuses at exit 1: the tool reports
-`error: Missing argument for --to`, and the port reports the `clap` text `a
-value is required for '--to <REV>'`.
+`ostrya receive` reads the receive policy before it reads `Hello`. If the
+policy does not load, it writes no frame and exits 1. The exit closes the
+standard output, so the client reads the end of the stream with no `Error`
+frame.
 
-The tool takes a positional argument after `reindex`, ignores it, and runs the
-pass the options select. The port refuses it at exit 1 with `error: unexpected
-argument '<value>' found` and writes nothing.
+## The commit of `push-tree`
 
-A directory at the index path refuses at exit 1 and leaves no temp file. The
-tool reports one of two lines:
+`ostrya push-tree` builds one commit over a local directory on the client
+and sends it to the server. The tool has no such command. The commit object
+has the format of each other commit, and its bytes follow these rules.
+`ostrya-push-tree(1)` states the options and the output of the command.
 
-- For a target with deltas, `error:
-  renameat(delta-indexes/<fanout>/tmp.<suffix>, delta-indexes/<fanout>/<rest>.index):
-  Is a directory`.
-- For a target with no delta, `error:
-  unlink(delta-indexes/<fanout>/<rest>.index): Is a directory`.
+- The metadata dict holds the entries of the caller and the binding keys, in
+  the order of `commit` (`conformance/cli-behavior.md`, "CLI output
+  formats", `commit`). These rules are specific to `push-tree`:
+  - The command has no `--keep-metadata`, so no entry comes from a parent.
+  - `ostree.ref-binding` holds each `-b` name, sorted.
+  - `ostree.collection-binding` holds the collection id that the server
+    reports for its repository. When the server has no collection id, the
+    key is absent. The collection id of a local repository has no effect.
+  - `--no-bindings` writes neither key.
+- `--owner-uid`, `--owner-gid`, and `--canonical-permissions` apply to each
+  entry of the walk, the root directory included, so they change the root
+  dirmeta too. The canonical rule comes first: owner 0:0, no extended
+  attributes, and the mode `type | (perm & 0o755)` for each entry other than
+  a symlink. Each declared owner id comes after it. The tool applies the
+  options to the root dirmeta in the same way.
+- The walk reads no extended attributes. The commit checksum depends on the
+  tree, the owner, the modes, the subject, and the body. It also depends on
+  the metadata options, the timestamp, the parent, and the collection id. The
+  collection id is that of the server for `push-tree`, and
+  `[core] collection-id` of the repository for the tool. With equal inputs,
+  the commit checksum is equal to the checksum of
+  `ostree commit --no-xattrs -b R1`. With two refs, it is equal to the
+  checksum of `ostree commit --no-xattrs -b R1 --bind-ref R2`.
+- The detached dict holds the entries of the caller, then the signatures in
+  the order of `commit` (`conformance/cli-behavior.md`, "CLI output
+  formats", `commit`). The server can change this dict before it stores it
+  ("Commit and CommitReply", checks 9 and 12).
 
-The port reports `error: i/o error: Is a directory (os error 21)` in both
-cases, and in the full pass.
+Observed behavior: with `SOURCE_DATE_EPOCH=1700000000` on both sides and no
+collection id on either side, both checksums are equal. The checks cover
+`--canonical-permissions`, `--owner-uid=0 --owner-gid=0`, `--body-file` alone
+and next to `-m`, `--parent=none`, `--parent` with a commit, `--no-bindings`,
+and an explicit `--timestamp`.
 
-For a target with no delta, a path to the index file through a component that
-is no directory also refuses at exit 1. This applies to a regular file at the
-fanout, a symlink at the fanout to a regular file, and a regular file at
-`delta-indexes`. The tool reports `error:
-unlink(delta-indexes/<fanout>/<rest>.index): Not a directory`, and the port
-reports `error: i/o error: Not a directory (os error 20)`. A dangling symlink
-at the fanout is an absent file, and both exit 0.
+Observed behavior: a check uses `--add-detached-metadata-string` and distinct
+ed25519 keys from `--sign` and `--sign-from-file`. With these options, the
+`.commitmeta` bytes on the server are equal to the bytes of `ostree commit`. The
+server of this check has no detached-metadata filter and no signing key, and
+it holds no `.commitmeta` of the commit before the push. The equality needs
+keys that are not empty, because `push-tree` refuses an empty key
+(`ostrya-push-tree(1)`).
 
-#### Exit status
+## bare-user-shared mode
 
-- 0 -- the report or the listing was written, the delta was removed,
-  `verify` printed `Verification OK`, `generate` wrote the delta, `-n`
-  found it, `apply-offline` applied the delta, or `reindex` rewrote or
-  removed the index files, `--to` included.
-- 1 -- no `DELTA` (`error: DELTA must be specified`, with no usage text), a
-  name the parser refuses, an absent or unreadable superblock or part, a
-  superblock that does not parse, a `delta-indexes/` that does not read, an
-  absent delta for `delete`, a removal that fails, every `verify` outcome
-  other than `Verification OK`, every `generate` refusal and failure the
-  section above states, every `apply-offline` refusal its section states, and
-  every `reindex` refusal its section states.
+`bare-user-shared` is a repository mode of the port for development. The
+tool has no such mode. A production repository (`/sysroot/ostree`) stays
+`bare`. The mode lets several users build images in one group-shared
+repository on a build machine, and it serves as a composefs backing store.
 
-A superblock that does not parse prints no line in the port. The tool prints
-the lines it read before the failure. Only a write that is neither
-implementation's makes such a superblock.
+In `bare-user`, the inode permission bits of a regular-file object come from
+the logical mode of the file: `(mode & (S_IFREG|0775)) | S_IRUSR`. So a file
+with a restrictive logical mode, for example `/etc/shadow` with 0600, gives an
+object that the other users of the repository cannot read. The next user
+then cannot load the object, and the shared build fails. `bare-user-shared`
+keeps the permissions of the repository separate from the logical
+permissions of the files.
 
-### `pull`
+Each byte that carries identity is the same as in `bare-user`:
 
-`--low-speed-limit-bytes=N` and `--low-speed-time-seconds=N` are read as a C
-`int` with the reader of `commit --owner-uid`, and a value that reader cannot
-hold is refused while the options are read, ahead of the repository and ahead
-of the remote, at exit 1, with the messages of `--owner-uid`: `error: Cannot
-parse integer value “<value>” for --low-speed-limit-bytes` for a syntax the
-reader cannot hold (`abc`, an empty value, a trailing space), and `error:
-Integer value “<value>” for --low-speed-time-seconds out of range` above
-`2147483647` or below `-2147483648`. Recovered by running the tool against a
-repository with no remote.
+- The content of an object is the raw payload. The `user.ostreemeta` xattr
+  holds the logical uid, gid, mode, and xattrs as `(uuua(ayay))`: uid, gid,
+  and mode big-endian, and the xattrs sorted.
+- A symlink is stored as a regular file with the mode 0644. Its content is
+  the target and one NUL. Linux permits a `user.*` xattr only on a regular
+  file and a directory (xattr(7)), so a real symlink cannot carry
+  `user.ostreemeta`. The port also reads a content with no trailing NUL as
+  the target. It refuses a content with a NUL before the last byte.
+- The object identity is `SHA256(6-field header ‖ payload)`, as in each other
+  mode. So the dirtree and commit checksums are equal to those of `bare`. A
+  commit built in this mode and pulled into a `bare` repository is the same
+  commit.
 
-A value of 0 in either option turns the low-speed rule off. A negative value
-keeps the default of its option: 1000 bytes per second for the limit, and 30
-seconds for the time. Recovered with a server that sends one object at about
-100 bytes per second: `--low-speed-limit-bytes=-1 --low-speed-time-seconds=1`
-fails after one second, as a limit of 1000 does, and the same limit at about
-2000 bytes per second completes. `--low-speed-limit-bytes=1000
---low-speed-time-seconds=-1` fails after 30 seconds, as the default time
-does. `-2147483648` and `-5` read as `-1` does.
+The port never applies the logical mode to the inode of an object. It writes
+each new object with the mode 0644 through an explicit `fchmod`, so the umask
+has no effect. A `.commitmeta` gets 0644 in the same way. This includes a
+`.commitmeta` that a pull stages in the staging directory before the rename
+into `objects/`.
 
-The tool samples the rate of a transfer once a second. A sample is the bytes
-of the last five seconds divided by five, and in the first five seconds the
-bytes so far divided by the time so far. The transfer fails when the samples
-stay below the limit for the time without a break, and one sample above the
-limit starts the count again. The count starts at the start of the
-request: before the response head arrives no byte is counted, so the rate is
-below any limit. Recovered with a server that sends the head at once and then
-sends one object on a schedule, at a limit of 1000 bytes per second. The times
-are those of the server, from the head to the moment the tool closes the
-connection:
+A local pull can hardlink an object from the source repository. It does so
+when the source inode has the uid and the gid that a new write gets. The
+linked inode keeps the mode and the group of the source. The pull can link
+these objects:
 
-- no byte after the head fails after 1.0, 2.0, and 3.0 seconds at a time of 1,
-  2, and 3 seconds;
-- a head sent after 1.5 seconds followed by no byte fails 0.5 seconds after the
-  head, at a time of 2 seconds. A head sent after 1.5 seconds followed by the
-  whole object completes. A head sent after 3 seconds fails before it is sent,
-  after 2 seconds;
-- one burst in the first half second followed by nothing, at a time of 2
-  seconds, fails after 2 seconds for 1000 bytes, 5 seconds for 3000, 6 seconds
-  for 3500, 7 seconds for 5000, and 8 seconds for 8000, 20000, and 60000. With
-  8000 bytes or more the rate stays above the limit until the burst leaves the
-  five seconds the sample spans;
-- 6000 bytes after 0.5 seconds and 6000 more after 6.5 or 7.5 seconds complete
-  at a time of 2 seconds, since the second burst lifts a sample above the
-  limit within 2 seconds of the first sample below it. The same second burst
-  after 8.5 seconds is too late: the transfer fails after 8 seconds;
-- 2100 bytes every 2 seconds completes at a time of 1 second, as does 2000
-  bytes every 1.9 seconds, though a whole second between two bursts carries no
-  byte.
+- a metadata object from a source of any mode;
+- a content object from a `bare-user-shared` source;
+- a symlink object from a `bare-user` source.
 
-A sample of exactly the limit reads as below it: 1000 bytes in the first
-second, 3000 in three seconds, and 5000 in five seconds are each read as below
-the limit. The span of each sample is a little longer than its whole seconds.
+The port forces the permission bits of each directory and each lock file that
+it creates inside the repository. It runs an `fchmod` after the create, so
+the file-creation mask of the process has no effect:
 
-The port applies the same rule, a sample of exactly the limit included, with
-the differences `conformance/cli-surface.md`, "P2", `pull`, records.
+- A directory gets 02770. This rule applies to these directories:
+  - the repository root and each layout directory at `init`;
+  - the `objects/<xx>` fanout directories;
+  - the parent directories under `refs/`;
+  - `tmp/`, and each staging directory of a transaction.
 
-A transfer below the rule reports `error: While fetching <url>: [28] Timeout
-was reached` in the tool. The port reports `error: i/o error: fetched body
-averaged below <limit> bytes per second for <time>` for a body, and `error:
-fetch: <url>: transfer below <limit> bytes per second for <time>` for a
-response head. Both exit 1 and write no ref.
+  So each member of the repository group can read, deduplicate, and write
+  objects, and can publish a ref.
+- The setgid bit is part of the forced mode, so each directory that a member
+  creates below gets the group. The sticky bit stays off, because the reaper
+  of old staging directories removes staging trees that other members own.
+- A ref file, an alias symlink, a `.commitmeta`, and a `.tombstone-commit`
+  start as a temp entry in `tmp/` or in a staging directory. So each one gets
+  the group of that directory.
+- `.lock`, `.update.lock`, and the lock file next to each staging directory
+  get 0660. So each group member can open them `O_RDWR`, take the repository
+  lock and the update lock, and remove a staging tree whose owner is dead.
+- The `state/<commit>.commitpartial` marker gets 0644.
 
-`--update-frequency=FREQUENCY` is read with the same reader, at the same step,
-and with the same two messages, `--update-frequency` in place of the option
-name. It sets the redraw interval of the terminal progress line in
-milliseconds. 0 and a negative value keep the default of 1000 ms. To a pipe the
-value changes no byte of output. Recovered by running the tool against a
-repository with no remote: `abc`, an empty value, and `1.5` are refused as a
-syntax, `99999999999`, `2147483648`, and `-2147483649` as out of range, and
-`-1`, `0x10`, `010`, ` 5`, `+5`, and `2147483647` are accepted.
+The port forces a mode only on an entry that it creates. An entry that exists
+keeps its mode and its group. This includes the repository root: the caller
+sets the group and the mode of a root that the port did not create. The port
+sets no group owner.
 
-A pull that succeeds prints one statistics line on standard output. To a pipe
-it is the whole of the output, and nothing is written to standard error. A
-pull that fails prints no statistics line. The line takes one of four forms:
+A staging lock file and a `.commitpartial` marker have a second open after an
+exclusive create fails. Another process can remove the entry between the two
+opens. Then the second open creates the entry, and the port does not force
+its mode.
 
-- `M metadata, C content objects fetched; T transferred in S seconds; W
-  content written`, for an HTTP pull that fetched no delta part as a file;
-- `P delta parts, L loose fetched; T transferred in S seconds; W content
-  written`, for an HTTP pull that fetched at least one delta part as a file.
-  `L` is `M` plus `C`;
-- either of the two forms above with `; T transferred in S seconds` left out,
-  for an HTTP pull that read no body byte after the summary, the config, and
-  the ref files;
-- `M metadata, C content objects imported; W content written`, for
-  `pull-local`, and in the tool for a `file://` remote, which the port
-  refuses. `pull-local --require-static-deltas` prints the forms of an HTTP
-  pull instead, with the rules below.
+02770 gives no permission to others. The objects are 0644, which each user
+can read. So the directory permissions keep other users out of the
+repository.
 
-The words `delta parts` and `content objects` stay plural for a count of 1.
-The figures are these:
+The directories and the files under `deltas/` and `delta-indexes/` are outside
+this rule. They get the modes of each other mode ("Object store layout"). The
+directories get 0755 reduced by the umask. The files get 0644, whatever the
+umask is.
 
-- `M` counts each loose metadata object and each `.commitmeta` the remote
-  served, and each delta index request and delta superblock request, whatever
-  the remote answered. A `.commitmeta` request answered 404 does not count.
-- `C` counts each content object fetched loose from the remote.
-- `P` counts each delta part fetched as a file. A part the superblock carries
-  inline does not count, so a delta whose parts are all inline takes the first
-  form, with the index and the superblock counted in `M`.
-- `T` is the bytes of the response bodies read after the summary, the config,
-  and the ref files: the `summary.sig`, `summary`, and `config` requests do
-  not count, and from a remote with no summary the `refs/heads` request of
-  each ref does not count either. It
-  is `N B` below 1024 bytes, and above that the whole KiB rounded down, `N
-  KiB`. 3842 bytes print as `3 KiB`. The tool counts the body of an error
-  answer too; the port counts the bodies of the answers it reads.
-- `S` is the whole seconds the pull ran, rounded down.
-- `W` is the total payload size of the regular-file content objects written,
-  before any compression the destination mode applies. A symlink, an object
-  shared by hardlink, and an object a static delta produced count nothing.
-  An object `pull-local` copies between two `archive` repositories counts
-  nothing, and an object an HTTP pull fetches into `archive` counts its
-  payload. `W`
-  takes the wording of the `prune` totals line: `1 byte`, `N bytes` below
-  1000, and above that one decimal digit, U+00A0, and an SI unit (`3.0 kB`).
+The mode string is `[core] mode=bare-user-shared`. The separate string keeps
+the tool out of the repository. Observed behavior: the tool refuses a
+repository with an unknown mode string. Not observed: the tool opens a
+repository with the string `bare-user`. Its hardlink checkout then gives each
+file the inode mode 0644 of its object, in place of the logical mode.
 
-When one pull reaches the same objects by a loose walk and by a delta part,
-`L` and `W` change from run to run, in the tool and in the port, and the two
-disagree (`conformance/cli-surface.md`, "P2", `pull`).
+A user with access to the repository can read each object, so the repository
+does not keep the confidentiality of a file through its permissions. A
+checkout restores the restrictive logical permissions. The permissions of the
+repository root directory control access from outside. This is an accepted
+property of a shared development repository.
 
-Recovered by running the tool with standard output a pipe against a server
-that logs each request and the size of each body it sends. Over a tree of a
-3000-byte file, a 6-byte file, a 1-byte file, and a symlink, a loose pull into
-`archive` prints `4 metadata, 4 content objects fetched; 3 KiB transferred in
-0 seconds; 3.0 kB content written`, into `bare-user` `5 metadata` for the
-delta index request it adds, and a tree of a 1-byte file prints `1 byte
-content written`. A from-scratch delta of one part into `bare-user` prints `1
-delta parts, 2 loose fetched; 6 KiB transferred in 0 seconds; 0 bytes content
-written`, and the same delta generated with `--inline` prints `2 metadata, 0
-content objects fetched`. A repeat pull into `archive` whose requests all
-answer 404 with an empty body prints `0 metadata, 0 content objects fetched; 0
-bytes content written`. Into `bare-user` the tool asks for the delta index
-again on a repeat pull and prints `1 metadata`. From a remote with no summary,
-a loose pull of one ref into `archive`, whose five objects total 233 bytes,
-prints `4 metadata, 1 content objects fetched; 233 B transferred`, so the
-65-byte `refs/heads` body does not count.
+As in `bare-user`, the port never writes `ostree.sizes` in this mode. Only an
+`archive` repository writes the key ("The `ostree.sizes` key"), so the
+identity of a commit across modes needs no rule for this mode.
 
-`pull-local --require-static-deltas` reads the source as a fetch reads a
-remote, and counts each file it reads from the source directory as the
-response body of that file: `M` counts the delta index read and the superblock
-read of each delta taken, whether the file is there or not, each loose
-metadata object and each `.commitmeta` read from the source, and `C` each
-content object read loose. `T` adds the sizes of those files as the source
-stores them and of each part file, and leaves out the summary. From an
-`archive` source holding a from-scratch delta of one part into `bare-user` the
-tool prints `1 delta parts, 2 loose fetched; 294 KiB transferred in 0 seconds;
-0 bytes content written`, the 294 KiB being the index, the superblock, and the
-part. A delta with a fallback object and a `.commitmeta` prints `4 loose
-fetched` and counts the payload of the fallback in `W`, the same delta
-generated with `--inline` prints `3 metadata, 0 content objects fetched`, and a
-commit-only pull prints `1 metadata, 0 content objects fetched; 150 B
-transferred`, 150 bytes being the commit object. A repeat pull of a commit the
-destination holds reads the index again and prints `1 metadata` in the tool.
-The port reads no delta for a commit the destination holds complete and prints `0
-metadata`, as it does over HTTP.
+A checkout never hardlinks a regular file of this mode, because the inode
+does not carry the logical mode (`conformance/cli-behavior.md`, "Checkout",
+"Hardlink and copy").
 
-`pull-local` from `archive` prints `0 bytes content written` into
-`archive` and `3.0 kB content written` into `bare-user`, and from `bare-user`
-it prints `0 bytes content written` into `bare-user` and `3.0 kB content
-written` into `bare` and into `archive`.
+`fsck` and prune act as in `bare-user`. `fsck` checks
+`SHA256(header-from-xattr ‖ payload) == object name`. The mode has no
+auxiliary objects and no extra reachability edges. `fsck` does not check the
+inode mode.
 
-Standard output that is a terminal also carries a progress line. The tool
-writes `ESC 7` when the pull starts, then each redraw as `ESC 8` and the
-progress text padded with spaces to the terminal width, and last `ESC 8`, the
-statistics line padded the same way, and a newline. The width is counted in
-bytes, so each U+00A0 in the line takes two of the columns, and a line longer
-than the width is written whole. A pull that fails writes a newline after the
-last line, and the error follows on standard error. Three forms of the
-progress text were seen: `Receiving metadata objects: 5/(estimating) 237
-bytes/s 948 bytes`, `Receiving objects: 38% (59/155) 454.8 kB/s 1.4 MB`, and
-`Receiving delta parts: 0/1 0 bytes/3.4 MB 356.2 kB/s 9 seconds remaining`.
-The rate reads `-/s` before the tool has measured one. Recovered with `script`
-and `stty cols` at 60, 80, and 100 columns: at 100 columns the progress line
-and the statistics line each take 100 bytes, and a pull that ends before the
-first redraw writes `ESC 7`, `ESC 8`, and the statistics line. At a redraw
-interval of 1 or 50 ms the tool was also seen to write a `Writing objects: N`
-form and to end on a progress line with no statistics line after it.
-
-The port writes the same sequences and the same three forms, pads each line to
-80 bytes, and does not read the terminal width. It writes `ESC 7` with its
-first redraw, or with the last line when the pull ends before the first
-redraw, so a pull that draws no progress line writes the bytes the tool
-writes. Its rate, the bytes transferred over the whole time the pull ran,
-reads `-/s` until a whole second has passed, and it always ends on the
-statistics line. Its progress totals count the units of work its own walk
-handles, and `pull-local` writes no progress line. The progress line is
-outside the byte-exact scope.
+This mode is the composefs backing store of the port. Its `.file` objects
+hold the raw payload at the loose paths that each image redirect names. So
+the repository serves as the lower layer of an image exported from any mode
+that holds the same tree. The fs-verity digest of each file covers the
+payload. The composefs uid mapping presents the owner at mount time, so the
+root-owned metadata is correct also inside a rootless container.

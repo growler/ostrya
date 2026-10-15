@@ -4,183 +4,48 @@
 //! [`Error::Protocol`] for the code `protocol`. [`ErrorCode`] names the
 //! codes.
 //!
+//! `docs/format-reference.md` of the repository specifies the wire format,
+//! and this module implements it. The sections below link to each part of the
+//! specification.
+//!
 //! # Frames
 //!
-//! The peers exchange frames. A frame has this layout:
+//! [Wire conventions] specifies the byte orders. [Frame layout] and
+//! [Frame limits] specify the frame and its limits. [Messages] specifies the
+//! message kinds with their bodies, and [Error codes] specifies the wire
+//! codes.
 //!
-//! ```text
-//! u32   length, big-endian, of the bytes that follow (kind byte + body)
-//! u8    message kind
-//! ...   GVariant body, normal form, of the type the kind names
-//! ```
-//!
-//! A frame holds at least the kind byte, so a frame length of 0 is
-//! [`Error::Protocol`]. A frame length greater than the current limit is
-//! [`Error::LimitExceeded`]. The reader checks the length before it reads or
-//! allocates the body.
-//!
-//! Before the server announces a limit, the limit is [`MIN_FRAME_LIMIT`]. The
-//! server announces its limit in the key `max-frame` of `HelloReply`. The
-//! value is from [`MIN_FRAME_LIMIT`] (1 MiB) to [`MAX_FRAME_LIMIT`]
-//! (`0xFFFFFFFE`), both included. A value out of this range is
-//! [`Error::Protocol`].
-//!
-//! The limit applies in both directions. A client writes frames up to the
-//! announced limit. It reads frames up to a limit of its own, because the
-//! reader allocates each frame body in full.
-//!
-//! The message kinds and their body types are:
-//!
-//! - 1 `Hello` -- `(ua{sv}as)`
-//! - 2 `HelloReply` -- `(ua{sv}a(smay))`
-//! - 3 `Have` -- `a(yay)`
-//! - 4 `HaveReply` -- `ay`
-//! - 5 `ObjectHeader` -- `(yayy)`
-//! - 6 `ObjectsEnd` -- an empty body of zero bytes, with no GVariant type
-//! - 7 `ObjectsReply` -- `(ut)`
-//! - 8 `Commit` -- `(a(symaymay)a{sv})`
-//! - 9 `CommitReply` -- `a(smaymay)`
-//! - 10 `Error` -- `(ssa{sv})`
-//! - 11 `Abort` -- `()`, which is the one byte `0x00` in normal form
-//! - 12 `PullHello` -- `(ua{sv})`
-//! - 13 `PullHelloReply` -- `(ua{sv})`
-//! - 14 `Get` -- `s`
-//! - 15 `GetReply` -- `(bmt)`
-//! - 16 `ListRefs` -- `as`
-//!
-//! The kinds belong to the two protocols as follows:
-//!
-//! - Kinds 1 to 9 and 11 belong to the push.
-//! - Kinds 12 to 16 belong to the pull.
-//! - Kind 10, the `Error` message, belongs to both.
+//! A client writes frames up to the limit that the server announces. It reads
+//! frames up to a limit of its own, because the reader allocates each frame
+//! body in full.
 //!
 //! The codec reads and writes every kind. A session refuses a kind of the
 //! other protocol with [`Error::Protocol`].
 //!
-//! Each of these is [`Error::Protocol`]:
-//!
-//! - a kind that is not in the list
-//! - a body that is not in normal form for its type, or that has trailing
-//!   bytes
-//! - an `ObjectsEnd` body that is not empty
-//! - an `Abort` body other than `0x00`
-//!
-//! The integers in a message body are little-endian, which is the GVariant
-//! normal form. The protocol applies no value-level byte swap. The frame
-//! length and the chunk length are big-endian.
-//!
-//! Every checksum in a body is an `ay` of exactly 32 bytes. A checksum of
-//! another length is [`Error::Protocol`].
-//!
-//! The decoder ignores an `a{sv}` key that it does not know. A known key whose
-//! value has the wrong type is [`Error::Protocol`]. If a key occurs twice, the
-//! first one counts.
-//!
 //! # Object stream
 //!
-//! After an `ObjectHeader` frame, the bytes of the object follow as chunks.
-//! A chunk is not a frame. It has this layout:
-//!
-//! ```text
-//! u32   length, big-endian
-//! ...   that number of object bytes
-//! ```
-//!
-//! The chunk length has these meanings:
-//!
-//! - A chunk of length 0 ends the object. Then frames follow again: the next
-//!   `ObjectHeader`, or `ObjectsEnd`, which closes the stream.
-//! - The length [`ABANDON`] (`0xFFFFFFFF`) abandons the object. The next frame
-//!   must be `Abort`. Any other frame is [`Error::Protocol`].
-//! - Any other length greater than the current limit is
-//!   [`Error::LimitExceeded`]. The chunk limit and the frame limit are the
-//!   same number, at most [`MAX_FRAME_LIMIT`].
-//!
-//! The object type in `ObjectHeader` is one of these values:
-//!
-//! - 1, a file
-//! - 2, a dirtree
-//! - 3, a dirmeta
-//! - 4, a commit
-//! - 6, the detached metadata of a commit
-//!
-//! For type 6, the checksum is the checksum of the commit that the metadata
-//! belongs to. `Have` names only types 1 to 4.
-//!
-//! The encoding is 0 (`raw`) or 1 (`deflate`). Only type 1 can have the
-//! encoding `deflate`.
+//! [Chunks and the abandon marker] specifies the chunks of an object that
+//! follow an `ObjectHeader`, and [Object streams] states the rules of the
+//! server. [`ABANDON`] is the chunk length of the abandon marker.
 //!
 //! # One-way stream
 //!
-//! A one-way stream carries the push messages in one direction, and the
-//! receiver sends no message. The stream holds these parts, in this order:
-//!
-//! 1. one `Hello` whose key `one-way` is `true`
-//! 2. zero or more object streams, each closed by `ObjectsEnd`
-//! 3. one `Commit`
-//! 4. the end of file
-//!
-//! No `HelloReply` announces a limit, so the frame limit and the chunk limit
-//! are [`MIN_FRAME_LIMIT`]. A `Have` is [`Error::Protocol`]. An `Abort` message
-//! between two objects is also [`Error::Protocol`].
-//!
-//! If a sender cannot complete an object, it writes the abandon marker and
-//! `Abort`, as in a two-way session. A two-way receiver refuses a `Hello`
-//! whose `one-way` is `true` with [`Error::Protocol`].
+//! [The one-way stream] specifies the stream that carries a push in one
+//! direction.
 //!
 //! # Pull
 //!
-//! The pull asks for files by their path, relative to the repository root.
-//! The client sends `PullHello` with the highest pull version that it speaks,
-//! [`PULL_PROTOCOL_VERSION`]. The server sends one of these replies:
-//!
-//! - `PullHelloReply` with the lower of the version of the client and the
-//!   highest version of the server
-//! - an `Error` message with the code `version-unsupported` for a version
-//!   that the server does not speak. An ostrya server speaks each version
-//!   from 1 to its highest, so it refuses only version 0.
-//!
-//! In version 1, `PullHelloReply` holds an empty dict. A decoder ignores a
-//! key of `PullHello` or of `PullHelloReply` that it does not know.
-//!
-//! The client then sends `Get` and [`ListRefs`](self#ref-listing) frames. The
-//! server answers each of them with one `GetReply`, in the order of the
-//! frames. A [`GetReply`] holds `found` and, if the server knows it, the
-//! length of the body. The frame limit of the pull is [`MIN_FRAME_LIMIT`] in
-//! both directions, and no message announces another limit.
-//!
-//! A body follows a `GetReply` whose `found` is `true`. The body is a
-//! sequence of chunks, as in the object stream. A chunk of length 0 ends the
-//! body, and a chunk is at most the frame limit.
-//!
-//! The length [`ABANDON`] ends a body that fails partway. The next frame must
-//! be an `Error` message, and any other frame is [`Error::Protocol`]. After
-//! the marker, an object of the push takes `Abort`, and a body of the pull
-//! takes an `Error` message.
+//! [The pull session over a stream] specifies `PullHello`, `Get`, and
+//! `ListRefs`. [`PULL_PROTOCOL_VERSION`] is the highest pull version that this
+//! crate speaks. A [`GetReply`] answers each `Get` and each `ListRefs`.
 //!
 //! # Ref listing
 //!
-//! A `ListRefs` holds the entries of a
-//! [`RefSelector`](ostrya_core::RefSelector), which gives the pattern
-//! language. An entry is a ref pattern with an optional leading `!`. The
-//! listing holds the refs under `refs/heads` that the entries select. An
-//! empty list selects all of them.
-//!
-//! A `ListRefs` holds at most [`MAX_REF_PATTERNS`] entries. Each entry has at
-//! most [`MAX_REF_ENTRY_PARTS`] parts and [`MAX_REF_ENTRY_LEN`] bytes.
-//!
-//! The server answers with a `GetReply` whose `found` is `true` and that
-//! holds the length of the listing. The body carries the listing, a summary
-//! GVariant of at most [`MAX_REF_LISTING`] bytes. A reply to a `ListRefs`
-//! whose `found` is `false`, or that holds no length, is [`Error::Protocol`].
-//!
-//! For these conditions, the server sends an `Error` message in place of the
-//! `GetReply`, and then ends the session:
-//!
-//! - `protocol` for an entry that is not a ref pattern, for an entry over
-//!   the limits of one entry, and for more than [`MAX_REF_PATTERNS`] entries
-//! - `limit-exceeded` for a listing larger than [`MAX_REF_LISTING`]
-//! - `internal` for any other failure of the build of the listing
+//! [The ref listing] specifies the body of a listing. The entries of a
+//! `ListRefs` are the entries of a [`RefSelector`](ostrya_core::RefSelector),
+//! which parses them. [`MAX_REF_PATTERNS`], [`MAX_REF_ENTRY_PARTS`],
+//! [`MAX_REF_ENTRY_LEN`], and [`MAX_REF_LISTING`] are the limits of a request
+//! and of a listing.
 //!
 //! # Codec
 //!
@@ -195,6 +60,16 @@
 //! as an `AsyncRead`.
 //!
 //! [`ErrorCode`]: crate::ErrorCode
+//! [Wire conventions]: https://github.com/growler/ostrya/blob/main/docs/format-reference.md#wire-conventions
+//! [Frame layout]: https://github.com/growler/ostrya/blob/main/docs/format-reference.md#frame-layout
+//! [Frame limits]: https://github.com/growler/ostrya/blob/main/docs/format-reference.md#frame-limits
+//! [Messages]: https://github.com/growler/ostrya/blob/main/docs/format-reference.md#messages
+//! [Error codes]: https://github.com/growler/ostrya/blob/main/docs/format-reference.md#error-codes
+//! [Chunks and the abandon marker]: https://github.com/growler/ostrya/blob/main/docs/format-reference.md#chunks-and-the-abandon-marker
+//! [Object streams]: https://github.com/growler/ostrya/blob/main/docs/format-reference.md#object-streams
+//! [The one-way stream]: https://github.com/growler/ostrya/blob/main/docs/format-reference.md#the-one-way-stream
+//! [The pull session over a stream]: https://github.com/growler/ostrya/blob/main/docs/format-reference.md#the-pull-session-over-a-stream
+//! [The ref listing]: https://github.com/growler/ostrya/blob/main/docs/format-reference.md#the-ref-listing
 
 mod frame;
 mod message;

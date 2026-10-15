@@ -160,6 +160,7 @@ impl<R: AsyncRead + Unpin> FrameReader<R> {
     /// - [`Error::Protocol`] if the frame length is 0, if the kind byte is not
     ///   a known kind, or if the body does not decode.
     /// - [`Error::LimitExceeded`] if the frame length is more than the limit.
+    ///   The reader checks the length before it reads or allocates the body.
     /// - [`Error::Io`] of kind `UnexpectedEof` if the stream ends inside a
     ///   frame.
     /// - [`Error::Io`] if a read of the stream fails.
@@ -536,8 +537,8 @@ impl<W: AsyncWrite + Unpin> FrameWriter<W> {
     ///
     /// The value is clamped to [`MIN_FRAME_LIMIT`]`..=`[`MAX_FRAME_LIMIT`].
     /// [`HelloReply::max_frame`](super::HelloReply::max_frame) holds the
-    /// announced value, and the [frame rules](crate::proto#frames) apply
-    /// the limit.
+    /// announced value. The writer applies the limit to each frame and each
+    /// chunk that it writes after the call.
     pub fn set_limit(&mut self, limit: u32) {
         self.limit = clamp_limit(limit);
     }

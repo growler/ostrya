@@ -63,8 +63,8 @@ The accepted `--mode` values are `archive`, `archive-z2`, `bare`, `bare-user`,
 `archive-z2` name the same mode, and the config always serializes as
 `archive-z2`. `bare-split-xattrs` is deliberately excluded even though the
 tool's own `init --mode` accepts it (see "Global conventions" below): the port
-reads that mode and does not write it (`format-reference.md`, "Repository
-modes and on-disk storage"), so exposing it here would create a repository
+reads that mode and does not write it (`format-reference.md`,
+"bare-split-xattrs mode"), so exposing it here would create a repository
 nothing in the port could subsequently commit into. An unrecognized mode, and
 `bare-split-xattrs`, are both rejected the way "Global conventions" describes.
 
@@ -84,9 +84,9 @@ Done, Phase 17b:
   takes one or more of.
 - `cat` -- `COMMIT` and one or more `PATH`.
 
-Their output formats are recorded in `../format-reference.md`, "CLI output
-formats". Sixteen tool behaviors around them are observed and deliberately not
-reproduced:
+Their output formats are recorded in `cli-behavior.md`, "CLI output
+formats", `refs`, `rev-parse`, and `cat`. Seventeen tool behaviors around them
+are observed and deliberately not reproduced:
 
 - the tool names an `-A` alias that lives under `refs/remotes/<remote>/` by its
   path below the remote, dropping the remote and printing a name that resolves
@@ -156,12 +156,36 @@ reproduced:
   The port skips the dangling entry everywhere else: it lists the rest, writes
   every `--create` form, and removes what a prefix matched. `--delete` naming
   the link itself exits 0 and leaves the link in place in both;
-- an invalid collection id aborts the tool on a GLib assertion when it names a
-  directory under `refs/mirrors`, and is rejected with `error: Listing refs:
-  Invalid collection ID <id>` when it is given as a `-c` positional; the port
-  validates a collection id only where `-c --create` writes one, so a `-c`
-  positional the tool refuses matches no collection ref in the port, which
-  prints nothing and exits 0 where the tool exits 1;
+- a symlink under `refs/` that names a directory. Such a link comes from an
+  out-of-band change alone, because `refs -A --create` validates its target as
+  a ref in both implementations. In both implementations, `-A` lists the link
+  as `lnk -> deep`. In each implementation, a link that names its own
+  directory (`refs/heads/selfdir -> .`) gives the same results as a link to
+  another directory. The other results part as follows:
+  - The tool reports `error: Listing refs: Is a directory` and exits 1 from
+    the default listing, `--list`, `-r`, `fsck`, `summary -u`, and `prune
+    --refs-only`. The default `prune` of the tool reads no ref and exits 0.
+  - The prefix forms of the tool complete over the link. A `PREFIX` that
+    names the link enumerates the directory that the link points at. So `refs
+    lnk` prints `nest/ing` where `refs/heads/lnk` links to `deep` and
+    `deep/nest/ing` is a ref. A `--delete PREFIX` that matches other refs
+    removes them and exits 0. A `--delete` that names the link reports `error:
+    Listing refs: opendir(lnk): Not a directory` and exits 1.
+  - The port reads each symlink under `refs/` as an alias, and descends into a
+    real directory alone. So the read of the link fails with `EISDIR` wherever
+    an enumeration reaches it. The port reports `error: i/o error: Is a
+    directory (os error 21)` and exits 1 from each listing form other than
+    `-A`. It does the same from `--delete`, whatever the prefix matches, and
+    from `fsck`, `prune`, and `summary -u`;
+- an invalid collection id aborts the tool when it names a directory under
+  `refs/mirrors`. The tool prints `ostree_collection_ref_new: assertion
+  'collection_id == NULL || ostree_validate_collection_id (collection_id,
+  NULL)' failed`, and a signal ends it. The port lists what that path holds.
+  The tool refuses an invalid id given as a `-c` positional with `error:
+  Listing refs: Invalid collection ID <id>` and exit 1. The port validates a
+  collection id only where `-c --create` writes one. So a `-c` positional that
+  the tool refuses matches no collection ref in the port, which prints nothing
+  and exits 0;
 - `refs -c --create=<id>`, whose NEWREF holds no `:` and therefore no ref name,
   makes the tool print a GLib assertion line (`g_regex_match_full: assertion
   'string != NULL' failed`) ahead of its own `error: Invalid ref name (null)`;
@@ -177,8 +201,8 @@ reproduced:
   the tool on a signal (exit 139), with `--force`, with `-A`, and with `-c` as
   `--create=<id>:<ref>^` alike, after leaving `refs/` untouched. The port
   reports `error: Invalid refspec NEWREF`, which is the tool's own refusal for
-  that name at the step a resolvable base reaches (`../format-reference.md`,
-  "refs");
+  that name at the step a resolvable base reaches (`cli-behavior.md`, "CLI
+  output formats", `refs`, "NEWREF check order");
 - an empty refspec is the zero-length case of the abbreviated-checksum scan in
   the tool, and the count that decides it is of commits: `rev-parse ''` resolves
   in a repository holding exactly one commit, reports `error: Refspec  not
@@ -196,7 +220,7 @@ reproduced:
   standard output, and leave the same refs tree, so the two lines differ by the
   tool's `Listing refs: ` context prefix, which the port carries nowhere: one
   condition has one message wherever a name reaches the library
-  (`../format-reference.md`, "refs");
+  (`cli-behavior.md`, "CLI output formats", `refs`, "Listing and prefixes");
 - a `PREFIX` whose path under `refs/` runs through a ref file -- `plain/x` over
   the ref `plain`, `origin:rr/x/y` over the ref `origin:rr/x`, `al/x` through an
   alias symlink -- is refused by both, in every listing form and in `--delete`,
@@ -212,7 +236,10 @@ reproduced:
   of which carry a name the port cannot reproduce. Against `refs/heads/d`, a
   directory holding the ref `d/inner`, the tool reports `error: Conflict: inner
   exists under d when attempting write` for `refs --create=d`, naming one ref read
-  in directory order, with `--force` and without it; `error:
+  in directory order, with `--force` and without it; over the ref
+  `deep/nest/ing`, `refs --create=deep plain` reports `error: Conflict:
+  nest/ing exists under deep when attempting write`, so the line names the
+  path below the directory that the scan reached; `error:
   renameat(tmplink.<random>, d): Is a directory` for `refs -A --create=d`, naming
   its own temporary file; and `error: Couldn't open ref 'd': Is a directory` for
   `rev-parse d` and `cat d PATH`, which names the ref half of a refspec alone, so
@@ -244,7 +271,10 @@ reproduced:
   the repository and the syscall, `error: openat(refs/heads/plain/x): Not a
   directory`, for `refs --create=plain/x`, `refs -A --create=plain/x`, the
   positional revision of a plain `--create`, `rev-parse plain/x`, and
-  `cat plain/x PATH`; under `-c --create=<id>:<ref>` the write reaches the
+  `cat plain/x PATH`, and the same line for a name that reaches the ref file
+  through an alias symlink; for `origin:rr/x/y` it reports `error:
+  openat(refs/remotes/origin/rr/x/y): Not a directory`; under
+  `-c --create=<id>:<ref>` the write reaches the
   mirror path and it reports `error: open(O_TMPFILE): Not a directory`, naming
   no path; and as an `-A --create` target it reports the target as a name no ref
   holds, `error: Cannot create alias to non-existent ref: plain/x`, the existence
@@ -300,12 +330,11 @@ revision is taken, and a prefix more than one commit carries reports `error:
 Refspec <prefix> not unique` at exit 1 in both. The scan of `objects/` inside
 `Repo::resolve_rev` landed in Phase 17f as item `X1`, with the `commit -b`
 consequence as `F10a`: a branch name prefixing a commit and naming no ref parents
-its commit on that commit in both implementations. The rule, the sites it reaches,
-and the observations that recovered it are in `../format-reference.md`, "Revision
-syntax".
+its commit on that commit in both implementations. The rule and the sites it
+reaches are in `../format-reference.md`, "Abbreviated checksums".
 
 One resolution behavior the tool has and the port does not, recorded in
-`../format-reference.md` with the observation that recovered it:
+`../format-reference.md`, "Branch names no revision reaches":
 
 - the tool's ref enumeration skips a ref whose name fails the ref-name rule
   without a word, and the port enumerates it. Only an out-of-band write puts
@@ -327,8 +356,7 @@ One resolution behavior the tool has and the port does not, recorded in
   consequence and is recorded under "P2"; the two are one class.
 
 One class of non-ASCII characters in a ref name parts the two implementations,
-recorded in `../format-reference.md`, "Ref name validation", with the
-observation that recovered it:
+recorded in `../format-reference.md`, "Ref name validation":
 
 - the tool accepts a nonspacing combining mark (Unicode category Mn), such as
   `U+0301`, and a non-ASCII connector punctuation character (category Pc), such
@@ -356,7 +384,7 @@ Done, Phase 17d:
 - `config get` -- the dotted key and `--group=GROUP`.
 
 Their output formats, and the GVariant text form they share, are recorded in
-`../format-reference.md`, "The GVariant text form", "`show`", "`log`", "`ls`",
+`cli-behavior.md`, "The GVariant text form", "`show`", "`log`", "`ls`",
 and "`config get`". `show --print-variant-type=TYPE` takes every definite
 GVariant type string in both implementations: Phase 17f widened
 `ostrya-gvariant`'s `Type` to `n`, `q`, `i`, `x`, `h`, `d`, `o`, `g`, and the
@@ -430,7 +458,8 @@ deliberately not reproduced:
   against the tail of either fingerprint, so the whole fingerprint of either
   key reaches it as well;
 - the verdict the report states rests on the port's own trust and validity
-  policy, which `../port-plan.md`, "Phase 13d", enumerates against GnuPG 2.4.9.
+  policy, which `../port-plan.md`, "Phase 13d -- GPG signing and verification
+  (DONE)", enumerates against GnuPG 2.4.9.
   Seven differences stand there, and each one can make a `show` verdict part
   from the tool's: the fixed digest policy, the GnuPG keybox refusal, the
   refusal a keyring the parser rejects draws, the 256-bit minimum digest an
@@ -439,15 +468,38 @@ deliberately not reproduced:
   the first alone, and the key expiry read as the newest statement two exports
   of one certificate carry rather than as the statement the first export makes.
 
+Not observed: the answer of the tool to a repeated `show
+--print-metadata-key` or `--print-detached-metadata-key`. No test runs the
+tool with a repeated key option. The port refuses the repeat with `error: the
+argument '--print-metadata-key <KEY>' cannot be used multiple times`, or the
+same line for `--print-detached-metadata-key <KEY>`, at exit 1.
+
+A dirtree that holds one name in both its file list and its directory list
+parts the two. The format lets the two lists hold one name, and the
+tool reads such an object, put in a repository by hand: `ostree fsck` reports
+no error, `ostree ls` prints both entries, and `ostree ls -R` aborts on an
+internal assertion when it resolves the name as a directory. The port writes
+no such object, and each port reader that loads the whole dirtree refuses it
+with `invalid dirtree: a name appears in both the file and directory lists`
+(`../format-reference.md`, "Dirtree -- `(a(say)a(sayay))`").
+
 `config set` and `config unset` write the document through the config write path
 Phase 17e landed. Both accept what the tool accepts and word every refusal the
 same way, and the file each writes holds the same bytes
-(`../format-reference.md`, "`config set` and `config unset`"). One divergence
+(`cli-behavior.md`, "`config set` and `config unset`"). One divergence
 stands, at a key naming an empty group or an empty key: `config set .k v` and
 `config set g. v` reach GLib's own key-file assertions in the tool, which prints
 a `GLib-CRITICAL` line, writes nothing, and exits 0, where the port refuses the
 name (`keyfile: group name is empty`, `keyfile: key is empty`), writes nothing,
 and exits 1. Both leave the file as it stands.
+
+`config get` unescapes a value by the rules of `../format-reference.md`,
+"Config file (`<repo>/config`, GKeyFile / INI)". Not observed: the answer of
+the tool to two values. The first value holds an escape that these rules do
+not name. The second value ends in a lone backslash. The port refuses the
+first value at exit 1 with `error: keyfile: invalid escape '\X'`, where `X` is
+the character after the backslash. The port refuses the second value at exit 1
+with `error: keyfile: value ends with a lone backslash`.
 
 Nothing in this section is absent.
 
@@ -479,8 +531,8 @@ below. The composition rule, the source list, the two type-change refusals,
 `--base`, `--consume`, `--generate-sizes` over any source list, and the two tar
 options otherwise agree with the tool over every form the cells and the tests
 hold, each accepted form checked by the commit checksum and each refusal by its
-text (`../format-reference.md`, "CLI output formats", `commit`, and that file's
-"The tar import").
+text (`cli-behavior.md`, "CLI output formats", `commit`, and that file's
+"The tar import options").
 
 The first is the source a command line naming neither `--tree` nor a positional
 `PATH` states. The tool walks the current working directory; the port reads a
@@ -577,7 +629,7 @@ its own line at exit 1.
 
 An expression neither engine compiles is refused by both at exit 1 with no
 commit written, and both report `error: --tar-pathname-filter: Error while
-compiling regular expression '<expression>' at char N: <reason>`. The line
+compiling regular expression ‘<expression>’ at char N: <reason>`. The line
 parts in two places.
 
 The reason string is the first. GLib passes some of PCRE2's own reasons through
@@ -621,7 +673,7 @@ characters needs a `b` the name does not hold, so both answer at exit 0 and
 write one commit. `(a+)+\d`, `(a+)+[0-9]`, and `(a|aa)+\d` require no literal
 and reach the limit over that name. Both refuse, writing no object and no ref,
 and the exit path is the difference: the port reports `error: tar:
---tar-pathname-filter: Error while matching regular expression '<expression>':
+--tar-pathname-filter: Error while matching regular expression ‘<expression>’:
 match limit exceeded` at exit 1, and the tool ends on a GLib assertion at exit
 134 whose printed message names `ot-builtin-commit.c` and
 `handle_translate_pathname` and reads `Error while matching regular expression
@@ -739,11 +791,25 @@ does not open, and `archive_read_open_filename: Failed to open '<path>'` for a
 `tar=` source. Both implementations open a `dir=` source no-follow, so a
 symlink naming a directory is `Not a directory` in both.
 
+A missing parent that `--tar-autocreate-parents` creates for a hardlink member
+takes the owner `0:0` in the port (`TarImportOptions::autocreate_parents` in
+`crates/ostrya/src/tar.rs`). No observation of the tool covers a hardlink
+member that creates a parent, so this case is not counted among the seven
+above (`cli-behavior.md`, "The tar import options").
+
+Not observed: the xattrs that the tool records under `--canonical-permissions`
+over a `tar=` source. No observation of the tool covers an archive that
+carries xattrs, so this case is not counted among the seven above. The port
+keeps the xattrs that the archive carries under the option (`shape` in
+`crates/ostrya/src/tar.rs`). Over a filesystem walk, both record no xattrs
+under the option (`../format-reference.md`, "Canonical permissions").
+
 The walk of a filesystem source carries divergences apart from the seven
 above: the wording of each refusal of an entry, and two outcomes. The walk
 reads each entry with `fstatat` and checks its type ahead of `--skip-list` in
 both implementations, and it opens an entry after that check
-(`../format-reference.md`, "commit"). Both refuse a fifo and a unix socket at
+(`cli-behavior.md`, "CLI output formats", `commit`, "The walk of a filesystem
+source"). Both refuse a fifo and a unix socket at
 exit 1, with no object and no ref, and a skip list that names the entry does
 not prevent the refusal. Both refuse a regular file or a directory that does
 not open, and an entry of a directory at mode 0644, whose `fstatat` fails. The
@@ -769,10 +835,19 @@ Two outcomes part:
   target. No matrix cell states the case;
 - a skip list that names a regular file or a directory that does not open. The
   tool does not open the entry and commits the tree without it. Without
-  `--no-xattrs` the port reads the extended attributes of the entry ahead of the
-  skip list, the read fails, and the port refuses at exit 1 with no object and
-  no ref. With `--no-xattrs` the port commits, and the commit checksum equals
-  the tool's. This is a defect of the port, and no matrix cell states it yet.
+  `--no-xattrs` the port reads the xattrs of each entry when it lists the
+  directory, ahead of the skip list. That read opens the entry, so it fails, and
+  the port refuses at exit 1 with no object and no ref. With `--no-xattrs` the
+  port commits, and the commit checksum equals the tool's. This is a defect of
+  the port, and no matrix cell states it yet.
+
+The port lists a whole directory before it enters a subdirectory. The walk of
+the tool enters a subdirectory when it reaches it (`cli-behavior.md`, "CLI
+output formats", `commit`, "The walk of a filesystem source"). So over a tree
+with more than one failing entry, the two can report different entries.
+The port reports an entry that does not open with `error: i/o error: <reason>
+(os error <n>)`, which names no path. A directory at mode 0644 opens, so a skip
+list that names one gives a commit in both.
 
 The one divergence the four Phase 17c options carry sits at the values
 `--timestamp` takes. The tool reads a date with a full natural-language reader:
@@ -792,16 +867,16 @@ The two Phase 17f options carry four divergences between them. One of the four
 parts on the text of a parse refusal; none parts on the set of values either
 reader accepts, on the checksum a commit reaches, or on the seven
 `--table-output` lines. The first is the order in which two refusable option
-values are read. Both implementations refuse a `--fsync` value
-neither reader holds with `error: Invalid boolean argument '<value>'` at exit 1,
-and both refuse it in the same step: while the options are read, ahead of the
-repository, ahead of the missing-branch check, ahead of the tree, and ahead of
-the timestamp (`../format-reference.md`, "CLI output formats"). Inside that step
-the tool reads the options in command-line order, where the port reads
-`--owner-uid`, then `--owner-gid`, then `--fsync`. One refusable value alone
-parts the two nowhere; two on one command line report the tool's leftmost and
-the port's fixed first, so `commit --fsync=on --owner-uid=abc` reports the fsync
-value from the tool and the id from the port.
+values are read. Both implementations refuse a `--fsync` value neither reader
+holds with `error: Invalid boolean argument '<value>'` at exit 1, and both
+refuse it in the same step: while the options are read, ahead of the repository,
+ahead of the branch check of `-b` and `--orphan`, ahead of the tree, and ahead
+of the timestamp (`cli-behavior.md`, "CLI output formats", `commit`, "Fault
+order"). Inside that step the tool reads the options in command-line order,
+where the port reads `--owner-uid`, then `--owner-gid`, then `--fsync`. One
+refusable value alone parts the two nowhere; two on one command line report the
+tool's leftmost and the port's fixed first, so `commit --fsync=on
+--owner-uid=abc` reports the fsync value from the tool and the id from the port.
 
 The second is `--disable-fsync`, which `commit --help` does not list and which
 the tool accepts there as `--fsync=false`. The port implements the documented
@@ -809,8 +884,8 @@ the tool accepts there as `--fsync=false`. The port implements the documented
 scope was chosen with the alias observed. `ostrya commit --disable-fsync`
 reports `error: unexpected argument '--disable-fsync' found` from `clap` and
 exits 1, where the tool commits. The valueless spelling stays with `pull` and
-`pull-local`, which document it (`../format-reference.md`, "The fsync
-vocabulary").
+`pull-local`, which document it (`cli-behavior.md`, "The fsync
+vocabulary", "Spellings per command").
 
 The third is a reference defect that no cell states. `--table-output` beside
 `--skip-if-unchanged` over an unchanged tree prints uninitialized counters from
@@ -845,15 +920,34 @@ The count of sync calls a policy-on commit makes is not among the four. The two
 resolve the same policy from the same inputs -- the configured `[core] fsync`
 narrowed by the option value, so a repository configured off syncs nothing under
 `--fsync=true` -- and both then sync the objects, the publication, and the ref.
-The port issues one call more over an eleven-object tree, syncing the directory
-holding the ref beside the ref file (`../format-reference.md`, "The fsync
-vocabulary").
+The port issues one call more over corpus `C0`, an eight-object commit, syncing
+the directory holding the ref beside the ref file (`cli-behavior.md`, "The fsync
+vocabulary", "Sync counts of a commit"). One commit with the branch `main`
+issues 11 sync calls in the tool and 12 in the port. The extra call is the
+`fsync` of `refs/heads` (`commit_fsync_policy_controls_the_syscalls` and
+`commit_syncs_every_created_ref_directory` in `crates/ostrya-cli/tests/cli.rs`).
+
+Under `[core] per-object-fsync=true`, one commit of corpus `C0` issues 15 sync
+calls in the tool and 16 in the port in `archive` and in `bare-user`. In `bare`
+it issues 14 in the tool and 15 in the port. The extra call is the same `fsync`
+of `refs/heads` (`commit_per_object_fsync_syncs_content_objects_alone`).
+
+The port runs `fsync` on the directory that holds a ref after it renames a ref
+file or an alias link over the ref name, and after it removes a ref. A write
+that creates directories for a ref name with `/` also syncs the directory that
+holds each created directory, deepest first. The tool syncs no directory in a
+ref write, an alias write, or a ref removal. In the port, the name that a
+completed ref operation created or removed survives a crash, and so does the
+content of the file. No published byte differs, and `fsync=false` turns off
+these syncs in the port. `../format-reference.md`, "Ref durability", states the
+rule of each side.
 
 The nine Phase 17f options that carry the message, the metadata, and the ref
 bindings agree with the tool over every form the cells and the unit tests hold.
 Each accepted form was checked against the tool by commit checksum, which is what
 the subject, the body, the metadata dict, and that dict's entry order all reach,
-and each refusal by its text (`../format-reference.md`, "CLI output formats").
+and each refusal by its text (`cli-behavior.md`, "CLI output formats",
+`commit`).
 The set covered: the body forms and their five refusals; the editor's template
 bytes, its file mode, its environment precedence, its shell-command handling, its
 place in the fault order, the twenty-three message-parse cases, and the two
@@ -869,15 +963,43 @@ comparing the commit checksum for an accepted one and the exact standard-error
 line and exit status for a refused one. 749 of the 776 agree. The 366 values both
 accept were then read back in four modes -- `--raw`, `-B --raw`,
 `--print-metadata-key`, and `-B --print-metadata-key` -- 1464 comparisons of
-which 1416 agree. Both sets of differences fall in the four classes
-`../format-reference.md`, "Reading the text form back" records: a `\u` escape
-naming a surrogate or a code point past U+10FFFF, which aborts the tool with a
-signal and is refused by the port; the offset the nesting refusal carries for
-`<`, `just`, a type keyword and a `@` declaration, which the tool prints as an
-uninitialized number; a string holding a code point GLib does not count as
-printable, which the tool escapes and the port prints as itself; and a value
-nested past 123 levels, where the two part first on the printed text and then on
-whether the commit is written at all. A `\u` or `\U` escape naming U+0000 is
+which 1416 agree. The first two classes below come from the 776 value texts.
+The last two come from the read-back of the 366 values. Both sets of
+differences fall in four classes:
+
+- A `\u` or `\U` escape that names a surrogate or a code point past
+  U+10FFFF. The tool accepts it and builds a string that is not UTF-8. It
+  then prints `GLib-CRITICAL **: g_variant_new_string(): requires valid
+  UTF-8`, aborts with a signal, and writes no commit. `'\uD800'` and
+  `'\U00110000'` both give this result. The port refuses the escape with
+  `3-7:invalid 4-character unicode escape` and `3-11:invalid 8-character
+  unicode escape`, at exit 1.
+- The offset of the nesting refusal. For `[`, `(`, and `{`, both
+  implementations name the token at level 128. For `<`, `just`, a type
+  keyword, and a `@` declaration, the tool prints an offset with no relation
+  to the text. The offset is `18446646599957580430` for one input and
+  `18446642783772371598` for another, so the value is not reproducible. The
+  port names the token as it does for the brackets. The reason text and the
+  exit status are the same in both.
+- A string that holds a code point that GLib does not count as printable: an
+  unassigned code point, a non-character, or a control. The tool prints it as
+  a `\uXXXX` or `\UXXXXXXXX` escape, and the port prints the character
+  itself. A run of the tool records `'\uffff'`, `'\ud7ff'`, and
+  `'\U0010ffff'`. Both store the same bytes, so the commit checksum agrees.
+  The difference is in the printed text alone.
+- The deepest nesting that the two carry through a commit. The codec of the
+  port holds a value-depth budget of 128 levels, counted from the commit
+  object. The tool counts from the metadata value. With
+  `--add-metadata=k=` and an array nested to each depth, the results are:
+  - Through 123, the two write the same commit and read the same text back.
+  - At 124 and 125, the commits agree and the read-back differs. The tool
+    prints `()` for the value. The port prints the value at 124, and reports
+    `error: gvariant: container nesting exceeds the supported depth` at 125.
+  - At 126 and 127, the tool writes the commit, and the port reports that
+    same line at exit 1.
+  - At 128 and more, both readers refuse in the same words.
+
+A `\u` or `\U` escape naming U+0000 is
 refused by both in the same words and at the same offset, and the cells cover it
 in a string, an object path, a signature, a dictionary key, an array, a variant,
 a maybe and a tuple. A raw NUL byte in a string literal is refused by the port
@@ -930,12 +1052,14 @@ The six Phase 17f options that shape the filesystem walk -- `--statoverride`,
 over every form the cells and the tests hold, less the spend rule below. The
 file formats, the mode arithmetic, the ordering against the other mode
 modifiers, the unmatched-entry checks, and the skip path's output and exit
-status are recorded in `../format-reference.md`, "CLI output formats", `commit`;
-the devino rules are in that file's "Commit modifier: canonical permissions,
-consume, and devino". Both control files are read ahead of everything else
-`commit` does, the statoverride file first, and each reports a path it cannot
-open as `error: openat(<path>): <reason>`, a directory as `error: Is a
-directory`, and a byte that is not UTF-8 or is NUL as `error: Invalid UTF-8`.
+status are recorded in `cli-behavior.md`, "CLI output formats", `commit`;
+the devino rules are in `../format-reference.md`, "Commit modifier:
+canonical permissions, consume, and devino". The declared ids and the fsync
+policy are read and the repository opened first. Both control files are read
+next, ahead of everything else `commit` does, the statoverride file first, and
+each reports a path it cannot open as `error: openat(<path>): <reason>`, a
+directory as `error: Is a directory`, and a byte that is not UTF-8 or is NUL as
+`error: Invalid UTF-8`.
 Every form both implementations accept was checked against the tool by commit
 checksum, over `archive`, `bare-user`, and `bare` for the two devino options;
 the two mode-field classes below are the forms one accepts and the other does
@@ -1055,13 +1179,32 @@ two: a `bare-user` repository checked out with `-U`, with or without `-H`. That
 checkout hardlinks the stored objects, which carry the repository's own
 `user.ostreemeta` xattr, and the plain walk reads it as a real xattr of the source
 file and commits it. There the plain commit is the outlier and the flagged one is
-the faithful result; `--no-xattrs` on the plain walk reaches the flagged
-checksum. The two implementations agree on all four commits over that variant, so
+the faithful result; `--no-xattrs` on the plain walk reaches a third checksum.
+The two implementations agree on all four commits over that variant, so
 what parts is the flagged commit from the unflagged one and not one
 implementation from the other. Three of the fourteen variants are checkouts
 both implementations refuse under `-H`, which the "checkout" paragraph below
 states; the eleven both perform were compared, and the two implementations
 agree on every one.
+
+The fs-verity seal of a content object whose logical mode has no owner-write
+bit (0444, 0555, or 0400) parts the two on `commit`, in a repository that
+holds `[ex-integrity] fsverity=yes`. `FS_IOC_ENABLE_VERITY` needs write
+permission on the inode, and a writer without `CAP_DAC_OVERRIDE` has that
+permission only before the logical mode goes on. The tool applies the logical
+mode before the seal, so an unprivileged writer gets `EACCES` and the write
+fails:
+
+```
+error: Writing content object: fsverity: ioctl(FS_IOC_ENABLE_VERITY): Permission denied
+```
+
+The port seals before it applies the logical mode and the owner, and writes
+the object: the bytes, the inode mode, the owner, and the xattrs that the tool
+writes where its write succeeds, as root. With `fsverity=maybe` the port seals
+these objects, and the tool ignores each enable failure under `maybe`.
+`../format-reference.md`, "Write path: fs-verity (ex-integrity)", gives the
+write order of each, and `../port-plan.md`, Phase pre13, records the decision.
 
 Two wordings the port reproduces are the tool's own and read as defects. The
 first is the editor-failure line, which carries no separator between the closing
@@ -1072,7 +1215,8 @@ be specified when using --keep-metadata`, which is issued whenever the resolved
 parent is absent, `--branch` having been given among those cases.
 
 One `commit` divergence sits at the values `--parent` takes, the parenting
-behavior itself being shared (`../format-reference.md`, "CLI output formats").
+behavior itself being shared (`cli-behavior.md`, "CLI output formats",
+`commit`, "The parent").
 The tool reads the value with a reader that takes a 64-character lowercase
 checksum or the literal `none`, and the port resolves any revision there, which is
 a superset of that syntax like the leading `--repo` form above. Each side refuses
@@ -1084,8 +1228,9 @@ what it cannot read, at exit 1, writing nothing:
   nothing reports `error: Refspec '<value>' not found`, and a prefix more than one
   commit carries reports `error: Refspec <value> not unique`. The tool refuses
   every one of those values at this site alone: it resolves an abbreviated
-  checksum wherever else a revision is taken (`../format-reference.md`, "Revision
-  syntax"), so `--parent` is the narrower reader and not the narrower rule;
+  checksum wherever else a revision is taken (`../format-reference.md`,
+  "Abbreviated checksums"), so `--parent` is the narrower reader and not the
+  narrower rule;
 - an empty value reports `error: Invalid rev ` from the tool and `error:
   Invalid refspec ` from the port, the one refusal at this site the port words
   with its refspec validator;
@@ -1101,9 +1246,9 @@ what it cannot read, at exit 1, writing nothing:
 
 A second `commit` divergence sits beside the branch-name guard both
 implementations carry: `commit -b <64 lowercase hex>` is refused in the same
-words at the same step (`../format-reference.md`, "Revision syntax"), and what
-each leaves behind differs. The tool writes the tree and the commit object before
-it reads the branch name, so the refusal leaves them in `objects/` -- seven loose
+words at the same step (`../format-reference.md`, "Branch names no revision
+reaches"), and what each leaves behind differs. The tool writes the tree and the
+commit object before it reads the branch name, so the refusal leaves them in `objects/` -- seven loose
 objects for corpus `C0` in mode `bare`, the commit among them, which its own
 `fsck` then validates -- where the port publishes a transaction's objects at
 commit and therefore publishes none. Neither writes a ref, so the refs tree is
@@ -1124,8 +1269,8 @@ when every ref is pulled. Such a source arrives by an out-of-band write alone
 once the guard is in place.
 
 A third `commit` divergence sits at the branch name ending in `^`, which
-resolution reads as ancestry (`../format-reference.md`,
-"Revision syntax"). Both implementations refuse it, neither writes a ref, and
+resolution reads as ancestry (`../format-reference.md`, "Branch names no
+revision reaches"). Both implementations refuse it, neither writes a ref, and
 neither publishes an object; the words and the step part. The ref-name rule
 refuses the name, so the port refuses at the ref write, after the tree is
 read, with `Invalid refspec <name>`, one message for every base. A tree error
@@ -1157,7 +1302,7 @@ over both names. A `^` inside the name is refused by both implementations, with
 
 Four `commit` divergences sit at the three options that derive a metadata key
 from the committed tree, `--generate-sizes`, `--bootable`, and
-`--generate-composefs-metadata` (`../format-reference.md`, "CLI output formats",
+`--generate-composefs-metadata` (`cli-behavior.md`, "CLI output formats",
 `commit`). The keys themselves agree: over corpus `C0`, a kernel tree, and a
 nested tree, in `archive`, `bare`, `bare-user`, and `bare-user-only`, both
 implementations reach one commit checksum for each option, and the packed
@@ -1220,7 +1365,7 @@ ref in both: a key that cannot sign leaves the ref where it stood and publishes
 nothing, and a ref write that cannot happen leaves the commit and its
 `.commitmeta` durable in `objects/` with no ref. Both write the same
 `.commitmeta` bytes for a given ed25519 key set, and each one's GPG signature
-verifies through the other's `show --gpg-verify-remote`. Nine divergences
+verifies through the other's `show --gpg-verify-remote`. Eight divergences
 stand.
 
 - `--sign-type` names an engine the port carries and this tool build does not.
@@ -1235,9 +1380,13 @@ stand.
   `error: Requested signature type is not implemented`. Because the tool
   carries no `gpg` engine here, `--gpg-sign` and `--sign --sign-type=gpg`
   cannot be compared tool-side at all, and no cell states that comparison.
-  Under `--sign-type=gpg` the port resolves each `--sign` and
-  `--sign-from-file` key as it resolves a `--gpg-sign` selector, before the
-  first signature, and gives the same refusals.
+  Under `--sign-type=gpg` the port obeys these rules:
+  - The port resolves each `--sign` and `--sign-from-file` key as it resolves
+    a `--gpg-sign` selector, before the first signature, and gives the same
+    refusals.
+  - The port signs with the fingerprint that the lookup gives.
+  - `--gpg-homedir` also names the home directory of `--sign` and
+    `--sign-from-file`.
 - A `--sign-from-file` file whose first line is empty, and a file with no bytes
   at all, both die on a signal in the tool: the first prints a GLib assertion
   about `g_base64_decode_inplace` and ends on SIGSEGV (exit 139), the second
@@ -1266,10 +1415,16 @@ stand.
   source that does not open, for a `--consume` removal that fails, for a
   `--tar-pathname-filter` value the reader refuses, for a `--base` revision that
   does not resolve, for a `--tree=ref=REV` value that does not resolve, for a
-  timestamp the reader refuses, for a branch name the revision syntax shadows,
-  and for a branch name the refspec grammar refuses. No matrix cell states the
-  comparison: `tmp/` carries no published state and the oracles read `objects/`
-  and the refs tree.
+  timestamp the reader refuses, and for a branch name the refspec grammar
+  refuses. A branch name of 64 lowercase hex characters parts the two: the tool
+  writes the tree and the commit object before it reads the name, so its
+  refusal leaves them in `objects/`, and the port publishes none
+  (`ostrya_cli::cli::commit_checksum_branch_name_matches_the_tool`). For a
+  branch name that ends in `^` over a repository with no commit, neither writes
+  an object (`ostrya_cli::cli::commit_ancestry_branch_name_matches_the_tool`).
+  The tool side of the other refspec refusals, such as `a^b`, needs
+  observation. No matrix cell states the comparison: `tmp/` carries no
+  published state and the oracles read `objects/` and the refs tree.
 - The ref write's failure line parts. Forcing one by making `refs/heads`
   read-only reports `error: open(O_TMPFILE): Permission denied` from the tool
   and `error: i/o error: Permission denied (os error 13)` from the port. The
@@ -1298,10 +1453,6 @@ stand.
   tool and `error: Error opening file adir: Is a directory` from the port. Both
   carry the same reason, exit 1, and write no object and no ref; an absolute
   path reaches one line from both.
-- The branch-name term of the signing step's fault order is observable only over
-  a name the ref-name rule refuses. `-b 'bad//name' --sign=zzz` reports
-  `error: Invalid refspec bad//name` in both, and so do `-b 'bad name'
-  --sign=zzz` and `-b 'a^b' --sign=zzz`.
 - The order the `.commitmeta` dict stores its keys in parts over some key sets.
   The port stores insertion order always. The tool stores that same order over
   most sets and a name-dependent order over some of them: with
@@ -1316,6 +1467,33 @@ stand.
   With one engine, or with both engines and no user key, the two agree on the
   stored order too.
 
+The branch-name term of the signing step's fault order is observable only over
+a name the ref-name rule refuses. `-b 'bad//name' --sign=zzz` reports
+`error: Invalid refspec bad//name` in both, and so do `-b 'bad name'
+--sign=zzz` and `-b 'a^b' --sign=zzz`.
+
+`[core] auto-update-summary` and its deprecated alias `commit-update-summary`
+part the two on `commit`. The tool reads the two keys together. Over the nine
+combinations of each key absent, `true`, and `false`, `ostree commit -b x` into
+an archive repository writes `summary` exactly when one of the two keys is
+`true`. So `auto-update-summary=false` with `commit-update-summary=true` writes
+it, and so does the reverse. A value that is not a boolean in either key, `yes`
+for example, makes the commit exit 1 with `error: Key file contains key
+“auto-update-summary” which has a value that cannot be interpreted.`, also when
+the other key is `true`. The ref is written and the summary is not.
+`ostrya commit` and `ostrya pull` read neither key and write no `summary`, so
+the port leaves `summary` as it stands and exits 0 over each of these values.
+`ostrya receive`, and `ostrya serve` without `--read-only`, read the two keys
+by the rule of the tool. They refuse a value that is not a boolean in either
+one (`ostrya-config(1)`).
+
+Not observed: the answer of the tool to a repeated `-s/--subject`. No test
+runs the tool with a repeated `-s`. The port refuses a repeated `-s` with
+`error: the argument '--subject <SUBJECT>' cannot be used multiple times` at
+exit 1, and it takes the last value of a repeated `-m/--body`.
+`cli-behavior.md`, "CLI output formats", `commit`, "The subject and the
+body", records that the tool takes the last value of a repeated `-m`.
+
 `checkout` accepts `--repo`, `-H/--require-hardlinks`, `-C/--force-copy`,
 `--composefs`, `--composefs-noverity`, and, since Phase 17c, `-U/--user-mode`
 and `--subpath=PATH`, and, since Phase 17f, `--union`, `--union-add`,
@@ -1325,8 +1503,9 @@ and `--subpath=PATH`, and, since Phase 17f, `--union`, `--union-add`,
 `--fsync=POLICY`. Missing: `--selinux-policy=PATH`, `--selinux-prefix=PREFIX`.
 
 The destination trees `-U` and `--subpath` produce agree with the tool's file for
-file, in `archive`, `bare-user`, and `bare` (`../format-reference.md`,
-"Checkout"). The two composefs switches are independent, and the no-verity one
+file, in `archive`, `bare-user`, and `bare` (`cli-behavior.md`,
+"Checkout", "Checkout modes", and `cli-behavior.md`, "Checkout", "Subpath").
+The two composefs switches are independent, and the no-verity one
 decides whatever the command-line order: `--composefs`, `--composefs-noverity`,
 and the two orders of the pair each write the tool's image bytes over a
 `bare-user` repository
@@ -1343,6 +1522,37 @@ Checking out composefs: Processing <checksum>: File name too long`, and the port
 reports `error: unsupported: a child name of 256 bytes is longer than the 255
 bytes that a composefs image holds`.
 
+A composefs image holds a symlink target inside the block of its inode, so a
+target with no extended attributes holds at most 4063 bytes
+(`../format-reference.md`, "Inodes"). At 4063 bytes `checkout --composefs`
+writes the image in both. At 4064 and at 4095 bytes the tool ends on
+`lcfs_write_erofs_to: Assertion 'ctx_erofs->current_end ==
+ctx->bytes_written' failed` and writes nothing. The port refuses the same
+trees with `Error::Unsupported` and writes nothing: `error: unsupported: a
+symlink target of 4064 bytes does not fit its inode's block, which holds 4063
+bytes of target, and a composefs image states a target inline` at exit 1
+(`ostrya::composefs::holds_a_symlink_target_to_its_inode_block`, which runs the
+port alone). The way the tool ends is the whole of the difference, which the
+standing exit-path rule covers.
+
+An inode whose extended attributes spend more than 32755 bytes, counting the
+full name, the value, and 7 bytes for each attribute, has no composefs image
+(`../format-reference.md`, "Inode extended attributes and the name filter").
+The tool writes no image, records no digest, and exits non-zero. The port
+refuses the tree with `Error::Unsupported`: `error: unsupported: xattr <name>
+takes the inode to <n> bytes of extended attributes, above the 32755 bytes a
+composefs image holds` at exit 1
+(`ostrya::composefs::holds_an_inode_to_the_composefs_xattr_budget`,
+`ostrya::composefs::the_composefs_xattr_budget_covers_the_inode`, and
+`ostrya::composefs::the_composefs_xattr_budget_covers_a_regular_file`, which
+run the port alone). At the budget both write the same image. The words are
+the whole of the difference, which the standing wording rule covers. The port
+also refuses an attribute name above 255 bytes, prefix included: `error:
+unsupported: xattr <name> is <n> bytes long, above the 255 bytes a composefs
+image states a name in`
+(`ostrya::composefs::holds_an_xattr_name_to_the_erofs_length_field`). The tool
+side needs observation: no test runs the tool with such a name.
+
 The three union modes and `--allow-noent` agree with the tool over a
 destination the test pre-populates, in `archive`, `bare-user`, and `bare`
 (`ostrya_cli::cli::checkout_union_modes_match_the_tool`). Two union options on
@@ -1352,8 +1562,8 @@ is the tool's own order; the port reproduces the tool's four wordings there --
 `Cannot specify both --union and --union-add`, `Cannot specify both --union and
 --union-identical`, `Cannot specify both --union-add and --union-identical`,
 and `--union-identical requires --require-hardlinks`. What `--union-identical`
-calls identical is stated in `../format-reference.md`, "Checkout", and held
-against the tool case by case in
+calls identical is stated in `cli-behavior.md`, "Checkout", "Overwrite
+policy", and held against the tool case by case in
 `ostrya_cli::cli::checkout_union_identical_identity_matches_the_tool`.
 
 `-H/--require-hardlinks` refuses rather than falling back to a copy, and the
@@ -1363,17 +1573,18 @@ zero-length regular file never refuses, a regular file of non-zero length
 refuses wherever the repository mode and the checkout mode in force give a copy
 -- `archive` under either mode, `bare` under `-U`, and `bare-user` without `-U`
 -- and a symlink refuses in `archive` under either mode and in `bare` under
-`-U`. A commit holding none of the refusing shapes is written whole at exit 0 in
-every mode, an empty commit and a directory-only commit among them. The refusal
-stands ahead of the destination disposition, so an entry `--union-add` would
-keep and an entry `--union-identical` would call identical are refused all the
-same; it stands behind the whiteout verdict, so a marker that removes a name and
-a marker that writes a character device are both taken. A destination directory
-on another filesystem than the repository is refused before any entry of it is
-written, whatever the subtree holds; the destination root reaches the refusal
-and so does every directory below it, fresh or reused. The tables are stated in
-`../format-reference.md`,
-"Checkout", and held against the tool in
+`-U`. A commit holding none of the
+refusing shapes is written whole at exit 0 in every mode, an empty commit and a
+directory-only commit among them. The refusal stands ahead of the destination
+disposition, so an entry `--union-add` would keep and an entry
+`--union-identical` would call identical are refused all the same; it stands
+behind the whiteout verdict, so a marker that removes a name and a marker that
+writes a character device are both taken. A destination directory on another
+filesystem than the repository is refused before any entry of it is written,
+whatever the subtree holds; the destination root reaches the refusal and so does
+every directory below it, fresh or reused. The tables are stated in
+`cli-behavior.md`, "Checkout", "Required hardlinks" and "Cross-device
+destinations", and held against the tool in
 `ostrya_cli::cli::checkout_require_hardlinks_refusals_match_the_tool`,
 `ostrya_cli::cli::checkout_require_hardlinks_refuses_at_the_entry`,
 `ostrya_cli::cli::checkout_require_hardlinks_and_skip_list_and_subpath_match_the_tool`,
@@ -1392,6 +1603,15 @@ a symlink reaches no directory walk and takes no such check: the two agree that
 a zero-length regular file is written at exit 0 and that a shape the mode pair
 hardlinks is refused at the link.
 
+Not observed: the `-H` table of the tool in `bare-split-xattrs`.
+`bare-user-shared` is a mode of the port alone (`../format-reference.md`,
+"bare-user-shared mode"). The port copies a regular file in `bare-user-shared`
+and `bare-split-xattrs` under both checkout modes. So under `-H` the port
+refuses a regular file of non-zero length in these two modes. `bare-user-shared`
+stores a symlink the way `bare-user` does, and `bare-split-xattrs` stores a real
+symlink the way `bare-user-only` does. So the port refuses a symlink in neither
+of the two modes.
+
 `-M/--bareuseronly-dirs` reduces every directory the checkout creates to
 `mode & 0775`, at the destination root and at every depth below it. A directory
 the checkout reuses under a union mode keeps its own mode, a regular file and a
@@ -1401,7 +1621,7 @@ it is a no-op in `bare-user-only`, whose directory modes are already below the
 mask at commit time. The two implementations produce the same destination tree
 in every combination
 (`ostrya_cli::cli::checkout_bareuseronly_dirs_matches_the_tool`), and the mask
-is stated in `../format-reference.md`, "Checkout".
+is stated in `cli-behavior.md`, "Checkout", "Directory mode mask".
 
 `--disable-cache` changes no byte and no metadata of the destination. The tool
 keeps an uncompressed-object cache at `<repo>/uncompressed-objects-cache/` and
@@ -1416,9 +1636,9 @@ destinations compare equal with the switch and without it, on both sides
 `--whiteouts` reads two marker names and `--process-passthrough-whiteouts`
 reads a third. Each switch reads its own names and no others, and the marker
 rules, the type gate per marker, and the destination disposition per union mode
-are stated in `../format-reference.md`, "Checkout". The two switches agree with
-the tool over every repository mode, every union mode, and a destination the
-test pre-populates
+are stated in `cli-behavior.md`, "Checkout", "Whiteouts". The two switches
+agree with the tool over every repository mode, every union mode, and a
+destination the test pre-populates
 (`ostrya_cli::cli::checkout_whiteouts_match_the_tool`,
 `ostrya_cli::cli::checkout_passthrough_whiteouts_match_the_tool`,
 `ostrya_cli::cli::checkout_passthrough_whiteout_dispositions_match_the_tool`,
@@ -1434,19 +1654,20 @@ passthrough marker whose target the destination holds as a directory under
 every entry and not only for a marker, and the two agree over the destination
 root, a nested path, and a destination entry of every type, under both switches
 and every union mode
-(`ostrya_cli::cli::checkout_whiteouts_widen_a_union_type_conflict`). The rule
-is stated in `../format-reference.md`, "Checkout".
-Either switch alongside `--composefs` or `--composefs-noverity` is refused at
-exit 1 with no image written, under the tool's own words, `Specified options
-are incompatible with --composefs`.
+(`ostrya_cli::cli::checkout_whiteouts_widen_a_union_type_conflict`). The rule is
+stated in `cli-behavior.md`, "Checkout", "Whiteouts". Either switch alongside
+`--composefs` or `--composefs-noverity` is refused at exit 1 with no image
+written, under the tool's own words, `Specified options are incompatible with
+--composefs`.
 
 The three path-selection options split into two families. `--skip-list=FILE`
 names tree paths to prune. `--from-stdin` and `--from-file=FILE` read a batch of
 checkouts: the input is a stream of NUL-separated records read as
 `(REFSPEC, SUBPATH)` pairs, and each pair checks its own revision out into one
 destination, which the invocation's first positional names.
-`../format-reference.md`, "Checkout", states the list's match rule and the
-stream's record format.
+`cli-behavior.md`, "Checkout", "Path selection", states the match rule of the
+list. `cli-behavior.md`, "Checkout", "Batch checkouts", states the record format
+of the stream.
 
 The list's path forms agree with the tool over `archive`, `bare-user`, and
 `bare`: a file and a symlink match under their own path, a directory matches
@@ -1477,8 +1698,9 @@ switch alongside `--skip-list` is refused in both under the tool's own words,
 (`ostrya_cli::cli::checkout_batch_ignores_subpath_and_takes_composefs`).
 
 An agreement worth stating: `checkout --skip-list` matches a directory under its
-trailing-slash spelling alone, where `commit --skip-list` matches it under both
-spellings. Each command follows its own rule in both implementations.
+trailing-slash spelling alone, where `commit --skip-list` matches it under the
+spelling with no trailing slash alone. Each command follows its own rule in both
+implementations.
 
 The batch record format agrees as well: the records are NUL-separated, a final
 record with no terminator counts, an empty record in the refspec position ends
@@ -1569,8 +1791,9 @@ the durability policy:
   for a tree whose first entry refuses, and the entries already written for one
   that refuses part-way through
   (`ostrya_cli::cli::checkout_require_hardlinks_leaves_the_same_destination_on_a_refusal`);
-- the tool writes the image through a temporary file it creates in the working
-  directory and links to the destination, so a destination on another
+- the tool writes the image through an anonymous temporary file (`O_TMPFILE`)
+  that it opens relative to the working directory and links to the
+  destination, so a destination on another
   filesystem ends the export at exit 1 with `error: linkat: Invalid
   cross-device link`. The port writes its temporary file in the destination's
   own directory and renames it over the destination, so the rename stays inside
@@ -1680,7 +1903,8 @@ under `--fsync=true` -- and the calls each then makes follow from what each
 writes. The tool syncs the temporary files of the uncompressed object
 cache it keeps in the repository, and syncs no part of the destination. The
 port keeps no such cache and syncs the files and the directories of the
-destination (`../format-reference.md`, "The fsync vocabulary").
+destination (`cli-behavior.md`, "The fsync vocabulary", "Sync counts of a
+checkout").
 
 The step the value reader stands at also sits outside the list. In both the
 reader runs ahead of the repository and ahead of the revision, so a value
@@ -1708,23 +1932,25 @@ stream both implementations import into one commit checksum
 stand:
 
 - the member order, and with it which path of a content-sharing group is
-  written in full. The tool emits a directory's non-directory entries in name
-  order and then its subdirectories in name order, each subdirectory's own
-  members following it; the port emits every entry of a directory in one name
-  order. The first member the walk reaches for a content object is the one
-  written in full, so a group whose paths lie in one directory coalesces the
-  same way in both, and a group spanning two directories coalesces in opposite
-  directions: over a tree holding `/z.txt` and `/adir/a.txt` on one content
-  object, the tool writes `z.txt` in full and `adir/a.txt` as the hardlink, and
-  the port writes `adir/a.txt` in full and `z.txt` as the hardlink
-  (`ostrya_cli::cli::export_hardlink_direction_parts_from_the_tool`). A
-  hardlink member's own header carries the linked-to member's metadata in the
-  tool and zeros in the port. Extraction resolves a hardlink against the member
-  it names, so the extracted tree is the same. Neither `--subpath` nor
-  `--prefix` changes either side's order, which
-  `ostrya_cli::cli::export_options_match_the_tool` states by holding each
-  side's member order under every option to the order that side set with no
-  option at all;
+  written in full. The two sides part as follows:
+  - The tool emits the members in the order that `../format-reference.md`,
+    "tar", states. The port emits each entry of a directory in one name order.
+    Neither `--subpath` nor `--prefix` changes either side's order, which
+    `ostrya_cli::cli::export_options_match_the_tool` states by holding each
+    side's member order under every option to the order that side set with no
+    option at all.
+  - The first member the walk reaches for a content object is the one written
+    in full, so a group whose paths lie in one directory coalesces the same way
+    in both, and a group spanning two directories coalesces in opposite
+    directions: over a tree holding `/z.txt` and `/adir/a.txt` on one content
+    object, the tool writes `z.txt` in full and `adir/a.txt` as the hardlink,
+    and the port writes `adir/a.txt` in full and `z.txt` as the hardlink
+    (`ostrya_cli::cli::export_hardlink_direction_parts_from_the_tool`).
+    Extraction resolves a hardlink against the member it names, so the
+    extracted tree is the same.
+  - Not observed: the header that the tool writes for a hardlink member, which
+    no test compares. In the port, the header of a hardlink member carries
+    mtime 0, mode 0, and owner 0:0;
 - the extended attributes. The port emits one `SCHILY.xattr.<name>` record per
   stored xattr and this tool version emits none, which Phase 10 recorded
   (`../format-reference.md`, "tar"). `--no-xattrs` drops the port's records, so
@@ -1760,7 +1986,7 @@ stand:
   argument '--no-xattrs' cannot be used multiple times`. The port refuses a
   repeated boolean flag throughout its CLI. The three `export` options that
   take a value each take the last occurrence, which is what the tool does for
-  all four (`../format-reference.md`, "The tar export options");
+  all four (`cli-behavior.md`, "The tar export options");
 - what the destination holds after a refusal. Both implementations open the
   destination before the revision resolves, so both truncate a `-o` destination
   that already existed and keep its inode and its mode, and neither writes a
@@ -1783,8 +2009,12 @@ stand:
 together with `--no-prune`
 (`error: Cannot specify both --delete-commit and --no-prune`, exit 1, no object
 removed), and the port refuses the same pair in the same words. The totals text
-the command writes is in `../format-reference.md`, "CLI output formats",
+the command writes is in `cli-behavior.md`, "CLI output formats",
 `prune`.
+
+A symlink under `refs/` that names a directory ends `prune --refs-only` of the
+tool with exit 1. It ends each `prune` of the port with exit 1, in different
+words ("P1", `refs`). The default `prune` of the tool exits 0.
 
 The static-delta sweep of a prune removes each delta directory it selects
 whole, nested directories included, and follows no symlink at the fanout, at
@@ -1803,8 +2033,8 @@ the store and each `state/<commit>.commitpartial` marker whose commit is
 absent. These are the leftovers of a run that stopped part way through. Every
 prune skips a delta name that does not decode and leaves that entry in place.
 This is a port behavior. The tool's handling of the two leftovers is not
-observed. `../port-plan.md`, "Prune sweep order", states the rule and the order
-in which the port's prune removes a commit and its content.
+observed. `../port-plan.md`, "Prune sweep order (DONE)", states the rule and
+the order in which the port's prune removes a commit and its content.
 
 Both implementations hold the repository lock for the whole of a prune, and
 both take it exclusive. Measured against `ostree` 2026.1 on an archive
@@ -1831,9 +2061,15 @@ exclusive over the whole run, a `--no-prune` dry run and a
 `--static-deltas-only` run included, reads `[core] locking` and
 `[core] lock-timeout-secs` as the tool does, and proceeds under a held foreign
 lock where `[core] locking` is false. With `lock-timeout-secs=-1` the port
-waits with no limit, as the tool does, through a non-blocking retry loop in
-place of the blocking request of the tool. A value below `-1` makes the tool
-take no lock, and the port refuses it. At the timeout the port exits 1 with its
+waits with no limit, as the tool does. The port uses a non-blocking retry loop,
+and the tool uses a blocking request with `F_OFD_SETLKW`. At a value less than
+`-1`, such as `-2`, `-3`, or `-100`, the tool does not open `.lock` and takes
+no lock. It then completes while another process holds the lock. The port
+refuses such a value. At a positive value the tool requests the lock with
+`F_OFD_SETLK` about once each second, and the port retries every 100 ms. `0`
+makes one attempt in both. Every port command that takes `.lock` or
+`.update.lock` reads the key by this rule (`../format-reference.md`,
+"Repository lock and staging"). At the timeout the port exits 1 with its
 own wording, `error: timed out acquiring repository lock after <N>s`, which is
 the diagnostic carve-out of "Scope of CLI compatibility" above.
 
@@ -1918,6 +2154,11 @@ Two corners at `prune` are not settled by an observation this host can make:
   tool falls back to the C separator and the two agree. Whether the tool follows
   a locale that renders a different separator is unverified here.
 
+`-v` parts the two as well. The tool writes `OT: ` trace lines to standard error
+and leaves standard output unchanged. The port writes the line `ostrya: using
+repository PATH` to standard error and no `OT: ` line, as on each subcommand
+that opens a repository other than `receive` and `send`.
+
 A ref name the tool's ref enumeration skips is read by the tool's
 `prune --refs-only` as unreachable, so the tool deletes a commit the port keeps.
 That is the out-of-band ref name of "P1", and the pair is stated there.
@@ -1925,7 +2166,7 @@ That is the out-of-band ref name of "P1", and the pair is stated there.
 Two repository config keys in the `[ex-ostrya]` group are port extensions with
 no option and no counterpart in the tool. They part `ostrya` from `ostree` on a
 repository that sets one, and the divergence is by intent
-(`format-reference.md`, "Port extension: the ex-ostrya config group";
+(`format-reference.md`, "Configuration keys of the port";
 `port-plan.md`, Phase 22):
 
 - `gc-root-metadata-keys` names metadata keys a prune reads for further
@@ -1952,8 +2193,10 @@ behavior.
 `--delete`, `--verify-bindings`, `--verify-back-refs`, and the port extension
 `--no-mark-partial`. Nothing is missing. The phase, finding, and summary text
 the command writes, the two binding checks, and the exit statuses are in
-`../format-reference.md`, "CLI output formats", `fsck`, together with the
-progress line the tool writes and the port does not.
+`cli-behavior.md`, "CLI output formats", `fsck`, together with the
+progress line the tool writes and the port does not. A symlink under `refs/`
+that names a directory ends an `fsck` run with exit 1 in both implementations,
+in different words ("P1", `refs`).
 
 The port's object walk runs to its end whatever the switches carry, so one run
 reports every fault it reaches and marks every commit an absent object leaves
@@ -1966,21 +2209,27 @@ run that went on would state an object set it never had; and a
 about the ref graph rather than about an object, marks nothing, and leaves the
 phase that found it with nothing further to decide. The tool ends a run at the
 same three conditions and at the first faulty object as well, unless `-a` or
-`--delete` carries it on.
+`--delete` carries it on. In the tool, `-a` also carries phase 1 and phase 2
+past a commit object whose checksum does not match. It carries
+the object walk past such an object in the same way.
 
 `-a` therefore carries a meaning of the port's own. In the tool it decides
 where a run ends; in the port the walk runs to its end without it, and the
 switch selects one thing: whether `--add-tombstones` may act after a walk that
 found an object whose bytes do not match its name. The tombstone step deletes
 a commit object and writes a `.tombstone-commit`, so the port holds it to the
-walk the tool holds it to. `--delete` carries the same permission on its own,
-because it carries the tool's walk to its end as well, and a walk whose
-findings are absent objects alone needs neither: an absent object never ends a
-run in either implementation. The repository the two leave therefore agrees in
-every combination of `-a`, `--delete`, and `--add-tombstones`, over a sound
-repository and over a faulty one alike. `--delete` takes no such gate of its
-own: the objects it unlinks and the commits it marks are the same set with
-`-a` and without it in both implementations.
+walk the tool holds it to.
+
+`--delete` carries the same permission alone, because it also carries the object
+walk of the tool to its end. A walk whose findings are absent content objects or
+absent dirmeta objects alone needs neither switch. An absent content object or
+an absent dirmeta never ends a run in either implementation. An absent dirtree
+ends the run: it is one of the three conditions that end a run early. The
+repository the two leave therefore agrees in every combination of `-a`,
+`--delete`, and `--add-tombstones`, over a sound repository and over a faulty
+one alike. `--delete` takes no such gate of its own: the objects it unlinks and
+the commits it marks are the same set with `-a` and without it in both
+implementations.
 
 Eight divergences stand at `fsck`:
 
@@ -2002,10 +2251,11 @@ Eight divergences stand at `fsck`:
   tests sort both before comparing;
 - a faulty repository run with neither `-a` nor `--delete`. The tool ends at
   the first fault its own walk order reaches, writes that one finding as its
-  own `error: ` line, and writes no closing line. The port carries the walk to
-  its end, writes every finding plain, and closes with
-  `error: Repository corruption encountered`. The port's finding set and its
-  `state/` markers are therefore a superset of the tool's over a repository
+  own `error: ` line, and writes no closing line. Where no condition ends the
+  run (`cli-behavior.md`, "CLI output formats", `fsck`, "Where a run ends"),
+  the port carries the walk to its end, writes every finding plain, and closes
+  with `error: Repository corruption encountered`. The port's finding set and
+  its `state/` markers are therefore a superset of the tool's over a repository
   holding more than one fault, and they do not follow a walk order: one
   repository gives one finding set. `-a` and `--delete` carry the tool to the
   end of the object set and the two agree again, which is the form the cited
@@ -2088,8 +2338,9 @@ inventory is the oracle and the port writes the bytes the tool writes.
   returning the counts and the size together. Both exit 1 and change nothing on
   disk;
 - `-v`. The tool writes `OT: ` trace lines to standard error and leaves
-  standard output unchanged. The port's `-v` writes its own lines. This is the
-  class already recorded for `prune`;
+  standard output unchanged. The port's `-v` writes the line `ostrya: using
+  repository PATH` to standard error and no `OT: ` line, as on each subcommand
+  that opens a repository other than `receive` and `send`;
 - an extended attribute whose value is zero bytes long, on a directory side.
   The tool's reader drops such an attribute and the port keeps it, so the port
   reports a modification the tool does not. Two directories differing in one
@@ -2113,16 +2364,18 @@ port extensions `-s` (the short form of `--sign-type`), `--verify`,
 `--last-modified`, `--metadata-commit-timestamp`, `--keys-file`, `--keys-dir`,
 `--remote`, and a positional `KEY_ID...`. Nothing is missing. The tool refuses
 `--verify`, `--keys-file`, `--keys-dir`, and `-s` with `error: Unknown option
-<arg>` at exit 1, and verifies a summary signature through a remote alone. The
-port's `summary --verify` reads the key sources of its `sign --verify`
-(`../format-reference.md`, "CLI output formats", `sign`). On this command the tool binds `-v`
-to `--view`, and `--verbose` has no short form. The port carries the same
-shape: `summary` declares `-v/--view` and a long-only `--verbose`, and every
-other subcommand, together with the top level, keeps `-v/--verbose`. `-m`,
+<arg>` at exit 1, and verifies a summary signature through a remote alone. A
+symlink under `refs/` that names a directory ends `summary -u` with exit 1 in
+both implementations, in different words ("P1", `refs`). The port's `summary
+--verify` reads the key sources of its `sign --verify` (`cli-behavior.md`, "CLI
+output formats", `sign`, "The key sources of `sign`"). On this command the tool
+binds `-v` to `--view`, and `--verbose` has no short form. The port carries the
+same shape: `summary` declares `-v/--view` and a long-only `--verbose`, and
+every other subcommand, together with the top level, keeps `-v/--verbose`. `-m`,
 `--sign`, and `--gpg-sign` are read with `-u` alone, and both implementations
 check every one of them before the regeneration, so a refusal leaves `summary`
-and `summary.sig` as they stood (`../format-reference.md`, "CLI output
-formats", `summary`). Twelve differences stand.
+and `summary.sig` as they stood (`cli-behavior.md`, "CLI output formats",
+`summary`, "The `-u` checks"). Twelve differences stand.
 
 - `-v` does not turn on the debug stream. The tool binds `-v` to `--view` and
   `--verbose` together and writes `OT: using fuse: 0` for a read-only view; the
@@ -2176,7 +2429,9 @@ formats", `summary`). Twelve differences stand.
   or more deltas. The tool writes the entries in the order of a hash table,
   which follows the set of delta names and, for some names, the order it read
   them, and which can differ from the order of an index file over the same
-  set. The port writes them in name order, the rule 2 decision the
+  set. The order is the same over runs on one tree, and removing deltas can
+  swap the order of two that stay. The port writes them in name order, the
+  rule 2 decision the
   `static-delta` entry below records for the index files. The entries and each
   digest agree. For some sets the tool's order is name order by chance, and
   the two maps then agree;
@@ -2189,14 +2444,20 @@ formats", `summary`). Twelve differences stand.
   up a `gpg` selector given to `--sign` or as a positional key before the
   regeneration, the way it looks up a `--gpg-sign` selector;
 - `-m` in a repository with a collection id. The tool adds the caller keys to
-  the metadata of the `ostree-metadata` anchor commit as well, beside the two
-  bindings and in the order of a hash table, so the anchor checksum follows that
-  order. The port refuses the run at exit 1 before the regeneration with
+  the metadata of the `ostree-metadata` anchor commit as well. The two
+  bindings win over a caller key of the same name, a repeated caller key takes
+  its last value, and the tool keeps any other caller key,
+  `ostree.summary.mode` among them. With a caller key present the tool stores
+  the anchor dict in the order of a hash table, even for one key: `-m k=1`
+  stores `ostree.collection-binding`, `k`, `ostree.ref-binding`, and
+  `-m b=1 -m n=2` stores `n`, `b`, `ostree.collection-binding`,
+  `ostree.ref-binding`. The anchor checksum follows that order. The port
+  refuses the run at exit 1 before the regeneration with
   `error: unsupported: summary metadata keys in a repository with a collection
-  id`, and `summary`, `summary.sig`, and the anchor ref keep their state. Rule 1
-  decides it: carrying the keys in the port's own order writes an anchor with
-  another checksum (`../format-reference.md`, "The `ostree-metadata` anchor
-  commit");
+  id`, and `summary`, `summary.sig`, and the anchor ref keep their state. Rule
+  1 decides it: carrying the keys in the port's own order writes an anchor
+  with another checksum (`../format-reference.md`, "The `ostree-metadata`
+  anchor commit");
 - a 64-byte `--sign` value whose halves are not an ed25519 key pair, the class
   `commit --sign` records above. 64 zero bytes are one such value. The tool
   signs with it at exit 0. The port refuses it at exit 1 before the
@@ -2220,7 +2481,7 @@ renders in the host zone with that zone's offset and the port renders in UTC.
 `reindex`, `show`, `delete`, `indexes`, and `verify`. `show` and `verify` take
 a delta name or the path of a superblock file, `delete` takes a delta name
 alone, `list` lists the deltas under `deltas/`, and `indexes` lists the
-`delta-indexes/` cache (`../format-reference.md`, "CLI output formats",
+`delta-indexes/` cache (`cli-behavior.md`, "CLI output formats",
 `static-delta`). `apply-offline` takes a path, a superblock file or a
 directory that holds `superblock`, and the key options of `verify`. Both
 implementations fold the path as text before they open it. Each `..` removes
@@ -2229,7 +2490,7 @@ and `<dir>/superblock/..` names `<dir>`. `verify` and `apply-offline` take
 `spki` in a build that carries the engine, the sign-type rule this section
 states for `commit --sign-type`. `reindex` takes `--to=REV`, which rewrites or
 removes the index file of one target and reads REV by the rule of one half of a
-delta name; the last `--to` wins. Thirty-four differences stand on `show`,
+delta name; the last `--to` wins. Thirty-seven differences stand on `show`,
 `delete`, `list`, `indexes`, `verify`, `apply-offline`, and `reindex`.
 
 - a superblock file over 128 MiB (134217728 bytes). The port refuses it in
@@ -2243,10 +2504,12 @@ delta name; the last `--to` wins. Thirty-four differences stand on `show`,
 
 - a part that fails its checksum or passes its declared size. The port refuses
   it at exit 1 after the `PartMeta<i>` line, before it decompresses a byte of
-  it. The tool checks neither. Where the tampered part still decodes, the tool
-  prints the counts of what it decodes at exit 0. A truncated xz part makes
-  the tool fail with `Input buffer too small` at exit 1. Only a write that is
-  neither implementation's reaches this;
+  it, with `error: invalid format: static delta part checksum mismatch` or
+  `error: invalid format: static delta: a stream passed the <n> byte(s)
+  declared for it`. The tool checks neither. Where the tampered part
+  still decodes, the tool prints the counts of what it decodes at exit 0. A
+  truncated xz part makes the tool fail with `Input buffer too small` at exit 1.
+  Only a write that is neither implementation's reaches this;
 - a part the superblock carries inline. The port reads it from the metadata
   dict, in the name form and the path form. The tool reads no inline part: in
   both forms it opens `deltas/<fanout>/<rest>/<i>` in the repository and
@@ -2306,7 +2569,17 @@ delta name; the last `--to` wins. Thirty-four differences stand on `show`,
   such a name;
 - the wording of an `indexes` read failure. The tool writes `error: opendirat:
   Not a directory` and `error: opendir(<fanout>): Permission denied`, and the
-  port writes the library's `error: i/o error:` sentence. Both exit 1;
+  port writes the library's `error: i/o error:` sentence. For a
+  `delta-indexes` that is a regular file, the port writes `error: i/o error:
+  Not a directory (os error 20)`. Both exit 1;
+- the wording of a `list` read failure. For a `superblock` that is a symlink
+  loop, the tool writes `error: fstatat(<rest>/superblock): Too many levels of
+  symbolic links`. For an entry that cannot be searched, it writes `error:
+  fstatat(<rest>/superblock): Permission denied`. For a `deltas` that is a
+  regular file, it writes `error: opendirat: Not a directory`. The port writes
+  the library's `error: i/o error:` sentence, with `Too many levels of
+  symbolic links (os error 40)`, `Permission denied (os error 13)`, and `Not a
+  directory (os error 20)`, and both exit 1;
 - the wording of a `delete` failure other than an absent delta. The tool
   writes `error: fstatat(<path>): <reason>`, `error: open(<path>): <reason>`,
   and `error: Removing <path>: unlinkat(<name>): <reason>`, and the port writes
@@ -2318,6 +2591,10 @@ delta name; the last `--to` wins. Thirty-four differences stand on `show`,
   removes nothing. For `reindex` the tool runs the pass the options select,
   the full pass with no `--to` and the pass over one target with it, and the
   port writes nothing. This is the class already recorded for `diff`;
+- `reindex --to` with no value. The tool writes `error: Missing argument for
+  --to`. The port writes `error: a value is required for '--to <REV>' but none
+  was supplied`. This is the parser text that `commit` records for `--fsync`.
+  Both exit 1;
 - the entry order of an index file that lists two or more deltas. The tool
   writes the entries in the order of a hash table, which follows the set of
   delta names and, for some names, the order it read them. The port writes
@@ -2332,8 +2609,9 @@ delta name; the last `--to` wins. Thirty-four differences stand on `show`,
   no directory. For a directory at the index path of a target with deltas the
   tool reports `error: renameat(<temp>, <index>): Is a directory`, and for a
   target with no delta `error: unlink(<index>): Is a directory`. The port
-  reports `error: i/o error: Is a directory (os error 21)` in both cases. For
-  a target with no delta, a regular file at the fanout or at `delta-indexes`,
+  reports `error: i/o error: Is a directory (os error 21)` in both cases. The
+  port reports the same line in the full pass. For a target with no delta, a
+  regular file at the fanout or at `delta-indexes`,
   or a symlink at the fanout to a regular file, makes the tool report `error:
   unlink(<index>): Not a directory`, and the port reports `error: i/o error:
   Not a directory (os error 20)`. Both exit 1 and leave no temp file;
@@ -2343,19 +2621,20 @@ delta name; the last `--to` wins. Thirty-four differences stand on `show`,
   sizes are little-endian, the tool prints `Endianness: invalid`. With the key
   absent over a delta the tool wrote under `B`, the tool prints `Endianness:
   big (heuristic)` and swaps the sizes, by a size-ratio heuristic
-  (`../format-reference.md`, "Static delta wire format"). With the byte `x`,
+  (`../format-reference.md`, "Endianness"). With the byte `x`,
   the tool prints `Endianness: invalid`. Only a write that is neither
   implementation's makes such a superblock: both generators write the key;
 - the decimal separator of the size wording. The port always writes `.`. The
   tool formats through the C library's locale, and only the `C` and `C.UTF-8`
   behavior is observed on this host;
-- `verify --sign-type=dummy`. The port refuses before it reads a key, with
-  `error: dummy signature type is only for ostree testing` and nothing on
-  standard output. The tool reads the keys and reports `Verification fails`
-  with a reason, for example `no signature for 'ostree.sign.dummy' in
-  static-delta superblock`, or `error: not implemented` where no key is given.
-  Both exit 1. Under its test switch `OSTREE_DUMMY_SIGN_ENABLED=1` the tool
-  verifies a dummy-signed delta, which only that switch lets it write;
+- `verify --sign-type=dummy`. The tool reads the keys and reports
+  `Verification fails` with a reason, for example `no signature for
+  'ostree.sign.dummy' in static-delta superblock`. With no key source, the
+  tool reports `error: not implemented`. Both exit 1. With
+  `OSTREE_DUMMY_SIGN_ENABLED=1`, the tool verifies a dummy-signed delta, and
+  only that variable lets the tool write such a delta. The port refuses before
+  it reads a key, with `error: dummy signature type is only for ostree
+  testing` and nothing on standard output, at exit 1;
 - `apply-offline --sign-type=dummy`. The port refuses at exit 1 with the same
   line as for `verify` and writes no object. The tool applies the delta at
   exit 0 with no key source, and applies an unsigned delta at exit 0 under a
@@ -2372,6 +2651,17 @@ delta name; the last `--to` wins. Thirty-four differences stand on `show`,
   superblock copied away from its parts. The tool reports `error: Opening
   deltapart '<i>': <reason>`. The port reports the library's `error: i/o
   error:` sentence. Both exit 1 and write no object;
+- the deltas `apply-offline` takes. `ostree static-delta apply-offline`
+  refuses a delta whose fallback array is not empty, with `Cannot execute
+  delta offline: contains nonempty http fallback entries`. To the tool,
+  fallbacks are a pull mechanism. The dispatch of its `open` opcode asserts a
+  repository of the bare family. So a delta that carries rollsum or bspatch
+  objects applies offline into `bare`, `bare-user`, or `bare-user-only`
+  alone. A delta of splices alone applies into each mode. The limits are in
+  the applier, so they also apply to a delta that the tool generates. The
+  port has neither limit. It applies rollsum and bspatch objects into an
+  `archive` repository. It applies a delta with fallbacks where the objects
+  that they name are already in the repository;
 - a 32-byte `apply-offline` key that decodes to no curve point. The port
   refuses every run that carries such a key at exit 1 with the error it gives
   for `verify` and writes no object. The tool applies an unsigned delta at
@@ -2449,11 +2739,11 @@ The key-file entries under `verify` also hold for `apply-offline`, and each
 refusal writes no object.
 
 `static-delta generate` accepts `--inline`, `--set-endianness=l|B`, and
-`--swap-endianness`, which take the tool's rules (`../format-reference.md`,
+`--swap-endianness`, which take the tool's rules (`cli-behavior.md`,
 "CLI output formats", `static-delta`). The byte order starts from the host
 order, as in the tool. Only a little-endian host is observed.
 
-`static-delta generate` carries sixteen differences. Two of them are open.
+`static-delta generate` carries eighteen differences. Three of them are open.
 
 - an inline superblock over the 128 MiB ceiling. The port refuses at exit 1
   after the block, with one of two messages. The inline parts share the
@@ -2476,21 +2766,50 @@ order, as in the tool. Only a little-endian host is observed.
   delta delivers are the same. Under `--filename` and `--output-dir` neither
   removes a file;
 
-- the `usize` of a part's meta entry. This difference is open. The port's
+- the `usize` of a part's meta-entry. This difference is open. The port's
   generator counts the target length of each symlink the part carries, and the
-  tool's generator does not. A from-scratch part of a 300,000-byte file, a
-  6-byte file, a symlink with the 1-byte target `a`, and two metadata objects
-  reports `usize=300129` from the tool's generator and `usize=300130` from the
-  port's. The objects the delta produces are the same: the port's application
-  reads no `usize`, and `show` prints the value the superblock holds. The
-  port's generator keeps its rule until a change to it is decided;
+  tool's generator does not. A from-scratch part holds a 300,000-byte file, a
+  6-byte file, a symlink with the 1-byte target `a`, and two metadata
+  objects. For this part, the tool's generator reports `usize=300129` and the
+  port's reports `usize=300130`. The objects the delta produces are the
+  same. The port's application reads no `usize`, and `show` prints the value
+  the superblock holds. The port's generator keeps its rule until a change to
+  it is decided;
+- the part boundaries. This difference is open. Both generators start a new
+  part where the next object would push the payload past `--max-chunk-size`
+  (`../format-reference.md`, "Part packing"). The port decides before it
+  appends the object. It adds the content size of the incoming object to the
+  data-source blob and the operation stream already in the part. The
+  operation bytes of that object, the mode table, the xattr table, and the
+  tuple framing are outside the estimate. So a part can pass the ceiling by
+  those bytes. The first object of a part goes in with no check. So a spliced
+  object larger than the ceiling goes into a part of its own, and that part
+  passes the ceiling. The content size is exact for the data of a spliced
+  object and an upper bound for a diffed one. A diffed object whose payload
+  comes out small thus still closes the part it fits in. This costs one more
+  xz stream and one more pair of mode and xattr tables, and the part
+  boundaries then differ from the tool's. The delta bytes differ. The objects
+  the delta delivers are the same, because a meta-entry names the contents of
+  its part;
+- the diff-source pairing. The tool pairs a modified content object with the
+  object at the same path in the source commit, and skips the pair where the
+  two sizes differ by a large ratio (`../format-reference.md`, "Diff-source
+  pairing"). The port pairs by path alone and has no size-ratio rule. A pair
+  the ratio rule skips costs the port a diff attempt whose result it
+  discards, and the object then travels whole, as in the tool. The port
+  bounds the diff attempt by the maximum chunk size of its chunker, so an
+  unrelated same-path rewrite of a large object is spliced with no suffix
+  sort first (`../port-plan.md`, Phase 15b). The pairing decides the size of
+  a delta and the delta bytes. The objects that the delta delivers are the
+  same. The pairing is the port's own choice, in the same sense as the
+  parameters of the chunker;
 - signing with a repeated `--keys-file`. This difference is in the bytes of
   the repository and is open. The tool signs with the last `--keys-file`
   alone. The port signs with each key of every file, so the superblock bytes
   differ. A `--sign` value beside one `--keys-file` signs with both keys in
   both implementations. `sign` carries the same difference;
 - the statistics. The tool writes seven or more lines to standard error on
-  every run that reaches generation (`../format-reference.md`, "CLI output
+  every run that reaches generation (`cli-behavior.md`, "CLI output
   formats", `static-delta`). The port writes nothing to standard error on
   success. The terminal is outside the compatibility scope;
 - a size value outside whole decimal digits, and a value whose byte count is
@@ -2512,7 +2831,10 @@ order, as in the tool. Only a little-endian host is observed.
   component is `.` or `..` after a directory. The tool writes part `0` and
   then refuses at the rename with `error: renameat(<temp>, <name>):
   <reason>`. The port refuses before it writes a file with `error: i/o error:
-  Is a directory (os error 21)`. Both exit 1 after the block;
+  Is a directory (os error 21)`. Both exit 1 after the block. The port reads
+  the last component from the bytes of PATH, and it refuses a last component
+  that is empty, `.`, or `..`. It refuses a PATH that names a directory, and it
+  follows no symlink for this check;
 - a `--filename` PATH whose name is a part file name, `0` for example. The
   tool renames the superblock over that part and exits 0, which gives a delta
   that `show` and `apply-offline` refuse. The port refuses at exit 1 after the
@@ -2539,14 +2861,20 @@ order, as in the tool. Only a little-endian host is observed.
   writes `error: object not found: Commit <hex>` and creates no directory.
   Both exit 1 after the block, and neither lists a delta;
 - a bad signing key. The tool writes the parts and then refuses the key, so it
-  leaves part `0` and writes no superblock. The port reads the keys before it
-  writes a part and writes nothing. Both exit 1 after the block with the same
-  error line. At a location that holds no delta, neither lists a delta. At a
-  location that holds one, both keep the earlier superblock, and the tool
-  also rewrites the parts. A `--sign-type=gpg` key, which the tool does not
-  carry, fails in the port after the parts, and at the repository's own
-  location it also removes the earlier superblock. Under `--inline` the port
-  writes no part, so the earlier superblock and its parts stay;
+  leaves part `0` and writes no superblock. Both exit 1 after the block with
+  the same error line. The other results part as follows:
+  - The port reads the keys before it writes a part, and it signs the
+    superblock before it writes it. So a bad ed25519 or spki key writes no
+    file.
+  - At a location that holds no delta, neither lists a delta. At a location
+    that holds one, both keep the earlier superblock, and the tool also
+    rewrites the parts.
+  - The tool does not carry the `gpg` engine. The port tests a
+    `--sign-type=gpg` key only when it signs, after it writes the parts. A
+    failure there writes no superblock. Outside `--inline`, the port removes
+    the earlier superblock at the delta location before it writes the first
+    part. So that superblock is gone too. Under `--inline`
+    the port writes no part, so the earlier superblock and its parts stay;
 - an unknown `--sign-type`. The tool ignores it where no key is given, and
   refuses it with `error: Requested signature type is not implemented` after
   the parts are written where a key is given. `clap` refuses it at exit 1
@@ -2584,10 +2912,12 @@ runs the ssh client with the remote command `ostrya send --repo='PATH'`
 (`send`). `pull` has no option for the ssh command or for the remote
 command: the `OSTRYA_SSH_COMMAND` environment variable, and then the
 `ssh-command` key of the remote, give the ssh command, and the
-`send-command` key gives the remote command. `../format-reference.md`,
-"Port extension: the push and pull keys of a remote", states the keys. A
-remote with `pull-url` and no `url` pulls in the port. The tool fails on
-such a remote with `error: No "url" option in remote "NAME"`. Over ssh:
+`send-command` key gives the remote command. `ostrya-config(1)`, "REMOTE
+KEYS", states the keys. A remote with `pull-url` and no `url` pulls in the
+port. The tool fails on such a remote: `pull`, `remote list -u`,
+`remote show-url`, `remote refs`, and `remote summary` each exit 1 with
+`error: No "url" option in remote "NAME"`, and `remote list` exits 0. Over
+ssh:
 
 - `--http-header`, `--network-retries` with a value above 0,
   `--low-speed-limit-bytes`, and `--low-speed-time-seconds` are refused at
@@ -2602,8 +2932,11 @@ such a remote with `error: No "url" option in remote "NAME"`. Over ssh:
 - An ssh address in the `url` key is refused at exit 1, and no ssh client
   starts: `error: pull: remote 'NAME': url 'SHOWN' is an ssh address; the
   port reads an ssh address from pull-url alone`. `SHOWN` is the value
-  without the text up to its last `@`. The tool refuses the same `url`
-  with `error: Invalid URI scheme in VALUE`, where `VALUE` is the value.
+  without the text up to its last `@`. The tool refuses the same `url` in
+  `pull`, `remote refs`, and `remote summary` with `error: Invalid URI scheme
+  in VALUE`, where `VALUE` is the value, and makes no `connect` call. A
+  scp-form `url` such as `h:/srv/repo` gets the same refusal from `pull`.
+  `remote list -u` prints the `url` at exit 0.
 - A malformed ssh address in `--url` or in `pull-url` is refused at exit 1
   with the text of the address parser, for example `error: invalid input:
   address 'ssh://HOST': an ssh:// address needs a path`.
@@ -2645,13 +2978,13 @@ body, or sends a body slowly:
   whole second carries no byte. The default is 1000 bytes per second for 30
   seconds, and it applies to a pull that names neither option. A 0 in either
   option turns the rule off, and a negative value keeps the default of that
-  option. `../format-reference.md`, "CLI output formats", `pull`, gives the
+  option. `cli-behavior.md`, "CLI output formats", `pull`, gives the
   rule and the measurements.
 
 The two low-speed values are read as a C `int` with the reader of `commit
 --owner-uid`, and a value that reader refuses reports the same messages, ahead
-of the repository (`../format-reference.md`, "CLI output formats"). Four
-differences stand:
+of the repository (`cli-behavior.md`, "CLI output formats", `pull`, "The
+low-speed options"). Five differences stand:
 
 - an object that exhausts its retries. The port ends the pull at the first such
   object and drops the transfers still in flight. It writes no object and no
@@ -2683,19 +3016,25 @@ differences stand:
   tool's samples fall at moments of its own. A burst that arrives within the
   timing noise of a sample can thus count in different samples of the two,
   and where that sample decides whether the rate is above the limit, the
-  outcome can differ. The measured cases in `../format-reference.md`, "CLI
+  outcome can differ. The measured cases in `cli-behavior.md`, "CLI
   output formats", `pull`, have bursts away from the sample moments, and the
   port abandons each at the second the tool does, or completes each where the
-  tool does.
+  tool does;
+- the message of a transfer that the low-speed rule fails. The tool writes
+  `error: While fetching <url>: [28] Timeout was reached`. The port writes
+  `error: i/o error: fetched body averaged below <limit> bytes per second for
+  <time>` for a body. It writes `error: fetch: <url>: transfer below <limit>
+  bytes per second for <time>` for a response head. Both exit 1 and write no
+  ref.
 
 `--disable-fsync` turns off every sync of the pull, and `--per-object-fsync`
 syncs the file of each content object the pull stages and no metadata object,
 as in the tool. `[core] fsync=false` and `--disable-fsync` each win over
 `--per-object-fsync`. Neither switch changes a byte the pull writes, and
-`../format-reference.md`, "The fsync vocabulary", gives the counts. A
-configured `[core] fsync` or `[core] per-object-fsync` value the reader refuses
-is refused at exit 1 under every state of the two switches, in both. Three
-differences stand:
+`cli-behavior.md`, "The fsync vocabulary", "Sync counts of a pull", gives
+the counts. A configured `[core] fsync` or `[core] per-object-fsync` value the
+reader refuses is refused at exit 1 under every state of the two switches, in
+both. Three differences stand:
 
 - syncs by default. The port syncs `refs/remotes/<remote>`, which holds the
   ref, and `refs/remotes`, where the ref write creates `refs/remotes/<remote>`.
@@ -2703,10 +3042,10 @@ differences stand:
   `--mirror` the port also syncs the summary file and the repository root. The
   tool makes none of these syncs. The count over corpus `C0` is 13 in the port
   and 11 in the tool, and 14 and 11 under `--mirror`. For a pulled commit that
-  carries detached metadata, the port also syncs the `.commitmeta` temp file,
-  its fanout directory, and `objects/`, which the tool does not: 16 in the port
-  and 11 in the tool, and 17 and 11 under `--mirror`. `--disable-fsync` turns
-  every one of them off;
+  carries detached metadata, the port syncs the fanout directory of the
+  `.commitmeta` file after the rename into `objects/`, which the tool does not,
+  and neither syncs the file itself: 14 in the port and 11 in the tool, and 15
+  and 11 under `--mirror`. `--disable-fsync` turns every one of them off;
 - a value given to either switch. The tool reads and discards an `=VALUE`
   suffix, so `--disable-fsync=false` disables fsync and
   `--per-object-fsync=bogus` is accepted. `clap` refuses the suffix with
@@ -2719,20 +3058,20 @@ differences stand:
   repeated-boolean-flag class.
 
 `--subpath=PATH`, repeatable, fetches the part of each commit's tree the rules
-in `../format-reference.md`, "HTTP pull surface", state, and the port leaves
-the same objects, the same ref, and the same zero-length
-`state/<commit>.commitpartial` marker as the tool for each form: a directory,
-a file, a name the tree does not hold, `/`, a trailing `/`, an empty or a `.`
-or `..` component, several values, and each under `--depth`,
+in `cli-behavior.md`, "HTTP pull surface", "The subpath option", state, and
+the port leaves the same objects, the same ref, and the same zero-length
+`state/<commit>.commitpartial` marker as the tool for each form: a directory, a
+file, a name the tree does not hold, `/`, a trailing `/`, an empty or a `.` or
+`..` component, several values, and each under `--depth`,
 `--commit-metadata-only`, and `--mirror`, into `archive` and `bare-user`. A
 later pull without the option completes the commit and removes the marker in
 both. Into `bare-user` both apply a delta whole for a commit the destination
 does not hold and keep the marker. Into `archive` both take no delta and fetch
 the subpath loose. Into `bare-user` a destination whose ref names the commit it
 holds partial leaves an advertised from-scratch delta alone and fetches loose,
-and where the remote serves no summary both ask for that delta by name and
-apply it whole. `--untrusted` changes no byte of an HTTP pull in either, and
-a corrupt object fails the pull with and without it. Four differences stand:
+and where the remote serves no summary both ask for that delta by name and apply
+it whole. `--untrusted` changes no byte of an HTTP pull in either, and a corrupt
+object fails the pull with and without it. Four differences stand:
 
 - a relative or an empty value. The tool ends on an assertion
   (`ostree_repo_pull_with_options: assertion 'dir_to_pull[0] == '/'' failed`,
@@ -2761,7 +3100,7 @@ ends on an assertion (`ostree_repo_pull_with_options: assertion
 'pull_data->maxdepth >= -1' failed`, `SIGABRT`, exit 134 from a shell). The
 port refuses the value with `error: invalid input: depth <depth> is below -1`
 at exit 1. Both stop before the first request, and neither writes an object
-or a ref (`../format-reference.md`, "HTTP pull surface").
+or a ref (`cli-behavior.md`, "HTTP pull surface", "Depth less than -1").
 
 `--untrusted` over a `file://` remote changes what the tool does; the port
 fetches no `file://` remote. Under `--require-static-deltas` into `archive`
@@ -2769,12 +3108,27 @@ the tool refuses with `error: Can't use static deltas in an archive repo`, and
 the port takes the delta, with or without `--subpath`, which is the capability
 difference `../port-plan.md`, Phase 16d, records.
 
+The tool cannot pull a signed delta. A from-scratch delta and a from-to delta
+that `static-delta generate --sign` signed both fail a pull of the tool with
+`error: Invalid checksum of length 0 expected 32`. The pull fails with
+verification configured and with verification off (`cli-behavior.md`,
+"Signature verification during a pull", "Static deltas and signatures").
+
+The port verifies a fetched delta with the sign-api engines that the commit
+policy names, before it requests a part. It applies a delta that a trusted
+key signed, and refuses a delta that another key signed. It accepts a delta
+with no signature under those engines. `../port-plan.md`, "Phase 16e --
+Signature verification during a pull (DONE)", states the port rule.
+
 `--require-static-deltas` refuses where the tool refuses
-(`../format-reference.md`, "HTTP pull surface"): a remote with no summary, and
-a commit the destination does not hold for which no advertised delta can be
-taken, with the tool's words behind `pull: `. Both take a from-to delta from
-any commit the destination holds complete, under a ref or not. Two
-differences stand:
+(`cli-behavior.md`, "HTTP pull surface", "Delta selection in a pull"): a
+remote with no summary, and a commit the destination does not hold for which no
+advertised delta can be taken, with the tool's words behind `pull: `. Where the
+superblock of the delta taken is absent, the tool writes the checksum of the
+start commit of the delta in place of `<ref>`. For a from-scratch delta it
+writes `(null)`, and the port writes the ref name in both cases. Both take a
+from-to delta from any commit the destination holds complete, under a ref or
+not. Two differences stand:
 
 - both delta switches together. The tool ends on an assertion (`SIGABRT`,
   exit 134 from a shell) and writes nothing. `clap` refuses the pair with
@@ -2786,8 +3140,28 @@ differences stand:
   from-scratch delta alone and fetches loose, and the port takes the delta.
   Both land the same objects, and neither refuses.
 
+A pull that returns an error removes the `state/<commit>.commitpartial` marker
+of each commit it marked whose commit object the destination does not hold, a
+marker it found in place included, and keeps the marker of a commit the
+destination holds. In the tool, a pull that fails part way leaves its
+zero-length marker in place.
+
+The port requests the remote `config` in every pull, with or without a
+summary, and parses the whole file as a repository config. It refuses a
+`config` with no `[core]` group, with `repo_version` absent or other than `1`,
+with no `mode` key, with an unknown mode, or that does not parse, and a mode
+that is not an archive mode. It reads a `config` that answers 404 as an
+archive repository. The tool requests `config` only after a summary arrives
+and reads `[core] mode` alone: it proceeds with `repo_version` absent, `0`,
+`2`, and `abc`, it fails the pull on a `config` that answers 404, and with no
+summary it pulls from an archive remote whose `config` does not parse or
+states `mode=bare-user` (`cli-behavior.md`, "HTTP pull surface", "The remote
+config"). No test covers the port's refusal; the code is `check_remote_mode` in
+`crates/ostrya/src/pull/http.rs` and `RepoConfig::from_keyfile` in
+`crates/ostrya/src/config.rs`.
+
 The statistics line a pull prints to a pipe takes the tool's forms, words, and
-counts (`../format-reference.md`, "CLI output formats", `pull`), and
+counts (`cli-behavior.md`, "CLI output formats", `pull`), and
 `--update-frequency=FREQUENCY` is read with the reader and the messages of the
 low-speed values. The same line agrees for a loose pull into `bare-user`, a
 repeat pull into `archive` that reads no body byte, a delta pull into
@@ -2833,7 +3207,16 @@ differences stand:
   handles, so the percentages, the moments the form changes, and the moment
   its rate replaces `-/s` are its own. It always ends on the statistics line,
   where the tool at a redraw interval of a few milliseconds was seen to end on
-  a progress line. `pull-local` writes no progress line in the port.
+  a progress line. `pull-local` writes no progress line in the port. The port
+  writes the progress line by these rules:
+  - The port writes the escape sequences and the three forms of the progress
+    text that `cli-behavior.md`, "CLI output formats", `pull`, "The pull
+    progress line", states.
+  - The port writes `ESC 7` with its first redraw, or with the last line when
+    the pull ends before the first redraw. So a pull that draws no progress
+    line writes the bytes that the tool writes.
+  - The rate of the port is the bytes transferred over the whole time of the
+    pull. The rate reads `-/s` until one whole second passes.
 
 `pull-local` accepts `--repo`, `--remote`, `--depth`, `--commit-metadata-only`,
 `--untrusted`, `--bareuseronly-files`, `--disable-verify-bindings`,
@@ -2844,7 +3227,7 @@ durability switches follow the `pull` paragraph above. An object hardlinked from
 the source is not synced, in both, so from `archive` into `archive`
 `--per-object-fsync` adds no call. The same three differences stand, with
 `refs/heads` in place of `refs/remotes/<remote>` and no summary: the count
-over corpus `C0` is 12 in the port and 11 in the tool, and 15 and 11 for a
+over corpus `C0` is 12 in the port and 11 in the tool, and 13 and 11 for a
 commit that carries detached metadata. `pull-local` takes neither `--subpath`
 nor `--http-trusted` in either: the tool reports `error: Unknown option
 <option>` at exit 1, and `clap` refuses the option at exit 1. The library's
@@ -2856,12 +3239,12 @@ refuses the value at exit 1. The port opens the source repository and each
 object of the source. Neither writes an object or a ref.
 
 The two GPG switches check what the tool checks and refuse where it refuses
-(`../format-reference.md`, "Signature verification during a pull"), with the
+(`cli-behavior.md`, "Signature verification during a pull"), with the
 port's own words. `--require-static-deltas` applies the delta the source's
 summary advertises, with the objects, the refs, and the statistics line of the
-tool, and refuses where the tool refuses (`../format-reference.md`, "HTTP pull
-surface"). `--disable-static-deltas` changes nothing, since `pull-local` reads
-no delta by default. Five differences stand:
+tool, and refuses where the tool refuses (`cli-behavior.md`, "HTTP pull
+surface", "Static deltas over pull-local"). `--disable-static-deltas` changes
+nothing, since `pull-local` reads no delta by default. Six differences stand:
 
 - a value given to a GPG switch. The tool reads and discards the value, so
   `--gpg-verify=false` turns the check on. The port's `pull-local` takes both
@@ -2872,42 +3255,64 @@ no delta by default. Five differences stand:
   deltas in an archive repo`, and the port applies the delta, as it does over
   HTTP. The tool's `fsck` accepts what the port wrote;
 - both delta switches together, as on `pull`;
-- the delta index on a repeat pull, as on `pull`;
+- the delta index on a repeat pull, as on `pull`. Under
+  `--require-static-deltas`, the tool reads the index again on a repeat pull
+  of a commit that the destination holds, and prints `1 metadata`. The port
+  reads no delta for a commit that the destination holds complete, and prints
+  `0 metadata`, as it does over HTTP;
 - the parents `--depth` reaches, as a loose walk and a delta part reaching
   the same objects on `pull`. With the from-scratch delta of a commit and its
   parent at `--depth=1`, the tool printed `6 loose fetched` and the port
-  prints `4 loose fetched`.
+  prints `4 loose fetched`;
+- an import into a repository that seals its objects. Into a repository that
+  holds `[ex-integrity] fsverity=yes`, the tool (built with `ex-fsverity`)
+  hardlinks the objects of the source and seals none of them. A
+  commit into the same repository is sealed. fs-verity is a property of the
+  inode, so a seal of a hardlinked object also seals the copy in the source
+  repository. The port links no object into a repository whose `fsverity` is
+  not `no`. It copies each object and seals the copy
+  (`../format-reference.md`, "Write path: fs-verity (ex-integrity)", and
+  `../port-plan.md`, Phase 16b). The object bytes agree.
 
 `sign` accepts the whole tool option set and adds `--gpg-homedir`,
 `--remote`, the `gpg` engine, and the `spki` engine. The tool build at hand,
 `ostree` 2026.1 with the `sign-ed25519` feature, refuses `-s spki` in signing,
 `--verify`, and `-d` with `error: Requested signature type is not
-implemented` at exit 1. Under `-s gpg` each `--keys-file` is a
-keyring, and every keyring given is read. Under `ed25519` and `spki`,
+implemented` at exit 1. Under `-s gpg` each `--keys-file` of a verify or a
+`-d` is a keyring, and every keyring given is read; a gpg signing run refuses
+`--keys-file`. Under `ed25519` and `spki`,
 `--verify` reads the key sources of `static-delta verify`: the positionals and
 the last `--keys-file`, either one leaving `--keys-dir` unread, the last
 `--keys-dir`, an empty one naming the working directory, and `no keys loaded`
-judged before revocation (`../format-reference.md`, "CLI output formats",
-`sign`). Over a commit either implementation signed, the verdict and the exit
-status agree for these rules, and so do the refusals `no keys loaded`, `File
-object '<path>' is not a regular file`, and `no valid keys in file '<path>'`,
-byte for byte. The key-file entries under `static-delta` above also hold for
-`sign --verify`. Nine differences stand.
+judged before revocation (`cli-behavior.md`, "CLI output formats",
+`static-delta`, "Key sources"). Over a commit either implementation signed,
+the verdict and the exit status agree for these rules, and so do the refusals
+`no keys loaded`, `File object '<path>' is not a regular file`, and `no valid
+keys in file '<path>'`, byte for byte. The key-file entries under `static-delta`
+above also hold for `sign --verify`. Nine differences stand.
 
-- the verdict report. The tool writes one line on success, `ed25519: Signature
-  verified successfully with key '<hex>'`, naming the key that verified. On
-  failure it writes nothing to standard output and one `error:` line: `No
-  valid signatures found` where the keys are positionals alone, over a
-  signed commit and over an unsigned one. Where a keys file or a key store
-  supplies keys, the line is `ed25519: commit have no signatures of my type`
-  over a commit with no signature of the engine, `ed25519: no signatures
-  found` over a signed commit where every trusted key of the store is
-  revoked, and `ed25519: Signature couldn't be verified with: key '<hex>';
-  ...` over a signed commit where no key verifies. The
-  port writes `signature <n>: good`, `no public key`, or `BAD` for each
-  signature and then `verification OK` or `verification FAILED`, or `no
-  signatures found`, all to standard output. The exit status agrees. The
-  report is the one the port's `summary --verify` and its gpg engine write;
+- the verdict report. The exit status agrees. The two reports part as
+  follows:
+  - The tool writes one line on success, `ed25519: Signature verified
+    successfully with key '<hex>'`, naming the key that verified. On failure
+    it writes nothing to standard output and one `error:` line: `No valid
+    signatures found` where the keys are positionals alone, over a signed
+    commit and over an unsigned one. Where a keys file or a key store supplies
+    keys, the line is `ed25519: commit have no signatures of my type` over a
+    commit with no signature of the engine, `ed25519: no signatures found`
+    over a signed commit where every trusted key of the store is revoked, and
+    `ed25519: Signature couldn't be verified with: key '<hex>'; ...` over a
+    signed commit where no key verifies.
+  - The port writes one line for each signature: `signature <n>: good`,
+    `signature <n>: no public key`, or `signature <n>: BAD`. It then writes
+    `verification OK` at exit 0 or `verification FAILED` at exit 1. A commit
+    with no signature of the engine gives `no signatures found` at exit 1. All
+    of these lines go to standard output. The port's `summary --verify` and
+    its gpg engine write the same report.
+  - Under the gpg engine of the port, a line also has ` key <fingerprint>`
+    where the signature names its key. It has ` (<name> <email>)` where the
+    key has a user id. A user id with no address gives ` (<name>)`. A user id
+    with an address alone gives ` (<<email>>)`;
 - a key that is not a valid key. The tool skips a positional that does not
   decode to 32 bytes with no message, so `COMMIT AAAA P1` verifies at exit 0.
   It also ignores a keys-file line of that kind, a line of whitespace
@@ -2978,8 +3383,8 @@ No matrix cell needs these. The shell suite invokes them.
 
 `remote` landed in Phase 17e: `add`, `delete`, `list`, `show-url`, `refs`,
 `summary`, `gpg-import`, and `gpg-list-keys`, with the option set the tool
-carries on each and the output formats `../format-reference.md`, "`remote`",
-records. Ten divergences stand:
+carries on each and the output formats `cli-behavior.md`, "`remote`",
+records. Twelve divergences stand:
 
 - the tool's `remote` accepts no `--repo` of its own -- `ostree remote --repo=R
   list` reports `error: Unknown option --repo=R`, where the leading position
@@ -3009,7 +3414,10 @@ records. Ten divergences stand:
   the port reports a certificate by its primary key, and a subkey reaches the
   trusted set through the certificate holding it. The creation instant parts the
   same way the GPG signature report in "P1" does -- the tool renders it in the
-  host locale and time zone and the port in UTC. `remote summary` renders its
+  host locale and time zone and the port in UTC. The port writes a `Key:
+  <fingerprint>` line, then a `Created:` line and one `UID:` line for each
+  user id, each indented by two spaces. Over a keyring that is absent or holds
+  no key, both print nothing at exit 0. `remote summary` renders its
   `Timestamp` and `Last-Modified` lines the same way, so a report compares byte
   for byte with `TZ=UTC` set;
 - `remote gpg-import` writes a keyring that carries no Trust packet, where the
@@ -3265,8 +3673,8 @@ records. Ten divergences stand:
   reader. Where the bytes the packet walk stops at stand inside a later
   certificate run, the answers part further: the port refuses the whole file,
   and the tool reads the certificates standing ahead of that point and trusts
-  them (`../port-plan.md`, "Phase 13d", the divergence for a keyring the parser
-  rejects).
+  them (`../port-plan.md`, "Phase 13d -- GPG signing and verification
+  (DONE)", the divergence for a keyring the parser rejects).
 
   Both rules hold inside one offered stream as well: where a stream carries two
   states of one key the port keeps the first, unless a later one revokes the key
@@ -3282,7 +3690,8 @@ records. Ten divergences stand:
   tool answers on which certificate it reads first. The port reads the
   revocation whichever one stands first, and reads the newest expiry statement
   of the two whichever one stands first. Those are the sixth and the seventh
-  verify divergences `../port-plan.md`, "Phase 13d", records;
+  verify divergences `../port-plan.md`, "Phase 13d -- GPG signing and
+  verification (DONE)", records;
 - a `gpg --export-secret-keys` stream offered to `remote gpg-import` is refused
   by the port and taken by the tool, which imports the public part of each key it
   holds and lists it afterwards. The port reads a keyring as transferable public
@@ -3297,7 +3706,17 @@ records. Ten divergences stand:
   `Imported 1 GPG key to remote "<name>"`, writes a 53-byte keyring, and lists
   the key. The tool reports `error: GPG: Unable to export keys: GPGME: No data`
   at exit 1 and writes no keyring, which is also what it answers over a
-  certificate whose self-signature does not verify.
+  certificate whose self-signature does not verify;
+- `remote add` with `--sign-verify` and `--no-sign-verify` together. Not
+  observed: the answer of the tool to the pair. The port refuses the pair with
+  `error: Cannot specify both --sign-verify and --no-sign-verify` at exit 1,
+  and writes nothing;
+- `remote add --gpg-import=FILE`. Not observed: the answer of the tool to
+  `--gpg-import`. The port imports the keys of `FILE` into the keyring of the
+  remote after it writes the section, the same way as `remote gpg-import` with
+  `--keyring`. It then prints `Imported <n> GPG key to remote "<name>"`, with
+  `keys` for each count other than 1. If `--if-not-exists` leaves the section
+  in place, the port imports nothing.
 
 Three messages the port words for itself, each reporting a condition the tool
 reports through gpgme: `remote gpg-import` with no `--keyring` and no `--stdin`
@@ -3306,7 +3725,9 @@ no key in the source (the tool's `GPG: Unable to find key "<id>": GPGME: End of
 file`), and a keyring the certificate parser does not read -- one holding no
 OpenPGP packet, one cut short of a packet boundary, and a GnuPG keybox -- which
 the tool reports as `GPG: Unable to export keys: GPGME: No data`. Both refuse all
-three at exit 1 and write no keyring.
+three at exit 1 and write no keyring. For `remote gpg-import` with no
+`--keyring` and no `--stdin`, the port writes `error: No keys to import; pass
+--keyring or --stdin`.
 
 `--cache-dir`, which the tool's `remote refs` and `remote summary` accept, is not
 carried: the port fetches a summary without a cache directory of its own. The
@@ -3425,8 +3846,9 @@ ostrya push [--repo=PATH] REMOTE SRC[:DST]...
   need no passphrase. Each of these options wins over the key of the remote
   with the same name. A relative path is relative to the current directory,
   and `~` is not expanded.
-  `../format-reference.md`, "Port extension: the push and pull keys of a remote",
-  states the keys and the grammar of the token file.
+  `ostrya-config(1)`, "REMOTE KEYS", states the keys.
+  `../format-reference.md`, "The push token file of a client", states the
+  grammar of the token file.
 - A token to an `http://` address is refused before any request. With
   `--allow-cleartext-credentials`, the push sends it. Use the switch for a
   server on a loopback address or behind a proxy that terminates TLS.
@@ -3641,12 +4063,10 @@ ostrya serve [--repo=PATH] [--listen=ADDR:PORT]...
   --push-credentials, --client-ca, or --allow-anonymous-push for the
   receive endpoint` and exits 1 before it opens the repository.
 - `--push-credentials` names the push credential file:
-  `../format-reference.md`, "Port extension: the push credential file",
-  states its grammar. A request with `Authorization: Bearer TOKEN`, or
-  with a Basic credential `NAME:TOKEN`, pushes when the SHA-256 digest of
-  `TOKEN` matches a line, of that `NAME` for Basic. The command reads the
-  file once, at start, up to 1 MiB. A file it cannot read or a larger file
-  ends the command with `error: MESSAGE` at exit 1. A malformed line ends
+  `../format-reference.md`, "The push credential file of a server",
+  states its grammar and how a credential matches a line. The command reads
+  the file once, at start, up to 1 MiB. A file it cannot read or a larger
+  file ends the command with `error: MESSAGE` at exit 1. A malformed line ends
   it with `error: push credentials: line N: MESSAGE` at exit 1, after the
   command opens the repository and before it binds a listener. The message
   holds no byte of the line. A file with no credential line is no method,
@@ -3707,9 +4127,9 @@ ostrya serve [--repo=PATH] [--listen=ADDR:PORT]...
   `ostrya receive` does. `reply-not-delivered` states that the connection
   did not take the `CommitReply` response.
 - The paths, the methods, the status codes, and the order of the
-  authentication checks of the receive endpoint are in the rustdoc of
-  `ostrya_server::ReceiveEndpoint`, "Responses", and `ServeOptions`,
-  "Authentication".
+  authentication checks of the receive endpoint are in
+  `../format-reference.md`, "The receive endpoint" and "Authentication of the
+  receive endpoint".
 - `--listen` takes an IP address and a port. Give it once for each address.
   The default is `127.0.0.1:8080`, and port 0 lets the kernel choose a port.
   A host name is refused.
@@ -3888,7 +4308,8 @@ Observed by running the tool (2026.1).
   integer value and ignores the rest, and reads no value at all where there is
   no leading digit, in which case the key's default applies with no diagnostic;
   its boolean reader ignores a run of trailing space, tab, or form feed before
-  it matches the four literals (`../format-reference.md`, "Config file"). So
+  it matches the four literals (`../format-reference.md`, "Config file
+  (`<repo>/config`, GKeyFile / INI)"). So
   `ostree` opens a repository holding `lock-timeout-secs=bogus`,
   `lock-timeout-secs=+101`, `tmp-expiry-secs=bogus`,
   `min-free-space-percent=bogus`,
@@ -3928,10 +4349,10 @@ Observed by running the tool (2026.1).
   or a `min-free-space-size` the size grammar does not hold checks the tree out
   at exit 0, where the tool refuses each of those three at exit 1. The reach of
   the port's refusal is therefore per key and per subcommand, and the list of
-  the keys a subcommand reads is the list of the values it can refuse.
-  Within `commit` the port reads the whole `[core]` set the transaction needs
-  in one place, after the `--statoverride` and `--skip-list` files and after
-  the missing-branch check, and before `--parent`, the metadata options, the
+  the keys a subcommand reads is the list of the values it can refuse. Within
+  `commit` the port reads the whole `[core]` set the transaction needs in one
+  place, after the `--statoverride` and `--skip-list` files and after the branch
+  check of `-b` and `--orphan`, and before `--parent`, the metadata options, the
   editor, and the repository lock. One fault on a `commit` line parts the two
   nowhere, since both refuse it and exit 1. Two faults report the tool's config
   refusal and the port's earlier check, so `commit --statoverride=no-such-file`
@@ -3953,12 +4374,17 @@ Observed by running the tool (2026.1).
   even where `locking` is false, so a malformed `lock-timeout-secs` refuses a
   prune on a repository that takes no lock. A `--static-deltas-only` run returns
   before the last two, so it refuses neither of them.
+- The port reads at most 1048576 bytes of `config`. It refuses a larger file
+  with `config exceeds the 1048576-byte size cap` when it opens a repository,
+  and at each later read of the file. The tool reads a `config` of any size.
+  The cap bounds the memory of a read of `config` (`../../CLAUDE.md`,
+  "Working conventions").
 - Every subcommand that opens a transaction reaps `tmp/`, in the port and in
   the tool. Both skip `cache`, and both remove an entry that is not a staging
   entry once its mtime is older than `tmp-expiry-secs`: a directory as a whole
   tree judged by its own mtime, and a symlink as the link itself.
-  `../format-reference.md`, "Object store layout" states the tool's rule and
-  the port's rule. `commit` over the same aged `tmp/` leaves the same
+  `../format-reference.md`, "Old entries in `tmp/`", states the tool's rule
+  and the port's rule. `commit` over the same aged `tmp/` leaves the same
   entries on both sides (`commit_reaps_aged_tmp_entries_as_the_tool_does` in
   `crates/ostrya-cli/tests/cli.rs`). No matrix cell states the comparison,
   because `tmp/` carries no published state and the oracles read `objects/`
@@ -4035,20 +4461,14 @@ Observed by running the tool (2026.1).
   with slashes handled), so `checkout` reports clap's own missing-argument error
   at the argument-parsing layer, ahead of the repository check.
 
-## Output formats still to recover
+## Output formats
 
-A script reads standard output, so the format is part of the surface. The
-formats of `commit`, including its `--table-output` block, `refs`, `rev-parse`,
-`cat`, `show`, `log`, `ls`, `config get`, `prune`, `fsck`, `diff`,
-`summary`, `static-delta show`, `static-delta list`, and
-`static-delta indexes`, together with the
-GVariant text form the reading commands share,
-are recovered and recorded in `../format-reference.md`, "CLI output formats" and
-"The GVariant text form". The `pull` statistics line and progress line are
-recovered, in `../format-reference.md`, "`pull`".
-
-`remote list`, `show-url`, `refs`, and `summary` are recovered, in
-`../format-reference.md`, "`remote`".
+`cli-behavior.md`, "CLI output formats", records the output format, the error
+text, and the exit status of each command that it lists. Its subsection "The
+GVariant text form" records the text form that the reading commands share.
+The cells of `m10-cli-behavior.matrix` compare the output of the port with the
+output of the tool. This file records each difference in output at its
+command.
 
 ## Ordering
 
@@ -4070,7 +4490,7 @@ recovered, in `../format-reference.md`, "`pull`".
 7. `config set`/`unset`, `remote`, and the two GPG keyring commands, which need
    the config write path. Done, Phase 17e.
 8. The remaining P2 gaps. Phase 17f, decomposed per command in
-   `../phase-17-cli-conformance-plan.md`.
+   `phase-17-cli-conformance-plan.md`.
 9. The rest of P3. Phase 17g, decomposed in the same file.
 
 That file holds the per-option status of both sub-phases, including any option

@@ -29,11 +29,12 @@ implemented and verified against golden fixtures produced by the `ostree` tool:
 - Checkout path
 - composefs/EROFS image writer and fs-verity digest (`ostrya-composefs`)
 
-In progress and planned: wiring composefs export into the library, tar
-import/export, a minimal `ostrya` CLI, prune/fsck/diff, signing, summaries,
-static deltas, pull, an `ostree`-compatible CLI for shell-test conformance,
-and the S3 and SSH transport extensions. See `docs/port-plan.md` for the full
-roadmap.
+Also implemented: composefs export from the library, tar import and export,
+the `ostrya` command, prune, fsck, and diff, signing, summaries, static deltas,
+pull over HTTP, from a local repository, and over ssh, and push over ssh and
+HTTP. In progress: the `ostree`-compatible CLI, checked by the project's own
+conformance matrices in `docs/conformance/`. Planned: the S3 transport
+extension. See `docs/port-plan.md` for the full roadmap.
 
 ## Design
 
@@ -127,7 +128,8 @@ over ssh for an ssh address in `PullOptions::overrides` or in the remote key
 `pull-url`, with no feature. `ostrya::endpoint::resolve_pull` reads the keys
 and the files of a remote for a pull, with no feature.
 
-Later phases add `s3` and `serve`.
+A later phase adds `s3`. `ostrya serve` is the `serve` feature of
+`ostrya-cli`, in its default set, built on `ostrya-server`.
 
 ## Clean-room provenance and licensing
 
@@ -135,9 +137,13 @@ Ostrya is a clean-room reimplementation. Its design is grounded only in the
 public ostree documentation (https://ostreedev.github.io/ostree/) and the
 observed behavior of the `ostree` tool run as a black box. The LGPL libostree
 source is not consulted, so the resulting code can be distributed under the MIT
-license. The on-disk format Ostrya reproduces is an interoperability interface;
-every format fact recorded in `docs/format-reference.md` is verifiable by
-running the tool and inspecting the bytes it writes.
+license. The on-disk format Ostrya reproduces is an interoperability interface.
+Each fact of `docs/format-reference.md` outside the part "Port extensions"
+comes from the public documentation or from the tool. A run of the tool can
+verify each such fact that no label marks "Not observed" or "Design target".
+The part "Port extensions" of that document specifies the formats and the
+protocols that only Ostrya writes. A run of Ostrya and a check of the bytes on
+the wire or on disk verify each fact of that part about Ostrya.
 
 ## Building and testing
 
@@ -194,7 +200,12 @@ skipped fixture test from a passing one.
 The design documents in `docs/` are the source of truth and are kept in sync
 with the code:
 
-- `docs/format-reference.md` -- the byte-exact on-disk format
+- `docs/format-reference.md` -- the byte-exact on-disk format, and the formats
+  and the protocols of the port extensions
+- `docs/conformance/cli-behavior.md` -- the observed CLI behavior of the
+  `ostree` command
+- `docs/conformance/cli-surface.md` -- the CLI surface of the port, and each
+  difference between the `ostree` command and the port
 - `docs/port-plan.md` -- architecture, testing strategy, and the phased roadmap
 
 ## License

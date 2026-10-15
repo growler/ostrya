@@ -154,7 +154,8 @@ emit_tree "$bare_repo" "bare"
 # forces owner 0:0 and reduces each permission set to `perm & 0755` (group and
 # other write and the setuid/setgid/sticky bits are dropped), so the objects are
 # deterministic and owner-independent. --no-xattrs keeps them free of host
-# SELinux labels. See format-reference.md, "Commit modifier".
+# SELinux labels. See format-reference.md, "Commit modifier: canonical
+# permissions, consume, and devino", "Canonical permissions".
 CANON_SRC="$WORK/canon-src"
 mkdir -p "$CANON_SRC/dir0775"
 printf 'a' >"$CANON_SRC/f0664"
@@ -194,8 +195,8 @@ emit_tar "$xattr_repo" "xattr"
 # object reachable in the commit -- content objects and the dirtree/dirmeta
 # metadata objects alike, each carrying its own object-type byte -- so the commit
 # object differs from the sizes-free archive fixture. Archive mode stores no
-# xattrs, so this is a plain tree. See format-reference.md, "Commit -- the
-# ostree.sizes key".
+# xattrs, so this is a plain tree. See format-reference.md, "Commit --
+# `(a{sv}aya(say)sstayay)`", "The `ostree.sizes` key".
 sizes_repo="$WORK/repo-sizes"
 ostree --repo="$sizes_repo" init --mode=archive-z2 >/dev/null
 SIZES_COMMIT="$(ostree --repo="$sizes_repo" commit \

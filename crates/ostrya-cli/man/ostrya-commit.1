@@ -10,7 +10,7 @@ Commit a tree into the repository and print the new commit checksum.
 .PP
 The command reads one or more tree sources: a directory, a tar archive, or a committed tree. With no \%\-\-tree option and no PATH, it reads a tar stream from standard input. It writes the objects of the tree and the commit object. If signing options name keys, it signs the commit. Then it points the \%\-\-branch ref at the new commit.
 .PP
-The command needs \%\-\-branch or \%\-\-orphan. Without \%\-\-parent, the current tip of the branch is the parent. On success, standard output carries the commit checksum, or the \%\-\-table\-output block. If the command refuses its input, it exits \%1 and moves no ref.
+The command needs \%\-\-branch or \%\-\-orphan. Without \%\-\-parent, the parent is the branch name resolved as a revision. On success, standard output carries the commit checksum, or the \%\-\-table\-output block. If the command refuses its input, it exits \%1 and moves no ref.
 .SH ARGUMENTS
 .TP
 \fIPATH...\fR
@@ -22,7 +22,7 @@ If a \%\-\-tree option is present, the command ignores this argument. It also ig
 \fB\-\-parent\fR \fIPARENT\fR
 The parent commit (a checksum or a ref), or \fB\%none\fR for a root commit.
 .IP
-Without this option, the current tip of the branch is the parent, unless \%\-\-orphan is given. A branch that names no ref gives a root commit. Only the lowercase \fB\%none\fR asks for a root commit, and each other value is a revision.
+Without this option, the parent is the branch name resolved as a revision, unless \%\-\-orphan is given: the commit that a short lowercase hexadecimal name abbreviates, or else the current tip of the branch. The command refuses a name that abbreviates more than one commit. A branch that names no ref and abbreviates no commit gives a root commit. Only the lowercase \fB\%none\fR asks for a root commit, and each other value is a revision.
 .TP
 \fB\-b\fR, \fB\-\-branch\fR \fIBRANCH\fR
 Point this branch at the new commit and bind it into the commit.
@@ -162,7 +162,7 @@ The command reads the kernel version from the committed tree. The version is the
 \fB\-\-generate\-composefs\-metadata\fR
 Store the composefs image digest of the tree in the commit metadata.
 .IP
-The key is \fB\%ostree.composefs.digest.v0\fR, and the value is the \%fs\-verity digest of the image as a byte array. The value depends on the tree alone, so each repository mode gives the same digest. It replaces a value that \%\-\-add\-metadata\-string, \%\-\-add\-metadata, or \%\-\-keep\-metadata gives for the same key.
+The key is \fB\%ostree.composefs.digest.v0\fR, and the value is the \%fs\-verity digest of the image as a byte array. The value depends on the committed tree alone. \fB\%archive\fR, \fB\%bare\fR, and \fB\%bare\-user\fR commit the same tree and give the same digest. \fB\%bare\-user\-only\fR canonicalizes the tree, so it can give another digest. It replaces a value that \%\-\-add\-metadata\-string, \%\-\-add\-metadata, or \%\-\-keep\-metadata gives for the same key.
 .TP
 \fB\-\-tree\fR \fIdir=PATH or tar=TARFILE or ref=COMMIT\fR
 Add a tree source: a directory, a tar archive, or a committed tree.

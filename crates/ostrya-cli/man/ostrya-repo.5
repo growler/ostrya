@@ -16,7 +16,9 @@ In this page, \fB\%<repo>\fR is the repository directory.
 The key \fB\%core.mode\fR of \fB\%config\fR sets the mode of the repository.
 \fB\%ostrya init \-\-mode\fR writes the key, and the default mode is \fB\%bare\fR.
 The mode controls how a file object is stored.
-An object has the same checksum in each mode.
+An object has the same checksum in each mode other than \fB\%bare\-user\-only\fR.
+In \fB\%bare\-user\-only\fR an object records no owner, no group, and no extended attributes, and the permission bits of a regular file or a directory are masked with 0755.
+The checksum covers this reduced form.
 .TP
 \fB\%bare\fR
 A file object is a regular file or a symbolic link.
@@ -54,7 +56,8 @@ An HTTP server can serve the repository as static files.
 An ostrya extension for development hosts where a group of users share one repository.
 A file object has the bytes and the \fB\%user.ostreemeta\fR attribute of \fB\%bare\-user\fR.
 The inode mode of each object is 0644, and the committed mode is never applied to the inode.
-A checkout copies or reflinks each file, and refuses a hard link checkout.
+A checkout copies or reflinks each regular file.
+\fB\%checkout \-\-require\-hardlinks\fR refuses a regular file of non-zero length.
 The \fB\%ostree\fR tool does not know this mode string and refuses to open the repository.
 The section PERMISSIONS gives the modes of the directories and the lock files.
 .PP
@@ -146,7 +149,8 @@ A pull with \fB\%\-\-subpath\fR or \fB\%\-\-commit\-metadata\-only\fR keeps it.
 The staging area.
 Each transaction makes a directory \fB\%tmp/staging\-<boot\-id>\-<6 characters>/\fR and a lock file with the same name and the suffix \fB\%\-lock\fR.
 A transaction writes its objects there and moves them into \fB\%objects/\fR when it commits.
-At the start of each transaction, ostrya removes the staging directories whose lock is free, and the other entries older than \fB\%core.tmp\-expiry\-secs\fR.
+At the start of each transaction, ostrya removes each staging directory whose lock is free.
+It removes a staging directory with no lock file, and each other entry except a staging lock file, when the entry is older than \fB\%core.tmp\-expiry\-secs\fR.
 \fB\%tmp/cache/\fR is never removed.
 .TP
 \fB\%<repo>/extensions/\fR
@@ -203,8 +207,12 @@ A part starts with one byte that names its compression: 0 for none, or \fB\%x\fR
 In the summary and in an index, the name of a delta is the hexadecimal \fB\%<to>\fR or \fB\%<from>\-<to>\fR.
 \fB\%ostrya prune\fR removes a delta when its target commit is not in the repository.
 .SH PERMISSIONS
-In each mode other than \fB\%bare\-user\-shared\fR, ostrya makes a directory with the mode 0775, or 0777 for an \fB\%objects/<xx>/\fR directory, less the umask.
+In each mode other than \fB\%bare\-user\-shared\fR, ostrya makes a directory with the mode 0775 less the umask.
+An \fB\%objects/<xx>/\fR directory and a directory that a ref write makes below \fB\%refs/\fR get 0777 less the umask.
 It writes \fB\%config\fR, each ref file, each object, \fB\%summary\fR, \fB\%summary.sig\fR, and each file in \fB\%deltas/\fR and \fB\%delta\-indexes/\fR with the mode 0644.
+.PP
+In every mode, \fB\%deltas/\fR, \fB\%delta\-indexes/\fR, and each directory below them get 0755 less the umask.
+In a \fB\%bare\-user\-shared\fR repository they also take the setgid bit of their parent directory.
 .PP
 In a \fB\%bare\-user\-shared\fR repository, ostrya sets these modes with fchmod after it makes each entry, so the umask has no effect:
 .TP
@@ -224,7 +232,7 @@ Each \fB\%state/<checksum>.commitpartial\fR.
 .PP
 An entry that exists keeps its mode and its group.
 ostrya sets no group owner.
-\fB\%deltas/\fR and \fB\%delta\-indexes/\fR take the modes of the other repository modes.
+\fB\%deltas/\fR and \fB\%delta\-indexes/\fR take the modes of the other repository modes and the setgid bit of their parent directory.
 .SH SERVED FILES
 \fB\%ostrya serve\fR and \fB\%ostrya send\fR read the repository through an archive view.
 The view serves these paths:

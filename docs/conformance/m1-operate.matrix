@@ -52,7 +52,7 @@ severity: interop
 identity: n-a
 oracle: exit-status
 evidence: -
-spec: format-reference.md#port-extension-bare-user-shared-mode
+spec: format-reference.md#bare-user-shared-mode
 note: The mode is a port extension. The tool rejects it when the repository is
  opened, so it can neither create nor populate one, and this column has no
  producer. The reverse direction is covered in D2 below.
@@ -71,7 +71,7 @@ oracle: manifest checksum-agreement
 evidence: ostrya::read_split_xattrs
 spec: format-reference.md#bare-split-xattrs-mode
 question: Establish first whether the tool can populate a repository in this mode
- at all, and by which gate. Its write support is experimental and gated. The
+ at all. The tool refuses a commit into it ("Not allowed due to repo mode"). The
  port's read support is currently proven against hand-built objects rather than
  tool output, so the oracle for these cells does not yet involve the tool.
 
@@ -232,7 +232,7 @@ severity: interop
 identity: n-a
 oracle: manifest
 evidence: -
-spec: format-reference.md#checkout
+spec: cli-behavior.md#checkout
 question: Bare mode is the one mode whose objects are hardlinked directly on
  checkout. Confirm the checked-out path shares the object inode, and that the
  ownership and mode presented are the object's. Foreign ids raise the tier to T3.
@@ -265,7 +265,7 @@ severity: interop
 identity: n-a
 oracle: exit-status stderr-text
 evidence: -
-spec: format-reference.md#checkout
+spec: cli-behavior.md#checkout
 question: The logical mode and ownership live outside the inode in these modes,
  so a hardlink cannot present them. Record both refusal texts for a checkout that
  requires hardlinks.
@@ -309,7 +309,7 @@ severity: interop
 identity: n-a
 oracle: exit-status stderr-text
 evidence: -
-spec: format-reference.md#port-extension-bare-user-shared-mode
+spec: format-reference.md#bare-user-shared-mode
 note: Observed with ostree 2026.1. Every subcommand fails when the repository is
  opened, before the operation runs, with "error: opening repo: Invalid mode
  'bare-user-shared' in repository configuration" and exit status 1. The
@@ -430,7 +430,7 @@ note: The tool applies the port's from-scratch delta, which carries splices
  under the big-endian byte and with the parts in files under the
  little-endian byte, and its `fsck` passes. A delta that carries an `o` operation applies in the tool into a bare
  family repository alone. That limit holds for the tool's own deltas too
- (`format-reference.md`, "Static delta wire format").
+ (`cli-surface.md`, "P2", `static-delta`).
 
 family: M1
 created-by: p
@@ -505,5 +505,5 @@ severity: interop
 identity: n-a
 oracle: exit-status stderr-text
 evidence: -
-spec: format-reference.md#checkout
+spec: cli-behavior.md#checkout
 question: Record both refusal texts, as in the matching D1 record.

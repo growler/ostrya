@@ -126,7 +126,8 @@ impl Repo {
     /// that it states. All these checks run before the transaction opens.
     ///
     /// After the checks, the session opens a transaction. The transaction
-    /// holds the repository lock shared until the session ends. The wait for
+    /// holds the repository lock shared until the session ends with no
+    /// commit, or until the end of the transaction commit. The wait for
     /// the lock stops at `[core] lock-timeout-secs`. A `bare` repository is
     /// `mode-refused` unless the process runs as root, because only root can
     /// store the owner of each file.

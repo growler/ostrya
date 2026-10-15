@@ -19,8 +19,8 @@ pub enum RepoMode {
     ///
     /// This mode drops the uid and the gid. The inode holds the canonical mode.
     BareUserOnly,
-    /// Storage as in [`BareUser`](Self::BareUser), with the xattrs in
-    /// separate `.file-xattrs` objects.
+    /// Storage as in [`Bare`](Self::Bare), with the xattrs in separate
+    /// `.file-xattrs` objects and none on the inode.
     BareSplitXattrs,
     /// File content in `.filez` objects, compressed with raw DEFLATE.
     ///

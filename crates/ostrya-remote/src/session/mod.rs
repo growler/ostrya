@@ -287,7 +287,8 @@ pub struct ServerInfo {
     pub collection_id: Option<String>,
     /// The frame and chunk limit that the session writes with.
     ///
-    /// The [frame rules](crate::proto#frames) give the range of the value.
+    /// The value is in
+    /// [`MIN_FRAME_LIMIT`](crate::proto::MIN_FRAME_LIMIT)`..=`[`MAX_FRAME_LIMIT`](crate::proto::MAX_FRAME_LIMIT).
     pub max_frame: u32,
     /// The highest number of object names in one `Have`.
     pub max_have: u32,
@@ -346,6 +347,12 @@ pub struct PushOutcome {
 /// [`abort`](PushSession::abort), the session sends nothing more. A stream
 /// transport then closes its output, so the server reads the end of the
 /// stream. Over HTTP, the server ends the session when its idle timeout ends.
+///
+/// After the server ends a session over HTTP, it answers each later request
+/// of that session with 404. The session reports a 404 on
+/// [`missing`](PushSession::missing) or [`send`](PushSession::send) as
+/// [`Error::Transport`], and a 404 on [`commit`](PushSession::commit) as
+/// [`Error::CommitOutcomeUnknown`].
 ///
 /// # Verification
 ///
@@ -688,8 +695,9 @@ impl PushSession {
     /// - [`Error::Io`] for a failure of the stream, or for a failed read of a
     ///   response body over HTTP.
     /// - [`Error::Fetch`] over HTTP, for a failure of the HTTP client.
-    /// - [`Error::Transport`] over HTTP, for a status that the endpoint does
-    ///   not give, or for a body that is not one frame.
+    /// - [`Error::Transport`] over HTTP, for a status other than 200, 401,
+    ///   403, 409, 422, 500, and 503, or for a body that is not one frame. A
+    ///   404 for a session that the server ended is such a status.
     pub async fn missing(&self, names: &[ObjectName]) -> Result<Vec<ObjectName>> {
         refuse_off_wire(names)?;
         let slot = match &self.inner.link {
@@ -784,8 +792,9 @@ impl PushSession {
     /// - [`Error::Io`] for a failure of the stream, or for a failed read of a
     ///   response body over HTTP.
     /// - [`Error::Fetch`] over HTTP, for a failure of the HTTP client.
-    /// - [`Error::Transport`] over HTTP, for a status that the endpoint does
-    ///   not give, or for a body that is not one frame.
+    /// - [`Error::Transport`] over HTTP, for a status other than 200, 401,
+    ///   403, 409, 422, 500, and 503, or for a body that is not one frame. A
+    ///   404 for a session that the server ended is such a status.
     ///
     /// If more than one object stream fails over HTTP, the call returns one
     /// error, in this order:
@@ -861,7 +870,8 @@ impl PushSession {
     /// - a response head that the client refuses, for example for a declared
     ///   coding or for a declared length over the cap
     /// - a failed read of the response
-    /// - a status that the endpoint does not give
+    /// - a status other than 200, 401, 403, 409, 422, 500, and 503, for
+    ///   example the 404 of a session that the server ended
     /// - a body that is not one frame
     ///
     /// # Errors

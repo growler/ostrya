@@ -1847,8 +1847,8 @@ fn commit_fsync_policy_controls_the_syscalls() {
                     calls.len(),
                     total,
                     "`{who}` issued {} sync calls in the `{tag}` row, where the table in \
-                     `docs/format-reference.md`, \"The fsync vocabulary\", records {total}: \
-                     {calls:?}",
+                     `docs/conformance/cli-behavior.md`, \"The fsync vocabulary\", records \
+                     {total}: {calls:?}",
                     calls.len(),
                 );
             } else {
@@ -6199,7 +6199,7 @@ fn assert_durability_syncs(
     assert_eq!(
         calls.len(),
         total,
-        "{label}: {} sync calls, where `docs/format-reference.md`, \"The fsync \
+        "{label}: {} sync calls, where `docs/conformance/cli-behavior.md`, \"The fsync \
          vocabulary\", records {total}: {calls:?}",
         calls.len(),
     );
@@ -29782,8 +29782,8 @@ fn checkout_fsync_policy_controls_the_syscalls() {
                     calls.len(),
                     *total,
                     "`{who}` issued {} sync calls in the `{tag}` row, where the table in \
-                     `docs/format-reference.md`, \"The fsync vocabulary\", records {total}: \
-                     {calls:?}",
+                     `docs/conformance/cli-behavior.md`, \"The fsync vocabulary\", records \
+                     {total}: {calls:?}",
                     calls.len(),
                 );
                 // `sync_calls` gives a target under the repository as a path

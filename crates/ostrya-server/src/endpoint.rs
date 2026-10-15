@@ -131,70 +131,29 @@ impl Default for EndpointOptions {
 /// # Responses
 ///
 /// Each request under the raw path prefix `/_ostrya/receive/v1/` is one
-/// step of a push session of [`ReceiveService`](ostrya::ReceiveService). The
-/// path is not percent-decoded.
+/// step of a push session of [`ReceiveService`](ostrya::ReceiveService).
+/// [The receive endpoint] specifies the routes, the request bodies, the
+/// session id, the statuses, and the end of a session. [Error codes] gives
+/// the status of each wire code.
+/// [Authentication of the receive endpoint] gives the refusals of the
+/// authentication.
 ///
-/// - `POST session`, with a body of one `Hello` frame, opens a session. The
-///   response is 200 with the `HelloReply` frame. The header
-///   `Ostrya-Session` carries the session id: 64 lowercase hex digits of 32
-///   bytes from the random source of the operating system.
-/// - `POST session/ID/have`, with one `Have` frame, gets `HaveReply`.
-/// - `POST session/ID/objects`, with one object stream, gets
-///   `ObjectsReply`. Up to [`EndpointOptions::parallel_uploads`] of these run
-///   at the same time in one session, and one more gets `limit-exceeded`.
-/// - `POST session/ID/commit`, with one `Commit` frame, gets `CommitReply`.
-///   The commit runs in a task of its own, so a disconnect, a `DELETE`, or
-///   the idle timeout does not stop it. If the session already commits, a
-///   second `commit` gets 422 with `protocol`, and the first commit goes on.
-/// - `DELETE session/ID` ends the session and the requests of the session
-///   in flight. It gets 204 with no body and no `Content-Length`. If the
-///   session commits, the `DELETE` gets 422 with `protocol`, and the commit
-///   goes on.
-///
-/// These requests get 404 with no body:
-///
-/// - a path under the prefix that names no route
-/// - an id that is not a session of the owner of the request
-/// - a session that ended
-///
-/// A known path with another method, also `GET` and `HEAD`, gets 405 with
-/// `Allow: POST` or `Allow: DELETE`. The body of `session`, `have`, and
-/// `commit` holds one frame of at most 1 MiB. An empty body or a byte after
-/// the frame is a `protocol` error.
-///
-/// Each other response body is one frame. An error is an `Error` frame, and
-/// its code sets the status:
-///
-/// - `ref-mismatch` and `non-fast-forward` get 409.
-/// - `internal` gets 500.
-/// - Every other code gets 422.
-/// - An error of the server with no wire code gets 500 with `internal` and
-///   the text of the error.
-/// - If [`EndpointOptions::max_sessions`] sessions are open, a `session`
-///   request whose `Hello` passes its checks gets 503 with `limit-exceeded`.
-/// - If the authentication refuses a request, the request gets 401 or 403
-///   with `unauthorized`.
-///
-/// No response that the endpoint builds itself carries `Content-Type` or
-/// `Retry-After`. A refusal of the authentication carries the headers that
-/// the authentication adds to it.
+/// [`EndpointOptions::parallel_uploads`] is the number of `objects` requests
+/// that one session runs at the same time. One more `objects` request gets
+/// 422 with `limit-exceeded`, and the session ends.
+/// [`EndpointOptions::max_sessions`] is the number of sessions that are open
+/// at the same time. A `session` request past the limit gets 503 with
+/// `limit-exceeded`. A refusal of the authentication carries the headers
+/// that the [`ReceiveAuth`] adds to it, except `Content-Length`,
+/// `Transfer-Encoding`, and `Connection`, which the endpoint sets itself.
 ///
 /// A refusal can come before the endpoint reads the body, for example a 404
 /// or a 405. Before such a refusal, the endpoint reads and drops up to 1 MiB
 /// of the body. The time limit of this read is the idle timeout or 5
-/// seconds, whichever is shorter. On HTTP/1.1, if the body did not reach its
-/// end, the response gets `Connection: close`.
+/// seconds, whichever is shorter. On HTTP/1.1 and HTTP/1.0, if the body did
+/// not reach its end, the response gets `Connection: close`.
 ///
 /// # Sessions
-///
-/// A failed step ends its session. The other requests of the session in
-/// flight get 422 with `protocol` and the cause.
-///
-/// If a request ends before its response, for example because the client
-/// closes the connection, its session ends too, unless the session commits.
-/// A request body can fail, for example because the client closes the
-/// connection in the middle of the body. The cause is then that of a request
-/// that ended before its response.
 ///
 /// If a session has no request in progress for
 /// [`EndpointOptions::session_idle_timeout`], the endpoint aborts it. The
@@ -213,6 +172,10 @@ impl Default for EndpointOptions {
 ///
 /// The endpoint reads the repository settings once, at start. A change of
 /// the settings applies at the next start.
+///
+/// [The receive endpoint]: https://github.com/growler/ostrya/blob/main/docs/format-reference.md#the-receive-endpoint
+/// [Error codes]: https://github.com/growler/ostrya/blob/main/docs/format-reference.md#error-codes
+/// [Authentication of the receive endpoint]: https://github.com/growler/ostrya/blob/main/docs/format-reference.md#authentication-of-the-receive-endpoint
 ///
 /// # Examples
 ///
@@ -305,11 +268,12 @@ impl<A: ReceiveAuth> ReceiveEndpoint<A> {
     /// The raw request path must start with `/_ostrya/receive/v1/`. The path
     /// is not percent-decoded, and the endpoint ignores the query.
     /// [Mounting](ReceiveEndpoint#mounting) states how a host removes its
-    /// prefix. [Responses](ReceiveEndpoint#responses) states the routes and
-    /// the responses.
+    /// prefix. [Responses](ReceiveEndpoint#responses) links the specification
+    /// of the routes and the responses.
     ///
     /// A request body that fails counts as a request that ended before its
-    /// response. The request gets 500 with `internal`, and its session ends.
+    /// response. The request gets 500 with `internal`, and its session ends,
+    /// unless the session commits.
     ///
     /// Under the tokio backend, the call must run within a tokio runtime
     /// with the time driver enabled. The commit runs in a task of its own,

@@ -1971,9 +1971,11 @@ fn require_hardlinks_refuses_regular(policy: Policy) -> bool {
 /// [`None`](CheckoutMode::None) creates the link again and does not refuse it.
 ///
 /// `bare-user-shared` and `bare-split-xattrs` are modes of ostrya that the
-/// `ostree` command does not carry, so no observation decides them. Each
-/// stores a symlink as `bare-user` does and creates it again. So each follows
-/// `bare-user` here and refuses nothing.
+/// `ostree` command does not write, so no observation decides them.
+/// `bare-user-shared` stores a symlink as `bare-user` does, and refuses
+/// nothing, as `bare-user` does. `bare-split-xattrs` stores a real symlink as
+/// `bare` does. It creates the link again and refuses nothing under both
+/// checkout modes, which is a choice of the port.
 ///
 /// [`require_hardlinks_refuses`], the one caller, reads the switch itself.
 fn require_hardlinks_refuses_symlink(policy: Policy) -> bool {

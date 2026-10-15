@@ -23,9 +23,9 @@ spec: format-reference.md#repository-modes-and-on-disk-storage
 question: Record both refusal texts. The tool answers "Not allowed due to repo
  mode" for every write. Confirm the port refuses when the transaction opens
  rather than failing later in the write.
-note: The tool's write support for this mode is gated and incomplete, and the
- port does not write it. Read-side interoperability for a repository the tool
- produced is covered in m1-operate.matrix.
+note: The tool refuses a commit into this mode ("Not allowed due to repo
+ mode"), and the port does not write it. Read-side interoperability for a
+ repository the tool produced is covered in m1-operate.matrix.
 
 family: M0
 corpus: C0
@@ -77,7 +77,7 @@ identity: full
 oracle: checksum-agreement
 evidence: ostrya::commit (cross-mode commit identity across archive, bare-user,
  and bare-user-shared)
-spec: format-reference.md#port-extension-bare-user-shared-mode
+spec: format-reference.md#bare-user-shared-mode
 note: The tool cannot read this mode, so the oracle is the cross-mode identity
  invariant rather than a direct comparison. Object bytes match the bare-user
  form; only the inode mode differs.
@@ -138,7 +138,7 @@ run: commit --repo=$REPO -b conformance -s x --timestamp=@1700000000 --owner-uid
 expect-exit: 0
 expect-stderr: empty
 oracle: exit-status checksum-agreement inventory
-spec: format-reference.md#commit
+spec: cli-behavior.md#commit
 note: the declared ids reach every entry -- the tree root's own metadata, the
  nested directory, the regular files, and the symlink -- and both implementations
  reach one commit checksum for them. An unprivileged writer can record any ids in
@@ -154,7 +154,7 @@ severity: interop
 identity: full
 oracle: checksum-agreement
 evidence: ostrya_cli::cli::declared_ownership_is_one_commit_across_modes
-spec: format-reference.md#port-extension-bare-user-shared-mode
+spec: format-reference.md#bare-user-shared-mode
 note: the tool cannot open this mode, so the oracle is the cross-mode identity
  invariant rather than a direct comparison, as it is for C0: the cited test
  commits the declared ownership into archive, bare-user, and bare-user-shared and
@@ -176,13 +176,14 @@ oracle: exit-status checksum-agreement inventory
 loss: The uid and gid are discarded and read back as 0. The mode stores no
  user.ostreemeta.
 spec: format-reference.md#repository-modes-and-on-disk-storage
-note: both halves observed. The commit checksum records the declared ids: it
- differs from the same tree committed without them, and the two implementations
- agree on it, so a pull into a checksum-preserving mode recovers what this mode
- does not store. The stored objects carry no ownership, so `ostree ls` reads 0 for
- both ids out of either implementation's repository. The identity this mode's
- reduction gives is its own: the checksum differs from the archive and bare-user
- rows above, which record the mode as well as the ids.
+note: both halves observed. The mode discards the declared ids, so the commit
+ checksum is the same as for the tree committed without them, and the two
+ implementations agree on it (`format-reference.md`, "Write path: loose-object
+ inode modes and durability"). The stored objects carry no ownership, so
+ `ostree ls` reads 0 for both ids out of either implementation's repository.
+ The identity this mode's reduction gives is its own: the checksum differs from
+ the archive and bare-user rows above, which record the mode as well as the
+ ids.
 
 family: M0
 corpus: C3
@@ -362,7 +363,7 @@ severity: interop
 identity: n-a
 oracle: exit-status stdout-text refs-bytes inventory
 evidence: -
-spec: format-reference.md#commit
+spec: cli-behavior.md#commit
 note: the format holds regular files, symlinks, and directories alone, so both
  implementations refuse a fifo and a unix socket at exit 1, with standard output
  empty, no ref, and no object. The tool reports `error: Not a regular file or
@@ -391,7 +392,7 @@ severity: interop
 identity: n-a
 oracle: exit-status refs-bytes inventory
 evidence: -
-spec: format-reference.md#port-extension-bare-user-shared-mode
+spec: format-reference.md#bare-user-shared-mode
 note: the tool does not open this mode, so the port's refusal has no counterpart
  to compare with. The port refuses the fifo and the socket as it does in the four
  modes above, at exit 1, with no ref and no object.

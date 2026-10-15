@@ -343,7 +343,6 @@ impl<A: ReceiveAuth> ReceiveEndpoint<A> {
 #[cfg(test)]
 mod tests {
     use hyper::{Method, StatusCode};
-    use ostrya::ReceivePolicy;
     use ostrya::remote::ErrorCode;
     use ostrya::remote::proto::{Hello, Kind, Message};
     use ostrya_rt::block_on;
@@ -354,7 +353,7 @@ mod tests {
     use crate::body::ServeBody;
     use crate::body::tests::frames;
     use crate::receive::PREFIX;
-    use crate::session::tests::TmpRepo;
+    use crate::session::tests::{TmpRepo, pushing_policy};
 
     /// The built-in authentication with anonymous push.
     fn anonymous() -> FileAuth {
@@ -362,7 +361,7 @@ mod tests {
             allow_anonymous_push: true,
             ..ServeOptions::default()
         };
-        FileAuth::new(&opts, Arc::new(ReceivePolicy::default())).unwrap()
+        FileAuth::new(&opts, Arc::new(pushing_policy())).unwrap()
     }
 
     fn endpoint(tmp: &TmpRepo, options: EndpointOptions) -> Result<ReceiveEndpoint<FileAuth>> {

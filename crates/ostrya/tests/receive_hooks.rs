@@ -17,14 +17,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::Duration;
 
-use common::receive::{Obj, assert_staging_removed, body, fixture_objects, is_root, new_repo};
+use common::receive::{
+    Obj, assert_staging_removed, body, fixture_objects, is_root, new_repo, policy_allowing,
+};
 use common::{COMMIT, TmpDir, foreign_holder, lock_holder_main};
 use ostrya::remote::proto::{CommitRequest, Hello};
 use ostrya::remote::{self, Encoding, Expected, RefUpdate};
 use ostrya::{
     Checksum, DetachedMetadataFilter, Error, HookFuture, HookRefusal, HostEntry, LockKind,
-    MAX_METADATA_SIZE, ObjectType, ReceiveHooks, ReceivePolicy, ReceiveReport, ReceiveRule,
-    ReceiveService, Repo, RepoMode, Type, UpdatePlan, Value,
+    MAX_METADATA_SIZE, ObjectType, ReceiveHooks, ReceivePolicy, ReceiveReport, ReceiveService,
+    Repo, RepoMode, Type, UpdatePlan, Value,
 };
 use ostrya_rt::block_on;
 
@@ -199,7 +201,7 @@ fn run(
     objects: &[Obj],
     updates: Vec<RefUpdate>,
 ) -> (ReceiveService, ostrya::Result<ReceiveReport>) {
-    run_with(repo, ReceivePolicy::default(), hooks, objects, updates)
+    run_with(repo, policy_allowing(&["w:**"]), hooks, objects, updates)
 }
 
 /// [`run`] with `policy`.
@@ -573,7 +575,7 @@ fn the_host_merge_takes_a_stored_dict_the_plan_read() {
     );
     let policy = ReceivePolicy {
         detached_metadata_filter: Some(DetachedMetadataFilter::excluding(["dropped"])),
-        ..ReceivePolicy::default()
+        ..policy_allowing(&["w:**"])
     };
     let mut objects = fixture_objects(Encoding::Raw);
     objects.push(client_dict(vec![("dropped", text("client"))]));
@@ -1260,13 +1262,7 @@ fn after_update_does_not_run_when_the_transaction_commit_fails() {
     std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).unwrap();
     let drops = Arc::new(AtomicUsize::new(0));
     let hook = Hook::giving(Vec::new(), &drops);
-    let policy = ReceivePolicy {
-        default_rule: ReceiveRule {
-            allow_delete: true,
-            ..ReceiveRule::default()
-        },
-        ..ReceivePolicy::default()
-    };
+    let policy = policy_allowing(&["rwd:**"]);
     let delete = |name: &str| RefUpdate {
         name: name.into(),
         expected: Expected::Commit(fixture_commit()),

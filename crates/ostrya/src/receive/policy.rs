@@ -1,42 +1,65 @@
-//! The receive policy and its rules.
+//! The receive policy of a client group, and the policies of the client
+//! groups of a repository.
 
-use std::path::Path;
 use std::sync::Arc;
 
+use crate::access::{AccessModes, AccessRules, ClientAccess};
 use crate::error::Result;
 use crate::pull::DetachedMetadataFilter;
+use crate::remote::{self, RefUpdate};
 use crate::repo::Repo;
 
-use super::reader::{self, Origin};
-use super::{ReceivePattern, ServerSigner, TrustedKeys};
+use super::reader;
+use super::session::Failure;
+use super::{ServerSigner, StreamPolicy, TrustedKeys};
 
-/// The rules that decide what a receiving repository accepts.
+/// The rules of one client group for a push session.
 ///
-/// The policy also states the steps after an accepted session: the server
-/// signatures, the summary regeneration, and the detached-metadata filter.
+/// The policy states which refs a session can read and change, how the
+/// server verifies the commits of the client, and which keys sign them. It
+/// also states the steps after an accepted session: the server signatures of
+/// the summary, the summary regeneration, and the detached-metadata filter.
 ///
-/// The [`Default`] policy holds:
+/// [`ReceivePolicies::from_config`] builds one policy for each client group
+/// of a repository. A caller can also build a policy in code.
 ///
-/// - the default rule with its defaults, which accepts fast-forward updates of
-///   plain refs with no signature verification and no server signature
-/// - no pattern rule, so every remote ref is refused
-/// - no privileged content
-/// - no summary signer and no summary regeneration
-/// - no detached-metadata filter.
+/// The [`Default`] policy has no allow item. It opens no push session, so
+/// each `Hello` gets `ref-denied`.
 ///
-/// [`from_config`](ReceivePolicy::from_config) and
-/// [`from_file`](ReceivePolicy::from_file) read the policy from key-file
-/// groups. For a repository with no receive group, `from_config` gives the
-/// rules of the default policy.
+/// # Rights
+///
+/// [`rights`](ReceivePolicy::rights) gives the effective rights of a ref. A
+/// session applies them in this way:
+///
+/// - Each ref of `Hello` needs `r`. A remote ref `REMOTE:NAME` has no right,
+///   so a push session never reads or writes one.
+/// - A session opens only if an allow item has `w`, `c`, `t`, or `d`.
+/// - An update that writes a commit needs `w` or `t`. With `t` and no `w`,
+///   the update can create the ref and cannot write to a ref that exists,
+///   also when the commit is the current one.
+/// - An update with `w` is a fast-forward. With `w`, `d`, and `force` in the
+///   request, it can also be a non-fast-forward update.
+/// - A delete of a ref that exists needs `d`. A delete of an absent ref
+///   changes nothing.
 #[derive(Debug, Default)]
 pub struct ReceivePolicy {
-    /// The rule of each plain ref that no pattern of
-    /// [`rules`](ReceivePolicy::rules) matches.
-    pub default_rule: ReceiveRule,
-    /// The rules of the refs that their patterns match.
+    /// The allow items and the deny items of the group.
+    pub rules: AccessRules,
+    /// The signatures that a new commit must carry.
+    pub verify: ReceiveVerify,
+    /// The switch that accepts a new commit with no signature.
     ///
-    /// [`rule_for`](ReceivePolicy::rule_for) selects one rule for a ref.
-    pub rules: Vec<(ReceivePattern, ReceiveRule)>,
+    /// The switch applies only with [`ReceiveVerify::Keys`]. A commit has no
+    /// signature if its detached metadata holds no blob under
+    /// `ostree.gpgsigs`, `ostree.sign.ed25519`, `ostree.sign.spki`, and
+    /// `ostree.sign.dummy`. A commit with a blob under one of these keys must
+    /// pass the verification on each axis of the keys, also when the switch
+    /// is `true`.
+    pub allow_unsigned: bool,
+    /// The keys that the server signs each new commit with, in order.
+    ///
+    /// A new commit is a commit that becomes the new value of a ref.
+    pub signers: Vec<Arc<ServerSigner>>,
     /// The switch that accepts privileged content in a `bare` repository.
     ///
     /// Privileged content is a setuid or setgid mode bit, or the
@@ -51,48 +74,6 @@ pub struct ReceivePolicy {
     ///
     /// `None` stores every key.
     pub detached_metadata_filter: Option<DetachedMetadataFilter>,
-}
-
-/// The rule that applies to an update of a ref.
-///
-/// A [`ReceivePolicy`] holds one rule for each pattern, and a default rule
-/// for the plain refs that no pattern matches.
-///
-/// [`Default`] accepts fast-forward updates with no signature verification
-/// and no server signature.
-#[derive(Debug, Clone)]
-pub struct ReceiveRule {
-    /// The switch that accepts an update of a matching ref.
-    ///
-    /// `false` refuses each update.
-    pub accept: bool,
-    /// The signatures that a commit must carry to become the new value of a
-    /// matching ref.
-    pub verify: ReceiveVerify,
-    /// The switch that accepts an update whose new commit does not descend
-    /// from the current one.
-    ///
-    /// The switch applies only if the client asks for such an update.
-    pub allow_non_fast_forward: bool,
-    /// The switch that accepts a delete of a matching ref.
-    pub allow_delete: bool,
-    /// The keys that the server signs the new commits of a matching ref with.
-    ///
-    /// A new commit is a commit that becomes the new value of the ref. The
-    /// server signs with the keys in order.
-    pub signers: Vec<Arc<ServerSigner>>,
-}
-
-impl Default for ReceiveRule {
-    fn default() -> ReceiveRule {
-        ReceiveRule {
-            accept: true,
-            verify: ReceiveVerify::Off,
-            allow_non_fast_forward: false,
-            allow_delete: false,
-            signers: Vec::new(),
-        }
-    }
 }
 
 /// The signatures that a received commit must carry.
@@ -123,50 +104,60 @@ pub enum ReceiveVerify {
 }
 
 impl ReceivePolicy {
-    /// Reads the receive policy from the configuration of `repo`.
+    /// Returns the effective rights of the ref `refspec`.
     ///
-    /// The policy comes from these groups:
+    /// For a plain ref `NAME`, the result is
+    /// [`AccessRules::rights`] of `NAME`. A remote ref `REMOTE:NAME` has no
+    /// right, because a push session does not write remote refs.
+    pub fn rights(&self, refspec: &str) -> AccessModes {
+        if refspec.contains(':') {
+            return AccessModes::NONE;
+        }
+        self.rules.rights(refspec)
+    }
+}
+
+/// The receive policy of each client group of a repository.
+///
+/// [`from_config`](ReceivePolicies::from_config) builds the value.
+#[derive(Debug, Clone)]
+pub struct ReceivePolicies {
+    access: ClientAccess,
+    /// The policy of each group of `access`, in the same order.
+    policies: Vec<Arc<ReceivePolicy>>,
+}
+
+impl ReceivePolicies {
+    /// Reads the client groups of the configuration of `repo` and builds the
+    /// receive policy of each group.
     ///
-    /// - `[ex-ostrya receive]` for the default rule and the session keys
-    /// - `[ex-ostrya receive "PATTERN"]` for the rule of each pattern
-    /// - `[ex-ostrya trust "NAME"]` for each set of trusted keys
-    /// - `[ex-ostrya key "NAME"]` for each server signing key.
+    /// [`ClientAccess::from_config`] reads the client groups and
+    /// `[ex-ostrya server]`. A config with no client group has the two
+    /// implicit groups, and each one gets a policy. Then the call reads each
+    /// `[ex-ostrya trust "NAME"]` and each `[ex-ostrya key "NAME"]` group,
+    /// and builds each one once, in file order, also a group that no client
+    /// group names. So a key source that the policies cannot use fails the
+    /// call.
     ///
-    /// [`update_summary`](ReceivePolicy::update_summary) comes from
-    /// `[core] auto-update-summary` and its alias, as
-    /// [`auto_update_summary`](crate::RepoConfig::auto_update_summary) reads
-    /// them. The filter comes from `[ex-ostrya] detached-metadata-exclude`.
+    /// The policy of a group takes these values:
     ///
-    /// The call parses the groups strictly. It builds each key group and each
-    /// trust group once, in file order, also a group that no rule names. The
-    /// rules share these builds, so a key source that the policy cannot use
-    /// fails the call.
+    /// - [`rules`](ReceivePolicy::rules) from `allow` and `deny`
+    /// - [`verify`](ReceivePolicy::verify) from `verify`, with the keys of the
+    ///   trust group
+    /// - [`allow_unsigned`](ReceivePolicy::allow_unsigned) from
+    ///   `allow-unsigned`, or its default
+    /// - [`signers`](ReceivePolicy::signers) from `sign`
+    /// - [`allow_privileged`](ReceivePolicy::allow_privileged) from
+    ///   `allow-privileged`
+    /// - [`summary_signers`](ReceivePolicy::summary_signers) from
+    ///   `sign-summary` of `[ex-ostrya server]`
+    /// - [`update_summary`](ReceivePolicy::update_summary) from
+    ///   `[core] auto-update-summary` and its alias, as
+    ///   [`auto_update_summary`](crate::RepoConfig::auto_update_summary) reads
+    ///   them
+    /// - the filter from `[ex-ostrya] detached-metadata-exclude`.
     ///
-    /// # Keys
-    ///
-    /// Each receive group takes the rule keys:
-    ///
-    /// - `accept`: a boolean, `true` by default. `false` refuses each update
-    ///   of a matching ref.
-    /// - `verify`: `off` (the default), `trust:NAME`, or `remote:NAME`.
-    /// - `allow-non-fast-forward`: a boolean. If `true`, the rule accepts a
-    ///   new commit that does not descend from the current commit of the ref.
-    /// - `allow-delete`: a boolean. If `true`, the rule accepts a ref delete.
-    /// - `sign`: a list of key group names. The server signs each new commit
-    ///   of a matching ref with these keys.
-    ///
-    /// `trust:NAME` uses the trust group `NAME`. `remote:NAME` uses the keys
-    /// that a pull from the remote `NAME` trusts, as
-    /// [`TrustedKeys::for_remote`] reads them. A pattern rule takes no key
-    /// from the default rule.
-    ///
-    /// `[ex-ostrya receive]` also takes the session keys:
-    ///
-    /// - `allow-privileged`: a boolean. If `true`, a session on a `bare`
-    ///   repository accepts the setuid and setgid bits, `security.capability`,
-    ///   and `security.selinux`.
-    /// - `sign-summary`: a list of key group names. These keys sign the new
-    ///   summary.
+    /// # Trust groups and key groups
     ///
     /// A trust group takes `gpg-verify`, `gpgkeypath`, `sign-verify`,
     /// `verification-ENGINE-key`, and `verification-ENGINE-file`, in the value
@@ -178,18 +169,11 @@ impl ReceivePolicy {
     ///
     /// # Errors
     ///
+    /// - Each error of [`ClientAccess::from_config`].
     /// - [`Error::InvalidFormat`](crate::Error::InvalidFormat) if:
-    ///   - a group name starts with `ex-ostrya ` and is not one of the four
-    ///     groups, or its quoted name is malformed
-    ///   - a group holds a key that it does not take, or a pattern group holds
-    ///     a session key
-    ///   - a pattern is outside the syntax of [`ReceivePattern`]
-    ///   - a `verify` value is malformed
-    ///   - a reference names a trust group, a key group, or a remote section
-    ///     that does not exist
+    ///   - a trust group or a key group holds a key that it does not take
     ///   - a key has no effect
-    ///   - a trust group or a `remote:` reference turns on no signature
-    ///     verification
+    ///   - a trust group turns on no signature verification
     ///   - a trust group names an engine other than `ed25519` or `spki`, or
     ///     sets `gpg-verify=true` and its `gpgkeypath` names no keyring
     ///   - a key group has no `type`, an unknown `type`, the type `dummy`, or
@@ -211,206 +195,275 @@ impl ReceivePolicy {
     /// - [`Error::Io`](crate::Error::Io) if a directory of keys cannot be
     ///   listed, or if the read of the output of `gpg` or the wait for `gpg`
     ///   fails.
-    pub async fn from_config(repo: &Repo) -> Result<ReceivePolicy> {
-        reader::read(repo, repo.config().keyfile(), Origin::Config).await
+    pub async fn from_config(repo: &Repo) -> Result<ReceivePolicies> {
+        let (access, policies) = reader::read(repo).await?;
+        Ok(ReceivePolicies { access, policies })
     }
 
-    /// Reads the receive policy from the file at `path`.
-    ///
-    /// The call reads the receive groups and the remote sections from the file
-    /// only, and parses them as [`from_config`](ReceivePolicy::from_config)
-    /// does. It does not read the receive groups of the repository config. The
-    /// file can hold a remote section that no rule names.
-    ///
-    /// A `remote:` reference reads no keyring inside the repository:
-    /// `<repo>/NAME.trustedkeys.gpg` does not take part.
-    /// [`update_summary`](ReceivePolicy::update_summary) and the filter come
-    /// from the repository config.
-    ///
-    /// The file must be a regular file of up to 1 MiB, in UTF-8.
-    ///
-    /// # Errors
-    ///
-    /// - Each error of [`from_config`](ReceivePolicy::from_config).
-    /// - [`Error::InvalidFormat`](crate::Error::InvalidFormat) if the file
-    ///   cannot be opened or read, is not a regular file, is larger than
-    ///   1 MiB, or is not valid UTF-8.
-    /// - [`Error::InvalidFormat`](crate::Error::InvalidFormat) if the file
-    ///   holds a group that is not a receive group or a remote section.
-    /// - [`Error::Core`](crate::Error::Core) if the file is not a valid key
-    ///   file.
-    pub async fn from_file(repo: &Repo, path: &Path) -> Result<ReceivePolicy> {
-        let keyfile = reader::read_policy_file(path).await?;
-        reader::read(repo, &keyfile, Origin::File).await
+    /// Returns the client groups and the server settings that the policies
+    /// come from.
+    pub fn access(&self) -> &ClientAccess {
+        &self.access
     }
 
-    /// Returns the rule of an update of `refspec`, or `None` if no rule covers
-    /// it.
+    /// Returns the policy of the client group `group`, or `None` if no group
+    /// has this name.
     ///
-    /// `refspec` is a plain ref `NAME` or a remote ref `REMOTE:NAME`. `None`
-    /// means that the update is refused.
-    ///
-    /// A remote ref matches only a pattern with a remote part. A plain ref
-    /// matches only a pattern without one. Among the patterns that match, the
-    /// call selects in this order:
-    ///
-    /// 1. A literal remote part wins over `*:`.
-    /// 2. The parts of the name pattern compare from the left. At the first
-    ///    part where the two patterns differ in kind, a literal wins over `*`,
-    ///    and `*` wins over `**`.
-    /// 3. If one pattern is a leading run of the other, the longer pattern
-    ///    wins.
-    ///
-    /// For example, `a/b` wins over `a/*`, `a/*` wins over `a/**`, and
-    /// `a/b/**` wins over `a/**`. For the ref `a/b/c`, `a/*/c` wins over
-    /// `*/b/c`, because the first part decides.
-    ///
-    /// If two entries of [`rules`](ReceivePolicy::rules) tie, the first one
-    /// wins. Two patterns tie if they differ only in the text of their
-    /// literal parts, for example `**/x/**` and `**/y/**` on the ref
-    /// `p/x/y/q`. A plain ref that no pattern matches gets
-    /// [`default_rule`](ReceivePolicy::default_rule). A remote ref that no
-    /// pattern matches gets `None`.
-    pub fn rule_for(&self, refspec: &str) -> Option<&ReceiveRule> {
-        let (remote, name) = match refspec.split_once(':') {
-            Some((remote, name)) => (Some(remote), name),
-            None => (None, refspec),
-        };
-        let mut best = None;
-        for (pattern, rule) in &self.rules {
-            if let Some(found) = pattern.specificity(remote, name)
-                && best.is_none_or(|(held, _)| found > held)
-            {
-                best = Some((found, rule));
+    /// `group` is the quoted part of the group name, as
+    /// [`ClientGroup::name`](crate::access::ClientGroup::name) returns it.
+    pub fn get(&self, group: &str) -> Option<&Arc<ReceivePolicy>> {
+        self.access
+            .groups()
+            .iter()
+            .position(|held| held.name() == group)
+            .map(|i| &self.policies[i])
+    }
+}
+
+/// The rule that the commit of a session applies to one ref update.
+pub(super) struct UpdateRule<'a> {
+    /// `true` if the update can create its ref and cannot write a commit to
+    /// a ref that exists.
+    pub(super) create_only: bool,
+    /// `true` if the update can delete a ref that exists.
+    pub(super) allow_delete: bool,
+    /// `true` if the update can be a non-fast-forward update, when the client
+    /// asks for one.
+    pub(super) allow_non_fast_forward: bool,
+    /// The signatures that the new commit must carry.
+    pub(super) verify: &'a ReceiveVerify,
+    /// `true` if a new commit with no signature passes the verification of
+    /// `verify`.
+    pub(super) allow_unsigned: bool,
+    /// The keys that the server signs the new commit with.
+    pub(super) signers: &'a [Arc<ServerSigner>],
+}
+
+/// The rules that a session applies: the policy of a client group, or the
+/// policy of a one-way stream.
+pub(super) trait SessionPolicy: Send + Sync {
+    /// Returns `true` if the session accepts privileged content in a `bare`
+    /// repository.
+    fn privileged_allowed(&self) -> bool;
+
+    /// Checks the refs of `Hello` before the session opens, with no I/O.
+    fn check_hello(&self, refs: &[String]) -> std::result::Result<(), Failure>;
+
+    /// Returns the rule of `update`, or the `ref-denied` refusal of the
+    /// update.
+    fn rule(&self, update: &RefUpdate) -> std::result::Result<UpdateRule<'_>, Failure>;
+
+    /// Returns the detached-metadata filter of the session.
+    fn metadata_filter(&self) -> Option<&DetachedMetadataFilter>;
+
+    /// Returns `true` if the session regenerates the summary after it writes
+    /// a ref.
+    fn regenerates_summary(&self) -> bool;
+
+    /// Returns the keys that sign the regenerated summary.
+    fn summary_keys(&self) -> &[Arc<ServerSigner>];
+}
+
+fn ref_denied(message: String) -> Failure {
+    Failure::Wire(remote::Error::RefDenied(message))
+}
+
+impl SessionPolicy for ReceivePolicy {
+    fn privileged_allowed(&self) -> bool {
+        self.allow_privileged
+    }
+
+    /// Refuses a policy that opens no push session, and a ref without `r`.
+    fn check_hello(&self, refs: &[String]) -> std::result::Result<(), Failure> {
+        if !self.rules.opens_push_session() {
+            return Err(ref_denied(
+                "the policy of the session opens no push session: no allow item has the \
+                 mode w, c, t, or d"
+                    .into(),
+            ));
+        }
+        for name in refs {
+            if name.contains(':') {
+                return Err(ref_denied(format!(
+                    "ref '{name}' is a remote ref, which a push session does not read or write"
+                )));
+            }
+            if !self.rights(name).contains(AccessModes::READ) {
+                return Err(ref_denied(format!("the policy gives no r on ref '{name}'")));
             }
         }
-        match best {
-            Some((_, rule)) => Some(rule),
-            None => remote.is_none().then_some(&self.default_rule),
+        Ok(())
+    }
+
+    /// Refuses a remote ref, and a write of a commit without `w` or `t`. The
+    /// rule of a delete comes from `d`, under the update lock.
+    fn rule(&self, update: &RefUpdate) -> std::result::Result<UpdateRule<'_>, Failure> {
+        let name = &update.name;
+        if name.contains(':') {
+            return Err(ref_denied(format!(
+                "ref '{name}' is a remote ref, which a push session does not write"
+            )));
         }
+        let rights = self.rights(name);
+        let write = rights.contains(AccessModes::WRITE);
+        let tag = rights.contains(AccessModes::TAG);
+        if update.new.is_some() && !write && !tag {
+            return Err(ref_denied(format!(
+                "the policy gives no w or t on ref '{name}'"
+            )));
+        }
+        let delete = rights.contains(AccessModes::DELETE);
+        Ok(UpdateRule {
+            create_only: tag && !write,
+            allow_delete: delete,
+            allow_non_fast_forward: write && delete,
+            verify: &self.verify,
+            allow_unsigned: self.allow_unsigned,
+            signers: &self.signers,
+        })
+    }
+
+    fn metadata_filter(&self) -> Option<&DetachedMetadataFilter> {
+        self.detached_metadata_filter.as_ref()
+    }
+
+    fn regenerates_summary(&self) -> bool {
+        self.update_summary
+    }
+
+    fn summary_keys(&self) -> &[Arc<ServerSigner>] {
+        &self.summary_signers
+    }
+}
+
+impl SessionPolicy for StreamPolicy {
+    fn privileged_allowed(&self) -> bool {
+        self.allow_privileged
+    }
+
+    /// A one-way stream checks its refs at `Commit` alone.
+    fn check_hello(&self, _refs: &[String]) -> std::result::Result<(), Failure> {
+        Ok(())
+    }
+
+    /// Refuses an update that no rule covers and an update whose rule
+    /// refuses it. The rule takes no server key.
+    fn rule(&self, update: &RefUpdate) -> std::result::Result<UpdateRule<'_>, Failure> {
+        let name = &update.name;
+        match self.rule_for(name) {
+            Some(rule) if rule.accept => Ok(UpdateRule {
+                create_only: false,
+                allow_delete: rule.allow_delete,
+                allow_non_fast_forward: rule.allow_non_fast_forward,
+                verify: &rule.verify,
+                allow_unsigned: false,
+                signers: &[],
+            }),
+            Some(_) => Err(ref_denied(format!(
+                "the policy refuses updates of ref '{name}'"
+            ))),
+            None => Err(ref_denied(format!(
+                "no rule of the policy covers the remote ref '{name}'"
+            ))),
+        }
+    }
+
+    fn metadata_filter(&self) -> Option<&DetachedMetadataFilter> {
+        self.detached_metadata_filter.as_ref()
+    }
+
+    /// A one-way stream does not regenerate the summary.
+    fn regenerates_summary(&self) -> bool {
+        false
+    }
+
+    /// A one-way stream does not regenerate the summary.
+    fn summary_keys(&self) -> &[Arc<ServerSigner>] {
+        &[]
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::access::AllowItem;
+    use crate::remote::Expected;
 
-    /// Returns a policy with one default rule for each of `patterns`, in order.
-    fn policy(patterns: &[&str]) -> ReceivePolicy {
+    fn policy(allow: &[&str]) -> ReceivePolicy {
         ReceivePolicy {
-            rules: patterns
-                .iter()
-                .map(|pattern| {
-                    (
-                        ReceivePattern::parse(pattern).unwrap(),
-                        ReceiveRule::default(),
-                    )
-                })
-                .collect(),
+            rules: AccessRules {
+                allow: allow.iter().map(|t| AllowItem::parse(t).unwrap()).collect(),
+                deny: Vec::new(),
+            },
             ..ReceivePolicy::default()
         }
     }
 
-    /// Returns the pattern of the rule that `rule_for` selects for `refspec`.
-    ///
-    /// The result is `Some("")` for the default rule and `None` for a refusal.
-    fn selected<'a>(policy: &'a ReceivePolicy, refspec: &str) -> Option<&'a str> {
-        let rule = policy.rule_for(refspec)?;
-        if std::ptr::eq(rule, &policy.default_rule) {
-            return Some("");
-        }
-        policy
-            .rules
-            .iter()
-            .find(|(_, held)| std::ptr::eq(held, rule))
-            .map(|(pattern, _)| pattern.as_str())
-    }
-
-    /// A plain ref never takes a remote rule, and a remote ref never takes a
-    /// plain one.
-    #[test]
-    fn the_remote_part_decides_first() {
-        let policy = policy(&["main", "*:**"]);
-        assert_eq!(selected(&policy, "main"), Some("main"));
-        assert_eq!(selected(&policy, "origin:main"), Some("*:**"));
-        assert_eq!(selected(&policy, "other"), Some(""));
-    }
-
-    /// A literal remote part wins over `*:`, before the name is compared.
-    #[test]
-    fn a_literal_remote_wins_over_any_remote() {
-        let policy = policy(&["*:apps/x", "origin:**"]);
-        assert_eq!(selected(&policy, "origin:apps/x"), Some("origin:**"));
-        assert_eq!(selected(&policy, "other:apps/x"), Some("*:apps/x"));
-        assert_eq!(selected(&policy, "other:apps/y"), None);
-        let policy = self::policy(&["*:a/b", "origin:**"]);
-        assert_eq!(selected(&policy, "origin:a/b"), Some("origin:**"));
-        let policy = self::policy(&["origin:**", "*:a/b"]);
-        assert_eq!(selected(&policy, "origin:a/b"), Some("origin:**"));
-    }
-
-    /// A literal wins over `*`, and `*` wins over `**`. The test gives the
-    /// rules in both orders.
-    #[test]
-    fn a_literal_wins_over_one_and_one_over_many() {
-        for patterns in [["a/b", "a/*", "a/**"], ["a/**", "a/*", "a/b"]] {
-            let policy = policy(&patterns);
-            assert_eq!(selected(&policy, "a/b"), Some("a/b"));
-            assert_eq!(selected(&policy, "a/c"), Some("a/*"));
-            assert_eq!(selected(&policy, "a/c/d"), Some("a/**"));
-            assert_eq!(selected(&policy, "a"), Some(""));
-        }
-        let policy = policy(&["origin:**", "origin:a/**", "origin:a/b"]);
-        assert_eq!(selected(&policy, "origin:a/b"), Some("origin:a/b"));
-        assert_eq!(selected(&policy, "origin:a/c"), Some("origin:a/**"));
-        assert_eq!(selected(&policy, "origin:b"), Some("origin:**"));
-    }
-
-    /// A longer pattern wins when the shorter one is its leading run, and the
-    /// leftmost differing part decides otherwise.
-    #[test]
-    fn the_leftmost_part_and_the_length_decide() {
-        for patterns in [["a/**", "a/b/**"], ["a/b/**", "a/**"]] {
-            let policy = policy(&patterns);
-            assert_eq!(selected(&policy, "a/b/c"), Some("a/b/**"));
-            assert_eq!(selected(&policy, "a/x/c"), Some("a/**"));
-        }
-        for patterns in [["a/*/c", "*/b/c"], ["*/b/c", "a/*/c"]] {
-            let policy = policy(&patterns);
-            assert_eq!(selected(&policy, "a/b/c"), Some("a/*/c"));
-        }
-        for patterns in [["a/**", "a/**/c"], ["a/**/c", "a/**"]] {
-            let policy = policy(&patterns);
-            assert_eq!(selected(&policy, "a/x/c"), Some("a/**/c"));
-            assert_eq!(selected(&policy, "a/x/d"), Some("a/**"));
+    fn update(name: &str, new: bool) -> RefUpdate {
+        RefUpdate {
+            name: name.into(),
+            expected: Expected::Any,
+            new: new.then(|| ostrya_core::Checksum::from_bytes([1; 32])),
         }
     }
 
-    /// Two patterns of equal kinds tie, and the first entry wins.
-    #[test]
-    fn a_tie_goes_to_the_first_entry() {
-        for patterns in [["**/x/**", "**/y/**"], ["**/y/**", "**/x/**"]] {
-            let policy = policy(&patterns);
-            assert_eq!(selected(&policy, "p/x/y/q"), Some(patterns[0]));
+    fn accepted<T>(result: std::result::Result<T, Failure>) -> T {
+        match result {
+            Ok(value) => value,
+            Err(_) => panic!("refused"),
         }
     }
 
-    /// A plain ref that no pattern matches gets the default rule, and a remote
-    /// ref that no pattern matches is refused.
-    #[test]
-    fn an_unmatched_ref_takes_the_default_or_is_refused() {
-        let policy = ReceivePolicy::default();
-        assert_eq!(selected(&policy, "main"), Some(""));
-        assert_eq!(selected(&policy, "origin:main"), None);
-        let policy = self::policy(&["other:**"]);
-        assert_eq!(selected(&policy, "origin:main"), None);
+    fn denied<T>(result: std::result::Result<T, Failure>) -> String {
+        match result {
+            Err(Failure::Wire(remote::Error::RefDenied(message))) => message,
+            Err(_) => panic!("another failure"),
+            Ok(_) => panic!("accepted"),
+        }
     }
 
-    /// If a hand-built policy repeats a pattern, the first entry wins.
+    /// A remote ref has no right, also under an item that matches each ref.
+    /// The rules alone read `origin:main` as one part, which `**` matches.
     #[test]
-    fn the_first_of_two_equal_patterns_wins() {
-        let policy = policy(&["main", "main"]);
-        let rule = policy.rule_for("main").unwrap();
-        assert!(std::ptr::eq(rule, &policy.rules[0].1));
+    fn a_remote_ref_has_no_right() {
+        let policy = policy(&["rwctd:**"]);
+        assert_eq!(policy.rights("main").to_string(), "rwctd");
+        assert_eq!(policy.rules.rights("origin:main").to_string(), "rwctd");
+        assert_eq!(policy.rights("origin:main"), AccessModes::NONE);
+        let message = denied(policy.check_hello(&["origin:main".into()]));
+        assert!(message.contains("remote ref"), "{message}");
+        let message = denied(policy.rule(&update("origin:main", true)));
+        assert!(message.contains("remote ref"), "{message}");
+    }
+
+    /// `Hello` needs a push mode in an allow item and `r` on each ref.
+    #[test]
+    fn hello_needs_a_push_mode_and_read() {
+        let names = |names: &[&str]| -> Vec<String> { names.iter().map(|&n| n.into()).collect() };
+        denied(ReceivePolicy::default().check_hello(&[]));
+        denied(policy(&["r:**"]).check_hello(&names(&["a"])));
+        denied(policy(&["d:a"]).check_hello(&names(&["a"])));
+        accepted(policy(&["rd:a"]).check_hello(&names(&["a"])));
+        accepted(policy(&["r:**", "w:a"]).check_hello(&names(&["a", "b"])));
+        let message = denied(policy(&["w:a"]).check_hello(&names(&["a", "b"])));
+        assert!(message.contains("'b'"), "{message}");
+    }
+
+    /// A write needs `w` or `t`, and the modes give the rule of the update.
+    #[test]
+    fn the_modes_give_the_rule_of_an_update() {
+        denied(policy(&["rd:a"]).rule(&update("a", true)));
+        let delete = policy(&["rd:a"]);
+        let rule = accepted(delete.rule(&update("a", false)));
+        assert!(rule.allow_delete && !rule.allow_non_fast_forward);
+        let tag = policy(&["t:a"]);
+        let rule = accepted(tag.rule(&update("a", true)));
+        assert!(rule.create_only && !rule.allow_delete);
+        let write_tag = policy(&["wt:a"]);
+        let rule = accepted(write_tag.rule(&update("a", true)));
+        assert!(!rule.create_only && !rule.allow_non_fast_forward);
+        let forced = policy(&["w:a", "d:a"]);
+        let rule = accepted(forced.rule(&update("a", true)));
+        assert!(rule.allow_non_fast_forward && rule.allow_delete);
     }
 }

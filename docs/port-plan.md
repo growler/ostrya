@@ -223,8 +223,11 @@ bounded:
   token or a Basic credential, which it matches against the push
   credential file (`format-reference.md`, "The push credential file of a
   server"), with a client certificate, or as an anonymous push.
-  `FileAuth` gives no hooks. `FileAuth` compares the digests in constant
-  time with a hand-rolled compare and no dependency. The server refuses to
+  `FileAuth` gives no hooks, and refuses a session with 403 when the policy
+  opens no push session. `ostrya serve` gives the default policy, which
+  opens no push session, because it selects no client group yet.
+  `FileAuth` compares the digests in constant time with a hand-rolled
+  compare and no dependency. The server refuses to
   start with no method, and over plain HTTP with the credential file as its
   one method and no switch for credentials over plain HTTP. The public type
   `ReceiveEndpoint<A>` is the endpoint with any `ReceiveAuth`, which a host
@@ -7716,8 +7719,9 @@ A value the key-file syntax cannot split is reported when the accessor runs, not
 when the repository opens, which is the style of every other tunable.
 `DetachedMetadataFilter::excluding` builds the filter the second key describes.
 
-The library reads `detached-metadata-exclude` in one place, the receive policy
-of `ostrya receive` and `ostrya serve`, and does not read
+The library reads `detached-metadata-exclude` in one place,
+`ReceivePolicies::from_config`, which builds the receive policies of
+`ostrya receive` and `ostrya serve`, and does not read
 `gc-root-metadata-keys`. `Repo::prune` and the pull drivers act on the options
 they are given, and every default is what it was: `PruneOptions::default` is
 still the tool's prune. `ostrya-cli` reads `gc-root-metadata-keys` at its

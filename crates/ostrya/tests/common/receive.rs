@@ -137,6 +137,21 @@ impl Client {
     }
 }
 
+/// Returns a policy whose rules hold the allow items `allow`, with the
+/// defaults of the other fields.
+pub fn policy_allowing(allow: &[&str]) -> ReceivePolicy {
+    ReceivePolicy {
+        rules: ostrya::access::AccessRules {
+            allow: allow
+                .iter()
+                .map(|item| ostrya::access::AllowItem::parse(item).unwrap())
+                .collect(),
+            deny: Vec::new(),
+        },
+        ..ReceivePolicy::default()
+    }
+}
+
 /// Runs a session of `repo` under `policy` against the client `script`.
 pub fn session<F, Fut, T>(
     repo: &Repo,

@@ -13,10 +13,10 @@ use ostrya_core::{
     Checksum, ObjectName, ObjectType, RepoMode, choose_offset_size, loose_path, offset_size_for,
 };
 
-use super::ReceivePolicy;
 use super::hooks::ReceiveHooks;
 use super::ingest::{self, Counted, ModeRules, limit_exceeded};
 use super::merge::check_incoming;
+use super::policy::SessionPolicy;
 use super::session::{Failure, ReceiveReport, aborted, codec, next, out_of_order};
 use crate::error::{Error, Result};
 use crate::object::{MAX_METADATA_SIZE, object_exists};
@@ -34,7 +34,7 @@ use crate::transaction::Transaction;
 /// until `Commit`. The session transaction holds the repository lock in
 /// shared mode. Each step except [`finish`](Self::finish) takes `&self`, so
 /// concurrent object streams can share one session.
-pub(super) struct SessionCore<P: Deref<Target = ReceivePolicy>> {
+pub(super) struct SessionCore<P: Deref<Target: SessionPolicy + Sized>> {
     repo: Repo,
     policy: P,
     txn: Transaction,
@@ -68,7 +68,7 @@ struct MetaState {
     reserved: u64,
 }
 
-impl<P: Deref<Target = ReceivePolicy>> SessionCore<P> {
+impl<P: Deref<Target: SessionPolicy + Sized>> SessionCore<P> {
     /// Answers the `Hello` of a two-way session and opens the session
     /// transaction.
     ///
@@ -131,11 +131,14 @@ impl<P: Deref<Target = ReceivePolicy>> SessionCore<P> {
         Self::start(repo, policy, None, hello, true).await
     }
 
-    /// Runs the checks of [`check_hello`] on `hello` and opens the session
-    /// transaction.
+    /// Runs the checks of [`check_hello`] on `hello`, then the checks of the
+    /// policy, and opens the session transaction.
     ///
-    /// If the repository mode is `bare` and the server does not run as root,
-    /// the result is a `mode-refused` failure.
+    /// The checks of the policy of a client group refuse a policy that opens
+    /// no push session, and a ref of `hello` without `r`, with `ref-denied`.
+    /// A one-way stream has no such check. If the repository mode is `bare`
+    /// and the server does not run as root, the result is a `mode-refused`
+    /// failure.
     async fn start(
         repo: Repo,
         policy: P,
@@ -144,6 +147,7 @@ impl<P: Deref<Target = ReceivePolicy>> SessionCore<P> {
         one_way: bool,
     ) -> std::result::Result<Self, Failure> {
         check_hello(&repo, &hello)?;
+        policy.check_hello(&hello.refs)?;
         let mode = repo.mode();
         let txn = repo.transaction().await.map_err(Failure::Internal)?;
         // Read the settings that the writes of the session use. A malformed
@@ -164,7 +168,7 @@ impl<P: Deref<Target = ReceivePolicy>> SessionCore<P> {
                 )));
             }
         }
-        let rules = ModeRules::new(mode, policy.allow_privileged);
+        let rules = ModeRules::new(mode, policy.privileged_allowed());
         Ok(SessionCore {
             repo,
             policy,
@@ -414,7 +418,7 @@ impl<P: Deref<Target = ReceivePolicy>> SessionCore<P> {
         } = self;
         let dicts = meta.into_inner().expect("detached metadata mutex").dicts;
         let hooks = hooks.as_deref();
-        super::finish::finish(&repo, &policy, hooks, txn, &named, dicts, request).await
+        super::finish::finish(&repo, &*policy, hooks, txn, &named, dicts, request).await
     }
 }
 

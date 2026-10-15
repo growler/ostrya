@@ -14,15 +14,15 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
-use common::receive::{PIPE_CAP, PipeReader, PipeWriter, is_root, new_repo, pipe};
+use common::receive::{PIPE_CAP, PipeReader, PipeWriter, is_root, new_repo, pipe, policy_allowing};
 use common::{Counting, TmpDir, mark_partial};
 use futures_io::AsyncWrite;
 use futures_lite::future::zip;
 use ostrya::remote::{self, Compression, PushOutcome, PushProgress};
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, DetachedMetadataFilter,
-    DictBuilder, Error, MutableTree, ObjectType, PruneOptions, ReceivePolicy, ReceiveReport,
-    ReceiveRule, Repo, RepoMode, RepoPushOptions, Value,
+    DictBuilder, Error, MutableTree, ObjectType, PruneOptions, ReceivePolicy, ReceiveReport, Repo,
+    RepoMode, RepoPushOptions, Value,
 };
 use ostrya_rt::block_on;
 
@@ -159,7 +159,7 @@ fn push_through<F>(pair: &Pair, opts: RepoPushOptions, hook: F) -> Pushed
 where
     F: FnMut(u8) + Send + 'static,
 {
-    push_under(pair, opts, &ReceivePolicy::default(), hook)
+    push_under(pair, opts, &policy_allowing(&["w:**"]), hook)
 }
 
 /// [`push_through`] with the server under `policy`.
@@ -1000,13 +1000,7 @@ fn a_forced_push_expects_any_state_of_the_ref() {
     // Another writer moves the ref of the server to an unrelated commit
     // after `HelloReply`. The update is then not a fast-forward from the
     // state that `HelloReply` reported.
-    let policy = ReceivePolicy {
-        default_rule: ReceiveRule {
-            allow_non_fast_forward: true,
-            ..ReceiveRule::default()
-        },
-        ..ReceivePolicy::default()
-    };
+    let policy = policy_allowing(&["wd:**"]);
     let server = pair.server.clone();
     let (report, outcome) = push_under(
         &pair,
@@ -1048,7 +1042,7 @@ fn a_destination_of_64_lowercase_hex_characters_is_refused_before_any_byte() {
 }
 
 /// A delete (`:DST`) of a `DST` of 64 lowercase hex characters passes the
-/// client, and a server rule that allows the delete removes the ref.
+/// client, and a server policy with `d` on the ref removes the ref.
 #[test]
 fn a_delete_of_a_destination_of_64_lowercase_hex_characters_removes_the_ref() {
     let pair = Pair::new("hex-delete", RepoMode::Archive, RepoMode::Archive, "");
@@ -1061,13 +1055,7 @@ fn a_delete_of_a_destination_of_64_lowercase_hex_characters_removes_the_ref() {
     let path = pair.server.path().join("refs/heads").join(&hex);
     assert!(path.exists());
 
-    let policy = ReceivePolicy {
-        default_rule: ReceiveRule {
-            allow_delete: true,
-            ..ReceiveRule::default()
-        },
-        ..ReceivePolicy::default()
-    };
+    let policy = policy_allowing(&["rwd:**"]);
     let (report, outcome) = push_under(&pair, opts(&[&format!(":{hex}")]), &policy, |_| {});
     report.unwrap();
     let outcome = outcome.unwrap();

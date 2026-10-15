@@ -123,7 +123,16 @@ impl Repo {
     /// A `Hello` with `one-way` true is `protocol`. It opens a one-way stream,
     /// which [`Repo::receive_stream`] reads. Then the session runs the checks
     /// of [`check_hello`](super::ReceiveService::check_hello), in the order
-    /// that it states. All these checks run before the transaction opens.
+    /// that it states. Then it runs the checks of `policy`, which are
+    /// `ref-denied`:
+    ///
+    /// - The policy opens no push session: no allow item has `w`, `c`, `t`,
+    ///   or `d`.
+    /// - A ref of `Hello` is a remote ref `REMOTE:NAME`.
+    /// - A ref of `Hello` has no `r` in the
+    ///   [rights](super::ReceivePolicy::rights) of the policy.
+    ///
+    /// All these checks run before the transaction opens.
     ///
     /// After the checks, the session opens a transaction. The transaction
     /// holds the repository lock shared until the session ends with no
@@ -157,12 +166,14 @@ impl Repo {
     /// 2. The size of `CommitReply` (`limit-exceeded`).
     /// 3. Each detached metadata object belongs to a commit of the session
     ///    (`protocol`).
-    /// 4. The rule of each update (`ref-denied`).
+    /// 4. The rights of each update (`ref-denied`): an update that writes a
+    ///    commit needs `w` or `t`. An update of `ostree-metadata` in a
+    ///    repository with a collection id is refused.
     /// 5. Each new commit, and the tree of each commit of the session, is
     ///    complete (`missing-objects`).
     /// 6. The ref binding and the collection binding of each new commit
     ///    (`binding-mismatch`).
-    /// 7. The signature verification of each rule (`signature-required`).
+    /// 7. The signature verification of the policy (`signature-required`).
     ///
     /// [`ReceiveService::commit`](super::ReceiveService::commit) runs the same
     /// checks. The errors section of its doc states the condition of each code.
@@ -175,9 +186,9 @@ impl Repo {
     /// is a commit of the session only if an update names it.
     ///
     /// After the checks, the session makes the staged objects durable. At the
-    /// same time, it signs each new commit with each server key of the rules
-    /// of its updates, each key once. A key that already signed the commit
-    /// makes no signature.
+    /// same time, it signs each new commit with each server key of the
+    /// policy, each key once. A key that already signed the commit makes no
+    /// signature.
     ///
     /// # Under the update lock
     ///
@@ -189,8 +200,11 @@ impl Repo {
     /// - Two updates where one update names a directory of the other.
     ///
     /// The session then checks that each ref is in the state that its update
-    /// expects (`ref-mismatch`). It checks the delete rule (`delete-denied`)
-    /// and the fast-forward rule (`non-fast-forward`).
+    /// expects (`ref-mismatch`). An update with `t` and no `w` that writes a
+    /// commit to a ref that is present is also `ref-mismatch`. A delete of a
+    /// ref that is present needs `d` (`delete-denied`). A new commit must
+    /// descend from the commit of the ref (`non-fast-forward`), unless the
+    /// client sent `force` and the ref has `w` and `d`.
     ///
     /// The session merges the incoming detached metadata into the stored
     /// dicts. A stored dict can change after the read before the lock. In that

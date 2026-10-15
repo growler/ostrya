@@ -1026,15 +1026,15 @@ of a new archive repository is exactly
 `[core]\nrepo_version=1\nmode=archive-z2\n`.
 
 `ostrya-config(1)` lists each key of `config`, its type, and its default. The
-list includes the keys of the port and the receive policy groups.
+list includes the keys of the port, the client groups, and the server group.
 `conformance/cli-behavior.md`, "Signature verification during a pull", states
 what the verification keys of a remote select and how each value is spelled.
 `conformance/cli-surface.md`, "Global conventions", records the size cap that
 the port applies to `config`.
 
 `RepoConfig::auto_update_summary` reads `auto-update-summary` and
-`commit-update-summary` together. Its callers in the port are the receive
-policy readers, `ReceivePolicy::from_config` and `ReceivePolicy::from_file`.
+`commit-update-summary` together. Its caller in the port is the reader of the
+receive policies, `ReceivePolicies::from_config`.
 `conformance/cli-surface.md`, "P2", `commit`, records the effect of the two
 keys on a commit.
 
@@ -2403,7 +2403,7 @@ the bytes on the wire or on disk can verify each fact.
 The part holds these items:
 
 - the config keys of the port;
-- the ref patterns of the receive policy and of the ref listing;
+- the ref patterns of the client groups and of the ref listing;
 - the push protocol and the pull protocol, over HTTP and over a byte stream;
 - the ref listing;
 - the endpoints of `ostrya serve`;
@@ -2419,42 +2419,45 @@ version. The pull over HTTP sends no version message.
 
 ## Configuration keys of the port
 
-The `[ex-ostrya]` group, the receive groups, and seven keys of a
-`[remote "NAME"]` group are extensions of the port. The seven keys are
-`push-url`, `ssh-command`, `receive-command`, `push-token-file`, `push-user`,
-`pull-url`, and `send-command`. The `ostree` tool defines none of them and
-reads none. `ostrya-config(1)` states each key, its type, its default, its
-precedence, each refusal, and the operations that read it. "EXTENSION KEYS"
-and "RECEIVE POLICY" state the groups, and "REMOTE KEYS" states the keys of a
+The `[ex-ostrya]` group, the server group, the client groups, the trust
+groups, the key groups, and seven keys of a `[remote "NAME"]` group are
+extensions of the port. The seven keys are `push-url`, `ssh-command`,
+`receive-command`, `push-token-file`, `push-user`, `pull-url`, and
+`send-command`. The `ostree` tool defines none of them and reads none.
+`ostrya-config(1)` states each key, its type, its default, its precedence,
+each refusal, and the operations that read it. "EXTENSION KEYS" and "CLIENT
+AND SERVER GROUPS" state the groups, and "REMOTE KEYS" states the keys of a
 remote. "The push token file of a client" states the grammar of the file that
 `push-token-file` names.
 
-The receive path of a server reads the receive groups from `<repo>/config`, or
-from a policy file. In both cases, it reads
+The receive path of a server reads the client groups, the server group, the
+trust groups, and the key groups from `<repo>/config`. It also reads
 `[ex-ostrya] detached-metadata-exclude` and `[core] auto-update-summary` from
 `<repo>/config`.
 
 The tool gives a quote no meaning in a group name, so the port splits the name
-of a receive group itself. The default group has the exact name
-`ex-ostrya receive`. The name of each other receive group starts with one of
-the literal prefixes `ex-ostrya receive "`, `ex-ostrya trust "`, and
-`ex-ostrya key "`, with one space between the words. After the prefix, the
-quoted part and a `"` end the name. `ostrya-config(1)`, "RECEIVE POLICY",
-states the refusals of a group name. "Receive patterns" states the grammar of
-the pattern of a receive group.
+of a group itself. The server group has the exact name `ex-ostrya server`. The
+name of each other group starts with one of the literal prefixes
+`ex-ostrya client "`, `ex-ostrya trust "`, and `ex-ostrya key "`, with one
+space between the words. After the prefix, the quoted part and a `"` end the
+name. The port refuses each other group name that starts with `ex-ostrya `,
+and it refuses `[ex-ostrya receive]` and `[ex-ostrya receive "PATTERN"]` with a
+message that names `[ex-ostrya client "NAME"]`. `ostrya-config(1)`, "CLIENT AND
+SERVER GROUPS", states the refusals of a group name. "Ref patterns" states the
+grammar of a pattern of an allow item and of a deny item.
 
 No key changes the encoding or the checksum of an object. Some keys change
 which bytes a repository holds:
 
-- `detached-metadata-exclude` and the rule key `sign` of a receive group
-  change the bytes of a `.commitmeta` file.
+- `detached-metadata-exclude` and the key `sign` of a client group change
+  the bytes of a `.commitmeta` file.
 - `gc-root-metadata-keys` changes which objects a prune keeps.
 
 The commit checksum does not cover detached metadata, so these keys change no
 commit checksum.
 
-Observed behavior: the tool keeps the `[ex-ostrya]` group and the receive
-groups, and ignores them.
+Observed behavior: the tool keeps the `[ex-ostrya]` group and the groups
+whose names start with `ex-ostrya `, and ignores them.
 
 - `commit` and `prune --refs-only` exit 0 and act as they do without the
   groups.
@@ -2463,7 +2466,7 @@ groups, and ignores them.
 - `config get` (dotted and with `--group`), `config set`, `remote list`, and
   `remote list -u` exit 0. `config get` prints a value as written, for example
   the list `app.roots;app.other;`. `config set` keeps each group and its keys in
-  order. `remote list` shows no receive group as a remote.
+  order. `remote list` shows no such group as a remote.
 - Dotted `config get` splits `GROUP.KEY` at the first `.`
   (`conformance/cli-behavior.md`, "`config get`"). So
   `config --group=GROUP get KEY` reads a key of a group whose pattern holds a
@@ -2499,11 +2502,12 @@ at a remote with no `url`.
 
 ## Ref patterns
 
-The port selects refs by name with two grammars. A receive pattern names the
-refs of one receive rule. A ref selector selects the refs of a ref listing. The
-two grammars share the part grammar. A receive pattern has no negative form:
-it refuses `!` at its start and in its name part. An entry of a ref selector
-takes one leading `!`.
+The port selects refs by name with two grammars. A pattern of a client group
+names the refs of an allow item or a deny item ("Access modes and patterns" of
+`ostrya-config(1)`). A ref selector selects the refs of a ref listing. The two
+grammars share the part grammar. A pattern of a client group is one pattern of
+the part grammar, with no remote part and no negative form. An entry of a ref
+selector takes one leading `!`.
 
 ### The part grammar
 
@@ -2527,56 +2531,6 @@ not match `apps/db`.
 A match compares parts. It does not check that the name passes the ref-name
 rule. The cost of one match is at most the number of pattern parts times the
 number of name parts.
-
-### Receive patterns
-
-`PATTERN` of a receive group has an optional remote part and a name part. The
-name part follows "The part grammar". `PATTERN` has one of these forms:
-
-- `NAME` -- the local refs that the name part `NAME` matches.
-- `REMOTE:NAME` -- the remote refs of the remote `REMOTE` that `NAME`
-  matches.
-- `*:NAME` -- the remote refs of every remote that `NAME` matches.
-
-For example, `central:**` selects every ref of the remote `central`.
-
-`REMOTE` is one component of a path. It is not empty, it is not `.` or `..`,
-and it holds no `/`, no NUL, and no `*`. The reader refuses these patterns:
-
-- a pattern with a `!` at the start or in the name part;
-- a pattern with a `*` in the remote part other than the whole part `*`;
-- a pattern with a `*` in the name part other than a whole part `*` or `**`;
-- an empty pattern, a pattern with an empty part, and a pattern with a `:` in
-  the name part;
-- a pattern with a control character;
-- a pattern with a literal part that fails the ref-name rule, for example a
-  part with a space or a part that starts with `-`.
-
-A `!` in the remote part, at a place other than the start of the pattern,
-follows the component rule of the remote part.
-
-The pattern splits at its first `:`, so the remote part holds no `:`. The
-reader accepts a remote part that the ref-name rule refuses, for example `o r`.
-A rule with such a remote part matches no update, because the server refuses
-the ref name of the update first ("Commit and CommitReply", check 1).
-
-The server selects one rule for each ref update:
-
-1. A remote ref matches only a pattern with a remote part, and a local ref
-   only a pattern without one.
-2. A literal remote part has precedence over `*:`.
-3. The kinds of the parts of the name part compare from the left. At the first
-   part where two patterns differ in kind, a literal has precedence over `*`,
-   and `*` has precedence over `**`. If the kind list of one pattern is a
-   leading run of the kind list of the other, the longer pattern has
-   precedence. The text of a literal part has no effect on precedence. If the
-   two kind lists are equal, the first rule in the file applies.
-4. A local ref that no pattern matches gets the default rule. The server
-   refuses a remote ref that no pattern matches with `ref-denied`.
-
-For example, on the ref `p/x/y`, the kind list of `**/y` is `**`, literal. The
-kind list of `**/x/**` is `**`, literal, `**`. The first list is a leading run
-of the second, so `**/x/**` has precedence.
 
 ### Ref selectors
 
@@ -2836,16 +2790,20 @@ give the condition of each refusal.
   a listing, or a session is over its limit.
 - `checksum-mismatch` -- the bytes of an object do not hash to its name.
 - `mode-refused` -- the repository mode cannot store the content, or the
-  policy does not allow privileged content.
+  client group does not allow privileged content.
 - `missing-objects` -- a commit reaches objects that the server does not hold.
-- `ref-mismatch` -- a ref is not in the state that its update expects.
+- `ref-mismatch` -- a ref is not in the state that its update expects, or an
+  update with `t` and no `w` writes a commit to a ref that exists.
 - `non-fast-forward` -- the new commit does not descend from the commit of the
-  ref, and the rule does not allow it.
-- `delete-denied` -- the rule does not allow the delete of a ref.
+  ref, and the client group or the request does not allow it.
+- `delete-denied` -- the client group has no `d` on a ref that an update
+  deletes.
 - `invalid-ref` -- the server refuses a ref name.
-- `ref-denied` -- no rule of the receive policy accepts a ref update.
-- `signature-required` -- a commit has no trusted signature that verifies, and
-  the rule requires one.
+- `ref-denied` -- the client group opens no push session, a ref of `Hello`
+  has no `r`, an update writes a commit without `w` or `t`, or an update names
+  a ref that a push does not write.
+- `signature-required` -- a commit has a signature that does not verify, or
+  has no signature and the client group requires one.
 - `binding-mismatch` -- the ref binding of a commit does not name its target
   ref, or its collection binding does not name the server collection id.
 - `internal` -- a failure on the server side, for example an I/O error.
@@ -2918,9 +2876,26 @@ The server runs these checks of `Hello` in this order. The checks do no I/O:
 6. A `HelloReply` with a commit for each ref that needs a frame over 1 MiB is
    `limit-exceeded`.
 
-A `Hello` with no ref, and a `Hello` that names one ref two times, pass these
-checks. A session whose `Hello` names no ref cannot commit, because `Commit`
-names refs of `Hello` alone (check 1 of "Commit and CommitReply").
+Then the server runs the checks of the client group of the session. They do
+no I/O, and each failure is `ref-denied`:
+
+7. A client group with no allow item that has `w`, `c`, `t`, or `d` opens no
+   push session.
+8. A remote ref `REMOTE:NAME` in `Hello` is refused, because a push writes no
+   remote ref.
+9. A ref of `Hello` needs `r` in the effective rights of the group
+   (`ostrya-config(1)`, "Access modes and patterns"). `d` does not add `r`.
+
+`ostrya receive` and `ostrya serve` select no client group, so a session of
+them opens no push session. `ostrya receive` answers `Hello` with
+`ref-denied`. `ostrya serve` answers the `session` request with 403
+("Authentication of the receive endpoint").
+
+A `Hello` with no ref, and a `Hello` that names one ref two times, pass
+checks 1 to 6. A `Hello` with no ref also passes checks 8 and 9, so a client
+group that opens a push session accepts it. A session whose `Hello` names no
+ref cannot commit, because `Commit` names refs of `Hello` alone (check 1 of
+"Commit and CommitReply").
 
 Then the server opens the transaction of the session, and the transaction
 takes the repository lock shared ("Locks and on-disk state of a receive"). A
@@ -2993,8 +2968,8 @@ object:
   - a file or a dirmeta with a `security.capability` or `security.selinux`
     xattr.
 
-  The session key `allow-privileged` of `[ex-ostrya receive]` turns this
-  check off (`ostrya-config(1)`, "Session keys").
+  The key `allow-privileged` of the client group turns this check off
+  (`ostrya-config(1)`, "Client keys").
 - In a `bare-user-only` repository, a file that the canonical rule of the mode
   does not allow is `mode-refused` ("Repository modes and on-disk storage").
 - An I/O error of the operating system is `internal`. An object that the
@@ -3036,11 +3011,13 @@ the session, and the session writes nothing:
    update, that needs a frame over 1 MiB is `limit-exceeded`.
 3. A detached metadata dict for a commit that the session did not stage and
    that no update names as `new` is `protocol`.
-4. The server selects the rule of each update ("Receive patterns"). These
-   updates are `ref-denied`:
+4. The server reads the effective rights of the ref of each update in the
+   client group. These updates are `ref-denied`:
    - an update of `ostree-metadata` in a repository with a collection id;
-   - an update whose rule has `accept=false`;
-   - an update of a remote ref that no pattern matches.
+   - an update of a remote ref `REMOTE:NAME`;
+   - an update that writes a commit to a ref with neither `w` nor `t`.
+
+   The server checks a delete at check 11.
 5. The server reads the new commits in the order of the updates. A staged
    commit that does not parse is `protocol`, and a stored one is `internal`.
    Such a commit fails the check at once. A `new` commit that the session did
@@ -3054,33 +3031,50 @@ the session, and the session writes nothing:
 7. The bindings of each new commit must agree with the session, else
    `binding-mismatch`:
    - A non-empty `ostree.ref-binding` must hold the name of each ref that the
-     commit is the new value of. For a remote ref, the name is the part after
-     `REMOTE:`.
+     commit is the new value of. For a remote ref of a one-way stream, the
+     name is the part after `REMOTE:`.
    - If the repository has a collection id and the commit has
      `ostree.collection-binding`, the value must be that id.
    - The server does not check a binding key that the commit does not have.
-8. A new commit must pass the signature verification of the rule of each
-   update that names it, else `signature-required`. The verification reads
-   the stored detached metadata of the commit and the incoming dict together,
-   before the `detached-metadata-exclude` filter of step 9.
+8. A new commit must pass the signature verification of the client group,
+   else `signature-required`. The verification reads the stored detached
+   metadata of the commit and the incoming dict together, before the
+   `detached-metadata-exclude` filter of step 9. A group with no `verify`
+   checks no signature. A group with `verify=trust:NAME` checks each axis of
+   the trust group. With `allow-unsigned=true`, a commit whose dict holds no
+   blob under `ostree.gpgsigs`, `ostree.sign.ed25519`, `ostree.sign.spki`, and
+   `ostree.sign.dummy` passes. A commit with a blob under one of these keys
+   must pass the check, so a signature of an engine that the trust group does
+   not read fails.
 9. The server applies the `detached-metadata-exclude` filter, makes the
-   staged objects durable, and signs each new commit with the keys of the
-   rule key `sign`. It walks the history of each update that needs the
-   fast-forward check. A host application is a program that embeds the
-   receive path of the port. Its hook before the update can refuse with
-   `ref-denied` or `internal`.
+   staged objects durable, and signs each new commit one time with each key
+   of the key `sign` of the client group. It walks the history of each update
+   that needs the fast-forward check. The walk starts at the new commit and
+   follows the parents until it reaches the commit of the ref, an absent
+   commit, or a root commit. An update of an absent ref needs no walk, so the
+   parent chain of a new branch can stop at any depth. With `force` in the
+   request and `w` and `d` on the ref, no walk runs. With `t` and no `w` on
+   the ref, no walk runs: check 11 refuses the update if the ref is present.
+   A host application is a program that embeds the receive path of the port.
+   Its hook before the update can refuse with `ref-denied` or `internal`.
 10. The server takes the update lock and reads the refs again. These are
     `ref-denied`:
     - a ref that is an alias;
     - a ref path that a ref write cannot replace;
     - two updates that write a commit, where one names a directory of the
       other.
-11. For each update: a ref that is not in the expected state is
-    `ref-mismatch`, with `ref` and `current`. A delete of a ref that is
-    present is `delete-denied` unless the rule has `allow-delete`. A new
-    commit that does not descend from the commit of the ref is
-    `non-fast-forward`. With `force` in the request and
-    `allow-non-fast-forward` in the rule, this last check does not run.
+11. For each update, in this order:
+    - A ref that is not in the expected state is `ref-mismatch`, with `ref`
+      and `current`.
+    - An update that writes a commit to a ref that is present, with `t` and
+      no `w` on the ref, is `ref-mismatch`, with `ref` and `current`. This
+      applies also when the commit is the current commit.
+    - A delete of a ref that is present is `delete-denied` unless the ref has
+      `d`. A delete of an absent ref changes nothing.
+    - A new commit whose parent chain stops at an absent commit or a root
+      commit before it reaches the commit of the ref is `non-fast-forward`.
+      With `force` in the request and `w` and `d` on the ref, this check does
+      not run.
 12. A merged detached metadata dict larger than 128 MiB is `limit-exceeded`.
     The hooks of a host application can add entries to the dict. Their merge
     can give this error before the update lock, at step 9. Then the server
@@ -3137,8 +3131,8 @@ that a receive uses. A receive uses them in this order:
 5. The server removes `state/<commit>.commitpartial` of each commit of the
    session.
 6. If the policy regenerates the summary and a ref changed, the server builds
-   the summary. It signs the summary with each key of the session key
-   `sign-summary` of `[ex-ostrya receive]`, GPG keys first. Then it removes
+   the summary. It signs the summary with each key of `sign-summary` of
+   `[ex-ostrya server]`, GPG keys first. Then it removes
    `summary.sig`, writes `summary`, and writes `summary.sig` if
    `sign-summary` names keys. A failed build or signature leaves the old
    `summary` and `summary.sig`.
@@ -3185,7 +3179,7 @@ with no change.
 
 The server runs `Hello` checks 2, 3, and 5 of a push session ("Hello and
 HelloReply"). In place of check 1, a `Hello` with no `one-way` true is
-`protocol`. The server then opens the transaction as in a push session, with
+`protocol`. Checks 7 to 9 do not apply. The server then opens the transaction as in a push session, with
 the same config reads and the same `bare` owner check. It reads no ref of
 `Hello` and sends no `HelloReply`.
 
@@ -3196,6 +3190,16 @@ The size check of `CommitReply` (check 2 of "Commit and CommitReply")
 applies. The server runs the other `Commit` checks after the end of the
 input. A one-way stream adds no server signature, writes no anchor commit,
 and does not regenerate the summary. It calls no hook of a host application.
+
+A one-way stream keeps rules of its own, and a client group does not apply to
+it. A host application gives the rules in code. Each rule has a pattern with
+an optional remote part, so a one-way stream can write a remote ref
+`REMOTE:NAME`. A rule states if it accepts an update, the trusted keys of
+check 8, if it allows a delete, and if it allows an update that is not a
+fast-forward under `force`. Check 4 refuses an update that no rule covers
+and an update whose rule does not accept it, with `ref-denied`. Check 8 with
+trusted keys refuses a commit with no signature. Check 11 refuses a delete
+that the rule does not allow with `delete-denied`.
 
 ## The pull session over a stream
 
@@ -3541,7 +3545,8 @@ alone. If the random source fails, `POST session` gets 500 with `internal`.
 1. It reads the `Hello` frame. The whole body must arrive within the idle
    time of the endpoint, else the request gets 422 with `protocol`.
 2. A `Hello` with `one-way` true gets 422 with `protocol`.
-3. It runs the `Hello` checks of "Hello and HelloReply".
+3. It runs checks 2 to 6 of "Hello and HelloReply". Step 2 is check 1.
+   These checks do not read the client group.
 4. It takes a place in the session table. The open sessions, the sessions
    that open now, and the sessions that commit count toward the session
    limit of the endpoint. If they reach the limit, or if the endpoint stops,
@@ -3549,10 +3554,12 @@ alone. If the random source fails, `POST session` gets 500 with `internal`.
 5. It makes the session id.
 6. It gets the setup of the session from the authentication of the
    endpoint. A refusal gets 401 or 403 with `unauthorized`, and the place in
-   the table becomes free.
-7. It opens the session transaction, as "Hello and HelloReply" states. If
-   the endpoint stopped during these steps, the request gets 503 with
-   `limit-exceeded`.
+   the table becomes free. Under `ostrya serve`, a client group that opens no
+   push session gives a refusal with 403.
+7. It runs checks 7 to 9 of "Hello and HelloReply" with the client group of
+   the setup. Then it opens the session transaction, as "Hello and
+   HelloReply" states. If the endpoint stopped during these steps, the
+   request gets 503 with `limit-exceeded`.
 
 The idle time, the session limit, and `parallel-uploads` are settings of the
 endpoint. `ostrya-serve(1)` states the options that set them for
@@ -3662,6 +3669,11 @@ body.
 
 With `--client-ca`, the TLS handshake verifies a client certificate against
 the CA. A client with no certificate also connects.
+
+`ostrya serve` selects no client group, so its endpoint opens no push session.
+A `session` request that passes these rules and the checks of `Hello` gets 403
+with `unauthorized` and the message
+`the policy of the server opens no push session`.
 
 Each 401 of `ostrya serve` carries two headers:
 `WWW-Authenticate: Bearer realm="ostrya"` and
@@ -3837,8 +3849,9 @@ committed, `ostrya receive` writes one `warning: STEP: MESSAGE` line.
 - `ostrya send` exits 0 when its input ends at a frame boundary. It exits 1
   in each other case.
 
-`ostrya receive` reads the receive policy before it reads `Hello`. If the
-policy does not load, it writes no frame and exits 1. The exit closes the
+`ostrya receive` reads the client groups, the server group, the trust groups,
+and the key groups before it reads `Hello`. If a group does not load, it writes
+no frame and exits 1. The exit closes the
 standard output, so the client reads the end of the stream with no `Error`
 frame.
 

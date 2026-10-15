@@ -14,7 +14,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use common::receive::{
-    Obj, connect, fixture_objects, new_repo, returned_code, session, sha, staging_entries,
+    Obj, connect, fixture_objects, new_repo, policy_allowing, returned_code, session, sha,
+    staging_entries,
 };
 use common::{
     COMMIT, GUARD_RELEASING_MARKER, ROOT_DIRMETA, ROOT_DIRTREE, TmpDir, file_inventory,
@@ -26,9 +27,8 @@ use ostrya::remote::{Encoding, ErrorCode, Expected, RefOutcome, RefUpdate};
 use ostrya::sign::append_signature;
 use ostrya::{
     Checksum, Commit, DictBuilder, Ed25519Signer, Ed25519Verifier, Error, FsckOptions, ObjectName,
-    ObjectType, ReceivePattern, ReceivePolicy, ReceiveReport, ReceiveRule, ReceiveStep,
-    ReceiveVerify, Repo, RepoMode, ServerSigner, Signer, Summary, SummaryOptions, TrustedKeys,
-    Type, Value, Verifier,
+    ObjectType, ReceivePolicies, ReceivePolicy, ReceiveReport, ReceiveStep, ReceiveVerify, Repo,
+    RepoMode, ServerSigner, Signer, Summary, SummaryOptions, TrustedKeys, Type, Value, Verifier,
 };
 use ostrya_rt::block_on;
 
@@ -284,16 +284,22 @@ fn ref_file(repo: &Repo, relpath: &str) -> Option<String> {
     std::fs::read_to_string(repo.path().join(relpath)).ok()
 }
 
+/// A policy that writes a commit to each ref as a fast-forward.
 fn policy() -> ReceivePolicy {
-    ReceivePolicy::default()
+    policy_allowing(&["w:**"])
 }
 
-/// A policy whose one pattern rule is `rule` under `pattern`.
-fn policy_with(pattern: &str, rule: ReceiveRule) -> ReceivePolicy {
-    ReceivePolicy {
-        rules: vec![(ReceivePattern::parse(pattern).unwrap(), rule)],
-        ..ReceivePolicy::default()
-    }
+/// Runs a session that sends `Hello` with `names` and reads the `Error` that
+/// the server answers.
+fn hello_refused(repo: &Repo, policy: &ReceivePolicy, names: &[&str]) -> ErrorMessage {
+    let names: Vec<String> = names.iter().map(|&n| n.into()).collect();
+    let (result, error) = session(repo, policy, |mut c| async move {
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        c.hello(&names).await.unwrap();
+        c.error().await
+    });
+    assert_eq!(returned_code(&result), Some(error.code), "{error:?}");
+    error
 }
 
 /// A repository with the fixture commit on `test/main`, pushed through a
@@ -645,7 +651,7 @@ fn the_filter_removes_its_keys_from_the_incoming_dict() {
     dict.insert_str("dropped", "b");
     let policy = ReceivePolicy {
         detached_metadata_filter: Some(ostrya::DetachedMetadataFilter::excluding(["dropped"])),
-        ..ReceivePolicy::default()
+        ..policy()
     };
     committed(push(
         &repo,
@@ -671,50 +677,74 @@ fn the_filter_removes_its_keys_from_the_incoming_dict() {
     assert_eq!(keys, vec!["kept"]);
 }
 
-/// Under a rule for `origin:**`, an update of `origin:test/main` writes
-/// `refs/remotes/origin/test/main`, and the binding check compares
-/// `test/main`.
+/// A push session writes no remote ref. A `Hello` that names a remote ref is
+/// `ref-denied`, also under an allow item that matches each ref, and the
+/// session opens no transaction.
 #[test]
-fn a_remote_rule_writes_refs_remotes_and_binds_the_name() {
+fn a_remote_ref_is_ref_denied_at_hello() {
     let tmp = TmpDir::new("recv-remote");
     let repo = new_repo(&tmp, RepoMode::Archive, "");
-    let policy = policy_with("origin:**", ReceiveRule::default());
     let before = snapshot(&repo);
-    let error = refused(
-        push(
-            &repo,
-            &policy,
-            &fixture_objects(Encoding::Raw),
-            &[],
-            vec![update(
-                "origin:other",
-                Expected::Absent,
-                Some(fixture_commit()),
-            )],
-            false,
-        ),
-        ErrorCode::BindingMismatch,
-    );
-    assert!(error.message.contains("'other'"), "{error:?}");
-    assert_unchanged(&repo, &before);
-
-    committed(push(
+    let error = hello_refused(
         &repo,
-        &policy,
-        &fixture_objects(Encoding::Raw),
+        &policy_allowing(&["rwctd:**"]),
+        &["test/main", "origin:test/main"],
+    );
+    assert_eq!(error.code, ErrorCode::RefDenied);
+    assert!(error.message.contains("'origin:test/main'"), "{error:?}");
+    assert!(error.message.contains("remote ref"), "{error:?}");
+    assert_unchanged(&repo, &before);
+}
+
+/// `Hello` needs a policy that opens a push session, and `r` on each ref.
+/// `d` does not add `r`, and a deny item removes each mode. Each refusal is
+/// `ref-denied`, and nothing is published.
+#[test]
+fn hello_needs_a_push_mode_and_read_on_each_ref() {
+    let tmp = TmpDir::new("recv-hello-rights");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    let before = snapshot(&repo);
+    let deny = ReceivePolicy {
+        rules: ostrya::access::AccessRules {
+            deny: vec![ostrya::RefPattern::parse("test/**").unwrap()],
+            ..policy().rules
+        },
+        ..policy()
+    };
+    let cases: Vec<(ReceivePolicy, Vec<&str>, &str)> = vec![
+        (
+            ReceivePolicy::default(),
+            vec!["test/main"],
+            "opens no push session",
+        ),
+        (
+            policy_allowing(&["r:**"]),
+            vec!["test/main"],
+            "opens no push session",
+        ),
+        (policy_allowing(&["w:a"]), vec!["a", "b"], "'b'"),
+        (policy_allowing(&["d:test/main"]), vec!["test/main"], "no r"),
+        (deny, vec!["main", "test/main"], "'test/main'"),
+    ];
+    for (policy, names, needle) in cases {
+        let error = hello_refused(&repo, &policy, &names);
+        assert_eq!(error.code, ErrorCode::RefDenied, "{names:?}");
+        assert!(error.message.contains(needle), "{names:?}: {error:?}");
+        assert_unchanged(&repo, &before);
+    }
+    // `r` on a ref that the session does not write is enough for `Hello`.
+    let commit = build_commit(None, "unbound", no_metadata());
+    let mut objects = tree_objects();
+    objects.push(commit.clone());
+    committed(push_named(
+        &repo,
+        &policy_allowing(&["r:**", "w:a"]),
+        &["a".to_owned(), "b".to_owned()],
+        &objects,
         &[],
-        vec![update(
-            "origin:test/main",
-            Expected::Absent,
-            Some(fixture_commit()),
-        )],
+        vec![update("a", Expected::Absent, Some(commit.checksum))],
         false,
     ));
-    assert_eq!(
-        ref_file(&repo, "refs/remotes/origin/test/main"),
-        Some(format!("{COMMIT}\n"))
-    );
-    assert_eq!(ref_file(&repo, "refs/heads/test/main"), None);
 }
 
 // ---------------------------------------------------------------------------
@@ -798,9 +828,7 @@ fn a_name_outside_the_ref_name_rule_at_commit_is_invalid_ref() {
 
 /// A ref name of 64 lowercase hex characters passes `Hello`. A revision reads
 /// such a name as a commit checksum. An update that writes a commit to it is
-/// `invalid-ref` at `Commit`, also if `Hello` did not name it. If the name has
-/// a `REMOTE:` part, it passes the check, and the binding check of the fixture
-/// commit refuses it.
+/// `invalid-ref` at `Commit`, also if `Hello` did not name it.
 #[test]
 fn a_write_to_a_checksum_shaped_name_is_invalid_ref_at_commit() {
     let tmp = TmpDir::new("recv-hex-commit");
@@ -823,24 +851,10 @@ fn a_write_to_a_checksum_shaped_name_is_invalid_ref_at_commit() {
         assert_eq!(error.message, format!("invalid ref name '{hex}'"));
         assert_unchanged(&repo, &before);
     }
-
-    let remote = format!("origin:{hex}");
-    refused(
-        push(
-            &repo,
-            &policy_with("origin:**", ReceiveRule::default()),
-            &fixture_objects(Encoding::Raw),
-            &[],
-            vec![update(&remote, Expected::Absent, Some(fixture_commit()))],
-            false,
-        ),
-        ErrorCode::BindingMismatch,
-    );
-    assert_unchanged(&repo, &before);
 }
 
 /// A delete of a ref of 64 lowercase hex characters passes the check of the
-/// name. A rule that allows the delete removes the ref.
+/// name. A policy with `d` on the ref removes the ref.
 #[test]
 fn a_delete_of_a_checksum_shaped_name_removes_the_ref() {
     let tmp = TmpDir::new("recv-hex-delete");
@@ -849,13 +863,7 @@ fn a_delete_of_a_checksum_shaped_name_removes_the_ref() {
     block_on(repo.set_ref_immediate(&hex, Some(&fixture_commit()))).unwrap();
     let path = format!("refs/heads/{hex}");
     assert_eq!(ref_file(&repo, &path), Some(format!("{COMMIT}\n")));
-    let allow = ReceivePolicy {
-        default_rule: ReceiveRule {
-            allow_delete: true,
-            ..ReceiveRule::default()
-        },
-        ..ReceivePolicy::default()
-    };
+    let allow = policy_allowing(&["rd:**"]);
     let report = committed(push(
         &repo,
         &allow,
@@ -971,13 +979,7 @@ fn detached_metadata_for_a_commit_outside_the_session_is_protocol() {
         )],
         false,
     ));
-    let policy = policy_with(
-        "protected",
-        ReceiveRule {
-            accept: false,
-            ..ReceiveRule::default()
-        },
-    );
+    let policy = policy_allowing(&["w:free"]);
     let before = snapshot(&repo);
     let error = refused(
         push(
@@ -1088,10 +1090,9 @@ fn an_object_that_does_not_parse_is_protocol_when_staged_and_internal_when_store
     }
 }
 
-/// Each of these refs is `ref-denied`:
+/// Each of these refs is `ref-denied` at `Commit`:
 ///
-/// - a ref under a rule with `accept=false`
-/// - a remote ref that no rule covers
+/// - a ref that the update writes a commit to, with `r` and no `w` or `t`
 /// - the collection anchor ref of a repository with a collection id
 /// - a ref that is an alias
 #[test]
@@ -1101,13 +1102,8 @@ fn ref_denied_covers_each_refused_ref() {
     let mut objects = tree_objects();
     objects.push(commit.clone());
     let new = Some(commit.checksum);
-    let denied = ReceiveRule {
-        accept: false,
-        ..ReceiveRule::default()
-    };
     let cases: Vec<(&str, ReceivePolicy, &str, &str)> = vec![
-        ("", policy_with("test/**", denied), "test/main", "refuses"),
-        ("", policy(), "origin:test/main", "no rule"),
+        ("", policy_allowing(&["rd:**"]), "test/main", "no w or t"),
         (
             "collection-id=org.example.C\n",
             policy(),
@@ -1261,17 +1257,14 @@ fn a_foreign_collection_binding_is_binding_mismatch() {
     ));
 }
 
-/// A commit that carries no signature that a rule trusts is
+/// A commit that carries no signature that the policy trusts is
 /// `signature-required`. The check reads the incoming signatures and the
 /// stored ones.
 #[test]
 fn an_unsigned_commit_is_signature_required() {
     let policy = ReceivePolicy {
-        default_rule: ReceiveRule {
-            verify: ReceiveVerify::Keys(trust(SECRET_B64)),
-            ..ReceiveRule::default()
-        },
-        ..ReceivePolicy::default()
+        verify: ReceiveVerify::Keys(trust(SECRET_B64)),
+        ..policy()
     };
     let objects = fixture_objects(Encoding::Raw);
     let payload = &objects
@@ -1330,7 +1323,7 @@ fn an_unsigned_commit_is_signature_required() {
         .collect();
     committed(push(
         &repo,
-        &ReceivePolicy::default(),
+        &self::policy(),
         &objects,
         &[(fixture_commit(), signed_dict(payload, &[SECRET_B64]))],
         vec![update(
@@ -1354,35 +1347,97 @@ fn an_unsigned_commit_is_signature_required() {
     ));
 }
 
-/// A commit that is the new value of two refs under two rules must pass the
-/// signature check of both rules. The session signs it once with each key of
-/// the `sign` lists of both rules. A second push adds no signature.
+/// With `allow_unsigned`, a commit with no signature blob passes. A signature
+/// blob under any signature key must pass the verification: a key that the
+/// trust does not hold fails, and so does a blob of an engine that the trust
+/// does not read. An empty signature list holds no blob. With no
+/// verification, a signature that does not verify passes.
 #[test]
-fn a_commit_under_two_rules_passes_both_and_gets_each_key_once() {
+fn allow_unsigned_accepts_only_a_commit_with_no_signature() {
+    let commit = build_commit(None, "unbound", no_metadata());
+    let mut objects = tree_objects();
+    objects.push(commit.clone());
+    let dict = |key: &str, blobs: Vec<Vec<u8>>| {
+        let list = Value::Array(blobs.into_iter().map(Value::Bytes).collect());
+        dict_bytes(&Value::Array(vec![Value::Tuple(vec![
+            Value::Str(key.into()),
+            Value::variant(Type::parse("aay").unwrap(), list),
+        ])]))
+    };
+    let valid = signed_dict(&commit.bytes, &[SECRET_B64]);
+    let untrusted = signed_dict(&commit.bytes, &[OTHER_SECRET_B64]);
+    let foreign = dict("ostree.sign.dummy", vec![b"dummy".to_vec()]);
+    let empty = dict(ED25519_KEY, Vec::new());
+    let keys = ReceiveVerify::Keys(trust(SECRET_B64));
+    let unsigned_ok = ReceivePolicy {
+        verify: keys.clone(),
+        allow_unsigned: true,
+        ..policy()
+    };
+    let signed_only = ReceivePolicy {
+        verify: keys,
+        ..policy()
+    };
+    let cases: Vec<(&ReceivePolicy, Option<&Vec<u8>>, bool)> = vec![
+        (&unsigned_ok, None, true),
+        (&unsigned_ok, Some(&empty), true),
+        (&unsigned_ok, Some(&valid), true),
+        (&unsigned_ok, Some(&untrusted), false),
+        (&unsigned_ok, Some(&foreign), false),
+        (&signed_only, None, false),
+        (&signed_only, Some(&empty), false),
+        (&signed_only, Some(&foreign), false),
+        (&signed_only, Some(&valid), true),
+    ];
+    for (policy, meta, accepted) in cases {
+        let tmp = TmpDir::new("recv-allow-unsigned");
+        let repo = new_repo(&tmp, RepoMode::Archive, "");
+        let before = snapshot(&repo);
+        let meta: Vec<(Checksum, Vec<u8>)> = meta
+            .map(|d| (commit.checksum, d.clone()))
+            .into_iter()
+            .collect();
+        let pushed = push(
+            &repo,
+            policy,
+            &objects,
+            &meta,
+            vec![update("main", Expected::Absent, Some(commit.checksum))],
+            false,
+        );
+        if accepted {
+            committed(pushed);
+        } else {
+            refused(pushed, ErrorCode::SignatureRequired);
+            assert_unchanged(&repo, &before);
+        }
+    }
+    // With no verification, the session checks no signature.
+    let tmp = TmpDir::new("recv-verify-off");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    committed(push(
+        &repo,
+        &policy(),
+        &objects,
+        &[(commit.checksum, untrusted)],
+        vec![update("main", Expected::Absent, Some(commit.checksum))],
+        false,
+    ));
+}
+
+/// A commit that is the new value of two refs passes the verification once
+/// and gets each server key of the policy once, also a key that the list
+/// holds two times. A second push adds no signature.
+#[test]
+fn a_commit_of_two_refs_gets_each_key_once() {
     let commit = build_commit(None, "unbound", no_metadata());
     let mut objects = tree_objects();
     objects.push(commit.clone());
     let shared = server_signer(SECOND_SERVER_SECRET_B64);
     let policy = ReceivePolicy {
-        rules: vec![
-            (
-                ReceivePattern::parse("a").unwrap(),
-                ReceiveRule {
-                    verify: ReceiveVerify::Keys(trust(SECRET_B64)),
-                    signers: vec![server_signer(SERVER_SECRET_B64), shared.clone()],
-                    ..ReceiveRule::default()
-                },
-            ),
-            (
-                ReceivePattern::parse("b").unwrap(),
-                ReceiveRule {
-                    verify: ReceiveVerify::Keys(trust(OTHER_SECRET_B64)),
-                    signers: vec![shared],
-                    ..ReceiveRule::default()
-                },
-            ),
-        ],
-        ..ReceivePolicy::default()
+        verify: ReceiveVerify::Keys(trust(SECRET_B64)),
+        signers: vec![server_signer(SERVER_SECRET_B64), shared.clone(), shared],
+        ..policy()
     };
     let updates = || {
         vec![
@@ -1390,25 +1445,23 @@ fn a_commit_under_two_rules_passes_both_and_gets_each_key_once() {
             update("b", Expected::Absent, Some(commit.checksum)),
         ]
     };
-    let tmp = TmpDir::new("recv-two-rules");
+    let tmp = TmpDir::new("recv-two-refs");
     let repo = new_repo(&tmp, RepoMode::Archive, "");
     let before = snapshot(&repo);
-    for keys in [&[SECRET_B64][..], &[OTHER_SECRET_B64][..]] {
-        let dict = signed_dict(&commit.bytes, keys);
-        refused(
-            push(
-                &repo,
-                &policy,
-                &objects,
-                &[(commit.checksum, dict)],
-                updates(),
-                false,
-            ),
-            ErrorCode::SignatureRequired,
-        );
-        assert_unchanged(&repo, &before);
-    }
-    let dict = signed_dict(&commit.bytes, &[SECRET_B64, OTHER_SECRET_B64]);
+    let dict = signed_dict(&commit.bytes, &[OTHER_SECRET_B64]);
+    refused(
+        push(
+            &repo,
+            &policy,
+            &objects,
+            &[(commit.checksum, dict)],
+            updates(),
+            false,
+        ),
+        ErrorCode::SignatureRequired,
+    );
+    assert_unchanged(&repo, &before);
+    let dict = signed_dict(&commit.bytes, &[SECRET_B64]);
     let report = committed(push(
         &repo,
         &policy,
@@ -1420,7 +1473,6 @@ fn a_commit_under_two_rules_passes_both_and_gets_each_key_once() {
     assert_eq!(report.refs.len(), 2);
     let expected = vec![
         ed25519_signature(SECRET_B64, &commit.bytes),
-        ed25519_signature(OTHER_SECRET_B64, &commit.bytes),
         ed25519_signature(SERVER_SECRET_B64, &commit.bytes),
         ed25519_signature(SECOND_SERVER_SECRET_B64, &commit.bytes),
     ];
@@ -1433,7 +1485,7 @@ fn a_commit_under_two_rules_passes_both_and_gets_each_key_once() {
     assert_eq!(
         stored(),
         expected,
-        "the client keys, then each server key once"
+        "the client key, then each server key once"
     );
 
     let again = vec![
@@ -1470,24 +1522,24 @@ fn two_key_groups_with_one_key_file_sign_once() {
             key.display()
         )
     };
-    let file = tmp.path().join("receive.conf");
-    std::fs::write(
-        &file,
-        format!(
-            "[ex-ostrya receive]\nsign=first;second\n{}{}",
-            group("first"),
-            group("second")
-        ),
-    )
-    .unwrap();
-    let policy = block_on(ReceivePolicy::from_file(&repo, &file)).unwrap();
-    assert_eq!(policy.default_rule.signers.len(), 2);
+    let config = repo.path().join("config");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(&format!(
+        "[ex-ostrya client \"c\"]\nauth=ssh:c\nallow=w:**\nsign=first;second\n{}{}",
+        group("first"),
+        group("second")
+    ));
+    std::fs::write(&config, text).unwrap();
+    let repo = block_on(Repo::open(repo.path())).unwrap();
+    let policies = block_on(ReceivePolicies::from_config(&repo)).unwrap();
+    let policy = policies.get("c").unwrap();
+    assert_eq!(policy.signers.len(), 2);
     let commit = build_commit(None, "signed once", no_metadata());
     let mut objects = tree_objects();
     objects.push(commit.clone());
     committed(push(
         &repo,
-        &policy,
+        policy,
         &objects,
         &[],
         vec![update("main", Expected::Absent, Some(commit.checksum))],
@@ -1554,26 +1606,19 @@ fn an_expected_state_that_differs_is_ref_mismatch() {
 }
 
 /// An update whose new commit does not descend from the current one is
-/// `non-fast-forward`. If the client sends `force` and the rule allows it, the
-/// update passes. A chain that reaches a commit that the repository does not
-/// hold proves no fast-forward. A child of the current commit is a
-/// fast-forward.
+/// `non-fast-forward`. With `w`, `force` does not change it, and with `wd`,
+/// an update without `force` is refused too. With `wd` and `force`, the update
+/// passes. A chain that reaches a commit that the repository does not hold
+/// proves no fast-forward. A child of the current commit is a fast-forward.
 #[test]
 fn a_non_ancestor_is_non_fast_forward() {
     let unrelated = build_commit(None, "unrelated", no_metadata());
     let orphan = build_commit(Some(sha(b"an absent parent")), "orphan", no_metadata());
     let child = build_commit(Some(fixture_commit()), "child", no_metadata());
-    let allow = ReceiveRule {
-        allow_non_fast_forward: true,
-        ..ReceiveRule::default()
-    };
+    let forced = || policy_allowing(&["wd:**"]);
     let current = Expected::Commit(fixture_commit());
     for commit in [&unrelated, &orphan] {
-        for (policy, force) in [
-            (policy_with("main", ReceiveRule::default()), false),
-            (policy_with("main", ReceiveRule::default()), true),
-            (policy_with("main", allow.clone()), false),
-        ] {
+        for (policy, force) in [(policy(), false), (policy(), true), (forced(), false)] {
             let tmp = TmpDir::new("recv-nff");
             let repo = repo_with_fixture(&tmp, RepoMode::Archive, "");
             write_ref(&repo, "main", &fixture_commit());
@@ -1606,10 +1651,10 @@ fn a_non_ancestor_is_non_fast_forward() {
             ),
             ErrorCode::NonFastForward,
         );
-        // A forced update under a rule that allows it.
+        // A forced update under `wd`.
         let report = committed(push(
             &repo,
-            &policy_with("main", allow.clone()),
+            &forced(),
             std::slice::from_ref(commit),
             &[],
             vec![update("main", current, Some(commit.checksum))],
@@ -1635,6 +1680,186 @@ fn a_non_ancestor_is_non_fast_forward() {
     );
 }
 
+/// The parent chain of a new branch can stop at any depth. On a branch that
+/// exists, a chain that reaches the current commit is a fast-forward, also
+/// when the parents before the current commit are absent.
+#[test]
+fn a_partial_history_is_a_fast_forward_when_it_reaches_the_tip() {
+    let tmp = TmpDir::new("recv-partial");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    // A commit whose parent the repository never holds.
+    let base = build_commit(Some(sha(b"an absent parent")), "base", no_metadata());
+    let mut objects = tree_objects();
+    objects.push(base.clone());
+    committed(push(
+        &repo,
+        &policy(),
+        &objects,
+        &[],
+        vec![update("main", Expected::Absent, Some(base.checksum))],
+        false,
+    ));
+    // A chain of two commits on top of it. The session sends both.
+    let middle = build_commit(Some(base.checksum), "middle", no_metadata());
+    let top = build_commit(Some(middle.checksum), "top", no_metadata());
+    committed(push(
+        &repo,
+        &policy(),
+        &[middle.clone(), top.clone()],
+        &[],
+        vec![update(
+            "main",
+            Expected::Commit(base.checksum),
+            Some(top.checksum),
+        )],
+        false,
+    ));
+    assert_eq!(
+        ref_file(&repo, "refs/heads/main"),
+        Some(format!("{}\n", top.checksum))
+    );
+    // A chain that stops at an absent commit before the tip is refused.
+    let stray = build_commit(Some(sha(b"another absent parent")), "stray", no_metadata());
+    let before = snapshot(&repo);
+    refused(
+        push(
+            &repo,
+            &policy(),
+            std::slice::from_ref(&stray),
+            &[],
+            vec![update("main", Expected::Any, Some(stray.checksum))],
+            false,
+        ),
+        ErrorCode::NonFastForward,
+    );
+    assert_unchanged(&repo, &before);
+}
+
+/// A tag is a ref that an update creates and does not move. With `t` and no
+/// `w`, an update creates an absent ref. A write to the ref after that is
+/// `ref-mismatch` in each expected state, also with the current commit. With
+/// `w` and `t`, the update moves the ref.
+#[test]
+fn t_creates_a_ref_and_never_moves_it() {
+    let tmp = TmpDir::new("recv-tag");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    let tag = policy_allowing(&["t:tags/**"]);
+    let first = build_commit(None, "first", no_metadata());
+    let second = build_commit(Some(first.checksum), "second", no_metadata());
+    let mut objects = tree_objects();
+    objects.push(first.clone());
+    committed(push(
+        &repo,
+        &tag,
+        &objects,
+        &[],
+        vec![update("tags/v1", Expected::Absent, Some(first.checksum))],
+        false,
+    ));
+    let before = snapshot(&repo);
+    let current = Expected::Commit(first.checksum);
+    for (expected, new) in [
+        (current, &first),
+        (Expected::Any, &first),
+        (current, &second),
+        (Expected::Any, &second),
+    ] {
+        let error = refused(
+            push(
+                &repo,
+                &tag,
+                std::slice::from_ref(new),
+                &[],
+                vec![update("tags/v1", expected, Some(new.checksum))],
+                true,
+            ),
+            ErrorCode::RefMismatch,
+        );
+        assert_eq!(
+            error.current.unwrap().commit,
+            Some(first.checksum),
+            "{expected:?}"
+        );
+        assert_unchanged(&repo, &before);
+    }
+    // `t` gives no right outside its pattern.
+    refused(
+        push(
+            &repo,
+            &policy_allowing(&["t:tags/**", "r:**"]),
+            std::slice::from_ref(&first),
+            &[],
+            vec![update("main", Expected::Absent, Some(first.checksum))],
+            false,
+        ),
+        ErrorCode::RefDenied,
+    );
+    committed(push(
+        &repo,
+        &policy_allowing(&["wt:tags/**"]),
+        std::slice::from_ref(&second),
+        &[],
+        vec![update("tags/v1", current, Some(second.checksum))],
+        false,
+    ));
+    assert_eq!(
+        ref_file(&repo, "refs/heads/tags/v1"),
+        Some(format!("{}\n", second.checksum))
+    );
+}
+
+/// An update with `t` and no `w` to a ref that is present is `ref-mismatch`
+/// with no walk of the parent chain. The parent of the new commit is a stored
+/// commit that does not parse: a walk reads it and fails with `internal`, as
+/// the same update with `wt` shows.
+#[test]
+fn t_refuses_a_present_ref_with_no_walk_of_the_parent_chain() {
+    let tmp = TmpDir::new("recv-tag-walk");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    let first = build_commit(None, "first", no_metadata());
+    let mut objects = tree_objects();
+    objects.push(first.clone());
+    committed(push(
+        &repo,
+        &policy_allowing(&["t:tags/**"]),
+        &objects,
+        &[],
+        vec![update("tags/v1", Expected::Absent, Some(first.checksum))],
+        false,
+    ));
+    let garbage = b"not a gvariant commit".to_vec();
+    let bad = sha(&garbage);
+    plant_object(&repo, ObjectType::Commit, &bad, &garbage);
+    let top = build_commit(Some(bad), "top", no_metadata());
+    let before = snapshot(&repo);
+    let error = refused(
+        push(
+            &repo,
+            &policy_allowing(&["t:tags/**"]),
+            std::slice::from_ref(&top),
+            &[],
+            vec![update("tags/v1", Expected::Any, Some(top.checksum))],
+            false,
+        ),
+        ErrorCode::RefMismatch,
+    );
+    assert_eq!(error.current.unwrap().commit, Some(first.checksum));
+    assert_unchanged(&repo, &before);
+    let error = refused(
+        push(
+            &repo,
+            &policy_allowing(&["wt:tags/**"]),
+            std::slice::from_ref(&top),
+            &[],
+            vec![update("tags/v1", Expected::Any, Some(top.checksum))],
+            false,
+        ),
+        ErrorCode::Internal,
+    );
+    assert!(error.message.contains("does not parse"), "{error:?}");
+    assert_unchanged(&repo, &before);
+}
+
 fn write_ref(repo: &Repo, name: &str, commit: &Checksum) {
     std::fs::write(
         repo.path().join("refs/heads").join(name),
@@ -1643,8 +1868,9 @@ fn write_ref(repo: &Repo, name: &str, commit: &Checksum) {
     .unwrap();
 }
 
-/// A delete that the rule does not allow is `delete-denied`. A rule that allows
-/// it deletes the ref. A delete of an absent ref changes nothing.
+/// A delete of a ref that is present needs `d`, else it is `delete-denied`.
+/// A policy with `r` and `d` deletes the ref. A delete of an absent ref changes
+/// nothing.
 #[test]
 fn a_delete_the_rule_refuses_is_delete_denied() {
     let tmp = TmpDir::new("recv-delete");
@@ -1682,16 +1908,9 @@ fn a_delete_the_rule_refuses_is_delete_denied() {
     );
     assert_eq!(snapshot(&repo), before);
 
-    let allow = ReceivePolicy {
-        default_rule: ReceiveRule {
-            allow_delete: true,
-            ..ReceiveRule::default()
-        },
-        ..ReceivePolicy::default()
-    };
     let report = committed(push(
         &repo,
-        &allow,
+        &policy_allowing(&["rd:test/**"]),
         &[],
         &[],
         vec![update("test/main", current, None)],
@@ -1835,7 +2054,7 @@ fn a_session_waits_for_a_guard_of_another_process() {
 fn summary_policy() -> ReceivePolicy {
     ReceivePolicy {
         update_summary: true,
-        ..ReceivePolicy::default()
+        ..policy()
     }
 }
 
@@ -2004,11 +2223,8 @@ fn two_pushes_with_a_gpg_server_key_leave_one_server_signature() {
     );
     let signer = ostrya::GpgSigner::new("server@example.org").with_homedir(&home.dir);
     let policy = ReceivePolicy {
-        default_rule: ReceiveRule {
-            signers: vec![Arc::new(block_on(ServerSigner::gpg(signer)).unwrap())],
-            ..ReceiveRule::default()
-        },
-        ..ReceivePolicy::default()
+        signers: vec![Arc::new(block_on(ServerSigner::gpg(signer)).unwrap())],
+        ..policy()
     };
     let repo = new_repo(&tmp, RepoMode::Archive, "");
     committed(push(
@@ -2054,7 +2270,7 @@ fn summary_is_regenerated_and_signed_from_the_built_bytes() {
             server_signer(SERVER_SECRET_B64),
             server_signer(SECOND_SERVER_SECRET_B64),
         ],
-        ..ReceivePolicy::default()
+        ..policy()
     };
     let report = committed(push(
         &repo,
@@ -2102,7 +2318,7 @@ fn summary_is_regenerated_and_signed_from_the_built_bytes() {
     // signatures.
     let unsigned = ReceivePolicy {
         update_summary: true,
-        ..ReceivePolicy::default()
+        ..policy()
     };
     let other = build_commit(None, "other", no_metadata());
     committed(push(
@@ -2128,7 +2344,7 @@ fn a_summary_failure_is_reported_and_the_refs_stay() {
     std::fs::create_dir(repo.path().join("summary")).unwrap();
     let policy = ReceivePolicy {
         update_summary: true,
-        ..ReceivePolicy::default()
+        ..policy()
     };
     let report = committed(push(
         &repo,
@@ -2166,7 +2382,7 @@ fn a_collection_repo_writes_the_anchor_in_the_session() {
     let repo = new_repo(&tmp, RepoMode::Archive, "collection-id=org.example.C\n");
     let policy = ReceivePolicy {
         update_summary: true,
-        ..ReceivePolicy::default()
+        ..policy()
     };
     let report = committed(push(
         &repo,
@@ -2226,7 +2442,7 @@ fn an_anchor_failure_is_internal() {
     let before = snapshot(&repo);
     let policy = ReceivePolicy {
         update_summary: true,
-        ..ReceivePolicy::default()
+        ..policy()
     };
     let error = refused(
         push(

@@ -62,7 +62,8 @@ impl fmt::Debug for ServerTls {
 ///
 /// The server runs the receive endpoint with built-in authentication methods.
 /// Each session gets the policy of [`receive`](ServeOptions::receive) and no
-/// hooks. The methods are:
+/// hooks. If that policy opens no push session, each `session` request that
+/// passes the authentication gets 403. The methods are:
 ///
 /// - A bearer token, `Authorization: Bearer TOKEN`. It matches a line of
 ///   [`credentials`](ServeOptions::credentials) by the SHA-256 digest of the
@@ -151,6 +152,12 @@ pub struct ServeOptions {
     /// policy. The server does not read the policy or a repository setting of
     /// the endpoint again while it runs. A change takes effect at the next
     /// start.
+    ///
+    /// A policy with no allow item that has `w`, `c`, `t`, or `d` opens no
+    /// push session, so each `session` request gets 403. The default
+    /// [`ReceivePolicy`] is such a policy.
+    /// [`ReceivePolicies::from_config`](ostrya::ReceivePolicies::from_config)
+    /// builds the policy of each client group of the repository config.
     pub receive: Option<Arc<ReceivePolicy>>,
     /// The switch that lets a request with no credential push.
     ///

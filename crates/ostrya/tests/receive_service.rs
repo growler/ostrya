@@ -24,16 +24,14 @@ use std::time::{Duration, Instant};
 
 use common::receive::{
     Obj, PIPE_CAP, PipeReader, PipeWriter, assert_staging_removed, body, fixture_objects, header,
-    new_repo, pipe, raw_object, sha, staging_entries, write_object,
+    new_repo, pipe, policy_allowing, raw_object, sha, staging_entries, write_object,
 };
 use common::{COMMIT, TmpDir, foreign_holder, lock_holder_main};
 use futures_io::AsyncRead;
 use futures_lite::future::{poll_once, zip};
 use ostrya::remote::proto::{CommitRequest, FrameWriter, Hello, Message, ObjectHeader};
 use ostrya::remote::{self, Encoding, ErrorCode, Expected, RefOutcome, RefUpdate};
-use ostrya::{
-    Checksum, Error, ObjectName, ObjectType, ReceivePolicy, ReceiveService, Repo, RepoMode,
-};
+use ostrya::{Checksum, Error, ObjectName, ObjectType, ReceiveService, Repo, RepoMode};
 use ostrya_rt::block_on;
 
 fn hello(refs: &[&str]) -> Hello {
@@ -47,7 +45,7 @@ fn hello(refs: &[&str]) -> Hello {
 
 /// Opens a session on `repo` that runs `parallel` object streams.
 fn open(repo: &Repo, parallel: u32, refs: &[&str]) -> ReceiveService {
-    let policy = Arc::new(ReceivePolicy::default());
+    let policy = Arc::new(policy_allowing(&["w:**"]));
     let (service, reply) = block_on(ReceiveService::hello(
         repo.clone(),
         policy,
@@ -235,7 +233,7 @@ fn lock_holder_subprocess() {
 fn zero_parallel_uploads_is_invalid_input() {
     let tmp = TmpDir::new("svc-zero");
     let repo = new_repo(&tmp, RepoMode::Archive, "");
-    let policy = Arc::new(ReceivePolicy::default());
+    let policy = Arc::new(policy_allowing(&["w:**"]));
     let result = block_on(ReceiveService::hello(repo.clone(), policy, 0, hello(&[])));
     assert!(matches!(result, Err(Error::InvalidInput(_))));
     assert!(staging_entries(repo.path()).is_empty());
@@ -245,7 +243,7 @@ fn zero_parallel_uploads_is_invalid_input() {
 fn hello_refusals_keep_their_codes() {
     let tmp = TmpDir::new("svc-hello");
     let repo = new_repo(&tmp, RepoMode::Archive, "locking=false\n");
-    let policy = Arc::new(ReceivePolicy::default());
+    let policy = Arc::new(policy_allowing(&["w:**"]));
     let result = block_on(ReceiveService::hello(repo, policy.clone(), 1, hello(&[]))).map(|_| ());
     assert_eq!(code(&result), Some(ErrorCode::LockingDisabled));
 
@@ -311,7 +309,7 @@ fn check_hello_runs_its_checks_in_order() {
         code(&check(&repo, &hello(&many))),
         Some(ErrorCode::LimitExceeded)
     );
-    let policy = Arc::new(ReceivePolicy::default());
+    let policy = Arc::new(policy_allowing(&["w:**"]));
     let holder = foreign_holder(repo.path(), ".lock");
     let started = Instant::now();
     let opened = block_on(ReceiveService::hello(repo.clone(), policy, 1, hello(&many)));

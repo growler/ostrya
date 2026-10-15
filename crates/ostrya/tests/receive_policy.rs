@@ -1,10 +1,10 @@
-//! `ReceivePolicy::from_config` and `ReceivePolicy::from_file`: the receive
-//! groups, `[core] auto-update-summary`, and `detached-metadata-exclude`.
+//! `ReceivePolicies::from_config`: the receive policy of each client group,
+//! the trust groups, the key groups, `[core] auto-update-summary`, and
+//! `detached-metadata-exclude`.
 //!
-//! Each case writes one repository configuration, and a policy file where the
-//! case needs one. Then it reads the policy. The policy read refuses a
-//! malformed group with the error kind that the policy documents. Each
-//! accepted value reaches its own field alone.
+//! Each case writes one repository configuration and reads the policies. The
+//! read refuses a malformed group with the error kind that the policies
+//! document. Each accepted value reaches its own field alone.
 
 #![cfg(feature = "receive")]
 
@@ -16,9 +16,10 @@ use std::sync::Arc;
 use common::TmpDir;
 #[cfg(feature = "verify-gpg")]
 use common::receive::GnupgHome;
+use ostrya::access::AccessModes;
 use ostrya::{
-    CreateOptions, Error, ReceivePattern, ReceivePolicy, ReceiveRule, ReceiveVerify, Repo,
-    RepoMode, ServerSigner, TrustedKeys, base64,
+    CreateOptions, Error, ReceivePolicies, ReceivePolicy, ReceiveVerify, Repo, RepoMode,
+    ServerSigner, TrustedKeys, base64,
 };
 use ostrya_rt::block_on;
 
@@ -30,6 +31,9 @@ const PUBLIC_B64: &str = "wjs0bB1XL4GE6M+szm+Tryv7/Jx+iny0d3X3bJ+mUsk=";
 
 /// The header of a trust group `t` that selects ed25519, with no key.
 const TRUST_T: &str = "[ex-ostrya trust \"t\"]\nsign-verify=ed25519\n";
+
+/// A client group `c` of the local refs that pushes to each ref.
+const CLIENT_C: &str = "[ex-ostrya client \"c\"]\nauth=ssh:c\nallow=w:**\n";
 
 /// A trust group `t` that trusts [`PUBLIC_B64`], with its key.
 fn trust_t() -> String {
@@ -53,23 +57,30 @@ fn repo_with(dir: &Path, core: &str, groups: &str) -> Repo {
     })
 }
 
-/// The receive policy of a repository under `dir` whose config carries `core`
-/// and `groups`.
-fn policy_with(dir: &Path, core: &str, groups: &str) -> ostrya::Result<ReceivePolicy> {
+/// The policies of a repository under `dir` whose config carries `core` and
+/// `groups`.
+fn policy_with(dir: &Path, core: &str, groups: &str) -> ostrya::Result<ReceivePolicies> {
     let repo = repo_with(dir, core, groups);
-    block_on(ReceivePolicy::from_config(&repo))
+    block_on(ReceivePolicies::from_config(&repo))
 }
 
-/// The receive policy of `groups`, in a fresh repository.
-fn policy(groups: &str) -> ostrya::Result<ReceivePolicy> {
+/// The policies of `groups`, in a fresh repository.
+fn policy(groups: &str) -> ostrya::Result<ReceivePolicies> {
     let dir = TmpDir::new("receive-policy");
     policy_with(dir.path(), "", groups)
+}
+
+/// The policy of the group `name` of `policies`.
+fn group<'a>(policies: &'a ReceivePolicies, name: &str) -> &'a ReceivePolicy {
+    policies
+        .get(name)
+        .unwrap_or_else(|| panic!("no group {name}"))
 }
 
 /// The refusal of `groups`.
 fn refusal(groups: &str) -> Error {
     match policy(groups) {
-        Ok(policy) => panic!("the groups {groups:?} were accepted as {policy:?}"),
+        Ok(policies) => panic!("the groups {groups:?} were accepted as {policies:?}"),
         Err(err) => err,
     }
 }
@@ -82,15 +93,6 @@ fn assert_malformed(groups: &str, part: &str) {
         matches!(&err, Error::InvalidFormat(m) if m.contains(part)),
         "{groups:?}: {err}"
     );
-}
-
-/// The policy that the file `text` states, for a repository under `dir` whose
-/// config carries `groups`.
-fn file_policy(dir: &Path, groups: &str, text: &str) -> ostrya::Result<ReceivePolicy> {
-    let repo = repo_with(dir, "", groups);
-    let file = dir.join("receive.conf");
-    std::fs::write(&file, text).unwrap();
-    block_on(ReceivePolicy::from_file(&repo, &file))
 }
 
 /// A secret key file under `dir` that holds [`SECRET_B64`].
@@ -108,104 +110,132 @@ fn key_group(name: &str, file: &Path) -> String {
     )
 }
 
-/// The trusted keys of a rule, `None` for no check.
-fn keys(rule: &ReceiveRule) -> Option<&Arc<TrustedKeys>> {
-    match &rule.verify {
+/// The trusted keys of a policy, `None` for no check.
+fn keys(policy: &ReceivePolicy) -> Option<&Arc<TrustedKeys>> {
+    match &policy.verify {
         ReceiveVerify::Off => None,
         ReceiveVerify::Keys(keys) => Some(keys),
     }
 }
 
-/// The policy with no receive group is the default rule with its defaults.
+/// A config with no client group gives the policies of the two implicit
+/// groups. Each one reads each ref, opens no push session, and has the
+/// defaults of the other fields.
 #[test]
-fn no_group_gives_the_default_rule() {
-    let policy = policy("").unwrap();
-    let rule = &policy.default_rule;
-    assert!(rule.accept);
-    assert!(keys(rule).is_none());
-    assert!(!rule.allow_non_fast_forward);
-    assert!(!rule.allow_delete);
-    assert!(rule.signers.is_empty());
-    assert!(policy.rules.is_empty());
-    assert!(!policy.allow_privileged);
-    assert!(policy.summary_signers.is_empty());
-    assert!(!policy.update_summary);
-    assert!(policy.detached_metadata_filter.is_none());
-    assert!(std::ptr::eq(policy.rule_for("main").unwrap(), rule));
-    assert!(policy.rule_for("origin:main").is_none());
-}
-
-/// Each boolean rule key reaches its own field, in the default group and in a
-/// pattern group. A pattern rule takes no key from the default rule.
-#[test]
-fn each_rule_boolean_reaches_its_own_field() {
-    type Field = fn(&ReceiveRule) -> bool;
-    let fields: [(&str, bool, Field); 3] = [
-        ("accept", true, |r| r.accept),
-        ("allow-non-fast-forward", false, |r| {
-            r.allow_non_fast_forward
-        }),
-        ("allow-delete", false, |r| r.allow_delete),
-    ];
-    for (key, _, _) in &fields {
-        for (value, expected) in [("true", true), ("1", true), ("false", false), ("0", false)] {
-            // A rule that refuses its refs takes none of the other keys.
-            if !expected && *key != "accept" {
-                continue;
-            }
-            let groups =
-                format!("[ex-ostrya receive]\n{key}={value}\n[ex-ostrya receive \"apps/**\"]\n");
-            let policy = policy(&groups).unwrap();
-            let (_, pattern_rule) = &policy.rules[0];
-            for (other, default, read) in &fields {
-                let want = if other == key { expected } else { *default };
-                assert_eq!(read(&policy.default_rule), want, "{key}={value}, {other}");
-                assert_eq!(read(pattern_rule), *default, "{key}={value}, {other}");
-            }
-        }
+fn no_client_group_gives_the_implicit_policies() {
+    let policies = policy("").unwrap();
+    let names: Vec<&str> = policies
+        .access()
+        .groups()
+        .iter()
+        .map(|g| g.name())
+        .collect();
+    assert_eq!(names, ["anonymous", "anonymous-collections"]);
+    for name in names {
+        let policy = group(&policies, name);
+        assert_eq!(policy.rights("main"), AccessModes::READ, "{name}");
+        assert_eq!(policy.rights("a/b/c"), AccessModes::READ, "{name}");
+        assert!(!policy.rules.opens_push_session(), "{name}");
+        assert!(keys(policy).is_none());
+        assert!(policy.allow_unsigned);
+        assert!(policy.signers.is_empty());
+        assert!(!policy.allow_privileged);
+        assert!(policy.summary_signers.is_empty());
+        assert!(!policy.update_summary);
+        assert!(policy.detached_metadata_filter.is_none());
     }
+    assert!(policies.get("c").is_none());
 }
 
-/// The session keys reach their fields in the default group. `from_config`
-/// refuses a pattern group that states a session key.
+/// Each key of a client group reaches its own field, and `sign-summary` of
+/// the server group reaches each policy. Each other field keeps its default.
 #[test]
-fn the_session_keys_live_in_the_default_group() {
-    let dir = TmpDir::new("receive-session");
+fn each_group_key_reaches_its_own_field() {
+    let dir = TmpDir::new("receive-fields");
     let file = secret_file(dir.path());
-    let policy = policy_with(
+    let policies = policy_with(
         dir.path(),
         "",
         &format!(
-            "[ex-ostrya receive]\nallow-privileged=true\nsign-summary=k\n{}",
+            "[ex-ostrya server]\nsign-summary=k\n\
+             [ex-ostrya client \"full\"]\nauth=ssh:full\nallow=wd:apps/**;r:**\n\
+             deny=apps/secret\nverify=trust:t\nsign=k\nallow-privileged=true\n\
+             [ex-ostrya client \"plain\"]\nauth=ssh:plain\nallow=t:tags/**\n{}{}",
+            trust_t(),
             key_group("k", &file)
         ),
     )
     .unwrap();
-    assert!(policy.allow_privileged);
-    assert_eq!(policy.summary_signers.len(), 1);
+    let full = group(&policies, "full");
+    assert_eq!(full.rights("apps/a").to_string(), "rwd");
+    assert_eq!(full.rights("main").to_string(), "r");
+    assert_eq!(full.rights("apps/secret"), AccessModes::NONE);
+    assert!(keys(full).is_some());
+    assert!(!full.allow_unsigned);
+    assert_eq!(full.signers.len(), 1);
+    assert!(full.allow_privileged);
+    assert_eq!(full.summary_signers.len(), 1);
 
-    for key in ["allow-privileged=true", "sign-summary=k"] {
+    let plain = group(&policies, "plain");
+    assert_eq!(plain.rights("tags/v1").to_string(), "rt");
+    assert_eq!(plain.rights("main"), AccessModes::NONE);
+    assert!(keys(plain).is_none());
+    assert!(plain.allow_unsigned);
+    assert!(plain.signers.is_empty());
+    assert!(!plain.allow_privileged);
+    assert_eq!(plain.summary_signers.len(), 1);
+    assert!(Arc::ptr_eq(&plain.summary_signers[0], &full.signers[0]));
+}
+
+/// `allow-unsigned` defaults to false with `verify` and to true without it,
+/// and an explicit value reaches the policy.
+#[test]
+fn allow_unsigned_has_two_defaults() {
+    for (keys_text, want) in [
+        ("", true),
+        ("verify=trust:t\n", false),
+        ("verify=trust:t\nallow-unsigned=true\n", true),
+        ("verify=trust:t\nallow-unsigned=false\n", false),
+    ] {
+        let policies = policy(&format!("{CLIENT_C}{keys_text}{}", trust_t())).unwrap();
+        assert_eq!(group(&policies, "c").allow_unsigned, want, "{keys_text:?}");
+    }
+}
+
+/// The groups of the removed receive policy are refused, and the message names
+/// the client group in their place.
+#[test]
+fn the_receive_groups_are_refused() {
+    for group in ["ex-ostrya receive", "ex-ostrya receive \"apps/**\""] {
         assert_malformed(
-            &format!(
-                "[ex-ostrya receive \"main\"]\n{key}\n{}",
-                key_group("k", &file)
-            ),
-            "valid in [ex-ostrya receive] alone",
+            &format!("[{group}]\naccept=true\n{CLIENT_C}"),
+            "[ex-ostrya client \"NAME\"]",
         );
     }
+}
+
+/// A refusal of the client groups or the server group fails the read, before
+/// a key source is read.
+#[test]
+fn a_refused_client_group_fails_the_read() {
+    assert_malformed(&format!("{CLIENT_C}owner=token:x\n"), "unknown key 'owner'");
+    assert_malformed(
+        &format!(
+            "{CLIENT_C}[ex-ostrya key \"k\"]\ntype=ed25519\n\
+             secret-key-file=/nonexistent/ostrya/secret\n\
+             [ex-ostrya client \"d\"]\nauth=ssh:c\n"
+        ),
+        "their namespaces overlap",
+    );
+    assert_malformed("[ex-ostrya server]\nlisten=\n", "listen is empty");
 }
 
 /// `from_config` refuses a boolean that the key-file syntax does not read, with
 /// a key-file error.
 #[test]
 fn a_malformed_boolean_is_refused() {
-    for key in [
-        "accept",
-        "allow-non-fast-forward",
-        "allow-delete",
-        "allow-privileged",
-    ] {
-        let err = refusal(&format!("[ex-ostrya receive]\n{key}=yes\n"));
+    for key in ["allow-privileged", "allow-unsigned"] {
+        let err = refusal(&format!("{CLIENT_C}{key}=yes\n"));
         assert!(matches!(err, Error::Core(_)), "{key}: {err}");
     }
     let err = refusal("[ex-ostrya trust \"t\"]\ngpg-verify=yes\n");
@@ -230,8 +260,8 @@ fn update_summary_reads_the_core_keys() {
         ("auto-update-summary=false\n", false),
     ] {
         let dir = TmpDir::new("receive-summary");
-        let policy = policy_with(dir.path(), core, "").unwrap();
-        assert_eq!(policy.update_summary, expected, "{core:?}");
+        let policies = policy_with(dir.path(), core, CLIENT_C).unwrap();
+        assert_eq!(group(&policies, "c").update_summary, expected, "{core:?}");
     }
     let dir = TmpDir::new("receive-summary");
     let err = policy_with(dir.path(), "auto-update-summary=yes\n", "").unwrap_err();
@@ -243,92 +273,25 @@ fn update_summary_reads_the_core_keys() {
 #[test]
 fn detached_metadata_exclude_gives_the_filter() {
     let named = policy("[ex-ostrya]\ndetached-metadata-exclude=app.secret;app.other\n").unwrap();
-    assert!(named.detached_metadata_filter.is_some());
+    assert!(
+        group(&named, "anonymous")
+            .detached_metadata_filter
+            .is_some()
+    );
     let empty = policy("[ex-ostrya]\ndetached-metadata-exclude=\n").unwrap();
-    assert!(empty.detached_metadata_filter.is_none());
+    assert!(
+        group(&empty, "anonymous")
+            .detached_metadata_filter
+            .is_none()
+    );
 }
 
-/// Each pattern group becomes a rule under its pattern, in file order. Each
-/// rule selects the refs that its pattern matches.
-#[test]
-fn the_pattern_groups_become_rules() {
-    let policy = policy(
-        "[ex-ostrya receive]\naccept=false\n\
-         [ex-ostrya receive \"apps/**\"]\nallow-delete=true\n\
-         [ex-ostrya receive \"central:**\"]\n\
-         [ex-ostrya receive \"*:apps/x\"]\n",
-    )
-    .unwrap();
-    let patterns: Vec<&str> = policy.rules.iter().map(|(p, _)| p.as_str()).collect();
-    assert_eq!(patterns, ["apps/**", "central:**", "*:apps/x"]);
-    assert!(!policy.rule_for("main").unwrap().accept);
-    assert!(policy.rule_for("apps/a").unwrap().allow_delete);
-    assert!(policy.rule_for("apps/a/b").unwrap().allow_delete);
-    let central = policy.rule_for("central:apps/x").unwrap();
-    assert!(std::ptr::eq(central, &policy.rules[1].1));
-    let other = policy.rule_for("other:apps/x").unwrap();
-    assert!(std::ptr::eq(other, &policy.rules[2].1));
-    assert!(policy.rule_for("other:apps/y").is_none());
-}
-
-/// A hand-built rule takes a pattern that `ReceivePattern::parse` accepts.
-#[test]
-fn a_hand_built_policy_selects_its_rules() {
-    let policy = ReceivePolicy {
-        rules: vec![(
-            ReceivePattern::parse("*:**").unwrap(),
-            ReceiveRule {
-                allow_delete: true,
-                ..ReceiveRule::default()
-            },
-        )],
-        ..ReceivePolicy::default()
-    };
-    assert!(policy.rule_for("origin:x").unwrap().allow_delete);
-    assert!(policy.rule_for("origin:a/b").unwrap().allow_delete);
-    assert!(!policy.rule_for("x").unwrap().allow_delete);
-}
-
-/// `from_config` refuses each malformed pattern in a group name.
-#[test]
-fn a_malformed_pattern_is_refused() {
-    for pattern in [
-        "a*", "/*", "a//*", ":x", "r:", "r/x:y", "..", "a/./b", "!a", "!*:x", "r:!a", "a/b*",
-        "a/**x", "***", "a/*b", "*:a*", "r:a:b", "**:x", "*/", "a//**",
-    ] {
-        assert_malformed(
-            &format!("[ex-ostrya receive \"{pattern}\"]\n"),
-            "malformed receive pattern",
-        );
-    }
-}
-
-/// `from_config` refuses each group name that starts with `ex-ostrya ` and has
-/// no shape of a receive group. `[ex-ostrya]` keeps its keys.
-#[test]
-fn an_unknown_receive_group_is_refused() {
-    for group in [
-        "ex-ostrya bogus",
-        "ex-ostrya receive p",
-        "ex-ostrya receive \"\"",
-        "ex-ostrya receive \"a\"b\"",
-        "ex-ostrya trust",
-        "ex-ostrya key \"\"",
-    ] {
-        let err = refusal(&format!("[{group}]\n"));
-        assert!(matches!(err, Error::InvalidFormat(_)), "{group}: {err}");
-    }
-    policy("[ex-ostrya]\ngc-root-metadata-keys=app.roots\n").unwrap();
-}
-
-/// `from_config` refuses an unknown key in each receive group shape.
+/// `from_config` refuses an unknown key in a trust group and in a key group.
 #[test]
 fn an_unknown_key_is_refused() {
     let dir = TmpDir::new("receive-unknown");
     let file = secret_file(dir.path());
     for groups in [
-        "[ex-ostrya receive]\nallow-remote-refs=true\n".to_owned(),
-        "[ex-ostrya receive \"main\"]\nverfy=off\n".to_owned(),
         format!("{}gpg-verfy=true\n", trust_t()),
         format!("{}comment=x\n", key_group("k", &file)),
     ] {
@@ -336,132 +299,184 @@ fn an_unknown_key_is_refused() {
     }
 }
 
-/// The values of `verify`: `off`, `trust:NAME`, and `remote:NAME`.
-#[test]
-fn verify_reads_its_three_forms() {
-    let policy = policy(&format!(
-        "[ex-ostrya receive]\nverify=off\n\
-         [ex-ostrya receive \"a\"]\nverify=trust:t\n\
-         [ex-ostrya receive \"b\"]\nverify=remote:central\n\
-         {}\
-         [remote \"central\"]\nurl=http://localhost/\ngpg-verify=false\n\
-         sign-verify=ed25519\nverification-ed25519-key={PUBLIC_B64}\n",
-        trust_t()
-    ))
-    .unwrap();
-    assert!(keys(&policy.default_rule).is_none());
-    assert!(keys(&policy.rules[0].1).is_some());
-    assert!(keys(&policy.rules[1].1).is_some());
-}
-
-/// `from_config` refuses each malformed `verify` value.
-#[test]
-fn a_malformed_verify_is_refused() {
-    for value in [
-        "", "OFF", "true", "gpg", "ed25519", "trust:", "remote:", "trust",
-    ] {
-        assert_malformed(
-            &format!("[ex-ostrya receive]\nverify={value}\n{}", trust_t()),
-            "malformed [ex-ostrya receive] verify value",
-        );
-    }
-    // `verify` takes one value, so the `;` is part of the trust group name.
-    assert_malformed(
-        &format!(
-            "[ex-ostrya receive]\nverify=trust:t;remote:c\n{}",
-            trust_t()
-        ),
-        "names no [ex-ostrya trust \"t;remote:c\"] group",
-    );
-}
-
-/// The remote name of `verify=remote:NAME` must be one path component. If a
-/// remote section of that name exists, `from_config` still refuses the name.
-#[test]
-fn a_remote_reference_names_one_path_component() {
-    for name in ["../x", "a/b", "..", "."] {
-        assert_malformed(
-            &format!(
-                "[remote \"{name}\"]\nurl=http://localhost/\n\
-                 [ex-ostrya receive]\nverify=remote:{name}\n"
-            ),
-            "the remote name is one path component",
-        );
-    }
-}
-
-/// `from_config` refuses a reference to a group or a section that does not
-/// exist.
+/// `from_config` refuses a reference to a group that does not exist.
 #[test]
 fn a_reference_to_a_missing_group_is_refused() {
     assert_malformed(
-        "[ex-ostrya receive]\nverify=trust:nosuch\n",
+        &format!("{CLIENT_C}verify=trust:nosuch\n"),
         "names no [ex-ostrya trust \"nosuch\"] group",
     );
     assert_malformed(
-        "[ex-ostrya receive]\nverify=remote:nosuch\n",
-        "names no [remote \"nosuch\"] group",
+        &format!("{CLIENT_C}sign=nosuch\n"),
+        "no [ex-ostrya key \"nosuch\"] group exists",
     );
-    for key in ["sign", "sign-summary"] {
-        assert_malformed(
-            &format!("[ex-ostrya receive]\n{key}=nosuch\n"),
-            "no [ex-ostrya key \"nosuch\"] group exists",
-        );
+    assert_malformed(
+        "[ex-ostrya server]\nsign-summary=nosuch\n",
+        "no [ex-ostrya key \"nosuch\"] group exists",
+    );
+}
+
+/// `sign-verify=true` in a trust group names every engine of the build.
+/// `from_config` skips an engine that has no key.
+#[test]
+fn a_trust_group_takes_every_engine() {
+    let policies = policy(&format!(
+        "{CLIENT_C}verify=trust:t\n\
+         [ex-ostrya trust \"t\"]\nsign-verify=true\nverification-ed25519-key={PUBLIC_B64}\n"
+    ))
+    .unwrap();
+    assert!(keys(group(&policies, "c")).is_some());
+}
+
+/// A trust group takes a GPG axis over a keyring that holds a certificate,
+/// together with a sign-api axis.
+#[cfg(feature = "verify-gpg")]
+#[test]
+fn a_trust_group_takes_both_axes() {
+    if !common::gnupg_available(&["gpg", "gpgconf"]) {
+        return;
     }
-    // An empty element names no group either.
-    let dir = TmpDir::new("receive-empty-sign");
-    let file = secret_file(dir.path());
-    let err = policy_with(
+    let dir = TmpDir::new("receive-trust-gpg");
+    let home = GnupgHome::new(&dir.path().join("gnupg"), "Trusted <trusted@example.org>");
+    let keyring = dir.path().join("trusted.gpg");
+    std::fs::write(&keyring, home.export()).unwrap();
+    let policies = policy_with(
         dir.path(),
         "",
-        &format!("[ex-ostrya receive]\nsign=k;;\n{}", key_group("k", &file)),
+        &format!(
+            "{CLIENT_C}verify=trust:t\n\
+             [ex-ostrya trust \"t\"]\ngpg-verify=true\ngpgkeypath={}\n\
+             sign-verify=ed25519\nverification-ed25519-key={PUBLIC_B64}\n",
+            keyring.display()
+        ),
+    )
+    .unwrap();
+    let debug = format!("{:?}", keys(group(&policies, "c")).unwrap());
+    assert!(debug.contains("gpg: true"), "{debug}");
+    assert!(debug.contains("ostree.sign.ed25519"), "{debug}");
+}
+
+/// `from_config` reads an ed25519 key group. Its key signs as the server.
+#[test]
+fn an_ed25519_key_group_is_read() {
+    let dir = TmpDir::new("receive-signer");
+    let file = secret_file(dir.path());
+    let policies = policy_with(
+        dir.path(),
+        "",
+        &format!("{CLIENT_C}sign=k\n{}", key_group("k", &file)),
+    )
+    .unwrap();
+    let signers = &group(&policies, "c").signers;
+    assert_eq!(signers.len(), 1);
+    assert_eq!(signers[0].signer().name(), "ed25519");
+    let expected = ServerSigner::ed25519(&base64::decode(SECRET_B64).unwrap()).unwrap();
+    let payload = b"payload";
+    assert_eq!(
+        block_on(signers[0].signer().sign(payload)).unwrap(),
+        block_on(expected.signer().sign(payload)).unwrap(),
+        "the configured key signs"
+    );
+}
+
+/// `from_config` reads an spki key group from its base64 PKCS#8 form.
+#[cfg(feature = "sign-spki")]
+#[test]
+fn an_spki_key_group_is_read() {
+    const SECRET_PKCS8_B64: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg2L708EsnnzHER0SYasMNIUcG\
+v63QapC/3kVsoPerzKGhRANCAATxfzfHKUPeJtyLTGMUoxHhvBS1NT9guWhUQPGiZRLZIcB8Wc3\
+csdVU1iOiTRmbZGKJTtekOdEAbVRrx5HxIpst";
+    let dir = TmpDir::new("receive-signer-spki");
+    let file = dir.path().join("secret.spki");
+    std::fs::write(&file, format!("{SECRET_PKCS8_B64}\n")).unwrap();
+    let policies = policy_with(
+        dir.path(),
+        "",
+        &format!(
+            "{CLIENT_C}sign=k\n[ex-ostrya key \"k\"]\ntype=spki\nsecret-key-file={}\n",
+            file.display()
+        ),
+    )
+    .unwrap();
+    let signers = &group(&policies, "c").signers;
+    assert_eq!(signers.len(), 1);
+    assert_eq!(signers[0].signer().name(), "spki");
+}
+
+/// `from_config` reads a GPG key group. It refuses a selector that names no
+/// secret key, and the message names the group.
+#[cfg(feature = "sign-gpg")]
+#[test]
+fn a_gpg_key_group_is_read() {
+    if !common::gnupg_available(&["gpg", "gpgconf"]) {
+        return;
+    }
+    let dir = TmpDir::new("receive-gpg-signer");
+    let home = GnupgHome::new(
+        &dir.path().join("gnupg"),
+        "Receive Server <server@example.org>",
+    );
+    let file = secret_file(dir.path());
+    let policies = policy_with(
+        dir.path(),
+        "",
+        &format!(
+            "{CLIENT_C}sign=ed;gpg\n{}\
+             [ex-ostrya key \"gpg\"]\ntype=gpg\ngpg-key=server@example.org\ngpg-homedir={}\n",
+            key_group("ed", &file),
+            home.dir.display(),
+        ),
+    )
+    .unwrap();
+    let names: Vec<&str> = group(&policies, "c")
+        .signers
+        .iter()
+        .map(|s| s.signer().name())
+        .collect();
+    assert_eq!(names, ["ed25519", "gpg"]);
+
+    let dir2 = TmpDir::new("receive-gpg-signer-missing");
+    let err = policy_with(
+        dir2.path(),
+        "",
+        &format!(
+            "[ex-ostrya key \"gpg\"]\ntype=gpg\ngpg-key=nobody@example.org\ngpg-homedir={}\n",
+            home.dir.display()
+        ),
     )
     .unwrap_err();
     assert!(
-        matches!(&err, Error::InvalidFormat(m) if m.contains("key group ''")),
+        matches!(&err, Error::Signature(m)
+            if m.contains("[ex-ostrya key \"gpg\"]") && m.contains("no secret key")),
         "{err}"
     );
 }
 
-/// If a rule with `accept=false` states a key that only an accepted ref reads,
-/// `from_config` refuses the rule. The value of the key does not change the
-/// result. The session keys `allow-privileged` and `sign-summary` are not such
-/// keys.
+/// Two groups that name one key group share one signer. The summary shares
+/// that signer too. Two groups that name one trust group share its keys. If a
+/// list gives a name two times, the name counts once.
 #[test]
-fn a_refusing_rule_takes_no_accept_only_key() {
-    for key in [
-        "verify=off",
-        "sign=k",
-        "allow-non-fast-forward=false",
-        "allow-delete=true",
-    ] {
-        for group in ["ex-ostrya receive", "ex-ostrya receive \"main\""] {
-            let dir = TmpDir::new("receive-dead-keys");
-            let file = secret_file(dir.path());
-            let err = policy_with(
-                dir.path(),
-                "",
-                &format!("[{group}]\naccept=false\n{key}\n{}", key_group("k", &file)),
-            )
-            .unwrap_err();
-            assert!(
-                matches!(&err, Error::InvalidFormat(m) if m.contains("has no effect")),
-                "{group} {key}: {err}"
-            );
-        }
-    }
-    let dir = TmpDir::new("receive-dead-keys");
+fn the_groups_share_what_the_trust_and_key_groups_build() {
+    let dir = TmpDir::new("receive-share");
     let file = secret_file(dir.path());
-    let policy = policy_with(
+    let policies = policy_with(
         dir.path(),
         "",
         &format!(
-            "[ex-ostrya receive]\naccept=false\nallow-privileged=true\nsign-summary=k\n{}",
-            key_group("k", &file)
+            "[ex-ostrya server]\nsign-summary=k\n\
+             [ex-ostrya client \"a\"]\nauth=ssh:a\nallow=w:**\nsign=k;k\nverify=trust:t\n\
+             [ex-ostrya client \"b\"]\nauth=ssh:b\nallow=w:**\nsign=k\nverify=trust:t\n{}{}",
+            key_group("k", &file),
+            trust_t()
         ),
     )
     .unwrap();
-    assert!(!policy.default_rule.accept);
+    let a = group(&policies, "a");
+    let b = group(&policies, "b");
+    assert_eq!(a.signers.len(), 1);
+    assert!(Arc::ptr_eq(&a.signers[0], &b.signers[0]));
+    assert!(Arc::ptr_eq(&a.signers[0], &a.summary_signers[0]));
+    assert!(Arc::ptr_eq(keys(a).unwrap(), keys(b).unwrap()));
 }
 
 /// A trust group must turn on one axis at least. It must state no summary key.
@@ -520,18 +535,6 @@ fn a_trust_group_key_no_axis_reads_is_refused() {
     );
     #[cfg(not(feature = "sign-spki"))]
     assert!(matches!(err, Error::Unsupported(_)), "{err}");
-}
-
-/// `sign-verify=true` in a trust group names every engine of the build.
-/// `from_config` skips an engine that has no key.
-#[test]
-fn a_trust_group_takes_every_engine() {
-    let policy = policy(&format!(
-        "[ex-ostrya receive]\nverify=trust:t\n\
-         [ex-ostrya trust \"t\"]\nsign-verify=true\nverification-ed25519-key={PUBLIC_B64}\n"
-    ))
-    .unwrap();
-    assert!(keys(&policy.default_rule).is_some());
 }
 
 /// `from_config` reads the key sources of each trust group, also of a group
@@ -620,73 +623,12 @@ fn a_trust_group_gpg_axis_needs_a_certificate() {
     }
 }
 
-/// A trust group takes a GPG axis over a keyring that holds a certificate,
-/// together with a sign-api axis.
-#[cfg(feature = "verify-gpg")]
-#[test]
-fn a_trust_group_takes_both_axes() {
-    if !common::gnupg_available(&["gpg", "gpgconf"]) {
-        return;
-    }
-    let dir = TmpDir::new("receive-trust-gpg");
-    let home = GnupgHome::new(&dir.path().join("gnupg"), "Trusted <trusted@example.org>");
-    let keyring = dir.path().join("trusted.gpg");
-    std::fs::write(&keyring, home.export()).unwrap();
-    let policy = policy_with(
-        dir.path(),
-        "",
-        &format!(
-            "[ex-ostrya receive]\nverify=trust:t\n\
-             [ex-ostrya trust \"t\"]\ngpg-verify=true\ngpgkeypath={}\n\
-             sign-verify=ed25519\nverification-ed25519-key={PUBLIC_B64}\n",
-            keyring.display()
-        ),
-    )
-    .unwrap();
-    let debug = format!("{:?}", keys(&policy.default_rule).unwrap());
-    assert!(debug.contains("gpg: true"), "{debug}");
-    assert!(debug.contains("ostree.sign.ed25519"), "{debug}");
-}
-
 /// The spki engine of a trust group needs the spki engine of the build.
 #[cfg(not(feature = "sign-spki"))]
 #[test]
 fn a_trust_group_spki_axis_needs_the_engine() {
     let err = refusal("[ex-ostrya trust \"t\"]\nsign-verify=spki\nverification-spki-key=AAAA\n");
     assert!(matches!(err, Error::Unsupported(_)), "{err}");
-}
-
-/// `remote:NAME` refuses a remote whose pull turns on no check.
-#[test]
-fn a_remote_reference_turns_on_a_check() {
-    assert_malformed(
-        "[ex-ostrya receive]\nverify=remote:c\n\
-         [remote \"c\"]\nurl=http://localhost/\ngpg-verify=false\n",
-        "turns on no signature check",
-    );
-}
-
-/// `from_config` reads an ed25519 key group. Its key signs as the server.
-#[test]
-fn an_ed25519_key_group_is_read() {
-    let dir = TmpDir::new("receive-signer");
-    let file = secret_file(dir.path());
-    let policy = policy_with(
-        dir.path(),
-        "",
-        &format!("[ex-ostrya receive]\nsign=k\n{}", key_group("k", &file)),
-    )
-    .unwrap();
-    let signers = &policy.default_rule.signers;
-    assert_eq!(signers.len(), 1);
-    assert_eq!(signers[0].signer().name(), "ed25519");
-    let expected = ServerSigner::ed25519(&base64::decode(SECRET_B64).unwrap()).unwrap();
-    let payload = b"payload";
-    assert_eq!(
-        block_on(signers[0].signer().sign(payload)).unwrap(),
-        block_on(expected.signer().sign(payload)).unwrap(),
-        "the configured key signs"
-    );
 }
 
 /// `from_config` refuses each malformed key group.
@@ -756,85 +698,12 @@ fn an_spki_key_group_needs_the_engine() {
     assert!(matches!(err, Error::Unsupported(_)), "{err}");
 }
 
-/// `from_config` reads an spki key group from its base64 PKCS#8 form.
-#[cfg(feature = "sign-spki")]
-#[test]
-fn an_spki_key_group_is_read() {
-    const SECRET_PKCS8_B64: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg2L708EsnnzHER0SYasMNIUcG\
-v63QapC/3kVsoPerzKGhRANCAATxfzfHKUPeJtyLTGMUoxHhvBS1NT9guWhUQPGiZRLZIcB8Wc3\
-csdVU1iOiTRmbZGKJTtekOdEAbVRrx5HxIpst";
-    let dir = TmpDir::new("receive-signer-spki");
-    let file = dir.path().join("secret.spki");
-    std::fs::write(&file, format!("{SECRET_PKCS8_B64}\n")).unwrap();
-    let policy = policy_with(
-        dir.path(),
-        "",
-        &format!(
-            "[ex-ostrya receive]\nsign=k\n[ex-ostrya key \"k\"]\ntype=spki\nsecret-key-file={}\n",
-            file.display()
-        ),
-    )
-    .unwrap();
-    assert_eq!(policy.default_rule.signers.len(), 1);
-    assert_eq!(policy.default_rule.signers[0].signer().name(), "spki");
-}
-
 /// A GPG key group needs GPG signing.
 #[cfg(not(feature = "sign-gpg"))]
 #[test]
 fn a_gpg_key_group_needs_the_engine() {
     let err = refusal("[ex-ostrya key \"k\"]\ntype=gpg\ngpg-key=0123456789ABCDEF\n");
     assert!(matches!(err, Error::Unsupported(_)), "{err}");
-}
-
-/// `from_config` reads a GPG key group. It refuses a selector that names no
-/// secret key, and the message names the group.
-#[cfg(feature = "sign-gpg")]
-#[test]
-fn a_gpg_key_group_is_read() {
-    if !common::gnupg_available(&["gpg", "gpgconf"]) {
-        return;
-    }
-    let dir = TmpDir::new("receive-gpg-signer");
-    let home = GnupgHome::new(
-        &dir.path().join("gnupg"),
-        "Receive Server <server@example.org>",
-    );
-    let file = secret_file(dir.path());
-    let policy = policy_with(
-        dir.path(),
-        "",
-        &format!(
-            "[ex-ostrya receive]\nsign=ed;gpg\n{}\
-             [ex-ostrya key \"gpg\"]\ntype=gpg\ngpg-key=server@example.org\ngpg-homedir={}\n",
-            key_group("ed", &file),
-            home.dir.display(),
-        ),
-    )
-    .unwrap();
-    let names: Vec<&str> = policy
-        .default_rule
-        .signers
-        .iter()
-        .map(|s| s.signer().name())
-        .collect();
-    assert_eq!(names, ["ed25519", "gpg"]);
-
-    let dir2 = TmpDir::new("receive-gpg-signer-missing");
-    let err = policy_with(
-        dir2.path(),
-        "",
-        &format!(
-            "[ex-ostrya key \"gpg\"]\ntype=gpg\ngpg-key=nobody@example.org\ngpg-homedir={}\n",
-            home.dir.display()
-        ),
-    )
-    .unwrap_err();
-    assert!(
-        matches!(&err, Error::Signature(m)
-            if m.contains("[ex-ostrya key \"gpg\"]") && m.contains("no secret key")),
-        "{err}"
-    );
 }
 
 /// `from_config` also builds a key group that no rule names. If it cannot read
@@ -847,120 +716,21 @@ fn an_unnamed_key_group_is_built() {
     assert!(matches!(err, Error::Signature(_)), "{err}");
 }
 
-/// Two rules that name one key group share one signer. The summary shares
-/// that signer too. Two rules that name one trust group share its keys. If a
-/// list gives a name two times, the name counts once.
-#[test]
-fn the_rules_share_what_the_groups_build() {
-    let dir = TmpDir::new("receive-share");
-    let file = secret_file(dir.path());
-    let policy = policy_with(
-        dir.path(),
-        "",
-        &format!(
-            "[ex-ostrya receive]\nsign=k;k\nsign-summary=k\nverify=trust:t\n\
-             [ex-ostrya receive \"apps/**\"]\nsign=k\nverify=trust:t\n{}{}",
-            key_group("k", &file),
-            trust_t()
-        ),
-    )
-    .unwrap();
-    let default = &policy.default_rule;
-    let apps = &policy.rules[0].1;
-    assert_eq!(default.signers.len(), 1);
-    assert!(Arc::ptr_eq(&default.signers[0], &apps.signers[0]));
-    assert!(Arc::ptr_eq(&default.signers[0], &policy.summary_signers[0]));
-    assert!(Arc::ptr_eq(keys(default).unwrap(), keys(apps).unwrap()));
+/// Runs the `ostree` command on the repository `repo`.
+fn ostree(repo: &Path, args: &[&str]) -> std::process::Output {
+    std::process::Command::new("ostree")
+        .arg(format!("--repo={}", repo.display()))
+        .args(args)
+        .output()
+        .unwrap()
 }
 
-/// Under `from_file`, the receive groups come from the file alone. `from_file`
-/// ignores the groups of the repository config, and a malformed group there
-/// causes no error. `update_summary` and the filter come from the repository
-/// config.
+/// The `ostree` command reads a repository whose config holds the client
+/// groups, the server group, a trust group, and a key group. Its `refs`,
+/// `fsck`, and `summary -u` commands exit 0 and write nothing to standard
+/// error.
 #[test]
-fn a_policy_file_replaces_the_config_groups() {
-    let dir = TmpDir::new("receive-file");
-    let repo = repo_with(
-        dir.path(),
-        "auto-update-summary=true\n",
-        "[ex-ostrya]\ndetached-metadata-exclude=app.secret\n\
-         [ex-ostrya receive]\nallow-delete=true\n\
-         [ex-ostrya bogus]\n",
-    );
-    let file = dir.path().join("receive.conf");
-    std::fs::write(&file, "[ex-ostrya receive]\naccept=false\n").unwrap();
-    let policy = block_on(ReceivePolicy::from_file(&repo, &file)).unwrap();
-    assert!(!policy.default_rule.accept);
-    assert!(!policy.default_rule.allow_delete);
-    assert!(policy.update_summary);
-    assert!(policy.detached_metadata_filter.is_some());
-}
-
-/// Under `from_file`, `remote:NAME` resolves in the file alone.
-#[test]
-fn a_policy_file_resolves_remotes_in_itself() {
-    let remote = format!(
-        "[remote \"central\"]\nurl=http://localhost/\ngpg-verify=false\n\
-         sign-verify=ed25519\nverification-ed25519-key={PUBLIC_B64}\n"
-    );
-    let rule = "[ex-ostrya receive \"central:**\"]\nverify=remote:central\n";
-    let dir = TmpDir::new("receive-file-remote");
-    let policy = file_policy(dir.path(), "", &format!("{rule}{remote}")).unwrap();
-    assert!(keys(&policy.rules[0].1).is_some());
-
-    let dir = TmpDir::new("receive-file-remote-config");
-    let err = file_policy(dir.path(), &remote, rule).unwrap_err();
-    assert!(
-        matches!(&err, Error::InvalidFormat(m) if m.contains("names no [remote \"central\"] group")),
-        "{err}"
-    );
-}
-
-/// A policy file holds the receive groups and remote sections alone.
-/// `from_file` refuses an absent file, and the message names the path. It also
-/// refuses a path that is not a regular file.
-#[test]
-fn a_policy_file_holds_the_receive_groups_alone() {
-    for text in [
-        "[core]\nmode=archive\n",
-        "[ex-ostrya]\ndetached-metadata-exclude=app.x\n",
-        "[other]\nk=v\n",
-    ] {
-        let dir = TmpDir::new("receive-file-extra");
-        let err = file_policy(dir.path(), "", text).unwrap_err();
-        assert!(
-            matches!(&err, Error::InvalidFormat(m) if m.contains("the receive policy file holds")),
-            "{text:?}: {err}"
-        );
-    }
-    let dir = TmpDir::new("receive-file-unused-remote");
-    file_policy(
-        dir.path(),
-        "",
-        "[remote \"spare\"]\nurl=http://localhost/\n",
-    )
-    .unwrap();
-
-    let dir = TmpDir::new("receive-file-missing");
-    let repo = repo_with(dir.path(), "", "");
-    let missing = dir.path().join("absent.conf");
-    let err = block_on(ReceivePolicy::from_file(&repo, &missing)).unwrap_err();
-    assert!(
-        matches!(&err, Error::InvalidFormat(m) if m.contains("absent.conf")),
-        "{err}"
-    );
-    let err = block_on(ReceivePolicy::from_file(&repo, dir.path())).unwrap_err();
-    assert!(
-        matches!(&err, Error::InvalidFormat(m) if m.contains("regular file")),
-        "{err}"
-    );
-}
-
-/// The `ostree` command reads a repository whose config holds the receive group
-/// shapes. Its `refs`, `fsck`, and `summary -u` commands exit 0 and write
-/// nothing to standard error.
-#[test]
-fn the_tool_tolerates_the_receive_groups() {
+fn the_tool_tolerates_the_client_groups() {
     if !common::ostree_available() {
         eprintln!("skipping: ostree not available");
         return;
@@ -970,40 +740,36 @@ fn the_tool_tolerates_the_receive_groups() {
     let tree = dir.path().join("tree");
     std::fs::create_dir(&tree).unwrap();
     std::fs::write(tree.join("file"), b"content").unwrap();
-    let ostree = |args: &[&str]| {
-        std::process::Command::new("ostree")
-            .arg(format!("--repo={}", repo.display()))
-            .args(args)
-            .output()
-            .unwrap()
-    };
-    let out = ostree(&["init", "--mode=archive"]);
+    let out = ostree(&repo, &["init", "--mode=archive"]);
     assert!(out.status.success(), "{out:?}");
-    let out = ostree(&[
-        "commit",
-        "-b",
-        "x",
-        &format!("--tree=dir={}", tree.display()),
-    ]);
+    let out = ostree(
+        &repo,
+        &[
+            "commit",
+            "-b",
+            "x",
+            &format!("--tree=dir={}", tree.display()),
+        ],
+    );
     assert!(out.status.success(), "{out:?}");
 
     let mut config = std::fs::read_to_string(repo.join("config")).unwrap();
     config.push_str(&format!(
-        "\n[ex-ostrya receive]\naccept=false\nsign-summary=central-ed\n\
-         [ex-ostrya receive \"apps/**\"]\nverify=trust:release\nsign=central-ed\n\
-         [ex-ostrya receive \"central:**\"]\nverify=remote:central\n\
-         [ex-ostrya receive \"*:apps/x.y\"]\nallow-delete=true\n\
+        "\n[ex-ostrya server]\nlisten=127.0.0.1:8080\nsign-summary=central-ed\n\
+         [ex-ostrya client \"public\"]\nauth=anonymous\nallow=r:**\n\
+         [ex-ostrya client \"mirror\"]\nauth=ssh:mirror;net:10.0.0.0/24\n\
+         collection=org.example.Os;org.example.Apps\n\
+         allow=wd:apps/**;t:releases/*\ndeny=apps/secret\n\
+         verify=trust:release\nallow-unsigned=false\nsign=central-ed\n\
          [ex-ostrya trust \"release\"]\nsign-verify=ed25519\n\
          verification-ed25519-key={PUBLIC_B64}\n\
          [ex-ostrya key \"central-ed\"]\ntype=ed25519\n\
-         secret-key-file=/nonexistent/central.ed25519.key\n\
-         [remote \"central\"]\nurl=https://central.example/repo\ngpg-verify=false\n\
-         sign-verify=ed25519\nverification-ed25519-file=/nonexistent/central.ed25519\n"
+         secret-key-file=/nonexistent/central.ed25519.key\n"
     ));
     std::fs::write(repo.join("config"), config).unwrap();
 
     for args in [&["refs"][..], &["fsck"], &["summary", "-u"]] {
-        let out = ostree(args);
+        let out = ostree(&repo, args);
         assert!(
             out.status.success() && out.stderr.is_empty(),
             "ostree {args:?}: {}\n{}",
@@ -1014,55 +780,54 @@ fn the_tool_tolerates_the_receive_groups() {
     assert!(repo.join("summary").exists());
 }
 
-/// The tool keeps a receive group with a `**` name verbatim in the config and
-/// still runs its commands. The policy reads the group as the pattern.
+/// The tool writes a key of a client group with `config set`, keeps the group
+/// and the value verbatim in the config, and still runs its commands. The
+/// policies read the group and the value.
 #[test]
-fn the_tool_keeps_a_double_star_group_verbatim() {
+fn the_tool_keeps_a_client_group_verbatim() {
     if !common::ostree_available() {
         eprintln!("skipping: ostree not available");
         return;
     }
     let dir = TmpDir::new("receive-tool-verbatim");
     let repo = dir.path().join("repo");
-    let ostree = |args: &[&str]| {
-        std::process::Command::new("ostree")
-            .arg(format!("--repo={}", repo.display()))
-            .args(args)
-            .output()
-            .unwrap()
-    };
-    let out = ostree(&["init", "--mode=archive"]);
+    let out = ostree(&repo, &["init", "--mode=archive"]);
     assert!(out.status.success(), "{out:?}");
-    let out = ostree(&[
-        "config",
-        "set",
-        "ex-ostrya receive \"apps/**\".allow-delete",
-        "true",
-    ]);
-    assert!(out.status.success(), "{out:?}");
+    for (key, value) in [("auth", "ssh:ci"), ("allow", "w:apps/**;r:**")] {
+        let out = ostree(
+            &repo,
+            &[
+                "config",
+                "set",
+                &format!("ex-ostrya client \"ci\".{key}"),
+                value,
+            ],
+        );
+        assert!(out.status.success(), "{out:?}");
+    }
     let config = std::fs::read_to_string(repo.join("config")).unwrap();
     assert!(
-        config.contains("[ex-ostrya receive \"apps/**\"]\nallow-delete=true\n"),
+        config.contains("[ex-ostrya client \"ci\"]\nauth=ssh:ci\nallow=w:apps/**;r:**\n"),
         "{config}"
     );
     for args in [&["refs"][..], &["fsck"], &["summary", "-u"]] {
-        let out = ostree(args);
+        let out = ostree(&repo, args);
         assert!(out.status.success(), "ostree {args:?}: {out:?}");
     }
     let repo = block_on(Repo::open(&repo)).unwrap();
-    let policy = block_on(ReceivePolicy::from_config(&repo)).unwrap();
-    assert_eq!(policy.rules[0].0.as_str(), "apps/**");
-    assert!(policy.rule_for("apps/a/b").unwrap().allow_delete);
+    let policies = block_on(ReceivePolicies::from_config(&repo)).unwrap();
+    let ci = group(&policies, "ci");
+    assert_eq!(ci.rights("apps/a/b").to_string(), "rw");
+    assert_eq!(ci.rights("main").to_string(), "r");
 }
 
-/// The policy moves across tasks and threads.
+/// The policies move across tasks and threads.
 #[test]
-fn the_policy_is_send_and_sync() {
+fn the_policies_are_send_and_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<ReceivePolicies>();
     assert_send_sync::<ReceivePolicy>();
-    assert_send_sync::<ReceiveRule>();
     assert_send_sync::<ReceiveVerify>();
-    assert_send_sync::<ReceivePattern>();
     assert_send_sync::<TrustedKeys>();
     assert_send_sync::<ServerSigner>();
 }

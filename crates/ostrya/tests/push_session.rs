@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-use common::receive::{PipeWriter, connect, fixture_objects, new_repo};
+use common::receive::{PipeWriter, connect, fixture_objects, new_repo, policy_allowing};
 use common::{COMMIT, TmpDir, fixture_repo};
 use futures_io::AsyncWrite;
 use futures_lite::future::zip;
@@ -22,8 +22,8 @@ use ostrya::remote::{
     PushSession, RefUpdate, SessionOptions,
 };
 use ostrya::{
-    Checksum, DictBuilder, FileKind, FsckOptions, ObjectName, ObjectType, ReceivePolicy,
-    ReceiveReport, Repo, RepoMode, Value,
+    Checksum, DictBuilder, FileKind, FsckOptions, ObjectName, ObjectType, ReceiveReport, Repo,
+    RepoMode, Value,
 };
 use ostrya_rt::block_on;
 
@@ -239,7 +239,7 @@ fn push(
     let (client, server_in, server_out) = connect();
     let output = client.writer.into_inner();
     let input = client.reader.into_inner();
-    let policy = ReceivePolicy::default();
+    let policy = policy_allowing(&["w:**"]);
     let refs = vec!["test/main".to_string()];
     let commit = fixture_commit();
     let client = async {

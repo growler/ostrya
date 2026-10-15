@@ -4,9 +4,9 @@
 use futures_io::AsyncRead;
 use futures_lite::io::{AsyncBufReadExt, BufReader};
 
+use super::StreamPolicy;
 use super::core::SessionCore;
 use super::session::{Failure, ReceiveReport, STREAM_BUFFER, next, out_of_order};
-use super::{ReceivePolicy, ReceiveRule};
 use crate::error::{Error, Result};
 use crate::remote::proto::{CommitRequest, FrameReader, Message};
 use crate::remote::{self, Expected};
@@ -50,9 +50,17 @@ impl Repo {
     ///
     /// # Commit
     ///
-    /// `Commit` runs the checks and the steps of [`Repo::receive`], with three
+    /// `Commit` runs the checks and the steps of [`Repo::receive`], with four
     /// differences:
     ///
+    /// - The rule of each update is the rule that
+    ///   [`StreamPolicy::rule_for`](super::StreamPolicy::rule_for) selects. An
+    ///   update that no rule covers, and an update whose rule has `accept`
+    ///   false, are `ref-denied`. A delete of a ref that is present needs
+    ///   `allow_delete`. An update that is not a fast-forward needs `force`
+    ///   and `allow_non_fast_forward`. With
+    ///   [`ReceiveVerify::Keys`](super::ReceiveVerify::Keys), each new commit
+    ///   must pass the verification, and a commit with no signature fails.
     /// - The call ignores the `signers` of each rule, `summary_signers`, and
     ///   `update_summary` of `policy`. As a result, the commit adds no server
     ///   signature, writes no anchor commit, and does not regenerate the
@@ -104,15 +112,14 @@ impl Repo {
     /// - [`Error::Io`] if a read of `input` fails.
     /// - An I/O error from the file system, if a step of the transaction
     ///   fails.
-    pub async fn receive_stream<R>(&self, input: R, policy: &ReceivePolicy) -> Result<ReceiveReport>
+    pub async fn receive_stream<R>(&self, input: R, policy: &StreamPolicy) -> Result<ReceiveReport>
     where
         R: AsyncRead + Unpin + Send,
     {
-        let policy = one_way_policy(policy);
         let reader = FrameReader::new(BufReader::with_capacity(STREAM_BUFFER, input));
         // A failure drops the transaction here, which removes its staging
         // directory and releases the repository lock.
-        run(self, &policy, reader)
+        run(self, policy, reader)
             .await
             .map_err(|failure| match failure {
                 Failure::Wire(e) => Error::Remote(e),
@@ -121,32 +128,9 @@ impl Repo {
     }
 }
 
-/// Returns a copy of `policy` with no server key and no summary step.
-///
-/// The `signers` of each rule and `summary_signers` are empty, and
-/// `update_summary` is `false`.
-fn one_way_policy(policy: &ReceivePolicy) -> ReceivePolicy {
-    let rule = |rule: &ReceiveRule| ReceiveRule {
-        signers: Vec::new(),
-        ..rule.clone()
-    };
-    ReceivePolicy {
-        default_rule: rule(&policy.default_rule),
-        rules: policy
-            .rules
-            .iter()
-            .map(|(pattern, r)| (pattern.clone(), rule(r)))
-            .collect(),
-        allow_privileged: policy.allow_privileged,
-        summary_signers: Vec::new(),
-        update_summary: false,
-        detached_metadata_filter: policy.detached_metadata_filter.clone(),
-    }
-}
-
 async fn run<R>(
     repo: &Repo,
-    policy: &ReceivePolicy,
+    policy: &StreamPolicy,
     mut reader: FrameReader<BufReader<R>>,
 ) -> std::result::Result<ReceiveReport, Failure>
 where
@@ -213,7 +197,7 @@ fn check_updates(request: &CommitRequest) -> std::result::Result<(), Failure> {
 // that it can run on a thread pool.
 const _: fn() = || {
     fn assert_send<T: Send>(_: T) {}
-    let _ = |repo: &Repo, policy: &ReceivePolicy| {
+    let _ = |repo: &Repo, policy: &StreamPolicy| {
         assert_send(repo.receive_stream(futures_lite::io::empty(), policy))
     };
 };

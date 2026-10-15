@@ -2,9 +2,11 @@
 //!
 //! This module needs the `receive` feature. These are its entry items:
 //!
-//! - [`ReceivePolicy`] states what a receiving repository accepts.
-//!   [`ReceivePolicy::from_config`] reads it from the repository config.
-//!   [`TrustedKeys`] holds the keys that a rule verifies a commit against.
+//! - [`ReceivePolicy`] states what a push session of one client group can
+//!   read and change, and how the server verifies and signs its commits.
+//!   [`ReceivePolicies::from_config`] builds the policy of each client group
+//!   of the repository config. [`TrustedKeys`] holds the keys that a policy
+//!   verifies a commit against.
 //! - [`Repo::receive`](crate::Repo::receive) runs one push session over a
 //!   pair of streams. Its doc lists the checks of `Commit` in order.
 //! - [`ReceiveService`] runs a push session as steps, one step for each
@@ -13,7 +15,8 @@
 //! - [`ReceiveHooks`] are the calls of the host that run before and after the
 //!   ref update of a session.
 //! - [`Repo::receive_stream`](crate::Repo::receive_stream) reads one one-way
-//!   stream: the messages of a session in one direction, with no reply.
+//!   stream: the messages of a session in one direction, with no reply. A
+//!   [`StreamPolicy`] states what the stream accepts.
 //! - [`ClientAccess`] reads the client groups and the server settings. The
 //!   module re-exports it and the other types of [`access`](crate::access).
 
@@ -30,6 +33,7 @@ mod service;
 mod session;
 mod signer;
 mod stream;
+mod stream_policy;
 mod trust;
 mod walk;
 
@@ -40,10 +44,11 @@ pub use crate::access::{
 pub use crate::verify::TrustedKeys;
 pub use hooks::{HookFuture, HookRefusal, HostEntry, ReceiveHooks, UpdatePlan};
 pub use pattern::ReceivePattern;
-pub use policy::{ReceivePolicy, ReceiveRule, ReceiveVerify};
+pub use policy::{ReceivePolicies, ReceivePolicy, ReceiveVerify};
 pub use service::ReceiveService;
 pub use session::{ReceiveReport, ReceiveStep, ReceiveWarning};
 pub use signer::ServerSigner;
+pub use stream_policy::{StreamPolicy, StreamRule};
 
 pub(crate) use merge::merge_detached;
 
@@ -52,8 +57,10 @@ pub(crate) use merge::merge_detached;
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<ReceivePolicy>();
-    assert_send_sync::<ReceiveRule>();
+    assert_send_sync::<ReceivePolicies>();
     assert_send_sync::<ReceiveVerify>();
+    assert_send_sync::<StreamPolicy>();
+    assert_send_sync::<StreamRule>();
     assert_send_sync::<ReceivePattern>();
     assert_send_sync::<TrustedKeys>();
     assert_send_sync::<ServerSigner>();

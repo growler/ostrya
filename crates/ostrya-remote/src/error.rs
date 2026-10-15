@@ -56,10 +56,13 @@ pub enum Error {
         /// The objects that are missing.
         missing: Vec<ObjectName>,
     },
-    /// A ref that is not in its expected state.
+    /// A ref that is not in its expected state, or a ref that exists and
+    /// that the update can create and not move.
     ///
-    /// `name` and `current` give the current state. `current` is `None` if
-    /// the ref is absent.
+    /// The second case is an update that writes a commit to a ref that
+    /// exists, with `t` and no `w` on the ref, also when the commit is the
+    /// current commit. `name` and `current` give the current state.
+    /// `current` is `None` if the ref is absent.
     #[error("ref-mismatch: {message}")]
     RefMismatch {
         /// The message for a human.
@@ -81,10 +84,21 @@ pub enum Error {
     /// A ref name that an ostrya server refuses.
     #[error("invalid-ref: {0}")]
     InvalidRef(String),
-    /// A ref update that no rule of the policy accepts.
+    /// A session or a ref update that the policy refuses.
     ///
-    /// The rule that matches the update has `accept=false`, or the update
-    /// names a remote ref that no rule matches.
+    /// In a push session, these are the causes:
+    ///
+    /// - The client group opens no push session.
+    /// - A ref of `Hello` has no `r`.
+    /// - An update writes a commit to a ref with no `w` and no `t`.
+    /// - An update names a ref that a push does not write: a remote ref, the
+    ///   collection anchor ref of a server with a collection id, a ref that
+    ///   is an alias, or a ref path that a ref write cannot replace.
+    /// - Two updates write a commit, and the ref of one names a directory of
+    ///   the other.
+    ///
+    /// In a one-way stream, the rule that matches the update does not accept
+    /// it, or the update names a remote ref that no rule matches.
     #[error("ref-denied: {0}")]
     RefDenied(String),
     /// A commit with no trusted signature that verifies.

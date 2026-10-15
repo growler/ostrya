@@ -50,6 +50,17 @@ use ostrya_server::{
     EndpointOptions, ReceiveAuth, ReceiveBody, ReceiveEndpoint, Refusal, RequestKind, SessionSetup,
 };
 
+/// A policy that writes a commit to each ref as a fast-forward.
+fn pushing_policy() -> ReceivePolicy {
+    ReceivePolicy {
+        rules: ostrya::access::AccessRules {
+            allow: vec![ostrya::access::AllowItem::parse("w:**").unwrap()],
+            deny: Vec::new(),
+        },
+        ..ReceivePolicy::default()
+    }
+}
+
 const CA_PEM: &[u8] = include_bytes!("../../../tests/fixtures/tls/ca.pem");
 const SERVER_CERT_PEM: &[u8] = include_bytes!("../../../tests/fixtures/tls/server.pem");
 const SERVER_KEY_PEM: &[u8] = include_bytes!("../../../tests/fixtures/tls/server.key.pem");
@@ -124,7 +135,7 @@ impl ReceiveAuth for TokenAuth {
     async fn open(&self, _principal: &String, hello: &Hello) -> Result<SessionSetup, Refusal> {
         self.opened.lock().unwrap().push(hello.refs.clone());
         Ok(SessionSetup {
-            policy: Arc::new(ReceivePolicy::default()),
+            policy: Arc::new(pushing_policy()),
             hooks: None,
         })
     }
@@ -553,7 +564,7 @@ impl ReceiveAuth for HookAuth {
             state: self.state.clone(),
         };
         Ok(SessionSetup {
-            policy: Arc::new(ReceivePolicy::default()),
+            policy: Arc::new(pushing_policy()),
             hooks: Some(Arc::new(hooks)),
         })
     }

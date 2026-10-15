@@ -47,8 +47,9 @@
 //!
 //! [`ClientAccess::from_config`] refuses a group name that starts with
 //! `ex-ostrya ` and has no shape of a known group, and a key that a client
-//! group or the server group does not take. It also refuses the config in
-//! these cases:
+//! group or the server group does not take. It refuses `[ex-ostrya receive]`
+//! and `[ex-ostrya receive "PATTERN"]` with a message that names
+//! `[ex-ostrya client "NAME"]`. It also refuses the config in these cases:
 //!
 //! - Two groups carry the same item, and their namespaces overlap: both
 //!   apply to the local refs, both name one id, or both have `*`.
@@ -105,6 +106,8 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 pub use item::{AuthItem, IpNet};
+#[cfg(feature = "receive")]
+pub(crate) use reader::{Group, classify};
 pub use rights::{AccessModes, AccessRules, AllowItem};
 
 use crate::config::RepoConfig;
@@ -312,8 +315,7 @@ impl ClientAccess {
     /// onto `repo_dir`. The call reads no file. It records the names of the
     /// `[ex-ostrya trust "NAME"]` and `[ex-ostrya key "NAME"]` groups, for
     /// the checks of `verify`, `sign`, and `sign-summary`, and reads no key
-    /// of these groups. It skips `[ex-ostrya receive]` and each
-    /// `[ex-ostrya receive "PATTERN"]`.
+    /// of these groups.
     ///
     /// # Errors
     ///

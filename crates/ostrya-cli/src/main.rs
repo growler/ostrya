@@ -369,13 +369,16 @@ enum Command {
     PullLocal(PullLocalArgs),
     /// Receive one push session over standard input and standard output.
     ///
-    /// By default, `ostrya push` runs this command on the server over ssh. The
-    /// receive policy comes from the repository config, or from the file of
-    /// --policy. Standard output carries the frames of the session alone. For
-    /// each warning of the session, the command writes one
-    /// `warning: STEP: MESSAGE` line to standard error. It writes nothing
-    /// else, also under --verbose. The exit status is 0 after a committed
-    /// session, also with warnings, and 1 otherwise.
+    /// By default, `ostrya push` runs this command on the server over ssh. At
+    /// start, the command reads and checks the client groups, the server
+    /// group, the trust groups, and the key groups of the repository config,
+    /// and a bad group ends it with status 1. The session selects no client
+    /// group, so it opens no push session: `Hello` gets `ref-denied`.
+    /// Standard output carries the frames of the session alone. For each
+    /// warning of the session, the command writes one `warning: STEP: MESSAGE`
+    /// line to standard error. It writes nothing else, also under --verbose.
+    /// The exit status is 0 after a committed session, also with warnings, and
+    /// 1 otherwise.
     #[cfg(feature = "receive")]
     Receive(ReceiveArgs),
     /// Push commits to a remote over ssh or HTTP and update its refs.
@@ -425,7 +428,12 @@ enum Command {
     /// than `archive`, the server builds each `.filez` object on request. The
     /// server also answers the ref listing at `/_ostrya/refs/v1`. Without
     /// --read-only, the server also has the receive endpoint of a push, and
-    /// the command needs a method of push authentication.
+    /// the command needs a method of push authentication. At start, the
+    /// command reads and checks the client groups and the server group of the
+    /// repository config. Without --read-only, it also reads the trust groups
+    /// and the key groups. A bad group ends the command with status 1. The
+    /// endpoint selects no client group, so it opens no push session: each
+    /// session request that passes the authentication gets 403.
     ///
     /// When all listeners are bound, the command writes the URL of each
     /// listener to standard output, one line each. Then it serves until the
@@ -2591,18 +2599,7 @@ struct PullArgs {
 
 #[cfg(feature = "receive")]
 #[derive(Args)]
-struct ReceiveArgs {
-    /// Read the receive policy from FILE in place of the repository config.
-    ///
-    /// FILE holds the receive, trust, and key groups and the remote sections,
-    /// in the key-file format of the config. The command then ignores these
-    /// groups and sections in the repository config.
-    /// `[core] auto-update-summary` and
-    /// `[ex-ostrya] detached-metadata-exclude` still come from the repository
-    /// config. FILE must be a regular UTF-8 file of 1 MiB or less.
-    #[arg(long, value_name = "FILE")]
-    policy: Option<PathBuf>,
-}
+struct ReceiveArgs {}
 
 #[cfg(feature = "serve")]
 #[derive(Args)]
@@ -2634,7 +2631,9 @@ struct ServeArgs {
     /// The option needs --tls-cert. A client that presents a certificate must
     /// present one that the CA signed. A client that presents no certificate
     /// is served. A client certificate that the CA signed is a method of push
-    /// authentication.
+    /// authentication. The start checks of the client groups take the client
+    /// CA from this option alone, also when `[ex-ostrya server]` sets
+    /// `tls-client-ca`.
     #[arg(long, value_name = "FILE", requires = "tls_cert")]
     client_ca: Option<PathBuf>,
     /// Serve the files of a pull alone, with no receive endpoint.
@@ -2650,12 +2649,13 @@ struct ServeArgs {
     ///
     /// HEX is the SHA-256 digest of the token in 64 lowercase hex digits. The
     /// command skips an empty line and a line that starts with `#`, and a
-    /// malformed line stops the command at start. A bearer token pushes if
-    /// its digest matches a line. A Basic credential NAME:TOKEN pushes if the
-    /// digest of TOKEN matches the line of NAME. Without --tls-cert, the
-    /// option needs --allow-cleartext-credentials or --allow-anonymous-push.
-    /// The command reads FILE once, at start, and refuses a file larger than
-    /// 1 MiB.
+    /// malformed line stops the command at start. A bearer token passes the
+    /// authentication if its digest matches a line. A Basic credential
+    /// NAME:TOKEN passes if the digest of TOKEN matches the line of NAME. A
+    /// request that passes opens no push session and gets 403. Without
+    /// --tls-cert, the option needs --allow-cleartext-credentials or
+    /// --allow-anonymous-push. The command reads FILE once, at start, and
+    /// refuses a file larger than 1 MiB.
     #[arg(long, value_name = "FILE", conflicts_with = "read_only")]
     push_credentials: Option<PathBuf>,
     /// Take a bearer or Basic credential of push over plain HTTP.
@@ -2666,18 +2666,9 @@ struct ServeArgs {
     /// files of a pull needs no credential.
     #[arg(long, conflicts_with = "read_only")]
     allow_cleartext_credentials: bool,
-    /// Read the receive policy from FILE in place of the repository config.
+    /// Let a request with no credential pass the authentication of a push.
     ///
-    /// FILE holds the receive, trust, and key groups and the remote sections,
-    /// in the key-file format of the config. The command then ignores these
-    /// groups and sections in the repository config.
-    /// `[core] auto-update-summary` and
-    /// `[ex-ostrya] detached-metadata-exclude` still come from the repository
-    /// config. The command reads the policy once, at start. FILE must be a
-    /// regular UTF-8 file of 1 MiB or less.
-    #[arg(long, value_name = "FILE", conflicts_with = "read_only")]
-    policy: Option<PathBuf>,
-    /// Let a request with no credential push.
+    /// A request that passes opens no push session and gets 403.
     #[arg(long, conflicts_with = "read_only")]
     allow_anonymous_push: bool,
     /// Abort a push session that stays idle for SECONDS.
@@ -2749,8 +2740,8 @@ struct PushArgs {
     /// Update each ref whatever its state on the server.
     ///
     /// The push also asks the server to allow an update that is not a
-    /// fast-forward. The receive policy of the server still refuses such an
-    /// update unless the policy sets `allow-non-fast-forward`.
+    /// fast-forward. The server still refuses such an update unless the
+    /// client group of the push has `w` and `d` on the ref.
     #[arg(long)]
     force: bool,
     /// Send the content objects deflated at LEVEL, 1 to 9.
@@ -3003,8 +2994,8 @@ struct PushTreeArgs {
     /// Set each target ref whatever its state on the server.
     ///
     /// The push also asks the server to allow an update that is not a
-    /// fast-forward. The receive policy of the server still refuses such an
-    /// update unless the policy sets `allow-non-fast-forward`.
+    /// fast-forward. The server still refuses such an update unless the
+    /// client group of the push has `w` and `d` on the ref.
     #[arg(long)]
     force: bool,
     /// Send the content objects deflated at LEVEL, 1 to 9.
@@ -3389,12 +3380,15 @@ const MAX_SERVE_FILE_SIZE: u64 = 1024 * 1024;
 /// When all listeners are bound, the URL of each listener goes to standard
 /// output, one line for each listener.
 ///
-/// Without `--read-only`, the receive endpoint uses the receive policy of the
-/// repository config, or of `--policy`, and the credential file of
-/// `--push-credentials`. `serve` reads each of them once at start. A malformed
-/// credential line ends the process with an error that names the line. For
-/// each session that commits, each warning of its report goes to standard
-/// error as one line.
+/// `serve` reads and checks the client groups and the server group of the
+/// repository config at start. The checks take the TLS files from the
+/// options of the command alone, because the server runs with these files.
+/// Without `--read-only`, it also builds the trust groups and the key groups,
+/// and the receive endpoint takes the credential file of `--push-credentials`.
+/// The endpoint selects no client group, so each session gets the default
+/// policy, which opens no push session. A malformed credential line ends the
+/// process with an error that names the line. For each session that commits,
+/// each warning of its report goes to standard error as one line.
 #[cfg(feature = "serve")]
 async fn serve(repo: Repo, args: ServeArgs) -> Result<()> {
     use std::io::Write;
@@ -3404,12 +3398,22 @@ async fn serve(repo: Repo, args: ServeArgs) -> Result<()> {
         opts.listen = args.listen;
     }
     opts.body_timeout = std::time::Duration::from_secs(args.body_timeout);
+    let access = if args.read_only {
+        ostrya::access::ClientAccess::from_config(repo.config(), repo.path())?
+    } else {
+        ostrya::ReceivePolicies::from_config(&repo)
+            .await?
+            .access()
+            .clone()
+    };
+    access.check_server(&ostrya::access::ServerSettings {
+        tls_cert: args.tls_cert.clone(),
+        tls_key: args.tls_key.clone(),
+        tls_client_ca: args.client_ca.clone(),
+        ..access.server().clone()
+    })?;
     if !args.read_only {
-        let policy = match &args.policy {
-            Some(path) => ostrya::ReceivePolicy::from_file(&repo, path).await?,
-            None => ostrya::ReceivePolicy::from_config(&repo).await?,
-        };
-        opts.receive = Some(Arc::new(policy));
+        opts.receive = Some(Arc::new(ostrya::ReceivePolicy::default()));
         opts.allow_anonymous_push = args.allow_anonymous_push;
         opts.credentials = args.push_credentials.as_deref().map(read_serve_file);
         opts.allow_cleartext_credentials = args.allow_cleartext_credentials;
@@ -3485,18 +3489,18 @@ fn read_serve_file(path: &Path) -> Vec<u8> {
 
 /// Runs one push session over standard input and standard output.
 ///
-/// The session uses the receive policy of the repository config, or of
-/// `--policy`. Standard output carries the frames of the session alone. Each
-/// warning of the report goes to standard error as one line. A failure goes
-/// there as the error line of [`main`].
+/// The command reads and checks the client groups, the server group, the
+/// trust groups, and the key groups of the repository config at start. The
+/// session selects no client group, so it runs under the default policy,
+/// which opens no push session. Standard output carries the frames of the
+/// session alone. Each warning of the report goes to standard error as one
+/// line. A failure goes there as the error line of [`main`].
 ///
 /// The command writes nothing else, also under `--verbose`.
 #[cfg(feature = "receive")]
-async fn receive(repo: Repo, args: ReceiveArgs) -> Result<()> {
-    let policy = match &args.policy {
-        Some(path) => ostrya::ReceivePolicy::from_file(&repo, path).await?,
-        None => ostrya::ReceivePolicy::from_config(&repo).await?,
-    };
+async fn receive(repo: Repo, _args: ReceiveArgs) -> Result<()> {
+    ostrya::ReceivePolicies::from_config(&repo).await?;
+    let policy = ostrya::ReceivePolicy::default();
     // The input is read at most 256 KiB ahead of the session. Under the smol
     // backend, the output goes through a blocking-pool pipe of 8 MiB, so up
     // to 8 MiB that the session wrote can wait in the pipe.

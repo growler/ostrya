@@ -163,6 +163,10 @@ impl ReceiveService {
     /// - [`Error::InvalidInput`] if `parallel_uploads` is 0.
     /// - [`remote::Error::Protocol`] if `Hello` has `one-way` true.
     /// - The errors of [`check_hello`](Self::check_hello).
+    /// - [`remote::Error::RefDenied`] if `policy` opens no push session, if
+    ///   `Hello` names a remote ref, or if `policy` gives no `r` on a ref of
+    ///   `Hello`. These checks follow the checks of `check_hello` and do no
+    ///   I/O.
     /// - The errors of [`Repo::transaction`](crate::Repo::transaction) if the
     ///   session transaction cannot open. These include
     ///   [`Error::LockTimeout`] if the wait for the repository lock passes
@@ -234,7 +238,8 @@ impl ReceiveService {
     ///    with a commit for each ref, against [`MAX_FRAME`]
     ///    (`limit-exceeded`).
     ///
-    /// The call is sync and does no I/O. [`hello`](Self::hello),
+    /// The call is sync, does no I/O, and reads no policy.
+    /// [`hello`](Self::hello),
     /// [`Repo::receive`](crate::Repo::receive), and
     /// [`Repo::receive_stream`](crate::Repo::receive_stream) run the same
     /// checks. The call does not refuse a `Hello` with `one-way` true, which
@@ -243,6 +248,8 @@ impl ReceiveService {
     /// A `Hello` that passes can still fail to open. These steps of the open
     /// come after the checks:
     ///
+    /// - The checks of the policy of a two-way session, which
+    ///   [`hello`](Self::hello) states.
     /// - The open of the session transaction.
     /// - The reads of `[core] fsync`, `[core] per-object-fsync`,
     ///   `[ex-integrity] fsverity`, and `[archive] zlib-level`.
@@ -409,9 +416,9 @@ impl ReceiveService {
     /// - [`remote::Error::LimitExceeded`] if the `CommitReply` can need a frame
     ///   over [`MAX_FRAME`], or if a merged detached metadata dict is larger
     ///   than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
-    /// - [`remote::Error::RefDenied`] if a rule refuses an update, or if an
-    ///   update names the collection anchor ref of a repository with a
-    ///   collection id.
+    /// - [`remote::Error::RefDenied`] if an update writes a commit to a ref
+    ///   on which the policy gives no `w` and no `t`, or if an update names
+    ///   the collection anchor ref of a repository with a collection id.
     /// - [`remote::Error::RefDenied`] if a ref path fails a check under the
     ///   update lock: a ref is an alias, a ref write cannot replace a path, or
     ///   one update names a directory of another.
@@ -424,14 +431,18 @@ impl ReceiveService {
     /// - [`remote::Error::BindingMismatch`] if the ref binding or the collection
     ///   binding of a new commit does not name its ref or the repository.
     /// - [`remote::Error::SignatureRequired`] if a new commit fails the
-    ///   signature verification of a rule.
+    ///   signature verification of the policy. With
+    ///   [`allow_unsigned`](super::ReceivePolicy::allow_unsigned), a commit
+    ///   with no signature passes, and a commit with a signature that does not
+    ///   verify fails.
     /// - [`remote::Error::RefMismatch`] if a ref is not in the state that its
-    ///   update expects.
-    /// - [`remote::Error::DeleteDenied`] if an update deletes a ref and the
-    ///   policy does not allow it.
+    ///   update expects, or if an update writes a commit to a ref that is
+    ///   present and the policy gives `t` and no `w` on it.
+    /// - [`remote::Error::DeleteDenied`] if an update deletes a ref that is
+    ///   present and the policy gives no `d` on it.
     /// - [`remote::Error::NonFastForward`] if the new commit does not descend
-    ///   from the commit of the ref. If the client sends `force` and the rule
-    ///   allows an update that is not a fast-forward, this check does not run.
+    ///   from the commit of the ref. If the client sends `force` and the policy
+    ///   gives `w` and `d` on the ref, this check does not run.
     /// - [`remote::Error::Internal`] if `after_update` returns an error.
     /// - [`Error::InvalidInput`] if the plan of `before_update` breaks a rule
     ///   that [`ReceiveHooks`] states. The host sends it as `internal`.

@@ -475,10 +475,21 @@ where
     });
 }
 
+/// A policy that writes a commit to each ref as a fast-forward.
+fn pushing_policy() -> ReceivePolicy {
+    ReceivePolicy {
+        rules: ostrya::access::AccessRules {
+            allow: vec![ostrya::access::AllowItem::parse("w:**").unwrap()],
+            deny: Vec::new(),
+        },
+        ..ReceivePolicy::default()
+    }
+}
+
 fn options() -> ServeOptions {
     let mut opts = ServeOptions::default();
     opts.listen = vec!["127.0.0.1:0".parse().unwrap()];
-    opts.receive = Some(Arc::new(ReceivePolicy::default()));
+    opts.receive = Some(Arc::new(pushing_policy()));
     opts.allow_anonymous_push = true;
     opts
 }
@@ -723,6 +734,26 @@ fn a_session_past_the_limit_gets_503() {
         assert_eq!(client.delete(&id).await.status, 404);
         client.open().await;
     });
+}
+
+/// The built-in authentication refuses each session with 403 when the policy
+/// of the server opens no push session. The refusal frees the slot of the
+/// session, so a second request under a limit of one gets the same answer.
+#[test]
+fn a_policy_that_opens_no_push_session_gets_403() {
+    let tmp = TmpDir::new("closed-policy");
+    let repo = receiver(tmp.path(), RepoMode::Archive, "");
+    let mut opts = options();
+    opts.receive = Some(Arc::new(ReceivePolicy::default()));
+    opts.max_sessions = 1;
+    with_server(repo.clone(), opts, |client, _| async move {
+        for _ in 0..2 {
+            let reply = client.post(SESSION, encode(&[hello()]).await).await;
+            let error = reply.error(403, ErrorCode::Unauthorized);
+            assert!(error.message.contains("opens no push session"), "{error:?}");
+        }
+    });
+    assert_released(&repo);
 }
 
 /// The endpoint checks a `Hello` before the session takes a slot. A bad

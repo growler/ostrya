@@ -40,7 +40,7 @@ Without this option, the push sends the chain back to the commit of the ref on t
 \fB\-\-force\fR
 Update each ref whatever its state on the server.
 .IP
-The push also asks the server to allow an update that is not a \%fast\-forward. The receive policy of the server still refuses such an update unless the policy sets \fB\%allow\-non\-fast\-forward\fR\&.
+The push also asks the server to allow an update that is not a \%fast\-forward. The server still refuses such an update unless the client group of the push has \fB\%w\fR and \fB\%d\fR on the ref.
 .TP
 \fB\-\-compress\fR[=\fILEVEL\fR]
 Send the content objects deflated at LEVEL, \%1 to \%9.

@@ -132,8 +132,9 @@ fn match_line(lines: &[Credential], digest: &[u8; 32]) -> Option<usize> {
 
 /// The authentication methods of `ostrya serve`: the credential file, the
 /// client certificate, and anonymous push. Each session gets the policy of
-/// the server. [`ServeOptions`] states the owner key of each method and the
-/// order of the checks.
+/// the server. A policy that opens no push session refuses each session with
+/// 403. [`ServeOptions`] states the owner key of each method and the order of
+/// the checks.
 pub(crate) struct FileAuth {
     /// `true` if a request with no credential can push.
     anonymous: bool,
@@ -319,12 +320,18 @@ impl ReceiveAuth for FileAuth {
         ready(self.authorize(&parts.headers, &peer).map_err(challenge))
     }
 
-    /// The policy of the server and no hooks, for every principal.
+    /// The policy of the server and no hooks, for every principal. If the
+    /// policy opens no push session, the refusal is 403.
     fn open(
         &self,
         _principal: &String,
         _hello: &Hello,
     ) -> impl Future<Output = Result<SessionSetup, Refusal>> + Send {
+        if !self.policy.rules.opens_push_session() {
+            return ready(Err(Refusal::forbidden(
+                "the policy of the server opens no push session",
+            )));
+        }
         ready(Ok(SessionSetup {
             policy: self.policy.clone(),
             hooks: None,
@@ -337,6 +344,7 @@ mod tests {
     use hyper::header::HeaderValue;
 
     use super::*;
+    use crate::session::tests::pushing_policy;
 
     const PLAIN: Peer = Peer {
         tls: false,
@@ -358,7 +366,7 @@ mod tests {
             client_ca: false,
             cleartext: false,
             credentials: parse_credentials(file.as_bytes()).unwrap(),
-            policy: Arc::new(ReceivePolicy::default()),
+            policy: Arc::new(pushing_policy()),
         }
     }
 
@@ -760,19 +768,32 @@ mod tests {
         }
     }
 
-    /// `open` gives the policy of the server to every principal.
+    /// `open` gives the policy of the server to every principal. A policy
+    /// that opens no push session refuses every principal with 403.
     #[test]
     fn open_gives_the_policy_of_the_server() {
-        let auth = auth("");
         let hello = Hello {
             version: 1,
             agent: None,
             refs: vec!["main".into()],
             one_way: false,
         };
+        let open = auth("");
         for principal in ["anonymous", "token:alice"] {
-            let setup = ostrya_rt::block_on(auth.open(&principal.to_owned(), &hello)).unwrap();
-            assert!(Arc::ptr_eq(&setup.policy, &auth.policy));
+            let setup = ostrya_rt::block_on(open.open(&principal.to_owned(), &hello)).unwrap();
+            assert!(Arc::ptr_eq(&setup.policy, &open.policy));
+        }
+        let closed = FileAuth {
+            policy: Arc::new(ReceivePolicy::default()),
+            ..auth("")
+        };
+        for principal in ["anonymous", "token:alice"] {
+            let Err(refusal) = ostrya_rt::block_on(closed.open(&principal.to_owned(), &hello))
+            else {
+                panic!("the policy opens no push session");
+            };
+            assert_eq!(refusal.status, StatusCode::FORBIDDEN);
+            assert!(refusal.message.contains("opens no push session"));
         }
     }
 

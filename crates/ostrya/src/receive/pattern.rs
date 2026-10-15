@@ -1,11 +1,11 @@
-//! The ref patterns of the receive rules.
+//! The ref patterns of the rules of a one-way stream.
 
 use ostrya_core::RefPattern;
 
 use crate::error::{Error, Result};
 use crate::refs::is_component;
 
-/// A pattern that names the refs of one receive rule.
+/// A pattern that names the refs of one rule of a one-way stream.
 ///
 /// A pattern has an optional remote part and a name part. The name part is a
 /// [`RefPattern`]: a path of parts, split at `/`. Each part is a literal, `*`,
@@ -36,7 +36,7 @@ use crate::refs::is_component;
 ///   or one that starts with `-`.
 ///
 /// If more than one pattern matches a ref,
-/// [`ReceivePolicy::rule_for`](super::ReceivePolicy::rule_for) states which
+/// [`StreamPolicy::rule_for`](super::StreamPolicy::rule_for) states which
 /// rule applies.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReceivePattern {
@@ -83,7 +83,7 @@ pub(crate) struct Specificity<'a> {
 }
 
 impl ReceivePattern {
-    /// Parses a ref pattern of a receive rule.
+    /// Parses a ref pattern of a rule of a one-way stream.
     ///
     /// # Errors
     ///

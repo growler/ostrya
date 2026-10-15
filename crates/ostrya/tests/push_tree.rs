@@ -24,7 +24,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use common::receive::{PipeReader, connect, new_repo};
+use common::receive::{PipeReader, connect, new_repo, policy_allowing};
 use common::{ROOT_DIRMETA, ROOT_DIRTREE, TmpDir};
 use futures_io::AsyncRead;
 use futures_lite::future::zip;
@@ -36,7 +36,7 @@ use ostrya::remote::{
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, DictBuilder,
     DummySigner, Ed25519Signer, Ed25519Verifier, FilterResult, FsckOptions, MutableTree,
-    ObjectType, ReceivePolicy, ReceiveReport, Repo, RepoMode, Signer, Type, Value,
+    ObjectType, ReceiveReport, Repo, RepoMode, Signer, Type, Value,
 };
 use ostrya_core::commit_metadata;
 use ostrya_rt::block_on;
@@ -283,7 +283,7 @@ fn push(
     let (client, server_in, server_out) = connect();
     let output = client.writer.into_inner();
     let input = client.reader.into_inner();
-    let policy = ReceivePolicy::default();
+    let policy = policy_allowing(&["w:**"]);
     let refs = vec![REF.to_string()];
     let client = async {
         let session =
@@ -508,7 +508,7 @@ fn tree_push(
         inner: client.reader.into_inner(),
         hook,
     };
-    let policy = ReceivePolicy::default();
+    let policy = policy_allowing(&["w:**"]);
     block_on(zip(
         repo.receive(server_in, server_out, &policy),
         push_tree_over_stream(input, output, src, opts),

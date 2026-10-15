@@ -36,11 +36,12 @@ const CONFIG_FILE: &str = "config";
 ///   [`gc_root_metadata_keys`](RepoConfig::gc_root_metadata_keys) and
 ///   [`detached_metadata_exclude`](RepoConfig::detached_metadata_exclude).
 /// - The groups whose names start with `ex-ostrya` and a space, for example
-///   `[ex-ostrya receive]`: the policy that a repository applies to the
-///   commits that it receives. Under the `receive` feature,
-///   `ReceivePolicy::from_config` reads these groups.
+///   `[ex-ostrya client "NAME"]`: the access of the clients of a server, and
+///   the keys that verify and sign the commits that it receives.
 ///   [`ClientAccess::from_config`](crate::access::ClientAccess::from_config)
 ///   reads `[ex-ostrya server]` and the `[ex-ostrya client "NAME"]` groups.
+///   Under the `receive` feature, `ReceivePolicies::from_config` also reads
+///   the `[ex-ostrya trust "NAME"]` and `[ex-ostrya key "NAME"]` groups.
 ///
 /// # Checks
 ///
@@ -479,8 +480,8 @@ impl RepoConfig {
     /// [`PullOptions::detached_metadata_filter`](crate::PullOptions::detached_metadata_filter)
     /// through
     /// [`DetachedMetadataFilter::excluding`](crate::DetachedMetadataFilter::excluding).
-    /// Under the `receive` feature, `ReceivePolicy::from_config` reads it into
-    /// the filter of the receive path.
+    /// Under the `receive` feature, `ReceivePolicies::from_config` reads it
+    /// into the filter of the receive path.
     ///
     /// This list never comes from
     /// [`gc_root_metadata_keys`](RepoConfig::gc_root_metadata_keys), also when
@@ -692,7 +693,7 @@ pub(crate) fn remote_keyring_name(remote: &str) -> String {
 /// A typed accessor for one `[remote "<name>"]` section.
 ///
 /// A trust group of a receive policy takes the key names of a remote section.
-/// Under the `receive` feature, `ReceivePolicy::from_config` reads a trust
+/// Under the `receive` feature, `ReceivePolicies::from_config` reads a trust
 /// group through this type.
 #[derive(Debug, Clone)]
 pub struct Remote<'a> {

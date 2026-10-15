@@ -19,9 +19,10 @@ use super::hooks::{self, HookRefusal, HostEntry, ReceiveHooks, UpdatePlan};
 use super::merge::{
     SIGNATURE_KEYS, check_stored, merge_detached, replace_entries, signature_keys_in,
 };
+use super::policy::{SessionPolicy, UpdateRule};
 use super::session::{Failure, ReceiveReport, ReceiveStep, ReceiveWarning};
 use super::walk::{self, Missing};
-use super::{ReceivePolicy, ReceiveRule, ReceiveVerify, ServerSigner, TrustedKeys};
+use super::{ReceiveVerify, ServerSigner, TrustedKeys};
 use crate::MAX_METADATA_SIZE;
 use crate::error::{Error, Result};
 use crate::object::read_meta_object;
@@ -121,8 +122,11 @@ struct Edit<'a> {
 ///   refs.
 /// - Each detached metadata dict belongs to a commit of the session: a staged
 ///   commit, or the new commit of an update (`protocol`).
-/// - The rule of each update accepts it, and no update names the collection
-///   anchor ref of a repository with a collection id (`ref-denied`).
+/// - No update names the collection anchor ref of a repository with a
+///   collection id, and `policy` gives a rule for each update (`ref-denied`).
+///   The policy of a client group needs `w` or `t` for an update that writes
+///   a commit. The policy of a one-way stream needs a rule that accepts the
+///   ref.
 /// - Each new commit is staged or present (`missing-objects`), and each
 ///   commit of the session parses.
 /// - The tree of each commit of the session is complete (`missing-objects`).
@@ -130,7 +134,8 @@ struct Edit<'a> {
 ///   refs and the repository (`binding-mismatch`).
 /// - Each new commit passes the signature verification of each of its rules
 ///   (`signature-required`). The verification reads the union of the stored
-///   and the incoming detached metadata.
+///   and the incoming detached metadata. A rule that accepts a commit with
+///   no signature skips a commit whose union holds no signature blob.
 ///
 /// # Before the update lock
 ///
@@ -146,7 +151,10 @@ struct Edit<'a> {
 /// the commit writes. Then the fast-forward walk of each update reads the
 /// parent chain as far as the ref tip that this function read before the
 /// lock. If the client sent `force` and the rule allows a non-fast-forward
-/// update, no walk runs.
+/// update, no walk runs. If the rule only creates its ref, no walk runs,
+/// because the check under the lock refuses the update for a ref that is
+/// present. The walk of a ref that the update creates does not run, so the
+/// parent chain of its new commit can stop at any depth.
 ///
 /// # Hooks
 ///
@@ -175,8 +183,12 @@ struct Edit<'a> {
 /// Each update then gets these checks:
 ///
 /// - The ref is in the state that the update expects (`ref-mismatch`).
+/// - A rule that only creates its ref refuses a commit for a ref that is
+///   present (`ref-mismatch`).
 /// - The rule allows the delete of a present ref (`delete-denied`).
-/// - The new commit is a fast-forward (`non-fast-forward`).
+/// - The new commit is a fast-forward (`non-fast-forward`): the parent chain
+///   of the new commit reaches the commit of the ref before it stops at an
+///   absent commit or a root commit.
 ///
 /// This function then reads the stored detached metadata again. If it changed
 /// after the plan, this function drops each prepared signature whose key
@@ -220,7 +232,7 @@ struct Edit<'a> {
 /// metadata stay written.
 pub(super) async fn finish(
     repo: &Repo,
-    policy: &ReceivePolicy,
+    policy: &dyn SessionPolicy,
     hooks: Option<&dyn ReceiveHooks>,
     txn: Transaction,
     named: &[String],
@@ -279,6 +291,9 @@ pub(super) async fn finish(
         chains.push(match (update.new, tip) {
             // A forced update that the rule allows needs no walk.
             _ if force && rule.allow_non_fast_forward => None,
+            // An update that only creates its ref needs no walk: the check
+            // under the lock refuses it for a ref that is present.
+            _ if rule.create_only => None,
             (Some(new), Some(tip)) if new != *tip => Some(walks.chain(&txn, new, *tip).await?),
             _ => None,
         });
@@ -303,7 +318,7 @@ pub(super) async fn finish(
         }
     };
     let held = repo.lock_update().await.map_err(Failure::Internal)?;
-    let anchor = policy.update_summary && repo.config().collection_id().is_some();
+    let anchor = policy.regenerates_summary() && repo.config().collection_id().is_some();
     let (states, anchor_parent) = repo
         .read_ref_states(&names, anchor.then_some(OSTREE_METADATA_REF))
         .await
@@ -312,7 +327,7 @@ pub(super) async fn finish(
     let mut changes = Vec::with_capacity(updates.len());
     for (i, update) in updates.iter().enumerate() {
         let changed = check_ref(
-            &txn, update, rules[i], force, current[i], chains[i], &mut walks,
+            &txn, update, &rules[i], force, current[i], chains[i], &mut walks,
         )
         .await?;
         changes.push(changed);
@@ -323,7 +338,7 @@ pub(super) async fn finish(
             txn.set_ref(&update.name, update.new.as_ref());
         }
     }
-    let summary = policy.update_summary && changes.contains(&true);
+    let summary = policy.regenerates_summary() && changes.contains(&true);
     if summary && let Some(collection_id) = repo.config().collection_id().map(str::to_owned) {
         let parent = anchor_parent
             .transpose()
@@ -343,7 +358,7 @@ pub(super) async fn finish(
             message: format!("the partial marker of commit {commit}: {e}"),
         })
         .collect();
-    if summary && let Err(warning) = write_summary(repo, &policy.summary_signers).await {
+    if summary && let Err(warning) = write_summary(repo, policy.summary_keys()).await {
         warnings.push(warning);
     }
     drop(held);
@@ -479,16 +494,14 @@ fn check_commit_meta_commits(
 
 /// Returns the rule of each update, in order.
 ///
-/// These updates are `ref-denied`:
-///
-/// - An update that no rule covers.
-/// - An update whose rule refuses it.
-/// - An update of the anchor ref of a repository with a collection id.
+/// An update of the anchor ref of a repository with a collection id is
+/// `ref-denied`. Then `policy` gives the rule of each update, or its
+/// `ref-denied` refusal.
 fn select_rules<'a>(
     repo: &Repo,
-    policy: &'a ReceivePolicy,
+    policy: &'a dyn SessionPolicy,
     updates: &[RefUpdate],
-) -> Checked<Vec<&'a ReceiveRule>> {
+) -> Checked<Vec<UpdateRule<'a>>> {
     let collection = repo.config().collection_id().is_some();
     updates
         .iter()
@@ -499,15 +512,7 @@ fn select_rules<'a>(
                     "ref '{name}' holds the collection anchor commit, which the server writes"
                 )));
             }
-            match policy.rule_for(name) {
-                Some(rule) if rule.accept => Ok(rule),
-                Some(_) => Err(ref_denied(format!(
-                    "the policy refuses updates of ref '{name}'"
-                ))),
-                None => Err(ref_denied(format!(
-                    "no rule of the policy covers the remote ref '{name}'"
-                ))),
-            }
+            policy.rule(update)
         })
         .collect()
 }
@@ -729,13 +734,18 @@ fn check_bindings(repo: &Repo, updates: &[RefUpdate], targets: &[Target]) -> Che
 
 /// Returns the trusted keys of the rules of the updates of `target`, each set
 /// once.
-fn target_keys<'a>(rules: &[&'a ReceiveRule], target: &Target) -> Vec<&'a Arc<TrustedKeys>> {
-    let mut keys: Vec<&Arc<TrustedKeys>> = Vec::new();
+///
+/// The flag of a set is `true` if each rule with the set accepts a commit
+/// with no signature.
+fn target_keys<'a>(rules: &[UpdateRule<'a>], target: &Target) -> Vec<(&'a Arc<TrustedKeys>, bool)> {
+    let mut keys: Vec<(&Arc<TrustedKeys>, bool)> = Vec::new();
     for &i in &target.updates {
-        if let ReceiveVerify::Keys(held) = &rules[i].verify
-            && !keys.iter().any(|k| Arc::ptr_eq(k, held))
-        {
-            keys.push(held);
+        let rule = &rules[i];
+        if let ReceiveVerify::Keys(held) = rule.verify {
+            match keys.iter_mut().find(|(k, _)| Arc::ptr_eq(k, held)) {
+                Some((_, unsigned)) => *unsigned &= rule.allow_unsigned,
+                None => keys.push((held, rule.allow_unsigned)),
+            }
         }
     }
     keys
@@ -743,10 +753,10 @@ fn target_keys<'a>(rules: &[&'a ReceiveRule], target: &Target) -> Vec<&'a Arc<Tr
 
 /// Returns the union of the server keys of the rules of the updates of
 /// `target`, each key once.
-fn target_signers<'a>(rules: &[&'a ReceiveRule], target: &Target) -> Vec<&'a Arc<ServerSigner>> {
+fn target_signers<'a>(rules: &[UpdateRule<'a>], target: &Target) -> Vec<&'a Arc<ServerSigner>> {
     let mut signers: Vec<&Arc<ServerSigner>> = Vec::new();
     for &i in &target.updates {
-        for signer in &rules[i].signers {
+        for signer in rules[i].signers {
             if !signers.iter().any(|s| Arc::ptr_eq(s, signer)) {
                 signers.push(signer);
             }
@@ -762,7 +772,7 @@ fn target_signers<'a>(rules: &[&'a ReceiveRule], target: &Target) -> Vec<&'a Arc
 /// server key, and each commit with an incoming dict.
 async fn read_stored_for(
     repo: &Repo,
-    rules: &[&ReceiveRule],
+    rules: &[UpdateRule<'_>],
     targets: &[Target],
     commit_meta: &HashMap<Checksum, Bytes>,
 ) -> Checked<HashMap<Checksum, Option<Bytes>>> {
@@ -837,8 +847,12 @@ fn empty_dict() -> Value {
 /// The verification reads the union of the stored detached metadata of the
 /// commit and the incoming dict, before the detached-metadata filter. This
 /// function builds the union on the blocking pool.
+///
+/// A set whose rules accept a commit with no signature skips the commit if
+/// the union holds no blob under a signature key. A commit with a blob must
+/// pass the verification on each axis of the set.
 async fn check_signatures(
-    rules: &[&ReceiveRule],
+    rules: &[UpdateRule<'_>],
     commit_meta: &HashMap<Checksum, Bytes>,
     targets: &[Target],
     stored: &HashMap<Checksum, Option<Bytes>>,
@@ -860,7 +874,12 @@ async fn check_signatures(
         .await
         .map_err(Failure::Internal)?;
         let subject = format!("commit {}", target.checksum);
-        for held in keys {
+        let signed = keys.iter().any(|(_, allow_unsigned)| *allow_unsigned)
+            && dict.as_ref().is_some_and(has_signature);
+        for (held, allow_unsigned) in keys {
+            if allow_unsigned && !signed {
+                continue;
+            }
             held.check(&subject, &target.bytes, dict.as_ref())
                 .await
                 .map_err(|e| match e {
@@ -872,6 +891,25 @@ async fn check_signatures(
         }
     }
     Ok(())
+}
+
+/// Returns `true` if the detached-metadata dict `dict` holds a blob under a
+/// key of [`SIGNATURE_KEYS`].
+///
+/// The check copies no blob.
+fn has_signature(dict: &Value) -> bool {
+    SIGNATURE_KEYS.iter().any(|key| {
+        let Some(value) = dict.dict_get(key) else {
+            return false;
+        };
+        let array = match value.as_variant() {
+            Some((_, inner)) => inner,
+            None => value,
+        };
+        array
+            .as_array()
+            .is_some_and(|blobs| blobs.iter().any(|blob| blob.as_bytes().is_some()))
+    })
 }
 
 /// Checks the ref paths under the lock and returns the commit that each ref
@@ -936,6 +974,8 @@ fn check_ref_paths(
 /// ref and an update to the current commit change nothing.
 ///
 /// - The ref must be in the state that the update expects, also for `Any`.
+/// - A rule that only creates its ref refuses a commit for a ref that is
+///   present, also the current commit (`ref-mismatch`).
 /// - A delete of a ref that is present needs `allow_delete`.
 /// - If a new commit differs from the current commit, the current commit must
 ///   be in the parent chain of the new commit. If the client sent `force` and
@@ -945,7 +985,7 @@ fn check_ref_paths(
 async fn check_ref(
     txn: &Transaction,
     update: &RefUpdate,
-    rule: &ReceiveRule,
+    rule: &UpdateRule<'_>,
     force: bool,
     current: Option<Checksum>,
     chain: Option<usize>,
@@ -964,6 +1004,18 @@ async fn check_ref(
         };
         return Err(Failure::Wire(remote::Error::RefMismatch {
             message: format!("ref '{name}' is {state}"),
+            name: name.clone(),
+            current,
+        }));
+    }
+    if let (Some(commit), Some(_)) = (current, update.new)
+        && rule.create_only
+    {
+        return Err(Failure::Wire(remote::Error::RefMismatch {
+            message: format!(
+                "ref '{name}' is at {commit}, and the policy lets an update create the ref \
+                 and not write to it"
+            ),
             name: name.clone(),
             current,
         }));
@@ -997,10 +1049,10 @@ async fn check_ref(
 ///
 /// The result leaves out a dict that the filter empties.
 async fn filter_detached(
-    policy: &ReceivePolicy,
+    policy: &dyn SessionPolicy,
     commit_meta: HashMap<Checksum, Bytes>,
 ) -> Checked<HashMap<Checksum, Bytes>> {
-    let filter = policy.detached_metadata_filter.clone();
+    let filter = policy.metadata_filter().cloned();
     ostrya_rt::unblock(move || -> Result<_> {
         let mut incoming = HashMap::with_capacity(commit_meta.len());
         for (commit, bytes) in commit_meta {
@@ -1027,7 +1079,7 @@ async fn filter_detached(
 /// dict. Each other commit with a filtered incoming dict also gets an edit.
 /// Each edit takes its stored dict out of `stored`.
 fn plan<'a>(
-    rules: &[&'a ReceiveRule],
+    rules: &[UpdateRule<'a>],
     targets: &'a [Target],
     stored: &mut HashMap<Checksum, Option<Bytes>>,
     mut incoming: HashMap<Checksum, Bytes>,

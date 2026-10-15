@@ -577,6 +577,17 @@ pub(crate) mod tests {
 
     use super::*;
 
+    /// A policy that writes a commit to each ref as a fast-forward.
+    pub(crate) fn pushing_policy() -> ReceivePolicy {
+        ReceivePolicy {
+            rules: ostrya::access::AccessRules {
+                allow: vec![ostrya::access::AllowItem::parse("w:**").unwrap()],
+                deny: Vec::new(),
+            },
+            ..ReceivePolicy::default()
+        }
+    }
+
     /// A repository in a directory of its own. The drop of the value removes
     /// the directory when no staging directory is left.
     pub(crate) struct TmpRepo {
@@ -604,7 +615,7 @@ pub(crate) mod tests {
                 refs: vec!["main".into()],
                 one_way: false,
             };
-            let policy = Arc::new(ReceivePolicy::default());
+            let policy = Arc::new(pushing_policy());
             block_on(ReceiveService::hello(self.repo.clone(), policy, 1, hello))
                 .unwrap()
                 .0

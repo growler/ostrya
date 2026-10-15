@@ -528,7 +528,11 @@ fn the_tool_pulls_loose_past_unserved_deltas() {
 /// It also refuses these inputs:
 ///
 /// - a receive option beside `--read-only`,
-/// - a policy file that it cannot open,
+/// - `--policy`, which it does not take,
+/// - a group of the removed receive policy in the config, also with
+///   `--read-only`,
+/// - a client group with a TLS item and no client CA,
+/// - a key group whose key it cannot read, without `--read-only`,
 /// - a TLS file that it cannot use,
 /// - a credential file larger than the size cap,
 /// - a credential file with no credential line, as the one method,
@@ -553,6 +557,22 @@ fn serve_refuses_what_it_cannot_serve() {
     // The path holds no word of the refusals, so a message that names it
     // does not pass for the refusal.
     let policy = format!("--policy={}", tmp.path().join("absent-rules").display());
+    let with_groups = |name: &str, groups: &str| {
+        let path = tmp.path().join(name);
+        let arg = format!("--repo={}", path.display());
+        ok(ostrya(), &[&arg, "init", "--mode=archive"]);
+        let config = path.join("config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str(groups);
+        std::fs::write(&config, text).unwrap();
+        arg
+    };
+    let removed = with_groups("removed", "[ex-ostrya receive]\naccept=true\n");
+    let tls_item = with_groups("tls-item", "[ex-ostrya client \"c\"]\nauth=tls:*\n");
+    let bad_key = with_groups(
+        "bad-key",
+        "[ex-ostrya key \"k\"]\ntype=ed25519\nsecret-key-file=/nonexistent/ostrya/k\n",
+    );
     let ro = "--read-only";
     let clear = "--allow-cleartext-credentials";
     let hex = "0".repeat(64);
@@ -568,11 +588,22 @@ fn serve_refuses_what_it_cannot_serve() {
     let empty = file("empty", b"# no credential\n");
     let big = file("big", &vec![b'#'; 1024 * 1024 + 1]);
     let creds = file("creds", format!("alice:{hex}\n").as_bytes());
-    let cases: [(&[&str], &str); 23] = [
+    let anon = "--allow-anonymous-push";
+    let cases: [(&[&str], &str); 27] = [
         (&[&repo, "serve", listen], "--allow-anonymous-push"),
         (&[&no_repo, "serve", listen], "--allow-anonymous-push"),
-        (&[&no_repo, "serve", listen, &policy], "--read-only"),
         (&[&no_repo, "serve", ro, listen, &policy], "--policy"),
+        (
+            &[&removed, "serve", listen, anon],
+            "[ex-ostrya client \"NAME\"]",
+        ),
+        (
+            &[&removed, "serve", ro, listen],
+            "[ex-ostrya client \"NAME\"]",
+        ),
+        (&[&tls_item, "serve", ro, listen], "tls-client-ca"),
+        (&[&tls_item, "serve", listen, anon], "tls-client-ca"),
+        (&[&bad_key, "serve", listen, anon], "/nonexistent/ostrya/k"),
         (
             &[&no_repo, "serve", ro, listen, "--allow-anonymous-push"],
             "--allow-anonymous-push",
@@ -611,7 +642,7 @@ fn serve_refuses_what_it_cannot_serve() {
         ),
         (
             &[&repo, "serve", listen, "--allow-anonymous-push", &policy],
-            "the receive policy file",
+            "--policy",
         ),
         (
             &[&repo, "serve", "--read-only", listen, "--body-timeout=0"],
@@ -663,6 +694,67 @@ fn serve_refuses_what_it_cannot_serve() {
     }
 }
 
+/// The start checks take the TLS files from the options alone, because the
+/// server runs with them:
+///
+/// - A `tls:*` item and `tls-cert`, `tls-key`, and `tls-client-ca` in the
+///   server group, with no TLS option, exit 1. With the three options, the
+///   server starts and serves HTTPS.
+/// - `tls-cert` alone in the server group, with no TLS option, does not stop
+///   the server, and it serves plain HTTP.
+#[test]
+fn serve_checks_the_client_groups_against_its_tls_options_alone() {
+    let tmp = TmpDir::new("tls-options");
+    let cert = fixture("server.pem");
+    let key = fixture("server.key.pem");
+    let ca = fixture("ca.pem");
+    let with_groups = |name: &str, groups: &str| {
+        let path = tmp.path().join(name);
+        let arg = format!("--repo={}", path.display());
+        ok(ostrya(), &[&arg, "init", "--mode=archive"]);
+        let config = path.join("config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str(groups);
+        std::fs::write(&config, text).unwrap();
+        (path, arg)
+    };
+    let (tls_path, tls_repo) = with_groups(
+        "tls-item",
+        &format!(
+            "[ex-ostrya server]\ntls-cert={}\ntls-key={}\ntls-client-ca={}\n\
+             [ex-ostrya client \"c\"]\nauth=tls:*\nallow=r:**\n",
+            cert.display(),
+            key.display(),
+            ca.display()
+        ),
+    );
+    let out = run(
+        ostrya(),
+        &[&tls_repo, "serve", "--read-only", "--listen=127.0.0.1:0"],
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert_eq!(out.status.code(), Some(1), "{stderr}");
+    assert!(out.stdout.is_empty());
+    assert!(stderr.contains("tls-client-ca"), "{stderr}");
+    let server = Serving::start(
+        &tls_path,
+        &[
+            &format!("--tls-cert={}", cert.display()),
+            &format!("--tls-key={}", key.display()),
+            &format!("--client-ca={}", ca.display()),
+        ],
+    );
+    assert!(server.url.starts_with("https://"), "{}", server.url);
+    drop(server);
+
+    let (cert_path, _) = with_groups(
+        "cert-alone",
+        &format!("[ex-ostrya server]\ntls-cert={}\n", cert.display()),
+    );
+    let server = Serving::start(&cert_path, &[]);
+    assert!(server.url.starts_with("http://"), "{}", server.url);
+}
+
 /// Send `request` to the server at `url` on a new connection, and read the
 /// response until the server closes it.
 fn raw(url: &str, request: &str) -> String {
@@ -678,7 +770,9 @@ fn raw(url: &str, request: &str) -> String {
 
 /// With `--allow-anonymous-push`, the receive endpoint answers a `session`
 /// request, and the archive view still serves `config`. With `--read-only`,
-/// the server has no receive endpoint, so the request gets 405.
+/// the server has no receive endpoint, so the request gets 405. A read-only
+/// server builds no key group, so a key that it cannot read does not stop
+/// it.
 #[test]
 fn serve_runs_the_receive_endpoint_with_anonymous_push() {
     let tmp = TmpDir::new("receive");
@@ -704,6 +798,10 @@ fn serve_runs_the_receive_endpoint_with_anonymous_push() {
     assert!(response.contains("the request body holds no message"));
     assert!(raw(&server.url, get).starts_with("HTTP/1.1 200 "));
     drop(server);
+    let config = path.join("config");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str("[ex-ostrya key \"k\"]\ntype=ed25519\nsecret-key-file=/nonexistent/ostrya/k\n");
+    std::fs::write(&config, text).unwrap();
     let server = Serving::start(&path, &[]);
     let response = raw(&server.url, post);
     assert!(response.starts_with("HTTP/1.1 405 "), "{response}");

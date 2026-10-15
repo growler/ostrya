@@ -1,103 +1,33 @@
-//! The reader of the receive groups: `[ex-ostrya receive]`,
-//! `[ex-ostrya receive "PATTERN"]`, `[ex-ostrya trust "NAME"]`, and
-//! `[ex-ostrya key "NAME"]`.
+//! The reader of the trust groups and the key groups, and the build of the
+//! receive policy of each client group.
 //!
-//! The reader makes two passes. The first pass reads each group and refuses
-//! each key and each value outside the syntax. It also resolves each reference
-//! to a trust group, a key group, or a remote section. This pass reads no file
-//! and runs no program.
+//! The reader makes two passes. The first pass checks each trust group and
+//! each key group, and refuses each key and each value outside the syntax.
+//! This pass reads no file and runs no program.
 //!
 //! The second pass builds each key group and each trust group once, in file
-//! order. It also builds a group that no rule names. Then it builds the pull
-//! trust of each remote that a rule names. The rules get shared handles to
-//! these objects.
+//! order. It also builds a group that no client group names. The policies get
+//! shared handles to these objects.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::Path;
 use std::sync::Arc;
 
 use ostrya_core::KeyFile;
-use rustix::fs::{Mode, OFlags};
 
-use crate::config::{Remote, SignVerify, remote_group_name};
+use crate::access::{ClientAccess, Group, classify};
+use crate::config::{Remote, SignVerify};
 use crate::error::{Error, Result};
 use crate::pull::DetachedMetadataFilter;
-use crate::refs::is_component;
 use crate::repo::Repo;
-use crate::sign::{MAX_KEY_FILE, key_text, read_key_path, read_key_source};
+use crate::sign::{MAX_KEY_FILE, key_text, read_key_path};
 
-use super::{ReceivePattern, ReceivePolicy, ReceiveRule, ReceiveVerify, ServerSigner, TrustedKeys};
+use super::{ReceivePolicy, ReceiveVerify, ServerSigner, TrustedKeys};
 
-/// The name of the default rule group.
-const DEFAULT_GROUP: &str = "ex-ostrya receive";
-/// The name prefix of a pattern rule group, before the quoted pattern.
-const RULE_PREFIX: &str = "ex-ostrya receive \"";
-/// The name prefix of a trust group, before the quoted name.
-const TRUST_PREFIX: &str = "ex-ostrya trust \"";
 /// The name prefix of a key group, before the quoted name.
 const KEY_PREFIX: &str = "ex-ostrya key \"";
-/// The name prefix of every receive group.
-///
-/// If a group name has this prefix and no shape of a receive group, the
-/// reader refuses the group.
-const RESERVED_PREFIX: &str = "ex-ostrya ";
-
-/// The keys of a rule, valid in each receive group.
-const RULE_KEYS: &[&str] = &[
-    "accept",
-    "verify",
-    "allow-non-fast-forward",
-    "allow-delete",
-    "sign",
-];
-/// The keys of a rule that have no effect if the rule refuses its refs.
-const ACCEPT_ONLY_KEYS: &[&str] = &["verify", "sign", "allow-non-fast-forward", "allow-delete"];
-/// The keys that cover the whole session, valid in `[ex-ostrya receive]`
-/// alone.
-const SESSION_KEYS: &[&str] = &["allow-privileged", "sign-summary"];
 /// The sign-api engines that a trust group can name.
 const TRUST_ENGINES: &[&str] = &["ed25519", "spki"];
-
-/// The source of the receive groups.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Origin {
-    /// The repository config. The groups other than the receive groups
-    /// belong to the repository, so the reader skips them.
-    Config,
-    /// A policy file. It holds the receive groups and remote sections, and
-    /// no other group. A remote section in a policy file reads no keyring
-    /// inside the repository.
-    File,
-}
-
-/// One receive group, by the shape of its name.
-enum Group<'a> {
-    /// `[ex-ostrya receive]`.
-    Default,
-    /// `[ex-ostrya receive "PATTERN"]`, with the pattern text.
-    Rule(&'a str),
-    /// `[ex-ostrya trust "NAME"]`, with the name.
-    Trust(&'a str),
-    /// `[ex-ostrya key "NAME"]`, with the name.
-    Key(&'a str),
-}
-
-/// The source of the trusted keys of one rule, as the rule names it.
-enum VerifySpec {
-    Off,
-    Trust(String),
-    Remote(String),
-}
-
-/// One rule as the first pass reads it, before the second pass builds the key
-/// sources.
-struct RuleSpec {
-    accept: bool,
-    verify: VerifySpec,
-    allow_non_fast_forward: bool,
-    allow_delete: bool,
-    sign: Vec<String>,
-}
 
 /// One key group as the first pass reads it.
 enum KeySpec {
@@ -115,75 +45,35 @@ enum KeySpec {
     },
 }
 
-/// Returns the receive policy that the receive groups of `keyfile` state.
-///
-/// For both origins, `update_summary` and the detached-metadata filter come
-/// from the repository config.
-pub(crate) async fn read(repo: &Repo, keyfile: &KeyFile, origin: Origin) -> Result<ReceivePolicy> {
-    // The first pass reads each group by its shape, in file order.
-    let mut default = None;
-    let mut rule_groups: Vec<(ReceivePattern, &str)> = Vec::new();
-    let mut trust_groups: Vec<(&str, &str)> = Vec::new();
-    let mut key_groups: Vec<(&str, &str)> = Vec::new();
-    // Trust and key groups with their names, in file order, for the second
-    // pass.
+/// Reads the client groups of the config of `repo`, and returns them with the
+/// receive policy of each group, in the order of the groups.
+pub(crate) async fn read(repo: &Repo) -> Result<(ClientAccess, Vec<Arc<ReceivePolicy>>)> {
+    let config = repo.config();
+    let access = ClientAccess::from_config(config, repo.path())?;
+    let keyfile = config.keyfile();
+
+    // The first pass checks each key group, then each trust group. The
+    // access reader refused each other group name with the extension prefix.
     let mut builds: Vec<(Group<'_>, &str)> = Vec::new();
     for group in keyfile.groups() {
-        match classify(group)? {
-            Some(Group::Default) => default = Some(group),
-            Some(Group::Rule(pattern)) => {
-                rule_groups.push((ReceivePattern::parse(pattern)?, group))
-            }
-            Some(Group::Trust(name)) => {
-                trust_groups.push((name, group));
-                builds.push((Group::Trust(name), group));
-            }
-            Some(Group::Key(name)) => {
-                key_groups.push((name, group));
-                builds.push((Group::Key(name), group));
-            }
-            None if origin == Origin::File && remote_group_name(group).is_none() => {
-                return Err(Error::InvalidFormat(format!(
-                    "the receive policy file holds [{group}], which is not a receive, \
-                     trust, key, or remote group"
-                )));
-            }
-            None => {}
+        if let Some(found @ (Group::Trust(_) | Group::Key(_))) = classify(group)? {
+            builds.push((found, group));
+        }
+    }
+    let mut keys: HashMap<&str, KeySpec> = HashMap::new();
+    for (build, group) in &builds {
+        if let Group::Key(name) = build {
+            keys.insert(name, parse_key(keyfile, group)?);
+        }
+    }
+    for (build, group) in &builds {
+        if let Group::Trust(_) = build {
+            check_trust(keyfile, group)?;
         }
     }
 
-    let mut keys: HashMap<&str, KeySpec> = HashMap::new();
-    for &(name, group) in &key_groups {
-        keys.insert(name, parse_key(keyfile, group)?);
-    }
-    for &(_, group) in &trust_groups {
-        check_trust(keyfile, group)?;
-    }
-    let names = Names {
-        keyfile,
-        trusts: trust_groups.iter().map(|(name, _)| *name).collect(),
-        keys: key_groups.iter().map(|(name, _)| *name).collect(),
-    };
-    let default_spec = match default {
-        Some(group) => parse_rule(&names, group, true)?,
-        None => RuleSpec::default(),
-    };
-    let mut rule_specs = Vec::with_capacity(rule_groups.len());
-    for (pattern, group) in rule_groups {
-        rule_specs.push((pattern, parse_rule(&names, group, false)?));
-    }
-    let (allow_privileged, sign_summary) = match default {
-        Some(group) => (
-            keyfile
-                .get_bool(group, "allow-privileged")?
-                .unwrap_or(false),
-            key_list(&names, group, "sign-summary")?,
-        ),
-        None => (false, Vec::new()),
-    };
-
     // The second pass builds each key group and each trust group once, in
-    // file order. Then it builds the trust of each remote that a rule names.
+    // file order.
     let mut signers: HashMap<&str, Arc<ServerSigner>> = HashMap::new();
     let mut trusts: HashMap<&str, Arc<TrustedKeys>> = HashMap::new();
     for (build, group) in builds {
@@ -196,269 +86,41 @@ pub(crate) async fn read(repo: &Repo, keyfile: &KeyFile, origin: Origin) -> Resu
                 let keys = TrustedKeys::for_trust_group(repo, keyfile, name, group).await?;
                 trusts.insert(name, Arc::new(keys));
             }
-            Group::Default | Group::Rule(_) => {}
-        }
-    }
-    let mut remotes: HashMap<&str, Arc<TrustedKeys>> = HashMap::new();
-    for spec in std::iter::once(&default_spec).chain(rule_specs.iter().map(|(_, spec)| spec)) {
-        if let VerifySpec::Remote(name) = &spec.verify
-            && !remotes.contains_key(name.as_str())
-        {
-            let keys =
-                TrustedKeys::for_remote_in(repo, keyfile, name, origin == Origin::Config).await?;
-            remotes.insert(name.as_str(), Arc::new(keys));
+            _ => {}
         }
     }
 
-    let rule = |spec: &RuleSpec| ReceiveRule {
-        accept: spec.accept,
-        verify: match &spec.verify {
-            VerifySpec::Off => ReceiveVerify::Off,
-            VerifySpec::Trust(name) => ReceiveVerify::Keys(Arc::clone(&trusts[name.as_str()])),
-            VerifySpec::Remote(name) => ReceiveVerify::Keys(Arc::clone(&remotes[name.as_str()])),
-        },
-        allow_non_fast_forward: spec.allow_non_fast_forward,
-        allow_delete: spec.allow_delete,
-        signers: spec
-            .sign
+    let named = |names: &[String]| -> Vec<Arc<ServerSigner>> {
+        names
             .iter()
             .map(|name| Arc::clone(&signers[name.as_str()]))
-            .collect(),
+            .collect()
     };
-    let default_rule = rule(&default_spec);
-    let rules = rule_specs
-        .iter()
-        .map(|(pattern, spec)| (pattern.clone(), rule(spec)))
-        .collect();
-    let summary_signers = sign_summary
-        .iter()
-        .map(|name| Arc::clone(&signers[name.as_str()]))
-        .collect();
-
-    let config = repo.config();
+    let summary_signers = named(access.server().sign_summary.as_deref().unwrap_or_default());
+    let update_summary = config.auto_update_summary()?;
     let exclude = config.detached_metadata_exclude()?;
     let detached_metadata_filter =
         (!exclude.is_empty()).then(|| DetachedMetadataFilter::excluding(exclude));
-    Ok(ReceivePolicy {
-        default_rule,
-        rules,
-        allow_privileged,
-        summary_signers,
-        update_summary: config.auto_update_summary()?,
-        detached_metadata_filter,
-    })
-}
-
-/// Reads the policy file at `path` and parses it as a key file.
-///
-/// The file must be a regular file of at most [`MAX_KEY_FILE`] bytes, in
-/// UTF-8. The read and the parse run on the blocking pool.
-///
-/// The function returns [`Error::InvalidFormat`], with the path in the
-/// message, if the file:
-///
-/// - cannot be opened or read,
-/// - is not a regular file,
-/// - is larger than [`MAX_KEY_FILE`] bytes,
-/// - is not valid UTF-8.
-///
-/// If the text is not a valid key file, the function returns the key-file
-/// error [`Error::Core`].
-pub(crate) async fn read_policy_file(path: &Path) -> Result<KeyFile> {
-    let path = path.to_owned();
-    ostrya_rt::unblock(move || {
-        let subject = format!("the receive policy file '{}'", path.display());
-        let refused = |e: Error| match e {
-            Error::Signature(message) => Error::InvalidFormat(message),
-            other => other,
-        };
-        // With `NONBLOCK`, the open of a fifo returns at once. Without the
-        // flag, the open waits for a writer. On a regular file, the flag has
-        // no effect on the read.
-        let fd = rustix::fs::open(
-            &path,
-            OFlags::RDONLY | OFlags::NONBLOCK | OFlags::CLOEXEC,
-            Mode::empty(),
-        )
-        .map_err(|e| Error::InvalidFormat(format!("{subject} cannot be opened: {e}")))?;
-        let bytes = read_key_source(std::fs::File::from(fd), &subject, MAX_KEY_FILE)
-            .map_err(|e| refused(e.into()))?;
-        let text = key_text(bytes, &subject).map_err(|e| refused(e.into()))?;
-        Ok(KeyFile::parse(&text)?)
-    })
-    .await
-}
-
-/// Returns the receive group that `group` names, or `None` for a group
-/// outside the receive groups.
-///
-/// If the name starts with `ex-ostrya ` and has no shape of a receive group,
-/// the function returns [`Error::InvalidFormat`].
-fn classify(group: &str) -> Result<Option<Group<'_>>> {
-    if group == DEFAULT_GROUP {
-        return Ok(Some(Group::Default));
-    }
-    if let Some(rest) = group.strip_prefix(RULE_PREFIX) {
-        return quoted(group, rest).map(|pattern| Some(Group::Rule(pattern)));
-    }
-    if let Some(rest) = group.strip_prefix(TRUST_PREFIX) {
-        return quoted(group, rest).map(|name| Some(Group::Trust(name)));
-    }
-    if let Some(rest) = group.strip_prefix(KEY_PREFIX) {
-        return quoted(group, rest).map(|name| Some(Group::Key(name)));
-    }
-    if group.starts_with(RESERVED_PREFIX) {
-        return Err(Error::InvalidFormat(format!(
-            "[{group}] is not a receive, trust, or key group"
-        )));
-    }
-    Ok(None)
-}
-
-/// Returns the quoted part of a group name.
-///
-/// `rest` is the text after the opening `"`. If the part does not end the
-/// name, is empty, or holds a `"` or a control character, the function
-/// returns [`Error::InvalidFormat`].
-fn quoted<'a>(group: &str, rest: &'a str) -> Result<&'a str> {
-    match rest.strip_suffix('"') {
-        Some(name)
-            if !name.is_empty() && !name.contains('"') && !name.contains(char::is_control) =>
-        {
-            Ok(name)
-        }
-        _ => Err(Error::InvalidFormat(format!(
-            "malformed group name [{group}]: the quoted name ends the group name, is \
-             not empty, and holds no '\"' and no control character"
-        ))),
-    }
-}
-
-/// The groups that a rule can name, for the checks of its references.
-struct Names<'a> {
-    keyfile: &'a KeyFile,
-    trusts: HashSet<&'a str>,
-    keys: HashSet<&'a str>,
-}
-
-impl Default for RuleSpec {
-    fn default() -> RuleSpec {
-        RuleSpec {
-            accept: true,
-            verify: VerifySpec::Off,
-            allow_non_fast_forward: false,
-            allow_delete: false,
-            sign: Vec::new(),
-        }
-    }
-}
-
-/// Reads the rule keys of the receive group `group`.
-///
-/// `session` is `true` for `[ex-ostrya receive]`, which also holds the
-/// session keys.
-fn parse_rule(names: &Names<'_>, group: &str, session: bool) -> Result<RuleSpec> {
-    let keyfile = names.keyfile;
-    for key in keyfile.keys(group) {
-        if RULE_KEYS.contains(&key) || (session && SESSION_KEYS.contains(&key)) {
-            continue;
-        }
-        if SESSION_KEYS.contains(&key) {
-            return Err(Error::InvalidFormat(format!(
-                "[{group}] holds '{key}', which covers the whole session and is valid \
-                 in [{DEFAULT_GROUP}] alone"
-            )));
-        }
-        return Err(unknown_key(group, key));
-    }
-    let accept = keyfile.get_bool(group, "accept")?.unwrap_or(true);
-    if !accept {
-        let dead: Vec<&str> = ACCEPT_ONLY_KEYS
-            .iter()
-            .copied()
-            .filter(|key| keyfile.get_value(group, key).is_some())
-            .collect();
-        if !dead.is_empty() {
-            return Err(Error::InvalidFormat(format!(
-                "[{group}] sets accept=false, so {} has no effect; remove it",
-                dead.join(", ")
-            )));
-        }
-    }
-    Ok(RuleSpec {
-        accept,
-        verify: parse_verify(names, group)?,
-        allow_non_fast_forward: keyfile
-            .get_bool(group, "allow-non-fast-forward")?
-            .unwrap_or(false),
-        allow_delete: keyfile.get_bool(group, "allow-delete")?.unwrap_or(false),
-        sign: key_list(names, group, "sign")?,
-    })
-}
-
-/// Reads the `verify` key of `group`.
-///
-/// The value is `off` (the default), `trust:NAME` for a trust group, or
-/// `remote:NAME` for a remote section of the same file.
-fn parse_verify(names: &Names<'_>, group: &str) -> Result<VerifySpec> {
-    let Some(raw) = names.keyfile.get_string(group, "verify")? else {
-        return Ok(VerifySpec::Off);
-    };
-    if raw == "off" {
-        return Ok(VerifySpec::Off);
-    }
-    if let Some(name) = raw.strip_prefix("trust:").filter(|name| !name.is_empty()) {
-        if !names.trusts.contains(&name) {
-            return Err(Error::InvalidFormat(format!(
-                "[{group}] verify={raw} names no [{TRUST_PREFIX}{name}\"] group"
-            )));
-        }
-        return Ok(VerifySpec::Trust(name.to_owned()));
-    }
-    if let Some(name) = raw.strip_prefix("remote:").filter(|name| !name.is_empty()) {
-        // The name is part of the path of the keyrings of the remote, so it
-        // must be one path component.
-        if !is_component(name) || name.contains(char::is_control) {
-            return Err(Error::InvalidFormat(format!(
-                "malformed [{group}] verify value '{raw}': the remote name is one path \
-                 component, not '.' or '..', with no '/' and no control character"
-            )));
-        }
-        if Remote::in_keyfile(names.keyfile, name).is_none() {
-            return Err(Error::InvalidFormat(format!(
-                "[{group}] verify={raw} names no [remote \"{name}\"] group"
-            )));
-        }
-        return Ok(VerifySpec::Remote(name.to_owned()));
-    }
-    Err(Error::InvalidFormat(format!(
-        "malformed [{group}] verify value '{raw}': the value is off, trust:NAME, or \
-         remote:NAME"
-    )))
-}
-
-/// Reads the list of key group names in the key `key` of `group`.
-///
-/// `key` is `sign` or `sign-summary`. Each entry must name a key group. An
-/// entry that occurs twice counts once.
-fn key_list(names: &Names<'_>, group: &str, key: &str) -> Result<Vec<String>> {
-    let mut kept: Vec<String> = Vec::new();
-    for name in names
-        .keyfile
-        .get_string_list(group, key)?
-        .unwrap_or_default()
-    {
-        if !names.keys.contains(&name.as_str()) {
-            return Err(Error::InvalidFormat(format!(
-                "[{group}] {key} names the key group '{name}', and no \
-                 [{KEY_PREFIX}{name}\"] group exists"
-            )));
-        }
-        if !kept.contains(&name) {
-            kept.push(name);
-        }
-    }
-    Ok(kept)
+    let policies = access
+        .groups()
+        .iter()
+        .map(|group| {
+            Arc::new(ReceivePolicy {
+                rules: group.rules().clone(),
+                verify: match group.verify_trust() {
+                    Some(name) => ReceiveVerify::Keys(Arc::clone(&trusts[name])),
+                    None => ReceiveVerify::Off,
+                },
+                allow_unsigned: group.allow_unsigned(),
+                signers: named(group.sign()),
+                allow_privileged: group.allow_privileged(),
+                summary_signers: summary_signers.clone(),
+                update_summary,
+                detached_metadata_filter: detached_metadata_filter.clone(),
+            })
+        })
+        .collect();
+    Ok((access, policies))
 }
 
 /// Checks the trust group `group`.
@@ -720,58 +382,6 @@ fn unknown_key(group: &str, key: &str) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// `classify` tells the four shapes apart, and the groups outside the
-    /// receive groups pass through.
-    #[test]
-    fn the_group_shapes_are_told_apart() {
-        assert!(matches!(
-            classify("ex-ostrya receive").unwrap(),
-            Some(Group::Default)
-        ));
-        assert!(matches!(
-            classify("ex-ostrya receive \"a/**\"").unwrap(),
-            Some(Group::Rule("a/**"))
-        ));
-        assert!(matches!(
-            classify("ex-ostrya trust \"t\"").unwrap(),
-            Some(Group::Trust("t"))
-        ));
-        assert!(matches!(
-            classify("ex-ostrya key \"k 1\"").unwrap(),
-            Some(Group::Key("k 1"))
-        ));
-        for group in ["ex-ostrya", "ex-ostryax", "core", "remote \"origin\""] {
-            assert!(classify(group).unwrap().is_none(), "{group}");
-        }
-    }
-
-    /// `classify` refuses each name that starts with `ex-ostrya ` and has no
-    /// shape of a receive group.
-    #[test]
-    fn the_other_reserved_names_are_refused() {
-        for group in [
-            "ex-ostrya receive p",
-            "ex-ostrya receive \"\"",
-            "ex-ostrya receive \"a\"b\"",
-            "ex-ostrya receive \"p\" ",
-            "ex-ostrya receive  \"p\"",
-            "ex-ostrya receive \"p",
-            "ex-ostrya receivex",
-            "ex-ostrya bogus",
-            "ex-ostrya trust",
-            "ex-ostrya trust \"\"",
-            "ex-ostrya trust \"a\tb\"",
-            "ex-ostrya key",
-            "ex-ostrya key \"a\"\"",
-            "ex-ostrya ",
-        ] {
-            let Err(err) = classify(group) else {
-                panic!("{group:?} was accepted");
-            };
-            assert!(matches!(err, Error::InvalidFormat(_)), "{group:?}: {err}");
-        }
-    }
 
     /// `verification_engine` returns the engine that a verification key
     /// names.

@@ -14,7 +14,7 @@ const ED25519_SECRET_LEN: usize = 64;
 /// A signing key of the server, with a verifier that trusts that key alone.
 ///
 /// The server signs each commit that becomes the new value of a ref with the
-/// keys in [`ReceiveRule::signers`](super::ReceiveRule::signers). Before it
+/// keys in [`ReceivePolicy::signers`](super::ReceivePolicy::signers). Before it
 /// signs, the server looks for a signature of this key in the detached
 /// metadata of the commit, stored or incoming. If it finds one, the server
 /// does not add a second signature.

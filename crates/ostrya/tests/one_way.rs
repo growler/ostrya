@@ -18,8 +18,8 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use common::receive::{
-    Obj, PIPE_CAP, assert_nothing_published, fixture_objects, new_repo, pipe, returned_code,
-    session, staging_entries,
+    Obj, PIPE_CAP, assert_nothing_published, fixture_objects, new_repo, pipe, policy_allowing,
+    returned_code, session, staging_entries,
 };
 use common::{COMMIT, TmpDir, file_inventory, foreign_holder, lock_holder_main, tool_fsck};
 use futures_io::AsyncWrite;
@@ -28,8 +28,8 @@ use ostrya::remote::proto::{CommitRequest, FrameWriter, Hello, Message, ObjectHe
 use ostrya::remote::{self, Encoding, ErrorCode, Expected, RefOutcome, RefUpdate};
 use ostrya::{
     Checksum, DictBuilder, Error, FsckOptions, MAX_METADATA_SIZE, ObjectName, ObjectType,
-    ReceivePattern, ReceivePolicy, ReceiveReport, ReceiveRule, ReceiveService, Repo, RepoMode,
-    ServerSigner, Type,
+    ReceivePattern, ReceiveReport, ReceiveService, Repo, RepoMode, ServerSigner, StreamPolicy,
+    StreamRule, Type,
 };
 use ostrya_rt::block_on;
 
@@ -76,19 +76,19 @@ fn detached_meta() -> Vec<u8> {
 /// A policy that accepts every remote ref, with a server key on each rule, a
 /// summary key, and summary regeneration. The one-way receiver ignores the
 /// keys and the summary step.
-fn policy() -> ReceivePolicy {
+fn policy() -> StreamPolicy {
     let secret = ostrya::base64::decode(SERVER_SECRET_B64).unwrap();
     let signer = Arc::new(ServerSigner::ed25519(&secret).unwrap());
-    let rule = ReceiveRule {
+    let rule = StreamRule {
         signers: vec![signer.clone()],
-        ..ReceiveRule::default()
+        ..StreamRule::default()
     };
-    ReceivePolicy {
+    StreamPolicy {
         default_rule: rule.clone(),
         rules: vec![(ReceivePattern::parse("*:**").unwrap(), rule)],
         summary_signers: vec![signer],
         update_summary: true,
-        ..ReceivePolicy::default()
+        ..StreamPolicy::default()
     }
 }
 
@@ -221,7 +221,7 @@ fn fixture_stream(encoding: Encoding) -> Stream {
 /// pipe.
 fn receive_piped(
     repo: &Repo,
-    policy: &ReceivePolicy,
+    policy: &StreamPolicy,
     bytes: Vec<u8>,
 ) -> ostrya::Result<ReceiveReport> {
     let (mut writer, reader) = pipe(PIPE_CAP);
@@ -236,7 +236,7 @@ fn receive_piped(
     result
 }
 
-fn receive(repo: &Repo, policy: &ReceivePolicy, bytes: &[u8]) -> ostrya::Result<ReceiveReport> {
+fn receive(repo: &Repo, policy: &StreamPolicy, bytes: &[u8]) -> ostrya::Result<ReceiveReport> {
     block_on(repo.receive_stream(bytes, policy))
 }
 
@@ -330,7 +330,8 @@ fn a_stream_commits_into_a_repository_without_locking() {
     assert_eq!(report.refs.len(), 2);
     assert!(repo.path().join("refs/heads/test/main").exists());
 
-    let (result, error) = session(&repo, &policy, |mut c| async move {
+    let two_way = policy_allowing(&["w:**"]);
+    let (result, error) = session(&repo, &two_way, |mut c| async move {
         c.hello(&["test/main"]).await.unwrap();
         c.error().await
     });
@@ -688,7 +689,7 @@ fn the_two_way_receiver_refuses_a_one_way_hello() {
     };
     let tmp = TmpDir::new("one-way-two-way");
     let (repo, before) = empty_repo(&tmp, "");
-    let policy = Arc::new(policy());
+    let policy = Arc::new(policy_allowing(&["w:**"]));
     let hello = one_way.clone();
     let (result, error) = session(&repo, &policy, |mut c| async move {
         c.send(&Message::Hello(hello)).await.unwrap();
@@ -901,14 +902,14 @@ mod export {
     }
 
     /// A policy that accepts privileged content and every remote ref.
-    fn export_policy() -> ReceivePolicy {
-        ReceivePolicy {
+    fn export_policy() -> StreamPolicy {
+        StreamPolicy {
             rules: vec![(
                 ReceivePattern::parse("*:**").unwrap(),
-                ReceiveRule::default(),
+                StreamRule::default(),
             )],
             allow_privileged: true,
-            ..ReceivePolicy::default()
+            ..StreamPolicy::default()
         }
     }
 
@@ -931,7 +932,7 @@ mod export {
     fn export_piped(
         source: &Repo,
         target: &Repo,
-        policy: &ReceivePolicy,
+        policy: &StreamPolicy,
         opts: ExportStreamOptions,
     ) -> (ostrya::Result<ReceiveReport>, ostrya::Result<PushStats>) {
         let (mut writer, reader) = pipe(PIPE_CAP);

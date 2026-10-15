@@ -3761,16 +3761,20 @@ pulls from it with `ostree pull-local`. The tool pulls from `serve` with
 ### `receive`
 
 ```text
-ostrya receive [--repo=PATH] [--policy=FILE]
+ostrya receive [--repo=PATH]
 ```
 
 - The `receive` feature of `ostrya-cli` builds the command. It is in the
   default set.
 - The command runs one push session over standard input and standard
-  output. It reads the receive groups, the trust groups, the key groups, and
-  the remote sections from the repository config, or from `FILE` alone under
-  `--policy`. `[core] auto-update-summary` and `[ex-ostrya]
-  detached-metadata-exclude` come from the repository config in both cases.
+  output. At start it reads and checks the client groups, the server group,
+  the trust groups, and the key groups of the repository config
+  (`ostrya-config(1)`, "CLIENT AND SERVER GROUPS"). It builds each trust
+  group and each key group. A bad group ends the command with
+  `error: MESSAGE` at exit 1, before it reads its input.
+- The session selects no client group, so it opens no push session: the
+  `Hello` gets `ref-denied`, and the command exits 1. The command takes no
+  `--policy`, and the option parser refuses it at exit 1.
 - Standard output carries the frames of the session alone. The command
   writes one `warning: STEP: MESSAGE` line to standard error for each
   warning of the session, and `error: MESSAGE` on failure. It writes
@@ -3804,8 +3808,8 @@ ostrya push [--repo=PATH] REMOTE SRC[:DST]...
   revision reads as a commit checksum, are refused with `error: Invalid
   refspec DST` at exit 1. The refusal comes after `REMOTE` resolves and before the ssh client
   starts or the first HTTP request. A delete `:DST` of a `DST` of 64
-  lowercase hex characters passes, and the server removes the ref where its
-  rule allows the delete.
+  lowercase hex characters passes, and the server removes the ref where the
+  client group has `r` and `d` on it.
 - The command checks its operands after the repository opens. With no
   `REMOTE` it writes the usage text and `error: REMOTE must be specified`.
   With no refspec it writes the usage text and `error: REFSPEC must be
@@ -3825,8 +3829,9 @@ ostrya push [--repo=PATH] REMOTE SRC[:DST]...
   below `-1` is refused before the ssh client starts and before the first
   HTTP request.
 - `--force` sends each update with any expected state, and asks the server
-  to allow an update that is not a fast-forward. The receive policy of the
-  server refuses such an update unless it sets `allow-non-fast-forward`.
+  to allow an update that is not a fast-forward. The server refuses such an
+  update unless the client group of the push has `w` and `d` on the ref
+  (`ostrya-config(1)`, "Access modes and patterns").
 - `--compress` sends content objects deflated at level 6, and
   `--compress=LEVEL` at `LEVEL`, 1 to 9. The value needs the `=` form.
   Without the option, the push sends them raw. An `archive` repository
@@ -4030,7 +4035,7 @@ ostrya serve [--repo=PATH] [--listen=ADDR:PORT]...
              [--body-timeout=SECONDS]
              (--read-only |
               [--push-credentials=FILE] [--allow-anonymous-push]
-              [--allow-cleartext-credentials] [--policy=FILE]
+              [--allow-cleartext-credentials]
               [--session-timeout=SECONDS] [--max-sessions=N]
               [--parallel-uploads=N])
 ```
@@ -4083,8 +4088,13 @@ ostrya serve [--repo=PATH] [--listen=ADDR:PORT]...
   `Error::Options`.
 - With `--client-ca`, a client certificate that the CA signed is a method
   of push. A request with no `Authorization` header and with such a
-  certificate pushes.
-- `--allow-anonymous-push` lets a request with no credential push.
+  certificate passes the authentication.
+- `--allow-anonymous-push` lets a request with no credential pass the
+  authentication.
+- The endpoint selects no client group, so it opens no push session. A
+  `session` request that passes the authentication and the checks of
+  `Hello` gets 403 with `unauthorized` and the message `the policy of the
+  server opens no push session`.
 - Without `--allow-cleartext-credentials`, a request of the receive endpoint
   with a bearer or Basic credential over plain HTTP gets 403, also with
   `--allow-anonymous-push`. The switch takes such a credential. Use it for a
@@ -4096,19 +4106,22 @@ ostrya serve [--repo=PATH] [--listen=ADDR:PORT]...
   body within `--session-timeout` or 5 seconds, whichever is shorter, and
   then answers. On HTTP/1.1 a body that did not reach its end gets
   `Connection: close`.
-- `--push-credentials`, `--allow-cleartext-credentials`, `--policy`,
+- `--push-credentials`, `--allow-cleartext-credentials`,
   `--allow-anonymous-push`, `--session-timeout`, `--max-sessions`, and
   `--parallel-uploads` each conflict with `--read-only`. The pair is refused
   with the argument error of the option parser at exit 1. A default value
   is no conflict.
-- The receive policy comes from the receive groups, the trust groups, the
-  key groups, and the remote sections of the repository config, or from
-  `FILE` alone under `--policy`. `[core] auto-update-summary` and
-  `[ex-ostrya] detached-metadata-exclude` come from the repository config
-  in both cases. The command reads the policy and the repository settings
-  of the endpoint once, at start, before it binds a listener, and a change
-  applies at the next start. A policy that cannot be read ends the command
-  with `error: MESSAGE` at exit 1.
+- At start, before it binds a listener, the command reads and checks the
+  client groups and the server group of the repository config
+  (`ostrya-config(1)`, "CLIENT AND SERVER GROUPS"). The start checks take
+  the TLS files from `--tls-cert`, `--tls-key`, and `--client-ca` alone,
+  because the server runs with these files. `tls-cert`, `tls-key`, and
+  `tls-client-ca` of `[ex-ostrya server]` do not change the checks. Without
+  `--read-only`, the command also builds each trust group and each key
+  group. A bad group ends the command with `error: MESSAGE` at exit 1. The
+  command reads the groups and the repository settings of the endpoint
+  once, and a change applies at the next start. The command takes no
+  `--policy`, and the option parser refuses it at exit 1.
 - `--session-timeout` takes a positive number of seconds, and the default
   is 300. A push session with no request in progress for that time is
   aborted, and so is a push session with a request body that delivers no
@@ -4222,15 +4235,16 @@ An `authorized_keys` entry restricts an ssh key to push into one
 repository:
 
 ```text
-restrict,command="ostrya receive --repo=/srv/repo --policy=/etc/ostrya/receive.conf" ssh-ed25519 AAAA...
+restrict,command="ostrya receive --repo=/srv/repo" ssh-ed25519 AAAA...
 ```
 
 - sshd runs the forced command and ignores the command of the client. The
   `ostrya receive --repo='PATH'` of the client reaches the server only in
   the `SSH_ORIGINAL_COMMAND` environment variable. So the key pushes into
   the forced repository, whatever path the address holds.
-- Give absolute paths to `--repo` and `--policy`. A policy that must hold
-  against the pusher is in a file that the pusher cannot write.
+- Give an absolute path to `--repo`. The client groups that must hold
+  against the pusher are in a repository config that the pusher cannot
+  write.
 - sshd runs the `command=` string through the login shell of the user, with
   `-c`. The shell and its startup files must write nothing to standard
   output, because standard output carries the frames of the session.

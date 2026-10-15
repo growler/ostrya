@@ -75,10 +75,14 @@ use ostrya::{ReceiveHooks, ReceivePolicy};
 ///     }
 /// }
 ///
-/// fn endpoint(repo: Repo, token: &str) -> ostrya_server::Result<ReceiveEndpoint<OneToken>> {
+/// fn endpoint(
+///     repo: Repo,
+///     token: &str,
+///     policy: Arc<ReceivePolicy>,
+/// ) -> ostrya_server::Result<ReceiveEndpoint<OneToken>> {
 ///     let auth = OneToken {
 ///         header: format!("Bearer {token}"),
-///         policy: Arc::new(ReceivePolicy::default()),
+///         policy,
 ///     };
 ///     ReceiveEndpoint::new(repo, auth, EndpointOptions::default())
 /// }

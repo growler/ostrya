@@ -281,15 +281,16 @@ Detached metadata keys that are not stored.
 \fB\%ostrya push\fR does not send these keys.
 \fB\%ostrya receive\fR and \fB\%ostrya serve\fR remove them from each commit that a push gives.
 \fB\%ostrya send\fR and \fB\%ostrya serve\fR serve a stored \fB\%.commitmeta\fR unchanged.
-.SH RECEIVE POLICY
-The receive policy controls what \fB\%ostrya receive\fR and \fB\%ostrya serve\fR accept from a push.
-These groups are extensions of ostrya:
+.SH CLIENT AND SERVER GROUPS
+Client groups control the access to a repository through \fB\%ostrya serve\fR, \fB\%ostrya receive\fR, and \fB\%ostrya send\fR.
+A client group states how a client authenticates, which refs it can read and change in one namespace, how the server verifies its commits, and which keys sign them.
+These groups are extensions of ostrya, and the \fB\%ostree\fR tool ignores them:
 .TP
-\fB\%[ex\-ostrya receive]\fR
-The default rule, and the session keys.
+\fB\%[ex\-ostrya server]\fR
+The settings of \fB\%ostrya serve\fR.
 .TP
-\fB\%[ex\-ostrya receive "PATTERN"]\fR
-The rule of the refs that \fB\%PATTERN\fR matches.
+\fB\%[ex\-ostrya client "NAME"]\fR
+One client group.
 .TP
 \fB\%[ex\-ostrya trust "NAME"]\fR
 A set of trusted keys.
@@ -297,64 +298,243 @@ A set of trusted keys.
 \fB\%[ex\-ostrya key "NAME"]\fR
 A signing key of the server.
 .PP
-ostrya refuses an unknown key, a key that has no effect, a reference to a group that does not exist, and a group name that starts with \fB\%ex\-ostrya \fR and has no form of this list.
+ostrya refuses an unknown key, a reference to a group that does not exist, and a group name that starts with \fB\%ex\-ostrya \fR and has no form of this list.
+It refuses \fB\%[ex\-ostrya receive]\fR and \fB\%[ex\-ostrya receive "PATTERN"]\fR, with a message that names \fB\%[ex\-ostrya client "NAME"]\fR.
 The quoted part of a group name is not empty and holds no \fB\%"\fR and no control character.
+A repeated key takes the last value, so each list key is one line in a group.
 .PP
-ostrya builds each trust group and each key group one time when it reads the policy, also a group that no rule names.
-Thus a key source that ostrya cannot read makes the read of the policy fail.
-.SS "Patterns"
-\fB\%PATTERN\fR is \fB\%NAME\fR for the local refs, \fB\%REMOTE:NAME\fR for the refs of the remote \fB\%REMOTE\fR, or \fB\%*:NAME\fR for the refs of each remote.
-\fB\%NAME\fR is a series of parts split at \fB\%/\fR.
-Each part is a literal, \fB\%*\fR for exactly one part, or \fB\%**\fR for one or more parts.
-For example, \fB\%apps/*\fR matches \fB\%apps/web\fR and does not match \fB\%apps/web/db\fR.
-\fB\%apps/**\fR matches both, and neither pattern matches \fB\%apps\fR.
+\fB\%ostrya receive\fR and \fB\%ostrya serve\fR read and check the client groups and the server group at start.
+\fB\%ostrya receive\fR, and \fB\%ostrya serve\fR without \fB\%\-\-read\-only\fR, also build each trust group and each key group one time, also a group that no client group names.
+Thus a key source that ostrya cannot read stops the command.
+A bad group stops the command with status 1.
+The two commands select no client group for a session, so no push session opens: \fB\%ostrya receive\fR answers \fB\%ref\-denied\fR, and \fB\%ostrya serve\fR answers 403.
+\fB\%ostrya serve\fR takes its addresses, its TLS files, and its session limits from its options, and checks the client groups against its TLS options.
+.SS "Server keys"
+The keys of \fB\%[ex\-ostrya server]\fR.
+An option of \fB\%ostrya serve\fR with the name of a key has precedence over the key.
+A relative path in a key is relative to the repository directory.
+An empty value of \fB\%listen\fR, \fB\%trusted\-proxy\fR, \fB\%sign\-summary\fR, \fB\%tls\-cert\fR, \fB\%tls\-key\fR, or \fB\%tls\-client\-ca\fR is refused.
+To get the default, remove the key.
+.TP
+\fB\%listen\fR (list of \fB\%ADDR:PORT\fR, default \fB\%127.0.0.1:8080\fR)
+The addresses to listen on.
+A host name is refused.
+.TP
+\fB\%tls\-cert\fR (string)
+The PEM certificate chain.
+It needs \fB\%tls\-key\fR.
+.TP
+\fB\%tls\-key\fR (string)
+The PEM private key.
+It needs \fB\%tls\-cert\fR.
+.TP
+\fB\%tls\-client\-ca\fR (string)
+The PEM CA certificates that verify a client certificate.
+It needs \fB\%tls\-cert\fR or \fB\%trusted\-proxy\-client\-cert\fR.
+The server verifies the certificate of the TLS handshake and the certificate that a proxy forwards with these certificates.
+.TP
+\fB\%trusted\-proxy\fR (list of CIDR)
+The peers whose forwarding data the server reads.
+From such a peer, the server reads \fB\%Forwarded\fR, \fB\%X\-Forwarded\-For\fR, and \fB\%X\-Real\-IP\fR, in this order, and walks the hops from the right.
+The first hop that is not a trusted proxy is the client address.
+\fB\%X\-Forwarded\-Proto: https\fR or a \fB\%Forwarded\fR \fB\%proto=https\fR makes the request count as TLS.
+.TP
+\fB\%trusted\-proxy\-client\-cert\fR (string)
+The name of the request header that carries the client certificate from a trusted proxy.
+The name is one or more ASCII letters, digits, and the characters \fB\%!#$%&'*+\-.^_`|~\fR.
+It needs \fB\%tls\-client\-ca\fR and \fB\%trusted\-proxy\fR.
+The value is a URL\-escaped PEM certificate or a base64 DER certificate.
+.TP
+\fB\%proxy\-protocol\fR (boolean, default false)
+Each connection starts with a PROXY protocol v1 or v2 header, whose source address is the client address.
+.TP
+\fB\%allow\-cleartext\-credentials\fR (boolean, default false)
+Take a bearer or Basic credential on a connection with no TLS.
+.TP
+\fB\%session\-timeout\fR (integer, 1 or more)
+The idle time of a push session, in seconds.
+.TP
+\fB\%max\-sessions\fR (integer, 1 or more)
+The number of push sessions at the same time.
+.TP
+\fB\%parallel\-uploads\fR (integer, 1 to 31)
+The number of object streams of a push session at the same time.
+.TP
+\fB\%body\-timeout\fR (integer, 1 or more)
+The time in seconds that a response waits for the client to take its next bytes.
+.TP
+\fB\%sign\-summary\fR (list)
+The key groups whose keys sign the summary that a push writes again.
+A name that occurs two times counts one time.
 .PP
-For each ref, the server selects one rule:
-.IP 1. 3
-A remote ref matches only a pattern with a remote part, and a local ref only a pattern without one.
-.IP 2. 3
-A literal remote part has precedence over \fB\%*:\fR.
-.IP 3. 3
-The parts of \fB\%NAME\fR compare from the left.
-At the first part where two patterns differ, a literal has precedence over \fB\%*\fR, and \fB\%*\fR over \fB\%**\fR.
-A longer pattern has precedence over a pattern that is its start.
-If the patterns are equal in kind, the first rule in the file applies.
-.IP 4. 3
-A local ref that no pattern matches gets the default rule.
-A remote ref that no pattern matches is refused.
-.SS "Rule keys"
-Each receive group takes these keys.
-A pattern rule takes no key from the default rule.
+A CIDR value, in \fB\%trusted\-proxy\fR and in a \fB\%net:\fR item, is \fB\%ADDR/LEN\fR or a bare \fB\%ADDR\fR.
+A bare IPv4 address is \fB\%ADDR/32\fR, and a bare IPv6 address is \fB\%ADDR/128\fR.
+\fB\%LEN\fR has decimal digits alone, with no sign and no leading zero.
+A value with host bits set, for example \fB\%10.0.0.1/24\fR, is refused.
+An IPv6 address with a zone id is refused.
+An IPv4\-mapped IPv6 address is refused, and the IPv4 form names the same network.
+.SS "Client keys"
+The keys of \fB\%[ex\-ostrya client "NAME"]\fR.
 .TP
-\fB\%accept\fR (boolean, default true)
-\fB\%false\fR refuses each update of a matching ref.
-A rule with \fB\%accept=false\fR refuses each other rule key.
+\fB\%auth\fR (list)
+The authentication items of the group.
+The key is necessary.
+An item that occurs two times counts one time.
 .TP
-\fB\%verify\fR (string, default off)
-\fB\%off\fR, \fB\%trust:NAME\fR for the keys of \fB\%[ex\-ostrya trust "NAME"]\fR, or \fB\%remote:NAME\fR for the keys that a pull from \fB\%[remote "NAME"]\fR trusts.
-The \fB\%NAME\fR of \fB\%remote:NAME\fR is one path component: it is not \fB\%.\fR or \fB\%..\fR, and it holds no \fB\%/\fR and no control character.
-A \fB\%remote:NAME\fR whose remote turns on no check is refused.
+\fB\%collection\fR (list, or \fB\%*\fR)
+The namespace of the group.
+Without the key, the group applies to the local refs.
+A list names one or more collection ids.
+\fB\%*\fR, as the whole value, names each collection other than the own collection of the repository.
+Each id must pass the collection\-id rule, and the own collection id is refused, because its refs are the local refs.
 .TP
-\fB\%allow\-non\-fast\-forward\fR (boolean, default false)
-Accept a ref update whose new commit does not descend from the current commit.
+\fB\%allow\fR (list)
+The allow items, each \fB\%[MODES:]PATTERN\fR.
+Without the key, the group has no right on a ref.
 .TP
-\fB\%allow\-delete\fR (boolean, default false)
-Accept the delete of a ref.
+\fB\%deny\fR (list)
+The deny items, each a \fB\%PATTERN\fR.
+.TP
+\fB\%tls\-accept\-claim\fR (boolean, default false)
+Read the claims of the client certificate.
+A group with no \fB\%tls:\fR or \fB\%tls\-sha256:\fR item refuses the key, with any value.
+.TP
+\fB\%verify\fR (string)
+\fB\%trust:NAME\fR, the trust group that verifies each commit that a client builds and pushes.
+Each other value is refused, \fB\%off\fR and \fB\%remote:NAME\fR included.
+Without the key, the group verifies no signature.
+.TP
+\fB\%allow\-unsigned\fR (boolean)
+Accept a pushed commit that has no signature.
+A commit has no signature if its detached metadata holds no blob under \fB\%ostree.gpgsigs\fR, \fB\%ostree.sign.ed25519\fR, \fB\%ostree.sign.spki\fR, and \fB\%ostree.sign.dummy\fR.
+A commit with a signature must verify on each axis of the trust group, also when the key is true, so a signature of an engine that the trust group does not read is refused.
+The default is true without \fB\%verify\fR, and false with \fB\%verify\fR.
+\fB\%allow\-unsigned=false\fR needs \fB\%verify\fR.
 .TP
 \fB\%sign\fR (list)
-The key groups whose keys sign each new commit of a matching ref.
+The key groups whose keys sign each new commit of a ref update of the group.
 A name that occurs two times counts one time.
-.SS "Session keys"
-Only \fB\%[ex\-ostrya receive]\fR takes these keys.
+An empty value is refused.
 .TP
 \fB\%allow\-privileged\fR (boolean, default false)
 In a \fB\%bare\fR repository, accept the setuid and setgid bits, and the extended attributes \fB\%security.capability\fR and \fB\%security.selinux\fR.
 The rule applies to each content object and each dirmeta object that a session receives, also to an object that the repository already holds.
 A session on a \fB\%bare\fR repository needs a server that runs as root.
+.SS "Authentication items"
+\fB\%auth\fR is a list.
+A group matches when one of its items matches.
 .TP
-\fB\%sign\-summary\fR (list)
-The key groups whose keys sign the summary that a push writes again.
-A name that occurs two times counts one time.
+\fB\%anonymous\fR
+A request with no credential and no client address match.
+.TP
+\fB\%tls:*\fR
+A client certificate that \fB\%tls\-client\-ca\fR verified.
+.TP
+\fB\%tls:NAME\fR
+A verified client certificate whose subject holds exactly one CN, of type UTF8String or PrintableString, equal to \fB\%NAME\fR byte for byte.
+.TP
+\fB\%tls\-sha256:HEX\fR
+A verified client certificate whose DER bytes have the SHA\-256 digest \fB\%HEX\fR.
+.TP
+\fB\%token\-sha256:HEX\fR
+A bearer token whose SHA\-256 digest is \fB\%HEX\fR.
+The digest covers the whole token.
+.TP
+\fB\%basic\-sha256:USER:HEX\fR
+A Basic credential whose user name is \fB\%USER\fR and whose password has the SHA\-256 digest \fB\%HEX\fR.
+The item splits at the last \fB\%:\fR.
+\fB\%USER\fR is not empty and holds no \fB\%:\fR and no control character.
+.TP
+\fB\%ssh:NAME\fR
+An ssh session whose client name is \fB\%NAME\fR.
+.TP
+\fB\%net:CIDR\fR
+A request whose client address is in \fB\%CIDR\fR.
+.PP
+\fB\%HEX\fR is 64 lowercase hex digits.
+\fB\%NAME\fR and \fB\%USER\fR do not start or end with white space.
+Two items are the same when their values are equal after the parse, so \fB\%net:2001:0db8::/56\fR and \fB\%net:2001:db8::/56\fR are the same item.
+.SS "Access modes and patterns"
+An allow item is \fB\%[MODES:]PATTERN\fR.
+\fB\%MODES\fR is one or more of these letters, each at most one time, in any order, and an item with no \fB\%MODES\fR has the mode \fB\%r\fR:
+.TP
+\fB\%r\fR
+Read the ref.
+.TP
+\fB\%w\fR
+Write a commit that the client built to the ref, as a fast\-forward.
+.TP
+\fB\%c\fR
+Let the server make a commit on the branch.
+.TP
+\fB\%t\fR
+Create the ref as a tag.
+An update with \fB\%t\fR and no \fB\%w\fR creates an absent ref, and gets \fB\%ref\-mismatch\fR for a ref that exists, also with the current commit.
+.TP
+\fB\%d\fR
+Delete the ref.
+.PP
+\fB\%w\fR, \fB\%c\fR, and \fB\%t\fR add \fB\%r\fR, and \fB\%d\fR does not.
+\fB\%wd\fR allows a push that is not a fast\-forward, when the client sends \fB\%\-\-force\fR.
+\fB\%cd\fR allows a server commit with no parent on a branch that exists.
+.PP
+\fB\%PATTERN\fR is a series of parts split at \fB\%/\fR.
+Each part is a literal, \fB\%*\fR for exactly one part, or \fB\%**\fR for one or more parts.
+For example, \fB\%apps/*\fR matches \fB\%apps/web\fR and does not match \fB\%apps/web/db\fR.
+\fB\%apps/**\fR matches both, and neither pattern matches \fB\%apps\fR.
+A pattern has no remote part and no collection part.
+.PP
+The effective rights of a ref are the union of the modes of each allow item that matches the ref.
+When a deny item matches the ref, the ref has no mode.
+A push session follows these rules:
+.IP \(bu 2
+A group opens a push session only when an allow item has \fB\%w\fR, \fB\%c\fR, \fB\%t\fR, or \fB\%d\fR.
+.IP \(bu 2
+Each ref of the session needs \fB\%r\fR.
+So a delete needs \fB\%r\fR and \fB\%d\fR, for example the item \fB\%rd:PATTERN\fR.
+.IP \(bu 2
+An update that writes a commit needs \fB\%w\fR or \fB\%t\fR.
+.IP \(bu 2
+A push writes no remote ref, and no \fB\%ostree\-metadata\fR in a repository with a collection id.
+.IP \(bu 2
+The parent chain of a new branch can stop at any depth.
+On a branch that exists, the chain of the new commit must reach the current commit, else the update is \fB\%non\-fast\-forward\fR.
+.SS "No client group"
+A repository with no client group has two groups:
+.PP
+.nf
+[ex\-ostrya client "anonymous"]
+auth=anonymous
+allow=r:**
+
+[ex\-ostrya client "anonymous\-collections"]
+auth=anonymous
+collection=*
+allow=r:**
+.fi
+.SS "Start checks"
+ostrya refuses the config in these cases:
+.IP \(bu 2
+Two groups carry the same item, and their namespaces overlap: both have no \fB\%collection\fR, both name one id, or both have \fB\%*\fR.
+.IP \(bu 2
+A group has \fB\%tls\-accept\-claim\fR and no \fB\%tls:\fR or \fB\%tls\-sha256:\fR item.
+.IP \(bu 2
+A group has \fB\%allow\-unsigned=false\fR and no \fB\%verify\fR.
+.IP \(bu 2
+A \fB\%collection\fR value is the own collection id, or fails the collection\-id rule.
+.IP \(bu 2
+A \fB\%verify\fR, \fB\%sign\fR, or \fB\%sign\-summary\fR value names a trust group or a key group that does not exist.
+.PP
+\fB\%ostrya serve\fR also refuses to start in these cases.
+It takes the TLS files from its options alone, also when the server group sets \fB\%tls\-cert\fR, \fB\%tls\-key\fR, or \fB\%tls\-client\-ca\fR:
+.IP \(bu 2
+A \fB\%tls:\fR or \fB\%tls\-sha256:\fR item exists, and the server has no \fB\%tls\-client\-ca\fR.
+.IP \(bu 2
+\fB\%trusted\-proxy\-client\-cert\fR is set, and the server has no \fB\%tls\-client\-ca\fR or no \fB\%trusted\-proxy\fR.
+.IP \(bu 2
+\fB\%tls\-cert\fR is set and \fB\%tls\-key\fR is not, or the reverse.
+.IP \(bu 2
+\fB\%tls\-client\-ca\fR is set, and \fB\%tls\-cert\fR and \fB\%trusted\-proxy\-client\-cert\fR are not.
 .SS "Trust keys"
 A trust group takes the remote keys \fB\%gpg\-verify\fR (default false here), \fB\%gpgkeypath\fR, \fB\%sign\-verify\fR, \fB\%verification\-ENGINE\-key\fR, and \fB\%verification\-ENGINE\-file\fR.
 It trusts the keys that it names, and no system key store or keyring.
@@ -382,13 +562,6 @@ For \fB\%gpg\fR: a selector that names exactly one secret key.
 \fB\%gpg\-homedir\fR (string)
 For \fB\%gpg\fR: the GnuPG home directory.
 It is optional.
-.SS "Policy file"
-\fB\%ostrya receive \-\-policy=FILE\fR and \fB\%ostrya serve \-\-policy=FILE\fR read the receive groups, the trust groups, the key groups, and the remote groups from \fB\%FILE\fR.
-They then ignore these groups in \fB\%<repo>/config\fR.
-\fB\%FILE\fR holds no other group.
-A remote group in \fB\%FILE\fR can be one that no rule names.
-\fB\%[core] auto\-update\-summary\fR and \fB\%[ex\-ostrya] detached\-metadata\-exclude\fR still come from \fB\%<repo>/config\fR.
-A \fB\%remote:NAME\fR reference then does not read \fB\%<repo>/NAME.trustedkeys.gpg\fR.
 .SH KEYS WITHOUT EFFECT
 ostrya keeps these keys and does not use them:
 .TP
@@ -436,12 +609,12 @@ sign\-verify=ed25519
 verification\-ed25519\-file=/etc/ostrya/origin.ed25519
 .fi
 .PP
-A receive policy that accepts the refs below \fB\%apps/\fR with a trusted signature, and refuses each other ref:
+A client group that reads each ref and pushes the refs below \fB\%apps/\fR with a trusted signature:
 .PP
 .nf
-[ex\-ostrya receive]
-accept=false
-[ex\-ostrya receive "apps/**"]
+[ex\-ostrya client "builder"]
+auth=ssh:builder
+allow=r:**;w:apps/**
 verify=trust:release
 [ex\-ostrya trust "release"]
 sign\-verify=ed25519

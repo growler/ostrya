@@ -8,7 +8,7 @@ ostrya serve [OPTIONS]
 .SH DESCRIPTION
 Serve the repository over HTTP as an archive repository for pull.
 .PP
-The repository can be in any mode that ostrya reads. In a mode other than \fB\%archive\fR, the server builds each \fB\%\&.filez\fR object on request. The server also answers the ref listing at \fB\%/_ostrya/refs/v1\fR\&. Without \%\-\-read\-only, the server also has the receive endpoint of a push, and the command needs a method of push authentication.
+The repository can be in any mode that ostrya reads. In a mode other than \fB\%archive\fR, the server builds each \fB\%\&.filez\fR object on request. The server also answers the ref listing at \fB\%/_ostrya/refs/v1\fR\&. Without \%\-\-read\-only, the server also has the receive endpoint of a push, and the command needs a method of push authentication. At start, the command reads and checks the client groups and the server group of the repository config. Without \%\-\-read\-only, it also reads the trust groups and the key groups. A bad group ends the command with status \%1. The endpoint selects no client group, so it opens no push session: each session request that passes the authentication gets \%403.
 .PP
 When all listeners are bound, the command writes the URL of each listener to standard output, one line each. Then it serves until the process ends. For each push session that commits, the command writes one \fB\%warning: STEP: MESSAGE\fR line to standard error for each warning of the session.
 .SH OPTIONS
@@ -31,7 +31,7 @@ The command refuses an encrypted key, because it has no option for a passphrase.
 \fB\-\-client\-ca\fR \fIFILE\fR
 Verify client certificates against the CA certificates in FILE, in PEM.
 .IP
-The option needs \%\-\-tls\-cert. A client that presents a certificate must present one that the CA signed. A client that presents no certificate is served. A client certificate that the CA signed is a method of push authentication.
+The option needs \%\-\-tls\-cert. A client that presents a certificate must present one that the CA signed. A client that presents no certificate is served. A client certificate that the CA signed is a method of push authentication. The start checks of the client groups take the client CA from this option alone, also when \fB\%[ex\-ostrya server]\fR sets \fB\%tls\-client\-ca\fR\&.
 .TP
 \fB\-\-read\-only\fR
 Serve the files of a pull alone, with no receive endpoint.
@@ -41,20 +41,17 @@ Without this switch, the command needs a method of push authentication: \%\-\-pu
 \fB\-\-push\-credentials\fR \fIFILE\fR
 Take the push credentials in FILE, one \%NAME:HEX line each.
 .IP
-HEX is the \%SHA\-256 digest of the token in \%64 lowercase hex digits. The command skips an empty line and a line that starts with \fB\%#\fR, and a malformed line stops the command at start. A bearer token pushes if its digest matches a line. A Basic credential \%NAME:TOKEN pushes if the digest of TOKEN matches the line of NAME. Without \%\-\-tls\-cert, the option needs \%\-\-allow\-cleartext\-credentials or \%\-\-allow\-anonymous\-push. The command reads FILE once, at start, and refuses a file larger than \%1 MiB.
+HEX is the \%SHA\-256 digest of the token in \%64 lowercase hex digits. The command skips an empty line and a line that starts with \fB\%#\fR, and a malformed line stops the command at start. A bearer token passes the authentication if its digest matches a line. A Basic credential \%NAME:TOKEN passes if the digest of TOKEN matches the line of NAME. A request that passes opens no push session and gets \%403. Without \%\-\-tls\-cert, the option needs \%\-\-allow\-cleartext\-credentials or \%\-\-allow\-anonymous\-push. The command reads FILE once, at start, and refuses a file larger than \%1 MiB.
 .TP
 \fB\-\-allow\-cleartext\-credentials\fR
 Take a bearer or Basic credential of push over plain HTTP.
 .IP
 Without this switch, the receive endpoint answers \%403 to such a request, also with \%\-\-allow\-anonymous\-push. Use it for a server on a loopback address or behind a proxy that terminates TLS. A read of the files of a pull needs no credential.
 .TP
-\fB\-\-policy\fR \fIFILE\fR
-Read the receive policy from FILE in place of the repository config.
-.IP
-FILE holds the receive, trust, and key groups and the remote sections, in the \%key\-file format of the config. The command then ignores these groups and sections in the repository config. \fB\%[core] auto\-update\-summary\fR and \fB\%[ex\-ostrya] detached\-metadata\-exclude\fR still come from the repository config. The command reads the policy once, at start. FILE must be a regular \%UTF\-8 file of \%1 MiB or less.
-.TP
 \fB\-\-allow\-anonymous\-push\fR
-Let a request with no credential push.
+Let a request with no credential pass the authentication of a push.
+.IP
+A request that passes opens no push session and gets \%403.
 .TP
 \fB\-\-session\-timeout\fR \fISECONDS\fR
 Abort a push session that stays idle for SECONDS.

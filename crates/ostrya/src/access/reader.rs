@@ -23,9 +23,10 @@ const CLIENT_PREFIX: &str = "ex-ostrya client \"";
 const TRUST_PREFIX: &str = "ex-ostrya trust \"";
 /// The name prefix of a key group, before the quoted name.
 const KEY_PREFIX: &str = "ex-ostrya key \"";
-/// The name of the default receive group.
+/// The name of a receive group of the removed receive policy.
 const RECEIVE_GROUP: &str = "ex-ostrya receive";
-/// The name prefix of a receive pattern group, before the quoted pattern.
+/// The name prefix of a receive pattern group of the removed receive policy,
+/// before the quoted pattern.
 const RECEIVE_PREFIX: &str = "ex-ostrya receive \"";
 /// The name prefix of each group of the extensions. A group name with this
 /// prefix and no known shape is refused.
@@ -61,7 +62,7 @@ const SERVER_KEYS: &[&str] = &[
 ];
 
 /// One group of the extensions, by the shape of its name.
-enum Group<'a> {
+pub(crate) enum Group<'a> {
     /// `[ex-ostrya server]`.
     Server,
     /// `[ex-ostrya client "NAME"]`, with the name.
@@ -70,8 +71,6 @@ enum Group<'a> {
     Trust(&'a str),
     /// `[ex-ostrya key "NAME"]`, with the name.
     Key(&'a str),
-    /// `[ex-ostrya receive]` or `[ex-ostrya receive "PATTERN"]`.
-    Receive,
 }
 
 /// The names of the trust groups and the key groups, for the checks of the
@@ -101,7 +100,7 @@ pub(super) fn read(config: &RepoConfig, repo_dir: &Path) -> Result<ClientAccess>
             Some(Group::Key(name)) => {
                 names.keys.insert(name);
             }
-            Some(Group::Receive) | None => {}
+            None => {}
         }
     }
 
@@ -131,13 +130,18 @@ pub(super) fn read(config: &RepoConfig, repo_dir: &Path) -> Result<ClientAccess>
 /// extensions.
 ///
 /// If the name starts with `ex-ostrya ` and has no known shape, the function
-/// returns [`Error::InvalidFormat`].
-fn classify(group: &str) -> Result<Option<Group<'_>>> {
+/// returns [`Error::InvalidFormat`]. It also refuses `[ex-ostrya receive]` and
+/// each `[ex-ostrya receive "PATTERN"]`, with a message that names the client
+/// group in their place.
+pub(crate) fn classify(group: &str) -> Result<Option<Group<'_>>> {
     if group == SERVER_GROUP {
         return Ok(Some(Group::Server));
     }
-    if group == RECEIVE_GROUP {
-        return Ok(Some(Group::Receive));
+    if group == RECEIVE_GROUP || group.starts_with(RECEIVE_PREFIX) {
+        return Err(Error::InvalidFormat(format!(
+            "[{group}] is a group of the removed receive policy; a client group \
+             [ex-ostrya client \"NAME\"] states the rights of a push"
+        )));
     }
     if let Some(rest) = group.strip_prefix(CLIENT_PREFIX) {
         return quoted(group, rest).map(|name| Some(Group::Client(name)));
@@ -148,12 +152,9 @@ fn classify(group: &str) -> Result<Option<Group<'_>>> {
     if let Some(rest) = group.strip_prefix(KEY_PREFIX) {
         return quoted(group, rest).map(|name| Some(Group::Key(name)));
     }
-    if let Some(rest) = group.strip_prefix(RECEIVE_PREFIX) {
-        return quoted(group, rest).map(|_| Some(Group::Receive));
-    }
     if group.starts_with(RESERVED_PREFIX) {
         return Err(Error::InvalidFormat(format!(
-            "[{group}] is not a server, client, trust, key, or receive group"
+            "[{group}] is not a server, client, trust, or key group"
         )));
     }
     Ok(None)
@@ -619,12 +620,6 @@ mod tests {
             classify("ex-ostrya key \"k\"").unwrap(),
             Some(Group::Key("k"))
         ));
-        for group in ["ex-ostrya receive", "ex-ostrya receive \"a/**\""] {
-            assert!(
-                matches!(classify(group).unwrap(), Some(Group::Receive)),
-                "{group}"
-            );
-        }
         for group in ["ex-ostrya", "ex-ostryax", "core", "remote \"origin\""] {
             assert!(classify(group).unwrap().is_none(), "{group}");
         }
@@ -656,15 +651,23 @@ mod tests {
         }
     }
 
-    /// The receive groups are skipped, with their keys.
+    /// The groups of the removed receive policy are refused, and the message
+    /// names the client group in their place.
     #[test]
-    fn the_receive_groups_are_skipped() {
-        let access = access(
-            "[ex-ostrya receive]\naccept=false\nbogus=1\n\
-             [ex-ostrya receive \"a/**\"]\nverify=remote:x\n\
-             [ex-ostrya client \"c\"]\nauth=anonymous\n",
-        );
-        assert_eq!(access.groups().len(), 1);
+    fn the_receive_groups_are_refused() {
+        for group in [
+            "ex-ostrya receive",
+            "ex-ostrya receive \"a/**\"",
+            "ex-ostrya receive \"\"",
+        ] {
+            let message = refused(try_access(&format!(
+                "[{group}]\naccept=true\n[ex-ostrya client \"c\"]\nauth=anonymous\n"
+            )));
+            assert!(message.starts_with(&format!("[{group}] ")), "{message}");
+            assert!(message.contains("[ex-ostrya client \"NAME\"]"), "{message}");
+        }
+        let message = refused(try_access("[ex-ostrya receivex]\n"));
+        assert!(!message.contains("receive policy"), "{message}");
     }
 
     /// A key that a client group or the server group does not take is

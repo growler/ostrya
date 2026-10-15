@@ -21,8 +21,8 @@ use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use common::receive::{
-    Client, assert_nothing_published, deflate_object, header, is_root, new_repo, raw_object,
-    returned_code, session, sha, staging_entries,
+    Client, assert_nothing_published, deflate_object, header, is_root, new_repo, policy_allowing,
+    raw_object, returned_code, session, sha, staging_entries,
 };
 use common::{TmpDir, file_inventory, foreign_holder, lock_holder_main};
 use ostrya::remote::proto::{
@@ -62,7 +62,7 @@ fn detached_meta() -> Vec<u8> {
 // ---------------------------------------------------------------------------
 
 fn policy() -> ReceivePolicy {
-    ReceivePolicy::default()
+    policy_allowing(&["w:**"])
 }
 
 // ---------------------------------------------------------------------------
@@ -76,12 +76,11 @@ fn hello_reply_states_the_repository_and_its_refs() {
     let tip = sha(b"tip");
     let heads = repo.path().join("refs/heads");
     std::fs::write(heads.join("main"), format!("{tip}\n")).unwrap();
-    let remote = repo.path().join("refs/remotes/origin");
-    std::fs::create_dir_all(&remote).unwrap();
-    std::fs::write(remote.join("stable"), format!("{tip}\n")).unwrap();
+    std::fs::create_dir_all(heads.join("os")).unwrap();
+    std::fs::write(heads.join("os/stable"), format!("{tip}\n")).unwrap();
 
     let (result, reply) = session(&repo, &policy(), |mut c| async move {
-        let reply = c.hello_reply(&["main", "absent", "origin:stable"]).await;
+        let reply = c.hello_reply(&["main", "absent", "os/stable"]).await;
         c.send(&Message::Abort).await.unwrap();
         reply
     });
@@ -102,7 +101,7 @@ fn hello_reply_states_the_repository_and_its_refs() {
         vec![
             ("main", Some(tip)),
             ("absent", None),
-            ("origin:stable", Some(tip))
+            ("os/stable", Some(tip))
         ]
     );
     assert!(
@@ -839,6 +838,46 @@ fn bare_refuses_privileged_content_unless_the_policy_allows_it() {
         });
         assert_eq!(reply.objects, 1, "{ty:?}");
     }
+}
+
+/// `allow-privileged` comes from the client group of the session. Of two
+/// groups in one config, the session under the group with the key stages a
+/// setuid file, and the session under the other group refuses it.
+#[test]
+fn privileged_content_follows_the_client_group() {
+    if !is_root() {
+        eprintln!("skipping: a session on a bare repository needs a server that runs as root");
+        return;
+    }
+    let tmp = TmpDir::new("recv-priv-group");
+    let repo = new_repo(
+        &tmp,
+        RepoMode::Bare,
+        "[ex-ostrya client \"admin\"]\nauth=ssh:admin\nallow=w:**\nallow-privileged=true\n\
+         [ex-ostrya client \"user\"]\nauth=ssh:user\nallow=w:**\n",
+    );
+    let policies = block_on(ostrya::ReceivePolicies::from_config(&repo)).unwrap();
+    let (sum, bytes) = raw_object(&header(0, 0, 0o104755), b"data");
+    let before = file_inventory(repo.path(), "objects");
+    let b = bytes.clone();
+    let (result, error) = session(&repo, policies.get("user").unwrap(), |mut c| async move {
+        c.hello_reply(&[]).await;
+        let _ = c.object(ObjectType::File, sum, Encoding::Raw, &b).await;
+        c.error().await
+    });
+    assert_eq!(error.code, ErrorCode::ModeRefused);
+    assert_eq!(returned_code(&result), Some(ErrorCode::ModeRefused));
+    assert_nothing_published(&repo, &before);
+    let (_, reply) = session(&repo, policies.get("admin").unwrap(), |mut c| async move {
+        c.hello_reply(&[]).await;
+        c.object(ObjectType::File, sum, Encoding::Raw, &bytes)
+            .await
+            .unwrap();
+        let reply = c.objects_end().await;
+        c.send(&Message::Abort).await.unwrap();
+        reply
+    });
+    assert_eq!(reply.objects, 1);
 }
 
 // ---------------------------------------------------------------------------

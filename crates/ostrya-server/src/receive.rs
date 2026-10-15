@@ -649,10 +649,10 @@ mod tests {
     use crate::auth::{FileAuth, Peer};
     use crate::body::tests::frames;
     use crate::request::MAX_DRAIN;
-    use crate::session::tests::TmpRepo;
+    use crate::session::tests::{TmpRepo, pushing_policy};
     use ostrya::remote::proto::{CommitRequest, Hello, Kind};
     use ostrya::remote::{Expected, RefOutcome, RefUpdate};
-    use ostrya::{Checksum, ObjectName, ObjectType, ReceivePolicy, ReceiveRule, TransactionStats};
+    use ostrya::{Checksum, ObjectName, ObjectType, ReceivePolicy, TransactionStats};
     use ostrya_rt::block_on;
 
     #[test]
@@ -921,7 +921,7 @@ mod tests {
             allow_anonymous_push: true,
             ..ServeOptions::default()
         };
-        let auth = FileAuth::new(&opts, Arc::new(ReceivePolicy::default())).unwrap();
+        let auth = FileAuth::new(&opts, Arc::new(pushing_policy())).unwrap();
         endpoint_with(tmp, max, auth)
     }
 
@@ -1102,8 +1102,8 @@ mod tests {
     /// An authentication of a host for the tests. The principal of a
     /// request is its `x-principal` header. `authenticate` refuses the
     /// principal `deny`. `open` refuses the principal `forbidden`, gives the
-    /// principal `strict` a policy that accepts no update, and gives each
-    /// other principal the default policy.
+    /// principal `strict` a policy that reads each ref and writes `other/**`
+    /// alone, and gives each other principal a policy that writes each ref.
     struct TestAuth {
         /// The bytes that an [`Endless`] body of the test gave.
         polled: Arc<AtomicU64>,
@@ -1163,13 +1163,16 @@ mod tests {
                     return Err(refusal);
                 }
                 "strict" => ReceivePolicy {
-                    default_rule: ReceiveRule {
-                        accept: false,
-                        ..ReceiveRule::default()
+                    rules: ostrya::access::AccessRules {
+                        allow: ["r:**", "w:other/**"]
+                            .iter()
+                            .map(|item| ostrya::access::AllowItem::parse(item).unwrap())
+                            .collect(),
+                        deny: Vec::new(),
                     },
                     ..ReceivePolicy::default()
                 },
-                _ => ReceivePolicy::default(),
+                _ => pushing_policy(),
             };
             Ok(SessionSetup {
                 policy: Arc::new(policy),
@@ -1296,7 +1299,10 @@ mod tests {
     }
 
     /// The session takes the policy that `open` gives for its principal, and
-    /// a request of another principal gets the 404 of an unknown session.
+    /// a request of another principal gets the 404 of an unknown session. The
+    /// commit names a commit that the session did not send: the policy of
+    /// `strict` refuses the write first, and the policy of `alice` passes it
+    /// to the check of the objects.
     #[test]
     fn the_policy_of_open_is_the_policy_of_the_session() {
         let tmp = TmpRepo::new("receive-open-policy");
@@ -1304,7 +1310,14 @@ mod tests {
         block_on(async {
             let strict = open_as(&receive, "strict").await;
             let alice = open_as(&receive, "alice").await;
-            let commit = delete_main();
+            let commit = Message::Commit(CommitRequest {
+                updates: vec![RefUpdate {
+                    name: "main".into(),
+                    expected: Expected::Absent,
+                    new: Some(Checksum::from_bytes([7; 32])),
+                }],
+                force: false,
+            });
 
             let path = format!("session/{strict}/commit");
             let response = post_as(&receive, "alice", &path, &commit, None).await;
@@ -1317,8 +1330,8 @@ mod tests {
             let path = format!("session/{alice}/commit");
             let (status, reply) =
                 answer(post_as(&receive, "alice", &path, &commit, None).await).await;
-            assert_eq!(status, StatusCode::OK);
-            assert!(matches!(reply, Message::CommitReply(_)), "{reply:?}");
+            assert_eq!(status, StatusCode::UNPROCESSABLE_ENTITY);
+            assert_eq!(error(reply).code, ErrorCode::MissingObjects);
         });
     }
 

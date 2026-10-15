@@ -51,7 +51,7 @@ pub(super) fn cut(message: &mut String) {
 /// - the ref names
 /// - the size of the reply
 /// - the commits of the detached metadata
-/// - the rules of the policy
+/// - the rights of the policy
 /// - the objects
 /// - the ref and collection bindings
 /// - the signature policy
@@ -63,7 +63,7 @@ pub(super) fn cut(message: &mut String) {
 /// The hook gets each ref update of the `Commit` message as the client sent
 /// it, deletes included. A delete has `new` set to `None`. The `expected`
 /// field is the state that the client expects. The hook gets no `force` flag,
-/// because the policy of the session holds `allow_non_fast_forward`.
+/// because the rights of the policy decide what `force` allows.
 ///
 /// The checks of the current value of each ref run after the hook, under the
 /// update lock, in this order:

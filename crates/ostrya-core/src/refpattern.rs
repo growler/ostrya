@@ -119,7 +119,11 @@ impl RefPattern {
     ///
     /// The name is not checked against the ref-name rule.
     pub fn matches(&self, name: &str) -> bool {
-        if self.parts.contains(&Part::Many) {
+        let head = match self.parts.split_last() {
+            Some((Part::Many, head)) => head,
+            _ => &self.parts,
+        };
+        if head.contains(&Part::Many) {
             let name: Vec<&str> = name.split('/').collect();
             match_parts(&self.parts, &name, &mut 0)
         } else {
@@ -185,10 +189,15 @@ fn match_parts(parts: &[Part], name: &[&str], steps: &mut usize) -> bool {
     prev[n]
 }
 
-/// Matches `name` against `parts`, which hold no `**`. Each part covers
-/// exactly one name part, so the match compares the parts in order and needs
-/// no table.
+/// Matches `name` against `parts`, which hold no `**` before the last part.
+/// Each other part covers exactly one name part, and a last `**` covers the
+/// one or more name parts that remain. So the match compares the parts in
+/// order and needs no table.
 fn match_flat(parts: &[Part], name: &str) -> bool {
+    let (parts, last_many) = match parts.split_last() {
+        Some((Part::Many, head)) => (head, true),
+        _ => (parts, false),
+    };
     let mut name = name.split('/');
     for part in parts {
         let Some(piece) = name.next() else {
@@ -197,15 +206,17 @@ fn match_flat(parts: &[Part], name: &str) -> bool {
         let ok = match part {
             Part::Literal(literal) => piece == literal,
             Part::One => true,
-            // The caller passes no `**`. The part would need more than one
-            // name part.
+            // The caller passes no `**` before the last part. The part would
+            // need more than one name part.
             Part::Many => return false,
         };
         if !ok {
             return false;
         }
     }
-    name.next().is_none()
+    // A last `**` needs one or more name parts. Each other pattern needs no
+    // more name parts.
+    name.next().is_some() == last_many
 }
 
 /// A list of positive and negative [`RefPattern`]s.
@@ -275,12 +286,30 @@ mod tests {
     }
 
     /// The match with no table agrees with the table on patterns with no
-    /// `**`.
+    /// `**`, and on patterns whose one `**` is the last part.
     #[test]
     fn the_flat_match_agrees_with_the_table() {
-        let patterns = ["a", "a/b", "*", "*/*", "a/*", "*/b", "a/*/c", "a/b/c"];
+        let patterns = [
+            "a", "a/b", "*", "*/*", "a/*", "*/b", "a/*/c", "a/b/c", "**", "a/**", "*/**", "a/b/**",
+            "a/*/**", "*/*/**",
+        ];
         let names = [
-            "a", "b", "a/b", "a/c", "b/b", "a/b/c", "a/x/c", "a/b/c/d", "x/a/b", "a/b/d",
+            "",
+            "/",
+            "a/",
+            "/a",
+            "a//b",
+            "a",
+            "b",
+            "a/b",
+            "a/c",
+            "b/b",
+            "a/b/c",
+            "a/x/c",
+            "a/b/c/d",
+            "x/a/b",
+            "a/b/d",
+            "a/b/c/d/e/f",
         ];
         for p in patterns {
             let pattern = pat(p);
@@ -294,6 +323,24 @@ mod tests {
                 );
                 assert_eq!(pattern.matches(n), match_flat(&parts, n), "{p} {n}");
             }
+        }
+    }
+
+    /// A last `**` covers one or more name parts, an empty part included.
+    #[test]
+    fn a_last_double_star_needs_one_part() {
+        let cases = [
+            ("**", "", true),
+            ("**", "a", true),
+            ("a/**", "a", false),
+            ("a/**", "a/", true),
+            ("a/**", "a/b/c/d", true),
+            ("a/**", "b/c", false),
+            ("*/**", "a", false),
+            ("*/**", "a/b", true),
+        ];
+        for (p, n, want) in cases {
+            assert_eq!(pat(p).matches(n), want, "{p:?} {n:?}");
         }
     }
 

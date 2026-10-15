@@ -8,7 +8,8 @@
 //! `ostree` tool refuses. The remote part of a refspec follows the rule of a
 //! component. `is_ref_component` is a wider check for a part that is not a
 //! ref name, such as a collection id. `is_checksum_shaped` marks a valid ref
-//! name that a revision reads as a checksum.
+//! name that a revision reads as a checksum. `is_collection_id` checks a
+//! collection id.
 
 use crate::Checksum;
 
@@ -279,6 +280,28 @@ pub fn is_checksum_shaped(name: &str) -> bool {
     Checksum::from_hex_lower(name).is_ok()
 }
 
+/// Returns `true` if `id` is a collection id.
+///
+/// A collection id has two or more elements, separated by `.`. Each element
+/// starts with an ASCII letter or `_` and continues with ASCII letters,
+/// digits, or `_`.
+///
+/// Recovered by observation: the `ostree` command writes `a.b`, `A.b`,
+/// `_a.b`, `a._b`, `a_b.c`, and `a.b.c.d`. It refuses `fresh`, `a..b`,
+/// `a.b.`, `1a.b`, `a.1b`, `a-b.c`, and `a.b-c` with
+/// `error: Invalid collection ID <id>`. Only the file system limits the
+/// length, because the id is one path component.
+pub fn is_collection_id(id: &str) -> bool {
+    id.split('.').count() >= 2
+        && id.split('.').all(|element| {
+            let mut chars = element.chars();
+            chars
+                .next()
+                .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
+                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -450,6 +473,21 @@ mod tests {
             String::new(),
         ] {
             assert!(!is_checksum_shaped(&name), "{name}");
+        }
+    }
+
+    /// The ids that the `ostree` command writes are collection ids, and the
+    /// ids that it refuses are not.
+    #[test]
+    fn a_collection_id_has_two_or_more_elements_of_the_rule() {
+        for id in ["a.b", "A.b", "_a.b", "a._b", "a_b.c", "a.b.c.d"] {
+            assert!(is_collection_id(id), "{id}");
+        }
+        for id in [
+            "fresh", "a..b", "a.b.", "1a.b", "a.1b", "a-b.c", "a.b-c", "", ".", ".a.b", "a.b c",
+            "a.\u{e9}",
+        ] {
+            assert!(!is_collection_id(id), "{id:?}");
         }
     }
 }

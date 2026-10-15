@@ -39,6 +39,8 @@ const CONFIG_FILE: &str = "config";
 ///   `[ex-ostrya receive]`: the policy that a repository applies to the
 ///   commits that it receives. Under the `receive` feature,
 ///   `ReceivePolicy::from_config` reads these groups.
+///   [`ClientAccess::from_config`](crate::access::ClientAccess::from_config)
+///   reads `[ex-ostrya server]` and the `[ex-ostrya client "NAME"]` groups.
 ///
 /// # Checks
 ///

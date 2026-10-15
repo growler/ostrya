@@ -39,6 +39,8 @@ API documentation: <https://docs.rs/ostrya>
   `remote`, which holds the session of a pull over HTTP, over ssh, or over a pair
   of byte streams.
 - Push and receive: `remote`, the wire protocol of `ostrya-remote`, and `receive`.
+- Client access: `access`, the client groups and the server settings of the
+  config.
 - Remote resolution: `endpoint`, which reads the keys and files of a remote for a
   pull or a push.
 - Signing: `sign`, `gpg`, and `spki`.

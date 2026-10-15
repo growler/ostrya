@@ -7976,39 +7976,17 @@ async fn refs_create_collection(repo: &Repo, newref: &str, existing: &str) -> Re
     };
     let commit = resolve(repo, existing).await?;
     let Some((collection_id, ref_name)) = pair else {
-        if !is_collection_id(newref) {
+        if !ostrya::is_collection_id(newref) {
             exit_error(&format!("Invalid collection ID {newref}"));
         }
         exit_error("Invalid ref name (null)");
     };
-    if !is_collection_id(collection_id) {
+    if !ostrya::is_collection_id(collection_id) {
         exit_error(&format!("Invalid collection ID {collection_id}"));
     }
     let cref = CollectionRef::new(collection_id, ref_name);
     repo.set_collection_ref_immediate(&cref, Some(&commit))
         .await
-}
-
-/// Returns `true` if `id` is a collection id.
-///
-/// A collection id has two or more elements, separated by `.`. Each element
-/// starts with an ASCII letter or `_` and continues with ASCII letters,
-/// digits, or `_`.
-///
-/// Recovered by observation: the `ostree` command writes `a.b`, `A.b`,
-/// `_a.b`, `a._b`, `a_b.c`, and `a.b.c.d`. It refuses `fresh`, `a..b`,
-/// `a.b.`, `1a.b`, `a.1b`, `a-b.c`, and `a.b-c` with
-/// `error: Invalid collection ID <id>`. Only the file system limits the
-/// length, because the id is one path component.
-fn is_collection_id(id: &str) -> bool {
-    id.split('.').count() >= 2
-        && id.split('.').all(|element| {
-            let mut chars = element.chars();
-            chars
-                .next()
-                .is_some_and(|first| first.is_ascii_alphabetic() || first == '_')
-                && chars.all(|c| c.is_ascii_alphanumeric() || c == '_')
-        })
 }
 
 /// Returns the commit of a ref name, or `None` if the name names no ref.

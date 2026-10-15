@@ -81,7 +81,8 @@ pub use mode::RepoMode;
 pub use objname::ObjectName;
 pub use objtype::ObjectType;
 pub use refname::{
-    is_checksum_shaped, is_ref_component, is_ref_name, is_ref_name_component, is_refspec,
+    is_checksum_shaped, is_collection_id, is_ref_component, is_ref_name, is_ref_name_component,
+    is_refspec,
 };
 pub use refpattern::{RefPattern, RefSelector};
 pub use xattr::{Xattrs, XattrsRef};

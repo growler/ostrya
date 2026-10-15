@@ -14,6 +14,8 @@
 //!   ref update of a session.
 //! - [`Repo::receive_stream`](crate::Repo::receive_stream) reads one one-way
 //!   stream: the messages of a session in one direction, with no reply.
+//! - [`ClientAccess`] reads the client groups and the server settings. The
+//!   module re-exports it and the other types of [`access`](crate::access).
 
 mod ancestry;
 mod core;
@@ -31,6 +33,10 @@ mod stream;
 mod trust;
 mod walk;
 
+pub use crate::access::{
+    AccessModes, AccessRules, AllowItem, AuthItem, ClientAccess, ClientGroup, CollectionScope,
+    IpNet, Namespace, ServerSettings,
+};
 pub use crate::verify::TrustedKeys;
 pub use hooks::{HookFuture, HookRefusal, HostEntry, ReceiveHooks, UpdatePlan};
 pub use pattern::ReceivePattern;

@@ -27,6 +27,7 @@
 //! - Checkout and export: [`checkout`], [`composefs`], [`tar`], and [`archive`].
 //! - Pull: [`pull`], [`summary`], [`fetch`], the HTTP client of `ostrya-fetch`, and [`remote`], which holds the session of a pull over HTTP, over ssh, or over a pair of byte streams.
 //! - Push and receive: [`remote`], the wire protocol of `ostrya-remote`, and `receive`.
+//! - Client access: [`access`], the client groups and the server settings of the config.
 //! - Remote resolution: [`endpoint`], which reads the keys and files of a remote for a pull or a push.
 //! - Signing: [`sign`], `gpg`, and `spki`.
 //! - Signature trust: [`verify`], the trusted keys and the trust of one pull.
@@ -54,6 +55,7 @@
 pub mod repo;
 pub mod transaction;
 
+pub mod access;
 pub mod archive;
 pub mod bootable;
 mod bspatch;
@@ -164,7 +166,7 @@ pub use ostrya_core::base64;
 pub use ostrya_core::{
     Checksum, Commit, DictBuilder, DirMeta, DirTree, ObjectName, ObjectType, RefPattern,
     RefSelector, RepoMode, Span, TextError, Type, Value, Xattrs, from_bytes, from_text,
-    is_checksum_shaped, loose_path, to_text, to_text_unannotated,
+    is_checksum_shaped, is_collection_id, loose_path, to_text, to_text_unannotated,
 };
 pub use ostrya_remote::proto::{
     MAX_REF_ENTRY_LEN, MAX_REF_ENTRY_PARTS, MAX_REF_LISTING, MAX_REF_PATTERNS,

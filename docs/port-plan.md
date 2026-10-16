@@ -227,7 +227,15 @@ bounded:
   prefix, and the `anonymous` item (`format-reference.md`, "Authentication
   of the receive endpoint"). It reads the client certificate of a TLS
   connection one time, in the module `cert`, and each request of the
-  connection shares the result. The owner key of a session is the text of
+  connection shares the result. From a peer in `trusted-proxy`, it reads the
+  client address and the scheme of one forwarding header, in the module
+  `forwarded`, and a forwarded client certificate for each request, in the
+  module `cert`. `ostrya-fetch` builds one verifier of the client CA, which
+  serves the TLS handshake and the forwarded certificates, and a cache of
+  1024 entries keeps the verified forwarded certificates. With
+  `proxy-protocol`, each connection starts with a PROXY protocol header of
+  version 1 or 2, which the module `proxy_protocol` reads before the TLS
+  handshake, with no crate. The owner key of a session is the text of
   the auth item. `GroupAuth` gives each session the policy of the client
   group of the local refs that carries the item, and no hooks. It refuses a
   session with 403 when no such group exists, and when the group opens no

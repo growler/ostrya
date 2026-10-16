@@ -14,7 +14,8 @@
 //! is read, and [`ClientConfigs::has_trust_anchors`] is `true`.
 //!
 //! [`server_config`] builds the configuration of an HTTP server with the same
-//! provider and the same key loaders.
+//! provider and the same key loaders. [`client_cert_verifier`] builds the
+//! verifier of a client certificate that the server configuration takes.
 
 use std::io::BufReader;
 use std::sync::Arc;
@@ -271,13 +272,46 @@ pub(crate) async fn client_config(
     })
 }
 
+/// Builds the verifier of a client certificate from the PEM CA certificates
+/// `client_ca_pem`.
+///
+/// The verifier is the WebPKI verifier of rustls with the `graviola` crypto
+/// provider. It verifies a certificate chain against the CA certificates as
+/// trust anchors, the validity period of each certificate, and the
+/// `clientAuth` extended key usage of the end-entity certificate. It checks
+/// no revocation. A TLS handshake with this verifier also serves a client
+/// that presents no certificate.
+///
+/// A server builds one verifier, and gives it to [`server_config`] and to
+/// each other check of a client certificate, for example of a certificate
+/// that a proxy forwards.
+///
+/// # Errors
+///
+/// - [`Error::Fetch`] if `client_ca_pem` does not decode as PEM, holds no
+///   certificate, or holds a certificate that the root store refuses.
+/// - [`Error::Fetch`] if rustls refuses the verifier that it builds from the
+///   certificates.
+pub fn client_cert_verifier(
+    client_ca_pem: &[u8],
+) -> Result<Arc<dyn rustls::server::danger::ClientCertVerifier>> {
+    let provider = Arc::new(rustls_graviola::default_provider());
+    rustls::server::WebPkiClientVerifier::builder_with_provider(
+        Arc::new(pem_store(client_ca_pem)?),
+        provider,
+    )
+    .allow_unauthenticated()
+    .build()
+    .map_err(|e| Error::Fetch(format!("client ca rejected: {e}")))
+}
+
 /// Builds the TLS configuration of an HTTP server from PEM bytes.
 ///
 /// The inputs are the certificate chain, the private key, and the passphrase
-/// of an encrypted key. With `client_ca_pem`, the server verifies a client
-/// certificate against that CA. A client that presents a certificate must
-/// present one that the CA signed. A client that presents none completes the
-/// handshake.
+/// of an encrypted key. With `client_verifier`, the server verifies a client
+/// certificate with that verifier, which [`client_cert_verifier`] builds. A
+/// client that presents a certificate must present one that the verifier
+/// accepts. A client that presents none completes the handshake.
 ///
 /// The key is read as the key of a [`ClientIdentity`] is read, with the same
 /// refusals. ALPN offers `h2`, then `http/1.1`.
@@ -290,17 +324,13 @@ pub(crate) async fn client_config(
 ///   refusal of [`ClientIdentity::key_passphrase`] applies.
 /// - [`Error::Fetch`] if the crypto provider supports no default protocol
 ///   version.
-/// - [`Error::Fetch`] if `client_ca_pem` does not decode as PEM, holds no
-///   certificate, or holds a certificate that the root store refuses.
-/// - [`Error::Fetch`] if rustls refuses the client certificate verifier that
-///   it builds from `client_ca_pem`.
 /// - [`Error::Fetch`] if rustls refuses the certificate chain with the key,
 ///   for example a key of another certificate.
 pub async fn server_config(
     cert_chain_pem: &[u8],
     key_pem: &[u8],
     key_passphrase: Option<&str>,
-    client_ca_pem: Option<&[u8]>,
+    client_verifier: Option<Arc<dyn rustls::server::danger::ClientCertVerifier>>,
 ) -> Result<Arc<rustls::ServerConfig>> {
     let provider = Arc::new(rustls_graviola::default_provider());
     let chain = parse_certs(cert_chain_pem)?;
@@ -310,20 +340,11 @@ pub async fn server_config(
         ));
     }
     let key = parse_key(key_pem, key_passphrase).await?;
-    let builder = rustls::ServerConfig::builder_with_provider(provider.clone())
+    let builder = rustls::ServerConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
         .map_err(|e| Error::Fetch(format!("tls setup: {e}")))?;
-    let builder = match client_ca_pem {
-        Some(pem) => {
-            let verifier = rustls::server::WebPkiClientVerifier::builder_with_provider(
-                Arc::new(pem_store(pem)?),
-                provider,
-            )
-            .allow_unauthenticated()
-            .build()
-            .map_err(|e| Error::Fetch(format!("client ca rejected: {e}")))?;
-            builder.with_client_cert_verifier(verifier)
-        }
+    let builder = match client_verifier {
+        Some(verifier) => builder.with_client_cert_verifier(verifier),
         None => builder.with_no_client_auth(),
     };
     let mut config = builder
@@ -1109,7 +1130,7 @@ mod tests {
     /// client CA.
     #[test]
     fn a_server_config_offers_h2_and_http1() {
-        for ca in [None, Some(CA_PEM)] {
+        for ca in [None, Some(client_cert_verifier(CA_PEM).unwrap())] {
             let config =
                 block_on(server_config(SERVER_CERT_PEM, SERVER_KEY_PEM, None, ca)).unwrap();
             assert_eq!(
@@ -1141,17 +1162,59 @@ mod tests {
         assert!(err.to_string().contains("passphrase"), "{err}");
     }
 
-    /// An empty chain, a key of another certificate, and a CA blob with no
-    /// certificate are each refused.
+    /// An empty chain and a key of another certificate are each refused.
     #[test]
     fn a_server_config_refuses_bad_material() {
-        let refused = |cert: &[u8], key: &[u8], ca: Option<&[u8]>| {
-            block_on(server_config(cert, key, None, ca))
+        let refused = |cert: &[u8], key: &[u8]| {
+            block_on(server_config(cert, key, None, None))
                 .unwrap_err()
                 .to_string()
         };
-        assert!(refused(b"", SERVER_KEY_PEM, None).contains("no certificate"));
-        assert!(refused(SERVER_CERT_PEM, CLIENT_KEY_PEM, None).contains("rejected"));
-        assert!(refused(SERVER_CERT_PEM, SERVER_KEY_PEM, Some(b"")).contains("no certificate"));
+        assert!(refused(b"", SERVER_KEY_PEM).contains("no certificate"));
+        assert!(refused(SERVER_CERT_PEM, CLIENT_KEY_PEM).contains("rejected"));
+    }
+
+    /// The DER bytes of the one certificate of `pem`.
+    fn der(pem: &[u8]) -> CertificateDer<'static> {
+        let mut certs = parse_certs(pem).unwrap();
+        assert_eq!(certs.len(), 1);
+        certs.remove(0)
+    }
+
+    /// The verifier of the fixture CA accepts the fixture client certificate
+    /// with no intermediate. It refuses a certificate that another CA
+    /// signed, and a certificate of the CA with no `clientAuth` extended key
+    /// usage.
+    #[test]
+    fn the_client_verifier_checks_the_ca_and_the_key_usage() {
+        let verifier = client_cert_verifier(CA_PEM).unwrap();
+        assert!(!verifier.client_auth_mandatory());
+        verifier
+            .verify_client_cert(&der(CLIENT_CERT_PEM), &[], UnixTime::now())
+            .unwrap();
+        let untrusted = include_bytes!("../../../tests/fixtures/tls/server-untrusted.pem");
+        for pem in [&untrusted[..], SERVER_CERT_PEM] {
+            assert!(
+                verifier
+                    .verify_client_cert(&der(pem), &[], UnixTime::now())
+                    .is_err()
+            );
+        }
+    }
+
+    /// A CA blob with no certificate and a blob that is not PEM are refused.
+    #[test]
+    fn the_client_verifier_refuses_a_bad_ca() {
+        for pem in [
+            &b""[..],
+            b"no certificate here",
+            b"-----BEGIN CERTIFICATE-----\n!\n",
+        ] {
+            let err = client_cert_verifier(pem).unwrap_err().to_string();
+            assert!(
+                err.contains("no certificate") || err.contains("certificate pem"),
+                "{err}"
+            );
+        }
     }
 }

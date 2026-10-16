@@ -308,21 +308,46 @@ The server verifies the certificate of the TLS handshake and the certificate tha
 .TP
 \fB\%trusted\-proxy\fR (list of CIDR)
 The peers whose forwarding data the server reads.
-From such a peer, the server reads \fB\%Forwarded\fR, \fB\%X\-Forwarded\-For\fR, and \fB\%X\-Real\-IP\fR, in this order, and walks the hops from the right.
-The first hop that is not a trusted proxy is the client address.
-\fB\%X\-Forwarded\-Proto: https\fR or a \fB\%Forwarded\fR \fB\%proto=https\fR makes the request count as TLS.
+It needs \fB\%trusted\-proxy\-header\fR.
+From such a peer, the server reads the client address from the header of \fB\%trusted\-proxy\-header\fR, and walks the hops of the header from the right.
+It skips each hop in a trusted network, and the first other hop is the client address.
+When all hops are trusted, the client is the leftmost hop.
+A hop with no address, for example \fB\%unknown\fR, gives a client with no address, which matches no \fB\%net:\fR item.
+A header that is absent, or that has one line of white space alone, keeps the peer address.
+A header with other text and no hop, for example an \fB\%X\-Forwarded\-For\fR value of commas alone, gives no address.
+A trusted proxy must set or remove the forwarding header, \fB\%X\-Forwarded\-Proto\fR, and the header of \fB\%trusted\-proxy\-client\-cert\fR in each request.
+From a peer that is not trusted, the server reads none of these headers.
+.TP
+\fB\%trusted\-proxy\-header\fR (\fB\%forwarded\fR, \fB\%x\-forwarded\-for\fR, or \fB\%x\-real\-ip\fR)
+The one request header from which the server reads the client address of a request from a trusted proxy: \fB\%Forwarded\fR of RFC 7239, \fB\%X\-Forwarded\-For\fR, or \fB\%X\-Real\-IP\fR.
+It needs \fB\%trusted\-proxy\fR.
+A hop of \fB\%Forwarded\fR is the \fB\%for\fR value of one element.
+A hop of the other two headers is \fB\%ADDR\fR, \fB\%IPV4:PORT\fR, or \fB\%[IPV6]:PORT\fR.
+The request counts as TLS when the trusted proxy reports \fB\%https\fR, in any case: with \fB\%forwarded\fR, in the \fB\%proto\fR of the client hop, and with the other two, in the rightmost value of \fB\%X\-Forwarded\-Proto\fR.
 .TP
 \fB\%trusted\-proxy\-client\-cert\fR (string)
 The name of the request header that carries the client certificate from a trusted proxy.
 The name is one or more ASCII letters, digits, and the characters \fB\%!#$%&'*+\-.^_`|~\fR.
 It needs \fB\%tls\-client\-ca\fR and \fB\%trusted\-proxy\fR.
-The value is a URL\-escaped PEM certificate or a base64 DER certificate.
+The server percent\-decodes the value.
+The value is then a PEM certificate, as nginx \fB\%$ssl_client_escaped_cert\fR gives it, or a base64 DER certificate, as HAProxy \fB\%ssl_c_der,base64\fR and Traefik \fB\%passTLSClientCert\fR give it.
+An empty value is no certificate.
+A value with more than one certificate, for example with a comma, a value that does not parse, and a certificate that \fB\%tls\-client\-ca\fR does not verify get 403.
+The server uses no intermediate certificate from the proxy, so \fB\%tls\-client\-ca\fR must hold each intermediate CA.
+From a trusted proxy, this header alone gives the certificate, and the server does not use the certificate of the TLS handshake.
+A request with no such header gives no certificate.
 .TP
 \fB\%proxy\-protocol\fR (boolean, default false)
-Each connection starts with a PROXY protocol v1 or v2 header, whose source address is the client address.
+Each connection starts with a PROXY protocol v1 or v2 header, before the TLS handshake.
+The source address of the header is the client address.
+A header with no address, for example \fB\%UNKNOWN\fR, keeps the peer address.
+The server closes a connection with no valid header within 30 seconds, and sends no response.
+Each peer that can connect states its own client address in the header, so only the proxy must be able to reach the listener.
+The check of \fB\%trusted\-proxy\fR uses the source address of the header, so the server does not read the forwarding headers and the forwarded certificate of a proxy that states the address of its client in the PROXY header.
 .TP
 \fB\%allow\-cleartext\-credentials\fR (boolean, default false)
 Take a bearer or Basic credential on a connection with no TLS.
+A request from a trusted proxy that reports \fB\%https\fR counts as TLS.
 .TP
 \fB\%session\-timeout\fR (integer, 1 or more)
 The idle time of a push session, in seconds.
@@ -506,12 +531,11 @@ A \fB\%tls:\fR or \fB\%tls\-sha256:\fR item exists, and the server has no \fB\%t
 .IP \(bu 2
 \fB\%trusted\-proxy\-client\-cert\fR is set, and the server has no \fB\%tls\-client\-ca\fR or no \fB\%trusted\-proxy\fR.
 .IP \(bu 2
+\fB\%trusted\-proxy\fR is set, and the server has no \fB\%trusted\-proxy\-header\fR, or the reverse.
+.IP \(bu 2
 \fB\%tls\-cert\fR is set and \fB\%tls\-key\fR is not, or the reverse.
 .IP \(bu 2
 \fB\%tls\-client\-ca\fR is set, and \fB\%tls\-cert\fR and \fB\%trusted\-proxy\-client\-cert\fR are not.
-.IP \(bu 2
-\fB\%trusted\-proxy\fR is set, \fB\%trusted\-proxy\-client\-cert\fR is set, or \fB\%proxy\-protocol\fR is true.
-\fB\%ostrya serve\fR does not support these keys yet.
 .SS "Trust keys"
 A trust group takes the remote keys \fB\%gpg\-verify\fR (default false here), \fB\%gpgkeypath\fR, \fB\%sign\-verify\fR, \fB\%verification\-ENGINE\-key\fR, and \fB\%verification\-ENGINE\-file\fR.
 It trusts the keys that it names, and no system key store or keyring.

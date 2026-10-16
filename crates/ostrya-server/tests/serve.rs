@@ -433,7 +433,10 @@ fn bad_options_are_refused() {
         opts.client_ca_pem = Some(CA_PEM.to_vec());
         match ostrya_server::bind(repo.clone(), opts).await.err().unwrap() {
             ostrya_server::Error::Options(message) => {
-                assert_eq!(message, "a client CA with no TLS")
+                assert_eq!(
+                    message,
+                    "a client CA with no TLS and no forwarded certificate header"
+                )
             }
             other => panic!("{other}"),
         }

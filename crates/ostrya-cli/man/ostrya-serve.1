@@ -10,7 +10,7 @@ Serve the repository over HTTP as an archive repository for pull.
 .PP
 The repository can be in any mode that ostrya reads. In a mode other than \fB\%archive\fR, the server builds each \fB\%\&.filez\fR object on request. The server also answers the ref listing at \fB\%/_ostrya/refs/v1\fR, and has the receive endpoint of a push. The client groups of the repository config give the push rights. The endpoint identifies the client of each request by the auth items of the client groups: a bearer token, a Basic credential, a client certificate, the client address, or \fB\%anonymous\fR\&. A session takes the policy of the client group of the local refs that carries the item. With no such group, or with a group that opens no push session, the session request gets \%403.
 .PP
-The server takes its settings from \fB\%[ex\-ostrya server]\fR of the repository config. Each option of the command with the name of a key has precedence over the key. A relative path in a key is relative to the repository directory, and a relative path in an option is relative to the current directory. \fB\%sign\-summary\fR has no option. The command refuses the keys \fB\%trusted\-proxy\fR and \fB\%trusted\-proxy\-client\-cert\fR, and \fB\%proxy\-protocol=true\fR, because it does not support a proxy yet. At start, the command reads and checks the client groups, the server group, the trust groups, and the key groups. A bad group, or a key group whose key the command cannot read, ends the command with status \%1.
+The server takes its settings from \fB\%[ex\-ostrya server]\fR of the repository config. Each option of the command with the name of a key has precedence over the key. A relative path in a key is relative to the repository directory, and a relative path in an option is relative to the current directory. \fB\%sign\-summary\fR has no option. At start, the command reads and checks the client groups, the server group, the trust groups, and the key groups. A bad group, or a key group whose key the command cannot read, ends the command with status \%1.
 .PP
 When all listeners are bound, the command writes the URL of each listener to standard output, one line each, and writes nothing else to standard output. Then it serves until the process ends. Warnings and errors go to standard error. For each push session that commits, the command writes one \fB\%warning: STEP: MESSAGE\fR line to standard error for each warning of the session.
 .SH OPTIONS
@@ -33,12 +33,32 @@ The key needs a certificate, from \%\-\-tls\-cert or from the \fB\%tls\-cert\fR 
 \fB\-\-tls\-client\-ca\fR \fIFILE\fR
 Verify client certificates against the CA certificates in FILE, in PEM.
 .IP
-The CA needs a server certificate, from \%\-\-tls\-cert or from the \fB\%tls\-cert\fR key. A client that presents a certificate must present one that the CA signed. A client that presents no certificate is served. A client certificate that the CA signed can match a \fB\%tls:*\fR, \fB\%tls:NAME\fR, or \fB\%tls\-sha256:HEX\fR item of a client group. The command reads FILE once, at start, and refuses a file larger than \%1 MiB.
+The CA needs a server certificate, from \%\-\-tls\-cert or from the \fB\%tls\-cert\fR key, or a header of a forwarded certificate, from \%\-\-trusted\-proxy\-client\-cert or from the \fB\%trusted\-proxy\-client\-cert\fR key. The CA verifies the certificate of the TLS handshake and the certificate that a trusted proxy forwards. A client that presents a certificate in the handshake must present one that the CA signed. A client that presents no certificate is served. A client certificate that the CA signed can match a \fB\%tls:*\fR, \fB\%tls:NAME\fR, or \fB\%tls\-sha256:HEX\fR item of a client group. The command reads FILE once, at start, and refuses a file larger than \%1 MiB.
+.TP
+\fB\-\-trusted\-proxy\fR \fICIDR\fR
+Read the forwarding headers of a peer in the network CIDR.
+.IP
+CIDR is \%ADDR/LEN or a bare ADDR. A network with host bits set is refused. Give the option once for each network. The options replace the whole \fB\%trusted\-proxy\fR key. The option needs a header of the client address, from \%\-\-trusted\-proxy\-header or from the \fB\%trusted\-proxy\-header\fR key. From a peer in such a network, the receive endpoint reads the client address from that header, the scheme \fB\%https\fR, and a forwarded client certificate. It walks the hops of the header from the right, and skips each hop in a trusted network. The first other hop is the client address. A proxy in the list must set or remove these headers in each request. No option removes the key: to trust no peer, remove the key.
+.TP
+\fB\-\-trusted\-proxy\-header\fR \fIHEADER\fR
+Read the client address of a request from a trusted proxy in HEADER.
+.IP
+HEADER is \fB\%forwarded\fR for the \fB\%Forwarded\fR header of RFC \%7239, \fB\%x\-forwarded\-for\fR, or \fB\%x\-real\-ip\fR\&. The server reads this one header. With \fB\%forwarded\fR, the \fB\%proto\fR of the client hop gives the scheme. With the other two, the rightmost value of \fB\%X\-Forwarded\-Proto\fR gives the scheme. The option needs a trusted network, from \%\-\-trusted\-proxy or from the \fB\%trusted\-proxy\fR key. No option removes the key.
+.TP
+\fB\-\-trusted\-proxy\-client\-cert\fR \fIHEADER\fR
+Read the client certificate of a request from a trusted proxy in the request header HEADER.
+.IP
+HEADER is a header name: an HTTP token of RFC \%9110, which is one or more ASCII letters, digits, and token characters. The value is a \%URL\-escaped PEM certificate, as nginx \fB\%$ssl_client_escaped_cert\fR gives it, or a \%base64 DER certificate, as HAProxy \fB\%ssl_c_der,base64\fR and Traefik \fB\%passTLSClientCert\fR give it. The client CA verifies the certificate, also on a plain HTTP listener. A value with more than one certificate, a value that does not parse, and a certificate that the CA does not verify get \%403. The option needs a client CA and a trusted network, each from its option or its key. No option removes the key.
+.TP
+\fB\-\-proxy\-protocol\fR[=\fIBOOL\fR]
+Read a PROXY protocol header, version \%1 or \%2, at the start of each connection.
+.IP
+\fB\%\-\-proxy\-protocol\fR reads the header, and \fB\%\-\-proxy\-protocol=false\fR does not. The header comes before the TLS handshake, and its source address is the client address. The server closes a connection with no valid header, or with no header within \%30 seconds, with no response. Each peer that can connect states its own client address in the header, so only the proxy must be able to reach the listener. Possible values: true, false.
 .TP
 \fB\-\-allow\-cleartext\-credentials\fR[=\fIBOOL\fR]
 Take a bearer or Basic credential of push over plain HTTP.
 .IP
-\fB\%\-\-allow\-cleartext\-credentials\fR takes such a credential, and \fB\%\-\-allow\-cleartext\-credentials=false\fR refuses it. Without the option and the key, the receive endpoint answers \%403 to such a request, also when a client group has the \fB\%anonymous\fR item. Use it for a server on a loopback address or behind a proxy that terminates TLS. A read of the files of a pull needs no credential. Possible values: true, false.
+\fB\%\-\-allow\-cleartext\-credentials\fR takes such a credential, and \fB\%\-\-allow\-cleartext\-credentials=false\fR refuses it. Without the option and the key, the receive endpoint answers \%403 to such a request, also when a client group has the \fB\%anonymous\fR item, unless a trusted proxy states the scheme \fB\%https\fR (see \%\-\-trusted\-proxy). Use it for a server on a loopback address, or behind a proxy that terminates TLS and is not a trusted proxy. A read of the files of a pull needs no credential. Possible values: true, false.
 .TP
 \fB\-\-session\-timeout\fR \fISECONDS\fR
 Abort a push session that stays idle for SECONDS.

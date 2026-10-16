@@ -1,5 +1,31 @@
-//! The client certificate of a TLS connection.
+//! The client certificate of a TLS connection, and the client certificate
+//! that a trusted proxy forwards in a request header.
+//!
+//! A forwarded certificate is one of these values:
+//!
+//! - a URL-escaped PEM certificate, as nginx `$ssl_client_escaped_cert`
+//!   gives it;
+//! - a base64 DER certificate, as HAProxy `ssl_c_der,base64` gives it, or
+//!   URL-escaped, as Traefik `passTLSClientCert` gives it.
+//!
+//! The server percent-decodes each value, and `+` stays `+`. A value that
+//! starts with `-----BEGIN` is PEM, and each other value is base64. An empty
+//! value is no certificate. A value with a comma, more than one line of the
+//! header, and PEM with more than one `CERTIFICATE` section hold more than
+//! one certificate. The server verifies the certificate with the verifier of
+//! the client CA, with no intermediate. It keeps each verified certificate in
+//! a cache of [`CACHE_ENTRIES`] entries, keyed by the SHA-256 digest of its
+//! DER bytes, until the end of its validity period.
 
+use std::collections::{HashMap, VecDeque};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
+
+use futures_rustls::pki_types::pem::PemObject;
+use futures_rustls::pki_types::{CertificateDer, UnixTime};
+use futures_rustls::rustls::server::danger::ClientCertVerifier;
+use hyper::HeaderMap;
+use hyper::header::HeaderName;
 use ostrya::Checksum;
 use x509_cert::Certificate;
 use x509_cert::der::asn1::{PrintableStringRef, Utf8StringRef};
@@ -7,8 +33,13 @@ use x509_cert::der::oid::db::rfc4519::CN;
 use x509_cert::der::{Decode, Tag, Tagged};
 use x509_cert::name::Name;
 
+/// The most verified certificates that the cache of forwarded certificates
+/// holds. When the cache is full, a new entry removes the oldest entry.
+pub(crate) const CACHE_ENTRIES: usize = 1024;
+
 /// What the server reads from the end-entity certificate of a client. The
-/// server reads it one time for each connection.
+/// server reads the certificate of a TLS handshake one time for each
+/// connection.
 #[derive(Debug)]
 pub(crate) struct ClientCert {
     /// The SHA-256 digest of the DER bytes of the certificate.
@@ -17,6 +48,9 @@ pub(crate) struct ClientCert {
     /// more than one CN, or a CN of a type other than UTF8String or
     /// PrintableString, and if the DER bytes do not parse.
     pub(crate) cn: Option<String>,
+    /// The end of the validity period, as the time since the Unix epoch. It
+    /// is `None` if the DER bytes do not parse.
+    pub(crate) not_after: Option<Duration>,
 }
 
 impl ClientCert {
@@ -24,13 +58,188 @@ impl ClientCert {
     /// has the digest and no CN, so the certificate can still match a
     /// `tls-sha256:HEX` or a `tls:*` item.
     pub(crate) fn from_der(der: &[u8]) -> ClientCert {
-        let cn = Certificate::from_der(der)
-            .ok()
-            .and_then(|cert| subject_cn(&cert.tbs_certificate.subject));
+        ClientCert::from_der_with_digest(der, Checksum::sha256(der))
+    }
+
+    /// [`from_der`](ClientCert::from_der), with the digest `digest` of `der`
+    /// that the caller computed.
+    fn from_der_with_digest(der: &[u8], digest: Checksum) -> ClientCert {
+        let cert = Certificate::from_der(der).ok();
         ClientCert {
-            digest: Checksum::sha256(der),
-            cn,
+            digest,
+            cn: cert
+                .as_ref()
+                .and_then(|cert| subject_cn(&cert.tbs_certificate.subject)),
+            not_after: cert.map(|cert| cert.tbs_certificate.validity.not_after.to_unix_duration()),
         }
+    }
+}
+
+/// Why a forwarded certificate gets 403.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Bad {
+    /// The header holds more than one certificate.
+    MoreThanOne,
+    /// The value does not decode to one certificate.
+    Invalid,
+    /// The verifier of the client CA refuses the certificate.
+    Unverified,
+}
+
+impl Bad {
+    /// The message of the refusal.
+    pub(crate) fn message(self) -> &'static str {
+        match self {
+            Bad::MoreThanOne => "the forwarded client certificate holds more than one certificate",
+            Bad::Invalid => "the forwarded client certificate does not parse",
+            Bad::Unverified => "the client CA does not verify the forwarded client certificate",
+        }
+    }
+}
+
+/// The DER bytes of the forwarded certificate in the header `name` of
+/// `headers`, or `None` when the header is absent or empty.
+fn forwarded_der(headers: &HeaderMap, name: &HeaderName) -> Result<Option<Vec<u8>>, Bad> {
+    let mut values = headers.get_all(name).iter();
+    let Some(value) = values.next() else {
+        return Ok(None);
+    };
+    if values.next().is_some() {
+        return Err(Bad::MoreThanOne);
+    }
+    let text = std::str::from_utf8(value.as_bytes()).map_err(|_| Bad::Invalid)?;
+    let text = crate::router::percent_decode(text).ok_or(Bad::Invalid)?;
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    if text.contains(',') {
+        return Err(Bad::MoreThanOne);
+    }
+    if !text.starts_with("-----BEGIN") {
+        return ostrya::base64::decode(text)
+            .map(Some)
+            .map_err(|_| Bad::Invalid);
+    }
+    let mut certs = CertificateDer::pem_slice_iter(text.as_bytes());
+    let der = certs
+        .next()
+        .ok_or(Bad::Invalid)?
+        .map_err(|_| Bad::Invalid)?;
+    match certs.next() {
+        None => Ok(Some(der.to_vec())),
+        Some(Ok(_)) => Err(Bad::MoreThanOne),
+        Some(Err(_)) => Err(Bad::Invalid),
+    }
+}
+
+/// The certificates that trusted proxies forward in the request header
+/// `header`, and the verifier of the client CA.
+pub(crate) struct ForwardedCerts {
+    header: HeaderName,
+    verifier: Arc<dyn ClientCertVerifier>,
+    cache: Mutex<Cache>,
+}
+
+/// The verified forwarded certificates, by the SHA-256 digest of their DER
+/// bytes.
+struct Cache {
+    capacity: usize,
+    entries: HashMap<[u8; 32], Cached>,
+    /// The keys of `entries`, from the oldest to the newest.
+    order: VecDeque<[u8; 32]>,
+}
+
+/// One verified certificate.
+struct Cached {
+    cert: Arc<ClientCert>,
+    /// The end of the validity period of the certificate.
+    not_after: Duration,
+}
+
+impl Cache {
+    /// Removes the entry of `key`.
+    fn remove(&mut self, key: &[u8; 32]) {
+        if self.entries.remove(key).is_some() {
+            self.order.retain(|k| k != key);
+        }
+    }
+
+    /// Adds `cert` under `key`. When the cache is full, the oldest entry
+    /// goes.
+    fn insert(&mut self, key: [u8; 32], cert: Arc<ClientCert>, not_after: Duration) {
+        if self.entries.contains_key(&key) {
+            return;
+        }
+        while self.entries.len() >= self.capacity {
+            let Some(oldest) = self.order.pop_front() else {
+                break;
+            };
+            self.entries.remove(&oldest);
+        }
+        self.entries.insert(key, Cached { cert, not_after });
+        self.order.push_back(key);
+    }
+}
+
+impl ForwardedCerts {
+    /// The certificates of the header `header`, verified by `verifier`.
+    pub(crate) fn new(header: HeaderName, verifier: Arc<dyn ClientCertVerifier>) -> ForwardedCerts {
+        ForwardedCerts::with_capacity(header, verifier, CACHE_ENTRIES)
+    }
+
+    fn with_capacity(
+        header: HeaderName,
+        verifier: Arc<dyn ClientCertVerifier>,
+        capacity: usize,
+    ) -> ForwardedCerts {
+        ForwardedCerts {
+            header,
+            verifier,
+            cache: Mutex::new(Cache {
+                capacity,
+                entries: HashMap::new(),
+                order: VecDeque::new(),
+            }),
+        }
+    }
+
+    /// The verified certificate of a request with `headers` at the time
+    /// `now`, or `None` when the header is absent or empty.
+    ///
+    /// A cache entry serves the request while `now` is before the end of the
+    /// validity period of its certificate. Else the function verifies the
+    /// certificate, and keeps a verified certificate in the cache. It keeps
+    /// no refusal.
+    pub(crate) fn certificate(
+        &self,
+        headers: &HeaderMap,
+        now: UnixTime,
+    ) -> Result<Option<Arc<ClientCert>>, Bad> {
+        let Some(der) = forwarded_der(headers, &self.header)? else {
+            return Ok(None);
+        };
+        let digest = Checksum::sha256(&der);
+        let key = *digest.as_bytes();
+        let at = Duration::from_secs(now.as_secs());
+        {
+            let mut cache = self.cache.lock().expect("certificate cache mutex");
+            if let Some(entry) = cache.entries.get(&key) {
+                if at < entry.not_after {
+                    return Ok(Some(entry.cert.clone()));
+                }
+                cache.remove(&key);
+            }
+        }
+        self.verifier
+            .verify_client_cert(&CertificateDer::from(der.as_slice()), &[], now)
+            .map_err(|_| Bad::Unverified)?;
+        let cert = Arc::new(ClientCert::from_der_with_digest(&der, digest));
+        if let Some(not_after) = cert.not_after {
+            let mut cache = self.cache.lock().expect("certificate cache mutex");
+            cache.insert(key, cert.clone(), not_after);
+        }
+        Ok(Some(cert))
     }
 }
 
@@ -63,6 +272,14 @@ fn subject_cn(name: &Name) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use futures_rustls::rustls;
+    use futures_rustls::rustls::client::danger::HandshakeSignatureValid;
+    use futures_rustls::rustls::server::danger::ClientCertVerified;
+    use futures_rustls::rustls::{DigitallySignedStruct, DistinguishedName, SignatureScheme};
+    use hyper::header::HeaderValue;
+
     use super::*;
 
     /// The CN of the subject `text`, in the string form of RFC 4514. A value
@@ -111,15 +328,18 @@ mod tests {
     /// The fixture client certificate has the subject `CN=ostrya test`.
     #[test]
     fn the_fixture_certificate_gives_its_digest_and_cn() {
-        let pem = include_str!("../../../tests/fixtures/tls/client.pem");
-        let base64: String = pem
-            .lines()
-            .filter(|line| !line.starts_with("-----"))
-            .collect();
-        let der = ostrya::base64::decode(&base64).unwrap();
+        let der = der(CLIENT_PEM);
         let cert = ClientCert::from_der(&der);
         assert_eq!(cert.digest, Checksum::sha256(&der));
         assert_eq!(cert.cn.as_deref(), Some("ostrya test"));
+    }
+
+    /// The fixture client certificate ends its validity on 2126-07-02 at
+    /// 12:02:20 UTC.
+    #[test]
+    fn the_fixture_certificate_gives_its_not_after() {
+        let cert = ClientCert::from_der(&der(CLIENT_PEM));
+        assert_eq!(cert.not_after, Some(Duration::from_secs(4_938_667_340)));
     }
 
     /// Bytes that do not parse give the digest and no CN.
@@ -129,6 +349,288 @@ mod tests {
             let cert = ClientCert::from_der(der);
             assert_eq!(cert.digest, Checksum::sha256(der));
             assert_eq!(cert.cn, None);
+            assert_eq!(cert.not_after, None);
+        }
+    }
+
+    const CLIENT_PEM: &str = include_str!("../../../tests/fixtures/tls/client.pem");
+    const SERVER_PEM: &str = include_str!("../../../tests/fixtures/tls/server.pem");
+    const CA_PEM: &str = include_str!("../../../tests/fixtures/tls/ca.pem");
+    const UNTRUSTED_PEM: &str = include_str!("../../../tests/fixtures/tls/server-untrusted.pem");
+
+    /// The base64 of the one certificate of `pem`, with no line break.
+    fn base64(pem: &str) -> String {
+        pem.lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect()
+    }
+
+    /// The DER bytes of the one certificate of `pem`.
+    fn der(pem: &str) -> Vec<u8> {
+        ostrya::base64::decode(&base64(pem)).unwrap()
+    }
+
+    /// `text` with each byte other than a letter, a digit, `-`, `.`, `_`, and
+    /// `~` as `%XX`.
+    fn escape(text: &str) -> String {
+        text.bytes()
+            .map(|b| {
+                if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+                    char::from(b).to_string()
+                } else {
+                    format!("%{b:02X}")
+                }
+            })
+            .collect()
+    }
+
+    fn name() -> HeaderName {
+        HeaderName::from_static("x-client-cert")
+    }
+
+    /// The headers with one line of `name` for each of `values`.
+    fn headers(values: &[&str]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for value in values {
+            headers.append(name(), value.parse().unwrap());
+        }
+        headers
+    }
+
+    fn decoded(values: &[&str]) -> Result<Option<Vec<u8>>, Bad> {
+        forwarded_der(&headers(values), &name())
+    }
+
+    /// The forms of nginx, HAProxy, and Traefik give the DER bytes of the
+    /// certificate.
+    #[test]
+    fn the_forms_of_each_proxy_decode_to_the_der() {
+        let der = der(CLIENT_PEM);
+        let base64 = base64(CLIENT_PEM);
+        assert!(base64.contains('+') || base64.contains('/'));
+        for value in [
+            escape(CLIENT_PEM),
+            base64.clone(),
+            escape(&base64),
+            format!(" {base64} "),
+            escape(&CLIENT_PEM.replace('\n', "\r\n")),
+        ] {
+            assert_eq!(decoded(&[&value]), Ok(Some(der.clone())), "{value}");
+        }
+    }
+
+    /// An absent header, an empty value, and white space alone give no
+    /// certificate.
+    #[test]
+    fn an_empty_value_is_no_certificate() {
+        assert_eq!(decoded(&[]), Ok(None));
+        for value in ["", " ", "%20", "%0A%09"] {
+            assert_eq!(decoded(&[value]), Ok(None), "{value:?}");
+        }
+    }
+
+    /// A comma, two lines of the header, and two PEM sections hold more
+    /// than one certificate.
+    #[test]
+    fn more_than_one_certificate_is_refused() {
+        let base64 = base64(CLIENT_PEM);
+        let other = self::base64(SERVER_PEM);
+        let two = format!("{CLIENT_PEM}{SERVER_PEM}");
+        for values in [
+            vec![format!("{base64},{other}")],
+            vec![escape(&format!("{base64},{other}"))],
+            vec![format!("{base64},")],
+            vec![base64.clone(), other.clone()],
+            vec![base64.clone(), String::new()],
+            vec![escape(&two)],
+        ] {
+            let values: Vec<&str> = values.iter().map(String::as_str).collect();
+            assert_eq!(decoded(&values), Err(Bad::MoreThanOne), "{values:?}");
+        }
+    }
+
+    /// A bad escape, bad base64, and PEM with no `CERTIFICATE` section do
+    /// not parse.
+    #[test]
+    fn a_value_that_does_not_decode_is_invalid() {
+        let key = "-----BEGIN PRIVATE KEY-----\nAAAA\n-----END PRIVATE KEY-----\n";
+        for value in [
+            "%zz".to_owned(),
+            "abc%".to_owned(),
+            "%00".to_owned(),
+            "!!!".to_owned(),
+            "QUJD RA==".to_owned(),
+            "A".to_owned(),
+            escape(key),
+            escape("-----BEGIN CERTIFICATE-----\n!!!\n-----END CERTIFICATE-----\n"),
+            "-----BEGIN CERTIFICATE-----".to_owned(),
+        ] {
+            assert_eq!(decoded(&[&value]), Err(Bad::Invalid), "{value}");
+        }
+        let bytes = HeaderValue::from_bytes(b"\xffabc").unwrap();
+        let mut headers = HeaderMap::new();
+        headers.append(name(), bytes);
+        assert_eq!(forwarded_der(&headers, &name()), Err(Bad::Invalid));
+    }
+
+    /// A verifier that accepts each certificate whose DER bytes are not in
+    /// `refused`, and counts its calls.
+    #[derive(Debug, Default)]
+    struct Counting {
+        calls: AtomicUsize,
+        refused: Vec<Vec<u8>>,
+    }
+
+    impl ClientCertVerifier for Counting {
+        fn root_hint_subjects(&self) -> &[DistinguishedName] {
+            &[]
+        }
+
+        fn verify_client_cert(
+            &self,
+            end_entity: &CertificateDer<'_>,
+            intermediates: &[CertificateDer<'_>],
+            _now: UnixTime,
+        ) -> Result<ClientCertVerified, rustls::Error> {
+            assert!(intermediates.is_empty());
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            if self.refused.iter().any(|der| der[..] == end_entity[..]) {
+                return Err(rustls::Error::General("refused".into()));
+            }
+            Ok(ClientCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            _: &[u8],
+            _: &CertificateDer<'_>,
+            _: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Err(rustls::Error::General("unused".into()))
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            _: &[u8],
+            _: &CertificateDer<'_>,
+            _: &DigitallySignedStruct,
+        ) -> Result<HandshakeSignatureValid, rustls::Error> {
+            Err(rustls::Error::General("unused".into()))
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+            Vec::new()
+        }
+    }
+
+    fn at(secs: u64) -> UnixTime {
+        UnixTime::since_unix_epoch(Duration::from_secs(secs))
+    }
+
+    /// A cache hit verifies no more. An entry serves until the end of the
+    /// validity period of its certificate, and then the certificate is
+    /// verified again.
+    #[test]
+    fn a_cache_hit_verifies_no_more_until_not_after() {
+        let counting = Arc::new(Counting::default());
+        let certs = ForwardedCerts::new(name(), counting.clone());
+        let request = headers(&[&base64(CLIENT_PEM)]);
+        let calls = || counting.calls.load(Ordering::Relaxed);
+        let not_after = 4_938_667_340;
+        let first = certs.certificate(&request, at(1)).unwrap().unwrap();
+        assert_eq!(first.cn.as_deref(), Some("ostrya test"));
+        assert_eq!(first.digest, Checksum::sha256(&der(CLIENT_PEM)));
+        let second = certs
+            .certificate(&request, at(not_after - 1))
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(&first, &second));
+        assert_eq!(calls(), 1);
+        let third = certs.certificate(&request, at(not_after)).unwrap().unwrap();
+        assert!(!Arc::ptr_eq(&first, &third));
+        assert_eq!(calls(), 2);
+        certs.certificate(&request, at(2)).unwrap().unwrap();
+        assert_eq!(calls(), 2);
+    }
+
+    /// A full cache removes its oldest entry for a new one.
+    #[test]
+    fn a_full_cache_removes_the_oldest_entry() {
+        let counting = Arc::new(Counting::default());
+        let certs = ForwardedCerts::with_capacity(name(), counting.clone(), 2);
+        let calls = || counting.calls.load(Ordering::Relaxed);
+        let get = |pem: &str| {
+            certs
+                .certificate(&headers(&[&base64(pem)]), at(1))
+                .unwrap()
+                .unwrap();
+        };
+        get(CLIENT_PEM);
+        get(SERVER_PEM);
+        get(CLIENT_PEM);
+        assert_eq!(calls(), 2);
+        get(CA_PEM);
+        assert_eq!(calls(), 3);
+        get(SERVER_PEM);
+        get(CA_PEM);
+        assert_eq!(calls(), 3);
+        get(CLIENT_PEM);
+        assert_eq!(calls(), 4);
+        get(CA_PEM);
+        assert_eq!(calls(), 4);
+        get(SERVER_PEM);
+        assert_eq!(calls(), 5);
+        assert_eq!(certs.cache.lock().unwrap().entries.len(), 2);
+        assert_eq!(certs.cache.lock().unwrap().order.len(), 2);
+        assert_eq!(CACHE_ENTRIES, 1024);
+    }
+
+    /// A refusal of the verifier is no cache entry, and a value that does
+    /// not decode reaches no verifier.
+    #[test]
+    fn a_refusal_is_not_cached() {
+        let counting = Arc::new(Counting {
+            refused: vec![der(UNTRUSTED_PEM)],
+            ..Counting::default()
+        });
+        let certs = ForwardedCerts::new(name(), counting.clone());
+        let request = headers(&[&base64(UNTRUSTED_PEM)]);
+        for _ in 0..2 {
+            assert_eq!(
+                certs.certificate(&request, at(1)).err(),
+                Some(Bad::Unverified)
+            );
+        }
+        assert_eq!(counting.calls.load(Ordering::Relaxed), 2);
+        assert!(certs.cache.lock().unwrap().entries.is_empty());
+        assert_eq!(
+            certs.certificate(&headers(&["!"]), at(1)).err(),
+            Some(Bad::Invalid)
+        );
+        assert_eq!(
+            certs.certificate(&headers(&[]), at(1)).unwrap().map(|_| ()),
+            None
+        );
+        assert_eq!(counting.calls.load(Ordering::Relaxed), 2);
+    }
+
+    /// The verifier of the fixture CA accepts the fixture client
+    /// certificate, and refuses a certificate with no `clientAuth` usage.
+    #[test]
+    fn the_verifier_of_the_client_ca_checks_a_forwarded_certificate() {
+        let verifier = ostrya_fetch::client_cert_verifier(CA_PEM.as_bytes()).unwrap();
+        let certs = ForwardedCerts::new(name(), verifier);
+        let cert = certs
+            .certificate(&headers(&[&escape(CLIENT_PEM)]), UnixTime::now())
+            .unwrap()
+            .unwrap();
+        assert_eq!(cert.cn.as_deref(), Some("ostrya test"));
+        for pem in [SERVER_PEM, UNTRUSTED_PEM] {
+            let request = headers(&[&base64(pem)]);
+            assert_eq!(
+                certs.certificate(&request, UnixTime::now()).err(),
+                Some(Bad::Unverified)
+            );
         }
     }
 }

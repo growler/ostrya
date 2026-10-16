@@ -444,12 +444,9 @@ enum Command {
     /// repository config. Each option of the command with the name of a key
     /// has precedence over the key. A relative path in a key is relative to
     /// the repository directory, and a relative path in an option is
-    /// relative to the current directory. `sign-summary` has no option. The
-    /// command refuses the keys `trusted-proxy` and
-    /// `trusted-proxy-client-cert`, and `proxy-protocol=true`, because it
-    /// does not support a proxy yet. At start, the command reads and checks
-    /// the client groups, the server group, the trust groups, and the key
-    /// groups. A bad group, or a key group whose key the command cannot
+    /// relative to the current directory. `sign-summary` has no option. At
+    /// start, the command reads and checks the client groups, the server
+    /// group, the trust groups, and the key groups. A bad group, or a key group whose key the command cannot
     /// read, ends the command with status 1.
     ///
     /// When all listeners are bound, the command writes the URL of each
@@ -2676,21 +2673,78 @@ struct ServeArgs {
     /// Verify client certificates against the CA certificates in FILE, in PEM.
     ///
     /// The CA needs a server certificate, from --tls-cert or from the
-    /// `tls-cert` key. A client that presents a certificate must present one
-    /// that the CA signed. A client that presents no certificate is served. A
-    /// client certificate that the CA signed can match a `tls:*`, `tls:NAME`,
-    /// or `tls-sha256:HEX` item of a client group. The command reads FILE
-    /// once, at start, and refuses a file larger than 1 MiB.
+    /// `tls-cert` key, or a header of a forwarded certificate, from
+    /// --trusted-proxy-client-cert or from the `trusted-proxy-client-cert`
+    /// key. The CA verifies the certificate of the TLS handshake and the
+    /// certificate that a trusted proxy forwards. A client that presents a
+    /// certificate in the handshake must present one that the CA signed. A
+    /// client that presents no certificate is served. A client certificate
+    /// that the CA signed can match a `tls:*`, `tls:NAME`, or
+    /// `tls-sha256:HEX` item of a client group. The command reads FILE once,
+    /// at start, and refuses a file larger than 1 MiB.
     #[arg(long, value_name = "FILE")]
     tls_client_ca: Option<PathBuf>,
+    /// Read the forwarding headers of a peer in the network CIDR.
+    ///
+    /// CIDR is ADDR/LEN or a bare ADDR. A network with host bits set is
+    /// refused. Give the option once for each network. The options replace
+    /// the whole `trusted-proxy` key. The option needs a header of the client
+    /// address, from --trusted-proxy-header or from the
+    /// `trusted-proxy-header` key. From a peer in such a network, the
+    /// receive endpoint reads the client address from that header, the
+    /// scheme `https`, and a forwarded client certificate. It walks the hops
+    /// of the header from the right, and skips each hop in a trusted network.
+    /// The first other hop is the client address. A proxy in the list must
+    /// set or remove these headers in each request. No option removes the
+    /// key: to trust no peer, remove the key.
+    #[arg(long, value_name = "CIDR", value_parser = parse_trusted_proxy)]
+    trusted_proxy: Vec<ostrya::access::IpNet>,
+    /// Read the client address of a request from a trusted proxy in HEADER.
+    ///
+    /// HEADER is `forwarded` for the `Forwarded` header of RFC 7239,
+    /// `x-forwarded-for`, or `x-real-ip`. The server reads this one header.
+    /// With `forwarded`, the `proto` of the client hop gives the scheme. With
+    /// the other two, the rightmost value of `X-Forwarded-Proto` gives the
+    /// scheme. The option needs a trusted network, from --trusted-proxy or
+    /// from the `trusted-proxy` key. No option removes the key.
+    #[arg(long, value_name = "HEADER", value_parser = parse_forwarded_header)]
+    trusted_proxy_header: Option<ostrya::access::ForwardedHeader>,
+    /// Read the client certificate of a request from a trusted proxy in the
+    /// request header HEADER.
+    ///
+    /// HEADER is a header name: an HTTP token of RFC 9110, which is one or
+    /// more ASCII letters, digits, and token characters. The value is a
+    /// URL-escaped PEM
+    /// certificate, as nginx `$ssl_client_escaped_cert` gives it, or a base64
+    /// DER certificate, as HAProxy `ssl_c_der,base64` and Traefik
+    /// `passTLSClientCert` give it. The client CA verifies the certificate,
+    /// also on a plain HTTP listener. A value with more than one certificate,
+    /// a value that does not parse, and a certificate that the CA does not
+    /// verify get 403. The option needs a client CA and a trusted network,
+    /// each from its option or its key. No option removes the key.
+    #[arg(long, value_name = "HEADER", value_parser = parse_header_name)]
+    trusted_proxy_client_cert: Option<String>,
+    /// Read a PROXY protocol header, version 1 or 2, at the start of each
+    /// connection.
+    ///
+    /// `--proxy-protocol` reads the header, and `--proxy-protocol=false`
+    /// does not. The header comes before the TLS handshake, and its source
+    /// address is the client address. The server closes a connection with
+    /// no valid header, or with no header within 30 seconds, with no
+    /// response. Each peer that can connect states its own client address
+    /// in the header, so only the proxy must be able to reach the listener.
+    #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
+    proxy_protocol: Option<bool>,
     /// Take a bearer or Basic credential of push over plain HTTP.
     ///
     /// `--allow-cleartext-credentials` takes such a credential, and
     /// `--allow-cleartext-credentials=false` refuses it. Without the option
     /// and the key, the receive endpoint answers 403 to such a request, also
-    /// when a client group has the `anonymous` item. Use it for a server on a
-    /// loopback address or behind a proxy that terminates TLS. A read of the
-    /// files of a pull needs no credential.
+    /// when a client group has the `anonymous` item, unless a trusted proxy
+    /// states the scheme `https` (see --trusted-proxy). Use it for a server
+    /// on a loopback address, or behind a proxy that terminates TLS and is
+    /// not a trusted proxy. A read of the files of a pull needs no
+    /// credential.
     #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
     allow_cleartext_credentials: Option<bool>,
     /// Abort a push session that stays idle for SECONDS.
@@ -2751,6 +2805,10 @@ impl ServeArgs {
             tls_cert: self.tls_cert,
             tls_key: self.tls_key,
             tls_client_ca: self.tls_client_ca,
+            trusted_proxy: (!self.trusted_proxy.is_empty()).then_some(self.trusted_proxy),
+            trusted_proxy_header: self.trusted_proxy_header,
+            trusted_proxy_client_cert: self.trusted_proxy_client_cert,
+            proxy_protocol: self.proxy_protocol,
             allow_cleartext_credentials: self.allow_cleartext_credentials,
             session_timeout: self.session_timeout,
             max_sessions: self.max_sessions,
@@ -2758,6 +2816,33 @@ impl ServeArgs {
             body_timeout: self.body_timeout,
             ..ostrya::access::ServerSettings::default()
         }
+    }
+}
+
+/// Reads a value of `--trusted-proxy`.
+#[cfg(feature = "serve")]
+fn parse_trusted_proxy(text: &str) -> std::result::Result<ostrya::access::IpNet, String> {
+    ostrya::access::IpNet::parse(text).map_err(|err| err.to_string())
+}
+
+/// Reads a value of `--trusted-proxy-header`.
+#[cfg(feature = "serve")]
+fn parse_forwarded_header(
+    text: &str,
+) -> std::result::Result<ostrya::access::ForwardedHeader, String> {
+    ostrya::access::ForwardedHeader::parse(text).map_err(|err| err.to_string())
+}
+
+/// Reads a value of `--trusted-proxy-client-cert`.
+#[cfg(feature = "serve")]
+fn parse_header_name(text: &str) -> std::result::Result<String, String> {
+    if ostrya::access::is_header_name(text) {
+        Ok(text.to_owned())
+    } else {
+        Err(format!(
+            "'{text}' is not a header name: one or more ASCII letters, digits, and the \
+             characters !#$%&'*+-.^_`|~"
+        ))
     }
 }
 
@@ -3397,9 +3482,7 @@ const MAX_SERVE_FILE_SIZE: u64 = 1024 * 1024;
 /// `serve` reads and checks the client groups, the server group, the trust
 /// groups, and the key groups of the repository config at start. Each option
 /// of `args` replaces the key of `[ex-ostrya server]` with its name, and the
-/// checks run on the result. The command refuses a set `trusted-proxy`, a set
-/// `trusted-proxy-client-cert`, and `proxy-protocol=true`, because it does
-/// not support a proxy yet. The receive endpoint identifies each client by
+/// checks run on the result. The receive endpoint identifies each client by
 /// the client groups. For each session that commits, each warning of its
 /// report goes to standard error as one line.
 #[cfg(feature = "serve")]
@@ -3409,20 +3492,6 @@ async fn serve(repo: Repo, args: ServeArgs) -> Result<()> {
 
     let policies = Arc::new(ostrya::ReceivePolicies::from_config(&repo).await?);
     let settings = policies.access().server().overridden_by(&args.settings());
-    for (key, set) in [
-        ("trusted-proxy", settings.trusted_proxy.is_some()),
-        (
-            "trusted-proxy-client-cert",
-            settings.trusted_proxy_client_cert.is_some(),
-        ),
-        ("proxy-protocol", settings.proxy_protocol == Some(true)),
-    ] {
-        if set {
-            return Err(Error::Unsupported(format!(
-                "[ex-ostrya server] {key} is not supported yet"
-            )));
-        }
-    }
     policies.access().check_server(&settings)?;
     let mut opts = ostrya_server::ServeOptions::default();
     if let Some(listen) = settings.listen {
@@ -3451,6 +3520,10 @@ async fn serve(repo: Repo, args: ServeArgs) -> Result<()> {
         });
     }
     opts.client_ca_pem = settings.tls_client_ca.as_deref().map(read_serve_file);
+    opts.trusted_proxies = settings.trusted_proxy.unwrap_or_default();
+    opts.trusted_proxy_header = settings.trusted_proxy_header;
+    opts.trusted_proxy_client_cert = settings.trusted_proxy_client_cert;
+    opts.proxy_protocol = settings.proxy_protocol.unwrap_or(false);
     opts.receive = Some(policies);
     opts.on_report = Some(Arc::new(|report: ostrya::ReceiveReport| {
         for warning in &report.warnings {

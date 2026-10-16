@@ -11,7 +11,10 @@ of ostrya. The pull reads it as an `archive` repository, whatever its mode
 (see `ostrya::ArchiveView`). With the client groups of the repository
 (`ostrya::ReceivePolicies`), the server also runs the receive endpoint
 of a push. It identifies the client of each request by the auth items of
-the groups, and gives each session the policy of one group. A host with
+the groups, and gives each session the policy of one group. Behind a
+proxy, it reads the PROXY protocol header of a connection, and the client
+address, the scheme, and the client certificate that a trusted proxy
+forwards in the request headers. A host with
 its own HTTP router mounts that endpoint as a `ReceiveEndpoint` and
 authenticates the requests itself. The server also answers `GET /_ostrya/refs/v1` with the bytes of
 `ostrya::Repo::build_ref_listing` for the ref patterns of its query. The
@@ -23,7 +26,7 @@ API documentation: <https://docs.rs/ostrya-server>
 
 - `serve` binds the listeners of a `ServeOptions` and runs the server.
 - `bind` binds the listeners and returns a `Server` to run with `Server::run`.
-- `ServeOptions` holds the addresses, the TLS files, the client CA, and the options of a push.
+- `ServeOptions` holds the addresses, the TLS files, the client CA, the proxy settings, and the options of a push.
 - `ReceiveEndpoint::new` creates the receive endpoint for the router of a host.
 - `ReceiveEndpoint::handle` answers one request of the endpoint.
 - `ReceiveAuth` is the authentication of the endpoint by its host.

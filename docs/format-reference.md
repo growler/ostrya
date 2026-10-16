@@ -3338,7 +3338,9 @@ cuts it short.
 `ostrya serve` answers HTTP requests with three endpoints: the archive view,
 the ref listing at `/_ostrya/refs/v1`, and the receive endpoint of a push
 under `/_ostrya/receive/v1/`. No repository layout uses a path under
-`/_ostrya/`.
+`/_ostrya/`. With `proxy-protocol=true`, each connection starts with a PROXY
+protocol header before the TLS handshake and the first request
+("Authentication of the receive endpoint" states its rules).
 
 ### Routing
 
@@ -3657,14 +3659,16 @@ applies:
 1. A request with more than one `Authorization` header gets 401.
 2. Over plain HTTP, a `Bearer` or `Basic` credential gets 403, unless
    `allow-cleartext-credentials` is true, from the key or from the option of
-   `ostrya serve`. This step also applies when a group has the `anonymous`
-   item.
+   `ostrya serve`, or a trusted proxy reports the scheme `https`. This step
+   also applies when a group has the `anonymous` item.
 3. A request with an `Authorization` header gets the item of its
    credential. A credential that matches no item gets 401, also when the
    request has a client certificate. A header with another scheme gets 401.
 4. A request with a client certificate gets the first item that matches, in
    this order: `tls-sha256:HEX`, `tls:NAME`, `tls:*`. A certificate that
-   matches no item gets 403.
+   matches no item gets 403. From a trusted proxy with
+   `trusted-proxy-client-cert`, the certificate comes from that header
+   alone, and never from the TLS handshake.
 5. A request whose client address is in the network of a `net:` item gets
    that item. When two items match, the item with the longer prefix wins.
 6. A request gets the `anonymous` item, if a group has it.
@@ -3707,8 +3711,119 @@ end-entity certificate one time for each connection:
   parse matches no `tls:NAME` item, and can match `tls-sha256:HEX` and
   `tls:*`.
 
-The client address is the TCP peer address. An IPv4-mapped IPv6 address
+The client address is the TCP peer address, with the changes of the PROXY
+protocol and of the trusted proxies below. An IPv4-mapped IPv6 address
 counts as its IPv4 address.
+
+With `proxy-protocol=true`, each listener reads a PROXY protocol header at
+the start of each connection, before the TLS handshake. The source address
+of the header replaces the peer address. A connection with no valid header,
+a connection that ends or fails in the header, and a connection with no
+header within 30 seconds close with no byte of response. The bytes after the
+header go to the TLS handshake or to the first request. Each peer that can
+connect states its own client address in the header, so only the proxy must
+be able to reach the listener. The header is one of these forms:
+
+- Version 1, a text line. The line starts with `PROXY ` and ends at its
+  first CRLF, with at most 107 bytes, the CRLF included. `TCP4 SRC DST SPORT
+  DPORT` and `TCP6 SRC DST SPORT DPORT` give the address `SRC`. One space
+  separates two fields, each address is of the family of the protocol, and
+  each port is decimal digits alone, at most 65535. `UNKNOWN`, with any rest
+  of the line, gives no address. Each other line is not valid, for example
+  `UDP4` or a protocol in lowercase.
+- Version 2, binary. The header is the 12-byte signature
+  `\r\n\r\n\0\r\nQUIT\n`, a byte with the version 2 and the command, a
+  family byte, a 16-bit big-endian length, and that number of bytes. The
+  command `LOCAL` gives no address, and the server ignores its family.
+  Under the command `PROXY`, the family `0x00` gives no address, `0x11`
+  gives the IPv4 source address of an address block of at least 12 bytes,
+  `0x21` gives the IPv6 source address of a block of at least 36 bytes, and
+  `0x31` gives no address, with a block of at least 216 bytes. Under
+  `PROXY`, each other family is not valid, for example a datagram family.
+  Each other version and command is not valid. The server ignores the TLVs
+  after the address block.
+
+A header with no address keeps the peer address. The check of
+`trusted-proxy` below uses the source address of the header, so the server
+does not read the forwarding headers and the forwarded certificate of a proxy
+that states the address of its client in the PROXY header.
+
+`trusted-proxy` lists the networks of the trusted proxies, and
+`trusted-proxy-header` names the one request header from which the server
+reads the client address of a request from a trusted proxy: `forwarded`,
+`x-forwarded-for`, or `x-real-ip`. Each key needs the other. When the peer
+address is in `trusted-proxy`, the server reads that header and no other
+header of a client address:
+
+- `Forwarded` (RFC 7239): each element of the list is one hop. A pair is
+  `NAME=VALUE`, the names compare with no regard to case, and a value is a
+  token or a quoted string with `\` escapes. The `for` value of a hop is
+  `IPV4`, `"IPV4:PORT"`, `"[IPV6]"`, or `"[IPV6]:PORT"`. `unknown`, an
+  obfuscated name such as `_hidden`, a hop with no `for`, and another value
+  give a hop with no address. An IPv6 address with no quotes, an
+  unterminated quoted string, and another value that does not tokenize give
+  a client with no address.
+- `X-Forwarded-For`: each item of the comma list is one hop, with the white
+  space around it removed: `ADDR`, `IPV4:PORT`, or `[IPV6]:PORT`. Another
+  item is a hop with no address.
+- `X-Real-IP`: one hop, in the forms of an `X-Forwarded-For` item.
+
+The lines of the header join in their order. The server walks the hops from
+the right, and skips each hop whose address is in `trusted-proxy`. The first
+other hop is the client. When all hops are trusted, the client is the
+leftmost hop. A hop with no address gives a client with no address, which
+matches no `net:` item: the server does not take the address of the proxy in
+its place. A header that is absent, or that has one line of white space
+alone, keeps the peer address. A header with other text and no hop, for
+example `X-Forwarded-For: , ,` or `Forwarded: ;`, gives no address. A header
+that is not UTF-8 gives no address.
+
+From a trusted proxy, the request counts as TLS for step 2 when the proxy
+reports the scheme `https`, in any case. With `trusted-proxy-header=forwarded`,
+the report is the `proto` of the selected hop. With the other two headers,
+it is the rightmost value of `X-Forwarded-Proto`: the last comma item of its
+last line, with no white space around it. The server reads the scheme also
+when the header of the client address is absent.
+
+`trusted-proxy-client-cert` names the request header that carries the
+client certificate from a trusted proxy. It needs `tls-client-ca` and
+`trusted-proxy`. The server reads the header for each request and never
+keeps the result for a connection, because a proxy sends the requests of
+many clients over one connection. The server percent-decodes the value, and
+`+` stays `+`. Then the value is one of:
+
+- a PEM certificate that starts with `-----BEGIN`, as nginx
+  `$ssl_client_escaped_cert` gives it URL-escaped;
+- the base64 of the DER bytes, as HAProxy `ssl_c_der,base64` gives it, or
+  URL-escaped, as Traefik `passTLSClientCert` gives it.
+
+An empty value, or white space alone, is no certificate. These values get
+403 with `unauthorized`: a value with a comma, as the chain of Traefik holds;
+more than one line of the header; PEM with more than one `CERTIFICATE`
+section; a value that does not decode; and a certificate that does not
+verify. The server builds one verifier from `tls-client-ca` at start, and
+the TLS handshake and each forwarded certificate use it, also on a plain
+HTTP listener. The verifier checks the chain to a CA of `tls-client-ca`, the
+validity period, and the `clientAuth` extended key usage. The server uses
+no intermediate certificate from the proxy, so `tls-client-ca` must hold
+each intermediate CA. The server keeps each verified certificate in a cache
+of 1024 entries, keyed by the SHA-256 digest of its DER bytes, until the
+notAfter time of the certificate. A full cache removes its oldest entry. The
+cache keeps no refusal.
+
+From a trusted proxy, the header of `trusted-proxy-client-cert` alone gives
+the certificate. The server does not use the certificate of the TLS
+handshake, which is the certificate of the proxy. A request with no such
+header gives no certificate. From a peer that is not in `trusted-proxy`, and
+with no `trusted-proxy-client-cert`, the certificate of the TLS handshake
+applies.
+
+From a peer that is not in `trusted-proxy`, the server reads no forwarding
+header, no `X-Forwarded-Proto`, and no forwarded certificate. A trusted
+proxy must set or remove the header of `trusted-proxy-header`,
+`X-Forwarded-Proto`, and the header of `trusted-proxy-client-cert` in each
+request. Else a client can send these headers through the proxy, and take
+another address, the scheme `https`, or another certificate.
 
 A `session` request then selects the client group of the local refs that
 carries the item. `Hello` names no collection, so the namespace of each

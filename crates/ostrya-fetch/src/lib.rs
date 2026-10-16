@@ -72,10 +72,10 @@ pub use self::error::{Error, Result};
 use gate::{Gate, Permit};
 #[doc(hidden)]
 pub use io::{FuturesIo, RtExecutor, RtTimer, WriteVectored};
-#[doc(hidden)]
-pub use tls::server_config;
 use tls::{ClientConfigs, client_config};
 pub use tls::{ClientIdentity, TlsOptions, TrustRoots};
+#[doc(hidden)]
+pub use tls::{client_cert_verifier, server_config};
 
 /// The `User-Agent` value of each request. A `User-Agent` header of the fetcher
 /// or of the request replaces it.

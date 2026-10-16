@@ -8,9 +8,10 @@
 //! - `DELETE`, and the commit that holds its session
 //! - the refusals of the steps in flight
 //! - the authentication of each request
+//! - the PROXY protocol, the trusted proxies, and the forwarded certificates
 
 use std::future::Future;
-use std::net::SocketAddr;
+use std::net::{Ipv6Addr, SocketAddr};
 use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -18,6 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures_lite::{AsyncReadExt, AsyncWriteExt, future};
+use ostrya::access::{ForwardedHeader, IpNet};
 use ostrya::fetch::{
     BasicAuth, BearerToken, ClientIdentity, Fetcher, FetcherOptions, Protocol, Proxy, TlsOptions,
     TrustRoots, UploadBody, UploadMethod, UploadRequest,
@@ -1868,5 +1870,485 @@ fn a_refusal_with_a_silent_body_answers_within_5_seconds() {
         assert_eq!(header(&response, "connection"), Some("close"), "{response}");
         assert!(elapsed >= Duration::from_millis(400), "{elapsed:?}");
         assert!(elapsed < Duration::from_secs(4), "{elapsed:?}");
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Proxies.
+// ---------------------------------------------------------------------------
+
+/// A client group that pushes from 192.0.2.0/24, and a group of the loopback
+/// address that reads and opens no push session.
+const NET_GROUPS: &str = "[ex-ostrya client \"farm\"]\nauth=net:192.0.2.0/24\nallow=w:**\n\
+                          [ex-ostrya client \"loopback\"]\nauth=net:127.0.0.1\nallow=r:**\n";
+
+/// The message of a request that the group `loopback` identifies.
+const LOOPBACK: &str = "client group 'loopback' opens no push session";
+
+/// A `session` request with the header lines `headers`, each with its CRLF,
+/// and `Connection: close` when `close` is set.
+async fn session_request(headers: &str, close: bool) -> Vec<u8> {
+    let body = encode(&[hello()]).await;
+    let connection = if close { "connection: close\r\n" } else { "" };
+    let mut request = format!(
+        "POST /{SESSION} HTTP/1.1\r\nhost: x\r\n{headers}{connection}\
+         content-length: {}\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    request.extend_from_slice(&body);
+    request
+}
+
+/// Sends `bytes` on a new connection and reads until the server closes it.
+/// A reset of the connection ends the read with no error, so a connection
+/// that the server closes with no response gives no byte.
+async fn exchange(addr: SocketAddr, bytes: &[u8]) -> Vec<u8> {
+    let mut stream = ostrya_rt::TcpStream::connect("127.0.0.1", addr.port())
+        .await
+        .unwrap();
+    let _ = stream.write_all(bytes).await;
+    let _ = stream.flush().await;
+    let mut out = Vec::new();
+    let mut chunk = [0u8; 4096];
+    while let Ok(n) = stream.read(&mut chunk).await {
+        if n == 0 {
+            break;
+        }
+        out.extend_from_slice(&chunk[..n]);
+    }
+    out
+}
+
+/// The status of the one response of `bytes`, from a request with
+/// `Connection: close`, and its text.
+async fn status(addr: SocketAddr, bytes: &[u8]) -> (u16, String) {
+    let out = exchange(addr, bytes).await;
+    let text = String::from_utf8_lossy(&out).into_owned();
+    let code = text
+        .strip_prefix("HTTP/1.1 ")
+        .and_then(|rest| rest.get(..3))
+        .and_then(|code| code.parse().ok())
+        .unwrap_or_else(|| panic!("no response: {text:?}"));
+    (code, text)
+}
+
+/// A PROXY protocol header of version 2 for TCP over IPv4 from `source`.
+fn proxy_v2(source: [u8; 4]) -> Vec<u8> {
+    let mut header = b"\r\n\r\n\0\r\nQUIT\n\x21\x11\x00\x0c".to_vec();
+    header.extend_from_slice(&source);
+    header.extend_from_slice(&[127, 0, 0, 1, 0xdc, 0x04, 0x1f, 0x90]);
+    header
+}
+
+/// With the PROXY protocol, the source address of a version 1 or version 2
+/// header is the client address. A header with no address keeps the peer
+/// address. A connection with no header or a bad header closes with no
+/// response.
+#[test]
+fn the_proxy_protocol_gives_the_client_address() {
+    let tmp = TmpDir::new("proxy-protocol");
+    let repo = receiver(tmp.path(), RepoMode::Archive, "");
+    let mut opts = options_with(&repo, NET_GROUPS);
+    opts.proxy_protocol = true;
+    with_server(repo, opts, |_, addr| async move {
+        let request = session_request("", true).await;
+        let with = |header: &[u8]| [header, &request[..]].concat();
+        for header in [
+            b"PROXY TCP4 192.0.2.7 127.0.0.1 56324 8080\r\n".to_vec(),
+            proxy_v2([192, 0, 2, 8]),
+            b"PROXY TCP6 ::ffff:192.0.2.9 ::1 1 2\r\n".to_vec(),
+        ] {
+            let (code, text) = status(addr, &with(&header)).await;
+            assert_eq!(code, 200, "{text}");
+        }
+        let (code, text) = status(addr, &with(b"PROXY UNKNOWN\r\n")).await;
+        assert_eq!(code, 403, "{text}");
+        assert!(text.contains(LOOPBACK), "{text}");
+        for bad in [
+            &b""[..],
+            b"PROXY TCP4 192.0.2.7 127.0.0.1 1\r\n",
+            b"PROXY TCP4 192.0.2.7  127.0.0.1 1 2\r\n",
+            b"\r\n\r\n\0\r\nQUIT\n\x21\x12\x00\x0c",
+        ] {
+            assert!(exchange(addr, &with(bad)).await.is_empty(), "{bad:?}");
+        }
+        let get = b"GET /config HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n";
+        assert!(exchange(addr, get).await.is_empty());
+        let header = b"PROXY TCP4 192.0.2.7 127.0.0.1 1 2\r\n";
+        let (code, _) = status(addr, &[&header[..], get].concat()).await;
+        assert_eq!(code, 200);
+    });
+}
+
+/// A PROXY protocol header of version 2 with the command `PROXY`, the family
+/// byte `family`, and the bytes `block`: the address block and the TLVs.
+fn proxy_v2_block(family: u8, block: &[u8]) -> Vec<u8> {
+    let mut header = b"\r\n\r\n\0\r\nQUIT\n\x21".to_vec();
+    header.push(family);
+    header.extend_from_slice(&u16::try_from(block.len()).unwrap().to_be_bytes());
+    header.extend_from_slice(block);
+    header
+}
+
+/// The source address of a version 2 header for TCP over IPv6 is the client
+/// address. The server skips the TLVs after the address block, also TLVs
+/// longer than one read of the header, and serves the request after them.
+#[test]
+fn the_proxy_protocol_reads_ipv6_and_tlvs() {
+    let tmp = TmpDir::new("proxy-protocol-v2");
+    let repo = receiver(tmp.path(), RepoMode::Archive, "");
+    let groups =
+        format!("{NET_GROUPS}[ex-ostrya client \"farm6\"]\nauth=net:2001:db8::/32\nallow=w:**\n");
+    let mut opts = options_with(&repo, &groups);
+    opts.proxy_protocol = true;
+    with_server(repo, opts, |_, addr| async move {
+        let request = session_request("", true).await;
+        let with = |header: &[u8]| [header, &request[..]].concat();
+        let inet6 = |source: &str| {
+            let mut block = source.parse::<Ipv6Addr>().unwrap().octets().to_vec();
+            block.extend_from_slice(&Ipv6Addr::LOCALHOST.octets());
+            block.extend_from_slice(&[0xdc, 0x04, 0x1f, 0x90]);
+            block
+        };
+        let mut tlvs = vec![192, 0, 2, 8, 127, 0, 0, 1, 0xdc, 0x04, 0x1f, 0x90];
+        tlvs.extend_from_slice(&[0x01, 0x00, 0x02, b'h', b'2']);
+        tlvs.extend_from_slice(&[0x04, 0x13, 0x88]);
+        tlvs.resize(tlvs.len() + 5000, 0);
+        for header in [
+            proxy_v2_block(0x21, &inet6("2001:db8::7")),
+            proxy_v2_block(0x21, &inet6("::ffff:192.0.2.9")),
+            proxy_v2_block(0x11, &tlvs),
+        ] {
+            let (code, text) = status(addr, &with(&header)).await;
+            assert_eq!(code, 200, "{text}");
+        }
+        let header = proxy_v2_block(0x21, &inet6("2001:db9::7"));
+        let (code, text) = status(addr, &with(&header)).await;
+        assert_eq!(code, 403, "{text}");
+        assert!(text.contains("matches no auth item"), "{text}");
+    });
+}
+
+/// A tunnel of `CONNECT` on a port the kernel chooses, which writes the
+/// PROXY header `header` to the server before the bytes of the client.
+/// The function returns the URL of the tunnel.
+async fn proxy_tunnel(server: SocketAddr, header: Vec<u8>) -> String {
+    let listener = ostrya_rt::TcpListener::bind("127.0.0.1:0".parse().unwrap())
+        .await
+        .unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    drop(ostrya_rt::spawn(async move {
+        loop {
+            let Ok((mut client, _)) = listener.accept().await else {
+                return;
+            };
+            let header = header.clone();
+            drop(ostrya_rt::spawn(async move {
+                let mut head = Vec::new();
+                let mut byte = [0u8; 1];
+                while !head.ends_with(b"\r\n\r\n") {
+                    if client.read(&mut byte).await.unwrap_or(0) == 0 {
+                        return;
+                    }
+                    head.push(byte[0]);
+                }
+                assert!(head.starts_with(b"CONNECT "), "{head:?}");
+                let mut upstream = ostrya_rt::TcpStream::connect("127.0.0.1", server.port())
+                    .await
+                    .unwrap();
+                upstream.write_all(&header).await.unwrap();
+                client
+                    .write_all(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                    .await
+                    .unwrap();
+                let (client_read, mut client_write) = futures_lite::io::split(client);
+                let (upstream_read, mut upstream_write) = futures_lite::io::split(upstream);
+                let _ = future::zip(
+                    futures_lite::io::copy(client_read, &mut upstream_write),
+                    futures_lite::io::copy(upstream_read, &mut client_write),
+                )
+                .await;
+            }));
+        }
+    }));
+    url
+}
+
+/// The PROXY header comes before the TLS handshake. Through a tunnel that
+/// sends the header, the client opens a session over TLS with the source
+/// address of the header. A direct TLS client sends no header and gets no
+/// response.
+#[test]
+fn the_proxy_protocol_comes_before_tls() {
+    let tmp = TmpDir::new("proxy-protocol-tls");
+    let repo = receiver(tmp.path(), RepoMode::Archive, "");
+    let mut opts = options_with(&repo, NET_GROUPS);
+    with_tls(&mut opts);
+    opts.proxy_protocol = true;
+    with_server(repo, opts, |_, addr| async move {
+        let header = b"PROXY TCP4 192.0.2.7 127.0.0.1 56324 8080\r\n".to_vec();
+        let tunnel = proxy_tunnel(addr, header).await;
+        for http2 in [false, true] {
+            let mut client = Client::tls(addr, http2, None).await;
+            let mut options = FetcherOptions::new(format!("https://127.0.0.1:{}/", addr.port()));
+            options.proxy = Proxy::Url(tunnel.clone());
+            options.max_retries = 0;
+            options.http2 = http2;
+            options.tls = TlsOptions {
+                roots: TrustRoots::Pem(CA_PEM.to_vec()),
+                client_identity: None,
+            };
+            client.fetcher = Fetcher::new(options).await.unwrap();
+            let id = client.open().await;
+            assert_eq!(client.delete(&id).await.status, 204);
+        }
+        let direct = Client::tls(addr, false, None).await;
+        let mut request = UploadRequest::path(SESSION, UploadBody::bytes(encode(&[hello()]).await));
+        request.method = UploadMethod::Post;
+        assert!(direct.fetcher.upload(request).await.is_err());
+    });
+}
+
+/// The options of a plain server with the client groups `groups` and the
+/// trusted proxies `proxies` that write the client address into `header`.
+fn proxied_options(
+    repo: &Repo,
+    groups: &str,
+    proxies: &[&str],
+    header: ForwardedHeader,
+) -> ServeOptions {
+    let mut opts = options_with(repo, groups);
+    opts.trusted_proxies = proxies
+        .iter()
+        .map(|net| IpNet::parse(net).unwrap())
+        .collect();
+    opts.trusted_proxy_header = Some(header);
+    opts
+}
+
+/// From a peer that is not a trusted proxy, the server reads no forwarding
+/// header, no `X-Forwarded-Proto`, and no forwarded certificate.
+#[test]
+fn forged_headers_from_an_untrusted_peer_have_no_effect() {
+    let tmp = TmpDir::new("forged");
+    let repo = receiver(tmp.path(), RepoMode::Archive, "");
+    let groups = format!("{NET_GROUPS}{CERT_GROUP}{}", credential_groups());
+    for header in [
+        ForwardedHeader::Forwarded,
+        ForwardedHeader::XForwardedFor,
+        ForwardedHeader::XRealIp,
+    ] {
+        let mut opts = proxied_options(&repo, &groups, &["198.51.100.0/24"], header);
+        opts.client_ca_pem = Some(CA_PEM.to_vec());
+        opts.trusted_proxy_client_cert = Some("X-Client-Cert".into());
+        with_server(repo.clone(), opts, |_, addr| async move {
+            let forged = format!(
+                "forwarded: for=192.0.2.7;proto=https\r\nx-forwarded-for: 192.0.2.7\r\n\
+                 x-real-ip: 192.0.2.7\r\nx-forwarded-proto: https\r\n\
+                 x-client-cert: {}\r\n",
+                base64_der(CLIENT_CERT_PEM)
+            );
+            let (code, text) = status(addr, &session_request(&forged, true).await).await;
+            assert_eq!(code, 403, "{text}");
+            assert!(text.contains(LOOPBACK), "{text}");
+            let token = format!("{forged}authorization: Bearer {ALICE}\r\n");
+            let (code, text) = status(addr, &session_request(&token, true).await).await;
+            assert_eq!(code, 403, "{text}");
+            assert!(text.contains("plain HTTP"), "{text}");
+        });
+    }
+}
+
+/// A chain of proxies through each header kind gives the first hop from the
+/// right that is not a trusted proxy. A hop of an untrusted address that no
+/// group carries gets 403.
+#[test]
+fn a_chain_of_proxies_gives_the_first_untrusted_hop() {
+    let tmp = TmpDir::new("chain");
+    let repo = receiver(tmp.path(), RepoMode::Archive, "");
+    for (header, name, client, outside) in [
+        (
+            ForwardedHeader::Forwarded,
+            "forwarded",
+            "for=192.0.2.7, for=10.0.0.2, for=\"[2001:db8::2]:443\"",
+            "for=198.51.100.1, for=10.0.0.2",
+        ),
+        (
+            ForwardedHeader::XForwardedFor,
+            "x-forwarded-for",
+            "198.51.100.1, 192.0.2.7, 10.0.0.2, 2001:db8::2",
+            "192.0.2.7, 198.51.100.1, 10.0.0.2",
+        ),
+        (
+            ForwardedHeader::XRealIp,
+            "x-real-ip",
+            "192.0.2.7",
+            "198.51.100.1",
+        ),
+    ] {
+        let opts = proxied_options(
+            &repo,
+            NET_GROUPS,
+            &["127.0.0.1", "10.0.0.0/8", "2001:db8::/64"],
+            header,
+        );
+        with_server(repo.clone(), opts, |_, addr| async move {
+            let lines = format!("{name}: {client}\r\n");
+            let (code, text) = status(addr, &session_request(&lines, true).await).await;
+            assert_eq!(code, 200, "{header}: {text}");
+            let lines = format!("{name}: {outside}\r\n");
+            let (code, text) = status(addr, &session_request(&lines, true).await).await;
+            assert_eq!(code, 403, "{header}: {text}");
+            assert!(text.contains("matches no auth item"), "{text}");
+            let (code, text) = status(addr, &session_request("", true).await).await;
+            assert_eq!(code, 403, "{header}: {text}");
+            assert!(text.contains(LOOPBACK), "{text}");
+        });
+    }
+}
+
+/// The source address of a PROXY header can be a trusted proxy. The
+/// forwarding header of its request then gives the client address.
+#[test]
+fn a_proxy_protocol_source_can_be_a_trusted_proxy() {
+    let tmp = TmpDir::new("proxy-chain");
+    let repo = receiver(tmp.path(), RepoMode::Archive, "");
+    let mut opts = proxied_options(
+        &repo,
+        NET_GROUPS,
+        &["10.0.0.0/8"],
+        ForwardedHeader::XForwardedFor,
+    );
+    opts.proxy_protocol = true;
+    with_server(repo, opts, |_, addr| async move {
+        let header = b"PROXY TCP4 10.0.0.5 127.0.0.1 56324 8080\r\n";
+        let request = session_request("x-forwarded-for: 192.0.2.7\r\n", true).await;
+        let (code, text) = status(addr, &[&header[..], &request].concat()).await;
+        assert_eq!(code, 200, "{text}");
+        let request = session_request("", true).await;
+        let (code, text) = status(addr, &[&header[..], &request].concat()).await;
+        assert_eq!(code, 403, "{text}");
+        assert!(text.contains("matches no auth item"), "{text}");
+    });
+}
+
+/// `X-Forwarded-Proto: https` from a trusted proxy lets a bearer token pass
+/// over plain HTTP.
+#[test]
+fn https_from_a_trusted_proxy_takes_a_bearer_token() {
+    let tmp = TmpDir::new("proxy-https");
+    let repo = receiver(tmp.path(), RepoMode::Archive, "");
+    let opts = proxied_options(
+        &repo,
+        &credential_groups(),
+        &["127.0.0.1"],
+        ForwardedHeader::XForwardedFor,
+    );
+    with_server(repo, opts, |_, addr| async move {
+        let token = format!("authorization: Bearer {ALICE}\r\n");
+        let https = format!("{token}x-forwarded-proto: https\r\n");
+        let (code, text) = status(addr, &session_request(&https, true).await).await;
+        assert_eq!(code, 200, "{text}");
+        let (code, text) = status(addr, &session_request(&token, true).await).await;
+        assert_eq!(code, 403, "{text}");
+        assert!(text.contains("plain HTTP"), "{text}");
+    });
+}
+
+/// The base64 of the DER bytes of the one certificate of `pem`.
+fn base64_der(pem: &[u8]) -> String {
+    std::str::from_utf8(pem)
+        .unwrap()
+        .lines()
+        .filter(|line| !line.starts_with("-----"))
+        .collect()
+}
+
+/// `text` with each byte other than a letter, a digit, `-`, `.`, `_`, and
+/// `~` as `%XX`, as nginx and Traefik escape a value.
+fn url_escape(text: &str) -> String {
+    text.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+                char::from(b).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
+}
+
+/// The options of a plain server with the client CA `ca` and no TLS, behind
+/// the trusted proxy 127.0.0.1, which forwards the client certificate in
+/// `X-SSL-Client-Cert`.
+fn forwarded_cert_options(repo: &Repo, groups: &str, ca: &[u8]) -> ServeOptions {
+    let mut opts = proxied_options(repo, groups, &["127.0.0.1"], ForwardedHeader::XForwardedFor);
+    opts.client_ca_pem = Some(ca.to_vec());
+    opts.trusted_proxy_client_cert = Some("X-SSL-Client-Cert".into());
+    opts
+}
+
+/// On a plain listener with a client CA and no TLS, the forms of nginx,
+/// HAProxy, and Traefik open a session for a `tls:NAME` item. A certificate
+/// that the CA does not verify, a chain with a comma, and a value that does
+/// not parse get 403.
+#[test]
+fn a_forwarded_certificate_opens_a_session() {
+    let tmp = TmpDir::new("forwarded-cert");
+    let repo = receiver(tmp.path(), RepoMode::Archive, "");
+    let groups = format!("{CERT_GROUP}{ANONYMOUS_PUSH}");
+    let opts = forwarded_cert_options(&repo, &groups, CA_PEM);
+    assert!(opts.tls.is_none());
+    with_server(repo.clone(), opts, |_, addr| async move {
+        let pem = std::str::from_utf8(CLIENT_CERT_PEM).unwrap();
+        let base64 = base64_der(CLIENT_CERT_PEM);
+        for value in [url_escape(pem), base64.clone(), url_escape(&base64)] {
+            let line = format!("x-ssl-client-cert: {value}\r\n");
+            let (code, text) = status(addr, &session_request(&line, true).await).await;
+            assert_eq!(code, 200, "{value}: {text}");
+        }
+        for (value, needle) in [
+            (base64_der(SERVER_CERT_PEM), "does not verify"),
+            (url_escape(&format!("{base64},{base64}")), "more than one"),
+            (format!("{base64},{base64}"), "more than one"),
+            ("not-a-certificate".to_owned(), "does not parse"),
+        ] {
+            let line = format!("x-ssl-client-cert: {value}\r\n");
+            let (code, text) = status(addr, &session_request(&line, true).await).await;
+            assert_eq!(code, 403, "{value}: {text}");
+            assert!(text.contains(needle), "{text}");
+        }
+        let (code, _) = status(addr, &session_request("", true).await).await;
+        assert_eq!(code, 200);
+    });
+    let opts = forwarded_cert_options(&repo, &groups, UNTRUSTED_CERT_PEM);
+    with_server(repo, opts, |_, addr| async move {
+        let line = format!("x-ssl-client-cert: {}\r\n", base64_der(CLIENT_CERT_PEM));
+        let (code, text) = status(addr, &session_request(&line, true).await).await;
+        assert_eq!(code, 403, "{text}");
+        assert!(text.contains("does not verify"), "{text}");
+    });
+}
+
+/// The server identifies each request of one connection again. Two requests
+/// on one keep-alive connection with two forwarded identities get two
+/// results.
+#[test]
+fn each_request_of_one_connection_is_identified_again() {
+    let tmp = TmpDir::new("keep-alive");
+    let repo = receiver(tmp.path(), RepoMode::Archive, "");
+    let groups = format!("{CERT_GROUP}{NET_GROUPS}");
+    let opts = forwarded_cert_options(&repo, &groups, CA_PEM);
+    with_server(repo, opts, |_, addr| async move {
+        let cert = format!("x-ssl-client-cert: {}\r\n", base64_der(CLIENT_CERT_PEM));
+        let first = session_request(&cert, false).await;
+        let second = session_request("", true).await;
+        let out = exchange(addr, &[first, second].concat()).await;
+        let text = String::from_utf8_lossy(&out);
+        assert!(text.starts_with("HTTP/1.1 200 "), "{text}");
+        let second = text.find("HTTP/1.1 403 ").expect("a second response");
+        assert!(text[second..].contains(LOOPBACK), "{text}");
+        assert_eq!(text.matches("HTTP/1.1 ").count(), 2, "{text}");
     });
 }

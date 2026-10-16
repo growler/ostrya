@@ -14,6 +14,8 @@
 //! - [`AccessRules`] holds the allow items and the deny items of a group,
 //!   and gives the effective rights of a ref as [`AccessModes`].
 //! - [`ServerSettings`] holds the keys of `[ex-ostrya server]`.
+//! - [`ForwardedHeader`] is a value of `trusted-proxy-header`, and
+//!   [`is_header_name`] checks a value of `trusted-proxy-client-cert`.
 //!
 //! # Client group keys
 //!
@@ -103,6 +105,7 @@ mod reader;
 mod rights;
 
 use std::collections::HashMap;
+use std::fmt;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
@@ -248,6 +251,91 @@ impl ClientGroup {
     }
 }
 
+/// The request header from which a server reads the client address of a
+/// request from a trusted proxy: a value of `trusted-proxy-header`.
+///
+/// The text form is the lowercase name of the header. [`parse`](Self::parse)
+/// takes that form alone.
+///
+/// # Examples
+///
+/// ```
+/// use ostrya::access::ForwardedHeader;
+///
+/// let header = ForwardedHeader::parse("x-forwarded-for")?;
+/// assert_eq!(header, ForwardedHeader::XForwardedFor);
+/// assert_eq!(header.to_string(), "x-forwarded-for");
+/// assert!(ForwardedHeader::parse("X-Forwarded-For").is_err());
+/// # Ok::<(), ostrya::Error>(())
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ForwardedHeader {
+    /// `forwarded`: the `Forwarded` header of RFC 7239.
+    Forwarded,
+    /// `x-forwarded-for`: the `X-Forwarded-For` header.
+    XForwardedFor,
+    /// `x-real-ip`: the `X-Real-IP` header.
+    XRealIp,
+}
+
+impl ForwardedHeader {
+    /// Parses a value of `trusted-proxy-header`: `forwarded`,
+    /// `x-forwarded-for`, or `x-real-ip`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidFormat`] for each other text, also for a name in
+    /// another case.
+    pub fn parse(text: &str) -> Result<ForwardedHeader> {
+        match text {
+            "forwarded" => Ok(ForwardedHeader::Forwarded),
+            "x-forwarded-for" => Ok(ForwardedHeader::XForwardedFor),
+            "x-real-ip" => Ok(ForwardedHeader::XRealIp),
+            _ => Err(Error::InvalidFormat(format!(
+                "malformed trusted-proxy-header value '{text}': the value is forwarded, \
+                 x-forwarded-for, or x-real-ip"
+            ))),
+        }
+    }
+
+    /// Returns the text form: the lowercase name of the header.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ForwardedHeader::Forwarded => "forwarded",
+            ForwardedHeader::XForwardedFor => "x-forwarded-for",
+            ForwardedHeader::XRealIp => "x-real-ip",
+        }
+    }
+}
+
+impl fmt::Display for ForwardedHeader {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Returns `true` if `name` is a name of an HTTP header: a token of HTTP, one
+/// or more of the ASCII letters, the digits, and the characters
+/// ``!#$%&'*+-.^_`|~``.
+///
+/// A value of `trusted-proxy-client-cert` must pass this check.
+///
+/// # Examples
+///
+/// ```
+/// use ostrya::access::is_header_name;
+///
+/// assert!(is_header_name("X-SSL-Client-Cert"));
+/// assert!(!is_header_name("X Client"));
+/// assert!(!is_header_name(""));
+/// ```
+pub fn is_header_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
+}
+
 /// The keys of `[ex-ostrya server]`.
 ///
 /// Each field is `None` when the key is absent. The server takes its default
@@ -268,9 +356,12 @@ pub struct ServerSettings {
     /// `trusted-proxy`: the networks of the peers whose forwarding data the
     /// server reads. An empty value is refused.
     pub trusted_proxy: Option<Vec<IpNet>>,
+    /// `trusted-proxy-header`: the request header from which the server reads
+    /// the client address of a request from a trusted proxy.
+    pub trusted_proxy_header: Option<ForwardedHeader>,
     /// `trusted-proxy-client-cert`: the name of the request header that
-    /// carries the client certificate from a trusted proxy. The name is an
-    /// HTTP token.
+    /// carries the client certificate from a trusted proxy. The name passes
+    /// [`is_header_name`].
     pub trusted_proxy_client_cert: Option<String>,
     /// `proxy-protocol`: each connection starts with a PROXY protocol header.
     pub proxy_protocol: Option<bool>,
@@ -334,6 +425,7 @@ impl ServerSettings {
             tls_key,
             tls_client_ca,
             trusted_proxy,
+            trusted_proxy_header,
             trusted_proxy_client_cert,
             proxy_protocol,
             allow_cleartext_credentials,
@@ -349,6 +441,7 @@ impl ServerSettings {
             tls_key: pick(tls_key, &self.tls_key),
             tls_client_ca: pick(tls_client_ca, &self.tls_client_ca),
             trusted_proxy: pick(trusted_proxy, &self.trusted_proxy),
+            trusted_proxy_header: pick(trusted_proxy_header, &self.trusted_proxy_header),
             trusted_proxy_client_cert: pick(
                 trusted_proxy_client_cert,
                 &self.trusted_proxy_client_cert,
@@ -497,6 +590,8 @@ impl ClientAccess {
     ///   and `tls_client_ca` is `None`.
     /// - `trusted_proxy_client_cert` is set, and `tls_client_ca` is `None`.
     /// - `trusted_proxy_client_cert` is set, and `trusted_proxy` is `None`.
+    /// - `trusted_proxy` is set, and `trusted_proxy_header` is `None`.
+    /// - `trusted_proxy_header` is set, and `trusted_proxy` is `None`.
     /// - `tls_cert` is set and `tls_key` is `None`, or the reverse.
     /// - `tls_client_ca` is set, and `tls_cert` and
     ///   `trusted_proxy_client_cert` are `None`.
@@ -525,6 +620,19 @@ impl ClientAccess {
             return Err(Error::InvalidFormat(
                 "trusted-proxy-client-cert is set, and the server has no trusted-proxy".to_owned(),
             ));
+        }
+        match (&merged.trusted_proxy, &merged.trusted_proxy_header) {
+            (Some(_), None) => {
+                return Err(Error::InvalidFormat(
+                    "trusted-proxy is set, and the server has no trusted-proxy-header".to_owned(),
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(Error::InvalidFormat(
+                    "trusted-proxy-header is set, and the server has no trusted-proxy".to_owned(),
+                ));
+            }
+            _ => {}
         }
         match (&merged.tls_cert, &merged.tls_key) {
             (Some(_), None) => {
@@ -563,6 +671,7 @@ const _: fn() = || {
     assert_send_sync::<CollectionScope>();
     assert_send_sync::<AuthItem>();
     assert_send_sync::<IpNet>();
+    assert_send_sync::<ForwardedHeader>();
     assert_send_sync::<AccessModes>();
     assert_send_sync::<AllowItem>();
     assert_send_sync::<AccessRules>();
@@ -608,6 +717,7 @@ tls-cert=/etc/ostrya/server.pem
 tls-key=/etc/ostrya/server.key
 tls-client-ca=/etc/ostrya/clients-ca.pem
 trusted-proxy=10.0.0.0/24
+trusted-proxy-header=x-forwarded-for
 
 [ex-ostrya client "public"]
 auth=anonymous
@@ -701,6 +811,10 @@ secret-key-file=/etc/ostrya/release.secret
         assert_eq!(
             access.server().trusted_proxy,
             Some(vec![IpNet::parse("10.0.0.0/24").unwrap()])
+        );
+        assert_eq!(
+            access.server().trusted_proxy_header,
+            Some(ForwardedHeader::XForwardedFor)
         );
     }
 
@@ -949,6 +1063,7 @@ secret-key-file=/etc/ostrya/release.secret
         let merged = ServerSettings {
             trusted_proxy_client_cert: Some("X-Client-Cert".into()),
             trusted_proxy: proxy,
+            trusted_proxy_header: Some(ForwardedHeader::XForwardedFor),
             tls_client_ca: Some("/ca.pem".into()),
             ..ServerSettings::default()
         };
@@ -977,6 +1092,80 @@ secret-key-file=/etc/ostrya/release.secret
         assert!(message.contains("no trusted-proxy"), "{message}");
     }
 
+    /// `trusted-proxy` and `trusted-proxy-header` go together, from a key or
+    /// from a flag.
+    #[test]
+    fn a_trusted_proxy_and_its_header_go_together() {
+        let anonymous = access("[ex-ostrya client \"c\"]\nauth=anonymous\n");
+        let proxy = Some(vec![IpNet::parse("10.0.0.0/24").unwrap()]);
+        let merged = ServerSettings {
+            trusted_proxy: proxy.clone(),
+            ..ServerSettings::default()
+        };
+        assert_eq!(
+            check(&anonymous, &merged),
+            "trusted-proxy is set, and the server has no trusted-proxy-header"
+        );
+        let merged = ServerSettings {
+            trusted_proxy_header: Some(ForwardedHeader::Forwarded),
+            ..ServerSettings::default()
+        };
+        assert_eq!(
+            check(&anonymous, &merged),
+            "trusted-proxy-header is set, and the server has no trusted-proxy"
+        );
+        let merged = ServerSettings {
+            trusted_proxy: proxy,
+            trusted_proxy_header: Some(ForwardedHeader::XRealIp),
+            ..ServerSettings::default()
+        };
+        anonymous.check_server(&merged).unwrap();
+        let configured = access("[ex-ostrya server]\ntrusted-proxy-header=x-real-ip\n");
+        let message = check(&configured, configured.server());
+        assert!(message.contains("no trusted-proxy"), "{message}");
+        let configured = access("[ex-ostrya server]\ntrusted-proxy=10.0.0.0/8\n");
+        let flags = ServerSettings {
+            trusted_proxy_header: Some(ForwardedHeader::Forwarded),
+            ..ServerSettings::default()
+        };
+        let merged = configured.server().overridden_by(&flags);
+        configured.check_server(&merged).unwrap();
+    }
+
+    /// A value of `trusted-proxy-header` is one of three lowercase names.
+    #[test]
+    fn a_forwarded_header_has_three_names() {
+        for (text, header) in [
+            ("forwarded", ForwardedHeader::Forwarded),
+            ("x-forwarded-for", ForwardedHeader::XForwardedFor),
+            ("x-real-ip", ForwardedHeader::XRealIp),
+        ] {
+            assert_eq!(ForwardedHeader::parse(text).unwrap(), header);
+            assert_eq!(header.to_string(), text);
+        }
+        for text in [
+            "",
+            "Forwarded",
+            "X-Real-IP",
+            "x-forwarded-proto",
+            " forwarded",
+        ] {
+            let err = ForwardedHeader::parse(text).unwrap_err();
+            assert!(matches!(err, Error::InvalidFormat(_)), "{text:?}: {err}");
+        }
+    }
+
+    /// `is_header_name` takes the characters of an HTTP token.
+    #[test]
+    fn a_header_name_is_an_http_token() {
+        for name in ["X-Client-Cert", "ssl_client_cert", "a!#$%&'*+-.^_`|~9"] {
+            assert!(is_header_name(name), "{name}");
+        }
+        for name in ["", "a b", "a:b", "a\"b", "a(b", "a/b", "\u{e9}", "a\tb"] {
+            assert!(!is_header_name(name), "{name:?}");
+        }
+    }
+
     /// A field of the flags that is set replaces the key, a list in whole,
     /// and a field that is `None` keeps the key.
     #[test]
@@ -991,6 +1180,7 @@ secret-key-file=/etc/ostrya/release.secret
             tls_key: Some("/key/k.pem".into()),
             tls_client_ca: Some("/key/ca.pem".into()),
             trusted_proxy: Some(vec![net("10.0.0.0/8"), net("10.1.0.0/16")]),
+            trusted_proxy_header: Some(ForwardedHeader::Forwarded),
             trusted_proxy_client_cert: Some("X-Key".into()),
             proxy_protocol: Some(false),
             allow_cleartext_credentials: Some(true),
@@ -1006,6 +1196,7 @@ secret-key-file=/etc/ostrya/release.secret
             tls_key: Some("flag/k.pem".into()),
             tls_client_ca: Some("flag/ca.pem".into()),
             trusted_proxy: Some(vec![net("192.0.2.0/24")]),
+            trusted_proxy_header: Some(ForwardedHeader::XRealIp),
             trusted_proxy_client_cert: Some("X-Flag".into()),
             proxy_protocol: Some(true),
             allow_cleartext_credentials: Some(false),

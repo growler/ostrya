@@ -11,7 +11,9 @@ use ostrya_core::{KeyFile, RefPattern, is_collection_id};
 
 use super::item::{AuthItem, parse_item, parse_net};
 use super::rights::{AccessModes, AccessRules, AllowItem, parse_allow, parse_pattern};
-use super::{ClientAccess, ClientGroup, CollectionScope, ServerSettings};
+use super::{
+    ClientAccess, ClientGroup, CollectionScope, ForwardedHeader, ServerSettings, is_header_name,
+};
 use crate::config::RepoConfig;
 use crate::error::{Error, Result};
 
@@ -51,6 +53,7 @@ const SERVER_KEYS: &[&str] = &[
     "tls-key",
     "tls-client-ca",
     "trusted-proxy",
+    "trusted-proxy-header",
     "trusted-proxy-client-cert",
     "proxy-protocol",
     "allow-cleartext-credentials",
@@ -489,9 +492,19 @@ fn parse_server(
         ),
     };
 
+    let trusted_proxy_header = match keyfile.get_string(group, "trusted-proxy-header")? {
+        None => None,
+        Some(text) => Some(ForwardedHeader::parse(&text).map_err(|_| {
+            Error::InvalidFormat(format!(
+                "malformed [{group}] trusted-proxy-header value '{text}': the value is \
+                 forwarded, x-forwarded-for, or x-real-ip"
+            ))
+        })?),
+    };
+
     let trusted_proxy_client_cert = keyfile.get_string(group, "trusted-proxy-client-cert")?;
     if let Some(name) = &trusted_proxy_client_cert
-        && !is_token(name)
+        && !is_header_name(name)
     {
         return Err(Error::InvalidFormat(format!(
             "malformed [{group}] trusted-proxy-client-cert value '{name}': the value is \
@@ -506,6 +519,7 @@ fn parse_server(
         tls_key: path(keyfile, group, "tls-key", repo_dir)?,
         tls_client_ca: path(keyfile, group, "tls-client-ca", repo_dir)?,
         trusted_proxy,
+        trusted_proxy_header,
         trusted_proxy_client_cert,
         proxy_protocol: keyfile.get_bool(group, "proxy-protocol")?,
         allow_cleartext_credentials: keyfile.get_bool(group, "allow-cleartext-credentials")?,
@@ -545,15 +559,6 @@ fn positive(keyfile: &KeyFile, group: &str, key: &str, max: u64) -> Result<Optio
             ))),
         },
     }
-}
-
-/// Returns `true` if `name` is a token of HTTP: one or more of the ASCII
-/// letters, the digits, and the characters ``!#$%&'*+-.^_`|~``.
-fn is_token(name: &str) -> bool {
-    !name.is_empty()
-        && name
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b))
 }
 
 #[cfg(test)]
@@ -957,6 +962,7 @@ mod tests {
              tls-key=/etc/ostrya/server.key\n\
              tls-client-ca=~/ca.pem\n\
              trusted-proxy=10.0.0.0/24;2001:db8::1\n\
+             trusted-proxy-header=forwarded\n\
              trusted-proxy-client-cert=X-SSL-Client-Cert\n\
              proxy-protocol=true\n\
              allow-cleartext-credentials=0\n\
@@ -991,6 +997,10 @@ mod tests {
         assert_eq!(proxies.len(), 2);
         assert!(proxies[0].contains("10.0.0.7".parse::<IpAddr>().unwrap()));
         assert_eq!(proxies[1], IpNet::parse("2001:db8::1/128").unwrap());
+        assert_eq!(
+            settings.trusted_proxy_header,
+            Some(ForwardedHeader::Forwarded)
+        );
         assert_eq!(
             settings.trusted_proxy_client_cert.as_deref(),
             Some("X-SSL-Client-Cert")
@@ -1031,6 +1041,10 @@ mod tests {
             "trusted-proxy-client-cert=\n",
             "trusted-proxy-client-cert=X Client\n",
             "trusted-proxy-client-cert=X:Client\n",
+            "trusted-proxy-header=\n",
+            "trusted-proxy-header=X-Forwarded-For\n",
+            "trusted-proxy-header=x-forwarded-proto\n",
+            "trusted-proxy-header=forwarded;x-real-ip\n",
             "session-timeout=0\n",
             "session-timeout=-1\n",
             "max-sessions=0\n",
@@ -1069,16 +1083,5 @@ mod tests {
             "auth=anonymous\nverify=trust:k\n",
             "[ex-ostrya key \"k\"]\n",
         ));
-    }
-
-    /// `is_token` takes the characters of an HTTP token.
-    #[test]
-    fn a_header_name_is_an_http_token() {
-        for name in ["X-Client-Cert", "ssl_client_cert", "a!#$%&'*+-.^_`|~9"] {
-            assert!(is_token(name), "{name}");
-        }
-        for name in ["", "a b", "a:b", "a\"b", "a(b", "a/b", "\u{e9}", "a\tb"] {
-            assert!(!is_token(name), "{name:?}");
-        }
     }
 }

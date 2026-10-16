@@ -1,7 +1,7 @@
 //! The listeners and the connections of a server.
 
 use std::convert::Infallible;
-use std::net::SocketAddr;
+use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
@@ -9,8 +9,10 @@ use std::time::Duration;
 use futures_lite::future;
 use futures_rustls::TlsAcceptor;
 use futures_rustls::rustls::ServerConfig;
+use futures_rustls::rustls::server::danger::ClientCertVerifier;
 use hyper::Request;
 use hyper::body::Incoming;
+use hyper::header::HeaderName;
 use hyper::server::conn::{http1, http2};
 use hyper::service::service_fn;
 use ostrya::{ArchiveView, Repo};
@@ -18,16 +20,21 @@ use ostrya_fetch::{FuturesIo, RtExecutor, RtTimer};
 use ostrya_rt as rt;
 
 use crate::auth::{GroupAuth, Peer};
-use crate::cert::ClientCert;
+use crate::cert::{ClientCert, ForwardedCerts};
 use crate::endpoint::{EndpointOptions, ReceiveEndpoint};
 use crate::error::{Error, Result};
+use crate::forwarded::Forwarding;
 use crate::options::ServeOptions;
+use crate::proxy_protocol::{self, Rewind};
 use crate::router;
 use crate::shutdown::{Shutdown, Trigger};
 use crate::stall::Stall;
 
 /// The time a TLS handshake has to complete.
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The time a connection has to send its PROXY protocol header.
+const PROXY_HEADER_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The time an HTTP/1.1 connection has to send the headers of a request.
 const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(30);
@@ -120,6 +127,16 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 ///   yields to the executor.
 /// - With a client CA, the server verifies a client certificate against the
 ///   CA. The server also serves a client that presents no certificate.
+/// - With [`ServeOptions::proxy_protocol`], each listener reads a PROXY
+///   protocol header, version 1 or 2, at the start of each connection,
+///   before the TLS handshake. A connection with no valid header, or with no
+///   header within 30 seconds, closes with no response. The bytes after the
+///   header go to the TLS handshake or to the HTTP layer.
+/// - The receive endpoint reads the client address, the scheme, and a
+///   forwarded certificate from the headers of a trusted proxy.
+///   [Client address](ServeOptions#client-address) and
+///   [Forwarded certificate](ServeOptions#forwarded-certificate) state the
+///   rules. The archive view and the ref listing ignore these headers.
 pub struct Server {
     listeners: Vec<rt::TcpListener>,
     addrs: Vec<SocketAddr>,
@@ -128,17 +145,35 @@ pub struct Server {
     receive: Option<Arc<ReceiveEndpoint<GroupAuth>>>,
     tls: Option<Arc<ServerConfig>>,
     body_timeout: Duration,
+    proxy_protocol: bool,
 }
 
 /// Returns the receive endpoint of `opts` over `repo`, or `None` if `opts`
 /// has no receive policies. With policies, the function checks the options
 /// of the endpoint with [`ReceiveEndpoint::new`]. With no policies, it checks
-/// nothing.
-fn receive(repo: &Repo, opts: &ServeOptions) -> Result<Option<Arc<ReceiveEndpoint<GroupAuth>>>> {
+/// nothing. `verifier` is the verifier of the client CA, which checks a
+/// forwarded certificate.
+fn receive(
+    repo: &Repo,
+    opts: &ServeOptions,
+    verifier: Option<&Arc<dyn ClientCertVerifier>>,
+) -> Result<Option<Arc<ReceiveEndpoint<GroupAuth>>>> {
     let Some(policies) = &opts.receive else {
         return Ok(None);
     };
-    let auth = GroupAuth::new(policies.clone(), opts.allow_cleartext_credentials);
+    let forwarding = opts
+        .trusted_proxy_header
+        .map(|header| Forwarding::new(opts.trusted_proxies.clone(), header));
+    let certs = match (&opts.trusted_proxy_client_cert, verifier) {
+        (Some(name), Some(verifier)) => {
+            let name = HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| Error::Options(format!("a bad header name '{name}'")))?;
+            Some(ForwardedCerts::new(name, verifier.clone()))
+        }
+        _ => None,
+    };
+    let auth = GroupAuth::new(policies.clone(), opts.allow_cleartext_credentials)
+        .with_proxies(forwarding, certs);
     let options = EndpointOptions {
         parallel_uploads: opts.parallel_uploads,
         session_idle_timeout: opts.session_idle_timeout,
@@ -161,12 +196,22 @@ fn receive(repo: &Repo, opts: &ServeOptions) -> Result<Option<Arc<ReceiveEndpoin
 /// The checks run in this order:
 ///
 /// - [`Error::Options`] if `listen` is empty, or if `body_timeout` is zero.
-/// - [`Error::Options`] if `receive` is set and `parallel_uploads` is
-///   outside `1..=31`, or `session_idle_timeout` or `max_sessions` is zero.
-/// - [`Error::Options`] if `client_ca_pem` is set and `tls` is `None`.
+/// - [`Error::Options`] if `trusted_proxy_client_cert` is not a header name
+///   ([`ostrya::access::is_header_name`]).
+/// - [`Error::Options`] if `trusted_proxy_client_cert` is set and
+///   `client_ca_pem` is `None`, or `trusted_proxies` is empty.
+/// - [`Error::Options`] if `trusted_proxies` is not empty and
+///   `trusted_proxy_header` is `None`, or the reverse.
+/// - [`Error::Options`] if `client_ca_pem` is set, and `tls` and
+///   `trusted_proxy_client_cert` are `None`.
 /// - [`Error::Options`] if a client group of `receive` carries a `tls:*`,
 ///   `tls:NAME`, or `tls-sha256:HEX` item and `client_ca_pem` is `None`. The
 ///   message names the group and the item.
+/// - [`Error::Tls`] if `client_ca_pem` gives no verifier: it does not decode
+///   as PEM, holds no certificate, or holds a certificate that rustls
+///   refuses as a trust anchor.
+/// - [`Error::Options`] if `receive` is set and `parallel_uploads` is
+///   outside `1..=31`, or `session_idle_timeout` or `max_sessions` is zero.
 /// - [`Error::Tls`] if the TLS files give no server configuration.
 /// - [`Error::Bind`] if a listen address cannot be bound, or if its local
 ///   address cannot be read.
@@ -177,36 +222,26 @@ pub async fn bind(repo: Repo, opts: ServeOptions) -> Result<Server> {
     if opts.body_timeout.is_zero() {
         return Err(Error::Options("a body timeout of zero".into()));
     }
-    let receive = receive(&repo, &opts)?;
-    if opts.client_ca_pem.is_some() && opts.tls.is_none() {
-        return Err(Error::Options("a client CA with no TLS".into()));
-    }
-    if opts.client_ca_pem.is_none()
-        && let Some(policies) = &opts.receive
-    {
-        for group in policies.access().groups() {
-            if let Some(item) = group.auth().iter().find(|item| item.is_tls()) {
-                return Err(Error::Options(format!(
-                    "[ex-ostrya client \"{}\"] carries the item {item}, and the server has \
-                     no client CA",
-                    group.name()
-                )));
-            }
-        }
-    }
+    check_proxies(&opts)?;
+    let tls_error = |e| match e {
+        ostrya_fetch::Error::Fetch(message) => Error::Tls(message),
+        other => Error::Tls(other.to_string()),
+    };
+    let verifier = match &opts.client_ca_pem {
+        Some(pem) => Some(ostrya_fetch::client_cert_verifier(pem).map_err(tls_error)?),
+        None => None,
+    };
+    let receive = receive(&repo, &opts, verifier.as_ref())?;
     let tls = match &opts.tls {
         Some(tls) => Some(
             ostrya_fetch::server_config(
                 &tls.cert_chain_pem,
                 &tls.key_pem,
                 tls.key_passphrase.as_deref(),
-                opts.client_ca_pem.as_deref(),
+                verifier,
             )
             .await
-            .map_err(|e| match e {
-                ostrya_fetch::Error::Fetch(message) => Error::Tls(message),
-                other => Error::Tls(other.to_string()),
-            })?,
+            .map_err(tls_error)?,
         ),
         None => None,
     };
@@ -226,7 +261,66 @@ pub async fn bind(repo: Repo, opts: ServeOptions) -> Result<Server> {
         receive,
         tls,
         body_timeout: opts.body_timeout,
+        proxy_protocol: opts.proxy_protocol,
     })
+}
+
+/// Checks the fields of `opts` that go together: the client CA, the TLS
+/// files, the trusted proxies, and their headers. The doc of [`bind`] lists
+/// the refusals.
+fn check_proxies(opts: &ServeOptions) -> Result<()> {
+    if let Some(name) = &opts.trusted_proxy_client_cert {
+        if !ostrya::access::is_header_name(name) {
+            return Err(Error::Options(format!(
+                "the forwarded certificate header '{name}' is not a header name"
+            )));
+        }
+        if opts.client_ca_pem.is_none() {
+            return Err(Error::Options(
+                "a forwarded certificate header with no client CA".into(),
+            ));
+        }
+        if opts.trusted_proxies.is_empty() {
+            return Err(Error::Options(
+                "a forwarded certificate header with no trusted proxy".into(),
+            ));
+        }
+    }
+    match (opts.trusted_proxies.is_empty(), opts.trusted_proxy_header) {
+        (false, None) => {
+            return Err(Error::Options(
+                "trusted proxies with no header of the client address".into(),
+            ));
+        }
+        (true, Some(header)) => {
+            return Err(Error::Options(format!(
+                "the client address header {header} with no trusted proxy"
+            )));
+        }
+        _ => {}
+    }
+    if opts.client_ca_pem.is_some()
+        && opts.tls.is_none()
+        && opts.trusted_proxy_client_cert.is_none()
+    {
+        return Err(Error::Options(
+            "a client CA with no TLS and no forwarded certificate header".into(),
+        ));
+    }
+    if opts.client_ca_pem.is_none()
+        && let Some(policies) = &opts.receive
+    {
+        for group in policies.access().groups() {
+            if let Some(item) = group.auth().iter().find(|item| item.is_tls()) {
+                return Err(Error::Options(format!(
+                    "[ex-ostrya client \"{}\"] carries the item {item}, and the server has \
+                     no client CA",
+                    group.name()
+                )));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Binds the listeners of `opts` and runs the server until the future drops.
@@ -283,6 +377,7 @@ impl Server {
             receive: self.receive,
             tls: self.tls,
             body_timeout: self.body_timeout,
+            proxy_protocol: self.proxy_protocol,
         });
         for listener in self.listeners {
             let accept = accept_loop(listener, serving.clone(), shutdown.clone());
@@ -301,6 +396,8 @@ struct Serving {
     receive: Option<Arc<ReceiveEndpoint<GroupAuth>>>,
     tls: Option<Arc<ServerConfig>>,
     body_timeout: Duration,
+    /// `true` if each connection starts with a PROXY protocol header.
+    proxy_protocol: bool,
 }
 
 /// Accepts connections on `listener` and serves each one in a task of its
@@ -330,16 +427,26 @@ async fn connection(stream: rt::TcpStream, addr: SocketAddr, serving: Arc<Servin
 }
 
 /// Serves one connection from the peer address `addr`. An error ends this
-/// connection and no other. With a receive endpoint, each request carries the
-/// [`Peer`] of the connection in its extensions. The server then reads the
-/// client certificate of a TLS connection one time, for each request of the
-/// connection.
+/// connection and no other. With the PROXY protocol, the function first reads
+/// the header, and its source address replaces `addr`. A connection with no
+/// valid header ends with no byte written. With a receive endpoint, each
+/// request carries the [`Peer`] of the connection in its extensions. The
+/// server then reads the client certificate of a TLS connection one time,
+/// for each request of the connection.
 async fn serve_connection(
     stream: rt::TcpStream,
     addr: SocketAddr,
     serving: Arc<Serving>,
     stall: Arc<Stall>,
 ) {
+    let (addr, stream): (IpAddr, _) = if serving.proxy_protocol {
+        match proxy_protocol::read_header(stream, PROXY_HEADER_TIMEOUT).await {
+            Some((source, stream)) => (source.unwrap_or(addr.ip()), stream),
+            None => return,
+        }
+    } else {
+        (addr.ip(), Rewind::new(stream))
+    };
     let shared = serving.clone();
     let service = move |peer: Peer| {
         service_fn(move |mut req: Request<Incoming>| {
@@ -366,7 +473,7 @@ async fn serve_connection(
     let Some(config) = serving.tls.clone() else {
         let peer = Peer {
             tls: false,
-            addr: addr.ip(),
+            addr,
             cert: None,
         };
         let served = http1::Builder::new()
@@ -397,7 +504,7 @@ async fn serve_connection(
     };
     let peer = Peer {
         tls: true,
-        addr: addr.ip(),
+        addr,
         cert,
     };
     let service = service(peer);
@@ -426,5 +533,131 @@ async fn serve_connection(
             .header_read_timeout(HEADER_READ_TIMEOUT)
             .serve_connection(io, service);
         let _ = served.await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use ostrya::access::{ForwardedHeader, IpNet};
+
+    use super::*;
+    use crate::options::ServerTls;
+    use crate::session::tests::TmpRepo;
+
+    const CA_PEM: &[u8] = include_bytes!("../../../tests/fixtures/tls/ca.pem");
+
+    /// The options with the trusted proxies of 10.0.0.0/8, the header
+    /// `X-Forwarded-For`, a forwarded certificate header, and a client CA,
+    /// with no TLS.
+    fn proxied() -> ServeOptions {
+        ServeOptions {
+            client_ca_pem: Some(CA_PEM.to_vec()),
+            trusted_proxies: vec![IpNet::parse("10.0.0.0/8").unwrap()],
+            trusted_proxy_header: Some(ForwardedHeader::XForwardedFor),
+            trusted_proxy_client_cert: Some("X-Client-Cert".into()),
+            ..ServeOptions::default()
+        }
+    }
+
+    fn refused(opts: &ServeOptions) -> String {
+        match check_proxies(opts) {
+            Err(Error::Options(message)) => message,
+            other => panic!("{opts:?}: {other:?}"),
+        }
+    }
+
+    /// A client CA with a forwarded certificate header needs no TLS.
+    #[test]
+    fn a_client_ca_with_a_forwarded_certificate_header_needs_no_tls() {
+        check_proxies(&proxied()).unwrap();
+        let tmp = TmpRepo::new("bind-tls-item");
+        let opts = ServeOptions {
+            receive: Some(
+                tmp.policies("[ex-ostrya client \"c\"]\nauth=tls:ostrya test\nallow=w:**\n"),
+            ),
+            ..proxied()
+        };
+        check_proxies(&opts).unwrap();
+    }
+
+    /// Each field that needs another field is refused without it.
+    #[test]
+    fn each_field_needs_its_partner() {
+        type Change = fn(&mut ServeOptions);
+        let cases: [(Change, &str); 7] = [
+            (
+                |o| o.trusted_proxy_client_cert = Some("X Client".into()),
+                "the forwarded certificate header 'X Client' is not a header name",
+            ),
+            (
+                |o| o.trusted_proxy_client_cert = Some(String::new()),
+                "the forwarded certificate header '' is not a header name",
+            ),
+            (
+                |o| o.client_ca_pem = None,
+                "a forwarded certificate header with no client CA",
+            ),
+            (
+                |o| o.trusted_proxies.clear(),
+                "a forwarded certificate header with no trusted proxy",
+            ),
+            (
+                |o| o.trusted_proxy_header = None,
+                "trusted proxies with no header of the client address",
+            ),
+            (
+                |o| {
+                    o.trusted_proxy_client_cert = None;
+                    o.trusted_proxies.clear();
+                },
+                "the client address header x-forwarded-for with no trusted proxy",
+            ),
+            (
+                |o| o.trusted_proxy_client_cert = None,
+                "a client CA with no TLS and no forwarded certificate header",
+            ),
+        ];
+        for (change, message) in cases {
+            let mut opts = proxied();
+            change(&mut opts);
+            assert_eq!(refused(&opts), message);
+        }
+        let mut opts = proxied();
+        opts.trusted_proxy_client_cert = None;
+        opts.tls = Some(ServerTls {
+            cert_chain_pem: Vec::new(),
+            key_pem: Vec::new(),
+            key_passphrase: None,
+        });
+        check_proxies(&opts).unwrap();
+        check_proxies(&ServeOptions::default()).unwrap();
+    }
+
+    /// A `tls:` item needs a client CA.
+    #[test]
+    fn a_tls_item_needs_a_client_ca() {
+        let tmp = TmpRepo::new("bind-no-ca");
+        let opts = ServeOptions {
+            receive: Some(tmp.policies("[ex-ostrya client \"c\"]\nauth=tls:*\nallow=w:**\n")),
+            ..ServeOptions::default()
+        };
+        assert_eq!(
+            refused(&opts),
+            "[ex-ostrya client \"c\"] carries the item tls:*, and the server has no client CA"
+        );
+    }
+
+    /// A client CA that gives no verifier is a TLS error of `bind`, before
+    /// it binds a listener.
+    #[test]
+    fn a_bad_client_ca_is_a_tls_error() {
+        let tmp = TmpRepo::new("bind-bad-ca");
+        let opts = ServeOptions {
+            client_ca_pem: Some(b"no certificate".to_vec()),
+            listen: vec!["127.0.0.1:0".parse().unwrap()],
+            ..proxied()
+        };
+        let err = rt::block_on(bind(tmp.repo.clone(), opts)).err().unwrap();
+        assert!(matches!(err, Error::Tls(_)), "{err}");
     }
 }

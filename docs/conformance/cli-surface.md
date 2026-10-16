@@ -4047,6 +4047,9 @@ ostrya push-tree [--repo=PATH] REMOTE DIR -b REF [-b REF]...
 ```text
 ostrya serve [--repo=PATH] [--listen=ADDR:PORT]...
              [--tls-cert=FILE] [--tls-key=FILE] [--tls-client-ca=FILE]
+             [--trusted-proxy=CIDR]... [--trusted-proxy-header=HEADER]
+             [--trusted-proxy-client-cert=HEADER]
+             [--proxy-protocol[=BOOL]]
              [--allow-cleartext-credentials[=BOOL]]
              [--session-timeout=SECONDS] [--max-sessions=N]
              [--parallel-uploads=N] [--body-timeout=SECONDS]
@@ -4081,11 +4084,22 @@ ostrya serve [--repo=PATH] [--listen=ADDR:PORT]...
   a key is relative to the repository directory, and a relative path in an
   option is relative to the current directory. A bad key value ends the
   command at exit 1, also when an option replaces the key.
-- The command refuses a set `trusted-proxy`, a set
-  `trusted-proxy-client-cert`, and `proxy-protocol=true` with
-  `error: unsupported: [ex-ostrya server] KEY is not supported yet` at
-  exit 1, because it does not support a proxy yet. It takes no option for
-  these keys.
+- `--trusted-proxy` takes a network, `ADDR/LEN` or a bare `ADDR`, once for
+  each network, and the options replace the whole `trusted-proxy` key. A
+  network with host bits set is refused at exit 1. `--trusted-proxy-header`
+  takes `forwarded`, `x-forwarded-for`, or `x-real-ip`, in lowercase, and
+  each needs the other, from a key or from an option.
+  `--trusted-proxy-client-cert` takes a header name, an HTTP token, and
+  needs `tls-client-ca` and `trusted-proxy`. `--proxy-protocol` reads a
+  PROXY protocol header at the start of each connection, and
+  `--proxy-protocol=false` does not, also when the key is `true`. No option
+  removes a set `trusted-proxy`, `trusted-proxy-header`, or
+  `trusted-proxy-client-cert` key. A start check that fails ends the command
+  with `error: invalid format: MESSAGE` at exit 1, for example
+  `trusted-proxy is set, and the server has no trusted-proxy-header`.
+  `../format-reference.md`, "Authentication of the receive endpoint", states
+  the PROXY header, the walk of the hops, the scheme `https` of a trusted
+  proxy, and the forms of a forwarded certificate.
 - The receive endpoint identifies the client of each request by the auth
   items of the client groups: a bearer token, a Basic credential, a client
   certificate, the client address, or `anonymous`. A `session` request
@@ -4104,7 +4118,9 @@ ostrya serve [--repo=PATH] [--listen=ADDR:PORT]...
   with a bearer or Basic credential over plain HTTP gets 403, also when a
   group has the `anonymous` item. `allow-cleartext-credentials=true` and
   `--allow-cleartext-credentials` take such a credential. Use them for a
-  server on a loopback address or behind a proxy that terminates TLS.
+  server on a loopback address, or behind a proxy that terminates TLS and
+  is not in `trusted-proxy`. A trusted proxy that reports the scheme `https`
+  needs neither.
   `--allow-cleartext-credentials=false` refuses such a credential, also when
   the key is `true`. A read of the archive view ignores the `Authorization`
   header and needs no credential.
@@ -4151,9 +4167,11 @@ ostrya serve [--repo=PATH] [--listen=ADDR:PORT]...
   from an option. ALPN selects HTTP/2 or HTTP/1.1, and plain HTTP serves
   HTTP/1.1. An encrypted key is refused: the command has no option for a
   passphrase.
-- `tls-client-ca` needs `tls-cert`, from a key or from an option. A client
-  that presents a certificate must present one the CA signed. A client that
-  presents none is served, and a read needs no certificate.
+- `tls-client-ca` needs `tls-cert` or `trusted-proxy-client-cert`, from a
+  key or from an option. A client that presents a certificate in the TLS
+  handshake must present one the CA signed. A client that presents none is
+  served, and a read needs no certificate. The CA also verifies the
+  certificate that a trusted proxy forwards, also on a plain HTTP listener.
 - `--body-timeout` takes a positive number of seconds, and the default is
   60. A connection ends when a response waits longer than that time for the
   client to take its next bytes. An HTTP/2 client that does not answer a

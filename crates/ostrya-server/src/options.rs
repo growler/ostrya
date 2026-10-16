@@ -5,6 +5,7 @@ use std::net::{Ipv4Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::Duration;
 
+use ostrya::access::{ForwardedHeader, IpNet};
 use ostrya::{ReceivePolicies, ReceiveReport};
 
 use crate::endpoint::EndpointOptions;
@@ -47,11 +48,8 @@ impl fmt::Debug for ServerTls {
 /// The struct is `#[non_exhaustive]`, so a caller starts from
 /// [`ServeOptions::default`] and sets the fields.
 ///
-/// [`bind`](crate::bind) refuses
-/// [`client_ca_pem`](ServeOptions::client_ca_pem) with no
-/// [`tls`](ServeOptions::tls), and a `tls:*`, `tls:NAME`, or
-/// `tls-sha256:HEX` item of [`receive`](ServeOptions::receive) with no
-/// `client_ca_pem`.
+/// [`bind`](crate::bind) checks the fields that go together. Its
+/// [errors](crate::bind#errors) list the refusals.
 ///
 /// The fields `parallel_uploads`, `session_idle_timeout`, `max_sessions`, and
 /// `on_report` go to the [`EndpointOptions`] of the receive endpoint. Their
@@ -71,7 +69,8 @@ impl fmt::Debug for ServerTls {
 /// 2. If the connection has no TLS, a bearer or Basic credential gets 403,
 ///    unless
 ///    [`allow_cleartext_credentials`](ServeOptions::allow_cleartext_credentials)
-///    is set.
+///    is set, or a trusted proxy states the scheme `https` (see
+///    [Client address](ServeOptions#client-address)).
 /// 3. A request with an `Authorization` header gets the item of its
 ///    credential. A bearer token, `Authorization: Bearer TOKEN`, gets the
 ///    `token-sha256:HEX` item of the SHA-256 digest of the token. A Basic
@@ -86,8 +85,11 @@ impl fmt::Debug for ServerTls {
 ///    in this order: `tls-sha256:HEX` by the SHA-256 digest of the DER
 ///    bytes, `tls:NAME` by the subject CN, `tls:*`. A certificate that
 ///    matches no item gets 403. A subject matches `tls:NAME` only if it holds
-///    exactly one CN, of type UTF8String or PrintableString.
-/// 5. A request whose peer address is in the network of a `net:` item gets
+///    exactly one CN, of type UTF8String or PrintableString. From a trusted
+///    proxy with a header of a forwarded certificate, the certificate comes
+///    from that header alone, and never from the TLS handshake (see
+///    [Forwarded certificate](ServeOptions#forwarded-certificate)).
+/// 5. A request whose client address is in the network of a `net:` item gets
 ///    that item. When two items match, the item with the longer prefix wins.
 /// 6. A request gets the `anonymous` item, if one exists.
 /// 7. Else the request gets 401 when a `token-sha256` or a `basic-sha256`
@@ -97,7 +99,7 @@ impl fmt::Debug for ServerTls {
 /// or `basic-sha256` item in constant time. It does not stop at a match. The
 /// TLS handshake verifies a client certificate against
 /// [`client_ca_pem`](ServeOptions::client_ca_pem). The server reads the
-/// certificate one time for each connection.
+/// certificate of the handshake one time for each connection.
 ///
 /// Each 401 carries two headers: `WWW-Authenticate: Bearer realm="ostrya"`
 /// and `WWW-Authenticate: Basic realm="ostrya"`.
@@ -112,6 +114,81 @@ impl fmt::Debug for ServerTls {
 /// names no collection, so the namespace of each session is the local refs.
 /// The session gets the policy of that group and no hooks. With no such
 /// group, and with a group that opens no push session, the request gets 403.
+///
+/// # Client address
+///
+/// The client address is the TCP peer address of the connection, with these
+/// changes:
+///
+/// - With [`proxy_protocol`](ServeOptions::proxy_protocol), the source
+///   address of the PROXY header replaces the peer address. A header with
+///   no address keeps the peer address.
+/// - When the peer address is in
+///   [`trusted_proxies`](ServeOptions::trusted_proxies), the server reads
+///   the client address from the one header of
+///   [`trusted_proxy_header`](ServeOptions::trusted_proxy_header). It walks
+///   the hops of the header from the right, and skips each hop whose address
+///   is in a trusted network. The first other hop is the client. When all
+///   hops are trusted, the client is the leftmost hop. A hop with no
+///   address, for example `unknown`, gives a client with no address, which
+///   matches no `net:` item. A header that is absent, or that has one line
+///   of white space alone, keeps the peer address. A header that is not
+///   UTF-8, that does not parse, or that has text and no hop, for example
+///   `X-Forwarded-For: , ,`, gives no address.
+/// - From a trusted peer, the request counts as TLS for step 2 when the
+///   proxy states the scheme `https`, in any case. With
+///   [`ForwardedHeader::Forwarded`], the scheme is the `proto` of the
+///   selected hop. With the other headers, it is the rightmost value of
+///   `X-Forwarded-Proto`.
+/// - From a peer that is not trusted, the server reads no forwarding header,
+///   no `X-Forwarded-Proto`, and no forwarded certificate.
+///
+/// An IPv4-mapped IPv6 address counts as its IPv4 address.
+///
+/// With [`proxy_protocol`](ServeOptions::proxy_protocol), the server compares
+/// the source address of the PROXY header with
+/// [`trusted_proxies`](ServeOptions::trusted_proxies), so it does not read
+/// the forwarding headers and the forwarded certificate of a proxy that
+/// states the address of its client in the PROXY header.
+///
+/// A trusted proxy must set or remove the forwarding header, the
+/// `X-Forwarded-Proto` header, and the header of a forwarded certificate of
+/// each request. Else a client can send these headers through the proxy and
+/// take another address or another certificate.
+///
+/// # Forwarded certificate
+///
+/// [`trusted_proxy_client_cert`](ServeOptions::trusted_proxy_client_cert)
+/// names the request header that carries the client certificate from a
+/// trusted proxy. The server reads the header for each request, and never
+/// keeps the result for a connection, because a proxy sends the requests of
+/// many clients over one connection. The value is one of these forms, after
+/// the server percent-decodes it, with `+` kept as `+`:
+///
+/// - a PEM certificate that starts with `-----BEGIN`, as nginx
+///   `$ssl_client_escaped_cert` gives it URL-escaped;
+/// - the base64 of the DER bytes, as HAProxy `ssl_c_der,base64` gives it, or
+///   URL-escaped, as Traefik `passTLSClientCert` gives it.
+///
+/// From a trusted proxy, this header alone gives the certificate. The server
+/// does not use the certificate of the TLS handshake, which is the
+/// certificate of the proxy. A request with no such header gives no
+/// certificate. From a peer that is not trusted, or with no
+/// `trusted_proxy_client_cert`, the certificate of the TLS handshake applies.
+///
+/// An empty value, or white space alone, is no certificate. These cases get
+/// 403: a value with a comma, as the chain of Traefik holds; more than one
+/// line of the header; PEM with more than one `CERTIFICATE` section; a value
+/// that does not decode; and a certificate that
+/// [`client_ca_pem`](ServeOptions::client_ca_pem) does not verify. The
+/// server uses no intermediate certificate from the proxy, so the client CA
+/// must hold each intermediate CA. The verification checks the validity
+/// period and the `clientAuth` extended key usage.
+///
+/// The server keeps each verified certificate in a cache of 1024 entries,
+/// keyed by the SHA-256 digest of its DER bytes, until the end of its
+/// validity period. A full cache removes its oldest entry. The cache keeps
+/// no refusal.
 #[derive(Clone)]
 #[non_exhaustive]
 pub struct ServeOptions {
@@ -125,13 +202,53 @@ pub struct ServeOptions {
     /// The TLS files, or `None` for plain HTTP. The default is `None`.
     pub tls: Option<ServerTls>,
     /// The PEM CA certificates that verify the client certificate of the TLS
-    /// handshake, or `None`.
+    /// handshake and a forwarded certificate, or `None`.
     ///
-    /// The server also serves a client that presents no certificate. A
-    /// client that presents a certificate that the CA did not sign fails the
-    /// handshake. The field needs [`tls`](ServeOptions::tls). The default is
-    /// `None`.
+    /// [`bind`](crate::bind) builds one verifier from the certificates, and
+    /// the handshake and each forwarded certificate use it. The server also
+    /// serves a client that presents no certificate. A client that presents
+    /// a certificate that the CA did not sign fails the handshake. The field
+    /// needs [`tls`](ServeOptions::tls) or
+    /// [`trusted_proxy_client_cert`](ServeOptions::trusted_proxy_client_cert).
+    /// The default is `None`.
     pub client_ca_pem: Option<Vec<u8>>,
+    /// The networks of the peers whose forwarding data the server reads.
+    ///
+    /// [Client address](ServeOptions#client-address) states the rules. A
+    /// non-empty list needs
+    /// [`trusted_proxy_header`](ServeOptions::trusted_proxy_header). The
+    /// default is an empty list, which trusts no peer.
+    pub trusted_proxies: Vec<IpNet>,
+    /// The request header from which the server reads the client address of
+    /// a request from a trusted proxy, or `None`.
+    ///
+    /// The server reads this one header, and no other header of a client
+    /// address. The field needs a non-empty
+    /// [`trusted_proxies`](ServeOptions::trusted_proxies). The default is
+    /// `None`.
+    pub trusted_proxy_header: Option<ForwardedHeader>,
+    /// The name of the request header that carries the client certificate
+    /// from a trusted proxy, or `None`.
+    ///
+    /// [Forwarded certificate](ServeOptions#forwarded-certificate) states the
+    /// rules. The name passes [`ostrya::access::is_header_name`]. The field
+    /// needs [`client_ca_pem`](ServeOptions::client_ca_pem) and a non-empty
+    /// [`trusted_proxies`](ServeOptions::trusted_proxies). The default is
+    /// `None`.
+    pub trusted_proxy_client_cert: Option<String>,
+    /// The switch that reads a PROXY protocol header, version 1 or 2, at the
+    /// start of each connection.
+    ///
+    /// With the switch, each listener reads the header before the TLS
+    /// handshake and before the first request. Its source address replaces
+    /// the peer address. A header with no address, for example `UNKNOWN` or
+    /// `LOCAL`, keeps the peer address. The server closes a connection with
+    /// no valid header, or with no header within 30 seconds, and writes no
+    /// byte to it. The default is `false`.
+    ///
+    /// Each peer that can connect states its own client address in the
+    /// header. Only the proxy must be able to reach the listener.
+    pub proxy_protocol: bool,
     /// The longest time that a response body waits for the client to take its
     /// next bytes.
     ///
@@ -162,9 +279,11 @@ pub struct ServeOptions {
     /// without TLS.
     ///
     /// The default is `false`. If the switch is `false`, the endpoint refuses
-    /// such a credential with 403. A server on a loopback address or behind a
-    /// proxy that terminates TLS can set it. A read-only server does not read
-    /// the field.
+    /// such a credential with 403, unless a trusted proxy states the scheme
+    /// `https`. A server on a loopback address, or behind a proxy that
+    /// terminates TLS and is not in
+    /// [`trusted_proxies`](ServeOptions::trusted_proxies), can set it. A
+    /// read-only server does not read the field.
     pub allow_cleartext_credentials: bool,
     /// The number of object streams of one session, as in
     /// [`EndpointOptions::parallel_uploads`].
@@ -187,7 +306,8 @@ pub struct ServeOptions {
 }
 
 /// The debug text shows a report callback that is set as `<callback>`, a
-/// client CA that is set as `<N bytes>`, and the receive policies as the
+/// client CA that is set as `<N bytes>`, the trusted proxies as networks,
+/// and the receive policies as the
 /// names of their client groups. It holds no auth item, so no digest and no
 /// user name.
 impl fmt::Debug for ServeOptions {
@@ -202,6 +322,17 @@ impl fmt::Debug for ServeOptions {
                     .as_ref()
                     .map(|pem| format!("<{} bytes>", pem.len())),
             )
+            .field(
+                "trusted_proxies",
+                &self
+                    .trusted_proxies
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>(),
+            )
+            .field("trusted_proxy_header", &self.trusted_proxy_header)
+            .field("trusted_proxy_client_cert", &self.trusted_proxy_client_cert)
+            .field("proxy_protocol", &self.proxy_protocol)
             .field("body_timeout", &self.body_timeout)
             .field(
                 "receive",
@@ -233,6 +364,10 @@ impl Default for ServeOptions {
             listen: vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 8080))],
             tls: None,
             client_ca_pem: None,
+            trusted_proxies: Vec::new(),
+            trusted_proxy_header: None,
+            trusted_proxy_client_cert: None,
+            proxy_protocol: false,
             body_timeout: Duration::from_secs(60),
             receive: None,
             allow_cleartext_credentials: false,

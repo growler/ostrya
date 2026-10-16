@@ -605,9 +605,21 @@ fn serve_refuses_what_it_cannot_serve() {
     let max_key = server("max-key", "max-sessions=0\n");
     let parallel_key = server("parallel-key", "parallel-uploads=32\n");
     let body_key = server("body-key", "body-timeout=0\n");
-    let proxy_protocol = server("proxy-protocol", "proxy-protocol=true\n");
-    let trusted_proxy = server("trusted-proxy", "trusted-proxy=10.0.0.0/8\n");
-    let proxy_cert = server("proxy-cert", "trusted-proxy-client-cert=X-Client-Cert\n");
+    let header_key = server("header-key", "trusted-proxy-header=X-Real-IP\n");
+    let proxy_alone = server("proxy-alone", "trusted-proxy=10.0.0.0/8\n");
+    let header_alone = server("header-alone", "trusted-proxy-header=x-real-ip\n");
+    let cert_no_ca = server(
+        "cert-no-ca",
+        "trusted-proxy=10.0.0.0/8\ntrusted-proxy-header=x-real-ip\n\
+         trusted-proxy-client-cert=X-Client-Cert\n",
+    );
+    let cert_no_proxy = server(
+        "cert-no-proxy",
+        &format!(
+            "tls-client-ca={}\ntrusted-proxy-client-cert=X-Client-Cert\n",
+            fixture("ca.pem").display()
+        ),
+    );
     let anon = "--allow-anonymous-push";
     let tls_pair = "tls-cert is set, and tls-key is not";
     let ca_alone = "tls-client-ca is set, and tls-cert and trusted-proxy-client-cert are not";
@@ -674,16 +686,57 @@ fn serve_refuses_what_it_cannot_serve() {
         ),
         (&[&body_key, "serve", listen], "body-timeout is 0"),
         (
-            &[&proxy_protocol, "serve", listen],
-            "[ex-ostrya server] proxy-protocol is not supported yet",
+            &[&repo, "serve", listen, "--trusted-proxy=10.0.0.1/24"],
+            "--trusted-proxy",
         ),
         (
-            &[&trusted_proxy, "serve", listen],
-            "[ex-ostrya server] trusted-proxy is not supported yet",
+            &[&repo, "serve", listen, "--trusted-proxy=fe80::1%eth0"],
+            "--trusted-proxy",
         ),
         (
-            &[&proxy_cert, "serve", listen],
-            "[ex-ostrya server] trusted-proxy-client-cert is not supported yet",
+            &[&repo, "serve", listen, "--trusted-proxy-header=X-Real-IP"],
+            "--trusted-proxy-header",
+        ),
+        (
+            &[
+                &repo,
+                "serve",
+                listen,
+                "--trusted-proxy-client-cert=X Client",
+            ],
+            "--trusted-proxy-client-cert",
+        ),
+        (
+            &[&repo, "serve", listen, "--trusted-proxy-client-cert="],
+            "--trusted-proxy-client-cert",
+        ),
+        (
+            &[&repo, "serve", listen, "--proxy-protocol=yes"],
+            "--proxy-protocol",
+        ),
+        (
+            &[&header_key, "serve", listen],
+            "trusted-proxy-header value 'X-Real-IP'",
+        ),
+        (
+            &[&proxy_alone, "serve", listen],
+            "trusted-proxy is set, and the server has no trusted-proxy-header",
+        ),
+        (
+            &[&repo, "serve", listen, "--trusted-proxy=10.0.0.0/8"],
+            "trusted-proxy is set, and the server has no trusted-proxy-header",
+        ),
+        (
+            &[&header_alone, "serve", listen],
+            "trusted-proxy-header is set, and the server has no trusted-proxy",
+        ),
+        (
+            &[&cert_no_ca, "serve", listen],
+            "trusted-proxy-client-cert is set, and the server has no tls-client-ca",
+        ),
+        (
+            &[&cert_no_proxy, "serve", listen],
+            "trusted-proxy-client-cert is set, and the server has no trusted-proxy",
         ),
     ];
     for &(args, message) in cases {
@@ -701,6 +754,12 @@ fn serve_refuses_what_it_cannot_serve() {
 /// Returns a request that opens a push session of the ref `name`, with no
 /// credential.
 fn session_request(name: &str) -> Vec<u8> {
+    session_request_with(name, "")
+}
+
+/// Returns a request that opens a push session of the ref `name`, with the
+/// header lines `headers`, each with its CRLF.
+fn session_request_with(name: &str, headers: &str) -> Vec<u8> {
     use ostrya::remote::proto::{FrameWriter, Hello, Message};
 
     let hello = Message::Hello(Hello {
@@ -715,7 +774,7 @@ fn session_request(name: &str) -> Vec<u8> {
         writer.into_inner()
     });
     let mut request = format!(
-        "POST /_ostrya/receive/v1/session HTTP/1.1\r\nhost: x\r\n\
+        "POST /_ostrya/receive/v1/session HTTP/1.1\r\nhost: x\r\n{headers}\
          content-length: {}\r\nconnection: close\r\n\r\n",
         body.len()
     )
@@ -874,6 +933,142 @@ fn raw(url: &str, request: impl AsRef<[u8]>) -> String {
     let mut out = Vec::new();
     stream.read_to_end(&mut out).unwrap();
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Send `request` to the server at `url` on a new connection, and read until
+/// the server closes it. A reset of the connection ends the read with no
+/// error, so a connection that the server closes with no response gives an
+/// empty string.
+fn raw_or_closed(url: &str, request: impl AsRef<[u8]>) -> String {
+    use std::io::{Read, Write};
+
+    let addr = url.trim_start_matches("http://").trim_end_matches('/');
+    let mut stream = std::net::TcpStream::connect(addr).unwrap();
+    let _ = stream.write_all(request.as_ref());
+    let mut out = Vec::new();
+    let mut chunk = [0u8; 4096];
+    while let Ok(n) = stream.read(&mut chunk) {
+        if n == 0 {
+            break;
+        }
+        out.extend_from_slice(&chunk[..n]);
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// `ostrya serve` takes the proxy settings from `[ex-ostrya server]`, and an
+/// option replaces the key of its name:
+///
+/// - `proxy-protocol=true` serves a request after a PROXY header and closes
+///   a connection with no header. `--proxy-protocol=false` serves the
+///   request with no header. With no key, `--proxy-protocol` with no value
+///   reads the header.
+/// - `trusted-proxy` and `trusted-proxy-header` give the client address of
+///   `X-Forwarded-For`, which a `net:` item matches. `--trusted-proxy`
+///   replaces the networks of the key, so the server ignores the header of
+///   the loopback peer. `--trusted-proxy-header` replaces the header of the
+///   key.
+/// - `tls-client-ca` and `trusted-proxy-client-cert`, with no `tls-cert`,
+///   start a plain HTTP server, and a forwarded certificate opens a session.
+///   `--trusted-proxy-client-cert` replaces the header of the key.
+#[test]
+fn serve_takes_the_proxy_settings_from_the_server_group() {
+    let tmp = TmpDir::new("proxies");
+    let with_config = |name: &str, sections: &str| {
+        let path = tmp.path().join(name);
+        ok(
+            ostrya(),
+            &[
+                &format!("--repo={}", path.display()),
+                "init",
+                "--mode=archive",
+            ],
+        );
+        let config = path.join("config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str(sections);
+        std::fs::write(&config, text).unwrap();
+        path
+    };
+    let get = "GET /config HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n";
+    let header = "PROXY TCP4 192.0.2.7 127.0.0.1 56324 8080\r\n";
+
+    let proxy_protocol = with_config(
+        "proxy-protocol",
+        "[ex-ostrya server]\nproxy-protocol=true\n",
+    );
+    let server = Serving::start(&proxy_protocol, &[]);
+    let response = raw_or_closed(&server.url, format!("{header}{get}"));
+    assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
+    assert_eq!(raw_or_closed(&server.url, get), "");
+    drop(server);
+    let server = Serving::start(&proxy_protocol, &["--proxy-protocol=false"]);
+    assert!(raw(&server.url, get).starts_with("HTTP/1.1 200 "));
+    drop(server);
+    let no_key = with_config("no-key", "");
+    let server = Serving::start(&no_key, &["--proxy-protocol"]);
+    let response = raw_or_closed(&server.url, format!("{header}{get}"));
+    assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
+    assert_eq!(raw_or_closed(&server.url, get), "");
+    drop(server);
+
+    let farm = "[ex-ostrya client \"farm\"]\nauth=net:192.0.2.0/24\nallow=w:**\n";
+    let forwarded = with_config(
+        "forwarded",
+        &format!(
+            "[ex-ostrya server]\ntrusted-proxy=127.0.0.1\n\
+             trusted-proxy-header=x-forwarded-for\n{farm}"
+        ),
+    );
+    let request = session_request_with("a", "x-forwarded-for: 192.0.2.7\r\n");
+    let server = Serving::start(&forwarded, &[]);
+    let response = raw(&server.url, &request);
+    assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
+    drop(server);
+    let server = Serving::start(&forwarded, &["--trusted-proxy=192.0.2.0/24"]);
+    let response = raw(&server.url, &request);
+    assert!(response.starts_with("HTTP/1.1 403 "), "{response}");
+    assert!(response.contains("matches no auth item"), "{response}");
+    drop(server);
+    let server = Serving::start(&forwarded, &["--trusted-proxy-header=x-real-ip"]);
+    let response = raw(
+        &server.url,
+        session_request_with("b", "x-forwarded-for: 192.0.2.7\r\n"),
+    );
+    assert!(response.starts_with("HTTP/1.1 403 "), "{response}");
+    let response = raw(
+        &server.url,
+        session_request_with("b", "x-real-ip: 192.0.2.7\r\n"),
+    );
+    assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
+    drop(server);
+
+    let certs = with_config(
+        "certs",
+        "[ex-ostrya server]\ntls-client-ca=ca.pem\ntrusted-proxy=127.0.0.1\n\
+         trusted-proxy-header=x-real-ip\ntrusted-proxy-client-cert=X-SSL-Client-Cert\n\
+         [ex-ostrya client \"certs\"]\nauth=tls:ostrya test\nallow=w:**\n",
+    );
+    std::fs::copy(fixture("ca.pem"), certs.join("ca.pem")).unwrap();
+    let client: String = std::fs::read_to_string(fixture("client.pem"))
+        .unwrap()
+        .lines()
+        .filter(|line| !line.starts_with("-----"))
+        .collect();
+    let server = Serving::start(&certs, &[]);
+    assert!(server.url.starts_with("http://"), "{}", server.url);
+    let line = format!("x-ssl-client-cert: {client}\r\n");
+    let response = raw(&server.url, session_request_with("a", &line));
+    assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
+    let response = raw(&server.url, session_request("a"));
+    assert!(response.starts_with("HTTP/1.1 403 "), "{response}");
+    drop(server);
+    let server = Serving::start(&certs, &["--trusted-proxy-client-cert=X-Other-Cert"]);
+    let response = raw(&server.url, session_request_with("c", &line));
+    assert!(response.starts_with("HTTP/1.1 403 "), "{response}");
+    let line = format!("x-other-cert: {client}\r\n");
+    let response = raw(&server.url, session_request_with("c", &line));
+    assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
 }
 
 /// With a client group of anonymous push, the receive endpoint answers a

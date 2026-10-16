@@ -12,6 +12,7 @@ use std::hint::black_box;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
+use futures_rustls::pki_types::UnixTime;
 use hyper::header::{AUTHORIZATION, HeaderValue, WWW_AUTHENTICATE};
 use hyper::http::request::Parts;
 use hyper::{HeaderMap, StatusCode};
@@ -19,7 +20,8 @@ use ostrya::access::{AuthItem, IpNet};
 use ostrya::remote::proto::Hello;
 use ostrya::{Checksum, ReceivePolicies};
 
-use crate::cert::ClientCert;
+use crate::cert::{ClientCert, ForwardedCerts};
+use crate::forwarded::{Forwarding, Origin};
 use crate::receive_auth::{ReceiveAuth, Refusal, RequestKind, SessionSetup};
 
 /// The `WWW-Authenticate` headers of a 401: the two schemes of a credential.
@@ -31,7 +33,8 @@ const CHALLENGES: [&str; 2] = [r#"Bearer realm="ostrya""#, r#"Basic realm="ostry
 pub(crate) struct Peer {
     /// `true` if the connection runs over TLS.
     pub(crate) tls: bool,
-    /// The TCP peer address of the connection.
+    /// The peer address of the connection: the source address of its PROXY
+    /// header, else the TCP peer address.
     pub(crate) addr: IpAddr,
     /// The end-entity certificate that the client presented in the TLS
     /// handshake. The handshake verified it against the client CA. The
@@ -181,8 +184,10 @@ impl CredentialIndex {
         self.tls_any.clone()
     }
 
-    /// The `net:` item with the longest prefix that holds `addr`.
-    fn net(&self, addr: IpAddr) -> Option<Client> {
+    /// The `net:` item with the longest prefix that holds `addr`. A client
+    /// with no address matches no item.
+    fn net(&self, addr: Option<IpAddr>) -> Option<Client> {
+        let addr = addr?;
         self.nets
             .iter()
             .filter(|(net, _)| net.contains(addr))
@@ -225,6 +230,12 @@ pub(crate) struct GroupAuth {
     policies: Arc<ReceivePolicies>,
     /// The auth items of the groups.
     index: CredentialIndex,
+    /// The trusted proxies and the header of the client address, or `None`
+    /// with no trusted proxy.
+    forwarding: Option<Forwarding>,
+    /// The client certificates that trusted proxies forward, or `None` with
+    /// no header of a forwarded certificate.
+    forwarded_certs: Option<ForwardedCerts>,
 }
 
 impl GroupAuth {
@@ -235,13 +246,53 @@ impl GroupAuth {
             cleartext,
             index: CredentialIndex::new(policies.access().items()),
             policies,
+            forwarding: None,
+            forwarded_certs: None,
         }
+    }
+
+    /// The authentication with the forwarding data of the trusted proxies
+    /// of `forwarding`, and the forwarded certificates of `certs`. The server
+    /// reads a forwarded certificate only from a trusted proxy.
+    pub(crate) fn with_proxies(
+        mut self,
+        forwarding: Option<Forwarding>,
+        certs: Option<ForwardedCerts>,
+    ) -> GroupAuth {
+        self.forwarding = forwarding;
+        self.forwarded_certs = certs;
+        self
     }
 
     /// The auth item of a request with `headers` from `peer`, or the refusal
     /// of the request. The server takes the first step that applies, in the
     /// order that [`ServeOptions`](crate::ServeOptions#authentication) states.
     fn identify(&self, headers: &HeaderMap, peer: &Peer) -> Result<Client, Refusal> {
+        self.identify_at(headers, peer, UnixTime::now())
+    }
+
+    /// [`identify`](GroupAuth::identify) at the time `now`, which checks the
+    /// validity of a forwarded certificate.
+    fn identify_at(
+        &self,
+        headers: &HeaderMap,
+        peer: &Peer,
+        now: UnixTime,
+    ) -> Result<Client, Refusal> {
+        let (origin, trusted) = match &self.forwarding {
+            Some(forwarding) => (
+                forwarding.origin(headers, peer.addr),
+                forwarding.trusts(peer.addr),
+            ),
+            None => (
+                Origin {
+                    addr: Some(peer.addr),
+                    https: false,
+                },
+                false,
+            ),
+        };
+        let tls = peer.tls || origin.https;
         let mut values = headers.get_all(AUTHORIZATION).iter();
         let value = values.next();
         if values.next().is_some() {
@@ -257,7 +308,7 @@ impl GroupAuth {
             };
             let bearer = scheme.eq_ignore_ascii_case(b"Bearer");
             let basic = scheme.eq_ignore_ascii_case(b"Basic");
-            if (bearer || basic) && !peer.tls && !self.cleartext {
+            if (bearer || basic) && !tls && !self.cleartext {
                 return Err(Refusal::forbidden(
                     "the server takes no credential over plain HTTP",
                 ));
@@ -275,14 +326,27 @@ impl GroupAuth {
                 )
             });
         }
-        if let Some(cert) = &peer.cert {
+        // From a trusted proxy with a header of a forwarded certificate, the
+        // header alone gives the certificate. The certificate of the
+        // handshake is then the certificate of the proxy.
+        let forwarded;
+        let cert = match &self.forwarded_certs {
+            Some(certs) if trusted => {
+                forwarded = certs
+                    .certificate(headers, now)
+                    .map_err(|bad| Refusal::forbidden(bad.message()))?;
+                forwarded.as_ref()
+            }
+            _ => peer.cert.as_ref(),
+        };
+        if let Some(cert) = cert {
             return self.index.certificate(cert).ok_or_else(|| {
                 Refusal::forbidden(
                     "the client certificate of the request matches no auth item of the server",
                 )
             });
         }
-        if let Some(client) = self.index.net(peer.addr) {
+        if let Some(client) = self.index.net(origin.addr) {
             return Ok(client);
         }
         if let Some(client) = &self.index.anonymous {
@@ -424,6 +488,7 @@ mod tests {
         ClientCert {
             digest: Checksum::sha256(der.as_bytes()),
             cn: cn.map(str::to_owned),
+            not_after: None,
         }
     }
 
@@ -810,5 +875,226 @@ mod tests {
             assert_eq!(refusal.status, StatusCode::FORBIDDEN, "{text}");
             assert_eq!(refusal.message, needle, "{text}");
         }
+    }
+
+    const CA_PEM: &[u8] = include_bytes!("../../../tests/fixtures/tls/ca.pem");
+    const CLIENT_PEM: &str = include_str!("../../../tests/fixtures/tls/client.pem");
+    const SERVER_PEM: &str = include_str!("../../../tests/fixtures/tls/server.pem");
+
+    /// The base64 of the DER bytes of the one certificate of `pem`.
+    fn base64_der(pem: &str) -> String {
+        pem.lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect()
+    }
+
+    /// The authentication by `groups` behind the trusted proxies of
+    /// 10.0.0.0/8, which forward the client address in `X-Forwarded-For` and
+    /// the client certificate in `X-Client-Cert`. The fixture CA verifies the
+    /// certificate.
+    fn proxied(groups: &str) -> (GroupAuth, TmpRepo) {
+        let (auth, tmp) = auth(groups);
+        let forwarding = Forwarding::new(
+            vec![IpNet::parse("10.0.0.0/8").unwrap()],
+            ostrya::access::ForwardedHeader::XForwardedFor,
+        );
+        let verifier = ostrya_fetch::client_cert_verifier(CA_PEM).unwrap();
+        let certs = ForwardedCerts::new(
+            hyper::header::HeaderName::from_static("x-client-cert"),
+            verifier,
+        );
+        (auth.with_proxies(Some(forwarding), Some(certs)), tmp)
+    }
+
+    /// The headers of the pairs `lines`.
+    fn lines(lines: &[(&str, &str)]) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        for (name, value) in lines {
+            headers.append(
+                hyper::header::HeaderName::from_bytes(name.as_bytes()).unwrap(),
+                HeaderValue::from_str(value).unwrap(),
+            );
+        }
+        headers
+    }
+
+    fn proxy() -> Peer {
+        peer(false, "10.0.0.1", None)
+    }
+
+    fn stranger() -> Peer {
+        peer(false, "192.0.2.9", None)
+    }
+
+    /// `X-Forwarded-Proto: https` from a trusted proxy passes the step of a
+    /// credential over plain HTTP. From another peer, it has no effect.
+    #[test]
+    fn https_from_a_trusted_proxy_counts_as_tls() {
+        let (auth, _tmp) = proxied(&credentials());
+        let request = lines(&[
+            ("authorization", "Bearer a-token"),
+            ("x-forwarded-proto", "https"),
+        ]);
+        let found = auth.identify(&request, &proxy()).unwrap();
+        assert_eq!(&*found.owner, format!("token-sha256:{}", hex("a-token")));
+        let refusal = auth.identify(&request, &stranger()).unwrap_err();
+        assert_eq!(refusal.status, StatusCode::FORBIDDEN);
+        assert!(refusal.message.contains("plain HTTP"), "{refusal:?}");
+        let http = lines(&[
+            ("authorization", "Bearer a-token"),
+            ("x-forwarded-proto", "http"),
+        ]);
+        assert_eq!(auth.identify(&http, &proxy()).unwrap_err().status, 403);
+    }
+
+    /// A forwarded certificate from a trusted proxy matches `tls:NAME` and
+    /// `tls-sha256:HEX`. From another peer, the server ignores it.
+    #[test]
+    fn a_forwarded_certificate_matches_the_tls_items() {
+        let der = ostrya::base64::decode(&base64_der(CLIENT_PEM)).unwrap();
+        let by_digest = format!("tls-sha256:{}", Checksum::sha256(&der).to_hex());
+        for (groups, expected) in [
+            (
+                "[ex-ostrya client \"c\"]\nauth=tls:ostrya test\nallow=w:**\n\
+                 [ex-ostrya client \"a\"]\nauth=anonymous\nallow=w:**\n"
+                    .to_owned(),
+                "tls:ostrya test".to_owned(),
+            ),
+            (
+                format!(
+                    "[ex-ostrya client \"c\"]\nauth={by_digest};tls:*\nallow=w:**\n\
+                     [ex-ostrya client \"a\"]\nauth=anonymous\nallow=w:**\n"
+                ),
+                by_digest.clone(),
+            ),
+        ] {
+            let (auth, _tmp) = proxied(&groups);
+            let request = lines(&[("x-client-cert", &base64_der(CLIENT_PEM))]);
+            assert_eq!(&*auth.identify(&request, &proxy()).unwrap().owner, expected);
+            assert_eq!(
+                &*auth.identify(&request, &stranger()).unwrap().owner,
+                "anonymous"
+            );
+        }
+    }
+
+    /// A forwarded certificate that does not decode, that holds two
+    /// certificates, or that the CA does not verify gets 403, also with an
+    /// anonymous item. With an `Authorization` header, the credential
+    /// decides first.
+    #[test]
+    fn a_bad_forwarded_certificate_is_403() {
+        let (auth, _tmp) = proxied(&format!(
+            "{}[ex-ostrya client \"a\"]\nauth=anonymous;tls:*\nallow=w:**\n",
+            credentials()
+        ));
+        let client = base64_der(CLIENT_PEM);
+        for (value, needle) in [
+            ("!!!".to_owned(), "does not parse"),
+            (format!("{client},{client}"), "more than one"),
+            (base64_der(SERVER_PEM), "does not verify"),
+        ] {
+            let request = lines(&[("x-client-cert", &value)]);
+            let refusal = auth.identify(&request, &proxy()).unwrap_err();
+            assert_eq!(refusal.status, StatusCode::FORBIDDEN, "{value}");
+            assert!(refusal.message.contains(needle), "{refusal:?}");
+            let with_token = lines(&[
+                ("x-client-cert", &value),
+                ("authorization", "Bearer a-token"),
+                ("x-forwarded-proto", "https"),
+            ]);
+            let found = auth.identify(&with_token, &proxy()).unwrap();
+            assert_eq!(&*found.owner, format!("token-sha256:{}", hex("a-token")));
+            assert_eq!(
+                &*auth.identify(&request, &stranger()).unwrap().owner,
+                "anonymous"
+            );
+        }
+        let empty = lines(&[("x-client-cert", "")]);
+        assert_eq!(
+            &*auth.identify(&empty, &proxy()).unwrap().owner,
+            "anonymous"
+        );
+    }
+
+    /// From a trusted proxy with a header of a forwarded certificate, the
+    /// header alone gives the certificate: with no header, or an empty
+    /// header, the certificate of the handshake does not identify the
+    /// client. From another peer, or with no header of a forwarded
+    /// certificate, the certificate of the handshake applies.
+    #[test]
+    fn a_forwarded_certificate_replaces_the_handshake() {
+        let groups = format!(
+            "[ex-ostrya client \"c\"]\nauth=tls:ostrya test\nallow=w:**\n\
+             [ex-ostrya client \"h\"]\nauth=tls-sha256:{}\nallow=w:**\n\
+             [ex-ostrya client \"a\"]\nauth=anonymous\nallow=w:**\n",
+            hex("handshake")
+        );
+        let (direct, _direct_tmp) = auth(&groups);
+        let (auth, _tmp) = proxied(&groups);
+        let handshake = peer(true, "10.0.0.1", Some(cert("handshake", Some("other"))));
+        let request = lines(&[("x-client-cert", &base64_der(CLIENT_PEM))]);
+        let by_handshake = format!("tls-sha256:{}", hex("handshake"));
+        assert_eq!(
+            &*auth.identify(&request, &handshake).unwrap().owner,
+            "tls:ostrya test"
+        );
+        for request in [HeaderMap::new(), lines(&[("x-client-cert", "")])] {
+            assert_eq!(
+                &*auth.identify(&request, &handshake).unwrap().owner,
+                "anonymous"
+            );
+        }
+        let untrusted = peer(true, "192.0.2.9", Some(cert("handshake", Some("other"))));
+        assert_eq!(
+            &*auth.identify(&request, &untrusted).unwrap().owner,
+            by_handshake
+        );
+        let forwarding = Forwarding::new(
+            vec![IpNet::parse("10.0.0.0/8").unwrap()],
+            ostrya::access::ForwardedHeader::XForwardedFor,
+        );
+        let auth = direct.with_proxies(Some(forwarding), None);
+        assert_eq!(
+            &*auth.identify(&request, &handshake).unwrap().owner,
+            by_handshake
+        );
+    }
+
+    /// A `net:` item matches the forwarded client address. A client with no
+    /// address matches no `net:` item, and never takes the address of the
+    /// proxy.
+    #[test]
+    fn a_net_item_matches_the_forwarded_address() {
+        let (auth, _tmp) = proxied(
+            "[ex-ostrya client \"farm\"]\nauth=net:192.0.2.0/24\nallow=w:**\n\
+             [ex-ostrya client \"proxies\"]\nauth=net:10.0.0.0/8\nallow=w:**\n",
+        );
+        let request = |value: &str| lines(&[("x-forwarded-for", value)]);
+        let owner = |value: &str, peer: &Peer| {
+            auth.identify(&request(value), peer)
+                .map(|client| client.owner.to_string())
+                .map_err(|refusal| refusal.status)
+        };
+        assert_eq!(
+            owner("192.0.2.7, 10.0.0.2", &proxy()).unwrap(),
+            "net:192.0.2.0/24"
+        );
+        assert_eq!(owner("10.0.0.3", &proxy()).unwrap(), "net:10.0.0.0/8");
+        assert_eq!(owner("unknown", &proxy()), Err(StatusCode::FORBIDDEN));
+        assert_eq!(owner("", &proxy()).unwrap(), "net:10.0.0.0/8");
+        assert_eq!(owner("10.9.9.9", &stranger()).unwrap(), "net:192.0.2.0/24");
+    }
+
+    /// The time of the request checks the validity of a forwarded
+    /// certificate.
+    #[test]
+    fn an_expired_forwarded_certificate_is_403() {
+        let (auth, _tmp) = proxied("[ex-ostrya client \"c\"]\nauth=tls:*\nallow=w:**\n");
+        let request = lines(&[("x-client-cert", &base64_der(CLIENT_PEM))]);
+        let late = UnixTime::since_unix_epoch(std::time::Duration::from_secs(4_938_667_341));
+        let refusal = auth.identify_at(&request, &proxy(), late).unwrap_err();
+        assert_eq!(refusal.status, StatusCode::FORBIDDEN);
+        assert_eq!(&*auth.identify(&request, &proxy()).unwrap().owner, "tls:*");
     }
 }

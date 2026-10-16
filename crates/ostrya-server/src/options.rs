@@ -61,10 +61,11 @@ impl fmt::Debug for ServerTls {
 ///
 /// # Authentication
 ///
-/// The server identifies the client of each request of the receive endpoint
-/// by the auth items of the client groups of
-/// [`receive`](ServeOptions::receive). Identification gives one auth item.
-/// The server takes the first step that applies:
+/// The server identifies the client of each request by the auth items of the
+/// client groups of [`receive`](ServeOptions::receive): the requests of the
+/// receive endpoint, and the reads of the archive view and of the ref
+/// listing. Identification gives one auth item. The server takes the first
+/// step that applies:
 ///
 /// 1. A request with more than one `Authorization` header gets 401.
 /// 2. If the connection has no TLS, a bearer or Basic credential gets 403,
@@ -105,6 +106,11 @@ impl fmt::Debug for ServerTls {
 /// Each 401 carries two headers: `WWW-Authenticate: Bearer realm="ostrya"`
 /// and `WWW-Authenticate: Basic realm="ostrya"`.
 ///
+/// A read gets the [`ReadAccess`](ostrya::access::ReadAccess) of the item,
+/// with the claims of its certificate. A refused read gets the status of the
+/// refusal and an empty body. [`Server`](crate::Server) states the rules of
+/// a read.
+///
 /// The owner key of a request is the text of its item, as
 /// [`AuthItem`](ostrya::access::AuthItem) writes it. All clients with one
 /// item share one owner key, for example all anonymous clients. A client
@@ -125,14 +131,15 @@ impl fmt::Debug for ServerTls {
 /// # Claims
 ///
 /// A client group with `tls-accept-claim=true` reads the claims of the client
-/// certificate that gives the item of a `session` request: the URI SANs with
-/// the scheme `ostrya`, as [`Claims`](ostrya::access::Claims) reads them.
+/// certificate that gives the item of a `session` request or of a read: the
+/// URI SANs with the scheme `ostrya`, as [`Claims`](ostrya::access::Claims)
+/// reads them.
 /// The claims of the certificate of the TLS handshake are read one time for
 /// each connection. The claims of a forwarded certificate are read one time
 /// for each cache entry.
 ///
 /// - When the certificate holds one or more claims for the namespace of the
-///   session, as
+///   session or of the ref that a read names, as
 ///   [`ClientAccess::claim_rules`](ostrya::access::ClientAccess::claim_rules)
 ///   gives them, they replace the allow items and the deny items of the
 ///   group. The other values of the policy come from the group.
@@ -145,8 +152,13 @@ impl fmt::Debug for ServerTls {
 ///   such URIs, when the certificate does not decode, when it holds more
 ///   than one subjectAltName extension, and when its subjectAltName
 ///   extension does not decode. Each case has its own reason.
-/// - When the rules of the claims open no push session, the request gets
-///   403.
+/// - When the rules of the claims open no push session, the `session`
+///   request gets 403.
+/// - A read gets 403 when the claims do not parse and a group with
+///   `tls-accept-claim=true` carries the item of the certificate, also a read
+///   of an object or of `config`. The server reports a
+///   [`ServerEvent::BadClaims`](crate::ServerEvent::BadClaims) for each such
+///   read.
 ///
 /// A group with `tls-accept-claim=false`, a credential, a `net:` item, and the
 /// `anonymous` item read no claim.
@@ -241,10 +253,10 @@ pub struct ServeOptions {
     /// handshake and a forwarded certificate, or `None`.
     ///
     /// [`bind`](crate::bind) builds one verifier from the certificates, and
-    /// the handshake and each forwarded certificate use it. The server also
-    /// serves a client that presents no certificate. A client that presents
-    /// a certificate that the CA did not sign fails the handshake. The field
-    /// needs [`tls`](ServeOptions::tls) or
+    /// the handshake and each forwarded certificate use it. A client that
+    /// presents no certificate also completes the handshake. A client that
+    /// presents a certificate that the CA did not sign fails the handshake.
+    /// The field needs [`tls`](ServeOptions::tls) or
     /// [`trusted_proxy_client_cert`](ServeOptions::trusted_proxy_client_cert).
     /// The default is `None`.
     pub client_ca_pem: Option<Vec<u8>>,
@@ -300,10 +312,13 @@ pub struct ServeOptions {
     ///
     /// The default is 60 seconds. [`bind`](crate::bind) refuses zero.
     pub body_timeout: Duration,
-    /// The client groups of the receive endpoint and their policies, or
-    /// `None` for a read-only server.
+    /// The client groups of the server and their policies, or `None` for a
+    /// read-only server.
     ///
-    /// The default is `None`.
+    /// With `None`, the server has no receive endpoint and identifies no
+    /// client. Each read gets the rights of the `anonymous` item under the
+    /// two implicit groups of a config with no client group. The default is
+    /// `None`.
     /// [`ReceivePolicies::from_config`](ostrya::ReceivePolicies::from_config)
     /// builds the value from the repository config.
     /// [Authentication](ServeOptions#authentication) states how a request
@@ -314,7 +329,7 @@ pub struct ServeOptions {
     /// The switch that takes a bearer or Basic credential on a connection
     /// without TLS.
     ///
-    /// The default is `false`. If the switch is `false`, the endpoint refuses
+    /// The default is `false`. If the switch is `false`, the server refuses
     /// such a credential with 403, unless a trusted proxy states the scheme
     /// `https`. A server on a loopback address, or behind a proxy that
     /// terminates TLS and is not in
@@ -340,7 +355,7 @@ pub struct ServeOptions {
     /// [`EndpointOptions::on_report`].
     pub on_report: Option<Arc<dyn Fn(ReceiveReport) + Send + Sync>>,
     /// The callback for each [`ServerEvent`](crate::ServerEvent) of the
-    /// receive endpoint, or `None`.
+    /// server, or `None`.
     ///
     /// The server calls it in the task of the request, so the callback must
     /// return soon. A host writes the event to its log, for example the

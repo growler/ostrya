@@ -322,6 +322,15 @@ remote ref. Each entry is `(s, (t, ay, a{sv}))`:
   present only when the commit has a `version` metadata key, then
   `ostree.commit.timestamp` (`t`, big-endian), always present.
 
+Observed behavior: in a repository with `[core] collection-id=ID`,
+`ostree summary -u` of the tool 2026.1 puts each ref of `refs/mirrors/ID/`
+into field 0 under its plain name. When `refs/heads/NAME` and
+`refs/mirrors/ID/NAME` both exist, field 0 holds one entry `NAME`, with the
+checksum of the mirror ref. `ID` is not a key of
+`ostree.summary.collection-map`. The summary writer of the port puts the
+refs of `refs/heads` alone into field 0, and writes the refs of
+`refs/mirrors/ID/` under the key `ID` of `ostree.summary.collection-map`.
+
 Field 1, `a{sv}`, is the global metadata. GVariant does not sort a dict again,
 so the insertion order is the on-disk order. The writer writes the keys in
 this order, and a key is absent when its condition is false:
@@ -3234,10 +3243,11 @@ Then the client sends any mix of `Get` and `ListRefs`. Each other kind is
 
 The path of `Get` is relative to the repository root, with no leading `/`.
 The server does not percent-decode it. The server answers it as "The archive
-view" states:
+view" states, with the read rights of the client of the session ("Read
+access"):
 
-- An absent path and a refused path get a `GetReply` with `found` false. The
-  session goes on.
+- An absent path, a refused path, and a path that the client cannot read
+  get a `GetReply` with `found` false. The session goes on.
 - A path that the view serves gets a `GetReply` with `found` true, then the
   body as chunks, then a chunk of length 0. `len` is the length of the body.
   A `.filez` built on request has no `len`.
@@ -3254,9 +3264,10 @@ view" states:
 ### ListRefs
 
 The server answers a `ListRefs` with a `GetReply` with `found` true and
-`len`, and then the listing as chunks. The listing has the same bytes as the
-body of `GET /_ostrya/refs/v1` for the same entries. A reply to a `ListRefs`
-with `found` false or with no `len` is `protocol`.
+`len`, and then the listing as chunks. The listing holds the refs that the
+client of the session reads ("The ref listing"). It has the same bytes as the
+body of `GET /_ostrya/refs/v1` for the same entries and the same rights. A
+reply to a `ListRefs` with `found` false or with no `len` is `protocol`.
 
 In these cases, the server sends an `Error` in place of the reply, and the
 session ends:
@@ -3289,20 +3300,29 @@ Over HTTP, the server keeps one copy of an entry that the query repeats ("GET
 
 A ref listing is a summary GVariant `(a(s(taya{sv}))a{sv})` with no signature.
 The server builds it for each request, from the refs that the entries of the
-request select ("Ref selectors"). The format is that of "Summary --
+request select ("Ref selectors") and that the client of the request reads
+("Read access"). The format is that of "Summary --
 `(a(s(taya{sv}))a{sv})`".
 
 - The listing holds refs under `refs/heads` alone, sorted byte-wise by name,
   each one time. It holds no remote ref and no mirror ref.
+- The listing holds a selected ref when the client group of the item has `r`
+  on its name in the local namespace. The server checks the name before it
+  reads the ref file. So it reads no ref file that the client cannot read,
+  and the content of such a file fails no listing.
 - An alias is in the listing under its own name, with the commit of its
-  target.
+  target, when the client reads its name and its target. The alias resolves
+  by the rules of "The archive view": the body is relative and stays inside
+  `refs/`, and the server follows one link and no symlink on the path of the
+  target. These aliases are not in the listing: an alias that breaks one of
+  these rules, an alias of an alias, an alias to a ref under `refs/remotes/`,
+  and an alias whose target is no regular file, for example a directory.
 - An alias whose target is absent, and a ref file that a write removes during
   the walk, are not in the listing.
-- These refs fail the whole listing, and the server leaves out no ref for
-  these causes:
+- These refs fail the whole listing when the client reads them, and the
+  server leaves out no ref for these causes:
   - a ref file that is not UTF-8, or that holds no checksum;
-  - a ref whose commit is not in the object store, or does not parse;
-  - an alias that names a directory.
+  - a ref whose commit is not in the object store, or does not parse.
 - Each entry has the bytes of the entry of the same ref in a summary of the
   same repository state.
 
@@ -3338,9 +3358,11 @@ cuts it short.
 `ostrya serve` answers HTTP requests with three endpoints: the archive view,
 the ref listing at `/_ostrya/refs/v1`, and the receive endpoint of a push
 under `/_ostrya/receive/v1/`. No repository layout uses a path under
-`/_ostrya/`. With `proxy-protocol=true`, each connection starts with a PROXY
-protocol header before the TLS handshake and the first request
-("Authentication of the receive endpoint" states its rules).
+`/_ostrya/`. Each endpoint identifies the client of a request
+("Authentication of the receive endpoint"). With `proxy-protocol=true`, each
+connection starts with a PROXY protocol header before the TLS handshake and
+the first request ("Authentication of the receive endpoint" states its
+rules).
 
 ### Routing
 
@@ -3352,7 +3374,9 @@ The server routes a request by these rules, in this order:
 2. A request whose raw path is `/_ostrya/refs/v1` goes to the ref listing, for
    each method.
 3. Each other request goes to the archive view. A method other than `GET` and
-   `HEAD` gets 405 with `Allow: GET, HEAD` and `Content-Length: 0`.
+   `HEAD` gets 405 with `Allow: GET, HEAD` and `Content-Length: 0`. Then the
+   server identifies the client ("Read access"). Then a path that does not
+   decode gets 404.
 
 The first two rules compare the raw path, with no percent-decoding. A path
 under `/_ostrya/` that matches neither rule gets the rules of the archive
@@ -3386,7 +3410,8 @@ repository root in this way:
   under `refs/` and `extensions/`, and the `.commit`, `.dirtree`, `.dirmeta`,
   and `.commitmeta` objects. In an `archive` repository, it also serves the
   `.filez` objects and the files under `deltas/` and `delta-indexes/` as
-  stored.
+  stored. "Read access" states which of these files a client gets.
+  `extensions/ostrya` and each path under it are absent.
 - In each other mode, the view builds a `.filez` object on request. The
   object is the framed archive header of the logical metadata that the mode
   stores, then the payload in raw DEFLATE at `[archive] zlib-level`. An
@@ -3440,7 +3465,8 @@ Over HTTP, `ostrya serve` applies these rules:
   the rest. An escape takes hex digits in either case, and `+` stays `+`. A
   path with a bad escape, a NUL, or bytes that are not UTF-8 gets 404. A
   request path with no leading `/` gets 404.
-- The server ignores the query and `Authorization`.
+- The server ignores the query. It identifies the client with the headers of
+  the request ("Read access").
 - A path that the view serves gets 200 with its bytes. The response carries
   `Content-Length` when the view knows the length. A `.filez` built on
   request has no `Content-Length`.
@@ -3477,12 +3503,64 @@ The summary of a `bare-user-shared` repository states that mode in
 `ostree.summary.mode`. `conformance/cli-surface.md`, "P2", `serve`, records
 the pull of the tool from this summary.
 
+### Read access
+
+`ostrya serve` and `ostrya send` serve the files of the archive view and the
+ref listing to an identified client alone. `ostrya serve` identifies the
+client of each request by the steps of "Authentication of the receive
+endpoint". `ostrya send` identifies the client of a session by its name
+(same section). A request that identifies no item gets the status of its
+refusal, 401 or 403, with an empty body and `Content-Length: 0`. A 401
+carries the two `WWW-Authenticate` headers. The server sends no message of
+the refusal. The steps also apply in a repository with no client group: a
+credential over plain HTTP gets 403, and a credential that matches no item
+gets 401.
+
+A client certificate whose claims do not parse gets 403 for each read, also
+for an object and `config`, when a group with `tls-accept-claim=true`
+carries its item. For each such read, `ostrya serve` writes the error line of
+"Claims of a client certificate".
+
+The client group of the item then gives the rights (`ostrya-config(1)`,
+"Access modes and patterns"):
+
+- `refs/heads/NAME` is in the local namespace. `refs/mirrors/ID/NAME` is in
+  the namespace of the collection `ID`. When `ID` is `[core] collection-id`,
+  the path is in the local namespace: the group of the local refs gives the
+  rights of `NAME`, and a group of `collection=*` does not apply.
+- The server serves such a ref when the group of the item in its namespace
+  has `r` on `NAME`. `w`, `c`, and `t` include `r`, and `d` alone does not.
+  In a group with `tls-accept-claim=true`, the claims of the namespace
+  replace the rules of the group ("Claims of a client certificate").
+- An alias needs `r` on its name and on its target. A target in another
+  namespace takes the group of the item in that namespace.
+- `refs/remotes/`, each other path under `refs/`, and `extensions/ostrya/`
+  are not served. An id under `refs/mirrors/` that fails the collection-id
+  rule selects no group.
+- `summary` and `summary.sig` are served only when the repository has no
+  client group.
+- Objects, `deltas/`, `delta-indexes/`, `config`, and the other files under
+  `extensions/` are served to each identified client. The checksum of an
+  object is the capability.
+
+A path that the client cannot read gets the answer of an absent path: 404
+over HTTP, and a `GetReply` with `found` false over a stream. The server
+checks the rights before it opens a file, so it reads no ref that the client
+cannot read.
+
+A repository with no client group has two implicit groups
+(`ostrya-config(1)`, "No client group"). Each client then reads each local
+ref, each mirror ref, and the summary. A server of `ostrya-server` with no
+receive policies identifies no client. Each read there gets the rights of
+the `anonymous` item under the two implicit groups. `ostrya serve` always
+reads the client groups.
+
 ### GET /_ostrya/refs/v1
 
 A `GET` of `/_ostrya/refs/v1` gets a ref listing ("The ref listing"). The
-server serves it with and without a receive endpoint, and it ignores
-`Authorization`. The version of the listing is the `v1` in the path, and no
-request negotiates it.
+server serves it with and without a receive endpoint, and the listing holds
+the refs that the client of the request reads ("Read access"). The version of
+the listing is the `v1` in the path, and no request negotiates it.
 
 The query holds the entries of a ref selector ("Ref selectors"):
 
@@ -3502,17 +3580,19 @@ states the limits of the HTTP layer. The server checks a request in this
 order:
 
 1. A method other than `GET`, `HEAD` included, gets 405 with `Allow: GET`.
-2. A bad query gets 400. A query is bad when it holds one of these:
+2. The server identifies the client. A refusal gets its status ("Read
+   access").
+3. A bad query gets 400. A query is bad when it holds one of these:
    - an empty pair, a pair with no `=`, or a pair with another key;
    - a raw value larger than 12288 bytes, or a value that does not decode;
    - more than 256 pairs, or an entry over the limits of "Ref selectors";
    - an entry that is not a selector entry.
 
    The server refuses the 257th pair before it decodes it.
-3. If 4 listings are in flight over all connections, the request gets 503
+4. If 4 listings are in flight over all connections, the request gets 503
    with `Retry-After: 1`. A listing is in flight from the start of its build
    until its response body drops.
-4. Each error of the build gets 500, a listing larger than 128 MiB included.
+5. Each error of the build gets 500, a listing larger than 128 MiB included.
 
 A listing gets 200 with `Content-Length`. The body is the raw listing, with
 no frame. A 400, a 405, a 500, and a 503 have an empty body and
@@ -3652,7 +3732,9 @@ method. The endpoint authenticates a request before it reads a byte of the
 body.
 
 `ostrya serve` identifies the client of a request by the auth items of the
-client groups (`ostrya-config(1)`, "Authentication items"). The
+client groups (`ostrya-config(1)`, "Authentication items"). The steps apply
+to each request of `ostrya serve`: the requests of the receive endpoint, and
+the reads of the archive view and of the ref listing ("Read access"). The
 identification gives one auth item. The server takes the first step that
 applies:
 
@@ -3871,11 +3953,15 @@ its name: `--client NAME`, else the value of `LOGNAME`, which sshd sets from
 the password entry of the user. An empty `LOGNAME` counts as absent.
 `ostrya receive` gives the session the policy of the client group of the
 local refs that carries `ssh:NAME`. With no such group, the session opens no
-push session, and `Hello` gets `ref-denied`. An ssh session uses no
-`anonymous` item and no `net:` item. `ostrya send` does not check the name
-and does not limit the session by the name. `--client` is safe only under a
-forced `command=` in `authorized_keys`, because a user with a shell can give
-any name.
+push session, and `Hello` gets `ref-denied`. `ostrya send` serves the refs
+that the client groups of `ssh:NAME` read ("Read access"). When the
+repository has client groups and no group carries `ssh:NAME`, `ostrya send`
+writes one `error: MESSAGE` line and exits 1 before it reads its input. An
+ssh session uses no `anonymous` item and no `net:` item, with one exception:
+in a repository with no client group, an `ostrya send` session gets the
+`anonymous` item, so the implicit groups apply. `--client` is safe only
+under a forced `command=` in `authorized_keys`, because a user with a shell
+can give any name.
 
 ### Claims of a client certificate
 
@@ -3929,7 +4015,9 @@ The claims of a certificate do not parse in these cases:
 
 The server refuses such a request with 403 and `unauthorized`, when the
 selected group has `tls-accept-claim=true`. A claim of another namespace
-that does not parse also refuses the request. The message starts with
+that does not parse also refuses the request. A read gets 403 when a group
+with `tls-accept-claim=true` carries the item of the certificate ("Read
+access"). The message starts with
 `the claims of the client certificate do not parse: `. `ostrya serve` writes
 an error to standard error, which names the SHA-256 digest of the DER bytes
 of the certificate and the URI:
@@ -4041,16 +4129,21 @@ committed, `ostrya receive` writes one `warning: STEP: MESSAGE` line.
 
 `ostrya receive` and `ostrya send` need a client name ("Authentication of the
 receive endpoint"). With no name, each command writes one `error: MESSAGE`
-line and exits 1 before it opens the repository. `ostrya receive` does the
-same with a name that an `ssh:` item cannot hold. Its message shows the name
-in escaped form, so a control character in the name does not split the line.
-A refusal writes no frame.
+line and exits 1 before it opens the repository. Each command does the same
+with a name that an `ssh:` item cannot hold. The message shows the name in
+escaped form, so a control character in the name does not split the line. A
+refusal writes no frame.
 
 `ostrya receive` reads the client groups, the server group, the trust groups,
 and the key groups before it reads `Hello`. If a group does not load, it writes
 no frame and exits 1. The exit closes the
 standard output, so the client reads the end of the stream with no `Error`
 frame.
+
+`ostrya send` reads the client groups and the server group before it reads
+`PullHello`. It reads no key of a trust group or of a key group. If a group
+does not load, or if the repository has client groups and no group carries
+`ssh:NAME`, it writes one `error: MESSAGE` line and no frame, and exits 1.
 
 ## The commit of `push-tree`
 

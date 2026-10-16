@@ -111,13 +111,12 @@ pub(super) fn read(config: &RepoConfig, repo_dir: &Path) -> Result<ClientAccess>
         Some(group) => parse_server(keyfile, group, &names, repo_dir)?,
         None => ServerSettings::default(),
     };
-    let mut groups = Vec::with_capacity(clients.len().max(2));
+    let mut groups = Vec::with_capacity(clients.len());
     for (name, group) in clients {
         groups.push(parse_client(keyfile, name, group, &names, own_id)?);
     }
     if groups.is_empty() {
-        groups.push(implicit("anonymous", CollectionScope::Local));
-        groups.push(implicit("anonymous-collections", CollectionScope::AllOther));
+        groups = implicit_groups();
     }
     let by_item = index(&groups);
     check_overlap(&groups, &by_item)?;
@@ -376,6 +375,14 @@ fn key_list(
     Ok(Some(kept))
 }
 
+/// Returns the two implicit groups of a config with no client group.
+pub(super) fn implicit_groups() -> Vec<ClientGroup> {
+    vec![
+        implicit("anonymous", CollectionScope::Local),
+        implicit("anonymous-collections", CollectionScope::AllOther),
+    ]
+}
+
 /// Returns an implicit group: `auth=anonymous`, `allow=r:**`, and `scope`.
 fn implicit(name: &str, scope: CollectionScope) -> ClientGroup {
     ClientGroup {
@@ -400,7 +407,7 @@ fn implicit(name: &str, scope: CollectionScope) -> ClientGroup {
 
 /// Returns the indexes in `groups` of the groups that carry each item, in
 /// the order of the config.
-fn index(groups: &[ClientGroup]) -> HashMap<AuthItem, Vec<usize>> {
+pub(super) fn index(groups: &[ClientGroup]) -> HashMap<AuthItem, Vec<usize>> {
     let mut by_item: HashMap<AuthItem, Vec<usize>> = HashMap::new();
     for (i, group) in groups.iter().enumerate() {
         for item in &group.auth {

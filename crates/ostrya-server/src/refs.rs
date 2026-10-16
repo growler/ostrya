@@ -2,9 +2,9 @@
 //! selects.
 //!
 //! A `GET` of [`PATH`] gets the bytes of [`Repo::build_ref_listing`], built
-//! for each request. Each pair of the query is `pattern=VALUE`. The value is
-//! percent-decoded, and it is one entry of a [`RefSelector`]: a ref pattern
-//! with an optional leading `!`. An entry has at most
+//! for each request with the read rights of its client. Each pair of the
+//! query is `pattern=VALUE`. The value is percent-decoded, and it is one
+//! entry of a [`RefSelector`]: a ref pattern with an optional leading `!`. An entry has at most
 //! [`MAX_REF_ENTRY_PARTS`] parts and [`MAX_REF_ENTRY_LEN`] bytes. The server
 //! parses the entries before it takes a slot, so a bad entry gets 400 also
 //! when the slots are busy. No query is an empty list, which selects all
@@ -24,10 +24,12 @@ use futures_io::AsyncRead;
 use futures_lite::io::Cursor;
 use hyper::header::{ALLOW, HeaderValue, RETRY_AFTER};
 use hyper::{Method, Response, StatusCode};
+use ostrya::access::ReadAccess;
 use ostrya::{MAX_REF_ENTRY_LEN, MAX_REF_ENTRY_PARTS, MAX_REF_PATTERNS, RefSelector, Repo};
 
 use crate::body::ServeBody;
-use crate::router::{empty, percent_decode, with_length};
+use crate::receive_auth::Refusal;
+use crate::router::{empty, percent_decode, refused, with_length};
 use crate::stall::Stall;
 
 /// The path of the listing. No repository layout uses it.
@@ -44,24 +46,35 @@ const MAX_LISTINGS: usize = 4;
 /// Returns the response to a request of [`PATH`] with `method` and the raw
 /// `query`. The function records the body in `stall`, the deadline of its
 /// connection. `listings` is the count of listings in flight in the server.
+/// `identify` gives the read rights of the client, or the refusal of the
+/// request.
 ///
-/// A method other than `GET` gets 405 with `Allow: GET`. A bad query gets
-/// 400. If [`MAX_LISTINGS`] listings are in flight, the request gets 503 with
-/// `Retry-After: 1`. These checks come in this order, before the build. A
-/// query entry that is not a ref pattern, or that is over the limits of one
-/// entry, is a bad query. The listing is built in the request task.
+/// A method other than `GET` gets 405 with `Allow: GET`. Then `identify`
+/// runs. Then a bad query gets 400. If [`MAX_LISTINGS`] listings are in
+/// flight, the request gets 503 with `Retry-After: 1`. These checks come in
+/// this order, before the build. A query entry that is not a ref pattern, or
+/// that is over the limits of one entry, is a bad query. The listing is
+/// built in the request task, and holds the refs that the client reads.
 pub(crate) async fn handle(
     repo: &Repo,
     listings: &Arc<AtomicUsize>,
     method: &Method,
     query: Option<&str>,
     stall: &Arc<Stall>,
+    identify: impl FnOnce() -> Result<ReadAccess, Refusal>,
 ) -> Response<ServeBody> {
-    let (selector, slot) = match admit(method, query, listings) {
+    if method != Method::GET {
+        return refusal(StatusCode::METHOD_NOT_ALLOWED);
+    }
+    let access = match identify() {
+        Ok(access) => access,
+        Err(rejected) => return refused(rejected),
+    };
+    let (selector, slot) = match admit(query, listings) {
         Ok(admitted) => admitted,
         Err(status) => return refusal(status),
     };
-    match repo.build_ref_listing(&selector).await {
+    match repo.build_ref_listing(&selector, &access).await {
         Ok(bytes) => {
             let len = bytes.len() as u64;
             let reader = Box::new(Listing {
@@ -78,24 +91,19 @@ pub(crate) async fn handle(
 /// Returns the selector of the request and a slot of `listings`, or the
 /// status that refuses the request.
 ///
-/// A method other than `GET` gets 405. Then a bad query gets 400, also for
-/// an entry that is not a ref pattern. Then, if no slot is free, the request
-/// gets 503.
+/// A bad query gets 400, also for an entry that is not a ref pattern. Then,
+/// if no slot is free, the request gets 503.
 fn admit(
-    method: &Method,
     query: Option<&str>,
     listings: &Arc<AtomicUsize>,
 ) -> Result<(RefSelector, Slot), StatusCode> {
-    if method != Method::GET {
-        return Err(StatusCode::METHOD_NOT_ALLOWED);
-    }
     let selector = parse_query(query).ok_or(StatusCode::BAD_REQUEST)?;
     let slot = Slot::take(listings).ok_or(StatusCode::SERVICE_UNAVAILABLE)?;
     Ok((selector, slot))
 }
 
-/// Returns the response of a refusal of [`admit`] with `status`, with an
-/// empty body. A 405 carries `Allow: GET`, and a 503 carries
+/// Returns the response of a refusal of [`handle`] or [`admit`] with
+/// `status`, with an empty body. A 405 carries `Allow: GET`, and a 503 carries
 /// `Retry-After: 1`.
 fn refusal(status: StatusCode) -> Response<ServeBody> {
     let mut response = empty(status);
@@ -398,32 +406,22 @@ mod tests {
         assert_eq!(listings.load(Ordering::Acquire), 0);
     }
 
-    /// The method comes first, then the query, then the count. A full count
-    /// gives 503 with `Retry-After: 1` and an empty body.
+    /// The query comes first, then the count. A full count gives 503 with
+    /// `Retry-After: 1` and an empty body.
     #[test]
     fn a_full_count_gives_503() {
         let listings = Arc::new(AtomicUsize::new(MAX_LISTINGS));
-        let refused = |method: Method, query: &str| {
-            let Err(status) = admit(&method, Some(query), &listings) else {
-                panic!("{method} {query} is admitted");
+        let refused = |query: &str| {
+            let Err(status) = admit(Some(query), &listings) else {
+                panic!("{query} is admitted");
             };
             status
         };
-        assert_eq!(refused(Method::HEAD, "x"), StatusCode::METHOD_NOT_ALLOWED);
-        assert_eq!(refused(Method::GET, "x"), StatusCode::BAD_REQUEST);
+        assert_eq!(refused("x"), StatusCode::BAD_REQUEST);
         // A bad entry gets 400 also when no slot is free.
-        assert_eq!(
-            refused(Method::GET, "pattern=a%2F%2Fb"),
-            StatusCode::BAD_REQUEST
-        );
-        assert_eq!(
-            refused(Method::GET, "pattern=a%2A"),
-            StatusCode::BAD_REQUEST
-        );
-        assert_eq!(
-            refused(Method::GET, "pattern=a"),
-            StatusCode::SERVICE_UNAVAILABLE
-        );
+        assert_eq!(refused("pattern=a%2F%2Fb"), StatusCode::BAD_REQUEST);
+        assert_eq!(refused("pattern=a%2A"), StatusCode::BAD_REQUEST);
+        assert_eq!(refused("pattern=a"), StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(listings.load(Ordering::Acquire), MAX_LISTINGS);
 
         let response = refusal(StatusCode::SERVICE_UNAVAILABLE);
@@ -441,7 +439,7 @@ mod tests {
         );
 
         listings.store(MAX_LISTINGS - 1, Ordering::Release);
-        let Ok((selector, slot)) = admit(&Method::GET, Some("pattern=a"), &listings) else {
+        let Ok((selector, slot)) = admit(Some("pattern=a"), &listings) else {
             panic!("a free slot is refused");
         };
         assert_eq!(selector, parsed(&["a"]));

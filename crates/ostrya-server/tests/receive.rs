@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use futures_lite::{AsyncReadExt, AsyncWriteExt, future};
-use ostrya::access::{ForwardedHeader, IpNet};
+use ostrya::access::{AuthItem, ClientAccess, ForwardedHeader, IpNet, ReadAccess};
 use ostrya::fetch::{
     BasicAuth, BearerToken, ClientIdentity, Fetcher, FetcherOptions, Protocol, Proxy, TlsOptions,
     TrustRoots, UploadBody, UploadMethod, UploadRequest,
@@ -481,6 +481,13 @@ where
     });
 }
 
+/// The read rights of an anonymous client under the client groups of the
+/// config that `repo` read.
+fn anyone(repo: &Repo) -> ReadAccess {
+    let access = ClientAccess::from_config(repo.config(), repo.path()).unwrap();
+    ReadAccess::new(Arc::new(access), AuthItem::Anonymous, None)
+}
+
 /// A client group that lets each request with no credential write a commit
 /// to each ref as a fast-forward.
 const ANONYMOUS_PUSH: &str = "[ex-ostrya client \"push\"]\nauth=anonymous\nallow=w:**\n";
@@ -718,7 +725,7 @@ fn the_ref_listing_is_served_beside_the_endpoint() {
         assert!(out.starts_with(b"HTTP/1.1 200 "));
         assert_eq!(
             out[end..],
-            repo.build_ref_listing(&RefSelector::parse([]).unwrap())
+            repo.build_ref_listing(&RefSelector::parse([]).unwrap(), &anyone(&repo))
                 .await
                 .unwrap()
         );
@@ -1727,29 +1734,50 @@ fn more_than_one_authorization_header_is_401() {
     });
 }
 
-/// A `GET` and a `HEAD` of the archive view ignore `Authorization`. A read
-/// with Basic over plain HTTP succeeds on a server whose receive endpoint
-/// takes no credential over plain HTTP.
+/// A `GET` and a `HEAD` of the archive view take the steps of the
+/// identification. Basic over plain HTTP gets 403, and two `Authorization`
+/// headers get 401 with the two challenges. Each refusal has an empty body.
+/// A request with no credential gets the `anonymous` item. With
+/// `allow_cleartext_credentials`, Basic over plain HTTP gets its item.
 #[test]
-fn a_read_ignores_authorization() {
+fn a_read_takes_the_steps_of_the_identification() {
     let tmp = TmpDir::new("read");
     let repo = receiver(tmp.path(), RepoMode::Archive, "");
-    let opts = options_with(&repo, &format!("{}{ANONYMOUS_PUSH}", credential_groups()));
-    with_server(repo, opts, |_, addr| async move {
-        let basic = ostrya::base64::encode(format!("alice:{ALICE}").as_bytes());
-        for method in ["GET", "HEAD"] {
-            for auth in [
-                format!("authorization: Basic {basic}\r\n"),
-                format!("authorization: Basic {basic}\r\nauthorization: Bearer x\r\n"),
-            ] {
-                let request = format!(
-                    "{method} /config HTTP/1.1\r\nhost: x\r\n{auth}connection: close\r\n\r\n"
-                );
-                let response = raw(addr, &request).await;
+    let groups = format!("{}{ANONYMOUS_PUSH}", credential_groups());
+    for cleartext in [false, true] {
+        let mut opts = options_with(&repo, &groups);
+        opts.allow_cleartext_credentials = cleartext;
+        with_server(repo.clone(), opts, |_, addr| async move {
+            let basic = ostrya::base64::encode(format!("alice:{ALICE}").as_bytes());
+            let single = format!("authorization: Basic {basic}\r\n");
+            let double = format!("{single}authorization: Bearer x\r\n");
+            for method in ["GET", "HEAD"] {
+                let request = |auth: &str| {
+                    format!(
+                        "{method} /config HTTP/1.1\r\nhost: x\r\n{auth}connection: close\r\n\r\n"
+                    )
+                };
+                let response = raw(addr, &request("")).await;
                 assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
+                let response = raw(addr, &request(&single)).await;
+                if cleartext {
+                    assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
+                } else {
+                    assert!(response.starts_with("HTTP/1.1 403 "), "{response}");
+                    assert_eq!(header(&response, "content-length"), Some("0"));
+                    assert!(response.ends_with("\r\n\r\n"), "{response}");
+                }
+                let response = raw(addr, &request(&double)).await;
+                assert!(response.starts_with("HTTP/1.1 401 "), "{response}");
+                assert_eq!(header(&response, "content-length"), Some("0"));
+                for challenge in ["Bearer realm=\"ostrya\"", "Basic realm=\"ostrya\""] {
+                    let line = format!("www-authenticate: {challenge}\r\n");
+                    assert!(response.contains(&line), "{response}");
+                }
+                assert!(response.ends_with("\r\n\r\n"), "{response}");
             }
-        }
-    });
+        });
+    }
 }
 
 /// With a client CA that did not sign the client certificate, the TLS

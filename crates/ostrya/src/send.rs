@@ -7,6 +7,7 @@ use futures_io::{AsyncRead, AsyncWrite};
 use futures_lite::io::{AsyncReadExt, BufReader, BufWriter};
 use ostrya_core::RefSelector;
 
+use crate::access::ReadAccess;
 use crate::archive::{ArchiveAnswer, ArchiveView};
 use crate::error::{Error, Result};
 use crate::remote;
@@ -87,7 +88,8 @@ fn complete_frame(buf: &[u8]) -> bool {
 
 /// Methods that serve a pull session.
 impl Repo {
-    /// Serves one pull session over the streams `input` and `output`.
+    /// Serves one pull session over the streams `input` and `output`, with
+    /// the read rights `access`.
     ///
     /// The session reads a `PullHello` message and then `Get` and `ListRefs`
     /// messages of a client from `input`. It writes the replies and the bodies
@@ -97,9 +99,10 @@ impl Repo {
     /// # Requests
     ///
     /// The session answers each `Get` through one [`ArchiveView`] of this
-    /// repository. All requests of the session share the parsed `config` and
-    /// the idle compressors of the view. The session reads one `Get`, answers
-    /// it to the end of its body, and then reads the next request.
+    /// repository, with `access`. All requests of the session share the
+    /// parsed `config` and the idle compressors of the view. The session reads
+    /// one `Get`, answers it to the end of its body, and then reads the next
+    /// request.
     ///
     /// - If the view does not find the path, or refuses it, the reply is a
     ///   `GetReply` with `found` set to `false`. The session continues.
@@ -108,7 +111,8 @@ impl Repo {
     ///   body follows as chunks.
     ///
     /// The session answers each `ListRefs` with the listing that
-    /// [`build_ref_listing`](Repo::build_ref_listing) builds for its entries.
+    /// [`build_ref_listing`](Repo::build_ref_listing) builds for its entries
+    /// and `access`.
     /// The entries are ref patterns with an optional leading `!`, which
     /// [`RefSelector::parse`] reads. A `ListRefs` holds at most
     /// [`MAX_REF_PATTERNS`] entries, and each entry holds at most
@@ -117,6 +121,12 @@ impl Repo {
     /// the listing. The listing follows as chunks.
     ///
     /// # Access
+    ///
+    /// `access` gives the refs that the session serves. A ref that `access`
+    /// does not read, a path under `refs/` that names no ref, and `summary`
+    /// and `summary.sig` in a config with client groups get a `GetReply`
+    /// with `found` set to `false`, as an absent path does. The listing of
+    /// `ListRefs` holds the refs that `access` reads.
     ///
     /// The session opens no transaction and takes no lock. For an `archive`,
     /// `bare-user`, `bare-user-only`, or `bare-user-shared` repository, read
@@ -197,12 +207,13 @@ impl Repo {
     ///   kind is `UnexpectedEof`. For a stored file that holds more, the kind
     ///   is `InvalidData`.
     /// - [`Error::Io`] if a write of a reply or of a body to `output` fails.
-    pub async fn send<R, W>(&self, input: R, output: W) -> Result<()>
+    pub async fn send<R, W>(&self, input: R, output: W, access: &ReadAccess) -> Result<()>
     where
         R: AsyncRead + Unpin + Send,
         W: AsyncWrite + Unpin + Send,
     {
-        self.send_capped(input, output, MAX_REF_LISTING).await
+        self.send_capped(input, output, access, MAX_REF_LISTING)
+            .await
     }
 
     /// Serves the session of [`send`](Repo::send) with a cap of `listing_cap`
@@ -211,6 +222,7 @@ impl Repo {
         &self,
         input: R,
         output: W,
+        access: &ReadAccess,
         listing_cap: u64,
     ) -> Result<()>
     where
@@ -219,6 +231,7 @@ impl Repo {
     {
         let mut session = Session {
             repo: self.clone(),
+            access: access.clone(),
             listing_cap,
             view: ArchiveView::new(self.clone()),
             reader: FrameReader::new(BufReader::with_capacity(STREAM_BUFFER, input)),
@@ -251,6 +264,8 @@ impl Repo {
 
 struct Session<R, W> {
     repo: Repo,
+    /// The read rights of the client.
+    access: ReadAccess,
     /// The size cap of each ref listing.
     listing_cap: u64,
     view: ArchiveView,
@@ -327,7 +342,11 @@ where
     /// The method drops the body before the next `Get`, so a built `.filez`
     /// gives its compressor back to the view first.
     async fn get(&mut self, path: &str) -> std::result::Result<(), Failure> {
-        let answer = self.view.get(path).await.map_err(Failure::Internal)?;
+        let answer = self
+            .view
+            .get(path, &self.access)
+            .await
+            .map_err(Failure::Internal)?;
         let found = |len| Message::GetReply(GetReply { found: true, len });
         match answer {
             ArchiveAnswer::Bytes(bytes) => {
@@ -373,7 +392,7 @@ where
             .map_err(|e| protocol(format!("ListRefs: {e}")))?;
         let listing = self
             .repo
-            .build_ref_listing_capped(&selector, self.listing_cap)
+            .build_ref_listing_capped(&selector, &self.access, self.listing_cap)
             .await
             .map_err(|e| match e {
                 Error::Remote(e @ remote::Error::LimitExceeded(_)) => Failure::Wire(e),
@@ -486,8 +505,9 @@ async fn abandon<W: AsyncWrite + Unpin>(
 /// The future can run on a thread pool.
 const _: fn() = || {
     fn assert_send<T: Send>(_: T) {}
-    let _ =
-        |repo: &Repo| assert_send(repo.send(futures_lite::io::empty(), futures_lite::io::sink()));
+    let _ = |repo: &Repo, access: &ReadAccess| {
+        assert_send(repo.send(futures_lite::io::empty(), futures_lite::io::sink(), access))
+    };
 };
 
 #[cfg(test)]
@@ -711,8 +731,16 @@ mod tests {
             let repo = Repo::create(&dir, crate::CreateOptions::new(crate::RepoMode::BareUser))
                 .await
                 .unwrap();
+            let config =
+                crate::RepoConfig::parse("[core]\nrepo_version=1\nmode=bare-user\n").unwrap();
+            let access = crate::access::ClientAccess::from_config(&config, &dir).unwrap();
+            let access = ReadAccess::new(
+                std::sync::Arc::new(access),
+                crate::access::AuthItem::Anonymous,
+                None,
+            );
             let listing = repo
-                .build_ref_listing(&crate::RefSelector::parse([]).unwrap())
+                .build_ref_listing(&crate::RefSelector::parse([]).unwrap(), &access)
                 .await
                 .unwrap();
             let mut input = FrameWriter::new(Vec::new());
@@ -729,7 +757,7 @@ mod tests {
 
             let mut out = Vec::new();
             let result = repo
-                .send_capped(&input[..], &mut out, listing.len() as u64 - 1)
+                .send_capped(&input[..], &mut out, &access, listing.len() as u64 - 1)
                 .await;
             assert!(
                 matches!(result, Err(Error::Remote(remote::Error::LimitExceeded(_)))),
@@ -747,7 +775,7 @@ mod tests {
             assert_eq!(reader.read_message().await.unwrap(), None);
 
             let mut out = Vec::new();
-            repo.send_capped(&input[..], &mut out, listing.len() as u64)
+            repo.send_capped(&input[..], &mut out, &access, listing.len() as u64)
                 .await
                 .unwrap();
             let mut reader = FrameReader::new(&out[..]);

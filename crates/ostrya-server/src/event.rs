@@ -20,8 +20,10 @@ pub enum ServerEvent {
     /// The server refused a request because the claims of its client
     /// certificate do not parse.
     ///
-    /// The selected client group of the request has `tls-accept-claim=true`.
-    /// The request got 403.
+    /// For a `session` request, the selected client group has
+    /// `tls-accept-claim=true`. For a read, a group with
+    /// `tls-accept-claim=true` carries the item of the certificate. The
+    /// request got 403.
     #[non_exhaustive]
     BadClaims {
         /// The SHA-256 digest of the DER bytes of the certificate, as a

@@ -21,6 +21,8 @@ use ostrya_core::{Checksum, RefPattern, RefSelector, RepoMode};
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use rustix::io::Errno;
 
+use crate::access::{Namespace, ReadAccess};
+use crate::archive::{Walked, resolve_alias, walk};
 use crate::error::{Error, Result};
 use crate::perm;
 use crate::repo::Repo;
@@ -491,8 +493,16 @@ impl Repo {
     /// walk enumerates a name that the ref-name rule refuses, and a wildcard
     /// selects it.
     ///
-    /// The call follows each alias. An alias whose target names no ref is not
-    /// in the result.
+    /// The result holds a ref only when `access` reads its name. The call
+    /// checks the name before it reads the ref file, so a ref file that
+    /// `access` does not read is never read. When `access` reads no local
+    /// ref, the call reads no entry of `refs/heads`. The call opens a ref
+    /// file and a directory with no symlink followed. An alias resolves by the rule of the
+    /// archive view: its body is relative, it names a regular file under
+    /// `refs/` by one link, and `access` reads the target path. The call
+    /// opens the target with no symlink followed. An alias that breaks one
+    /// of these rules, and an alias whose target names no regular file, are
+    /// not in the result.
     ///
     /// # Errors
     ///
@@ -500,10 +510,12 @@ impl Repo {
     pub(crate) async fn list_refs_selected(
         &self,
         selector: &RefSelector,
+        access: &ReadAccess,
     ) -> Result<Vec<(String, Checksum)>> {
         let repo = self.clone();
         let selector = selector.clone();
-        ostrya_rt::unblock(move || collect_heads_selected(&repo, &selector)).await
+        let access = access.clone();
+        ostrya_rt::unblock(move || collect_heads_selected(&repo, &selector, &access)).await
     }
 
     /// Returns the remote refs as `(refspec, commit)` pairs, sorted by refspec.
@@ -956,22 +968,34 @@ fn collect_heads(repo: &Repo) -> Result<Vec<(String, Checksum)>> {
     Ok(out)
 }
 
-/// Collects each ref under `refs/heads` that `selector` selects, sorted by
-/// name, each one time. A ref that no entry selects is not read, and a
-/// directory that a negative pattern covers is not read.
-fn collect_heads_selected(repo: &Repo, selector: &RefSelector) -> Result<Vec<(String, Checksum)>> {
+/// Collects each ref under `refs/heads` that `selector` selects and
+/// `access` reads, sorted by name, each one time. A ref that no entry
+/// selects or that `access` does not read is not read, and a directory that
+/// a negative pattern covers is not read. When `access` reads no local ref,
+/// the call does not open `refs/heads`.
+fn collect_heads_selected(
+    repo: &Repo,
+    selector: &RefSelector,
+    access: &ReadAccess,
+) -> Result<Vec<(String, Checksum)>> {
+    if !access.reads_local_refs() {
+        return Ok(Vec::new());
+    }
     let Some(heads) = open_refs_dir(repo, "refs/heads")? else {
         return Ok(Vec::new());
     };
     let mut out: BTreeMap<String, Checksum> = BTreeMap::new();
-    // Reads the ref of `entry` unless it is in `out` already or a negative
-    // pattern matches it. The positive match is the duty of the walk.
+    // Reads the ref of `entry` unless it is in `out` already, a negative
+    // pattern matches it, or `access` does not read it. The positive match
+    // is the duty of the walk.
     let mut take = |entry: RefEntry<'_>| -> Result<()> {
-        if out.contains_key(entry.path) || selector.negative().iter().any(|p| p.matches(entry.path))
+        if out.contains_key(entry.path)
+            || selector.negative().iter().any(|p| p.matches(entry.path))
+            || !access.can_read(&Namespace::Local, entry.path)
         {
             return Ok(());
         }
-        if let Some(bytes) = read_ref_file(entry.dir, entry.name)? {
+        if let Some(bytes) = read_listed_ref(repo, &entry, access)? {
             out.insert(entry.path.to_owned(), parse_ref_content(&bytes)?);
         }
         Ok(())
@@ -991,6 +1015,77 @@ fn collect_heads_selected(repo: &Repo, selector: &RefSelector) -> Result<Vec<(St
         }
     }
     Ok(out.into_iter().collect())
+}
+
+/// Reads the ref of the entry `entry` of a walk of `refs/heads` for the
+/// listing of `access`, or returns `None`.
+///
+/// An alias goes to [`read_alias_ref`]. The call opens each other entry
+/// with no symlink followed. An entry that is an alias at the open goes to
+/// `read_alias_ref`, as the classification of the walk sends an alias. An
+/// entry removed after the walk read its type gives `None`.
+fn read_listed_ref(
+    repo: &Repo,
+    entry: &RefEntry<'_>,
+    access: &ReadAccess,
+) -> Result<Option<Vec<u8>>> {
+    if entry.file_type == FileType::Symlink {
+        return read_alias_ref(repo, entry, access);
+    }
+    let fd = match rustix::fs::openat(
+        entry.dir,
+        entry.name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(Errno::NOENT) => return Ok(None),
+        Err(Errno::LOOP) => return read_alias_ref(repo, entry, access),
+        Err(e) => return Err(Error::Io(e.into())),
+    };
+    let mut buf = Vec::with_capacity(REF_READ_CAP as usize);
+    std::fs::File::from(fd)
+        .take(REF_READ_CAP)
+        .read_to_end(&mut buf)?;
+    Ok(Some(buf))
+}
+
+/// Reads the ref that the alias `entry` of a walk of `refs/heads` names, or
+/// returns `None`.
+///
+/// The body of the alias resolves by the rule of the archive view. The
+/// result is `None` when the body breaks that rule, when `access` does not
+/// read the target path, and when the target is no regular file. The read
+/// of the target follows no symlink.
+fn read_alias_ref(
+    repo: &Repo,
+    entry: &RefEntry<'_>,
+    access: &ReadAccess,
+) -> Result<Option<Vec<u8>>> {
+    let body = match rustix::fs::readlinkat(entry.dir, entry.name, Vec::new()) {
+        Ok(body) => body,
+        // The entry was removed after the walk read its type.
+        Err(Errno::NOENT) => return Ok(None),
+        Err(e) => return Err(Error::Io(e.into())),
+    };
+    let link_dir = match entry.path.rsplit_once('/') {
+        Some((dir, _)) => format!("refs/heads/{dir}"),
+        None => "refs/heads".to_owned(),
+    };
+    let Some(target) = resolve_alias(&link_dir, body.as_bytes()) else {
+        return Ok(None);
+    };
+    if !access.can_read_path(&target) {
+        return Ok(None);
+    }
+    match walk(repo.repo_fd(), &target, false)? {
+        Walked::File(file, _) => {
+            let mut buf = Vec::with_capacity(REF_READ_CAP as usize);
+            file.take(REF_READ_CAP).read_to_end(&mut buf)?;
+            Ok(Some(buf))
+        }
+        Walked::NotFound | Walked::Refused | Walked::Alias(_) => Ok(None),
+    }
 }
 
 /// Reads the ref entry `entry` of a walk of `refs/heads` and adds it to
@@ -1118,6 +1213,11 @@ pub(crate) struct RefEntry<'a> {
 /// `EISDIR`, and a caller that reads it as an alias reads the link. The walk
 /// skips a name that is not UTF-8, and a name removed between the directory
 /// read and the classification.
+///
+/// The walk opens a subdirectory with no symlink followed. When the entry is
+/// no directory at the open, the walk reads its type again and reports it
+/// with that type. When the entry is removed, or is a directory again, the
+/// walk skips it.
 pub(crate) fn walk_ref_dir(
     dir: BorrowedFd<'_>,
     prefix: &str,
@@ -1137,7 +1237,7 @@ fn walk_ref_dir_skipping(
     for name in read_dir_names(dir)? {
         // A name removed between the directory read and the classification
         // has no type.
-        let Some(file_type) = ref_entry_type(dir, &name)? else {
+        let Some(mut file_type) = ref_entry_type(dir, &name)? else {
             continue;
         };
         let path = if prefix.is_empty() {
@@ -1149,16 +1249,23 @@ fn walk_ref_dir_skipping(
             if skip(&path) {
                 continue;
             }
-            let sub = open_ref_subdir(dir, &name)?;
-            walk_ref_dir_skipping(sub.as_fd(), &path, skip, visit)?;
-        } else {
-            visit(RefEntry {
-                dir,
-                name: &name,
-                path: &path,
-                file_type,
-            })?;
+            if let Some(sub) = open_ref_subdir(dir, &name)? {
+                walk_ref_dir_skipping(sub.as_fd(), &path, skip, visit)?;
+                continue;
+            }
+            // The entry changed after its classification. It takes the type
+            // that it has now.
+            match ref_entry_type(dir, &name)? {
+                Some(now) if now != FileType::Directory => file_type = now,
+                _ => continue,
+            }
         }
+        visit(RefEntry {
+            dir,
+            name: &name,
+            path: &path,
+            file_type,
+        })?;
     }
     Ok(())
 }
@@ -1170,8 +1277,9 @@ fn walk_ref_dir_skipping(
 /// and no other entry. The call does not read a subdirectory when `skip`
 /// returns `true` for its path.
 ///
-/// The call classifies each entry with `SYMLINK_NOFOLLOW`, as `walk_ref_dir`
-/// does, so it descends only into a real directory. It reads no ref file
+/// The call classifies each entry with `SYMLINK_NOFOLLOW`, and opens a
+/// subdirectory with no symlink followed, as `walk_ref_dir` does, so it
+/// descends only into a real directory. It reads no ref file
 /// outside the literal leading parts of the pattern and the matches. A
 /// leading wildcard lists the directories at its level. For the first of
 /// `parts`:
@@ -1222,8 +1330,11 @@ fn walk_ref_pattern(
         };
         match (file_type == FileType::Directory, rest.is_empty()) {
             (true, false) if !skip(&path) => {
-                let sub = open_ref_subdir(dir, &name)?;
-                walk_ref_pattern(sub.as_fd(), &path, rest, pattern, skip, visit)?;
+                // An entry that is no directory at the open matches no
+                // pattern with more parts.
+                if let Some(sub) = open_ref_subdir(dir, &name)? {
+                    walk_ref_pattern(sub.as_fd(), &path, rest, pattern, skip, visit)?;
+                }
             }
             (false, true) => visit(RefEntry {
                 dir,
@@ -1323,15 +1434,20 @@ fn ref_entry_type(dir: BorrowedFd<'_>, name: &str) -> Result<Option<FileType>> {
     }
 }
 
-/// Opens the subdirectory `name` of `dir` in a ref-tree walk.
-fn open_ref_subdir(dir: BorrowedFd<'_>, name: &str) -> Result<OwnedFd> {
-    rustix::fs::openat(
+/// Opens the subdirectory `name` of `dir` in a ref-tree walk, with no
+/// symlink followed. Returns `None` if the entry is removed or is no
+/// directory, a symlink included.
+fn open_ref_subdir(dir: BorrowedFd<'_>, name: &str) -> Result<Option<OwnedFd>> {
+    match rustix::fs::openat(
         dir,
         name,
-        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC,
+        OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
         Mode::empty(),
-    )
-    .map_err(|e| Error::Io(e.into()))
+    ) {
+        Ok(fd) => Ok(Some(fd)),
+        Err(Errno::NOENT | Errno::NOTDIR | Errno::LOOP) => Ok(None),
+        Err(e) => Err(Error::Io(e.into())),
+    }
 }
 
 /// Returns the symlink target of an alias entry, as stored. Returns `None`
@@ -2231,6 +2347,73 @@ mod tests {
         fn drop(&mut self) {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
+    }
+
+    /// A ref-tree walk opens a subdirectory with no symlink followed: a
+    /// symlink to a directory, a regular file, and an absent entry give no
+    /// directory.
+    #[test]
+    fn a_ref_subdirectory_opens_with_no_symlink_followed() {
+        let root = Root::new("subdir-nofollow");
+        let heads = root.dir.join("refs/heads");
+        std::fs::create_dir(heads.join("real")).unwrap();
+        std::os::unix::fs::symlink("real", heads.join("link")).unwrap();
+        std::fs::write(heads.join("file"), b"").unwrap();
+        let dir = std::fs::File::open(&heads).unwrap();
+        assert!(open_ref_subdir(dir.as_fd(), "real").unwrap().is_some());
+        for name in ["link", "file", "absent"] {
+            let sub = open_ref_subdir(dir.as_fd(), name).unwrap();
+            assert!(sub.is_none(), "{name}");
+        }
+    }
+
+    /// The listing opens an entry that the walk found as a ref file with no
+    /// symlink followed. An entry that is an alias at the open takes the
+    /// alias rule, so an alias to a ref that the client does not read gives
+    /// no ref. The same entry gives the ref of its target to a client that
+    /// reads the target.
+    #[test]
+    fn a_listed_ref_file_that_is_an_alias_at_the_open_takes_the_alias_rule() {
+        let root = Root::new("listed-alias");
+        ostrya_rt::block_on(async {
+            let repo = Repo::create(
+                &root.dir.join("repo"),
+                crate::CreateOptions::new(RepoMode::Archive),
+            )
+            .await
+            .unwrap();
+            let commit = Checksum::from_bytes([7; 32]);
+            let heads = root.dir.join("repo/refs/heads");
+            std::fs::write(heads.join("secret"), format!("{}\n", commit.to_hex())).unwrap();
+            std::fs::create_dir(heads.join("pub")).unwrap();
+            std::os::unix::fs::symlink("../secret", heads.join("pub/a")).unwrap();
+            let dir = std::fs::File::open(heads.join("pub")).unwrap();
+            let entry = RefEntry {
+                dir: dir.as_fd(),
+                name: "a",
+                path: "pub/a",
+                file_type: FileType::RegularFile,
+            };
+            let reader = |allow: &str| {
+                let text = format!(
+                    "[core]\nrepo_version=1\nmode=archive-z2\n\
+                     [ex-ostrya client \"c\"]\nauth=anonymous\nallow={allow}\n"
+                );
+                let config = crate::RepoConfig::parse(&text).unwrap();
+                let access = crate::access::ClientAccess::from_config(&config, &root.dir).unwrap();
+                ReadAccess::new(
+                    std::sync::Arc::new(access),
+                    crate::access::AuthItem::Anonymous,
+                    None,
+                )
+            };
+            let hidden = read_listed_ref(&repo, &entry, &reader("r:pub/**")).unwrap();
+            assert_eq!(hidden, None);
+            let read = read_listed_ref(&repo, &entry, &reader("r:**"))
+                .unwrap()
+                .unwrap();
+            assert_eq!(parse_ref_content(&read).unwrap(), commit);
+        });
     }
 
     #[test]

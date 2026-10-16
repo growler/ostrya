@@ -40,7 +40,8 @@ API documentation: <https://docs.rs/ostrya>
   of byte streams.
 - Push and receive: `remote`, the wire protocol of `ostrya-remote`, and `receive`.
 - Client access: `access`, the client groups and the server settings of the
-  config, and the claims of a client certificate.
+  config, the claims of a client certificate, and the read rights of a
+  client.
 - Remote resolution: `endpoint`, which reads the keys and files of a remote for a
   pull or a push.
 - Signing: `sign`, `gpg`, and `spki`.

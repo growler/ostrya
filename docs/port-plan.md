@@ -208,11 +208,19 @@ bounded:
   regular dependency in every build, re-exported as `ostrya::remote`, and
   `ostrya::Error::Remote` carries its error type. `Repo::send` serves one pull
   session over a pair of streams through `ArchiveView`, with no feature.
+  `ostrya::access::ReadAccess` holds the read rights of one identified
+  client. `ArchiveView`, the ref listing, and `Repo::send` take it, so each
+  serves the refs that the client group of the item reads
+  (`format-reference.md`, "Read access").
 - `ostrya-server` -- the HTTP server of `ostrya serve`, on Linux alone. It
   serves `ArchiveView` of `ostrya`, the archive view of a repository of any
   mode, over HTTP/1.1, and over TLS with ALPN for HTTP/2 and HTTP/1.1. With
-  the client groups of the repository (`ReceivePolicies`) it also runs the
-  receive endpoint of a push: it holds the
+  the client groups of the repository (`ReceivePolicies`) it identifies the
+  client of each request, a read included, and serves the archive view and
+  the ref listing with the `ReadAccess` of the item. With no receive
+  policies, it identifies no client, and each read gets the rights of
+  `anonymous` under the implicit groups. With the client groups it also runs
+  the receive endpoint of a push: it holds the
   session table, and each request is one step of the `ReceiveService` of
   its session (the rustdoc of `ostrya_server::ReceiveEndpoint`). The
   endpoint opens each session with `ReceiveService::hello_with_hooks`, with
@@ -7397,7 +7405,8 @@ a bearer token, a Basic credential, or a client certificate, and with
 the HTTP keys of a remote (`docs/conformance/cli-surface.md`, "push").
 
 The serving side of the pull over ssh is done. `Repo::send` serves one pull
-session over a pair of streams through one `ArchiveView`, and takes no lock.
+session over a pair of streams through one `ArchiveView`, with the read
+rights of the client, and takes no lock.
 `ostrya send` serves the session over standard input and standard output
 (the rustdoc of `Repo::send`, and `docs/conformance/cli-surface.md`,
 "send").

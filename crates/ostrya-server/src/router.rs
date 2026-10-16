@@ -1,5 +1,5 @@
-//! The HTTP mapping of the archive view, and the routing to the receive
-//! endpoint and to the ref listing.
+//! The HTTP mapping of the archive view, the identification of the client of
+//! a read, and the routing to the receive endpoint and to the ref listing.
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicUsize;
@@ -7,13 +7,57 @@ use std::sync::atomic::AtomicUsize;
 use hyper::body::{Bytes, Incoming};
 use hyper::header::{ALLOW, CONTENT_LENGTH, HeaderValue};
 use hyper::{Method, Request, Response, StatusCode};
+use ostrya::access::ReadAccess;
 use ostrya::{ArchiveAnswer, ArchiveHead, ArchiveView, Repo};
 
-use crate::auth::GroupAuth;
+use crate::auth::{GroupAuth, peer_of};
 use crate::body::{ReceiveBody, ServeBody};
 use crate::endpoint::ReceiveEndpoint;
+use crate::receive_auth::Refusal;
 use crate::stall::Stall;
 use crate::{receive, refs};
+
+/// How a server identifies the client of a request.
+pub(crate) enum Clients {
+    /// The client groups of the repository identify the client of each
+    /// request. The receive endpoint serves the pushes of the groups.
+    Groups(Arc<ReceiveEndpoint<GroupAuth>>),
+    /// The server identifies no client and has no receive endpoint. Each
+    /// read has these rights.
+    Anonymous(ReadAccess),
+}
+
+impl Clients {
+    /// Returns the receive endpoint, or `None`.
+    pub(crate) fn endpoint(&self) -> Option<&Arc<ReceiveEndpoint<GroupAuth>>> {
+        match self {
+            Clients::Groups(endpoint) => Some(endpoint),
+            Clients::Anonymous(_) => None,
+        }
+    }
+
+    /// Returns the read rights of the client of `req`, or the refusal of the
+    /// request.
+    pub(crate) fn read_access<B>(&self, req: &Request<B>) -> Result<ReadAccess, Refusal> {
+        match self {
+            Clients::Groups(endpoint) => endpoint
+                .auth()
+                .identify_read(req.headers(), &peer_of(req.extensions())),
+            Clients::Anonymous(access) => Ok(access.clone()),
+        }
+    }
+}
+
+/// Returns the response to a refused identification: the status and the
+/// headers of `refusal`, and an empty body. The server does not send the
+/// message of the refusal.
+pub(crate) fn refused(refusal: Refusal) -> Response<ServeBody> {
+    let mut response = empty(refusal.status);
+    for (name, value) in refusal.headers {
+        response.headers_mut().append(name, value);
+    }
+    response
+}
 
 /// Returns the response to one request. The function records a stream body
 /// in `stall`, the deadline of its connection. `listings` is the count of
@@ -24,22 +68,36 @@ use crate::{receive, refs};
 /// `HEAD` there goes to the view, which finds nothing. A request of the raw
 /// path [`refs::PATH`] goes to the ref listing of `repo`, with each method.
 /// Each other request goes to the view.
+///
+/// A request to the view gets 405 for a method other than `GET` and `HEAD`.
+/// Then `clients` identifies the client, and a refusal gets its response.
+/// Then a path that does not decode gets 404. The view answers with the read
+/// rights of the client.
 pub(crate) async fn handle(
     view: &ArchiveView,
     repo: &Repo,
     listings: &Arc<AtomicUsize>,
-    receive: Option<&ReceiveEndpoint<GroupAuth>>,
+    clients: &Clients,
     stall: &Arc<Stall>,
     req: Request<Incoming>,
 ) -> Response<ServeBody> {
-    if let Some(receive) = receive {
+    if let Some(receive) = clients.endpoint() {
         let read = matches!(*req.method(), Method::GET | Method::HEAD);
         if !read && req.uri().path().starts_with(receive::PREFIX) {
             return receive.handle(req).await.map(ReceiveBody::into_serve);
         }
     }
     if req.uri().path() == refs::PATH {
-        return refs::handle(repo, listings, req.method(), req.uri().query(), stall).await;
+        let identify = || clients.read_access(&req);
+        return refs::handle(
+            repo,
+            listings,
+            req.method(),
+            req.uri().query(),
+            stall,
+            identify,
+        )
+        .await;
     }
     let head = match *req.method() {
         Method::GET => false,
@@ -52,13 +110,17 @@ pub(crate) async fn handle(
             return response;
         }
     };
+    let access = match clients.read_access(&req) {
+        Ok(access) => access,
+        Err(refusal) => return refused(refusal),
+    };
     let Some(path) = decode_path(req.uri().path()) else {
         return empty(StatusCode::NOT_FOUND);
     };
     if head {
-        respond_head(view.head(&path).await)
+        respond_head(view.head(&path, &access).await)
     } else {
-        respond(view.get(&path).await, stall)
+        respond(view.get(&path, &access).await, stall)
     }
 }
 

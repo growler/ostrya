@@ -15,6 +15,7 @@ use hyper::body::Incoming;
 use hyper::header::HeaderName;
 use hyper::server::conn::{http1, http2};
 use hyper::service::service_fn;
+use ostrya::access::{AuthItem, ClientAccess, ReadAccess};
 use ostrya::{ArchiveView, Repo};
 use ostrya_fetch::{FuturesIo, RtExecutor, RtTimer};
 use ostrya_rt as rt;
@@ -26,7 +27,7 @@ use crate::error::{Error, Result};
 use crate::forwarded::Forwarding;
 use crate::options::ServeOptions;
 use crate::proxy_protocol::{self, Rewind};
-use crate::router;
+use crate::router::{self, Clients};
 use crate::shutdown::{Shutdown, Trigger};
 use crate::stall::Stall;
 
@@ -67,13 +68,30 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 ///   `/_ostrya/receive/v1/` goes to the endpoint if its method is not `GET`
 ///   or `HEAD`. A `GET` or a `HEAD` under the prefix goes to the archive
 ///   view and gets 404.
-/// - A `GET` and a `HEAD` of the archive view, and a `GET` of the ref
-///   listing, ignore `Authorization`.
+/// - With receive policies, the server identifies the client of each
+///   request by the steps of [Authentication](ServeOptions#authentication),
+///   after the check of the method. A `GET` and a `HEAD` of the archive
+///   view, and a `GET` of the ref listing, get the status of a refusal, 401
+///   or 403, with an empty body and `Content-Length: 0`. A 401 carries the
+///   two `WWW-Authenticate` headers. Claims that do not parse refuse each
+///   read with 403, as [Claims](ServeOptions#claims) states.
+/// - The server serves the archive view and the ref listing with the
+///   [`ReadAccess`] of the item, as
+///   [`ArchiveView`](ArchiveView#read-access) and
+///   [`Repo::build_ref_listing`] state. A path that the client cannot read
+///   gets the 404 of an absent path. `summary` and `summary.sig` are served
+///   only with no client group.
+/// - With no receive policies, the server identifies no client. Each read
+///   gets the rights of the `anonymous` item under the two implicit groups of
+///   a config with no client group, with the collection id of the
+///   repository. Each local ref, each mirror ref, and the summary are
+///   served, and `refs/remotes/` is not.
 /// - The HTTP layer removes a `#` fragment before the routing, so the server
 ///   does not see a fragment.
 /// - The server percent-decodes the request path. Outside the ref listing,
 ///   it ignores the query. If the path has a bad escape, a NUL, or bytes
-///   that are not UTF-8, the response is 404.
+///   that are not UTF-8, the response is 404. The server decodes the path
+///   after it identifies the client.
 /// - The server answers the raw path `/_ostrya/refs/v1`, with and without a
 ///   receive endpoint, with the bytes of [`Repo::build_ref_listing`]. The
 ///   path must match exactly, and the server reads its query. Each pair of
@@ -85,15 +103,17 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 ///   selects all refs. The checks come in this order:
 ///   1. A method other than `GET`, `HEAD` included, gets 405 with
 ///      `Allow: GET`.
-///   2. A bad pair, an entry over the limits of one entry, an entry that
+///   2. The server identifies the client. A refusal gets its status.
+///   3. A bad pair, an entry over the limits of one entry, an entry that
 ///      [`ostrya::RefSelector::parse`] refuses, and a query of more than 256
 ///      pairs ([`ostrya::MAX_REF_PATTERNS`]), get 400. An entry given two
 ///      times counts two times, and the server keeps it one time.
-///   3. If 4 listings are in flight over all connections, the request gets
+///   4. If 4 listings are in flight over all connections, the request gets
 ///      503 with `Retry-After: 1`. A listing is in flight from the start of
 ///      its build until its response body drops.
 ///
-///   Then the server builds the listing. Each error of the build gets 500.
+///   Then the server builds the listing with the read rights of the client.
+///   Each error of the build gets 500.
 ///   A 400, a 405, a 500, and a 503 have an empty body. A 200 carries
 ///   `Content-Length`, and the server sends the body in frames of at most
 ///   64 KiB under the body timeout.
@@ -126,23 +146,24 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 /// - A body that streams gives at most 256 KiB in one run of polls. Then it
 ///   yields to the executor.
 /// - With a client CA, the server verifies a client certificate against the
-///   CA. The server also serves a client that presents no certificate.
+///   CA. A client that presents no certificate also completes the handshake,
+///   and the other auth items identify it.
 /// - With [`ServeOptions::proxy_protocol`], each listener reads a PROXY
 ///   protocol header, version 1 or 2, at the start of each connection,
 ///   before the TLS handshake. A connection with no valid header, or with no
 ///   header within 30 seconds, closes with no response. The bytes after the
 ///   header go to the TLS handshake or to the HTTP layer.
-/// - The receive endpoint reads the client address, the scheme, and a
-///   forwarded certificate from the headers of a trusted proxy.
+/// - The server reads the client address, the scheme, and a forwarded
+///   certificate from the headers of a trusted proxy, for each request.
 ///   [Client address](ServeOptions#client-address) and
 ///   [Forwarded certificate](ServeOptions#forwarded-certificate) state the
-///   rules. The archive view and the ref listing ignore these headers.
+///   rules.
 pub struct Server {
     listeners: Vec<rt::TcpListener>,
     addrs: Vec<SocketAddr>,
     view: Arc<ArchiveView>,
     repo: Repo,
-    receive: Option<Arc<ReceiveEndpoint<GroupAuth>>>,
+    clients: Arc<Clients>,
     tls: Option<Arc<ServerConfig>>,
     body_timeout: Duration,
     proxy_protocol: bool,
@@ -232,7 +253,10 @@ pub async fn bind(repo: Repo, opts: ServeOptions) -> Result<Server> {
         Some(pem) => Some(ostrya_fetch::client_cert_verifier(pem).map_err(tls_error)?),
         None => None,
     };
-    let receive = receive(&repo, &opts, verifier.as_ref())?;
+    let clients = match receive(&repo, &opts, verifier.as_ref())? {
+        Some(endpoint) => Clients::Groups(endpoint),
+        None => Clients::Anonymous(anonymous_reads(&repo)),
+    };
     let tls = match &opts.tls {
         Some(tls) => Some(
             ostrya_fetch::server_config(
@@ -259,11 +283,21 @@ pub async fn bind(repo: Repo, opts: ServeOptions) -> Result<Server> {
         addrs,
         view: Arc::new(ArchiveView::new(repo.clone())),
         repo,
-        receive,
+        clients: Arc::new(clients),
         tls,
         body_timeout: opts.body_timeout,
         proxy_protocol: opts.proxy_protocol,
     })
+}
+
+/// Returns the read rights of each request of a server with no receive
+/// policies: the rights of the `anonymous` item under the two implicit
+/// groups of a config with no client group. The config has the collection id
+/// of `repo`, so `refs/mirrors/ID/NAME` of that id is in the local
+/// namespace.
+fn anonymous_reads(repo: &Repo) -> ReadAccess {
+    let access = ClientAccess::implicit(repo.config().collection_id());
+    ReadAccess::new(Arc::new(access), AuthItem::Anonymous, None)
 }
 
 /// Checks the fields of `opts` that go together: the client CA, the TLS
@@ -363,7 +397,7 @@ impl Server {
     pub async fn run(self) -> Result<()> {
         let shutdown = Arc::new(Shutdown::default());
         let _trigger = Trigger(shutdown.clone());
-        if let Some(endpoint) = &self.receive {
+        if let Some(endpoint) = self.clients.endpoint() {
             let endpoint = endpoint.clone();
             let stop = shutdown.wait();
             drop(rt::spawn(async move {
@@ -375,7 +409,7 @@ impl Server {
             view: self.view,
             repo: self.repo,
             listings: Arc::new(AtomicUsize::new(0)),
-            receive: self.receive,
+            clients: self.clients,
             tls: self.tls,
             body_timeout: self.body_timeout,
             proxy_protocol: self.proxy_protocol,
@@ -394,7 +428,7 @@ struct Serving {
     repo: Repo,
     /// The count of ref listings in flight, over all connections.
     listings: Arc<AtomicUsize>,
-    receive: Option<Arc<ReceiveEndpoint<GroupAuth>>>,
+    clients: Arc<Clients>,
     tls: Option<Arc<ServerConfig>>,
     body_timeout: Duration,
     /// `true` if each connection starts with a PROXY protocol header.
@@ -430,10 +464,10 @@ async fn connection(stream: rt::TcpStream, addr: SocketAddr, serving: Arc<Servin
 /// Serves one connection from the peer address `addr`. An error ends this
 /// connection and no other. With the PROXY protocol, the function first reads
 /// the header, and its source address replaces `addr`. A connection with no
-/// valid header ends with no byte written. With a receive endpoint, each
-/// request carries the [`Peer`] of the connection in its extensions. The
-/// server then reads the client certificate of a TLS connection one time,
-/// for each request of the connection.
+/// valid header ends with no byte written. With client groups, each request
+/// carries the [`Peer`] of the connection in its extensions. The server then
+/// reads the client certificate of a TLS connection one time, for each
+/// request of the connection.
 async fn serve_connection(
     stream: rt::TcpStream,
     addr: SocketAddr,
@@ -453,16 +487,15 @@ async fn serve_connection(
         service_fn(move |mut req: Request<Incoming>| {
             let serving = shared.clone();
             let stall = stall.clone();
-            if serving.receive.is_some() {
+            if serving.clients.endpoint().is_some() {
                 req.extensions_mut().insert(peer.clone());
             }
             async move {
-                let receive = serving.receive.as_deref();
                 let response = router::handle(
                     &serving.view,
                     &serving.repo,
                     &serving.listings,
-                    receive,
+                    &serving.clients,
                     &stall,
                     req,
                 )
@@ -496,7 +529,7 @@ async fn serve_connection(
     };
     let connection = stream.get_ref().1;
     let h2 = connection.alpn_protocol() == Some(b"h2".as_slice());
-    let cert = match serving.receive {
+    let cert = match serving.clients.endpoint() {
         Some(_) => connection
             .peer_certificates()
             .and_then(|chain| chain.first())
@@ -521,7 +554,7 @@ async fn serve_connection(
         // With a receive endpoint, the windows bound the bytes of the request
         // bodies of one connection that the server did not read. A
         // read-only server keeps the windows of hyper.
-        if let Some((stream, connection)) = serving.receive.as_ref().map(|e| e.h2_windows()) {
+        if let Some((stream, connection)) = serving.clients.endpoint().map(|e| e.h2_windows()) {
             builder
                 .initial_stream_window_size(stream)
                 .initial_connection_window_size(connection);

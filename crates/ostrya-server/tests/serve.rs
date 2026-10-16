@@ -14,9 +14,11 @@ use std::net::SocketAddr;
 use std::os::fd::AsFd;
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use futures_lite::{AsyncReadExt, AsyncWriteExt, future};
+use ostrya::access::{AuthItem, ClientAccess, ReadAccess};
 use ostrya::fetch::{
     ClientIdentity, FetchRequest, Fetched, Fetcher, FetcherOptions, Protocol, Proxy, TlsOptions,
     TrustRoots,
@@ -25,8 +27,8 @@ use ostrya::remote::PullSession;
 use ostrya::verify::PullTrust;
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, DeltaOptions,
-    MutableTree, ObjectType, PullOptions, PullProgress, RefSelector, Repo, RepoMode, Summary, Type,
-    Value, loose_path,
+    MutableTree, ObjectType, PullOptions, PullProgress, ReceivePolicies, RefSelector, Repo,
+    RepoMode, Summary, Type, Value, loose_path,
 };
 use ostrya_rt::block_on;
 use ostrya_server::{ServeOptions, ServerTls};
@@ -107,6 +109,13 @@ async fn repo(base: &Path) -> (PathBuf, Repo, Checksum, Checksum) {
         .unwrap()
         .checksum;
     (path, repo, commit, file)
+}
+
+/// The read rights of an anonymous client under the client groups of the
+/// config that `repo` read.
+fn anyone(repo: &Repo) -> ReadAccess {
+    let access = ClientAccess::from_config(repo.config(), repo.path()).unwrap();
+    ReadAccess::new(Arc::new(access), AuthItem::Anonymous, None)
 }
 
 fn object_path(ty: ObjectType, checksum: &Checksum) -> String {
@@ -635,7 +644,7 @@ fn the_ref_listing_is_served() {
         assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
         assert_eq!(
             body,
-            repo.build_ref_listing(&selector(&["a/b/**", "main"]))
+            repo.build_ref_listing(&selector(&["a/b/**", "main"]), &anyone(&repo))
                 .await
                 .unwrap()
         );
@@ -652,13 +661,19 @@ fn the_ref_listing_is_served() {
             .collect();
         assert_eq!(names, ["a/b/c", "a/b/d", "main"]);
 
-        let all = repo.build_ref_listing(&selector(&[])).await.unwrap();
+        let all = repo
+            .build_ref_listing(&selector(&[]), &anyone(&repo))
+            .await
+            .unwrap();
         for query in ["", "?", "#pattern=main"] {
             let (head, body) = get(query).await;
             assert!(head.starts_with("HTTP/1.1 200 "), "{query}: {head}");
             assert_eq!(body, all, "{query}");
         }
-        let main = repo.build_ref_listing(&selector(&["main"])).await.unwrap();
+        let main = repo
+            .build_ref_listing(&selector(&["main"]), &anyone(&repo))
+            .await
+            .unwrap();
         for query in [
             "?pattern=main&pattern=main",
             "?pattern=main",
@@ -695,7 +710,9 @@ fn the_ref_listing_is_served() {
             assert!(head.starts_with("HTTP/1.1 200 "), "{query}: {head}");
             assert_eq!(
                 body,
-                repo.build_ref_listing(&selector(entries)).await.unwrap(),
+                repo.build_ref_listing(&selector(entries), &anyone(&repo))
+                    .await
+                    .unwrap(),
                 "{query}"
             );
             assert_eq!(listed_names(&body), names, "{query}");
@@ -727,7 +744,9 @@ fn a_failed_listing_gets_500() {
         assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
         assert_eq!(
             body,
-            repo.build_ref_listing(&selector(&["main"])).await.unwrap()
+            repo.build_ref_listing(&selector(&["main"]), &anyone(&repo))
+                .await
+                .unwrap()
         );
     });
 }
@@ -888,7 +907,10 @@ fn fetch_refs_over_http_gives_the_built_listing() {
                     .await
                     .unwrap()
                     .unwrap();
-                let want = repo.build_ref_listing(&selector(entries)).await.unwrap();
+                let want = repo
+                    .build_ref_listing(&selector(entries), &anyone(&repo))
+                    .await
+                    .unwrap();
                 assert_eq!(got, want, "{scheme}: {entries:?}");
             }
             let got = session
@@ -966,7 +988,10 @@ fn fetch_refs_takes_a_target_at_the_client_limit() {
             let session = PullSession::Http(fetcher(url, http2, None).await);
             let entries: Vec<&str> = prefixes.iter().map(String::as_str).collect();
             let got = session.fetch_refs(&selector(&entries)).await;
-            let want = repo.build_ref_listing(&selector(&entries)).await.unwrap();
+            let want = repo
+                .build_ref_listing(&selector(&entries), &anyone(&repo))
+                .await
+                .unwrap();
             assert_eq!(got.unwrap(), Some(want), "{scheme}");
         });
     }
@@ -1003,7 +1028,10 @@ fn fetch_refs_takes_a_mixed_list_up_to_the_limit() {
             let entries = mixed(200);
             let entries: Vec<&str> = entries.iter().map(String::as_str).collect();
             let got = session.fetch_refs(&selector(&entries)).await;
-            let want = repo.build_ref_listing(&selector(&entries)).await.unwrap();
+            let want = repo
+                .build_ref_listing(&selector(&entries), &anyone(&repo))
+                .await
+                .unwrap();
             assert_eq!(got.unwrap(), Some(want), "{scheme}");
             let entries = mixed(257);
             let entries: Vec<&str> = entries.iter().map(String::as_str).collect();
@@ -1033,7 +1061,7 @@ fn fetch_refs_of_a_too_long_part_gets_an_empty_listing() {
             let session = PullSession::Http(fetcher(url, http2, None).await);
             let got = session.fetch_refs(&selector(&[long.as_str()])).await;
             let want = repo
-                .build_ref_listing(&selector(&["absent"]))
+                .build_ref_listing(&selector(&["absent"]), &anyone(&repo))
                 .await
                 .unwrap();
             assert_eq!(got.unwrap(), Some(want), "{scheme}");
@@ -1187,4 +1215,265 @@ fn a_chain_from_the_ref_listing_is_pulled_over_http() {
             assert_eq!(meta.unwrap(), Some(detached_dict()), "{scheme}");
         });
     }
+}
+
+/// Writes the client groups `groups` at the end of the config of the
+/// repository at `path`, and returns the repository opened again and its
+/// receive policies.
+fn with_groups(path: &Path, groups: &str) -> (Repo, Arc<ReceivePolicies>) {
+    let config = path.join("config");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(groups);
+    std::fs::write(&config, text).unwrap();
+    block_on(async {
+        let repo = Repo::open(path).await.unwrap();
+        let policies = Arc::new(ReceivePolicies::from_config(&repo).await.unwrap());
+        (repo, policies)
+    })
+}
+
+/// The options of [`local`] with the receive policies `policies`.
+fn with_policies(policies: Arc<ReceivePolicies>) -> ServeOptions {
+    let mut opts = local();
+    opts.receive = Some(policies);
+    opts
+}
+
+/// Copies the ref file `refs/heads/main` of the repository at `path` to each
+/// path of `refs`, so each one names the commit of `main`.
+fn copy_main(path: &Path, refs: &[&str]) {
+    let main = path.join("refs/heads/main");
+    for to in refs {
+        let to = path.join(to);
+        std::fs::create_dir_all(to.parent().unwrap()).unwrap();
+        std::fs::copy(&main, to).unwrap();
+    }
+}
+
+/// With client groups, a read needs an identified item. With a token group
+/// alone, a `GET` and a `HEAD` of `config` and a `GET` of the ref listing get
+/// 401 with the two challenges and an empty body. A `HEAD` of the listing
+/// gets 405 first. With the token, the reads get 200.
+#[test]
+fn a_read_needs_an_identified_client() {
+    let tmp = TmpDir::new("read-identified");
+    let (path, _, _, _) = block_on(repo(tmp.path()));
+    let digest = Checksum::sha256(b"a-token").to_hex();
+    let (repo, policies) = with_groups(
+        &path,
+        &format!("[ex-ostrya client \"t\"]\nauth=token-sha256:{digest}\nallow=r:**\n"),
+    );
+    let mut opts = with_policies(policies);
+    opts.allow_cleartext_credentials = true;
+    with_server(repo, opts, |addrs| async move {
+        let addr = addrs[0];
+        for (method, target) in [
+            ("GET", "/config"),
+            ("HEAD", "/config"),
+            ("GET", "/_ostrya/refs/v1"),
+            ("GET", "/refs/heads/main"),
+        ] {
+            let response = raw(addr, &ask(method, target)).await;
+            assert!(
+                response.starts_with("HTTP/1.1 401 "),
+                "{target}: {response}"
+            );
+            assert_eq!(header(&response, "content-length"), Some("0"));
+            for challenge in [r#"Bearer realm="ostrya""#, r#"Basic realm="ostrya""#] {
+                let line = format!("www-authenticate: {challenge}\r\n");
+                assert!(response.contains(&line), "{response}");
+            }
+            assert!(response.ends_with("\r\n\r\n"), "{response}");
+            let request = format!(
+                "{method} {target} HTTP/1.1\r\nhost: x\r\nauthorization: Bearer a-token\r\n\
+                 connection: close\r\n\r\n"
+            );
+            let response = raw(addr, &request).await;
+            assert!(
+                response.starts_with("HTTP/1.1 200 "),
+                "{target}: {response}"
+            );
+        }
+        let response = raw(addr, &ask("HEAD", "/_ostrya/refs/v1")).await;
+        assert!(response.starts_with("HTTP/1.1 405 "), "{response}");
+    });
+}
+
+/// A ref is served when the group of the item has `r` on its name, an alias
+/// when the item reads its name and its target, and a mirror ref by the
+/// group of its collection. Each denial gets the response of an absent
+/// path. `refs/remotes/` is never served. Objects and `config` are served.
+#[test]
+fn the_refs_follow_the_read_rights() {
+    let tmp = TmpDir::new("read-rights");
+    let (path, _, commit, _) = block_on(repo(tmp.path()));
+    copy_main(
+        &path,
+        &[
+            "refs/heads/pub/a",
+            "refs/heads/secret",
+            "refs/remotes/o/pub/a",
+            "refs/mirrors/a.b/x",
+            "refs/mirrors/a.b/y",
+        ],
+    );
+    let heads = path.join("refs/heads");
+    symlink("a", heads.join("pub/to-a")).unwrap();
+    symlink("../main", heads.join("pub/to-main")).unwrap();
+    symlink("../../remotes/o/pub/a", heads.join("pub/to-remote")).unwrap();
+    let (repo, policies) = with_groups(
+        &path,
+        "[ex-ostrya client \"public\"]\nauth=anonymous\nallow=r:pub/**\n\
+         [ex-ostrya client \"mirrors\"]\nauth=anonymous\ncollection=a.b\nallow=r:x\n",
+    );
+    with_server(repo, with_policies(policies), |addrs| async move {
+        let addr = addrs[0];
+        let stored = std::fs::read(path.join("refs/heads/main")).unwrap();
+        for target in [
+            "/refs/heads/pub/a",
+            "/refs/heads/pub/to-a",
+            "/refs/mirrors/a.b/x",
+        ] {
+            let (head, body) = exchange(addr, &ask("GET", target)).await;
+            assert!(head.starts_with("HTTP/1.1 200 "), "{target}: {head}");
+            assert_eq!(body, stored, "{target}");
+        }
+        let absent = without_date(&raw(addr, &ask("GET", "/refs/heads/absent")).await);
+        assert!(absent.starts_with("HTTP/1.1 404 "), "{absent}");
+        for target in [
+            "/refs/heads/main",
+            "/refs/heads/secret",
+            "/refs/heads/pub/to-main",
+            "/refs/heads/pub/to-remote",
+            "/refs/remotes/o/pub/a",
+            "/refs/mirrors/a.b/y",
+            "/refs/mirrors/c.d/x",
+        ] {
+            let response = raw(addr, &ask("GET", target)).await;
+            assert_eq!(without_date(&response), absent, "{target}");
+        }
+        for target in [
+            "/config".to_owned(),
+            format!("/{}", object_path(ObjectType::Commit, &commit)),
+        ] {
+            let response = raw(addr, &ask("GET", &target)).await;
+            assert!(
+                response.starts_with("HTTP/1.1 200 "),
+                "{target}: {response}"
+            );
+        }
+    });
+}
+
+/// `summary` and `summary.sig` are served with no client group, also with
+/// receive policies, and get 404 with a client group.
+#[test]
+fn the_summary_is_served_with_no_client_group_alone() {
+    let tmp = TmpDir::new("read-summary");
+    let (path, repo, _, _) = block_on(repo(tmp.path()));
+    block_on(repo.regenerate_summary(&ostrya::SummaryOptions::default())).unwrap();
+    std::fs::write(path.join("summary.sig"), b"sig").unwrap();
+    let stored = std::fs::read(path.join("summary")).unwrap();
+    let (repo, policies) = with_groups(&path, "");
+    with_server(repo, with_policies(policies), |addrs| async move {
+        let (head, body) = exchange(addrs[0], &ask("GET", "/summary")).await;
+        assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+        assert_eq!(body, stored);
+        let (head, _) = exchange(addrs[0], &ask("HEAD", "/summary.sig")).await;
+        assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+    });
+    let (repo, policies) = with_groups(
+        &path,
+        "[ex-ostrya client \"c\"]\nauth=anonymous\nallow=r:**\n",
+    );
+    with_server(repo, with_policies(policies), |addrs| async move {
+        for (method, target) in [
+            ("GET", "/summary"),
+            ("HEAD", "/summary"),
+            ("GET", "/summary.sig"),
+            ("HEAD", "/summary.sig"),
+        ] {
+            let (head, _) = exchange(addrs[0], &ask(method, target)).await;
+            assert!(
+                head.starts_with("HTTP/1.1 404 "),
+                "{method} {target}: {head}"
+            );
+        }
+    });
+}
+
+/// The ref listing holds the refs that the item reads. Its body is the
+/// listing that `build_ref_listing` builds with the same rights.
+#[test]
+fn the_ref_listing_holds_the_readable_refs() {
+    let tmp = TmpDir::new("read-listing");
+    let (path, _, _, _) = block_on(repo(tmp.path()));
+    copy_main(&path, &["refs/heads/pub/a", "refs/heads/secret"]);
+    symlink("../main", path.join("refs/heads/pub/to-main")).unwrap();
+    symlink("a", path.join("refs/heads/pub/to-a")).unwrap();
+    let (repo, policies) = with_groups(
+        &path,
+        "[ex-ostrya client \"public\"]\nauth=anonymous\nallow=r:pub/**\n",
+    );
+    let want = block_on(repo.build_ref_listing(&selector(&[]), &anyone(&repo))).unwrap();
+    assert_eq!(listed_names(&want), ["pub/a", "pub/to-a"]);
+    with_server(repo, with_policies(policies), |addrs| async move {
+        let (head, body) = exchange(addrs[0], &ask("GET", "/_ostrya/refs/v1")).await;
+        assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+        assert_eq!(body, want);
+    });
+}
+
+/// With no receive policies, the server identifies no client. Each read is
+/// the `anonymous` item under the two implicit groups, also when the
+/// repository config has client groups and the request has a credential:
+/// each local ref and each mirror ref, the summary, and no remote ref.
+#[test]
+fn a_server_with_no_receive_policies_serves_as_the_implicit_groups() {
+    let tmp = TmpDir::new("read-implicit");
+    let (path, repo, _, _) = block_on(repo(tmp.path()));
+    block_on(repo.regenerate_summary(&ostrya::SummaryOptions::default())).unwrap();
+    copy_main(&path, &["refs/mirrors/a.b/x", "refs/remotes/o/x"]);
+    let (repo, _) = with_groups(&path, "[ex-ostrya client \"c\"]\nauth=ssh:u\n");
+    with_server(repo, local(), |addrs| async move {
+        let addr = addrs[0];
+        for target in ["/refs/heads/main", "/refs/mirrors/a.b/x", "/summary"] {
+            for auth in ["", "authorization: Bearer x\r\n"] {
+                let request =
+                    format!("GET {target} HTTP/1.1\r\nhost: x\r\n{auth}connection: close\r\n\r\n");
+                let response = raw(addr, &request).await;
+                assert!(
+                    response.starts_with("HTTP/1.1 200 "),
+                    "{target}: {response}"
+                );
+            }
+        }
+        let response = raw(addr, &ask("GET", "/refs/remotes/o/x")).await;
+        assert!(response.starts_with("HTTP/1.1 404 "), "{response}");
+    });
+}
+
+/// With no receive policies, the collection id of the repository maps its
+/// mirror refs to the local refs as the config holds it. The id `a\b` is
+/// written with an escape in the config and fails the collection-id rule,
+/// so only that mapping serves `refs/mirrors/a\b/x`. Another id that fails
+/// the rule is not served.
+#[test]
+fn a_server_with_no_receive_policies_takes_the_own_collection_id_as_read() {
+    let tmp = TmpDir::new("read-own-id");
+    let (path, _, _, _) = block_on(repo(tmp.path()));
+    let config = path.join("config");
+    let text = std::fs::read_to_string(&config).unwrap();
+    let text = text.replacen("[core]\n", "[core]\ncollection-id=a\\\\b\n", 1);
+    std::fs::write(&config, text).unwrap();
+    copy_main(&path, &["refs/mirrors/a\\b/x", "refs/mirrors/c\\d/x"]);
+    let repo = block_on(Repo::open(&path)).unwrap();
+    assert_eq!(repo.config().collection_id(), Some("a\\b"));
+    with_server(repo, local(), |addrs| async move {
+        let addr = addrs[0];
+        let response = raw(addr, &ask("GET", "/refs/mirrors/a%5Cb/x")).await;
+        assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
+        let response = raw(addr, &ask("GET", "/refs/mirrors/c%5Cd/x")).await;
+        assert!(response.starts_with("HTTP/1.1 404 "), "{response}");
+    });
 }

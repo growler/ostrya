@@ -11,12 +11,13 @@ use std::os::unix::fs::symlink;
 use std::path::Path;
 
 use async_compression::futures::bufread::DeflateDecoder;
-use common::TmpDir;
 use common::modes::{
     WRITABLE, build_tree, current_owner, file_objects, object_path, repo_of, write_split_object,
 };
+use common::{TmpDir, anyone, repo_access};
 use futures_lite::AsyncReadExt;
 use futures_lite::io::{BufReader, Cursor};
+use ostrya::access::ReadAccess;
 use ostrya::{
     ArchiveAnswer, ArchiveHead, ArchiveView, Checksum, CreateOptions, FileKind, ObjectType, Repo,
     RepoMode, SummaryOptions, loose_path,
@@ -39,7 +40,7 @@ async fn read_all(answer: ArchiveAnswer) -> (Option<u64>, Vec<u8>) {
 }
 
 async fn get(view: &ArchiveView, path: &str) -> (Option<u64>, Vec<u8>) {
-    read_all(view.get(path).await.unwrap()).await
+    read_all(view.get(path, &anyone()).await.unwrap()).await
 }
 
 /// Splits a `.filez` into its header, its declared size, and its inflated
@@ -141,7 +142,7 @@ fn a_config_past_the_cap_is_refused() {
             matches!(&err, ostrya::Error::InvalidFormat(m) if m.contains("1048576")),
             "{err:?}"
         );
-        let err = view.get("config").await.unwrap_err();
+        let err = view.get("config", &anyone()).await.unwrap_err();
         assert!(matches!(err, ostrya::Error::InvalidFormat(_)), "{err:?}");
     });
 }
@@ -231,7 +232,9 @@ fn a_built_filez_matches_the_archive_object() {
             let view = ArchiveView::new(repo.clone());
             let mut symlinks = 0;
             for checksum in file_objects(&repo, &commit).await {
-                let answer = view.get(&object_path(ObjectType::File, &checksum)).await;
+                let answer = view
+                    .get(&object_path(ObjectType::File, &checksum), &anyone())
+                    .await;
                 let (len, bytes) = read_all(answer.unwrap()).await;
                 assert_eq!(len, None);
                 let (header, size, payload) = parse_filez(&bytes).await;
@@ -349,7 +352,7 @@ fn a_built_filez_carries_the_split_xattrs() {
         assert_eq!(size, 0);
         for id in [regular, link] {
             assert_eq!(
-                view.head(&object_path(ObjectType::File, &id))
+                view.head(&object_path(ObjectType::File, &id), &anyone())
                     .await
                     .unwrap(),
                 ArchiveHead::Found { len: None }
@@ -373,9 +376,9 @@ fn a_built_filez_carries_the_split_xattrs() {
         fs::remove_file(&other_link).unwrap();
         fs::write(&other_link, b"\xff").unwrap();
         let other_filez = object_path(ObjectType::File, &other);
-        assert!(view.get(&other_filez).await.is_err());
+        assert!(view.get(&other_filez, &anyone()).await.is_err());
         assert_eq!(
-            view.head(&other_filez).await.unwrap(),
+            view.head(&other_filez, &anyone()).await.unwrap(),
             ArchiveHead::Found { len: None }
         );
 
@@ -406,13 +409,17 @@ fn assert_answer(answer: ArchiveAnswer, refused: bool, path: &str) {
 /// Checks the answers to the `GET` and the `HEAD` of `path`, as
 /// [`assert_answer`] does.
 async fn assert_both(view: &ArchiveView, path: &str, refused: bool) {
-    assert_answer(view.get(path).await.unwrap(), refused, path);
+    assert_answer(view.get(path, &anyone()).await.unwrap(), refused, path);
     let expected = if refused {
         ArchiveHead::Refused
     } else {
         ArchiveHead::NotFound
     };
-    assert_eq!(view.head(path).await.unwrap(), expected, "HEAD {path}");
+    assert_eq!(
+        view.head(path, &anyone()).await.unwrap(),
+        expected,
+        "HEAD {path}"
+    );
 }
 
 /// The view answers `Refused` for each path that it refuses and `NotFound` for
@@ -451,7 +458,7 @@ fn private_and_absent_paths_are_refused_or_not_found() {
             let main = fs::read(heads.join("main")).unwrap();
             assert_eq!(get(&view, "refs/heads/alias").await.1, main);
             assert_eq!(
-                view.head("refs/heads/alias").await.unwrap(),
+                view.head("refs/heads/alias", &anyone()).await.unwrap(),
                 ArchiveHead::Found {
                     len: Some(main.len() as u64)
                 }
@@ -461,7 +468,12 @@ fn private_and_absent_paths_are_refused_or_not_found() {
                 "objects/{}",
                 loose_path(&file, ObjectType::File, RepoMode::Bare)
             );
+            let long = "x".repeat(300);
+            let long_dir = format!("refs/{long}/x");
+            // A path under `refs/` that names no ref is refused by its name.
             let refused = [
+                "refs/heads",
+                long_dir.as_str(),
                 ".lock",
                 ".update.lock",
                 "tmp/x",
@@ -479,9 +491,7 @@ fn private_and_absent_paths_are_refused_or_not_found() {
                 "/refs/heads/main",
                 "refs/heads/./main",
             ];
-            let long = "x".repeat(300);
             let long_ref = format!("refs/heads/{long}");
-            let long_dir = format!("refs/{long}/x");
             let long_extension = format!("extensions/{long}");
             // Deep paths: an absent directory and a file at an inner
             // component.
@@ -490,11 +500,9 @@ fn private_and_absent_paths_are_refused_or_not_found() {
             let mut not_found = vec![
                 "refs/heads/absent",
                 "refs/heads/fifo",
-                "refs/heads",
                 "nothing",
                 file_path.as_str(),
                 long_ref.as_str(),
-                long_dir.as_str(),
                 long_extension.as_str(),
                 deep_absent.as_str(),
                 deep_under_file.as_str(),
@@ -570,5 +578,258 @@ fn a_symlink_at_a_bare_user_object_is_refused() {
             let filez = object_path(ObjectType::File, &file);
             assert_both(&view, &filez, true).await;
         }
+    });
+}
+
+/// Creates a `bare-user` repository at `dir` with a regular file at each
+/// path of `files`, and appends `groups` to its config. Returns the
+/// repository, opened again so its config holds the groups. `own` sets the
+/// own collection id.
+async fn repo_with_files(dir: &Path, own: Option<&str>, groups: &str, files: &[&str]) -> Repo {
+    Repo::create(dir, CreateOptions::new(RepoMode::BareUser))
+        .await
+        .unwrap();
+    for file in files {
+        let path = dir.join(file);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, format!("{}\n", Checksum::sha256(file.as_bytes()))).unwrap();
+    }
+    let mut text = fs::read_to_string(dir.join("config")).unwrap();
+    if let Some(own) = own {
+        text = text.replacen("[core]\n", &format!("[core]\ncollection-id={own}\n"), 1);
+    }
+    text.push_str(groups);
+    fs::write(dir.join("config"), text).unwrap();
+    Repo::open(dir).await.unwrap()
+}
+
+/// Returns `true` if the view serves `path` to `access` on a `GET` and a
+/// `HEAD`, and `false` if it refuses the path on both.
+async fn serves(view: &ArchiveView, path: &str, access: &ReadAccess) -> bool {
+    let get = view.get(path, access).await.unwrap();
+    let head = view.head(path, access).await.unwrap();
+    match (get, head) {
+        (ArchiveAnswer::Stream { .. } | ArchiveAnswer::Bytes(_), ArchiveHead::Found { .. }) => true,
+        (ArchiveAnswer::Refused, ArchiveHead::Refused) => false,
+        (get, head) => panic!("{path}: {get:?} {head:?}"),
+    }
+}
+
+/// A ref is served when the group of the item has `r` on its name, and
+/// refused otherwise. An item with no group reads no ref.
+#[test]
+fn a_ref_without_read_is_refused() {
+    let tmp = TmpDir::new("view-ref-rights");
+    block_on(async {
+        let repo = repo_with_files(
+            tmp.path(),
+            None,
+            "[ex-ostrya client \"public\"]\nauth=anonymous\nallow=r:pub/**\n",
+            &["refs/heads/pub/a", "refs/heads/secret"],
+        )
+        .await;
+        let view = ArchiveView::new(repo.clone());
+        let anonymous = repo_access(&repo, "anonymous");
+        assert!(serves(&view, "refs/heads/pub/a", &anonymous).await);
+        assert!(!serves(&view, "refs/heads/secret", &anonymous).await);
+        let stored = fs::read(tmp.path().join("refs/heads/pub/a")).unwrap();
+        let (len, bytes) = read_all(view.get("refs/heads/pub/a", &anonymous).await.unwrap()).await;
+        assert_eq!((len, bytes), (Some(stored.len() as u64), stored));
+        let stranger = repo_access(&repo, "ssh:u");
+        assert!(!serves(&view, "refs/heads/pub/a", &stranger).await);
+    });
+}
+
+/// An alias needs `r` on its name and on its target. A target in a
+/// collection takes the group of that collection. A target under
+/// `refs/remotes/` is never served.
+#[test]
+fn an_alias_needs_read_on_its_name_and_its_target() {
+    let tmp = TmpDir::new("view-alias-rights");
+    block_on(async {
+        let repo = repo_with_files(
+            tmp.path(),
+            None,
+            "[ex-ostrya client \"public\"]\nauth=anonymous\nallow=r:open/**\n\
+             [ex-ostrya client \"mirrors\"]\nauth=anonymous\ncollection=a.b\nallow=r:m/**\n",
+            &[
+                "refs/heads/open/target",
+                "refs/heads/hidden/target",
+                "refs/remotes/o/open/x",
+                "refs/mirrors/a.b/m/x",
+                "refs/mirrors/a.b/n/x",
+            ],
+        )
+        .await;
+        let heads = tmp.path().join("refs/heads");
+        for (alias, body) in [
+            ("open/to-open", "target"),
+            ("open/to-hidden", "../hidden/target"),
+            ("hidden/to-open", "../open/target"),
+            ("open/to-remote", "../../remotes/o/open/x"),
+            ("open/to-mirror", "../../mirrors/a.b/m/x"),
+            ("open/to-hidden-mirror", "../../mirrors/a.b/n/x"),
+        ] {
+            symlink(body, heads.join(alias)).unwrap();
+        }
+        let view = ArchiveView::new(repo.clone());
+        let access = repo_access(&repo, "anonymous");
+        for (alias, served) in [
+            ("open/to-open", true),
+            ("open/to-hidden", false),
+            ("hidden/to-open", false),
+            ("open/to-remote", false),
+            ("open/to-mirror", true),
+            ("open/to-hidden-mirror", false),
+        ] {
+            let path = format!("refs/heads/{alias}");
+            assert_eq!(serves(&view, &path, &access).await, served, "{alias}");
+        }
+        let target = fs::read(tmp.path().join("refs/mirrors/a.b/m/x")).unwrap();
+        let answer = view.get("refs/heads/open/to-mirror", &access).await;
+        assert_eq!(read_all(answer.unwrap()).await.1, target);
+    });
+}
+
+/// `refs/remotes/` and a path under `refs/` outside `refs/heads/` and
+/// `refs/mirrors/` are never served, also under the implicit groups, which
+/// serve each local ref and each collection ref.
+#[test]
+fn remote_and_other_ref_paths_are_never_served() {
+    let tmp = TmpDir::new("view-remote-refs");
+    block_on(async {
+        let repo = repo_with_files(
+            tmp.path(),
+            None,
+            "",
+            &[
+                "refs/heads/main",
+                "refs/mirrors/a.b/x",
+                "refs/remotes/o/x",
+                "refs/x",
+                "refs/tags/x",
+            ],
+        )
+        .await;
+        let view = ArchiveView::new(repo.clone());
+        let access = repo_access(&repo, "anonymous");
+        assert!(serves(&view, "refs/heads/main", &access).await);
+        assert!(serves(&view, "refs/mirrors/a.b/x", &access).await);
+        for path in ["refs/remotes/o/x", "refs/x", "refs/tags/x"] {
+            assert!(!serves(&view, path, &access).await, "{path}");
+        }
+    });
+}
+
+/// `refs/mirrors/ID/NAME` with the own collection id is in the local
+/// namespace: the group of the local refs decides, and a `collection=*`
+/// group does not. Another collection takes its own group.
+#[test]
+fn a_mirror_of_the_own_collection_takes_the_local_rights() {
+    let tmp = TmpDir::new("view-own-mirror");
+    block_on(async {
+        let repo = repo_with_files(
+            tmp.path(),
+            Some("own.id"),
+            "[ex-ostrya client \"local\"]\nauth=anonymous\nallow=r:pub/**\n\
+             [ex-ostrya client \"others\"]\nauth=anonymous\ncollection=*\nallow=r:**\n",
+            &[
+                "refs/mirrors/own.id/pub/a",
+                "refs/mirrors/own.id/secret",
+                "refs/mirrors/c.d/secret",
+            ],
+        )
+        .await;
+        let view = ArchiveView::new(repo.clone());
+        let access = repo_access(&repo, "anonymous");
+        assert!(serves(&view, "refs/mirrors/own.id/pub/a", &access).await);
+        assert!(!serves(&view, "refs/mirrors/own.id/secret", &access).await);
+        assert!(serves(&view, "refs/mirrors/c.d/secret", &access).await);
+        let stranger = repo_access(&repo, "ssh:u");
+        assert!(!serves(&view, "refs/mirrors/own.id/pub/a", &stranger).await);
+    });
+}
+
+/// `summary` and `summary.sig` are served with no client group alone.
+#[test]
+fn the_summary_is_served_with_no_client_group_alone() {
+    let tmp = TmpDir::new("view-summary-rights");
+    block_on(async {
+        let files = ["summary", "summary.sig"];
+        let open = repo_with_files(&tmp.path().join("open"), None, "", &files).await;
+        let view = ArchiveView::new(open.clone());
+        let access = repo_access(&open, "anonymous");
+        for path in files {
+            assert!(serves(&view, path, &access).await, "{path}");
+        }
+        let closed = repo_with_files(
+            &tmp.path().join("closed"),
+            None,
+            "[ex-ostrya client \"c\"]\nauth=anonymous\nallow=r:**\n",
+            &files,
+        )
+        .await;
+        let view = ArchiveView::new(closed.clone());
+        let access = repo_access(&closed, "anonymous");
+        for path in files {
+            assert!(!serves(&view, path, &access).await, "{path}");
+        }
+    });
+}
+
+/// An identified client with no read right on a ref gets `config`, the
+/// metadata objects, and the built `.filez` objects. It gets no ref.
+#[test]
+fn objects_and_config_are_served_to_each_identified_client() {
+    let tmp = TmpDir::new("view-objects-rights");
+    let src = build_tree(tmp.path());
+    block_on(async {
+        let (path, _, commit) = repo_of(tmp.path(), RepoMode::BareUser, &src).await;
+        let mut text = fs::read_to_string(path.join("config")).unwrap();
+        text.push_str("[ex-ostrya client \"c\"]\nauth=ssh:u\n");
+        fs::write(path.join("config"), text).unwrap();
+        let repo = Repo::open(&path).await.unwrap();
+        let view = ArchiveView::new(repo.clone());
+        let access = repo_access(&repo, "ssh:u");
+        let file = file_objects(&repo, &commit).await[0];
+        for served in [
+            "config".to_owned(),
+            object_path(ObjectType::Commit, &commit),
+            object_path(ObjectType::File, &file),
+        ] {
+            assert!(serves(&view, &served, &access).await, "{served}");
+        }
+        assert!(!serves(&view, "refs/heads/main", &access).await);
+    });
+}
+
+/// `extensions/ostrya/` is not found. The other files under `extensions/`
+/// are served as stored.
+#[test]
+fn the_extensions_of_the_port_are_not_found() {
+    let tmp = TmpDir::new("view-port-extensions");
+    block_on(async {
+        let repo = repo_with_files(
+            tmp.path(),
+            None,
+            "",
+            &[
+                "extensions/ostrya/x",
+                "extensions/ostrya-other/x",
+                "extensions/other/y",
+            ],
+        )
+        .await;
+        let view = ArchiveView::new(repo.clone());
+        let access = repo_access(&repo, "anonymous");
+        for path in ["extensions/ostrya/x", "extensions/ostrya"] {
+            assert_answer(view.get(path, &access).await.unwrap(), false, path);
+            assert_eq!(
+                view.head(path, &access).await.unwrap(),
+                ArchiveHead::NotFound
+            );
+        }
+        assert!(serves(&view, "extensions/ostrya-other/x", &access).await);
+        assert!(serves(&view, "extensions/other/y", &access).await);
     });
 }

@@ -8,8 +8,9 @@
 //!
 //! - [`ArchiveView::get`] gives the [`ArchiveAnswer`] for a `GET`.
 //! - [`ArchiveView::head`] gives the [`ArchiveHead`] for a `HEAD`.
-//! - [`ArchiveView`] states the [routing](ArchiveView#routing) of a path and
-//!   the [file access](ArchiveView#file-access).
+//! - [`ArchiveView`] states the [routing](ArchiveView#routing) of a path, the
+//!   [read access](ArchiveView#read-access), and the
+//!   [file access](ArchiveView#file-access).
 
 use std::fmt;
 use std::future::Future;
@@ -27,6 +28,7 @@ use ostrya_rt::FileReader;
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, Statx, StatxFlags};
 use rustix::io::Errno;
 
+use crate::access::ReadAccess;
 use crate::config::RepoConfig;
 use crate::error::{Error, Result};
 use crate::file::{Contained, ContentReader, FileKind};
@@ -51,7 +53,9 @@ pub const MAX_COMPRESSORS: usize = 16;
 ///   if the repository sets them. The view serves no other key.
 /// - `summary`, `summary.sig`, the files under `refs/` and `extensions/`, and
 ///   the `.commit`, `.dirtree`, `.dirmeta`, and `.commitmeta` objects: the
-///   view serves them as stored.
+///   view serves them as stored, to a client that reads them (see
+///   [Read access](ArchiveView#read-access)). `extensions/ostrya` and each
+///   path under it are not found.
 /// - In an `archive` repository, the view also serves the `.filez` objects
 ///   and the files under `deltas/` and `delta-indexes/` as stored.
 /// - In every other mode, the view builds a `.filez` object on request from
@@ -68,6 +72,22 @@ pub const MAX_COMPRESSORS: usize = 16;
 /// under `refs/`. If the alias names a ref that is a regular file under
 /// `refs/`, the view serves that ref. The view follows one link, so it
 /// refuses an alias of an alias.
+///
+/// # Read access
+///
+/// Each request carries the [`ReadAccess`] of its client. The view checks
+/// it before it opens a file, so it reads no ref that the client cannot
+/// read:
+///
+/// - A path under `refs/` needs [`ReadAccess::can_read_path`]. So
+///   `refs/heads/NAME` and `refs/mirrors/ID/NAME` need `r` on `NAME`, and
+///   each other path under `refs/` is refused, `refs/remotes/` included.
+/// - An alias also needs [`ReadAccess::can_read_path`] on its target.
+/// - `summary` and `summary.sig` need [`ReadAccess::serves_summary`].
+/// - `config`, the objects, and the files under `extensions/`, `deltas/`,
+///   and `delta-indexes/` need no right.
+///
+/// A path that the client cannot read is refused.
 ///
 /// # File access
 ///
@@ -126,7 +146,8 @@ pub enum ArchiveAnswer {
     /// - a path with an empty component, or with a `.` at the start of a
     ///   component
     /// - `tmp/` and `state/`
-    /// - a path with a symlink on it that is no ref alias.
+    /// - a path with a symlink on it that is no ref alias
+    /// - a path that the [`ReadAccess`] of the request does not read.
     Refused,
 }
 
@@ -183,10 +204,12 @@ impl ArchiveView {
         }
     }
 
-    /// Returns the answer for one `GET` request path.
+    /// Returns the answer for one `GET` request path of a client with the
+    /// read rights `access`.
     ///
     /// The path is relative to the repository root and has no leading `/`.
-    /// [`ArchiveView`](ArchiveView#routing) states the routing.
+    /// [`ArchiveView`](ArchiveView#routing) states the routing and the
+    /// [read access](ArchiveView#read-access).
     ///
     /// # Built `.filez` objects
     ///
@@ -222,7 +245,7 @@ impl ArchiveView {
     /// - [`Error::InvalidFormat`] or [`Error::Core`] if the content object
     ///   for a built `.filez` is not a valid object, or its archive header
     ///   cannot be written.
-    pub async fn get(&self, path: &str) -> Result<ArchiveAnswer> {
+    pub async fn get(&self, path: &str, access: &ReadAccess) -> Result<ArchiveAnswer> {
         match classify(path, self.repo.mode()) {
             Route::Config => Ok(ArchiveAnswer::Bytes(built_config(
                 &*self.current_config().await?,
@@ -231,7 +254,7 @@ impl ArchiveView {
                 anchor,
                 path,
                 alias_ok,
-            } => Ok(match self.stored(anchor, path, alias_ok).await? {
+            } => Ok(match self.stored(anchor, path, alias_ok, access).await? {
                 Walked::File(file, len) => ArchiveAnswer::Stream {
                     len: Some(len),
                     body: Box::new(FileReader::with_len_hint(file, len)),
@@ -245,11 +268,12 @@ impl ArchiveView {
         }
     }
 
-    /// Returns the answer for one `HEAD` request path.
+    /// Returns the answer for one `HEAD` request path of a client with the
+    /// read rights `access`.
     ///
     /// The answer matches the answer of [`get`](ArchiveView::get) for a `GET`
-    /// of the same path. The view uses the same routing and the same walk. It
-    /// opens a stored file and does not read it.
+    /// of the same path and the same rights. The view uses the same routing
+    /// and the same walk. It opens a stored file and does not read it.
     ///
     /// For a `.filez` built on request, the view checks that the object is
     /// there. It reads no xattr and no byte of the object. Because of this, a
@@ -273,7 +297,7 @@ impl ArchiveView {
     ///   view checks this entry before the object, so a missing object in a
     ///   fan-out directory that exists also gives this error. For the same
     ///   path, [`get`](ArchiveView::get) gives [`ArchiveAnswer::NotFound`].
-    pub async fn head(&self, path: &str) -> Result<ArchiveHead> {
+    pub async fn head(&self, path: &str, access: &ReadAccess) -> Result<ArchiveHead> {
         match classify(path, self.repo.mode()) {
             Route::Config => Ok(ArchiveHead::Found {
                 len: Some(built_config(&*self.current_config().await?).len() as u64),
@@ -282,7 +306,7 @@ impl ArchiveView {
                 anchor,
                 path,
                 alias_ok,
-            } => Ok(match self.stored(anchor, path, alias_ok).await? {
+            } => Ok(match self.stored(anchor, path, alias_ok, access).await? {
                 Walked::File(_, len) => ArchiveHead::Found { len: Some(len) },
                 Walked::NotFound => ArchiveHead::NotFound,
                 Walked::Refused | Walked::Alias(_) => ArchiveHead::Refused,
@@ -348,8 +372,22 @@ impl ArchiveView {
     }
 
     /// Opens a stored file through the safe walk.
-    async fn stored(&self, anchor: Anchor, path: String, alias_ok: bool) -> Result<Walked> {
+    ///
+    /// A path under the repository root that `access` does not read is
+    /// refused before the walk. The target of an alias must also be a path
+    /// that `access` reads.
+    async fn stored(
+        &self,
+        anchor: Anchor,
+        path: String,
+        alias_ok: bool,
+        access: &ReadAccess,
+    ) -> Result<Walked> {
+        if anchor == Anchor::Repo && !readable(&path, access) {
+            return Ok(Walked::Refused);
+        }
         let repo = self.repo.clone();
+        let access = access.clone();
         let walked = ostrya_rt::unblock(move || {
             let root = match anchor {
                 Anchor::Repo => repo.repo_fd(),
@@ -359,8 +397,8 @@ impl ArchiveView {
                 Walked::Alias(body) => {
                     let link_dir = path.rsplit_once('/').map_or("", |(dir, _)| dir);
                     match resolve_alias(link_dir, &body) {
-                        Some(target) => walk(root, &target, false),
-                        None => Ok(Walked::Refused),
+                        Some(target) if access.can_read_path(&target) => walk(root, &target, false),
+                        _ => Ok(Walked::Refused),
                     }
                 }
                 walked => Ok(walked),
@@ -441,6 +479,20 @@ fn object_answer<T>(loaded: Result<T>) -> Result<Object<T>> {
             Ok(Object::Refused)
         }
         Err(e) => Err(e),
+    }
+}
+
+/// Returns `true` if `access` reads the stored file at `path` under the
+/// repository root.
+///
+/// `summary` and `summary.sig` need [`ReadAccess::serves_summary`]. A path
+/// under `refs/` needs [`ReadAccess::can_read_path`]. Each other path needs
+/// no right. The function reads no file.
+fn readable(path: &str, access: &ReadAccess) -> bool {
+    match path {
+        "summary" | "summary.sig" => access.serves_summary(),
+        _ if path.starts_with("refs/") => access.can_read_path(path),
+        _ => true,
     }
 }
 
@@ -554,6 +606,9 @@ fn classify(path: &str, mode: RepoMode) -> Route {
         ("config", None) => Route::Config,
         ("summary" | "summary.sig", None) => stored(false),
         ("refs", Some(_)) => stored(true),
+        ("extensions", Some(rest)) if rest == "ostrya" || rest.starts_with("ostrya/") => {
+            Route::NotFound
+        }
         ("extensions", Some(_)) => stored(false),
         ("deltas" | "delta-indexes", Some(_)) if archive => stored(false),
         ("objects", Some(rest)) => match rest.split_once('/') {
@@ -589,7 +644,7 @@ fn object_route(fanout: &str, name: &str, archive: bool) -> Route {
 }
 
 /// The result of the safe walk.
-enum Walked {
+pub(crate) enum Walked {
     /// A regular file and its size.
     File(std::fs::File, u64),
     NotFound,
@@ -613,7 +668,7 @@ enum Walked {
 /// longer than the kernel accepts is not found, and so is a path with nothing
 /// at it. A directory that the process cannot search fails the walk with its
 /// error.
-fn walk(root: BorrowedFd<'_>, path: &str, alias_ok: bool) -> io::Result<Walked> {
+pub(crate) fn walk(root: BorrowedFd<'_>, path: &str, alias_ok: bool) -> io::Result<Walked> {
     let (dirs, last) = match path.rsplit_once('/') {
         Some((dirs, last)) => (Some(dirs), last),
         None => (None, path),
@@ -686,7 +741,7 @@ fn not_a_directory(dir: BorrowedFd<'_>, part: &str) -> io::Result<Walked> {
 /// - a `..` that leaves `refs/`
 /// - a component that the router refuses by name
 /// - a result with no component under `refs/`.
-fn resolve_alias(link_dir: &str, body: &[u8]) -> Option<String> {
+pub(crate) fn resolve_alias(link_dir: &str, body: &[u8]) -> Option<String> {
     let body = std::str::from_utf8(body).ok()?;
     if body.starts_with('/') {
         return None;
@@ -925,8 +980,8 @@ const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     fn assert_send<T: Send>(_: &T) {}
     assert_send_sync::<ArchiveView>();
-    let _ = |view: &ArchiveView| assert_send(&view.get(""));
-    let _ = |view: &ArchiveView| assert_send(&view.head(""));
+    let _ = |view: &ArchiveView, access: &ReadAccess| assert_send(&view.get("", access));
+    let _ = |view: &ArchiveView, access: &ReadAccess| assert_send(&view.head("", access));
 };
 
 #[cfg(test)]
@@ -953,6 +1008,13 @@ mod tests {
         }
     }
 
+    /// The rights of an anonymous client under the implicit groups.
+    fn anyone() -> ReadAccess {
+        let config = config_of("[core]\nrepo_version=1\nmode=archive-z2\n");
+        let access = crate::access::ClientAccess::from_config(&config, Path::new("/")).unwrap();
+        ReadAccess::new(Arc::new(access), crate::access::AuthItem::Anonymous, None)
+    }
+
     const HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 
     #[test]
@@ -977,6 +1039,17 @@ mod tests {
                 route("extensions/x", mode),
                 stored(Anchor::Repo, "extensions/x", false)
             );
+            assert_eq!(
+                route("extensions/ostrya-x/y", mode),
+                stored(Anchor::Repo, "extensions/ostrya-x/y", false)
+            );
+            for path in [
+                "extensions/ostrya",
+                "extensions/ostrya/x",
+                "extensions/ostrya/a/b",
+            ] {
+                assert_eq!(route(path, mode), Route::NotFound, "{path}");
+            }
             for ext in ["commit", "dirtree", "dirmeta", "commitmeta"] {
                 assert_eq!(
                     route(&object(ext), mode),
@@ -1149,13 +1222,13 @@ mod tests {
             let leases = || view.compressors.leases.load(Ordering::Relaxed);
             let idle = || view.compressors.idle.lock().unwrap().len();
 
-            let answer = view.get(&filez_path(&checksum)).await.unwrap();
+            let answer = view.get(&filez_path(&checksum), &anyone()).await.unwrap();
             assert!(matches!(answer, ArchiveAnswer::Stream { len: None, .. }));
             drop(answer);
             assert_eq!(leases(), 0);
 
             let ArchiveAnswer::Stream { mut body, .. } =
-                view.get(&filez_path(&checksum)).await.unwrap()
+                view.get(&filez_path(&checksum), &anyone()).await.unwrap()
             else {
                 panic!("a stream");
             };
@@ -1169,7 +1242,7 @@ mod tests {
             assert_eq!(idle(), 1);
 
             let ArchiveAnswer::Stream { mut body, .. } =
-                view.get(&filez_path(&checksum)).await.unwrap()
+                view.get(&filez_path(&checksum), &anyone()).await.unwrap()
             else {
                 panic!("a stream");
             };
@@ -1195,7 +1268,8 @@ mod tests {
         view: &ArchiveView,
         checksum: &Checksum,
     ) -> Box<dyn AsyncRead + Unpin + Send> {
-        let ArchiveAnswer::Stream { mut body, .. } = view.get(&filez_path(checksum)).await.unwrap()
+        let ArchiveAnswer::Stream { mut body, .. } =
+            view.get(&filez_path(checksum), &anyone()).await.unwrap()
         else {
             panic!("a stream");
         };
@@ -1279,8 +1353,8 @@ mod tests {
         std::thread::spawn(move || {
             ostrya_rt::block_on(async {
                 let view = ArchiveView::new(repo);
-                let get = view.get(&filez_path(&checksum)).await;
-                let head = view.head(&filez_path(&checksum)).await;
+                let get = view.get(&filez_path(&checksum), &anyone()).await;
+                let head = view.head(&filez_path(&checksum), &anyone()).await;
                 tx.send((get.is_err(), head.is_err())).unwrap();
             });
         });
@@ -1298,9 +1372,9 @@ mod tests {
             let (repo, checksum) = repo_with_object(&dir).await;
             let view = ArchiveView::new(repo);
             let reads = || view.config_reads.load(Ordering::Relaxed);
-            view.get("config").await.unwrap();
+            view.get("config", &anyone()).await.unwrap();
             assert_eq!(reads(), 1);
-            view.get("config").await.unwrap();
+            view.get("config", &anyone()).await.unwrap();
             assert_eq!(reads(), 1);
 
             let config = dir.join("repo/config");
@@ -1314,9 +1388,9 @@ mod tests {
                 let path = path.as_str();
                 requests.push(Box::pin(async move {
                     if i % 2 == 0 {
-                        view.get("config").await.unwrap();
+                        view.get("config", &anyone()).await.unwrap();
                     } else {
-                        view.get(path).await.unwrap();
+                        view.get(path, &anyone()).await.unwrap();
                     }
                 }));
             }
@@ -1351,7 +1425,7 @@ mod tests {
             }
             let open = || async {
                 let ArchiveAnswer::Stream { body, .. } =
-                    view.get(&filez_path(&checksum)).await.unwrap()
+                    view.get(&filez_path(&checksum), &anyone()).await.unwrap()
                 else {
                     panic!("a stream");
                 };

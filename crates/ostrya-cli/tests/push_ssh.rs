@@ -446,12 +446,12 @@ fn a_session_with_no_client_name_is_refused() {
     }
 }
 
-/// A name that an `ssh:` item cannot hold ends `ostrya receive` with one
-/// error line and exit 1, before it reads its input. The line shows the name
-/// in escaped form, also a name with a line feed. `ostrya send` does not
-/// check the name, so it serves the session: with no input, it exits 0.
+/// A name that an `ssh:` item cannot hold ends `ostrya receive` and
+/// `ostrya send` with one error line and exit 1, before they read their
+/// input. The line shows the name in escaped form, also a name with a line
+/// feed.
 #[test]
-fn a_malformed_client_name_is_refused_by_receive_alone() {
+fn a_malformed_client_name_is_refused() {
     let base = TmpDir::new("badname");
     let dest = receiver(&base, RepoMode::Archive);
     for (logname, args) in [(Some("a\nb"), &[][..]), (None, &["--client= x"][..])] {
@@ -468,17 +468,12 @@ fn a_malformed_client_name_is_refused_by_receive_alone() {
             let out = run.output().unwrap();
             assert!(out.stdout.is_empty(), "{command} {logname:?}");
             let stderr = String::from_utf8_lossy(&out.stderr);
-            if command == "send" {
-                assert_eq!(out.status.code(), Some(0), "{logname:?}: {stderr}");
-                assert!(stderr.is_empty(), "{stderr}");
-                continue;
-            }
-            assert_eq!(out.status.code(), Some(1), "{logname:?}");
+            assert_eq!(out.status.code(), Some(1), "{command} {logname:?}");
             assert!(
                 stderr.starts_with("error: malformed client name \""),
-                "{stderr}"
+                "{command}: {stderr}"
             );
-            assert_eq!(stderr.lines().count(), 1, "{stderr}");
+            assert_eq!(stderr.lines().count(), 1, "{command}: {stderr}");
         }
     }
 }

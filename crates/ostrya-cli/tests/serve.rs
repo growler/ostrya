@@ -475,6 +475,66 @@ fn the_tool_pulls_an_alias_with_no_summary() {
     assert_eq!(pulled, commit);
 }
 
+/// With a client group, the server serves no summary, so the `ostree`
+/// command requests `refs/heads/<ref>`. It pulls a ref that the group of
+/// `anonymous` reads. A ref that the group does not read gets 404, so the
+/// pull of that ref fails.
+#[test]
+fn the_tool_pulls_a_readable_ref_with_no_summary() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("read-rights");
+    let src = build_tree(tmp.path());
+    let path = tmp.path().join("server");
+    let commit = server_repo(&path, "bare-user", &src, &[]);
+    let repo = format!("--repo={}", path.display());
+    let src = src.to_str().unwrap();
+    ok(
+        ostrya(),
+        &[
+            &repo,
+            "commit",
+            "-b",
+            "secret",
+            "-s",
+            "secret",
+            "--no-xattrs",
+            src,
+        ],
+    );
+    ok(ostrya(), &[&repo, "summary", "-u"]);
+    assert!(path.join("summary").exists());
+    let config = path.join("config");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str("[ex-ostrya client \"public\"]\nauth=anonymous\nallow=r:main\n");
+    std::fs::write(&config, text).unwrap();
+    let server = Serving::start(&path, &[]);
+
+    let response = raw(
+        &server.url,
+        "GET /summary HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n",
+    );
+    assert!(response.starts_with("HTTP/1.1 404 "), "{response}");
+    let pulled = pull(
+        &tmp.path().join("client"),
+        "archive",
+        &server.url,
+        None,
+        "main",
+    );
+    assert_eq!(pulled, commit);
+
+    let denied = client(&tmp.path().join("denied"), "archive", &server.url, None);
+    let out = run("ostree", &[&denied, "pull", "origin", "secret"]);
+    // The tool 2026.1 writes `error: While fetching URL/refs/heads/secret:
+    // Server returned HTTP 404`. The test checks the path and the status.
+    assert_eq!(out.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("/refs/heads/secret"), "{stderr}");
+    assert!(stderr.contains("404"), "{stderr}");
+}
+
 /// The summary of a repository in a mode other than `archive` names a delta
 /// that the view does not serve. A `bare-user` client of the `ostree` command
 /// fetches the objects loose. With `--require-static-deltas`, the pull fails.

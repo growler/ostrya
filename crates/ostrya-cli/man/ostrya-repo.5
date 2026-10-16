@@ -155,7 +155,7 @@ It removes a staging directory with no lock file, and each other entry except a 
 .TP
 \fB\%<repo>/extensions/\fR
 Reserved.
-\fB\%ostrya init\fR makes it empty, and \fB\%ostrya serve\fR serves its content as stored.
+\fB\%ostrya init\fR makes it empty, and \fB\%ostrya serve\fR serves its content as stored, except \fB\%extensions/ostrya/\fR.
 .TP
 \fB\%<repo>/deltas/\fR
 The static deltas.
@@ -241,6 +241,7 @@ The view serves these paths:
 .IP \(bu 2
 \fB\%summary\fR, \fB\%summary.sig\fR, \fB\%refs/\fR, and \fB\%extensions/\fR, as stored.
 An alias ref is served as its target.
+\fB\%extensions/ostrya/\fR is not served.
 .IP \(bu 2
 The metadata objects, as stored.
 .IP \(bu 2
@@ -250,6 +251,12 @@ In an archive repository the view serves them as stored, and in another mode it 
 \fB\%deltas/\fR and \fB\%delta\-indexes/\fR, in an archive repository alone.
 .PP
 The view refuses \fB\%tmp/\fR, \fB\%state/\fR, each name that starts with \fB\%.\fR, and each other path.
+.PP
+The client groups of the config give the read rights of each client, as \fB\%ostrya\-config\fR(1) states in "Read access".
+A ref under \fB\%refs/heads/\fR or \fB\%refs/mirrors/ID/\fR is served when the group of the client has \fB\%r\fR on its name.
+\fB\%refs/remotes/\fR and each other path under \fB\%refs/\fR are not served.
+\fB\%summary\fR and \fB\%summary.sig\fR are served only when the repository has no client group.
+Objects, deltas, \fB\%config\fR, and the other files under \fB\%extensions/\fR are served to each identified client.
 \fB\%ostrya serve\fR also serves \fB\%/_ostrya/refs/v1\fR, a list of refs that match a pattern, and \fB\%/_ostrya/receive/v1/\fR, the endpoint of a push over HTTP.
 These two are not files of the repository.
 .SH EXTENSIONS

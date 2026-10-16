@@ -433,12 +433,24 @@ enum Command {
     /// than `archive`, the server builds each `.filez` object on request. The
     /// server also answers the ref listing at `/_ostrya/refs/v1`, and has
     /// the receive endpoint of a push. The client groups of the repository
-    /// config give the push rights. The endpoint identifies the client of
-    /// each request by the auth items of the client groups: a bearer token, a
-    /// Basic credential, a client certificate, the client address, or
-    /// `anonymous`. A session takes the policy of the client group of the
-    /// local refs that carries the item. With no such group, or with a group
-    /// that opens no push session, the session request gets 403.
+    /// config give the read rights and the push rights. The server
+    /// identifies the client of each request by the auth items of the client
+    /// groups: a bearer token, a Basic credential, a client certificate, the
+    /// client address, or `anonymous`. A request that identifies no item gets
+    /// 401 or 403 and no file. A session takes the policy of the client group
+    /// of the local refs that carries the item. With no such group, or with a
+    /// group that opens no push session, the session request gets 403.
+    ///
+    /// A ref under `refs/heads/` or `refs/mirrors/ID/` is served when the
+    /// client group of the item has `r` on its name. An alias needs `r` on
+    /// its name and on its target. The ref listing holds the refs of
+    /// `refs/heads/` that the client reads. `refs/remotes/`, each other path
+    /// under `refs/`, and `extensions/ostrya/` get 404. `summary` and
+    /// `summary.sig` are served only when the repository has no client
+    /// group. Objects, deltas, `config`, and the other files under
+    /// `extensions/` are served to each identified client. A denied path gets
+    /// the 404 of an absent path. With no client group, each client reads
+    /// each local ref and each mirror ref.
     ///
     /// The server takes its settings from `[ex-ostrya server]` of the
     /// repository config. Each option of the command with the name of a key
@@ -464,9 +476,21 @@ enum Command {
     /// that path. It takes no lock and writes no file in the repository.
     ///
     /// The client name is --client, else the value of `LOGNAME`, which sshd
-    /// sets from the password entry of the user. With neither, the command
-    /// writes an error line and exits 1 before it opens the repository. The
-    /// name does not limit the paths that the session serves.
+    /// sets from the password entry of the user. With neither, and with a
+    /// name that the item `ssh:NAME` refuses, the command writes an error line
+    /// and exits 1 before it opens the repository. At start, the command
+    /// reads and checks the client groups and the server group of the
+    /// repository config. It reads no key group. A bad group ends it with
+    /// status 1.
+    ///
+    /// The session serves the refs that the client group of the item
+    /// `ssh:NAME` reads, as `ostrya serve` serves them to that item. When the
+    /// repository has client groups and none carries the item, the command
+    /// writes an error line and exits 1 before it reads standard input. The
+    /// session uses no
+    /// `anonymous` and no `net:` item. In a repository with no client group,
+    /// the session takes the item `anonymous`, so it serves each local ref,
+    /// each mirror ref, and the summary.
     ///
     /// Standard output carries the frames of the session alone. On failure,
     /// the command writes `error: MESSAGE` to standard error. It writes
@@ -2636,9 +2660,11 @@ struct ReceiveArgs {
 struct SendArgs {
     /// The client name of the session, in place of `LOGNAME`.
     ///
-    /// The name does not limit the paths that the session serves. The option
-    /// is safe only under a forced `command=` in `authorized_keys`, because a
-    /// user with a shell can give any name.
+    /// The session serves the refs of the client group that carries the item
+    /// `ssh:NAME`. NAME is not empty, holds no control character, and does
+    /// not start or end with white space. The option is safe only under a
+    /// forced `command=` in `authorized_keys`, because a user with a shell
+    /// can give any name.
     #[arg(long, value_name = "NAME")]
     client: Option<String>,
 }
@@ -2678,7 +2704,8 @@ struct ServeArgs {
     /// key. The CA verifies the certificate of the TLS handshake and the
     /// certificate that a trusted proxy forwards. A client that presents a
     /// certificate in the handshake must present one that the CA signed. A
-    /// client that presents no certificate is served. A client certificate
+    /// client that presents no certificate completes the handshake, and the
+    /// other auth items identify it. A client certificate
     /// that the CA signed can match a `tls:*`, `tls:NAME`, or
     /// `tls-sha256:HEX` item of a client group. The command reads FILE once,
     /// at start, and refuses a file larger than 1 MiB.
@@ -2691,7 +2718,7 @@ struct ServeArgs {
     /// the whole `trusted-proxy` key. The option needs a header of the client
     /// address, from --trusted-proxy-header or from the
     /// `trusted-proxy-header` key. From a peer in such a network, the
-    /// receive endpoint reads the client address from that header, the
+    /// server reads the client address from that header, the
     /// scheme `https`, and a forwarded client certificate. It walks the hops
     /// of the header from the right, and skips each hop in a trusted network.
     /// The first other hop is the client address. A proxy in the list must
@@ -2735,16 +2762,16 @@ struct ServeArgs {
     /// in the header, so only the proxy must be able to reach the listener.
     #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
     proxy_protocol: Option<bool>,
-    /// Take a bearer or Basic credential of push over plain HTTP.
+    /// Take a bearer or Basic credential over plain HTTP.
     ///
     /// `--allow-cleartext-credentials` takes such a credential, and
     /// `--allow-cleartext-credentials=false` refuses it. Without the option
-    /// and the key, the receive endpoint answers 403 to such a request, also
+    /// and the key, the server answers 403 to such a request, also
     /// when a client group has the `anonymous` item, unless a trusted proxy
     /// states the scheme `https` (see --trusted-proxy). Use it for a server
     /// on a loopback address, or behind a proxy that terminates TLS and is
-    /// not a trusted proxy. A read of the files of a pull needs no
-    /// credential.
+    /// not a trusted proxy. A read of the files of a pull takes the same
+    /// rule.
     #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
     allow_cleartext_credentials: Option<bool>,
     /// Abort a push session that stays idle for SECONDS.
@@ -3458,12 +3485,11 @@ async fn run(repo: Option<&Path>, verbose: bool, command: Command) -> Result<()>
         }
         #[cfg(feature = "send")]
         Command::Send(args) => {
-            // The name does not limit the session.
-            let _client = ssh_client_name(args.client, name);
+            let client = ssh_client(args.client, name);
             // `send` writes nothing on success, also under `--verbose`, so
             // `resolve_repo` does not write the repository line of `--verbose`.
             let (repo, _) = resolve_repo(repo, false, name).await;
-            send(repo).await
+            send(repo, client).await
         }
     }
 }
@@ -3643,7 +3669,7 @@ fn ssh_client_name(client: Option<String>, name: &str) -> String {
 /// [`ssh_client_name`] gives NAME. With a name that the item refuses, the
 /// process ends with one error line and exit 1. The line shows the name in
 /// escaped form, so a control character in the name does not split the line.
-#[cfg(feature = "receive")]
+#[cfg(any(feature = "receive", feature = "send"))]
 fn ssh_client(client: Option<String>, name: &str) -> ostrya::access::AuthItem {
     let client = ssh_client_name(client, name);
     match ostrya::access::AuthItem::parse(&format!("ssh:{client}")) {
@@ -3658,19 +3684,40 @@ fn ssh_client(client: Option<String>, name: &str) -> ostrya::access::AuthItem {
     }
 }
 
-/// Serves one pull session over standard input and standard output.
+/// Serves one pull session of the client `client` over standard input and
+/// standard output.
+///
+/// The command reads and checks the client groups and the server group of
+/// the repository config at start. It reads no key group, because a pull
+/// signs nothing. The session serves the refs that the client group of
+/// `client` reads. In a config with no client group, the session takes the
+/// item `anonymous` of the implicit groups. When no client group carries
+/// `client`, the process ends with an error line and exit 1 before the
+/// session reads its input.
 ///
 /// Standard output carries the frames of the session alone. A failure goes to
 /// standard error as the error line of [`main`]. The command takes no lock and
 /// writes no file in the repository.
 #[cfg(feature = "send")]
-async fn send(repo: Repo) -> Result<()> {
+async fn send(repo: Repo, client: ostrya::access::AuthItem) -> Result<()> {
+    use ostrya::access::{AuthItem, ClientAccess, ReadAccess};
+
+    let access = ClientAccess::from_config(repo.config(), repo.path())?;
+    let item = if !access.has_client_groups() {
+        AuthItem::Anonymous
+    } else if access.groups_of(&client).next().is_none() {
+        eprintln!("error: no client group carries the item {client}");
+        exit_process(1);
+    } else {
+        client
+    };
+    let access = ReadAccess::new(Arc::new(access), item, None);
     // The input is read at most 256 KiB ahead of the session. Under the smol
     // backend, the output goes through a blocking-pool pipe of 8 MiB, and a
     // flush waits until each byte reaches the descriptor. For this reason,
     // the session flushes only if no whole `Get` frame waits in its input
     // buffer.
-    repo.send(stdin_file()?, stdout_file()?).await
+    repo.send(stdin_file()?, stdout_file()?, &access).await
 }
 
 /// Pushes the commits that the refspecs name to a remote over ssh or HTTP.

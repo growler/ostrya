@@ -4100,9 +4100,16 @@ ostrya serve [--repo=PATH] [--listen=ADDR:PORT]...
   `../format-reference.md`, "Authentication of the receive endpoint", states
   the PROXY header, the walk of the hops, the scheme `https` of a trusted
   proxy, and the forms of a forwarded certificate.
-- The receive endpoint identifies the client of each request by the auth
-  items of the client groups: a bearer token, a Basic credential, a client
-  certificate, the client address, or `anonymous`. A `session` request
+- The server identifies the client of each request by the auth items of the
+  client groups: a bearer token, a Basic credential, a client certificate,
+  the client address, or `anonymous`. This applies to the reads of the
+  archive view and of the ref listing too. A read that identifies no item
+  gets 401 or 403 with an empty body. A ref under `refs/heads/` or
+  `refs/mirrors/ID/` is served when the group of the item has `r` on its
+  name, and the ref listing holds these refs alone. `refs/remotes/` and
+  `extensions/ostrya/` get 404. `summary` and `summary.sig` are served only
+  with no client group in the config. `../format-reference.md`, "Read
+  access", states the rules. The tool has no such rights. A `session` request
   takes the policy of the client group of the local refs that carries the
   item. An item with no such group gets 403 with `unauthorized` and the
   message `no client group of the request covers the local refs`. A group
@@ -4114,16 +4121,15 @@ ostrya serve [--repo=PATH] [--listen=ADDR:PORT]...
   of a session.
 - With `tls-client-ca`, a client certificate that the CA signed can match a
   `tls:*`, `tls:NAME`, or `tls-sha256:HEX` item.
-- Without `allow-cleartext-credentials`, a request of the receive endpoint
-  with a bearer or Basic credential over plain HTTP gets 403, also when a
-  group has the `anonymous` item. `allow-cleartext-credentials=true` and
+- Without `allow-cleartext-credentials`, a request with a bearer or Basic
+  credential over plain HTTP gets 403, also when a group has the
+  `anonymous` item. `allow-cleartext-credentials=true` and
   `--allow-cleartext-credentials` take such a credential. Use them for a
   server on a loopback address, or behind a proxy that terminates TLS and
   is not in `trusted-proxy`. A trusted proxy that reports the scheme `https`
   needs neither.
   `--allow-cleartext-credentials=false` refuses such a credential, also when
-  the key is `true`. A read of the archive view ignores the `Authorization`
-  header and needs no credential.
+  the key is `true`. The rule applies to a read of the archive view too.
 - A refusal of the receive endpoint that comes before the request body is
   read, as a 401, a 403, a 404, or a 405, reads and drops up to 1 MiB of the
   body within the session timeout, from `session-timeout` or
@@ -4169,8 +4175,9 @@ ostrya serve [--repo=PATH] [--listen=ADDR:PORT]...
   passphrase.
 - `tls-client-ca` needs `tls-cert` or `trusted-proxy-client-cert`, from a
   key or from an option. A client that presents a certificate in the TLS
-  handshake must present one the CA signed. A client that presents none is
-  served, and a read needs no certificate. The CA also verifies the
+  handshake must present one the CA signed. A client that presents none
+  completes the handshake, and the other auth items identify it. The CA
+  also verifies the
   certificate that a trusted proxy forwards, also on a plain HTTP listener.
 - `--body-timeout` takes a positive number of seconds, and the default is
   60. A connection ends when a response waits longer than that time for the
@@ -4200,6 +4207,12 @@ ostrya serve [--repo=PATH] [--listen=ADDR:PORT]...
   'bare-user-shared' in repository configuration`. A pull from such a
   repository with no summary succeeds. The gap is recorded and kept: a pull
   of the tool from a `bare-user-shared` repository is no goal of the port.
+- With a client group in the config, the command serves no summary, so
+  `ostree pull` requests `refs/heads/NAME`. A pull of a ref that the group
+  of `anonymous` reads succeeds and passes `ostree fsck`. A ref that the
+  group does not read gets 404, and the tool 2026.1 exits 1 with `error:
+  While fetching URL/refs/heads/NAME: Server returned HTTP 404`, in
+  `crates/ostrya-cli/tests/serve.rs`.
 
 ### `send`
 
@@ -4213,15 +4226,24 @@ ostrya send [--repo=PATH] [--client=NAME]
 - The client name is `--client`, else the value of `LOGNAME`, as for
   `receive`. With no name, the command writes `error: send needs a client
   name: give --client, or set LOGNAME` and exits 1 before it opens the
-  repository. The command does not check the name against the form of an
-  `ssh:` item, and the name does not limit the paths that the session
-  serves.
+  repository. A name that an `ssh:` item cannot hold gets the error line of
+  `receive` and exit 1. The session serves the refs that the client group
+  of `ssh:NAME` reads, as `serve` serves them to that item
+  (`../format-reference.md`, "Read access"). In a repository with client
+  groups, a name that no group carries gets `error: no client group carries
+  the item ssh:NAME` and exit 1 before the command reads its input. In a
+  repository with no client group, the session takes the item `anonymous`,
+  so it serves each local ref, each mirror ref, and the summary. At start,
+  the command reads and checks the client groups and the server group. It
+  reads no key of a trust group or a key group, and a bad group ends it
+  with `error: MESSAGE` at exit 1.
   `--client` is safe only under a forced `command=` in `authorized_keys`,
   because a user with a shell can give any name.
 - The command serves one pull session over standard input and standard
   output, through `Repo::send`. An ssh pull runs it on the remote side. It answers each
   `Get` path as the archive view of `serve` answers a `GET` of that path. A
-  path that the view refuses gets the reply of a path that is not found.
+  path that the view refuses, and a path that the client cannot read, get
+  the reply of a path that is not found.
 - The command takes no lock and writes no file in the repository. An
   account with read access to the repository serves an `archive`,
   `bare-user`, `bare-user-only`, or `bare-user-shared` repository. A `bare`

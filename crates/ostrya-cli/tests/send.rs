@@ -8,10 +8,12 @@ use std::io::{Read, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use ostrya::Repo;
+use ostrya::access::{AuthItem, ClientAccess, ReadAccess};
 use ostrya::remote::ErrorCode;
 use ostrya::remote::proto::{FrameReader, FrameWriter, GetReply, Message, ObjectRead, PullHello};
 use ostrya_rt::block_on;
@@ -308,7 +310,12 @@ fn send_serves_a_repository_its_user_cannot_write() {
         let mut expected = Vec::new();
         block_on(async {
             let handle = Repo::open(&repo).await.unwrap();
-            handle.send(&input[..], &mut expected).await.unwrap();
+            let access = ClientAccess::from_config(handle.config(), handle.path()).unwrap();
+            let access = ReadAccess::new(Arc::new(access), AuthItem::Anonymous, None);
+            handle
+                .send(&input[..], &mut expected, &access)
+                .await
+                .unwrap();
         });
         assert_eq!(out.stdout, expected, "{}", repo.display());
 
@@ -319,6 +326,99 @@ fn send_serves_a_repository_its_user_cannot_write() {
             0
         );
     }
+}
+
+/// Appends `groups` to the config of the repository at `repo`.
+fn add_groups(repo: &Path, groups: &str) {
+    let config = repo.join("config");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(groups);
+    std::fs::write(&config, text).unwrap();
+}
+
+/// The `found` value of each `GetReply` of a session output, in order.
+fn found(out: &Output) -> Vec<bool> {
+    messages(&out.stdout)
+        .iter()
+        .filter_map(|(msg, _)| match msg {
+            Message::GetReply(reply) => Some(reply.found),
+            _ => None,
+        })
+        .collect()
+}
+
+/// With client groups, a name that no `ssh:` item carries ends `send` with
+/// one error line and exit 1, before it reads standard input. Standard
+/// output stays empty.
+#[test]
+fn send_refuses_a_name_with_no_ssh_item() {
+    let tmp = TmpDir::new("no-item");
+    let repo = archive_copy(&tmp.0);
+    add_groups(
+        &repo,
+        "[ex-ostrya client \"other\"]\nauth=ssh:other;anonymous\nallow=r:**\n",
+    );
+    let input = frames(&[pull_hello(1), Message::Get("config".to_owned())]);
+    let out = send(&repo, &[], input);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+    assert!(out.stdout.is_empty(), "{out:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "error: no client group carries the item ssh:puller\n"
+    );
+}
+
+/// The session serves the refs that the group of `ssh:NAME` reads. Another
+/// ref and the summary get the reply of an absent path, and `ListRefs`
+/// holds the readable refs alone. Objects and `config` are served.
+#[test]
+fn send_serves_the_readable_refs_of_the_name() {
+    let tmp = TmpDir::new("rights");
+    let repo = archive_copy(&tmp.0);
+    let heads = repo.join("refs/heads");
+    std::fs::copy(heads.join("test/main"), heads.join("secret")).unwrap();
+    std::fs::write(repo.join("summary"), b"summary").unwrap();
+    add_groups(
+        &repo,
+        "[ex-ostrya client \"puller\"]\nauth=ssh:puller\nallow=r:test/**\n",
+    );
+    let input = frames(&[
+        pull_hello(1),
+        Message::Get("refs/heads/test/main".to_owned()),
+        Message::Get("refs/heads/secret".to_owned()),
+        Message::Get("summary".to_owned()),
+        Message::Get("config".to_owned()),
+        Message::ListRefs(Vec::new()),
+    ]);
+    let out = send(&repo, &[], input);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(found(&out), [true, false, false, true, true]);
+    let msgs = messages(&out.stdout);
+    let listing = ostrya::Summary::parse(&msgs.last().unwrap().1).unwrap();
+    let names: Vec<&str> = listing.refs.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(names, ["test/main"]);
+}
+
+/// In a repository with no client group, the session takes the item
+/// `anonymous` of the implicit groups: it serves each ref and the summary,
+/// whatever the client name.
+#[test]
+fn send_with_no_client_group_serves_each_ref() {
+    let tmp = TmpDir::new("implicit");
+    let repo = archive_copy(&tmp.0);
+    let heads = repo.join("refs/heads");
+    std::fs::copy(heads.join("test/main"), heads.join("secret")).unwrap();
+    std::fs::write(repo.join("summary"), b"summary").unwrap();
+    let input = frames(&[
+        pull_hello(1),
+        Message::Get("refs/heads/test/main".to_owned()),
+        Message::Get("refs/heads/secret".to_owned()),
+        Message::Get("summary".to_owned()),
+        Message::Get("refs/remotes/o/x".to_owned()),
+    ]);
+    let out = send(&repo, &[], input);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(found(&out), [true, true, true, false]);
 }
 
 /// The anonymous resident memory of process `pid`, `RssAnon` of

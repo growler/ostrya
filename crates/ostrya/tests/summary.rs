@@ -17,7 +17,9 @@ mod common;
 use std::path::Path;
 use std::process::Command;
 
-use common::{TmpDir, fixture_root, ostree_available, ostree_supports_ed25519};
+use common::{
+    TmpDir, anyone, fixture_root, ostree_available, ostree_supports_ed25519, read_access,
+};
 use ostrya::base64;
 use ostrya::{
     AdvertisedDelta, Checksum, DeltaOptions, Ed25519Signer, Ed25519Verifier, RefSelector, Repo,
@@ -808,9 +810,10 @@ fn selector(entries: &[&str]) -> RefSelector {
     RefSelector::parse(entries.iter().copied()).unwrap()
 }
 
-/// Builds the ref listing of the selector that `entries` give.
+/// Builds the ref listing of the selector that `entries` give, with the
+/// rights of an anonymous client under the implicit groups.
 async fn list(repo: &Repo, entries: &[&str]) -> Result<Vec<u8>, ostrya::Error> {
-    repo.build_ref_listing(&selector(entries)).await
+    repo.build_ref_listing(&selector(entries), &anyone()).await
 }
 
 /// Returns the names of `list_refs(None)` that the selector of `entries`
@@ -912,28 +915,25 @@ fn a_ref_listing_selects_refs_by_pattern() {
         let listing = list(&repo, &["x/al"]).await.unwrap();
         assert_eq!(Summary::parse(&listing).unwrap().lookup("x/al"), Some(main));
 
-        // A walk reports a symlink to a directory as one entry. A listing
-        // that selects it reads it as a ref and fails, as `list_refs` does. A
-        // pattern below it selects nothing. A negative entry for it comes
-        // before the read, so the listing does not fail.
+        // A walk reports a symlink to a directory as one entry. The alias
+        // names no regular file, so the listing leaves it out, as the archive
+        // view does not serve it. `list_refs` reads it as a ref and fails. A
+        // pattern below it selects nothing.
         std::os::unix::fs::symlink("a", heads.join("ln")).unwrap();
         assert!(matches!(
             repo.list_refs(Some("ln")).await,
             Err(ostrya::Error::Io(_))
         ));
-        for entries in [
-            &["ln"][..],
-            &["a/**", "ln"][..],
-            &["*"][..],
-            &["**"][..],
-            &[][..],
-            &["!a/**"][..],
+        for (entries, want) in [
+            (&["ln"][..], vec![]),
+            (&["a/**", "ln"][..], vec!["a/b", "a/bc", "a/c/d"]),
+            (&["*"][..], vec!["ab", "main", "other"]),
+            (&["**"][..], all.to_vec()),
+            (&[][..], all.to_vec()),
+            (&["!a/**"][..], vec!["ab", "main", "other", "x/al", "x/y"]),
         ] {
-            let outcome = list(&repo, entries).await;
-            assert!(
-                matches!(outcome, Err(ostrya::Error::Io(_))),
-                "{entries:?}: {outcome:?}"
-            );
+            let listing = list(&repo, entries).await.unwrap();
+            assert_eq!(listed_names(&listing), want, "{entries:?}");
         }
         for entries in [
             &["ln/*"][..],
@@ -1234,6 +1234,134 @@ fn a_ref_listing_reads_only_the_refs_that_it_selects() {
             let listing = list(&repo, entries).await.unwrap();
             assert_eq!(listed_names(&listing), want, "{entries:?}");
         }
+    });
+}
+
+/// The listing holds the selected refs that the group of the item can
+/// read. A ref that the client cannot read is not read, so a broken ref of
+/// that kind fails no listing of this client. The same ref fails the
+/// listing of a client that reads it.
+#[test]
+fn a_ref_listing_holds_the_readable_refs_alone() {
+    let (_tmp, repo_dir) = writable_fixture("summary", "listing-rights");
+    block_on(async {
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        add_prefix_refs(&repo).await;
+        let heads = repo_dir.join("refs/heads");
+        std::fs::write(heads.join("garbage"), "no checksum\n").unwrap();
+        let missing = Checksum::from_bytes([7; 32]);
+        repo.set_ref_immediate("broken", Some(&missing))
+            .await
+            .unwrap();
+        let reader = read_access(
+            "[ex-ostrya client \"c\"]\nauth=ssh:u\nallow=r:a/**;w:main;d:ab\ndeny=a/c/**\n",
+            "ssh:u",
+        );
+        for (entries, want) in [
+            (&[][..], vec!["a/b", "a/bc", "main"]),
+            (&["*"][..], vec!["main"]),
+            (&["a/**", "ab", "garbage"][..], vec!["a/b", "a/bc"]),
+            (&["!a/bc"][..], vec!["a/b", "main"]),
+        ] {
+            let listing = repo
+                .build_ref_listing(&selector(entries), &reader)
+                .await
+                .unwrap();
+            assert_eq!(listed_names(&listing), want, "{entries:?}");
+        }
+        let stranger = read_access(
+            "[ex-ostrya client \"c\"]\nauth=ssh:u\nallow=r:**\n",
+            "ssh:v",
+        );
+        let listing = repo
+            .build_ref_listing(&selector(&[]), &stranger)
+            .await
+            .unwrap();
+        assert!(listed_names(&listing).is_empty());
+        let outcome = list(&repo, &["garbage"]).await;
+        assert!(
+            matches!(outcome, Err(ostrya::Error::Core(_))),
+            "{outcome:?}"
+        );
+        let all = read_access(
+            "[ex-ostrya client \"c\"]\nauth=ssh:u\nallow=r:**\n",
+            "ssh:u",
+        );
+        let outcome = repo.build_ref_listing(&selector(&["broken"]), &all).await;
+        assert!(
+            matches!(outcome, Err(ostrya::Error::ObjectNotFound { .. })),
+            "{outcome:?}"
+        );
+    });
+}
+
+/// A client with no group of the local refs, and a client whose group of
+/// the local refs gives no `r`, read no entry of `refs/heads`. The listing
+/// of each one is empty also when `refs/heads` is a regular file, which
+/// fails the listing of a client that reads local refs.
+#[test]
+fn a_client_that_reads_no_local_ref_reads_no_entry_of_refs_heads() {
+    let (_tmp, repo_dir) = writable_fixture("summary", "listing-no-local");
+    block_on(async {
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        let heads = repo_dir.join("refs/heads");
+        std::fs::remove_dir_all(&heads).unwrap();
+        std::fs::write(&heads, "").unwrap();
+        let groups = "[ex-ostrya client \"mirrors\"]\nauth=ssh:m\ncollection=*\nallow=r:**\n\
+                      [ex-ostrya client \"delete\"]\nauth=ssh:d\nallow=d:**\n\
+                      [ex-ostrya client \"all\"]\nauth=ssh:a\nallow=r:**\n";
+        for item in ["ssh:m", "ssh:d", "ssh:other"] {
+            let listing = repo
+                .build_ref_listing(&selector(&[]), &read_access(groups, item))
+                .await
+                .unwrap();
+            assert!(listed_names(&listing).is_empty(), "{item}");
+        }
+        let outcome = repo
+            .build_ref_listing(&selector(&[]), &read_access(groups, "ssh:a"))
+            .await;
+        assert!(matches!(outcome, Err(ostrya::Error::Io(_))), "{outcome:?}");
+    });
+}
+
+/// An alias is in the listing when the client reads its name and its
+/// target, and the alias resolves by the rule of the archive view: a
+/// relative body inside `refs/`, one link, and a regular file at the
+/// target. An absolute body, an alias of an alias, and an alias to a ref
+/// under `refs/remotes/` are left out, also under the implicit groups.
+#[test]
+fn the_listing_applies_the_alias_rule() {
+    let (_tmp, repo_dir) = writable_fixture("summary", "listing-alias-rule");
+    block_on(async {
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        let (main, _) = add_prefix_refs(&repo).await;
+        let heads = repo_dir.join("refs/heads");
+        let remotes = repo_dir.join("refs/remotes/o");
+        std::fs::create_dir_all(&remotes).unwrap();
+        std::fs::copy(heads.join("main"), remotes.join("x")).unwrap();
+        let absolute = heads.join("a/b").canonicalize().unwrap();
+        for (alias, body) in [
+            ("x/hidden", "../ab"),
+            ("x/abs", absolute.to_str().unwrap()),
+            ("x/chain", "al"),
+            ("x/remote", "../../remotes/o/x"),
+            ("x/out", "../../../config"),
+            ("zz", "a/b"),
+        ] {
+            std::os::unix::fs::symlink(body, heads.join(alias)).unwrap();
+        }
+        let reader = read_access(
+            "[ex-ostrya client \"c\"]\nauth=anonymous\nallow=r:x/**;r:a/b\n",
+            "anonymous",
+        );
+        let listing = repo
+            .build_ref_listing(&selector(&["x/**", "zz"]), &reader)
+            .await
+            .unwrap();
+        assert_eq!(listed_names(&listing), ["x/al", "x/y"]);
+        assert_eq!(Summary::parse(&listing).unwrap().lookup("x/al"), Some(main));
+        let listing = list(&repo, &["x/**", "zz"]).await.unwrap();
+        assert_eq!(listed_names(&listing), ["x/al", "x/hidden", "x/y", "zz"]);
     });
 }
 

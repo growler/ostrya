@@ -27,15 +27,16 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use common::TmpDir;
 use common::modes::{
     WRITABLE, build_tree, commit, file_objects, object_path, repo_of, write_split_object,
 };
 use common::pipe::{PipeReader, PipeWriter, pipe};
+use common::{TmpDir, anyone, repo_access};
 use futures_io::AsyncWrite;
 use futures_lite::future;
 use futures_lite::io::{AsyncReadExt, AsyncWriteExt, Cursor};
 use ostrya::RefSelector;
+use ostrya::access::ReadAccess;
 use ostrya::remote::ErrorCode;
 use ostrya::remote::proto::{
     ErrorMessage, FrameReader, FrameWriter, GetReply, Hello, MIN_FRAME_LIMIT, Message, ObjectRead,
@@ -235,8 +236,24 @@ async fn fetch(client: &mut Client, paths: &[String], depth: usize) -> (Vec<Repl
 }
 
 /// Runs a session of `repo` against the client `script`, over two pipes of
-/// `cap` bytes.
+/// `cap` bytes, with the rights of an anonymous client under the groups of
+/// the config of `repo`.
 fn session<F, Fut, T>(repo: &Repo, cap: usize, script: F) -> (ostrya::Result<()>, T)
+where
+    F: FnOnce(Client) -> Fut,
+    Fut: Future<Output = T>,
+{
+    session_as(repo, &repo_access(repo, "anonymous"), cap, script)
+}
+
+/// Runs a session of `repo` with the rights `access` against the client
+/// `script`, over two pipes of `cap` bytes.
+fn session_as<F, Fut, T>(
+    repo: &Repo,
+    access: &ReadAccess,
+    cap: usize,
+    script: F,
+) -> (ostrya::Result<()>, T)
 where
     F: FnOnce(Client) -> Fut,
     Fut: Future<Output = T>,
@@ -250,7 +267,7 @@ where
     block_on(within(
         LIMIT,
         "the session",
-        future::zip(repo.send(server_in, server_out), script(client)),
+        future::zip(repo.send(server_in, server_out, access), script(client)),
     ))
 }
 
@@ -264,7 +281,7 @@ fn returned_code(result: &ostrya::Result<()>) -> Option<ErrorCode> {
 
 /// What the archive view serves for `path`.
 async fn view_reply(view: &ArchiveView, path: &str) -> Reply {
-    match view.get(path).await.unwrap() {
+    match view.get(path, &anyone()).await.unwrap() {
         ArchiveAnswer::Bytes(body) => Reply {
             found: true,
             len: Some(body.len() as u64),
@@ -513,13 +530,19 @@ fn refused_and_absent_paths_get_the_not_found_reply() {
     block_on(async {
         for p in refused {
             assert!(
-                matches!(view.get(p).await.unwrap(), ArchiveAnswer::Refused),
+                matches!(
+                    view.get(p, &anyone()).await.unwrap(),
+                    ArchiveAnswer::Refused
+                ),
                 "{p}"
             );
         }
         for p in absent {
             assert!(
-                matches!(view.get(p).await.unwrap(), ArchiveAnswer::NotFound),
+                matches!(
+                    view.get(p, &anyone()).await.unwrap(),
+                    ArchiveAnswer::NotFound
+                ),
                 "{p}"
             );
         }
@@ -690,6 +713,93 @@ fn listing_repo(tmp: &TmpDir) -> Repo {
     repo
 }
 
+/// Appends `groups` to the config of `repo`, and returns the repository
+/// opened again.
+fn with_groups(repo: &Repo, groups: &str) -> Repo {
+    let config = repo.path().join("config");
+    let mut text = fs::read_to_string(&config).unwrap();
+    text.push_str(groups);
+    fs::write(&config, text).unwrap();
+    block_on(Repo::open(repo.path())).unwrap()
+}
+
+/// The client groups of the rights tests: `ssh:puller` reads the refs under
+/// `a/`, and `ssh:all` reads each ref.
+const PULLER_GROUPS: &str = "[ex-ostrya client \"puller\"]\nauth=ssh:puller\nallow=r:a/**\n\
+                             [ex-ostrya client \"all\"]\nauth=ssh:all\nallow=r:**\n";
+
+/// A session serves the refs that its item reads. Another ref gets the
+/// reply of an absent path. `summary` is served with no client group alone.
+#[test]
+fn a_session_serves_the_refs_of_its_item() {
+    let tmp = TmpDir::new("send-ref-rights");
+    let repo = listing_repo(&tmp);
+    block_on(repo.regenerate_summary(&SummaryOptions::default())).unwrap();
+    let paths = ["refs/heads/a/b", "refs/heads/z", "summary", "config"];
+    let fetch_all = |repo: &Repo, access: &ReadAccess| {
+        let (result, replies) = session_as(repo, access, PIPE_CAP, |mut c| async move {
+            c.open().await;
+            fetch(&mut c, &paths.map(str::to_owned), 4).await.0
+        });
+        result.unwrap();
+        replies
+    };
+    let open = fetch_all(&repo, &repo_access(&repo, "anonymous"));
+    assert!(open.iter().all(|reply| reply.found), "{open:?}");
+
+    let repo = with_groups(&repo, PULLER_GROUPS);
+    let replies = fetch_all(&repo, &repo_access(&repo, "ssh:puller"));
+    let found: Vec<bool> = replies.iter().map(|reply| reply.found).collect();
+    assert_eq!(found, [true, false, false, true]);
+    assert_eq!(
+        replies[0].body,
+        fs::read(repo.path().join("refs/heads/a/b")).unwrap()
+    );
+    assert_eq!(replies[1], Reply::not_found());
+    let replies = fetch_all(&repo, &repo_access(&repo, "ssh:all"));
+    let found: Vec<bool> = replies.iter().map(|reply| reply.found).collect();
+    assert_eq!(found, [true, true, false, true]);
+}
+
+/// The listing of a `ListRefs` holds the refs that the item of the session
+/// reads, and equals the listing that `build_ref_listing` builds with the
+/// same rights. A ref that the item cannot read is not read, so a broken
+/// ref of that kind does not fail the listing.
+#[test]
+fn list_refs_holds_the_readable_refs_alone() {
+    let tmp = TmpDir::new("send-list-refs-rights");
+    let repo = with_groups(&listing_repo(&tmp), PULLER_GROUPS);
+    let missing = Checksum::from_bytes([7; 32]);
+    block_on(repo.set_ref_immediate("broken", Some(&missing))).unwrap();
+    let access = repo_access(&repo, "ssh:puller");
+    let (result, reply) = session_as(&repo, &access, PIPE_CAP, |mut c| async move {
+        c.open().await;
+        c.send(&Message::ListRefs(Vec::new())).await;
+        read_reply(&mut c.reader).await
+    });
+    result.unwrap();
+    let selector = RefSelector::parse([]).unwrap();
+    assert_eq!(
+        reply.body,
+        block_on(repo.build_ref_listing(&selector, &access)).unwrap()
+    );
+    let parsed = ostrya::Summary::parse(&reply.body).unwrap();
+    let names: Vec<&str> = parsed.refs.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(names, ["a/b", "a/bc"]);
+
+    let all = repo_access(&repo, "ssh:all");
+    let (result, error) = session_as(&repo, &all, PIPE_CAP, |mut c| async move {
+        c.open().await;
+        c.send(&Message::ListRefs(Vec::new())).await;
+        c.error().await
+    });
+    assert!(
+        matches!(result, Err(Error::ObjectNotFound { .. })),
+        "{result:?}"
+    );
+    assert_eq!(error.code, ErrorCode::Internal);
+}
+
 /// The session answers each `ListRefs` with a found reply that states the
 /// length of the listing, and the body is the listing that
 /// `build_ref_listing` builds. A `Get` between two `ListRefs` keeps its
@@ -712,7 +822,7 @@ fn list_refs_answers_with_the_built_listing() {
     result.unwrap();
     for (reply, entries) in [(&replies[0], &["a/b"][..]), (&replies[2], &[])] {
         let selector = RefSelector::parse(entries.iter().copied()).unwrap();
-        let listing = block_on(repo.build_ref_listing(&selector)).unwrap();
+        let listing = block_on(repo.build_ref_listing(&selector, &anyone())).unwrap();
         assert!(reply.found, "{entries:?}");
         assert_eq!(reply.len, Some(listing.len() as u64), "{entries:?}");
         assert_eq!(reply.body, listing, "{entries:?}");
@@ -750,7 +860,7 @@ fn list_refs_selects_refs_by_pattern() {
         let selector = RefSelector::parse(entries.iter().map(String::as_str)).unwrap();
         assert_eq!(
             reply.body,
-            block_on(repo.build_ref_listing(&selector)).unwrap()
+            block_on(repo.build_ref_listing(&selector, &anyone())).unwrap()
         );
         let parsed = ostrya::Summary::parse(&reply.body).unwrap();
         let names: Vec<&str> = parsed.refs.iter().map(|r| r.name.as_str()).collect();
@@ -1130,7 +1240,11 @@ fn record(repo: &Repo, input: Vec<u8>) -> (ostrya::Result<()>, Recorder) {
     let result = block_on(within(
         LIMIT,
         "the session",
-        repo.send(Cursor::new(input), &mut out),
+        repo.send(
+            Cursor::new(input),
+            &mut out,
+            &repo_access(repo, "anonymous"),
+        ),
     ));
     (result, out)
 }

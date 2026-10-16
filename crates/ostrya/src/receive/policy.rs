@@ -128,7 +128,7 @@ impl ReceivePolicy {
 /// [`from_config`](ReceivePolicies::from_config) builds the value.
 #[derive(Debug, Clone)]
 pub struct ReceivePolicies {
-    access: ClientAccess,
+    access: Arc<ClientAccess>,
     /// The policy of each group of `access`, in the same order.
     policies: Vec<Arc<ReceivePolicy>>,
 }
@@ -203,12 +203,15 @@ impl ReceivePolicies {
     ///   fails.
     pub async fn from_config(repo: &Repo) -> Result<ReceivePolicies> {
         let (access, policies) = reader::read(repo).await?;
-        Ok(ReceivePolicies { access, policies })
+        Ok(ReceivePolicies {
+            access: Arc::new(access),
+            policies,
+        })
     }
 
     /// Returns the client groups and the server settings that the policies
-    /// come from.
-    pub fn access(&self) -> &ClientAccess {
+    /// come from. A clone of the `Arc` shares them.
+    pub fn access(&self) -> &Arc<ClientAccess> {
         &self.access
     }
 

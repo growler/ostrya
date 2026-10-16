@@ -19,6 +19,30 @@ pub mod pipe;
 #[cfg(feature = "receive")]
 pub mod receive;
 
+/// Returns the read rights of an anonymous client under the two implicit
+/// groups of a config with no client group.
+pub fn anyone() -> ostrya::access::ReadAccess {
+    read_access("", "anonymous")
+}
+
+/// Returns the read rights of the client with the auth item `item` under
+/// the client groups `groups`, in a repository with no collection id.
+pub fn read_access(groups: &str, item: &str) -> ostrya::access::ReadAccess {
+    let text = format!("[core]\nrepo_version=1\nmode=archive-z2\n{groups}");
+    let config = ostrya::RepoConfig::parse(&text).unwrap();
+    let access = ostrya::access::ClientAccess::from_config(&config, Path::new("/")).unwrap();
+    let item = ostrya::access::AuthItem::parse(item).unwrap();
+    ostrya::access::ReadAccess::new(Arc::new(access), item, None)
+}
+
+/// Returns the read rights of the client with the auth item `item` under
+/// the client groups of the config of `repo`.
+pub fn repo_access(repo: &ostrya::Repo, item: &str) -> ostrya::access::ReadAccess {
+    let access = ostrya::access::ClientAccess::from_config(repo.config(), repo.path()).unwrap();
+    let item = ostrya::access::AuthItem::parse(item).unwrap();
+    ostrya::access::ReadAccess::new(Arc::new(access), item, None)
+}
+
 /// Returns the root directory of the fixture repositories of the `ostree` command.
 ///
 /// The `ostree` command generated these repositories. The root holds one

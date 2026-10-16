@@ -67,7 +67,7 @@ pub(crate) struct ClientCert {
     /// is `None` if the DER bytes do not parse.
     pub(crate) not_after: Option<Duration>,
     /// The claims of the URI SANs, or why they do not parse.
-    pub(crate) claims: Result<Claims, ClaimFault>,
+    pub(crate) claims: Result<Arc<Claims>, ClaimFault>,
 }
 
 impl ClientCert {
@@ -93,7 +93,8 @@ impl ClientCert {
                 .map(|cert| cert.tbs_certificate.validity.not_after.to_unix_duration()),
             claims: cert
                 .as_ref()
-                .map_or(Err(ClaimFault::Unreadable(UNDECODABLE)), claims),
+                .map_or(Err(ClaimFault::Unreadable(UNDECODABLE)), claims)
+                .map(Arc::new),
         }
     }
 }
@@ -758,9 +759,12 @@ mod tests {
         let dns = ClientCert::from_der(&ca.leaf_with("dns", None, &[san.to_der().unwrap()]));
         assert_eq!(claim_texts(&dns), ["Local d:b".to_owned()]);
         let none = ClientCert::from_der(&ca.leaf("none", &[]));
-        assert_eq!(none.claims, Ok(ostrya::access::Claims::default()));
+        assert_eq!(none.claims, Ok(Arc::new(ostrya::access::Claims::default())));
         let fixture = ClientCert::from_der(&der(CLIENT_PEM));
-        assert_eq!(fixture.claims, Ok(ostrya::access::Claims::default()));
+        assert_eq!(
+            fixture.claims,
+            Ok(Arc::new(ostrya::access::Claims::default()))
+        );
     }
 
     /// A malformed claim gives its URI and the reason. Too many claims, a

@@ -273,14 +273,17 @@ It refuses \fB\%[ex\-ostrya receive]\fR and \fB\%[ex\-ostrya receive "PATTERN"]\
 The quoted part of a group name is not empty and holds no \fB\%"\fR and no control character.
 A repeated key takes the last value, so each list key is one line in a group.
 .PP
-\fB\%ostrya receive\fR and \fB\%ostrya serve\fR read and check the client groups and the server group at start.
+\fB\%ostrya receive\fR, \fB\%ostrya serve\fR, and \fB\%ostrya send\fR read and check the client groups and the server group at start.
 \fB\%ostrya receive\fR and \fB\%ostrya serve\fR also build each trust group and each key group one time, also a group that no client group names.
 Thus a key source that ostrya cannot read stops the command.
+\fB\%ostrya send\fR reads no key of a trust group or a key group.
 A bad group stops the command with status 1.
 \fB\%ostrya receive\fR gives a session the client group of the local refs that holds the \fB\%ssh:NAME\fR item of the client name.
 With no such group, the session gets \fB\%ref\-denied\fR.
 \fB\%ostrya serve\fR gives a session the client group of the local refs that holds the item that identified the request.
 With no such group, the request gets 403.
+\fB\%ostrya send\fR serves the refs that the groups of the \fB\%ssh:NAME\fR item read.
+With client groups and no group that holds that item, it writes an error line and exits 1 before it reads its input.
 \fB\%ostrya serve\fR takes its settings from the server group, and an option of the command has precedence over the key of its name.
 .SS "Server keys"
 The keys of \fB\%[ex\-ostrya server]\fR.
@@ -538,6 +541,28 @@ The server writes an error to standard error that names the SHA\-256 digest of t
 .PP
 The claims can give more rights than the group, so the CA of \fB\%tls\-client\-ca\fR grants the rights of each certificate that it signs.
 A credential, a \fB\%net:\fR item, and the \fB\%anonymous\fR item take no claims.
+.SS "Read access"
+\fB\%ostrya serve\fR identifies the client of each read of a file and of the ref listing, as it identifies a push.
+A read that identifies no item gets 401 or 403 and no file.
+\fB\%ostrya send\fR identifies the client of a session by the \fB\%ssh:NAME\fR item of the client name.
+The groups of the item then give the read rights:
+.IP \(bu 2
+\fB\%refs/heads/NAME\fR is in the local refs, and \fB\%refs/mirrors/ID/NAME\fR is in the collection \fB\%ID\fR.
+When \fB\%ID\fR is the \fB\%collection\-id\fR of \fB\%[core]\fR, the path is in the local refs, and the group of the local refs gives the rights of \fB\%NAME\fR.
+.IP \(bu 2
+The server serves such a ref when the group of the item in its namespace has \fB\%r\fR on \fB\%NAME\fR.
+An alias needs \fB\%r\fR on its name and on its target.
+.IP \(bu 2
+The ref listing holds the refs of \fB\%refs/heads\fR that the client reads.
+.IP \(bu 2
+\fB\%refs/remotes/\fR, each other path under \fB\%refs/\fR, and \fB\%extensions/ostrya/\fR are not served.
+.IP \(bu 2
+\fB\%summary\fR and \fB\%summary.sig\fR are served only when the repository has no client group.
+.IP \(bu 2
+Objects, deltas, \fB\%config\fR, and the other files under \fB\%extensions/\fR are served to each identified client.
+.PP
+A path that the client cannot read gets the answer of an absent path: 404 over HTTP, and no file over ssh.
+With \fB\%tls\-accept\-claim=true\fR, the claims of the certificate set the read rights too, and claims that do not parse refuse each read with 403.
 .SS "No client group"
 A repository with no client group has two groups:
 .PP
@@ -551,6 +576,10 @@ auth=anonymous
 collection=*
 allow=r:**
 .fi
+.PP
+So each client reads each local ref, each mirror ref, and the summary, and no client opens a push session.
+An ssh session of \fB\%ostrya send\fR gets the \fB\%anonymous\fR item in such a repository, whatever its client name, so these groups apply to it.
+An ssh session of \fB\%ostrya receive\fR uses no \fB\%anonymous\fR item.
 .SS "Start checks"
 ostrya refuses the config in these cases:
 .IP \(bu 2

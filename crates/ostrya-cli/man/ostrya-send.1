@@ -10,7 +10,9 @@ Serve one pull session over standard input and standard output.
 .PP
 An ssh pull runs this command on the remote side. The command answers each \fB\%Get\fR path as the archive view of \fB\%ostrya serve\fR answers a \fB\%GET\fR of that path. It takes no lock and writes no file in the repository.
 .PP
-The client name is \%\-\-client, else the value of \fB\%LOGNAME\fR, which sshd sets from the password entry of the user. With neither, the command writes an error line and exits \%1 before it opens the repository. The name does not limit the paths that the session serves.
+The client name is \%\-\-client, else the value of \fB\%LOGNAME\fR, which sshd sets from the password entry of the user. With neither, and with a name that the item \fB\%ssh:NAME\fR refuses, the command writes an error line and exits \%1 before it opens the repository. At start, the command reads and checks the client groups and the server group of the repository config. It reads no key group. A bad group ends it with status \%1.
+.PP
+The session serves the refs that the client group of the item \fB\%ssh:NAME\fR reads, as \fB\%ostrya serve\fR serves them to that item. When the repository has client groups and none carries the item, the command writes an error line and exits \%1 before it reads standard input. The session uses no \fB\%anonymous\fR and no \fB\%net:\fR item. In a repository with no client group, the session takes the item \fB\%anonymous\fR, so it serves each local ref, each mirror ref, and the summary.
 .PP
 Standard output carries the frames of the session alone. On failure, the command writes \fB\%error: MESSAGE\fR to standard error. It writes nothing else, also under \%\-\-verbose. It exits \%0 when standard input ends at a frame boundary, and \%1 after an \fB\%Error\fR frame or a failed write.
 .PP
@@ -20,7 +22,7 @@ An \fB\%authorized_keys\fR entry with \fB\%command="ostrya send \-\-repo=PATH"\f
 \fB\-\-client\fR \fINAME\fR
 The client name of the session, in place of \fB\%LOGNAME\fR\&.
 .IP
-The name does not limit the paths that the session serves. The option is safe only under a forced \fB\%command=\fR in \fB\%authorized_keys\fR, because a user with a shell can give any name.
+The session serves the refs of the client group that carries the item \fB\%ssh:NAME\fR\&. NAME is not empty, holds no control character, and does not start or end with white space. The option is safe only under a forced \fB\%command=\fR in \fB\%authorized_keys\fR, because a user with a shell can give any name.
 .PP
 The global options are listed in \fBostrya\fR(1).
 .SH SEE ALSO

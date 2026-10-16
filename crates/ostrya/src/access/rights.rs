@@ -213,6 +213,13 @@ impl AccessRules {
         let push = push_modes_with_read().union(AccessModes::DELETE);
         self.allow.iter().any(|item| item.modes.intersects(push))
     }
+
+    /// Returns `true` if an allow item gives `r`: it has `r`, `w`, `c`, or
+    /// `t`. The deny items have no effect on the result.
+    pub(crate) fn gives_read(&self) -> bool {
+        let read = push_modes_with_read().union(AccessModes::READ);
+        self.allow.iter().any(|item| item.modes.intersects(read))
+    }
 }
 
 /// The modes that add `r`: `w`, `c`, and `t`.

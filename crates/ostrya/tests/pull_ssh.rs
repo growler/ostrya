@@ -20,8 +20,8 @@ use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
-use common::TmpDir;
 use common::pipe::{PipeReader, pipe};
+use common::{TmpDir, anyone};
 use futures_lite::future;
 use futures_lite::io::AsyncRead;
 use ostrya::RefSelector;
@@ -727,7 +727,7 @@ fn a_pull_session_fetches_the_summary_over_a_stream() {
                     session.finish().await.unwrap();
                     fetched
                 },
-                async move { remote.send(server_in, server_out).await },
+                async move { remote.send(server_in, server_out, &anyone()).await },
             ),
         )
         .await;
@@ -763,7 +763,12 @@ fn a_pull_session_fetches_the_ref_listing_over_a_stream() {
         let mut expected = Vec::new();
         for entries in selectors {
             let selector = RefSelector::parse(entries.iter().copied()).unwrap();
-            expected.push(remote.build_ref_listing(&selector).await.unwrap());
+            expected.push(
+                remote
+                    .build_ref_listing(&selector, &anyone())
+                    .await
+                    .unwrap(),
+            );
         }
         let (to_server, server_in) = pipe(PIPE_CAP);
         let (server_out, from_server) = pipe(PIPE_CAP);
@@ -786,7 +791,7 @@ fn a_pull_session_fetches_the_ref_listing_over_a_stream() {
                     session.finish().await.unwrap();
                     fetched
                 },
-                async move { remote.send(server_in, server_out).await },
+                async move { remote.send(server_in, server_out, &anyone()).await },
             ),
         )
         .await;
@@ -888,7 +893,7 @@ fn a_chain_from_the_ref_listing_is_pulled_over_a_stream() {
                     dest.pull_with_session(session, PullTrust::unverified(), opts)
                         .await
                 },
-                async move { remote.send(server_in, server_out).await },
+                async move { remote.send(server_in, server_out, &anyone()).await },
             ),
         )
         .await;
@@ -1227,7 +1232,7 @@ async fn pull_session_ssh(
                 let session = PullSession::over_stream(from_server, to_server, stream).await?;
                 dest.pull_with_session(session, trust, opts).await
             },
-            async move { remote.send(server_in, server_out).await },
+            async move { remote.send(server_in, server_out, &anyone()).await },
         ),
     )
     .await;

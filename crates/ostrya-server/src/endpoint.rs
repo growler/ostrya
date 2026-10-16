@@ -263,6 +263,11 @@ impl<A: ReceiveAuth> ReceiveEndpoint<A> {
         })
     }
 
+    /// Returns the authentication of the endpoint.
+    pub(crate) fn auth(&self) -> &A {
+        &self.inner.auth
+    }
+
     /// Returns the response to one request of the endpoint.
     ///
     /// The raw request path must start with `/_ostrya/receive/v1/`. The path

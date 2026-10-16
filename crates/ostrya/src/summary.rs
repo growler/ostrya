@@ -27,6 +27,7 @@ use ostrya_core::{
 use rustix::fs::{AtFlags, Mode, OFlags};
 use rustix::io::Errno;
 
+use crate::access::ReadAccess;
 use crate::commit::{CommitOptions, append_dict_entry};
 use crate::deltagen::{STATIC_DELTAS_KEY, advertised_delta_map, parse_delta_name};
 use crate::error::{Error, Result};
@@ -697,7 +698,7 @@ impl Repo {
     }
 
     /// Returns a ref listing: a summary of the local refs that `selector`
-    /// selects, built for one request.
+    /// selects and `access` reads, built for one request.
     ///
     /// The listing has the type of a `summary` file, `(a(s(taya{sv}))a{sv})`,
     /// and [`Summary::parse`] reads it. The call writes nothing and takes no
@@ -716,6 +717,22 @@ impl Repo {
     /// An alias is in the listing under its own name, with the commit of its
     /// target. The listing holds no mirror ref. Each entry has the bytes of
     /// the entry of the same ref in a summary of the same repository state.
+    ///
+    /// # Access
+    ///
+    /// The listing holds a selected ref only when `access` reads it
+    /// ([`ReadAccess::can_read`](crate::access::ReadAccess::can_read) in the
+    /// local namespace). The call checks the name before it reads the ref
+    /// file, so it never reads a ref file that `access` does not read. The
+    /// content of such a file does not fail the listing.
+    ///
+    /// An alias is in the listing when `access` reads its name and its
+    /// target, and the target is a regular file. The alias resolves by the
+    /// rule of [`ArchiveView`](crate::ArchiveView#routing): its body is
+    /// relative, it stays inside `refs/`, and the call follows one link with
+    /// no symlink followed on the path of the target. Each other alias is
+    /// not in the listing, also an alias of an alias and an alias to a ref
+    /// under `refs/remotes/`.
     ///
     /// The call reads only the directories of `refs/heads` that a positive
     /// pattern can match, and it reads no ref file outside the literal
@@ -778,16 +795,21 @@ impl Repo {
     ///   object does not parse.
     /// - [`Error::ObjectNotFound`] if a listed ref names a commit that is not
     ///   in the object store.
-    /// - [`Error::Io`] if a read fails, for example for an alias that names a
-    ///   directory, or if `delta-indexes/` is not a directory.
+    /// - [`Error::Io`] if a read fails, for example if `delta-indexes/` is not
+    ///   a directory.
     ///
     /// A failure of one selected ref or of one index file fails the whole
-    /// listing. The call does not read a ref that the selector does not select.
+    /// listing. The call does not read a ref that the selector does not
+    /// select or that `access` does not read.
     ///
     /// `ostrya-server` exports no handler of the listing. A host with a router
     /// of its own calls this method in its own handler.
-    pub async fn build_ref_listing(&self, selector: &RefSelector) -> Result<Vec<u8>> {
-        self.build_ref_listing_capped(selector, MAX_REF_LISTING)
+    pub async fn build_ref_listing(
+        &self,
+        selector: &RefSelector,
+        access: &ReadAccess,
+    ) -> Result<Vec<u8>> {
+        self.build_ref_listing_capped(selector, access, MAX_REF_LISTING)
             .await
     }
 
@@ -796,11 +818,12 @@ impl Repo {
     pub(crate) async fn build_ref_listing_capped(
         &self,
         selector: &RefSelector,
+        access: &ReadAccess,
         cap: u64,
     ) -> Result<Vec<u8>> {
         // The refs come sorted byte-wise by name, each one time, which is the
         // order of `build_summary`.
-        let refs = self.list_refs_selected(selector).await?;
+        let refs = self.list_refs_selected(selector, access).await?;
 
         // Each entry is at least its name and the fixed fields. If the sum of
         // these sizes is over the cap, the listing is too.
@@ -1598,12 +1621,26 @@ const _: fn() = || {
     assert_send_sync::<Summary>();
     assert_send_sync::<AdvertisedDelta>();
     fn assert_send<T: Send>(_: &T) {}
-    let _ = |repo: &Repo, selector: &RefSelector| assert_send(&repo.build_ref_listing(selector));
+    let _ = |repo: &Repo, selector: &RefSelector, access: &ReadAccess| {
+        assert_send(&repo.build_ref_listing(selector, access))
+    };
 };
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The rights of an anonymous client under the implicit groups.
+    fn anyone() -> ReadAccess {
+        let config = crate::RepoConfig::parse("[core]\nrepo_version=1\nmode=archive-z2\n").unwrap();
+        let access =
+            crate::access::ClientAccess::from_config(&config, std::path::Path::new("/")).unwrap();
+        ReadAccess::new(
+            std::sync::Arc::new(access),
+            crate::access::AuthItem::Anonymous,
+            None,
+        )
+    }
 
     /// The selector with no entry, which selects each ref.
     fn all_refs() -> RefSelector {
@@ -2150,7 +2187,10 @@ mod tests {
         ostrya_rt::block_on(async {
             let names = ["a/b", "a/c", "z"];
             let repo = repo_with_refs(&dir, &names).await;
-            let full = repo.build_ref_listing(&all_refs()).await.unwrap();
+            let full = repo
+                .build_ref_listing(&all_refs(), &anyone())
+                .await
+                .unwrap();
             let parsed = Summary::parse(&full).unwrap();
             assert_eq!(parsed.refs.len(), 3);
             assert_eq!(parsed.static_deltas().unwrap().len(), 1);
@@ -2162,13 +2202,15 @@ mod tests {
             );
             let len = full.len() as u64;
             let capped = repo
-                .build_ref_listing_capped(&all_refs(), len)
+                .build_ref_listing_capped(&all_refs(), &anyone(), len)
                 .await
                 .unwrap();
             assert_eq!(capped, full);
             assert!(capped.capacity() as u64 <= len);
             for cap in 0..len {
-                let outcome = repo.build_ref_listing_capped(&all_refs(), cap).await;
+                let outcome = repo
+                    .build_ref_listing_capped(&all_refs(), &anyone(), cap)
+                    .await;
                 assert!(is_cap_error(&outcome), "cap {cap}: {outcome:?}");
             }
 
@@ -2186,11 +2228,15 @@ mod tests {
             let path = loose_path(&commit, ObjectType::Commit, repo.mode());
             std::fs::remove_file(dir.join("objects").join(path)).unwrap();
             for cap in [names_floor - 1, floor - 1] {
-                let outcome = repo.build_ref_listing_capped(&all_refs(), cap).await;
+                let outcome = repo
+                    .build_ref_listing_capped(&all_refs(), &anyone(), cap)
+                    .await;
                 assert!(is_cap_error(&outcome), "cap {cap}: {outcome:?}");
             }
             for cap in [floor, MAX_REF_LISTING] {
-                let outcome = repo.build_ref_listing_capped(&all_refs(), cap).await;
+                let outcome = repo
+                    .build_ref_listing_capped(&all_refs(), &anyone(), cap)
+                    .await;
                 assert!(
                     matches!(outcome, Err(Error::ObjectNotFound { .. })),
                     "cap {cap}: {outcome:?}"

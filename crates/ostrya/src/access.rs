@@ -18,6 +18,8 @@
 //!   [`ClientAccess::claim_rules`] gives their rules for one namespace.
 //! - [`ForwardedHeader`] is a value of `trusted-proxy-header`, and
 //!   [`is_header_name`] checks a value of `trusted-proxy-client-cert`.
+//! - [`ReadAccess`] holds the read rights of one identified client, which
+//!   the archive view, the ref listing, and a pull session take.
 //!
 //! # Client group keys
 //!
@@ -88,6 +90,15 @@
 //! the rights of each certificate that it signs. The other keys of the group
 //! apply as they are.
 //!
+//! # Read access
+//!
+//! A client reads `refs/heads/NAME` and `refs/mirrors/ID/NAME` when the
+//! group of its item in the namespace of the path has `r` on `NAME`. The own
+//! collection id under `refs/mirrors/` names the local refs. An alias needs
+//! `r` on its name and on its target. No client reads another path under
+//! `refs/`. `summary` and `summary.sig` are read only with no client group.
+//! [`ReadAccess`] states the rules.
+//!
 //! # Implicit groups
 //!
 //! A config with no client group has two implicit groups:
@@ -125,9 +136,11 @@
 
 mod claim;
 mod item;
+mod read;
 mod reader;
 mod rights;
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
 use std::net::SocketAddr;
@@ -135,6 +148,7 @@ use std::path::{Path, PathBuf};
 
 pub use claim::{Claim, ClaimError, ClaimRule, Claims, MAX_CLAIMS};
 pub use item::{AuthItem, IpNet};
+pub use read::ReadAccess;
 #[cfg(feature = "receive")]
 pub(crate) use reader::{Group, classify};
 pub use rights::{AccessModes, AccessRules, AllowItem};
@@ -523,6 +537,38 @@ impl ClientAccess {
         reader::read(config, repo_dir)
     }
 
+    /// Returns the two implicit groups of a config with no client group, with
+    /// the own collection id `collection_id` and the default server
+    /// settings.
+    ///
+    /// The value is the value that
+    /// [`from_config`](ClientAccess::from_config) gives for a config with no
+    /// client group, no `[ex-ostrya server]`, and `[core] collection-id` set
+    /// to `collection_id`. The call checks no value.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ostrya::access::{AuthItem, ClientAccess, Namespace};
+    ///
+    /// let access = ClientAccess::implicit(Some("com.example.own"));
+    /// assert!(!access.has_client_groups());
+    /// let own = access.namespace(Some("com.example.own"));
+    /// assert_eq!(own, Namespace::Local);
+    /// let group = access.select(&AuthItem::Anonymous, &own).unwrap();
+    /// assert_eq!(group.name(), "anonymous");
+    /// ```
+    pub fn implicit(collection_id: Option<&str>) -> ClientAccess {
+        let groups = reader::implicit_groups();
+        let by_item = reader::index(&groups);
+        ClientAccess {
+            collection_id: collection_id.map(str::to_owned),
+            server: ServerSettings::default(),
+            groups,
+            by_item,
+        }
+    }
+
     /// Returns the keys of `[ex-ostrya server]`.
     pub fn server(&self) -> &ServerSettings {
         &self.server
@@ -664,6 +710,62 @@ impl ClientAccess {
         found.then_some(rules)
     }
 
+    /// Returns the rules of `group` in `namespace`, with the claims of
+    /// `claims`.
+    ///
+    /// When the group has `tls-accept-claim=true` and
+    /// [`claim_rules`](ClientAccess::claim_rules) gives the rules of
+    /// `claims` for `namespace`, the result is these rules, owned. Else the
+    /// result is the rules of the group, borrowed. The [module
+    /// doc](crate::access#claims) states the rule.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use std::borrow::Cow;
+    ///
+    /// use ostrya::config::RepoConfig;
+    /// use ostrya::access::{AuthItem, Claims, ClientAccess, Namespace};
+    ///
+    /// let config = RepoConfig::parse(
+    ///     "[core]\nrepo_version=1\nmode=archive-z2\n\
+    ///      [ex-ostrya client \"certs\"]\nauth=tls:*\ntls-accept-claim=true\nallow=r:**\n",
+    /// )?;
+    /// let access = ClientAccess::from_config(&config, "/srv/repo".as_ref())?;
+    /// let group = access.select(&AuthItem::TlsAny, &Namespace::Local).unwrap();
+    /// let claims = Claims::parse(["ostrya:ref:w:main"]).unwrap();
+    /// let rules = access.effective_rules(group, &Namespace::Local, Some(&claims));
+    /// assert!(matches!(rules, Cow::Owned(_)));
+    /// let rules = access.effective_rules(group, &Namespace::Local, None);
+    /// assert!(matches!(rules, Cow::Borrowed(_)));
+    /// # Ok::<(), ostrya::Error>(())
+    /// ```
+    pub fn effective_rules<'g>(
+        &self,
+        group: &'g ClientGroup,
+        namespace: &Namespace,
+        claims: Option<&Claims>,
+    ) -> Cow<'g, AccessRules> {
+        match claims {
+            Some(claims) if group.tls_accept_claim => match self.claim_rules(claims, namespace) {
+                Some(rules) => Cow::Owned(rules),
+                None => Cow::Borrowed(&group.rules),
+            },
+            _ => Cow::Borrowed(&group.rules),
+        }
+    }
+
+    /// Returns `true` if the config has one or more client groups, and
+    /// `false` if it has the two implicit groups.
+    pub fn has_client_groups(&self) -> bool {
+        !self.groups.iter().all(ClientGroup::is_implicit)
+    }
+
+    /// Returns `true` if `id` is `[core] collection-id`.
+    fn is_own_collection(&self, id: &str) -> bool {
+        Some(id) == self.collection_id.as_deref()
+    }
+
     /// Returns each auth item of the groups one time, in the order of its
     /// first group in the config.
     pub fn items(&self) -> impl Iterator<Item = &AuthItem> {
@@ -774,6 +876,7 @@ const _: fn() = || {
     assert_send_sync::<Claim>();
     assert_send_sync::<ClaimRule>();
     assert_send_sync::<ClaimError>();
+    assert_send_sync::<ReadAccess>();
 };
 
 #[cfg(test)]
@@ -951,6 +1054,31 @@ secret-key-file=/etc/ostrya/release.secret
                 Some("anonymous-collections")
             );
         }
+    }
+
+    /// [`ClientAccess::implicit`] gives the groups and the server settings
+    /// of a config with no client group. It keeps the own collection id as
+    /// given, also an id that a config text holds only with an escape.
+    #[test]
+    fn the_implicit_access_has_the_groups_of_a_config_with_no_client_group() {
+        let from_config = access("");
+        for id in [None, Some("a.b"), Some("a\\b"), Some(" a.b")] {
+            let implicit = ClientAccess::implicit(id);
+            assert_eq!(
+                format!("{:?}", implicit.groups()),
+                format!("{:?}", from_config.groups()),
+                "{id:?}"
+            );
+            assert_eq!(implicit.server(), from_config.server(), "{id:?}");
+            assert!(!implicit.has_client_groups(), "{id:?}");
+            if let Some(id) = id {
+                assert_eq!(implicit.namespace(Some(id)), Namespace::Local, "{id:?}");
+            }
+        }
+        assert_eq!(
+            ClientAccess::implicit(None).namespace(Some("a.b")),
+            collection("a.b")
+        );
     }
 
     /// One client group of any kind removes the implicit groups.

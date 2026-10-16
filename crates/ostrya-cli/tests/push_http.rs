@@ -1901,7 +1901,9 @@ mod cli {
     /// After `ostrya push` over HTTPS to `ostrya serve`, the receiving
     /// `bare-user` repository passes `ostree fsck`. `ostree pull` over
     /// HTTPS from the archive view of the same server gives the pushed commit
-    /// in a new archive repository. This repository passes `ostree fsck` too.
+    /// in a new archive repository. The pull sends no credential, so the
+    /// server has a group of anonymous readers. This repository passes
+    /// `ostree fsck` too.
     #[test]
     fn the_tool_checks_and_pulls_a_push_over_https() {
         if !tools_available() {
@@ -1913,6 +1915,10 @@ mod cli {
         let (client, commit) = setup.client(&src);
         let server = setup.init("server", "bare-user");
         add_credential_group(&server);
+        add_config(
+            &server,
+            "[ex-ostrya client \"readers\"]\nauth=anonymous\nallow=r:**\n",
+        );
         let pki = make_pki(&setup.path("pki"));
         let serving = Serving::start(
             &server,

@@ -1,11 +1,13 @@
-//! The authentication of the requests of the receive endpoint by the client
-//! groups of the repository.
+//! The authentication of the requests of a server by the client groups of
+//! the repository: the reads of the archive view and of the ref listing,
+//! and the requests of the receive endpoint.
 //!
 //! The doc of [`ServeOptions`](crate::ServeOptions) states the order of the
 //! checks and the rules of the claims of a client certificate. The server
 //! compares the digest of a credential with every `token-sha256` or
 //! `basic-sha256` item in constant time, and does not stop at a match.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::{Future, ready};
 use std::hint::black_box;
@@ -14,9 +16,10 @@ use std::sync::Arc;
 
 use futures_rustls::pki_types::UnixTime;
 use hyper::header::{AUTHORIZATION, HeaderValue, WWW_AUTHENTICATE};
+use hyper::http::Extensions;
 use hyper::http::request::Parts;
 use hyper::{HeaderMap, StatusCode};
-use ostrya::access::{AuthItem, ClientAccess, ClientGroup, IpNet};
+use ostrya::access::{AuthItem, Claims, ClientAccess, ClientGroup, IpNet, ReadAccess};
 use ostrya::remote::proto::Hello;
 use ostrya::{Checksum, ReceivePolicies, ReceivePolicy};
 
@@ -251,7 +254,8 @@ pub(crate) struct GroupAuth {
     /// `true` if the server takes a bearer or Basic credential over plain
     /// HTTP.
     cleartext: bool,
-    /// The client groups and their policies.
+    /// The client groups and their policies. The read rights of each request
+    /// share the client groups.
     policies: Arc<ReceivePolicies>,
     /// The auth items of the groups.
     index: CredentialIndex,
@@ -396,6 +400,48 @@ impl GroupAuth {
         }
     }
 
+    /// The read rights of a request with `headers` from `peer`, or the
+    /// refusal of the request.
+    ///
+    /// The identification takes the steps of [`identify`](GroupAuth::identify),
+    /// and a 401 carries the two challenges. When a group with
+    /// `tls-accept-claim=true` carries the item of a certificate, claims that
+    /// do not parse get 403, and the server reports an event. Else the rights
+    /// carry the item and the claims of the client.
+    pub(crate) fn identify_read(
+        &self,
+        headers: &HeaderMap,
+        peer: &Peer,
+    ) -> Result<ReadAccess, Refusal> {
+        let client = self.identify(headers, peer).map_err(challenge)?;
+        let claims = match &client.cert {
+            Some(cert) => Some(self.claims_of(cert)?.clone()),
+            None => None,
+        };
+        Ok(ReadAccess::new(
+            self.policies.access().clone(),
+            client.item.clone(),
+            claims,
+        ))
+    }
+
+    /// The claims of `cert`, or the 403 of claims that do not parse. The
+    /// refusal reports a [`ServerEvent::BadClaims`].
+    fn claims_of<'c>(&self, cert: &'c ClientCert) -> Result<&'c Arc<Claims>, Refusal> {
+        cert.claims.as_ref().map_err(|fault| {
+            if let Some(on_event) = &self.on_event {
+                on_event(&ServerEvent::BadClaims {
+                    digest: cert.digest,
+                    san: fault.san().map(str::to_owned),
+                    reason: fault.reason(),
+                });
+            }
+            Refusal::forbidden(format!(
+                "the claims of the client certificate do not parse: {fault}"
+            ))
+        })
+    }
+
     /// The setup of a session that `client` opens. [`open`](ReceiveAuth::open)
     /// states the rules.
     fn setup(&self, client: &Client) -> Result<SessionSetup, Refusal> {
@@ -406,23 +452,13 @@ impl GroupAuth {
                 "no client group of the request covers the local refs",
             ));
         };
-        let claimed = match &client.cert {
-            Some(cert) if group.tls_accept_claim() => match &cert.claims {
-                Ok(claims) => access.claim_rules(claims, &namespace),
-                Err(fault) => {
-                    if let Some(on_event) = &self.on_event {
-                        on_event(&ServerEvent::BadClaims {
-                            digest: cert.digest,
-                            san: fault.san().map(str::to_owned),
-                            reason: fault.reason(),
-                        });
-                    }
-                    return Err(Refusal::forbidden(format!(
-                        "the claims of the client certificate do not parse: {fault}"
-                    )));
-                }
-            },
+        let claims = match &client.cert {
+            Some(cert) if group.tls_accept_claim() => Some(self.claims_of(cert)?),
             _ => None,
+        };
+        let claimed = match access.effective_rules(group, &namespace, claims.map(|c| &**c)) {
+            Cow::Owned(rules) => Some(rules),
+            Cow::Borrowed(_) => None,
         };
         let policy = match claimed {
             Some(rules) if !rules.opens_push_session() => {
@@ -473,6 +509,22 @@ impl GroupAuth {
     }
 }
 
+/// The [`Peer`] in the extensions of a request. The server puts a peer into
+/// each request when it has client groups.
+///
+/// If a request has no peer, a build with debug assertions panics. Other
+/// builds take the request as plain HTTP from the unspecified address, with
+/// no client certificate.
+pub(crate) fn peer_of(extensions: &Extensions) -> Peer {
+    let peer = extensions.get::<Peer>().cloned();
+    debug_assert!(peer.is_some(), "the server puts a peer into each request");
+    peer.unwrap_or(Peer {
+        tls: false,
+        addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+        cert: None,
+    })
+}
+
 /// `refusal`, with the two challenges of a credential when it is 401.
 fn challenge(refusal: Refusal) -> Refusal {
     if refusal.status != StatusCode::UNAUTHORIZED {
@@ -492,24 +544,14 @@ impl ReceiveAuth for GroupAuth {
     }
 
     /// The client of the request, from its headers and the [`Peer`] in its
-    /// extensions. The server puts a peer into each request of its receive
-    /// endpoint. The route does not change the answer.
-    ///
-    /// If a request has no peer, a build with debug assertions panics. Other
-    /// builds take the request as plain HTTP from the unspecified address,
-    /// with no client certificate.
+    /// extensions. The route does not change the answer. [`peer_of`] states
+    /// the case of a request with no peer.
     fn authenticate(
         &self,
         parts: &Parts,
         _kind: RequestKind,
     ) -> impl Future<Output = Result<Client, Refusal>> + Send {
-        let peer = parts.extensions.get::<Peer>().cloned();
-        debug_assert!(peer.is_some(), "the server puts a peer into each request");
-        let peer = peer.unwrap_or(Peer {
-            tls: false,
-            addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            cert: None,
-        });
+        let peer = peer_of(&parts.extensions);
         ready(self.identify(&parts.headers, &peer).map_err(challenge))
     }
 
@@ -593,7 +635,7 @@ mod tests {
             digest,
             cn: cn.map(str::to_owned),
             not_after: None,
-            claims: Ok(ostrya::access::Claims::default()),
+            claims: Ok(Arc::new(ostrya::access::Claims::default())),
         }
     }
 
@@ -1523,6 +1565,94 @@ mod tests {
                 if *digest == Checksum::sha256(&bad) && san == "ostrya:ref:c:main/"),
             "{events:?}"
         );
+    }
+
+    /// A read takes the steps of the identification: a 401 carries the two
+    /// challenges, a credential over plain HTTP gets 403, and a request
+    /// with nothing gets the anonymous item. A `net:` item matches the
+    /// address that a trusted proxy forwards. The rights carry the item.
+    #[test]
+    fn a_read_takes_the_steps_of_the_identification() {
+        let (auth, _tmp) = proxied(&format!(
+            "{}[ex-ostrya client \"farm\"]\nauth=net:198.51.100.0/24\nallow=r:farm/**\n\
+             [ex-ostrya client \"anonymous\"]\nauth=anonymous\nallow=r:pub/**\n",
+            credentials()
+        ));
+        let refusal = auth
+            .identify_read(&headers(&["Bearer x", "Bearer y"]), &tls())
+            .unwrap_err();
+        assert_eq!(refusal.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(refusal.headers.len(), 2);
+        let refusal = auth
+            .identify_read(&headers(&["Bearer a-token"]), &stranger())
+            .unwrap_err();
+        assert_eq!(refusal.status, StatusCode::FORBIDDEN);
+        assert!(refusal.headers.is_empty());
+
+        let read = auth.identify_read(&HeaderMap::new(), &stranger()).unwrap();
+        assert_eq!(read.item(), &AuthItem::Anonymous);
+        assert!(read.can_read_path("refs/heads/pub/a"));
+        assert!(!read.can_read_path("refs/heads/farm/a"));
+        let forwarded = lines(&[("x-forwarded-for", "198.51.100.7")]);
+        let read = auth.identify_read(&forwarded, &proxy()).unwrap();
+        assert_eq!(read.item().to_string(), "net:198.51.100.0/24");
+        assert!(read.can_read_path("refs/heads/farm/a"));
+        assert!(!read.can_read_path("refs/heads/pub/a"));
+        let read = auth
+            .identify_read(&headers(&["Bearer a-token"]), &tls())
+            .unwrap();
+        assert!(read.can_read_path("refs/heads/any"));
+        assert!(!read.serves_summary());
+
+        let (auth, _tmp) = self::auth(&credentials());
+        let refusal = auth.identify_read(&HeaderMap::new(), &tls()).unwrap_err();
+        assert_eq!(refusal.status, StatusCode::UNAUTHORIZED);
+        assert_eq!(refusal.headers.len(), 2);
+    }
+
+    /// The claims of a certificate set the read rights in a group with
+    /// `tls-accept-claim=true`. Claims that do not parse refuse each read
+    /// with 403, and the server reports one event for each read.
+    #[test]
+    fn claims_set_the_read_rights_and_bad_claims_refuse_a_read() {
+        let (auth, _tmp) = auth(CLAIMS_GROUP);
+        let (auth, events) = recording(auth);
+        let ca = TestCa::new();
+        let good = with_der(&ca.leaf("c", &["ostrya:ref:r:main"]));
+        let read = auth.identify_read(&HeaderMap::new(), &good).unwrap();
+        assert!(read.can_read_path("refs/heads/main"));
+        assert!(!read.can_read_path("refs/heads/other"));
+        let plain = with_der(&ca.leaf("c", &[]));
+        let read = auth.identify_read(&HeaderMap::new(), &plain).unwrap();
+        assert!(read.can_read_path("refs/heads/other"));
+        assert!(events.lock().unwrap().is_empty());
+
+        let der = ca.leaf("c", &["ostrya:ref:x:a"]);
+        let bad = with_der(&der);
+        for _ in 0..2 {
+            let refusal = auth.identify_read(&HeaderMap::new(), &bad).unwrap_err();
+            assert_eq!(refusal.status, StatusCode::FORBIDDEN);
+            assert!(refusal.headers.is_empty());
+        }
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(
+            matches!(&events[0], ServerEvent::BadClaims { digest, .. }
+                if *digest == Checksum::sha256(&der)),
+            "{events:?}"
+        );
+    }
+
+    /// A group with `tls-accept-claim=false` reads no claim on a read:
+    /// claims that do not parse get no 403 and no event.
+    #[test]
+    fn a_read_of_a_group_that_reads_no_claim_ignores_the_claims() {
+        let (auth, _tmp) = auth("[ex-ostrya client \"certs\"]\nauth=tls:*\nallow=r:**\n");
+        let (auth, events) = recording(auth);
+        let peer = with_der(&TestCa::new().leaf("c", &["ostrya:ref:x:a"]));
+        let read = auth.identify_read(&HeaderMap::new(), &peer).unwrap();
+        assert!(read.can_read_path("refs/heads/main"));
+        assert!(events.lock().unwrap().is_empty());
     }
 
     /// The time of the request checks the validity of a forwarded

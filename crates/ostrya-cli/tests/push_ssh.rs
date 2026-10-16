@@ -26,6 +26,10 @@ const ROOT_DIRMETA: &str = "446a0ef11b7cc167f3b603e585c7eeeeb675faa412d5ec73f629
 
 const REQUIRE_OSTREE: &str = "OSTRYA_REQUIRE_OSTREE";
 
+/// The client name of each push, and of the client group that [`receiver`]
+/// writes.
+const CLIENT: &str = "pusher";
+
 /// The stand-in ssh client. Its first two arguments are a file that gets the
 /// exit status of the remote command and a file that gets its standard
 /// error. It skips `-p PORT` and the host, and runs the remote command string
@@ -200,17 +204,30 @@ impl ObjectSource for BadSource {
 }
 
 /// A receiving repository of `mode` at a path that holds a `'` and a space.
+/// Its config has the client group of [`CLIENT`], which writes each ref as a
+/// fast-forward.
 fn receiver(base: &TmpDir, mode: RepoMode) -> PathBuf {
     let path = base.0.join("it's a repo");
     block_on(Repo::create(&path, CreateOptions::new(mode))).unwrap();
+    let config = path.join("config");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(&format!(
+        "[ex-ostrya client \"{CLIENT}\"]\nauth=ssh:{CLIENT}\nallow=w:**\n"
+    ));
+    std::fs::write(&config, text).unwrap();
     path
 }
 
-/// The options that run `ostrya -v receive` through the stand-in, with the
-/// exit status of the command written to `status` and its standard error to
-/// the file beside it that [`stderr_of`] names.
-fn options(status: &Path) -> SshOptions {
-    let receive = format!("{} -v receive", quote(env!("CARGO_BIN_EXE_ostrya")));
+/// The options that run `ostrya -v receive --client=CLIENT` through the
+/// stand-in, with the client name `client`, the exit status of the command
+/// written to `status`, and its standard error written to the file beside it
+/// that [`stderr_of`] names.
+fn options_as(status: &Path, client: &str) -> SshOptions {
+    let receive = format!(
+        "{} -v receive --client={}",
+        quote(env!("CARGO_BIN_EXE_ostrya")),
+        quote(client)
+    );
     SshOptions {
         command: Some(standin(status)),
         remote_command: Some(receive),
@@ -235,11 +252,16 @@ fn stderr_of(status: &Path) -> PathBuf {
     status.with_extension("stderr")
 }
 
-/// The endpoint of `dest` with the options of [`options`].
+/// The endpoint of `dest` with the options of [`options_as`] for [`CLIENT`].
 fn endpoint(dest: &Path, status: &Path) -> Endpoint {
+    endpoint_as(dest, status, CLIENT)
+}
+
+/// The endpoint of `dest` with the options of [`options_as`].
+fn endpoint_as(dest: &Path, status: &Path, client: &str) -> Endpoint {
     Endpoint::Ssh {
         address: SshAddress::parse(&format!("ssh://localhost{}", dest.display())).unwrap(),
-        options: options(status),
+        options: options_as(status, client),
     }
 }
 
@@ -257,10 +279,20 @@ fn push(
     status: &Path,
     compression: Compression,
 ) -> ostrya::remote::Result<PushOutcome> {
+    push_as(dest, status, compression, CLIENT)
+}
+
+/// [`push`] with the client name `client`.
+fn push_as(
+    dest: &Path,
+    status: &Path,
+    compression: Compression,
+    client: &str,
+) -> ostrya::remote::Result<PushOutcome> {
     let source = FixtureSource::new();
     block_on(async {
         let session = PushSession::connect(
-            endpoint(dest, status),
+            endpoint_as(dest, status, client),
             &[BRANCH.to_owned()],
             SessionOptions::default(),
         )
@@ -335,7 +367,6 @@ fn tool_fsck(repo: &Path) {
 }
 
 #[test]
-#[ignore = "push needs client identification"]
 fn a_push_over_ssh_writes_the_ref_and_the_tool_checks_the_repository() {
     for (mode, compression) in [
         (RepoMode::Archive, Compression::Deflate { level: 6 }),
@@ -358,15 +389,23 @@ fn a_push_over_ssh_writes_the_ref_and_the_tool_checks_the_repository() {
     }
 }
 
-/// `ostrya receive` selects no client group, so it opens no push session.
-/// `Hello` gets `ref-denied`, the command exits 1 with one error line, and the
-/// ref stays absent.
+/// A client name that no `ssh:` item of a group of the local refs names
+/// opens no push session. `Hello` gets `ref-denied`, the command exits 1
+/// with one error line, and the ref stays absent. A group of a collection
+/// does not count, and neither does an `anonymous` or a `net:` item.
 #[test]
-fn receive_refuses_each_session_with_ref_denied() {
+fn receive_refuses_a_name_with_no_group_with_ref_denied() {
     let base = TmpDir::new("refused");
     let dest = receiver(&base, RepoMode::Archive);
+    let config = dest.join("config");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(
+        "[ex-ostrya client \"mirror\"]\nauth=ssh:other\ncollection=*\nallow=w:**\n\
+         [ex-ostrya client \"anyone\"]\nauth=anonymous;net:0.0.0.0/0;net:::/0\nallow=w:**\n",
+    );
+    std::fs::write(&config, text).unwrap();
     let status = base.0.join("status");
-    match push(&dest, &status, Compression::None) {
+    match push_as(&dest, &status, Compression::None, "other") {
         Err(Error::RefDenied(message)) => {
             assert!(message.contains("opens no push session"), "{message}");
         }
@@ -379,8 +418,72 @@ fn receive_refuses_each_session_with_ref_denied() {
     assert_eq!(stderr.lines().count(), 1, "{stderr}");
 }
 
+/// `ostrya receive` and `ostrya send` need a client name: `--client`, else
+/// `LOGNAME`. With neither, or with an empty `LOGNAME`, each command writes
+/// one error line and exits 1 before it reads its input.
 #[test]
-#[ignore = "push needs client identification"]
+fn a_session_with_no_client_name_is_refused() {
+    let base = TmpDir::new("noname");
+    let dest = receiver(&base, RepoMode::Archive);
+    for command in ["receive", "send"] {
+        for logname in [None, Some("")] {
+            let mut run = Command::new(env!("CARGO_BIN_EXE_ostrya"));
+            run.arg(format!("--repo={}", dest.display()))
+                .arg(command)
+                .env_remove("LOGNAME")
+                .stdin(Stdio::null());
+            if let Some(value) = logname {
+                run.env("LOGNAME", value);
+            }
+            let out = run.output().unwrap();
+            assert_eq!(out.status.code(), Some(1), "{command} {logname:?}");
+            assert!(out.stdout.is_empty());
+            assert_eq!(
+                String::from_utf8_lossy(&out.stderr),
+                format!("error: {command} needs a client name: give --client, or set LOGNAME\n")
+            );
+        }
+    }
+}
+
+/// A name that an `ssh:` item cannot hold ends `ostrya receive` with one
+/// error line and exit 1, before it reads its input. The line shows the name
+/// in escaped form, also a name with a line feed. `ostrya send` does not
+/// check the name, so it serves the session: with no input, it exits 0.
+#[test]
+fn a_malformed_client_name_is_refused_by_receive_alone() {
+    let base = TmpDir::new("badname");
+    let dest = receiver(&base, RepoMode::Archive);
+    for (logname, args) in [(Some("a\nb"), &[][..]), (None, &["--client= x"][..])] {
+        for command in ["receive", "send"] {
+            let mut run = Command::new(env!("CARGO_BIN_EXE_ostrya"));
+            run.arg(format!("--repo={}", dest.display()))
+                .arg(command)
+                .args(args)
+                .env_remove("LOGNAME")
+                .stdin(Stdio::null());
+            if let Some(value) = logname {
+                run.env("LOGNAME", value);
+            }
+            let out = run.output().unwrap();
+            assert!(out.stdout.is_empty(), "{command} {logname:?}");
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            if command == "send" {
+                assert_eq!(out.status.code(), Some(0), "{logname:?}: {stderr}");
+                assert!(stderr.is_empty(), "{stderr}");
+                continue;
+            }
+            assert_eq!(out.status.code(), Some(1), "{logname:?}");
+            assert!(
+                stderr.starts_with("error: malformed client name \""),
+                "{stderr}"
+            );
+            assert_eq!(stderr.lines().count(), 1, "{stderr}");
+        }
+    }
+}
+
+#[test]
 fn a_server_error_while_the_client_still_sends_reaches_the_client() {
     let base = TmpDir::new("mismatch");
     let dest = receiver(&base, RepoMode::Archive);
@@ -515,7 +618,8 @@ mod repo_push {
         let config = path.join("config");
         let mut text = std::fs::read_to_string(&config).unwrap();
         text.push_str(&format!(
-            "\n[remote \"origin\"]\npush-url=ssh://localhost{}\nreceive-command={} -v receive\n",
+            "\n[remote \"origin\"]\npush-url=ssh://localhost{}\n\
+             receive-command={} -v receive --client={CLIENT}\n",
             dest.display(),
             quote(env!("CARGO_BIN_EXE_ostrya")),
         ));
@@ -543,7 +647,6 @@ mod repo_push {
     }
 
     #[test]
-    #[ignore = "push needs client identification"]
     fn a_push_to_a_configured_remote_writes_the_ref() {
         let base = TmpDir::new("repo-push");
         let dest = receiver(&base, RepoMode::Archive);
@@ -570,7 +673,6 @@ mod repo_push {
     }
 
     #[test]
-    #[ignore = "push needs client identification"]
     fn a_delete_of_a_present_ref_is_delete_denied() {
         let base = TmpDir::new("repo-push-delete");
         let dest = receiver(&base, RepoMode::Archive);
@@ -601,7 +703,8 @@ mod cli {
     const SSH_LOCALHOST: &str = "OSTRYA_TEST_SSH_LOCALHOST";
 
     /// A run of the built `ostrya` in `dir`, with no ssh command and no
-    /// repository from the environment.
+    /// repository from the environment, and with `LOGNAME` set to [`CLIENT`].
+    /// The stand-in passes `LOGNAME` on to `ostrya receive`.
     fn ostrya(dir: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
         let mut command = Command::new(env!("CARGO_BIN_EXE_ostrya"));
         command
@@ -609,6 +712,7 @@ mod cli {
             .current_dir(dir)
             .env_remove("OSTRYA_SSH_COMMAND")
             .env_remove("OSTREE_REPO")
+            .env("LOGNAME", CLIENT)
             .stdin(Stdio::null());
         for (key, value) in envs {
             command.env(key, value);
@@ -697,17 +801,6 @@ mod cli {
             self.push(&all, &[])
         }
 
-        /// Run [`push_to`](Setup::push_to) with `LOGNAME` set to [`CLIENT`],
-        /// the client name of the ssh session.
-        fn push_as_client(&self, dest: &Path, args: &[&str]) -> Output {
-            let ssh = self.ssh_command();
-            let receive = receive_command();
-            let address = address(dest);
-            let mut all = vec![ssh.as_str(), receive.as_str(), address.as_str()];
-            all.extend_from_slice(args);
-            self.push(&all, &[("LOGNAME", CLIENT)])
-        }
-
         fn ssh_started(&self) -> bool {
             self.status.exists()
         }
@@ -749,9 +842,6 @@ mod cli {
             quote(env!("CARGO_BIN_EXE_ostrya"))
         )
     }
-
-    /// The client name of [`Setup::push_as_client`].
-    const CLIENT: &str = "pusher";
 
     /// Writes the client group of [`CLIENT`] with the allow list `allow` into
     /// the config of `dest`, in place of the group of an earlier call.
@@ -799,7 +889,6 @@ mod cli {
     /// `archive` receiver with `--compress` and into a `bare-user` receiver
     /// raw, and check each receiver with the `ostree` command.
     #[test]
-    #[ignore = "push needs client identification"]
     fn a_push_over_ssh_to_localhost_is_read_by_the_tool() {
         if std::env::var(SSH_LOCALHOST).as_deref() != Ok("1") {
             eprintln!(
@@ -822,8 +911,10 @@ mod cli {
                  -o BatchMode=yes -o LogLevel=ERROR -o ConnectTimeout=10",
                 known_hosts.display()
             );
+            // sshd sets `LOGNAME` to the name of the user, so the receive
+            // command names the client.
             let receive = format!(
-                "--receive-command={} receive",
+                "--receive-command={} receive --client={CLIENT}",
                 quote(env!("CARGO_BIN_EXE_ostrya"))
             );
             let address = address(&dest);
@@ -891,7 +982,6 @@ mod cli {
     /// A push to an address, with no remote section in the client config,
     /// writes the ref, and a repeat push reports it unchanged.
     #[test]
-    #[ignore = "push needs client identification"]
     fn a_repeat_push_to_an_address_reports_the_ref_unchanged() {
         let setup = Setup::new("cli-repeat", "archive");
         let config = std::fs::read_to_string(setup.client.join("config")).unwrap();
@@ -915,7 +1005,6 @@ mod cli {
     /// Under `--verbose`, one statistics line goes to standard error after
     /// the repository line, and standard output keeps the ref lines alone.
     #[test]
-    #[ignore = "push needs client identification"]
     fn a_verbose_push_writes_the_statistics_to_standard_error() {
         let setup = Setup::new("cli-verbose", "archive");
         let c = setup.commit("main", FILES, &[]);
@@ -935,7 +1024,6 @@ mod cli {
     /// keeps the ref line. `TERM` names a terminal, so the pipe alone hides
     /// the bar.
     #[test]
-    #[ignore = "push needs client identification"]
     fn a_push_to_a_pipe_writes_no_progress() {
         let setup = Setup::new("cli-progress-pipe", "archive");
         let big = "progress\n".repeat(40_000);
@@ -970,7 +1058,6 @@ mod cli {
     /// pushes `C2` on `C1`: the server refuses the update that is not a
     /// fast-forward, keeps `D`, and does not store `C2`.
     #[test]
-    #[ignore = "push needs client identification"]
     fn a_push_onto_a_moved_ref_fails_and_changes_no_ref() {
         let setup = Setup::new("cli-moved", "archive");
         let c1 = setup.commit("main", FILES, &[]);
@@ -991,23 +1078,22 @@ mod cli {
     /// `d` still refuses the update that is not a fast-forward, and a group
     /// with `wd` takes it.
     #[test]
-    #[ignore = "push needs client identification"]
     fn a_forced_push_needs_a_group_with_w_and_d() {
         let setup = Setup::new("cli-force", "archive");
         setup.commit("main", FILES, &[]);
         let dest = receiver(&setup.base, RepoMode::Archive);
         client_group(&dest, "w:**");
-        let out = setup.push_as_client(&dest, &["main"]);
+        let out = setup.push_to(&dest, &["main"]);
         assert!(out.status.success(), "{}", stderr(&out));
         let d = commit_to(&setup.base, &dest, "main", &[("d", "delta\n")], &[]);
         let c2 = setup.commit("main", &[("e", "epsilon\n")], &[]);
 
-        let out = setup.push_as_client(&dest, &["--force", "main"]);
+        let out = setup.push_to(&dest, &["--force", "main"]);
         assert_failed(&out, "error: non-fast-forward: ");
         assert_eq!(server_tip(&dest, "main"), Some(d));
 
         client_group(&dest, "wd:**");
-        let out = setup.push_as_client(&dest, &["--force", "main"]);
+        let out = setup.push_to(&dest, &["--force", "main"]);
         assert!(out.status.success(), "{}", stderr(&out));
         assert_eq!(stdout(&out), format!("main {d} {c2}\n"));
         assert_eq!(server_tip(&dest, "main"), Some(c2));
@@ -1073,7 +1159,6 @@ mod cli {
 
     /// A push with level 9 and depth 0 starts ssh and succeeds.
     #[test]
-    #[ignore = "push needs client identification"]
     fn a_level_of_nine_and_a_depth_of_zero_push() {
         let setup = Setup::new("cli-level-nine", "archive");
         setup.commit("main", FILES, &[]);
@@ -1105,7 +1190,6 @@ mod cli {
     /// pushed commit, although the write of the ref line fails.
     #[cfg(target_os = "linux")]
     #[test]
-    #[ignore = "push needs client identification"]
     fn a_failed_write_of_the_ref_lines_exits_one() {
         let setup = Setup::new("cli-dev-full", "archive");
         let main = setup.commit("main", FILES, &[]);
@@ -1119,6 +1203,7 @@ mod cli {
             .current_dir(&setup.base.0)
             .env_remove("OSTRYA_SSH_COMMAND")
             .env_remove("OSTREE_REPO")
+            .env("LOGNAME", CLIENT)
             .stdin(Stdio::null())
             .stdout(std::fs::File::create("/dev/full").unwrap())
             .stderr(Stdio::piped())
@@ -1155,7 +1240,6 @@ mod cli {
     /// `ssh-command` key of the remote, and `--receive-command` wins over the
     /// `receive-command` key.
     #[test]
-    #[ignore = "push needs client identification"]
     fn the_command_options_win_over_the_environment_and_the_remote_keys() {
         let setup = Setup::new("cli-precedence", "archive");
         let c = setup.commit("main", FILES, &[]);
@@ -1185,21 +1269,20 @@ mod cli {
     /// and a group with `rd` takes it. A delete of an absent ref changes
     /// nothing.
     #[test]
-    #[ignore = "push needs client identification"]
     fn a_delete_needs_a_group_with_d() {
         let setup = Setup::new("cli-delete", "archive");
         let c = setup.commit("main", FILES, &[]);
         let dest = receiver(&setup.base, RepoMode::Archive);
         client_group(&dest, "w:**");
-        let out = setup.push_as_client(&dest, &["main"]);
+        let out = setup.push_to(&dest, &["main"]);
         assert!(out.status.success(), "{}", stderr(&out));
 
-        let out = setup.push_as_client(&dest, &[":main"]);
+        let out = setup.push_to(&dest, &[":main"]);
         assert_failed(&out, "error: delete-denied: ");
         assert_eq!(server_tip(&dest, "main"), Some(c));
 
         client_group(&dest, "rd:**");
-        let out = setup.push_as_client(&dest, &[":main", ":absent"]);
+        let out = setup.push_to(&dest, &[":main", ":absent"]);
         assert!(out.status.success(), "{}", stderr(&out));
         assert_eq!(
             stdout(&out),
@@ -1208,10 +1291,57 @@ mod cli {
         assert_eq!(server_tip(&dest, "main"), None);
     }
 
+    /// `--client` of the receive command wins over `LOGNAME`. A name with no
+    /// `ssh:` item gets `ref-denied`. A receiver whose one push group carries
+    /// the `anonymous` item refuses each ssh push with `ref-denied`, because
+    /// an ssh session uses the `ssh:` items alone.
+    #[test]
+    fn the_client_option_wins_over_logname_and_ssh_uses_ssh_items_alone() {
+        let setup = Setup::new("cli-client", "archive");
+        let c = setup.commit("main", FILES, &[]);
+        let dest = receiver(&setup.base, RepoMode::Archive);
+        let ssh = setup.ssh_command();
+        let address = address(&dest);
+        let as_client = |client: &str| {
+            format!(
+                "--receive-command={} -v receive --client={}",
+                quote(env!("CARGO_BIN_EXE_ostrya")),
+                quote(client)
+            )
+        };
+        let receive = as_client(CLIENT);
+        let out = setup.push(&[&ssh, &receive, &address, "main"], &[("LOGNAME", "other")]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(stdout(&out), format!("main (new) {c}\n"));
+
+        let c2 = setup.commit("main", &[("e", "epsilon\n")], &[]);
+        let receive = as_client("other");
+        let out = setup.push(&[&ssh, &receive, &address, "main"], &[]);
+        assert_failed(&out, "error: ref-denied: ");
+        let out = setup.push_to(&dest, &["main"]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(server_tip(&dest, "main"), Some(c2));
+
+        let config = dest.join("config");
+        let text = std::fs::read_to_string(&config).unwrap();
+        let start = text.find("[ex-ostrya client ").unwrap();
+        std::fs::write(
+            &config,
+            format!(
+                "{}[ex-ostrya client \"anyone\"]\nauth=anonymous\nallow=w:**\n",
+                &text[..start]
+            ),
+        )
+        .unwrap();
+        setup.commit("main", &[("f", "phi\n")], &[]);
+        let out = setup.push_to(&dest, &["main"]);
+        assert_failed(&out, "error: ref-denied: ");
+        assert_eq!(server_tip(&dest, "main"), Some(c2));
+    }
+
     /// A key that `[ex-ostrya] detached-metadata-exclude` of the client names
     /// does not reach the server, and the other keys do.
     #[test]
-    #[ignore = "push needs client identification"]
     fn an_excluded_detached_metadata_key_does_not_reach_the_server() {
         let setup = Setup::new("cli-exclude", "archive");
         let c = setup.commit(
@@ -1380,7 +1510,6 @@ mod cli {
         /// the second commit of `ostree`, whose parent is the first. Under
         /// `-v`, the statistics line goes to standard error.
         #[test]
-        #[ignore = "push needs client identification"]
         fn a_tree_push_gives_the_commit_of_the_tool() {
             let setup = Setup::without_client("tree-one");
             let tree = tree(&setup.base, "tree", 0o644, 0o755);
@@ -1429,7 +1558,6 @@ mod cli {
         /// line is the last line. Standard output keeps the commit checksum.
         /// `TERM` names a terminal, so the pipe alone hides the bar.
         #[test]
-        #[ignore = "push needs client identification"]
         fn a_tree_push_to_a_pipe_writes_no_progress() {
             let setup = Setup::without_client("tree-progress-pipe");
             let tree = tree(&setup.base, "tree", 0o644, 0o755);
@@ -1472,7 +1600,6 @@ mod cli {
         /// Two `-b` give the commit of `ostree commit -b R1 --bind-ref R2`,
         /// and both refs of the server take it.
         #[test]
-        #[ignore = "push needs client identification"]
         fn two_refs_give_the_commit_of_the_tool_with_bind_ref() {
             let setup = Setup::without_client("tree-two");
             let tree = tree(&setup.base, "tree", 0o644, 0o755);
@@ -1495,7 +1622,6 @@ mod cli {
         /// of the `ostree` command with the same options, over a tree whose
         /// modes the canonical rule changes.
         #[test]
-        #[ignore = "push needs client identification"]
         fn the_owner_and_canonical_options_give_the_commit_of_the_tool() {
             let setup = Setup::without_client("tree-owner");
             let tree = tree(&setup.base, "tree", 0o664, 0o2775);
@@ -1524,7 +1650,6 @@ mod cli {
         /// with ostrya in the receiver. The signature leaves the commit equal
         /// to the commit of an unsigned push.
         #[test]
-        #[ignore = "push needs client identification"]
         fn a_signed_tree_push_verifies_in_the_receiver() {
             let setup = Setup::without_client("tree-sign");
             let tree = tree(&setup.base, "tree", 0o644, 0o755);
@@ -1565,7 +1690,6 @@ mod cli {
         /// and 0755 modes goes in. With `--canonical-permissions`, a tree of
         /// 0664 goes in.
         #[test]
-        #[ignore = "push needs client identification"]
         fn the_owner_and_canonical_options_make_a_push_into_bare_user_only_succeed() {
             let setup = Setup::without_client("tree-buo");
             let plain = tree(&setup.base, "plain", 0o644, 0o755);
@@ -1620,7 +1744,6 @@ mod cli {
         /// - `OSTREE_REPO` at a missing path,
         /// - a current directory that is no repository.
         #[test]
-        #[ignore = "push needs client identification"]
         fn an_address_opens_no_repository() {
             let setup = Setup::new("tree-address", "archive");
             let tree = tree(&setup.base, "tree", 0o644, 0o755);
@@ -1691,7 +1814,6 @@ mod cli {
         /// the remote section of the repository, and `--ssh-command` gives
         /// the ssh command.
         #[test]
-        #[ignore = "push needs client identification"]
         fn a_configured_remote_gives_the_address_and_the_receive_command() {
             let setup = Setup::new("tree-remote", "archive");
             let tree = tree(&setup.base, "tree", 0o644, 0o755);
@@ -1819,7 +1941,6 @@ mod cli {
         /// a commit of the server each give the commit of the `ostree`
         /// command with the same options.
         #[test]
-        #[ignore = "push needs client identification"]
         fn the_commit_options_give_the_commit_of_the_tool() {
             let setup = Setup::without_client("tree-options");
             let tree = tree(&setup.base, "tree", 0o644, 0o755);
@@ -1868,7 +1989,6 @@ mod cli {
         /// `.commitmeta` bytes and the commit are equal to those of the
         /// `ostree` command with the same options.
         #[test]
-        #[ignore = "push needs client identification"]
         fn detached_metadata_and_signers_give_the_commitmeta_of_the_tool() {
             let setup = Setup::without_client("tree-detached");
             let tree = tree(&setup.base, "tree", 0o644, 0o755);

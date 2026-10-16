@@ -307,7 +307,10 @@ A repeated key takes the last value, so each list key is one line in a group.
 \fB\%ostrya receive\fR, and \fB\%ostrya serve\fR without \fB\%\-\-read\-only\fR, also build each trust group and each key group one time, also a group that no client group names.
 Thus a key source that ostrya cannot read stops the command.
 A bad group stops the command with status 1.
-The two commands select no client group for a session, so no push session opens: \fB\%ostrya receive\fR answers \fB\%ref\-denied\fR, and \fB\%ostrya serve\fR answers 403.
+\fB\%ostrya receive\fR gives a session the client group of the local refs that holds the \fB\%ssh:NAME\fR item of the client name.
+With no such group, the session gets \fB\%ref\-denied\fR.
+\fB\%ostrya serve\fR gives a session the client group of the local refs that holds the item that identified the request.
+With no such group, the request gets 403.
 \fB\%ostrya serve\fR takes its addresses, its TLS files, and its session limits from its options, and checks the client groups against its TLS options.
 .SS "Server keys"
 The keys of \fB\%[ex\-ostrya server]\fR.

@@ -1,22 +1,25 @@
-//! The authorization of the requests of the receive endpoint.
+//! The authentication of the requests of the receive endpoint by the client
+//! groups of the repository.
 //!
-//! The doc of [`ServeOptions`] states the credential file, the methods, and
-//! the order of the checks. The server compares the digest of a request with
-//! every credential line in constant time, and does not stop at a match.
+//! The doc of [`ServeOptions`](crate::ServeOptions) states the order of the
+//! checks. The server compares the digest of a credential with every
+//! `token-sha256` or `basic-sha256` item in constant time, and does not stop
+//! at a match.
 
 use std::collections::HashMap;
 use std::future::{Future, ready};
 use std::hint::black_box;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
 use hyper::header::{AUTHORIZATION, HeaderValue, WWW_AUTHENTICATE};
 use hyper::http::request::Parts;
 use hyper::{HeaderMap, StatusCode};
+use ostrya::access::{AuthItem, IpNet};
 use ostrya::remote::proto::Hello;
-use ostrya::{Checksum, ReceivePolicy};
+use ostrya::{Checksum, ReceivePolicies};
 
-use crate::error::Error;
-use crate::options::ServeOptions;
+use crate::cert::ClientCert;
 use crate::receive_auth::{ReceiveAuth, Refusal, RequestKind, SessionSetup};
 
 /// The `WWW-Authenticate` headers of a 401: the two schemes of a credential.
@@ -24,77 +27,17 @@ const CHALLENGES: [&str; 2] = [r#"Bearer realm="ostrya""#, r#"Basic realm="ostry
 
 /// What the connection of a request states about its client. The server puts
 /// it into the extensions of each request.
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct Peer {
     /// `true` if the connection runs over TLS.
     pub(crate) tls: bool,
-    /// The SHA-256 digest of the DER bytes of the end-entity certificate that
-    /// the client presented in the TLS handshake. The handshake verified the
-    /// certificate against the client CA.
-    pub(crate) cert: Option<Checksum>,
-}
-
-/// One line of the credential file.
-#[derive(Debug)]
-pub(crate) struct Credential {
-    name: String,
-    digest: [u8; 32],
-}
-
-/// The credential lines of the credential file `bytes`, in the format that
-/// [`ServeOptions::credentials`] states. A malformed line, a name on two
-/// lines, and a digest on two lines are [`Error::Credentials`]. The error
-/// names the line by its number and holds no byte of it.
-pub(crate) fn parse_credentials(bytes: &[u8]) -> Result<Vec<Credential>, Error> {
-    let mut lines = Vec::new();
-    let mut names = HashMap::new();
-    let mut digests = HashMap::new();
-    for (index, line) in bytes.split(|&b| b == b'\n').enumerate() {
-        let number = index + 1;
-        let malformed = |message: String| Error::Credentials {
-            line: number,
-            message,
-        };
-        if line.contains(&b'\r') {
-            return Err(malformed("the line holds a CR".into()));
-        }
-        let Ok(line) = std::str::from_utf8(line) else {
-            return Err(malformed("the line is not UTF-8".into()));
-        };
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        if line.contains(' ') {
-            return Err(malformed("the line holds a space".into()));
-        }
-        let Some((name, hex)) = line.split_once(':') else {
-            return Err(malformed("the line is not NAME:HEX".into()));
-        };
-        if name.is_empty() {
-            return Err(malformed("the name is empty".into()));
-        }
-        if !name.bytes().all(|b| b.is_ascii_graphic()) {
-            return Err(malformed(
-                "the name holds a character other than visible ASCII".into(),
-            ));
-        }
-        let Ok(digest) = Checksum::from_hex_lower(hex) else {
-            return Err(malformed(
-                "the digest is not 64 lowercase hex digits".into(),
-            ));
-        };
-        if let Some(first) = names.insert(name.to_owned(), number) {
-            return Err(malformed(format!("the name of line {first} is repeated")));
-        }
-        if let Some(first) = digests.insert(digest, number) {
-            return Err(malformed(format!("the digest of line {first} is repeated")));
-        }
-        lines.push(Credential {
-            name: name.to_owned(),
-            digest: *digest.as_bytes(),
-        });
-    }
-    Ok(lines)
+    /// The TCP peer address of the connection.
+    pub(crate) addr: IpAddr,
+    /// The end-entity certificate that the client presented in the TLS
+    /// handshake. The handshake verified it against the client CA. The
+    /// server reads it one time for each connection, and each request of
+    /// the connection shares it.
+    pub(crate) cert: Option<Arc<ClientCert>>,
 }
 
 #[cfg(test)]
@@ -118,166 +61,239 @@ fn digest_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
     black_box(diff) == 0
 }
 
-/// The index of the first line of `lines` with the digest `digest`. The
-/// function compares the digest of every line, also after a match.
-fn match_line(lines: &[Credential], digest: &[u8; 32]) -> Option<usize> {
-    let mut found = None;
-    for (index, line) in lines.iter().enumerate() {
-        if digest_eq(&line.digest, digest) && found.is_none() {
-            found = Some(index);
-        }
-    }
-    found
+/// One `token-sha256:HEX` item.
+#[derive(Debug)]
+struct TokenEntry {
+    digest: [u8; 32],
+    client: Client,
 }
 
-/// The authentication methods of `ostrya serve`: the credential file, the
-/// client certificate, and anonymous push. Each session gets the policy of
-/// the server. A policy that opens no push session refuses each session with
-/// 403. [`ServeOptions`] states the owner key of each method and the order of
-/// the checks.
-pub(crate) struct FileAuth {
-    /// `true` if a request with no credential can push.
-    anonymous: bool,
-    /// `true` if the TLS layer verifies a client certificate against a
-    /// client CA.
-    client_ca: bool,
+/// One `basic-sha256:USER:HEX` item, with the SHA-256 digest of its user
+/// name.
+#[derive(Debug)]
+struct BasicEntry {
+    user: [u8; 32],
+    password: [u8; 32],
+    client: Client,
+}
+
+/// The auth items of the client groups, in the form that each step of the
+/// identification reads. An `ssh:NAME` item has no place, because a request
+/// over HTTP never matches it. Each item has its [`Client`], so a request
+/// that matches an item clones two `Arc`s alone.
+#[derive(Debug, Default)]
+struct CredentialIndex {
+    tokens: Vec<TokenEntry>,
+    basics: Vec<BasicEntry>,
+    tls_sha256: HashMap<[u8; 32], Client>,
+    tls_names: HashMap<String, Client>,
+    tls_any: Option<Client>,
+    nets: Vec<(IpNet, Client)>,
+    anonymous: Option<Client>,
+}
+
+impl CredentialIndex {
+    fn new<'a>(items: impl Iterator<Item = &'a AuthItem>) -> CredentialIndex {
+        let mut index = CredentialIndex::default();
+        for item in items {
+            let client = Client::new(item.clone());
+            match item {
+                AuthItem::Anonymous => index.anonymous = Some(client),
+                AuthItem::TlsAny => index.tls_any = Some(client),
+                AuthItem::TlsName(name) => {
+                    index.tls_names.insert(name.clone(), client);
+                }
+                AuthItem::TlsSha256(digest) => {
+                    index.tls_sha256.insert(*digest, client);
+                }
+                AuthItem::TokenSha256(digest) => index.tokens.push(TokenEntry {
+                    digest: *digest,
+                    client,
+                }),
+                AuthItem::BasicSha256 { user, digest } => index.basics.push(BasicEntry {
+                    user: *Checksum::sha256(user.as_bytes()).as_bytes(),
+                    password: *digest,
+                    client,
+                }),
+                AuthItem::Ssh(_) => {}
+                AuthItem::Net(net) => index.nets.push((*net, client)),
+            }
+        }
+        index
+    }
+
+    /// The `token-sha256` item of the bearer token `token`. The function
+    /// compares the digest of the token with every item, also after a match.
+    /// An empty token matches no item.
+    fn bearer(&self, token: &[u8]) -> Option<Client> {
+        if token.is_empty() {
+            return None;
+        }
+        let digest = *Checksum::sha256(token).as_bytes();
+        let mut found = None;
+        for entry in &self.tokens {
+            if digest_eq(&entry.digest, &digest) && found.is_none() {
+                found = Some(&entry.client);
+            }
+        }
+        found.cloned()
+    }
+
+    /// The `basic-sha256` item of the Basic credential `encoded`: the base64
+    /// of the user name, a `:`, and the password, which can hold `:` too.
+    /// The function compares the digest of the user name and the digest of
+    /// the password with every item, also after a match. A credential with
+    /// no `:`, a user name that is not UTF-8, and an empty password match no
+    /// item.
+    fn basic(&self, encoded: &[u8]) -> Option<Client> {
+        let encoded = std::str::from_utf8(encoded).ok()?;
+        let decoded = ostrya::base64::decode(encoded).ok()?;
+        let colon = decoded.iter().position(|&b| b == b':')?;
+        let user = std::str::from_utf8(&decoded[..colon]).ok()?;
+        let password = &decoded[colon + 1..];
+        if password.is_empty() {
+            return None;
+        }
+        let user = *Checksum::sha256(user.as_bytes()).as_bytes();
+        let password = *Checksum::sha256(password).as_bytes();
+        let mut found = None;
+        for entry in &self.basics {
+            let user_eq = digest_eq(&entry.user, &user);
+            let password_eq = digest_eq(&entry.password, &password);
+            if user_eq & password_eq && found.is_none() {
+                found = Some(&entry.client);
+            }
+        }
+        found.cloned()
+    }
+
+    /// The first item that `cert` matches, in this order: `tls-sha256:HEX`,
+    /// `tls:NAME`, `tls:*`.
+    fn certificate(&self, cert: &ClientCert) -> Option<Client> {
+        if let Some(client) = self.tls_sha256.get(cert.digest.as_bytes()) {
+            return Some(client.clone());
+        }
+        if let Some(cn) = &cert.cn
+            && let Some(client) = self.tls_names.get(cn)
+        {
+            return Some(client.clone());
+        }
+        self.tls_any.clone()
+    }
+
+    /// The `net:` item with the longest prefix that holds `addr`.
+    fn net(&self, addr: IpAddr) -> Option<Client> {
+        self.nets
+            .iter()
+            .filter(|(net, _)| net.contains(addr))
+            .max_by_key(|(net, _)| net.prefix_len())
+            .map(|(_, client)| client.clone())
+    }
+
+    /// Returns `true` if a `token-sha256` or a `basic-sha256` item exists.
+    fn takes_credentials(&self) -> bool {
+        !self.tokens.is_empty() || !self.basics.is_empty()
+    }
+}
+
+/// The identified client of a request: its auth item, and the owner key of
+/// its sessions.
+#[derive(Debug, Clone)]
+pub(crate) struct Client {
+    item: Arc<AuthItem>,
+    /// The text of `item`.
+    owner: Arc<str>,
+}
+
+impl Client {
+    fn new(item: AuthItem) -> Client {
+        Client {
+            owner: item.to_string().into(),
+            item: Arc::new(item),
+        }
+    }
+}
+
+/// The authentication of `ostrya serve`: the client groups of the repository.
+/// [`ServeOptions`](crate::ServeOptions) states the order of the checks and
+/// the selection of a group.
+pub(crate) struct GroupAuth {
     /// `true` if the server takes a bearer or Basic credential over plain
     /// HTTP.
     cleartext: bool,
-    /// The lines of the credential file.
-    credentials: Vec<Credential>,
-    /// The policy of each session.
-    policy: Arc<ReceivePolicy>,
+    /// The client groups and their policies.
+    policies: Arc<ReceivePolicies>,
+    /// The auth items of the groups.
+    index: CredentialIndex,
 }
 
-impl FileAuth {
-    /// The methods of `opts`, with `policy` for each session.
-    ///
-    /// A malformed line of the credential file is [`Error::Credentials`]. A
-    /// server with no method is [`Error::Options`]. A server with no TLS and
-    /// no anonymous push has the credential file as its one method. If it
-    /// also takes no credential over plain HTTP, no request can pass it, so
-    /// it is [`Error::Options`].
-    pub(crate) fn new(opts: &ServeOptions, policy: Arc<ReceivePolicy>) -> Result<FileAuth, Error> {
-        let credentials = match &opts.credentials {
-            Some(bytes) => parse_credentials(bytes)?,
-            None => Vec::new(),
-        };
-        let auth = FileAuth {
-            anonymous: opts.allow_anonymous_push,
-            client_ca: opts
-                .tls
-                .as_ref()
-                .is_some_and(|tls| tls.client_ca_pem.is_some()),
-            cleartext: opts.allow_cleartext_credentials,
-            credentials,
-            policy,
-        };
-        if !auth.has_method() {
-            return Err(Error::Options(
-                "a receive endpoint with no authentication method".into(),
-            ));
+impl GroupAuth {
+    /// The authentication by the groups of `policies`. With `cleartext`, the
+    /// server takes a bearer or Basic credential over plain HTTP.
+    pub(crate) fn new(policies: Arc<ReceivePolicies>, cleartext: bool) -> GroupAuth {
+        GroupAuth {
+            cleartext,
+            index: CredentialIndex::new(policies.access().items()),
+            policies,
         }
-        // With no TLS there is no client CA, so the credential lines are the one
-        // method. The endpoint refuses each credential over plain HTTP.
-        if opts.tls.is_none() && !auth.anonymous && !auth.cleartext {
-            return Err(Error::Options(
-                "a receive endpoint over plain HTTP with the credential file as its one method \
-                 and no allow_cleartext_credentials"
-                    .into(),
-            ));
-        }
-        Ok(auth)
     }
 
-    /// Returns `true` if one method or more can accept a request.
-    fn has_method(&self) -> bool {
-        self.anonymous || self.client_ca || !self.credentials.is_empty()
-    }
-
-    /// The owner key of a request with `headers` from `peer`, or the refusal
-    /// of the request. The checks run in the order that
-    /// [`ServeOptions`](ServeOptions#authentication) states.
-    fn authorize(&self, headers: &HeaderMap, peer: &Peer) -> Result<String, Refusal> {
+    /// The auth item of a request with `headers` from `peer`, or the refusal
+    /// of the request. The server takes the first step that applies, in the
+    /// order that [`ServeOptions`](crate::ServeOptions#authentication) states.
+    fn identify(&self, headers: &HeaderMap, peer: &Peer) -> Result<Client, Refusal> {
         let mut values = headers.get_all(AUTHORIZATION).iter();
-        let Some(value) = values.next() else {
-            return self.without_credential(peer);
-        };
+        let value = values.next();
         if values.next().is_some() {
             return Err(Refusal::unauthorized(
                 "the request has more than one Authorization header",
             ));
         }
-        let value = value.as_bytes();
-        let (scheme, rest) = match value.iter().position(|&b| b == b' ') {
-            Some(space) => (&value[..space], value[space..].trim_ascii_start()),
-            None => (value, &value[value.len()..]),
-        };
-        let bearer = scheme.eq_ignore_ascii_case(b"Bearer");
-        let basic = scheme.eq_ignore_ascii_case(b"Basic");
-        if (bearer || basic) && !peer.tls && !self.cleartext {
-            return Err(Refusal::forbidden(
-                "the server takes no credential over plain HTTP",
-            ));
+        if let Some(value) = value {
+            let value = value.as_bytes();
+            let (scheme, rest) = match value.iter().position(|&b| b == b' ') {
+                Some(space) => (&value[..space], value[space..].trim_ascii_start()),
+                None => (value, &value[value.len()..]),
+            };
+            let bearer = scheme.eq_ignore_ascii_case(b"Bearer");
+            let basic = scheme.eq_ignore_ascii_case(b"Basic");
+            if (bearer || basic) && !peer.tls && !self.cleartext {
+                return Err(Refusal::forbidden(
+                    "the server takes no credential over plain HTTP",
+                ));
+            }
+            let item = if bearer {
+                self.index.bearer(rest)
+            } else if basic {
+                self.index.basic(rest)
+            } else {
+                None
+            };
+            return item.ok_or_else(|| {
+                Refusal::unauthorized(
+                    "the credential of the request matches no auth item of the server",
+                )
+            });
         }
-        let matched = if bearer {
-            self.bearer(rest)
-        } else if basic {
-            self.basic(rest)
-        } else {
-            None
-        };
-        match matched {
-            Some(index) => Ok(format!("token:{}", self.credentials[index].name)),
-            None => Err(Refusal::unauthorized(
-                "the credential of the request matches no credential of the server",
-            )),
+        if let Some(cert) = &peer.cert {
+            return self.index.certificate(cert).ok_or_else(|| {
+                Refusal::forbidden(
+                    "the client certificate of the request matches no auth item of the server",
+                )
+            });
         }
-    }
-
-    /// The line of the bearer token `token`. An empty token matches no line.
-    fn bearer(&self, token: &[u8]) -> Option<usize> {
-        if token.is_empty() {
-            return None;
+        if let Some(client) = self.index.net(peer.addr) {
+            return Ok(client);
         }
-        match_line(&self.credentials, Checksum::sha256(token).as_bytes())
-    }
-
-    /// The line of the Basic credential `encoded`: the base64 of the name, a
-    /// `:`, and the password, which can hold `:` too. The digest of the
-    /// password selects the line, and the name must then be the name of that
-    /// line. No two lines have one digest, so one name compare is enough. A
-    /// credential with no `:`, a name that is not UTF-8, and an empty
-    /// password match no line.
-    fn basic(&self, encoded: &[u8]) -> Option<usize> {
-        let encoded = std::str::from_utf8(encoded).ok()?;
-        let decoded = ostrya::base64::decode(encoded).ok()?;
-        let colon = decoded.iter().position(|&b| b == b':')?;
-        let name = std::str::from_utf8(&decoded[..colon]).ok()?;
-        let password = &decoded[colon + 1..];
-        if password.is_empty() {
-            return None;
+        if let Some(client) = &self.index.anonymous {
+            return Ok(client.clone());
         }
-        let index = match_line(&self.credentials, Checksum::sha256(password).as_bytes())?;
-        (self.credentials[index].name == name).then_some(index)
-    }
-
-    /// The owner key of a request with no `Authorization` header.
-    fn without_credential(&self, peer: &Peer) -> Result<String, Refusal> {
-        if self.client_ca
-            && let Some(cert) = peer.cert
-        {
-            return Ok(format!("cert:{}", cert.to_hex()));
-        }
-        if self.anonymous {
-            return Ok("anonymous".into());
-        }
-        if self.credentials.is_empty() {
-            Err(Refusal::forbidden(
-                "the request has no client certificate, and the server takes no other credential",
-            ))
-        } else {
+        if self.index.takes_credentials() {
             Err(Refusal::unauthorized("the request has no credential"))
+        } else {
+            Err(Refusal::forbidden(
+                "the request matches no auth item of the server",
+            ))
         }
     }
 }
@@ -292,48 +308,59 @@ fn challenge(refusal: Refusal) -> Refusal {
     })
 }
 
-impl ReceiveAuth for FileAuth {
-    /// The owner key.
-    type Principal = String;
+impl ReceiveAuth for GroupAuth {
+    type Principal = Client;
 
-    fn owner(principal: &String) -> &str {
-        principal
+    /// The text of the auth item.
+    fn owner(principal: &Client) -> &str {
+        &principal.owner
     }
 
-    /// The owner key of the request, from its headers and the [`Peer`] in
-    /// its extensions. The server puts a peer into each request of its
-    /// receive endpoint. The route does not change the answer.
+    /// The client of the request, from its headers and the [`Peer`] in its
+    /// extensions. The server puts a peer into each request of its receive
+    /// endpoint. The route does not change the answer.
     ///
     /// If a request has no peer, a build with debug assertions panics. Other
-    /// builds take the request as plain HTTP with no client certificate.
+    /// builds take the request as plain HTTP from the unspecified address,
+    /// with no client certificate.
     fn authenticate(
         &self,
         parts: &Parts,
         _kind: RequestKind,
-    ) -> impl Future<Output = Result<String, Refusal>> + Send {
-        let peer = parts.extensions.get::<Peer>().copied();
+    ) -> impl Future<Output = Result<Client, Refusal>> + Send {
+        let peer = parts.extensions.get::<Peer>().cloned();
         debug_assert!(peer.is_some(), "the server puts a peer into each request");
         let peer = peer.unwrap_or(Peer {
             tls: false,
+            addr: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
             cert: None,
         });
-        ready(self.authorize(&parts.headers, &peer).map_err(challenge))
+        ready(self.identify(&parts.headers, &peer).map_err(challenge))
     }
 
-    /// The policy of the server and no hooks, for every principal. If the
-    /// policy opens no push session, the refusal is 403.
+    /// The policy of the client group that carries the item of `client` in
+    /// the local refs, and no hooks. `Hello` names no collection, so the
+    /// namespace of each session is the local refs. With no such group, and
+    /// with a group that opens no push session, the refusal is 403.
     fn open(
         &self,
-        _principal: &String,
+        client: &Client,
         _hello: &Hello,
     ) -> impl Future<Output = Result<SessionSetup, Refusal>> + Send {
-        if !self.policy.rules.opens_push_session() {
+        let namespace = self.policies.access().namespace(None);
+        let Some((group, policy)) = self.policies.select(&client.item, &namespace) else {
             return ready(Err(Refusal::forbidden(
-                "the policy of the server opens no push session",
+                "no client group of the request covers the local refs",
             )));
+        };
+        if !policy.rules.opens_push_session() {
+            return ready(Err(Refusal::forbidden(format!(
+                "client group '{}' opens no push session",
+                group.name()
+            ))));
         }
         ready(Ok(SessionSetup {
-            policy: self.policy.clone(),
+            policy: policy.clone(),
             hooks: None,
         }))
     }
@@ -341,32 +368,62 @@ impl ReceiveAuth for FileAuth {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicU32, Ordering};
+
     use hyper::header::HeaderValue;
 
     use super::*;
-    use crate::session::tests::pushing_policy;
+    use crate::session::tests::TmpRepo;
 
-    const PLAIN: Peer = Peer {
-        tls: false,
-        cert: None,
-    };
-
-    const TLS: Peer = Peer {
-        tls: true,
-        cert: None,
-    };
-
-    fn line(name: &str, secret: &str) -> String {
-        format!("{name}:{}\n", Checksum::sha256(secret.as_bytes()).to_hex())
+    /// The hex digest of `text`.
+    fn hex(text: &str) -> String {
+        Checksum::sha256(text.as_bytes()).to_hex()
     }
 
-    fn auth(file: &str) -> FileAuth {
-        FileAuth {
-            anonymous: false,
-            client_ca: false,
-            cleartext: false,
-            credentials: parse_credentials(file.as_bytes()).unwrap(),
-            policy: Arc::new(pushing_policy()),
+    /// The authentication by `groups`, in a new repository. The repository
+    /// lives until the end of the test.
+    fn auth(groups: &str) -> (GroupAuth, TmpRepo) {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let tmp = TmpRepo::new(&format!("auth-{}", N.fetch_add(1, Ordering::Relaxed)));
+        (GroupAuth::new(tmp.policies(groups), false), tmp)
+    }
+
+    /// Two groups of credentials: `tokens` with two bearer tokens, and
+    /// `basics` with two Basic credentials. Both push to each ref.
+    fn credentials() -> String {
+        format!(
+            "[ex-ostrya client \"tokens\"]\n\
+             auth=token-sha256:{};token-sha256:{}\nallow=w:**\n\
+             [ex-ostrya client \"basics\"]\n\
+             auth=basic-sha256:alice:{};basic-sha256:bob:{}\nallow=w:**\n",
+            hex("a-token"),
+            hex("b-token"),
+            hex("a-pass"),
+            hex("pa:ss:"),
+        )
+    }
+
+    fn peer(tls: bool, addr: &str, cert: Option<ClientCert>) -> Peer {
+        Peer {
+            tls,
+            addr: addr.parse().unwrap(),
+            cert: cert.map(Arc::new),
+        }
+    }
+
+    fn plain() -> Peer {
+        peer(false, "192.0.2.1", None)
+    }
+
+    fn tls() -> Peer {
+        peer(true, "192.0.2.1", None)
+    }
+
+    /// A certificate with the digest of `der` and the CN `cn`.
+    fn cert(der: &str, cn: Option<&str>) -> ClientCert {
+        ClientCert {
+            digest: Checksum::sha256(der.as_bytes()),
+            cn: cn.map(str::to_owned),
         }
     }
 
@@ -378,143 +435,31 @@ mod tests {
         headers
     }
 
-    fn basic(name: &str, password: &str) -> String {
+    fn basic(user: &str, password: &str) -> String {
         format!(
             "Basic {}",
-            ostrya::base64::encode(format!("{name}:{password}").as_bytes())
+            ostrya::base64::encode(format!("{user}:{password}").as_bytes())
         )
     }
 
-    /// The line number and the message of the refusal of `file`.
-    fn malformed(file: &str) -> (usize, String) {
-        match parse_credentials(file.as_bytes()) {
-            Err(Error::Credentials { line, message }) => (line, message),
-            other => panic!("{file:?}: {other:?}"),
-        }
+    /// The text of the item that `auth` gives to `values` from `peer`.
+    fn item(auth: &GroupAuth, values: &[&str], peer: &Peer) -> String {
+        auth.identify(&headers(values), peer)
+            .unwrap()
+            .owner
+            .to_string()
     }
 
-    #[test]
-    fn comments_and_empty_lines_hold_no_credential() {
-        let file = format!(
-            "# the push credentials\n\n{}#{}{}",
-            line("alice", "a"),
-            line("bob", "b"),
-            line("carol", "c").trim_end()
-        );
-        let lines = parse_credentials(file.as_bytes()).unwrap();
-        let names: Vec<&str> = lines.iter().map(|l| l.name.as_str()).collect();
-        assert_eq!(names, ["alice", "carol"]);
-        assert!(parse_credentials(b"").unwrap().is_empty());
-        assert!(parse_credentials(b"# none\n\n").unwrap().is_empty());
-        let odd = parse_credentials(line("a!~\"", "x").as_bytes()).unwrap();
-        assert_eq!(odd[0].name, "a!~\"");
+    /// The status of the refusal of `values` from `peer`.
+    fn refused(auth: &GroupAuth, values: &[&str], peer: &Peer) -> StatusCode {
+        auth.identify(&headers(values), peer).unwrap_err().status
     }
 
-    #[test]
-    fn a_cr_is_malformed() {
-        let file = format!("# ok\n{}\r\n", line("alice", "a").trim_end());
-        assert_eq!(malformed(&file), (2, "the line holds a CR".into()));
-        assert_eq!(malformed("# a comment\r\n").0, 1);
-    }
-
-    #[test]
-    fn a_space_is_malformed() {
-        let hex = Checksum::sha256(b"a").to_hex();
-        for file in [
-            format!("alice :{hex}"),
-            format!(" alice:{hex}"),
-            format!("alice:{hex} "),
-            " ".to_string(),
-        ] {
-            assert_eq!(malformed(&file), (1, "the line holds a space".into()));
-        }
-    }
-
-    #[test]
-    fn a_line_with_no_colon_is_malformed() {
-        assert_eq!(
-            malformed(&Checksum::sha256(b"a").to_hex()),
-            (1, "the line is not NAME:HEX".into())
-        );
-    }
-
-    #[test]
-    fn an_empty_name_is_malformed() {
-        let file = format!(":{}", Checksum::sha256(b"a").to_hex());
-        assert_eq!(malformed(&file), (1, "the name is empty".into()));
-    }
-
-    #[test]
-    fn a_name_outside_visible_ascii_is_malformed() {
-        let hex = Checksum::sha256(b"a").to_hex();
-        for name in ["al\tice", "älice", "al\u{7f}ice"] {
-            let (number, message) = malformed(&format!("{name}:{hex}"));
-            assert_eq!(number, 1);
-            assert!(message.contains("visible ASCII"), "{message}");
-        }
-    }
-
-    #[test]
-    fn a_digest_that_is_not_64_lowercase_hex_is_malformed() {
-        let hex = Checksum::sha256(b"a").to_hex();
-        for digest in [
-            hex.to_ascii_uppercase(),
-            hex[..63].to_string(),
-            format!("{hex}0"),
-            format!("{}g", &hex[..63]),
-            format!("{}:{}", &hex[..31], &hex[32..]),
-            String::new(),
-        ] {
-            let (number, message) = malformed(&format!("alice:{digest}"));
-            assert_eq!(number, 1);
-            assert_eq!(message, "the digest is not 64 lowercase hex digits");
-        }
-    }
-
-    #[test]
-    fn a_line_that_is_not_utf8_is_malformed() {
-        let mut file = line("alice", "a").into_bytes();
-        file.extend_from_slice(b"# \xff\n");
-        match parse_credentials(&file) {
-            Err(Error::Credentials { line, message }) => {
-                assert_eq!((line, message.as_str()), (2, "the line is not UTF-8"));
-            }
-            other => panic!("{other:?}"),
-        }
-    }
-
-    #[test]
-    fn a_repeated_name_is_malformed() {
-        let file = format!(
-            "{}\n{}{}",
-            line("alice", "a"),
-            line("bob", "b"),
-            line("alice", "c")
-        );
-        assert_eq!(
-            malformed(&file),
-            (4, "the name of line 1 is repeated".into())
-        );
-    }
-
-    #[test]
-    fn a_repeated_digest_is_malformed() {
-        let file = format!("{}{}", line("alice", "a"), line("bob", "a"));
-        assert_eq!(
-            malformed(&file),
-            (2, "the digest of line 1 is repeated".into())
-        );
-    }
-
-    /// The message of a malformed line holds no byte of the line.
-    #[test]
-    fn a_refusal_holds_no_byte_of_the_line() {
-        let secret_name = "secret-name-1234";
-        let error = parse_credentials(format!("{secret_name}:abc").as_bytes()).unwrap_err();
-        let text = error.to_string();
-        assert!(!text.contains(secret_name), "{text}");
-        assert!(!text.contains("abc"), "{text}");
-        assert!(text.contains("line 1"), "{text}");
+    /// The result of `f`, and the number of digest compares it made.
+    fn counted<T>(f: impl FnOnce() -> T) -> (T, usize) {
+        COMPARES.with(|n| n.set(0));
+        let result = f();
+        (result, COMPARES.with(|n| n.get()))
     }
 
     #[test]
@@ -528,169 +473,219 @@ mod tests {
         }
     }
 
-    /// A match compares the digest with every line, also when the first line
-    /// matches, and gives the first line that matches.
+    /// The index holds each item of each group once, and no `ssh:` item.
     #[test]
-    fn a_match_visits_every_line() {
-        let file: String = (0..5)
-            .map(|i| line(&format!("n{i}"), &format!("s{i}")))
-            .collect();
-        let lines = parse_credentials(file.as_bytes()).unwrap();
-        let count = |secret: &str| {
-            COMPARES.with(|n| n.set(0));
-            let found = match_line(&lines, Checksum::sha256(secret.as_bytes()).as_bytes());
-            (found, COMPARES.with(|n| n.get()))
-        };
-        assert_eq!(count("s0"), (Some(0), 5));
-        assert_eq!(count("s4"), (Some(4), 5));
-        assert_eq!(count("none"), (None, 5));
+    fn the_index_holds_the_items_of_each_group() {
+        let (auth, _tmp) = auth(&format!(
+            "{}[ex-ostrya client \"other\"]\nauth=ssh:u;token-sha256:{};tls:*;net:10.0.0.0/8\n\
+             collection=*\n",
+            credentials(),
+            hex("a-token"),
+        ));
+        let index = &auth.index;
+        assert_eq!(index.tokens.len(), 2);
+        assert_eq!(index.basics.len(), 2);
+        assert!(index.tls_any.is_some() && index.anonymous.is_none());
+        assert_eq!(index.nets.len(), 1);
+        assert!(index.tls_names.is_empty() && index.tls_sha256.is_empty());
     }
 
-    /// A Basic credential compares the digest of every line, and then the
-    /// name of the line that matched.
+    /// A bearer token gives its `token-sha256` item, and a Basic credential
+    /// its `basic-sha256` item. Each compare visits every item of its kind:
+    /// one compare for each token, and two for each Basic item.
     #[test]
-    fn basic_visits_every_line_and_then_checks_the_name() {
-        let file: String = (0..5)
-            .map(|i| line(&format!("n{i}"), &format!("s{i}")))
-            .collect();
-        let auth = auth(&file);
-        let count = |name: &str, secret: &str| {
-            COMPARES.with(|n| n.set(0));
-            let value = basic(name, secret);
-            let found = auth.basic(value.strip_prefix("Basic ").unwrap().as_bytes());
-            (found, COMPARES.with(|n| n.get()))
-        };
-        assert_eq!(count("n0", "s0"), (Some(0), 5));
-        assert_eq!(count("n2", "s2"), (Some(2), 5));
-        assert_eq!(count("n1", "s2"), (None, 5));
-        assert_eq!(count("n1", "none"), (None, 5));
-    }
-
-    #[test]
-    fn a_bearer_token_and_basic_give_the_owner_of_their_line() {
-        let auth = auth(&(line("alice", "a-token") + &line("bob", "b-token")));
-        let owner = |value: &str| auth.authorize(&headers(&[value]), &TLS);
-        let bob = "token:bob";
-        assert_eq!(owner("Bearer b-token").unwrap(), bob);
-        assert_eq!(owner("bearer   b-token").unwrap(), bob);
-        assert_eq!(owner(&basic("bob", "b-token")).unwrap(), bob);
-        assert_eq!(
-            owner(&basic("alice", "a-token").replacen("Basic", "BASIC", 1)).unwrap(),
-            "token:alice"
-        );
-        assert_eq!(owner(&basic("bob", "x:y")).unwrap_err().status, 401);
-    }
-
-    /// The password of a Basic credential runs from the first `:` to the
-    /// end, so a password that holds `:` matches its line.
-    #[test]
-    fn a_basic_password_with_a_colon_matches() {
-        let auth = auth(&(line("alice", "a-token") + &line("bob", "pa:ss:")));
-        let owner = |value: &str| auth.authorize(&headers(&[value]), &TLS);
-        assert_eq!(owner(&basic("bob", "pa:ss:")).unwrap(), "token:bob");
-        assert_eq!(owner(&basic("bob", "pa:ss")).unwrap_err().status, 401);
-        assert_eq!(owner(&basic("alice", "pa:ss:")).unwrap_err().status, 401);
-    }
-
-    #[test]
-    fn a_credential_that_matches_no_line_is_401() {
-        let mut auth = auth(&line("alice", "a-token"));
-        auth.client_ca = true;
-        auth.anonymous = true;
-        let peer = Peer {
-            tls: true,
-            cert: Some(Checksum::sha256(b"cert")),
-        };
-        for value in [
-            "Bearer other".to_string(),
-            "Bearer".to_string(),
-            "Bearer ".to_string(),
-            basic("bob", "a-token"),
-            basic("alice", "other"),
-            basic("alice", ""),
-            "Basic !!!".to_string(),
-            format!("Basic {}", ostrya::base64::encode(b"alice")),
-            "Digest a-token".to_string(),
+    fn a_credential_gives_its_item_and_visits_every_item() {
+        let (auth, _tmp) = auth(&credentials());
+        for (value, expected) in [
+            (
+                "Bearer a-token".to_owned(),
+                format!("token-sha256:{}", hex("a-token")),
+            ),
+            (
+                "bearer   b-token".to_owned(),
+                format!("token-sha256:{}", hex("b-token")),
+            ),
         ] {
-            let refusal = auth.authorize(&headers(&[&value]), &peer).unwrap_err();
-            assert_eq!(refusal.status, StatusCode::UNAUTHORIZED, "{value}");
+            let (found, compares) = counted(|| item(&auth, &[&value], &tls()));
+            assert_eq!((found, compares), (expected, 2), "{value}");
         }
+        for (user, password) in [("alice", "a-pass"), ("bob", "pa:ss:")] {
+            let value = basic(user, password);
+            let (found, compares) = counted(|| item(&auth, &[&value], &tls()));
+            let expected = format!("basic-sha256:{user}:{}", hex(password));
+            assert_eq!((found, compares), (expected, 4), "{user}");
+        }
+        let upper = basic("alice", "a-pass").replacen("Basic", "BASIC", 1);
+        assert!(item(&auth, &[&upper], &tls()).starts_with("basic-sha256:alice:"));
     }
 
+    /// A credential that matches no item is 401, also with a client
+    /// certificate, an anonymous item, and a `net:` item that holds the peer.
+    /// A Basic credential with a wrong user name or a wrong password visits
+    /// every item.
+    #[test]
+    fn a_credential_that_matches_no_item_is_401() {
+        let (auth, _tmp) = auth(&format!(
+            "{}[ex-ostrya client \"others\"]\nauth=anonymous;tls:*;net:0.0.0.0/0\nallow=w:**\n",
+            credentials()
+        ));
+        let with_cert = peer(true, "192.0.2.1", Some(cert("cert", Some("host"))));
+        for value in [
+            "Bearer other".to_owned(),
+            "Bearer".to_owned(),
+            "Bearer ".to_owned(),
+            basic("alice", "pa:ss:"),
+            basic("bob", "a-pass"),
+            basic("carol", "a-pass"),
+            basic("alice", ""),
+            "Basic !!!".to_owned(),
+            format!("Basic {}", ostrya::base64::encode(b"alice")),
+            format!("Basic {}", ostrya::base64::encode(b"\xff:a-pass")),
+            "Digest a-token".to_owned(),
+            "a-token".to_owned(),
+        ] {
+            assert_eq!(
+                refused(&auth, &[&value], &with_cert),
+                StatusCode::UNAUTHORIZED,
+                "{value}"
+            );
+        }
+        for (user, password) in [("alice", "b-pass"), ("carol", "a-pass")] {
+            let value = basic(user, password);
+            let (status, compares) = counted(|| refused(&auth, &[&value], &tls()));
+            assert_eq!((status, compares), (StatusCode::UNAUTHORIZED, 4));
+        }
+        let (status, compares) = counted(|| refused(&auth, &["Bearer other"], &tls()));
+        assert_eq!((status, compares), (StatusCode::UNAUTHORIZED, 2));
+    }
+
+    /// More than one `Authorization` header is 401 before each other step,
+    /// also over plain HTTP.
     #[test]
     fn more_than_one_authorization_header_is_401() {
-        let auth = auth(&line("alice", "a-token"));
+        let (auth, _tmp) = auth(&credentials());
         let two = headers(&["Bearer a-token", "Bearer a-token"]);
-        let refusal = auth.authorize(&two, &TLS).unwrap_err();
-        assert_eq!(refusal.status, StatusCode::UNAUTHORIZED);
-        assert_eq!(
-            refusal.message,
-            "the request has more than one Authorization header"
-        );
+        for peer in [tls(), plain()] {
+            let refusal = auth.identify(&two, &peer).unwrap_err();
+            assert_eq!(refusal.status, StatusCode::UNAUTHORIZED);
+            assert_eq!(
+                refusal.message,
+                "the request has more than one Authorization header"
+            );
+        }
     }
 
     /// A bearer or Basic credential over plain HTTP is 403 before any
-    /// compare, also where anonymous push is allowed. If the server takes
-    /// credentials over plain HTTP, the credential passes.
+    /// compare, also where an anonymous item exists. With the cleartext
+    /// switch, the credential gives its item.
     #[test]
     fn a_credential_over_plain_http_is_403() {
-        let mut auth = auth(&line("alice", "a-token"));
-        auth.anonymous = true;
+        let (mut auth, _tmp) = auth(&format!(
+            "{}[ex-ostrya client \"anonymous\"]\nauth=anonymous\nallow=w:**\n",
+            credentials()
+        ));
         for value in [
-            "Bearer a-token",
-            "BEARER a-token",
-            &basic("alice", "a-token"),
+            "Bearer a-token".to_owned(),
+            "BEARER a-token".to_owned(),
+            basic("alice", "a-pass"),
         ] {
-            COMPARES.with(|n| n.set(0));
-            let refusal = auth.authorize(&headers(&[value]), &PLAIN).unwrap_err();
-            assert_eq!(refusal.status, StatusCode::FORBIDDEN, "{value}");
-            assert_eq!(COMPARES.with(|n| n.get()), 0);
+            let (status, compares) = counted(|| refused(&auth, &[&value], &plain()));
+            assert_eq!((status, compares), (StatusCode::FORBIDDEN, 0), "{value}");
         }
+        assert_eq!(refused(&auth, &["Digest x"], &plain()), 401);
+        assert_eq!(item(&auth, &[], &plain()), "anonymous");
         auth.cleartext = true;
         assert_eq!(
-            auth.authorize(&headers(&["Bearer a-token"]), &PLAIN)
-                .unwrap(),
-            "token:alice"
+            item(&auth, &["Bearer a-token"], &plain()),
+            format!("token-sha256:{}", hex("a-token"))
         );
     }
 
-    /// With no header: a client certificate, then anonymous push, then 401
-    /// with credential lines and 403 with a client CA alone.
+    /// A certificate gives the first item that it matches: `tls-sha256:HEX`,
+    /// then `tls:NAME` by the CN, then `tls:*`. A certificate that matches
+    /// no item is 403, also with an anonymous item and a `net:` item that
+    /// holds the peer.
     #[test]
-    fn a_request_with_no_header() {
-        let cert = Checksum::sha256(b"cert");
-        let with_cert = Peer {
-            tls: true,
-            cert: Some(cert),
-        };
-        let cert_key = format!("cert:{}", cert.to_hex());
-        let none = HeaderMap::new();
-        let mut auth = auth("");
-        auth.client_ca = true;
-        assert!(auth.has_method());
-        assert_eq!(auth.authorize(&none, &with_cert).unwrap(), cert_key);
-        assert_eq!(auth.authorize(&none, &TLS).unwrap_err().status, 403);
-        auth.anonymous = true;
-        assert_eq!(auth.authorize(&none, &with_cert).unwrap(), cert_key);
-        assert_eq!(auth.authorize(&none, &TLS).unwrap(), "anonymous");
-        let mut auth = self::auth(&line("alice", "a-token"));
-        assert!(auth.has_method());
-        assert_eq!(auth.authorize(&none, &with_cert).unwrap_err().status, 401);
-        auth.client_ca = true;
-        assert_eq!(auth.authorize(&none, &TLS).unwrap_err().status, 401);
-    }
-
-    #[test]
-    fn a_file_with_no_line_is_no_method() {
-        let auth = auth("# none\n");
-        assert!(!auth.has_method());
-        let mut open = self::auth("");
-        open.anonymous = true;
-        assert!(open.has_method());
+    fn a_certificate_gives_the_first_item_that_matches() {
+        let (auth, _tmp) = auth(&format!(
+            "[ex-ostrya client \"by-digest\"]\nauth=tls-sha256:{}\nallow=w:**\n\
+             [ex-ostrya client \"by-name\"]\nauth=tls:host\nallow=w:**\n\
+             [ex-ostrya client \"any\"]\nauth=tls:*\nallow=w:**\n",
+            hex("pinned"),
+        ));
+        let with =
+            |der: &str, cn: Option<&str>| item(&auth, &[], &peer(true, "::1", Some(cert(der, cn))));
         assert_eq!(
-            open.authorize(&HeaderMap::new(), &PLAIN).unwrap(),
-            "anonymous"
+            with("pinned", Some("host")),
+            format!("tls-sha256:{}", hex("pinned"))
         );
+        assert_eq!(with("other", Some("host")), "tls:host");
+        assert_eq!(with("other", Some("Host")), "tls:*");
+        assert_eq!(with("other", None), "tls:*");
+        assert_eq!(refused(&auth, &[], &tls()), StatusCode::FORBIDDEN);
+
+        let (auth, _tmp) = self::auth(&format!(
+            "[ex-ostrya client \"by-name\"]\nauth=tls:host\nallow=w:**\n\
+             [ex-ostrya client \"others\"]\nauth=anonymous;net:0.0.0.0/0;token-sha256:{}\n\
+             allow=w:**\n",
+            hex("a-token"),
+        ));
+        let unknown = peer(true, "192.0.2.1", Some(cert("other", Some("guest"))));
+        let refusal = auth.identify(&HeaderMap::new(), &unknown).unwrap_err();
+        assert_eq!(refusal.status, StatusCode::FORBIDDEN);
+        assert!(
+            refusal.message.contains("client certificate"),
+            "{refusal:?}"
+        );
+        assert_eq!(item(&auth, &[], &tls()), "net:0.0.0.0/0");
+    }
+
+    /// A request with no credential and no certificate gets the `net:` item
+    /// with the longest prefix that holds its address. An IPv4-mapped IPv6
+    /// address counts as its IPv4 address. A `net:` item wins over the
+    /// anonymous item.
+    #[test]
+    fn a_net_item_with_the_longest_prefix_wins() {
+        let (auth, _tmp) = auth(
+            "[ex-ostrya client \"wide\"]\nauth=net:10.0.0.0/8;net:2001:db8::/32\nallow=w:**\n\
+             [ex-ostrya client \"narrow\"]\nauth=net:10.0.1.0/24;net:2001:db8::/56\nallow=w:**\n\
+             [ex-ostrya client \"anonymous\"]\nauth=anonymous\nallow=w:**\n",
+        );
+        for (addr, expected) in [
+            ("10.0.1.7", "net:10.0.1.0/24"),
+            ("10.0.2.7", "net:10.0.0.0/8"),
+            ("::ffff:10.0.1.7", "net:10.0.1.0/24"),
+            ("::ffff:10.9.0.1", "net:10.0.0.0/8"),
+            ("2001:db8::1", "net:2001:db8::/56"),
+            ("2001:db8:1::1", "net:2001:db8::/32"),
+            ("192.0.2.1", "anonymous"),
+            ("::1", "anonymous"),
+        ] {
+            assert_eq!(
+                item(&auth, &[], &peer(false, addr, None)),
+                expected,
+                "{addr}"
+            );
+        }
+    }
+
+    /// With no credential, no certificate, and no `net:` match, a request
+    /// gets the anonymous item. With no anonymous item, it gets 401 when a
+    /// `token-sha256` or `basic-sha256` item exists, and 403 when none
+    /// exists.
+    #[test]
+    fn a_request_with_nothing_is_anonymous_401_or_403() {
+        let (auth, _tmp) = auth(&format!(
+            "{}[ex-ostrya client \"anonymous\"]\nauth=anonymous\nallow=w:**\n",
+            credentials()
+        ));
+        assert_eq!(item(&auth, &[], &tls()), "anonymous");
+        let (auth, _tmp) = self::auth(&credentials());
+        assert_eq!(refused(&auth, &[], &tls()), StatusCode::UNAUTHORIZED);
+        let (auth, _tmp) =
+            self::auth("[ex-ostrya client \"c\"]\nauth=tls:*;ssh:u;net:10.0.0.0/8\nallow=w:**\n");
+        assert_eq!(refused(&auth, &[], &tls()), StatusCode::FORBIDDEN);
+        assert_eq!(refused(&auth, &[], &plain()), StatusCode::FORBIDDEN);
     }
 
     /// The parts of a request with the `Authorization` values `values` and,
@@ -706,27 +701,23 @@ mod tests {
         builder.body(()).unwrap().into_parts().0
     }
 
-    fn authenticate(auth: &FileAuth, parts: &Parts) -> Result<String, Refusal> {
+    fn authenticate(auth: &GroupAuth, parts: &Parts) -> Result<Client, Refusal> {
         ostrya_rt::block_on(auth.authenticate(parts, RequestKind::Open))
     }
 
     /// `authenticate` reads the peer from the extensions of the request, and
-    /// adds the two challenges to a 401 alone. The route does not change the
-    /// answer.
+    /// adds the two challenges to a 401 alone. The owner key is the text of
+    /// the item. The route does not change the answer.
     #[test]
     fn authenticate_reads_the_peer_and_challenges_a_401_alone() {
-        let mut auth = auth(&line("alice", "a-token"));
-        auth.client_ca = true;
-        let cert = Checksum::sha256(b"cert");
-        let with_cert = Peer {
-            tls: true,
-            cert: Some(cert),
-        };
-        assert_eq!(
-            authenticate(&auth, &parts(&[], Some(with_cert))).unwrap(),
-            format!("cert:{}", cert.to_hex())
-        );
-        let token = parts(&["Bearer a-token"], Some(TLS));
+        let (auth, _tmp) = auth(&format!(
+            "{}[ex-ostrya client \"cert\"]\nauth=tls:*\nallow=w:**\n",
+            credentials()
+        ));
+        let with_cert = peer(true, "192.0.2.1", Some(cert("cert", None)));
+        let client = authenticate(&auth, &parts(&[], Some(with_cert))).unwrap();
+        assert_eq!(GroupAuth::owner(&client), "tls:*");
+        let token = parts(&["Bearer a-token"], Some(tls()));
         for kind in [
             RequestKind::Open,
             RequestKind::Have,
@@ -734,11 +725,12 @@ mod tests {
             RequestKind::Commit,
             RequestKind::Delete,
         ] {
-            let owner = ostrya_rt::block_on(auth.authenticate(&token, kind)).unwrap();
-            assert_eq!(FileAuth::owner(&owner), "token:alice");
+            let client = ostrya_rt::block_on(auth.authenticate(&token, kind)).unwrap();
+            let expected = format!("token-sha256:{}", hex("a-token"));
+            assert_eq!(GroupAuth::owner(&client), expected);
         }
 
-        let refusal = authenticate(&auth, &parts(&[], Some(TLS))).unwrap_err();
+        let refusal = authenticate(&auth, &parts(&[], Some(tls()))).unwrap_err();
         assert_eq!(refusal.status, StatusCode::UNAUTHORIZED);
         let challenges: Vec<_> = CHALLENGES
             .into_iter()
@@ -746,7 +738,7 @@ mod tests {
             .collect();
         assert_eq!(refusal.headers, challenges);
 
-        let refusal = authenticate(&auth, &parts(&["Bearer a-token"], Some(PLAIN))).unwrap_err();
+        let refusal = authenticate(&auth, &parts(&["Bearer a-token"], Some(plain()))).unwrap_err();
         assert_eq!(refusal.status, StatusCode::FORBIDDEN);
         assert!(refusal.headers.is_empty());
     }
@@ -756,7 +748,7 @@ mod tests {
     /// credential is 403.
     #[test]
     fn a_request_with_no_peer_is_plain_http() {
-        let auth = auth(&line("alice", "a-token"));
+        let (auth, _tmp) = auth(&credentials());
         let no_peer = parts(&["Bearer a-token"], None);
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             authenticate(&auth, &no_peer)
@@ -768,85 +760,55 @@ mod tests {
         }
     }
 
-    /// `open` gives the policy of the server to every principal. A policy
-    /// that opens no push session refuses every principal with 403.
+    /// `open` gives the policy of the group that carries the item in the
+    /// local refs. An item with no such group, and a group that opens no
+    /// push session, get 403. A `tls:NAME` item whose groups do not cover
+    /// the local refs gets 403, although a group of `tls:*` covers them.
     #[test]
-    fn open_gives_the_policy_of_the_server() {
+    fn open_selects_the_group_of_the_item() {
+        let (auth, _tmp) = auth(
+            "[ex-ostrya client \"push\"]\nauth=anonymous;tls:*\nallow=w:**\n\
+             [ex-ostrya client \"read\"]\nauth=ssh:r;net:10.0.0.0/8\nallow=r:**\n\
+             [ex-ostrya client \"mirror\"]\nauth=tls:host\ncollection=*\nallow=w:**\n",
+        );
         let hello = Hello {
             version: 1,
             agent: None,
             refs: vec!["main".into()],
             one_way: false,
         };
-        let open = auth("");
-        for principal in ["anonymous", "token:alice"] {
-            let setup = ostrya_rt::block_on(open.open(&principal.to_owned(), &hello)).unwrap();
-            assert!(Arc::ptr_eq(&setup.policy, &open.policy));
-        }
-        let closed = FileAuth {
-            policy: Arc::new(ReceivePolicy::default()),
-            ..auth("")
+        let open = |text: &str| {
+            let client = Client::new(AuthItem::parse(text).unwrap());
+            ostrya_rt::block_on(auth.open(&client, &hello))
         };
-        for principal in ["anonymous", "token:alice"] {
-            let Err(refusal) = ostrya_rt::block_on(closed.open(&principal.to_owned(), &hello))
-            else {
-                panic!("the policy opens no push session");
+        for text in ["anonymous", "tls:*"] {
+            let setup = open(text).unwrap_or_else(|r| panic!("{text}: {r:?}"));
+            assert!(Arc::ptr_eq(
+                &setup.policy,
+                auth.policies.get("push").unwrap()
+            ));
+            assert_eq!(setup.policy.group.as_deref(), Some("push"));
+            assert!(setup.hooks.is_none());
+        }
+        for (text, needle) in [
+            (
+                "net:10.0.0.0/8",
+                "client group 'read' opens no push session",
+            ),
+            (
+                "tls:host",
+                "no client group of the request covers the local refs",
+            ),
+            (
+                "tls:other",
+                "no client group of the request covers the local refs",
+            ),
+        ] {
+            let Err(refusal) = open(text) else {
+                panic!("{text} opens a session");
             };
-            assert_eq!(refusal.status, StatusCode::FORBIDDEN);
-            assert!(refusal.message.contains("opens no push session"));
+            assert_eq!(refusal.status, StatusCode::FORBIDDEN, "{text}");
+            assert_eq!(refusal.message, needle, "{text}");
         }
-    }
-
-    /// `FileAuth::new` refuses a server with no method. It also refuses a
-    /// server with no TLS whose one method is the credential file, unless it
-    /// takes credentials over plain HTTP. A malformed line is
-    /// [`Error::Credentials`].
-    #[test]
-    fn new_refuses_a_server_that_no_request_can_pass() {
-        let policy = Arc::new(ReceivePolicy::default());
-        let new = |change: &dyn Fn(&mut ServeOptions)| {
-            let mut opts = ServeOptions::default();
-            change(&mut opts);
-            FileAuth::new(&opts, policy.clone())
-        };
-        let options = |result: Result<FileAuth, Error>| match result {
-            Err(Error::Options(message)) => message,
-            Err(other) => panic!("{other}"),
-            Ok(_) => panic!("the options pass"),
-        };
-        let file = line("alice", "a-token").into_bytes();
-        assert_eq!(
-            options(new(&|_| {})),
-            "a receive endpoint with no authentication method"
-        );
-        assert_eq!(
-            options(new(&|o| o.credentials = Some(b"# none\n".to_vec()))),
-            "a receive endpoint with no authentication method"
-        );
-        assert!(options(new(&|o| o.credentials = Some(file.clone()))).contains("over plain HTTP"),);
-        assert!(matches!(
-            new(&|o| o.credentials = Some(b"alice".to_vec())),
-            Err(Error::Credentials { line: 1, .. })
-        ));
-        let auth = new(&|o| {
-            o.credentials = Some(file.clone());
-            o.allow_cleartext_credentials = true;
-        })
-        .unwrap();
-        assert!(auth.cleartext && !auth.anonymous && !auth.client_ca);
-        assert_eq!(auth.credentials.len(), 1);
-        let auth = new(&|o| {
-            o.credentials = Some(file.clone());
-            o.tls = Some(crate::ServerTls {
-                cert_chain_pem: Vec::new(),
-                key_pem: Vec::new(),
-                key_passphrase: None,
-                client_ca_pem: Some(Vec::new()),
-            });
-        })
-        .unwrap();
-        assert!(auth.client_ca && !auth.cleartext);
-        let auth = new(&|o| o.allow_anonymous_push = true).unwrap();
-        assert!(auth.anonymous && auth.credentials.is_empty());
     }
 }

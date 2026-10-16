@@ -3761,7 +3761,7 @@ pulls from it with `ostree pull-local`. The tool pulls from `serve` with
 ### `receive`
 
 ```text
-ostrya receive [--repo=PATH]
+ostrya receive [--repo=PATH] [--client=NAME]
 ```
 
 - The `receive` feature of `ostrya-cli` builds the command. It is in the
@@ -3772,9 +3772,24 @@ ostrya receive [--repo=PATH]
   (`ostrya-config(1)`, "CLIENT AND SERVER GROUPS"). It builds each trust
   group and each key group. A bad group ends the command with
   `error: MESSAGE` at exit 1, before it reads its input.
-- The session selects no client group, so it opens no push session: the
-  `Hello` gets `ref-denied`, and the command exits 1. The command takes no
-  `--policy`, and the option parser refuses it at exit 1.
+- The client name is `--client`, else the value of `LOGNAME`, which sshd
+  sets from the password entry of the user. An empty `LOGNAME` counts as
+  absent. With no name, the command writes `error: receive needs a client
+  name: give --client, or set LOGNAME` and exits 1 before it opens the
+  repository. A name that an `ssh:` item cannot hold, for example a name
+  with white space at its start, ends the command with `error: MESSAGE` at
+  exit 1 at the same step. The message shows the name in escaped form, so a
+  name with a line feed gives one line.
+- The session takes the policy of the client group of the local refs that
+  carries `ssh:NAME`. With no such group, the session opens no push
+  session: the `Hello` gets `ref-denied`, and the command exits 1. The
+  session uses no `anonymous` item and no `net:` item.
+  `../format-reference.md`, "Authentication of the receive endpoint",
+  states the rules.
+- `--client` is safe only under a forced `command=` in `authorized_keys`,
+  because a user with a shell can give any name.
+- The command takes no `--policy`, and the option parser refuses it at
+  exit 1.
 - Standard output carries the frames of the session alone. The command
   writes one `warning: STEP: MESSAGE` line to standard error for each
   warning of the session, and `error: MESSAGE` on failure. It writes
@@ -4034,7 +4049,6 @@ ostrya serve [--repo=PATH] [--listen=ADDR:PORT]...
              [--tls-cert=FILE --tls-key=FILE] [--client-ca=FILE]
              [--body-timeout=SECONDS]
              (--read-only |
-              [--push-credentials=FILE] [--allow-anonymous-push]
               [--allow-cleartext-credentials]
               [--session-timeout=SECONDS] [--max-sessions=N]
               [--parallel-uploads=N])
@@ -4061,54 +4075,34 @@ ostrya serve [--repo=PATH] [--listen=ADDR:PORT]...
   405 with `Allow: GET`. The command holds at most 4 listings at the same
   time. A request over this limit gets 503 with `Retry-After: 1`.
 - `--read-only` serves the files of a pull alone. Without it the command
-  also runs the receive endpoint of a push, and needs an authentication
-  method of push: `--push-credentials`, `--client-ca`, or
-  `--allow-anonymous-push`. Without `--read-only` and without each of the
-  three, the command writes `error: serve needs --read-only, or
-  --push-credentials, --client-ca, or --allow-anonymous-push for the
-  receive endpoint` and exits 1 before it opens the repository.
-- `--push-credentials` names the push credential file:
-  `../format-reference.md`, "The push credential file of a server",
-  states its grammar and how a credential matches a line. The command reads
-  the file once, at start, up to 1 MiB. A file it cannot read or a larger
-  file ends the command with `error: MESSAGE` at exit 1. A malformed line ends
-  it with `error: push credentials: line N: MESSAGE` at exit 1, after the
-  command opens the repository and before it binds a listener. The message
-  holds no byte of the line. A file with no credential line is no method,
-  and with no other method the command writes `error: invalid serve
-  options: a receive endpoint with no authentication method` at exit 1.
-- Over plain HTTP the endpoint takes no bearer or Basic credential without
-  `--allow-cleartext-credentials`, so `--push-credentials` without
-  `--tls-cert` needs `--allow-cleartext-credentials` or
-  `--allow-anonymous-push`. Without each of the three, the command writes
-  `error: serve --push-credentials needs --tls-cert,
-  --allow-cleartext-credentials, or --allow-anonymous-push: the receive
-  endpoint takes no credential over plain HTTP` and exits 1 before it opens
-  the repository. `ostrya_server::bind` makes the same refusal with
-  `Error::Options`.
-- With `--client-ca`, a client certificate that the CA signed is a method
-  of push. A request with no `Authorization` header and with such a
-  certificate passes the authentication.
-- `--allow-anonymous-push` lets a request with no credential pass the
-  authentication.
-- The endpoint selects no client group, so it opens no push session. A
-  `session` request that passes the authentication and the checks of
-  `Hello` gets 403 with `unauthorized` and the message `the policy of the
-  server opens no push session`.
+  also runs the receive endpoint of a push.
+- The receive endpoint identifies the client of each request by the auth
+  items of the client groups: a bearer token, a Basic credential, a client
+  certificate, the client address, or `anonymous`. A `session` request
+  takes the policy of the client group of the local refs that carries the
+  item. An item with no such group gets 403 with `unauthorized` and the
+  message `no client group of the request covers the local refs`. A group
+  that opens no push session gets 403 with `unauthorized` and the message
+  `client group 'NAME' opens no push session`. With no client group in the
+  config, the implicit group `anonymous` reads each ref and opens no push
+  session, so the command starts with no option of push and each push gets
+  403. `../format-reference.md`, "Authentication of the receive endpoint",
+  states the order of the steps and the owner key of a session.
+- With `--client-ca`, a client certificate that the CA signed can match a
+  `tls:*`, `tls:NAME`, or `tls-sha256:HEX` item.
 - Without `--allow-cleartext-credentials`, a request of the receive endpoint
-  with a bearer or Basic credential over plain HTTP gets 403, also with
-  `--allow-anonymous-push`. The switch takes such a credential. Use it for a
-  server on a loopback address or behind a proxy that terminates TLS. A
-  read of the archive view ignores the `Authorization` header and needs no
+  with a bearer or Basic credential over plain HTTP gets 403, also when a
+  group has the `anonymous` item. The switch takes such a credential. Use it
+  for a server on a loopback address or behind a proxy that terminates TLS.
+  A read of the archive view ignores the `Authorization` header and needs no
   switch.
 - A refusal of the receive endpoint that comes before the request body is
   read, as a 401, a 403, a 404, or a 405, reads and drops up to 1 MiB of the
   body within `--session-timeout` or 5 seconds, whichever is shorter, and
   then answers. On HTTP/1.1 a body that did not reach its end gets
   `Connection: close`.
-- `--push-credentials`, `--allow-cleartext-credentials`,
-  `--allow-anonymous-push`, `--session-timeout`, `--max-sessions`, and
-  `--parallel-uploads` each conflict with `--read-only`. The pair is refused
+- `--allow-cleartext-credentials`, `--session-timeout`, `--max-sessions`,
+  and `--parallel-uploads` each conflict with `--read-only`. The pair is refused
   with the argument error of the option parser at exit 1. A default value
   is no conflict.
 - At start, before it binds a listener, the command reads and checks the
@@ -4183,12 +4177,20 @@ ostrya serve [--repo=PATH] [--listen=ADDR:PORT]...
 ### `send`
 
 ```text
-ostrya send [--repo=PATH]
+ostrya send [--repo=PATH] [--client=NAME]
 ```
 
 - The `send` feature of `ostrya-cli` builds the command. It is in the
   default set. `Repo::send` takes no feature of `ostrya`, so the command
   builds without `receive`, `push`, and `serve`.
+- The client name is `--client`, else the value of `LOGNAME`, as for
+  `receive`. With no name, the command writes `error: send needs a client
+  name: give --client, or set LOGNAME` and exits 1 before it opens the
+  repository. The command does not check the name against the form of an
+  `ssh:` item, and the name does not limit the paths that the session
+  serves.
+  `--client` is safe only under a forced `command=` in `authorized_keys`,
+  because a user with a shell can give any name.
 - The command serves one pull session over standard input and standard
   output, through `Repo::send`. An ssh pull runs it on the remote side. It answers each
   `Get` path as the archive view of `serve` answers a `GET` of that path. A

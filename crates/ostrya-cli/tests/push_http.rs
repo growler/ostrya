@@ -37,7 +37,7 @@ use ostrya::remote::{
 };
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, MutableTree,
-    ObjectName, ObjectType, ReceivePolicy, Repo, RepoMode, RepoPushOptions, Value,
+    ObjectName, ObjectType, ReceivePolicies, Repo, RepoMode, RepoPushOptions, Value,
 };
 use ostrya_rt::block_on;
 use ostrya_server::{ServeOptions, ServerTls};
@@ -193,20 +193,40 @@ async fn both<A: Future, B: Future>(a: A, b: B) -> (A::Output, B::Output) {
 // The server and the client.
 // ---------------------------------------------------------------------------
 
-/// The options of a plain HTTP server on a port the kernel chooses, with a
-/// receive policy that writes each ref and with anonymous push.
-fn serve_options() -> ServeOptions {
+/// A client group that lets each request with no credential write a commit
+/// to each ref as a fast-forward.
+const ANONYMOUS_PUSH: &str = "[ex-ostrya client \"push\"]\nauth=anonymous\nallow=w:**\n";
+
+/// Writes the client groups `groups` into the config of `repo`, in place of
+/// the groups of an earlier call, and returns their policies. The open
+/// repository keeps the config that it read.
+fn policies(repo: &Repo, groups: &str) -> Arc<ReceivePolicies> {
+    let config = repo.path().join("config");
+    let text = std::fs::read_to_string(&config).unwrap();
+    let mut text = match text.find("[ex-ostrya client ") {
+        Some(i) => text[..i].to_owned(),
+        None => text,
+    };
+    text.push_str(groups);
+    std::fs::write(&config, text).unwrap();
+    block_on(async {
+        let repo = Repo::open(repo.path()).await.unwrap();
+        Arc::new(ReceivePolicies::from_config(&repo).await.unwrap())
+    })
+}
+
+/// The options of a plain HTTP server over `repo` on a port the kernel
+/// chooses, with the client groups `groups`.
+fn serve_options_with(repo: &Repo, groups: &str) -> ServeOptions {
     let mut opts = ServeOptions::default();
     opts.listen = vec!["127.0.0.1:0".parse().unwrap()];
-    opts.receive = Some(Arc::new(ReceivePolicy {
-        rules: ostrya::access::AccessRules {
-            allow: vec![ostrya::access::AllowItem::parse("w:**").unwrap()],
-            deny: Vec::new(),
-        },
-        ..ReceivePolicy::default()
-    }));
-    opts.allow_anonymous_push = true;
+    opts.receive = Some(policies(repo, groups));
     opts
+}
+
+/// [`serve_options_with`] with the group of anonymous push.
+fn serve_options(repo: &Repo) -> ServeOptions {
+    serve_options_with(repo, ANONYMOUS_PUSH)
 }
 
 /// The server TLS files of the fixtures, with the fixture CA as the client
@@ -220,10 +240,17 @@ fn server_tls() -> ServerTls {
     }
 }
 
-/// A credential file with the lines of `alice` and `bob`.
-fn credentials() -> Vec<u8> {
+/// A client group with the bearer token `ALICE`, the Basic credential of
+/// `bob` with the password `BOB`, and the fixture client certificate by its
+/// subject CN.
+fn credential_groups() -> String {
     let digest = |token: &str| Checksum::sha256(token.as_bytes()).to_hex();
-    format!("alice:{}\nbob:{}\n", digest(ALICE), digest(BOB)).into_bytes()
+    format!(
+        "[ex-ostrya client \"builders\"]\n\
+         auth=token-sha256:{};basic-sha256:bob:{};tls:ostrya test\nallow=w:**\n",
+        digest(ALICE),
+        digest(BOB),
+    )
 }
 
 /// Run `test` with the address of a server over `repo`, then drop the
@@ -589,16 +616,14 @@ async fn scan(root: &Path) -> TreeModel {
 /// Over HTTPS, a push with a bearer token, with Basic, and with a client
 /// certificate sets its ref. A push with no credential is
 /// `unauthorized`. Each credential and each key is in memory. One client key
-/// is an encrypted PKCS#8 key, with its passphrase in memory. A server that
-/// allows anonymous push takes a push with no credential.
+/// is an encrypted PKCS#8 key, with its passphrase in memory. A server with
+/// a client group of anonymous push takes a push with no credential.
 #[test]
 fn each_method_pushes_over_https_and_no_credential_is_refused() {
     let tmp = TmpDir::new("methods");
     let root = tree(tmp.path(), "tree", 4, 1000);
     let server = repo(tmp.path(), "server");
-    let mut opts = serve_options();
-    opts.allow_anonymous_push = false;
-    opts.credentials = Some(credentials());
+    let mut opts = serve_options_with(&server, &credential_groups());
     opts.tls = Some(server_tls());
     let (first_server, first_root) = (server.clone(), root.clone());
     with_server(server.clone(), opts, |addr| async move {
@@ -641,7 +666,7 @@ fn each_method_pushes_over_https_and_no_credential_is_refused() {
         assert_eq!(tip(&server, "nobody").await, None);
     });
 
-    let mut opts = serve_options();
+    let mut opts = serve_options(&server);
     opts.tls = Some(server_tls());
     with_server(server.clone(), opts, |addr| async move {
         let url = format!("https://127.0.0.1:{}/", addr.port());
@@ -661,7 +686,7 @@ fn a_trust_setting_of_the_caller_that_accepts_any_chain_pushes() {
     let tmp = TmpDir::new("any-chain");
     let root = tree(tmp.path(), "tree", 2, 100);
     let server = repo(tmp.path(), "server");
-    let mut opts = serve_options();
+    let mut opts = serve_options(&server);
     opts.tls = Some(ServerTls {
         cert_chain_pem: read_fixture("server-untrusted.pem"),
         key_pem: read_fixture("server-untrusted.key.pem"),
@@ -696,9 +721,7 @@ fn a_cleartext_credential_needs_the_switch() {
     let root = tree(tmp.path(), "tree", 2, 100);
     let server = repo(tmp.path(), "server");
     let alice = tmp.file("alice", format!("{ALICE}\n").as_bytes());
-    let mut opts = serve_options();
-    opts.allow_anonymous_push = false;
-    opts.credentials = Some(credentials());
+    let mut opts = serve_options_with(&server, &credential_groups());
     opts.allow_cleartext_credentials = true;
     with_server(server.clone(), opts, |addr| async move {
         let proxy = CountingProxy::start(addr, CommitResponse::Forward);
@@ -744,7 +767,7 @@ fn a_tree_push_and_its_repeat_over_http() {
     let tmp = TmpDir::new("tree");
     let root = tree(tmp.path(), "tree", 6, 5000);
     let server = repo(tmp.path(), "server");
-    with_server(server.clone(), serve_options(), |addr| async move {
+    with_server(server.clone(), serve_options(&server), |addr| async move {
         let url = format!("http://{addr}/");
         let first = push(endpoint(&url), &root, &["main"]).await.unwrap();
         assert_pushed(&server, "main", &first).await;
@@ -792,7 +815,7 @@ fn a_repository_push_over_http() {
         commit
     });
     let server = repo(tmp.path(), "server");
-    with_server(server.clone(), serve_options(), |addr| async move {
+    with_server(server.clone(), serve_options(&server), |addr| async move {
         let opts = RepoPushOptions {
             refspecs: vec!["main".into()],
             ..Default::default()
@@ -815,7 +838,7 @@ fn the_object_streams_stay_within_parallel_uploads() {
     let root = tree(tmp.path(), "tree", 96, 48 * 1024);
     for parallel in [1, 3] {
         let server = repo(tmp.path(), &format!("server-{parallel}"));
-        let mut opts = serve_options();
+        let mut opts = serve_options(&server);
         opts.parallel_uploads = parallel;
         let root = root.clone();
         with_server(server.clone(), opts, |addr| async move {
@@ -869,7 +892,7 @@ fn the_object_streams_stay_within_parallel_uploads() {
 fn expected_commit(base: &Path, root: &Path) -> Checksum {
     let server = repo(base, "expected");
     let mut commit = None;
-    with_server(server, serve_options(), |addr| {
+    with_server(server.clone(), serve_options(&server), |addr| {
         let commit = &mut commit;
         async move {
             let url = format!("http://{addr}/");
@@ -888,7 +911,7 @@ fn a_lost_commit_response_leaves_the_outcome_unknown() {
     let root = tree(tmp.path(), "tree", 2, 100);
     let expected = expected_commit(tmp.path(), &root);
     let server = repo(tmp.path(), "server");
-    with_server(server.clone(), serve_options(), |addr| async move {
+    with_server(server.clone(), serve_options(&server), |addr| async move {
         let proxy = CountingProxy::start(addr, CommitResponse::Drop);
         match push(endpoint(&proxy.url), &root, &["main"]).await {
             Err(Error::CommitOutcomeUnknown { refs, .. }) => assert_eq!(refs, ["main"]),
@@ -909,7 +932,7 @@ fn a_refused_commit_response_leaves_the_outcome_unknown() {
     let root = tree(tmp.path(), "tree", 2, 100);
     let expected = expected_commit(tmp.path(), &root);
     let server = repo(tmp.path(), "server");
-    with_server(server.clone(), serve_options(), |addr| async move {
+    with_server(server.clone(), serve_options(&server), |addr| async move {
         let proxy = CountingProxy::start(addr, CommitResponse::Gzip);
         match push(endpoint(&proxy.url), &root, &["main"]).await {
             Err(Error::CommitOutcomeUnknown { refs, message }) => {
@@ -931,7 +954,7 @@ fn a_failed_source_aborts_the_session() {
     let tmp = TmpDir::new("source");
     let root = tree(tmp.path(), "tree", 40, 16 * 1024);
     let server = repo(tmp.path(), "server");
-    let mut opts = serve_options();
+    let mut opts = serve_options(&server);
     opts.parallel_uploads = 3;
     with_server(server.clone(), opts, |addr| async move {
         let model = scan(&root).await;
@@ -974,7 +997,7 @@ fn a_checksum_mismatch_over_http() {
     let tmp = TmpDir::new("mismatch");
     let root = tree(tmp.path(), "tree", 40, 16 * 1024);
     let server = repo(tmp.path(), "server");
-    let mut opts = serve_options();
+    let mut opts = serve_options(&server);
     opts.parallel_uploads = 3;
     with_server(server.clone(), opts, |addr| async move {
         let proxy = CountingProxy::start(addr, CommitResponse::Forward);
@@ -1168,11 +1191,10 @@ mod cli {
         }
     }
 
-    /// The paths of one test: the base, a credential file of `alice` and
-    /// `bob`, a token file of each, and a token file that no line names.
+    /// The paths of one test: the base, a token file of `alice` and `bob`,
+    /// and a token file that no item names.
     struct Setup {
         tmp: TmpDir,
-        credentials: PathBuf,
         alice: PathBuf,
         bob: PathBuf,
         wrong: PathBuf,
@@ -1181,13 +1203,11 @@ mod cli {
     impl Setup {
         fn new(tag: &str) -> Setup {
             let tmp = TmpDir::new(tag);
-            let credentials = tmp.file("credentials", &super::credentials());
             let alice = tmp.file("alice", format!("{ALICE}\n").as_bytes());
             let bob = tmp.file("bob", format!("{BOB}\n").as_bytes());
             let wrong = tmp.file("wrong", b"wrong-token\n");
             Setup {
                 tmp,
-                credentials,
                 alice,
                 bob,
                 wrong,
@@ -1233,11 +1253,23 @@ mod cli {
             );
             (client, commit.trim().to_owned())
         }
+    }
 
-        /// `--push-credentials` of the credential file.
-        fn credentials_arg(&self) -> String {
-            format!("--push-credentials={}", self.credentials.display())
-        }
+    /// Adds a client group to the config of `server` with the bearer tokens
+    /// of `alice` and `bob`, and with their Basic credentials, whose
+    /// passwords are their tokens.
+    fn add_credential_group(server: &Path) {
+        let digest = |token: &str| Checksum::sha256(token.as_bytes()).to_hex();
+        add_config(
+            server,
+            &format!(
+                "[ex-ostrya client \"builders\"]\n\
+                 auth=token-sha256:{a};token-sha256:{b};basic-sha256:alice:{a};\
+                 basic-sha256:bob:{b}\nallow=w:**\n",
+                a = digest(ALICE),
+                b = digest(BOB),
+            ),
+        );
     }
 
     /// Add `sections` to the config of `repo`.
@@ -1301,16 +1333,13 @@ mod cli {
     /// a section with an HTTP address. Each option wins over the key of its
     /// name, and each key resolves on its own.
     #[test]
-    #[ignore = "push needs client identification"]
     fn push_takes_the_http_keys_of_the_remote_and_the_options_win() {
         let setup = Setup::new("cli-keys");
         let src = tree(setup.tmp.path(), "tree", 3, 1000);
         let (client, commit) = setup.client(&src);
         let server = setup.init("server", "archive");
-        let creds = setup.credentials_arg();
-        let mut args = server_tls_args();
-        args.push(creds);
-        let serving = Serving::start(&server, &strs(&args));
+        add_credential_group(&server);
+        let serving = Serving::start(&server, &strs(&server_tls_args()));
         let ca = fixture("ca.pem");
         let absent = setup.path("absent-ca");
         add_config(
@@ -1342,7 +1371,7 @@ mod cli {
 
         // The CA key of `override` names no file.
         assert_refused(&push_from(&client, &["override", "main:o"]), "absent-ca");
-        // The option wins over the CA key, and the token key, which no line
+        // The option wins over the CA key, and the token key, which no item
         // names, is sent.
         let ca_arg = format!("--tls-ca-path={}", ca.display());
         assert_refused(
@@ -1360,7 +1389,7 @@ mod cli {
             &[&ca_arg, &alice, "--push-user=alice", "override", "main:o2"],
         );
         assert!(out.status.success(), "{}", stderr(&out));
-        // The server refuses a user that does not own the token.
+        // The server refuses a user whose item has another password.
         assert_refused(
             &push_from(
                 &client,
@@ -1377,14 +1406,18 @@ mod cli {
     }
 
     /// `ostrya push-tree` over HTTPS with a client certificate that the
-    /// client CA of the server signed sets the ref. With no credential, the
-    /// server refuses the push as `unauthorized`, and the command exits 1.
+    /// client CA of the server signed sets the ref. The client group names
+    /// the certificate by its subject CN. With no credential, the server
+    /// refuses the push as `unauthorized`, and the command exits 1.
     #[test]
-    #[ignore = "push needs client identification"]
     fn push_tree_over_https_with_a_client_certificate() {
         let setup = Setup::new("cli-cert");
         let src = tree(setup.tmp.path(), "tree", 4, 3000);
         let server = setup.init("server", "archive");
+        add_config(
+            &server,
+            "[ex-ostrya client \"certs\"]\nauth=tls:ostrya test\nallow=w:**\n",
+        );
         let mut args = server_tls_args();
         args.push(format!("--client-ca={}", fixture("ca.pem").display()));
         let serving = Serving::start(&server, &strs(&args));
@@ -1419,7 +1452,6 @@ mod cli {
     /// an `http://` address before any connection. With the switch, the push
     /// succeeds against a server that takes credentials over plain HTTP.
     #[test]
-    #[ignore = "push needs client identification"]
     fn a_cleartext_token_needs_the_switch() {
         let setup = Setup::new("cli-cleartext");
         let src = tree(setup.tmp.path(), "tree", 2, 100);
@@ -1438,10 +1470,8 @@ mod cli {
         silent.assert_untouched();
 
         let server = setup.init("server", "archive");
-        let serving = Serving::start(
-            &server,
-            &[&setup.credentials_arg(), "--allow-cleartext-credentials"],
-        );
+        add_credential_group(&server);
+        let serving = Serving::start(&server, &["--allow-cleartext-credentials"]);
         assert!(serving.url.starts_with("http://"), "{}", serving.url);
         let out = ostrya(&[
             "push-tree",
@@ -1566,13 +1596,13 @@ mod cli {
     /// The push ignores `tls-permissive=true` on a remote whose push address
     /// is `http://`. The push uses no TLS, and it succeeds.
     #[test]
-    #[ignore = "push needs client identification"]
     fn tls_permissive_is_ignored_for_an_http_address() {
         let setup = Setup::new("cli-permissive-http");
         let src = tree(setup.tmp.path(), "tree", 2, 100);
         let (client, commit) = setup.client(&src);
         let server = setup.init("server", "archive");
-        let serving = Serving::start(&server, &["--allow-anonymous-push"]);
+        add_config(&server, ANONYMOUS_PUSH);
+        let serving = Serving::start(&server, &[]);
         assert!(serving.url.starts_with("http://"), "{}", serving.url);
         add_config(
             &client,
@@ -1587,22 +1617,22 @@ mod cli {
         assert_eq!(rev_parse(&server, "main"), commit);
     }
 
-    /// `ostrya serve` selects no client group, so its receive endpoint opens
-    /// no push session. A push that passes the authentication gets 403, the
-    /// command exits 1, and the server ref stays absent.
+    /// With no client group, the implicit group `anonymous` reads each ref
+    /// and opens no push session. An anonymous push gets 403, the command
+    /// exits 1, and the server ref stays absent.
     #[test]
-    fn serve_refuses_each_push_session_with_403() {
+    fn serve_refuses_a_push_of_a_read_only_group_with_403() {
         let setup = Setup::new("cli-serve-403");
         let src = tree(setup.tmp.path(), "tree", 2, 100);
         let (client, _) = setup.client(&src);
         let server = setup.init("server", "archive");
-        let serving = Serving::start(&server, &["--allow-anonymous-push"]);
+        let serving = Serving::start(&server, &[]);
         let out = push_from(&client, &[&serving.url, "main"]);
         assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
         assert_eq!(stdout(&out), "");
         assert_eq!(
             stderr(&out),
-            "error: unauthorized: the policy of the server opens no push session\n"
+            "error: unauthorized: client group 'anonymous' opens no push session\n"
         );
         assert!(!server.join("refs/heads/main").exists());
     }
@@ -1834,7 +1864,6 @@ mod cli {
     /// HTTPS from the archive view of the same server gives the pushed commit
     /// in a new archive repository. This repository passes `ostree fsck` too.
     #[test]
-    #[ignore = "push needs client identification"]
     fn the_tool_checks_and_pulls_a_push_over_https() {
         if !tools_available() {
             return;
@@ -1844,13 +1873,13 @@ mod cli {
         std::os::unix::fs::symlink("a/file-0", src.join("link")).unwrap();
         let (client, commit) = setup.client(&src);
         let server = setup.init("server", "bare-user");
+        add_credential_group(&server);
         let pki = make_pki(&setup.path("pki"));
         let serving = Serving::start(
             &server,
             &[
                 &format!("--tls-cert={}", pki.cert.display()),
                 &format!("--tls-key={}", pki.key.display()),
-                &setup.credentials_arg(),
             ],
         );
         assert!(serving.url.starts_with("https://"), "{}", serving.url);

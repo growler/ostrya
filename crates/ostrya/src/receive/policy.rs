@@ -3,7 +3,7 @@
 
 use std::sync::Arc;
 
-use crate::access::{AccessModes, AccessRules, ClientAccess};
+use crate::access::{AccessModes, AccessRules, AuthItem, ClientAccess, ClientGroup, Namespace};
 use crate::error::Result;
 use crate::pull::DetachedMetadataFilter;
 use crate::remote::{self, RefUpdate};
@@ -74,6 +74,12 @@ pub struct ReceivePolicy {
     ///
     /// `None` stores every key.
     pub detached_metadata_filter: Option<DetachedMetadataFilter>,
+    /// The name of the client group of the policy.
+    ///
+    /// [`ReceivePolicies::from_config`] sets the name of each group. A policy
+    /// built in code can have `None`. A session copies the name into
+    /// [`ReceiveReport::group`](super::ReceiveReport::group).
+    pub group: Option<String>,
 }
 
 /// The signatures that a received commit must carry.
@@ -218,6 +224,20 @@ impl ReceivePolicies {
             .position(|held| held.name() == group)
             .map(|i| &self.policies[i])
     }
+
+    /// Returns the client group that carries `item` in `namespace`, with its
+    /// policy, or `None`.
+    ///
+    /// [`ClientAccess::select`] states the selection.
+    pub fn select(
+        &self,
+        item: &AuthItem,
+        namespace: &Namespace,
+    ) -> Option<(&ClientGroup, &Arc<ReceivePolicy>)> {
+        self.access
+            .select_index(item, namespace)
+            .map(|i| (&self.access.groups()[i], &self.policies[i]))
+    }
 }
 
 /// The rule that the commit of a session applies to one ref update.
@@ -262,6 +282,9 @@ pub(super) trait SessionPolicy: Send + Sync {
 
     /// Returns the keys that sign the regenerated summary.
     fn summary_keys(&self) -> &[Arc<ServerSigner>];
+
+    /// Returns the name of the client group of the session, for the report.
+    fn group(&self) -> Option<&str>;
 }
 
 fn ref_denied(message: String) -> Failure {
@@ -334,6 +357,10 @@ impl SessionPolicy for ReceivePolicy {
     fn summary_keys(&self) -> &[Arc<ServerSigner>] {
         &self.summary_signers
     }
+
+    fn group(&self) -> Option<&str> {
+        self.group.as_deref()
+    }
 }
 
 impl SessionPolicy for StreamPolicy {
@@ -380,6 +407,11 @@ impl SessionPolicy for StreamPolicy {
     /// A one-way stream does not regenerate the summary.
     fn summary_keys(&self) -> &[Arc<ServerSigner>] {
         &[]
+    }
+
+    /// A one-way stream has no client group.
+    fn group(&self) -> Option<&str> {
+        None
     }
 }
 

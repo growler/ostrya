@@ -1194,6 +1194,37 @@ fn after_update_runs_when_no_ref_changes() {
     assert_eq!(main_ref(&repo).as_deref(), Some(COMMIT));
 }
 
+/// The report carries the group name of the policy, and `after_update` gets
+/// that report. A policy with no group name gives a report with none.
+#[test]
+fn the_report_carries_the_group_of_the_policy() {
+    let tmp = TmpDir::new("hooks-after-group");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    let drops = Arc::new(AtomicUsize::new(0));
+    let hook = Hook::giving(Vec::new(), &drops);
+    let policy = ReceivePolicy {
+        group: Some("builders".into()),
+        ..policy_allowing(&["w:**"])
+    };
+    let objects = fixture_objects(Encoding::Raw);
+    let (_, result) = run_with(
+        &repo,
+        policy,
+        Some(hook.clone()),
+        &objects,
+        vec![main_update()],
+    );
+    let report = result.unwrap();
+    assert_eq!(report.group.as_deref(), Some("builders"));
+    assert_eq!(hook.reports(), [report]);
+    let update = RefUpdate {
+        expected: Expected::Commit(fixture_commit()),
+        ..main_update()
+    };
+    let (_, result) = run(&repo, None, &[], vec![update]);
+    assert_eq!(result.unwrap().group, None);
+}
+
 /// Opens a transaction of `repo` that holds the repository lock exclusive,
 /// and aborts it.
 async fn take_exclusive(repo: &Repo) -> ostrya::Result<()> {

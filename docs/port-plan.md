@@ -211,7 +211,8 @@ bounded:
 - `ostrya-server` -- the HTTP server of `ostrya serve`, on Linux alone. It
   serves `ArchiveView` of `ostrya`, the archive view of a repository of any
   mode, over HTTP/1.1, and over TLS with ALPN for HTTP/2 and HTTP/1.1. With
-  a receive policy it also runs the receive endpoint of a push: it holds the
+  the client groups of the repository (`ReceivePolicies`) it also runs the
+  receive endpoint of a push: it holds the
   session table, and each request is one step of the `ReceiveService` of
   its session (the rustdoc of `ostrya_server::ReceiveEndpoint`). The
   endpoint opens each session with `ReceiveService::hello_with_hooks`, with
@@ -219,20 +220,22 @@ bounded:
   `SessionSetup`. The endpoint authenticates each request through the
   public trait `ReceiveAuth`, which also gives the setup of each session:
   its policy and its hooks. The server implements it with the
-  crate-private `FileAuth`, which authorizes each request with a bearer
-  token or a Basic credential, which it matches against the push
-  credential file (`format-reference.md`, "The push credential file of a
-  server"), with a client certificate, or as an anonymous push.
-  `FileAuth` gives no hooks, and refuses a session with 403 when the policy
-  opens no push session. `ostrya serve` gives the default policy, which
-  opens no push session, because it selects no client group yet.
-  `FileAuth` compares the digests in constant time with a hand-rolled
-  compare and no dependency. The server refuses to
-  start with no method, and over plain HTTP with the credential file as its
-  one method and no switch for credentials over plain HTTP. The public type
+  crate-private `GroupAuth`, which identifies the client of each request by
+  the auth items of the client groups: a bearer token or a Basic credential
+  by its digest, a client certificate by its digest, its subject CN, or the
+  client CA alone, the peer address by the `net:` item with the longest
+  prefix, and the `anonymous` item (`format-reference.md`, "Authentication
+  of the receive endpoint"). It reads the client certificate of a TLS
+  connection one time, in the module `cert`, and each request of the
+  connection shares the result. The owner key of a session is the text of
+  the auth item. `GroupAuth` gives each session the policy of the client
+  group of the local refs that carries the item, and no hooks. It refuses a
+  session with 403 when no such group exists, and when the group opens no
+  push session. `GroupAuth` compares the digests in constant time with a
+  hand-rolled compare and no dependency. The public type
   `ReceiveEndpoint<A>` is the endpoint with any `ReceiveAuth`, which a host
   mounts in its own router: it opens no listener and does no TLS, and the
-  server builds on `ReceiveEndpoint<FileAuth>`. `EndpointOptions` holds the
+  server builds on `ReceiveEndpoint<GroupAuth>`. `EndpointOptions` holds the
   options of the endpoint, and `ReceiveBody` is its response body. With the
   endpoint, an HTTP/2 stream has a receive window of 2 MiB, and a
   connection a window of 2 MiB for each of the `parallel_uploads` object
@@ -240,7 +243,9 @@ bounded:
   depends on `ostrya` with `receive`, on `ostrya-fetch` for the hyper
   adapters over `ostrya-rt` and for the server TLS configuration, on
   `ostrya-rt`, on `hyper` and `futures-rustls`, and on `getrandom` for the
-  session ids (`CLAUDE.md`, "Authorized: the `getrandom` crate"). Its features `smol`, the
+  session ids (`CLAUDE.md`, "Authorized: the `getrandom` crate"), and on
+  `x509-cert` for the subject CN of a client certificate (`CLAUDE.md`,
+  "Authorized: the `x509-cert` crate"). Its features `smol`, the
   default, and `tokio` select the runtime backend. `ostrya-server` and
   `ostrya-fetch` take `hyper` 1.11.1 or later: 1.11.0 can keep the last
   chunk of a response body in its write buffer when the first poll of the
@@ -8621,6 +8626,25 @@ crate", states the measured graph.
 - The verification of a client certificate from a proxy uses the
   `WebPkiClientVerifier` of `rustls`, which `ostrya-fetch` already builds
   for the TLS handshake. `rustls-webpki` stays a transitive dependency.
+
+The binary cost of `x509-cert`:
+
+- `ostrya-server` reads the subject CN of a client certificate with
+  `x509-cert`, for the `tls:NAME` items of the identification of a client.
+- The figure is measured on `target/release/ostrya`, the binary
+  `cargo build --release -p ostrya-cli` writes with its default feature set,
+  stripped after the build. Two builds of one tree under one toolchain are
+  compared. The first is the tree as it stands. The second holds the
+  counterfactual, which has two parts: the read of the CN in
+  `crates/ostrya-server/src/cert.rs` is stubbed to give no CN, and the
+  `x509-cert` entry is dropped from `crates/ostrya-server/Cargo.toml`. Both
+  parts are needed, because the stub alone leaves the crate in the link.
+  `cargo tree -p ostrya-cli -i x509-cert` confirms the second build reaches
+  no such package.
+- The first binary measures 20,122,136 bytes and the second 20,046,872, so
+  the read costs 75,264 bytes, which is about 74 KiB. A rebuild of the first
+  tree gives the same byte count. The standalone probe of the phase setup
+  gave an upper bound of about 121 KiB.
 
 ## Risk register
 

@@ -572,10 +572,15 @@ pub(crate) mod tests {
 
     use ostrya::remote::proto::{CommitRequest, Hello};
     use ostrya::remote::{Expected, RefUpdate};
-    use ostrya::{CreateOptions, ReceivePolicy, Repo, RepoMode};
+    use ostrya::{CreateOptions, ReceivePolicies, ReceivePolicy, Repo, RepoMode};
     use ostrya_rt::block_on;
 
     use super::*;
+
+    /// A client group that lets each request with no credential write a
+    /// commit to each ref as a fast-forward.
+    pub(crate) const ANONYMOUS_PUSH: &str =
+        "[ex-ostrya client \"push\"]\nauth=anonymous\nallow=w:**\n";
 
     /// A policy that writes a commit to each ref as a fast-forward.
     pub(crate) fn pushing_policy() -> ReceivePolicy {
@@ -605,6 +610,20 @@ pub(crate) mod tests {
             let repo =
                 block_on(Repo::create(&path, CreateOptions::new(RepoMode::Archive))).unwrap();
             TmpRepo { path, repo }
+        }
+
+        /// Writes the client groups `groups` at the end of the config of the
+        /// repository, and returns their policies. The open repository keeps
+        /// the config that it read.
+        pub(crate) fn policies(&self, groups: &str) -> Arc<ReceivePolicies> {
+            let config = self.path.join("config");
+            let mut text = std::fs::read_to_string(&config).unwrap();
+            text.push_str(groups);
+            std::fs::write(&config, text).unwrap();
+            block_on(async {
+                let repo = Repo::open(&self.path).await.unwrap();
+                Arc::new(ReceivePolicies::from_config(&repo).await.unwrap())
+            })
         }
 
         /// Returns a new open session over the repository.

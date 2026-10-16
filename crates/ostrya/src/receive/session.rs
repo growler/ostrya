@@ -31,6 +31,10 @@ pub struct ReceiveReport {
     /// These failures do not undo the ref writes, and the session does not
     /// report them to the client.
     pub warnings: Vec<ReceiveWarning>,
+    /// The name of the client group of the session, from
+    /// [`ReceivePolicy::group`]. A one-way stream has no client group, so
+    /// its report has `None`.
+    pub group: Option<String>,
 }
 
 /// A failure of one step after the transaction commit of a session.

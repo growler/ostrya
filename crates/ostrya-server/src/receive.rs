@@ -644,12 +644,11 @@ mod tests {
     use hyper::http::request::Parts;
 
     use super::*;
-    use crate::ServeOptions;
     use crate::SessionSetup;
-    use crate::auth::{FileAuth, Peer};
+    use crate::auth::{GroupAuth, Peer};
     use crate::body::tests::frames;
     use crate::request::MAX_DRAIN;
-    use crate::session::tests::{TmpRepo, pushing_policy};
+    use crate::session::tests::{ANONYMOUS_PUSH, TmpRepo, pushing_policy};
     use ostrya::remote::proto::{CommitRequest, Hello, Kind};
     use ostrya::remote::{Expected, RefOutcome, RefUpdate};
     use ostrya::{Checksum, ObjectName, ObjectType, ReceivePolicy, TransactionStats};
@@ -761,6 +760,7 @@ mod tests {
             refs: Vec::new(),
             stats: TransactionStats::default(),
             warnings: Vec::new(),
+            group: None,
         }
     }
 
@@ -916,12 +916,8 @@ mod tests {
 
     /// An endpoint over `tmp` with anonymous push and at most `max`
     /// sessions.
-    fn endpoint(tmp: &TmpRepo, max: usize) -> Receive<FileAuth> {
-        let opts = ServeOptions {
-            allow_anonymous_push: true,
-            ..ServeOptions::default()
-        };
-        let auth = FileAuth::new(&opts, Arc::new(pushing_policy())).unwrap();
+    fn endpoint(tmp: &TmpRepo, max: usize) -> Receive<GroupAuth> {
+        let auth = GroupAuth::new(tmp.policies(ANONYMOUS_PUSH), false);
         endpoint_with(tmp, max, auth)
     }
 
@@ -953,6 +949,7 @@ mod tests {
             .header("x-principal", principal)
             .extension(Peer {
                 tls: false,
+                addr: std::net::Ipv4Addr::LOCALHOST.into(),
                 cert: None,
             })
             .body(Pieces::new(&bytes, 3, fail_after))

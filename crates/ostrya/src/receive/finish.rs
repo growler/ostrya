@@ -379,6 +379,7 @@ pub(super) async fn finish(
         refs,
         stats,
         warnings,
+        group: policy.group().map(str::to_owned),
     };
     if let (Some(hooks), Some(carried)) = (hooks, carried)
         && let Err(mut message) = hooks.after_update(&report, carried).await

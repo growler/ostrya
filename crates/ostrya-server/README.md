@@ -8,10 +8,12 @@ The HTTP server of ostrya, for the pull and the push of one repository.
 
 A `Server` serves one repository to the pull of the `ostree` command and
 of ostrya. The pull reads it as an `archive` repository, whatever its mode
-(see `ostrya::ArchiveView`). With a receive policy, the server also runs
-the receive endpoint of a push. A host with its own HTTP router mounts
-that endpoint as a `ReceiveEndpoint` and authenticates the requests
-itself. The server also answers `GET /_ostrya/refs/v1` with the bytes of
+(see `ostrya::ArchiveView`). With the client groups of the repository
+(`ostrya::ReceivePolicies`), the server also runs the receive endpoint
+of a push. It identifies the client of each request by the auth items of
+the groups, and gives each session the policy of one group. A host with
+its own HTTP router mounts that endpoint as a `ReceiveEndpoint` and
+authenticates the requests itself. The server also answers `GET /_ostrya/refs/v1` with the bytes of
 `ostrya::Repo::build_ref_listing` for the ref patterns of its query. The
 crate builds on Linux alone.
 

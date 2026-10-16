@@ -235,10 +235,10 @@ impl Setup {
     }
 
     /// `ssh-command` of the stand-in and `send-command` of the built
-    /// `ostrya send`.
+    /// `ostrya send`, with a client name.
     fn standin_keys(&self) -> String {
         format!(
-            "ssh-command=sh {} {} {}\nsend-command={} send\n",
+            "ssh-command=sh {} {} {}\nsend-command={} send --client=puller\n",
             self.standin.display(),
             self.status.display(),
             self.status.with_extension("stderr").display(),

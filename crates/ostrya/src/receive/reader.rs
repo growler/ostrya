@@ -117,6 +117,7 @@ pub(crate) async fn read(repo: &Repo) -> Result<(ClientAccess, Vec<Arc<ReceivePo
                 summary_signers: summary_signers.clone(),
                 update_summary,
                 detached_metadata_filter: detached_metadata_filter.clone(),
+                group: Some(group.name().to_owned()),
             })
         })
         .collect();

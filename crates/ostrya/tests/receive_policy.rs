@@ -16,7 +16,7 @@ use std::sync::Arc;
 use common::TmpDir;
 #[cfg(feature = "verify-gpg")]
 use common::receive::GnupgHome;
-use ostrya::access::AccessModes;
+use ostrya::access::{AccessModes, AuthItem, Namespace};
 use ostrya::{
     CreateOptions, Error, ReceivePolicies, ReceivePolicy, ReceiveVerify, Repo, RepoMode,
     ServerSigner, TrustedKeys, base64,
@@ -116,6 +116,30 @@ fn keys(policy: &ReceivePolicy) -> Option<&Arc<TrustedKeys>> {
         ReceiveVerify::Off => None,
         ReceiveVerify::Keys(keys) => Some(keys),
     }
+}
+
+/// `select` gives the group of an item in a namespace with the policy of that
+/// group. Each policy carries the name of its group.
+#[test]
+fn select_gives_the_group_and_its_policy() {
+    let policies = policy(
+        "[ex-ostrya client \"local\"]\nauth=ssh:u\nallow=w:**\n\
+         [ex-ostrya client \"mirrors\"]\nauth=ssh:u\ncollection=*\nallow=r:**\n",
+    )
+    .unwrap();
+    let item = AuthItem::parse("ssh:u").unwrap();
+    let (group, selected) = policies.select(&item, &Namespace::Local).unwrap();
+    assert_eq!(group.name(), "local");
+    assert!(Arc::ptr_eq(selected, policies.get("local").unwrap()));
+    assert_eq!(selected.group.as_deref(), Some("local"));
+    let namespace = Namespace::Collection("org.example.Os".into());
+    let (group, selected) = policies.select(&item, &namespace).unwrap();
+    assert_eq!(group.name(), "mirrors");
+    assert!(Arc::ptr_eq(selected, policies.get("mirrors").unwrap()));
+    assert_eq!(selected.group.as_deref(), Some("mirrors"));
+    let other = AuthItem::parse("ssh:v").unwrap();
+    assert!(policies.select(&other, &Namespace::Local).is_none());
+    assert_eq!(ReceivePolicy::default().group, None);
 }
 
 /// A config with no client group gives the policies of the two implicit

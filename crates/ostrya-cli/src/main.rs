@@ -369,11 +369,16 @@ enum Command {
     PullLocal(PullLocalArgs),
     /// Receive one push session over standard input and standard output.
     ///
-    /// By default, `ostrya push` runs this command on the server over ssh. At
-    /// start, the command reads and checks the client groups, the server
-    /// group, the trust groups, and the key groups of the repository config,
-    /// and a bad group ends it with status 1. The session selects no client
-    /// group, so it opens no push session: `Hello` gets `ref-denied`.
+    /// By default, `ostrya push` runs this command on the server over ssh. The
+    /// client name is --client, else the value of `LOGNAME`, which sshd sets
+    /// from the password entry of the user. With neither, the command writes
+    /// an error line and exits 1 before it opens the repository. At start,
+    /// the command reads and checks the client groups, the server group, the
+    /// trust groups, and the key groups of the repository config, and a bad
+    /// group ends it with status 1. The session takes the policy of the
+    /// client group of the local refs that carries the item `ssh:NAME`. With
+    /// no such group, the session opens no push session: `Hello` gets
+    /// `ref-denied`. The session uses no `anonymous` and no `net:` item.
     /// Standard output carries the frames of the session alone. For each
     /// warning of the session, the command writes one `warning: STEP: MESSAGE`
     /// line to standard error. It writes nothing else, also under --verbose.
@@ -427,13 +432,16 @@ enum Command {
     /// The repository can be in any mode that ostrya reads. In a mode other
     /// than `archive`, the server builds each `.filez` object on request. The
     /// server also answers the ref listing at `/_ostrya/refs/v1`. Without
-    /// --read-only, the server also has the receive endpoint of a push, and
-    /// the command needs a method of push authentication. At start, the
-    /// command reads and checks the client groups and the server group of the
-    /// repository config. Without --read-only, it also reads the trust groups
-    /// and the key groups. A bad group ends the command with status 1. The
-    /// endpoint selects no client group, so it opens no push session: each
-    /// session request that passes the authentication gets 403.
+    /// --read-only, the server also has the receive endpoint of a push. The
+    /// endpoint identifies the client of each request by the auth items of
+    /// the client groups: a bearer token, a Basic credential, a client
+    /// certificate, the client address, or `anonymous`. A session takes the
+    /// policy of the client group of the local refs that carries the item.
+    /// With no such group, or with a group that opens no push session, the
+    /// session request gets 403. At start, the command reads and checks the
+    /// client groups and the server group of the repository config. Without
+    /// --read-only, it also reads the trust groups and the key groups. A bad
+    /// group ends the command with status 1.
     ///
     /// When all listeners are bound, the command writes the URL of each
     /// listener to standard output, one line each. Then it serves until the
@@ -448,6 +456,11 @@ enum Command {
     /// each `Get` path as the archive view of `ostrya serve` answers a `GET` of
     /// that path. It takes no lock and writes no file in the repository.
     ///
+    /// The client name is --client, else the value of `LOGNAME`, which sshd
+    /// sets from the password entry of the user. With neither, the command
+    /// writes an error line and exits 1 before it opens the repository. The
+    /// name does not limit the paths that the session serves.
+    ///
     /// Standard output carries the frames of the session alone. On failure,
     /// the command writes `error: MESSAGE` to standard error. It writes
     /// nothing else, also under --verbose. It exits 0 when standard input ends
@@ -456,7 +469,7 @@ enum Command {
     /// An `authorized_keys` entry with `command="ostrya send --repo=PATH"`
     /// limits an ssh key to a pull from one repository.
     #[cfg(feature = "send")]
-    Send,
+    Send(SendArgs),
 }
 
 impl Command {
@@ -533,7 +546,7 @@ impl Command {
             #[cfg(feature = "serve")]
             Command::Serve(_) => "serve",
             #[cfg(feature = "send")]
-            Command::Send => "send",
+            Command::Send(_) => "send",
         }
     }
 }
@@ -2599,7 +2612,29 @@ struct PullArgs {
 
 #[cfg(feature = "receive")]
 #[derive(Args)]
-struct ReceiveArgs {}
+struct ReceiveArgs {
+    /// The client name of the session, in place of `LOGNAME`.
+    ///
+    /// The session selects the client group that carries the item
+    /// `ssh:NAME`. NAME is not empty, holds no control character, and does
+    /// not start or end with white space. The option is safe only under a
+    /// forced `command=` in `authorized_keys`, because a user with a shell
+    /// can give any name.
+    #[arg(long, value_name = "NAME")]
+    client: Option<String>,
+}
+
+#[cfg(feature = "send")]
+#[derive(Args)]
+struct SendArgs {
+    /// The client name of the session, in place of `LOGNAME`.
+    ///
+    /// The name does not limit the paths that the session serves. The option
+    /// is safe only under a forced `command=` in `authorized_keys`, because a
+    /// user with a shell can give any name.
+    #[arg(long, value_name = "NAME")]
+    client: Option<String>,
+}
 
 #[cfg(feature = "serve")]
 #[derive(Args)]
@@ -2630,47 +2665,25 @@ struct ServeArgs {
     ///
     /// The option needs --tls-cert. A client that presents a certificate must
     /// present one that the CA signed. A client that presents no certificate
-    /// is served. A client certificate that the CA signed is a method of push
-    /// authentication. The start checks of the client groups take the client
-    /// CA from this option alone, also when `[ex-ostrya server]` sets
-    /// `tls-client-ca`.
+    /// is served. A client certificate that the CA signed can match a
+    /// `tls:*`, `tls:NAME`, or `tls-sha256:HEX` item of a client group. The
+    /// start checks of the client groups take the client CA from this option
+    /// alone, also when `[ex-ostrya server]` sets `tls-client-ca`.
     #[arg(long, value_name = "FILE", requires = "tls_cert")]
     client_ca: Option<PathBuf>,
     /// Serve the files of a pull alone, with no receive endpoint.
     ///
-    /// Without this switch, the command needs a method of push
-    /// authentication: --push-credentials, --client-ca, or
-    /// --allow-anonymous-push. With none of them, the command exits with
-    /// status 1 before it opens the repository. The options of the receive
-    /// endpoint conflict with this switch.
+    /// The options of the receive endpoint conflict with this switch.
     #[arg(long)]
     read_only: bool,
-    /// Take the push credentials in FILE, one NAME:HEX line each.
-    ///
-    /// HEX is the SHA-256 digest of the token in 64 lowercase hex digits. The
-    /// command skips an empty line and a line that starts with `#`, and a
-    /// malformed line stops the command at start. A bearer token passes the
-    /// authentication if its digest matches a line. A Basic credential
-    /// NAME:TOKEN passes if the digest of TOKEN matches the line of NAME. A
-    /// request that passes opens no push session and gets 403. Without
-    /// --tls-cert, the option needs --allow-cleartext-credentials or
-    /// --allow-anonymous-push. The command reads FILE once, at start, and
-    /// refuses a file larger than 1 MiB.
-    #[arg(long, value_name = "FILE", conflicts_with = "read_only")]
-    push_credentials: Option<PathBuf>,
     /// Take a bearer or Basic credential of push over plain HTTP.
     ///
     /// Without this switch, the receive endpoint answers 403 to such a
-    /// request, also with --allow-anonymous-push. Use it for a server on a
-    /// loopback address or behind a proxy that terminates TLS. A read of the
-    /// files of a pull needs no credential.
+    /// request, also when a client group has the `anonymous` item. Use it for
+    /// a server on a loopback address or behind a proxy that terminates TLS.
+    /// A read of the files of a pull needs no credential.
     #[arg(long, conflicts_with = "read_only")]
     allow_cleartext_credentials: bool,
-    /// Let a request with no credential pass the authentication of a push.
-    ///
-    /// A request that passes opens no push session and gets 403.
-    #[arg(long, conflicts_with = "read_only")]
-    allow_anonymous_push: bool,
     /// Abort a push session that stays idle for SECONDS.
     ///
     /// A push session is idle when it has no request in progress, or when its
@@ -3307,10 +3320,11 @@ async fn run(repo: Option<&Path>, verbose: bool, command: Command) -> Result<()>
         }
         #[cfg(feature = "receive")]
         Command::Receive(args) => {
+            let client = ssh_client(args.client, name);
             // `receive` writes nothing on success, also under `--verbose`, so
             // `resolve_repo` does not write the repository line of `--verbose`.
             let (repo, _) = resolve_repo(repo, false, name).await;
-            receive(repo, args).await
+            receive(repo, client).await
         }
         #[cfg(feature = "push")]
         Command::Push(args) => {
@@ -3329,38 +3343,13 @@ async fn run(repo: Option<&Path>, verbose: bool, command: Command) -> Result<()>
         }
         #[cfg(feature = "serve")]
         Command::Serve(args) => {
-            // If no method of push authentication guards the receive endpoint,
-            // `serve` refuses the command before it opens the repository.
-            if !args.read_only
-                && !args.allow_anonymous_push
-                && args.push_credentials.is_none()
-                && args.client_ca.is_none()
-            {
-                eprintln!(
-                    "error: serve needs --read-only, or --push-credentials, --client-ca, or \
-                     --allow-anonymous-push for the receive endpoint"
-                );
-                exit_process(1);
-            }
-            // Without TLS, the credential file is the only method, and the
-            // endpoint refuses each credential over plain HTTP.
-            if !args.read_only
-                && args.tls_cert.is_none()
-                && !args.allow_anonymous_push
-                && !args.allow_cleartext_credentials
-            {
-                eprintln!(
-                    "error: serve --push-credentials needs --tls-cert, \
-                     --allow-cleartext-credentials, or --allow-anonymous-push: the receive \
-                     endpoint takes no credential over plain HTTP"
-                );
-                exit_process(1);
-            }
             let (repo, _) = resolve_repo(repo, verbose, name).await;
             serve(repo, args).await
         }
         #[cfg(feature = "send")]
-        Command::Send => {
+        Command::Send(args) => {
+            // The name does not limit the session.
+            let _client = ssh_client_name(args.client, name);
             // `send` writes nothing on success, also under `--verbose`, so
             // `resolve_repo` does not write the repository line of `--verbose`.
             let (repo, _) = resolve_repo(repo, false, name).await;
@@ -3371,7 +3360,7 @@ async fn run(repo: Option<&Path>, verbose: bool, command: Command) -> Result<()>
 
 /// The maximum size in bytes of a file that `serve` reads.
 ///
-/// The files are the PEM files and the push credential file.
+/// The files are the PEM files.
 #[cfg(feature = "serve")]
 const MAX_SERVE_FILE_SIZE: u64 = 1024 * 1024;
 
@@ -3384,11 +3373,9 @@ const MAX_SERVE_FILE_SIZE: u64 = 1024 * 1024;
 /// repository config at start. The checks take the TLS files from the
 /// options of the command alone, because the server runs with these files.
 /// Without `--read-only`, it also builds the trust groups and the key groups,
-/// and the receive endpoint takes the credential file of `--push-credentials`.
-/// The endpoint selects no client group, so each session gets the default
-/// policy, which opens no push session. A malformed credential line ends the
-/// process with an error that names the line. For each session that commits,
-/// each warning of its report goes to standard error as one line.
+/// and the receive endpoint identifies each client by the client groups. For
+/// each session that commits, each warning of its report goes to standard
+/// error as one line.
 #[cfg(feature = "serve")]
 async fn serve(repo: Repo, args: ServeArgs) -> Result<()> {
     use std::io::Write;
@@ -3398,13 +3385,14 @@ async fn serve(repo: Repo, args: ServeArgs) -> Result<()> {
         opts.listen = args.listen;
     }
     opts.body_timeout = std::time::Duration::from_secs(args.body_timeout);
-    let access = if args.read_only {
-        ostrya::access::ClientAccess::from_config(repo.config(), repo.path())?
+    let policies = if args.read_only {
+        None
     } else {
-        ostrya::ReceivePolicies::from_config(&repo)
-            .await?
-            .access()
-            .clone()
+        Some(Arc::new(ostrya::ReceivePolicies::from_config(&repo).await?))
+    };
+    let access = match &policies {
+        Some(policies) => policies.access().clone(),
+        None => ostrya::access::ClientAccess::from_config(repo.config(), repo.path())?,
     };
     access.check_server(&ostrya::access::ServerSettings {
         tls_cert: args.tls_cert.clone(),
@@ -3412,10 +3400,8 @@ async fn serve(repo: Repo, args: ServeArgs) -> Result<()> {
         tls_client_ca: args.client_ca.clone(),
         ..access.server().clone()
     })?;
-    if !args.read_only {
-        opts.receive = Some(Arc::new(ostrya::ReceivePolicy::default()));
-        opts.allow_anonymous_push = args.allow_anonymous_push;
-        opts.credentials = args.push_credentials.as_deref().map(read_serve_file);
+    if let Some(policies) = policies {
+        opts.receive = Some(policies);
         opts.allow_cleartext_credentials = args.allow_cleartext_credentials;
         opts.session_idle_timeout = std::time::Duration::from_secs(args.session_timeout);
         opts.max_sessions = usize::try_from(args.max_sessions).unwrap_or(usize::MAX);
@@ -3487,24 +3473,32 @@ fn read_serve_file(path: &Path) -> Vec<u8> {
     }
 }
 
-/// Runs one push session over standard input and standard output.
+/// Runs one push session of the client `client` over standard input and
+/// standard output.
 ///
 /// The command reads and checks the client groups, the server group, the
 /// trust groups, and the key groups of the repository config at start. The
-/// session selects no client group, so it runs under the default policy,
+/// session runs under the policy of the client group of the local refs that
+/// carries `client`. With no such group, it runs under the default policy,
 /// which opens no push session. Standard output carries the frames of the
 /// session alone. Each warning of the report goes to standard error as one
 /// line. A failure goes there as the error line of [`main`].
 ///
 /// The command writes nothing else, also under `--verbose`.
 #[cfg(feature = "receive")]
-async fn receive(repo: Repo, _args: ReceiveArgs) -> Result<()> {
-    ostrya::ReceivePolicies::from_config(&repo).await?;
-    let policy = ostrya::ReceivePolicy::default();
+async fn receive(repo: Repo, client: ostrya::access::AuthItem) -> Result<()> {
+    let policies = ostrya::ReceivePolicies::from_config(&repo).await?;
+    let default = ostrya::ReceivePolicy::default();
+    // `Hello` names no collection, so the session takes the group of the
+    // local refs.
+    let policy = match policies.select(&client, &ostrya::access::Namespace::Local) {
+        Some((_, policy)) => policy.as_ref(),
+        None => &default,
+    };
     // The input is read at most 256 KiB ahead of the session. Under the smol
     // backend, the output goes through a blocking-pool pipe of 8 MiB, so up
     // to 8 MiB that the session wrote can wait in the pipe.
-    let report = repo.receive(stdin_file()?, stdout_file()?, &policy).await?;
+    let report = repo.receive(stdin_file()?, stdout_file()?, policy).await?;
     for warning in &report.warnings {
         eprintln!(
             "warning: {}: {}",
@@ -3513,6 +3507,42 @@ async fn receive(repo: Repo, _args: ReceiveArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Returns the client name of an ssh session of the command `name`.
+///
+/// The name is `client`, else the value of `LOGNAME`. An empty `LOGNAME` and
+/// a value that is not UTF-8 count as absent. With no name, the process ends
+/// with an error line and exit 1.
+#[cfg(any(feature = "receive", feature = "send"))]
+fn ssh_client_name(client: Option<String>, name: &str) -> String {
+    let client = client.or_else(|| std::env::var("LOGNAME").ok().filter(|v| !v.is_empty()));
+    let Some(client) = client else {
+        eprintln!("error: {name} needs a client name: give --client, or set LOGNAME");
+        exit_process(1);
+    };
+    client
+}
+
+/// Returns the `ssh:NAME` auth item of the client of an ssh session of the
+/// command `name`.
+///
+/// [`ssh_client_name`] gives NAME. With a name that the item refuses, the
+/// process ends with one error line and exit 1. The line shows the name in
+/// escaped form, so a control character in the name does not split the line.
+#[cfg(feature = "receive")]
+fn ssh_client(client: Option<String>, name: &str) -> ostrya::access::AuthItem {
+    let client = ssh_client_name(client, name);
+    match ostrya::access::AuthItem::parse(&format!("ssh:{client}")) {
+        Ok(item) => item,
+        Err(_) => {
+            eprintln!(
+                "error: malformed client name {client:?}: the name is not empty, holds no \
+                 control character, and does not start or end with white space"
+            );
+            exit_process(1);
+        }
+    }
 }
 
 /// Serves one pull session over standard input and standard output.

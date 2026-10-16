@@ -517,27 +517,16 @@ fn the_tool_pulls_loose_past_unserved_deltas() {
     );
 }
 
-/// `ostrya serve` refuses to run in these cases, before it opens the
-/// repository:
-///
-/// - with no `--read-only` and no authentication method of push,
-/// - with a credential file as the one method over plain HTTP and no
-///   `--allow-cleartext-credentials`, because the receive endpoint then
-///   takes no credential.
-///
-/// It also refuses these inputs:
+/// `ostrya serve` refuses these inputs:
 ///
 /// - a receive option beside `--read-only`,
-/// - `--policy`, which it does not take,
+/// - `--policy`, `--push-credentials`, and `--allow-anonymous-push`, which it
+///   does not take,
 /// - a group of the removed receive policy in the config, also with
 ///   `--read-only`,
 /// - a client group with a TLS item and no client CA,
 /// - a key group whose key it cannot read, without `--read-only`,
-/// - a TLS file that it cannot use,
-/// - a credential file larger than the size cap,
-/// - a credential file with no credential line, as the one method,
-/// - a malformed credential line. The refusal names the line by its number
-///   alone.
+/// - a TLS file that it cannot use, or that is larger than the size cap.
 ///
 /// Each refusal exits 1 and writes no URL.
 #[test]
@@ -552,11 +541,15 @@ fn serve_refuses_what_it_cannot_serve() {
     let enc_cert = format!("--tls-cert={}", fixture("client.pem").display());
     let enc_key = format!("--tls-key={}", fixture("client.key.enc.pem").display());
     let absent = format!("--tls-key={}", tmp.path().join("absent").display());
+    let big = tmp.path().join("big.pem");
+    std::fs::write(&big, vec![b'#'; 1024 * 1024 + 1]).unwrap();
+    let big_cert = format!("--tls-cert={}", big.display());
     let listen = "--listen=127.0.0.1:0";
     let no_repo = format!("--repo={}", tmp.path().join("no-repo").display());
     // The path holds no word of the refusals, so a message that names it
     // does not pass for the refusal.
     let policy = format!("--policy={}", tmp.path().join("absent-rules").display());
+    let creds = format!("--push-credentials={}", tmp.path().join("creds").display());
     let with_groups = |name: &str, groups: &str| {
         let path = tmp.path().join(name);
         let arg = format!("--repo={}", path.display());
@@ -574,40 +567,28 @@ fn serve_refuses_what_it_cannot_serve() {
         "[ex-ostrya key \"k\"]\ntype=ed25519\nsecret-key-file=/nonexistent/ostrya/k\n",
     );
     let ro = "--read-only";
-    let clear = "--allow-cleartext-credentials";
-    let hex = "0".repeat(64);
-    let file = |name: &str, text: &[u8]| {
-        let path = tmp.path().join(name);
-        std::fs::write(&path, text).unwrap();
-        format!("--push-credentials={}", path.display())
-    };
-    let malformed = file(
-        "malformed",
-        format!("# push\nalice:{hex}\nsecret-name {hex}\n").as_bytes(),
-    );
-    let empty = file("empty", b"# no credential\n");
-    let big = file("big", &vec![b'#'; 1024 * 1024 + 1]);
-    let creds = file("creds", format!("alice:{hex}\n").as_bytes());
     let anon = "--allow-anonymous-push";
-    let cases: [(&[&str], &str); 27] = [
-        (&[&repo, "serve", listen], "--allow-anonymous-push"),
-        (&[&no_repo, "serve", listen], "--allow-anonymous-push"),
+    let cases: [(&[&str], &str); 22] = [
         (&[&no_repo, "serve", ro, listen, &policy], "--policy"),
+        (&[&repo, "serve", listen, &policy], "--policy"),
+        (&[&repo, "serve", listen, &creds], "--push-credentials"),
         (
-            &[&removed, "serve", listen, anon],
-            "[ex-ostrya client \"NAME\"]",
+            &[&no_repo, "serve", ro, listen, &creds],
+            "--push-credentials",
         ),
+        (&[&repo, "serve", listen, anon], "--allow-anonymous-push"),
+        (
+            &[&no_repo, "serve", ro, listen, anon],
+            "--allow-anonymous-push",
+        ),
+        (&[&removed, "serve", listen], "[ex-ostrya client \"NAME\"]"),
         (
             &[&removed, "serve", ro, listen],
             "[ex-ostrya client \"NAME\"]",
         ),
         (&[&tls_item, "serve", ro, listen], "tls-client-ca"),
-        (&[&tls_item, "serve", listen, anon], "tls-client-ca"),
-        (&[&bad_key, "serve", listen, anon], "/nonexistent/ostrya/k"),
-        (
-            &[&no_repo, "serve", ro, listen, "--allow-anonymous-push"],
-            "--allow-anonymous-push",
-        ),
+        (&[&tls_item, "serve", listen], "tls-client-ca"),
+        (&[&bad_key, "serve", listen], "/nonexistent/ostrya/k"),
         (
             &[&no_repo, "serve", ro, listen, "--session-timeout=5"],
             "--session-timeout",
@@ -621,37 +602,16 @@ fn serve_refuses_what_it_cannot_serve() {
             "--parallel-uploads",
         ),
         (
-            &[
-                &repo,
-                "serve",
-                listen,
-                "--allow-anonymous-push",
-                "--parallel-uploads=32",
-            ],
+            &[&repo, "serve", listen, "--parallel-uploads=32"],
             "--parallel-uploads",
         ),
         (
-            &[
-                &repo,
-                "serve",
-                listen,
-                "--allow-anonymous-push",
-                "--session-timeout=0",
-            ],
+            &[&repo, "serve", listen, "--session-timeout=0"],
             "--session-timeout",
-        ),
-        (
-            &[&repo, "serve", listen, "--allow-anonymous-push", &policy],
-            "--policy",
         ),
         (
             &[&repo, "serve", "--read-only", listen, "--body-timeout=0"],
             "--body-timeout",
-        ),
-        (&[&no_repo, "serve", listen, &cert, &key], "--client-ca"),
-        (
-            &[&no_repo, "serve", ro, listen, &creds],
-            "--push-credentials",
         ),
         (
             &[
@@ -663,26 +623,13 @@ fn serve_refuses_what_it_cannot_serve() {
             ],
             "--allow-cleartext-credentials",
         ),
-        (
-            &[&no_repo, "serve", listen, &creds],
-            "takes no credential over plain HTTP",
-        ),
-        (&[&repo, "serve", listen, clear, &malformed], "line 3"),
-        (
-            &[&repo, "serve", listen, clear, &empty],
-            "no authentication method",
-        ),
-        (&[&repo, "serve", listen, clear, &big], "size cap"),
         (&[&repo, "serve", "--read-only", listen, &ca], "--tls-cert"),
         (&[&repo, "serve", "--read-only", listen, &cert], "--tls-key"),
         (
             &[&repo, "serve", "--read-only", listen, &enc_cert, &enc_key],
             "passphrase",
         ),
-        (
-            &[&repo, "serve", "--read-only", listen, &cert, &absent],
-            "absent",
-        ),
+        (&[&repo, "serve", ro, listen, &big_cert, &key], "size cap"),
     ];
     for (args, message) in cases {
         let out = run(ostrya(), args);
@@ -690,8 +637,13 @@ fn serve_refuses_what_it_cannot_serve() {
         assert_eq!(out.status.code(), Some(1), "{args:?}: {stderr}");
         assert!(out.stdout.is_empty(), "{args:?}");
         assert!(stderr.contains(message), "{args:?}: {stderr}");
-        assert!(!stderr.contains("secret-name"), "{args:?}: {stderr}");
     }
+    let out = run(
+        ostrya(),
+        &[&repo, "serve", "--read-only", listen, &cert, &absent],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&out.stderr).contains("absent"));
 }
 
 /// The start checks take the TLS files from the options alone, because the
@@ -768,24 +720,27 @@ fn raw(url: &str, request: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// With `--allow-anonymous-push`, the receive endpoint answers a `session`
-/// request, and the archive view still serves `config`. With `--read-only`,
-/// the server has no receive endpoint, so the request gets 405. A read-only
-/// server builds no key group, so a key that it cannot read does not stop
-/// it.
+/// With a client group of anonymous push, the receive endpoint answers a
+/// `session` request, and the archive view still serves `config`. With
+/// `--read-only`, the server has no receive endpoint, so the request gets
+/// 405. A read-only server builds no key group, so a key that it cannot read
+/// does not stop it.
 #[test]
 fn serve_runs_the_receive_endpoint_with_anonymous_push() {
     let tmp = TmpDir::new("receive");
     let path = tmp.path().join("repo");
     let repo = format!("--repo={}", path.display());
     ok(ostrya(), &[&repo, "init", "--mode=archive"]);
+    let config = path.join("config");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str("[ex-ostrya client \"push\"]\nauth=anonymous\nallow=w:**\n");
+    std::fs::write(&config, text).unwrap();
     let post = "POST /_ostrya/receive/v1/session HTTP/1.1\r\nhost: x\r\n\
                 content-length: 0\r\nconnection: close\r\n\r\n";
     let get = "GET /config HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n";
     let server = Serving::start_with(
         &path,
         &[
-            "--allow-anonymous-push",
             "--session-timeout=30",
             "--max-sessions=2",
             "--parallel-uploads=2",
@@ -798,7 +753,6 @@ fn serve_runs_the_receive_endpoint_with_anonymous_push() {
     assert!(response.contains("the request body holds no message"));
     assert!(raw(&server.url, get).starts_with("HTTP/1.1 200 "));
     drop(server);
-    let config = path.join("config");
     let mut text = std::fs::read_to_string(&config).unwrap();
     text.push_str("[ex-ostrya key \"k\"]\ntype=ed25519\nsecret-key-file=/nonexistent/ostrya/k\n");
     std::fs::write(&config, text).unwrap();
@@ -807,31 +761,39 @@ fn serve_runs_the_receive_endpoint_with_anonymous_push() {
     assert!(response.starts_with("HTTP/1.1 405 "), "{response}");
 }
 
-/// With `--push-credentials` and `--allow-anonymous-push`, and with no
+/// With a `token-sha256` item and an anonymous item, and with no
 /// `--allow-cleartext-credentials`, a bearer token over plain HTTP gets 403.
-/// With `--push-credentials` and `--allow-cleartext-credentials`, the token
-/// passes the authentication. A client CA alone is a method of push, and the
-/// server starts with it.
+/// With `--allow-cleartext-credentials`, the token passes the
+/// authentication, and a token that matches no item gets 401. With no
+/// `--read-only` and no client group, and with a client CA alone, the server
+/// starts.
 #[test]
-fn serve_takes_push_credentials() {
+fn serve_takes_the_credentials_of_the_client_groups() {
     let tmp = TmpDir::new("credentials");
     let path = tmp.path().join("repo");
     let repo = format!("--repo={}", path.display());
     ok(ostrya(), &[&repo, "init", "--mode=archive"]);
+    let server = Serving::start_with(&path, &[]);
+    assert!(server.url.starts_with("http://"), "{}", server.url);
+    drop(server);
     // The SHA-256 digest of `token`.
     let digest = "3c469e9d6c5875d37a43f353d4f88e61fcf812c66eee3457465a40b0da4153e0";
-    let file = tmp.path().join("credentials");
-    std::fs::write(&file, format!("# push\nalice:{digest}\n")).unwrap();
-    let creds = format!("--push-credentials={}", file.display());
+    let config = path.join("config");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(&format!(
+        "[ex-ostrya client \"builders\"]\nauth=token-sha256:{digest}\nallow=w:**\n\
+         [ex-ostrya client \"anyone\"]\nauth=anonymous\nallow=w:**\n"
+    ));
+    std::fs::write(&config, text).unwrap();
     let post = "POST /_ostrya/receive/v1/session HTTP/1.1\r\nhost: x\r\n\
                 authorization: Bearer token\r\ncontent-length: 0\r\n\
                 connection: close\r\n\r\n";
-    let server = Serving::start_with(&path, &[&creds, "--allow-anonymous-push"]);
+    let server = Serving::start_with(&path, &[]);
     let response = raw(&server.url, post);
     assert!(response.starts_with("HTTP/1.1 403 "), "{response}");
     assert!(response.contains("the server takes no credential over plain HTTP"));
     drop(server);
-    let server = Serving::start_with(&path, &[&creds, "--allow-cleartext-credentials"]);
+    let server = Serving::start_with(&path, &["--allow-cleartext-credentials"]);
     let response = raw(&server.url, post);
     // A 422 shows that the request passed the authentication. The empty
     // body holds no `Hello`, so the endpoint refuses it with `protocol`.

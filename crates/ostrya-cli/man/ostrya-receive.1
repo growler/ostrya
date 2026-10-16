@@ -8,8 +8,13 @@ ostrya receive [OPTIONS]
 .SH DESCRIPTION
 Receive one push session over standard input and standard output.
 .PP
-By default, \fB\%ostrya push\fR runs this command on the server over ssh. At start, the command reads and checks the client groups, the server group, the trust groups, and the key groups of the repository config, and a bad group ends it with status \%1. The session selects no client group, so it opens no push session: \fB\%Hello\fR gets \fB\%ref\-denied\fR\&. Standard output carries the frames of the session alone. For each warning of the session, the command writes one \fB\%warning: STEP: MESSAGE\fR line to standard error. It writes nothing else, also under \%\-\-verbose. The exit status is \%0 after a committed session, also with warnings, and \%1 otherwise.
+By default, \fB\%ostrya push\fR runs this command on the server over ssh. The client name is \%\-\-client, else the value of \fB\%LOGNAME\fR, which sshd sets from the password entry of the user. With neither, the command writes an error line and exits \%1 before it opens the repository. At start, the command reads and checks the client groups, the server group, the trust groups, and the key groups of the repository config, and a bad group ends it with status \%1. The session takes the policy of the client group of the local refs that carries the item \fB\%ssh:NAME\fR\&. With no such group, the session opens no push session: \fB\%Hello\fR gets \fB\%ref\-denied\fR\&. The session uses no \fB\%anonymous\fR and no \fB\%net:\fR item. Standard output carries the frames of the session alone. For each warning of the session, the command writes one \fB\%warning: STEP: MESSAGE\fR line to standard error. It writes nothing else, also under \%\-\-verbose. The exit status is \%0 after a committed session, also with warnings, and \%1 otherwise.
 .SH OPTIONS
+.TP
+\fB\-\-client\fR \fINAME\fR
+The client name of the session, in place of \fB\%LOGNAME\fR\&.
+.IP
+The session selects the client group that carries the item \fB\%ssh:NAME\fR\&. NAME is not empty, holds no control character, and does not start or end with white space. The option is safe only under a forced \fB\%command=\fR in \fB\%authorized_keys\fR, because a user with a shell can give any name.
 .PP
 The global options are listed in \fBostrya\fR(1).
 .SH SEE ALSO

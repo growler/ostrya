@@ -2407,7 +2407,7 @@ The part holds these items:
 - the push protocol and the pull protocol, over HTTP and over a byte stream;
 - the ref listing;
 - the endpoints of `ostrya serve`;
-- the credential files of a push over HTTP;
+- the credential file of a push over HTTP;
 - the ssh transport;
 - the commit of `push-tree`;
 - the mode `bare-user-shared`.
@@ -2886,10 +2886,11 @@ no I/O, and each failure is `ref-denied`:
 9. A ref of `Hello` needs `r` in the effective rights of the group
    (`ostrya-config(1)`, "Access modes and patterns"). `d` does not add `r`.
 
-`ostrya receive` and `ostrya serve` select no client group, so a session of
-them opens no push session. `ostrya receive` answers `Hello` with
-`ref-denied`. `ostrya serve` answers the `session` request with 403
-("Authentication of the receive endpoint").
+`ostrya receive` and `ostrya serve` give a session the client group of the
+local refs that carries the auth item of the client ("Authentication of the
+receive endpoint"). With no such group, `ostrya receive` runs the session
+under a policy with no allow item, so check 7 gives `ref-denied`, and
+`ostrya serve` answers the `session` request with 403.
 
 A `Hello` with no ref, and a `Hello` that names one ref two times, pass
 checks 1 to 6. A `Hello` with no ref also passes checks 8 and 9, so a client
@@ -3554,8 +3555,9 @@ alone. If the random source fails, `POST session` gets 500 with `internal`.
 5. It makes the session id.
 6. It gets the setup of the session from the authentication of the
    endpoint. A refusal gets 401 or 403 with `unauthorized`, and the place in
-   the table becomes free. Under `ostrya serve`, a client group that opens no
-   push session gives a refusal with 403.
+   the table becomes free. Under `ostrya serve`, an item that no client group
+   of the local refs carries, and a client group that opens no push session,
+   give a refusal with 403.
 7. It runs checks 7 to 9 of "Hello and HelloReply" with the client group of
    the setup. Then it opens the session transaction, as "Hello and
    HelloReply" states. If the endpoint stopped during these steps, the
@@ -3646,52 +3648,89 @@ request. So a client with no credential gets 404 or 405 for a bad route or
 method. The endpoint authenticates a request before it reads a byte of the
 body.
 
-`ostrya serve` authenticates a request by these rules, in this order:
+`ostrya serve` identifies the client of a request by the auth items of the
+client groups (`ostrya-config(1)`, "Authentication items"). The
+identification gives one auth item. The server takes the first step that
+applies:
 
 1. A request with more than one `Authorization` header gets 401.
-2. The server splits `Authorization` at its first space, and removes the
-   ASCII white space at the start of the rest. The scheme compares with no
-   regard to case.
-3. Over plain HTTP, a `Bearer` or `Basic` credential gets 403, unless
-   `--allow-cleartext-credentials` is given. This rule also applies when
-   anonymous push is on.
-4. A `Bearer` or `Basic` credential that matches no line of the push
-   credential file gets 401, also when the request has a client certificate.
-   "The push credential file of a server" states the match. A header with
-   another scheme gets 401.
-5. A request with no `Authorization` header gets the first result that
-   applies:
-   - the owner of its client certificate, when the server has a client CA
-     and the request has a certificate;
-   - the owner `anonymous`, with `--allow-anonymous-push`;
-   - 401, when the server has credential lines;
-   - 403.
+2. Over plain HTTP, a `Bearer` or `Basic` credential gets 403, unless
+   `--allow-cleartext-credentials` is given. This step also applies when a
+   group has the `anonymous` item.
+3. A request with an `Authorization` header gets the item of its
+   credential. A credential that matches no item gets 401, also when the
+   request has a client certificate. A header with another scheme gets 401.
+4. A request with a client certificate gets the first item that matches, in
+   this order: `tls-sha256:HEX`, `tls:NAME`, `tls:*`. A certificate that
+   matches no item gets 403.
+5. A request whose client address is in the network of a `net:` item gets
+   that item. When two items match, the item with the longer prefix wins.
+6. A request gets the `anonymous` item, if a group has it.
+7. Else the request gets 401 when a `token-sha256` or a `basic-sha256` item
+   exists, and 403 when none exists.
+
+The server splits `Authorization` at its first space, and removes the ASCII
+white space at the start of the rest. The scheme compares with no regard to
+case.
+
+- A bearer token gets the item `token-sha256:HEX`. `HEX` is the SHA-256
+  digest of the token. The first field of the output of
+  `printf %s "$TOKEN" | sha256sum` gives it.
+- A Basic credential is the base64 of `USER:PASSWORD`. `USER` runs to the
+  first `:`, so `PASSWORD` can hold `:`. The padding of the base64 is
+  optional. The credential gets the item `basic-sha256:USER:HEX`, where
+  `HEX` is the digest of the password.
+- These credentials match no item:
+  - an empty token, also `Bearer` with no space after it;
+  - a Basic value that is not base64, for example a value that holds a
+    `!`;
+  - a Basic credential with no `:` or with an empty password;
+  - a Basic credential whose user name is not UTF-8.
+
+The server compares the digest of a bearer token with every `token-sha256`
+item in constant time. It compares the digest of the user name and the digest
+of the password of a Basic credential with every `basic-sha256` item in
+constant time. It does not stop at a match.
 
 With `--client-ca`, the TLS handshake verifies a client certificate against
-the CA. A client with no certificate also connects.
+the CA. A client with no certificate also connects. The server reads the
+end-entity certificate one time for each connection:
 
-`ostrya serve` selects no client group, so its endpoint opens no push session.
-A `session` request that passes these rules and the checks of `Hello` gets 403
-with `unauthorized` and the message
-`the policy of the server opens no push session`.
+- `tls-sha256:HEX` compares the SHA-256 digest of the DER bytes of the
+  certificate.
+- `tls:NAME` compares the CN of the subject with `NAME`, byte for byte. The
+  subject must hold exactly one CN, in any RDN, of type UTF8String or
+  PrintableString. A subject with no CN, with two CNs, or with a CN of
+  another type matches no `tls:NAME` item. A certificate whose bytes do not
+  parse matches no `tls:NAME` item, and can match `tls-sha256:HEX` and
+  `tls:*`.
+
+The client address is the TCP peer address. An IPv4-mapped IPv6 address
+counts as its IPv4 address.
+
+A `session` request then selects the client group of the local refs that
+carries the item. `Hello` names no collection, so the namespace of each
+session is the local refs. The server does not try another item: a
+certificate that gets a `tls:NAME` item gets no group of `tls:*`. These
+requests get 403 with `unauthorized`:
+
+- a request whose item no group of the local refs carries. The message is
+  `no client group of the request covers the local refs`.
+- a request whose group opens no push session. The message is
+  `client group 'NAME' opens no push session`. With no client group, the
+  implicit group `anonymous` reads each ref and opens no push session.
 
 Each 401 of `ostrya serve` carries two headers:
 `WWW-Authenticate: Bearer realm="ostrya"` and
-`WWW-Authenticate: Basic realm="ostrya"`. The server compares the digest of a
-request with the digest of each line in constant time, and it does not stop
-at a match.
+`WWW-Authenticate: Basic realm="ostrya"`.
 
-The owner key of a request has a prefix for each method:
-
-- `token:NAME` for a bearer token or a Basic credential. `NAME` is the name
-  of its credential line.
-- `cert:HEX` for a client certificate. `HEX` is the SHA-256 digest of the DER
-  bytes of the end-entity certificate, in lowercase hex.
-- `anonymous` for anonymous push.
-
-The endpoint gives a session to its owner alone. A request of another owner
-gets 404 for that session id. All anonymous clients share one owner key, so
-each anonymous client that knows a session id reaches the session.
+The owner key of a request is the text of its auth item, for example
+`token-sha256:HEX` or `net:10.0.1.0/24`. A bearer token and a Basic
+credential are two items, so they give two owner keys. The endpoint gives a
+session to its owner alone. A request of another owner gets 404 for that
+session id. All clients with one item share one owner key. So each anonymous
+client that knows a session id reaches the session, and so does each client
+of one `net:` item.
 
 A refusal of the authentication gets its status, 401 or 403, and an `Error`
 frame with `unauthorized`. A host application can mount the endpoint with an
@@ -3702,69 +3741,18 @@ also a `Content-Type` or a `Retry-After`. It drops `Content-Length`,
 connection state itself. It cuts the message of the refusal to 4096 bytes at
 a character boundary.
 
+`ostrya receive` and `ostrya send` identify the client of an ssh session by
+its name: `--client NAME`, else the value of `LOGNAME`, which sshd sets from
+the password entry of the user. An empty `LOGNAME` counts as absent.
+`ostrya receive` gives the session the policy of the client group of the
+local refs that carries `ssh:NAME`. With no such group, the session opens no
+push session, and `Hello` gets `ref-denied`. An ssh session uses no
+`anonymous` item and no `net:` item. `ostrya send` does not check the name
+and does not limit the session by the name. `--client` is safe only under a
+forced `command=` in `authorized_keys`, because a user with a shell can give
+any name.
+
 ## Credential files
-
-### The push credential file of a server
-
-`ostrya serve --push-credentials=FILE` reads the credentials of a push over
-HTTP from `FILE`. The file is outside the repository, and the server reads it
-one time, at start.
-
-The file is UTF-8 text. A LF ends each line, and the last line can have no
-LF. Each line is one of these:
-
-- An empty line. The server skips it.
-- A comment: a line whose first byte is `#`. The server skips it.
-- A credential: each other line, in the form `NAME:HEX`.
-  - `NAME` is one or more visible ASCII characters (0x21 to 0x7e) other
-    than `:`.
-  - `HEX` is the SHA-256 digest of the token, in 64 lowercase hex digits.
-    The first field of the output of `printf %s "$TOKEN" | sha256sum` gives
-    it.
-
-A line of spaces, and a line with a space before its `#`, are credential
-lines. So the server refuses them.
-
-Example:
-
-```text
-# the push credentials of the build hosts
-builder-1:3c469e9d6c5875d37a43f353d4f88e61fcf812c66eee3457465a40b0da4153e0
-```
-
-The server refuses the file at start when a line is malformed:
-
-- A line holds a CR (0x0d). This rule applies to comments and empty lines
-  too, so the server refuses a file with CRLF line ends.
-- A line is not valid UTF-8.
-- A credential line holds a space.
-- A credential line holds no `:`, or its `NAME` is empty.
-- A `NAME` holds a character other than visible ASCII.
-- A `HEX` is not 64 lowercase hex digits.
-- Two lines have the same `NAME`, or the same `HEX`.
-
-The server stops at the first malformed line. The error names the number of
-that line, from 1. For a repeated `NAME` or `HEX`, the error also names the
-first line. The error holds no byte of a line. The server refuses a file
-larger than 1 MiB. A file with no credential line gives no authentication
-method, and a server with no other method does not start. A server with no
-TLS whose one method is the file does not start either, unless it takes
-credentials over plain HTTP.
-
-A bearer token matches a line when the SHA-256 digest of the token is equal
-to `HEX`. A Basic credential `NAME:TOKEN` matches the line with that `NAME`
-when the digest of `TOKEN` is equal to its `HEX`. `NAME` runs to the first
-`:`, so `TOKEN` can hold `:`. A bearer token and a Basic credential that match
-one line give the same session owner.
-
-These credentials match no line:
-
-- an empty token, also `Bearer` with no space after it;
-- a Basic value that is not base64, for example with white space at its end;
-- a Basic credential with no `:` or with an empty `TOKEN`;
-- a Basic credential whose `NAME` is not UTF-8.
-
-The padding of the base64 is optional.
 
 ### The push token file of a client
 
@@ -3848,6 +3836,13 @@ committed, `ostrya receive` writes one `warning: STEP: MESSAGE` line.
   warnings. It exits 1 in each other case.
 - `ostrya send` exits 0 when its input ends at a frame boundary. It exits 1
   in each other case.
+
+`ostrya receive` and `ostrya send` need a client name ("Authentication of the
+receive endpoint"). With no name, each command writes one `error: MESSAGE`
+line and exits 1 before it opens the repository. `ostrya receive` does the
+same with a name that an `ssh:` item cannot hold. Its message shows the name
+in escaped form, so a control character in the name does not split the line.
+A refusal writes no frame.
 
 `ostrya receive` reads the client groups, the server group, the trust groups,
 and the key groups before it reads `Hello`. If a group does not load, it writes

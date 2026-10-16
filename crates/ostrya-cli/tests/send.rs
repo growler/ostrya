@@ -114,14 +114,15 @@ fn drain<P: Read + Send + 'static>(mut pipe: P) -> std::thread::JoinHandle<Vec<u
     })
 }
 
-/// Runs `ostrya [global] send --repo=REPO` with `input` on standard input.
-/// If a run takes longer than [`SEND_LIMIT`], this function kills it and the
-/// test fails.
+/// Runs `ostrya [global] send --repo=REPO` with `input` on standard input,
+/// with a client name in `LOGNAME`. If a run takes longer than
+/// [`SEND_LIMIT`], this function kills it and the test fails.
 fn send(repo: &Path, global: &[&str], input: Vec<u8>) -> Output {
     let mut child = Command::new(env!("CARGO_BIN_EXE_ostrya"))
         .args(global)
         .arg("send")
         .arg(format!("--repo={}", repo.display()))
+        .env("LOGNAME", "puller")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -424,6 +425,7 @@ fn send_streams_a_large_object_in_bounded_memory() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_ostrya"))
         .arg("send")
         .arg(format!("--repo={}", repo_path.display()))
+        .arg("--client=puller")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()

@@ -378,9 +378,16 @@ impl ClientAccess {
     /// give `None`. The selection compares `item` alone, so a `tls:NAME` item
     /// never selects a group of `tls:*`.
     pub fn select(&self, item: &AuthItem, namespace: &Namespace) -> Option<&ClientGroup> {
-        let mut carriers = self.carriers(item).iter().map(|&i| &self.groups[i]);
+        self.select_index(item, namespace).map(|i| &self.groups[i])
+    }
+
+    /// Returns the index in `groups` of the group that
+    /// [`select`](ClientAccess::select) returns.
+    pub(crate) fn select_index(&self, item: &AuthItem, namespace: &Namespace) -> Option<usize> {
+        let mut carriers = self.carriers(item).iter().copied();
+        let scope = |i: usize| &self.groups[i].scope;
         match namespace {
-            Namespace::Local => carriers.find(|group| group.scope == CollectionScope::Local),
+            Namespace::Local => carriers.find(|&i| *scope(i) == CollectionScope::Local),
             Namespace::Collection(id) => {
                 if !ostrya_core::is_collection_id(id)
                     || Some(id.as_str()) == self.collection_id.as_deref()
@@ -389,10 +396,21 @@ impl ClientAccess {
                 }
                 carriers
                     .clone()
-                    .find(|group| matches!(&group.scope, CollectionScope::Ids(ids) if ids.contains(id)))
-                    .or_else(|| carriers.find(|group| group.scope == CollectionScope::AllOther))
+                    .find(|&i| matches!(scope(i), CollectionScope::Ids(ids) if ids.contains(id)))
+                    .or_else(|| carriers.find(|&i| *scope(i) == CollectionScope::AllOther))
             }
         }
+    }
+
+    /// Returns each auth item of the groups one time, in the order of its
+    /// first group in the config.
+    pub fn items(&self) -> impl Iterator<Item = &AuthItem> {
+        self.groups.iter().enumerate().flat_map(move |(i, group)| {
+            group
+                .auth
+                .iter()
+                .filter(move |item| self.carriers(item).first() == Some(&i))
+        })
     }
 
     /// Checks the server settings that a server runs with.
@@ -744,6 +762,25 @@ secret-key-file=/etc/ostrya/release.secret
         let names: Vec<&str> = access.groups_of(&ssh).map(ClientGroup::name).collect();
         assert_eq!(names, ["a", "c"]);
         assert_eq!(access.groups_of(&item("ssh:w")).count(), 0);
+    }
+
+    /// `items` gives each item one time, in the order of its first group.
+    /// Two texts of one network are one item.
+    #[test]
+    fn items_gives_each_item_one_time() {
+        let access = access(
+            "[ex-ostrya client \"a\"]\nauth=ssh:u;anonymous\n\
+             [ex-ostrya client \"b\"]\nauth=net:2001:0db8::/56;ssh:v\n\
+             [ex-ostrya client \"c\"]\nauth=ssh:u;net:2001:db8::/56;tls:*\ncollection=*\n",
+        );
+        let items: Vec<String> = access.items().map(AuthItem::to_string).collect();
+        assert_eq!(
+            items,
+            ["ssh:u", "anonymous", "net:2001:db8::/56", "ssh:v", "tls:*"]
+        );
+        let implicit = self::access("");
+        let items: Vec<&AuthItem> = implicit.items().collect();
+        assert_eq!(items, [&AuthItem::Anonymous]);
     }
 
     /// Two groups with one item are refused when their namespaces overlap.

@@ -502,6 +502,11 @@ dependency graph.
   holds.
 - Three packages enter `Cargo.lock` with it: `x509-cert` 0.2.5,
   `der_derive` 0.7.3, and `flagset` 0.4.7.
+- The read of the subject CN costs about 74 KiB of the stripped
+  `target/release/ostrya`, the binary `cargo build --release -p ostrya-cli`
+  writes with its default feature set. `docs/port-plan.md`, Phase 26,
+  states the counterfactual the figure is measured against and the two byte
+  counts.
 
 ## Requirement: permissive licenses only
 

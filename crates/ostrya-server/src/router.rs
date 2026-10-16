@@ -9,7 +9,7 @@ use hyper::header::{ALLOW, CONTENT_LENGTH, HeaderValue};
 use hyper::{Method, Request, Response, StatusCode};
 use ostrya::{ArchiveAnswer, ArchiveHead, ArchiveView, Repo};
 
-use crate::auth::FileAuth;
+use crate::auth::GroupAuth;
 use crate::body::{ReceiveBody, ServeBody};
 use crate::endpoint::ReceiveEndpoint;
 use crate::stall::Stall;
@@ -28,7 +28,7 @@ pub(crate) async fn handle(
     view: &ArchiveView,
     repo: &Repo,
     listings: &Arc<AtomicUsize>,
-    receive: Option<&ReceiveEndpoint<FileAuth>>,
+    receive: Option<&ReceiveEndpoint<GroupAuth>>,
     stall: &Arc<Stall>,
     req: Request<Incoming>,
 ) -> Response<ServeBody> {

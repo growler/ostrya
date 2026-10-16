@@ -28,7 +28,7 @@ use ostrya::remote::proto::{
 use ostrya::remote::{Encoding, ErrorCode, Expected, RefUpdate};
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, MutableTree,
-    ObjectName, ObjectType, PruneOptions, ReceivePolicy, ReceiveReport, RefSelector, Repo,
+    ObjectName, ObjectType, PruneOptions, ReceivePolicies, ReceiveReport, RefSelector, Repo,
     RepoMode, loose_path,
 };
 use ostrya_rt::{Timer, block_on};
@@ -475,23 +475,40 @@ where
     });
 }
 
-/// A policy that writes a commit to each ref as a fast-forward.
-fn pushing_policy() -> ReceivePolicy {
-    ReceivePolicy {
-        rules: ostrya::access::AccessRules {
-            allow: vec![ostrya::access::AllowItem::parse("w:**").unwrap()],
-            deny: Vec::new(),
-        },
-        ..ReceivePolicy::default()
-    }
+/// A client group that lets each request with no credential write a commit
+/// to each ref as a fast-forward.
+const ANONYMOUS_PUSH: &str = "[ex-ostrya client \"push\"]\nauth=anonymous\nallow=w:**\n";
+
+/// Writes the client groups `groups` into the config of `repo`, in place of
+/// the groups of an earlier call, and returns their policies. The open
+/// repository keeps the config that it read.
+fn policies(repo: &Repo, groups: &str) -> Arc<ReceivePolicies> {
+    let config = repo.path().join("config");
+    let text = std::fs::read_to_string(&config).unwrap();
+    let mut text = match text.find("[ex-ostrya client ") {
+        Some(i) => text[..i].to_owned(),
+        None => text,
+    };
+    text.push_str(groups);
+    std::fs::write(&config, text).unwrap();
+    block_on(async {
+        let repo = Repo::open(repo.path()).await.unwrap();
+        Arc::new(ReceivePolicies::from_config(&repo).await.unwrap())
+    })
 }
 
-fn options() -> ServeOptions {
+/// The options of a plain HTTP server over `repo` on a port the kernel
+/// chooses, with the client groups `groups`.
+fn options_with(repo: &Repo, groups: &str) -> ServeOptions {
     let mut opts = ServeOptions::default();
     opts.listen = vec!["127.0.0.1:0".parse().unwrap()];
-    opts.receive = Some(Arc::new(pushing_policy()));
-    opts.allow_anonymous_push = true;
+    opts.receive = Some(policies(repo, groups));
     opts
+}
+
+/// [`options_with`] with the group of anonymous push.
+fn options(repo: &Repo) -> ServeOptions {
+    options_with(repo, ANONYMOUS_PUSH)
 }
 
 /// Writes `bytes` to `writer` and flushes it. A failure gives `false` and no
@@ -541,7 +558,7 @@ fn a_push_through_the_endpoint_commits() {
     let repo = receiver(tmp.path(), RepoMode::Archive, "");
     let reports = Arc::new(Mutex::new(Vec::<ReceiveReport>::new()));
     let sink = reports.clone();
-    let mut opts = options();
+    let mut opts = options(&repo);
     opts.parallel_uploads = 2;
     opts.on_report = Some(Arc::new(move |r| sink.lock().unwrap().push(r)));
     let commit = src.commits[0];
@@ -603,6 +620,7 @@ fn a_push_through_the_endpoint_commits() {
     let reports = reports.lock().unwrap();
     assert_eq!(reports.len(), 1);
     assert!(reports[0].warnings.is_empty(), "{:?}", reports[0].warnings);
+    assert_eq!(reports[0].group.as_deref(), Some("push"));
 }
 
 /// An unknown session id gets an empty 404 on each route. A path under the
@@ -615,7 +633,7 @@ fn routes_unknown_ids_and_methods() {
     let tmp = TmpDir::new("routes");
     let repo = receiver(tmp.path(), RepoMode::Archive, "");
     let id = "0".repeat(64);
-    with_server(repo.clone(), options(), |client, addr| async move {
+    with_server(repo.clone(), options(&repo), |client, addr| async move {
         let ask = |method: &str, path: &str| {
             format!(
                 "{method} /{path} HTTP/1.1\r\nhost: x\r\ncontent-length: 0\r\n\
@@ -662,7 +680,7 @@ fn routes_unknown_ids_and_methods() {
         let reply = client.post(SESSION, two).await;
         reply.error(422, ErrorCode::Protocol);
     });
-    let mut opts = options();
+    let mut opts = options(&repo);
     opts.receive = None;
     with_server(repo, opts, |_, addr| async move {
         let request = format!(
@@ -680,7 +698,7 @@ fn routes_unknown_ids_and_methods() {
 fn the_ref_listing_is_served_beside_the_endpoint() {
     let tmp = TmpDir::new("listing");
     let repo = receiver(tmp.path(), RepoMode::Archive, "");
-    with_server(repo.clone(), options(), |_, addr| async move {
+    with_server(repo.clone(), options(&repo), |_, addr| async move {
         let mut stream = ostrya_rt::TcpStream::connect("127.0.0.1", addr.port())
             .await
             .unwrap();
@@ -718,7 +736,7 @@ fn the_ref_listing_is_served_beside_the_endpoint() {
 fn a_session_past_the_limit_gets_503() {
     let tmp = TmpDir::new("limit");
     let repo = receiver(tmp.path(), RepoMode::Archive, "");
-    let mut opts = options();
+    let mut opts = options(&repo);
     opts.max_sessions = 1;
     with_server(repo, opts, |client, addr| async move {
         let id = client.open().await;
@@ -736,15 +754,16 @@ fn a_session_past_the_limit_gets_503() {
     });
 }
 
-/// The built-in authentication refuses each session with 403 when the policy
-/// of the server opens no push session. The refusal frees the slot of the
-/// session, so a second request under a limit of one gets the same answer.
+/// The built-in authentication refuses each session with 403 when the client
+/// group of the request opens no push session. The refusal frees the slot of
+/// the session, so a second request under a limit of one gets the same
+/// answer. The implicit groups of a config with no client group read each
+/// ref and push none.
 #[test]
-fn a_policy_that_opens_no_push_session_gets_403() {
+fn a_group_that_opens_no_push_session_gets_403() {
     let tmp = TmpDir::new("closed-policy");
     let repo = receiver(tmp.path(), RepoMode::Archive, "");
-    let mut opts = options();
-    opts.receive = Some(Arc::new(ReceivePolicy::default()));
+    let mut opts = options_with(&repo, "");
     opts.max_sessions = 1;
     with_server(repo.clone(), opts, |client, _| async move {
         for _ in 0..2 {
@@ -762,7 +781,7 @@ fn a_policy_that_opens_no_push_session_gets_403() {
 fn a_bad_hello_is_422_also_when_the_sessions_are_at_the_limit() {
     let tmp = TmpDir::new("limit-bad-hello");
     let repo = receiver(tmp.path(), RepoMode::Archive, "");
-    let mut opts = options();
+    let mut opts = options(&repo);
     opts.max_sessions = 1;
     with_server(repo, opts, |client, _| async move {
         client.open().await;
@@ -785,7 +804,7 @@ fn a_bad_hello_is_422_also_when_the_sessions_are_at_the_limit() {
 fn a_delete_over_http2_has_no_length() {
     let tmp = TmpDir::new("h2-delete");
     let repo = receiver(tmp.path(), RepoMode::Archive, "");
-    let mut opts = options();
+    let mut opts = options(&repo);
     opts.tls = Some(ServerTls {
         cert_chain_pem: SERVER_CERT_PEM.to_vec(),
         key_pem: SERVER_KEY_PEM.to_vec(),
@@ -824,7 +843,7 @@ fn errors_map_to_their_status() {
     let [c1, c2] = src.commits;
     let [o1, o2] = src.objects;
     let held = repo.clone();
-    with_server(repo.clone(), options(), |client, _| async move {
+    with_server(repo.clone(), options(&repo), |client, _| async move {
         // An expected commit on an absent ref.
         let id = client.open().await;
         client.step(&id, "objects", stream(&o1).await).await.ok();
@@ -896,7 +915,7 @@ fn errors_map_to_their_status() {
     if !is_root() {
         let tmp = TmpDir::new("status-bare");
         let repo = receiver(tmp.path(), RepoMode::Bare, "");
-        with_server(repo, options(), |client, _| async move {
+        with_server(repo.clone(), options(&repo), |client, _| async move {
             let reply = client.post(SESSION, encode(&[hello()]).await).await;
             reply.error(422, ErrorCode::ModeRefused);
         });
@@ -922,7 +941,7 @@ fn objects_past_parallel_uploads_is_limit_exceeded() {
     let tmp = TmpDir::new("parallel");
     let src = block_on(source(tmp.path()));
     let repo = receiver(tmp.path(), RepoMode::Archive, "");
-    let mut opts = options();
+    let mut opts = options(&repo);
     opts.parallel_uploads = 1;
     let first = of_type(&src.objects[0], ObjectType::DirMeta);
     with_server(repo.clone(), opts, |client, _| async move {
@@ -956,7 +975,7 @@ fn a_commit_during_objects_is_protocol() {
     let repo = receiver(tmp.path(), RepoMode::Archive, "");
     let commit = src.commits[0];
     let first = of_type(&src.objects[0], ObjectType::DirMeta);
-    with_server(repo.clone(), options(), |client, _| async move {
+    with_server(repo.clone(), options(&repo), |client, _| async move {
         let id = client.open().await;
         let body = waiting_body(&first).await;
         let (waiting, committed) = future::zip(
@@ -986,7 +1005,7 @@ fn an_error_in_one_stream_fails_the_other() {
     let src = block_on(source(tmp.path()));
     let repo = receiver(tmp.path(), RepoMode::Archive, "");
     let first = of_type(&src.objects[0], ObjectType::DirMeta);
-    with_server(repo.clone(), options(), |client, _| async move {
+    with_server(repo.clone(), options(&repo), |client, _| async move {
         let id = client.open().await;
         let body = waiting_body(&first).await;
         let corrupt = Obj {
@@ -1021,7 +1040,7 @@ fn a_delete_during_an_upload_aborts_the_session() {
     let src = block_on(source(tmp.path()));
     let repo = receiver(tmp.path(), RepoMode::Archive, "lock-timeout-secs=0\n");
     let first = of_type(&src.objects[0], ObjectType::DirMeta);
-    with_server(repo.clone(), options(), |client, _| async move {
+    with_server(repo.clone(), options(&repo), |client, _| async move {
         let id = client.open().await;
         let body = waiting_body(&first).await;
         let (waiting, deleted) = future::zip(
@@ -1056,7 +1075,7 @@ fn a_session_that_commits_keeps_its_commit_and_its_slot() {
     let commit = src.commits[0];
     let objects = src.objects[0].clone();
     let held = repo.clone();
-    let mut opts = options();
+    let mut opts = options(&repo);
     opts.max_sessions = 1;
     with_server(repo.clone(), opts, |client, _| async move {
         let id = client.open().await;
@@ -1101,7 +1120,7 @@ fn an_idle_session_is_aborted_and_a_slow_upload_is_not() {
     let src = block_on(source(tmp.path()));
     let repo = receiver(tmp.path(), RepoMode::Archive, "");
     let idle = Duration::from_millis(500);
-    let mut opts = options();
+    let mut opts = options(&repo);
     opts.session_idle_timeout = idle;
     let objects = src.objects[0].clone();
     with_server(repo.clone(), opts, |client, _| async move {
@@ -1135,7 +1154,7 @@ fn an_idle_session_is_aborted_and_a_slow_upload_is_not() {
 fn a_silent_body_aborts_the_session() {
     let tmp = TmpDir::new("silent");
     let repo = receiver(tmp.path(), RepoMode::Archive, "");
-    let mut opts = options();
+    let mut opts = options(&repo);
     opts.session_idle_timeout = Duration::from_millis(500);
     with_server(repo.clone(), opts, |client, _| async move {
         let id = client.open().await;
@@ -1166,7 +1185,7 @@ fn a_cut_request_ends_the_session() {
     let repo = receiver(tmp.path(), RepoMode::Archive, "");
     let first = of_type(&src.objects[0], ObjectType::DirMeta);
     let file = of_type(&src.objects[0], ObjectType::File);
-    with_server(repo.clone(), options(), |client, addr| async move {
+    with_server(repo.clone(), options(&repo), |client, addr| async move {
         let id = client.open().await;
         let body = waiting_body(&first).await;
         let (waiting, ()) = future::zip(
@@ -1226,7 +1245,7 @@ fn detached_metadata_past_the_session_cap_is_limit_exceeded() {
     let tmp = TmpDir::new("metacap");
     let repo = receiver(tmp.path(), RepoMode::Archive, "");
     let len = 65 << 20;
-    with_server(repo.clone(), options(), |client, _| async move {
+    with_server(repo.clone(), options(&repo), |client, _| async move {
         let id = client.open().await;
         let header = |seed: &[u8]| {
             Message::ObjectHeader(ObjectHeader {
@@ -1277,30 +1296,31 @@ fn detached_metadata_past_the_session_cap_is_limit_exceeded() {
     assert_released(&repo);
 }
 
-/// `bind` refuses a receive endpoint with no authentication method, a
-/// `parallel_uploads` outside `1..=31`, a zero idle timeout, and a zero
-/// session limit.
+/// `bind` refuses a `parallel_uploads` outside `1..=31`, a zero idle
+/// timeout, and a zero session limit. Client groups that identify no request
+/// are no refusal.
 #[test]
 fn bad_receive_options_are_refused() {
     let tmp = TmpDir::new("options");
     let repo = receiver(tmp.path(), RepoMode::Archive, "");
-    let cases: [fn(&mut ServeOptions); 5] = [
-        |o| o.allow_anonymous_push = false,
+    let cases: [fn(&mut ServeOptions); 4] = [
         |o| o.parallel_uploads = 0,
         |o| o.parallel_uploads = 32,
         |o| o.session_idle_timeout = Duration::ZERO,
         |o| o.max_sessions = 0,
     ];
     for change in cases {
-        let mut opts = options();
+        let mut opts = options(&repo);
         change(&mut opts);
         let err = block_on(ostrya_server::bind(repo.clone(), opts))
             .err()
             .unwrap();
         assert!(matches!(err, ostrya_server::Error::Options(_)), "{err}");
     }
-    let mut opts = options();
+    let mut opts = options(&repo);
     opts.parallel_uploads = 31;
+    block_on(ostrya_server::bind(repo.clone(), opts)).unwrap();
+    let opts = options_with(&repo, "[ex-ostrya client \"c\"]\nauth=ssh:u\nallow=w:**\n");
     block_on(ostrya_server::bind(repo, opts)).unwrap();
 }
 
@@ -1311,17 +1331,21 @@ fn bad_receive_options_are_refused() {
 const ALICE: &str = "alice-token";
 const BOB: &str = "bob-token";
 
-/// A credential file with a comment, an empty line, and the lines of
-/// `alice` and `bob`.
-fn credentials() -> Vec<u8> {
+/// A client group with the bearer tokens `ALICE` and `BOB`, and the Basic
+/// credentials of `alice` and `bob` with these tokens as passwords.
+fn credential_groups() -> String {
     let digest = |token: &str| Checksum::sha256(token.as_bytes()).to_hex();
     format!(
-        "# the push credentials\n\nalice:{}\nbob:{}\n",
-        digest(ALICE),
-        digest(BOB)
+        "[ex-ostrya client \"builders\"]\n\
+         auth=token-sha256:{a};token-sha256:{b};basic-sha256:alice:{a};basic-sha256:bob:{b}\n\
+         allow=w:**\n",
+        a = digest(ALICE),
+        b = digest(BOB),
     )
-    .into_bytes()
 }
+
+/// A client group of the fixture client certificate, by its subject CN.
+const CERT_GROUP: &str = "[ex-ostrya client \"certs\"]\nauth=tls:ostrya test\nallow=w:**\n";
 
 /// The server TLS files. If `client_ca` is `true`, the fixture CA is also the
 /// client CA.
@@ -1334,12 +1358,21 @@ fn server_tls(client_ca: bool) -> ServerTls {
     }
 }
 
-/// The options of a server whose one method is the credential file.
-fn credential_options() -> ServeOptions {
-    let mut opts = options();
-    opts.allow_anonymous_push = false;
-    opts.credentials = Some(credentials());
-    opts
+/// The options of a server whose one group takes the credentials of
+/// [`credential_groups`].
+fn credential_options(repo: &Repo) -> ServeOptions {
+    options_with(repo, &credential_groups())
+}
+
+/// The SHA-256 digest of the DER bytes of the fixture client certificate, in
+/// lowercase hex.
+fn client_cert_digest() -> String {
+    let base64: String = std::str::from_utf8(CLIENT_CERT_PEM)
+        .unwrap()
+        .lines()
+        .filter(|line| !line.starts_with("-----"))
+        .collect();
+    Checksum::sha256(&ostrya::base64::decode(&base64).unwrap()).to_hex()
 }
 
 fn bearer(token: &str) -> Option<BearerToken> {
@@ -1388,15 +1421,17 @@ fn absent() -> ObjectName {
 }
 
 /// Over TLS, the endpoint accepts `Hello` with a bearer token, with Basic,
-/// and with a client certificate. The session then takes the next step of
-/// its owner. A `Hello` with no credential gets 401 with `unauthorized`. A
-/// credential that matches no line gets the same 401, also beside a valid
-/// client certificate.
+/// and with a client certificate whose CN a `tls:NAME` item names. The
+/// session then takes the next step of its owner. A `Hello` with no
+/// credential gets 401 with `unauthorized`. A credential that matches no item
+/// gets the same 401, also beside a valid client certificate. A Basic
+/// credential with the user name or the password of another item matches no
+/// item.
 #[test]
 fn each_method_opens_a_session_and_a_bad_credential_is_401() {
     let tmp = TmpDir::new("methods");
     let repo = receiver(tmp.path(), RepoMode::Archive, "");
-    let mut opts = credential_options();
+    let mut opts = options_with(&repo, &format!("{}{CERT_GROUP}", credential_groups()));
     opts.tls = Some(server_tls(true));
     with_server(repo, opts, |_, addr| async move {
         let identity = Some((CLIENT_CERT_PEM, CLIENT_KEY_PEM));
@@ -1417,7 +1452,11 @@ fn each_method_opens_a_session_and_a_bad_credential_is_401() {
         let nobody = Client::tls(addr, false, None).await;
         assert_401(&nobody.post(SESSION, encode(&[hello()]).await).await);
         let mut wrong = Client::tls(addr, false, identity).await;
-        for (token, user) in [(bearer("other"), None), (None, basic("alice", BOB))] {
+        for (token, user) in [
+            (bearer("other"), None),
+            (None, basic("alice", BOB)),
+            (None, basic("carol", ALICE)),
+        ] {
             wrong.bearer = token;
             wrong.basic = user;
             assert_401(&wrong.post(SESSION, encode(&[hello()]).await).await);
@@ -1425,15 +1464,72 @@ fn each_method_opens_a_session_and_a_bad_credential_is_401() {
     });
 }
 
-/// With a client CA as the one method, a client with no certificate gets
-/// 403 with `unauthorized` and no challenge. A client with a certificate
-/// opens a session.
+/// A client certificate gets the first item that it matches:
+/// `tls-sha256:HEX`, then `tls:NAME`, then `tls:*`. The refusal of a group
+/// that opens no push session names the selected group. A certificate that
+/// matches no item gets 403, also with an anonymous item.
 #[test]
-fn a_client_ca_alone_refuses_a_client_with_no_certificate() {
+fn a_certificate_selects_the_group_of_its_first_item() {
+    let tmp = TmpDir::new("cert-items");
+    let repo = receiver(tmp.path(), RepoMode::Archive, "");
+    let read = |name: &str, item: &str| {
+        format!("[ex-ostrya client \"{name}\"]\nauth={item}\nallow=r:**\n")
+    };
+    let digest = format!("tls-sha256:{}", client_cert_digest());
+    for (groups, selected) in [
+        (
+            format!(
+                "{}{}{}",
+                read("by-digest", &digest),
+                read("by-name", "tls:ostrya test"),
+                read("any", "tls:*")
+            ),
+            Some("by-digest"),
+        ),
+        (
+            format!(
+                "{}{}",
+                read("by-name", "tls:ostrya test"),
+                read("any", "tls:*")
+            ),
+            Some("by-name"),
+        ),
+        (
+            format!("{}{}", read("by-name", "tls:other"), read("any", "tls:*")),
+            Some("any"),
+        ),
+        (
+            format!("{}{ANONYMOUS_PUSH}", read("by-name", "tls:other")),
+            None,
+        ),
+    ] {
+        let mut opts = options_with(&repo, &groups);
+        opts.tls = Some(server_tls(true));
+        with_server(repo.clone(), opts, |_, addr| async move {
+            let identity = Some((CLIENT_CERT_PEM, CLIENT_KEY_PEM));
+            let client = Client::tls(addr, false, identity).await;
+            let reply = client.post(SESSION, encode(&[hello()]).await).await;
+            let error = reply.error(403, ErrorCode::Unauthorized);
+            assert!(challenges(&reply).is_empty(), "{reply:?}");
+            match selected {
+                Some(name) => assert_eq!(
+                    error.message,
+                    format!("client group '{name}' opens no push session")
+                ),
+                None => assert!(error.message.contains("client certificate"), "{error:?}"),
+            }
+        });
+    }
+}
+
+/// With `tls:` items alone, a client with no certificate gets 403 with
+/// `unauthorized` and no challenge. A client with a certificate opens a
+/// session.
+#[test]
+fn tls_items_alone_refuse_a_client_with_no_certificate() {
     let tmp = TmpDir::new("client-ca");
     let repo = receiver(tmp.path(), RepoMode::Archive, "");
-    let mut opts = options();
-    opts.allow_anonymous_push = false;
+    let mut opts = options_with(&repo, CERT_GROUP);
     opts.tls = Some(server_tls(true));
     with_server(repo, opts, |_, addr| async move {
         let nobody = Client::tls(addr, false, None).await;
@@ -1445,16 +1541,53 @@ fn a_client_ca_alone_refuses_a_client_with_no_certificate() {
     });
 }
 
+/// A request from an address in a `net:` item gets that item, over plain
+/// HTTP and with no credential.
+#[test]
+fn a_net_item_identifies_the_peer_address() {
+    let tmp = TmpDir::new("net");
+    let repo = receiver(tmp.path(), RepoMode::Archive, "");
+    let opts = options_with(
+        &repo,
+        "[ex-ostrya client \"loopback\"]\nauth=net:127.0.0.1\nallow=w:**\n\
+         [ex-ostrya client \"other\"]\nauth=net:192.0.2.0/24\nallow=r:**\n",
+    );
+    with_server(repo, opts, |client, _| async move {
+        let id = client.open().await;
+        assert_eq!(client.delete(&id).await.status, 204);
+    });
+}
+
+/// An item that no group of the local refs carries gets 403 at `session`:
+/// here the anonymous item of a group of each collection.
+#[test]
+fn an_item_with_no_group_of_the_local_refs_gets_403() {
+    let tmp = TmpDir::new("no-group");
+    let repo = receiver(tmp.path(), RepoMode::Archive, "");
+    let opts = options_with(
+        &repo,
+        "[ex-ostrya client \"mirrors\"]\nauth=anonymous\ncollection=*\nallow=w:**\n",
+    );
+    with_server(repo.clone(), opts, |client, _| async move {
+        let reply = client.post(SESSION, encode(&[hello()]).await).await;
+        let error = reply.error(403, ErrorCode::Unauthorized);
+        assert_eq!(
+            error.message,
+            "no client group of the request covers the local refs"
+        );
+    });
+    assert_released(&repo);
+}
+
 /// Over plain HTTP, a bearer or Basic credential gets 403 with
-/// `unauthorized`, also on a server that allows anonymous push. On that
+/// `unauthorized`, also on a server with an anonymous push group. On that
 /// server, a request with no credential pushes anonymously. With
 /// `allow_cleartext_credentials`, the endpoint accepts both credentials.
 #[test]
 fn a_credential_over_plain_http_is_403_unless_allowed() {
     let tmp = TmpDir::new("cleartext");
     let repo = receiver(tmp.path(), RepoMode::Archive, "");
-    let mut opts = credential_options();
-    opts.allow_anonymous_push = true;
+    let mut opts = options_with(&repo, &format!("{}{ANONYMOUS_PUSH}", credential_groups()));
     with_server(repo.clone(), opts.clone(), |client, addr| async move {
         client.open().await;
         for (token, user) in [(bearer(ALICE), None), (None, basic("alice", ALICE))] {
@@ -1477,15 +1610,34 @@ fn a_credential_over_plain_http_is_403_unless_allowed() {
     });
 }
 
+/// Over plain HTTP, `bind` takes groups whose one kind of item is a
+/// credential. Each credential gets 403, and a request with none gets 401.
+#[test]
+fn credential_items_alone_over_plain_http_bind() {
+    let tmp = TmpDir::new("plain-credentials");
+    let repo = receiver(tmp.path(), RepoMode::Archive, "");
+    with_server(
+        repo.clone(),
+        credential_options(&repo),
+        |client, addr| async move {
+            assert_401(&client.post(SESSION, encode(&[hello()]).await).await);
+            let mut alice = Client::new(addr).await;
+            alice.bearer = bearer(ALICE);
+            let reply = alice.post(SESSION, encode(&[hello()]).await).await;
+            reply.error(403, ErrorCode::Unauthorized);
+        },
+    );
+}
+
 /// A request of a session with another credential, or with none, gets the
-/// bytes of an unknown id. The session stays. A Basic credential with the
-/// name of the line of a bearer token is the same owner as that token.
+/// bytes of an unknown id. The session stays. The owner key is the auth item
+/// of the request, so the Basic credential of `alice`, which has her token
+/// as its password, is another owner than her bearer token.
 #[test]
 fn another_credential_gets_the_404_of_an_unknown_id() {
     let tmp = TmpDir::new("owner");
     let repo = receiver(tmp.path(), RepoMode::Archive, "");
-    let mut opts = credential_options();
-    opts.allow_anonymous_push = true;
+    let mut opts = options_with(&repo, &format!("{}{ANONYMOUS_PUSH}", credential_groups()));
     opts.allow_cleartext_credentials = true;
     with_server(repo, opts, |anonymous, addr| async move {
         let mut alice = Client::new(addr).await;
@@ -1499,7 +1651,7 @@ fn another_credential_gets_the_404_of_an_unknown_id() {
         let reference = without_date_reply(&bob.have(&unknown, vec![absent()]).await);
         assert_eq!(reference.0, 404);
         assert!(reference.2.is_empty());
-        for other in [&bob, &anonymous] {
+        for other in [&bob, &anonymous, &alice_basic] {
             for step in ["have", "objects", "commit"] {
                 let reply = other.step(&id, step, Vec::new()).await;
                 assert_eq!(without_date_reply(&reply), reference, "{step}");
@@ -1507,7 +1659,7 @@ fn another_credential_gets_the_404_of_an_unknown_id() {
             assert_eq!(other.delete(&id).await.status, 404);
         }
         assert!(matches!(
-            alice_basic.have(&id, vec![absent()]).await.ok(),
+            alice.have(&id, vec![absent()]).await.ok(),
             Message::HaveReply(_)
         ));
         assert_eq!(alice.delete(&id).await.status, 204);
@@ -1519,8 +1671,7 @@ fn another_credential_gets_the_404_of_an_unknown_id() {
 fn more_than_one_authorization_header_is_401() {
     let tmp = TmpDir::new("two-headers");
     let repo = receiver(tmp.path(), RepoMode::Archive, "");
-    let mut opts = credential_options();
-    opts.allow_anonymous_push = true;
+    let opts = options_with(&repo, &format!("{}{ANONYMOUS_PUSH}", credential_groups()));
     with_server(repo, opts, |_, addr| async move {
         let token = format!("authorization: Bearer {ALICE}\r\n");
         let request = format!(
@@ -1544,8 +1695,7 @@ fn more_than_one_authorization_header_is_401() {
 fn a_read_ignores_authorization() {
     let tmp = TmpDir::new("read");
     let repo = receiver(tmp.path(), RepoMode::Archive, "");
-    let mut opts = credential_options();
-    opts.allow_anonymous_push = true;
+    let opts = options_with(&repo, &format!("{}{ANONYMOUS_PUSH}", credential_groups()));
     with_server(repo, opts, |_, addr| async move {
         let basic = ostrya::base64::encode(format!("alice:{ALICE}").as_bytes());
         for method in ["GET", "HEAD"] {
@@ -1563,66 +1713,6 @@ fn a_read_ignores_authorization() {
     });
 }
 
-/// `bind` refuses a malformed credential line with `Error::Credentials`,
-/// which names the line and holds no byte of it. A file with no credential
-/// line gives no authentication method.
-#[test]
-fn a_malformed_credential_line_is_refused_at_bind() {
-    let tmp = TmpDir::new("malformed");
-    let repo = receiver(tmp.path(), RepoMode::Archive, "");
-    let mut opts = credential_options();
-    let mut file = credentials();
-    file.extend_from_slice(b"carol secret\n");
-    opts.credentials = Some(file);
-    let err = block_on(ostrya_server::bind(repo.clone(), opts))
-        .err()
-        .unwrap();
-    assert!(
-        matches!(err, ostrya_server::Error::Credentials { line: 5, .. }),
-        "{err}"
-    );
-    let text = err.to_string();
-    assert!(text.contains("line 5"), "{text}");
-    assert!(
-        !text.contains("carol") && !text.contains("secret"),
-        "{text}"
-    );
-
-    let mut opts = credential_options();
-    opts.credentials = Some(b"# no credential\n".to_vec());
-    let err = block_on(ostrya_server::bind(repo.clone(), opts.clone()))
-        .err()
-        .unwrap();
-    assert!(matches!(err, ostrya_server::Error::Options(_)), "{err}");
-    opts.allow_anonymous_push = true;
-    block_on(ostrya_server::bind(repo, opts)).unwrap();
-}
-
-/// Over plain HTTP, `bind` refuses a receive endpoint whose one method is
-/// the credential file, because the endpoint refuses each credential over
-/// plain HTTP. `allow_cleartext_credentials`, anonymous push, and TLS each
-/// let it bind.
-#[test]
-fn a_credential_file_alone_over_plain_http_is_refused_at_bind() {
-    let tmp = TmpDir::new("plain-file");
-    let repo = receiver(tmp.path(), RepoMode::Archive, "");
-    let err = block_on(ostrya_server::bind(repo.clone(), credential_options()))
-        .err()
-        .unwrap();
-    assert!(matches!(err, ostrya_server::Error::Options(_)), "{err}");
-    assert!(err.to_string().contains("plain HTTP"), "{err}");
-    let cases: [fn(&mut ServeOptions); 3] = [
-        |o| o.allow_cleartext_credentials = true,
-        |o| o.allow_anonymous_push = true,
-        |o| o.tls = Some(server_tls(false)),
-    ];
-    for change in cases {
-        let mut opts = credential_options();
-        change(&mut opts);
-        block_on(ostrya_server::bind(repo.clone(), opts)).unwrap();
-    }
-}
-
 /// With a client CA that did not sign the client certificate, the TLS
 /// handshake of a client that presents that certificate fails. The request
 /// gets no response. The handshake of a client with no certificate
@@ -1631,8 +1721,7 @@ fn a_credential_file_alone_over_plain_http_is_refused_at_bind() {
 fn a_client_certificate_the_client_ca_did_not_sign_fails_the_handshake() {
     let tmp = TmpDir::new("other-ca");
     let repo = receiver(tmp.path(), RepoMode::Archive, "");
-    let mut opts = options();
-    opts.allow_anonymous_push = false;
+    let mut opts = options_with(&repo, CERT_GROUP);
     opts.tls = Some(ServerTls {
         client_ca_pem: Some(UNTRUSTED_CERT_PEM.to_vec()),
         ..server_tls(false)
@@ -1656,8 +1745,10 @@ fn a_client_certificate_the_client_ca_did_not_sign_fails_the_handshake() {
 /// request to the session of a bearer token gets these responses:
 ///
 /// - with no `Authorization` header: 401
-/// - with the token of another line: the 404 of an unknown id
-/// - with Basic of the same line: the reply of its step
+/// - with another token: the 404 of an unknown id
+/// - with the Basic credential of the same user: the 404 of an unknown id,
+///   because it is another item
+/// - with the same token: the reply of its step
 ///
 /// One client opens a session with its client certificate and a session
 /// with a token, on one connection. A request of each owner to the session of
@@ -1666,7 +1757,7 @@ fn a_client_certificate_the_client_ca_did_not_sign_fails_the_handshake() {
 fn each_stream_of_one_http2_connection_is_authorized_again() {
     let tmp = TmpDir::new("h2-owners");
     let repo = receiver(tmp.path(), RepoMode::Archive, "");
-    let mut opts = credential_options();
+    let mut opts = options_with(&repo, &format!("{}{CERT_GROUP}", credential_groups()));
     opts.tls = Some(server_tls(true));
     with_server(repo, opts, |_, addr| async move {
         let mut client = Client::http2(addr).await;
@@ -1681,6 +1772,10 @@ fn each_stream_of_one_http2_connection_is_authorized_again() {
         assert_eq!((reply.status, reply.body.is_empty()), (404, true));
         client.bearer = None;
         client.basic = basic("alice", ALICE);
+        let reply = client.have(&id, vec![absent()]).await;
+        assert_eq!((reply.status, reply.body.is_empty()), (404, true));
+        client.basic = None;
+        client.bearer = bearer(ALICE);
         assert!(matches!(
             client.have(&id, vec![absent()]).await.ok(),
             Message::HaveReply(_)
@@ -1719,7 +1814,7 @@ fn a_refusal_with_a_silent_body_answers_within_5_seconds() {
              ten bytes."
         )
     };
-    let mut opts = credential_options();
+    let mut opts = credential_options(&repo);
     opts.allow_cleartext_credentials = true;
     assert_eq!(opts.session_idle_timeout, Duration::from_secs(300));
     with_server(repo.clone(), opts, |_, addr| async move {
@@ -1731,7 +1826,7 @@ fn a_refusal_with_a_silent_body_answers_within_5_seconds() {
         assert!(elapsed >= Duration::from_millis(4900), "{elapsed:?}");
         assert!(elapsed < Duration::from_secs(15), "{elapsed:?}");
     });
-    let mut opts = options();
+    let mut opts = options(&repo);
     opts.session_idle_timeout = Duration::from_millis(500);
     with_server(repo, opts, |_, addr| async move {
         let started = Instant::now();

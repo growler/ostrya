@@ -13,11 +13,12 @@ use hyper::Request;
 use hyper::body::Incoming;
 use hyper::server::conn::{http1, http2};
 use hyper::service::service_fn;
-use ostrya::{ArchiveView, Checksum, Repo};
+use ostrya::{ArchiveView, Repo};
 use ostrya_fetch::{FuturesIo, RtExecutor, RtTimer};
 use ostrya_rt as rt;
 
-use crate::auth::{FileAuth, Peer};
+use crate::auth::{GroupAuth, Peer};
+use crate::cert::ClientCert;
 use crate::endpoint::{EndpointOptions, ReceiveEndpoint};
 use crate::error::{Error, Result};
 use crate::options::ServeOptions;
@@ -124,21 +125,20 @@ pub struct Server {
     addrs: Vec<SocketAddr>,
     view: Arc<ArchiveView>,
     repo: Repo,
-    receive: Option<Arc<ReceiveEndpoint<FileAuth>>>,
+    receive: Option<Arc<ReceiveEndpoint<GroupAuth>>>,
     tls: Option<Arc<ServerConfig>>,
     body_timeout: Duration,
 }
 
 /// Returns the receive endpoint of `opts` over `repo`, or `None` if `opts`
-/// has no receive policy. With a policy, the function checks the
-/// authentication methods first, with [`FileAuth::new`]. Then it checks the
-/// other options, with [`ReceiveEndpoint::new`]. With no policy, it checks
+/// has no receive policies. With policies, the function checks the options
+/// of the endpoint with [`ReceiveEndpoint::new`]. With no policies, it checks
 /// nothing.
-fn receive(repo: &Repo, opts: &ServeOptions) -> Result<Option<Arc<ReceiveEndpoint<FileAuth>>>> {
-    let Some(policy) = &opts.receive else {
+fn receive(repo: &Repo, opts: &ServeOptions) -> Result<Option<Arc<ReceiveEndpoint<GroupAuth>>>> {
+    let Some(policies) = &opts.receive else {
         return Ok(None);
     };
-    let auth = FileAuth::new(opts, policy.clone())?;
+    let auth = GroupAuth::new(policies.clone(), opts.allow_cleartext_credentials);
     let options = EndpointOptions {
         parallel_uploads: opts.parallel_uploads,
         session_idle_timeout: opts.session_idle_timeout,
@@ -161,12 +161,6 @@ fn receive(repo: &Repo, opts: &ServeOptions) -> Result<Option<Arc<ReceiveEndpoin
 /// The checks run in this order:
 ///
 /// - [`Error::Options`] if `listen` is empty, or if `body_timeout` is zero.
-/// - [`Error::Credentials`] if `receive` is set and a line of `credentials`
-///   is malformed.
-/// - [`Error::Options`] if `receive` is set and the endpoint has no
-///   [authentication method](ServeOptions#authentication).
-/// - [`Error::Options`] if `receive` is set, `tls` is `None`, and both
-///   `allow_anonymous_push` and `allow_cleartext_credentials` are `false`.
 /// - [`Error::Options`] if `receive` is set and `parallel_uploads` is
 ///   outside `1..=31`, or `session_idle_timeout` or `max_sessions` is zero.
 /// - [`Error::Tls`] if the TLS files give no server configuration.
@@ -284,7 +278,7 @@ struct Serving {
     repo: Repo,
     /// The count of ref listings in flight, over all connections.
     listings: Arc<AtomicUsize>,
-    receive: Option<Arc<ReceiveEndpoint<FileAuth>>>,
+    receive: Option<Arc<ReceiveEndpoint<GroupAuth>>>,
     tls: Option<Arc<ServerConfig>>,
     body_timeout: Duration,
 }
@@ -294,8 +288,8 @@ struct Serving {
 async fn accept_loop(listener: rt::TcpListener, serving: Arc<Serving>, shutdown: Arc<Shutdown>) {
     loop {
         match listener.accept().await {
-            Ok((stream, _peer)) => {
-                let connection = connection(stream, serving.clone());
+            Ok((stream, peer)) => {
+                let connection = connection(stream, peer, serving.clone());
                 let stop = shutdown.wait();
                 drop(rt::spawn(future::or(connection, stop)));
             }
@@ -306,26 +300,33 @@ async fn accept_loop(listener: rt::TcpListener, serving: Arc<Serving>, shutdown:
 
 /// Serves one connection until it ends, or until one of its response bodies
 /// waits longer than the body timeout for the client.
-async fn connection(stream: rt::TcpStream, serving: Arc<Serving>) {
+async fn connection(stream: rt::TcpStream, addr: SocketAddr, serving: Arc<Serving>) {
     let stall = Stall::new(serving.body_timeout);
     future::or(
-        serve_connection(stream, serving, stall.clone()),
+        serve_connection(stream, addr, serving, stall.clone()),
         async move { stall.expired().await },
     )
     .await
 }
 
-/// Serves one connection. An error ends this connection and no other. With
-/// a receive endpoint, each request carries the [`Peer`] of the connection
-/// in its extensions.
-async fn serve_connection(stream: rt::TcpStream, serving: Arc<Serving>, stall: Arc<Stall>) {
+/// Serves one connection from the peer address `addr`. An error ends this
+/// connection and no other. With a receive endpoint, each request carries the
+/// [`Peer`] of the connection in its extensions. The server then reads the
+/// client certificate of a TLS connection one time, for each request of the
+/// connection.
+async fn serve_connection(
+    stream: rt::TcpStream,
+    addr: SocketAddr,
+    serving: Arc<Serving>,
+    stall: Arc<Stall>,
+) {
     let shared = serving.clone();
     let service = move |peer: Peer| {
         service_fn(move |mut req: Request<Incoming>| {
             let serving = shared.clone();
             let stall = stall.clone();
             if serving.receive.is_some() {
-                req.extensions_mut().insert(peer);
+                req.extensions_mut().insert(peer.clone());
             }
             async move {
                 let receive = serving.receive.as_deref();
@@ -345,6 +346,7 @@ async fn serve_connection(stream: rt::TcpStream, serving: Arc<Serving>, stall: A
     let Some(config) = serving.tls.clone() else {
         let peer = Peer {
             tls: false,
+            addr: addr.ip(),
             cert: None,
         };
         let served = http1::Builder::new()
@@ -366,12 +368,17 @@ async fn serve_connection(stream: rt::TcpStream, serving: Arc<Serving>, stall: A
     };
     let connection = stream.get_ref().1;
     let h2 = connection.alpn_protocol() == Some(b"h2".as_slice());
-    let peer = Peer {
-        tls: true,
-        cert: connection
+    let cert = match serving.receive {
+        Some(_) => connection
             .peer_certificates()
             .and_then(|chain| chain.first())
-            .map(|der| Checksum::sha256(der.as_ref())),
+            .map(|der| Arc::new(ClientCert::from_der(der.as_ref()))),
+        None => None,
+    };
+    let peer = Peer {
+        tls: true,
+        addr: addr.ip(),
+        cert,
     };
     let service = service(peer);
     let io = FuturesIo::new(stream);

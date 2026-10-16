@@ -348,24 +348,19 @@ mod tests {
     use ostrya_rt::block_on;
 
     use super::*;
-    use crate::ServeOptions;
-    use crate::auth::{FileAuth, Peer};
+    use crate::auth::{GroupAuth, Peer};
     use crate::body::ServeBody;
     use crate::body::tests::frames;
     use crate::receive::PREFIX;
-    use crate::session::tests::{TmpRepo, pushing_policy};
+    use crate::session::tests::{ANONYMOUS_PUSH, TmpRepo};
 
-    /// The built-in authentication with anonymous push.
-    fn anonymous() -> FileAuth {
-        let opts = ServeOptions {
-            allow_anonymous_push: true,
-            ..ServeOptions::default()
-        };
-        FileAuth::new(&opts, Arc::new(pushing_policy())).unwrap()
+    /// The built-in authentication with a group of anonymous push.
+    fn anonymous(tmp: &TmpRepo) -> GroupAuth {
+        GroupAuth::new(tmp.policies(ANONYMOUS_PUSH), false)
     }
 
-    fn endpoint(tmp: &TmpRepo, options: EndpointOptions) -> Result<ReceiveEndpoint<FileAuth>> {
-        ReceiveEndpoint::new(tmp.repo.clone(), anonymous(), options)
+    fn endpoint(tmp: &TmpRepo, options: EndpointOptions) -> Result<ReceiveEndpoint<GroupAuth>> {
+        ReceiveEndpoint::new(tmp.repo.clone(), anonymous(tmp), options)
     }
 
     #[test]
@@ -474,6 +469,7 @@ mod tests {
                 .uri(format!("{PREFIX}session"))
                 .extension(Peer {
                     tls: false,
+                    addr: std::net::Ipv4Addr::LOCALHOST.into(),
                     cert: None,
                 })
                 .body(ServeBody::Full(Some(Bytes::from(bytes))))

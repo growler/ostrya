@@ -122,11 +122,12 @@ impl fmt::Debug for ServerTls {
 /// of that digest matches the item `tls-sha256:HEX`.
 ///
 /// A `session` request selects the client group that carries the item in the
-/// local refs, with
-/// [`ReceivePolicies::select`](ostrya::ReceivePolicies::select). `Hello`
-/// names no collection, so the namespace of each session is the local refs.
-/// The session gets the policy of that group and no hooks. With no such
-/// group, and with a group that opens no push session, the request gets 403.
+/// namespace of its `Hello`, with
+/// [`ReceivePolicies::select`](ostrya::ReceivePolicies::select). The
+/// collection id of `Hello` names the namespace, and no collection or the
+/// collection id of the repository names the local refs. The session gets
+/// the policy of that group and no hooks. With no such group, and with a
+/// group that opens no push session, the request gets 403.
 ///
 /// # Claims
 ///

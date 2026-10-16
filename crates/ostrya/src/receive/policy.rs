@@ -3,7 +3,9 @@
 
 use std::sync::Arc;
 
-use crate::access::{AccessModes, AccessRules, AuthItem, ClientAccess, ClientGroup, Namespace};
+use crate::access::{
+    AccessModes, AccessRules, AuthItem, ClientAccess, ClientGroup, CollectionScope, Namespace,
+};
 use crate::error::Result;
 use crate::pull::DetachedMetadataFilter;
 use crate::remote::{self, RefUpdate};
@@ -31,6 +33,8 @@ use super::{ServerSigner, StreamPolicy, TrustedKeys};
 /// [`rights`](ReceivePolicy::rights) gives the effective rights of a ref. A
 /// session applies them in this way:
 ///
+/// - The [`scope`](ReceivePolicy::scope) must cover the namespace of
+///   `Hello`.
 /// - Each ref of `Hello` needs `r`. A remote ref `REMOTE:NAME` has no right,
 ///   so a push session never reads or writes one.
 /// - A session opens only if an allow item has `w`, `c`, `t`, or `d`.
@@ -43,6 +47,12 @@ use super::{ServerSigner, StreamPolicy, TrustedKeys};
 ///   changes nothing.
 #[derive(Debug, Clone, Default)]
 pub struct ReceivePolicy {
+    /// The namespace of the group.
+    ///
+    /// A session opens only in a namespace that the scope covers, as
+    /// [`CollectionScope::covers`] states. The rules name the refs of that
+    /// namespace. The default is [`CollectionScope::Local`].
+    pub scope: CollectionScope,
     /// The allow items and the deny items of the group.
     pub rules: AccessRules,
     /// The signatures that a new commit must carry.
@@ -147,6 +157,7 @@ impl ReceivePolicies {
     ///
     /// The policy of a group takes these values:
     ///
+    /// - [`scope`](ReceivePolicy::scope) from `collection`
     /// - [`rules`](ReceivePolicy::rules) from `allow` and `deny`
     /// - [`verify`](ReceivePolicy::verify) from `verify`, with the keys of the
     ///   trust group
@@ -269,8 +280,13 @@ pub(super) trait SessionPolicy: Send + Sync {
     /// repository.
     fn privileged_allowed(&self) -> bool;
 
-    /// Checks the refs of `Hello` before the session opens, with no I/O.
-    fn check_hello(&self, refs: &[String]) -> std::result::Result<(), Failure>;
+    /// Checks the namespace and the refs of `Hello` before the session
+    /// opens, with no I/O.
+    fn check_hello(
+        &self,
+        namespace: &Namespace,
+        refs: &[String],
+    ) -> std::result::Result<(), Failure>;
 
     /// Returns the rule of `update`, or the `ref-denied` refusal of the
     /// update.
@@ -294,13 +310,33 @@ fn ref_denied(message: String) -> Failure {
     Failure::Wire(remote::Error::RefDenied(message))
 }
 
+/// Returns `namespace` as the words of a message: `the local refs` or `the
+/// collection 'ID'`.
+pub(super) fn namespace_text(namespace: &Namespace) -> String {
+    match namespace {
+        Namespace::Local => "the local refs".into(),
+        Namespace::Collection(id) => format!("the collection '{id}'"),
+    }
+}
+
 impl SessionPolicy for ReceivePolicy {
     fn privileged_allowed(&self) -> bool {
         self.allow_privileged
     }
 
-    /// Refuses a policy that opens no push session, and a ref without `r`.
-    fn check_hello(&self, refs: &[String]) -> std::result::Result<(), Failure> {
+    /// Refuses a namespace that the scope does not cover, a policy that
+    /// opens no push session, and a ref without `r`.
+    fn check_hello(
+        &self,
+        namespace: &Namespace,
+        refs: &[String],
+    ) -> std::result::Result<(), Failure> {
+        if !self.scope.covers(namespace) {
+            return Err(ref_denied(format!(
+                "the policy of the session does not cover {}",
+                namespace_text(namespace)
+            )));
+        }
         if !self.rules.opens_push_session() {
             return Err(ref_denied(
                 "the policy of the session opens no push session: no allow item has the \
@@ -371,8 +407,13 @@ impl SessionPolicy for StreamPolicy {
         self.allow_privileged
     }
 
-    /// A one-way stream checks its refs at `Commit` alone.
-    fn check_hello(&self, _refs: &[String]) -> std::result::Result<(), Failure> {
+    /// A one-way stream has no namespace, and checks its refs at `Commit`
+    /// alone.
+    fn check_hello(
+        &self,
+        _namespace: &Namespace,
+        _refs: &[String],
+    ) -> std::result::Result<(), Failure> {
         Ok(())
     }
 
@@ -465,7 +506,7 @@ mod tests {
         assert_eq!(policy.rights("main").to_string(), "rwctd");
         assert_eq!(policy.rules.rights("origin:main").to_string(), "rwctd");
         assert_eq!(policy.rights("origin:main"), AccessModes::NONE);
-        let message = denied(policy.check_hello(&["origin:main".into()]));
+        let message = denied(policy.check_hello(&Namespace::Local, &["origin:main".into()]));
         assert!(message.contains("remote ref"), "{message}");
         let message = denied(policy.rule(&update("origin:main", true)));
         assert!(message.contains("remote ref"), "{message}");
@@ -475,13 +516,43 @@ mod tests {
     #[test]
     fn hello_needs_a_push_mode_and_read() {
         let names = |names: &[&str]| -> Vec<String> { names.iter().map(|&n| n.into()).collect() };
-        denied(ReceivePolicy::default().check_hello(&[]));
-        denied(policy(&["r:**"]).check_hello(&names(&["a"])));
-        denied(policy(&["d:a"]).check_hello(&names(&["a"])));
-        accepted(policy(&["rd:a"]).check_hello(&names(&["a"])));
-        accepted(policy(&["r:**", "w:a"]).check_hello(&names(&["a", "b"])));
-        let message = denied(policy(&["w:a"]).check_hello(&names(&["a", "b"])));
+        let local = &Namespace::Local;
+        denied(ReceivePolicy::default().check_hello(local, &[]));
+        denied(policy(&["r:**"]).check_hello(local, &names(&["a"])));
+        denied(policy(&["d:a"]).check_hello(local, &names(&["a"])));
+        accepted(policy(&["rd:a"]).check_hello(local, &names(&["a"])));
+        accepted(policy(&["r:**", "w:a"]).check_hello(local, &names(&["a", "b"])));
+        let message = denied(policy(&["w:a"]).check_hello(local, &names(&["a", "b"])));
         assert!(message.contains("'b'"), "{message}");
+    }
+
+    /// `Hello` needs a scope that covers its namespace. The scope check comes
+    /// before the other checks.
+    #[test]
+    fn hello_needs_a_scope_that_covers_the_namespace() {
+        let os = Namespace::Collection("org.example.Os".into());
+        let other = Namespace::Collection("org.example.Other".into());
+        let refs = ["main".to_owned()];
+        let local = policy(&["w:**"]);
+        let message = denied(local.check_hello(&os, &refs));
+        assert!(
+            message.contains("the collection 'org.example.Os'"),
+            "{message}"
+        );
+        let exact = ReceivePolicy {
+            scope: CollectionScope::Ids(vec!["org.example.Os".into()]),
+            ..policy(&["w:**"])
+        };
+        accepted(exact.check_hello(&os, &refs));
+        denied(exact.check_hello(&other, &refs));
+        let message = denied(exact.check_hello(&Namespace::Local, &refs));
+        assert!(message.contains("the local refs"), "{message}");
+        let all = ReceivePolicy {
+            scope: CollectionScope::AllOther,
+            ..ReceivePolicy::default()
+        };
+        let message = denied(all.check_hello(&Namespace::Local, &[]));
+        assert!(message.contains("does not cover"), "{message}");
     }
 
     /// A write needs `w` or `t`, and the modes give the rule of the update.

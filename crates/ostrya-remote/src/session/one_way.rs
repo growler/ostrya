@@ -177,6 +177,7 @@ where
             version: PROTOCOL_VERSION,
             agent: Some(agent),
             refs: updates.iter().map(|u| u.name.clone()).collect(),
+            collection: None,
             one_way: true,
         }),
         "Hello",
@@ -587,6 +588,7 @@ mod tests {
             version: PROTOCOL_VERSION,
             agent: Some("ostrya".into()),
             refs: long(20_000, 40).into_iter().map(|u| u.name).collect(),
+            collection: None,
             one_way: true,
         });
         frame(&hello, "Hello").unwrap();
@@ -699,6 +701,7 @@ mod tests {
                 version: PROTOCOL_VERSION,
                 agent: Some("test".into()),
                 refs: updates().into_iter().map(|u| u.name).collect(),
+                collection: None,
                 one_way: true,
             }),
             "Hello",

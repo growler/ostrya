@@ -48,10 +48,20 @@ impl Client {
     }
 
     pub async fn hello(&mut self, refs: &[&str]) -> remote::Result<()> {
+        self.hello_in(refs, None).await
+    }
+
+    /// Sends `Hello` with `refs` and the collection id `collection`.
+    pub async fn hello_in(
+        &mut self,
+        refs: &[&str],
+        collection: Option<&str>,
+    ) -> remote::Result<()> {
         self.send(&Message::Hello(Hello {
             version: 1,
             agent: None,
             refs: refs.iter().map(|r| r.to_string()).collect(),
+            collection: collection.map(str::to_owned),
             one_way: false,
         }))
         .await
@@ -65,7 +75,12 @@ impl Client {
     }
 
     pub async fn hello_reply(&mut self, refs: &[&str]) -> HelloReply {
-        self.hello(refs).await.unwrap();
+        self.hello_reply_in(refs, None).await
+    }
+
+    /// Sends `Hello` with `refs` and `collection`, and reads `HelloReply`.
+    pub async fn hello_reply_in(&mut self, refs: &[&str], collection: Option<&str>) -> HelloReply {
+        self.hello_in(refs, collection).await.unwrap();
         match self.recv().await {
             Some(Message::HelloReply(reply)) => reply,
             other => panic!("expected HelloReply, got {other:?}"),
@@ -149,6 +164,14 @@ pub fn policy_allowing(allow: &[&str]) -> ReceivePolicy {
             deny: Vec::new(),
         },
         ..ReceivePolicy::default()
+    }
+}
+
+/// Returns [`policy_allowing`] with the scope `collection=*`.
+pub fn collections_policy(allow: &[&str]) -> ReceivePolicy {
+    ReceivePolicy {
+        scope: ostrya::access::CollectionScope::AllOther,
+        ..policy_allowing(allow)
     }
 }
 

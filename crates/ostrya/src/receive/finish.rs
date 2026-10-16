@@ -24,9 +24,10 @@ use super::session::{Failure, ReceiveReport, ReceiveStep, ReceiveWarning};
 use super::walk::{self, Missing};
 use super::{ReceiveVerify, ServerSigner, TrustedKeys};
 use crate::MAX_METADATA_SIZE;
+use crate::access::Namespace;
 use crate::error::{Error, Result};
 use crate::object::read_meta_object;
-use crate::refs::{RefFileState, refspec_to_relpath};
+use crate::refs::{CollectionRef, RefFileState};
 use crate::remote::proto::{CommitRequest, MAX_FRAME, Message};
 use crate::remote::{self, Expected, RefOutcome, RefUpdate};
 use crate::repo::Repo;
@@ -55,6 +56,24 @@ fn protocol(message: String) -> Failure {
 
 fn ref_denied(message: String) -> Failure {
     Failure::Wire(remote::Error::RefDenied(message))
+}
+
+/// The refs that `Hello` named, and the namespace that they are in.
+pub(super) struct Named<'a> {
+    /// The namespace of the session, or `None` for a one-way stream.
+    pub(super) namespace: Option<&'a Namespace>,
+    /// The refs of `Hello`.
+    pub(super) names: &'a [String],
+    /// The path under `refs/` of each ref of `names`, in the same order.
+    pub(super) paths: &'a [String],
+}
+
+impl Named<'_> {
+    /// Returns `true` for the local refs of a session, and for a one-way
+    /// stream.
+    fn is_local(&self) -> bool {
+        !matches!(self.namespace, Some(Namespace::Collection(_)))
+    }
 }
 
 /// A commit that a ref update names as its new value.
@@ -104,8 +123,9 @@ struct Edit<'a> {
 /// Runs the checks of the ref updates of `request`, then writes the refs and
 /// commits `txn` under the update lock.
 ///
-/// `named` holds the refs of `Hello`. `commit_meta` holds the detached
-/// metadata dicts of the session.
+/// `named` holds the refs of `Hello`, their paths, and their namespace.
+/// `commit_meta` holds the detached metadata dicts of the session. In a
+/// collection namespace, the refs are under `refs/mirrors/ID/`.
 ///
 /// # Checks
 ///
@@ -122,8 +142,9 @@ struct Edit<'a> {
 ///   refs.
 /// - Each detached metadata dict belongs to a commit of the session: a staged
 ///   commit, or the new commit of an update (`protocol`).
-/// - No update names the collection anchor ref of a repository with a
-///   collection id, and `policy` gives a rule for each update (`ref-denied`).
+/// - No update names the collection anchor ref of the local refs of a
+///   repository with a collection id, and `policy` gives a rule for each
+///   update (`ref-denied`).
 ///   The policy of a client group needs `w` or `t` for an update that writes
 ///   a commit. The policy of a one-way stream needs a rule that accepts the
 ///   ref.
@@ -131,7 +152,7 @@ struct Edit<'a> {
 ///   commit of the session parses.
 /// - The tree of each commit of the session is complete (`missing-objects`).
 /// - The ref binding and the collection binding of each new commit name its
-///   refs and the repository (`binding-mismatch`).
+///   refs and the namespace (`binding-mismatch`).
 /// - Each new commit passes the signature verification of each of its rules
 ///   (`signature-required`). The verification reads the union of the stored
 ///   and the incoming detached metadata. A rule that accepts a commit with
@@ -235,15 +256,15 @@ pub(super) async fn finish(
     policy: &dyn SessionPolicy,
     hooks: Option<&dyn ReceiveHooks>,
     txn: Transaction,
-    named: &[String],
+    named: Named<'_>,
     commit_meta: HashMap<Checksum, Vec<u8>>,
     request: CommitRequest,
 ) -> Checked<ReceiveReport> {
     let CommitRequest { updates, force } = request;
-    check_names(named, &updates)?;
+    let paths: Arc<[String]> = check_names(&named, &updates)?.into();
     check_reply_fits(&updates)?;
     check_commit_meta_commits(&txn, &updates, &commit_meta)?;
-    let rules = select_rules(repo, policy, &updates)?;
+    let rules = select_rules(repo, policy, named.is_local(), &updates)?;
     let Loaded {
         targets,
         session_commits,
@@ -254,7 +275,7 @@ pub(super) async fn finish(
     if missing.total > 0 {
         return Err(missing_objects(missing, "the trees of the commits reach"));
     }
-    check_bindings(repo, &updates, &targets)?;
+    check_bindings(repo, named.namespace, &updates, &targets)?;
     let commit_meta: HashMap<Checksum, Bytes> = commit_meta
         .into_iter()
         .map(|(commit, bytes)| (commit, Arc::new(bytes)))
@@ -280,9 +301,8 @@ pub(super) async fn finish(
     .await;
     synced.map_err(Failure::Internal)?;
     let edits = edits?;
-    let names: Vec<String> = updates.iter().map(|u| u.name.clone()).collect();
     let tips = repo
-        .resolve_ref_tips(&names)
+        .resolve_relpath_tips(Arc::clone(&paths))
         .await
         .map_err(Failure::Internal)?;
     let mut walks = Walks::new(parents);
@@ -320,10 +340,10 @@ pub(super) async fn finish(
     let held = repo.lock_update().await.map_err(Failure::Internal)?;
     let anchor = policy.regenerates_summary() && repo.config().collection_id().is_some();
     let (states, anchor_parent) = repo
-        .read_ref_states(&names, anchor.then_some(OSTREE_METADATA_REF))
+        .read_ref_states(Arc::clone(&paths), anchor.then_some(OSTREE_METADATA_REF))
         .await
         .map_err(Failure::Internal)?;
-    let current = check_ref_paths(&updates, &states)?;
+    let current = check_ref_paths(&updates, &paths, &states)?;
     let mut changes = Vec::with_capacity(updates.len());
     for (i, update) in updates.iter().enumerate() {
         let changed = check_ref(
@@ -334,8 +354,15 @@ pub(super) async fn finish(
     }
     queue_detached(repo, &txn, edits).await?;
     for (update, changed) in updates.iter().zip(&changes) {
-        if *changed {
-            txn.set_ref(&update.name, update.new.as_ref());
+        if !*changed {
+            continue;
+        }
+        match named.namespace {
+            Some(Namespace::Collection(id)) => txn.set_collection_ref(
+                &CollectionRef::new(id.as_str(), update.name.as_str()),
+                update.new.as_ref(),
+            ),
+            _ => txn.set_ref(&update.name, update.new.as_ref()),
         }
     }
     let summary = policy.regenerates_summary() && changes.contains(&true);
@@ -364,7 +391,7 @@ pub(super) async fn finish(
     drop(held);
     // The state of the checks is freed here, so it is not held while the
     // hook of the host runs.
-    drop((walks, targets, chains, tips, names, rules, states, changes));
+    drop((walks, targets, chains, tips, paths, rules, states, changes));
 
     let refs = updates
         .into_iter()
@@ -380,6 +407,10 @@ pub(super) async fn finish(
         stats,
         warnings,
         group: policy.group().map(str::to_owned),
+        collection: named
+            .namespace
+            .and_then(Namespace::collection)
+            .map(str::to_owned),
     };
     if let (Some(hooks), Some(carried)) = (hooks, carried)
         && let Err(mut message) = hooks.after_update(&report, carried).await
@@ -390,13 +421,14 @@ pub(super) async fn finish(
     Ok(report)
 }
 
-/// Checks the ref names of the updates against the refs of `Hello`.
+/// Checks the ref names of the updates against the refs of `Hello`, and
+/// returns the path under `refs/` of each update, in order.
 ///
 /// - Each ref name is valid.
 /// - No update writes a commit to a ref name of 64 lowercase hex characters.
 /// - The message holds one update at least.
 /// - Each update names a ref of `Hello`, once.
-fn check_names(named: &[String], updates: &[RefUpdate]) -> Checked<()> {
+fn check_names(named: &Named<'_>, updates: &[RefUpdate]) -> Checked<Vec<String>> {
     for update in updates {
         crate::validate_refspec(&update.name).map_err(|e| match e {
             Error::InvalidRefspec(_) => Failure::Wire(remote::Error::InvalidRef(format!(
@@ -417,15 +449,22 @@ fn check_names(named: &[String], updates: &[RefUpdate]) -> Checked<()> {
     if updates.is_empty() {
         return Err(protocol("the Commit message holds no ref update".into()));
     }
-    let named: HashSet<&str> = named.iter().map(String::as_str).collect();
+    let paths: HashMap<&str, &String> = named
+        .names
+        .iter()
+        .map(String::as_str)
+        .zip(named.paths)
+        .collect();
     let mut seen = HashSet::with_capacity(updates.len());
+    let mut found = Vec::with_capacity(updates.len());
     for update in updates {
-        if !named.contains(update.name.as_str()) {
+        let Some(&path) = paths.get(update.name.as_str()) else {
             return Err(protocol(format!(
                 "ref '{}' was not named in Hello",
                 update.name
             )));
-        }
+        };
+        found.push(path.clone());
         if !seen.insert(update.name.as_str()) {
             return Err(protocol(format!(
                 "ref '{}' is updated more than once",
@@ -433,7 +472,7 @@ fn check_names(named: &[String], updates: &[RefUpdate]) -> Checked<()> {
             )));
         }
     }
-    Ok(())
+    Ok(found)
 }
 
 /// Checks that the `CommitReply` of `updates` fits in a frame of
@@ -495,15 +534,16 @@ fn check_commit_meta_commits(
 
 /// Returns the rule of each update, in order.
 ///
-/// An update of the anchor ref of a repository with a collection id is
-/// `ref-denied`. Then `policy` gives the rule of each update, or its
-/// `ref-denied` refusal.
+/// In the local refs of a repository with a collection id, an update of the
+/// anchor ref is `ref-denied`. `local` is `true` for the local refs. Then
+/// `policy` gives the rule of each update, or its `ref-denied` refusal.
 fn select_rules<'a>(
     repo: &Repo,
     policy: &'a dyn SessionPolicy,
+    local: bool,
     updates: &[RefUpdate],
 ) -> Checked<Vec<UpdateRule<'a>>> {
-    let collection = repo.config().collection_id().is_some();
+    let collection = local && repo.config().collection_id().is_some();
     updates
         .iter()
         .map(|update| {
@@ -702,11 +742,22 @@ fn missing_objects(missing: Missing, what: &str) -> Failure {
 /// Checks the ref binding and the collection binding of each new commit.
 ///
 /// The `ostree.ref-binding` of each new commit lists each ref that the commit
-/// is the new value of, without the remote part of a remote ref. If the
-/// repository has a collection id, the `ostree.collection-binding` of each new
-/// commit is that id. A commit without the key passes.
-fn check_bindings(repo: &Repo, updates: &[RefUpdate], targets: &[Target]) -> Checked<()> {
-    let collection = repo.config().collection_id();
+/// is the new value of, without the remote part of a remote ref.
+///
+/// The `ostree.collection-binding` of each new commit is the id of
+/// `namespace`: the collection id of a collection namespace, or the collection
+/// id of the repository for the local refs. In the local refs of a repository
+/// with no collection id, a commit with the key fails. A one-way stream has no
+/// namespace: if the repository has a collection id, the binding is that id,
+/// and else the stream does not check the key. A commit without the key
+/// passes.
+fn check_bindings(
+    repo: &Repo,
+    namespace: Option<&Namespace>,
+    updates: &[RefUpdate],
+    targets: &[Target],
+) -> Checked<()> {
+    let own = repo.config().collection_id();
     for target in targets {
         let bindings = target.commit.ref_bindings();
         if !bindings.is_empty() {
@@ -721,13 +772,32 @@ fn check_bindings(repo: &Repo, updates: &[RefUpdate], targets: &[Target]) -> Che
                 }
             }
         }
-        if let (Some(id), Some(bound)) = (collection, target.commit.collection_binding())
-            && id != bound
-        {
-            return Err(Failure::Wire(remote::Error::BindingMismatch(format!(
-                "commit {} is bound to the collection '{bound}', not '{id}'",
-                target.checksum
-            ))));
+        let Some(bound) = target.commit.collection_binding() else {
+            continue;
+        };
+        let wanted = match namespace {
+            Some(Namespace::Collection(id)) => Some(id.as_str()),
+            Some(Namespace::Local) => own,
+            None => match own {
+                Some(id) => Some(id),
+                None => continue,
+            },
+        };
+        match wanted {
+            Some(id) if id == bound => {}
+            Some(id) => {
+                return Err(Failure::Wire(remote::Error::BindingMismatch(format!(
+                    "commit {} is bound to the collection '{bound}', not '{id}'",
+                    target.checksum
+                ))));
+            }
+            None => {
+                return Err(Failure::Wire(remote::Error::BindingMismatch(format!(
+                    "commit {} is bound to the collection '{bound}', and the session writes the \
+                     local refs of a repository with no collection id",
+                    target.checksum
+                ))));
+            }
         }
     }
     Ok(())
@@ -925,8 +995,10 @@ fn has_signature(dict: &Value) -> bool {
 ///
 /// In these cases no ref write can complete, so the check runs before any
 /// write goes into the queue.
+/// `paths` holds the path under `refs/` of each update, in order.
 fn check_ref_paths(
     updates: &[RefUpdate],
+    paths: &[String],
     states: &[RefFileState],
 ) -> Checked<Vec<Option<Checksum>>> {
     let mut current = Vec::with_capacity(updates.len());
@@ -948,13 +1020,12 @@ fn check_ref_paths(
             }
         });
     }
-    let mut written: HashMap<String, &str> = HashMap::new();
-    for update in updates.iter().filter(|u| u.new.is_some()) {
-        let relpath = refspec_to_relpath(&update.name).map_err(Failure::Internal)?;
+    let writes = || updates.iter().zip(paths).filter(|(u, _)| u.new.is_some());
+    let mut written: HashMap<&str, &str> = HashMap::new();
+    for (update, relpath) in writes() {
         written.insert(relpath, update.name.as_str());
     }
-    for update in updates.iter().filter(|u| u.new.is_some()) {
-        let relpath = refspec_to_relpath(&update.name).map_err(Failure::Internal)?;
+    for (update, relpath) in writes() {
         let mut path = relpath.as_str();
         while let Some((parent, _)) = path.rsplit_once('/') {
             if let Some(other) = written.get(parent) {

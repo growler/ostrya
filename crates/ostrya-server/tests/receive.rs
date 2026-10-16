@@ -275,6 +275,7 @@ fn hello() -> Message {
         version: 1,
         agent: None,
         refs: vec!["main".into()],
+        collection: None,
         one_way: false,
     })
 }
@@ -802,6 +803,7 @@ fn a_bad_hello_is_422_also_when_the_sessions_are_at_the_limit() {
             version: 1,
             agent: None,
             refs: vec!["a//b".into()],
+            collection: None,
             one_way: false,
         });
         let reply = client.post(SESSION, encode(&[bad]).await).await;
@@ -1604,10 +1606,12 @@ fn a_net_item_identifies_the_peer_address() {
     });
 }
 
-/// An item that no group of the local refs carries gets 403 at `session`:
-/// here the anonymous item of a group of each collection.
+/// An item that no group of the namespace of `Hello` carries gets 403 at
+/// `session`: here the anonymous item of a group of each collection in the
+/// local refs, and the anonymous item of a group of the local refs in a
+/// collection.
 #[test]
-fn an_item_with_no_group_of_the_local_refs_gets_403() {
+fn an_item_with_no_group_of_the_namespace_gets_403() {
     let tmp = TmpDir::new("no-group");
     let repo = receiver(tmp.path(), RepoMode::Archive, "");
     let opts = options_with(
@@ -1621,6 +1625,94 @@ fn an_item_with_no_group_of_the_local_refs_gets_403() {
             error.message,
             "no client group of the request covers the local refs"
         );
+    });
+    with_server(repo.clone(), options(&repo), |client, _| async move {
+        let hello = hello_in(&["main"], Some("org.example.Os"));
+        let reply = client.post(SESSION, encode(&[hello]).await).await;
+        let error = reply.error(403, ErrorCode::Unauthorized);
+        assert_eq!(
+            error.message,
+            "no client group of the request covers the collection 'org.example.Os'"
+        );
+    });
+    assert_released(&repo);
+}
+
+/// `Hello` with the refs `refs` in the collection `collection`.
+fn hello_in(refs: &[&str], collection: Option<&str>) -> Message {
+    Message::Hello(Hello {
+        version: 1,
+        agent: None,
+        refs: refs.iter().map(|r| (*r).to_owned()).collect(),
+        collection: collection.map(str::to_owned),
+        one_way: false,
+    })
+}
+
+/// The collection of `Hello` selects the group: a group that names the
+/// collection wins over a group with `collection=*`, which covers each other
+/// collection. The own collection id selects the group of the local refs.
+/// `HelloReply` reports the collection, and no collection for the local refs.
+/// A collection id that fails the rule is 422 with `invalid-ref`.
+#[test]
+fn the_collection_of_hello_selects_the_group() {
+    let tmp = TmpDir::new("namespace-groups");
+    let repo = receiver(
+        tmp.path(),
+        RepoMode::Archive,
+        "collection-id=org.example.C\n",
+    );
+    let opts = options_with(
+        &repo,
+        "[ex-ostrya client \"local\"]\nauth=anonymous\nallow=w:local/**\n\
+         [ex-ostrya client \"os\"]\nauth=anonymous\ncollection=org.example.Os\nallow=w:os/**\n\
+         [ex-ostrya client \"all\"]\nauth=anonymous\ncollection=*\nallow=w:main\n",
+    );
+    with_server(repo.clone(), opts, |client, _| async move {
+        for (refs, collection, reported) in [
+            (
+                &["os/x"][..],
+                Some("org.example.Os"),
+                Some("org.example.Os"),
+            ),
+            (
+                &["main"],
+                Some("org.example.Other"),
+                Some("org.example.Other"),
+            ),
+            (&["local/x"], Some("org.example.C"), None),
+            (&["local/x"], None, None),
+        ] {
+            let reply = client
+                .post(SESSION, encode(&[hello_in(refs, collection)]).await)
+                .await;
+            let Message::HelloReply(hello_reply) = reply.ok() else {
+                panic!("no HelloReply");
+            };
+            assert_eq!(
+                hello_reply.collection.as_deref(),
+                reported,
+                "{collection:?}"
+            );
+            let id = reply.headers["ostrya-session"].to_str().unwrap().to_owned();
+            assert_eq!(client.delete(&id).await.status, 204);
+        }
+        // The group of the exact id gives no right on `main`, and the group
+        // of `*` does not apply.
+        for (refs, collection) in [(&["main"][..], Some("org.example.Os")), (&["main"], None)] {
+            let reply = client
+                .post(SESSION, encode(&[hello_in(refs, collection)]).await)
+                .await;
+            reply.error(422, ErrorCode::RefDenied);
+        }
+        let reply = client
+            .post(
+                SESSION,
+                encode(&[hello_in(&["main"], Some("no-dot"))]).await,
+            )
+            .await;
+        let error = reply.error(422, ErrorCode::InvalidRef);
+        assert!(error.message.contains("collection id"), "{error:?}");
     });
     assert_released(&repo);
 }

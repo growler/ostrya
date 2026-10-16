@@ -462,7 +462,7 @@ impl Prepared {
             metadata: self.metadata,
             refs: &self.refs,
             no_bindings: self.no_bindings,
-            collection_id: server.collection_id.as_deref(),
+            collection_id: server.binding_collection(),
             root_dirtree: model.root_dirtree(),
             root_dirmeta: model.root_dirmeta(),
         })?;

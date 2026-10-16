@@ -16,6 +16,8 @@
 use std::collections::{BTreeMap, HashSet};
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+#[cfg(feature = "receive")]
+use std::sync::Arc;
 
 use ostrya_core::{Checksum, RefPattern, RefSelector, RepoMode};
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
@@ -373,20 +375,16 @@ impl Repo {
         }
     }
 
-    /// Returns the commits of several refspecs, each read as
-    /// [`resolve_ref_tip`](Repo::resolve_ref_tip) reads it, in one pass on the
-    /// blocking pool. The result holds one entry for each refspec, in order.
-    /// A ref path that names a directory, or that passes through a file,
-    /// holds no ref and reads as absent.
+    /// Returns the commits of the ref files at several paths under `refs/`,
+    /// each read as [`resolve_ref_tip`](Repo::resolve_ref_tip) reads a
+    /// refspec, in one pass on the blocking pool. The result holds one entry
+    /// for each path, in order. A ref path that names a directory, or that
+    /// passes through a file, holds no ref and reads as absent.
     #[cfg(feature = "receive")]
-    pub(crate) async fn resolve_ref_tips(
+    pub(crate) async fn resolve_relpath_tips(
         &self,
-        refspecs: &[String],
+        relpaths: Arc<[String]>,
     ) -> Result<Vec<Option<Checksum>>> {
-        let relpaths = refspecs
-            .iter()
-            .map(|r| refspec_to_relpath(r))
-            .collect::<Result<Vec<_>>>()?;
         let repo = self.clone();
         let contents = ostrya_rt::unblock(move || {
             relpaths
@@ -411,9 +409,9 @@ impl Repo {
             .collect()
     }
 
-    /// Returns the state of each of several refspecs, and the commit of `tip`,
-    /// in one pass on the blocking pool. The result holds one state for each
-    /// refspec, in order.
+    /// Returns the state of the ref file at each of several paths under
+    /// `refs/`, and the commit of the refspec `tip`, in one pass on the
+    /// blocking pool. The result holds one state for each path, in order.
     ///
     /// The call reads each ref path with `lstat` first. It then opens a
     /// regular file with `O_NOFOLLOW` and parses it. A ref that does not parse
@@ -427,13 +425,9 @@ impl Repo {
     #[allow(clippy::type_complexity)]
     pub(crate) async fn read_ref_states(
         &self,
-        refspecs: &[String],
+        relpaths: Arc<[String]>,
         tip: Option<&str>,
     ) -> Result<(Vec<RefFileState>, Option<Result<Option<Checksum>>>)> {
-        let relpaths = refspecs
-            .iter()
-            .map(|r| refspec_to_relpath(r))
-            .collect::<Result<Vec<_>>>()?;
         let tip = tip.map(refspec_to_relpath);
         let repo = self.clone();
         ostrya_rt::unblock(move || {
@@ -1632,6 +1626,13 @@ pub(crate) fn ref_prefixes(name: &str) -> impl Iterator<Item = &str> {
 // uses the wider `is_ref_component`: not empty, not `.` or `..`, no slash, no
 // NUL. `ostrya-core` holds the rule.
 pub(crate) use ostrya_core::{is_ref_component as is_component, is_ref_name as is_ref_path};
+
+/// The longest collection id, in bytes, that a push session names.
+///
+/// The id is one path component under `refs/mirrors/`, and a Linux file
+/// system takes a name of 255 bytes at most (`NAME_MAX`).
+#[cfg(any(feature = "push", feature = "receive"))]
+pub(crate) const MAX_COLLECTION_ID_LEN: usize = 255;
 
 /// Maps a collection ref to its path under `refs/`. A collection id puts the
 /// ref under `refs/mirrors/<collection>/`. A `None` id gives a local ref under

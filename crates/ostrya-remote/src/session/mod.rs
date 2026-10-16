@@ -285,6 +285,15 @@ pub struct ServerInfo {
     pub mode: String,
     /// The collection id of the repository.
     pub collection_id: Option<String>,
+    /// The collection of the namespace of the session, from the key
+    /// `collection` of `HelloReply`.
+    ///
+    /// `None` is the local refs of the server. The session checks the value
+    /// against [`SessionOptions::collection`] when it opens. With no
+    /// requested collection, the value is `None`. With a requested id, the
+    /// value is that id, or `None` if the id is
+    /// [`collection_id`](ServerInfo::collection_id).
+    pub collection: Option<String>,
     /// The frame and chunk limit that the session writes with.
     ///
     /// The value is in
@@ -301,6 +310,16 @@ pub struct ServerInfo {
 }
 
 impl ServerInfo {
+    /// Returns the collection id that a commit of the session binds to.
+    ///
+    /// The value is [`collection`](ServerInfo::collection) for a collection
+    /// namespace, and [`collection_id`](ServerInfo::collection_id) for the
+    /// local refs. `None` is the local refs of a server with no collection
+    /// id.
+    pub fn binding_collection(&self) -> Option<&str> {
+        self.collection.as_deref().or(self.collection_id.as_deref())
+    }
+
     /// Returns the current commit of the ref `name` on the server.
     ///
     /// Returns `None` if the ref is absent, or if the session did not name it.
@@ -319,6 +338,13 @@ pub struct SessionOptions {
     ///
     /// The default is `ostrya/<version>`.
     pub agent: Option<String>,
+    /// The collection id that the session sends in `Hello`, under the key
+    /// `collection`.
+    ///
+    /// `None` targets the local refs of the server. The collection id of the
+    /// server also targets its local refs. The session does not check the
+    /// id: the server refuses an id that fails the collection-id rule.
+    pub collection: Option<String>,
     /// A handle that the session also counts its progress into.
     pub progress: Option<PushProgress>,
 }
@@ -521,10 +547,18 @@ fn into_stream(slot: Mutex<Slot>) -> Result<Box<Stream>> {
     }
 }
 
-/// The facts of the server from `reply`, the reply to a `Hello` with `refs`.
-/// A reply whose version is not the version of the session, or whose refs
-/// are not `refs` in order, is [`Error::Protocol`].
-fn server_info(reply: HelloReply, refs: &[String]) -> Result<ServerInfo> {
+/// The facts of the server from `reply`, the reply to a `Hello` with `refs`
+/// and `collection`.
+///
+/// These replies are [`Error::Protocol`]:
+///
+/// - a version that is not the version of the session;
+/// - refs that are not `refs` in order;
+/// - a `collection` that does not match the request. A request with no
+///   collection needs a reply with none. A request of an id needs a reply of
+///   that id, or a reply with none from a server whose collection id is that
+///   id.
+fn server_info(reply: HelloReply, refs: &[String], collection: Option<&str>) -> Result<ServerInfo> {
     if reply.version != PROTOCOL_VERSION {
         return Err(protocol(format!(
             "the server replied with protocol version {}, not {PROTOCOL_VERSION}",
@@ -534,10 +568,25 @@ fn server_info(reply: HelloReply, refs: &[String]) -> Result<ServerInfo> {
     if reply.refs.len() != refs.len() || reply.refs.iter().zip(refs).any(|(s, n)| s.name != *n) {
         return Err(protocol("the refs of HelloReply are not the refs of Hello"));
     }
+    let matches = match (collection, reply.collection.as_deref()) {
+        (None, None) => true,
+        (Some(asked), Some(got)) => asked == got,
+        (Some(asked), None) => reply.collection_id.as_deref() == Some(asked),
+        (None, Some(_)) => false,
+    };
+    if !matches {
+        let text = |c: Option<&str>| c.map_or_else(|| "none".to_owned(), |id| format!("'{id}'"));
+        return Err(protocol(format!(
+            "the collection {} of HelloReply does not match the collection {} of Hello",
+            text(reply.collection.as_deref()),
+            text(collection)
+        )));
+    }
     Ok(ServerInfo {
         version: reply.version,
         mode: reply.mode,
         collection_id: reply.collection_id,
+        collection: reply.collection,
         max_frame: reply.max_frame,
         max_have: reply.max_have,
         encodings: reply.encodings,
@@ -568,6 +617,9 @@ impl PushSession {
     ///   code, for example [`Error::VersionUnsupported`].
     /// - [`Error::Protocol`] if the version of `HelloReply` is not the version
     ///   of the session, or if its refs are not the refs of `Hello` in order.
+    /// - [`Error::Protocol`] if the `collection` of `HelloReply` does not
+    ///   match [`SessionOptions::collection`]. [`ServerInfo::collection`]
+    ///   states the match.
     /// - [`Error::Protocol`] for a malformed frame, or for a reply that is not
     ///   `HelloReply`.
     /// - [`Error::LimitExceeded`] for a frame over the frame limit.
@@ -609,6 +661,7 @@ impl PushSession {
                 version: PROTOCOL_VERSION,
                 agent: Some(agent),
                 refs: refs.to_vec(),
+                collection: opts.collection.clone(),
                 one_way: false,
             }))
             .await?;
@@ -617,7 +670,7 @@ impl PushSession {
             Message::Error(e) => return Err(e.into()),
             other => return Err(unexpected(&other, "Hello")),
         };
-        let server = server_info(reply, refs)?;
+        let server = server_info(reply, refs, opts.collection.as_deref())?;
         stream.set_write_limit(server.max_frame);
         Ok(PushSession {
             inner: SessionInner {
@@ -644,7 +697,7 @@ impl PushSession {
         let agent = opts
             .agent
             .unwrap_or_else(|| format!("ostrya/{}", env!("CARGO_PKG_VERSION")));
-        let (server, link) = http::open(endpoint, refs, agent, &counters).await?;
+        let (server, link) = http::open(endpoint, refs, agent, opts.collection, &counters).await?;
         Ok(PushSession {
             inner: SessionInner {
                 server,

@@ -16,10 +16,14 @@ use ostrya_core::{
 use super::hooks::ReceiveHooks;
 use super::ingest::{self, Counted, ModeRules, limit_exceeded};
 use super::merge::check_incoming;
-use super::policy::SessionPolicy;
+use super::policy::{SessionPolicy, namespace_text};
 use super::session::{Failure, ReceiveReport, aborted, codec, next, out_of_order};
+use crate::access::Namespace;
 use crate::error::{Error, Result};
 use crate::object::{MAX_METADATA_SIZE, object_exists};
+use crate::refs::{
+    CollectionRef, MAX_COLLECTION_ID_LEN, collection_ref_to_relpath, refspec_to_relpath,
+};
 use crate::remote::proto::{
     CommitRequest, FrameReader, HaveReply, Hello, HelloReply, MAX_FRAME, MAX_HAVE, Message,
     ObjectHeader, ObjectsReply, PROTOCOL_VERSION, RefState,
@@ -41,6 +45,11 @@ pub(super) struct SessionCore<P: Deref<Target: SessionPolicy + Sized>> {
     rules: ModeRules,
     /// The refs that `Hello` named.
     named: Vec<String>,
+    /// The namespace of the session, or `None` for a one-way stream.
+    namespace: Option<Namespace>,
+    /// The path under `refs/` of each ref of `named`, in the order of
+    /// `named`.
+    paths: Arc<[String]>,
     /// `true` if the session reads a one-way stream.
     one_way: bool,
     /// The hooks of the session, which `Commit` calls.
@@ -72,7 +81,9 @@ impl<P: Deref<Target: SessionPolicy + Sized>> SessionCore<P> {
     /// Answers the `Hello` of a two-way session and opens the session
     /// transaction.
     ///
-    /// The answer checks the version, the repository, and the ref names.
+    /// The answer checks the version, the repository, the ref names, and
+    /// the collection id. `select` gives the policy of the namespace of
+    /// `Hello`, or `None`, which is a `ref-denied` failure.
     /// `parallel_uploads` is the value that the reply announces. `hooks` are
     /// the hooks that `Commit` calls.
     ///
@@ -80,7 +91,7 @@ impl<P: Deref<Target: SessionPolicy + Sized>> SessionCore<P> {
     /// `one-way` set to `true` gives a `protocol` failure.
     pub(super) async fn open(
         repo: Repo,
-        policy: P,
+        select: impl FnOnce(&Namespace) -> Option<P>,
         hooks: Option<Arc<dyn ReceiveHooks>>,
         parallel_uploads: u32,
         hello: Hello,
@@ -92,10 +103,18 @@ impl<P: Deref<Target: SessionPolicy + Sized>> SessionCore<P> {
                     .into(),
             )));
         }
-        let core = Self::start(repo, policy, hooks, hello, false).await?;
+        check_hello(&repo, &hello)?;
+        let namespace = namespace(&repo, &hello);
+        let Some(policy) = select(&namespace) else {
+            return Err(Failure::Wire(remote::Error::RefDenied(format!(
+                "no client group of the session covers {}",
+                namespace_text(&namespace)
+            ))));
+        };
+        let core = Self::start(repo, policy, hooks, hello, Some(namespace)).await?;
         let repo = &core.repo;
         let tips = repo
-            .resolve_ref_tips(&core.named)
+            .resolve_relpath_tips(Arc::clone(&core.paths))
             .await
             .map_err(Failure::Internal)?;
         let refs = core
@@ -105,7 +124,7 @@ impl<P: Deref<Target: SessionPolicy + Sized>> SessionCore<P> {
             .zip(tips)
             .map(|(name, commit)| RefState { name, commit })
             .collect();
-        let reply = hello_reply(repo, parallel_uploads, refs);
+        let reply = hello_reply(repo, parallel_uploads, core.namespace.as_ref(), refs);
         Ok((core, reply))
     }
 
@@ -117,7 +136,8 @@ impl<P: Deref<Target: SessionPolicy + Sized>> SessionCore<P> {
     /// stream gets no reply.
     ///
     /// The session checks `one-way` before the version. A `Hello` without
-    /// `one-way` set to `true` gives a `protocol` failure.
+    /// `one-way` set to `true`, and a `Hello` that names a collection, give a
+    /// `protocol` failure.
     pub(super) async fn open_one_way(
         repo: Repo,
         policy: P,
@@ -128,26 +148,37 @@ impl<P: Deref<Target: SessionPolicy + Sized>> SessionCore<P> {
                 "a one-way stream starts with a Hello with one-way true".into(),
             )));
         }
-        Self::start(repo, policy, None, hello, true).await
+        if hello.collection.is_some() {
+            return Err(Failure::Wire(remote::Error::Protocol(
+                "a one-way stream names no collection in Hello".into(),
+            )));
+        }
+        check_hello(&repo, &hello)?;
+        Self::start(repo, policy, None, hello, None).await
     }
 
-    /// Runs the checks of [`check_hello`] on `hello`, then the checks of the
-    /// policy, and opens the session transaction.
+    /// Runs the checks of the policy on `hello`, and opens the session
+    /// transaction. The caller ran [`check_hello`].
     ///
-    /// The checks of the policy of a client group refuse a policy that opens
-    /// no push session, and a ref of `hello` without `r`, with `ref-denied`.
-    /// A one-way stream has no such check. If the repository mode is `bare`
-    /// and the server does not run as root, the result is a `mode-refused`
-    /// failure.
+    /// The checks of the policy of a client group refuse a namespace that
+    /// the policy does not cover, a policy that opens no push session, and a
+    /// ref of `hello` without `r`, with `ref-denied`. A one-way stream has no
+    /// namespace and no such check. If the repository mode is `bare` and the
+    /// server does not run as root, the result is a `mode-refused` failure.
     async fn start(
         repo: Repo,
         policy: P,
         hooks: Option<Arc<dyn ReceiveHooks>>,
         hello: Hello,
-        one_way: bool,
+        namespace: Option<Namespace>,
     ) -> std::result::Result<Self, Failure> {
-        check_hello(&repo, &hello)?;
-        policy.check_hello(&hello.refs)?;
+        policy.check_hello(namespace.as_ref().unwrap_or(&Namespace::Local), &hello.refs)?;
+        let paths = hello
+            .refs
+            .iter()
+            .map(|name| ref_path(namespace.as_ref(), name))
+            .collect::<Result<Arc<[String]>>>()
+            .map_err(Failure::Internal)?;
         let mode = repo.mode();
         let txn = repo.transaction().await.map_err(Failure::Internal)?;
         // Read the settings that the writes of the session use. A malformed
@@ -175,7 +206,9 @@ impl<P: Deref<Target: SessionPolicy + Sized>> SessionCore<P> {
             txn,
             rules,
             named: hello.refs,
-            one_way,
+            one_way: namespace.is_none(),
+            namespace,
+            paths,
             hooks,
             meta: Mutex::default(),
             reading: AtomicU64::new(0),
@@ -412,13 +445,42 @@ impl<P: Deref<Target: SessionPolicy + Sized>> SessionCore<P> {
             policy,
             txn,
             named,
+            namespace,
+            paths,
             hooks,
             meta,
             ..
         } = self;
         let dicts = meta.into_inner().expect("detached metadata mutex").dicts;
         let hooks = hooks.as_deref();
-        super::finish::finish(&repo, &*policy, hooks, txn, &named, dicts, request).await
+        let session = super::finish::Named {
+            namespace: namespace.as_ref(),
+            names: &named,
+            paths: &paths,
+        };
+        super::finish::finish(&repo, &*policy, hooks, txn, session, dicts, request).await
+    }
+}
+
+/// Returns the namespace that `hello` names in `repo`.
+///
+/// No collection and the collection id of `repo` give the local refs.
+fn namespace(repo: &Repo, hello: &Hello) -> Namespace {
+    Namespace::of(hello.collection.as_deref(), repo.config().collection_id())
+}
+
+/// Returns the path under `refs/` of the ref `name` of `namespace`.
+///
+/// A one-way stream has no namespace, and its names are refspecs, so a
+/// remote ref `REMOTE:NAME` maps to `refs/remotes/`. In the local namespace,
+/// `name` maps to `refs/heads/NAME`. In a collection namespace, it maps to
+/// `refs/mirrors/ID/NAME`.
+fn ref_path(namespace: Option<&Namespace>, name: &str) -> Result<String> {
+    match namespace {
+        None | Some(Namespace::Local) => refspec_to_relpath(name),
+        Some(Namespace::Collection(id)) => {
+            collection_ref_to_relpath(&CollectionRef::new(id.as_str(), name))
+        }
     }
 }
 
@@ -430,7 +492,9 @@ impl<P: Deref<Target: SessionPolicy + Sized>> SessionCore<P> {
 /// 2. The repository mode `bare-split-xattrs`.
 /// 3. `[core] locking=false`, for a two-way `Hello`.
 /// 4. Each ref name.
-/// 5. The size of the longest `HelloReply`, for a two-way `Hello`.
+/// 5. The collection id: an id longer than [`MAX_COLLECTION_ID_LEN`] bytes,
+///    or one that fails the collection-id rule, is `invalid-ref`.
+/// 6. The size of the longest `HelloReply`, for a two-way `Hello`.
 ///
 /// No check does I/O.
 pub(super) fn check_hello(repo: &Repo, hello: &Hello) -> std::result::Result<(), Failure> {
@@ -458,20 +522,41 @@ pub(super) fn check_hello(repo: &Repo, hello: &Hello) -> std::result::Result<(),
             other => Failure::Internal(other),
         })?;
     }
+    if let Some(id) = &hello.collection {
+        if id.len() > MAX_COLLECTION_ID_LEN {
+            return Err(Failure::Wire(remote::Error::InvalidRef(format!(
+                "the collection id of {} bytes is longer than {MAX_COLLECTION_ID_LEN} bytes",
+                id.len()
+            ))));
+        }
+        if !ostrya_core::is_collection_id(id) {
+            return Err(Failure::Wire(remote::Error::InvalidRef(format!(
+                "invalid collection id '{id}'"
+            ))));
+        }
+    }
     if !hello.one_way {
-        check_hello_reply_fits(repo, &hello.refs)?;
+        check_hello_reply_fits(repo, &namespace(repo, hello), &hello.refs)?;
     }
     Ok(())
 }
 
 /// Returns the `HelloReply` of `repo` for the ref states `refs`.
 ///
-/// `parallel_uploads` is the value that the reply announces.
-fn hello_reply(repo: &Repo, parallel_uploads: u32, refs: Vec<RefState>) -> HelloReply {
+/// `parallel_uploads` is the value that the reply announces. The reply
+/// reports the collection of `namespace`, and no collection for the local
+/// refs.
+fn hello_reply(
+    repo: &Repo,
+    parallel_uploads: u32,
+    namespace: Option<&Namespace>,
+    refs: Vec<RefState>,
+) -> HelloReply {
     HelloReply {
         version: PROTOCOL_VERSION,
         mode: repo.mode().as_mode_str().into(),
         collection_id: repo.config().collection_id().map(Into::into),
+        collection: namespace.and_then(Namespace::collection).map(Into::into),
         max_frame: MAX_FRAME,
         max_have: MAX_HAVE,
         encodings: vec![Encoding::Raw, Encoding::Deflate],
@@ -480,17 +565,22 @@ fn hello_reply(repo: &Repo, parallel_uploads: u32, refs: Vec<RefState>) -> Hello
     }
 }
 
-/// Checks that the `HelloReply` for `names` fits in a frame of [`MAX_FRAME`].
+/// Checks that the `HelloReply` for `names` in `namespace` fits in a frame
+/// of [`MAX_FRAME`].
 ///
 /// The check uses a commit for each ref, which is the longest state that a
 /// ref can have. A reply over the limit gives a `limit-exceeded` failure.
 /// The size comes from the reply with no ref and from the length of each
 /// name. The check builds no reply with the refs.
-fn check_hello_reply_fits(repo: &Repo, names: &[String]) -> std::result::Result<(), Failure> {
+fn check_hello_reply_fits(
+    repo: &Repo,
+    namespace: &Namespace,
+    names: &[String],
+) -> std::result::Result<(), Failure> {
     // If the codec refuses the reply, the failure is a fault of the server,
     // whatever code the codec gives it. The value of `parallel_uploads` does
     // not change the size of the reply.
-    let empty = Message::HelloReply(hello_reply(repo, 1, Vec::new()))
+    let empty = Message::HelloReply(hello_reply(repo, 1, Some(namespace), Vec::new()))
         .encode_body()
         .map_err(|e| Failure::Wire(remote::Error::Internal(e.to_string())))?;
     let fits = reply_frame_len(empty.len(), names.iter().map(String::len))
@@ -603,15 +693,17 @@ mod tests {
 
     /// Returns a `HelloReply` like the one of a session.
     ///
-    /// The reply has a collection id of `collection_id` bytes, or no
-    /// collection id for 0. It has `count` refs with names of `name` bytes,
-    /// each with a commit.
-    fn reply(collection_id: usize, name: usize, count: usize) -> HelloReply {
+    /// The reply has a collection id of `ids.0` bytes and a collection of
+    /// the namespace of `ids.1` bytes, each absent for 0. It has `count`
+    /// refs with names of `name` bytes, each with a commit.
+    fn reply(ids: (usize, usize), name: usize, count: usize) -> HelloReply {
         let commit = Some(Checksum::from_bytes([7; 32]));
+        let id = |len: usize| (len > 0).then(|| "c".repeat(len));
         HelloReply {
             version: PROTOCOL_VERSION,
             mode: RepoMode::Archive.as_mode_str().into(),
-            collection_id: (collection_id > 0).then(|| "c".repeat(collection_id)),
+            collection_id: id(ids.0),
+            collection: id(ids.1),
             max_frame: MAX_FRAME,
             max_have: MAX_HAVE,
             encodings: vec![Encoding::Raw, Encoding::Deflate],
@@ -629,25 +721,24 @@ mod tests {
         Message::HelloReply(reply).encode_body().unwrap().len() as u64 + 1
     }
 
-    fn computed_frame_len(collection_id: usize, name: usize, count: usize) -> Option<u64> {
-        let empty = Message::HelloReply(reply(collection_id, 0, 0))
-            .encode_body()
-            .unwrap();
+    fn computed_frame_len(ids: (usize, usize), name: usize, count: usize) -> Option<u64> {
+        let empty = Message::HelloReply(reply(ids, 0, 0)).encode_body().unwrap();
         reply_frame_len(empty.len(), std::iter::repeat_n(name, count))
     }
 
     /// The computed frame length is the length of the frame that the encoder
     /// writes. The test covers each size of the framing offsets of a ref
-    /// state, of the array, and of the reply.
+    /// state, of the array, and of the reply. The collection of the namespace
+    /// is in the reply with no ref, so the bound holds it too.
     #[test]
     fn the_reply_bound_is_the_encoded_size() {
-        for collection_id in [0, 300] {
+        for ids in [(0, 0), (300, 0), (0, 300), (300, 300)] {
             for name in [0, 1, 220, 221, 300] {
                 for count in [0, 1, 2, 7, 8, 9, 1000] {
                     assert_eq!(
-                        computed_frame_len(collection_id, name, count),
-                        Some(encoded_frame_len(reply(collection_id, name, count))),
-                        "collection id {collection_id}, name {name}, count {count}"
+                        computed_frame_len(ids, name, count),
+                        Some(encoded_frame_len(reply(ids, name, count))),
+                        "ids {ids:?}, name {name}, count {count}"
                     );
                 }
             }
@@ -659,10 +750,8 @@ mod tests {
     #[test]
     fn the_largest_count_that_fits_is_the_limit_of_the_encoder() {
         let limit = u64::from(MAX_FRAME);
-        for (collection_id, name) in [(0, 220), (300, 1)] {
-            let fits = |count| {
-                computed_frame_len(collection_id, name, count).is_some_and(|len| len <= limit)
-            };
+        for (ids, name) in [((0, 0), 220), ((300, 0), 1), ((300, 300), 1)] {
+            let fits = |count| computed_frame_len(ids, name, count).is_some_and(|len| len <= limit);
             // The largest count that fits, by bisection: `low` fits, and
             // `high` does not.
             let (mut low, mut high) = (0, MAX_FRAME as usize);
@@ -675,8 +764,8 @@ mod tests {
                 }
             }
             let count = low;
-            assert!(encoded_frame_len(reply(collection_id, name, count)) <= limit);
-            assert!(encoded_frame_len(reply(collection_id, name, count + 1)) > limit);
+            assert!(encoded_frame_len(reply(ids, name, count)) <= limit);
+            assert!(encoded_frame_len(reply(ids, name, count + 1)) > limit);
         }
     }
 
@@ -684,7 +773,9 @@ mod tests {
     /// limit, and returns `None`.
     #[test]
     fn the_reply_bound_stops_past_the_frame_limit() {
-        let empty = Message::HelloReply(reply(0, 0, 0)).encode_body().unwrap();
+        let empty = Message::HelloReply(reply((0, 0), 0, 0))
+            .encode_body()
+            .unwrap();
         let mut taken = 0usize;
         let names = std::iter::repeat_n(1000, usize::MAX).inspect(|_| taken += 1);
         assert_eq!(reply_frame_len(empty.len(), names), None);

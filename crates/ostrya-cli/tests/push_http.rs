@@ -1676,6 +1676,57 @@ mod cli {
         assert!(!server.join("refs/heads/main").exists());
     }
 
+    /// A commit bound to a collection opens the session in that collection,
+    /// and the group of the collection writes `refs/mirrors/ID/NAME`. A
+    /// collection that no group covers gets 403 with the namespace in the
+    /// message.
+    #[test]
+    fn a_collection_push_over_http_takes_the_group_of_the_collection() {
+        let setup = Setup::new("cli-collection");
+        let src = tree(setup.tmp.path(), "tree", 2, 100);
+        let client = setup.init("client", "archive");
+        let config = client.join("config");
+        let text = std::fs::read_to_string(&config).unwrap();
+        let text = text.replacen("[core]\n", "[core]\ncollection-id=org.example.Os\n", 1);
+        std::fs::write(&config, text).unwrap();
+        let commit_to = |branch: &str, extra: &[&str]| {
+            let repo = format!("--repo={}", client.display());
+            let mut args = vec![repo.as_str(), "commit", "-b", branch, "-s", "subject"];
+            args.extend_from_slice(extra);
+            args.push(src.to_str().unwrap());
+            ok("ostrya", &args).trim().to_owned()
+        };
+        let commit = commit_to("main", &[]);
+        commit_to("plain", &["--no-bindings"]);
+        let server = setup.init("server", "archive");
+        add_config(
+            &server,
+            "[ex-ostrya client \"os\"]\nauth=anonymous\ncollection=org.example.Os\nallow=w:**\n",
+        );
+        let serving = Serving::start(&server, &[]);
+
+        let out = push_from(&client, &[&serving.url, "main"]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(stdout(&out), format!("main (new) {commit}\n"));
+        assert_eq!(
+            std::fs::read_to_string(server.join("refs/mirrors/org.example.Os/main")).unwrap(),
+            format!("{commit}\n")
+        );
+        assert!(!server.join("refs/heads/main").exists());
+
+        let out = push_from(
+            &client,
+            &[&serving.url, "--collection=org.example.Other", "plain"],
+        );
+        assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+        assert_eq!(stdout(&out), "");
+        assert_eq!(
+            stderr(&out),
+            "error: unauthorized: no client group of the request covers the collection \
+             'org.example.Other'\n"
+        );
+    }
+
     /// The push checks the remote and makes the transport ready before its
     /// own local work. `ostrya push` refuses an HTTP option that is not
     /// valid before it reads a refspec. `ostrya push-tree` refuses an option

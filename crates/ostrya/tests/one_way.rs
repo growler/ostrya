@@ -142,6 +142,7 @@ impl Stream {
             version: 1,
             agent: None,
             refs: refs.iter().map(|r| r.to_string()).collect(),
+            collection: None,
             one_way,
         }));
         stream
@@ -409,8 +410,23 @@ fn messages_out_of_place_are_protocol() {
             version: 2,
             agent: None,
             refs: vec!["test/main".into()],
+            collection: None,
             one_way: false,
         }));
+        s.bytes()
+    }));
+    cases.push(("a one-way Hello with a collection", {
+        let mut s = Stream {
+            writer: FrameWriter::new(Recorder::default()),
+        };
+        s.message(&Message::Hello(Hello {
+            version: 1,
+            agent: None,
+            refs: vec!["test/main".into(), "origin:test/main".into()],
+            collection: Some("org.example.Os".into()),
+            one_way: true,
+        }));
+        s.objects(&objects).commit(updates());
         s.bytes()
     }));
     cases.push(("a first frame that is not Hello", {
@@ -437,6 +453,7 @@ fn messages_out_of_place_are_protocol() {
             version: 1,
             agent: None,
             refs: vec![],
+            collection: None,
             one_way: true,
         }));
         s.commit(updates());
@@ -685,6 +702,7 @@ fn the_two_way_receiver_refuses_a_one_way_hello() {
         version: 2,
         agent: None,
         refs: vec!["test/main".into()],
+        collection: None,
         one_way: true,
     };
     let tmp = TmpDir::new("one-way-two-way");

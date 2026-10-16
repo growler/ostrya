@@ -9,6 +9,7 @@ use ostrya_core::ObjectName;
 
 use super::ReceivePolicy;
 use super::core::SessionCore;
+use crate::access::Namespace;
 use crate::error::{Error, Result};
 use crate::remote::proto::{CommitRequest, FrameReader, FrameWriter, Hello, Message, ObjectHeader};
 use crate::remote::{self, RefOutcome};
@@ -35,6 +36,11 @@ pub struct ReceiveReport {
     /// [`ReceivePolicy::group`]. A one-way stream has no client group, so
     /// its report has `None`.
     pub group: Option<String>,
+    /// The collection of the namespace of the session.
+    ///
+    /// `None` is the local refs. A one-way stream writes no collection ref,
+    /// so its report has `None`.
+    pub collection: Option<String>,
 }
 
 /// A failure of one step after the transaction commit of a session.
@@ -122,6 +128,10 @@ impl Repo {
     /// `protocol`. After the transaction commit, the call returns a
     /// [`ReceiveReport`]. The call does not close `output`.
     ///
+    /// The session runs under `policy` in each namespace. The call is
+    /// [`receive_selected`](Repo::receive_selected) with a selection that
+    /// gives `policy`.
+    ///
     /// # Hello
     ///
     /// A `Hello` with `one-way` true is `protocol`. It opens a one-way stream,
@@ -130,6 +140,10 @@ impl Repo {
     /// that it states. Then it runs the checks of `policy`, which are
     /// `ref-denied`:
     ///
+    /// - The [scope](super::ReceivePolicy::scope) of the policy does not
+    ///   cover the namespace of `Hello`. `Hello` names the namespace with its
+    ///   collection id. No collection, and the collection id of the
+    ///   repository, name the local refs.
     /// - The policy opens no push session: no allow item has `w`, `c`, `t`,
     ///   or `d`.
     /// - A ref of `Hello` is a remote ref `REMOTE:NAME`.
@@ -137,6 +151,11 @@ impl Repo {
     ///   [rights](super::ReceivePolicy::rights) of the policy.
     ///
     /// All these checks run before the transaction opens.
+    ///
+    /// The session reads and writes the refs of its namespace: the local refs
+    /// under `refs/heads/`, or the refs of a collection under
+    /// `refs/mirrors/ID/`. `HelloReply` reports the collection of a
+    /// collection namespace, and no collection for the local refs.
     ///
     /// After the checks, the session opens a transaction. The transaction
     /// holds the repository lock shared until the session ends with no
@@ -171,12 +190,14 @@ impl Repo {
     /// 3. Each detached metadata object belongs to a commit of the session
     ///    (`protocol`).
     /// 4. The rights of each update (`ref-denied`): an update that writes a
-    ///    commit needs `w` or `t`. An update of `ostree-metadata` in a
-    ///    repository with a collection id is refused.
+    ///    commit needs `w` or `t`. An update of `ostree-metadata` in the local
+    ///    refs of a repository with a collection id is refused.
     /// 5. Each new commit, and the tree of each commit of the session, is
     ///    complete (`missing-objects`).
     /// 6. The ref binding and the collection binding of each new commit
-    ///    (`binding-mismatch`).
+    ///    (`binding-mismatch`). The collection binding must be the collection
+    ///    of the namespace, or the collection id of the repository for the
+    ///    local refs. A commit with no collection binding passes.
     /// 7. The signature verification of the policy (`signature-required`).
     ///
     /// [`ReceiveService::commit`](super::ReceiveService::commit) runs the same
@@ -325,15 +346,44 @@ impl Repo {
         R: AsyncRead + Unpin + Send,
         W: AsyncWrite + Unpin + Send,
     {
+        self.receive_selected(input, output, |_| Some(policy)).await
+    }
+
+    /// Runs one push session as [`receive`](Repo::receive) does, under the
+    /// policy that `select` gives for the namespace of `Hello`.
+    ///
+    /// The session calls `select` once, after the checks of
+    /// [`check_hello`](super::ReceiveService::check_hello) and before the
+    /// checks of the policy. `Hello` names the namespace with its collection
+    /// id. No collection, and the collection id of the repository, give
+    /// [`Namespace::Local`]. Each other id gives [`Namespace::Collection`].
+    /// A host selects the policy of the client group of the client in that
+    /// namespace, as [`ReceivePolicies::select`](super::ReceivePolicies::select)
+    /// does.
+    ///
+    /// # Errors
+    ///
+    /// - [`remote::Error::RefDenied`] if `select` gives `None`.
+    /// - Each error of [`receive`](Repo::receive).
+    pub async fn receive_selected<'p, R, W, S>(
+        &self,
+        input: R,
+        output: W,
+        select: S,
+    ) -> Result<ReceiveReport>
+    where
+        R: AsyncRead + Unpin + Send,
+        W: AsyncWrite + Unpin + Send,
+        S: FnOnce(&Namespace) -> Option<&'p ReceivePolicy> + Send,
+    {
         let mut session = Session {
             repo: self,
-            policy,
             reader: FrameReader::new(BufReader::with_capacity(STREAM_BUFFER, input)),
             writer: FrameWriter::new(BufWriter::with_capacity(STREAM_BUFFER, output)),
             core: None,
             buf: Vec::new(),
         };
-        let failure = match session.run().await {
+        let failure = match session.run(select).await {
             Ok(report) => return Ok(report),
             Err(failure) => failure,
         };
@@ -356,26 +406,29 @@ impl Repo {
     }
 }
 
-struct Session<'a, R, W> {
+struct Session<'a, 'p, R, W> {
     repo: &'a Repo,
-    policy: &'a ReceivePolicy,
     reader: FrameReader<BufReader<R>>,
     writer: FrameWriter<BufWriter<W>>,
     /// The session, open from `Hello` on.
-    core: Option<SessionCore<&'a ReceivePolicy>>,
+    core: Option<SessionCore<&'p ReceivePolicy>>,
     /// The chunk buffer of the object stream, shared by every object.
     buf: Vec<u8>,
 }
 
-impl<R, W> Session<'_, R, W>
+impl<'p, R, W> Session<'_, 'p, R, W>
 where
     R: AsyncRead + Unpin + Send,
     W: AsyncWrite + Unpin + Send,
 {
-    /// Runs the session until it commits or fails.
-    async fn run(&mut self) -> std::result::Result<ReceiveReport, Failure> {
+    /// Runs the session until it commits or fails. `select` gives the policy
+    /// of the namespace of `Hello`.
+    async fn run(
+        &mut self,
+        select: impl FnOnce(&Namespace) -> Option<&'p ReceivePolicy>,
+    ) -> std::result::Result<ReceiveReport, Failure> {
         match next(&mut self.reader).await? {
-            Message::Hello(hello) => self.hello(hello).await?,
+            Message::Hello(hello) => self.hello(hello, select).await?,
             other => return Err(out_of_order(&other)),
         }
         loop {
@@ -420,9 +473,12 @@ where
         self.core.as_ref().expect("the session is open after Hello")
     }
 
-    async fn hello(&mut self, hello: Hello) -> std::result::Result<(), Failure> {
-        let (core, reply) =
-            SessionCore::open(self.repo.clone(), self.policy, None, 1, hello).await?;
+    async fn hello(
+        &mut self,
+        hello: Hello,
+        select: impl FnOnce(&Namespace) -> Option<&'p ReceivePolicy>,
+    ) -> std::result::Result<(), Failure> {
+        let (core, reply) = SessionCore::open(self.repo.clone(), select, None, 1, hello).await?;
         self.core = Some(core);
         self.reply(&Message::HelloReply(reply)).await
     }
@@ -471,5 +527,13 @@ const _: fn() = || {
     fn assert_send<T: Send>(_: T) {}
     let _ = |repo: &Repo, policy: &ReceivePolicy| {
         assert_send(repo.receive(futures_lite::io::empty(), futures_lite::io::sink(), policy))
+    };
+    let _ = |repo: &Repo, policy: &ReceivePolicy| {
+        let select = move |_: &Namespace| Some(policy);
+        assert_send(repo.receive_selected(
+            futures_lite::io::empty(),
+            futures_lite::io::sink(),
+            select,
+        ))
     };
 };

@@ -39,6 +39,7 @@ fn hello(refs: &[&str]) -> Hello {
         version: 1,
         agent: None,
         refs: refs.iter().map(|r| r.to_string()).collect(),
+        collection: None,
         one_way: false,
     }
 }
@@ -328,6 +329,24 @@ fn check_hello_runs_its_checks_in_order() {
     let repo = new_repo(&tmp, RepoMode::Bare, "");
     check(&repo, &hello(&["main"])).unwrap();
     assert!(staging_entries(repo.path()).is_empty());
+}
+
+/// A collection id is one name under `refs/mirrors/`, so `check_hello`
+/// takes an id of 255 bytes and refuses an id of 256 bytes with
+/// `invalid-ref`.
+#[test]
+fn a_collection_id_over_255_bytes_is_invalid_ref() {
+    let tmp = TmpDir::new("svc-check-long-collection");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    let with_id = |len: usize| Hello {
+        collection: Some(format!("org.{}", "a".repeat(len - 4))),
+        ..hello(&["main"])
+    };
+    ReceiveService::check_hello(&repo, &with_id(255)).unwrap();
+    let refused = ReceiveService::check_hello(&repo, &with_id(256));
+    assert_eq!(code(&refused), Some(ErrorCode::InvalidRef), "{refused:?}");
+    let message = refused.unwrap_err().to_string();
+    assert!(message.contains("256 bytes"), "{message}");
 }
 
 /// Two concurrent streams carry the objects of the fixture commit. The

@@ -119,7 +119,12 @@ pub trait ReceiveAuth: Send + Sync + 'static {
     /// The setup holds the receive policy and the hooks of the session. The
     /// endpoint calls `open` in the [call order](ReceiveAuth#call-order),
     /// after the checks of `Hello` and after it reserves a session slot.
-    /// Because of these checks, `hello` holds valid ref names alone.
+    /// Because of these checks, `hello` holds valid ref names alone. Its
+    /// collection id, if present, is valid too.
+    ///
+    /// The scope of the returned [`ReceivePolicy`](ostrya::ReceivePolicy)
+    /// must cover the namespace of `hello`. Otherwise the session refuses
+    /// the policy with 422 and `ref-denied`.
     ///
     /// Each `open` call holds a slot, so the session limit also limits the
     /// count of `open` calls that run at one time.

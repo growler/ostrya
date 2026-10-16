@@ -176,6 +176,7 @@ fn hello(refs: &[&str]) -> Hello {
         version: 1,
         agent: None,
         refs: refs.iter().map(|r| r.to_string()).collect(),
+        collection: None,
         one_way: false,
     }
 }

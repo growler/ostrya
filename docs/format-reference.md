@@ -2697,6 +2697,9 @@ A session refuses a kind of the other protocol with `protocol`.
 The dict holds these keys:
 
 - `agent` (`s`, optional): the name and the version of the client.
+- `collection` (`s`, optional): the collection id of the namespace that the
+  session writes. Without the key, the session writes the local refs. A
+  writer puts the key in the dict only when it names a collection.
 - `one-way` (`b`, optional): true for a one-way stream. A writer puts the key
   in the dict only when its value is true.
 
@@ -2706,6 +2709,8 @@ absent ref. The dict holds these keys:
 
 - `mode` (`s`, required): the mode of the repository.
 - `collection-id` (`s`, optional): the collection id of the repository.
+- `collection` (`s`, optional): the collection of the namespace that the
+  server selected for the session. The key is absent for the local refs.
 - `max-frame` (`u`, required): the frame limit ("Frame limits").
 - `max-have` (`u`, required): the most entries of one `Have`.
 - `encodings` (`as`, required): the encodings that the server accepts.
@@ -2715,6 +2720,12 @@ absent ref. The dict holds these keys:
 A `HelloReply` with no value for a required key is `protocol`. A `max-have` or
 a `parallel-uploads` of 0 is `protocol`. A client drops an encoding name that
 it does not know.
+
+A client refuses a `HelloReply` whose `collection` does not agree with its
+`Hello`, with `protocol`. A `Hello` with no `collection` needs a reply with
+no `collection`. A `Hello` with the collection `ID` needs a reply with the
+`collection` `ID`, or a reply with no `collection` and the `collection-id`
+`ID`.
 
 `Have` is a list of object names: the object type (1 to 4) and the checksum.
 Another type is `protocol`. `HaveReply` is a bitmap with one bit for each entry
@@ -2807,14 +2818,18 @@ give the condition of each refusal.
   ref, and the client group or the request does not allow it.
 - `delete-denied` -- the client group has no `d` on a ref that an update
   deletes.
-- `invalid-ref` -- the server refuses a ref name.
-- `ref-denied` -- the client group opens no push session, a ref of `Hello`
-  has no `r`, an update writes a commit without `w` or `t`, or an update names
-  a ref that a push does not write.
+- `invalid-ref` -- the server refuses a ref name, or the collection id of
+  `Hello`: an id longer than 255 bytes, or one that fails the collection-id
+  rule.
+- `ref-denied` -- no client group covers the namespace of `Hello`, the client
+  group opens no push session, a ref of `Hello` has no `r`, an update writes
+  a commit without `w` or `t`, or an update names a ref that a push does not
+  write.
 - `signature-required` -- a commit has a signature that does not verify, or
   has no signature and the client group requires one.
 - `binding-mismatch` -- the ref binding of a commit does not name its target
-  ref, or its collection binding does not name the server collection id.
+  ref, or its collection binding does not name the collection of the
+  namespace of the session.
 - `internal` -- a failure on the server side, for example an I/O error.
 
 An unknown code in a received `Error` is `protocol`. A server error with no
@@ -2882,30 +2897,42 @@ The server runs these checks of `Hello` in this order. The checks do no I/O:
    malformed `[core] locking` value is `internal`.
 5. A ref name that fails the refspec rule ("Ref name validation") is
    `invalid-ref`.
-6. A `HelloReply` with a commit for each ref that needs a frame over 1 MiB is
-   `limit-exceeded`.
+6. A `collection` that is longer than 255 bytes, or that fails the
+   collection-id rule, is `invalid-ref`. The id is one name under
+   `refs/mirrors/`, and a file system takes a name of 255 bytes at most.
+7. A `HelloReply` with a commit for each ref that needs a frame over 1 MiB is
+   `limit-exceeded`. The reply holds the `collection` of the namespace.
+
+`collection` names the namespace of the session. No `collection`, and the
+collection id of the repository, name the local refs, under `refs/heads/`.
+Each other id names the refs of that collection, under `refs/mirrors/ID/`.
+The session reads and writes the refs of its namespace alone, so a session
+of a collection does not touch `refs/heads/`.
 
 Then the server runs the checks of the client group of the session. They do
 no I/O, and each failure is `ref-denied`:
 
-7. A client group with no allow item that has `w`, `c`, `t`, or `d` opens no
+8. The session needs a client group whose `collection` key covers the
+   namespace.
+9. A client group with no allow item that has `w`, `c`, `t`, or `d` opens no
    push session.
-8. A remote ref `REMOTE:NAME` in `Hello` is refused, because a push writes no
-   remote ref.
-9. A ref of `Hello` needs `r` in the effective rights of the group
-   (`ostrya-config(1)`, "Access modes and patterns"). `d` does not add `r`.
+10. A remote ref `REMOTE:NAME` in `Hello` is refused, because a push writes
+    no remote ref.
+11. A ref of `Hello` needs `r` in the effective rights of the group
+    (`ostrya-config(1)`, "Access modes and patterns"). `d` does not add `r`.
 
-`ostrya receive` and `ostrya serve` give a session the client group of the
-local refs that carries the auth item of the client ("Authentication of the
-receive endpoint"). With no such group, `ostrya receive` runs the session
-under a policy with no allow item, so check 7 gives `ref-denied`, and
-`ostrya serve` answers the `session` request with 403.
+`ostrya receive` and `ostrya serve` give a session the client group that
+carries the auth item of the client in the namespace of `Hello`
+("Authentication of the receive endpoint"). For a collection, the group is
+the group that names the collection, else the group with `collection=*`.
+With no such group, `ostrya receive` answers `Hello` with `ref-denied` at
+check 8, and `ostrya serve` answers the `session` request with 403.
 
 A `Hello` with no ref, and a `Hello` that names one ref two times, pass
-checks 1 to 6. A `Hello` with no ref also passes checks 8 and 9, so a client
-group that opens a push session accepts it. A session whose `Hello` names no
-ref cannot commit, because `Commit` names refs of `Hello` alone (check 1 of
-"Commit and CommitReply").
+checks 1 to 7. A `Hello` with no ref also passes checks 10 and 11, so a
+client group that opens a push session accepts it. A session whose `Hello`
+names no ref cannot commit, because `Commit` names refs of `Hello` alone
+(check 1 of "Commit and CommitReply").
 
 Then the server opens the transaction of the session, and the transaction
 takes the repository lock shared ("Locks and on-disk state of a receive"). A
@@ -2921,21 +2948,26 @@ this order:
 3. In a `bare` repository, a new file in the staging directory must get the
    owner uid 0. Only root can store the owner of each file. Else the session
    is `mode-refused`.
-4. The server reads the ref of each name of `Hello`. A failed read, and a ref
-   file that does not parse, are `internal`.
+4. The server reads the ref of each name of `Hello` in the namespace of the
+   session. A failed read, and a ref file that does not parse, are
+   `internal`.
 
 An ostrya server announces these values in `HelloReply`:
 
 - version 1;
 - `mode`: the mode of the repository, with `archive` sent as `archive-z2`;
 - `collection-id`: the collection id of the repository, when it has one;
+- `collection`: the collection of the namespace of the session. The key is
+  absent for the local refs, also when `Hello` names the collection id of the
+  repository;
 - `max-frame`: 1 MiB;
 - `max-have`: 16384;
 - `encodings`: `raw` and `deflate`, in every mode;
 - `parallel-uploads`: 1 on a stream, and the `parallel-uploads` setting of
   the endpoint over HTTP ("The receive endpoint");
-- the refs: the current commit of each ref of `Hello`, in the order of
-  `Hello`, with one entry for each name that `Hello` repeats. A ref name that
+- the refs: the current commit of each ref of `Hello` in the namespace of the
+  session, in the order of `Hello`, with one entry for each name that `Hello`
+  repeats. A ref name that
   names a directory, or a path through a file, reads as absent. An alias gets
   the commit of its target.
 
@@ -3023,7 +3055,9 @@ the session, and the session writes nothing:
    that no update names as `new` is `protocol`.
 4. The server reads the effective rights of the ref of each update in the
    client group. These updates are `ref-denied`:
-   - an update of `ostree-metadata` in a repository with a collection id;
+   - an update of `ostree-metadata` in the local refs of a repository with a
+     collection id. In a collection namespace, `ostree-metadata` is a ref
+     like the other refs;
    - an update of a remote ref `REMOTE:NAME`;
    - an update that writes a commit to a ref with neither `w` nor `t`.
 
@@ -3043,9 +3077,15 @@ the session, and the session writes nothing:
    - A non-empty `ostree.ref-binding` must hold the name of each ref that the
      commit is the new value of. For a remote ref of a one-way stream, the
      name is the part after `REMOTE:`.
-   - If the repository has a collection id and the commit has
-     `ostree.collection-binding`, the value must be that id.
-   - The server does not check a binding key that the commit does not have.
+   - If the commit has `ostree.collection-binding`, the value must be the id
+     of the namespace: the collection of a collection namespace, or the
+     collection id of the repository for the local refs. In the local refs of
+     a repository with no collection id, a commit with the key fails. A
+     one-way stream checks the key against the collection id of the
+     repository, and does not check it in a repository with no collection
+     id.
+   - The server does not check a binding key that the commit does not have,
+     so a commit with no binding passes in each namespace.
 8. A new commit must pass the signature verification of the client group,
    else `signature-required`. The verification reads the stored detached
    metadata of the commit and the incoming dict together, before the
@@ -3067,8 +3107,8 @@ the session, and the session writes nothing:
    the ref, no walk runs: check 11 refuses the update if the ref is present.
    A host application is a program that embeds the receive path of the port.
    Its hook before the update can refuse with `ref-denied` or `internal`.
-10. The server takes the update lock and reads the refs again. These are
-    `ref-denied`:
+10. The server takes the update lock and reads the refs again, in the
+    namespace of the session. These are `ref-denied`:
     - a ref that is an alias;
     - a ref path that a ref write cannot replace;
     - two updates that write a commit, where one names a directory of the
@@ -3189,9 +3229,11 @@ with no change.
 
 The server runs `Hello` checks 2, 3, and 5 of a push session ("Hello and
 HelloReply"). In place of check 1, a `Hello` with no `one-way` true is
-`protocol`. Checks 7 to 9 do not apply. The server then opens the transaction as in a push session, with
-the same config reads and the same `bare` owner check. It reads no ref of
-`Hello` and sends no `HelloReply`.
+`protocol`, and so is a `Hello` with a `collection`: a one-way stream writes
+the local refs and the remote refs. Checks 8 to 11 do not apply. The server
+then opens the transaction as in a push session, with the same config reads
+and the same `bare` owner check. It reads no ref of `Hello` and sends no
+`HelloReply`.
 
 The server accepts a repository with `[core] locking=false`. It then takes no
 repository lock, and `Commit` still takes the update lock ("The update lock").
@@ -3629,7 +3671,7 @@ alone. If the random source fails, `POST session` gets 500 with `internal`.
 1. It reads the `Hello` frame. The whole body must arrive within the idle
    time of the endpoint, else the request gets 422 with `protocol`.
 2. A `Hello` with `one-way` true gets 422 with `protocol`.
-3. It runs checks 2 to 6 of "Hello and HelloReply". Step 2 is check 1.
+3. It runs checks 2 to 7 of "Hello and HelloReply". Step 2 is check 1.
    These checks do not read the client group.
 4. It takes a place in the session table. The open sessions, the sessions
    that open now, and the sessions that commit count toward the session
@@ -3639,9 +3681,9 @@ alone. If the random source fails, `POST session` gets 500 with `internal`.
 6. It gets the setup of the session from the authentication of the
    endpoint. A refusal gets 401 or 403 with `unauthorized`, and the place in
    the table becomes free. Under `ostrya serve`, an item that no client group
-   of the local refs carries, and a client group that opens no push session,
-   give a refusal with 403.
-7. It runs checks 7 to 9 of "Hello and HelloReply" with the client group of
+   of the namespace of `Hello` carries, and a client group that opens no push
+   session, give a refusal with 403.
+7. It runs checks 8 to 11 of "Hello and HelloReply" with the client group of
    the setup. Then it opens the session transaction, as "Hello and
    HelloReply" states. If the endpoint stopped during these steps, the
    request gets 503 with `limit-exceeded`.
@@ -3907,14 +3949,15 @@ proxy must set or remove the header of `trusted-proxy-header`,
 request. Else a client can send these headers through the proxy, and take
 another address, the scheme `https`, or another certificate.
 
-A `session` request then selects the client group of the local refs that
-carries the item. `Hello` names no collection, so the namespace of each
-session is the local refs. The server does not try another item: a
-certificate that gets a `tls:NAME` item gets no group of `tls:*`. These
-requests get 403 with `unauthorized`:
+A `session` request then selects the client group that carries the item in
+the namespace of its `Hello` ("Hello and HelloReply"). For a collection, a
+group that names the collection wins over a group with `collection=*`. The
+server does not try another item: a certificate that gets a `tls:NAME` item
+gets no group of `tls:*`. These requests get 403 with `unauthorized`:
 
-- a request whose item no group of the local refs carries. The message is
-  `no client group of the request covers the local refs`.
+- a request whose item no group of the namespace carries. The message is
+  `no client group of the request covers the local refs`, or
+  `no client group of the request covers the collection 'ID'`.
 - a request whose group opens no push session. The message is
   `client group 'NAME' opens no push session`. With no client group, the
   implicit group `anonymous` reads each ref and opens no push session.
@@ -3951,9 +3994,9 @@ a character boundary.
 `ostrya receive` and `ostrya send` identify the client of an ssh session by
 its name: `--client NAME`, else the value of `LOGNAME`, which sshd sets from
 the password entry of the user. An empty `LOGNAME` counts as absent.
-`ostrya receive` gives the session the policy of the client group of the
-local refs that carries `ssh:NAME`. With no such group, the session opens no
-push session, and `Hello` gets `ref-denied`. `ostrya send` serves the refs
+`ostrya receive` gives the session the policy of the client group that
+carries `ssh:NAME` in the namespace of `Hello`. With no such group, `Hello`
+gets `ref-denied`. `ostrya send` serves the refs
 that the client groups of `ssh:NAME` read ("Read access"). When the
 repository has client groups and no group carries `ssh:NAME`, `ostrya send`
 writes one `error: MESSAGE` line and exits 1 before it reads its input. An

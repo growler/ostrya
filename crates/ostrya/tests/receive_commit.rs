@@ -14,8 +14,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use common::receive::{
-    Obj, connect, fixture_objects, new_repo, policy_allowing, returned_code, session, sha,
-    staging_entries,
+    Obj, collections_policy, connect, fixture_objects, new_repo, policy_allowing, returned_code,
+    session, sha, staging_entries,
 };
 use common::{
     COMMIT, GUARD_RELEASING_MARKER, ROOT_DIRMETA, ROOT_DIRTREE, TmpDir, file_inventory,
@@ -201,20 +201,36 @@ fn push_named(
     force: bool,
 ) -> Pushed {
     session(repo, policy, |c| {
-        script(c, names, objects, meta, updates, force)
+        script(c, names, None, objects, meta, updates, force)
+    })
+}
+
+/// Runs one [`push`] whose `Hello` names the collection id `collection`.
+fn push_in(
+    repo: &Repo,
+    policy: &ReceivePolicy,
+    collection: &str,
+    objects: &[Obj],
+    updates: Vec<RefUpdate>,
+    force: bool,
+) -> Pushed {
+    let names: Vec<String> = updates.iter().map(|u| u.name.clone()).collect();
+    session(repo, policy, |c| {
+        script(c, &names, Some(collection), objects, &[], updates, force)
     })
 }
 
 async fn script(
     mut c: common::receive::Client,
     names: &[String],
+    collection: Option<&str>,
     objects: &[Obj],
     meta: &[(Checksum, Vec<u8>)],
     updates: Vec<RefUpdate>,
     force: bool,
 ) -> Result<Vec<RefOutcome>, ErrorMessage> {
     let names: Vec<&str> = names.iter().map(String::as_str).collect();
-    c.hello_reply(&names).await;
+    c.hello_reply_in(&names, collection).await;
     if !objects.is_empty() || !meta.is_empty() {
         for o in objects {
             c.object(o.ty, o.checksum, o.encoding, &o.bytes)
@@ -477,11 +493,11 @@ fn two_sessions_from_absent_give_one_success_and_one_ref_mismatch() {
     let ((r1, reply1), (r2, reply2)) = block_on(futures_lite::future::zip(
         futures_lite::future::zip(
             repo.receive(in1, out1, &policy),
-            script(c1, &names, &objects, &[], updates(), false),
+            script(c1, &names, None, &objects, &[], updates(), false),
         ),
         futures_lite::future::zip(
             repo.receive(in2, out2, &policy),
-            script(c2, &names, &objects, &[], updates(), false),
+            script(c2, &names, None, &objects, &[], updates(), false),
         ),
     ));
     let (ok, failed) = match (r1.is_ok(), r2.is_ok()) {
@@ -1255,6 +1271,215 @@ fn a_foreign_collection_binding_is_binding_mismatch() {
         vec![update("main", Expected::Absent, Some(commit.checksum))],
         false,
     ));
+}
+
+/// In the local refs of a repository with no collection id, a commit with
+/// a collection binding is `binding-mismatch`. A commit with no binding
+/// passes.
+#[test]
+fn a_collection_binding_needs_a_namespace_of_that_id() {
+    let mut metadata = DictBuilder::new();
+    metadata.insert_str("ostree.collection-binding", "org.example.Os");
+    let bound = build_commit(None, "bound", metadata.build());
+    let unbound = build_commit(None, "unbound", no_metadata());
+    let mut objects = tree_objects();
+    objects.extend([bound.clone(), unbound.clone()]);
+
+    let tmp = TmpDir::new("recv-binding-no-id");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    let before = snapshot(&repo);
+    let error = refused(
+        push(
+            &repo,
+            &policy(),
+            &objects,
+            &[],
+            vec![update("main", Expected::Absent, Some(bound.checksum))],
+            false,
+        ),
+        ErrorCode::BindingMismatch,
+    );
+    assert!(error.message.contains("no collection id"), "{error:?}");
+    assert_unchanged(&repo, &before);
+
+    // In the namespace of the collection, the bound commit and the unbound
+    // commit pass. Another collection refuses the bound commit.
+    let all = collections_policy(&["w:**"]);
+    committed(push_in(
+        &repo,
+        &all,
+        "org.example.Os",
+        &objects,
+        vec![
+            update("bound", Expected::Absent, Some(bound.checksum)),
+            update("unbound", Expected::Absent, Some(unbound.checksum)),
+        ],
+        false,
+    ));
+    let before = snapshot(&repo);
+    let error = refused(
+        push_in(
+            &repo,
+            &all,
+            "org.example.Other",
+            &[],
+            vec![update("main", Expected::Absent, Some(bound.checksum))],
+            false,
+        ),
+        ErrorCode::BindingMismatch,
+    );
+    assert!(
+        error.message.contains("not 'org.example.Other'"),
+        "{error:?}"
+    );
+    assert_unchanged(&repo, &before);
+}
+
+/// A session of a collection namespace reads and writes the refs under
+/// `refs/mirrors/ID/`, and does not touch `refs/heads/`. The fast-forward
+/// check, the delete, and the rule of `t` apply to these refs.
+#[test]
+fn a_collection_namespace_writes_the_mirror_refs() {
+    let tmp = TmpDir::new("recv-mirror-refs");
+    let repo = new_repo(&tmp, RepoMode::Archive, "collection-id=org.example.C\n");
+    let mut metadata = DictBuilder::new();
+    metadata.insert_str("ostree.collection-binding", "org.example.Os");
+    let first = build_commit(None, "first", metadata.build());
+    let mut metadata = DictBuilder::new();
+    metadata.insert_str("ostree.collection-binding", "org.example.Os");
+    let second = build_commit(Some(first.checksum), "second", metadata.build());
+    let mut objects = tree_objects();
+    objects.extend([first.clone(), second.clone()]);
+    let local = sha(b"local");
+    std::fs::write(repo.path().join("refs/heads/main"), format!("{local}\n")).unwrap();
+    let mirror = "refs/mirrors/org.example.Os/main";
+    let all = collections_policy(&["w:**"]);
+
+    let report = committed(push_in(
+        &repo,
+        &all,
+        "org.example.Os",
+        &objects,
+        vec![update("main", Expected::Absent, Some(first.checksum))],
+        false,
+    ));
+    assert_eq!(report.collection.as_deref(), Some("org.example.Os"));
+    assert_eq!(report.refs[0].old, None);
+    assert_eq!(
+        ref_file(&repo, mirror),
+        Some(format!("{}\n", first.checksum))
+    );
+    assert_eq!(
+        ref_file(&repo, "refs/heads/main"),
+        Some(format!("{local}\n"))
+    );
+
+    // The expected state is the state of the mirror ref.
+    let report = committed(push_in(
+        &repo,
+        &all,
+        "org.example.Os",
+        &[],
+        vec![update(
+            "main",
+            Expected::Commit(first.checksum),
+            Some(second.checksum),
+        )],
+        false,
+    ));
+    assert_eq!(report.refs[0].old, Some(first.checksum));
+    assert_eq!(
+        ref_file(&repo, mirror),
+        Some(format!("{}\n", second.checksum))
+    );
+
+    // A tag that exists is `ref-mismatch`, and a delete needs `d`.
+    let before = snapshot(&repo);
+    let error = refused(
+        push_in(
+            &repo,
+            &collections_policy(&["t:**"]),
+            "org.example.Os",
+            &[],
+            vec![update("main", Expected::Any, Some(second.checksum))],
+            false,
+        ),
+        ErrorCode::RefMismatch,
+    );
+    assert_eq!(error.current.unwrap().commit, Some(second.checksum));
+    assert_unchanged(&repo, &before);
+    let current = Expected::Commit(second.checksum);
+    refused(
+        push_in(
+            &repo,
+            &all,
+            "org.example.Os",
+            &[],
+            vec![update("main", current, None)],
+            false,
+        ),
+        ErrorCode::DeleteDenied,
+    );
+    assert_unchanged(&repo, &before);
+    committed(push_in(
+        &repo,
+        &collections_policy(&["rd:**"]),
+        "org.example.Os",
+        &[],
+        vec![update("main", current, None)],
+        false,
+    ));
+    assert_eq!(ref_file(&repo, mirror), None);
+    assert_eq!(
+        ref_file(&repo, "refs/heads/main"),
+        Some(format!("{local}\n"))
+    );
+}
+
+/// `ostree-metadata` is the anchor ref of the local refs of a repository
+/// with a collection id. In a collection namespace, the name is a normal ref.
+#[test]
+fn ostree_metadata_is_a_normal_ref_in_a_collection() {
+    let tmp = TmpDir::new("recv-mirror-anchor");
+    let repo = new_repo(&tmp, RepoMode::Archive, "collection-id=org.example.C\n");
+    let commit = build_commit(None, "unbound", no_metadata());
+    let mut objects = tree_objects();
+    objects.push(commit.clone());
+    let before = snapshot(&repo);
+    let error = refused(
+        push_in(
+            &repo,
+            &policy(),
+            "org.example.C",
+            &objects,
+            vec![update(
+                "ostree-metadata",
+                Expected::Any,
+                Some(commit.checksum),
+            )],
+            false,
+        ),
+        ErrorCode::RefDenied,
+    );
+    assert!(error.message.contains("anchor"), "{error:?}");
+    assert_unchanged(&repo, &before);
+    committed(push_in(
+        &repo,
+        &collections_policy(&["w:**"]),
+        "org.example.Os",
+        &objects,
+        vec![update(
+            "ostree-metadata",
+            Expected::Absent,
+            Some(commit.checksum),
+        )],
+        false,
+    ));
+    assert_eq!(
+        ref_file(&repo, "refs/mirrors/org.example.Os/ostree-metadata"),
+        Some(format!("{}\n", commit.checksum))
+    );
+    assert_eq!(ref_file(&repo, "refs/heads/ostree-metadata"), None);
 }
 
 /// A commit that carries no signature that the policy trusts is
@@ -2155,7 +2380,7 @@ fn a_session_and_concurrent_regenerations_chain_their_anchors() {
         futures_lite::future::zip(
             futures_lite::future::zip(
                 repo.receive(input, output, &policy),
-                script(c, &names, &objects, &[], updates, false),
+                script(c, &names, None, &objects, &[], updates, false),
             ),
             repo.regenerate_summary(&opts),
         ),

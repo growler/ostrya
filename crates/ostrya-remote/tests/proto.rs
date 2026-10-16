@@ -123,6 +123,7 @@ fn hello(agent: Option<&str>, refs: &[&str]) -> Message {
         version: 1,
         agent,
         refs,
+        collection: None,
         one_way: false,
     })
 }
@@ -138,6 +139,7 @@ fn hello_reply(refs: Vec<RefState>, collection_id: Option<String>) -> HelloReply
         version,
         mode,
         collection_id,
+        collection: None,
         max_frame,
         max_have,
         encodings,
@@ -1070,6 +1072,124 @@ fn the_one_way_key_reads_strictly() {
     );
     assert_protocol(read(vec![entry("one-way", "s", st("true"))]));
     assert_protocol(read(vec![entry("one-way", "u", Value::U32(1))]));
+}
+
+fn collection_hello(collection: &str, refs: &[&str]) -> Message {
+    let Message::Hello(h) = hello(None, refs) else {
+        unreachable!("hello gives a Hello")
+    };
+    Message::Hello(Hello {
+        collection: Some(collection.into()),
+        ..h
+    })
+}
+
+/// The encoder writes `collection` after `agent`, and the message reads back.
+/// A `HelloReply` with a `collection` reads back too. The encoder writes no
+/// key for `None`, so `golden_bytes_pin_the_frame_layout` pins the bytes of
+/// a `Hello` with no collection.
+///
+/// The entry `{"collection": <"org.example.Os">}` has these bytes:
+///
+/// - the key `collection\0` (11 bytes) and 5 bytes of padding to the
+///   alignment 8 of the variant
+/// - the variant `org.example.Os\0` (15 bytes), a zero separator, and the
+///   type `s`
+/// - the framing offset of the end of the key, 11
+///
+/// The array of one entry of 34 bytes adds the offset of the end of the
+/// entry, 34. The tuple ends with the offset of the end of the dict, 43.
+///
+/// With the agent `x`, the entry `{"agent": <"x">}` of 13 bytes comes first,
+/// at offset 8 of the body. The entry of `collection` follows at offset 24,
+/// after 3 bytes of padding. The array adds the offsets of the end of each
+/// entry, 13 and 50, and the tuple ends with the offset 60.
+#[test]
+fn a_collection_round_trips() {
+    round_trip(collection_hello("org.example.Os", &[]));
+    let Message::Hello(h) = collection_hello("org.example.Os", &["main"]) else {
+        unreachable!("collection_hello gives a Hello")
+    };
+    round_trip(Message::Hello(Hello {
+        agent: Some("ostrya/0.2.8".into()),
+        ..h.clone()
+    }));
+    golden(
+        collection_hello("org.example.Os", &["main"]),
+        hex(
+            "00 00 00 33 01 01 00 00 00 00 00 00 00 63 6f 6c 6c 65 63 74 69 6f 6e 00 \
+             00 00 00 00 00 6f 72 67 2e 65 78 61 6d 70 6c 65 2e 4f 73 00 00 73 0b 22 \
+             6d 61 69 6e 00 05 2b",
+        ),
+    );
+    golden(
+        Message::Hello(Hello {
+            agent: Some("x".into()),
+            ..h
+        }),
+        hex(
+            "00 00 00 44 01 01 00 00 00 00 00 00 00 61 67 65 6e 74 00 00 00 78 00 00 \
+             73 06 00 00 00 63 6f 6c 6c 65 63 74 69 6f 6e 00 00 00 00 00 00 6f 72 67 \
+             2e 65 78 61 6d 70 6c 65 2e 4f 73 00 00 73 0b 0d 32 6d 61 69 6e 00 05 3c",
+        ),
+    );
+    for collection_id in [None, Some("org.example.C".to_owned())] {
+        let reply = HelloReply {
+            collection: Some("org.example.Os".into()),
+            ..hello_reply(vec![state("main", Some(ck(3)))], collection_id)
+        };
+        round_trip(Message::HelloReply(reply));
+    }
+}
+
+/// An absent `collection` key reads as `None` in `Hello` and in
+/// `HelloReply`. A value of another type is `Error::Protocol`. If the key
+/// occurs two times, the first one counts.
+#[test]
+fn the_collection_key_reads_strictly() {
+    let read = |entries| read_one(&frame(1, &hello_body(entries)));
+    assert_eq!(read(vec![]).unwrap(), Some(hello(None, &[])));
+    let os = || entry("collection", "s", st("org.example.Os"));
+    assert_eq!(
+        read(vec![os()]).unwrap(),
+        Some(collection_hello("org.example.Os", &[]))
+    );
+    assert_eq!(
+        read(vec![
+            os(),
+            entry("collection", "s", st("org.example.Other"))
+        ])
+        .unwrap(),
+        Some(collection_hello("org.example.Os", &[]))
+    );
+    assert_protocol(read(vec![entry("collection", "u", Value::U32(1))]));
+    assert_protocol(read(vec![entry("collection", "as", Value::Array(vec![]))]));
+
+    let reply = |extra: Vec<(&str, &str, Value)>| {
+        let mut entries = vec![
+            ("mode", "s", st("archive-z2")),
+            ("max-frame", "u", Value::U32(MAX_FRAME)),
+            ("max-have", "u", Value::U32(MAX_HAVE)),
+            ("encodings", "as", Value::Array(vec![])),
+            ("parallel-uploads", "u", Value::U32(1)),
+        ];
+        entries.extend(extra);
+        let body = t(vec![Value::U32(1), opts(&entries), Value::Array(vec![])]);
+        read_one(&frame(2, &gv("(ua{sv}a(smay))", body)))
+    };
+    let collection = |got: Result<Option<Message>, Error>| match got.unwrap() {
+        Some(Message::HelloReply(r)) => r.collection,
+        other => panic!("expected HelloReply, got {other:?}"),
+    };
+    assert_eq!(collection(reply(vec![])), None);
+    assert_eq!(
+        collection(reply(vec![
+            ("collection", "s", st("org.example.Os")),
+            ("collection", "s", st("org.example.Other")),
+        ])),
+        Some("org.example.Os".into())
+    );
+    assert_protocol(reply(vec![("collection", "u", Value::U32(1))]));
 }
 
 #[test]

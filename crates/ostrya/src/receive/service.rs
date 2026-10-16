@@ -147,6 +147,10 @@ fn into_error(failure: Failure) -> Error {
 impl ReceiveService {
     /// Opens a session: answers `Hello` and opens the session transaction.
     ///
+    /// `policy` is the policy of the namespace of `Hello`, which the host
+    /// selects. The session reads and writes the refs of that namespace, as
+    /// [`Repo::receive`](crate::Repo::receive) states.
+    ///
     /// The session transaction holds the repository lock shared until the
     /// session ends. `parallel_uploads` is the value that `HelloReply`
     /// announces. It is also the number of `objects` calls that the session
@@ -163,10 +167,11 @@ impl ReceiveService {
     /// - [`Error::InvalidInput`] if `parallel_uploads` is 0.
     /// - [`remote::Error::Protocol`] if `Hello` has `one-way` true.
     /// - The errors of [`check_hello`](Self::check_hello).
-    /// - [`remote::Error::RefDenied`] if `policy` opens no push session, if
-    ///   `Hello` names a remote ref, or if `policy` gives no `r` on a ref of
-    ///   `Hello`. These checks follow the checks of `check_hello` and do no
-    ///   I/O.
+    /// - [`remote::Error::RefDenied`] if the
+    ///   [scope](ReceivePolicy::scope) of `policy` does not cover the
+    ///   namespace of `Hello`, if `policy` opens no push session, if `Hello`
+    ///   names a remote ref, or if `policy` gives no `r` on a ref of `Hello`.
+    ///   These checks follow the checks of `check_hello` and do no I/O.
     /// - The errors of [`Repo::transaction`](crate::Repo::transaction) if the
     ///   session transaction cannot open. These include
     ///   [`Error::LockTimeout`] if the wait for the repository lock passes
@@ -210,9 +215,10 @@ impl ReceiveService {
                 "parallel_uploads must be at least 1".into(),
             ));
         }
-        let (core, reply) = SessionCore::open(repo, policy, hooks, parallel_uploads, hello)
-            .await
-            .map_err(into_error)?;
+        let (core, reply) =
+            SessionCore::open(repo, |_| Some(policy), hooks, parallel_uploads, hello)
+                .await
+                .map_err(into_error)?;
         let service = ReceiveService {
             state: Mutex::new(State::Open {
                 core: Arc::new(core),
@@ -234,7 +240,9 @@ impl ReceiveService {
     /// 3. For a `Hello` with `one-way` false, `[core] locking=false`
     ///    (`locking-disabled`).
     /// 4. Each ref name (`invalid-ref`).
-    /// 5. For a `Hello` with `one-way` false, the size of the `HelloReply`
+    /// 5. The collection id of `Hello`, which must be 255 bytes at most and
+    ///    pass [`is_collection_id`](crate::is_collection_id) (`invalid-ref`).
+    /// 6. For a `Hello` with `one-way` false, the size of the `HelloReply`
     ///    with a commit for each ref, against [`MAX_FRAME`]
     ///    (`limit-exceeded`).
     ///
@@ -266,7 +274,9 @@ impl ReceiveService {
     ///   `bare-split-xattrs`.
     /// - [`remote::Error::LockingDisabled`] if `hello` has `one-way` false and
     ///   the repository sets `[core] locking=false`.
-    /// - [`remote::Error::InvalidRef`] if a ref name of `hello` is not valid.
+    /// - [`remote::Error::InvalidRef`] if a ref name of `hello` is not valid,
+    ///   or if its collection id is longer than 255 bytes or fails the
+    ///   collection-id rule.
     /// - [`remote::Error::LimitExceeded`] if `hello` has `one-way` false and
     ///   its `HelloReply` can need a frame over [`MAX_FRAME`].
     /// - [`remote::Error::Internal`] if the encoder refuses the `HelloReply`
@@ -418,7 +428,8 @@ impl ReceiveService {
     ///   than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
     /// - [`remote::Error::RefDenied`] if an update writes a commit to a ref
     ///   on which the policy gives no `w` and no `t`, or if an update names
-    ///   the collection anchor ref of a repository with a collection id.
+    ///   the collection anchor ref in the local refs of a repository with a
+    ///   collection id.
     /// - [`remote::Error::RefDenied`] if a ref path fails a check under the
     ///   update lock: a ref is an alias, a ref write cannot replace a path, or
     ///   one update names a directory of another.
@@ -428,8 +439,11 @@ impl ReceiveService {
     ///   [`HookRefusal::internal`](super::HookRefusal::internal).
     /// - [`remote::Error::MissingObjects`] if a new commit, or an object of the
     ///   tree of a commit of the session, is neither staged nor present.
-    /// - [`remote::Error::BindingMismatch`] if the ref binding or the collection
-    ///   binding of a new commit does not name its ref or the repository.
+    /// - [`remote::Error::BindingMismatch`] if the ref binding of a new commit
+    ///   does not name its ref, or if its collection binding does not name the
+    ///   collection of the namespace. For the local refs, that collection is
+    ///   the collection id of the repository, and in a repository with no
+    ///   collection id each collection binding fails.
     /// - [`remote::Error::SignatureRequired`] if a new commit fails the
     ///   signature verification of the policy. With
     ///   [`allow_unsigned`](super::ReceivePolicy::allow_unsigned), a commit

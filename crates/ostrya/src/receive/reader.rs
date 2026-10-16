@@ -106,6 +106,7 @@ pub(crate) async fn read(repo: &Repo) -> Result<(ClientAccess, Vec<Arc<ReceivePo
         .iter()
         .map(|group| {
             Arc::new(ReceivePolicy {
+                scope: group.scope().clone(),
                 rules: group.rules().clone(),
                 verify: match group.verify_trust() {
                     Some(name) => ReceiveVerify::Keys(Arc::clone(&trusts[name])),

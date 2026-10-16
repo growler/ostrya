@@ -80,8 +80,10 @@ impl Repo {
     /// leave the detached metadata and some refs written. The call returns a
     /// wire code inside [`Error::Remote`]. It returns each other error as it is.
     ///
-    /// - [`remote::Error::Protocol`] if the first message is not `Hello`, or if
-    ///   `Hello` does not have `one-way` true.
+    /// - [`remote::Error::Protocol`] if the first message is not `Hello`, if
+    ///   `Hello` does not have `one-way` true, or if `Hello` names a
+    ///   collection. A one-way stream writes the local refs and the remote
+    ///   refs alone.
     /// - [`remote::Error::Protocol`] if a message comes out of order. `Have` and
     ///   an `Abort` frame between two objects are out of order.
     /// - [`remote::Error::VersionUnsupported`] if `Hello` states another

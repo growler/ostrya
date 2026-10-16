@@ -19,7 +19,7 @@ use hyper::header::{AUTHORIZATION, HeaderValue, WWW_AUTHENTICATE};
 use hyper::http::Extensions;
 use hyper::http::request::Parts;
 use hyper::{HeaderMap, StatusCode};
-use ostrya::access::{AuthItem, Claims, ClientAccess, ClientGroup, IpNet, ReadAccess};
+use ostrya::access::{AuthItem, Claims, ClientAccess, ClientGroup, IpNet, Namespace, ReadAccess};
 use ostrya::remote::proto::Hello;
 use ostrya::{Checksum, ReceivePolicies, ReceivePolicy};
 
@@ -442,15 +442,19 @@ impl GroupAuth {
         })
     }
 
-    /// The setup of a session that `client` opens. [`open`](ReceiveAuth::open)
-    /// states the rules.
-    fn setup(&self, client: &Client) -> Result<SessionSetup, Refusal> {
+    /// The setup of a session that `client` opens with `hello`.
+    /// [`open`](ReceiveAuth::open) states the rules.
+    fn setup(&self, client: &Client, hello: &Hello) -> Result<SessionSetup, Refusal> {
         let access = self.policies.access();
-        let namespace = access.namespace(None);
+        let namespace = access.namespace(hello.collection.as_deref());
         let Some((group, policy)) = self.policies.select(&client.item, &namespace) else {
-            return Err(Refusal::forbidden(
-                "no client group of the request covers the local refs",
-            ));
+            let covered = match &namespace {
+                Namespace::Local => "the local refs".to_owned(),
+                Namespace::Collection(id) => format!("the collection '{id}'"),
+            };
+            return Err(Refusal::forbidden(format!(
+                "no client group of the request covers {covered}"
+            )));
         };
         let claims = match &client.cert {
             Some(cert) if group.tls_accept_claim() => Some(self.claims_of(cert)?),
@@ -472,6 +476,7 @@ impl GroupAuth {
                 // Each field but `rules` by name, so a new field of the
                 // policy needs a decision here.
                 let ReceivePolicy {
+                    scope,
                     rules: _,
                     verify,
                     allow_unsigned,
@@ -483,6 +488,7 @@ impl GroupAuth {
                     group,
                 } = &**policy;
                 Arc::new(ReceivePolicy {
+                    scope: scope.clone(),
                     rules,
                     verify: verify.clone(),
                     allow_unsigned: *allow_unsigned,
@@ -556,20 +562,25 @@ impl ReceiveAuth for GroupAuth {
     }
 
     /// The policy of the client group that carries the item of `client` in
-    /// the local refs, and no hooks. `Hello` names no collection, so the
-    /// namespace of each session is the local refs.
+    /// the namespace of `hello`, and no hooks.
+    ///
+    /// The collection id of `hello` names the namespace. No collection, and
+    /// the collection id of the repository, name the local refs.
+    /// [`ClientAccess::select`](ostrya::access::ClientAccess::select) states
+    /// the selection: a group that names the collection, else a group with
+    /// `collection=*`.
     ///
     /// When the group has `tls-accept-claim=true` and a certificate gave the
-    /// item, the claims of the certificate for the local refs replace the
+    /// item, the claims of the certificate for the namespace replace the
     /// rules of the group. Claims that do not parse get 403, and the server
     /// reports an event. With no such group, and with rules that open no
     /// push session, the refusal is 403.
     fn open(
         &self,
         client: &Client,
-        _hello: &Hello,
+        hello: &Hello,
     ) -> impl Future<Output = Result<SessionSetup, Refusal>> + Send {
-        ready(self.setup(client))
+        ready(self.setup(client, hello))
     }
 }
 
@@ -973,26 +984,33 @@ mod tests {
     }
 
     /// `open` gives the policy of the group that carries the item in the
-    /// local refs. An item with no such group, and a group that opens no
-    /// push session, get 403. A `tls:NAME` item whose groups do not cover
-    /// the local refs gets 403, although a group of `tls:*` covers them.
+    /// namespace of `Hello`. An item with no such group, and a group that
+    /// opens no push session, get 403. A `tls:NAME` item whose groups do not
+    /// cover the local refs gets 403, although a group of `tls:*` covers
+    /// them. A collection selects the group that names it, else the group
+    /// with `collection=*`.
     #[test]
     fn open_selects_the_group_of_the_item() {
         let (auth, _tmp) = auth(
             "[ex-ostrya client \"push\"]\nauth=anonymous;tls:*\nallow=w:**\n\
              [ex-ostrya client \"read\"]\nauth=ssh:r;net:10.0.0.0/8\nallow=r:**\n\
-             [ex-ostrya client \"mirror\"]\nauth=tls:host\ncollection=*\nallow=w:**\n",
+             [ex-ostrya client \"mirror\"]\nauth=tls:host\ncollection=*\nallow=w:**\n\
+             [ex-ostrya client \"os\"]\nauth=tls:host\ncollection=org.example.Os\n\
+             allow=w:os/**\n",
         );
-        let hello = Hello {
+        let hello_in = |collection: Option<&str>| Hello {
             version: 1,
             agent: None,
             refs: vec!["main".into()],
+            collection: collection.map(str::to_owned),
             one_way: false,
         };
-        let open = |text: &str| {
+        let hello = hello_in(None);
+        let open_in = |text: &str, hello: &Hello| {
             let client = Client::new(AuthItem::parse(text).unwrap(), false);
-            ostrya_rt::block_on(auth.open(&client, &hello))
+            ostrya_rt::block_on(auth.open(&client, hello))
         };
+        let open = |text: &str| open_in(text, &hello);
         for text in ["anonymous", "tls:*"] {
             let setup = open(text).unwrap_or_else(|r| panic!("{text}: {r:?}"));
             assert!(Arc::ptr_eq(
@@ -1021,6 +1039,24 @@ mod tests {
             };
             assert_eq!(refusal.status, StatusCode::FORBIDDEN, "{text}");
             assert_eq!(refusal.message, needle, "{text}");
+        }
+        for (collection, group) in [("org.example.Os", "os"), ("org.example.Other", "mirror")] {
+            let setup = open_in("tls:host", &hello_in(Some(collection)))
+                .unwrap_or_else(|r| panic!("{collection}: {r:?}"));
+            assert!(Arc::ptr_eq(
+                &setup.policy,
+                auth.policies.get(group).unwrap()
+            ));
+        }
+        for text in ["anonymous", "tls:other"] {
+            let Err(refusal) = open_in(text, &hello_in(Some("org.example.Os"))) else {
+                panic!("{text} opens a session in a collection");
+            };
+            assert_eq!(refusal.status, StatusCode::FORBIDDEN, "{text}");
+            assert_eq!(
+                refusal.message,
+                "no client group of the request covers the collection 'org.example.Os'"
+            );
         }
     }
 
@@ -1248,6 +1284,7 @@ mod tests {
             version: 1,
             agent: None,
             refs: vec!["main".into()],
+            collection: None,
             one_way: false,
         }
     }
@@ -1324,6 +1361,39 @@ mod tests {
                 .unwrap_or_else(|r| panic!("{uris:?}: {r:?}"));
             assert!(Arc::ptr_eq(&setup.policy, group), "{uris:?}");
         }
+    }
+
+    /// In a collection namespace, the claims of that collection replace the
+    /// rules of a group with `collection=*`. The claims of the local refs and
+    /// of another collection do not apply. The policy keeps the scope of the
+    /// group.
+    #[test]
+    fn the_claims_of_the_collection_apply_in_its_namespace() {
+        let (auth, _tmp) = auth(&CLAIMS_GROUP.replace("auth=tls:*", "auth=tls:*\ncollection=*"));
+        let der = TestCa::new().leaf(
+            "c",
+            &[
+                "ostrya:ref:w:main",
+                "ostrya:collection:org.example.Os:w:os/**",
+                "ostrya:collection:org.example.Os:!os/secret",
+                "ostrya:collection:org.example.Other:d:x",
+            ],
+        );
+        let client = auth.identify(&HeaderMap::new(), &with_der(&der)).unwrap();
+        let hello = Hello {
+            collection: Some("org.example.Os".into()),
+            ..hello()
+        };
+        let setup = ostrya_rt::block_on(auth.open(&client, &hello)).unwrap();
+        assert_eq!(
+            rule_texts(&setup),
+            (vec!["w:os/**".to_owned()], vec!["os/secret".to_owned()])
+        );
+        assert_eq!(
+            setup.policy.scope,
+            ostrya::access::CollectionScope::AllOther
+        );
+        assert_eq!(setup.policy.group.as_deref(), Some("certs"));
     }
 
     /// The own collection id of the repository names the local refs in a

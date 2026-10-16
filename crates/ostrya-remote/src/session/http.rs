@@ -237,7 +237,8 @@ fn session_id(uploaded: &Uploaded) -> Option<String> {
     valid.then(|| id.to_owned())
 }
 
-/// Opens a session: sends `Hello` with `refs` and reads `HelloReply`.
+/// Opens a session: sends `Hello` with `refs` and `collection`, and reads
+/// `HelloReply`.
 ///
 /// If a check of the reply fails after the server opened the session, the
 /// call ends the session with `DELETE`.
@@ -245,12 +246,14 @@ pub(super) async fn open(
     endpoint: Endpoint,
     refs: &[String],
     agent: String,
+    collection: Option<String>,
     counters: &Counters,
 ) -> Result<(ServerInfo, HttpLink)> {
     let hello = Message::Hello(Hello {
         version: PROTOCOL_VERSION,
         agent: Some(agent),
         refs: refs.to_vec(),
+        collection: collection.clone(),
         one_way: false,
     });
     let body = encode_frame(&hello, MIN_FRAME_LIMIT)?;
@@ -282,7 +285,7 @@ pub(super) async fn open(
         broken: AtomicBool::new(false),
         have_busy: AtomicBool::new(false),
     };
-    match server_info(reply, refs) {
+    match server_info(reply, refs, collection.as_deref()) {
         Ok(server) => Ok((server, link)),
         Err(e) => {
             let _ = link.delete().await;
@@ -913,6 +916,7 @@ mod tests {
             version: PROTOCOL_VERSION,
             mode: "archive".into(),
             collection_id: None,
+            collection: None,
             max_frame: MIN_FRAME_LIMIT,
             max_have: 16_384,
             encodings: vec![Encoding::Raw],
@@ -947,6 +951,7 @@ mod tests {
             version: PROTOCOL_VERSION,
             mode: "archive".into(),
             collection_id: None,
+            collection: None,
             max_frame: MIN_FRAME_LIMIT,
             max_have: 16_384,
             encodings: vec![Encoding::Raw],

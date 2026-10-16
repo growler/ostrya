@@ -39,6 +39,13 @@ pub struct Hello {
     /// The refs that the client intends to update, each `NAME` or
     /// `REMOTE:NAME`.
     pub refs: Vec<String>,
+    /// The collection id of the namespace that the session targets, under
+    /// the key `collection`.
+    ///
+    /// `None` targets the local refs. The collection id of the server also
+    /// targets the local refs. The encoder writes the key only if the value
+    /// is `Some`.
+    pub collection: Option<String>,
     /// The flag that is `true` if the `Hello` opens a
     /// [one-way stream](super#one-way-stream).
     ///
@@ -59,6 +66,12 @@ pub struct HelloReply {
     pub mode: String,
     /// The collection id of the repository, under the key `collection-id`.
     pub collection_id: Option<String>,
+    /// The collection of the namespace that the server selected for the
+    /// session, under the key `collection`.
+    ///
+    /// `None` is the local refs. The encoder writes the key only if the value
+    /// is `Some`.
+    pub collection: Option<String>,
     /// The frame limit that the server announces, under the key `max-frame`.
     ///
     /// Encode and decode return [`Error::Protocol`] for a value outside
@@ -351,6 +364,9 @@ impl Message {
                 if let Some(agent) = &h.agent {
                     opts.insert_str("agent", agent);
                 }
+                if let Some(collection) = &h.collection {
+                    opts.insert_str("collection", collection);
+                }
                 if h.one_way {
                     opts.insert_bool("one-way", true);
                 }
@@ -368,6 +384,9 @@ impl Message {
                 opts.insert_str("mode", &r.mode);
                 if let Some(id) = &r.collection_id {
                     opts.insert_str("collection-id", id);
+                }
+                if let Some(collection) = &r.collection {
+                    opts.insert_str("collection", collection);
                 }
                 let encodings: Vec<String> =
                     r.encodings.iter().map(|e| e.as_str().to_owned()).collect();
@@ -539,13 +558,15 @@ impl Message {
             }
             Kind::Hello => {
                 let (version, opts, refs): (u32, Dict, ArrayIter<&str>) = parse_body(body)?;
-                let [agent, one_way] = dict(opts, ["agent", "one-way"])?;
+                let [agent, collection, one_way] = dict(opts, ["agent", "collection", "one-way"])?;
                 let agent: Option<&str> = field(agent, "agent", &Type::Str)?;
+                let collection: Option<&str> = field(collection, "collection", &Type::Str)?;
                 let one_way = field(one_way, "one-way", &Type::Bool)?.unwrap_or(false);
                 Message::Hello(Hello {
                     version,
                     agent: agent.map(str::to_owned),
                     refs: collect(refs, |r| Ok(r.to_owned()))?,
+                    collection: collection.map(str::to_owned),
                     one_way,
                 })
             }
@@ -650,6 +671,7 @@ fn decode_hello_reply(body: &[u8]) -> Result<HelloReply> {
     let [
         mode,
         collection_id,
+        collection,
         max_frame,
         max_have,
         encodings,
@@ -659,6 +681,7 @@ fn decode_hello_reply(body: &[u8]) -> Result<HelloReply> {
         [
             "mode",
             "collection-id",
+            "collection",
             "max-frame",
             "max-have",
             "encodings",
@@ -667,6 +690,7 @@ fn decode_hello_reply(body: &[u8]) -> Result<HelloReply> {
     )?;
     let mode: &str = required(mode, "mode", &Type::Str)?;
     let collection_id: Option<&str> = field(collection_id, "collection-id", &Type::Str)?;
+    let collection: Option<&str> = field(collection, "collection", &Type::Str)?;
     let max_frame = required(max_frame, "max-frame", &Type::U32)?;
     let max_have = required(max_have, "max-have", &Type::U32)?;
     let parallel_uploads = required(parallel_uploads, "parallel-uploads", &Type::U32)?;
@@ -686,6 +710,7 @@ fn decode_hello_reply(body: &[u8]) -> Result<HelloReply> {
         version,
         mode: mode.to_owned(),
         collection_id: collection_id.map(str::to_owned),
+        collection: collection.map(str::to_owned),
         max_frame,
         max_have,
         encodings,

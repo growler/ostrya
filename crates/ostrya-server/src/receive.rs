@@ -761,6 +761,7 @@ mod tests {
             stats: TransactionStats::default(),
             warnings: Vec::new(),
             group: None,
+            collection: None,
         }
     }
 
@@ -970,6 +971,7 @@ mod tests {
             version: 1,
             agent: None,
             refs: vec!["main".into()],
+            collection: None,
             one_way: false,
         })
     }
@@ -1344,6 +1346,7 @@ mod tests {
                 version: 1,
                 agent: None,
                 refs: vec!["main".into(), "a//b".into()],
+                collection: None,
                 one_way: false,
             });
             for open_before in [false, true] {
@@ -1372,6 +1375,7 @@ mod tests {
                 version: 2,
                 agent: None,
                 refs: vec!["main".into()],
+                collection: None,
                 one_way: true,
             });
             let (status, reply) =

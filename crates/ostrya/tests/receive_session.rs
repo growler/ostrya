@@ -21,8 +21,8 @@ use std::pin::Pin;
 use std::time::{Duration, Instant};
 
 use common::receive::{
-    Client, assert_nothing_published, deflate_object, header, is_root, new_repo, policy_allowing,
-    raw_object, returned_code, session, sha, staging_entries,
+    Client, assert_nothing_published, collections_policy, connect, deflate_object, header, is_root,
+    new_repo, policy_allowing, raw_object, returned_code, session, sha, staging_entries,
 };
 use common::{TmpDir, file_inventory, foreign_holder, lock_holder_main};
 use ostrya::remote::proto::{
@@ -119,6 +119,7 @@ fn an_unknown_version_is_version_unsupported() {
             version: 2,
             agent: None,
             refs: vec![],
+            collection: None,
             one_way: false,
         }))
         .await
@@ -186,6 +187,153 @@ fn a_ref_path_through_a_directory_or_a_file_is_absent() {
     });
     let refs: Vec<_> = reply.refs.iter().map(|r| r.commit).collect();
     assert_eq!(refs, vec![None, Some(tip), None]);
+}
+
+// ---------------------------------------------------------------------------
+// Namespaces.
+// ---------------------------------------------------------------------------
+
+/// A `Hello` with a collection id reads the tips of the refs of that
+/// collection under `refs/mirrors/ID/`, and `HelloReply` reports the
+/// collection. The collection id of the repository names the local refs,
+/// and the reply then reports no collection.
+#[test]
+fn hello_reply_reports_the_namespace_and_reads_its_refs() {
+    let tmp = TmpDir::new("recv-namespace");
+    let repo = new_repo(&tmp, RepoMode::Archive, "collection-id=org.example.C\n");
+    let (local, mirror) = (sha(b"local"), sha(b"mirror"));
+    std::fs::write(repo.path().join("refs/heads/main"), format!("{local}\n")).unwrap();
+    let mirrors = repo.path().join("refs/mirrors/org.example.Os");
+    std::fs::create_dir_all(&mirrors).unwrap();
+    std::fs::write(mirrors.join("main"), format!("{mirror}\n")).unwrap();
+
+    let tips = |reply: &ostrya::remote::proto::HelloReply| -> Vec<Option<Checksum>> {
+        reply.refs.iter().map(|r| r.commit).collect()
+    };
+    let (_, reply) = session(&repo, &collections_policy(&["w:**"]), |mut c| async move {
+        let reply = c
+            .hello_reply_in(&["main", "absent"], Some("org.example.Os"))
+            .await;
+        c.send(&Message::Abort).await.unwrap();
+        reply
+    });
+    assert_eq!(reply.collection.as_deref(), Some("org.example.Os"));
+    assert_eq!(reply.collection_id.as_deref(), Some("org.example.C"));
+    assert_eq!(tips(&reply), vec![Some(mirror), None]);
+
+    for collection in [None, Some("org.example.C")] {
+        let (_, reply) = session(&repo, &policy(), |mut c| async move {
+            let reply = c.hello_reply_in(&["main"], collection).await;
+            c.send(&Message::Abort).await.unwrap();
+            reply
+        });
+        assert_eq!(reply.collection, None, "{collection:?}");
+        assert_eq!(tips(&reply), vec![Some(local)], "{collection:?}");
+    }
+}
+
+/// A collection id that fails the collection-id rule is `invalid-ref`, also
+/// under a policy that covers each collection.
+#[test]
+fn an_invalid_collection_id_is_invalid_ref() {
+    let tmp = TmpDir::new("recv-bad-collection");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    for id in ["", "no-dot", "org.example/Os", "..", "1org.example"] {
+        let (result, error) = session(&repo, &collections_policy(&["w:**"]), |mut c| async move {
+            c.hello_in(&["main"], Some(id)).await.unwrap();
+            c.error().await
+        });
+        assert_eq!(error.code, ErrorCode::InvalidRef, "{id:?}: {error:?}");
+        assert!(error.message.contains("collection id"), "{error:?}");
+        assert_eq!(returned_code(&result), Some(ErrorCode::InvalidRef));
+    }
+    assert!(staging_entries(repo.path()).is_empty());
+}
+
+/// A namespace that the scope of the policy does not cover is `ref-denied`.
+/// The policy of the local refs covers no collection, and a policy of
+/// collections does not cover the local refs.
+#[test]
+fn a_namespace_the_policy_does_not_cover_is_ref_denied() {
+    let tmp = TmpDir::new("recv-uncovered");
+    let repo = new_repo(&tmp, RepoMode::Archive, "collection-id=org.example.C\n");
+    for (policy, collection, needle) in [
+        (
+            policy(),
+            Some("org.example.Os"),
+            "the collection 'org.example.Os'",
+        ),
+        (collections_policy(&["w:**"]), None, "the local refs"),
+        (
+            collections_policy(&["w:**"]),
+            Some("org.example.C"),
+            "the local refs",
+        ),
+    ] {
+        let (result, error) = session(&repo, &policy, |mut c| async move {
+            c.hello_in(&["main"], collection).await.unwrap();
+            c.error().await
+        });
+        assert_eq!(error.code, ErrorCode::RefDenied, "{error:?}");
+        assert!(error.message.contains(needle), "{error:?}");
+        assert_eq!(returned_code(&result), Some(ErrorCode::RefDenied));
+    }
+    assert!(staging_entries(repo.path()).is_empty());
+}
+
+/// `receive_selected` asks for the policy of the namespace of `Hello`. A
+/// selection of no policy is `ref-denied`.
+#[test]
+fn receive_selected_takes_the_policy_of_the_namespace() {
+    let tmp = TmpDir::new("recv-selected");
+    let repo = new_repo(&tmp, RepoMode::Archive, "collection-id=org.example.C\n");
+    let policy = collections_policy(&["w:**"]);
+    for (collection, wanted, found) in [
+        (
+            Some("org.example.Os"),
+            ostrya::access::Namespace::Collection("org.example.Os".into()),
+            true,
+        ),
+        (
+            Some("org.example.C"),
+            ostrya::access::Namespace::Local,
+            false,
+        ),
+        (None, ostrya::access::Namespace::Local, false),
+    ] {
+        let (mut client, server_in, server_out) = connect();
+        let seen = std::sync::Mutex::new(None);
+        let select = |namespace: &ostrya::access::Namespace| {
+            *seen.lock().unwrap() = Some(namespace.clone());
+            found.then_some(&policy)
+        };
+        let (result, reply) = block_on(futures_lite::future::zip(
+            repo.receive_selected(server_in, server_out, select),
+            async move {
+                client.hello_in(&["main"], collection).await.unwrap();
+                let reply = client.recv().await;
+                let _ = client.send(&Message::Abort).await;
+                reply
+            },
+        ));
+        assert_eq!(seen.into_inner().unwrap(), Some(wanted), "{collection:?}");
+        if found {
+            assert!(matches!(reply, Some(Message::HelloReply(_))), "{reply:?}");
+            assert!(
+                matches!(result, Err(Error::Remote(remote::Error::Aborted))),
+                "{result:?}"
+            );
+        } else {
+            match reply {
+                Some(Message::Error(e)) => {
+                    assert_eq!(e.code, ErrorCode::RefDenied);
+                    assert!(e.message.contains("no client group"), "{e:?}");
+                }
+                other => panic!("expected ref-denied, got {other:?}"),
+            }
+            assert_eq!(returned_code(&result), Some(ErrorCode::RefDenied));
+        }
+    }
 }
 
 /// A malformed setting of the write paths is a fault of the server. The

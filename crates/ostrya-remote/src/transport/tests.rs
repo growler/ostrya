@@ -1156,6 +1156,7 @@ mod standin {
             version: PROTOCOL_VERSION,
             agent: Some(AGENT.into()),
             refs: refs(),
+            collection: None,
             one_way: false,
         })])
         .len()
@@ -1166,6 +1167,7 @@ mod standin {
             version: PROTOCOL_VERSION,
             mode: "archive".into(),
             collection_id: None,
+            collection: None,
             max_frame: MIN_FRAME_LIMIT,
             max_have: 16_384,
             encodings: vec![Encoding::Raw],

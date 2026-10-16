@@ -10,7 +10,9 @@ Push commits to a remote over ssh or HTTP and update its refs.
 .PP
 The command resolves REMOTE and sends the objects that the server does not have. The server then updates all the refs of the refspecs in one transaction. Over ssh, the push runs the ssh client with the receive command on the remote side. Over HTTP, the push sends its requests to the receive endpoint of \fB\%ostrya serve\fR\&. The push drops the detached metadata keys that \fB\%[ex\-ostrya] detached\-metadata\-exclude\fR names.
 .PP
-On success, standard output carries one line for each ref, in the order of the refspecs. A line holds the DST name, the old state, and the new state. The old state is a full commit checksum, \fB\%(new)\fR, or \fB\%(absent)\fR\&. The new state is a full commit checksum, \fB\%(unchanged)\fR, or \fB\%(deleted)\fR\&.
+The collection bindings of the source commits, or \%\-\-collection, give the namespace of the push on the server: the local refs or one collection. The server writes the refs of a collection other than its own collection id under \fB\%refs/mirrors/ID/\fR\&.
+.PP
+On success, standard output carries one line for each ref, in the order of the refspecs and then of the tags. A line holds the DST name, the old state, and the new state. The old state is a full commit checksum, \fB\%(new)\fR, or \fB\%(absent)\fR\&. The new state is a full commit checksum, \fB\%(unchanged)\fR, or \fB\%(deleted)\fR\&.
 .PP
 Under \%\-\-verbose, one statistics line goes to standard error. If standard error is a terminal and \fB\%TERM\fR is set and is not \fB\%dumb\fR, standard error shows a progress bar while the push runs. On failure, the command writes \fB\%error: MESSAGE\fR to standard error and nothing to standard output, and exits \%1.
 .SH ARGUMENTS
@@ -41,6 +43,18 @@ Without this option, the push sends the chain back to the commit of the ref on t
 Update each ref whatever its state on the server.
 .IP
 The push also asks the server to allow an update that is not a \%fast\-forward. The server still refuses such an update unless the client group of the push has \fB\%w\fR and \fB\%d\fR on the ref.
+.TP
+\fB\-\-collection\fR \fIID\fR
+Write the refs of the collection ID on the server.
+.IP
+The push reads the \fB\%ostree.collection\-binding\fR of each source commit. Without this option, the bindings give the namespace on the server: a commit with no binding goes to the local refs, and a commit bound to ID goes to the refs of ID. The server writes the refs of its own collection id under \fB\%refs/heads/\fR, and the refs of each other collection under \fB\%refs/mirrors/ID/\fR\&. \fB\%commit\fR binds each commit of a repository with a collection id to that id. So a push of such a commit to a server with another collection id, or with none, writes \fB\%refs/mirrors/ID/NAME\fR on the server.
+.IP
+The command refuses two source commits with different bindings, a binding that differs from ID, and a commit with no binding that goes to the refs of a collection. It refuses an ID or a binding that fails the \%collection\-id rule or is longer than \%255 bytes before it starts the transport.
+.TP
+\fB\-\-tag\fR \fINAME\fR
+Create the ref NAME on the server at the source commit.
+.IP
+The option can occur more than once. A tag is a ref update that expects no ref, also with \%\-\-force. So a tag that exists gets \%ref\-mismatch after the server reports its refs, and before the push sends an object. The refspecs that are not deletes must give one commit, and the \fB\%ostree.ref\-binding\fR of that commit must hold NAME. NAME passes the \%ref\-name rule, has no \fB\%:\fR, is not \%64 lowercase hex characters, and is not a DST. The client group of the push needs \fB\%t\fR or \fB\%w\fR on NAME.
 .TP
 \fB\-\-compress\fR[=\fILEVEL\fR]
 Send the content objects deflated at LEVEL, \%1 to \%9.

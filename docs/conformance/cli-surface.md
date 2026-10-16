@@ -3780,10 +3780,14 @@ ostrya receive [--repo=PATH] [--client=NAME]
   with white space at its start, ends the command with `error: MESSAGE` at
   exit 1 at the same step. The message shows the name in escaped form, so a
   name with a line feed gives one line.
-- The session takes the policy of the client group of the local refs that
-  carries `ssh:NAME`. With no such group, the session opens no push
-  session: the `Hello` gets `ref-denied`, and the command exits 1. The
-  session uses no `anonymous` item and no `net:` item.
+- `Hello` names the namespace of the session: the local refs, or one
+  collection. The collection id of the repository names the local refs. The
+  session takes the policy of the client group of that namespace that
+  carries `ssh:NAME`. For a collection, a group that names the collection
+  wins over a group with `collection=*`. With no such group, the `Hello`
+  gets `ref-denied`, and the command exits 1. A session of a collection
+  reads and writes the refs under `refs/mirrors/ID/`. The session uses no
+  `anonymous` item and no `net:` item.
   `../format-reference.md`, "Authentication of the receive endpoint",
   states the rules.
 - `--client` is safe only under a forced `command=` in `authorized_keys`,
@@ -3801,6 +3805,7 @@ ostrya receive [--repo=PATH] [--client=NAME]
 
 ```text
 ostrya push [--repo=PATH] REMOTE SRC[:DST]...
+            [--collection=ID] [--tag=NAME]...
             [--depth=N] [--force] [--compress[=LEVEL]]
             [--ssh-command=CMD] [--receive-command=CMD]
             [--push-token-file=FILE] [--push-user=NAME]
@@ -3836,6 +3841,35 @@ ostrya push [--repo=PATH] REMOTE SRC[:DST]...
   and the TLS files of an `https://` push. So
   `push --push-user=bob https://HOST/ nosuchref` fails with the refusal of
   `--push-user`, and does not name the refspec.
+- The push reads the `ostree.collection-binding` of each source commit
+  before the ssh client starts and before the first HTTP request. The
+  bindings, or `--collection=ID`, give the namespace on the server. A commit
+  with no binding goes to the local refs, and a commit bound to `ID` goes to
+  the refs of `ID`. The server writes the refs of its own collection id
+  under `refs/heads/`, and the refs of each other collection under
+  `refs/mirrors/ID/`. So a commit of a repository with a collection id goes
+  to `refs/mirrors/ID/NAME` of a server with another collection id or with
+  none.
+- Two source commits with different bindings, and a binding that differs
+  from `--collection`, are refused with `error: binding-mismatch: ...` at
+  exit 1, before the ssh client starts and before the first HTTP request.
+  An `ID` that fails the collection-id rule or is longer than 255 bytes is
+  refused with `error: Invalid collection ID ID` at exit 1, at the same
+  step. A binding of a source commit that fails the collection-id rule or is
+  longer than 255 bytes is refused with `error: invalid input: ...` at exit
+  1, at the same step. A commit with no binding in the namespace of a
+  collection is refused with `error: binding-mismatch: ...` after the server
+  reports the namespace, and before the push sends an object.
+- `--tag=NAME` creates the ref `NAME` on the server at the source commit.
+  The option can repeat. The refspecs that are not deletes must give one
+  commit, and its `ostree.ref-binding` must hold `NAME`. `NAME` passes the
+  ref-name rule, holds no `:`, is not 64 lowercase hex characters, is not a
+  `DST`, and is named once. Each of these refusals comes before the ssh
+  client starts and before the first HTTP request. A tag is an update that
+  expects no ref, also under `--force`. So a tag that exists gets
+  `error: ref-mismatch: ...` after the server reports its refs, and before
+  the push sends an object. The client group of the push needs `t` or `w`
+  on `NAME`.
 - `--depth=N` sends `N` parents of each source commit, and `-1` the whole
   chain. Without it, the push sends the chain back to the commit of the ref
   on the server. When the server does not hold the ref, or the local chain
@@ -3894,9 +3928,9 @@ ostrya push [--repo=PATH] REMOTE SRC[:DST]...
 - The push drops the detached metadata keys that `[ex-ostrya]
   detached-metadata-exclude` of the local repository names.
 - On success the command writes one line for each ref to standard output,
-  in the order of the refspecs, and exits 0. A line holds the `DST` name,
-  the old state, and the new state, separated by one space. A commit is its
-  full 64-character checksum:
+  in the order of the refspecs and then of the tags, and exits 0. A line
+  holds the `DST` name, the old state, and the new state, separated by one
+  space. A commit is its full 64-character checksum:
   - `main (new) C1` -- the server did not hold the ref;
   - `main C1 C2` -- the ref moved from `C1` to `C2`;
   - `main C2 (unchanged)` -- the ref was at `C2` already;
@@ -4110,9 +4144,11 @@ ostrya serve [--repo=PATH] [--listen=ADDR:PORT]...
   `extensions/ostrya/` get 404. `summary` and `summary.sig` are served only
   with no client group in the config. `../format-reference.md`, "Read
   access", states the rules. The tool has no such rights. A `session` request
-  takes the policy of the client group of the local refs that carries the
-  item. An item with no such group gets 403 with `unauthorized` and the
-  message `no client group of the request covers the local refs`. A group
+  takes the policy of the client group that carries the item in the
+  namespace of its `Hello`: the local refs, or one collection. An item with
+  no such group gets 403 with `unauthorized` and the message `no client
+  group of the request covers the local refs`, or `no client group of the
+  request covers the collection 'ID'`. A group
   that opens no push session gets 403 with `unauthorized` and the message
   `client group 'NAME' opens no push session`. With no client group in the
   config, the implicit group `anonymous` reads each ref and opens no push

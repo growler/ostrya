@@ -308,10 +308,14 @@ A repeated key takes the last value, so each list key is one line in a group.
 Thus a key source that ostrya cannot read stops the command.
 \fB\%ostrya send\fR reads no key of a trust group or a key group.
 A bad group stops the command with status 1.
-\fB\%ostrya receive\fR gives a session the client group of the local refs that holds the \fB\%ssh:NAME\fR item of the client name.
+A push session names its namespace in \fB\%Hello\fR: the local refs, or one collection.
+The \fB\%collection\-id\fR of \fB\%[core]\fR names the local refs.
+\fB\%ostrya receive\fR gives a session the client group of that namespace that holds the \fB\%ssh:NAME\fR item of the client name.
 With no such group, the session gets \fB\%ref\-denied\fR.
-\fB\%ostrya serve\fR gives a session the client group of the local refs that holds the item that identified the request.
+\fB\%ostrya serve\fR gives a session the client group of that namespace that holds the item that identified the request.
 With no such group, the request gets 403.
+For a collection, a group that names the collection wins over a group with \fB\%collection=*\fR.
+A session of a collection reads and writes the refs below \fB\%refs/mirrors/ID/\fR alone.
 \fB\%ostrya send\fR serves the refs that the groups of the \fB\%ssh:NAME\fR item read.
 With client groups and no group that holds that item, it writes an error line and exits 1 before it reads its input.
 \fB\%ostrya serve\fR takes its settings from the server group, and an option of the command has precedence over the key of its name.
@@ -528,7 +532,11 @@ So a delete needs \fB\%r\fR and \fB\%d\fR, for example the item \fB\%rd:PATTERN\
 .IP \(bu 2
 An update that writes a commit needs \fB\%w\fR or \fB\%t\fR.
 .IP \(bu 2
-A push writes no remote ref, and no \fB\%ostree\-metadata\fR in a repository with a collection id.
+A push writes no remote ref, and no \fB\%ostree\-metadata\fR in the local refs of a repository with a collection id.
+.IP \(bu 2
+The \fB\%ostree.collection\-binding\fR of a new commit must name the collection of the namespace.
+For the local refs, that is the \fB\%collection\-id\fR of \fB\%[core]\fR, and in a repository with no collection id, each collection binding is refused.
+A commit with no collection binding passes in each namespace.
 .IP \(bu 2
 The parent chain of a new branch can stop at any depth.
 On a branch that exists, the chain of the new commit must reach the current commit, else the update is \fB\%non\-fast\-forward\fR.

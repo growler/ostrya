@@ -375,10 +375,14 @@ enum Command {
     /// an error line and exits 1 before it opens the repository. At start,
     /// the command reads and checks the client groups, the server group, the
     /// trust groups, and the key groups of the repository config, and a bad
-    /// group ends it with status 1. The session takes the policy of the
-    /// client group of the local refs that carries the item `ssh:NAME`. With
-    /// no such group, the session opens no push session: `Hello` gets
-    /// `ref-denied`. The session uses no `anonymous` and no `net:` item.
+    /// group ends it with status 1. `Hello` names the namespace of the
+    /// session: the local refs, or one collection. The session takes the
+    /// policy of the client group of that namespace that carries the item
+    /// `ssh:NAME`. For a collection, a group that names the collection wins
+    /// over a group with `collection=*`. With no such group, `Hello` gets
+    /// `ref-denied`. A session of a collection writes the refs under
+    /// `refs/mirrors/ID/`. The session uses no `anonymous` and no `net:`
+    /// item.
     /// Standard output carries the frames of the session alone. For each
     /// warning of the session, the command writes one `warning: STEP: MESSAGE`
     /// line to standard error. It writes nothing else, also under --verbose.
@@ -395,10 +399,16 @@ enum Command {
     /// the receive endpoint of `ostrya serve`. The push drops the detached
     /// metadata keys that `[ex-ostrya] detached-metadata-exclude` names.
     ///
+    /// The collection bindings of the source commits, or --collection, give
+    /// the namespace of the push on the server: the local refs or one
+    /// collection. The server writes the refs of a collection other than its
+    /// own collection id under `refs/mirrors/ID/`.
+    ///
     /// On success, standard output carries one line for each ref, in the order
-    /// of the refspecs. A line holds the DST name, the old state, and the new
-    /// state. The old state is a full commit checksum, `(new)`, or `(absent)`.
-    /// The new state is a full commit checksum, `(unchanged)`, or `(deleted)`.
+    /// of the refspecs and then of the tags. A line holds the DST name, the
+    /// old state, and the new state. The old state is a full commit checksum,
+    /// `(new)`, or `(absent)`. The new state is a full commit checksum,
+    /// `(unchanged)`, or `(deleted)`.
     ///
     /// Under --verbose, one statistics line goes to standard error. If
     /// standard error is a terminal and `TERM` is set and is not `dumb`,
@@ -437,9 +447,10 @@ enum Command {
     /// identifies the client of each request by the auth items of the client
     /// groups: a bearer token, a Basic credential, a client certificate, the
     /// client address, or `anonymous`. A request that identifies no item gets
-    /// 401 or 403 and no file. A session takes the policy of the client group
-    /// of the local refs that carries the item. With no such group, or with a
-    /// group that opens no push session, the session request gets 403.
+    /// 401 or 403 and no file. A push session takes the policy of the client
+    /// group that carries the item in the namespace of its `Hello`: the local
+    /// refs, or one collection. With no such group, or with a group that
+    /// opens no push session, the session request gets 403.
     ///
     /// A ref under `refs/heads/` or `refs/mirrors/ID/` is served when the
     /// client group of the item has `r` on its name. An alias needs `r` on
@@ -2894,6 +2905,37 @@ struct PushArgs {
     /// client group of the push has `w` and `d` on the ref.
     #[arg(long)]
     force: bool,
+    /// Write the refs of the collection ID on the server.
+    ///
+    /// The push reads the `ostree.collection-binding` of each source commit.
+    /// Without this option, the bindings give the namespace on the server: a
+    /// commit with no binding goes to the local refs, and a commit bound to
+    /// ID goes to the refs of ID. The server writes the refs of its own
+    /// collection id under `refs/heads/`, and the refs of each other
+    /// collection under `refs/mirrors/ID/`. `commit` binds each commit of a
+    /// repository with a collection id to that id. So a push of such a
+    /// commit to a server with another collection id, or with none, writes
+    /// `refs/mirrors/ID/NAME` on the server.
+    ///
+    /// The command refuses two source commits with different bindings, a
+    /// binding that differs from ID, and a commit with no binding that goes
+    /// to the refs of a collection. It refuses an ID or a binding that fails
+    /// the collection-id rule or is longer than 255 bytes before it starts
+    /// the transport.
+    #[arg(long, value_name = "ID")]
+    collection: Option<String>,
+    /// Create the ref NAME on the server at the source commit.
+    ///
+    /// The option can occur more than once. A tag is a ref update that
+    /// expects no ref, also with --force. So a tag that exists gets
+    /// ref-mismatch after the server reports its refs, and before the push
+    /// sends an object. The refspecs that are not deletes must give one
+    /// commit, and the `ostree.ref-binding` of that commit must hold NAME.
+    /// NAME passes the ref-name rule, has no `:`, is not 64 lowercase hex
+    /// characters, and is not a DST. The client group of the push needs `t`
+    /// or `w` on NAME.
+    #[arg(long = "tag", value_name = "NAME")]
+    tags: Vec<String>,
     /// Send the content objects deflated at LEVEL, 1 to 9.
     ///
     /// The value needs the `=` form, and --compress alone gives level 6.
@@ -3617,27 +3659,27 @@ fn read_serve_file(path: &Path) -> Vec<u8> {
 ///
 /// The command reads and checks the client groups, the server group, the
 /// trust groups, and the key groups of the repository config at start. The
-/// session runs under the policy of the client group of the local refs that
-/// carries `client`. With no such group, it runs under the default policy,
-/// which opens no push session. Standard output carries the frames of the
-/// session alone. Each warning of the report goes to standard error as one
-/// line. A failure goes there as the error line of [`main`].
+/// session runs under the policy of the client group that carries `client`
+/// in the namespace of `Hello`. With no such group, `Hello` gets
+/// `ref-denied`. Standard output carries the frames of the session alone.
+/// Each warning of the report goes to standard error as one line. A failure
+/// goes there as the error line of [`main`].
 ///
 /// The command writes nothing else, also under `--verbose`.
 #[cfg(feature = "receive")]
 async fn receive(repo: Repo, client: ostrya::access::AuthItem) -> Result<()> {
     let policies = ostrya::ReceivePolicies::from_config(&repo).await?;
-    let default = ostrya::ReceivePolicy::default();
-    // `Hello` names no collection, so the session takes the group of the
-    // local refs.
-    let policy = match policies.select(&client, &ostrya::access::Namespace::Local) {
-        Some((_, policy)) => policy.as_ref(),
-        None => &default,
+    let select = |namespace: &ostrya::access::Namespace| {
+        policies
+            .select(&client, namespace)
+            .map(|(_, policy)| policy.as_ref())
     };
     // The input is read at most 256 KiB ahead of the session. Under the smol
     // backend, the output goes through a blocking-pool pipe of 8 MiB, so up
     // to 8 MiB that the session wrote can wait in the pipe.
-    let report = repo.receive(stdin_file()?, stdout_file()?, policy).await?;
+    let report = repo
+        .receive_selected(stdin_file()?, stdout_file()?, select)
+        .await?;
     for warning in &report.warnings {
         eprintln!(
             "warning: {}: {}",
@@ -3723,9 +3765,9 @@ async fn send(repo: Repo, client: ostrya::access::AuthItem) -> Result<()> {
 /// Pushes the commits that the refspecs name to a remote over ssh or HTTP.
 ///
 /// The push updates the refs of the remote in one transaction. Standard output
-/// carries one line for each ref, in the order of the refspecs, and nothing
-/// else. Under `--verbose`, one statistics line goes to standard error. A
-/// failure writes nothing to standard output.
+/// carries one line for each ref, in the order of the refspecs and then of
+/// the tags, and nothing else. Under `--verbose`, one statistics line goes to
+/// standard error. A failure writes nothing to standard output.
 ///
 /// On a terminal, standard error shows the progress bar of [`PushBar`] while
 /// the push runs.
@@ -3737,6 +3779,13 @@ async fn push(repo: Repo, name: &str, verbose: bool, args: PushArgs) -> Result<(
     if args.refspecs.is_empty() {
         exit_with_error(name, "REFSPEC must be specified");
     }
+    // The id is one name under `refs/mirrors/` on the server, and a file
+    // system takes a name of 255 bytes at most.
+    if let Some(id) = &args.collection
+        && (id.len() > 255 || !ostrya::is_collection_id(id))
+    {
+        exit_error(&format!("Invalid collection ID {id}"));
+    }
     let detached_metadata_filter = detached_metadata_filter(&repo)?;
     let overrides = push_overrides(args.connect);
     let endpoint = ostrya::endpoint::resolve_push(Some(repo.config()), remote, overrides).await?;
@@ -3744,6 +3793,8 @@ async fn push(repo: Repo, name: &str, verbose: bool, args: PushArgs) -> Result<(
     let opts = ostrya::RepoPushOptions {
         refspecs: args.refspecs,
         depth: args.depth,
+        collection: args.collection,
+        tags: args.tags,
         compression: push_compression(args.compress),
         force: args.force,
         detached_metadata_filter,

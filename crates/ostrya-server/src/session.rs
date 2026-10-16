@@ -632,6 +632,7 @@ pub(crate) mod tests {
                 version: 1,
                 agent: None,
                 refs: vec!["main".into()],
+                collection: None,
                 one_way: false,
             };
             let policy = Arc::new(pushing_policy());

@@ -18,6 +18,7 @@ use common::receive::{PIPE_CAP, PipeReader, PipeWriter, is_root, new_repo, pipe,
 use common::{Counting, TmpDir, mark_partial};
 use futures_io::AsyncWrite;
 use futures_lite::future::zip;
+use ostrya::access::CollectionScope;
 use ostrya::remote::{self, Compression, PushOutcome, PushProgress};
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, DetachedMetadataFilter,
@@ -511,45 +512,314 @@ fn an_empty_ref_binding_list_passes() {
     assert_eq!(tip(&pair.server, "b"), Some(c1));
 }
 
+/// Returns the metadata of a commit bound to the collection `id` and to the
+/// refs `refs`. An empty `refs` gives no ref binding.
+fn bound(id: Option<&str>, refs: &[&str]) -> Option<Value> {
+    let mut metadata = DictBuilder::new();
+    if !refs.is_empty() {
+        let refs: Vec<String> = refs.iter().map(|r| (*r).to_owned()).collect();
+        metadata.insert_strv("ostree.ref-binding", &refs);
+    }
+    if let Some(id) = id {
+        metadata.insert_str("ostree.collection-binding", id);
+    }
+    Some(metadata.build())
+}
+
+/// The policy of a client group with `collection=*` and the allow items
+/// `allow`.
+fn collections(allow: &[&str]) -> ReceivePolicy {
+    ReceivePolicy {
+        scope: CollectionScope::AllOther,
+        ..policy_allowing(allow)
+    }
+}
+
+fn ref_file(repo: &Repo, relpath: &str) -> Option<String> {
+    std::fs::read_to_string(repo.path().join(relpath)).ok()
+}
+
+fn assert_binding_mismatch<T: std::fmt::Debug>(result: &ostrya::Result<T>, needle: &str) {
+    match result {
+        Err(Error::Remote(remote::Error::BindingMismatch(msg))) => {
+            assert!(msg.contains(needle), "{msg:?} lacks {needle:?}")
+        }
+        other => panic!("expected BindingMismatch, got {other:?}"),
+    }
+}
+
+/// A commit bound to a collection that is not the collection id of the
+/// server goes to `refs/mirrors/ID/` of the server. The server has no
+/// collection id here.
 #[test]
-fn a_collection_binding_mismatch_is_refused_before_any_upload() {
+fn a_commit_bound_to_another_collection_goes_to_the_mirror_refs() {
+    let pair = Pair::new("mirror", RepoMode::Archive, RepoMode::Archive, "");
+    let c1 = commit(
+        &pair.client,
+        "main",
+        None,
+        "c1",
+        bound(Some("org.example.Os"), &[]),
+    );
+    let (report, outcome) = push_under(&pair, opts(&["main"]), &collections(&["w:**"]), |_| {});
+    let report = report.unwrap();
+    assert_eq!(report.collection.as_deref(), Some("org.example.Os"));
+    outcome.unwrap();
+    assert_eq!(
+        ref_file(&pair.server, "refs/mirrors/org.example.Os/main"),
+        Some(format!("{c1}\n"))
+    );
+    assert_eq!(tip(&pair.server, "main"), None);
+}
+
+/// A commit bound to the collection id of the server goes to the local refs.
+/// A commit with no binding goes there with it.
+#[test]
+fn a_commit_bound_to_the_server_collection_goes_to_the_local_refs() {
     let pair = Pair::new(
-        "collection",
+        "own",
+        RepoMode::Archive,
+        RepoMode::Archive,
+        "collection-id=org.example.Os\n",
+    );
+    let c1 = commit(
+        &pair.client,
+        "main",
+        None,
+        "c1",
+        bound(Some("org.example.Os"), &[]),
+    );
+    let c2 = commit(&pair.client, "other", None, "c2", None);
+    let (report, outcome) = push(&pair, opts(&["main", "other"]));
+    assert_eq!(report.unwrap().collection, None);
+    let outcome = outcome.unwrap();
+    assert_eq!(outcome.refs.len(), 2);
+    assert_eq!(tip(&pair.server, "main"), Some(c1));
+    assert_eq!(tip(&pair.server, "other"), Some(c2));
+    assert!(
+        !pair
+            .server
+            .path()
+            .join("refs/mirrors/org.example.Os")
+            .exists()
+    );
+}
+
+/// Two different bindings, a `collection` that differs from the binding, a
+/// `collection` that fails the collection-id rule or is longer than 255
+/// bytes, and a binding that fails the collection-id rule are refused before
+/// the push writes a byte.
+#[test]
+fn disagreeing_collections_are_refused_before_any_byte() {
+    let dir = TmpDir::new("push-repo-mixed-bindings");
+    let repo = new_repo(&dir, RepoMode::Archive, "");
+    commit(&repo, "os-a", None, "a", bound(Some("org.example.A"), &[]));
+    commit(&repo, "os-b", None, "b", bound(Some("org.example.B"), &[]));
+    let (error, written) = refused(&repo, opts(&["os-a", "os-b"]));
+    assert_binding_mismatch::<()>(&Err(error), "'org.example.A'");
+    assert_eq!(written, 0);
+    let (error, written) = refused(
+        &repo,
+        RepoPushOptions {
+            collection: Some("org.example.B".into()),
+            ..opts(&["os-a"])
+        },
+    );
+    assert_binding_mismatch::<()>(&Err(error), "not 'org.example.B'");
+    assert_eq!(written, 0);
+    let (error, written) = refused(
+        &repo,
+        RepoPushOptions {
+            collection: Some("no-dot".into()),
+            ..opts(&["os-a"])
+        },
+    );
+    assert_invalid_input(&error, "invalid collection id 'no-dot'");
+    assert_eq!(written, 0);
+    let (error, written) = refused(
+        &repo,
+        RepoPushOptions {
+            collection: Some(format!("org.{}", "a".repeat(252))),
+            ..opts(&["os-a"])
+        },
+    );
+    assert_invalid_input(&error, "256 bytes");
+    assert_eq!(written, 0);
+    commit(&repo, "os-bad", None, "bad", bound(Some("no-dot"), &[]));
+    let (error, written) = refused(&repo, opts(&["os-bad"]));
+    assert_invalid_input(&error, "'no-dot'");
+    assert_eq!(written, 0);
+}
+
+/// A commit with no binding goes to the local refs alone. If `Hello` names a
+/// collection that is not the collection id of the server, the push sends
+/// `Abort` after `HelloReply` and sends no `Have`. This holds for a
+/// requested collection and for the binding of another source commit.
+#[test]
+fn an_unbound_commit_is_refused_in_a_collection_before_any_upload() {
+    let pair = Pair::new(
+        "unbound-collection",
         RepoMode::Archive,
         RepoMode::Archive,
         "collection-id=org.example.Server\n",
     );
-    let mut metadata = DictBuilder::new();
-    metadata.insert_str("ostree.collection-binding", "org.example.Other");
-    let c1 = commit(&pair.client, "main", None, "c1", Some(metadata.build()));
-    let progress = PushProgress::new();
-    let (kinds, hook) = frame_kinds();
-    let (report, outcome) = push_through(
-        &pair,
+    let c1 = commit(&pair.client, "main", None, "c1", None);
+    commit(
+        &pair.client,
+        "os",
+        None,
+        "os",
+        bound(Some("org.example.Os"), &[]),
+    );
+    for opts in [
         RepoPushOptions {
-            progress: Some(progress.clone()),
+            collection: Some("org.example.Os".into()),
             ..opts(&["main"])
         },
-        hook,
-    );
-    assert_aborted(&report);
-    match outcome {
-        Err(Error::Remote(remote::Error::BindingMismatch(msg))) => {
-            assert!(msg.contains("org.example.Other"), "{msg}");
-        }
-        other => panic!("expected BindingMismatch, got {other:?}"),
+        opts(&["main", "os"]),
+    ] {
+        let progress = PushProgress::new();
+        let (kinds, hook) = frame_kinds();
+        let (report, outcome) = push_under(
+            &pair,
+            RepoPushOptions {
+                progress: Some(progress.clone()),
+                ..opts
+            },
+            &collections(&["w:**"]),
+            hook,
+        );
+        assert_aborted(&report);
+        assert_binding_mismatch(&outcome, "has no collection binding");
+        let kinds = kinds.lock().unwrap().clone();
+        assert!(!kinds.contains(&HAVE_FRAME), "{kinds:?}");
+        assert_eq!(kinds.last(), Some(&ABORT_FRAME), "{kinds:?}");
+        assert_eq!(progress.snapshot().objects_total, 0, "no Have was sent");
+        assert!(!has_commit(&pair.server, &c1));
     }
-    // The client refuses after `Hello` and sends no `Have`. The check of
-    // the server runs only after the upload.
-    let kinds = kinds.lock().unwrap().clone();
-    assert!(!kinds.contains(&HAVE_FRAME), "{kinds:?}");
-    assert_eq!(kinds.last(), Some(&ABORT_FRAME), "{kinds:?}");
-    let snapshot = progress.snapshot();
-    assert_eq!(snapshot.objects_total, 0, "no Have was sent");
-    assert_eq!(snapshot.objects_sent, 0);
-    assert_eq!(snapshot.payload_bytes, 0);
-    assert!(!has_commit(&pair.server, &c1));
-    assert_eq!(tip(&pair.server, "main"), None);
+    assert!(
+        !pair
+            .server
+            .path()
+            .join("refs/mirrors")
+            .join("org.example.Os")
+            .exists()
+    );
+}
+
+/// A tag is a ref update that expects no ref at the source commit. A tag
+/// that exists is `ref-mismatch`, also with `force`. The push sends `Abort`
+/// after `HelloReply`, and sends no `Have` and no object.
+#[test]
+fn a_tag_is_created_once_at_the_source_commit() {
+    let pair = Pair::new("tag", RepoMode::Archive, RepoMode::Archive, "");
+    let c1 = commit(
+        &pair.client,
+        "main",
+        None,
+        "c1",
+        bound(None, &["main", "v1"]),
+    );
+    let tags = || RepoPushOptions {
+        tags: vec!["v1".into()],
+        ..opts(&["main"])
+    };
+    let policy = policy_allowing(&["w:main", "t:v1"]);
+    let (report, outcome) = push_under(&pair, tags(), &policy, |_| {});
+    report.unwrap();
+    let outcome = outcome.unwrap();
+    let names: Vec<_> = outcome
+        .refs
+        .iter()
+        .map(|r| (r.name.as_str(), r.old, r.new))
+        .collect();
+    assert_eq!(
+        names,
+        vec![("main", None, Some(c1)), ("v1", None, Some(c1))]
+    );
+    assert_eq!(tip(&pair.server, "v1"), Some(c1));
+
+    let c2 = commit(
+        &pair.client,
+        "main",
+        Some(c1),
+        "c2",
+        bound(None, &["main", "v1"]),
+    );
+    for force in [false, true] {
+        let progress = PushProgress::new();
+        let (kinds, hook) = frame_kinds();
+        let (report, outcome) = push_under(
+            &pair,
+            RepoPushOptions {
+                force,
+                progress: Some(progress.clone()),
+                ..tags()
+            },
+            &policy,
+            hook,
+        );
+        assert_aborted(&report);
+        match outcome {
+            Err(Error::Remote(remote::Error::RefMismatch { name, current, .. })) => {
+                assert_eq!(name, "v1");
+                assert_eq!(current, Some(c1));
+            }
+            other => panic!("expected RefMismatch, got {other:?}"),
+        }
+        let kinds = kinds.lock().unwrap().clone();
+        assert!(!kinds.contains(&HAVE_FRAME), "{kinds:?}");
+        assert_eq!(kinds.last(), Some(&ABORT_FRAME), "{kinds:?}");
+        let snapshot = progress.snapshot();
+        assert_eq!(snapshot.objects_total, 0, "no Have was sent");
+        assert_eq!(snapshot.payload_bytes, 0, "no object was sent");
+        assert!(!has_commit(&pair.server, &c2));
+        assert_eq!(tip(&pair.server, "main"), Some(c1));
+    }
+}
+
+/// A tag needs one source commit whose ref binding holds the tag. A tag name
+/// that a push cannot create is refused. Each refusal comes before the push
+/// writes a byte.
+#[test]
+fn a_tag_the_push_cannot_create_is_refused_before_any_byte() {
+    let dir = TmpDir::new("push-repo-bad-tag");
+    let repo = new_repo(&dir, RepoMode::Archive, "");
+    let c1 = commit(&repo, "main", None, "c1", bound(None, &["main", "v1"]));
+    commit(&repo, "other", None, "c2", bound(None, &["other", "v1"]));
+    commit(&repo, "plain", None, "c3", None);
+    let with = |specs: &[&str], tags: &[&str]| RepoPushOptions {
+        tags: tags.iter().map(|t| (*t).to_owned()).collect(),
+        ..opts(specs)
+    };
+
+    let (error, written) = refused(&repo, with(&["main"], &["v2"]));
+    assert_binding_mismatch::<()>(&Err(error), "the tag 'v2'");
+    assert_eq!(written, 0);
+    let (error, written) = refused(&repo, with(&["plain"], &["v1"]));
+    assert_binding_mismatch::<()>(&Err(error), "the tag 'v1'");
+    assert_eq!(written, 0);
+    let (error, written) = refused(&repo, with(&["main", "other"], &["v1"]));
+    assert_invalid_input(&error, "one source commit");
+    assert_eq!(written, 0);
+    let (error, written) = refused(&repo, with(&[":gone"], &["v1"]));
+    assert_invalid_input(&error, "not a delete");
+    assert_eq!(written, 0);
+    let (error, written) = refused(&repo, with(&["main"], &["v1", "v1"]));
+    assert_invalid_input(&error, "named twice");
+    assert_eq!(written, 0);
+    let (error, written) = refused(&repo, with(&["main"], &["main"]));
+    assert_invalid_input(&error, "destination");
+    assert_eq!(written, 0);
+    let hex = c1.to_string();
+    for name in ["origin:v1", "a b", hex.as_str()] {
+        let (error, written) = refused(&repo, with(&["main"], &[name]));
+        match error {
+            Error::InvalidRefspec(got) => assert_eq!(got, name),
+            other => panic!("{name}: expected InvalidRefspec, got {other:?}"),
+        }
+        assert_eq!(written, 0);
+    }
 }
 
 #[test]

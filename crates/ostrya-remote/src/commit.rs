@@ -138,7 +138,8 @@ pub(crate) struct CommitInputs<'a> {
     pub(crate) refs: &'a [String],
     /// If `true`, the metadata holds no ref binding and no collection binding.
     pub(crate) no_bindings: bool,
-    /// The collection id of the server.
+    /// The collection id that the commit binds to, from
+    /// [`ServerInfo::binding_collection`](crate::ServerInfo::binding_collection).
     pub(crate) collection_id: Option<&'a str>,
     pub(crate) root_dirtree: Checksum,
     pub(crate) root_dirmeta: Checksum,
@@ -352,6 +353,7 @@ mod tests {
             version: 1,
             mode: "archive".into(),
             collection_id: collection_id.map(str::to_owned),
+            collection: None,
             max_frame: 1 << 20,
             max_have: 16_384,
             encodings: vec![Encoding::Raw],

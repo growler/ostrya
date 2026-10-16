@@ -826,6 +826,7 @@ fn session_request_with(name: &str, headers: &str) -> Vec<u8> {
         version: 1,
         agent: None,
         refs: vec![name.into()],
+        collection: None,
         one_way: false,
     });
     let body = ostrya_rt::block_on(async {

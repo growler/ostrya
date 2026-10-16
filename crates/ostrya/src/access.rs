@@ -168,10 +168,37 @@ pub enum Namespace {
     Collection(String),
 }
 
+impl Namespace {
+    /// Returns the namespace of the collection id `collection` in a
+    /// repository whose own collection id is `own`.
+    ///
+    /// `None` and `own` give [`Local`](Namespace::Local). Each other id gives
+    /// [`Collection`](Namespace::Collection).
+    pub(crate) fn of(collection: Option<&str>, own: Option<&str>) -> Namespace {
+        match collection {
+            Some(id) if Some(id) != own => Namespace::Collection(id.to_owned()),
+            _ => Namespace::Local,
+        }
+    }
+
+    /// Returns the collection id of a collection namespace, or `None` for
+    /// the local refs.
+    #[cfg(feature = "receive")]
+    pub(crate) fn collection(&self) -> Option<&str> {
+        match self {
+            Namespace::Local => None,
+            Namespace::Collection(id) => Some(id),
+        }
+    }
+}
+
 /// The namespace of a client group, from its `collection` key.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// The [`Default`] scope is [`Local`](CollectionScope::Local).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub enum CollectionScope {
     /// No `collection` key: the local refs.
+    #[default]
     Local,
     /// A list of collection ids, in the order of the config, each one time.
     Ids(Vec<String>),
@@ -181,6 +208,23 @@ pub enum CollectionScope {
 }
 
 impl CollectionScope {
+    /// Returns `true` if the scope holds `namespace`.
+    ///
+    /// A `*` scope holds each [`Collection`](Namespace::Collection) whose id
+    /// passes the collection-id rule. [`ClientAccess::select`] also refuses
+    /// the own collection id, which [`ClientAccess::namespace`] maps to
+    /// [`Local`](Namespace::Local).
+    pub fn covers(&self, namespace: &Namespace) -> bool {
+        match (self, namespace) {
+            (CollectionScope::Local, Namespace::Local) => true,
+            (CollectionScope::Ids(ids), Namespace::Collection(id)) => ids.contains(id),
+            (CollectionScope::AllOther, Namespace::Collection(id)) => {
+                ostrya_core::is_collection_id(id)
+            }
+            _ => false,
+        }
+    }
+
     /// Returns `true` if one namespace is in both scopes.
     fn overlaps(&self, other: &CollectionScope) -> bool {
         match (self, other) {
@@ -271,20 +315,10 @@ impl ClientGroup {
 
     /// Returns `true` if the scope of the group holds `namespace`.
     ///
-    /// The method reads the scope alone. A `*` scope holds each
-    /// [`Collection`](Namespace::Collection) whose id passes the
-    /// collection-id rule. [`ClientAccess::select`] also refuses the own
-    /// collection id, which [`ClientAccess::namespace`] maps to
-    /// [`Local`](Namespace::Local).
+    /// The method reads the scope alone, as [`CollectionScope::covers`]
+    /// states.
     pub fn covers(&self, namespace: &Namespace) -> bool {
-        match (&self.scope, namespace) {
-            (CollectionScope::Local, Namespace::Local) => true,
-            (CollectionScope::Ids(ids), Namespace::Collection(id)) => ids.contains(id),
-            (CollectionScope::AllOther, Namespace::Collection(id)) => {
-                ostrya_core::is_collection_id(id)
-            }
-            _ => false,
-        }
+        self.scope.covers(namespace)
     }
 
     /// Returns the group name of the group, for the error messages.
@@ -598,12 +632,7 @@ impl ClientAccess {
     /// [`Collection`](Namespace::Collection), also an id that fails the
     /// collection-id rule.
     pub fn namespace(&self, collection: Option<&str>) -> Namespace {
-        match collection {
-            Some(id) if Some(id) != self.collection_id.as_deref() => {
-                Namespace::Collection(id.to_owned())
-            }
-            _ => Namespace::Local,
-        }
+        Namespace::of(collection, self.collection_id.as_deref())
     }
 
     /// Returns the group that carries `item` in `namespace`, or `None`.

@@ -431,23 +431,33 @@ enum Command {
     ///
     /// The repository can be in any mode that ostrya reads. In a mode other
     /// than `archive`, the server builds each `.filez` object on request. The
-    /// server also answers the ref listing at `/_ostrya/refs/v1`. Without
-    /// --read-only, the server also has the receive endpoint of a push. The
-    /// endpoint identifies the client of each request by the auth items of
-    /// the client groups: a bearer token, a Basic credential, a client
-    /// certificate, the client address, or `anonymous`. A session takes the
-    /// policy of the client group of the local refs that carries the item.
-    /// With no such group, or with a group that opens no push session, the
-    /// session request gets 403. At start, the command reads and checks the
-    /// client groups and the server group of the repository config. Without
-    /// --read-only, it also reads the trust groups and the key groups. A bad
-    /// group ends the command with status 1.
+    /// server also answers the ref listing at `/_ostrya/refs/v1`, and has
+    /// the receive endpoint of a push. The client groups of the repository
+    /// config give the push rights. The endpoint identifies the client of
+    /// each request by the auth items of the client groups: a bearer token, a
+    /// Basic credential, a client certificate, the client address, or
+    /// `anonymous`. A session takes the policy of the client group of the
+    /// local refs that carries the item. With no such group, or with a group
+    /// that opens no push session, the session request gets 403.
+    ///
+    /// The server takes its settings from `[ex-ostrya server]` of the
+    /// repository config. Each option of the command with the name of a key
+    /// has precedence over the key. A relative path in a key is relative to
+    /// the repository directory, and a relative path in an option is
+    /// relative to the current directory. `sign-summary` has no option. The
+    /// command refuses the keys `trusted-proxy` and
+    /// `trusted-proxy-client-cert`, and `proxy-protocol=true`, because it
+    /// does not support a proxy yet. At start, the command reads and checks
+    /// the client groups, the server group, the trust groups, and the key
+    /// groups. A bad group, or a key group whose key the command cannot
+    /// read, ends the command with status 1.
     ///
     /// When all listeners are bound, the command writes the URL of each
-    /// listener to standard output, one line each. Then it serves until the
-    /// process ends. For each push session that commits, the command writes
-    /// one `warning: STEP: MESSAGE` line to standard error for each warning
-    /// of the session.
+    /// listener to standard output, one line each, and writes nothing else
+    /// to standard output. Then it serves until the process ends. Warnings
+    /// and errors go to standard error. For each push session that commits,
+    /// the command writes one `warning: STEP: MESSAGE` line to standard error
+    /// for each warning of the session.
     #[cfg(feature = "serve")]
     Serve(ServeArgs),
     /// Serve one pull session over standard input and standard output.
@@ -2641,99 +2651,114 @@ struct SendArgs {
 struct ServeArgs {
     /// Listen on ADDR:PORT, an IP address and a port.
     ///
-    /// Give the option once for each address. Without it, the server listens
-    /// on `127.0.0.1:8080`. Port 0 lets the kernel choose a port. The command
+    /// Give the option once for each address. The options replace the whole
+    /// `listen` key. Without the option and the key, the server listens on
+    /// `127.0.0.1:8080`. Port 0 lets the kernel choose a port. The command
     /// refuses a host name. When all listeners are bound, the command writes
     /// the URL of each listener to standard output, one line each.
     #[arg(long, value_name = "ADDR:PORT")]
     listen: Vec<std::net::SocketAddr>,
     /// Serve HTTPS with the certificate chain in FILE, in PEM.
     ///
-    /// The option needs --tls-key. ALPN selects HTTP/2 or HTTP/1.1. The
-    /// command reads FILE once, at start, and refuses a file larger than
-    /// 1 MiB.
-    #[arg(long, value_name = "FILE", requires = "tls_key")]
+    /// The certificate needs a key, from --tls-key or from the `tls-key`
+    /// key. ALPN selects HTTP/2 or HTTP/1.1. The command reads FILE once, at
+    /// start, and refuses a file larger than 1 MiB.
+    #[arg(long, value_name = "FILE")]
     tls_cert: Option<PathBuf>,
-    /// The private key of --tls-cert, in PEM.
+    /// The private key of the server certificate, in PEM.
     ///
-    /// The command refuses an encrypted key, because it has no option for a
-    /// passphrase. It reads FILE once, at start, and refuses a file larger
-    /// than 1 MiB.
-    #[arg(long, value_name = "FILE", requires = "tls_cert")]
+    /// The key needs a certificate, from --tls-cert or from the `tls-cert`
+    /// key. The command refuses an encrypted key, because it has no option
+    /// for a passphrase. It reads FILE once, at start, and refuses a file
+    /// larger than 1 MiB.
+    #[arg(long, value_name = "FILE")]
     tls_key: Option<PathBuf>,
     /// Verify client certificates against the CA certificates in FILE, in PEM.
     ///
-    /// The option needs --tls-cert. A client that presents a certificate must
-    /// present one that the CA signed. A client that presents no certificate
-    /// is served. A client certificate that the CA signed can match a
-    /// `tls:*`, `tls:NAME`, or `tls-sha256:HEX` item of a client group. The
-    /// start checks of the client groups take the client CA from this option
-    /// alone, also when `[ex-ostrya server]` sets `tls-client-ca`.
-    #[arg(long, value_name = "FILE", requires = "tls_cert")]
-    client_ca: Option<PathBuf>,
-    /// Serve the files of a pull alone, with no receive endpoint.
-    ///
-    /// The options of the receive endpoint conflict with this switch.
-    #[arg(long)]
-    read_only: bool,
+    /// The CA needs a server certificate, from --tls-cert or from the
+    /// `tls-cert` key. A client that presents a certificate must present one
+    /// that the CA signed. A client that presents no certificate is served. A
+    /// client certificate that the CA signed can match a `tls:*`, `tls:NAME`,
+    /// or `tls-sha256:HEX` item of a client group. The command reads FILE
+    /// once, at start, and refuses a file larger than 1 MiB.
+    #[arg(long, value_name = "FILE")]
+    tls_client_ca: Option<PathBuf>,
     /// Take a bearer or Basic credential of push over plain HTTP.
     ///
-    /// Without this switch, the receive endpoint answers 403 to such a
-    /// request, also when a client group has the `anonymous` item. Use it for
-    /// a server on a loopback address or behind a proxy that terminates TLS.
-    /// A read of the files of a pull needs no credential.
-    #[arg(long, conflicts_with = "read_only")]
-    allow_cleartext_credentials: bool,
+    /// `--allow-cleartext-credentials` takes such a credential, and
+    /// `--allow-cleartext-credentials=false` refuses it. Without the option
+    /// and the key, the receive endpoint answers 403 to such a request, also
+    /// when a client group has the `anonymous` item. Use it for a server on a
+    /// loopback address or behind a proxy that terminates TLS. A read of the
+    /// files of a pull needs no credential.
+    #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
+    allow_cleartext_credentials: Option<bool>,
     /// Abort a push session that stays idle for SECONDS.
     ///
     /// A push session is idle when it has no request in progress, or when its
     /// request body delivers no byte. The value is a positive integer.
+    /// Without the option and the key, the value is 300.
     #[arg(
         long,
         value_name = "SECONDS",
-        default_value = "300",
-        value_parser = clap::value_parser!(u64).range(1..),
-        conflicts_with = "read_only"
+        value_parser = clap::value_parser!(u64).range(1..)
     )]
-    session_timeout: u64,
+    session_timeout: Option<u64>,
     /// Serve at most N push sessions at the same time.
     ///
-    /// The value is a positive integer. A request that opens a session past
-    /// this limit gets the HTTP status 503.
+    /// The value is a positive integer. Without the option and the key, the
+    /// value is 16. A request that opens a session past this limit gets the
+    /// HTTP status 503.
     #[arg(
         long,
         value_name = "N",
-        default_value = "16",
-        value_parser = clap::value_parser!(u64).range(1..),
-        conflicts_with = "read_only"
+        value_parser = clap::value_parser!(u64).range(1..)
     )]
-    max_sessions: u64,
+    max_sessions: Option<u64>,
     /// Let a push session send N object streams at the same time.
     ///
-    /// The value is 1 to 31. The `HelloReply` of a session announces it. Over
-    /// HTTP/2, the receive window of a stream is 2 MiB, and the window of a
-    /// connection is N times 2 MiB.
+    /// The value is 1 to 31. Without the option and the key, the value is 4.
+    /// The `HelloReply` of a session announces it. Over HTTP/2, the receive
+    /// window of a stream is 2 MiB, and the window of a connection is N
+    /// times 2 MiB.
     #[arg(
         long,
         value_name = "N",
-        default_value = "4",
-        value_parser = clap::value_parser!(u32).range(1..=31),
-        conflicts_with = "read_only"
+        value_parser = clap::value_parser!(u32).range(1..=31)
     )]
-    parallel_uploads: u32,
+    parallel_uploads: Option<u32>,
     /// End a connection whose response waits more than SECONDS for the client.
     ///
     /// The response waits for the client to take its next bytes. If an HTTP/2
     /// client does not answer a ping within SECONDS, it also loses its
-    /// connection. The value is a positive integer. The option also applies
-    /// with --read-only.
+    /// connection. The value is a positive integer. Without the option and
+    /// the key, the value is 60.
     #[arg(
         long,
         value_name = "SECONDS",
-        default_value = "60",
         value_parser = clap::value_parser!(u64).range(1..)
     )]
-    body_timeout: u64,
+    body_timeout: Option<u64>,
+}
+
+#[cfg(feature = "serve")]
+impl ServeArgs {
+    /// Returns the options as the server settings that they replace. An
+    /// option that is not given is `None`.
+    fn settings(self) -> ostrya::access::ServerSettings {
+        ostrya::access::ServerSettings {
+            listen: (!self.listen.is_empty()).then_some(self.listen),
+            tls_cert: self.tls_cert,
+            tls_key: self.tls_key,
+            tls_client_ca: self.tls_client_ca,
+            allow_cleartext_credentials: self.allow_cleartext_credentials,
+            session_timeout: self.session_timeout,
+            max_sessions: self.max_sessions,
+            parallel_uploads: self.parallel_uploads,
+            body_timeout: self.body_timeout,
+            ..ostrya::access::ServerSettings::default()
+        }
+    }
 }
 
 #[cfg(feature = "push")]
@@ -3369,61 +3394,73 @@ const MAX_SERVE_FILE_SIZE: u64 = 1024 * 1024;
 /// When all listeners are bound, the URL of each listener goes to standard
 /// output, one line for each listener.
 ///
-/// `serve` reads and checks the client groups and the server group of the
-/// repository config at start. The checks take the TLS files from the
-/// options of the command alone, because the server runs with these files.
-/// Without `--read-only`, it also builds the trust groups and the key groups,
-/// and the receive endpoint identifies each client by the client groups. For
-/// each session that commits, each warning of its report goes to standard
-/// error as one line.
+/// `serve` reads and checks the client groups, the server group, the trust
+/// groups, and the key groups of the repository config at start. Each option
+/// of `args` replaces the key of `[ex-ostrya server]` with its name, and the
+/// checks run on the result. The command refuses a set `trusted-proxy`, a set
+/// `trusted-proxy-client-cert`, and `proxy-protocol=true`, because it does
+/// not support a proxy yet. The receive endpoint identifies each client by
+/// the client groups. For each session that commits, each warning of its
+/// report goes to standard error as one line.
 #[cfg(feature = "serve")]
 async fn serve(repo: Repo, args: ServeArgs) -> Result<()> {
     use std::io::Write;
+    use std::time::Duration;
 
+    let policies = Arc::new(ostrya::ReceivePolicies::from_config(&repo).await?);
+    let settings = policies.access().server().overridden_by(&args.settings());
+    for (key, set) in [
+        ("trusted-proxy", settings.trusted_proxy.is_some()),
+        (
+            "trusted-proxy-client-cert",
+            settings.trusted_proxy_client_cert.is_some(),
+        ),
+        ("proxy-protocol", settings.proxy_protocol == Some(true)),
+    ] {
+        if set {
+            return Err(Error::Unsupported(format!(
+                "[ex-ostrya server] {key} is not supported yet"
+            )));
+        }
+    }
+    policies.access().check_server(&settings)?;
     let mut opts = ostrya_server::ServeOptions::default();
-    if !args.listen.is_empty() {
-        opts.listen = args.listen;
+    if let Some(listen) = settings.listen {
+        opts.listen = listen;
     }
-    opts.body_timeout = std::time::Duration::from_secs(args.body_timeout);
-    let policies = if args.read_only {
-        None
-    } else {
-        Some(Arc::new(ostrya::ReceivePolicies::from_config(&repo).await?))
-    };
-    let access = match &policies {
-        Some(policies) => policies.access().clone(),
-        None => ostrya::access::ClientAccess::from_config(repo.config(), repo.path())?,
-    };
-    access.check_server(&ostrya::access::ServerSettings {
-        tls_cert: args.tls_cert.clone(),
-        tls_key: args.tls_key.clone(),
-        tls_client_ca: args.client_ca.clone(),
-        ..access.server().clone()
-    })?;
-    if let Some(policies) = policies {
-        opts.receive = Some(policies);
-        opts.allow_cleartext_credentials = args.allow_cleartext_credentials;
-        opts.session_idle_timeout = std::time::Duration::from_secs(args.session_timeout);
-        opts.max_sessions = usize::try_from(args.max_sessions).unwrap_or(usize::MAX);
-        opts.parallel_uploads = args.parallel_uploads;
-        opts.on_report = Some(Arc::new(|report: ostrya::ReceiveReport| {
-            for warning in &report.warnings {
-                eprintln!(
-                    "warning: {}: {}",
-                    receive_step(warning.step),
-                    warning.message
-                );
-            }
-        }));
+    if let Some(seconds) = settings.body_timeout {
+        opts.body_timeout = Duration::from_secs(seconds);
     }
-    if let (Some(cert), Some(key)) = (&args.tls_cert, &args.tls_key) {
+    if let Some(allow) = settings.allow_cleartext_credentials {
+        opts.allow_cleartext_credentials = allow;
+    }
+    if let Some(seconds) = settings.session_timeout {
+        opts.session_idle_timeout = Duration::from_secs(seconds);
+    }
+    if let Some(n) = settings.max_sessions {
+        opts.max_sessions = usize::try_from(n).unwrap_or(usize::MAX);
+    }
+    if let Some(n) = settings.parallel_uploads {
+        opts.parallel_uploads = n;
+    }
+    if let (Some(cert), Some(key)) = (&settings.tls_cert, &settings.tls_key) {
         opts.tls = Some(ostrya_server::ServerTls {
             cert_chain_pem: read_serve_file(cert),
             key_pem: read_serve_file(key),
             key_passphrase: None,
-            client_ca_pem: args.client_ca.as_deref().map(read_serve_file),
         });
     }
+    opts.client_ca_pem = settings.tls_client_ca.as_deref().map(read_serve_file);
+    opts.receive = Some(policies);
+    opts.on_report = Some(Arc::new(|report: ostrya::ReceiveReport| {
+        for warning in &report.warnings {
+            eprintln!(
+                "warning: {}: {}",
+                receive_step(warning.step),
+                warning.message
+            );
+        }
+    }));
     let scheme = if opts.tls.is_some() { "https" } else { "http" };
     let server = match ostrya_server::bind(repo, opts).await {
         Ok(server) => server,

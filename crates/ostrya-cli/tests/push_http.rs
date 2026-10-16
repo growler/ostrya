@@ -229,15 +229,15 @@ fn serve_options(repo: &Repo) -> ServeOptions {
     serve_options_with(repo, ANONYMOUS_PUSH)
 }
 
-/// The server TLS files of the fixtures, with the fixture CA as the client
-/// CA.
-fn server_tls() -> ServerTls {
-    ServerTls {
+/// Sets the server TLS files of the fixtures on `opts`, with the fixture CA
+/// as the client CA.
+fn with_tls(opts: &mut ServeOptions) {
+    opts.tls = Some(ServerTls {
         cert_chain_pem: read_fixture("server.pem"),
         key_pem: read_fixture("server.key.pem"),
         key_passphrase: None,
-        client_ca_pem: Some(read_fixture("ca.pem")),
-    }
+    });
+    opts.client_ca_pem = Some(read_fixture("ca.pem"));
 }
 
 /// A client group with the bearer token `ALICE`, the Basic credential of
@@ -624,7 +624,7 @@ fn each_method_pushes_over_https_and_no_credential_is_refused() {
     let root = tree(tmp.path(), "tree", 4, 1000);
     let server = repo(tmp.path(), "server");
     let mut opts = serve_options_with(&server, &credential_groups());
-    opts.tls = Some(server_tls());
+    with_tls(&mut opts);
     let (first_server, first_root) = (server.clone(), root.clone());
     with_server(server.clone(), opts, |addr| async move {
         let (server, root) = (first_server, first_root);
@@ -667,7 +667,7 @@ fn each_method_pushes_over_https_and_no_credential_is_refused() {
     });
 
     let mut opts = serve_options(&server);
-    opts.tls = Some(server_tls());
+    with_tls(&mut opts);
     with_server(server.clone(), opts, |addr| async move {
         let url = format!("https://127.0.0.1:{}/", addr.port());
         let outcome = push(Endpoint::Http(fixture_ca(&url)), &root, &["anonymous"])
@@ -691,7 +691,6 @@ fn a_trust_setting_of_the_caller_that_accepts_any_chain_pushes() {
         cert_chain_pem: read_fixture("server-untrusted.pem"),
         key_pem: read_fixture("server-untrusted.key.pem"),
         key_passphrase: None,
-        client_ca_pem: None,
     });
     with_server(server.clone(), opts, |addr| async move {
         let url = format!("https://127.0.0.1:{}/", addr.port());
@@ -721,7 +720,12 @@ fn a_cleartext_credential_needs_the_switch() {
     let root = tree(tmp.path(), "tree", 2, 100);
     let server = repo(tmp.path(), "server");
     let alice = tmp.file("alice", format!("{ALICE}\n").as_bytes());
-    let mut opts = serve_options_with(&server, &credential_groups());
+    // Plain HTTP has no client CA, so the group carries no `tls:` item.
+    let groups = format!(
+        "[ex-ostrya client \"builders\"]\nauth=token-sha256:{}\nallow=w:**\n",
+        Checksum::sha256(ALICE.as_bytes()).to_hex()
+    );
+    let mut opts = serve_options_with(&server, &groups);
     opts.allow_cleartext_credentials = true;
     with_server(server.clone(), opts, |addr| async move {
         let proxy = CountingProxy::start(addr, CommitResponse::Forward);
@@ -1419,7 +1423,7 @@ mod cli {
             "[ex-ostrya client \"certs\"]\nauth=tls:ostrya test\nallow=w:**\n",
         );
         let mut args = server_tls_args();
-        args.push(format!("--client-ca={}", fixture("ca.pem").display()));
+        args.push(format!("--tls-client-ca={}", fixture("ca.pem").display()));
         let serving = Serving::start(&server, &strs(&args));
         let src_arg = src.to_str().unwrap();
         let push_tree = |extra: &[String], branch: &str| {
@@ -1446,6 +1450,41 @@ mod cli {
         );
         let refs = ok("ostrya", &[&format!("--repo={}", server.display()), "refs"]);
         assert_eq!(refs, "main\n");
+    }
+
+    /// With `tls-cert`, `tls-key`, and `tls-client-ca` from the keys of
+    /// `[ex-ostrya server]` and no option of `ostrya serve`, the server
+    /// verifies the client certificate against the CA of the key, and a
+    /// `tls:NAME` item identifies the client. `ostrya push-tree` sets the ref.
+    #[test]
+    fn push_tree_with_a_client_certificate_and_the_tls_keys_of_the_server() {
+        let setup = Setup::new("cli-cert-keys");
+        let src = tree(setup.tmp.path(), "tree", 2, 1000);
+        let server = setup.init("server", "archive");
+        add_config(
+            &server,
+            &format!(
+                "[ex-ostrya server]\ntls-cert={}\ntls-key={}\ntls-client-ca={}\n\
+                 [ex-ostrya client \"certs\"]\nauth=tls:ostrya test\nallow=w:**\n",
+                fixture("server.pem").display(),
+                fixture("server.key.pem").display(),
+                fixture("ca.pem").display(),
+            ),
+        );
+        let serving = Serving::start(&server, &[]);
+        assert!(serving.url.starts_with("https://"), "{}", serving.url);
+        let mut args = vec![
+            "push-tree",
+            serving.url.as_str(),
+            src.to_str().unwrap(),
+            "-b",
+            "main",
+        ];
+        let tls = tls_args(true);
+        args.extend(strs(&tls));
+        let out = ostrya(&args);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(rev_parse(&server, "main"), stdout(&out).trim());
     }
 
     /// Without `--allow-cleartext-credentials`, the push refuses a token to

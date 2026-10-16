@@ -7348,9 +7348,9 @@ inputs. `ostrya push-tree` pushes a local directory over ssh as one commit
 and prints the commit checksum (`docs/conformance/cli-surface.md`, "Port
 extensions with no counterpart in the tool"). Its commit checksum equals
 the checksum of `ostree commit --no-xattrs` over the same tree with the same
-options. The read-only half of `ostrya serve` is done: `ostrya serve
---read-only` serves `ArchiveView`, the archive view of a repository of any
-mode, over HTTP and HTTPS, and `ostree pull` from it passes `ostree fsck`
+options. The read-only half of `ostrya serve` is done: `ostrya serve` serves
+`ArchiveView`, the archive view of a repository of any mode, over HTTP and
+HTTPS, and `ostree pull` from it passes `ostree fsck`
 (`docs/conformance/cli-surface.md`, "Port extensions with no counterpart in
 the tool"). The fetcher has the upload request that the HTTP push transport
 sends through: a `POST` with a body given whole or streamed, retried only

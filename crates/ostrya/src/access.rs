@@ -59,8 +59,9 @@
 //! - `verify`, `sign`, or `sign-summary` names a trust group or a key group
 //!   that does not exist.
 //!
-//! [`ClientAccess::check_server`] checks the server settings after the
-//! values of the command line replace the keys.
+//! [`ServerSettings::overridden_by`] puts the values of the command line in
+//! place of the keys that they replace, and [`ClientAccess::check_server`]
+//! checks the result.
 //!
 //! # Implicit groups
 //!
@@ -291,6 +292,79 @@ pub struct ServerSettings {
     /// `sign-summary`: the key groups that sign a summary that a push writes
     /// again, each one time. An empty value is refused.
     pub sign_summary: Option<Vec<String>>,
+}
+
+impl ServerSettings {
+    /// Returns the settings with each field of `flags` that is set in place
+    /// of the field of `self`.
+    ///
+    /// A server takes the keys of `[ex-ostrya server]` as `self` and the
+    /// values of its command line as `flags`. A field that is `None` in
+    /// `flags` keeps the value of `self`. A list in `flags` replaces the
+    /// whole list of `self`.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ostrya::access::ServerSettings;
+    ///
+    /// let keys = ServerSettings {
+    ///     listen: Some(vec!["0.0.0.0:80".parse()?, "[::]:80".parse()?]),
+    ///     max_sessions: Some(8),
+    ///     ..ServerSettings::default()
+    /// };
+    /// let flags = ServerSettings {
+    ///     listen: Some(vec!["127.0.0.1:8080".parse()?]),
+    ///     ..ServerSettings::default()
+    /// };
+    /// let merged = keys.overridden_by(&flags);
+    /// assert_eq!(merged.listen, flags.listen);
+    /// assert_eq!(merged.max_sessions, Some(8));
+    /// # Ok::<(), std::net::AddrParseError>(())
+    /// ```
+    pub fn overridden_by(&self, flags: &ServerSettings) -> ServerSettings {
+        fn pick<T: Clone>(flag: &Option<T>, key: &Option<T>) -> Option<T> {
+            flag.as_ref().or(key.as_ref()).cloned()
+        }
+        // The pattern names each field, so a new field does not compile
+        // until it is merged here.
+        let ServerSettings {
+            listen,
+            tls_cert,
+            tls_key,
+            tls_client_ca,
+            trusted_proxy,
+            trusted_proxy_client_cert,
+            proxy_protocol,
+            allow_cleartext_credentials,
+            session_timeout,
+            max_sessions,
+            parallel_uploads,
+            body_timeout,
+            sign_summary,
+        } = flags;
+        ServerSettings {
+            listen: pick(listen, &self.listen),
+            tls_cert: pick(tls_cert, &self.tls_cert),
+            tls_key: pick(tls_key, &self.tls_key),
+            tls_client_ca: pick(tls_client_ca, &self.tls_client_ca),
+            trusted_proxy: pick(trusted_proxy, &self.trusted_proxy),
+            trusted_proxy_client_cert: pick(
+                trusted_proxy_client_cert,
+                &self.trusted_proxy_client_cert,
+            ),
+            proxy_protocol: pick(proxy_protocol, &self.proxy_protocol),
+            allow_cleartext_credentials: pick(
+                allow_cleartext_credentials,
+                &self.allow_cleartext_credentials,
+            ),
+            session_timeout: pick(session_timeout, &self.session_timeout),
+            max_sessions: pick(max_sessions, &self.max_sessions),
+            parallel_uploads: pick(parallel_uploads, &self.parallel_uploads),
+            body_timeout: pick(body_timeout, &self.body_timeout),
+            sign_summary: pick(sign_summary, &self.sign_summary),
+        }
+    }
 }
 
 /// The client groups and the server settings of a repository config.
@@ -901,6 +975,62 @@ secret-key-file=/etc/ostrya/release.secret
         );
         let message = check(&configured, configured.server());
         assert!(message.contains("no trusted-proxy"), "{message}");
+    }
+
+    /// A field of the flags that is set replaces the key, a list in whole,
+    /// and a field that is `None` keeps the key.
+    #[test]
+    fn a_flag_overrides_its_key() {
+        let net = |text: &str| IpNet::parse(text).unwrap();
+        let keys = ServerSettings {
+            listen: Some(vec![
+                "127.0.0.1:1".parse().unwrap(),
+                "127.0.0.1:2".parse().unwrap(),
+            ]),
+            tls_cert: Some("/key/c.pem".into()),
+            tls_key: Some("/key/k.pem".into()),
+            tls_client_ca: Some("/key/ca.pem".into()),
+            trusted_proxy: Some(vec![net("10.0.0.0/8"), net("10.1.0.0/16")]),
+            trusted_proxy_client_cert: Some("X-Key".into()),
+            proxy_protocol: Some(false),
+            allow_cleartext_credentials: Some(true),
+            session_timeout: Some(1),
+            max_sessions: Some(2),
+            parallel_uploads: Some(3),
+            body_timeout: Some(4),
+            sign_summary: Some(vec!["a".into(), "b".into()]),
+        };
+        let flags = ServerSettings {
+            listen: Some(vec!["127.0.0.1:3".parse().unwrap()]),
+            tls_cert: Some("flag/c.pem".into()),
+            tls_key: Some("flag/k.pem".into()),
+            tls_client_ca: Some("flag/ca.pem".into()),
+            trusted_proxy: Some(vec![net("192.0.2.0/24")]),
+            trusted_proxy_client_cert: Some("X-Flag".into()),
+            proxy_protocol: Some(true),
+            allow_cleartext_credentials: Some(false),
+            session_timeout: Some(10),
+            max_sessions: Some(20),
+            parallel_uploads: Some(30),
+            body_timeout: Some(40),
+            sign_summary: Some(vec!["c".into()]),
+        };
+        assert_eq!(keys.overridden_by(&flags), flags);
+        assert_eq!(keys.overridden_by(&ServerSettings::default()), keys);
+        assert_eq!(ServerSettings::default().overridden_by(&flags), flags);
+        let one = ServerSettings {
+            max_sessions: Some(20),
+            ..ServerSettings::default()
+        };
+        let merged = keys.overridden_by(&one);
+        assert_eq!(merged.max_sessions, Some(20));
+        assert_eq!(
+            merged,
+            ServerSettings {
+                max_sessions: Some(20),
+                ..keys.clone()
+            }
+        );
     }
 
     /// `tls-cert` and `tls-key` go together, and `tls-client-ca` needs

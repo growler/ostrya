@@ -8,60 +8,57 @@ ostrya serve [OPTIONS]
 .SH DESCRIPTION
 Serve the repository over HTTP as an archive repository for pull.
 .PP
-The repository can be in any mode that ostrya reads. In a mode other than \fB\%archive\fR, the server builds each \fB\%\&.filez\fR object on request. The server also answers the ref listing at \fB\%/_ostrya/refs/v1\fR\&. Without \%\-\-read\-only, the server also has the receive endpoint of a push. The endpoint identifies the client of each request by the auth items of the client groups: a bearer token, a Basic credential, a client certificate, the client address, or \fB\%anonymous\fR\&. A session takes the policy of the client group of the local refs that carries the item. With no such group, or with a group that opens no push session, the session request gets \%403. At start, the command reads and checks the client groups and the server group of the repository config. Without \%\-\-read\-only, it also reads the trust groups and the key groups. A bad group ends the command with status \%1.
+The repository can be in any mode that ostrya reads. In a mode other than \fB\%archive\fR, the server builds each \fB\%\&.filez\fR object on request. The server also answers the ref listing at \fB\%/_ostrya/refs/v1\fR, and has the receive endpoint of a push. The client groups of the repository config give the push rights. The endpoint identifies the client of each request by the auth items of the client groups: a bearer token, a Basic credential, a client certificate, the client address, or \fB\%anonymous\fR\&. A session takes the policy of the client group of the local refs that carries the item. With no such group, or with a group that opens no push session, the session request gets \%403.
 .PP
-When all listeners are bound, the command writes the URL of each listener to standard output, one line each. Then it serves until the process ends. For each push session that commits, the command writes one \fB\%warning: STEP: MESSAGE\fR line to standard error for each warning of the session.
+The server takes its settings from \fB\%[ex\-ostrya server]\fR of the repository config. Each option of the command with the name of a key has precedence over the key. A relative path in a key is relative to the repository directory, and a relative path in an option is relative to the current directory. \fB\%sign\-summary\fR has no option. The command refuses the keys \fB\%trusted\-proxy\fR and \fB\%trusted\-proxy\-client\-cert\fR, and \fB\%proxy\-protocol=true\fR, because it does not support a proxy yet. At start, the command reads and checks the client groups, the server group, the trust groups, and the key groups. A bad group, or a key group whose key the command cannot read, ends the command with status \%1.
+.PP
+When all listeners are bound, the command writes the URL of each listener to standard output, one line each, and writes nothing else to standard output. Then it serves until the process ends. Warnings and errors go to standard error. For each push session that commits, the command writes one \fB\%warning: STEP: MESSAGE\fR line to standard error for each warning of the session.
 .SH OPTIONS
 .TP
 \fB\-\-listen\fR \fIADDR:PORT\fR
 Listen on \%ADDR:PORT, an IP address and a port.
 .IP
-Give the option once for each address. Without it, the server listens on \fB\%127.0.0.1:8080\fR\&. Port \%0 lets the kernel choose a port. The command refuses a host name. When all listeners are bound, the command writes the URL of each listener to standard output, one line each.
+Give the option once for each address. The options replace the whole \fB\%listen\fR key. Without the option and the key, the server listens on \fB\%127.0.0.1:8080\fR\&. Port \%0 lets the kernel choose a port. The command refuses a host name. When all listeners are bound, the command writes the URL of each listener to standard output, one line each.
 .TP
 \fB\-\-tls\-cert\fR \fIFILE\fR
 Serve HTTPS with the certificate chain in FILE, in PEM.
 .IP
-The option needs \%\-\-tls\-key. ALPN selects \%HTTP/2 or \%HTTP/1.1. The command reads FILE once, at start, and refuses a file larger than \%1 MiB.
+The certificate needs a key, from \%\-\-tls\-key or from the \fB\%tls\-key\fR key. ALPN selects \%HTTP/2 or \%HTTP/1.1. The command reads FILE once, at start, and refuses a file larger than \%1 MiB.
 .TP
 \fB\-\-tls\-key\fR \fIFILE\fR
-The private key of \%\-\-tls\-cert, in PEM.
+The private key of the server certificate, in PEM.
 .IP
-The command refuses an encrypted key, because it has no option for a passphrase. It reads FILE once, at start, and refuses a file larger than \%1 MiB.
+The key needs a certificate, from \%\-\-tls\-cert or from the \fB\%tls\-cert\fR key. The command refuses an encrypted key, because it has no option for a passphrase. It reads FILE once, at start, and refuses a file larger than \%1 MiB.
 .TP
-\fB\-\-client\-ca\fR \fIFILE\fR
+\fB\-\-tls\-client\-ca\fR \fIFILE\fR
 Verify client certificates against the CA certificates in FILE, in PEM.
 .IP
-The option needs \%\-\-tls\-cert. A client that presents a certificate must present one that the CA signed. A client that presents no certificate is served. A client certificate that the CA signed can match a \fB\%tls:*\fR, \fB\%tls:NAME\fR, or \fB\%tls\-sha256:HEX\fR item of a client group. The start checks of the client groups take the client CA from this option alone, also when \fB\%[ex\-ostrya server]\fR sets \fB\%tls\-client\-ca\fR\&.
+The CA needs a server certificate, from \%\-\-tls\-cert or from the \fB\%tls\-cert\fR key. A client that presents a certificate must present one that the CA signed. A client that presents no certificate is served. A client certificate that the CA signed can match a \fB\%tls:*\fR, \fB\%tls:NAME\fR, or \fB\%tls\-sha256:HEX\fR item of a client group. The command reads FILE once, at start, and refuses a file larger than \%1 MiB.
 .TP
-\fB\-\-read\-only\fR
-Serve the files of a pull alone, with no receive endpoint.
-.IP
-The options of the receive endpoint conflict with this switch.
-.TP
-\fB\-\-allow\-cleartext\-credentials\fR
+\fB\-\-allow\-cleartext\-credentials\fR[=\fIBOOL\fR]
 Take a bearer or Basic credential of push over plain HTTP.
 .IP
-Without this switch, the receive endpoint answers \%403 to such a request, also when a client group has the \fB\%anonymous\fR item. Use it for a server on a loopback address or behind a proxy that terminates TLS. A read of the files of a pull needs no credential.
+\fB\%\-\-allow\-cleartext\-credentials\fR takes such a credential, and \fB\%\-\-allow\-cleartext\-credentials=false\fR refuses it. Without the option and the key, the receive endpoint answers \%403 to such a request, also when a client group has the \fB\%anonymous\fR item. Use it for a server on a loopback address or behind a proxy that terminates TLS. A read of the files of a pull needs no credential. Possible values: true, false.
 .TP
 \fB\-\-session\-timeout\fR \fISECONDS\fR
 Abort a push session that stays idle for SECONDS.
 .IP
-A push session is idle when it has no request in progress, or when its request body delivers no byte. The value is a positive integer. Default: \%300.
+A push session is idle when it has no request in progress, or when its request body delivers no byte. The value is a positive integer. Without the option and the key, the value is \%300.
 .TP
 \fB\-\-max\-sessions\fR \fIN\fR
 Serve at most N push sessions at the same time.
 .IP
-The value is a positive integer. A request that opens a session past this limit gets the HTTP status \%503. Default: \%16.
+The value is a positive integer. Without the option and the key, the value is \%16. A request that opens a session past this limit gets the HTTP status \%503.
 .TP
 \fB\-\-parallel\-uploads\fR \fIN\fR
 Let a push session send N object streams at the same time.
 .IP
-The value is \%1 to \%31. The \fB\%HelloReply\fR of a session announces it. Over \%HTTP/2, the receive window of a stream is \%2 MiB, and the window of a connection is N times \%2 MiB. Default: \%4.
+The value is \%1 to \%31. Without the option and the key, the value is \%4. The \fB\%HelloReply\fR of a session announces it. Over \%HTTP/2, the receive window of a stream is \%2 MiB, and the window of a connection is N times \%2 MiB.
 .TP
 \fB\-\-body\-timeout\fR \fISECONDS\fR
 End a connection whose response waits more than SECONDS for the client.
 .IP
-The response waits for the client to take its next bytes. If an \%HTTP/2 client does not answer a ping within SECONDS, it also loses its connection. The value is a positive integer. The option also applies with \%\-\-read\-only. Default: \%60.
+The response waits for the client to take its next bytes. If an \%HTTP/2 client does not answer a ping within SECONDS, it also loses its connection. The value is a positive integer. Without the option and the key, the value is \%60.
 .PP
 The global options are listed in \fBostrya\fR(1).
 .SH SEE ALSO

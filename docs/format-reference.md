@@ -3357,7 +3357,8 @@ under `/_ostrya/` that matches neither rule gets the rules of the archive
 view, for example `/_ostrya/receive/v2/session`.
 
 A `GET` and a `HEAD` under `/_ostrya/receive/v1/` go to the archive view and
-get 404. With `--read-only` the server has no receive endpoint, so a `POST`
+get 404. `ostrya serve` always has the receive endpoint. A server of
+`ostrya-server` with no receive policies has no receive endpoint, so a `POST`
 and a `DELETE` under that prefix go to the archive view and get 405.
 
 A host application can mount the receive endpoint in a router of its own
@@ -3477,7 +3478,7 @@ the pull of the tool from this summary.
 ### GET /_ostrya/refs/v1
 
 A `GET` of `/_ostrya/refs/v1` gets a ref listing ("The ref listing"). The
-server serves it with and without `--read-only`, and it ignores
+server serves it with and without a receive endpoint, and it ignores
 `Authorization`. The version of the listing is the `v1` in the path, and no
 request negotiates it.
 
@@ -3655,8 +3656,9 @@ applies:
 
 1. A request with more than one `Authorization` header gets 401.
 2. Over plain HTTP, a `Bearer` or `Basic` credential gets 403, unless
-   `--allow-cleartext-credentials` is given. This step also applies when a
-   group has the `anonymous` item.
+   `allow-cleartext-credentials` is true, from the key or from the option of
+   `ostrya serve`. This step also applies when a group has the `anonymous`
+   item.
 3. A request with an `Authorization` header gets the item of its
    credential. A credential that matches no item gets 401, also when the
    request has a client certificate. A header with another scheme gets 401.
@@ -3692,7 +3694,7 @@ item in constant time. It compares the digest of the user name and the digest
 of the password of a Basic credential with every `basic-sha256` item in
 constant time. It does not stop at a match.
 
-With `--client-ca`, the TLS handshake verifies a client certificate against
+With `tls-client-ca`, the TLS handshake verifies a client certificate against
 the CA. A client with no certificate also connects. The server reads the
 end-entity certificate one time for each connection:
 

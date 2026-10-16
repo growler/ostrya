@@ -146,8 +146,8 @@ fn tls(client_ca: bool) -> ServeOptions {
         cert_chain_pem: SERVER_CERT_PEM.to_vec(),
         key_pem: SERVER_KEY_PEM.to_vec(),
         key_passphrase: None,
-        client_ca_pem: client_ca.then(|| CA_PEM.to_vec()),
     });
+    opts.client_ca_pem = client_ca.then(|| CA_PEM.to_vec());
     opts
 }
 
@@ -417,8 +417,9 @@ fn dropping_the_server_stops_it() {
     });
 }
 
-/// `bind` refuses an empty listen list and TLS files that give no
-/// configuration. It refuses them before it binds a listener.
+/// `bind` refuses an empty listen list, a client CA with no TLS, and TLS
+/// files that give no configuration. It refuses them before it binds a
+/// listener.
 #[test]
 fn bad_options_are_refused() {
     let tmp = TmpDir::new("options");
@@ -428,6 +429,14 @@ fn bad_options_are_refused() {
         opts.listen.clear();
         let err = ostrya_server::bind(repo.clone(), opts).await.err().unwrap();
         assert!(matches!(err, ostrya_server::Error::Options(_)), "{err}");
+        let mut opts = local();
+        opts.client_ca_pem = Some(CA_PEM.to_vec());
+        match ostrya_server::bind(repo.clone(), opts).await.err().unwrap() {
+            ostrya_server::Error::Options(message) => {
+                assert_eq!(message, "a client CA with no TLS")
+            }
+            other => panic!("{other}"),
+        }
         let mut opts = tls(false);
         opts.tls.as_mut().unwrap().key_pem = CLIENT_KEY_PEM.to_vec();
         let err = ostrya_server::bind(repo, opts).await.err().unwrap();

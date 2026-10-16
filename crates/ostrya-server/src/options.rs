@@ -21,9 +21,6 @@ pub struct ServerTls {
     pub key_pem: Vec<u8>,
     /// The passphrase of an encrypted key.
     pub key_passphrase: Option<String>,
-    /// The CA against which the server verifies client certificates. The
-    /// server also serves a client that presents no certificate.
-    pub client_ca_pem: Option<Vec<u8>>,
 }
 
 /// The debug text holds no byte of the private key or of the passphrase. It
@@ -41,7 +38,6 @@ impl fmt::Debug for ServerTls {
                 "key_passphrase",
                 &self.key_passphrase.as_ref().map(|_| "<redacted>"),
             )
-            .field("client_ca_pem", &self.client_ca_pem)
             .finish()
     }
 }
@@ -50,6 +46,12 @@ impl fmt::Debug for ServerTls {
 ///
 /// The struct is `#[non_exhaustive]`, so a caller starts from
 /// [`ServeOptions::default`] and sets the fields.
+///
+/// [`bind`](crate::bind) refuses
+/// [`client_ca_pem`](ServeOptions::client_ca_pem) with no
+/// [`tls`](ServeOptions::tls), and a `tls:*`, `tls:NAME`, or
+/// `tls-sha256:HEX` item of [`receive`](ServeOptions::receive) with no
+/// `client_ca_pem`.
 ///
 /// The fields `parallel_uploads`, `session_idle_timeout`, `max_sessions`, and
 /// `on_report` go to the [`EndpointOptions`] of the receive endpoint. Their
@@ -93,9 +95,9 @@ impl fmt::Debug for ServerTls {
 ///
 /// The server compares the digest of a credential with every `token-sha256`
 /// or `basic-sha256` item in constant time. It does not stop at a match. The
-/// TLS handshake verifies a client certificate against the client CA of
-/// [`tls`](ServeOptions::tls). The server reads the certificate one time for
-/// each connection.
+/// TLS handshake verifies a client certificate against
+/// [`client_ca_pem`](ServeOptions::client_ca_pem). The server reads the
+/// certificate one time for each connection.
 ///
 /// Each 401 carries two headers: `WWW-Authenticate: Bearer realm="ostrya"`
 /// and `WWW-Authenticate: Basic realm="ostrya"`.
@@ -122,6 +124,14 @@ pub struct ServeOptions {
     pub listen: Vec<SocketAddr>,
     /// The TLS files, or `None` for plain HTTP. The default is `None`.
     pub tls: Option<ServerTls>,
+    /// The PEM CA certificates that verify the client certificate of the TLS
+    /// handshake, or `None`.
+    ///
+    /// The server also serves a client that presents no certificate. A
+    /// client that presents a certificate that the CA did not sign fails the
+    /// handshake. The field needs [`tls`](ServeOptions::tls). The default is
+    /// `None`.
+    pub client_ca_pem: Option<Vec<u8>>,
     /// The longest time that a response body waits for the client to take its
     /// next bytes.
     ///
@@ -176,14 +186,22 @@ pub struct ServeOptions {
     pub on_report: Option<Arc<dyn Fn(ReceiveReport) + Send + Sync>>,
 }
 
-/// The debug text shows a report callback that is set as `<callback>`, and
-/// the receive policies as the names of their client groups. It holds no auth
-/// item, so no digest and no user name.
+/// The debug text shows a report callback that is set as `<callback>`, a
+/// client CA that is set as `<N bytes>`, and the receive policies as the
+/// names of their client groups. It holds no auth item, so no digest and no
+/// user name.
 impl fmt::Debug for ServeOptions {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ServeOptions")
             .field("listen", &self.listen)
             .field("tls", &self.tls)
+            .field(
+                "client_ca_pem",
+                &self
+                    .client_ca_pem
+                    .as_ref()
+                    .map(|pem| format!("<{} bytes>", pem.len())),
+            )
             .field("body_timeout", &self.body_timeout)
             .field(
                 "receive",
@@ -214,6 +232,7 @@ impl Default for ServeOptions {
         ServeOptions {
             listen: vec![SocketAddr::from((Ipv4Addr::LOCALHOST, 8080))],
             tls: None,
+            client_ca_pem: None,
             body_timeout: Duration::from_secs(60),
             receive: None,
             allow_cleartext_credentials: false,
@@ -238,7 +257,6 @@ mod tests {
             cert_chain_pem: b"cert".to_vec(),
             key_pem: b"secret key".to_vec(),
             key_passphrase: Some("secret passphrase".into()),
-            client_ca_pem: None,
         };
         let text = format!("{tls:?}");
         assert!(!text.contains("secret"), "{text}");

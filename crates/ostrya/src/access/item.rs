@@ -82,7 +82,10 @@ impl AuthItem {
 
     /// Returns `true` if the item identifies a client certificate:
     /// `tls:*`, `tls:NAME`, or `tls-sha256:HEX`.
-    pub(super) fn is_tls(&self) -> bool {
+    ///
+    /// A server can match such an item only with a client CA, which
+    /// verifies the client certificate.
+    pub fn is_tls(&self) -> bool {
         matches!(
             self,
             AuthItem::TlsAny | AuthItem::TlsName(_) | AuthItem::TlsSha256(_)

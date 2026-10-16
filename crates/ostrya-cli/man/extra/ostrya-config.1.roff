@@ -93,7 +93,7 @@ The summary records the value as \fB\%ostree.summary.indexed\-deltas\fR.
 .TP
 \fB\%auto\-update\-summary\fR (boolean, default false)
 Write the summary again after a push changes a ref.
-\fB\%ostrya receive\fR, and \fB\%ostrya serve\fR without \fB\%\-\-read\-only\fR, read it.
+\fB\%ostrya receive\fR and \fB\%ostrya serve\fR read it.
 \fB\%ostrya commit\fR and \fB\%ostrya pull\fR do not write the summary.
 .TP
 \fB\%commit\-update\-summary\fR (boolean, default false)
@@ -274,18 +274,18 @@ The quoted part of a group name is not empty and holds no \fB\%"\fR and no contr
 A repeated key takes the last value, so each list key is one line in a group.
 .PP
 \fB\%ostrya receive\fR and \fB\%ostrya serve\fR read and check the client groups and the server group at start.
-\fB\%ostrya receive\fR, and \fB\%ostrya serve\fR without \fB\%\-\-read\-only\fR, also build each trust group and each key group one time, also a group that no client group names.
+\fB\%ostrya receive\fR and \fB\%ostrya serve\fR also build each trust group and each key group one time, also a group that no client group names.
 Thus a key source that ostrya cannot read stops the command.
 A bad group stops the command with status 1.
 \fB\%ostrya receive\fR gives a session the client group of the local refs that holds the \fB\%ssh:NAME\fR item of the client name.
 With no such group, the session gets \fB\%ref\-denied\fR.
 \fB\%ostrya serve\fR gives a session the client group of the local refs that holds the item that identified the request.
 With no such group, the request gets 403.
-\fB\%ostrya serve\fR takes its addresses, its TLS files, and its session limits from its options, and checks the client groups against its TLS options.
+\fB\%ostrya serve\fR takes its settings from the server group, and an option of the command has precedence over the key of its name.
 .SS "Server keys"
 The keys of \fB\%[ex\-ostrya server]\fR.
 An option of \fB\%ostrya serve\fR with the name of a key has precedence over the key.
-A relative path in a key is relative to the repository directory.
+A relative path in a key is relative to the repository directory, and a relative path in an option is relative to the current directory.
 An empty value of \fB\%listen\fR, \fB\%trusted\-proxy\fR, \fB\%sign\-summary\fR, \fB\%tls\-cert\fR, \fB\%tls\-key\fR, or \fB\%tls\-client\-ca\fR is refused.
 To get the default, remove the key.
 .TP
@@ -339,6 +339,7 @@ The time in seconds that a response waits for the client to take its next bytes.
 \fB\%sign\-summary\fR (list)
 The key groups whose keys sign the summary that a push writes again.
 A name that occurs two times counts one time.
+\fB\%ostrya serve\fR has no option for the key, because \fB\%ostrya receive\fR reads it too.
 .PP
 A CIDR value, in \fB\%trusted\-proxy\fR and in a \fB\%net:\fR item, is \fB\%ADDR/LEN\fR or a bare \fB\%ADDR\fR.
 A bare IPv4 address is \fB\%ADDR/32\fR, and a bare IPv6 address is \fB\%ADDR/128\fR.
@@ -499,7 +500,7 @@ A \fB\%collection\fR value is the own collection id, or fails the collection\-id
 A \fB\%verify\fR, \fB\%sign\fR, or \fB\%sign\-summary\fR value names a trust group or a key group that does not exist.
 .PP
 \fB\%ostrya serve\fR also refuses to start in these cases.
-It takes the TLS files from its options alone, also when the server group sets \fB\%tls\-cert\fR, \fB\%tls\-key\fR, or \fB\%tls\-client\-ca\fR:
+It runs these checks after each option replaces the key of its name:
 .IP \(bu 2
 A \fB\%tls:\fR or \fB\%tls\-sha256:\fR item exists, and the server has no \fB\%tls\-client\-ca\fR.
 .IP \(bu 2
@@ -508,6 +509,9 @@ A \fB\%tls:\fR or \fB\%tls\-sha256:\fR item exists, and the server has no \fB\%t
 \fB\%tls\-cert\fR is set and \fB\%tls\-key\fR is not, or the reverse.
 .IP \(bu 2
 \fB\%tls\-client\-ca\fR is set, and \fB\%tls\-cert\fR and \fB\%trusted\-proxy\-client\-cert\fR are not.
+.IP \(bu 2
+\fB\%trusted\-proxy\fR is set, \fB\%trusted\-proxy\-client\-cert\fR is set, or \fB\%proxy\-protocol\fR is true.
+\fB\%ostrya serve\fR does not support these keys yet.
 .SS "Trust keys"
 A trust group takes the remote keys \fB\%gpg\-verify\fR (default false here), \fB\%gpgkeypath\fR, \fB\%sign\-verify\fR, \fB\%verification\-ENGINE\-key\fR, and \fB\%verification\-ENGINE\-file\fR.
 It trusts the keys that it names, and no system key store or keyring.

@@ -1483,9 +1483,9 @@ for example, makes the commit exit 1 with `error: Key file contains key
 the other key is `true`. The ref is written and the summary is not.
 `ostrya commit` and `ostrya pull` read neither key and write no `summary`, so
 the port leaves `summary` as it stands and exits 0 over each of these values.
-`ostrya receive`, and `ostrya serve` without `--read-only`, read the two keys
-by the rule of the tool. They refuse a value that is not a boolean in either
-one (`ostrya-config(1)`).
+`ostrya receive` and `ostrya serve` read the two keys by the rule of the
+tool. They refuse a value that is not a boolean in either one
+(`ostrya-config(1)`).
 
 Not observed: the answer of the tool to a repeated `-s/--subject`. No test
 runs the tool with a repeated `-s`. The port refuses a repeated `-s` with
@@ -4046,12 +4046,10 @@ ostrya push-tree [--repo=PATH] REMOTE DIR -b REF [-b REF]...
 
 ```text
 ostrya serve [--repo=PATH] [--listen=ADDR:PORT]...
-             [--tls-cert=FILE --tls-key=FILE] [--client-ca=FILE]
-             [--body-timeout=SECONDS]
-             (--read-only |
-              [--allow-cleartext-credentials]
-              [--session-timeout=SECONDS] [--max-sessions=N]
-              [--parallel-uploads=N])
+             [--tls-cert=FILE] [--tls-key=FILE] [--tls-client-ca=FILE]
+             [--allow-cleartext-credentials[=BOOL]]
+             [--session-timeout=SECONDS] [--max-sessions=N]
+             [--parallel-uploads=N] [--body-timeout=SECONDS]
 ```
 
 - The `serve` feature of `ostrya-cli` builds the command. It is in the
@@ -4065,17 +4063,29 @@ ostrya serve [--repo=PATH] [--listen=ADDR:PORT]...
   request at `[archive] zlib-level`, and `deltas/` and `delta-indexes/` are
   not served. A path the server refuses and a path it does not find both get
   404. `../format-reference.md`, "The archive view", states the rules.
-- The command also answers `GET /_ostrya/refs/v1?pattern=P&pattern=Q`, with
-  and without `--read-only`. The body is the ref listing, a summary
-  GVariant built for each request, of the refs that the entries of the query
-  select. Each entry is a ref pattern with an optional leading `!`. No
-  query takes all refs. A bad pair of the query, a query of more than 256
-  pairs, an entry of more than 256 parts or 4096 bytes, and an entry that is not a ref
-  pattern get 400, and a method other than `GET` gets
-  405 with `Allow: GET`. The command holds at most 4 listings at the same
-  time. A request over this limit gets 503 with `Retry-After: 1`.
-- `--read-only` serves the files of a pull alone. Without it the command
-  also runs the receive endpoint of a push.
+- The command also answers `GET /_ostrya/refs/v1?pattern=P&pattern=Q`. The
+  body is the ref listing, a summary GVariant built for each request, of the
+  refs that the entries of the query select. Each entry is a ref pattern with
+  an optional leading `!`. No query takes all refs. A bad pair of the query, a
+  query of more than 256 pairs, an entry of more than 256 parts or 4096 bytes,
+  and an entry that is not a ref pattern get 400, and a method other than
+  `GET` gets 405 with `Allow: GET`. The command holds at most 4 listings at
+  the same time. A request over this limit gets 503 with `Retry-After: 1`.
+- The command always runs the receive endpoint of a push. The client
+  groups of the config give the push rights.
+- The command takes its settings from `[ex-ostrya server]`
+  (`ostrya-config(1)`, "Server keys"). Each option of the command has the
+  name of a key, and the option replaces the key. A `--listen` option
+  replaces the whole `listen` list. The command has no option for
+  `sign-summary`, because `ostrya receive` reads it too. A relative path in
+  a key is relative to the repository directory, and a relative path in an
+  option is relative to the current directory. A bad key value ends the
+  command at exit 1, also when an option replaces the key.
+- The command refuses a set `trusted-proxy`, a set
+  `trusted-proxy-client-cert`, and `proxy-protocol=true` with
+  `error: unsupported: [ex-ostrya server] KEY is not supported yet` at
+  exit 1, because it does not support a proxy yet. It takes no option for
+  these keys.
 - The receive endpoint identifies the client of each request by the auth
   items of the client groups: a bearer token, a Basic credential, a client
   certificate, the client address, or `anonymous`. A `session` request
@@ -4085,37 +4095,34 @@ ostrya serve [--repo=PATH] [--listen=ADDR:PORT]...
   that opens no push session gets 403 with `unauthorized` and the message
   `client group 'NAME' opens no push session`. With no client group in the
   config, the implicit group `anonymous` reads each ref and opens no push
-  session, so the command starts with no option of push and each push gets
-  403. `../format-reference.md`, "Authentication of the receive endpoint",
-  states the order of the steps and the owner key of a session.
-- With `--client-ca`, a client certificate that the CA signed can match a
+  session, so each push gets 403. `../format-reference.md`, "Authentication
+  of the receive endpoint", states the order of the steps and the owner key
+  of a session.
+- With `tls-client-ca`, a client certificate that the CA signed can match a
   `tls:*`, `tls:NAME`, or `tls-sha256:HEX` item.
-- Without `--allow-cleartext-credentials`, a request of the receive endpoint
+- Without `allow-cleartext-credentials`, a request of the receive endpoint
   with a bearer or Basic credential over plain HTTP gets 403, also when a
-  group has the `anonymous` item. The switch takes such a credential. Use it
-  for a server on a loopback address or behind a proxy that terminates TLS.
-  A read of the archive view ignores the `Authorization` header and needs no
-  switch.
+  group has the `anonymous` item. `allow-cleartext-credentials=true` and
+  `--allow-cleartext-credentials` take such a credential. Use them for a
+  server on a loopback address or behind a proxy that terminates TLS.
+  `--allow-cleartext-credentials=false` refuses such a credential, also when
+  the key is `true`. A read of the archive view ignores the `Authorization`
+  header and needs no credential.
 - A refusal of the receive endpoint that comes before the request body is
   read, as a 401, a 403, a 404, or a 405, reads and drops up to 1 MiB of the
-  body within `--session-timeout` or 5 seconds, whichever is shorter, and
-  then answers. On HTTP/1.1 a body that did not reach its end gets
-  `Connection: close`.
-- `--allow-cleartext-credentials`, `--session-timeout`, `--max-sessions`,
-  and `--parallel-uploads` each conflict with `--read-only`. The pair is refused
-  with the argument error of the option parser at exit 1. A default value
-  is no conflict.
+  body within the session timeout, from `session-timeout` or
+  `--session-timeout`, or 5 seconds, whichever is shorter, and then answers.
+  On HTTP/1.1 a body that did not reach its end gets `Connection: close`.
 - At start, before it binds a listener, the command reads and checks the
-  client groups and the server group of the repository config
-  (`ostrya-config(1)`, "CLIENT AND SERVER GROUPS"). The start checks take
-  the TLS files from `--tls-cert`, `--tls-key`, and `--client-ca` alone,
-  because the server runs with these files. `tls-cert`, `tls-key`, and
-  `tls-client-ca` of `[ex-ostrya server]` do not change the checks. Without
-  `--read-only`, the command also builds each trust group and each key
-  group. A bad group ends the command with `error: MESSAGE` at exit 1. The
-  command reads the groups and the repository settings of the endpoint
-  once, and a change applies at the next start. The command takes no
-  `--policy`, and the option parser refuses it at exit 1.
+  client groups, the server group, the trust groups, and the key groups of
+  the repository config (`ostrya-config(1)`, "CLIENT AND SERVER GROUPS").
+  The start checks take each TLS file from its option, else from its key.
+  A bad group, or a key group whose key the command cannot read, ends the
+  command with `error: MESSAGE` at exit 1. The command reads the groups and
+  the repository settings of the endpoint once, and a change applies at the
+  next start. The command takes no `--policy`, `--push-credentials`,
+  `--allow-anonymous-push`, `--read-only`, or `--client-ca`, and the option
+  parser refuses each at exit 1.
 - `--session-timeout` takes a positive number of seconds, and the default
   is 300. A push session with no request in progress for that time is
   aborted, and so is a push session with a request body that delivers no
@@ -4140,12 +4147,13 @@ ostrya serve [--repo=PATH] [--listen=ADDR:PORT]...
 - `--listen` takes an IP address and a port. Give it once for each address.
   The default is `127.0.0.1:8080`, and port 0 lets the kernel choose a port.
   A host name is refused.
-- `--tls-cert` and `--tls-key` serve HTTPS. Each needs the other. ALPN
-  selects HTTP/2 or HTTP/1.1, and plain HTTP serves HTTP/1.1. An encrypted
-  key is refused: the command has no option for a passphrase.
-- `--client-ca` needs `--tls-cert`. A client that presents a certificate
-  must present one the CA signed. A client that presents none is served,
-  and a read needs no certificate.
+- `tls-cert` and `tls-key` serve HTTPS. Each needs the other, from a key or
+  from an option. ALPN selects HTTP/2 or HTTP/1.1, and plain HTTP serves
+  HTTP/1.1. An encrypted key is refused: the command has no option for a
+  passphrase.
+- `tls-client-ca` needs `tls-cert`, from a key or from an option. A client
+  that presents a certificate must present one the CA signed. A client that
+  presents none is served, and a read needs no certificate.
 - `--body-timeout` takes a positive number of seconds, and the default is
   60. A connection ends when a response waits longer than that time for the
   client to take its next bytes. An HTTP/2 client that does not answer a
@@ -4159,12 +4167,13 @@ ostrya serve [--repo=PATH] [--listen=ADDR:PORT]...
   configuration ends the command with `error: MESSAGE` at exit 1.
 - When every listener is bound, the command writes one line for each to
   standard output, `http://ADDR:PORT/` or `https://ADDR:PORT/`, in the order
-  of the options, and serves until the process ends. SIGINT and SIGTERM end
-  the process with the default action. A push session that did not start
-  its commit does not commit, and the next transaction of the repository
-  removes its staging directory. The commit of a push session writes its
-  refs one by one, so a commit that runs when the process ends can stop
-  after it wrote some of its refs and before it wrote the others.
+  of the addresses, and serves until the process ends. Standard output carries
+  these lines alone, and warnings and errors go to standard error. SIGINT and
+  SIGTERM end the process with the default action. A push session that did not
+  start its commit does not commit, and the next transaction of the repository
+  removes its staging directory. The commit of a push session writes its refs
+  one by one, so a commit that runs when the process ends can stop after it
+  wrote some of its refs and before it wrote the others.
 - `ostree pull` from the command, over HTTP and HTTPS, from a repository in
   each mode the port reads, passes `ostree fsck` on the pulled repository,
   in `crates/ostrya-cli/tests/serve.rs`. The summary of a

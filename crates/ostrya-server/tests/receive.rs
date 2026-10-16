@@ -809,7 +809,6 @@ fn a_delete_over_http2_has_no_length() {
         cert_chain_pem: SERVER_CERT_PEM.to_vec(),
         key_pem: SERVER_KEY_PEM.to_vec(),
         key_passphrase: None,
-        client_ca_pem: None,
     });
     with_server(repo, opts, |_, addr| async move {
         let client = Client::http2(addr).await;
@@ -1347,15 +1346,14 @@ fn credential_groups() -> String {
 /// A client group of the fixture client certificate, by its subject CN.
 const CERT_GROUP: &str = "[ex-ostrya client \"certs\"]\nauth=tls:ostrya test\nallow=w:**\n";
 
-/// The server TLS files. If `client_ca` is `true`, the fixture CA is also the
-/// client CA.
-fn server_tls(client_ca: bool) -> ServerTls {
-    ServerTls {
+/// Sets the server TLS files on `opts`, with the fixture CA as the client CA.
+fn with_tls(opts: &mut ServeOptions) {
+    opts.tls = Some(ServerTls {
         cert_chain_pem: SERVER_CERT_PEM.to_vec(),
         key_pem: SERVER_KEY_PEM.to_vec(),
         key_passphrase: None,
-        client_ca_pem: client_ca.then(|| CA_PEM.to_vec()),
-    }
+    });
+    opts.client_ca_pem = Some(CA_PEM.to_vec());
 }
 
 /// The options of a server whose one group takes the credentials of
@@ -1432,7 +1430,7 @@ fn each_method_opens_a_session_and_a_bad_credential_is_401() {
     let tmp = TmpDir::new("methods");
     let repo = receiver(tmp.path(), RepoMode::Archive, "");
     let mut opts = options_with(&repo, &format!("{}{CERT_GROUP}", credential_groups()));
-    opts.tls = Some(server_tls(true));
+    with_tls(&mut opts);
     with_server(repo, opts, |_, addr| async move {
         let identity = Some((CLIENT_CERT_PEM, CLIENT_KEY_PEM));
         let mut by_bearer = Client::tls(addr, false, None).await;
@@ -1504,7 +1502,7 @@ fn a_certificate_selects_the_group_of_its_first_item() {
         ),
     ] {
         let mut opts = options_with(&repo, &groups);
-        opts.tls = Some(server_tls(true));
+        with_tls(&mut opts);
         with_server(repo.clone(), opts, |_, addr| async move {
             let identity = Some((CLIENT_CERT_PEM, CLIENT_KEY_PEM));
             let client = Client::tls(addr, false, identity).await;
@@ -1530,7 +1528,7 @@ fn tls_items_alone_refuse_a_client_with_no_certificate() {
     let tmp = TmpDir::new("client-ca");
     let repo = receiver(tmp.path(), RepoMode::Archive, "");
     let mut opts = options_with(&repo, CERT_GROUP);
-    opts.tls = Some(server_tls(true));
+    with_tls(&mut opts);
     with_server(repo, opts, |_, addr| async move {
         let nobody = Client::tls(addr, false, None).await;
         let reply = nobody.post(SESSION, encode(&[hello()]).await).await;
@@ -1539,6 +1537,41 @@ fn tls_items_alone_refuse_a_client_with_no_certificate() {
         let identity = Some((CLIENT_CERT_PEM, CLIENT_KEY_PEM));
         Client::tls(addr, true, identity).await.open().await;
     });
+}
+
+/// `bind` refuses a client group with a `tls:` or `tls-sha256:` item and no
+/// client CA, over plain HTTP and over TLS. The message names the group and
+/// the item.
+#[test]
+fn a_tls_item_with_no_client_ca_is_refused() {
+    let tmp = TmpDir::new("no-client-ca");
+    let repo = receiver(tmp.path(), RepoMode::Archive, "");
+    let by_digest = format!("tls-sha256:{}", client_cert_digest());
+    for (item, tls) in [
+        ("tls:ostrya test", false),
+        ("tls:*", true),
+        (by_digest.as_str(), false),
+    ] {
+        let mut opts = options_with(
+            &repo,
+            &format!("{ANONYMOUS_PUSH}[ex-ostrya client \"certs\"]\nauth={item}\nallow=w:**\n"),
+        );
+        if tls {
+            with_tls(&mut opts);
+            opts.client_ca_pem = None;
+        }
+        let refused = block_on(ostrya_server::bind(repo.clone(), opts));
+        match refused.err().unwrap() {
+            ostrya_server::Error::Options(message) => assert_eq!(
+                message,
+                format!(
+                    "[ex-ostrya client \"certs\"] carries the item {item}, and the server \
+                     has no client CA"
+                )
+            ),
+            other => panic!("{item}: {other}"),
+        }
+    }
 }
 
 /// A request from an address in a `net:` item gets that item, over plain
@@ -1722,10 +1755,8 @@ fn a_client_certificate_the_client_ca_did_not_sign_fails_the_handshake() {
     let tmp = TmpDir::new("other-ca");
     let repo = receiver(tmp.path(), RepoMode::Archive, "");
     let mut opts = options_with(&repo, CERT_GROUP);
-    opts.tls = Some(ServerTls {
-        client_ca_pem: Some(UNTRUSTED_CERT_PEM.to_vec()),
-        ..server_tls(false)
-    });
+    with_tls(&mut opts);
+    opts.client_ca_pem = Some(UNTRUSTED_CERT_PEM.to_vec());
     with_server(repo, opts, |_, addr| async move {
         for http2 in [false, true] {
             let identity = Some((CLIENT_CERT_PEM, CLIENT_KEY_PEM));
@@ -1758,7 +1789,7 @@ fn each_stream_of_one_http2_connection_is_authorized_again() {
     let tmp = TmpDir::new("h2-owners");
     let repo = receiver(tmp.path(), RepoMode::Archive, "");
     let mut opts = options_with(&repo, &format!("{}{CERT_GROUP}", credential_groups()));
-    opts.tls = Some(server_tls(true));
+    with_tls(&mut opts);
     with_server(repo, opts, |_, addr| async move {
         let mut client = Client::http2(addr).await;
         client.bearer = bearer(ALICE);

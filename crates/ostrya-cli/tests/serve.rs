@@ -1,5 +1,5 @@
-//! Tests of `ostrya serve --read-only` against the `ostree` command. The
-//! tests run these pulls with `ostree`:
+//! Tests of `ostrya serve` against the `ostree` command. The tests run these
+//! pulls with `ostree`:
 //!
 //! - a pull from a repository of each mode that ostrya reads, over HTTP and
 //!   HTTPS,
@@ -7,15 +7,15 @@
 //! - a pull from a repository whose summary names deltas that the server
 //!   does not serve.
 //!
-//! The tests of the refusals of `ostrya serve` and of the routing of the
-//! receive endpoint run without `ostree`.
+//! The tests of the refusals of `ostrya serve`, of its settings, and of the
+//! routing of the receive endpoint run without `ostree`.
 
 #![cfg(feature = "serve")]
 
 use std::io::{BufRead, BufReader};
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, ChildStdout, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 
 const REQUIRE_OSTREE: &str = "OSTRYA_REQUIRE_OSTREE";
@@ -104,36 +104,58 @@ fn ostrya() -> &'static str {
 struct Serving {
     child: Child,
     url: String,
+    stdout: BufReader<ChildStdout>,
+}
+
+/// The command `ostrya serve` over `repo`, with standard output on a pipe.
+fn serve_command(repo: &Path) -> Command {
+    let mut command = Command::new(ostrya());
+    command
+        .arg(format!("--repo={}", repo.display()))
+        .arg("serve")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::inherit());
+    command
 }
 
 impl Serving {
-    /// Start the read-only server over `repo` with the `extra` options, on a
-    /// port that the kernel chooses. Then read the URL that the server writes.
-    fn start(repo: &Path, extra: &[&str]) -> Serving {
-        Serving::start_with(repo, &[&["--read-only"], extra].concat())
-    }
-
     /// Start the server over `repo` with the options `args`, on a port that
     /// the kernel chooses. Then read the URL that the server writes.
-    fn start_with(repo: &Path, args: &[&str]) -> Serving {
-        let mut child = Command::new(ostrya())
-            .arg(format!("--repo={}", repo.display()))
-            .args(["serve", "--listen=127.0.0.1:0"])
-            .args(args)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::inherit())
-            .spawn()
-            .unwrap();
-        let mut line = String::new();
-        BufReader::new(child.stdout.take().unwrap())
-            .read_line(&mut line)
-            .unwrap();
-        assert!(line.ends_with("/\n"), "serve wrote {line:?}");
-        Serving {
+    fn start(repo: &Path, args: &[&str]) -> Serving {
+        Serving::spawn(serve_command(repo).arg("--listen=127.0.0.1:0").args(args))
+    }
+
+    /// Start `command`, and read the first URL that the server writes.
+    fn spawn(command: &mut Command) -> Serving {
+        let mut child = command.spawn().unwrap();
+        let stdout = BufReader::new(child.stdout.take().unwrap());
+        let mut serving = Serving {
             child,
-            url: line.trim_end().to_owned(),
-        }
+            url: String::new(),
+            stdout,
+        };
+        serving.url = serving.next_url();
+        serving
+    }
+
+    /// Read the next URL that the server writes.
+    fn next_url(&mut self) -> String {
+        let mut line = String::new();
+        self.stdout.read_line(&mut line).unwrap();
+        assert!(line.starts_with("http"), "serve wrote {line:?}");
+        assert!(line.ends_with("/\n"), "serve wrote {line:?}");
+        line.trim_end().to_owned()
+    }
+
+    /// Kill the server, and return what it wrote to standard output after
+    /// the URLs that the test read.
+    fn rest(&mut self) -> String {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        let mut rest = String::new();
+        std::io::Read::read_to_string(&mut self.stdout, &mut rest).unwrap();
+        rest
     }
 
     fn tls(repo: &Path, pki: &Pki) -> Serving {
@@ -519,14 +541,16 @@ fn the_tool_pulls_loose_past_unserved_deltas() {
 
 /// `ostrya serve` refuses these inputs:
 ///
-/// - a receive option beside `--read-only`,
-/// - `--policy`, `--push-credentials`, and `--allow-anonymous-push`, which it
-///   does not take,
-/// - a group of the removed receive policy in the config, also with
-///   `--read-only`,
+/// - `--policy`, `--push-credentials`, `--allow-anonymous-push`,
+///   `--read-only`, and `--client-ca`, which it does not take,
+/// - a group of the removed receive policy in the config,
 /// - a client group with a TLS item and no client CA,
-/// - a key group whose key it cannot read, without `--read-only`,
-/// - a TLS file that it cannot use, or that is larger than the size cap.
+/// - a key group whose key it cannot read,
+/// - a TLS file that it cannot use, or that is larger than the size cap,
+/// - a TLS file with no partner, from an option or from a key,
+/// - a key of the server group with a bad value, also when an option
+///   replaces the key,
+/// - a proxy key of the server group.
 ///
 /// Each refusal exits 1 and writes no URL.
 #[test]
@@ -537,7 +561,8 @@ fn serve_refuses_what_it_cannot_serve() {
     ok(ostrya(), &[&repo, "init", "--mode=bare-user"]);
     let cert = format!("--tls-cert={}", fixture("server.pem").display());
     let key = format!("--tls-key={}", fixture("server.key.pem").display());
-    let ca = format!("--client-ca={}", fixture("ca.pem").display());
+    let ca = format!("--tls-client-ca={}", fixture("ca.pem").display());
+    let old_ca = format!("--client-ca={}", fixture("ca.pem").display());
     let enc_cert = format!("--tls-cert={}", fixture("client.pem").display());
     let enc_key = format!("--tls-key={}", fixture("client.key.enc.pem").display());
     let absent = format!("--tls-key={}", tmp.path().join("absent").display());
@@ -560,47 +585,47 @@ fn serve_refuses_what_it_cannot_serve() {
         std::fs::write(&config, text).unwrap();
         arg
     };
+    let server = |name: &str, keys: &str| with_groups(name, &format!("[ex-ostrya server]\n{keys}"));
     let removed = with_groups("removed", "[ex-ostrya receive]\naccept=true\n");
     let tls_item = with_groups("tls-item", "[ex-ostrya client \"c\"]\nauth=tls:*\n");
     let bad_key = with_groups(
         "bad-key",
         "[ex-ostrya key \"k\"]\ntype=ed25519\nsecret-key-file=/nonexistent/ostrya/k\n",
     );
-    let ro = "--read-only";
+    let cert_key = server(
+        "cert-key",
+        &format!("tls-cert={}\n", fixture("server.pem").display()),
+    );
+    let ca_key = server(
+        "ca-key",
+        &format!("tls-client-ca={}\n", fixture("ca.pem").display()),
+    );
+    let listen_key = server("listen-key", "listen=localhost:8080\n");
+    let session_key = server("session-key", "session-timeout=0\n");
+    let max_key = server("max-key", "max-sessions=0\n");
+    let parallel_key = server("parallel-key", "parallel-uploads=32\n");
+    let body_key = server("body-key", "body-timeout=0\n");
+    let proxy_protocol = server("proxy-protocol", "proxy-protocol=true\n");
+    let trusted_proxy = server("trusted-proxy", "trusted-proxy=10.0.0.0/8\n");
+    let proxy_cert = server("proxy-cert", "trusted-proxy-client-cert=X-Client-Cert\n");
     let anon = "--allow-anonymous-push";
-    let cases: [(&[&str], &str); 22] = [
-        (&[&no_repo, "serve", ro, listen, &policy], "--policy"),
+    let tls_pair = "tls-cert is set, and tls-key is not";
+    let ca_alone = "tls-client-ca is set, and tls-cert and trusted-proxy-client-cert are not";
+    let cases: &[(&[&str], &str)] = &[
+        (&[&no_repo, "serve", listen, &policy], "--policy"),
         (&[&repo, "serve", listen, &policy], "--policy"),
         (&[&repo, "serve", listen, &creds], "--push-credentials"),
-        (
-            &[&no_repo, "serve", ro, listen, &creds],
-            "--push-credentials",
-        ),
+        (&[&no_repo, "serve", listen, &creds], "--push-credentials"),
         (&[&repo, "serve", listen, anon], "--allow-anonymous-push"),
+        (&[&no_repo, "serve", listen, anon], "--allow-anonymous-push"),
+        (&[&no_repo, "serve", listen, "--read-only"], "--read-only"),
         (
-            &[&no_repo, "serve", ro, listen, anon],
-            "--allow-anonymous-push",
+            &[&no_repo, "serve", listen, &old_ca, &cert, &key],
+            "--client-ca",
         ),
         (&[&removed, "serve", listen], "[ex-ostrya client \"NAME\"]"),
-        (
-            &[&removed, "serve", ro, listen],
-            "[ex-ostrya client \"NAME\"]",
-        ),
-        (&[&tls_item, "serve", ro, listen], "tls-client-ca"),
         (&[&tls_item, "serve", listen], "tls-client-ca"),
         (&[&bad_key, "serve", listen], "/nonexistent/ostrya/k"),
-        (
-            &[&no_repo, "serve", ro, listen, "--session-timeout=5"],
-            "--session-timeout",
-        ),
-        (
-            &[&no_repo, "serve", ro, listen, "--max-sessions=5"],
-            "--max-sessions",
-        ),
-        (
-            &[&no_repo, "serve", ro, listen, "--parallel-uploads=5"],
-            "--parallel-uploads",
-        ),
         (
             &[&repo, "serve", listen, "--parallel-uploads=32"],
             "--parallel-uploads",
@@ -610,121 +635,250 @@ fn serve_refuses_what_it_cannot_serve() {
             "--session-timeout",
         ),
         (
-            &[&repo, "serve", "--read-only", listen, "--body-timeout=0"],
+            &[&repo, "serve", listen, "--max-sessions=0"],
+            "--max-sessions",
+        ),
+        (
+            &[&repo, "serve", listen, "--body-timeout=0"],
             "--body-timeout",
         ),
         (
-            &[
-                &no_repo,
-                "serve",
-                ro,
-                listen,
-                "--allow-cleartext-credentials",
-            ],
+            &[&repo, "serve", listen, "--allow-cleartext-credentials=yes"],
             "--allow-cleartext-credentials",
         ),
-        (&[&repo, "serve", "--read-only", listen, &ca], "--tls-cert"),
-        (&[&repo, "serve", "--read-only", listen, &cert], "--tls-key"),
+        (&[&repo, "serve", listen, &ca], ca_alone),
+        (&[&repo, "serve", listen, &cert], tls_pair),
         (
-            &[&repo, "serve", "--read-only", listen, &enc_cert, &enc_key],
-            "passphrase",
+            &[&repo, "serve", listen, &key],
+            "tls-key is set, and tls-cert is not",
         ),
-        (&[&repo, "serve", ro, listen, &big_cert, &key], "size cap"),
+        (&[&repo, "serve", listen, &enc_cert, &enc_key], "passphrase"),
+        (&[&repo, "serve", listen, &big_cert, &key], "size cap"),
+        (&[&cert_key, "serve", listen], tls_pair),
+        (&[&ca_key, "serve", listen], ca_alone),
+        (
+            &[&ca_key, "serve", listen, &key],
+            "tls-key is set, and tls-cert is not",
+        ),
+        (&[&listen_key, "serve"], "listen item 'localhost:8080'"),
+        (
+            &[&listen_key, "serve", listen],
+            "listen item 'localhost:8080'",
+        ),
+        (&[&session_key, "serve", listen], "session-timeout is 0"),
+        (&[&max_key, "serve", listen], "max-sessions is 0"),
+        (&[&parallel_key, "serve", listen], "parallel-uploads is 32"),
+        (
+            &[&parallel_key, "serve", listen, "--parallel-uploads=4"],
+            "parallel-uploads is 32",
+        ),
+        (&[&body_key, "serve", listen], "body-timeout is 0"),
+        (
+            &[&proxy_protocol, "serve", listen],
+            "[ex-ostrya server] proxy-protocol is not supported yet",
+        ),
+        (
+            &[&trusted_proxy, "serve", listen],
+            "[ex-ostrya server] trusted-proxy is not supported yet",
+        ),
+        (
+            &[&proxy_cert, "serve", listen],
+            "[ex-ostrya server] trusted-proxy-client-cert is not supported yet",
+        ),
     ];
-    for (args, message) in cases {
+    for &(args, message) in cases {
         let out = run(ostrya(), args);
         let stderr = String::from_utf8_lossy(&out.stderr);
         assert_eq!(out.status.code(), Some(1), "{args:?}: {stderr}");
         assert!(out.stdout.is_empty(), "{args:?}");
         assert!(stderr.contains(message), "{args:?}: {stderr}");
     }
-    let out = run(
-        ostrya(),
-        &[&repo, "serve", "--read-only", listen, &cert, &absent],
-    );
+    let out = run(ostrya(), &[&repo, "serve", listen, &cert, &absent]);
     assert_eq!(out.status.code(), Some(1));
     assert!(String::from_utf8_lossy(&out.stderr).contains("absent"));
 }
 
-/// The start checks take the TLS files from the options alone, because the
-/// server runs with them:
+/// Returns a request that opens a push session of the ref `name`, with no
+/// credential.
+fn session_request(name: &str) -> Vec<u8> {
+    use ostrya::remote::proto::{FrameWriter, Hello, Message};
+
+    let hello = Message::Hello(Hello {
+        version: 1,
+        agent: None,
+        refs: vec![name.into()],
+        one_way: false,
+    });
+    let body = ostrya_rt::block_on(async {
+        let mut writer = FrameWriter::new(Vec::new());
+        writer.write_message(&hello).await.unwrap();
+        writer.into_inner()
+    });
+    let mut request = format!(
+        "POST /_ostrya/receive/v1/session HTTP/1.1\r\nhost: x\r\n\
+         content-length: {}\r\nconnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    request.extend_from_slice(&body);
+    request
+}
+
+/// `ostrya serve` takes its settings from `[ex-ostrya server]`, and an option
+/// replaces the key of its name:
 ///
-/// - A `tls:*` item and `tls-cert`, `tls-key`, and `tls-client-ca` in the
-///   server group, with no TLS option, exit 1. With the three options, the
-///   server starts and serves HTTPS.
-/// - `tls-cert` alone in the server group, with no TLS option, does not stop
-///   the server, and it serves plain HTTP.
+/// - `tls-cert`, `tls-key`, and `tls-client-ca` in the server group, with a
+///   `tls:*` item and no option, serve HTTPS. A relative path in a key is
+///   relative to the repository directory, also when the command runs in
+///   another directory.
+/// - A relative path in an option is relative to the current directory.
+/// - An option replaces the path of a key, and the command does not read
+///   the file of the key. `tls-cert` from a key and `--tls-key` go together.
+/// - A `listen` key with two addresses gives two listeners, and `--listen`
+///   replaces both with one. Standard output carries the URL lines alone.
+/// - `allow-cleartext-credentials=true` takes a bearer token over plain
+///   HTTP, and `--allow-cleartext-credentials=false` refuses it with 403.
+/// - `max-sessions=1` refuses a second session with 503, and
+///   `--max-sessions=2` opens it.
 #[test]
-fn serve_checks_the_client_groups_against_its_tls_options_alone() {
-    let tmp = TmpDir::new("tls-options");
-    let cert = fixture("server.pem");
-    let key = fixture("server.key.pem");
-    let ca = fixture("ca.pem");
-    let with_groups = |name: &str, groups: &str| {
+fn serve_takes_its_settings_from_the_server_group() {
+    let tmp = TmpDir::new("settings");
+    let with_config = |name: &str, sections: &str| {
         let path = tmp.path().join(name);
-        let arg = format!("--repo={}", path.display());
-        ok(ostrya(), &[&arg, "init", "--mode=archive"]);
+        ok(
+            ostrya(),
+            &[
+                &format!("--repo={}", path.display()),
+                "init",
+                "--mode=archive",
+            ],
+        );
         let config = path.join("config");
         let mut text = std::fs::read_to_string(&config).unwrap();
-        text.push_str(groups);
+        text.push_str(sections);
         std::fs::write(&config, text).unwrap();
-        (path, arg)
+        path
     };
-    let (tls_path, tls_repo) = with_groups(
-        "tls-item",
-        &format!(
-            "[ex-ostrya server]\ntls-cert={}\ntls-key={}\ntls-client-ca={}\n\
-             [ex-ostrya client \"c\"]\nauth=tls:*\nallow=r:**\n",
-            cert.display(),
-            key.display(),
-            ca.display()
-        ),
+    let listen = "--listen=127.0.0.1:0";
+    let pem = |name: &str| fixture(name).display().to_string();
+
+    let keys = with_config(
+        "keys",
+        "[ex-ostrya server]\ntls-cert=server.pem\ntls-key=server.key.pem\n\
+         tls-client-ca=ca.pem\n[ex-ostrya client \"c\"]\nauth=tls:*\nallow=r:**\n",
     );
-    let out = run(
-        ostrya(),
-        &[&tls_repo, "serve", "--read-only", "--listen=127.0.0.1:0"],
-    );
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert_eq!(out.status.code(), Some(1), "{stderr}");
-    assert!(out.stdout.is_empty());
-    assert!(stderr.contains("tls-client-ca"), "{stderr}");
-    let server = Serving::start(
-        &tls_path,
-        &[
-            &format!("--tls-cert={}", cert.display()),
-            &format!("--tls-key={}", key.display()),
-            &format!("--client-ca={}", ca.display()),
-        ],
+    for name in ["server.pem", "server.key.pem", "ca.pem"] {
+        std::fs::copy(fixture(name), keys.join(name)).unwrap();
+    }
+    let mut server = Serving::spawn(serve_command(&keys).arg(listen).current_dir(tmp.path()));
+    assert!(server.url.starts_with("https://"), "{}", server.url);
+    assert_eq!(server.rest(), "");
+
+    let flags = with_config("flags", "");
+    let server = Serving::spawn(
+        serve_command(&flags)
+            .args([
+                listen,
+                "--tls-cert=server.pem",
+                "--tls-key=server.key.pem",
+                "--tls-client-ca=ca.pem",
+            ])
+            .current_dir(fixture("")),
     );
     assert!(server.url.starts_with("https://"), "{}", server.url);
     drop(server);
 
-    let (cert_path, _) = with_groups(
-        "cert-alone",
-        &format!("[ex-ostrya server]\ntls-cert={}\n", cert.display()),
+    let replaced = with_config(
+        "replaced",
+        "[ex-ostrya server]\ntls-cert=absent.pem\ntls-key=absent.key.pem\n",
     );
-    let server = Serving::start(&cert_path, &[]);
+    let server = Serving::start(
+        &replaced,
+        &[
+            &format!("--tls-cert={}", pem("server.pem")),
+            &format!("--tls-key={}", pem("server.key.pem")),
+        ],
+    );
+    assert!(server.url.starts_with("https://"), "{}", server.url);
+    drop(server);
+    let mixed = with_config("mixed", "[ex-ostrya server]\ntls-cert=server.pem\n");
+    std::fs::copy(fixture("server.pem"), mixed.join("server.pem")).unwrap();
+    let server = Serving::start(&mixed, &[&format!("--tls-key={}", pem("server.key.pem"))]);
+    assert!(server.url.starts_with("https://"), "{}", server.url);
+    drop(server);
+
+    let two = with_config(
+        "listen",
+        "[ex-ostrya server]\nlisten=127.0.0.1:0;127.0.0.1:0\n",
+    );
+    let mut server = Serving::spawn(&mut serve_command(&two));
+    let second = server.next_url();
     assert!(server.url.starts_with("http://"), "{}", server.url);
+    assert!(second.starts_with("http://"), "{second}");
+    assert_ne!(server.url, second);
+    assert_eq!(server.rest(), "");
+    let mut server = Serving::start(&two, &[]);
+    assert!(server.url.starts_with("http://"), "{}", server.url);
+    assert_eq!(server.rest(), "");
+
+    // The SHA-256 digest of `token`.
+    let digest = "3c469e9d6c5875d37a43f353d4f88e61fcf812c66eee3457465a40b0da4153e0";
+    let cleartext = with_config(
+        "cleartext",
+        &format!(
+            "[ex-ostrya server]\nallow-cleartext-credentials=true\n\
+             [ex-ostrya client \"builders\"]\nauth=token-sha256:{digest}\nallow=w:**\n"
+        ),
+    );
+    let post = "POST /_ostrya/receive/v1/session HTTP/1.1\r\nhost: x\r\n\
+                authorization: Bearer token\r\ncontent-length: 0\r\n\
+                connection: close\r\n\r\n";
+    let server = Serving::start(&cleartext, &[]);
+    let response = raw(&server.url, post);
+    // A 422 shows that the request passed the authentication. The empty
+    // body holds no `Hello`, so the endpoint refuses it with `protocol`.
+    assert!(response.starts_with("HTTP/1.1 422 "), "{response}");
+    drop(server);
+    let server = Serving::start(&cleartext, &["--allow-cleartext-credentials=false"]);
+    let response = raw(&server.url, post);
+    assert!(response.starts_with("HTTP/1.1 403 "), "{response}");
+    assert!(response.contains("the server takes no credential over plain HTTP"));
+    drop(server);
+
+    let sessions = with_config(
+        "sessions",
+        "[ex-ostrya server]\nmax-sessions=1\n\
+         [ex-ostrya client \"push\"]\nauth=anonymous\nallow=w:**\n",
+    );
+    let server = Serving::start(&sessions, &[]);
+    let response = raw(&server.url, session_request("a"));
+    assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
+    let response = raw(&server.url, session_request("b"));
+    assert!(response.starts_with("HTTP/1.1 503 "), "{response}");
+    drop(server);
+    let server = Serving::start(&sessions, &["--max-sessions=2"]);
+    for name in ["a", "b"] {
+        let response = raw(&server.url, session_request(name));
+        assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
+    }
 }
 
 /// Send `request` to the server at `url` on a new connection, and read the
 /// response until the server closes it.
-fn raw(url: &str, request: &str) -> String {
+fn raw(url: &str, request: impl AsRef<[u8]>) -> String {
     use std::io::{Read, Write};
 
     let addr = url.trim_start_matches("http://").trim_end_matches('/');
     let mut stream = std::net::TcpStream::connect(addr).unwrap();
-    stream.write_all(request.as_bytes()).unwrap();
+    stream.write_all(request.as_ref()).unwrap();
     let mut out = Vec::new();
     stream.read_to_end(&mut out).unwrap();
     String::from_utf8_lossy(&out).into_owned()
 }
 
 /// With a client group of anonymous push, the receive endpoint answers a
-/// `session` request, and the archive view still serves `config`. With
-/// `--read-only`, the server has no receive endpoint, so the request gets
-/// 405. A read-only server builds no key group, so a key that it cannot read
-/// does not stop it.
+/// `session` request, and the archive view still serves `config`. With a
+/// group that reads each ref and opens no push session, a `Hello` gets 403.
 #[test]
 fn serve_runs_the_receive_endpoint_with_anonymous_push() {
     let tmp = TmpDir::new("receive");
@@ -738,7 +892,7 @@ fn serve_runs_the_receive_endpoint_with_anonymous_push() {
     let post = "POST /_ostrya/receive/v1/session HTTP/1.1\r\nhost: x\r\n\
                 content-length: 0\r\nconnection: close\r\n\r\n";
     let get = "GET /config HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n";
-    let server = Serving::start_with(
+    let server = Serving::start(
         &path,
         &[
             "--session-timeout=30",
@@ -753,27 +907,29 @@ fn serve_runs_the_receive_endpoint_with_anonymous_push() {
     assert!(response.contains("the request body holds no message"));
     assert!(raw(&server.url, get).starts_with("HTTP/1.1 200 "));
     drop(server);
-    let mut text = std::fs::read_to_string(&config).unwrap();
-    text.push_str("[ex-ostrya key \"k\"]\ntype=ed25519\nsecret-key-file=/nonexistent/ostrya/k\n");
-    std::fs::write(&config, text).unwrap();
+    let text = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(&config, text.replace("allow=w:**", "allow=r:**")).unwrap();
     let server = Serving::start(&path, &[]);
-    let response = raw(&server.url, post);
-    assert!(response.starts_with("HTTP/1.1 405 "), "{response}");
+    let response = raw(&server.url, session_request("main"));
+    assert!(response.starts_with("HTTP/1.1 403 "), "{response}");
+    assert!(
+        response.contains("client group 'push' opens no push session"),
+        "{response}"
+    );
 }
 
 /// With a `token-sha256` item and an anonymous item, and with no
 /// `--allow-cleartext-credentials`, a bearer token over plain HTTP gets 403.
 /// With `--allow-cleartext-credentials`, the token passes the
-/// authentication, and a token that matches no item gets 401. With no
-/// `--read-only` and no client group, and with a client CA alone, the server
-/// starts.
+/// authentication, and a token that matches no item gets 401. With no client
+/// group, the server starts. With a client CA, the server serves HTTPS.
 #[test]
 fn serve_takes_the_credentials_of_the_client_groups() {
     let tmp = TmpDir::new("credentials");
     let path = tmp.path().join("repo");
     let repo = format!("--repo={}", path.display());
     ok(ostrya(), &[&repo, "init", "--mode=archive"]);
-    let server = Serving::start_with(&path, &[]);
+    let server = Serving::start(&path, &[]);
     assert!(server.url.starts_with("http://"), "{}", server.url);
     drop(server);
     // The SHA-256 digest of `token`.
@@ -788,12 +944,12 @@ fn serve_takes_the_credentials_of_the_client_groups() {
     let post = "POST /_ostrya/receive/v1/session HTTP/1.1\r\nhost: x\r\n\
                 authorization: Bearer token\r\ncontent-length: 0\r\n\
                 connection: close\r\n\r\n";
-    let server = Serving::start_with(&path, &[]);
+    let server = Serving::start(&path, &[]);
     let response = raw(&server.url, post);
     assert!(response.starts_with("HTTP/1.1 403 "), "{response}");
     assert!(response.contains("the server takes no credential over plain HTTP"));
     drop(server);
-    let server = Serving::start_with(&path, &["--allow-cleartext-credentials"]);
+    let server = Serving::start(&path, &["--allow-cleartext-credentials"]);
     let response = raw(&server.url, post);
     // A 422 shows that the request passed the authentication. The empty
     // body holds no `Hello`, so the endpoint refuses it with `protocol`.
@@ -802,12 +958,12 @@ fn serve_takes_the_credentials_of_the_client_groups() {
     let response = raw(&server.url, &unknown);
     assert!(response.starts_with("HTTP/1.1 401 "), "{response}");
     drop(server);
-    let server = Serving::start_with(
+    let server = Serving::start(
         &path,
         &[
             &format!("--tls-cert={}", fixture("server.pem").display()),
             &format!("--tls-key={}", fixture("server.key.pem").display()),
-            &format!("--client-ca={}", fixture("ca.pem").display()),
+            &format!("--tls-client-ca={}", fixture("ca.pem").display()),
         ],
     );
     assert!(server.url.starts_with("https://"), "{}", server.url);

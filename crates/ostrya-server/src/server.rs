@@ -163,6 +163,10 @@ fn receive(repo: &Repo, opts: &ServeOptions) -> Result<Option<Arc<ReceiveEndpoin
 /// - [`Error::Options`] if `listen` is empty, or if `body_timeout` is zero.
 /// - [`Error::Options`] if `receive` is set and `parallel_uploads` is
 ///   outside `1..=31`, or `session_idle_timeout` or `max_sessions` is zero.
+/// - [`Error::Options`] if `client_ca_pem` is set and `tls` is `None`.
+/// - [`Error::Options`] if a client group of `receive` carries a `tls:*`,
+///   `tls:NAME`, or `tls-sha256:HEX` item and `client_ca_pem` is `None`. The
+///   message names the group and the item.
 /// - [`Error::Tls`] if the TLS files give no server configuration.
 /// - [`Error::Bind`] if a listen address cannot be bound, or if its local
 ///   address cannot be read.
@@ -174,13 +178,29 @@ pub async fn bind(repo: Repo, opts: ServeOptions) -> Result<Server> {
         return Err(Error::Options("a body timeout of zero".into()));
     }
     let receive = receive(&repo, &opts)?;
+    if opts.client_ca_pem.is_some() && opts.tls.is_none() {
+        return Err(Error::Options("a client CA with no TLS".into()));
+    }
+    if opts.client_ca_pem.is_none()
+        && let Some(policies) = &opts.receive
+    {
+        for group in policies.access().groups() {
+            if let Some(item) = group.auth().iter().find(|item| item.is_tls()) {
+                return Err(Error::Options(format!(
+                    "[ex-ostrya client \"{}\"] carries the item {item}, and the server has \
+                     no client CA",
+                    group.name()
+                )));
+            }
+        }
+    }
     let tls = match &opts.tls {
         Some(tls) => Some(
             ostrya_fetch::server_config(
                 &tls.cert_chain_pem,
                 &tls.key_pem,
                 tls.key_passphrase.as_deref(),
-                tls.client_ca_pem.as_deref(),
+                opts.client_ca_pem.as_deref(),
             )
             .await
             .map_err(|e| match e {

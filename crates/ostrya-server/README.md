@@ -23,7 +23,7 @@ API documentation: <https://docs.rs/ostrya-server>
 
 - `serve` binds the listeners of a `ServeOptions` and runs the server.
 - `bind` binds the listeners and returns a `Server` to run with `Server::run`.
-- `ServeOptions` holds the addresses, the TLS files, and the options of a push.
+- `ServeOptions` holds the addresses, the TLS files, the client CA, and the options of a push.
 - `ReceiveEndpoint::new` creates the receive endpoint for the router of a host.
 - `ReceiveEndpoint::handle` answers one request of the endpoint.
 - `ReceiveAuth` is the authentication of the endpoint by its host.

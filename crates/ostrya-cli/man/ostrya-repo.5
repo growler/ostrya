@@ -287,6 +287,14 @@ The system trusted keys of the signature engine \fB\%<engine>\fR, which is \fB\%
 .TQ
 \fB\%/usr/share/ostree/revoked.<engine>\fR, \fB\%/usr/share/ostree/revoked.<engine>.d/\fR
 The system revoked keys of the signature engine \fB\%<engine>\fR.
+.PP
+\fB\%ostrya serve\fR also reads the files that these keys of \fB\%[ex\-ostrya server]\fR name, in the repository directory or outside it:
+.TP
+\fB\%tls\-cert\fR, \fB\%tls\-key\fR, \fB\%tls\-client\-ca\fR
+The PEM certificate chain of the server, its private key, and the CA certificates that verify a client certificate.
+A relative path in a key is relative to the repository directory.
+An option of \fB\%ostrya serve\fR with the name of a key replaces the key, and a relative path in an option is relative to the current directory.
+\fB\%ostrya serve\fR reads each file one time, at start, and refuses a file larger than 1 MiB.
 .SH SEE ALSO
 \fBostrya\fR(1),
 \fBostrya\-config\fR(1),

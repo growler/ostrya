@@ -3534,6 +3534,9 @@ async fn serve(repo: Repo, args: ServeArgs) -> Result<()> {
             );
         }
     }));
+    opts.on_event = Some(Arc::new(|event: &ostrya_server::ServerEvent| {
+        eprintln!("error: {event}");
+    }));
     let scheme = if opts.tls.is_some() { "https" } else { "http" };
     let server = match ostrya_server::bind(repo, opts).await {
         Ok(server) => server,

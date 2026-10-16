@@ -9,6 +9,7 @@
 //! - the refusals of the steps in flight
 //! - the authentication of each request
 //! - the PROXY protocol, the trusted proxies, and the forwarded certificates
+//! - the claims of a client certificate
 
 use std::future::Future;
 use std::net::{Ipv6Addr, SocketAddr};
@@ -34,7 +35,10 @@ use ostrya::{
     RepoMode, loose_path,
 };
 use ostrya_rt::{Timer, block_on};
-use ostrya_server::{ServeOptions, ServerTls};
+use ostrya_server::{ServeOptions, ServerEvent, ServerTls};
+
+#[path = "../src/test_pki.rs"]
+mod test_pki;
 
 const SESSION: &str = "_ostrya/receive/v1/session";
 
@@ -2350,5 +2354,122 @@ fn each_request_of_one_connection_is_identified_again() {
         let second = text.find("HTTP/1.1 403 ").expect("a second response");
         assert!(text[second..].contains(LOOPBACK), "{text}");
         assert_eq!(text.matches("HTTP/1.1 ").count(), 2, "{text}");
+    });
+}
+
+/// A group of `tls:*` that reads the claims of a certificate and opens no
+/// push session by its own rules.
+const CLAIMS_GROUP: &str =
+    "[ex-ostrya client \"certs\"]\nauth=tls:*\ntls-accept-claim=true\nallow=r:**\n";
+
+/// Sets an event callback on `opts`, and returns the events it receives.
+fn record_events(opts: &mut ServeOptions) -> Arc<Mutex<Vec<ServerEvent>>> {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let sink = events.clone();
+    opts.on_event = Some(Arc::new(move |event: &ServerEvent| {
+        sink.lock().unwrap().push(event.clone());
+    }));
+    events
+}
+
+/// Over TLS, the claims of the client certificate of the handshake replace
+/// the rules of the group: a claim with `w` opens a session that the group
+/// alone refuses. With no claim, the group applies. A malformed claim gets
+/// 403, and the server reports one event.
+#[test]
+fn the_claims_of_a_handshake_certificate_open_a_session() {
+    let tmp = TmpDir::new("claims-tls");
+    let repo = receiver(tmp.path(), RepoMode::Archive, "");
+    let ca = test_pki::TestCa::new();
+    let mut opts = options_with(&repo, CLAIMS_GROUP);
+    with_tls(&mut opts);
+    opts.client_ca_pem = Some(ca.pem.clone().into_bytes());
+    let events = record_events(&mut opts);
+    let client_spki = test_pki::spki_of(std::str::from_utf8(CLIENT_CERT_PEM).unwrap());
+    let leaf = |uris: &[&str]| {
+        let sans = [test_pki::uri_sans(uris)];
+        let der = ca.leaf_with("claims", Some(client_spki.clone()), &sans);
+        (test_pki::pem(&der).into_bytes(), der)
+    };
+    let (claimed, _) = leaf(&["ostrya:ref:w:main"]);
+    let (plain, _) = leaf(&["https://example.com/"]);
+    let (malformed, malformed_der) = leaf(&["ostrya:ref:w:main", "ostrya:ref:w:a b"]);
+    with_server(repo, opts, |_, addr| async move {
+        let client = Client::tls(addr, false, Some((&claimed, CLIENT_KEY_PEM))).await;
+        let id = client.open().await;
+        assert_eq!(client.delete(&id).await.status, 204);
+
+        let client = Client::tls(addr, true, Some((&plain, CLIENT_KEY_PEM))).await;
+        let reply = client.post(SESSION, encode(&[hello()]).await).await;
+        let error = reply.error(403, ErrorCode::Unauthorized);
+        assert_eq!(error.message, "client group 'certs' opens no push session");
+        assert!(events.lock().unwrap().is_empty());
+
+        let client = Client::tls(addr, false, Some((&malformed, CLIENT_KEY_PEM))).await;
+        let reply = client.post(SESSION, encode(&[hello()]).await).await;
+        let error = reply.error(403, ErrorCode::Unauthorized);
+        assert!(
+            error
+                .message
+                .starts_with("the claims of the client certificate do not parse: malformed claim 'ostrya:ref:w:a b': "),
+            "{error:?}"
+        );
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        let line = events[0].to_string();
+        let digest = Checksum::sha256(&malformed_der);
+        assert!(
+            line.starts_with(&format!(
+                "refused the client certificate tls-sha256:{digest}: malformed claim \
+                 'ostrya:ref:w:a b': "
+            )),
+            "{line}"
+        );
+    });
+}
+
+/// On a plain listener behind a trusted proxy, the claims of a forwarded
+/// certificate replace the rules of the group, as the claims of a handshake
+/// certificate do. A malformed claim gets 403 and one event.
+#[test]
+fn the_claims_of_a_forwarded_certificate_open_a_session() {
+    let tmp = TmpDir::new("claims-forwarded");
+    let repo = receiver(tmp.path(), RepoMode::Archive, "");
+    let ca = test_pki::TestCa::new();
+    let mut opts = forwarded_cert_options(&repo, CLAIMS_GROUP, ca.pem.as_bytes());
+    let events = record_events(&mut opts);
+    let claimed = ostrya::base64::encode(&ca.leaf("c", &["ostrya:ref:w:main"]));
+    let plain = ostrya::base64::encode(&ca.leaf("c", &[]));
+    let malformed_der = ca.leaf("c", &["ostrya:ref:w:main/"]);
+    let malformed = ostrya::base64::encode(&malformed_der);
+    with_server(repo, opts, |_, addr| async move {
+        let line = |value: &str| format!("x-ssl-client-cert: {value}\r\n");
+        let (code, text) = status(addr, &session_request(&line(&claimed), true).await).await;
+        assert_eq!(code, 200, "{text}");
+        let (code, text) = status(addr, &session_request(&line(&plain), true).await).await;
+        assert_eq!(code, 403, "{text}");
+        assert!(
+            text.contains("client group 'certs' opens no push session"),
+            "{text}"
+        );
+        assert!(events.lock().unwrap().is_empty());
+        for _ in 0..2 {
+            let (code, text) = status(addr, &session_request(&line(&malformed), true).await).await;
+            assert_eq!(code, 403, "{text}");
+            assert!(
+                text.contains("malformed claim 'ostrya:ref:w:main/'"),
+                "{text}"
+            );
+        }
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 2, "{events:?}");
+        assert!(
+            events.iter().all(|event| matches!(
+                event,
+                ServerEvent::BadClaims { digest, san: Some(san), .. }
+                    if *digest == Checksum::sha256(&malformed_der) && san == "ostrya:ref:w:main/"
+            )),
+            "{events:?}"
+        );
     });
 }

@@ -9,6 +9,7 @@ use ostrya::access::{ForwardedHeader, IpNet};
 use ostrya::{ReceivePolicies, ReceiveReport};
 
 use crate::endpoint::EndpointOptions;
+use crate::event::EventSink;
 
 /// The PEM bytes of the server TLS files.
 ///
@@ -55,8 +56,8 @@ impl fmt::Debug for ServerTls {
 /// `on_report` go to the [`EndpointOptions`] of the receive endpoint. Their
 /// defaults are the defaults of [`EndpointOptions::default`]. If
 /// [`receive`](ServeOptions::receive) is `None`, [`bind`](crate::bind) does
-/// not read these four fields or `allow_cleartext_credentials`. It then
-/// refuses no value of them.
+/// not read these four fields, `allow_cleartext_credentials`, or `on_event`.
+/// It then refuses no value of them.
 ///
 /// # Authentication
 ///
@@ -106,7 +107,13 @@ impl fmt::Debug for ServerTls {
 ///
 /// The owner key of a request is the text of its item, as
 /// [`AuthItem`](ostrya::access::AuthItem) writes it. All clients with one
-/// item share one owner key, for example all anonymous clients.
+/// item share one owner key, for example all anonymous clients. A client
+/// certificate that gives a `tls:*`, `tls:NAME`, or `tls-sha256:HEX` item of
+/// a group with `tls-accept-claim=true` has the key `tls-sha256:HEX`, the
+/// SHA-256 digest of its DER bytes. So two certificates with different
+/// claims never share a session. This key is the key of no other client:
+/// the certificate sets the item that it matches, and only the certificate
+/// of that digest matches the item `tls-sha256:HEX`.
 ///
 /// A `session` request selects the client group that carries the item in the
 /// local refs, with
@@ -114,6 +121,35 @@ impl fmt::Debug for ServerTls {
 /// names no collection, so the namespace of each session is the local refs.
 /// The session gets the policy of that group and no hooks. With no such
 /// group, and with a group that opens no push session, the request gets 403.
+///
+/// # Claims
+///
+/// A client group with `tls-accept-claim=true` reads the claims of the client
+/// certificate that gives the item of a `session` request: the URI SANs with
+/// the scheme `ostrya`, as [`Claims`](ostrya::access::Claims) reads them.
+/// The claims of the certificate of the TLS handshake are read one time for
+/// each connection. The claims of a forwarded certificate are read one time
+/// for each cache entry.
+///
+/// - When the certificate holds one or more claims for the namespace of the
+///   session, as
+///   [`ClientAccess::claim_rules`](ostrya::access::ClientAccess::claim_rules)
+///   gives them, they replace the allow items and the deny items of the
+///   group. The other values of the policy come from the group.
+/// - When it holds no claim for the namespace, the rules of the group apply.
+/// - When the claims do not parse, the request gets 403, and the server
+///   reports a [`ServerEvent::BadClaims`](crate::ServerEvent::BadClaims) to
+///   [`on_event`](ServeOptions::on_event). The claims do not parse when a
+///   URI with the scheme `ostrya`, in any case, is no claim form, when the
+///   certificate holds more than [`MAX_CLAIMS`](ostrya::access::MAX_CLAIMS)
+///   such URIs, when the certificate does not decode, when it holds more
+///   than one subjectAltName extension, and when its subjectAltName
+///   extension does not decode. Each case has its own reason.
+/// - When the rules of the claims open no push session, the request gets
+///   403.
+///
+/// A group with `tls-accept-claim=false`, a credential, a `net:` item, and the
+/// `anonymous` item read no claim.
 ///
 /// # Client address
 ///
@@ -303,9 +339,17 @@ pub struct ServeOptions {
     /// The callback for the report of a committed session, as in
     /// [`EndpointOptions::on_report`].
     pub on_report: Option<Arc<dyn Fn(ReceiveReport) + Send + Sync>>,
+    /// The callback for each [`ServerEvent`](crate::ServerEvent) of the
+    /// receive endpoint, or `None`.
+    ///
+    /// The server calls it in the task of the request, so the callback must
+    /// return soon. A host writes the event to its log, for example the
+    /// [`Display`](std::fmt::Display) text of the event on standard error.
+    /// The default is `None`, which drops each event.
+    pub on_event: Option<EventSink>,
 }
 
-/// The debug text shows a report callback that is set as `<callback>`, a
+/// The debug text shows a callback that is set as `<callback>`, a
 /// client CA that is set as `<N bytes>`, the trusted proxies as networks,
 /// and the receive policies as the
 /// names of their client groups. It holds no auth item, so no digest and no
@@ -353,6 +397,7 @@ impl fmt::Debug for ServeOptions {
             .field("session_idle_timeout", &self.session_idle_timeout)
             .field("max_sessions", &self.max_sessions)
             .field("on_report", &self.on_report.as_ref().map(|_| "<callback>"))
+            .field("on_event", &self.on_event.as_ref().map(|_| "<callback>"))
             .finish()
     }
 }
@@ -375,6 +420,7 @@ impl Default for ServeOptions {
             session_idle_timeout: endpoint.session_idle_timeout,
             max_sessions: endpoint.max_sessions,
             on_report: endpoint.on_report,
+            on_event: None,
         }
     }
 }

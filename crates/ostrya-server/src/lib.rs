@@ -24,6 +24,7 @@
 //! - [`ReceiveEndpoint::new`] creates the receive endpoint for the router of a host.
 //! - [`ReceiveEndpoint::handle`] answers one request of the endpoint.
 //! - [`ReceiveAuth`] is the authentication of the endpoint by its host.
+//! - [`ServerEvent`] is an event that the server reports to its host.
 //! - [`Error`] is the error of each fallible operation of the crate.
 //!
 //! # Features
@@ -52,6 +53,7 @@ mod body;
 mod cert;
 mod endpoint;
 mod error;
+mod event;
 mod forwarded;
 mod options;
 mod proxy_protocol;
@@ -64,10 +66,13 @@ mod server;
 mod session;
 mod shutdown;
 mod stall;
+#[cfg(test)]
+mod test_pki;
 
 pub use body::ReceiveBody;
 pub use endpoint::{EndpointOptions, ReceiveEndpoint};
 pub use error::{Error, Result};
+pub use event::ServerEvent;
 pub use options::{ServeOptions, ServerTls};
 pub use receive_auth::{ReceiveAuth, Refusal, RequestKind, SessionSetup};
 pub use server::{Server, bind, serve};

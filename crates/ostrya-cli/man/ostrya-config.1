@@ -425,7 +425,8 @@ Without the key, the group has no right on a ref.
 The deny items, each a \fB\%PATTERN\fR.
 .TP
 \fB\%tls\-accept\-claim\fR (boolean, default false)
-Read the claims of the client certificate.
+Read the claims of the client certificate (see "Claims").
+The claims of the namespace replace \fB\%allow\fR and \fB\%deny\fR of the group.
 A group with no \fB\%tls:\fR or \fB\%tls\-sha256:\fR item refuses the key, with any value.
 .TP
 \fB\%verify\fR (string)
@@ -528,6 +529,45 @@ A push writes no remote ref, and no \fB\%ostree\-metadata\fR in a repository wit
 .IP \(bu 2
 The parent chain of a new branch can stop at any depth.
 On a branch that exists, the chain of the new commit must reach the current commit, else the update is \fB\%non\-fast\-forward\fR.
+.SS "Claims"
+A claim is a URI SAN of a client certificate.
+A group with \fB\%tls\-accept\-claim=true\fR reads the claims of the certificate that gives its \fB\%tls:\fR or \fB\%tls\-sha256:\fR item.
+A claim has one of these forms:
+.TP
+\fB\%ostrya:ref:[MODES:]PATTERN\fR
+An allow item of the local refs.
+.TP
+\fB\%ostrya:ref:!PATTERN\fR
+A deny item of the local refs.
+.TP
+\fB\%ostrya:collection:ID:[MODES:]PATTERN\fR
+An allow item of the collection \fB\%ID\fR.
+.TP
+\fB\%ostrya:collection:ID:!PATTERN\fR
+A deny item of the collection \fB\%ID\fR.
+.PP
+\fB\%MODES\fR and \fB\%PATTERN\fR have the grammar of "Access modes and patterns", and a claim with no \fB\%MODES\fR has the mode \fB\%r\fR.
+\fB\%ID\fR passes the collection\-id rule.
+.IP \(bu 2
+A group of the local refs reads the \fB\%ostrya:ref:\fR claims, and the \fB\%ostrya:collection:ID:\fR claims whose \fB\%ID\fR is the \fB\%collection\-id\fR of \fB\%[core]\fR.
+A group of a collection reads the \fB\%ostrya:collection:ID:\fR claims of the collection of the request.
+.IP \(bu 2
+When the certificate holds one or more claims for the namespace, they replace \fB\%allow\fR and \fB\%deny\fR of the group.
+When it holds none, \fB\%allow\fR and \fB\%deny\fR apply.
+.IP \(bu 2
+\fB\%verify\fR, \fB\%allow\-unsigned\fR, \fB\%sign\fR, and \fB\%allow\-privileged\fR come from the group.
+.IP \(bu 2
+A URI whose scheme is not \fB\%ostrya\fR, in any case, has no effect.
+.IP \(bu 2
+A URI whose scheme is \fB\%ostrya\fR, in any case, and that is no claim refuses the request with 403.
+The scheme and the kind are lowercase in a claim.
+More than 256 such URIs also refuse the request.
+So do a certificate that does not decode, a certificate with more than one subjectAltName extension, and a subjectAltName extension that does not decode.
+Each case has its own reason.
+The server writes an error to standard error that names the SHA\-256 digest of the certificate and the URI.
+.PP
+The claims can give more rights than the group, so the CA of \fB\%tls\-client\-ca\fR grants the rights of each certificate that it signs.
+A credential, a \fB\%net:\fR item, and the \fB\%anonymous\fR item take no claims.
 .SS "No client group"
 A repository with no client group has two groups:
 .PP

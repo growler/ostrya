@@ -236,8 +236,12 @@ bounded:
   `proxy-protocol`, each connection starts with a PROXY protocol header of
   version 1 or 2, which the module `proxy_protocol` reads before the TLS
   handshake, with no crate. The owner key of a session is the text of
-  the auth item. `GroupAuth` gives each session the policy of the client
-  group of the local refs that carries the item, and no hooks. It refuses a
+  the auth item. For a certificate item that a group with
+  `tls-accept-claim` carries, the key is `tls-sha256:HEX` of the
+  certificate. `GroupAuth` gives each session the policy of the client
+  group of the local refs that carries the item, and no hooks. When that
+  group has `tls-accept-claim`, the claims of the certificate for the
+  namespace replace `allow` and `deny` of the policy. It refuses a
   session with 403 when no such group exists, and when the group opens no
   push session. `GroupAuth` compares the digests in constant time with a
   hand-rolled compare and no dependency. The public type
@@ -252,9 +256,9 @@ bounded:
   adapters over `ostrya-rt` and for the server TLS configuration, on
   `ostrya-rt`, on `hyper` and `futures-rustls`, and on `getrandom` for the
   session ids (`CLAUDE.md`, "Authorized: the `getrandom` crate"), and on
-  `x509-cert` for the subject CN of a client certificate (`CLAUDE.md`,
-  "Authorized: the `x509-cert` crate"). Its features `smol`, the
-  default, and `tokio` select the runtime backend. `ostrya-server` and
+  `x509-cert` for the subject CN and the URI SANs of a client certificate
+  (`CLAUDE.md`, "Authorized: the `x509-cert` crate"). Its features `smol`,
+  the default, and `tokio` select the runtime backend. `ostrya-server` and
   `ostrya-fetch` take `hyper` 1.11.1 or later: 1.11.0 can keep the last
   chunk of a response body in its write buffer when the first poll of the
   body is pending, so the response never ends.
@@ -8637,21 +8641,23 @@ crate", states the measured graph.
 
 The binary cost of `x509-cert`:
 
-- `ostrya-server` reads the subject CN of a client certificate with
-  `x509-cert`, for the `tls:NAME` items of the identification of a client.
+- `ostrya-server` reads the subject CN and the URI SANs of a client
+  certificate with `x509-cert`, for the `tls:NAME` items of the
+  identification of a client and for the claims.
 - The figure is measured on `target/release/ostrya`, the binary
   `cargo build --release -p ostrya-cli` writes with its default feature set,
   stripped after the build. Two builds of one tree under one toolchain are
   compared. The first is the tree as it stands. The second holds the
-  counterfactual, which has two parts: the read of the CN in
-  `crates/ostrya-server/src/cert.rs` is stubbed to give no CN, and the
+  counterfactual, which has two parts: the read of the certificate in
+  `crates/ostrya-server/src/cert.rs` is stubbed to give no CN, no end of
+  the validity period, and no claims, and the
   `x509-cert` entry is dropped from `crates/ostrya-server/Cargo.toml`. Both
   parts are needed, because the stub alone leaves the crate in the link.
   `cargo tree -p ostrya-cli -i x509-cert` confirms the second build reaches
   no such package.
-- The first binary measures 20,122,136 bytes and the second 20,046,872, so
-  the read costs 75,264 bytes, which is about 74 KiB. A rebuild of the first
-  tree gives the same byte count. The standalone probe of the phase setup
+- The first binary measures 20,271,128 bytes and the second 20,162,840, so
+  the read costs 108,288 bytes, which is about 106 KiB. A rebuild of the
+  first tree gives the same byte count. The standalone probe of the phase setup
   gave an upper bound of about 121 KiB.
 
 ## Risk register

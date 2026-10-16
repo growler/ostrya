@@ -27,7 +27,7 @@
 //! - Checkout and export: [`checkout`], [`composefs`], [`tar`], and [`archive`].
 //! - Pull: [`pull`], [`summary`], [`fetch`], the HTTP client of `ostrya-fetch`, and [`remote`], which holds the session of a pull over HTTP, over ssh, or over a pair of byte streams.
 //! - Push and receive: [`remote`], the wire protocol of `ostrya-remote`, and `receive`.
-//! - Client access: [`access`], the client groups and the server settings of the config.
+//! - Client access: [`access`], the client groups and the server settings of the config, and the claims of a client certificate.
 //! - Remote resolution: [`endpoint`], which reads the keys and files of a remote for a pull or a push.
 //! - Signing: [`sign`], `gpg`, and `spki`.
 //! - Signature trust: [`verify`], the trusted keys and the trust of one pull.

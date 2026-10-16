@@ -41,7 +41,7 @@ use super::{ServerSigner, StreamPolicy, TrustedKeys};
 ///   request, it can also be a non-fast-forward update.
 /// - A delete of a ref that exists needs `d`. A delete of an absent ref
 ///   changes nothing.
-#[derive(Debug, Default)]
+#[derive(Debug, Clone, Default)]
 pub struct ReceivePolicy {
     /// The allow items and the deny items of the group.
     pub rules: AccessRules,

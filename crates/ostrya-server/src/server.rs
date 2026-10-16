@@ -173,7 +173,8 @@ fn receive(
         _ => None,
     };
     let auth = GroupAuth::new(policies.clone(), opts.allow_cleartext_credentials)
-        .with_proxies(forwarding, certs);
+        .with_proxies(forwarding, certs)
+        .with_events(opts.on_event.clone());
     let options = EndpointOptions {
         parallel_uploads: opts.parallel_uploads,
         session_idle_timeout: opts.session_idle_timeout,

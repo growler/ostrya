@@ -30,6 +30,7 @@ API documentation: <https://docs.rs/ostrya-server>
 - `ReceiveEndpoint::new` creates the receive endpoint for the router of a host.
 - `ReceiveEndpoint::handle` answers one request of the endpoint.
 - `ReceiveAuth` is the authentication of the endpoint by its host.
+- `ServerEvent` is an event that the server reports to its host.
 - `Error` is the error of each fallible operation of the crate.
 
 ## Features

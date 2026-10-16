@@ -16,8 +16,13 @@
 //! the client CA, with no intermediate. It keeps each verified certificate in
 //! a cache of [`CACHE_ENTRIES`] entries, keyed by the SHA-256 digest of its
 //! DER bytes, until the end of its validity period.
+//!
+//! The server reads the claims of a certificate, its URI SANs with the
+//! scheme `ostrya`, when it reads the certificate. A cache entry keeps them,
+//! also when they do not parse.
 
 use std::collections::{HashMap, VecDeque};
+use std::fmt;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -27,11 +32,17 @@ use futures_rustls::rustls::server::danger::ClientCertVerifier;
 use hyper::HeaderMap;
 use hyper::header::HeaderName;
 use ostrya::Checksum;
+use ostrya::access::{ClaimError, Claims};
 use x509_cert::Certificate;
 use x509_cert::der::asn1::{PrintableStringRef, Utf8StringRef};
 use x509_cert::der::oid::db::rfc4519::CN;
+use x509_cert::der::oid::db::rfc5280::ID_CE_SUBJECT_ALT_NAME;
 use x509_cert::der::{Decode, Tag, Tagged};
+use x509_cert::ext::pkix::SubjectAltName;
+use x509_cert::ext::pkix::name::GeneralName;
 use x509_cert::name::Name;
+
+use crate::event::Escaped;
 
 /// The most verified certificates that the cache of forwarded certificates
 /// holds. When the cache is full, a new entry removes the oldest entry.
@@ -44,6 +55,10 @@ pub(crate) const CACHE_ENTRIES: usize = 1024;
 pub(crate) struct ClientCert {
     /// The SHA-256 digest of the DER bytes of the certificate.
     pub(crate) digest: Checksum,
+    /// The text `tls-sha256:HEX` of `digest`. It is the owner key of a
+    /// client whose certificate gives the item of a group with
+    /// `tls-accept-claim=true`.
+    pub(crate) owner: Arc<str>,
     /// The one CN of the subject. It is `None` if the subject holds no CN,
     /// more than one CN, or a CN of a type other than UTF8String or
     /// PrintableString, and if the DER bytes do not parse.
@@ -51,6 +66,8 @@ pub(crate) struct ClientCert {
     /// The end of the validity period, as the time since the Unix epoch. It
     /// is `None` if the DER bytes do not parse.
     pub(crate) not_after: Option<Duration>,
+    /// The claims of the URI SANs, or why they do not parse.
+    pub(crate) claims: Result<Claims, ClaimFault>,
 }
 
 impl ClientCert {
@@ -66,13 +83,92 @@ impl ClientCert {
     fn from_der_with_digest(der: &[u8], digest: Checksum) -> ClientCert {
         let cert = Certificate::from_der(der).ok();
         ClientCert {
+            owner: format!("tls-sha256:{digest}").into(),
             digest,
             cn: cert
                 .as_ref()
                 .and_then(|cert| subject_cn(&cert.tbs_certificate.subject)),
-            not_after: cert.map(|cert| cert.tbs_certificate.validity.not_after.to_unix_duration()),
+            not_after: cert
+                .as_ref()
+                .map(|cert| cert.tbs_certificate.validity.not_after.to_unix_duration()),
+            claims: cert
+                .as_ref()
+                .map_or(Err(ClaimFault::Unreadable(UNDECODABLE)), claims),
         }
     }
+}
+
+/// Why the server reads no claims from a certificate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ClaimFault {
+    /// A URI SAN with the scheme `ostrya` is no claim, or the certificate
+    /// holds too many claims.
+    Claim(ClaimError),
+    /// The certificate or its subjectAltName extension does not decode, or
+    /// the certificate holds more than one subjectAltName extension. The
+    /// text is the reason.
+    Unreadable(&'static str),
+}
+
+/// The reason of a certificate that does not decode.
+const UNDECODABLE: &str = "the certificate does not decode";
+
+/// The reason of a certificate with more than one subjectAltName extension.
+const TWO_SANS: &str = "the certificate holds more than one subjectAltName extension";
+
+/// The reason of a subjectAltName extension that does not decode.
+const BAD_SAN: &str = "the subjectAltName extension of the certificate does not decode";
+
+impl ClaimFault {
+    /// The URI SAN that is no claim, if one is.
+    pub(crate) fn san(&self) -> Option<&str> {
+        match self {
+            ClaimFault::Claim(ClaimError::Malformed { uri, .. }) => Some(uri),
+            _ => None,
+        }
+    }
+
+    /// Why the claims do not parse, without the URI SAN.
+    pub(crate) fn reason(&self) -> String {
+        match self {
+            ClaimFault::Claim(ClaimError::Malformed { reason, .. }) => reason.clone(),
+            ClaimFault::Claim(other) => other.to_string(),
+            ClaimFault::Unreadable(reason) => (*reason).to_owned(),
+        }
+    }
+}
+
+/// The URI SAN and the reason, with each control character escaped.
+impl fmt::Display for ClaimFault {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(san) = self.san() {
+            write!(f, "malformed claim '{}': ", Escaped(san))?;
+        }
+        write!(f, "{}", Escaped(&self.reason()))
+    }
+}
+
+/// The claims of the URI SANs of `cert`.
+fn claims(cert: &Certificate) -> Result<Claims, ClaimFault> {
+    let mut extensions = cert
+        .tbs_certificate
+        .extensions
+        .iter()
+        .flatten()
+        .filter(|extension| extension.extn_id == ID_CE_SUBJECT_ALT_NAME);
+    let Some(extension) = extensions.next() else {
+        return Ok(Claims::default());
+    };
+    if extensions.next().is_some() {
+        return Err(ClaimFault::Unreadable(TWO_SANS));
+    }
+    let names = SubjectAltName::from_der(extension.extn_value.as_bytes())
+        .map_err(|_| ClaimFault::Unreadable(BAD_SAN))?;
+    Claims::parse(names.0.iter().filter_map(|name| match name {
+        GeneralName::UniformResourceIdentifier(uri) => Some(uri.as_str()),
+        _ => None,
+    }))
+    .map_err(ClaimFault::Claim)
 }
 
 /// Why a forwarded certificate gets 403.
@@ -281,6 +377,7 @@ mod tests {
     use hyper::header::HeaderValue;
 
     use super::*;
+    use crate::test_pki::TestCa;
 
     /// The CN of the subject `text`, in the string form of RFC 4514. A value
     /// `#HEX` is the DER bytes of the value, with its tag.
@@ -612,6 +709,149 @@ mod tests {
             None
         );
         assert_eq!(counting.calls.load(Ordering::Relaxed), 2);
+    }
+
+    use x509_cert::der::Encode;
+    use x509_cert::der::asn1::Ia5String;
+
+    /// The URIs of the claims of `cert`, as the claims write them.
+    fn claim_texts(cert: &ClientCert) -> Vec<String> {
+        use ostrya::access::ClaimRule;
+        cert.claims
+            .as_ref()
+            .unwrap()
+            .as_slice()
+            .iter()
+            .map(|claim| match &claim.rule {
+                ClaimRule::Allow(item) => format!("{:?} {item}", claim.namespace),
+                ClaimRule::Deny(pattern) => format!("{:?} !{}", claim.namespace, pattern.as_str()),
+            })
+            .collect()
+    }
+
+    /// The URI SANs with the scheme `ostrya` are the claims, in order. Other
+    /// URIs and DNS names are no claims.
+    #[test]
+    fn the_uri_sans_give_the_claims() {
+        let ca = TestCa::new();
+        let leaf = ca.leaf(
+            "claims",
+            &[
+                "ostrya:ref:w:main",
+                "https://example.com/",
+                "ostrya:collection:a.b:!os/**",
+            ],
+        );
+        let cert = ClientCert::from_der(&leaf);
+        assert_eq!(cert.cn.as_deref(), Some("claims"));
+        assert_eq!(
+            claim_texts(&cert),
+            [
+                "Local w:main".to_owned(),
+                "Collection(\"a.b\") !os/**".to_owned()
+            ]
+        );
+        let san = SubjectAltName(vec![
+            GeneralName::DnsName(Ia5String::new("ostrya:ref:x:a").unwrap()),
+            GeneralName::UniformResourceIdentifier(Ia5String::new("ostrya:ref:d:b").unwrap()),
+        ]);
+        let dns = ClientCert::from_der(&ca.leaf_with("dns", None, &[san.to_der().unwrap()]));
+        assert_eq!(claim_texts(&dns), ["Local d:b".to_owned()]);
+        let none = ClientCert::from_der(&ca.leaf("none", &[]));
+        assert_eq!(none.claims, Ok(ostrya::access::Claims::default()));
+        let fixture = ClientCert::from_der(&der(CLIENT_PEM));
+        assert_eq!(fixture.claims, Ok(ostrya::access::Claims::default()));
+    }
+
+    /// A malformed claim gives its URI and the reason. Too many claims, a
+    /// subjectAltName extension that does not decode, two subjectAltName
+    /// extensions, and bytes that do not parse give a fault with no URI, each
+    /// with its own reason.
+    #[test]
+    fn claims_that_do_not_parse_give_a_fault() {
+        let ca = TestCa::new();
+        let bad = ClientCert::from_der(&ca.leaf("bad", &["ostrya:ref:a", "ostrya:ref:x:b"]));
+        let fault = bad.claims.unwrap_err();
+        assert_eq!(fault.san(), Some("ostrya:ref:x:b"));
+        assert_eq!(
+            fault.to_string(),
+            "malformed claim 'ostrya:ref:x:b': the modes are one or more of r, w, c, t, and d"
+        );
+        let upper = ClientCert::from_der(&ca.leaf("upper", &["OSTRYA:ref:a"]));
+        assert_eq!(upper.claims.unwrap_err().san(), Some("OSTRYA:ref:a"));
+        let uris: Vec<String> = (0..=ostrya::access::MAX_CLAIMS)
+            .map(|i| format!("ostrya:ref:r{i}"))
+            .collect();
+        let uris: Vec<&str> = uris.iter().map(String::as_str).collect();
+        let many = ClientCert::from_der(&ca.leaf("many", &uris));
+        let fault = many.claims.unwrap_err();
+        assert_eq!(fault, ClaimFault::Claim(ClaimError::TooMany));
+        assert_eq!(fault.san(), None);
+        assert_eq!(
+            fault.to_string(),
+            "the certificate holds more than 256 claims"
+        );
+        // A SEQUENCE with one URI whose byte 0x80 is not IA5.
+        let undecodable = ca.leaf_with("raw", None, &[vec![0x30, 0x03, 0x86, 0x01, 0x80]]);
+        let cert = ClientCert::from_der(&undecodable);
+        assert_eq!(cert.cn.as_deref(), Some("raw"));
+        let fault = cert.claims.unwrap_err();
+        assert_eq!(fault.san(), None);
+        assert_eq!(
+            fault.to_string(),
+            "the subjectAltName extension of the certificate does not decode"
+        );
+        let san = crate::test_pki::uri_sans(&["ostrya:ref:a"]);
+        let two = ClientCert::from_der(&ca.leaf_with("two", None, &[san.clone(), san]));
+        let fault = two.claims.unwrap_err();
+        assert_eq!(fault.san(), None);
+        assert_eq!(
+            fault.to_string(),
+            "the certificate holds more than one subjectAltName extension"
+        );
+        let fault = ClientCert::from_der(b"not a certificate")
+            .claims
+            .unwrap_err();
+        assert_eq!(fault.san(), None);
+        assert_eq!(fault.to_string(), "the certificate does not decode");
+    }
+
+    /// A control character of a malformed claim is escaped in the text of
+    /// the fault.
+    #[test]
+    fn a_fault_escapes_control_characters() {
+        let fault = ClaimFault::Claim(ClaimError::Malformed {
+            uri: "ostrya:ref:a\nb".to_owned(),
+            reason: "why\r".to_owned(),
+        });
+        assert_eq!(
+            fault.to_string(),
+            "malformed claim 'ostrya:ref:a\\nb': why\\r"
+        );
+    }
+
+    /// A cache entry keeps the claims of a forwarded certificate, also when
+    /// they do not parse, and a cache hit verifies and parses nothing.
+    #[test]
+    fn a_cache_entry_keeps_the_claims() {
+        let ca = TestCa::new();
+        let verifier = ostrya_fetch::client_cert_verifier(ca.pem.as_bytes()).unwrap();
+        let certs = ForwardedCerts::new(name(), verifier);
+        for uris in [&["ostrya:ref:w:main"][..], &["ostrya:ref:x:main"]] {
+            let der = ca.leaf("forwarded", uris);
+            let request = headers(&[&ostrya::base64::encode(&der)]);
+            let first = certs
+                .certificate(&request, UnixTime::now())
+                .unwrap()
+                .unwrap();
+            let second = certs
+                .certificate(&request, UnixTime::now())
+                .unwrap()
+                .unwrap();
+            assert!(Arc::ptr_eq(&first, &second));
+            assert_eq!(first.claims, ClientCert::from_der(&der).claims);
+        }
+        assert_eq!(certs.cache.lock().unwrap().entries.len(), 2);
     }
 
     /// The verifier of the fixture CA accepts the fixture client

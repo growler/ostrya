@@ -2,9 +2,9 @@
 //! groups of the repository.
 //!
 //! The doc of [`ServeOptions`](crate::ServeOptions) states the order of the
-//! checks. The server compares the digest of a credential with every
-//! `token-sha256` or `basic-sha256` item in constant time, and does not stop
-//! at a match.
+//! checks and the rules of the claims of a client certificate. The server
+//! compares the digest of a credential with every `token-sha256` or
+//! `basic-sha256` item in constant time, and does not stop at a match.
 
 use std::collections::HashMap;
 use std::future::{Future, ready};
@@ -16,11 +16,12 @@ use futures_rustls::pki_types::UnixTime;
 use hyper::header::{AUTHORIZATION, HeaderValue, WWW_AUTHENTICATE};
 use hyper::http::request::Parts;
 use hyper::{HeaderMap, StatusCode};
-use ostrya::access::{AuthItem, IpNet};
+use ostrya::access::{AuthItem, ClientAccess, ClientGroup, IpNet};
 use ostrya::remote::proto::Hello;
-use ostrya::{Checksum, ReceivePolicies};
+use ostrya::{Checksum, ReceivePolicies, ReceivePolicy};
 
 use crate::cert::{ClientCert, ForwardedCerts};
+use crate::event::{EventSink, ServerEvent};
 use crate::forwarded::{Forwarding, Origin};
 use crate::receive_auth::{ReceiveAuth, Refusal, RequestKind, SessionSetup};
 
@@ -96,10 +97,11 @@ struct CredentialIndex {
 }
 
 impl CredentialIndex {
-    fn new<'a>(items: impl Iterator<Item = &'a AuthItem>) -> CredentialIndex {
+    fn new(access: &ClientAccess) -> CredentialIndex {
         let mut index = CredentialIndex::default();
-        for item in items {
-            let client = Client::new(item.clone());
+        for item in access.items() {
+            let claims = item.is_tls() && access.groups_of(item).any(ClientGroup::tls_accept_claim);
+            let client = Client::new(item.clone(), claims);
             match item {
                 AuthItem::Anonymous => index.anonymous = Some(client),
                 AuthItem::TlsAny => index.tls_any = Some(client),
@@ -206,16 +208,39 @@ impl CredentialIndex {
 #[derive(Debug, Clone)]
 pub(crate) struct Client {
     item: Arc<AuthItem>,
-    /// The text of `item`.
+    /// The text of `item`. For a certificate of `claims`, the
+    /// `tls-sha256:HEX` text of the certificate alone.
     owner: Arc<str>,
+    /// `true` if `item` is a TLS item and a group that carries it has
+    /// `tls-accept-claim=true`.
+    claims: bool,
+    /// The certificate that gave `item`, when `claims` is `true`.
+    cert: Option<Arc<ClientCert>>,
 }
 
 impl Client {
-    fn new(item: AuthItem) -> Client {
+    fn new(item: AuthItem, claims: bool) -> Client {
         Client {
             owner: item.to_string().into(),
             item: Arc::new(item),
+            claims,
+            cert: None,
         }
+    }
+
+    /// The client that the certificate `cert` identifies. When a group of
+    /// the item reads claims, the client keeps the certificate, and its
+    /// owner key is the `tls-sha256:HEX` text of the certificate.
+    ///
+    /// The digest alone is a key with no collision. The certificate sets
+    /// the item that it matches, and a `tls-sha256:HEX` item, the one other
+    /// item with this text, matches only the certificate of that digest.
+    fn with_cert(mut self, cert: &Arc<ClientCert>) -> Client {
+        if self.claims {
+            self.owner = cert.owner.clone();
+            self.cert = Some(cert.clone());
+        }
+        self
     }
 }
 
@@ -236,6 +261,8 @@ pub(crate) struct GroupAuth {
     /// The client certificates that trusted proxies forward, or `None` with
     /// no header of a forwarded certificate.
     forwarded_certs: Option<ForwardedCerts>,
+    /// The callback of the events, or `None`.
+    on_event: Option<EventSink>,
 }
 
 impl GroupAuth {
@@ -244,10 +271,11 @@ impl GroupAuth {
     pub(crate) fn new(policies: Arc<ReceivePolicies>, cleartext: bool) -> GroupAuth {
         GroupAuth {
             cleartext,
-            index: CredentialIndex::new(policies.access().items()),
+            index: CredentialIndex::new(policies.access()),
             policies,
             forwarding: None,
             forwarded_certs: None,
+            on_event: None,
         }
     }
 
@@ -261,6 +289,12 @@ impl GroupAuth {
     ) -> GroupAuth {
         self.forwarding = forwarding;
         self.forwarded_certs = certs;
+        self
+    }
+
+    /// The authentication that reports its events to `on_event`.
+    pub(crate) fn with_events(mut self, on_event: Option<EventSink>) -> GroupAuth {
+        self.on_event = on_event;
         self
     }
 
@@ -340,11 +374,12 @@ impl GroupAuth {
             _ => peer.cert.as_ref(),
         };
         if let Some(cert) = cert {
-            return self.index.certificate(cert).ok_or_else(|| {
-                Refusal::forbidden(
+            return match self.index.certificate(cert) {
+                Some(client) => Ok(client.with_cert(cert)),
+                None => Err(Refusal::forbidden(
                     "the client certificate of the request matches no auth item of the server",
-                )
-            });
+                )),
+            };
         }
         if let Some(client) = self.index.net(origin.addr) {
             return Ok(client);
@@ -359,6 +394,82 @@ impl GroupAuth {
                 "the request matches no auth item of the server",
             ))
         }
+    }
+
+    /// The setup of a session that `client` opens. [`open`](ReceiveAuth::open)
+    /// states the rules.
+    fn setup(&self, client: &Client) -> Result<SessionSetup, Refusal> {
+        let access = self.policies.access();
+        let namespace = access.namespace(None);
+        let Some((group, policy)) = self.policies.select(&client.item, &namespace) else {
+            return Err(Refusal::forbidden(
+                "no client group of the request covers the local refs",
+            ));
+        };
+        let claimed = match &client.cert {
+            Some(cert) if group.tls_accept_claim() => match &cert.claims {
+                Ok(claims) => access.claim_rules(claims, &namespace),
+                Err(fault) => {
+                    if let Some(on_event) = &self.on_event {
+                        on_event(&ServerEvent::BadClaims {
+                            digest: cert.digest,
+                            san: fault.san().map(str::to_owned),
+                            reason: fault.reason(),
+                        });
+                    }
+                    return Err(Refusal::forbidden(format!(
+                        "the claims of the client certificate do not parse: {fault}"
+                    )));
+                }
+            },
+            _ => None,
+        };
+        let policy = match claimed {
+            Some(rules) if !rules.opens_push_session() => {
+                return Err(Refusal::forbidden(format!(
+                    "the claims of the client certificate open no push session in client \
+                     group '{}'",
+                    group.name()
+                )));
+            }
+            Some(rules) => {
+                // Each field but `rules` by name, so a new field of the
+                // policy needs a decision here.
+                let ReceivePolicy {
+                    rules: _,
+                    verify,
+                    allow_unsigned,
+                    signers,
+                    allow_privileged,
+                    summary_signers,
+                    update_summary,
+                    detached_metadata_filter,
+                    group,
+                } = &**policy;
+                Arc::new(ReceivePolicy {
+                    rules,
+                    verify: verify.clone(),
+                    allow_unsigned: *allow_unsigned,
+                    signers: signers.clone(),
+                    allow_privileged: *allow_privileged,
+                    summary_signers: summary_signers.clone(),
+                    update_summary: *update_summary,
+                    detached_metadata_filter: detached_metadata_filter.clone(),
+                    group: group.clone(),
+                })
+            }
+            None if !policy.rules.opens_push_session() => {
+                return Err(Refusal::forbidden(format!(
+                    "client group '{}' opens no push session",
+                    group.name()
+                )));
+            }
+            None => policy.clone(),
+        };
+        Ok(SessionSetup {
+            policy,
+            hooks: None,
+        })
     }
 }
 
@@ -404,29 +515,19 @@ impl ReceiveAuth for GroupAuth {
 
     /// The policy of the client group that carries the item of `client` in
     /// the local refs, and no hooks. `Hello` names no collection, so the
-    /// namespace of each session is the local refs. With no such group, and
-    /// with a group that opens no push session, the refusal is 403.
+    /// namespace of each session is the local refs.
+    ///
+    /// When the group has `tls-accept-claim=true` and a certificate gave the
+    /// item, the claims of the certificate for the local refs replace the
+    /// rules of the group. Claims that do not parse get 403, and the server
+    /// reports an event. With no such group, and with rules that open no
+    /// push session, the refusal is 403.
     fn open(
         &self,
         client: &Client,
         _hello: &Hello,
     ) -> impl Future<Output = Result<SessionSetup, Refusal>> + Send {
-        let namespace = self.policies.access().namespace(None);
-        let Some((group, policy)) = self.policies.select(&client.item, &namespace) else {
-            return ready(Err(Refusal::forbidden(
-                "no client group of the request covers the local refs",
-            )));
-        };
-        if !policy.rules.opens_push_session() {
-            return ready(Err(Refusal::forbidden(format!(
-                "client group '{}' opens no push session",
-                group.name()
-            ))));
-        }
-        ready(Ok(SessionSetup {
-            policy: policy.clone(),
-            hooks: None,
-        }))
+        ready(self.setup(client))
     }
 }
 
@@ -438,6 +539,7 @@ mod tests {
 
     use super::*;
     use crate::session::tests::TmpRepo;
+    use crate::test_pki::TestCa;
 
     /// The hex digest of `text`.
     fn hex(text: &str) -> String {
@@ -485,10 +587,13 @@ mod tests {
 
     /// A certificate with the digest of `der` and the CN `cn`.
     fn cert(der: &str, cn: Option<&str>) -> ClientCert {
+        let digest = Checksum::sha256(der.as_bytes());
         ClientCert {
-            digest: Checksum::sha256(der.as_bytes()),
+            owner: format!("tls-sha256:{digest}").into(),
+            digest,
             cn: cn.map(str::to_owned),
             not_after: None,
+            claims: Ok(ostrya::access::Claims::default()),
         }
     }
 
@@ -843,7 +948,7 @@ mod tests {
             one_way: false,
         };
         let open = |text: &str| {
-            let client = Client::new(AuthItem::parse(text).unwrap());
+            let client = Client::new(AuthItem::parse(text).unwrap(), false);
             ostrya_rt::block_on(auth.open(&client, &hello))
         };
         for text in ["anonymous", "tls:*"] {
@@ -1084,6 +1189,340 @@ mod tests {
         assert_eq!(owner("unknown", &proxy()), Err(StatusCode::FORBIDDEN));
         assert_eq!(owner("", &proxy()).unwrap(), "net:10.0.0.0/8");
         assert_eq!(owner("10.9.9.9", &stranger()).unwrap(), "net:192.0.2.0/24");
+    }
+
+    /// The events that `auth` reports, in order.
+    fn recording(auth: GroupAuth) -> (GroupAuth, Arc<std::sync::Mutex<Vec<ServerEvent>>>) {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let auth = auth.with_events(Some(Arc::new(move |event: &ServerEvent| {
+            sink.lock().unwrap().push(event.clone());
+        })));
+        (auth, events)
+    }
+
+    fn hello() -> Hello {
+        Hello {
+            version: 1,
+            agent: None,
+            refs: vec!["main".into()],
+            one_way: false,
+        }
+    }
+
+    /// The setup of the session that a request with `headers` from `peer`
+    /// opens.
+    fn open_with(
+        auth: &GroupAuth,
+        headers: &HeaderMap,
+        peer: &Peer,
+    ) -> Result<SessionSetup, Refusal> {
+        let client = auth.identify(headers, peer)?;
+        ostrya_rt::block_on(auth.open(&client, &hello()))
+    }
+
+    /// A TLS peer with the certificate `der`.
+    fn with_der(der: &[u8]) -> Peer {
+        peer(true, "192.0.2.1", Some(ClientCert::from_der(der)))
+    }
+
+    /// The allow items and the deny items of `setup`, as text.
+    fn rule_texts(setup: &SessionSetup) -> (Vec<String>, Vec<String>) {
+        let rules = &setup.policy.rules;
+        (
+            rules.allow.iter().map(ToString::to_string).collect(),
+            rules.deny.iter().map(|p| p.as_str().to_owned()).collect(),
+        )
+    }
+
+    /// A group of `tls:*` that reads the claims, reads all refs, and accepts
+    /// privileged content.
+    const CLAIMS_GROUP: &str = "[ex-ostrya client \"certs\"]\nauth=tls:*\n\
+                                tls-accept-claim=true\nallow=r:**\nallow-privileged=true\n";
+
+    /// The claims of the local refs replace the allow items and the deny
+    /// items of the group. The other values of the policy and the name of
+    /// the group stay. Claims of a collection are ignored.
+    #[test]
+    fn the_claims_replace_the_rules_of_the_group() {
+        let (auth, _tmp) = auth(CLAIMS_GROUP);
+        let ca = TestCa::new();
+        let der = ca.leaf(
+            "c",
+            &[
+                "ostrya:ref:w:main",
+                "ostrya:collection:a.b:d:x",
+                "ostrya:ref:!main/secret",
+            ],
+        );
+        let setup = open_with(&auth, &HeaderMap::new(), &with_der(&der)).unwrap();
+        assert_eq!(
+            rule_texts(&setup),
+            (vec!["w:main".to_owned()], vec!["main/secret".to_owned()])
+        );
+        let group = auth.policies.get("certs").unwrap();
+        assert!(!Arc::ptr_eq(&setup.policy, group));
+        assert_eq!(setup.policy.group.as_deref(), Some("certs"));
+        assert!(setup.policy.allow_privileged);
+        assert_eq!(group.rules.allow[0].to_string(), "r:**");
+    }
+
+    /// With no claim of the local refs, also with claims of a collection
+    /// alone, the rules of the group apply.
+    #[test]
+    fn with_no_claim_of_the_namespace_the_group_applies() {
+        let (auth, _tmp) = auth(&CLAIMS_GROUP.replace("allow=r:**", "allow=w:**"));
+        let ca = TestCa::new();
+        let group = auth.policies.get("certs").unwrap();
+        for uris in [
+            &[][..],
+            &["ostrya:collection:a.b:w:main", "https://example.com/"],
+        ] {
+            let setup = open_with(&auth, &HeaderMap::new(), &with_der(&ca.leaf("c", uris)))
+                .unwrap_or_else(|r| panic!("{uris:?}: {r:?}"));
+            assert!(Arc::ptr_eq(&setup.policy, group), "{uris:?}");
+        }
+    }
+
+    /// The own collection id of the repository names the local refs in a
+    /// claim.
+    #[test]
+    fn a_claim_of_the_own_collection_names_the_local_refs() {
+        static N: AtomicU32 = AtomicU32::new(0);
+        let tmp = TmpRepo::new(&format!("auth-own-{}", N.fetch_add(1, Ordering::Relaxed)));
+        let config = tmp.repo.path().join("config");
+        let text = std::fs::read_to_string(&config).unwrap();
+        let text = text.replacen("[core]\n", "[core]\ncollection-id=own.id\n", 1);
+        std::fs::write(&config, text).unwrap();
+        let auth = GroupAuth::new(tmp.policies(CLAIMS_GROUP), false);
+        let der = TestCa::new().leaf("c", &["ostrya:collection:own.id:t:release/**"]);
+        let setup = open_with(&auth, &HeaderMap::new(), &with_der(&der)).unwrap();
+        assert_eq!(
+            rule_texts(&setup),
+            (vec!["t:release/**".to_owned()], Vec::new())
+        );
+    }
+
+    /// Claims that open no push session get 403 with a message that names
+    /// the claims, also where the group opens a push session.
+    #[test]
+    fn claims_with_no_push_mode_open_no_session() {
+        let (auth, _tmp) = auth(&CLAIMS_GROUP.replace("allow=r:**", "allow=w:**"));
+        let ca = TestCa::new();
+        for uris in [&["ostrya:ref:!secret"][..], &["ostrya:ref:main"]] {
+            let refusal = open_with(&auth, &HeaderMap::new(), &with_der(&ca.leaf("c", uris)))
+                .err()
+                .unwrap();
+            assert_eq!(refusal.status, StatusCode::FORBIDDEN);
+            assert_eq!(
+                refusal.message,
+                "the claims of the client certificate open no push session in client group \
+                 'certs'"
+            );
+        }
+    }
+
+    /// Claims that do not parse get 403 at the open of a session, and the
+    /// server reports one event that names the digest and the URI SAN. The
+    /// identification of the request succeeds.
+    #[test]
+    fn claims_that_do_not_parse_get_403_and_an_event() {
+        let (auth, _tmp) = auth(CLAIMS_GROUP);
+        let (auth, events) = recording(auth);
+        let ca = TestCa::new();
+        let many: Vec<String> = (0..=ostrya::access::MAX_CLAIMS)
+            .map(|i| format!("ostrya:ref:w:r{i}"))
+            .collect();
+        let many: Vec<&str> = many.iter().map(String::as_str).collect();
+        let san = crate::test_pki::uri_sans(&["ostrya:ref:w:main"]);
+        for (der, san, reason) in [
+            (
+                ca.leaf("c", &["ostrya:ref:w:main", "ostrya:ref:x:a"]),
+                Some("ostrya:ref:x:a"),
+                "the modes are one or more of r, w, c, t, and d",
+            ),
+            (
+                ca.leaf("c", &["Ostrya:ref:w:main"]),
+                Some("Ostrya:ref:w:main"),
+                "a claim starts with ostrya:ref: or ostrya:collection:ID:",
+            ),
+            (
+                ca.leaf("c", &["ostrya:collection:a.b:x:y"]),
+                Some("ostrya:collection:a.b:x:y"),
+                "the modes are one or more of r, w, c, t, and d",
+            ),
+            (
+                ca.leaf("c", &many),
+                None,
+                "the certificate holds more than 256 claims",
+            ),
+            (
+                ca.leaf_with("c", None, &[vec![0x30, 0x03, 0x86, 0x01, 0x80]]),
+                None,
+                "the subjectAltName extension of the certificate does not decode",
+            ),
+            (
+                ca.leaf_with("c", None, &[san.clone(), san.clone()]),
+                None,
+                "the certificate holds more than one subjectAltName extension",
+            ),
+            (
+                b"not a certificate".to_vec(),
+                None,
+                "the certificate does not decode",
+            ),
+        ] {
+            events.lock().unwrap().clear();
+            let peer = with_der(&der);
+            auth.identify(&HeaderMap::new(), &peer).unwrap();
+            let refusal = open_with(&auth, &HeaderMap::new(), &peer).err().unwrap();
+            assert_eq!(refusal.status, StatusCode::FORBIDDEN, "{san:?}");
+            let fault = match san {
+                Some(san) => format!("malformed claim '{san}': {reason}"),
+                None => reason.to_owned(),
+            };
+            assert_eq!(
+                refusal.message,
+                format!("the claims of the client certificate do not parse: {fault}")
+            );
+            let digest = Checksum::sha256(&der);
+            assert_eq!(
+                *events.lock().unwrap(),
+                [ServerEvent::BadClaims {
+                    digest,
+                    san: san.map(str::to_owned),
+                    reason: reason.to_owned(),
+                }]
+            );
+            assert_eq!(
+                events.lock().unwrap()[0].to_string(),
+                format!("refused the client certificate tls-sha256:{digest}: {fault}")
+            );
+        }
+    }
+
+    /// A group with `tls-accept-claim=false` reads no claim: claims that do
+    /// not parse get no 403 and no event, and the owner key is the item.
+    #[test]
+    fn a_group_that_reads_no_claim_ignores_the_claims() {
+        let (auth, _tmp) = auth("[ex-ostrya client \"certs\"]\nauth=tls:*\nallow=w:**\n");
+        let (auth, events) = recording(auth);
+        let ca = TestCa::new();
+        for uris in [&["ostrya:ref:x:a"][..], &["ostrya:ref:r:main"]] {
+            let peer = with_der(&ca.leaf("c", uris));
+            let setup = open_with(&auth, &HeaderMap::new(), &peer).unwrap();
+            assert!(Arc::ptr_eq(
+                &setup.policy,
+                auth.policies.get("certs").unwrap()
+            ));
+            let client = auth.identify(&HeaderMap::new(), &peer).unwrap();
+            assert_eq!(&*client.owner, "tls:*");
+            assert!(client.cert.is_none());
+        }
+        assert!(events.lock().unwrap().is_empty());
+    }
+
+    /// A credential, a `net:` item, and the anonymous item take no claims,
+    /// also with a client certificate in the request.
+    #[test]
+    fn an_item_other_than_a_certificate_takes_no_claims() {
+        let (auth, _tmp) = auth(&format!(
+            "[ex-ostrya client \"mixed\"]\nauth=tls-sha256:{};token-sha256:{}\n\
+             tls-accept-claim=true\nallow=w:**\n\
+             [ex-ostrya client \"anonymous\"]\nauth=anonymous\nallow=w:**\n",
+            hex("unused"),
+            hex("a-token")
+        ));
+        let (auth, events) = recording(auth);
+        let der = TestCa::new().leaf("c", &["ostrya:ref:x:a"]);
+        let peer = with_der(&der);
+        let token = headers(&["Bearer a-token"]);
+        let setup = open_with(&auth, &token, &peer).unwrap();
+        assert!(Arc::ptr_eq(
+            &setup.policy,
+            auth.policies.get("mixed").unwrap()
+        ));
+        let client = auth.identify(&token, &peer).unwrap();
+        assert_eq!(&*client.owner, format!("token-sha256:{}", hex("a-token")));
+        let setup = open_with(&auth, &HeaderMap::new(), &tls()).unwrap();
+        assert!(Arc::ptr_eq(
+            &setup.policy,
+            auth.policies.get("anonymous").unwrap()
+        ));
+        assert!(events.lock().unwrap().is_empty());
+    }
+
+    /// With a group that reads claims, the owner key of a certificate item
+    /// is the digest of the certificate, so two certificates of one item
+    /// have two owner keys.
+    #[test]
+    fn the_owner_key_is_the_digest_of_a_certificate_with_claims() {
+        let (auth, _tmp) = auth(CLAIMS_GROUP);
+        let ca = TestCa::new();
+        let a = ca.leaf("a", &["ostrya:ref:w:a"]);
+        let b = ca.leaf("b", &["ostrya:ref:w:b"]);
+        let owner = |der: &[u8]| {
+            let client = auth.identify(&HeaderMap::new(), &with_der(der)).unwrap();
+            GroupAuth::owner(&client).to_owned()
+        };
+        assert_eq!(owner(&a), format!("tls-sha256:{}", Checksum::sha256(&a)));
+        assert_ne!(owner(&a), owner(&b));
+    }
+
+    /// A `tls:NAME` item can hold a space. The item `tls:* tls-sha256:HEX`
+    /// of a group that reads no claim and the certificate of that digest
+    /// under `tls:*` of a group that reads claims have two owner keys.
+    #[test]
+    fn a_name_with_a_space_shares_no_owner_key_with_a_digest() {
+        let ca = TestCa::new();
+        let pinned = ca.leaf("pinned", &[]);
+        let digest = Checksum::sha256(&pinned);
+        let (auth, _tmp) = auth(&format!(
+            "{CLAIMS_GROUP}[ex-ostrya client \"named\"]\n\
+             auth=tls:* tls-sha256:{digest}\nallow=r:**\n"
+        ));
+        let named = ca.leaf(&format!("* tls-sha256:{digest}"), &[]);
+        let owner = |der: &[u8]| {
+            let client = auth.identify(&HeaderMap::new(), &with_der(der)).unwrap();
+            GroupAuth::owner(&client).to_owned()
+        };
+        assert_eq!(owner(&named), format!("tls:* tls-sha256:{digest}"));
+        assert_eq!(owner(&pinned), format!("tls-sha256:{digest}"));
+        assert_ne!(owner(&named), owner(&pinned));
+    }
+
+    /// The claims of a forwarded certificate replace the rules of the group,
+    /// as the claims of the certificate of a handshake do.
+    #[test]
+    fn a_forwarded_certificate_takes_its_claims() {
+        let ca = TestCa::new();
+        let (auth, _tmp) = auth(CLAIMS_GROUP);
+        let forwarding = Forwarding::new(
+            vec![IpNet::parse("10.0.0.0/8").unwrap()],
+            ostrya::access::ForwardedHeader::XForwardedFor,
+        );
+        let verifier = ostrya_fetch::client_cert_verifier(ca.pem.as_bytes()).unwrap();
+        let certs = ForwardedCerts::new(
+            hyper::header::HeaderName::from_static("x-client-cert"),
+            verifier,
+        );
+        let auth = auth.with_proxies(Some(forwarding), Some(certs));
+        let (auth, events) = recording(auth);
+        let good = ca.leaf("c", &["ostrya:ref:c:main"]);
+        let request = lines(&[("x-client-cert", &ostrya::base64::encode(&good))]);
+        let setup = open_with(&auth, &request, &proxy()).unwrap();
+        assert_eq!(rule_texts(&setup), (vec!["c:main".to_owned()], Vec::new()));
+        let bad = ca.leaf("c", &["ostrya:ref:c:main/"]);
+        let request = lines(&[("x-client-cert", &ostrya::base64::encode(&bad))]);
+        let refusal = open_with(&auth, &request, &proxy()).err().unwrap();
+        assert_eq!(refusal.status, StatusCode::FORBIDDEN);
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(
+            matches!(&events[0], ServerEvent::BadClaims { digest, san: Some(san), .. }
+                if *digest == Checksum::sha256(&bad) && san == "ostrya:ref:c:main/"),
+            "{events:?}"
+        );
     }
 
     /// The time of the request checks the validity of a forwarded

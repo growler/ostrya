@@ -14,6 +14,8 @@
 //! - [`AccessRules`] holds the allow items and the deny items of a group,
 //!   and gives the effective rights of a ref as [`AccessModes`].
 //! - [`ServerSettings`] holds the keys of `[ex-ostrya server]`.
+//! - [`Claims`] holds the claims of a client certificate, and
+//!   [`ClientAccess::claim_rules`] gives their rules for one namespace.
 //! - [`ForwardedHeader`] is a value of `trusted-proxy-header`, and
 //!   [`is_header_name`] checks a value of `trusted-proxy-client-cert`.
 //!
@@ -30,8 +32,9 @@
 //!   right on a ref.
 //! - `deny` (list) -- the deny items, each a [`RefPattern`](crate::RefPattern).
 //! - `tls-accept-claim` (boolean, default false) -- read the claims of the
-//!   client certificate. A group with no `tls:*`, `tls:NAME`, or
-//!   `tls-sha256:HEX` item cannot hold this key, with any value.
+//!   client certificate (see [Claims](#claims)). A group with no `tls:*`,
+//!   `tls:NAME`, or `tls-sha256:HEX` item cannot hold this key, with any
+//!   value.
 //! - `verify` (`trust:NAME`) -- the trust group that verifies each
 //!   client-built commit of the group.
 //! - `allow-unsigned` (boolean) -- accept a client-built commit with no
@@ -64,6 +67,26 @@
 //! [`ServerSettings::overridden_by`] puts the values of the command line in
 //! place of the keys that they replace, and [`ClientAccess::check_server`]
 //! checks the result.
+//!
+//! # Claims
+//!
+//! A claim is a URI SAN of a client certificate that states an allow item or
+//! a deny item. [`Claim`] lists the forms. With `tls-accept-claim=true`, a
+//! server reads the claims of the certificate that gives the auth item of a
+//! request:
+//!
+//! - A group of the local refs reads the `ostrya:ref:` claims, and the
+//!   `ostrya:collection:ID:` claims whose `ID` is `[core] collection-id`. A
+//!   group of a collection reads the `ostrya:collection:ID:` claims of the
+//!   collection of the request.
+//! - When the certificate holds one or more claims for the namespace, they
+//!   replace `allow` and `deny` of the group.
+//! - When the certificate holds no claim for the namespace, `allow` and
+//!   `deny` apply.
+//!
+//! The claims can give more rights than the group, so the client CA grants
+//! the rights of each certificate that it signs. The other keys of the group
+//! apply as they are.
 //!
 //! # Implicit groups
 //!
@@ -100,6 +123,7 @@
 //! # Ok::<(), ostrya::Error>(())
 //! ```
 
+mod claim;
 mod item;
 mod reader;
 mod rights;
@@ -109,6 +133,7 @@ use std::fmt;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
+pub use claim::{Claim, ClaimError, ClaimRule, Claims, MAX_CLAIMS};
 pub use item::{AuthItem, IpNet};
 #[cfg(feature = "receive")]
 pub(crate) use reader::{Group, classify};
@@ -193,7 +218,10 @@ impl ClientGroup {
         &self.rules
     }
 
-    /// Returns the value of `tls-accept-claim`.
+    /// Returns the value of `tls-accept-claim`: `true` if the claims of a
+    /// client certificate replace the rules of the group.
+    ///
+    /// The [module doc](crate::access#claims) states the rule.
     pub fn tls_accept_claim(&self) -> bool {
         self.tls_accept_claim
     }
@@ -569,6 +597,73 @@ impl ClientAccess {
         }
     }
 
+    /// Returns the rules of the claims of `claims` for `namespace`, or `None`
+    /// if no claim names `namespace`.
+    ///
+    /// A claim of the collection `[core] collection-id` names the
+    /// [`Local`](Namespace::Local) namespace. A
+    /// [`Collection`](Namespace::Collection) of that id is the
+    /// [`Local`](Namespace::Local) namespace too, as in
+    /// [`namespace`](ClientAccess::namespace). The allow items and the deny
+    /// items keep the order of `claims`. With `Some`, the rules replace the
+    /// rules of a group with `tls-accept-claim=true`. The [module
+    /// doc](crate::access#claims) states the rule.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ostrya::config::RepoConfig;
+    /// use ostrya::access::{AccessModes, Claims, ClientAccess, Namespace};
+    ///
+    /// let config = RepoConfig::parse(
+    ///     "[core]\nrepo_version=1\nmode=archive-z2\ncollection-id=com.example.own\n",
+    /// )?;
+    /// let access = ClientAccess::from_config(&config, "/srv/repo".as_ref())?;
+    /// let claims = Claims::parse([
+    ///     "ostrya:ref:w:main",
+    ///     "ostrya:collection:com.example.own:!secret",
+    ///     "ostrya:collection:com.example.os:r:os/**",
+    /// ])
+    /// .unwrap();
+    /// let local = access.claim_rules(&claims, &Namespace::Local).unwrap();
+    /// assert!(local.rights("main").contains(AccessModes::WRITE));
+    /// assert_eq!(local.deny.len(), 1);
+    /// let own = Namespace::Collection("com.example.own".into());
+    /// assert_eq!(access.claim_rules(&claims, &own), Some(local));
+    /// let other = Namespace::Collection("org.example.other".into());
+    /// assert!(access.claim_rules(&claims, &other).is_none());
+    /// # Ok::<(), ostrya::Error>(())
+    /// ```
+    pub fn claim_rules(&self, claims: &Claims, namespace: &Namespace) -> Option<AccessRules> {
+        let namespace = match namespace {
+            Namespace::Collection(id) if Some(id.as_str()) == self.collection_id.as_deref() => {
+                &Namespace::Local
+            }
+            other => other,
+        };
+        let mut rules = AccessRules::default();
+        let mut found = false;
+        for claim in claims.as_slice() {
+            let names = match (&claim.namespace, namespace) {
+                (Namespace::Local, Namespace::Local) => true,
+                (Namespace::Collection(id), Namespace::Local) => {
+                    Some(id.as_str()) == self.collection_id.as_deref()
+                }
+                (Namespace::Collection(id), Namespace::Collection(wanted)) => id == wanted,
+                (Namespace::Local, Namespace::Collection(_)) => false,
+            };
+            if !names {
+                continue;
+            }
+            found = true;
+            match &claim.rule {
+                ClaimRule::Allow(item) => rules.allow.push(item.clone()),
+                ClaimRule::Deny(pattern) => rules.deny.push(pattern.clone()),
+            }
+        }
+        found.then_some(rules)
+    }
+
     /// Returns each auth item of the groups one time, in the order of its
     /// first group in the config.
     pub fn items(&self) -> impl Iterator<Item = &AuthItem> {
@@ -675,6 +770,10 @@ const _: fn() = || {
     assert_send_sync::<AccessModes>();
     assert_send_sync::<AllowItem>();
     assert_send_sync::<AccessRules>();
+    assert_send_sync::<Claims>();
+    assert_send_sync::<Claim>();
+    assert_send_sync::<ClaimRule>();
+    assert_send_sync::<ClaimError>();
 };
 
 #[cfg(test)]
@@ -936,6 +1035,84 @@ secret-key-file=/etc/ostrya/release.secret
         let access = access("");
         assert_eq!(access.namespace(Some("a.b")), collection("a.b"));
         assert_eq!(access.namespace(None), Namespace::Local);
+    }
+
+    /// The rules of the claims for a namespace hold the claims of that
+    /// namespace alone, in order. A claim of the own collection id counts
+    /// for the local refs. No claim for a namespace gives `None`, also with
+    /// claims of other namespaces.
+    #[test]
+    fn the_claim_rules_hold_the_claims_of_one_namespace() {
+        let config = RepoConfig::parse(&format!("{CORE}collection-id=own.id\n")).unwrap();
+        let access = ClientAccess::from_config(&config, Path::new("/r")).unwrap();
+        let claims = Claims::parse([
+            "ostrya:ref:w:main",
+            "ostrya:collection:a.b:t:os/**",
+            "ostrya:ref:!secret/**",
+            "ostrya:collection:own.id:d:devel/**",
+            "ostrya:collection:a.b:!os/secret",
+        ])
+        .unwrap();
+        let local = access.claim_rules(&claims, &Namespace::Local).unwrap();
+        let allow: Vec<String> = local.allow.iter().map(AllowItem::to_string).collect();
+        assert_eq!(allow, ["w:main", "d:devel/**"]);
+        assert_eq!(local.deny.len(), 1);
+        assert_eq!(local.deny[0].as_str(), "secret/**");
+        assert_eq!(local.rights("main"), AccessModes::parse("rw").unwrap());
+        assert_eq!(local.rights("secret/a"), AccessModes::NONE);
+
+        let ab = access.claim_rules(&claims, &collection("a.b")).unwrap();
+        let allow: Vec<String> = ab.allow.iter().map(AllowItem::to_string).collect();
+        assert_eq!(allow, ["t:os/**"]);
+        assert_eq!(ab.rights("os/secret"), AccessModes::NONE);
+        assert!(access.claim_rules(&claims, &collection("c.d")).is_none());
+        assert!(
+            access
+                .claim_rules(&Claims::default(), &Namespace::Local)
+                .is_none()
+        );
+
+        let collections_only = Claims::parse(["ostrya:collection:a.b:w:main"]).unwrap();
+        assert!(
+            access
+                .claim_rules(&collections_only, &Namespace::Local)
+                .is_none()
+        );
+        let deny_only = Claims::parse(["ostrya:ref:!secret/**"]).unwrap();
+        let rules = access.claim_rules(&deny_only, &Namespace::Local).unwrap();
+        assert!(rules.allow.is_empty());
+        assert_eq!(rules.rights("main"), AccessModes::NONE);
+
+        let no_own_id = self::access("");
+        let own = Claims::parse(["ostrya:collection:own.id:w:main"]).unwrap();
+        assert!(no_own_id.claim_rules(&own, &Namespace::Local).is_none());
+        assert!(no_own_id.claim_rules(&own, &collection("own.id")).is_some());
+    }
+
+    /// The namespace of the own collection id gives the rules of the local
+    /// refs: the `ostrya:ref:` claims and the claims of the own id.
+    #[test]
+    fn the_own_collection_id_gives_the_claim_rules_of_the_local_refs() {
+        let config = RepoConfig::parse(&format!("{CORE}collection-id=own.id\n")).unwrap();
+        let access = ClientAccess::from_config(&config, Path::new("/r")).unwrap();
+        let claims = Claims::parse([
+            "ostrya:ref:w:main",
+            "ostrya:collection:own.id:d:devel/**",
+            "ostrya:collection:a.b:t:os/**",
+            "ostrya:ref:!secret/**",
+        ])
+        .unwrap();
+        let own = access.claim_rules(&claims, &collection("own.id")).unwrap();
+        let allow: Vec<String> = own.allow.iter().map(AllowItem::to_string).collect();
+        assert_eq!(allow, ["w:main", "d:devel/**"]);
+        assert_eq!(own.deny.len(), 1);
+        assert_eq!(Some(own), access.claim_rules(&claims, &Namespace::Local));
+        let refs_only = Claims::parse(["ostrya:ref:w:main"]).unwrap();
+        assert!(
+            access
+                .claim_rules(&refs_only, &collection("own.id"))
+                .is_some()
+        );
     }
 
     /// `groups_of` gives each group of an item in config order.

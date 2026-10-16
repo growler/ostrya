@@ -3836,6 +3836,9 @@ requests get 403 with `unauthorized`:
 - a request whose group opens no push session. The message is
   `client group 'NAME' opens no push session`. With no client group, the
   implicit group `anonymous` reads each ref and opens no push session.
+- a request whose group has `tls-accept-claim=true`, when the claims of the
+  certificate do not parse, or when they replace the rules of the group and
+  open no push session ("Claims of a client certificate").
 
 Each 401 of `ostrya serve` carries two headers:
 `WWW-Authenticate: Bearer realm="ostrya"` and
@@ -3847,7 +3850,12 @@ credential are two items, so they give two owner keys. The endpoint gives a
 session to its owner alone. A request of another owner gets 404 for that
 session id. All clients with one item share one owner key. So each anonymous
 client that knows a session id reaches the session, and so does each client
-of one `net:` item.
+of one `net:` item. A client certificate that gets a `tls:*`, `tls:NAME`, or
+`tls-sha256:HEX` item of a group with `tls-accept-claim=true` gives
+`tls-sha256:HEX`, the SHA-256 digest of the DER bytes of the certificate. So
+two certificates with different claims never share a session. This key is
+the key of no other client. The certificate sets the item that it matches,
+and only the certificate of that digest matches the item `tls-sha256:HEX`.
 
 A refusal of the authentication gets its status, 401 or 403, and an `Error`
 frame with `unauthorized`. A host application can mount the endpoint with an
@@ -3868,6 +3876,83 @@ push session, and `Hello` gets `ref-denied`. An ssh session uses no
 and does not limit the session by the name. `--client` is safe only under a
 forced `command=` in `authorized_keys`, because a user with a shell can give
 any name.
+
+### Claims of a client certificate
+
+A claim is a URI SAN of a client certificate that states an allow item or a
+deny item. A client group with `tls-accept-claim=true` reads the claims of
+the certificate that gives the item of a request. A claim has one of these
+forms:
+
+- `ostrya:ref:[MODES:]PATTERN` -- an allow item of the local refs.
+- `ostrya:ref:!PATTERN` -- a deny item of the local refs.
+- `ostrya:collection:ID:[MODES:]PATTERN` -- an allow item of the collection
+  `ID`.
+- `ostrya:collection:ID:!PATTERN` -- a deny item of the collection `ID`.
+
+`[MODES:]PATTERN` has the grammar of an `allow` item, and `PATTERN` has the
+grammar of a `deny` item (`ostrya-config(1)`, "Access modes and patterns").
+A claim with no `MODES` has the mode `r`. `ID` passes the collection-id
+rule. The server reads the URI SANs alone. It does not percent-decode a
+URI, and it removes no white space.
+
+- A group of the local refs reads the `ostrya:ref:` claims, and the
+  `ostrya:collection:ID:` claims whose `ID` is `[core] collection-id`. A
+  group of a collection reads the `ostrya:collection:ID:` claims of the
+  collection of the request.
+- When the certificate holds one or more claims for the namespace, they
+  replace `allow` and `deny` of the group. Deny claims alone leave no allow
+  item, so they give no right.
+- When the certificate holds no claim for the namespace, `allow` and `deny`
+  of the group apply.
+- A URI whose scheme is not `ostrya`, in any case, has no effect. So do the
+  SANs of other types, for example a DNS name.
+
+The claims set the access alone. `verify`, `allow-unsigned`, `sign`, and
+`allow-privileged` still come from the group, and so does the group name of
+the report. The claims can give more rights than `allow` of the group, so
+the CA of `tls-client-ca` grants the rights of each certificate that it
+signs.
+
+The claims of a certificate do not parse in these cases:
+
+- A URI whose scheme is `ostrya`, in any case, is no claim form. The scheme
+  and the kind, `ref` or `collection`, are lowercase in a claim, so
+  `OSTRYA:ref:a` and `ostrya:Ref:a` do not parse.
+- The certificate holds more than 256 URIs whose scheme is `ostrya`.
+- The certificate does not decode. The reason is
+  `the certificate does not decode`.
+- The certificate holds more than one subjectAltName extension. The reason
+  is `the certificate holds more than one subjectAltName extension`.
+- The subjectAltName extension does not decode. The reason is
+  `the subjectAltName extension of the certificate does not decode`.
+
+The server refuses such a request with 403 and `unauthorized`, when the
+selected group has `tls-accept-claim=true`. A claim of another namespace
+that does not parse also refuses the request. The message starts with
+`the claims of the client certificate do not parse: `. `ostrya serve` writes
+an error to standard error, which names the SHA-256 digest of the DER bytes
+of the certificate and the URI:
+
+```text
+error: refused the client certificate tls-sha256:HEX: malformed claim 'URI': REASON
+```
+
+When no one URI is at fault, the line has the reason after the digest. The
+line writes each control character of the URI and of the reason as an
+escape sequence, for example `\n`. A group with `tls-accept-claim=false`
+reads no claim, so claims that do not parse have no effect in it.
+
+When the claims replace the rules of the group and open no push session, a
+`session` request gets 403. The message is `the claims of the client
+certificate open no push session in client group 'NAME'`.
+
+The server reads the claims of the certificate of a TLS handshake one time
+for each connection, and the claims of a forwarded certificate one time for
+each entry of the cache of forwarded certificates. A cache entry keeps
+claims that do not parse too. Claims never apply to a credential, a `net:`
+item, an ssh client, or the `anonymous` item, also when the request has a
+client certificate.
 
 ## Credential files
 

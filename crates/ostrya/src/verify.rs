@@ -46,8 +46,9 @@ const DUMMY_METADATA_KEY: &str = "ostree.sign.dummy";
 /// source.
 ///
 /// [`PullTrust`] holds a set for the commits and a set for the summary of one
-/// pull. With the `receive` feature, a receive rule holds a set for the
-/// commits that it accepts.
+/// pull. With the `receive` feature, the policy of a client group and a rule
+/// of a one-way stream can each hold a set, in `ReceiveVerify::Keys`, for the
+/// commits that they accept.
 #[derive(Clone)]
 pub struct TrustedKeys {
     /// The built axes. At least one axis applies.

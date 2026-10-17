@@ -872,7 +872,7 @@ fn the_tool_pulls_loose_past_unserved_deltas() {
 ///
 /// - `--policy`, `--push-credentials`, `--allow-anonymous-push`,
 ///   `--read-only`, and `--client-ca`, which it does not take,
-/// - a group of the removed receive policy in the config,
+/// - `[ex-ostrya receive]` in the config,
 /// - a client group with a TLS item and no client CA,
 /// - a key group whose key it cannot read,
 /// - a TLS file that it cannot use, or that is larger than the size cap,

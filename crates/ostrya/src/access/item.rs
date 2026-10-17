@@ -420,7 +420,7 @@ mod tests {
         );
     }
 
-    /// Each other form is refused, the removed forms and white space
+    /// Each other form is refused, `token:`, `cert:`, and white space
     /// included.
     #[test]
     fn the_other_forms_are_refused() {

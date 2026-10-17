@@ -250,7 +250,10 @@ bounded:
   the auth item. For a certificate item that a group with
   `tls-accept-claim` carries, the key is `tls-sha256:HEX` of the
   certificate. `GroupAuth` gives each session the policy of the client
-  group of the local refs that carries the item, and no hooks. When that
+  group that carries the item and covers the namespace of `Hello`, and no
+  hooks. The collection id of `Hello` names the namespace: no collection, and
+  the collection id of the repository, name the local refs. For a collection,
+  a group that names it comes before a group with `collection=*`. When that
   group has `tls-accept-claim`, the claims of the certificate for the
   namespace replace `allow` and `deny` of the policy. It refuses a
   session with 403 when no such group exists, and when the group opens no
@@ -8595,7 +8598,7 @@ The removal of these leftovers is a port behavior. The tool's handling of a
 delta whose target is absent, and of a marker whose commit is absent, is not
 observed.
 
-### Phase 26 -- Client access for serve, receive, and send
+### Phase 26 -- Client access for serve, receive, and send (DONE)
 
 Client groups control the access to a served repository. A group is
 `[ex-ostrya client "NAME"]` in the repository config. The identification of
@@ -8659,7 +8662,7 @@ crate", states the measured graph.
   `pkcs8`.
 - PEM decoding -- `PemObject` of `rustls-pki-types`, through the re-export
   of `rustls`, with no crate. A base64 DER certificate that a proxy forwards
-  gets the PEM armor and goes through the same decoder.
+  with no PEM armor goes through `ostrya::base64::decode`.
 - PROXY protocol v1 and v2 -- written in the tree, with no crate.
 - CIDR matching -- `std::net::IpAddr` and a prefix length, with no crate.
 - The verification of a client certificate from a proxy uses the

@@ -27,10 +27,11 @@ const CLIENT_PREFIX: &str = "ex-ostrya client \"";
 const TRUST_PREFIX: &str = "ex-ostrya trust \"";
 /// The name prefix of a key group, before the quoted name.
 const KEY_PREFIX: &str = "ex-ostrya key \"";
-/// The name of a receive group of the removed receive policy.
+/// The name of a group that the config refuses, with a message that names
+/// the client group.
 const RECEIVE_GROUP: &str = "ex-ostrya receive";
-/// The name prefix of a receive pattern group of the removed receive policy,
-/// before the quoted pattern.
+/// The name prefix of a group that the config refuses in the same way, before
+/// the quoted pattern.
 const RECEIVE_PREFIX: &str = "ex-ostrya receive \"";
 /// The name prefix of each group of the extensions. A group name with this
 /// prefix and no known shape is refused.
@@ -759,8 +760,8 @@ mod tests {
         }
     }
 
-    /// The groups of the removed receive policy are refused, and the message
-    /// names the client group in their place.
+    /// `[ex-ostrya receive]` and each `[ex-ostrya receive "PATTERN"]` are
+    /// refused, and the message names the client group in their place.
     #[test]
     fn the_receive_groups_are_refused() {
         for group in [

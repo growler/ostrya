@@ -547,9 +547,9 @@ fn receive_takes_no_policy_option() {
     assert!(stderr.contains("--policy"), "{stderr}");
 }
 
-/// `ostrya receive` reads the client groups at start. A group of the removed
-/// receive policy, a bad client group, and a key group whose key it cannot
-/// read end the command with status 1 before it reads its input.
+/// `ostrya receive` reads the client groups at start. `[ex-ostrya receive]`,
+/// a bad client group, and a key group whose key it cannot read end the
+/// command with status 1 before it reads its input.
 #[test]
 fn receive_refuses_a_bad_group_at_start() {
     for (groups, needle) in [

@@ -88,12 +88,11 @@ The project is a Cargo workspace of focused crates:
   pair of byte streams, and `PullSession`, the session of a pull over the
   HTTP fetcher or over a stream session. It also holds the endpoint types
   `Endpoint`, `SshAddress`, and `SshOptions`, and the ssh and HTTP
-  transports. It holds
-  the walk of a local directory into a tree model. It holds the tree push of
-  that directory as one commit, signed when signers are given. The
-  transports read no remote key and no file that a remote key names.
-  Portable, with no repository knowledge. Depends on `ostrya-sign` and
-  `ostrya-fetch`.
+  transports. It holds the walk of a local directory into a tree model, and
+  the tree push of that directory, for which the server makes the commit.
+  The transports read no remote key and no file that a remote key names.
+  Portable, with no repository knowledge. Depends on `ostrya-gvariant`,
+  `ostrya-core`, `ostrya-rt`, and `ostrya-fetch`.
 - `ostrya-composefs` -- standalone, synchronous EROFS/composefs image writer
   and fs-verity digest. Takes a tree model and emits image bytes.
 - `ostrya` -- the library: repo, transactions, commit, checkout, refs,
@@ -107,13 +106,16 @@ Feature flags on `ostrya`:
 - `sign-spki` -- the spki signature engine.
 - `verify-gpg` -- GPG signature verification.
 - `sign-gpg` -- GPG signing. It turns on `verify-gpg`.
-- `receive` -- the server side of a push: the receive policy,
-  `Repo::receive`, and `Repo::receive_stream`, which reads one one-way stream
-  with no reply. The `receive` feature of `ostrya-cli`, in its default set,
-  builds `ostrya receive` on it.
+- `receive` -- the server side of a push: the receive policy of each
+  client group (`ReceivePolicies`), the policy of one group
+  (`ReceivePolicy`), `Repo::receive`, and `Repo::receive_stream`, which
+  reads one one-way stream with no reply. The `receive` feature of
+  `ostrya-cli`, in its default set, builds `ostrya receive` on it.
 - `push` -- the client side of a push from a repository: `Repo::push`,
-  `Repo::push_over_stream`, `Repo::export_stream`, which writes one one-way
-  stream for `Repo::receive_stream`, and `ostrya::endpoint::resolve_push`,
+  `Repo::push_over_stream`, `Repo::push_onto` and
+  `Repo::push_onto_over_stream`, which ask the server to commit the tree of
+  a local commit, `Repo::export_stream`, which writes one one-way stream for
+  `Repo::receive_stream`, and `ostrya::endpoint::resolve_push`,
   which gives the endpoint of a configured remote or of an address. The
   `push` feature of `ostrya-cli`, in its default set, builds `ostrya push`
   and `ostrya push-tree` on it.

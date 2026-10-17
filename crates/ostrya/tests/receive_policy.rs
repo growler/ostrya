@@ -226,8 +226,8 @@ fn allow_unsigned_has_two_defaults() {
     }
 }
 
-/// The groups of the removed receive policy are refused, and the message names
-/// the client group in their place.
+/// `[ex-ostrya receive]` and each `[ex-ostrya receive "PATTERN"]` are refused,
+/// and the message names the client group in their place.
 #[test]
 fn the_receive_groups_are_refused() {
     for group in ["ex-ostrya receive", "ex-ostrya receive \"apps/**\""] {

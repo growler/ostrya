@@ -690,6 +690,8 @@ impl Repo {
     ///
     /// - [`Error::Signature`] if `keys` or the keyring is over 4 MiB, holds
     ///   more than 256 certificates, or is a GnuPG keybox.
+    /// - [`Error::InvalidFormat`] if the keyring is larger than 64 MiB, the
+    ///   cap of its read.
     /// - [`Error::Signature`] if `keys` or the keyring does not parse as an
     ///   OpenPGP keyring.
     /// - [`Error::Signature`] if `keys` holds no certificate, or a selector in
@@ -742,6 +744,8 @@ impl Repo {
     /// - [`Error::Signature`] if the keyring is over 4 MiB, is a GnuPG keybox,
     ///   holds more than 256 certificates, or does not parse as an OpenPGP
     ///   keyring.
+    /// - [`Error::InvalidFormat`] if the keyring is larger than 64 MiB, the
+    ///   cap of its read.
     /// - [`Error::Signature`] if an armored keyring is not valid UTF-8.
     /// - [`Error::Core`] if the armor of the keyring holds text that is not
     ///   valid base64.

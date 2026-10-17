@@ -1085,6 +1085,44 @@ fn dict_keys_unknown_duplicate_and_malformed() {
     assert_protocol(read_one(&frame(1, &body)));
 }
 
+/// A `Hello` body whose unknown key `zz` holds a `v` of a `y` under `levels`
+/// levels of maybe.
+///
+/// The serializer counts its depth from the body, so the call encodes an
+/// `ay` of the same length and writes the bytes of the `v` over it.
+fn deep_unknown_hello(levels: usize) -> Vec<u8> {
+    let mut v = vec![1];
+    v.resize(levels, 0);
+    v.push(0);
+    v.extend("m".repeat(levels).bytes());
+    v.push(b'y');
+    let fill = vec![0xab; v.len() - 3];
+    let mut body = hello_body(vec![entry("zz", "ay", Value::Bytes(fill.clone()))]);
+    let at = body.windows(fill.len()).position(|w| w == fill).unwrap();
+    assert_eq!(&body[at + fill.len()..at + v.len()], b"\0ay");
+    body[at..at + v.len()].copy_from_slice(&v);
+    body
+}
+
+/// The decoder checks the value of an unknown key and of a repeated key with
+/// the depth limit and the normal-form rules of the parser, and refuses a
+/// value that breaks one of them.
+#[test]
+fn dict_values_that_the_decoder_drops_are_checked() {
+    let got = read_one(&frame(1, &deep_unknown_hello(128))).unwrap();
+    assert_eq!(got, Some(hello(None, &[])));
+    assert_protocol(read_one(&frame(1, &deep_unknown_hello(129))));
+
+    // A repeated `agent` whose boolean value is 2 is not in normal form.
+    let mut body = hello_body(vec![
+        entry("agent", "s", st("first")),
+        entry("agent", "b", Value::Bool(true)),
+    ]);
+    let at = body.windows(3).position(|w| w == [1, 0, b'b']).unwrap();
+    body[at] = 2;
+    assert_protocol(read_one(&frame(1, &body)));
+}
+
 fn one_way_hello(agent: Option<&str>, refs: &[&str]) -> Message {
     let Message::Hello(h) = hello(agent, refs) else {
         unreachable!("hello gives a Hello")

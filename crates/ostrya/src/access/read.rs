@@ -213,7 +213,7 @@ impl ReadAccess {
     /// Returns the rules of the group of the item in the local namespace,
     /// with the claims, or `None` with no such group. The value finds them
     /// at the first call.
-    fn local_rules(&self) -> Option<&AccessRules> {
+    pub(crate) fn local_rules(&self) -> Option<&AccessRules> {
         let access = &self.inner.access;
         let local = self.inner.local.get_or_init(|| {
             let index = access.select_index(&self.inner.item, &Namespace::Local)?;

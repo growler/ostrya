@@ -141,6 +141,14 @@ impl AllowItem {
     }
 }
 
+impl AllowItem {
+    /// Returns `true` if the item gives `r`: it has `r`, `w`, `c`, or `t`.
+    pub(crate) fn gives_read(&self) -> bool {
+        self.modes
+            .intersects(push_modes_with_read().union(AccessModes::READ))
+    }
+}
+
 impl fmt::Display for AllowItem {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}:{}", self.modes, self.pattern.as_str())
@@ -217,8 +225,7 @@ impl AccessRules {
     /// Returns `true` if an allow item gives `r`: it has `r`, `w`, `c`, or
     /// `t`. The deny items have no effect on the result.
     pub(crate) fn gives_read(&self) -> bool {
-        let read = push_modes_with_read().union(AccessModes::READ);
-        self.allow.iter().any(|item| item.modes.intersects(read))
+        self.allow.iter().any(AllowItem::gives_read)
     }
 }
 

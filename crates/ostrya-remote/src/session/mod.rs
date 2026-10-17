@@ -1192,9 +1192,10 @@ fn server_commit_refs(sc: &ServerCommit) -> impl Iterator<Item = &str> {
 /// depth of each metadata value, and the length of the longest
 /// `CommitReply`.
 fn check_server_commit_fields(server: &ServerInfo, sc: &ServerCommit) -> Result<()> {
+    let named: HashSet<&str> = server.refs.iter().map(|r| r.name.as_str()).collect();
     let mut seen = HashSet::new();
     for name in server_commit_refs(sc) {
-        if !server.refs.iter().any(|r| r.name == name) {
+        if !named.contains(name) {
             return Err(invalid(format!(
                 "ref '{name}' was not named when the session opened"
             )));

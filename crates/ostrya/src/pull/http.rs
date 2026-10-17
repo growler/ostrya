@@ -21,7 +21,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 use std::task::{Context, Poll, ready};
 use std::time::Instant;
 
@@ -904,16 +904,20 @@ impl Repo {
         marked: &mut Vec<Checksum>,
     ) -> Result<FetchedPull> {
         let mut root;
-        let summary = if let Wanted::Pinned(Pinned {
-            summary: Some(bytes),
-            ..
-        }) = wanted
-        {
-            // The probe of a collection pull read this summary and checked it
-            // under the trust of this pull, so the pull does not fetch it
-            // again. The parse runs on the blocking pool, as below.
+        // The probe of a collection pull read this summary and checked it
+        // under the trust of this pull, so the pull does not fetch it again.
+        // The pull takes the bytes, so they drop after the parse.
+        let probed = match wanted {
+            Wanted::Pinned(pinned) => pinned
+                .summary
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .take(),
+            _ => None,
+        };
+        let summary = if let Some(bytes) = probed {
+            // The parse runs on the blocking pool, as below.
             root = RootFiles::default();
-            let bytes = Arc::clone(bytes);
             Some(ostrya_rt::unblock(move || Summary::parse(&bytes)).await?)
         } else {
             root = source.root_files().await?;
@@ -1941,8 +1945,9 @@ pub(super) struct Pinned<'a> {
     pub(super) place: RefPlace<'a>,
     /// The `summary` of the remote, if the probe of the collection pull read
     /// the refs from it. The probe checked it under the trust of this pull,
-    /// so the pull reads these bytes in place of the remote file.
-    pub(super) summary: Option<Arc<Vec<u8>>>,
+    /// so the pull reads these bytes in place of the remote file. The pull
+    /// takes them out before the parse.
+    pub(super) summary: Mutex<Option<Arc<Vec<u8>>>>,
 }
 
 /// The state that every step of one pull shares.

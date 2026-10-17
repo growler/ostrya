@@ -590,11 +590,11 @@ impl Message {
     /// Decodes the body of a message of `kind`.
     ///
     /// The decoder borrows strings and byte arrays from `body` and reads each
-    /// array one entry at a time. It allocates the decoded message. For a
-    /// dict value under a key that it does not know, it allocates a value
-    /// tree, checks it for normal form, and then drops it. If a dict holds a
-    /// key two times, the first value counts, and the decoder checks each
-    /// later value for normal form alone. It checks each metadata entry of a
+    /// array one entry at a time. It allocates the decoded message. It checks
+    /// a dict value under a key that it does not know for normal form in
+    /// place, with no value tree, and then drops it. If a dict holds a key
+    /// two times, the first value counts, and the decoder checks each later
+    /// value for normal form alone. It checks each metadata entry of a
     /// server commit in place and copies its bytes, with no value tree.
     /// [`MAX_FRAME`](super::MAX_FRAME) states the measured peaks.
     ///
@@ -1295,7 +1295,7 @@ fn dict<'a, const N: usize>(
         match keys.iter().position(|k| *k == key) {
             Some(i) if found[i].is_none() => found[i] = Some(value),
             _ => {
-                ostrya_gvariant::from_bytes(&value.ty, value.child).map_err(malformed)?;
+                ostrya_gvariant::validate(&value.ty, value.child).map_err(malformed)?;
             }
         }
     }

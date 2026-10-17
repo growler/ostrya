@@ -3637,7 +3637,10 @@ These rules apply to each ref of the two parts:
   groups never combine. The server checks the name before it reads the ref
   file. So it reads no ref file that the client cannot read, and the content
   of such a file fails no listing. The server reads no directory of a
-  collection whose group gives no `r`.
+  collection whose group gives no `r`. When the entries of a part hold no
+  positive entry, the server reads only the directories that the pattern of
+  an allow item of the group that gives `r` can match, and no directory that
+  a deny item of the group covers.
 - An alias is in the listing under its own name, with the commit of its
   target, when the client reads its name and its target. The alias resolves
   by the rules of "The archive view": the body is relative and stays inside
@@ -3885,13 +3888,20 @@ item at a time, in the order of the first group of each item in the config:
    that file.
 3. It removes the old signature file, writes the summary, and writes the new
    signature file when a key signs.
-4. It writes the `.access` file of the item.
+4. When the `.access` file of the item does not hold the access digest of
+   the item, it writes the `.access` file.
 
 So while the `.access` file of an item holds a digest, the summary next to
 it is a summary of that digest. With `[core] fsync=true`, the command syncs
-the directory of the `.access` file after the removal of step 2, and the
-directory of the summary before step 4. A crash then cannot leave an
-`.access` file next to a summary of another digest.
+the directory of the `.access` file after the removal of step 2 and after
+the write of step 4, and the directory of the summary before step 4. A crash
+then cannot leave an `.access` file next to a summary of another digest.
+
+A summary is at most 64 MiB (67108864 bytes). The command refuses a larger
+summary before it writes a file of the item, and each reader of a summary in
+the port refuses a larger file. The items before the refusal keep their new
+files, and the item of the refusal and the items after it keep their old
+files.
 
 Then it removes the files under `extensions/ostrya/summary/` of each item
 that has no summary, the `.access` files first. It removes the temp files of

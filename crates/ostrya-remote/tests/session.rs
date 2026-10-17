@@ -1405,12 +1405,24 @@ fn a_server_commit_sends_commit_with_the_server_commit_alone() {
     }
 }
 
+/// A name that `Hello` did not name, and a name that the server commit
+/// names twice, fail the check, and `server_commit` then sends nothing. The
+/// first name in the order of the branch and the tags that fails gives the
+/// refusal.
 #[test]
 fn server_commit_prechecks_send_nothing() {
-    let cases: [(ServerCommit, &str); 3] = [
+    let cases: [(ServerCommit, &str); 5] = [
         (server_commit("other", &[]), "'other' was not named"),
         (server_commit("main", &["t3"]), "'t3' was not named"),
         (server_commit("main", &["t1", "t1"]), "'t1' is named twice"),
+        (
+            server_commit("main", &["t1", "t1", "t3"]),
+            "'t1' is named twice",
+        ),
+        (
+            server_commit("main", &["t3", "t1", "t1"]),
+            "'t3' was not named",
+        ),
     ];
     for (sc, text) in cases {
         let (session, out) = open(&["main", "t1"], BOTH, &[]);

@@ -1415,6 +1415,97 @@ fn a_ref_listing_skips_a_directory_that_a_negative_entry_covers() {
     });
 }
 
+/// With no positive entry, the walk of a namespace reads only the
+/// directories that an allow item that gives `r` can match, and it skips a
+/// directory that a deny item of the group covers. A directory with mode 0
+/// outside these directories fails no listing of the client, and the
+/// listing holds the refs that the client reads. A positive entry walks by
+/// its patterns. The test returns at once for a user that ignores the mode.
+#[test]
+fn a_ref_listing_walks_the_directories_that_the_client_reads() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_tmp, repo_dir) = writable_fixture("summary", "listing-readable-dirs");
+    block_on(async {
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        let (main, other) = add_prefix_refs(&repo).await;
+        for (name, commit) in [
+            ("pub/a", main),
+            ("pub/b/c", other),
+            ("pub/b/d/e", main),
+            ("pub/secret/s", other),
+            ("pub/x", main),
+            ("priv/p", other),
+            ("locked/l", main),
+        ] {
+            repo.set_ref_immediate(name, Some(&commit)).await.unwrap();
+        }
+        repo.set_ref_alias_immediate("pub/al", "main")
+            .await
+            .unwrap();
+        repo.set_ref_alias_immediate("pub/hid", "priv/p")
+            .await
+            .unwrap();
+        for name in ["c/a", "c/b/c", "c/no/b", "z/x"] {
+            set_mirror(&repo, "org.example.M", name, &main).await;
+        }
+        let groups = "[ex-ostrya client \"pub\"]\nauth=ssh:u\nallow=r:pub/**;w:main;d:priv/**\n\
+                      deny=pub/secret/**;pub/x\n\
+                      [ex-ostrya client \"pub-c\"]\nauth=ssh:u\ncollection=*\nallow=r:c/**\n\
+                      deny=c/no/**\n";
+        let reader = read_access(groups, "ssh:u");
+        let check = |listing: ostrya::RefListing, local: Names<'_>, map: Map<'_>| {
+            assert_eq!(listed_names(&listing.bytes), local);
+            assert_eq!(collection_names(&listing.bytes), names_of(map));
+        };
+        let readable = ["main", "pub/a", "pub/al", "pub/b/c", "pub/b/d/e"];
+        let map: Map<'_> = &[("org.example.M", &["c/a", "c/b/c"])];
+        check(
+            list_with(&repo, &[], Some(&[]), &reader).await,
+            &readable,
+            map,
+        );
+
+        let locked = [
+            repo_dir.join("refs/heads/locked"),
+            repo_dir.join("refs/heads/pub/secret"),
+            repo_dir.join("refs/mirrors/org.example.M/c/no"),
+            repo_dir.join("refs/mirrors/org.example.M/z"),
+        ];
+        for dir in &locked {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        let restore = || {
+            for dir in &locked {
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        };
+        if std::fs::read_dir(&locked[0]).is_ok() {
+            restore();
+            return;
+        }
+        check(
+            list_with(&repo, &[], Some(&[]), &reader).await,
+            &readable,
+            map,
+        );
+        check(
+            list_with(&repo, &["!pub/b/**"], Some(&["!*/c/b/**"]), &reader).await,
+            &["main", "pub/a", "pub/al"],
+            &[("org.example.M", &["c/a"])],
+        );
+        for (refs, collections) in [(&["**"][..], &[][..]), (&[][..], &["*/**"][..])] {
+            let outcome = repo
+                .build_ref_listing(&selector(refs), Some(&selector(collections)), &reader)
+                .await;
+            assert!(
+                matches!(outcome, Err(ostrya::Error::Io(_))),
+                "{refs:?} {collections:?}: {outcome:?}"
+            );
+        }
+        restore();
+    });
+}
+
 /// An entry that `RefSelector::parse` refuses never reaches a listing. The
 /// parse comes before each read, so a repository with a bad ref gives the
 /// same refusal.
@@ -2523,5 +2614,40 @@ fn a_changed_access_file_goes_before_the_summary() {
         let after = std::fs::read(&access).unwrap();
         assert_ne!(after, before);
         assert_eq!(ref_names(&summary_of(&repo, "anonymous").await), ["main"]);
+    });
+}
+
+/// A write keeps the `.access` file of an item that holds the access digest
+/// of the item: the file is not written again.
+#[test]
+fn an_access_file_that_holds_the_digest_is_not_written_again() {
+    use std::os::unix::fs::MetadataExt;
+
+    let (_tmp, repo_dir) = writable_fixture("summary", "items-access-kept");
+    block_on(async {
+        let groups = "[ex-ostrya client \"public\"]\nauth=anonymous\nallow=r:**\nsummary=true\n\
+                      [ex-ostrya client \"ci\"]\nauth=ssh:ci\nallow=r:main\nsummary=true\n";
+        let repo = with_groups(&repo_dir, groups).await;
+        repo.regenerate_summary(&fixed()).await.unwrap();
+        let files = [
+            item_file(&repo_dir, "anonymous", ".access"),
+            item_file(&repo_dir, "ssh:ci", ".access"),
+        ];
+        let before: Vec<(u64, Vec<u8>)> = files
+            .iter()
+            .map(|file| {
+                (
+                    std::fs::metadata(file).unwrap().ino(),
+                    std::fs::read(file).unwrap(),
+                )
+            })
+            .collect();
+        repo.set_ref_immediate("main", None).await.unwrap();
+        repo.regenerate_summary(&fixed()).await.unwrap();
+        for (file, (ino, bytes)) in files.iter().zip(&before) {
+            assert_eq!(std::fs::metadata(file).unwrap().ino(), *ino, "{file:?}");
+            assert_eq!(&std::fs::read(file).unwrap(), bytes, "{file:?}");
+        }
+        assert!(ref_names(&summary_of(&repo, "ssh:ci").await).is_empty());
     });
 }

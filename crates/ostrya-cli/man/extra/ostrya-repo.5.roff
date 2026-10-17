@@ -189,6 +189,7 @@ The summary: the refs and their commits, the static deltas, and the repository m
 It is the summary of the authentication item \fB\%anonymous\fR.
 \fB\%ostrya summary \-u\fR writes it, and removes it when \fB\%anonymous\fR has no summary.
 A pull reads it from the remote.
+A summary is at most 64 MiB: \fB\%ostrya summary \-u\fR refuses a larger summary, and ostrya refuses to read a larger file.
 .TP
 \fB\%<repo>/summary.sig\fR
 The signatures of the summary.

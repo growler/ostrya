@@ -15,7 +15,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use ostrya_core::{Checksum, RefSelector, Value, is_collection_id};
@@ -505,12 +505,9 @@ impl Repo {
         };
         drop(answers);
         // A remote with no selected ref is not asked again.
-        let unselected: Vec<PullSession> = sessions
-            .iter_mut()
-            .enumerate()
-            .filter(|(index, _)| !selected.iter().any(|s| s.remote == *index))
-            .filter_map(|(_, session)| session.take())
-            .collect();
+        let unselected = take_unselected(&mut sessions, &mut summaries, |index| {
+            selected.iter().any(|s| s.remote == index)
+        });
         end_sessions(unselected).await;
 
         let place = if self.config().collection_id() == Some(collection_id) {
@@ -534,7 +531,7 @@ impl Repo {
                 listed: mine.iter().map(|l| (l.name.clone(), l.timestamp)).collect(),
                 collection: collection_id,
                 place,
-                summary: summaries[index].take(),
+                summary: Mutex::new(summaries[index].take()),
             };
             // The trust and the session hold what these fields gave.
             let run = PullOptions {
@@ -586,6 +583,30 @@ impl Repo {
 fn first_of_each<'a>(values: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
     let mut seen = HashSet::new();
     values.filter(|value| seen.insert(*value)).collect()
+}
+
+/// Takes out of `sessions` the session of each remote for whose position
+/// `selected` returns `false`, and drops the summary of that remote in
+/// `summaries`.
+///
+/// `sessions` and `summaries` hold one slot for each remote, by its
+/// position. The pull reads nothing more from a remote with no selected ref,
+/// so its summary does not stay in memory for the rest of the pull.
+fn take_unselected<S, M>(
+    sessions: &mut [Option<S>],
+    summaries: &mut [Option<M>],
+    selected: impl Fn(usize) -> bool,
+) -> Vec<S> {
+    sessions
+        .iter_mut()
+        .zip(summaries.iter_mut())
+        .enumerate()
+        .filter(|(index, _)| !selected(*index))
+        .filter_map(|(_, (session, summary))| {
+            *summary = None;
+            session.take()
+        })
+        .collect()
 }
 
 /// Ends each session of `sessions`.
@@ -1142,6 +1163,19 @@ mod tests {
     /// collection id.
     fn summary(field0: TestRefs<'_>, map: &[(&str, TestRefs<'_>)], own: Option<&str>) -> Vec<u8> {
         summary_of(ref_values(field0), map, own)
+    }
+
+    /// The sessions of the remotes with no selected ref leave their slots,
+    /// and the summaries of these remotes are dropped. The slots of the
+    /// selected remotes keep their sessions and their summaries.
+    #[test]
+    fn the_unselected_remotes_leave_their_sessions_and_summaries() {
+        let mut sessions = vec![Some('a'), None, Some('c'), Some('d')];
+        let mut summaries = vec![Some(1), None, Some(3), Some(4)];
+        let taken = take_unselected(&mut sessions, &mut summaries, |index| index == 2);
+        assert_eq!(taken, ['a', 'd']);
+        assert_eq!(sessions, [None, None, Some('c'), None]);
+        assert_eq!(summaries, [None, None, Some(3), None]);
     }
 
     /// A summary whose own collection id is the pulled id gives the refs of

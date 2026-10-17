@@ -638,14 +638,15 @@ impl Repo {
     /// 1. When the `.access` file holds another digest, the call removes it.
     /// 2. It removes the old signature file, writes the summary, and writes
     ///    the new signature file if `signers` is not empty.
-    /// 3. It writes the `.access` file.
+    /// 3. When the `.access` file does not hold the access digest of the
+    ///    item, it writes the `.access` file.
     ///
     /// So while the `.access` file of an item holds a digest, the summary
     /// next to it is a summary of that digest. Each file is written
     /// atomically, with the mode `0644`. If `[core] fsync` is `true`, the
     /// call syncs the data of each file. It also syncs the directory of the
-    /// `.access` file after the removal of step 1 and after step 3, and the
-    /// directory of the summary before step 3.
+    /// `.access` file after the removal of step 1 and after the write of
+    /// step 3, and the directory of the summary before step 3.
     ///
     /// Then the call removes the files of each item that has no summary.
     /// Under `extensions/ostrya/summary/`, it removes each file
@@ -754,6 +755,15 @@ impl Repo {
     /// their new files, and the summary of the failure and the summaries
     /// after it keep their old files.
     ///
+    /// # Size
+    ///
+    /// A summary is at most 64 MiB (67108864 bytes), the cap of each reader
+    /// of a summary in this crate. The call refuses a larger summary before
+    /// it writes a file of the item. The items before it keep their new
+    /// files, and the item of the refusal and the items after it keep their
+    /// old files. The names of the refs give a lower bound of the size, so
+    /// the call can refuse a summary before it reads the commits of its refs.
+    ///
     /// # Locks
     ///
     /// The call takes the repository lock shared and then the update lock, as
@@ -777,8 +787,9 @@ impl Repo {
     ///   if a client group or the server group is malformed
     ///   ([`ClientAccess::from_config`]), if `[core] lock-timeout-secs` is
     ///   below `-1`, if a ref file is not UTF-8, if the system clock is
-    ///   before the Unix epoch, or if `extensions`, `extensions/ostrya`, or
-    ///   `extensions/ostrya/summary` is not a directory.
+    ///   before the Unix epoch, if a summary is larger than 64 MiB, or if
+    ///   `extensions`, `extensions/ostrya`, or `extensions/ostrya/summary` is
+    ///   not a directory.
     /// - [`Error::Unsupported`] if the repository has a collection id and
     ///   [`SummaryOptions::additional_metadata`] is not empty.
     /// - [`Error::Core`] if `[core] fsync`, `[core] locking`, `[core]
@@ -978,16 +989,35 @@ impl Repo {
     ) -> Result<Vec<u8>> {
         // With no client group, the item is `anonymous` under the implicit
         // groups, which have `summary=true`. Its rights are the rights of the
-        // full selection of the run, so the call takes that selection.
+        // full selection of the run, so the call takes that selection. Each
+        // other item takes the refs of the full selection that it reads. When
+        // the full selection did not read a ref that the item reads, the
+        // call walks the refs with the rights of the item.
         let selected;
         let selection = if run.access.has_client_groups() {
-            let all = RefSelector::parse([])?;
             let read = ReadAccess::for_summary(run.access.clone(), item.clone());
-            selected = self.select_refs(&all, Some(&all), &read, None).await?;
+            selected = match run.every.readable(&read) {
+                Some(selected) => selected,
+                None => {
+                    let all = RefSelector::parse([])?;
+                    self.select_refs(&all, Some(&all), &read, None).await?
+                }
+            };
             &selected
         } else {
             &run.every
         };
+        self.selection_summary(run, selection, opts).await
+    }
+
+    /// Returns the bytes of the summary of the refs `selection` in the run
+    /// `run`.
+    async fn selection_summary(
+        &self,
+        run: &SummaryRun,
+        selection: &RefSelection,
+        opts: &SummaryOptions,
+    ) -> Result<Vec<u8>> {
         // A summary of each ref lists each delta. Each other summary lists
         // the deltas to the commits of its refs, because another delta can
         // name a commit that the item does not read.
@@ -1037,8 +1067,20 @@ impl Repo {
         last_modified: u64,
         added: &[(String, Value)],
     ) -> Result<Vec<u8>> {
+        // The names give a lower bound of the size of the summary, so a
+        // summary over the cap is refused before the commit reads and the
+        // build.
+        check_summary_size(
+            local
+                .iter()
+                .map(|(name, _)| name.len() as u64 + REF_ENTRY_FLOOR)
+                .sum::<u64>()
+                + collection_map_floor(collections),
+        )?;
         // A ref can name a commit that the facts of the run do not hold, if
-        // the ref changed after the full selection.
+        // the walk of an item read a ref of `refs/heads` that the full
+        // selection did not read, or if the ref changed after the full
+        // selection.
         let missing: HashSet<Checksum> = local
             .iter()
             .chain(collections.values().flatten())
@@ -1124,7 +1166,9 @@ impl Repo {
 
         let summary = Value::Tuple(vec![Value::Array(ref_entries), metadata]);
         let ty = Type::parse(SUMMARY_SIGNATURE).map_err(ostrya_core::Error::from)?;
-        Ok(to_bytes(&ty, &summary).map_err(ostrya_core::Error::from)?)
+        let bytes = to_bytes(&ty, &summary).map_err(ostrya_core::Error::from)?;
+        check_summary_size(bytes.len() as u64)?;
+        Ok(bytes)
     }
 
     /// Returns a ref listing: a summary of the local refs that `refs`
@@ -1210,9 +1254,10 @@ impl Repo {
     /// it reads the ref file, so it reads no ref that the selector does not
     /// select. It reads each commit one time, also when more than one ref
     /// names it. An empty selector, and a selector of negative patterns
-    /// alone, read each directory of the refs that it can select. A name
-    /// that the ref-name rule refuses is in the walk, and a wildcard selects
-    /// it.
+    /// alone, read only the directories that an allow item that gives `r`
+    /// in the group of the namespace can match, and no directory that a deny
+    /// item of that group covers. A name that the ref-name rule refuses is in
+    /// the walk, and a wildcard selects it.
     ///
     /// # Global metadata
     ///
@@ -1306,6 +1351,7 @@ impl Repo {
             local,
             collections,
             invalid_dirs,
+            ..
         } = self
             .select_refs(refs, collections, access, Some(cap))
             .await?;
@@ -1365,11 +1411,12 @@ impl Repo {
 
     /// Returns the bytes of `summary`, or `None` if the file does not exist.
     ///
-    /// The read stops at 64 MiB. If the file is longer, the call returns the
-    /// first 64 MiB and no error.
+    /// The call refuses a file larger than 64 MiB, the cap of a summary
+    /// ([`regenerate_summaries`](Repo::regenerate_summaries), "Size").
     ///
     /// # Errors
     ///
+    /// - [`Error::InvalidFormat`] if the file is larger than 64 MiB.
     /// - [`Error::Io`] if the read fails, for example if `summary` is a
     ///   symlink.
     pub async fn read_summary(&self) -> Result<Option<Vec<u8>>> {
@@ -1385,13 +1432,14 @@ impl Repo {
     /// SHA-256 digest of the text of the item
     /// ([`regenerate_summaries`](Repo::regenerate_summaries), "Files"). The call
     /// opens each component with no symlink followed. It does not compare the
-    /// `.access` file of the item with the client groups. The read stops at
-    /// 64 MiB, as for [`read_summary`](Repo::read_summary).
+    /// `.access` file of the item with the client groups. The call refuses a
+    /// file larger than 64 MiB, as [`read_summary`](Repo::read_summary) does.
     ///
     /// # Errors
     ///
     /// - [`Error::InvalidFormat`] if `extensions`, `extensions/ostrya`, or
-    ///   `extensions/ostrya/summary` is not a directory.
+    ///   `extensions/ostrya/summary` is not a directory, or if the file is
+    ///   larger than 64 MiB.
     /// - [`Error::Io`] if the read fails, for example if the file is a
     ///   symlink.
     pub async fn read_summary_of(&self, item: &AuthItem) -> Result<Option<Vec<u8>>> {
@@ -1412,12 +1460,13 @@ impl Repo {
     /// Returns the signature dict of `summary.sig`, or `None` if the file does
     /// not exist or is empty.
     ///
-    /// The dict is an `a{sv}` with one entry for each signing engine. The read
-    /// stops at 64 MiB. If the file is longer, the call parses the first
-    /// 64 MiB. The read and the parse run in one call on the blocking pool.
+    /// The dict is an `a{sv}` with one entry for each signing engine. The call
+    /// refuses a file larger than 64 MiB. The read and the parse run in one
+    /// call on the blocking pool.
     ///
     /// # Errors
     ///
+    /// - [`Error::InvalidFormat`] if the file is larger than 64 MiB.
     /// - [`Error::Core`] if the file is not an `a{sv}` dict.
     /// - [`Error::Io`] if the read fails, for example if `summary.sig` is a
     ///   symlink.
@@ -1457,8 +1506,9 @@ impl Repo {
     /// # Errors
     ///
     /// - [`Error::InvalidFormat`] if the repository has no summary, if
-    ///   `[core] lock-timeout-secs` is below `-1`, if the entry of the engine
-    ///   in a signature file is not an array, or if `extensions`,
+    ///   `[core] lock-timeout-secs` is below `-1`, if a summary or a signature
+    ///   file is larger than 64 MiB, if the entry of the engine in a
+    ///   signature file is not an array, or if `extensions`,
     ///   `extensions/ostrya`, or `extensions/ostrya/summary` is not a
     ///   directory.
     /// - [`Error::Core`] if `[core] fsync`, `[core] locking`, or `[core]
@@ -1505,8 +1555,9 @@ impl Repo {
     /// # Errors
     ///
     /// - [`Error::InvalidFormat`] if the repository has no summary, if
-    ///   `[core] lock-timeout-secs` is below `-1`, if the entry of the engine
-    ///   of a signer in a signature file is not an array, or if `extensions`,
+    ///   `[core] lock-timeout-secs` is below `-1`, if a summary or a signature
+    ///   file is larger than 64 MiB, if the entry of the engine of a signer in
+    ///   a signature file is not an array, or if `extensions`,
     ///   `extensions/ostrya`, or `extensions/ostrya/summary` is not a
     ///   directory.
     /// - [`Error::Core`] if `[core] fsync`, `[core] locking`, or `[core]
@@ -1752,7 +1803,7 @@ impl Repo {
     }
 
     /// Reads a whole file at the repository root, or returns `None` if it does
-    /// not exist. The read stops at [`SUMMARY_READ_CAP`].
+    /// not exist. The call refuses a file larger than [`SUMMARY_READ_CAP`].
     pub(crate) async fn read_root_file(&self, name: &str) -> Result<Option<Vec<u8>>> {
         let repo_fd = self.repo_fd().try_clone_to_owned()?;
         let name = name.to_owned();
@@ -2328,17 +2379,20 @@ fn resolve_last_modified(explicit: Option<u64>) -> Result<u64> {
     Ok(now.as_secs())
 }
 
-/// The largest summary that the reader loads whole: 64 MiB.
+/// The largest summary: 64 MiB.
 ///
 /// The size of the summary grows with the number of refs and deltas, and each
 /// reader loads it whole. This bound protects against a corrupt or hostile
-/// file.
+/// file. The writer refuses a larger summary, so each summary that it writes
+/// passes each reader.
 pub(crate) const SUMMARY_READ_CAP: u64 = 64 * 1024 * 1024;
 
 /// Reads a whole file relative to `repo_fd`, or returns `None` if it does not
 /// exist.
 ///
-/// The read does not follow a symlink, and it stops at [`SUMMARY_READ_CAP`].
+/// The read does not follow a symlink. It refuses a file larger than
+/// [`SUMMARY_READ_CAP`] with [`Error::InvalidFormat`], and reads at most one
+/// byte past the cap.
 pub(crate) fn read_root_file_blocking(
     repo_fd: BorrowedFd<'_>,
     name: &str,
@@ -2363,8 +2417,24 @@ pub(crate) fn read_root_file_blocking(
     // hostile size allocates no more than that.
     let hint = file.metadata()?.len().min(SUMMARY_READ_CAP) + 1;
     let mut buf = Vec::with_capacity(hint as usize);
-    file.take(SUMMARY_READ_CAP).read_to_end(&mut buf)?;
+    file.take(SUMMARY_READ_CAP + 1).read_to_end(&mut buf)?;
+    if buf.len() as u64 > SUMMARY_READ_CAP {
+        return Err(Error::InvalidFormat(format!(
+            "{name} is larger than its cap of {SUMMARY_READ_CAP} bytes"
+        )));
+    }
     Ok(Some(buf))
+}
+
+/// Refuses a summary of `size` bytes, or of at least `size` bytes, when
+/// `size` is larger than [`SUMMARY_READ_CAP`], the cap of each reader.
+fn check_summary_size(size: u64) -> Result<()> {
+    if size > SUMMARY_READ_CAP {
+        return Err(Error::InvalidFormat(format!(
+            "the summary is larger than its cap of {SUMMARY_READ_CAP} bytes"
+        )));
+    }
+    Ok(())
 }
 
 /// Writes `bytes` to `name` at the repository root, atomically.
@@ -2385,11 +2455,12 @@ pub(crate) fn write_root_file_blocking(
     Ok(())
 }
 
-/// Removes `name` at the repository root. If the file does not exist, the
-/// call succeeds.
-pub(crate) fn remove_root_file_blocking(repo_fd: BorrowedFd<'_>, name: &str) -> Result<()> {
+/// Removes `name` at the repository root, and returns `true` if it removed
+/// a file. If the file does not exist, the call succeeds with `false`.
+pub(crate) fn remove_root_file_blocking(repo_fd: BorrowedFd<'_>, name: &str) -> Result<bool> {
     match rustix::fs::unlinkat(repo_fd, name, AtFlags::empty()) {
-        Ok(()) | Err(Errno::NOENT) => Ok(()),
+        Ok(()) => Ok(true),
+        Err(Errno::NOENT) => Ok(false),
         Err(e) => Err(e.into()),
     }
 }
@@ -2558,13 +2629,15 @@ async fn sign_summary_bytes(
 /// When the `.access` file of the item holds another digest, the call
 /// removes it first. Then it removes the old signature file, writes the
 /// summary `bytes` and the signature file `signatures`, and writes the
-/// `.access` file last. So while the `.access` file holds a digest, the
-/// summary next to it is a summary of that digest.
+/// `.access` file last, unless it holds the digest. So while the `.access`
+/// file holds a digest, the summary next to it is a summary of that digest.
 ///
 /// With `fsync`, the call syncs the directory of the `.access` file after
-/// its removal, and the directory of the summary before the write of the
-/// `.access` file. So after a crash too, an `.access` file never pairs with
-/// a summary of another digest.
+/// its removal and after its write, and the directory of the summary before
+/// the write of the `.access` file. So after a crash too, an `.access` file
+/// never pairs with a summary of another digest. When the summary and the
+/// `.access` file are in one directory, the sync before the write of the
+/// `.access` file keeps the order of the two renames.
 fn put_item_summary_blocking(
     repo: &Repo,
     item: &AuthItem,
@@ -2577,11 +2650,9 @@ fn put_item_summary_blocking(
         .expect("the call creates the directory");
     let access = format!("{}{ACCESS_SUFFIX}", files.stem);
     let want = access_file_bytes(&files.digest);
-    if holds_blocking(dir.as_fd(), &access, &want)? == Some(false) {
-        remove_root_file_blocking(dir.as_fd(), &access)?;
-        if fsync {
-            rustix::fs::fsync(&dir)?;
-        }
+    let held = holds_blocking(dir.as_fd(), &access, &want)?;
+    if held == Some(false) && remove_root_file_blocking(dir.as_fd(), &access)? && fsync {
+        rustix::fs::fsync(&dir)?;
     }
     let (at, file, sig) = if *item == AuthItem::Anonymous {
         (
@@ -2605,9 +2676,12 @@ fn put_item_summary_blocking(
     if fsync {
         rustix::fs::fsync(at)?;
     }
-    put_root_file_blocking(dir.as_fd(), &access, &want, fsync)?;
-    if fsync {
-        rustix::fs::fsync(&dir)?;
+    // An `.access` file that holds the digest stays as it is.
+    if held != Some(true) {
+        put_root_file_blocking(dir.as_fd(), &access, &want, fsync)?;
+        if fsync {
+            rustix::fs::fsync(&dir)?;
+        }
     }
     Ok(())
 }
@@ -2661,17 +2735,18 @@ fn remove_other_summaries_blocking(
         // The server stops serving a summary at the removal of its
         // `.access` file, so that file goes first.
         gone.sort_by_key(|name| !name.ends_with(ACCESS_SUFFIX));
+        let mut removed = false;
         for name in &gone {
-            remove_root_file_blocking(dir.as_fd(), name)?;
+            removed |= remove_root_file_blocking(dir.as_fd(), name)?;
         }
-        if fsync && !gone.is_empty() {
+        if fsync && removed {
             rustix::fs::fsync(&dir)?;
         }
     }
     if !anonymous {
-        remove_root_file_blocking(repo.repo_fd(), SUMMARY_FILE)?;
-        remove_root_file_blocking(repo.repo_fd(), SUMMARY_SIG_FILE)?;
-        if fsync {
+        let summary = remove_root_file_blocking(repo.repo_fd(), SUMMARY_FILE)?;
+        let sig = remove_root_file_blocking(repo.repo_fd(), SUMMARY_SIG_FILE)?;
+        if fsync && (summary || sig) {
             rustix::fs::fsync(repo.repo_fd())?;
         }
     }
@@ -2680,14 +2755,14 @@ fn remove_other_summaries_blocking(
 
 /// Removes the `.access` file of the `anonymous` item, so that no server
 /// serves `summary` and `summary.sig` until the next run of the writer. A
-/// file that does not exist is no error.
+/// file that does not exist is no error. With `fsync`, the call syncs the
+/// directory when it removed the file.
 pub(crate) fn remove_anonymous_access_blocking(repo_fd: BorrowedFd<'_>, fsync: bool) -> Result<()> {
     let Some(dir) = open_summary_dir(repo_fd, None, false)? else {
         return Ok(());
     };
     let name = format!("{}{ACCESS_SUFFIX}", summary_stem(&AuthItem::Anonymous));
-    remove_root_file_blocking(dir.as_fd(), &name)?;
-    if fsync {
+    if remove_root_file_blocking(dir.as_fd(), &name)? && fsync {
         rustix::fs::fsync(&dir)?;
     }
     Ok(())
@@ -3658,6 +3733,258 @@ mod tests {
             let selected = repo.select_refs(&all, Some(&all), &anyone, None).await;
             assert!(matches!(selected, Err(Error::Core(_))));
         });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Writes a commit with no version and an empty root tree to `repo`, at
+    /// `timestamp`, and returns it.
+    async fn commit_at(repo: &Repo, timestamp: u64) -> Checksum {
+        let txn = repo.transaction().await.unwrap();
+        let dirmeta = DirMeta {
+            uid: 0,
+            gid: 0,
+            mode: ANCHOR_DIR_MODE,
+            xattrs: Default::default(),
+        };
+        let dirmeta = txn
+            .write_metadata(ObjectType::DirMeta, None, &dirmeta.serialize().unwrap())
+            .await
+            .unwrap();
+        let mut mtree = MutableTree::new();
+        mtree.set_metadata_checksum(dirmeta);
+        let root = txn.write_mtree(&mut mtree).await.unwrap();
+        let options = CommitOptions {
+            parent: None,
+            subject: None,
+            body: None,
+            timestamp: Some(timestamp),
+            metadata: None,
+        };
+        let commit = txn.write_commit(options, &root).await.unwrap();
+        txn.commit().await.unwrap();
+        commit
+    }
+
+    /// Returns the local refs and the collection refs of `summary`, by name
+    /// and commit.
+    #[allow(clippy::type_complexity)]
+    fn summary_refs(
+        summary: &Summary,
+    ) -> (
+        Vec<(String, Checksum)>,
+        BTreeMap<String, Vec<(String, Checksum)>>,
+    ) {
+        let pairs = |refs: &[SummaryRef]| -> Vec<(String, Checksum)> {
+            refs.iter().map(|r| (r.name.clone(), r.commit)).collect()
+        };
+        let collections = summary
+            .collection_map()
+            .unwrap()
+            .into_iter()
+            .map(|(id, refs)| (id, pairs(&refs)))
+            .collect();
+        (pairs(&summary.refs), collections)
+    }
+
+    /// The summary of each item holds the refs that a walk of the repository
+    /// with the rights of the summary of the item selects: the local refs
+    /// with the mirror refs of the own id, the collection refs, the aliases
+    /// whose names and targets the item reads, and no ref that a deny item
+    /// covers. A mirror alias of the own id that the item does not read
+    /// gives its place to the ref of `refs/heads` of the same name.
+    #[test]
+    fn each_item_summary_holds_the_refs_of_a_walk_with_its_rights() {
+        let dir = std::env::temp_dir().join(format!(
+            "ostrya-item-summary-walk-{}-{}",
+            std::process::id(),
+            crate::write::unique()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        ostrya_rt::block_on(async {
+            let repo = repo_with_refs(
+                &dir,
+                &["main", "pub/a", "pub/b/c", "pub/secret/s", "shadow", "free"],
+            )
+            .await;
+            let first = repo.resolve_ref_tip("main").await.unwrap().unwrap();
+            let second = commit_at(&repo, 1_700_000_100).await;
+            for name in ["priv/p", "pub/secret/t"] {
+                repo.set_ref_immediate(name, Some(&second)).await.unwrap();
+            }
+            repo.set_ref_alias_immediate("pub/link", "priv/p")
+                .await
+                .unwrap();
+            repo.set_ref_alias_immediate("pub/open", "main")
+                .await
+                .unwrap();
+            let own = "org.example.Own";
+            for (id, name, commit) in [
+                (own, "pub/m", &second),
+                ("org.example.A", "a/x", &first),
+                ("org.example.A", "hidden/h", &second),
+                ("org.example.B", "b", &second),
+            ] {
+                let cref = crate::CollectionRef::new(id, name);
+                repo.set_collection_ref_immediate(&cref, Some(commit))
+                    .await
+                    .unwrap();
+            }
+            // A mirror alias of the own id hides `refs/heads/shadow`, and
+            // aliases under the directory of a collection.
+            let mirrors = dir.join("refs/mirrors");
+            for (link, body) in [
+                (format!("{own}/shadow"), "../../heads/priv/p"),
+                ("org.example.A/a/l".to_owned(), "../../../heads/main"),
+                ("org.example.A/a/p".to_owned(), "../../../heads/priv/p"),
+            ] {
+                std::os::unix::fs::symlink(body, mirrors.join(link)).unwrap();
+            }
+            let config = dir.join("config");
+            let mut text = std::fs::read_to_string(&config).unwrap();
+            text.push_str(&format!("collection-id={own}\n"));
+            text.push_str(
+                "[ex-ostrya client \"public\"]\nauth=anonymous\nallow=r:pub/**;r:main\n\
+                 deny=pub/secret/**\nsummary=true\n\
+                 [ex-ostrya client \"public-c\"]\nauth=anonymous\ncollection=*\n\
+                 allow=r:**\ndeny=hidden/**\nsummary=true\n\
+                 [ex-ostrya client \"ci\"]\nauth=ssh:ci\nallow=r:**\ndeny=priv/**\n\
+                 summary=true\n\
+                 [ex-ostrya client \"ci-a\"]\nauth=ssh:ci\ncollection=org.example.A\n\
+                 allow=r:a/**\nsummary=true\n\
+                 [ex-ostrya client \"admin\"]\nauth=ssh:admin\nallow=r:**\nsummary=true\n\
+                 [ex-ostrya client \"admin-c\"]\nauth=ssh:admin\ncollection=*\n\
+                 allow=r:**\nsummary=true\n\
+                 [ex-ostrya client \"none\"]\nauth=ssh:none\nallow=d:**\nsummary=true\n",
+            );
+            std::fs::write(&config, text).unwrap();
+            let repo = Repo::open(&dir).await.unwrap();
+
+            let opts = SummaryOptions {
+                last_modified: Some(1_700_000_000),
+                ..SummaryOptions::default()
+            };
+            let access = Arc::new(ClientAccess::from_config(repo.config(), repo.path()).unwrap());
+            let run = repo.summary_run(access.clone(), &opts).await.unwrap();
+            let all = all_refs();
+            let mut fallbacks = 0;
+            for text in ["anonymous", "ssh:ci", "ssh:admin", "ssh:none"] {
+                let item = AuthItem::parse(text).unwrap();
+                let bytes = repo.item_summary(&run, &item, &opts).await.unwrap();
+                let summary = Summary::parse(&bytes).unwrap();
+                let read = ReadAccess::for_summary(access.clone(), item.clone());
+                let walked = repo
+                    .select_refs(&all, Some(&all), &read, None)
+                    .await
+                    .unwrap();
+                let (local, collections) = summary_refs(&summary);
+                assert_eq!(local, walked.local, "{text}");
+                assert_eq!(collections, walked.collections, "{text}");
+                let built = repo.selection_summary(&run, &walked, &opts).await.unwrap();
+                assert_eq!(bytes, built, "{text}");
+                if run.every.readable(&read).is_none() {
+                    assert!(local.contains(&("shadow".to_owned(), first)), "{text}");
+                    fallbacks += 1;
+                }
+            }
+            assert_eq!(fallbacks, 1, "the ci item walks the refs");
+            let anonymous = Summary::parse(
+                &repo
+                    .item_summary(&run, &AuthItem::Anonymous, &opts)
+                    .await
+                    .unwrap(),
+            )
+            .unwrap();
+            let (local, collections) = summary_refs(&anonymous);
+            let names: Vec<&str> = local.iter().map(|(name, _)| name.as_str()).collect();
+            assert_eq!(names, ["main", "pub/a", "pub/b/c", "pub/m", "pub/open"]);
+            let ids: Vec<&str> = collections.keys().map(String::as_str).collect();
+            assert_eq!(ids, ["org.example.A", "org.example.B"]);
+            let a: Vec<&str> = collections["org.example.A"]
+                .iter()
+                .map(|(name, _)| name.as_str())
+                .collect();
+            assert_eq!(a, ["a/l", "a/x"]);
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The writer refuses a summary larger than [`SUMMARY_READ_CAP`] and
+    /// keeps the summary that the repository holds.
+    #[test]
+    fn a_summary_over_the_read_cap_is_refused() {
+        let dir = std::env::temp_dir().join(format!(
+            "ostrya-summary-write-cap-{}-{}",
+            std::process::id(),
+            crate::write::unique()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        ostrya_rt::block_on(async {
+            let repo = repo_with_refs(&dir, &["main"]).await;
+            repo.regenerate_summary(&SummaryOptions::default())
+                .await
+                .unwrap();
+            let before = std::fs::read(dir.join(SUMMARY_FILE)).unwrap();
+            let big = "x".repeat(SUMMARY_READ_CAP as usize);
+            let opts = SummaryOptions {
+                additional_metadata: vec![(
+                    "big".to_owned(),
+                    Value::Variant(Box::new((Type::parse("s").unwrap(), Value::Str(big)))),
+                )],
+                ..SummaryOptions::default()
+            };
+            let outcome = repo.regenerate_summary(&opts).await;
+            assert!(
+                matches!(&outcome, Err(Error::InvalidFormat(m)) if m.contains("cap")),
+                "{outcome:?}"
+            );
+            assert_eq!(std::fs::read(dir.join(SUMMARY_FILE)).unwrap(), before);
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A reader of a summary file refuses a file larger than
+    /// [`SUMMARY_READ_CAP`], and reads a file of the cap whole.
+    #[test]
+    fn a_summary_file_over_the_read_cap_is_refused() {
+        let dir = std::env::temp_dir().join(format!(
+            "ostrya-summary-read-cap-{}-{}",
+            std::process::id(),
+            crate::write::unique()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        ostrya_rt::block_on(async {
+            let repo = repo_with_refs(&dir, &["main"]).await;
+            let file = std::fs::File::create(dir.join(SUMMARY_FILE)).unwrap();
+            file.set_len(SUMMARY_READ_CAP).unwrap();
+            let bytes = repo.read_summary().await.unwrap().unwrap();
+            assert_eq!(bytes.len() as u64, SUMMARY_READ_CAP);
+            drop(bytes);
+            file.set_len(SUMMARY_READ_CAP + 1).unwrap();
+            let outcome = repo.read_summary().await;
+            assert!(
+                matches!(&outcome, Err(Error::InvalidFormat(m)) if m.contains("cap")),
+                "{:?}",
+                outcome.map(|bytes| bytes.map(|bytes| bytes.len()))
+            );
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The removal of a root file reports whether it removed a file. A file
+    /// that does not exist is no error.
+    #[test]
+    fn the_removal_of_a_root_file_reports_the_removal() {
+        let dir = std::env::temp_dir().join(format!(
+            "ostrya-remove-root-file-{}-{}",
+            std::process::id(),
+            crate::write::unique()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("file"), b"x").unwrap();
+        let fd = std::fs::File::open(&dir).unwrap();
+        assert!(remove_root_file_blocking(fd.as_fd(), "file").unwrap());
+        assert!(!dir.join("file").exists());
+        assert!(!remove_root_file_blocking(fd.as_fd(), "file").unwrap());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

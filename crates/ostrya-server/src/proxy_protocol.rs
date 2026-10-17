@@ -4,8 +4,11 @@
 //! bytes of the client. The header states the source address of the client.
 //! [`parse`] reads the header from the bytes of the connection that the
 //! server holds. [`read_header`] reads the bytes from the stream, in chunks
-//! of at most 4 KiB, until [`parse`] gives a result. The bytes after the
-//! header stay in a [`Rewind`], which gives them first to the next read.
+//! of at most 4 KiB, into one buffer of 4 KiB. It keeps the bytes that it
+//! reads until [`parse`] gives a result, which comes at the end of the
+//! address block of a version 2 header. It reads the rest of the TLVs
+//! through the buffer and keeps none of them. The bytes after the header
+//! stay in a [`Rewind`], which gives them first to the next read.
 //!
 //! Version 1 is a text line:
 //!
@@ -60,17 +63,23 @@ const READ_CHUNK: usize = 4096;
 /// The result of [`parse`].
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Parsed {
-    /// The bytes are a strict prefix of a valid header.
+    /// The bytes are a strict prefix of a valid header, and end before the
+    /// end of its address block.
     Incomplete,
     /// The bytes do not start with a valid header.
     Invalid,
-    /// The bytes start with a valid header of `len` bytes. `source` is the
-    /// source address of the header, or `None` when the header gives no
+    /// The bytes start with a valid header of `len` bytes, or with the part
+    /// of a version 2 header up to the end of its address block. `source` is
+    /// the source address of the header, or `None` when the header gives no
     /// address.
     Done { source: Option<IpAddr>, len: usize },
 }
 
 /// Reads the PROXY header at the start of `bytes`.
+///
+/// The result of a version 2 header is known at the end of its address
+/// block, because the server ignores the TLVs after it. So `len` of
+/// [`Parsed::Done`] can be more than the length of `bytes`.
 pub(crate) fn parse(bytes: &[u8]) -> Parsed {
     let first = bytes.len().min(V2_SIGNATURE.len());
     if bytes[..first] == V2_SIGNATURE[..first] {
@@ -143,7 +152,8 @@ fn is_port(text: &str) -> bool {
     !text.is_empty() && text.bytes().all(|b| b.is_ascii_digit()) && text.parse::<u16>().is_ok()
 }
 
-/// Reads a version 2 header. `bytes` starts with [`V2_SIGNATURE`].
+/// Reads a version 2 header up to the end of its address block. `bytes`
+/// starts with [`V2_SIGNATURE`].
 fn parse_v2(bytes: &[u8]) -> Parsed {
     let Some(&version_command) = bytes.get(12) else {
         return Parsed::Incomplete;
@@ -176,7 +186,7 @@ fn parse_v2(bytes: &[u8]) -> Parsed {
         return Parsed::Invalid;
     }
     let len = V2_FIXED + length;
-    let Some(block) = bytes.get(V2_FIXED..len) else {
+    let Some(block) = bytes.get(V2_FIXED..V2_FIXED + least) else {
         return Parsed::Incomplete;
     };
     let source = match source_len {
@@ -290,39 +300,56 @@ pub(crate) async fn read_header<S: AsyncRead + Unpin>(
 
 /// [`read_header`] with no time limit.
 async fn read<S: AsyncRead + Unpin>(mut stream: S) -> Option<(Option<IpAddr>, Rewind<S>)> {
+    let mut chunk = [0u8; READ_CHUNK];
+    // The bytes up to the end of the address block. The result is known
+    // before the bytes pass the end of the largest address block, so the
+    // buffer holds at most that and one chunk.
     let mut bytes = Vec::new();
-    loop {
-        let filled = bytes.len();
-        bytes.resize(filled + READ_CHUNK, 0);
-        let n = stream.read(&mut bytes[filled..]).await.ok()?;
-        bytes.truncate(filled + n);
+    let (source, len) = loop {
+        let n = stream.read(&mut chunk).await.ok()?;
         if n == 0 {
             return None;
         }
+        bytes.extend_from_slice(&chunk[..n]);
         match parse(&bytes) {
-            Parsed::Incomplete => {
-                // The length of a version 2 header is known from its 16th
-                // byte. The buffer takes the header and one more chunk, so
-                // a long header does not double the buffer.
-                if let Some(length) = bytes.strip_prefix(V2_SIGNATURE).and_then(|b| b.get(2..4)) {
-                    let total = V2_FIXED + usize::from(u16::from_be_bytes([length[0], length[1]]));
-                    bytes.reserve_exact((total + READ_CHUNK).saturating_sub(bytes.len()));
-                }
-            }
+            Parsed::Incomplete => {}
             Parsed::Invalid => return None,
-            Parsed::Done { source, len } => {
-                // The prefix holds the bytes after the header alone, so the
-                // buffer of a long header does not stay with the connection.
-                let rest = bytes[len..].to_vec();
-                return Some((source, Rewind::with_prefix(rest, stream)));
-            }
+            Parsed::Done { source, len } => break (source, len),
         }
+    };
+    if let Some(rest) = bytes.get(len..) {
+        // The prefix holds the bytes after the header alone.
+        return Some((source, Rewind::with_prefix(rest.to_vec(), stream)));
+    }
+    // The TLVs of a version 2 header go through `chunk`, and the call keeps
+    // the bytes after them alone.
+    let mut left = len - bytes.len();
+    drop(bytes);
+    loop {
+        let n = stream.read(&mut chunk).await.ok()?;
+        if n == 0 {
+            return None;
+        }
+        if n < left {
+            left -= n;
+            continue;
+        }
+        return Some((source, Rewind::with_prefix(chunk[left..n].to_vec(), stream)));
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// [`parse`], which gives [`Parsed::Incomplete`] until `bytes` hold the
+    /// whole header.
+    fn parse_whole(bytes: &[u8]) -> Parsed {
+        match parse(bytes) {
+            Parsed::Done { len, .. } if bytes.len() < len => Parsed::Incomplete,
+            parsed => parsed,
+        }
+    }
 
     /// A version 2 header with the command byte `command`, the family
     /// `family`, and the address block `block`.
@@ -410,10 +437,10 @@ mod tests {
         let headers = valid();
         assert_eq!(headers[3].0.len(), V1_MAX);
         for (bytes, source) in headers {
-            assert_eq!(parse(&bytes), done(source, bytes.len()), "{bytes:?}");
+            assert_eq!(parse_whole(&bytes), done(source, bytes.len()), "{bytes:?}");
             let mut longer = bytes.clone();
             longer.extend_from_slice(b"GET / HTTP/1.1\r\n");
-            assert_eq!(parse(&longer), done(source, bytes.len()), "{bytes:?}");
+            assert_eq!(parse_whole(&longer), done(source, bytes.len()), "{bytes:?}");
         }
     }
 
@@ -422,7 +449,11 @@ mod tests {
     fn each_strict_prefix_is_incomplete() {
         for (bytes, _) in valid() {
             for end in 0..bytes.len() {
-                assert_eq!(parse(&bytes[..end]), Parsed::Incomplete, "{bytes:?} {end}");
+                assert_eq!(
+                    parse_whole(&bytes[..end]),
+                    Parsed::Incomplete,
+                    "{bytes:?} {end}"
+                );
             }
         }
     }
@@ -458,7 +489,7 @@ mod tests {
             b"\r\n\r\n\x00\r\nQUIT\r",
         ] {
             assert_eq!(
-                parse(bytes),
+                parse_whole(bytes),
                 Parsed::Invalid,
                 "{:?}",
                 String::from_utf8_lossy(bytes)
@@ -484,20 +515,34 @@ mod tests {
             v2(0x21, 0x21, &inet6()[..35]),
             v2(0x21, 0x31, &[0; 215]),
         ] {
-            assert_eq!(parse(&bytes), Parsed::Invalid, "{bytes:?}");
+            assert_eq!(parse_whole(&bytes), Parsed::Invalid, "{bytes:?}");
             // The header is invalid before its address block arrives.
-            assert_eq!(parse(&bytes[..V2_FIXED]), Parsed::Invalid, "{bytes:?}");
+            assert_eq!(
+                parse_whole(&bytes[..V2_FIXED]),
+                Parsed::Invalid,
+                "{bytes:?}"
+            );
         }
     }
 
-    /// The largest version 2 header has 16 + 65535 bytes.
+    /// The largest version 2 header has 16 + 65535 bytes. Its result is
+    /// known at the end of its address block.
     #[test]
     fn a_version_2_header_has_up_to_64_kib_of_block() {
         let mut block = inet();
         block.resize(usize::from(u16::MAX), 0);
         let bytes = v2(0x21, 0x11, &block);
-        assert_eq!(parse(&bytes), done(Some("192.0.2.1"), V2_FIXED + 65535));
-        assert_eq!(parse(&bytes[..bytes.len() - 1]), Parsed::Incomplete);
+        assert_eq!(
+            parse_whole(&bytes),
+            done(Some("192.0.2.1"), V2_FIXED + 65535)
+        );
+        assert_eq!(parse_whole(&bytes[..bytes.len() - 1]), Parsed::Incomplete);
+        let end = V2_FIXED + inet().len();
+        assert_eq!(
+            parse(&bytes[..end]),
+            done(Some("192.0.2.1"), V2_FIXED + 65535)
+        );
+        assert_eq!(parse(&bytes[..end - 1]), Parsed::Incomplete);
     }
 
     /// A stream of the bytes of `bytes`, which then ends.
@@ -540,6 +585,78 @@ mod tests {
         assert_eq!(rest.prefix.capacity(), 0);
     }
 
+    /// A stream that gives one byte for each read.
+    struct ByteByByte {
+        bytes: Vec<u8>,
+        at: usize,
+    }
+
+    impl AsyncRead for ByteByByte {
+        fn poll_read(
+            self: Pin<&mut Self>,
+            _: &mut Context<'_>,
+            buf: &mut [u8],
+        ) -> Poll<io::Result<usize>> {
+            let this = self.get_mut();
+            if buf.is_empty() || this.at == this.bytes.len() {
+                return Poll::Ready(Ok(0));
+            }
+            buf[0] = this.bytes[this.at];
+            this.at += 1;
+            Poll::Ready(Ok(1))
+        }
+    }
+
+    /// A version 2 header with the largest TLV area, and the bytes of the
+    /// application after it.
+    fn largest_v2_and_payload() -> (Vec<u8>, Vec<u8>) {
+        let mut block = inet();
+        block.resize(usize::from(u16::MAX), 0xa5);
+        let payload: Vec<u8> = (0..3 * READ_CHUNK + 17).map(|i| i as u8).collect();
+        (v2(0x21, 0x11, &block), payload)
+    }
+
+    /// The bytes after a version 2 header with the largest TLV area come
+    /// first from the stream, each one time and in order. The prefix of the
+    /// stream holds at most one read chunk.
+    #[test]
+    fn the_bytes_after_a_largest_tlv_area_stay() {
+        let (header, payload) = largest_v2_and_payload();
+        let bytes = [header, payload.clone()].concat();
+        let (source, mut rest) =
+            rt::block_on(read_header(stream(bytes), Duration::from_secs(5))).unwrap();
+        assert_eq!(source, Some("192.0.2.1".parse().unwrap()));
+        assert!(rest.prefix.capacity() <= READ_CHUNK);
+        let mut out = Vec::new();
+        rt::block_on(rest.read_to_end(&mut out)).unwrap();
+        assert_eq!(out, payload);
+    }
+
+    /// A header that arrives one byte at a time gives its source, and the
+    /// bytes after it stay.
+    #[test]
+    fn a_header_read_byte_by_byte_gives_its_source() {
+        let request = b"GET / HTTP/1.1\r\n\r\n".to_vec();
+        let (largest, payload) = largest_v2_and_payload();
+        for (header, after) in [
+            (
+                b"PROXY TCP4 192.0.2.1 192.0.2.2 1 2\r\n".to_vec(),
+                request.clone(),
+            ),
+            (v2(0x21, 0x11, &inet()), request.clone()),
+            (largest, payload),
+        ] {
+            let bytes = [header, after.clone()].concat();
+            let slow = ByteByByte { bytes, at: 0 };
+            let (source, mut rest) =
+                rt::block_on(read_header(slow, Duration::from_secs(5))).unwrap();
+            assert_eq!(source, Some("192.0.2.1".parse().unwrap()));
+            let mut out = Vec::new();
+            rt::block_on(rest.read_to_end(&mut out)).unwrap();
+            assert_eq!(out, after);
+        }
+    }
+
     /// A stream that ends inside the header, a bad header, and an empty
     /// stream give no result.
     #[test]
@@ -549,6 +666,7 @@ mod tests {
             b"PROXY TCP4 192.0.2.1",
             b"GET / HTTP/1.1\r\n\r\n",
             &V2_SIGNATURE[..5],
+            &largest_v2_and_payload().0[..2 * READ_CHUNK],
         ] {
             let read = rt::block_on(read_header(stream(bytes.to_vec()), Duration::from_secs(5)));
             assert!(read.is_none(), "{bytes:?}");

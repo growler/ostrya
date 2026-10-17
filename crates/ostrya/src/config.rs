@@ -680,7 +680,7 @@ impl Repo {
     /// - [`Error::Io`] if a lock file or the removal fails on the file system.
     pub async fn remove_remote_keyring(&self, remote: &str) -> Result<()> {
         let name = remote_keyring_name(remote);
-        self.write_locked(move |repo| remove_root_file_blocking(repo.repo_fd(), &name))
+        self.write_locked(move |repo| remove_root_file_blocking(repo.repo_fd(), &name).map(drop))
             .await
     }
 }

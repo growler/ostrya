@@ -75,10 +75,12 @@ pub struct ReceivePolicy {
     /// Privileged content is a setuid or setgid mode bit, or the
     /// `security.capability` or `security.selinux` extended attribute.
     pub allow_privileged: bool,
-    /// The keys that the server signs the regenerated summary with, in order.
+    /// The keys that the server signs each regenerated summary with, in
+    /// order.
     pub summary_signers: Vec<Arc<ServerSigner>>,
-    /// The switch that regenerates the summary after a session that writes a
-    /// ref.
+    /// The switch that regenerates the summary of each auth item, as
+    /// [`Repo::regenerate_summaries`](crate::Repo::regenerate_summaries)
+    /// writes them, after a session that writes a ref.
     pub update_summary: bool,
     /// The detached-metadata keys that the repository does not store.
     ///
@@ -299,7 +301,7 @@ pub(super) trait SessionPolicy: Send + Sync {
     /// a ref.
     fn regenerates_summary(&self) -> bool;
 
-    /// Returns the keys that sign the regenerated summary.
+    /// Returns the keys that sign each regenerated summary.
     fn summary_keys(&self) -> &[Arc<ServerSigner>];
 
     /// Returns the name of the client group of the session, for the report.

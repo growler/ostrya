@@ -750,30 +750,259 @@ fn a_mirror_of_the_own_collection_takes_the_local_rights() {
     });
 }
 
-/// `summary` and `summary.sig` are served with no client group alone.
+/// Creates a `bare-user` repository under `base` with a commit on `main`,
+/// writes that commit to each ref path of `refs`, and appends `groups` to the
+/// config. Returns the repository, opened again so its config holds the
+/// groups, and the commit.
+async fn repo_with_refs(base: &Path, groups: &str, refs: &[&str]) -> (Repo, Checksum) {
+    let src = build_tree(base);
+    let (path, _, commit) = repo_of(base, RepoMode::BareUser, &src).await;
+    for rel in refs {
+        let file = path.join(rel);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(&file, format!("{commit}\n")).unwrap();
+    }
+    let mut text = fs::read_to_string(path.join("config")).unwrap();
+    text.push_str(groups);
+    fs::write(path.join("config"), text).unwrap();
+    (Repo::open(&path).await.unwrap(), commit)
+}
+
+/// The path of the `.access` file of `item`, relative to the repository
+/// root.
+fn access_file(item: &str) -> String {
+    format!(
+        "extensions/ostrya/summary/{}.access",
+        Checksum::sha256(item.as_bytes())
+    )
+}
+
+/// The client groups of the summary tests: `anonymous` reads `pub/**` but
+/// `pub/secret`, `ssh:ci` reads each ref, and `ssh:ops` has no summary.
+const SUMMARY_GROUPS: &str = "[ex-ostrya client \"public\"]\nauth=anonymous\nallow=r:pub/**\n\
+                              deny=pub/secret\nsummary=true\n\
+                              [ex-ostrya client \"ci\"]\nauth=ssh:ci\nallow=r:**\nsummary=true\n\
+                              [ex-ostrya client \"ops\"]\nauth=ssh:ops\nallow=r:**\n";
+
+/// Returns the names of the refs in field 0 of a summary.
+fn summary_names(bytes: &[u8]) -> Vec<String> {
+    ostrya::Summary::parse(bytes)
+        .unwrap()
+        .refs
+        .into_iter()
+        .map(|entry| entry.name)
+        .collect()
+}
+
+/// The view serves the summary of the item of the client: the files at the
+/// root for `anonymous`, and the files under `extensions/ostrya/summary/` for
+/// each other item. An item with no summary gets not found, and so does a
+/// direct request of a file under `extensions/ostrya/`.
 #[test]
-fn the_summary_is_served_with_no_client_group_alone() {
-    let tmp = TmpDir::new("view-summary-rights");
+fn the_summary_of_each_item_is_served() {
+    let tmp = TmpDir::new("view-summary-items");
     block_on(async {
-        let files = ["summary", "summary.sig"];
-        let open = repo_with_files(&tmp.path().join("open"), None, "", &files).await;
-        let view = ArchiveView::new(open.clone());
-        let access = repo_access(&open, "anonymous");
-        for path in files {
-            assert!(serves(&view, path, &access).await, "{path}");
-        }
-        let closed = repo_with_files(
-            &tmp.path().join("closed"),
-            None,
-            "[ex-ostrya client \"c\"]\nauth=anonymous\nallow=r:**\n",
-            &files,
+        let (repo, _) = repo_with_refs(
+            tmp.path(),
+            SUMMARY_GROUPS,
+            &["refs/heads/pub/a", "refs/heads/pub/secret"],
         )
         .await;
-        let view = ArchiveView::new(closed.clone());
-        let access = repo_access(&closed, "anonymous");
-        for path in files {
-            assert!(!serves(&view, path, &access).await, "{path}");
+        let signer = ostrya::DummySigner::new(b"sig".to_vec());
+        repo.regenerate_summaries(&SummaryOptions::default(), &[&signer])
+            .await
+            .unwrap();
+        let view = ArchiveView::new(repo.clone());
+        let root = repo.path();
+
+        let anonymous = repo_access(&repo, "anonymous");
+        for path in ["summary", "summary.sig"] {
+            assert!(serves(&view, path, &anonymous).await, "{path}");
+            let (_, bytes) = read_all(view.get(path, &anonymous).await.unwrap()).await;
+            assert_eq!(bytes, fs::read(root.join(path)).unwrap(), "{path}");
         }
+        let (_, bytes) = read_all(view.get("summary", &anonymous).await.unwrap()).await;
+        assert_eq!(summary_names(&bytes), ["pub/a"]);
+
+        let ci = repo_access(&repo, "ssh:ci");
+        let stem = Checksum::sha256(b"ssh:ci").to_hex();
+        let (_, bytes) = read_all(view.get("summary", &ci).await.unwrap()).await;
+        let stored = format!("extensions/ostrya/summary/{stem}");
+        assert_eq!(bytes, fs::read(root.join(&stored)).unwrap());
+        assert_eq!(summary_names(&bytes), ["main", "pub/a", "pub/secret"]);
+        let (_, sig) = read_all(view.get("summary.sig", &ci).await.unwrap()).await;
+        assert_eq!(sig, fs::read(root.join(format!("{stored}.sig"))).unwrap());
+        assert_eq!(
+            repo.read_summary_of(&ci.item().clone()).await.unwrap(),
+            Some(bytes)
+        );
+
+        let ops = repo_access(&repo, "ssh:ops");
+        for path in ["summary", "summary.sig"] {
+            assert!(matches!(
+                view.get(path, &ops).await.unwrap(),
+                ArchiveAnswer::NotFound
+            ));
+            assert_eq!(view.head(path, &ops).await.unwrap(), ArchiveHead::NotFound);
+        }
+        let ops_stem = Checksum::sha256(b"ssh:ops").to_hex();
+        assert!(
+            !root
+                .join(format!("extensions/ostrya/summary/{ops_stem}"))
+                .exists()
+        );
+
+        for path in [stored.clone(), access_file("anonymous")] {
+            assert!(matches!(
+                view.get(&path, &ci).await.unwrap(),
+                ArchiveAnswer::NotFound
+            ));
+        }
+    });
+}
+
+/// A summary whose `.access` file holds another digest than the access
+/// digest of the item, or does not exist while the summary exists, is stale
+/// on a `GET` and a `HEAD`. With no `.access` file and no file, the file is
+/// not found. A change to `allow` makes the summary stale until the
+/// summaries are written again.
+#[test]
+fn a_summary_with_no_matching_access_file_is_stale() {
+    let tmp = TmpDir::new("view-summary-stale");
+    block_on(async {
+        let (repo, _) = repo_with_refs(tmp.path(), SUMMARY_GROUPS, &["refs/heads/pub/a"]).await;
+        repo.regenerate_summary(&SummaryOptions::default())
+            .await
+            .unwrap();
+        let view = ArchiveView::new(repo.clone());
+        let anonymous = repo_access(&repo, "anonymous");
+        let stale = |answer: ArchiveAnswer| match answer {
+            ArchiveAnswer::StaleSummary { item } => item.to_string(),
+            other => panic!("{other:?}"),
+        };
+        let access = repo.path().join(access_file("anonymous"));
+        let digest = fs::read(&access).unwrap();
+        assert_eq!(digest.len(), 65);
+
+        for body in [None, Some(b"0\n".to_vec()), Some(digest[..64].to_vec())] {
+            let absent = body.is_none();
+            match body {
+                Some(body) => fs::write(&access, body).unwrap(),
+                None => fs::remove_file(&access).unwrap(),
+            }
+            for path in ["summary", "summary.sig"] {
+                // The repository holds no `summary.sig`.
+                if absent && path == "summary.sig" {
+                    let answer = view.get(path, &anonymous).await.unwrap();
+                    assert!(matches!(answer, ArchiveAnswer::NotFound), "{answer:?}");
+                    let head = view.head(path, &anonymous).await.unwrap();
+                    assert_eq!(head, ArchiveHead::NotFound);
+                    continue;
+                }
+                let answer = view.get(path, &anonymous).await.unwrap();
+                assert_eq!(stale(answer), "anonymous", "{path}");
+                let head = view.head(path, &anonymous).await.unwrap();
+                assert_eq!(head, ArchiveHead::StaleSummary, "{path}");
+            }
+        }
+        fs::write(&access, &digest).unwrap();
+        assert!(serves(&view, "summary", &anonymous).await);
+
+        let text = fs::read_to_string(repo.path().join("config")).unwrap();
+        let changed = text.replace("allow=r:pub/**\n", "allow=r:pub/**;r:main\n");
+        fs::write(repo.path().join("config"), changed).unwrap();
+        let reopened = Repo::open(repo.path()).await.unwrap();
+        let anonymous = repo_access(&reopened, "anonymous");
+        let answer = view.get("summary", &anonymous).await.unwrap();
+        assert_eq!(stale(answer), "anonymous");
+        reopened
+            .regenerate_summary(&SummaryOptions::default())
+            .await
+            .unwrap();
+        let (_, bytes) = read_all(view.get("summary", &anonymous).await.unwrap()).await;
+        assert_eq!(summary_names(&bytes), ["main", "pub/a"]);
+    });
+}
+
+/// An exact group with `summary=false` under a group of `*` with
+/// `summary=true` makes the summary stale. The exact group takes the refs of
+/// its collection from the summary, so the summary that the group of `*`
+/// gave holds refs that the item no more gets.
+#[test]
+fn an_exact_group_with_no_summary_makes_the_summary_stale() {
+    let tmp = TmpDir::new("view-summary-exact");
+    block_on(async {
+        let any = "[ex-ostrya client \"any\"]\nauth=anonymous\ncollection=*\nallow=r:**\n\
+                   summary=true\n";
+        let refs = ["refs/mirrors/a.b/public", "refs/mirrors/a.b/secret"];
+        let (repo, _) = repo_with_refs(tmp.path(), any, &refs).await;
+        repo.regenerate_summary(&SummaryOptions::default())
+            .await
+            .unwrap();
+        let view = ArchiveView::new(repo.clone());
+        let anonymous = repo_access(&repo, "anonymous");
+        let (_, bytes) = read_all(view.get("summary", &anonymous).await.unwrap()).await;
+        let map = ostrya::Summary::parse(&bytes)
+            .unwrap()
+            .collection_map()
+            .unwrap();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map[0].1.len(), 2);
+
+        let config = repo.path().join("config");
+        let mut text = fs::read_to_string(&config).unwrap();
+        text.push_str(
+            "[ex-ostrya client \"exact\"]\nauth=anonymous\ncollection=a.b\nallow=r:public\n",
+        );
+        fs::write(&config, text).unwrap();
+        let reopened = Repo::open(repo.path()).await.unwrap();
+        let anonymous = repo_access(&reopened, "anonymous");
+        for path in ["summary", "summary.sig"] {
+            let answer = view.get(path, &anonymous).await.unwrap();
+            assert!(
+                matches!(answer, ArchiveAnswer::StaleSummary { .. }),
+                "{path}: {answer:?}"
+            );
+        }
+        reopened
+            .regenerate_summary(&SummaryOptions::default())
+            .await
+            .unwrap();
+        let (_, bytes) = read_all(view.get("summary", &anonymous).await.unwrap()).await;
+        let summary = ostrya::Summary::parse(&bytes).unwrap();
+        assert!(
+            summary
+                .metadata_value("ostree.summary.collection-map")
+                .is_none()
+        );
+    });
+}
+
+/// A symlink at `extensions/ostrya` is refused: the view does not serve the
+/// summary, and the writer does not write through it.
+#[test]
+fn a_symlink_at_the_summary_directory_is_refused() {
+    let tmp = TmpDir::new("view-summary-symlink");
+    block_on(async {
+        let (repo, _) = repo_with_refs(tmp.path(), SUMMARY_GROUPS, &[]).await;
+        repo.regenerate_summary(&SummaryOptions::default())
+            .await
+            .unwrap();
+        let elsewhere = tmp.path().join("elsewhere");
+        fs::rename(repo.path().join("extensions/ostrya"), &elsewhere).unwrap();
+        symlink(&elsewhere, repo.path().join("extensions/ostrya")).unwrap();
+        let view = ArchiveView::new(repo.clone());
+        for item in ["anonymous", "ssh:ci"] {
+            let access = repo_access(&repo, item);
+            assert!(!serves(&view, "summary", &access).await, "{item}");
+        }
+        let err = repo
+            .regenerate_summary(&SummaryOptions::default())
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("extensions/ostrya"), "{err}");
+        let ci = ostrya::access::AuthItem::parse("ssh:ci").unwrap();
+        assert!(repo.read_summary_of(&ci).await.is_err());
     });
 }
 

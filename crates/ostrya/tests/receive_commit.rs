@@ -2560,6 +2560,60 @@ fn summary_is_regenerated_and_signed_from_the_built_bytes() {
     assert!(!repo.path().join("summary.sig").exists());
 }
 
+/// The session writes the summary of each auth item of the client groups of
+/// the config, signs each one, and writes the `.access` file of each item.
+/// An item with no summary gets no file, and with no summary of `anonymous`
+/// the root holds no summary.
+#[test]
+fn the_session_writes_the_summary_of_each_item() {
+    let tmp = TmpDir::new("recv-summary-items");
+    let repo = new_repo(
+        &tmp,
+        RepoMode::Archive,
+        "[ex-ostrya client \"ci\"]\nauth=ssh:ci\nallow=r:test/**\nsummary=true\n\
+         [ex-ostrya client \"ops\"]\nauth=ssh:ops\nallow=r:**\n",
+    );
+    let signed = ReceivePolicy {
+        update_summary: true,
+        summary_signers: vec![server_signer(SERVER_SECRET_B64)],
+        ..policy()
+    };
+    let report = committed(push(
+        &repo,
+        &signed,
+        &fixture_objects(Encoding::Raw),
+        &[],
+        vec![update(
+            "test/main",
+            Expected::Absent,
+            Some(fixture_commit()),
+        )],
+        false,
+    ));
+    assert_eq!(report.warnings, vec![]);
+    assert!(!repo.path().join("summary").exists());
+    let ci = ostrya::access::AuthItem::parse("ssh:ci").unwrap();
+    let bytes = block_on(repo.read_summary_of(&ci)).unwrap().unwrap();
+    let summary = Summary::parse(&bytes).unwrap();
+    assert_eq!(summary.lookup("test/main"), Some(fixture_commit()));
+    let dir = repo.path().join("extensions/ostrya/summary");
+    let stem = ostrya::Checksum::sha256(b"ssh:ci");
+    let sig = std::fs::read(dir.join(format!("{stem}.sig"))).unwrap();
+    let sig = ostrya::from_bytes(&ostrya::Type::parse("a{sv}").unwrap(), &sig).unwrap();
+    assert_eq!(
+        signatures(&sig, ED25519_KEY),
+        vec![ed25519_signature(SERVER_SECRET_B64, &bytes)]
+    );
+    let access = ostrya::access::ClientAccess::from_config(repo.config(), repo.path()).unwrap();
+    let digest = access.summary_digest(&ci).unwrap();
+    assert_eq!(
+        std::fs::read(dir.join(format!("{stem}.access"))).unwrap(),
+        format!("{digest}\n").into_bytes()
+    );
+    let ops = ostrya::Checksum::sha256(b"ssh:ops");
+    assert!(!dir.join(format!("{ops}.access")).exists());
+}
+
 /// If a summary write fails after the commit, the report holds a warning. The
 /// refs stay written, and the client gets `CommitReply`.
 #[test]

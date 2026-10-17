@@ -57,11 +57,13 @@ pub struct ReceiveWarning {
 /// The steps after the transaction commit of a session.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReceiveStep {
-    /// The build of the regenerated summary.
+    /// The build of a regenerated summary.
     SummaryBuild,
-    /// The signing of the regenerated summary with a key of the policy.
+    /// The signing of a regenerated summary with a key of the policy.
     SummarySign,
-    /// The write of the regenerated summary and of its signatures.
+    /// The write of a regenerated summary, of its signatures, or of its
+    /// `.access` file, or the removal of the files of an item with no
+    /// summary.
     SummaryWrite,
     /// The removal of the partial marker of one commit of the session.
     ///

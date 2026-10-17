@@ -369,8 +369,9 @@ fn send_refuses_a_name_with_no_ssh_item() {
 }
 
 /// The session serves the refs that the group of `ssh:NAME` reads. Another
-/// ref and the summary get the reply of an absent path, and `ListRefs`
-/// holds the readable refs alone. Objects and `config` are served.
+/// ref and the summary of an item with no summary get the reply of an
+/// absent path, and `ListRefs` holds the readable refs alone. Objects and
+/// `config` are served.
 #[test]
 fn send_serves_the_readable_refs_of_the_name() {
     let tmp = TmpDir::new("rights");
@@ -399,6 +400,16 @@ fn send_serves_the_readable_refs_of_the_name() {
     assert_eq!(names, ["test/main"]);
 }
 
+/// Runs `ostrya summary -u` on `repo`.
+fn summary_update(repo: &Path) {
+    let repo_arg = format!("--repo={}", repo.display());
+    run(
+        env!("CARGO_BIN_EXE_ostrya"),
+        &["summary", "-u", &repo_arg],
+        repo,
+    );
+}
+
 /// In a repository with no client group, the session takes the item
 /// `anonymous` of the implicit groups: it serves each ref and the summary,
 /// whatever the client name.
@@ -408,7 +419,7 @@ fn send_with_no_client_group_serves_each_ref() {
     let repo = archive_copy(&tmp.0);
     let heads = repo.join("refs/heads");
     std::fs::copy(heads.join("test/main"), heads.join("secret")).unwrap();
-    std::fs::write(repo.join("summary"), b"summary").unwrap();
+    summary_update(&repo);
     let input = frames(&[
         pull_hello(1),
         Message::Get("refs/heads/test/main".to_owned()),
@@ -419,6 +430,59 @@ fn send_with_no_client_group_serves_each_ref() {
     let out = send(&repo, &[], input);
     assert!(out.status.success(), "{out:?}");
     assert_eq!(found(&out), [true, true, true, false]);
+    let summary = &messages(&out.stdout)[3].1;
+    assert_eq!(summary, &std::fs::read(repo.join("summary")).unwrap());
+    let parsed = ostrya::Summary::parse(summary).unwrap();
+    let names: Vec<&str> = parsed.refs.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(names, ["secret", "test/main"]);
+}
+
+/// The session serves the summary of the item `ssh:NAME`, which
+/// `ostrya summary -u` writes under `extensions/ostrya/summary/`. When a
+/// change to the client groups makes the summary stale, `summary` gets the
+/// reply of an absent path, and the command writes one `error:` line in the
+/// session.
+#[test]
+fn send_serves_the_summary_of_the_name() {
+    let tmp = TmpDir::new("item-summary");
+    let repo = archive_copy(&tmp.0);
+    let heads = repo.join("refs/heads");
+    std::fs::copy(heads.join("test/main"), heads.join("secret")).unwrap();
+    add_groups(
+        &repo,
+        "[ex-ostrya client \"puller\"]\nauth=ssh:puller\nallow=r:test/**\nsummary=true\n",
+    );
+    summary_update(&repo);
+    assert!(!repo.join("summary").exists());
+    let stem = ostrya::Checksum::sha256(b"ssh:puller");
+    let stored = std::fs::read(repo.join(format!("extensions/ostrya/summary/{stem}"))).unwrap();
+    let input = || {
+        frames(&[
+            pull_hello(1),
+            Message::Get("summary".to_owned()),
+            Message::Get("summary".to_owned()),
+        ])
+    };
+    let out = send(&repo, &[], input());
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(found(&out), [true, true]);
+    assert_eq!(messages(&out.stdout)[1].1, stored);
+    let parsed = ostrya::Summary::parse(&stored).unwrap();
+    let names: Vec<&str> = parsed.refs.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(names, ["test/main"]);
+    assert!(out.stderr.is_empty(), "{out:?}");
+
+    let config = repo.join("config");
+    let text = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(&config, text.replace("allow=r:test/**", "allow=r:**")).unwrap();
+    let out = send(&repo, &[], input());
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(found(&out), [false, false]);
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "error: the summary of the auth item ssh:puller does not match the client groups, \
+         and the session does not serve it; run `ostrya summary -u`\n"
+    );
 }
 
 /// A directory under `refs/mirrors/` whose name is not a collection id

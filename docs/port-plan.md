@@ -211,7 +211,10 @@ bounded:
   `ostrya::access::ReadAccess` holds the read rights of one identified
   client. `ArchiveView`, the ref listing, and `Repo::send` take it, so each
   serves the refs that the client group of the item reads
-  (`format-reference.md`, "Read access").
+  (`format-reference.md`, "Read access"). `Repo::regenerate_summaries`
+  writes one summary for each auth item of the client groups, and the
+  archive view serves the summary of the identified item
+  (`format-reference.md`, "Summaries of auth items").
 - `ostrya-server` -- the HTTP server of `ostrya serve`, on Linux alone. It
   serves `ArchiveView` of `ostrya`, the archive view of a repository of any
   mode, over HTTP/1.1, and over TLS with ALPN for HTTP/2 and HTTP/1.1. With
@@ -488,14 +491,16 @@ repository lock shared first:
   the commit payload first and then removes the signatures under the locks.
   So two processes that sign one commit keep both signatures.
 - `Repo::sign_summary` and `Repo::sign_summary_all` take the locks before
-  the read of `summary` and hold them until `summary.sig` is written. A mirror
-  pull writes `summary` and `summary.sig` under a second hold, after its
+  the read of the first summary and hold them until the last signature file
+  is written. A mirror pull writes `summary` and `summary.sig`, and removes
+  the `.access` file of the `anonymous` item, under a second hold, after its
   commit.
-- The receive commit and `Repo::regenerate_summary` commit their
+- The receive commit and `Repo::regenerate_summaries` commit their
   transactions through the crate-private `Transaction::commit_under`, which
   takes a reference to the held lock and does not take it again.
-  `regenerate_summary` holds the lock from the read of the previous anchor
-  commit to the removal of `summary.sig`.
+  `regenerate_summaries` holds the lock from the read of the previous anchor
+  commit to the last removal of the files of an item with no summary. The
+  receive commit writes the summaries under the hold of its commit.
 - The CLI commands `config set`, `config unset`, `remote add`, and `remote
   delete` first decide each no-op and each refusal from the configuration
   that `Repo::open` read, and take no lock for it. A held lock, a
@@ -8621,8 +8626,7 @@ and the CI gates pass at its end.
 - `S6` -- PROXY protocol v1 and v2, the trusted proxies, and a client
   certificate from a proxy.
 - `S7` -- the claims in the URI SANs of a client certificate.
-- `S8` -- read access in the archive view and the ref listing, and the
-  summary rule.
+- `S8` -- read access in the archive view and the ref listing.
 - `S9` -- collection namespaces in the push path, and `push --tag`.
 - `S10` -- collection refs in the ref listing.
 - `S11` -- the update `ServerCommit`: the server builds the commit.
@@ -8631,6 +8635,16 @@ and the CI gates pass at its end.
 - `S14` -- `pull --collection`.
 - `S15` -- the closing checks: the `spec:` values, the man pages, the
   package `README.md` files, and the CI gates.
+
+The phase also writes one summary for each auth item. The client-group key
+`summary` adds the namespace of a group to the summary of each of its
+items. `ostrya summary -u` writes the summary of each item, signs each one,
+and writes an `.access` file with the access digest of the item.
+`ostrya serve` and `ostrya send` serve the summary of the identified item
+while its `.access` file holds the digest of the current client groups.
+`ostrya summary --auth-group=NAME` reads the summary of the item of one
+group. `format-reference.md`, "Summaries of auth items", states the files
+and the digest.
 
 Dependency set for the phase. `CLAUDE.md`, "Authorized: the `x509-cert`
 crate", states the measured graph.

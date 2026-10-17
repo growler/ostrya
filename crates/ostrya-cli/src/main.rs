@@ -315,12 +315,15 @@ enum Command {
     Sign(SignArgs),
     /// Regenerate, sign, or verify the repository summary.
     ///
-    /// With -u, the command writes `summary` from the refs of the repository
-    /// and signs it with the given keys. With --verify, it verifies the
-    /// signatures in `summary.sig`, and --verify takes precedence over -u.
-    /// Without these two options, a KEY-ID or a --keys-file signs the existing
-    /// summary. The read options --raw, -v, --list-metadata-keys, and
-    /// --print-metadata-key print the local summary. If no option gives an
+    /// With -u, the command writes the summary of each auth item of the
+    /// client groups from the refs of the repository, and signs each one
+    /// with the given keys. The summary of the `anonymous` item is `summary`
+    /// at the repository root. With --verify, it verifies the signatures in
+    /// `summary.sig`, and --verify takes precedence over -u. Without these
+    /// two options, a KEY-ID or a --keys-file signs each existing summary.
+    /// The read options --raw, -v, --list-metadata-keys, and
+    /// --print-metadata-key print the local summary, or with --auth-group the
+    /// summary of the item of one client group. If no option gives an
     /// action, the command exits 1.
     Summary(SummaryArgs),
     /// List, generate, apply, or index static deltas.
@@ -382,7 +385,9 @@ enum Command {
     /// over a group with `collection=*`. With no such group, `Hello` gets
     /// `ref-denied`. A session of a collection writes the refs under
     /// `refs/mirrors/ID/`. The session uses no `anonymous` and no `net:`
-    /// item.
+    /// item. With `[core] auto-update-summary=true`, a session that changes a
+    /// ref writes each summary again, as `ostrya summary -u` does, signed
+    /// with the key groups of `sign-summary`.
     /// Standard output carries the frames of the session alone. For each
     /// warning of the session, the command writes one `warning: STEP: MESSAGE`
     /// line to standard error. It writes nothing else, also under --verbose.
@@ -459,12 +464,25 @@ enum Command {
     /// collection refs that the client reads. A directory under
     /// `refs/mirrors/` whose name is not a collection id is not served and
     /// not listed. `refs/remotes/`, each other path
-    /// under `refs/`, and `extensions/ostrya/` get 404. `summary` and
-    /// `summary.sig` are served only when the repository has no client
-    /// group. Objects, deltas, `config`, and the other files under
-    /// `extensions/` are served to each identified client. A denied path gets
-    /// the 404 of an absent path. With no client group, each client reads
-    /// each local ref and each mirror ref.
+    /// under `refs/`, and `extensions/ostrya/` get 404. Objects, deltas,
+    /// `config`, and the other files under `extensions/` are served to each
+    /// identified client. A denied path gets the 404 of an absent path. With
+    /// no client group, each client reads each local ref and each mirror
+    /// ref.
+    ///
+    /// `summary` and `summary.sig` give the summary of the auth item of the
+    /// client, which `ostrya summary -u` writes. An item with no summary gets
+    /// 404. When the summary of the item does not match the client groups,
+    /// the request gets 404, and the command writes one `error:` line that
+    /// names the item and tells the operator to run `ostrya summary -u`, one
+    /// time for each item in each run. The responses of `summary` and
+    /// `summary.sig` carry `Cache-Control: private`. Also with no client
+    /// group, the summary needs the `.access` file of the `anonymous` item.
+    /// A mirror pull removes that file, and `summary` gets 404 until
+    /// `ostrya summary -u`. `ostree summary -u` leaves the file in place. In
+    /// a repository where `ostrya summary -u` never ran, a `summary` that it
+    /// wrote gets 404. Else the server serves that `summary` while the file
+    /// matches.
     ///
     /// The server takes its settings from `[ex-ostrya server]` of the
     /// repository config. Each option of the command with the name of a key
@@ -482,7 +500,9 @@ enum Command {
     /// the command writes one `warning: STEP: MESSAGE` line to standard error
     /// for each warning of the session. When a ref listing finds a directory
     /// under `refs/mirrors/` whose name is not a collection id, the command
-    /// writes one `warning:` line that names it, one time in each run.
+    /// writes one `warning:` line that names it, one time in each run. With
+    /// `[core] auto-update-summary=true`, each push that changes a ref writes
+    /// each summary again, signed with the key groups of `sign-summary`.
     #[cfg(feature = "serve")]
     Serve(ServeArgs),
     /// Serve one pull session over standard input and standard output.
@@ -505,16 +525,20 @@ enum Command {
     /// writes an error line and exits 1 before it reads standard input. The
     /// session uses no
     /// `anonymous` and no `net:` item. In a repository with no client group,
-    /// the session takes the item `anonymous`, so it serves each local ref,
-    /// each mirror ref, and the summary.
+    /// the session takes the item `anonymous`, so it serves each local ref and
+    /// each mirror ref. `summary` and `summary.sig` give the summary of the
+    /// item, as `ostrya serve` gives it.
     ///
     /// Standard output carries the frames of the session alone. On failure,
     /// the command writes `error: MESSAGE` to standard error. When a ref
     /// listing finds a directory under `refs/mirrors/` whose name is not a
     /// collection id, the command writes one `warning:` line that names it
-    /// to standard error, one time in each session. It exits 0 when standard
-    /// input ends at a frame boundary, and 1 after an `Error` frame or a
-    /// failed write.
+    /// to standard error, one time in each session. When the summary of the
+    /// item does not match the client groups, the session answers `summary`
+    /// and `summary.sig` as absent paths, and the command writes one `error:`
+    /// line to standard error, one time in each session. It exits 0 when
+    /// standard input ends at a frame boundary, and 1 after an `Error` frame
+    /// or a failed write.
     ///
     /// An `authorized_keys` entry with `command="ostrya send --repo=PATH"`
     /// limits an ssh key to a pull from one repository.
@@ -2008,13 +2032,29 @@ struct SignArgs {
 
 #[derive(Args)]
 struct SummaryArgs {
-    /// Regenerate the summary from the refs of the repository.
+    /// Regenerate the summary of each auth item from the refs of the
+    /// repository.
     ///
-    /// The command writes `summary` and removes `summary.sig`. Then it signs
-    /// the new summary with each --gpg-sign key, each --sign key, and each
-    /// KEY-ID and --keys-file key, in this order. The command checks every -m
-    /// value and every key before the regeneration, so a refusal leaves
-    /// `summary` and `summary.sig` as they were. The command prints nothing.
+    /// An auth item has a summary when one or more of its client groups has
+    /// `summary=true`. With no client group, the `anonymous` item has a
+    /// summary that holds each ref. The summary of an item holds the refs that
+    /// the item reads in each namespace whose selected group has
+    /// `summary=true`. A namespace whose selected group has `summary=false`
+    /// adds no ref. The summary of the `anonymous`
+    /// item is `summary` at the repository root, and the summary of each other
+    /// item is under `extensions/ostrya/summary/`. The command writes each
+    /// summary and replaces its signature file. Each summary gets a signature
+    /// of each --gpg-sign key, each --sign key, and each KEY-ID and
+    /// --keys-file key, in this order. The command writes the `.access` file
+    /// of each item last, and removes the files of each item that has no
+    /// summary. When the `anonymous` item has no summary, the command removes
+    /// `summary` and `summary.sig`.
+    ///
+    /// The command checks every -m value, every key, and the client groups
+    /// before the regeneration, so a refusal leaves each summary as it was.
+    /// For each directory under `refs/mirrors/` whose name is not a
+    /// collection id, the command writes one `warning:` line to standard
+    /// error. It prints nothing else.
     #[arg(short = 'u', long)]
     update: bool,
     /// View a report of the local summary file.
@@ -2137,11 +2177,25 @@ struct SummaryArgs {
     /// this option.
     #[arg(long)]
     remote: Option<String>,
+    /// Read the summary of the auth item of the client group NAME.
+    ///
+    /// This is an ostrya extension. It applies to -v, --raw,
+    /// --list-metadata-keys, and --print-metadata-key. The command reads the
+    /// file of the summary of the item, and does not compare its `.access`
+    /// file with the client groups. In a repository with no client group,
+    /// NAME is `anonymous` or `anonymous-collections`, the implicit groups.
+    /// The command refuses a group that does not exist, a group with
+    /// `summary=false`, and a group whose `auth` list holds more than one
+    /// item. It also refuses this option with -u, with --verify, with a
+    /// signing key, and with no read option.
+    #[arg(long, value_name = "NAME")]
+    auth_group: Option<String>,
     /// Signing or verification keys, in the format of `ostrya sign`.
     ///
-    /// This is an ostrya extension. With -u, the keys sign after every --sign
-    /// key. Without -u, they sign the existing summary, and the command then
-    /// ignores every read option. With --verify, they are the trusted keys.
+    /// This is an ostrya extension. With -u, the keys sign each summary after
+    /// every --sign key. Without -u, they sign each existing summary, and the
+    /// command then ignores every read option. With --verify, they are the
+    /// trusted keys.
     key_id: Vec<String>,
 }
 
@@ -2452,7 +2506,10 @@ struct PullArgs {
     /// remote lists, and fails if the remote serves no summary. This pull also
     /// copies the `summary` and `summary.sig` of the remote to this
     /// repository. If the remote has no `summary.sig`, the `summary.sig` of
-    /// this repository stays as it is. A pull of named refs copies no summary.
+    /// this repository stays as it is. The pull removes the `.access` file of
+    /// the `anonymous` item under `extensions/ostrya/summary/`, so `ostrya
+    /// serve` serves no summary until `ostrya summary -u`. A pull of named
+    /// refs copies no summary.
     #[arg(long)]
     mirror: bool,
     /// The number of parents of each pulled commit to follow.
@@ -3751,8 +3808,9 @@ fn ssh_client(client: Option<String>, name: &str) -> ostrya::access::AuthItem {
 ///
 /// Standard output carries the frames of the session alone. A failure goes to
 /// standard error as the error line of [`main`]. Each
-/// [`SendEvent`](ostrya::SendEvent) goes there as one `warning:` line. The
-/// command takes no lock and writes no file in the repository.
+/// [`SendEvent`](ostrya::SendEvent) goes there as one `warning:` line, or as
+/// one `error:` line for an event that is no warning. The command takes no
+/// lock and writes no file in the repository.
 #[cfg(feature = "send")]
 async fn send(repo: Repo, client: ostrya::access::AuthItem) -> Result<()> {
     use ostrya::access::{AuthItem, ClientAccess, ReadAccess};
@@ -3774,7 +3832,11 @@ async fn send(repo: Repo, client: ostrya::access::AuthItem) -> Result<()> {
     // buffer.
     let mut opts = ostrya::SendOptions::default();
     opts.on_event = Some(Arc::new(|event: &ostrya::SendEvent| {
-        eprintln!("warning: {event}");
+        if event.is_warning() {
+            eprintln!("warning: {event}");
+        } else {
+            eprintln!("error: {event}");
+        }
     }));
     repo.send_with(stdin_file()?, stdout_file()?, &access, &opts)
         .await
@@ -11172,6 +11234,10 @@ async fn sign(repo: Repo, repo_path: PathBuf, name: &str, args: SignArgs) -> Res
 
 /// Updates, verifies, signs, or reads the summary of the repository.
 async fn summary(repo: Repo, repo_path: PathBuf, args: SummaryArgs) -> Result<()> {
+    let item = match &args.auth_group {
+        Some(name) => Some(summary_auth_item(&repo, name, &args)?),
+        None => None,
+    };
     if args.verify {
         let engine = summary_sign_type(&args);
         let verifier = summary_verifier(&repo_path, engine, &args)?;
@@ -11209,7 +11275,62 @@ async fn summary(repo: Repo, repo_path: PathBuf, args: SummaryArgs) -> Result<()
     if !reading {
         return Err(summary_nothing_to_do());
     }
-    summary_read(&repo, &args).await
+    summary_read(&repo, &args, item.as_ref()).await
+}
+
+/// Returns the auth item of the client group `name` for `--auth-group`.
+///
+/// The checks of the options come first: the command refuses
+/// `--auth-group` with `--verify`, with `-u`, with a signing key, and with no
+/// read option. Then it reads the client groups, and refuses a group that
+/// does not exist, a group with `summary=false`, and a group with more than
+/// one auth item.
+fn summary_auth_item(
+    repo: &Repo,
+    name: &str,
+    args: &SummaryArgs,
+) -> Result<ostrya::access::AuthItem> {
+    let refuse = |why: &str| Err(Error::InvalidFormat(format!("--auth-group {why}")));
+    let reading =
+        args.raw || args.view || args.list_metadata_keys || args.print_metadata_key.is_some();
+    let signing = !args.sign.is_empty()
+        || !args.gpg_sign.is_empty()
+        || !args.key_id.is_empty()
+        || !args.keys_file.is_empty();
+    if args.verify {
+        return refuse("does not apply to --verify, which verifies `summary.sig`");
+    }
+    if args.update {
+        return refuse("does not apply to -u, which writes the summary of each item");
+    }
+    if signing {
+        return refuse("does not apply to a signing key");
+    }
+    if !reading {
+        return refuse(
+            "needs a read option: -v, --raw, --list-metadata-keys, or --print-metadata-key",
+        );
+    }
+    let access = ostrya::access::ClientAccess::from_config(repo.config(), repo.path())?;
+    let Some(group) = access.groups().iter().find(|group| group.name() == name) else {
+        return refuse(&format!("names no client group '{name}'"));
+    };
+    if !group.summary() {
+        return refuse(&format!(
+            "names the client group '{name}', which has summary=false"
+        ));
+    }
+    match group.auth() {
+        [item] => Ok(item.clone()),
+        items => {
+            let items: Vec<String> = items.iter().map(ToString::to_string).collect();
+            refuse(&format!(
+                "names the client group '{name}', whose auth list holds more than one item: \
+                 {}",
+                items.join(";")
+            ))
+        }
+    }
 }
 
 /// Returns the refusal for a `summary` command line that names nothing to do.
@@ -11233,11 +11354,13 @@ fn summary_sign_type(args: &SummaryArgs) -> SignType {
     }
 }
 
-/// Regenerates the summary and signs it with each key that the options name.
+/// Regenerates the summary of each auth item and signs each one with each key
+/// that the options name.
 ///
 /// Each argument is checked before the regeneration, so a refusal leaves
-/// `summary` and `summary.sig` as they were. The checks run in the order of
-/// the `ostree` command:
+/// each summary and its signature file as they were. The client groups are
+/// checked after the arguments. The checks of the arguments run in the order
+/// of the `ostree` command:
 ///
 /// 1. each `-m` argument, in command-line order
 /// 2. each `--gpg-sign` lookup
@@ -11247,7 +11370,9 @@ fn summary_sign_type(args: &SummaryArgs) -> SignType {
 ///
 /// Under the gpg engine, a `--sign` key and a positional key are looked up as
 /// a `--gpg-sign` selector is. The GPG signatures are written first, and the
-/// `--sign` signatures after them, in one write of `summary.sig`.
+/// `--sign` signatures after them, in one write of each signature file. Each
+/// directory under `refs/mirrors/` whose name is not a collection id gets one
+/// `warning:` line on standard error.
 async fn summary_update(repo: &Repo, args: &SummaryArgs) -> Result<()> {
     let additional_metadata = match summary_added_metadata(&args.add_metadata) {
         Ok(entries) => entries,
@@ -11279,13 +11404,31 @@ async fn summary_update(repo: &Repo, args: &SummaryArgs) -> Result<()> {
         }
     }
 
-    repo.regenerate_summary(&SummaryOptions {
+    let opts = SummaryOptions {
         last_modified: args.last_modified,
         metadata_commit_timestamp: args.metadata_commit_timestamp,
         additional_metadata,
-    })
-    .await?;
-    repo.sign_summary_all(&signer_refs(&signers)).await
+    };
+    let report = repo
+        .regenerate_summaries(&opts, &signer_refs(&signers))
+        .await?;
+    for name in &report.invalid_collection_dirs {
+        let name: String = name
+            .chars()
+            .map(|c| {
+                if c.is_ascii_control() {
+                    c.escape_default().to_string()
+                } else {
+                    c.to_string()
+                }
+            })
+            .collect();
+        eprintln!(
+            "warning: refs/mirrors/{name}: the directory name is not a collection id, and no \
+             summary holds its refs"
+        );
+    }
+    Ok(())
 }
 
 /// Returns a borrow of each boxed signer, in order, for a batch signing call.
@@ -11300,13 +11443,26 @@ fn signer_refs(signers: &[Box<dyn Signer>]) -> Vec<&dyn Signer> {
 /// standard output. This is a recorded divergence.
 const SUMMARY_ABSENT: &str = "opening summary: No such file or directory";
 
-/// Reports the local summary.
+/// Reports the local summary, or the summary of `item`.
 ///
 /// The output is the raw variant, the report, the metadata keys, or one
 /// metadata value. The precedence is that of the `ostree` command.
-async fn summary_read(repo: &Repo, args: &SummaryArgs) -> Result<()> {
-    let Some(bytes) = repo.read_summary().await? else {
-        exit_error(SUMMARY_ABSENT);
+async fn summary_read(
+    repo: &Repo,
+    args: &SummaryArgs,
+    item: Option<&ostrya::access::AuthItem>,
+) -> Result<()> {
+    let read = match item {
+        Some(item) => repo.read_summary_of(item).await?,
+        None => repo.read_summary().await?,
+    };
+    let Some(bytes) = read else {
+        match item {
+            Some(item) => exit_error(&format!(
+                "the summary of the auth item {item} does not exist; run `ostrya summary -u`"
+            )),
+            None => exit_error(SUMMARY_ABSENT),
+        }
     };
     print_summary_document(
         &bytes,

@@ -72,9 +72,10 @@ const KEY_CHECK_GROUP: &str = "remote";
 ///   and [`Repo::set_ref_alias_immediate`].
 /// - [`Repo::write_config`], [`Repo::remove_remote_keyring`], and, under the
 ///   `verify-gpg` feature, `Repo::gpg_import_keys`.
-/// - [`Repo::regenerate_summary`], [`Repo::sign_summary`],
-///   [`Repo::sign_summary_all`], and the `summary` and `summary.sig` writes
-///   of a mirror pull.
+/// - [`Repo::regenerate_summary`], [`Repo::regenerate_summaries`],
+///   [`Repo::sign_summary`], [`Repo::sign_summary_all`], and the `summary`
+///   and `summary.sig` writes of a mirror pull, with the removal of the
+///   `.access` file of the `anonymous` item.
 /// - [`Repo::write_commit_detached_metadata`], [`Repo::sign_commit`], and
 ///   [`Repo::delete_signatures`].
 ///

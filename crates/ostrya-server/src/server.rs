@@ -23,6 +23,7 @@ use crate::auth::{GroupAuth, Peer};
 use crate::cert::{ClientCert, ForwardedCerts};
 use crate::endpoint::{EndpointOptions, ReceiveEndpoint};
 use crate::error::{Error, Result};
+use crate::event::StaleSummaries;
 use crate::forwarded::Forwarding;
 use crate::options::ServeOptions;
 use crate::proxy_protocol::{self, Rewind};
@@ -79,13 +80,25 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 ///   [`ReadAccess`] of the item, as
 ///   [`ArchiveView`](ArchiveView#read-access) and
 ///   [`Repo::build_ref_listing`] state. A path that the client cannot read
-///   gets the 404 of an absent path. `summary` and `summary.sig` are served
-///   only with no client group.
+///   gets the 404 of an absent path.
+/// - `summary` and `summary.sig` give the files of the summary of the item
+///   of the client, which [`Repo::regenerate_summaries`] writes. An item
+///   with no summary gets 404. When the `.access` file of the item holds
+///   another digest than the access digest of the item, or does not exist
+///   while the file exists, the request gets 404, and the server reports one
+///   [`ServerEvent::StaleSummary`](crate::ServerEvent::StaleSummary) for
+///   each item in the life of the server. The server computes the digests
+///   at start, and reads the files for each request, so a new write of the
+///   summaries takes effect while the server runs. A 200 and a 404 of these
+///   two paths carry `Cache-Control: private`, because the body depends on
+///   the client. A 401 and a 403 do not.
 /// - With no receive policies, the server identifies no client. Each read
 ///   gets the rights of the `anonymous` item under the two implicit groups of
 ///   a config with no client group, with the collection id of the
-///   repository. Each local ref, each mirror ref, and the summary are
-///   served, and `refs/remotes/` is not.
+///   repository. Each local ref and each mirror ref are served, and
+///   `refs/remotes/` is not. `summary` and `summary.sig` are the files at
+///   the repository root, with the `.access` file of the `anonymous` item of
+///   these implicit groups.
 /// - The HTTP layer removes a `#` fragment before the routing, so the server
 ///   does not see a fragment.
 /// - The server percent-decodes the request path. Outside the ref listing,
@@ -176,6 +189,8 @@ pub struct Server {
     clients: Arc<Clients>,
     /// The ref listings of the server.
     listings: Arc<Listings>,
+    /// The stale summaries that the server reported.
+    stale: StaleSummaries,
     tls: Option<Arc<ServerConfig>>,
     body_timeout: Duration,
     proxy_protocol: bool,
@@ -296,7 +311,8 @@ pub async fn bind(repo: Repo, opts: ServeOptions) -> Result<Server> {
         view: Arc::new(ArchiveView::new(repo.clone())),
         repo,
         clients: Arc::new(clients),
-        listings: Arc::new(Listings::new(opts.on_event)),
+        listings: Arc::new(Listings::new(opts.on_event.clone())),
+        stale: StaleSummaries::new(opts.on_event),
         tls,
         body_timeout: opts.body_timeout,
         proxy_protocol: opts.proxy_protocol,
@@ -422,6 +438,7 @@ impl Server {
             view: self.view,
             repo: self.repo,
             listings: self.listings,
+            stale: self.stale,
             clients: self.clients,
             tls: self.tls,
             body_timeout: self.body_timeout,
@@ -441,6 +458,8 @@ struct Serving {
     repo: Repo,
     /// The ref listings of the server, over all connections.
     listings: Arc<Listings>,
+    /// The stale summaries that the server reported, over all connections.
+    stale: StaleSummaries,
     clients: Arc<Clients>,
     tls: Option<Arc<ServerConfig>>,
     body_timeout: Duration,
@@ -508,6 +527,7 @@ async fn serve_connection(
                     &serving.view,
                     &serving.repo,
                     &serving.listings,
+                    &serving.stale,
                     &serving.clients,
                     &stall,
                     req,

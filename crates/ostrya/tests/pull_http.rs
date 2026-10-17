@@ -1167,7 +1167,8 @@ fn an_empty_ref_list_with_no_branches_fails() {
 /// A mirror pull of all refs takes them from the summary and writes them under
 /// `refs/heads`. It copies the summary and its signature without change. Here
 /// the signature bytes are arbitrary. The remote turns on no summary
-/// verification, so the pull copies the bytes and does not read them.
+/// verification, so the pull copies the bytes and does not read them. The
+/// pull removes the `.access` file of the `anonymous` item.
 #[test]
 fn a_mirror_pull_writes_local_refs_and_copies_the_summary() {
     block_on(async {
@@ -1176,6 +1177,14 @@ fn a_mirror_pull_writes_local_refs_and_copies_the_summary() {
         std::fs::write(dir.path().join("remote/summary.sig"), SUMMARY_SIG).unwrap();
         let server = RepoServer::start(&dir.path().join("remote"), false).await;
         let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
+        dest.regenerate_summary(&ostrya::SummaryOptions::default())
+            .await
+            .unwrap();
+        let access = dir.path().join(format!(
+            "dest/extensions/ostrya/summary/{}.access",
+            Checksum::sha256(b"anonymous")
+        ));
+        assert!(access.exists());
 
         dest.pull(
             "origin",
@@ -1206,6 +1215,7 @@ fn a_mirror_pull_writes_local_refs_and_copies_the_summary() {
         // bytes.
         let signature = std::fs::read(dir.path().join("dest/summary.sig")).unwrap();
         assert_eq!(signature, SUMMARY_SIG);
+        assert!(!access.exists());
     });
 }
 

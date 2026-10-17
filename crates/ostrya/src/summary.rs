@@ -4,12 +4,16 @@
 //! of the repository and holds a dict of global metadata. A pull reads it to
 //! resolve refs and to find static deltas.
 //!
-//! - [`Repo::regenerate_summary`] writes `summary` from the local refs, with
-//!   the options in [`SummaryOptions`].
+//! - [`Repo::regenerate_summaries`] writes the summary of each auth item of
+//!   the client groups, with the options in [`SummaryOptions`], signs each
+//!   one, and returns a [`SummaryReport`]. The summary of the `anonymous`
+//!   item is `summary`. [`Repo::regenerate_summary`] writes them unsigned.
 //! - [`Repo::sign_summary`] and [`Repo::sign_summary_all`] add signatures to
-//!   `summary.sig`. [`Repo::verify_summary`] verifies them.
-//! - [`Repo::read_summary`] and [`Repo::read_summary_signature`] read the two
-//!   files.
+//!   each summary. [`Repo::verify_summary`] verifies the signatures in
+//!   `summary.sig`.
+//! - [`Repo::read_summary`] and [`Repo::read_summary_signature`] read
+//!   `summary` and `summary.sig`. [`Repo::read_summary_of`] reads the
+//!   summary of one auth item.
 //! - [`Repo::build_ref_listing`] builds a ref listing for one request: a
 //!   summary of the local refs and of the collection refs that two
 //!   [`RefSelector`] values select, with a size cap. It returns a
@@ -19,22 +23,26 @@
 //!   values.
 
 use std::collections::hash_map::Entry;
-use std::collections::{BTreeMap, HashMap};
-use std::os::fd::{AsFd, BorrowedFd};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::sync::Arc;
 
 use ostrya_core::{
-    Checksum, Commit, DirMeta, ObjectType, RefSelector, Type, Value, choose_offset_size,
+    Checksum, Commit, DirMeta, ObjectType, RefSelector, RepoMode, Type, Value, choose_offset_size,
     from_bytes, loose_path, to_bytes, tuple_field_from_bytes, write_offset,
 };
 use rustix::fs::{AtFlags, Mode, OFlags};
 use rustix::io::Errno;
 
-use crate::access::ReadAccess;
+use crate::access::{AuthItem, ClientAccess, ReadAccess, SummaryFiles};
 use crate::commit::{CommitOptions, append_dict_entry};
-use crate::deltagen::{STATIC_DELTAS_KEY, advertised_delta_map, parse_delta_name};
+use crate::deltagen::{
+    DeltaDigest, STATIC_DELTAS_KEY, advertised_delta_map, parse_delta_name, summary_delta_map,
+};
 use crate::error::{Error, Result};
 use crate::lock::{LockKind, UpdateLockHeld};
 use crate::mtree::MutableTree;
+use crate::perm;
 use crate::refs::RefSelection;
 use crate::remote::proto::MAX_REF_LISTING;
 use crate::repo::Repo;
@@ -130,6 +138,58 @@ pub struct RefListing {
     /// then reads no such directory. A server writes a warning for each
     /// name.
     pub invalid_collection_dirs: Vec<String>,
+}
+
+/// The report of [`Repo::regenerate_summaries`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct SummaryReport {
+    /// The name of each directory under `refs/mirrors/` whose name fails
+    /// the collection-id rule, sorted byte-wise, each one time.
+    ///
+    /// No summary holds a ref of these directories. A command writes a
+    /// warning for each name.
+    pub invalid_collection_dirs: Vec<String>,
+}
+
+/// The step at which [`Repo::write_summaries`] stopped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SummaryStep {
+    /// The read of the refs or of the deltas, or the build of a summary.
+    Build,
+    /// A signature of a summary.
+    Sign,
+    /// A write or a removal of a file.
+    Write,
+}
+
+/// A failure of [`Repo::write_summaries`]: the step, the key, and the
+/// error.
+///
+/// The receive path reads the step and the key for its warning.
+#[derive(Debug)]
+pub(crate) struct SummaryFailure {
+    #[cfg_attr(not(feature = "receive"), allow(dead_code))]
+    pub(crate) step: SummaryStep,
+    /// The name of the key whose signature failed, for
+    /// [`SummaryStep::Sign`].
+    #[cfg_attr(not(feature = "receive"), allow(dead_code))]
+    pub(crate) key: Option<String>,
+    pub(crate) error: Error,
+}
+
+/// The state of one run of [`Repo::write_summaries`].
+struct SummaryRun {
+    /// The client groups that give the items.
+    access: Arc<ClientAccess>,
+    /// The `ostree.summary.last-modified` value of each summary.
+    last_modified: u64,
+    /// The selection of each ref of the repository.
+    every: RefSelection,
+    /// The facts of the commit of each ref of `every`.
+    facts: HashMap<Checksum, CommitFacts>,
+    /// Each static delta of the repository, sorted by name.
+    deltas: Vec<DeltaDigest>,
 }
 
 /// One static delta that a delta map advertises.
@@ -469,51 +529,131 @@ pub struct SummaryOptions {
 
 /// Methods that write, read, sign, and verify the summary.
 impl Repo {
-    /// Writes the summary of the repository from its local refs.
+    /// Writes the summary of each auth item, unsigned.
     ///
-    /// The call writes `summary` atomically at the repository root, with the
-    /// mode `0644`. It removes `summary.sig`, because a new summary makes an
-    /// old signature invalid. If `[core] fsync` is `true`, the call syncs the
-    /// data of the file and the repository root directory.
+    /// The call is [`regenerate_summaries`](Repo::regenerate_summaries) with
+    /// no signer. It drops the report.
     ///
-    /// The checks of [`SummaryOptions::additional_metadata`] come before each
-    /// write and before each lock. A refusal writes nothing, the anchor commit
-    /// included.
+    /// # Errors
     ///
-    /// # Layout
+    /// The errors of [`regenerate_summaries`](Repo::regenerate_summaries).
+    pub async fn regenerate_summary(&self, opts: &SummaryOptions) -> Result<()> {
+        self.regenerate_summaries(opts, &[]).await.map(drop)
+    }
+
+    /// Writes the summary of each auth item that has a summary, and signs
+    /// each summary with `signers`.
     ///
-    /// The summary is a `(a(s(taya{sv}))a{sv})` GVariant. Field 0 lists the
-    /// refs under `refs/heads`, sorted byte-wise by name. Each entry holds:
+    /// The client groups of the config ([`ClientAccess::from_config`]) give
+    /// the auth items. An item has a summary when one or more of its groups
+    /// has `summary=true`. A config with no client group has the two
+    /// implicit groups, which set `summary=true`, so the `anonymous` item has
+    /// a summary that holds each ref.
+    ///
+    /// The checks of [`SummaryOptions::additional_metadata`] and of the
+    /// client groups come before each write and before each lock. A refusal
+    /// writes nothing, the anchor commit included.
+    ///
+    /// # Files
+    ///
+    /// `HEX` below is the SHA-256 digest, in 64 lowercase hex digits, of the
+    /// text of the item ([`AuthItem`] `Display`).
+    ///
+    /// - The summary of the `anonymous` item is `summary` and `summary.sig`
+    ///   at the repository root.
+    /// - The summary of each other item is `extensions/ostrya/summary/HEX`
+    ///   and `extensions/ostrya/summary/HEX.sig`.
+    /// - Each item with a summary, `anonymous` included, has
+    ///   `extensions/ostrya/summary/HEX.access`. It holds the access digest
+    ///   of the item ([`ClientAccess::summary_digest`]) in 64 lowercase hex
+    ///   digits and a newline.
+    ///
+    /// The call handles one item at a time, in the order of
+    /// [`ClientAccess::items`]. It builds the summary and makes each
+    /// signature. Then it writes the files of the item in this order:
+    ///
+    /// 1. When the `.access` file holds another digest, the call removes it.
+    /// 2. It removes the old signature file, writes the summary, and writes
+    ///    the new signature file if `signers` is not empty.
+    /// 3. It writes the `.access` file.
+    ///
+    /// So while the `.access` file of an item holds a digest, the summary
+    /// next to it is a summary of that digest. Each file is written
+    /// atomically, with the mode `0644`. If `[core] fsync` is `true`, the
+    /// call syncs the data of each file. It also syncs the directory of the
+    /// `.access` file after the removal of step 1 and after step 3, and the
+    /// directory of the summary before step 3.
+    ///
+    /// Then the call removes the files of each item that has no summary.
+    /// Under `extensions/ostrya/summary/`, it removes each file
+    /// `HEX`, `HEX.sig`, and `HEX.access` of no item with a summary, the
+    /// `.access` files first, and each temp file of these names that an
+    /// interrupted write left. It removes `HEX` and `HEX.sig` of the
+    /// `anonymous` item. It leaves each other entry. When the `anonymous`
+    /// item has no summary, it removes `summary` and `summary.sig` at the
+    /// repository root.
+    ///
+    /// The call creates `extensions/`, `extensions/ostrya/`, and
+    /// `extensions/ostrya/summary/` with the mode `0775`, less the
+    /// file-creation mask. In a `bare-user-shared` repository, it forces the
+    /// mode `02770` on each directory that it creates. It opens each of these
+    /// directories with no symlink followed.
+    ///
+    /// # Refs
+    ///
+    /// The summary of an item holds the refs that the item reads in each
+    /// namespace whose selected group has `summary=true`, by the rules of
+    /// [`build_ref_listing`](Repo::build_ref_listing) with empty selectors
+    /// for the local refs and for the collection refs. A namespace whose
+    /// selected group has `summary=false` adds no ref. Field 0 holds the
+    /// local refs, sorted byte-wise by name: the refs under `refs/heads` and,
+    /// in a repository with `[core] collection-id`, the refs under
+    /// `refs/mirrors/ID/` of that id, under their plain names. When the two
+    /// directories hold one name, field 0 holds the commit of the mirror ref.
+    /// The refs of each other collection go into
+    /// `ostree.summary.collection-map`. A directory under `refs/mirrors/`
+    /// whose name fails the collection-id rule is in no summary, and its
+    /// name is in [`SummaryReport::invalid_collection_dirs`].
+    ///
+    /// Each entry of field 0 and of the map holds:
     ///
     /// - the size of the commit object in bytes, in host order,
     /// - the 32-byte checksum of the commit,
     /// - a metadata dict of the ref: `ostree.commit.version` if the commit
     ///   records a version, then `ostree.commit.timestamp`, big-endian.
     ///
-    /// Field 1 is the global metadata dict. Its entries have a fixed order,
-    /// and the byte identity of the file depends on this order:
+    /// # Global metadata
+    ///
+    /// The summary is a `(a(s(taya{sv}))a{sv})` GVariant. Field 1 is the
+    /// global metadata dict. Its entries have a fixed order, and the byte
+    /// identity of the file depends on this order:
     ///
     /// 1. `ostree.summary.mode`, the mode of the repository.
     /// 2. `ostree.summary.last-modified`, big-endian
-    ///    ([`SummaryOptions::last_modified`]).
+    ///    ([`SummaryOptions::last_modified`]). Each summary of one call has
+    ///    the same value.
     /// 3. `ostree.summary.tombstone-commits`, the value of `[core]
     ///    tombstone-commits`.
-    /// 4. `ostree.static-deltas`, if the repository holds a delta.
-    /// 5. `ostree.summary.collection-map`, if the repository holds mirror
-    ///    refs.
+    /// 4. `ostree.static-deltas`, if the summary lists a delta.
+    /// 5. `ostree.summary.collection-map`, if the summary holds a collection
+    ///    ref.
     /// 6. `ostree.summary.indexed-deltas`, the value of `[core]
     ///    indexed-deltas`.
     /// 7. `ostree.summary.collection-id`, if `[core] collection-id` is set.
     ///
     /// The keys of [`SummaryOptions::additional_metadata`] come after these
-    /// entries.
+    /// entries, in each summary.
     ///
     /// # Static deltas
     ///
-    /// `ostree.static-deltas` maps the name of each delta under `deltas/` to
-    /// the SHA-256 digest of its `superblock`, as an `ay` variant. A pull uses
+    /// `ostree.static-deltas` maps the name of a delta under `deltas/` to the
+    /// SHA-256 digest of its `superblock`, as an `ay` variant. A pull uses
     /// the map to find a delta and to verify the superblock that it fetches.
     /// The entries are in the order of the delta names.
+    ///
+    /// When the summary holds each local ref and each collection ref of the
+    /// repository, the map holds each delta. Else it holds the deltas whose
+    /// target commit is the commit of a ref in the summary.
     ///
     /// The `ostree` command writes the map in hash-table order. This order
     /// depends on the set of names and, for some names, on the order of the
@@ -532,25 +672,33 @@ impl Repo {
     /// - has the timestamp that
     ///   [`SummaryOptions::metadata_commit_timestamp`] states.
     ///
-    /// Each regeneration adds a commit to the chain, and the summary lists the
-    /// new checksum of the anchor commit.
-    ///
-    /// The mirror refs `refs/mirrors/<collection>/<ref>` go into
-    /// `ostree.summary.collection-map`, grouped by collection. The collections
-    /// and the refs of each collection are sorted byte-wise.
+    /// Each regeneration adds a commit to the chain, and a summary whose item
+    /// reads `ostree-metadata` lists the new checksum of the anchor commit.
     ///
     /// The `ostree` command copies the caller keys into the metadata of the
     /// anchor commit. ostrya does not reproduce the order of these keys, so a
     /// repository with a collection id refuses each caller key.
     ///
+    /// # Signatures
+    ///
+    /// Each signer signs the exact bytes of each summary, in slice order. Two
+    /// summaries with the same bytes get the same signatures, which the
+    /// signers make one time. The signature file of a summary holds these
+    /// signatures alone, in the form of
+    /// [`sign_summary_all`](Repo::sign_summary_all). With no signer, the
+    /// call removes each signature file of the summaries that it writes. If
+    /// a signer fails, the summaries before the summary of the failure keep
+    /// their new files, and the summary of the failure and the summaries
+    /// after it keep their old files.
+    ///
     /// # Locks
     ///
     /// The call takes the repository lock shared and then the update lock, as
     /// [`begin_update`](Repo::begin_update) does. It holds both from the read
-    /// of the previous anchor commit to the removal of `summary.sig`. Because
-    /// of this hold, two regenerations never put their anchor commits on one
-    /// parent. The anchor commit commits under this hold and does not take the
-    /// update lock again.
+    /// of the previous anchor commit to the last removal. Because of this
+    /// hold, two regenerations never put their anchor commits on one parent.
+    /// The anchor commit commits under this hold and does not take the update
+    /// lock again.
     ///
     /// Regenerations run one at a time, in this process and across processes.
     /// A regeneration waits for each holder of an
@@ -563,24 +711,34 @@ impl Repo {
     ///
     /// - [`Error::InvalidFormat`] if a value of
     ///   [`SummaryOptions::additional_metadata`] is not a [`Value::Variant`],
-    ///   if `[core] lock-timeout-secs` is below `-1`, if a ref file is not
-    ///   UTF-8, or if the system clock is before the Unix epoch.
+    ///   if a client group or the server group is malformed
+    ///   ([`ClientAccess::from_config`]), if `[core] lock-timeout-secs` is
+    ///   below `-1`, if a ref file is not UTF-8, if the system clock is
+    ///   before the Unix epoch, or if `extensions`, `extensions/ostrya`, or
+    ///   `extensions/ostrya/summary` is not a directory.
     /// - [`Error::Unsupported`] if the repository has a collection id and
     ///   [`SummaryOptions::additional_metadata`] is not empty.
     /// - [`Error::Core`] if `[core] fsync`, `[core] locking`, `[core]
     ///   lock-timeout-secs`, `[core] tombstone-commits`, or `[core]
-    ///   indexed-deltas` does not parse, if a ref file holds no checksum, or if
-    ///   a commit object does not parse.
+    ///   indexed-deltas` does not parse, if a value of a client group does
+    ///   not parse, if a ref file holds no checksum, or if a commit object
+    ///   does not parse.
     /// - [`Error::LockTimeout`] if the wait for a lock passes `[core]
     ///   lock-timeout-secs`.
     /// - [`Error::ObjectNotFound`] if a ref names a commit that is not in the
     ///   object store.
+    /// - [`Error::Signature`], or the variant that the engine error converts
+    ///   to, if a signer fails.
     /// - In a repository with a collection id, an error of
     ///   [`transaction`](Repo::transaction) or of
     ///   [`Transaction::commit`](crate::Transaction::commit) for the anchor
     ///   commit.
     /// - [`Error::Io`] if a file system operation fails.
-    pub async fn regenerate_summary(&self, opts: &SummaryOptions) -> Result<()> {
+    pub async fn regenerate_summaries(
+        &self,
+        opts: &SummaryOptions,
+        signers: &[&dyn Signer],
+    ) -> Result<SummaryReport> {
         // A caller value the dict cannot hold is refused before the anchor
         // commit advances, so a refusal leaves the repository as it stood.
         if let Some((key, _)) = opts
@@ -602,8 +760,10 @@ impl Repo {
                 "summary metadata keys in a repository with a collection id".into(),
             ));
         }
-
-        let fsync = self.config().fsync()?;
+        // The client groups give the items. A malformed group is refused
+        // before the anchor advances.
+        let access = Arc::new(ClientAccess::from_config(self.config(), self.path())?);
+        self.config().fsync()?;
 
         // The repository lock comes before the update lock. The anchor
         // transaction takes the repository lock shared too, before the update
@@ -617,45 +777,221 @@ impl Repo {
 
         // A repository with a collection id advertises a new anchor commit, so
         // the anchor commit comes before the list of refs. It goes to
-        // refs/heads/ostree-metadata, and the summary must list its new
+        // refs/heads/ostree-metadata, and a summary must list its new
         // checksum.
         if let (Some(cid), Some(txn)) = (&collection_id, txn) {
             self.refresh_anchor_commit(txn, cid, opts, &held).await?;
         }
 
-        let bytes = self.build_summary(opts).await?;
-        self.write_root_file(SUMMARY_FILE, bytes, fsync).await?;
-        self.remove_root_file(SUMMARY_SIG_FILE).await?;
+        let report = self
+            .write_summaries(access, opts, signers)
+            .await
+            .map_err(|failure| failure.error)?;
         drop(held);
         drop(repo_lock);
-        Ok(())
+        Ok(report)
     }
 
-    /// Returns the bytes of the summary of the current refs, as
-    /// [`regenerate_summary`](Repo::regenerate_summary) writes them.
+    /// Writes the summary of each item of `access`, as
+    /// [`regenerate_summaries`](Repo::regenerate_summaries) states, and
+    /// removes the files of each other item.
     ///
-    /// The call writes nothing. In a repository with a collection id, it
-    /// writes no new anchor commit, and the summary lists the anchor that
-    /// `ostree-metadata` names. The caller checks the values of
-    /// [`SummaryOptions::additional_metadata`].
-    pub(crate) async fn build_summary(&self, opts: &SummaryOptions) -> Result<Vec<u8>> {
-        let collection_id = self.config().collection_id().map(str::to_owned);
-
-        // Field 0: the local refs, byte-wise sorted by name.
-        let mut heads = self.list_refs(None).await?;
-        heads.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-        let mirrors = self.mirror_refs_by_collection().await?;
-
-        // The commits of the local refs and then of the mirror refs, loaded
-        // in one pass on the blocking pool.
-        let commits = heads
-            .iter()
-            .chain(mirrors.values().flatten())
-            .map(|(_, commit)| *commit)
+    /// The caller holds the update lock, and the anchor commit is in place.
+    /// The call checks no value of [`SummaryOptions::additional_metadata`].
+    /// A failure names the step at which the call stopped.
+    pub(crate) async fn write_summaries(
+        &self,
+        access: Arc<ClientAccess>,
+        opts: &SummaryOptions,
+        signers: &[&dyn Signer],
+    ) -> std::result::Result<SummaryReport, SummaryFailure> {
+        let build = |error| SummaryFailure {
+            step: SummaryStep::Build,
+            key: None,
+            error,
+        };
+        let write = |error| SummaryFailure {
+            step: SummaryStep::Write,
+            key: None,
+            error,
+        };
+        let fsync = self.config().fsync().map_err(write)?;
+        let run = self.summary_run(access, opts).await.map_err(build)?;
+        let items: Vec<(AuthItem, SummaryFiles)> = run
+            .access
+            .items()
+            .filter_map(|item| {
+                let files = run.access.summary_files(item)?;
+                Some((item.clone(), files.clone()))
+            })
             .collect();
-        let mut facts = self.summary_commit_facts(commits).await?.into_iter();
-        let mut entry = |name: &str, commit: &Checksum| {
-            let fact = facts.next().expect("one fact for each commit of the pass");
+        // The signature file of each distinct summary of the run, by the
+        // SHA-256 digest of its bytes. Two items whose summaries have the
+        // same bytes share one signature file, so each signer signs each
+        // distinct summary one time.
+        let mut signed: HashMap<Checksum, Vec<u8>> = HashMap::new();
+        for (item, files) in &items {
+            let bytes = self.item_summary(&run, item, opts).await.map_err(build)?;
+            let signatures = if signers.is_empty() {
+                None
+            } else {
+                let key = Checksum::sha256(&bytes);
+                match signed.get(&key) {
+                    Some(signatures) => Some(signatures.clone()),
+                    None => {
+                        let signatures =
+                            sign_summary_bytes(&bytes, signers)
+                                .await
+                                .map_err(|(key, error)| SummaryFailure {
+                                    step: SummaryStep::Sign,
+                                    key,
+                                    error,
+                                })?;
+                        if let Some(signatures) = &signatures {
+                            signed.insert(key, signatures.clone());
+                        }
+                        signatures
+                    }
+                }
+            };
+            let repo = self.clone();
+            let item = item.clone();
+            let files = files.clone();
+            ostrya_rt::unblock(move || {
+                put_item_summary_blocking(&repo, &item, &bytes, signatures, &files, fsync)
+            })
+            .await
+            .map_err(write)?;
+        }
+        let kept: HashSet<String> = items.iter().map(|(_, files)| files.stem.clone()).collect();
+        let anonymous = items.iter().any(|(item, _)| *item == AuthItem::Anonymous);
+        let repo = self.clone();
+        ostrya_rt::unblock(move || remove_other_summaries_blocking(&repo, &kept, anonymous, fsync))
+            .await
+            .map_err(write)?;
+        Ok(SummaryReport {
+            invalid_collection_dirs: run.every.invalid_dirs,
+        })
+    }
+
+    /// Returns the state of one run of the summary writer: the selection of
+    /// each ref of the repository, the facts of the commits of these refs,
+    /// the static deltas, and the `ostree.summary.last-modified` value of
+    /// each summary.
+    async fn summary_run(
+        &self,
+        access: Arc<ClientAccess>,
+        opts: &SummaryOptions,
+    ) -> Result<SummaryRun> {
+        let last_modified = resolve_last_modified(opts.last_modified)?;
+        let all = RefSelector::parse([])?;
+        let own = self.config().collection_id();
+        let everyone = ReadAccess::new(
+            Arc::new(ClientAccess::implicit(own)),
+            AuthItem::Anonymous,
+            None,
+        );
+        let every = self.select_refs(&all, Some(&all), &everyone, None).await?;
+        let facts = self.commit_facts(commits_of(&every)).await?;
+        let deltas = self.static_delta_digests().await?;
+        Ok(SummaryRun {
+            access,
+            last_modified,
+            every,
+            facts,
+            deltas,
+        })
+    }
+
+    /// Returns the bytes of the summary of `item` in the run `run`.
+    ///
+    /// The call writes nothing. The caller checks the values of
+    /// [`SummaryOptions::additional_metadata`].
+    async fn item_summary(
+        &self,
+        run: &SummaryRun,
+        item: &AuthItem,
+        opts: &SummaryOptions,
+    ) -> Result<Vec<u8>> {
+        // With no client group, the item is `anonymous` under the implicit
+        // groups, which have `summary=true`. Its rights are the rights of the
+        // full selection of the run, so the call takes that selection.
+        let selected;
+        let selection = if run.access.has_client_groups() {
+            let all = RefSelector::parse([])?;
+            let read = ReadAccess::for_summary(run.access.clone(), item.clone());
+            selected = self.select_refs(&all, Some(&all), &read, None).await?;
+            &selected
+        } else {
+            &run.every
+        };
+        // A summary of each ref lists each delta. Each other summary lists
+        // the deltas to the commits of its refs, because another delta can
+        // name a commit that the item does not read.
+        let deltas: Vec<&DeltaDigest> = if same_refs(selection, &run.every) {
+            run.deltas.iter().collect()
+        } else {
+            let commits = commits_of(selection);
+            run.deltas
+                .iter()
+                .filter(|delta| commits.contains(&delta.to))
+                .collect()
+        };
+        let deltas = if deltas.is_empty() {
+            None
+        } else {
+            Some(summary_delta_map(
+                deltas
+                    .iter()
+                    .map(|delta| (delta.name.as_str(), &delta.digest)),
+            )?)
+        };
+        self.summary_bytes(
+            &selection.local,
+            &selection.collections,
+            &run.facts,
+            deltas,
+            run.last_modified,
+            &opts.additional_metadata,
+        )
+        .await
+    }
+
+    /// Returns the bytes of a summary of the local refs `local` and of the
+    /// collection refs `collections`, with the delta map `deltas`.
+    ///
+    /// `local` and each list of `collections` are sorted byte-wise by name.
+    /// `facts` holds the facts of the commits of the run. The call reads
+    /// each other commit one time.
+    /// The global metadata has the order of
+    /// [`regenerate_summaries`](Repo::regenerate_summaries), "Global metadata".
+    async fn summary_bytes(
+        &self,
+        local: &[(String, Checksum)],
+        collections: &BTreeMap<String, Vec<(String, Checksum)>>,
+        facts: &HashMap<Checksum, CommitFacts>,
+        deltas: Option<Value>,
+        last_modified: u64,
+        added: &[(String, Value)],
+    ) -> Result<Vec<u8>> {
+        // A ref can name a commit that the facts of the run do not hold, if
+        // the ref changed after the full selection.
+        let missing: HashSet<Checksum> = local
+            .iter()
+            .chain(collections.values().flatten())
+            .map(|(_, commit)| *commit)
+            .filter(|commit| !facts.contains_key(commit))
+            .collect();
+        let read = if missing.is_empty() {
+            HashMap::new()
+        } else {
+            self.commit_facts(missing).await?
+        };
+        let entry = |name: &str, commit: &Checksum| {
+            let fact = facts
+                .get(commit)
+                .or_else(|| read.get(commit))
+                .expect("the facts of each commit are in one of the two maps");
             ref_entry(
                 name,
                 fact.size,
@@ -664,31 +1000,27 @@ impl Repo {
                 fact.timestamp,
             )
         };
-        let ref_entries = heads
+        let ref_entries = local
             .iter()
             .map(|(name, commit)| entry(name, commit))
             .collect::<Result<Vec<_>>>()?;
-        let collection_map = if mirrors.is_empty() {
+        let collection_map = if collections.is_empty() {
             None
         } else {
-            let mut collections = Vec::with_capacity(mirrors.len());
-            for (collection, refs) in &mirrors {
+            let mut values = Vec::with_capacity(collections.len());
+            for (collection, refs) in collections {
                 let ref_values = refs
                     .iter()
                     .map(|(name, commit)| entry(name, commit))
                     .collect::<Result<Vec<_>>>()?;
-                collections.push(Value::Tuple(vec![
+                values.push(Value::Tuple(vec![
                     Value::Str(collection.clone()),
                     Value::Array(ref_values),
                 ]));
             }
-            Some(variant(
-                COLLECTION_MAP_SIGNATURE,
-                Value::Array(collections),
-            )?)
+            Some(variant(COLLECTION_MAP_SIGNATURE, Value::Array(values))?)
         };
 
-        let last_modified = resolve_last_modified(opts.last_modified)?;
         let mut metadata = Value::Array(Vec::new());
         append_dict_entry(
             &mut metadata,
@@ -705,9 +1037,7 @@ impl Repo {
             TOMBSTONE_KEY,
             variant("b", Value::Bool(self.config().tombstone_commits()?))?,
         )?;
-        // The deltas this repository holds, so a fetcher can find them without
-        // asking for an index file. Absent when the repository holds none.
-        if let Some(deltas) = self.static_deltas_summary_value().await? {
+        if let Some(deltas) = deltas {
             append_dict_entry(&mut metadata, STATIC_DELTAS_KEY, deltas)?;
         }
         if let Some(map) = collection_map {
@@ -718,14 +1048,14 @@ impl Repo {
             INDEXED_DELTAS_KEY,
             variant("b", Value::Bool(self.config().indexed_deltas()?))?,
         )?;
-        if let Some(cid) = &collection_id {
+        if let Some(cid) = self.config().collection_id() {
             append_dict_entry(
                 &mut metadata,
                 COLLECTION_ID_KEY,
-                variant("s", Value::Str(cid.clone()))?,
+                variant("s", Value::Str(cid.to_owned()))?,
             )?;
         }
-        for (key, value) in caller_entries(&metadata, &opts.additional_metadata) {
+        for (key, value) in caller_entries(&metadata, added) {
             append_dict_entry(&mut metadata, key, value.clone())?;
         }
 
@@ -983,6 +1313,39 @@ impl Repo {
         self.read_root_file(SUMMARY_FILE).await
     }
 
+    /// Returns the bytes of the summary of the auth item `item`, or `None` if
+    /// the file does not exist.
+    ///
+    /// The summary of the `anonymous` item is `summary` at the repository
+    /// root, which [`read_summary`](Repo::read_summary) reads. The summary of
+    /// each other item is `extensions/ostrya/summary/HEX`, where `HEX` is the
+    /// SHA-256 digest of the text of the item
+    /// ([`regenerate_summaries`](Repo::regenerate_summaries), "Files"). The call
+    /// opens each component with no symlink followed. It does not compare the
+    /// `.access` file of the item with the client groups. The read stops at
+    /// 64 MiB, as for [`read_summary`](Repo::read_summary).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidFormat`] if `extensions`, `extensions/ostrya`, or
+    ///   `extensions/ostrya/summary` is not a directory.
+    /// - [`Error::Io`] if the read fails, for example if the file is a
+    ///   symlink.
+    pub async fn read_summary_of(&self, item: &AuthItem) -> Result<Option<Vec<u8>>> {
+        if *item == AuthItem::Anonymous {
+            return self.read_summary().await;
+        }
+        let repo = self.clone();
+        let name = summary_stem(item);
+        ostrya_rt::unblock(
+            move || match open_summary_dir(repo.repo_fd(), None, false)? {
+                Some(dir) => read_root_file_blocking(dir.as_fd(), &name),
+                None => Ok(None),
+            },
+        )
+        .await
+    }
+
     /// Returns the signature dict of `summary.sig`, or `None` if the file does
     /// not exist or is empty.
     ///
@@ -1006,7 +1369,15 @@ impl Repo {
         .await
     }
 
-    /// Signs the summary with `signer` and adds the signature to `summary.sig`.
+    /// Signs each summary with `signer` and adds the signature to its
+    /// signature file.
+    ///
+    /// The summaries are `summary` at the repository root and each
+    /// `extensions/ostrya/summary/HEX` file, where `HEX` is 64 lowercase hex
+    /// digits ([`regenerate_summaries`](Repo::regenerate_summaries), "Files").
+    /// The signature file of `summary` is `summary.sig`, and the signature
+    /// file of `HEX` is `HEX.sig`. The text below states `summary` and
+    /// `summary.sig`, and each other summary follows the same rules.
     ///
     /// The signed payload is the exact bytes of `summary`. `summary.sig` is an
     /// `a{sv}` dict with the same engine keys as the detached metadata of a
@@ -1022,11 +1393,13 @@ impl Repo {
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidFormat`] if the repository has no `summary`, if
-    ///   `[core] lock-timeout-secs` is below `-1`, or if the entry of the
-    ///   engine in `summary.sig` is not an array.
+    /// - [`Error::InvalidFormat`] if the repository has no summary, if
+    ///   `[core] lock-timeout-secs` is below `-1`, if the entry of the engine
+    ///   in a signature file is not an array, or if `extensions`,
+    ///   `extensions/ostrya`, or `extensions/ostrya/summary` is not a
+    ///   directory.
     /// - [`Error::Core`] if `[core] fsync`, `[core] locking`, or `[core]
-    ///   lock-timeout-secs` does not parse, or if `summary.sig` is not an
+    ///   lock-timeout-secs` does not parse, or if a signature file is not an
     ///   `a{sv}` dict.
     /// - [`Error::LockTimeout`] if the wait for a lock passes `[core]
     ///   lock-timeout-secs`.
@@ -1037,25 +1410,28 @@ impl Repo {
         self.sign_summary_all(&[signer]).await
     }
 
-    /// Signs the summary with each signer in `signers` and adds the signatures
-    /// to `summary.sig` in slice order.
+    /// Signs each summary with each signer in `signers` and adds the
+    /// signatures to its signature file in slice order.
     ///
-    /// The result is the `summary.sig` that one
-    /// [`sign_summary`](Repo::sign_summary) call for each signer writes, in
-    /// the same order. The call reads `summary` and `summary.sig` once and
-    /// makes each signature. Then it replaces `summary.sig` atomically in one
-    /// write.
+    /// The summaries and their signature files are those of
+    /// [`sign_summary`](Repo::sign_summary). The result is the signature
+    /// file that one [`sign_summary`](Repo::sign_summary) call for each
+    /// signer writes, in the same order. The call reads each summary and its
+    /// signature file once and makes each signature. Two summaries with the
+    /// same bytes get the same signatures, which the signers make one time.
+    /// Then the call replaces each signature file atomically, with one write
+    /// for each file.
     ///
-    /// If a signer fails, the call stops before the write, and `summary.sig`
-    /// stays as it is. An empty slice reads nothing, writes nothing, and takes
-    /// no lock.
+    /// If a signer fails, the call stops before the first write, and each
+    /// signature file stays as it is. An empty slice reads nothing, writes
+    /// nothing, and takes no lock.
     ///
     /// # Locks
     ///
     /// The call takes the repository lock shared and then the update lock, as
     /// [`begin_update`](Repo::begin_update) does. It takes them before it
-    /// reads `summary` and holds both until it writes `summary.sig`, so a
-    /// signature always covers the `summary` next to it.
+    /// reads the first summary and holds both until it writes the last
+    /// signature file, so a signature always covers the summary next to it.
     ///
     /// The calls of several tasks or processes and
     /// [`regenerate_summary`](Repo::regenerate_summary) run one at a time, and
@@ -1065,11 +1441,13 @@ impl Repo {
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidFormat`] if the repository has no `summary`, if
-    ///   `[core] lock-timeout-secs` is below `-1`, or if the entry of the
-    ///   engine of a signer in `summary.sig` is not an array.
+    /// - [`Error::InvalidFormat`] if the repository has no summary, if
+    ///   `[core] lock-timeout-secs` is below `-1`, if the entry of the engine
+    ///   of a signer in a signature file is not an array, or if `extensions`,
+    ///   `extensions/ostrya`, or `extensions/ostrya/summary` is not a
+    ///   directory.
     /// - [`Error::Core`] if `[core] fsync`, `[core] locking`, or `[core]
-    ///   lock-timeout-secs` does not parse, or if `summary.sig` is not an
+    ///   lock-timeout-secs` does not parse, or if a signature file is not an
     ///   `a{sv}` dict.
     /// - [`Error::LockTimeout`] if the wait for a lock passes `[core]
     ///   lock-timeout-secs`.
@@ -1082,21 +1460,91 @@ impl Repo {
         }
         let fsync = self.config().fsync()?;
         let locks = self.lock_for_update().await?;
-        let data = self.read_summary().await?.ok_or_else(|| {
-            Error::InvalidFormat("no summary to sign; regenerate it first".into())
-        })?;
-        let mut dict = self
-            .read_summary_signature()
-            .await?
-            .unwrap_or_else(|| Value::Array(Vec::new()));
-        for signer in signers {
-            let signature = signer.sign(&data).await?;
-            append_signature(&mut dict, signer.metadata_key(), signature)?;
+        let repo = self.clone();
+        // The one open of the summary directory, for each read and each
+        // write of the call.
+        let (dir, stems) = ostrya_rt::unblock(move || -> Result<_> {
+            match open_summary_dir(repo.repo_fd(), None, false)? {
+                Some(dir) => {
+                    let stems = item_summary_stems(&dir)?;
+                    Ok((Some(Arc::new(dir)), stems))
+                }
+                None => Ok((None, Vec::new())),
+            }
+        })
+        .await?;
+        // The signatures of each distinct summary, by the SHA-256 digest of
+        // its bytes, so each signer signs each distinct summary one time.
+        let mut made: HashMap<Checksum, Vec<Vec<u8>>> = HashMap::new();
+        // `None` is the summary at the repository root.
+        let mut written: Vec<(Option<String>, Vec<u8>)> = Vec::new();
+        for stem in std::iter::once(None).chain(stems.into_iter().map(Some)) {
+            let repo = self.clone();
+            let dir = dir.clone();
+            let name = stem.clone();
+            let read = ostrya_rt::unblock(move || -> Result<Option<(Vec<u8>, Option<Value>)>> {
+                let (at, file, sig) = match &name {
+                    Some(stem) => (
+                        dir.as_deref()
+                            .expect("each stem comes from the directory")
+                            .as_fd(),
+                        stem.clone(),
+                        format!("{stem}{SIG_SUFFIX}"),
+                    ),
+                    None => (
+                        repo.repo_fd(),
+                        SUMMARY_FILE.to_owned(),
+                        SUMMARY_SIG_FILE.to_owned(),
+                    ),
+                };
+                let Some(data) = read_root_file_blocking(at, &file)? else {
+                    return Ok(None);
+                };
+                let dict = match read_root_file_blocking(at, &sig)? {
+                    Some(bytes) => parse_signature_dict(&bytes)?,
+                    None => None,
+                };
+                Ok(Some((data, dict)))
+            })
+            .await?;
+            let Some((data, dict)) = read else {
+                continue;
+            };
+            let key = Checksum::sha256(&data);
+            let signatures = match made.get(&key) {
+                Some(signatures) => signatures.clone(),
+                None => {
+                    let mut signatures = Vec::with_capacity(signers.len());
+                    for signer in signers {
+                        signatures.push(signer.sign(&data).await?);
+                    }
+                    made.insert(key, signatures.clone());
+                    signatures
+                }
+            };
+            drop(data);
+            let mut dict = dict.unwrap_or_else(|| Value::Array(Vec::new()));
+            for (signer, signature) in signers.iter().zip(signatures) {
+                append_signature(&mut dict, signer.metadata_key(), signature)?;
+            }
+            written.push((stem, serialize_signature_dict(&dict)?));
         }
-        let ty = Type::parse(METADATA_SIGNATURE).map_err(ostrya_core::Error::from)?;
-        let bytes = to_bytes(&ty, &dict).map_err(ostrya_core::Error::from)?;
+        if written.is_empty() {
+            return Err(Error::InvalidFormat(
+                "no summary to sign; regenerate it first".into(),
+            ));
+        }
         self.write_holding(locks, move |repo| {
-            write_root_file_blocking(repo.repo_fd(), SUMMARY_SIG_FILE, &bytes, fsync)
+            for (stem, bytes) in &written {
+                let Some(stem) = stem else {
+                    write_root_file_blocking(repo.repo_fd(), SUMMARY_SIG_FILE, bytes, fsync)?;
+                    continue;
+                };
+                let at = dir.as_deref().expect("each stem comes from the directory");
+                let name = format!("{stem}{SIG_SUFFIX}");
+                write_root_file_blocking(at.as_fd(), &name, bytes, fsync)?;
+            }
+            Ok(())
         })
         .await
     }
@@ -1138,43 +1586,23 @@ impl Repo {
     }
 
     /// Returns the size, the version, and the timestamp of each commit of
-    /// `commits`, in order.
+    /// `commits`, by checksum.
     ///
     /// The call reads the commits in one pass on the blocking pool. It reads
-    /// each commit object under the size cap of a metadata object, and holds
-    /// one commit in memory at a time.
-    async fn summary_commit_facts(&self, commits: Vec<Checksum>) -> Result<Vec<CommitFacts>> {
+    /// each commit object one time, under the size cap of a metadata object,
+    /// and holds one commit in memory at a time.
+    async fn commit_facts(
+        &self,
+        commits: HashSet<Checksum>,
+    ) -> Result<HashMap<Checksum, CommitFacts>> {
         let repo = self.clone();
         ostrya_rt::unblock(move || {
             commits
-                .iter()
-                .map(|commit| read_commit_facts(&repo, commit))
+                .into_iter()
+                .map(|commit| Ok((commit, read_commit_facts(&repo, &commit)?)))
                 .collect()
         })
         .await
-    }
-
-    /// Returns the mirror refs, grouped by collection, for
-    /// `ostree.summary.collection-map`.
-    ///
-    /// The collections and the refs are sorted byte-wise. A `BTreeMap` with
-    /// the UTF-8 collection id as key sorts the collections by byte value.
-    /// The refs of each collection are sorted by name in the same way.
-    async fn mirror_refs_by_collection(
-        &self,
-    ) -> Result<std::collections::BTreeMap<String, Vec<(String, Checksum)>>> {
-        let mut by_collection: std::collections::BTreeMap<String, Vec<(String, Checksum)>> =
-            std::collections::BTreeMap::new();
-        for (collection, name, commit) in self.list_mirror_refs().await? {
-            by_collection
-                .entry(collection)
-                .or_default()
-                .push((name, commit));
-        }
-        for refs in by_collection.values_mut() {
-            refs.sort_by(|a, b| a.0.as_bytes().cmp(b.0.as_bytes()));
-        }
-        Ok(by_collection)
     }
 
     /// Writes a new anchor commit of the collection to
@@ -1266,30 +1694,6 @@ impl Repo {
         let repo_fd = self.repo_fd().try_clone_to_owned()?;
         let name = name.to_owned();
         ostrya_rt::unblock(move || read_root_file_blocking(repo_fd.as_fd(), &name)).await
-    }
-
-    /// Writes `bytes` to a file at the repository root, atomically.
-    ///
-    /// A mirror pull writes the summary of the remote with this call, byte for
-    /// byte.
-    pub(crate) async fn write_root_file(
-        &self,
-        name: &str,
-        bytes: Vec<u8>,
-        fsync: bool,
-    ) -> Result<()> {
-        let repo_fd = self.repo_fd().try_clone_to_owned()?;
-        let name = name.to_owned();
-        ostrya_rt::unblock(move || write_root_file_blocking(repo_fd.as_fd(), &name, &bytes, fsync))
-            .await
-    }
-
-    /// Removes a file at the repository root. If the file does not exist, the
-    /// call succeeds.
-    pub(crate) async fn remove_root_file(&self, name: &str) -> Result<()> {
-        let repo_fd = self.repo_fd().try_clone_to_owned()?;
-        let name = name.to_owned();
-        ostrya_rt::unblock(move || remove_root_file_blocking(repo_fd.as_fd(), &name)).await
     }
 }
 
@@ -1927,6 +2331,331 @@ pub(crate) fn remove_root_file_blocking(repo_fd: BorrowedFd<'_>, name: &str) -> 
     }
 }
 
+/// The directory of the summaries of the auth items other than
+/// `anonymous`, and of the `.access` file of each item with a summary.
+pub(crate) const SUMMARY_DIR: &str = "extensions/ostrya/summary";
+/// The components of [`SUMMARY_DIR`], from the repository root.
+const SUMMARY_DIR_PARTS: [&str; 3] = ["extensions", "ostrya", "summary"];
+/// The mode of each directory of [`SUMMARY_DIR`] that the writer creates,
+/// before the file-creation mask.
+const SUMMARY_DIR_MODE: u32 = 0o775;
+/// The suffix of the signature file of the summary of an item.
+pub(crate) const SIG_SUFFIX: &str = ".sig";
+/// The suffix of the file that holds the access digest of an item.
+pub(crate) const ACCESS_SUFFIX: &str = ".access";
+
+/// Returns `HEX`, the file stem of the files of the summary of `item`: the
+/// SHA-256 digest of the text of the item in 64 lowercase hex digits.
+pub(crate) fn summary_stem(item: &AuthItem) -> String {
+    Checksum::sha256(item.to_string().as_bytes()).to_hex()
+}
+
+/// Returns the bytes of an `.access` file that holds `digest`.
+pub(crate) fn access_file_bytes(digest: &Checksum) -> Vec<u8> {
+    format!("{}\n", digest.to_hex()).into_bytes()
+}
+
+/// Opens [`SUMMARY_DIR`] under `repo_fd`, one component at a time, with no
+/// symlink followed.
+///
+/// With `create`, the mode of the repository, the call creates each
+/// component that does not exist, with [`SUMMARY_DIR_MODE`], and forces the
+/// shared mode on it in a `bare-user-shared` repository. With `fsync`, it
+/// then syncs the parent of each directory that it creates. Without
+/// `create`, a component that does not exist gives `None`.
+///
+/// A component that is a symlink, or that is no directory, gives
+/// [`Error::InvalidFormat`].
+fn open_summary_dir(
+    repo_fd: BorrowedFd<'_>,
+    create: Option<RepoMode>,
+    fsync: bool,
+) -> Result<Option<OwnedFd>> {
+    let mut dir: Option<OwnedFd> = None;
+    let mut path = String::new();
+    for part in SUMMARY_DIR_PARTS {
+        let parent = dir.as_ref().map_or(repo_fd, AsFd::as_fd);
+        if !path.is_empty() {
+            path.push('/');
+        }
+        path.push_str(part);
+        let open = || {
+            rustix::fs::openat(
+                parent,
+                part,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+        };
+        let opened = match (open(), create) {
+            (Err(Errno::NOENT), None) => return Ok(None),
+            (Err(Errno::NOENT), Some(mode)) => {
+                match rustix::fs::mkdirat(parent, part, Mode::from_raw_mode(SUMMARY_DIR_MODE)) {
+                    Ok(()) => {
+                        perm::force_created_dir(parent, part, mode)?;
+                        if fsync {
+                            rustix::fs::fsync(parent)?;
+                        }
+                    }
+                    Err(Errno::EXIST) => {}
+                    Err(e) => return Err(e.into()),
+                }
+                open()
+            }
+            (opened, _) => opened,
+        };
+        dir = Some(match opened {
+            Ok(fd) => fd,
+            Err(Errno::NOTDIR | Errno::LOOP) => {
+                return Err(Error::InvalidFormat(format!(
+                    "{path} is not a directory; the summaries follow no symlink"
+                )));
+            }
+            Err(e) => return Err(e.into()),
+        });
+    }
+    Ok(dir)
+}
+
+/// Returns `true` if `name` is 64 lowercase hex digits.
+fn is_stem(name: &str) -> bool {
+    name.len() == 64 && name.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// One file name under [`SUMMARY_DIR`] that the writer owns: `HEX`,
+/// `HEX.sig`, or `HEX.access`, or a temp file of one of these names.
+struct SummaryEntry<'a> {
+    stem: &'a str,
+    /// `""`, [`SIG_SUFFIX`], or [`ACCESS_SUFFIX`].
+    suffix: &'a str,
+    /// `true` for a temp file of [`put_root_file_blocking`].
+    temp: bool,
+}
+
+/// Returns the entry of `name`, or `None` for a name that the writer does
+/// not own.
+fn summary_entry(name: &str) -> Option<SummaryEntry<'_>> {
+    let (name, temp) = match name.split_once(".tmp-") {
+        Some((name, tail)) => {
+            let (pid, n) = tail.split_once('-')?;
+            let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+            if !digits(pid) || !digits(n) {
+                return None;
+            }
+            (name, true)
+        }
+        None => (name, false),
+    };
+    let (stem, suffix) = name.split_at_checked(64)?;
+    if !is_stem(stem) || !matches!(suffix, "" | SIG_SUFFIX | ACCESS_SUFFIX) {
+        return None;
+    }
+    Some(SummaryEntry { stem, suffix, temp })
+}
+
+/// Returns the stem of each summary in `dir`, the open [`SUMMARY_DIR`],
+/// sorted: each file name that is 64 lowercase hex digits.
+fn item_summary_stems(dir: &OwnedFd) -> Result<Vec<String>> {
+    let mut stems: Vec<String> = crate::delta::dir_child_names(dir)?
+        .into_iter()
+        .filter(|name| is_stem(name))
+        .collect();
+    stems.sort();
+    Ok(stems)
+}
+
+/// Returns the signature file of `bytes` with a signature of each signer of
+/// `signers`, in order, or `None` with no signer.
+///
+/// A failure of a signer gives the name of its key with the error.
+async fn sign_summary_bytes(
+    bytes: &[u8],
+    signers: &[&dyn Signer],
+) -> std::result::Result<Option<Vec<u8>>, (Option<String>, Error)> {
+    if signers.is_empty() {
+        return Ok(None);
+    }
+    let mut dict = Value::Array(Vec::new());
+    for signer in signers {
+        let signature = signer
+            .sign(bytes)
+            .await
+            .map_err(|e| (Some(signer.name().to_owned()), e.into()))?;
+        append_signature(&mut dict, signer.metadata_key(), signature)
+            .map_err(|e| (None, e.into()))?;
+    }
+    serialize_signature_dict(&dict)
+        .map(Some)
+        .map_err(|e| (None, e))
+}
+
+/// Writes the files of the summary of `item`, whose access digest and file
+/// stem are `files`.
+///
+/// When the `.access` file of the item holds another digest, the call
+/// removes it first. Then it removes the old signature file, writes the
+/// summary `bytes` and the signature file `signatures`, and writes the
+/// `.access` file last. So while the `.access` file holds a digest, the
+/// summary next to it is a summary of that digest.
+///
+/// With `fsync`, the call syncs the directory of the `.access` file after
+/// its removal, and the directory of the summary before the write of the
+/// `.access` file. So after a crash too, an `.access` file never pairs with
+/// a summary of another digest.
+fn put_item_summary_blocking(
+    repo: &Repo,
+    item: &AuthItem,
+    bytes: &[u8],
+    signatures: Option<Vec<u8>>,
+    files: &SummaryFiles,
+    fsync: bool,
+) -> Result<()> {
+    let dir = open_summary_dir(repo.repo_fd(), Some(repo.mode()), fsync)?
+        .expect("the call creates the directory");
+    let access = format!("{}{ACCESS_SUFFIX}", files.stem);
+    let want = access_file_bytes(&files.digest);
+    if holds_blocking(dir.as_fd(), &access, &want)? == Some(false) {
+        remove_root_file_blocking(dir.as_fd(), &access)?;
+        if fsync {
+            rustix::fs::fsync(&dir)?;
+        }
+    }
+    let (at, file, sig) = if *item == AuthItem::Anonymous {
+        (
+            repo.repo_fd(),
+            SUMMARY_FILE.to_owned(),
+            SUMMARY_SIG_FILE.to_owned(),
+        )
+    } else {
+        (
+            dir.as_fd(),
+            files.stem.clone(),
+            format!("{}{SIG_SUFFIX}", files.stem),
+        )
+    };
+    // The old signatures never pair with the new summary.
+    remove_root_file_blocking(at, &sig)?;
+    put_root_file_blocking(at, &file, bytes, fsync)?;
+    if let Some(signatures) = signatures {
+        put_root_file_blocking(at, &sig, &signatures, fsync)?;
+    }
+    if fsync {
+        rustix::fs::fsync(at)?;
+    }
+    put_root_file_blocking(dir.as_fd(), &access, &want, fsync)?;
+    if fsync {
+        rustix::fs::fsync(&dir)?;
+    }
+    Ok(())
+}
+
+/// Returns `None` if `name` under `dir` does not exist, else `true` if it
+/// is a file that holds exactly `want`.
+///
+/// The call follows no symlink, and a symlink gives `false`. The read stops
+/// one byte past the length of `want`.
+fn holds_blocking(dir: BorrowedFd<'_>, name: &str, want: &[u8]) -> Result<Option<bool>> {
+    match rustix::fs::openat(
+        dir,
+        name,
+        OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => Ok(Some(crate::archive::holds(&std::fs::File::from(fd), want)?)),
+        Err(Errno::NOENT) => Ok(None),
+        Err(Errno::LOOP) => Ok(Some(false)),
+        Err(e) => Err(e.into()),
+    }
+}
+
+/// Removes the files of each item with no summary.
+///
+/// `kept` holds the stem of each item with a summary, and `anonymous` is
+/// `true` when the `anonymous` item has a summary. Under [`SUMMARY_DIR`],
+/// the call removes each [`SummaryEntry`] of a stem outside `kept`, the
+/// `.access` files first, each temp file, and the summary and the signature
+/// file of the `anonymous` item. Without `anonymous`, it removes `summary`
+/// and `summary.sig` at the repository root.
+fn remove_other_summaries_blocking(
+    repo: &Repo,
+    kept: &HashSet<String>,
+    anonymous: bool,
+    fsync: bool,
+) -> Result<()> {
+    let anonymous_stem = summary_stem(&AuthItem::Anonymous);
+    if let Some(dir) = open_summary_dir(repo.repo_fd(), None, false)? {
+        let mut gone: Vec<String> = crate::delta::dir_child_names(&dir)?
+            .into_iter()
+            .filter(|name| match summary_entry(name) {
+                None => false,
+                Some(entry) => {
+                    entry.temp
+                        || !kept.contains(entry.stem)
+                        || (entry.stem == anonymous_stem && entry.suffix != ACCESS_SUFFIX)
+                }
+            })
+            .collect();
+        // The server stops serving a summary at the removal of its
+        // `.access` file, so that file goes first.
+        gone.sort_by_key(|name| !name.ends_with(ACCESS_SUFFIX));
+        for name in &gone {
+            remove_root_file_blocking(dir.as_fd(), name)?;
+        }
+        if fsync && !gone.is_empty() {
+            rustix::fs::fsync(&dir)?;
+        }
+    }
+    if !anonymous {
+        remove_root_file_blocking(repo.repo_fd(), SUMMARY_FILE)?;
+        remove_root_file_blocking(repo.repo_fd(), SUMMARY_SIG_FILE)?;
+        if fsync {
+            rustix::fs::fsync(repo.repo_fd())?;
+        }
+    }
+    Ok(())
+}
+
+/// Removes the `.access` file of the `anonymous` item, so that no server
+/// serves `summary` and `summary.sig` until the next run of the writer. A
+/// file that does not exist is no error.
+pub(crate) fn remove_anonymous_access_blocking(repo_fd: BorrowedFd<'_>, fsync: bool) -> Result<()> {
+    let Some(dir) = open_summary_dir(repo_fd, None, false)? else {
+        return Ok(());
+    };
+    let name = format!("{}{ACCESS_SUFFIX}", summary_stem(&AuthItem::Anonymous));
+    remove_root_file_blocking(dir.as_fd(), &name)?;
+    if fsync {
+        rustix::fs::fsync(&dir)?;
+    }
+    Ok(())
+}
+
+/// Returns the commit of each ref of `selection`, each one time.
+fn commits_of(selection: &RefSelection) -> HashSet<Checksum> {
+    selection
+        .local
+        .iter()
+        .chain(selection.collections.values().flatten())
+        .map(|(_, commit)| *commit)
+        .collect()
+}
+
+/// Returns `true` if `a` and `b` hold the same names of local refs and the
+/// same names of collection refs.
+fn same_refs(a: &RefSelection, b: &RefSelection) -> bool {
+    fn same(a: &[(String, Checksum)], b: &[(String, Checksum)]) -> bool {
+        a.iter()
+            .map(|(name, _)| name)
+            .eq(b.iter().map(|(name, _)| name))
+    }
+    same(&a.local, &b.local)
+        && a.collections.len() == b.collections.len()
+        && a.collections
+            .iter()
+            .zip(&b.collections)
+            .all(|((a_id, a_refs), (b_id, b_refs))| a_id == b_id && same(a_refs, b_refs))
+}
+
 /// Writes a file as [`write_root_file_blocking`] does, with no sync of the
 /// root directory. The caller syncs the root directory.
 pub(crate) fn put_root_file_blocking(
@@ -2222,11 +2951,11 @@ mod tests {
         }
     }
 
-    /// `build_summary` gives the bytes `regenerate_summary` writes, for a
-    /// repository with a collection id, whose anchor commit the regeneration
-    /// refreshed, and it writes nothing.
+    /// `item_summary` gives the bytes `regenerate_summary` writes for the
+    /// `anonymous` item, for a repository with a collection id, whose anchor
+    /// commit the regeneration refreshed, and it writes nothing.
     #[test]
-    fn build_summary_gives_the_bytes_regenerate_summary_writes() {
+    fn item_summary_gives_the_bytes_regenerate_summary_writes() {
         let dir = std::env::temp_dir().join(format!(
             "ostrya-build-summary-{}-{}",
             std::process::id(),
@@ -2246,7 +2975,13 @@ mod tests {
             let written = repo.read_summary().await.unwrap().unwrap();
             let anchor = repo.resolve_ref_tip(OSTREE_METADATA_REF).await.unwrap();
             assert!(anchor.is_some(), "the regeneration wrote the anchor");
-            assert_eq!(repo.build_summary(&opts).await.unwrap(), written);
+            let access = Arc::new(ClientAccess::from_config(repo.config(), repo.path()).unwrap());
+            let run = repo.summary_run(access, &opts).await.unwrap();
+            let built = repo
+                .item_summary(&run, &AuthItem::Anonymous, &opts)
+                .await
+                .unwrap();
+            assert_eq!(built, written);
             assert_eq!(
                 repo.resolve_ref_tip(OSTREE_METADATA_REF).await.unwrap(),
                 anchor,

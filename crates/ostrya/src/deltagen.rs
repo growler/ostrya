@@ -740,24 +740,6 @@ impl Repo {
         Ok(out)
     }
 
-    /// Returns the `ostree.static-deltas` value of the summary, or `None` if
-    /// the repository holds no delta.
-    ///
-    /// The value is an `a{sv}` that maps the name of each delta to the 32-byte
-    /// digest of its superblock.
-    pub(crate) async fn static_deltas_summary_value(&self) -> Result<Option<Value>> {
-        let entries = self.static_delta_digests().await?;
-        if entries.is_empty() {
-            return Ok(None);
-        }
-        let map = summary_delta_map(
-            entries
-                .iter()
-                .map(|entry| (entry.name.as_str(), &entry.digest)),
-        )?;
-        Ok(Some(map))
-    }
-
     /// Returns the target commits of the index files in `delta-indexes/`, sorted.
     ///
     /// An index file is a regular file `delta-indexes/<fanout>/<rest>.index`.
@@ -2007,7 +1989,9 @@ fn delta_map_value<'a>(deltas: impl Iterator<Item = (&'a str, &'a Checksum)>) ->
 
 /// Returns the `ostree.static-deltas` value of a summary: the map of
 /// [`delta_map_value`] in a variant of type `a{sv}`.
-fn summary_delta_map<'a>(deltas: impl Iterator<Item = (&'a str, &'a Checksum)>) -> Result<Value> {
+pub(crate) fn summary_delta_map<'a>(
+    deltas: impl Iterator<Item = (&'a str, &'a Checksum)>,
+) -> Result<Value> {
     let map_ty = Type::parse("a{sv}").map_err(ostrya_core::Error::from)?;
     Ok(Value::variant(map_ty, delta_map_value(deltas)?))
 }
@@ -2015,9 +1999,8 @@ fn summary_delta_map<'a>(deltas: impl Iterator<Item = (&'a str, &'a Checksum)>) 
 /// Returns the `ostree.static-deltas` value of a summary that advertises
 /// `deltas`, in the order of the slice.
 ///
-/// The value has the bytes of the value that
-/// [`Repo::static_deltas_summary_value`] gives for the same deltas in the
-/// same order.
+/// The value has the bytes of the value that [`summary_delta_map`] gives
+/// for the same deltas in the same order.
 pub(crate) fn advertised_delta_map(deltas: &[AdvertisedDelta]) -> Result<Value> {
     let names: Vec<String> = deltas
         .iter()

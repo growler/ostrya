@@ -4,7 +4,7 @@
 use std::sync::Arc;
 
 use hyper::body::{Bytes, Incoming};
-use hyper::header::{ALLOW, CONTENT_LENGTH, HeaderValue};
+use hyper::header::{ALLOW, CACHE_CONTROL, CONTENT_LENGTH, HeaderValue};
 use hyper::{Method, Request, Response, StatusCode};
 use ostrya::access::ReadAccess;
 use ostrya::{ArchiveAnswer, ArchiveHead, ArchiveView, Repo};
@@ -12,6 +12,7 @@ use ostrya::{ArchiveAnswer, ArchiveHead, ArchiveView, Repo};
 use crate::auth::{GroupAuth, peer_of};
 use crate::body::{ReceiveBody, ServeBody};
 use crate::endpoint::ReceiveEndpoint;
+use crate::event::StaleSummaries;
 use crate::receive_auth::Refusal;
 use crate::refs::Listings;
 use crate::stall::Stall;
@@ -61,7 +62,8 @@ pub(crate) fn refused(refusal: Refusal) -> Response<ServeBody> {
 
 /// Returns the response to one request. The function records a stream body
 /// in `stall`, the deadline of its connection. `listings` holds the ref
-/// listings in flight in the server.
+/// listings in flight in the server. `stale` records the stale summaries
+/// that the server reported.
 ///
 /// With a receive endpoint, a request under its raw path prefix with a
 /// method other than `GET` and `HEAD` goes to the endpoint. A `GET` or a
@@ -72,11 +74,14 @@ pub(crate) fn refused(refusal: Refusal) -> Response<ServeBody> {
 /// A request to the view gets 405 for a method other than `GET` and `HEAD`.
 /// Then `clients` identifies the client, and a refusal gets its response.
 /// Then a path that does not decode gets 404. The view answers with the read
-/// rights of the client.
+/// rights of the client. A stale summary gets 404, and `stale` reports it.
+/// A 200 and a 404 of `summary` and `summary.sig` carry
+/// `Cache-Control: private`, because the body depends on the client.
 pub(crate) async fn handle(
     view: &ArchiveView,
     repo: &Repo,
     listings: &Listings,
+    stale: &StaleSummaries,
     clients: &Clients,
     stall: &Arc<Stall>,
     req: Request<Incoming>,
@@ -117,11 +122,33 @@ pub(crate) async fn handle(
     let Some(path) = decode_path(req.uri().path()) else {
         return empty(StatusCode::NOT_FOUND);
     };
-    if head {
-        respond_head(view.head(&path, &access).await)
+    let response = if head {
+        let answer = view.head(&path, &access).await;
+        if matches!(answer, Ok(ArchiveHead::StaleSummary)) {
+            stale.report(access.item());
+        }
+        respond_head(answer)
     } else {
-        respond(view.get(&path, &access).await, stall)
+        let answer = view.get(&path, &access).await;
+        if let Ok(ArchiveAnswer::StaleSummary { item }) = &answer {
+            stale.report(item);
+        }
+        respond(answer, stall)
+    };
+    private_summary(&path, response)
+}
+
+/// Returns `response` with `Cache-Control: private` when `path` is
+/// `summary` or `summary.sig` and the status is 200 or 404.
+fn private_summary(path: &str, mut response: Response<ServeBody>) -> Response<ServeBody> {
+    let summary = matches!(path, "summary" | "summary.sig");
+    let status = response.status();
+    if summary && (status == StatusCode::OK || status == StatusCode::NOT_FOUND) {
+        response
+            .headers_mut()
+            .insert(CACHE_CONTROL, HeaderValue::from_static("private"));
     }
+    response
 }
 
 /// Returns the response for an answer of the view to a `GET`. A not-found
@@ -135,7 +162,9 @@ fn respond(answer: ostrya::Result<ArchiveAnswer>, stall: &Arc<Stall>) -> Respons
         Ok(ArchiveAnswer::Stream { len, body }) => {
             (len, ServeBody::stream(body, len, stall.track()))
         }
-        Ok(ArchiveAnswer::NotFound | ArchiveAnswer::Refused) => {
+        Ok(
+            ArchiveAnswer::NotFound | ArchiveAnswer::Refused | ArchiveAnswer::StaleSummary { .. },
+        ) => {
             return empty(StatusCode::NOT_FOUND);
         }
         Err(_) => return empty(StatusCode::INTERNAL_SERVER_ERROR),
@@ -148,7 +177,9 @@ fn respond(answer: ostrya::Result<ArchiveAnswer>, stall: &Arc<Stall>) -> Respons
 fn respond_head(answer: ostrya::Result<ArchiveHead>) -> Response<ServeBody> {
     match answer {
         Ok(ArchiveHead::Found { len }) => with_length(Response::new(ServeBody::Empty), len),
-        Ok(ArchiveHead::NotFound | ArchiveHead::Refused) => empty(StatusCode::NOT_FOUND),
+        Ok(ArchiveHead::NotFound | ArchiveHead::Refused | ArchiveHead::StaleSummary) => {
+            empty(StatusCode::NOT_FOUND)
+        }
         Err(_) => empty(StatusCode::INTERNAL_SERVER_ERROR),
     }
 }

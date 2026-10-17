@@ -169,14 +169,17 @@ impl Serving {
     }
 }
 
-/// A CA and a server certificate for `127.0.0.1` that the CA signed, for the
-/// HTTPS pulls of the `ostree` command. The TLS fixtures name one subject for
-/// the CA and the server certificate. An OpenSSL client reads that server
+/// A CA, a server certificate for `127.0.0.1` that the CA signed, and a
+/// client certificate with the subject CN `puller` that the CA signed, for
+/// the HTTPS pulls of the `ostree` command. The TLS fixtures name one subject
+/// for the CA and the server certificate. An OpenSSL client reads that server
 /// certificate as a self-signed leaf, so `ostree` needs a pair of its own.
 struct Pki {
     ca: PathBuf,
     cert: PathBuf,
     key: PathBuf,
+    client_cert: PathBuf,
+    client_key: PathBuf,
 }
 
 /// Generate a `Pki` under `dir` with `openssl`. Each certificate takes a
@@ -195,6 +198,12 @@ fn make_pki(dir: &Path) -> Pki {
         "[req]\ndistinguished_name = dn\n[dn]\n[v3]\nbasicConstraints = critical,CA:FALSE\n\
          keyUsage = critical,digitalSignature\nextendedKeyUsage = serverAuth\n\
          subjectAltName = IP:127.0.0.1\n",
+    )
+    .unwrap();
+    std::fs::write(
+        dir.join("client.cnf"),
+        "[req]\ndistinguished_name = dn\n[dn]\n[v3]\nbasicConstraints = critical,CA:FALSE\n\
+         keyUsage = critical,digitalSignature\nextendedKeyUsage = clientAuth\n",
     )
     .unwrap();
     let at = |name: &str| dir.join(name).to_str().unwrap().to_owned();
@@ -269,10 +278,46 @@ fn make_pki(dir: &Path) -> Pki {
         "-out",
         &at("server.pem"),
     ]);
+    openssl(&[&p256[..], &["-out", &at("client.key")]].concat());
+    openssl(&[
+        "req",
+        "-new",
+        "-sha256",
+        "-key",
+        &at("client.key"),
+        "-subj",
+        "/CN=puller",
+        "-config",
+        &at("client.cnf"),
+        "-out",
+        &at("client.csr"),
+    ]);
+    openssl(&[
+        "x509",
+        "-req",
+        "-sha256",
+        "-in",
+        &at("client.csr"),
+        "-CA",
+        &at("ca.pem"),
+        "-CAkey",
+        &at("ca.key"),
+        "-CAcreateserial",
+        "-days",
+        "2",
+        "-extfile",
+        &at("client.cnf"),
+        "-extensions",
+        "v3",
+        "-out",
+        &at("client.pem"),
+    ]);
     Pki {
         ca: dir.join("ca.pem"),
         cert: dir.join("server.pem"),
         key: dir.join("server.key"),
+        client_cert: dir.join("client.pem"),
+        client_key: dir.join("client.key"),
     }
 }
 
@@ -533,6 +578,230 @@ fn the_tool_pulls_a_readable_ref_with_no_summary() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("/refs/heads/secret"), "{stderr}");
     assert!(stderr.contains("404"), "{stderr}");
+}
+
+/// Returns the names of the refs that `ostree remote refs` lists for the
+/// remote `origin` of the client `repo`, each with the remote prefix.
+fn remote_refs(repo: &str) -> Vec<String> {
+    let mut names: Vec<String> = ok("ostree", &[repo, "remote", "refs", "origin"])
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    names.sort();
+    names
+}
+
+/// The `ostree` command pulls through the root summary of the `anonymous`
+/// item, whose group has a deny item. The summary lists the refs that the
+/// group reads, and a pull of a denied ref fails.
+#[test]
+fn the_tool_pulls_through_the_summary_of_the_anonymous_item() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("anonymous-summary");
+    let src = build_tree(tmp.path());
+    let path = tmp.path().join("server");
+    let commit = server_repo(&path, "bare-user", &src, &[]);
+    let repo = format!("--repo={}", path.display());
+    let src = src.to_str().unwrap();
+    ok(
+        ostrya(),
+        &[
+            &repo,
+            "commit",
+            "-b",
+            "secret",
+            "-s",
+            "secret",
+            "--no-xattrs",
+            src,
+        ],
+    );
+    let config = path.join("config");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(
+        "[ex-ostrya client \"public\"]\nauth=anonymous\nallow=r:**\ndeny=secret\n\
+         summary=true\n",
+    );
+    std::fs::write(&config, text).unwrap();
+    ok(ostrya(), &[&repo, "summary", "-u"]);
+    let server = Serving::start(&path, &[]);
+    let client = client(&tmp.path().join("client"), "archive", &server.url, None);
+    assert_eq!(remote_refs(&client), ["origin:main"]);
+    ok("ostree", &[&client, "pull", "origin", "main"]);
+    ok("ostree", &[&client, "fsck"]);
+    let pulled = ok("ostree", &[&client, "rev-parse", "origin:main"]);
+    assert_eq!(pulled.trim(), commit);
+    let out = run("ostree", &[&client, "pull", "origin", "secret"]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+}
+
+/// The `ostree` command pulls through the summary of a `tls:NAME` item, with
+/// the client certificate of `tls-client-cert-path` and
+/// `tls-client-key-path`. A client with no certificate gets 401 for the
+/// summary, and its pull fails.
+#[test]
+fn the_tool_pulls_through_the_summary_of_a_tls_item() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("tls-summary");
+    let src = build_tree(tmp.path());
+    let pki = make_pki(&tmp.path().join("pki"));
+    let path = tmp.path().join("server");
+    let commit = server_repo(&path, "bare-user", &src, &[]);
+    let repo = format!("--repo={}", path.display());
+    let src = src.to_str().unwrap();
+    ok(
+        ostrya(),
+        &[
+            &repo,
+            "commit",
+            "-b",
+            "other",
+            "-s",
+            "other",
+            "--no-xattrs",
+            src,
+        ],
+    );
+    let config = path.join("config");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str("[ex-ostrya client \"puller\"]\nauth=tls:puller\nallow=r:main\nsummary=true\n");
+    std::fs::write(&config, text).unwrap();
+    ok(ostrya(), &[&repo, "summary", "-u"]);
+    assert!(!path.join("summary").exists());
+    let server = Serving::start(
+        &path,
+        &[
+            &format!("--tls-cert={}", pki.cert.display()),
+            &format!("--tls-key={}", pki.key.display()),
+            &format!("--tls-client-ca={}", pki.ca.display()),
+        ],
+    );
+    let client_path = tmp.path().join("client");
+    let client = format!("--repo={}", client_path.display());
+    ok("ostree", &[&client, "init", "--mode=archive"]);
+    ok(
+        "ostree",
+        &[
+            &client,
+            "remote",
+            "add",
+            "--no-gpg-verify",
+            &format!("--set=tls-ca-path={}", pki.ca.display()),
+            &format!("--set=tls-client-cert-path={}", pki.client_cert.display()),
+            &format!("--set=tls-client-key-path={}", pki.client_key.display()),
+            "origin",
+            &server.url,
+        ],
+    );
+    assert_eq!(remote_refs(&client), ["origin:main"]);
+    ok("ostree", &[&client, "pull", "origin", "main"]);
+    ok("ostree", &[&client, "fsck"]);
+    let pulled = ok("ostree", &[&client, "rev-parse", "origin:main"]);
+    assert_eq!(pulled.trim(), commit);
+
+    let stranger = client_without_cert(&tmp.path().join("stranger"), &server.url, &pki);
+    let out = run("ostree", &[&stranger, "pull", "origin", "main"]);
+    assert_eq!(out.status.code(), Some(1), "{out:?}");
+}
+
+/// A client repository with the remote `origin` at `url`, which trusts the
+/// CA of `pki` and has no client certificate.
+fn client_without_cert(path: &Path, url: &str, pki: &Pki) -> String {
+    client(path, "archive", url, Some(pki))
+}
+
+/// In a repository with a collection id, `ostrya summary -u` and `ostree
+/// summary -u` put the refs of `refs/mirrors/ID/` of the own id into field 0,
+/// with the mirror ref in place of the ref of `refs/heads` of the same name.
+/// Both keep the other collections in the collection map, and neither has
+/// the own id there. The anchor commit differs in each run, so the test
+/// compares each other ref.
+#[test]
+fn the_summary_merges_the_own_mirrors_as_the_tool_does() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("own-mirrors");
+    let src = build_tree(tmp.path());
+    let path = tmp.path().join("port");
+    let main = server_repo(&path, "archive", &src, &[]);
+    let repo = format!("--repo={}", path.display());
+    let other = ok(
+        ostrya(),
+        &[
+            &repo,
+            "commit",
+            "-b",
+            "other",
+            "-s",
+            "other",
+            "--no-xattrs",
+            src.to_str().unwrap(),
+        ],
+    )
+    .trim()
+    .to_owned();
+    ok(
+        ostrya(),
+        &[
+            &repo,
+            "config",
+            "set",
+            "core.collection-id",
+            "org.example.Own",
+        ],
+    );
+    for (rel, commit) in [
+        ("org.example.Own/main", &other),
+        ("org.example.Own/extra/x", &main),
+        ("org.example.Other/m", &main),
+    ] {
+        let file = path.join("refs/mirrors").join(rel);
+        std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+        std::fs::write(file, format!("{commit}\n")).unwrap();
+    }
+    let tool = tmp.path().join("tool");
+    ok(
+        "cp",
+        &["-a", path.to_str().unwrap(), tool.to_str().unwrap()],
+    );
+    ok(ostrya(), &[&repo, "summary", "-u"]);
+    ok(
+        "ostree",
+        &[&format!("--repo={}", tool.display()), "summary", "-u"],
+    );
+
+    type Refs = Vec<(String, ostrya::Checksum)>;
+    let parse = |dir: &Path| -> (Refs, Vec<(String, Refs)>) {
+        let bytes = std::fs::read(dir.join("summary")).unwrap();
+        let summary = ostrya::Summary::parse(&bytes).unwrap();
+        let entries = |refs: Vec<ostrya::SummaryRef>| -> Refs {
+            refs.into_iter()
+                .filter(|entry| entry.name != "ostree-metadata")
+                .map(|entry| (entry.name, entry.commit))
+                .collect()
+        };
+        let map = summary
+            .collection_map()
+            .unwrap()
+            .into_iter()
+            .map(|(id, refs)| (id, entries(refs)))
+            .collect();
+        (entries(summary.refs.clone()), map)
+    };
+    let (port_refs, port_map) = parse(&path);
+    let (tool_refs, tool_map) = parse(&tool);
+    assert_eq!(port_refs, tool_refs);
+    assert_eq!(port_map, tool_map);
+    let names: Vec<&str> = port_refs.iter().map(|(name, _)| name.as_str()).collect();
+    assert_eq!(names, ["extra/x", "main", "other"]);
+    assert_eq!(port_refs[1].1.to_hex(), other);
+    let ids: Vec<&str> = port_map.iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(ids, ["org.example.Other"]);
 }
 
 /// The summary of a repository in a mode other than `archive` names a delta

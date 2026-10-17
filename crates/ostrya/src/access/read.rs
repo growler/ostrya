@@ -3,7 +3,9 @@
 use std::borrow::Cow;
 use std::sync::{Arc, OnceLock};
 
-use super::{AccessModes, AccessRules, AuthItem, Claims, ClientAccess, Namespace};
+use ostrya_core::Checksum;
+
+use super::{AccessModes, AccessRules, AuthItem, Claims, ClientAccess, Namespace, SummaryFiles};
 
 /// The read rights of one identified client: the client groups, the auth
 /// item of the client, and the claims of its client certificate.
@@ -24,8 +26,10 @@ use super::{AccessModes, AccessRules, AuthItem, Claims, ClientAccess, Namespace}
 /// - Each other path under `refs/` is never read, `refs/remotes/` included.
 ///   A directory under `refs/mirrors/` whose name fails the collection-id
 ///   rule selects no group, so the client reads no ref in it.
-/// - The client reads `summary` and `summary.sig` when the config has no
-///   client group.
+///
+/// `summary` and `summary.sig` are the files of the summary of the item.
+/// [`summary_digest`](ReadAccess::summary_digest) gives the access digest
+/// that these files must match.
 ///
 /// The value computes the rules of the local namespace one time, at their
 /// first use. It computes the rules of a collection namespace for each use.
@@ -49,7 +53,7 @@ use super::{AccessModes, AccessRules, AuthItem, Claims, ClientAccess, Namespace}
 /// assert!(read.can_read_path("refs/mirrors/com.example.own/pub/main"));
 /// assert!(!read.can_read_path("refs/heads/secret"));
 /// assert!(!read.can_read_path("refs/remotes/origin/pub/main"));
-/// assert!(!read.serves_summary());
+/// assert!(read.summary_digest().is_none());
 /// # Ok::<(), ostrya::Error>(())
 /// ```
 #[derive(Debug, Clone)]
@@ -63,6 +67,9 @@ struct Reader {
     access: Arc<ClientAccess>,
     item: Arc<AuthItem>,
     claims: Option<Arc<Claims>>,
+    /// `true` for the rights of the summary of the item: a selected group
+    /// with `summary=false` gives no right.
+    summary_only: bool,
     /// The rules of the local namespace, or `None` with no group of the
     /// item there. The value finds them at their first use.
     local: OnceLock<Option<Local>>,
@@ -94,6 +101,25 @@ impl ReadAccess {
                 access,
                 item: item.into(),
                 claims,
+                summary_only: false,
+                local: OnceLock::new(),
+            }),
+        }
+    }
+
+    /// Returns the rights that give the refs of the summary of `item`.
+    ///
+    /// The group of the item in a namespace is selected as for
+    /// [`new`](ReadAccess::new). When that group has `summary=false`, the
+    /// value reads no ref of the namespace, and no other group takes its
+    /// place. The value takes no claims.
+    pub(crate) fn for_summary(access: Arc<ClientAccess>, item: AuthItem) -> ReadAccess {
+        ReadAccess {
+            inner: Arc::new(Reader {
+                access,
+                item: Arc::new(item),
+                claims: None,
+                summary_only: true,
                 local: OnceLock::new(),
             }),
         }
@@ -149,10 +175,18 @@ impl ReadAccess {
         false
     }
 
-    /// Returns `true` if the client reads `summary` and `summary.sig`: the
-    /// config has no client group.
-    pub fn serves_summary(&self) -> bool {
-        !self.inner.access.has_client_groups()
+    /// Returns the access digest of the item of the client, or `None` if the
+    /// item has no summary.
+    ///
+    /// The value is [`ClientAccess::summary_digest`] of the item.
+    pub fn summary_digest(&self) -> Option<Checksum> {
+        self.inner.access.summary_digest(&self.inner.item)
+    }
+
+    /// Returns the access digest of the item of the client and the stem of
+    /// the names of its files, or `None` if the item has no summary.
+    pub(crate) fn summary_files(&self) -> Option<&SummaryFiles> {
+        self.inner.access.summary_files(&self.inner.item)
     }
 
     /// Returns `true` if the rules of the local namespace have an allow item
@@ -184,6 +218,9 @@ impl ReadAccess {
         let local = self.inner.local.get_or_init(|| {
             let index = access.select_index(&self.inner.item, &Namespace::Local)?;
             let group = &access.groups()[index];
+            if self.inner.summary_only && !group.summary() {
+                return None;
+            }
             let claims = self.inner.claims.as_deref();
             let rules = match access.effective_rules(group, &Namespace::Local, claims) {
                 Cow::Owned(rules) => Local::Claimed(rules),
@@ -202,6 +239,9 @@ impl ReadAccess {
     fn rules(&self, namespace: &Namespace) -> Option<Cow<'_, AccessRules>> {
         let access = &self.inner.access;
         let group = access.select(&self.inner.item, namespace)?;
+        if self.inner.summary_only && !group.summary() {
+            return None;
+        }
         Some(access.effective_rules(group, namespace, self.inner.claims.as_deref()))
     }
 }
@@ -369,14 +409,14 @@ mod tests {
     }
 
     /// With no client group, the implicit groups read each local ref and
-    /// each collection ref, and the summary is served. One client group
-    /// stops the summary.
+    /// each collection ref, and the item has a summary. A client group with
+    /// no `summary` key gives no summary.
     #[test]
     fn the_implicit_groups_read_each_local_and_collection_ref() {
         let read = reader("", "anonymous", None);
         assert!(read.can_read(&Namespace::Local, "a/b"));
         assert!(read.can_read(&collection("a.b"), "x"));
-        assert!(read.serves_summary());
+        assert!(read.summary_digest().is_some());
         assert!(!read.access().has_client_groups());
         let groups = reader(
             "[ex-ostrya client \"c\"]\nauth=anonymous\nallow=r:**\n",
@@ -384,7 +424,33 @@ mod tests {
             None,
         );
         assert!(groups.can_read(&Namespace::Local, "a/b"));
-        assert!(!groups.serves_summary());
+        assert!(groups.summary_digest().is_none());
         assert!(groups.access().has_client_groups());
+    }
+
+    /// The rights of a summary select the group of each namespace first, and
+    /// keep it only with `summary=true`. A group of `*` does not take the
+    /// place of an exact group with `summary=false`.
+    #[test]
+    fn the_rights_of_a_summary_keep_the_groups_with_summary() {
+        let groups = "[ex-ostrya client \"local\"]\nauth=ssh:u\nallow=r:**\n\
+                      [ex-ostrya client \"exact\"]\nauth=ssh:u\ncollection=a.b\nallow=r:**\n\
+                      [ex-ostrya client \"any\"]\nauth=ssh:u\ncollection=*\nallow=r:**\n\
+                      summary=true\n";
+        let access = access(groups);
+        let item = AuthItem::parse("ssh:u").unwrap();
+        let full = ReadAccess::new(access.clone(), item.clone(), None);
+        let summary = ReadAccess::for_summary(access, item);
+        for read in [&full, &summary] {
+            assert!(read.can_read(&collection("c.d"), "x"));
+        }
+        assert!(full.can_read(&Namespace::Local, "x"));
+        assert!(!summary.can_read(&Namespace::Local, "x"));
+        assert!(!summary.reads_local_refs());
+        assert!(full.can_read(&collection("a.b"), "x"));
+        assert!(!summary.can_read(&collection("a.b"), "x"));
+        assert!(summary.collection_rules("a.b").is_none());
+        assert!(summary.collection_rules("c.d").is_some());
+        assert!(summary.summary_digest().is_some());
     }
 }

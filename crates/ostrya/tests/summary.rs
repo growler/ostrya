@@ -2072,3 +2072,456 @@ fn own_id_mirror_refs_go_into_field_0() {
         );
     });
 }
+
+// ---------------------------------------------------------------------------
+// The summaries of the auth items.
+// ---------------------------------------------------------------------------
+
+/// Appends `groups` to the config of the repository at `repo_dir`, and
+/// opens the repository again so its config holds the groups.
+async fn with_groups(repo_dir: &Path, groups: &str) -> Repo {
+    let config = repo_dir.join("config");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(groups);
+    std::fs::write(&config, text).unwrap();
+    Repo::open(repo_dir).await.unwrap()
+}
+
+/// Returns the auth item of `text`.
+fn item(text: &str) -> ostrya::access::AuthItem {
+    ostrya::access::AuthItem::parse(text).unwrap()
+}
+
+/// Returns the path of a file of the summary of the item `text` under
+/// `extensions/ostrya/summary/`, with `suffix`.
+fn item_file(repo_dir: &Path, text: &str, suffix: &str) -> std::path::PathBuf {
+    let stem = Checksum::sha256(text.as_bytes());
+    repo_dir.join(format!("extensions/ostrya/summary/{stem}{suffix}"))
+}
+
+/// Returns the parsed summary of the item `text`.
+async fn summary_of(repo: &Repo, text: &str) -> Summary {
+    let bytes = repo.read_summary_of(&item(text)).await.unwrap().unwrap();
+    Summary::parse(&bytes).unwrap()
+}
+
+/// Returns the names of the refs in field 0 of `summary`.
+fn ref_names(summary: &Summary) -> Vec<String> {
+    summary
+        .refs
+        .iter()
+        .map(|entry| entry.name.clone())
+        .collect()
+}
+
+/// Returns the names of the deltas that `summary` lists.
+fn delta_names(summary: &Summary) -> Vec<String> {
+    summary
+        .static_deltas()
+        .unwrap()
+        .into_iter()
+        .map(|delta| match delta.from {
+            Some(from) => format!("{from}-{}", delta.to),
+            None => delta.to.to_hex(),
+        })
+        .collect()
+}
+
+/// The options of each regeneration of the item tests.
+fn fixed() -> SummaryOptions {
+    SummaryOptions {
+        last_modified: Some(FIXED_EPOCH),
+        ..SummaryOptions::default()
+    }
+}
+
+/// Each item with a summary gets the refs that its groups with
+/// `summary=true` read: the local refs in field 0, and the collection refs
+/// in the collection map. The summary of `anonymous` is at the root, and
+/// each summary has the same `ostree.summary.last-modified`. An item with no
+/// summary gets no file, and each `.access` file holds the digest of its
+/// item.
+#[test]
+fn each_item_gets_the_summary_of_its_groups() {
+    let (_tmp, repo_dir) = writable_fixture("summary", "items-groups");
+    block_on(async {
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        let (_, main) = repo.list_refs(None).await.unwrap()[0].clone();
+        set_mirror(&repo, "org.example.M", "m", &main).await;
+        let repo = with_groups(
+            &repo_dir,
+            "[ex-ostrya client \"public\"]\nauth=anonymous\nallow=r:main\nsummary=true\n\
+             [ex-ostrya client \"public-collections\"]\nauth=anonymous\ncollection=*\n\
+             allow=r:**\nsummary=true\n\
+             [ex-ostrya client \"ci\"]\nauth=ssh:ci\nallow=r:**\nsummary=true\n\
+             [ex-ostrya client \"ops\"]\nauth=ssh:ops\nallow=r:**\n",
+        )
+        .await;
+        let report = repo.regenerate_summaries(&fixed(), &[]).await.unwrap();
+        assert!(report.invalid_collection_dirs.is_empty());
+
+        let anonymous = Summary::parse(&repo.read_summary().await.unwrap().unwrap()).unwrap();
+        assert_eq!(ref_names(&anonymous), ["main"]);
+        let map = anonymous.collection_map().unwrap();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map[0].0, "org.example.M");
+        assert_eq!(map[0].1[0].name, "m");
+        assert_eq!(summary_of(&repo, "anonymous").await, anonymous);
+
+        let ci = summary_of(&repo, "ssh:ci").await;
+        assert_eq!(ref_names(&ci), ["main", "other"]);
+        assert!(ci.metadata_value("ostree.summary.collection-map").is_none());
+        for summary in [&anonymous, &ci] {
+            assert_eq!(
+                summary.metadata_value("ostree.summary.last-modified"),
+                anonymous.metadata_value("ostree.summary.last-modified")
+            );
+        }
+        assert!(
+            repo.read_summary_of(&item("ssh:ops"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(!item_file(&repo_dir, "ssh:ops", ".access").exists());
+        assert!(!item_file(&repo_dir, "anonymous", "").exists());
+
+        let access = ostrya::access::ClientAccess::from_config(repo.config(), repo.path()).unwrap();
+        for text in ["anonymous", "ssh:ci"] {
+            let digest = access.summary_digest(&item(text)).unwrap();
+            assert_eq!(
+                std::fs::read(item_file(&repo_dir, text, ".access")).unwrap(),
+                format!("{digest}\n").into_bytes(),
+                "{text}"
+            );
+        }
+    });
+}
+
+/// A summary of each local ref and each collection ref lists each delta.
+/// Each other summary lists the deltas to the commits of its refs, also
+/// when it holds each local ref and the repository holds a collection ref.
+#[test]
+fn the_delta_map_follows_the_refs_of_the_summary() {
+    let (_tmp, repo_dir) = writable_fixture("summary", "items-deltas");
+    block_on(async {
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        let refs = repo.list_refs(None).await.unwrap();
+        let (main, other) = (refs[0].1, refs[1].1);
+        let opts = DeltaOptions {
+            timestamp: Some(FIXED_EPOCH),
+            ..DeltaOptions::default()
+        };
+        repo.generate_static_delta(None, &main, &opts)
+            .await
+            .unwrap();
+        repo.generate_static_delta(Some(&other), &main, &opts)
+            .await
+            .unwrap();
+        repo.generate_static_delta(None, &other, &opts)
+            .await
+            .unwrap();
+        // No ref names `other` now, so only a summary of each ref lists the
+        // delta to it.
+        repo.set_ref_immediate("other", Some(&main)).await.unwrap();
+        set_mirror(&repo, "org.example.M", "m", &main).await;
+        let repo = with_groups(
+            &repo_dir,
+            "[ex-ostrya client \"all\"]\nauth=anonymous\nallow=r:**\nsummary=true\n\
+             [ex-ostrya client \"all-collections\"]\nauth=anonymous\ncollection=*\n\
+             allow=r:**\nsummary=true\n\
+             [ex-ostrya client \"local\"]\nauth=ssh:local\nallow=r:**\nsummary=true\n\
+             [ex-ostrya client \"none\"]\nauth=ssh:none\nallow=r:nothing\nsummary=true\n",
+        )
+        .await;
+        repo.regenerate_summary(&fixed()).await.unwrap();
+
+        let every = [main.to_hex(), other.to_hex(), format!("{other}-{main}")];
+        let mut sorted = every.to_vec();
+        sorted.sort();
+        assert_eq!(delta_names(&summary_of(&repo, "anonymous").await), sorted);
+        let mut to_main = vec![main.to_hex(), format!("{other}-{main}")];
+        to_main.sort();
+        assert_eq!(delta_names(&summary_of(&repo, "ssh:local").await), to_main);
+        let none = summary_of(&repo, "ssh:none").await;
+        assert!(none.refs.is_empty());
+        assert!(none.metadata_value("ostree.static-deltas").is_none());
+    });
+}
+
+/// With no client group, the root summary holds each local ref and each
+/// collection ref, and lists each delta. The summary directory holds the
+/// `.access` file of `anonymous` alone. A directory under `refs/mirrors/`
+/// whose name is not a collection id is in the report and in no summary.
+#[test]
+fn with_no_client_group_the_root_summary_holds_each_ref() {
+    let (_tmp, repo_dir) = writable_fixture("summary", "items-implicit");
+    block_on(async {
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        let (_, main) = repo.list_refs(None).await.unwrap()[0].clone();
+        set_mirror(&repo, "org.example.M", "m", &main).await;
+        write_mirror_file(&repo_dir, "bad/x", &format!("{main}\n"));
+        let report = repo.regenerate_summaries(&fixed(), &[]).await.unwrap();
+        assert_eq!(report.invalid_collection_dirs, ["bad"]);
+        let summary = Summary::parse(&repo.read_summary().await.unwrap().unwrap()).unwrap();
+        assert_eq!(ref_names(&summary), ["main", "other"]);
+        let map = summary.collection_map().unwrap();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map[0].0, "org.example.M");
+        let dir: Vec<String> = std::fs::read_dir(repo_dir.join("extensions/ostrya/summary"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        assert_eq!(dir, [format!("{}.access", Checksum::sha256(b"anonymous"))]);
+    });
+}
+
+/// A write removes the files of each item that has no summary: the
+/// `.access` file, the summary, and its signature file. With no summary of
+/// `anonymous`, it removes `summary` and `summary.sig` at the root. It
+/// removes a temp file of a summary file, and leaves each other entry.
+#[test]
+fn the_files_of_an_item_with_no_summary_are_removed() {
+    let (_tmp, repo_dir) = writable_fixture("summary", "items-removed");
+    block_on(async {
+        let groups = "[ex-ostrya client \"public\"]\nauth=anonymous\nallow=r:**\nsummary=true\n\
+                      [ex-ostrya client \"ci\"]\nauth=ssh:ci\nallow=r:**\nsummary=true\n";
+        let repo = with_groups(&repo_dir, groups).await;
+        let signer = ostrya::DummySigner::new(b"sig".to_vec());
+        repo.regenerate_summaries(&fixed(), &[&signer])
+            .await
+            .unwrap();
+        let ci_files = [
+            item_file(&repo_dir, "ssh:ci", ""),
+            item_file(&repo_dir, "ssh:ci", ".sig"),
+            item_file(&repo_dir, "ssh:ci", ".access"),
+        ];
+        for file in &ci_files {
+            assert!(file.exists(), "{file:?}");
+        }
+        assert!(repo_dir.join("summary.sig").exists());
+        let dir = repo_dir.join("extensions/ostrya/summary");
+        std::fs::write(dir.join("notes"), b"keep").unwrap();
+        let temp = format!("{}.sig.tmp-1-2", Checksum::sha256(b"ssh:ci"));
+        std::fs::write(dir.join(&temp), b"temp").unwrap();
+        let other = format!("{}.access", Checksum::sha256(b"ssh:other"));
+        std::fs::write(dir.join(&other), b"x\n").unwrap();
+
+        let text = std::fs::read_to_string(repo_dir.join("config")).unwrap();
+        let text = text
+            .replace(
+                "[ex-ostrya client \"ci\"]\nauth=ssh:ci\nallow=r:**\nsummary=true\n",
+                "",
+            )
+            .replace("allow=r:**\nsummary=true\n", "allow=r:**\nsummary=false\n");
+        std::fs::write(repo_dir.join("config"), text).unwrap();
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        repo.regenerate_summary(&fixed()).await.unwrap();
+        for file in &ci_files {
+            assert!(!file.exists(), "{file:?}");
+        }
+        for name in ["summary", "summary.sig"] {
+            assert!(!repo_dir.join(name).exists(), "{name}");
+        }
+        assert!(!item_file(&repo_dir, "anonymous", ".access").exists());
+        assert!(!dir.join(&temp).exists());
+        assert!(!dir.join(&other).exists());
+        assert_eq!(std::fs::read(dir.join("notes")).unwrap(), b"keep");
+    });
+}
+
+/// A new group name keeps the `.access` file, and a change to `deny` changes
+/// it.
+#[test]
+fn a_new_group_name_keeps_the_access_file() {
+    let (_tmp, repo_dir) = writable_fixture("summary", "items-rename");
+    block_on(async {
+        let groups = "[ex-ostrya client \"public\"]\nauth=anonymous\nallow=r:**\nsummary=true\n";
+        let repo = with_groups(&repo_dir, groups).await;
+        repo.regenerate_summary(&fixed()).await.unwrap();
+        let access = item_file(&repo_dir, "anonymous", ".access");
+        let before = std::fs::read(&access).unwrap();
+        let config = repo_dir.join("config");
+        let text = std::fs::read_to_string(&config).unwrap();
+        std::fs::write(&config, text.replace("\"public\"", "\"renamed\"")).unwrap();
+        Repo::open(&repo_dir)
+            .await
+            .unwrap()
+            .regenerate_summary(&fixed())
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&access).unwrap(), before);
+        let text = std::fs::read_to_string(&config).unwrap();
+        std::fs::write(
+            &config,
+            text.replace("summary=true\n", "deny=other\nsummary=true\n"),
+        )
+        .unwrap();
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        repo.regenerate_summary(&fixed()).await.unwrap();
+        assert_ne!(std::fs::read(&access).unwrap(), before);
+        assert_eq!(ref_names(&summary_of(&repo, "anonymous").await), ["main"]);
+    });
+}
+
+/// A write with signers signs each summary. A signing with no write adds a
+/// signature to each existing summary.
+#[test]
+fn each_summary_is_signed() {
+    let (_tmp, repo_dir) = writable_fixture("summary", "items-signed");
+    block_on(async {
+        let groups = "[ex-ostrya client \"public\"]\nauth=anonymous\nallow=r:**\nsummary=true\n\
+                      [ex-ostrya client \"ci\"]\nauth=ssh:ci\nallow=r:main\nsummary=true\n";
+        let repo = with_groups(&repo_dir, groups).await;
+        let first = ostrya::DummySigner::new(b"first-signature".to_vec());
+        repo.regenerate_summaries(&fixed(), &[&first])
+            .await
+            .unwrap();
+        let holds = |path: &Path, needle: &[u8]| {
+            let bytes = std::fs::read(path).unwrap();
+            bytes.windows(needle.len()).any(|w| w == needle)
+        };
+        let sigs = [
+            repo_dir.join("summary.sig"),
+            item_file(&repo_dir, "ssh:ci", ".sig"),
+        ];
+        for sig in &sigs {
+            assert!(holds(sig, b"first-signature"), "{sig:?}");
+        }
+        let second = ostrya::DummySigner::new(b"second-signature".to_vec());
+        repo.sign_summary_all(&[&second]).await.unwrap();
+        for sig in &sigs {
+            assert!(holds(sig, b"first-signature"), "{sig:?}");
+            assert!(holds(sig, b"second-signature"), "{sig:?}");
+        }
+        repo.regenerate_summary(&fixed()).await.unwrap();
+        for sig in &sigs {
+            assert!(!sig.exists(), "{sig:?}");
+        }
+    });
+}
+
+/// The mirror refs of the own collection id go into field 0 of a summary
+/// under their plain names, and the mirror ref wins over the ref of
+/// `refs/heads` of the same name. The own id is no key of the map.
+#[test]
+fn a_summary_merges_the_mirror_refs_of_the_own_id() {
+    let (_tmp, repo_dir) = collection_fixture_with_no_wait("items-own-mirrors");
+    block_on(async {
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        let (_, main) = repo.list_refs(None).await.unwrap()[0].clone();
+        regenerate_with(&repo, Vec::new()).await;
+        let anchor = repo
+            .resolve_rev("ostree-metadata", false)
+            .await
+            .unwrap()
+            .unwrap();
+        set_mirror(&repo, COLLECTION_ID, "main", &anchor).await;
+        set_mirror(&repo, COLLECTION_ID, "extra/x", &main).await;
+        set_mirror(&repo, "org.ostrya.Other", "m", &main).await;
+        let summary = regenerate_with(&repo, Vec::new()).await;
+        assert_eq!(ref_names(&summary), ["extra/x", "main", "ostree-metadata"]);
+        assert_eq!(summary.lookup("main"), Some(anchor));
+        let map = summary.collection_map().unwrap();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map[0].0, "org.ostrya.Other");
+    });
+}
+
+/// A signer that counts its signatures, for the tests of the summaries with
+/// the same bytes.
+struct CountingSigner {
+    count: std::sync::atomic::AtomicUsize,
+}
+
+impl ostrya::Signer for CountingSigner {
+    fn name(&self) -> &str {
+        "dummy"
+    }
+
+    fn metadata_key(&self) -> &str {
+        "ostree.sign.dummy"
+    }
+
+    fn sign<'a>(&'a self, _: &'a [u8]) -> ostrya::SignFuture<'a> {
+        self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Box::pin(async { Ok(b"counted-signature".to_vec()) })
+    }
+}
+
+/// Two summaries with the same bytes get one signature of each signer, in
+/// a write and in a signing with no write. Each signature file holds it.
+#[test]
+fn summaries_with_the_same_bytes_are_signed_one_time() {
+    let (_tmp, repo_dir) = writable_fixture("summary", "items-same-bytes");
+    block_on(async {
+        let groups = "[ex-ostrya client \"public\"]\nauth=anonymous\nallow=r:**\nsummary=true\n\
+                      [ex-ostrya client \"ci\"]\nauth=ssh:ci\nallow=r:**\nsummary=true\n\
+                      [ex-ostrya client \"main\"]\nauth=ssh:main\nallow=r:main\nsummary=true\n";
+        let repo = with_groups(&repo_dir, groups).await;
+        let counting = || CountingSigner {
+            count: std::sync::atomic::AtomicUsize::new(0),
+        };
+        let signer = counting();
+        repo.regenerate_summaries(&fixed(), &[&signer])
+            .await
+            .unwrap();
+        assert_eq!(signer.count.into_inner(), 2);
+        assert_eq!(
+            repo.read_summary().await.unwrap(),
+            repo.read_summary_of(&item("ssh:ci")).await.unwrap()
+        );
+        let sigs = [
+            repo_dir.join("summary.sig"),
+            item_file(&repo_dir, "ssh:ci", ".sig"),
+            item_file(&repo_dir, "ssh:main", ".sig"),
+        ];
+        let signer = counting();
+        repo.sign_summary_all(&[&signer]).await.unwrap();
+        assert_eq!(signer.count.into_inner(), 2);
+        for sig in &sigs {
+            let bytes = std::fs::read(sig).unwrap();
+            let needle = b"counted-signature";
+            let found = bytes.windows(needle.len()).filter(|w| w == needle).count();
+            assert_eq!(found, 2, "{sig:?}");
+        }
+    });
+}
+
+/// When the access digest of an item changes, the write removes the old
+/// `.access` file before it writes the summary. So a write that fails at the
+/// summary leaves no `.access` file of the old digest.
+#[test]
+fn a_changed_access_file_goes_before_the_summary() {
+    let (_tmp, repo_dir) = writable_fixture("summary", "items-access-first");
+    block_on(async {
+        let groups = "[ex-ostrya client \"public\"]\nauth=anonymous\nallow=r:**\nsummary=true\n";
+        let repo = with_groups(&repo_dir, groups).await;
+        repo.regenerate_summary(&fixed()).await.unwrap();
+        let access = item_file(&repo_dir, "anonymous", ".access");
+        let before = std::fs::read(&access).unwrap();
+
+        // The same digest keeps the file through a failed write.
+        std::fs::remove_file(repo_dir.join("summary")).unwrap();
+        std::fs::create_dir_all(repo_dir.join("summary/block")).unwrap();
+        repo.regenerate_summary(&fixed()).await.unwrap_err();
+        assert_eq!(std::fs::read(&access).unwrap(), before);
+
+        let config = repo_dir.join("config");
+        let text = std::fs::read_to_string(&config).unwrap();
+        std::fs::write(
+            &config,
+            text.replace("summary=true\n", "deny=other\nsummary=true\n"),
+        )
+        .unwrap();
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        repo.regenerate_summary(&fixed()).await.unwrap_err();
+        assert!(!access.exists());
+
+        std::fs::remove_dir_all(repo_dir.join("summary")).unwrap();
+        repo.regenerate_summary(&fixed()).await.unwrap();
+        let after = std::fs::read(&access).unwrap();
+        assert_ne!(after, before);
+        assert_eq!(ref_names(&summary_of(&repo, "anonymous").await), ["main"]);
+    });
+}

@@ -325,7 +325,9 @@ async fn view_reply(view: &ArchiveView, path: &str) -> Reply {
                 body: bytes,
             }
         }
-        ArchiveAnswer::NotFound | ArchiveAnswer::Refused => Reply::not_found(),
+        ArchiveAnswer::NotFound | ArchiveAnswer::Refused | ArchiveAnswer::StaleSummary { .. } => {
+            Reply::not_found()
+        }
     }
 }
 
@@ -407,7 +409,14 @@ async fn split_repo(base: &Path, bare_path: &Path, bare: &Repo, commit: &Checksu
         );
         assert_eq!(id, name.checksum, "the hand-written split object");
     }
-    for rel in ["refs/heads/main", "summary", "summary.sig"] {
+    // The summary of the `anonymous` item needs its `.access` file. Both
+    // repositories have the implicit groups and no collection id, so the
+    // file of the `bare` repository holds the digest of this one.
+    let access = format!(
+        "extensions/ostrya/summary/{}.access",
+        Checksum::sha256(b"anonymous")
+    );
+    for rel in ["refs/heads/main", "summary", "summary.sig", &access] {
         copy(rel);
     }
     write_delta_files(&root);
@@ -768,7 +777,8 @@ const PULLER_GROUPS: &str = "[ex-ostrya client \"puller\"]\nauth=ssh:puller\nall
                              [ex-ostrya client \"all\"]\nauth=ssh:all\nallow=r:**\n";
 
 /// A session serves the refs that its item reads. Another ref gets the
-/// reply of an absent path. `summary` is served with no client group alone.
+/// reply of an absent path. An item with no summary gets the reply of an
+/// absent path for `summary`.
 #[test]
 fn a_session_serves_the_refs_of_its_item() {
     let tmp = TmpDir::new("send-ref-rights");
@@ -1224,7 +1234,72 @@ fn an_invalid_collection_dir_is_reported_one_time_in_a_session() {
     assert_eq!(plain, replies);
 }
 
-/// An end of the input inside a frame is `protocol`.
+/// A session serves the summary of the item of its client. When the
+/// `.access` file of the item does not match, `summary` and `summary.sig`
+/// are absent, and the session reports one `StaleSummary` event, which is no
+/// warning.
+#[test]
+fn a_session_serves_the_summary_of_its_item() {
+    let tmp = TmpDir::new("send-item-summary");
+    let src = build_tree(tmp.path());
+    let repo = block_on(async {
+        let (path, _, _) = repo_of(tmp.path(), RepoMode::Archive, &src).await;
+        let mut text = fs::read_to_string(path.join("config")).unwrap();
+        text.push_str("[ex-ostrya client \"ci\"]\nauth=ssh:ci\nallow=r:**\nsummary=true\n");
+        fs::write(path.join("config"), text).unwrap();
+        let repo = Repo::open(&path).await.unwrap();
+        repo.regenerate_summary(&SummaryOptions::default())
+            .await
+            .unwrap();
+        repo
+    });
+    let stem = Checksum::sha256(b"ssh:ci");
+    let stored = fs::read(
+        repo.path()
+            .join(format!("extensions/ostrya/summary/{stem}")),
+    )
+    .unwrap();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    let mut opts = ostrya::SendOptions::default();
+    opts.on_event = Some(std::sync::Arc::new(move |event: &ostrya::SendEvent| {
+        sink.lock().unwrap().push(event.clone());
+    }));
+    let script = |mut c: Client| async move {
+        c.open().await;
+        let mut replies = Vec::new();
+        for path in ["summary", "summary.sig", "summary"] {
+            c.send(&Message::Get(path.to_owned())).await;
+            replies.push(read_reply(&mut c.reader).await);
+        }
+        replies
+    };
+    let access = repo_access(&repo, "ssh:ci");
+    let (result, replies) = session_with(&repo, &access, &opts, PIPE_CAP, script);
+    result.unwrap();
+    assert_eq!(replies[0].body, stored);
+    assert!(!replies[1].found, "no signature file");
+    assert!(seen.lock().unwrap().is_empty());
+
+    fs::remove_file(
+        repo.path()
+            .join(format!("extensions/ostrya/summary/{stem}.access")),
+    )
+    .unwrap();
+    let (result, replies) = session_with(&repo, &access, &opts, PIPE_CAP, script);
+    result.unwrap();
+    assert!(replies.iter().all(|reply| !reply.found));
+    let seen = seen.lock().unwrap();
+    assert_eq!(seen.len(), 1, "{seen:?}");
+    assert!(!seen[0].is_warning());
+    assert_eq!(
+        seen[0].to_string(),
+        "the summary of the auth item ssh:ci does not match the client groups, and the \
+         session does not serve it; run `ostrya summary -u`"
+    );
+}
+
+/// An end of the input inside a frame is `protocol`./// An end of the input inside a frame is `protocol`.
 #[test]
 fn an_end_inside_a_frame_is_protocol() {
     let tmp = TmpDir::new("send-eof");

@@ -1380,39 +1380,196 @@ fn the_refs_follow_the_read_rights() {
     });
 }
 
-/// `summary` and `summary.sig` are served with no client group, also with
-/// receive policies, and get 404 with a client group.
+/// Returns a request of `method` for `target` with the bearer token
+/// `token`, which closes its connection.
+fn ask_with_token(method: &str, target: &str, token: &str) -> String {
+    format!(
+        "{method} {target} HTTP/1.1\r\nhost: x\r\nauthorization: Bearer {token}\r\n\
+         connection: close\r\n\r\n"
+    )
+}
+
+/// `summary` and `summary.sig` give the files of the summary of the item of
+/// the client: the files at the root for `anonymous`, and the files under
+/// `extensions/ostrya/summary/` for a token item. An item with no summary
+/// gets 404. A 200 and a 404 carry `Cache-Control: private`, and a 401 does
+/// not.
 #[test]
-fn the_summary_is_served_with_no_client_group_alone() {
+fn the_summary_of_each_item_is_served() {
     let tmp = TmpDir::new("read-summary");
-    let (path, repo, _, _) = block_on(repo(tmp.path()));
-    block_on(repo.regenerate_summary(&ostrya::SummaryOptions::default())).unwrap();
-    std::fs::write(path.join("summary.sig"), b"sig").unwrap();
-    let stored = std::fs::read(path.join("summary")).unwrap();
-    let (repo, policies) = with_groups(&path, "");
-    with_server(repo, with_policies(policies), |addrs| async move {
-        let (head, body) = exchange(addrs[0], &ask("GET", "/summary")).await;
-        assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
-        assert_eq!(body, stored);
-        let (head, _) = exchange(addrs[0], &ask("HEAD", "/summary.sig")).await;
-        assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
-    });
+    let (path, _, _, _) = block_on(repo(tmp.path()));
+    copy_main(&path, &["refs/heads/pub/a"]);
+    let digest = |token: &str| Checksum::sha256(token.as_bytes()).to_hex();
     let (repo, policies) = with_groups(
         &path,
-        "[ex-ostrya client \"c\"]\nauth=anonymous\nallow=r:**\n",
+        &format!(
+            "[ex-ostrya client \"public\"]\nauth=anonymous\nallow=r:pub/**\nsummary=true\n\
+             [ex-ostrya client \"ci\"]\nauth=token-sha256:{}\nallow=r:**\nsummary=true\n\
+             [ex-ostrya client \"ops\"]\nauth=token-sha256:{}\nallow=r:**\n",
+            digest("ci-token"),
+            digest("ops-token")
+        ),
     );
-    with_server(repo, with_policies(policies), |addrs| async move {
+    let signer = ostrya::DummySigner::new(b"sig".to_vec());
+    block_on(repo.regenerate_summaries(&ostrya::SummaryOptions::default(), &[&signer])).unwrap();
+    let stem = Checksum::sha256(format!("token-sha256:{}", digest("ci-token")).as_bytes());
+    let stored = |rel: &str| std::fs::read(path.join(rel)).unwrap();
+    let ci_summary = stored(&format!("extensions/ostrya/summary/{stem}"));
+    let ci_sig = stored(&format!("extensions/ostrya/summary/{stem}.sig"));
+    let (root_summary, root_sig) = (stored("summary"), stored("summary.sig"));
+    assert_eq!(listed_names(&root_summary), ["pub/a"]);
+    assert_eq!(listed_names(&ci_summary), ["main", "pub/a"]);
+    let mut opts = with_policies(policies);
+    opts.allow_cleartext_credentials = true;
+    with_server(repo, opts, |addrs| async move {
+        let addr = addrs[0];
+        for (token, target, want) in [
+            (None, "/summary", &root_summary),
+            (None, "/summary.sig", &root_sig),
+            (Some("ci-token"), "/summary", &ci_summary),
+            (Some("ci-token"), "/summary.sig", &ci_sig),
+        ] {
+            for method in ["GET", "HEAD"] {
+                let request = match token {
+                    Some(token) => ask_with_token(method, target, token),
+                    None => ask(method, target),
+                };
+                let (head, body) = exchange(addr, &request).await;
+                assert!(
+                    head.starts_with("HTTP/1.1 200 "),
+                    "{method} {target}: {head}"
+                );
+                assert!(head.contains("cache-control: private\r\n"), "{head}");
+                let len = want.len().to_string();
+                assert_eq!(header(&head, "content-length"), Some(len.as_str()));
+                if method == "GET" {
+                    assert_eq!(&body, want, "{target}");
+                }
+            }
+        }
+        for method in ["GET", "HEAD"] {
+            for target in ["/summary", "/summary.sig"] {
+                let (head, _) = exchange(addr, &ask_with_token(method, target, "ops-token")).await;
+                assert!(
+                    head.starts_with("HTTP/1.1 404 "),
+                    "{method} {target}: {head}"
+                );
+                assert!(head.contains("cache-control: private\r\n"), "{head}");
+            }
+            let response = raw(addr, &ask_with_token(method, "/summary", "bad-token")).await;
+            assert!(!response.starts_with("HTTP/1.1 200 "), "{response}");
+            assert!(!response.starts_with("HTTP/1.1 404 "), "{response}");
+            assert_eq!(header(&response, "cache-control"), None, "{response}");
+        }
+        let (head, _) = exchange(addr, &ask("GET", "/config")).await;
+        assert_eq!(header(&head, "cache-control"), None, "{head}");
+        let direct = format!("/extensions/ostrya/summary/{stem}");
+        let (head, _) = exchange(addr, &ask_with_token("GET", &direct, "ci-token")).await;
+        assert!(head.starts_with("HTTP/1.1 404 "), "{head}");
+    });
+}
+
+/// A change to `allow` makes the summary stale: the server answers 404 and
+/// reports one error event for each item, until the summaries are written
+/// again. The server reads the files for each request, so the new write
+/// takes effect while the server runs.
+#[test]
+fn a_stale_summary_gets_404_until_it_is_written_again() {
+    stale_until_written("read-summary-stale", "allow=r:pub/**\n", "allow=r:**\n");
+}
+
+/// A change to `deny` makes the summary stale, as a change to `allow` does.
+#[test]
+fn a_deny_change_gets_404_until_the_summary_is_written_again() {
+    stale_until_written(
+        "read-summary-stale-deny",
+        "allow=r:**\ndeny=main\n",
+        "allow=r:**\n",
+    );
+}
+
+/// Writes the summary of `anonymous` under the rules `before`, which read
+/// `pub/a` alone, and serves the repository under the rules `after`, which
+/// read `main` and `pub/a`. The summary gets 404 and one error event until
+/// the summaries are written again.
+fn stale_until_written(name: &str, before: &str, after: &str) {
+    let tmp = TmpDir::new(name);
+    let (path, _, _, _) = block_on(repo(tmp.path()));
+    copy_main(&path, &["refs/heads/pub/a"]);
+    let group = |rules: &str| {
+        format!("[ex-ostrya client \"public\"]\nauth=anonymous\n{rules}summary=true\n")
+    };
+    let (repo, _) = with_groups(&path, &group(before));
+    block_on(repo.regenerate_summary(&ostrya::SummaryOptions::default())).unwrap();
+    let written = std::fs::read(path.join("summary")).unwrap();
+    assert_eq!(listed_names(&written), ["pub/a"]);
+    let config = path.join("config");
+    let text = std::fs::read_to_string(&config).unwrap();
+    std::fs::write(&config, text.replace(&group(before), &group(after))).unwrap();
+    let (repo, policies) = with_groups(&path, "");
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = events.clone();
+    let mut opts = with_policies(policies);
+    opts.on_event = Some(Arc::new(move |event: &ostrya_server::ServerEvent| {
+        sink.lock().unwrap().push(event.clone());
+    }));
+    let writer = repo.clone();
+    with_server(repo, opts, |addrs| async move {
         for (method, target) in [
             ("GET", "/summary"),
             ("HEAD", "/summary"),
             ("GET", "/summary.sig"),
-            ("HEAD", "/summary.sig"),
         ] {
             let (head, _) = exchange(addrs[0], &ask(method, target)).await;
             assert!(
                 head.starts_with("HTTP/1.1 404 "),
                 "{method} {target}: {head}"
             );
+            assert!(head.contains("cache-control: private\r\n"), "{head}");
+        }
+        writer
+            .regenerate_summary(&ostrya::SummaryOptions::default())
+            .await
+            .unwrap();
+        let (head, body) = exchange(addrs[0], &ask("GET", "/summary")).await;
+        assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+        assert_eq!(listed_names(&body), ["main", "pub/a"]);
+    });
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 1, "{events:?}");
+    assert!(
+        matches!(&events[0], ostrya_server::ServerEvent::StaleSummary { item, .. }
+            if item == "anonymous"),
+        "{events:?}"
+    );
+    assert!(!events[0].is_warning());
+}
+
+/// A 403 of `summary` and `summary.sig` carries no `Cache-Control`. A
+/// credential over plain HTTP gets 403 without
+/// `allow-cleartext-credentials`.
+#[test]
+fn a_403_of_the_summary_carries_no_cache_control() {
+    let tmp = TmpDir::new("read-summary-403");
+    let (path, _, _, _) = block_on(repo(tmp.path()));
+    let token = Checksum::sha256(b"ci-token").to_hex();
+    let (repo, policies) = with_groups(
+        &path,
+        &format!(
+            "[ex-ostrya client \"ci\"]\nauth=token-sha256:{token}\nallow=r:**\nsummary=true\n"
+        ),
+    );
+    block_on(repo.regenerate_summary(&ostrya::SummaryOptions::default())).unwrap();
+    with_server(repo, with_policies(policies), |addrs| async move {
+        for method in ["GET", "HEAD"] {
+            for target in ["/summary", "/summary.sig"] {
+                let response = raw(addrs[0], &ask_with_token(method, target, "ci-token")).await;
+                assert!(
+                    response.starts_with("HTTP/1.1 403 "),
+                    "{method} {target}: {response}"
+                );
+                assert_eq!(header(&response, "cache-control"), None, "{response}");
+            }
         }
     });
 }

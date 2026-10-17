@@ -47,6 +47,10 @@
 //!   empty value is refused.
 //! - `allow-privileged` (boolean, default false) -- accept the privileged
 //!   file modes and extended attributes in a `bare` repository.
+//! - `summary` (boolean, default false) -- add the namespace of the group to
+//!   the summary of each auth item of the group (see
+//!   [Summaries](#summaries)). A group with `tls-accept-claim=true` cannot
+//!   set `summary=true`.
 //!
 //! [`ServerSettings`] lists the keys of `[ex-ostrya server]`.
 //!
@@ -63,6 +67,7 @@
 //! - A collection id fails the collection-id rule, or is the own collection
 //!   id of the repository.
 //! - A network has host bits set.
+//! - A group sets `tls-accept-claim=true` and `summary=true`.
 //! - `verify`, `sign`, or `sign-summary` names a trust group or a key group
 //!   that does not exist.
 //!
@@ -96,8 +101,47 @@
 //! group of its item in the namespace of the path has `r` on `NAME`. The own
 //! collection id under `refs/mirrors/` names the local refs. An alias needs
 //! `r` on its name and on its target. No client reads another path under
-//! `refs/`. `summary` and `summary.sig` are read only with no client group.
-//! [`ReadAccess`] states the rules.
+//! `refs/`. `summary` and `summary.sig` give the summary of the item of the
+//! client (see [Summaries](#summaries)). [`ReadAccess`] states the rules.
+//!
+//! # Summaries
+//!
+//! An auth item has a summary when one or more of its groups has
+//! `summary=true`. Each other item has no summary. The summary of an item
+//! holds the refs that the item reads in each namespace whose selected
+//! group has `summary=true`. A namespace whose selected group has
+//! `summary=false` adds no ref, and no other group takes its place.
+//!
+//! [`ClientAccess::summary_digest`] gives the access digest of an item: the
+//! SHA-256 digest of a text that holds `[core] collection-id` and the
+//! namespace, the allow items, the deny items, and the value of `summary`
+//! of each group of the item, `summary=false` groups included:
+//!
+//! ```text
+//! collection-id=ID
+//! namespace=NS
+//! allow=ITEMS
+//! deny=PATTERNS
+//! summary=BOOL
+//! ```
+//!
+//! - `ID` is `[core] collection-id`, or empty with no collection id.
+//! - Each group adds the four lines `namespace=`, `allow=`, `deny=`, and
+//!   `summary=`. The groups come in the byte-wise order of their
+//!   `namespace=` lines.
+//! - `NS` is empty for the local refs, `*` for `collection=*`, and else the
+//!   collection ids, sorted byte-wise and joined by `;`.
+//! - `ITEMS` is the allow items in the form `MODES:PATTERN`, with the modes
+//!   in the order `rwctd`. Each distinct item occurs one time. The items
+//!   are sorted byte-wise and joined by `;`.
+//! - `PATTERNS` is the deny patterns, in the same way.
+//! - `BOOL` is `true` or `false`, the value of `summary`.
+//! - Each line ends with a newline.
+//!
+//! The text holds each group that the item can select in a namespace, so
+//! the digest changes when a change to the config can change the refs of
+//! the summary. The group names are not in the text, so a new group name
+//! keeps the digest.
 //!
 //! # Implicit groups
 //!
@@ -107,11 +151,13 @@
 //! [ex-ostrya client "anonymous"]
 //! auth=anonymous
 //! allow=r:**
+//! summary=true
 //!
 //! [ex-ostrya client "anonymous-collections"]
 //! auth=anonymous
 //! collection=*
 //! allow=r:**
+//! summary=true
 //! ```
 //!
 //! # Examples
@@ -153,6 +199,8 @@ pub(crate) use read::reads;
 #[cfg(feature = "receive")]
 pub(crate) use reader::{Group, classify};
 pub use rights::{AccessModes, AccessRules, AllowItem};
+
+use ostrya_core::Checksum;
 
 use crate::config::RepoConfig;
 use crate::error::{Error, Result};
@@ -252,6 +300,7 @@ pub struct ClientGroup {
     allow_unsigned: bool,
     sign: Vec<String>,
     allow_privileged: bool,
+    summary: bool,
     implicit: bool,
 }
 
@@ -306,6 +355,14 @@ impl ClientGroup {
     /// Returns the value of `allow-privileged`.
     pub fn allow_privileged(&self) -> bool {
         self.allow_privileged
+    }
+
+    /// Returns the value of `summary`: `true` if the namespace of the group
+    /// is in the summary of each auth item of the group.
+    ///
+    /// The [module doc](crate::access#summaries) states the rule.
+    pub fn summary(&self) -> bool {
+        self.summary
     }
 
     /// Returns `true` for one of the two groups that a config with no client
@@ -549,6 +606,19 @@ pub struct ClientAccess {
     /// The indexes in `groups` of the groups that carry each item, in the
     /// order of the config.
     by_item: HashMap<AuthItem, Vec<usize>>,
+    /// The summary files of each item that has a summary.
+    summaries: HashMap<AuthItem, SummaryFiles>,
+}
+
+/// The access digest of one auth item with a summary, and the stem of the
+/// names of its files under `extensions/ostrya/summary/`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SummaryFiles {
+    /// The access digest of the item.
+    pub(crate) digest: Checksum,
+    /// `HEX`: the SHA-256 digest of the text of the item, in 64 lowercase
+    /// hex digits.
+    pub(crate) stem: String,
 }
 
 impl ClientAccess {
@@ -596,11 +666,13 @@ impl ClientAccess {
     pub fn implicit(collection_id: Option<&str>) -> ClientAccess {
         let groups = reader::implicit_groups();
         let by_item = reader::index(&groups);
+        let summaries = reader::summary_digests(&groups, &by_item, collection_id);
         ClientAccess {
             collection_id: collection_id.map(str::to_owned),
             server: ServerSettings::default(),
             groups,
             by_item,
+            summaries,
         }
     }
 
@@ -624,6 +696,42 @@ impl ClientAccess {
     /// the order of the config.
     fn carriers(&self, item: &AuthItem) -> &[usize] {
         self.by_item.get(item).map_or(&[], Vec::as_slice)
+    }
+
+    /// Returns the access digest of `item`, or `None` if `item` has no
+    /// summary.
+    ///
+    /// An item has a summary when one or more of its groups has
+    /// `summary=true`. The digest covers `[core] collection-id` and the
+    /// namespace, the allow items, the deny items, and the value of
+    /// `summary` of each group of the item. The
+    /// [module doc](crate::access#summaries) states the text.
+    /// The value computes the digests one time, when it reads the config.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use ostrya::config::RepoConfig;
+    /// use ostrya::access::{AuthItem, ClientAccess};
+    ///
+    /// let config = RepoConfig::parse(
+    ///     "[core]\nrepo_version=1\nmode=archive-z2\n\
+    ///      [ex-ostrya client \"public\"]\nauth=anonymous\nallow=r:pub/**\nsummary=true\n\
+    ///      [ex-ostrya client \"ci\"]\nauth=ssh:ci\nallow=r:**\n",
+    /// )?;
+    /// let access = ClientAccess::from_config(&config, "/srv/repo".as_ref())?;
+    /// assert!(access.summary_digest(&AuthItem::Anonymous).is_some());
+    /// assert!(access.summary_digest(&AuthItem::parse("ssh:ci")?).is_none());
+    /// # Ok::<(), ostrya::Error>(())
+    /// ```
+    pub fn summary_digest(&self, item: &AuthItem) -> Option<Checksum> {
+        self.summaries.get(item).map(|files| files.digest)
+    }
+
+    /// Returns the access digest of `item` and the stem of the names of its
+    /// files, or `None` if `item` has no summary.
+    pub(crate) fn summary_files(&self, item: &AuthItem) -> Option<&SummaryFiles> {
+        self.summaries.get(item)
     }
 
     /// Returns the namespace of the collection id `collection`.

@@ -1672,7 +1672,7 @@ mod tests {
             .identify_read(&headers(&["Bearer a-token"]), &tls())
             .unwrap();
         assert!(read.can_read_path("refs/heads/any"));
-        assert!(!read.serves_summary());
+        assert!(read.summary_digest().is_none());
 
         let (auth, _tmp) = self::auth(&credentials());
         let refusal = auth.identify_read(&HeaderMap::new(), &tls()).unwrap_err();

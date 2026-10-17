@@ -28,11 +28,14 @@ use ostrya_rt::FileReader;
 use rustix::fs::{AtFlags, FileType, Mode, OFlags, Statx, StatxFlags};
 use rustix::io::Errno;
 
-use crate::access::ReadAccess;
+use crate::access::{AuthItem, ReadAccess};
 use crate::config::RepoConfig;
 use crate::error::{Error, Result};
 use crate::file::{Contained, ContentReader, FileKind};
 use crate::repo::Repo;
+use crate::summary::{
+    ACCESS_SUFFIX, SIG_SUFFIX, SUMMARY_DIR, SUMMARY_FILE, SUMMARY_SIG_FILE, access_file_bytes,
+};
 use crate::write::archive_level;
 
 /// The maximum number of `.filez` objects that one view deflates at one time.
@@ -51,10 +54,12 @@ pub const MAX_COMPRESSORS: usize = 16;
 ///   group with `repo_version=1` and `mode=archive-z2`. Then come
 ///   `collection-id` and `indexed-deltas`, with the values of the repository,
 ///   if the repository sets them. The view serves no other key.
-/// - `summary`, `summary.sig`, the files under `refs/` and `extensions/`, and
-///   the `.commit`, `.dirtree`, `.dirmeta`, and `.commitmeta` objects: the
-///   view serves them as stored, to a client that reads them (see
-///   [Read access](ArchiveView#read-access)). `extensions/ostrya` and each
+/// - `summary` and `summary.sig`: the view serves the files of the summary
+///   of the item of the client, as stored (see
+///   [Read access](ArchiveView#read-access)).
+/// - The files under `refs/` and `extensions/`, and the `.commit`,
+///   `.dirtree`, `.dirmeta`, and `.commitmeta` objects: the view serves them
+///   as stored, to a client that reads them. `extensions/ostrya` and each
 ///   path under it are not found.
 /// - In an `archive` repository, the view also serves the `.filez` objects
 ///   and the files under `deltas/` and `delta-indexes/` as stored.
@@ -83,11 +88,36 @@ pub const MAX_COMPRESSORS: usize = 16;
 ///   `refs/heads/NAME` and `refs/mirrors/ID/NAME` need `r` on `NAME`, and
 ///   each other path under `refs/` is refused, `refs/remotes/` included.
 /// - An alias also needs [`ReadAccess::can_read_path`] on its target.
-/// - `summary` and `summary.sig` need [`ReadAccess::serves_summary`].
 /// - `config`, the objects, and the files under `extensions/`, `deltas/`,
 ///   and `delta-indexes/` need no right.
 ///
 /// A path that the client cannot read is refused.
+///
+/// `summary` and `summary.sig` give the files of the summary of the item of
+/// the client, which
+/// [`Repo::regenerate_summaries`](crate::Repo::regenerate_summaries) writes
+/// (section "Files"). For the `anonymous` item, they are `summary` and
+/// `summary.sig` at the repository root. For each other item, they are
+/// `extensions/ostrya/summary/HEX` and `extensions/ostrya/summary/HEX.sig`.
+/// For each request, the view opens the file first, and then reads the
+/// `.access` file of the item:
+///
+/// - An item with no summary ([`ReadAccess::summary_digest`] is `None`)
+///   gets [`ArchiveAnswer::NotFound`].
+/// - When the `.access` file holds another digest than the access digest of
+///   the item, or does not exist while the file exists, the answer is
+///   [`ArchiveAnswer::StaleSummary`].
+/// - Else the view serves the file, or answers not found when the file does
+///   not exist.
+///
+/// Before it serves the file, the view checks that the name of the file
+/// still names the file that it opened. If a write replaced the file during
+/// the request, the view starts again, at most three times, and then
+/// answers not found.
+///
+/// The view opens each component of these paths with no symlink followed,
+/// as for each stored file. A symlink on the path of the `.access` file or
+/// of the file is refused.
 ///
 /// # File access
 ///
@@ -149,6 +179,17 @@ pub enum ArchiveAnswer {
     /// - a path with a symlink on it that is no ref alias
     /// - a path that the [`ReadAccess`] of the request does not read.
     Refused,
+    /// The answer for `summary` or `summary.sig` when the `.access` file of
+    /// the item of the client holds another digest than the access digest of
+    /// the item, or does not exist while the file exists.
+    ///
+    /// The summary of the item does not match the client groups. A server
+    /// answers as for [`NotFound`](ArchiveAnswer::NotFound), and tells the
+    /// operator to write the summaries again.
+    StaleSummary {
+        /// The auth item of the client.
+        item: AuthItem,
+    },
 }
 
 /// The answer of the view for one `HEAD` request path.
@@ -168,6 +209,9 @@ pub enum ArchiveHead {
     NotFound,
     /// The same answer as [`ArchiveAnswer::Refused`].
     Refused,
+    /// The same answer as [`ArchiveAnswer::StaleSummary`]. The item is the
+    /// item of the [`ReadAccess`] of the request.
+    StaleSummary,
 }
 
 impl fmt::Debug for ArchiveAnswer {
@@ -180,6 +224,9 @@ impl fmt::Debug for ArchiveAnswer {
                 .finish_non_exhaustive(),
             ArchiveAnswer::NotFound => f.write_str("NotFound"),
             ArchiveAnswer::Refused => f.write_str("Refused"),
+            ArchiveAnswer::StaleSummary { item } => {
+                f.debug_struct("StaleSummary").field("item", item).finish()
+            }
         }
     }
 }
@@ -262,6 +309,17 @@ impl ArchiveView {
                 Walked::NotFound => ArchiveAnswer::NotFound,
                 Walked::Refused | Walked::Alias(_) => ArchiveAnswer::Refused,
             }),
+            Route::Summary { sig } => Ok(match self.summary(sig, access).await? {
+                Summarized::Walked(Walked::File(file, len)) => ArchiveAnswer::Stream {
+                    len: Some(len),
+                    body: Box::new(FileReader::with_len_hint(file, len)),
+                },
+                Summarized::Walked(Walked::NotFound) => ArchiveAnswer::NotFound,
+                Summarized::Walked(Walked::Refused | Walked::Alias(_)) => ArchiveAnswer::Refused,
+                Summarized::Stale => ArchiveAnswer::StaleSummary {
+                    item: access.item().clone(),
+                },
+            }),
             Route::BuiltFilez(checksum) => self.built_filez(&checksum).await,
             Route::NotFound => Ok(ArchiveAnswer::NotFound),
             Route::Refused => Ok(ArchiveAnswer::Refused),
@@ -310,6 +368,12 @@ impl ArchiveView {
                 Walked::File(_, len) => ArchiveHead::Found { len: Some(len) },
                 Walked::NotFound => ArchiveHead::NotFound,
                 Walked::Refused | Walked::Alias(_) => ArchiveHead::Refused,
+            }),
+            Route::Summary { sig } => Ok(match self.summary(sig, access).await? {
+                Summarized::Walked(Walked::File(_, len)) => ArchiveHead::Found { len: Some(len) },
+                Summarized::Walked(Walked::NotFound) => ArchiveHead::NotFound,
+                Summarized::Walked(Walked::Refused | Walked::Alias(_)) => ArchiveHead::Refused,
+                Summarized::Stale => ArchiveHead::StaleSummary,
             }),
             Route::BuiltFilez(checksum) => {
                 let repo = self.repo.clone();
@@ -408,6 +472,81 @@ impl ArchiveView {
         Ok(walked)
     }
 
+    /// Opens the file of the summary of the item of `access`: the summary,
+    /// or its signature file with `sig`.
+    ///
+    /// An item with no summary gives not found. The call opens the file
+    /// first, and then reads the `.access` file of the item, which must hold
+    /// the access digest of the item, else the result is
+    /// [`Summarized::Stale`]. With no `.access` file, the result is
+    /// [`Summarized::Stale`] when the file exists, and not found when it
+    /// does not. The walk to each file follows no symlink.
+    ///
+    /// A matching `.access` file covers the file that its directory holds
+    /// at the read. So after the read, the call checks that the name of the
+    /// file still names the open file. If not, a write replaced the file
+    /// during the request, and the call starts again, at most
+    /// [`SUMMARY_TRIES`] times. Then the result is not found.
+    async fn summary(&self, sig: bool, access: &ReadAccess) -> Result<Summarized> {
+        let Some(files) = access.summary_files() else {
+            return Ok(Summarized::Walked(Walked::NotFound));
+        };
+        let anonymous = *access.item() == AuthItem::Anonymous;
+        let name = match (anonymous, sig) {
+            (true, false) => SUMMARY_FILE.to_owned(),
+            (true, true) => SUMMARY_SIG_FILE.to_owned(),
+            (false, false) => files.stem.clone(),
+            (false, true) => format!("{}{SIG_SUFFIX}", files.stem),
+        };
+        let access_name = format!("{}{ACCESS_SUFFIX}", files.stem);
+        let want = access_file_bytes(&files.digest);
+        let repo = self.repo.clone();
+        let summarized = ostrya_rt::unblock(move || -> io::Result<Summarized> {
+            // The one walk to the directory of the `.access` file.
+            let dir = match walk_dir(repo.repo_fd(), SUMMARY_DIR)? {
+                WalkedDir::Dir(dir) => Some(dir),
+                WalkedDir::Other(Walked::NotFound) => None,
+                WalkedDir::Other(walked) => return Ok(Summarized::Walked(walked)),
+            };
+            for _ in 0..SUMMARY_TRIES {
+                let at = match (&dir, anonymous) {
+                    (_, true) => repo.repo_fd(),
+                    (Some(dir), false) => dir.as_fd(),
+                    (None, false) => return Ok(Summarized::Walked(Walked::NotFound)),
+                };
+                // The file first, so a write between the two opens cannot
+                // pair a matching `.access` file with a later file.
+                let file = walk(at, &name, false)?;
+                let current = match &dir {
+                    Some(dir) => walk(dir.as_fd(), &access_name, false)?,
+                    None => Walked::NotFound,
+                };
+                let file = match (current, file) {
+                    (Walked::File(current, _), file) => {
+                        if !holds(&current, &want)? {
+                            return Ok(Summarized::Stale);
+                        }
+                        file
+                    }
+                    (Walked::NotFound, Walked::File(..)) => return Ok(Summarized::Stale),
+                    // With no `.access` file and no file, no summary was
+                    // written for the item, and the answer is not found.
+                    (Walked::NotFound, file) => file,
+                    (current, _) => return Ok(Summarized::Walked(current)),
+                };
+                let Walked::File(file, len) = file else {
+                    return Ok(Summarized::Walked(file));
+                };
+                if names_file(at, &name, &file)? {
+                    return Ok(Summarized::Walked(Walked::File(file, len)));
+                }
+            }
+            Ok(Summarized::Walked(Walked::NotFound))
+        })
+        .await?;
+        Ok(summarized)
+    }
+
     /// Builds a `.filez` from the stored content object `checksum`.
     ///
     /// The `statx` of `config` and the load of the object share one call on
@@ -485,14 +624,43 @@ fn object_answer<T>(loaded: Result<T>) -> Result<Object<T>> {
 /// Returns `true` if `access` reads the stored file at `path` under the
 /// repository root.
 ///
-/// `summary` and `summary.sig` need [`ReadAccess::serves_summary`]. A path
-/// under `refs/` needs [`ReadAccess::can_read_path`]. Each other path needs
-/// no right. The function reads no file.
+/// A path under `refs/` needs [`ReadAccess::can_read_path`]. Each other path
+/// needs no right. The function reads no file.
 fn readable(path: &str, access: &ReadAccess) -> bool {
-    match path {
-        "summary" | "summary.sig" => access.serves_summary(),
-        _ if path.starts_with("refs/") => access.can_read_path(path),
-        _ => true,
+    !path.starts_with("refs/") || access.can_read_path(path)
+}
+
+/// The outcome of the walk to a file of a summary.
+enum Summarized {
+    /// The walk to the file.
+    Walked(Walked),
+    /// The `.access` file holds another digest than the access digest of the
+    /// item, or does not exist while the file exists.
+    Stale,
+}
+
+/// The number of times that a request for a file of a summary opens the
+/// file while a write replaces it, before the answer is not found.
+const SUMMARY_TRIES: usize = 3;
+
+/// Returns `true` if `file` holds exactly `want`. The read stops one byte
+/// past the length of `want`.
+pub(crate) fn holds(file: &std::fs::File, want: &[u8]) -> io::Result<bool> {
+    use std::io::Read;
+
+    let mut buf = Vec::with_capacity(want.len() + 1);
+    file.take(want.len() as u64 + 1).read_to_end(&mut buf)?;
+    Ok(buf == want)
+}
+
+/// Returns `true` if `name` under `dir` is the open file `file`, with no
+/// symlink followed.
+fn names_file(dir: BorrowedFd<'_>, name: &str, file: &std::fs::File) -> io::Result<bool> {
+    let open = rustix::fs::fstat(file)?;
+    match rustix::fs::statat(dir, name, AtFlags::SYMLINK_NOFOLLOW) {
+        Ok(named) => Ok(named.st_dev == open.st_dev && named.st_ino == open.st_ino),
+        Err(Errno::NOENT) => Ok(false),
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -561,6 +729,11 @@ enum Anchor {
 #[derive(Debug, Eq, PartialEq)]
 enum Route {
     Config,
+    /// `summary`, or `summary.sig` with `sig`: a file of the summary of the
+    /// item of the client.
+    Summary {
+        sig: bool,
+    },
     /// A stored file at `path` under `anchor`. `alias_ok` allows a ref alias
     /// at the last component.
     Stored {
@@ -604,7 +777,8 @@ fn classify(path: &str, mode: RepoMode) -> Route {
     match (first, rest) {
         ("tmp" | "state", _) => Route::Refused,
         ("config", None) => Route::Config,
-        ("summary" | "summary.sig", None) => stored(false),
+        ("summary", None) => Route::Summary { sig: false },
+        ("summary.sig", None) => Route::Summary { sig: true },
         ("refs", Some(_)) => stored(true),
         ("extensions", Some(rest)) if rest == "ostrya" || rest.starts_with("ostrya/") => {
             Route::NotFound
@@ -673,23 +847,11 @@ pub(crate) fn walk(root: BorrowedFd<'_>, path: &str, alias_ok: bool) -> io::Resu
         Some((dirs, last)) => (Some(dirs), last),
         None => (None, path),
     };
-    let mut held: Option<OwnedFd> = None;
-    for part in dirs.into_iter().flat_map(|dirs| dirs.split('/')) {
-        let dir = held.as_ref().map_or(root, |fd| fd.as_fd());
-        match rustix::fs::openat(
-            dir,
-            part,
-            OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
-            Mode::empty(),
-        ) {
-            Ok(fd) => held = Some(fd),
-            Err(Errno::NOENT | Errno::NAMETOOLONG) => return Ok(Walked::NotFound),
-            // A symlink gives `ENOTDIR` under `O_DIRECTORY`, and so does any
-            // other entry that is no directory.
-            Err(Errno::NOTDIR | Errno::LOOP) => return not_a_directory(dir, part),
-            Err(e) => return Err(e.into()),
-        }
-    }
+    let held = match dirs.map(|dirs| walk_dir(root, dirs)).transpose()? {
+        Some(WalkedDir::Dir(fd)) => Some(fd),
+        Some(WalkedDir::Other(walked)) => return Ok(walked),
+        None => None,
+    };
     let dir = held.as_ref().map_or(root, |fd| fd.as_fd());
     let fd = match rustix::fs::openat(
         dir,
@@ -716,6 +878,48 @@ pub(crate) fn walk(root: BorrowedFd<'_>, path: &str, alias_ok: bool) -> io::Resu
         std::fs::File::from(fd),
         stat.st_size.max(0) as u64,
     ))
+}
+
+/// The outcome of [`walk_dir`].
+enum WalkedDir {
+    /// The directory, opened with `O_PATH`.
+    Dir(OwnedFd),
+    /// [`Walked::NotFound`] or [`Walked::Refused`].
+    Other(Walked),
+}
+
+/// Opens the directory at `path` under `root` and follows no symlink.
+///
+/// The walk takes the components of `path` one at a time, and opens each
+/// one with `O_PATH`, `O_DIRECTORY`, and `O_NOFOLLOW`, as [`walk`] opens
+/// the directories on its path. A symlink gives refused, and a component
+/// that does not exist or is no directory gives not found.
+fn walk_dir(root: BorrowedFd<'_>, path: &str) -> io::Result<WalkedDir> {
+    let mut held: Option<OwnedFd> = None;
+    for part in path.split('/') {
+        let dir = held.as_ref().map_or(root, |fd| fd.as_fd());
+        match rustix::fs::openat(
+            dir,
+            part,
+            OFlags::PATH | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+            Mode::empty(),
+        ) {
+            Ok(fd) => held = Some(fd),
+            Err(Errno::NOENT | Errno::NAMETOOLONG) => {
+                return Ok(WalkedDir::Other(Walked::NotFound));
+            }
+            // A symlink gives `ENOTDIR` under `O_DIRECTORY`, and so does any
+            // other entry that is no directory.
+            Err(Errno::NOTDIR | Errno::LOOP) => {
+                return not_a_directory(dir, part).map(WalkedDir::Other);
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Ok(match held {
+        Some(fd) => WalkedDir::Dir(fd),
+        None => WalkedDir::Other(Walked::NotFound),
+    })
 }
 
 /// The answer for an intermediate component that did not open as a
@@ -1023,14 +1227,8 @@ mod tests {
         let object = |ext: &str| format!("objects/{fanout}/{rest}.{ext}");
         for mode in [RepoMode::Archive, RepoMode::BareUser] {
             assert_eq!(route("config", mode), Route::Config);
-            assert_eq!(
-                route("summary", mode),
-                stored(Anchor::Repo, "summary", false)
-            );
-            assert_eq!(
-                route("summary.sig", mode),
-                stored(Anchor::Repo, "summary.sig", false)
-            );
+            assert_eq!(route("summary", mode), Route::Summary { sig: false });
+            assert_eq!(route("summary.sig", mode), Route::Summary { sig: true });
             assert_eq!(
                 route("refs/heads/a/b", mode),
                 stored(Anchor::Repo, "refs/heads/a/b", true)
@@ -1181,6 +1379,25 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    /// `names_file` is `true` while the name names the open file, and
+    /// `false` after a rename replaces the file and after a removal.
+    #[test]
+    fn a_replaced_file_no_more_has_its_name() {
+        let dir = scratch("names-file");
+        std::fs::write(dir.join("summary"), b"old").unwrap();
+        let root = std::fs::File::open(&dir).unwrap();
+        let Walked::File(file, _) = walk(root.as_fd(), "summary", false).unwrap() else {
+            panic!("the file exists");
+        };
+        assert!(names_file(root.as_fd(), "summary", &file).unwrap());
+        std::fs::write(dir.join("new"), b"new").unwrap();
+        std::fs::rename(dir.join("new"), dir.join("summary")).unwrap();
+        assert!(!names_file(root.as_fd(), "summary", &file).unwrap());
+        std::fs::remove_file(dir.join("summary")).unwrap();
+        assert!(!names_file(root.as_fd(), "summary", &file).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A `bare-user` repository with one regular content object.

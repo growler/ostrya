@@ -92,7 +92,7 @@ The summary records the value as \fB\%ostree.summary.indexed\-deltas\fR.
 \fB\%ostrya serve\fR copies the key into the \fB\%config\fR that it serves.
 .TP
 \fB\%auto\-update\-summary\fR (boolean, default false)
-Write the summary again after a push changes a ref.
+Write each summary again after a push changes a ref, as \fB\%ostrya summary \-u\fR writes them.
 \fB\%ostrya receive\fR and \fB\%ostrya serve\fR read it.
 \fB\%ostrya commit\fR and \fB\%ostrya pull\fR do not write the summary.
 .TP
@@ -369,7 +369,7 @@ The number of object streams of a push session at the same time.
 The time in seconds that a response waits for the client to take its next bytes.
 .TP
 \fB\%sign\-summary\fR (list)
-The key groups whose keys sign the summary that a push writes again.
+The key groups whose keys sign each summary that a push writes again.
 A name that occurs two times counts one time.
 \fB\%ostrya serve\fR has no option for the key, because \fB\%ostrya receive\fR reads it too.
 .PP
@@ -427,6 +427,10 @@ An empty value is refused.
 In a \fB\%bare\fR repository, accept the setuid and setgid bits, and the extended attributes \fB\%security.capability\fR and \fB\%security.selinux\fR.
 The rule applies to each content object and each dirmeta object that a session receives, also to an object that the repository already holds.
 A session on a \fB\%bare\fR repository needs a server that runs as root.
+.TP
+\fB\%summary\fR (boolean, default false)
+Add the namespace of the group to the summary of each authentication item of the group (see "Summaries").
+A group with \fB\%tls\-accept\-claim=true\fR refuses \fB\%summary=true\fR.
 .SS "Authentication items"
 \fB\%auth\fR is a list.
 A group matches when one of its items matches.
@@ -571,12 +575,29 @@ The server writes one warning that names the directory.
 .IP \(bu 2
 \fB\%refs/remotes/\fR, each other path under \fB\%refs/\fR, and \fB\%extensions/ostrya/\fR are not served.
 .IP \(bu 2
-\fB\%summary\fR and \fB\%summary.sig\fR are served only when the repository has no client group.
+\fB\%summary\fR and \fB\%summary.sig\fR are the files of the summary of the item (see "Summaries").
 .IP \(bu 2
 Objects, deltas, \fB\%config\fR, and the other files under \fB\%extensions/\fR are served to each identified client.
 .PP
 A path that the client cannot read gets the answer of an absent path: 404 over HTTP, and no file over ssh.
 With \fB\%tls\-accept\-claim=true\fR, the claims of the certificate set the read rights too, and claims that do not parse refuse each read with 403.
+.SS "Summaries"
+An authentication item has a summary when one or more of its groups has \fB\%summary=true\fR.
+Each other item has no summary.
+The summary of an item holds the refs that the item reads in each namespace whose selected group has \fB\%summary=true\fR.
+A namespace whose selected group has \fB\%summary=false\fR adds no ref, and no other group takes its place.
+The claims of a client certificate do not apply.
+.PP
+\fB\%ostrya summary \-u\fR writes the summary of each item.
+The summary of \fB\%anonymous\fR is \fB\%summary\fR in the repository root.
+The summary of each other item is under \fB\%extensions/ostrya/summary/\fR (see \fBostrya\-repo\fR(5)).
+The command also writes the access digest of each item: a digest of \fB\%collection\-id\fR of \fB\%[core]\fR and of the namespace, \fB\%allow\fR, \fB\%deny\fR, and \fB\%summary\fR of each group of the item, a group with \fB\%summary=false\fR too.
+So the digest changes when a change to the config can change the refs of the summary.
+The group names are not in the digest.
+.PP
+\fB\%ostrya serve\fR and \fB\%ostrya send\fR serve \fB\%summary\fR and \fB\%summary.sig\fR of the identified item.
+An item with no summary gets the answer of an absent path.
+When a change to the config changes the access digest of an item, the summary of the item gets the answer of an absent path until \fB\%ostrya summary \-u\fR, and the server writes one error that names the item.
 .SS "No client group"
 A repository with no client group has two groups:
 .PP
@@ -584,14 +605,17 @@ A repository with no client group has two groups:
 [ex\-ostrya client "anonymous"]
 auth=anonymous
 allow=r:**
+summary=true
 
 [ex\-ostrya client "anonymous\-collections"]
 auth=anonymous
 collection=*
 allow=r:**
+summary=true
 .fi
 .PP
-So each client reads each local ref, each mirror ref, and the summary, and no client opens a push session.
+So each client reads each local ref and each mirror ref, and gets the summary of \fB\%anonymous\fR, which holds each ref.
+No client opens a push session.
 An ssh session of \fB\%ostrya send\fR gets the \fB\%anonymous\fR item in such a repository, whatever its client name, so these groups apply to it.
 An ssh session of \fB\%ostrya receive\fR uses no \fB\%anonymous\fR item.
 .SS "Start checks"
@@ -600,6 +624,8 @@ ostrya refuses the config in these cases:
 Two groups carry the same item, and their namespaces overlap: both have no \fB\%collection\fR, both name one id, or both have \fB\%*\fR.
 .IP \(bu 2
 A group has \fB\%tls\-accept\-claim\fR and no \fB\%tls:\fR or \fB\%tls\-sha256:\fR item.
+.IP \(bu 2
+A group has \fB\%tls\-accept\-claim=true\fR and \fB\%summary=true\fR.
 .IP \(bu 2
 A group has \fB\%allow\-unsigned=false\fR and no \fB\%verify\fR.
 .IP \(bu 2

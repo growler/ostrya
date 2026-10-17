@@ -157,6 +157,22 @@ It removes a staging directory with no lock file, and each other entry except a 
 Reserved.
 \fB\%ostrya init\fR makes it empty, and \fB\%ostrya serve\fR serves its content as stored, except \fB\%extensions/ostrya/\fR.
 .TP
+\fB\%<repo>/extensions/ostrya/summary/\fR
+The summaries of the authentication items of the client groups.
+\fB\%ostrya summary \-u\fR makes the directory and writes its files.
+In the names below, \fB\%<hex>\fR is the SHA\-256 digest, in 64 lowercase hex digits, of the text of an item.
+\fB\%ostrya summary \-u\fR removes the files of each item that has no summary, and leaves each other entry.
+\fB\%ostrya serve\fR serves no path under \fB\%extensions/ostrya/\fR.
+.TP
+\fB\%<repo>/extensions/ostrya/summary/<hex>\fR, \fB\%<hex>.sig\fR
+The summary of an item other than \fB\%anonymous\fR, and its signatures, in the formats of \fB\%summary\fR and \fB\%summary.sig\fR.
+.TP
+\fB\%<repo>/extensions/ostrya/summary/<hex>.access\fR
+The access digest of an item, in 64 lowercase hex digits and a newline.
+Each item with a summary has this file, \fB\%anonymous\fR included.
+\fB\%ostrya serve\fR and \fB\%ostrya send\fR serve the summary of the item only when the file holds the access digest of the current client groups.
+A mirror pull that writes \fB\%summary\fR removes the file of \fB\%anonymous\fR.
+.TP
 \fB\%<repo>/deltas/\fR
 The static deltas.
 \fB\%ostrya static\-delta generate\fR writes them.
@@ -169,13 +185,14 @@ Each entry maps a delta name to the SHA\-256 checksum of its superblock.
 .TP
 \fB\%<repo>/summary\fR
 The summary: the refs and their commits, the static deltas, and the repository metadata.
-\fB\%ostrya summary \-u\fR writes it.
+It is the summary of the authentication item \fB\%anonymous\fR.
+\fB\%ostrya summary \-u\fR writes it, and removes it when \fB\%anonymous\fR has no summary.
 A pull reads it from the remote.
 .TP
 \fB\%<repo>/summary.sig\fR
 The signatures of the summary.
 \fB\%ostrya summary \-u \-\-sign\fR and \fB\%\-\-gpg\-sign\fR write it.
-A regeneration of the summary removes it.
+A regeneration of the summary with no key removes it.
 .TP
 \fB\%<repo>/<remote>.trustedkeys.gpg\fR
 The trusted GPG keyring of the remote \fB\%<remote>\fR.
@@ -185,7 +202,7 @@ The trusted GPG keyring of the remote \fB\%<remote>\fR.
 A keyring that \fB\%ostrya show\fR reads to check a GPG signature, when \fB\%\-\-gpg\-verify\-remote\fR is not given.
 No command writes it.
 .PP
-To change \fB\%config\fR, a ref, or \fB\%summary\fR, ostrya writes a temporary file and renames it over the target.
+To change \fB\%config\fR, a ref, \fB\%summary\fR, or a file under \fB\%extensions/ostrya/summary/\fR, ostrya writes a temporary file and renames it over the target.
 The temporary file is \fB\%<name>.tmp\-<pid>\-<n>\fR next to the target, or \fB\%tmp/.ostrya\-ref\-*\fR or \fB\%tmp/.ostrya\-meta\-*\fR below \fB\%tmp/\fR.
 .SH STATIC DELTAS
 A static delta holds the objects that change between two commits, or all the objects of one commit.
@@ -209,7 +226,7 @@ In the summary and in an index, the name of a delta is the hexadecimal \fB\%<to>
 .SH PERMISSIONS
 In each mode other than \fB\%bare\-user\-shared\fR, ostrya makes a directory with the mode 0775 less the umask.
 An \fB\%objects/<xx>/\fR directory and a directory that a ref write makes below \fB\%refs/\fR get 0777 less the umask.
-It writes \fB\%config\fR, each ref file, each object, \fB\%summary\fR, \fB\%summary.sig\fR, and each file in \fB\%deltas/\fR and \fB\%delta\-indexes/\fR with the mode 0644.
+It writes \fB\%config\fR, each ref file, each object, \fB\%summary\fR, \fB\%summary.sig\fR, each file in \fB\%extensions/ostrya/summary/\fR, and each file in \fB\%deltas/\fR and \fB\%delta\-indexes/\fR with the mode 0644.
 .PP
 In every mode, \fB\%deltas/\fR, \fB\%delta\-indexes/\fR, and each directory below them get 0755 less the umask.
 In a \fB\%bare\-user\-shared\fR repository they also take the setgid bit of their parent directory.
@@ -217,7 +234,7 @@ In a \fB\%bare\-user\-shared\fR repository they also take the setgid bit of thei
 In a \fB\%bare\-user\-shared\fR repository, ostrya sets these modes with fchmod after it makes each entry, so the umask has no effect:
 .TP
 Directories: 02770
-The repository root, if ostrya made it, each directory that \fB\%ostrya init\fR makes, each \fB\%objects/<xx>/\fR directory, each directory below \fB\%refs/\fR, \fB\%tmp/\fR, and each staging directory.
+The repository root, if ostrya made it, each directory that \fB\%ostrya init\fR makes, each \fB\%objects/<xx>/\fR directory, each directory below \fB\%refs/\fR, \fB\%tmp/\fR, each staging directory, and \fB\%extensions/\fR, \fB\%extensions/ostrya/\fR, and \fB\%extensions/ostrya/summary/\fR.
 The setgid bit makes each new entry take the group of its directory.
 .TP
 Lock files: 0660
@@ -229,6 +246,9 @@ Each object and each \fB\%.commitmeta\fR.
 .TP
 Markers: 0644
 Each \fB\%state/<checksum>.commitpartial\fR.
+.TP
+Summaries: 0644
+\fB\%summary\fR, \fB\%summary.sig\fR, and each file in \fB\%extensions/ostrya/summary/\fR.
 .PP
 An entry that exists keeps its mode and its group.
 ostrya sets no group owner.
@@ -239,9 +259,11 @@ The view serves these paths:
 .IP \(bu 2
 \fB\%config\fR, which the view makes and does not read from disk: \fB\%[core]\fR with \fB\%repo_version=1\fR, \fB\%mode=archive\-z2\fR, and the \fB\%collection\-id\fR and \fB\%indexed\-deltas\fR keys of the repository if they are set.
 .IP \(bu 2
-\fB\%summary\fR, \fB\%summary.sig\fR, \fB\%refs/\fR, and \fB\%extensions/\fR, as stored.
+\fB\%refs/\fR and \fB\%extensions/\fR, as stored.
 An alias ref is served as its target.
 \fB\%extensions/ostrya/\fR is not served.
+.IP \(bu 2
+\fB\%summary\fR and \fB\%summary.sig\fR: the files of the summary of the authentication item of the client, as stored.
 .IP \(bu 2
 The metadata objects, as stored.
 .IP \(bu 2
@@ -255,7 +277,8 @@ The view refuses \fB\%tmp/\fR, \fB\%state/\fR, each name that starts with \fB\%.
 The client groups of the config give the read rights of each client, as \fB\%ostrya\-config\fR(1) states in "Read access".
 A ref under \fB\%refs/heads/\fR or \fB\%refs/mirrors/ID/\fR is served when the group of the client has \fB\%r\fR on its name.
 \fB\%refs/remotes/\fR and each other path under \fB\%refs/\fR are not served.
-\fB\%summary\fR and \fB\%summary.sig\fR are served only when the repository has no client group.
+\fB\%summary\fR and \fB\%summary.sig\fR give \fB\%summary\fR and \fB\%summary.sig\fR to \fB\%anonymous\fR, and the files under \fB\%extensions/ostrya/summary/\fR to each other item.
+An item with no summary, and an item whose \fB\%.access\fR file does not hold its access digest, get the answer of an absent path.
 Objects, deltas, \fB\%config\fR, and the other files under \fB\%extensions/\fR are served to each identified client.
 \fB\%ostrya serve\fR also serves \fB\%/_ostrya/refs/v1\fR, a list of refs that match a pattern, and \fB\%/_ostrya/receive/v1/\fR, the endpoint of a push over HTTP.
 These two are not files of the repository.
@@ -265,6 +288,8 @@ These parts of the layout are extensions of ostrya:
 the mode \fB\%bare\-user\-shared\fR and its permissions;
 .IP \(bu 2
 the lock file \fB\%.update.lock\fR;
+.IP \(bu 2
+the directory \fB\%extensions/ostrya/summary/\fR and its files;
 .IP \(bu 2
 the temporary names \fB\%tmp/.ostrya\-ref\-*\fR, \fB\%tmp/.ostrya\-meta\-*\fR, and \fB\%<name>.tmp\-<pid>\-<n>\fR;
 .IP \(bu 2

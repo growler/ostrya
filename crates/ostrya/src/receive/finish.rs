@@ -24,16 +24,16 @@ use super::session::{Failure, ReceiveReport, ReceiveStep, ReceiveWarning};
 use super::walk::{self, Missing};
 use super::{ReceiveVerify, ServerSigner, TrustedKeys};
 use crate::MAX_METADATA_SIZE;
-use crate::access::Namespace;
+use crate::access::{ClientAccess, Namespace};
 use crate::error::{Error, Result};
 use crate::object::read_meta_object;
 use crate::refs::{CollectionRef, RefFileState};
 use crate::remote::proto::{CommitRequest, MAX_FRAME, Message};
 use crate::remote::{self, Expected, RefOutcome, RefUpdate};
 use crate::repo::Repo;
-use crate::sign::append_signature;
+use crate::sign::{Signer, append_signature};
 use crate::summary::{
-    OSTREE_METADATA_REF, SUMMARY_FILE, SUMMARY_SIG_FILE, SummaryOptions, parse_signature_dict,
+    OSTREE_METADATA_REF, SummaryOptions, SummaryStep, parse_signature_dict,
     serialize_signature_dict,
 };
 use crate::transaction::Transaction;
@@ -227,8 +227,9 @@ struct Edit<'a> {
 ///
 /// After the transaction commit, this function removes the partial marker of
 /// each commit of the session. If the policy regenerates the summary and a ref
-/// changed, it builds, signs, and writes the summary. A failure of these last
-/// steps is a warning of the report.
+/// changed, it builds, signs, and writes the summary of each auth item of the
+/// client groups of the config. A failure of these last steps is a warning of
+/// the report.
 ///
 /// # Failure of the transaction commit
 ///
@@ -1728,14 +1729,15 @@ async fn queue_detached(repo: &Repo, txn: &Transaction, edits: Vec<Edit<'_>>) ->
     Ok(())
 }
 
-/// Regenerates the summary and signs it with `signers`, GPG keys first.
+/// Writes each summary again and signs each one with `signers`, GPG keys
+/// first.
 ///
-/// This function makes each signature from the new bytes before any write,
-/// so a failed signature leaves the old `summary` and `summary.sig`. It then
-/// removes `summary.sig` before it writes `summary`. As a result, a failed
-/// write never pairs the new summary with the old signatures. If the policy
-/// names a summary signer, it then writes `summary.sig` with the new
-/// signatures.
+/// The call reads the client groups of the config of `repo`, and writes the
+/// summary of each auth item as
+/// [`regenerate_summaries`](Repo::regenerate_summaries) does, under the
+/// update lock that the caller holds. Each summary gets the new signatures
+/// alone. A failure of one summary leaves the summaries after it as they
+/// were, and its step goes into the warning.
 async fn write_summary(
     repo: &Repo,
     signers: &[Arc<ServerSigner>],
@@ -1744,48 +1746,37 @@ async fn write_summary(
         step,
         message: format!("{what}: {e}"),
     };
-    let bytes = repo
-        .build_summary(&SummaryOptions::default())
-        .await
+    let access = ClientAccess::from_config(repo.config(), repo.path())
         .map_err(|e| warning(ReceiveStep::SummaryBuild, "the summary build", e))?;
     let is_gpg = |s: &&Arc<ServerSigner>| s.signer().metadata_key() == GPG_KEY;
-    let ordered = signers
+    let ordered: Vec<&dyn Signer> = signers
         .iter()
         .filter(is_gpg)
-        .chain(signers.iter().filter(|s| !is_gpg(s)));
-    let mut dict = Value::Array(Vec::new());
-    for signer in ordered {
-        let signer = signer.signer();
-        let signature = signer.sign(&bytes).await.map_err(|e| {
-            let what = format!("the summary signature with the {} key", signer.name());
-            warning(ReceiveStep::SummarySign, &what, e.into())
-        })?;
-        append_signature(&mut dict, signer.metadata_key(), signature)
-            .map_err(|e| warning(ReceiveStep::SummarySign, "the summary signature", e.into()))?;
-    }
-    let signatures = if signers.is_empty() {
-        None
-    } else {
-        Some(
-            serialize_signature_dict(&dict)
-                .map_err(|e| warning(ReceiveStep::SummarySign, "the summary signature", e))?,
-        )
-    };
-    let written = async {
-        let fsync = repo.config().fsync()?;
-        repo.remove_root_file(SUMMARY_SIG_FILE).await?;
-        repo.write_root_file(SUMMARY_FILE, bytes, fsync).await?;
-        match signatures {
-            Some(signatures) => {
-                repo.write_root_file(SUMMARY_SIG_FILE, signatures, fsync)
-                    .await
-            }
-            None => Ok(()),
-        }
-    };
-    written
+        .chain(signers.iter().filter(|s| !is_gpg(s)))
+        .map(|s| s.signer())
+        .collect();
+    repo.write_summaries(Arc::new(access), &SummaryOptions::default(), &ordered)
         .await
-        .map_err(|e| warning(ReceiveStep::SummaryWrite, "the summary write", e))
+        .map(drop)
+        .map_err(|failure| match failure.step {
+            SummaryStep::Build => warning(
+                ReceiveStep::SummaryBuild,
+                "the summary build",
+                failure.error,
+            ),
+            SummaryStep::Sign => {
+                let what = match &failure.key {
+                    Some(key) => format!("the summary signature with the {key} key"),
+                    None => "the summary signature".to_owned(),
+                };
+                warning(ReceiveStep::SummarySign, &what, failure.error)
+            }
+            SummaryStep::Write => warning(
+                ReceiveStep::SummaryWrite,
+                "the summary write",
+                failure.error,
+            ),
+        })
 }
 
 #[cfg(test)]

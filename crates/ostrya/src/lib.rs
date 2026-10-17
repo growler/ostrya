@@ -208,7 +208,9 @@ pub use staging_tree::{
     MergeOptions, RootDirmeta, StagedFileWriter, StagingEntry, StagingLookup, StagingTree,
 };
 #[doc(hidden)]
-pub use summary::{AdvertisedDelta, RefListing, Summary, SummaryOptions, SummaryRef};
+pub use summary::{
+    AdvertisedDelta, RefListing, Summary, SummaryOptions, SummaryRef, SummaryReport,
+};
 #[doc(hidden)]
 pub use tar::{TarExportOptions, TarImportOptions, TarRename};
 #[doc(hidden)]

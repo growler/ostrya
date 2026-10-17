@@ -2362,7 +2362,15 @@ inventory is the oracle and the port writes the bytes the tool writes.
 `--gpg-sign=KEY-ID`, `--gpg-homedir`, `--sign=KEY-ID`, `--sign-type`, and the
 port extensions `-s` (the short form of `--sign-type`), `--verify`,
 `--last-modified`, `--metadata-commit-timestamp`, `--keys-file`, `--keys-dir`,
-`--remote`, and a positional `KEY_ID...`. Nothing is missing. The tool refuses
+`--remote`, `--auth-group=NAME`, and a positional `KEY_ID...`. Nothing is
+missing. `--auth-group=NAME` reads the summary of the auth item of the client
+group `NAME` with `-v`, `--raw`, `--list-metadata-keys`, and
+`--print-metadata-key` (`../format-reference.md`, "Summaries of auth
+items"). The port refuses it at exit 1 for a group that does not exist, a
+group with `summary=false`, a group whose `auth` list holds more than one
+item, and with `-u`, `--verify`, a signing key, or no read option. With no
+client group, `NAME` is `anonymous` or `anonymous-collections`, the implicit
+groups. The tool refuses
 `--verify`, `--keys-file`, `--keys-dir`, and `-s` with `error: Unknown option
 <arg>` at exit 1, and verifies a summary signature through a remote alone. A
 symlink under `refs/` that names a directory ends `summary -u` with exit 1 in
@@ -2375,7 +2383,7 @@ every other subcommand, together with the top level, keeps `-v/--verbose`. `-m`,
 `--sign`, and `--gpg-sign` are read with `-u` alone, and both implementations
 check every one of them before the regeneration, so a refusal leaves `summary`
 and `summary.sig` as they stood (`cli-behavior.md`, "CLI output formats",
-`summary`, "The `-u` checks"). Twelve differences stand.
+`summary`, "The `-u` checks"). Thirteen differences stand.
 
 - `-v` does not turn on the debug stream. The tool binds `-v` to `--view` and
   `--verbose` together and writes `OT: using fuse: 0` for a read-only view; the
@@ -2388,8 +2396,9 @@ and `summary.sig` as they stood (`cli-behavior.md`, "CLI output formats",
   and ignores it, writing the report as if it were absent. The port keeps the
   positional as a signing key identifier, a port extension beside
   `--sign=KEY-ID` read under the same `--sign-type`. With `-u` the positional
-  keys sign after every `--sign` key. Without `-u` they sign the summary that
-  stands, and signing precedes every reading option, so
+  keys sign after every `--sign` key. Without `-u` they sign each summary that
+  stands, the root `summary` and each summary of an auth item, and signing
+  precedes every reading option, so
   `summary --view <word>` signs where the word is a key and refuses at exit 1
   where it is not. The tool writes the report and the port writes none;
 - a repeated switch. The tool takes a second `-v`, `--view`, `--raw`, or
@@ -2464,6 +2473,20 @@ and `summary.sig` as they stood (`cli-behavior.md`, "CLI output formats",
   regeneration with `error: signature: ed25519 secret key: signature error:
   Mismatched Keypair detected`, and `summary` and `summary.sig` keep their
   state;
+- the summaries of the client groups. The tool reads no client group, and
+  `summary -u` writes one `summary` of each local ref and each mirror ref.
+  The port writes one summary for each auth item that a group with
+  `summary=true` carries, under `extensions/ostrya/summary/`, with an
+  `.access` file for each item (`../format-reference.md`, "Summaries of auth
+  items"). The root `summary` is the summary of the `anonymous` item, and it
+  holds the refs that the groups of `anonymous` read. When `anonymous` has
+  no summary, the port removes `summary` and `summary.sig`. A repository
+  with no client group has the implicit groups, so the root `summary` holds
+  each ref, as the tool writes it. A malformed client group refuses
+  `summary -u` at exit 1 before any write, and the tool ignores the group.
+  For each directory under `refs/mirrors/` whose name is not a collection
+  id, the port writes one `warning:` line to standard error and leaves the
+  directory out of each summary;
 - a `summary` file whose bytes are not a document of the summary type. Such a
   file reaches a repository only through a write that is neither
   implementation's. The tool reads it as an empty document, so `--raw` writes
@@ -4148,9 +4171,19 @@ ostrya serve [--repo=PATH] [--listen=ADDR:PORT]...
   gets 401 or 403 with an empty body. A ref under `refs/heads/` or
   `refs/mirrors/ID/` is served when the group of the item has `r` on its
   name, and the ref listing holds these refs alone. `refs/remotes/` and
-  `extensions/ostrya/` get 404. `summary` and `summary.sig` are served only
-  with no client group in the config. `../format-reference.md`, "Read
-  access", states the rules. The tool has no such rights. A `session` request
+  `extensions/ostrya/` get 404. `summary` and `summary.sig` are the files of
+  the summary of the identified item, which `summary -u` writes. An item
+  with no summary gets 404. A summary whose `.access` file does not hold the
+  access digest of the current client groups gets 404, and the command
+  writes one `error:` line that names the item, one time for each item in
+  each run. A 200 and a 404 of the two paths carry `Cache-Control:
+  private`. A mirror pull removes the `.access` file of `anonymous`, so the
+  command serves its `summary` only after `summary -u`. `ostree summary -u`
+  leaves that file in place. In a repository where `summary -u` of the port
+  never ran, the command serves no `summary` of the tool. Else it serves
+  that `summary` while the `.access` file matches.
+  `../format-reference.md`, "Read access" and "Summaries of auth items",
+  state the rules. The tool has no such rights. A `session` request
   takes the policy of the client group that carries the item in the
   namespace of its `Hello`: the local refs, or one collection. An item with
   no such group gets 403 with `unauthorized` and the message `no client
@@ -4250,12 +4283,24 @@ ostrya serve [--repo=PATH] [--listen=ADDR:PORT]...
   'bare-user-shared' in repository configuration`. A pull from such a
   repository with no summary succeeds. The gap is recorded and kept: a pull
   of the tool from a `bare-user-shared` repository is no goal of the port.
-- With a client group in the config, the command serves no summary, so
-  `ostree pull` requests `refs/heads/NAME`. A pull of a ref that the group
-  of `anonymous` reads succeeds and passes `ostree fsck`. A ref that the
-  group does not read gets 404, and the tool 2026.1 exits 1 with `error:
-  While fetching URL/refs/heads/NAME: Server returned HTTP 404`, in
+- When the group of `anonymous` has `summary=false`, the command serves no
+  summary, so `ostree pull` requests `refs/heads/NAME`. A pull of a ref that
+  the group of `anonymous` reads succeeds and passes `ostree fsck`. A ref
+  that the group does not read gets 404, and the tool 2026.1 exits 1 with
+  `error: While fetching URL/refs/heads/NAME: Server returned HTTP 404`, in
   `crates/ostrya-cli/tests/serve.rs`.
+- `ostree remote refs` and `ostree pull` read the root summary of the
+  `anonymous` item of a group with a deny item. The summary lists the refs
+  that the group reads, the pull passes `ostree fsck`, and a pull of a
+  denied ref exits 1. Over HTTPS with `tls-client-cert-path` and
+  `tls-client-key-path` on the remote, the tool reads the summary of a
+  `tls:NAME` item and pulls through it. A client with no certificate gets
+  401 for the summary, and its pull exits 1. Both pulls are in
+  `crates/ostrya-cli/tests/serve.rs`.
+- In a repository with a collection id, `ostrya summary -u` and `ostree
+  summary -u` give the same refs in field 0 and the same collection map,
+  other than the anchor commit, with the mirror refs of the own id in
+  field 0, in `crates/ostrya-cli/tests/serve.rs`.
 
 ### `send`
 
@@ -4297,8 +4342,11 @@ ostrya send [--repo=PATH] [--client=NAME]
   writes `error: MESSAGE` to standard error on failure. For each directory
   under `refs/mirrors/` whose name is not a collection id, a `ListRefs` with
   the key `collections` writes one `warning:` line to standard error, one
-  time in each session. The command writes nothing else to standard error,
-  also under `-v`.
+  time in each session. When the summary of the item does not match the
+  client groups, `summary` and `summary.sig` get the reply of a path that is
+  not found, and the command writes one `error:` line that names the item,
+  one time in each session. The command writes nothing else to standard
+  error, also under `-v`.
 - It exits 0 when standard input ends at a frame boundary, an empty input
   included. It exits 1 after an `Error` frame and after a failed write.
 - The input is read through a read-ahead ring of 256 KiB and a buffer of

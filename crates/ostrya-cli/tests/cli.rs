@@ -31302,6 +31302,103 @@ fn summary_reading_options_match_the_tool() {
     );
 }
 
+/// `--auth-group=NAME` reads the summary of the item of the client group
+/// `NAME`. With no client group, the names of the implicit groups read the
+/// root summary. The command refuses a group that does not exist, a group
+/// with `summary=false`, a group with more than one item, and the option
+/// with `-u`, with `--verify`, with a signing key, and with no read option.
+#[test]
+fn summary_auth_group_reads_the_summary_of_one_item() {
+    let tmp = TmpDir::new("summary-auth-group");
+    let base = tmp.path();
+    build_fixture_source(base);
+    let src = base.join("src");
+    let src = src.to_str().unwrap();
+    let repo = create_repo(base, RepoMode::Archive);
+    let repo_arg = format!("--repo={}", repo.display());
+    for branch in ["main", "secret"] {
+        ostrya(
+            &[&repo_arg, "commit", "-b", branch, "-s", branch, src],
+            None,
+            &[],
+        )
+        .ok();
+    }
+    ostrya(&[&repo_arg, "summary", "-u"], None, &[]).ok();
+    let root = ostrya(&[&repo_arg, "summary", "--raw"], None, &[]);
+    root.ok();
+    for name in ["anonymous", "anonymous-collections"] {
+        let group = format!("--auth-group={name}");
+        let run = ostrya(&[&repo_arg, "summary", &group, "--raw"], None, &[]);
+        run.ok();
+        assert_eq!(run.stdout, root.stdout, "{name}");
+    }
+
+    let config = repo.join("config");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(
+        "[ex-ostrya client \"ci\"]\nauth=ssh:ci\nallow=r:main\nsummary=true\n\
+         [ex-ostrya client \"ops\"]\nauth=ssh:ops\nallow=r:**\n\
+         [ex-ostrya client \"two\"]\nauth=ssh:a;ssh:b\nallow=r:**\nsummary=true\n",
+    );
+    std::fs::write(&config, text).unwrap();
+    let missing = ostrya(&[&repo_arg, "summary", "--auth-group=ci", "-v"], None, &[]);
+    assert_eq!(missing.status.code(), Some(1));
+    assert!(missing.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&missing.stderr).contains("ssh:ci does not exist"),
+        "{}",
+        String::from_utf8_lossy(&missing.stderr)
+    );
+    ostrya(&[&repo_arg, "summary", "-u"], None, &[]).ok();
+    assert!(!repo.join("summary").exists());
+    let view = ostrya(&[&repo_arg, "summary", "--auth-group=ci", "-v"], None, &[]);
+    view.ok();
+    let view = String::from_utf8_lossy(&view.stdout);
+    assert!(view.contains("main"), "{view}");
+    assert!(!view.contains("secret"), "{view}");
+    let keys = ostrya(
+        &[
+            &repo_arg,
+            "summary",
+            "--auth-group=ci",
+            "--list-metadata-keys",
+        ],
+        None,
+        &[],
+    );
+    keys.ok();
+    assert!(String::from_utf8_lossy(&keys.stdout).contains("ostree.summary.mode"));
+
+    let key = base64::encode(&[7u8; 64]);
+    for (args, says) in [
+        (
+            vec!["--auth-group=nope", "-v"],
+            "names no client group 'nope'",
+        ),
+        (
+            vec!["--auth-group=anonymous", "-v"],
+            "names no client group 'anonymous'",
+        ),
+        (vec!["--auth-group=ops", "-v"], "summary=false"),
+        (vec!["--auth-group=two", "-v"], "ssh:a;ssh:b"),
+        (vec!["--auth-group=ci", "-u"], "-u"),
+        (vec!["--auth-group=ci", "--verify"], "--verify"),
+        (vec!["--auth-group=ci", "-v", "--sign=x"], "signing key"),
+        (vec!["--auth-group=ci", "-v", key.as_str()], "signing key"),
+        (vec!["--auth-group=ci"], "needs a read option"),
+    ] {
+        let mut all = vec![repo_arg.as_str(), "summary"];
+        all.extend(&args);
+        let run = ostrya(&all, None, &[]);
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert_eq!(run.status.code(), Some(1), "{args:?}: {stderr}");
+        assert!(run.stdout.is_empty(), "{args:?}");
+        assert!(stderr.contains("--auth-group"), "{args:?}: {stderr}");
+        assert!(stderr.contains(says), "{args:?}: {stderr}");
+    }
+}
+
 /// The `summary` argument handling of ostrya, where it differs from the
 /// `ostree` command:
 ///

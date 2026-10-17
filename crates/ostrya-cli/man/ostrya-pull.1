@@ -34,7 +34,7 @@ The address replaces the configured \fB\%pull\-url\fR or \fB\%url\fR of the remo
 \fB\-\-mirror\fR
 Write the pulled refs as local refs under \fB\%refs/heads/\fR\&.
 .IP
-If no ref is named, the pull takes every ref that the summary of the remote lists, and fails if the remote serves no summary. This pull also copies the \fB\%summary\fR and \fB\%summary.sig\fR of the remote to this repository. If the remote has no \fB\%summary.sig\fR, the \fB\%summary.sig\fR of this repository stays as it is. A pull of named refs copies no summary.
+If no ref is named, the pull takes every ref that the summary of the remote lists, and fails if the remote serves no summary. This pull also copies the \fB\%summary\fR and \fB\%summary.sig\fR of the remote to this repository. If the remote has no \fB\%summary.sig\fR, the \fB\%summary.sig\fR of this repository stays as it is. The pull removes the \fB\%\&.access\fR file of the \fB\%anonymous\fR item under \fB\%extensions/ostrya/summary/\fR, so \fB\%ostrya serve\fR serves no summary until \fB\%ostrya summary \-u\fR\&. A pull of named refs copies no summary.
 .TP
 \fB\-\-depth\fR \fIDEPTH\fR
 The number of parents of each pulled commit to follow.

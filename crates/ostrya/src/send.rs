@@ -80,6 +80,32 @@ pub enum SendEvent {
         /// The name of the directory.
         name: String,
     },
+    /// The session answered `summary` or `summary.sig` as an absent path,
+    /// because the `.access` file of the item of the client does not hold
+    /// the access digest of the item ([`ArchiveAnswer::StaleSummary`]).
+    ///
+    /// The summary of the item does not match the client groups. The session
+    /// reports the event one time, at the first request that finds it.
+    #[non_exhaustive]
+    StaleSummary {
+        /// The text of the auth item of the client.
+        item: String,
+    },
+}
+
+impl SendEvent {
+    /// Returns `true` if the event is a warning: the session served the
+    /// request. Each other event is an error of a request that the session
+    /// did not serve.
+    ///
+    /// [`InvalidCollectionDir`](SendEvent::InvalidCollectionDir) is a
+    /// warning, and [`StaleSummary`](SendEvent::StaleSummary) is an error.
+    pub fn is_warning(&self) -> bool {
+        match self {
+            SendEvent::InvalidCollectionDir { .. } => true,
+            SendEvent::StaleSummary { .. } => false,
+        }
+    }
 }
 
 impl fmt::Display for SendEvent {
@@ -87,20 +113,34 @@ impl fmt::Display for SendEvent {
         match self {
             SendEvent::InvalidCollectionDir { name } => {
                 f.write_str("refs/mirrors/")?;
-                for c in name.chars() {
-                    if c.is_ascii_control() {
-                        write!(f, "{}", c.escape_default())?;
-                    } else {
-                        write!(f, "{c}")?;
-                    }
-                }
+                write_escaped(f, name)?;
                 f.write_str(
                     ": the directory name is not a collection id, and the ref listing leaves \
                      out the directory",
                 )
             }
+            SendEvent::StaleSummary { item } => {
+                f.write_str("the summary of the auth item ")?;
+                write_escaped(f, item)?;
+                f.write_str(
+                    " does not match the client groups, and the session does not serve it; \
+                     run `ostrya summary -u`",
+                )
+            }
         }
     }
+}
+
+/// Writes `text` with each ASCII control character as its escape sequence.
+fn write_escaped(f: &mut fmt::Formatter<'_>, text: &str) -> fmt::Result {
+    for c in text.chars() {
+        if c.is_ascii_control() {
+            write!(f, "{}", c.escape_default())?;
+        } else {
+            write!(f, "{c}")?;
+        }
+    }
+    Ok(())
 }
 
 /// The kind of failure that ends a session.
@@ -152,6 +192,14 @@ fn out_of_order(msg: &Message) -> Failure {
     )))
 }
 
+/// Returns the `GetReply` of a path that the session does not serve.
+fn not_found() -> Message {
+    Message::GetReply(GetReply {
+        found: false,
+        len: None,
+    })
+}
+
 /// Returns `true` if `buf` starts with a whole frame.
 ///
 /// A whole frame is its 4-byte length and that number of bytes.
@@ -201,10 +249,13 @@ impl Repo {
     /// # Access
     ///
     /// `access` gives the refs that the session serves. A ref that `access`
-    /// does not read, a path under `refs/` that names no ref, and `summary`
-    /// and `summary.sig` in a config with client groups get a `GetReply`
-    /// with `found` set to `false`, as an absent path does. The listing of
-    /// `ListRefs` holds the refs that `access` reads.
+    /// does not read, and a path under `refs/` that names no ref, get a
+    /// `GetReply` with `found` set to `false`, as an absent path does. The
+    /// listing of `ListRefs` holds the refs that `access` reads. `summary`
+    /// and `summary.sig` give the files of the summary of the item of
+    /// `access`, by the rules of [`ArchiveView`](crate::ArchiveView#read-access).
+    /// An item with no summary, and a summary whose `.access` file does not
+    /// match, get `found` set to `false`.
     ///
     /// The session opens no transaction and takes no lock. For an `archive`,
     /// `bare-user`, `bare-user-only`, or `bare-user-shared` repository, read
@@ -306,6 +357,11 @@ impl Repo {
     /// that finds it. The listing leaves out the directory. The event does
     /// not change the session, and the peer gets no message of it.
     ///
+    /// When the view answers `summary` or `summary.sig` with
+    /// [`ArchiveAnswer::StaleSummary`], the session gives one
+    /// [`SendEvent::StaleSummary`], at the first such answer. The peer gets a
+    /// `GetReply` with `found` set to `false`, as for an absent path.
+    ///
     /// # Errors
     ///
     /// The errors of [`send`](Repo::send).
@@ -344,6 +400,7 @@ impl Repo {
             listing_cap,
             on_event: opts.on_event.clone(),
             warned: HashSet::new(),
+            stale_reported: false,
             view: ArchiveView::new(self.clone()),
             reader: FrameReader::new(BufReader::with_capacity(STREAM_BUFFER, input)),
             writer: FrameWriter::new(BufWriter::with_capacity(STREAM_BUFFER, output)),
@@ -384,6 +441,8 @@ struct Session<R, W> {
     /// The names of the invalid collection directories that the session
     /// reported.
     warned: HashSet<String>,
+    /// `true` once the session reported a stale summary.
+    stale_reported: bool,
     view: ArchiveView,
     reader: FrameReader<BufReader<R>>,
     writer: FrameWriter<BufWriter<W>>,
@@ -473,13 +532,18 @@ where
                 self.reply(&found(len)).await?;
                 write_body(&mut self.writer, &mut self.chunk, len, body).await
             }
-            ArchiveAnswer::NotFound | ArchiveAnswer::Refused => {
-                let reply = GetReply {
-                    found: false,
-                    len: None,
-                };
-                self.reply(&Message::GetReply(reply)).await
+            ArchiveAnswer::StaleSummary { item } => {
+                if let Some(on_event) = &self.on_event
+                    && !self.stale_reported
+                {
+                    self.stale_reported = true;
+                    on_event(&SendEvent::StaleSummary {
+                        item: item.to_string(),
+                    });
+                }
+                self.reply(&not_found()).await
             }
+            ArchiveAnswer::NotFound | ArchiveAnswer::Refused => self.reply(&not_found()).await,
         }
     }
 

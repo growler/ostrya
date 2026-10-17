@@ -1,9 +1,11 @@
 //! The events that a server reports to its host.
 
+use std::collections::HashSet;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use ostrya::Checksum;
+use ostrya::access::AuthItem;
 
 /// The callback that receives each [`ServerEvent`].
 pub(crate) type EventSink = Arc<dyn Fn(&ServerEvent) + Send + Sync>;
@@ -49,6 +51,20 @@ pub enum ServerEvent {
         /// The name of the directory.
         name: String,
     },
+    /// The server answered `summary` or `summary.sig` with 404, because the
+    /// `.access` file of the auth item of the client does not hold the
+    /// access digest of the item
+    /// ([`ArchiveAnswer::StaleSummary`](ostrya::ArchiveAnswer::StaleSummary)).
+    ///
+    /// The summary of the item does not match the client groups that the
+    /// server read at start. `ostrya summary -u` writes the summaries again.
+    /// The server reports each item one time for each
+    /// [`Server`](crate::Server) value, at the first request that finds it.
+    #[non_exhaustive]
+    StaleSummary {
+        /// The text of the auth item.
+        item: String,
+    },
 }
 
 impl ServerEvent {
@@ -57,10 +73,11 @@ impl ServerEvent {
     /// refused.
     ///
     /// [`InvalidCollectionDir`](ServerEvent::InvalidCollectionDir) is a
-    /// warning, and [`BadClaims`](ServerEvent::BadClaims) is an error.
+    /// warning. [`BadClaims`](ServerEvent::BadClaims) and
+    /// [`StaleSummary`](ServerEvent::StaleSummary) are errors.
     pub fn is_warning(&self) -> bool {
         match self {
-            ServerEvent::BadClaims { .. } => false,
+            ServerEvent::BadClaims { .. } | ServerEvent::StaleSummary { .. } => false,
             ServerEvent::InvalidCollectionDir { .. } => true,
         }
     }
@@ -86,6 +103,48 @@ impl fmt::Display for ServerEvent {
                  listing leaves out the directory",
                 Escaped(name)
             ),
+            ServerEvent::StaleSummary { item } => write!(
+                f,
+                "the summary of the auth item {} does not match the client groups, and the \
+                 server answers 404 for it; run `ostrya summary -u`",
+                Escaped(item)
+            ),
+        }
+    }
+}
+
+/// The stale summaries that one server reported.
+pub(crate) struct StaleSummaries {
+    /// The text of each item that the server reported.
+    reported: Mutex<HashSet<String>>,
+    /// The callback of the events of the server.
+    on_event: Option<EventSink>,
+}
+
+impl StaleSummaries {
+    /// Returns the record of a server that reported no stale summary, which
+    /// reports its events to `on_event`.
+    pub(crate) fn new(on_event: Option<EventSink>) -> StaleSummaries {
+        StaleSummaries {
+            reported: Mutex::new(HashSet::new()),
+            on_event,
+        }
+    }
+
+    /// Reports `item` as a [`ServerEvent::StaleSummary`] if the server did
+    /// not report it before.
+    pub(crate) fn report(&self, item: &AuthItem) {
+        let Some(on_event) = &self.on_event else {
+            return;
+        };
+        let item = item.to_string();
+        let new = self
+            .reported
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(item.clone());
+        if new {
+            on_event(&ServerEvent::StaleSummary { item });
         }
     }
 }
@@ -158,5 +217,39 @@ mod tests {
              collection id, and the ref listing leaves out the directory"
         );
         assert!(event.is_warning());
+    }
+
+    /// The line of a stale summary names the item, escapes each control
+    /// character, and names the command that writes the summaries. The event
+    /// is an error.
+    #[test]
+    fn the_line_of_a_stale_summary_names_the_item() {
+        let event = ServerEvent::StaleSummary {
+            item: "tls:a\nb".to_owned(),
+        };
+        assert_eq!(
+            event.to_string(),
+            "the summary of the auth item tls:a\\nb does not match the client groups, and \
+             the server answers 404 for it; run `ostrya summary -u`"
+        );
+        assert!(!event.is_warning());
+    }
+
+    /// The record reports each item one time.
+    #[test]
+    fn a_stale_summary_is_reported_one_time_for_each_item() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let sink = seen.clone();
+        let stale = StaleSummaries::new(Some(Arc::new(move |event: &ServerEvent| {
+            sink.lock().unwrap().push(event.to_string());
+        })));
+        let ssh = AuthItem::parse("ssh:u").unwrap();
+        for item in [&AuthItem::Anonymous, &ssh, &AuthItem::Anonymous, &ssh] {
+            stale.report(item);
+        }
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert!(seen[0].contains(" anonymous "), "{}", seen[0]);
+        assert!(seen[1].contains(" ssh:u "), "{}", seen[1]);
     }
 }

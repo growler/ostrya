@@ -764,13 +764,16 @@ A push guards the checksum shape at each site where it writes a commit to a
 target ref:
 
 - `push` refuses a `DST` of that shape after a `SRC` with `error: Invalid
-  refspec <name>` before the transport starts.
-- `push-tree -b` refuses it with `error: Rev name '<name>' looks like a
-  checksum`.
-- In the library, `Repo::push`, `Repo::export_stream`, and `push_tree` refuse
-  the name before they send a byte.
+  refspec <name>` before the transport starts. `push --onto` refuses a branch
+  or a `--tag` of that shape with the same error.
+- `push-tree` refuses a branch of `--onto` or a `--tag` of that shape with
+  `error: Rev name '<name>' looks like a checksum`.
+- In the library, `Repo::push`, `Repo::push_onto`, `Repo::export_stream`, and
+  `push_tree` refuse the name before they send a byte.
 - The server of a push session or of a one-way stream refuses an update that
-  writes a commit to such a ref at `Commit` ("Commit and CommitReply").
+  writes a commit to such a ref at `Commit` ("Commit and CommitReply"). It
+  refuses a server commit whose branch or tag has that shape with
+  `invalid-ref`.
 
 `Hello` names the refs of a session and does not tell a write from a delete, so
 the server does not check the shape at `Hello`. The client passes a push delete
@@ -3305,6 +3308,65 @@ in these cases:
 `ostree refs -c` lists the collection refs that the port writes, and
 `ostree show` reads the commit.
 
+The clients of a server commit are `ostrya push --onto` and `ostrya
+push-tree` ("The commit of `push-tree`"). Each client follows these rules:
+
+- `Hello` names the branch, then each tag. The namespace is the collection
+  of `--collection`, else the local refs of the server.
+- After `HelloReply`, a tag that the server reports at a commit is
+  `ref-mismatch` on the client. Then the client runs the checks of the
+  server at `Commit` that need no state of the server:
+  - The client refuses a metadata value that a commit cannot hold
+    (check 1) as invalid input. Bytes that are not a `v` in normal form are
+    `protocol` on the client.
+  - The client encodes the `CommitReply` with an old commit on the branch
+    and each tag (check 2). If its frame is longer than the `max-frame` of
+    the server, the client refuses the server commit with
+    `limit-exceeded`. A tag adds about 40 bytes and its name to the reply.
+  - The client encodes the `Commit` frame of the server commit. A frame
+    longer than the `max-frame` of the server is `limit-exceeded` on the
+    client.
+
+  An ostrya server announces 1 MiB. Thus the names, the subject, the body,
+  and the metadata of the server commit must fit in one frame of 1 MiB, and
+  so must the reply. These checks come before the first `Have`, so a
+  refused server commit sends no object.
+- The client offers the objects of the tree and sends the objects that the
+  server lacks. It sends no commit object and no detached metadata.
+- A host with hooks answers `ref-denied` (check 4). The client has no
+  fallback to a commit that it builds.
+- The `CommitReply` must hold the branch, then each tag, in order. Each entry
+  must have one new commit, the same for each entry, and a tag must have no
+  old commit. Any other reply is `CommitOutcomeUnknown` on the client. The
+  client prints the new commit.
+
+`ostrya push --onto BRANCH REF` makes the server commit from the local commit
+of the revision `REF`. The client does not split `REF` at `:`. The server
+commit holds these fields of the local commit:
+
+- the root dirtree, the root dirmeta, the subject, and the body;
+- each metadata entry, in order, with the bytes of its value, except each
+  entry under `ostree.ref-binding` and `ostree.collection-binding`. The
+  entries under `ostree.sizes` and `ostree.composefs.digest.v0` pass
+  unchanged. The bindings of the local commit do not select the namespace,
+  and the server writes the bindings of its own namespace;
+- the timestamp of the local commit, or the value of `--timestamp`.
+
+The client sends no parent, no commit object, and no detached metadata. So
+a signature of the local commit does not reach the server, and the server
+signs the new commit with `sign`. The client refuses a local commit that the
+repository marks partial, and a local commit with related objects, before it
+writes a byte.
+
+Observed behavior: a local commit of `ostrya commit --no-xattrs` in a
+repository with a collection id, with a `--bind-ref` of its own, goes to a
+server with no collection id. With `SOURCE_DATE_EPOCH=1700000000` on both
+sides, the checksum of the server commit is equal to the checksum of
+`ostree commit --no-xattrs -b BRANCH` over the same tree with the same
+subject, body, and metadata options. A second push with `--tag`,
+`--bind-ref`, and `--timestamp` gives the second commit of the tool with
+`--bind-ref` for each name and the same `--timestamp`.
+
 ### Abort, abandon, and end of input
 
 On a stream, these events end a session, and the server sends no `Error`:
@@ -4611,20 +4673,38 @@ does not load, or if the repository has client groups and no group carries
 
 ## The commit of `push-tree`
 
-`ostrya push-tree` builds one commit over a local directory on the client
-and sends it to the server. The tool has no such command. The commit object
-has the format of each other commit, and its bytes follow these rules.
-`ostrya-push-tree(1)` states the options and the output of the command.
+`ostrya push-tree` walks a local directory on the client, and the server
+makes one commit over its tree. The tool has no such command. The commit is a
+server commit ("Commit and CommitReply", "Server commit"), and its bytes
+follow the rules of that section. `ostrya-push-tree(1)` states the options and
+the output of the command.
 
-- The metadata dict holds the entries of the caller and the binding keys, in
-  the order of `commit` (`conformance/cli-behavior.md`, "CLI output
-  formats", `commit`). These rules are specific to `push-tree`:
-  - The command has no `--keep-metadata`, so no entry comes from a parent.
-  - `ostree.ref-binding` holds each `-b` name, sorted.
-  - `ostree.collection-binding` holds the collection id that the server
-    reports for its repository. When the server has no collection id, the
-    key is absent. The collection id of a local repository has no effect.
-  - `--no-bindings` writes neither key.
+The client does these steps:
+
+1. It walks and hashes the tree. It builds no commit object and no detached
+   metadata.
+2. It opens the session with the branch of `--onto`, then each `--tag`, and
+   with `--collection` in `Hello`.
+3. It sends the objects of the tree that the server does not hold.
+4. It sends a `Commit` with the server commit: the branch, the tags, the
+   names of `--bind-ref`, the root dirtree and the root dirmeta, the subject,
+   the body, the metadata entries in order, the timestamp, and `orphan`.
+
+These rules are specific to `push-tree`:
+
+- The metadata entries are each `--add-metadata-string` entry, then each
+  `--add-metadata` entry. The command has no `--keep-metadata`, so no entry
+  comes from a parent. The command refuses the keys `ostree.ref-binding` and
+  `ostree.collection-binding`, because the server writes them.
+- The timestamp is the value of `--timestamp`, else the value of the
+  `SOURCE_DATE_EPOCH` environment variable. When neither is set, the server
+  commit holds no timestamp, and the server takes its system clock.
+- The server writes `ostree.ref-binding` with the branch, each tag, and each
+  bound name, sorted. It writes `ostree.collection-binding` with the
+  collection of the namespace of the session. The collection id of a local
+  repository has no effect.
+- The parent is the tip of the branch on the server. With `--orphan`, the
+  commit has no parent.
 - `--owner-uid`, `--owner-gid`, and `--canonical-permissions` apply to each
   entry of the walk, the root directory included, so they change the root
   dirmeta too. The canonical rule comes first: owner 0:0, no extended
@@ -4633,30 +4713,19 @@ has the format of each other commit, and its bytes follow these rules.
   options to the root dirmeta in the same way.
 - The walk reads no extended attributes. The commit checksum depends on the
   tree, the owner, the modes, the subject, and the body. It also depends on
-  the metadata options, the timestamp, the parent, and the collection id. The
-  collection id is that of the server for `push-tree`, and
-  `[core] collection-id` of the repository for the tool. With equal inputs,
-  the commit checksum is equal to the checksum of
-  `ostree commit --no-xattrs -b R1`. With two refs, it is equal to the
-  checksum of `ostree commit --no-xattrs -b R1 --bind-ref R2`.
-- The detached dict holds the entries of the caller, then the signatures in
-  the order of `commit` (`conformance/cli-behavior.md`, "CLI output
-  formats", `commit`). The server can change this dict before it stores it
-  ("Commit and CommitReply", checks 9 and 12).
+  the metadata options, the timestamp, the parent, the bound names, and the
+  collection of the namespace. With equal inputs, the commit checksum is
+  equal to the checksum of `ostree commit --no-xattrs -b BRANCH` with the
+  same parent, in a repository whose `collection-id` is the collection of the
+  namespace. Each tag and each bound name is one `--bind-ref`, and `--orphan`
+  is `--parent=none`.
 
 Observed behavior: with `SOURCE_DATE_EPOCH=1700000000` on both sides and no
 collection id on either side, both checksums are equal. The checks cover
 `--canonical-permissions`, `--owner-uid=0 --owner-gid=0`, `--body-file` alone
-and next to `-m`, `--parent=none`, `--parent` with a commit, `--no-bindings`,
-and an explicit `--timestamp`.
-
-Observed behavior: a check uses `--add-detached-metadata-string` and distinct
-ed25519 keys from `--sign` and `--sign-from-file`. With these options, the
-`.commitmeta` bytes on the server are equal to the bytes of `ostree commit`. The
-server of this check has no detached-metadata filter and no signing key, and
-it holds no `.commitmeta` of the commit before the push. The equality needs
-keys that are not empty, because `push-tree` refuses an empty key
-(`ostrya-push-tree(1)`).
+and next to `-m`, an explicit `--timestamp`, a second push onto the same
+branch, `--tag` and `--bind-ref` against `--bind-ref` of the tool, and
+`--orphan` on a new branch against `--parent=none`.
 
 ## bare-user-shared mode
 

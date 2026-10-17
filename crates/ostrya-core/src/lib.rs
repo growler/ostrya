@@ -68,6 +68,7 @@ mod xattr;
 pub use checksum::Checksum;
 pub use commit::{
     Commit, CommitLink, TimestampError, commit_metadata, commit_timestamp, ref_binding,
+    source_date_epoch,
 };
 pub use deflate::{DeflateReader, DeflateSink};
 pub use dirmeta::{DirMeta, DirMetaRef};

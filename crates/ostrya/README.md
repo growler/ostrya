@@ -12,8 +12,9 @@ that the `ostree` command writes. Many `Transaction`s can write to one
 repository at once in one process.
 
 As an extension, the crate also has a push protocol over HTTP and over ssh. With
-the `push` feature, `Repo::push` sends commits to a remote. With the `receive`
-feature, the `receive` module takes a push on the server side.
+the `push` feature, `Repo::push` sends commits to a remote, and `Repo::push_onto`
+asks a remote to commit the tree of a local commit. With the `receive` feature,
+the `receive` module takes a push on the server side.
 
 API documentation: <https://docs.rs/ostrya>
 
@@ -59,7 +60,8 @@ API documentation: <https://docs.rs/ostrya>
 - `sign-gpg`: `GpgSigner`, which signs with the `gpg` command. It turns on
   `verify-gpg`.
 - `receive`: the `receive` module, the receive side of a push.
-- `push`: `Repo::push` and `Repo::export_stream`, the push from a repository.
+- `push`: `Repo::push`, `Repo::push_onto`, and `Repo::export_stream`, the push
+  from a repository.
 - `lzma-static`: xz built from source and linked statically, with no runtime
   liblzma.
 

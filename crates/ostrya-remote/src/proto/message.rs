@@ -35,6 +35,7 @@ static MAYBE_CHECKSUM: LazyLock<Type> = LazyLock::new(|| parse("may"));
 static PULL_HELLO: LazyLock<Type> = LazyLock::new(|| parse("(ua{sv})"));
 static GET_REPLY: LazyLock<Type> = LazyLock::new(|| parse("(bmt)"));
 static LIST_REFS: LazyLock<Type> = LazyLock::new(|| parse("(asa{sv})"));
+static VALUE_IN_COMMIT: LazyLock<Type> = LazyLock::new(|| parse("((v))"));
 
 /// The first message of a push client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -859,8 +860,74 @@ fn dict_entries<'a>(
 /// value inside the message does not count against the depth limit of the
 /// serializer.
 fn encode_commit(c: &CommitRequest) -> Result<Vec<u8>> {
-    let updates = c
-        .updates
+    encode_commit_parts(&c.updates, c.force, c.server_commit.as_deref())
+}
+
+/// Returns the length of the frame of a `Commit` that holds the server
+/// commit `sc` and no ref update: the kind byte and the body.
+///
+/// The bytes of each metadata entry of `sc` must be a `v` in normal form,
+/// else the call returns [`Error::Protocol`].
+pub(crate) fn server_commit_frame_len(sc: &ServerCommit) -> Result<u64> {
+    Ok(encode_commit_parts(&[], false, Some(sc))?.len() as u64 + 1)
+}
+
+/// Checks that a commit can hold each metadata value of the server commit
+/// `sc`.
+///
+/// A commit holds the depth limit of 128 levels of containers, counted from
+/// its metadata dict. In that dict, the `v` of each value is under two
+/// containers, the dict and its entry. A tuple with one member of variable
+/// size holds the bytes of the member and no framing, so the bytes of a `v`
+/// are also the bytes of `((v))`. The check reads the bytes as that type and
+/// builds no value tree.
+///
+/// Bytes that are not a `v` in normal form are [`Error::Protocol`], as the
+/// encode of the message gives. A `v` that a commit cannot hold is
+/// [`Error::InvalidInput`].
+pub(crate) fn check_server_commit_metadata(sc: &ServerCommit) -> Result<()> {
+    for (key, value) in &sc.metadata {
+        let Err(deep) = ostrya_gvariant::validate(&VALUE_IN_COMMIT, value) else {
+            continue;
+        };
+        if let Err(e) = ostrya_gvariant::validate(&Type::Variant, value) {
+            return Err(protocol(format!("encode: metadata entry '{key}': {e}")));
+        }
+        return Err(Error::InvalidInput(format!(
+            "a commit cannot hold the metadata value under '{key}': {deep}"
+        )));
+    }
+    Ok(())
+}
+
+/// Returns the length of the frame of the longest `CommitReply` to the
+/// server commit `sc`: the kind byte and the body.
+///
+/// The reply holds the branch with an old commit and each tag with no old
+/// commit, each with a new commit.
+pub(crate) fn server_commit_reply_frame_len(sc: &ServerCommit) -> Result<u64> {
+    let any_commit = Some(Checksum::from_bytes([0; 32]));
+    let refs = std::iter::once(RefOutcome {
+        name: sc.branch.clone(),
+        old: any_commit,
+        new: any_commit,
+    })
+    .chain(sc.tags.iter().map(|tag| RefOutcome {
+        name: tag.clone(),
+        old: None,
+        new: any_commit,
+    }))
+    .collect();
+    Ok(Message::CommitReply(refs).encode_body()?.len() as u64 + 1)
+}
+
+/// Encodes the body of a `Commit` message from its parts.
+fn encode_commit_parts(
+    updates: &[RefUpdate],
+    force: bool,
+    server_commit: Option<&ServerCommit>,
+) -> Result<Vec<u8>> {
+    let updates = updates
         .iter()
         .map(|u| {
             let (state, expected) = match u.expected {
@@ -878,10 +945,10 @@ fn encode_commit(c: &CommitRequest) -> Result<Vec<u8>> {
         .collect();
     let updates = to_bytes(&UPDATES, &Value::Array(updates)).map_err(encode_error)?;
     let mut opts = Vec::new();
-    if c.force {
+    if force {
         opts.push(("force", variant_bytes(Type::Bool, Value::Bool(true))?));
     }
-    if let Some(sc) = &c.server_commit {
+    if let Some(sc) = server_commit {
         let mut value = server_commit_bytes(sc)?;
         value.push(0);
         value.extend_from_slice(SERVER_COMMIT_SIGNATURE.as_bytes());

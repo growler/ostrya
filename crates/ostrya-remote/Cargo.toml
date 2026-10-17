@@ -10,8 +10,8 @@ readme = "README.md"
 
 [features]
 default = ["smol"]
-smol = ["ostrya-rt/smol", "ostrya-sign/smol", "ostrya-fetch/smol"]
-tokio = ["ostrya-rt/tokio", "ostrya-sign/tokio", "ostrya-fetch/tokio"]
+smol = ["ostrya-rt/smol", "ostrya-fetch/smol"]
+tokio = ["ostrya-rt/tokio", "ostrya-fetch/tokio"]
 
 [dependencies]
 ostrya-gvariant = { workspace = true }
@@ -19,8 +19,6 @@ ostrya-core = { workspace = true }
 # The ssh transport runs the ssh client as a child process, and bounds the
 # waits of a session over it with a timer.
 ostrya-rt = { workspace = true }
-# A tree push signs the commit it builds.
-ostrya-sign = { workspace = true }
 # The HTTP transport sends each step of a session as an upload request.
 ostrya-fetch = { workspace = true }
 thiserror = "2"

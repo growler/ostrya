@@ -1795,7 +1795,6 @@ dependencies = [
  "ostrya-fetch",
  "ostrya-gvariant",
  "ostrya-rt",
- "ostrya-sign",
  "thiserror",
 ]
 

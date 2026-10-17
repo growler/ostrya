@@ -3834,6 +3834,10 @@ ostrya push [--repo=PATH] REMOTE SRC[:DST]...
             [--push-token-file=FILE] [--push-user=NAME]
             [--tls-client-cert-path=FILE] [--tls-client-key-path=FILE]
             [--tls-ca-path=FILE] [--allow-cleartext-credentials]
+ostrya push [--repo=PATH] REMOTE REF --onto=BRANCH
+            [--collection=ID] [--tag=NAME]... [--bind-ref=NAME]...
+            [--orphan] [--timestamp=TIME] [--compress[=LEVEL]]
+            [the transport options of the first form]
 ```
 
 - The `push` feature of `ostrya-cli` builds the command. It is in the
@@ -3893,6 +3897,56 @@ ostrya push [--repo=PATH] REMOTE SRC[:DST]...
   `error: ref-mismatch: ...` after the server reports its refs, and before
   the push sends an object. The client group of the push needs `t` or `w`
   on `NAME`.
+- `--onto=BRANCH` makes a server commit
+  (`../format-reference.md`, "Server commit"). The push sends the objects of
+  the tree of the local commit of `REF` that the server does not hold. The
+  server then makes a new commit over the tree, moves `BRANCH` to it, and
+  creates each `--tag` at it, in one transaction. The parent is the commit
+  of `BRANCH` on the server, or none when the server does not hold
+  `BRANCH`. The new commit takes the subject, the body, the metadata, and
+  the timestamp of the local commit. The push drops the local
+  `ostree.ref-binding` and `ostree.collection-binding`, and the server
+  writes the bindings of its namespace. The push sends no parent, no commit
+  object, and no detached metadata, so the server signs the new commit with
+  the keys of the client group.
+- Under `--onto`:
+  - The command takes exactly one `REF`, a revision of the local
+    repository, and does not split it at `:`. A second operand is refused
+    with `error: --onto takes one REF, and N were given` at exit 1, before
+    `REMOTE` resolves.
+  - `--onto` with `--depth` or with `--force` is refused by the option
+    parser at exit 1. `--bind-ref`, `--orphan`, and `--timestamp` without
+    `--onto` are refused in the same way.
+  - `--tag=NAME` creates the ref `NAME` at the new commit, and the server
+    binds `NAME`. A tag equal to `BRANCH` is refused with `error: invalid
+    input: ...`. A tag that exists gets `error: ref-mismatch: ...` before
+    the push sends an object.
+  - `--bind-ref=NAME` binds `NAME` and creates no ref. It can repeat. `NAME`
+    passes the ref-name rule and holds no `:`.
+  - `--orphan` makes a commit with no parent. On a `BRANCH` that exists,
+    the server refuses it with `error: non-fast-forward: ...` unless the
+    client group has `c` and `d` on `BRANCH`.
+  - `--timestamp=TIME` takes the value forms of `commit --timestamp`.
+    Without it, the new commit takes the timestamp of the local commit.
+  - `--collection=ID` alone names the namespace. Without it, the server
+    commit goes to the local refs of the server. The bindings of the local
+    commit do not select the namespace.
+  - A `BRANCH` or a tag that the ref-name rule refuses, that holds `:`, or
+    that is 64 lowercase hex characters is refused with `error: Invalid
+    refspec NAME` after `REMOTE` resolves and before the ssh client starts or
+    the first HTTP request. So is a bound name that the ref-name rule
+    refuses or that holds `:`.
+  - A local commit that the repository marks partial, and a local commit
+    with related objects, are refused with `error: invalid input: ...` at
+    the same step.
+  - After the server reports its refs, the push checks the `Commit` frame of
+    the server commit and the longest reply, which names `BRANCH` and each
+    tag, against the frame limit of the server, 1 MiB for an ostrya server.
+    A longer frame is refused with `error: limit-exceeded: ...` before the
+    push sends an object.
+  - The client group needs `c` on `BRANCH`, and `t` or `w` on each tag. A
+    server that runs receive hooks takes no server commit, and the push
+    fails with `error: ref-denied: ...`.
 - `--depth=N` sends `N` parents of each source commit, and `-1` the whole
   chain. Without it, the push sends the chain back to the commit of the ref
   on the server. When the server does not hold the ref, or the local chain
@@ -3960,6 +4014,9 @@ ostrya push [--repo=PATH] REMOTE SRC[:DST]...
   - `main C2 (deleted)` -- the push deleted the ref;
   - `main (absent) (unchanged)` -- a delete of a ref that the server does
     not hold.
+
+  With `--onto`, the command writes the checksum of the new commit as one
+  line, and nothing else.
 - Under `-v` the command writes one statistics line to standard error: the
   objects offered, needed, and sent, the bytes sent, and the elapsed time.
 - While the push runs, the command draws a progress bar on standard error
@@ -4004,15 +4061,14 @@ ostrya push [--repo=PATH] REMOTE SRC[:DST]...
 ### `push-tree`
 
 ```text
-ostrya push-tree [--repo=PATH] REMOTE DIR -b REF [-b REF]...
+ostrya push-tree [--repo=PATH] REMOTE DIR --onto=BRANCH
+                 [--tag=NAME]... [--bind-ref=NAME]... [--orphan]
+                 [--collection=ID]
                  [-s SUBJECT] [-m BODY] [--body-file=FILE]
                  [--add-metadata-string=KEY=VALUE]... [--add-metadata=KEY=VALUE]...
-                 [--add-detached-metadata-string=KEY=VALUE]...
-                 [--timestamp=TIME] [--parent=CHECKSUM|none] [--no-bindings]
+                 [--timestamp=TIME]
                  [--owner-uid=UID] [--owner-gid=GID] [--canonical-permissions]
-                 [--sign=KEY]... [--sign-from-file=FILE]... [--sign-type=ENGINE]
-                 [--gpg-sign=KEYID]... [--gpg-homedir=DIR]
-                 [--force] [--compress[=LEVEL]]
+                 [--compress[=LEVEL]]
                  [--ssh-command=CMD] [--receive-command=CMD]
                  [--push-token-file=FILE] [--push-user=NAME]
                  [--tls-client-cert-path=FILE] [--tls-client-key-path=FILE]
@@ -4021,30 +4077,35 @@ ostrya push-tree [--repo=PATH] REMOTE DIR -b REF [-b REF]...
 
 - The `push` feature of `ostrya-cli` builds the command. It is in the
   default set.
-- The command walks the directory `DIR`, builds one commit over it, sends
-  the objects that the server does not hold, and sets each `-b` ref of the
-  server to the commit in one transaction.
-- The option names and value forms are those of `commit`. Each `-b` names
-  one more target ref of the server.
+- The command walks the directory `DIR` and sends the objects of its tree
+  that the server does not hold. The server then makes one commit over the
+  tree, moves `BRANCH` to it, and creates each `--tag` at it, in one
+  transaction (`../format-reference.md`, "The commit of `push-tree`"). The
+  parent is the commit of `BRANCH` on the server, or none when the server
+  does not hold `BRANCH`. The server writes the bindings and signs the
+  commit with the keys of the client group.
+- The option names and value forms of the commit options are those of
+  `commit`.
 - The command reads `--owner-uid` and `--owner-gid` first, as `commit`
   does. It refuses a bad value before every other check.
 - The command then checks its operands, before it opens a repository. With
   no `REMOTE` it writes the usage text and `error: REMOTE must be
   specified`. With no `DIR` it writes the usage text and `error: DIR must be
-  specified`. With no `-b` it writes the usage text and `error: A branch
-  must be specified with --branch`. Each exits 1. No ssh client starts, and
+  specified`. With no `--onto` it writes the usage text and `error: A branch
+  must be specified with --onto`. Each exits 1. No ssh client starts, and
   no HTTP request is sent.
-- The command then reads `--parent`, the metadata options, and
-  `--timestamp`, in this order. It refuses a bad value before it opens a
-  repository.
+- The command then reads the metadata options and the timestamp, in this
+  order. It refuses a bad value before it opens a repository.
+- The timestamp is `--timestamp`, else the `SOURCE_DATE_EPOCH` environment
+  variable. A `SOURCE_DATE_EPOCH` that is not a count of seconds is refused
+  with `error: SOURCE_DATE_EPOCH is not a Unix timestamp: ...` at exit 1.
+  With neither, the push sends no timestamp, and the server takes its own
+  clock.
 - The command then resolves `REMOTE` and makes the transport ready. It
   refuses an option of the other transport and a bad HTTP option. It reads
   the token file of an HTTP push, and the TLS files of an `https://` push.
-- The command then reads the signing keys and `--body-file`, in this order.
-  For a `--gpg-sign` key, and for a `--sign` or `--sign-from-file` key under
-  `--sign-type=gpg`, it looks up the secret key in the GnuPG home
-  directory. So a refusal of the remote or of its options starts no gpg and
-  reads no body file.
+- The command then reads `--body-file`. So a refusal of the remote or of
+  its options reads no body file.
 - Each of these refusals comes before the walk. No ssh client starts, and
   no HTTP request is sent.
 - `REMOTE` is an ssh address, an `http://` or `https://` address, or a
@@ -4053,50 +4114,58 @@ ostrya push-tree [--repo=PATH] REMOTE DIR -b REF [-b REF]...
   repository for a remote name alone, from `--repo`, then the current
   directory, then `OSTREE_REPO`. For an address the command opens no
   repository, and it ignores `--repo`.
-- `--parent` takes a full commit checksum of 64 lowercase hex characters,
-  or `none`. Without it, the parent is the commit of the first `-b` ref on
-  the server, or no parent when the server does not hold that ref.
-- The command refuses a `-b` name that holds `:`, a name that the ref-name
-  rule refuses, which includes a name that holds `^`, and a name given twice.
-  It refuses a name of 64 lowercase hex characters with the wording of
-  `commit`. A name of 64 lowercase hex characters is refused before
-  `--parent` is read. The other names are refused after `--body-file` is
-  read, and before the walk. A name that holds `^` is refused with `ref
-  'NAME' is not a valid ref name`.
+- The command refuses a `BRANCH` or a `--tag` that holds `:`, a name that
+  the ref-name rule refuses, which includes a name that holds `^`, a tag
+  equal to `BRANCH`, and a tag given twice. It refuses a name of 64
+  lowercase hex characters with the wording of `commit`, before it reads
+  the metadata options. The other names are refused after `--body-file` is
+  read, and before the walk. A name that holds `^` is refused with `branch
+  'NAME' is not a valid ref name` or `tag 'NAME' is not a valid ref name`.
+- `--bind-ref=NAME` binds `NAME` and creates no ref. It can repeat. `NAME`
+  passes the ref-name rule and holds no `:`.
+- `--orphan` makes a commit with no parent. On a `BRANCH` that exists, the
+  server refuses it with `error: non-fast-forward: ...` unless the client
+  group has `c` and `d` on `BRANCH`.
+- `--collection=ID` names the namespace on the server. Without it, the push
+  writes the local refs of the server. An `ID` that fails the collection-id
+  rule or is longer than 255 bytes is refused before the walk.
 - The metadata dict holds every `--add-metadata-string` entry, then every
-  `--add-metadata` entry, then the binding keys. `ostree.ref-binding`
-  holds the `-b` names sorted. `ostree.collection-binding` holds the
-  collection id of the server, when the server has one. An empty key is
-  refused in the metadata dict and in the detached metadata dict.
+  `--add-metadata` entry, then the binding keys that the server writes.
+  `ostree.ref-binding` holds `BRANCH`, each `--tag`, and each `--bind-ref`,
+  sorted. `ostree.collection-binding` holds the collection of the namespace.
+  An empty key is refused. The keys `ostree.ref-binding` and
+  `ostree.collection-binding` are refused, because the server writes them.
 - `--owner-uid`, `--owner-gid`, and `--canonical-permissions` have the
   meaning they have in `commit`, and they apply to the root directory too.
   `--canonical-permissions` beside a non-zero owner id is refused with the
   wording of `commit`.
-- The signatures follow the order of `commit`: every `--sign` key, then
-  every `--sign-from-file` key, then every `--gpg-sign` key. Both
-  `--sign` and `--sign-from-file` take more than one value.
-- `--force`, `--compress`, `--ssh-command`, `--receive-command`, and the
-  HTTP options have the meaning they have in `push`.
-- The command does not apply `[ex-ostrya] detached-metadata-exclude`.
-- On success the command writes the commit checksum as one line to
-  standard output and exits 0. Under `-v` it writes the statistics line of
-  `push` to standard error.
+- After the server reports its refs, a tag that exists gets `error:
+  ref-mismatch: ...`. A `--add-metadata` value that a commit cannot hold
+  gets `error: invalid input: ...`. In a commit, a value can hold two levels
+  of containers fewer than a variant, so an array nested to 126 levels is
+  refused. A
+  `Commit` frame or a longest reply over the frame limit of the server gets
+  `error: limit-exceeded: ...`. The reply names `BRANCH` and each tag. Each
+  refusal comes before the push sends an object.
+- The client group needs `c` on `BRANCH`, and `t` or `w` on each tag. A
+  server that runs receive hooks takes no server commit, and the push fails
+  with `error: ref-denied: ...`.
+- `--compress`, `--ssh-command`, `--receive-command`, and the HTTP options
+  have the meaning they have in `push`.
+- On success the command writes the checksum of the new commit as one line
+  to standard output and exits 0. Under `-v` it writes the statistics line
+  of `push` to standard error.
 - While the push runs, the command draws the progress bar of `push` on
   standard error, with the same rules and the same known gaps. The bar
-  shows nothing during the walk and the hash pass, and nothing while a
-  signer signs the commit.
+  shows nothing during the walk and the hash pass.
 - On failure the command writes `error: MESSAGE` to standard error and
   nothing to standard output, and exits 1. A refusal of the server gives
   its wire code first, for example `error: mode-refused: ...`.
-- The commit checksum equals the checksum of `ostree commit --no-xattrs`
-  over the same tree with the same options, and of `ostree commit
-  --no-xattrs -b R1 --bind-ref R2` for two refs. With
-  `--add-detached-metadata-string` and distinct ed25519 `--sign` and
-  `--sign-from-file` keys, the `.commitmeta` bytes on the server equal the
-  bytes that the tool writes. The server keeps one copy of a signature
-  that it gets twice, so a key given twice gives one signature on the
-  server, where the tool writes two. Each test that compares the two runs
-  the tool with the same `SOURCE_DATE_EPOCH`, in
+- The commit checksum equals the checksum of `ostree commit --no-xattrs -b
+  BRANCH` over the same tree with the same options and the same parent.
+  Each `--tag` and each `--bind-ref` is one `--bind-ref` of the tool, and
+  `--orphan` is `--parent=none`. Each test that compares the two runs the
+  tool with the same `SOURCE_DATE_EPOCH`, in
   `crates/ostrya-cli/tests/push_ssh.rs`.
 
 ### `serve`

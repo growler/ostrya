@@ -205,14 +205,14 @@ impl ObjectSource for BadSource {
 
 /// A receiving repository of `mode` at a path that holds a `'` and a space.
 /// Its config has the client group of [`CLIENT`], which writes each ref as a
-/// fast-forward.
+/// fast-forward and makes a server commit on each ref.
 fn receiver(base: &TmpDir, mode: RepoMode) -> PathBuf {
     let path = base.0.join("it's a repo");
     block_on(Repo::create(&path, CreateOptions::new(mode))).unwrap();
     let config = path.join("config");
     let mut text = std::fs::read_to_string(&config).unwrap();
     text.push_str(&format!(
-        "[ex-ostrya client \"{CLIENT}\"]\nauth=ssh:{CLIENT}\nallow=w:**\n"
+        "[ex-ostrya client \"{CLIENT}\"]\nauth=ssh:{CLIENT}\nallow=wc:**\n"
     ));
     std::fs::write(&config, text).unwrap();
     path
@@ -1547,39 +1547,6 @@ mod cli {
         /// make in these tests.
         const EPOCH: &str = "1700000000";
 
-        /// ed25519 sign fixture: the base64 of the 64-byte secret key and the
-        /// matching 32-byte public key.
-        const ED25519_SECRET_B64: &str = "o74ME/dmhvDeYf64dDJQY8kX2piK0M/nyIRWVi30i6DCOzRsHVcvgYToz6zOb5OvK/v8nH6KfLR3dfdsn6ZSyQ==";
-        const ED25519_PUBLIC_B64: &str = "wjs0bB1XL4GE6M+szm+Tryv7/Jx+iny0d3X3bJ+mUsk=";
-
-        /// A second and a third ed25519 secret key, so a run with several
-        /// keys states an order.
-        const ED25519_SECRET2_B64: &str = "vvLhmBcasjZ09s+tBj6bor7aXGEBSB2bM3PS9kc+MpHlZgDjxcMu3VPDpQPqYXmwzMlEJeqlpSM8+s7YLfum2g==";
-        const ED25519_SECRET3_B64: &str = "tsJNF0H4IpARVGv9Iz3ROGIx2XelWthR+uCWodpT9JLfG8EF8bnmKaLLqFPCuGTdm36JKb5elhEmLCf8gz/8zQ==";
-
-        /// The environment variable that turns the ed25519-unsupported skip
-        /// into a failure.
-        const REQUIRE_OSTREE_ED25519: &str = "OSTRYA_REQUIRE_OSTREE_ED25519";
-
-        /// Returns `true` if the `ostree` command carries its ed25519 signing
-        /// engine. `ostree --version` reports this engine as the
-        /// `sign-ed25519` feature. If [`REQUIRE_OSTREE_ED25519`] is set, the
-        /// absence fails the test. If it is not set, the test skips and says
-        /// so.
-        fn ostree_supports_ed25519() -> bool {
-            let supported = ostree_available()
-                && ostree_version().is_some_and(|text| text.contains("sign-ed25519"));
-            assert!(
-                supported || std::env::var_os(REQUIRE_OSTREE_ED25519).is_none(),
-                "{REQUIRE_OSTREE_ED25519} is set and the installed `ostree` carries no \
-                 ed25519 engine, so the ed25519 cross-check tests cannot run"
-            );
-            if !supported {
-                eprintln!("skipped: `ostree` carries no ed25519 engine");
-            }
-            supported
-        }
-
         fn set_mode(path: &Path, mode: u32) {
             std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
         }
@@ -1637,27 +1604,31 @@ mod cli {
         }
 
         /// Run `ostrya push-tree` with `args` in the base directory, with
-        /// `SOURCE_DATE_EPOCH` and `envs` set.
+        /// `SOURCE_DATE_EPOCH` and then `envs` set.
         fn push_tree(setup: &Setup, args: &[&str], envs: &[(&str, &str)]) -> Output {
             let mut all = vec!["push-tree"];
             all.extend_from_slice(args);
-            let mut envs = envs.to_vec();
-            envs.push(("SOURCE_DATE_EPOCH", EPOCH));
-            ostrya(&setup.base.0, &all, &envs)
+            let mut all_envs = vec![("SOURCE_DATE_EPOCH", EPOCH)];
+            all_envs.extend_from_slice(envs);
+            ostrya(&setup.base.0, &all, &all_envs)
+        }
+
+        /// The ssh command, the receive command, the address of `dest`, and
+        /// the directory `tree`: the leading arguments of a push of `tree`.
+        fn leading(setup: &Setup, dest: &Path, tree: &Path) -> [String; 4] {
+            [
+                setup.ssh_command(),
+                receive_command(),
+                address(dest),
+                tree.to_str().unwrap().to_owned(),
+            ]
         }
 
         /// Run `ostrya push-tree` of `tree` over the stand-in to `dest`, with
         /// the receive command of the built binary.
         fn push_tree_to(setup: &Setup, dest: &Path, tree: &Path, args: &[&str]) -> Output {
-            let ssh = setup.ssh_command();
-            let receive = receive_command();
-            let address = address(dest);
-            let mut all = vec![
-                ssh.as_str(),
-                receive.as_str(),
-                address.as_str(),
-                tree.to_str().unwrap(),
-            ];
+            let leading = leading(setup, dest, tree);
+            let mut all: Vec<&str> = leading.iter().map(String::as_str).collect();
             all.extend_from_slice(args);
             push_tree(setup, &all, &[])
         }
@@ -1672,10 +1643,18 @@ mod cli {
             Checksum::from_hex(text.trim_end()).unwrap()
         }
 
-        /// One `-b` with a subject, a body, and metadata options in mixed
-        /// order gives the commit of the `ostree` command. A second push gives
-        /// the second commit of `ostree`, whose parent is the first. Under
-        /// `-v`, the statistics line goes to standard error.
+        /// The commit `checksum` of the repository `repo`.
+        fn load(repo: &Path, checksum: &Checksum) -> ostrya::Commit {
+            block_on(async {
+                let repo = Repo::open(repo).await.unwrap();
+                repo.load_commit(checksum).await.unwrap().0
+            })
+        }
+
+        /// One `--onto` with a subject, a body, and metadata options in mixed
+        /// order gives the commit of the `ostree` command with `-b`. A second
+        /// push gives the second commit of `ostree`, whose parent is the
+        /// first. Under `-v`, the statistics line goes to standard error.
         #[test]
         fn a_tree_push_gives_the_commit_of_the_tool() {
             let setup = Setup::without_client("tree-one");
@@ -1689,7 +1668,7 @@ mod cli {
                 "--add-metadata=n=uint32 1",
                 "--add-metadata-string=a=x",
             ];
-            let mut args = vec!["-b", "main"];
+            let mut args = vec!["--onto", "main"];
             args.extend(options);
 
             let out = push_tree_to(&setup, &dest, &tree, &args);
@@ -1703,6 +1682,7 @@ mod cli {
             let c2 = pushed(&out);
             assert_ne!(c1, c2);
             assert_eq!(server_tip(&dest, "main"), Some(c2));
+            assert_eq!(load(&dest, &c2).parent, Some(c1));
             let err = stderr(&out);
             let last = err.lines().last().unwrap_or_default();
             assert!(last.contains(" objects offered, "), "{err}");
@@ -1731,18 +1711,10 @@ mod cli {
             std::fs::write(tree.join("big"), "progress\n".repeat(40_000)).unwrap();
             set_mode(&tree.join("big"), 0o644);
             let dest = receiver(&setup.base, RepoMode::Archive);
-            let ssh = setup.ssh_command();
-            let receive = receive_command();
-            let address = address(&dest);
+            let leading = leading(&setup, &dest, &tree);
             let run = |extra: &[&str]| {
-                let mut args = vec![
-                    ssh.as_str(),
-                    receive.as_str(),
-                    address.as_str(),
-                    tree.to_str().unwrap(),
-                    "-b",
-                    "main",
-                ];
+                let mut args: Vec<&str> = leading.iter().map(String::as_str).collect();
+                args.extend(["--onto", "main"]);
                 args.extend_from_slice(extra);
                 push_tree(&setup, &args, &[("TERM", "xterm")])
             };
@@ -1764,23 +1736,37 @@ mod cli {
             assert_eq!(err.lines().count(), 1, "{err}");
         }
 
-        /// Two `-b` give the commit of `ostree commit -b R1 --bind-ref R2`,
-        /// and both refs of the server take it.
+        /// `--bind-ref` and `--tag` each give the commit of
+        /// `ostree commit -b R1 --bind-ref R2`. The server creates the ref of
+        /// a tag, and creates no ref for a bound name.
         #[test]
-        fn two_refs_give_the_commit_of_the_tool_with_bind_ref() {
+        fn a_tag_and_a_bound_name_give_the_commit_of_the_tool_with_bind_ref() {
             let setup = Setup::without_client("tree-two");
             let tree = tree(&setup.base, "tree", 0o644, 0o755);
             let dest = receiver(&setup.base, RepoMode::Archive);
-            let c = pushed(&push_tree_to(
+            let bound = pushed(&push_tree_to(
                 &setup,
                 &dest,
                 &tree,
-                &["-b", "r1", "-b", "r2"],
+                &["--onto", "r1", "--bind-ref", "r2"],
             ));
-            assert_eq!(server_tip(&dest, "r1"), Some(c));
-            assert_eq!(server_tip(&dest, "r2"), Some(c));
+            assert_eq!(server_tip(&dest, "r1"), Some(bound));
+            assert_eq!(server_tip(&dest, "r2"), None);
+            let tagged = pushed(&push_tree_to(
+                &setup,
+                &dest,
+                &tree,
+                &["--onto", "t1", "--tag", "t2"],
+            ));
+            assert_eq!(server_tip(&dest, "t1"), Some(tagged));
+            assert_eq!(server_tip(&dest, "t2"), Some(tagged));
+            let out = push_tree_to(&setup, &dest, &tree, &["--onto", "t3", "--tag", "t2"]);
+            assert_failed(&out, "error: ref-mismatch: ");
+            assert_eq!(server_tip(&dest, "t3"), None);
             if let Some(t) = tool_commit(&setup.base, &tree, &["-b", "r1", "--bind-ref", "r2"]) {
-                assert_eq!(c, t);
+                assert_eq!(bound, t);
+                let t = tool_commit(&setup.base, &tree, &["-b", "t1", "--bind-ref", "t2"]);
+                assert_eq!(Some(tagged), t);
             }
             tool_fsck(&dest);
         }
@@ -1793,17 +1779,19 @@ mod cli {
             let setup = Setup::without_client("tree-owner");
             let tree = tree(&setup.base, "tree", 0o664, 0o2775);
             let dest = receiver(&setup.base, RepoMode::Archive);
-            let plain = pushed(&push_tree_to(&setup, &dest, &tree, &["-b", "plain"]));
+            let plain = pushed(&push_tree_to(&setup, &dest, &tree, &["--onto", "plain"]));
             for (name, options) in [
                 ("canonical", &["--canonical-permissions"][..]),
                 ("owner", &["--owner-uid=0", "--owner-gid=0"][..]),
             ] {
-                let mut args = vec!["-b", name];
+                let mut args = vec!["--onto", name];
                 args.extend(options);
                 let c = pushed(&push_tree_to(&setup, &dest, &tree, &args));
                 assert_ne!(c, plain, "{name}");
                 assert_eq!(server_tip(&dest, name), Some(c));
-                if let Some(t) = tool_commit(&setup.base, &tree, &args) {
+                let mut tool_args = vec!["-b", name];
+                tool_args.extend(options);
+                if let Some(t) = tool_commit(&setup.base, &tree, &tool_args) {
                     assert_eq!(c, t, "{name}");
                 }
             }
@@ -1811,45 +1799,6 @@ mod cli {
                 assert_eq!(plain, t);
             }
             tool_fsck(&dest);
-        }
-
-        /// A push signed with `--sign` verifies with the `ostree` command and
-        /// with ostrya in the receiver. The signature leaves the commit equal
-        /// to the commit of an unsigned push.
-        #[test]
-        fn a_signed_tree_push_verifies_in_the_receiver() {
-            let setup = Setup::without_client("tree-sign");
-            let tree = tree(&setup.base, "tree", 0o644, 0o755);
-            let dest = receiver(&setup.base, RepoMode::Archive);
-            let sign = format!("--sign={ED25519_SECRET_B64}");
-            let c = pushed(&push_tree_to(&setup, &dest, &tree, &["-b", "main", &sign]));
-            let dest_arg = format!("--repo={}", dest.display());
-            let hex = c.to_hex();
-            let out = ostrya(
-                &setup.base.0,
-                &[&dest_arg, "sign", "--verify", &hex, ED25519_PUBLIC_B64],
-                &[],
-            );
-            assert!(out.status.success(), "{}", stderr(&out));
-            assert!(stdout(&out).contains("verification OK"), "{}", stdout(&out));
-            if ostree_supports_ed25519() {
-                let out = Command::new("ostree")
-                    .args([&dest_arg, "sign", "--verify", "--sign-type=ed25519"])
-                    .args([hex.as_str(), ED25519_PUBLIC_B64])
-                    .output()
-                    .unwrap();
-                assert!(
-                    out.status.success(),
-                    "{}",
-                    String::from_utf8_lossy(&out.stderr)
-                );
-            }
-            let other = TmpDir::new("tree-sign-unsigned");
-            let unsigned = receiver(&other, RepoMode::Archive);
-            let u = pushed(&push_tree_to(&setup, &unsigned, &tree, &["-b", "main"]));
-            assert_eq!(c, u);
-            tool_fsck(&dest);
-            tool_fsck(&unsigned);
         }
 
         /// A `bare-user-only` receiver refuses the owner of the walk and a
@@ -1868,7 +1817,7 @@ mod cli {
                 &setup,
                 &dest,
                 &plain,
-                &["-b", "x", "--canonical-permissions", "--owner-uid=1"],
+                &["--onto", "x", "--canonical-permissions", "--owner-uid=1"],
             );
             assert_failed(
                 &out,
@@ -1877,11 +1826,11 @@ mod cli {
             assert!(!setup.ssh_started());
 
             if !root {
-                let out = push_tree_to(&setup, &dest, &plain, &["-b", "main"]);
+                let out = push_tree_to(&setup, &dest, &plain, &["--onto", "main"]);
                 assert_failed(&out, "error: mode-refused: ");
                 assert_eq!(server_tip(&dest, "main"), None);
             }
-            let owner = ["-b", "main", "--owner-uid=0", "--owner-gid=0"];
+            let owner = ["--onto", "main", "--owner-uid=0", "--owner-gid=0"];
             let c = pushed(&push_tree_to(&setup, &dest, &plain, &owner));
             assert_eq!(server_tip(&dest, "main"), Some(c));
 
@@ -1889,7 +1838,7 @@ mod cli {
                 &setup,
                 &dest,
                 &wide,
-                &["-b", "wide", "--owner-uid=0", "--owner-gid=0"],
+                &["--onto", "wide", "--owner-uid=0", "--owner-gid=0"],
             );
             assert_failed(&out, "error: mode-refused: ");
             assert_eq!(server_tip(&dest, "wide"), None);
@@ -1897,7 +1846,7 @@ mod cli {
                 &setup,
                 &dest,
                 &wide,
-                &["-b", "wide", "--canonical-permissions"],
+                &["--onto", "wide", "--canonical-permissions"],
             ));
             assert_eq!(server_tip(&dest, "wide"), Some(c));
             tool_fsck(&dest);
@@ -1915,10 +1864,7 @@ mod cli {
             let setup = Setup::new("tree-address", "archive");
             let tree = tree(&setup.base, "tree", 0o644, 0o755);
             let dest = receiver(&setup.base, RepoMode::Archive);
-            let ssh = setup.ssh_command();
-            let receive = receive_command();
-            let address = address(&dest);
-            let tree_arg = tree.to_str().unwrap();
+            let leading = leading(&setup, &dest, &tree);
             let missing = setup.base.0.join("missing");
             let garbage = setup.base.0.join("garbage");
             std::fs::create_dir_all(garbage.join("objects")).unwrap();
@@ -1926,24 +1872,19 @@ mod cli {
             let missing_arg = format!("--repo={}", missing.display());
             let garbage_arg = format!("--repo={}", garbage.display());
             let missing_env = [("OSTREE_REPO", missing.to_str().unwrap())];
-            // The ref, the `--repo` option, and the environment of each case.
+            // The branch, the `--repo` option, and the environment of each
+            // case.
             type Case<'a> = (&'a str, Option<&'a str>, &'a [(&'a str, &'a str)]);
             let cases: [Case; 4] = [
-                ("f1", Some(missing_arg.as_str()), &[]),
-                ("f2", Some(garbage_arg.as_str()), &[]),
-                ("f3", None, &missing_env),
-                ("f4", None, &[]),
+                ("n1", Some(missing_arg.as_str()), &[]),
+                ("n2", Some(garbage_arg.as_str()), &[]),
+                ("n3", None, &missing_env),
+                ("n4", None, &[]),
             ];
             for (name, repo, envs) in cases {
                 let mut args: Vec<&str> = repo.into_iter().collect();
-                args.extend([
-                    ssh.as_str(),
-                    receive.as_str(),
-                    &address,
-                    tree_arg,
-                    "-b",
-                    name,
-                ]);
+                args.extend(leading.iter().map(String::as_str));
+                args.extend(["--onto", name]);
                 let c = pushed(&push_tree(&setup, &args, envs));
                 assert_eq!(server_tip(&dest, name), Some(c), "{name}");
             }
@@ -1969,12 +1910,20 @@ mod cli {
             std::fs::write(&config, text).unwrap();
             let out = push_tree(
                 &setup,
-                &[&missing_arg, &ssh, &receive, "origin", tree_arg, "-b", "f5"],
+                &[
+                    &missing_arg,
+                    &ssh,
+                    &receive,
+                    "origin",
+                    tree_arg,
+                    "--onto",
+                    "n5",
+                ],
                 &[],
             );
             assert_failed(&out, "error: opening repo: ");
             assert!(!setup.ssh_started());
-            assert_eq!(server_tip(&dest, "f5"), None);
+            assert_eq!(server_tip(&dest, "n5"), None);
         }
 
         /// A remote name reads the push address and the receive command from
@@ -1997,7 +1946,14 @@ mod cli {
             let ssh = setup.ssh_command();
             let out = push_tree(
                 &setup,
-                &[&repo, &ssh, "origin", tree.to_str().unwrap(), "-b", "main"],
+                &[
+                    &repo,
+                    &ssh,
+                    "origin",
+                    tree.to_str().unwrap(),
+                    "--onto",
+                    "main",
+                ],
                 &[],
             );
             let c = pushed(&out);
@@ -2006,10 +1962,10 @@ mod cli {
             tool_fsck(&dest);
         }
 
-        /// A missing REMOTE, DIR, or `-b` fails with the usage text and the
-        /// error line, in that order, before ssh starts. A missing DIR wins
-        /// over a missing `-b`, and each wins over a `--repo` that does not
-        /// open.
+        /// A missing REMOTE, DIR, or `--onto` fails with the usage text and
+        /// the error line, in that order, before ssh starts. A missing DIR
+        /// wins over a missing `--onto`, and each wins over a `--repo` that
+        /// does not open.
         #[test]
         fn a_missing_operand_fails_with_the_usage_text() {
             let setup = Setup::without_client("tree-operands");
@@ -2020,23 +1976,26 @@ mod cli {
             let tree_arg = tree.to_str().unwrap();
             let missing_repo = format!("--repo={}", setup.base.0.join("missing").display());
             for (args, message) in [
-                (vec![ssh.as_str(), "-b", "main"], "REMOTE must be specified"),
                 (
-                    vec![ssh.as_str(), &address, "-b", "main"],
+                    vec![ssh.as_str(), "--onto", "main"],
+                    "REMOTE must be specified",
+                ),
+                (
+                    vec![ssh.as_str(), &address, "--onto", "main"],
                     "DIR must be specified",
                 ),
                 (
                     vec![ssh.as_str(), &address, tree_arg],
-                    "A branch must be specified with --branch",
+                    "A branch must be specified with --onto",
                 ),
                 (vec![ssh.as_str(), &address], "DIR must be specified"),
                 (
-                    vec![&missing_repo, ssh.as_str(), "origin", "-b", "main"],
+                    vec![&missing_repo, ssh.as_str(), "origin", "--onto", "main"],
                     "DIR must be specified",
                 ),
                 (
                     vec![&missing_repo, ssh.as_str(), "origin", tree_arg],
-                    "A branch must be specified with --branch",
+                    "A branch must be specified with --onto",
                 ),
             ] {
                 let out = push_tree(&setup, &args, &[]);
@@ -2052,39 +2011,40 @@ mod cli {
 
         /// Each refused option fails with exit 1 and nothing on standard
         /// output, before ssh starts, and sets no ref. Each case gives a DIR
-        /// that does not exist, so the refusal comes before the scan.
+        /// that does not exist, so the refusal comes before the scan. A
+        /// malformed `SOURCE_DATE_EPOCH` is refused too, and `--timestamp`
+        /// wins over it.
         #[test]
         fn a_refused_option_fails_before_ssh_starts() {
             let setup = Setup::without_client("tree-refused");
             let dest = receiver(&setup.base, RepoMode::Archive);
-            let upper = format!("--parent={}", "AB".repeat(32));
             let hex = "ab".repeat(32);
             let missing = setup.base.0.join("missing");
             let cases: Vec<(Vec<&str>, &str)> = vec![
-                (vec!["--parent=abc"], "Invalid --parent 'abc'"),
-                (vec![upper.as_str()], "Invalid --parent 'ABAB"),
                 (vec!["--timestamp=bogus"], "Could not parse 'bogus'"),
                 (vec!["--add-metadata-string=noeq"], "Missing '='"),
                 (vec!["--add-metadata=k=@@"], "Parsing k=@@: "),
                 (vec!["--add-metadata-string==v"], "Empty metadata key"),
                 (
-                    vec!["--add-detached-metadata-string==v"],
-                    "Empty metadata key",
+                    vec!["--add-metadata-string=ostree.ref-binding=x"],
+                    "'ostree.ref-binding', which the server writes",
                 ),
-                (vec!["--sign=short"], "Invalid ed25519 secret key"),
                 (
-                    vec!["--sign-type=dummy", "--sign=X"],
-                    "dummy signature type is only for ostree testing",
+                    vec!["--add-metadata=ostree.collection-binding='x'"],
+                    "'ostree.collection-binding', which the server writes",
                 ),
                 (vec!["--compress=0"], "--compress"),
-                (vec!["-b", "main"], "named twice"),
-                (vec!["-b", "main^"], "is not a valid ref name"),
-                (vec!["-b", "origin:main"], "holds ':'"),
-                (vec!["-b", hex.as_str()], "looks like a checksum"),
+                (vec!["--tag", "main"], "is also the branch"),
+                (vec!["--tag", "t", "--tag", "t"], "is named twice"),
+                (vec!["--tag", "main^"], "is not a valid ref name"),
+                (vec!["--tag", "origin:main"], "holds ':'"),
+                (vec!["--tag", hex.as_str()], "looks like a checksum"),
+                (vec!["--bind-ref", "o:b"], "bound name 'o:b'"),
+                (vec!["--collection=no-dot"], "invalid collection id"),
                 (vec!["--owner-uid=abc"], "Cannot parse integer value"),
             ];
             for (options, needle) in cases {
-                let mut args = vec!["-b", "main"];
+                let mut args = vec!["--onto", "main"];
                 args.extend(options.iter());
                 let out = push_tree_to(&setup, &dest, &missing, &args);
                 assert_eq!(out.status.code(), Some(1), "{options:?}: {}", stderr(&out));
@@ -2096,17 +2056,36 @@ mod cli {
                 );
                 assert!(!setup.ssh_started(), "{options:?}");
             }
-            let out = push_tree_to(&setup, &dest, &missing, &["-b", "main"]);
+            for branch in ["main^", "origin:main", hex.as_str()] {
+                let out = push_tree_to(&setup, &dest, &missing, &["--onto", branch]);
+                assert_failed(&out, "error: ");
+                assert!(!setup.ssh_started(), "{branch}");
+            }
+
+            let leading = leading(&setup, &dest, &missing);
+            let mut args: Vec<&str> = leading.iter().map(String::as_str).collect();
+            args.extend(["--onto", "main"]);
+            let out = push_tree(&setup, &args, &[("SOURCE_DATE_EPOCH", "soon")]);
+            assert_failed(
+                &out,
+                "error: SOURCE_DATE_EPOCH is not a Unix timestamp: \"soon\"",
+            );
+            assert!(!setup.ssh_started());
+            args.push("--timestamp=@1");
+            let out = push_tree(&setup, &args, &[("SOURCE_DATE_EPOCH", "soon")]);
+            assert_failed(&out, "error: ");
+            assert!(stderr(&out).contains("missing"), "{}", stderr(&out));
+
+            let out = push_tree_to(&setup, &dest, &missing, &["--onto", "main"]);
             assert_failed(&out, "error: ");
             assert!(stderr(&out).contains("missing"), "{}", stderr(&out));
             assert!(!setup.ssh_started());
             assert_eq!(server_tip(&dest, "main"), None);
         }
 
-        /// `--body-file` alone and beside `-m`, `--parent=none`,
-        /// `--no-bindings`, an explicit `--timestamp`, and `--parent` with
-        /// a commit of the server each give the commit of the `ostree`
-        /// command with the same options.
+        /// `--body-file` alone and beside `-m`, an explicit `--timestamp`,
+        /// and `--orphan` on a new branch each give the commit of the
+        /// `ostree` command with the matching options.
         #[test]
         fn the_commit_options_give_the_commit_of_the_tool() {
             let setup = Setup::without_client("tree-options");
@@ -2115,170 +2094,291 @@ mod cli {
             let body = setup.base.0.join("body.txt");
             std::fs::write(&body, "file body\n").unwrap();
             let body_file = format!("--body-file={}", body.display());
-            let first = pushed(&push_tree_to(&setup, &dest, &tree, &["-b", "first"]));
-            let parent = format!("--parent={first}");
-            let cases: [&[&str]; 4] = [
-                &["-b", "body", &body_file, "--parent=none"],
-                &["-b", "both", "-m", "inline", &body_file, "--no-bindings"],
-                &["-b", "stamp", "--timestamp=@1600000000"],
-                &["-b", "child", &parent],
+            // The options of ostrya and the options of the `ostree` command
+            // that give the same commit.
+            let cases: [(&[&str], &[&str]); 4] = [
+                (&["--onto", "body", &body_file], &["-b", "body", &body_file]),
+                (
+                    &["--onto", "both", "-m", "inline", &body_file],
+                    &["-b", "both", "-m", "inline", &body_file],
+                ),
+                (
+                    &["--onto", "stamp", "--timestamp=@1600000000"],
+                    &["-b", "stamp", "--timestamp=@1600000000"],
+                ),
+                (
+                    &["--onto", "root", "--orphan"],
+                    &["-b", "root", "--parent=none"],
+                ),
             ];
             let mut commits = Vec::new();
-            for args in cases {
+            for (args, _) in cases {
                 let c = pushed(&push_tree_to(&setup, &dest, &tree, args));
                 assert_eq!(server_tip(&dest, args[1]), Some(c), "{args:?}");
                 commits.push(c);
             }
-            if let Some(t) = tool_commit(&setup.base, &tree, &["-b", "first"]) {
-                assert_eq!(first, t);
-                for (args, c) in cases.iter().zip(&commits) {
-                    assert_eq!(tool_commit(&setup.base, &tree, args), Some(*c), "{args:?}");
+            assert_eq!(load(&dest, &commits[2]).timestamp, 1_600_000_000);
+            if ostree_available() {
+                for ((_, tool_args), c) in cases.iter().zip(&commits) {
+                    let t = tool_commit(&setup.base, &tree, tool_args);
+                    assert_eq!(t, Some(*c), "{tool_args:?}");
                 }
             }
             tool_fsck(&dest);
         }
 
-        /// The `.commitmeta` bytes of `commit` in the `archive` repository
-        /// `repo`.
-        fn commitmeta(repo: &Path, commit: &Checksum) -> Vec<u8> {
-            let hex = commit.to_hex();
-            let path = repo
-                .join("objects")
-                .join(&hex[..2])
-                .join(format!("{}.commitmeta", &hex[2..]));
-            std::fs::read(path).unwrap()
-        }
-
-        /// Detached metadata, two `--sign` keys, and a `--sign-from-file`
-        /// key give the detached entry, then the three signatures. The
-        /// signatures come in the order of `ostree commit`: the `--sign` keys
-        /// in command-line order, then the `--sign-from-file` key. The
-        /// `.commitmeta` bytes and the commit are equal to those of the
-        /// `ostree` command with the same options.
+        /// `--orphan` on a branch that exists needs `d`: with `wc` the server
+        /// answers `non-fast-forward`, and with `wcd` the new commit has no
+        /// parent.
         #[test]
-        fn detached_metadata_and_signers_give_the_commitmeta_of_the_tool() {
-            let setup = Setup::without_client("tree-detached");
+        fn orphan_on_a_present_branch_needs_d() {
+            let setup = Setup::without_client("tree-orphan");
             let tree = tree(&setup.base, "tree", 0o644, 0o755);
             let dest = receiver(&setup.base, RepoMode::Archive);
-            let key_file = setup.base.0.join("key.txt");
-            std::fs::write(&key_file, format!("{ED25519_SECRET3_B64}\n")).unwrap();
-            let from_file = format!("--sign-from-file={}", key_file.display());
-            let second = format!("--sign={ED25519_SECRET2_B64}");
-            let first = format!("--sign={ED25519_SECRET_B64}");
-            // The file key comes first on the command line and signs last.
-            // The receiver keeps one copy of a signature given twice, so the
-            // three keys are distinct.
-            let args = [
+            let first = pushed(&push_tree_to(&setup, &dest, &tree, &["--onto", "main"]));
+            let out = push_tree_to(&setup, &dest, &tree, &["--onto", "main", "--orphan"]);
+            assert_failed(&out, "error: non-fast-forward: ");
+            assert_eq!(server_tip(&dest, "main"), Some(first));
+            client_group(&dest, "wcd:**");
+            let out = push_tree_to(
+                &setup,
+                &dest,
+                &tree,
+                &["--onto", "main", "--orphan", "--timestamp=@1700000001"],
+            );
+            let root = pushed(&out);
+            assert_eq!(server_tip(&dest, "main"), Some(root));
+            assert_eq!(load(&dest, &root).parent, None);
+        }
+
+        /// A client group with no `c` gets `ref-denied`. A collection
+        /// namespace writes the refs of the collection, and binds the commit
+        /// to it.
+        #[test]
+        fn the_rights_and_the_collection_of_a_tree_push() {
+            let setup = Setup::without_client("tree-rights");
+            let tree = tree(&setup.base, "tree", 0o644, 0o755);
+            let dest = receiver(&setup.base, RepoMode::Archive);
+            client_group(&dest, "w:**");
+            let out = push_tree_to(&setup, &dest, &tree, &["--onto", "main"]);
+            assert_failed(&out, "error: ref-denied: ");
+            assert_eq!(server_tip(&dest, "main"), None);
+
+            collection_group(&dest, "os", "org.example.Os", "c:**");
+            let out = push_tree_to(
+                &setup,
+                &dest,
+                &tree,
+                &["--onto", "main", "--collection=org.example.Os"],
+            );
+            let c = pushed(&out);
+            let mirror = dest.join("refs/mirrors/org.example.Os/main");
+            assert_eq!(std::fs::read_to_string(mirror).unwrap(), format!("{c}\n"));
+            let commit = load(&dest, &c);
+            assert_eq!(commit.collection_binding(), Some("org.example.Os"));
+            assert_eq!(commit.ref_bindings(), ["main"]);
+            assert_eq!(server_tip(&dest, "main"), None);
+        }
+
+        /// With no `--timestamp` and no `SOURCE_DATE_EPOCH`, the push sends no
+        /// timestamp, and the server takes its clock.
+        #[test]
+        fn with_no_timestamp_the_server_takes_its_clock() {
+            let setup = Setup::without_client("tree-clock");
+            let tree = tree(&setup.base, "tree", 0o644, 0o755);
+            let dest = receiver(&setup.base, RepoMode::Archive);
+            let leading = leading(&setup, &dest, &tree);
+            let now = || {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_secs()
+            };
+            let before = now();
+            let out = Command::new(env!("CARGO_BIN_EXE_ostrya"))
+                .arg("push-tree")
+                .args(&leading)
+                .args(["--onto", "main"])
+                .current_dir(&setup.base.0)
+                .env_remove("OSTRYA_SSH_COMMAND")
+                .env_remove("OSTREE_REPO")
+                .env_remove("SOURCE_DATE_EPOCH")
+                .env("LOGNAME", CLIENT)
+                .stdin(Stdio::null())
+                .output()
+                .unwrap();
+            let after = now();
+            let c = pushed(&out);
+            let timestamp = load(&dest, &c).timestamp;
+            assert!(
+                (before..=after).contains(&timestamp),
+                "{timestamp} is not in {before}..={after}"
+            );
+        }
+
+        /// The commit of the local branch `main` of `setup` over the tree
+        /// `tree`, with `extra` options of `ostrya commit`.
+        fn local_commit(setup: &Setup, tree: &Path, extra: &[&str]) -> Checksum {
+            let repo = format!("--repo={}", setup.client.display());
+            let mut args = vec![
+                repo.as_str(),
+                "commit",
+                "--no-xattrs",
                 "-b",
                 "main",
-                &from_file,
-                "--add-detached-metadata-string=k=v",
-                &second,
-                &first,
+                "-s",
+                "S",
+                "-m",
+                "B",
+                "--add-metadata-string=a=x",
             ];
-            let c = pushed(&push_tree_to(&setup, &dest, &tree, &args));
-            let bytes = commitmeta(&dest, &c);
-            let dict = ostrya::from_bytes(&ostrya::Type::parse("a{sv}").unwrap(), &bytes).unwrap();
-            let keys: Vec<&str> = dict
-                .as_array()
-                .unwrap()
-                .iter()
-                .map(|entry| entry.as_tuple().unwrap()[0].as_str().unwrap())
-                .collect();
-            assert_eq!(keys, ["k", "ostree.sign.ed25519"]);
-            let (_, signatures) = dict
-                .dict_get("ostree.sign.ed25519")
-                .and_then(Value::as_variant)
-                .unwrap();
-            assert_eq!(signatures.as_array().unwrap().len(), 3);
-            if ostree_supports_ed25519()
-                && let Some(t) = tool_commit(&setup.base, &tree, &args)
-            {
-                assert_eq!(c, t);
-                assert_eq!(bytes, commitmeta(&setup.base.0.join("tool-ref"), &t));
+            args.extend_from_slice(extra);
+            args.push(tree.to_str().unwrap());
+            let out = ostrya(&setup.base.0, &args, &[("SOURCE_DATE_EPOCH", EPOCH)]);
+            assert!(out.status.success(), "{}", stderr(&out));
+            Checksum::from_hex(stdout(&out).trim()).unwrap()
+        }
+
+        /// `push --onto` prints the commit of the server alone. The commit
+        /// takes the subject, the body, the metadata, and the timestamp of
+        /// the local commit, with the bindings of the server in place of the
+        /// local bindings. It equals the commit of `ostree commit -b` over the
+        /// same tree, with the same parent. A second push moves the branch.
+        /// `--tag` and `--bind-ref` bind their names, and `--timestamp`
+        /// replaces the timestamp.
+        #[test]
+        fn push_onto_gives_the_commit_of_the_tool() {
+            let setup = Setup::new("onto-tool", "archive");
+            set_collection_id(&setup.client, Some("org.example.Local"));
+            let one = tree(&setup.base, "one", 0o644, 0o755);
+            let two = tree(&setup.base, "two", 0o644, 0o700);
+            let dest = receiver(&setup.base, RepoMode::Archive);
+
+            let local = local_commit(&setup, &one, &["--bind-ref=local/only"]);
+            let out = setup.push_to(&dest, &["--onto=main", "main"]);
+            let c1 = pushed(&out);
+            assert_ne!(c1, local);
+            assert_eq!(server_tip(&dest, "main"), Some(c1));
+            assert!(!server_has_commit(&dest, &local));
+            let commit = load(&dest, &c1);
+            assert_eq!(commit.ref_bindings(), ["main"]);
+            assert_eq!(commit.collection_binding(), None);
+            assert_eq!(commit.timestamp, 1_700_000_000);
+
+            local_commit(&setup, &two, &[]);
+            let out = setup.push_to(
+                &dest,
+                &[
+                    "--onto=main",
+                    "--tag=v1",
+                    "--bind-ref=b2",
+                    "--timestamp=@1600000000",
+                    "main",
+                ],
+            );
+            let c2 = pushed(&out);
+            assert_eq!(server_tip(&dest, "main"), Some(c2));
+            assert_eq!(server_tip(&dest, "v1"), Some(c2));
+            assert_eq!(load(&dest, &c2).parent, Some(c1));
+
+            let options = ["-s", "S", "-m", "B", "--add-metadata-string=a=x"];
+            let mut first = vec!["-b", "main"];
+            first.extend(options);
+            if let Some(t1) = tool_commit(&setup.base, &one, &first) {
+                assert_eq!(c1, t1);
+                let mut second = vec![
+                    "-b",
+                    "main",
+                    "--bind-ref=v1",
+                    "--bind-ref=b2",
+                    "--timestamp=@1600000000",
+                ];
+                second.extend(options);
+                assert_eq!(tool_commit(&setup.base, &two, &second), Some(c2));
             }
             tool_fsck(&dest);
         }
 
-        /// Under `--sign-type=gpg`, the push refuses a `--sign` key and a
-        /// `--sign-from-file` key that name no secret key in the GnuPG home
-        /// directory. It refuses them before the scan and before ssh starts,
-        /// with the words of `--gpg-sign`.
-        #[cfg(feature = "gpg")]
+        /// `push --onto` refuses a second REF, `--depth`, `--force`, a bad
+        /// timestamp, and a bad branch before ssh starts. `--bind-ref`,
+        /// `--orphan`, and `--timestamp` need `--onto`.
         #[test]
-        fn a_gpg_key_with_no_secret_key_fails_before_ssh_starts() {
-            if !gpg_available() {
-                return;
-            }
-            let setup = Setup::without_client("tree-gpg");
+        fn push_onto_refusals_come_before_ssh_starts() {
+            let setup = Setup::new("onto-refused", "archive");
+            setup.commit("main", FILES, &[]);
             let dest = receiver(&setup.base, RepoMode::Archive);
-            let missing = setup.base.0.join("missing");
-            let home = EmptyGpgHome::new(&setup.base);
-            let homedir = format!("--gpg-homedir={}", home.0.display());
-            let key_file = setup.base.0.join("key.txt");
-            std::fs::write(&key_file, "DEADBEEFDEADBEEF\n").unwrap();
-            let from_file = format!("--sign-from-file={}", key_file.display());
-            let message = format!(
-                "error: No gpg key found with ID DEADBEEFDEADBEEF (homedir: {})\n",
-                home.0.display()
-            );
-            for key in ["--sign=DEADBEEFDEADBEEF", from_file.as_str()] {
-                let args = ["-b", "main", "--sign-type=gpg", key, homedir.as_str()];
-                let out = push_tree_to(&setup, &dest, &missing, &args);
-                assert_failed(&out, &message);
-                assert_eq!(stderr(&out), message);
-                assert!(!setup.ssh_started(), "{key}");
+            for (args, needle) in [
+                (
+                    &["--onto=main", "main", "main"][..],
+                    "error: --onto takes one REF, and 2 were given",
+                ),
+                (&["--onto=main", "--depth=1", "main"], "cannot be used with"),
+                (&["--onto=main", "--force", "main"], "cannot be used with"),
+                (
+                    &["--onto=main", "--timestamp=bogus", "main"],
+                    "error: Could not parse 'bogus'",
+                ),
+                (&["--onto=main^", "main"], "error: Invalid refspec main^"),
+                (&["--onto=main", "--tag=main", "main"], "also the branch"),
+                (&["--bind-ref=x", "main"], "--onto"),
+                (&["--orphan", "main"], "--onto"),
+                (&["--timestamp=@1", "main"], "--onto"),
+            ] {
+                let out = setup.push_to(&dest, args);
+                assert_eq!(out.status.code(), Some(1), "{args:?}: {}", stderr(&out));
+                assert_eq!(stdout(&out), "", "{args:?}");
+                assert!(stderr(&out).contains(needle), "{args:?}: {}", stderr(&out));
+                assert!(!setup.ssh_started(), "{args:?}");
             }
             assert_eq!(server_tip(&dest, "main"), None);
         }
 
-        /// Returns `true` if the gpg binary runs. If `OSTRYA_REQUIRE_GNUPG` is
-        /// set, a missing binary fails the test.
-        #[cfg(feature = "gpg")]
-        fn gpg_available() -> bool {
-            const REQUIRE_GNUPG: &str = "OSTRYA_REQUIRE_GNUPG";
-            let found = Command::new("gpg")
-                .arg("--version")
-                .output()
-                .is_ok_and(|out| out.status.success());
-            assert!(
-                found || std::env::var_os(REQUIRE_GNUPG).is_none(),
-                "{REQUIRE_GNUPG} is set and `gpg` is not available"
+        /// The server refuses a `push --onto` from a client group with no
+        /// `c`, a tag that exists, and `--orphan` on a present branch without
+        /// `d`. `--orphan` with `d` makes a commit with no parent. A
+        /// collection writes the refs of the collection.
+        #[test]
+        fn push_onto_takes_the_rights_of_the_server() {
+            let setup = Setup::new("onto-rights", "archive");
+            setup.commit("main", FILES, &[]);
+            let dest = receiver(&setup.base, RepoMode::Archive);
+            client_group(&dest, "w:**");
+            let out = setup.push_to(&dest, &["--onto=main", "main"]);
+            assert_failed(&out, "error: ref-denied: ");
+            assert_eq!(server_tip(&dest, "main"), None);
+
+            client_group(&dest, "wc:**");
+            let first = pushed(&setup.push_to(&dest, &["--onto=main", "--tag=v1", "main"]));
+            let out = setup.push_to(&dest, &["--onto=main", "--tag=v1", "main"]);
+            assert_failed(&out, "error: ref-mismatch: ");
+            let out = setup.push_to(&dest, &["--onto=main", "--orphan", "main"]);
+            assert_failed(&out, "error: non-fast-forward: ");
+            assert_eq!(server_tip(&dest, "main"), Some(first));
+
+            client_group(&dest, "wcd:**");
+            let out = setup.push_to(
+                &dest,
+                &["--onto=main", "--orphan", "--timestamp=@1", "main"],
             );
-            if !found {
-                eprintln!("skipped: `gpg` is not available");
-            }
-            found
-        }
+            let root = pushed(&out);
+            assert_eq!(server_tip(&dest, "main"), Some(root));
+            assert_eq!(load(&dest, &root).parent, None);
 
-        /// An empty GnuPG home directory. The drop stops the GnuPG daemons
-        /// of the directory and removes their socket directory.
-        #[cfg(feature = "gpg")]
-        struct EmptyGpgHome(PathBuf);
-
-        #[cfg(feature = "gpg")]
-        impl EmptyGpgHome {
-            fn new(base: &TmpDir) -> EmptyGpgHome {
-                let dir = base.0.join("gnupghome");
-                std::fs::create_dir(&dir).unwrap();
-                set_mode(&dir, 0o700);
-                EmptyGpgHome(dir)
-            }
-        }
-
-        #[cfg(feature = "gpg")]
-        impl Drop for EmptyGpgHome {
-            fn drop(&mut self) {
-                for action in [&["--kill", "all"][..], &["--remove-socketdir"][..]] {
-                    let _ = Command::new("gpgconf")
-                        .arg("--homedir")
-                        .arg(&self.0)
-                        .args(action)
-                        .stdout(Stdio::null())
-                        .stderr(Stdio::null())
-                        .status();
-                }
-            }
+            collection_group(&dest, "os", "org.example.Os", "c:**");
+            let out = setup.push_to(
+                &dest,
+                &["--onto=main", "--collection=org.example.Os", "main"],
+            );
+            let mirrored = pushed(&out);
+            let mirror = dest.join("refs/mirrors/org.example.Os/main");
+            assert_eq!(
+                std::fs::read_to_string(mirror).unwrap(),
+                format!("{mirrored}\n")
+            );
+            assert_eq!(
+                load(&dest, &mirrored).collection_binding(),
+                Some("org.example.Os")
+            );
         }
     }
 }

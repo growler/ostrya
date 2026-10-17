@@ -5,11 +5,12 @@
 //!   tree. The tests skip extended attributes, run with and without canonical
 //!   permissions, and skip a directory.
 //! - The tree model as the object source of a push to `Repo::receive` over
-//!   two in-process pipes.
-//! - The tree push of `push_tree_over_stream` to `Repo::receive`. The tests
-//!   compare its commit with the commit of `Transaction::write_commit`. They
-//!   check the refs that it sets, the objects that it sends, the refusal of
-//!   mixed ref states, its signatures, and its progress phases.
+//!   two in-process pipes, with a commit that the test builds.
+//! - The tree push of `push_tree_over_stream` to `Repo::receive`, which makes
+//!   a server commit. The tests compare the commit of the server with the
+//!   commit of `Transaction::write_commit`. They check the refs that the
+//!   server sets, the objects that the push sends, the refusals before any
+//!   upload, and the progress phases.
 
 #![cfg(all(feature = "push", feature = "receive"))]
 
@@ -24,19 +25,20 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 
-use common::receive::{PipeReader, connect, new_repo, policy_allowing};
+use common::receive::{PipeReader, collections_policy, connect, new_repo, policy_allowing};
 use common::{ROOT_DIRMETA, ROOT_DIRTREE, TmpDir};
 use futures_io::AsyncRead;
 use futures_lite::future::zip;
 use ostrya::remote::tree::{EntryAction, EntryFilter, EntryKind, ScanOptions, TreeModel};
 use ostrya::remote::{
-    Compression, Error, Expected, ObjectSource, ParentPolicy, PushOutcome, PushPhase, PushProgress,
-    PushSession, RefUpdate, SessionOptions, TreePushOptions, push_tree_over_stream,
+    BoxFuture, Compression, Encoding, Error, Expected, ObjectData, ObjectSource, PushOutcome,
+    PushPhase, PushProgress, PushSession, RefUpdate, SessionOptions, TreePushOptions,
+    push_tree_over_stream,
 };
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, DictBuilder,
-    DummySigner, Ed25519Signer, Ed25519Verifier, FilterResult, FsckOptions, MutableTree,
-    ObjectType, ReceiveReport, Repo, RepoMode, Signer, Type, Value,
+    FilterResult, FsckOptions, MutableTree, ObjectName, ObjectType, ReceivePolicy, ReceiveReport,
+    Repo, RepoMode, Type, Value,
 };
 use ostrya_core::commit_metadata;
 use ostrya_rt::block_on;
@@ -241,15 +243,59 @@ fn a_skipped_directory_leaves_out_its_subtree_as_the_ingest_does() {
 /// The ref that each push sets.
 const REF: &str = "tree/main";
 
-/// Scans `src` with the canonical filter and gives the model a commit over
-/// its roots, with a detached metadata dict. Returns the model and the commit
-/// checksum.
-fn scan_and_commit(src: &Path) -> (TreeModel, Checksum) {
+/// A tree model and a commit over its tree, with a detached metadata dict. The
+/// source gives the objects of the tree from the model, and the commit and
+/// its detached metadata from its own fields.
+struct Committed {
+    model: TreeModel,
+    commit: Checksum,
+    bytes: Vec<u8>,
+    detached: Value,
+}
+
+impl ObjectSource for Committed {
+    fn objects<'a>(
+        &'a self,
+        _commit: &'a Checksum,
+    ) -> BoxFuture<'a, ostrya::remote::Result<Vec<ObjectName>>> {
+        let mut names = self.model.object_names();
+        names.push(ObjectName::new(self.commit, ObjectType::Commit));
+        Box::pin(async move { Ok(names) })
+    }
+
+    fn open<'a>(
+        &'a self,
+        name: &'a ObjectName,
+        encoding: Encoding,
+    ) -> BoxFuture<'a, ostrya::remote::Result<ObjectData>> {
+        if name.ty == ObjectType::Commit {
+            let reader = Box::new(futures_lite::io::Cursor::new(self.bytes.clone()));
+            return Box::pin(async move {
+                Ok(ObjectData::Encoded {
+                    encoding: Encoding::Raw,
+                    reader,
+                })
+            });
+        }
+        self.model.open(name, encoding)
+    }
+
+    fn detached_metadata<'a>(
+        &'a self,
+        _commit: &'a Checksum,
+    ) -> BoxFuture<'a, ostrya::remote::Result<Option<Value>>> {
+        Box::pin(async move { Ok(Some(self.detached.clone())) })
+    }
+}
+
+/// Scans `src` with the canonical filter and builds a commit over its roots,
+/// with a detached metadata dict.
+fn scan_and_commit(src: &Path) -> Committed {
     let options = ScanOptions {
         entry_filter: Some(canonical()),
         hash_jobs: None,
     };
-    let mut model = block_on(TreeModel::scan(src, options)).unwrap();
+    let model = block_on(TreeModel::scan(src, options)).unwrap();
     let bytes = ostrya_core::Commit {
         metadata: Value::Array(Vec::new()),
         parent: None,
@@ -262,19 +308,21 @@ fn scan_and_commit(src: &Path) -> (TreeModel, Checksum) {
     }
     .serialize()
     .unwrap();
-    let commit = Checksum::sha256(&bytes);
     let mut dict = DictBuilder::new();
     dict.insert_str("xa.pushed-by", "push_tree");
-    model.set_commit(commit, bytes, Some(dict.build()));
-    (model, commit)
+    Committed {
+        model,
+        commit: Checksum::sha256(&bytes),
+        bytes,
+        detached: dict.build(),
+    }
 }
 
-/// Pushes `commit` from `model` into `repo`. The push sets `REF` and expects
+/// Pushes the commit of `source` into `repo`. The push sets `REF` and expects
 /// it to be absent.
 fn push(
     repo: &Repo,
-    model: &TreeModel,
-    commit: Checksum,
+    source: &Committed,
     compression: Compression,
 ) -> (
     ostrya::Result<ReceiveReport>,
@@ -285,13 +333,14 @@ fn push(
     let input = client.reader.into_inner();
     let policy = policy_allowing(&["w:**"]);
     let refs = vec![REF.to_string()];
+    let commit = source.commit;
     let client = async {
         let session =
             PushSession::over_stream(input, output, &refs, SessionOptions::default()).await?;
-        let names = model.objects(&commit).await?;
+        let names = source.objects(&commit).await?;
         let missing = session.missing(&names).await?;
         session
-            .send(model, &missing, &[commit], compression)
+            .send(source, &missing, &[commit], compression)
             .await?;
         let update = RefUpdate {
             name: REF.into(),
@@ -318,18 +367,19 @@ fn a_push_of_the_tree_model_commits_and_sets_its_ref() {
             let tmp = TmpDir::new("push-tree-push");
             let src = build_fixture_source(tmp.path());
             let repo = new_repo(&tmp, mode, "");
-            let (model, commit) = scan_and_commit(&src);
-            let (report, client) = push(&repo, &model, commit, compression);
+            let source = scan_and_commit(&src);
+            let commit = source.commit;
+            let (report, client) = push(&repo, &source, compression);
             let report = report.unwrap_or_else(|e| panic!("{what}: {e}"));
             let outcome = client.unwrap_or_else(|e| panic!("{what}: {e}"));
             assert_eq!(outcome.refs, report.refs, "{what}");
             assert_eq!(outcome.refs[0].new, Some(commit), "{what}");
             assert_eq!(ref_file(&repo), Some(format!("{commit}\n")), "{what}");
 
-            // The server holds each object the model named, and no other.
+            // The server holds each object the source named, and no other.
             let reopened = block_on(Repo::open(repo.path())).unwrap();
             let stored = block_on(reopened.traverse_commit(&commit, 0)).unwrap();
-            let named: HashSet<_> = block_on(model.objects(&commit))
+            let named: HashSet<_> = block_on(source.objects(&commit))
                 .unwrap()
                 .into_iter()
                 .collect();
@@ -360,9 +410,9 @@ fn push_after_change(
     let tmp = TmpDir::new(tag);
     let src = build_fixture_source(tmp.path());
     let repo = new_repo(&tmp, mode, "");
-    let (model, commit) = scan_and_commit(&src);
+    let source = scan_and_commit(&src);
     change(&src.join("hello.txt"));
-    let (report, client) = push(&repo, &model, commit, compression);
+    let (report, client) = push(&repo, &source, compression);
     assert_eq!(ref_file(&repo), None, "{what}: a ref changed");
     let server = match report {
         Err(e) => e,
@@ -439,10 +489,6 @@ const SUBJECT: &str = "tree push";
 const BODY: &str = "the body";
 const TIMESTAMP: u64 = 1_700_000_000;
 
-/// The base64 of a 64-byte ed25519 secret key (seed, then public key).
-const SECRET_B64: &str =
-    "o74ME/dmhvDeYf64dDJQY8kX2piK0M/nyIRWVi30i6DCOzRsHVcvgYToz6zOb5OvK/v8nH6KfLR3dfdsn6ZSyQ==";
-
 fn string(s: &str) -> Value {
     Value::variant(Type::Str, Value::Str(s.to_owned()))
 }
@@ -455,11 +501,15 @@ fn caller_entries() -> Vec<(String, Value)> {
     ]
 }
 
-/// The options of a tree push of `refs` with the canonical filter, the
+fn strings(items: &[&str]) -> Vec<String> {
+    items.iter().map(|s| s.to_string()).collect()
+}
+
+/// The options of a tree push onto `branch` with the canonical filter, the
 /// subject, the body, and the timestamp of these tests.
-fn tree_options(refs: &[&str]) -> TreePushOptions {
+fn tree_options(branch: &str) -> TreePushOptions {
     TreePushOptions {
-        refs: refs.iter().map(|r| r.to_string()).collect(),
+        onto: branch.into(),
         subject: Some(SUBJECT.into()),
         body: Some(BODY.into()),
         timestamp: Some(TIMESTAMP),
@@ -491,10 +541,17 @@ impl AsyncRead for FirstRead {
     }
 }
 
-/// One tree push of `src` into `repo` over two in-process pipes, with `hook`
-/// at the first read of the client.
-fn tree_push(
+/// The policy of the tree pushes: a server commit on each ref, and a tag on
+/// each ref.
+fn server_commit_policy() -> ReceivePolicy {
+    policy_allowing(&["c:**", "t:**"])
+}
+
+/// One tree push of `src` into `repo` under `policy` over two in-process
+/// pipes, with `hook` at the first read of the client.
+fn tree_push_under(
     repo: &Repo,
+    policy: &ReceivePolicy,
     src: &Path,
     opts: TreePushOptions,
     hook: Option<Hook>,
@@ -508,25 +565,48 @@ fn tree_push(
         inner: client.reader.into_inner(),
         hook,
     };
-    let policy = policy_allowing(&["w:**"]);
     block_on(zip(
-        repo.receive(server_in, server_out, &policy),
+        repo.receive(server_in, server_out, policy),
         push_tree_over_stream(input, output, src, opts),
     ))
 }
 
-/// Runs a tree push that must succeed. Checks the outcome against the report
-/// of the server. Returns the commit and the outcome.
-fn pushed(repo: &Repo, src: &Path, opts: TreePushOptions, what: &str) -> (Checksum, PushOutcome) {
-    let (report, client) = tree_push(repo, src, opts, None);
+/// [`tree_push_under`] with [`server_commit_policy`].
+fn tree_push(
+    repo: &Repo,
+    src: &Path,
+    opts: TreePushOptions,
+    hook: Option<Hook>,
+) -> (
+    ostrya::Result<ReceiveReport>,
+    ostrya::remote::Result<PushOutcome>,
+) {
+    tree_push_under(repo, &server_commit_policy(), src, opts, hook)
+}
+
+/// Runs a tree push under `policy` that must succeed. Checks the outcome
+/// against the report of the server. Returns the commit and the outcome.
+fn pushed_under(
+    repo: &Repo,
+    policy: &ReceivePolicy,
+    src: &Path,
+    opts: TreePushOptions,
+    what: &str,
+) -> (Checksum, PushOutcome) {
+    let (report, client) = tree_push_under(repo, policy, src, opts, None);
     let report = report.unwrap_or_else(|e| panic!("{what}: {e}"));
     let outcome = client.unwrap_or_else(|e| panic!("{what}: {e}"));
     assert_eq!(outcome.refs, report.refs, "{what}");
-    let commit = outcome.commit.expect("a tree push builds a commit");
+    let commit = outcome.commit.expect("the server names its commit");
     for r in &outcome.refs {
         assert_eq!(r.new, Some(commit), "{what}");
     }
     (commit, outcome)
+}
+
+/// [`pushed_under`] with [`server_commit_policy`].
+fn pushed(repo: &Repo, src: &Path, opts: TreePushOptions, what: &str) -> (Checksum, PushOutcome) {
+    pushed_under(repo, &server_commit_policy(), src, opts, what)
 }
 
 fn named_ref(repo: &Repo, name: &str) -> Option<String> {
@@ -574,6 +654,10 @@ async fn local_commit(
     commit
 }
 
+/// The commit of the server is the commit of `write_commit` with the tip of
+/// the branch as its parent, the entries of the caller, and then the
+/// bindings of the namespace: the branch, the tags, and the bound names, and
+/// the collection.
 #[test]
 fn the_commit_of_a_tree_push_is_the_commit_that_write_commit_writes() {
     let tmp = TmpDir::new("push-tree-checksum");
@@ -583,35 +667,37 @@ fn the_commit_of_a_tree_push_is_the_commit_that_write_commit_writes() {
         block_on(local_commit(base, repo, parent, metadata))
     };
 
-    // One ref with entries of the caller, on a server with no collection id.
+    // One branch with entries of the caller, on a server with no collection
+    // id.
     let plain = new_repo(&tmp, RepoMode::Archive, "");
     let (first, _) = pushed(
         &plain,
         &src,
         TreePushOptions {
             metadata: caller_entries(),
-            ..tree_options(&[REF])
+            ..tree_options(REF)
         },
-        "one ref",
+        "one branch",
     );
     let want = local(
         "local-one",
         None,
         commit_metadata(caller_entries(), Some(&[REF]), None),
     );
-    assert_eq!(first, want, "one ref");
+    assert_eq!(first, want, "one branch");
     assert_eq!(named_ref(&plain, REF), Some(format!("{first}\n")));
 
-    // The current tip of the first ref is the parent.
-    let (second, _) = pushed(
+    // The current tip of the branch is the parent.
+    let (second, outcome) = pushed(
         &plain,
         &src,
         TreePushOptions {
             metadata: caller_entries(),
-            ..tree_options(&[REF])
+            ..tree_options(REF)
         },
         "current tip",
     );
+    assert_eq!(outcome.refs[0].old, Some(first));
     let want = local(
         "local-tip",
         Some(first),
@@ -619,81 +705,145 @@ fn the_commit_of_a_tree_push_is_the_commit_that_write_commit_writes() {
     );
     assert_eq!(second, want, "current tip");
 
-    // A given parent, for a ref that the server does not hold.
-    let (given, _) = pushed(
+    // Tags and bound names join the ref binding, a bound name twice. Each tag
+    // takes the commit, and a bound name gets no ref.
+    let (tagged, _) = pushed(
         &plain,
         &src,
         TreePushOptions {
-            parent: ParentPolicy::Commit(first),
-            ..tree_options(&["tree/other"])
+            tags: strings(&["tree/t2", "tree/t1"]),
+            bind_refs: strings(&["tree/bound", "tree/bound"]),
+            ..tree_options("tree/other")
         },
-        "given parent",
+        "tags",
+    );
+    let bound = [
+        "tree/other",
+        "tree/t2",
+        "tree/t1",
+        "tree/bound",
+        "tree/bound",
+    ];
+    let want = local(
+        "local-tags",
+        None,
+        commit_metadata(Vec::new(), Some(&bound), None),
+    );
+    assert_eq!(tagged, want, "tags");
+    for name in ["tree/t1", "tree/t2"] {
+        assert_eq!(
+            named_ref(&plain, name),
+            Some(format!("{tagged}\n")),
+            "{name}"
+        );
+    }
+    assert_eq!(named_ref(&plain, "tree/bound"), None);
+
+    // `orphan` on a branch that exists needs `d`, and makes a root commit.
+    let (report, client) = tree_push(
+        &plain,
+        &src,
+        TreePushOptions {
+            orphan: true,
+            ..tree_options(REF)
+        },
+        None,
+    );
+    assert!(
+        matches!(client, Err(Error::NonFastForward(_))),
+        "{client:?}"
+    );
+    assert!(report.is_err(), "{report:?}");
+    assert_eq!(named_ref(&plain, REF), Some(format!("{second}\n")));
+    let (orphan, _) = pushed_under(
+        &plain,
+        &policy_allowing(&["cd:**"]),
+        &src,
+        TreePushOptions {
+            orphan: true,
+            ..tree_options(REF)
+        },
+        "orphan",
     );
     let want = local(
-        "local-given",
-        Some(first),
-        commit_metadata(Vec::new(), Some(&["tree/other"]), None),
+        "local-orphan",
+        None,
+        commit_metadata(Vec::new(), Some(&[REF]), None),
     );
-    assert_eq!(given, want, "given parent");
+    assert_eq!(orphan, want, "orphan");
 
-    // Two refs, out of order, on a server with a collection id.
+    // A server with a collection id binds the commit to it.
     let tmp_c = TmpDir::new("push-tree-checksum-collection");
     let collection = new_repo(&tmp_c, RepoMode::Archive, "collection-id=org.example.C\n");
-    let refs = ["tree/b", "tree/a"];
-    let (bound, _) = pushed(
+    let (own, _) = pushed(
         &collection,
         &src,
         TreePushOptions {
             metadata: caller_entries(),
-            ..tree_options(&refs)
+            ..tree_options(REF)
         },
-        "two refs",
+        "own collection",
     );
     let want = local(
-        "local-two",
+        "local-own",
         None,
-        commit_metadata(caller_entries(), Some(&refs), Some("org.example.C")),
+        commit_metadata(caller_entries(), Some(&[REF]), Some("org.example.C")),
     );
-    assert_eq!(bound, want, "two refs");
+    assert_eq!(own, want, "own collection");
 
-    // No bindings, on the same server.
-    let (unbound, _) = pushed(
+    // The namespace of another collection binds the commit to it, and the
+    // server writes its refs under `refs/mirrors/`.
+    let (mirrored, _) = pushed_under(
         &collection,
+        &collections_policy(&["c:**"]),
         &src,
         TreePushOptions {
-            metadata: caller_entries(),
-            no_bindings: true,
-            ..tree_options(&["tree/unbound"])
+            collection: Some("org.example.Other".into()),
+            ..tree_options(REF)
         },
-        "no bindings",
+        "other collection",
     );
     let want = local(
-        "local-unbound",
+        "local-other",
         None,
-        commit_metadata(caller_entries(), None, None),
+        commit_metadata(Vec::new(), Some(&[REF]), Some("org.example.Other")),
     );
-    assert_eq!(unbound, want, "no bindings");
+    assert_eq!(mirrored, want, "other collection");
+    let mirror = collection
+        .path()
+        .join("refs/mirrors/org.example.Other")
+        .join(REF);
+    assert_eq!(
+        std::fs::read_to_string(mirror).ok(),
+        Some(format!("{mirrored}\n"))
+    );
+    assert_eq!(named_ref(&collection, REF), Some(format!("{own}\n")));
 }
 
+/// The push sends each object of the tree and no commit object. The server
+/// moves the branch and creates the tag. With no signing key, the server
+/// stores no detached metadata.
 #[test]
-fn a_tree_push_commits_and_sets_its_refs() {
+fn a_tree_push_sends_the_tree_and_the_server_sets_its_refs() {
     for mode in MODES {
         for compression in COMPRESSIONS {
             let what = format!("{mode:?}, {compression:?}");
             let tmp = TmpDir::new("push-tree-tree-push");
             let src = build_rich_source(tmp.path());
             let repo = new_repo(&tmp, mode, "");
-            let refs = ["tree/one", "tree/two"];
             let (commit, outcome) = pushed(
                 &repo,
                 &src,
                 TreePushOptions {
                     compression,
-                    ..tree_options(&refs)
+                    tags: strings(&["tree/tag"]),
+                    ..tree_options("tree/one")
                 },
                 &what,
             );
-            for name in refs {
+            let names: Vec<&str> = outcome.refs.iter().map(|r| r.name.as_str()).collect();
+            assert_eq!(names, ["tree/one", "tree/tag"], "{what}");
+            for name in ["tree/one", "tree/tag"] {
                 assert_eq!(
                     named_ref(&repo, name),
                     Some(format!("{commit}\n")),
@@ -703,9 +853,16 @@ fn a_tree_push_commits_and_sets_its_refs() {
             let reopened = block_on(Repo::open(repo.path())).unwrap();
             let stored = block_on(reopened.traverse_commit(&commit, 0)).unwrap();
             let stats = outcome.stats;
-            assert_eq!(stats.objects_total, stored.len() as u64, "{what}");
+            // The stored objects hold the commit, which the push did not send.
+            assert_eq!(stats.objects_total + 1, stored.len() as u64, "{what}");
             assert_eq!(stats.objects_needed, stats.objects_total, "{what}");
             assert_eq!(stats.objects_sent, stats.objects_total, "{what}");
+            let meta = repo.path().join("objects").join(ostrya::loose_path(
+                &commit,
+                ObjectType::CommitMeta,
+                mode,
+            ));
+            assert!(!meta.exists(), "{what}: detached metadata is stored");
             let fsck = block_on(reopened.fsck(&FsckOptions::default())).unwrap();
             assert!(fsck.is_ok(), "{what}: {fsck:?}");
         }
@@ -713,32 +870,71 @@ fn a_tree_push_commits_and_sets_its_refs() {
 }
 
 #[test]
-fn a_second_tree_push_sends_only_the_commit() {
+fn a_second_tree_push_sends_no_object() {
     let tmp = TmpDir::new("push-tree-second");
     let src = build_rich_source(tmp.path());
     let repo = new_repo(&tmp, RepoMode::Archive, "");
-    let (first, _) = pushed(&repo, &src, tree_options(&[REF]), "first");
-    let (second, outcome) = pushed(&repo, &src, tree_options(&[REF]), "second");
+    let (first, _) = pushed(&repo, &src, tree_options(REF), "first");
+    let (second, outcome) = pushed(&repo, &src, tree_options(REF), "second");
     assert_ne!(second, first);
     assert_eq!(outcome.refs[0].old, Some(first));
-    assert_eq!(outcome.stats.objects_needed, 1, "{:?}", outcome.stats);
-    assert_eq!(outcome.stats.objects_sent, 1, "{:?}", outcome.stats);
+    assert_eq!(outcome.stats.objects_needed, 0, "{:?}", outcome.stats);
+    assert_eq!(outcome.stats.objects_sent, 0, "{:?}", outcome.stats);
     let (commit, _) = block_on(repo.load_commit(&second)).unwrap();
     assert_eq!(commit.parent, Some(first));
     assert_eq!(named_ref(&repo, REF), Some(format!("{second}\n")));
 }
 
-/// The push refuses a target ref of 64 lowercase hex characters before the
-/// scan, because a revision reads it as a commit checksum. The server writes
-/// no ref and no object.
+/// With no timestamp, the server takes its clock.
 #[test]
-fn a_target_ref_of_64_lowercase_hex_characters_is_refused() {
+fn a_tree_push_with_no_timestamp_takes_the_clock_of_the_server() {
+    let tmp = TmpDir::new("push-tree-clock");
+    let src = build_fixture_source(tmp.path());
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    let now = || {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    };
+    let before = now();
+    let (commit, _) = pushed(
+        &repo,
+        &src,
+        TreePushOptions {
+            timestamp: None,
+            ..tree_options(REF)
+        },
+        "clock",
+    );
+    let after = now();
+    let (commit, _) = block_on(repo.load_commit(&commit)).unwrap();
+    assert!(
+        (before..=after).contains(&commit.timestamp),
+        "{} is not in {before}..={after}",
+        commit.timestamp
+    );
+}
+
+/// The push refuses a tag of 64 lowercase hex characters before the scan,
+/// because a revision reads it as a commit checksum. The server writes no
+/// ref and no object.
+#[test]
+fn a_tag_of_64_lowercase_hex_characters_is_refused() {
     let tmp = TmpDir::new("push-tree-hex-ref");
     let src = build_fixture_source(tmp.path());
     let repo = new_repo(&tmp, RepoMode::Archive, "");
     let before = object_files(&repo);
     let hex = "a".repeat(64);
-    let (report, client) = tree_push(&repo, &src, tree_options(&["main", &hex]), None);
+    let (report, client) = tree_push(
+        &repo,
+        &src,
+        TreePushOptions {
+            tags: strings(&[&hex]),
+            ..tree_options("main")
+        },
+        None,
+    );
     match client {
         Err(Error::InvalidInput(m)) => assert!(m.contains(&hex), "{m}"),
         other => panic!("{other:?}"),
@@ -765,7 +961,7 @@ fn a_file_changed_at_the_same_length_after_the_scan_fails_the_tree_push() {
                 &src,
                 TreePushOptions {
                     compression,
-                    ..tree_options(&[REF])
+                    ..tree_options(REF)
                 },
                 Some(change),
             );
@@ -804,99 +1000,151 @@ fn object_files(repo: &Repo) -> HashSet<PathBuf> {
     out
 }
 
-#[test]
-fn target_refs_in_mixed_states_are_refused_before_any_upload() {
-    let tmp = TmpDir::new("push-tree-mixed");
-    let src = build_fixture_source(tmp.path());
-    let repo = new_repo(&tmp, RepoMode::Archive, "");
-    let (tip, _) = pushed(&repo, &src, tree_options(&["tree/a"]), "first");
-    // A new file gives the tree objects that the server does not hold.
-    std::fs::write(src.join("new.txt"), b"new\n").unwrap();
-    let before = object_files(&repo);
-    for refs in [["tree/a", "tree/b"], ["tree/b", "tree/a"]] {
-        let what = format!("{refs:?}");
-        let progress = PushProgress::new();
-        let (report, client) = tree_push(
-            &repo,
-            &src,
-            TreePushOptions {
-                progress: Some(progress.clone()),
-                ..tree_options(&refs)
-            },
-            None,
-        );
-        match client {
-            Err(Error::InvalidInput(m)) => {
-                assert!(m.contains("mixed states"), "{what}: {m}");
-                assert!(m.contains(&format!("'tree/a' is at {tip}")), "{what}: {m}");
-                assert!(m.contains("'tree/b' is absent"), "{what}: {m}");
-            }
-            other => panic!("{what}: {other:?}"),
-        }
-        assert!(
-            matches!(
-                report,
-                Err(ostrya::Error::Remote(ostrya::remote::Error::Aborted))
-            ),
-            "{what}: server {report:?}"
-        );
-        let snapshot = progress.snapshot();
-        assert_eq!(snapshot.objects_total, 0, "{what}: {snapshot:?}");
-        assert_eq!(snapshot.objects_sent, 0, "{what}: {snapshot:?}");
-        assert_eq!(object_files(&repo), before, "{what}: the store changed");
-        assert_eq!(
-            named_ref(&repo, "tree/a"),
-            Some(format!("{tip}\n")),
-            "{what}"
-        );
-        assert_eq!(named_ref(&repo, "tree/b"), None, "{what}");
-    }
+/// Runs a tree push that the client refuses after `HelloReply`, and checks
+/// that the push offered no object and the server stored none. Returns the
+/// error of the client.
+fn refused_before_any_upload(repo: &Repo, src: &Path, opts: TreePushOptions, what: &str) -> Error {
+    let before = object_files(repo);
+    let progress = PushProgress::new();
+    let (report, client) = tree_push(
+        repo,
+        src,
+        TreePushOptions {
+            progress: Some(progress.clone()),
+            ..opts
+        },
+        None,
+    );
+    assert!(
+        matches!(
+            report,
+            Err(ostrya::Error::Remote(ostrya::remote::Error::Aborted))
+        ),
+        "{what}: server {report:?}"
+    );
+    let snapshot = progress.snapshot();
+    assert_eq!(snapshot.objects_total, 0, "{what}: {snapshot:?}");
+    assert_eq!(snapshot.objects_sent, 0, "{what}: {snapshot:?}");
+    assert_eq!(object_files(repo), before, "{what}: the store changed");
+    client.expect_err(what)
 }
 
 #[test]
-fn the_signatures_follow_the_detached_entries_of_the_caller_in_signer_order() {
-    let tmp = TmpDir::new("push-tree-signed");
+fn an_existing_tag_is_refused_before_any_upload() {
+    let tmp = TmpDir::new("push-tree-existing-tag");
     let src = build_fixture_source(tmp.path());
     let repo = new_repo(&tmp, RepoMode::Archive, "");
-    let secret = ostrya::base64::decode(SECRET_B64).unwrap();
-    let signers: Vec<Box<dyn Signer>> = vec![
-        Box::new(DummySigner::new(b"dummy-key".to_vec())),
-        Box::new(Ed25519Signer::from_secret_key(&secret).unwrap()),
-    ];
-    let (commit, _) = pushed(
+    let (tip, _) = pushed(&repo, &src, tree_options("tree/a"), "first");
+    // A new file gives the tree objects that the server does not hold.
+    std::fs::write(src.join("new.txt"), b"new\n").unwrap();
+    let opts = TreePushOptions {
+        tags: strings(&["tree/a"]),
+        ..tree_options("tree/b")
+    };
+    match refused_before_any_upload(&repo, &src, opts, "tag") {
+        Error::RefMismatch { name, current, .. } => {
+            assert_eq!(name, "tree/a");
+            assert_eq!(current, Some(tip));
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(named_ref(&repo, "tree/a"), Some(format!("{tip}\n")));
+    assert_eq!(named_ref(&repo, "tree/b"), None);
+}
+
+/// A server commit whose `Commit` frame is over the `max-frame` of the
+/// server is refused before any upload.
+#[test]
+fn a_server_commit_over_the_frame_limit_is_refused_before_any_upload() {
+    let tmp = TmpDir::new("push-tree-frame");
+    let src = build_fixture_source(tmp.path());
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    let big = Value::variant(
+        Type::parse("ay").unwrap(),
+        Value::Bytes(vec![7; ostrya::remote::proto::MAX_FRAME as usize]),
+    );
+    let opts = TreePushOptions {
+        metadata: vec![("xa.big".into(), big)],
+        ..tree_options(REF)
+    };
+    match refused_before_any_upload(&repo, &src, opts, "frame") {
+        Error::LimitExceeded(m) => assert!(m.contains("over the limit"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(named_ref(&repo, REF), None);
+}
+
+/// Returns a variant that holds `levels` nested arrays around one `i`.
+fn nested_arrays(levels: usize) -> Value {
+    let ty = Type::parse(&format!("{}i", "a".repeat(levels))).unwrap();
+    let value = (0..levels).fold(Value::I32(1), |inner, _| Value::Array(vec![inner]));
+    Value::variant(ty, value)
+}
+
+/// A metadata value that a `v` holds and a commit does not hold is refused
+/// before any upload. A value two levels less deep is committed.
+#[test]
+fn a_metadata_value_too_deep_for_a_commit_is_refused_before_any_upload() {
+    let tmp = TmpDir::new("push-tree-deep");
+    let src = build_fixture_source(tmp.path());
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    let opts = TreePushOptions {
+        metadata: vec![("xa.deep".into(), nested_arrays(126))],
+        ..tree_options(REF)
+    };
+    match refused_before_any_upload(&repo, &src, opts, "deep") {
+        Error::InvalidInput(m) => assert!(m.contains("'xa.deep'"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(named_ref(&repo, REF), None);
+
+    let opts = TreePushOptions {
+        metadata: vec![("xa.deep".into(), nested_arrays(125))],
+        ..tree_options(REF)
+    };
+    pushed(&repo, &src, opts, "125 levels");
+}
+
+/// A server commit whose longest `CommitReply` is over the frame limit of
+/// the server is refused before any upload, also when its `Commit` frame
+/// fits.
+#[test]
+fn a_server_commit_whose_reply_is_over_the_frame_limit_is_refused_before_any_upload() {
+    let tmp = TmpDir::new("push-tree-reply");
+    let src = build_fixture_source(tmp.path());
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    // A tag of 6 bytes costs 11 bytes in `Commit`, 45 in `HelloReply` with
+    // a commit, and 46 in `CommitReply`. With 23,000 tags, `HelloReply` fits
+    // in 1 MiB and `CommitReply` does not.
+    let tags: Vec<String> = (0..23_000).map(|i| format!("t{i:05}")).collect();
+    let opts = TreePushOptions {
+        tags,
+        ..tree_options(REF)
+    };
+    match refused_before_any_upload(&repo, &src, opts, "reply") {
+        Error::LimitExceeded(m) => assert!(m.contains("reply"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(named_ref(&repo, REF), None);
+}
+
+/// A client group with no `c` on the branch gets `ref-denied`, and the
+/// branch does not change.
+#[test]
+fn a_tree_push_needs_c_on_the_branch() {
+    let tmp = TmpDir::new("push-tree-denied");
+    let src = build_fixture_source(tmp.path());
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    let (report, client) = tree_push_under(
         &repo,
+        &policy_allowing(&["w:**"]),
         &src,
-        TreePushOptions {
-            detached_metadata: vec![
-                ("xa.one".to_owned(), string("1")),
-                ("xa.two".to_owned(), string("2")),
-            ],
-            signers,
-            ..tree_options(&[REF])
-        },
-        "signed",
+        tree_options(REF),
+        None,
     );
-    let dict = block_on(repo.read_commit_detached_metadata(&commit))
-        .unwrap()
-        .expect("the commit has detached metadata");
-    let keys: Vec<&str> = dict
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|entry| entry.as_tuple().unwrap()[0].as_str().unwrap())
-        .collect();
-    assert_eq!(
-        keys,
-        [
-            "xa.one",
-            "xa.two",
-            "ostree.sign.dummy",
-            "ostree.sign.ed25519"
-        ]
-    );
-    let verifier = Ed25519Verifier::new([&secret[32..]], Vec::<Vec<u8>>::new()).unwrap();
-    let outcome = block_on(repo.verify_commit(&commit, &[&verifier])).unwrap();
-    assert!(outcome.valid, "{outcome:?}");
+    assert!(matches!(client, Err(Error::RefDenied(_))), "{client:?}");
+    assert!(report.is_err(), "{report:?}");
+    assert_eq!(named_ref(&repo, REF), None);
 }
 
 /// At the end of a tree push, the count of content bytes equals the byte
@@ -914,7 +1162,7 @@ fn the_content_bytes_of_a_tree_push_end_at_the_byte_total() {
         let opts = TreePushOptions {
             progress: Some(progress.clone()),
             compression,
-            ..tree_options(&[REF])
+            ..tree_options(REF)
         };
         pushed(&repo, &src, opts, tag);
         let snapshot = progress.snapshot();
@@ -931,7 +1179,7 @@ fn the_progress_handle_shows_the_scan_and_then_the_session() {
     let progress = PushProgress::new();
     let first = TreePushOptions {
         progress: Some(progress.clone()),
-        ..tree_options(&[REF])
+        ..tree_options(REF)
     };
     pushed(&repo, &src, first, "first");
     assert_eq!(progress.snapshot().phase, PushPhase::Committing);
@@ -953,7 +1201,7 @@ fn the_progress_handle_shows_the_scan_and_then_the_session() {
     let second = TreePushOptions {
         progress: Some(progress.clone()),
         entry_filter: Some(filter),
-        ..tree_options(&[REF])
+        ..tree_options(REF)
     };
     let (report, client) = tree_push(&repo, &src, second, Some(hook));
     report.unwrap();

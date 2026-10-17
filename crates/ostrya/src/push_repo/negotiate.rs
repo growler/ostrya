@@ -494,7 +494,7 @@ impl Repo {
 /// is not 64 lowercase hex characters, and is named once. Each refusal of the
 /// name is [`Error::InvalidRefspec`] with the name. A repeated name is
 /// [`InvalidInput`](crate::remote::Error::InvalidInput).
-fn check_tag_names(tags: &[String]) -> Result<()> {
+pub(super) fn check_tag_names(tags: &[String]) -> Result<()> {
     let mut seen = HashSet::new();
     for tag in tags {
         crate::validate_refspec(tag)?;
@@ -559,7 +559,7 @@ fn check_tags(
 /// The id is one name under `refs/mirrors/` on the server, so it is not
 /// longer than [`MAX_COLLECTION_ID_LEN`] bytes. It also passes
 /// [`is_collection_id`](crate::is_collection_id).
-fn collection_id_refusal(id: &str) -> Option<String> {
+pub(super) fn collection_id_refusal(id: &str) -> Option<String> {
     if id.len() > MAX_COLLECTION_ID_LEN {
         Some(format!(
             "the collection id of {} bytes is longer than {MAX_COLLECTION_ID_LEN} bytes",

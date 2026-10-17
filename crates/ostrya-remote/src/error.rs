@@ -195,14 +195,6 @@ pub enum Error {
         #[source]
         source: std::io::Error,
     },
-    /// A failure of a signer of a tree push.
-    ///
-    /// The detached metadata of the caller can hold a value under the key of
-    /// a signer. If that value is not a signature array, the error is also
-    /// this variant. No wire code carries this variant. The client signs before it offers an
-    /// object, and it ends the session with `Abort`.
-    #[error("signing: {0}")]
-    Sign(#[source] ostrya_sign::Error),
 }
 
 /// The wire code of an `Error` message.
@@ -307,7 +299,6 @@ impl Error {
     /// - [`Error::Fetch`]
     /// - [`Error::Io`]
     /// - [`Error::Walk`]
-    /// - [`Error::Sign`]
     pub fn code(&self) -> Option<ErrorCode> {
         Some(match self {
             Error::VersionUnsupported(_) => ErrorCode::VersionUnsupported,
@@ -333,8 +324,7 @@ impl Error {
             | Error::Transport(_)
             | Error::Fetch(_)
             | Error::Io(_)
-            | Error::Walk { .. }
-            | Error::Sign(_) => return None,
+            | Error::Walk { .. } => return None,
         })
     }
 
@@ -374,8 +364,7 @@ impl Error {
             | Error::Transport(_)
             | Error::Fetch(_)
             | Error::Io(_)
-            | Error::Walk { .. }
-            | Error::Sign(_) => (ErrorCode::Internal, self.to_string()),
+            | Error::Walk { .. } => (ErrorCode::Internal, self.to_string()),
             Error::VersionUnsupported(m)
             | Error::LockingDisabled(m)
             | Error::Unauthorized(m)

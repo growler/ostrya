@@ -15,7 +15,7 @@ use ostrya_core::{Checksum, DeflateSink, FileHeader, ObjectName, ObjectType, Xat
 use ostrya_gvariant::{DictBuilder, Type, Value};
 use ostrya_remote::proto::{
     ErrorMessage, FrameReader, FrameWriter, HaveReply, HelloReply, MIN_FRAME_LIMIT, Message,
-    ObjectHeader, ObjectRead, ObjectsReply,
+    ObjectHeader, ObjectRead, ObjectsReply, ServerCommit,
 };
 use ostrya_remote::{
     BoxFuture, Compression, DetachedMetadata, Encoding, Error, ErrorCode, Expected, ObjectData,
@@ -1328,6 +1328,219 @@ fn a_failed_commit_write_reads_the_pending_reply() {
         &["a"],
         "the write of Commit failed",
     );
+}
+
+// ---------------------------------------------------------------------------
+// Server commit.
+// ---------------------------------------------------------------------------
+
+/// A server commit on `branch` with `tags` over the stand-in roots, with one
+/// metadata entry.
+fn server_commit(branch: &str, tags: &[&str]) -> ServerCommit {
+    ServerCommit {
+        branch: branch.into(),
+        tags: strings(tags),
+        bind_refs: strings(&["bound"]),
+        root_dirtree: ck(1),
+        root_dirmeta: ck(2),
+        subject: "subject".into(),
+        body: "body".into(),
+        metadata: vec![(
+            "version".into(),
+            ostrya_gvariant::to_bytes(&Type::Variant, &Value::variant(Type::Str, "1".into()))
+                .unwrap(),
+        )],
+        timestamp: Some(1_700_000_000),
+        orphan: false,
+    }
+}
+
+/// The `CommitReply` of a server commit: the branch from `old` to `new`,
+/// then each tag from absent to `new`.
+fn server_commit_reply(
+    branch: &str,
+    tags: &[&str],
+    old: Option<Checksum>,
+    new: Checksum,
+) -> Message {
+    Message::CommitReply(
+        std::iter::once(RefOutcome {
+            name: branch.into(),
+            old,
+            new: Some(new),
+        })
+        .chain(tags.iter().map(|t| RefOutcome {
+            name: t.to_string(),
+            old: None,
+            new: Some(new),
+        }))
+        .collect(),
+    )
+}
+
+#[test]
+fn a_server_commit_sends_commit_with_the_server_commit_alone() {
+    let sc = server_commit("main", &["t1", "t2"]);
+    let reply = server_commit_reply("main", &["t1", "t2"], Some(ck(4)), ck(9));
+    let (session, out) = open(&["main", "t1", "t2"], BOTH, &[reply]);
+    session.check_server_commit(&sc).unwrap();
+    let outcome = block_on(session.server_commit(sc.clone())).unwrap();
+    assert_eq!(outcome.commit, Some(ck(9)));
+    assert_eq!(
+        outcome
+            .refs
+            .iter()
+            .map(|r| r.name.as_str())
+            .collect::<Vec<_>>(),
+        ["main", "t1", "t2"]
+    );
+    assert_eq!(outcome.refs[0].old, Some(ck(4)));
+    match &after_hello(&out)[..] {
+        [Event::Msg(Message::Commit(c))] => {
+            assert!(c.updates.is_empty());
+            assert!(!c.force);
+            assert_eq!(c.server_commit.as_deref(), Some(&sc));
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn server_commit_prechecks_send_nothing() {
+    let cases: [(ServerCommit, &str); 3] = [
+        (server_commit("other", &[]), "'other' was not named"),
+        (server_commit("main", &["t3"]), "'t3' was not named"),
+        (server_commit("main", &["t1", "t1"]), "'t1' is named twice"),
+    ];
+    for (sc, text) in cases {
+        let (session, out) = open(&["main", "t1"], BOTH, &[]);
+        assert_invalid(session.check_server_commit(&sc), text);
+        assert_invalid(block_on(session.server_commit(sc)), text);
+        assert!(after_hello(&out).is_empty(), "{text}");
+    }
+}
+
+/// The frame of a server commit that the server limit does not hold fails
+/// the check, and `server_commit` then sends nothing.
+#[test]
+fn a_server_commit_over_the_frame_limit_is_refused_before_it_is_sent() {
+    let mut sc = server_commit("main", &[]);
+    let big = Value::variant(
+        Type::parse("ay").unwrap(),
+        Value::Bytes(vec![7; MIN_FRAME_LIMIT as usize]),
+    );
+    sc.metadata.push((
+        "big".into(),
+        ostrya_gvariant::to_bytes(&Type::Variant, &big).unwrap(),
+    ));
+    let (session, out) = open(&["main"], BOTH, &[]);
+    match session.check_server_commit(&sc) {
+        Err(Error::LimitExceeded(m)) => assert!(m.contains("over the limit"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(
+        block_on(session.server_commit(sc)),
+        Err(Error::LimitExceeded(_))
+    ));
+    assert!(after_hello(&out).is_empty());
+
+    // Metadata bytes that are not a `v` in normal form are `protocol`.
+    let mut sc = server_commit("main", &[]);
+    sc.metadata.push(("bad".into(), vec![1, 2, 3]));
+    let (session, out) = open(&["main"], BOTH, &[]);
+    assert!(matches!(
+        session.check_server_commit(&sc),
+        Err(Error::Protocol(_))
+    ));
+    drop(session);
+    assert!(after_hello(&out).is_empty());
+}
+
+/// A metadata value that a commit cannot hold, and a server commit whose
+/// longest `CommitReply` is over the frame limit, fail the check, and
+/// `server_commit` then sends nothing.
+#[test]
+fn a_server_commit_that_the_server_refuses_at_commit_is_refused_before_it_is_sent() {
+    // A `v` holds 126 nested arrays, and a commit holds 125.
+    let deep = |levels: usize| {
+        let ty = Type::parse(&format!("{}i", "a".repeat(levels))).unwrap();
+        let value = (0..levels).fold(Value::I32(1), |inner, _| Value::Array(vec![inner]));
+        let mut sc = server_commit("main", &[]);
+        sc.metadata.push((
+            "deep".into(),
+            ostrya_gvariant::to_bytes(&Type::Variant, &Value::variant(ty, value)).unwrap(),
+        ));
+        sc
+    };
+    let (session, out) = open(&["main"], BOTH, &[]);
+    session.check_server_commit(&deep(125)).unwrap();
+    assert_invalid(session.check_server_commit(&deep(126)), "'deep'");
+    assert_invalid(block_on(session.server_commit(deep(126))), "'deep'");
+    assert!(after_hello(&out).is_empty());
+
+    // A tag of 6 bytes costs 11 bytes in `Commit` and 46 in `CommitReply`.
+    let tags: Vec<String> = (0..23_000).map(|i| format!("t{i:05}")).collect();
+    let refs: Vec<&str> = std::iter::once("main")
+        .chain(tags.iter().map(String::as_str))
+        .collect();
+    let sc = ServerCommit {
+        tags: tags.clone(),
+        ..server_commit("main", &[])
+    };
+    let (session, out) = open(&refs, BOTH, &[]);
+    match session.check_server_commit(&sc) {
+        Err(Error::LimitExceeded(m)) => assert!(m.contains("23000 tags"), "{m}"),
+        other => panic!("{other:?}"),
+    }
+    assert!(matches!(
+        block_on(session.server_commit(sc)),
+        Err(Error::LimitExceeded(_))
+    ));
+    assert!(after_hello(&out).is_empty());
+}
+
+#[test]
+fn a_server_commit_reply_that_does_not_name_one_commit_is_an_unknown_outcome() {
+    let names = ["main", "t1"];
+    let mut split = server_commit_reply("main", &["t1"], None, ck(9));
+    if let Message::CommitReply(refs) = &mut split {
+        refs[1].new = Some(ck(8));
+    }
+    let mut old_tag = server_commit_reply("main", &["t1"], None, ck(9));
+    if let Message::CommitReply(refs) = &mut old_tag {
+        refs[1].old = Some(ck(3));
+    }
+    let mut deleted = server_commit_reply("main", &["t1"], None, ck(9));
+    if let Message::CommitReply(refs) = &mut deleted {
+        refs[0].new = None;
+        refs[1].new = None;
+    }
+    for (reply, text) in [
+        (split, "one new commit"),
+        (old_tag, "one new commit"),
+        (deleted, "one new commit"),
+        (
+            server_commit_reply("t1", &["main"], None, ck(9)),
+            "other refs",
+        ),
+        (server_commit_reply("main", &[], None, ck(9)), "other refs"),
+    ] {
+        let (session, _) = open(&names, BOTH, &[reply]);
+        assert_unknown(
+            block_on(session.server_commit(server_commit("main", &["t1"]))),
+            &names,
+            text,
+        );
+    }
+}
+
+#[test]
+fn an_error_after_a_server_commit_is_that_error() {
+    let (session, _) = open(&["main"], BOTH, &[error(ErrorCode::RefDenied)]);
+    assert!(matches!(
+        block_on(session.server_commit(server_commit("main", &[]))),
+        Err(Error::RefDenied(_))
+    ));
 }
 
 #[test]

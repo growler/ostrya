@@ -6,7 +6,7 @@
 use std::sync::LazyLock;
 
 use ostrya_gvariant::{
-    ArrayIter, GvDecode, GvEncode, GvType, Slice, Type, Value, from_bytes, to_bytes,
+    ArrayIter, GvDecode, GvEncode, GvType, Slice, Type, Value, VariantBytes, from_bytes, to_bytes,
 };
 
 use crate::be::Be64;
@@ -126,6 +126,47 @@ impl Commit {
             root_dirtree: parse_root_dirtree(root_dirtree)?,
             root_dirmeta: parse_root_dirmeta(root_dirmeta)?,
         })
+    }
+
+    /// Parses a serialized commit object, and returns the entries of its
+    /// metadata dict as bytes beside it.
+    ///
+    /// The returned commit holds an empty metadata dict. Each entry is the key
+    /// and the bytes of its `v` in normal form, in the order of the dict. A
+    /// key that occurs in more than one entry stays in each entry. The
+    /// function checks the metadata dict as [`Commit::parse`] does, and builds
+    /// no value tree of it.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Commit::parse`].
+    #[allow(clippy::type_complexity)]
+    pub fn parse_with_metadata_entries(data: &[u8]) -> Result<(Commit, Vec<(String, Vec<u8>)>)> {
+        let (metadata, parent, related, subject, body, timestamp, root_dirtree, root_dirmeta): CommitView = GvDecode::decode(data)?;
+        ostrya_gvariant::validate(&METADATA_TYPE, metadata)?;
+        let entries = ArrayIter::<(&str, VariantBytes)>::decode(metadata)?
+            .map(|entry| {
+                let (key, value) = entry?;
+                let mut bytes = Vec::new();
+                value.encode(&mut bytes)?;
+                Ok((key.to_owned(), bytes))
+            })
+            .collect::<ostrya_gvariant::Result<Vec<_>>>()?;
+        let parent = parse_parent(parent)?;
+        let related = related
+            .map(|item| item.map(|(name, bytes)| (name.to_owned(), bytes.to_vec())))
+            .collect::<ostrya_gvariant::Result<Vec<_>>>()?;
+        let commit = Commit {
+            metadata: Value::Array(Vec::new()),
+            parent,
+            related,
+            subject: subject.to_owned(),
+            body: body.to_owned(),
+            timestamp: timestamp.0,
+            root_dirtree: parse_root_dirtree(root_dirtree)?,
+            root_dirmeta: parse_root_dirmeta(root_dirmeta)?,
+        };
+        Ok((commit, entries))
     }
 
     /// Parses the parent and the root checksums of a serialized commit object.
@@ -418,7 +459,7 @@ pub fn commit_metadata(
     Value::Array(dict)
 }
 
-/// An error of [`commit_timestamp`].
+/// An error of [`commit_timestamp`] and of [`source_date_epoch`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TimestampError {
     /// A `SOURCE_DATE_EPOCH` value that is not a count of seconds.
@@ -469,6 +510,34 @@ pub fn commit_timestamp(explicit: Option<u64>) -> std::result::Result<u64, Times
     timestamp_from(explicit, std::env::var("SOURCE_DATE_EPOCH").ok())
 }
 
+/// Returns the value of the `SOURCE_DATE_EPOCH` environment variable, in
+/// seconds since the Unix epoch.
+///
+/// The function reads the variable with the rule of [`commit_timestamp`]: it
+/// trims white space before it parses the value, and it treats a value that
+/// is not valid Unicode as unset. If the variable is unset, the result is
+/// `None`.
+///
+/// # Errors
+///
+/// [`TimestampError::SourceDateEpoch`] if the variable is set to a value
+/// that is not a count of seconds.
+pub fn source_date_epoch() -> std::result::Result<Option<u64>, TimestampError> {
+    parse_source_date_epoch(std::env::var("SOURCE_DATE_EPOCH").ok())
+}
+
+/// [`source_date_epoch`] over a given `SOURCE_DATE_EPOCH` value.
+fn parse_source_date_epoch(
+    raw: Option<String>,
+) -> std::result::Result<Option<u64>, TimestampError> {
+    raw.map(|raw| {
+        raw.trim()
+            .parse::<u64>()
+            .map_err(|_| TimestampError::SourceDateEpoch(raw))
+    })
+    .transpose()
+}
+
 /// [`commit_timestamp`] over a given `SOURCE_DATE_EPOCH` value.
 fn timestamp_from(
     explicit: Option<u64>,
@@ -477,11 +546,8 @@ fn timestamp_from(
     if let Some(timestamp) = explicit {
         return Ok(timestamp);
     }
-    if let Some(raw) = source_date_epoch {
-        return raw
-            .trim()
-            .parse::<u64>()
-            .map_err(|_| TimestampError::SourceDateEpoch(raw));
+    if let Some(timestamp) = parse_source_date_epoch(source_date_epoch)? {
+        return Ok(timestamp);
     }
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -511,6 +577,45 @@ mod tests {
             root_dirtree: csum(1),
             root_dirmeta: csum(2),
         }
+    }
+
+    /// The entries are the key and the `v` of each entry of the dict, in
+    /// order, with duplicate keys kept. The rest is the parsed commit.
+    #[test]
+    fn metadata_entries_are_the_variants_of_the_dict() {
+        let entry = |key: &str, value: Value| Value::Tuple(vec![Value::Str(key.into()), value]);
+        let values = [
+            ("z", Value::variant(Type::Str, Value::Str("1".into()))),
+            ("a", Value::variant(Type::U32, Value::U32(7))),
+            (
+                "z",
+                Value::variant(Type::parse("ay").unwrap(), Value::Bytes(vec![1, 2, 3])),
+            ),
+        ];
+        let commit = Commit {
+            metadata: Value::Array(values.iter().map(|(k, v)| entry(k, v.clone())).collect()),
+            ..sample()
+        };
+        let bytes = commit.serialize().unwrap();
+        let (bare, entries) = Commit::parse_with_metadata_entries(&bytes).unwrap();
+        assert_eq!(
+            bare,
+            Commit {
+                metadata: Value::Array(Vec::new()),
+                ..commit
+            }
+        );
+        assert_eq!(entries.len(), values.len());
+        for ((key, raw), (want_key, want)) in entries.iter().zip(&values) {
+            assert_eq!(key, want_key);
+            assert_eq!(&from_bytes(&Type::Variant, raw).unwrap(), want);
+        }
+
+        // A dict that `Commit::parse` refuses is refused.
+        let mut bad = bytes.clone();
+        bad[0] ^= 0xff;
+        assert!(Commit::parse(&bad).is_err());
+        assert!(Commit::parse_with_metadata_entries(&bad).is_err());
     }
 
     #[test]
@@ -737,5 +842,21 @@ mod tests {
             .as_secs();
         let got = timestamp_from(None, None).unwrap();
         assert!(got.abs_diff(now) <= 5, "{got} is near {now}");
+    }
+
+    #[test]
+    fn source_date_epoch_is_trimmed_and_unset_is_none() {
+        assert_eq!(parse_source_date_epoch(None), Ok(None));
+        assert_eq!(
+            parse_source_date_epoch(Some(" 1700000000\n".to_owned())),
+            Ok(Some(1_700_000_000))
+        );
+        for raw in ["", "abc", "-1", "@1"] {
+            assert_eq!(
+                parse_source_date_epoch(Some(raw.to_owned())),
+                Err(TimestampError::SourceDateEpoch(raw.to_owned())),
+                "{raw:?}"
+            );
+        }
     }
 }

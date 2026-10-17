@@ -1,8 +1,9 @@
 //! Tests of the receive endpoint mounted in the router of a host.
 //!
-//! The client is `push_tree`. It pushes a tree over HTTPS and HTTP/2 to a
-//! path prefix, and the host removes the prefix. The tests cover these parts
-//! of the mount:
+//! The clients push a tree over HTTPS and HTTP/2 to a path prefix, and the
+//! host removes the prefix. `push_tree` asks the server to commit the tree,
+//! and a push session sends a commit that the client built over the tree.
+//! The tests cover these parts of the mount:
 //!
 //! - the authentication of the host and the HTTP/2 windows of the endpoint
 //! - the stop of the endpoint with `shutdown`
@@ -37,10 +38,14 @@ use hyper::server::conn::http2;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
 use ostrya::remote::proto::Hello;
-use ostrya::remote::{self, Endpoint, ParentPolicy, RefUpdate, TreePushOptions, push_tree};
+use ostrya::remote::tree::{ScanOptions, TreeModel};
+use ostrya::remote::{
+    self, BoxFuture, Compression, Encoding, Endpoint, Expected, ObjectData, ObjectSource,
+    PushOutcome, PushSession, RefUpdate, SessionOptions, TreePushOptions, push_tree,
+};
 use ostrya::{
-    Checksum, CreateOptions, HookFuture, HookRefusal, HostEntry, ReceiveHooks, ReceivePolicy,
-    ReceiveReport, Repo, RepoMode, Type, UpdatePlan, Value,
+    Checksum, Commit, CreateOptions, HookFuture, HookRefusal, HostEntry, ObjectName, ObjectType,
+    ReceiveHooks, ReceivePolicy, ReceiveReport, Repo, RepoMode, Type, UpdatePlan, Value,
 };
 use ostrya_fetch::{
     BearerToken, FetcherOptions, FuturesIo, Proxy, RtExecutor, RtTimer, TrustRoots,
@@ -50,11 +55,15 @@ use ostrya_server::{
     EndpointOptions, ReceiveAuth, ReceiveBody, ReceiveEndpoint, Refusal, RequestKind, SessionSetup,
 };
 
-/// A policy that writes a commit to each ref as a fast-forward.
+/// A policy that writes a commit to each ref as a fast-forward, and makes a
+/// server commit on each ref.
 fn pushing_policy() -> ReceivePolicy {
     ReceivePolicy {
         rules: ostrya::access::AccessRules {
-            allow: vec![ostrya::access::AllowItem::parse("w:**").unwrap()],
+            allow: ["w:**", "c:**"]
+                .into_iter()
+                .map(|item| ostrya::access::AllowItem::parse(item).unwrap())
+                .collect(),
             deny: Vec::new(),
         },
         ..ReceivePolicy::default()
@@ -313,7 +322,7 @@ fn a_push_through_a_mounted_endpoint_commits_over_http2() {
     let seen = Arc::new(Seen::default());
 
     let push_options = || TreePushOptions {
-        refs: vec!["main".into()],
+        onto: "main".into(),
         timestamp: Some(1_700_000_000),
         ..TreePushOptions::default()
     };
@@ -341,7 +350,7 @@ fn a_push_through_a_mounted_endpoint_commits_over_http2() {
                 let outcome = push_tree(connect(&url, TOKEN), &root, push_options())
                     .await
                     .unwrap();
-                let commit = outcome.commit.expect("a tree push builds a commit");
+                let commit = outcome.commit.expect("the server names its commit");
                 assert_eq!(outcome.refs.len(), 1);
                 assert_eq!(outcome.refs[0].new, Some(commit));
                 assert_eq!(
@@ -579,10 +588,118 @@ async fn uploader(repo: &Repo, commit: &Checksum) -> Option<String> {
         .and_then(|(_, value)| value.as_str().map(str::to_owned))
 }
 
-/// The hooks that `ReceiveAuth::open` gives run in the commit of a push
-/// through a mounted endpoint. Every push sends the same tree with no
-/// parent, no bindings, and one timestamp, so all the pushes give the same
+/// A tree model and one commit over its tree, with no parent, no metadata,
+/// and one timestamp. The source gives the objects of the tree and the
 /// commit.
+struct Committed {
+    model: TreeModel,
+    commit: Checksum,
+    bytes: Vec<u8>,
+}
+
+impl Committed {
+    /// Scans `root` and builds the commit over its tree.
+    async fn scan(root: &Path) -> Committed {
+        let model = TreeModel::scan(root, ScanOptions::default()).await.unwrap();
+        let bytes = Commit {
+            metadata: Value::Array(Vec::new()),
+            parent: None,
+            related: Vec::new(),
+            subject: String::new(),
+            body: String::new(),
+            timestamp: 1_700_000_000,
+            root_dirtree: model.root_dirtree(),
+            root_dirmeta: model.root_dirmeta(),
+        }
+        .serialize()
+        .unwrap();
+        Committed {
+            model,
+            commit: Checksum::sha256(&bytes),
+            bytes,
+        }
+    }
+}
+
+impl ObjectSource for Committed {
+    fn objects<'a>(
+        &'a self,
+        _commit: &'a Checksum,
+    ) -> BoxFuture<'a, remote::Result<Vec<ObjectName>>> {
+        let mut names = self.model.object_names();
+        names.push(ObjectName::new(self.commit, ObjectType::Commit));
+        Box::pin(async move { Ok(names) })
+    }
+
+    fn open<'a>(
+        &'a self,
+        name: &'a ObjectName,
+        encoding: Encoding,
+    ) -> BoxFuture<'a, remote::Result<ObjectData>> {
+        if name.ty == ObjectType::Commit {
+            let reader = Box::new(futures_lite::io::Cursor::new(self.bytes.clone()));
+            return Box::pin(async move {
+                Ok(ObjectData::Encoded {
+                    encoding: Encoding::Raw,
+                    reader,
+                })
+            });
+        }
+        self.model.open(name, encoding)
+    }
+
+    fn detached_metadata<'a>(
+        &'a self,
+        _commit: &'a Checksum,
+    ) -> BoxFuture<'a, remote::Result<Option<Value>>> {
+        Box::pin(async { Ok(None) })
+    }
+}
+
+/// Pushes the commit of [`Committed`] over the tree at `root` to the ref
+/// `name`, with an update that expects the state that `HelloReply` reports.
+/// Returns the commit and the outcome.
+async fn push_commit(
+    endpoint: Endpoint,
+    root: &Path,
+    name: &str,
+) -> (Checksum, remote::Result<PushOutcome>) {
+    let source = Committed::scan(root).await;
+    let commit = source.commit;
+    let pushed = async {
+        let session =
+            PushSession::connect(endpoint, &[name.to_owned()], SessionOptions::default()).await?;
+        let names = source.objects(&commit).await?;
+        let sent = async {
+            let missing = session.missing(&names).await?;
+            session
+                .send(&source, &missing, &[commit], Compression::None)
+                .await
+        };
+        if let Err(e) = sent.await {
+            let _ = session.abort().await;
+            return Err(e);
+        }
+        let expected = match session.server().tip(name) {
+            Some(tip) => Expected::Commit(tip),
+            None => Expected::Absent,
+        };
+        let update = RefUpdate {
+            name: name.to_owned(),
+            expected,
+            new: Some(commit),
+        };
+        session.commit(&[update], false).await
+    };
+    (commit, pushed.await)
+}
+
+/// The hooks that `ReceiveAuth::open` gives run in the commit of a push
+/// through a mounted endpoint. Every push sends the same commit that the
+/// client built over the same tree.
+///
+/// A tree push, which asks for a server commit, gets `ref-denied` from a
+/// session with hooks.
 ///
 /// The entry of the first uploader stays at the second push. An error of
 /// `after_update` gets 500 with the ref written and no report. A ref that
@@ -616,13 +733,6 @@ fn the_hooks_of_the_host_run_in_a_push_through_a_mounted_endpoint() {
     let endpoint = Arc::new(ReceiveEndpoint::new(receiver.clone(), auth, options).unwrap());
     let seen = Arc::new(Seen::default());
 
-    let push_options = |name: &str| TreePushOptions {
-        refs: vec![name.into()],
-        parent: ParentPolicy::None,
-        timestamp: Some(1_700_000_000),
-        no_bindings: true,
-        ..TreePushOptions::default()
-    };
     let before_calls = || state.before_calls.load(Ordering::SeqCst);
     let after_calls = || state.after_calls.load(Ordering::SeqCst);
 
@@ -644,12 +754,23 @@ fn the_hooks_of_the_host_run_in_a_push_through_a_mounted_endpoint() {
             async {
                 let resolve = |name: &'static str| receiver.resolve_rev(name, false);
 
+                // A server commit gets `ref-denied` before the hooks run.
+                let options = TreePushOptions {
+                    onto: "rel/s".into(),
+                    ..TreePushOptions::default()
+                };
+                let denied = push_tree(connect(&url, "alice-token"), &small, options).await;
+                assert!(
+                    matches!(denied, Err(remote::Error::RefDenied(_))),
+                    "{denied:?}"
+                );
+                assert_eq!(resolve("rel/s").await.ok().flatten(), None);
+                assert_eq!((before_calls(), after_calls()), (0, 0));
+
                 // The first push writes the entry of its uploader.
-                let outcome =
-                    push_tree(connect(&url, "alice-token"), &small, push_options("rel/a"))
-                        .await
-                        .unwrap();
-                let commit = outcome.commit.expect("a tree push builds a commit");
+                let (commit, outcome) =
+                    push_commit(connect(&url, "alice-token"), &small, "rel/a").await;
+                outcome.unwrap();
                 assert_eq!(resolve("rel/a").await.unwrap(), Some(commit));
                 assert_eq!(uploader(&receiver, &commit).await.as_deref(), Some("alice"));
                 assert_eq!((before_calls(), after_calls()), (1, 1));
@@ -657,26 +778,35 @@ fn the_hooks_of_the_host_run_in_a_push_through_a_mounted_endpoint() {
                     *state.held_in_after.lock().unwrap(),
                     vec![vec!["rel/a".to_owned()]]
                 );
-                assert_eq!(seen.commit_statuses(), [StatusCode::OK]);
+                assert_eq!(
+                    seen.commit_statuses(),
+                    [StatusCode::UNPROCESSABLE_ENTITY, StatusCode::OK]
+                );
                 assert!(locks.held().is_empty());
                 eventually("the first report", || reports.load(Ordering::SeqCst) == 1).await;
 
                 // The second push of the commit keeps the first entry.
-                let outcome = push_tree(connect(&url, "bob-token"), &small, push_options("rel/b"))
-                    .await
-                    .unwrap();
-                assert_eq!(outcome.commit, Some(commit));
+                let (second, outcome) =
+                    push_commit(connect(&url, "bob-token"), &small, "rel/b").await;
+                outcome.unwrap();
+                assert_eq!(second, commit);
                 assert_eq!(resolve("rel/b").await.unwrap(), Some(commit));
                 assert_eq!(uploader(&receiver, &commit).await.as_deref(), Some("alice"));
                 assert_eq!((before_calls(), after_calls()), (2, 2));
-                assert_eq!(seen.commit_statuses(), [StatusCode::OK; 2]);
+                assert_eq!(
+                    seen.commit_statuses(),
+                    [
+                        StatusCode::UNPROCESSABLE_ENTITY,
+                        StatusCode::OK,
+                        StatusCode::OK
+                    ]
+                );
                 assert!(locks.held().is_empty());
                 eventually("the second report", || reports.load(Ordering::SeqCst) == 2).await;
 
                 // An error of `after_update` comes after the write of the ref.
                 state.fail_after.store(true, Ordering::SeqCst);
-                let failed =
-                    push_tree(connect(&url, "bob-token"), &small, push_options("rel/c")).await;
+                let (_, failed) = push_commit(connect(&url, "bob-token"), &small, "rel/c").await;
                 match &failed {
                     Err(remote::Error::Internal(message)) => {
                         assert!(message.contains(AFTER_FAILED), "{message}");
@@ -696,8 +826,7 @@ fn the_hooks_of_the_host_run_in_a_push_through_a_mounted_endpoint() {
                 // the update lock fails the check under the lock.
                 state.fail_after.store(false, Ordering::SeqCst);
                 *state.move_ref.lock().unwrap() = Some(("rel/d".into(), commit));
-                let moved =
-                    push_tree(connect(&url, "alice-token"), &small, push_options("rel/d")).await;
+                let (_, moved) = push_commit(connect(&url, "alice-token"), &small, "rel/d").await;
                 match &moved {
                     Err(remote::Error::RefMismatch { name, current, .. }) => {
                         assert_eq!(name, "rel/d");

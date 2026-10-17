@@ -195,7 +195,7 @@ async fn both<A: Future, B: Future>(a: A, b: B) -> (A::Output, B::Output) {
 
 /// A client group that lets each request with no credential write a commit
 /// to each ref as a fast-forward.
-const ANONYMOUS_PUSH: &str = "[ex-ostrya client \"push\"]\nauth=anonymous\nallow=w:**\n";
+const ANONYMOUS_PUSH: &str = "[ex-ostrya client \"push\"]\nauth=anonymous\nallow=wc:**\n";
 
 /// Writes the client groups `groups` into the config of `repo`, in place of
 /// the groups of an earlier call, and returns their policies. The open
@@ -247,7 +247,7 @@ fn credential_groups() -> String {
     let digest = |token: &str| Checksum::sha256(token.as_bytes()).to_hex();
     format!(
         "[ex-ostrya client \"builders\"]\n\
-         auth=token-sha256:{};basic-sha256:bob:{};tls:ostrya test\nallow=w:**\n",
+         auth=token-sha256:{};basic-sha256:bob:{};tls:ostrya test\nallow=wc:**\n",
         digest(ALICE),
         digest(BOB),
     )
@@ -294,9 +294,9 @@ fn fixture_ca(url: &str) -> FetcherOptions {
     http
 }
 
-fn tree_options(refs: &[&str], timestamp: u64) -> TreePushOptions {
+fn tree_options(branch: &str, timestamp: u64) -> TreePushOptions {
     TreePushOptions {
-        refs: refs.iter().map(|s| s.to_string()).collect(),
+        onto: branch.to_string(),
         timestamp: Some(timestamp),
         ..Default::default()
     }
@@ -305,9 +305,9 @@ fn tree_options(refs: &[&str], timestamp: u64) -> TreePushOptions {
 async fn push(
     endpoint: Endpoint,
     root: &Path,
-    refs: &[&str],
+    branch: &str,
 ) -> ostrya::remote::Result<PushOutcome> {
-    push_tree(endpoint, root, tree_options(refs, 1_700_000_000)).await
+    push_tree(endpoint, root, tree_options(branch, 1_700_000_000)).await
 }
 
 /// The commit of `outcome`, which set the ref `name` of `server`.
@@ -656,10 +656,10 @@ fn each_method_pushes_over_https_and_no_credential_is_refused() {
             ("cert", by_cert),
             ("encrypted-key", by_encrypted_key),
         ] {
-            let outcome = push(Endpoint::Http(http), &root, &[name]).await.unwrap();
+            let outcome = push(Endpoint::Http(http), &root, name).await.unwrap();
             assert_pushed(&server, name, &outcome).await;
         }
-        match push(Endpoint::Http(fixture_ca(&url)), &root, &["nobody"]).await {
+        match push(Endpoint::Http(fixture_ca(&url)), &root, "nobody").await {
             Err(Error::Unauthorized(_)) => {}
             other => panic!("expected unauthorized, got {other:?}"),
         }
@@ -670,7 +670,7 @@ fn each_method_pushes_over_https_and_no_credential_is_refused() {
     with_tls(&mut opts);
     with_server(server.clone(), opts, |addr| async move {
         let url = format!("https://127.0.0.1:{}/", addr.port());
-        let outcome = push(Endpoint::Http(fixture_ca(&url)), &root, &["anonymous"])
+        let outcome = push(Endpoint::Http(fixture_ca(&url)), &root, "anonymous")
             .await
             .unwrap();
         assert_pushed(&server, "anonymous", &outcome).await;
@@ -696,14 +696,14 @@ fn a_trust_setting_of_the_caller_that_accepts_any_chain_pushes() {
         let url = format!("https://127.0.0.1:{}/", addr.port());
         let mut trusted = fixture_ca(&url);
         trusted.max_retries = 0;
-        match push(Endpoint::Http(trusted), &root, &["trusted"]).await {
+        match push(Endpoint::Http(trusted), &root, "trusted").await {
             Err(Error::Fetch(e)) if e.to_string().contains("UnknownIssuer") => {}
             other => panic!("expected a failure of the chain, got {other:?}"),
         }
         assert_eq!(tip(&server, "trusted").await, None);
         let mut http = direct(&url);
         http.tls.roots = TrustRoots::DangerousAcceptAnyChain;
-        let outcome = push(Endpoint::Http(http), &root, &["any-chain"])
+        let outcome = push(Endpoint::Http(http), &root, "any-chain")
             .await
             .unwrap();
         assert_pushed(&server, "any-chain", &outcome).await;
@@ -722,7 +722,7 @@ fn a_cleartext_credential_needs_the_switch() {
     let alice = tmp.file("alice", format!("{ALICE}\n").as_bytes());
     // Plain HTTP has no client CA, so the group carries no `tls:` item.
     let groups = format!(
-        "[ex-ostrya client \"builders\"]\nauth=token-sha256:{}\nallow=w:**\n",
+        "[ex-ostrya client \"builders\"]\nauth=token-sha256:{}\nallow=wc:**\n",
         Checksum::sha256(ALICE.as_bytes()).to_hex()
     );
     let mut opts = serve_options_with(&server, &groups);
@@ -743,7 +743,7 @@ fn a_cleartext_credential_needs_the_switch() {
         http.bearer_token = Some(BearerToken {
             token: ALICE.into(),
         });
-        match push(Endpoint::Http(http), &root, &["main"]).await {
+        match push(Endpoint::Http(http), &root, "main").await {
             Err(Error::Fetch(e)) => assert!(e.to_string().contains("cleartext"), "{e}"),
             other => panic!("expected a refusal, got {other:?}"),
         }
@@ -759,13 +759,13 @@ fn a_cleartext_credential_needs_the_switch() {
         if let Endpoint::Http(http) = &mut endpoint {
             http.proxy = Proxy::None;
         }
-        let outcome = push(endpoint, &root, &["main"]).await.unwrap();
+        let outcome = push(endpoint, &root, "main").await.unwrap();
         assert_pushed(&server, "main", &outcome).await;
     });
 }
 
 /// A tree push over HTTP sets the ref. A repeat push of the same tree with
-/// a new timestamp sends the new commit alone.
+/// a new timestamp sends no object, and the server makes the new commit.
 #[test]
 fn a_tree_push_and_its_repeat_over_http() {
     let tmp = TmpDir::new("tree");
@@ -773,10 +773,9 @@ fn a_tree_push_and_its_repeat_over_http() {
     let server = repo(tmp.path(), "server");
     with_server(server.clone(), serve_options(&server), |addr| async move {
         let url = format!("http://{addr}/");
-        let first = push(endpoint(&url), &root, &["main"]).await.unwrap();
+        let first = push(endpoint(&url), &root, "main").await.unwrap();
         assert_pushed(&server, "main", &first).await;
-        // The server holds nothing, so each object of the tree and the
-        // commit go.
+        // The server holds nothing, so each object of the tree goes.
         assert_eq!(
             first.stats.objects_sent, first.stats.objects_total,
             "{:?}",
@@ -785,12 +784,12 @@ fn a_tree_push_and_its_repeat_over_http() {
         assert!(first.stats.objects_sent > 6, "{:?}", first.stats);
         assert!(first.stats.bytes_sent > 30_000, "{:?}", first.stats);
 
-        let opts = tree_options(&["main"], 1_700_000_001);
+        let opts = tree_options("main", 1_700_000_001);
         let second = push_tree(endpoint(&url), &root, opts).await.unwrap();
         assert_pushed(&server, "main", &second).await;
         assert_eq!(second.refs[0].old, first.commit);
-        assert_eq!(second.stats.objects_sent, 1, "{:?}", second.stats);
-        assert_eq!(second.stats.objects_needed, 1, "{:?}", second.stats);
+        assert_eq!(second.stats.objects_sent, 0, "{:?}", second.stats);
+        assert_eq!(second.stats.objects_needed, 0, "{:?}", second.stats);
     });
 }
 
@@ -848,7 +847,7 @@ fn the_object_streams_stay_within_parallel_uploads() {
         with_server(server.clone(), opts, |addr| async move {
             let proxy = CountingProxy::start(addr, CommitResponse::Forward);
             let name = format!("p{parallel}");
-            let outcome = push(endpoint(&proxy.url), &root, &[&name]).await.unwrap();
+            let outcome = push(endpoint(&proxy.url), &root, &name).await.unwrap();
             assert_pushed(&server, &name, &outcome).await;
             let max = proxy.max_objects();
             assert!(max <= parallel as usize, "{max} streams, limit {parallel}");
@@ -900,7 +899,7 @@ fn expected_commit(base: &Path, root: &Path) -> Checksum {
         let commit = &mut commit;
         async move {
             let url = format!("http://{addr}/");
-            *commit = push(endpoint(&url), root, &["main"]).await.unwrap().commit;
+            *commit = push(endpoint(&url), root, "main").await.unwrap().commit;
         }
     });
     commit.unwrap()
@@ -917,7 +916,7 @@ fn a_lost_commit_response_leaves_the_outcome_unknown() {
     let server = repo(tmp.path(), "server");
     with_server(server.clone(), serve_options(&server), |addr| async move {
         let proxy = CountingProxy::start(addr, CommitResponse::Drop);
-        match push(endpoint(&proxy.url), &root, &["main"]).await {
+        match push(endpoint(&proxy.url), &root, "main").await {
             Err(Error::CommitOutcomeUnknown { refs, .. }) => assert_eq!(refs, ["main"]),
             other => panic!("expected an unknown outcome, got {other:?}"),
         }
@@ -938,7 +937,7 @@ fn a_refused_commit_response_leaves_the_outcome_unknown() {
     let server = repo(tmp.path(), "server");
     with_server(server.clone(), serve_options(&server), |addr| async move {
         let proxy = CountingProxy::start(addr, CommitResponse::Gzip);
-        match push(endpoint(&proxy.url), &root, &["main"]).await {
+        match push(endpoint(&proxy.url), &root, "main").await {
             Err(Error::CommitOutcomeUnknown { refs, message }) => {
                 assert_eq!(refs, ["main"]);
                 assert!(message.contains("gzip"), "{message}");
@@ -1269,7 +1268,7 @@ mod cli {
             &format!(
                 "[ex-ostrya client \"builders\"]\n\
                  auth=token-sha256:{a};token-sha256:{b};basic-sha256:alice:{a};\
-                 basic-sha256:bob:{b}\nallow=w:**\n",
+                 basic-sha256:bob:{b}\nallow=wc:**\n",
                 a = digest(ALICE),
                 b = digest(BOB),
             ),
@@ -1420,7 +1419,7 @@ mod cli {
         let server = setup.init("server", "archive");
         add_config(
             &server,
-            "[ex-ostrya client \"certs\"]\nauth=tls:ostrya test\nallow=w:**\n",
+            "[ex-ostrya client \"certs\"]\nauth=tls:ostrya test\nallow=wc:**\n",
         );
         let mut args = server_tls_args();
         args.push(format!("--tls-client-ca={}", fixture("ca.pem").display()));
@@ -1431,7 +1430,7 @@ mod cli {
                 "push-tree",
                 serving.url.as_str(),
                 src_arg,
-                "-b",
+                "--onto",
                 branch,
                 "--timestamp=@1700000000",
             ];
@@ -1465,7 +1464,7 @@ mod cli {
             &server,
             &format!(
                 "[ex-ostrya server]\ntls-cert={}\ntls-key={}\ntls-client-ca={}\n\
-                 [ex-ostrya client \"certs\"]\nauth=tls:ostrya test\nallow=w:**\n",
+                 [ex-ostrya client \"certs\"]\nauth=tls:ostrya test\nallow=wc:**\n",
                 fixture("server.pem").display(),
                 fixture("server.key.pem").display(),
                 fixture("ca.pem").display(),
@@ -1477,7 +1476,7 @@ mod cli {
             "push-tree",
             serving.url.as_str(),
             src.to_str().unwrap(),
-            "-b",
+            "--onto",
             "main",
         ];
         let tls = tls_args(true);
@@ -1501,7 +1500,7 @@ mod cli {
             "push-tree",
             &silent.url("http"),
             src_arg,
-            "-b",
+            "--onto",
             "main",
             &token,
         ]);
@@ -1516,7 +1515,7 @@ mod cli {
             "push-tree",
             &serving.url,
             src_arg,
-            "-b",
+            "--onto",
             "main",
             &token,
             "--allow-cleartext-credentials",
@@ -1554,7 +1553,7 @@ mod cli {
                 "push-tree",
                 "permissive",
                 src.to_str().unwrap(),
-                "-b",
+                "--onto",
                 "main",
             ]),
             "remote 'permissive' sets tls-permissive=true",
@@ -1600,7 +1599,7 @@ mod cli {
             "push-tree",
             "ssh://localhost/srv/repo",
             src.to_str().unwrap(),
-            "-b",
+            "--onto",
             "main",
             &ca,
         ]);
@@ -1730,8 +1729,7 @@ mod cli {
     /// The push checks the remote and makes the transport ready before its
     /// own local work. `ostrya push` refuses an HTTP option that is not
     /// valid before it reads a refspec. `ostrya push-tree` refuses an option
-    /// of the other transport before it checks a signing key and before it
-    /// reads the body file.
+    /// of the other transport before it reads the body file.
     #[test]
     fn the_transport_checks_come_before_the_local_work() {
         let setup = Setup::new("cli-order");
@@ -1767,33 +1765,22 @@ mod cli {
             "push-tree",
             "ssh://localhost/srv/repo",
             src.to_str().unwrap(),
-            "-b",
+            "--onto",
             "main",
             &ca,
-            "--sign=short",
             &body,
         ]);
         assert_refused(
             &out,
             "error: invalid input: tls-ca-path applies to an HTTP address",
         );
-        // Without the option of the other transport, the command checks the
-        // signing key first, and then the body file.
+        // Without the option of the other transport, the command reads the
+        // body file.
         let out = ostrya(&[
             "push-tree",
             "ssh://localhost/srv/repo",
             src.to_str().unwrap(),
-            "-b",
-            "main",
-            "--sign=short",
-            &body,
-        ]);
-        assert_refused(&out, "Invalid ed25519 secret key");
-        let out = ostrya(&[
-            "push-tree",
-            "ssh://localhost/srv/repo",
-            src.to_str().unwrap(),
-            "-b",
+            "--onto",
             "main",
             &body,
         ]);
@@ -1804,7 +1791,7 @@ mod cli {
             "push-tree",
             &https,
             src.to_str().unwrap(),
-            "-b",
+            "--onto",
             "main",
             "--push-user=bob",
             &body,
@@ -1813,6 +1800,145 @@ mod cli {
             &out,
             "error: invalid input: push-user needs push-token-file",
         );
+        silent.assert_untouched();
+    }
+
+    /// The commit of `name` in `repo`, parsed by the library.
+    fn load_commit(repo: &Path, name: &str) -> ostrya::Commit {
+        block_on(async {
+            let repo = Repo::open(repo).await.unwrap();
+            let checksum = repo.resolve_rev(name, false).await.unwrap().unwrap();
+            repo.load_commit(&checksum).await.unwrap().0
+        })
+    }
+
+    /// `ostrya push --onto` over HTTP prints the commit of the server alone.
+    /// The commit takes the subject and the timestamp of the local commit, or
+    /// `--timestamp`. A second push moves the branch, with the first commit
+    /// of the server as the parent. `--tag` creates the tag, and `--bind-ref`
+    /// binds a name with no ref. `--orphan` on a present branch needs `d`. A
+    /// client group with no `c` gets `ref-denied`.
+    #[test]
+    fn push_onto_over_http_makes_a_server_commit() {
+        let setup = Setup::new("cli-onto");
+        let src = tree(setup.tmp.path(), "tree", 3, 1000);
+        let (client, commit) = setup.client(&src);
+        let server = setup.init("server", "archive");
+        add_config(
+            &server,
+            "[ex-ostrya client \"push\"]\nauth=anonymous\nallow=c:srv/**;t:**\n",
+        );
+        let serving = Serving::start(&server, &[]);
+        let url = serving.url.as_str();
+        let local = load_commit(&client, "main");
+
+        let out = push_from(&client, &["--onto=srv/main", url, "main"]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        let first = stdout(&out);
+        assert_eq!(first.len(), 65, "{first:?}");
+        let first = first.trim();
+        assert_ne!(first, commit);
+        assert_eq!(rev_parse(&server, "srv/main"), first);
+        let made = load_commit(&server, "srv/main");
+        assert_eq!(made.parent, None);
+        assert_eq!(made.subject, local.subject);
+        assert_eq!(made.timestamp, local.timestamp);
+        assert_eq!(made.ref_bindings(), ["srv/main"]);
+        assert_eq!(made.root_dirtree, local.root_dirtree);
+
+        let out = push_from(
+            &client,
+            &[
+                "--onto=srv/main",
+                "--tag=v1",
+                "--bind-ref=srv/bound",
+                "--timestamp=@1600000000",
+                url,
+                "main",
+            ],
+        );
+        assert!(out.status.success(), "{}", stderr(&out));
+        let second = stdout(&out).trim().to_owned();
+        assert_eq!(rev_parse(&server, "srv/main"), second);
+        assert_eq!(rev_parse(&server, "v1"), second);
+        let made = load_commit(&server, "srv/main");
+        assert_eq!(made.parent.map(|p| p.to_hex()).as_deref(), Some(first));
+        assert_eq!(made.timestamp, 1_600_000_000);
+        assert_eq!(made.ref_bindings(), ["srv/bound", "srv/main", "v1"]);
+
+        // A tag that exists and `--orphan` without `d` change no ref.
+        let out = push_from(&client, &["--onto=srv/main", "--tag=v1", url, "main"]);
+        assert_refused(&out, "error: ref-mismatch: ");
+        let out = push_from(&client, &["--onto=srv/main", "--orphan", url, "main"]);
+        assert_refused(&out, "error: non-fast-forward: ");
+        let out = push_from(&client, &["--onto=other", url, "main"]);
+        assert_refused(&out, "error: ref-denied: ");
+        assert_eq!(rev_parse(&server, "srv/main"), second);
+    }
+
+    /// `ostrya push-tree` over HTTP takes `--tag`, `--bind-ref`, and
+    /// `--collection`, and refuses a binding key of `--add-metadata-string`
+    /// before any connection.
+    #[test]
+    fn push_tree_over_http_takes_the_options_of_a_server_commit() {
+        let setup = Setup::new("cli-tree-options");
+        let src = tree(setup.tmp.path(), "tree", 2, 100);
+        let server = setup.init("server", "archive");
+        add_config(
+            &server,
+            "[ex-ostrya client \"push\"]\nauth=anonymous\nallow=c:**;t:**\n\
+             [ex-ostrya client \"os\"]\nauth=anonymous\ncollection=org.example.Os\n\
+             allow=c:**\n",
+        );
+        let serving = Serving::start(&server, &[]);
+        let src_arg = src.to_str().unwrap();
+        let out = ostrya(&[
+            "push-tree",
+            &serving.url,
+            src_arg,
+            "--onto=main",
+            "--tag=v1",
+            "--bind-ref=bound",
+            "--timestamp=@1700000000",
+        ]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        let commit = stdout(&out).trim().to_owned();
+        assert_eq!(rev_parse(&server, "main"), commit);
+        assert_eq!(rev_parse(&server, "v1"), commit);
+        let made = load_commit(&server, "main");
+        assert_eq!(made.ref_bindings(), ["bound", "main", "v1"]);
+        assert_eq!(made.timestamp, 1_700_000_000);
+
+        let out = ostrya(&[
+            "push-tree",
+            &serving.url,
+            src_arg,
+            "--onto=main",
+            "--collection=org.example.Os",
+            "--timestamp=@1700000000",
+        ]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        let mirrored = stdout(&out).trim().to_owned();
+        let mirror = server.join("refs/mirrors/org.example.Os/main");
+        assert_eq!(
+            std::fs::read_to_string(mirror).unwrap(),
+            format!("{mirrored}\n")
+        );
+        let made = load_commit(&server, &mirrored);
+        assert_eq!(made.collection_binding(), Some("org.example.Os"));
+        assert_eq!(made.parent, None);
+
+        let silent = Silent::new();
+        for key in ["ostree.ref-binding", "ostree.collection-binding"] {
+            let out = ostrya(&[
+                "push-tree",
+                &silent.url("http"),
+                src_arg,
+                "--onto=main",
+                &format!("--add-metadata-string={key}=x"),
+            ]);
+            assert_refused(&out, &format!("'{key}', which the server writes"));
+        }
         silent.assert_untouched();
     }
 

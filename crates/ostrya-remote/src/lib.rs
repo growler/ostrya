@@ -2,14 +2,14 @@
 
 //! The wire codec and the client sessions of the ostrya push and pull.
 //!
-//! A caller pushes a local directory with [`push_tree`](fn@push_tree), or its own objects with a
-//! [`PushSession`]. A [`PullSession`] reads the summary and the ref listings of a remote. The
+//! A caller pushes a local directory as a commit that the server makes with
+//! [`push_tree`](fn@push_tree), or its own objects with a [`PushSession`]. A [`PullSession`] reads the summary and the ref listings of a remote. The
 //! crate has no repository knowledge, and it compiles on Linux, macOS, and Windows.
 //!
 //! # Entry points
 //!
 //! - [`Endpoint::parse`] reads an address into an [`Endpoint`].
-//! - [`push_tree`](fn@push_tree) pushes a local directory to an endpoint as one commit.
+//! - [`push_tree`](fn@push_tree) pushes a local directory to an endpoint as one server commit.
 //! - [`PushSession::connect`] opens a push session to an endpoint.
 //! - [`PushSession::prepare`] checks an endpoint before the session opens.
 //! - [`PushSession::over_stream`] opens a push session over a pair of byte streams.
@@ -35,13 +35,12 @@
 //! use ostrya_remote::{TreePushOptions, push_tree, transport::Endpoint};
 //! # async fn run() -> ostrya_remote::Result<()> {
 //! let endpoint = Endpoint::parse("ssh://builder@repo.example.com/srv/repo")?;
-//! let opts = TreePushOptions { refs: vec!["exampleos/stable".into()], ..Default::default() };
+//! let opts = TreePushOptions { onto: "exampleos/stable".into(), ..Default::default() };
 //! let outcome = push_tree(endpoint, "rootfs".as_ref(), opts).await?;
 //! println!("{:?}", outcome.commit);
 //! # Ok(()) }
 //! ```
 
-mod commit;
 mod error;
 pub mod proto;
 mod push_tree;
@@ -52,9 +51,7 @@ pub mod tree;
 pub use error::{Error, ErrorCode, Result};
 #[doc(hidden)]
 pub use proto::{Encoding, Expected, RefOutcome, RefState, RefUpdate};
-pub use push_tree::{
-    ParentPolicy, TreePushOptions, push_tree, push_tree_over_stream, push_tree_prepared,
-};
+pub use push_tree::{TreePushOptions, push_tree, push_tree_over_stream, push_tree_prepared};
 #[doc(hidden)]
 pub use session::{
     BoxFuture, Compression, DetachedMetadata, ObjectData, ObjectReader, ObjectSource, PullBody,
@@ -89,7 +86,6 @@ const _: fn() = || {
     assert_send_sync::<tree::EntryKind>();
     assert_send_sync::<tree::EntryAction>();
     assert_send_sync::<tree::EntryPath>();
-    assert_send_sync::<ParentPolicy>();
     assert_send_sync::<StreamSession>();
     assert_send_sync::<PullSession>();
     assert_send_sync::<PullBody>();
@@ -179,6 +175,13 @@ fn session_futures_are_send(
         Compression::None,
         SessionOptions::default(),
     ));
+}
+
+/// The future of a server commit can run on a multi-threaded executor.
+#[allow(dead_code)]
+fn server_commit_future_is_send(owned: PushSession, server_commit: proto::ServerCommit) {
+    fn assert_send<T: Send>(_: &T) {}
+    assert_send(&owned.server_commit(server_commit));
 }
 
 /// The future of a connect, and the futures of its two steps, can run on a

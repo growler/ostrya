@@ -9,8 +9,9 @@
 //! one repository at once in one process.
 //!
 //! As an extension, the crate also has a push protocol over HTTP and over ssh.
-//! With the `push` feature, `Repo::push` sends commits to a remote. With the
-//! `receive` feature, the `receive` module takes a push on the server side.
+//! With the `push` feature, `Repo::push` sends commits to a remote, and
+//! `Repo::push_onto` asks a remote to commit the tree of a local commit. With
+//! the `receive` feature, the `receive` module takes a push on the server side.
 //!
 //! # Entry points
 //! - [`Repo::open`] and [`Repo::create`] give a [`Repo`], the handle of a repository.
@@ -41,7 +42,7 @@
 //! - `verify-gpg`: the `gpg` module, GPG verification and keyring management.
 //! - `sign-gpg`: `GpgSigner`, which signs with the `gpg` command. It turns on `verify-gpg`.
 //! - `receive`: the `receive` module, the receive side of a push.
-//! - `push`: `Repo::push` and `Repo::export_stream`, the push from a repository.
+//! - `push`: `Repo::push`, `Repo::push_onto`, and `Repo::export_stream`, the push from a repository.
 //! - `lzma-static`: xz built from source and linked statically, with no runtime liblzma.
 //!
 //! # Examples
@@ -166,7 +167,8 @@ pub use ostrya_core::base64;
 pub use ostrya_core::{
     Checksum, Commit, DictBuilder, DirMeta, DirTree, ObjectName, ObjectType, RefPattern,
     RefSelector, RepoMode, Span, TextError, Type, Value, Xattrs, from_bytes, from_text,
-    is_checksum_shaped, is_collection_id, loose_path, to_text, to_text_unannotated,
+    is_checksum_shaped, is_collection_id, loose_path, source_date_epoch, to_text,
+    to_text_unannotated,
 };
 pub use ostrya_remote::proto::{
     MAX_REF_ENTRY_LEN, MAX_REF_ENTRY_PARTS, MAX_REF_LISTING, MAX_REF_PATTERNS,
@@ -179,7 +181,7 @@ pub use pull::{
     PullProgressSnapshot, PullStats, PullVerify, TimestampCheck,
 };
 #[cfg(feature = "push")]
-pub use push_repo::{ExportStreamOptions, RepoPushOptions, is_push_address};
+pub use push_repo::{ExportStreamOptions, PushOntoOptions, RepoPushOptions, is_push_address};
 #[doc(hidden)]
 pub use read::{CommitSizes, CommitState, MetadataReader};
 #[cfg(feature = "receive")]

@@ -1,16 +1,18 @@
 .TH "OSTRYA\-PUSH\-TREE" "1" "" "ostrya" "User Commands"
 .SH NAME
-ostrya\-push\-tree \- Push a directory as one commit over ssh or HTTP and set the remote refs
+ostrya\-push\-tree \- Push a directory over ssh or HTTP, and let the server commit it
 .SH SYNOPSIS
 .nf
 ostrya push\-tree [OPTIONS] [REMOTE] [DIR]
 .fi
 .SH DESCRIPTION
-Push a directory as one commit over ssh or HTTP and set the remote refs.
+Push a directory over ssh or HTTP, and let the server commit it.
 .PP
-The command walks DIR, builds one commit over it, and sends the objects that the server does not have. The server sets each \%\-b ref to the commit in one transaction. The commit holds no extended attributes. The option names and the value forms are those of \fB\%commit\fR\&.
+The command walks DIR and sends the objects of its tree that the server does not have. The server then makes one commit over the tree, moves the branch of \%\-\-onto to it, and creates each \%\-\-tag at it, in one transaction. The parent of the commit is the commit of the branch on the server. The server writes the bindings of its namespace and signs the commit with the keys of the client group. The tree holds no extended attributes. The option names and the value forms are those of \fB\%commit\fR\&.
 .PP
-The command makes its checks before the ssh client starts or the first HTTP request goes. It resolves REMOTE before it reads the signing keys and \%\-\-body\-file. A refusal of the remote thus starts no gpg and reads no body file.
+The client group needs \fB\%c\fR on the branch. A server that runs receive hooks takes no server commit and answers \%ref\-denied. The push sends the server commit in one frame, which an ostrya server limits to \%1 MiB. The reply names the branch and each \%\-\-tag, and must also fit in one frame. In a commit, an \%\-\-add\-metadata value can hold two levels of containers fewer than a variant. The push checks the two frames and the depth of each value before it sends an object.
+.PP
+The command makes its checks before the ssh client starts or the first HTTP request goes. It resolves REMOTE before it reads \%\-\-body\-file. A refusal of the remote thus reads no body file.
 .PP
 On success, standard output carries the commit checksum alone. Under \%\-\-verbose, one statistics line goes to standard error. On a terminal, standard error shows the progress bar of \fB\%push\fR while the push runs. On failure, the command writes \fB\%error: MESSAGE\fR to standard error and nothing to standard output, and exits \%1.
 .SH ARGUMENTS
@@ -24,10 +26,32 @@ A value with a \fB\%:\fR or a \fB\%/\fR is an address: an ssh, \fB\%http://\fR, 
 The directory to commit. Required.
 .SH OPTIONS
 .TP
-\fB\-b\fR, \fB\-\-branch\fR \fIREF\fR
-A target ref of the server. At least one is required.
+\fB\-\-onto\fR \fIBRANCH\fR
+The branch of the server that the server commit moves. Required.
 .IP
-Each occurrence names one more ref that the commit sets. The command refuses a name that holds \fB\%:\fR, a name that the \%ref\-name rule refuses, which includes a name with \fB\%^\fR, and a name that occurs twice. It also refuses a name of \%64 lowercase hex characters, because a revision reads such a name as a commit checksum.
+The server makes the commit over the tree of DIR. Its parent is the commit of BRANCH on the server, or none if BRANCH is absent. The server moves BRANCH to the commit. The client group needs \fB\%c\fR on BRANCH. A server that runs receive hooks takes no server commit and answers \%ref\-denied.
+.IP
+The command refuses a name that holds \fB\%:\fR, a name that the \%ref\-name rule refuses, which includes a name with \fB\%^\fR, and a name of \%64 lowercase hex characters, because a revision reads such a name as a commit checksum.
+.TP
+\fB\-\-tag\fR \fINAME\fR
+Create the ref NAME on the server at the new commit.
+.IP
+The option can occur more than once. The \fB\%ostree.ref\-binding\fR of the commit holds NAME. A tag that exists on the server gets \%ref\-mismatch before the push sends an object. NAME passes the rules of BRANCH, is not BRANCH, and occurs once. The client group needs \fB\%t\fR or \fB\%w\fR on NAME.
+.TP
+\fB\-\-bind\-ref\fR \fINAME\fR
+Bind the commit to NAME, and create no ref.
+.IP
+The option can occur more than once. The \fB\%ostree.ref\-binding\fR of the commit holds BRANCH, each \%\-\-tag, and each NAME, sorted. NAME passes the \%ref\-name rule and has no \fB\%:\fR\&.
+.TP
+\fB\-\-orphan\fR
+Make a commit with no parent.
+.IP
+If BRANCH exists on the server, the client group needs \fB\%c\fR and \fB\%d\fR on it, else the server answers \%non\-fast\-forward.
+.TP
+\fB\-\-collection\fR \fIID\fR
+Write the refs of the collection ID on the server.
+.IP
+The server writes the refs of its own collection id under \fB\%refs/heads/\fR, and the refs of each other collection under \fB\%refs/mirrors/ID/\fR\&. \fB\%ostree.collection\-binding\fR of the commit holds ID. Without this option, the push writes the local refs of the server, and the binding is the collection id of the server, if it has one. The command refuses an ID that fails the \%collection\-id rule or is longer than \%255 bytes before it starts the transport.
 .TP
 \fB\-s\fR, \fB\-\-subject\fR \fISUBJECT\fR
 The commit subject.
@@ -45,32 +69,17 @@ The whole file becomes the body, byte for byte. The command refuses a file that 
 \fB\-\-add\-metadata\-string\fR \fIKEY=VALUE\fR
 Add a \%string\-valued key to the commit metadata.
 .IP
-The command splits \%KEY=VALUE at the first \fB\%=\fR, and refuses an empty key. Each occurrence adds one key.
+The command splits \%KEY=VALUE at the first \fB\%=\fR, and refuses an empty key. Each occurrence adds one key. The command refuses the keys \fB\%ostree.ref\-binding\fR and \fB\%ostree.collection\-binding\fR, which the server writes.
 .TP
 \fB\-\-add\-metadata\fR \fIKEY=VALUE\fR
 Add a key to the commit metadata, with a value in GVariant text form.
 .IP
-Each occurrence adds one key. The metadata holds each \%\-\-add\-metadata\-string entry first, then each \%\-\-add\-metadata entry, and then the ref bindings.
-.TP
-\fB\-\-add\-detached\-metadata\-string\fR \fIKEY=VALUE\fR
-Add a \%string\-valued key to the detached commit metadata.
-.IP
-Each occurrence adds one key. The command refuses an empty key. The command does not apply \fB\%[ex\-ostrya] detached\-metadata\-exclude\fR to these keys.
+Each occurrence adds one key. The metadata holds each \%\-\-add\-metadata\-string entry first, then each \%\-\-add\-metadata entry, and then the ref bindings that the server writes. The command refuses the keys \fB\%ostree.ref\-binding\fR and \fB\%ostree.collection\-binding\fR\&.
 .TP
 \fB\-\-timestamp\fR \fITIMESTAMP\fR
-Override the timestamp of the commit.
+Set the timestamp of the commit.
 .IP
-The value is \fB\%@SECONDS\fR since the Unix epoch, or a date and time with a UTC offset (\fB\%2020\-01\-02T03:04:05Z\fR). Without this option, the commit takes the \fB\%SOURCE_DATE_EPOCH\fR environment variable. If that variable is not set, the commit takes the current time.
-.TP
-\fB\-\-parent\fR \fICHECKSUM\fR
-The parent commit: a full checksum, or \fB\%none\fR for a root commit.
-.IP
-A full checksum has \%64 lowercase hex characters. Without this option, the parent is the commit of the first target ref on the server. If the server does not have that ref, the commit has no parent.
-.TP
-\fB\-\-no\-bindings\fR
-Do not write any ref bindings.
-.IP
-Without this switch, \fB\%ostree.ref\-binding\fR holds the target refs in sorted order. \fB\%ostree.collection\-binding\fR holds the collection ID of the server, if the server has one.
+The value is \fB\%@SECONDS\fR since the Unix epoch, or a date and time with a UTC offset (\fB\%2020\-01\-02T03:04:05Z\fR). Without this option, the push sends the \fB\%SOURCE_DATE_EPOCH\fR environment variable. If that variable is not set, the push sends no timestamp, and the server takes its own clock. The command refuses a \fB\%SOURCE_DATE_EPOCH\fR that is not a count of seconds.
 .TP
 \fB\-\-owner\-uid\fR \fIUID\fR
 Set the user id of the owner of the committed files.
@@ -86,36 +95,6 @@ The value applies to the root directory too. A negative value keeps the group id
 Force owner \%0:0, canonicalize modes to \fB\%perm & 0755\fR, and drop xattrs.
 .IP
 The commit then does not depend on the owner or on the host. A symlink keeps its mode. The command refuses this switch with a \%non\-zero \%\-\-owner\-uid or \%\-\-owner\-gid.
-.TP
-\fB\-\-sign\fR \fIKEY_ID\fR
-Sign the commit with this key. Each occurrence adds one signature.
-.IP
-For \%ed25519 and spki, the key is the \%base64 of the secret key. Under \%\-\-sign\-type=gpg, the key is a GPG key ID. The signatures come in this order: every \%\-\-sign key, then every \%\-\-sign\-from\-file key, and then every \%\-\-gpg\-sign key.
-.TP
-\fB\-\-sign\-from\-file\fR \fIPATH\fR
-Sign the commit with the key on the first line of this file.
-.IP
-Each occurrence adds one signature. \%\-\-sign\-type selects the engine, as for \%\-\-sign. The command refuses a first line that is longer than \%64 KiB.
-.TP
-\fB\-\-sign\-type\fR \fINAME\fR
-The signature type of \%\-\-sign and \%\-\-sign\-from\-file.
-.IP
-The types are \fB\%ed25519\fR, \fB\%spki\fR, and \fB\%gpg\fR, and the default is \fB\%ed25519\fR\&. If the option occurs more than once, the last value wins. The command reads this option only if \%\-\-sign or \%\-\-sign\-from\-file names a key.
-.TP
-\fB\-\-gpg\-sign\fR \fIKEY\-ID\fR
-The GPG key ID to sign the commit with.
-.IP
-Each occurrence adds one signature under \fB\%ostree.gpgsigs\fR\&. The ID must name exactly one secret key in the GnuPG home directory. The command refuses an ID of less than \%8 bytes.
-.TP
-\fB\-\-gpg\-homedir\fR \fIHOMEDIR\fR
-The GPG home directory that holds the keyrings.
-.IP
-\%\-\-gpg\-sign reads it, and so do \%\-\-sign and \%\-\-sign\-from\-file under \%\-\-sign\-type=gpg. It wins over \fB\%GNUPGHOME\fR\&.
-.TP
-\fB\-\-force\fR
-Set each target ref whatever its state on the server.
-.IP
-The push also asks the server to allow an update that is not a \%fast\-forward. The server still refuses such an update unless the client group of the push has \fB\%w\fR and \fB\%d\fR on the ref.
 .TP
 \fB\-\-compress\fR[=\fILEVEL\fR]
 Send the content objects deflated at LEVEL, \%1 to \%9.

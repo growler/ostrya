@@ -81,6 +81,9 @@ pub use message::{
     CommitRequest, ErrorMessage, GetReply, HaveReply, Hello, HelloReply, ListRefsRequest, Message,
     ObjectHeader, ObjectsReply, PullHello, PullHelloReply, ServerCommit,
 };
+pub(crate) use message::{
+    check_server_commit_metadata, server_commit_frame_len, server_commit_reply_frame_len,
+};
 
 use ostrya_core::{Checksum, ObjectName, ObjectType};
 use ostrya_gvariant::Value;

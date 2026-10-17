@@ -77,9 +77,9 @@ fn stand_in(address: &str, marker: &Path) -> Endpoint {
     }
 }
 
-fn options(refs: &[&str]) -> TreePushOptions {
+fn options(branch: &str) -> TreePushOptions {
     TreePushOptions {
-        refs: refs.iter().map(|s| s.to_string()).collect(),
+        onto: branch.to_string(),
         timestamp: Some(1_700_000_000),
         ..Default::default()
     }
@@ -175,7 +175,7 @@ fn a_tree_that_scans_starts_the_ssh_client() {
     let result = ostrya_rt::block_on(push_tree(
         stand_in(ADDRESS, &marker),
         &root,
-        options(&["main"]),
+        options("main"),
     ));
     assert!(marker.exists(), "the ssh client did not start");
     // The stand-in exits with no reply, so the session cannot open.
@@ -189,7 +189,7 @@ fn a_tree_that_scans_starts_the_ssh_client() {
 fn a_walk_error_starts_no_ssh_client() {
     let scratch = Scratch::new("walk");
     let missing = scratch.path.join("missing");
-    let e = refused_with_no_start("missing root", ADDRESS, &missing, || options(&["main"]));
+    let e = refused_with_no_start("missing root", ADDRESS, &missing, || options("main"));
     assert_eq!(
         walk_error("missing root", e),
         (missing.clone(), io::ErrorKind::NotFound)
@@ -199,7 +199,7 @@ fn a_walk_error_starts_no_ssh_client() {
     let fifo = root.join("dir/fifo");
     match std::process::Command::new("mkfifo").arg(&fifo).status() {
         Ok(status) if status.success() => {
-            let e = refused_with_no_start("fifo", ADDRESS, &root, || options(&["main"]));
+            let e = refused_with_no_start("fifo", ADDRESS, &root, || options("main"));
             assert_eq!(
                 walk_error("fifo", e),
                 (fifo.clone(), io::ErrorKind::Unsupported)
@@ -219,7 +219,7 @@ fn a_hash_error_starts_no_ssh_client() {
         eprintln!("skipping: the process opens a file at mode 0000");
         return;
     }
-    let e = refused_with_no_start("hash", ADDRESS, &root, || options(&["main"]));
+    let e = refused_with_no_start("hash", ADDRESS, &root, || options("main"));
     assert_eq!(
         walk_error("hash", e),
         (file.clone(), io::ErrorKind::PermissionDenied)
@@ -232,52 +232,76 @@ fn options_refused_before_the_scan_start_no_ssh_client() {
     let root = tree(&scratch.path);
     let variant =
         || ostrya_core::Value::variant(ostrya_core::Type::Str, ostrya_core::Value::Str("v".into()));
-    // One `ay` value at the size limit. The dict that holds this value is
-    // larger than the limit.
-    let oversized = || {
-        let bytes = vec![0; ostrya_core::MAX_METADATA_SIZE as usize];
-        let ty = ostrya_core::Type::parse("ay").unwrap();
-        vec![(
-            "big".to_owned(),
-            ostrya_core::Value::variant(ty, ostrya_core::Value::Bytes(bytes)),
-        )]
-    };
     let cases: Vec<(&str, MakeOptions, &str)> = vec![
         (
             "hash_jobs 0",
             Box::new(|| TreePushOptions {
                 hash_jobs: Some(0),
-                ..options(&["main"])
+                ..options("main")
             }),
             "hash_jobs",
         ),
-        ("no refs", Box::new(|| options(&[])), "at least one"),
-        ("a ref twice", Box::new(|| options(&["a", "a"])), "twice"),
         (
-            "a bad ref",
-            Box::new(|| options(&["a/../b"])),
+            "no branch",
+            Box::new(|| options("")),
+            "not a valid ref name",
+        ),
+        (
+            "a tag twice",
+            Box::new(|| TreePushOptions {
+                tags: vec!["a".into(), "a".into()],
+                ..options("main")
+            }),
+            "twice",
+        ),
+        (
+            "a tag that is the branch",
+            Box::new(|| TreePushOptions {
+                tags: vec!["main".into()],
+                ..options("main")
+            }),
+            "also the branch",
+        ),
+        (
+            "a bad branch",
+            Box::new(|| options("a/../b")),
             "not a valid ref name",
         ),
         (
             "a name outside the rule",
-            Box::new(|| options(&["a b"])),
+            Box::new(|| options("a b")),
             "not a valid ref name",
         ),
-        (
-            "a remote ref",
-            Box::new(|| options(&["origin:main"])),
-            "':'",
-        ),
+        ("a remote ref", Box::new(|| options("origin:main")), "':'"),
         (
             "a parent revision",
-            Box::new(|| options(&["main", "main^"])),
+            Box::new(|| TreePushOptions {
+                tags: vec!["main^".into()],
+                ..options("main")
+            }),
             "not a valid ref name",
+        ),
+        (
+            "a bad bound name",
+            Box::new(|| TreePushOptions {
+                bind_refs: vec!["o:main".into()],
+                ..options("main")
+            }),
+            "bound name",
+        ),
+        (
+            "a bad collection",
+            Box::new(|| TreePushOptions {
+                collection: Some("no-dot".into()),
+                ..options("main")
+            }),
+            "invalid collection id",
         ),
         (
             "a level out of range",
             Box::new(|| TreePushOptions {
                 compression: Compression::Deflate { level: 10 },
-                ..options(&["main"])
+                ..options("main")
             }),
             "compression level",
         ),
@@ -285,33 +309,17 @@ fn options_refused_before_the_scan_start_no_ssh_client() {
             "an empty metadata key",
             Box::new(move || TreePushOptions {
                 metadata: vec![(String::new(), variant())],
-                ..options(&["main"])
+                ..options("main")
             }),
             "empty key",
         ),
         (
-            "an empty detached key",
+            "a binding key",
             Box::new(move || TreePushOptions {
-                detached_metadata: vec![(String::new(), variant())],
-                ..options(&["main"])
+                metadata: vec![("ostree.ref-binding".into(), variant())],
+                ..options("main")
             }),
-            "empty key",
-        ),
-        (
-            "an oversized metadata dict",
-            Box::new(move || TreePushOptions {
-                metadata: oversized(),
-                ..options(&["main"])
-            }),
-            "over the limit",
-        ),
-        (
-            "an oversized detached dict",
-            Box::new(move || TreePushOptions {
-                detached_metadata: oversized(),
-                ..options(&["main"])
-            }),
-            "over the limit",
+            "which the server writes",
         ),
     ];
     for (tag, opts, part) in cases {
@@ -330,14 +338,14 @@ fn options_refused_before_the_scan_start_no_ssh_client() {
             mirrors,
             ..Default::default()
         });
-        let result = ostrya_rt::block_on(push_tree(endpoint, &root, options(&["main"])));
+        let result = ostrya_rt::block_on(push_tree(endpoint, &root, options("main")));
         invalid_input("mirrors", result.unwrap_err(), "exactly one mirror");
     }
     let mut http = ostrya_fetch::FetcherOptions::new("http://host/repo");
     http.bearer_token = Some(ostrya_fetch::BearerToken {
         token: "token".into(),
     });
-    let result = ostrya_rt::block_on(push_tree(Endpoint::Http(http), &root, options(&["main"])));
+    let result = ostrya_rt::block_on(push_tree(Endpoint::Http(http), &root, options("main")));
     match result {
         Err(Error::Fetch(e)) => assert!(e.to_string().contains("cleartext"), "{e}"),
         other => panic!("cleartext: {other:?}"),

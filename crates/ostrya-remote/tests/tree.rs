@@ -25,7 +25,6 @@ use futures_io::AsyncWrite;
 use futures_lite::io::{AsyncReadExt, Cursor};
 use ostrya_core::filehdr::{frame, split_framed};
 use ostrya_core::{Checksum, FileHeader, ObjectName, ObjectType};
-use ostrya_gvariant::{DictBuilder, Value};
 use ostrya_remote::proto::{
     FrameReader, FrameWriter, HelloReply, MIN_FRAME_LIMIT, Message, ObjectRead, ObjectsReply,
     RefState,
@@ -651,14 +650,9 @@ fn no_file_of_the_pass_is_open_after_a_hash_error() {
 
 /// A commit checksum and bytes for the object-source calls. The model does
 /// not check them.
-fn stand_in_commit() -> (Checksum, Vec<u8>) {
-    (Checksum::from_bytes([0xc0; 32]), b"commit bytes".to_vec())
-}
-
-fn detached() -> Value {
-    let mut dict = DictBuilder::new();
-    dict.insert_str("xa.from", "tree");
-    dict.build()
+/// The checksum of a commit, which no tree model holds.
+fn stand_in_commit() -> Checksum {
+    Checksum::from_bytes([0xc0; 32])
 }
 
 fn run<T>(future: impl std::future::Future<Output = T>) -> T {
@@ -746,50 +740,25 @@ fn small_tree(root: &Path) -> TreeModel {
 }
 
 #[test]
-fn objects_of_the_commit_are_the_tree_objects_and_the_commit() {
+fn the_model_holds_the_tree_objects_and_no_commit() {
     let dir = Scratch::new("send-objects");
-    let mut model = small_tree(&dir.path);
-    let (commit, bytes) = stand_in_commit();
+    let model = small_tree(&dir.path);
+    // Three content objects, and two directories of distinct dirtrees that
+    // share one dirmeta.
+    assert_eq!(model.object_names().len(), 3 + 2 + 1);
 
-    // If the model has no commit, it refuses each call about a commit.
+    // The model refuses each call about a commit.
+    let commit = stand_in_commit();
     assert_invalid_input(run(model.objects(&commit)));
     assert_invalid_input(run(model.detached_metadata(&commit)));
     assert_invalid_input(open(&model, &ObjectName::new(commit, ObjectType::Commit)));
-
-    model.set_commit(commit, bytes.clone(), Some(detached()));
-    let mut want = model.object_names();
-    want.push(ObjectName::new(commit, ObjectType::Commit));
-    assert_eq!(run(model.objects(&commit)).unwrap(), want);
-    // Three content objects, and two directories of distinct dirtrees that
-    // share one dirmeta.
-    assert_eq!(want.len(), 3 + 2 + 1 + 1);
-
-    let commit_object = open(&model, &ObjectName::new(commit, ObjectType::Commit)).unwrap();
-    assert_eq!(raw_bytes(commit_object), bytes);
-    assert_eq!(
-        run(model.detached_metadata(&commit)).unwrap(),
-        Some(detached())
-    );
-
-    // Each call refuses a commit other than the commit of the model.
-    let other = Checksum::from_bytes([0xc1; 32]);
-    assert_invalid_input(run(model.objects(&other)));
-    assert_invalid_input(run(model.detached_metadata(&other)));
-    assert_invalid_input(open(&model, &ObjectName::new(other, ObjectType::Commit)));
-
-    // A later `set_commit` call replaces the commit. If the call gives no
-    // detached dict, `detached_metadata` gives `None`.
-    model.set_commit(other, b"other".to_vec(), None);
-    assert_invalid_input(run(model.objects(&commit)));
-    assert_eq!(run(model.detached_metadata(&other)).unwrap(), None);
 }
 
 #[test]
 fn an_object_the_model_does_not_hold_is_invalid_input() {
     let dir = Scratch::new("send-unknown");
-    let mut model = small_tree(&dir.path);
-    let (commit, bytes) = stand_in_commit();
-    model.set_commit(commit, bytes, None);
+    let model = small_tree(&dir.path);
+    let commit = stand_in_commit();
     let unknown = Checksum::from_bytes([0xee; 32]);
     for ty in [ObjectType::File, ObjectType::DirTree, ObjectType::DirMeta] {
         assert_invalid_input(open(&model, &ObjectName::new(unknown, ty)));

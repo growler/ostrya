@@ -12,7 +12,9 @@ The command resolves REMOTE and sends the objects that the server does not have.
 .PP
 The collection bindings of the source commits, or \%\-\-collection, give the namespace of the push on the server: the local refs or one collection. The server writes the refs of a collection other than its own collection id under \fB\%refs/mirrors/ID/\fR\&.
 .PP
-On success, standard output carries one line for each ref, in the order of the refspecs and then of the tags. A line holds the DST name, the old state, and the new state. The old state is a full commit checksum, \fB\%(new)\fR, or \fB\%(absent)\fR\&. The new state is a full commit checksum, \fB\%(unchanged)\fR, or \fB\%(deleted)\fR\&.
+With \%\-\-onto, the push sends the tree of one local commit, and the server makes a new commit over it on the branch BRANCH. The server picks the parent, writes the bindings, and signs the commit.
+.PP
+On success, standard output carries one line for each ref, in the order of the refspecs and then of the tags. A line holds the DST name, the old state, and the new state. The old state is a full commit checksum, \fB\%(new)\fR, or \fB\%(absent)\fR\&. The new state is a full commit checksum, \fB\%(unchanged)\fR, or \fB\%(deleted)\fR\&. With \%\-\-onto, standard output carries the checksum of the new commit alone.
 .PP
 Under \%\-\-verbose, one statistics line goes to standard error. If standard error is a terminal and \fB\%TERM\fR is set and is not \fB\%dumb\fR, standard error shows a progress bar while the push runs. On failure, the command writes \fB\%error: MESSAGE\fR to standard error and nothing to standard output, and exits \%1.
 .SH ARGUMENTS
@@ -30,6 +32,8 @@ The refspecs, each \fB\%SRC[:DST]\fR\&. At least one refspec is required.
 SRC is a revision of this repository, and DST is the ref of the server that takes its commit. The command splits each refspec at its last \fB\%:\fR\&. If SRC is a ref, DST defaults to SRC. A SRC that is a checksum, or that has a \fB\%^\fR suffix, needs a DST. \fB\%:DST\fR deletes the ref DST of the server.
 .IP
 The command refuses a DST that the \%ref\-name rule refuses, which includes a DST with \fB\%^\fR\&. It also refuses a DST of \%64 lowercase hex characters after a SRC, because a revision reads such a name as a commit checksum. A delete of such a DST passes.
+.IP
+With \%\-\-onto, the operand is one REF, a revision of this repository.
 .SH OPTIONS
 .TP
 \fB\-\-depth\fR \fIN\fR
@@ -50,11 +54,41 @@ Write the refs of the collection ID on the server.
 The push reads the \fB\%ostree.collection\-binding\fR of each source commit. Without this option, the bindings give the namespace on the server: a commit with no binding goes to the local refs, and a commit bound to ID goes to the refs of ID. The server writes the refs of its own collection id under \fB\%refs/heads/\fR, and the refs of each other collection under \fB\%refs/mirrors/ID/\fR\&. \fB\%commit\fR binds each commit of a repository with a collection id to that id. So a push of such a commit to a server with another collection id, or with none, writes \fB\%refs/mirrors/ID/NAME\fR on the server.
 .IP
 The command refuses two source commits with different bindings, a binding that differs from ID, and a commit with no binding that goes to the refs of a collection. It refuses an ID or a binding that fails the \%collection\-id rule or is longer than \%255 bytes before it starts the transport.
+.IP
+With \%\-\-onto, ID alone names the namespace, and the bindings of the local commit do not apply. Without ID, the server commit goes to the local refs of the server.
 .TP
 \fB\-\-tag\fR \fINAME\fR
 Create the ref NAME on the server at the source commit.
 .IP
 The option can occur more than once. A tag is a ref update that expects no ref, also with \%\-\-force. So a tag that exists gets \%ref\-mismatch after the server reports its refs, and before the push sends an object. The refspecs that are not deletes must give one commit, and the \fB\%ostree.ref\-binding\fR of that commit must hold NAME. NAME passes the \%ref\-name rule, has no \fB\%:\fR, is not \%64 lowercase hex characters, and is not a DST. The client group of the push needs \fB\%t\fR or \fB\%w\fR on NAME.
+.IP
+With \%\-\-onto, the server creates NAME at the new commit, and the \fB\%ostree.ref\-binding\fR of that commit holds NAME. NAME is not BRANCH. A tag that exists also gets \%ref\-mismatch before the push sends an object.
+.TP
+\fB\-\-onto\fR \fIBRANCH\fR
+Ask the server to commit the tree of REF onto the branch BRANCH.
+.IP
+The push sends the objects of the tree of the local commit that the server does not have. The server then makes a new commit over the tree, moves BRANCH to it, and creates each \%\-\-tag at it, in one transaction. The parent of the new commit is the commit of BRANCH on the server. The new commit takes the subject, the body, the metadata, and the timestamp of the local commit. The push leaves out the local \fB\%ostree.ref\-binding\fR and \fB\%ostree.collection\-binding\fR, and the server writes the bindings of its namespace: BRANCH, each \%\-\-tag, and each \%\-\-bind\-ref.
+.IP
+The push sends no parent, no commit object, and no detached metadata, so no signature of the local commit reaches the server. The server signs the new commit with the keys of its own client group.
+.IP
+The client group needs \fB\%c\fR on BRANCH. A server that runs receive hooks takes no server commit and answers \%ref\-denied. The push sends the server commit in one frame, which an ostrya server limits to \%1 MiB. The reply names BRANCH and each \%\-\-tag, and must also fit in one frame. The push checks the two frames against the limit of the server before it sends an object.
+.IP
+BRANCH passes the \%ref\-name rule, has no \fB\%:\fR, and is not \%64 lowercase hex characters. With \%\-\-onto, the command takes exactly one REF, a revision of this repository, and does not split it at \fB\%:\fR\&. The local commit must not be partial, and must have no related objects. \%\-\-onto conflicts with \%\-\-depth and \%\-\-force.
+.TP
+\fB\-\-bind\-ref\fR \fINAME\fR
+Bind the commit of \%\-\-onto to NAME, and create no ref.
+.IP
+The option can occur more than once. The \fB\%ostree.ref\-binding\fR of the new commit holds each NAME. NAME passes the \%ref\-name rule and has no \fB\%:\fR\&. The option needs \%\-\-onto.
+.TP
+\fB\-\-orphan\fR
+Make the commit of \%\-\-onto with no parent.
+.IP
+If BRANCH exists on the server, the client group needs \fB\%c\fR and \fB\%d\fR on it, else the server answers \%non\-fast\-forward. The option needs \%\-\-onto.
+.TP
+\fB\-\-timestamp\fR \fITIMESTAMP\fR
+Override the timestamp of the commit of \%\-\-onto.
+.IP
+The value is \fB\%@SECONDS\fR since the Unix epoch, or a date and time with a UTC offset (\fB\%2020\-01\-02T03:04:05Z\fR). Without this option, the new commit takes the timestamp of the local commit. The option needs \%\-\-onto.
 .TP
 \fB\-\-compress\fR[=\fILEVEL\fR]
 Send the content objects deflated at LEVEL, \%1 to \%9.

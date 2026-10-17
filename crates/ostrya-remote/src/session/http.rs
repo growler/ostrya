@@ -25,7 +25,7 @@ use super::{
 use crate::error::{Error, Result};
 use crate::proto::{
     CommitRequest, FrameReader, Hello, MAX_FRAME, MIN_FRAME_LIMIT, Message, PROTOCOL_VERSION,
-    RefUpdate, encode_frame, have_entries_within,
+    encode_frame, have_entries_within,
 };
 
 /// The path of the receive endpoint under the push address, with the step
@@ -684,8 +684,9 @@ impl HttpLink {
         }
     }
 
-    /// Sends `Commit` with `updates`, as
-    /// [`PushSession::commit`](super::PushSession::commit) states.
+    /// Sends `Commit` with `request`, as
+    /// [`PushSession::commit`](super::PushSession::commit) states. The reply
+    /// must hold the refs `names`, in order.
     ///
     /// The call ends the session with `DELETE` and sends no `Commit` in these
     /// cases:
@@ -698,8 +699,8 @@ impl HttpLink {
         server: &ServerInfo,
         counters: &Counters,
         checked: Result<()>,
-        updates: &[RefUpdate],
-        force: bool,
+        request: CommitRequest,
+        names: &[String],
     ) -> Result<PushOutcome> {
         if let Err(e) = checked {
             let _ = self.delete().await;
@@ -710,11 +711,7 @@ impl HttpLink {
             return Err(broken());
         }
         counters.phase(PushPhase::Committing);
-        let request = Message::Commit(CommitRequest {
-            updates: updates.to_vec(),
-            force,
-            server_commit: None,
-        });
+        let request = Message::Commit(request);
         let body = match encode_frame(&request, server.max_frame) {
             Ok(body) => body,
             Err(e) => {
@@ -722,8 +719,9 @@ impl HttpLink {
                 return Err(e);
             }
         };
+        drop(request);
         let unknown = |message: String| Error::CommitOutcomeUnknown {
-            refs: updates.iter().map(|u| u.name.clone()).collect(),
+            refs: names.to_vec(),
             message,
         };
         let path = self.step_path("commit");
@@ -740,7 +738,7 @@ impl HttpLink {
             }
             Err(e) => return Err(unknown(format!("the reply to Commit failed: {e}"))),
         };
-        if refs.len() != updates.len() || refs.iter().zip(updates).any(|(o, u)| o.name != u.name) {
+        if !super::reply_names_match(&refs, names) {
             return Err(unknown(
                 "the server replied to Commit for other refs than the refs of Commit".into(),
             ));
@@ -937,8 +935,8 @@ mod tests {
         assert!(size <= 4096, "the send future is {size} bytes");
     }
 
-    /// The futures of `missing`, `commit`, `connect`, its two steps, and the
-    /// tree pushes hold the state of both transports. The upload request, the
+    /// The futures of `missing`, `commit`, `server_commit`, `connect`, its two
+    /// steps, and the tree pushes hold the state of both transports. The upload request, the
     /// read of its reply, and the construction of the fetcher are boxed, so
     /// none of them sits inline in these futures.
     #[test]
@@ -974,6 +972,19 @@ mod tests {
         let session = open();
         let missing = std::mem::size_of_val(&session.missing(&[]));
         let commit = std::mem::size_of_val(&open().commit(&[], false));
+        let server_commit =
+            std::mem::size_of_val(&open().server_commit(crate::proto::ServerCommit {
+                branch: "main".into(),
+                tags: Vec::new(),
+                bind_refs: Vec::new(),
+                root_dirtree: ostrya_core::Checksum::from_bytes([1; 32]),
+                root_dirmeta: ostrya_core::Checksum::from_bytes([2; 32]),
+                subject: String::new(),
+                body: String::new(),
+                metadata: Vec::new(),
+                timestamp: None,
+                orphan: false,
+            }));
         let endpoint = Endpoint::parse("https://h/repo").unwrap();
         let refs = ["main".to_owned()];
         let connect = std::mem::size_of_val(&PushSession::connect(
@@ -998,11 +1009,16 @@ mod tests {
             TreePushOptions::default(),
         ));
         eprintln!(
-            "missing {missing}, commit {commit}, connect {connect}, prepare {prepare}, \
-             open {open}, push_tree {tree}, push_tree_prepared {tree_prepared} bytes"
+            "missing {missing}, commit {commit}, server_commit {server_commit}, \
+             connect {connect}, prepare {prepare}, open {open}, push_tree {tree}, \
+             push_tree_prepared {tree_prepared} bytes"
         );
         assert!(missing <= 1024, "the missing future is {missing} bytes");
         assert!(commit <= 3072, "the commit future is {commit} bytes");
+        assert!(
+            server_commit <= 3072,
+            "the server_commit future is {server_commit} bytes"
+        );
         assert!(connect <= 4096, "the connect future is {connect} bytes");
         assert!(prepare <= 2048, "the prepare future is {prepare} bytes");
         assert!(open <= 4096, "the open future is {open} bytes");

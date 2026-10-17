@@ -1,43 +1,28 @@
-//! The push of a local directory: the walk and the hash pass, the commit
-//! over the tree, and one session that sends the objects that the server
-//! lacks and sets the target refs.
+//! The push of a local directory: the walk and the hash pass, and one session
+//! that sends the objects that the server lacks and asks the server to commit
+//! the tree.
 
 use std::collections::HashSet;
 use std::path::Path;
 
 use futures_io::{AsyncRead, AsyncWrite};
-use ostrya_core::{Checksum, MAX_METADATA_SIZE, Value};
+use ostrya_core::{Checksum, Type, Value};
 
-use crate::commit::{
-    CommitInputs, build_commit, check_commit_floor, check_ref_states, commit_size_floor,
-    detached_dict, entry_dict, ref_updates, resolve_parent,
-};
-use crate::error::Result;
-use crate::proto::RefUpdate;
+use crate::error::{Error, Result};
+use crate::proto::ServerCommit;
 use crate::session::{
-    Compression, ObjectSource, PushOutcome, PushProgress, PushSession, SessionOptions,
-    deflate_level, invalid,
+    Compression, PushOutcome, PushProgress, PushSession, ServerInfo, SessionOptions, deflate_level,
+    invalid,
 };
 use crate::transport::{Endpoint, PreparedSession};
 use crate::tree::{EntryFilter, ScanOptions, TreeModel};
 
-/// The parent of the commit of a tree push.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub enum ParentPolicy {
-    /// The commit of the first target ref on the server, as `HelloReply`
-    /// reports it.
-    ///
-    /// If that ref is absent, the commit has no parent.
-    #[default]
-    CurrentTip,
-    /// No parent.
-    None,
-    /// The commit of the given full checksum.
-    ///
-    /// The client cannot resolve a ref name or an abbreviated checksum on the
-    /// server.
-    Commit(Checksum),
-}
+/// The longest collection id, in bytes. The server writes the refs of a
+/// collection under one directory of that name.
+const MAX_COLLECTION_ID_LEN: usize = 255;
+
+/// The metadata keys of the bindings, which the server writes.
+const BINDING_KEYS: [&str; 2] = ["ostree.ref-binding", "ostree.collection-binding"];
 
 /// The options of a tree push.
 ///
@@ -46,35 +31,46 @@ pub enum ParentPolicy {
 /// `..Default::default()`.
 #[derive(Default)]
 pub struct TreePushOptions {
-    /// The target refs, one or more, each a ref name below `refs/heads`.
+    /// The branch of the server that the server moves to the new commit.
     ///
-    /// The push sets each of them to the commit.
-    pub refs: Vec<String>,
-    /// The parent of the commit.
-    pub parent: ParentPolicy,
+    /// The parent of the commit is the commit of the branch on the server
+    /// when the server writes the commit. If the branch is absent, the commit
+    /// has no parent.
+    pub onto: String,
+    /// The tags that the server creates at the new commit, in order.
+    ///
+    /// A tag that exists on the server refuses the push.
+    pub tags: Vec<String>,
+    /// The names that the commit binds and that get no ref, in order.
+    ///
+    /// The `ostree.ref-binding` of the commit holds the branch, each tag, and
+    /// each of these names.
+    pub bind_refs: Vec<String>,
+    /// The switch that makes a commit with no parent.
+    ///
+    /// On a branch that exists, the server allows it only for a client that
+    /// can also delete the branch.
+    pub orphan: bool,
+    /// The collection id of the namespace of the server that the push
+    /// writes.
+    ///
+    /// `None` writes the local refs of the server. The collection id of the
+    /// server also writes its local refs.
+    pub collection: Option<String>,
     /// The subject of the commit, empty if not set.
     pub subject: Option<String>,
     /// The body of the commit, empty if not set.
     pub body: Option<String>,
     /// The entries of the `a{sv}` metadata dict of the commit, in order.
     ///
-    /// Each value is a variant. The bindings follow the entries.
+    /// Each value is a variant. The server writes the bindings after the
+    /// entries.
     pub metadata: Vec<(String, Value)>,
-    /// The entries of the detached metadata dict of the commit, in order.
-    ///
-    /// Each value is a variant. The signatures follow the entries.
-    pub detached_metadata: Vec<(String, Value)>,
     /// The timestamp of the commit, in seconds since the Unix epoch, UTC.
     ///
-    /// If this field is not set, the push takes the `SOURCE_DATE_EPOCH`
-    /// environment variable. If that variable is also not set, the push takes
-    /// the current time.
+    /// If this field is not set, the server takes its clock. The push reads
+    /// no environment variable.
     pub timestamp: Option<u64>,
-    /// The switch that leaves out `ostree.ref-binding` and
-    /// `ostree.collection-binding`.
-    pub no_bindings: bool,
-    /// The signers of the commit, in order.
-    pub signers: Vec<Box<dyn ostrya_sign::Signer>>,
     /// The encoding of the content objects.
     pub compression: Compression,
     /// The filter that sees each entry of the walk.
@@ -84,11 +80,6 @@ pub struct TreePushOptions {
     ///
     /// [`ScanOptions::hash_jobs`] gives the default and the limits.
     pub hash_jobs: Option<usize>,
-    /// The switch that sets each target ref whatever its state on the server.
-    ///
-    /// If it is `true`, `Commit` also asks the server to allow an update that
-    /// is not a fast-forward.
-    pub force: bool,
     /// The progress handle of the scan and of the session.
     ///
     /// The scan sets its phases in the handle, and the session counts its
@@ -96,10 +87,10 @@ pub struct TreePushOptions {
     pub progress: Option<PushProgress>,
 }
 
-/// Pushes the directory `root` to `endpoint` as one commit.
+/// Pushes the directory `root` to `endpoint` as one server commit.
 ///
-/// The server sets the target refs to the commit in one transaction. The push
-/// runs in this order:
+/// The server makes the commit over the tree, moves the branch to it, and
+/// creates each tag at it, in one transaction. The push runs in this order:
 ///
 /// 1. It checks `opts` and refuses each value that [`push_tree_over_stream`]
 ///    refuses. Then it makes the transport ready with
@@ -108,15 +99,14 @@ pub struct TreePushOptions {
 /// 2. It walks and hashes the tree with [`TreeModel::scan`], with
 ///    `entry_filter` and `hash_jobs`.
 /// 3. It starts the ssh client, or sends the first HTTP request. It opens the
-///    session with the target refs in one `Hello`.
-/// 4. It builds the commit and signs it. It offers each object of the tree
-///    and the commit in one round of `Have`. It sends the objects that the
-///    server lacks, with the detached metadata of the commit, and then it
-///    sends `Commit`.
+///    session with the branch and the tags in one `Hello`.
+/// 4. It offers each object of the tree in one round of `Have`. It sends the
+///    objects that the server lacks, and then it sends `Commit` with the
+///    server commit.
 ///
 /// A refusal of the options, a walk error, and a hash error start no ssh
 /// client, send no request, and open no session. [`push_tree_over_stream`]
-/// gives the rules of the commit and of the session.
+/// gives the rules of the server commit and of the session.
 ///
 /// [`PushStats::elapsed`](crate::session::PushStats::elapsed) of the outcome
 /// covers the session alone, from the open of the session. It excludes the
@@ -151,13 +141,13 @@ pub async fn push_tree(
     push.scan_and_run(transport, root, scan).await
 }
 
-/// Pushes the directory `root` as one commit over a prepared transport.
+/// Pushes the directory `root` as one server commit over a prepared
+/// transport.
 ///
 /// `session` is a transport that [`PushSession::prepare`] made ready. The
-/// server sets the target refs to the commit in one transaction. The push is
-/// that of [`push_tree`] with the transport checks done first, so a caller
-/// can do them before the work that builds `opts`. For example, the caller
-/// can start a signer after the checks.
+/// push is that of [`push_tree`] with the transport checks done first, so a
+/// caller can do them before the work that builds `opts`. For example, the
+/// caller can read a large body file after the checks.
 ///
 /// The push checks `opts` as [`push_tree`] does, then scans the tree, and then
 /// opens `session`. A refusal of the options, a walk error, and a hash error
@@ -187,88 +177,55 @@ pub async fn push_tree_prepared(
     push.scan_and_run(session, root, scan).await
 }
 
-/// Pushes the directory `root` as one commit over a pair of byte streams.
+/// Pushes the directory `root` as one server commit over a pair of byte
+/// streams.
 ///
-/// `input` comes from the server, and `output` goes to it. The server sets the
-/// target refs to the commit in one transaction. The push scans the tree
-/// before it writes the first byte to `output`.
+/// `input` comes from the server, and `output` goes to it. The push scans
+/// the tree before it writes the first byte to `output`.
 ///
 /// # Refusals
 ///
 /// Before the scan, the push refuses these values of `opts`:
 ///
-/// - empty `refs`, and a ref named twice
-/// - a ref that holds `:`, and a ref that fails the ref-name rule of
-///   [`is_ref_name`](ostrya_core::is_ref_name), for example a ref that holds
-///   `^`, which a revision reads as the parent of a commit
-/// - a ref of 64 lowercase hex characters, which a revision reads as a
-///   commit checksum
+/// - a branch or a tag that holds `:`, that fails the ref-name rule of
+///   [`is_ref_name`](ostrya_core::is_ref_name), for example a name that holds
+///   `^`, or that is 64 lowercase hex characters, which a revision reads as
+///   a commit checksum
+/// - a tag that is the branch, and a tag named twice
+/// - a bound name that holds `:` or that fails the ref-name rule
+/// - a `collection` that fails
+///   [`is_collection_id`](ostrya_core::is_collection_id) or is longer than
+///   255 bytes
 /// - a DEFLATE level outside 1 through 9
-/// - a malformed `SOURCE_DATE_EPOCH` if `timestamp` is not set, and a system
-///   clock before the Unix epoch if neither is set
-/// - an empty key in `metadata` or in `detached_metadata`, entries that do not
-///   serialize as an `a{sv}` dict, and entries whose serialized dict is more
-///   than [`MAX_METADATA_SIZE`]
-/// - a `subject`, a `body`, and `metadata` whose commit object is more than
-///   `MAX_METADATA_SIZE` without the bindings and without a parent of
-///   [`ParentPolicy::CurrentTip`]
+/// - an empty key in `metadata`, the key `ostree.ref-binding` or
+///   `ostree.collection-binding`, which the server writes, and a value that
+///   is not a variant
 ///
-/// The bindings and a parent from the server only add bytes to the commit
-/// object. As a result, the size check before the scan never refuses a commit
-/// object that the check after `HelloReply` accepts.
+/// The scan refuses `hash_jobs` of `Some(0)` before the walk starts. If the
+/// push refuses a value, or if the walk or the hash pass fails, the push
+/// writes nothing.
 ///
-/// The push reads the timestamp before the scan. The scan refuses `hash_jobs`
-/// of `Some(0)` before the walk starts. If the push refuses a value, or if
-/// the walk or the hash pass fails, the push writes nothing.
+/// # Server commit
 ///
-/// # Commit
+/// The session opens with the branch and then each tag. The push sends
+/// [`collection`](TreePushOptions::collection) in `Hello`. After `HelloReply`,
+/// the push refuses a tag that the server holds with
+/// [`Error::RefMismatch`]. Then it runs
+/// [`PushSession::check_server_commit`]: a commit must hold each metadata
+/// value, and the `Commit` frame of the server commit and the longest
+/// `CommitReply` must fit in the `max-frame` of the server. Each refusal
+/// comes before the push offers an object.
 ///
-/// After `HelloReply`, the push builds the commit object:
+/// The push offers each object of the tree in one round of `Have`, and sends
+/// the objects that the server lacks. It sends no commit object and no
+/// detached metadata. Then it sends the server commit with the root dirtree
+/// and the root dirmeta of the tree, the subject, the body, the entries of
+/// `metadata`, the timestamp, the tags, the bound names, and `orphan`.
 ///
-/// - The parent comes from [`ParentPolicy`].
-/// - The metadata dict holds the entries of `metadata`, in order. Then it
-///   holds `ostree.ref-binding` with the target refs sorted. Then it holds
-///   `ostree.collection-binding` with the collection id of the server, if the
-///   server has one.
-/// - With `no_bindings`, the dict holds the entries of `metadata` alone.
-///
-/// The dict follows the rule of [`ostrya_core::commit_metadata`]. As a result,
-/// the commit checksum equals the checksum of the commit that
-/// `Transaction::write_commit` of `ostrya` writes over the same tree with the
-/// same inputs.
-///
-/// # Ref states
-///
-/// Without `force`, each target ref must have the state of the first target
-/// ref on the server: all absent, or all at one commit. If the target refs
-/// are in mixed states, the push offers no object. The message of the error
-/// names each ref and its commit.
-///
-/// # Signatures
-///
-/// The push signs the serialized commit with each signer of `signers`, in
-/// order, while the session is open. It checks the key of each signer before
-/// the first signer signs.
-///
-/// The detached metadata dict holds the entries of `detached_metadata`, in
-/// order. Then it holds each signature under the
-/// [`metadata_key`](ostrya_sign::Signer::metadata_key) of its signer. If the
-/// dict is empty, the push sends no detached metadata.
-///
-/// A signature goes into the `aay` array of its key, after the blobs that the
-/// array already holds. This is also the rule if the array is an entry of
-/// `detached_metadata`.
-///
-/// # Objects and refs
-///
-/// The push offers each object of the tree and the commit in one round of
-/// `Have`. It sends the objects that the server lacks. It sends the detached
-/// metadata of the commit also if the server holds the commit.
-///
-/// Each ref update expects the state that `HelloReply` reported for its ref:
-/// the commit of the ref, or an absent ref. With `force`, each update expects
-/// any state, and `Commit` carries `force`. [`PushOutcome::commit`] holds the
-/// commit.
+/// The server reads the tip of the branch and writes the commit with that tip
+/// as its parent, the bindings of its namespace, and the keys of its own
+/// signing rule. [`PushOutcome::commit`] holds the commit that the server
+/// wrote.
 ///
 /// The server verifies each object. If the bytes of a file change after the
 /// hash pass, the server sends an `Error` message and no ref changes.
@@ -285,35 +242,36 @@ pub async fn push_tree_prepared(
 ///
 /// - [`Error::InvalidInput`] for each value of [Refusals](#refusals), and if
 ///   `hash_jobs` is `Some(0)`.
-/// - [`Error::InvalidInput`] if the target refs are in mixed states on the
-///   server without `force`.
-/// - [`Error::InvalidInput`] if the commit object or the detached metadata
-///   dict is more than [`MAX_METADATA_SIZE`].
 /// - [`Error::Walk`] if the walk or the hash pass fails. [`TreeModel::scan`]
 ///   gives the `io::ErrorKind` of each case.
+/// - [`Error::RefMismatch`] if `HelloReply` reports a commit for a tag.
+/// - [`Error::InvalidInput`] if a commit cannot hold a value of `metadata`.
+///   In a commit, a value can hold two levels of containers fewer than a
+///   variant.
+/// - [`Error::LimitExceeded`] if the `Commit` frame of the server commit, or
+///   the longest `CommitReply` to it, is over the `max-frame` of the
+///   server.
 /// - [`Error::Source`] if the send pass cannot open or read a file of the
 ///   tree. The error of a failed open is the [`Error::Walk`] of that file.
-/// - [`Error::Sign`] if a signer fails, or if `detached_metadata` holds a
-///   value that is not an `aay` under the key of a signer.
 /// - [`Error::Protocol`] or [`Error::LimitExceeded`] if the codec refuses a
 ///   frame of the session.
 /// - [`Error::Io`] for an I/O error of `input` or `output`.
 /// - [`Error::CommitOutcomeUnknown`] if the session ends after `Commit` with
 ///   no reply that the client can read.
 /// - An `Error` message from the server, as the [`Error`] variant of its code.
-///   An example is [`Error::RefMismatch`] if a target ref is not in the state
-///   that `HelloReply` reported.
+///   An example is [`Error::RefDenied`] if the client has no `c` on the
+///   branch, or if the server runs hooks, which take no server commit.
 ///
 /// [`Error`]: crate::Error
 /// [`Error::InvalidInput`]: crate::Error::InvalidInput
 /// [`Error::Walk`]: crate::Error::Walk
-/// [`Error::Source`]: crate::Error::Source
-/// [`Error::Sign`]: crate::Error::Sign
-/// [`Error::Protocol`]: crate::Error::Protocol
+/// [`Error::RefMismatch`]: crate::Error::RefMismatch
 /// [`Error::LimitExceeded`]: crate::Error::LimitExceeded
+/// [`Error::Source`]: crate::Error::Source
+/// [`Error::Protocol`]: crate::Error::Protocol
 /// [`Error::Io`]: crate::Error::Io
 /// [`Error::CommitOutcomeUnknown`]: crate::Error::CommitOutcomeUnknown
-/// [`Error::RefMismatch`]: crate::Error::RefMismatch
+/// [`Error::RefDenied`]: crate::Error::RefDenied
 pub async fn push_tree_over_stream<R, W>(
     input: R,
     output: W,
@@ -333,68 +291,65 @@ where
 
 /// The checked options of a tree push, without the options of the scan.
 struct Prepared {
+    /// The refs of `Hello`: the branch, then each tag.
     refs: Vec<String>,
-    parent: ParentPolicy,
-    subject: String,
-    body: String,
-    /// The entries of the metadata dict, checked.
-    metadata: Vec<Value>,
-    /// The entries of the detached metadata dict, checked.
-    detached: Vec<Value>,
-    timestamp: u64,
-    no_bindings: bool,
-    signers: Vec<Box<dyn ostrya_sign::Signer>>,
+    /// The server commit, with no root checksums before the scan.
+    commit: ServerCommit,
+    collection: Option<String>,
     compression: Compression,
-    force: bool,
     progress: Option<PushProgress>,
 }
 
 impl Prepared {
-    /// Checks `opts` and resolves the timestamp. Returns the options of the
-    /// scan as a separate value, because the entry filter is not `Sync`.
+    /// Checks `opts`. Returns the options of the scan as a separate value,
+    /// because the entry filter is not `Sync`.
     fn new(opts: TreePushOptions) -> Result<(ScanOptions, Prepared)> {
         let TreePushOptions {
-            refs,
-            parent,
+            onto,
+            tags,
+            bind_refs,
+            orphan,
+            collection,
             subject,
             body,
             metadata,
-            detached_metadata,
             timestamp,
-            no_bindings,
-            signers,
             compression,
             entry_filter,
             hash_jobs,
-            force,
             progress,
         } = opts;
-        check_refs(&refs)?;
+        check_names(&onto, &tags, &bind_refs)?;
+        if let Some(id) = &collection {
+            check_collection(id)?;
+        }
         deflate_level(compression)?;
-        let timestamp = ostrya_core::commit_timestamp(timestamp)
-            .map_err(|e| invalid(format!("the commit timestamp: {e}")))?;
-        let (metadata, metadata_len) = entry_dict(metadata, "metadata")?;
-        let (detached, _) = entry_dict(detached_metadata, "detached metadata")?;
-        let subject = subject.unwrap_or_default();
-        let body = body.unwrap_or_default();
-        let floor = commit_size_floor(metadata_len, &subject, &body, parent);
-        check_commit_floor(floor, MAX_METADATA_SIZE)?;
+        let metadata = metadata_entries(metadata)?;
         let scan = ScanOptions {
             entry_filter,
             hash_jobs,
         };
+        let refs = std::iter::once(onto.clone())
+            .chain(tags.iter().cloned())
+            .collect();
+        // The scan gives the root checksums.
+        let unset = Checksum::from_bytes([0; 32]);
         let push = Prepared {
             refs,
-            parent,
-            subject,
-            body,
-            metadata,
-            detached,
-            timestamp,
-            no_bindings,
-            signers,
+            commit: ServerCommit {
+                branch: onto,
+                tags,
+                bind_refs,
+                root_dirtree: unset,
+                root_dirmeta: unset,
+                subject: subject.unwrap_or_default(),
+                body: body.unwrap_or_default(),
+                metadata,
+                timestamp,
+                orphan,
+            },
+            collection,
             compression,
-            force,
             progress,
         };
         Ok((scan, push))
@@ -415,11 +370,14 @@ impl Prepared {
     ) -> Result<PushOutcome> {
         let model = self.scan(root, scan).await?;
         let session = transport.open(&self.refs, self.session_options()).await?;
-        self.run(session, model).await
+        // The future of the run is large. The box keeps it out of the future
+        // of the push.
+        Box::pin(self.run(session, model)).await
     }
 
     fn session_options(&self) -> SessionOptions {
         SessionOptions {
+            collection: self.collection.clone(),
             progress: self.progress.clone(),
             ..SessionOptions::default()
         }
@@ -428,12 +386,13 @@ impl Prepared {
     /// Runs the push over `session`. A failure before `Commit` ends the
     /// session, with `Abort` if the stream is still usable.
     async fn run(self, session: PushSession, model: TreeModel) -> Result<PushOutcome> {
-        let force = self.force;
-        match self.upload(&session, model).await {
-            Ok((commit, updates)) => {
-                let mut outcome = session.commit(&updates, force).await?;
-                outcome.commit = Some(commit);
-                Ok(outcome)
+        let mut commit = self.commit;
+        commit.root_dirtree = model.root_dirtree();
+        commit.root_dirmeta = model.root_dirmeta();
+        match upload(&session, &model, &commit, self.compression).await {
+            Ok(()) => {
+                drop(model);
+                session.server_commit(commit).await
             }
             Err(e) => {
                 let _ = session.abort().await;
@@ -441,76 +400,130 @@ impl Prepared {
             }
         }
     }
+}
 
-    /// Checks the ref states, builds the commit, runs the one `Have` round,
-    /// and sends the objects. Returns the commit and the ref updates of
-    /// `Commit`.
-    async fn upload(
-        self,
-        session: &PushSession,
-        mut model: TreeModel,
-    ) -> Result<(Checksum, Vec<RefUpdate>)> {
-        let server = session.server();
-        if !self.force {
-            check_ref_states(server, &self.refs)?;
-        }
-        let (commit, bytes) = build_commit(CommitInputs {
-            parent: resolve_parent(self.parent, server, &self.refs),
-            subject: self.subject,
-            body: self.body,
-            timestamp: self.timestamp,
-            metadata: self.metadata,
-            refs: &self.refs,
-            no_bindings: self.no_bindings,
-            collection_id: server.binding_collection(),
-            root_dirtree: model.root_dirtree(),
-            root_dirmeta: model.root_dirmeta(),
-        })?;
-        let detached = detached_dict(self.detached, &self.signers, &bytes).await?;
-        model.set_commit(commit, bytes, detached);
-        let names = model.objects(&commit).await?;
-        let missing = session.missing(&names).await?;
-        drop(names);
-        session
-            .send(&model, &missing, &[commit], self.compression)
-            .await?;
-        Ok((commit, ref_updates(server, &self.refs, commit, self.force)))
+/// Runs the checks after `HelloReply`, the one `Have` round, and the upload
+/// of the objects of `model` that the server lacks.
+async fn upload(
+    session: &PushSession,
+    model: &TreeModel,
+    commit: &ServerCommit,
+    compression: Compression,
+) -> Result<()> {
+    check_tags_absent(session.server(), &commit.tags)?;
+    session.check_server_commit(commit)?;
+    let names = model.object_names();
+    let missing = session.missing(&names).await?;
+    drop(names);
+    session.send(model, &missing, &[], compression).await
+}
+
+/// Refuses a tag that `server` reports at a commit, with
+/// [`Error::RefMismatch`]. The server refuses it at `Commit` too.
+fn check_tags_absent(server: &ServerInfo, tags: &[String]) -> Result<()> {
+    match tags
+        .iter()
+        .find_map(|tag| server.tip(tag).map(|tip| (tag, tip)))
+    {
+        Some((tag, current)) => Err(Error::RefMismatch {
+            message: format!("ref '{tag}' is at {current}"),
+            name: tag.clone(),
+            current: Some(current),
+        }),
+        None => Ok(()),
     }
 }
 
-/// Refuses empty `refs`, a ref that holds `:`, a ref that fails the ref-name
-/// rule (which includes a ref that holds `^`), a ref of 64 lowercase hex
-/// characters, and a ref named twice.
-fn check_refs(refs: &[String]) -> Result<()> {
-    if refs.is_empty() {
-        return Err(invalid("a tree push needs at least one target ref"));
+/// Refuses a name of a ref that the server commit writes: a name that holds
+/// `:`, a name that fails the ref-name rule (which includes a name that holds
+/// `^`), and a name of 64 lowercase hex characters. `what` names the ref in
+/// the message.
+fn check_ref(name: &str, what: &str) -> Result<()> {
+    if name.contains(':') {
+        return Err(invalid(format!(
+            "{what} '{name}' holds ':'; a tree push writes refs below refs/heads"
+        )));
     }
+    if !ostrya_core::is_ref_name(name) {
+        return Err(invalid(format!("{what} '{name}' is not a valid ref name")));
+    }
+    if ostrya_core::is_checksum_shaped(name) {
+        return Err(invalid(format!(
+            "{what} '{name}' is 64 hex characters, which a revision reads as a commit checksum"
+        )));
+    }
+    Ok(())
+}
+
+/// Refuses a bad branch, a bad tag, a tag that is the branch, a tag named
+/// twice, and a bound name that holds `:` or fails the ref-name rule.
+fn check_names(onto: &str, tags: &[String], bind_refs: &[String]) -> Result<()> {
+    check_ref(onto, "branch")?;
     let mut seen = HashSet::new();
-    for name in refs {
-        if name.contains(':') {
+    for tag in tags {
+        check_ref(tag, "tag")?;
+        if tag == onto {
+            return Err(invalid(format!("the tag '{tag}' is also the branch")));
+        }
+        if !seen.insert(tag.as_str()) {
+            return Err(invalid(format!("the tag '{tag}' is named twice")));
+        }
+    }
+    for name in bind_refs {
+        if name.contains(':') || !ostrya_core::is_ref_name(name) {
             return Err(invalid(format!(
-                "ref '{name}' holds ':'; a tree push sets refs below refs/heads"
+                "bound name '{name}' is not a valid ref name"
             )));
-        }
-        if !ostrya_core::is_ref_name(name) {
-            return Err(invalid(format!("ref '{name}' is not a valid ref name")));
-        }
-        if ostrya_core::is_checksum_shaped(name) {
-            return Err(invalid(format!(
-                "ref '{name}' is 64 hex characters, which a revision reads as a commit checksum"
-            )));
-        }
-        if !seen.insert(name.as_str()) {
-            return Err(invalid(format!("ref '{name}' is named twice")));
         }
     }
     Ok(())
 }
 
+/// Refuses a collection id that fails the collection-id rule or is longer
+/// than [`MAX_COLLECTION_ID_LEN`] bytes.
+fn check_collection(id: &str) -> Result<()> {
+    if id.len() > MAX_COLLECTION_ID_LEN {
+        return Err(invalid(format!(
+            "the collection id of {} bytes is longer than {MAX_COLLECTION_ID_LEN} bytes",
+            id.len()
+        )));
+    }
+    if !ostrya_core::is_collection_id(id) {
+        return Err(invalid(format!("invalid collection id '{id}'")));
+    }
+    Ok(())
+}
+
+/// Returns the metadata entries of a server commit: each key with the bytes of
+/// its value as a `v` in normal form, in order.
+///
+/// An empty key, a binding key, and a value that is not a variant are
+/// [`Error::InvalidInput`].
+fn metadata_entries(entries: Vec<(String, Value)>) -> Result<Vec<(String, Vec<u8>)>> {
+    entries
+        .into_iter()
+        .map(|(key, value)| {
+            if key.is_empty() {
+                return Err(invalid("the metadata holds an empty key"));
+            }
+            if BINDING_KEYS.contains(&key.as_str()) {
+                return Err(invalid(format!(
+                    "the metadata holds the key '{key}', which the server writes"
+                )));
+            }
+            let bytes = ostrya_core::to_bytes(&Type::Variant, &value).map_err(|e| {
+                invalid(format!(
+                    "the metadata value under '{key}' is not a variant: {e}"
+                ))
+            })?;
+            Ok((key, bytes))
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::Error;
 
     fn refused(opts: TreePushOptions) -> String {
         match Prepared::new(opts) {
@@ -520,39 +533,103 @@ mod tests {
         }
     }
 
-    fn with_refs(refs: &[&str]) -> TreePushOptions {
+    fn onto(branch: &str) -> TreePushOptions {
         TreePushOptions {
-            refs: refs.iter().map(|s| s.to_string()).collect(),
+            onto: branch.into(),
             timestamp: Some(1),
             ..Default::default()
         }
     }
 
+    fn strings(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    const BAD_NAMES: [&str; 16] = [
+        "", "main^", "a^b", "^", "x/y^", "/a", "a/", "a//b", ".", "..", "a/../b", "a\0b", "a b",
+        "a*", "-a", "a/.b",
+    ];
+
     #[test]
-    fn the_target_refs_are_checked_before_the_scan() {
-        assert!(refused(with_refs(&[])).contains("at least one"));
-        assert!(refused(with_refs(&["a", "b", "a"])).contains("twice"));
-        assert!(refused(with_refs(&["origin:main"])).contains("':'"));
-        assert!(refused(with_refs(&["main", "o:a:b"])).contains("':'"));
-        for bad in [
-            "", "main^", "a^b", "^", "x/y^", "/a", "a/", "a//b", ".", "..", "a/../b", "a\0b",
-            "a b", "a*", "-a", "a/.b",
-        ] {
-            assert!(
-                refused(with_refs(&[bad])).contains("not a valid ref name"),
-                "{bad:?}"
-            );
-        }
+    fn the_branch_and_the_tags_are_checked_before_the_scan() {
         let hex = "ab".repeat(32);
-        assert!(refused(with_refs(&["main", &hex])).contains("commit checksum"));
-        Prepared::new(with_refs(&[
-            "main",
-            "a/b",
-            "x.y",
-            &hex.to_uppercase(),
-            &hex[1..],
-        ]))
+        for (what, make) in [
+            (
+                "branch",
+                (|name: &str| onto(name)) as fn(&str) -> TreePushOptions,
+            ),
+            ("tag", |name: &str| TreePushOptions {
+                tags: strings(&[name]),
+                ..onto("main")
+            }),
+        ] {
+            assert!(refused(make("origin:main")).contains("':'"), "{what}");
+            for bad in BAD_NAMES {
+                let m = refused(make(bad));
+                assert!(m.contains("not a valid ref name"), "{what} {bad:?}: {m}");
+                assert!(m.starts_with(what), "{what} {bad:?}: {m}");
+            }
+            assert!(refused(make(&hex)).contains("commit checksum"), "{what}");
+        }
+        let m = refused(TreePushOptions {
+            tags: strings(&["t", "main"]),
+            ..onto("main")
+        });
+        assert!(m.contains("'main' is also the branch"), "{m}");
+        let m = refused(TreePushOptions {
+            tags: strings(&["t", "u", "t"]),
+            ..onto("main")
+        });
+        assert!(m.contains("'t' is named twice"), "{m}");
+        let (_, push) = Prepared::new(TreePushOptions {
+            tags: strings(&["a/b", "x.y", &hex.to_uppercase(), &hex[1..]]),
+            ..onto("main")
+        })
         .unwrap();
+        assert_eq!(
+            push.refs,
+            ["main", "a/b", "x.y", &hex.to_uppercase(), &hex[1..]]
+        );
+    }
+
+    #[test]
+    fn a_bound_name_passes_the_ref_name_rule_with_no_colon() {
+        for bad in BAD_NAMES.iter().copied().chain(["o:main"]) {
+            let m = refused(TreePushOptions {
+                bind_refs: strings(&[bad]),
+                ..onto("main")
+            });
+            assert!(m.contains("bound name"), "{bad:?}: {m}");
+        }
+        // A bound name can repeat, can be the branch, and can be 64 hex
+        // characters, because it gets no ref.
+        let hex = "ab".repeat(32);
+        let (_, push) = Prepared::new(TreePushOptions {
+            bind_refs: strings(&["x", "x", "main", &hex]),
+            ..onto("main")
+        })
+        .unwrap();
+        assert_eq!(push.commit.bind_refs, ["x", "x", "main", hex.as_str()]);
+        assert_eq!(push.refs, ["main"]);
+    }
+
+    #[test]
+    fn the_collection_is_checked_before_the_scan() {
+        let longest = format!("org.{}", "a".repeat(251));
+        let over = format!("org.{}", "a".repeat(252));
+        for (id, needle) in [("no-dot", "invalid collection id"), (&*over, "256 bytes")] {
+            let m = refused(TreePushOptions {
+                collection: Some(id.into()),
+                ..onto("main")
+            });
+            assert!(m.contains(needle), "{m}");
+        }
+        let (_, push) = Prepared::new(TreePushOptions {
+            collection: Some(longest.clone()),
+            ..onto("main")
+        })
+        .unwrap();
+        assert_eq!(push.session_options().collection, Some(longest));
     }
 
     #[test]
@@ -560,26 +637,100 @@ mod tests {
         for level in [0, 10] {
             let m = refused(TreePushOptions {
                 compression: Compression::Deflate { level },
-                ..with_refs(&["main"])
+                ..onto("main")
             });
             assert!(m.contains("compression level"), "{m}");
         }
         let variant = Value::variant(ostrya_core::Type::Str, Value::Str("v".into()));
         let m = refused(TreePushOptions {
             metadata: vec![(String::new(), variant.clone())],
-            ..with_refs(&["main"])
+            ..onto("main")
         });
         assert!(m.contains("metadata holds an empty key"), "{m}");
-        let m = refused(TreePushOptions {
-            detached_metadata: vec![(String::new(), variant)],
-            ..with_refs(&["main"])
-        });
-        assert!(m.contains("detached metadata holds an empty key"), "{m}");
+        for key in BINDING_KEYS {
+            let m = refused(TreePushOptions {
+                metadata: vec![("k".into(), variant.clone()), (key.into(), variant.clone())],
+                ..onto("main")
+            });
+            assert!(
+                m.contains(&format!("'{key}', which the server writes")),
+                "{m}"
+            );
+        }
         let m = refused(TreePushOptions {
             metadata: vec![("k".into(), Value::Str("bare".into()))],
-            ..with_refs(&["main"])
+            ..onto("main")
         });
-        assert!(m.contains("not an a{sv} dict"), "{m}");
+        assert!(m.contains("not a variant"), "{m}");
+    }
+
+    #[test]
+    fn the_server_commit_carries_the_options() {
+        let string = |s: &str| Value::variant(ostrya_core::Type::Str, Value::Str(s.into()));
+        let (_, push) = Prepared::new(TreePushOptions {
+            tags: strings(&["t"]),
+            bind_refs: strings(&["b"]),
+            orphan: true,
+            subject: Some("s".into()),
+            body: Some("m".into()),
+            metadata: vec![("z".into(), string("1")), ("a".into(), string("2"))],
+            timestamp: Some(42),
+            ..onto("main")
+        })
+        .unwrap();
+        let sc = push.commit;
+        assert_eq!(sc.branch, "main");
+        assert_eq!(sc.tags, ["t"]);
+        assert_eq!(sc.bind_refs, ["b"]);
+        assert!(sc.orphan);
+        assert_eq!((sc.subject.as_str(), sc.body.as_str()), ("s", "m"));
+        let v = |value: &Value| ostrya_core::to_bytes(&Type::Variant, value).unwrap();
+        assert_eq!(
+            sc.metadata,
+            [
+                ("z".to_owned(), v(&string("1"))),
+                ("a".to_owned(), v(&string("2")))
+            ]
+        );
+        assert_eq!(sc.timestamp, Some(42));
+        let (_, push) = Prepared::new(TreePushOptions {
+            timestamp: None,
+            ..onto("main")
+        })
+        .unwrap();
+        assert_eq!(push.commit.timestamp, None);
+        assert_eq!(push.commit.subject, "");
+    }
+
+    #[test]
+    fn a_tag_that_the_server_holds_is_ref_mismatch() {
+        use crate::proto::{Encoding, RefState};
+        let tip = Checksum::from_bytes([5; 32]);
+        let server = ServerInfo {
+            version: 1,
+            mode: "archive".into(),
+            collection_id: None,
+            collection: None,
+            max_frame: 1 << 20,
+            max_have: 16_384,
+            encodings: vec![Encoding::Raw],
+            parallel_uploads: 1,
+            refs: [("main", Some(tip)), ("a", None), ("b", Some(tip))]
+                .into_iter()
+                .map(|(name, commit)| RefState {
+                    name: name.into(),
+                    commit,
+                })
+                .collect(),
+        };
+        check_tags_absent(&server, &strings(&["a"])).unwrap();
+        match check_tags_absent(&server, &strings(&["a", "b"])) {
+            Err(Error::RefMismatch { name, current, .. }) => {
+                assert_eq!(name, "b");
+                assert_eq!(current, Some(tip));
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[test]
@@ -614,15 +765,5 @@ mod tests {
         assert_eq!(seen.len(), 3, "{seen:?}");
         assert!(seen.iter().all(|p| *p == PushPhase::Scanning), "{seen:?}");
         assert_eq!(progress.snapshot().phase, PushPhase::Hashing);
-    }
-
-    #[test]
-    fn the_given_timestamp_wins() {
-        let (_, push) = Prepared::new(TreePushOptions {
-            timestamp: Some(42),
-            ..with_refs(&["main"])
-        })
-        .unwrap();
-        assert_eq!(push.timestamp, 42);
     }
 }

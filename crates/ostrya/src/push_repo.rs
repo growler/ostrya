@@ -7,6 +7,10 @@
 //! [`Repo::push`](crate::Repo::push) and
 //! [`Repo::push_over_stream`](crate::Repo::push_over_stream) push the commits
 //! of a set of refspecs with the options of [`RepoPushOptions`].
+//! [`Repo::push_onto`](crate::Repo::push_onto) and
+//! [`Repo::push_onto_over_stream`](crate::Repo::push_onto_over_stream) push
+//! the tree of a local commit, and the server commits it onto a branch with
+//! the options of [`PushOntoOptions`].
 //! [`Repo::export_stream`](crate::Repo::export_stream) writes the commits of a
 //! set of ref updates as one one-way stream, with the options of
 //! [`ExportStreamOptions`]. The private submodules read the refspecs of a push
@@ -15,6 +19,7 @@
 
 mod export;
 mod negotiate;
+mod onto;
 mod refspec;
 mod source;
 #[cfg(test)]
@@ -22,6 +27,7 @@ mod test_repo;
 
 pub use self::export::ExportStreamOptions;
 pub use self::negotiate::RepoPushOptions;
+pub use self::onto::PushOntoOptions;
 
 use crate::error::Error;
 

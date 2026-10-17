@@ -409,11 +409,16 @@ enum Command {
     /// collection. The server writes the refs of a collection other than its
     /// own collection id under `refs/mirrors/ID/`.
     ///
+    /// With --onto, the push sends the tree of one local commit, and the
+    /// server makes a new commit over it on the branch BRANCH. The server
+    /// picks the parent, writes the bindings, and signs the commit.
+    ///
     /// On success, standard output carries one line for each ref, in the order
     /// of the refspecs and then of the tags. A line holds the DST name, the
     /// old state, and the new state. The old state is a full commit checksum,
     /// `(new)`, or `(absent)`. The new state is a full commit checksum,
-    /// `(unchanged)`, or `(deleted)`.
+    /// `(unchanged)`, or `(deleted)`. With --onto, standard output carries the
+    /// checksum of the new commit alone.
     ///
     /// Under --verbose, one statistics line goes to standard error. If
     /// standard error is a terminal and `TERM` is set and is not `dumb`,
@@ -422,17 +427,28 @@ enum Command {
     /// standard output, and exits 1.
     #[cfg(feature = "push")]
     Push(PushArgs),
-    /// Push a directory as one commit over ssh or HTTP and set the remote refs.
+    /// Push a directory over ssh or HTTP, and let the server commit it.
     ///
-    /// The command walks DIR, builds one commit over it, and sends the objects
-    /// that the server does not have. The server sets each -b ref to the
-    /// commit in one transaction. The commit holds no extended attributes. The
-    /// option names and the value forms are those of `commit`.
+    /// The command walks DIR and sends the objects of its tree that the server
+    /// does not have. The server then makes one commit over the tree, moves
+    /// the branch of --onto to it, and creates each --tag at it, in one
+    /// transaction. The parent of the commit is the commit of the branch on
+    /// the server. The server writes the bindings of its namespace and signs
+    /// the commit with the keys of the client group. The tree holds no
+    /// extended attributes. The option names and the value forms are those
+    /// of `commit`.
+    ///
+    /// The client group needs `c` on the branch. A server that runs receive
+    /// hooks takes no server commit and answers ref-denied. The push sends
+    /// the server commit in one frame, which an ostrya server limits to
+    /// 1 MiB. The reply names the branch and each --tag, and must also fit
+    /// in one frame. In a commit, an --add-metadata value can hold two levels
+    /// of containers fewer than a variant. The push checks the two frames
+    /// and the depth of each value before it sends an object.
     ///
     /// The command makes its checks before the ssh client starts or the first
-    /// HTTP request goes. It resolves REMOTE before it reads the signing keys
-    /// and --body-file. A refusal of the remote thus starts no gpg and reads
-    /// no body file.
+    /// HTTP request goes. It resolves REMOTE before it reads --body-file. A
+    /// refusal of the remote thus reads no body file.
     ///
     /// On success, standard output carries the commit checksum alone. Under
     /// --verbose, one statistics line goes to standard error. On a terminal,
@@ -2987,6 +3003,10 @@ struct PushArgs {
     /// to the refs of a collection. It refuses an ID or a binding that fails
     /// the collection-id rule or is longer than 255 bytes before it starts
     /// the transport.
+    ///
+    /// With --onto, ID alone names the namespace, and the bindings of the
+    /// local commit do not apply. Without ID, the server commit goes to the
+    /// local refs of the server.
     #[arg(long, value_name = "ID")]
     collection: Option<String>,
     /// Create the ref NAME on the server at the source commit.
@@ -2999,8 +3019,64 @@ struct PushArgs {
     /// NAME passes the ref-name rule, has no `:`, is not 64 lowercase hex
     /// characters, and is not a DST. The client group of the push needs `t`
     /// or `w` on NAME.
+    ///
+    /// With --onto, the server creates NAME at the new commit, and the
+    /// `ostree.ref-binding` of that commit holds NAME. NAME is not BRANCH. A
+    /// tag that exists also gets ref-mismatch before the push sends an
+    /// object.
     #[arg(long = "tag", value_name = "NAME")]
     tags: Vec<String>,
+    /// Ask the server to commit the tree of REF onto the branch BRANCH.
+    ///
+    /// The push sends the objects of the tree of the local commit that the
+    /// server does not have. The server then makes a new commit over the
+    /// tree, moves BRANCH to it, and creates each --tag at it, in one
+    /// transaction. The parent of the new commit is the commit of BRANCH on
+    /// the server. The new commit takes the subject, the body, the metadata,
+    /// and the timestamp of the local commit. The push leaves out the local
+    /// `ostree.ref-binding` and `ostree.collection-binding`, and the server
+    /// writes the bindings of its namespace: BRANCH, each --tag, and each
+    /// --bind-ref.
+    ///
+    /// The push sends no parent, no commit object, and no detached metadata,
+    /// so no signature of the local commit reaches the server. The server
+    /// signs the new commit with the keys of its own client group.
+    ///
+    /// The client group needs `c` on BRANCH. A server that runs receive hooks
+    /// takes no server commit and answers ref-denied. The push sends the
+    /// server commit in one frame, which an ostrya server limits to 1 MiB.
+    /// The reply names BRANCH and each --tag, and must also fit in one
+    /// frame. The push checks the two frames against the limit of the
+    /// server before it sends an object.
+    ///
+    /// BRANCH passes the ref-name rule, has no `:`, and is not 64 lowercase
+    /// hex characters. With --onto, the command takes exactly one REF, a
+    /// revision of this repository, and does not split it at `:`. The local
+    /// commit must not be partial, and must have no related objects. --onto
+    /// conflicts with --depth and --force.
+    #[arg(long, value_name = "BRANCH", conflicts_with_all = ["depth", "force"])]
+    onto: Option<String>,
+    /// Bind the commit of --onto to NAME, and create no ref.
+    ///
+    /// The option can occur more than once. The `ostree.ref-binding` of the
+    /// new commit holds each NAME. NAME passes the ref-name rule and has no
+    /// `:`. The option needs --onto.
+    #[arg(long = "bind-ref", value_name = "NAME", requires = "onto")]
+    bind_refs: Vec<String>,
+    /// Make the commit of --onto with no parent.
+    ///
+    /// If BRANCH exists on the server, the client group needs `c` and `d` on
+    /// it, else the server answers non-fast-forward. The option needs --onto.
+    #[arg(long, requires = "onto")]
+    orphan: bool,
+    /// Override the timestamp of the commit of --onto.
+    ///
+    /// The value is `@SECONDS` since the Unix epoch, or a date and time with
+    /// a UTC offset (`2020-01-02T03:04:05Z`). Without this option, the new
+    /// commit takes the timestamp of the local commit. The option needs
+    /// --onto.
+    #[arg(long, value_name = "TIMESTAMP", requires = "onto")]
+    timestamp: Option<String>,
     /// Send the content objects deflated at LEVEL, 1 to 9.
     ///
     /// The value needs the `=` form, and --compress alone gives level 6.
@@ -3045,6 +3121,8 @@ struct PushArgs {
     /// includes a DST with `^`. It also refuses a DST of 64 lowercase hex
     /// characters after a SRC, because a revision reads such a name as a
     /// commit checksum. A delete of such a DST passes.
+    ///
+    /// With --onto, the operand is one REF, a revision of this repository.
     refspecs: Vec<String>,
 }
 
@@ -3128,15 +3206,53 @@ struct PushConnectArgs {
 #[cfg(feature = "push")]
 #[derive(Args)]
 struct PushTreeArgs {
-    /// A target ref of the server. At least one is required.
+    /// The branch of the server that the server commit moves. Required.
     ///
-    /// Each occurrence names one more ref that the commit sets. The command
-    /// refuses a name that holds `:`, a name that the ref-name rule refuses,
-    /// which includes a name with `^`, and a name that occurs twice. It also
-    /// refuses a name of 64 lowercase hex characters, because a revision reads
-    /// such a name as a commit checksum.
-    #[arg(short = 'b', long, value_name = "REF")]
-    branch: Vec<String>,
+    /// The server makes the commit over the tree of DIR. Its parent is the
+    /// commit of BRANCH on the server, or none if BRANCH is absent. The
+    /// server moves BRANCH to the commit. The client group needs `c` on
+    /// BRANCH. A server that runs receive hooks takes no server commit and
+    /// answers ref-denied.
+    ///
+    /// The command refuses a name that holds `:`, a name that the ref-name
+    /// rule refuses, which includes a name with `^`, and a name of 64
+    /// lowercase hex characters, because a revision reads such a name as a
+    /// commit checksum.
+    #[arg(long, value_name = "BRANCH")]
+    onto: Option<String>,
+    /// Create the ref NAME on the server at the new commit.
+    ///
+    /// The option can occur more than once. The `ostree.ref-binding` of the
+    /// commit holds NAME. A tag that exists on the server gets ref-mismatch
+    /// before the push sends an object. NAME passes the rules of BRANCH, is
+    /// not BRANCH, and occurs once. The client group needs `t` or `w` on
+    /// NAME.
+    #[arg(long = "tag", value_name = "NAME")]
+    tags: Vec<String>,
+    /// Bind the commit to NAME, and create no ref.
+    ///
+    /// The option can occur more than once. The `ostree.ref-binding` of the
+    /// commit holds BRANCH, each --tag, and each NAME, sorted. NAME passes
+    /// the ref-name rule and has no `:`.
+    #[arg(long = "bind-ref", value_name = "NAME")]
+    bind_refs: Vec<String>,
+    /// Make a commit with no parent.
+    ///
+    /// If BRANCH exists on the server, the client group needs `c` and `d` on
+    /// it, else the server answers non-fast-forward.
+    #[arg(long)]
+    orphan: bool,
+    /// Write the refs of the collection ID on the server.
+    ///
+    /// The server writes the refs of its own collection id under
+    /// `refs/heads/`, and the refs of each other collection under
+    /// `refs/mirrors/ID/`. `ostree.collection-binding` of the commit holds
+    /// ID. Without this option, the push writes the local refs of the server,
+    /// and the binding is the collection id of the server, if it has one.
+    /// The command refuses an ID that fails the collection-id rule or is
+    /// longer than 255 bytes before it starts the transport.
+    #[arg(long, value_name = "ID")]
+    collection: Option<String>,
     /// The commit subject.
     #[arg(short, long)]
     subject: Option<String>,
@@ -3154,45 +3270,29 @@ struct PushTreeArgs {
     /// Add a string-valued key to the commit metadata.
     ///
     /// The command splits KEY=VALUE at the first `=`, and refuses an empty
-    /// key. Each occurrence adds one key.
+    /// key. Each occurrence adds one key. The command refuses the keys
+    /// `ostree.ref-binding` and `ostree.collection-binding`, which the server
+    /// writes.
     #[arg(long, value_name = "KEY=VALUE")]
     add_metadata_string: Vec<String>,
     /// Add a key to the commit metadata, with a value in GVariant text form.
     ///
     /// Each occurrence adds one key. The metadata holds each
     /// --add-metadata-string entry first, then each --add-metadata entry, and
-    /// then the ref bindings.
+    /// then the ref bindings that the server writes. The command refuses the
+    /// keys `ostree.ref-binding` and `ostree.collection-binding`.
     #[arg(long, value_name = "KEY=VALUE")]
     add_metadata: Vec<String>,
-    /// Add a string-valued key to the detached commit metadata.
-    ///
-    /// Each occurrence adds one key. The command refuses an empty key. The
-    /// command does not apply `[ex-ostrya] detached-metadata-exclude` to these
-    /// keys.
-    #[arg(long, value_name = "KEY=VALUE")]
-    add_detached_metadata_string: Vec<String>,
-    /// Override the timestamp of the commit.
+    /// Set the timestamp of the commit.
     ///
     /// The value is `@SECONDS` since the Unix epoch, or a date and time with a
-    /// UTC offset (`2020-01-02T03:04:05Z`). Without this option, the commit
-    /// takes the `SOURCE_DATE_EPOCH` environment variable. If that variable is
-    /// not set, the commit takes the current time.
+    /// UTC offset (`2020-01-02T03:04:05Z`). Without this option, the push
+    /// sends the `SOURCE_DATE_EPOCH` environment variable. If that variable is
+    /// not set, the push sends no timestamp, and the server takes its own
+    /// clock. The command refuses a `SOURCE_DATE_EPOCH` that is not a count
+    /// of seconds.
     #[arg(long, value_name = "TIMESTAMP")]
     timestamp: Option<String>,
-    /// The parent commit: a full checksum, or `none` for a root commit.
-    ///
-    /// A full checksum has 64 lowercase hex characters. Without this option,
-    /// the parent is the commit of the first target ref on the server. If the
-    /// server does not have that ref, the commit has no parent.
-    #[arg(long, value_name = "CHECKSUM")]
-    parent: Option<String>,
-    /// Do not write any ref bindings.
-    ///
-    /// Without this switch, `ostree.ref-binding` holds the target refs in
-    /// sorted order. `ostree.collection-binding` holds the collection ID of
-    /// the server, if the server has one.
-    #[arg(long)]
-    no_bindings: bool,
     /// Set the user id of the owner of the committed files.
     ///
     /// The value applies to the root directory too. A negative value keeps
@@ -3212,49 +3312,6 @@ struct PushTreeArgs {
     /// --owner-uid or --owner-gid.
     #[arg(long)]
     canonical_permissions: bool,
-    /// Sign the commit with this key. Each occurrence adds one signature.
-    ///
-    /// For ed25519 and spki, the key is the base64 of the secret key. Under
-    /// --sign-type=gpg, the key is a GPG key ID. The signatures come in this
-    /// order: every --sign key, then every --sign-from-file key, and then
-    /// every --gpg-sign key.
-    #[arg(long, value_name = "KEY_ID")]
-    sign: Vec<String>,
-    /// Sign the commit with the key on the first line of this file.
-    ///
-    /// Each occurrence adds one signature. --sign-type selects the engine, as
-    /// for --sign. The command refuses a first line that is longer than
-    /// 64 KiB.
-    #[arg(long, value_name = "PATH")]
-    sign_from_file: Vec<std::ffi::OsString>,
-    /// The signature type of --sign and --sign-from-file.
-    ///
-    /// The types are `ed25519`, `spki`, and `gpg`, and the default is
-    /// `ed25519`. If the option occurs more than once, the last value wins.
-    /// The command reads this option only if --sign or --sign-from-file names
-    /// a key.
-    #[arg(long, value_name = "NAME", overrides_with = "sign_type")]
-    sign_type: Option<String>,
-    /// The GPG key ID to sign the commit with.
-    ///
-    /// Each occurrence adds one signature under `ostree.gpgsigs`. The ID must
-    /// name exactly one secret key in the GnuPG home directory. The command
-    /// refuses an ID of less than 8 bytes.
-    #[arg(long, value_name = "KEY-ID")]
-    gpg_sign: Vec<String>,
-    /// The GPG home directory that holds the keyrings.
-    ///
-    /// --gpg-sign reads it, and so do --sign and --sign-from-file under
-    /// --sign-type=gpg. It wins over `GNUPGHOME`.
-    #[arg(long, value_name = "HOMEDIR")]
-    gpg_homedir: Option<PathBuf>,
-    /// Set each target ref whatever its state on the server.
-    ///
-    /// The push also asks the server to allow an update that is not a
-    /// fast-forward. The server still refuses such an update unless the
-    /// client group of the push has `w` and `d` on the ref.
-    #[arg(long)]
-    force: bool,
     /// Send the content objects deflated at LEVEL, 1 to 9.
     ///
     /// The value needs the `=` form, and --compress alone gives level 6.
@@ -3866,6 +3923,9 @@ async fn push(repo: Repo, name: &str, verbose: bool, args: PushArgs) -> Result<(
     {
         exit_error(&format!("Invalid collection ID {id}"));
     }
+    if args.onto.is_some() {
+        return push_onto(repo, verbose, args).await;
+    }
     let detached_metadata_filter = detached_metadata_filter(&repo)?;
     let overrides = push_overrides(args.connect);
     let endpoint = ostrya::endpoint::resolve_push(Some(repo.config()), remote, overrides).await?;
@@ -3895,6 +3955,70 @@ async fn push(repo: Repo, name: &str, verbose: bool, args: PushArgs) -> Result<(
         }
         out.flush().map_err(Error::Io)?;
     }
+    if verbose {
+        eprintln!("{}", push_statistics_line(&outcome.stats));
+    }
+    Ok(())
+}
+
+/// Pushes the tree of the commit of one revision to a remote over ssh or
+/// HTTP, and asks the server to commit it onto the branch of `--onto`.
+///
+/// The caller checked REMOTE, the presence of a REF, and `--collection`. The
+/// command refuses a second REF and a bad `--timestamp` before it resolves
+/// the remote. Standard output carries the checksum of the new commit alone.
+/// Under `--verbose`, one statistics line goes to standard error. A failure
+/// writes nothing to standard output.
+#[cfg(feature = "push")]
+async fn push_onto(repo: Repo, verbose: bool, args: PushArgs) -> Result<()> {
+    let (Some(remote), Some(onto)) = (args.remote.as_deref(), args.onto) else {
+        unreachable!("the caller checked REMOTE and --onto");
+    };
+    let [rev] = &args.refspecs[..] else {
+        exit_error(&format!(
+            "--onto takes one REF, and {} were given",
+            args.refspecs.len()
+        ));
+    };
+    let timestamp = args.timestamp.as_deref().map(|text| {
+        parse_timestamp(text).unwrap_or_else(|| exit_error(&format!("Could not parse '{text}'")))
+    });
+    let overrides = push_overrides(args.connect);
+    let endpoint = ostrya::endpoint::resolve_push(Some(repo.config()), remote, overrides).await?;
+    let (progress, bar) = PushBar::start();
+    let opts = ostrya::PushOntoOptions {
+        rev: rev.clone(),
+        onto,
+        collection: args.collection,
+        tags: args.tags,
+        bind_refs: args.bind_refs,
+        orphan: args.orphan,
+        timestamp,
+        compression: push_compression(args.compress),
+        progress,
+    };
+    let pushed = repo.push_onto(endpoint, opts).await;
+    // The bar is cleared before any line of the result or of the error.
+    bar.finish();
+    print_server_commit(verbose, pushed?)
+}
+
+/// Writes the commit of a server commit to standard output, and under
+/// `verbose` the statistics line to standard error.
+///
+/// The remote holds the new refs at this point. If the write to standard
+/// output fails, for example on a full device or a closed pipe, `main` prints
+/// the error line and exits 1.
+#[cfg(feature = "push")]
+fn print_server_commit(verbose: bool, outcome: ostrya::remote::PushOutcome) -> Result<()> {
+    use std::io::Write;
+    let commit = outcome
+        .commit
+        .expect("the outcome of a server commit names its commit");
+    let mut out = std::io::stdout().lock();
+    writeln!(out, "{commit}").map_err(Error::Io)?;
+    out.flush().map_err(Error::Io)?;
+    drop(out);
     if verbose {
         eprintln!("{}", push_statistics_line(&outcome.stats));
     }
@@ -3940,28 +4064,28 @@ fn push_overrides(args: PushConnectArgs) -> ostrya::endpoint::EndpointOverrides 
     }
 }
 
-/// Pushes the directory DIR to a remote over ssh or HTTP as one commit.
+/// Pushes the directory DIR to a remote over ssh or HTTP, and asks the server
+/// to commit it onto the branch of `--onto`.
 ///
-/// The push sets each target ref of the server to this commit in one
-/// transaction.
+/// The server moves the branch to the new commit and creates each tag at it
+/// in one transaction.
 ///
 /// # Check order
 ///
 /// 1. [`run`] reads the owner ids.
-/// 2. The command checks the operands in the order REMOTE, DIR, and `-b`, each
-///    with the usage text.
+/// 2. The command checks the operands in the order REMOTE, DIR, and
+///    `--onto`, each with the usage text.
 /// 3. The command checks the other options that it reads itself, before a
-///    repository opens. The signing keys and the body file are not in this
-///    step.
+///    repository opens. The body file is not in this step. The timestamp is
+///    `--timestamp`, else `SOURCE_DATE_EPOCH`, else none.
 /// 4. The command resolves the remote. It refuses an option of the other
 ///    transport and the bad HTTP options. It reads the token file of an HTTP
 ///    push, and the TLS files of an `https://` push.
 /// 5. The command makes the transport ready.
-/// 6. The command checks the signing keys.
-/// 7. The command reads the body file.
+/// 6. The command reads the body file.
 ///
-/// The push refuses the other bad refs before the scan. All of these steps
-/// come before the ssh client starts or the first HTTP request.
+/// The push refuses the other bad names and options before the scan. All of
+/// these steps come before the ssh client starts or the first HTTP request.
 ///
 /// A remote name is looked up in the repository that `--repo`, the current
 /// directory, or `OSTREE_REPO` gives. An address opens no repository, so the
@@ -3987,9 +4111,9 @@ async fn push_tree(
     let Some(dir) = args.dir.as_deref() else {
         exit_with_error(name, "DIR must be specified");
     };
-    if args.branch.is_empty() {
-        exit_with_error(name, "A branch must be specified with --branch");
-    }
+    let Some(onto) = args.onto else {
+        exit_with_error(name, "A branch must be specified with --onto");
+    };
     macro_rules! refuse {
         ($result:expr) => {
             match $result {
@@ -4001,42 +4125,26 @@ async fn push_tree(
     if let Some(message) = canonical_owner_conflict(args.canonical_permissions, owner) {
         exit_error(&message);
     }
-    // The ref rule of the push refuses `:`, a name with `^`, a bad name, and a
-    // name that occurs twice. This loop refuses a name that a revision reads
-    // as a checksum, with the words of `commit`.
-    for branch in &args.branch {
+    // The name rule of the push refuses `:`, a name with `^`, and a bad name.
+    // This loop refuses a name that a revision reads as a checksum, with the
+    // words of `commit`.
+    for branch in std::iter::once(&onto).chain(&args.tags) {
         if let Some(message) = shadowed_branch_name(branch) {
             exit_error(&message);
         }
     }
-    // The server resolves no revision, so the parent is a full checksum.
-    let parent = match args.parent.as_deref() {
-        None => ostrya::remote::ParentPolicy::CurrentTip,
-        Some(NO_PARENT) => ostrya::remote::ParentPolicy::None,
-        Some(text) => match Checksum::from_hex_lower(text) {
-            Ok(checksum) => ostrya::remote::ParentPolicy::Commit(checksum),
-            Err(_) => exit_error(&format!(
-                "Invalid --parent '{text}': give a commit checksum of 64 lowercase hex \
-                 characters, or none"
-            )),
-        },
-    };
     let strings = refuse!(metadata_pairs(&args.add_metadata_string));
     let variants = refuse!(parse_added_metadata(&args.add_metadata));
-    let detached_pairs = refuse!(metadata_pairs(&args.add_detached_metadata_string));
     let metadata = refuse!(user_metadata_entries(&strings, &variants));
-    let detached_metadata = refuse!(user_metadata_entries(&detached_pairs, &[]));
     let timestamp = match args.timestamp.as_deref() {
         Some(text) => match parse_timestamp(text) {
             Some(seconds) => Some(seconds),
             None => exit_error(&format!("Could not parse '{text}'")),
         },
-        None => None,
+        None => refuse!(ostrya::source_date_epoch().map_err(|e| e.to_string())),
     };
-    // The transport is made ready before a signer can start gpg and before the
-    // body file is read. A refusal of the remote or of its options then starts
-    // no gpg and reads no body file. The library refuses a name with `^` at a
-    // later step.
+    // The transport is made ready before the body file is read. A refusal of
+    // the remote or of its options then reads no body file.
     let overrides = push_overrides(args.connect);
     let endpoint = if ostrya::is_push_address(remote) {
         ostrya::endpoint::resolve_push(None, remote, overrides).await?
@@ -4045,16 +4153,6 @@ async fn push_tree(
         ostrya::endpoint::resolve_push(Some(repo.config()), remote, overrides).await?
     };
     let transport = ostrya::remote::PushSession::prepare(endpoint).await?;
-    let signers = refuse!(
-        collect_signers(
-            &args.sign,
-            &args.sign_from_file,
-            args.sign_type.as_deref(),
-            &args.gpg_sign,
-            args.gpg_homedir.as_deref(),
-        )
-        .await?
-    );
     // The body file can be large, so it is read after the other checks.
     let body = match args.body_file.as_deref() {
         Some(path) => Some(refuse!(read_body_file(path))),
@@ -4062,39 +4160,24 @@ async fn push_tree(
     };
     let (progress, bar) = PushBar::start();
     let opts = ostrya::remote::TreePushOptions {
-        refs: args.branch,
-        parent,
+        onto,
+        tags: args.tags,
+        bind_refs: args.bind_refs,
+        orphan: args.orphan,
+        collection: args.collection,
         subject: args.subject,
         body,
         metadata,
-        detached_metadata,
         timestamp,
-        no_bindings: args.no_bindings,
-        signers,
         compression: push_compression(args.compress),
         entry_filter: tree_push_filter(owner, args.canonical_permissions),
         hash_jobs: None,
-        force: args.force,
         progress,
     };
     let pushed = ostrya::remote::push_tree_prepared(transport, dir, opts).await;
     // The bar is cleared before any line of the result or of the error.
     bar.finish();
-    let outcome = pushed?;
-    let commit = outcome.commit.expect("a tree push names its commit");
-    // The remote holds the new refs at this point. If the write to standard
-    // output fails, for example on a full device or a closed pipe, `main`
-    // prints the error line and exits 1.
-    {
-        use std::io::Write;
-        let mut out = std::io::stdout().lock();
-        writeln!(out, "{commit}").map_err(Error::Io)?;
-        out.flush().map_err(Error::Io)?;
-    }
-    if verbose {
-        eprintln!("{}", push_statistics_line(&outcome.stats));
-    }
-    Ok(())
+    print_server_commit(verbose, pushed?)
 }
 
 /// Returns the entry filter of the owner and permission options of `push-tree`.
@@ -13359,7 +13442,7 @@ mod tests {
             "--add-metadata-string=b=z",
             "host:repo",
             "dir",
-            "-b",
+            "--onto",
             "main",
         ])
         .unwrap();
@@ -13388,6 +13471,69 @@ mod tests {
             );
         }
         assert!(user_metadata_entries(&[], &[]).unwrap().is_empty());
+    }
+
+    /// `--onto` conflicts with `--depth` and `--force`, and `--bind-ref`,
+    /// `--orphan`, and `--timestamp` of `push` need `--onto`. `push-tree`
+    /// takes none of the options of a commit that the client builds.
+    #[cfg(feature = "push")]
+    #[test]
+    fn the_server_commit_options_of_push_need_onto() {
+        let parse = |args: &[&str]| {
+            let mut all = vec!["ostrya", "push"];
+            all.extend_from_slice(args);
+            Cli::try_parse_from(all).map(|_| ())
+        };
+        let kind = |args: &[&str]| parse(args).unwrap_err().kind();
+        use clap::error::ErrorKind;
+        for extra in [&["--depth=1"][..], &["--force"]] {
+            let mut args = vec!["--onto=main", "origin", "main"];
+            args.extend_from_slice(extra);
+            assert_eq!(kind(&args), ErrorKind::ArgumentConflict, "{extra:?}");
+        }
+        for extra in ["--bind-ref=x", "--orphan", "--timestamp=@1"] {
+            assert_eq!(
+                kind(&[extra, "origin", "main"]),
+                ErrorKind::MissingRequiredArgument,
+                "{extra}"
+            );
+        }
+        parse(&[
+            "--onto=main",
+            "--tag=t",
+            "--bind-ref=x",
+            "--bind-ref=y",
+            "--orphan",
+            "--timestamp=@1",
+            "--collection=org.example.C",
+            "origin",
+            "main",
+        ])
+        .unwrap();
+
+        for removed in [
+            "-b",
+            "--branch=main",
+            "--parent=none",
+            "--sign=k",
+            "--sign-from-file=f",
+            "--sign-type=ed25519",
+            "--gpg-sign=k",
+            "--gpg-homedir=d",
+            "--add-detached-metadata-string=k=v",
+            "--force",
+            "--no-bindings",
+        ] {
+            let args = [
+                "ostrya",
+                "push-tree",
+                "--onto=main",
+                removed,
+                "host:repo",
+                "dir",
+            ];
+            assert!(Cli::try_parse_from(args).is_err(), "{removed}");
+        }
     }
 
     /// Each template of the push progress bar parses. The bar shows no stage

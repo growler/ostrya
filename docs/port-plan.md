@@ -186,7 +186,7 @@ bounded:
   process through `ostrya-rt`, or sends the steps of a session to an HTTP
   server, and `PullSession::connect`, which opens the session of a pull over
   HTTP or ssh. No repository knowledge. Depends on `ostrya-gvariant`,
-  `ostrya-core`, `ostrya-rt`, `ostrya-sign`, `ostrya-fetch`, `thiserror`,
+  `ostrya-core`, `ostrya-rt`, `ostrya-fetch`, `thiserror`,
   `futures-io`, `futures-lite`, and `libc` on Unix, for the `O_NOFOLLOW` and
   `O_NONBLOCK` flags and the error values of the file open in the walk of a
   local directory. The `smol` (default) and `tokio` features select the
@@ -7295,13 +7295,15 @@ with `ostree fsck`, and pulls from it.
 
 The extension serves three scenarios:
 
-- Tree push -- a client program pushes a directory tree. The client builds the
-  commit object with `ostrya-core` and signs it with its own keys. With the
-  same inputs, over a tree the walker accepts, the commit is byte-identical to
-  the commit `ostree commit --no-xattrs` builds from the same directory
-  (`format-reference.md`, "The commit of `push-tree`"). The client library
-  compiles on Linux, macOS, and Windows. `ostrya push-tree` is the command
-  form.
+- Tree push -- a client program pushes a directory tree, and the server
+  makes the commit over it, with the tip of the branch as the parent, the
+  bindings of its namespace, and its own signing keys. With the same inputs,
+  over a tree the walker accepts, the commit is byte-identical to the commit
+  `ostree commit --no-xattrs` builds from the same directory with the same
+  parent (`format-reference.md`, "The commit of `push-tree`"). The client
+  library compiles on Linux, macOS, and Windows. `ostrya push-tree` is the
+  command form. `ostrya push --onto` makes the same kind of commit from the
+  tree of a local commit.
 - Commit push -- `ostrya push` sends one or more commits from a local
   repository and updates refs on the remote.
 - One-way stream -- a library caller writes commits of a local repository
@@ -7366,11 +7368,12 @@ passes the ssh half of the verify step below: the receiving repository
 passes `ostree fsck`, `ostree rev-parse` resolves each pushed ref, and
 `ostree pull-local` from it succeeds. The library half of the tree push is
 done: `ostrya::remote::push_tree` and `push_tree_over_stream` walk and hash a
-local directory, build and sign one commit over it, and set the target refs
-in one session (the rustdoc of `ostrya::remote::push_tree`). The commit checksum
-equals that of `Transaction::write_commit` over the same tree with the same
-inputs. `ostrya push-tree` pushes a local directory over ssh as one commit
-and prints the commit checksum (`docs/conformance/cli-surface.md`, "Port
+local directory, send the objects of its tree, and ask the server to commit
+the tree onto a branch in one session (the rustdoc of
+`ostrya::remote::push_tree`). The commit checksum equals that of
+`Transaction::write_commit` over the same tree with the same inputs and the
+same parent. `ostrya push-tree` pushes a local directory over ssh as one
+server commit and prints the commit checksum (`docs/conformance/cli-surface.md`, "Port
 extensions with no counterpart in the tool"). Its commit checksum equals
 the checksum of `ostree commit --no-xattrs` over the same tree with the same
 options. The read-only half of `ostrya serve` is done: `ostrya serve` serves
@@ -7401,7 +7404,8 @@ test pushes over HTTPS and HTTP/2 through a mounted endpoint with hooks: the
 entry of the host is written, an entry with `keep_existing` keeps the first
 value at a second push of the commit, an error of `after_update` gives 500
 with the refs written, and a ref that moves during `before_update` gives 409
-with `ref-mismatch`. The
+with `ref-mismatch`. A server commit through a session with hooks gets
+`ref-denied`. The
 HTTP push transport is done: `PushSession::connect`,
 `push_tree`, and `Repo::push` take an `http://` or `https://` address, with
 a bearer token, a Basic credential, or a client certificate, and with
@@ -7470,18 +7474,16 @@ refs. A tree push with one target ref gives the commit checksum that
 
 Result of the ssh half: `crates/ostrya-cli/tests/push_ssh.rs` runs `ostrya
 push-tree` over a stand-in ssh client with `SOURCE_DATE_EPOCH` set on both
-sides. With one `-b`, a subject, a body, and metadata options, the commit
-checksum equals the checksum of `ostree commit --no-xattrs -b main` with the
-same options, and a second push equals a second commit of the tool. With
-two refs it equals the checksum of `ostree commit --no-xattrs -b r1
---bind-ref r2`. `--canonical-permissions` and `--owner-uid=0
---owner-gid=0` each give the commit of the tool with the same options, and
-so do `--body-file` alone and beside `-m`, `--parent=none`, `--parent`
-with a commit, `--no-bindings`, and an explicit `--timestamp`. With
-`--add-detached-metadata-string` and three distinct ed25519 keys from
-`--sign` and `--sign-from-file`, the `.commitmeta` bytes equal those of the
-tool. A push signed with ed25519 verifies with `ostree sign --verify` in
-the receiving repository, and `ostree fsck` passes on each receiver.
+sides. With `--onto main`, a subject, a body, and metadata options, the
+commit checksum equals the checksum of `ostree commit --no-xattrs -b main`
+with the same options, and a second push equals a second commit of the tool.
+With a second bound ref it equals the checksum of `ostree commit
+--no-xattrs -b r1 --bind-ref r2`. `--canonical-permissions` and
+`--owner-uid=0 --owner-gid=0` each give the commit of the tool with the same
+options, and so do `--body-file` alone and beside `-m`, an explicit
+`--timestamp`, `--tag`, and `--orphan` on a new branch. `ostrya push --onto`
+of a local commit gives the commit of the tool over the same tree with the
+same options. `ostree fsck` passes on each receiver.
 
 Result of the HTTP half: `crates/ostrya-cli/tests/push_http.rs` runs the
 library against `ostrya_server` in the same process, and the commands

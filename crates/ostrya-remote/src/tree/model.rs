@@ -78,34 +78,33 @@ struct Node {
 ///
 /// # Object source
 ///
-/// After [`set_commit`](TreeModel::set_commit) gives the model the commit over
-/// the tree, the model is the [`ObjectSource`] of a push of the tree:
+/// The model is the [`ObjectSource`] of the objects of the tree.
+/// [`object_names`](TreeModel::object_names) gives each object of the tree
+/// once. The model holds no commit.
 ///
-/// - [`objects`](ObjectSource::objects) of that commit gives each object of
-///   the tree once, and then the commit.
 /// - [`open`](ObjectSource::open) of a regular file opens the file again on
 ///   the blocking pool, with the open and the checks of the hash pass. These
 ///   are the type check, and on Unix the identity check. It gives the file as
 ///   [`ObjectData::Content`], whose `size` is the payload size that the hash
 ///   pass read.
 /// - `open` of a symlink opens no file. `open` of a dirtree or a dirmeta
-///   object serializes the object again from the model. `open` of the commit
-///   gives the bytes that `set_commit` gave. Each of the three is
+///   object serializes the object again from the model. Each of the two is
 ///   [`ObjectData::Encoded`] in the `raw` encoding.
-/// - [`detached_metadata`](ObjectSource::detached_metadata) of the commit
-///   gives the dict that `set_commit` gave.
 /// - [`content_size`](ObjectSource::content_size) gives the sum of the
 ///   payload sizes of the hash pass, in each encoding. It reads no file.
+/// - [`objects`](ObjectSource::objects) and
+///   [`detached_metadata`](ObjectSource::detached_metadata) name a commit,
+///   so each call returns [`Error::InvalidInput`].
 ///
 /// When the model sends a file, it gives the payload size of the hash pass and
 /// does not hash the file again. If a file changes after the hash pass, the
 /// server verifies the object and refuses it.
 ///
-/// If a call names another commit, or an object that the model does not hold,
-/// it returns [`Error::InvalidInput`]. If the open of a file fails, the call
-/// returns [`Error::Walk`] with the path of the file and one of the kinds that
-/// [`scan`](TreeModel::scan) lists. The session returns that error inside
-/// [`Error::Source`].
+/// If a call names an object that the model does not hold, a commit
+/// included, it returns [`Error::InvalidInput`]. If the open of a file fails,
+/// the call returns [`Error::Walk`] with the path of the file and one of the
+/// kinds that [`scan`](TreeModel::scan) lists. The session returns that error
+/// inside [`Error::Source`].
 pub struct TreeModel {
     /// The walk root.
     root: PathBuf,
@@ -114,16 +113,6 @@ pub struct TreeModel {
     nodes: Vec<Node>,
     /// The source entry of each object.
     sources: Sources,
-    /// The commit over the tree, once [`set_commit`](TreeModel::set_commit)
-    /// gave it.
-    commit: Option<CommitObject>,
-}
-
-/// The commit object of a model and its detached metadata.
-struct CommitObject {
-    checksum: Checksum,
-    bytes: Vec<u8>,
-    detached: Option<Value>,
 }
 
 /// The source entry of each object: the first entry, in walk order, that
@@ -270,29 +259,12 @@ impl TreeModel {
         names
     }
 
-    /// Sets the commit object over the tree, which a push of the tree sends.
-    ///
-    /// `checksum` is the checksum of the commit, and `bytes` is its serialized
-    /// form. `detached` is the `a{sv}` dict that the push sends as the detached
-    /// metadata of the commit. A later call replaces the commit.
-    ///
-    /// The model does not check the bytes. The server verifies the commit
-    /// object as it verifies each other object.
-    pub fn set_commit(&mut self, checksum: Checksum, bytes: Vec<u8>, detached: Option<Value>) {
-        self.commit = Some(CommitObject {
-            checksum,
-            bytes,
-            detached,
-        });
-    }
-
     /// An empty model of the walk root `root`.
     pub(super) fn new(root: &Path) -> TreeModel {
         TreeModel {
             root: root.to_path_buf(),
             nodes: Vec::new(),
             sources: Sources::default(),
-            commit: None,
         }
     }
 
@@ -548,26 +520,8 @@ impl TreeModel {
         Ok((Checksum::sha256(&dirtree), Checksum::sha256(&dirmeta)))
     }
 
-    /// The commit object of the model, when its checksum is `checksum`.
-    fn commit_object(&self, checksum: &Checksum) -> Result<&CommitObject> {
-        match &self.commit {
-            Some(commit) if commit.checksum == *checksum => Ok(commit),
-            Some(commit) => Err(Error::InvalidInput(format!(
-                "commit {checksum} is not the commit {} of the tree model",
-                commit.checksum
-            ))),
-            None => Err(Error::InvalidInput(format!(
-                "commit {checksum} is not in the tree model, which has no commit"
-            ))),
-        }
-    }
-
     /// The data of the object `name` for the send pass.
     async fn open_object(&self, name: &ObjectName) -> Result<ObjectData> {
-        if name.ty == ObjectType::Commit {
-            let commit = self.commit_object(&name.checksum)?;
-            return Ok(encoded(commit.bytes.clone()));
-        }
         let index = self.source(name).ok_or_else(|| {
             Error::InvalidInput(format!(
                 "object {} of type {:?} is not in the tree model",
@@ -713,12 +667,7 @@ fn node_names(node: &Node) -> [Option<ObjectName>; 2] {
 
 impl ObjectSource for TreeModel {
     fn objects<'a>(&'a self, commit: &'a Checksum) -> BoxFuture<'a, Result<Vec<ObjectName>>> {
-        Box::pin(async move {
-            let commit = self.commit_object(commit)?;
-            let mut names = self.object_names();
-            names.push(ObjectName::new(commit.checksum, ObjectType::Commit));
-            Ok(names)
-        })
+        Box::pin(async move { Err(no_commit(commit)) })
     }
 
     fn open<'a>(
@@ -733,7 +682,7 @@ impl ObjectSource for TreeModel {
         &'a self,
         commit: &'a Checksum,
     ) -> BoxFuture<'a, Result<Option<Value>>> {
-        Box::pin(async move { Ok(self.commit_object(commit)?.detached.clone()) })
+        Box::pin(async move { Err(no_commit(commit)) })
     }
 
     fn content_size<'a>(
@@ -743,6 +692,14 @@ impl ObjectSource for TreeModel {
     ) -> BoxFuture<'a, Result<Option<u64>>> {
         Box::pin(async move { self.content_bytes(names).map(Some) })
     }
+}
+
+/// The error of a call that names the commit `commit`, which the model does
+/// not hold.
+fn no_commit(commit: &Checksum) -> Error {
+    Error::InvalidInput(format!(
+        "commit {commit} is not in the tree model, which holds no commit"
+    ))
 }
 
 /// Metadata object bytes, given as they are in `raw`.

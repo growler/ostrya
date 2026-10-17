@@ -8,6 +8,8 @@
 //!   detached metadata of their commits.
 //! - [`commit`](PushSession::commit) asks the server to update its refs in
 //!   one transaction.
+//! - [`server_commit`](PushSession::server_commit) asks the server to make a
+//!   commit over a tree that it holds, and to move a branch to it.
 //!
 //! [`PushProgress`] counts the progress of a session, and [`PushOutcome`]
 //! gives the result of a session that committed.
@@ -50,7 +52,8 @@ use self::writer::{MetaClaims, Upload};
 use crate::error::{Error, Result};
 use crate::proto::{
     CommitRequest, Encoding, Hello, HelloReply, Message, PROTOCOL_VERSION, RefOutcome, RefState,
-    RefUpdate, have_entries_within, have_type, protocol,
+    RefUpdate, ServerCommit, check_server_commit_metadata, have_entries_within, have_type,
+    protocol, server_commit_frame_len, server_commit_reply_frame_len,
 };
 use crate::transport::Transport;
 
@@ -166,9 +169,8 @@ pub trait ObjectSource: Send + Sync {
     ///
     /// The error depends on the implementation:
     ///
-    /// - [`TreeModel`](crate::tree::TreeModel) returns [`Error::InvalidInput`]
-    ///   if the model holds no commit, or if `commit` is not the commit of the
-    ///   model.
+    /// - [`TreeModel`](crate::tree::TreeModel) returns [`Error::InvalidInput`],
+    ///   because the model holds no commit.
     /// - The repository source of the `ostrya` crate returns
     ///   [`Error::Source`] if the walk of `commit` in the repository fails.
     fn objects<'a>(&'a self, commit: &'a Checksum) -> BoxFuture<'a, Result<Vec<ObjectName>>>;
@@ -352,9 +354,11 @@ pub struct SessionOptions {
 /// The result of a push that committed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PushOutcome {
-    /// The commit that the client built, if it built one.
+    /// The commit that the server made for
+    /// [`server_commit`](PushSession::server_commit).
     ///
-    /// A session that sends the objects of a source builds no commit.
+    /// A session that ends with [`commit`](PushSession::commit) gives
+    /// `None`.
     pub commit: Option<Checksum>,
     /// One outcome for each ref update, in the order of the updates.
     pub refs: Vec<RefOutcome>,
@@ -369,7 +373,8 @@ pub struct PushOutcome {
 /// [`over_stream`](PushSession::over_stream) opens a session over a pair of
 /// byte streams.
 ///
-/// If the caller drops a session without [`commit`](PushSession::commit) or
+/// If the caller drops a session without [`commit`](PushSession::commit),
+/// [`server_commit`](PushSession::server_commit), or
 /// [`abort`](PushSession::abort), the session sends nothing more. A stream
 /// transport then closes its output, so the server reads the end of the
 /// stream. Over HTTP, the server ends the session when its idle timeout ends.
@@ -377,7 +382,8 @@ pub struct PushOutcome {
 /// After the server ends a session over HTTP, it answers each later request
 /// of that session with 404. The session reports a 404 on
 /// [`missing`](PushSession::missing) or [`send`](PushSession::send) as
-/// [`Error::Transport`], and a 404 on [`commit`](PushSession::commit) as
+/// [`Error::Transport`], and a 404 on [`commit`](PushSession::commit) or
+/// [`server_commit`](PushSession::server_commit) as
 /// [`Error::CommitOutcomeUnknown`].
 ///
 /// # Verification
@@ -951,27 +957,102 @@ impl PushSession {
     /// [`Error::CommitOutcomeUnknown`].
     pub async fn commit(self, updates: &[RefUpdate], force: bool) -> Result<PushOutcome> {
         let checked = check_updates(&self.inner.server.refs, updates);
-        let (slot, transport, counters, checked) =
-            match self.inner.into_commit(checked, updates, force) {
-                Committing::Stream {
-                    slot,
-                    transport,
-                    counters,
-                    checked,
-                } => (slot, transport, counters, checked),
-                Committing::Http(commit) => return commit.await,
-            };
-        let stream = into_stream(slot);
-        let result = match (checked, stream) {
-            (Ok(()), Ok(stream)) => commit_on(stream, updates, force, &counters).await,
-            (Ok(()), Err(e)) => Err(e),
-            (Err(e), stream) => {
-                // The server reads the end of the stream.
-                drop(stream);
-                Err(e)
-            }
+        let request = CommitRequest {
+            updates: updates.to_vec(),
+            force,
+            server_commit: None,
         };
-        finish(transport, result).await
+        let names = updates.iter().map(|u| u.name.clone()).collect();
+        // The future of the commit is large. The box keeps it out of the
+        // future of this call.
+        Box::pin(self.inner.send_commit(checked, request, names)).await
+    }
+
+    /// Checks the server commit `sc` against the session, and sends nothing.
+    ///
+    /// The check is the check of [`server_commit`](PushSession::server_commit)
+    /// before it sends `Commit`. A caller runs it after the session opens and
+    /// before it offers or sends an object, so that a refused server commit
+    /// sends no object.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidInput`] if `Hello` did not name the branch or a tag
+    ///   of `sc`, or if `sc` names a ref twice among its branch and its
+    ///   tags.
+    /// - [`Error::Protocol`] if the bytes of a metadata entry of `sc` are not
+    ///   a `v` in normal form.
+    /// - [`Error::InvalidInput`] if a commit cannot hold a metadata value of
+    ///   `sc`. A commit holds 128 levels of containers, counted from its
+    ///   metadata dict, so the value can hold two levels fewer than a `v`.
+    /// - [`Error::LimitExceeded`] if the `CommitReply` to `sc` can need a
+    ///   frame over the `max-frame` of the server. The longest reply holds
+    ///   the branch with an old and a new commit, and each tag with a new
+    ///   commit.
+    /// - [`Error::LimitExceeded`] if the `Commit` frame that holds `sc` is
+    ///   over the `max-frame` of the server.
+    pub fn check_server_commit(&self, sc: &ServerCommit) -> Result<()> {
+        check_server_commit_fields(&self.inner.server, sc)?;
+        let limit = self.inner.server.max_frame;
+        let len = server_commit_frame_len(sc)?;
+        if len > u64::from(limit) {
+            return Err(Error::LimitExceeded(format!(
+                "the Commit frame of the server commit is {len} bytes, over the limit {limit} \
+                 of the server"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Sends `Commit` with the server commit `sc`, and returns the outcome
+    /// from the reply.
+    ///
+    /// The server makes a commit over the root dirtree and the root dirmeta
+    /// of `sc`. It moves the branch of `sc` to the commit and creates each
+    /// tag at it, in one transaction. [`PushOutcome::commit`] gives the new
+    /// commit, and [`PushOutcome::refs`] gives the outcome of the branch,
+    /// then of each tag.
+    ///
+    /// The call consumes the session. It sends no detached metadata. It
+    /// runs the checks of
+    /// [`check_server_commit`](PushSession::check_server_commit) before it
+    /// writes `Commit`. The encode of the `Commit` frame checks the length of
+    /// the frame, so the call encodes the frame one time. If a check fails,
+    /// or if the session is broken, the call sends no `Commit` and ends the
+    /// session as [`commit`](PushSession::commit) does. The rules of
+    /// the HTTP request and of the wait for the ssh client are those of
+    /// [`commit`](PushSession::commit).
+    ///
+    /// # Errors
+    ///
+    /// - Each error of
+    ///   [`check_server_commit`](PushSession::check_server_commit).
+    /// - [`Error::InvalidInput`] if the session is broken.
+    /// - An `Error` message from the server, as the [`Error`] variant of its
+    ///   code. An ostrya server sends it before it changes a ref. Examples
+    ///   are [`Error::RefDenied`] for a client with no `c` on the branch, or
+    ///   for a server that runs hooks, and [`Error::RefMismatch`] for a tag
+    ///   that exists.
+    /// - [`Error::Fetch`] over HTTP, if the client did not hand the request
+    ///   over to a connection.
+    /// - [`Error::CommitOutcomeUnknown`] for each other end of the session
+    ///   after the session wrote `Commit`. The server can have written the
+    ///   refs. A `CommitReply` that does not hold the branch and then each
+    ///   tag, each at one new commit, with no old commit for a tag, is one of
+    ///   these cases.
+    pub async fn server_commit(self, sc: ServerCommit) -> Result<PushOutcome> {
+        // The send path refuses a frame over the `max-frame` of the server
+        // before it writes a byte.
+        let checked = check_server_commit_fields(&self.inner.server, &sc);
+        let names: Vec<String> = server_commit_refs(&sc).map(str::to_owned).collect();
+        let request = CommitRequest {
+            updates: Vec::new(),
+            force: false,
+            server_commit: Some(Box::new(sc)),
+        };
+        let mut outcome = Box::pin(self.inner.send_commit(checked, request, names)).await?;
+        outcome.commit = Some(server_commit_checksum(&outcome.refs)?);
+        Ok(outcome)
     }
 
     /// Ends the session, so that the server aborts its transaction.
@@ -1020,26 +1101,29 @@ impl PushSession {
 /// an HTTP session. The value lives for one match, so the size of the
 /// stream variant costs nothing.
 #[allow(clippy::large_enum_variant)]
-enum Committing<'a> {
+enum Committing {
     Stream {
         slot: Mutex<Slot>,
         transport: Option<Transport>,
         counters: Arc<Counters>,
         checked: Result<()>,
+        request: CommitRequest,
+        names: Vec<String>,
     },
     /// The HTTP commit holds the response of its request, so its future is
     /// boxed, and the future of a stream commit does not hold it.
-    Http(BoxFuture<'a, Result<PushOutcome>>),
+    Http(BoxFuture<'static, Result<PushOutcome>>),
 }
 
 impl SessionInner {
-    /// Takes the session apart to commit `updates`, which `checked` checked.
-    fn into_commit<'a>(
+    /// Takes the session apart to send `request`, which `checked` checked.
+    /// `names` are the refs that the `CommitReply` must hold, in order.
+    fn into_commit(
         self,
         checked: Result<()>,
-        updates: &'a [RefUpdate],
-        force: bool,
-    ) -> Committing<'a> {
+        request: CommitRequest,
+        names: Vec<String>,
+    ) -> Committing {
         let SessionInner {
             server,
             counters,
@@ -1052,12 +1136,108 @@ impl SessionInner {
                 transport,
                 counters,
                 checked,
+                request,
+                names,
             },
             Link::Http(link) => Committing::Http(Box::pin(async move {
-                link.commit(&server, &counters, checked, updates, force)
+                link.commit(&server, &counters, checked, request, &names)
                     .await
             })),
         }
+    }
+
+    /// Sends `Commit` with `request`, which `checked` checked, and returns
+    /// the outcome from the reply. `names` are the refs that the
+    /// `CommitReply` must hold, in order.
+    async fn send_commit(
+        self,
+        checked: Result<()>,
+        request: CommitRequest,
+        names: Vec<String>,
+    ) -> Result<PushOutcome> {
+        let (slot, transport, counters, checked, request, names) =
+            match self.into_commit(checked, request, names) {
+                Committing::Stream {
+                    slot,
+                    transport,
+                    counters,
+                    checked,
+                    request,
+                    names,
+                } => (slot, transport, counters, checked, request, names),
+                Committing::Http(commit) => return commit.await,
+            };
+        let stream = into_stream(slot);
+        let result = match (checked, stream) {
+            (Ok(()), Ok(stream)) => commit_on(stream, request, &names, &counters).await,
+            (Ok(()), Err(e)) => Err(e),
+            (Err(e), stream) => {
+                // The server reads the end of the stream.
+                drop(stream);
+                Err(e)
+            }
+        };
+        finish(transport, result).await
+    }
+}
+
+/// Returns the refs that the server commit `sc` writes: the branch, then
+/// each tag.
+fn server_commit_refs(sc: &ServerCommit) -> impl Iterator<Item = &str> {
+    std::iter::once(sc.branch.as_str()).chain(sc.tags.iter().map(String::as_str))
+}
+
+/// Runs the checks of a server commit `sc` against the facts of `server`,
+/// other than the length of the `Commit` frame: the names of the refs, the
+/// depth of each metadata value, and the length of the longest
+/// `CommitReply`.
+fn check_server_commit_fields(server: &ServerInfo, sc: &ServerCommit) -> Result<()> {
+    let mut seen = HashSet::new();
+    for name in server_commit_refs(sc) {
+        if !server.refs.iter().any(|r| r.name == name) {
+            return Err(invalid(format!(
+                "ref '{name}' was not named when the session opened"
+            )));
+        }
+        if !seen.insert(name) {
+            return Err(invalid(format!(
+                "ref '{name}' is named twice in the server commit"
+            )));
+        }
+    }
+    check_server_commit_metadata(sc)?;
+    let limit = server.max_frame;
+    let len = server_commit_reply_frame_len(sc)?;
+    if len > u64::from(limit) {
+        return Err(Error::LimitExceeded(format!(
+            "the reply to the server commit with {} tags can need a frame of {len} bytes, over \
+             the limit {limit} of the server",
+            sc.tags.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Returns the commit of the `CommitReply` of a server commit, whose ref
+/// names the session checked.
+///
+/// Each ref must have one new commit, and a tag must have no old commit.
+/// Else the result is [`Error::CommitOutcomeUnknown`].
+fn server_commit_checksum(refs: &[RefOutcome]) -> Result<Checksum> {
+    let commit = refs.first().and_then(|branch| branch.new);
+    match commit {
+        Some(commit)
+            if refs.iter().all(|r| r.new == Some(commit))
+                && refs.iter().skip(1).all(|tag| tag.old.is_none()) =>
+        {
+            Ok(commit)
+        }
+        _ => Err(Error::CommitOutcomeUnknown {
+            refs: refs.iter().map(|r| r.name.clone()).collect(),
+            message: "the server replied to the server commit with refs that are not each at \
+                      one new commit"
+                .into(),
+        }),
     }
 }
 
@@ -1091,25 +1271,21 @@ async fn finish<T>(transport: Option<Transport>, result: Result<T>) -> Result<T>
     }
 }
 
-/// Sends `Commit` over `stream` and reads the reply. The stream is closed or
+/// Sends `Commit` with `request` over `stream` and reads the reply. The
+/// reply must hold the refs `names`, in order. The stream is closed or
 /// dropped when the call returns.
 async fn commit_on(
     mut stream: Box<Stream>,
-    updates: &[RefUpdate],
-    force: bool,
+    request: CommitRequest,
+    names: &[String],
     counters: &Counters,
 ) -> Result<PushOutcome> {
     counters.phase(PushPhase::Committing);
-    let names = || updates.iter().map(|u| u.name.clone()).collect::<Vec<_>>();
     let unknown = |message: String| Error::CommitOutcomeUnknown {
-        refs: names(),
+        refs: names.to_vec(),
         message,
     };
-    let request = Message::Commit(CommitRequest {
-        updates: updates.to_vec(),
-        force,
-        server_commit: None,
-    });
+    let request = Message::Commit(request);
     let reply = match stream.write_raw(&request).await {
         Ok(()) => stream.read_raw().await,
         Err(e @ Error::Io(_)) => match stream.pending_message(&e).await {
@@ -1127,7 +1303,7 @@ async fn commit_on(
         Ok(None) => return Err(unknown("the session ended before CommitReply".into())),
         Err(e) => return Err(unknown(format!("the reply to Commit failed: {e}"))),
     };
-    if refs.len() != updates.len() || refs.iter().zip(updates).any(|(o, u)| o.name != u.name) {
+    if !reply_names_match(&refs, names) {
         return Err(unknown(
             "the server replied to Commit for other refs than the refs of Commit".into(),
         ));
@@ -1139,4 +1315,10 @@ async fn commit_on(
         refs,
         stats: counters.stats(),
     })
+}
+
+/// Returns `true` if the outcomes `refs` of a `CommitReply` name the refs
+/// `names`, in order.
+fn reply_names_match(refs: &[RefOutcome], names: &[String]) -> bool {
+    refs.len() == names.len() && refs.iter().zip(names).all(|(o, n)| o.name == *n)
 }

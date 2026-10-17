@@ -15,6 +15,7 @@
 //! - [`PushSession::over_stream`] opens a push session over a pair of byte streams.
 //! - [`PullSession::connect`] opens the session of a pull to an endpoint.
 //! - [`StreamSession::connect`] opens a stream session over ssh.
+//! - [`StreamSession::check_command_line`] checks the ssh command line of a pull before the session opens.
 //! - [`Error`] is the error of each fallible operation.
 //!
 //! # Modules

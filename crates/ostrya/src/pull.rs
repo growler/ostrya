@@ -7,13 +7,17 @@
 //!   [`PullSession`](crate::remote::PullSession) that the caller opened,
 //!   under a [`PullTrust`](crate::verify::PullTrust) that the caller gives.
 //!   It reads no remote section of the config.
+//! - [`Repo::pull_collection`] pulls the refs of a collection from the
+//!   remotes that serve it. For each ref, it selects the remote with the
+//!   newest commit, and pulls from that remote as [`Repo::pull`] does.
 //!
-//! The three pulls share [`PullOptions`], [`PullFlags`], [`PullStats`], the
+//! The pulls share [`PullOptions`], [`PullFlags`], [`PullStats`], the
 //! ref-binding check, and the `.commitpartial` markers. [`PullVerify`] holds
 //! the signature policy of each pull other than [`Repo::pull_with_session`].
 //!
 //! The sections from "Concurrency" to "Retries" apply to a pull from a
-//! remote: [`Repo::pull`] and [`Repo::pull_with_session`].
+//! remote: [`Repo::pull`], [`Repo::pull_with_session`], and
+//! [`Repo::pull_collection`].
 //!
 //! # Commit state
 //!
@@ -191,6 +195,7 @@ use crate::traverse::reaches_at_least;
 use crate::write::FileMeta;
 
 mod chain;
+mod collection;
 mod delta;
 mod drive;
 #[doc(hidden)]
@@ -198,6 +203,10 @@ pub mod http;
 mod source;
 mod subpath;
 mod verify;
+
+pub use collection::{
+    CollectionPullEvent, CollectionPullOptions, CollectionPullRef, CollectionPullStats,
+};
 
 /// The chunk size of a streamed read of the payload of a content object.
 const READ_CHUNK: usize = 128 * 1024;
@@ -244,7 +253,8 @@ impl PullFlags {
     /// Without this flag, the pull checks that the `ostree.ref-binding` list of
     /// each pulled commit names the ref that the pull reads. A commit with no
     /// binding key passes. A commit with a list that does not name the ref
-    /// fails the pull with [`Error::Pull`].
+    /// fails the pull with [`Error::Pull`]. [`Repo::pull_collection`] refuses
+    /// this flag, because it always checks the bindings.
     pub const DISABLE_VERIFY_BINDINGS: PullFlags = PullFlags(1 << 3);
     /// A copy of each object, with no hardlink.
     ///
@@ -677,7 +687,9 @@ impl std::fmt::Debug for DetachedMetadataFilter {
 ///   [`verify`](PullOptions::verify), and
 ///   [`detached_metadata_filter`](PullOptions::detached_metadata_filter).
 /// - Only a local pull reads [`collection_id`](PullOptions::collection_id).
-///   A pull from a remote refuses it.
+///   A pull from a remote refuses it. [`Repo::pull_collection`] takes the
+///   collection id as an argument, and states the other fields that it
+///   refuses.
 /// - A pull from a remote also reads [`subpaths`](PullOptions::subpaths),
 ///   [`overrides`](PullOptions::overrides),
 ///   [`max_outstanding_fetches`](PullOptions::max_outstanding_fetches),
@@ -764,9 +776,10 @@ pub struct PullOptions {
     ///
     /// Delta discovery reads the name as a refspec, where a `:` changes what
     /// the name refers to. The local pull makes these checks in this order,
-    /// before it reads the source. [`Repo::pull`] and
-    /// [`Repo::pull_with_session`] refuse an id with [`Error::Unsupported`]
-    /// before they send a request.
+    /// before it reads the source. [`Repo::pull`],
+    /// [`Repo::pull_with_session`], and [`Repo::pull_collection`] refuse an id
+    /// with [`Error::Unsupported`] before they send a request.
+    /// [`Repo::pull_collection`] pulls the collection refs of a remote.
     pub collection_id: Option<String>,
     /// The flag set.
     pub flags: PullFlags,
@@ -1741,10 +1754,13 @@ impl Repo {
                 summary.as_ref(),
                 &targets,
                 &opts,
-                opts.remote.as_deref(),
-                edges,
                 // A local pull makes no timestamp check.
-                TimestampBase::Off,
+                TipChecks::new(
+                    flags,
+                    TimestampBase::Off,
+                    RefPlace::of_remote(opts.remote.as_deref()),
+                ),
+                edges,
                 &verification,
                 &counters,
             )
@@ -1982,8 +1998,9 @@ impl Repo {
                 .await?;
             }
             if !opts.no_ref_writes {
+                let place = RefPlace::of_remote(opts.remote.as_deref());
                 for (ref_name, tip) in &targets {
-                    txn.set_ref(&refspec(opts.remote.as_deref(), ref_name), Some(tip));
+                    place.queue(&txn, ref_name, tip);
                 }
             }
             txn.commit().await
@@ -2336,6 +2353,57 @@ fn refspec(remote: Option<&str>, ref_name: &str) -> String {
     match remote {
         Some(remote) => format!("{remote}:{ref_name}"),
         None => ref_name.to_owned(),
+    }
+}
+
+/// The place of the refs of a pull.
+///
+/// The pull writes each pulled ref at this place. Delta discovery and the
+/// timestamp check read the current commit of a ref at the same place.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum RefPlace<'a> {
+    /// The local refs, `refs/heads/<name>`.
+    Heads,
+    /// The refs of a remote, `refs/remotes/<remote>/<name>`.
+    Remote(&'a str),
+    /// The refs of a collection, `refs/mirrors/<id>/<name>`.
+    Collection(&'a str),
+}
+
+impl<'a> RefPlace<'a> {
+    /// Returns the refs of the remote `remote`, or the local refs if `remote`
+    /// is `None`.
+    pub(crate) fn of_remote(remote: Option<&'a str>) -> RefPlace<'a> {
+        match remote {
+            Some(remote) => RefPlace::Remote(remote),
+            None => RefPlace::Heads,
+        }
+    }
+
+    /// Returns the path under the repository of the ref `name` at this place.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidRefspec`] if the place and the name give no valid ref
+    /// path.
+    pub(crate) fn relpath(self, name: &str) -> Result<String> {
+        match self {
+            RefPlace::Heads => refspec_to_relpath(name),
+            RefPlace::Remote(remote) => refspec_to_relpath(&refspec(Some(remote), name)),
+            RefPlace::Collection(id) => collection_ref_to_relpath(&CollectionRef::new(id, name)),
+        }
+    }
+
+    /// Queues the write of the ref `name` at this place, to the commit `tip`,
+    /// in `txn`.
+    pub(crate) fn queue(self, txn: &Transaction, name: &str, tip: &Checksum) {
+        match self {
+            RefPlace::Heads => txn.set_ref(name, Some(tip)),
+            RefPlace::Remote(remote) => txn.set_ref(&refspec(Some(remote), name), Some(tip)),
+            RefPlace::Collection(id) => {
+                txn.set_collection_ref(&CollectionRef::new(id, name), Some(tip));
+            }
+        }
     }
 }
 
@@ -3080,16 +3148,15 @@ async fn commit_timestamp(repo: &Repo, commit: &Checksum) -> Result<u64> {
     .await
 }
 
-/// Reads the commit that the ref `refspec` of this repository names, and the
-/// timestamp of that commit. Returns `None` if this repository holds no such
-/// ref.
+/// Reads the commit that the ref at `relpath` of this repository names, and
+/// the timestamp of that commit. Returns `None` if this repository holds no
+/// such ref.
 ///
 /// The ref, the read of the commit, and the decode run in one call on the
-/// blocking pool. The errors come in this order: the refspec, the read and
-/// the parse of the ref, then the read and the decode of the commit, as
+/// blocking pool. The errors come in this order: the read and the parse of
+/// the ref, then the read and the decode of the commit, as
 /// [`commit_timestamp`] states.
-async fn current_ref_timestamp(repo: &Repo, refspec: &str) -> Result<Option<(Checksum, u64)>> {
-    let relpath = refspec_to_relpath(refspec)?;
+async fn current_ref_timestamp(repo: &Repo, relpath: String) -> Result<Option<(Checksum, u64)>> {
     let repo = repo.clone();
     ostrya_rt::unblock(move || {
         let Some(current) = repo.resolve_relpath_tip_blocking(&relpath)? else {
@@ -3109,13 +3176,38 @@ struct TipChecks<'a> {
     bindings: bool,
     /// The timestamp check of the pull.
     timestamp: TimestampBase,
-    /// The prefix of the pulled refs. The timestamp check resolves the current
-    /// tip of a ref through it. `None` is a local ref.
-    ref_prefix: Option<&'a str>,
+    /// The place of the pulled refs. The timestamp check resolves the current
+    /// tip of a ref there.
+    place: RefPlace<'a>,
+    /// The collection id that the `ostree.collection-binding` of each tip
+    /// must state, or `None` for no collection-binding check.
+    collection: Option<&'a str>,
+    /// The timestamp that the remote listed for each requested ref, which the
+    /// timestamp of its tip must equal. `None` for no such check.
+    listed: Option<&'a HashMap<String, u64>>,
 }
 
-/// Makes the ref-binding check and the timestamp check of each ref of `refs`,
-/// in order, for the tip commit `tip`, which parses to `commit`.
+impl<'a> TipChecks<'a> {
+    /// Returns the checks of a pull with the flags `flags`, the timestamp
+    /// check `timestamp`, and its refs at `place`. The ref-binding check is on
+    /// unless `flags` holds
+    /// [`DISABLE_VERIFY_BINDINGS`](PullFlags::DISABLE_VERIFY_BINDINGS). The
+    /// checks have no collection-binding check and no listed timestamps.
+    fn new(flags: PullFlags, timestamp: TimestampBase, place: RefPlace<'a>) -> TipChecks<'a> {
+        TipChecks {
+            bindings: !flags.contains(PullFlags::DISABLE_VERIFY_BINDINGS),
+            timestamp,
+            place,
+            collection: None,
+            listed: None,
+        }
+    }
+}
+
+/// Makes the checks of each ref of `refs`, in order, for the tip commit
+/// `tip`, which parses to `commit`: the ref-binding check, the
+/// collection-binding check, the check of the listed timestamp, and the
+/// timestamp check.
 ///
 /// The first check that fails stops the call.
 async fn check_tip_refs(
@@ -3129,28 +3221,63 @@ async fn check_tip_refs(
         if checks.bindings {
             check_ref_binding(tip, commit, ref_name)?;
         }
-        check_timestamp(
-            repo,
-            checks.timestamp,
-            checks.ref_prefix,
-            ref_name,
-            tip,
-            commit,
-        )
-        .await?;
+        if let Some(id) = checks.collection {
+            check_collection_binding(tip, commit, id)?;
+        }
+        if let Some(listed) = checks.listed.and_then(|listed| listed.get(*ref_name)) {
+            check_listed_timestamp(tip, commit, ref_name, *listed)?;
+        }
+        check_timestamp(repo, checks.timestamp, checks.place, ref_name, tip, commit).await?;
     }
     Ok(())
 }
 
+/// Checks that the `ostree.collection-binding` of a commit states the
+/// collection id `id`.
+///
+/// A commit with no binding key fails, and so does a commit whose binding is
+/// not a string.
+fn check_collection_binding(checksum: &Checksum, commit: &Commit, id: &str) -> Result<()> {
+    match commit.collection_binding() {
+        Some(bound) if bound == id => Ok(()),
+        Some(bound) => Err(Error::Pull(format!(
+            "commit {checksum}: collection binding '{bound}' is not the requested collection \
+             '{id}'"
+        ))),
+        None => Err(Error::Pull(format!(
+            "commit {checksum}: no collection binding metadata for the requested collection \
+             '{id}'"
+        ))),
+    }
+}
+
+/// Checks that the timestamp of a commit equals the timestamp `listed` that
+/// the remote listed for the ref `ref_name`.
+fn check_listed_timestamp(
+    checksum: &Checksum,
+    commit: &Commit,
+    ref_name: &str,
+    listed: u64,
+) -> Result<()> {
+    if commit.timestamp == listed {
+        return Ok(());
+    }
+    Err(Error::Pull(format!(
+        "commit {checksum} (timestamp {}) of ref '{ref_name}' does not have the timestamp \
+         that the remote listed ({listed})",
+        commit.timestamp
+    )))
+}
+
 /// Refuses a fetched tip that is older than the commit of the check.
 ///
-/// Under [`TimestampBase::CurrentRef`], the call reads the ref and the
-/// timestamp of its commit in one call on the blocking pool, through
+/// Under [`TimestampBase::CurrentRef`], the call reads the ref at `place` and
+/// the timestamp of its commit in one call on the blocking pool, through
 /// [`current_ref_timestamp`].
 async fn check_timestamp(
     repo: &Repo,
     check: TimestampBase,
-    ref_prefix: Option<&str>,
+    place: RefPlace<'_>,
     ref_name: &str,
     tip: &Checksum,
     fetched: &Commit,
@@ -3160,8 +3287,7 @@ async fn check_timestamp(
         TimestampBase::CurrentRef => {
             // A ref that this repository does not hold has nothing to be
             // older than.
-            let Some(current) = current_ref_timestamp(repo, &refspec(ref_prefix, ref_name)).await?
-            else {
+            let Some(current) = current_ref_timestamp(repo, place.relpath(ref_name)?).await? else {
                 return Ok(());
             };
             current
@@ -3397,6 +3523,90 @@ mod tests {
     fn refspec_uses_the_remote_when_given() {
         assert_eq!(refspec(None, "test/main"), "test/main");
         assert_eq!(refspec(Some("origin"), "test/main"), "origin:test/main");
+    }
+
+    #[test]
+    fn a_ref_place_gives_the_path_of_its_refs() {
+        assert_eq!(
+            RefPlace::Heads.relpath("os/stable").unwrap(),
+            "refs/heads/os/stable"
+        );
+        assert_eq!(
+            RefPlace::Remote("origin").relpath("os/stable").unwrap(),
+            "refs/remotes/origin/os/stable"
+        );
+        assert_eq!(
+            RefPlace::Collection("org.example.Os")
+                .relpath("os/stable")
+                .unwrap(),
+            "refs/mirrors/org.example.Os/os/stable"
+        );
+        assert_eq!(RefPlace::of_remote(None), RefPlace::Heads);
+        assert_eq!(
+            RefPlace::of_remote(Some("origin")),
+            RefPlace::Remote("origin")
+        );
+        assert!(matches!(
+            RefPlace::Collection("org.example.Os").relpath("../x"),
+            Err(Error::InvalidRefspec(_))
+        ));
+    }
+
+    /// Returns a commit with the metadata `entries`, each a key and a value
+    /// of type `ty`.
+    fn commit_with(entries: &[(&str, &str, Value)]) -> Commit {
+        let metadata = Value::Array(
+            entries
+                .iter()
+                .map(|(key, ty, value)| {
+                    Value::Tuple(vec![
+                        Value::Str((*key).to_owned()),
+                        Value::Variant(Box::new((
+                            ostrya_core::Type::parse(ty).unwrap(),
+                            value.clone(),
+                        ))),
+                    ])
+                })
+                .collect(),
+        );
+        Commit {
+            metadata,
+            parent: None,
+            related: Vec::new(),
+            subject: String::new(),
+            body: String::new(),
+            timestamp: 7,
+            root_dirtree: Checksum::from_bytes([1; 32]),
+            root_dirmeta: Checksum::from_bytes([2; 32]),
+        }
+    }
+
+    #[test]
+    fn the_collection_binding_must_state_the_collection() {
+        let tip = Checksum::from_bytes([3; 32]);
+        let id = "org.example.Os";
+        let bound = commit_with(&[("ostree.collection-binding", "s", Value::Str(id.into()))]);
+        check_collection_binding(&tip, &bound, id).unwrap();
+        let other = commit_with(&[(
+            "ostree.collection-binding",
+            "s",
+            Value::Str("org.example.Other".into()),
+        )]);
+        let err = check_collection_binding(&tip, &other, id).unwrap_err();
+        assert!(
+            matches!(&err, Error::Pull(m) if m.contains("org.example.Other") && m.contains(id)),
+            "{err:?}"
+        );
+        let none = commit_with(&[]);
+        assert!(matches!(
+            check_collection_binding(&tip, &none, id),
+            Err(Error::Pull(_))
+        ));
+        assert!(check_listed_timestamp(&tip, &none, "os/stable", 7).is_ok());
+        assert!(matches!(
+            check_listed_timestamp(&tip, &none, "os/stable", 8),
+            Err(Error::Pull(_))
+        ));
     }
 
     #[test]

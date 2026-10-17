@@ -1980,11 +1980,11 @@ pub(crate) fn ref_prefixes(name: &str) -> impl Iterator<Item = &str> {
 // NUL. `ostrya-core` holds the rule.
 pub(crate) use ostrya_core::{is_ref_component as is_component, is_ref_name as is_ref_path};
 
-/// The longest collection id, in bytes, that a push session names.
+/// The longest collection id, in bytes, that a push session or a collection
+/// pull names.
 ///
 /// The id is one path component under `refs/mirrors/`, and a Linux file
 /// system takes a name of 255 bytes at most (`NAME_MAX`).
-#[cfg(any(feature = "push", feature = "receive"))]
 pub(crate) const MAX_COLLECTION_ID_LEN: usize = 255;
 
 /// Maps a collection ref to its path under `refs/`. A collection id puts the

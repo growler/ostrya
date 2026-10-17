@@ -51,8 +51,8 @@ use std::sync::{Arc, Mutex};
 use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
 use ostrya::{
     BootableMetadata, BootableRefusal, CheckoutFilterFn, CheckoutMode, CheckoutOptions, Checksum,
-    CollectionRef, CollectionRefEntry, CommitModifier, CommitModifierFlags, CommitOptions,
-    ComposefsOptions, CreateOptions, DeltaEndianness, DeltaOptions, DeltaSuperblock,
+    CollectionPullOptions, CollectionRef, CollectionRefEntry, CommitModifier, CommitModifierFlags,
+    CommitOptions, ComposefsOptions, CreateOptions, DeltaEndianness, DeltaOptions, DeltaSuperblock,
     DetachedMetadataFilter, DevInoCache, DictBuilder, DiffChange, DiffOptions, DiffSide,
     Ed25519Signer, Ed25519Verifier, Error, FileKind, FileMeta, FileObject, FilterResult,
     FsckBindingError, FsckBindingErrorKind, FsckError, FsckErrorKind, FsckFailure, FsckOptions,
@@ -2543,6 +2543,32 @@ struct PullArgs {
     /// signature policy, for example --gpg-verify=false.
     #[arg(long)]
     url: Option<String>,
+    /// Pull refs of the collection ID from each remote that serves it.
+    ///
+    /// The candidates are the remotes whose `collection-id` key is ID. If no
+    /// remote has the key, the command fails. The command reads the key of
+    /// each remote, so a `collection-id` value with a malformed escape
+    /// sequence in any remote fails the command. With this option, each
+    /// operand is a ref of the collection, and the command takes no REMOTE.
+    /// With no ref, the pull takes each ref of the collection that a
+    /// candidate lists, and fails if no candidate lists a ref. The pull asks
+    /// each candidate for the commit of each ref, through the ref listing of
+    /// the server or else through its summary. Under `gpg-verify-summary` or
+    /// `sign-verify-summary`, it reads the refs from the verified summary
+    /// alone. For each ref, it selects the candidate with the newest commit,
+    /// and a tie goes to the first candidate in the config. A candidate that
+    /// fails to answer is skipped with a warning. The pull from each selected
+    /// candidate is a pull of its own, so a failure of a later candidate keeps
+    /// the refs of the earlier ones. The keys of the selected candidate apply.
+    /// Each commit must be bound to ID. If a commit has a ref binding, the
+    /// binding must hold the ref. The pull writes `refs/mirrors/ID/REF`, or
+    /// `refs/heads/REF` if the `collection-id` of this repository is ID.
+    #[arg(
+        long,
+        value_name = "ID",
+        conflicts_with_all = ["url", "mirror", "disable_verify_bindings"]
+    )]
+    collection: Option<String>,
     /// Write the pulled refs as local refs under `refs/heads/`.
     ///
     /// If no ref is named, the pull takes every ref that the summary of the
@@ -2748,15 +2774,17 @@ struct PullArgs {
     /// The remote to pull from, a `[remote "<name>"]` section of the config.
     ///
     /// The remote name is also the prefix of the written refs,
-    /// `refs/remotes/<name>/`. The operand is required, and the command
-    /// refuses a pull with no remote.
+    /// `refs/remotes/<name>/`. Without --collection, the operand is required,
+    /// and the command refuses a pull with no remote. With --collection, this
+    /// operand is the first ref of the collection.
     remote: Option<String>,
     /// The refs to pull.
     ///
     /// With none, the pull takes the configured `branches` of the remote, or
     /// with --mirror every ref that its summary lists. The pull looks up each
     /// ref in the summary of the remote. If the summary does not list the ref,
-    /// the pull reads `refs/heads/<ref>` of the remote.
+    /// the pull reads `refs/heads/<ref>` of the remote. With --collection,
+    /// these are the other refs of the collection.
     refs: Vec<String>,
 }
 
@@ -4700,8 +4728,17 @@ async fn pull(
     low_speed: LowSpeedArgs,
     redraw: std::time::Duration,
 ) -> Result<()> {
-    let Some(remote) = args.remote.as_deref() else {
-        exit_with_error(name, "REMOTE must be specified");
+    // With `--collection`, each operand is a ref of the collection.
+    let (from, refs) = match args.collection {
+        Some(id) => {
+            let remotes = collection_candidates(&repo, &id)?;
+            let refs = args.remote.into_iter().chain(args.refs).collect();
+            (PullFrom::Collection { id, remotes }, refs)
+        }
+        None => match args.remote {
+            Some(remote) => (PullFrom::Remote(remote), args.refs),
+            None => exit_with_error(name, "REMOTE must be specified"),
+        },
     };
     let mut localcache_repos = Vec::with_capacity(args.localcache_repo.len());
     for path in &args.localcache_repo {
@@ -4762,34 +4799,41 @@ async fn pull(
     let line = progress
         .clone()
         .map(|progress| ProgressLine::start(progress, redraw));
-    let pulled = repo
-        .pull(
-            remote,
-            PullOptions {
-                refs: args.refs,
-                flags,
-                depth: args.depth,
-                localcache_repos,
-                disable_fsync: args.disable_fsync,
-                per_object_fsync: args.per_object_fsync,
-                subpaths: args.subpath,
-                overrides,
-                max_outstanding_fetches: args.max_outstanding_fetcher_requests,
-                timestamp_check,
-                disable_static_deltas: args.disable_static_deltas,
-                require_static_deltas: args.require_static_deltas,
-                verify: PullVerify {
-                    gpg: args.gpg_verify,
-                    gpg_summary: args.gpg_verify_summary,
-                    sign: args.sign_verify,
-                    sign_summary: args.sign_verify_summary,
-                },
-                detached_metadata_filter,
-                progress,
-                ..PullOptions::default()
-            },
-        )
-        .await;
+    let opts = PullOptions {
+        refs,
+        flags,
+        depth: args.depth,
+        localcache_repos,
+        disable_fsync: args.disable_fsync,
+        per_object_fsync: args.per_object_fsync,
+        subpaths: args.subpath,
+        overrides,
+        max_outstanding_fetches: args.max_outstanding_fetcher_requests,
+        timestamp_check,
+        disable_static_deltas: args.disable_static_deltas,
+        require_static_deltas: args.require_static_deltas,
+        verify: PullVerify {
+            gpg: args.gpg_verify,
+            gpg_summary: args.gpg_verify_summary,
+            sign: args.sign_verify,
+            sign_summary: args.sign_verify_summary,
+        },
+        detached_metadata_filter,
+        progress,
+        ..PullOptions::default()
+    };
+    let pulled = match from {
+        PullFrom::Remote(remote) => repo.pull(&remote, opts).await,
+        PullFrom::Collection { id, remotes } => {
+            let remotes: Vec<&str> = remotes.iter().map(String::as_str).collect();
+            let mut collection = CollectionPullOptions::default();
+            collection.pull = opts;
+            collection.on_event = Some(Box::new(|event| eprintln!("warning: {event}")));
+            repo.pull_collection(&id, &remotes, collection)
+                .await
+                .map(|pulled| pulled.stats)
+        }
+    };
     let prefix = line.map_or("", ProgressLine::finish);
     let stats = match pulled {
         Ok(stats) => stats,
@@ -4811,6 +4855,38 @@ async fn pull(
         println!("{text}");
     }
     Ok(())
+}
+
+/// What a pull reads from.
+enum PullFrom {
+    /// One remote, a section of the config.
+    Remote(String),
+    /// The remotes of the config whose `collection-id` is `id`, in the order
+    /// of the config.
+    Collection { id: String, remotes: Vec<String> },
+}
+
+/// Returns the remotes of the config of `repo` whose `collection-id` is `id`,
+/// in the order of the config.
+///
+/// If no remote has the id, the command ends with an error. A refused id
+/// goes on to the pull, which states the refusal. The function reads the key
+/// of each remote, so a malformed value in any remote fails the command.
+fn collection_candidates(repo: &Repo, id: &str) -> Result<Vec<String>> {
+    let config = repo.config();
+    let mut candidates = Vec::new();
+    for name in config.remotes() {
+        let Some(remote) = config.remote(name) else {
+            continue;
+        };
+        if remote.collection_id()?.as_deref() == Some(id) {
+            candidates.push(name.to_owned());
+        }
+    }
+    if candidates.is_empty() && ostrya::is_collection_id(id) {
+        exit_error(&format!("no remote has collection-id {id}"));
+    }
+    Ok(candidates)
 }
 
 /// The progress line of a pull on a terminal, redrawn on a thread of its own.

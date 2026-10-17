@@ -90,7 +90,7 @@ use crate::error::{Error, Result};
 use crate::fetch::{FetchRequest, Fetched, Fetcher, Priority};
 use crate::object::MAX_METADATA_SIZE;
 use crate::pull::verify::Verification;
-use crate::pull::{ModeChecks, PullCounters, PullFlags, PullOptions, refspec};
+use crate::pull::{ModeChecks, PullCounters, PullFlags, PullOptions, RefPlace};
 use crate::read::CommitState;
 use crate::repo::Repo;
 use crate::summary::{AdvertisedDelta, INDEXED_DELTAS_KEY, Summary, delta_digest};
@@ -102,9 +102,8 @@ use super::chain::{
 use super::http::{cached_source, fetch_remote_detached};
 use super::source::{RemoteSource, Transfer, session_error};
 use super::{
-    CheckedMeta, DetachedMetadataFilter, TimestampBase, TipChecks,
-    check_commit_signatures_filtered, check_local_commit_signatures, check_tip_refs, count_fetched,
-    source_size,
+    CheckedMeta, DetachedMetadataFilter, TipChecks, check_commit_signatures_filtered,
+    check_local_commit_signatures, check_tip_refs, count_fetched, source_size,
 };
 
 /// The number of delta parts that one pull fetches at a time.
@@ -722,9 +721,11 @@ impl ParsedDelta {
 /// `edges` is the index of a list of static deltas. With a list, discovery
 /// reads no summary and no delta index, and [`discover_chain`] plans and
 /// fetches the chains. It also checks the commit of each step, a target
-/// included, before the pull opens its transaction. `timestamp` is the
-/// timestamp check of these checks, which the caller resolved. A local pull
-/// passes [`TimestampBase::Off`]. A
+/// included, before the pull opens its transaction. `tips` holds the checks
+/// of each requested ref, with the timestamp check that the caller resolved,
+/// and the place of the refs, where discovery reads the current commit of a
+/// ref. A local pull passes
+/// [`TimestampBase::Off`](super::TimestampBase::Off). A
 /// [`COMMIT_ONLY`](PullFlags::COMMIT_ONLY) pull ignores the list. A pull that
 /// requires static deltas needs no summary for the list.
 #[allow(clippy::too_many_arguments)]
@@ -734,9 +735,8 @@ pub(crate) async fn discover(
     summary: Option<&Summary>,
     targets: &[(String, Checksum)],
     opts: &PullOptions,
-    ref_prefix: Option<&str>,
+    tips: TipChecks<'_>,
     edges: Option<Edges>,
-    timestamp: TimestampBase,
     verification: &Verification,
     progress: &PullCounters,
 ) -> Result<DeltaPlan> {
@@ -752,9 +752,8 @@ pub(crate) async fn discover(
             source,
             targets,
             opts,
-            ref_prefix,
+            tips,
             edges,
-            timestamp,
             verification,
             progress,
         )
@@ -777,7 +776,9 @@ pub(crate) async fn discover(
         if jobs.contains_key(to) || complete_here(repo, to).await? {
             continue;
         }
-        let tip = repo.resolve_ref_tip(&refspec(ref_prefix, ref_name)).await?;
+        let tip = repo
+            .resolve_relpath_tip(tips.place.relpath(ref_name)?)
+            .await?;
         let from = source_commit(repo, tip, to).await?;
         let scratch = scratch_allowed(tip, from, to);
         if let Some(job) = discover_one(
@@ -853,13 +854,12 @@ async fn discover_chain(
     source: &DeltaSource<'_>,
     targets: &[(String, Checksum)],
     opts: &PullOptions,
-    ref_prefix: Option<&str>,
+    tips: TipChecks<'_>,
     edges: Edges,
-    timestamp: TimestampBase,
     verification: &Verification,
     progress: &PullCounters,
 ) -> Result<DeltaPlan> {
-    let (wanted, names) = chain_targets(repo, targets, ref_prefix).await?;
+    let (wanted, names) = chain_targets(repo, targets, tips.place).await?;
     if wanted.is_empty() {
         return Ok(DeltaPlan::default());
     }
@@ -889,11 +889,7 @@ async fn discover_chain(
         verification,
         filter: &opts.detached_metadata_filter,
         progress,
-        tips: TipChecks {
-            bindings: !opts.flags.contains(PullFlags::DISABLE_VERIFY_BINDINGS),
-            timestamp,
-            ref_prefix,
-        },
+        tips,
     };
     // The record of each fetched step, by list index.
     let mut records: HashMap<usize, StepRecord> = HashMap::new();
@@ -1032,7 +1028,7 @@ impl Pass {
 async fn chain_targets<'t>(
     repo: &Repo,
     targets: &'t [(String, Checksum)],
-    ref_prefix: Option<&str>,
+    place: RefPlace<'_>,
 ) -> Result<(Vec<(Checksum, bool)>, Vec<&'t str>)> {
     let mut unique: Vec<Checksum> = Vec::new();
     let mut seen: HashSet<Checksum> = HashSet::new();
@@ -1051,7 +1047,7 @@ async fn chain_targets<'t>(
         if held.contains(to) {
             continue;
         }
-        let tip = repo.resolve_ref_tip(&refspec(ref_prefix, ref_name)).await?;
+        let tip = repo.resolve_relpath_tip(place.relpath(ref_name)?).await?;
         tips.push((ref_name.as_str(), *to, tip));
     }
     // A tip can be the source commit only if it is not the target.
@@ -2092,6 +2088,7 @@ async fn fetch_part_blob(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::pull::TimestampBase;
     use ostrya_core::Type;
 
     fn checksum(byte: u8) -> Checksum {
@@ -2346,9 +2343,8 @@ mod tests {
                 None,
                 &targets,
                 opts,
-                None,
+                TipChecks::new(opts.flags, TimestampBase::Off, RefPlace::Heads),
                 Some(Edges::new(list)?),
-                TimestampBase::Off,
                 verification,
                 counters,
             )
@@ -3129,9 +3125,8 @@ mod tests {
                     None,
                     &targets,
                     &opts,
-                    None,
+                    TipChecks::new(opts.flags, TimestampBase::Off, RefPlace::Heads),
                     Some(Edges::new(list.clone()).unwrap()),
-                    TimestampBase::Off,
                     &ed25519_verification(),
                     &counters,
                 )
@@ -3382,9 +3377,8 @@ mod tests {
                     None,
                     &targets,
                     &opts,
-                    None,
+                    TipChecks::new(opts.flags, TimestampBase::Off, RefPlace::Heads),
                     Some(Edges::new(list.clone()).unwrap()),
-                    TimestampBase::Off,
                     &verification,
                     &counters,
                 );
@@ -3501,9 +3495,8 @@ mod tests {
                 None,
                 &targets,
                 &opts,
-                None,
+                TipChecks::new(opts.flags, TimestampBase::Off, RefPlace::Heads),
                 Some(Edges::new(list).unwrap()),
-                TimestampBase::Off,
                 &verification,
                 &counters,
             );

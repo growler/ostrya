@@ -142,6 +142,7 @@ The summary lists these refs in its collection map.
 A directory under \fB\%refs/mirrors\fR whose name is not a collection id is not served and not listed.
 A push to the collection \fB\%<collection\-id>\fR writes it, when \fB\%<collection\-id>\fR is not the \fB\%collection\-id\fR of \fB\%[core]\fR.
 A push to that own collection id writes \fB\%refs/heads/<ref>\fR.
+A pull with \fB\%\-\-collection\fR writes these refs by the same rule: the collection ref, or \fB\%refs/heads/<ref>\fR for the own collection id.
 .TP
 \fB\%<repo>/state/<checksum>.commitpartial\fR
 A marker of a commit that the repository does not hold in full.

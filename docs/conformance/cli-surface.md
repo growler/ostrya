@@ -2950,6 +2950,17 @@ included) at exit 1. The port's fetcher serves `http` and `https` alone, so a
 `file://` remote, which the tool pulls from, reports `error: unsupported: fetch
 url scheme file: only http and https are fetched` at exit 1 and writes nothing.
 
+The port adds `--collection=ID`, the pull of the refs of the collection ID
+from each remote whose `collection-id` is ID (`format-reference.md`, "The
+pull of collection refs"). With it, each operand is a ref of the collection,
+and the command takes no REMOTE. `clap` refuses it together with `--url`,
+`--mirror`, or `--disable-verify-bindings`. A collection pull always checks
+the bindings of each commit. The command reads the `collection-id` key of
+each remote, so a value with a malformed escape sequence in any remote fails
+the command at exit 1. With no ref operand, a pull in which no candidate
+lists a ref of ID fails at exit 1 and writes nothing. The counterpart in the
+tool is `find-remotes --pull` ("P3").
+
 The keys `tls-ca-path`, `tls-client-cert-path`, and `tls-client-key-path` of
 a remote name TLS files. For each address other than an ssh address, the port
 reads at most 1 MiB and one byte of each such file. Under
@@ -3430,7 +3441,17 @@ No matrix cell needs these. The shell suite invokes them.
   note at the end of this section.
 - `checksum` -- `--ignore-xattrs`.
 - `find-remotes` -- `--cache-dir`, `--disable-fsync`, `--finders=FINDERS`,
-  `--pull`, `--mirror`.
+  `--pull`, `--mirror`. The port's counterpart of `find-remotes --pull` is
+  `pull --collection=ID [REF]...` ("P2", `pull`). It differs from the tool in
+  these points:
+  - The port reads the candidates from the config alone. It has no
+    `--finders`, no mount finder, and no LAN (Avahi) finder.
+  - The operands are refs of one collection. The tool takes
+    `COLLECTION-ID REF` pairs.
+  - The port prints the statistics line of a pull, and one warning line for
+    each candidate that it skips.
+  - The port has no `--mirror` for a collection pull, and no command that
+    finds the remotes and pulls nothing.
 - `create-usb` -- `--disable-fsync`, `--destination-repo=DEST`,
   `--commit=COMMIT`.
 - `gpg-sign` -- `-d/--delete`, `--gpg-homedir=HOMEDIR`. The port folds GPG

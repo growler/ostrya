@@ -17,6 +17,7 @@ use ostrya_core::{DirTree, ObjectName, ObjectType};
 use crate::error::{Error, Result};
 
 /// The parsed subpath values of one pull, each split into its components.
+#[derive(Clone)]
 pub(crate) struct Subpaths {
     paths: Vec<Vec<String>>,
 }

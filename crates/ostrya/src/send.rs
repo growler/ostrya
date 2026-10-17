@@ -132,7 +132,7 @@ impl fmt::Display for SendEvent {
 }
 
 /// Writes `text` with each ASCII control character as its escape sequence.
-fn write_escaped(f: &mut fmt::Formatter<'_>, text: &str) -> fmt::Result {
+pub(crate) fn write_escaped(f: &mut fmt::Formatter<'_>, text: &str) -> fmt::Result {
     for c in text.chars() {
         if c.is_ascii_control() {
             write!(f, "{}", c.escape_default())?;

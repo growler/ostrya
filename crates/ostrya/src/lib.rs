@@ -20,6 +20,7 @@
 //! - [`Repo::checkout_at`] writes the tree of a commit into a directory.
 //! - [`Repo::pull`] copies commits from a remote, and [`Repo::pull_local`] from a local repository.
 //! - [`Repo::pull_with_session`] copies commits from a remote through a session of the caller.
+//! - [`Repo::pull_collection`] copies the refs of a collection from the remotes that serve it.
 //! - [`Error`] is the error of each fallible operation of the crate.
 //!
 //! # Modules
@@ -177,6 +178,7 @@ pub use ostrya_remote::proto::{
 pub use prune::{PruneOptions, PruneStats, WeakRefFilter, WeakRefFilterFn};
 #[doc(hidden)]
 pub use pull::{
+    CollectionPullEvent, CollectionPullOptions, CollectionPullRef, CollectionPullStats,
     DetachedMetadataFilter, DetachedMetadataFilterFn, PullFlags, PullOptions, PullProgress,
     PullProgressSnapshot, PullStats, PullVerify, TimestampCheck,
 };

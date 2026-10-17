@@ -4,13 +4,14 @@
 //!
 //! The server records these values:
 //!
-//! - each request path that it receives
+//! - each request path that it receives, and its query
 //! - the status of the answer to each request
 //! - the largest number of requests in flight at the same time
 //! - the number of connections that it accepts
 //!
 //! A TLS server can demand a client certificate that the fixture authority
-//! signed, and any server can demand a bearer token.
+//! signed, and any server can demand a bearer token. Any server can answer a
+//! path with a fixed status.
 //!
 //! The pull tests declare this module with a `path` attribute, so the other
 //! tests do not build the server.
@@ -183,6 +184,12 @@ pub struct Policy {
     /// The bearer token that each request must carry. A request without
     /// `Authorization: Bearer <token>` gets a 401 answer.
     bearer: Option<String>,
+    /// The request paths, each with the status of its answer, which has an
+    /// empty body.
+    statuses: HashMap<String, u16>,
+    /// Each request path with its query, or an empty query, in the order of
+    /// the requests.
+    queries: Vec<(String, String)>,
 }
 
 /// The server leaf certificate that a TLS [`RepoServer`] presents.
@@ -349,6 +356,28 @@ impl RepoServer {
         self.policy.lock().unwrap().bearer = Some(token.to_owned());
     }
 
+    /// Answers each request for `path` with `status` and an empty body.
+    pub fn answer_status(&self, path: &str, status: u16) {
+        self.policy
+            .lock()
+            .unwrap()
+            .statuses
+            .insert(path.to_owned(), status);
+    }
+
+    /// Returns the query of each request for `path`, in order. A request
+    /// with no query gives an empty string.
+    pub fn queries_for(&self, path: &str) -> Vec<String> {
+        self.policy
+            .lock()
+            .unwrap()
+            .queries
+            .iter()
+            .filter(|(seen, _)| seen == path)
+            .map(|(_, query)| query.clone())
+            .collect()
+    }
+
     pub fn hide(&self, path: &str) {
         self.policy.lock().unwrap().hidden.insert(path.to_owned());
     }
@@ -398,6 +427,7 @@ impl RepoServer {
     pub fn forget(&self) {
         self.seen.lock().unwrap().clear();
         self.answered.lock().unwrap().clear();
+        self.policy.lock().unwrap().queries.clear();
     }
 }
 
@@ -423,6 +453,8 @@ where
         let (root, seen, answered, policy, peak, inflight) = state.clone();
         async move {
             let path = request.uri().path().trim_start_matches('/').to_owned();
+            let query = request.uri().query().unwrap_or_default().to_owned();
+            policy.lock().unwrap().queries.push((path.clone(), query));
             let authorization = request
                 .headers()
                 .get(hyper::header::AUTHORIZATION)
@@ -468,6 +500,9 @@ pub fn answer(
             && authorization != Some(format!("Bearer {token}").as_str())
         {
             return status_only(StatusCode::UNAUTHORIZED);
+        }
+        if let Some(status) = policy.statuses.get(path) {
+            return status_only(StatusCode::from_u16(*status).unwrap());
         }
         let cut_once = match policy.truncate_first.get_mut(path) {
             Some(left) if *left > 0 => {

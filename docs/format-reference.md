@@ -3587,6 +3587,9 @@ this way:
 Over HTTP, the server keeps one copy of an entry that the query repeats ("GET
 /_ostrya/refs/v1"). The selection and the bytes of the listing are the same.
 
+A pull of collection refs reads the ref listing or the summary of a remote,
+over both transports ("The pull of collection refs").
+
 ## The ref listing
 
 A ref listing is a summary GVariant `(a(s(taya{sv}))a{sv})` with no signature.
@@ -3691,6 +3694,80 @@ a lower bound of the size from the names of the refs and from the collection
 ids after each ref that it selects, before it reads a commit. It reads no more
 ref file when the bound passes the size. It writes the map one ref entry at a
 time, so a listing over the size fails before it is whole in memory.
+
+## The pull of collection refs
+
+`ostrya pull --collection ID [REF]...` pulls refs of the collection `ID` from
+the remotes that serve it. The candidates are the `[remote "NAME"]` groups
+with `collection-id=ID`, in the order of the config. The `ostree` command does
+this work with `find-remotes --pull`.
+
+Before its first request, the pull refuses a `REF` whose entry `ID/REF` is
+longer than 4,096 bytes or has more than 256 parts, or whose request target
+alone over HTTP (item 2 below) is longer than 16 KiB. It resolves the address
+and the trust of each candidate. It also builds the HTTP client of each HTTP
+candidate, and checks the ssh command and the send command of each ssh
+candidate. An error in the config of any candidate stops the pull.
+
+The pull asks each candidate in turn for the commit of each ref. It opens one
+session to each candidate: an ssh client over ssh, or the HTTP client over
+HTTP. The pull from a selected candidate uses the same session.
+
+1. If the remote config asks for a signature on the summary
+   (`gpg-verify-summary`, `sign-verify-summary`), the pull reads `summary.sig`
+   and `summary`, verifies the summary, and reads the refs from it. No
+   signature covers a ref listing, so the pull reads no listing from such a
+   candidate.
+2. Otherwise, the pull reads a ref listing ("The ref listing"). The entries of
+   the local refs are the names `REF`. The entries of the collection refs are
+   the names `ID/REF`. A request holds at most 128 names, so it holds at most
+   256 entries ("Ref selectors"). Over HTTP, the request target of a request
+   is also at most 16 KiB, from `_ostrya/refs/v1` to the end of the query. A
+   longer list of names takes more requests.
+3. A pull with no `REF` first sends the one entry `!**` of the local refs,
+   which selects no ref, and the one entry `ID/**` of the collection refs. If
+   the listing states `ID` in `ostree.summary.collection-id`, a second request
+   sends no entry of the local refs, which selects each local ref, and no
+   selector of the collection refs.
+4. If the server answers a listing request with a status from 400 to 499, for
+   example 404 from a static server, the pull reads `summary`. A remote with
+   no listing and no summary lists no ref. Over a stream session, the server
+   always serves the listing.
+
+In the listing or the summary, the refs of `ID` are in field 0 when
+`ostree.summary.collection-id` is `ID`. Otherwise they are in
+`ostree.summary.collection-map` under `ID`, and the pull ignores field 0. The
+timestamp of each ref is its `ostree.commit.timestamp`, a big-endian `t`.
+
+A candidate is skipped, with a warning, when a request fails, when a listing
+request gets a status from 500 to 599, when the listing or the summary does
+not parse, when the summary fails its signature check, when a listed name
+fails the ref-name rule, or when a listed ref has no `ostree.commit.timestamp`
+of type `t`. The pull fails when each candidate is skipped, when no candidate
+lists a requested `REF`, and, with no `REF`, when no candidate lists a ref of
+`ID`. These failures come before the first object request.
+
+For each ref, the pull selects the candidate with the newest listed
+timestamp. A tie goes to the first candidate in the config. After the
+selection, the pull ends the session of each candidate with no selected ref.
+The pull then takes the objects of the refs of each selected candidate, in
+the order of the config, as a pull from that remote does at the listed commit
+(`conformance/cli-behavior.md`, "HTTP pull surface"). It uses one transaction
+for each such candidate. If the probe read the refs from the summary, the pull
+uses those bytes. Otherwise it reads the `summary.sig` and the `summary` of
+the candidate. It reads the `config` of the candidate, and no ref file. The
+keys of that candidate verify its commits. A failure of a selected candidate
+stops the pull, and the refs of the earlier candidates stay written.
+
+The pull refuses a commit:
+
+- whose `ostree.collection-binding` is not `ID`, or that has no such key;
+- whose `ostree.ref-binding` is present and does not hold `REF`;
+- whose timestamp is not the listed timestamp of `REF`.
+
+The pull writes `refs/mirrors/ID/REF`. In a repository with
+`[core] collection-id=ID`, it writes `refs/heads/REF`. It writes no ref under
+`refs/remotes/`.
 
 ## Summaries of auth items
 

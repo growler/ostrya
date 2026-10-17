@@ -55,14 +55,14 @@ use crate::write::FileMeta;
 use super::chain::Edges;
 use super::delta::{self, CommitCheck, DeltaJob, DeltaPlan, DeltaSource, PART_CAP};
 use super::drive::Slots;
-use super::source::{RemoteSource, Transfer, http_error, session_error};
+use super::source::{RemoteSource, RootFiles, Transfer, http_error, session_error};
 use super::subpath::{Scope, Subpaths};
 use super::verify::Verification;
 use super::{
     CheckedMeta, DetachedMetadataFilter, ModeChecks, PullCounters, PullFlags, PullOptions,
-    PullStats, PullVerify, READ_CHUNK, TimestampBase, TipChecks, apply_durability,
+    PullStats, PullVerify, READ_CHUNK, RefPlace, TimestampBase, TipChecks, apply_durability,
     check_commit_signatures_filtered, check_depth, check_remote_option, check_static_deltas,
-    check_tip_refs, refspec, refuse_remote_collection, take_static_deltas,
+    check_tip_refs, refuse_remote_collection, take_static_deltas,
 };
 
 /// The number of fetched content objects that stream into the object store at
@@ -418,7 +418,8 @@ impl Repo {
     ///   `-1`.
     /// - [`Error::Unsupported`] if
     ///   [`collection_id`](PullOptions::collection_id) is set. The pull reads
-    ///   no collection ref.
+    ///   no collection ref. [`pull_collection`](Repo::pull_collection) pulls
+    ///   collection refs.
     /// - [`Error::InvalidInput`] if [`remote`](PullOptions::remote) holds a
     ///   name that [`valid_remote_name`](crate::config::valid_remote_name)
     ///   refuses, also under [`MIRROR`](PullFlags::MIRROR).
@@ -558,23 +559,7 @@ impl Repo {
         // The trust comes before the session, so a refused policy starts no
         // fetcher and no ssh client.
         let trust = PullTrust::from_remote(self, remote, &opts.verify).await?;
-        // A limit of the caller replaces the limit of the endpoint. The pull
-        // keeps as many steps in flight as the session admits.
-        let (endpoint, stream) = match endpoint {
-            Endpoint::Http(mut http) => {
-                if let Some(n) = opts.max_outstanding_fetches {
-                    http.max_outstanding = n;
-                }
-                (Endpoint::Http(http), StreamSessionOptions::default())
-            }
-            ssh @ Endpoint::Ssh { .. } => (
-                ssh,
-                StreamSessionOptions {
-                    agent: None,
-                    max_outstanding: opts.max_outstanding_fetches,
-                },
-            ),
-        };
+        let (endpoint, stream) = session_options(endpoint, opts.max_outstanding_fetches);
         let session = connect(endpoint, stream).await?;
         // The trust and the session now hold what these fields gave.
         opts.verify = PullVerify::default();
@@ -658,7 +643,8 @@ impl Repo {
     /// - [`Error::InvalidInput`] if [`depth`](PullOptions::depth) is below
     ///   `-1`.
     /// - [`Error::Unsupported`] if
-    ///   [`collection_id`](PullOptions::collection_id) is set.
+    ///   [`collection_id`](PullOptions::collection_id) is set. The pull reads
+    ///   no collection ref.
     /// - [`Error::InvalidInput`] if [`remote`](PullOptions::remote) holds a
     ///   name that [`valid_remote_name`](crate::config::valid_remote_name)
     ///   refuses, also under `MIRROR`.
@@ -740,7 +726,7 @@ impl Repo {
     /// index of the list of static deltas that the caller took out of `opts`.
     /// `started` is the start of [`PullStats::elapsed`].
     #[allow(clippy::too_many_arguments)]
-    async fn run_session(
+    pub(super) async fn run_session(
         &self,
         session: PullSession,
         trust: PullTrust,
@@ -784,7 +770,11 @@ impl Repo {
         started: Instant,
     ) -> Result<PullStats> {
         let mirror = opts.flags.contains(PullFlags::MIRROR);
-        let prefix = if mirror { None } else { opts.remote.as_deref() };
+        let place = match wanted {
+            Wanted::Pinned(pinned) => pinned.place,
+            _ if mirror => RefPlace::Heads,
+            _ => RefPlace::of_remote(opts.remote.as_deref()),
+        };
 
         // The markers that the pull writes. They stay outside the span that
         // writes them, so a failure in that span clears the markers it left.
@@ -794,7 +784,7 @@ impl Repo {
                 &source,
                 wanted,
                 opts,
-                prefix,
+                place,
                 verification,
                 subpaths,
                 edges,
@@ -817,7 +807,7 @@ impl Repo {
                 } = fetched;
                 if !opts.no_ref_writes {
                     for (name, tip) in &targets {
-                        txn.set_ref(&refspec(prefix, name), Some(tip));
+                        place.queue(&txn, name, tip);
                     }
                 }
                 txn.commit().await.map(|stats| (stats, summary, signature))
@@ -906,41 +896,56 @@ impl Repo {
         source: &RemoteSource,
         wanted: Wanted<'_>,
         opts: &PullOptions,
-        prefix: Option<&str>,
+        place: RefPlace<'_>,
         verification: &Verification,
         subpaths: Option<Subpaths>,
         edges: Option<Edges>,
         counters: &PullCounters,
         marked: &mut Vec<Checksum>,
     ) -> Result<FetchedPull> {
-        let mut root = source.root_files().await?;
-        // A mirror pull of every ref that writes refs copies the `summary` and
-        // the `summary.sig` of the remote. Each other pull drops the bytes
-        // after their checks.
-        let copies_summary =
-            opts.flags.contains(PullFlags::MIRROR) && opts.refs.is_empty() && !opts.no_ref_writes;
-        // The pull checks the summary before it reads it. The pull acts on the
-        // refs that the summary resolves and the deltas that it advertises.
-        // As a result, a summary that the policy refuses stops the pull before
-        // its first object request.
-        root.signature = verification
-            .check_summary(root.summary.as_deref(), root.signature.take())
-            .await?
-            .filter(|_| copies_summary);
-        // A summary can be as large as its read cap, so the parse runs on the
-        // blocking pool. The bytes come back only for the write of a mirror
-        // pull, and else drop there.
-        let summary = match root.summary.take() {
-            Some(bytes) => {
-                let (parsed, bytes) = ostrya_rt::unblock(move || {
-                    let parsed = Summary::parse(&bytes);
-                    (parsed, copies_summary.then_some(bytes))
-                })
-                .await;
-                root.summary = bytes;
-                Some(parsed?)
+        let mut root;
+        let summary = if let Wanted::Pinned(Pinned {
+            summary: Some(bytes),
+            ..
+        }) = wanted
+        {
+            // The probe of a collection pull read this summary and checked it
+            // under the trust of this pull, so the pull does not fetch it
+            // again. The parse runs on the blocking pool, as below.
+            root = RootFiles::default();
+            let bytes = Arc::clone(bytes);
+            Some(ostrya_rt::unblock(move || Summary::parse(&bytes)).await?)
+        } else {
+            root = source.root_files().await?;
+            // A mirror pull of every ref that writes refs copies the `summary`
+            // and the `summary.sig` of the remote. Each other pull drops the
+            // bytes after their checks.
+            let copies_summary = opts.flags.contains(PullFlags::MIRROR)
+                && opts.refs.is_empty()
+                && !opts.no_ref_writes;
+            // The pull checks the summary before it reads it. The pull acts on
+            // the refs that the summary resolves and the deltas that it
+            // advertises. As a result, a summary that the policy refuses stops
+            // the pull before its first object request.
+            root.signature = verification
+                .check_summary(root.summary.as_deref(), root.signature.take())
+                .await?
+                .filter(|_| copies_summary);
+            // A summary can be as large as its read cap, so the parse runs on
+            // the blocking pool. The bytes come back only for the write of a
+            // mirror pull, and else drop there.
+            match root.summary.take() {
+                Some(bytes) => {
+                    let (parsed, bytes) = ostrya_rt::unblock(move || {
+                        let parsed = Summary::parse(&bytes);
+                        (parsed, copies_summary.then_some(bytes))
+                    })
+                    .await;
+                    root.summary = bytes;
+                    Some(parsed?)
+                }
+                None => None,
             }
-            None => None,
         };
         check_remote_mode(root.config(source).await?)?;
         let targets = self
@@ -960,6 +965,17 @@ impl Repo {
         } else {
             TimestampBase::resolve(self, &opts.timestamp_check).await?
         };
+        // The checks of each requested ref. A collection pull adds the check
+        // of the collection binding and of the timestamp that the remote
+        // listed.
+        let tip_checks = match wanted {
+            Wanted::Pinned(pinned) => TipChecks {
+                collection: Some(pinned.collection),
+                listed: Some(&pinned.listed),
+                ..TipChecks::new(opts.flags, timestamp, place)
+            },
+            _ => TipChecks::new(opts.flags, timestamp, place),
+        };
 
         // The deltas that can deliver these commits, found before the first
         // object request. A commit that a delta carries has no `.commit`
@@ -971,9 +987,8 @@ impl Repo {
             summary.as_ref(),
             &targets,
             opts,
-            prefix,
+            tip_checks,
             edges,
-            timestamp,
             verification,
             counters,
         )
@@ -1006,8 +1021,7 @@ impl Repo {
                 &txn,
                 source,
                 opts,
-                prefix,
-                timestamp,
+                tip_checks,
                 phase,
                 &deltas,
                 verification,
@@ -1042,8 +1056,7 @@ impl Repo {
             &txn,
             source,
             opts,
-            prefix,
-            timestamp,
+            tip_checks,
             phase,
             &deltas,
             verification,
@@ -1116,6 +1129,9 @@ impl Repo {
         summary: Option<&Summary>,
         source: &RemoteSource,
     ) -> Result<Vec<(String, Checksum)>> {
+        if let Wanted::Pinned(pinned) = wanted {
+            return Ok(pinned.targets.clone());
+        }
         let names = if !opts.refs.is_empty() {
             opts.refs.clone()
         } else if opts.flags.contains(PullFlags::MIRROR) {
@@ -1190,8 +1206,7 @@ impl Repo {
         txn: &Transaction,
         source: &RemoteSource,
         opts: &PullOptions,
-        ref_prefix: Option<&str>,
-        timestamp: TimestampBase,
+        tip_checks: TipChecks<'_>,
         phase: Phase<'_>,
         delta_plan: &DeltaPlan,
         verification: &Verification,
@@ -1206,8 +1221,7 @@ impl Repo {
             sources: &opts.localcache_repos,
             flags: opts.flags,
             checks: ModeChecks::new(opts.flags, self.mode()),
-            ref_prefix,
-            timestamp,
+            tip_checks,
             tips: phase.tips,
             deltas: phase.deltas,
             done: phase.done,
@@ -1540,12 +1554,7 @@ impl Repo {
             .flatten()
             .map(String::as_str)
             .collect();
-        let checks = TipChecks {
-            bindings: !ctx.flags.contains(PullFlags::DISABLE_VERIFY_BINDINGS),
-            timestamp: ctx.timestamp,
-            ref_prefix: ctx.ref_prefix,
-        };
-        check_tip_refs(self, checks, checksum, commit, &refs).await
+        check_tip_refs(self, ctx.tip_checks, checksum, commit, &refs).await
     }
 
     /// Runs the step of a commit that an earlier run of this pull made
@@ -1815,11 +1824,40 @@ struct FetchedPull {
     signature: Option<Vec<u8>>,
 }
 
+/// Returns `endpoint` with the request limit `max_outstanding` of the caller,
+/// and the options of a stream session to it.
+///
+/// A limit of the caller replaces the limit of the endpoint. The pull keeps as
+/// many steps in flight as the session admits.
+pub(super) fn session_options(
+    endpoint: Endpoint,
+    max_outstanding: Option<usize>,
+) -> (Endpoint, StreamSessionOptions) {
+    match endpoint {
+        Endpoint::Http(mut http) => {
+            if let Some(n) = max_outstanding {
+                http.max_outstanding = n;
+            }
+            (Endpoint::Http(http), StreamSessionOptions::default())
+        }
+        ssh @ Endpoint::Ssh { .. } => (
+            ssh,
+            StreamSessionOptions {
+                agent: None,
+                max_outstanding,
+            },
+        ),
+    }
+}
+
 /// Opens the session of a pull to `endpoint`.
 ///
 /// Over ssh, the session takes the options `stream`. Over HTTP, the options
 /// of the endpoint give the request limit, and `stream` must be the default.
-async fn connect(endpoint: Endpoint, stream: StreamSessionOptions) -> Result<PullSession> {
+pub(super) async fn connect(
+    endpoint: Endpoint,
+    stream: StreamSessionOptions,
+) -> Result<PullSession> {
     match endpoint {
         Endpoint::Http(http) => PullSession::connect(Endpoint::Http(http), stream)
             .await
@@ -1874,15 +1912,37 @@ fn no_refs() -> Error {
 }
 
 /// The refs that a pull from a remote takes if
-/// [`refs`](PullOptions::refs) is empty.
+/// [`refs`](PullOptions::refs) is empty, or the refs of a collection pull.
 #[derive(Clone, Copy)]
-enum Wanted<'a> {
+pub(super) enum Wanted<'a> {
     /// No other ref. [`Repo::pull_with_session`] refuses an empty list.
     Named,
     /// Under [`MIRROR`](PullFlags::MIRROR), each ref of the summary of the
     /// remote. Otherwise, the `branches` key of the remote section of this
     /// name.
     Config(&'a str),
+    /// The refs of a collection pull, each at the commit that the pull
+    /// selected. The pull reads no ref of the remote, and does not read
+    /// [`refs`](PullOptions::refs).
+    Pinned(&'a Pinned<'a>),
+}
+
+/// The refs of a collection pull from one remote, and the checks of their
+/// commits.
+pub(super) struct Pinned<'a> {
+    /// Each ref name, and the commit that the pull selected for it.
+    pub(super) targets: Vec<(String, Checksum)>,
+    /// The timestamp that the remote listed for each ref of `targets`.
+    pub(super) listed: HashMap<String, u64>,
+    /// The collection id that the `ostree.collection-binding` of each tip
+    /// must state.
+    pub(super) collection: &'a str,
+    /// The place of the written refs.
+    pub(super) place: RefPlace<'a>,
+    /// The `summary` of the remote, if the probe of the collection pull read
+    /// the refs from it. The probe checked it under the trust of this pull,
+    /// so the pull reads these bytes in place of the remote file.
+    pub(super) summary: Option<Arc<Vec<u8>>>,
 }
 
 /// The state that every step of one pull shares.
@@ -1900,12 +1960,10 @@ struct StepCtx<'a> {
     /// path: a loose fetch, a localcache import, or the parts of a static
     /// delta.
     checks: ModeChecks,
-    /// The prefix of the pulled refs. The timestamp check resolves the current
-    /// tip of a ref through it. `None` is a local ref.
-    ref_prefix: Option<&'a str>,
-    /// The timestamp check of the pull, which the pull resolved before
-    /// discovery.
-    timestamp: TimestampBase,
+    /// The checks of each requested ref: the ref-binding check, the timestamp
+    /// check that the pull resolved before discovery, and the place of the
+    /// pulled refs, where the timestamp check reads the current tip of a ref.
+    tip_checks: TipChecks<'a>,
     /// The requested refs of each tip commit, for the binding check and the
     /// timestamp check. A commit with no entry is a parent under `depth`,
     /// which no ref names. The map is empty in the run of a level of

@@ -18,18 +18,23 @@ On success, the command prints one statistics line to standard output. If standa
 \fIREMOTE\fR
 The remote to pull from, a \fB\%[remote "<name>"]\fR section of the config.
 .IP
-The remote name is also the prefix of the written refs, \fB\%refs/remotes/<name>/\fR\&. The operand is required, and the command refuses a pull with no remote.
+The remote name is also the prefix of the written refs, \fB\%refs/remotes/<name>/\fR\&. Without \%\-\-collection, the operand is required, and the command refuses a pull with no remote. With \%\-\-collection, this operand is the first ref of the collection.
 .TP
 \fIREFS...\fR
 The refs to pull.
 .IP
-With none, the pull takes the configured \fB\%branches\fR of the remote, or with \%\-\-mirror every ref that its summary lists. The pull looks up each ref in the summary of the remote. If the summary does not list the ref, the pull reads \fB\%refs/heads/<ref>\fR of the remote.
+With none, the pull takes the configured \fB\%branches\fR of the remote, or with \%\-\-mirror every ref that its summary lists. The pull looks up each ref in the summary of the remote. If the summary does not list the ref, the pull reads \fB\%refs/heads/<ref>\fR of the remote. With \%\-\-collection, these are the other refs of the collection.
 .SH OPTIONS
 .TP
 \fB\-\-url\fR \fIURL\fR
 Fetch from this address, an HTTP URL or an ssh address.
 .IP
 The address replaces the configured \fB\%pull\-url\fR or \fB\%url\fR of the remote. An address that starts with \fB\%ssh://\fR, or that holds no \fB\%://\fR, is an ssh address. With this option, a pull can use a remote that the config does not describe. The config gives no keys for such a remote, and \fB\%gpg\-verify\fR keeps its default of true. So the pull requires a GPG signature on each commit, unless the command line states its own signature policy, for example \%\-\-gpg\-verify=false.
+.TP
+\fB\-\-collection\fR \fIID\fR
+Pull refs of the collection ID from each remote that serves it.
+.IP
+The candidates are the remotes whose \fB\%collection\-id\fR key is ID. If no remote has the key, the command fails. The command reads the key of each remote, so a \fB\%collection\-id\fR value with a malformed escape sequence in any remote fails the command. With this option, each operand is a ref of the collection, and the command takes no REMOTE. With no ref, the pull takes each ref of the collection that a candidate lists, and fails if no candidate lists a ref. The pull asks each candidate for the commit of each ref, through the ref listing of the server or else through its summary. Under \fB\%gpg\-verify\-summary\fR or \fB\%sign\-verify\-summary\fR, it reads the refs from the verified summary alone. For each ref, it selects the candidate with the newest commit, and a tie goes to the first candidate in the config. A candidate that fails to answer is skipped with a warning. The pull from each selected candidate is a pull of its own, so a failure of a later candidate keeps the refs of the earlier ones. The keys of the selected candidate apply. Each commit must be bound to ID. If a commit has a ref binding, the binding must hold the ref. The pull writes \fB\%refs/mirrors/ID/REF\fR, or \fB\%refs/heads/REF\fR if the \fB\%collection\-id\fR of this repository is ID.
 .TP
 \fB\-\-mirror\fR
 Write the pulled refs as local refs under \fB\%refs/heads/\fR\&.

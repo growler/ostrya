@@ -29,6 +29,8 @@ API documentation: <https://docs.rs/ostrya>
   repository.
 - `Repo::pull_with_session` copies commits from a remote through a session of the
   caller.
+- `Repo::pull_collection` copies the refs of a collection from the remotes that
+  serve it.
 - `Error` is the error of each fallible operation of the crate.
 
 ## Modules

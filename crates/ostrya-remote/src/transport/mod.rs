@@ -467,6 +467,25 @@ impl StreamSession {
         let argv = pull_command_line(address, options, env.as_deref())?;
         spawn_and_open_pull(&argv, session, PENDING_READ_LIMIT).await
     }
+
+    /// Checks the command line of the ssh client that
+    /// [`connect`](StreamSession::connect) builds for `address` and
+    /// `options`.
+    ///
+    /// The call reads the `OSTRYA_SSH_COMMAND` environment variable, and
+    /// applies the [Empty values](SshOptions#empty-values) rules of a pull. It
+    /// starts no ssh client. A caller that opens sessions to more than one
+    /// remote can make this check for each remote before its first request.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidInput`] if the ssh command or the send command is
+    ///   empty or holds only white space, or if the value of
+    ///   `OSTRYA_SSH_COMMAND` is not UTF-8.
+    pub fn check_command_line(address: &SshAddress, options: &SshOptions) -> Result<()> {
+        let env = std::env::var_os("OSTRYA_SSH_COMMAND");
+        pull_command_line(address, options, env.as_deref()).map(drop)
+    }
 }
 
 /// The open of the session of a pull over ssh or HTTP.

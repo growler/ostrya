@@ -133,6 +133,12 @@ A pull refuses an ssh address in this key.
 .TP
 \fB\%branches\fR (list)
 The refs that \fB\%ostrya pull NAME\fR fetches when the command names no ref.
+.TP
+\fB\%collection\-id\fR (string)
+The collection that the remote serves.
+\fB\%ostrya pull \-\-collection ID\fR takes each remote whose \fB\%collection\-id\fR is \fB\%ID\fR as a candidate, in the order of the config.
+A pull that names the remote does not read this key.
+\fB\%ostrya pull \-\-collection\fR reads the key of each remote, so a value with a malformed escape sequence in any remote fails that command.
 .SS "Verification"
 .TP
 \fB\%gpg\-verify\fR (boolean, default true)
@@ -686,7 +692,7 @@ ostrya keeps these keys and does not use them:
 ostrya does not read these keys.
 The default of \fB\%default\-repo\-finders\fR is \fB\%config;mount\fR.
 .TP
-\fB\%contenturl\fR, \fB\%metalink\fR, \fB\%custom\-backend\fR, and \fB\%collection\-id\fR of a remote
+\fB\%contenturl\fR, \fB\%metalink\fR, and \fB\%custom\-backend\fR of a remote
 \fB\%ostrya remote add\fR writes them, and a pull does not read them.
 .PP
 ostrya does not read the remote groups in \fB\%remotes.d/\fR directories.

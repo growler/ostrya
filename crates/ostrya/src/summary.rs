@@ -98,9 +98,9 @@ const TOMBSTONE_KEY: &str = "ostree.summary.tombstone-commits";
 const COLLECTION_MAP_KEY: &str = "ostree.summary.collection-map";
 /// The summary key that states if the remote indexes its deltas.
 pub(crate) const INDEXED_DELTAS_KEY: &str = "ostree.summary.indexed-deltas";
-const COLLECTION_ID_KEY: &str = "ostree.summary.collection-id";
+pub(crate) const COLLECTION_ID_KEY: &str = "ostree.summary.collection-id";
 const COMMIT_VERSION_KEY: &str = "ostree.commit.version";
-const COMMIT_TIMESTAMP_KEY: &str = "ostree.commit.timestamp";
+pub(crate) const COMMIT_TIMESTAMP_KEY: &str = "ostree.commit.timestamp";
 const COLLECTION_BINDING_KEY: &str = "ostree.collection-binding";
 const REF_BINDING_KEY: &str = "ostree.ref-binding";
 
@@ -308,27 +308,10 @@ impl Summary {
     ///   other than `a{sa(s(taya{sv}))}`, or if the map does not have the
     ///   shape of that type.
     pub fn collection_map(&self) -> Result<Vec<(String, Vec<SummaryRef>)>> {
-        let Some((ty, map)) = self
-            .metadata
-            .dict_get(COLLECTION_MAP_KEY)
-            .and_then(Value::as_variant)
-        else {
-            return Ok(Vec::new());
-        };
-        let signature = ty.signature();
-        if signature != COLLECTION_MAP_SIGNATURE {
-            return Err(malformed(&format!(
-                "the collection map has type `{signature}`, not `{COLLECTION_MAP_SIGNATURE}`"
-            )));
-        }
-        let Some(entries) = map.as_array() else {
-            return Err(malformed("the collection map is not an array"));
-        };
+        let entries = collection_map_entries(&self.metadata)?;
         let mut collections = Vec::with_capacity(entries.len());
         for entry in entries {
-            let Some([Value::Str(collection), Value::Array(refs)]) = entry.as_tuple() else {
-                return Err(malformed("a collection-map entry is not (id, refs)"));
-            };
+            let (collection, refs) = collection_map_entry(entry)?;
             let mut parsed = Vec::with_capacity(refs.len());
             for value in refs {
                 parsed.push(parse_ref_entry(value.clone())?);
@@ -371,6 +354,86 @@ impl Summary {
             .find(|entry| entry.name == ref_name)
             .map(|entry| entry.commit)
     }
+}
+
+/// Parses only the ref list, field 0, of the bytes of a `summary` file.
+///
+/// The global metadata dict stays undecoded. The framing checks are those of
+/// [`Summary::parse`].
+///
+/// # Errors
+///
+/// - [`Error::Core`] if the codec cannot read the bytes as the summary type.
+/// - [`Error::InvalidFormat`] if a ref entry does not have the shape of the
+///   type.
+pub(crate) fn parse_ref_list(bytes: &[u8]) -> Result<Vec<SummaryRef>> {
+    let ty = Type::parse(SUMMARY_SIGNATURE).map_err(ostrya_core::Error::from)?;
+    let Value::Array(entries) =
+        tuple_field_from_bytes(&ty, bytes, 0).map_err(ostrya_core::Error::from)?
+    else {
+        return Err(malformed("summary field 0 is not an array"));
+    };
+    entries.into_iter().map(parse_ref_entry).collect()
+}
+
+/// Returns the refs of the collection `id` in the
+/// `ostree.summary.collection-map` of the global metadata dict `metadata`.
+///
+/// The list is empty if the dict has no map, or if the map has no entry of
+/// `id`. If the map holds `id` two times, the first entry counts. The call
+/// parses the refs of that entry alone, and copies no ref of another
+/// collection.
+///
+/// # Errors
+///
+/// - [`Error::InvalidFormat`] for the reasons of
+///   [`Summary::collection_map`], in the entries up to the entry of `id`.
+pub(crate) fn collection_map_refs(metadata: &Value, id: &str) -> Result<Vec<SummaryRef>> {
+    for entry in collection_map_entries(metadata)? {
+        let (collection, refs) = collection_map_entry(entry)?;
+        if collection == id {
+            return refs.iter().cloned().map(parse_ref_entry).collect();
+        }
+    }
+    Ok(Vec::new())
+}
+
+/// Returns the entries of the `ostree.summary.collection-map` of the global
+/// metadata dict `metadata`, or no entry if the dict has no map.
+///
+/// # Errors
+///
+/// - [`Error::InvalidFormat`] if the variant that holds the map has a type
+///   other than `a{sa(s(taya{sv}))}`, or if the map is not an array.
+fn collection_map_entries(metadata: &Value) -> Result<&[Value]> {
+    let Some((ty, map)) = metadata
+        .dict_get(COLLECTION_MAP_KEY)
+        .and_then(Value::as_variant)
+    else {
+        return Ok(&[]);
+    };
+    let signature = ty.signature();
+    if signature != COLLECTION_MAP_SIGNATURE {
+        return Err(malformed(&format!(
+            "the collection map has type `{signature}`, not `{COLLECTION_MAP_SIGNATURE}`"
+        )));
+    }
+    map.as_array()
+        .ok_or_else(|| malformed("the collection map is not an array"))
+}
+
+/// Returns the collection id and the ref entries of one entry of the
+/// collection map.
+///
+/// # Errors
+///
+/// - [`Error::InvalidFormat`] if the entry is not a pair of an id and an
+///   array.
+fn collection_map_entry(entry: &Value) -> Result<(&String, &[Value])> {
+    let Some([Value::Str(collection), Value::Array(refs)]) = entry.as_tuple() else {
+        return Err(malformed("a collection-map entry is not (id, refs)"));
+    };
+    Ok((collection, refs))
 }
 
 /// Parses one entry `(s, (t, ay, a{sv}))` of the ref list.

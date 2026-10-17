@@ -2764,8 +2764,9 @@ Split into sub-phases:
   source-agnostic; 16c reuses them.
 - 16d Delta-accelerated pull and the delta-part cap of 2 (DONE, see below). The
   config and mount repo finders moved out of this sub-phase: a finder resolves a
-  collection ref. The local pull resolves collection refs, and the HTTP and ssh
-  pulls refuse them. The ref a collection pull writes is not yet scheduled.
+  collection ref. The local pull resolves collection refs. The HTTP and ssh
+  pulls of `Repo::pull` refuse them. `Repo::pull_collection` pulls collection
+  refs from the remotes of the config (locked decision 9).
 - 16e Commit and summary signature verification during a pull (DONE, see
   below): the GPG and sign-api axes, their configuration keys and key sources,
   and the delta signature check 16d left open.
@@ -7259,9 +7260,10 @@ conformance run reports 1127 cells and 451 passes (the M10 family 448).
 `gpg-sign` (an alias for `sign --sign-type=gpg`, per `cli-surface.md`).
 `remote add-cookie`/`delete-cookie`/`list-cookies` stay out, per 17e.
 
-- `find-remotes` needs the repo-finder machinery Phase 16d already carries
-  for collection-ref-based pull; check whether its public surface covers a
-  finder invoked standalone, or add a thin new entry point if not.
+- `find-remotes` has its counterpart of `find-remotes --pull` in
+  `ostrya pull --collection` over `Repo::pull_collection`, with the config
+  finder alone (locked decision 9). The library has no entry point that
+  finds the remotes of a collection and pulls nothing.
 - `create-usb` layers `pull-local`/mirror onto a destination-repo target; no
   new library primitive is expected.
 
@@ -8841,12 +8843,15 @@ Resolved:
    lock for its write step, and `Transaction::commit` takes it after it
    publishes its objects, only when it writes a ref or detached metadata.
 
-9. Repo finders: the config and mount finders land with the phase that brings
-   the pull of collection refs from a remote, which is not yet scheduled; they
-   were originally slated for Phase 16d and moved out of it. Avahi discovery is
-   out of scope. A finder resolves a collection ref. The local pull resolves
-   collection refs, and the HTTP and ssh pulls refuse them. The ref a
-   collection pull writes is not yet scheduled.
+9. Repo finders: the config finder alone. `Repo::pull_collection` takes the
+   candidate remotes from its caller. `ostrya pull --collection` gives the
+   remotes of the config whose `collection-id` names the collection, in the
+   order of the config. The pull selects the remote with the newest commit of
+   each ref, and writes `refs/mirrors/ID/REF`, or `refs/heads/REF` in a
+   repository of the same collection id (`format-reference.md`, "The pull of
+   collection refs"). The port has no mount finder, and Avahi discovery is
+   out of scope. The local pull resolves collection refs, and `Repo::pull`
+   refuses them.
 10. HTTP/2: required for pull. The fetcher is built on `hyper` 1.11
     (`client`, `http1`, `http2`) with ALPN over `rustls` 0.23, the crypto
     provider being `rustls-graviola` (Rust plus formally-verified assembly, no

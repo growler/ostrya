@@ -15,6 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll, ready};
 
 use futures_io::AsyncRead;
+use ostrya_core::RefSelector;
 
 use crate::error::{Error, Result};
 use crate::fetch::{Fetcher, Priority};
@@ -48,6 +49,10 @@ pub(crate) struct StreamSource<'a> {
 }
 
 /// The files at the root of the remote that a pull reads first.
+///
+/// The default holds no summary and no signature, and reads the remote
+/// `config` on demand.
+#[derive(Default)]
 pub(crate) struct RootFiles {
     pub(crate) summary: Option<Vec<u8>>,
     pub(crate) signature: Option<Vec<u8>>,
@@ -177,6 +182,22 @@ impl RemoteSource {
         }
     }
 
+    /// Reads the ref listing of `refs` and `collections` from the remote, or
+    /// returns `None` if the remote serves no ref listing.
+    ///
+    /// The call is [`PullSession::fetch_refs`], under its cap and its rules.
+    /// A stream session always serves the listing.
+    pub(crate) async fn ref_listing(
+        &self,
+        refs: &RefSelector,
+        collections: Option<&RefSelector>,
+    ) -> Result<Option<Vec<u8>>> {
+        self.session
+            .fetch_refs(refs, collections)
+            .await
+            .map_err(http_error)
+    }
+
     /// Returns the path of the remote ref `name`.
     ///
     /// An HTTP request takes the path percent-encoded. The stream source
@@ -186,6 +207,15 @@ impl RemoteSource {
             Transfer::Http(_) => ref_request_path(name),
             Transfer::Stream(_) => format!("refs/heads/{name}"),
         }
+    }
+
+    /// Returns the session of the source, which stays open.
+    ///
+    /// Over HTTP, the fetcher handle of the session keeps the counters of
+    /// the source. A new source over the session adds the counters that its
+    /// caller gives.
+    pub(crate) fn into_session(self) -> PullSession {
+        self.session
     }
 
     /// Ends the source with `result`, the result of the pull so far.

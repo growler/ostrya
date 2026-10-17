@@ -157,12 +157,14 @@ enum Command {
     /// archive, or a committed tree. With no --tree option and no PATH, it
     /// reads a tar stream from standard input. It writes the objects of the
     /// tree and the commit object. If signing options name keys, it signs the
-    /// commit. Then it points the --branch ref at the new commit.
+    /// commit. Then it points the --branch ref at the new commit, and creates
+    /// each --tag ref at the new commit.
     ///
     /// The command needs --branch or --orphan. Without --parent, the parent
     /// is the branch name resolved as a revision. On success, standard output
     /// carries the commit checksum, or the --table-output block. If the
-    /// command refuses its input, it exits 1 and moves no ref.
+    /// command refuses its input, it exits 1, moves no ref, and creates no
+    /// ref.
     Commit(CommitArgs),
     /// Check a commit out onto the file system, or write its composefs image.
     ///
@@ -687,8 +689,9 @@ struct CommitArgs {
     /// Take no implicit parent, and permit a commit that names no branch.
     ///
     /// The commit has no parent unless --parent names one. Without --branch,
-    /// the command moves no ref. Without --branch and --bind-ref, the
-    /// `ostree.ref-binding` key holds an empty list.
+    /// the command moves no branch, but it creates each --tag ref. Without
+    /// --branch, --tag, and --bind-ref, the `ostree.ref-binding` key holds an
+    /// empty list.
     #[arg(long)]
     orphan: bool,
     /// The commit subject.
@@ -733,10 +736,34 @@ struct CommitArgs {
     /// Bind this ref name into the commit beside the branch.
     ///
     /// The option can occur more than once. The `ostree.ref-binding` key holds
-    /// the --branch name and each --bind-ref name, sorted byte by byte. The
-    /// command moves no ref for a --bind-ref name.
+    /// the --branch name, each --tag name, and each --bind-ref name, sorted
+    /// byte by byte. The command moves no ref for a --bind-ref name.
     #[arg(long = "bind-ref", value_name = "BRANCH")]
     bind_ref: Vec<String>,
+    /// Create the local ref NAME at the new commit, and bind NAME into it.
+    ///
+    /// The option can occur more than once. Each NAME goes into the
+    /// `ostree.ref-binding` key, as a --bind-ref name does. After the command
+    /// publishes the objects, it writes the --branch ref and then each ref
+    /// NAME under `refs/heads`, one ref at a time. A name that is also a
+    /// --bind-ref name occurs two times in the key.
+    ///
+    /// NAME passes the ref-name rule, has no `:`, and is not 64 lowercase
+    /// hexadecimal characters. NAME is not the --branch name, and each NAME
+    /// occurs one time. No name of --branch and --tag is a path below another
+    /// of these names. The command refuses a NAME that has an entry under
+    /// `refs/heads`: a ref, an alias, or a directory of refs. It also refuses
+    /// a NAME below a ref. A refused NAME gives no new object and no ref. The
+    /// command reads the path of each NAME again before it publishes the
+    /// objects. If another writer creates a ref at the path after this read,
+    /// the command replaces that ref. The option conflicts with --no-bindings
+    /// and --skip-if-unchanged.
+    #[arg(
+        long = "tag",
+        value_name = "NAME",
+        conflicts_with_all = ["no_bindings", "skip_if_unchanged"]
+    )]
+    tags: Vec<String>,
     /// Add a string-valued key to the commit metadata.
     ///
     /// The argument splits at its first `=`, so the value can hold `=`. The
@@ -5839,6 +5866,18 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
         exit_error("A branch must be specified with --branch, or use --orphan");
     }
 
+    // The names of `--tag` are checked before the repository lock. A tag
+    // whose ref path has an entry is refused here, and again before the
+    // transaction publishes.
+    if let Some(message) = tag_name_refusal(args.branch.as_deref(), &args.tags) {
+        exit_error(&message);
+    }
+    for tag in &args.tags {
+        if let Some(message) = existing_tag_refusal(repo.path(), tag) {
+            exit_error(&message);
+        }
+    }
+
     // The `ostree` command refuses `--canonical-permissions` with a non-zero
     // owner id after the branch check and before the tree.
     if let Some(message) = canonical_owner_conflict(args.canonical_permissions, owner) {
@@ -6172,8 +6211,21 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
     // transaction publishes. If a key cannot sign, `objects/` then gets no
     // object and the ref does not move.
     refuse!(sign_staged_commit(&txn, &checksum, &args).await?);
+    // A ref can appear at the path of a tag while the command reads the tree.
+    // The second check refuses it, and the abort publishes no staged object.
+    // `txn.commit` publishes the objects before it writes the refs, so a ref
+    // that another writer creates in that step is replaced.
+    for tag in &args.tags {
+        if let Some(message) = existing_tag_refusal(repo.path(), tag) {
+            txn.abort().await?;
+            exit_error(&message);
+        }
+    }
     if let Some(branch) = args.branch.as_deref() {
         txn.set_ref(branch, Some(&checksum));
+    }
+    for tag in &args.tags {
+        txn.set_ref(tag, Some(&checksum));
     }
     let stats = txn.commit().await?;
 
@@ -6183,6 +6235,86 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
         println!("{}", checksum.to_hex());
     }
     Ok(())
+}
+
+/// Returns the refusal of the `--tag` names of a commit, or `None` if each
+/// name is good.
+///
+/// A tag is a local ref, so a name with `:` is refused. A name that the
+/// ref-name rule refuses, and a name of 64 lowercase hex characters, are
+/// refused with the words of a refused branch. A tag that is the branch, and
+/// a tag named twice, are also refused.
+///
+/// After these checks, a name that is a path below another name is refused,
+/// because the ref file of the outer name blocks the directory of the inner
+/// name. The check covers each tag and the branch. It skips a branch with `:`,
+/// which is a ref under `refs/remotes`, and a branch that the ref write
+/// refuses with its own message.
+fn tag_name_refusal(branch: Option<&str>, tags: &[String]) -> Option<String> {
+    let mut seen = HashSet::new();
+    for tag in tags {
+        if tag.contains(':') {
+            return Some(format!("--tag {tag} holds ':', and a tag is a local ref"));
+        }
+        if validate_refspec(tag).is_err() {
+            return Some(format!("Invalid refspec {tag}"));
+        }
+        if let Some(message) = shadowed_branch_name(tag) {
+            return Some(message);
+        }
+        if branch == Some(tag.as_str()) {
+            return Some(format!("--tag {tag} is also the --branch name"));
+        }
+        if !seen.insert(tag.as_str()) {
+            return Some(format!("--tag {tag} is given more than once"));
+        }
+    }
+    let local_branch = branch.filter(|branch| {
+        !branch.contains(':')
+            && shadowed_branch_name(branch).is_none()
+            && validate_refspec(branch).is_ok()
+    });
+    let names: Vec<(&str, &str)> = local_branch
+        .map(|branch| ("--branch", branch))
+        .into_iter()
+        .chain(tags.iter().map(|tag| ("--tag", tag.as_str())))
+        .collect();
+    for &(inner_option, inner) in &names {
+        for &(outer_option, outer) in &names {
+            if inner.starts_with(&format!("{outer}/")) {
+                return Some(format!(
+                    "{inner_option} {inner} names a path below {outer_option} {outer}"
+                ));
+            }
+        }
+    }
+    None
+}
+
+/// Returns the refusal of a `--tag` name that has an entry at its ref path,
+/// or `None` if the path is absent.
+///
+/// The path is `refs/heads/<tag>` in the repository at `repo_path`. The
+/// lookup reads each component with no symlink follow. Each component before
+/// the last must be a directory. The check refuses a regular file, a
+/// symlink (also a dangling one), and a directory at the last component. It
+/// also refuses a component before the last that is not a directory. Only a
+/// component that is absent gives `None`. A lookup error other than an
+/// absent entry is also a refusal.
+fn existing_tag_refusal(repo_path: &Path, tag: &str) -> Option<String> {
+    let exists = || format!("--tag specified but ref {tag} already exists");
+    let mut path = repo_path.join("refs/heads");
+    let mut components = tag.split('/').peekable();
+    while let Some(component) = components.next() {
+        path.push(component);
+        match std::fs::symlink_metadata(&path) {
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
+            Err(err) => return Some(format!("Cannot read ref {tag}: {err}")),
+            Ok(meta) if meta.is_dir() && components.peek().is_some() => {}
+            Ok(_) => return Some(exists()),
+        }
+    }
+    Some(exists())
 }
 
 /// Returns the refusal of `--canonical-permissions` with a non-zero owner id.
@@ -12336,9 +12468,10 @@ async fn kept_metadata(
 /// tree and the timestamp.
 ///
 /// The order and the binding keys come from `ostrya::commit::commit_metadata`,
-/// which `ostrya-core` defines. The binding keys name the branch of `-b` and
-/// each `--bind-ref` value. A commit that names neither has the empty `as`
-/// array. The `ostree` command writes this value under `--orphan` alone.
+/// which `ostrya-core` defines. The binding keys name the branch of `-b`, each
+/// `--tag` value, and each `--bind-ref` value. A commit that names none of
+/// them has the empty `as` array. The `ostree` command writes this value under
+/// `--orphan` alone.
 fn commit_metadata_dict(
     repo: &Repo,
     args: &CommitArgs,
@@ -12352,6 +12485,7 @@ fn commit_metadata_dict(
         .branch
         .as_deref()
         .into_iter()
+        .chain(args.tags.iter().map(String::as_str))
         .chain(args.bind_ref.iter().map(String::as_str))
         .collect();
     // `--no-bindings` writes neither binding key, so the dict of a commit that
@@ -13471,6 +13605,101 @@ mod tests {
             );
         }
         assert!(user_metadata_entries(&[], &[]).unwrap().is_empty());
+    }
+
+    /// `--tag` of `commit` conflicts with `--no-bindings` and with
+    /// `--skip-if-unchanged`.
+    #[test]
+    fn the_tag_of_commit_conflicts_with_no_bindings_and_skip_if_unchanged() {
+        let parse = |extra: &[&str]| {
+            let mut all = vec!["ostrya", "commit", "-b", "main", "--tag=t"];
+            all.extend_from_slice(extra);
+            Cli::try_parse_from(all).map(|_| ())
+        };
+        use clap::error::ErrorKind;
+        for extra in ["--no-bindings", "--skip-if-unchanged"] {
+            assert_eq!(
+                parse(&[extra]).unwrap_err().kind(),
+                ErrorKind::ArgumentConflict,
+                "{extra}"
+            );
+        }
+        parse(&["--tag=u", "--bind-ref=t", "--orphan"]).unwrap();
+    }
+
+    /// `tag_name_refusal` refuses a name with `:`, a name that the ref-name
+    /// rule refuses, a checksum-shaped name, the branch name, a repeated
+    /// name, and a name that is a path below another name.
+    #[test]
+    fn tag_names_follow_the_ref_rules() {
+        let tags = |names: &[&str]| names.iter().map(|n| (*n).to_owned()).collect::<Vec<_>>();
+        let hex = "0123456789abcdef".repeat(4);
+        for (branch, names, message) in [
+            (
+                Some("main"),
+                tags(&["a:b"]),
+                "--tag a:b holds ':', and a tag is a local ref".to_owned(),
+            ),
+            (
+                Some("main"),
+                tags(&["bad name"]),
+                "Invalid refspec bad name".to_owned(),
+            ),
+            (
+                Some("main"),
+                tags(&[&hex]),
+                format!("Rev name '{hex}' looks like a checksum"),
+            ),
+            (
+                Some("main"),
+                tags(&["main"]),
+                "--tag main is also the --branch name".to_owned(),
+            ),
+            (
+                None,
+                tags(&["x", "y", "x"]),
+                "--tag x is given more than once".to_owned(),
+            ),
+            (
+                Some("a"),
+                tags(&["a/b"]),
+                "--tag a/b names a path below --branch a".to_owned(),
+            ),
+            (
+                None,
+                tags(&["x", "x/y"]),
+                "--tag x/y names a path below --tag x".to_owned(),
+            ),
+            (
+                None,
+                tags(&["x/y/z", "x"]),
+                "--tag x/y/z names a path below --tag x".to_owned(),
+            ),
+            (
+                Some("p/q"),
+                tags(&["p"]),
+                "--branch p/q names a path below --tag p".to_owned(),
+            ),
+            // The checks of each name come before the check of the paths.
+            (
+                Some("a"),
+                tags(&["a/b", "a/b"]),
+                "--tag a/b is given more than once".to_owned(),
+            ),
+        ] {
+            assert_eq!(tag_name_refusal(branch, &names), Some(message));
+        }
+        assert_eq!(tag_name_refusal(Some("main"), &tags(&["a", "b/c"])), None);
+        // A name that only starts with the other name is not below it.
+        assert_eq!(tag_name_refusal(Some("ab"), &tags(&["a", "a-b/c"])), None);
+        // A remote branch is a ref under `refs/remotes`, and the ref write
+        // refuses a bad branch with its own message.
+        assert_eq!(tag_name_refusal(Some("origin:a"), &tags(&["a/b"])), None);
+        assert_eq!(
+            tag_name_refusal(Some(&hex), &tags(&[&format!("{hex}/x")])),
+            None
+        );
+        assert_eq!(tag_name_refusal(None, &[]), None);
     }
 
     /// `--onto` conflicts with `--depth` and `--force`, and `--bind-ref`,

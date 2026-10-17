@@ -768,6 +768,8 @@ target ref:
   or a `--tag` of that shape with the same error.
 - `push-tree` refuses a branch of `--onto` or a `--tag` of that shape with
   `error: Rev name '<name>' looks like a checksum`.
+- `commit --tag` refuses a tag of that shape with `error: Rev name '<name>'
+  looks like a checksum` before it takes the repository lock.
 - In the library, `Repo::push`, `Repo::push_onto`, `Repo::export_stream`, and
   `push_tree` refuse the name before they send a byte.
 - The server of a push session or of a one-way stream refuses an update that

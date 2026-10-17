@@ -520,10 +520,43 @@ The command exists and the matrix exercises an option it does not accept.
 `--base=REV`, `--tree=dir=PATH or tar=TARFILE or ref=COMMIT`, `--consume`,
 `--tar-autocreate-parents`, `--tar-pathname-filter=REGEX,REPLACEMENT`,
 `--gpg-sign=KEY-ID`, `--gpg-homedir=HOMEDIR`, `--sign=KEY_ID`,
-`--sign-from-file=PATH`, and `--sign-type=NAME`.
+`--sign-from-file=PATH`, `--sign-type=NAME`, and the port extension
+`--tag=NAME`.
 Missing:
 `--selinux-policy=PATH`, `-P/--selinux-policy-from-base`,
 `--selinux-labeling-epoch`.
+
+`--tag=NAME` of the port is one `--bind-ref=NAME` of the tool, and the
+creation of the local ref `NAME` at the new commit. `NAME` goes into
+`ostree.ref-binding` as a `--bind-ref` name does, so the commit has the
+checksum that the tool gives for `--bind-ref=NAME`. After the port publishes
+the objects, it writes the `-b` ref and then each tag ref, one ref at a time.
+A name that is also a `--bind-ref` name occurs two times in
+`ostree.ref-binding`. The tool refuses the option with
+`error: Unknown option --tag=NAME` at exit 1. The port refuses these values at
+exit 1, before it takes the repository lock:
+
+- a name with `:`;
+- a name that the ref-name rule refuses, with `error: Invalid refspec <name>`;
+- a name of 64 lowercase hex characters, with `error: Rev name '<name>' looks
+  like a checksum`;
+- the `-b` name, and a name given two times;
+- a name that is a path below another name of `-b` and `--tag`, with
+  `error: --tag <name> names a path below --branch <branch>`, `error: --tag
+  <name> names a path below --tag <tag>`, or `error: --branch <branch> names
+  a path below --tag <tag>`. A `-b` name with `:` is a ref under
+  `refs/remotes`, and this check does not include it;
+- a name that has an entry under `refs/heads`: a ref, an alias (also a
+  dangling one), or a directory of refs. A name below a ref is refused too.
+  The message is `error: --tag specified but ref <name> already exists`. The
+  port reads the path again before it publishes the objects, and refuses an
+  entry that came after the first read. If another writer creates a ref at
+  the path after the second read, the port replaces that ref.
+
+A refusal writes no object and no ref. Without `-b`, the option needs
+`--orphan`, as each commit does. `--orphan --tag=NAME` creates `NAME` and
+moves no branch. `--tag` conflicts with `--no-bindings` and with
+`--skip-if-unchanged`, and `clap` refuses each pair at exit 1.
 
 The five tree-source options carry seven divergences between them, and the
 walk of a filesystem source carries the divergences its own paragraph states

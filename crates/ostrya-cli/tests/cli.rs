@@ -15572,6 +15572,379 @@ fn commit_ref_bindings_match_the_tool() {
     }
 }
 
+/// Runs `commit` against `repo` under the fixed timestamp with no parent, and
+/// returns the run. `args` go between the timestamp and the source `src`.
+fn commit_no_parent(repo: &Path, args: &[&str], src: &Path) -> Run {
+    let mut argv = vec![
+        "commit",
+        "--repo",
+        repo.to_str().unwrap(),
+        FIXED_TIMESTAMP,
+        "--parent=none",
+    ];
+    argv.extend_from_slice(args);
+    argv.push(src.to_str().unwrap());
+    ostrya(&argv, None, &[])
+}
+
+/// `commit --tag` binds each tag as `--bind-ref` does, so the commit has the
+/// checksum of the same commit with `--bind-ref`. It also creates the local
+/// ref of each tag at the new commit.
+#[test]
+fn commit_tag_binds_like_bind_ref_and_creates_the_ref() {
+    let tmp = TmpDir::new("commit-tag");
+    let base = tmp.path();
+    build_fixture_source(base);
+    let src = base.join("src");
+    let repo = create_repo(base, RepoMode::Archive);
+    let collection = base.join("collection");
+    ostrya(
+        &[
+            "init",
+            "--repo",
+            collection.to_str().unwrap(),
+            "--mode=archive",
+            "--collection-id=org.example.Test",
+        ],
+        None,
+        &[],
+    )
+    .ok();
+
+    // Each case: the repository, the options with `--tag`, the same options
+    // with `--bind-ref` in place of each `--tag`, the branch, and the tags.
+    type Case<'a> = (
+        &'a Path,
+        &'a [&'a str],
+        &'a [&'a str],
+        Option<&'a str>,
+        &'a [&'a str],
+    );
+    let cases: [Case; 5] = [
+        (
+            &repo,
+            &["-b", "m1", "--tag=t1"],
+            &["-b", "m1", "--bind-ref=t1"],
+            Some("m1"),
+            &["t1"],
+        ),
+        (
+            &repo,
+            &["-b", "m2", "--tag=b", "--tag=a", "--bind-ref=c"],
+            &["-b", "m2", "--bind-ref=b", "--bind-ref=a", "--bind-ref=c"],
+            Some("m2"),
+            &["a", "b"],
+        ),
+        (
+            &repo,
+            &["--orphan", "--tag=t3"],
+            &["--orphan", "--bind-ref=t3"],
+            None,
+            &["t3"],
+        ),
+        (
+            &repo,
+            &["-b", "m4", "--tag=t4", "--bind-ref=t4"],
+            &["-b", "m4", "--bind-ref=t4", "--bind-ref=t4"],
+            Some("m4"),
+            &["t4"],
+        ),
+        (
+            &collection,
+            &["-b", "m5", "--tag=t5"],
+            &["-b", "m5", "--bind-ref=t5"],
+            Some("m5"),
+            &["t5"],
+        ),
+    ];
+    for (repo, tagged, bound, branch, tags) in cases {
+        let refs_before = describe_tree_with_content(&repo.join("refs/heads"));
+        let expected = commit_no_parent(repo, bound, &src).ok().stdout_trimmed();
+        // The bound run moved the branch, so the branch file is in the
+        // listing that the tagged run starts from.
+        let refs_bound = describe_tree_with_content(&repo.join("refs/heads"));
+        let checksum = commit_no_parent(repo, tagged, &src).ok().stdout_trimmed();
+        assert_eq!(checksum, expected, "`{tagged:?}` bound other names");
+        // The test reads each ref file, because a revision of one hex
+        // character such as `a` can name a commit by its prefix.
+        let tip = |name: &str| {
+            std::fs::read_to_string(repo.join("refs/heads").join(name))
+                .ok()
+                .map(|text| text.trim().to_owned())
+        };
+        for tag in tags {
+            assert_eq!(
+                tip(tag).as_deref(),
+                Some(checksum.as_str()),
+                "`{tagged:?}` did not create {tag}"
+            );
+        }
+        if let Some(branch) = branch {
+            assert_eq!(tip(branch).as_deref(), Some(checksum.as_str()));
+        } else {
+            // An orphan commit creates its tags and moves no branch.
+            assert_eq!(refs_bound, refs_before, "the bound orphan wrote a ref");
+        }
+        let created = describe_tree_with_content(&repo.join("refs/heads"));
+        assert_eq!(
+            created.len(),
+            refs_bound.len() + tags.len(),
+            "`{tagged:?}` wrote other refs: {created:?}"
+        );
+    }
+}
+
+/// `commit --tag` refuses a tag that has an entry at its ref path: a ref, an
+/// alias, a dangling alias, a directory of refs, and a name below a ref. The
+/// refusal writes no object and no ref.
+#[test]
+fn commit_tag_refuses_an_existing_ref_and_writes_nothing() {
+    let tmp = TmpDir::new("commit-tag-exists");
+    let base = tmp.path();
+    build_fixture_source(base);
+    let repo = create_repo(base, RepoMode::Archive);
+    commit_no_parent(&repo, &["-b", "held"], &base.join("src")).ok();
+    let repo_arg = repo.to_str().unwrap();
+    for args in [
+        &["refs", "--repo", repo_arg, "--create=al", "-A", "held"][..],
+        &["refs", "--repo", repo_arg, "--create=dir/sub", "held"],
+    ] {
+        ostrya(args, None, &[]).ok();
+    }
+    std::os::unix::fs::symlink("nosuch", repo.join("refs/heads/dangling")).unwrap();
+
+    // The changed tree has a new file, so a commit of it writes objects.
+    let changed = base.join("changed");
+    build_fixture_source(&changed);
+    std::fs::write(changed.join("src/extra.txt"), b"extra\n").unwrap();
+    let changed = changed.join("src");
+
+    let staging = || -> Vec<String> {
+        std::fs::read_dir(repo.join("tmp"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("staging-"))
+            .collect()
+    };
+    for tag in ["held", "al", "dangling", "dir", "held/x"] {
+        let objects = loose_objects(&repo);
+        let refs = describe_tree_with_content(&repo.join("refs/heads"));
+        let run = commit_no_parent(&repo, &["-b", "new", &format!("--tag={tag}")], &changed);
+        assert_eq!(run.status.code(), Some(1), "--tag={tag} was not refused");
+        assert_eq!(
+            String::from_utf8_lossy(&run.stderr).trim(),
+            format!("error: --tag specified but ref {tag} already exists"),
+        );
+        assert_eq!(loose_objects(&repo), objects, "--tag={tag} wrote an object");
+        assert!(staging().is_empty(), "--tag={tag} left a staging directory");
+        assert_eq!(
+            describe_tree_with_content(&repo.join("refs/heads")),
+            refs,
+            "--tag={tag} changed a ref"
+        );
+    }
+}
+
+/// `commit --tag` checks the ref path of each tag again before the
+/// transaction publishes. The editor runs after the first check, so a ref
+/// that the editor creates reaches the second check. The refusal writes no
+/// object and no ref.
+#[test]
+fn commit_tag_refuses_a_ref_created_during_the_commit() {
+    let tmp = TmpDir::new("commit-tag-late");
+    let base = tmp.path();
+    build_fixture_source(base);
+    let repo = create_repo(base, RepoMode::Archive);
+    commit_no_parent(&repo, &["-b", "held"], &base.join("src")).ok();
+    let changed = base.join("changed");
+    build_fixture_source(&changed);
+    std::fs::write(changed.join("src/extra.txt"), b"extra\n").unwrap();
+
+    let editor = write_script(
+        &base.join("editor.sh"),
+        "#!/bin/sh\ncp \"$HEADS/held\" \"$HEADS/late\"\nprintf 'S\\n' > \"$1\"\n",
+    );
+    let objects = loose_objects(&repo);
+    let heads = repo.join("refs/heads");
+    let run = ostrya_no_editor(
+        &[
+            "commit",
+            "--repo",
+            repo.to_str().unwrap(),
+            FIXED_TIMESTAMP,
+            "-b",
+            "new",
+            "--tag=late",
+            "-e",
+            changed.join("src").to_str().unwrap(),
+        ],
+        &[
+            ("OSTREE_EDITOR", editor.to_str().unwrap()),
+            ("HEADS", heads.to_str().unwrap()),
+        ],
+    );
+    assert_eq!(run.status.code(), Some(1), "the late ref was not refused");
+    assert_eq!(
+        String::from_utf8_lossy(&run.stderr).trim(),
+        "error: --tag specified but ref late already exists",
+    );
+    assert_eq!(loose_objects(&repo), objects, "the refusal wrote an object");
+    assert_eq!(resolve(&repo, "new"), None, "the refusal moved the branch");
+    assert_eq!(resolve(&repo, "late"), resolve(&repo, "held"));
+}
+
+/// `commit --tag` refuses a bad name before it reads the tree: a name with
+/// `:`, a name that the ref-name rule refuses, a checksum-shaped name, the
+/// branch name, a name given twice, and a tag with no branch and no
+/// `--orphan`. The refusal writes no object and no ref.
+#[test]
+fn commit_tag_refuses_bad_names_and_writes_nothing() {
+    let tmp = TmpDir::new("commit-tag-names");
+    let base = tmp.path();
+    build_fixture_source(base);
+    let src = base.join("src");
+    let repo = create_repo(base, RepoMode::Archive);
+    let hex = "0123456789abcdef".repeat(4);
+    let hex_tag = format!("--tag={hex}");
+    let cases: [(&[&str], String); 6] = [
+        (
+            &["-b", "new", "--tag=a:b"],
+            "--tag a:b holds ':', and a tag is a local ref".to_owned(),
+        ),
+        (
+            &["-b", "new", "--tag=-bad"],
+            "Invalid refspec -bad".to_owned(),
+        ),
+        (
+            &["-b", "new", &hex_tag],
+            format!("Rev name '{hex}' looks like a checksum"),
+        ),
+        (
+            &["-b", "new", "--tag=new"],
+            "--tag new is also the --branch name".to_owned(),
+        ),
+        (
+            &["-b", "new", "--tag=t", "--tag=t"],
+            "--tag t is given more than once".to_owned(),
+        ),
+        (
+            &["--tag=t"],
+            "A branch must be specified with --branch, or use --orphan".to_owned(),
+        ),
+    ];
+    for (args, message) in cases {
+        let run = commit_no_parent(&repo, args, &src);
+        assert_eq!(run.status.code(), Some(1), "`{args:?}` was not refused");
+        assert_eq!(
+            String::from_utf8_lossy(&run.stderr).trim(),
+            format!("error: {message}"),
+            "`{args:?}` was refused in other words"
+        );
+        assert!(
+            loose_objects(&repo).is_empty(),
+            "`{args:?}` wrote an object"
+        );
+        assert!(
+            describe_tree_with_content(&repo.join("refs/heads")).is_empty(),
+            "`{args:?}` wrote a ref"
+        );
+    }
+}
+
+/// `commit --tag` refuses a name that is a path below another name of the
+/// commit, before it takes the repository lock: a tag below the branch, a tag
+/// below a tag, and the branch below a tag. The refusal writes no object and
+/// no ref.
+#[test]
+fn commit_tag_refuses_nested_names_and_writes_nothing() {
+    let tmp = TmpDir::new("commit-tag-nested");
+    let base = tmp.path();
+    build_fixture_source(base);
+    let src = base.join("src");
+    let repo = create_repo(base, RepoMode::Archive);
+    let staging = || -> Vec<String> {
+        std::fs::read_dir(repo.join("tmp"))
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name.starts_with("staging-"))
+            .collect()
+    };
+    let cases: [(&[&str], &str); 3] = [
+        (
+            &["-b", "a", "--tag=a/b"],
+            "--tag a/b names a path below --branch a",
+        ),
+        (
+            &["--orphan", "--tag=x", "--tag=x/y"],
+            "--tag x/y names a path below --tag x",
+        ),
+        (
+            &["-b", "p/q", "--tag=p"],
+            "--branch p/q names a path below --tag p",
+        ),
+    ];
+    for (args, message) in cases {
+        let run = commit_no_parent(&repo, args, &src);
+        assert_eq!(run.status.code(), Some(1), "`{args:?}` was not refused");
+        assert_eq!(
+            String::from_utf8_lossy(&run.stderr).trim(),
+            format!("error: {message}"),
+            "`{args:?}` was refused in other words"
+        );
+        assert!(
+            loose_objects(&repo).is_empty(),
+            "`{args:?}` wrote an object"
+        );
+        assert!(staging().is_empty(), "`{args:?}` left a staging directory");
+        assert!(
+            describe_tree_with_content(&repo.join("refs/heads")).is_empty(),
+            "`{args:?}` wrote a ref"
+        );
+    }
+}
+
+/// `ostrya commit -b X --tag=T` writes the commit that
+/// `ostree commit -b X --bind-ref=T` writes.
+#[test]
+fn commit_tag_binds_as_the_bind_ref_of_the_tool() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("commit-tag-tool");
+    let base = tmp.path();
+    let (port_repo, tool_repo, tree) = commit_pair(base, RepoMode::Archive);
+    let src = tree.to_str().unwrap();
+    for (port_extra, tool_extra) in [
+        (
+            &["-b", "x", "--tag=t"][..],
+            &["-b", "x", "--bind-ref=t"][..],
+        ),
+        (
+            &["--orphan", "--tag=b", "--tag=a"],
+            &["--orphan", "--bind-ref=b", "--bind-ref=a"],
+        ),
+    ] {
+        let run = |extra: &[&str], repo: &Path, port: bool| {
+            let repo_arg = format!("--repo={}", repo.display());
+            let mut args = vec!["commit", &repo_arg, FIXED_TIMESTAMP];
+            args.extend_from_slice(extra);
+            args.push(src);
+            let run = if port {
+                ostrya(&args, None, &[])
+            } else {
+                ostree(&args)
+            };
+            assert!(run.status.success(), "`{extra:?}` failed");
+            run.stdout_trimmed()
+        };
+        assert_eq!(
+            run(port_extra, &port_repo, true),
+            run(tool_extra, &tool_repo, false),
+            "`{port_extra:?}` and `{tool_extra:?}` wrote other commits"
+        );
+    }
+}
+
 /// `show --print-variant-type` prints each basic GVariant type and the maybe
 /// types `ms` and `mi`, with the types that the on-disk format does not use.
 /// Each case is one file in normal form that `show` reads with one signature.

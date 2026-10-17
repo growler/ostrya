@@ -8,9 +8,9 @@ ostrya commit [OPTIONS] [PATH]...
 .SH DESCRIPTION
 Commit a tree into the repository and print the new commit checksum.
 .PP
-The command reads one or more tree sources: a directory, a tar archive, or a committed tree. With no \%\-\-tree option and no PATH, it reads a tar stream from standard input. It writes the objects of the tree and the commit object. If signing options name keys, it signs the commit. Then it points the \%\-\-branch ref at the new commit.
+The command reads one or more tree sources: a directory, a tar archive, or a committed tree. With no \%\-\-tree option and no PATH, it reads a tar stream from standard input. It writes the objects of the tree and the commit object. If signing options name keys, it signs the commit. Then it points the \%\-\-branch ref at the new commit, and creates each \%\-\-tag ref at the new commit.
 .PP
-The command needs \%\-\-branch or \%\-\-orphan. Without \%\-\-parent, the parent is the branch name resolved as a revision. On success, standard output carries the commit checksum, or the \%\-\-table\-output block. If the command refuses its input, it exits \%1 and moves no ref.
+The command needs \%\-\-branch or \%\-\-orphan. Without \%\-\-parent, the parent is the branch name resolved as a revision. On success, standard output carries the commit checksum, or the \%\-\-table\-output block. If the command refuses its input, it exits \%1, moves no ref, and creates no ref.
 .SH ARGUMENTS
 .TP
 \fIPATH...\fR
@@ -32,7 +32,7 @@ The command needs \%\-\-branch or \%\-\-orphan. The branch name goes into the \f
 \fB\-\-orphan\fR
 Take no implicit parent, and permit a commit that names no branch.
 .IP
-The commit has no parent unless \%\-\-parent names one. Without \%\-\-branch, the command moves no ref. Without \%\-\-branch and \%\-\-bind\-ref, the \fB\%ostree.ref\-binding\fR key holds an empty list.
+The commit has no parent unless \%\-\-parent names one. Without \%\-\-branch, the command moves no branch, but it creates each \%\-\-tag ref. Without \%\-\-branch, \%\-\-tag, and \%\-\-bind\-ref, the \fB\%ostree.ref\-binding\fR key holds an empty list.
 .TP
 \fB\-s\fR, \fB\-\-subject\fR \fISUBJECT\fR
 The commit subject.
@@ -62,7 +62,14 @@ The commit then has no \fB\%ostree.ref\-binding\fR key and no \fB\%ostree.collec
 \fB\-\-bind\-ref\fR \fIBRANCH\fR
 Bind this ref name into the commit beside the branch.
 .IP
-The option can occur more than once. The \fB\%ostree.ref\-binding\fR key holds the \%\-\-branch name and each \%\-\-bind\-ref name, sorted byte by byte. The command moves no ref for a \%\-\-bind\-ref name.
+The option can occur more than once. The \fB\%ostree.ref\-binding\fR key holds the \%\-\-branch name, each \%\-\-tag name, and each \%\-\-bind\-ref name, sorted byte by byte. The command moves no ref for a \%\-\-bind\-ref name.
+.TP
+\fB\-\-tag\fR \fINAME\fR
+Create the local ref NAME at the new commit, and bind NAME into it.
+.IP
+The option can occur more than once. Each NAME goes into the \fB\%ostree.ref\-binding\fR key, as a \%\-\-bind\-ref name does. After the command publishes the objects, it writes the \%\-\-branch ref and then each ref NAME under \fB\%refs/heads\fR, one ref at a time. A name that is also a \%\-\-bind\-ref name occurs two times in the key.
+.IP
+NAME passes the \%ref\-name rule, has no \fB\%:\fR, and is not \%64 lowercase hexadecimal characters. NAME is not the \%\-\-branch name, and each NAME occurs one time. No name of \%\-\-branch and \%\-\-tag is a path below another of these names. The command refuses a NAME that has an entry under \fB\%refs/heads\fR: a ref, an alias, or a directory of refs. It also refuses a NAME below a ref. A refused NAME gives no new object and no ref. The command reads the path of each NAME again before it publishes the objects. If another writer creates a ref at the path after this read, the command replaces that ref. The option conflicts with \%\-\-no\-bindings and \%\-\-skip\-if\-unchanged.
 .TP
 \fB\-\-add\-metadata\-string\fR \fIKEY=VALUE\fR
 Add a \%string\-valued key to the commit metadata.

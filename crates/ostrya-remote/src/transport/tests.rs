@@ -1191,6 +1191,7 @@ mod standin {
         encode(&[Message::Commit(CommitRequest {
             updates: vec![update()],
             force: false,
+            server_commit: None,
         })])
         .len()
     }

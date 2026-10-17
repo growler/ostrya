@@ -24,6 +24,10 @@ pub(super) const STREAM_BUFFER: usize = 64 * 1024;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReceiveReport {
     /// One outcome for each ref update, in the order of the `Commit` message.
+    ///
+    /// For a server commit, the first outcome is the branch, and one outcome
+    /// for each tag follows, in order. The `new` commit of each outcome is the
+    /// commit that the server wrote, and a tag has no `old` commit.
     pub refs: Vec<RefOutcome>,
     /// The statistics of the session transaction.
     pub stats: TransactionStats,
@@ -207,6 +211,10 @@ impl Repo {
     /// The first failed check ends the session, and the session publishes
     /// nothing.
     ///
+    /// Checks 6 and 7 apply to a commit that the client built. A `Commit` with
+    /// a [server commit](crate::remote::proto::ServerCommit) runs the checks of
+    /// the section "Server commit" in place of this list.
+    ///
     /// The commits of the session are the commits that the session staged and
     /// the new commits of the updates. The session does not stage a commit
     /// that the client sends and that the repository holds already. That commit
@@ -245,6 +253,39 @@ impl Repo {
     /// The policy can regenerate the summary of a repository with a
     /// collection id. If a ref then changes, the transaction also writes the
     /// refreshed anchor commit on `ostree-metadata`.
+    ///
+    /// # Server commit
+    ///
+    /// A `Commit` with a server commit holds no update and no `force`. The
+    /// session runs these checks in this order:
+    ///
+    /// 1. The names (`invalid-ref`): the branch and each tag pass the refspec
+    ///    rule and are not 64 lowercase hex characters, and each bound name
+    ///    passes the refspec rule and has no `:`. Then the form of the message
+    ///    (`protocol`): no update, no `force`, the branch and each tag are refs
+    ///    of `Hello`, no ref occurs two times among them, and a commit can
+    ///    hold each metadata value within the depth limit of 128 levels of
+    ///    containers.
+    /// 2. The size of `CommitReply` (`limit-exceeded`).
+    /// 3. The session holds no detached metadata and staged no commit object
+    ///    (`protocol`).
+    /// 4. The rights (`ref-denied`): the branch needs `c`, and each tag needs
+    ///    `t` or `w`. A session with hooks, and a branch or a tag
+    ///    `ostree-metadata` in the local refs of a repository with a
+    ///    collection id, are refused.
+    /// 5. The tree of the commit is complete (`missing-objects`).
+    ///
+    /// The bindings and the signature verification of the policy do not
+    /// apply. Under the update lock, the session reads the branch and the
+    /// tags, with the checks of the ref paths above. `orphan` on a branch that
+    /// is present needs `d` (`non-fast-forward`), and a tag that is present is
+    /// `ref-mismatch`. Then the session builds the commit. Its parent is the
+    /// commit of the branch, or none with `orphan` or for an absent branch.
+    /// Its timestamp is the value of the client, else the system clock. The
+    /// session signs the commit with each server key of the policy, moves the
+    /// branch, and creates each tag, in one transaction commit. A bound name
+    /// gets no ref. `docs/format-reference.md`, "Server commit", states the
+    /// metadata of the commit.
     ///
     /// # After the transaction commit
     ///

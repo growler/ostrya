@@ -26,7 +26,7 @@ use ostrya::fetch::{
     TrustRoots, UploadBody, UploadMethod, UploadRequest,
 };
 use ostrya::remote::proto::{
-    CommitRequest, ErrorMessage, FrameWriter, Hello, Kind, Message, ObjectHeader,
+    CommitRequest, ErrorMessage, FrameWriter, Hello, Kind, Message, ObjectHeader, ServerCommit,
 };
 use ostrya::remote::{Encoding, ErrorCode, Expected, RefUpdate};
 use ostrya::{
@@ -288,6 +288,7 @@ fn update(expected: Expected, new: Checksum) -> Message {
             new: Some(new),
         }],
         force: false,
+        server_commit: None,
     })
 }
 
@@ -935,6 +936,95 @@ fn errors_map_to_their_status() {
             reply.error(422, ErrorCode::ModeRefused);
         });
     }
+}
+
+/// Opens a session whose `Hello` names `refs`, and returns its id.
+async fn open_named(client: &Client, refs: &[&str]) -> String {
+    let hello = Message::Hello(Hello {
+        version: 1,
+        agent: None,
+        refs: refs.iter().map(|&r| r.into()).collect(),
+        collection: None,
+        one_way: false,
+    });
+    let reply = client.post(SESSION, encode(&[hello]).await).await;
+    assert!(matches!(reply.ok(), Message::HelloReply(_)));
+    reply.headers["ostrya-session"].to_str().unwrap().to_owned()
+}
+
+/// A server commit through the endpoint gets 200 and a `CommitReply` with
+/// the branch, then the tag, each at the new commit. A second server commit
+/// that creates the same tag gets 409 with `ref-mismatch`.
+#[test]
+fn a_server_commit_through_the_endpoint() {
+    let tmp = TmpDir::new("server-commit");
+    let src = block_on(source(tmp.path()));
+    let repo = receiver(tmp.path(), RepoMode::Archive, "");
+    let tree: Vec<Obj> = src.objects[0]
+        .iter()
+        .filter(|o| o.name.ty != ObjectType::Commit)
+        .cloned()
+        .collect();
+    let root = ostrya::Commit::parse(&of_type(&src.objects[0], ObjectType::Commit).bytes).unwrap();
+    let request = |subject: &str| {
+        Message::Commit(CommitRequest {
+            updates: Vec::new(),
+            force: false,
+            server_commit: Some(Box::new(ServerCommit {
+                branch: "main".into(),
+                tags: vec!["v1".into()],
+                bind_refs: Vec::new(),
+                root_dirtree: root.root_dirtree,
+                root_dirmeta: root.root_dirmeta,
+                subject: subject.into(),
+                body: String::new(),
+                metadata: Vec::new(),
+                timestamp: Some(1_700_000_000),
+                orphan: false,
+            })),
+        })
+    };
+    let groups = "[ex-ostrya client \"push\"]\nauth=anonymous\nallow=c:main;t:v1\n";
+    let committed = Arc::new(Mutex::new(None));
+    let seen = committed.clone();
+    with_server(
+        repo.clone(),
+        options_with(&repo, groups),
+        |client, _| async move {
+            let id = open_named(&client, &["main", "v1"]).await;
+            client.step(&id, "objects", stream(&tree).await).await.ok();
+            let reply = client
+                .step(&id, "commit", encode(&[request("first")]).await)
+                .await;
+            let Message::CommitReply(refs) = reply.ok() else {
+                panic!("no CommitReply");
+            };
+            let commit = refs[0].new.expect("the new commit");
+            assert_eq!(refs.len(), 2);
+            assert_eq!((refs[0].name.as_str(), refs[0].old), ("main", None));
+            assert_eq!(
+                (refs[1].name.as_str(), refs[1].old, refs[1].new),
+                ("v1", None, Some(commit))
+            );
+            *seen.lock().unwrap() = Some(commit);
+
+            let id = open_named(&client, &["main", "v1"]).await;
+            let reply = client
+                .step(&id, "commit", encode(&[request("second")]).await)
+                .await;
+            let error = reply.error(409, ErrorCode::RefMismatch);
+            assert_eq!(error.current.unwrap().commit, Some(commit));
+        },
+    );
+    let commit = committed.lock().unwrap().expect("the first commit");
+    assert_eq!(
+        block_on(repo.resolve_rev("main", false)).unwrap(),
+        Some(commit)
+    );
+    assert_eq!(
+        block_on(repo.resolve_rev("v1", false)).unwrap(),
+        Some(commit)
+    );
 }
 
 /// Returns `true` if the process runs as root. The function reads the user

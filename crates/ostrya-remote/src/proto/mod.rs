@@ -79,7 +79,7 @@ pub use frame::{FrameReader, FrameWriter, ObjectBody, ObjectRead};
 pub(crate) use frame::{Step, encode_frame};
 pub use message::{
     CommitRequest, ErrorMessage, GetReply, HaveReply, Hello, HelloReply, ListRefsRequest, Message,
-    ObjectHeader, ObjectsReply, PullHello, PullHelloReply,
+    ObjectHeader, ObjectsReply, PullHello, PullHelloReply, ServerCommit,
 };
 
 use ostrya_core::{Checksum, ObjectName, ObjectType};
@@ -124,11 +124,20 @@ pub const MIN_FRAME_LIMIT: u32 = 1 << 20;
 /// - 2 times the frame for a `Have`
 /// - 12 times the frame for a `HelloReply` of refs with empty names
 /// - 13 times the frame for a `Commit` of ref updates with empty names
-/// - 49 times the frame for a `Hello` whose one unknown key holds an `ab` of
+/// - 33 times the frame for a `Hello` whose one unknown key holds an `ab` of
 ///   1 MiB
+/// - 289 times the frame for a `Hello` whose one unknown key holds an array
+///   of one-byte values in 8 levels of one-member tuples
+/// - 2 times the frame for a `Commit` whose server commit holds one metadata
+///   entry with an `ab` of 1 MiB, or with an array of one-byte values in 8 or
+///   64 levels of one-member tuples
 ///
 /// The decoder checks a dict value under an unknown key through a value tree,
-/// and then drops the tree. The peak grows in proportion to the limit.
+/// and then drops the tree. In a value tree, each level of nesting adds about
+/// 32 bytes for each byte of the frame, up to the depth limit of 128 levels
+/// of the parser. The decoder checks each metadata entry of a server commit
+/// in place and keeps a copy of its bytes, with no value tree. The peak grows
+/// in proportion to the limit.
 pub const MAX_FRAME: u32 = 1 << 20;
 
 /// The largest ref listing: 128 MiB.

@@ -194,6 +194,29 @@ impl Commit {
         Ok(ostrya_gvariant::encode_to_vec(self)?)
     }
 
+    /// Serializes the commit with the serialized `a{sv}` dict `metadata` in
+    /// place of [`metadata`](Commit::metadata).
+    ///
+    /// The call writes `metadata` as it is and reads no field
+    /// [`metadata`](Commit::metadata), so a caller that holds the metadata as
+    /// bytes builds no value tree. The call does not check `metadata`. If it
+    /// is not a normal-form `a{sv}` dict, [`Commit::parse`] refuses the
+    /// result. With the bytes of `self.metadata`, the result is the result of
+    /// [`serialize`](Commit::serialize).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Gvariant`] with [`InvalidValue`] if a string holds an
+    /// interior NUL byte: the subject, the body, or the name of a related
+    /// object.
+    ///
+    /// [`InvalidValue`]: ostrya_gvariant::Error::InvalidValue
+    pub fn serialize_with_metadata(&self, metadata: &[u8]) -> Result<Vec<u8>> {
+        let mut out = Vec::new();
+        self.encode_with(metadata, &mut out)?;
+        Ok(out)
+    }
+
     /// Returns the commit checksum, the SHA-256 of the serialized bytes.
     ///
     /// # Errors
@@ -303,6 +326,13 @@ impl GvType for Commit {
 impl GvEncode for Commit {
     fn encode(&self, out: &mut Vec<u8>) -> ostrya_gvariant::Result<()> {
         let metadata = to_bytes(&METADATA_TYPE, &self.metadata)?;
+        self.encode_with(&metadata, out)
+    }
+}
+
+impl Commit {
+    /// Writes the commit tuple with the serialized metadata dict `metadata`.
+    fn encode_with(&self, metadata: &[u8], out: &mut Vec<u8>) -> ostrya_gvariant::Result<()> {
         let parent: &[u8] = match &self.parent {
             Some(checksum) => checksum.as_bytes(),
             None => &[],
@@ -313,7 +343,7 @@ impl GvEncode for Commit {
             .map(|(name, bytes)| (name.as_str(), bytes.as_slice()))
             .collect();
         (
-            RawDict(&metadata),
+            RawDict(metadata),
             parent,
             Slice(&related),
             self.subject.as_str(),
@@ -493,6 +523,22 @@ mod tests {
         assert_eq!(parsed.version(), Some("42"));
         assert!(parsed.ref_bindings().is_empty());
         assert_eq!(parsed.collection_binding(), None);
+    }
+
+    /// The bytes of the metadata dict in place of the dict give the bytes of
+    /// `serialize`, and the call does not read the field.
+    #[test]
+    fn serialize_with_metadata_splices_the_dict_bytes() {
+        let commit = sample();
+        let dict = to_bytes(&METADATA_TYPE, &commit.metadata).unwrap();
+        let other = Commit {
+            metadata: Value::Array(Vec::new()),
+            ..sample()
+        };
+        assert_eq!(
+            other.serialize_with_metadata(&dict).unwrap(),
+            commit.serialize().unwrap()
+        );
     }
 
     #[test]

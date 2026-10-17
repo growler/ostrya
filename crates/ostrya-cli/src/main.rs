@@ -6044,10 +6044,7 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
         let digest = txn.composefs_digest(&root).await?;
         let entry = Value::Tuple(vec![
             Value::Str(COMPOSEFS_DIGEST_KEY.to_owned()),
-            Value::variant(
-                Type::Array(Box::new(Type::Byte)),
-                Value::Bytes(digest.to_vec()),
-            ),
+            Value::variant(Type::array(Type::Byte), Value::Bytes(digest.to_vec())),
         ]);
         set_metadata_entry(&mut metadata, COMPOSEFS_DIGEST_KEY, entry)?;
     }
@@ -9169,7 +9166,7 @@ fn print_metadata_value(value: &Value, hex: bool) -> Result<()> {
         Some((ty, inner)) => (ty.clone(), inner),
         None => (Type::Str, value),
     };
-    if hex && ty == Type::Array(Box::new(Type::Byte)) {
+    if hex && ty == Type::array(Type::Byte) {
         let bytes = inner.as_bytes().unwrap_or_default();
         let mut text = String::with_capacity(bytes.len() * 2);
         for byte in bytes {

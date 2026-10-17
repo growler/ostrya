@@ -42,6 +42,10 @@ pub(super) fn cut(message: &mut String) {
 /// receive endpoint of `ostrya-server` gives the hooks that its
 /// `SessionSetup` holds.
 ///
+/// A session with hooks refuses a `Commit` with a
+/// [server commit](crate::remote::proto::ServerCommit) with `ref-denied`.
+/// Neither hook runs for that `Commit`.
+///
 /// # When `before_update` runs
 ///
 /// In a session with hooks, [`before_update`](Self::before_update) runs once

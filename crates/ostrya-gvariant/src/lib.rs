@@ -52,5 +52,5 @@ pub use error::{Error, Result};
 pub use print::{to_text, to_text_unannotated};
 pub use ser::{choose_offset_size, to_bytes, write_offset};
 pub use text::{Span, TextError, from_text};
-pub use ty::Type;
+pub use ty::{ElementType, MemberTypes, Type};
 pub use value::Value;

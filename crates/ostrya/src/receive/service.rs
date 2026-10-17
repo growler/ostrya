@@ -415,14 +415,25 @@ impl ReceiveService {
     ///
     /// - [`remote::Error::Protocol`] if another step of the session is in
     ///   flight, if the session ended, or if another `commit` runs.
-    /// - [`remote::Error::Protocol`] if the request holds no update, or names a
-    ///   ref that `Hello` does not name, or names one ref twice.
+    /// - [`remote::Error::Protocol`] if the request holds no update and no
+    ///   server commit, or names a ref that `Hello` does not name, or names
+    ///   one ref twice.
+    /// - [`remote::Error::Protocol`] if the request holds a server commit and
+    ///   an update or `force`, if the branch or a tag of the server commit is
+    ///   not a ref of `Hello`, if one ref occurs two times among them, or if
+    ///   a metadata value of the server commit is not a `v` in normal form or
+    ///   is too deep for a commit.
+    /// - [`remote::Error::Protocol`] if the request holds a server commit and
+    ///   the session holds a detached metadata dict or staged a commit object.
     /// - [`remote::Error::Protocol`] if a detached metadata dict belongs to a
     ///   commit that is not a commit of the session.
     /// - [`remote::Error::Protocol`] if a staged commit or a staged dirtree does
     ///   not parse.
     /// - [`remote::Error::InvalidRef`] if a ref name is not valid, or if an
     ///   update writes a commit to a ref name of 64 lowercase hex characters.
+    ///   This applies to the branch and each tag of a server commit too. A
+    ///   bound name of a server commit that is not valid, or that holds `:`,
+    ///   also gives this error.
     /// - [`remote::Error::LimitExceeded`] if the `CommitReply` can need a frame
     ///   over [`MAX_FRAME`], or if a merged detached metadata dict is larger
     ///   than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
@@ -430,6 +441,10 @@ impl ReceiveService {
     ///   on which the policy gives no `w` and no `t`, or if an update names
     ///   the collection anchor ref in the local refs of a repository with a
     ///   collection id.
+    /// - [`remote::Error::RefDenied`] if the policy gives no `c` on the branch
+    ///   of a server commit, or neither `t` nor `w` on a tag, if the branch or
+    ///   a tag is the collection anchor ref in the local refs of a repository
+    ///   with a collection id, or if the session has hooks.
     /// - [`remote::Error::RefDenied`] if a ref path fails a check under the
     ///   update lock: a ref is an alias, a ref write cannot replace a path, or
     ///   one update names a directory of another.
@@ -444,19 +459,22 @@ impl ReceiveService {
     ///   collection of the namespace. For the local refs, that collection is
     ///   the collection id of the repository, and in a repository with no
     ///   collection id each collection binding fails.
-    /// - [`remote::Error::SignatureRequired`] if a new commit fails the
-    ///   signature verification of the policy. With
+    /// - [`remote::Error::SignatureRequired`] if a new commit that the client
+    ///   built fails the signature verification of the policy. With
     ///   [`allow_unsigned`](super::ReceivePolicy::allow_unsigned), a commit
     ///   with no signature passes, and a commit with a signature that does not
     ///   verify fails.
     /// - [`remote::Error::RefMismatch`] if a ref is not in the state that its
     ///   update expects, or if an update writes a commit to a ref that is
-    ///   present and the policy gives `t` and no `w` on it.
+    ///   present and the policy gives `t` and no `w` on it. A tag of a server
+    ///   commit that is present also gives this error.
     /// - [`remote::Error::DeleteDenied`] if an update deletes a ref that is
     ///   present and the policy gives no `d` on it.
     /// - [`remote::Error::NonFastForward`] if the new commit does not descend
     ///   from the commit of the ref. If the client sends `force` and the policy
-    ///   gives `w` and `d` on the ref, this check does not run.
+    ///   gives `w` and `d` on the ref, this check does not run. A server commit
+    ///   with `orphan` on a branch that is present, where the policy gives no
+    ///   `d` on the branch, also gives this error.
     /// - [`remote::Error::Internal`] if `after_update` returns an error.
     /// - [`Error::InvalidInput`] if the plan of `before_update` breaks a rule
     ///   that [`ReceiveHooks`] states. The host sends it as `internal`.
@@ -468,6 +486,8 @@ impl ReceiveService {
     ///   `aay` under a signature key that the merge extends.
     /// - The error of the signing engine, for example [`Error::Signature`], if
     ///   a server key fails to sign a commit.
+    /// - [`Error::InvalidFormat`] if a server commit takes the time of the
+    ///   system clock, and the clock is before the Unix epoch.
     /// - [`Error::LockTimeout`] if the wait for the update lock passes
     ///   `[core] lock-timeout-secs`.
     /// - An I/O error from the file system, if a read of the repository or a

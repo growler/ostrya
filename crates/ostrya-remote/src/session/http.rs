@@ -713,6 +713,7 @@ impl HttpLink {
         let request = Message::Commit(CommitRequest {
             updates: updates.to_vec(),
             force,
+            server_commit: None,
         });
         let body = match encode_frame(&request, server.max_frame) {
             Ok(body) => body,

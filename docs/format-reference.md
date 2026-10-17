@@ -2785,12 +2785,40 @@ The body of the object follows as chunks:
 - `new` is the new commit. An absent `new` deletes the ref.
 
 A `state` greater than 2, and an `expected` that does not agree with its
-`state`, are `protocol`. The dict holds the key `force` (`b`). A writer puts the
-key in the dict only when its value is true.
+`state`, are `protocol`. The dict holds these keys:
+
+- `force` (`b`, optional): A writer puts the key in the dict only when its
+  value is true.
+- `server-commit` (`(sasas(ayay)ssa{sv}a{sv})`, optional): a commit that the
+  server makes from a tree and the fields of the client ("Server commit").
+  A writer puts the key in the dict only for a server commit, and the list of
+  updates is then empty.
+
+The value of `server-commit` holds these members, in this order:
+
+1. `s`: the branch.
+2. `as`: the tags, in the order of the client.
+3. `as`: the bound names, in the order of the client.
+4. `(ayay)`: the checksums of the root dirtree and of the root dirmeta.
+5. `s`: the subject.
+6. `s`: the body.
+7. `a{sv}`: the metadata of the client. This dict is data, and the dict rules
+   of "Wire conventions" do not apply to it. A reader keeps each entry in
+   order, also a key that occurs two times. Each value must be a `v` in
+   normal form, else the message is `protocol`.
+8. `a{sv}`: the options, with the dict rules of "Wire conventions". The dict
+   holds these keys:
+   - `timestamp` (`t`, optional): the commit time in seconds since the Unix
+     epoch, UTC.
+   - `orphan` (`b`, optional): true for a commit with no parent. A writer
+     puts the key in the dict only when its value is true.
 
 `CommitReply` holds one `(name, old, new)` entry for each update, in the order
 of `Commit`. `old` is the commit of the ref before the write, and `new` is the
-commit after it. An absent commit is an absent ref.
+commit after it. An absent commit is an absent ref. For a server commit, the
+reply holds one entry for the branch, then one entry for each tag, in the
+order of `server-commit`. `new` of each entry is the new commit, and `old` of
+each tag is absent. A bound name has no entry.
 
 `Error` holds the code, a message for a person, and a dict of details:
 
@@ -2835,10 +2863,13 @@ give the condition of each refusal.
 - `mode-refused` -- the repository mode cannot store the content, or the
   client group does not allow privileged content.
 - `missing-objects` -- a commit reaches objects that the server does not hold.
-- `ref-mismatch` -- a ref is not in the state that its update expects, or an
-  update with `t` and no `w` writes a commit to a ref that exists.
+- `ref-mismatch` -- a ref is not in the state that its update expects, an
+  update with `t` and no `w` writes a commit to a ref that exists, or a tag of
+  a server commit exists.
 - `non-fast-forward` -- the new commit does not descend from the commit of the
-  ref, and the client group or the request does not allow it.
+  ref, and the client group or the request does not allow it. A server commit
+  with `orphan` on a branch that exists, without `d` on the branch, gets this
+  code too.
 - `delete-denied` -- the client group has no `d` on a ref that an update
   deletes.
 - `invalid-ref` -- the server refuses a ref name, or the collection id of
@@ -2847,7 +2878,8 @@ give the condition of each refusal.
 - `ref-denied` -- no client group covers the namespace of `Hello`, the client
   group opens no push session, a ref of `Hello` has no `r`, an update writes
   a commit without `w` or `t`, or an update names a ref that a push does not
-  write.
+  write. A server commit gets this code without `c` on its branch, without
+  `t` or `w` on a tag, or in a session with the hooks of a host application.
 - `signature-required` -- a commit has a signature that does not verify, or
   has no signature and the client group requires one.
 - `binding-mismatch` -- the ref binding of a commit does not name its target
@@ -2891,7 +2923,8 @@ The server enforces these rules, or depends on them, so a client must keep
 them:
 
 - The refs of `Commit` are a subset of the refs of `Hello`. The subset is not
-  empty and names no ref two times.
+  empty and names no ref two times. The refs of a server commit are its
+  branch and its tags.
 - `Have` and `missing` name objects of the types 1 to 4.
 - An object has the encoding `deflate` only if it is a file and `HelloReply`
   lists `deflate`.
@@ -2902,7 +2935,10 @@ them:
 - Before `Commit`, a session sends each object that the tree of a commit of
   the session reaches, unless the server holds the object. The commits of the
   session are the commits that it sends and the new commits of the updates.
-  The session does not need to send the parent commits.
+  The session does not need to send the parent commits. A session with a
+  server commit sends the objects of its tree.
+- A session with a server commit sends no commit object and no detached
+  metadata.
 - To cancel an object, a client sends the abandon marker and then `Abort`.
 - On a stream, a client sends one request and reads its reply before it sends
   the next one.
@@ -3064,8 +3100,9 @@ two `objects` requests send at the same time can count in both replies.
 
 ### Commit and CommitReply
 
-The server runs these checks of `Commit` in this order. Each failed check ends
-the session, and the session writes nothing:
+The server runs these checks of a `Commit` with no server commit in this
+order. "Server commit" states the checks of a `Commit` with a server commit.
+Each failed check ends the session, and the session writes nothing:
 
 1. Each ref name passes the refspec rule ("Ref name validation"). An update
    that writes a commit to a name of 64 lowercase hex characters fails this
@@ -3109,8 +3146,8 @@ the session, and the session writes nothing:
      id.
    - The server does not check a binding key that the commit does not have,
      so a commit with no binding passes in each namespace.
-8. A new commit must pass the signature verification of the client group,
-   else `signature-required`. The verification reads the stored detached
+8. A new commit that the client built must pass the signature verification
+   of the client group, else `signature-required`. The verification reads the stored detached
    metadata of the commit and the incoming dict together, before the
    `detached-metadata-exclude` filter of step 9. A group with no `verify`
    checks no signature. A group with `verify=trust:NAME` checks each axis of
@@ -3156,6 +3193,118 @@ the session, and the session writes nothing:
 `CommitReply` has one entry for each update, in the order of `Commit`.
 "Locks and on-disk state of a receive" states when the server sends it.
 
+#### Server commit
+
+A server commit is a commit that the server makes from a tree and the fields
+that the client sends in `server-commit` ("Messages"). Its parent is the tip
+of the branch on the server. The server runs these checks in this order. Each
+failed check ends the session, and the session writes nothing:
+
+1. The branch and each tag pass the refspec rule ("Ref name validation"), and
+   none is 64 lowercase hex characters. Each bound name passes the refspec
+   rule and holds no `:`. A failure is `invalid-ref`. Then a `Commit` with an
+   update, a `Commit` with `force`, a branch or a tag that `Hello` does not
+   name, and a ref that occurs two times among the branch and the tags are
+   `protocol`. A metadata value of the client that the commit cannot hold is
+   also `protocol`. The port reads and writes the metadata dict of a commit
+   with at most 128 levels of containers. In that dict, the `v` of each value
+   is under two containers, the dict and its entry, so the `v` can hold two
+   levels fewer than in the message.
+2. A `CommitReply` with a commit in `old` of the branch that needs a frame
+   over 1 MiB is `limit-exceeded`.
+3. A detached metadata dict of the session, and a commit object that the
+   session staged, are `protocol`.
+4. These are `ref-denied`:
+   - a session with the hooks of a host application;
+   - a branch or a tag `ostree-metadata` in the local refs of a repository
+     with a collection id;
+   - a remote ref `REMOTE:NAME`;
+   - a branch without `c`;
+   - a tag with neither `t` nor `w`.
+
+   A bound name gets no ref and needs no right.
+5. Each object that the tree of the commit reaches must be staged or
+   present, else `missing-objects`.
+
+Checks 7 and 8 of a `Commit` with no server commit do not apply. The server
+writes the binding keys, and `verify` and `allow-unsigned` of the client group
+do not apply. The trust in a server commit comes from the authentication of
+the client and from `sign`.
+
+The server then makes the staged objects durable and takes the update lock.
+Under the lock it reads the branch and the tags in the namespace of the
+session, and check 10 applies, with a write to each of these refs. Then the
+server checks the branch, and then each tag, in order:
+
+- A server commit with `orphan` on a branch that is present is
+  `non-fast-forward`, unless the branch has `d`.
+- A tag that is present is `ref-mismatch`, with `ref` and `current`. This
+  applies also with `w` on the tag.
+
+Then the server builds the commit under the update lock:
+
+- The parent is the commit of the branch. With `orphan`, or when the branch
+  is absent, the commit has no parent.
+- The subject, the body, and the root dirtree and root dirmeta are the values
+  of the client. The list of related objects is empty.
+- The timestamp is the value of `timestamp`, else the system clock of the
+  server. The server does not read `SOURCE_DATE_EPOCH`.
+- The metadata dict holds these entries, in this order, which is the order of
+  `commit` (`conformance/cli-behavior.md`, "CLI output formats", `commit`):
+  1. each entry of the client, in order, with duplicate keys kept. The server
+     drops each entry under `ostree.ref-binding` and
+     `ostree.collection-binding`, and moves each entry under
+     `ostree.composefs.digest.v0` and `ostree.sizes` to items 4 and 5;
+  2. `ostree.ref-binding` (`as`): the branch, each tag, and each bound name,
+     sorted byte-wise, with duplicates kept;
+  3. `ostree.collection-binding` (`s`): the collection of a collection
+     namespace, or the collection id of the repository for the local refs.
+     The key is absent for the local refs of a repository with no collection
+     id;
+  4. each entry of the client under `ostree.composefs.digest.v0`, in order;
+  5. each entry of the client under `ostree.sizes`, in order.
+
+  The server adds no `ostree.sizes` of its own.
+
+Inputs that equal those of a commit that the repository holds give the
+checksum of that commit. Then the commit object stays as it is.
+
+The server signs the commit under the update lock with each key of `sign` of
+the client group, each key one time. A key that signed the commit in its
+stored detached metadata adds no signature. Check 12 applies to the merged
+dict. The server then moves the branch to the commit and creates each tag at
+the commit, in one transaction commit. If the branch already names the
+commit, the branch does not change. A bound name gets no ref. The steps of
+"Locks and on-disk state of a receive" follow.
+
+A failure of the build is `internal`, for example a system clock before the
+Unix epoch, or an I/O error.
+
+With equal inputs, the checksum of a server commit is equal to the checksum
+of `ostree commit --no-xattrs -b BRANCH --bind-ref NAME ...` with the same
+parent, in a repository whose `collection-id` is the collection of the target.
+Each tag and each bound name is one `--bind-ref`, and `orphan` is
+`--parent=none`.
+
+Observed behavior: the tool version 2026.1 makes each commit in an `archive`
+repository with `SOURCE_DATE_EPOCH=1700000000`. The commit has a subject, a
+body, two `--add-metadata-string` entries with one key, and one
+`--add-metadata` entry. The server commit carries the fields of the commit of
+the tool and its metadata without the binding keys. The checksums are equal
+in these cases:
+
+- no collection id in either repository;
+- the local refs of a repository whose collection id is that of the tool;
+- the collection of the tool in a repository with another collection id, and
+  in a repository with no collection id;
+- one `--bind-ref` as a tag and one as a bound name;
+- a second commit on the branch, with the tip as its parent;
+- `--parent=none` and `orphan` on a branch that exists.
+
+`ostree fsck` passes on the repository of the port after these commits.
+`ostree refs -c` lists the collection refs that the port writes, and
+`ostree show` reads the commit.
+
 ### Abort, abandon, and end of input
 
 On a stream, these events end a session, and the server sends no `Error`:
@@ -3190,7 +3339,11 @@ that a receive uses. A receive uses them in this order:
    transaction commit. Under `[core] locking=false`, a one-way stream takes
    no repository lock.
 2. At `Commit`, after check 9, the server takes the update lock. Under the
-   lock it reads the refs again and runs checks 10 to 12.
+   lock it reads the refs again and runs checks 10 to 12. For a server
+   commit, the server also builds, writes, and signs the commit under the
+   lock, because the commit bytes exist only after the read of the tip
+   ("Server commit"). A GPG signature then holds the lock for the time of the
+   `gpg` run.
 3. The server queues the detached metadata and the ref writes in the
    transaction. The policy regenerates the summary when
    `[core] auto-update-summary` is true ("Config file (`<repo>/config`,
@@ -3243,8 +3396,8 @@ The server sends no message. The stream holds these parts, in this order:
 - a `Have`, and each other message out of this order;
 - an `Abort` frame between two objects;
 - a byte after `Commit`;
-- an update whose state is 1, and an update with no `new`. The server refuses
-  them when it reads `Commit`.
+- an update whose state is 1, an update with no `new`, and a `Commit` with
+  `server-commit`. The server refuses them when it reads `Commit`.
 
 If a client cannot complete an object, it sends the abandon marker and then
 `Abort` ("Abort, abandon, and end of input"). The server then ends the session

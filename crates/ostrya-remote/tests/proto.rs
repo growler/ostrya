@@ -8,7 +8,7 @@ use ostrya_remote::proto::{
     CommitRequest, ErrorMessage, FrameReader, FrameWriter, GetReply, HaveReply, Hello, HelloReply,
     Kind, ListRefsRequest, MAX_FRAME, MAX_FRAME_LIMIT, MAX_HAVE, MIN_FRAME_LIMIT, Message,
     ObjectHeader, ObjectRead, ObjectsReply, PULL_PROTOCOL_VERSION, PullHello, PullHelloReply,
-    RefState,
+    RefState, ServerCommit,
 };
 use ostrya_remote::{Encoding, Error, ErrorCode, Expected, RefOutcome, RefUpdate};
 
@@ -188,6 +188,7 @@ fn samples() -> Vec<Message> {
         Message::Commit(CommitRequest {
             updates,
             force: true,
+            server_commit: None,
         }),
         Message::CommitReply(vec![
             outcome("a", None, Some(ck(1))),
@@ -240,7 +241,10 @@ fn every_message_round_trips() {
     round_trip(Message::Commit(CommitRequest {
         updates: vec![],
         force: false,
+        server_commit: None,
     }));
+    round_trip(server_commit_request(full_server_commit()));
+    round_trip(server_commit_request(minimal_server_commit()));
     for code in ErrorCode::ALL {
         round_trip(Message::Error(sample_error(code, code.as_str())));
     }
@@ -1752,4 +1756,261 @@ fn get_ref_shows_the_buffered_bytes() {
         r.read_message().await.unwrap();
         assert!(r.get_ref().buffer().is_empty());
     });
+}
+
+/// A server commit with the branch `m`, no tag, no bound name, the root
+/// `ck(0)`, no subject, no body, no metadata, and no option.
+fn minimal_server_commit() -> ServerCommit {
+    ServerCommit {
+        branch: "m".into(),
+        tags: Vec::new(),
+        bind_refs: Vec::new(),
+        root_dirtree: ck(0),
+        root_dirmeta: ck(0),
+        subject: String::new(),
+        body: String::new(),
+        metadata: Vec::new(),
+        timestamp: None,
+        orphan: false,
+    }
+}
+
+/// A server commit with tags, bound names, metadata with a key that occurs
+/// two times and a value that is not a string, a timestamp, and `orphan`.
+fn full_server_commit() -> ServerCommit {
+    ServerCommit {
+        branch: "os/main".into(),
+        tags: vec!["os/v1".into(), "os/stable".into()],
+        bind_refs: vec!["os/alias".into(), "os/alias".into()],
+        root_dirtree: ck(1),
+        root_dirmeta: ck(2),
+        subject: "Subject".into(),
+        body: "Body\nline".into(),
+        metadata: vec![
+            ("version".into(), variant(Type::Str, st("1"))),
+            ("n".into(), variant(Type::U32, Value::U32(7))),
+            ("version".into(), variant(Type::Str, st("2"))),
+            (
+                "list".into(),
+                variant(ty("as"), Value::Array(vec![st("a"), st("b")])),
+            ),
+        ],
+        timestamp: Some(1_700_000_000),
+        orphan: true,
+    }
+}
+
+/// The bytes of a `v` that holds `value` of the type `ty`.
+fn variant(ty: Type, value: Value) -> Vec<u8> {
+    gv("v", Value::variant(ty, value))
+}
+
+/// The bytes of a `v` that holds a `y` under `levels` levels of maybe.
+fn nested_maybe(levels: usize) -> Vec<u8> {
+    let ty = (0..levels).fold(Type::Byte, |ty, _| Type::maybe(ty));
+    let value = (0..levels).fold(Value::Byte(1), |value, _| {
+        Value::Maybe(Some(Box::new(value)))
+    });
+    let mut bytes = ostrya_gvariant::to_bytes(&ty, &value).unwrap();
+    bytes.push(0);
+    bytes.extend(ty.signature().as_bytes());
+    bytes
+}
+
+fn server_commit_request(sc: ServerCommit) -> Message {
+    Message::Commit(CommitRequest {
+        updates: Vec::new(),
+        force: false,
+        server_commit: Some(Box::new(sc)),
+    })
+}
+
+/// The type of the `server-commit` value.
+const SERVER_COMMIT: &str = "(sasas(ayay)ssa{sv}a{sv})";
+
+/// A `server-commit` value with the branch `m`, no tag, no bound name, the
+/// root pair `(dirtree, dirmeta)`, no subject, no body, and the dicts
+/// `metadata` and `options`.
+fn server_commit_value(dirtree: Value, dirmeta: Value, metadata: Value, options: Value) -> Value {
+    t(vec![
+        st("m"),
+        Value::Array(vec![]),
+        Value::Array(vec![]),
+        t(vec![dirtree, dirmeta]),
+        st(""),
+        st(""),
+        metadata,
+        options,
+    ])
+}
+
+/// A `Commit` body with no update and the dict `entries`.
+fn server_commit_body(entries: Vec<Value>) -> Vec<u8> {
+    gv(
+        "(a(symaymay)a{sv})",
+        t(vec![Value::Array(vec![]), Value::Array(entries)]),
+    )
+}
+
+/// The bytes of a `Commit` with the minimal server commit.
+///
+/// The value `(sasas(ayay)ssa{sv}a{sv})` has these bytes:
+///
+/// - the branch `m\0`
+/// - two empty string arrays of 0 bytes
+/// - the root pair: two checksums of 32 bytes and the framing offset of the
+///   end of the first one, 32
+/// - two empty strings, each the one byte `0`
+/// - 3 bytes of padding to the alignment 8 of the dicts, and two empty dicts
+///   of 0 bytes
+/// - the framing offsets of the ends of the first seven members, in reverse
+///   order: 72, 69, 68, 67, 2, 2, and 2
+///
+/// The value is 79 bytes. The dict entry holds the key `server-commit\0`
+/// (14 bytes), 2 bytes of padding, the value, a zero separator, the type (25
+/// bytes), and the framing offset of the end of the key, 14. The array of one
+/// entry of 122 bytes adds the offset of the end of the entry, 122. The empty
+/// update list comes first, so the body ends with its framing offset, 0.
+#[test]
+fn a_server_commit_has_golden_bytes() {
+    let mut expected = hex("00 00 00 7d 08");
+    expected.extend(b"server-commit\0");
+    expected.extend(hex("00 00 6d 00"));
+    expected.extend(ck_bytes(0));
+    expected.extend(ck_bytes(0));
+    expected.extend(hex("20 00 00 00 00 00 48 45 44 43 02 02 02 00"));
+    expected.extend(SERVER_COMMIT.as_bytes());
+    expected.extend(hex("0e 7a 00"));
+    golden(server_commit_request(minimal_server_commit()), expected);
+    // A `Commit` with no server commit writes no key.
+    golden(
+        Message::Commit(CommitRequest {
+            updates: vec![],
+            force: false,
+            server_commit: None,
+        }),
+        hex("00 00 00 02 08 00"),
+    );
+}
+
+/// The decoder refuses a root checksum of another length, a `server-commit`
+/// value of another type, and an option of another type, each with
+/// `Error::Protocol`. It ignores an unknown option. It keeps each metadata
+/// entry in order, also a key that occurs two times.
+#[test]
+fn a_server_commit_decodes_strictly() {
+    let good = || Value::Bytes(ck_bytes(0));
+    let none = || opts(&[]);
+    let read = |value: Value, sig: &str| {
+        read_one(&frame(
+            8,
+            &server_commit_body(vec![entry("server-commit", sig, value)]),
+        ))
+    };
+    let valid = read(
+        server_commit_value(good(), good(), none(), none()),
+        SERVER_COMMIT,
+    );
+    assert_eq!(
+        valid.unwrap(),
+        Some(server_commit_request(minimal_server_commit()))
+    );
+
+    for len in [0, 31, 33] {
+        let bad = || bytes_value(len);
+        assert_protocol(read(
+            server_commit_value(bad(), good(), none(), none()),
+            SERVER_COMMIT,
+        ));
+        assert_protocol(read(
+            server_commit_value(good(), bad(), none(), none()),
+            SERVER_COMMIT,
+        ));
+    }
+    assert_protocol(read(st("main"), "s"));
+    let options = |key: &str, sig: &str, v: Value| opts(&[(key, sig, v)]);
+    for bad in [
+        options("timestamp", "u", Value::U32(1)),
+        options("timestamp", "s", st("1")),
+        options("orphan", "s", st("true")),
+        options("orphan", "u", Value::U32(1)),
+    ] {
+        assert_protocol(read(
+            server_commit_value(good(), good(), none(), bad),
+            SERVER_COMMIT,
+        ));
+    }
+
+    let ignored = options("zz-unknown", "u", Value::U32(1));
+    let got = read(
+        server_commit_value(good(), good(), none(), ignored),
+        SERVER_COMMIT,
+    );
+    assert_eq!(
+        got.unwrap(),
+        Some(server_commit_request(minimal_server_commit()))
+    );
+
+    let metadata = Value::Array(vec![
+        entry("k", "s", st("first")),
+        entry("other", "u", Value::U32(3)),
+        entry("k", "u", Value::U32(2)),
+    ]);
+    let options = opts(&[
+        ("orphan", "b", Value::Bool(true)),
+        ("timestamp", "t", Value::U64(5)),
+        ("orphan", "b", Value::Bool(false)),
+    ]);
+    let got = read(
+        server_commit_value(good(), good(), metadata, options),
+        SERVER_COMMIT,
+    );
+    let expected = ServerCommit {
+        metadata: vec![
+            ("k".into(), variant(Type::Str, st("first"))),
+            ("other".into(), variant(Type::U32, Value::U32(3))),
+            ("k".into(), variant(Type::U32, Value::U32(2))),
+        ],
+        timestamp: Some(5),
+        orphan: true,
+        ..minimal_server_commit()
+    };
+    assert_eq!(got.unwrap(), Some(server_commit_request(expected)));
+
+    // A metadata value whose bytes are not a `v` in normal form decodes to
+    // `Error::Protocol`. The bool `2` is not normal form.
+    let metadata = Value::Array(vec![entry("k", "b", Value::Bool(true))]);
+    let mut body = server_commit_body(vec![entry(
+        "server-commit",
+        SERVER_COMMIT,
+        server_commit_value(good(), good(), metadata, none()),
+    )]);
+    let at = body.windows(3).position(|w| w == b"\x01\0b").unwrap();
+    body[at] = 2;
+    assert_protocol(read_one(&frame(8, &body)));
+
+    // The bytes of a value that is not a `v` in normal form do not encode:
+    // a string with no type signature, and a bool `2`.
+    for bad in [b"bare\0".to_vec(), b"\x02\0b".to_vec()] {
+        let mut sc = minimal_server_commit();
+        sc.metadata.push(("k".into(), bad));
+        let mut w = FrameWriter::new(Vec::new());
+        assert_protocol(block_on(w.write_message(&server_commit_request(sc))));
+        assert!(w.into_inner().is_empty());
+    }
+}
+
+/// The depth of a metadata value counts from its `v`, not from the start of
+/// the message: a `v` that holds 127 levels of maybe round-trips, and one
+/// that holds 128 levels does not encode.
+#[test]
+fn a_server_commit_carries_a_metadata_value_at_the_depth_limit() {
+    let with = |levels: usize| ServerCommit {
+        metadata: vec![("deep".into(), nested_maybe(levels))],
+        ..minimal_server_commit()
+    };
+    round_trip(server_commit_request(with(127)));
+    let mut w = FrameWriter::new(Vec::new());
+    assert_protocol(block_on(w.write_message(&server_commit_request(with(128)))));
+    assert!(w.into_inner().is_empty());
 }

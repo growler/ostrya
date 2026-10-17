@@ -1478,14 +1478,12 @@ fn resolve(guess: &Guess) -> TextResult<Type> {
         Guess::StringLit => Type::Str,
         Guess::Basic(ty) => ty.clone(),
         Guess::Variant => Type::Variant,
-        Guess::Maybe(elem) => Type::Maybe(Box::new(resolve(elem)?)),
-        Guess::Array(elem) => Type::Array(Box::new(resolve(elem)?)),
+        Guess::Maybe(elem) => Type::maybe(resolve(elem)?),
+        Guess::Array(elem) => Type::array(resolve(elem)?),
         Guess::Tuple(members) => {
-            Type::Tuple(members.iter().map(resolve).collect::<TextResult<_>>()?)
+            Type::tuple(members.iter().map(resolve).collect::<TextResult<_>>()?)
         }
-        Guess::Entry(key, value) => {
-            Type::DictEntry(Box::new(resolve(key)?), Box::new(resolve(value)?))
-        }
+        Guess::Entry(key, value) => Type::dict_entry(resolve(key)?, resolve(value)?),
     })
 }
 

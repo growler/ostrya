@@ -3,13 +3,18 @@
 use std::sync::LazyLock;
 
 use ostrya_core::{Checksum, ObjectName, ObjectType};
-use ostrya_gvariant::{ArrayIter, DictBuilder, GvDecode, GvType, Type, Value};
+use ostrya_gvariant::{
+    ArrayIter, DictBuilder, GvDecode, GvEncode, GvType, Slice, Type, Value, encode_to_vec, to_bytes,
+};
 
 use super::{
     Encoding, Expected, Kind, MAX_FRAME_LIMIT, MIN_FRAME_LIMIT, RefOutcome, RefState, RefUpdate,
     checksum, have_type, header_type, maybe_value, object_name, object_name_value, protocol,
 };
 use crate::error::{Error, ErrorCode, Result};
+
+/// The type of the `server-commit` value of a `Commit`.
+const SERVER_COMMIT_SIGNATURE: &str = "(sasas(ayay)ssa{sv}a{sv})";
 
 fn parse(signature: &str) -> Type {
     Type::parse(signature).expect("valid signature")
@@ -21,7 +26,8 @@ static OBJECT_NAMES: LazyLock<Type> = LazyLock::new(|| parse("a(yay)"));
 static BYTES: LazyLock<Type> = LazyLock::new(|| parse("ay"));
 static OBJECT_HEADER: LazyLock<Type> = LazyLock::new(|| parse("(yayy)"));
 static OBJECTS_REPLY: LazyLock<Type> = LazyLock::new(|| parse("(ut)"));
-static COMMIT: LazyLock<Type> = LazyLock::new(|| parse("(a(symaymay)a{sv})"));
+static UPDATES: LazyLock<Type> = LazyLock::new(|| parse("a(symaymay)"));
+static SERVER_COMMIT: LazyLock<Type> = LazyLock::new(|| parse(SERVER_COMMIT_SIGNATURE));
 static COMMIT_REPLY: LazyLock<Type> = LazyLock::new(|| parse("a(smaymay)"));
 static ERROR: LazyLock<Type> = LazyLock::new(|| parse("(ssa{sv})"));
 static STRV: LazyLock<Type> = LazyLock::new(|| parse("as"));
@@ -192,12 +198,76 @@ pub struct ObjectsReply {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitRequest {
     /// The ref updates.
+    ///
+    /// A `Commit` with a [`server_commit`](Self::server_commit) holds no
+    /// update.
     pub updates: Vec<RefUpdate>,
     /// The flag that allows a ref update that is not a fast-forward.
     ///
     /// The key is `force`. The encoder writes the key only if the value is
     /// `true`, and the decoder reads an absent key as `false`.
     pub force: bool,
+    /// The commit that the server makes, under the key `server-commit`.
+    ///
+    /// The encoder writes the key only if the value is `Some`, and the
+    /// decoder reads an absent key as `None`. The value is boxed, so a
+    /// [`Message`] of another kind stays small.
+    pub server_commit: Option<Box<ServerCommit>>,
+}
+
+/// A commit that the server makes from a tree and the fields that the client
+/// sends, the value of the `server-commit` key of a `Commit`.
+///
+/// The value has the type `(sasas(ayay)ssa{sv}a{sv})`. Its members hold the
+/// fields in the order of this struct. The root dirtree and the root dirmeta
+/// make one `(ayay)` member. [`timestamp`](Self::timestamp) and
+/// [`orphan`](Self::orphan) are keys of the last member, a dict of options.
+///
+/// The server reads the tip of the branch under its update lock, and writes
+/// the commit with that tip as its parent. It moves the branch and creates
+/// each tag at the new commit. The `CommitReply` of a server commit holds
+/// one entry for the branch, then one entry for each tag. The `new` commit of
+/// each entry is the commit that the server wrote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServerCommit {
+    /// The branch that the server moves to the new commit.
+    pub branch: String,
+    /// The tags that the server creates at the new commit, in order.
+    pub tags: Vec<String>,
+    /// The names that the commit binds and that get no ref, in order.
+    ///
+    /// The `ostree.ref-binding` of the commit holds the branch, each tag, and
+    /// each of these names.
+    pub bind_refs: Vec<String>,
+    /// The checksum of the root dirtree of the commit.
+    pub root_dirtree: Checksum,
+    /// The checksum of the root dirmeta of the commit.
+    pub root_dirmeta: Checksum,
+    /// The subject of the commit.
+    pub subject: String,
+    /// The body of the commit.
+    pub body: String,
+    /// The metadata entries of the client, in order.
+    ///
+    /// Each entry is a key and the bytes of a `v` in normal form: the bytes
+    /// of the value, a zero byte, and the type signature of the value.
+    /// [`to_bytes`](ostrya_gvariant::to_bytes) with [`Type::Variant`] gives
+    /// these bytes. The dict is data, and the rules of a protocol dict do not
+    /// apply to it: the decoder keeps each entry in order, also a key that
+    /// occurs two times. The decoder and the encoder check the bytes of each
+    /// entry and build no value tree.
+    pub metadata: Vec<(String, Vec<u8>)>,
+    /// The commit time in seconds since the Unix epoch, UTC, under the key
+    /// `timestamp`.
+    ///
+    /// `None` gives the clock of the server. The encoder writes the key only
+    /// if the value is `Some`.
+    pub timestamp: Option<u64>,
+    /// The flag that makes a commit with no parent, under the key `orphan`.
+    ///
+    /// The encoder writes the key only if the value is `true`, and the
+    /// decoder reads an absent key as `false`.
+    pub orphan: bool,
 }
 
 /// The `Error` message, which the server sends to report a failure.
@@ -312,7 +382,8 @@ pub enum Message {
     ObjectsReply(ObjectsReply),
     /// The `Commit` message.
     Commit(CommitRequest),
-    /// The `CommitReply` message, with one outcome for each ref update.
+    /// The `CommitReply` message, with one outcome for each ref update, or
+    /// for each ref of a [`ServerCommit`].
     CommitReply(Vec<RefOutcome>),
     /// The `Error` message.
     Error(ErrorMessage),
@@ -370,10 +441,13 @@ impl Message {
     /// - an `Error` message with the code `ref-mismatch` and no `current`
     ///   state
     /// - a `GetReply` whose `found` is `false` and that has a length
+    /// - a metadata entry of a [`ServerCommit`] whose bytes are not a `v` in
+    ///   normal form
     /// - a string with an interior NUL byte, which the GVariant serializer
     ///   refuses
     pub fn encode_body(&self) -> Result<Vec<u8>> {
         let (ty, value): (&Type, Value) = match self {
+            Message::Commit(c) => return encode_commit(c),
             Message::ObjectsEnd => return Ok(Vec::new()),
             Message::Abort => return Ok(vec![0]),
             Message::Hello(h) => {
@@ -442,33 +516,6 @@ impl Message {
                 let v = Value::Tuple(vec![Value::U32(r.objects), Value::U64(r.payload_bytes)]);
                 (&OBJECTS_REPLY, v)
             }
-            Message::Commit(c) => {
-                let updates = c
-                    .updates
-                    .iter()
-                    .map(|u| {
-                        let (state, expected) = match u.expected {
-                            Expected::Absent => (0, None),
-                            Expected::Commit(c) => (1, Some(c)),
-                            Expected::Any => (2, None),
-                        };
-                        Value::Tuple(vec![
-                            Value::Str(u.name.clone()),
-                            Value::Byte(state),
-                            maybe_value(expected),
-                            maybe_value(u.new),
-                        ])
-                    })
-                    .collect();
-                let mut opts = DictBuilder::new();
-                if c.force {
-                    opts.insert_bool("force", true);
-                }
-                (
-                    &COMMIT,
-                    Value::Tuple(vec![Value::Array(updates), opts.build()]),
-                )
-            }
             Message::CommitReply(outcomes) => {
                 let v = outcomes
                     .iter()
@@ -536,7 +583,7 @@ impl Message {
                 )
             }
         };
-        ostrya_gvariant::to_bytes(ty, &value).map_err(|e| protocol(format!("encode: {e}")))
+        to_bytes(ty, &value).map_err(encode_error)
     }
 
     /// Decodes the body of a message of `kind`.
@@ -546,8 +593,9 @@ impl Message {
     /// dict value under a key that it does not know, it allocates a value
     /// tree, checks it for normal form, and then drops it. If a dict holds a
     /// key two times, the first value counts, and the decoder checks each
-    /// later value for normal form alone. [`MAX_FRAME`](super::MAX_FRAME)
-    /// states the measured peaks.
+    /// later value for normal form alone. It checks each metadata entry of a
+    /// server commit in place and copies its bytes, with no value tree.
+    /// [`MAX_FRAME`](super::MAX_FRAME) states the measured peaks.
     ///
     /// # Errors
     ///
@@ -563,6 +611,8 @@ impl Message {
     /// - an object type or an encoding byte is not allowed in the message
     /// - a ref update of a `Commit` has an unknown expected state, or a state
     ///   that does not match its expected commit
+    /// - the value under `server-commit` of a `Commit`, or under `timestamp`
+    ///   or `orphan` of its options, has the wrong type
     /// - an `Error` message has an unknown code, has one of the keys `ref`
     ///   and `current` alone, or has the code `ref-mismatch` with neither
     /// - a `GetReply` whose `found` is `false` has a length
@@ -619,9 +669,17 @@ impl Message {
             Kind::Commit => {
                 let (updates, opts): (ArrayIter<UpdateView>, Dict) = parse_body(body)?;
                 let updates = collect(updates, decode_update)?;
-                let [force] = dict(opts, ["force"])?;
+                let [force, server_commit] = dict(opts, ["force", "server-commit"])?;
                 let force = field(force, "force", &Type::Bool)?.unwrap_or(false);
-                Message::Commit(CommitRequest { updates, force })
+                let server_commit = field(server_commit, "server-commit", &SERVER_COMMIT)?
+                    .map(decode_server_commit)
+                    .transpose()?
+                    .map(Box::new);
+                Message::Commit(CommitRequest {
+                    updates,
+                    force,
+                    server_commit,
+                })
             }
             Kind::CommitReply => {
                 let outcomes: ArrayIter<(&str, MaybeBytes, MaybeBytes)> = parse_body(body)?;
@@ -770,6 +828,145 @@ fn decode_update((name, state, expected, new): UpdateView) -> Result<RefUpdate> 
         name: name.to_owned(),
         expected,
         new: maybe_checksum(new)?,
+    })
+}
+
+/// Returns the [`Error::Protocol`] of an encode that fails.
+fn encode_error(e: ostrya_gvariant::Error) -> Error {
+    protocol(format!("encode: {e}"))
+}
+
+/// Returns the bytes of a `v` that holds `value` of the type `ty`.
+fn variant_bytes(ty: Type, value: Value) -> Result<Vec<u8>> {
+    to_bytes(&Type::Variant, &Value::variant(ty, value)).map_err(encode_error)
+}
+
+/// Returns the `a{sv}` entries of `entries`, each a key and the bytes of a
+/// `v`, in the form that the typed encoder writes.
+fn dict_entries<'a>(
+    entries: &'a [(&'static str, Vec<u8>)],
+) -> Vec<(&'static str, VariantSlice<'a>)> {
+    entries
+        .iter()
+        .map(|(key, value)| (*key, VariantSlice { inner: value }))
+        .collect()
+}
+
+/// Encodes the body of a `Commit` message.
+///
+/// The typed encoder writes the metadata of a server commit from its bytes,
+/// so the encode builds no value tree for it, and the depth of a metadata
+/// value inside the message does not count against the depth limit of the
+/// serializer.
+fn encode_commit(c: &CommitRequest) -> Result<Vec<u8>> {
+    let updates = c
+        .updates
+        .iter()
+        .map(|u| {
+            let (state, expected) = match u.expected {
+                Expected::Absent => (0, None),
+                Expected::Commit(c) => (1, Some(c)),
+                Expected::Any => (2, None),
+            };
+            Value::Tuple(vec![
+                Value::Str(u.name.clone()),
+                Value::Byte(state),
+                maybe_value(expected),
+                maybe_value(u.new),
+            ])
+        })
+        .collect();
+    let updates = to_bytes(&UPDATES, &Value::Array(updates)).map_err(encode_error)?;
+    let mut opts = Vec::new();
+    if c.force {
+        opts.push(("force", variant_bytes(Type::Bool, Value::Bool(true))?));
+    }
+    if let Some(sc) = &c.server_commit {
+        let mut value = server_commit_bytes(sc)?;
+        value.push(0);
+        value.extend_from_slice(SERVER_COMMIT_SIGNATURE.as_bytes());
+        opts.push(("server-commit", value));
+    }
+    encode_to_vec(&(updates.as_slice(), Slice(&dict_entries(&opts)))).map_err(encode_error)
+}
+
+/// Returns the bytes of the `server-commit` value of a `Commit`.
+///
+/// The bytes of each metadata entry must be a `v` in normal form, else the
+/// call returns [`Error::Protocol`].
+fn server_commit_bytes(sc: &ServerCommit) -> Result<Vec<u8>> {
+    let tags: Vec<&str> = sc.tags.iter().map(String::as_str).collect();
+    let bind_refs: Vec<&str> = sc.bind_refs.iter().map(String::as_str).collect();
+    let metadata = sc
+        .metadata
+        .iter()
+        .map(|(key, value)| {
+            ostrya_gvariant::validate(&Type::Variant, value)
+                .map_err(|e| protocol(format!("encode: metadata entry '{key}': {e}")))?;
+            Ok((key.as_str(), VariantSlice { inner: value }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut opts = Vec::new();
+    if let Some(timestamp) = sc.timestamp {
+        opts.push((
+            "timestamp",
+            variant_bytes(Type::U64, Value::U64(timestamp))?,
+        ));
+    }
+    if sc.orphan {
+        opts.push(("orphan", variant_bytes(Type::Bool, Value::Bool(true))?));
+    }
+    encode_to_vec(&(
+        sc.branch.as_str(),
+        Slice(&tags),
+        Slice(&bind_refs),
+        (sc.root_dirtree, sc.root_dirmeta),
+        sc.subject.as_str(),
+        sc.body.as_str(),
+        Slice(&metadata),
+        Slice(&dict_entries(&opts)),
+    ))
+    .map_err(encode_error)
+}
+
+/// A `(sasas(ayay)ssa{sv}a{sv})` server commit, as the body holds it.
+type ServerCommitView<'a> = (
+    &'a str,
+    ArrayIter<'a, &'a str>,
+    ArrayIter<'a, &'a str>,
+    (&'a [u8], &'a [u8]),
+    &'a str,
+    &'a str,
+    ArrayIter<'a, (&'a str, VariantSlice<'a>)>,
+    Dict<'a>,
+);
+
+/// Decodes the `server-commit` value of a `Commit`.
+///
+/// The decoder checks that the bytes of each entry of the metadata dict are
+/// a `v` in normal form, and keeps the bytes, in order, also a key that occurs
+/// two times. It builds no value tree.
+fn decode_server_commit(
+    (branch, tags, bind_refs, (dirtree, dirmeta), subject, body, metadata, opts): ServerCommitView,
+) -> Result<ServerCommit> {
+    let [timestamp, orphan] = dict(opts, ["timestamp", "orphan"])?;
+    let timestamp = field(timestamp, "timestamp", &Type::U64)?;
+    let orphan = field(orphan, "orphan", &Type::Bool)?.unwrap_or(false);
+    let metadata = collect(metadata, |(key, value)| {
+        ostrya_gvariant::validate(&Type::Variant, value.inner).map_err(malformed)?;
+        Ok((key.to_owned(), value.inner.to_vec()))
+    })?;
+    Ok(ServerCommit {
+        branch: branch.to_owned(),
+        tags: collect(tags, |t| Ok(t.to_owned()))?,
+        bind_refs: collect(bind_refs, |n| Ok(n.to_owned()))?,
+        root_dirtree: checksum(dirtree)?,
+        root_dirmeta: checksum(dirmeta)?,
+        subject: subject.to_owned(),
+        body: body.to_owned(),
+        metadata,
+        timestamp,
+        orphan,
     })
 }
 
@@ -992,6 +1189,30 @@ impl<'a> GvDecode<'a> for RawVariant<'a> {
 
 /// An `a{sv}` in the body.
 type Dict<'a> = ArrayIter<'a, (&'a str, RawVariant<'a>)>;
+
+/// A `v` in the body as its bytes, not yet checked.
+#[derive(Clone, Copy)]
+struct VariantSlice<'a> {
+    inner: &'a [u8],
+}
+
+impl GvType for VariantSlice<'_> {
+    const ALIGNMENT: usize = 8;
+    const FIXED_SIZE: Option<usize> = None;
+}
+
+impl<'a> GvDecode<'a> for VariantSlice<'a> {
+    fn decode(data: &'a [u8]) -> ostrya_gvariant::Result<Self> {
+        Ok(VariantSlice { inner: data })
+    }
+}
+
+impl GvEncode for VariantSlice<'_> {
+    fn encode(&self, out: &mut Vec<u8>) -> ostrya_gvariant::Result<()> {
+        out.extend_from_slice(self.inner);
+        Ok(())
+    }
+}
 
 /// Returns the first entry of each of `keys` in `entries`.
 ///

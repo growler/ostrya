@@ -10,7 +10,7 @@ use std::path::Path;
 use futures_lite::io::AsyncReadExt;
 use ostrya::remote::proto::{
     CommitRequest, ErrorMessage, FrameReader, FrameWriter, Hello, HelloReply, Message,
-    ObjectHeader, ObjectsReply,
+    ObjectHeader, ObjectsReply, ServerCommit,
 };
 use ostrya::remote::{self, Encoding, ErrorCode, RefOutcome, RefUpdate};
 use ostrya::{
@@ -119,8 +119,22 @@ impl Client {
 
     /// Sends a `Commit` message with `updates` and `force`.
     pub async fn commit(&mut self, updates: Vec<RefUpdate>, force: bool) -> remote::Result<()> {
-        self.send(&Message::Commit(CommitRequest { updates, force }))
-            .await
+        self.send(&Message::Commit(CommitRequest {
+            updates,
+            force,
+            server_commit: None,
+        }))
+        .await
+    }
+
+    /// Sends a `Commit` message with the server commit `sc` and no update.
+    pub async fn server_commit(&mut self, sc: ServerCommit) -> remote::Result<()> {
+        self.send(&Message::Commit(CommitRequest {
+            updates: Vec::new(),
+            force: false,
+            server_commit: Some(Box::new(sc)),
+        }))
+        .await
     }
 
     /// Reads the reply to `Commit`: the outcomes of `CommitReply`, or the
@@ -300,10 +314,19 @@ pub struct Obj {
 /// `encoding`. The `deflate` form of a content object is the `.filez` file of
 /// the archive fixture. The `raw` form is its header and payload.
 pub fn fixture_objects(encoding: Encoding) -> Vec<Obj> {
-    let root = fixture_repo("archive");
-    let repo = block_on(Repo::open(&root)).unwrap();
-    let commit = Checksum::from_hex(COMMIT).unwrap();
-    let names = block_on(repo.traverse_commit(&commit, 0)).unwrap();
+    commit_objects(
+        &fixture_repo("archive"),
+        &Checksum::from_hex(COMMIT).unwrap(),
+        encoding,
+    )
+}
+
+/// Returns every object of `commit` in the `archive` repository at `root`,
+/// the commit included, with the content objects in `encoding`, as
+/// [`fixture_objects`] does.
+pub fn commit_objects(root: &Path, commit: &Checksum, encoding: Encoding) -> Vec<Obj> {
+    let repo = block_on(Repo::open(root)).unwrap();
+    let names = block_on(repo.traverse_commit(commit, 0)).unwrap();
     let mut names: Vec<ObjectName> = names.into_iter().collect();
     names.sort_by_key(|n| (n.ty as u8, n.checksum));
     names

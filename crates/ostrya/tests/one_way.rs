@@ -24,7 +24,9 @@ use common::receive::{
 use common::{COMMIT, TmpDir, file_inventory, foreign_holder, lock_holder_main, tool_fsck};
 use futures_io::AsyncWrite;
 use futures_lite::io::AsyncWriteExt;
-use ostrya::remote::proto::{CommitRequest, FrameWriter, Hello, Message, ObjectHeader};
+use ostrya::remote::proto::{
+    CommitRequest, FrameWriter, Hello, Message, ObjectHeader, ServerCommit,
+};
 use ostrya::remote::{self, Encoding, ErrorCode, Expected, RefOutcome, RefUpdate};
 use ostrya::{
     Checksum, DictBuilder, Error, FsckOptions, MAX_METADATA_SIZE, ObjectName, ObjectType,
@@ -197,6 +199,7 @@ impl Stream {
         self.message(&Message::Commit(CommitRequest {
             updates,
             force: false,
+            server_commit: None,
         }))
     }
 
@@ -560,6 +563,47 @@ fn an_abandoned_object_is_aborted() {
     let mut other = abandoned[..marks[marks.len() - 2]].to_vec();
     other.extend_from_slice(&[0, 0, 0, 1, 6]);
     assert_protocol(receive(&repo, &policy, &other));
+    assert_nothing_published(&repo, &before);
+}
+
+/// A `Commit` with a server commit is `protocol`, and nothing is published.
+/// The stream sends the tree of the fixture commit and no update.
+#[test]
+fn a_server_commit_is_protocol() {
+    let tmp = TmpDir::new("one-way-server-commit");
+    let (repo, before) = empty_repo(&tmp, "");
+    let tree: Vec<Obj> = fixture_objects(Encoding::Raw)
+        .into_iter()
+        .filter(|o| o.ty != ObjectType::Commit)
+        .collect();
+    let mut stream = Stream::hello(&["main"], true);
+    for o in &tree {
+        stream.object(o);
+    }
+    stream.message(&Message::ObjectsEnd);
+    stream.message(&Message::Commit(CommitRequest {
+        updates: Vec::new(),
+        force: false,
+        server_commit: Some(Box::new(ServerCommit {
+            branch: "main".into(),
+            tags: Vec::new(),
+            bind_refs: Vec::new(),
+            root_dirtree: Checksum::from_hex(common::ROOT_DIRTREE).unwrap(),
+            root_dirmeta: Checksum::from_hex(common::ROOT_DIRMETA).unwrap(),
+            subject: String::new(),
+            body: String::new(),
+            metadata: Vec::new(),
+            timestamp: None,
+            orphan: false,
+        })),
+    }));
+    let result = receive(&repo, &policy(), &stream.bytes());
+    match &result {
+        Err(Error::Remote(remote::Error::Protocol(m))) => {
+            assert!(m.contains("server commit"), "{m}")
+        }
+        other => panic!("expected protocol, got {other:?}"),
+    }
     assert_nothing_published(&repo, &before);
 }
 

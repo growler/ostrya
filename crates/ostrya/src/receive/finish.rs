@@ -26,6 +26,7 @@ use super::{ReceiveVerify, ServerSigner, TrustedKeys};
 use crate::MAX_METADATA_SIZE;
 use crate::access::{ClientAccess, Namespace};
 use crate::error::{Error, Result};
+use crate::lock::UpdateLockHeld;
 use crate::object::read_meta_object;
 use crate::refs::{CollectionRef, RefFileState};
 use crate::remote::proto::{CommitRequest, MAX_FRAME, Message};
@@ -36,7 +37,7 @@ use crate::summary::{
     OSTREE_METADATA_REF, SummaryOptions, SummaryStep, parse_signature_dict,
     serialize_signature_dict,
 };
-use crate::transaction::Transaction;
+use crate::transaction::{Transaction, TransactionStats};
 use crate::write::flat_name;
 
 /// The detached-metadata key of GPG signatures. The `ostree` command writes
@@ -45,16 +46,16 @@ use crate::write::flat_name;
 /// records this order.
 const GPG_KEY: &str = "ostree.gpgsigs";
 
-type Checked<T> = std::result::Result<T, Failure>;
+pub(super) type Checked<T> = std::result::Result<T, Failure>;
 
 /// A serialized detached-metadata dict, shared with the blocking pool.
 type Bytes = Arc<Vec<u8>>;
 
-fn protocol(message: String) -> Failure {
+pub(super) fn protocol(message: String) -> Failure {
     Failure::Wire(remote::Error::Protocol(message))
 }
 
-fn ref_denied(message: String) -> Failure {
+pub(super) fn ref_denied(message: String) -> Failure {
     Failure::Wire(remote::Error::RefDenied(message))
 }
 
@@ -71,7 +72,7 @@ pub(super) struct Named<'a> {
 impl Named<'_> {
     /// Returns `true` for the local refs of a session, and for a one-way
     /// stream.
-    fn is_local(&self) -> bool {
+    pub(super) fn is_local(&self) -> bool {
         !matches!(self.namespace, Some(Namespace::Collection(_)))
     }
 }
@@ -126,6 +127,10 @@ struct Edit<'a> {
 /// `named` holds the refs of `Hello`, their paths, and their namespace.
 /// `commit_meta` holds the detached metadata dicts of the session. In a
 /// collection namespace, the refs are under `refs/mirrors/ID/`.
+///
+/// A request with a server commit goes to
+/// [`server_commit::finish`](super::server_commit::finish), and the sections
+/// below do not apply to it.
 ///
 /// # Checks
 ///
@@ -261,7 +266,21 @@ pub(super) async fn finish(
     commit_meta: HashMap<Checksum, Vec<u8>>,
     request: CommitRequest,
 ) -> Checked<ReceiveReport> {
-    let CommitRequest { updates, force } = request;
+    if request.server_commit.is_some() {
+        // The future of a server commit is large. The box keeps it out of the
+        // future of a session with ref updates.
+        return Box::pin(super::server_commit::finish(
+            repo,
+            policy,
+            hooks,
+            txn,
+            named,
+            commit_meta,
+            request,
+        ))
+        .await;
+    }
+    let CommitRequest { updates, force, .. } = request;
     let paths: Arc<[String]> = check_names(&named, &updates)?.into();
     check_reply_fits(&updates)?;
     check_commit_meta_commits(&txn, &updates, &commit_meta)?;
@@ -344,7 +363,13 @@ pub(super) async fn finish(
         .read_ref_states(Arc::clone(&paths), anchor.then_some(OSTREE_METADATA_REF))
         .await
         .map_err(Failure::Internal)?;
-    let current = check_ref_paths(&updates, &paths, &states)?;
+    let refs: Vec<(&str, &str, bool)> = updates
+        .iter()
+        .zip(paths.iter())
+        .map(|(update, path)| (update.name.as_str(), path.as_str(), update.new.is_some()))
+        .collect();
+    let current = check_ref_paths(&refs, &states)?;
+    drop(refs);
     let mut changes = Vec::with_capacity(updates.len());
     for (i, update) in updates.iter().enumerate() {
         let changed = check_ref(
@@ -358,15 +383,86 @@ pub(super) async fn finish(
         if !*changed {
             continue;
         }
-        match named.namespace {
-            Some(Namespace::Collection(id)) => txn.set_collection_ref(
-                &CollectionRef::new(id.as_str(), update.name.as_str()),
-                update.new.as_ref(),
-            ),
-            _ => txn.set_ref(&update.name, update.new.as_ref()),
-        }
+        queue_ref(&txn, named.namespace, &update.name, update.new.as_ref());
     }
-    let summary = policy.regenerates_summary() && changes.contains(&true);
+    let changed = changes.contains(&true);
+    // The future of the publication is large. The box keeps it out of the
+    // future of the checks.
+    let (stats, warnings) = Box::pin(publish(
+        repo,
+        policy,
+        txn,
+        held,
+        changed,
+        anchor_parent,
+        session_commits,
+    ))
+    .await?;
+    // The state of the checks is freed here, so it is not held while the
+    // hook of the host runs.
+    drop((walks, targets, chains, tips, paths, rules, states, changes));
+
+    let refs = updates
+        .into_iter()
+        .zip(current)
+        .map(|(update, old)| RefOutcome {
+            name: update.name,
+            old,
+            new: update.new,
+        })
+        .collect();
+    let report = report(policy, named.namespace, refs, stats, warnings);
+    if let (Some(hooks), Some(carried)) = (hooks, carried)
+        && let Err(mut message) = hooks.after_update(&report, carried).await
+    {
+        hooks::cut(&mut message);
+        return Err(Failure::Wire(remote::Error::Internal(message)));
+    }
+    Ok(report)
+}
+
+/// Queues the write of the ref `name` of `namespace` to `new` in `txn`, or
+/// its delete for `None`.
+///
+/// In a collection namespace, the ref is under `refs/mirrors/ID/`. Else it
+/// is a refspec.
+pub(super) fn queue_ref(
+    txn: &Transaction,
+    namespace: Option<&Namespace>,
+    name: &str,
+    new: Option<&Checksum>,
+) {
+    match namespace {
+        Some(Namespace::Collection(id)) => {
+            txn.set_collection_ref(&CollectionRef::new(id.as_str(), name), new)
+        }
+        _ => txn.set_ref(name, new),
+    }
+}
+
+/// Publishes `txn`, whose ref writes are in its queue, under the update lock
+/// `held`, and returns the statistics and the warnings of the commit.
+///
+/// `changed` is `true` if a ref changes. If the policy regenerates the
+/// summary, a ref changes, and the repository has a collection id, the anchor
+/// commit goes into the queue first. Its parent is `anchor_parent`, the tip
+/// of the anchor ref that the caller read under the lock. A failure of the
+/// anchor is `internal`, and nothing is published.
+///
+/// After the transaction commit, the call removes the partial marker of each
+/// commit of `session_commits`. If the policy regenerates the summary and a
+/// ref changed, it writes each summary. A failure of these two steps is a
+/// warning. Then the call releases the update lock.
+pub(super) async fn publish(
+    repo: &Repo,
+    policy: &dyn SessionPolicy,
+    txn: Transaction,
+    held: UpdateLockHeld,
+    changed: bool,
+    anchor_parent: Option<Result<Option<Checksum>>>,
+    session_commits: Vec<Checksum>,
+) -> Checked<(TransactionStats, Vec<ReceiveWarning>)> {
+    let summary = policy.regenerates_summary() && changed;
     if summary && let Some(collection_id) = repo.config().collection_id().map(str::to_owned) {
         let parent = anchor_parent
             .transpose()
@@ -390,36 +486,25 @@ pub(super) async fn finish(
         warnings.push(warning);
     }
     drop(held);
-    // The state of the checks is freed here, so it is not held while the
-    // hook of the host runs.
-    drop((walks, targets, chains, tips, paths, rules, states, changes));
+    Ok((stats, warnings))
+}
 
-    let refs = updates
-        .into_iter()
-        .zip(current)
-        .map(|(update, old)| RefOutcome {
-            name: update.name,
-            old,
-            new: update.new,
-        })
-        .collect();
-    let report = ReceiveReport {
+/// Returns the report of a session that committed, with the outcomes
+/// `refs`, under `policy` in `namespace`.
+pub(super) fn report(
+    policy: &dyn SessionPolicy,
+    namespace: Option<&Namespace>,
+    refs: Vec<RefOutcome>,
+    stats: TransactionStats,
+    warnings: Vec<ReceiveWarning>,
+) -> ReceiveReport {
+    ReceiveReport {
         refs,
         stats,
         warnings,
         group: policy.group().map(str::to_owned),
-        collection: named
-            .namespace
-            .and_then(Namespace::collection)
-            .map(str::to_owned),
-    };
-    if let (Some(hooks), Some(carried)) = (hooks, carried)
-        && let Err(mut message) = hooks.after_update(&report, carried).await
-    {
-        hooks::cut(&mut message);
-        return Err(Failure::Wire(remote::Error::Internal(message)));
+        collection: namespace.and_then(Namespace::collection).map(str::to_owned),
     }
-    Ok(report)
 }
 
 /// Checks the ref names of the updates against the refs of `Hello`, and
@@ -726,7 +811,7 @@ async fn read_commits(
 /// Returns the `missing-objects` failure for `missing`.
 ///
 /// `what` completes the phrase "objects that ..." of the message.
-fn missing_objects(missing: Missing, what: &str) -> Failure {
+pub(super) fn missing_objects(missing: Missing, what: &str) -> Failure {
     let mut message = format!(
         "{} objects that {what} are neither staged nor present",
         missing.total
@@ -863,6 +948,48 @@ async fn read_stored_for(
     Ok(commits.into_iter().zip(stored).collect())
 }
 
+/// Signs the server commit `commit`, whose bytes are `payload`, with each key
+/// of `signers` once, under the update lock, and queues the signatures in
+/// `txn`.
+///
+/// The call reads the dict that the repository holds for the commit. A key
+/// that signed the commit in that dict, or in a signature that a key before
+/// it made, makes no signature. A merged dict over the size limit is
+/// `limit-exceeded`.
+pub(super) async fn sign_server_commit(
+    repo: &Repo,
+    txn: &Transaction,
+    commit: Checksum,
+    payload: &[u8],
+    signers: &[Arc<ServerSigner>],
+) -> Checked<()> {
+    let mut unique: Vec<&Arc<ServerSigner>> = Vec::with_capacity(signers.len());
+    for signer in signers {
+        if !unique.iter().any(|s| Arc::ptr_eq(s, signer)) {
+            unique.push(signer);
+        }
+    }
+    if unique.is_empty() {
+        return Ok(());
+    }
+    let stored = read_stored(repo, vec![commit]).await?.pop().flatten();
+    let edit = Edit {
+        commit,
+        payload,
+        stored,
+        incoming: None,
+        keep: Arc::default(),
+        signers: unique,
+        signatures: Vec::new(),
+        oversize: None,
+    };
+    // The read of the stored dict and the plan run under the update lock, so
+    // the dict cannot change before the queue, and the queue reads it no
+    // second time.
+    let edits = prepare_signatures(vec![edit], true).await?;
+    queue_edits(txn, edits)
+}
+
 /// Reads the detached metadata dict that the repository holds for each of
 /// `commits`, in order.
 ///
@@ -991,20 +1118,20 @@ fn has_signature(dict: &Value) -> bool {
 ///
 /// - A ref that is an alias.
 /// - A path that a ref write cannot replace.
-/// - Two updates that write refs, where one ref names a directory of the
-///   other.
+/// - Two refs that the message writes, where one ref names a directory of
+///   the other.
 ///
 /// In these cases no ref write can complete, so the check runs before any
 /// write goes into the queue.
-/// `paths` holds the path under `refs/` of each update, in order.
-fn check_ref_paths(
-    updates: &[RefUpdate],
-    paths: &[String],
+/// Each entry of `refs` is the name of a ref of the message, its path under
+/// `refs/`, and `true` if the message writes a commit to it. `states` holds
+/// the state of each path, in the same order.
+pub(super) fn check_ref_paths(
+    refs: &[(&str, &str, bool)],
     states: &[RefFileState],
 ) -> Checked<Vec<Option<Checksum>>> {
-    let mut current = Vec::with_capacity(updates.len());
-    for (update, state) in updates.iter().zip(states) {
-        let name = &update.name;
+    let mut current = Vec::with_capacity(refs.len());
+    for (&(name, _, _), state) in refs.iter().zip(states) {
         current.push(match state {
             RefFileState::Absent => None,
             RefFileState::Commit(commit) => Some(*commit),
@@ -1021,18 +1148,17 @@ fn check_ref_paths(
             }
         });
     }
-    let writes = || updates.iter().zip(paths).filter(|(u, _)| u.new.is_some());
+    let writes = || refs.iter().filter(|(_, _, writes)| *writes);
     let mut written: HashMap<&str, &str> = HashMap::new();
-    for (update, relpath) in writes() {
-        written.insert(relpath, update.name.as_str());
+    for &(name, relpath, _) in writes() {
+        written.insert(relpath, name);
     }
-    for (update, relpath) in writes() {
-        let mut path = relpath.as_str();
+    for &(name, relpath, _) in writes() {
+        let mut path = relpath;
         while let Some((parent, _)) = path.rsplit_once('/') {
             if let Some(other) = written.get(parent) {
                 return Err(ref_denied(format!(
-                    "ref '{}' names a path below ref '{other}' of the same message",
-                    update.name
+                    "ref '{name}' names a path below ref '{other}' of the same message"
                 )));
             }
             path = parent;
@@ -1206,6 +1332,11 @@ async fn check_edit(
     build: bool,
     keep: Arc<Vec<String>>,
 ) -> Checked<Option<Value>> {
+    // With no dict on either side, the edit accepts the absent stored dict
+    // and builds the empty dict, so no trip to the blocking pool is needed.
+    if stored.is_none() && incoming.is_none() {
+        return Ok(build.then(empty_dict));
+    }
     ostrya_rt::unblock(move || -> Result<Option<Value>> {
         let incoming = incoming.as_deref().map(Vec::as_slice);
         let stored = stored.as_deref().map(Vec::as_slice);
@@ -1674,12 +1805,9 @@ async fn add_host_entries<'a>(
 ///
 /// If the dict changed, this function drops some prepared signatures. It
 /// drops each one whose key signed the commit in the new merge, or in a
-/// signature kept before it. It then finds the size again. A dict over the
-/// size limit is `limit-exceeded`.
+/// signature kept before it. It then finds the size again.
 ///
-/// Last, it queues the merge of each filtered incoming dict, with the keys of
-/// the host entries that keep a stored value. It also queues the kept
-/// signatures.
+/// Last, [`queue_edit`] queues each edit.
 async fn queue_detached(repo: &Repo, txn: &Transaction, edits: Vec<Edit<'_>>) -> Checked<()> {
     let stored = read_stored(repo, edits.iter().map(|e| e.commit).collect()).await?;
     for (mut edit, stored) in edits.into_iter().zip(stored) {
@@ -1708,23 +1836,44 @@ async fn queue_detached(repo: &Repo, txn: &Transaction, edits: Vec<Edit<'_>>) ->
             }
             edit.oversize = oversize(&edit, written).await?;
         }
-        if let Some(size) = edit.oversize {
-            return Err(oversize_failure(&edit.commit, size));
-        }
-        if let Some(incoming) = edit.incoming {
-            txn.merge_commit_detached(
-                &edit.commit,
-                Arc::unwrap_or_clone(incoming),
-                Arc::unwrap_or_clone(edit.keep),
-            );
-        }
-        for prepared in edit.signatures {
-            txn.append_signature(
-                &edit.commit,
-                prepared.signer.signer().metadata_key(),
-                prepared.signature,
-            );
-        }
+        queue_edit(txn, edit)?;
+    }
+    Ok(())
+}
+
+/// Queues `edits`, which a plan under the update lock made, in `txn`, with
+/// no second read of the stored dicts.
+///
+/// [`queue_edit`] queues each edit.
+fn queue_edits(txn: &Transaction, edits: Vec<Edit<'_>>) -> Checked<()> {
+    for edit in edits {
+        queue_edit(txn, edit)?;
+    }
+    Ok(())
+}
+
+/// Queues one edit of the detached metadata in `txn`.
+///
+/// A dict over the size limit is `limit-exceeded`. Else the call queues the
+/// merge of the filtered incoming dict, with the keys of the host entries
+/// that keep a stored value, and then the kept signatures.
+fn queue_edit(txn: &Transaction, edit: Edit<'_>) -> Checked<()> {
+    if let Some(size) = edit.oversize {
+        return Err(oversize_failure(&edit.commit, size));
+    }
+    if let Some(incoming) = edit.incoming {
+        txn.merge_commit_detached(
+            &edit.commit,
+            Arc::unwrap_or_clone(incoming),
+            Arc::unwrap_or_clone(edit.keep),
+        );
+    }
+    for prepared in edit.signatures {
+        txn.append_signature(
+            &edit.commit,
+            prepared.signer.signer().metadata_key(),
+            prepared.signature,
+        );
     }
     Ok(())
 }
@@ -1806,6 +1955,7 @@ mod tests {
         let request = Message::Commit(CommitRequest {
             updates: updates.clone(),
             force: false,
+            server_commit: None,
         });
         let request_len = request.encode_body().unwrap().len() + 1;
         assert!(request_len <= MAX_FRAME as usize, "{request_len}");

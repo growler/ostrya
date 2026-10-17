@@ -760,4 +760,50 @@ mod tests {
         let bomb = Value::variant(Type::Variant, value);
         assert_eq!(to_bytes(&ty, &bomb), Err(Error::DepthExceeded));
     }
+
+    /// The layout lookups of a parse, a check, and a serialization grow in
+    /// proportion to the depth of the value.
+    ///
+    /// Each container type keeps the alignment and the fixed size of the
+    /// types in it, so a lookup does not walk the type. The value is an array
+    /// of nested one-member tuples. Two times the depth gives at most two
+    /// times the lookups. A lookup that walks the type gives four times or
+    /// more.
+    #[test]
+    fn layout_lookups_grow_linearly_with_depth() {
+        fn value(depth: usize) -> (Type, Value) {
+            let sig = format!("a{}s{}", "(".repeat(depth), ")".repeat(depth));
+            let ty = Type::parse(&sig).unwrap();
+            let mut element = Value::Str("leaf".into());
+            for _ in 0..depth {
+                element = Value::Tuple(vec![element]);
+            }
+            (ty, Value::Array(vec![element; 4]))
+        }
+        fn lookups(run: impl FnOnce()) -> usize {
+            crate::ty::LAYOUT_CALLS.with(|calls| calls.set(0));
+            run();
+            crate::ty::LAYOUT_CALLS.with(std::cell::Cell::get)
+        }
+        let counts = |depth: usize| {
+            let (ty, value) = value(depth);
+            let bytes = to_bytes(&ty, &value).unwrap();
+            [
+                lookups(|| drop(to_bytes(&ty, &value).unwrap())),
+                lookups(|| drop(from_bytes(&ty, &bytes).unwrap())),
+                lookups(|| validate(&ty, &bytes).unwrap()),
+            ]
+        };
+        let (shallow, deep) = (counts(32), counts(64));
+        for (what, (shallow, deep)) in ["serialize", "parse", "check"]
+            .into_iter()
+            .zip(shallow.into_iter().zip(deep))
+        {
+            assert!(shallow > 0, "{what} looks up no layout");
+            assert!(
+                deep <= 2 * shallow,
+                "{what}: {deep} lookups at depth 64, {shallow} at depth 32"
+            );
+        }
+    }
 }

@@ -1,3 +1,7 @@
+use std::fmt;
+use std::num::NonZeroU64;
+use std::ops::Deref;
+
 use crate::{Error, Result};
 
 /// The maximum container nesting depth in a type signature.
@@ -16,6 +20,12 @@ const MAX_TYPE_DEPTH: usize = crate::de::MAX_VALUE_DEPTH;
 /// The other types get into a repository through the `ostree commit
 /// --add-metadata` command. That command accepts a value of any type in the
 /// GVariant text form, which [`from_text`] reads.
+///
+/// A container type keeps the alignment and the fixed size of the types in
+/// it, which it computes one time when it is constructed. So
+/// [`alignment`](Type::alignment) and [`fixed_size`](Type::fixed_size) do
+/// not walk the type. [`Type::maybe`], [`Type::array`], [`Type::tuple`], and
+/// [`Type::dict_entry`] construct a container type.
 ///
 /// [`from_text`]: crate::from_text
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -49,18 +59,202 @@ pub enum Type {
     /// `v`
     Variant,
     /// `m<T>`
-    Maybe(Box<Type>),
+    Maybe(ElementType),
     /// `a<T>`
-    Array(Box<Type>),
+    Array(ElementType),
     /// `(<T>...)`
-    Tuple(Vec<Type>),
+    Tuple(MemberTypes),
     /// `{<K><V>}`
     ///
     /// The key `K` must be a [basic type](Type::is_basic).
-    DictEntry(Box<Type>, Box<Type>),
+    DictEntry(ElementType, ElementType),
+}
+
+/// The alignment and the fixed size of a type, in one word.
+///
+/// The low 4 bits hold the alignment in bytes: 1, 2, 4, or 8. The other bits
+/// hold the fixed size, or 0 for a type of variable size. No type has the
+/// fixed size 0.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct Layout {
+    inner: NonZeroU64,
+}
+
+impl Layout {
+    const fn new(fixed: Option<usize>, alignment: usize) -> Layout {
+        let size = match fixed {
+            Some(size) => size as u64,
+            None => 0,
+        };
+        match NonZeroU64::new(size << 4 | alignment as u64) {
+            Some(inner) => Layout { inner },
+            None => unreachable!(),
+        }
+    }
+
+    /// The layout of a scalar, whose size is its alignment.
+    const fn scalar(size: usize) -> Layout {
+        Layout::new(Some(size), size)
+    }
+
+    /// The layout of a type of variable size.
+    const fn variable(alignment: usize) -> Layout {
+        Layout::new(None, alignment)
+    }
+
+    fn alignment(self) -> usize {
+        (self.inner.get() & 0xf) as usize
+    }
+
+    fn fixed(self) -> Option<usize> {
+        match self.inner.get() >> 4 {
+            0 => None,
+            size => Some(size as usize),
+        }
+    }
+
+    /// The layout of a tuple or a dict entry with members of the layouts
+    /// `members`.
+    ///
+    /// The alignment is the greatest member alignment, at least 1. If a member
+    /// has a variable size, the structure has a variable size. The size of a
+    /// fixed structure includes the padding at its end to its alignment, and
+    /// the empty structure has the fixed size 1.
+    fn of_struct(members: impl Iterator<Item = Layout>) -> Layout {
+        let mut alignment = 1;
+        let mut size = Some(0);
+        let mut any = false;
+        for m in members {
+            any = true;
+            alignment = alignment.max(m.alignment());
+            size = match (size, m.fixed()) {
+                (Some(size), Some(fixed)) => Some(align_up(size, m.alignment()) + fixed),
+                _ => None,
+            };
+        }
+        let size = if any {
+            size.map(|size| align_up(size, alignment))
+        } else {
+            Some(1)
+        };
+        Layout::new(size, alignment)
+    }
+}
+
+/// A type in a container type: the element of a maybe or of an array, or the
+/// key or the value of a dict entry.
+///
+/// It dereferences to the [`Type`] that it holds. It keeps the alignment and
+/// the fixed size of that type, which it computes one time when it is
+/// constructed.
+#[derive(Clone, PartialEq, Eq)]
+pub struct ElementType {
+    ty: Box<Type>,
+    layout: Layout,
+}
+
+impl ElementType {
+    fn new(ty: Type) -> ElementType {
+        let layout = ty.layout();
+        ElementType {
+            ty: Box::new(ty),
+            layout,
+        }
+    }
+}
+
+impl Deref for ElementType {
+    type Target = Type;
+
+    fn deref(&self) -> &Type {
+        &self.ty
+    }
+}
+
+impl AsRef<Type> for ElementType {
+    fn as_ref(&self) -> &Type {
+        &self.ty
+    }
+}
+
+impl fmt::Debug for ElementType {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.ty, f)
+    }
+}
+
+/// The member types of a tuple type, in order.
+///
+/// It dereferences to the slice of the member types. It keeps the alignment
+/// and the fixed size of the tuple, which it computes one time when it is
+/// constructed.
+#[derive(Clone, PartialEq, Eq)]
+pub struct MemberTypes {
+    types: Vec<Type>,
+    layout: Layout,
+}
+
+impl MemberTypes {
+    fn new(types: Vec<Type>) -> MemberTypes {
+        let layout = Layout::of_struct(types.iter().map(Type::layout));
+        MemberTypes { types, layout }
+    }
+}
+
+impl Deref for MemberTypes {
+    type Target = [Type];
+
+    fn deref(&self) -> &[Type] {
+        &self.types
+    }
+}
+
+impl<'a> IntoIterator for &'a MemberTypes {
+    type Item = &'a Type;
+    type IntoIter = std::slice::Iter<'a, Type>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.types.iter()
+    }
+}
+
+impl fmt::Debug for MemberTypes {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt::Debug::fmt(&self.types, f)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// The number of calls of [`Type::layout`] on this thread.
+    ///
+    /// A test of the cost of a parse reads it.
+    pub(crate) static LAYOUT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
 impl Type {
+    /// Returns the maybe type `m<elem>`.
+    pub fn maybe(elem: Type) -> Type {
+        Type::Maybe(ElementType::new(elem))
+    }
+
+    /// Returns the array type `a<elem>`.
+    pub fn array(elem: Type) -> Type {
+        Type::Array(ElementType::new(elem))
+    }
+
+    /// Returns the tuple type of `members`, in order.
+    pub fn tuple(members: Vec<Type>) -> Type {
+        Type::Tuple(MemberTypes::new(members))
+    }
+
+    /// Returns the dict entry type `{<key><value>}`.
+    ///
+    /// The call does not check that `key` is a [basic type](Type::is_basic).
+    pub fn dict_entry(key: Type, value: Type) -> Type {
+        Type::DictEntry(ElementType::new(key), ElementType::new(value))
+    }
+
     /// Parses a complete type signature.
     ///
     /// The string must hold exactly one complete type. For example,
@@ -161,15 +355,7 @@ impl Type {
 
     /// Returns the alignment requirement of the serialized form, in bytes.
     pub fn alignment(&self) -> usize {
-        match self {
-            Type::Bool | Type::Byte | Type::Str | Type::ObjectPath | Type::Signature => 1,
-            Type::I16 | Type::U16 => 2,
-            Type::I32 | Type::U32 | Type::Handle => 4,
-            Type::I64 | Type::U64 | Type::Double | Type::Variant => 8,
-            Type::Maybe(elem) | Type::Array(elem) => elem.alignment(),
-            Type::Tuple(members) => members.iter().map(Type::alignment).max().unwrap_or(1),
-            Type::DictEntry(key, value) => key.alignment().max(value.alignment()),
-        }
+        self.layout().alignment()
     }
 
     /// Returns the serialized size, or `None` if the type has a variable size.
@@ -178,20 +364,27 @@ impl Type {
     /// its alignment, so `(ty)` has the size 16. The empty tuple `()` has the
     /// fixed size 1.
     pub fn fixed_size(&self) -> Option<usize> {
+        self.layout().fixed()
+    }
+
+    /// Returns the layout of this type.
+    ///
+    /// A container type holds the layouts of the types in it, so the call
+    /// does not walk the type.
+    fn layout(&self) -> Layout {
+        #[cfg(test)]
+        LAYOUT_CALLS.with(|calls| calls.set(calls.get() + 1));
         match self {
-            Type::Bool | Type::Byte => Some(1),
-            Type::I16 | Type::U16 => Some(2),
-            Type::I32 | Type::U32 | Type::Handle => Some(4),
-            Type::I64 | Type::U64 | Type::Double => Some(8),
-            Type::Str
-            | Type::ObjectPath
-            | Type::Signature
-            | Type::Variant
-            | Type::Maybe(_)
-            | Type::Array(_) => None,
-            Type::Tuple(members) => fixed_size_of(members.iter(), self.alignment()),
+            Type::Bool | Type::Byte => Layout::scalar(1),
+            Type::I16 | Type::U16 => Layout::scalar(2),
+            Type::I32 | Type::U32 | Type::Handle => Layout::scalar(4),
+            Type::I64 | Type::U64 | Type::Double => Layout::scalar(8),
+            Type::Str | Type::ObjectPath | Type::Signature => Layout::variable(1),
+            Type::Variant => Layout::variable(8),
+            Type::Maybe(elem) | Type::Array(elem) => Layout::variable(elem.layout.alignment()),
+            Type::Tuple(members) => members.layout,
             Type::DictEntry(key, value) => {
-                fixed_size_of([&**key, &**value].into_iter(), self.alignment())
+                Layout::of_struct([key.layout, value.layout].into_iter())
             }
         }
     }
@@ -218,23 +411,6 @@ impl Type {
                 | Type::Signature
         )
     }
-}
-
-/// Returns the combined fixed size of the members of a structure.
-///
-/// If a member has a variable size, this function returns `None`. The empty
-/// structure has the fixed size 1.
-fn fixed_size_of<'a>(members: impl Iterator<Item = &'a Type>, alignment: usize) -> Option<usize> {
-    let mut size = 0;
-    let mut any = false;
-    for m in members {
-        any = true;
-        size = align_up(size, m.alignment()) + m.fixed_size()?;
-    }
-    if !any {
-        return Some(1);
-    }
-    Some(align_up(size, alignment))
 }
 
 pub(crate) const fn align_up(n: usize, alignment: usize) -> usize {
@@ -266,15 +442,15 @@ fn parse_one(sig: &[u8], pos: &mut usize, depth: usize) -> std::result::Result<T
         b'o' => Ok(Type::ObjectPath),
         b'g' => Ok(Type::Signature),
         b'v' => Ok(Type::Variant),
-        b'm' => Ok(Type::Maybe(Box::new(parse_one(sig, pos, depth + 1)?))),
-        b'a' => Ok(Type::Array(Box::new(parse_one(sig, pos, depth + 1)?))),
+        b'm' => Ok(Type::maybe(parse_one(sig, pos, depth + 1)?)),
+        b'a' => Ok(Type::array(parse_one(sig, pos, depth + 1)?)),
         b'(' => {
             let mut members = Vec::new();
             while sig.get(*pos) != Some(&b')') {
                 members.push(parse_one(sig, pos, depth + 1)?);
             }
             *pos += 1;
-            Ok(Type::Tuple(members))
+            Ok(Type::tuple(members))
         }
         b'{' => {
             let key_offset = *pos;
@@ -287,7 +463,7 @@ fn parse_one(sig: &[u8], pos: &mut usize, depth: usize) -> std::result::Result<T
                 return Err((*pos, "expected '}' after the dict-entry value"));
             }
             *pos += 1;
-            Ok(Type::DictEntry(Box::new(key), Box::new(value)))
+            Ok(Type::dict_entry(key, value))
         }
         _ => Err((*pos - 1, "unsupported type character")),
     }

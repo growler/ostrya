@@ -29,6 +29,7 @@ mod merge;
 mod pattern;
 mod policy;
 mod reader;
+mod server_commit;
 mod service;
 mod session;
 mod signer;

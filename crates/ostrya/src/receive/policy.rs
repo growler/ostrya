@@ -45,6 +45,10 @@ use super::{ServerSigner, StreamPolicy, TrustedKeys};
 ///   request, it can also be a non-fast-forward update.
 /// - A delete of a ref that exists needs `d`. A delete of an absent ref
 ///   changes nothing.
+/// - A server commit needs `c` on its branch. With `orphan` on a branch that
+///   exists, it needs `c` and `d`. Each tag of a server commit needs `t` or
+///   `w`, and the tag must not exist, also with `w`. A bound name of a
+///   server commit gets no ref and needs no right.
 #[derive(Debug, Clone, Default)]
 pub struct ReceivePolicy {
     /// The namespace of the group.
@@ -56,10 +60,14 @@ pub struct ReceivePolicy {
     /// The allow items and the deny items of the group.
     pub rules: AccessRules,
     /// The signatures that a new commit must carry.
+    ///
+    /// The verification applies to a commit that the client built. A server
+    /// commit gets no verification.
     pub verify: ReceiveVerify,
     /// The switch that accepts a new commit with no signature.
     ///
-    /// The switch applies only with [`ReceiveVerify::Keys`]. A commit has no
+    /// The switch applies only with [`ReceiveVerify::Keys`], and only to a
+    /// commit that the client built. A commit has no
     /// signature if its detached metadata holds no blob under
     /// `ostree.gpgsigs`, `ostree.sign.ed25519`, `ostree.sign.spki`, and
     /// `ostree.sign.dummy`. A commit with a blob under one of these keys must
@@ -68,7 +76,8 @@ pub struct ReceivePolicy {
     pub allow_unsigned: bool,
     /// The keys that the server signs each new commit with, in order.
     ///
-    /// A new commit is a commit that becomes the new value of a ref.
+    /// A new commit is a commit that becomes the new value of a ref. A server
+    /// commit is a new commit too.
     pub signers: Vec<Arc<ServerSigner>>,
     /// The switch that accepts privileged content in a `bare` repository.
     ///
@@ -275,6 +284,14 @@ pub(super) struct UpdateRule<'a> {
     pub(super) signers: &'a [Arc<ServerSigner>],
 }
 
+/// The rule that the commit of a session applies to a server commit.
+pub(super) struct ServerCommitRule<'a> {
+    /// `true` if an `orphan` server commit can replace a branch that exists.
+    pub(super) allow_orphan_over_branch: bool,
+    /// The keys that the server signs the commit with.
+    pub(super) signers: &'a [Arc<ServerSigner>],
+}
+
 /// The rules that a session applies: the policy of a client group, or the
 /// policy of a one-way stream.
 pub(super) trait SessionPolicy: Send + Sync {
@@ -293,6 +310,14 @@ pub(super) trait SessionPolicy: Send + Sync {
     /// Returns the rule of `update`, or the `ref-denied` refusal of the
     /// update.
     fn rule(&self, update: &RefUpdate) -> std::result::Result<UpdateRule<'_>, Failure>;
+
+    /// Returns the rule of a server commit on `branch` that creates `tags`,
+    /// or the `ref-denied` refusal of the server commit.
+    fn server_commit_rule(
+        &self,
+        branch: &str,
+        tags: &[String],
+    ) -> std::result::Result<ServerCommitRule<'_>, Failure>;
 
     /// Returns the detached-metadata filter of the session.
     fn metadata_filter(&self) -> Option<&DetachedMetadataFilter>;
@@ -387,6 +412,41 @@ impl SessionPolicy for ReceivePolicy {
         })
     }
 
+    /// Refuses a remote ref, a branch without `c`, and a tag without `t` or
+    /// `w`. The rule of `orphan` on a branch that exists comes from `d`,
+    /// under the update lock.
+    fn server_commit_rule(
+        &self,
+        branch: &str,
+        tags: &[String],
+    ) -> std::result::Result<ServerCommitRule<'_>, Failure> {
+        for name in std::iter::once(branch).chain(tags.iter().map(String::as_str)) {
+            if name.contains(':') {
+                return Err(ref_denied(format!(
+                    "ref '{name}' is a remote ref, which a push session does not write"
+                )));
+            }
+        }
+        let rights = self.rights(branch);
+        if !rights.contains(AccessModes::COMMIT) {
+            return Err(ref_denied(format!(
+                "the policy gives no c on ref '{branch}'"
+            )));
+        }
+        for tag in tags {
+            let tag_rights = self.rights(tag);
+            if !tag_rights.contains(AccessModes::TAG) && !tag_rights.contains(AccessModes::WRITE) {
+                return Err(ref_denied(format!(
+                    "the policy gives no t or w on ref '{tag}'"
+                )));
+            }
+        }
+        Ok(ServerCommitRule {
+            allow_orphan_over_branch: rights.contains(AccessModes::DELETE),
+            signers: &self.signers,
+        })
+    }
+
     fn metadata_filter(&self) -> Option<&DetachedMetadataFilter> {
         self.detached_metadata_filter.as_ref()
     }
@@ -439,6 +499,17 @@ impl SessionPolicy for StreamPolicy {
                 "no rule of the policy covers the remote ref '{name}'"
             ))),
         }
+    }
+
+    /// A one-way stream carries no server commit.
+    fn server_commit_rule(
+        &self,
+        _branch: &str,
+        _tags: &[String],
+    ) -> std::result::Result<ServerCommitRule<'_>, Failure> {
+        Err(Failure::Wire(remote::Error::Protocol(
+            "a one-way stream carries no server commit".into(),
+        )))
     }
 
     fn metadata_filter(&self) -> Option<&DetachedMetadataFilter> {
@@ -573,5 +644,47 @@ mod tests {
         let forced = policy(&["w:a", "d:a"]);
         let rule = accepted(forced.rule(&update("a", true)));
         assert!(rule.allow_non_fast_forward && rule.allow_delete);
+    }
+
+    /// A server commit needs `c` on its branch and `t` or `w` on each tag.
+    /// `d` on the branch allows `orphan` over a branch that exists. A deny
+    /// item takes each right, and a bound name needs none.
+    #[test]
+    fn the_modes_give_the_rule_of_a_server_commit() {
+        let tags = |names: &[&str]| -> Vec<String> { names.iter().map(|&n| n.into()).collect() };
+        let commit = policy(&["c:main"]);
+        let rule = accepted(commit.server_commit_rule("main", &[]));
+        assert!(!rule.allow_orphan_over_branch);
+        let orphan = policy(&["cd:main"]);
+        let rule = accepted(orphan.server_commit_rule("main", &[]));
+        assert!(rule.allow_orphan_over_branch);
+        let message = denied(policy(&["wtd:main"]).server_commit_rule("main", &[]));
+        assert!(message.contains("no c on ref 'main'"), "{message}");
+        let message = denied(policy(&["r:**"]).server_commit_rule("main", &[]));
+        assert!(message.contains("no c"), "{message}");
+
+        let both = policy(&["c:main", "t:v1", "w:v2"]);
+        accepted(both.server_commit_rule("main", &tags(&["v1", "v2"])));
+        let message = denied(both.server_commit_rule("main", &tags(&["v1", "v3"])));
+        assert!(message.contains("no t or w on ref 'v3'"), "{message}");
+        let message =
+            denied(policy(&["c:main", "cd:v1"]).server_commit_rule("main", &tags(&["v1"])));
+        assert!(message.contains("'v1'"), "{message}");
+
+        let denying = ReceivePolicy {
+            rules: AccessRules {
+                allow: vec![AllowItem::parse("ctwd:**").unwrap()],
+                deny: vec![ostrya_core::RefPattern::parse("v1").unwrap()],
+            },
+            ..ReceivePolicy::default()
+        };
+        accepted(denying.server_commit_rule("main", &tags(&["v2"])));
+        let message = denied(denying.server_commit_rule("main", &tags(&["v1"])));
+        assert!(message.contains("'v1'"), "{message}");
+        let message = denied(denying.server_commit_rule("v1", &[]));
+        assert!(message.contains("no c"), "{message}");
+
+        let message = denied(policy(&["c:**"]).server_commit_rule("origin:main", &[]));
+        assert!(message.contains("remote ref"), "{message}");
     }
 }

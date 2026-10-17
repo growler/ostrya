@@ -70,6 +70,7 @@ fn fixture_update() -> CommitRequest {
             new: Some(fixture_commit()),
         }],
         force: false,
+        server_commit: None,
     }
 }
 
@@ -435,6 +436,7 @@ fn a_commit_whose_reply_cannot_fit_writes_no_ref() {
             })
             .collect(),
         force: false,
+        server_commit: None,
     };
     let result = block_on(service.commit(request));
     assert_eq!(code(&result), Some(ErrorCode::LimitExceeded));
@@ -875,4 +877,31 @@ fn metadata_objects_read_at_the_same_time_past_the_budget_are_limit_exceeded() {
 fn the_service_is_send_and_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<ReceiveService>();
+}
+
+/// The futures of `commit`, `Repo::receive`, and `Repo::receive_stream` stay
+/// small. The checks and the commit of a session sit inline in these
+/// futures, and the publication step and the commit of a server commit are
+/// boxed, so neither sits inline.
+#[test]
+fn the_receive_futures_are_small() {
+    let tmp = TmpDir::new("future-sizes");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    let policy = policy_allowing(&["w:**"]);
+    let commit = std::mem::size_of_val(&open(&repo, 1, &["test/main"]).commit(fixture_update()));
+    let receive = std::mem::size_of_val(&repo.receive(
+        futures_lite::io::empty(),
+        futures_lite::io::sink(),
+        &policy,
+    ));
+    let stream_policy = ostrya::StreamPolicy::default();
+    let stream =
+        std::mem::size_of_val(&repo.receive_stream(futures_lite::io::empty(), &stream_policy));
+    eprintln!("commit {commit}, receive {receive}, receive_stream {stream} bytes");
+    assert!(commit <= 4096, "the commit future is {commit} bytes");
+    assert!(receive <= 6144, "the receive future is {receive} bytes");
+    assert!(
+        stream <= 5120,
+        "the receive_stream future is {stream} bytes"
+    );
 }

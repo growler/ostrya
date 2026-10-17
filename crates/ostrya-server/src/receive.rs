@@ -984,6 +984,7 @@ mod tests {
                 new: None,
             }],
             force: false,
+            server_commit: None,
         })
     }
 
@@ -1316,6 +1317,7 @@ mod tests {
                     new: Some(Checksum::from_bytes([7; 32])),
                 }],
                 force: false,
+                server_commit: None,
             });
 
             let path = format!("session/{strict}/commit");

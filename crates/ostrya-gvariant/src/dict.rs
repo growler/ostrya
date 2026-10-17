@@ -76,16 +76,12 @@ impl DictBuilder {
     /// Appends the entry `key` with an `as` value.
     pub fn insert_strv(&mut self, key: &str, values: &[String]) -> &mut Self {
         let items = values.iter().map(|v| Value::Str(v.clone())).collect();
-        self.insert(key, Type::Array(Box::new(Type::Str)), Value::Array(items))
+        self.insert(key, Type::array(Type::Str), Value::Array(items))
     }
 
     /// Appends the entry `key` with an `ay` value.
     pub fn insert_bytes(&mut self, key: &str, value: &[u8]) -> &mut Self {
-        self.insert(
-            key,
-            Type::Array(Box::new(Type::Byte)),
-            Value::Bytes(value.to_vec()),
-        )
+        self.insert(key, Type::array(Type::Byte), Value::Bytes(value.to_vec()))
     }
 
     /// Returns the assembled `a{sv}` with its entries in insertion order.
@@ -130,7 +126,7 @@ mod tests {
             entry("b", Type::Bool, Value::Bool(true)),
             entry(
                 "as",
-                Type::Array(Box::new(Type::Str)),
+                Type::array(Type::Str),
                 Value::Array(vec![
                     Value::Str("one".to_owned()),
                     Value::Str("two".to_owned()),
@@ -138,7 +134,7 @@ mod tests {
             ),
             entry(
                 "ay",
-                Type::Array(Box::new(Type::Byte)),
+                Type::array(Type::Byte),
                 Value::Bytes(vec![0xde, 0xad]),
             ),
             entry("v", Type::U32, Value::U32(3)),

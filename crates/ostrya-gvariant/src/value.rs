@@ -387,7 +387,7 @@ mod tests {
         );
         assert_eq!(Value::Maybe(None).as_strv(), None);
         assert_eq!(
-            Value::variant(Type::Array(Box::new(Type::Str)), Value::Array(Vec::new())).as_strv(),
+            Value::variant(Type::array(Type::Str), Value::Array(Vec::new())).as_strv(),
             None
         );
     }

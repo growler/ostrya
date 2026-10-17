@@ -21,7 +21,7 @@ use common::receive::{
     Obj, assert_staging_removed, body, fixture_objects, is_root, new_repo, policy_allowing,
 };
 use common::{COMMIT, TmpDir, foreign_holder, lock_holder_main};
-use ostrya::remote::proto::{CommitRequest, Hello};
+use ostrya::remote::proto::{CommitRequest, Hello, ServerCommit};
 use ostrya::remote::{self, Encoding, Expected, RefUpdate};
 use ostrya::{
     Checksum, DetachedMetadataFilter, Error, HookFuture, HookRefusal, HostEntry, LockKind,
@@ -227,6 +227,7 @@ fn run_with(
     let result = block_on(service.commit(CommitRequest {
         updates,
         force: false,
+        server_commit: None,
     }));
     (service, result)
 }
@@ -253,7 +254,7 @@ fn nested_variants(depth: usize) -> Value {
 /// the value `nothing`. The value is shallow, and its type can nest over the
 /// depth limit.
 fn deep_maybe(depth: usize) -> Value {
-    let ty = (0..depth).fold(Type::Byte, |ty, _| Type::Maybe(Box::new(ty)));
+    let ty = (0..depth).fold(Type::Byte, |ty, _| Type::maybe(ty));
     Value::variant(ty, Value::Maybe(None))
 }
 
@@ -401,6 +402,56 @@ fn writing_after(repo: &Repo, drops: &Arc<AtomicUsize>) -> Arc<Hook> {
             })
         },
     )
+}
+
+// ---------------------------------------------------------------------------
+// Server commits.
+// ---------------------------------------------------------------------------
+
+/// A server commit in a session with hooks is `ref-denied`. Neither hook
+/// runs, and no ref is written.
+#[test]
+fn a_server_commit_with_hooks_is_ref_denied() {
+    let tmp = TmpDir::new("hooks-server-commit");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    let drops = Arc::new(AtomicUsize::new(0));
+    let hook = Hook::giving(Vec::new(), &drops);
+    let (service, _) = block_on(ReceiveService::hello_with_hooks(
+        repo.clone(),
+        Arc::new(policy_allowing(&["c:**"])),
+        Some(hook.clone() as Arc<dyn ReceiveHooks>),
+        1,
+        hello(&["main"]),
+    ))
+    .unwrap();
+    let tree: Vec<Obj> = fixture_objects(Encoding::Raw)
+        .into_iter()
+        .filter(|o| o.ty != ObjectType::Commit)
+        .collect();
+    block_on(service.objects(&body(&tree)[..])).unwrap();
+    let result = block_on(service.commit(CommitRequest {
+        updates: Vec::new(),
+        force: false,
+        server_commit: Some(Box::new(ServerCommit {
+            branch: "main".into(),
+            tags: Vec::new(),
+            bind_refs: Vec::new(),
+            root_dirtree: Checksum::from_hex(common::ROOT_DIRTREE).unwrap(),
+            root_dirmeta: Checksum::from_hex(common::ROOT_DIRMETA).unwrap(),
+            subject: String::new(),
+            body: String::new(),
+            metadata: Vec::new(),
+            timestamp: None,
+            orphan: false,
+        })),
+    }));
+    match result {
+        Err(Error::Remote(remote::Error::RefDenied(m))) => assert!(m.contains("hooks"), "{m}"),
+        other => panic!("expected ref-denied, got {other:?}"),
+    }
+    assert_eq!(hook.calls(), 0);
+    assert_eq!(hook.after_calls(), 0);
+    assert!(common::file_inventory(repo.path(), "refs").is_empty());
 }
 
 // ---------------------------------------------------------------------------
@@ -706,7 +757,7 @@ fn a_refused_plan_is_internal_and_writes_nothing() {
                 vec![entry(
                     "centrex.uploader",
                     Value::variant(
-                        Type::DictEntry(Box::new(Type::Variant), Box::new(Type::Byte)),
+                        Type::dict_entry(Type::Variant, Type::Byte),
                         Value::Tuple(vec![text("k"), Value::Byte(1)]),
                     ),
                     false,

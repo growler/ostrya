@@ -793,6 +793,7 @@ pub(crate) mod tests {
                 new: None,
             }],
             force: false,
+            server_commit: None,
         };
         let result = block_on(active.service().commit(request));
         assert!(result.is_ok(), "{:?}", result.err());

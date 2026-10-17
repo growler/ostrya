@@ -412,14 +412,15 @@ Each other value is refused, \fB\%off\fR and \fB\%remote:NAME\fR included.
 Without the key, the group verifies no signature.
 .TP
 \fB\%allow\-unsigned\fR (boolean)
-Accept a pushed commit that has no signature.
+Accept a commit that a client builds and pushes, when it has no signature.
 A commit has no signature if its detached metadata holds no blob under \fB\%ostree.gpgsigs\fR, \fB\%ostree.sign.ed25519\fR, \fB\%ostree.sign.spki\fR, and \fB\%ostree.sign.dummy\fR.
 A commit with a signature must verify on each axis of the trust group, also when the key is true, so a signature of an engine that the trust group does not read is refused.
 The default is true without \fB\%verify\fR, and false with \fB\%verify\fR.
 \fB\%allow\-unsigned=false\fR needs \fB\%verify\fR.
 .TP
 \fB\%sign\fR (list)
-The key groups whose keys sign each new commit of a ref update of the group.
+The key groups whose keys sign each new commit of a ref update of the group, and each server commit of the group.
+A key that already signed a commit adds no signature.
 A name that occurs two times counts one time.
 An empty value is refused.
 .TP
@@ -506,9 +507,15 @@ So a delete needs \fB\%r\fR and \fB\%d\fR, for example the item \fB\%rd:PATTERN\
 .IP \(bu 2
 An update that writes a commit needs \fB\%w\fR or \fB\%t\fR.
 .IP \(bu 2
+A server commit needs \fB\%c\fR on its branch.
+A server commit with no parent on a branch that exists needs \fB\%cd\fR, else it is \fB\%non\-fast\-forward\fR.
+Each tag of a server commit needs \fB\%t\fR or \fB\%w\fR, and a tag that exists gets \fB\%ref\-mismatch\fR, also with \fB\%w\fR.
+A bound name of a server commit gets no ref and needs no mode.
+\fB\%verify\fR and \fB\%allow\-unsigned\fR do not apply to a server commit.
+.IP \(bu 2
 A push writes no remote ref, and no \fB\%ostree\-metadata\fR in the local refs of a repository with a collection id.
 .IP \(bu 2
-The \fB\%ostree.collection\-binding\fR of a new commit must name the collection of the namespace.
+The \fB\%ostree.collection\-binding\fR of a new commit that the client built must name the collection of the namespace.
 For the local refs, that is the \fB\%collection\-id\fR of \fB\%[core]\fR, and in a repository with no collection id, each collection binding is refused.
 A commit with no collection binding passes in each namespace.
 .IP \(bu 2

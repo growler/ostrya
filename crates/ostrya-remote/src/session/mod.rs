@@ -1108,6 +1108,7 @@ async fn commit_on(
     let request = Message::Commit(CommitRequest {
         updates: updates.to_vec(),
         force,
+        server_commit: None,
     });
     let reply = match stream.write_raw(&request).await {
         Ok(()) => stream.read_raw().await,

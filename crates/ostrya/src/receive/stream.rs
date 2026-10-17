@@ -66,7 +66,8 @@ impl Repo {
     ///   signature, writes no anchor commit, and does not regenerate the
     ///   summary.
     /// - A ref update whose expected state is [`Expected::Commit`] is
-    ///   `protocol`. A ref update with no new commit is also `protocol`.
+    ///   `protocol`. A ref update with no new commit, and a server commit,
+    ///   are also `protocol`.
     /// - The commit checks run only after `input` reaches its end. A byte
     ///   after `Commit` is `protocol`.
     ///
@@ -101,7 +102,8 @@ impl Repo {
     ///   `checksum-mismatch`, `mode-refused`, `limit-exceeded`, `protocol`,
     ///   and the wire code of the frame decoder.
     /// - [`remote::Error::Protocol`] if an update of `Commit` expects a commit
-    ///   or has no new commit, or if a byte follows `Commit`.
+    ///   or has no new commit, if `Commit` holds a server commit, or if a byte
+    ///   follows `Commit`.
     /// - At `Commit`, the errors of
     ///   [`ReceiveService::commit`](super::ReceiveService::commit), other than
     ///   the errors of steps in flight and of hooks. These include
@@ -173,11 +175,18 @@ where
     core.finish(request).await
 }
 
-/// Checks that each update of `request` expects its ref absent or takes any
-/// state, and sets a new commit.
+/// Checks that `request` holds no server commit, and that each update of
+/// `request` expects its ref absent or takes any state, and sets a new
+/// commit.
 ///
-/// A one-way sender cannot learn the current tips of the refs.
+/// A one-way sender cannot learn the current tips of the refs, and the
+/// server makes no commit for it.
 fn check_updates(request: &CommitRequest) -> std::result::Result<(), Failure> {
+    if request.server_commit.is_some() {
+        return Err(Failure::Wire(remote::Error::Protocol(
+            "a one-way stream carries no server commit".into(),
+        )));
+    }
     for update in &request.updates {
         if let Expected::Commit(_) = update.expected {
             return Err(Failure::Wire(remote::Error::Protocol(format!(

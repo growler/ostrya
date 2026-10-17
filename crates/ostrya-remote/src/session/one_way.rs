@@ -186,6 +186,7 @@ where
         &Message::Commit(CommitRequest {
             updates: updates.to_vec(),
             force: false,
+            server_commit: None,
         }),
         "Commit",
     )?;
@@ -442,6 +443,7 @@ mod tests {
             Some(Message::Commit(CommitRequest {
                 updates: updates(),
                 force: false,
+                server_commit: None,
             }))
         );
         assert_eq!(next(&mut reader), None);

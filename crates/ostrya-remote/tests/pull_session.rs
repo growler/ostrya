@@ -18,7 +18,7 @@ use futures_lite::io::AsyncReadExt;
 use ostrya_core::RefSelector;
 use ostrya_fetch::{FetcherOptions, Proxy};
 use ostrya_remote::proto::{
-    ErrorMessage, FrameReader, FrameWriter, GetReply, MAX_REF_LISTING, Message,
+    ErrorMessage, FrameReader, FrameWriter, GetReply, ListRefsRequest, MAX_REF_LISTING, Message,
     PULL_PROTOCOL_VERSION, PullHelloReply,
 };
 use ostrya_remote::transport::Endpoint;
@@ -196,10 +196,18 @@ impl Server {
         self.writer.flush().await.unwrap();
     }
 
-    /// Reads one `ListRefs` and returns its entries.
+    /// Reads one `ListRefs` with no `collections` key and returns its
+    /// entries.
     async fn list_refs(&mut self) -> Vec<String> {
+        let request = self.list_refs_request().await;
+        assert_eq!(request.collections, None);
+        request.refs
+    }
+
+    /// Reads one `ListRefs` and returns it.
+    async fn list_refs_request(&mut self) -> ListRefsRequest {
         match self.recv().await {
-            Some(Message::ListRefs(entries)) => entries,
+            Some(Message::ListRefs(request)) => request,
             other => panic!("{other:?}"),
         }
     }
@@ -1053,7 +1061,12 @@ fn fetch_refs_and_get_keep_their_order() {
                     let body = stream.get("config", u64::MAX).await.unwrap().unwrap();
                     read_all(body).await.unwrap()
                 };
-                let refs = async { session.fetch_refs(&selector(&["a", "b/c"])).await.unwrap() };
+                let refs = async {
+                    session
+                        .fetch_refs(&selector(&["a", "b/c"]), None)
+                        .await
+                        .unwrap()
+                };
                 let out = if refs_first {
                     future::zip(refs, get).await
                 } else {
@@ -1100,7 +1113,10 @@ fn fetch_refs_sends_an_empty_list_and_reads_the_listing() {
             let session = PullSession::over_stream(input, output, options(None))
                 .await
                 .unwrap();
-            let got = session.fetch_refs(&selector::<&str>(&[])).await.unwrap();
+            let got = session
+                .fetch_refs(&selector::<&str>(&[]), None)
+                .await
+                .unwrap();
             session.finish().await.unwrap();
             got
         },
@@ -1125,7 +1141,10 @@ fn fetch_refs_refuses_a_stated_length_over_the_cap() {
             let session = PullSession::over_stream(input, output, options(None))
                 .await
                 .unwrap();
-            let e = session.fetch_refs(&selector(&["main"])).await.unwrap_err();
+            let e = session
+                .fetch_refs(&selector(&["main"]), None)
+                .await
+                .unwrap_err();
             assert!(
                 matches!(&e, Error::LimitExceeded(m)
                     if m.contains(&format!("over the limit {MAX_REF_LISTING}"))),
@@ -1158,7 +1177,7 @@ fn fetch_refs_gives_the_limit_exceeded_of_the_server() {
                 .await
                 .unwrap();
             let e = session
-                .fetch_refs(&selector::<&str>(&[]))
+                .fetch_refs(&selector::<&str>(&[]), None)
                 .await
                 .unwrap_err();
             assert!(
@@ -1166,7 +1185,7 @@ fn fetch_refs_gives_the_limit_exceeded_of_the_server() {
                 "{e:?}"
             );
             let e = session
-                .fetch_refs(&selector::<&str>(&[]))
+                .fetch_refs(&selector::<&str>(&[]), None)
                 .await
                 .unwrap_err();
             assert!(
@@ -1202,7 +1221,7 @@ fn fetch_refs_refuses_an_entry_over_a_limit_and_writes_nothing() {
                 format!("!{}", "a".repeat(4096)),
             ] {
                 let e = session
-                    .fetch_refs(&selector(&["main", bad.as_str()]))
+                    .fetch_refs(&selector(&["main", bad.as_str()]), None)
                     .await
                     .unwrap_err();
                 assert!(matches!(e, Error::InvalidInput(_)), "{e:?}");
@@ -1235,7 +1254,10 @@ fn a_not_found_reply_to_list_refs_is_protocol() {
             let session = PullSession::over_stream(input, output, options(None))
                 .await
                 .unwrap();
-            let e = session.fetch_refs(&selector(&["main"])).await.unwrap_err();
+            let e = session
+                .fetch_refs(&selector(&["main"]), None)
+                .await
+                .unwrap_err();
             assert!(
                 matches!(&e, Error::Protocol(m) if m.contains("ListRefs")),
                 "{e:?}"
@@ -1266,7 +1288,10 @@ fn a_reply_to_list_refs_with_no_length_is_protocol() {
             let session = PullSession::over_stream(input, output, options(None))
                 .await
                 .unwrap();
-            let e = session.fetch_refs(&selector(&["main"])).await.unwrap_err();
+            let e = session
+                .fetch_refs(&selector(&["main"]), None)
+                .await
+                .unwrap_err();
             assert!(
                 matches!(&e, Error::Protocol(m) if m.contains("no length")),
                 "{e:?}"
@@ -1351,19 +1376,22 @@ fn fetch_refs_over_http_refuses_bad_input_before_a_request() {
             ("4097 bytes", &vec![bytes]),
             ("negative 4097 bytes", &vec![negative_bytes]),
         ] {
-            let e = session.fetch_refs(&selector(entries)).await.unwrap_err();
+            let e = session
+                .fetch_refs(&selector(entries), None)
+                .await
+                .unwrap_err();
             assert!(matches!(e, Error::InvalidInput(_)), "{case}: {e:?}");
         }
         // 300 copies of one entry are one entry, and the client sends the
         // request.
         let e = session
-            .fetch_refs(&selector(&["main"; 300]))
+            .fetch_refs(&selector(&["main"; 300]), None)
             .await
             .unwrap_err();
         assert!(matches!(e, Error::Fetch(_)), "{e:?}");
         // 256 distinct entries, of both kinds, pass the client checks.
         let e = session
-            .fetch_refs(&selector(&many[..256]))
+            .fetch_refs(&selector(&many[..256]), None)
             .await
             .unwrap_err();
         assert!(matches!(e, Error::Fetch(_)), "{e:?}");
@@ -1386,11 +1414,14 @@ fn fetch_refs_over_a_stream_counts_the_entries_that_stay() {
                 .await
                 .unwrap();
             let many = mixed_entries(257);
-            let e = session.fetch_refs(&selector(&many)).await.unwrap_err();
+            let e = session
+                .fetch_refs(&selector(&many), None)
+                .await
+                .unwrap_err();
             assert!(matches!(e, Error::InvalidInput(_)), "{e:?}");
             let mut entries = vec!["!a/*", "a/b", "main", "a", "!main"];
             entries.extend(["main"; 300]);
-            let got = session.fetch_refs(&selector(&entries)).await.unwrap();
+            let got = session.fetch_refs(&selector(&entries), None).await.unwrap();
             session.finish().await.unwrap();
             got
         },
@@ -1405,4 +1436,62 @@ fn fetch_refs_over_a_stream_counts_the_entries_that_stay() {
         },
     );
     assert_eq!(got, Some(listing));
+}
+
+/// Over a stream session, a selector of the collection refs goes in the
+/// `collections` key of `ListRefs`, with the rules of the entries of the
+/// local refs: positive entries first, and an exact duplicate removed. A
+/// selector with no entry is a present empty list, and no selector sends no
+/// key. The two lists share the limit of 256 entries, and a call over it
+/// writes nothing.
+#[test]
+fn fetch_refs_over_a_stream_sends_the_collection_entries() {
+    let ((input, output), mut server) = ends();
+    let listing = body_of("listing");
+    let served = listing.clone();
+    let got = run(
+        async {
+            let session = PullSession::over_stream(input, output, options(None))
+                .await
+                .unwrap();
+            let many = mixed_entries(200);
+            let e = session
+                .fetch_refs(&selector(&many), Some(&selector(&many[..57])))
+                .await
+                .unwrap_err();
+            assert!(matches!(e, Error::InvalidInput(_)), "{e:?}");
+            let mut got = Vec::new();
+            let collections = selector(&["!org.b/**", "org.a/*", "org.a/*"]);
+            for collections in [Some(&collections), Some(&selector::<&str>(&[])), None] {
+                let listing = session
+                    .fetch_refs(&selector(&["main"]), collections)
+                    .await
+                    .unwrap();
+                got.push(listing);
+            }
+            session.finish().await.unwrap();
+            got
+        },
+        async {
+            server.hello(1).await;
+            let entries =
+                |list: &[&str]| -> Vec<String> { list.iter().map(|e| (*e).to_owned()).collect() };
+            for collections in [
+                Some(entries(&["org.a/*", "!org.b/**"])),
+                Some(Vec::new()),
+                None,
+            ] {
+                assert_eq!(
+                    server.list_refs_request().await,
+                    ListRefsRequest {
+                        refs: entries(&["main"]),
+                        collections,
+                    }
+                );
+                server.body(Some(served.len() as u64), &served, 700).await;
+            }
+            assert!(server.recv().await.is_none());
+        },
+    );
+    assert_eq!(got, vec![Some(listing); 3]);
 }

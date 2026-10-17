@@ -3,7 +3,6 @@
 use std::convert::Infallible;
 use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
 use futures_lite::future;
@@ -27,6 +26,7 @@ use crate::error::{Error, Result};
 use crate::forwarded::Forwarding;
 use crate::options::ServeOptions;
 use crate::proxy_protocol::{self, Rewind};
+use crate::refs::Listings;
 use crate::router::{self, Clients};
 use crate::shutdown::{Shutdown, Trigger};
 use crate::stall::Stall;
@@ -95,25 +95,35 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 /// - The server answers the raw path `/_ostrya/refs/v1`, with and without a
 ///   receive endpoint, with the bytes of [`Repo::build_ref_listing`]. The
 ///   path must match exactly, and the server reads its query. Each pair of
-///   the query is `pattern=VALUE`, with the raw key `pattern` and a
-///   percent-decoded value in which `+` stays `+`. The value is one entry of
-///   a [`ostrya::RefSelector`]: a ref pattern with an optional leading `!`.
+///   the query is `pattern=VALUE`, an entry of the local refs, or
+///   `collection=VALUE`, an entry of the collection refs by `ID/NAME`. The
+///   raw key is `pattern` or `collection`, and the value is percent-decoded,
+///   with `+` that stays `+`. The value is one entry of a
+///   [`ostrya::RefSelector`]: a ref pattern with an optional leading `!`.
 ///   An entry has at most [`ostrya::MAX_REF_ENTRY_PARTS`] parts and
-///   [`ostrya::MAX_REF_ENTRY_LEN`] bytes. No query is an empty list, which
-///   selects all refs. The checks come in this order:
+///   [`ostrya::MAX_REF_ENTRY_LEN`] bytes. No `pattern` pair is an empty
+///   list, which selects all local refs. With one or more `collection`
+///   pairs, the listing holds the selected collection refs in
+///   `ostree.summary.collection-map`. With none, it holds no collection ref.
+///   The checks come in this order:
 ///   1. A method other than `GET`, `HEAD` included, gets 405 with
 ///      `Allow: GET`.
 ///   2. The server identifies the client. A refusal gets its status.
-///   3. A bad pair, an entry over the limits of one entry, an entry that
-///      [`ostrya::RefSelector::parse`] refuses, and a query of more than 256
-///      pairs ([`ostrya::MAX_REF_PATTERNS`]), get 400. An entry given two
-///      times counts two times, and the server keeps it one time.
+///   3. A bad pair, a pair with another key, an entry over the limits of one
+///      entry, an entry that [`ostrya::RefSelector::parse`] refuses, and a
+///      query of more than 256 pairs of the two keys together
+///      ([`ostrya::MAX_REF_PATTERNS`]), get 400. An entry given two times
+///      for one key counts two times, and the server keeps it one time.
 ///   4. If 4 listings are in flight over all connections, the request gets
 ///      503 with `Retry-After: 1`. A listing is in flight from the start of
 ///      its build until its response body drops.
 ///
 ///   Then the server builds the listing with the read rights of the client.
-///   Each error of the build gets 500.
+///   Each error of the build gets 500. For each directory under
+///   `refs/mirrors/` whose name fails the collection-id rule, the server
+///   reports one [`ServerEvent::InvalidCollectionDir`](crate::ServerEvent::InvalidCollectionDir)
+///   to [`ServeOptions::on_event`] in the life of the server, and the
+///   listing leaves out the directory.
 ///   A 400, a 405, a 500, and a 503 have an empty body. A 200 carries
 ///   `Content-Length`, and the server sends the body in frames of at most
 ///   64 KiB under the body timeout.
@@ -164,6 +174,8 @@ pub struct Server {
     view: Arc<ArchiveView>,
     repo: Repo,
     clients: Arc<Clients>,
+    /// The ref listings of the server.
+    listings: Arc<Listings>,
     tls: Option<Arc<ServerConfig>>,
     body_timeout: Duration,
     proxy_protocol: bool,
@@ -284,6 +296,7 @@ pub async fn bind(repo: Repo, opts: ServeOptions) -> Result<Server> {
         view: Arc::new(ArchiveView::new(repo.clone())),
         repo,
         clients: Arc::new(clients),
+        listings: Arc::new(Listings::new(opts.on_event)),
         tls,
         body_timeout: opts.body_timeout,
         proxy_protocol: opts.proxy_protocol,
@@ -408,7 +421,7 @@ impl Server {
         let serving = Arc::new(Serving {
             view: self.view,
             repo: self.repo,
-            listings: Arc::new(AtomicUsize::new(0)),
+            listings: self.listings,
             clients: self.clients,
             tls: self.tls,
             body_timeout: self.body_timeout,
@@ -426,8 +439,8 @@ impl Server {
 struct Serving {
     view: Arc<ArchiveView>,
     repo: Repo,
-    /// The count of ref listings in flight, over all connections.
-    listings: Arc<AtomicUsize>,
+    /// The ref listings of the server, over all connections.
+    listings: Arc<Listings>,
     clients: Arc<Clients>,
     tls: Option<Arc<ServerConfig>>,
     body_timeout: Duration,

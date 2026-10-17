@@ -2555,8 +2555,10 @@ The order of the entries has no effect. So `["!a/**", "a/b"]` does not select
 second `!`, such as `!!a`.
 
 A request for a ref listing holds at most 256 entries. Positive and negative
-entries count together. A server counts each entry of the request, also an
-entry that the request holds more than one time. An entry has at most 256
+entries count together, and the entries of the local refs and of the
+collection refs count together ("The ref listing"). A server counts each
+entry of the request, also an entry that the request holds more than one
+time. An entry has at most 256
 parts and 4096 bytes. A part is one element of the entry split at each `/`.
 The `!` of a negative entry counts as one byte and adds no part. A server
 checks the limits of an entry before it parses the entry.
@@ -2689,7 +2691,7 @@ Each message kind has a number, a direction, a protocol, and a body type:
 - 13 `PullHelloReply` -- server to client, pull, `(ua{sv})`.
 - 14 `Get` -- client to server, pull, `s`.
 - 15 `GetReply` -- server to client, pull, `(bmt)`.
-- 16 `ListRefs` -- client to server, pull, `as`.
+- 16 `ListRefs` -- client to server, pull, `(asa{sv})`.
 
 A session refuses a kind of the other protocol with `protocol`.
 
@@ -2788,8 +2790,13 @@ commit after it. An absent commit is an absent ref.
 optional key `agent` (`s`). `PullHelloReply` holds the version of the session
 and a dict. In version 1 the dict of `PullHelloReply` is empty.
 
-`Get` holds a path. `ListRefs` holds the entries of a ref selector ("Ref
-selectors"). `GetReply` holds `found` and `len`. `len` is the length of the
+`Get` holds a path. `ListRefs` holds the entries of the ref selector of the
+local refs ("Ref selectors") and a dict. The dict holds the key
+`collections` (`as`, optional): the entries of the ref selector of the
+collection refs ("The ref listing"). A writer puts the key in the dict only
+when the client asks for collection refs, also for an empty list. A reader
+ignores a key that it does not know. A `ListRefs` body of the type `as`
+alone is `protocol`. `GetReply` holds `found` and `len`. `len` is the length of the
 body, and it is absent when the server does not know the length. A `GetReply`
 with `found` false and a `len` is `protocol`.
 
@@ -3307,19 +3314,28 @@ access"):
 
 The server answers a `ListRefs` with a `GetReply` with `found` true and
 `len`, and then the listing as chunks. The listing holds the refs that the
-client of the session reads ("The ref listing"). It has the same bytes as the
-body of `GET /_ostrya/refs/v1` for the same entries and the same rights. A
-reply to a `ListRefs` with `found` false or with no `len` is `protocol`.
+client of the session reads ("The ref listing"). The entries of field 0
+select the local refs. The entries of `collections` select the collection
+refs, and with no such key the listing holds no collection ref. The listing
+has the same bytes as the body of `GET /_ostrya/refs/v1` for the same
+entries and the same rights. A reply to a `ListRefs` with `found` false or
+with no `len` is `protocol`.
 
 In these cases, the server sends an `Error` in place of the reply, and the
 session ends:
 
-- `protocol`: more than 256 entries, an entry over the limits of one entry,
-  or an entry that is not a selector entry ("Ref selectors").
+- `protocol`: more than 256 entries in the two lists together, an entry over
+  the limits of one entry, or an entry that is not a selector entry ("Ref
+  selectors"). The message of a refused entry of `collections` names the
+  key.
 - `limit-exceeded`: a listing larger than 128 MiB.
 - `internal`: each other failure of the build of the listing.
 
 "Ref selectors" states how the server counts the entries.
+
+`ostrya send` writes one warning line to standard error for each directory
+that a listing leaves out for its name ("The ref listing"), one time in each
+session. The session goes on.
 
 ### The pull over HTTP and over a stream
 
@@ -3346,19 +3362,54 @@ request select ("Ref selectors") and that the client of the request reads
 ("Read access"). The format is that of "Summary --
 `(a(s(taya{sv}))a{sv})`".
 
-- The listing holds refs under `refs/heads` alone, sorted byte-wise by name,
-  each one time. It holds no remote ref and no mirror ref.
+A request has two lists of entries:
+
+- The entries of the local refs select local refs by name.
+- The entries of the collection refs select the refs under
+  `refs/mirrors/ID/` of each other collection by the path `ID/NAME`, for
+  example `org.example.Os/stable`, `*/stable`, or `org.example.Os/**`. The
+  list is optional. An empty list selects each collection ref. An entry of
+  one part, such as `org.example.Os`, selects no ref, and an entry of the
+  collection id of the repository selects no ref.
+
+Field 0 holds the local refs:
+
+- The local refs are the refs under `refs/heads` and, in a repository with
+  `[core] collection-id=ID`, the refs under `refs/mirrors/ID/`, under their
+  plain names. When `refs/heads/NAME` and `refs/mirrors/ID/NAME` both exist,
+  field 0 holds one entry `NAME` with the checksum of the mirror ref, and the
+  server does not read `refs/heads/NAME`. This is
+  the field 0 that the tool writes into a summary ("Summary --
+  `(a(s(taya{sv}))a{sv})`"). So a request with no list of the collection
+  refs gets the bytes of a listing of `refs/heads` alone in each repository
+  with no `refs/mirrors/ID/` of its own id.
+- Field 0 is sorted byte-wise by name and holds each ref one time. It holds
+  no remote ref.
+
+`ostree.summary.collection-map` holds the collection refs, in the form of
+the summary: the collections sorted byte-wise by id, and the refs of each
+collection sorted byte-wise by name. A collection with no selected ref is not
+in the map. With no selected collection ref, and with no list of the
+collection refs, the dict holds no map. The collection id of the repository
+is not a key of the map.
+
+These rules apply to each ref of the two parts:
+
 - The listing holds a selected ref when the client group of the item has `r`
-  on its name in the local namespace. The server checks the name before it
-  reads the ref file. So it reads no ref file that the client cannot read,
-  and the content of such a file fails no listing.
+  on its name in its namespace: the local namespace for field 0, and the
+  namespace of the collection for the map ("Read access"). The rules of two
+  groups never combine. The server checks the name before it reads the ref
+  file. So it reads no ref file that the client cannot read, and the content
+  of such a file fails no listing. The server reads no directory of a
+  collection whose group gives no `r`.
 - An alias is in the listing under its own name, with the commit of its
   target, when the client reads its name and its target. The alias resolves
   by the rules of "The archive view": the body is relative and stays inside
   `refs/`, and the server follows one link and no symlink on the path of the
-  target. These aliases are not in the listing: an alias that breaks one of
-  these rules, an alias of an alias, an alias to a ref under `refs/remotes/`,
-  and an alias whose target is no regular file, for example a directory.
+  target. The path of the target gives its namespace. These aliases are not
+  in the listing: an alias that breaks one of these rules, an alias of an
+  alias, an alias to a ref under `refs/remotes/`, and an alias whose target
+  is no regular file, for example a directory.
 - An alias whose target is absent, and a ref file that a write removes during
   the walk, are not in the listing.
 - These refs fail the whole listing when the client reads them, and the
@@ -3368,20 +3419,29 @@ request select ("Ref selectors") and that the client of the request reads
 - Each entry has the bytes of the entry of the same ref in a summary of the
   same repository state.
 
+With a list of the collection refs, the server reads the top level of
+`refs/mirrors/` one time, whatever the rights of the client. A directory
+whose name fails the collection-id rule is left out of the listing, and the
+server reads no file in it. The server writes a warning for each such
+directory. A name that is not UTF-8, and a file or a symlink at the top level,
+are left out with no warning. With no list of the collection refs, the server
+reads `refs/mirrors/ID/` of the collection id of the repository alone.
+
 The global metadata dict holds these entries, in this order:
 
 1. `ostree.summary.mode`: the mode of the repository.
 2. `ostree.static-deltas`: when the walk below finds a delta.
-3. `ostree.summary.collection-id`: when the repository has a collection id.
+3. `ostree.summary.collection-map`: when the listing holds a collection ref.
+4. `ostree.summary.collection-id`: when the repository has a collection id.
 
-The dict holds no `ostree.summary.last-modified` and no
-`ostree.summary.collection-map`.
+This is the order of the same keys in a summary. The dict holds no
+`ostree.summary.last-modified`.
 
 The deltas come from the index files under `delta-indexes/` ("Static delta
-index files"). The server reads the index file of each listed commit. Then it
-reads the index file of each source commit that an index file names, until it
-finds no new commit. The map is sorted by delta name. These index files fail
-the listing:
+index files"). The server reads the index file of the commit of each listed
+ref, in field 0 and in the map. Then it reads the index file of each source
+commit that an index file names, until it finds no new commit. The map is
+sorted by delta name. These index files fail the listing:
 
 - an index file that does not decode, or that is larger than 128 MiB;
 - an index file with no `ostree.static-deltas` map;
@@ -3393,7 +3453,11 @@ delta, and an index path that is not a regular file counts as no index file.
 If an index file names one delta two times, the first entry applies.
 
 A listing is at most 128 MiB. The server refuses a larger listing and never
-cuts it short.
+cuts it short. The collection map counts toward this size. The server checks
+a lower bound of the size from the names of the refs and from the collection
+ids after each ref that it selects, before it reads a commit. It reads no more
+ref file when the bound passes the size. It writes the map one ref entry at a
+time, so a listing over the size fails before it is whole in memory.
 
 ## The endpoints of `ostrya serve`
 
@@ -3578,7 +3642,8 @@ The client group of the item then gives the rights (`ostrya-config(1)`,
   namespace takes the group of the item in that namespace.
 - `refs/remotes/`, each other path under `refs/`, and `extensions/ostrya/`
   are not served. An id under `refs/mirrors/` that fails the collection-id
-  rule selects no group.
+  rule selects no group, so its refs are not served, and the ref listing
+  leaves out its directory ("The ref listing").
 - `summary` and `summary.sig` are served only when the repository has no
   client group.
 - Objects, `deltas/`, `delta-indexes/`, `config`, and the other files under
@@ -3604,17 +3669,25 @@ server serves it with and without a receive endpoint, and the listing holds
 the refs that the client of the request reads ("Read access"). The version of
 the listing is the `v1` in the path, and no request negotiates it.
 
-The query holds the entries of a ref selector ("Ref selectors"):
+The query holds the entries of the two ref selectors of "The ref listing":
 
 - `&` splits the query into pairs.
-- Each pair is `pattern=VALUE`. The key is the raw bytes `pattern`, with no
-  decoding, and the case counts. The pair splits at its first `=`.
+- Each pair is `pattern=VALUE`, an entry of the local refs, or
+  `collection=VALUE`, an entry of the collection refs. The key is the raw
+  bytes `pattern` or `collection`, with no decoding, and the case counts.
+  The pair splits at its first `=`. The pairs of the two keys can come in
+  any order.
 - The value is percent-decoded as a path is ("The archive view"), so `+`
   stays `+`. The decoded value is one entry.
-- No query and an empty query give an empty selector, which selects every
-  ref.
-- The server keeps one copy of an entry that more than one pair gives. Each
-  pair counts toward the limit of 256 entries ("Ref selectors").
+- No `pattern` pair gives an empty selector of the local refs, which selects
+  every local ref.
+- A query with one or more `collection` pairs holds the list of the
+  collection refs. A query with no `collection` pair holds no such list, so
+  the listing holds no collection ref. A client sends an empty list as the
+  one pair `collection=**`, which selects each collection ref.
+- The server keeps one copy of an entry that more than one pair of the same
+  key gives. Each pair of the two keys counts toward the limit of 256
+  entries ("Ref selectors").
 
 The HTTP layer of the server can refuse a request with a long target before
 these checks. The rustdoc of `Server` in `ostrya-server`, "HTTP behavior",
@@ -3625,9 +3698,11 @@ order:
 2. The server identifies the client. A refusal gets its status ("Read
    access").
 3. A bad query gets 400. A query is bad when it holds one of these:
-   - an empty pair, a pair with no `=`, or a pair with another key;
+   - an empty pair, a pair with no `=`, or a pair with a key other than
+     `pattern` and `collection`;
    - a raw value larger than 12288 bytes, or a value that does not decode;
-   - more than 256 pairs, or an entry over the limits of "Ref selectors";
+   - more than 256 pairs of the two keys together, or an entry over the
+     limits of "Ref selectors";
    - an entry that is not a selector entry.
 
    The server refuses the 257th pair before it decodes it.
@@ -3635,6 +3710,10 @@ order:
    with `Retry-After: 1`. A listing is in flight from the start of its build
    until its response body drops.
 5. Each error of the build gets 500, a listing larger than 128 MiB included.
+
+`ostrya serve` writes one warning line to standard error for each directory
+that a listing leaves out for its name ("The ref listing"), one time in each
+run.
 
 A listing gets 200 with `Content-Length`. The body is the raw listing, with
 no frame. A 400, a 405, a 500, and a 503 have an empty body and

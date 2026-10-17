@@ -39,8 +39,8 @@ use ostrya::RefSelector;
 use ostrya::access::ReadAccess;
 use ostrya::remote::ErrorCode;
 use ostrya::remote::proto::{
-    ErrorMessage, FrameReader, FrameWriter, GetReply, Hello, MIN_FRAME_LIMIT, Message, ObjectRead,
-    PullHello, PullHelloReply,
+    ErrorMessage, FrameReader, FrameWriter, GetReply, Hello, ListRefsRequest, MIN_FRAME_LIMIT,
+    Message, ObjectRead, PullHello, PullHelloReply,
 };
 use ostrya::{
     ArchiveAnswer, ArchiveView, Checksum, CreateOptions, Ed25519Signer, Error, FileKind,
@@ -268,6 +268,35 @@ where
         LIMIT,
         "the session",
         future::zip(repo.send(server_in, server_out, access), script(client)),
+    ))
+}
+
+/// Runs a session of `repo` with the rights `access` and the options `opts`
+/// against the client `script`, over two pipes of `cap` bytes.
+fn session_with<F, Fut, T>(
+    repo: &Repo,
+    access: &ReadAccess,
+    opts: &ostrya::SendOptions,
+    cap: usize,
+    script: F,
+) -> (ostrya::Result<()>, T)
+where
+    F: FnOnce(Client) -> Fut,
+    Fut: Future<Output = T>,
+{
+    let (client_out, server_in) = pipe(cap);
+    let (server_out, client_in) = pipe(cap);
+    let client = Client {
+        writer: FrameWriter::new(client_out),
+        reader: FrameReader::new(client_in),
+    };
+    block_on(within(
+        LIMIT,
+        "the session",
+        future::zip(
+            repo.send_with(server_in, server_out, access, opts),
+            script(client),
+        ),
     ))
 }
 
@@ -693,7 +722,7 @@ fn a_message_out_of_order_is_protocol() {
 
     // A `ListRefs` as the first frame.
     let (result, error) = session(&repo, PIPE_CAP, |mut c| async move {
-        c.send(&Message::ListRefs(Vec::new())).await;
+        c.send(&Message::ListRefs(local_refs(Vec::new()))).await;
         c.error().await
     });
     assert_eq!(error.code, ErrorCode::Protocol);
@@ -703,6 +732,15 @@ fn a_message_out_of_order_is_protocol() {
 // ---------------------------------------------------------------------------
 // The ref listing.
 // ---------------------------------------------------------------------------
+
+/// Returns the `ListRefs` request of the entries `refs` of the local refs,
+/// with no `collections` key.
+fn local_refs(refs: Vec<String>) -> ListRefsRequest {
+    ListRefsRequest {
+        refs,
+        collections: None,
+    }
+}
 
 /// Returns a repository with the refs `a/b`, `a/bc`, and `z` on one commit.
 fn listing_repo(tmp: &TmpDir) -> Repo {
@@ -775,14 +813,16 @@ fn list_refs_holds_the_readable_refs_alone() {
     let access = repo_access(&repo, "ssh:puller");
     let (result, reply) = session_as(&repo, &access, PIPE_CAP, |mut c| async move {
         c.open().await;
-        c.send(&Message::ListRefs(Vec::new())).await;
+        c.send(&Message::ListRefs(local_refs(Vec::new()))).await;
         read_reply(&mut c.reader).await
     });
     result.unwrap();
     let selector = RefSelector::parse([]).unwrap();
     assert_eq!(
         reply.body,
-        block_on(repo.build_ref_listing(&selector, &access)).unwrap()
+        block_on(repo.build_ref_listing(&selector, None, &access))
+            .unwrap()
+            .bytes
     );
     let parsed = ostrya::Summary::parse(&reply.body).unwrap();
     let names: Vec<&str> = parsed.refs.iter().map(|r| r.name.as_str()).collect();
@@ -791,7 +831,7 @@ fn list_refs_holds_the_readable_refs_alone() {
     let all = repo_access(&repo, "ssh:all");
     let (result, error) = session_as(&repo, &all, PIPE_CAP, |mut c| async move {
         c.open().await;
-        c.send(&Message::ListRefs(Vec::new())).await;
+        c.send(&Message::ListRefs(local_refs(Vec::new()))).await;
         c.error().await
     });
     assert!(
@@ -811,9 +851,10 @@ fn list_refs_answers_with_the_built_listing() {
     let repo = listing_repo(&tmp);
     let (result, replies) = session(&repo, PIPE_CAP, |mut c| async move {
         c.open().await;
-        c.send(&Message::ListRefs(vec!["a/b".to_owned()])).await;
+        c.send(&Message::ListRefs(local_refs(vec!["a/b".to_owned()])))
+            .await;
         c.send(&Message::Get("config".to_owned())).await;
-        c.send(&Message::ListRefs(Vec::new())).await;
+        c.send(&Message::ListRefs(local_refs(Vec::new()))).await;
         let mut replies = Vec::new();
         for _ in 0..3 {
             replies.push(read_reply(&mut c.reader).await);
@@ -823,7 +864,9 @@ fn list_refs_answers_with_the_built_listing() {
     result.unwrap();
     for (reply, entries) in [(&replies[0], &["a/b"][..]), (&replies[2], &[])] {
         let selector = RefSelector::parse(entries.iter().copied()).unwrap();
-        let listing = block_on(repo.build_ref_listing(&selector, &anyone())).unwrap();
+        let listing = block_on(repo.build_ref_listing(&selector, None, &anyone()))
+            .unwrap()
+            .bytes;
         assert!(reply.found, "{entries:?}");
         assert_eq!(reply.len, Some(listing.len() as u64), "{entries:?}");
         assert_eq!(reply.body, listing, "{entries:?}");
@@ -854,14 +897,16 @@ fn list_refs_selects_refs_by_pattern() {
         let sent = entries.clone();
         let (result, reply) = session(&repo, PIPE_CAP, |mut c| async move {
             c.open().await;
-            c.send(&Message::ListRefs(sent)).await;
+            c.send(&Message::ListRefs(local_refs(sent))).await;
             read_reply(&mut c.reader).await
         });
         result.unwrap();
         let selector = RefSelector::parse(entries.iter().map(String::as_str)).unwrap();
         assert_eq!(
             reply.body,
-            block_on(repo.build_ref_listing(&selector, &anyone())).unwrap()
+            block_on(repo.build_ref_listing(&selector, None, &anyone()))
+                .unwrap()
+                .bytes
         );
         let parsed = ostrya::Summary::parse(&reply.body).unwrap();
         let names: Vec<&str> = parsed.refs.iter().map(|r| r.name.as_str()).collect();
@@ -881,8 +926,11 @@ fn list_refs_with_a_bad_prefix_is_protocol() {
     ] {
         let (result, error) = session(&repo, PIPE_CAP, |mut c| async move {
             c.open().await;
-            c.send(&Message::ListRefs(vec!["z".to_owned(), bad.to_owned()]))
-                .await;
+            c.send(&Message::ListRefs(local_refs(vec![
+                "z".to_owned(),
+                bad.to_owned(),
+            ])))
+            .await;
             c.error().await
         });
         assert_eq!(error.code, ErrorCode::Protocol, "{bad:?}");
@@ -906,7 +954,7 @@ fn list_refs_over_the_entry_limits_is_protocol() {
     ] {
         let (result, reply) = session(&repo, PIPE_CAP, |mut c| async move {
             c.open().await;
-            c.send(&Message::ListRefs(vec![ok])).await;
+            c.send(&Message::ListRefs(local_refs(vec![ok]))).await;
             read_reply(&mut c.reader).await
         });
         result.unwrap();
@@ -921,7 +969,8 @@ fn list_refs_over_the_entry_limits_is_protocol() {
     ] {
         let (result, error) = session(&repo, PIPE_CAP, |mut c| async move {
             c.open().await;
-            c.send(&Message::ListRefs(vec!["z".to_owned(), bad])).await;
+            c.send(&Message::ListRefs(local_refs(vec!["z".to_owned(), bad])))
+                .await;
             c.error().await
         });
         assert_eq!(error.code, ErrorCode::Protocol);
@@ -944,16 +993,20 @@ fn list_refs_over_the_entry_count_limit_is_protocol() {
     };
     let (result, reply) = session(&repo, PIPE_CAP, |mut c| async move {
         c.open().await;
-        c.send(&Message::ListRefs(mixed(ostrya::MAX_REF_PATTERNS)))
-            .await;
+        c.send(&Message::ListRefs(local_refs(mixed(
+            ostrya::MAX_REF_PATTERNS,
+        ))))
+        .await;
         read_reply(&mut c.reader).await
     });
     result.unwrap();
     assert!(reply.found);
     let (result, error) = session(&repo, PIPE_CAP, |mut c| async move {
         c.open().await;
-        c.send(&Message::ListRefs(mixed(ostrya::MAX_REF_PATTERNS + 1)))
-            .await;
+        c.send(&Message::ListRefs(local_refs(mixed(
+            ostrya::MAX_REF_PATTERNS + 1,
+        ))))
+        .await;
         c.error().await
     });
     assert_eq!(error.code, ErrorCode::Protocol);
@@ -974,7 +1027,8 @@ fn list_refs_with_a_failed_build_is_internal() {
     .unwrap();
     let (result, error) = session(&repo, PIPE_CAP, |mut c| async move {
         c.open().await;
-        c.send(&Message::ListRefs(vec!["x".to_owned()])).await;
+        c.send(&Message::ListRefs(local_refs(vec!["x".to_owned()])))
+            .await;
         c.error().await
     });
     assert_eq!(error.code, ErrorCode::Internal);
@@ -982,6 +1036,192 @@ fn list_refs_with_a_failed_build_is_internal() {
         matches!(result, Err(Error::ObjectNotFound { .. })),
         "{result:?}"
     );
+}
+
+/// Returns the `ListRefs` request of the entries `refs` of the local refs
+/// and of the entries `collections` of the collection refs.
+fn both_lists(refs: &[&str], collections: Option<&[&str]>) -> ListRefsRequest {
+    let entries = |list: &[&str]| list.iter().map(|e| (*e).to_owned()).collect();
+    ListRefsRequest {
+        refs: entries(refs),
+        collections: collections.map(entries),
+    }
+}
+
+/// Returns the listing repository with the mirror refs `org.a/x`,
+/// `org.a/y/z`, and `org.b/main`.
+fn mirror_repo(tmp: &TmpDir) -> Repo {
+    let repo = listing_repo(tmp);
+    let commit = block_on(repo.resolve_rev("z", false)).unwrap().unwrap();
+    for (id, name) in [("org.a", "x"), ("org.a", "y/z"), ("org.b", "main")] {
+        let cref = ostrya::CollectionRef::new(id, name);
+        block_on(repo.set_collection_ref_immediate(&cref, Some(&commit))).unwrap();
+    }
+    repo
+}
+
+/// A `ListRefs` with the key `collections` gets the listing that
+/// `build_ref_listing` builds for the two lists, and a `ListRefs` with no
+/// key gets the listing of the local refs alone.
+#[test]
+fn list_refs_with_collections_answers_with_the_built_listing() {
+    let tmp = TmpDir::new("send-list-refs-collections");
+    let repo = mirror_repo(&tmp);
+    let cases: [(&[&str], Option<&[&str]>); 5] = [
+        (&[], Some(&[])),
+        (&["a/**"], Some(&["org.a/**"])),
+        (&["!**"], Some(&["*/main", "!org.b/**"])),
+        (&[], Some(&["org.a"])),
+        (&["z"], None),
+    ];
+    let requests: Vec<ListRefsRequest> = cases
+        .iter()
+        .map(|(refs, collections)| both_lists(refs, *collections))
+        .collect();
+    let sent = requests.clone();
+    let (result, replies) = session(&repo, PIPE_CAP, |mut c| async move {
+        c.open().await;
+        let mut replies = Vec::new();
+        for request in sent {
+            c.send(&Message::ListRefs(request)).await;
+            replies.push(read_reply(&mut c.reader).await);
+        }
+        replies
+    });
+    result.unwrap();
+    for ((refs, collections), reply) in cases.iter().zip(&replies) {
+        let collections = collections.map(|entries| RefSelector::parse(entries.iter().copied()));
+        let collections = collections.transpose().unwrap();
+        let refs_selector = RefSelector::parse(refs.iter().copied()).unwrap();
+        let want =
+            block_on(repo.build_ref_listing(&refs_selector, collections.as_ref(), &anyone()))
+                .unwrap()
+                .bytes;
+        assert!(reply.found, "{refs:?}");
+        assert_eq!(reply.body, want, "{refs:?} {collections:?}");
+    }
+    let map = ostrya::Summary::parse(&replies[1].body)
+        .unwrap()
+        .collection_map()
+        .unwrap();
+    let ids: Vec<&str> = map.iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(ids, ["org.a"]);
+    assert_eq!(map[0].1.len(), 2);
+    let plain =
+        block_on(repo.build_ref_listing(&RefSelector::parse(["z"]).unwrap(), None, &anyone()));
+    assert_eq!(replies[4].body, plain.unwrap().bytes);
+}
+
+/// The two lists of a `ListRefs` share the limit of 256 entries: 128 and 128
+/// pass, and 129 and 128 are `protocol`. A bad entry under `collections`,
+/// and an entry there over the limits of one entry, are `protocol`, and the
+/// message of each names the key.
+#[test]
+fn list_refs_lists_share_the_limits_of_a_request() {
+    let tmp = TmpDir::new("send-list-refs-shared-limit");
+    let repo = mirror_repo(&tmp);
+    let names = |count: usize, prefix: &str| -> Vec<String> {
+        (0..count).map(|n| format!("{prefix}{n}")).collect()
+    };
+    let request = |refs: usize, collections: usize| ListRefsRequest {
+        refs: names(refs, "r"),
+        collections: Some(names(collections, "org.a/c")),
+    };
+    let (result, reply) = session(&repo, PIPE_CAP, |mut c| async move {
+        c.open().await;
+        c.send(&Message::ListRefs(request(128, 128))).await;
+        read_reply(&mut c.reader).await
+    });
+    result.unwrap();
+    assert!(reply.found);
+    let (result, error) = session(&repo, PIPE_CAP, |mut c| async move {
+        c.open().await;
+        c.send(&Message::ListRefs(request(129, 128))).await;
+        c.error().await
+    });
+    assert_eq!(error.code, ErrorCode::Protocol);
+    assert!(error.message.contains("over the limit of 256"), "{error:?}");
+    assert_eq!(returned_code(&result), Some(ErrorCode::Protocol));
+
+    for (bad, says) in [
+        ("a//b".to_owned(), "collections"),
+        ("!!a".to_owned(), "collections"),
+        (
+            "a".repeat(ostrya::MAX_REF_ENTRY_LEN + 1),
+            "ListRefs: collections: an entry of",
+        ),
+        (
+            vec!["a"; ostrya::MAX_REF_ENTRY_PARTS + 1].join("/"),
+            "ListRefs: collections: an entry of",
+        ),
+    ] {
+        let sent = both_lists(&["z"], Some(&["org.a/**", &bad]));
+        let (result, error) = session(&repo, PIPE_CAP, |mut c| async move {
+            c.open().await;
+            c.send(&Message::ListRefs(sent)).await;
+            c.error().await
+        });
+        assert_eq!(error.code, ErrorCode::Protocol, "{bad}");
+        assert!(error.message.contains(says), "{error:?}");
+        assert_eq!(returned_code(&result), Some(ErrorCode::Protocol));
+    }
+}
+
+/// A session reports each directory under `refs/mirrors/` whose name is not
+/// a collection id one time, at the first listing with the key
+/// `collections`. A listing with no key reads no such directory. Each
+/// session reports again, and a session with no callback runs as `send`
+/// does.
+#[test]
+fn an_invalid_collection_dir_is_reported_one_time_in_a_session() {
+    let tmp = TmpDir::new("send-invalid-collection-dir");
+    let repo = mirror_repo(&tmp);
+    for path in ["bad/x", "a..b/main"] {
+        let file = repo.path().join("refs/mirrors").join(path);
+        fs::create_dir_all(file.parent().unwrap()).unwrap();
+        fs::write(
+            file,
+            "no checksum
+",
+        )
+        .unwrap();
+    }
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let sink = seen.clone();
+    let mut opts = ostrya::SendOptions::default();
+    opts.on_event = Some(std::sync::Arc::new(move |event: &ostrya::SendEvent| {
+        sink.lock().unwrap().push(event.to_string());
+    }));
+    let script = |mut c: Client| async move {
+        c.open().await;
+        let mut replies = Vec::new();
+        for request in [
+            both_lists(&[], None),
+            both_lists(&[], Some(&[])),
+            both_lists(&[], Some(&["org.a/**"])),
+        ] {
+            c.send(&Message::ListRefs(request)).await;
+            replies.push(read_reply(&mut c.reader).await);
+        }
+        replies
+    };
+    let access = anyone();
+    let (result, replies) = session_with(&repo, &access, &opts, PIPE_CAP, script);
+    result.unwrap();
+    assert!(replies.iter().all(|reply| reply.found));
+    let line = |name: &str| {
+        format!(
+            "refs/mirrors/{name}: the directory name is not a collection id, and the ref \
+             listing leaves out the directory"
+        )
+    };
+    assert_eq!(*seen.lock().unwrap(), [line("a..b"), line("bad")]);
+    let (result, _) = session_with(&repo, &access, &opts, PIPE_CAP, script);
+    result.unwrap();
+    assert_eq!(seen.lock().unwrap().len(), 4);
+    let (result, plain) = session(&repo, PIPE_CAP, script);
+    result.unwrap();
+    assert_eq!(plain, replies);
 }
 
 /// An end of the input inside a frame is `protocol`.

@@ -22,11 +22,14 @@ use super::{AccessModes, AccessRules, AuthItem, Claims, ClientAccess, Namespace}
 ///   the group are the rules that [`ClientAccess::effective_rules`] gives
 ///   with the claims. `w`, `c`, and `t` include `r`.
 /// - Each other path under `refs/` is never read, `refs/remotes/` included.
+///   A directory under `refs/mirrors/` whose name fails the collection-id
+///   rule selects no group, so the client reads no ref in it.
 /// - The client reads `summary` and `summary.sig` when the config has no
 ///   client group.
 ///
 /// The value computes the rules of the local namespace one time, at their
 /// first use. It computes the rules of a collection namespace for each use.
+/// A ref listing computes them one time for each collection.
 ///
 /// # Examples
 ///
@@ -158,6 +161,21 @@ impl ReadAccess {
         self.local_rules().is_some_and(AccessRules::gives_read)
     }
 
+    /// Returns the rules of the group of the item in the namespace of the
+    /// collection `id`, with the claims, or `None`.
+    ///
+    /// The result is `None` for `[core] collection-id`, which is the local
+    /// namespace, for an id that fails the collection-id rule, and when no
+    /// group carries the item in the namespace. The group is the group that
+    /// [`ClientAccess::select`] gives: the group of the exact id, else the
+    /// group of `collection=*`. The rules of the two groups never combine.
+    pub(crate) fn collection_rules(&self, id: &str) -> Option<Cow<'_, AccessRules>> {
+        if self.inner.access.is_own_collection(id) {
+            return None;
+        }
+        self.rules(&Namespace::Collection(id.to_owned()))
+    }
+
     /// Returns the rules of the group of the item in the local namespace,
     /// with the claims, or `None` with no such group. The value finds them
     /// at the first call.
@@ -189,7 +207,7 @@ impl ReadAccess {
 }
 
 /// Returns `true` if `rules` give `r` on `name`.
-fn reads(rules: &AccessRules, name: &str) -> bool {
+pub(crate) fn reads(rules: &AccessRules, name: &str) -> bool {
     rules.rights(name).contains(AccessModes::READ)
 }
 
@@ -309,6 +327,45 @@ mod tests {
         assert!(read.can_read(&collection("own.id"), "local/x"));
         assert!(!read.can_read_path("refs/mirrors/bad/any/x"));
         assert!(!read.can_read_path("refs/mirrors/a..b/any/x"));
+    }
+
+    /// The rules of a collection come from the group of its exact id, else
+    /// from the group of `collection=*`, and never from both. The own id, an
+    /// id that fails the collection-id rule, and an id with no group give
+    /// none. The claims of a namespace replace the rules of a claim group.
+    #[test]
+    fn collection_rules_take_the_selected_group_alone() {
+        let groups = "[ex-ostrya client \"local\"]\nauth=ssh:u\nallow=r:**\n\
+                      [ex-ostrya client \"exact\"]\nauth=ssh:u\ncollection=a.b\nallow=r:exact/**\n\
+                      [ex-ostrya client \"any\"]\nauth=ssh:u\ncollection=*\nallow=r:any/**\n\
+                      [ex-ostrya client \"deny\"]\nauth=ssh:v\ncollection=*\nallow=d:**\n";
+        let read = reader(groups, "ssh:u", None);
+        let exact = read.collection_rules("a.b").unwrap();
+        assert!(reads(&exact, "exact/x"));
+        assert!(!reads(&exact, "any/x"));
+        let any = read.collection_rules("c.d").unwrap();
+        assert!(reads(&any, "any/x"));
+        assert!(!reads(&any, "exact/x"));
+        for id in ["own.id", "bad", "a..b", "1a.b"] {
+            assert!(read.collection_rules(id).is_none(), "{id}");
+        }
+        let delete = reader(groups, "ssh:v", None);
+        assert!(!delete.collection_rules("a.b").unwrap().gives_read());
+        assert!(
+            reader(groups, "ssh:w", None)
+                .collection_rules("a.b")
+                .is_none()
+        );
+
+        let claims = "[ex-ostrya client \"certs\"]\nauth=tls:*\ncollection=*\n\
+                      tls-accept-claim=true\nallow=r:group/**\n";
+        let claimed = reader(claims, "tls:*", Some(&["ostrya:collection:a.b:claim/**"]));
+        let rules = claimed.collection_rules("a.b").unwrap();
+        assert!(reads(&rules, "claim/x"));
+        assert!(!reads(&rules, "group/x"));
+        let rules = claimed.collection_rules("c.d").unwrap();
+        assert!(reads(&rules, "group/x"));
+        assert!(!reads(&rules, "claim/x"));
     }
 
     /// With no client group, the implicit groups read each local ref and

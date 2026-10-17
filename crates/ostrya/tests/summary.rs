@@ -813,7 +813,9 @@ fn selector(entries: &[&str]) -> RefSelector {
 /// Builds the ref listing of the selector that `entries` give, with the
 /// rights of an anonymous client under the implicit groups.
 async fn list(repo: &Repo, entries: &[&str]) -> Result<Vec<u8>, ostrya::Error> {
-    repo.build_ref_listing(&selector(entries), &anyone()).await
+    repo.build_ref_listing(&selector(entries), None, &anyone())
+        .await
+        .map(|listing| listing.bytes)
 }
 
 /// Returns the names of `list_refs(None)` that the selector of `entries`
@@ -1264,9 +1266,10 @@ fn a_ref_listing_holds_the_readable_refs_alone() {
             (&["!a/bc"][..], vec!["a/b", "main"]),
         ] {
             let listing = repo
-                .build_ref_listing(&selector(entries), &reader)
+                .build_ref_listing(&selector(entries), None, &reader)
                 .await
-                .unwrap();
+                .unwrap()
+                .bytes;
             assert_eq!(listed_names(&listing), want, "{entries:?}");
         }
         let stranger = read_access(
@@ -1274,9 +1277,10 @@ fn a_ref_listing_holds_the_readable_refs_alone() {
             "ssh:v",
         );
         let listing = repo
-            .build_ref_listing(&selector(&[]), &stranger)
+            .build_ref_listing(&selector(&[]), None, &stranger)
             .await
-            .unwrap();
+            .unwrap()
+            .bytes;
         assert!(listed_names(&listing).is_empty());
         let outcome = list(&repo, &["garbage"]).await;
         assert!(
@@ -1287,7 +1291,9 @@ fn a_ref_listing_holds_the_readable_refs_alone() {
             "[ex-ostrya client \"c\"]\nauth=ssh:u\nallow=r:**\n",
             "ssh:u",
         );
-        let outcome = repo.build_ref_listing(&selector(&["broken"]), &all).await;
+        let outcome = repo
+            .build_ref_listing(&selector(&["broken"]), None, &all)
+            .await;
         assert!(
             matches!(outcome, Err(ostrya::Error::ObjectNotFound { .. })),
             "{outcome:?}"
@@ -1312,13 +1318,14 @@ fn a_client_that_reads_no_local_ref_reads_no_entry_of_refs_heads() {
                       [ex-ostrya client \"all\"]\nauth=ssh:a\nallow=r:**\n";
         for item in ["ssh:m", "ssh:d", "ssh:other"] {
             let listing = repo
-                .build_ref_listing(&selector(&[]), &read_access(groups, item))
+                .build_ref_listing(&selector(&[]), None, &read_access(groups, item))
                 .await
-                .unwrap();
+                .unwrap()
+                .bytes;
             assert!(listed_names(&listing).is_empty(), "{item}");
         }
         let outcome = repo
-            .build_ref_listing(&selector(&[]), &read_access(groups, "ssh:a"))
+            .build_ref_listing(&selector(&[]), None, &read_access(groups, "ssh:a"))
             .await;
         assert!(matches!(outcome, Err(ostrya::Error::Io(_))), "{outcome:?}");
     });
@@ -1355,9 +1362,10 @@ fn the_listing_applies_the_alias_rule() {
             "anonymous",
         );
         let listing = repo
-            .build_ref_listing(&selector(&["x/**", "zz"]), &reader)
+            .build_ref_listing(&selector(&["x/**", "zz"]), None, &reader)
             .await
-            .unwrap();
+            .unwrap()
+            .bytes;
         assert_eq!(listed_names(&listing), ["x/al", "x/y"]);
         assert_eq!(Summary::parse(&listing).unwrap().lookup("x/al"), Some(main));
         let listing = list(&repo, &["x/**", "zz"]).await.unwrap();
@@ -1424,4 +1432,643 @@ fn a_bad_entry_is_refused_by_the_parser() {
             );
         }
     }
+}
+
+/// Returns the SHA-256 digest of `bytes` in hex.
+fn digest(bytes: &[u8]) -> String {
+    Checksum::sha256(bytes).to_hex()
+}
+
+/// Builds the ref listing of the selectors that `refs` and `collections`
+/// give, with the rights `access`.
+async fn list_with(
+    repo: &Repo,
+    refs: &[&str],
+    collections: Option<&[&str]>,
+    access: &ostrya::access::ReadAccess,
+) -> ostrya::RefListing {
+    let collections = collections.map(selector);
+    repo.build_ref_listing(&selector(refs), collections.as_ref(), access)
+        .await
+        .unwrap()
+}
+
+/// Returns the collections of the collection map of `listing`, each with the
+/// names of its refs, in stored order.
+fn collection_names(listing: &[u8]) -> Vec<(String, Vec<String>)> {
+    Summary::parse(listing)
+        .unwrap()
+        .collection_map()
+        .unwrap()
+        .into_iter()
+        .map(|(id, refs)| (id, refs.into_iter().map(|entry| entry.name).collect()))
+        .collect()
+}
+
+/// A list of ref names or of selector entries.
+type Names<'a> = &'a [&'a str];
+
+/// The collections of a collection map, each with the names of its refs.
+type Map<'a> = &'a [(&'a str, Names<'a>)];
+
+/// Returns the map that `collection_names` gives, from string slices.
+fn names_of(map: Map<'_>) -> Vec<(String, Vec<String>)> {
+    map.iter()
+        .map(|(id, names)| {
+            let names = names.iter().map(|name| (*name).to_owned()).collect();
+            ((*id).to_owned(), names)
+        })
+        .collect()
+}
+
+/// Sets the mirror ref `id/name` of `repo` to `commit`.
+async fn set_mirror(repo: &Repo, id: &str, name: &str, commit: &Checksum) {
+    repo.set_collection_ref_immediate(&ostrya::CollectionRef::new(id, name), Some(commit))
+        .await
+        .unwrap();
+}
+
+/// Writes `body` to the file `refs/mirrors/<path>` of the repository at
+/// `repo_dir`, and creates its parents. The path can name a directory that
+/// no ref write accepts.
+fn write_mirror_file(repo_dir: &Path, path: &str, body: &str) {
+    let file = repo_dir.join("refs/mirrors").join(path);
+    std::fs::create_dir_all(file.parent().unwrap()).unwrap();
+    std::fs::write(file, body).unwrap();
+}
+
+/// Returns the read rights of the client with the auth item `item` under
+/// the client groups `groups`, in a repository with the collection id of
+/// the collection fixture.
+fn collection_access(groups: &str, item: &str) -> ostrya::access::ReadAccess {
+    let text =
+        format!("[core]\nrepo_version=1\nmode=archive-z2\ncollection-id={COLLECTION_ID}\n{groups}");
+    let config = ostrya::RepoConfig::parse(&text).unwrap();
+    let access = ostrya::access::ClientAccess::from_config(&config, Path::new("/")).unwrap();
+    let item = ostrya::access::AuthItem::parse(item).unwrap();
+    ostrya::access::ReadAccess::new(std::sync::Arc::new(access), item, None)
+}
+
+/// A request with no selector of the collection refs has the bytes of the
+/// listing before collection refs entered the listing. The SHA-256 digests
+/// below pin those bytes, for the `summary` fixture with several selectors,
+/// with more refs, with rights, with deltas, and for the collection fixture
+/// before and after its first summary. Mirror refs of other collections and
+/// a directory that is no collection change no byte, and a selector of the
+/// collection refs that selects nothing gives the same bytes.
+#[test]
+fn a_listing_without_collections_keeps_its_bytes() {
+    let (_tmp, repo_dir) = writable_fixture("summary", "listing-pinned-bytes");
+    block_on(async {
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        let (main, other) = {
+            let refs = repo.list_refs(None).await.unwrap();
+            (refs[0].1, refs[1].1)
+        };
+        set_mirror(&repo, "org.other", "x", &main).await;
+        set_mirror(&repo, "org.other", "y/z", &other).await;
+        write_mirror_file(&repo_dir, "bad/x", "no checksum\n");
+        write_mirror_file(&repo_dir, "file", "no checksum\n");
+        let anyone = anyone();
+        let check = |repo: &Repo, refs: &'static [&'static str], want: &'static str| {
+            let repo = repo.clone();
+            let anyone = anyone.clone();
+            async move {
+                let plain = list_with(&repo, refs, None, &anyone).await;
+                assert_eq!(digest(&plain.bytes), want, "{refs:?}");
+                assert!(plain.invalid_collection_dirs.is_empty());
+                let none = list_with(&repo, refs, Some(&["!**"]), &anyone).await;
+                assert_eq!(none.bytes, plain.bytes, "{refs:?}");
+                assert_eq!(none.invalid_collection_dirs, ["bad"]);
+            }
+        };
+        let cases: [(&[&str], &str); 4] = [
+            (
+                &[],
+                "a4d5a9eeb9ef261850b4b7005e7e8e8c50322e3003257ea89e16b2088c12b6f5",
+            ),
+            (
+                &["main"],
+                "371e66dc81781e8837b85e89c58098dc764405d98fcaeb3a2a358760ae69285f",
+            ),
+            (
+                &["!main"],
+                "fc5552356bdd83513ca1f5d849ad52c88176f1626aa230f3c9b8a90535088659",
+            ),
+            (
+                &["**"],
+                "a4d5a9eeb9ef261850b4b7005e7e8e8c50322e3003257ea89e16b2088c12b6f5",
+            ),
+        ];
+        for (refs, want) in cases {
+            check(&repo, refs, want).await;
+        }
+
+        add_prefix_refs(&repo).await;
+        let cases: [(&[&str], &str); 4] = [
+            (
+                &[],
+                "299fe13ac4273c6d4a5372870004bde38e4d284d887106371553f794a2acb7ae",
+            ),
+            (
+                &["a/**"],
+                "dfa5a07c6d06da621484232a02ba4a40792f46e2d722f96559aef254bbae4a2d",
+            ),
+            (
+                &["x/**", "main"],
+                "f776a1efcc603212dec0855f05e1815b733854bdd32ab7d6b962e540597415c9",
+            ),
+            (
+                &["!a/**"],
+                "0ee45df0f1a4baa1f81dafa789d57da2cc9eec94ddc8c8756819914d5cc160ca",
+            ),
+        ];
+        for (refs, want) in cases {
+            check(&repo, refs, want).await;
+        }
+        let reader = read_access(
+            "[ex-ostrya client \"c\"]\nauth=ssh:u\nallow=r:a/**;w:main\n",
+            "ssh:u",
+        );
+        let listing = list_with(&repo, &[], None, &reader).await;
+        assert_eq!(
+            digest(&listing.bytes),
+            "0c4bd6287f9d8470eca9aae719423dad3079def94f3915c2953c693865a0c203"
+        );
+
+        let opts = DeltaOptions {
+            timestamp: Some(FIXED_EPOCH),
+            ..DeltaOptions::default()
+        };
+        for (from, to) in [(None, &main), (Some(&other), &main), (None, &other)] {
+            repo.generate_static_delta(from, to, &opts).await.unwrap();
+        }
+        repo.reindex_static_deltas().await.unwrap();
+        let cases: [(&[&str], &str); 2] = [
+            (
+                &[],
+                "56f6755238adb6aba5aedbdfe427d90335ae27938bf34586959ee64bb814a3cf",
+            ),
+            (
+                &["other"],
+                "6b1973202aa00771ed99b949b25d82aa941fce0fc98529fe1cb60780c0205a99",
+            ),
+        ];
+        for (refs, want) in cases {
+            check(&repo, refs, want).await;
+        }
+    });
+
+    let (_tmp, repo_dir) = collection_fixture_with_no_wait("listing-pinned-collection");
+    block_on(async {
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        let (_, commit) = repo.list_refs(None).await.unwrap()[0].clone();
+        set_mirror(&repo, "org.ostrya.Other", "mirrored", &commit).await;
+        write_mirror_file(&repo_dir, "a..b/x", "no checksum\n");
+        let listing = list_with(&repo, &[], None, &anyone()).await;
+        assert_eq!(
+            digest(&listing.bytes),
+            "d95d180e87476907feee797a1aa16edc3a340d975e746eb72420cd90450d724b"
+        );
+        // The summary writer reads each mirror ref, so the bad directory is
+        // out of the tree while it runs.
+        std::fs::remove_dir_all(repo_dir.join("refs/mirrors/a..b")).unwrap();
+        regenerate_with(&repo, Vec::new()).await;
+        write_mirror_file(&repo_dir, "a..b/x", "no checksum\n");
+        let listing = list_with(&repo, &[], None, &anyone()).await;
+        assert_eq!(
+            digest(&listing.bytes),
+            "db34fc4fc0a5350df8a518828906cf7f775f5fa03306cc760786647ae99f519a"
+        );
+        let none = list_with(&repo, &[], Some(&["!**"]), &anyone()).await;
+        assert_eq!(none.bytes, listing.bytes);
+        assert_eq!(none.invalid_collection_dirs, ["a..b"]);
+    });
+}
+
+/// A selector of the collection refs selects them by `ID/NAME`. Field 0
+/// stays the listing of the local refs. The map holds each collection with
+/// a selected ref, both levels sorted byte-wise, and a selector that selects
+/// no collection ref gives no map. An entry of one part selects nothing.
+#[test]
+fn a_listing_selects_collection_refs_by_id_and_name() {
+    let (_tmp, repo_dir) = writable_fixture("summary", "listing-collections");
+    block_on(async {
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        let refs = repo.list_refs(None).await.unwrap();
+        let (main, other) = (refs[0].1, refs[1].1);
+        for (id, name, commit) in [
+            ("org.b", "main", &main),
+            ("org.b", "dev", &other),
+            ("org.a", "x/y", &other),
+            ("org.a", "main", &main),
+        ] {
+            set_mirror(&repo, id, name, commit).await;
+        }
+        let local = list_with(&repo, &[], None, &anyone()).await.bytes;
+        let both: &[(&str, &[&str])] = &[("org.a", &["main", "x/y"]), ("org.b", &["dev", "main"])];
+        let cases: [(Names, Map); 10] = [
+            (&[], both),
+            (&["**"], both),
+            (&["*/main"], &[("org.a", &["main"]), ("org.b", &["main"])]),
+            (&["org.a/**"], &[("org.a", &["main", "x/y"])]),
+            (&["org.a/*"], &[("org.a", &["main"])]),
+            (&["!org.b/**"], &[("org.a", &["main", "x/y"])]),
+            (
+                &["**", "!*/main"],
+                &[("org.a", &["x/y"]), ("org.b", &["dev"])],
+            ),
+            (
+                &["org.a/x/y", "org.b/dev"],
+                &[("org.a", &["x/y"]), ("org.b", &["dev"])],
+            ),
+            (&["org.a"], &[]),
+            (&["org.c/**", "main"], &[]),
+        ];
+        for (collections, want) in cases {
+            let listing = list_with(&repo, &[], Some(collections), &anyone()).await;
+            assert_normal_form(&listing.bytes);
+            assert_eq!(
+                collection_names(&listing.bytes),
+                names_of(want),
+                "{collections:?}"
+            );
+            let parsed = Summary::parse(&listing.bytes).unwrap();
+            assert_eq!(listed_names(&listing.bytes), ["main", "other"]);
+            let keys = metadata_keys(&parsed);
+            if want.is_empty() {
+                assert_eq!(listing.bytes, local, "{collections:?}");
+            } else {
+                assert_eq!(
+                    keys,
+                    ["ostree.summary.mode", "ostree.summary.collection-map"],
+                    "{collections:?}"
+                );
+            }
+        }
+        let listing = list_with(&repo, &["!**"], Some(&[]), &anyone()).await;
+        let parsed = Summary::parse(&listing.bytes).unwrap();
+        assert!(parsed.refs.is_empty());
+        let map = parsed.collection_map().unwrap();
+        assert_eq!(map[0].1[1].commit, other);
+        assert_eq!(map[1].1[1].commit, main);
+    });
+}
+
+/// Each collection entry of a listing has the bytes of the entry of the
+/// same ref in the collection map of a summary of the same state, and a
+/// listing of all collection refs has the map of the summary.
+#[test]
+fn a_collection_entry_has_the_bytes_of_the_summary_entry() {
+    let (_tmp, repo_dir) = writable_fixture("summary", "listing-collection-entries");
+    block_on(async {
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        let refs = repo.list_refs(None).await.unwrap();
+        let (main, other) = (refs[0].1, refs[1].1);
+        for (id, name, commit) in [
+            ("org.a", "main", &main),
+            ("org.a", "x/y", &other),
+            ("org.b", "dev", &other),
+        ] {
+            set_mirror(&repo, id, name, commit).await;
+        }
+        let summary = regenerate_with(&repo, Vec::new()).await;
+        let stored = summary.collection_map().unwrap();
+        let listing = list_with(&repo, &[], Some(&[]), &anyone()).await;
+        let parsed = Summary::parse(&listing.bytes).unwrap();
+        assert_eq!(parsed.collection_map().unwrap(), stored);
+        assert_eq!(
+            parsed.metadata_value("ostree.summary.collection-map"),
+            summary.metadata_value("ostree.summary.collection-map")
+        );
+        let listing = list_with(&repo, &[], Some(&["org.a/x/**"]), &anyone()).await;
+        let map = Summary::parse(&listing.bytes)
+            .unwrap()
+            .collection_map()
+            .unwrap();
+        assert_eq!(map, [(stored[0].0.clone(), vec![stored[0].1[1].clone()])]);
+    });
+}
+
+/// Each collection takes the group of the item in its namespace: the group
+/// of its exact id, else the group of `collection=*`, and never the two.
+/// A deny item wins, `d` alone gives no read, a collection with no group of
+/// the item is left out, and an item with no collection group gets no map.
+/// In a group with `tls-accept-claim=true`, the claims of a namespace
+/// replace the rules of the group for that namespace alone. Field 0 keeps
+/// the rights of the local refs.
+#[test]
+fn the_collection_map_follows_the_group_of_each_namespace() {
+    let (_tmp, repo_dir) = writable_fixture("summary", "listing-collection-rights");
+    block_on(async {
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        let (_, main) = repo.list_refs(None).await.unwrap()[0].clone();
+        for (id, name) in [
+            ("org.a", "main"),
+            ("org.a", "x/y"),
+            ("org.b", "main"),
+            ("org.b", "dev"),
+            ("org.c", "main"),
+        ] {
+            set_mirror(&repo, id, name, &main).await;
+        }
+        let groups = "[ex-ostrya client \"local\"]\nauth=ssh:u\nallow=r:main\n\
+                      [ex-ostrya client \"exact\"]\nauth=ssh:u\ncollection=org.a\nallow=r:x/**\n\
+                      [ex-ostrya client \"any\"]\nauth=ssh:u\ncollection=*\nallow=r:main;d:dev\n\
+                      [ex-ostrya client \"deny\"]\nauth=ssh:v\ncollection=*\nallow=r:**\ndeny=dev\n\
+                      [ex-ostrya client \"only-local\"]\nauth=ssh:w\nallow=r:**\n\
+                      [ex-ostrya client \"one\"]\nauth=ssh:x\ncollection=org.b\nallow=w:**\n";
+        let cases: [(&str, Names, Map); 4] = [
+            (
+                "ssh:u",
+                &["main"],
+                &[
+                    ("org.a", &["x/y"]),
+                    ("org.b", &["main"]),
+                    ("org.c", &["main"]),
+                ],
+            ),
+            (
+                "ssh:v",
+                &[],
+                &[
+                    ("org.a", &["main", "x/y"]),
+                    ("org.b", &["main"]),
+                    ("org.c", &["main"]),
+                ],
+            ),
+            ("ssh:w", &["main", "other"], &[]),
+            ("ssh:x", &[], &[("org.b", &["dev", "main"])]),
+        ];
+        for (item, local, map) in cases {
+            let access = read_access(groups, item);
+            let listing = list_with(&repo, &[], Some(&[]), &access).await;
+            assert_eq!(listed_names(&listing.bytes), local, "{item}");
+            assert_eq!(collection_names(&listing.bytes), names_of(map), "{item}");
+        }
+
+        let config = ostrya::RepoConfig::parse(
+            "[core]\nrepo_version=1\nmode=archive-z2\n\
+             [ex-ostrya client \"certs\"]\nauth=tls:*\ncollection=*\n\
+             tls-accept-claim=true\nallow=r:main\n",
+        )
+        .unwrap();
+        let access = ostrya::access::ClientAccess::from_config(&config, Path::new("/")).unwrap();
+        let claims = ostrya::access::Claims::parse(["ostrya:collection:org.a:r:x/**"]).unwrap();
+        let access = ostrya::access::ReadAccess::new(
+            std::sync::Arc::new(access),
+            ostrya::access::AuthItem::TlsAny,
+            Some(std::sync::Arc::new(claims)),
+        );
+        let listing = list_with(&repo, &[], Some(&[]), &access).await;
+        assert!(listed_names(&listing.bytes).is_empty());
+        assert_eq!(
+            collection_names(&listing.bytes),
+            names_of(&[
+                ("org.a", &["x/y"]),
+                ("org.b", &["main"]),
+                ("org.c", &["main"]),
+            ])
+        );
+    });
+}
+
+/// A directory under `refs/mirrors/` whose name fails the collection-id rule
+/// is left out of the listing, and its ref files are not read, so their
+/// content fails no listing. The listing names each such directory one time,
+/// sorted byte-wise, whatever its selector selects. A file or a symlink at
+/// the top level, and a name that is not UTF-8, are left out with no report.
+/// A listing with no selector of the collection refs reads none of them.
+/// The archive view does not serve a ref of such a directory.
+#[test]
+fn a_listing_leaves_out_an_invalid_collection_directory() {
+    use std::os::unix::ffi::OsStrExt;
+    let (_tmp, repo_dir) = writable_fixture("summary", "listing-invalid-dirs");
+    block_on(async {
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        let (_, main) = repo.list_refs(None).await.unwrap()[0].clone();
+        set_mirror(&repo, "org.a", "main", &main).await;
+        for path in ["bad/x", "bad/y/z", "a..b/x", "1a.b/main", "file"] {
+            write_mirror_file(&repo_dir, path, "no checksum\n");
+        }
+        let mirrors = repo_dir.join("refs/mirrors");
+        std::os::unix::fs::symlink("bad", mirrors.join("link")).unwrap();
+        let raw = mirrors.join(std::ffi::OsStr::from_bytes(b"\xff.b"));
+        std::fs::create_dir(&raw).unwrap();
+        std::fs::write(raw.join("main"), "no checksum\n").unwrap();
+
+        for collections in [&[][..], &["**"], &["org.a/**"], &["*/main"], &["!**"]] {
+            let listing = list_with(&repo, &[], Some(collections), &anyone()).await;
+            assert_eq!(
+                listing.invalid_collection_dirs,
+                ["1a.b", "a..b", "bad"],
+                "{collections:?}"
+            );
+            let want: &[(&str, &[&str])] = if collections == ["!**"] {
+                &[]
+            } else {
+                &[("org.a", &["main"])]
+            };
+            assert_eq!(
+                collection_names(&listing.bytes),
+                names_of(want),
+                "{collections:?}"
+            );
+        }
+        let listing = list_with(&repo, &[], None, &anyone()).await;
+        assert!(listing.invalid_collection_dirs.is_empty());
+        assert!(collection_names(&listing.bytes).is_empty());
+
+        let view = ostrya::ArchiveView::new(repo.clone());
+        for path in ["refs/mirrors/bad/x", "refs/mirrors/1a.b/main"] {
+            let answer = view.get(path, &anyone()).await.unwrap();
+            assert!(
+                matches!(
+                    answer,
+                    ostrya::ArchiveAnswer::NotFound | ostrya::ArchiveAnswer::Refused
+                ),
+                "{path}"
+            );
+        }
+    });
+}
+
+/// A collection ref that the client cannot read is not read: a ref file with
+/// no checksum in a collection with no group of the item, or under a name
+/// that the group denies, fails no listing of that client, and fails the
+/// listing of a client that reads it. The directory of a collection whose
+/// group gives no `r` is not opened: a directory with mode 0 fails only the
+/// listing of a client that reads it. The second part returns at once for a
+/// user that ignores the mode.
+#[test]
+fn a_collection_ref_that_the_client_cannot_read_is_not_read() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_tmp, repo_dir) = writable_fixture("summary", "listing-collection-unread");
+    block_on(async {
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        let (_, main) = repo.list_refs(None).await.unwrap()[0].clone();
+        set_mirror(&repo, "org.a", "main", &main).await;
+        write_mirror_file(&repo_dir, "org.a/secret", "no checksum\n");
+        write_mirror_file(&repo_dir, "org.b/x", "no checksum\n");
+        let groups = "[ex-ostrya client \"a\"]\nauth=ssh:u\ncollection=org.a\n\
+                      allow=r:**\ndeny=secret\n\
+                      [ex-ostrya client \"delete\"]\nauth=ssh:u\ncollection=org.b\nallow=d:**\n\
+                      [ex-ostrya client \"all\"]\nauth=ssh:all\ncollection=*\nallow=r:**\n";
+        let reader = read_access(groups, "ssh:u");
+        let listing = list_with(&repo, &[], Some(&[]), &reader).await;
+        assert_eq!(
+            collection_names(&listing.bytes),
+            names_of(&[("org.a", &["main"])])
+        );
+        let all = read_access(groups, "ssh:all");
+        for collections in [&["org.a/secret"][..], &["org.b/**"]] {
+            let outcome = repo
+                .build_ref_listing(&selector(&[]), Some(&selector(collections)), &all)
+                .await;
+            assert!(
+                matches!(outcome, Err(ostrya::Error::Core(_))),
+                "{collections:?}: {outcome:?}"
+            );
+        }
+
+        std::fs::remove_file(repo_dir.join("refs/mirrors/org.b/x")).unwrap();
+        let locked = repo_dir.join("refs/mirrors/org.b");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let restore = || {
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+        };
+        if std::fs::read_dir(&locked).is_ok() {
+            restore();
+            return;
+        }
+        let listing = list_with(&repo, &[], Some(&[]), &reader).await;
+        assert_eq!(
+            collection_names(&listing.bytes),
+            names_of(&[("org.a", &["main"])])
+        );
+        let outcome = repo
+            .build_ref_listing(&selector(&[]), Some(&selector(&["org.b/**"])), &all)
+            .await;
+        assert!(matches!(outcome, Err(ostrya::Error::Io(_))), "{outcome:?}");
+        restore();
+    });
+}
+
+/// The delta map of a listing holds the deltas that the index files
+/// advertise from the commits of field 0 and of the collection map. A
+/// selector of the collection refs that selects nothing adds no delta.
+#[test]
+fn a_listing_with_collections_advertises_the_deltas_of_collection_commits() {
+    let (_tmp, repo_dir) = writable_fixture("summary", "listing-collection-deltas");
+    block_on(async {
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        let refs = repo.list_refs(None).await.unwrap();
+        let (main, other) = (refs[0].1, refs[1].1);
+        set_mirror(&repo, "org.a", "x", &other).await;
+        let opts = DeltaOptions {
+            timestamp: Some(FIXED_EPOCH),
+            ..DeltaOptions::default()
+        };
+        for to in [&main, &other] {
+            repo.generate_static_delta(None, to, &opts).await.unwrap();
+        }
+        repo.reindex_static_deltas().await.unwrap();
+        let targets = |listing: &[u8]| -> Vec<Checksum> {
+            let parsed = Summary::parse(listing).unwrap();
+            let mut to: Vec<Checksum> = parsed
+                .static_deltas()
+                .unwrap()
+                .into_iter()
+                .map(|delta| delta.to)
+                .collect();
+            to.sort_by_key(Checksum::to_hex);
+            to
+        };
+        let mut both = vec![main, other];
+        both.sort_by_key(Checksum::to_hex);
+        let cases: [(Names, Option<Names>, Vec<Checksum>); 5] = [
+            (&["main"], None, vec![main]),
+            (&["main"], Some(&["org.b/**"]), vec![main]),
+            (&["main"], Some(&["org.a/**"]), both.clone()),
+            (&["!**"], Some(&[]), vec![other]),
+            (&["!**"], None, Vec::new()),
+        ];
+        for (refs, collections, want) in cases {
+            let listing = list_with(&repo, refs, collections, &anyone()).await;
+            assert_eq!(targets(&listing.bytes), want, "{refs:?} {collections:?}");
+        }
+        let listing = list_with(&repo, &["main"], Some(&[]), &anyone()).await;
+        let summary = regenerate_with(&repo, Vec::new()).await;
+        let parsed = Summary::parse(&listing.bytes).unwrap();
+        assert_eq!(
+            metadata_keys(&parsed),
+            [
+                "ostree.summary.mode",
+                "ostree.static-deltas",
+                "ostree.summary.collection-map"
+            ]
+        );
+        assert_eq!(
+            parsed.metadata_value("ostree.static-deltas"),
+            summary.metadata_value("ostree.static-deltas")
+        );
+    });
+}
+
+/// In a repository with a collection id, the refs under
+/// `refs/mirrors/ID/` of that id go into field 0 under their plain names,
+/// as the `ostree` command writes them into a summary. The mirror ref wins
+/// over the ref of `refs/heads` of the same name. The local rights apply to
+/// them, the group of `collection=*` does not, and the id is no key of the
+/// collection map.
+#[test]
+fn own_id_mirror_refs_go_into_field_0() {
+    let (_tmp, repo_dir) = collection_fixture_with_no_wait("listing-own-mirrors");
+    block_on(async {
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        let (_, main) = repo.list_refs(None).await.unwrap()[0].clone();
+        regenerate_with(&repo, Vec::new()).await;
+        let anchor = repo
+            .resolve_rev("ostree-metadata", false)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(anchor, main);
+        set_mirror(&repo, COLLECTION_ID, "main", &anchor).await;
+        set_mirror(&repo, COLLECTION_ID, "extra/x", &main).await;
+        set_mirror(&repo, "org.ostrya.Other", "m", &main).await;
+
+        let all = collection_access("", "anonymous");
+        for collections in [None, Some(&[][..])] {
+            let listing = list_with(&repo, &[], collections, &all).await;
+            let parsed = Summary::parse(&listing.bytes).unwrap();
+            assert_eq!(
+                listed_names(&listing.bytes),
+                ["extra/x", "main", "ostree-metadata"]
+            );
+            assert_eq!(parsed.lookup("main"), Some(anchor));
+            assert_eq!(parsed.lookup("extra/x"), Some(main));
+            let want: &[(&str, &[&str])] = match collections {
+                Some(_) => &[("org.ostrya.Other", &["m"])],
+                None => &[],
+            };
+            assert_eq!(collection_names(&listing.bytes), names_of(want));
+        }
+        let listing = list_with(&repo, &[], Some(&["org.ostrya.Test/**"]), &all).await;
+        assert!(collection_names(&listing.bytes).is_empty());
+
+        let groups = "[ex-ostrya client \"local\"]\nauth=ssh:u\nallow=r:main\n\
+                      [ex-ostrya client \"any\"]\nauth=ssh:u\ncollection=*\nallow=r:**\n\
+                      [ex-ostrya client \"mirrors\"]\nauth=ssh:m\ncollection=*\nallow=r:**\n";
+        let listing = list_with(&repo, &[], Some(&[]), &collection_access(groups, "ssh:u")).await;
+        assert_eq!(listed_names(&listing.bytes), ["main"]);
+        let parsed = Summary::parse(&listing.bytes).unwrap();
+        assert_eq!(parsed.lookup("main"), Some(anchor));
+        let listing = list_with(&repo, &[], Some(&[]), &collection_access(groups, "ssh:m")).await;
+        assert!(listed_names(&listing.bytes).is_empty());
+        assert_eq!(
+            collection_names(&listing.bytes),
+            names_of(&[("org.ostrya.Other", &["m"])])
+        );
+    });
 }

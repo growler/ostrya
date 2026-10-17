@@ -454,8 +454,11 @@ enum Command {
     ///
     /// A ref under `refs/heads/` or `refs/mirrors/ID/` is served when the
     /// client group of the item has `r` on its name. An alias needs `r` on
-    /// its name and on its target. The ref listing holds the refs of
-    /// `refs/heads/` that the client reads. `refs/remotes/`, each other path
+    /// its name and on its target. The ref listing holds the local refs that
+    /// the client reads, and with a `collection` pair in its query the
+    /// collection refs that the client reads. A directory under
+    /// `refs/mirrors/` whose name is not a collection id is not served and
+    /// not listed. `refs/remotes/`, each other path
     /// under `refs/`, and `extensions/ostrya/` get 404. `summary` and
     /// `summary.sig` are served only when the repository has no client
     /// group. Objects, deltas, `config`, and the other files under
@@ -477,7 +480,9 @@ enum Command {
     /// to standard output. Then it serves until the process ends. Warnings
     /// and errors go to standard error. For each push session that commits,
     /// the command writes one `warning: STEP: MESSAGE` line to standard error
-    /// for each warning of the session.
+    /// for each warning of the session. When a ref listing finds a directory
+    /// under `refs/mirrors/` whose name is not a collection id, the command
+    /// writes one `warning:` line that names it, one time in each run.
     #[cfg(feature = "serve")]
     Serve(ServeArgs),
     /// Serve one pull session over standard input and standard output.
@@ -504,9 +509,12 @@ enum Command {
     /// each mirror ref, and the summary.
     ///
     /// Standard output carries the frames of the session alone. On failure,
-    /// the command writes `error: MESSAGE` to standard error. It writes
-    /// nothing else, also under --verbose. It exits 0 when standard input ends
-    /// at a frame boundary, and 1 after an `Error` frame or a failed write.
+    /// the command writes `error: MESSAGE` to standard error. When a ref
+    /// listing finds a directory under `refs/mirrors/` whose name is not a
+    /// collection id, the command writes one `warning:` line that names it
+    /// to standard error, one time in each session. It exits 0 when standard
+    /// input ends at a frame boundary, and 1 after an `Error` frame or a
+    /// failed write.
     ///
     /// An `authorized_keys` entry with `command="ostrya send --repo=PATH"`
     /// limits an ssh key to a pull from one repository.
@@ -3603,7 +3611,11 @@ async fn serve(repo: Repo, args: ServeArgs) -> Result<()> {
         }
     }));
     opts.on_event = Some(Arc::new(|event: &ostrya_server::ServerEvent| {
-        eprintln!("error: {event}");
+        if event.is_warning() {
+            eprintln!("warning: {event}");
+        } else {
+            eprintln!("error: {event}");
+        }
     }));
     let scheme = if opts.tls.is_some() { "https" } else { "http" };
     let server = match ostrya_server::bind(repo, opts).await {
@@ -3738,8 +3750,9 @@ fn ssh_client(client: Option<String>, name: &str) -> ostrya::access::AuthItem {
 /// session reads its input.
 ///
 /// Standard output carries the frames of the session alone. A failure goes to
-/// standard error as the error line of [`main`]. The command takes no lock and
-/// writes no file in the repository.
+/// standard error as the error line of [`main`]. Each
+/// [`SendEvent`](ostrya::SendEvent) goes there as one `warning:` line. The
+/// command takes no lock and writes no file in the repository.
 #[cfg(feature = "send")]
 async fn send(repo: Repo, client: ostrya::access::AuthItem) -> Result<()> {
     use ostrya::access::{AuthItem, ClientAccess, ReadAccess};
@@ -3759,7 +3772,12 @@ async fn send(repo: Repo, client: ostrya::access::AuthItem) -> Result<()> {
     // flush waits until each byte reaches the descriptor. For this reason,
     // the session flushes only if no whole `Get` frame waits in its input
     // buffer.
-    repo.send(stdin_file()?, stdout_file()?, &access).await
+    let mut opts = ostrya::SendOptions::default();
+    opts.on_event = Some(Arc::new(|event: &ostrya::SendEvent| {
+        eprintln!("warning: {event}");
+    }));
+    repo.send_with(stdin_file()?, stdout_file()?, &access, &opts)
+        .await
 }
 
 /// Pushes the commits that the refspecs name to a remote over ssh or HTTP.

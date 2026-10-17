@@ -139,6 +139,7 @@ The refspec \fB\%<remote>:<ref>\fR names it.
 \fB\%<repo>/refs/mirrors/<collection\-id>/<ref>\fR
 A collection ref.
 The summary lists these refs in its collection map.
+A directory under \fB\%refs/mirrors\fR whose name is not a collection id is not served and not listed.
 A push to the collection \fB\%<collection\-id>\fR writes it, when \fB\%<collection\-id>\fR is not the \fB\%collection\-id\fR of \fB\%[core]\fR.
 A push to that own collection id writes \fB\%refs/heads/<ref>\fR.
 .TP

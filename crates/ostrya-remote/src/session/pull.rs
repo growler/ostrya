@@ -19,9 +19,9 @@ use ostrya_fetch::gate::{Gate, Permit};
 use super::stream::{Input, Output};
 use crate::error::{Error, Result};
 use crate::proto::{
-    FrameReader, FrameWriter, GetReply, Kind, MAX_REF_ENTRY_LEN, MAX_REF_ENTRY_PARTS,
-    MAX_REF_PATTERNS, MIN_FRAME_LIMIT, Message, PULL_PROTOCOL_VERSION, PullHello, Step,
-    encode_frame, protocol,
+    FrameReader, FrameWriter, GetReply, Kind, ListRefsRequest, MAX_REF_ENTRY_LEN,
+    MAX_REF_ENTRY_PARTS, MAX_REF_PATTERNS, MIN_FRAME_LIMIT, Message, PULL_PROTOCOL_VERSION,
+    PullHello, Step, encode_frame, protocol,
 };
 use crate::transport::Transport;
 
@@ -185,15 +185,32 @@ fn body_error(e: Error) -> io::Error {
     io::Error::new(kind, e)
 }
 
-/// Returns the entries of a ref listing that a request sends, by the rules of
-/// `PullSession` `# Ref patterns`.
+/// Returns the `ListRefs` request of a ref listing of `refs` and
+/// `collections`, by the rules of `PullSession` `# Ref patterns`.
 ///
 /// # Errors
 ///
 /// [`Error::InvalidInput`] if an entry is over [`MAX_REF_ENTRY_LEN`] bytes,
 /// with its `!` counted as one byte, or over [`MAX_REF_ENTRY_PARTS`] parts,
-/// or if more than [`MAX_REF_PATTERNS`] entries stay.
-pub(super) fn wire_entries(selector: &RefSelector) -> Result<Vec<String>> {
+/// or if more than [`MAX_REF_PATTERNS`] entries stay in the two lists.
+pub(super) fn wire_entries(
+    refs: &RefSelector,
+    collections: Option<&RefSelector>,
+) -> Result<ListRefsRequest> {
+    let mut count = 0;
+    let refs = list_entries(refs, &mut count)?;
+    let collections = collections
+        .map(|selector| list_entries(selector, &mut count))
+        .transpose()?;
+    Ok(ListRefsRequest { refs, collections })
+}
+
+/// Returns the entries of one list of a request, and adds their number to
+/// `count`, the number of entries of the request.
+///
+/// The positive entries come first, then the negative entries with their
+/// `!`. Each exact duplicate of one kind is removed.
+fn list_entries(selector: &RefSelector, count: &mut usize) -> Result<Vec<String>> {
     let mut seen = HashSet::new();
     let mut entries = Vec::new();
     let positive = selector.positive().iter().map(|p| (false, p.as_str()));
@@ -210,11 +227,12 @@ pub(super) fn wire_entries(selector: &RefSelector) -> Result<Vec<String>> {
                  {MAX_REF_ENTRY_LEN} bytes and {MAX_REF_ENTRY_PARTS} parts"
             )));
         }
-        if entries.len() == MAX_REF_PATTERNS {
+        if *count == MAX_REF_PATTERNS {
             return Err(Error::InvalidInput(format!(
                 "the ref listing names more than {MAX_REF_PATTERNS} distinct entries"
             )));
         }
+        *count += 1;
         entries.push(if is_negative {
             format!("!{text}")
         } else {
@@ -571,10 +589,12 @@ impl StreamSession {
         self.request(Kind::Get, frame, path, max_len).await
     }
 
-    /// Asks for the ref listing of `selector` and waits for the head of its
-    /// reply.
+    /// Asks for the ref listing of `refs` and `collections` and waits for the
+    /// head of its reply.
     ///
-    /// The call sends the entries of `selector` by the rules of
+    /// `refs` selects the local refs. `collections` selects the collection
+    /// refs by `ID/NAME`, and `None` asks for no collection ref. The call
+    /// sends the entries of the two selectors by the rules of
     /// [Ref patterns](super::PullSession#ref-patterns). The [`PullBody`] holds
     /// the listing to `max_len` bytes and to its stated length.
     ///
@@ -599,10 +619,15 @@ impl StreamSession {
     ///
     /// A failure ends the session, as [Failures](StreamSession#failures)
     /// states.
-    pub async fn list_refs(&self, selector: &RefSelector, max_len: u64) -> Result<PullBody> {
+    pub async fn list_refs(
+        &self,
+        refs: &RefSelector,
+        collections: Option<&RefSelector>,
+        max_len: u64,
+    ) -> Result<PullBody> {
         self.inner.shared.check()?;
-        let entries = wire_entries(selector)?;
-        let frame = encode_frame(&Message::ListRefs(entries), MIN_FRAME_LIMIT)?;
+        let request = wire_entries(refs, collections)?;
+        let frame = encode_frame(&Message::ListRefs(request), MIN_FRAME_LIMIT)?;
         let body = self
             .request(Kind::ListRefs, frame, "ListRefs".to_owned(), max_len)
             .await?;
@@ -1003,7 +1028,7 @@ mod tests {
     }
 
     fn wire(entries: &[&str]) -> Vec<String> {
-        wire_entries(&selector(entries)).unwrap()
+        wire_entries(&selector(entries), None).unwrap().refs
     }
 
     /// `wire_entries` removes an exact duplicate of one kind and keeps the
@@ -1039,14 +1064,47 @@ mod tests {
             })
             .collect();
         let entries: Vec<&str> = entries.iter().map(String::as_str).collect();
-        let err = wire_entries(&selector(&entries)).unwrap_err();
+        let err = wire_entries(&selector(&entries), None).unwrap_err();
         assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
         assert_eq!(wire(&entries[1..]).len(), MAX_REF_PATTERNS);
     }
 
+    /// The two lists share the limit. An entry repeated within one list is
+    /// sent one time, and the same entry in the two lists is sent in each
+    /// list. An absent list and an empty list stay apart.
+    #[test]
+    fn the_two_lists_share_the_limit() {
+        let names: Vec<String> = (0..MAX_REF_PATTERNS).map(|n| format!("r{n}")).collect();
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let (half, rest) = names.split_at(MAX_REF_PATTERNS / 2);
+        let request = wire_entries(&selector(half), Some(&selector(rest))).unwrap();
+        assert_eq!(request.refs.len() + request.collections.unwrap().len(), 256);
+        let err = wire_entries(&selector(half), Some(&selector(&names[..129]))).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
+        let err = wire_entries(&selector(&names), Some(&selector(&["x/*"]))).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
+
+        let request =
+            wire_entries(&selector(&["a", "a"]), Some(&selector(&["a", "!b", "a"]))).unwrap();
+        assert_eq!(request.refs, ["a"]);
+        assert_eq!(request.collections.unwrap(), ["a", "!b"]);
+        assert_eq!(
+            wire_entries(&selector(&[]), None).unwrap().collections,
+            None
+        );
+        assert_eq!(
+            wire_entries(&selector(&[]), Some(&selector(&[])))
+                .unwrap()
+                .collections,
+            Some(Vec::new())
+        );
+        let full = wire_entries(&selector(&names), Some(&selector(&[]))).unwrap();
+        assert_eq!(full.refs.len(), MAX_REF_PATTERNS);
+    }
+
     /// `wire_entries` refuses an entry over the limit of bytes or parts, and
     /// accepts an entry at the limit. The `!` counts as one byte and adds no
-    /// part.
+    /// part. The limits apply to an entry of each list.
     #[test]
     fn an_entry_over_a_limit_is_refused() {
         let parts = |n: usize| vec!["a"; n].join("/");
@@ -1065,7 +1123,9 @@ mod tests {
             format!("!{}", long(MAX_REF_ENTRY_LEN)),
             format!("!{}", parts(MAX_REF_ENTRY_PARTS + 1)),
         ] {
-            let err = wire_entries(&selector(&[&bad])).unwrap_err();
+            let err = wire_entries(&selector(&[&bad]), None).unwrap_err();
+            assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
+            let err = wire_entries(&selector(&[]), Some(&selector(&[&bad]))).unwrap_err();
             assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
         }
     }

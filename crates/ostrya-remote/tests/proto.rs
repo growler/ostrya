@@ -6,8 +6,9 @@ use ostrya_core::{Checksum, ObjectName, ObjectType};
 use ostrya_gvariant::{DictBuilder, Type, Value};
 use ostrya_remote::proto::{
     CommitRequest, ErrorMessage, FrameReader, FrameWriter, GetReply, HaveReply, Hello, HelloReply,
-    Kind, MAX_FRAME, MAX_FRAME_LIMIT, MAX_HAVE, MIN_FRAME_LIMIT, Message, ObjectHeader, ObjectRead,
-    ObjectsReply, PULL_PROTOCOL_VERSION, PullHello, PullHelloReply, RefState,
+    Kind, ListRefsRequest, MAX_FRAME, MAX_FRAME_LIMIT, MAX_HAVE, MIN_FRAME_LIMIT, Message,
+    ObjectHeader, ObjectRead, ObjectsReply, PULL_PROTOCOL_VERSION, PullHello, PullHelloReply,
+    RefState,
 };
 use ostrya_remote::{Encoding, Error, ErrorCode, Expected, RefOutcome, RefUpdate};
 
@@ -199,8 +200,16 @@ fn samples() -> Vec<Message> {
         Message::PullHelloReply(PullHelloReply { version: 1 }),
         Message::Get("objects/ab/cd.filez".into()),
         get_reply(true, Some(3)),
-        Message::ListRefs(vec!["a".into(), "b/c".into()]),
+        list_refs(&["a", "b/c"], Some(&["org.a/**", "!org.b/x"])),
     ]
+}
+
+fn list_refs(refs: &[&str], collections: Option<&[&str]>) -> Message {
+    let entries = |list: &[&str]| list.iter().map(|e| (*e).to_owned()).collect();
+    Message::ListRefs(ListRefsRequest {
+        refs: entries(refs),
+        collections: collections.map(entries),
+    })
 }
 
 fn pull_hello(agent: Option<&str>) -> Message {
@@ -263,11 +272,13 @@ fn every_message_round_trips() {
     ] {
         round_trip(get_reply(found, len));
     }
-    // The codec does not check the prefixes.
-    for prefixes in [vec![], vec![""], vec!["a"; 3], vec!["a b", "/x/"]] {
-        round_trip(Message::ListRefs(
-            prefixes.into_iter().map(Into::into).collect(),
-        ));
+    // The codec does not check the entries. An absent and an empty list of
+    // collection entries stay apart.
+    for entries in [&[][..], &[""], &["a"; 3], &["a b", "/x/"]] {
+        round_trip(list_refs(entries, None));
+        round_trip(list_refs(entries, Some(&[])));
+        round_trip(list_refs(&[], Some(entries)));
+        round_trip(list_refs(entries, Some(entries)));
     }
 }
 
@@ -538,17 +549,80 @@ fn golden_bytes_pin_the_pull_messages() {
         get_reply(true, Some(0)),
         hex("00 00 00 11 0f 01 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00"),
     );
-    // An empty `as` is 0 bytes. Each string ends with a zero byte, and the
-    // offsets of the string ends follow, one byte each.
-    golden(Message::ListRefs(vec![]), hex("00 00 00 01 10"));
+    // A `ListRefs` is `(asa{sv})`. Each string of the `as` ends with a zero
+    // byte, and the offsets of the string ends follow, one byte each. The
+    // dict starts at the next multiple of 8, and the end of the `as` is the
+    // last byte.
+    golden(list_refs(&[], None), hex("00 00 00 02 10 00"));
     golden(
-        Message::ListRefs(vec!["a".into()]),
-        hex("00 00 00 04 10 61 00 02"),
+        list_refs(&["a"], None),
+        hex("00 00 00 0a 10 61 00 02 00 00 00 00 00 03"),
     );
     golden(
-        Message::ListRefs(vec!["a".into(), "b/c".into()]),
-        hex("00 00 00 09 10 61 00 62 2f 63 00 02 06"),
+        list_refs(&["a", "b/c"], None),
+        hex("00 00 00 0a 10 61 00 62 2f 63 00 02 06 08"),
     );
+    // A present empty list is the key `collections` with an empty `as`.
+    golden(
+        list_refs(&[], Some(&[])),
+        hex(
+            "00 00 00 17 10 63 6f 6c 6c 65 63 74 69 6f 6e 73 00 00 00 00 00 00 61 73 0c \
+             14 00",
+        ),
+    );
+    golden(
+        list_refs(&["a"], Some(&["o.a/x"])),
+        hex(
+            "00 00 00 26 10 61 00 02 00 00 00 00 00 63 6f 6c 6c 65 63 74 69 6f 6e 73 00 \
+             00 00 00 00 6f 2e 61 2f 78 00 06 00 61 73 0c 1b 03",
+        ),
+    );
+}
+
+/// The body of `ListRefs` with the entries `refs` and the dict entries
+/// `entries`.
+fn list_refs_body(refs: &[&str], entries: Vec<Value>) -> Vec<u8> {
+    let refs = refs.iter().map(|r| st(r)).collect();
+    gv(
+        "(asa{sv})",
+        t(vec![Value::Array(refs), Value::Array(entries)]),
+    )
+}
+
+/// The dict of `ListRefs` ignores a key that it does not know, and the
+/// first `collections` counts. A `collections` of another type is
+/// `protocol`. The body of the form `as` alone is `protocol`.
+#[test]
+fn list_refs_reads_the_collections_key() {
+    let strv = |list: &[&str]| Value::Array(list.iter().map(|e| st(e)).collect());
+    let body = list_refs_body(
+        &["a"],
+        vec![
+            entry("zz", "u", Value::U32(7)),
+            entry("collections", "as", strv(&["o.a/x"])),
+            entry("collections", "s", st("ignored")),
+        ],
+    );
+    assert_eq!(
+        read_one(&frame(16, &body)).unwrap(),
+        Some(list_refs(&["a"], Some(&["o.a/x"])))
+    );
+    let body = list_refs_body(&["a"], vec![entry("zz", "as", strv(&["o.a/x"]))]);
+    assert_eq!(
+        read_one(&frame(16, &body)).unwrap(),
+        Some(list_refs(&["a"], None))
+    );
+    for wrong in [
+        entry("collections", "s", st("o.a/x")),
+        entry("collections", "ay", Value::Bytes(b"o.a".to_vec())),
+        entry("collections", "a(s)", Value::Array(vec![])),
+    ] {
+        let body = list_refs_body(&[], vec![wrong]);
+        assert_protocol(read_one(&frame(16, &body)));
+    }
+    for old in [hex(""), hex("61 00 02"), hex("61 00 62 2f 63 00 02 06")] {
+        assert_protocol(read_one(&frame(16, &old)));
+    }
 }
 
 #[test]
@@ -573,15 +647,17 @@ fn malformed_pull_bodies_decode_to_protocol() {
         hex("00 00 00 04 0e 61 00 62 00"),
         frame(14, &[]),
         frame(15, &[]),
-        // A `ListRefs` whose offset points past the end, one whose offset
-        // table holds its own offset, and one with no terminating zero byte.
-        frame(16, &hex("61")),
-        frame(16, &hex("61 00 03")),
-        frame(16, &hex("61 62 02")),
-        // A `ListRefs` with a prefix that is not UTF-8, and one with a zero
-        // inside a prefix.
-        frame(16, &hex("ff 00 02")),
-        frame(16, &hex("61 00 62 00 04")),
+        // A `ListRefs` whose tuple offset points past the end, one whose
+        // offset table of the `as` holds its own offset, and one with no
+        // terminating zero byte.
+        frame(16, &hex("61 00 02 00 00 00 00 00 09")),
+        frame(16, &hex("61 00 03 00 00 00 00 00 03")),
+        frame(16, &hex("61 62 02 00 00 00 00 00 03")),
+        // A `ListRefs` with an entry that is not UTF-8, one with a zero
+        // inside an entry, and one with a padding byte that is not zero.
+        frame(16, &hex("ff 00 02 00 00 00 00 00 03")),
+        frame(16, &hex("61 00 62 00 04 00 00 00 05")),
+        frame(16, &hex("61 00 02 00 01 00 00 00 03")),
     ];
     for bytes in cases {
         assert_protocol(read_one(&bytes));

@@ -11,13 +11,15 @@
 //! - [`Repo::read_summary`] and [`Repo::read_summary_signature`] read the two
 //!   files.
 //! - [`Repo::build_ref_listing`] builds a ref listing for one request: a
-//!   summary of the refs that a [`RefSelector`] selects, with a size cap.
+//!   summary of the local refs and of the collection refs that two
+//!   [`RefSelector`] values select, with a size cap. It returns a
+//!   [`RefListing`].
 //! - [`Summary`] is the parsed form of a `summary` file.
 //!   [`Summary::static_deltas`] reads its delta map as [`AdvertisedDelta`]
 //!   values.
 
-use std::collections::HashMap;
 use std::collections::hash_map::Entry;
+use std::collections::{BTreeMap, HashMap};
 use std::os::fd::{AsFd, BorrowedFd};
 
 use ostrya_core::{
@@ -33,6 +35,7 @@ use crate::deltagen::{STATIC_DELTAS_KEY, advertised_delta_map, parse_delta_name}
 use crate::error::{Error, Result};
 use crate::lock::{LockKind, UpdateLockHeld};
 use crate::mtree::MutableTree;
+use crate::refs::RefSelection;
 use crate::remote::proto::MAX_REF_LISTING;
 use crate::repo::Repo;
 use crate::sign::{Signer, Verifier, VerifyOutcome, append_signature, signatures_for};
@@ -43,6 +46,8 @@ const SUMMARY_SIGNATURE: &str = "(a(s(taya{sv}))a{sv})";
 const METADATA_SIGNATURE: &str = "a{sv}";
 /// The type of one entry of the ref list of the summary.
 const REF_ENTRY_SIGNATURE: &str = "(s(taya{sv}))";
+/// The type of one entry of the global metadata dict.
+const DICT_ENTRY_SIGNATURE: &str = "{sv}";
 /// The alignment of a ref entry and of the global metadata dict, in bytes.
 const LISTING_ALIGNMENT: usize = 8;
 /// The fewest bytes of a ref entry other than its name.
@@ -107,6 +112,24 @@ pub struct Summary {
     pub refs: Vec<SummaryRef>,
     /// The global metadata dict, as the `a{sv}` [`Value`] of the file.
     pub metadata: Value,
+}
+
+/// A ref listing that [`Repo::build_ref_listing`] built for one request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct RefListing {
+    /// The bytes of the listing: a summary GVariant
+    /// `(a(s(taya{sv}))a{sv})` with no signature, which [`Summary::parse`]
+    /// reads.
+    pub bytes: Vec<u8>,
+    /// The name of each directory under `refs/mirrors/` whose name fails
+    /// the collection-id rule, sorted byte-wise, each one time.
+    ///
+    /// The listing holds no ref of these directories. The list is empty for
+    /// a request with no selector of the collection refs, because the build
+    /// then reads no such directory. A server writes a warning for each
+    /// name.
+    pub invalid_collection_dirs: Vec<String>,
 }
 
 /// One static delta that a delta map advertises.
@@ -216,14 +239,28 @@ impl Summary {
     /// A repository publishes this map for the refs that it mirrors from
     /// other collections. If the summary has no such key, the list is empty.
     ///
+    /// A ref listing that a request with a selector of the collection refs
+    /// gets holds the selected collection refs in this map.
+    ///
     /// # Errors
     ///
-    /// - [`Error::InvalidFormat`] if the map does not have the shape of its
-    ///   type `a{sa(s(taya{sv}))}`.
+    /// - [`Error::InvalidFormat`] if the variant that holds the map has a type
+    ///   other than `a{sa(s(taya{sv}))}`, or if the map does not have the
+    ///   shape of that type.
     pub fn collection_map(&self) -> Result<Vec<(String, Vec<SummaryRef>)>> {
-        let Some(map) = self.metadata_value(COLLECTION_MAP_KEY) else {
+        let Some((ty, map)) = self
+            .metadata
+            .dict_get(COLLECTION_MAP_KEY)
+            .and_then(Value::as_variant)
+        else {
             return Ok(Vec::new());
         };
+        let signature = ty.signature();
+        if signature != COLLECTION_MAP_SIGNATURE {
+            return Err(malformed(&format!(
+                "the collection map has type `{signature}`, not `{COLLECTION_MAP_SIGNATURE}`"
+            )));
+        }
         let Some(entries) = map.as_array() else {
             return Err(malformed("the collection map is not an array"));
         };
@@ -697,8 +734,9 @@ impl Repo {
         Ok(to_bytes(&ty, &summary).map_err(ostrya_core::Error::from)?)
     }
 
-    /// Returns a ref listing: a summary of the local refs that `selector`
-    /// selects and `access` reads, built for one request.
+    /// Returns a ref listing: a summary of the local refs that `refs`
+    /// selects, and of the collection refs that `collections` selects, that
+    /// `access` reads, built for one request.
     ///
     /// The listing has the type of a `summary` file, `(a(s(taya{sv}))a{sv})`,
     /// and [`Summary::parse`] reads it. The call writes nothing and takes no
@@ -709,41 +747,79 @@ impl Repo {
     /// A ref is selected when the selector has no positive pattern or a
     /// positive pattern matches its name, and no negative pattern matches it.
     /// The pattern `a/*` selects `a/b` and the pattern `a/**` selects `a/b`
-    /// and `a/b/c`. An empty selector selects each ref under `refs/heads`.
-    /// A selector of negative patterns alone selects each ref that they do
-    /// not match. The order of the entries has no effect.
+    /// and `a/b/c`. An empty selector selects each ref. A selector of
+    /// negative patterns alone selects each ref that they do not match. The
+    /// order of the entries has no effect.
     ///
-    /// The listing holds each selected ref one time, sorted byte-wise by name.
+    /// Field 0 holds the local refs that `refs` selects, each one time,
+    /// sorted byte-wise by name. The local refs are the refs under
+    /// `refs/heads` and, in a repository with `[core] collection-id`, the
+    /// refs under `refs/mirrors/ID/` of that id, under their plain names.
+    /// When the two directories hold one name, field 0 holds one entry with
+    /// the commit of the mirror ref. `collections` has no effect on field 0.
+    /// In a repository with no `refs/mirrors/ID/` of its own id, field 0
+    /// holds the refs of `refs/heads` alone.
+    ///
+    /// `collections` selects the refs under `refs/mirrors/` of each other
+    /// collection by `ID/NAME`, for example `org.example.Os/stable` or
+    /// `*/stable`. An entry of one part, such as `org.example.Os`, selects no
+    /// ref, and an entry of the own id selects no ref. The selected refs go
+    /// into `ostree.summary.collection-map`, in the form of the summary: the
+    /// collections sorted byte-wise by id, and the refs of each collection
+    /// sorted byte-wise by name. A collection with no selected ref is not in
+    /// the map, and with no selected collection ref the listing holds no
+    /// map. With `None`, the call reads no collection ref, and the listing
+    /// has the bytes of the listing of `refs` alone.
+    ///
     /// An alias is in the listing under its own name, with the commit of its
-    /// target. The listing holds no mirror ref. Each entry has the bytes of
+    /// target. The listing holds no remote ref. Each entry has the bytes of
     /// the entry of the same ref in a summary of the same repository state.
+    ///
+    /// # Collection directories
+    ///
+    /// With `collections`, the call reads the top level of `refs/mirrors/`
+    /// one time, whatever the rights of `access`. A directory whose name
+    /// fails the collection-id rule ([`is_collection_id`](crate::is_collection_id))
+    /// is left out of the listing, and the call reads no entry in it. The
+    /// names of these directories are in
+    /// [`RefListing::invalid_collection_dirs`], so a server can write a
+    /// warning. A name that is not UTF-8, and an entry at the top level that
+    /// is no directory, are left out with no report. With `None`, the call
+    /// reads only `refs/mirrors/ID/` of the own id.
     ///
     /// # Access
     ///
     /// The listing holds a selected ref only when `access` reads it
-    /// ([`ReadAccess::can_read`](crate::access::ReadAccess::can_read) in the
-    /// local namespace). The call checks the name before it reads the ref
+    /// ([`ReadAccess::can_read`](crate::access::ReadAccess::can_read)). A
+    /// local ref takes the group of the item in the local namespace, and a
+    /// collection ref takes the group of the item in the namespace of its
+    /// collection: the group of the exact id, else the group of
+    /// `collection=*`. The rules of two groups never combine. In a group
+    /// with `tls-accept-claim=true`, the claims of the namespace replace the
+    /// rules of the group. The call checks the name before it reads the ref
     /// file, so it never reads a ref file that `access` does not read. The
-    /// content of such a file does not fail the listing.
+    /// content of such a file does not fail the listing. The call reads no
+    /// directory of a collection whose group gives no `r`.
     ///
     /// An alias is in the listing when `access` reads its name and its
     /// target, and the target is a regular file. The alias resolves by the
     /// rule of [`ArchiveView`](crate::ArchiveView#routing): its body is
     /// relative, it stays inside `refs/`, and the call follows one link with
-    /// no symlink followed on the path of the target. Each other alias is
-    /// not in the listing, also an alias of an alias and an alias to a ref
-    /// under `refs/remotes/`.
+    /// no symlink followed on the path of the target. The path of the target
+    /// gives its namespace. Each other alias is not in the listing, also an
+    /// alias of an alias and an alias to a ref under `refs/remotes/`.
     ///
-    /// The call reads only the directories of `refs/heads` that a positive
-    /// pattern can match, and it reads no ref file outside the literal
-    /// leading parts of a positive pattern and its matches. A leading
-    /// wildcard lists the directories at its level. It skips a directory that
-    /// a negative pattern covers, and it applies the negative patterns to a
-    /// name before it reads the ref file, so it reads no ref that the
-    /// selector does not select. It reads each commit one time, also when
-    /// more than one ref names it. An empty selector, and a selector of
-    /// negative patterns alone, read all of `refs/heads`. A name that the
-    /// ref-name rule refuses is in the walk, and a wildcard selects it.
+    /// The call reads only the directories that a positive pattern can
+    /// match, and it reads no ref file outside the literal leading parts of
+    /// a positive pattern and its matches. A leading wildcard lists the
+    /// directories at its level. It skips a directory that a negative
+    /// pattern covers, and it applies the negative patterns to a name before
+    /// it reads the ref file, so it reads no ref that the selector does not
+    /// select. It reads each commit one time, also when more than one ref
+    /// names it. An empty selector, and a selector of negative patterns
+    /// alone, read each directory of the refs that it can select. A name
+    /// that the ref-name rule refuses is in the walk, and a wildcard selects
+    /// it.
     ///
     /// # Global metadata
     ///
@@ -751,18 +827,21 @@ impl Repo {
     ///
     /// 1. `ostree.summary.mode`, the mode of the repository.
     /// 2. `ostree.static-deltas`, if the index files advertise a delta.
-    /// 3. `ostree.summary.collection-id`, if `[core] collection-id` is set.
+    /// 3. `ostree.summary.collection-map`, if the listing holds a collection
+    ///    ref.
+    /// 4. `ostree.summary.collection-id`, if `[core] collection-id` is set.
     ///
-    /// The values have the encoding of the same keys in a summary. The dict
-    /// holds no `ostree.summary.last-modified` and no
-    /// `ostree.summary.collection-map`.
+    /// This is the order of the same keys in a summary. The values have the
+    /// encoding of the same keys in a summary. The dict holds no
+    /// `ostree.summary.last-modified`.
     ///
     /// The deltas come from the index files under `delta-indexes/` alone,
     /// which [`reindex_static_deltas`](Repo::reindex_static_deltas) writes.
-    /// The call reads the index file of each listed commit. Then it reads the
-    /// index file of each source commit that an index file names, until it
-    /// finds no new commit. A commit with no index file adds no delta. The map
-    /// is sorted by delta name.
+    /// The call reads the index file of the commit of each listed ref, a
+    /// collection ref included. Then it reads the index file of each source
+    /// commit that an index file names, until it finds no new commit. A
+    /// commit with no index file adds no delta. The map is sorted by delta
+    /// name.
     ///
     /// # Size
     ///
@@ -772,16 +851,21 @@ impl Repo {
     /// size of the listing with the cap, so a listing that fits passes each
     /// check. The call refuses the listing at the first check that fails:
     ///
-    /// 1. After the read of the refs: the size of each entry, from the length
-    ///    of the ref name. No commit and no index file is read before this
-    ///    check.
+    /// 1. During and after the read of the refs: the size of each entry, from
+    ///    the length of the ref name, and the size of the collection map,
+    ///    from the length of each collection id. The call checks the sum
+    ///    after each ref that it selects, and reads no more ref file when the
+    ///    sum passes the cap. No commit and no index file is read before
+    ///    this check.
     /// 2. After the delta walk: the same sum and the size of the delta map,
     ///    from the number of deltas.
-    /// 3. After the serialization of the global metadata: the same sum and
-    ///    the length of the metadata. No commit is read before this check.
+    /// 3. After the serialization of the global metadata other than the
+    ///    collection map: the same sum and the length of the metadata. No
+    ///    commit is read before this check.
     /// 4. During the read of the commits: the same sum and, for each ref, the
     ///    size of the version of its commit.
-    /// 5. During the write of the entries: the length of the listing.
+    /// 5. During the write of the entries and of the collection map: the
+    ///    length of the listing.
     ///
     /// # Errors
     ///
@@ -799,17 +883,18 @@ impl Repo {
     ///   a directory.
     ///
     /// A failure of one selected ref or of one index file fails the whole
-    /// listing. The call does not read a ref that the selector does not
+    /// listing. The call does not read a ref that the selectors do not
     /// select or that `access` does not read.
     ///
     /// `ostrya-server` exports no handler of the listing. A host with a router
     /// of its own calls this method in its own handler.
     pub async fn build_ref_listing(
         &self,
-        selector: &RefSelector,
+        refs: &RefSelector,
+        collections: Option<&RefSelector>,
         access: &ReadAccess,
-    ) -> Result<Vec<u8>> {
-        self.build_ref_listing_capped(selector, access, MAX_REF_LISTING)
+    ) -> Result<RefListing> {
+        self.build_ref_listing_capped(refs, collections, access, MAX_REF_LISTING)
             .await
     }
 
@@ -817,52 +902,72 @@ impl Repo {
     /// with a size cap of `cap` bytes. A listing of exactly `cap` bytes fits.
     pub(crate) async fn build_ref_listing_capped(
         &self,
-        selector: &RefSelector,
+        refs: &RefSelector,
+        collections: Option<&RefSelector>,
         access: &ReadAccess,
         cap: u64,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<RefListing> {
         // The refs come sorted byte-wise by name, each one time, which is the
         // order of `build_summary`.
-        let refs = self.list_refs_selected(selector, access).await?;
+        let RefSelection {
+            local,
+            collections,
+            invalid_dirs,
+        } = self
+            .select_refs(refs, collections, access, Some(cap))
+            .await?;
 
         // Each entry is at least its name and the fixed fields. If the sum of
-        // these sizes is over the cap, the listing is too.
-        let mut floor: u64 = refs
+        // these sizes is over the cap, the listing is too. The selection
+        // checks the same sum while it reads the refs.
+        let mut floor: u64 = local
             .iter()
             .map(|(name, _)| name.len() as u64 + REF_ENTRY_FLOOR)
-            .sum();
+            .sum::<u64>()
+            + collection_map_floor(&collections);
         check_floor(floor, cap)?;
 
-        // The global metadata comes before the commit reads, so its length
-        // is in the floor before a commit is in memory.
+        // The global metadata other than the map comes before the commit
+        // reads, so its length is in the floor before a commit is in memory.
+        let commits = local.iter().chain(collections.values().flatten());
         let deltas = self
-            .walk_delta_indexes(refs.iter().map(|(_, commit)| *commit))
+            .walk_delta_indexes(commits.map(|(_, commit)| *commit))
             .await?;
         check_floor(floor + deltas.len() as u64 * DELTA_ENTRY_FLOOR, cap)?;
-        let mut dict = Value::Array(Vec::new());
-        append_dict_entry(
-            &mut dict,
+        let mut head = vec![dict_entry(
             MODE_KEY,
             variant("s", Value::Str(self.mode().as_mode_str().to_owned()))?,
-        )?;
+        )?];
         if !deltas.is_empty() {
-            append_dict_entry(&mut dict, STATIC_DELTAS_KEY, advertised_delta_map(&deltas)?)?;
+            head.push(dict_entry(
+                STATIC_DELTAS_KEY,
+                advertised_delta_map(&deltas)?,
+            )?);
         }
         drop(deltas);
+        let mut tail = Vec::new();
         if let Some(cid) = self.config().collection_id() {
-            append_dict_entry(
-                &mut dict,
+            tail.push(dict_entry(
                 COLLECTION_ID_KEY,
                 variant("s", Value::Str(cid.to_owned()))?,
-            )?;
+            )?);
         }
-        let metadata = serialize_signature_dict(&dict)?;
-        drop(dict);
-        floor += metadata.len() as u64;
+        floor += dict_len(head.iter().chain(&tail)) as u64;
         check_floor(floor, cap)?;
 
         let repo = self.clone();
-        ostrya_rt::unblock(move || write_ref_listing(&repo, &refs, &metadata, floor, cap)).await
+        let parts = ListingParts {
+            local,
+            collections,
+            head,
+            tail,
+        };
+        let bytes =
+            ostrya_rt::unblock(move || write_ref_listing(&repo, &parts, floor, cap)).await?;
+        Ok(RefListing {
+            bytes,
+            invalid_collection_dirs: invalid_dirs,
+        })
     }
 
     /// Returns the bytes of `summary`, or `None` if the file does not exist.
@@ -1242,28 +1347,59 @@ fn read_commit_facts(repo: &Repo, commit: &Checksum) -> Result<CommitFacts> {
     })
 }
 
-/// Writes the ref listing of `refs`, with the serialized global metadata
-/// `metadata`, on the calling thread.
+/// Returns the fewest bytes that the `ostree.commit.version` entry with the
+/// value `version` adds to a ref entry: the key and its NUL, the variant of
+/// type `s` (the value, its NUL, a zero byte, and the type `s`), the framing
+/// offset of the entry, and the framing offset of the dict array.
+fn version_floor(version: &str) -> u64 {
+    (COMMIT_VERSION_KEY.len() + 1 + version.len() + 3 + 2) as u64
+}
+
+/// Fails with the cap error if `floor`, a lower bound of the size of a ref
+/// listing, is over `cap`.
+fn check_floor(floor: u64, cap: u64) -> Result<()> {
+    if floor > cap {
+        return Err(listing_too_large(cap));
+    }
+    Ok(())
+}
+
+/// The parts of a ref listing that [`write_ref_listing`] writes.
+struct ListingParts {
+    /// The refs of field 0, sorted byte-wise by name.
+    local: Vec<(String, Checksum)>,
+    /// The refs of `ostree.summary.collection-map`, by collection id.
+    collections: BTreeMap<String, Vec<(String, Checksum)>>,
+    /// The serialized `{sv}` entries of the global metadata before the map.
+    head: Vec<Vec<u8>>,
+    /// The serialized `{sv}` entries of the global metadata after the map.
+    tail: Vec<Vec<u8>>,
+}
+
+/// Writes the ref listing of `parts` on the calling thread.
 ///
 /// `floor` is a lower bound of the size of the listing from the names of
-/// `refs` and from `metadata`. The call reads each distinct commit one time.
-/// It adds the size of the version of each commit to the floor, one time for
+/// the refs, from the collection ids, and from the metadata entries. The
+/// call reads each distinct commit of field 0 and of the map one time. It
+/// adds the size of the version of each commit to the floor, one time for
 /// each ref that names the commit, and refuses the listing when the floor
-/// passes `cap`. Then it writes the entries one at a time.
+/// passes `cap`. Then it writes the entries of field 0, the metadata
+/// entries, and the map, one entry at a time.
 fn write_ref_listing(
     repo: &Repo,
-    refs: &[(String, Checksum)],
-    metadata: &[u8],
+    parts: &ListingParts,
     mut floor: u64,
     cap: u64,
 ) -> Result<Vec<u8>> {
-    // `slots[i]` is the index in `commits` of the commit of `refs[i]`. Each
-    // item of `commits` is a distinct commit and the number of refs that
-    // name it.
+    // `slots[i]` is the index in `commits` of the commit of ref `i`, field 0
+    // first and then the map in its order. Each item of `commits` is a
+    // distinct commit and the number of refs that name it.
     let mut index: HashMap<Checksum, usize> = HashMap::new();
     let mut commits: Vec<(Checksum, u64)> = Vec::new();
-    let slots: Vec<usize> = refs
+    let slots: Vec<usize> = parts
+        .local
         .iter()
+        .chain(parts.collections.values().flatten())
         .map(|(_, commit)| match index.entry(*commit) {
             Entry::Occupied(slot) => {
                 commits[*slot.get()].1 += 1;
@@ -1289,9 +1425,9 @@ fn write_ref_listing(
     drop(commits);
 
     let entry_ty = Type::parse(REF_ENTRY_SIGNATURE).map_err(ostrya_core::Error::from)?;
-    let mut listing = ListingWriter::new(cap, floor, refs.len());
-    for ((name, commit), slot) in refs.iter().zip(slots) {
-        let fact = &facts[slot];
+    let mut slots = slots.into_iter();
+    let mut entry = |name: &str, commit: &Checksum| -> Result<Vec<u8>> {
+        let fact = &facts[slots.next().expect("one slot for each ref")];
         let entry = ref_entry(
             name,
             fact.size,
@@ -1299,27 +1435,146 @@ fn write_ref_listing(
             fact.version.as_deref(),
             fact.timestamp,
         )?;
-        listing.push_entry(&to_bytes(&entry_ty, &entry).map_err(ostrya_core::Error::from)?)?;
+        Ok(to_bytes(&entry_ty, &entry).map_err(ostrya_core::Error::from)?)
+    };
+    let mut listing = ListingWriter::new(cap, floor, parts.local.len());
+    for (name, commit) in &parts.local {
+        listing.push_entry(&entry(name, commit)?)?;
     }
-    drop(facts);
-    listing.finish(metadata)
+    listing.start_metadata()?;
+    for bytes in &parts.head {
+        listing.push_entry(bytes)?;
+    }
+    if !parts.collections.is_empty() {
+        listing.start_map(COLLECTION_MAP_KEY)?;
+        for (id, refs) in &parts.collections {
+            listing.start_collection(id, refs.len())?;
+            for (name, commit) in refs {
+                listing.push_entry(&entry(name, commit)?)?;
+            }
+            listing.end_collection()?;
+        }
+        listing.end_map(COLLECTION_MAP_SIGNATURE)?;
+    }
+    for bytes in &parts.tail {
+        listing.push_entry(bytes)?;
+    }
+    listing.finish()
 }
 
-/// Returns the fewest bytes that the `ostree.commit.version` entry with the
-/// value `version` adds to a ref entry: the key and its NUL, the variant of
-/// type `s` (the value, its NUL, a zero byte, and the type `s`), the framing
-/// offset of the entry, and the framing offset of the dict array.
-fn version_floor(version: &str) -> u64 {
-    (COMMIT_VERSION_KEY.len() + 1 + version.len() + 3 + 2) as u64
+/// Returns a lower bound of the bytes that `ostree.summary.collection-map`
+/// of `collections` adds to a ref listing, or 0 for no collection.
+///
+/// The count is the key of the entry and its NUL, the zero byte and the type
+/// of the variant, and for each collection the id, its NUL, and the framing
+/// offset of the end of the id. Each ref adds the floor of a ref entry,
+/// [`REF_ENTRY_FLOOR`] and the name. The padding and the framing offsets of
+/// the arrays are not in the count.
+fn collection_map_floor(collections: &BTreeMap<String, Vec<(String, Checksum)>>) -> u64 {
+    if collections.is_empty() {
+        return 0;
+    }
+    let each: u64 = collections
+        .iter()
+        .map(|(id, refs)| {
+            let names: u64 = refs
+                .iter()
+                .map(|(name, _)| name.len() as u64 + REF_ENTRY_FLOOR)
+                .sum();
+            id.len() as u64 + 2 + names
+        })
+        .sum();
+    COLLECTION_MAP_FIXED_FLOOR + each
 }
 
-/// Fails with the cap error if `floor`, a lower bound of the size of a ref
-/// listing, is over `cap`.
-fn check_floor(floor: u64, cap: u64) -> Result<()> {
-    if floor > cap {
-        return Err(listing_too_large(cap));
+/// The fewest bytes of `ostree.summary.collection-map` other than its
+/// collections: the key of the entry and its NUL, and the zero byte and the
+/// type of the variant.
+const COLLECTION_MAP_FIXED_FLOOR: u64 =
+    (COLLECTION_MAP_KEY.len() + 1 + 1 + COLLECTION_MAP_SIGNATURE.len()) as u64;
+
+/// The lower bound of the size of a ref listing that
+/// [`Repo::select_refs`] keeps while it reads the refs.
+///
+/// The bound grows to the sum of the first size check of
+/// [`build_ref_listing`](Repo::build_ref_listing): each ref adds
+/// [`REF_ENTRY_FLOOR`] and its name, and the collection map adds the count of
+/// [`collection_map_floor`]. The bound never passes that sum.
+pub(crate) struct SelectionFloor {
+    /// The bound so far.
+    floor: u64,
+    /// The cap of the listing, or `None` for no cap.
+    cap: Option<u64>,
+    /// `true` once the bound holds a collection of the map.
+    map: bool,
+}
+
+impl SelectionFloor {
+    /// Returns the bound of no ref, for a listing with the cap `cap`.
+    pub(crate) fn new(cap: Option<u64>) -> SelectionFloor {
+        SelectionFloor {
+            floor: 0,
+            cap,
+            map: false,
+        }
     }
-    Ok(())
+
+    /// Adds a ref entry with the name `name`.
+    ///
+    /// # Errors
+    ///
+    /// The cap error of the listing if the bound passes the cap.
+    pub(crate) fn add_ref(&mut self, name: &str) -> Result<()> {
+        self.add(name.len() as u64 + REF_ENTRY_FLOOR)
+    }
+
+    /// Adds the collection `id` of the map, before its first ref. The first
+    /// collection also adds the fixed part of the map.
+    ///
+    /// # Errors
+    ///
+    /// The cap error of the listing if the bound passes the cap.
+    pub(crate) fn add_collection(&mut self, id: &str) -> Result<()> {
+        let fixed = if self.map {
+            0
+        } else {
+            COLLECTION_MAP_FIXED_FLOOR
+        };
+        self.map = true;
+        self.add(fixed + id.len() as u64 + 2)
+    }
+
+    /// Adds `bytes` to the bound and checks it against the cap.
+    fn add(&mut self, bytes: u64) -> Result<()> {
+        self.floor += bytes;
+        match self.cap {
+            Some(cap) => check_floor(self.floor, cap),
+            None => Ok(()),
+        }
+    }
+}
+
+/// Returns the serialized `{sv}` entry of `key` and `value`, a variant.
+fn dict_entry(key: &str, value: Value) -> Result<Vec<u8>> {
+    let ty = Type::parse(DICT_ENTRY_SIGNATURE).map_err(ostrya_core::Error::from)?;
+    let entry = Value::Tuple(vec![Value::Str(key.to_owned()), value]);
+    Ok(to_bytes(&ty, &entry).map_err(ostrya_core::Error::from)?)
+}
+
+/// Returns the length of the `a{sv}` dict of the serialized entries
+/// `entries`: each entry at a multiple of 8 bytes, then the framing offset of
+/// the end of each entry.
+fn dict_len<'a>(entries: impl Iterator<Item = &'a Vec<u8>>) -> usize {
+    let mut len: usize = 0;
+    let mut count = 0;
+    for entry in entries {
+        len = len.next_multiple_of(LISTING_ALIGNMENT) + entry.len();
+        count += 1;
+    }
+    if count == 0 {
+        return 0;
+    }
+    len + count * choose_offset_size(len, count)
 }
 
 /// Builds one entry `(s, (t, ay, a{sv}))` of the ref list.
@@ -1359,27 +1614,50 @@ fn ref_entry(
     Ok(Value::Tuple(vec![Value::Str(name.to_owned()), inner]))
 }
 
-/// The writer of a ref listing, a `(a(s(taya{sv}))a{sv})` GVariant, one ref
+/// The writer of a ref listing, a `(a(s(taya{sv}))a{sv})` GVariant, one
 /// entry at a time.
 ///
 /// The writer gives the bytes that `to_bytes` gives for the whole value. It
-/// checks the length against the cap before each append, so a listing over
-/// the cap fails before it is whole in memory.
+/// writes the ref entries of field 0, then the entries of the metadata dict.
+/// The map of `ostree.summary.collection-map` goes into the dict one
+/// collection and one ref entry at a time. The writer checks the length
+/// against the cap before each append, so a listing over the cap fails
+/// before it is whole in memory.
+///
+/// Each container of the listing has an alignment of 8: the outer tuple, the
+/// ref arrays, the dict, a dict entry, the map, and an entry of the map. So
+/// a value at an aligned position of the buffer has the bytes of the value
+/// alone.
 struct ListingWriter {
     out: Vec<u8>,
-    /// The end of each entry, counted from the start of the ref array.
-    ends: Vec<usize>,
+    /// The containers that are open, the outer tuple first.
+    open: Vec<Container>,
     cap: u64,
 }
 
+/// One open container of a listing: a tuple, an array, or a dict entry.
+struct Container {
+    /// The position of the container in the buffer.
+    start: usize,
+    /// The framing offsets of the container, counted from its start: the end
+    /// of each member of an array, and the end of each member of a tuple or
+    /// a dict entry other than the last member.
+    ends: Vec<usize>,
+}
+
 impl ListingWriter {
-    /// Returns a writer of a listing of `entries` ref entries, with a size cap
-    /// of `cap` bytes. The buffer starts with a capacity of `floor` bytes, a
-    /// lower bound of the size of the listing, and no more than the cap.
+    /// Returns a writer of a listing of `entries` ref entries in field 0,
+    /// with a size cap of `cap` bytes. The buffer starts with a capacity of
+    /// `floor` bytes, a lower bound of the size of the listing, and no more
+    /// than the cap. The outer tuple and the ref array of field 0 are open.
     fn new(cap: u64, floor: u64, entries: usize) -> ListingWriter {
+        let container = |members| Container {
+            start: 0,
+            ends: Vec::with_capacity(members),
+        };
         ListingWriter {
             out: Vec::with_capacity(usize::try_from(floor.min(cap)).unwrap_or(usize::MAX)),
-            ends: Vec::with_capacity(entries),
+            open: vec![container(1), container(entries)],
             cap,
         }
     }
@@ -1400,47 +1678,121 @@ impl ListingWriter {
         Ok(())
     }
 
-    /// Appends zero bytes up to the alignment of an entry and of the
-    /// metadata dict, then `bytes`.
-    fn append_aligned(&mut self, bytes: &[u8]) -> Result<()> {
-        let aligned = self.out.len().next_multiple_of(LISTING_ALIGNMENT);
-        self.make_room(aligned - self.out.len() + bytes.len())?;
-        self.out.resize(aligned, 0);
+    /// Appends `bytes` with no padding.
+    fn append(&mut self, bytes: &[u8]) -> Result<()> {
+        self.make_room(bytes.len())?;
         self.out.extend_from_slice(bytes);
         Ok(())
     }
 
-    /// Appends the serialized ref entry `entry` to the ref array.
+    /// Appends zero bytes up to the alignment of each container.
+    fn align(&mut self) -> Result<()> {
+        let aligned = self.out.len().next_multiple_of(LISTING_ALIGNMENT);
+        self.make_room(aligned - self.out.len())?;
+        self.out.resize(aligned, 0);
+        Ok(())
+    }
+
+    /// Records the end of the buffer as a framing offset of the innermost
+    /// open container.
+    fn mark(&mut self) {
+        let container = self.open.last_mut().expect("a container is open");
+        container.ends.push(self.out.len() - container.start);
+    }
+
+    /// Opens a container of `members` framing offsets at the next aligned
+    /// position.
+    fn open(&mut self, members: usize) -> Result<()> {
+        self.align()?;
+        self.open.push(Container {
+            start: self.out.len(),
+            ends: Vec::with_capacity(members),
+        });
+        Ok(())
+    }
+
+    /// Closes the innermost open container: it appends the framing offsets
+    /// of the container, in order. An empty array has no offset.
+    fn close(&mut self) -> Result<()> {
+        let container = self.open.pop().expect("a container is open");
+        if !container.ends.is_empty() {
+            let len = self.out.len() - container.start;
+            let width = choose_offset_size(len, container.ends.len());
+            self.make_room(container.ends.len() * width)?;
+            for end in container.ends {
+                write_offset(&mut self.out, end, width);
+            }
+        }
+        Ok(())
+    }
+
+    /// Appends the serialized entry `entry` to the innermost open array: the
+    /// ref array of field 0, the metadata dict, or the ref array of a
+    /// collection.
     ///
     /// An entry has an alignment of 8, so its bytes at an aligned position
     /// equal its bytes alone.
     fn push_entry(&mut self, entry: &[u8]) -> Result<()> {
-        self.append_aligned(entry)?;
-        self.ends.push(self.out.len());
+        self.align()?;
+        self.append(entry)?;
+        self.mark();
         Ok(())
     }
 
-    /// Closes the ref array, appends the serialized metadata dict `metadata`,
-    /// and returns the listing. The function gives the unused capacity of the
-    /// buffer back to the allocator.
-    ///
-    /// The ref array starts at offset 0. Its framing offsets follow its
-    /// entries, in entry order. An empty array has no offsets. The tuple then
-    /// holds the dict, aligned to 8, and one framing offset: the end of the
-    /// array.
-    fn finish(mut self, metadata: &[u8]) -> Result<Vec<u8>> {
-        if !self.ends.is_empty() {
-            let width = choose_offset_size(self.out.len(), self.ends.len());
-            self.make_room(self.ends.len() * width)?;
-            for &end in &self.ends {
-                write_offset(&mut self.out, end, width);
-            }
-        }
-        let array_end = self.out.len();
-        self.append_aligned(metadata)?;
-        let width = choose_offset_size(self.out.len(), 1);
-        self.make_room(width)?;
-        write_offset(&mut self.out, array_end, width);
+    /// Closes the ref array of field 0, and opens the metadata dict.
+    fn start_metadata(&mut self) -> Result<()> {
+        self.close()?;
+        // The tuple holds the end of field 0 as its one framing offset.
+        self.mark();
+        self.open(0)
+    }
+
+    /// Opens the dict entry `key` of the map, and the map in its variant.
+    fn start_map(&mut self, key: &str) -> Result<()> {
+        self.open(1)?;
+        self.append(key.as_bytes())?;
+        self.append(&[0])?;
+        self.mark();
+        // The child of a variant starts at the start of the variant.
+        self.open(0)
+    }
+
+    /// Opens the entry of the collection `id` in the map, and its ref array
+    /// of `refs` entries.
+    fn start_collection(&mut self, id: &str, refs: usize) -> Result<()> {
+        self.open(1)?;
+        self.append(id.as_bytes())?;
+        self.append(&[0])?;
+        self.mark();
+        self.open(refs)
+    }
+
+    /// Closes the ref array and the entry of a collection.
+    fn end_collection(&mut self) -> Result<()> {
+        self.close()?;
+        self.close()?;
+        self.mark();
+        Ok(())
+    }
+
+    /// Closes the map, ends its variant with the type `signature`, and
+    /// closes the dict entry of the map.
+    fn end_map(&mut self, signature: &str) -> Result<()> {
+        self.close()?;
+        self.append(&[0])?;
+        self.append(signature.as_bytes())?;
+        self.close()?;
+        self.mark();
+        Ok(())
+    }
+
+    /// Closes the metadata dict and the outer tuple, and returns the listing.
+    /// The function gives the unused capacity of the buffer back to the
+    /// allocator.
+    fn finish(mut self) -> Result<Vec<u8>> {
+        self.close()?;
+        self.close()?;
+        debug_assert!(self.open.is_empty(), "each container is closed");
         self.out.shrink_to_fit();
         Ok(self.out)
     }
@@ -1613,16 +1965,17 @@ pub(crate) fn put_root_file_blocking(
     })
 }
 
-/// `SummaryOptions`, the parsed summary, and its deltas move across tasks and
-/// threads, and so does the future of a ref listing.
+/// `SummaryOptions`, the parsed summary, its deltas, and a ref listing move
+/// across tasks and threads, and so does the future of a ref listing.
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<SummaryOptions>();
     assert_send_sync::<Summary>();
     assert_send_sync::<AdvertisedDelta>();
+    assert_send_sync::<RefListing>();
     fn assert_send<T: Send>(_: &T) {}
     let _ = |repo: &Repo, selector: &RefSelector, access: &ReadAccess| {
-        assert_send(&repo.build_ref_listing(selector, access))
+        assert_send(&repo.build_ref_listing(selector, Some(selector), access))
     };
 };
 
@@ -1908,17 +2261,71 @@ mod tests {
     /// and with `to_bytes` of the whole value, checks that the two agree, and
     /// returns the bytes.
     fn listing_both_ways(entries: Vec<Value>, metadata: Value) -> Vec<u8> {
+        let Value::Array(head) = metadata else {
+            panic!("the metadata is a dict");
+        };
+        listing_with_map(entries, head, Vec::new(), Vec::new())
+    }
+
+    /// Writes a listing of `entries` with [`ListingWriter`] and with
+    /// `to_bytes` of the whole value, checks that the two agree, and returns
+    /// the bytes.
+    ///
+    /// The metadata dict holds the entries `head`, then the collection map
+    /// of `map` if it is not empty, then the entries `tail`.
+    fn listing_with_map(
+        entries: Vec<Value>,
+        head: Vec<Value>,
+        map: Vec<(String, Vec<Value>)>,
+        tail: Vec<Value>,
+    ) -> Vec<u8> {
         let entry_ty = Type::parse(REF_ENTRY_SIGNATURE).unwrap();
+        let dict_ty = Type::parse(DICT_ENTRY_SIGNATURE).unwrap();
         let mut writer = ListingWriter::new(u64::MAX, 0, entries.len());
         for entry in &entries {
             writer
                 .push_entry(&to_bytes(&entry_ty, entry).unwrap())
                 .unwrap();
         }
-        let streamed = writer
-            .finish(&serialize_signature_dict(&metadata).unwrap())
-            .unwrap();
-        let whole = Value::Tuple(vec![Value::Array(entries), metadata]);
+        writer.start_metadata().unwrap();
+        for entry in &head {
+            writer
+                .push_entry(&to_bytes(&dict_ty, entry).unwrap())
+                .unwrap();
+        }
+        if !map.is_empty() {
+            writer.start_map(COLLECTION_MAP_KEY).unwrap();
+            for (id, refs) in &map {
+                writer.start_collection(id, refs.len()).unwrap();
+                for entry in refs {
+                    writer
+                        .push_entry(&to_bytes(&entry_ty, entry).unwrap())
+                        .unwrap();
+                }
+                writer.end_collection().unwrap();
+            }
+            writer.end_map(COLLECTION_MAP_SIGNATURE).unwrap();
+        }
+        for entry in &tail {
+            writer
+                .push_entry(&to_bytes(&dict_ty, entry).unwrap())
+                .unwrap();
+        }
+        let streamed = writer.finish().unwrap();
+
+        let mut metadata = head;
+        if !map.is_empty() {
+            let collections = map
+                .into_iter()
+                .map(|(id, refs)| Value::Tuple(vec![Value::Str(id), Value::Array(refs)]))
+                .collect();
+            metadata.push(Value::Tuple(vec![
+                Value::Str(COLLECTION_MAP_KEY.to_owned()),
+                variant(COLLECTION_MAP_SIGNATURE, Value::Array(collections)).unwrap(),
+            ]));
+        }
+        metadata.extend(tail);
+        let whole = Value::Tuple(vec![Value::Array(entries), Value::Array(metadata)]);
         let ty = Type::parse(SUMMARY_SIGNATURE).unwrap();
         assert_eq!(streamed, to_bytes(&ty, &whole).unwrap());
         streamed
@@ -1967,16 +2374,19 @@ mod tests {
 
     /// Returns a ref entry of `size` bytes.
     fn entry_of_size(size: usize) -> Value {
-        value_of_size(REF_ENTRY_SIGNATURE, size, |n| {
+        value_of_size(REF_ENTRY_SIGNATURE, size, entry_ending_in)
+    }
+
+    /// Returns a ref entry whose metadata dict ends in a string of `n` bytes.
+    fn entry_ending_in(n: usize) -> Value {
+        Value::Tuple(vec![
+            Value::Str("r".into()),
             Value::Tuple(vec![
-                Value::Str("r".into()),
-                Value::Tuple(vec![
-                    Value::U64(0),
-                    Value::Bytes(vec![0; 32]),
-                    dict_ending_in(n),
-                ]),
-            ])
-        })
+                Value::U64(0),
+                Value::Bytes(vec![0; 32]),
+                dict_ending_in(n),
+            ]),
+        ])
     }
 
     /// Returns the end of the ref array of `listing`: the framing offset at
@@ -2068,6 +2478,135 @@ mod tests {
         let listing = listing_both_ways(entries_of(1000, 40), Value::Array(Vec::new()));
         let spare = listing.capacity() - listing.len();
         assert!(spare < listing.len() / 8, "{spare} of {}", listing.len());
+    }
+
+    /// Returns the `{sv}` entry `key` of the metadata dict with a string of
+    /// `len` bytes.
+    fn string_entry(key: &str, len: usize) -> Value {
+        Value::Tuple(vec![
+            Value::Str(key.to_owned()),
+            variant("s", Value::Str("c".repeat(len))).unwrap(),
+        ])
+    }
+
+    /// The listing writer gives the bytes of `to_bytes` with a collection
+    /// map, with metadata entries before and after the map, and for framing
+    /// offsets of 1, 2, and 4 bytes in each container of the map: the ref
+    /// array of a collection, the entry of a collection, the map, the dict
+    /// entry of the map, and the dict.
+    #[test]
+    fn the_listing_writer_frames_a_collection_map_as_to_bytes_does() {
+        let mode = || string_entry(MODE_KEY, 10);
+        let id = || string_entry(COLLECTION_ID_KEY, 8);
+        let cases = [
+            (entries_of(0, 4), vec![("a.b".to_owned(), entries_of(1, 4))]),
+            (
+                entries_of(2, 4),
+                vec![
+                    ("a.b".to_owned(), entries_of(3, 5)),
+                    ("c.d".to_owned(), entries_of(1, 1)),
+                    ("e".repeat(200), entries_of(2, 3)),
+                ],
+            ),
+            (
+                entries_of(1, 4),
+                vec![("a.b".to_owned(), entries_of(8, 40))],
+            ),
+            (
+                entries_of(1, 4),
+                vec![
+                    ("a.b".to_owned(), entries_of(2, 30_000)),
+                    ("c.d".to_owned(), entries_of(1, 30_000)),
+                ],
+            ),
+        ];
+        for (entries, map) in cases {
+            listing_with_map(entries.clone(), vec![mode()], map.clone(), vec![id()]);
+            listing_with_map(entries.clone(), Vec::new(), map.clone(), Vec::new());
+            listing_with_map(
+                entries,
+                vec![mode(), string_entry("x", 300)],
+                map,
+                Vec::new(),
+            );
+        }
+
+        // One collection with one ref entry of each size near the boundaries
+        // of 1-byte and 2-byte offsets moves each container of the map across
+        // each boundary.
+        for n in (0..=260).chain(65_250..=65_520) {
+            let map = vec![("a.b".to_owned(), vec![entry_ending_in(n)])];
+            listing_with_map(Vec::new(), vec![mode()], map, vec![id()]);
+        }
+    }
+
+    /// `dict_len` is the length of the serialized dict of its entries.
+    #[test]
+    fn the_dict_length_is_the_length_of_the_serialized_dict() {
+        let dict_ty = Type::parse(DICT_ENTRY_SIGNATURE).unwrap();
+        for lens in [&[][..], &[1], &[1, 7], &[5, 300, 2], &[70_000, 1]] {
+            let entries: Vec<Value> = lens
+                .iter()
+                .enumerate()
+                .map(|(i, len)| string_entry(&format!("k{i}"), *len))
+                .collect();
+            let bytes: Vec<Vec<u8>> = entries
+                .iter()
+                .map(|entry| to_bytes(&dict_ty, entry).unwrap())
+                .collect();
+            let whole = serialize_signature_dict(&Value::Array(entries)).unwrap();
+            assert_eq!(dict_len(bytes.iter()), whole.len(), "{lens:?}");
+        }
+    }
+
+    /// The floor of a collection map, with the floor of the names of field 0
+    /// and the length of the dict without the map, is at most the length of
+    /// the listing.
+    #[test]
+    fn the_collection_map_floor_is_a_lower_bound() {
+        let dict_ty = Type::parse(DICT_ENTRY_SIGNATURE).unwrap();
+        let shapes: [&[(usize, usize, usize)]; 5] = [
+            &[(1, 1, 1)],
+            &[(3, 2, 7), (1, 1, 1)],
+            &[(255, 1, 300)],
+            &[(5, 40, 8), (6, 1, 2), (7, 3, 1)],
+            &[(10, 2, 30_000)],
+        ];
+        for shape in shapes {
+            for (head, tail) in [
+                (vec![string_entry(MODE_KEY, 10)], Vec::new()),
+                (
+                    vec![string_entry(MODE_KEY, 10)],
+                    vec![string_entry(COLLECTION_ID_KEY, 3)],
+                ),
+                (Vec::new(), vec![string_entry(COLLECTION_ID_KEY, 9)]),
+            ] {
+                let mut floor_map = BTreeMap::new();
+                let mut map = Vec::new();
+                for (n, &(id_len, count, name_len)) in shape.iter().enumerate() {
+                    let id = format!("{n}{}", "i".repeat(id_len));
+                    let refs = entries_of(count, name_len);
+                    let names = refs
+                        .iter()
+                        .map(|_| ("n".repeat(name_len), checksum(0)))
+                        .collect();
+                    floor_map.insert(id.clone(), names);
+                    map.push((id, refs));
+                }
+                let entries = entries_of(2, 3);
+                let names = 2 * (3 + REF_ENTRY_FLOOR);
+                let metadata: Vec<Vec<u8>> = head
+                    .iter()
+                    .chain(&tail)
+                    .map(|entry| to_bytes(&dict_ty, entry).unwrap())
+                    .collect();
+                let floor =
+                    names + dict_len(metadata.iter()) as u64 + collection_map_floor(&floor_map);
+                let listing = listing_with_map(entries, head, map, tail);
+                assert!(floor <= listing.len() as u64, "{shape:?}");
+            }
+        }
+        assert_eq!(collection_map_floor(&BTreeMap::new()), 0);
     }
 
     /// The floor of a ref entry is at most the size of each entry, and is the
@@ -2164,7 +2703,7 @@ mod tests {
     }
 
     /// Returns `true` if `outcome` is the cap error.
-    fn is_cap_error(outcome: &Result<Vec<u8>>) -> bool {
+    fn is_cap_error(outcome: &Result<RefListing>) -> bool {
         matches!(
             outcome,
             Err(Error::Remote(crate::remote::Error::LimitExceeded(_)))
@@ -2175,7 +2714,8 @@ mod tests {
     /// the cap, and each lower cap refuses it with the cap error. The listing
     /// has a version in each entry and a delta map, so each floor check is
     /// on the path. The checks of the names and of the metadata come before
-    /// the commit reads.
+    /// the commit reads. With a selector of the collection refs, the listing
+    /// holds a collection map, and the same holds.
     #[test]
     fn a_ref_listing_fits_its_cap_to_the_byte() {
         let dir = std::env::temp_dir().join(format!(
@@ -2187,31 +2727,44 @@ mod tests {
         ostrya_rt::block_on(async {
             let names = ["a/b", "a/c", "z"];
             let repo = repo_with_refs(&dir, &names).await;
-            let full = repo
-                .build_ref_listing(&all_refs(), &anyone())
+            let commit = repo.resolve_ref_tip("z").await.unwrap().unwrap();
+            let mirrors = [("org.a", "x"), ("org.a", "y/z"), ("org.b", "main")];
+            for (id, name) in mirrors {
+                repo.set_collection_ref_immediate(
+                    &crate::CollectionRef::new(id, name),
+                    Some(&commit),
+                )
                 .await
                 .unwrap();
-            let parsed = Summary::parse(&full).unwrap();
-            assert_eq!(parsed.refs.len(), 3);
-            assert_eq!(parsed.static_deltas().unwrap().len(), 1);
-            assert!(
-                parsed.refs[0]
-                    .metadata
-                    .dict_get(COMMIT_VERSION_KEY)
-                    .is_some()
-            );
-            let len = full.len() as u64;
-            let capped = repo
-                .build_ref_listing_capped(&all_refs(), &anyone(), len)
-                .await
-                .unwrap();
-            assert_eq!(capped, full);
-            assert!(capped.capacity() as u64 <= len);
-            for cap in 0..len {
-                let outcome = repo
-                    .build_ref_listing_capped(&all_refs(), &anyone(), cap)
-                    .await;
-                assert!(is_cap_error(&outcome), "cap {cap}: {outcome:?}");
+            }
+            let all = all_refs();
+            let anyone = anyone();
+            for collections in [None, Some(&all)] {
+                let build = |cap| repo.build_ref_listing_capped(&all, collections, &anyone, cap);
+                let full = repo
+                    .build_ref_listing(&all, collections, &anyone)
+                    .await
+                    .unwrap()
+                    .bytes;
+                let parsed = Summary::parse(&full).unwrap();
+                assert_eq!(parsed.refs.len(), 3);
+                assert_eq!(parsed.static_deltas().unwrap().len(), 1);
+                assert!(
+                    parsed.refs[0]
+                        .metadata
+                        .dict_get(COMMIT_VERSION_KEY)
+                        .is_some()
+                );
+                let map = parsed.collection_map().unwrap();
+                assert_eq!(map.len(), if collections.is_some() { 2 } else { 0 });
+                let len = full.len() as u64;
+                let capped = build(len).await.unwrap().bytes;
+                assert_eq!(capped, full);
+                assert!(capped.capacity() as u64 <= len);
+                for cap in 0..len {
+                    let outcome = build(cap).await;
+                    assert!(is_cap_error(&outcome), "cap {cap}: {outcome:?}");
+                }
             }
 
             // With no commit object, a cap below the floor of the names and
@@ -2222,27 +2775,121 @@ mod tests {
                 .iter()
                 .map(|name| name.len() as u64 + REF_ENTRY_FLOOR)
                 .sum();
-            let floor =
-                names_floor + serialize_signature_dict(&parsed.metadata).unwrap().len() as u64;
-            let commit = parsed.refs[0].commit;
+            let mut by_id: BTreeMap<String, Vec<(String, Checksum)>> = BTreeMap::new();
+            for (id, name) in mirrors {
+                by_id
+                    .entry(id.to_owned())
+                    .or_default()
+                    .push((name.to_owned(), commit));
+            }
+            let listing = repo
+                .build_ref_listing(&all, Some(&all), &anyone)
+                .await
+                .unwrap()
+                .bytes;
+            let mut metadata = Summary::parse(&listing).unwrap().metadata;
+            let Value::Array(entries) = &mut metadata else {
+                panic!("the metadata is a dict");
+            };
+            entries.retain(|entry| {
+                entry.as_tuple().and_then(|t| t.first()?.as_str()) != Some(COLLECTION_MAP_KEY)
+            });
+            let metadata = serialize_signature_dict(&metadata).unwrap().len() as u64;
             let path = loose_path(&commit, ObjectType::Commit, repo.mode());
             std::fs::remove_file(dir.join("objects").join(path)).unwrap();
-            for cap in [names_floor - 1, floor - 1] {
-                let outcome = repo
-                    .build_ref_listing_capped(&all_refs(), &anyone(), cap)
-                    .await;
-                assert!(is_cap_error(&outcome), "cap {cap}: {outcome:?}");
-            }
-            for cap in [floor, MAX_REF_LISTING] {
-                let outcome = repo
-                    .build_ref_listing_capped(&all_refs(), &anyone(), cap)
-                    .await;
-                assert!(
-                    matches!(outcome, Err(Error::ObjectNotFound { .. })),
-                    "cap {cap}: {outcome:?}"
-                );
+            for (collections, floor) in [
+                (None, names_floor + metadata),
+                (
+                    Some(&all),
+                    names_floor + collection_map_floor(&by_id) + metadata,
+                ),
+            ] {
+                let build = |cap| repo.build_ref_listing_capped(&all, collections, &anyone, cap);
+                for cap in [names_floor - 1, floor - 1] {
+                    let outcome = build(cap).await;
+                    assert!(is_cap_error(&outcome), "cap {cap}: {outcome:?}");
+                }
+                for cap in [floor, MAX_REF_LISTING] {
+                    let outcome = build(cap).await;
+                    assert!(
+                        matches!(outcome, Err(Error::ObjectNotFound { .. })),
+                        "cap {cap}: {outcome:?}"
+                    );
+                }
             }
         });
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The selection stops with the cap error of the listing at the first ref
+    /// that takes the floor of the names over the cap, so it reads no ref
+    /// file after that ref. With a cap that holds the names, and with no
+    /// cap, the selection reads each selected ref.
+    #[test]
+    fn a_listing_over_its_cap_fails_during_the_selection() {
+        let dir = std::env::temp_dir().join(format!(
+            "ostrya-ref-listing-selection-cap-{}-{}",
+            std::process::id(),
+            crate::write::unique()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        ostrya_rt::block_on(async {
+            let repo = repo_with_refs(&dir, &["z"]).await;
+            // A collection ref with no checksum. The selection reads the
+            // collection refs after the local refs.
+            let bad = dir.join("refs/mirrors/org.a/x");
+            std::fs::create_dir_all(bad.parent().unwrap()).unwrap();
+            std::fs::write(&bad, "no checksum\n").unwrap();
+            let all = all_refs();
+            let anyone = anyone();
+            let cap = "z".len() as u64 + REF_ENTRY_FLOOR - 1;
+            let outcome = repo
+                .build_ref_listing_capped(&all, Some(&all), &anyone, cap)
+                .await;
+            assert!(is_cap_error(&outcome), "{outcome:?}");
+            let error = outcome.err().unwrap().to_string();
+            assert_eq!(error, listing_too_large(cap).to_string());
+            let selected = repo.select_refs(&all, Some(&all), &anyone, Some(cap)).await;
+            let error = selected.err().map(|e| e.to_string());
+            assert_eq!(error, Some(listing_too_large(cap).to_string()));
+
+            let outcome = repo
+                .build_ref_listing_capped(&all, Some(&all), &anyone, MAX_REF_LISTING)
+                .await;
+            assert!(matches!(outcome, Err(Error::Core(_))), "{outcome:?}");
+            let selected = repo.select_refs(&all, Some(&all), &anyone, None).await;
+            assert!(matches!(selected, Err(Error::Core(_))));
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A collection map in a variant of another type than
+    /// `a{sa(s(taya{sv}))}` is refused. An empty array of another type has
+    /// the shape of an empty map, and the type of the variant tells them
+    /// apart.
+    #[test]
+    fn collection_map_checks_the_type_of_its_variant() {
+        let with_map = |ty: &str, map: Value| {
+            let mut metadata = Value::Array(Vec::new());
+            append_dict_entry(&mut metadata, COLLECTION_MAP_KEY, variant(ty, map).unwrap())
+                .unwrap();
+            Summary {
+                refs: Vec::new(),
+                metadata,
+            }
+        };
+        let empty = with_map(COLLECTION_MAP_SIGNATURE, Value::Array(Vec::new()));
+        assert_eq!(empty.collection_map().unwrap(), Vec::new());
+        for (ty, map) in [
+            ("as", Value::Array(Vec::new())),
+            ("a{sv}", Value::Array(Vec::new())),
+            ("s", Value::Str("x".into())),
+        ] {
+            let outcome = with_map(ty, map).collection_map();
+            assert!(
+                matches!(outcome, Err(Error::InvalidFormat(_))),
+                "{ty}: {outcome:?}"
+            );
+        }
     }
 }

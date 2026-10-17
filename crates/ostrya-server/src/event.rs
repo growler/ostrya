@@ -35,6 +35,35 @@ pub enum ServerEvent {
         /// Why the claims do not parse.
         reason: String,
     },
+    /// A ref listing left out a directory under `refs/mirrors/` whose name
+    /// fails the collection-id rule
+    /// ([`ostrya::is_collection_id`]).
+    ///
+    /// The server reports each name one time for each [`Server`](crate::Server)
+    /// value, at the first listing that finds it. Only a listing whose query
+    /// holds a `collection` pair reads the directories under
+    /// `refs/mirrors/`. The listing itself goes on. The server reports the
+    /// event also with no receive policies.
+    #[non_exhaustive]
+    InvalidCollectionDir {
+        /// The name of the directory.
+        name: String,
+    },
+}
+
+impl ServerEvent {
+    /// Returns `true` if the event is a warning: the server served the
+    /// request. Each other event is an error of a request that the server
+    /// refused.
+    ///
+    /// [`InvalidCollectionDir`](ServerEvent::InvalidCollectionDir) is a
+    /// warning, and [`BadClaims`](ServerEvent::BadClaims) is an error.
+    pub fn is_warning(&self) -> bool {
+        match self {
+            ServerEvent::BadClaims { .. } => false,
+            ServerEvent::InvalidCollectionDir { .. } => true,
+        }
+    }
 }
 
 impl fmt::Display for ServerEvent {
@@ -51,6 +80,12 @@ impl fmt::Display for ServerEvent {
                 }
                 write!(f, "{}", Escaped(reason))
             }
+            ServerEvent::InvalidCollectionDir { name } => write!(
+                f,
+                "refs/mirrors/{}: the directory name is not a collection id, and the ref \
+                 listing leaves out the directory",
+                Escaped(name)
+            ),
         }
     }
 }
@@ -107,5 +142,21 @@ mod tests {
                 digest.to_hex()
             )
         );
+        assert!(!event.is_warning());
+    }
+
+    /// The line of an invalid collection directory names its path and
+    /// escapes each control character. The event is a warning.
+    #[test]
+    fn the_line_of_an_invalid_collection_dir_escapes_its_name() {
+        let event = ServerEvent::InvalidCollectionDir {
+            name: "bad\nforged line\t\u{7f}".to_owned(),
+        };
+        assert_eq!(
+            event.to_string(),
+            "refs/mirrors/bad\\nforged line\\t\\u{7f}: the directory name is not a \
+             collection id, and the ref listing leaves out the directory"
+        );
+        assert!(event.is_warning());
     }
 }

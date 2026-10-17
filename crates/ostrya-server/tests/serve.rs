@@ -644,9 +644,10 @@ fn the_ref_listing_is_served() {
         assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
         assert_eq!(
             body,
-            repo.build_ref_listing(&selector(&["a/b/**", "main"]), &anyone(&repo))
+            repo.build_ref_listing(&selector(&["a/b/**", "main"]), None, &anyone(&repo))
                 .await
                 .unwrap()
+                .bytes
         );
         assert_eq!(
             header(&head, "content-length"),
@@ -662,18 +663,20 @@ fn the_ref_listing_is_served() {
         assert_eq!(names, ["a/b/c", "a/b/d", "main"]);
 
         let all = repo
-            .build_ref_listing(&selector(&[]), &anyone(&repo))
+            .build_ref_listing(&selector(&[]), None, &anyone(&repo))
             .await
-            .unwrap();
+            .unwrap()
+            .bytes;
         for query in ["", "?", "#pattern=main"] {
             let (head, body) = get(query).await;
             assert!(head.starts_with("HTTP/1.1 200 "), "{query}: {head}");
             assert_eq!(body, all, "{query}");
         }
         let main = repo
-            .build_ref_listing(&selector(&["main"]), &anyone(&repo))
+            .build_ref_listing(&selector(&["main"]), None, &anyone(&repo))
             .await
-            .unwrap();
+            .unwrap()
+            .bytes;
         for query in [
             "?pattern=main&pattern=main",
             "?pattern=main",
@@ -710,9 +713,10 @@ fn the_ref_listing_is_served() {
             assert!(head.starts_with("HTTP/1.1 200 "), "{query}: {head}");
             assert_eq!(
                 body,
-                repo.build_ref_listing(&selector(entries), &anyone(&repo))
+                repo.build_ref_listing(&selector(entries), None, &anyone(&repo))
                     .await
-                    .unwrap(),
+                    .unwrap()
+                    .bytes,
                 "{query}"
             );
             assert_eq!(listed_names(&body), names, "{query}");
@@ -744,9 +748,10 @@ fn a_failed_listing_gets_500() {
         assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
         assert_eq!(
             body,
-            repo.build_ref_listing(&selector(&["main"]), &anyone(&repo))
+            repo.build_ref_listing(&selector(&["main"]), None, &anyone(&repo))
                 .await
                 .unwrap()
+                .bytes
         );
     });
 }
@@ -903,24 +908,25 @@ fn fetch_refs_over_http_gives_the_built_listing() {
             ];
             for entries in cases {
                 let got = session
-                    .fetch_refs(&selector(entries))
+                    .fetch_refs(&selector(entries), None)
                     .await
                     .unwrap()
                     .unwrap();
                 let want = repo
-                    .build_ref_listing(&selector(entries), &anyone(&repo))
+                    .build_ref_listing(&selector(entries), None, &anyone(&repo))
                     .await
-                    .unwrap();
+                    .unwrap()
+                    .bytes;
                 assert_eq!(got, want, "{scheme}: {entries:?}");
             }
             let got = session
-                .fetch_refs(&selector(&["a/**", "!a/b/*"]))
+                .fetch_refs(&selector(&["a/**", "!a/b/*"]), None)
                 .await
                 .unwrap()
                 .unwrap();
             assert_eq!(listed_names(&got), ["a/bc"], "{scheme}");
             let got = session
-                .fetch_refs(&selector(&ESCAPED_REFS))
+                .fetch_refs(&selector(&ESCAPED_REFS), None)
                 .await
                 .unwrap()
                 .unwrap();
@@ -929,7 +935,7 @@ fn fetch_refs_over_http_gives_the_built_listing() {
             assert_eq!(listed_names(&got), names, "{scheme}");
             for name in ESCAPED_REFS {
                 let got = session
-                    .fetch_refs(&selector(&[name]))
+                    .fetch_refs(&selector(&[name]), None)
                     .await
                     .unwrap()
                     .unwrap();
@@ -987,11 +993,12 @@ fn fetch_refs_takes_a_target_at_the_client_limit() {
             let url = format!("{scheme}://127.0.0.1:{}/", addrs[0].port());
             let session = PullSession::Http(fetcher(url, http2, None).await);
             let entries: Vec<&str> = prefixes.iter().map(String::as_str).collect();
-            let got = session.fetch_refs(&selector(&entries)).await;
+            let got = session.fetch_refs(&selector(&entries), None).await;
             let want = repo
-                .build_ref_listing(&selector(&entries), &anyone(&repo))
+                .build_ref_listing(&selector(&entries), None, &anyone(&repo))
                 .await
-                .unwrap();
+                .unwrap()
+                .bytes;
             assert_eq!(got.unwrap(), Some(want), "{scheme}");
         });
     }
@@ -1027,20 +1034,27 @@ fn fetch_refs_takes_a_mixed_list_up_to_the_limit() {
             let session = PullSession::Http(fetcher(url, http2, None).await);
             let entries = mixed(200);
             let entries: Vec<&str> = entries.iter().map(String::as_str).collect();
-            let got = session.fetch_refs(&selector(&entries)).await;
+            let got = session.fetch_refs(&selector(&entries), None).await;
             let want = repo
-                .build_ref_listing(&selector(&entries), &anyone(&repo))
+                .build_ref_listing(&selector(&entries), None, &anyone(&repo))
                 .await
-                .unwrap();
+                .unwrap()
+                .bytes;
             assert_eq!(got.unwrap(), Some(want), "{scheme}");
             let entries = mixed(257);
             let entries: Vec<&str> = entries.iter().map(String::as_str).collect();
-            let err = session.fetch_refs(&selector(&entries)).await.unwrap_err();
+            let err = session
+                .fetch_refs(&selector(&entries), None)
+                .await
+                .unwrap_err();
             assert!(
                 matches!(err, ostrya::remote::Error::InvalidInput(_)),
                 "{err:?}"
             );
-            let got = session.fetch_refs(&selector(&["main"])).await.unwrap();
+            let got = session
+                .fetch_refs(&selector(&["main"]), None)
+                .await
+                .unwrap();
             assert!(got.is_some(), "{scheme}");
         });
     }
@@ -1059,11 +1073,12 @@ fn fetch_refs_of_a_too_long_part_gets_an_empty_listing() {
         with_server(repo.clone(), opts, |addrs| async move {
             let url = format!("{scheme}://127.0.0.1:{}/", addrs[0].port());
             let session = PullSession::Http(fetcher(url, http2, None).await);
-            let got = session.fetch_refs(&selector(&[long.as_str()])).await;
+            let got = session.fetch_refs(&selector(&[long.as_str()]), None).await;
             let want = repo
-                .build_ref_listing(&selector(&["absent"]), &anyone(&repo))
+                .build_ref_listing(&selector(&["absent"]), None, &anyone(&repo))
                 .await
-                .unwrap();
+                .unwrap()
+                .bytes;
             assert_eq!(got.unwrap(), Some(want), "{scheme}");
         });
     }
@@ -1187,7 +1202,7 @@ fn a_chain_from_the_ref_listing_is_pulled_over_http() {
             let url = format!("{scheme}://127.0.0.1:{}/", addrs[0].port());
             let session = PullSession::Http(fetcher(url, http2, None).await);
             let listing = session
-                .fetch_refs(&selector(&["test/main"]))
+                .fetch_refs(&selector(&["test/main"]), None)
                 .await
                 .unwrap()
                 .unwrap();
@@ -1415,7 +1430,9 @@ fn the_ref_listing_holds_the_readable_refs() {
         &path,
         "[ex-ostrya client \"public\"]\nauth=anonymous\nallow=r:pub/**\n",
     );
-    let want = block_on(repo.build_ref_listing(&selector(&[]), &anyone(&repo))).unwrap();
+    let want = block_on(repo.build_ref_listing(&selector(&[]), None, &anyone(&repo)))
+        .unwrap()
+        .bytes;
     assert_eq!(listed_names(&want), ["pub/a", "pub/to-a"]);
     with_server(repo, with_policies(policies), |addrs| async move {
         let (head, body) = exchange(addrs[0], &ask("GET", "/_ostrya/refs/v1")).await;
@@ -1476,4 +1493,272 @@ fn a_server_with_no_receive_policies_takes_the_own_collection_id_as_read() {
         let response = raw(addr, &ask("GET", "/refs/mirrors/c%5Cd/x")).await;
         assert!(response.starts_with("HTTP/1.1 404 "), "{response}");
     });
+}
+
+/// A list of selector entries.
+type Entries<'a> = &'a [&'a str];
+
+/// Copies `refs/heads/main` of the repository at `path` to the mirror refs
+/// `org.a/x`, `org.a/y/z`, and `org.b/main`, and returns the repository
+/// opened again.
+fn with_mirrors(path: &Path) -> Repo {
+    copy_main(
+        path,
+        &[
+            "refs/mirrors/org.a/x",
+            "refs/mirrors/org.a/y/z",
+            "refs/mirrors/org.b/main",
+        ],
+    );
+    block_on(Repo::open(path)).unwrap()
+}
+
+/// Returns the collection ids of the collection map of `listing`, each with
+/// the names of its refs, in stored order.
+fn collection_names(listing: &[u8]) -> Vec<(String, Vec<String>)> {
+    Summary::parse(listing)
+        .unwrap()
+        .collection_map()
+        .unwrap()
+        .into_iter()
+        .map(|(id, refs)| (id, refs.into_iter().map(|entry| entry.name).collect()))
+        .collect()
+}
+
+/// `PullSession::fetch_refs` with a selector of the collection refs, over
+/// HTTP/1.1 and over HTTP/2, gives the bytes of `build_ref_listing` for the
+/// two selectors. A selector with no entry goes as `collection=**` and gives
+/// each collection ref. With no selector of the collection refs, the bytes
+/// are those of the listing of the local refs alone.
+#[test]
+fn fetch_refs_with_collections_over_http_gives_the_built_listing() {
+    let tmp = TmpDir::new("fetch-refs-collections");
+    let (path, _, _, _) = block_on(repo(tmp.path()));
+    let repo = with_mirrors(&path);
+    for (opts, scheme, http2) in [(local(), "http", false), (tls(false), "https", true)] {
+        let repo = repo.clone();
+        with_server(repo.clone(), opts, |addrs| async move {
+            let url = format!("{scheme}://127.0.0.1:{}/", addrs[0].port());
+            let session = PullSession::Http(fetcher(url, http2, None).await);
+            let cases: [(&[&str], Option<&[&str]>); 6] = [
+                (&[], Some(&[])),
+                (&["main"], Some(&["org.a/**"])),
+                (&["!**"], Some(&["*/main", "!org.b/**", "*/main"])),
+                (&[], Some(&["!org.a/**"])),
+                (&[], Some(&["org.a"])),
+                (&["main"], None),
+            ];
+            for (refs, collections) in cases {
+                let collections = collections.map(selector);
+                let got = session
+                    .fetch_refs(&selector(refs), collections.as_ref())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                let want = repo
+                    .build_ref_listing(&selector(refs), collections.as_ref(), &anyone(&repo))
+                    .await
+                    .unwrap()
+                    .bytes;
+                assert_eq!(got, want, "{scheme}: {refs:?} {collections:?}");
+            }
+            let got = session
+                .fetch_refs(&selector(&[]), Some(&selector(&[])))
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                collection_names(&got),
+                [
+                    ("org.a".to_owned(), vec!["x".to_owned(), "y/z".to_owned()]),
+                    ("org.b".to_owned(), vec!["main".to_owned()]),
+                ],
+                "{scheme}"
+            );
+            let plain = session
+                .fetch_refs(&selector(&[]), None)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(collection_names(&plain).is_empty());
+            assert_eq!(listed_names(&plain), listed_names(&got));
+        });
+    }
+}
+
+/// The query of the ref listing takes `collection` pairs beside `pattern`
+/// pairs. A query with no `collection` pair has the bytes of the listing of
+/// the local refs alone. A bad `collection` entry, a pair with another key,
+/// and more than 256 pairs of the two keys together get 400.
+#[test]
+fn the_ref_listing_reads_collection_pairs() {
+    let tmp = TmpDir::new("listing-collection-pairs");
+    let (path, _, _, _) = block_on(repo(tmp.path()));
+    let repo = with_mirrors(&path);
+    with_server(repo.clone(), local(), |addrs| async move {
+        let addr = addrs[0];
+        let get = |query: String| {
+            let request = ask("GET", &format!("/_ostrya/refs/v1{query}"));
+            async move { exchange(addr, &request).await }
+        };
+        let build = |refs: &[&str], collections: Option<&[&str]>| {
+            let repo = repo.clone();
+            let refs = selector(refs);
+            let collections = collections.map(selector);
+            async move {
+                repo.build_ref_listing(&refs, collections.as_ref(), &anyone(&repo))
+                    .await
+                    .unwrap()
+                    .bytes
+            }
+        };
+        let cases: [(&str, Entries, Option<Entries>); 5] = [
+            ("?collection=org.a%2F%2A%2A", &[], Some(&["org.a/**"])),
+            (
+                "?collection=%2A%2Fmain&pattern=main&collection=%2A%2Fmain",
+                &["main"],
+                Some(&["*/main"]),
+            ),
+            ("?collection=%2A%2A", &[], Some(&[])),
+            ("?pattern=main", &["main"], None),
+            ("", &[], None),
+        ];
+        for (query, refs, collections) in cases {
+            let (head, body) = get(query.to_owned()).await;
+            assert!(head.starts_with("HTTP/1.1 200 "), "{query}: {head}");
+            assert_eq!(body, build(refs, collections).await, "{query}");
+        }
+        let mixed = |count: usize| {
+            (0..count)
+                .map(|n| {
+                    if n % 2 == 0 {
+                        format!("pattern=r{n}")
+                    } else {
+                        format!("collection=org.a%2Fc{n}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("&")
+        };
+        let (head, _) = get(format!("?{}", mixed(256))).await;
+        assert!(head.starts_with("HTTP/1.1 200 "), "{head}");
+        for query in [
+            format!("?{}", mixed(257)),
+            "?collection=a%2F%2Fb".to_owned(),
+            "?collection=%21%21a".to_owned(),
+            "?collection=".to_owned(),
+            "?collections=org.a%2Fx".to_owned(),
+            format!("?collection={}", "a".repeat(4097)),
+        ] {
+            let (head, body) = get(query.clone()).await;
+            assert!(head.starts_with("HTTP/1.1 400 "), "{query}: {head}");
+            assert!(body.is_empty());
+        }
+    });
+}
+
+/// Each collection of a listing takes the group of the token item in the
+/// namespace of the collection: the group of the exact id, else the group
+/// of `collection=*`. The body is the listing that `build_ref_listing`
+/// builds with the rights of the item.
+#[test]
+fn the_collection_refs_follow_the_group_of_the_item() {
+    let tmp = TmpDir::new("listing-collection-rights");
+    let (path, _, _, _) = block_on(repo(tmp.path()));
+    with_mirrors(&path);
+    let a = Checksum::sha256(b"token-a").to_hex();
+    let b = Checksum::sha256(b"token-b").to_hex();
+    let (repo, policies) = with_groups(
+        &path,
+        &format!(
+            "[ex-ostrya client \"a-local\"]\nauth=token-sha256:{a}\nallow=r:main\n\
+             [ex-ostrya client \"a-exact\"]\nauth=token-sha256:{a}\ncollection=org.a\n\
+             allow=r:y/**\n\
+             [ex-ostrya client \"a-any\"]\nauth=token-sha256:{a}\ncollection=*\nallow=r:**\n\
+             [ex-ostrya client \"b-local\"]\nauth=token-sha256:{b}\nallow=r:**\n"
+        ),
+    );
+    let access = |digest: &str| {
+        let access = ClientAccess::from_config(repo.config(), repo.path()).unwrap();
+        let item = AuthItem::parse(&format!("token-sha256:{digest}")).unwrap();
+        ReadAccess::new(Arc::new(access), item, None)
+    };
+    let all = selector(&[]);
+    let want_a = block_on(repo.build_ref_listing(&all, Some(&all), &access(&a)))
+        .unwrap()
+        .bytes;
+    let want_b = block_on(repo.build_ref_listing(&all, Some(&all), &access(&b)))
+        .unwrap()
+        .bytes;
+    assert_eq!(
+        collection_names(&want_a),
+        [
+            ("org.a".to_owned(), vec!["y/z".to_owned()]),
+            ("org.b".to_owned(), vec!["main".to_owned()]),
+        ]
+    );
+    assert!(collection_names(&want_b).is_empty());
+    let mut opts = with_policies(policies);
+    opts.allow_cleartext_credentials = true;
+    with_server(repo, opts, |addrs| async move {
+        for (token, want) in [("token-a", want_a), ("token-b", want_b)] {
+            let request = format!(
+                "GET /_ostrya/refs/v1?collection=%2A%2A HTTP/1.1\r\nhost: x\r\n\
+                 authorization: Bearer {token}\r\nconnection: close\r\n\r\n"
+            );
+            let (head, body) = exchange(addrs[0], &request).await;
+            assert!(head.starts_with("HTTP/1.1 200 "), "{token}: {head}");
+            assert_eq!(body, want, "{token}");
+        }
+    });
+}
+
+/// A directory under `refs/mirrors/` whose name is not a collection id gives
+/// one `InvalidCollectionDir` event over two listings that read it, with and
+/// without receive policies. A listing with no `collection` pair reads no
+/// such directory. Each listing gets 200 and leaves out the directory.
+#[test]
+fn an_invalid_collection_dir_gives_one_event_per_server() {
+    let tmp = TmpDir::new("listing-invalid-dir");
+    let (path, _, _, _) = block_on(repo(tmp.path()));
+    with_mirrors(&path);
+    let bad = path.join("refs/mirrors/bad");
+    std::fs::create_dir_all(&bad).unwrap();
+    std::fs::write(bad.join("x"), "no checksum\n").unwrap();
+    let (repo, policies) = with_groups(
+        &path,
+        "[ex-ostrya client \"all\"]\nauth=anonymous\nallow=r:**\n\
+         [ex-ostrya client \"mirrors\"]\nauth=anonymous\ncollection=*\nallow=r:**\n",
+    );
+    for opts in [local(), with_policies(policies)] {
+        let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = events.clone();
+        let mut opts = opts;
+        opts.on_event = Some(Arc::new(move |event: &ostrya_server::ServerEvent| {
+            sink.lock().unwrap().push(event.clone());
+        }));
+        with_server(repo.clone(), opts, |addrs| async move {
+            for target in [
+                "/_ostrya/refs/v1",
+                "/_ostrya/refs/v1?collection=%2A%2A",
+                "/_ostrya/refs/v1?pattern=main&collection=org.a%2F%2A%2A",
+            ] {
+                let (head, body) = exchange(addrs[0], &ask("GET", target)).await;
+                assert!(head.starts_with("HTTP/1.1 200 "), "{target}: {head}");
+                let ids: Vec<String> = collection_names(&body)
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect();
+                assert!(!ids.contains(&"bad".to_owned()), "{target}");
+            }
+        });
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(
+            matches!(&events[0], ostrya_server::ServerEvent::InvalidCollectionDir { name, .. }
+                if name == "bad"),
+            "{events:?}"
+        );
+        assert!(events[0].is_warning());
+    }
 }

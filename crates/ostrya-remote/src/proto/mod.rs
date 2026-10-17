@@ -41,11 +41,12 @@
 //!
 //! # Ref listing
 //!
-//! [The ref listing] specifies the body of a listing. The entries of a
-//! `ListRefs` are the entries of a [`RefSelector`](ostrya_core::RefSelector),
-//! which parses them. [`MAX_REF_PATTERNS`], [`MAX_REF_ENTRY_PARTS`],
-//! [`MAX_REF_ENTRY_LEN`], and [`MAX_REF_LISTING`] are the limits of a request
-//! and of a listing.
+//! [The ref listing] specifies the body of a listing. A `ListRefs`
+//! ([`ListRefsRequest`]) holds two lists of entries of a
+//! [`RefSelector`](ostrya_core::RefSelector), which parses them: the entries
+//! of the local refs, and the optional entries of the collection refs.
+//! [`MAX_REF_PATTERNS`], [`MAX_REF_ENTRY_PARTS`], [`MAX_REF_ENTRY_LEN`], and
+//! [`MAX_REF_LISTING`] are the limits of a request and of a listing.
 //!
 //! # Codec
 //!
@@ -77,8 +78,8 @@ mod message;
 pub use frame::{FrameReader, FrameWriter, ObjectBody, ObjectRead};
 pub(crate) use frame::{Step, encode_frame};
 pub use message::{
-    CommitRequest, ErrorMessage, GetReply, HaveReply, Hello, HelloReply, Message, ObjectHeader,
-    ObjectsReply, PullHello, PullHelloReply,
+    CommitRequest, ErrorMessage, GetReply, HaveReply, Hello, HelloReply, ListRefsRequest, Message,
+    ObjectHeader, ObjectsReply, PullHello, PullHelloReply,
 };
 
 use ostrya_core::{Checksum, ObjectName, ObjectType};
@@ -144,14 +145,16 @@ pub const MAX_REF_LISTING: u64 = 128 * 1024 * 1024;
 
 /// The most entries in one request of a ref listing: 256.
 ///
-/// Positive and negative entries count together. A server refuses a request
-/// with more entries. It counts an entry that the request holds two times as
-/// two entries. Over HTTP, each `pattern=VALUE` pair of the query is one
-/// entry.
+/// Positive and negative entries count together, and the entries of the
+/// local refs and of the collection refs count together. A server refuses a
+/// request with more entries. It counts an entry that the request holds two
+/// times as two entries. Over HTTP, each `pattern=VALUE` pair and each
+/// `collection=VALUE` pair of the query is one entry.
 ///
 /// Before it counts, a client removes each exact duplicate of an entry of the
-/// same kind. The [ref patterns](crate::session::PullSession#ref-patterns) of
-/// a pull give the client rules.
+/// same kind in the same list. The
+/// [ref patterns](crate::session::PullSession#ref-patterns) of a pull give
+/// the client rules.
 pub const MAX_REF_PATTERNS: usize = 256;
 
 /// The most parts in one entry of a ref listing request: 256.

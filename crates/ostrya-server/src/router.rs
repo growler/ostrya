@@ -2,7 +2,6 @@
 //! a read, and the routing to the receive endpoint and to the ref listing.
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicUsize;
 
 use hyper::body::{Bytes, Incoming};
 use hyper::header::{ALLOW, CONTENT_LENGTH, HeaderValue};
@@ -14,6 +13,7 @@ use crate::auth::{GroupAuth, peer_of};
 use crate::body::{ReceiveBody, ServeBody};
 use crate::endpoint::ReceiveEndpoint;
 use crate::receive_auth::Refusal;
+use crate::refs::Listings;
 use crate::stall::Stall;
 use crate::{receive, refs};
 
@@ -60,8 +60,8 @@ pub(crate) fn refused(refusal: Refusal) -> Response<ServeBody> {
 }
 
 /// Returns the response to one request. The function records a stream body
-/// in `stall`, the deadline of its connection. `listings` is the count of
-/// ref listings in flight in the server.
+/// in `stall`, the deadline of its connection. `listings` holds the ref
+/// listings in flight in the server.
 ///
 /// With a receive endpoint, a request under its raw path prefix with a
 /// method other than `GET` and `HEAD` goes to the endpoint. A `GET` or a
@@ -76,7 +76,7 @@ pub(crate) fn refused(refusal: Refusal) -> Response<ServeBody> {
 pub(crate) async fn handle(
     view: &ArchiveView,
     repo: &Repo,
-    listings: &Arc<AtomicUsize>,
+    listings: &Listings,
     clients: &Clients,
     stall: &Arc<Stall>,
     req: Request<Incoming>,

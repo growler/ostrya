@@ -16,8 +16,9 @@
 //! forwards in the request headers. A host with
 //! its own HTTP router mounts that endpoint as a [`ReceiveEndpoint`] and
 //! authenticates the requests itself. The server also answers `GET /_ostrya/refs/v1` with the bytes of
-//! [`ostrya::Repo::build_ref_listing`] for the ref patterns of its query and
-//! the read rights of its client. The crate builds on Linux alone.
+//! [`ostrya::Repo::build_ref_listing`] for the ref patterns of its query, of
+//! the local refs and of the collection refs, and the read rights of its
+//! client. The crate builds on Linux alone.
 //!
 //! # Entry points
 //!

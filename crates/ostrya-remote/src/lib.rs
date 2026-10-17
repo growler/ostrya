@@ -120,7 +120,7 @@ fn stream_session_futures_are_send(
         StreamSessionOptions::default(),
     ));
     assert_send(&session.get("config", 1));
-    assert_send(&session.list_refs(selector, 1));
+    assert_send(&session.list_refs(selector, Some(selector), 1));
     assert_send(&owned.finish());
 }
 
@@ -143,7 +143,7 @@ fn pull_session_futures_are_send(
         StreamSessionOptions::default(),
     ));
     assert_send(&session.fetch_summary());
-    assert_send(&session.fetch_refs(selector));
+    assert_send(&session.fetch_refs(selector, Some(selector)));
     assert_send(&owned.finish());
 }
 

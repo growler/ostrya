@@ -522,7 +522,9 @@ fn a_pull_kind_is_protocol() {
         ("ListRefs after Hello", |mut c| {
             Box::pin(async move {
                 c.hello_reply(&[]).await;
-                c.send(&Message::ListRefs(Vec::new())).await.unwrap();
+                c.send(&Message::ListRefs(Default::default()))
+                    .await
+                    .unwrap();
                 c.error().await
             })
         }),

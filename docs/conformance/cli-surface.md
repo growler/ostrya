@@ -4100,14 +4100,21 @@ ostrya serve [--repo=PATH] [--listen=ADDR:PORT]...
   request at `[archive] zlib-level`, and `deltas/` and `delta-indexes/` are
   not served. A path the server refuses and a path it does not find both get
   404. `../format-reference.md`, "The archive view", states the rules.
-- The command also answers `GET /_ostrya/refs/v1?pattern=P&pattern=Q`. The
-  body is the ref listing, a summary GVariant built for each request, of the
-  refs that the entries of the query select. Each entry is a ref pattern with
-  an optional leading `!`. No query takes all refs. A bad pair of the query, a
-  query of more than 256 pairs, an entry of more than 256 parts or 4096 bytes,
-  and an entry that is not a ref pattern get 400, and a method other than
-  `GET` gets 405 with `Allow: GET`. The command holds at most 4 listings at
-  the same time. A request over this limit gets 503 with `Retry-After: 1`.
+- The command also answers `GET /_ostrya/refs/v1?pattern=P&collection=C`.
+  The body is the ref listing, a summary GVariant built for each request, of
+  the refs that the entries of the query select. Each entry is a ref pattern
+  with an optional leading `!`. A `pattern` entry selects local refs, and no
+  `pattern` pair takes all local refs. A `collection` entry selects the
+  collection refs under `refs/mirrors/` by `ID/NAME`, and the listing holds
+  them in `ostree.summary.collection-map`. With no `collection` pair, the
+  listing holds no collection ref. A bad pair of the query, a query of more
+  than 256 pairs, an entry of more than 256 parts or 4096 bytes, and an entry
+  that is not a ref pattern get 400, and a method other than `GET` gets 405
+  with `Allow: GET`. The command holds at most 4 listings at the same time. A
+  request over this limit gets 503 with `Retry-After: 1`. For each directory
+  under `refs/mirrors/` whose name is not a collection id, a listing writes
+  one `warning:` line to standard error, one time in each run.
+  `../format-reference.md`, "The ref listing", states the rules.
 - The command always runs the receive endpoint of a push. The client
   groups of the config give the push rights.
 - The command takes its settings from `[ex-ostrya server]`
@@ -4276,7 +4283,7 @@ ostrya send [--repo=PATH] [--client=NAME]
   `--client` is safe only under a forced `command=` in `authorized_keys`,
   because a user with a shell can give any name.
 - The command serves one pull session over standard input and standard
-  output, through `Repo::send`. An ssh pull runs it on the remote side. It answers each
+  output, through `Repo::send_with`. An ssh pull runs it on the remote side. It answers each
   `Get` path as the archive view of `serve` answers a `GET` of that path. A
   path that the view refuses, and a path that the client cannot read, get
   the reply of a path that is not found.
@@ -4287,7 +4294,10 @@ ostrya send [--repo=PATH] [--client=NAME]
   object and its extended attributes. A file that the account cannot read
   ends the session with `internal`.
 - Standard output carries the frames of the session alone. The command
-  writes `error: MESSAGE` to standard error on failure, and nothing else,
+  writes `error: MESSAGE` to standard error on failure. For each directory
+  under `refs/mirrors/` whose name is not a collection id, a `ListRefs` with
+  the key `collections` writes one `warning:` line to standard error, one
+  time in each session. The command writes nothing else to standard error,
   also under `-v`.
 - It exits 0 when standard input ends at a frame boundary, an empty input
   included. It exits 1 after an `Error` frame and after a failed write.

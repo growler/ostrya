@@ -10,7 +10,7 @@ use ostrya_fetch::{FetchRequest, Fetched, Fetcher, Priority};
 
 use super::pull::{PullBody, StreamSession, StreamSessionOptions, wire_entries};
 use crate::error::{Error, Result};
-use crate::proto::MAX_REF_LISTING;
+use crate::proto::{ListRefsRequest, MAX_REF_LISTING};
 
 /// The cap on the `summary` and the `summary.sig` that
 /// [`PullSession::fetch_summary`] reads: 64 MiB.
@@ -42,8 +42,13 @@ const REFS_PATH: &str = "_ostrya/refs/v1";
 /// left for the base path and the other fields.
 const MAX_REFS_TARGET: usize = 16 * 1024;
 
-/// The key of each pair of the query of a ref listing.
+/// The key of each pair of the query of a ref listing that holds an entry of
+/// the local refs.
 const PATTERN_KEY: &str = "pattern=";
+
+/// The key of each pair of the query of a ref listing that holds an entry of
+/// the collection refs.
+const COLLECTION_KEY: &str = "collection=";
 
 /// The session of a pull: the HTTP fetcher of a remote, or a stream session.
 ///
@@ -63,22 +68,40 @@ const PATTERN_KEY: &str = "pattern=";
 /// # Ref patterns
 ///
 /// [`fetch_refs`](PullSession::fetch_refs) and [`StreamSession::list_refs`]
-/// send the entries of a [`RefSelector`]. [`RefSelector`] and
-/// [`RefPattern`] give the pattern language. The listing holds the refs
-/// under `refs/heads` that the selector selects, so a selector with no entry
-/// lists all refs under `refs/heads`.
+/// send the entries of two [`RefSelector`] values. [`RefSelector`] and
+/// [`RefPattern`] give the pattern language.
+///
+/// - The first selector selects the local refs by name. In field 0, the
+///   listing holds the local refs that it selects, so a selector with no
+///   entry lists all local refs.
+/// - The second selector selects the collection refs by `ID/NAME`, for
+///   example `org.example.Os/stable` or `org.example.Os/**`. The listing
+///   holds the collection refs that it selects under
+///   `ostree.summary.collection-map`. A selector with no entry lists all
+///   collection refs. `None` asks for no collection ref, and the listing
+///   then has the bytes of a listing of the first selector alone.
+///
+/// The server leaves out each ref that the client cannot read. A caller
+/// reads the collection refs of a listing with
+/// `Summary::parse(&listing)?.collection_map()` of the `ostrya` crate.
 ///
 /// Each of the two methods sends the entries by these rules, over both
 /// transports:
 ///
-/// - The positive entries come first, then the negative entries, each with
-///   its `!`.
-/// - The method removes each exact duplicate of one kind and keeps the first
-///   appearance, so `["a", "!b", "a"]` sends `["a", "!b"]`.
+/// - In each list, the positive entries come first, then the negative
+///   entries, each with its `!`.
+/// - The method removes each exact duplicate of one kind in one list and
+///   keeps the first appearance, so `["a", "!b", "a"]` sends `["a", "!b"]`.
+///   An entry of the two lists stays in each list.
 /// - The method removes no entry because another entry covers it. A positive
 ///   `a` and a negative `!a` both stay, and `a` and `a/b` both stay.
 /// - At most [`MAX_REF_PATTERNS`] entries can stay, positive and negative
-///   together.
+///   entries of the two lists together.
+/// - Over HTTP, `Some` of a second selector with no entry goes on the wire
+///   as one `**` entry, and that entry counts toward the limit. Thus
+///   [`MAX_REF_PATTERNS`] distinct entries in the first selector and `Some`
+///   of an empty second selector are refused over HTTP, and accepted over
+///   a stream session.
 /// - An entry has at most [`MAX_REF_ENTRY_LEN`] bytes, with its `!` counted
 ///   as one byte. It has at most [`MAX_REF_ENTRY_PARTS`] parts, and the `!`
 ///   adds no part.
@@ -204,23 +227,28 @@ impl PullSession {
         }
     }
 
-    /// Reads the ref listing of `selector` from the remote.
+    /// Reads the ref listing of `refs` and `collections` from the remote.
     ///
-    /// The listing is a summary of the refs under `refs/heads` that the
-    /// selector selects. The server builds it for this request. The listing
-    /// has a cap of [`MAX_REF_LISTING`] bytes. No signature covers the
-    /// listing, and the call verifies none.
+    /// The listing is a summary of the local refs that `refs` selects and of
+    /// the collection refs that `collections` selects. `None` asks for no
+    /// collection ref. The server builds the listing for this request. The
+    /// listing has a cap of [`MAX_REF_LISTING`] bytes. No signature covers
+    /// the listing, and the call verifies none.
     ///
-    /// The call sends the entries of `selector` by the rules of
+    /// The call sends the entries of the two selectors by the rules of
     /// [Ref patterns](PullSession#ref-patterns). It reads the listing by the
     /// rules of [Reads](PullSession#reads).
     ///
     /// # HTTP
     ///
     /// The call sends a `GET` of `_ostrya/refs/v1` under the base URL of each
-    /// mirror, at [`Priority::High`]. Each entry that stays goes into the
-    /// query as one `pattern=VALUE` pair, and `&` separates the pairs. A
-    /// selector with no entry sends no query.
+    /// mirror, at [`Priority::High`]. Each entry of `refs` that stays goes
+    /// into the query as one `pattern=VALUE` pair. Then each entry of
+    /// `collections` that stays goes into the query as one `collection=VALUE`
+    /// pair. `&` separates the pairs. With no entry and with `None`, the call
+    /// sends no query. `Some` of a selector with no entry goes into the query
+    /// as the one pair `collection=**`, which selects each collection ref and
+    /// counts toward the limit of entries.
     ///
     /// The value is the entry with each byte outside `A-Z`, `a-z`, `0-9`,
     /// `-`, `.`, `_`, and `~` written as `%XX`. For example, `/` is `%2F`,
@@ -270,7 +298,9 @@ impl PullSession {
     ///   reply, the inner error is [`Fetch`](ostrya_fetch::Error::Fetch).
     /// - [`Error::Fetch`] over HTTP if the server refuses the request. The
     ///   inner error is [`HttpStatus`](ostrya_fetch::Error::HttpStatus). For
-    ///   example, the status is 400 for a pattern that the server refuses, and
+    ///   example, the status is 400 for a pattern that the server refuses, or
+    ///   for a `collection` pair that a server without collection refs in its
+    ///   listing does not know, and
     ///   414 or 431 for a target that is too long for it. A server that stays
     ///   busy gives 503. An ostrya server gives 500 for a listing over
     ///   [`MAX_REF_LISTING`] bytes.
@@ -284,11 +314,27 @@ impl PullSession {
     ///   [`Error::LimitExceeded`].
     /// - Over a stream session, the error of the session if the read of the
     ///   body fails, as [`fetch_summary`](PullSession::fetch_summary) lists.
-    pub async fn fetch_refs(&self, selector: &RefSelector) -> Result<Option<Vec<u8>>> {
+    pub async fn fetch_refs(
+        &self,
+        refs: &RefSelector,
+        collections: Option<&RefSelector>,
+    ) -> Result<Option<Vec<u8>>> {
         match self {
             PullSession::Http(fetcher) => {
-                let entries = wire_entries(selector)?;
-                let query = refs_query(&entries)?;
+                // A query with no `collection` pair asks for no collection
+                // ref, so a list with no entry goes as the entry `**`.
+                let every;
+                let collections = match collections {
+                    Some(selector)
+                        if selector.positive().is_empty() && selector.negative().is_empty() =>
+                    {
+                        every = RefSelector::parse(["**"]).expect("`**` is a selector entry");
+                        Some(&every)
+                    }
+                    other => other,
+                };
+                let request = wire_entries(refs, collections)?;
+                let query = refs_query(&request)?;
                 let request = match &query {
                     Some(query) => FetchRequest::path_query(REFS_PATH, query),
                     None => FetchRequest::path(REFS_PATH),
@@ -296,7 +342,9 @@ impl PullSession {
                 fetch_optional(fetcher, request, MAX_REF_LISTING).await
             }
             PullSession::Stream(session) => {
-                let body = session.list_refs(selector, MAX_REF_LISTING).await?;
+                let body = session
+                    .list_refs(refs, collections, MAX_REF_LISTING)
+                    .await?;
                 read_body(body, MAX_REF_LISTING).await.map(Some)
             }
         }
@@ -337,27 +385,33 @@ impl PullSession {
     }
 }
 
-/// Returns the query of a ref listing of `entries`, or `None` for an empty
-/// list.
+/// Returns the query of a ref listing of `request`, or `None` for a request
+/// with no entry.
 ///
-/// Each entry is one `pattern=VALUE` pair, and `&` separates the pairs. The
-/// value is the entry with each byte outside the unreserved set of URIs
-/// written as `%XX`, in upper case.
+/// Each entry of the local refs is one `pattern=VALUE` pair. Then each entry
+/// of the collection refs is one `collection=VALUE` pair. `&` separates the
+/// pairs. The value is the entry with each byte outside the unreserved set
+/// of URIs written as `%XX`, in upper case.
 ///
 /// # Errors
 ///
 /// [`Error::InvalidInput`] if the request target, [`REFS_PATH`] with `?` and
 /// the query, is longer than [`MAX_REFS_TARGET`]. The function measures the
 /// target before it builds the query.
-fn refs_query(entries: &[String]) -> Result<Option<String>> {
-    if entries.is_empty() {
+fn refs_query(request: &ListRefsRequest) -> Result<Option<String>> {
+    let collections = request.collections.as_deref().unwrap_or_default();
+    let pairs = || {
+        let refs = request.refs.iter().map(|entry| (PATTERN_KEY, entry));
+        refs.chain(collections.iter().map(|entry| (COLLECTION_KEY, entry)))
+    };
+    let count = request.refs.len() + collections.len();
+    if count == 0 {
         return Ok(None);
     }
-    let len = entries
-        .iter()
-        .map(|entry| PATTERN_KEY.len() + encoded_len(entry))
+    let len = pairs()
+        .map(|(key, entry)| key.len() + encoded_len(entry))
         .sum::<usize>()
-        + entries.len()
+        + count
         - 1;
     let target = REFS_PATH.len() + 1 + len;
     if target > MAX_REFS_TARGET {
@@ -367,11 +421,11 @@ fn refs_query(entries: &[String]) -> Result<Option<String>> {
         )));
     }
     let mut query = String::with_capacity(len);
-    for (n, entry) in entries.iter().enumerate() {
+    for (n, (key, entry)) in pairs().enumerate() {
         if n > 0 {
             query.push('&');
         }
-        query.push_str(PATTERN_KEY);
+        query.push_str(key);
         encode(entry, &mut query);
     }
     Ok(Some(query))
@@ -539,19 +593,70 @@ mod tests {
             assert_eq!(out, encoded);
             assert_eq!(encoded_len(value), encoded.len());
         }
-        assert_eq!(refs_query(&[]).unwrap(), None);
-        let entries =
-            |list: &[&str]| -> Vec<String> { list.iter().map(|e| (*e).to_owned()).collect() };
+        assert_eq!(refs_query(&request(&[], None)).unwrap(), None);
         assert_eq!(
-            refs_query(&entries(&["a/b", "main"])).unwrap().as_deref(),
+            refs_query(&request(&["a/b", "main"], None))
+                .unwrap()
+                .as_deref(),
             Some("pattern=a%2Fb&pattern=main")
         );
         assert_eq!(
-            refs_query(&entries(&["a/**", "x/*", "!a/b/*", "!z"]))
+            refs_query(&request(&["a/**", "x/*", "!a/b/*", "!z"], None))
                 .unwrap()
                 .as_deref(),
             Some("pattern=a%2F%2A%2A&pattern=x%2F%2A&pattern=%21a%2Fb%2F%2A&pattern=%21z")
         );
+    }
+
+    /// Returns the request of the entries `refs` and `collections`, as
+    /// `wire_entries` gives them.
+    fn request(refs: &[&str], collections: Option<&[&str]>) -> ListRefsRequest {
+        let entries = |list: &[&str]| list.iter().map(|e| (*e).to_owned()).collect();
+        ListRefsRequest {
+            refs: entries(refs),
+            collections: collections.map(entries),
+        }
+    }
+
+    /// The `collection` pairs come after the `pattern` pairs. A request with
+    /// collection entries alone has a query. An empty list of collection
+    /// entries adds no pair: `fetch_refs` sends it as the entry `**`.
+    #[test]
+    fn collection_entries_follow_the_pattern_pairs() {
+        assert_eq!(
+            refs_query(&request(&["main"], Some(&["org.a/**", "!org.b/x"])))
+                .unwrap()
+                .as_deref(),
+            Some("pattern=main&collection=org.a%2F%2A%2A&collection=%21org.b%2Fx")
+        );
+        assert_eq!(
+            refs_query(&request(&[], Some(&["*/main"])))
+                .unwrap()
+                .as_deref(),
+            Some("collection=%2A%2Fmain")
+        );
+        assert_eq!(refs_query(&request(&[], Some(&[]))).unwrap(), None);
+        assert_eq!(
+            refs_query(&request(&["a"], Some(&["**"])))
+                .unwrap()
+                .as_deref(),
+            Some("pattern=a&collection=%2A%2A")
+        );
+    }
+
+    /// The target limit counts the `collection` pairs, their keys, and the
+    /// `&` between the two kinds of pairs.
+    #[test]
+    fn the_target_limit_counts_the_collection_pairs() {
+        let fixed = REFS_PATH.len() + 1 + PATTERN_KEY.len() + 1 + 1 + COLLECTION_KEY.len();
+        let fits = "a".repeat(MAX_REFS_TARGET - fixed);
+        let query = refs_query(&request(&["a"], Some(&[&fits])))
+            .unwrap()
+            .unwrap();
+        assert_eq!(REFS_PATH.len() + 1 + query.len(), MAX_REFS_TARGET);
+        let over = "a".repeat(MAX_REFS_TARGET - fixed + 1);
+        let err = refs_query(&request(&["a"], Some(&[&over]))).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
     }
 
     /// The target limit counts `_ostrya/refs/v1`, the `?`, and the query. A
@@ -560,11 +665,11 @@ mod tests {
     fn the_target_limit_is_inclusive() {
         let fixed = REFS_PATH.len() + 1 + PATTERN_KEY.len();
         let fits = "a".repeat(MAX_REFS_TARGET - fixed);
-        let query = refs_query(&[fits]).unwrap().unwrap();
+        let query = refs_query(&request(&[&fits], None)).unwrap().unwrap();
         assert_eq!(REFS_PATH.len() + 1 + query.len(), MAX_REFS_TARGET);
         assert_eq!(query.capacity(), query.len());
         let over = "a".repeat(MAX_REFS_TARGET - fixed + 1);
-        let err = refs_query(&[over]).unwrap_err();
+        let err = refs_query(&request(&[&over], None)).unwrap_err();
         assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
     }
 
@@ -575,10 +680,10 @@ mod tests {
     fn the_target_limit_counts_the_bang() {
         let fixed = REFS_PATH.len() + 1 + PATTERN_KEY.len();
         let fits = format!("!{}", "a".repeat(MAX_REFS_TARGET - fixed - 3));
-        let query = refs_query(&[fits]).unwrap().unwrap();
+        let query = refs_query(&request(&[&fits], None)).unwrap().unwrap();
         assert_eq!(REFS_PATH.len() + 1 + query.len(), MAX_REFS_TARGET);
         let over = format!("!{}", "a".repeat(MAX_REFS_TARGET - fixed - 2));
-        let err = refs_query(&[over]).unwrap_err();
+        let err = refs_query(&request(&[&over], None)).unwrap_err();
         assert!(matches!(err, Error::InvalidInput(_)), "{err:?}");
     }
 }

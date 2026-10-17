@@ -388,7 +388,7 @@ fn send_serves_the_readable_refs_of_the_name() {
         Message::Get("refs/heads/secret".to_owned()),
         Message::Get("summary".to_owned()),
         Message::Get("config".to_owned()),
-        Message::ListRefs(Vec::new()),
+        Message::ListRefs(Default::default()),
     ]);
     let out = send(&repo, &[], input);
     assert!(out.status.success(), "{out:?}");
@@ -419,6 +419,59 @@ fn send_with_no_client_group_serves_each_ref() {
     let out = send(&repo, &[], input);
     assert!(out.status.success(), "{out:?}");
     assert_eq!(found(&out), [true, true, true, false]);
+}
+
+/// A directory under `refs/mirrors/` whose name is not a collection id
+/// gives one `warning:` line on standard error in a session, at the first
+/// `ListRefs` with the key `collections`. A `ListRefs` with no key reads no
+/// such directory. Standard output holds the bytes of a session over the
+/// same refs with no such directory.
+#[test]
+fn send_warns_one_time_for_each_invalid_collection_dir() {
+    let tmp = TmpDir::new("invalid-collection-dir");
+    let repo = archive_copy(&tmp.0);
+    let mirrors = repo.join("refs/mirrors");
+    std::fs::create_dir_all(mirrors.join("org.a")).unwrap();
+    std::fs::copy(
+        repo.join("refs/heads/test/main"),
+        mirrors.join("org.a/main"),
+    )
+    .unwrap();
+    let all = || ostrya::remote::proto::ListRefsRequest {
+        refs: Vec::new(),
+        collections: Some(Vec::new()),
+    };
+    let input = frames(&[
+        pull_hello(1),
+        Message::ListRefs(Default::default()),
+        Message::ListRefs(all()),
+        Message::ListRefs(all()),
+    ]);
+    let clean = send(&repo, &[], input.clone());
+    assert!(clean.status.success(), "{clean:?}");
+    assert!(clean.stderr.is_empty(), "{clean:?}");
+    for dir in ["bad", "a..b"] {
+        std::fs::create_dir_all(mirrors.join(dir)).unwrap();
+        std::fs::write(mirrors.join(dir).join("x"), "no checksum\n").unwrap();
+    }
+    let out = send(&repo, &[], input);
+    assert!(out.status.success(), "{out:?}");
+    assert_eq!(out.stdout, clean.stdout);
+    let line = |name: &str| {
+        format!(
+            "warning: refs/mirrors/{name}: the directory name is not a collection id, and \
+             the ref listing leaves out the directory\n"
+        )
+    };
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!("{}{}", line("a..b"), line("bad"))
+    );
+    let msgs = messages(&out.stdout);
+    let listing = ostrya::Summary::parse(&msgs.last().unwrap().1).unwrap();
+    let map = listing.collection_map().unwrap();
+    assert_eq!(map.len(), 1);
+    assert_eq!(map[0].0, "org.a");
 }
 
 /// The anonymous resident memory of process `pid`, `RssAnon` of

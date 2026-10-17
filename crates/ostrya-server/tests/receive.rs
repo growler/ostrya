@@ -726,9 +726,10 @@ fn the_ref_listing_is_served_beside_the_endpoint() {
         assert!(out.starts_with(b"HTTP/1.1 200 "));
         assert_eq!(
             out[end..],
-            repo.build_ref_listing(&RefSelector::parse([]).unwrap(), &anyone(&repo))
+            repo.build_ref_listing(&RefSelector::parse([]).unwrap(), None, &anyone(&repo))
                 .await
                 .unwrap()
+                .bytes
         );
 
         for request in [

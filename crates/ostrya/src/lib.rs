@@ -193,6 +193,7 @@ pub use receive::{
 pub use refs::{CollectionRef, CollectionRefEntry, RefAlias, validate_refspec};
 #[doc(hidden)]
 pub use repo::{CreateOptions, Repo};
+pub use send::{SendEvent, SendEventFn, SendOptions};
 #[doc(hidden)]
 pub use sign::{
     DummySigner, DummyVerifier, Ed25519Signer, Ed25519Verifier, FromSystemKeys, SignFuture,
@@ -207,7 +208,7 @@ pub use staging_tree::{
     MergeOptions, RootDirmeta, StagedFileWriter, StagingEntry, StagingLookup, StagingTree,
 };
 #[doc(hidden)]
-pub use summary::{AdvertisedDelta, Summary, SummaryOptions, SummaryRef};
+pub use summary::{AdvertisedDelta, RefListing, Summary, SummaryOptions, SummaryRef};
 #[doc(hidden)]
 pub use tar::{TarExportOptions, TarImportOptions, TarRename};
 #[doc(hidden)]

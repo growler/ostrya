@@ -1017,6 +1017,51 @@ fn raw_or_closed(url: &str, request: impl AsRef<[u8]>) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// A directory under `refs/mirrors/` whose name is not a collection id
+/// gives one `warning:` line on standard error in a run, at the first ref
+/// listing whose query holds a `collection` pair. Each listing gets 200,
+/// and standard output holds the URL alone.
+#[test]
+fn serve_warns_one_time_for_each_invalid_collection_dir() {
+    use std::io::Read;
+
+    let tmp = TmpDir::new("serve-invalid-collection-dir");
+    let src = build_tree(tmp.path());
+    let path = tmp.path().join("repo");
+    server_repo(&path, "archive", &src, &[]);
+    for dir in ["bad", "a..b"] {
+        let dir = path.join("refs/mirrors").join(dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("x"), "no checksum\n").unwrap();
+    }
+    let mut command = serve_command(&path);
+    command.arg("--listen=127.0.0.1:0").stderr(Stdio::piped());
+    let mut serving = Serving::spawn(&mut command);
+    for query in ["", "?collection=%2A%2A", "?pattern=main&collection=%2A%2A"] {
+        let response = raw(
+            &serving.url,
+            format!("GET /_ostrya/refs/v1{query} HTTP/1.1\r\nhost: x\r\nconnection: close\r\n\r\n"),
+        );
+        assert!(response.starts_with("HTTP/1.1 200 "), "{query}: {response}");
+    }
+    assert_eq!(serving.rest(), "");
+    let mut stderr = String::new();
+    serving
+        .child
+        .stderr
+        .take()
+        .unwrap()
+        .read_to_string(&mut stderr)
+        .unwrap();
+    let line = |name: &str| {
+        format!(
+            "warning: refs/mirrors/{name}: the directory name is not a collection id, and \
+             the ref listing leaves out the directory\n"
+        )
+    };
+    assert_eq!(stderr, format!("{}{}", line("a..b"), line("bad")));
+}
+
 /// `ostrya serve` takes the proxy settings from `[ex-ostrya server]`, and an
 /// option replaces the key of its name:
 ///

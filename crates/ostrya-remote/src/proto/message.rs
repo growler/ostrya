@@ -28,6 +28,7 @@ static STRV: LazyLock<Type> = LazyLock::new(|| parse("as"));
 static MAYBE_CHECKSUM: LazyLock<Type> = LazyLock::new(|| parse("may"));
 static PULL_HELLO: LazyLock<Type> = LazyLock::new(|| parse("(ua{sv})"));
 static GET_REPLY: LazyLock<Type> = LazyLock::new(|| parse("(bmt)"));
+static LIST_REFS: LazyLock<Type> = LazyLock::new(|| parse("(asa{sv})"));
 
 /// The first message of a push client.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -262,6 +263,31 @@ pub struct GetReply {
     pub len: Option<u64>,
 }
 
+/// The `ListRefs` message: the entries of a ref listing request.
+///
+/// Each entry is a ref pattern of a
+/// [`RefSelector`](ostrya_core::RefSelector), with an optional leading `!`.
+/// The codec does not check the entries.
+/// [`MAX_REF_PATTERNS`](super::MAX_REF_PATTERNS),
+/// [`MAX_REF_ENTRY_PARTS`](super::MAX_REF_ENTRY_PARTS), and
+/// [`MAX_REF_ENTRY_LEN`](super::MAX_REF_ENTRY_LEN) are the limits of a
+/// request. The two lists share the limit of entries. The specification of
+/// [`ListRefs`](https://github.com/growler/ostrya/blob/main/docs/format-reference.md#listrefs)
+/// states the reply.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ListRefsRequest {
+    /// The entries that the server matches against the names of the local
+    /// refs.
+    pub refs: Vec<String>,
+    /// The entries that the server matches against `ID/NAME` of the
+    /// collection refs, under the key `collections`.
+    ///
+    /// `None` asks for no collection ref. The encoder writes the key only if
+    /// the value is `Some`, also for an empty list. An empty list selects
+    /// each collection ref.
+    pub collections: Option<Vec<String>>,
+}
+
 /// A message of the push or the pull protocol.
 ///
 /// A later protocol version can add messages.
@@ -303,16 +329,7 @@ pub enum Message {
     /// The `GetReply` message.
     GetReply(GetReply),
     /// The `ListRefs` message, with the entries of a ref listing request.
-    ///
-    /// Each entry is a ref pattern of a
-    /// [`RefSelector`](ostrya_core::RefSelector), with an optional leading
-    /// `!`. The codec does not check the entries.
-    /// [`MAX_REF_PATTERNS`](super::MAX_REF_PATTERNS),
-    /// [`MAX_REF_ENTRY_PARTS`](super::MAX_REF_ENTRY_PARTS), and
-    /// [`MAX_REF_ENTRY_LEN`](super::MAX_REF_ENTRY_LEN) are the limits of a
-    /// request. The specification of [`ListRefs`](https://github.com/growler/ostrya/blob/main/docs/format-reference.md#listrefs)
-    /// states the reply.
-    ListRefs(Vec<String>),
+    ListRefs(ListRefsRequest),
 }
 
 impl Message {
@@ -507,9 +524,16 @@ impl Message {
                 let len = Value::Maybe(r.len.map(|n| Box::new(Value::U64(n))));
                 (&GET_REPLY, Value::Tuple(vec![Value::Bool(r.found), len]))
             }
-            Message::ListRefs(entries) => {
-                let entries = entries.iter().cloned().map(Value::Str).collect();
-                (&STRV, Value::Array(entries))
+            Message::ListRefs(r) => {
+                let mut opts = DictBuilder::new();
+                if let Some(collections) = &r.collections {
+                    opts.insert_strv("collections", collections);
+                }
+                let refs = r.refs.iter().cloned().map(Value::Str).collect();
+                (
+                    &LIST_REFS,
+                    Value::Tuple(vec![Value::Array(refs), opts.build()]),
+                )
             }
         };
         ostrya_gvariant::to_bytes(ty, &value).map_err(|e| protocol(format!("encode: {e}")))
@@ -635,8 +659,16 @@ impl Message {
                 Message::GetReply(r)
             }
             Kind::ListRefs => {
-                let entries: ArrayIter<&str> = parse_body(body)?;
-                Message::ListRefs(collect(entries, |e| Ok(e.to_owned()))?)
+                let (refs, opts): (ArrayIter<&str>, Dict) = parse_body(body)?;
+                let [collections] = dict(opts, ["collections"])?;
+                let collections: Option<ArrayIter<&str>> =
+                    field(collections, "collections", &STRV)?;
+                Message::ListRefs(ListRefsRequest {
+                    refs: collect(refs, |e| Ok(e.to_owned()))?,
+                    collections: collections
+                        .map(|entries| collect(entries, |e| Ok(e.to_owned())))
+                        .transpose()?,
+                })
             }
         })
     }

@@ -591,7 +591,13 @@ When \fB\%ID\fR is the \fB\%collection\-id\fR of \fB\%[core]\fR, the path is in 
 The server serves such a ref when the group of the item in its namespace has \fB\%r\fR on \fB\%NAME\fR.
 An alias needs \fB\%r\fR on its name and on its target.
 .IP \(bu 2
-The ref listing holds the refs of \fB\%refs/heads\fR that the client reads.
+The ref listing holds the local refs that the client reads.
+A request that names the collection refs gets them too: each collection takes the group of the item in its namespace, the group of the exact id, else the group of \fB\%collection=*\fR.
+The rights of two groups never combine.
+.IP \(bu 2
+A directory under \fB\%refs/mirrors/\fR whose name is not a collection id selects no group.
+Its refs are not served, and the ref listing leaves out the directory.
+The server writes one warning that names the directory.
 .IP \(bu 2
 \fB\%refs/remotes/\fR, each other path under \fB\%refs/\fR, and \fB\%extensions/ostrya/\fR are not served.
 .IP \(bu 2

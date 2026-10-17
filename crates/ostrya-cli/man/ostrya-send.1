@@ -14,7 +14,7 @@ The client name is \%\-\-client, else the value of \fB\%LOGNAME\fR, which sshd s
 .PP
 The session serves the refs that the client group of the item \fB\%ssh:NAME\fR reads, as \fB\%ostrya serve\fR serves them to that item. When the repository has client groups and none carries the item, the command writes an error line and exits \%1 before it reads standard input. The session uses no \fB\%anonymous\fR and no \fB\%net:\fR item. In a repository with no client group, the session takes the item \fB\%anonymous\fR, so it serves each local ref, each mirror ref, and the summary.
 .PP
-Standard output carries the frames of the session alone. On failure, the command writes \fB\%error: MESSAGE\fR to standard error. It writes nothing else, also under \%\-\-verbose. It exits \%0 when standard input ends at a frame boundary, and \%1 after an \fB\%Error\fR frame or a failed write.
+Standard output carries the frames of the session alone. On failure, the command writes \fB\%error: MESSAGE\fR to standard error. When a ref listing finds a directory under \fB\%refs/mirrors/\fR whose name is not a collection id, the command writes one \fB\%warning:\fR line that names it to standard error, one time in each session. It exits \%0 when standard input ends at a frame boundary, and \%1 after an \fB\%Error\fR frame or a failed write.
 .PP
 An \fB\%authorized_keys\fR entry with \fB\%command="ostrya send \-\-repo=PATH"\fR limits an ssh key to a pull from one repository.
 .SH OPTIONS

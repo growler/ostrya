@@ -149,6 +149,7 @@ use std::path::{Path, PathBuf};
 pub use claim::{Claim, ClaimError, ClaimRule, Claims, MAX_CLAIMS};
 pub use item::{AuthItem, IpNet};
 pub use read::ReadAccess;
+pub(crate) use read::reads;
 #[cfg(feature = "receive")]
 pub(crate) use reader::{Group, classify};
 pub use rights::{AccessModes, AccessRules, AllowItem};

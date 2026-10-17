@@ -1,7 +1,10 @@
 //! One pull session over a pair of streams: the serving side of the pull over
 //! ssh.
 
+use std::collections::HashSet;
+use std::fmt;
 use std::io;
+use std::sync::Arc;
 
 use futures_io::{AsyncRead, AsyncWrite};
 use futures_lite::io::{AsyncReadExt, BufReader, BufWriter};
@@ -12,8 +15,8 @@ use crate::archive::{ArchiveAnswer, ArchiveView};
 use crate::error::{Error, Result};
 use crate::remote;
 use crate::remote::proto::{
-    FrameReader, FrameWriter, GetReply, MAX_REF_ENTRY_LEN, MAX_REF_ENTRY_PARTS, MAX_REF_LISTING,
-    MAX_REF_PATTERNS, Message, PULL_PROTOCOL_VERSION, PullHello, PullHelloReply,
+    FrameReader, FrameWriter, GetReply, ListRefsRequest, MAX_REF_ENTRY_LEN, MAX_REF_ENTRY_PARTS,
+    MAX_REF_LISTING, MAX_REF_PATTERNS, Message, PULL_PROTOCOL_VERSION, PullHello, PullHelloReply,
 };
 use crate::repo::Repo;
 
@@ -26,6 +29,79 @@ const STREAM_BUFFER: usize = 64 * 1024;
 /// full chunk and its 4-byte length fill the output buffer. No write holds a
 /// chunk length alone.
 const CHUNK: usize = STREAM_BUFFER - 4;
+
+/// The callback that receives each [`SendEvent`] of a session.
+///
+/// The session calls it in its own task, so the callback must return soon.
+pub type SendEventFn = Arc<dyn Fn(&SendEvent) + Send + Sync>;
+
+/// The options of [`Repo::send_with`].
+///
+/// The struct is `#[non_exhaustive]`, so a caller starts from
+/// [`SendOptions::default`] and sets the fields.
+#[derive(Clone, Default)]
+#[non_exhaustive]
+pub struct SendOptions {
+    /// The callback for each [`SendEvent`] of the session, or `None`.
+    ///
+    /// A host writes the event to its log, for example the
+    /// [`Display`](fmt::Display) text of the event on standard error. The
+    /// default is `None`, which drops each event.
+    pub on_event: Option<SendEventFn>,
+}
+
+/// The debug text shows a callback that is set as `<callback>`.
+impl fmt::Debug for SendOptions {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SendOptions")
+            .field("on_event", &self.on_event.as_ref().map(|_| "<callback>"))
+            .finish()
+    }
+}
+
+/// An event of a session of [`Repo::send_with`], which
+/// [`SendOptions::on_event`] receives.
+///
+/// [`Display`](fmt::Display) writes one line for the log of the host. It
+/// writes each ASCII control character of a name as an escape sequence, for
+/// example `\n`, so the line holds no line break.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum SendEvent {
+    /// A ref listing of the session left out a directory under
+    /// `refs/mirrors/` whose name fails the collection-id rule
+    /// ([`is_collection_id`](crate::is_collection_id)).
+    ///
+    /// The session reports each name one time, at the first listing that
+    /// finds it. Only a `ListRefs` with the `collections` key reads the
+    /// directories under `refs/mirrors/`.
+    #[non_exhaustive]
+    InvalidCollectionDir {
+        /// The name of the directory.
+        name: String,
+    },
+}
+
+impl fmt::Display for SendEvent {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SendEvent::InvalidCollectionDir { name } => {
+                f.write_str("refs/mirrors/")?;
+                for c in name.chars() {
+                    if c.is_ascii_control() {
+                        write!(f, "{}", c.escape_default())?;
+                    } else {
+                        write!(f, "{c}")?;
+                    }
+                }
+                f.write_str(
+                    ": the directory name is not a collection id, and the ref listing leaves \
+                     out the directory",
+                )
+            }
+        }
+    }
+}
 
 /// The kind of failure that ends a session.
 enum Failure {
@@ -111,14 +187,16 @@ impl Repo {
     ///   body follows as chunks.
     ///
     /// The session answers each `ListRefs` with the listing that
-    /// [`build_ref_listing`](Repo::build_ref_listing) builds for its entries
-    /// and `access`.
+    /// [`build_ref_listing`](Repo::build_ref_listing) builds for its two
+    /// lists of entries and `access`. The entries of field 0 select the local
+    /// refs. The entries under the key `collections` select the collection
+    /// refs, and with no such key the listing holds no collection ref.
     /// The entries are ref patterns with an optional leading `!`, which
     /// [`RefSelector::parse`] reads. A `ListRefs` holds at most
-    /// [`MAX_REF_PATTERNS`] entries, and each entry holds at most
-    /// [`MAX_REF_ENTRY_PARTS`] parts and [`MAX_REF_ENTRY_LEN`] bytes.
-    /// The reply is a `GetReply` with `found` set to `true` and the length of
-    /// the listing. The listing follows as chunks.
+    /// [`MAX_REF_PATTERNS`] entries in its two lists together, and each entry
+    /// holds at most [`MAX_REF_ENTRY_PARTS`] parts and [`MAX_REF_ENTRY_LEN`]
+    /// bytes. The reply is a `GetReply` with `found` set to `true` and the
+    /// length of the listing. The listing follows as chunks.
     ///
     /// # Access
     ///
@@ -186,10 +264,11 @@ impl Repo {
     /// - [`Error::Remote`] with the code `protocol` if a frame is malformed, or
     ///   if `input` ends inside a frame.
     /// - [`Error::Remote`] with the code `protocol` if a `ListRefs` holds more
-    ///   than [`MAX_REF_PATTERNS`] entries, an entry over the limits of one
-    ///   entry, or an entry that [`RefSelector::parse`] refuses. An entry
-    ///   given two times counts two times. The check of the limits of an entry
-    ///   comes before the parse.
+    ///   than [`MAX_REF_PATTERNS`] entries in its two lists, an entry over the
+    ///   limits of one entry, or an entry that [`RefSelector::parse`]
+    ///   refuses. An entry given two times counts two times. The check of the
+    ///   limits of an entry comes before the parse. The message of a refused
+    ///   entry under `collections` names that key.
     /// - [`Error::Remote`] with the code `limit-exceeded` if a ref listing is
     ///   larger than [`MAX_REF_LISTING`].
     /// - [`Error::Remote`] with the code `limit-exceeded` if a frame is larger
@@ -212,17 +291,47 @@ impl Repo {
         R: AsyncRead + Unpin + Send,
         W: AsyncWrite + Unpin + Send,
     {
-        self.send_capped(input, output, access, MAX_REF_LISTING)
+        self.send_with(input, output, access, &SendOptions::default())
             .await
     }
 
-    /// Serves the session of [`send`](Repo::send) with a cap of `listing_cap`
-    /// bytes on each ref listing.
+    /// Serves one pull session as [`send`](Repo::send) does, with the
+    /// options `opts`.
+    ///
+    /// The session gives each [`SendEvent`] to
+    /// [`SendOptions::on_event`]. A ref listing of a `ListRefs` with the
+    /// `collections` key reads the top level of `refs/mirrors/`. For each
+    /// directory there whose name fails the collection-id rule, the session
+    /// gives one [`SendEvent::InvalidCollectionDir`], at the first listing
+    /// that finds it. The listing leaves out the directory. The event does
+    /// not change the session, and the peer gets no message of it.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`send`](Repo::send).
+    pub async fn send_with<R, W>(
+        &self,
+        input: R,
+        output: W,
+        access: &ReadAccess,
+        opts: &SendOptions,
+    ) -> Result<()>
+    where
+        R: AsyncRead + Unpin + Send,
+        W: AsyncWrite + Unpin + Send,
+    {
+        self.send_capped(input, output, access, opts, MAX_REF_LISTING)
+            .await
+    }
+
+    /// Serves the session of [`send_with`](Repo::send_with) with a cap of
+    /// `listing_cap` bytes on each ref listing.
     pub(crate) async fn send_capped<R, W>(
         &self,
         input: R,
         output: W,
         access: &ReadAccess,
+        opts: &SendOptions,
         listing_cap: u64,
     ) -> Result<()>
     where
@@ -233,6 +342,8 @@ impl Repo {
             repo: self.clone(),
             access: access.clone(),
             listing_cap,
+            on_event: opts.on_event.clone(),
+            warned: HashSet::new(),
             view: ArchiveView::new(self.clone()),
             reader: FrameReader::new(BufReader::with_capacity(STREAM_BUFFER, input)),
             writer: FrameWriter::new(BufWriter::with_capacity(STREAM_BUFFER, output)),
@@ -268,6 +379,11 @@ struct Session<R, W> {
     access: ReadAccess,
     /// The size cap of each ref listing.
     listing_cap: u64,
+    /// The callback of the events of the session.
+    on_event: Option<SendEventFn>,
+    /// The names of the invalid collection directories that the session
+    /// reported.
+    warned: HashSet<String>,
     view: ArchiveView,
     reader: FrameReader<BufReader<R>>,
     writer: FrameWriter<BufWriter<W>>,
@@ -295,7 +411,7 @@ where
             }
             match self.next().await? {
                 Some(Message::Get(path)) => self.get(&path).await?,
-                Some(Message::ListRefs(entries)) => self.list_refs(&entries).await?,
+                Some(Message::ListRefs(request)) => self.list_refs(&request).await?,
                 Some(other) => return Err(out_of_order(&other)),
                 None => return Ok(()),
             }
@@ -367,43 +483,64 @@ where
         }
     }
 
-    /// Answers one `ListRefs` with the listing of `entries`.
+    /// Answers one `ListRefs` with the listing of `request`.
     ///
     /// Each failure comes before the reply, so the session sends an `Error`
-    /// message in place of the reply.
-    async fn list_refs(&mut self, entries: &[String]) -> std::result::Result<(), Failure> {
+    /// message in place of the reply. The session reports each invalid
+    /// collection directory of the listing that it did not report before.
+    async fn list_refs(&mut self, request: &ListRefsRequest) -> std::result::Result<(), Failure> {
         let protocol = |why: String| Failure::Wire(remote::Error::Protocol(why));
-        if entries.len() > MAX_REF_PATTERNS {
+        let collections = request.collections.as_deref();
+        let count = request.refs.len() + collections.map_or(0, <[String]>::len);
+        if count > MAX_REF_PATTERNS {
             return Err(protocol(format!(
-                "ListRefs: {} entries, over the limit of {MAX_REF_PATTERNS}",
-                entries.len()
+                "ListRefs: {count} entries, over the limit of {MAX_REF_PATTERNS}"
             )));
         }
-        for entry in entries {
-            if entry.len() > MAX_REF_ENTRY_LEN || entry.split('/').count() > MAX_REF_ENTRY_PARTS {
-                return Err(protocol(format!(
-                    "ListRefs: an entry of {} bytes is over the limit of \
-                     {MAX_REF_ENTRY_PARTS} parts or {MAX_REF_ENTRY_LEN} bytes",
-                    entry.len()
-                )));
+        let lists = [
+            ("", request.refs.as_slice()),
+            ("collections: ", collections.unwrap_or_default()),
+        ];
+        for (label, entries) in lists {
+            for entry in entries {
+                if entry.len() > MAX_REF_ENTRY_LEN || entry.split('/').count() > MAX_REF_ENTRY_PARTS
+                {
+                    return Err(protocol(format!(
+                        "ListRefs: {label}an entry of {} bytes is over the limit of \
+                         {MAX_REF_ENTRY_PARTS} parts or {MAX_REF_ENTRY_LEN} bytes",
+                        entry.len()
+                    )));
+                }
             }
         }
-        let selector = RefSelector::parse(entries.iter().map(String::as_str))
+        let refs = RefSelector::parse(request.refs.iter().map(String::as_str))
             .map_err(|e| protocol(format!("ListRefs: {e}")))?;
+        let collections = collections
+            .map(|entries| RefSelector::parse(entries.iter().map(String::as_str)))
+            .transpose()
+            .map_err(|e| protocol(format!("ListRefs: collections: {e}")))?;
         let listing = self
             .repo
-            .build_ref_listing_capped(&selector, &self.access, self.listing_cap)
+            .build_ref_listing_capped(&refs, collections.as_ref(), &self.access, self.listing_cap)
             .await
             .map_err(|e| match e {
                 Error::Remote(e @ remote::Error::LimitExceeded(_)) => Failure::Wire(e),
                 other => Failure::Internal(other),
             })?;
+        for name in listing.invalid_collection_dirs {
+            if let Some(on_event) = &self.on_event
+                && !self.warned.contains(&name)
+            {
+                self.warned.insert(name.clone());
+                on_event(&SendEvent::InvalidCollectionDir { name });
+            }
+        }
         let reply = GetReply {
             found: true,
-            len: Some(listing.len() as u64),
+            len: Some(listing.bytes.len() as u64),
         };
         self.reply(&Message::GetReply(reply)).await?;
-        write_bytes(&mut self.writer, &listing).await
+        write_bytes(&mut self.writer, &listing.bytes).await
     }
 }
 
@@ -508,6 +645,9 @@ const _: fn() = || {
     let _ = |repo: &Repo, access: &ReadAccess| {
         assert_send(repo.send(futures_lite::io::empty(), futures_lite::io::sink(), access))
     };
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<SendOptions>();
+    assert_send_sync::<SendEvent>();
 };
 
 #[cfg(test)]
@@ -740,16 +880,17 @@ mod tests {
                 None,
             );
             let listing = repo
-                .build_ref_listing(&crate::RefSelector::parse([]).unwrap(), &access)
+                .build_ref_listing(&crate::RefSelector::parse([]).unwrap(), None, &access)
                 .await
-                .unwrap();
+                .unwrap()
+                .bytes;
             let mut input = FrameWriter::new(Vec::new());
             for msg in [
                 Message::PullHello(PullHello {
                     version: 1,
                     agent: None,
                 }),
-                Message::ListRefs(Vec::new()),
+                Message::ListRefs(ListRefsRequest::default()),
             ] {
                 input.write_message(&msg).await.unwrap();
             }
@@ -757,7 +898,13 @@ mod tests {
 
             let mut out = Vec::new();
             let result = repo
-                .send_capped(&input[..], &mut out, &access, listing.len() as u64 - 1)
+                .send_capped(
+                    &input[..],
+                    &mut out,
+                    &access,
+                    &SendOptions::default(),
+                    listing.len() as u64 - 1,
+                )
                 .await;
             assert!(
                 matches!(result, Err(Error::Remote(remote::Error::LimitExceeded(_)))),
@@ -775,9 +922,15 @@ mod tests {
             assert_eq!(reader.read_message().await.unwrap(), None);
 
             let mut out = Vec::new();
-            repo.send_capped(&input[..], &mut out, &access, listing.len() as u64)
-                .await
-                .unwrap();
+            repo.send_capped(
+                &input[..],
+                &mut out,
+                &access,
+                &SendOptions::default(),
+                listing.len() as u64,
+            )
+            .await
+            .unwrap();
             let mut reader = FrameReader::new(&out[..]);
             reader.read_message().await.unwrap();
             assert_eq!(
@@ -800,6 +953,20 @@ mod tests {
             assert_eq!(reader.read_message().await.unwrap(), None);
         });
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The line of an invalid collection directory names its path and
+    /// escapes each control character.
+    #[test]
+    fn the_line_of_an_invalid_collection_dir_escapes_control_characters() {
+        let event = SendEvent::InvalidCollectionDir {
+            name: "bad\nforged line\t\u{7f}".to_owned(),
+        };
+        assert_eq!(
+            event.to_string(),
+            "refs/mirrors/bad\\nforged line\\t\\u{7f}: the directory name is not a \
+             collection id, and the ref listing leaves out the directory"
+        );
     }
 
     /// The chunk payload is equal to the chunk payload of the push, so the

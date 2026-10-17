@@ -2845,14 +2845,14 @@ fn a_pull_session_fetches_no_ref_listing_from_a_static_server() {
         .unwrap();
         assert_eq!(
             session
-                .fetch_refs(&RefSelector::parse(["main"]).unwrap())
+                .fetch_refs(&RefSelector::parse(["main"]).unwrap(), None)
                 .await
                 .unwrap(),
             None
         );
         assert_eq!(
             session
-                .fetch_refs(&RefSelector::parse([]).unwrap())
+                .fetch_refs(&RefSelector::parse([]).unwrap(), None)
                 .await
                 .unwrap(),
             None
@@ -2882,7 +2882,7 @@ fn a_pull_session_refuses_a_ref_listing_over_the_cap_over_http() {
             .await
             .unwrap();
         let selector = RefSelector::parse(["a/b", "!a/*", "x-y", "a/b/c", "é/ü", "x-y"]).unwrap();
-        let err = session.fetch_refs(&selector).await.unwrap_err();
+        let err = session.fetch_refs(&selector, None).await.unwrap_err();
         assert!(
             matches!(
                 err,

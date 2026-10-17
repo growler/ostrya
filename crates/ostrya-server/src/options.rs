@@ -56,8 +56,8 @@ impl fmt::Debug for ServerTls {
 /// `on_report` go to the [`EndpointOptions`] of the receive endpoint. Their
 /// defaults are the defaults of [`EndpointOptions::default`]. If
 /// [`receive`](ServeOptions::receive) is `None`, [`bind`](crate::bind) does
-/// not read these four fields, `allow_cleartext_credentials`, or `on_event`.
-/// It then refuses no value of them.
+/// not read these four fields or `allow_cleartext_credentials`. It then
+/// refuses no value of them.
 ///
 /// # Authentication
 ///
@@ -361,7 +361,9 @@ pub struct ServeOptions {
     /// The server calls it in the task of the request, so the callback must
     /// return soon. A host writes the event to its log, for example the
     /// [`Display`](std::fmt::Display) text of the event on standard error.
-    /// The default is `None`, which drops each event.
+    /// [`ServerEvent::is_warning`](crate::ServerEvent::is_warning) tells a
+    /// warning from an error. The server calls it also with no receive
+    /// policies. The default is `None`, which drops each event.
     pub on_event: Option<EventSink>,
 }
 

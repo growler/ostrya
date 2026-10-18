@@ -7704,12 +7704,15 @@ reproduce; `cli-surface.md`, "P2", records that divergence.
 
 `E1` -- the traversal core (DONE). `GcRoots` carries two edges into the walk in
 `traverse.rs`: the commit `parent` edge, which becomes optional, and any number
-of metadata keys. For each configured key the walk reads the value in a reached
-commit's own metadata and then in its detached metadata, and each element of the
-`aay` it holds is a commit checksum the walk seeds as a root of its own. Depth
-counts parent hops, so a commit a metadata key names is given the walk's full
-depth rather than the remaining depth of the commit that named it. A key that is
-present and holds anything but an `aay` of 32-byte checksums fails the walk with
+of metadata keys. For each configured key the walk reads each entry with the key
+in a reached commit's own metadata and then in its detached metadata. A dict
+that holds the key more than once gives the commits of each entry. The variant
+type of a value selects its shape: `aay`, `a(say)`, or `a{s(say)}`. The walk
+reads the checksums alone and ignores each string, and each checksum is a commit
+the walk seeds as a root of its own. Depth counts parent hops, so a commit a
+metadata key names is given the walk's full depth rather than the remaining
+depth of the commit that named it. A value of another type, an element of the
+wrong shape, or a checksum that is not 32 bytes fails the walk with
 `Error::InvalidGcRoot`, because objects are deleted for what the walk does not
 find, and a value it cannot read is an edge it cannot follow. A key naming a
 commit that is absent stays tolerated, which is what a dangling ref target

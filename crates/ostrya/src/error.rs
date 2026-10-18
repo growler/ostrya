@@ -455,7 +455,8 @@ pub enum Error {
     ///
     /// [`gc_root_metadata_keys`](crate::PruneOptions::gc_root_metadata_keys)
     /// names the keys. A value gives this error if its variant type is not
-    /// `aay`, or if an element is not a 32-byte checksum.
+    /// `aay`, `a(say)`, or `a{s(say)}`, if an element does not have the shape
+    /// of that type, or if a checksum is not 32 bytes.
     #[error("gc-root metadata key {metadata_key} on commit {commit}: {reason}")]
     InvalidGcRoot {
         /// The commit that holds the metadata key.

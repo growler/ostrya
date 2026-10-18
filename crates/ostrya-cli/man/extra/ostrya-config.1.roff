@@ -248,8 +248,11 @@ The group is an extension of ostrya, and the \fB\%ostree\fR tool ignores it.
 .TP
 \fB\%gc\-root\-metadata\-keys\fR (list)
 Metadata keys that hold more roots for \fB\%ostrya prune\fR.
-The value of each key, in the metadata or the detached metadata of a commit, is an array of 32\-byte commit checksums, of the GVariant type \fB\%aay\fR.
+A prune reads each entry with such a key, in the metadata and in the detached metadata of a commit.
+The value of an entry has one of the GVariant types \fB\%aay\fR, \fB\%a(say)\fR, or \fB\%a{s(say)}\fR.
+Each checksum in the value is a commit checksum of 32 bytes, and a prune ignores the strings.
 A prune keeps each commit that such a value names.
+A value of another type, or a checksum that is not 32 bytes, fails the prune, and the prune deletes nothing.
 .TP
 \fB\%detached\-metadata\-exclude\fR (list)
 Detached metadata keys that are not stored.

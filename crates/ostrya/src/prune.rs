@@ -217,22 +217,29 @@ pub struct PruneOptions {
     pub static_deltas_only: bool,
     /// Metadata keys whose values name more commits to keep.
     ///
-    /// The run looks up each key in the metadata of each reached commit and in
-    /// its detached metadata. A key that is present holds an `aay` whose
-    /// elements are commit checksums. The run walks each of those commits as a
-    /// root of its own, so it also keeps what that commit reaches. Such a
-    /// commit gets the full depth of the walk, because the depth counts parent
-    /// hops.
+    /// The run reads each entry with one of these keys in the metadata of each
+    /// reached commit and in its detached metadata. A dict that holds a key
+    /// more than one time gives the commits of each entry. The value of an
+    /// entry has one of these shapes:
     ///
-    /// If a key holds a value of another type, the prune fails with
-    /// [`Error::InvalidGcRoot`].
+    /// - `aay`: an array of commit checksums.
+    /// - `a(say)`: an array of pairs of a string and a commit checksum.
+    /// - `a{s(say)}`: a dict of names, each with a `(say)` pair.
+    ///
+    /// The run reads the checksums alone and ignores the strings. Each
+    /// checksum is 32 bytes. The run walks each of those commits as a root of
+    /// its own, so it also keeps what that commit reaches. Such a commit gets
+    /// the full depth of the walk, because the depth counts parent hops.
+    ///
+    /// If an entry holds a value without one of these shapes, or a checksum
+    /// that is not 32 bytes, the prune fails with [`Error::InvalidGcRoot`].
     ///
     /// The list is empty by default, and an empty list reads no metadata. If
     /// [`refs_only`](PruneOptions::refs_only) is `false`, a non-empty list adds
     /// no reachability, because each commit in the store is already a root.
     /// The run still reads the metadata and the detached metadata of each
-    /// commit. A key of the wrong type fails the prune with either value of
-    /// `refs_only`.
+    /// commit. A defective value fails the prune, whether `refs_only` is `true`
+    /// or `false`.
     ///
     /// This field is an ostrya extension. The `ostrya` CLI fills it from the
     /// repository config key `[ex-ostrya] gc-root-metadata-keys`
@@ -619,9 +626,10 @@ impl Repo {
     /// - An error of [`resolve_rev`](Repo::resolve_rev), for example
     ///   [`Error::RefNotFound`], if a value of
     ///   [`only_branch`](PruneOptions::only_branch) does not resolve.
-    /// - [`Error::InvalidGcRoot`] if a key of
+    /// - [`Error::InvalidGcRoot`] if an entry with a key of
     ///   [`gc_root_metadata_keys`](PruneOptions::gc_root_metadata_keys) holds a
-    ///   value that is not an `aay` of commit checksums.
+    ///   value that is not an `aay`, an `a(say)`, or an `a{s(say)}`, or a
+    ///   checksum that is not 32 bytes.
     /// - [`Error::Io`] if a read, a write, or a removal on the file system
     ///   fails.
     /// - [`Error::Io`] if a metadata object is larger than

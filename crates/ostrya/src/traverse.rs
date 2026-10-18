@@ -20,10 +20,22 @@ use crate::error::{Error, Result};
 use crate::refs::walk_ref_dir;
 use crate::repo::Repo;
 
-/// The GVariant type of the value of a GC-root metadata key.
+/// The GVariant type of a GC-root value that is an array of checksums.
 ///
-/// The value is an array of commit checksums, each in its 32-byte binary form.
-const GC_ROOT_SIGNATURE: &str = "aay";
+/// Each element is one commit checksum in its 32-byte binary form.
+const ANCHOR_CHECKSUMS: &str = "aay";
+
+/// The GVariant type of a GC-root value that is an array of pairs.
+///
+/// Each pair holds a string and one commit checksum in its 32-byte binary
+/// form. The walk ignores the string.
+const ANCHOR_PAIRS: &str = "a(say)";
+
+/// The GVariant type of a GC-root value that is a dict of named pairs.
+///
+/// Each entry holds a name and a pair of the [`ANCHOR_PAIRS`] shape. The walk
+/// ignores the name and the string of the pair.
+const ANCHOR_NAMED_PAIRS: &str = "a{s(say)}";
 
 /// The bound that a walk puts on the `parent` chain of one root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -219,7 +231,9 @@ impl Expanded {
 pub(crate) struct GcRoots {
     /// The metadata keys whose values name more reachable commits.
     ///
-    /// If the list is empty, the walk reads no metadata.
+    /// The walk reads each entry with one of these keys, in the metadata and
+    /// in the detached metadata of each commit that it expands. If the list
+    /// is empty, the walk reads no metadata.
     pub metadata_keys: Vec<String>,
     /// `true` if the walk follows the `parent` edge of a commit.
     pub traverse_parent: bool,
@@ -751,14 +765,23 @@ impl Repo {
     /// Pushes onto the walk each commit that the configured metadata keys
     /// name.
     ///
-    /// The method reads each key from `metadata`, the metadata of the commit,
-    /// and then from its detached metadata. So one key name gives edges from
-    /// both. A key that no dict holds adds nothing.
+    /// The method reads each entry with the key from `metadata`, the metadata
+    /// of the commit, and then from its detached metadata. So one key name
+    /// gives edges from both. A dict that holds the key more than one time
+    /// gives the edges of each entry, and the entries can have different
+    /// shapes. A key that no dict holds adds nothing.
     ///
-    /// If a key is present and does not hold an `aay` of 32-byte checksums,
-    /// the walk fails with [`Error::InvalidGcRoot`]. If the walk does not
-    /// follow an edge, a sweep deletes the objects of that edge. So a value
-    /// that the walk cannot read stops the walk.
+    /// The value of each entry is an `aay`, an `a(say)`, or an `a{s(say)}`.
+    /// The walk reads the 32-byte checksums alone and ignores each string.
+    /// If a value does not have one of these shapes, or holds a checksum that
+    /// is not 32 bytes, the walk fails with [`Error::InvalidGcRoot`]. If the
+    /// walk does not follow an edge, a sweep deletes the objects of that edge.
+    /// So a value that the walk cannot read stops the walk.
+    ///
+    /// With more than one defect, the error names the first in this order:
+    /// the order of the keys in [`GcRoots::metadata_keys`], then the metadata
+    /// of the commit before its detached metadata, then the order of the
+    /// entries in the dict, then the order of the elements in the value.
     ///
     /// The method reads the detached metadata once for each expansion of a
     /// commit, and only if the walk has metadata keys. The walk can reach a
@@ -775,11 +798,14 @@ impl Repo {
         let detached = self.read_commit_detached_metadata(commit).await?;
         for key in &gc.metadata_keys {
             for source in [Some(metadata), detached.as_ref()].into_iter().flatten() {
-                let Some(value) = source.dict_get(key) else {
-                    continue;
-                };
-                for target in metadata_key_targets(commit, key, value)? {
-                    stack.push((target, root_bound, Arrival::Root));
+                for value in dict_values(source, key) {
+                    let targets =
+                        metadata_key_targets(value).map_err(|reason| Error::InvalidGcRoot {
+                            commit: *commit,
+                            metadata_key: key.clone(),
+                            reason,
+                        })?;
+                    stack.extend(targets.into_iter().map(|t| (t, root_bound, Arrival::Root)));
                 }
             }
         }
@@ -890,39 +916,87 @@ async fn join_all<F: Future>(futures: impl IntoIterator<Item = F>) -> Vec<F::Out
         .collect()
 }
 
-/// Returns the commits that the value of one metadata key names.
+/// Returns the value of each entry of the `a{sv}` dict `dict` whose key is
+/// `key`, in the order of the dict.
 ///
-/// The value is the variant that an `a{sv}` entry holds. It must hold an `aay`
-/// in which each element is a 32-byte commit checksum. Any other value is an
-/// [`Error::InvalidGcRoot`] that names the commit of the value.
-fn metadata_key_targets(commit: &Checksum, key: &str, value: &Value) -> Result<Vec<Checksum>> {
-    let invalid = |reason: String| Error::InvalidGcRoot {
-        commit: *commit,
-        metadata_key: key.to_owned(),
-        reason,
-    };
-    let Some((ty, elements)) = value.as_variant() else {
-        return Err(invalid("value is not a variant".into()));
+/// The function skips each entry that does not have the `{s?}` shape. If
+/// `dict` is not an array, the result is empty.
+fn dict_values<'a>(dict: &'a Value, key: &'a str) -> impl Iterator<Item = &'a Value> {
+    dict.as_array()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(move |entry| match entry.as_tuple()? {
+            [k, v] if k.as_str() == Some(key) => Some(v),
+            _ => None,
+        })
+}
+
+/// Returns the commits that the value of one metadata key names, in the order
+/// of the value.
+///
+/// The value is the variant that an `a{sv}` entry holds. The type of the
+/// variant selects the shape:
+///
+/// - `aay`: each element is a checksum.
+/// - `a(say)`: each element is a pair of a string and a checksum.
+/// - `a{s(say)}`: each element is an entry of a name and an `(say)` pair.
+///
+/// The function ignores each string. Each checksum is a 32-byte commit
+/// checksum. An empty array gives no commit.
+///
+/// Any other value gives an error with the reason, the first defect in the
+/// order of the elements. The caller puts the reason into an
+/// [`Error::InvalidGcRoot`].
+fn metadata_key_targets(value: &Value) -> std::result::Result<Vec<Checksum>, String> {
+    let Some((ty, child)) = value.as_variant() else {
+        return Err("value is not a variant".into());
     };
     let signature = ty.signature();
-    if signature != GC_ROOT_SIGNATURE {
-        return Err(invalid(format!(
-            "type is `{signature}`, not `{GC_ROOT_SIGNATURE}`"
-        )));
-    }
-    let Some(elements) = elements.as_array() else {
-        return Err(invalid("value is not an array".into()));
+    let (checksum_of, element): (ChecksumOf, &str) = match signature.as_str() {
+        ANCHOR_CHECKSUMS => (Value::as_bytes, "a byte array"),
+        ANCHOR_PAIRS => (pair_checksum, "a (say) pair"),
+        ANCHOR_NAMED_PAIRS => (entry_checksum, "a {s(say)} entry"),
+        _ => {
+            return Err(format!(
+                "type is `{signature}`, not `aay`, `a(say)`, or `a{{s(say)}}`"
+            ));
+        }
+    };
+    let Some(elements) = child.as_array() else {
+        return Err("value is not an array".into());
     };
     let mut targets = Vec::with_capacity(elements.len());
-    for (index, element) in elements.iter().enumerate() {
-        let Some(bytes) = element.as_bytes() else {
-            return Err(invalid(format!("element {index} is not a byte array")));
+    for (index, item) in elements.iter().enumerate() {
+        let Some(bytes) = checksum_of(item) else {
+            return Err(format!("element {index} is not {element}"));
         };
         let checksum = Checksum::from_ay(bytes)
-            .map_err(|_| invalid(format!("element {index} is {} bytes, not 32", bytes.len())))?;
+            .map_err(|_| format!("element {index} is {} bytes, not 32", bytes.len()))?;
         targets.push(checksum);
     }
     Ok(targets)
+}
+
+/// A function that returns the checksum bytes of one element of a GC-root
+/// value, or `None` if the element does not have the shape of the value.
+type ChecksumOf = fn(&Value) -> Option<&[u8]>;
+
+/// Returns the checksum bytes of an `(say)` pair, or `None` if `pair` does not
+/// have that shape.
+fn pair_checksum(pair: &Value) -> Option<&[u8]> {
+    match pair.as_tuple()? {
+        [Value::Str(_), Value::Bytes(checksum)] => Some(checksum),
+        _ => None,
+    }
+}
+
+/// Returns the checksum bytes of an `{s(say)}` entry, or `None` if `entry`
+/// does not have that shape.
+fn entry_checksum(entry: &Value) -> Option<&[u8]> {
+    match entry.as_tuple()? {
+        [Value::Str(_), pair] => pair_checksum(pair),
+        _ => None,
+    }
 }
 
 /// Returns `true` if an expansion at remaining depth `prev` follows at least
@@ -1128,4 +1202,160 @@ fn read_ref_target(dir: BorrowedFd<'_>, name: &str) -> Result<Option<Checksum>> 
     let text = std::str::from_utf8(&buf)
         .map_err(|_| Error::InvalidFormat("ref content is not valid UTF-8".into()))?;
     Ok(Some(Checksum::from_hex(text.trim())?))
+}
+
+#[cfg(test)]
+mod tests {
+    use ostrya_core::Type;
+
+    use super::*;
+
+    /// Returns a variant of the type `signature` that holds `child`.
+    fn variant(signature: &str, child: Value) -> Value {
+        Value::variant(Type::parse(signature).unwrap(), child)
+    }
+
+    /// Returns a `(say)` pair of `name` and `checksum`.
+    fn pair(name: &str, checksum: &[u8]) -> Value {
+        Value::Tuple(vec![
+            Value::Str(name.into()),
+            Value::Bytes(checksum.to_vec()),
+        ])
+    }
+
+    /// Returns an `{s(say)}` entry of `name` and a pair of `name` and
+    /// `checksum`.
+    fn entry(name: &str, checksum: &[u8]) -> Value {
+        Value::Tuple(vec![Value::Str(name.into()), pair(name, checksum)])
+    }
+
+    /// Returns the reason that the decoder gives for `value`.
+    fn reason(value: &Value) -> String {
+        metadata_key_targets(value).unwrap_err()
+    }
+
+    #[test]
+    fn each_shape_gives_its_checksums_in_order() {
+        let one = Checksum::from_bytes([1; 32]);
+        let two = Checksum::from_bytes([2; 32]);
+        let checksums = variant(
+            "aay",
+            Value::Array(vec![
+                Value::Bytes(one.as_bytes().to_vec()),
+                Value::Bytes(two.as_bytes().to_vec()),
+            ]),
+        );
+        let pairs = variant(
+            "a(say)",
+            Value::Array(vec![pair("a", one.as_bytes()), pair("", two.as_bytes())]),
+        );
+        let named = variant(
+            "a{s(say)}",
+            Value::Array(vec![entry("a", one.as_bytes()), entry("a", two.as_bytes())]),
+        );
+        for value in [checksums, pairs, named] {
+            assert_eq!(metadata_key_targets(&value).unwrap(), [one, two]);
+        }
+    }
+
+    #[test]
+    fn an_empty_array_of_each_shape_gives_no_checksum() {
+        for signature in ["aay", "a(say)", "a{s(say)}"] {
+            let value = variant(signature, Value::Array(Vec::new()));
+            assert!(
+                metadata_key_targets(&value).unwrap().is_empty(),
+                "{signature}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_value_that_is_not_a_variant_is_refused() {
+        assert_eq!(reason(&Value::Str("x".into())), "value is not a variant");
+    }
+
+    #[test]
+    fn a_variant_that_holds_no_array_is_refused() {
+        assert_eq!(
+            reason(&variant("aay", Value::Str("x".into()))),
+            "value is not an array"
+        );
+    }
+
+    #[test]
+    fn another_type_is_refused_with_its_signature() {
+        let empty_strings = variant("as", Value::Array(Vec::new()));
+        assert_eq!(
+            reason(&empty_strings),
+            "type is `as`, not `aay`, `a(say)`, or `a{s(say)}`"
+        );
+        let nested = variant("v", variant("aay", Value::Array(Vec::new())));
+        assert_eq!(
+            reason(&nested),
+            "type is `v`, not `aay`, `a(say)`, or `a{s(say)}`"
+        );
+    }
+
+    #[test]
+    fn an_element_of_the_wrong_shape_is_refused() {
+        let checksum = [0; 32];
+        let cases = [
+            (
+                variant("aay", Value::Array(vec![Value::Str("x".into())])),
+                "element 0 is not a byte array",
+            ),
+            (
+                variant(
+                    "a(say)",
+                    Value::Array(vec![Value::Bytes(checksum.to_vec())]),
+                ),
+                "element 0 is not a (say) pair",
+            ),
+            (
+                variant(
+                    "a(say)",
+                    Value::Array(vec![
+                        pair("a", &checksum),
+                        Value::Tuple(vec![Value::U32(0), Value::Bytes(checksum.to_vec())]),
+                    ]),
+                ),
+                "element 1 is not a (say) pair",
+            ),
+            (
+                variant("a{s(say)}", Value::Array(vec![pair("a", &checksum)])),
+                "element 0 is not a {s(say)} entry",
+            ),
+        ];
+        for (value, expected) in cases {
+            assert_eq!(reason(&value), expected);
+        }
+    }
+
+    #[test]
+    fn the_first_defect_in_element_order_is_reported() {
+        let value = variant(
+            "a(say)",
+            Value::Array(vec![
+                pair("a", &[0; 32]),
+                pair("b", &[0; 20]),
+                Value::U32(0),
+            ]),
+        );
+        assert_eq!(reason(&value), "element 1 is 20 bytes, not 32");
+    }
+
+    #[test]
+    fn dict_values_yields_each_entry_with_the_key() {
+        let mut builder = ostrya_core::DictBuilder::new();
+        builder
+            .insert_str("k", "first")
+            .insert_str("other", "x")
+            .insert_str("k", "second");
+        let dict = builder.build();
+        let values: Vec<&str> = dict_values(&dict, "k")
+            .map(|v| v.as_variant().unwrap().1.as_str().unwrap())
+            .collect();
+        assert_eq!(values, ["first", "second"]);
+        assert_eq!(dict_values(&Value::Str("k".into()), "k").count(), 0);
+    }
 }

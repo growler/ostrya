@@ -1,3 +1,21 @@
+ostrya (0.4.0) unstable; urgency=medium
+
+  * Control the access to a served repository with client groups in the
+    repository config. The receive policy groups are removed.
+  * Take the settings of ostrya serve from the [ex-ostrya server] group.
+  * Identify a client of ostrya serve by a client certificate, and serve
+    behind a trusted proxy or with the PROXY protocol.
+  * Rename the serve option --client-ca to --tls-client-ca.
+  * Push into collection namespaces, and list and pull collection refs.
+  * Build a server commit on the server for push --onto and push-tree.
+  * Write and serve a summary for each auth item. Add summary --auth-group.
+  * Add commit --tag.
+  * Accept named GC anchors in prune, and refuse a bad value of a GC anchor
+    key in commit.
+  * Add the man pages ostrya-repo(5) and ostrya-config(1).
+
+ -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Sun, 18 Oct 2026 13:56:29 +0200
+
 ostrya (0.3.1) unstable; urgency=medium
 
   * Install the man pages of the ostrya command.

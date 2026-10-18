@@ -231,6 +231,10 @@ impl Expanded {
 pub(crate) struct GcRoots {
     /// The metadata keys whose values name more reachable commits.
     ///
+    /// A prune puts the merged key list of the run here: the keys of the
+    /// repository config first, and then the keys of the caller. The list
+    /// holds each key one time.
+    ///
     /// The walk reads each entry with one of these keys, in the metadata and
     /// in the detached metadata of each commit that it expands. If the list
     /// is empty, the walk reads no metadata.

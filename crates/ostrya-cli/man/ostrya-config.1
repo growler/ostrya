@@ -277,7 +277,10 @@ The keys of the group \fB\%[ex\-ostrya]\fR.
 The group is an extension of ostrya, and the \fB\%ostree\fR tool ignores it.
 .TP
 \fB\%gc\-root\-metadata\-keys\fR (list)
-Metadata keys that hold more roots for \fB\%ostrya prune\fR.
+Metadata keys that hold more roots for a prune.
+Each prune reads this key: a prune of \fB\%ostrya prune\fR, and a prune of a program that uses the ostrya library.
+Such a program can add metadata keys to a prune, but it cannot remove a key of this list.
+A value that has a malformed escape sequence fails the prune before the repository lock, and the prune deletes nothing.
 A prune reads each entry with such a key, in the metadata and in the detached metadata of a commit.
 The value of an entry has one of the GVariant types \fB\%aay\fR, \fB\%a(say)\fR, or \fB\%a{s(say)}\fR.
 Each checksum in the value is a commit checksum of 32 bytes, and a prune ignores the strings.

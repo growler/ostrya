@@ -4646,16 +4646,23 @@ Observed by running the tool (2026.1).
   refuses such a value too. A `--composefs` line reaches it nowhere, so the port
   exports the image at exit 0 where the tool refuses the repository, which
   "checkout" above records as a divergence. Within `prune` the port reads
-  `[ex-ostrya] gc-root-metadata-keys` first. It then reads `[core] locking` in
-  the `prune` handler, for the line it writes where that key is false. It reads
-  `[core] locking` a second time, together with `[core] lock-timeout-secs`, as
-  it takes the repository lock, and it reads `[core] tombstone-commits` and
-  `[core] fsync` inside the run. All of them come after every option refusal and
-  after the revision `--delete-commit` names, so a line the port refuses on its
-  options refuses the same way whatever those values hold. The timeout is read
-  even where `locking` is false, so a malformed `lock-timeout-secs` refuses a
-  prune on a repository that takes no lock. A `--static-deltas-only` run returns
-  before the last two, so it refuses neither of them.
+  `[core] locking` first, in the `prune` handler, for the line it writes where
+  that key is false. The library then reads `[ex-ostrya]
+  gc-root-metadata-keys` before the repository lock. It reads `[core] locking`
+  a second time, together with `[core] lock-timeout-secs`, as it takes the
+  repository lock, and it reads `[core] tombstone-commits` and `[core] fsync`
+  inside the run. All of them come after every option refusal and after the
+  revision `--delete-commit` names, so a line the port refuses on its options
+  refuses the same way whatever those values hold. A repository holding
+  `locking=bogus` and a `gc-root-metadata-keys` value that does not parse
+  refuses on `locking`
+  (`prune_refuses_a_bad_locking_value_before_a_malformed_key_list` in
+  `crates/ostrya-cli/tests/cli.rs`). The tool reads neither value as the port
+  does, so no conformance record covers the pair. The timeout is read even
+  where `locking` is false, so a malformed `lock-timeout-secs` refuses a prune
+  on a repository that takes no lock. A `--static-deltas-only` run returns
+  before the last two, so it refuses neither of them. It reads
+  `gc-root-metadata-keys`, so a value that does not parse refuses it.
 - The port reads at most 1048576 bytes of `config`. It refuses a larger file
   with `config exceeds the 1048576-byte size cap` when it opens a repository,
   and at each later read of the file. The tool reads a `config` of any size.

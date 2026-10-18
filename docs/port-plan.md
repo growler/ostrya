@@ -7698,9 +7698,11 @@ information in commit metadata needs, and the two repository config keys that
 put them under repository policy. Neither capability has a counterpart in the
 `ostree` tool, so neither has a black-box oracle, and the port's own tests carry
 them. The default of every new field is the behavior that stood before it, so a
-prune with default options is the tool's prune. The CLI reads the two config
-keys, and a repository that sets one takes a prune or a pull the tool does not
-reproduce; `cli-surface.md`, "P2", records that divergence.
+prune with default options on a repository that does not set
+`gc-root-metadata-keys` is the tool's prune. `Repo::prune` reads
+`gc-root-metadata-keys`, and the CLI reads `detached-metadata-exclude`. A
+repository that sets one of the two keys takes a prune or a pull the tool does
+not reproduce; `cli-surface.md`, "P2", records that divergence.
 
 `E1` -- the traversal core (DONE). `GcRoots` carries two edges into the walk in
 `traverse.rs`: the commit `parent` edge, which becomes optional, and any number
@@ -7729,7 +7731,11 @@ extended use: refs alone, no `parent` edge, and the named metadata keys as the
 extra roots. The metadata-key list adds no reachability with `refs_only` unset,
 since a prune that is not restricted to refs already roots every commit in the
 store. The keys are read under either setting, so a key of the wrong type fails
-the prune either way.
+the prune either way. `Repo::prune` merges the keys of `[ex-ostrya]
+gc-root-metadata-keys` with the keys of the caller: the config keys first, in
+config order, then each caller key the list does not already hold. The merged
+list holds each key one time, and the options keep the caller keys alone. A
+caller can add keys to a run and cannot remove a config key from it.
 
 `E3` -- the detached-metadata filter (DONE). `PullOptions` gains
 `detached_metadata_filter`, which a pull calls once per property of each commit's
@@ -7762,12 +7768,13 @@ when the repository opens, which is the style of every other tunable.
 
 The library reads `detached-metadata-exclude` in one place,
 `ReceivePolicies::from_config`, which builds the receive policies of
-`ostrya receive` and `ostrya serve`, and does not read
-`gc-root-metadata-keys`. `Repo::prune` and the pull drivers act on the options
-they are given, and every default is what it was: `PruneOptions::default` is
-still the tool's prune. `ostrya-cli` reads `gc-root-metadata-keys` at its
-`prune` site and `detached-metadata-exclude` at its `pull`, `pull-local`, and
-`push` sites.
+`ostrya receive` and `ostrya serve`. It reads `gc-root-metadata-keys` in
+`Repo::prune`, after the option refusals and before the repository lock, and
+adds the config keys to the keys of the caller (E2). The pull drivers act on
+the options they are given, and every default is what it was:
+`PruneOptions::default` is the tool's prune on a repository that does not set
+`gc-root-metadata-keys`. `ostrya-cli` reads `detached-metadata-exclude` alone,
+at its `pull`, `pull-local`, and `push` sites.
 
 Five properties hold over the two keys:
 
@@ -8379,7 +8386,8 @@ over the survivors. This phase carries the walk inside `Repo::prune` and leaves
 the consumer the policy alone. The classification is a function, so no
 `[ex-ostrya]` config key carries it; a name-pattern key is a separate decision
 for a later phase. Every default the phase adds is the behavior that stands
-without it, so `PruneOptions::default()` is still the tool's prune.
+without it, so `PruneOptions::default()` is still the tool's prune on a
+repository that does not set `[ex-ostrya] gc-root-metadata-keys`.
 
 The release is 0.2.5. `PruneOptions` gains a field, and `PruneStats` gains one
 and loses `Copy`. Decision 14 calls a field added to an option struct a breaking
@@ -8505,12 +8513,13 @@ costs about 92 ns for each ref.
 line to standard error, in its own name, where the repository config sets
 `[core] locking` false, stating that the run holds no repository lock and that
 another writer can change the repository while it runs. The read stands after
-the options are assembled, so it leaves the place an `[ex-ostrya]
-gc-root-metadata-keys` refusal lands unmoved. One divergence stands, and
-`cli-surface.md`, "P2", `prune`, records it: with that key set the tool takes no
-lock either, prunes beside a held foreign lock, exits 0, and writes nothing to
-standard error. 25a closed a difference that stood between the two
-implementations, and it opened none; `cli-surface.md`, "P2", `prune`, now
+the options are assembled and before `Repo::prune`, which gives an
+`[ex-ostrya] gc-root-metadata-keys` refusal before the lock. So a `locking`
+refusal comes before a refusal of that key. One divergence stands, and
+`cli-surface.md`, "P2", `prune`, records it: with `[core] locking` false the
+tool takes no lock either, prunes beside a held foreign lock, exits 0, and
+writes nothing to standard error. 25a closed a difference that stood between the
+two implementations, and it opened none; `cli-surface.md`, "P2", `prune`, now
 carries the observation both implementations are measured against. No matrix
 cell reaches the line, because no harness setup edits `config`
 (`conformance/harness.md`, "Constraints").

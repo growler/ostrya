@@ -454,7 +454,8 @@ pub enum Error {
     /// A GC-root metadata key whose value is not a list of commit checksums.
     ///
     /// [`gc_root_metadata_keys`](crate::PruneOptions::gc_root_metadata_keys)
-    /// names the keys. A value gives this error if its variant type is not
+    /// and the repository config key `[ex-ostrya] gc-root-metadata-keys` name
+    /// the keys. A value gives this error if its variant type is not
     /// `aay`, `a(say)`, or `a{s(say)}`, if an element does not have the shape
     /// of that type, or if a checksum is not 32 bytes.
     #[error("gc-root metadata key {metadata_key} on commit {commit}: {reason}")]

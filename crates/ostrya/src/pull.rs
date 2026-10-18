@@ -512,8 +512,9 @@ impl DetachedMetadataFilter {
     /// ([`RepoConfig::detached_metadata_exclude`](crate::RepoConfig::detached_metadata_exclude)).
     /// These names share the key space that
     /// [`PruneOptions::gc_root_metadata_keys`](crate::PruneOptions::gc_root_metadata_keys)
-    /// reads, and neither list comes from the other. The library reads no
-    /// config: a pull filters what its options state.
+    /// reads, and neither list comes from the other. A pull does not read
+    /// `[ex-ostrya] detached-metadata-exclude`: it filters what its options
+    /// state.
     pub fn excluding<I, S>(names: I) -> DetachedMetadataFilter
     where
         I: IntoIterator<Item = S>,

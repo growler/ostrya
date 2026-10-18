@@ -13,7 +13,7 @@ use std::path::Path;
 use common::TmpDir;
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, DictBuilder,
-    Error, MutableTree, ObjectType, PruneOptions, Repo, RepoMode, Type, Value,
+    Error, LockKind, MutableTree, ObjectType, PruneOptions, Repo, RepoMode, Type, Value,
 };
 use ostrya_rt::block_on;
 
@@ -1080,5 +1080,262 @@ fn the_first_defect_in_walk_order_is_reported() {
         assert_eq!(metadata_key, GC_ROOTS);
         assert_eq!(reason, "type is `s`, not `aay`, `a(say)`, or `a{s(say)}`");
         assert!(holds(&repo, &orphan).await, "the orphan stays");
+    });
+}
+
+/// The metadata key that the tests of the config key name in the repository
+/// config, next to [`GC_ROOTS`].
+const CONFIG_ROOTS: &str = "test.config-roots";
+
+/// Appends `text` to the config of the repository under `base/repo` and
+/// returns a new handle, which reads the changed config.
+///
+/// The repository config of [`repo_with_trees`] ends in its `[core]` group, so
+/// a `[core]` key in `text` goes before the first group header of `text`.
+async fn reconfigure(base: &Path, text: &str) -> Repo {
+    let path = base.join("repo");
+    let config = path.join("config");
+    let mut current = std::fs::read_to_string(&config).unwrap();
+    current.push_str(text);
+    std::fs::write(&config, current).unwrap();
+    Repo::open(&path).await.unwrap()
+}
+
+/// Sets `[ex-ostrya] gc-root-metadata-keys` to `value` in the repository
+/// under `base/repo` and returns a new handle.
+async fn configure_keys(base: &Path, value: &str) -> Repo {
+    reconfigure(
+        base,
+        &format!("\n[ex-ostrya]\ngc-root-metadata-keys={value}\n"),
+    )
+    .await
+}
+
+#[test]
+fn a_config_key_keeps_its_anchor_with_no_caller_key() {
+    for configured in [false, true] {
+        let tmp = TmpDir::new("gc-roots-config-key");
+        block_on(async {
+            let repo = repo_with_trees(tmp.path(), &["kept", "head", "orphan"]).await;
+            let kept = commit(&repo, tmp.path(), "kept", None, None, None).await;
+            commit(
+                &repo,
+                tmp.path(),
+                "head",
+                None,
+                Some(checksum_list(GC_ROOTS, &[kept])),
+                Some("main"),
+            )
+            .await;
+            let orphan = orphan(&repo, tmp.path()).await;
+            let kept_root = commit_root(&repo, &kept).await;
+            let repo = if configured {
+                configure_keys(tmp.path(), GC_ROOTS).await
+            } else {
+                repo
+            };
+
+            // The caller names no metadata key.
+            let opts = PruneOptions {
+                refs_only: true,
+                ..PruneOptions::new()
+            };
+            assert!(opts.gc_root_metadata_keys.is_empty());
+            repo.prune(&opts).await.unwrap();
+            assert_eq!(
+                holds(&repo, &kept).await,
+                configured,
+                "the anchor survives only where the config names its key"
+            );
+            assert_eq!(
+                repo.has_object(ObjectType::DirTree, &kept_root)
+                    .await
+                    .unwrap(),
+                configured,
+                "the objects of the anchor go with it"
+            );
+            assert!(!holds(&repo, &orphan).await, "the orphan is pruned");
+        });
+    }
+}
+
+#[test]
+fn a_config_key_and_a_caller_key_keep_both_anchors() {
+    let tmp = TmpDir::new("gc-roots-config-and-caller");
+    block_on(async {
+        let repo = repo_with_trees(tmp.path(), &["first", "second", "head", "orphan"]).await;
+        let first = commit(&repo, tmp.path(), "first", None, None, None).await;
+        let second = commit(&repo, tmp.path(), "second", None, None, None).await;
+        let metadata = entries(vec![
+            (CONFIG_ROOTS, checksums(&[first])),
+            (GC_ROOTS, checksums(&[second])),
+        ]);
+        commit(
+            &repo,
+            tmp.path(),
+            "head",
+            None,
+            Some(metadata),
+            Some("main"),
+        )
+        .await;
+        let orphan = orphan(&repo, tmp.path()).await;
+        let repo = configure_keys(tmp.path(), CONFIG_ROOTS).await;
+
+        let opts = PruneOptions {
+            refs_only: true,
+            gc_root_metadata_keys: vec![GC_ROOTS.to_owned()],
+            ..PruneOptions::new()
+        };
+        repo.prune(&opts).await.unwrap();
+        assert!(
+            holds(&repo, &first).await,
+            "the anchor of the config key survives"
+        );
+        assert!(
+            holds(&repo, &second).await,
+            "the anchor of the caller key survives"
+        );
+        assert!(!holds(&repo, &orphan).await, "the orphan is pruned");
+    });
+}
+
+/// Checks that a key in both lists is accepted and keeps its anchor. The unit
+/// tests of the merge cover the merge order and the removal of repeats.
+#[test]
+fn a_key_in_both_lists_keeps_its_anchor() {
+    let tmp = TmpDir::new("gc-roots-key-in-both");
+    block_on(async {
+        let repo = repo_with_trees(tmp.path(), &["kept", "head", "orphan"]).await;
+        let kept = commit(&repo, tmp.path(), "kept", None, None, None).await;
+        commit(
+            &repo,
+            tmp.path(),
+            "head",
+            None,
+            Some(checksum_list(GC_ROOTS, &[kept])),
+            Some("main"),
+        )
+        .await;
+        let orphan = orphan(&repo, tmp.path()).await;
+        let repo = configure_keys(tmp.path(), GC_ROOTS).await;
+
+        repo.prune(&gc_root_options()).await.unwrap();
+        assert!(holds(&repo, &kept).await, "the anchor survives");
+        assert!(!holds(&repo, &orphan).await, "the orphan is pruned");
+    });
+}
+
+#[test]
+fn a_config_value_that_does_not_parse_fails_the_prune() {
+    let tmp = TmpDir::new("gc-roots-config-malformed");
+    block_on(async {
+        let repo = repo_with_trees(tmp.path(), &["head", "orphan"]).await;
+        commit(&repo, tmp.path(), "head", None, None, Some("main")).await;
+        let orphan = orphan(&repo, tmp.path()).await;
+        // A trailing backslash is a malformed escape sequence.
+        let repo = configure_keys(tmp.path(), "app.roots\\").await;
+
+        let before = repo.list_objects().await.unwrap();
+        let err = repo.prune(&gc_root_options()).await.unwrap_err();
+        assert!(matches!(err, Error::Core(_)), "got {err:?}");
+        assert_eq!(
+            repo.list_objects().await.unwrap(),
+            before,
+            "a refused prune deletes nothing"
+        );
+        assert!(holds(&repo, &orphan).await, "the orphan stays");
+
+        // A delta-only run walks nothing, and the value also fails it.
+        let opts = PruneOptions {
+            delete_commit: Some(orphan),
+            static_deltas_only: true,
+            ..PruneOptions::new()
+        };
+        let err = repo.prune(&opts).await.unwrap_err();
+        assert!(matches!(err, Error::Core(_)), "got {err:?}");
+        assert_eq!(
+            repo.list_objects().await.unwrap(),
+            before,
+            "a refused delta-only prune deletes nothing"
+        );
+    });
+}
+
+#[test]
+fn the_config_read_precedes_the_lock() {
+    let tmp = TmpDir::new("gc-roots-config-before-lock");
+    block_on(async {
+        let repo = repo_with_trees(tmp.path(), &["head", "orphan"]).await;
+        commit(&repo, tmp.path(), "head", None, None, Some("main")).await;
+        let orphan = orphan(&repo, tmp.path()).await;
+        let pruning = reconfigure(
+            tmp.path(),
+            "lock-timeout-secs=0\n\n[ex-ostrya]\ngc-root-metadata-keys=app.roots\\\n",
+        )
+        .await;
+
+        let held = repo
+            .transaction_with_lock(LockKind::Exclusive)
+            .await
+            .expect("take the exclusive hold");
+        // The hold excludes the handle that the prune uses.
+        let Err(err) = pruning.transaction().await else {
+            panic!("a transaction opened under an exclusive hold");
+        };
+        assert!(
+            matches!(err, Error::LockTimeout { secs: 0 }),
+            "the hold is live: {err:?}"
+        );
+
+        let err = pruning.prune(&gc_root_options()).await.unwrap_err();
+        assert!(
+            matches!(err, Error::Core(_)),
+            "the config refusal comes before the lock: {err:?}"
+        );
+        held.abort().await.unwrap();
+        assert!(holds(&pruning, &orphan).await, "the orphan stays");
+    });
+}
+
+#[test]
+fn gc_roots_options_with_a_config_key_keep_the_anchors_of_both() {
+    let tmp = TmpDir::new("gc-roots-options-and-config");
+    block_on(async {
+        let repo = repo_with_trees(tmp.path(), &["first", "second", "head", "orphan"]).await;
+        let first = commit(&repo, tmp.path(), "first", None, None, None).await;
+        let second = commit(&repo, tmp.path(), "second", None, None, None).await;
+        let metadata = entries(vec![
+            (CONFIG_ROOTS, checksums(&[first])),
+            (GC_ROOTS, checksums(&[second])),
+        ]);
+        commit(
+            &repo,
+            tmp.path(),
+            "head",
+            None,
+            Some(metadata),
+            Some("main"),
+        )
+        .await;
+        let orphan = orphan(&repo, tmp.path()).await;
+        let repo = configure_keys(tmp.path(), CONFIG_ROOTS).await;
+
+        let opts = gc_root_options();
+        repo.prune(&opts).await.unwrap();
+        assert_eq!(
+            opts.gc_root_metadata_keys,
+            vec![GC_ROOTS.to_owned()],
+            "the options hold the caller key alone"
+        );
+        assert!(
+            holds(&repo, &first).await,
+            "the anchor of the config key survives"
+        );
+        assert!(
+            holds(&repo, &second).await,
+            "the anchor of the caller key survives"
+        );
+        assert!(!holds(&repo, &orphan).await, "the orphan is pruned");
     });
 }

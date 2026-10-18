@@ -22399,6 +22399,36 @@ fn prune_refuses_a_malformed_gc_root_metadata_keys_value() {
     );
 }
 
+/// The `prune` handler reads `[core] locking` before `Repo::prune` reads
+/// `[ex-ostrya] gc-root-metadata-keys`. If both values do not parse, the
+/// `locking` refusal comes first, and the prune deletes nothing.
+#[test]
+fn prune_refuses_a_bad_locking_value_before_a_malformed_key_list() {
+    let tmp = TmpDir::new("prune-gc-roots-locking-first");
+    let base = tmp.path();
+    let repo = create_repo(base, RepoMode::Archive);
+    let repo_arg = format!("--repo={}", repo.display());
+    let orphan = ex_ostrya_commit(&repo, base, "orphan", None, None);
+    ex_ostrya_commit(&repo, base, "head", None, Some("main"));
+
+    let config = std::fs::read_to_string(repo.join("config")).unwrap();
+    let mut config = config.replacen("[core]\n", "[core]\nlocking=bogus\n", 1);
+    config.push_str("\n[ex-ostrya]\ngc-root-metadata-keys=app.roots\\\n");
+    std::fs::write(repo.join("config"), config).unwrap();
+
+    let run = ostrya(&[&repo_arg, "prune", "--refs-only"], None, &[]);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(!run.status.success(), "the prune fails: {stderr}");
+    assert!(
+        stderr.contains("value 'bogus' for core.locking is not a boolean"),
+        "the prune refuses on `locking` first: {stderr}"
+    );
+    assert!(
+        ex_ostrya_holds(&repo, &orphan),
+        "and the prune deletes nothing"
+    );
+}
+
 // --- prune -------------------------------------------------------------------
 //
 // Each test builds one repository and copies it for each command. The test

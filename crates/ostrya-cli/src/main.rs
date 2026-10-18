@@ -11099,7 +11099,6 @@ async fn prune(repo: Repo, args: PruneArgs) -> Result<()> {
         retain_branch_depth,
         commit_only: args.commit_only,
         static_deltas_only: args.static_deltas_only,
-        gc_root_metadata_keys: repo.config().gc_root_metadata_keys()?,
         ..PruneOptions::default()
     };
     // If the config of a repository sets `[core] locking` to false, the prune
@@ -11107,10 +11106,18 @@ async fn prune(repo: Repo, args: PruneArgs) -> Result<()> {
     // writer. The `ostree` command writes nothing at this point, so this line
     // is a recorded divergence.
     //
-    // The read is here, after the options are assembled, so it does not move
-    // the point of an `[ex-ostrya] gc-root-metadata-keys` refusal. `commit`
-    // reads the four `[core]` keys of its transaction at the top of its
-    // function. If this read moves to the top of this function, a
+    // The config reads of a prune come in this order:
+    //
+    // 1. `[core] locking`, here, for the warning line.
+    // 2. `[ex-ostrya] gc-root-metadata-keys`, in `Repo::prune`, before the
+    //    lock.
+    // 3. `[core] locking` and `[core] lock-timeout-secs`, at the lock.
+    // 4. `[core] tombstone-commits` and `[core] fsync`, in the run.
+    //
+    // So a `locking=bogus` refusal comes before a refusal of a key list that
+    // does not parse. The read is here, after the options are assembled.
+    // `commit` reads the four `[core]` keys of its transaction at the top of
+    // its function. If this read moves to the top of this function, a
     // `locking=bogus` refusal comes before the `--keep-younger-than`,
     // `--retain-branch-depth`, and `--delete-commit` refusals. That order
     // contradicts the conformance record: each config read of `prune` comes

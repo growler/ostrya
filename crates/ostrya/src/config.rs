@@ -452,15 +452,15 @@ impl RepoConfig {
     /// reachable commits. The key is an ostrya extension, and the list is empty
     /// by default.
     ///
-    /// The `ostrya prune` command puts this list into
+    /// [`Repo::prune`](crate::Repo::prune) reads this key and merges the list
+    /// with
     /// [`PruneOptions::gc_root_metadata_keys`](crate::PruneOptions::gc_root_metadata_keys).
-    /// The list adds roots and removes none. It has no counterpart for
+    /// The config keys come first, and the merged list holds each key one
+    /// time. The list adds roots and removes none. It has no counterpart for
     /// [`traverse_parent`](crate::PruneOptions::traverse_parent). As a result,
-    /// a prune with this list keeps at least what a prune with the
-    /// reachability of the `ostree` command keeps.
-    ///
-    /// The library does not read this key. [`Repo::prune`](crate::Repo::prune)
-    /// uses only the options that its caller gives.
+    /// a prune with this list keeps at least what the same prune without it
+    /// keeps. With `traverse_parent` set, as `ostrya prune` runs, that is at
+    /// least what the `ostree` command keeps.
     ///
     /// # Errors
     ///

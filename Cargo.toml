@@ -10,6 +10,7 @@ members = [
     "crates/ostrya-remote",
     "crates/ostrya-sys",
     "crates/ostrya",
+    "crates/ostrya-mount",
     "crates/ostrya-server",
     "crates/ostrya-cli",
     "crates/ostrya-conformance",
@@ -33,4 +34,5 @@ ostrya-fetch = { path = "crates/ostrya-fetch", version = "0.4.0", default-featur
 ostrya-remote = { path = "crates/ostrya-remote", version = "0.4.0", default-features = false }
 ostrya-sys = { path = "crates/ostrya-sys", version = "0.4.0" }
 ostrya = { path = "crates/ostrya", version = "0.4.0", default-features = false }
+ostrya-mount = { path = "crates/ostrya-mount", version = "0.4.0", default-features = false }
 ostrya-server = { path = "crates/ostrya-server", version = "0.4.0", default-features = false }

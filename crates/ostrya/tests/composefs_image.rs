@@ -17,6 +17,8 @@
 //! - Prune removes the image with its commit, and removes an image whose
 //!   commit is absent. The image changes no prune statistic.
 //! - The image bytes are the same in `bare`, `bare-user`, and `archive`.
+//! - The checked open returns the image that it checked, at offset 0, and
+//!   refuses a commit without the key, an absent image, and a changed image.
 //!
 //! The test of the golden image skips if the composefs fixture is absent. The
 //! tests that seal the image skip if the file system has no fs-verity. The
@@ -709,6 +711,100 @@ fn a_sealing_repository_seals_the_image() {
             repo.check_composefs_image(&commit).await.unwrap(),
             ComposefsImageState::Valid
         );
+        // The checked open reads the digest from the kernel for a sealed
+        // image: the descriptor it returns carries the fs-verity attribute,
+        // and the kernel digest of that descriptor is the key.
+        let (file, len) = repo.open_composefs_image_checked(&commit).await.unwrap();
+        assert_eq!(len, std::fs::metadata(&path).unwrap().len());
+        let stat = rustix::fs::statx(
+            &file,
+            "",
+            rustix::fs::AtFlags::EMPTY_PATH,
+            rustix::fs::StatxFlags::SIZE,
+        )
+        .unwrap();
+        assert!(
+            stat.stx_attributes
+                .contains(rustix::fs::StatxAttributes::VERITY)
+        );
+        assert_eq!(
+            ostrya_sys::measure_verity(file.as_fd()).unwrap(),
+            recorded(&repo, &commit).await
+        );
+    });
+}
+
+/// The checked open returns the stored image at offset 0, with its size. It
+/// refuses a commit without the key, a malformed key, an absent image, and an
+/// image with one byte changed.
+#[test]
+fn the_checked_open_returns_the_image_it_checked() {
+    use std::io::Read;
+
+    let scratch = TmpDir::new("cfs-open-checked");
+    let base = scratch.path().join("tree");
+    build_owned_source(&base);
+    block_on(async {
+        let repo = new_repo(&scratch.path().join("repo"), RepoMode::BareUser, "").await;
+        let plain = commit_owned(&repo, &base).await;
+        let (keyed, _) = commit_tree(&repo, &base, 3, false, None).await;
+        let (commit, _) = commit_tree(&repo, &base, 5, true, None).await;
+        let path = repo.composefs_image_path(&commit);
+
+        let (mut file, len) = repo.open_composefs_image_checked(&commit).await.unwrap();
+        let mut bytes = Vec::new();
+        file.read_to_end(&mut bytes).unwrap();
+        assert_eq!(bytes, std::fs::read(&path).unwrap(), "the read starts at 0");
+        assert_eq!(len, bytes.len() as u64);
+
+        let err = repo.open_composefs_image_checked(&plain).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidInput(_)), "{err}");
+
+        let (tree, _) = repo.read_commit(&plain.to_hex()).await.unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let bad = txn
+            .write_commit(
+                CommitOptions {
+                    timestamp: Some(9),
+                    metadata: Some(dict(DIGEST_KEY, "s", Value::Str("digest".into()))),
+                    ..CommitOptions::default()
+                },
+                &tree,
+            )
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        let err = repo.open_composefs_image_checked(&bad).await.unwrap_err();
+        assert!(matches!(err, Error::InvalidFormat(_)), "{err}");
+
+        let err = repo.open_composefs_image_checked(&keyed).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::ObjectNotFound { checksum, ty: ObjectType::ComposefsImage }
+                    if checksum == keyed
+            ),
+            "{err}"
+        );
+
+        let expected = recorded(&repo, &commit).await;
+        flip_middle_byte(&path);
+        match repo
+            .open_composefs_image_checked(&commit)
+            .await
+            .unwrap_err()
+        {
+            Error::ComposefsDigestMismatch {
+                commit: got,
+                expected: key,
+                actual,
+            } => {
+                assert_eq!(got, commit);
+                assert_eq!(key, expected);
+                assert_eq!(actual, file_digest(&path));
+            }
+            other => panic!("{other}"),
+        }
     });
 }
 

@@ -1,0 +1,32 @@
+[package]
+name = "ostrya-mount"
+description = "Mounts an ostrya commit as composefs (EROFS and overlayfs) on Linux"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+readme = "README.md"
+
+[features]
+default = ["smol"]
+smol = ["ostrya/smol", "ostrya-rt/smol"]
+tokio = ["ostrya/tokio", "ostrya-rt/tokio"]
+
+# The crate builds on Linux alone.
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
+
+[dependencies]
+ostrya = { workspace = true }
+ostrya-rt = { workspace = true }
+# The loop device and the sealed memory file.
+ostrya-sys = { workspace = true }
+thiserror = "2"
+# The new mount API (`fsopen`, `fsconfig`, `fsmount`, `move_mount`) and the
+# unmount. Each of these calls is safe in rustix.
+rustix = { version = "1", default-features = false, features = [
+    "std",
+    "fs",
+    "mount",
+] }

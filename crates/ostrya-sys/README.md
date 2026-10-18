@@ -4,13 +4,15 @@ Ostrya \[_n._ a botanical genus within the family Betulaceae, commonly
 known as _ironwood tree_\] is a pure-Rust, async implementation of the
 ostree repository system, written from scratch.
 
-Wrappers for the Linux fs-verity ioctls and for a read-only memory map.
+Wrappers for the Linux fs-verity ioctls, a read-only memory map, the loop
+device, and a sealed memory file.
 
 A caller seals a file with fs-verity and reads the digest and the
 parameters that the kernel holds for the sealed file. The seal has the
 parameters that ostree uses: SHA-256, 4096-byte blocks, and no salt. A
-caller can also map a file read-only. The only dependency of the crate is
-`rustix`.
+caller can also map a file read-only. On Linux, a caller attaches a file
+to a loop device, and writes bytes to a memory file that it then seals.
+The only dependency of the crate is `rustix`.
 
 API documentation: <https://docs.rs/ostrya-sys>
 
@@ -20,6 +22,10 @@ API documentation: <https://docs.rs/ostrya-sys>
 - `measure_verity` returns the fs-verity digest of a sealed file.
 - `read_verity_descriptor` returns the parameters of a sealed file.
 - `Mmap` is a read-only memory map of a file.
+- `LoopDevice::attach` attaches a file to a free loop device with a
+  `LoopConfig`. Linux only.
+- `sealable_memfd` creates a memory file that accepts seals, and
+  `seal_contents` seals its bytes and its size. Linux only.
 
 ## Examples
 

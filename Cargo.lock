@@ -1785,6 +1785,17 @@ name = "ostrya-gvariant"
 version = "0.4.0"
 
 [[package]]
+name = "ostrya-mount"
+version = "0.4.0"
+dependencies = [
+ "ostrya",
+ "ostrya-rt",
+ "ostrya-sys",
+ "rustix",
+ "thiserror",
+]
+
+[[package]]
 name = "ostrya-remote"
 version = "0.4.0"
 dependencies = [

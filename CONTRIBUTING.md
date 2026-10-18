@@ -26,6 +26,15 @@ cargo test                                        # smol (default)
 cargo test -p ostrya --no-default-features --features tokio
 ```
 
+The mount tests of `ostrya-sys` and `ostrya-mount` need `CAP_SYS_ADMIN` in the
+initial user namespace, so they skip for another user. Run them as root on a
+file system with fs-verity. If `OSTRYA_REQUIRE_MOUNT` is set, a missing
+privilege or a file system without fs-verity fails them:
+
+```sh
+OSTRYA_REQUIRE_MOUNT=1 cargo test -p ostrya-sys -p ostrya-mount
+```
+
 ## Golden fixtures
 
 The golden fixtures are in `tests/fixtures/`. This directory is outside every

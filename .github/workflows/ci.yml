@@ -191,6 +191,11 @@ jobs:
           cargo check -p ostrya-server --no-default-features --features smol
           cargo check -p ostrya-cli --no-default-features --features smol,serve
 
+      # The composefs mount library compiles on the smol backend with its own
+      # feature set.
+      - name: ostrya-mount on the smol backend compiles
+        run: cargo check -p ostrya-mount --no-default-features --features smol
+
       # `Repo::send` takes no feature of `ostrya`, so `ostrya send` compiles
       # without `receive`, `push`, and `serve`.
       - name: ostrya send without the push features compiles
@@ -244,14 +249,14 @@ jobs:
       # `default-features = false`, and each dependent forwards `smol` and
       # `tokio` itself. So a tokio build of `ostrya` holds no `smol`, with and
       # without the `receive` and the `push` features, and so does a tokio
-      # build of `ostrya-server`. `ostrya-remote` is a regular dependency of
-      # `ostrya`, so each of these builds holds it. This fails when one path
-      # turns the smol backend on.
+      # build of `ostrya-server` and of `ostrya-mount`. `ostrya-remote` is a
+      # regular dependency of `ostrya`, so each of these builds holds it. This
+      # fails when one path turns the smol backend on.
       # `cargo tree -i` exits non-zero both when the package is absent and on
       # any other failure, so the step also reads the error text.
       - name: A tokio build holds no smol
         run: |
-          for build in ostrya:tokio ostrya:tokio,receive ostrya:tokio,push ostrya-server:tokio; do
+          for build in ostrya:tokio ostrya:tokio,receive ostrya:tokio,push ostrya-server:tokio ostrya-mount:tokio; do
             package=${build%%:*}
             features=${build#*:}
             if out=$(cargo tree -p "$package" --no-default-features --features "$features" -i smol 2>&1); then

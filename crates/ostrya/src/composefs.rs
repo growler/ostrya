@@ -30,6 +30,10 @@
 //!   transaction.
 //! - [`Repo::check_composefs_image`] compares a stored image with the key of
 //!   its commit, and [`Repo::composefs_image_path`] gives its path.
+//! - [`Repo::open_composefs_image_checked`] opens a stored image and compares
+//!   it with the key through the descriptor that it returns.
+//! - [`Repo::objects_dir`] gives the descriptor of the object store. A
+//!   composefs mount reads the backing objects of the image through it.
 //!
 //! Each write refuses a commit without the key and an image whose digest is
 //! not the key. A write never holds the whole image in memory.
@@ -1068,6 +1072,81 @@ impl Repo {
         })
     }
 
+    /// Opens the stored composefs image of `commit` and compares its digest
+    /// with the key `ostree.composefs.digest.v0` of the commit.
+    ///
+    /// The call returns the open file and its size in bytes. The file offset
+    /// is 0. The call measures the digest through the same descriptor that it
+    /// returns, so a caller that reads the image through this file reads the
+    /// inode that the call checked.
+    ///
+    /// If the image is sealed with fs-verity with SHA-256, 4096-byte blocks,
+    /// no salt, and its full size, the call reads the digest from the kernel.
+    /// The kernel then refuses each change of the image. Otherwise the call
+    /// streams the image through the fs-verity hasher in chunks of 128 KiB. A
+    /// process that can write the unsealed file can change it after the call
+    /// returns, so the check holds only for the bytes that the call read.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidInput`] if the commit does not carry
+    ///   `ostree.composefs.digest.v0`.
+    /// - [`Error::InvalidFormat`] if the first entry of
+    ///   `ostree.composefs.digest.v0` is not a variant of type `ay` with 32
+    ///   bytes.
+    /// - [`Error::ObjectNotFound`] with the type
+    ///   [`ObjectType::ComposefsImage`] if the repository holds no image of
+    ///   `commit`, or with the type [`ObjectType::Commit`] if the commit object
+    ///   is not in the object store.
+    /// - [`Error::ComposefsDigestMismatch`] if the digest of the image is not
+    ///   the key.
+    /// - [`Error::Core`] if the commit object does not parse.
+    /// - [`Error::Io`] if a read of the image or another file system operation
+    ///   fails, or if the commit object is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
+    pub async fn open_composefs_image_checked(
+        &self,
+        commit: &Checksum,
+    ) -> Result<(std::fs::File, u64)> {
+        let bytes = self.load_object_bytes(ObjectType::Commit, commit).await?;
+        let commit_obj = Commit::parse(&bytes)?;
+        let expected = require_recorded_digest(&commit_obj, commit)?;
+        let repo = self.clone();
+        let commit = *commit;
+        ostrya_rt::unblock(move || {
+            use std::io::{Seek, SeekFrom};
+
+            let Some(StoredImage {
+                mut file,
+                len,
+                sealed,
+            }) = open_stored_image_blocking(repo.objects_fd(), &commit, repo.mode())?
+            else {
+                return Err(Error::ObjectNotFound {
+                    checksum: commit,
+                    ty: ObjectType::ComposefsImage,
+                });
+            };
+            let actual = match crate::file::sealed_digest(file.as_fd(), len, sealed) {
+                Some(digest) => digest,
+                None => {
+                    let digest = image_file_digest(&mut file)?;
+                    file.seek(SeekFrom::Start(0))?;
+                    digest
+                }
+            };
+            if actual != expected {
+                return Err(Error::ComposefsDigestMismatch {
+                    commit,
+                    expected,
+                    actual,
+                });
+            }
+            Ok((file, len))
+        })
+        .await
+    }
+
     /// Returns the fs-verity digest of the stored composefs image of
     /// `commit`, or `None` if the repository holds no image of it.
     ///
@@ -1095,14 +1174,45 @@ impl Repo {
         let repo = self.clone();
         let commit = *commit;
         ostrya_rt::unblock(move || {
-            let Some(file) = open_image_blocking(repo.objects_fd(), &commit, repo.mode())? else {
-                return Ok(None);
-            };
-            let len = file.metadata()?.len();
-            Ok(Some((file, len)))
+            let image = open_stored_image_blocking(repo.objects_fd(), &commit, repo.mode())?;
+            Ok(image.map(|image| (image.file, image.len)))
         })
         .await
     }
+}
+
+/// A stored composefs image, open for reading.
+struct StoredImage {
+    /// The open image.
+    file: std::fs::File,
+    /// The size of the image in bytes.
+    len: u64,
+    /// The image is sealed with fs-verity.
+    sealed: bool,
+}
+
+/// Opens the stored composefs image of `commit` under `objects_fd` for
+/// reading, and reads its size and its fs-verity attribute with one `statx`
+/// of the open file. Returns `None` if the image is absent.
+fn open_stored_image_blocking(
+    objects_fd: BorrowedFd<'_>,
+    commit: &Checksum,
+    mode: RepoMode,
+) -> Result<Option<StoredImage>> {
+    let Some(file) = open_image_blocking(objects_fd, commit, mode)? else {
+        return Ok(None);
+    };
+    let stat = rustix::fs::statx(
+        &file,
+        "",
+        rustix::fs::AtFlags::EMPTY_PATH,
+        rustix::fs::StatxFlags::SIZE,
+    )?;
+    Ok(Some(StoredImage {
+        file,
+        len: stat.stx_size,
+        sealed: crate::file::is_sealed(&stat),
+    }))
 }
 
 /// Opens the stored composefs image of `commit` under `objects_fd` for
@@ -1248,7 +1358,7 @@ async fn composefs_model(
 /// image. A buffer wraps the descriptor, because the writer emits the image in
 /// many small writes.
 fn write_image_to_fd(dir: &Directory, fd: OwnedFd) -> std::result::Result<[u8; 32], WriterError> {
-    let mut out = BufWriter::new(std::fs::File::from(fd));
+    let mut out = BufWriter::with_capacity(DIGEST_CHUNK, std::fs::File::from(fd));
     write_image_to(dir, &mut out)
 }
 

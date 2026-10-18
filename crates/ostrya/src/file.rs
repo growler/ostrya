@@ -734,7 +734,7 @@ fn stat_object(
 /// kernel sets the attribute on every file with fs-verity enabled. The
 /// function does not read the attribute mask, because btrfs sets the
 /// attribute and leaves it out of the mask.
-fn is_sealed(stat: &Statx) -> bool {
+pub(crate) fn is_sealed(stat: &Statx) -> bool {
     stat.stx_attributes.contains(StatxAttributes::VERITY)
 }
 
@@ -742,7 +742,7 @@ fn is_sealed(stat: &Statx) -> bool {
 /// object open at `fd`. The object must be sealed with SHA-256, 4096-byte
 /// blocks, no salt, and a data size of `size`. If `probe` is clear, the
 /// function issues no ioctl. Every error and every mismatch gives `None`.
-fn sealed_digest(fd: BorrowedFd<'_>, size: u64, probe: bool) -> Option<[u8; 32]> {
+pub(crate) fn sealed_digest(fd: BorrowedFd<'_>, size: u64, probe: bool) -> Option<[u8; 32]> {
     if !probe {
         return None;
     }

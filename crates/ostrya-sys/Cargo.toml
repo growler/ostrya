@@ -1,6 +1,6 @@
 [package]
 name = "ostrya-sys"
-description = "Audited unsafe rustix syscall wrappers for ostrya (fs-verity ioctls, read-only mmap)"
+description = "Audited unsafe rustix syscall wrappers for ostrya (fs-verity ioctls, read-only mmap, loop device, sealed memfd)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true

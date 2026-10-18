@@ -1,12 +1,14 @@
 #![deny(unsafe_code)]
 
-//! Wrappers for the Linux fs-verity ioctls and for a read-only memory map.
+//! Wrappers for the Linux fs-verity ioctls, a read-only memory map, the loop
+//! device, and a sealed memory file.
 //!
 //! A caller seals a file with fs-verity and reads the digest and the
 //! parameters that the kernel holds for the sealed file. The seal has the
 //! parameters that ostree uses: SHA-256, 4096-byte blocks, and no salt. A
-//! caller can also map a file read-only. The only dependency of the crate is
-//! `rustix`.
+//! caller can also map a file read-only. On Linux, a caller attaches a file
+//! to a loop device, and writes bytes to a memory file that it then seals.
+//! The only dependency of the crate is `rustix`.
 //!
 //! # Entry points
 //!
@@ -14,6 +16,10 @@
 //! - [`measure_verity`] returns the fs-verity digest of a sealed file.
 //! - [`read_verity_descriptor`] returns the parameters of a sealed file.
 //! - [`Mmap`] is a read-only memory map of a file.
+//! - [`LoopDevice::attach`] attaches a file to a free loop device with a
+//!   [`LoopConfig`]. Linux only.
+//! - [`sealable_memfd`] creates a memory file that accepts seals, and
+//!   [`seal_contents`] seals its bytes and its size. Linux only.
 //!
 //! # Examples
 //!
@@ -41,9 +47,9 @@
 
 // All other library crates of ostrya are `#![forbid(unsafe_code)]`. This crate
 // holds the `rustix` calls that need `unsafe` and that no safe `rustix` wrapper
-// gives. The crate root is `#![deny(unsafe_code)]`. Each of the modules `imp`
-// and `mmap` has a scoped `#![allow(unsafe_code)]`, so the audited `unsafe`
-// code stays in these two modules.
+// gives. The crate root is `#![deny(unsafe_code)]`. Each of the modules `imp`,
+// `mmap`, and `loop_dev` has a scoped `#![allow(unsafe_code)]`, so the audited
+// `unsafe` code stays in these three modules.
 
 mod imp {
     #![allow(unsafe_code)]
@@ -529,6 +535,338 @@ mod mmap {
     }
 }
 
+#[cfg(target_os = "linux")]
+pub use loop_dev::{
+    LO_FLAGS_AUTOCLEAR, LO_FLAGS_DIRECT_IO, LO_FLAGS_READ_ONLY, LoopConfig, LoopDevice,
+};
+#[cfg(target_os = "linux")]
+pub use memfd::{seal_contents, sealable_memfd};
+
+#[cfg(target_os = "linux")]
+mod loop_dev {
+    #![allow(unsafe_code)]
+
+    use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd};
+
+    use rustix::fs::{CWD, Mode, OFlags, openat};
+    use rustix::io::{Errno, Result};
+    use rustix::ioctl::{Getter, Ioctl, IoctlOutput, Opcode, Setter, ioctl};
+
+    /// The loop device is read-only.
+    pub const LO_FLAGS_READ_ONLY: u32 = 1;
+    /// The kernel detaches the backing file at the last close of the device.
+    pub const LO_FLAGS_AUTOCLEAR: u32 = 4;
+    /// The loop device reads the backing file with direct I/O.
+    pub const LO_FLAGS_DIRECT_IO: u32 = 16;
+
+    /// `LOOP_GET_STATUS64`. The loop ioctls use fixed numbers, not the
+    /// `_IOC` encoding.
+    const LOOP_GET_STATUS64: Opcode = 0x4C05;
+    /// `LOOP_CONFIGURE`.
+    const LOOP_CONFIGURE: Opcode = 0x4C0A;
+    /// `LOOP_CTL_GET_FREE`, an ioctl of `/dev/loop-control`.
+    const LOOP_CTL_GET_FREE: Opcode = 0x4C82;
+    /// The number of attempts of [`LoopDevice::attach`] when another process
+    /// takes the free device first.
+    const ATTACH_ATTEMPTS: u32 = 10;
+
+    /// The `loop_info64` struct of the kernel UAPI, 232 bytes.
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    #[allow(dead_code)]
+    struct LoopInfo64 {
+        lo_device: u64,
+        lo_inode: u64,
+        lo_rdevice: u64,
+        lo_offset: u64,
+        lo_sizelimit: u64,
+        lo_number: u32,
+        lo_encrypt_type: u32,
+        lo_encrypt_key_size: u32,
+        lo_flags: u32,
+        lo_file_name: [u8; 64],
+        lo_crypt_name: [u8; 64],
+        lo_encrypt_key: [u8; 32],
+        lo_init: [u64; 2],
+    }
+
+    /// The `loop_config` struct of the kernel UAPI, 304 bytes. The kernel
+    /// reads each field through the raw pointer of `LOOP_CONFIGURE`.
+    #[repr(C)]
+    #[allow(dead_code)]
+    struct LoopConfigRaw {
+        fd: u32,
+        block_size: u32,
+        info: LoopInfo64,
+        reserved: [u64; 8],
+    }
+
+    const _: () = assert!(size_of::<LoopInfo64>() == 232);
+    const _: () = assert!(size_of::<LoopConfigRaw>() == 304);
+    const _: () = assert!(std::mem::offset_of!(LoopConfigRaw, info) == 8);
+    const _: () = assert!(std::mem::offset_of!(LoopInfo64, lo_flags) == 52);
+
+    /// The `LOOP_CTL_GET_FREE` call. The kernel returns the number of a free
+    /// loop device as the result of the ioctl. No rustix pattern returns this
+    /// value.
+    struct GetFree;
+
+    // SAFETY: `LOOP_CTL_GET_FREE` takes no argument and reads no user memory,
+    // so the null pointer of `as_ptr` is never read. The call changes no user
+    // memory, so `IS_MUTATING` is false. `output_from_ptr` reads nothing
+    // through the pointer. It converts the non-negative device number that a
+    // successful call returns.
+    unsafe impl Ioctl for GetFree {
+        type Output = u32;
+
+        const IS_MUTATING: bool = false;
+
+        fn opcode(&self) -> Opcode {
+            LOOP_CTL_GET_FREE
+        }
+
+        fn as_ptr(&mut self) -> *mut core::ffi::c_void {
+            core::ptr::null_mut()
+        }
+
+        unsafe fn output_from_ptr(
+            out: IoctlOutput,
+            _: *mut core::ffi::c_void,
+        ) -> Result<Self::Output> {
+            u32::try_from(out).map_err(|_| Errno::INVAL)
+        }
+    }
+
+    /// The configuration of a new loop device.
+    #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+    pub struct LoopConfig {
+        /// The logical block size of the device in bytes. The value 0 lets
+        /// the kernel choose the default.
+        pub block_size: u32,
+        /// The device is read-only.
+        pub read_only: bool,
+        /// The kernel detaches the backing file at the last close of the
+        /// device.
+        pub autoclear: bool,
+        /// The device reads the backing file with direct I/O where the
+        /// kernel accepts it. [`LoopDevice::attach`] tells which.
+        pub direct_io: bool,
+    }
+
+    impl LoopConfig {
+        /// Returns the `lo_flags` value of the configuration.
+        fn flags(&self) -> u32 {
+            let mut flags = 0;
+            if self.read_only {
+                flags |= LO_FLAGS_READ_ONLY;
+            }
+            if self.autoclear {
+                flags |= LO_FLAGS_AUTOCLEAR;
+            }
+            if self.direct_io {
+                flags |= LO_FLAGS_DIRECT_IO;
+            }
+            flags
+        }
+    }
+
+    /// An open loop device with a backing file.
+    ///
+    /// The value holds an open descriptor of `/dev/loopN`. With
+    /// [`LoopConfig::autoclear`], the kernel detaches the backing file at the
+    /// last close of the device. A file system that the device holds keeps
+    /// the device open until its unmount.
+    #[derive(Debug)]
+    pub struct LoopDevice {
+        fd: OwnedFd,
+        number: u32,
+    }
+
+    impl LoopDevice {
+        /// Attaches `backing` to a free loop device with `cfg`.
+        ///
+        /// The call asks `/dev/loop-control` for a free device, opens
+        /// `/dev/loopN`, and configures it with `LOOP_CONFIGURE` in one step.
+        /// The open is read-only for [`LoopConfig::read_only`], and for
+        /// reading and writing otherwise. If another process configures the
+        /// same device first, the kernel returns `EBUSY`, and the call tries
+        /// the next free device, up to 10 times.
+        ///
+        /// If the kernel refuses [`LoopConfig::direct_io`] with `EINVAL`, the
+        /// call configures the same device again without direct I/O. A
+        /// backing file that does not accept direct I/O gives this refusal.
+        ///
+        /// `LOOP_CONFIGURE` is available since Linux 5.8.
+        ///
+        /// # Errors
+        ///
+        /// - An `Errno` from the open of `/dev/loop-control` or of
+        ///   `/dev/loopN`, for example `EACCES` or `EPERM` for a process with
+        ///   no access to the loop devices.
+        /// - An `Errno` from `LOOP_CTL_GET_FREE`.
+        /// - `EBUSY` if 10 attempts find the device taken.
+        /// - `EINVAL` from `LOOP_CONFIGURE` if the kernel refuses a value of
+        ///   `cfg` other than [`LoopConfig::direct_io`].
+        /// - Another `Errno` from `LOOP_CONFIGURE`.
+        pub fn attach(backing: impl AsFd, cfg: &LoopConfig) -> Result<LoopDevice> {
+            let control = openat(
+                CWD,
+                "/dev/loop-control",
+                OFlags::RDWR | OFlags::CLOEXEC,
+                Mode::empty(),
+            )?;
+            let backing_fd = u32::try_from(backing.as_fd().as_raw_fd()).map_err(|_| Errno::BADF)?;
+            let access = if cfg.read_only {
+                OFlags::RDONLY
+            } else {
+                OFlags::RDWR
+            };
+            let mut attempts = 0;
+            loop {
+                attempts += 1;
+                // SAFETY: `GetFree` is the `LOOP_CTL_GET_FREE` request, which
+                // takes no argument. The kernel reads and writes no user
+                // memory.
+                let number = unsafe { ioctl(&control, GetFree)? };
+                let fd = openat(
+                    CWD,
+                    format!("/dev/loop{number}"),
+                    access | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )?;
+                let mut result = configure(&fd, backing_fd, cfg.block_size, cfg.flags());
+                if result == Err(Errno::INVAL) && cfg.direct_io {
+                    let flags = cfg.flags() & !LO_FLAGS_DIRECT_IO;
+                    result = configure(&fd, backing_fd, cfg.block_size, flags);
+                }
+                match result {
+                    Ok(()) => return Ok(LoopDevice { fd, number }),
+                    Err(Errno::BUSY) if attempts < ATTACH_ATTEMPTS => continue,
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+
+        /// Returns the number `N` of the device `/dev/loopN`.
+        pub fn number(&self) -> u32 {
+            self.number
+        }
+
+        /// Returns the `lo_flags` value that the kernel holds for the device.
+        ///
+        /// The value is a combination of [`LO_FLAGS_READ_ONLY`],
+        /// [`LO_FLAGS_AUTOCLEAR`], [`LO_FLAGS_DIRECT_IO`], and other flags of
+        /// the kernel. A kernel can clear [`LO_FLAGS_DIRECT_IO`] when the
+        /// backing file does not accept direct I/O.
+        ///
+        /// # Errors
+        ///
+        /// - `ENXIO` if the device has no backing file.
+        /// - Another `Errno` from `LOOP_GET_STATUS64`.
+        pub fn flags(&self) -> Result<u32> {
+            // SAFETY: `LOOP_GET_STATUS64` writes one `loop_info64` to the
+            // pointer. `LoopInfo64` is that 232-byte `#[repr(C)]` struct, so
+            // the kernel writes inside the buffer of `Getter`. Each field is
+            // an integer or an integer array, so each bit pattern that the
+            // kernel writes is a valid value.
+            let info = unsafe {
+                let call: Getter<{ LOOP_GET_STATUS64 }, LoopInfo64> = Getter::new();
+                ioctl(&self.fd, call)?
+            };
+            Ok(info.lo_flags)
+        }
+    }
+
+    /// Runs `LOOP_CONFIGURE` on the loop device `fd` with the backing file
+    /// `backing_fd`, the block size `block_size`, and the flags `flags`.
+    fn configure(fd: &OwnedFd, backing_fd: u32, block_size: u32, flags: u32) -> Result<()> {
+        let raw = LoopConfigRaw {
+            fd: backing_fd,
+            block_size,
+            info: LoopInfo64 {
+                lo_device: 0,
+                lo_inode: 0,
+                lo_rdevice: 0,
+                lo_offset: 0,
+                lo_sizelimit: 0,
+                lo_number: 0,
+                lo_encrypt_type: 0,
+                lo_encrypt_key_size: 0,
+                lo_flags: flags,
+                lo_file_name: [0; 64],
+                lo_crypt_name: [0; 64],
+                lo_encrypt_key: [0; 32],
+                lo_init: [0; 2],
+            },
+            reserved: [0; 8],
+        };
+        // SAFETY: `LOOP_CONFIGURE` expects a pointer to a `loop_config`.
+        // `LoopConfigRaw` is that 304-byte `#[repr(C)]` struct, and the
+        // compile-time asserts pin its size and its field offsets. The kernel
+        // only reads the argument, which matches `Setter`. `backing_fd` names
+        // a descriptor that the caller of `LoopDevice::attach` keeps open for
+        // the whole call. The kernel takes its own reference to the backing
+        // file, so the caller can close it after the call. The ioctl is
+        // synchronous, so the kernel holds no pointer after it returns.
+        unsafe {
+            let call: Setter<{ LOOP_CONFIGURE }, LoopConfigRaw> = Setter::new(raw);
+            ioctl(fd, call)
+        }
+    }
+
+    impl AsFd for LoopDevice {
+        fn as_fd(&self) -> BorrowedFd<'_> {
+            self.fd.as_fd()
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+mod memfd {
+    use std::os::fd::{AsFd, OwnedFd};
+
+    use rustix::fs::{MemfdFlags, SealFlags, fcntl_add_seals, memfd_create};
+    use rustix::io::Result;
+
+    /// Creates an anonymous memory file that accepts seals.
+    ///
+    /// The file has the flags `MFD_CLOEXEC`, `MFD_ALLOW_SEALING`, and
+    /// `MFD_NOEXEC_SEAL`, so no process can execute it. `name` shows in
+    /// `/proc/<pid>/fd` as `/memfd:<name>`. The memory of the file counts
+    /// against the memory cgroup of the process until the last reference to
+    /// the file closes.
+    ///
+    /// # Errors
+    ///
+    /// - `EINVAL` if `name` is longer than 249 bytes, or if the kernel does
+    ///   not know `MFD_NOEXEC_SEAL`, which Linux 6.3 adds.
+    /// - Another `Errno` from `memfd_create`.
+    pub fn sealable_memfd(name: &str) -> Result<OwnedFd> {
+        memfd_create(
+            name,
+            MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING | MemfdFlags::NOEXEC_SEAL,
+        )
+    }
+
+    /// Seals the content of a memory file from [`sealable_memfd`].
+    ///
+    /// The call adds `F_SEAL_WRITE`, `F_SEAL_GROW`, `F_SEAL_SHRINK`, and
+    /// `F_SEAL_SEAL`. After the call, no process can change the bytes or the
+    /// size of the file, and no process can remove a seal.
+    ///
+    /// # Errors
+    ///
+    /// - `EBUSY` if a writable shared memory map of the file exists.
+    /// - `EPERM` if the file has `F_SEAL_SEAL` already.
+    /// - Another `Errno` from `fcntl(F_ADD_SEALS)`.
+    pub fn seal_contents(fd: impl AsFd) -> Result<()> {
+        fcntl_add_seals(
+            fd,
+            SealFlags::WRITE | SealFlags::GROW | SealFlags::SHRINK | SealFlags::SEAL,
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -677,5 +1015,171 @@ mod tests {
         assert!(read_verity_descriptor(ro.as_fd()).is_err());
         assert!(measure_verity(ro.as_fd()).is_err());
         let _ = std::fs::remove_file(&path);
+    }
+}
+
+/// Tests of the loop device and the memory-file helpers.
+///
+/// The tests of the loop device need access to `/dev/loop-control`, which a
+/// root process has. Without access, they skip. If `OSTRYA_REQUIRE_MOUNT` is
+/// set, a missing access fails them.
+#[cfg(all(test, target_os = "linux"))]
+mod linux_tests {
+    use super::{
+        LO_FLAGS_AUTOCLEAR, LO_FLAGS_DIRECT_IO, LO_FLAGS_READ_ONLY, LoopConfig, LoopDevice,
+        seal_contents, sealable_memfd,
+    };
+    use std::fs::File;
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::os::fd::{AsFd, OwnedFd};
+    use std::time::{Duration, Instant};
+
+    use rustix::fs::SealFlags;
+    use rustix::io::Errno;
+
+    /// The environment variable that turns the skip of a test with no access
+    /// to the loop devices into a failure.
+    const REQUIRE_MOUNT: &str = "OSTRYA_REQUIRE_MOUNT";
+
+    /// The read-only, auto-clearing configuration with 4096-byte blocks.
+    const BASE: LoopConfig = LoopConfig {
+        block_size: 4096,
+        read_only: true,
+        autoclear: true,
+        direct_io: false,
+    };
+
+    /// Attaches `backing` with `cfg`. Returns `None` and prints a message if
+    /// the process has no access to the loop devices and
+    /// [`REQUIRE_MOUNT`] is not set.
+    fn attach_or_skip(backing: impl AsFd, cfg: &LoopConfig) -> Option<LoopDevice> {
+        match LoopDevice::attach(backing, cfg) {
+            Ok(dev) => Some(dev),
+            Err(e @ (Errno::ACCESS | Errno::PERM | Errno::NOENT)) => {
+                assert!(
+                    std::env::var_os(REQUIRE_MOUNT).is_none(),
+                    "{REQUIRE_MOUNT} is set and the process has no access to the loop devices ({e})"
+                );
+                eprintln!("skipped: no access to the loop devices ({e})");
+                None
+            }
+            Err(e) => panic!("attach failed: {e}"),
+        }
+    }
+
+    /// Returns the backing file that the kernel names for device `number`,
+    /// or `None` if the device has no backing file.
+    fn backing_file(number: u32) -> Option<String> {
+        std::fs::read_to_string(format!("/sys/block/loop{number}/loop/backing_file"))
+            .ok()
+            .map(|s| s.trim_end().to_owned())
+    }
+
+    /// Waits up to 5 seconds until device `number` no longer has the backing
+    /// file `backing`. The release of an auto-clearing device can finish
+    /// after the last close returns. Another test can take the same device
+    /// after the release, with another backing file.
+    fn wait_detached(number: u32, backing: &str) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while backing_file(number).as_deref() == Some(backing) {
+            assert!(Instant::now() < deadline, "loop{number} stays attached");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
+
+    /// Returns a sealed memory file that holds 16 KiB.
+    fn sealed_image() -> OwnedFd {
+        let fd = sealable_memfd("ostrya-sys-loop").unwrap();
+        let mut file = File::from(fd);
+        file.write_all(&[0x5a; 16384]).unwrap();
+        seal_contents(&file).unwrap();
+        file.into()
+    }
+
+    /// A sealed memory file refuses a write, a larger size, a smaller size,
+    /// and a removal of the seal, and still reads.
+    #[test]
+    fn a_sealed_memfd_refuses_each_change() {
+        let fd = sealable_memfd("ostrya-sys-seal").unwrap();
+        let mut file = File::from(fd);
+        file.write_all(b"sealed bytes").unwrap();
+        seal_contents(&file).unwrap();
+
+        let seals = rustix::fs::fcntl_get_seals(&file).unwrap();
+        assert!(
+            seals
+                .contains(SealFlags::WRITE | SealFlags::GROW | SealFlags::SHRINK | SealFlags::SEAL)
+        );
+        file.seek(SeekFrom::Start(0)).unwrap();
+        assert!(file.write_all(b"x").is_err(), "a write is refused");
+        assert_eq!(
+            rustix::fs::ftruncate(&file, 64).unwrap_err(),
+            Errno::PERM,
+            "a larger size is refused"
+        );
+        assert_eq!(
+            rustix::fs::ftruncate(&file, 1).unwrap_err(),
+            Errno::PERM,
+            "a smaller size is refused"
+        );
+        assert_eq!(seal_contents(&file).unwrap_err(), Errno::PERM);
+
+        let mut back = String::new();
+        file.seek(SeekFrom::Start(0)).unwrap();
+        file.read_to_string(&mut back).unwrap();
+        assert_eq!(back, "sealed bytes");
+    }
+
+    /// A loop device on a regular file holds the flags of its configuration
+    /// and names the file. At the last close, the kernel detaches it.
+    #[test]
+    fn an_auto_clearing_device_detaches_at_the_last_close() {
+        let path = std::env::temp_dir().join(format!("ostrya-sys-loop-{}", std::process::id()));
+        std::fs::write(&path, vec![0u8; 16384]).unwrap();
+        let file = File::open(&path).unwrap();
+        let Some(dev) = attach_or_skip(&file, &BASE) else {
+            let _ = std::fs::remove_file(&path);
+            return;
+        };
+        let flags = dev.flags().unwrap();
+        assert_eq!(
+            flags & (LO_FLAGS_READ_ONLY | LO_FLAGS_AUTOCLEAR),
+            LO_FLAGS_READ_ONLY | LO_FLAGS_AUTOCLEAR
+        );
+        let number = dev.number();
+        let backing = backing_file(number).unwrap();
+        assert_eq!(backing, path.to_str().unwrap());
+
+        drop(file);
+        drop(dev);
+        wait_detached(number, &backing);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A sealed memory file backs a loop device with a request for direct
+    /// I/O. If the kernel refuses direct I/O on it, the device attaches
+    /// without direct I/O. The test prints the flags that the kernel holds.
+    #[test]
+    fn a_sealed_memfd_backs_a_loop_device() {
+        let image = sealed_image();
+        let cfg = LoopConfig {
+            direct_io: true,
+            ..BASE
+        };
+        let Some(dev) = attach_or_skip(&image, &cfg) else {
+            return;
+        };
+        let flags = dev.flags().unwrap();
+        eprintln!(
+            "loop{} flags {flags:#x}, direct I/O {}",
+            dev.number(),
+            flags & LO_FLAGS_DIRECT_IO != 0
+        );
+        assert_ne!(flags & LO_FLAGS_READ_ONLY, 0);
+        let number = dev.number();
+        let backing = backing_file(number).unwrap();
+        drop(image);
+        drop(dev);
+        wait_detached(number, &backing);
     }
 }

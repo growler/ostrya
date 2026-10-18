@@ -75,6 +75,9 @@ Ostrya adds these functions, which the `ostree` command does not have:
   with its commit, and fsck checks it. A pull, a push, and a static delta
   carry the image with its commit, and `ostrya serve` and `ostrya send` serve
   it.
+- composefs mounts. The library `ostrya-mount` mounts a commit as a composefs
+  tree on Linux, from its stored image or from an image that it builds in
+  memory. The mount reads the objects of the repository in place.
 - Library functions: a staging tree with a tree merge, and the import of an
   overlay changeset.
 
@@ -242,8 +245,8 @@ The project is a Cargo workspace of these crates:
 - `ostrya-core`: the object model, checksums, and the serialization of the
   format.
 - `ostrya-rt`: the internal async runtime layer, for `smol` or `tokio`.
-- `ostrya-sys`: wrappers for the Linux fs-verity ioctls and for a read-only
-  memory map.
+- `ostrya-sys`: wrappers for the Linux fs-verity ioctls, a read-only memory
+  map, the loop device, and a sealed memory file.
 - `ostrya-sign`: the signing engines: dummy, ed25519, spki, and GPG.
 - `ostrya-fetch`: the async HTTP/1.1 and HTTP/2 client, with TLS over
   `rustls`.
@@ -253,6 +256,7 @@ The project is a Cargo workspace of these crates:
   digest.
 - `ostrya-server`: the HTTP server of one repository, for pull and push.
 - `ostrya`: the library.
+- `ostrya-mount`: the composefs mount of a commit on Linux.
 - `ostrya-cli`: the `ostrya` command. It is not published to crates.io.
 - `ostrya-conformance`: the conformance harness that compares Ostrya with the
   `ostree` command. It is not published to crates.io.

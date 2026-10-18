@@ -326,6 +326,17 @@ impl Repo {
         &self.inner.path
     }
 
+    /// Returns the descriptor of the `objects` directory of the repository.
+    ///
+    /// The handle opened the directory read-only at the open, so the
+    /// descriptor refers to the directory that the handle reads, also after a
+    /// rename of the repository. The descriptor is valid while the handle
+    /// lives. A caller that needs it for a longer time duplicates it with
+    /// [`BorrowedFd::try_clone_to_owned`].
+    pub fn objects_dir(&self) -> BorrowedFd<'_> {
+        self.objects_fd()
+    }
+
     /// Begins a transaction that holds the repository lock shared.
     ///
     /// A shared lock matches the read lock that the `ostree` command holds

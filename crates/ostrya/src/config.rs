@@ -462,11 +462,12 @@ impl RepoConfig {
     /// keeps. With `traverse_parent` set, as `ostrya prune` runs, that is at
     /// least what the `ostree` command keeps.
     ///
-    /// Three write methods also read this key, when a dict that they check
+    /// Four write methods also read this key, when a dict that they check
     /// holds at least one entry:
     /// [`Transaction::write_commit`](crate::Transaction::write_commit),
-    /// [`Transaction::commit`](crate::Transaction::commit), and
-    /// [`Repo::write_commit_detached_metadata`]. Each one refuses a dict that
+    /// [`Transaction::commit`](crate::Transaction::commit),
+    /// [`Repo::write_commit_detached_metadata`], and
+    /// [`Repo::commit_add_composefs_metadata`]. Each one refuses a dict that
     /// gives a key of this list a value that a prune refuses, with
     /// [`Error::InvalidGcAnchor`].
     ///
@@ -478,6 +479,8 @@ impl RepoConfig {
     /// - [`Transaction::sign_commit`](crate::Transaction::sign_commit) and
     ///   [`Repo::sign_commit`]
     /// - the tombstone of a pruned commit
+    /// - [`Transaction::write_metadata`](crate::Transaction::write_metadata),
+    ///   which takes the bytes of a metadata object
     /// - the anchor commit of a repository with a collection id, which
     ///   [`Repo::regenerate_summaries`], `ostrya receive`, and `ostrya serve`
     ///   write. The port builds the binding keys of this commit.

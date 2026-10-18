@@ -30,7 +30,7 @@ use ostrya_rt::block_on;
 /// A fixed timestamp, so the commits are reproducible.
 const FIXED_TS: u64 = 1_700_000_000;
 
-/// The metadata key that these tests configure as a GC root.
+/// The metadata key that these tests configure as a GC anchor key.
 const GC_ROOTS: &str = "test.gc-roots";
 
 /// Writes a tree of one file at `base/<name>`. The file content is the name.

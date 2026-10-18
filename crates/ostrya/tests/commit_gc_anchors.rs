@@ -1,7 +1,8 @@
 //! Integration tests of the check of GC anchor keys at a commit write.
 //!
-//! `Transaction::write_commit`, `Transaction::commit`, and
-//! `Repo::write_commit_detached_metadata` refuse a dict that gives a key of
+//! `Transaction::write_commit`, `Transaction::commit`,
+//! `Repo::write_commit_detached_metadata`, and
+//! `Repo::commit_add_composefs_metadata` refuse a dict that gives a key of
 //! `[ex-ostrya] gc-root-metadata-keys` a value that a prune refuses. The
 //! anchor commit of a summary takes no check. The `ostree` command has no
 //! counterpart, so the tests use ostrya alone.
@@ -694,5 +695,92 @@ fn a_summary_anchor_commit_takes_no_check() {
                 "the summary is written"
             );
         }
+    });
+}
+
+/// The metadata key that holds the composefs digest of a commit.
+const COMPOSEFS_DIGEST: &str = "ostree.composefs.digest.v0";
+
+#[test]
+fn composefs_metadata_refuses_a_copied_defective_anchor_value() {
+    let tmp = TmpDir::new("gc-anchors-composefs-copy");
+    block_on(async {
+        let repo = repo_with_trees(tmp.path(), "repo", &["head"]).await;
+        // The dict goes in before the config names the key.
+        let metadata = entries(vec![(ANCHORS, string("main"))]);
+        let head = commit(&repo, tmp.path(), "head", Some(metadata), Some("main")).await;
+        let repo = configure_keys(&repo, ANCHORS).await;
+        let objects_before = objects(&repo);
+        let refs_before = refs(&repo);
+
+        let txn = repo.transaction().await.unwrap();
+        let err = repo
+            .commit_add_composefs_metadata(&txn, &head)
+            .await
+            .unwrap_err();
+        assert_eq!(anchor_reason(err), STRING_REASON);
+        txn.abort().await.unwrap();
+        assert_eq!(
+            objects(&repo),
+            objects_before,
+            "the store holds no new object"
+        );
+        assert_eq!(refs(&repo), refs_before, "the store holds no new ref");
+    });
+}
+
+#[test]
+fn composefs_metadata_refuses_the_digest_key_as_an_anchor_key() {
+    let tmp = TmpDir::new("gc-anchors-composefs-digest-key");
+    block_on(async {
+        let repo = repo_with_trees(tmp.path(), "repo", &["head"]).await;
+        let head = commit(&repo, tmp.path(), "head", None, Some("main")).await;
+        let repo = configure_keys(&repo, COMPOSEFS_DIGEST).await;
+        let objects_before = objects(&repo);
+
+        let txn = repo.transaction().await.unwrap();
+        let err = repo
+            .commit_add_composefs_metadata(&txn, &head)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidGcAnchor { metadata_key, .. } if metadata_key == COMPOSEFS_DIGEST),
+            "got {err:?}"
+        );
+        txn.abort().await.unwrap();
+        assert_eq!(
+            objects(&repo),
+            objects_before,
+            "the store holds no new object"
+        );
+    });
+}
+
+#[test]
+fn composefs_metadata_keeps_a_valid_anchor_value() {
+    let tmp = TmpDir::new("gc-anchors-composefs-valid");
+    block_on(async {
+        let repo = repo_with_trees(tmp.path(), "repo", &["anchor", "head"]).await;
+        let anchor = commit(&repo, tmp.path(), "anchor", None, None).await;
+        let repo = configure_keys(&repo, ANCHORS).await;
+        let metadata = entries(vec![(ANCHORS, checksums(&[anchor.as_bytes()]))]);
+        let head = commit(&repo, tmp.path(), "head", Some(metadata.clone()), None).await;
+
+        let txn = repo.transaction().await.unwrap();
+        let written = repo
+            .commit_add_composefs_metadata(&txn, &head)
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        let (stored, _) = repo.load_commit(&written).await.unwrap();
+        assert_eq!(
+            stored.metadata.dict_get(ANCHORS),
+            metadata.dict_get(ANCHORS),
+            "the commit keeps the anchor value"
+        );
+        assert!(
+            stored.metadata.dict_get(COMPOSEFS_DIGEST).is_some(),
+            "the commit holds the composefs digest"
+        );
     });
 }

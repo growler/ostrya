@@ -451,7 +451,7 @@ pub enum Error {
         /// The text that names what ended the upload.
         message: String,
     },
-    /// A GC-root metadata key whose value is not a list of commit checksums.
+    /// A GC anchor key whose value a prune cannot read as commit checksums.
     ///
     /// [`gc_root_metadata_keys`](crate::PruneOptions::gc_root_metadata_keys)
     /// and the repository config key `[ex-ostrya] gc-root-metadata-keys` name
@@ -470,12 +470,14 @@ pub enum Error {
         /// The text that names the defect of the value.
         reason: String,
     },
-    /// A metadata dict to write that gives a GC-root metadata key a value that
-    /// a prune refuses.
+    /// A metadata dict to write that gives a GC anchor key a value that a
+    /// prune refuses.
     ///
     /// [`Transaction::write_commit`](crate::Transaction::write_commit),
-    /// [`Transaction::commit`](crate::Transaction::commit), and
-    /// [`Repo::write_commit_detached_metadata`](crate::Repo::write_commit_detached_metadata)
+    /// [`Transaction::commit`](crate::Transaction::commit),
+    /// [`Repo::write_commit_detached_metadata`](crate::Repo::write_commit_detached_metadata),
+    /// and
+    /// [`Repo::commit_add_composefs_metadata`](crate::Repo::commit_add_composefs_metadata)
     /// give this error before they write. The keys are those of the
     /// repository config key `[ex-ostrya] gc-root-metadata-keys`. The values
     /// and the reasons are those of [`Error::InvalidGcRoot`].

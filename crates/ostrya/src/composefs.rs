@@ -25,7 +25,7 @@ use ostrya_core::{
     Checksum, Commit, DirMeta, DirTree, ObjectType, RepoMode, Type, Value, Xattrs, loose_path,
 };
 
-use crate::commit::append_dict_entry;
+use crate::commit::{append_dict_entry, check_gc_anchors};
 use crate::error::{Error, Result};
 use crate::file::{FileKind, FileObject};
 use crate::repo::Repo;
@@ -401,6 +401,11 @@ impl Repo {
     /// `txn` and returns its checksum. The new commit publishes when `txn`
     /// commits.
     ///
+    /// The call checks the values of the GC anchor keys in the new metadata
+    /// dict, as [`write_commit`](Transaction::write_commit) does. The check
+    /// includes the entries that the call copies from `commit`. On a refusal,
+    /// the call stages nothing.
+    ///
     /// The image depends on the tree of the commit alone, so the metadata of
     /// the commit and the repository mode do not change the digest. The image
     /// goes to [`std::io::sink`], so the digest needs no image-sized buffer.
@@ -409,6 +414,11 @@ impl Repo {
     ///
     /// - [`Error::InvalidFormat`] if `commit` already carries
     ///   `ostree.composefs.digest.v0`.
+    /// - [`Error::InvalidGcAnchor`] if an entry of the new metadata gives a
+    ///   key of `[ex-ostrya] gc-root-metadata-keys` a value that a prune
+    ///   refuses.
+    /// - [`Error::Core`] if `[ex-ostrya] gc-root-metadata-keys` holds a
+    ///   malformed escape sequence.
     /// - [`Error::ObjectNotFound`] if the commit object, or a dirtree,
     ///   dirmeta, or file object of its tree, is not in the object store.
     /// - [`Error::Core`] if the commit object, a dirtree object, a dirmeta
@@ -447,6 +457,7 @@ impl Repo {
         let digest_type = Type::parse(DIGEST_SIGNATURE).map_err(ostrya_core::Error::from)?;
         let value = Value::variant(digest_type, Value::Bytes(fs_verity.to_vec()));
         append_dict_entry(&mut commit_obj.metadata, COMPOSEFS_DIGEST_KEY, value)?;
+        check_gc_anchors(self.config(), [&commit_obj.metadata])?;
         let bytes = commit_obj.serialize()?;
         txn.write_metadata(ObjectType::Commit, None, &bytes).await
     }

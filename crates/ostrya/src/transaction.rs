@@ -681,7 +681,7 @@ impl Transaction {
     /// queued before it.
     ///
     /// The call does not check `meta`, and it cannot fail. [`commit`] checks
-    /// the GC anchor keys of the queued dict, as
+    /// the values of the GC anchor keys in the queued dict, as
     /// [`write_commit`](Transaction::write_commit) checks the metadata of a
     /// commit. If an entry gives a key of `[ex-ostrya] gc-root-metadata-keys`
     /// a value that a prune refuses, `commit` fails with
@@ -1294,7 +1294,8 @@ impl Transaction {
     ///
     /// 1. The call checks each queued refspec. If a refspec is malformed, the
     ///    call fails before it publishes an object, and it writes nothing.
-    ///    The call then checks the GC anchor keys of each dict that
+    ///    The call then checks the values of the GC anchor keys in each dict
+    ///    that
     ///    [`set_commit_detached_metadata`](Transaction::set_commit_detached_metadata)
     ///    queued, as [`write_commit`](Transaction::write_commit) checks the
     ///    metadata of a commit. If a dict holds at least one entry, the call
@@ -1397,7 +1398,7 @@ impl Transaction {
         self.write_tail(refs, synced, None).await
     }
 
-    /// Checks the GC anchor keys of each dict that
+    /// Checks the values of the GC anchor keys in each dict that
     /// [`set_commit_detached_metadata`](Transaction::set_commit_detached_metadata)
     /// queued.
     ///

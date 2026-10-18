@@ -219,10 +219,11 @@ pub struct PruneOptions {
     pub static_deltas_only: bool,
     /// Metadata keys whose values name more commits to keep.
     ///
-    /// The run reads each entry with one of these keys in the metadata of each
-    /// reached commit and in its detached metadata. A dict that holds a key
-    /// more than one time gives the commits of each entry. The value of an
-    /// entry has one of these shapes:
+    /// Each key of this list is a GC anchor key: a commit metadata key whose
+    /// value names commits that the run keeps. The run reads each entry with
+    /// one of these keys in the metadata of each reached commit and in its
+    /// detached metadata. A dict that holds a key more than one time gives the
+    /// commits of each entry. The value of an entry has one of these shapes:
     ///
     /// - `aay`: an array of commit checksums.
     /// - `a(say)`: an array of pairs of a string and a commit checksum.
@@ -231,27 +232,26 @@ pub struct PruneOptions {
     /// The run reads the checksums alone and ignores the strings. Each
     /// checksum is 32 bytes. The run walks each of those commits as a root of
     /// its own, so it also keeps what that commit reaches. Such a commit gets
-    /// the full depth of the walk, because the depth counts parent hops.
+    /// the full depth of the walk, because the depth counts parent edges.
     ///
     /// If an entry holds a value without one of these shapes, or a checksum
     /// that is not 32 bytes, the prune fails with [`Error::InvalidGcRoot`].
     ///
-    /// [`Repo::prune`] adds the keys of the repository config key
+    /// [`Repo::prune`] also reads the keys of the repository config key
     /// `[ex-ostrya] gc-root-metadata-keys`
-    /// ([`RepoConfig::gc_root_metadata_keys`](crate::RepoConfig::gc_root_metadata_keys))
-    /// to this list. The run reads the config keys first, in config order, and
+    /// ([`RepoConfig::gc_root_metadata_keys`](crate::RepoConfig::gc_root_metadata_keys)).
+    /// The run reads the config keys first, in config order, and
     /// then the keys of this list, in list order. It reads each key one time.
     /// This field holds the keys of the caller alone, and the run does not
     /// change it. A caller can add keys to the run, but cannot remove a config
     /// key from it.
     ///
     /// The list is empty by default. If this list and the config list are both
-    /// empty, the run reads no metadata. If
-    /// [`refs_only`](PruneOptions::refs_only) is `false`, the keys add no
+    /// empty, the run reads no metadata. If no option roots the walk on the
+    /// refs alone (see [`Repo::prune`], "Roots"), the keys add no
     /// reachability, because each commit in the store is already a root. The
     /// run still reads the metadata and the detached metadata of each commit.
-    /// A defective value fails the prune, whether `refs_only` is `true` or
-    /// `false`.
+    /// A defective value fails the prune in both cases.
     ///
     /// This field is an ostrya extension.
     pub gc_root_metadata_keys: Vec<String>,
@@ -359,8 +359,8 @@ impl PruneOptions {
     /// The options set [`refs_only`](PruneOptions::refs_only) to `true`,
     /// [`gc_root_metadata_keys`](PruneOptions::gc_root_metadata_keys) to
     /// `keys`, and [`traverse_parent`](PruneOptions::traverse_parent) to
-    /// `false`. The other fields keep their defaults. [`Repo::prune`] adds the
-    /// keys of `[ex-ostrya] gc-root-metadata-keys` to `keys`.
+    /// `false`. The other fields keep their defaults. [`Repo::prune`] also
+    /// reads the keys of `[ex-ostrya] gc-root-metadata-keys`.
     ///
     /// With these options, an application that records its own reachability in
     /// commit metadata decides what the run keeps. The ancestry of a commit
@@ -540,7 +540,7 @@ impl Repo {
     /// The run reads five keys of the repository config, in this order:
     ///
     /// 1. `[ex-ostrya] gc-root-metadata-keys`, before the repository lock. The
-    ///    run adds these keys to
+    ///    run reads these keys before the keys of
     ///    [`gc_root_metadata_keys`](PruneOptions::gc_root_metadata_keys).
     /// 2. `[core] locking` and `[core] lock-timeout-secs`, when it takes the
     ///    repository lock.

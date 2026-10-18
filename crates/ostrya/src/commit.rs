@@ -111,7 +111,7 @@ impl Transaction {
     /// If `opts.metadata` holds at least one entry, the call reads the
     /// repository config key `[ex-ostrya] gc-root-metadata-keys`
     /// ([`RepoConfig::gc_root_metadata_keys`]). It checks each entry whose key
-    /// is in that list, as a prune reads it: the value is an `aay`, an
+    /// is in that list with the rules of a prune: the value is an `aay`, an
     /// `a(say)`, or an `a{s(say)}`, and each checksum in it is 32 bytes. A
     /// checksum that names no commit in the store passes. The call checks
     /// each entry, also when a key occurs more than one time.
@@ -476,9 +476,9 @@ impl Repo {
     }
 }
 
-/// Checks the GC anchor keys of each metadata dict of `dicts`.
+/// Checks the values of the GC anchor keys in each metadata dict of `dicts`.
 ///
-/// The anchor keys are the list of `[ex-ostrya] gc-root-metadata-keys` in
+/// The GC anchor keys are the list of `[ex-ostrya] gc-root-metadata-keys` in
 /// `config`. The function reads the list once, at the first dict that holds
 /// an entry. If no dict holds an entry, the function does not read the list.
 /// It checks each entry whose key is in the list with the decoder of the

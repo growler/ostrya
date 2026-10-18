@@ -6064,7 +6064,7 @@ path a walk took to reach that commit. `Repo::prune` hands the walk the set of
 ref targets, and the walk drops every `parent`-edge arrival at one of them:
 the seed the ref placed holds the branch's own bound, so that bound stands
 there in place of the bound the arrival carried. The ref's bound stands whole:
-a ref at the global depth 3, reached with one parent hop left, keeps three more
+a ref at the global depth 3, reached with one parent edge left, keeps three more
 parents. So a branch cut short cuts every history running through its head. Where two refs name one commit, both seeds
 stand and the commit is walked under each of the two bounds, so it keeps what
 either of them reaches; `cli-surface.md`, "P2", `prune` records that corner as
@@ -7712,7 +7712,7 @@ in a reached commit's own metadata and then in its detached metadata. A dict
 that holds the key more than once gives the commits of each entry. The variant
 type of a value selects its shape: `aay`, `a(say)`, or `a{s(say)}`. The walk
 reads the checksums alone and ignores each string, and each checksum is a commit
-the walk seeds as a root of its own. Depth counts parent hops, so a commit a
+the walk seeds as a root of its own. Depth counts parent edges, so a commit a
 metadata key names is given the walk's full depth rather than the remaining
 depth of the commit that named it. A value of another type, an element of the
 wrong shape, or a checksum that is not 32 bytes fails the walk with
@@ -7772,14 +7772,16 @@ The library reads `detached-metadata-exclude` in one place,
 `ostrya receive` and `ostrya serve`. It reads `gc-root-metadata-keys` in
 `Repo::prune`, after the option refusals and before the repository lock, and
 adds the config keys to the keys of the caller (E2).
-`Transaction::write_commit`, `Transaction::commit`, and
-`Repo::write_commit_detached_metadata` read it too, when a dict they write
+`Transaction::write_commit`, `Transaction::commit`,
+`Repo::write_commit_detached_metadata`, and
+`Repo::commit_add_composefs_metadata` read it too, when a dict they write
 holds at least one entry. Each checks the entries of the listed keys with the
 decoder of the walk, before its first write, and refuses a value the walk
 refuses with `Error::InvalidGcAnchor`. That error names the key and the reason
 and no commit, because `write_commit` checks before the commit has a checksum.
 A pull, the mirror push and the server commit of `ostrya receive` and
-`ostrya serve`, a signature, and a tombstone store their metadata with no
+`ostrya serve`, a signature, a tombstone, and `Transaction::write_metadata`,
+which takes the bytes of a metadata object, store their metadata with no
 check. The anchor commit of a collection takes no check either: `summary -u`,
 `ostrya receive`, and `ostrya serve` write it through the crate-private
 `Transaction::write_commit_unchecked`, because the port builds its binding

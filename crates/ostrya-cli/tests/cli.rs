@@ -23309,7 +23309,7 @@ fn prune_bounds_stand_at_every_ref_target_matching_the_tool() {
         ),
         // The bound at `mid` replaces the bound of the arrival, and does not
         // narrow it. `mid` at the global depth 3 keeps the whole chain. If the
-        // bound of the arrival applied, its two remaining parent hops cut it.
+        // bound of the arrival applied, its two remaining parent edges cut it.
         (
             "shared-no-narrow",
             vec!["--refs-only", "--depth=3", "--retain-branch-depth=mid=0"],

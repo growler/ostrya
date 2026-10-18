@@ -9925,7 +9925,7 @@ evidence: ostrya_cli::cli::prune_bounds_stand_at_every_ref_target_matching_the_t
  ostrya::prune_options::a_ref_target_bound_replaces_and_does_not_narrow
 spec: cli-surface.md#p2----options-missing-from-commands-that-exist
 note: the bound at a ref target stands whole in place of the inherited one: a
- ref at the global depth 3, reached with one parent hop left, keeps three more
+ ref at the global depth 3, reached with one parent edge left, keeps three more
  parents. Needs two refs sharing history.
 
 family: M10

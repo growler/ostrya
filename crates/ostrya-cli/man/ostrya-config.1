@@ -287,9 +287,11 @@ Each checksum in the value is a commit checksum of 32 bytes, and a prune ignores
 A prune keeps each commit that such a value names.
 A value of another type, or a checksum that is not 32 bytes, fails the prune, and the prune deletes nothing.
 A write of commit metadata or of detached metadata also reads this key and refuses such a value: \fB\%ostrya commit\fR and a write of a program that uses the ostrya library.
+The ostrya library also checks the metadata of a commit when it adds a composefs digest to the commit.
 A refused write writes no object, no ref, and no detached metadata.
 A write reads this key only if the metadata that it writes holds at least one entry, and a value that has a malformed escape sequence then fails the write.
 A pull, a push that \fB\%ostrya receive\fR or \fB\%ostrya serve\fR stores, a server commit, and a signature do not check the values.
+A program that writes the bytes of a metadata object through the ostrya library does not check the values.
 The port builds the binding keys of the anchor commit of a collection, so the anchor commit that \fB\%ostrya summary \-u\fR, \fB\%ostrya receive\fR, and \fB\%ostrya serve\fR write takes no check.
 A prune that reaches a commit with a defective value from one of these paths fails.
 .TP

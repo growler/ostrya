@@ -2212,7 +2212,8 @@ repository that sets one, and the divergence is by intent
 
   The library also reads the key when it writes a commit or the detached
   metadata of a commit, and it refuses a value of a listed key that a prune
-  refuses. `ostrya commit` refuses an `--add-metadata-string` or
+  refuses. It does not check a commit that a caller gives as the bytes of a
+  metadata object. `ostrya commit` refuses an `--add-metadata-string` or
   `--add-detached-metadata-string` entry of a listed key, and an
   `--add-metadata` or `--keep-metadata` value of a listed key that is not an
   `aay`, an `a(say)`, or an `a{s(say)}` with checksums of 32 bytes. It writes

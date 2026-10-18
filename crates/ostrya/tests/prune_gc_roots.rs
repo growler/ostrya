@@ -388,8 +388,8 @@ fn a_metadata_key_edge_seeds_the_full_depth() {
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["base", "tip", "head"]).await;
         // A chain of two commits that the ref does not name. One metadata-key
-        // edge at its tip reaches it. The depth counts parent hops, and the edge
-        // seeds the depth of the walk, so the prune keeps the full chain.
+        // edge at its tip reaches it. The depth counts parent edges, and the
+        // edge seeds the depth of the walk, so the prune keeps the full chain.
         let base = commit(&repo, tmp.path(), "base", None, None, None).await;
         let tip = commit(&repo, tmp.path(), "tip", Some(base), None, None).await;
         commit(
@@ -415,6 +415,50 @@ fn a_metadata_key_edge_seeds_the_full_depth() {
             holds(&repo, &base).await,
             "and its parent, since the edge seeds the walk's depth"
         );
+    });
+}
+
+#[test]
+fn a_chain_that_names_the_same_anchors_keeps_each_anchor() {
+    let tmp = TmpDir::new("gc-roots-same-anchors");
+    block_on(async {
+        let repo = repo_with_trees(tmp.path(), &["base", "tip", "single", "head", "orphan"]).await;
+        let orphan = orphan(&repo, tmp.path()).await;
+        let base = commit(&repo, tmp.path(), "base", None, None, None).await;
+        let tip = commit(&repo, tmp.path(), "tip", Some(base), None, None).await;
+        let single = commit(&repo, tmp.path(), "single", None, None, None).await;
+        // Each commit of the chain names the same anchors, in its metadata
+        // and in its detached metadata. Each edge to an anchor seeds the same
+        // walk, so the prune keeps each anchor and its parent.
+        let anchors = checksum_list(GC_ROOTS, &[tip, single]);
+        let mut chain = Vec::new();
+        let mut parent = None;
+        for _ in 0..3 {
+            let next = commit(
+                &repo,
+                tmp.path(),
+                "head",
+                parent,
+                Some(anchors.clone()),
+                Some("main"),
+            )
+            .await;
+            repo.write_commit_detached_metadata(&next, Some(&anchors))
+                .await
+                .unwrap();
+            chain.push(next);
+            parent = Some(next);
+        }
+
+        let opts = PruneOptions {
+            traverse_parent: true,
+            ..gc_root_options()
+        };
+        repo.prune(&opts).await.unwrap();
+        for kept in chain.iter().chain([&tip, &base, &single]) {
+            assert!(holds(&repo, kept).await, "{kept} survives");
+        }
+        assert!(!holds(&repo, &orphan).await, "the orphan is pruned");
     });
 }
 

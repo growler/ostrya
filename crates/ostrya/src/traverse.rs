@@ -20,18 +20,20 @@ use crate::error::{Error, Result};
 use crate::refs::walk_ref_dir;
 use crate::repo::Repo;
 
-/// The GVariant type of a GC-root value that is an array of checksums.
+/// The GVariant type of a value of a GC anchor key that is an array of
+/// checksums.
 ///
 /// Each element is one commit checksum in its 32-byte binary form.
 const ANCHOR_CHECKSUMS: &str = "aay";
 
-/// The GVariant type of a GC-root value that is an array of pairs.
+/// The GVariant type of a value of a GC anchor key that is an array of pairs.
 ///
 /// Each pair holds a string and one commit checksum in its 32-byte binary
 /// form. The walk ignores the string.
 const ANCHOR_PAIRS: &str = "a(say)";
 
-/// The GVariant type of a GC-root value that is a dict of named pairs.
+/// The GVariant type of a value of a GC anchor key that is a dict of named
+/// pairs.
 ///
 /// Each entry holds a name and a pair of the [`ANCHOR_PAIRS`] shape. The walk
 /// ignores the name and the string of the pair.
@@ -40,7 +42,7 @@ const ANCHOR_NAMED_PAIRS: &str = "a{s(say)}";
 /// The bound that a walk puts on the `parent` chain of one root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ParentBound {
-    /// The number of `parent` hops that the walk can still follow.
+    /// The number of `parent` edges that the walk can still follow.
     ///
     /// `-1` is the whole ancestry. It is the one negative value that the bound
     /// holds.
@@ -519,8 +521,9 @@ impl Repo {
     /// child that arrives under the same bound reads no commit.
     ///
     /// The walk seeds each commit that a metadata-key edge names at
-    /// `root_bound`. The walk reads the commit `pending_delete` names as
-    /// absent.
+    /// `root_bound`. Each such seed is the same entry, so the walk pushes it
+    /// at the first edge alone. The walk reads the commit `pending_delete`
+    /// names as absent.
     async fn collect_reachable(
         &self,
         seeds: Vec<(Checksum, ParentBound, Arrival)>,
@@ -537,6 +540,9 @@ impl Repo {
         // matches `weak_roots` again when the walk pops it. This set stops the
         // walk from a second push of the seed.
         let mut weak_seeded: HashSet<Checksum> = HashSet::new();
+        // The commits for which a metadata-key edge pushed a seed. A second
+        // edge to the same commit pushes the same entry, which adds nothing.
+        let mut anchor_seeded: HashSet<Checksum> = HashSet::new();
 
         while let Some((commit_checksum, bound, arrival)) = commit_stack.pop() {
             // When the walk reaches the commit of a weak ref over any edge,
@@ -626,6 +632,7 @@ impl Repo {
                     &commit.metadata,
                     gc,
                     root_bound,
+                    &mut anchor_seeded,
                     &mut commit_stack,
                 )
                 .await?;
@@ -787,6 +794,10 @@ impl Repo {
     /// of the commit before its detached metadata, then the order of the
     /// entries in the dict, then the order of the elements in the value.
     ///
+    /// The method pushes a commit only if `seeded` does not hold it, and
+    /// adds the commit to `seeded`. It decodes each value also when it pushes
+    /// no commit, so the errors stay the same.
+    ///
     /// The method reads the detached metadata once for each expansion of a
     /// commit, and only if the walk has metadata keys. The walk can reach a
     /// commit again at a depth that follows more parents. It then expands the
@@ -797,6 +808,7 @@ impl Repo {
         metadata: &Value,
         gc: &GcRoots,
         root_bound: ParentBound,
+        seeded: &mut HashSet<Checksum>,
         stack: &mut Vec<(Checksum, ParentBound, Arrival)>,
     ) -> Result<()> {
         let detached = self.read_commit_detached_metadata(commit).await?;
@@ -804,7 +816,9 @@ impl Repo {
             for source in [Some(metadata), detached.as_ref()].into_iter().flatten() {
                 for value in dict_values(source, key) {
                     for_each_metadata_key_target(value, |target| {
-                        stack.push((target, root_bound, Arrival::Root));
+                        if seeded.insert(target) {
+                            stack.push((target, root_bound, Arrival::Root));
+                        }
                     })
                     .map_err(|reason| Error::InvalidGcRoot {
                         commit: *commit,
@@ -986,8 +1000,9 @@ pub(crate) fn for_each_metadata_key_target(
     Ok(())
 }
 
-/// A function that returns the checksum bytes of one element of a GC-root
-/// value, or `None` if the element does not have the shape of the value.
+/// A function that returns the checksum bytes of one element of a value of a
+/// GC anchor key, or `None` if the element does not have the shape of the
+/// value.
 type ChecksumOf = fn(&Value) -> Option<&[u8]>;
 
 /// Returns the checksum bytes of an `(say)` pair, or `None` if `pair` does not

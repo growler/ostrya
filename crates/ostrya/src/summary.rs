@@ -1787,7 +1787,7 @@ impl Repo {
             )?,
         )?;
         let commit = txn
-            .write_commit(
+            .write_commit_unchecked(
                 CommitOptions {
                     parent,
                     subject: None,

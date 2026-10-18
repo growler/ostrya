@@ -679,6 +679,15 @@ impl Transaction {
     /// If the call runs twice for one checksum, the last dict stays. The call
     /// also drops the signatures that [`sign_commit`](Transaction::sign_commit)
     /// queued before it.
+    ///
+    /// The call does not check `meta`, and it cannot fail. [`commit`] checks
+    /// the GC anchor keys of the queued dict, as
+    /// [`write_commit`](Transaction::write_commit) checks the metadata of a
+    /// commit. If an entry gives a key of `[ex-ostrya] gc-root-metadata-keys`
+    /// a value that a prune refuses, `commit` fails with
+    /// [`Error::InvalidGcAnchor`] and publishes nothing.
+    ///
+    /// [`commit`]: Transaction::commit
     pub fn set_commit_detached_metadata(&self, checksum: &Checksum, meta: Value) {
         let mut queue = self.detached.lock().unwrap();
         let edit = Self::edit_for(&mut queue, checksum);
@@ -1285,6 +1294,12 @@ impl Transaction {
     ///
     /// 1. The call checks each queued refspec. If a refspec is malformed, the
     ///    call fails before it publishes an object, and it writes nothing.
+    ///    The call then checks the GC anchor keys of each dict that
+    ///    [`set_commit_detached_metadata`](Transaction::set_commit_detached_metadata)
+    ///    queued, as [`write_commit`](Transaction::write_commit) checks the
+    ///    metadata of a commit. If a dict holds at least one entry, the call
+    ///    reads `[ex-ostrya] gc-root-metadata-keys` for this check. On a
+    ///    refusal the call publishes no object and writes nothing.
     /// 2. The call renames each staged object into `objects/<xx>/`.
     /// 3. The call writes the queued detached-metadata edits.
     /// 4. The call writes the queued refs. Each ref write is atomic: a temp
@@ -1335,6 +1350,12 @@ impl Transaction {
     ///
     /// - [`Error::InvalidRefspec`] if a queued refspec is malformed. The call
     ///   publishes no object.
+    /// - [`Error::InvalidGcAnchor`] if a queued detached-metadata dict gives a
+    ///   key of `[ex-ostrya] gc-root-metadata-keys` a value that a prune
+    ///   refuses. The call publishes no object and writes nothing.
+    /// - [`Error::Core`] if a queued detached-metadata dict holds at least one
+    ///   entry and `[ex-ostrya] gc-root-metadata-keys` holds a malformed
+    ///   escape sequence. The call publishes no object and writes nothing.
     /// - [`Error::LockTimeout`] if the wait for the update lock passes
     ///   `[core] lock-timeout-secs`. The published objects stay, and the call
     ///   writes no detached metadata and no ref.
@@ -1349,6 +1370,7 @@ impl Transaction {
     ///   detached metadata fails.
     pub async fn commit(mut self) -> Result<TransactionStats> {
         let refs = self.resolve_ref_queue()?;
+        self.check_queued_gc_anchors()?;
         let synced = self.publish().await?;
         if refs.is_empty() && self.detached.lock().unwrap().edits.is_empty() {
             let stats = self.staged.lock().unwrap().stats;
@@ -1370,8 +1392,26 @@ impl Transaction {
             "the hold is not the update lock of this repository"
         );
         let refs = self.resolve_ref_queue()?;
+        self.check_queued_gc_anchors()?;
         let synced = self.publish().await?;
         self.write_tail(refs, synced, None).await
+    }
+
+    /// Checks the GC anchor keys of each dict that
+    /// [`set_commit_detached_metadata`](Transaction::set_commit_detached_metadata)
+    /// queued.
+    ///
+    /// The check reads no file, so it holds the lock of the queue and no
+    /// await.
+    fn check_queued_gc_anchors(&self) -> Result<()> {
+        let queue = self.detached.lock().unwrap();
+        crate::commit::check_gc_anchors(
+            self.repo.config(),
+            queue
+                .edits
+                .iter()
+                .filter_map(|(_, edit)| edit.replace.as_ref()),
+        )
     }
 
     /// Writes the queued detached metadata and then `refs`, removes the

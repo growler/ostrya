@@ -22429,6 +22429,213 @@ fn prune_refuses_a_bad_locking_value_before_a_malformed_key_list() {
     );
 }
 
+// --- commit and [ex-ostrya] gc-root-metadata-keys -----------------------------
+
+/// The metadata key that the commit tests of GC anchors name in
+/// `[ex-ostrya] gc-root-metadata-keys`.
+const GC_ANCHOR_KEY: &str = "app.anchors";
+
+/// Sets `[ex-ostrya] gc-root-metadata-keys` to [`GC_ANCHOR_KEY`] in the
+/// repository at `repo`.
+fn commit_gc_anchor_configure(repo: &Path) {
+    let mut config = std::fs::read_to_string(repo.join("config")).unwrap();
+    config.push_str(&format!(
+        "\n[ex-ostrya]\ngc-root-metadata-keys={GC_ANCHOR_KEY}\n"
+    ));
+    std::fs::write(repo.join("config"), config).unwrap();
+}
+
+/// Returns the GVariant text of a byte array of `len` bytes `0x11`.
+fn commit_gc_anchor_bytes(len: usize) -> String {
+    let bytes = vec!["0x11"; len].join(", ");
+    format!("[byte {bytes}]")
+}
+
+/// Returns each file under `objects/` of `repo` with its bytes, and the refs
+/// of `repo`. A refused commit leaves both as they were.
+fn commit_gc_anchor_state(repo: &Path) -> (Vec<(String, Vec<u8>)>, Vec<String>) {
+    fn walk(dir: &Path, prefix: &str, out: &mut Vec<(String, Vec<u8>)>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let rel = format!("{prefix}{name}");
+            if entry.path().symlink_metadata().unwrap().is_dir() {
+                walk(&entry.path(), &format!("{rel}/"), out);
+            } else {
+                out.push((rel, std::fs::read(entry.path()).unwrap()));
+            }
+        }
+    }
+    let mut objects = Vec::new();
+    walk(&repo.join("objects"), "objects/", &mut objects);
+    objects.sort();
+    (objects, describe_refs(repo))
+}
+
+/// Runs `ostrya commit` of `tree` to `main` in `repo` with `extra` options.
+fn commit_gc_anchor_run(repo: &Path, tree: &Path, extra: &[&str]) -> Run {
+    let repo_arg = format!("--repo={}", repo.display());
+    let mut args = vec![
+        "commit",
+        repo_arg.as_str(),
+        "-b",
+        "main",
+        "-s",
+        "anchors",
+        "--timestamp=@1700000000",
+    ];
+    args.extend_from_slice(extra);
+    args.push(tree.to_str().unwrap());
+    ostrya(&args, None, &[])
+}
+
+/// Runs `ostrya commit` with `extra` options that the command must refuse
+/// with `reason`. Checks the exit status, the error line, and that the
+/// objects, the `.commitmeta` files, and the refs stay as they were.
+fn commit_gc_anchor_refused(repo: &Path, tree: &Path, extra: &[&str], reason: &str) {
+    let before = commit_gc_anchor_state(repo);
+    let run = commit_gc_anchor_run(repo, tree, extra);
+    assert_eq!(run.status.code(), Some(1), "{extra:?}: the command exits 1");
+    assert_eq!(
+        String::from_utf8_lossy(&run.stderr),
+        format!(
+            "error: metadata key {GC_ANCHOR_KEY} is in [ex-ostrya] \
+             gc-root-metadata-keys: {reason}\n"
+        ),
+        "{extra:?}: the error line"
+    );
+    assert!(run.stdout.is_empty(), "{extra:?}: no checksum is printed");
+    assert_eq!(
+        commit_gc_anchor_state(repo),
+        before,
+        "{extra:?}: the store holds the same objects, .commitmeta files, and refs"
+    );
+}
+
+/// `commit` takes an `--add-metadata` value of each anchor shape for a key of
+/// `[ex-ostrya] gc-root-metadata-keys`. A checksum that names no commit is
+/// accepted.
+#[test]
+fn commit_accepts_each_gc_anchor_shape() {
+    let tmp = TmpDir::new("commit-gc-anchor-shapes");
+    let base = tmp.path();
+    let repo = create_repo(base, RepoMode::Archive);
+    commit_gc_anchor_configure(&repo);
+    let tree = ex_ostrya_tree(base, "tree");
+    let checksum = commit_gc_anchor_bytes(32);
+    let values = [
+        format!("[{checksum}]"),
+        format!("[('main', {checksum})]"),
+        format!("{{'app': ('main', {checksum})}}"),
+        "@aay []".to_owned(),
+    ];
+    for value in values {
+        let option = format!("--add-metadata={GC_ANCHOR_KEY}={value}");
+        commit_gc_anchor_run(&repo, &tree, &[&option]).ok();
+    }
+}
+
+/// `commit` refuses an `--add-metadata-string` entry of a key of
+/// `[ex-ostrya] gc-root-metadata-keys`, and writes no object and no ref.
+#[test]
+fn commit_refuses_a_string_metadata_value_of_a_gc_anchor_key() {
+    let tmp = TmpDir::new("commit-gc-anchor-string");
+    let base = tmp.path();
+    let repo = create_repo(base, RepoMode::Archive);
+    let tree = ex_ostrya_tree(base, "tree");
+    commit_gc_anchor_run(&repo, &tree, &[]).ok();
+    commit_gc_anchor_configure(&repo);
+    let option = format!("--add-metadata-string={GC_ANCHOR_KEY}=main");
+    commit_gc_anchor_refused(
+        &repo,
+        &tree,
+        &[&option],
+        "type is `s`, not `aay`, `a(say)`, or `a{s(say)}`",
+    );
+}
+
+/// `commit` refuses an `--add-detached-metadata-string` entry of a key of
+/// `[ex-ostrya] gc-root-metadata-keys`, and writes no object, no ref, and no
+/// `.commitmeta` file.
+#[test]
+fn commit_refuses_a_detached_string_value_of_a_gc_anchor_key() {
+    let tmp = TmpDir::new("commit-gc-anchor-detached");
+    let base = tmp.path();
+    let repo = create_repo(base, RepoMode::Archive);
+    let tree = ex_ostrya_tree(base, "tree");
+    commit_gc_anchor_run(&repo, &tree, &[]).ok();
+    commit_gc_anchor_configure(&repo);
+    let option = format!("--add-detached-metadata-string={GC_ANCHOR_KEY}=main");
+    commit_gc_anchor_refused(
+        &repo,
+        &tree,
+        &[&option],
+        "type is `s`, not `aay`, `a(say)`, or `a{s(say)}`",
+    );
+}
+
+/// `commit` refuses an `--add-metadata` value of a key of `[ex-ostrya]
+/// gc-root-metadata-keys` whose checksum has 20 bytes, in each shape.
+#[test]
+fn commit_refuses_a_short_checksum_of_a_gc_anchor_key() {
+    let tmp = TmpDir::new("commit-gc-anchor-short");
+    let base = tmp.path();
+    let repo = create_repo(base, RepoMode::Archive);
+    let tree = ex_ostrya_tree(base, "tree");
+    commit_gc_anchor_run(&repo, &tree, &[]).ok();
+    commit_gc_anchor_configure(&repo);
+    let short = commit_gc_anchor_bytes(20);
+    let values = [
+        format!("[{short}]"),
+        format!("[('main', {short})]"),
+        format!("{{'app': ('main', {short})}}"),
+    ];
+    for value in values {
+        let option = format!("--add-metadata={GC_ANCHOR_KEY}={value}");
+        commit_gc_anchor_refused(&repo, &tree, &[&option], "element 0 is 20 bytes, not 32");
+    }
+}
+
+/// `commit --keep-metadata` copies the value of a key of `[ex-ostrya]
+/// gc-root-metadata-keys` from the parent, and the command checks the copy.
+/// The parent comes from a `pull-local` of a repository that does not name
+/// the key, so the pull stores the defective value.
+#[test]
+fn commit_refuses_a_kept_defective_gc_anchor_value() {
+    let tmp = TmpDir::new("commit-gc-anchor-keep");
+    let base = tmp.path();
+    let src = base.join("src");
+    block_on(async {
+        Repo::create(&src, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+    });
+    let tree = ex_ostrya_tree(base, "tree");
+    let option = format!("--add-metadata-string={GC_ANCHOR_KEY}=main");
+    commit_gc_anchor_run(&src, &tree, &[&option]).ok();
+
+    let repo = create_repo(base, RepoMode::Archive);
+    commit_gc_anchor_configure(&repo);
+    let repo_arg = format!("--repo={}", repo.display());
+    ostrya(
+        &[&repo_arg, "pull-local", src.to_str().unwrap(), "main"],
+        None,
+        &[],
+    )
+    .ok();
+
+    let keep = format!("--keep-metadata={GC_ANCHOR_KEY}");
+    commit_gc_anchor_refused(
+        &repo,
+        &tree,
+        &[&keep],
+        "type is `s`, not `aay`, `a(say)`, or `a{s(say)}`",
+    );
+}
+
 // --- prune -------------------------------------------------------------------
 //
 // Each test builds one repository and copies it for each command. The test

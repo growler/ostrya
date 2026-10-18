@@ -458,10 +458,32 @@ pub enum Error {
     /// the keys. A value gives this error if its variant type is not
     /// `aay`, `a(say)`, or `a{s(say)}`, if an element does not have the shape
     /// of that type, or if a checksum is not 32 bytes.
+    ///
+    /// A prune gives this error for a commit that it reaches. A commit write
+    /// refuses the same values with [`Error::InvalidGcAnchor`].
     #[error("gc-root metadata key {metadata_key} on commit {commit}: {reason}")]
     InvalidGcRoot {
         /// The commit that holds the metadata key.
         commit: Checksum,
+        /// The name of the metadata key, as configured.
+        metadata_key: String,
+        /// The text that names the defect of the value.
+        reason: String,
+    },
+    /// A metadata dict to write that gives a GC-root metadata key a value that
+    /// a prune refuses.
+    ///
+    /// [`Transaction::write_commit`](crate::Transaction::write_commit),
+    /// [`Transaction::commit`](crate::Transaction::commit), and
+    /// [`Repo::write_commit_detached_metadata`](crate::Repo::write_commit_detached_metadata)
+    /// give this error before they write. The keys are those of the
+    /// repository config key `[ex-ostrya] gc-root-metadata-keys`. The values
+    /// and the reasons are those of [`Error::InvalidGcRoot`].
+    ///
+    /// The error names no commit, because `write_commit` checks the dict
+    /// before the commit has a checksum.
+    #[error("metadata key {metadata_key} is in [ex-ostrya] gc-root-metadata-keys: {reason}")]
+    InvalidGcAnchor {
         /// The name of the metadata key, as configured.
         metadata_key: String,
         /// The text that names the defect of the value.

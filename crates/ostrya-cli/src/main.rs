@@ -771,6 +771,10 @@ struct CommitArgs {
     /// separate entry. The command refuses an argument with no `=` and an
     /// empty key. The metadata holds these entries first, then the
     /// --add-metadata entries, then the --keep-metadata entries.
+    ///
+    /// A prune refuses a string value of a key of `[ex-ostrya]
+    /// gc-root-metadata-keys`. So the command refuses such a KEY when it
+    /// writes the commit, and it writes no object and no ref.
     #[arg(long, value_name = "KEY=VALUE")]
     add_metadata_string: Vec<String>,
     /// Add a key to the commit metadata, with a value in GVariant text form.
@@ -779,6 +783,11 @@ struct CommitArgs {
     /// the text. The command refuses an argument with no `=`, a value that
     /// does not parse, and an empty key. A repeated key stays as a separate
     /// entry.
+    ///
+    /// The value of a key of `[ex-ostrya] gc-root-metadata-keys` has the type
+    /// `aay`, `a(say)`, or `a{s(say)}`, and each checksum in it has 32 bytes.
+    /// The command refuses each other value of such a key when it writes the
+    /// commit, and it writes no object and no ref.
     #[arg(long, value_name = "KEY=VALUE")]
     add_metadata: Vec<String>,
     /// Carry this metadata key over from the parent commit.
@@ -786,6 +795,10 @@ struct CommitArgs {
     /// The value keeps its bytes. The option needs a parent, from --parent or
     /// from the tip of --branch. The command refuses a key that the parent
     /// does not hold.
+    ///
+    /// The command checks a carried value of a key of `[ex-ostrya]
+    /// gc-root-metadata-keys` as it checks an --add-metadata value. A parent
+    /// from a pull can hold a value that this check refuses.
     #[arg(long, value_name = "KEY")]
     keep_metadata: Vec<String>,
     /// Add a string-valued key to the detached commit metadata.
@@ -794,6 +807,11 @@ struct CommitArgs {
     /// detached metadata of the commit, so a signature that an earlier run
     /// left on the same commit checksum goes. The signatures of this run come
     /// after these entries.
+    ///
+    /// A prune refuses a string value of a key of `[ex-ostrya]
+    /// gc-root-metadata-keys`. So the command refuses such a KEY at the end of
+    /// the command, after any signatures, and it writes no object, no ref, and
+    /// no .commitmeta file.
     #[arg(long, value_name = "KEY=VALUE")]
     add_detached_metadata_string: Vec<String>,
     /// Record owner 0:0, modes of `perm & 0755`, and no extended attributes.

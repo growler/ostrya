@@ -462,6 +462,29 @@ impl RepoConfig {
     /// keeps. With `traverse_parent` set, as `ostrya prune` runs, that is at
     /// least what the `ostree` command keeps.
     ///
+    /// Three write methods also read this key, when a dict that they check
+    /// holds at least one entry:
+    /// [`Transaction::write_commit`](crate::Transaction::write_commit),
+    /// [`Transaction::commit`](crate::Transaction::commit), and
+    /// [`Repo::write_commit_detached_metadata`]. Each one refuses a dict that
+    /// gives a key of this list a value that a prune refuses, with
+    /// [`Error::InvalidGcAnchor`].
+    ///
+    /// These paths store a commit or its detached metadata with no check:
+    ///
+    /// - a pull
+    /// - the mirror push and the server commit of `ostrya receive` and
+    ///   `ostrya serve`
+    /// - [`Transaction::sign_commit`](crate::Transaction::sign_commit) and
+    ///   [`Repo::sign_commit`]
+    /// - the tombstone of a pruned commit
+    /// - the anchor commit of a repository with a collection id, which
+    ///   [`Repo::regenerate_summaries`], `ostrya receive`, and `ostrya serve`
+    ///   write. The port builds the binding keys of this commit.
+    ///
+    /// A prune that reaches a commit with a defective value from one of these
+    /// paths fails.
+    ///
     /// # Errors
     ///
     /// [`Error::Core`] if the value holds a malformed escape sequence.

@@ -803,13 +803,14 @@ impl Repo {
         for key in &gc.metadata_keys {
             for source in [Some(metadata), detached.as_ref()].into_iter().flatten() {
                 for value in dict_values(source, key) {
-                    let targets =
-                        metadata_key_targets(value).map_err(|reason| Error::InvalidGcRoot {
-                            commit: *commit,
-                            metadata_key: key.clone(),
-                            reason,
-                        })?;
-                    stack.extend(targets.into_iter().map(|t| (t, root_bound, Arrival::Root)));
+                    for_each_metadata_key_target(value, |target| {
+                        stack.push((target, root_bound, Arrival::Root));
+                    })
+                    .map_err(|reason| Error::InvalidGcRoot {
+                        commit: *commit,
+                        metadata_key: key.clone(),
+                        reason,
+                    })?;
                 }
             }
         }
@@ -925,7 +926,7 @@ async fn join_all<F: Future>(futures: impl IntoIterator<Item = F>) -> Vec<F::Out
 ///
 /// The function skips each entry that does not have the `{s?}` shape. If
 /// `dict` is not an array, the result is empty.
-fn dict_values<'a>(dict: &'a Value, key: &'a str) -> impl Iterator<Item = &'a Value> {
+pub(crate) fn dict_values<'a>(dict: &'a Value, key: &'a str) -> impl Iterator<Item = &'a Value> {
     dict.as_array()
         .unwrap_or_default()
         .iter()
@@ -935,8 +936,8 @@ fn dict_values<'a>(dict: &'a Value, key: &'a str) -> impl Iterator<Item = &'a Va
         })
 }
 
-/// Returns the commits that the value of one metadata key names, in the order
-/// of the value.
+/// Gives `visit` each commit that the value of one metadata key names, in the
+/// order of the value.
 ///
 /// The value is the variant that an `a{sv}` entry holds. The type of the
 /// variant selects the shape:
@@ -949,9 +950,14 @@ fn dict_values<'a>(dict: &'a Value, key: &'a str) -> impl Iterator<Item = &'a Va
 /// checksum. An empty array gives no commit.
 ///
 /// Any other value gives an error with the reason, the first defect in the
-/// order of the elements. The caller puts the reason into an
-/// [`Error::InvalidGcRoot`].
-fn metadata_key_targets(value: &Value) -> std::result::Result<Vec<Checksum>, String> {
+/// order of the elements. `visit` then has the checksums of the elements
+/// before the defect. The walk puts the reason into an
+/// [`Error::InvalidGcRoot`]. The check of a commit write gives a `visit` that
+/// does nothing, and puts the reason into an [`Error::InvalidGcAnchor`].
+pub(crate) fn for_each_metadata_key_target(
+    value: &Value,
+    mut visit: impl FnMut(Checksum),
+) -> std::result::Result<(), String> {
     let Some((ty, child)) = value.as_variant() else {
         return Err("value is not a variant".into());
     };
@@ -969,16 +975,15 @@ fn metadata_key_targets(value: &Value) -> std::result::Result<Vec<Checksum>, Str
     let Some(elements) = child.as_array() else {
         return Err("value is not an array".into());
     };
-    let mut targets = Vec::with_capacity(elements.len());
     for (index, item) in elements.iter().enumerate() {
         let Some(bytes) = checksum_of(item) else {
             return Err(format!("element {index} is not {element}"));
         };
         let checksum = Checksum::from_ay(bytes)
             .map_err(|_| format!("element {index} is {} bytes, not 32", bytes.len()))?;
-        targets.push(checksum);
+        visit(checksum);
     }
-    Ok(targets)
+    Ok(())
 }
 
 /// A function that returns the checksum bytes of one element of a GC-root
@@ -1231,6 +1236,14 @@ mod tests {
     /// `checksum`.
     fn entry(name: &str, checksum: &[u8]) -> Value {
         Value::Tuple(vec![Value::Str(name.into()), pair(name, checksum)])
+    }
+
+    /// Returns the checksums that the decoder gives for `value`, or the
+    /// reason of its refusal.
+    fn metadata_key_targets(value: &Value) -> std::result::Result<Vec<Checksum>, String> {
+        let mut targets = Vec::new();
+        for_each_metadata_key_target(value, |target| targets.push(target))?;
+        Ok(targets)
     }
 
     /// Returns the reason that the decoder gives for `value`.

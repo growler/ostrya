@@ -2209,6 +2209,31 @@ repository that sets one, and the divergence is by intent
   configured `ostrya prune` keeps at least what `ostree prune` keeps, and never
   less. A value the key-file syntax cannot split fails the prune, which then
   deletes nothing.
+
+  The library also reads the key when it writes a commit or the detached
+  metadata of a commit, and it refuses a value of a listed key that a prune
+  refuses. `ostrya commit` refuses an `--add-metadata-string` or
+  `--add-detached-metadata-string` entry of a listed key, and an
+  `--add-metadata` or `--keep-metadata` value of a listed key that is not an
+  `aay`, an `a(say)`, or an `a{s(say)}` with checksums of 32 bytes. It writes
+  `error: metadata key KEY is in [ex-ostrya] gc-root-metadata-keys: REASON`,
+  exits 1, and writes no object, no ref, and no `.commitmeta`. `ostree commit`
+  writes each such value. The refusal comes after the editor, the repository
+  lock, and the walk of the tree. The refusal of the commit metadata comes
+  before the refusal of a branch name that the revision syntax shadows or that
+  the refspec grammar refuses, and before the second check of the tags. The
+  checks of the tag names come before the repository lock. The refusal of the
+  detached metadata comes at the end of the command, after the signatures.
+  Each commit that writes metadata, the binding keys included, reads the key
+  when it writes the commit, so a value the key-file syntax cannot split fails
+  it. A commit with `--no-bindings` and `--add-detached-metadata-string` as its
+  only metadata option reads the key at the end of the command. A commit with
+  `--no-bindings` and no metadata option does not read the key. The port
+  builds the binding keys of the anchor commit of a collection, so the anchor
+  commit that `ostrya summary -u`, `ostrya receive`, and `ostrya serve` write
+  takes no check. A pull, `pull-local`, and the mirror push and the server
+  commit of `ostrya receive` and `ostrya serve` store the values with no check,
+  and a prune that reaches such a commit fails.
 - `detached-metadata-exclude` names detached-metadata keys the repository does
   not store on receive. `ostrya pull` and `ostrya pull-local` drop them from the
   `.commitmeta` they write; the tool's pull writes what the source holds. The
@@ -4639,7 +4664,12 @@ Observed by running the tool (2026.1).
   nowhere, since both refuse it and exit 1. Two faults report the tool's config
   refusal and the port's earlier check, so `commit --statoverride=no-such-file`
   against a repository holding `fsync=bogus` names the config from the tool and
-  the file from the port. Both exit 1 with no object and no ref written. Within
+  the file from the port. Both exit 1 with no object and no ref written.
+  `commit` also reads `[ex-ostrya] gc-root-metadata-keys` when it writes the
+  commit. A run whose only metadata option is `--add-detached-metadata-string`,
+  with `--no-bindings`, reads the key at the end of the command, after the
+  signatures. `ostree commit` ignores the `[ex-ostrya]` group and exits 0, so
+  a fault in that key parts the tool and the port ("P2", `prune`). Within
   `checkout` the port reads `[core] fsync` alone, and it reads it after the
   composefs export decision, which applies no durability policy, and ahead of
   the first checkout. A record stream carrying no pair reaches the read and

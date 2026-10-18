@@ -75,21 +75,29 @@ NAME passes the \%ref\-name rule, has no \fB\%:\fR, and is not \%64 lowercase he
 Add a \%string\-valued key to the commit metadata.
 .IP
 The argument splits at its first \fB\%=\fR, so the value can hold \fB\%=\fR\&. The option can occur more than once, and a repeated key stays as a separate entry. The command refuses an argument with no \fB\%=\fR and an empty key. The metadata holds these entries first, then the \%\-\-add\-metadata entries, then the \%\-\-keep\-metadata entries.
+.IP
+A prune refuses a string value of a key of \fB\%[ex\-ostrya] gc\-root\-metadata\-keys\fR\&. So the command refuses such a KEY when it writes the commit, and it writes no object and no ref.
 .TP
 \fB\-\-add\-metadata\fR \fIKEY=VALUE\fR
 Add a key to the commit metadata, with a value in GVariant text form.
 .IP
 The argument splits at its first \fB\%=\fR\&. The type of the value comes from the text. The command refuses an argument with no \fB\%=\fR, a value that does not parse, and an empty key. A repeated key stays as a separate entry.
+.IP
+The value of a key of \fB\%[ex\-ostrya] gc\-root\-metadata\-keys\fR has the type \fB\%aay\fR, \fB\%a(say)\fR, or \fB\%a{s(say)}\fR, and each checksum in it has \%32 bytes. The command refuses each other value of such a key when it writes the commit, and it writes no object and no ref.
 .TP
 \fB\-\-keep\-metadata\fR \fIKEY\fR
 Carry this metadata key over from the parent commit.
 .IP
 The value keeps its bytes. The option needs a parent, from \%\-\-parent or from the tip of \%\-\-branch. The command refuses a key that the parent does not hold.
+.IP
+The command checks a carried value of a key of \fB\%[ex\-ostrya] gc\-root\-metadata\-keys\fR as it checks an \%\-\-add\-metadata value. A parent from a pull can hold a value that this check refuses.
 .TP
 \fB\-\-add\-detached\-metadata\-string\fR \fIKEY=VALUE\fR
 Add a \%string\-valued key to the detached commit metadata.
 .IP
 The argument splits at its first \fB\%=\fR\&. These entries replace all detached metadata of the commit, so a signature that an earlier run left on the same commit checksum goes. The signatures of this run come after these entries.
+.IP
+A prune refuses a string value of a key of \fB\%[ex\-ostrya] gc\-root\-metadata\-keys\fR\&. So the command refuses such a KEY at the end of the command, after any signatures, and it writes no object, no ref, and no \%.commitmeta file.
 .TP
 \fB\-\-canonical\-permissions\fR
 Record owner \%0:0, modes of \fB\%perm & 0755\fR, and no extended attributes.

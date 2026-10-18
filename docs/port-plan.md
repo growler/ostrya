@@ -7699,10 +7699,11 @@ put them under repository policy. Neither capability has a counterpart in the
 `ostree` tool, so neither has a black-box oracle, and the port's own tests carry
 them. The default of every new field is the behavior that stood before it, so a
 prune with default options on a repository that does not set
-`gc-root-metadata-keys` is the tool's prune. `Repo::prune` reads
-`gc-root-metadata-keys`, and the CLI reads `detached-metadata-exclude`. A
-repository that sets one of the two keys takes a prune or a pull the tool does
-not reproduce; `cli-surface.md`, "P2", records that divergence.
+`gc-root-metadata-keys` is the tool's prune. `Repo::prune` and the write
+methods of a commit read `gc-root-metadata-keys`, and the CLI reads
+`detached-metadata-exclude`. A repository that sets one of the two keys takes a
+prune, a commit, or a pull the tool does not reproduce; `cli-surface.md`, "P2",
+records that divergence.
 
 `E1` -- the traversal core (DONE). `GcRoots` carries two edges into the walk in
 `traverse.rs`: the commit `parent` edge, which becomes optional, and any number
@@ -7770,8 +7771,20 @@ The library reads `detached-metadata-exclude` in one place,
 `ReceivePolicies::from_config`, which builds the receive policies of
 `ostrya receive` and `ostrya serve`. It reads `gc-root-metadata-keys` in
 `Repo::prune`, after the option refusals and before the repository lock, and
-adds the config keys to the keys of the caller (E2). The pull drivers act on
-the options they are given, and every default is what it was:
+adds the config keys to the keys of the caller (E2).
+`Transaction::write_commit`, `Transaction::commit`, and
+`Repo::write_commit_detached_metadata` read it too, when a dict they write
+holds at least one entry. Each checks the entries of the listed keys with the
+decoder of the walk, before its first write, and refuses a value the walk
+refuses with `Error::InvalidGcAnchor`. That error names the key and the reason
+and no commit, because `write_commit` checks before the commit has a checksum.
+A pull, the mirror push and the server commit of `ostrya receive` and
+`ostrya serve`, a signature, and a tombstone store their metadata with no
+check. The anchor commit of a collection takes no check either: `summary -u`,
+`ostrya receive`, and `ostrya serve` write it through the crate-private
+`Transaction::write_commit_unchecked`, because the port builds its binding
+keys. The pull drivers act on the options they are given, and every default
+is what it was:
 `PruneOptions::default` is the tool's prune on a repository that does not set
 `gc-root-metadata-keys`. `ostrya-cli` reads `detached-metadata-exclude` alone,
 at its `pull`, `pull-local`, and `push` sites.

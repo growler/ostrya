@@ -2710,6 +2710,48 @@ fn a_collection_repo_writes_the_anchor_in_the_session() {
     }
 }
 
+/// The session writes the anchor commit with no check of the GC anchor keys.
+/// The config list names `ostree.ref-binding`, a binding key of the anchor
+/// commit and of the fixture commit, whose `as` value a prune refuses.
+#[test]
+fn a_collection_repo_writes_the_anchor_with_no_gc_anchor_check() {
+    let tmp = TmpDir::new("recv-anchor-gc-keys");
+    let repo = new_repo(
+        &tmp,
+        RepoMode::Archive,
+        "collection-id=org.example.C\n\n[ex-ostrya]\ngc-root-metadata-keys=ostree.ref-binding\n",
+    );
+    let policy = ReceivePolicy {
+        update_summary: true,
+        ..policy()
+    };
+    let report = committed(push(
+        &repo,
+        &policy,
+        &fixture_objects(Encoding::Raw),
+        &[],
+        vec![update(
+            "test/main",
+            Expected::Absent,
+            Some(fixture_commit()),
+        )],
+        false,
+    ));
+    assert_eq!(report.warnings, vec![]);
+    let tip = block_on(repo.resolve_ref_tip("ostree-metadata"))
+        .unwrap()
+        .expect("the anchor ref");
+    let bytes = block_on(repo.load_object_bytes(ObjectType::Commit, &tip)).unwrap();
+    assert_eq!(
+        Commit::parse(&bytes).unwrap().ref_bindings(),
+        vec!["ostree-metadata"]
+    );
+    assert_eq!(
+        ref_file(&repo, "refs/heads/test/main").as_deref(),
+        Some(format!("{}\n", fixture_commit()).as_str())
+    );
+}
+
 /// If the session cannot write an anchor commit, the session fails with
 /// `internal` before the commit and publishes nothing. In this test,
 /// `refs/heads/ostree-metadata` holds no checksum.

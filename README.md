@@ -266,23 +266,37 @@ nix build .#ostrya        # ./result/bin/ostrya
 The flake gives the package as an overlay in `overlays.default`, so another
 flake can use `pkgs.ostrya`.
 
-The flake also gives the NixOS module `nixosModules.default`. The module runs
-`ostrya serve` on one repository as the systemd unit `ostrya-serve.service`.
-Each option of `services.ostrya-serve` that is not set adds no flag, so the
-key of `[ex-ostrya server]` in the repository config applies. The client
-groups, the trust groups, and the key groups are in the repository config.
+The flake also gives the NixOS module `nixosModules.default`. Each item of
+`services.ostrya-serve.instances` runs one `ostrya serve` process as the
+systemd unit `ostrya-serve-<name>.service`. Each option of an instance that
+is not set adds no flag, so the key of `[ex-ostrya server]` in the repository
+config applies. The client groups, the trust groups, and the key groups are
+in the repository config.
+
+Two instances can serve one repository. The example below serves plain HTTP
+on port 80 and HTTPS on port 443. The keys of `[ex-ostrya server]` apply to
+the two instances, so the TLS files are options of the `https` instance.
 
 ```nix
-services.ostrya-serve = {
-  enable = true;
-  repo = "/srv/ostree/repo";
-  user = "ostree";
-  group = "ostree";
-  listen = [ { address = "::"; port = 8443; } ];
-  openFirewall = true;
-  tls.certFile = "/etc/ostrya/server.pem";
-  tls.keyFile = "/etc/ostrya/server.key";
-};
+services.ostrya-serve.instances =
+  let
+    common = {
+      repo = "/srv/ostree/repo";
+      user = "ostree";
+      group = "ostree";
+      openFirewall = true;
+    };
+  in
+  {
+    http = common // {
+      listen = [ { address = "::"; port = 80; } ];
+    };
+    https = common // {
+      listen = [ { address = "::"; port = 443; } ];
+      tls.certFile = "/etc/ostrya/server.pem";
+      tls.keyFile = "/etc/ostrya/server.key";
+    };
+  };
 ```
 
 The Debian packaging is in `crates/ostrya-cli/debian`. The Nix package and the

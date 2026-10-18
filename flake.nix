@@ -126,8 +126,8 @@
     // {
       inherit overlays;
 
-      # `services.ostrya-serve` runs `ostrya serve` on one repository. The
-      # package defaults to the `ostrya` of this flake.
+      # Each item of `services.ostrya-serve.instances` runs one `ostrya serve`
+      # process. The package defaults to the `ostrya` of this flake.
       nixosModules.default = import ./nix/module.nix { inherit self; };
     };
 }

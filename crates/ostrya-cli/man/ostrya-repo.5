@@ -99,6 +99,7 @@ Its fs\-verity digest is the value of the key \fB\%ostree.composefs.digest.v0\fR
 Each mode stores it uncompressed, with the inode mode 0644.
 \fB\%ostrya commit \-\-generate\-composefs\fR and \fB\%ostrya composefs\-image \-\-add\fR write it, and \fB\%ostrya prune\fR removes it with its commit.
 \fB\%ostrya pull\fR, \fB\%ostrya pull\-local\fR, and \fB\%ostrya push\fR copy it with its commit, and install the copy only when its digest is the key.
+A static delta to the commit can carry it in a part, and its application installs it only when its digest is the key.
 .TP
 \fB\%.tombstone\-commit\fR
 A marker that records a commit that a prune deleted.
@@ -233,6 +234,9 @@ The superblock holds the metadata of the delta, the target commit, and the list 
 A signed delta has the same file names, and its superblock is wrapped in a signed envelope.
 \fB\%static\-delta generate \-\-inline\fR puts each part into the superblock and writes no part file.
 A part starts with one byte that names its compression: 0 for none, or \fB\%x\fR for xz.
+A delta to a commit that carries a valid \fB\%ostree.composefs.digest.v0\fR and has a \fB\%.cfs\fR object names the image.
+The last part holds the image, or the superblock lists the image as a fallback.
+The image is a fallback with \fB\%\-\-inline\fR, at the \fB\%\-\-min\-fallback\-size\fR threshold or larger, and when it is larger than \fB\%\-\-max\-chunk\-size\fR or 128 MiB.
 .PP
 In the summary and in an index, the name of a delta is the hexadecimal \fB\%<to>\fR or \fB\%<from>\-<to>\fR.
 \fB\%ostrya prune\fR removes a delta when its target commit is not in the repository.

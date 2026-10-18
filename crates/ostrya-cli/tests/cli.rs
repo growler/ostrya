@@ -18829,6 +18829,47 @@ fn pull_local_copies_the_composefs_image() {
     );
 }
 
+/// `static-delta generate` puts the composefs image of the target commit in
+/// the delta. `static-delta apply-offline` into a new repository stores the
+/// image byte for byte, and `composefs-image --check` passes on it.
+#[test]
+fn a_static_delta_carries_the_composefs_image() {
+    let tmp = TmpDir::new("static-delta-composefs-image");
+    let tree = tmp.path().join("tree");
+    ostrya_conformance::corpus::materialize("C0", &tree).unwrap();
+    let [src, dest] =
+        [("src", RepoMode::BareUser), ("dest", RepoMode::Archive)].map(|(name, mode)| {
+            let dir = tmp.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            create_repo(&dir, mode)
+        });
+    let checksum = ostrya_repo(
+        &src,
+        &[
+            "commit",
+            "-b",
+            "m",
+            FIXED_TIMESTAMP,
+            "--generate-composefs",
+            tree.to_str().unwrap(),
+        ],
+    )
+    .ok()
+    .stdout_trimmed();
+    ostrya_repo(&src, &["static-delta", "generate", "--empty", "--to", "m"]).ok();
+    let delta_dir = only_delta_dir(&src);
+    ostrya_repo(
+        &dest,
+        &["static-delta", "apply-offline", delta_dir.to_str().unwrap()],
+    )
+    .ok();
+    ostrya_repo(&dest, &["composefs-image", "--check", &checksum]).ok();
+    assert_eq!(
+        std::fs::read(image_path(&dest, &checksum)).unwrap(),
+        std::fs::read(image_path(&src, &checksum)).unwrap()
+    );
+}
+
 /// `composefs-image --add` refuses a commit without the key and stores
 /// nothing. `--check` and `--get-path` fail for the same commit. The command
 /// takes exactly one action.

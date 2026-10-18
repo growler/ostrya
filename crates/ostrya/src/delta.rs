@@ -23,13 +23,14 @@ use futures_io::{AsyncRead, AsyncSeek, AsyncWrite};
 use futures_lite::io::{BufReader, Cursor};
 use futures_lite::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 use ostrya_core::{
-    ArrayIter, Checksum, GvDecode, ObjectType, Type, Value, Xattrs, from_bytes, offset_size_for,
-    to_bytes, varint,
+    ArrayIter, Checksum, Commit, GvDecode, ObjectType, Type, Value, Xattrs, from_bytes,
+    offset_size_for, to_bytes, varint,
 };
 use ostrya_rt::{File as RtFile, FileReader};
 use sha2::{Digest, Sha256};
 
 use crate::bspatch::bspatch;
+use crate::composefs::recorded_digest;
 use crate::error::{Error, Result};
 use crate::hashing::HashingReader;
 use crate::pull::{ModeChecks, PullFlags};
@@ -94,6 +95,11 @@ pub(crate) const IO_CHUNK: usize = 128 * 1024;
 /// unbounded copy.
 pub(crate) const MAX_TABLE_BYTES: usize = crate::object::MAX_METADATA_SIZE as usize;
 
+/// The size limit of a composefs image that a part carries: 128 MiB. The
+/// generation puts a larger image in a fallback entry, and an application
+/// refuses a larger image in a part.
+pub(crate) const MAX_PART_IMAGE: u64 = crate::object::MAX_METADATA_SIZE;
+
 /// The zero-copy view of a decompressed part payload
 /// `(a(uuu) aa(ayay) ay ay)`: the mode table, the xattr table, the data-source
 /// blob, and the operation stream. The two trailing byte arrays borrow the
@@ -141,6 +147,12 @@ type PartView<'a> = (
 /// - one [meta-entry](DeltaPart) for each part: the part checksum, the
 ///   object list, and two sizes
 /// - the [fallback objects](DeltaFallback)
+///
+/// A delta that ostrya writes can also carry the composefs image of the
+/// target commit, as an object of the type [`ObjectType::ComposefsImage`]
+/// in the object list of a part or in the fallbacks. The `ostree` command
+/// writes no such entry. An image entry names the target commit, and a
+/// superblock has one image entry at most.
 ///
 /// A part is a compressed GVariant. It holds a mode table, an xattr table, a
 /// data-source blob, and an operation stream. An application runs the
@@ -225,7 +237,9 @@ impl DeltaPart {
 /// An object that a static delta delivers as a loose object, outside its parts.
 ///
 /// In the superblock a fallback is a `(yaytt)` tuple: the object type, the
-/// checksum, and two sizes.
+/// checksum, and two sizes. The object is a content object, or the
+/// composefs image of the target commit in a delta that ostrya writes. Both
+/// sizes of an image are the size of the image.
 #[derive(Debug, Clone)]
 pub struct DeltaFallback {
     pub(crate) objtype: ObjectType,
@@ -355,7 +369,17 @@ impl Repo {
     /// If a part patches against a source commit, the objects of the source
     /// commit must be in the repository. The fallback objects of the delta
     /// must be in the repository too, because an offline application does not
-    /// fetch them.
+    /// fetch them. The composefs image is optional, so a fallback image need
+    /// not be present.
+    ///
+    /// # Composefs image
+    ///
+    /// A part can carry the composefs image of the target commit. The image
+    /// needs the key `ostree.composefs.digest.v0` of the target commit. If
+    /// the transaction staged or the repository holds an image of the commit,
+    /// the call does not read the image in the part. Else the call streams the
+    /// image to the staging directory, computes its fs-verity digest, and
+    /// stages it only when the digest is the key.
     ///
     /// # Verification
     ///
@@ -425,10 +449,16 @@ impl Repo {
     ///   - mode and xattr tables larger than 128 MiB together, or a metadata
     ///     object or a symlink target larger than 128 MiB
     ///   - a symlink target that is not UTF-8
+    ///   - a composefs image for a target commit with no key or a malformed
+    ///     key, a composefs image larger than 128 MiB, or an open of a
+    ///     composefs image
     /// - [`Error::Core`] if a part payload, an operand, a checksum, or an xattr
     ///   set does not decode.
     /// - [`Error::ChecksumMismatch`] if an object that a part produces does not
     ///   hash to the checksum that the part names for it.
+    /// - [`Error::ComposefsDigestMismatch`] if the fs-verity digest of a
+    ///   composefs image that a part carries is not the key of the target
+    ///   commit.
     /// - [`Error::Pull`] if the repository is `bare-user-only` and a content
     ///   object has an owner, xattrs, or mode bits that this mode does not store.
     /// - [`Error::InsufficientFreeSpace`] if a write makes the free space less
@@ -454,8 +484,13 @@ impl Repo {
         // The fallback objects that the delta names but does not carry must be
         // present, because an offline application does not fetch them. The
         // check runs against the repository first, so a missing prerequisite
-        // fails before an object is staged.
-        for fb in &sb.fallbacks {
+        // fails before an object is staged. The composefs image is optional,
+        // so a fallback image need not be present.
+        for fb in sb
+            .fallbacks
+            .iter()
+            .filter(|fb| fb.objtype != ObjectType::ComposefsImage)
+        {
             if !self.has_object(fb.objtype, &fb.checksum).await? {
                 return Err(Error::ObjectNotFound {
                     checksum: fb.checksum,
@@ -463,6 +498,22 @@ impl Repo {
                 });
             }
         }
+
+        // A part that carries the composefs image needs the key of the target
+        // commit. The commit parses on the blocking pool, and only if a part
+        // carries the image.
+        let image_key = if carries_image(&sb.meta_entries) {
+            let bytes = std::mem::take(&mut sb.commit_bytes);
+            let (bytes, key) = ostrya_rt::unblock(move || {
+                let key = image_key(&bytes);
+                (bytes, key)
+            })
+            .await;
+            sb.commit_bytes = bytes;
+            key
+        } else {
+            None
+        };
 
         let txn = self.transaction().await?;
         let staging = txn.staging_fd().try_clone_to_owned()?;
@@ -483,11 +534,27 @@ impl Repo {
                 Some((compression, body)) => {
                     verify_inline_part(compression, body, entry)?;
                     let payload = decode_inline_part(compression, body, &staging).await?;
-                    apply_part(&txn, payload.as_slice(), &entry.objects, &staging, checks).await?;
+                    apply_part(
+                        &txn,
+                        payload.as_slice(),
+                        &entry.objects,
+                        &staging,
+                        checks,
+                        image_key,
+                    )
+                    .await?;
                 }
                 None => {
                     let blob = decode_part(parts_dir.join(i.to_string()), entry, &staging).await?;
-                    apply_part(&txn, blob.as_slice(), &entry.objects, &staging, checks).await?;
+                    apply_part(
+                        &txn,
+                        blob.as_slice(),
+                        &entry.objects,
+                        &staging,
+                        checks,
+                        image_key,
+                    )
+                    .await?;
                 }
             }
         }
@@ -1011,6 +1078,9 @@ impl DeltaSuperblock {
     ///   object list is not a multiple of 33 bytes.
     /// - [`Error::InvalidFormat`] if the embedded commit does not hash to the
     ///   target commit checksum.
+    /// - [`Error::InvalidFormat`] if an entry of the type
+    ///   [`ObjectType::ComposefsImage`] names a commit other than the target
+    ///   commit, or if the superblock has more than one such entry.
     pub fn parse(bytes: Vec<u8>) -> Result<DeltaSuperblock> {
         let (payload, signatures) = if bytes.starts_with(SIGNED_MAGIC) {
             let ty = Type::parse(SIGNED_SIG).map_err(ostrya_core::Error::from)?;
@@ -1077,6 +1147,7 @@ impl DeltaSuperblock {
 
         let meta_entries = parse_meta_entries(array(&fields[6])?, big_endian)?;
         let fallbacks = parse_fallbacks(array(&fields[7])?, big_endian)?;
+        check_image_entries(&to, &meta_entries, &fallbacks)?;
 
         // The metadata dict moves out of the parsed tree with no copy, because
         // it can carry inline parts.
@@ -1560,16 +1631,67 @@ fn size_field(value: &Value, what: &str, big_endian: bool) -> Result<u64> {
 
 /// Reads the type byte of a part object or of a fallback entry.
 ///
-/// A static delta carries no composefs image, so the type
-/// [`ObjectType::ComposefsImage`] is refused with the error of an unknown
-/// type.
+/// Each type of [`ObjectType::from_u32`] is accepted, the type
+/// [`ObjectType::ComposefsImage`] included. [`check_image_entries`] holds the
+/// rules of an image entry.
 fn delta_object_type(byte: u8) -> Result<ObjectType> {
-    match ObjectType::from_u32(u32::from(byte))? {
-        ObjectType::ComposefsImage => {
-            Err(ostrya_core::Error::InvalidObjectType(u32::from(byte)).into())
+    Ok(ObjectType::from_u32(u32::from(byte))?)
+}
+
+/// Refuses the composefs image entries of a superblock that break the
+/// format: each entry of the type [`ObjectType::ComposefsImage`], in the
+/// object list of a part or in the fallbacks, must name the target commit
+/// `to`, and the superblock can have one such entry at most.
+fn check_image_entries(
+    to: &Checksum,
+    parts: &[DeltaPart],
+    fallbacks: &[DeltaFallback],
+) -> Result<()> {
+    let images = parts
+        .iter()
+        .flat_map(|part| part.objects.iter().copied())
+        .chain(fallbacks.iter().map(|fb| (fb.objtype, fb.checksum)))
+        .filter(|(ty, _)| *ty == ObjectType::ComposefsImage);
+    let mut count = 0usize;
+    for (_, checksum) in images {
+        if checksum != *to {
+            return Err(Error::InvalidFormat(format!(
+                "static delta composefs image entry names {checksum}, which is not the \
+                 target commit {to}"
+            )));
         }
-        ty => Ok(ty),
+        count += 1;
+        if count > 1 {
+            return Err(Error::InvalidFormat(
+                "static delta has more than one composefs image entry".to_owned(),
+            ));
+        }
     }
+    Ok(())
+}
+
+/// Returns `true` if a part of `entries` carries the composefs image of the
+/// target commit.
+pub(crate) fn carries_image(entries: &[DeltaPart]) -> bool {
+    entries.iter().any(|entry| {
+        entry
+            .objects
+            .iter()
+            .any(|(ty, _)| *ty == ObjectType::ComposefsImage)
+    })
+}
+
+/// Returns the digest that the commit in `commit_bytes` records under
+/// `ostree.composefs.digest.v0`. A part that carries the composefs image of
+/// the commit needs this key.
+///
+/// Returns `None` if the commit does not parse, carries no key, or carries a
+/// malformed key. The parse costs CPU in proportion to the size of the
+/// commit, so a caller runs it on the blocking pool.
+pub(crate) fn image_key(commit_bytes: &[u8]) -> Option<[u8; 32]> {
+    Commit::parse(commit_bytes)
+        .ok()
+        .and_then(|commit| recorded_digest(&commit).ok().flatten())
 }
 
 /// Parses the stride-33 `objtype + 32-byte checksum` object array, which gives
@@ -2082,12 +2204,19 @@ fn bad_frame() -> Error {
     Error::InvalidFormat("static delta part payload framing is invalid".to_owned())
 }
 
+/// Returns `true` if an `S` for an object of `objtype` takes two operands,
+/// the length and the offset: a metadata object or the composefs image. An
+/// `S` for a content object also takes the mode and xattr indexes.
+fn splices_bare(objtype: ObjectType) -> bool {
+    objtype.is_meta() || objtype == ObjectType::ComposefsImage
+}
+
 /// Returns the operand count of `opcode`, by the rules that [`apply_part`]
-/// decodes with. `meta` is `true` if the object at the current index is a
-/// metadata object. `None` for a byte that is not an opcode.
-fn operand_count(opcode: u8, meta: bool) -> Option<usize> {
+/// decodes with. `bare` is `true` if [`splices_bare`] is `true` for the
+/// object at the current index. `None` for a byte that is not an opcode.
+fn operand_count(opcode: u8, bare: bool) -> Option<usize> {
     match opcode {
-        OP_OPEN_SPLICE_CLOSE if meta => Some(2),
+        OP_OPEN_SPLICE_CLOSE if bare => Some(2),
         OP_OPEN_SPLICE_CLOSE => Some(4),
         OP_OPEN => Some(3),
         OP_WRITE | OP_BSPATCH => Some(2),
@@ -2150,9 +2279,9 @@ impl<'a> OpCounter<'a> {
 
     fn step(&mut self, byte: u8) -> Result<()> {
         let Some(op) = self.pending.as_mut() else {
-            let meta =
-                byte == OP_OPEN_SPLICE_CLOSE && object_at(self.objects, self.index)?.0.is_meta();
-            let need = operand_count(byte, meta).ok_or_else(|| {
+            let bare = byte == OP_OPEN_SPLICE_CLOSE
+                && splices_bare(object_at(self.objects, self.index)?.0);
+            let need = operand_count(byte, bare).ok_or_else(|| {
                 Error::InvalidFormat(format!("unknown static delta opcode {byte:#x}"))
             })?;
             let op = PendingOp {
@@ -2376,12 +2505,17 @@ pub(crate) fn open_rw_temp(staging: BorrowedFd<'_>) -> Result<OwnedFd> {
 /// They run on the mode and xattr tables of the part, before the bytes of the
 /// object are written. So a delta delivers no object that a loose fetch of
 /// the same object refuses.
+///
+/// `image_key` is the key `ostree.composefs.digest.v0` of the target commit,
+/// from [`image_key`]. A part that carries the composefs image needs it.
+/// [`stage_part_image`] states the rules of the image.
 pub(crate) async fn apply_part(
     txn: &Transaction,
     payload: &[u8],
     objects: &[(ObjectType, Checksum)],
     staging: &OwnedFd,
     checks: ModeChecks,
+    image_key: Option<[u8; 32]>,
 ) -> Result<()> {
     let view: PartView<'_> = GvDecode::decode(payload).map_err(ostrya_core::Error::from)?;
     let (mode_it, xattr_it, data_source, ops) = view;
@@ -2423,7 +2557,11 @@ pub(crate) async fn apply_part(
         match opcode {
             OP_OPEN_SPLICE_CLOSE => {
                 let (objtype, csum) = object_at(objects, index)?;
-                if objtype.is_meta() {
+                if objtype == ObjectType::ComposefsImage {
+                    let len = take_leb(ops, &mut cur)?;
+                    let off = take_leb(ops, &mut cur)? as usize;
+                    stage_part_image(txn, &csum, image_key, data_source, off, len).await?;
+                } else if splices_bare(objtype) {
                     let len = take_leb(ops, &mut cur)? as usize;
                     let off = take_leb(ops, &mut cur)? as usize;
                     // A spliced metadata object is buffered whole (it hashes
@@ -2453,6 +2591,10 @@ pub(crate) async fn apply_part(
                 let xattr_idx = take_leb(ops, &mut cur)? as usize;
                 let out_size = take_leb(ops, &mut cur)? as usize;
                 let (objtype, csum) = object_at(objects, index)?;
+                // The composefs image travels in one `S` alone.
+                if objtype == ObjectType::ComposefsImage {
+                    return Err(op_error("open of a composefs image"));
+                }
                 let meta = if objtype.is_meta() {
                     None
                 } else {
@@ -2547,6 +2689,46 @@ pub(crate) async fn apply_part(
             "operation stream produced fewer objects than declared",
         ));
     }
+    Ok(())
+}
+
+/// Stages the composefs image of `commit` that an `S` splices from
+/// `data_source[off..off + len]`.
+///
+/// The image needs `key`, the key `ostree.composefs.digest.v0` of `commit`:
+/// a target commit with no key or a malformed key refuses the part. The
+/// image can be [`MAX_PART_IMAGE`] bytes at most. An image that the
+/// transaction staged or that the repository holds is trusted by its
+/// presence, and the call does not read the copy in the part. Else the call
+/// streams the image from the data source to the staging directory, checks
+/// its fs-verity digest against `key`, and stages it. No step copies the
+/// whole image onto the heap.
+async fn stage_part_image(
+    txn: &Transaction,
+    commit: &Checksum,
+    key: Option<[u8; 32]>,
+    data_source: &[u8],
+    off: usize,
+    len: u64,
+) -> Result<()> {
+    let key = key.ok_or_else(|| {
+        op_error("composefs image of a target commit with no valid ostree.composefs.digest.v0")
+    })?;
+    if len > MAX_PART_IMAGE {
+        return Err(op_error("composefs image exceeds the part image ceiling"));
+    }
+    let bytes = slice(data_source, off, len as usize)?;
+    if txn.is_staged(commit, ObjectType::ComposefsImage)
+        || txn
+            .repo()
+            .has_object(ObjectType::ComposefsImage, commit)
+            .await?
+    {
+        return Ok(());
+    }
+    let mut buf = Vec::new();
+    txn.stage_composefs_image_keyed(commit, &key, bytes, &mut buf)
+        .await?;
     Ok(())
 }
 
@@ -3677,35 +3859,223 @@ mod tests {
         }
     }
 
-    /// A part object and a fallback entry of type 100, the composefs image,
-    /// are refused as an unknown type. A file object passes in both.
+    /// The target commit of each superblock that [`superblock`] builds.
+    fn superblock_target() -> Checksum {
+        DeltaSuperblock::parse(superblock(
+            endianness_dict(ENDIANNESS_LITTLE),
+            0,
+            0,
+            Vec::new(),
+            Vec::new(),
+        ))
+        .unwrap()
+        .to
+    }
+
+    /// One meta-entry tuple whose object list holds `objects`.
+    fn objects_entry(objects: &[(ObjectType, Checksum)]) -> Value {
+        let mut array = Vec::new();
+        for (ty, checksum) in objects {
+            array.push(ty.as_u32() as u8);
+            array.extend_from_slice(checksum.as_bytes());
+        }
+        Value::Tuple(vec![
+            Value::U32(0),
+            Value::Bytes(Checksum::from_bytes([0x11; 32]).as_bytes().to_vec()),
+            Value::U64(1),
+            Value::U64(1),
+            Value::Bytes(array),
+        ])
+    }
+
+    /// One fallback tuple of type `ty` for `checksum`.
+    fn typed_fallback(ty: ObjectType, checksum: &Checksum) -> Value {
+        Value::Tuple(vec![
+            Value::Byte(ty.as_u32() as u8),
+            Value::Bytes(checksum.as_bytes().to_vec()),
+            Value::U64(1),
+            Value::U64(1),
+        ])
+    }
+
+    /// An entry of type 100, the composefs image, parses if it names the
+    /// target commit, in a part or in the fallbacks.
     #[test]
-    fn a_delta_refuses_the_composefs_image_type() {
-        let refused = |err: Error| {
+    fn a_delta_accepts_the_composefs_image_of_its_target() {
+        let to = superblock_target();
+        let image = (ObjectType::ComposefsImage, to);
+        let file = (ObjectType::File, Checksum::from_bytes([0x44; 32]));
+
+        let sb = DeltaSuperblock::parse(superblock(
+            endianness_dict(ENDIANNESS_LITTLE),
+            0,
+            0,
+            vec![objects_entry(&[file, image])],
+            Vec::new(),
+        ))
+        .unwrap();
+        assert_eq!(sb.parts()[0].objects(), [file, image]);
+        assert!(carries_image(&sb.meta_entries));
+
+        let sb = DeltaSuperblock::parse(superblock(
+            endianness_dict(ENDIANNESS_LITTLE),
+            0,
+            0,
+            vec![objects_entry(&[file])],
+            vec![typed_fallback(ObjectType::ComposefsImage, &to)],
+        ))
+        .unwrap();
+        assert_eq!(sb.fallbacks()[0].object_type(), ObjectType::ComposefsImage);
+        assert!(!carries_image(&sb.meta_entries));
+    }
+
+    /// An image entry that names another commit is refused, and so is a
+    /// second image entry, in a part or in the fallbacks.
+    #[test]
+    fn a_delta_refuses_a_misplaced_composefs_image() {
+        let to = superblock_target();
+        let refused = |entries: Vec<Value>, fallbacks: Vec<Value>, needle: &str| {
+            let err = DeltaSuperblock::parse(superblock(
+                endianness_dict(ENDIANNESS_LITTLE),
+                0,
+                0,
+                entries,
+                fallbacks,
+            ))
+            .unwrap_err();
             assert!(
-                matches!(err, Error::Core(ostrya_core::Error::InvalidObjectType(100))),
+                matches!(&err, Error::InvalidFormat(msg) if msg.contains(needle)),
                 "{err}"
             );
         };
+        let image = (ObjectType::ComposefsImage, to);
+        let other = Checksum::from_bytes([0x55; 32]);
 
-        let mut array = vec![ObjectType::ComposefsImage.as_u32() as u8];
-        array.extend_from_slice(&[0x44; 32]);
-        refused(parse_object_array(&array).unwrap_err());
-        array[0] = ObjectType::File.as_u32() as u8;
-        assert_eq!(parse_object_array(&array).unwrap()[0].0, ObjectType::File);
+        refused(
+            vec![objects_entry(&[(ObjectType::ComposefsImage, other)])],
+            Vec::new(),
+            "not the target commit",
+        );
+        refused(
+            Vec::new(),
+            vec![typed_fallback(ObjectType::ComposefsImage, &other)],
+            "not the target commit",
+        );
+        refused(
+            vec![objects_entry(&[image]), objects_entry(&[image])],
+            Vec::new(),
+            "more than one composefs image",
+        );
+        refused(
+            vec![objects_entry(&[image])],
+            vec![typed_fallback(ObjectType::ComposefsImage, &to)],
+            "more than one composefs image",
+        );
+    }
 
-        let fallback = |ty: ObjectType| {
-            Value::Tuple(vec![
-                Value::Byte(ty.as_u32() as u8),
-                Value::Bytes(vec![0x33; 32]),
-                Value::U64(1),
-                Value::U64(1),
-            ])
-        };
-        refused(parse_fallbacks(&[fallback(ObjectType::ComposefsImage)], false).unwrap_err());
-        assert_eq!(
-            parse_fallbacks(&[fallback(ObjectType::File)], false).unwrap()[0].objtype,
-            ObjectType::File
+    /// `S` reads two operands for the composefs image, as for a metadata
+    /// object, and checks its range against the blob.
+    #[test]
+    fn the_op_counter_splices_the_image_with_two_operands() {
+        let objects = [
+            (ObjectType::File, Checksum::from_bytes([0x01; 32])),
+            (ObjectType::ComposefsImage, Checksum::from_bytes([0x02; 32])),
+        ];
+        let stream = [
+            op(OP_OPEN_SPLICE_CLOSE, &[0, 0, 4, 0]),
+            op(OP_OPEN_SPLICE_CLOSE, &[60, 4]),
+        ]
+        .concat();
+        let mut counter = OpCounter::new(&objects, 64);
+        counter.feed(&stream).unwrap();
+        assert_eq!(counter.finish().unwrap().open_splice_close, 2);
+
+        let mut past = OpCounter::new(&objects[1..], 64);
+        let err = past.feed(&op(OP_OPEN_SPLICE_CLOSE, &[61, 4])).unwrap_err();
+        assert!(err.to_string().contains("out of bounds"), "{err}");
+    }
+
+    /// A transaction on a new `archive` repository under the temp directory.
+    /// The repository is removed with the returned guard.
+    struct TxnFixture {
+        root: PathBuf,
+        repo: Repo,
+    }
+
+    impl Drop for TxnFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    impl TxnFixture {
+        async fn new() -> TxnFixture {
+            let root = std::env::temp_dir().join(format!(
+                "ostrya-delta-apply-{}-{}",
+                std::process::id(),
+                crate::write::unique()
+            ));
+            let repo = Repo::create(
+                &root,
+                crate::CreateOptions::new(ostrya_core::RepoMode::Archive),
+            )
+            .await
+            .unwrap();
+            TxnFixture { root, repo }
+        }
+    }
+
+    /// Applies one part that produces the composefs image of a commit, with
+    /// `ops` against a 64-byte blob and `key` as the key of the commit.
+    fn apply_image_part(ops: &[u8], key: Option<[u8; 32]>) -> Error {
+        block_on(async {
+            let fixture = TxnFixture::new().await;
+            let txn = fixture.repo.transaction().await.unwrap();
+            let staging = txn.staging_fd().try_clone_to_owned().unwrap();
+            let objects = [(ObjectType::ComposefsImage, Checksum::from_bytes([0x07; 32]))];
+            let checks = ModeChecks::new(PullFlags::empty(), fixture.repo.mode());
+            let err = apply_part(
+                &txn,
+                &payload(1, 1, 64, ops),
+                &objects,
+                &staging,
+                checks,
+                key,
+            )
+            .await
+            .unwrap_err();
+            assert!(!txn.is_staged(&objects[0].1, ObjectType::ComposefsImage));
+            err
+        })
+    }
+
+    /// An application refuses the image of a commit with no valid key, an
+    /// image past the part ceiling, an `o` of the image, and an image whose
+    /// digest is not the key. None of them stages the image.
+    #[test]
+    fn an_application_refuses_a_part_image_that_breaks_a_rule() {
+        let splice = op(OP_OPEN_SPLICE_CLOSE, &[64, 0]);
+        let err = apply_image_part(&splice, None);
+        assert!(
+            err.to_string()
+                .contains("no valid ostree.composefs.digest.v0"),
+            "{err}"
+        );
+
+        let key = Some([0x09; 32]);
+        let err = apply_image_part(&op(OP_OPEN_SPLICE_CLOSE, &[MAX_PART_IMAGE + 1, 0]), key);
+        assert!(err.to_string().contains("part image ceiling"), "{err}");
+
+        let err = apply_image_part(&[op(OP_OPEN, &[0, 0, 64]), op(OP_CLOSE, &[])].concat(), key);
+        assert!(
+            err.to_string().contains("open of a composefs image"),
+            "{err}"
+        );
+
+        let err = apply_image_part(&splice, key);
+        assert!(
+            matches!(err, Error::ComposefsDigestMismatch { expected, .. } if expected == [0x09; 32]),
+            "{err}"
         );
     }
 }

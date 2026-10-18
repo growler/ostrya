@@ -2743,7 +2743,9 @@ delta name; the last `--to` wins. Thirty-seven differences stand on `show`,
   the applier, so they also apply to a delta that the tool generates. The
   port has neither limit. It applies rollsum and bspatch objects into an
   `archive` repository. It applies a delta with fallbacks where the objects
-  that they name are already in the repository;
+  that they name are already in the repository. A fallback entry of the
+  composefs image need not be present (`../format-reference.md`, "The
+  composefs image in a static delta");
 - a 32-byte `apply-offline` key that decodes to no curve point. The port
   refuses every run that carries such a key at exit 1 with the error it gives
   for `verify` and writes no object. The tool applies an unsigned delta at
@@ -2825,7 +2827,15 @@ refusal writes no object.
 "CLI output formats", `static-delta`). The byte order starts from the host
 order, as in the tool. Only a little-endian host is observed.
 
-`static-delta generate` carries eighteen differences. Three of them are open.
+`static-delta generate` carries nineteen differences. Three of them are open.
+
+- the composefs image of the target commit. The port puts the stored image
+  of a commit that carries `ostree.composefs.digest.v0` in the delta, in a
+  part or as a fallback entry of the type 100 (`../format-reference.md`,
+  "The composefs image in a static delta"). A delta of `--inline` lists the
+  image as a fallback entry. The tool has no image object. A delta of a
+  commit with no key or with no stored image has no image entry, and this
+  rule changes none of its bytes;
 
 - an inline superblock over the 128 MiB ceiling. The port refuses at exit 1
   after the block, with one of two messages. The inline parts share the
@@ -2985,7 +2995,10 @@ hardlink. On `pull`, the image adds its bytes to the transferred count of the
 statistics line. On `pull-local`, it adds its bytes there only when the pull
 reads static deltas, under `--require-static-deltas` or a list of deltas,
 because only that pull counts the bytes that it reads. The image adds no
-object to a count.
+object to a count. A static delta of the port can carry the image in a part.
+The pull then stores the image from the part and requests no `.cfs`, a pull
+with a subpath included (`format-reference.md`, "The composefs image in a
+static delta").
 
 The port adds `--collection=ID`, the pull of the refs of the collection ID
 from each remote whose `collection-id` is ID (`format-reference.md`, "The
@@ -4594,6 +4607,10 @@ ostrya composefs-image [--repo=PATH] (--add=REV | --get-path=REV | --check=REV)
   none of these lines.
 - `pull`, `pull-local`, `push`, `send`, and `serve` carry the image
   (`../format-reference.md`, "The composefs image object").
+- `static-delta generate` puts the image of the target commit in the delta,
+  and `static-delta apply-offline` stores it after it checks the digest
+  against the key (`../format-reference.md`, "The composefs image in a
+  static delta").
 - `crates/ostrya/tests/composefs_image.rs`,
   `crates/ostrya/tests/composefs_transfer.rs`, and
   `crates/ostrya-cli/tests/cli.rs` hold the tests.

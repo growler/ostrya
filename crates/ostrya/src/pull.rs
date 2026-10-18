@@ -1570,6 +1570,10 @@ impl Repo {
     /// [`bytes_transferred`](PullStats::bytes_transferred) when the pull
     /// counts a fetch, and adds no object count.
     ///
+    /// A static delta can carry the image of its target commit in a part.
+    /// The pull then stages the image from the part, with the same digest
+    /// check, and copies no image from a source.
+    ///
     /// # Static deltas
     ///
     /// Under [`require_static_deltas`](PullOptions::require_static_deltas),

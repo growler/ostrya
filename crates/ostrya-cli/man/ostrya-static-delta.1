@@ -100,7 +100,9 @@ The command does not create the directory. It refuses a PATH that names a direct
 \fB\-\-min\-fallback\-size\fR \fIMB\fR
 Send an object of this many decimal megabytes or more as a fallback.
 .IP
-The size is the size of the uncompressed stream of the object: the file header and the content. A loose fallback goes outside the parts, and the receiver fetches it whole. The value is a whole number. A value of \fB\%0\fR turns fallbacks off. Default: \%4.
+The size is the size of the uncompressed stream of the object: the file header and the content. A loose fallback goes outside the parts, and the receiver fetches it whole. The value is a whole number. A value of \fB\%0\fR turns fallbacks off for content objects.
+.IP
+The composefs image of the target commit goes in the delta if the commit carries a valid \fB\%ostree.composefs.digest.v0\fR and the repository stores the image. The image is a fallback if this value is not \fB\%0\fR and the image is this size or larger. It is also a fallback if it is larger than \%\-\-max\-chunk\-size or \%128 MiB, or with \%\-\-inline. Default: \%4.
 .TP
 \fB\-\-max\-bsdiff\-size\fR \fIMB\fR
 The largest content size, in decimal megabytes, for a bspatch stream.
@@ -110,7 +112,7 @@ A fixed limit of \%64 KiB also applies, and the smaller limit decides. Both limi
 \fB\-\-max\-chunk\-size\fR \fIMB\fR
 Close a part before its payload passes this many decimal megabytes.
 .IP
-A part that holds one large object can pass this size. The command refuses a value of \fB\%0\fR\&. Default: \%32.
+A part that holds one large object can pass this size. A composefs image larger than this size is a fallback. The command refuses a value of \fB\%0\fR\&. Default: \%32.
 .TP
 \fB\-\-disable\-bsdiff\fR
 Emit no bspatch stream.
@@ -153,7 +155,7 @@ The rebuild covers the deltas under the \fB\%deltas/\fR tree of the repository, 
 \fB\-\-inline\fR
 Carry the parts in the superblock and write no part file.
 .IP
-The parts count toward the superblock limit of \%128 MiB. If the superblock passes this limit, the command fails before it writes the superblock.
+The parts count toward the superblock limit of \%128 MiB. If the superblock passes this limit, the command fails before it writes the superblock. With this switch, the composefs image of the target commit is a fallback, and no part carries it.
 .TP
 \fB\-\-set\-endianness\fR \fIENDIAN\fR
 The byte order of the superblock size fields: \fB\%l\fR or \fB\%B\fR\&.

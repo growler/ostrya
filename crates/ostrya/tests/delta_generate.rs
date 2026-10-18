@@ -3025,3 +3025,181 @@ fn a_signed_inline_delta_verifies_in_both() {
         assert!(stats.ops.open_splice_close > 0);
     });
 }
+
+/// Commits `tree` into `repo` as [`commit_tree`] does. If `key` is set, the
+/// commit records the composefs image digest of the tree under
+/// `ostree.composefs.digest.v0`, and the repository stores no image.
+async fn commit_tree_keyed(
+    repo: &Repo,
+    tree: &Path,
+    parent: Option<Checksum>,
+    key: bool,
+) -> Checksum {
+    let txn = repo.transaction().await.unwrap();
+    let dfd = std::fs::File::open(tree).unwrap();
+    let mut modifier = Some(CommitModifier::new(
+        CommitModifierFlags::CANONICAL_PERMISSIONS | CommitModifierFlags::SKIP_XATTRS,
+    ));
+    let mut mtree = MutableTree::new();
+    txn.write_dfd_to_mtree(dfd.as_fd(), Path::new("."), &mut mtree, modifier.as_mut())
+        .await
+        .unwrap();
+    let root = txn.write_mtree(&mut mtree).await.unwrap();
+    let metadata = if key {
+        let digest = txn.composefs_digest(&root).await.unwrap();
+        Some(Value::Array(vec![Value::Tuple(vec![
+            Value::Str("ostree.composefs.digest.v0".to_owned()),
+            Value::variant(Type::parse("ay").unwrap(), Value::Bytes(digest.to_vec())),
+        ])]))
+    } else {
+        None
+    };
+    let commit = txn
+        .write_commit(
+            CommitOptions {
+                parent,
+                subject: Some("test".to_owned()),
+                body: None,
+                timestamp: Some(1_700_000_000),
+                metadata,
+            },
+            &root,
+        )
+        .await
+        .unwrap();
+    txn.set_ref("test", Some(&commit));
+    txn.commit().await.unwrap();
+    commit
+}
+
+/// Returns the SHA-256 of the superblock in `dir`, with the checksum and the
+/// size of each part set to zero. xz output is not pinned, so the two fields
+/// that depend on it are left out.
+fn superblock_digest(dir: &Path) -> String {
+    let bytes = std::fs::read(dir.join("superblock")).unwrap();
+    let ty = Type::parse("(a{sv}tayay(a{sv}aya(say)sstayay)aya(uayttay)a(yaytt))").unwrap();
+    let Value::Tuple(mut fields) = from_bytes(&ty, &bytes).unwrap() else {
+        panic!("the superblock is not a tuple");
+    };
+    let Value::Array(entries) = &mut fields[6] else {
+        panic!("the meta-entries are not an array");
+    };
+    for entry in entries {
+        let Value::Tuple(entry) = entry else {
+            panic!("a meta-entry is not a tuple");
+        };
+        entry[1] = Value::Bytes(vec![0; 32]);
+        entry[2] = Value::U64(0);
+    }
+    let bytes = ostrya_core::to_bytes(&ty, &Value::Tuple(fields)).unwrap();
+    Checksum::sha256(&bytes).to_hex()
+}
+
+/// Returns the SHA-256 of the decompressed payload of each part of the delta
+/// in `dir`, in part order.
+async fn part_payload_digests(dir: &Path) -> Vec<String> {
+    use async_compression::futures::bufread::XzDecoder;
+
+    let sb = DeltaSuperblock::read(&dir.join("superblock"))
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    for index in 0..sb.parts().len() {
+        let part = std::fs::read(dir.join(index.to_string())).unwrap();
+        assert_eq!(part[0], b'x', "part {index} is not xz-compressed");
+        let mut payload = Vec::new();
+        XzDecoder::new(futures_lite::io::Cursor::new(&part[1..]))
+            .read_to_end(&mut payload)
+            .await
+            .unwrap();
+        out.push(Checksum::sha256(&payload).to_hex());
+    }
+    out
+}
+
+/// The image rule changes no byte of a delta of commits with no stored
+/// composefs image: a commit with no key, and a commit with the key and no
+/// stored image. The test pins the SHA-256 of each decompressed part payload
+/// and of the superblock with the part checksums and sizes left out. Neither
+/// depends on the xz encoder.
+#[test]
+fn a_delta_of_commits_without_an_image_keeps_its_bytes() {
+    let tmp = TmpDir::new("gen-no-image-pin");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    std::fs::create_dir_all(tree.join("usr/bin")).unwrap();
+    std::fs::write(tree.join("usr/bin/app"), b"hello world\n").unwrap();
+    std::fs::write(tree.join("usr/bin/empty"), b"").unwrap();
+    std::fs::write(tree.join("usr/bin/data.bin"), noise(150_000, 31)).unwrap();
+    std::fs::write(tree.join("usr/bin/big.bin"), noise(300_000, 32)).unwrap();
+    std::os::unix::fs::symlink("app", tree.join("usr/bin/applink")).unwrap();
+
+    let src = base.join("src");
+    let pins = block_on(async {
+        let repo = Repo::create(&src, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        let plain = commit_tree_keyed(&repo, &tree, None, false).await;
+        let mut data = noise(150_000, 31);
+        data[70_000..70_100].copy_from_slice(&[0x5a; 100]);
+        std::fs::write(tree.join("usr/bin/data.bin"), data).unwrap();
+        let keyed = commit_tree_keyed(&repo, &tree, Some(plain), true).await;
+        assert!(!repo.composefs_image_path(&keyed).exists());
+
+        let mut pins = Vec::new();
+        for (name, from, to) in [
+            ("plain", None, plain),
+            ("keyed", None, keyed),
+            ("both", Some(plain), keyed),
+        ] {
+            let dir = base.join(name);
+            let opts = DeltaOptions {
+                min_fallback_size: 250_000,
+                timestamp: Some(1_700_000_000),
+                output_dir: Some(dir.clone()),
+                ..DeltaOptions::default()
+            };
+            repo.generate_static_delta(from.as_ref(), &to, &opts)
+                .await
+                .unwrap();
+            pins.push((
+                name,
+                to.to_hex(),
+                superblock_digest(&dir),
+                part_payload_digests(&dir).await,
+            ));
+        }
+        pins
+    });
+    let expected = [
+        (
+            "plain",
+            "5818384ba94370f7e4dfa6b213e4573744b44b01230995bdd2970ff9de7b49c3",
+            "1fa56b311ddde55b3073af134a9948507c36b3dc81cea46b3c360721bbdee7b5",
+            ["4e906020cd4a5b8dc077d1cb870b037ea3a211a3d219ec44fcba0377d3c479ed"],
+        ),
+        (
+            "keyed",
+            "4f41b18c703b7acbc989aea32e08af8a87057a4f8edc082a466c418d5aa5e32e",
+            "32bce759fac41bb9bb7bafbc7030b1c84e997670d821d9787b3bd5b061f5fb50",
+            ["a8c2ec712787de982858071a48498710fa0bf85aa5382c69419b6ee9ea17a2ea"],
+        ),
+        (
+            "both",
+            "4f41b18c703b7acbc989aea32e08af8a87057a4f8edc082a466c418d5aa5e32e",
+            "b67dca3c0be77aced9496a29f4822b54ee1c0f1c1b959f9ae733cd7487622157",
+            ["ebfd14b9f68e90a90042c56aabdc7fe8b5659716ab284eed5fe0adfa31c33eeb"],
+        ),
+    ];
+    for ((name, to, superblock, parts), (want_name, want_to, want_superblock, want_parts)) in
+        pins.iter().zip(expected)
+    {
+        assert_eq!(*name, want_name);
+        assert_eq!(to, want_to, "the target commit of {name} changed");
+        assert_eq!(
+            superblock, want_superblock,
+            "the superblock of {name} changed"
+        );
+        assert_eq!(parts, &want_parts, "a part payload of {name} changed");
+    }
+}

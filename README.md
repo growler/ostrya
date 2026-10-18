@@ -72,8 +72,9 @@ Ostrya adds these functions, which the `ostree` command does not have:
   repository, as `objects/<xx>/<commit>.cfs`. The fs-verity digest of the
   image is the digest that the commit records. `ostrya composefs-image`
   also checks a stored image and prints its path. Prune removes the image
-  with its commit, and fsck checks it. A pull and a push carry the image
-  with its commit, and `ostrya serve` and `ostrya send` serve it.
+  with its commit, and fsck checks it. A pull, a push, and a static delta
+  carry the image with its commit, and `ostrya serve` and `ostrya send` serve
+  it.
 - Library functions: a staging tree with a tree merge, and the import of an
   overlay changeset.
 
@@ -84,9 +85,9 @@ the protocols of these functions.
 
 Ostrya and the `ostree` command use the same repository format. The `ostree`
 command reads each repository that Ostrya writes, and Ostrya reads each
-repository that the `ostree` command writes. The `bare-user-shared` mode and
-a repository that holds a composefs image object are the exceptions, because
-only Ostrya writes them.
+repository that the `ostree` command writes. The `bare-user-shared` mode, a
+repository that holds a composefs image object, and a static delta that
+carries one are the exceptions, because only Ostrya writes them.
 
 The `ostrya` command is functionally compatible with the `ostree` command. A
 command that `ostrya` carries takes the same option names and values, does the

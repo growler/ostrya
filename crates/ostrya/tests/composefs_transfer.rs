@@ -25,6 +25,12 @@
 //!   for one commit, an image for a commit that it neither staged nor holds,
 //!   and an image in a session with a server commit. It accepts an image for
 //!   a commit that the repository holds. No object count holds an image.
+//! - A static delta carries the image of its target in its last part, or as
+//!   a fallback entry when the image is large or the delta is inline. An
+//!   offline application and a pull store the image from the part, and the
+//!   pull requests no `.cfs`. A pull requests a fallback image after the last
+//!   part, and an offline application does not need it. Each path refuses an
+//!   image whose digest is not the key.
 //!
 //! The tests of the seal skip if the file system has no fs-verity.
 
@@ -35,7 +41,7 @@ mod pull;
 use std::io;
 use std::os::fd::AsFd;
 use std::os::unix::fs::MetadataExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -50,9 +56,9 @@ use futures_lite::future;
 use ostrya::remote::{PullSession, StreamSessionOptions};
 use ostrya::verify::PullTrust;
 use ostrya::{
-    AdvertisedDelta, Checksum, CommitOptions, ComposefsImageState, DeltaOptions, Error,
-    MutableTree, PullFlags, PullOptions, PullStats, Repo, RepoMode, SummaryOptions, Value,
-    static_delta_relative_dir,
+    AdvertisedDelta, Checksum, CommitOptions, ComposefsImageState, DeltaOptions, DeltaSuperblock,
+    Error, MutableTree, ObjectType, PullFlags, PullOptions, PullStats, Repo, RepoMode,
+    SummaryOptions, Value, static_delta_relative_dir,
 };
 use ostrya_rt::block_on;
 use pull::{RepoServer, build_dest, meta_path};
@@ -476,10 +482,19 @@ fn a_delta_chain_pull_requests_the_images_last() {
             let (commit, _) = commit_tree(&remote, &base, at as u64 + 1, true, Some("main")).await;
             commits.push(commit);
         }
+        // A delta carries the image of its target in a part, unless the image
+        // is a fallback. At this threshold each image is a fallback, so the
+        // pull requests each image.
+        let smallest = commits
+            .iter()
+            .map(|commit| image_bytes(&remote, commit).unwrap().len() as u64)
+            .min()
+            .unwrap();
         let mut list = Vec::new();
         for pair in commits.windows(2) {
             let opts = DeltaOptions {
                 timestamp: Some(1),
+                min_fallback_size: smallest,
                 ..DeltaOptions::default()
             };
             remote
@@ -773,6 +788,376 @@ fn a_stream_pull_refuses_an_image_that_is_not_the_key() {
             "{err:?}"
         );
         assert!(dest.list_refs(None).await.unwrap().is_empty());
+        assert_eq!(image_bytes(&dest, &commit), None);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// The static delta.
+// ---------------------------------------------------------------------------
+
+/// Builds the owned tree under `dir/name` with `marker` in `src/marker`, and
+/// returns the directory that holds `src`.
+fn marked_tree(dir: &Path, name: &str, marker: &[u8]) -> PathBuf {
+    let base = dir.join(name);
+    build_owned_source(&base);
+    std::fs::write(base.join("src/marker"), marker).unwrap();
+    base
+}
+
+/// Generates the delta from `from` to `to` in `repo` under `deltas/` with
+/// `opts` and a fixed timestamp, writes a summary, and returns the delta
+/// directory.
+async fn publish_delta(
+    repo: &Repo,
+    from: Option<&Checksum>,
+    to: &Checksum,
+    opts: DeltaOptions,
+) -> PathBuf {
+    let relative = repo
+        .generate_static_delta(
+            from,
+            to,
+            &DeltaOptions {
+                timestamp: Some(1),
+                ..opts
+            },
+        )
+        .await
+        .unwrap();
+    repo.regenerate_summary(&SummaryOptions {
+        last_modified: Some(1),
+        ..SummaryOptions::default()
+    })
+    .await
+    .unwrap();
+    repo.path().join(relative)
+}
+
+/// Returns each image entry of the superblock in `dir`: the part that lists
+/// the image, or `None` for a fallback entry, with the commit that the entry
+/// names.
+async fn image_entries(dir: &Path) -> Vec<(Option<usize>, Checksum)> {
+    let sb = DeltaSuperblock::read(&dir.join("superblock"))
+        .await
+        .unwrap();
+    let mut out = Vec::new();
+    for (index, part) in sb.parts().iter().enumerate() {
+        for (ty, checksum) in part.objects() {
+            if *ty == ObjectType::ComposefsImage {
+                out.push((Some(index), *checksum));
+            }
+        }
+    }
+    for fallback in sb.fallbacks() {
+        if fallback.object_type() == ObjectType::ComposefsImage {
+            out.push((None, *fallback.checksum()));
+        }
+    }
+    out
+}
+
+/// The options of a pull of `main` that takes a static delta.
+fn delta_ref() -> PullOptions {
+    PullOptions {
+        require_static_deltas: true,
+        ..main_ref()
+    }
+}
+
+/// A delta from scratch and a delta from one commit to the next each carry
+/// the image of their target in the last part, as the last object. An
+/// offline application into `bare-user` and into `archive` stores each image
+/// byte for byte. The statistics of each part read. An image that the
+/// destination holds is trusted by its presence, and an application leaves
+/// it as it is.
+#[test]
+fn a_delta_carries_the_image_of_its_target() {
+    let dir = TmpDir::new("cfs-delta-offline");
+    block_on(async {
+        let src = new_repo(&dir.path().join("src"), RepoMode::Archive, "").await;
+        let tree_a = marked_tree(dir.path(), "tree-a", b"a\n");
+        let (a, _) = commit_tree(&src, &tree_a, 1, true, Some("main")).await;
+        let tree_b = marked_tree(dir.path(), "tree-b", b"b\n");
+        let (b, _) = commit_tree(&src, &tree_b, 2, true, Some("main")).await;
+        let scratch = publish_delta(&src, None, &a, DeltaOptions::default()).await;
+        let next = publish_delta(&src, Some(&a), &b, DeltaOptions::default()).await;
+
+        for (delta, to) in [(&scratch, a), (&next, b)] {
+            let sb = DeltaSuperblock::read(&delta.join("superblock"))
+                .await
+                .unwrap();
+            let last = sb.parts().len() - 1;
+            assert_eq!(image_entries(delta).await, [(Some(last), to)]);
+            assert_eq!(
+                sb.parts()[last].objects().last(),
+                Some(&(ObjectType::ComposefsImage, to))
+            );
+            for index in 0..sb.parts().len() {
+                let stats = sb.part_stats(index, delta).await.unwrap();
+                assert!(stats.ops.open_splice_close > 0);
+            }
+        }
+
+        for mode in [RepoMode::BareUser, RepoMode::Archive] {
+            let dest = new_repo(&dir.path().join(format!("{mode:?}")), mode, "").await;
+            assert_eq!(dest.apply_static_delta_offline(&scratch).await.unwrap(), a);
+            assert_same_image(&src, &dest, &a).await;
+            assert_eq!(dest.apply_static_delta_offline(&next).await.unwrap(), b);
+            assert_same_image(&src, &dest, &b).await;
+
+            let wrong = flipped(image_bytes(&dest, &b).unwrap());
+            replace_image(&dest, &b, &wrong);
+            dest.apply_static_delta_offline(&next).await.unwrap();
+            assert_eq!(image_bytes(&dest, &b), Some(wrong), "{mode:?}");
+        }
+    });
+}
+
+/// With fallbacks off and the default chunk size, the image is a packed
+/// entry of the type 100 in the last part.
+#[test]
+fn an_image_is_packed_with_fallbacks_off() {
+    let dir = TmpDir::new("cfs-delta-no-fallback");
+    block_on(async {
+        let (remote, commit) = source(dir.path(), "remote", RepoMode::Archive, true).await;
+        let opts = DeltaOptions {
+            min_fallback_size: 0,
+            ..DeltaOptions::default()
+        };
+        let delta = publish_delta(&remote, None, &commit, opts).await;
+        let sb = DeltaSuperblock::read(&delta.join("superblock"))
+            .await
+            .unwrap();
+        let last = sb.parts().len() - 1;
+        assert_eq!(image_entries(&delta).await, [(Some(last), commit)]);
+        assert_eq!(
+            sb.parts()[last].objects().last(),
+            Some(&(ObjectType::ComposefsImage, commit))
+        );
+    });
+}
+
+/// An inline delta lists the image as a fallback entry of the type 100, and
+/// no part lists the image.
+#[test]
+fn an_inline_delta_lists_the_image_as_a_fallback() {
+    let dir = TmpDir::new("cfs-delta-inline");
+    block_on(async {
+        let (remote, commit) = source(dir.path(), "remote", RepoMode::Archive, true).await;
+        let size = image_bytes(&remote, &commit).unwrap().len() as u64;
+        let opts = DeltaOptions {
+            inline: true,
+            ..DeltaOptions::default()
+        };
+        let delta = publish_delta(&remote, None, &commit, opts).await;
+        assert_eq!(image_entries(&delta).await, [(None, commit)]);
+        let sb = DeltaSuperblock::read(&delta.join("superblock"))
+            .await
+            .unwrap();
+        assert!(!sb.parts().is_empty());
+        let fallback = sb.fallbacks().last().unwrap();
+        assert_eq!(fallback.object_type(), ObjectType::ComposefsImage);
+        assert_eq!(
+            (fallback.size(), fallback.uncompressed_size()),
+            (size, size)
+        );
+    });
+}
+
+/// An HTTP pull, a pull through a stream session, and a local pull that take
+/// a delta store the image from its part. The remote holds no stored image
+/// after the generation, so each pull can take the image from the part
+/// alone. The HTTP pull and the stream pull request no `.cfs`.
+#[test]
+fn a_delta_pull_takes_the_image_from_the_part() {
+    let dir = TmpDir::new("cfs-delta-pull");
+    block_on(async {
+        let (remote, commit) = source(dir.path(), "remote", RepoMode::Archive, true).await;
+        publish_delta(&remote, None, &commit, DeltaOptions::default()).await;
+        let expected = image_bytes(&remote, &commit).unwrap();
+        std::fs::remove_file(remote.composefs_image_path(&commit)).unwrap();
+        let holds_image = async |dest: &Repo| {
+            assert_eq!(image_bytes(dest, &commit).as_ref(), Some(&expected));
+            assert_eq!(
+                dest.check_composefs_image(&commit).await.unwrap(),
+                ComposefsImageState::Valid
+            );
+        };
+        let server = RepoServer::start(remote.path(), false).await;
+
+        let http = dir.path().join("http");
+        std::fs::create_dir(&http).unwrap();
+        let dest = build_dest(&http, RepoMode::BareUser, &server.url(), "").await;
+        dest.pull("origin", delta_ref()).await.unwrap();
+        let seen = server.seen();
+        assert!(seen.iter().any(|p| p.starts_with("deltas/")), "{seen:?}");
+        assert!(!seen.iter().any(|p| p.ends_with(".cfs")), "{seen:?}");
+        holds_image(&dest).await;
+
+        let dest = new_repo(&dir.path().join("stream"), RepoMode::BareUser, "").await;
+        let (pulled, seen) = stream_pull_seen(&dest, &remote, delta_ref()).await;
+        pulled.unwrap();
+        assert!(!seen.iter().any(|p| p.ends_with(".cfs")), "{seen:?}");
+        holds_image(&dest).await;
+
+        let dest = new_repo(&dir.path().join("local"), RepoMode::Archive, "").await;
+        dest.pull_local(&remote, delta_ref()).await.unwrap();
+        holds_image(&dest).await;
+    });
+}
+
+/// An image of the fallback size or larger is a fallback entry. So is an
+/// image larger than the chunk size, also when fallbacks are off. An offline
+/// application does not need the image. An HTTP pull requests the image
+/// after the last part.
+#[test]
+fn a_large_image_goes_as_a_fallback() {
+    let dir = TmpDir::new("cfs-delta-fallback");
+    block_on(async {
+        let (remote, commit) = source(dir.path(), "remote", RepoMode::Archive, true).await;
+        let size = image_bytes(&remote, &commit).unwrap().len() as u64;
+        let server = RepoServer::start(remote.path(), false).await;
+        for (at, opts) in [
+            DeltaOptions {
+                min_fallback_size: size,
+                ..DeltaOptions::default()
+            },
+            DeltaOptions {
+                min_fallback_size: 0,
+                max_chunk_size: size - 1,
+                ..DeltaOptions::default()
+            },
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let delta = publish_delta(&remote, None, &commit, opts).await;
+            assert_eq!(image_entries(&delta).await, [(None, commit)], "{at}");
+            let sb = DeltaSuperblock::read(&delta.join("superblock"))
+                .await
+                .unwrap();
+            let fallback = sb.fallbacks().last().unwrap();
+            assert_eq!(
+                (fallback.size(), fallback.uncompressed_size()),
+                (size, size)
+            );
+
+            let offline = new_repo(
+                &dir.path().join(format!("offline-{at}")),
+                RepoMode::Archive,
+                "",
+            )
+            .await;
+            offline.apply_static_delta_offline(&delta).await.unwrap();
+            assert_eq!(
+                offline.check_composefs_image(&commit).await.unwrap(),
+                ComposefsImageState::Absent
+            );
+
+            let base = dir.path().join(format!("http-{at}"));
+            std::fs::create_dir(&base).unwrap();
+            let dest = build_dest(&base, RepoMode::BareUser, &server.url(), "").await;
+            server.forget();
+            dest.pull("origin", delta_ref()).await.unwrap();
+            let seen = server.seen();
+            let last_part = seen
+                .iter()
+                .rposition(|path| path.starts_with("deltas/"))
+                .unwrap_or_else(|| panic!("no delta request: {seen:?}"));
+            let image = seen
+                .iter()
+                .position(|path| *path == cfs_path(&commit))
+                .unwrap_or_else(|| panic!("no image request: {seen:?}"));
+            assert!(last_part < image, "{seen:?}");
+            assert_same_image(&remote, &dest, &commit).await;
+        }
+    });
+}
+
+/// A delta that carries an image whose digest is not the key is refused.
+/// The offline application stores no commit, and an HTTP pull and a stream
+/// pull write no ref and no image.
+#[test]
+fn a_corrupt_image_in_a_delta_is_refused() {
+    let dir = TmpDir::new("cfs-delta-corrupt");
+    block_on(async {
+        let (remote, commit) = source(dir.path(), "remote", RepoMode::Archive, true).await;
+        let bytes = image_bytes(&remote, &commit).unwrap();
+        replace_image(&remote, &commit, &flipped(bytes));
+        let delta = publish_delta(&remote, None, &commit, DeltaOptions::default()).await;
+        assert_eq!(image_entries(&delta).await, [(Some(0), commit)]);
+        let mismatch = |err: Error| {
+            assert!(
+                matches!(err, Error::ComposefsDigestMismatch { commit: c, .. } if c == commit),
+                "{err:?}"
+            );
+        };
+
+        let offline = new_repo(&dir.path().join("offline"), RepoMode::BareUser, "").await;
+        mismatch(
+            offline
+                .apply_static_delta_offline(&delta)
+                .await
+                .unwrap_err(),
+        );
+        assert!(
+            !offline
+                .has_object(ObjectType::Commit, &commit)
+                .await
+                .unwrap()
+        );
+        assert_eq!(image_bytes(&offline, &commit), None);
+
+        let server = RepoServer::start(remote.path(), false).await;
+        let dest = build_dest(dir.path(), RepoMode::BareUser, &server.url(), "").await;
+        mismatch(dest.pull("origin", delta_ref()).await.unwrap_err());
+        pull::assert_nothing_published(&dest).await;
+        assert_eq!(image_bytes(&dest, &commit), None);
+
+        let dest = new_repo(&dir.path().join("stream"), RepoMode::Archive, "").await;
+        mismatch(stream_pull(&dest, &remote, delta_ref()).await.unwrap_err());
+        assert!(dest.list_refs(None).await.unwrap().is_empty());
+        assert_eq!(image_bytes(&dest, &commit), None);
+    });
+}
+
+/// A pull with a subpath that takes a delta stores the image that a part
+/// carries. It requests no image that a fallback entry names, and leaves the
+/// commit with no image.
+#[test]
+fn a_subpath_delta_pull_keeps_a_part_image_and_skips_a_fallback_image() {
+    let dir = TmpDir::new("cfs-delta-subpath");
+    block_on(async {
+        let (remote, commit) = source(dir.path(), "remote", RepoMode::Archive, true).await;
+        let size = image_bytes(&remote, &commit).unwrap().len() as u64;
+        let server = RepoServer::start(remote.path(), false).await;
+        let opts = || PullOptions {
+            subpaths: vec!["/sub".to_owned()],
+            ..delta_ref()
+        };
+
+        publish_delta(&remote, None, &commit, DeltaOptions::default()).await;
+        let base = dir.path().join("part");
+        std::fs::create_dir(&base).unwrap();
+        let dest = build_dest(&base, RepoMode::BareUser, &server.url(), "").await;
+        dest.pull("origin", opts()).await.unwrap();
+        assert_same_image(&remote, &dest, &commit).await;
+
+        let fallback = DeltaOptions {
+            min_fallback_size: size,
+            ..DeltaOptions::default()
+        };
+        let delta = publish_delta(&remote, None, &commit, fallback).await;
+        assert_eq!(image_entries(&delta).await, [(None, commit)]);
+        let base = dir.path().join("fallback");
+        std::fs::create_dir(&base).unwrap();
+        let dest = build_dest(&base, RepoMode::BareUser, &server.url(), "").await;
+        server.forget();
+        dest.pull("origin", opts()).await.unwrap();
+        let seen = server.seen();
+        assert!(seen.iter().any(|p| p.starts_with("deltas/")), "{seen:?}");
+        assert!(!seen.iter().any(|p| p.ends_with(".cfs")), "{seen:?}");
         assert_eq!(image_bytes(&dest, &commit), None);
     });
 }

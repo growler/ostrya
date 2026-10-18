@@ -2496,7 +2496,13 @@ struct DeltaGenerateArgs {
     /// The size is the size of the uncompressed stream of the object: the file
     /// header and the content. A loose fallback goes outside the parts, and
     /// the receiver fetches it whole. The value is a whole number. A value of
-    /// `0` turns fallbacks off.
+    /// `0` turns fallbacks off for content objects.
+    ///
+    /// The composefs image of the target commit goes in the delta if the
+    /// commit carries a valid `ostree.composefs.digest.v0` and the repository
+    /// stores the image. The image is a fallback if this value is not `0` and
+    /// the image is this size or larger. It is also a fallback if it is
+    /// larger than --max-chunk-size or 128 MiB, or with --inline.
     #[arg(long, value_name = "MB", default_value = "4", value_parser = parse_megabytes)]
     min_fallback_size: u64,
     /// The largest content size, in decimal megabytes, for a bspatch stream.
@@ -2507,8 +2513,9 @@ struct DeltaGenerateArgs {
     max_bsdiff_size: u64,
     /// Close a part before its payload passes this many decimal megabytes.
     ///
-    /// A part that holds one large object can pass this size. The command
-    /// refuses a value of `0`.
+    /// A part that holds one large object can pass this size. A composefs
+    /// image larger than this size is a fallback. The command refuses a value
+    /// of `0`.
     #[arg(long, value_name = "MB", default_value = "32", value_parser = parse_megabytes)]
     max_chunk_size: u64,
     /// Emit no bspatch stream.
@@ -2561,7 +2568,8 @@ struct DeltaGenerateArgs {
     ///
     /// The parts count toward the superblock limit of 128 MiB. If the
     /// superblock passes this limit, the command fails before it writes the
-    /// superblock.
+    /// superblock. With this switch, the composefs image of the target
+    /// commit is a fallback, and no part carries it.
     #[arg(long)]
     inline: bool,
     /// The byte order of the superblock size fields: `l` or `B`.

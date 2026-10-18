@@ -34,10 +34,11 @@
 //! Each write refuses a commit without the key and an image whose digest is
 //! not the key. A write never holds the whole image in memory.
 //!
-//! A pull ([`Repo::pull`], [`Repo::pull_local`]), a push, and a one-way stream
-//! carry the image with its commit. Each of them computes the digest of the
-//! bytes that it writes, and installs the image only when the digest is the
-//! key.
+//! A pull ([`Repo::pull`], [`Repo::pull_local`]), a push, a one-way stream,
+//! and the application of a static delta
+//! ([`Repo::apply_static_delta_offline`]) carry the image with its commit.
+//! Each of them computes the digest of the bytes that it writes, and installs
+//! the image only when the digest is the key.
 
 use std::future::Future;
 use std::io::BufWriter;
@@ -445,13 +446,36 @@ impl Transaction {
                 "the composefs image comes from another transaction".into(),
             ));
         }
-        let checked = async {
+        let key = async {
             let commit_obj = self.load_commit_staged_first(commit).await?;
-            let key = require_recorded_digest(&commit_obj, commit)?;
-            check_image_digest(commit, &key, &image)?;
-            self.image_state(commit, &key).await
+            require_recorded_digest(&commit_obj, commit)
         }
         .await;
+        match key {
+            Ok(key) => self.attach_keyed(commit, &key, image).await,
+            Err(e) => {
+                image.discard().await;
+                Err(e)
+            }
+        }
+    }
+
+    /// Stages `image` as the composefs image of `commit`, with `key` as the
+    /// digest that the commit records.
+    ///
+    /// The call makes the checks and the steps of
+    /// [`attach_composefs_image`](Transaction::attach_composefs_image) that
+    /// come after the read of the key.
+    async fn attach_keyed(
+        &self,
+        commit: &Checksum,
+        key: &[u8; 32],
+        image: StagedComposefsImage<'_>,
+    ) -> Result<ComposefsImageAdd> {
+        let checked = match check_image_digest(commit, key, &image) {
+            Ok(()) => self.image_state(commit, key).await,
+            Err(e) => Err(e),
+        };
         self.finish_attach(commit, checked, image).await
     }
 
@@ -646,6 +670,41 @@ impl Transaction {
             image: Some(image),
         };
         self.attach_composefs_image(commit, staged).await
+    }
+
+    /// Streams a composefs image from `reader` and stages it as the image of
+    /// `commit`, with `key` as the digest that the commit records.
+    ///
+    /// The call writes and seals the image as
+    /// [`stage_composefs_image_from`](Transaction::stage_composefs_image_from)
+    /// does. It does not read the commit, so the commit need not be staged or
+    /// stored yet. The caller reads `key` from the commit. Then the call
+    /// checks the digest of the image against `key` and stages the image as
+    /// [`attach_composefs_image`](Transaction::attach_composefs_image) does.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Unsupported`] if the repository mode is `bare-split-xattrs`.
+    /// - [`Error::Io`] if a read from `reader` fails, or if a file system
+    ///   operation fails.
+    /// - [`Error::ComposefsDigestMismatch`] if the digest of the image is not
+    ///   `key`.
+    /// - [`Error::InsufficientFreeSpace`] if the image needs more space than
+    ///   the free-space budget of the transaction holds.
+    pub(crate) async fn stage_composefs_image_keyed<R: AsyncRead + Unpin>(
+        &self,
+        commit: &Checksum,
+        key: &[u8; 32],
+        reader: R,
+        buf: &mut Vec<u8>,
+    ) -> Result<ComposefsImageAdd> {
+        let image = write_image_stream_temp(self, reader, buf).await?;
+        let staged = StagedComposefsImage {
+            txn: self,
+            digest: image.digest,
+            image: Some(image),
+        };
+        self.attach_keyed(commit, key, staged).await
     }
 
     /// Streams a composefs image from `reader` and stages it as the image of
@@ -1022,6 +1081,48 @@ impl Repo {
         })
         .await
     }
+
+    /// Opens the stored composefs image of `commit` for reading, and returns
+    /// the file and its size in bytes. Returns `None` if the repository holds
+    /// no image of `commit`.
+    ///
+    /// The open and the `fstat` run on the blocking pool. The call reads no
+    /// byte of the image.
+    pub(crate) async fn open_composefs_image(
+        &self,
+        commit: &Checksum,
+    ) -> Result<Option<(std::fs::File, u64)>> {
+        let repo = self.clone();
+        let commit = *commit;
+        ostrya_rt::unblock(move || {
+            let Some(file) = open_image_blocking(repo.objects_fd(), &commit, repo.mode())? else {
+                return Ok(None);
+            };
+            let len = file.metadata()?.len();
+            Ok(Some((file, len)))
+        })
+        .await
+    }
+}
+
+/// Opens the stored composefs image of `commit` under `objects_fd` for
+/// reading, or returns `None` if the image is absent.
+fn open_image_blocking(
+    objects_fd: BorrowedFd<'_>,
+    commit: &Checksum,
+    mode: RepoMode,
+) -> Result<Option<std::fs::File>> {
+    let path = loose_path(commit, ObjectType::ComposefsImage, mode);
+    match rustix::fs::openat(
+        objects_fd,
+        path.as_str(),
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::empty(),
+    ) {
+        Ok(fd) => Ok(Some(std::fs::File::from(fd))),
+        Err(rustix::io::Errno::NOENT) => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
 /// Returns the fs-verity digest of the stored composefs image of `commit`
@@ -1034,18 +1135,9 @@ pub(crate) fn stored_image_digest_blocking(
     commit: &Checksum,
     mode: RepoMode,
 ) -> Result<Option<[u8; 32]>> {
-    let path = loose_path(commit, ObjectType::ComposefsImage, mode);
-    let fd = match rustix::fs::openat(
-        objects_fd,
-        path.as_str(),
-        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW,
-        rustix::fs::Mode::empty(),
-    ) {
-        Ok(fd) => fd,
-        Err(rustix::io::Errno::NOENT) => return Ok(None),
-        Err(e) => return Err(e.into()),
+    let Some(mut file) = open_image_blocking(objects_fd, commit, mode)? else {
+        return Ok(None);
     };
-    let mut file = std::fs::File::from(fd);
     Ok(Some(image_file_digest(&mut file)?))
 }
 

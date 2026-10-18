@@ -255,6 +255,13 @@ impl Repo {
     /// [`bytes_transferred`](PullStats::bytes_transferred) includes the
     /// image.
     ///
+    /// A static delta can carry the image of its target commit in a part.
+    /// The application of the part stages the image with the same digest
+    /// check, so the pull does not request it. A pull with
+    /// [`subpaths`](PullOptions::subpaths) also stages an image that a part
+    /// carries. The pull does not fetch an image that the delta lists as a
+    /// fallback as a fallback object: the rules above apply to it.
+    ///
     /// # Verification
     ///
     /// The pull stores each fetched object under the name that it requested.

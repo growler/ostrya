@@ -34,16 +34,16 @@ use ostrya_core::{
     Checksum, ObjectType, Type, Value, Xattrs, choose_offset_size, from_bytes, to_bytes, varint,
     write_offset,
 };
-use ostrya_rt::File as RtFile;
+use ostrya_rt::{File as RtFile, FileReader};
 use sha2::{Digest, Sha256};
 
 use crate::commit::append_dict_entry;
 use crate::delta::{
     Blob, COMMIT_SIG, COMPRESSION_XZ, DeltaEndianness, ENDIANNESS_BIG, ENDIANNESS_KEY,
-    ENDIANNESS_LITTLE, IO_CHUNK, MAX_SUPERBLOCK, MAX_TABLE_BYTES, MMAP_THRESHOLD, OP_BSPATCH,
-    OP_CLOSE, OP_OPEN, OP_OPEN_SPLICE_CLOSE, OP_SET_READ_SOURCE, OP_UNSET_READ_SOURCE, OP_WRITE,
-    SIGNED_MAGIC, SIGNED_SIG, SUPERBLOCK_SIG, dir_child_names, open_rw_temp, read_capped,
-    spill_to_blob,
+    ENDIANNESS_LITTLE, IO_CHUNK, MAX_PART_IMAGE, MAX_SUPERBLOCK, MAX_TABLE_BYTES, MMAP_THRESHOLD,
+    OP_BSPATCH, OP_CLOSE, OP_OPEN, OP_OPEN_SPLICE_CLOSE, OP_SET_READ_SOURCE, OP_UNSET_READ_SOURCE,
+    OP_WRITE, SIGNED_MAGIC, SIGNED_SIG, SUPERBLOCK_SIG, dir_child_names, image_key, open_rw_temp,
+    read_capped, spill_to_blob,
 };
 use crate::error::{Error, Result};
 use crate::file::{FileKind, FileObject};
@@ -119,9 +119,17 @@ pub struct DeltaOptions {
     /// file header, plus 7 bytes, plus the content, as the `ostree` command
     /// compares it.
     ///
-    /// Default 4,000,000. Zero turns fallbacks off, as `--min-fallback-size=0`
-    /// of the `ostree` command does. Each object is then packed whatever its
-    /// size, and the memory of a diff has no bound from this value.
+    /// Default 4,000,000. Zero turns fallbacks off for content objects, as
+    /// `--min-fallback-size=0` of the `ostree` command does. Each content
+    /// object is then packed whatever its size, and the memory of a diff has
+    /// no bound from this value.
+    ///
+    /// The composefs image of the target commit is a fallback if its size is
+    /// this value or larger, with a value other than zero. It is also a
+    /// fallback if it is larger than
+    /// [`max_chunk_size`](DeltaOptions::max_chunk_size) or larger than
+    /// 128 MiB, also with zero, and in each delta with
+    /// [`inline`](DeltaOptions::inline) set.
     pub min_fallback_size: u64,
     /// The largest content size for which a bspatch stream is tried.
     ///
@@ -134,7 +142,8 @@ pub struct DeltaOptions {
     pub max_bsdiff_size: u64,
     /// The payload size at which a part closes and the next part starts.
     ///
-    /// Default 32,000,000. Zero is refused with [`Error::InvalidFormat`].
+    /// A composefs image larger than this size is a fallback. Default
+    /// 32,000,000. Zero is refused with [`Error::InvalidFormat`].
     pub max_chunk_size: u64,
     /// The switch that allows bspatch streams.
     ///
@@ -192,6 +201,9 @@ pub struct DeltaOptions {
     /// superblock passes the limit, the generation fails before it writes
     /// the superblock. A superblock that an earlier delta left at the same
     /// location then stays in place. Default `false`.
+    ///
+    /// An inline delta carries no composefs image in a part. The image of the
+    /// target commit is then always a fallback.
     pub inline: bool,
     /// The byte order of the size fields of the superblock.
     ///
@@ -343,6 +355,19 @@ impl Repo {
     /// has a few dozen nonzero bytes. If the source object is not present, the
     /// object is spliced.
     ///
+    /// # Composefs image
+    ///
+    /// If `to` carries a valid `ostree.composefs.digest.v0` and the
+    /// repository stores the composefs image of `to`, the delta carries the
+    /// image. The image is a fallback if its size is
+    /// [`DeltaOptions::min_fallback_size`] or larger, with a value other than
+    /// zero, or if it is larger than [`DeltaOptions::max_chunk_size`] or
+    /// 128 MiB. It is also a fallback if [`DeltaOptions::inline`] is set. Else
+    /// it is spliced whole as the last object of the parts, with no diff
+    /// against the image of `from`. The generation does not read the
+    /// image to check its digest. A commit with no key or with no stored
+    /// image gives a delta with no image entry.
+    ///
     /// # Memory
     ///
     /// The generation holds a bounded amount of memory:
@@ -398,6 +423,8 @@ impl Repo {
     ///   part are larger than 128 MiB together.
     /// - [`Error::InvalidFormat`] if the temp file of the data source of a part
     ///   holds a byte count other than the count that the generation wrote.
+    /// - [`Error::InvalidFormat`] if the size of the composefs image of `to`
+    ///   changes during the generation.
     /// - [`Error::InvalidFormat`] if [`DeltaOptions::timestamp`] is `None` and
     ///   the system clock is before the Unix epoch.
     /// - [`Error::Core`] if the commit or its detached metadata does not parse,
@@ -444,6 +471,13 @@ impl Repo {
         // `ostree` command checks the delivered commit against that copy. The
         // two reads run in one call on the blocking pool, the commit first.
         let (commit_bytes, detached) = self.load_commit_and_detached(to).await?;
+        // A valid key `ostree.composefs.digest.v0` is the condition for the
+        // composefs image in the delta. The parse runs on the blocking pool.
+        let (commit_bytes, keyed) = ostrya_rt::unblock(move || {
+            let keyed = image_key(&commit_bytes).is_some();
+            (commit_bytes, keyed)
+        })
+        .await;
         let commit = Target {
             bytes: &commit_bytes,
             detached: detached.as_ref(),
@@ -469,7 +503,7 @@ impl Repo {
             None => None,
         };
 
-        let selection = self.select_objects(from, to, opts).await?;
+        let mut selection = self.select_objects(from, to, keyed, opts).await?;
         let (dir_path, dir_fd, superblock_name) = match superblock_target {
             Some(target) => target,
             None => {
@@ -516,7 +550,7 @@ impl Repo {
         };
         let mut entries: Vec<PartEntry> = Vec::new();
         let mut part = Part::default();
-        for item in &selection.packed {
+        for item in &mut selection.packed {
             // A part closes if the next object can push its payload past the
             // chunk ceiling. The content size of the object is the estimate. It
             // is exact for a splice and an upper bound for a diffed object. The
@@ -816,10 +850,18 @@ impl Repo {
     /// the superblock carries the target commit object. Metadata objects come
     /// before content objects, and each group is in checksum order, so the
     /// same inputs give the same delta.
+    ///
+    /// `keyed` is `true` if `to` carries a valid key
+    /// `ostree.composefs.digest.v0`. If it is `true` and the repository
+    /// stores the composefs image of `to`, the image comes last, as a packed
+    /// object or as a fallback, by the rule of [`image_is_fallback`]. A
+    /// packed image keeps the file that the selection opens. The generation
+    /// does not read the image to check its digest.
     async fn select_objects(
         &self,
         from: Option<&Checksum>,
         to: &Checksum,
+        keyed: bool,
         opts: &DeltaOptions,
     ) -> Result<Selection> {
         let mut needed = self.traverse_commit(to, 0).await?;
@@ -858,6 +900,7 @@ impl Repo {
                 content_size: self.loose_object_size(ty, &checksum).await?,
                 source: None,
                 file: None,
+                image: None,
             });
         }
         for checksum in content {
@@ -865,6 +908,7 @@ impl Repo {
             let content_size = content_size(&file);
             if opts.min_fallback_size != 0 && stream_size(&file)? >= opts.min_fallback_size {
                 selection.fallbacks.push(FallbackItem {
+                    objtype: ObjectType::File,
                     checksum,
                     compressed_size: self.loose_object_size(ObjectType::File, &checksum).await?,
                     content_size,
@@ -883,7 +927,29 @@ impl Repo {
                 content_size,
                 source,
                 file: Some(file),
+                image: None,
             });
+        }
+
+        // The image goes into a part whole, with no diff.
+        if keyed && let Some((file, size)) = self.open_composefs_image(to).await? {
+            if image_is_fallback(size, opts) {
+                selection.fallbacks.push(FallbackItem {
+                    objtype: ObjectType::ComposefsImage,
+                    checksum: *to,
+                    compressed_size: size,
+                    content_size: size,
+                });
+            } else {
+                selection.packed.push(PackItem {
+                    objtype: ObjectType::ComposefsImage,
+                    checksum: *to,
+                    content_size: size,
+                    source: None,
+                    file: None,
+                    image: Some(file),
+                });
+            }
         }
         Ok(selection)
     }
@@ -934,10 +1000,37 @@ impl Repo {
     async fn add_object(
         &self,
         part: &mut Part,
-        item: &PackItem,
+        item: &mut PackItem,
         opts: &DeltaOptions,
         tmp: BorrowedFd<'_>,
     ) -> Result<()> {
+        // The composefs image streams into the data source from the file
+        // that the selection opened, and the generation never holds it whole.
+        // The read stops one byte past the selected size, so an image that
+        // grows costs no more than that byte. Its `S` has the two operands of
+        // a metadata splice.
+        if item.objtype == ObjectType::ComposefsImage {
+            use futures_lite::AsyncReadExt;
+
+            let file = item
+                .image
+                .take()
+                .expect("the selection opens each composefs image that it packs");
+            let size = item.content_size;
+            let reader = FileReader::with_len_hint(file, size).take(size + 1);
+            let (offset, len) = part.blob.append_reader(reader, tmp).await?;
+            if len != size {
+                return Err(Error::InvalidFormat(format!(
+                    "the size of the composefs image of {} changed after the generation \
+                     selected it at {size} byte(s)",
+                    item.checksum
+                )));
+            }
+            part.push_op(OP_OPEN_SPLICE_CLOSE, &[len, offset]);
+            part.finish_object(item.objtype, item.checksum, len);
+            return Ok(());
+        }
+
         // Only a content object carries a loaded file object. A metadata
         // object is spliced from its serialized bytes.
         let Some(file) = &item.file else {
@@ -1161,7 +1254,7 @@ impl Repo {
             .iter()
             .map(|fallback| {
                 Value::Tuple(vec![
-                    Value::Byte(ObjectType::File.as_u32() as u8),
+                    Value::Byte(fallback.objtype.as_u32() as u8),
                     Value::Bytes(fallback.checksum.as_bytes().to_vec()),
                     Value::U64(host(fallback.compressed_size)),
                     Value::U64(host(fallback.content_size)),
@@ -1290,22 +1383,42 @@ struct PackItem {
     objtype: ObjectType,
     checksum: Checksum,
     /// The payload size of the object: the serialized size of a metadata
-    /// object, the content size of a file, or the target length of a symlink.
+    /// object, the content size of a file, the target length of a symlink,
+    /// or the size of the composefs image.
     content_size: u64,
     /// The object at the same path in the source commit, if one exists for a
     /// diff.
     source: Option<Checksum>,
     /// The content object, loaded once at selection and used again when the
     /// object is packed. `None` for a metadata object, which is packed from
-    /// its serialized bytes.
+    /// its serialized bytes, and for the composefs image, which streams from
+    /// its file.
     file: Option<FileObject>,
+    /// The file of the composefs image, opened at selection and taken when
+    /// the image is packed. `None` for each other object.
+    image: Option<std::fs::File>,
 }
 
-/// One object that the delta names and does not carry.
+/// One object that the delta names and does not carry: a content object or
+/// the composefs image.
 struct FallbackItem {
+    objtype: ObjectType,
     checksum: Checksum,
     compressed_size: u64,
     content_size: u64,
+}
+
+/// Returns `true` if the composefs image of `size` bytes is a fallback
+/// entry, and `false` if a part carries it.
+///
+/// The image is a fallback in an inline delta, because the generation and
+/// the applier hold an inline part in memory. The applier holds the payload
+/// of a part file in a mapped temp file, so the image in a part has a size
+/// limit also when fallbacks are off.
+fn image_is_fallback(size: u64, opts: &DeltaOptions) -> bool {
+    opts.inline
+        || (opts.min_fallback_size != 0 && size >= opts.min_fallback_size)
+        || size > opts.max_chunk_size.min(MAX_PART_IMAGE)
 }
 
 /// A written part, as its meta-entry records it.
@@ -3572,5 +3685,32 @@ mod tests {
         assert!(is_temp_name(&temp_name(SUPERBLOCK_FILE)));
         assert!(!is_temp_name("0"));
         assert!(!is_temp_name(SUPERBLOCK_FILE));
+    }
+
+    /// The composefs image is a fallback at the fallback size or larger, past
+    /// the chunk size, past 128 MiB also when fallbacks are off and the chunk
+    /// size is larger, and in each inline delta.
+    #[test]
+    fn the_image_selection_bounds_the_image_in_a_part() {
+        let opts = |min_fallback_size, max_chunk_size, inline| DeltaOptions {
+            min_fallback_size,
+            max_chunk_size,
+            inline,
+            ..DeltaOptions::default()
+        };
+        let off = opts(0, u64::MAX, false);
+        assert!(!image_is_fallback(MAX_PART_IMAGE, &off));
+        assert!(image_is_fallback(MAX_PART_IMAGE + 1, &off));
+
+        let chunk = opts(0, 1000, false);
+        assert!(!image_is_fallback(1000, &chunk));
+        assert!(image_is_fallback(1001, &chunk));
+
+        let threshold = opts(1000, u64::MAX, false);
+        assert!(!image_is_fallback(999, &threshold));
+        assert!(image_is_fallback(1000, &threshold));
+
+        assert!(image_is_fallback(1, &opts(0, u64::MAX, true)));
+        assert!(!image_is_fallback(1, &DeltaOptions::default()));
     }
 }

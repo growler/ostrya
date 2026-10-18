@@ -128,33 +128,12 @@ impl RepoSource {
     ///
     /// The image has no size cap, so the source never reads it whole.
     async fn stored_image(&self, commit: &Checksum) -> Result<ObjectData> {
-        let path = loose_path(commit, ObjectType::ComposefsImage, self.repo.mode());
-        let repo = self.repo.clone();
-        // The size bounds the read-ahead. The `fstat` runs on the pool
-        // thread of the open.
-        let opened = ostrya_rt::unblock(move || -> Result<_> {
-            let fd = rustix::fs::openat(
-                repo.objects_fd(),
-                path.as_str(),
-                rustix::fs::OFlags::RDONLY
-                    | rustix::fs::OFlags::CLOEXEC
-                    | rustix::fs::OFlags::NOFOLLOW,
-                rustix::fs::Mode::empty(),
-            )?;
-            let file = std::fs::File::from(fd);
-            let len = file.metadata()?.len();
-            Ok((file, len))
-        })
-        .await;
-        let (file, len) = match opened {
-            Ok(opened) => opened,
-            Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(Error::ObjectNotFound {
-                    checksum: *commit,
-                    ty: ObjectType::ComposefsImage,
-                });
-            }
-            Err(e) => return Err(e),
+        // The size bounds the read-ahead.
+        let Some((file, len)) = self.repo.open_composefs_image(commit).await? else {
+            return Err(Error::ObjectNotFound {
+                checksum: *commit,
+                ty: ObjectType::ComposefsImage,
+            });
         };
         Ok(ObjectData::Encoded {
             encoding: Encoding::Raw,

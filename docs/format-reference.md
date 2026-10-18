@@ -1614,6 +1614,11 @@ threshold. An offline application requires each fallback object to be present
 already. `conformance/cli-surface.md`, "P2", `static-delta`, records the limits
 of the tool's `apply-offline`.
 
+A delta of the port can also list the composefs image of the target commit,
+the object type 100, in the object array of a part or in the fallback array.
+The tool writes no such entry. "The composefs image in a static delta" states
+the rules.
+
 ### Fallback selection
 
 The generator makes an object a fallback when its compared size is at least the
@@ -1621,7 +1626,9 @@ threshold of `--min-fallback-size`. It puts the object into a part otherwise.
 The unit is the decimal megabyte, 1,000,000 bytes. The default is 4, so the
 default threshold is 4,000,000 bytes. An object whose size equals the threshold
 is a fallback. The value is read as a whole number of megabytes, and 0 turns
-fallbacks off.
+fallbacks off. The composefs image that a delta of the port carries has a
+selection rule of its own, and an inline delta lists the image as a fallback
+always ("The composefs image in a static delta").
 
 Observed behavior: over a commit that holds one 5,000,000-byte object,
 `--min-fallback-size=0.1` reports `Number of fallback entries: 0`, and
@@ -1724,6 +1731,9 @@ The operands, as the tool writes them:
   `(mode-index, xattr-index, length, offset)`. The mode and xattr tables supply
   the metadata of the object. A symlink (mode `S_IFLNK`) takes the spliced
   bytes as its target, and a regular file as its content.
+- `S` for the composefs image, the object type 100 of the port: `(length,
+  offset)`, as for a metadata object. The image travels in one `S` alone, and
+  the port refuses an `o` for it.
 - `o` (open) for a content object: `(mode-index, xattr-index, output-size)`.
 - `r` (set-read-source): `(offset)`. The 32 bytes at `offset` in the data
   source are the checksum of a source object. The content of that object is the
@@ -3662,6 +3672,13 @@ wait for the last step. A 404, or a `GetReply` with `found` false, leaves
 the commit with no image, and the pull goes on. A remote of the tool holds
 no image, so it answers 404.
 
+A static delta can carry the image of its target commit in a part ("The
+composefs image in a static delta"). The application of the part stages the
+image, so the pull sends no request for it. The pull does not fetch a
+fallback image entry as a fallback object. The image of the commit follows
+the rules above. A pull with a subpath requests no image, and stages the
+image that a part carries.
+
 After the first image that the remote does not serve, the pull requests no
 image of a commit that the repository holds complete. The pull requests the
 image of each commit whose objects it takes all the same. The images of the
@@ -4972,17 +4989,66 @@ The transfer:
   byte count that the transfer keeps includes it. A local pull keeps a
   byte count only when it reads static deltas.
 
-Other formats refuse the type:
-
-- `ostree.sizes` has no entry for the image, and the decoder refuses the type
-  byte 100.
-- A static delta carries no image. The parser of a part and of a fallback
-  entry refuses the type 100.
+`ostree.sizes` has no entry for the image, and the decoder refuses the type
+byte 100.
 
 Prune removes the image with its commit, and removes an image whose commit is
 absent. A kept commit keeps its image. No prune count and no byte count of
 freed space includes the image. `port-plan.md`, "Prune sweep order", states
 the order of the removals.
+
+### The composefs image in a static delta
+
+A static delta to a commit `T` carries the image of `T` if `T` carries a
+valid `ostree.composefs.digest.v0` and the repository stores the image. A
+delta of a commit with no key or with no stored image has no image entry,
+and the image rule changes none of its bytes. A run of `ostrya static-delta
+generate` and a check of the superblock and the parts that it writes can
+verify the facts of the entry and the selection. `ostrya static-delta show`
+prints the count of fallback entries and the object count of each part, and
+no type byte. A run of `ostrya static-delta apply-offline` and of a pull can
+verify the facts of the application.
+
+The entry:
+
+- The image entry has the type byte 100, and its checksum is `T`. The object
+  array of a part or the fallback array can hold it, and the superblock holds
+  one image entry at most. The parser refuses an image entry that names
+  another commit and a second image entry.
+- The image goes into the delta whole. The generator makes no rollsum and no
+  bspatch against the image of the source commit, and it does not read the
+  image to check its digest.
+
+The selection, where `n` is the size of the image in bytes:
+
+- The image is a fallback entry if `--min-fallback-size` is not 0 and `n` is
+  at least its threshold. It is also a fallback entry if `n` is larger than
+  `--max-chunk-size` or larger than 128 MiB. So the bound applies also when
+  `--min-fallback-size` is 0.
+- The image is a fallback entry in each delta of `--inline`, whatever `n`
+  is. The generator and the applier hold an inline part in memory, so no
+  inline part carries the image.
+- Else the image is the last object that the parts carry, under the part
+  packing rule ("Part packing"). It can share the last part with other
+  objects. Its `S` has the operands `(n, offset)` ("Opcodes").
+- A fallback entry states `n` as its compressed size and as its uncompressed
+  size.
+
+The application:
+
+- An image in a part needs the key of `T`. An application refuses the delta
+  if `T` has no key or a malformed key, or if the `S` of the image states
+  more than 128 MiB.
+- If the destination stages or holds an image of `T`, the application does
+  not read the image in the part.
+- Else the application streams the image from the part to the staging
+  directory, computes its fs-verity digest, and installs it only when the
+  digest is the key. A digest that is not the key fails the application,
+  and it writes no commit and no ref.
+- The image is optional. An offline application does not need a fallback
+  image to be present. A pull does not fetch a fallback image as a fallback.
+  It requests the image of the commit by the rules of "The pull over HTTP and
+  over a stream".
 
 ## bare-user-shared mode
 

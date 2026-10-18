@@ -1408,6 +1408,61 @@ mod cli {
         assert!(!refs.lines().any(|l| l == "o3"), "{refs}");
     }
 
+    /// `ostrya push` to `ostrya serve` over plain HTTP, under a client group
+    /// of anonymous push, sends the composefs image of a commit that
+    /// `commit --generate-composefs` stored. The server holds the image byte
+    /// for byte, and `composefs-image --check` passes on it.
+    #[test]
+    fn push_carries_the_composefs_image() {
+        let setup = Setup::new("cli-composefs");
+        let src = tree(setup.tmp.path(), "tree", 3, 1000);
+        let client = setup.init("client", "bare-user");
+        let commit = ok(
+            "ostrya",
+            &[
+                &format!("--repo={}", client.display()),
+                "commit",
+                "-b",
+                "main",
+                "-s",
+                "subject",
+                "--no-bindings",
+                "--generate-composefs",
+                src.to_str().unwrap(),
+            ],
+        )
+        .trim()
+        .to_owned();
+        let server = setup.init("server", "archive");
+        add_config(
+            &server,
+            "[ex-ostrya client \"anyone\"]\nauth=anonymous\nallow=w:**\n",
+        );
+        let serving = Serving::start(&server, &[]);
+
+        let out = push_from(&client, &[&serving.url, "main"]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(stdout(&out), format!("main (new) {commit}\n"));
+        ok(
+            "ostrya",
+            &[
+                &format!("--repo={}", server.display()),
+                "composefs-image",
+                "--check",
+                "main",
+            ],
+        );
+        let image = |repo: &Path| {
+            std::fs::read(
+                repo.join("objects")
+                    .join(&commit[..2])
+                    .join(format!("{}.cfs", &commit[2..])),
+            )
+            .unwrap()
+        };
+        assert_eq!(image(&server), image(&client));
+    }
+
     /// `ostrya push-tree` over HTTPS with a client certificate that the
     /// client CA of the server signed sets the ref. The client group names
     /// the certificate by its subject CN. With no credential, the server

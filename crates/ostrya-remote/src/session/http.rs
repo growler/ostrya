@@ -571,7 +571,7 @@ impl HttpLink {
         };
         let call = Call::new(&self.broken);
         counters.phase(PushPhase::Negotiating);
-        counters.offered(names.len() as u64);
+        counters.offered(names);
         let mut missing = Vec::new();
         let batch_len = server
             .max_have
@@ -594,7 +594,7 @@ impl HttpLink {
                 other => return Err(unexpected(&other, "Have")),
             }
         }
-        counters.needed(missing.len() as u64);
+        counters.needed(&missing);
         call.complete();
         Ok(missing)
     }

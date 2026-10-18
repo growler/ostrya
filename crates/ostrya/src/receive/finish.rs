@@ -25,6 +25,7 @@ use super::walk::{self, Missing};
 use super::{ReceiveVerify, ServerSigner, TrustedKeys};
 use crate::MAX_METADATA_SIZE;
 use crate::access::{ClientAccess, Namespace};
+use crate::composefs::recorded_digest;
 use crate::error::{Error, Result};
 use crate::lock::UpdateLockHeld;
 use crate::object::read_meta_object;
@@ -125,8 +126,10 @@ struct Edit<'a> {
 /// commits `txn` under the update lock.
 ///
 /// `named` holds the refs of `Hello`, their paths, and their namespace.
-/// `commit_meta` holds the detached metadata dicts of the session. In a
-/// collection namespace, the refs are under `refs/mirrors/ID/`.
+/// `commit_meta` holds the detached metadata dicts of the session. `images`
+/// holds the fs-verity digest of each composefs image of the session, by
+/// commit, or `None` for an image that the session dropped. In a collection
+/// namespace, the refs are under `refs/mirrors/ID/`.
 ///
 /// A request with a server commit goes to
 /// [`server_commit::finish`](super::server_commit::finish), and the sections
@@ -155,6 +158,10 @@ struct Edit<'a> {
 ///   ref.
 /// - Each new commit is staged or present (`missing-objects`), and each
 ///   commit of the session parses.
+/// - Each composefs image belongs to a commit that the session staged or
+///   that the repository holds. That commit carries a valid
+///   `ostree.composefs.digest.v0` (`protocol`), and the digest of each image
+///   that the session staged is the value of the key (`checksum-mismatch`).
 /// - The tree of each commit of the session is complete (`missing-objects`).
 /// - The ref binding and the collection binding of each new commit name its
 ///   refs and the namespace (`binding-mismatch`).
@@ -257,6 +264,7 @@ struct Edit<'a> {
 /// An error of the hook is `internal`, with the message cut at 4096 bytes at a
 /// character boundary. After an error of the hook, the refs and the detached
 /// metadata stay written.
+#[allow(clippy::too_many_arguments)]
 pub(super) async fn finish(
     repo: &Repo,
     policy: &dyn SessionPolicy,
@@ -264,6 +272,7 @@ pub(super) async fn finish(
     txn: Transaction,
     named: Named<'_>,
     commit_meta: HashMap<Checksum, Vec<u8>>,
+    images: HashMap<Checksum, Option<[u8; 32]>>,
     request: CommitRequest,
 ) -> Checked<ReceiveReport> {
     if request.server_commit.is_some() {
@@ -276,6 +285,7 @@ pub(super) async fn finish(
             txn,
             named,
             commit_meta,
+            images,
             request,
         ))
         .await;
@@ -291,6 +301,7 @@ pub(super) async fn finish(
         roots,
         parents,
     } = load_commits(&txn, &updates).await?;
+    check_images(&txn, images).await?;
     let missing = walk::completeness(&txn, roots).await?;
     if missing.total > 0 {
         return Err(missing_objects(missing, "the trees of the commits reach"));
@@ -612,6 +623,66 @@ fn check_commit_meta_commits(
             return Err(protocol(format!(
                 "detached metadata for commit {commit}, which the session did not stage \
                  and no ref update names"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Checks each composefs image of the session against its commit.
+///
+/// - The commit is staged in the session or held in the repository
+///   (`protocol`).
+/// - The commit carries `ostree.composefs.digest.v0`, and its value is valid
+///   (`protocol`).
+/// - The fs-verity digest of the image is the value of the key
+///   (`checksum-mismatch`).
+///
+/// An image that the session dropped, because the repository holds an image
+/// of its commit, gets the first check alone. The checks take the commits in
+/// the order of their checksums.
+async fn check_images(
+    txn: &Transaction,
+    images: HashMap<Checksum, Option<[u8; 32]>>,
+) -> Checked<()> {
+    let mut images: Vec<(Checksum, Option<[u8; 32]>)> = images.into_iter().collect();
+    images.sort_unstable_by_key(|(commit, _)| *commit);
+    for (commit, digest) in images {
+        let commit_obj = match txn.load_commit_staged_first(&commit).await {
+            Ok(commit_obj) => commit_obj,
+            Err(Error::ObjectNotFound { .. }) => {
+                return Err(protocol(format!(
+                    "a composefs image for commit {commit}, which the session did not stage \
+                     and the repository does not hold"
+                )));
+            }
+            Err(e) => return Err(Failure::Internal(e)),
+        };
+        let Some(actual) = digest else {
+            continue;
+        };
+        let expected = match recorded_digest(&commit_obj) {
+            Ok(Some(expected)) => expected,
+            Ok(None) => {
+                return Err(protocol(format!(
+                    "a composefs image for commit {commit}, which does not carry \
+                     ostree.composefs.digest.v0"
+                )));
+            }
+            Err(e) => {
+                return Err(protocol(format!(
+                    "a composefs image for commit {commit}: {e}"
+                )));
+            }
+        };
+        if actual != expected {
+            let mismatch = Error::ComposefsDigestMismatch {
+                commit,
+                expected,
+                actual,
+            };
+            return Err(Failure::Wire(remote::Error::ChecksumMismatch(
+                mismatch.to_string(),
             )));
         }
     }

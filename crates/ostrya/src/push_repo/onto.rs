@@ -155,8 +155,8 @@ impl Repo {
     /// push offers an object.
     ///
     /// The push walks the tree of the commit and offers each of its objects
-    /// in one round of `Have`. It sends the objects that the server lacks,
-    /// and then the server commit. [`PushOutcome::commit`] holds the commit
+    /// in one round of `Have`. It offers no composefs image. It sends the
+    /// objects that the server lacks, and then the server commit. [`PushOutcome::commit`] holds the commit
     /// that the server wrote, and [`PushOutcome::refs`] holds the outcome of
     /// the branch, then of each tag.
     ///

@@ -55,6 +55,9 @@ pub(super) struct SessionCore<P: Deref<Target: SessionPolicy + Sized>> {
     /// The hooks of the session, which `Commit` calls.
     hooks: Option<Arc<dyn ReceiveHooks>>,
     meta: Mutex<MetaState>,
+    /// The composefs images of the session. The box keeps the state out of
+    /// the futures of the session, which hold the session by value.
+    images: Box<Mutex<ImageState>>,
     /// The bytes of the dirtree, dirmeta, and commit objects that the object
     /// streams of the session read now and did not stage yet. The session
     /// keeps this count at most [`MAX_METADATA_SIZE`].
@@ -75,6 +78,20 @@ struct MetaState {
     /// that it keeps and in the dicts that it reads now. The session keeps
     /// this count at most [`MAX_METADATA_SIZE`].
     reserved: u64,
+}
+
+/// The composefs images of a session.
+///
+/// A step holds the lock on this state only for a check or an update of its
+/// fields. No step holds the lock across a read of an image.
+#[derive(Default)]
+struct ImageState {
+    /// The commits whose image an object stream reads now.
+    pending: HashSet<Checksum>,
+    /// The fs-verity digest of each image that the session staged, by
+    /// commit. The value is `None` for an image that the session dropped,
+    /// because the repository holds an image of the commit.
+    received: HashMap<Checksum, Option<[u8; 32]>>,
 }
 
 impl<P: Deref<Target: SessionPolicy + Sized>> SessionCore<P> {
@@ -211,6 +228,7 @@ impl<P: Deref<Target: SessionPolicy + Sized>> SessionCore<P> {
             paths,
             hooks,
             meta: Mutex::default(),
+            images: Box::default(),
             reading: AtomicU64::new(0),
         })
     }
@@ -271,8 +289,12 @@ impl<P: Deref<Target: SessionPolicy + Sized>> SessionCore<P> {
             });
         };
         loop {
+            // A composefs image adds its bytes alone, and no object count.
+            let image = header.name.ty == ObjectType::ComposefsImage;
             if let Some(bytes) = self.ingest(header, reader, buf).await? {
-                objects = objects.saturating_add(1);
+                if !image {
+                    objects = objects.saturating_add(1);
+                }
                 payload_bytes += bytes;
             }
             match next(reader).await? {
@@ -298,6 +320,10 @@ impl<P: Deref<Target: SessionPolicy + Sized>> SessionCore<P> {
     /// kept the object. The result is `None` if the session dropped the
     /// object.
     ///
+    /// A composefs image streams to the staging directory in chunks of `buf`.
+    /// Its size has no cap beyond the free-space budget of the session
+    /// transaction.
+    ///
     /// The bytes of a dirtree, dirmeta, or commit object count against one
     /// budget of [`MAX_METADATA_SIZE`]. The budget covers each object of
     /// these types that the session streams read at the same time, from its
@@ -316,7 +342,7 @@ impl<P: Deref<Target: SessionPolicy + Sized>> SessionCore<P> {
         // hashes a content object that the repository holds and does not
         // write it.
         let held = match ty {
-            ObjectType::CommitMeta => false,
+            ObjectType::CommitMeta | ObjectType::ComposefsImage => false,
             _ if txn.is_staged(&checksum, ty) => true,
             ObjectType::File => self
                 .repo
@@ -328,6 +354,7 @@ impl<P: Deref<Target: SessionPolicy + Sized>> SessionCore<P> {
         let mut body = Counted::new(reader.object_body());
         let result = match (ty, header.encoding) {
             (ObjectType::CommitMeta, _) => self.commit_meta_object(&checksum, &mut body).await,
+            (ObjectType::ComposefsImage, _) => self.image_object(&checksum, &mut body, buf).await,
             (ObjectType::File, Encoding::Raw) => {
                 ingest::raw_content(txn, rules, &checksum, held, &mut body, buf).await
             }
@@ -414,6 +441,44 @@ impl<P: Deref<Target: SessionPolicy + Sized>> SessionCore<P> {
         Ok(true)
     }
 
+    /// Ingests one composefs image, the image of the commit `checksum`.
+    ///
+    /// A second image for the same commit gives a `protocol` failure, also
+    /// while another stream reads the first. If the repository holds an
+    /// image of the commit, the session reads the image to its end and drops
+    /// it. It does not read the stored image. Else the session stages the
+    /// image and keeps its fs-verity digest. `Commit` checks the commit of
+    /// each image and compares each digest with the key of the commit.
+    async fn image_object<B: AsyncRead + Unpin>(
+        &self,
+        checksum: &Checksum,
+        body: &mut B,
+        buf: &mut Vec<u8>,
+    ) -> std::result::Result<bool, Failure> {
+        {
+            let mut images = self.lock_images();
+            if images.received.contains_key(checksum) || !images.pending.insert(*checksum) {
+                return Err(Failure::Wire(remote::Error::Protocol(format!(
+                    "a second composefs image for commit {checksum}"
+                ))));
+            }
+        }
+        let held = self
+            .repo
+            .has_object(ObjectType::ComposefsImage, checksum)
+            .await
+            .map_err(Failure::Internal)?;
+        let digest = ingest::image(&self.txn, checksum, held, body, buf).await?;
+        let mut images = self.lock_images();
+        images.pending.remove(checksum);
+        images.received.insert(*checksum, digest);
+        Ok(digest.is_some())
+    }
+
+    fn lock_images(&self) -> std::sync::MutexGuard<'_, ImageState> {
+        self.images.lock().expect("composefs image mutex")
+    }
+
     /// Counts `n` more bytes of detached metadata against the cap of the
     /// session.
     fn reserve(&self, n: u64) -> std::result::Result<(), Failure> {
@@ -449,16 +514,18 @@ impl<P: Deref<Target: SessionPolicy + Sized>> SessionCore<P> {
             paths,
             hooks,
             meta,
+            images,
             ..
         } = self;
         let dicts = meta.into_inner().expect("detached metadata mutex").dicts;
+        let images = images.into_inner().expect("composefs image mutex").received;
         let hooks = hooks.as_deref();
         let session = super::finish::Named {
             namespace: namespace.as_ref(),
             names: &named,
             paths: &paths,
         };
-        super::finish::finish(&repo, &*policy, hooks, txn, session, dicts, request).await
+        super::finish::finish(&repo, &*policy, hooks, txn, session, dicts, images, request).await
     }
 }
 

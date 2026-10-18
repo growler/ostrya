@@ -364,6 +364,8 @@ impl Repo {
     ///   or if bytes follow the end of an object.
     /// - [`remote::Error::Protocol`] if two detached metadata objects name the
     ///   same commit, or if an incoming detached metadata dict is malformed.
+    /// - [`remote::Error::Protocol`] if two composefs images name the same
+    ///   commit.
     /// - The wire code of the frame decoder, if it refuses a frame.
     /// - [`remote::Error::Internal`] if the encoder refuses a reply.
     /// - At `Commit`, the errors of

@@ -2603,7 +2603,8 @@ to each message:
 - A ref name in a message is `NAME` for a local ref and `REMOTE:NAME` for a
   remote ref.
 - An object type is one byte. The values are 1 for a file, 2 for a dirtree,
-  3 for a dirmeta, 4 for a commit, and 6 for detached metadata.
+  3 for a dirmeta, 4 for a commit, 6 for detached metadata, and 100 for a
+  composefs image.
 - An encoding is one byte: 0 for `raw` and 1 for `deflate`. In the
   `encodings` list of `HelloReply`, the names are `raw` and `deflate`.
 
@@ -2668,8 +2669,11 @@ The length of a chunk has these meanings:
 - Each other length greater than the current limit is `limit-exceeded`. The
   chunk limit and the frame limit are the same number.
 
-The sender selects the length of each chunk, up to the limit. In the push,
-after the end chunk of an object, the next frame is one of these:
+The sender selects the length of each chunk, up to the limit. A body has no
+limit on its number of chunks. The body of a composefs image (type 100) has
+no size limit of the protocol. The free-space reserve of the receiving
+repository is its only bound ("Object streams"). In the push, after the end
+chunk of an object, the next frame is one of these:
 
 - the `ObjectHeader` of the next object;
 - `ObjectsEnd`, which closes the object stream;
@@ -2754,8 +2758,8 @@ no `collection`. A `Hello` with the collection `ID` needs a reply with the
 `collection` `ID`, or a reply with no `collection` and the `collection-id`
 `ID`.
 
-`Have` is a list of object names: the object type (1 to 4) and the checksum.
-Another type is `protocol`. `HaveReply` is a bitmap with one bit for each entry
+`Have` is a list of object names: the object type (1 to 4, or 100) and the
+checksum. Another type is `protocol`. `HaveReply` is a bitmap with one bit for each entry
 of the `Have`:
 
 - Bit `i` is bit `i % 8` of byte `i / 8`, with bit 0 the least significant.
@@ -2768,17 +2772,20 @@ last entry, with `protocol`.
 
 `ObjectHeader` holds the object type, the checksum, and the encoding. For type
 6, the checksum is the checksum of the commit that the detached metadata
-belongs to. Only type 1 can have the encoding `deflate`. These headers are
-`protocol`:
+belongs to. For type 100, the checksum is the checksum of the commit that the
+composefs image belongs to. Only type 1 can have the encoding `deflate`. These
+headers are `protocol`:
 
-- a type other than 1, 2, 3, 4, and 6;
+- a type other than 1, 2, 3, 4, 6, and 100;
 - an encoding byte other than 0 and 1;
 - the encoding `deflate` with a type other than 1.
 
 The body of the object follows as chunks:
 
 - `raw` -- for a file, the framed header and the payload of "File content
-  object header". For each other type, the bytes of the object.
+  object header". For a composefs image, the bytes of the stored image
+  ("The composefs image object"). For each other type, the bytes of the
+  object.
 - `deflate` -- the framed archive header and the payload in raw DEFLATE, as a
   `.filez` object stores them.
 
@@ -2832,7 +2839,7 @@ each tag is absent. A bound name has no entry.
 `Error` holds the code, a message for a person, and a dict of details:
 
 - `missing` (`a(yay)`): the objects that a `missing-objects` error names, of
-  the types 1 to 4. An entry of another type is `protocol`.
+  the types 1 to 4 and 100. An entry of another type is `protocol`.
 - `ref` (`s`) and `current` (`may`): the name and the current commit of the
   ref of a `ref-mismatch` error.
 
@@ -2868,7 +2875,8 @@ give the condition of each refusal.
   of order, or a message breaks a rule of the session.
 - `limit-exceeded` -- a frame, a chunk, a batch, a reply, a metadata object,
   a listing, or a session is over its limit.
-- `checksum-mismatch` -- the bytes of an object do not hash to its name.
+- `checksum-mismatch` -- the bytes of an object do not hash to its name, or
+  the fs-verity digest of a composefs image is not the key of its commit.
 - `mode-refused` -- the repository mode cannot store the content, or the
   client group does not allow privileged content.
 - `missing-objects` -- a commit reaches objects that the server does not hold.
@@ -2934,20 +2942,22 @@ them:
 - The refs of `Commit` are a subset of the refs of `Hello`. The subset is not
   empty and names no ref two times. The refs of a server commit are its
   branch and its tags.
-- `Have` and `missing` name objects of the types 1 to 4.
+- `Have` and `missing` name objects of the types 1 to 4 and 100.
 - An object has the encoding `deflate` only if it is a file and `HelloReply`
   lists `deflate`.
 - A `Have` holds at most `max-have` entries, and its frame fits in
   `max-frame`.
 - A session sends at most one detached metadata dict for each commit. The
   commit is a commit that the session sends, or the new commit of an update.
+- A session sends at most one composefs image for each commit. The commit is
+  a commit that the session sends, or a commit that the server holds.
 - Before `Commit`, a session sends each object that the tree of a commit of
   the session reaches, unless the server holds the object. The commits of the
   session are the commits that it sends and the new commits of the updates.
   The session does not need to send the parent commits. A session with a
   server commit sends the objects of its tree.
-- A session with a server commit sends no commit object and no detached
-  metadata.
+- A session with a server commit sends no commit object, no detached
+  metadata, and no composefs image.
 - To cancel an object, a client sends the abandon marker and then `Abort`.
 - On a stream, a client sends one request and reads its reply before it sends
   the next one.
@@ -3046,6 +3056,16 @@ bit of an object when the session did not stage the object and `objects/`
 does not hold it. Each entry gets its own bit, also an entry that the `Have`
 holds two times. An empty `Have` gets an empty bitmap.
 
+For a composefs image (type 100), the object is `<commit>.cfs`. The server
+does not read a stored image, so it does not set the bit of an image that
+`objects/` holds, also when its digest is not the key of its commit.
+
+A session of version 1 can carry the type 100. A receiver that does not
+accept the type 100 refuses a session that offers it, in a `Have` or in an
+`ObjectHeader`, with `protocol`. So a receiver must accept the type 100
+before a sender that holds composefs images pushes to it or sends it a
+one-way stream.
+
 ### Object streams
 
 The server reads, hashes, and checks each object of a stream, also an object
@@ -3099,13 +3119,30 @@ A detached metadata object (type 6) follows these rules:
   under `ostree.gpgsigs`, `ostree.sign.ed25519`, `ostree.sign.spki`, and
   `ostree.sign.dummy` is an `aay`. Each other dict is `protocol`.
 
+A composefs image (type 100, "The composefs image object") follows these
+rules:
+
+- The encoding is `raw`, and the body is the bytes of the image. The image
+  has no size limit beyond the free-space reserve of the repository.
+- A second image for one commit is `protocol`, also from another stream.
+- If `objects/` holds an image of the commit, the server reads the body to
+  its end and drops it. It does not read the stored image.
+- Else the server streams the image to its staging directory and computes
+  its fs-verity digest as it writes it. It seals the image as it seals a new
+  image. No step holds the whole image. The commit of the image need not be
+  staged or held when the image arrives.
+- At `Commit`, the server checks each image against its commit (check 5 of
+  "Commit and CommitReply").
+
 The server writes no object and no dict to `objects/` before `Commit`.
 
 `ObjectsReply` counts the objects of one stream that the server staged and
 the dicts that it kept. `payload_bytes` counts the body bytes of these
 objects, with the chunk framing removed, in the encoding of the wire. An
-object that the server held already does not count. Over HTTP, an object that
-two `objects` requests send at the same time can count in both replies.
+object that the server held already does not count. A composefs image that
+the server staged adds its bytes to `payload_bytes` and does not count in
+`objects`. Over HTTP, an object that two `objects` requests send at the same
+time can count in both replies.
 
 ### Commit and CommitReply
 
@@ -3135,7 +3172,14 @@ Each failed check ends the session, and the session writes nothing:
    commit that does not parse is `protocol`, and a stored one is `internal`.
    Such a commit fails the check at once. A `new` commit that the session did
    not stage and that the repository does not hold is `missing-objects`. The
-   absent commits fail together, after the read of the other commits.
+   absent commits fail together, after the read of the other commits. Then
+   the server checks each composefs image of the session, in the order of
+   the checksums of their commits. An image for a commit that the session did
+   not stage and that the repository does not hold is `protocol`. For an
+   image that the session staged, a commit without
+   `ostree.composefs.digest.v0`, or with a value that is not a variant of
+   type `ay` with 32 bytes, is `protocol`. An image whose fs-verity digest is
+   not that value is `checksum-mismatch`.
 6. Each object that the tree of a commit of the session reaches must be
    staged or present, else `missing-objects`. The parents of a commit are not
    required. The `missing` detail names at most 16384 objects. A staged
@@ -3221,8 +3265,8 @@ failed check ends the session, and the session writes nothing:
    levels fewer than in the message.
 2. A `CommitReply` with a commit in `old` of the branch that needs a frame
    over 1 MiB is `limit-exceeded`.
-3. A detached metadata dict of the session, and a commit object that the
-   session staged, are `protocol`.
+3. A detached metadata dict of the session, a composefs image of the
+   session, and a commit object that the session staged, are `protocol`.
 4. These are `ref-denied`:
    - a session with the hooks of a host application;
    - a branch or a tag `ostree-metadata` in the local refs of a repository
@@ -3471,6 +3515,11 @@ If a client cannot complete an object, it sends the abandon marker and then
 `Abort` ("Abort, abandon, and end of input"). The server then ends the session
 with no change.
 
+An object stream can carry the composefs image of a new commit. An ostrya
+sender sends the image of each new commit that its repository holds, after
+the trees of the commits. The server reads and checks the image as in a push
+session ("Object streams").
+
 The server runs `Hello` checks 2, 3, and 5 of a push session ("Hello and
 HelloReply"). In place of check 1, a `Hello` with no `one-way` true is
 `protocol`, and so is a `Hello` with a `collection`: a one-way stream writes
@@ -3593,6 +3642,42 @@ Over HTTP, the server keeps one copy of an entry that the query repeats ("GET
 
 A pull of collection refs reads the ref listing or the summary of a remote,
 over both transports ("The pull of collection refs").
+
+A pull of the port requests the composefs image of a commit,
+`objects/<first 2 hex>/<remaining 62 hex>.cfs`, over both transports when
+each of these is true:
+
+- The commit carries `ostree.composefs.digest.v0`, and its value is a
+  variant of type `ay` with 32 bytes. A malformed value counts as no key.
+- The pull is not commit-only and has no subpath.
+- The repository does not hold an image of the commit, and the transaction
+  of the pull did not stage one. The pull does not read a stored image.
+
+The pull requests the image also for a commit that the repository holds
+complete. The requests of the images come after the requests of all other
+objects of the pull: the pull sends the first image request when no request
+of another object is queued or in flight. In a pull
+through a chain of static deltas, the images of all commits of the chain
+wait for the last step. A 404, or a `GetReply` with `found` false, leaves
+the commit with no image, and the pull goes on. A remote of the tool holds
+no image, so it answers 404.
+
+After the first image that the remote does not serve, the pull requests no
+image of a commit that the repository holds complete. The pull requests the
+image of each commit whose objects it takes all the same. The images of the
+held commits come after the images of the other commits, and the pull sends
+one request for a held commit at a time until the remote serves one. So a
+remote that serves no image gets at most one request for the held commits
+of a pull. A local pull reads each source for each image, because a source
+that holds no image costs only a failed open.
+
+The pull streams the body to its staging directory, computes the fs-verity
+digest as it writes it, and installs the image only when the digest is the
+key ("The composefs image object"). A digest that is not the key fails the
+pull, and the pull writes no ref. The pull fetches that image no second
+time. A local pull takes the image from the first source repository that
+holds it, with a `FICLONE` reflink or a byte copy, never with a hardlink, and
+checks the digest of the copy in the same way.
 
 ## The ref listing
 
@@ -4006,8 +4091,9 @@ repository root in this way:
   change time differs from the last parse. The next answer then shows the
   change.
 - The view serves these files as stored: the files under `refs/` and
-  `extensions/`, and the `.commit`, `.dirtree`, `.dirmeta`, and
-  `.commitmeta` objects. In an `archive` repository, it also serves the
+  `extensions/`, and the `.commit`, `.dirtree`, `.dirmeta`, `.commitmeta`,
+  and `.cfs` objects. A `.cfs` object is the composefs image of a commit, in
+  every mode. In an `archive` repository, it also serves the
   `.filez` objects and the files under `deltas/` and `delta-indexes/` as
   stored. "Read access" states which of these files a client gets.
   `extensions/ostrya` and each path under it are absent.
@@ -4298,6 +4384,9 @@ session ends:
 - a body that ends before `ObjectsEnd`;
 - a byte after `ObjectsEnd`;
 - an `Abort` frame in the body, with or without the abandon marker before it.
+
+The body of `objects` has no size limit of its own. It can carry a composefs
+image of any size ("Object streams").
 
 A request body that fails, for example with a malformed chunked encoding,
 gets 500 with `internal`. The session ends as for a request that ends before
@@ -4865,14 +4954,30 @@ The write:
   objects and before its refs. The rename replaces a stored image of the same
   commit in one step.
 
+The transfer:
+
+- A pull, a push, and a one-way stream carry the image as the object type
+  100, after the other objects of the transfer. "The pull over HTTP and over
+  a stream", "Have and HaveReply", and "Object streams" state the rules. A
+  push with a server commit carries no image.
+- Each receiver computes the fs-verity digest of the bytes and installs the
+  image only when the digest is the key of the commit. A local pull copies
+  the image with a reflink or a byte copy, never with a hardlink, and checks
+  the copy in the same way.
+- A receiver that holds an image of the commit takes no second copy. It does
+  not read the stored image.
+- A pull and a push send the image also for a commit that the receiver holds
+  with no image.
+- No object count of a pull, a push, or a receive includes the image. Each
+  byte count that the transfer keeps includes it. A local pull keeps a
+  byte count only when it reads static deltas.
+
 Other formats refuse the type:
 
 - `ostree.sizes` has no entry for the image, and the decoder refuses the type
   byte 100.
 - A static delta carries no image. The parser of a part and of a fallback
   entry refuses the type 100.
-- The push protocol and the pull protocol carry no image. `Have`, the
-  `missing` list, and `ObjectHeader` refuse the type 100.
 
 Prune removes the image with its commit, and removes an image whose commit is
 absent. A kept commit keeps its image. No prune count and no byte count of

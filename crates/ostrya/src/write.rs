@@ -1228,8 +1228,8 @@ pub(crate) fn stage_metadata_blocking(
 /// A composefs image in a temp file of the staging directory, not yet linked
 /// under its staging name.
 ///
-/// [`write_image_temp_blocking`] makes it, and [`link_image_blocking`] links
-/// it.
+/// [`write_image_temp_blocking`], [`clone_image_temp_blocking`], and
+/// [`write_image_stream_temp`] make it, and [`link_image_blocking`] links it.
 pub(crate) struct ImageTemp {
     /// The descriptor that links an anonymous temp. It is read-only if the
     /// image is sealed.
@@ -1241,6 +1241,8 @@ pub(crate) struct ImageTemp {
     pub(crate) digest: [u8; 32],
     /// The size of the image file in bytes.
     pub(crate) size: u64,
+    /// How the image bytes reached the staging directory.
+    pub(crate) blocks: Blocks,
 }
 
 /// Writes the composefs image of `dir` to a temp file in the staging
@@ -1252,14 +1254,7 @@ pub(crate) struct ImageTemp {
 /// 2. It writes the image through a buffer of 128 KiB, and the writer
 ///    computes the fs-verity digest of the bytes that it writes. No step holds
 ///    the whole image.
-/// 3. It sets the mode 0644 with `fchmod`, so the umask does not change the
-///    mode. A seal needs write permission on the inode, and the mode gives it.
-/// 4. If `do_fsync` is set, it runs `fsync` on the file.
-/// 5. If `verity` is not [`Tristate::No`], it closes the writable descriptor,
-///    seals the file through a read-only descriptor, and reads the digest of
-///    the seal from the kernel. If the kernel digest is not the digest of the
-///    writer, the function fails. Under [`Tristate::Maybe`], a file that the
-///    file system did not seal has no kernel digest to compare.
+/// 3. It ends the temp file as [`finish_image_temp_blocking`] does.
 ///
 /// On a failure, the function removes the temp file.
 pub(crate) fn write_image_temp_blocking(
@@ -1275,38 +1270,183 @@ pub(crate) fn write_image_temp_blocking(
     let digest =
         ostrya_composefs::write_image_to(dir, &mut out).map_err(crate::composefs::writer_error)?;
     let file = out.into_inner().map_err(|e| Error::Io(e.into_error()))?;
+    finish_image_temp_blocking(
+        file,
+        pending,
+        Some(digest),
+        Blocks::Written,
+        do_fsync,
+        verity,
+    )
+}
+
+/// Copies the stored composefs image of `commit` from the object store under
+/// `src_objects_fd` to a temp file in the staging directory.
+///
+/// The copy is a `FICLONE` reflink if the file system supports one, and a
+/// byte copy in the kernel otherwise. The function then ends the temp file
+/// as [`finish_image_temp_blocking`] does. The fs-verity digest of the image
+/// is the digest of the copy: the kernel digest of the seal if the function
+/// seals the copy, else the digest of a read of the copy in chunks of
+/// 128 KiB. No step holds the whole image.
+///
+/// Returns `None` if the source holds no image of `commit`. On a failure, the
+/// function removes the temp file.
+pub(crate) fn clone_image_temp_blocking(
+    staging_fd: BorrowedFd<'_>,
+    src_objects_fd: BorrowedFd<'_>,
+    src_mode: RepoMode,
+    commit: &Checksum,
+    do_fsync: bool,
+    verity: Tristate,
+) -> Result<Option<ImageTemp>> {
+    let src_path = loose_path(commit, ObjectType::ComposefsImage, src_mode);
+    let src = match rustix::fs::openat(
+        src_objects_fd,
+        src_path.as_str(),
+        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+        Mode::empty(),
+    ) {
+        Ok(src) => src,
+        Err(rustix::io::Errno::NOENT) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let (file, temp, blocks) = clone_payload(staging_fd, src.as_fd())?;
+    drop(src);
+    let pending = PendingTemp::new(staging_fd, temp);
+    finish_image_temp_blocking(file, pending, None, blocks, do_fsync, verity).map(Some)
+}
+
+/// Streams a composefs image from `reader` to a temp file in the staging
+/// directory of `txn`.
+///
+/// The bytes go through `buf`, which the call grows to [`COPY_CHUNK`] bytes
+/// if it is shorter. The fs-verity hasher reads each chunk as the call writes
+/// it, so no step holds the whole image. The call then ends the temp file as
+/// [`finish_image_temp_blocking`] does, with the durability and the
+/// `[ex-integrity] fsverity` settings of `txn`.
+///
+/// On a failure, the call removes the temp file.
+pub(crate) async fn write_image_stream_temp<R: AsyncRead + Unpin>(
+    txn: &Transaction,
+    mut reader: R,
+    buf: &mut Vec<u8>,
+) -> Result<ImageTemp> {
+    if txn.repo().mode() == RepoMode::BareSplitXattrs {
+        return Err(Error::Unsupported(
+            "bare-split-xattrs is read-only; the port does not write it".into(),
+        ));
+    }
+    let (fsync, per_object_fsync) = txn.fsync_flags()?;
+    let verity = txn.repo().config().fsverity()?;
+    let staging = txn.staging_fd().try_clone_to_owned()?;
+    let opened = staging.try_clone()?;
+    let (fd, temp) = ostrya_rt::unblock(move || open_temp(opened.as_fd())).await?;
+    let pending = PendingTemp::new(txn.staging_fd(), temp);
+    let mut file = RtFile::from(fd);
+    if buf.len() < COPY_CHUNK {
+        buf.resize(COPY_CHUNK, 0);
+    }
+    let mut hasher = ostrya_composefs::FsVerityHasher::new();
+    loop {
+        let n = read_some(&mut reader, buf).await?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        write_all(&mut file, &buf[..n]).await?;
+    }
+    flush(&mut file).await?;
+    let file = file.into_std().await;
+    let digest = hasher.finalize();
+    let temp = pending.into_inner();
+    ostrya_rt::unblock(move || {
+        let pending = PendingTemp::new(staging.as_fd(), temp);
+        finish_image_temp_blocking(
+            file,
+            pending,
+            Some(digest),
+            Blocks::Written,
+            fsync && per_object_fsync,
+            verity,
+        )
+    })
+    .await
+}
+
+/// Ends a composefs image in the temp file `file`. `digest` is the
+/// fs-verity digest of its bytes that the writer computed, or `None` if the
+/// writer computed none.
+///
+/// The function runs these steps:
+///
+/// 1. It sets the mode 0644 with `fchmod`, so the umask does not change the
+///    mode. A seal needs write permission on the inode, and the mode gives it.
+/// 2. If `do_fsync` is set, it runs `fsync` on the file.
+/// 3. If `verity` is not [`Tristate::No`], it closes the writable descriptor,
+///    seals the file through a read-only descriptor, and reads the digest of
+///    the seal from the kernel. If `digest` is set and the kernel digest is
+///    not `digest`, the function fails. Under [`Tristate::Maybe`], a file
+///    that the file system did not seal has no kernel digest.
+/// 4. If `digest` is `None`, the digest of the image is the kernel digest.
+///    A file with no kernel digest is read in chunks of 128 KiB through a
+///    read-only descriptor, and the digest of that read is the digest of the
+///    image.
+///
+/// `blocks` tells how the bytes reached the staging directory. On a failure,
+/// the drop of `pending` removes the temp file.
+fn finish_image_temp_blocking(
+    file: std::fs::File,
+    pending: PendingTemp<'_>,
+    digest: Option<[u8; 32]>,
+    blocks: Blocks,
+    do_fsync: bool,
+    verity: Tristate,
+) -> Result<ImageTemp> {
     rustix::fs::fchmod(file.as_fd(), Mode::from_raw_mode(FIXED_MODE))?;
     if do_fsync {
         rustix::fs::fsync(file.as_fd())?;
     }
     let size = size_of(file.as_fd())?;
-    let fd = if verity == Tristate::No {
-        OwnedFd::from(file)
+    let (fd, sealed) = if verity == Tristate::No {
+        (OwnedFd::from(file), None)
     } else {
         let ro = reopen_ro(file.as_fd())?;
         drop(file);
         seal_regular(ro.as_fd(), verity)?;
-        match ostrya_sys::measure_verity(ro.as_fd()) {
-            Ok(sealed) if sealed != digest => {
-                return Err(Error::InvalidFormat(format!(
-                    "the fs-verity digest of the sealed composefs image is {}, and the \
-                     writer computed {}",
-                    crate::composefs::digest_hex(&sealed),
-                    crate::composefs::digest_hex(&digest)
-                )));
-            }
-            Ok(_) => {}
+        let sealed = match ostrya_sys::measure_verity(ro.as_fd()) {
+            Ok(sealed) => Some(sealed),
             // `seal_regular` ignored the seal failure under `maybe`.
-            Err(_) if verity == Tristate::Maybe => {}
+            Err(_) if verity == Tristate::Maybe => None,
             Err(e) => return Err(Error::Io(e.into())),
+        };
+        (ro, sealed)
+    };
+    let digest = match (digest, sealed) {
+        (Some(digest), Some(sealed)) if sealed != digest => {
+            return Err(Error::InvalidFormat(format!(
+                "the fs-verity digest of the sealed composefs image is {}, and the \
+                 writer computed {}",
+                crate::composefs::digest_hex(&sealed),
+                crate::composefs::digest_hex(&digest)
+            )));
         }
-        ro
+        (Some(digest), _) => digest,
+        (None, Some(sealed)) => sealed,
+        (None, None) => {
+            // A writable descriptor reads nothing, and a read moves the
+            // offset of the descriptor. A second, read-only open reads the
+            // image from its start.
+            let mut image = std::fs::File::from(reopen_ro(fd.as_fd())?);
+            crate::composefs::image_file_digest(&mut image)?
+        }
     };
     Ok(ImageTemp {
         fd,
         temp: pending.into_inner(),
         digest,
         size,
+        blocks,
     })
 }
 
@@ -1328,7 +1468,7 @@ pub(crate) fn link_image_blocking(
     Ok(StageOutcome {
         deduped: false,
         on_disk_size: image.size,
-        blocks: Blocks::Written,
+        blocks: image.blocks,
         unpacked: 0,
         staging_name,
         dest: loose_path(commit, ObjectType::ComposefsImage, mode),

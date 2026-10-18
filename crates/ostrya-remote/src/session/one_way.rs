@@ -87,7 +87,8 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for Direct<W> {
 ///
 /// - `opts.agent` is the `agent` of `Hello`.
 /// - `opts.progress` receives the counters.
-/// - The statistics count each name of `names` as offered and as needed.
+/// - The statistics count each name of `names` as offered and as needed. A
+///   composefs image does not count.
 /// - The phases are [`PushPhase::Uploading`] and then
 ///   [`PushPhase::Committing`].
 ///
@@ -125,7 +126,7 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for Direct<W> {
 /// - [`Error::InvalidInput`] if `compression` is [`Compression::Deflate`]
 ///   with a level outside 1 through 9.
 /// - [`Error::InvalidInput`] if the type of a name of `names` is not a file,
-///   a dirtree, a dirmeta, or a commit.
+///   a dirtree, a dirmeta, a commit, or a composefs image.
 /// - [`Error::InvalidInput`] if the `Hello` frame or the `Commit` frame is
 ///   more than [`MIN_FRAME_LIMIT`].
 /// - [`Error::Protocol`] if `opts.agent` holds a NUL byte, because the
@@ -194,8 +195,8 @@ where
     let counters = Arc::new(Counters::new(opts.progress.as_ref()));
     count_content_total(&counters, source, names, level).await;
     counters.phase(PushPhase::Uploading);
-    counters.offered(names.len() as u64);
-    counters.needed(names.len() as u64);
+    counters.offered(names);
+    counters.needed(names);
     let counting = Counting::new(Direct { inner: output }, Arc::clone(&counters));
     let mut writer = ObjectWriter::new(
         BufWriter::with_capacity(WRITE_BUFFER, counting),

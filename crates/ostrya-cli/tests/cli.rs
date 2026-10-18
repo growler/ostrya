@@ -18794,6 +18794,41 @@ fn commit_generate_composefs_stores_the_image_of_the_recorded_digest() {
     }
 }
 
+/// `pull-local` copies the composefs image of a commit byte for byte from a
+/// `bare-user` repository into an `archive` repository, and
+/// `composefs-image --check` passes on the copy.
+#[test]
+fn pull_local_copies_the_composefs_image() {
+    let tmp = TmpDir::new("pull-local-composefs-image");
+    let tree = tmp.path().join("tree");
+    ostrya_conformance::corpus::materialize("C0", &tree).unwrap();
+    let [src, dest] =
+        [("src", RepoMode::BareUser), ("dest", RepoMode::Archive)].map(|(name, mode)| {
+            let dir = tmp.path().join(name);
+            std::fs::create_dir_all(&dir).unwrap();
+            create_repo(&dir, mode)
+        });
+    let checksum = ostrya_repo(
+        &src,
+        &[
+            "commit",
+            "-b",
+            "m",
+            FIXED_TIMESTAMP,
+            "--generate-composefs",
+            tree.to_str().unwrap(),
+        ],
+    )
+    .ok()
+    .stdout_trimmed();
+    ostrya_repo(&dest, &["pull-local", src.to_str().unwrap(), "m"]).ok();
+    ostrya_repo(&dest, &["composefs-image", "--check", "m"]).ok();
+    assert_eq!(
+        std::fs::read(image_path(&dest, &checksum)).unwrap(),
+        std::fs::read(image_path(&src, &checksum)).unwrap()
+    );
+}
+
 /// `composefs-image --add` refuses a commit without the key and stores
 /// nothing. `--check` and `--get-path` fail for the same commit. The command
 /// takes exactly one action.

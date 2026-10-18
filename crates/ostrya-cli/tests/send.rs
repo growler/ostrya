@@ -1,6 +1,7 @@
 //! `ostrya send` as a process: the exit status after a clean end and after
-//! an `Error`, and the pull session it serves from an `archive` and a
-//! `bare-user` repository that its user can read and cannot write.
+//! an `Error`, the pull session it serves from an `archive` and a
+//! `bare-user` repository that its user can read and cannot write, and the
+//! composefs image of a commit.
 
 #![cfg(feature = "send")]
 
@@ -326,6 +327,45 @@ fn send_serves_a_repository_its_user_cannot_write() {
             0
         );
     }
+}
+
+/// `ostrya send` serves the composefs image of a commit that
+/// `commit --generate-composefs` stored, as stored and with its length.
+#[test]
+fn send_serves_the_composefs_image() {
+    let tmp = TmpDir::new("composefs");
+    let tree = tmp.0.join("tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(tree.join("file"), b"composefs image\n").unwrap();
+    let repo = tmp.0.join("repo");
+    let repo_arg = format!("--repo={}", repo.display());
+    let bin = env!("CARGO_BIN_EXE_ostrya");
+    run(bin, &[&repo_arg, "init", "--mode=bare-user"], &tmp.0);
+    let out = Command::new(bin)
+        .args([&repo_arg, "commit", "-b", "main", "-s", "subject"])
+        .arg("--generate-composefs")
+        .arg(&tree)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "{out:?}");
+    let commit = String::from_utf8(out.stdout).unwrap().trim().to_owned();
+    let path = format!("objects/{}/{}.cfs", &commit[..2], &commit[2..]);
+    let stored = std::fs::read(repo.join(&path)).unwrap();
+
+    let out = send(&repo, &[], frames(&[pull_hello(1), Message::Get(path)]));
+    assert!(out.status.success(), "{out:?}");
+    let served = messages(&out.stdout);
+    assert_eq!(served.len(), 2);
+    assert_eq!(
+        served[1],
+        (
+            Message::GetReply(GetReply {
+                found: true,
+                len: Some(stored.len() as u64),
+            }),
+            stored
+        )
+    );
 }
 
 /// Appends `groups` to the config of the repository at `repo`.

@@ -632,7 +632,7 @@ impl<W: AsyncWrite + Unpin> ObjectWriter<W> {
         match item {
             Item::Object(name, plan) => {
                 self.write_object(name, plan).await?;
-                self.counters.object_sent();
+                self.counters.object_sent(&name);
             }
             Item::Meta(commit, bytes) => {
                 let name = ObjectName::new(commit, ObjectType::CommitMeta);

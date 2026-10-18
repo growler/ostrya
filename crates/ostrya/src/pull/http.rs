@@ -32,6 +32,7 @@ use ostrya_core::{
     Checksum, Commit, DirTree, FileHeader, ObjectName, ObjectType, RepoMode, loose_path,
 };
 
+use crate::composefs::recorded_digest;
 use crate::config::RepoConfig;
 use crate::delta::IO_CHUNK;
 use crate::endpoint::{EndpointOverrides, resolve_pull};
@@ -223,6 +224,36 @@ impl Repo {
     /// object arrives, so no `.commitmeta` stays for a parent that the remote
     /// answers 404 for. [`pull_local`](Repo::pull_local) states when the
     /// transaction writes it and what a failure leaves.
+    ///
+    /// # Composefs image
+    ///
+    /// For each commit that carries `ostree.composefs.digest.v0`, the pull
+    /// requests the composefs image `objects/<..>.cfs`, also for a commit
+    /// that this repository holds complete. A
+    /// [`COMMIT_ONLY`](PullFlags::COMMIT_ONLY) pull and a pull with
+    /// [`subpaths`](PullOptions::subpaths) request no image. A malformed value
+    /// of the key counts as no key. If this repository holds an image of the
+    /// commit, the pull does not request it and does not read the stored
+    /// image. A localcache repository that holds the image supplies it.
+    ///
+    /// The requests of the images come after the requests of all other
+    /// objects of the pull: the first image request goes out when no request
+    /// of another object is queued or in flight. In a pull through a chain of
+    /// static deltas, the images wait for the last step of the chain. A
+    /// remote that serves no image of a commit leaves the commit with no
+    /// image, and the pull goes on. After the first image that the remote
+    /// does not serve, the pull requests no image of a commit that this
+    /// repository holds complete. The image of each commit whose objects the
+    /// pull takes is requested all the same. The images of the held commits
+    /// come after the other images, one request at a time until the remote
+    /// serves one, so a remote that serves no image gets at most one request
+    /// for them.
+    ///
+    /// The pull streams the image to the staging directory, computes its
+    /// fs-verity digest, and stages it only when the digest is the key. No
+    /// count of the pull but
+    /// [`bytes_transferred`](PullStats::bytes_transferred) includes the
+    /// image.
     ///
     /// # Verification
     ///
@@ -514,6 +545,8 @@ impl Repo {
     /// - [`Error::InvalidFormat`] if a content object inflates to fewer bytes
     ///   than declared, or has bytes after its end. A malformed static delta
     ///   has the same error.
+    /// - [`Error::ComposefsDigestMismatch`] if the fs-verity digest of a
+    ///   fetched composefs image is not the key of its commit.
     /// - [`Error::InsufficientFreeSpace`] if a stored object needs more space
     ///   than the free-space budget of the transaction holds.
     ///
@@ -1232,10 +1265,12 @@ impl Repo {
             delta_plan,
             verification,
             detached_filter: &opts.detached_metadata_filter,
+            images: !opts.flags.contains(PullFlags::COMMIT_ONLY) && opts.subpaths.is_empty(),
             progress,
         };
         let mut plan = Plan::new(phase.subpaths);
         plan.queued = std::mem::take(&mut carry.queued);
+        plan.images = std::mem::take(&mut carry.images);
         for root in phase.roots {
             plan.push_commit(CommitItem {
                 checksum: *root,
@@ -1258,8 +1293,12 @@ impl Repo {
         // total.
         let mut started = carry.started;
         loop {
+            // The composefs images wait for the last run, and in that run for
+            // the end of each other step.
             while slots.has_room()
-                && let Some(item) = plan.next()
+                && let Some(item) = plan
+                    .next()
+                    .or_else(|| phase.last.then(|| plan.next_image(slots.len())).flatten())
             {
                 let buffer = buffers.pop().unwrap_or_default();
                 slots.push(self.step(&ctx, item, buffer));
@@ -1275,6 +1314,7 @@ impl Repo {
             plan.apply(step, marked);
         }
         carry.queued = plan.queued;
+        carry.images = plan.images;
         carry.started = started;
         Ok(())
     }
@@ -1295,6 +1335,9 @@ impl Repo {
             Item::Commit(commit) => self.fetch_commit(ctx, commit, &mut read_buf).await?,
             Item::Object(name) if name.ty == ObjectType::File => {
                 self.fetch_content(ctx, name, &mut read_buf).await?
+            }
+            Item::Object(name) if name.ty == ObjectType::ComposefsImage => {
+                Box::pin(self.fetch_image(ctx, name.checksum, &mut read_buf)).await?
             }
             Item::Object(name) => self.fetch_metadata(ctx, name, &mut read_buf).await?,
             Item::Part(part) => {
@@ -1532,11 +1575,22 @@ impl Repo {
         } else {
             CommitNext::Scan(tree)
         };
+        // The composefs image of the commit follows the other objects of the
+        // pull. A commit that is complete here gets its image too, if this
+        // repository holds none. A malformed key counts as no key.
+        let image = if !ctx.images || !matches!(recorded_digest(&commit), Ok(Some(_))) {
+            CommitImage::None
+        } else if complete {
+            CommitImage::Held
+        } else {
+            CommitImage::New
+        };
         Ok(Step::Commit(CommitOutcome {
             checksum,
             next,
             parent: commit.parent,
             marked: !complete,
+            image,
         }))
     }
 
@@ -1579,6 +1633,7 @@ impl Repo {
             next: CommitNext::Nothing,
             parent: commit.parent,
             marked: false,
+            image: CommitImage::None,
         }))
     }
 
@@ -1770,6 +1825,86 @@ impl Repo {
                     ctx.progress.content_fetched();
                     return Ok(Step::Done);
                 }
+                Err(e) => refetch.retry(e).await?,
+            }
+        }
+    }
+
+    /// Fetches the composefs image of `commit` and stages it.
+    ///
+    /// The step fetches nothing if the transaction staged an image of the
+    /// commit or this repository holds one. It does not read a stored image.
+    /// An image of a localcache repository is copied from there. Else the
+    /// step requests `objects/<xx>/<rest>.cfs` at low priority. A remote that
+    /// serves no image, with a 404 or a not-found reply, leaves the commit
+    /// without an image, and the pull goes on. The step returns the answer of
+    /// the remote in [`Step::Image`].
+    ///
+    /// The body streams through `read_buf`, the buffer of the slot. The write
+    /// computes the fs-verity digest of the image and checks it against the
+    /// key of the commit. A digest that is not the key fails the pull with
+    /// [`Error::ComposefsDigestMismatch`], and the step fetches the image no
+    /// second time.
+    async fn fetch_image(
+        &self,
+        ctx: &StepCtx<'_>,
+        commit: Checksum,
+        read_buf: &mut Vec<u8>,
+    ) -> Result<Step> {
+        let name = ObjectName::new(commit, ObjectType::ComposefsImage);
+        if ctx.txn.is_staged(&commit, name.ty) || self.has_object(name.ty, &commit).await? {
+            return Ok(Step::Image(ImageAnswer::NotAsked));
+        }
+        if let Some(src) = cached_source(ctx.sources, name).await? {
+            ctx.txn.import_composefs_image(src, &commit).await?;
+            return Ok(Step::Image(ImageAnswer::NotAsked));
+        }
+        let path = object_path(&commit, name.ty);
+        let fetcher = match ctx.source.transfer() {
+            Transfer::Http(fetcher) => fetcher,
+            Transfer::Stream(stream) => {
+                // The image has no length cap. The stream source takes no
+                // write permit, as for a content object.
+                let Some(body) = stream.get(&path, u64::MAX).await? else {
+                    return Ok(Step::Image(ImageAnswer::Absent));
+                };
+                ctx.txn
+                    .stage_composefs_image_from(&commit, body, read_buf)
+                    .await
+                    .map_err(session_error)?;
+                return Ok(Step::Image(ImageAnswer::Served));
+            }
+        };
+        // A body that fails in transit is fetched again from the start, as
+        // for a content object. A failed write removes its temp file.
+        let mut refetch = fetcher.refetching(FetchRequest {
+            priority: Priority::Low,
+            ..FetchRequest::path(&path)
+        });
+        loop {
+            let body = match refetch.fetch().await {
+                Ok(Fetched::Body(body)) => body,
+                Ok(Fetched::NotModified) => {
+                    return Err(Error::Fetch(format!(
+                        "{path}: the remote answered 304 to an unconditional request"
+                    )));
+                }
+                Err(e) => match Error::from(e) {
+                    Error::HttpStatus { status: 404, .. } => {
+                        return Ok(Step::Image(ImageAnswer::Absent));
+                    }
+                    e => return Err(e),
+                },
+            };
+            let permit = ctx.writes.acquire(Priority::Normal).await;
+            let stored = ctx
+                .txn
+                .stage_composefs_image_from(&commit, body, read_buf)
+                .await;
+            drop(permit);
+            match stored {
+                Ok(_) => return Ok(Step::Image(ImageAnswer::Served)),
+                Err(e @ Error::ComposefsDigestMismatch { .. }) => return Err(e),
                 Err(e) => refetch.retry(e).await?,
             }
         }
@@ -1990,6 +2125,9 @@ struct StepCtx<'a> {
     /// The filter of the properties of detached metadata that this pull
     /// stores. It applies after the checks of the commit pass.
     detached_filter: &'a DetachedMetadataFilter,
+    /// `true` if the pull fetches the composefs image of each commit that
+    /// carries the key: a pull that is not commit-only and has no subpath.
+    images: bool,
     /// The live counters of the pull.
     progress: &'a PullCounters,
 }
@@ -2018,6 +2156,9 @@ struct Carry {
     /// The objects that the runs queued, so that the pull fetches an object
     /// once over all runs.
     queued: HashSet<ObjectName>,
+    /// The composefs images that the runs queued. Only the last run fetches
+    /// them.
+    images: Images,
     /// The units of work that the runs gave to a slot, for the progress total.
     started: usize,
 }
@@ -2057,6 +2198,8 @@ enum Step {
     DirTree(Checksum, DirTree),
     /// A delta part is applied. The value is the commit of the part.
     Part(Checksum),
+    /// The step of a composefs image ended, with the answer of the remote.
+    Image(ImageAnswer),
     /// Nothing follows: a dirmeta or content object is stored, or a parent
     /// that the remote does not hold ended its chain.
     Done,
@@ -2071,6 +2214,34 @@ struct CommitOutcome {
     parent: Option<Checksum>,
     /// `true` if this pull wrote the `.commitpartial` marker of the commit.
     marked: bool,
+    /// The composefs image of the commit that the pull fetches, after the
+    /// other objects of the pull.
+    image: CommitImage,
+}
+
+/// The composefs image that a commit adds to the plan.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CommitImage {
+    /// No image: the commit carries no valid key, or the pull fetches no
+    /// image.
+    None,
+    /// The image of a commit whose objects this pull takes.
+    New,
+    /// The image of a commit that this repository holds complete.
+    Held,
+}
+
+/// What the step of a composefs image got from the remote.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ImageAnswer {
+    /// The step sent no request: the transaction or this repository holds
+    /// the image, or a localcache repository supplied it.
+    NotAsked,
+    /// The remote served the image.
+    Served,
+    /// The remote serves no image of the commit: a 404, or a not-found
+    /// reply.
+    Absent,
 }
 
 /// How a commit object reaches the object store, after the commit passes the
@@ -2120,8 +2291,11 @@ struct Plan {
     /// The dirtree and dirmeta objects that the walk waits for, drained third
     /// and fetched at high priority.
     scan: VecDeque<ObjectName>,
-    /// The content objects, drained last and fetched at low priority.
+    /// The content objects, drained fourth and fetched at low priority.
     content: VecDeque<ObjectName>,
+    /// The composefs images, drained last and fetched at low priority, when
+    /// no other step is queued or in flight.
+    images: Images,
     /// The objects that this pull queued, so that the pull fetches an object
     /// once, also if several commits reach it.
     queued: HashSet<ObjectName>,
@@ -2152,6 +2326,65 @@ struct Plan {
 struct PartialTree {
     scope: Scope,
     walked: bool,
+}
+
+/// The composefs images that a pull fetches, and what the remote answered.
+///
+/// After the first image that the remote does not serve, the pull requests
+/// no image of a held commit. The image of a commit whose objects the pull
+/// takes is requested all the same. Until the remote answers a request, at
+/// most one image of a held commit is in flight, and only after each image
+/// of a new commit. So a remote that serves no image gets at most one
+/// request for the held commits.
+#[derive(Default)]
+struct Images {
+    /// The images of the commits whose objects this pull takes.
+    new: VecDeque<ObjectName>,
+    /// The images of the commits that this repository holds complete.
+    held: VecDeque<ObjectName>,
+    /// The number of image steps in flight.
+    in_flight: usize,
+    /// The answers of the remote so far: `None` before the first answer,
+    /// `Some(false)` after an image that the remote does not serve, and
+    /// `Some(true)` after served images alone.
+    served: Option<bool>,
+}
+
+impl Images {
+    /// Returns the number of queued images.
+    fn len(&self) -> usize {
+        self.new.len() + self.held.len()
+    }
+
+    /// Returns the next image to fetch: the images of new commits, then the
+    /// images of held commits by the rule of [`Images`].
+    fn next(&mut self) -> Option<ObjectName> {
+        let name = match self.new.pop_front() {
+            Some(name) => name,
+            None => match self.served {
+                Some(false) => {
+                    self.held.clear();
+                    return None;
+                }
+                None if self.in_flight > 0 => return None,
+                _ => self.held.pop_front()?,
+            },
+        };
+        self.in_flight += 1;
+        Some(name)
+    }
+
+    /// Records the end of the step of one image.
+    fn apply(&mut self, answer: ImageAnswer) {
+        self.in_flight -= 1;
+        match answer {
+            ImageAnswer::NotAsked => {}
+            ImageAnswer::Served => {
+                self.served.get_or_insert(true);
+            }
+            ImageAnswer::Absent => self.served = Some(false),
+        }
+    }
 }
 
 impl Plan {
@@ -2243,6 +2476,20 @@ impl Plan {
         self.push_object(name, scope);
     }
 
+    /// Queues the composefs image of `commit`, if the commit has one to
+    /// fetch.
+    fn push_image(&mut self, commit: Checksum, image: CommitImage) {
+        let name = ObjectName::new(commit, ObjectType::ComposefsImage);
+        if image == CommitImage::None || !self.queued.insert(name) {
+            return;
+        }
+        if image == CommitImage::Held {
+            self.images.held.push_back(name);
+        } else {
+            self.images.new.push_back(name);
+        }
+    }
+
     /// Queues the objects that a stored dirtree references, under the scope of
     /// its walk.
     fn apply_dirtree(&mut self, checksum: Checksum, dirtree: &DirTree) {
@@ -2265,7 +2512,8 @@ impl Plan {
     }
 
     /// Returns the next unit of work: the commits, then the delta parts, then
-    /// the scan, then the content.
+    /// the scan, then the content. [`next_image`](Plan::next_image) gives the
+    /// composefs images.
     ///
     /// The plan holds back a queued part while [`PART_CAP`] parts are in
     /// flight. A pull with more slots spends the other slots on the scan and
@@ -2288,11 +2536,36 @@ impl Plan {
         self.content.pop_front().map(Item::Object)
     }
 
+    /// Returns the next composefs image to fetch, when `in_flight` steps are
+    /// in flight.
+    ///
+    /// An image goes out only after each other step of the run: no other
+    /// unit of work is queued, and each step in flight is the step of an
+    /// image. A dirtree in flight can still queue content, so the images
+    /// wait for it. The plan holds back an image while another step is in
+    /// flight. This is safe for the same reason as the part cap of
+    /// [`next`](Plan::next).
+    fn next_image(&mut self, in_flight: usize) -> Option<Item> {
+        if !self.commits.is_empty()
+            || !self.parts.is_empty()
+            || !self.scan.is_empty()
+            || !self.content.is_empty()
+            || in_flight > self.images.in_flight
+        {
+            return None;
+        }
+        self.images.next().map(Item::Object)
+    }
+
     /// Stores the progress total and the scan state: the `started` units of
     /// work given to a slot, and the queued work. `more` is `true` if a later
     /// run of the plan follows this run. The pull then still scans.
     fn report(&self, progress: &PullCounters, started: usize, more: bool) {
-        let queued = self.commits.len() + self.parts.len() + self.scan.len() + self.content.len();
+        let queued = self.commits.len()
+            + self.parts.len()
+            + self.scan.len()
+            + self.content.len()
+            + self.images.len();
         let total = u32::try_from(started + queued).unwrap_or(u32::MAX);
         progress.report(
             total,
@@ -2306,6 +2579,7 @@ impl Plan {
             Step::Commit(outcome) => self.apply_commit(outcome, marked),
             Step::DirTree(checksum, dirtree) => self.apply_dirtree(checksum, &dirtree),
             Step::Part(commit) => self.apply_part(commit),
+            Step::Image(answer) => self.images.apply(answer),
             Step::Done => {}
         }
     }
@@ -2336,6 +2610,7 @@ impl Plan {
             marked.push(outcome.checksum);
         }
         self.parents.insert(outcome.checksum, outcome.parent);
+        self.push_image(outcome.checksum, outcome.image);
         match outcome.next {
             CommitNext::Nothing => {}
             CommitNext::Scan(tree) => {
@@ -3284,7 +3559,42 @@ mod tests {
             next: CommitNext::Scan(tree),
             parent,
             marked: true,
+            image: CommitImage::None,
         })
+    }
+
+    /// Returns `step`, the outcome of a commit, with `image` as the
+    /// composefs image of the commit to fetch.
+    fn with_image(step: Step, image: CommitImage) -> Step {
+        match step {
+            Step::Commit(outcome) => Step::Commit(CommitOutcome { image, ..outcome }),
+            other => other,
+        }
+    }
+
+    /// Returns the outcome of a commit that this repository holds complete.
+    fn held(checksum: Checksum) -> Step {
+        Step::Commit(CommitOutcome {
+            checksum,
+            next: CommitNext::Nothing,
+            parent: None,
+            marked: false,
+            image: CommitImage::Held,
+        })
+    }
+
+    /// Returns the next unit of work as the drive loop takes it, with
+    /// `in_flight` steps in flight.
+    fn take(plan: &mut Plan, in_flight: usize) -> Option<Item> {
+        plan.next().or_else(|| plan.next_image(in_flight))
+    }
+
+    /// Returns the composefs image that `item` names.
+    fn image_of(item: Option<Item>) -> ObjectName {
+        match item {
+            Some(Item::Object(name)) if name.ty == ObjectType::ComposefsImage => name,
+            _ => panic!("the plan gave no image"),
+        }
     }
 
     /// Returns the outcome of a commit that a delta delivers.
@@ -3303,6 +3613,7 @@ mod tests {
             },
             parent: None,
             marked: true,
+            image: CommitImage::None,
         })
     }
 
@@ -3431,6 +3742,176 @@ mod tests {
             });
         }
         assert_eq!(drained, [csum(5), csum(2), csum(3), csum(4)]);
+    }
+
+    /// The composefs image of a commit drains after the content of the pull,
+    /// also the content of a later commit. A commit that is complete here
+    /// queues its image too. A commit with no image to fetch queues none.
+    #[test]
+    fn the_image_of_a_commit_drains_after_the_content() {
+        let mut plan = Plan::default();
+        let mut marked = Vec::new();
+        plan.apply(
+            with_image(
+                fetched(
+                    csum(1),
+                    vec![object(4, ObjectType::File), object(2, ObjectType::DirMeta)],
+                    None,
+                ),
+                CommitImage::New,
+            ),
+            &mut marked,
+        );
+        plan.apply(
+            fetched(csum(5), vec![object(6, ObjectType::File)], None),
+            &mut marked,
+        );
+        plan.apply(held(csum(7)), &mut marked);
+        let mut drained = Vec::new();
+        while let Some(item) = take(&mut plan, 0) {
+            let Item::Object(name) = item else {
+                panic!("the test queues objects alone");
+            };
+            drained.push(name);
+            if name.ty == ObjectType::ComposefsImage {
+                plan.apply(Step::Image(ImageAnswer::Served), &mut marked);
+            }
+        }
+        assert_eq!(
+            drained,
+            [
+                object(2, ObjectType::DirMeta),
+                object(4, ObjectType::File),
+                object(6, ObjectType::File),
+                object(1, ObjectType::ComposefsImage),
+                object(7, ObjectType::ComposefsImage),
+            ]
+        );
+    }
+
+    /// The composefs image of a commit waits while a dirtree is in flight,
+    /// also when the content queue is empty. The dirtree can still queue
+    /// content, and that content goes out before the image.
+    #[test]
+    fn the_image_waits_for_a_dirtree_in_flight() {
+        let mut plan = Plan::default();
+        let mut marked = Vec::new();
+        plan.apply(
+            with_image(
+                fetched(csum(1), vec![object(3, ObjectType::DirTree)], None),
+                CommitImage::New,
+            ),
+            &mut marked,
+        );
+        let Some(Item::Object(tree)) = take(&mut plan, 0) else {
+            panic!("the plan gave no dirtree");
+        };
+        assert_eq!(tree, object(3, ObjectType::DirTree));
+        assert!(plan.content.is_empty());
+        assert!(take(&mut plan, 1).is_none());
+
+        let dirtree = DirTree {
+            files: vec![("f".to_owned(), csum(4))],
+            dirs: Vec::new(),
+        };
+        plan.apply(Step::DirTree(tree.checksum, dirtree), &mut marked);
+        let Some(Item::Object(file)) = take(&mut plan, 0) else {
+            panic!("the plan gave no content");
+        };
+        assert_eq!(file, object(4, ObjectType::File));
+        assert!(take(&mut plan, 1).is_none());
+
+        plan.apply(Step::Done, &mut marked);
+        assert_eq!(
+            image_of(take(&mut plan, 0)),
+            object(1, ObjectType::ComposefsImage)
+        );
+        assert!(take(&mut plan, 1).is_none());
+    }
+
+    /// The composefs image of a commit that a delta delivers waits for the
+    /// parts and for the tree.
+    #[test]
+    fn the_image_of_a_delta_commit_waits_for_the_last_part() {
+        let mut plan = Plan::default();
+        let mut marked = Vec::new();
+        let tree = vec![object(2, ObjectType::DirMeta)];
+        plan.apply(
+            with_image(by_delta(csum(1), 1, Vec::new(), tree), CommitImage::New),
+            &mut marked,
+        );
+        assert!(matches!(take(&mut plan, 0), Some(Item::Part(_))));
+        assert!(take(&mut plan, 1).is_none());
+
+        plan.apply(Step::Part(csum(1)), &mut marked);
+        let Some(Item::Object(name)) = take(&mut plan, 0) else {
+            panic!("the plan gave no tree object");
+        };
+        assert_eq!(name, object(2, ObjectType::DirMeta));
+        assert!(take(&mut plan, 1).is_none());
+        plan.apply(Step::Done, &mut marked);
+        assert_eq!(
+            image_of(take(&mut plan, 0)),
+            object(1, ObjectType::ComposefsImage)
+        );
+    }
+
+    /// After an image that the remote does not serve, the plan gives no image
+    /// of a held commit. The images of new commits go out all the same. Until
+    /// the remote answers, one image of a held commit is in flight.
+    #[test]
+    fn an_absent_image_stops_the_images_of_held_commits() {
+        let mut plan = Plan::default();
+        let mut marked = Vec::new();
+        for byte in [1, 2, 3] {
+            plan.apply(held(csum(byte)), &mut marked);
+        }
+        plan.apply(
+            with_image(fetched(csum(9), Vec::new(), None), CommitImage::New),
+            &mut marked,
+        );
+        plan.apply(
+            with_image(fetched(csum(8), Vec::new(), None), CommitImage::New),
+            &mut marked,
+        );
+        // The images of the new commits go out together, and the held images
+        // wait for their answers.
+        let first = image_of(take(&mut plan, 0));
+        let second = image_of(take(&mut plan, 1));
+        assert_eq!([first.checksum, second.checksum], [csum(9), csum(8)]);
+        assert!(take(&mut plan, 2).is_none());
+        plan.apply(Step::Image(ImageAnswer::NotAsked), &mut marked);
+        assert!(take(&mut plan, 1).is_none());
+        plan.apply(Step::Image(ImageAnswer::NotAsked), &mut marked);
+
+        // No answer yet: one held image probes the remote.
+        assert_eq!(image_of(take(&mut plan, 0)).checksum, csum(1));
+        assert!(take(&mut plan, 1).is_none());
+        plan.apply(Step::Image(ImageAnswer::Absent), &mut marked);
+        assert!(take(&mut plan, 0).is_none());
+        assert_eq!(plan.images.len(), 0);
+
+        // A new commit still gets its image.
+        plan.apply(
+            with_image(fetched(csum(7), Vec::new(), None), CommitImage::New),
+            &mut marked,
+        );
+        assert_eq!(image_of(take(&mut plan, 0)).checksum, csum(7));
+    }
+
+    /// After a served image, the images of held commits go out together.
+    #[test]
+    fn a_served_image_releases_the_images_of_held_commits() {
+        let mut plan = Plan::default();
+        let mut marked = Vec::new();
+        for byte in [1, 2, 3] {
+            plan.apply(held(csum(byte)), &mut marked);
+        }
+        assert_eq!(image_of(take(&mut plan, 0)).checksum, csum(1));
+        assert!(take(&mut plan, 1).is_none());
+        plan.apply(Step::Image(ImageAnswer::Served), &mut marked);
+        assert_eq!(image_of(take(&mut plan, 0)).checksum, csum(2));
+        assert_eq!(image_of(take(&mut plan, 1)).checksum, csum(3));
     }
 
     /// A delta queues its parts and the objects that it hands over loose. The

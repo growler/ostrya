@@ -5,6 +5,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
+use ostrya_core::{ObjectName, ObjectType};
+
 /// The step that a push is in.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -181,12 +183,16 @@ pub struct PushProgressSnapshot {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PushStats {
     /// The number of objects that the client offered in `Have`.
+    ///
+    /// A composefs image does not count.
     pub objects_total: u64,
     /// The number of objects that the server asked for in `HaveReply`.
+    ///
+    /// A composefs image does not count.
     pub objects_needed: u64,
     /// The number of objects that the session sent in the object stream.
     ///
-    /// A detached metadata object does not count.
+    /// A detached metadata object and a composefs image do not count.
     pub objects_sent: u64,
     /// The number of bytes that the session gave to its transport.
     ///
@@ -208,7 +214,7 @@ pub struct PushStats {
     /// The object bytes that the session sent, without the chunk lengths.
     ///
     /// The bytes are in the encoding that the session sent them in. Detached
-    /// metadata objects count.
+    /// metadata objects and composefs images count.
     pub payload_bytes: u64,
     /// The time that the session ran.
     ///
@@ -321,20 +327,29 @@ impl Counters {
         self.each(|c| c.set_phase(phase));
     }
 
-    pub(crate) fn offered(&self, n: u64) {
+    /// Counts the objects of `names` as offered. A composefs image does not
+    /// count.
+    pub(crate) fn offered(&self, names: &[ObjectName]) {
+        let n = object_count(names);
         self.each(|c| {
             c.objects_total.fetch_add(n, Ordering::Relaxed);
         });
     }
 
-    pub(crate) fn needed(&self, n: u64) {
+    /// Counts the objects of `names` as needed. A composefs image does not
+    /// count.
+    pub(crate) fn needed(&self, names: &[ObjectName]) {
+        let n = object_count(names);
         self.each(|c| {
             c.objects_needed.fetch_add(n, Ordering::Relaxed);
         });
     }
 
-    pub(crate) fn object_sent(&self) {
-        self.each(ProgressCounters::object_sent);
+    /// Counts the object `name` as sent. A composefs image does not count.
+    pub(crate) fn object_sent(&self, name: &ObjectName) {
+        if name.ty != ObjectType::ComposefsImage {
+            self.each(ProgressCounters::object_sent);
+        }
     }
 
     /// Counts `n` content bytes read from the source of a file object.
@@ -378,4 +393,13 @@ impl Counters {
             elapsed: self.start.elapsed(),
         }
     }
+}
+
+/// Returns the number of names in `names` that the object counts of a
+/// session count: each name but a composefs image.
+fn object_count(names: &[ObjectName]) -> u64 {
+    names
+        .iter()
+        .filter(|n| n.ty != ObjectType::ComposefsImage)
+        .count() as u64
 }

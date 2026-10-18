@@ -14,7 +14,9 @@ use crate::repo::Repo;
 /// The [`ObjectSource`] over a local repository.
 ///
 /// A metadata object is [`ObjectData::Encoded`] in `raw`. The source reads it
-/// whole, because the format caps its size.
+/// whole, because the format caps its size. A composefs image is
+/// [`ObjectData::Encoded`] in `raw` too, with a stream over the stored `.cfs`
+/// file.
 ///
 /// If the encoding is `deflate` and the repository is in `archive` mode, a file
 /// object is [`ObjectData::Encoded`] in `deflate`. Its reader is a stream over
@@ -45,6 +47,9 @@ impl RepoSource {
     }
 
     async fn load(&self, name: &ObjectName, encoding: Encoding) -> Result<ObjectData> {
+        if name.ty == ObjectType::ComposefsImage {
+            return self.stored_image(&name.checksum).await;
+        }
         if name.ty != ObjectType::File {
             let bytes = self.repo.load_object_bytes(name.ty, &name.checksum).await?;
             return Ok(ObjectData::Encoded {
@@ -115,6 +120,44 @@ impl RepoSource {
         };
         Ok(ObjectData::Encoded {
             encoding: Encoding::Deflate,
+            reader: Box::new(FileReader::with_len_hint(file, len)),
+        })
+    }
+
+    /// Opens a stream over the stored composefs image of `commit`.
+    ///
+    /// The image has no size cap, so the source never reads it whole.
+    async fn stored_image(&self, commit: &Checksum) -> Result<ObjectData> {
+        let path = loose_path(commit, ObjectType::ComposefsImage, self.repo.mode());
+        let repo = self.repo.clone();
+        // The size bounds the read-ahead. The `fstat` runs on the pool
+        // thread of the open.
+        let opened = ostrya_rt::unblock(move || -> Result<_> {
+            let fd = rustix::fs::openat(
+                repo.objects_fd(),
+                path.as_str(),
+                rustix::fs::OFlags::RDONLY
+                    | rustix::fs::OFlags::CLOEXEC
+                    | rustix::fs::OFlags::NOFOLLOW,
+                rustix::fs::Mode::empty(),
+            )?;
+            let file = std::fs::File::from(fd);
+            let len = file.metadata()?.len();
+            Ok((file, len))
+        })
+        .await;
+        let (file, len) = match opened {
+            Ok(opened) => opened,
+            Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(Error::ObjectNotFound {
+                    checksum: *commit,
+                    ty: ObjectType::ComposefsImage,
+                });
+            }
+            Err(e) => return Err(e),
+        };
+        Ok(ObjectData::Encoded {
+            encoding: Encoding::Raw,
             reader: Box::new(FileReader::with_len_hint(file, len)),
         })
     }

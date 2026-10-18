@@ -739,8 +739,8 @@ impl PushSession {
     /// # Errors
     ///
     /// - [`Error::InvalidInput`] if the type of a name is not a file, a
-    ///   dirtree, a dirmeta, or a commit. The call sends nothing, and the
-    ///   session stays usable.
+    ///   dirtree, a dirmeta, a commit, or a composefs image. The call sends
+    ///   nothing, and the session stays usable.
     /// - [`Error::InvalidInput`] if another call runs, as the rules of
     ///   [concurrent calls](PushSession#concurrent-calls) state, or if the
     ///   session is broken.
@@ -770,7 +770,7 @@ impl PushSession {
         let mut taken = take(slot)?;
         let counters = &self.inner.counters;
         counters.phase(PushPhase::Negotiating);
-        counters.offered(names.len() as u64);
+        counters.offered(names);
         let stream = taken.stream();
         let mut missing = Vec::new();
         let server = &self.inner.server;
@@ -795,7 +795,7 @@ impl PushSession {
                 other => return Err(unexpected(&other, "Have")),
             }
         }
-        counters.needed(missing.len() as u64);
+        counters.needed(&missing);
         taken.release();
         Ok(missing)
     }
@@ -831,8 +831,8 @@ impl PushSession {
     ///
     /// - [`Error::InvalidInput`] if the level of `compression` is not 1
     ///   through 9, or if the type of a name is not a file, a dirtree, a
-    ///   dirmeta, or a commit. The call sends nothing, and the session stays
-    ///   usable.
+    ///   dirmeta, a commit, or a composefs image. The call sends nothing, and
+    ///   the session stays usable.
     /// - [`Error::InvalidInput`] if another call runs, as the rules of
     ///   [concurrent calls](PushSession#concurrent-calls) state, or if the
     ///   session is broken.

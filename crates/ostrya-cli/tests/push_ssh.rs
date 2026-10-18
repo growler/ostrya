@@ -1000,6 +1000,37 @@ mod cli {
         tool_fsck(&dest);
     }
 
+    /// A push sends the composefs image of a commit that
+    /// `commit --generate-composefs` stored. The receiver holds the image byte
+    /// for byte, and `composefs-image --check` passes on it.
+    #[test]
+    fn a_push_carries_the_composefs_image() {
+        let setup = Setup::new("cli-composefs", "bare-user");
+        let c = setup.commit("main", FILES, &["--generate-composefs"]);
+        let dest = receiver(&setup.base, RepoMode::Archive);
+
+        let out = setup.push_to(&dest, &["main"]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(stdout(&out), format!("main (new) {c}\n"));
+        let repo = format!("--repo={}", dest.display());
+        let check = ostrya(
+            &setup.base.0,
+            &[&repo, "composefs-image", "--check", "main"],
+            &[],
+        );
+        assert!(check.status.success(), "{}", stderr(&check));
+        let image = |repo: &Path| {
+            let hex = c.to_hex();
+            std::fs::read(
+                repo.join("objects")
+                    .join(&hex[..2])
+                    .join(format!("{}.cfs", &hex[2..])),
+            )
+            .unwrap()
+        };
+        assert_eq!(image(&dest), image(&setup.client));
+    }
+
     /// Under `--verbose`, one statistics line goes to standard error after
     /// the repository line, and standard output keeps the ref lines alone.
     #[test]

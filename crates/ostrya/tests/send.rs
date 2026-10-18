@@ -2,6 +2,7 @@
 //! cover:
 //!
 //! - the files of a commit from a repository of each mode
+//! - the composefs image of a commit
 //! - the replies to paths that are not found
 //! - the pipeline of `Get` frames and the version reply
 //! - the ref listing of a `ListRefs`
@@ -530,6 +531,36 @@ fn each_mode_serves_the_files_of_a_commit() {
         // The noise file and the file of 300,000 bytes.
         assert!(large >= 1, "{mode:?}: no .filez longer than one chunk");
     }
+}
+
+/// A session serves the composefs image of a commit as stored, with its
+/// length.
+#[test]
+fn a_session_serves_the_composefs_image() {
+    let tmp = TmpDir::new("send-cfs");
+    let base = tmp.path().join("tree");
+    common::composefs::build_owned_source(&base);
+    let (repo, commit) = block_on(async {
+        let repo =
+            common::composefs::new_repo(&tmp.path().join("repo"), RepoMode::BareUser, "").await;
+        let (commit, _) = common::composefs::commit_tree(&repo, &base, 1, true, None).await;
+        (repo, commit)
+    });
+    let stored = fs::read(repo.composefs_image_path(&commit)).unwrap();
+    let paths = vec![object_path(ObjectType::ComposefsImage, &commit)];
+    let (result, (replies, _)) = session(&repo, PIPE_CAP, |mut c| async move {
+        c.open().await;
+        fetch(&mut c, &paths, 1).await
+    });
+    result.unwrap();
+    assert_eq!(
+        replies,
+        [Reply {
+            found: true,
+            len: Some(stored.len() as u64),
+            body: stored,
+        }]
+    );
 }
 
 /// A path that the view refuses gets the reply of a path that is not found.

@@ -238,6 +238,11 @@ fn every_message_round_trips() {
     round_trip(header(DirTree, 7, Encoding::Raw));
     round_trip(header(Commit, 7, Encoding::Raw));
     round_trip(header(CommitMeta, 7, Encoding::Raw));
+    round_trip(header(ComposefsImage, 7, Encoding::Raw));
+    round_trip(Message::Have(vec![
+        name(Commit, 1),
+        name(ComposefsImage, 1),
+    ]));
     round_trip(Message::Commit(CommitRequest {
         updates: vec![],
         force: false,
@@ -250,7 +255,7 @@ fn every_message_round_trips() {
     }
     round_trip(Message::Error(error(ErrorCode::RefDenied, "main")));
     let mut e = error(ErrorCode::MissingObjects, "2 missing");
-    e.missing = vec![name(File, 1), name(Commit, 2)];
+    e.missing = vec![name(File, 1), name(Commit, 2), name(ComposefsImage, 2)];
     round_trip(Message::Error(e));
     for commit in [Some(ck(9)), None] {
         let mut e = error(ErrorCode::RefMismatch, "moved");
@@ -394,6 +399,7 @@ fn an_object_header_frame_equals_the_generic_encoding() {
         (DirMeta, &[Encoding::Raw][..]),
         (Commit, &[Encoding::Raw][..]),
         (CommitMeta, &[Encoding::Raw][..]),
+        (ComposefsImage, &[Encoding::Raw][..]),
     ] {
         for &encoding in encodings {
             for n in [0, 0x7f, 0xff] {
@@ -407,6 +413,7 @@ fn an_object_header_frame_equals_the_generic_encoding() {
     for msg in [
         header(DirTree, 0, Encoding::Deflate),
         header(CommitMeta, 0, Encoding::Deflate),
+        header(ComposefsImage, 0, Encoding::Deflate),
         header(TombstoneCommit, 0, Encoding::Raw),
     ] {
         let mut w = FrameWriter::new(Vec::new());
@@ -847,10 +854,19 @@ fn malformed_bodies_decode_to_protocol() {
         }
     }
 
-    for ty in [0, 5, 6, 7, 9, 100] {
+    for ty in [0, 5, 6, 7, 9, 99, 101] {
         assert_protocol(read_one(&frame(3, &names_body(ty, good()))));
     }
-    for (ty, enc) in [(0, 0), (5, 0), (7, 0), (9, 0), (100, 0), (2, 1), (1, 2)] {
+    for (ty, enc) in [
+        (0, 0),
+        (5, 0),
+        (7, 0),
+        (9, 0),
+        (101, 0),
+        (2, 1),
+        (100, 1),
+        (1, 2),
+    ] {
         assert_protocol(read_one(&frame(5, &header_body(ty, good(), enc))));
     }
     let mut w = FrameWriter::new(Vec::new());

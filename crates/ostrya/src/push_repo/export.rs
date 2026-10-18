@@ -58,7 +58,9 @@ impl Repo {
     /// each object that the tree of the commit reaches. It also carries the
     /// detached metadata of the commit after
     /// [`detached_metadata_filter`](ExportStreamOptions::detached_metadata_filter).
-    /// The stream carries no parent commit.
+    /// If the repository holds the composefs image of a new commit, the
+    /// stream carries the image after the trees. The stream carries no parent
+    /// commit.
     ///
     /// The call does no negotiation, so it sends each object, also the
     /// objects that the receiver holds.
@@ -224,6 +226,21 @@ impl Repo {
         }
         drop(seen);
         drop(loaded);
+        // The composefs image of each new commit that this repository holds
+        // goes after the trees.
+        let repo = self.clone();
+        let wanted = commits.clone();
+        let images = ostrya_rt::unblock(move || -> Result<Vec<ObjectName>> {
+            let mut images = Vec::new();
+            for commit in wanted {
+                if repo.has_object_blocking(ObjectType::ComposefsImage, &commit)? {
+                    images.push(ObjectName::new(commit, ObjectType::ComposefsImage));
+                }
+            }
+            Ok(images)
+        })
+        .await?;
+        names.extend(images);
 
         let source = RepoSource::new(self.clone(), opts.detached_metadata_filter);
         Ok(crate::remote::session::export_stream(

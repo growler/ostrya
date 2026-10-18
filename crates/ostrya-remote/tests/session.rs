@@ -608,13 +608,12 @@ fn missing_sends_batches_of_max_have() {
 
 /// The object types that neither `Have` nor the object stream of a client
 /// carries.
-const OFF_WIRE: [ObjectType; 6] = [
+const OFF_WIRE: [ObjectType; 5] = [
     ObjectType::TombstoneCommit,
     ObjectType::CommitMeta,
     ObjectType::PayloadLink,
     ObjectType::FileXattrs,
     ObjectType::FileXattrsLink,
-    ObjectType::ComposefsImage,
 ];
 
 #[test]
@@ -1627,6 +1626,57 @@ fn progress_counts_and_phases() {
         Event::Msg(Message::Hello(h)) => assert_eq!(h.agent.as_deref(), Some("test/1")),
         other => panic!("{other:?}"),
     }
+}
+
+/// A composefs image goes on the wire as a raw object, and the session
+/// counts its bytes alone: no object count of the session holds it.
+#[test]
+fn a_composefs_image_counts_its_bytes_alone() {
+    let image = meta_name(ObjectType::ComposefsImage, 1);
+    let source = Source::default()
+        .with(file(1), Item::Encoded(Encoding::Raw, b"xyz".to_vec()))
+        .with(image, Item::Encoded(Encoding::Raw, b"image".to_vec()));
+    let msgs = [
+        hello_reply(&["a"], BOTH, 16),
+        Message::HaveReply(HaveReply::from_missing([true, true])),
+        objects_reply(),
+        commit_reply(&["a"]),
+    ];
+    let (session, out) = open_with(encode(&msgs), &["a"], SessionOptions::default());
+    let session = session.unwrap();
+    let needed = block_on(session.missing(&[file(1), image])).unwrap();
+    assert_eq!(needed, [file(1), image]);
+    block_on(session.send(&source, &needed, &[], Compression::None)).unwrap();
+    let stats = block_on(session.commit(&[update("a")], false))
+        .unwrap()
+        .stats;
+    assert_eq!(
+        (
+            stats.objects_total,
+            stats.objects_needed,
+            stats.objects_sent,
+            stats.payload_bytes
+        ),
+        (1, 1, 1, 8)
+    );
+    let objects: Vec<(ObjectHeader, Vec<u8>)> = decode(&out.bytes())
+        .into_iter()
+        .filter_map(|event| match event {
+            Event::Object { header, data, .. } => Some((header, data)),
+            Event::Msg(_) => None,
+        })
+        .collect();
+    let raw = |name| ObjectHeader {
+        name,
+        encoding: Encoding::Raw,
+    };
+    assert_eq!(
+        objects,
+        [
+            (raw(file(1)), b"xyz".to_vec()),
+            (raw(image), b"image".to_vec()),
+        ]
+    );
 }
 
 /// The hook of a handle runs at each phase change, after each object, and

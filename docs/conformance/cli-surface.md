@@ -2976,6 +2976,17 @@ included) at exit 1. The port's fetcher serves `http` and `https` alone, so a
 `file://` remote, which the tool pulls from, reports `error: unsupported: fetch
 url scheme file: only http and https are fetched` at exit 1 and writes nothing.
 
+`pull` and `pull-local` also take the composefs image of each commit that
+carries `ostree.composefs.digest.v0`, unless the pull is commit-only or has a
+subpath (`format-reference.md`, "The pull over HTTP and over a stream"). A
+remote of the tool holds no image and answers 404, and the pull goes on.
+`pull-local` copies the image with a reflink or a byte copy and never with a
+hardlink. On `pull`, the image adds its bytes to the transferred count of the
+statistics line. On `pull-local`, it adds its bytes there only when the pull
+reads static deltas, under `--require-static-deltas` or a list of deltas,
+because only that pull counts the bytes that it reads. The image adds no
+object to a count.
+
 The port adds `--collection=ID`, the pull of the refs of the collection ID
 from each remote whose `collection-id` is ID (`format-reference.md`, "The
 pull of collection refs"). With it, each operand is a ref of the collection,
@@ -3968,6 +3979,12 @@ ostrya push [--repo=PATH] REMOTE REF --onto=BRANCH
   1, at the same step. A commit with no binding in the namespace of a
   collection is refused with `error: binding-mismatch: ...` after the server
   reports the namespace, and before the push sends an object.
+- The push offers the composefs image of each commit whose tree it walks,
+  where the local repository holds the image, also for a source commit that
+  the server holds (`../format-reference.md`, "Have and HaveReply"). A push
+  with `--onto` sends no image. A server that does not accept the object
+  type 100 refuses the session with `protocol`, so the server must accept
+  the type before a push with images goes to it.
 - `--tag=NAME` creates the ref `NAME` on the server at the source commit.
   The option can repeat. The refspecs that are not deletes must give one
   commit, and its `ostree.ref-binding` must hold `NAME`. `NAME` passes the
@@ -4271,7 +4288,8 @@ ostrya serve [--repo=PATH] [--listen=ADDR:PORT]...
   `collection-id=ID\n` and `indexed-deltas=VALUE\n` when the repository
   sets them. In a mode other than `archive` each `.filez` object is built on
   request at `[archive] zlib-level`, and `deltas/` and `delta-indexes/` are
-  not served. A path the server refuses and a path it does not find both get
+  not served. The `.cfs` composefs image of a commit is served as stored in
+  every mode. A path the server refuses and a path it does not find both get
   404. `../format-reference.md`, "The archive view", states the rules.
 - The command also answers `GET /_ostrya/refs/v1?pattern=P&collection=C`.
   The body is the ref listing, a summary GVariant built for each request, of
@@ -4461,6 +4479,8 @@ ostrya send [--repo=PATH] [--client=NAME]
 - The `send` feature of `ostrya-cli` builds the command. It is in the
   default set. `Repo::send` takes no feature of `ostrya`, so the command
   builds without `receive`, `push`, and `serve`.
+- The session serves the `.cfs` composefs image of a commit as stored, as
+  `serve` does.
 - The client name is `--client`, else the value of `LOGNAME`, as for
   `receive`. With no name, the command writes `error: send needs a client
   name: give --client, or set LOGNAME` and exits 1 before it opens the
@@ -4572,7 +4592,10 @@ ostrya composefs-image [--repo=PATH] (--add=REV | --get-path=REV | --check=REV)
   absent, it writes `Composefs image with no commit: CHECKSUM` to standard
   output, and this line is not an error. A repository with no image gets
   none of these lines.
-- `crates/ostrya/tests/composefs_image.rs` and
+- `pull`, `pull-local`, `push`, `send`, and `serve` carry the image
+  (`../format-reference.md`, "The composefs image object").
+- `crates/ostrya/tests/composefs_image.rs`,
+  `crates/ostrya/tests/composefs_transfer.rs`, and
   `crates/ostrya-cli/tests/cli.rs` hold the tests.
 
 ### ssh access with `authorized_keys`

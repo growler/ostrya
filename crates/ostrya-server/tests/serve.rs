@@ -1,6 +1,7 @@
 //! Tests of the server over a `bare-user` repository:
 //!
 //! - the archive view over HTTP/1.1, and over TLS with HTTP/2 and HTTP/1.1
+//! - the composefs image of a commit, served as stored
 //! - the 404 of a refused path and of an absent path
 //! - `HEAD`
 //! - client certificates
@@ -292,6 +293,22 @@ fn the_archive_view_is_served_over_http() {
                 .0
                 .ends_with(b"mode=archive-z2\nindexed-deltas=true\n")
         );
+    });
+}
+
+/// The server serves the composefs image of a commit as stored, with its
+/// length. The view does not read the image, so any bytes serve.
+#[test]
+fn the_composefs_image_is_served_as_stored() {
+    let tmp = TmpDir::new("cfs");
+    let (path, repo, commit, _) = block_on(repo(tmp.path()));
+    let image_path = object_path(ObjectType::ComposefsImage, &commit);
+    std::fs::write(path.join(&image_path), b"composefs image\n").unwrap();
+    with_server(repo, local(), |addrs| async move {
+        let fetcher = fetcher(format!("http://{}/", addrs[0]), false, None).await;
+        let (bytes, len, _) = fetch(&fetcher, &image_path).await.unwrap();
+        assert_eq!(bytes, b"composefs image\n");
+        assert_eq!(len, Some(bytes.len() as u64));
     });
 }
 

@@ -7,8 +7,8 @@
 //! session transaction.
 //!
 //! The ingest reads a metadata object and a detached metadata object whole, up
-//! to [`MAX_METADATA_SIZE`] bytes. Content streams through the transaction
-//! writers in bounded chunks.
+//! to [`MAX_METADATA_SIZE`] bytes. Content and composefs images stream through
+//! the transaction writers in bounded chunks.
 
 use std::io;
 use std::pin::Pin;
@@ -284,6 +284,32 @@ where
         .await
         .map_err(Failure::Internal)?;
     Ok(stored)
+}
+
+/// Ingests the composefs image of the commit `commit`.
+///
+/// If `held` is `true`, the repository holds an image of the commit. The
+/// function then reads the image to its end, drops it, and returns
+/// `Ok(None)`. Otherwise it streams the image into the staging directory
+/// through `buf`, seals it as the transaction seals a new image, and returns
+/// its fs-verity digest. The function does not compare the digest with the
+/// key of the commit.
+pub(super) async fn image<R: AsyncRead + Unpin>(
+    txn: &Transaction,
+    commit: &Checksum,
+    held: bool,
+    body: &mut R,
+    buf: &mut Vec<u8>,
+) -> Result<Option<[u8; 32]>, Failure> {
+    if held {
+        grow(buf);
+        while body.read(buf).await.map_err(|e| classify(e.into()))? > 0 {}
+        return Ok(None);
+    }
+    txn.stage_composefs_image_unchecked(commit, body, buf)
+        .await
+        .map(Some)
+        .map_err(classify)
 }
 
 /// Reads the framed header of a content object.

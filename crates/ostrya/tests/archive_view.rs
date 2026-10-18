@@ -1,8 +1,8 @@
 //! Integration tests for `ArchiveView` over a repository of each mode.
 //!
 //! The tests cover the built `config` and the stored files. They also cover
-//! the `.filez` objects that the view builds on request, and the paths that the
-//! view refuses or does not find.
+//! the `.filez` objects that the view builds on request, the composefs image
+//! of a commit, and the paths that the view refuses or does not find.
 
 mod common;
 
@@ -1060,5 +1060,36 @@ fn the_extensions_of_the_port_are_not_found() {
         }
         assert!(serves(&view, "extensions/ostrya-other/x", &access).await);
         assert!(serves(&view, "extensions/other/y", &access).await);
+    });
+}
+
+/// In each mode, the view serves the composefs image of a commit as stored.
+/// A `HEAD` gives its length. The image of a commit that the repository does
+/// not hold is not found.
+#[test]
+fn the_composefs_image_is_served_as_stored() {
+    let tmp = TmpDir::new("view-cfs");
+    let base = tmp.path().join("tree");
+    common::composefs::build_owned_source(&base);
+    block_on(async {
+        for mode in [RepoMode::Archive, RepoMode::BareUser] {
+            let root = tmp.path().join(mode.as_mode_str());
+            let repo = common::composefs::new_repo(&root, mode, "").await;
+            let (commit, _) = common::composefs::commit_tree(&repo, &base, 1, true, None).await;
+            let view = ArchiveView::new(repo.clone());
+            let path = object_path(ObjectType::ComposefsImage, &commit);
+            let stored = fs::read(repo.composefs_image_path(&commit)).unwrap();
+            let (len, bytes) = get(&view, &path).await;
+            assert_eq!(len, Some(stored.len() as u64), "{mode:?}");
+            assert_eq!(bytes, stored, "{mode:?}");
+            assert_eq!(
+                view.head(&path, &anyone()).await.unwrap(),
+                ArchiveHead::Found {
+                    len: Some(stored.len() as u64)
+                }
+            );
+            let absent = object_path(ObjectType::ComposefsImage, &Checksum::from_bytes([7; 32]));
+            assert_both(&view, &absent, false).await;
+        }
     });
 }

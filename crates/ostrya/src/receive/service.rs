@@ -335,6 +335,8 @@ impl ReceiveService {
     /// - [`remote::Error::Protocol`] if two detached metadata objects of the
     ///   session name the same commit, or if a detached metadata dict is
     ///   malformed.
+    /// - [`remote::Error::Protocol`] if two composefs images of the session
+    ///   name the same commit.
     /// - [`remote::Error::Protocol`] if the payload of an object is malformed,
     ///   for example a corrupt DEFLATE stream or a size that does not match
     ///   its header.
@@ -424,9 +426,15 @@ impl ReceiveService {
     ///   a metadata value of the server commit is not a `v` in normal form or
     ///   is too deep for a commit.
     /// - [`remote::Error::Protocol`] if the request holds a server commit and
-    ///   the session holds a detached metadata dict or staged a commit object.
+    ///   the session holds a detached metadata dict or a composefs image, or
+    ///   staged a commit object.
     /// - [`remote::Error::Protocol`] if a detached metadata dict belongs to a
     ///   commit that is not a commit of the session.
+    /// - [`remote::Error::Protocol`] if a composefs image belongs to a commit
+    ///   that the session did not stage and the repository does not hold, or
+    ///   to a commit with no valid `ostree.composefs.digest.v0`.
+    /// - [`remote::Error::ChecksumMismatch`] if the fs-verity digest of a
+    ///   composefs image is not the key of its commit.
     /// - [`remote::Error::Protocol`] if a staged commit or a staged dirtree does
     ///   not parse.
     /// - [`remote::Error::InvalidRef`] if a ref name is not valid, or if an

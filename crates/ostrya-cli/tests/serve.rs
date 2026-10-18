@@ -1446,6 +1446,48 @@ fn serve_takes_the_proxy_settings_from_the_server_group() {
     assert!(response.starts_with("HTTP/1.1 200 "), "{response}");
 }
 
+/// `ostrya pull` from `ostrya serve` copies the composefs image of a commit
+/// that `commit --generate-composefs` stored in a `bare-user` repository.
+/// The pulled image is the stored image, and `composefs-image --check`
+/// passes on it.
+#[test]
+fn ostrya_pulls_the_composefs_image_from_serve() {
+    let tmp = TmpDir::new("composefs");
+    let src = build_tree(tmp.path());
+    let server = tmp.path().join("server");
+    let commit = server_repo(&server, "bare-user", &src, &["--generate-composefs"]);
+    let serving = Serving::start(&server, &[]);
+
+    let client = tmp.path().join("client");
+    let client_arg = format!("--repo={}", client.display());
+    ok(ostrya(), &[&client_arg, "init", "--mode=archive"]);
+    ok(
+        ostrya(),
+        &[
+            &client_arg,
+            "remote",
+            "add",
+            "--no-gpg-verify",
+            "origin",
+            &serving.url,
+        ],
+    );
+    ok(ostrya(), &[&client_arg, "pull", "origin", "main"]);
+    ok(
+        ostrya(),
+        &[&client_arg, "composefs-image", "--check", "origin:main"],
+    );
+    let image = |repo: &Path| {
+        std::fs::read(
+            repo.join("objects")
+                .join(&commit[..2])
+                .join(format!("{}.cfs", &commit[2..])),
+        )
+        .unwrap()
+    };
+    assert_eq!(image(&client), image(&server));
+}
+
 /// With a client group of anonymous push, the receive endpoint answers a
 /// `session` request, and the archive view still serves `config`. With a
 /// group that reads each ref and opens no push session, a `Hello` gets 403.

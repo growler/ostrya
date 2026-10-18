@@ -98,6 +98,7 @@ Its name is the checksum of the commit, as for \fB\%.commitmeta\fR.
 Its fs\-verity digest is the value of the key \fB\%ostree.composefs.digest.v0\fR of the commit.
 Each mode stores it uncompressed, with the inode mode 0644.
 \fB\%ostrya commit \-\-generate\-composefs\fR and \fB\%ostrya composefs\-image \-\-add\fR write it, and \fB\%ostrya prune\fR removes it with its commit.
+\fB\%ostrya pull\fR, \fB\%ostrya pull\-local\fR, and \fB\%ostrya push\fR copy it with its commit, and install the copy only when its digest is the key.
 .TP
 \fB\%.tombstone\-commit\fR
 A marker that records a commit that a prune deleted.
@@ -278,6 +279,8 @@ An alias ref is served as its target.
 \fB\%summary\fR and \fB\%summary.sig\fR: the files of the summary of the authentication item of the client, as stored.
 .IP \(bu 2
 The metadata objects, as stored.
+.IP \(bu 2
+The \fB\%.cfs\fR objects, as stored, in each mode.
 .IP \(bu 2
 The \fB\%.filez\fR objects.
 In an archive repository the view serves them as stored, and in another mode it makes them on request.

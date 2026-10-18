@@ -56,8 +56,7 @@ impl<'a, T> Slots<'a, T> {
     }
 
     /// Returns the number of futures in flight.
-    #[cfg(test)]
-    fn len(&self) -> usize {
+    pub(crate) fn len(&self) -> usize {
         self.slots.len()
     }
 

@@ -249,7 +249,10 @@ impl Repo {
     ///
     /// If the local repository lacks a dirtree or a dirmeta, the push ends
     /// the session with `Abort`. The second `Have` round offers the tree
-    /// objects. The push sends the objects that the server lacks.
+    /// objects. After them it offers the composefs image of each walked
+    /// commit that the local repository holds, so a server that holds a
+    /// source commit with no image gets the image. The push sends the objects
+    /// that the server lacks.
     ///
     /// The push also sends the detached metadata of each commit that it sends
     /// and of each source commit. The metadata passes
@@ -789,6 +792,22 @@ impl Plan {
             }
             drop(commits);
             drop(seen);
+            // The composefs image of each walked commit that this repository
+            // holds goes after the trees. A source commit that the server
+            // holds is walked too, so the server gets an image that it lacks
+            // for that commit.
+            let repo = self.repo.clone();
+            let images = ostrya_rt::unblock(move || -> Result<Vec<ObjectName>> {
+                let mut images = Vec::new();
+                for commit in walked {
+                    if repo.has_object_blocking(ObjectType::ComposefsImage, &commit)? {
+                        images.push(ObjectName::new(commit, ObjectType::ComposefsImage));
+                    }
+                }
+                Ok(images)
+            })
+            .await?;
+            tree_names.extend(images);
             let missing_trees = session.missing(&tree_names).await?;
             drop(tree_names);
 

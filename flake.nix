@@ -12,6 +12,7 @@
 
   outputs =
     {
+      self,
       nixpkgs,
       flake-utils,
       rust-overlay,
@@ -124,5 +125,9 @@
       )
     // {
       inherit overlays;
+
+      # `services.ostrya-serve` runs `ostrya serve` on one repository. The
+      # package defaults to the `ostrya` of this flake.
+      nixosModules.default = import ./nix/module.nix { inherit self; };
     };
 }

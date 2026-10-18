@@ -266,6 +266,25 @@ nix build .#ostrya        # ./result/bin/ostrya
 The flake gives the package as an overlay in `overlays.default`, so another
 flake can use `pkgs.ostrya`.
 
+The flake also gives the NixOS module `nixosModules.default`. The module runs
+`ostrya serve` on one repository as the systemd unit `ostrya-serve.service`.
+Each option of `services.ostrya-serve` that is not set adds no flag, so the
+key of `[ex-ostrya server]` in the repository config applies. The client
+groups, the trust groups, and the key groups are in the repository config.
+
+```nix
+services.ostrya-serve = {
+  enable = true;
+  repo = "/srv/ostree/repo";
+  user = "ostree";
+  group = "ostree";
+  listen = [ { address = "::"; port = 8443; } ];
+  openFirewall = true;
+  tls.certFile = "/etc/ostrya/server.pem";
+  tls.keyFile = "/etc/ostrya/server.key";
+};
+```
+
 The Debian packaging is in `crates/ostrya-cli/debian`. The Nix package and the
 Debian package install the man pages.
 

@@ -1558,6 +1558,20 @@ fn size_field(value: &Value, what: &str, big_endian: bool) -> Result<u64> {
     Ok(if big_endian { raw.swap_bytes() } else { raw })
 }
 
+/// Reads the type byte of a part object or of a fallback entry.
+///
+/// A static delta carries no composefs image, so the type
+/// [`ObjectType::ComposefsImage`] is refused with the error of an unknown
+/// type.
+fn delta_object_type(byte: u8) -> Result<ObjectType> {
+    match ObjectType::from_u32(u32::from(byte))? {
+        ObjectType::ComposefsImage => {
+            Err(ostrya_core::Error::InvalidObjectType(u32::from(byte)).into())
+        }
+        ty => Ok(ty),
+    }
+}
+
 /// Parses the stride-33 `objtype + 32-byte checksum` object array, which gives
 /// the object order and types of a part.
 fn parse_object_array(bytes: &[u8]) -> Result<Vec<(ObjectType, Checksum)>> {
@@ -1568,7 +1582,7 @@ fn parse_object_array(bytes: &[u8]) -> Result<Vec<(ObjectType, Checksum)>> {
     }
     let mut out = Vec::with_capacity(bytes.len() / 33);
     for chunk in bytes.chunks_exact(33) {
-        let objtype = ObjectType::from_u32(u32::from(chunk[0]))?;
+        let objtype = delta_object_type(chunk[0])?;
         let checksum = Checksum::from_ay(&chunk[1..33])?;
         out.push((objtype, checksum));
     }
@@ -1580,7 +1594,7 @@ fn parse_fallbacks(entries: &[Value], big_endian: bool) -> Result<Vec<DeltaFallb
     let mut out = Vec::with_capacity(entries.len());
     for entry in entries {
         let fields = tuple(entry)?;
-        let objtype = ObjectType::from_u32(u32::from(byte_field(&fields[0], "fallback objtype")?))?;
+        let objtype = delta_object_type(byte_field(&fields[0], "fallback objtype")?)?;
         let checksum = Checksum::from_ay(bytes_field(&fields[1], "fallback checksum")?)?;
         let size = size_field(&fields[2], "fallback size", big_endian)?;
         let uncompressed_size = size_field(&fields[3], "fallback uncompressed size", big_endian)?;
@@ -3661,5 +3675,37 @@ mod tests {
             .unwrap();
             assert_eq!(sb.parent_count(), parents, "field 5 of {len} bytes");
         }
+    }
+
+    /// A part object and a fallback entry of type 100, the composefs image,
+    /// are refused as an unknown type. A file object passes in both.
+    #[test]
+    fn a_delta_refuses_the_composefs_image_type() {
+        let refused = |err: Error| {
+            assert!(
+                matches!(err, Error::Core(ostrya_core::Error::InvalidObjectType(100))),
+                "{err}"
+            );
+        };
+
+        let mut array = vec![ObjectType::ComposefsImage.as_u32() as u8];
+        array.extend_from_slice(&[0x44; 32]);
+        refused(parse_object_array(&array).unwrap_err());
+        array[0] = ObjectType::File.as_u32() as u8;
+        assert_eq!(parse_object_array(&array).unwrap()[0].0, ObjectType::File);
+
+        let fallback = |ty: ObjectType| {
+            Value::Tuple(vec![
+                Value::Byte(ty.as_u32() as u8),
+                Value::Bytes(vec![0x33; 32]),
+                Value::U64(1),
+                Value::U64(1),
+            ])
+        };
+        refused(parse_fallbacks(&[fallback(ObjectType::ComposefsImage)], false).unwrap_err());
+        assert_eq!(
+            parse_fallbacks(&[fallback(ObjectType::File)], false).unwrap()[0].objtype,
+            ObjectType::File
+        );
     }
 }

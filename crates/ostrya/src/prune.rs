@@ -454,15 +454,16 @@ fn merge_metadata_keys(config: Vec<String>, caller: &[String]) -> Vec<String> {
 
 /// Returns `true` if an object of this type is in the counts of a run.
 ///
-/// Detached commit metadata and tombstone markers are outside both counts.
-/// `commit_only` narrows the counts to commit objects, which is what the
+/// The sidecars of a commit -- detached commit metadata and composefs
+/// images -- and tombstone markers are outside both counts. `commit_only`
+/// narrows the counts to commit objects, which is what the
 /// `ostree` command reports. Static deltas are not loose objects, so they are
 /// outside both counts.
 fn counted(ty: ObjectType, commit_only: bool) -> bool {
     if commit_only {
         ty == ObjectType::Commit
     } else {
-        !matches!(ty, ObjectType::CommitMeta | ObjectType::TombstoneCommit)
+        !ty.is_commit_sidecar() && ty != ObjectType::TombstoneCommit
     }
 }
 
@@ -473,7 +474,8 @@ pub struct PruneStats {
     ///
     /// It is the total of the store after a
     /// [`delete_commit`](PruneOptions::delete_commit) removal. It leaves out
-    /// detached commit metadata and tombstone markers. Static deltas are not
+    /// detached commit metadata, composefs images, and tombstone markers.
+    /// Static deltas are not
     /// loose objects, so they are outside it. If
     /// [`commit_only`](PruneOptions::commit_only) is set, it counts commit
     /// objects alone.
@@ -482,11 +484,14 @@ pub struct PruneStats {
     ///
     /// If [`no_prune`](PruneOptions::no_prune) is set, it is the number that
     /// the run deletes without `no_prune`. It counts on the terms of
-    /// [`total_objects`](PruneStats::total_objects). A `.commitmeta` removed
-    /// with its commit is not in the number, and a static delta is not in it.
+    /// [`total_objects`](PruneStats::total_objects). A `.commitmeta` or a
+    /// `.cfs` removed with its commit or as an orphan is not in the number,
+    /// and a static delta is not in it.
     pub pruned_objects: usize,
     /// The on-disk bytes of the objects that
     /// [`pruned_objects`](PruneStats::pruned_objects) counts.
+    ///
+    /// The bytes of a removed `.commitmeta` or `.cfs` are not in the number.
     ///
     /// If [`no_prune`](PruneOptions::no_prune) is set, it is the number of
     /// bytes that the run frees without `no_prune`.
@@ -532,9 +537,10 @@ impl Repo {
     /// Removes the objects that no root reaches and returns the statistics.
     ///
     /// The run walks from the roots, keeps each object that the walk reaches,
-    /// and removes each other loose object. A kept commit keeps its detached
-    /// metadata (`.commitmeta`). The run removes the detached metadata of each
-    /// commit that it removes. [`PruneOptions`] sets the roots, the bounds, and
+    /// and removes each other loose object. A kept commit keeps its sidecars:
+    /// its detached metadata (`.commitmeta`) and its composefs image (`.cfs`).
+    /// The run removes the sidecars of each commit that it removes, and each
+    /// sidecar whose commit is absent. [`PruneOptions`] sets the roots, the bounds, and
     /// the dry run.
     ///
     /// The run reads five keys of the repository config, in this order:
@@ -608,8 +614,9 @@ impl Repo {
     ///
     /// The sweep removes the commits first and their content after them. For
     /// each commit, it writes the tombstone, unlinks the commit object, and
-    /// then unlinks its detached metadata. Next, it removes each detached
-    /// metadata whose commit is absent.
+    /// then unlinks its detached metadata and its composefs image. Next, it
+    /// removes each detached metadata and each composefs image whose commit is
+    /// absent.
     ///
     /// If `[core] fsync` is `true`, the run syncs the `objects/` directories
     /// that these removals changed before it removes the first dirtree,
@@ -852,6 +859,7 @@ impl Repo {
         if let Some(commit) = opts.delete_commit {
             all_objects.remove(&ObjectName::new(commit, ObjectType::Commit));
             all_objects.remove(&ObjectName::new(commit, ObjectType::CommitMeta));
+            all_objects.remove(&ObjectName::new(commit, ObjectType::ComposefsImage));
         }
         let global_bound = opts.global_bound();
         if !opts.roots_on_refs_alone() {
@@ -871,23 +879,21 @@ impl Repo {
             traverse_tree: !opts.commit_only,
             weak_roots,
         };
-        let mut keep = self
+        let keep = self
             .traverse_reachable_gc(roots, global_bound, &gc, &ref_targets, opts.delete_commit)
             .await?;
-        // A kept commit keeps its detached metadata.
-        let kept_commits: Vec<Checksum> = keep
-            .iter()
-            .filter(|name| name.ty == ObjectType::Commit)
-            .map(|name| name.checksum)
-            .collect();
-        for checksum in kept_commits {
-            keep.insert(ObjectName::new(checksum, ObjectType::CommitMeta));
-        }
+        // A kept commit keeps its sidecars: the detached metadata and the
+        // composefs image.
+        let kept = |o: &ObjectName| {
+            keep.contains(o)
+                || (o.ty.is_commit_sidecar()
+                    && keep.contains(&ObjectName::new(o.checksum, ObjectType::Commit)))
+        };
 
         // Each present object that the walk did not reach is a candidate,
         // except tombstone markers, which the `ostree` command never prunes.
         // `commit_only` narrows the candidates to commit objects and the
-        // detached metadata removed with one.
+        // sidecars removed with one.
         // The objects of the store less the reachable ones is the largest size
         // of the list, so one allocation holds it.
         let mut doomed: Vec<ObjectName> =
@@ -895,9 +901,9 @@ impl Repo {
         doomed.extend(
             all_objects
                 .iter()
-                .filter(|o| o.ty != ObjectType::TombstoneCommit && !keep.contains(o))
+                .filter(|o| o.ty != ObjectType::TombstoneCommit && !kept(o))
                 .filter(|o| {
-                    !opts.commit_only || matches!(o.ty, ObjectType::Commit | ObjectType::CommitMeta)
+                    !opts.commit_only || o.ty == ObjectType::Commit || o.ty.is_commit_sidecar()
                 })
                 .copied(),
         );
@@ -1019,8 +1025,9 @@ impl Repo {
         Ok(())
     }
 
-    /// Removes the object and the detached metadata of a named commit. If the
-    /// run writes tombstones, the tombstone comes first.
+    /// Removes the object and the sidecars of a named commit: the detached
+    /// metadata and the composefs image. If the run writes tombstones, the
+    /// tombstone comes first.
     ///
     /// The ref check runs again next to the unlink, so a ref published while
     /// the prune walked the store still refuses the deletion. If the run
@@ -1043,7 +1050,7 @@ impl Repo {
                 objects_fd,
                 &sweep,
                 &commit,
-                true,
+                |_| true,
                 &mut touched,
             )?;
             if sweep.fsync {
@@ -1117,12 +1124,17 @@ fn tombstone_tmp(repo: &Repo, sweep: &Sweep) -> Result<Option<OwnedFd>> {
     )?))
 }
 
+/// The sidecar types of a commit, in the order in which [`remove_commit`]
+/// unlinks them.
+const SIDECARS: [ObjectType; 2] = [ObjectType::CommitMeta, ObjectType::ComposefsImage];
+
 /// Removes one commit, in this order:
 ///
 /// 1. If `tmp_fd`, the open `tmp/` of the repository, is given, writes the
 ///    tombstone of the commit.
 /// 2. Unlinks the commit object.
-/// 3. If `meta` is true, unlinks its detached metadata.
+/// 3. Unlinks each sidecar of the commit whose type `sidecar` accepts, in the
+///    order of [`SIDECARS`]: the detached metadata, then the composefs image.
 ///
 /// The function adds to `touched` each `objects/` fanout directory in which it
 /// unlinked an entry, named relative to `objects/`.
@@ -1134,15 +1146,15 @@ fn tombstone_tmp(repo: &Repo, sweep: &Sweep) -> Result<Option<OwnedFd>> {
 /// commit is absent. The next run removes a marker that a failed or crashed
 /// run leaves.
 ///
-/// The commit goes before its detached metadata. Detached metadata with no
-/// commit is unreachable, and the next prune removes it. The reverse order
-/// leaves a commit with no signatures.
+/// The commit goes before its sidecars. A sidecar with no commit is
+/// unreachable, and the next prune removes it. The reverse order leaves a
+/// commit with no signatures or with no image.
 fn remove_commit(
     tmp_fd: Option<BorrowedFd<'_>>,
     objects_fd: BorrowedFd<'_>,
     sweep: &Sweep,
     commit: &Checksum,
-    meta: bool,
+    sidecar: impl Fn(ObjectType) -> bool,
     touched: &mut BTreeSet<String>,
 ) -> Result<()> {
     if let Some(tmp_fd) = tmp_fd {
@@ -1150,9 +1162,8 @@ fn remove_commit(
     }
     let commit_path = loose_path(commit, ObjectType::Commit, sweep.mode);
     let mut unlinked = unlink_optional(objects_fd, &commit_path)?;
-    if meta {
-        let meta_path = loose_path(commit, ObjectType::CommitMeta, sweep.mode);
-        unlinked |= unlink_optional(objects_fd, &meta_path)?;
+    for ty in SIDECARS.into_iter().filter(|ty| sidecar(*ty)) {
+        unlinked |= unlink_optional(objects_fd, &loose_path(commit, ty, sweep.mode))?;
     }
     if unlinked {
         touched.insert(objects_fanout(commit));
@@ -1191,9 +1202,9 @@ fn object_size(objects_fd: BorrowedFd<'_>, path: &str) -> Result<Option<u64>> {
 /// The sweep runs in two phases:
 ///
 /// 1. The commit phase removes each doomed commit with [`remove_commit`],
-///    together with its detached metadata if that is doomed too. Then it
-///    removes each doomed detached metadata whose commit the phase did not
-///    remove.
+///    together with each of its sidecars -- the detached metadata and the
+///    composefs image -- that is doomed too. Then it removes each doomed
+///    sidecar whose commit the phase did not remove.
 /// 2. The content phase removes every other doomed object, in any order.
 ///
 /// If the run syncs, the sweep syncs the `objects/` directories that the
@@ -1202,9 +1213,9 @@ fn object_size(objects_fd: BorrowedFd<'_>, path: &str) -> Result<Option<u64>> {
 /// the run does not sync, a crash gives no guarantee of which removals reached
 /// the disk, in which order. The sweep removes no `.commitpartial` marker.
 ///
-/// The sweep stats each doomed object before its unlink. The detached metadata
-/// that the commit phase removes with its commit is the exception, and neither
-/// number counts it. The sweep skips an object that is already absent at its
+/// The sweep stats each doomed object before its unlink. A sidecar that the
+/// commit phase removes with its commit is the exception. Neither number
+/// counts a sidecar. The sweep skips an object that is already absent at its
 /// stat and counts it in neither number.
 fn sweep_blocking(repo: &Repo, sweep: &Sweep, doomed: &[ObjectName]) -> Result<(usize, u64)> {
     let objects_fd = repo.objects_fd();
@@ -1218,10 +1229,10 @@ fn sweep_blocking(repo: &Repo, sweep: &Sweep, doomed: &[ObjectName]) -> Result<(
     };
 
     // The commit phase.
-    let doomed_meta: HashSet<Checksum> = doomed
+    let doomed_sidecars: HashSet<ObjectName> = doomed
         .iter()
-        .filter(|o| o.ty == ObjectType::CommitMeta)
-        .map(|o| o.checksum)
+        .filter(|o| o.ty.is_commit_sidecar())
+        .copied()
         .collect();
     let mut touched = BTreeSet::new();
     let mut removed_commits = HashSet::new();
@@ -1235,24 +1246,22 @@ fn sweep_blocking(repo: &Repo, sweep: &Sweep, doomed: &[ObjectName]) -> Result<(
             continue;
         };
         if !sweep.no_prune {
-            let meta = doomed_meta.contains(&name.checksum);
             remove_commit(
                 tmp.as_ref().map(AsFd::as_fd),
                 objects_fd,
                 sweep,
                 &name.checksum,
-                meta,
+                |ty| doomed_sidecars.contains(&ObjectName::new(name.checksum, ty)),
                 &mut touched,
             )?;
         }
         removed_commits.insert(name.checksum);
         tally(name.ty, size);
     }
-    // Detached metadata whose commit is absent, which no commit removal took
-    // with it.
+    // Sidecars whose commit is absent, which no commit removal took with it.
     for name in doomed
         .iter()
-        .filter(|o| o.ty == ObjectType::CommitMeta && !removed_commits.contains(&o.checksum))
+        .filter(|o| o.ty.is_commit_sidecar() && !removed_commits.contains(&o.checksum))
     {
         let path = name.loose_path(sweep.mode);
         let Some(size) = object_size(objects_fd, &path)? else {
@@ -1272,7 +1281,7 @@ fn sweep_blocking(repo: &Repo, sweep: &Sweep, doomed: &[ObjectName]) -> Result<(
     // The content phase.
     for name in doomed
         .iter()
-        .filter(|o| !matches!(o.ty, ObjectType::Commit | ObjectType::CommitMeta))
+        .filter(|o| o.ty != ObjectType::Commit && !o.ty.is_commit_sidecar())
     {
         let path = name.loose_path(sweep.mode);
         let Some(size) = object_size(objects_fd, &path)? else {

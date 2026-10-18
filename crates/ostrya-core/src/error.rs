@@ -21,7 +21,8 @@ pub enum Error {
     InvalidChecksum(&'static str),
     /// A base64 string with an invalid character or a truncated group.
     InvalidBase64(&'static str),
-    /// An object-type number that names no known type.
+    /// An object-type number that names no known type, or names a type that
+    /// the encoding does not allow.
     InvalidObjectType(u32),
     /// A LEB128 varint that is truncated, overflows 64 bits, or is not minimal.
     InvalidVarint(&'static str),

@@ -67,6 +67,12 @@ Ostrya adds these functions, which the `ostree` command does not have:
   metadata refuses a value that a prune cannot read.
 - The `bare-user-shared` mode, for development. It is `bare-user` storage
   with the fixed file mode 0644, for a repository that one group shares.
+- composefs image objects. `ostrya commit --generate-composefs` and
+  `ostrya composefs-image --add` store the composefs image of a commit in the
+  repository, as `objects/<xx>/<commit>.cfs`. The fs-verity digest of the
+  image is the digest that the commit records. `ostrya composefs-image`
+  also checks a stored image and prints its path. Prune removes the image
+  with its commit, and fsck checks it.
 - Library functions: a staging tree with a tree merge, and the import of an
   overlay changeset.
 
@@ -77,8 +83,9 @@ the protocols of these functions.
 
 Ostrya and the `ostree` command use the same repository format. The `ostree`
 command reads each repository that Ostrya writes, and Ostrya reads each
-repository that the `ostree` command writes. The `bare-user-shared` mode is
-the one exception, because only Ostrya writes it.
+repository that the `ostree` command writes. The `bare-user-shared` mode and
+a repository that holds a composefs image object are the exceptions, because
+only Ostrya writes them.
 
 The `ostrya` command is functionally compatible with the `ostree` command. A
 command that `ostrya` carries takes the same option names and values, does the
@@ -119,7 +126,8 @@ The `ostrya` command has these subcommands:
 - `sign` and `summary`: sign and verify commits, and generate the summary.
 - `static-delta`: list, generate, apply, and index static deltas.
 - `prune` and `fsck`: delete unreachable objects and verify the repository.
-- `push`, `push-tree`, `receive`, `send`, and `serve`: the port extensions.
+- `composefs-image`, `push`, `push-tree`, `receive`, `send`, and `serve`: the
+  port extensions.
 
 Each subcommand has a man page, for example `ostrya-commit(1)`. The page
 `ostrya-repo(5)` describes the layout of a repository, and the page

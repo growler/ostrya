@@ -11,6 +11,8 @@ Verify object integrity and completeness across every commit.
 The command loads the commit of each ref, lists each commit in the store, and reads each object that these commits reach. Each object must be present, and its checksum must equal its name. The command skips each commit that has a \fB\%state/<commit>.commitpartial\fR marker, and prints the number of these commits.
 .PP
 The walk runs to its end and writes each finding on standard error. A ref to a missing commit, a missing dirtree, or a failed binding check ends the run early. If the command finds an error or skips a partial commit, it exits \%1.
+.PP
+After the walk, the command checks each composefs image object against the key \fB\%ostree.composefs.digest.v0\fR of its commit. A faulty image is an error, and \%\-\-delete removes it: an image whose digest is not the key, an image that does not read, and an image whose commit has no key or a malformed key. If the commit of an image does not load, the command reports an error and keeps the image. An image whose commit is absent gets one line on standard output and is not an error.
 .SH OPTIONS
 .TP
 \fB\-\-no\-mark\-partial\fR

@@ -179,6 +179,11 @@ Store the composefs image digest of the tree in the commit metadata.
 .IP
 The key is \fB\%ostree.composefs.digest.v0\fR, and the value is the \%fs\-verity digest of the image as a byte array. The value depends on the committed tree alone. \fB\%archive\fR, \fB\%bare\fR, and \fB\%bare\-user\fR commit the same tree and give the same digest. \fB\%bare\-user\-only\fR canonicalizes the tree, so it can give another digest. It replaces a value that \%\-\-add\-metadata\-string, \%\-\-add\-metadata, or \%\-\-keep\-metadata gives for the same key.
 .TP
+\fB\-\-generate\-composefs\fR
+Store the composefs image of the tree with the commit.
+.IP
+The option turns on \%\-\-generate\-composefs\-metadata. The image is the object \fB\%objects/<xx>/<commit>.cfs\fR of the repository, and its \%fs\-verity digest is the value of \fB\%ostree.composefs.digest.v0\fR\&. The command reads the tree one time for the digest and the image. This option is an extension of ostrya.
+.TP
 \fB\-\-tree\fR \fIdir=PATH or tar=TARFILE or ref=COMMIT\fR
 Add a tree source: a directory, a tar archive, or a committed tree.
 .IP

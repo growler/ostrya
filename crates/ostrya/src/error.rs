@@ -518,6 +518,24 @@ pub enum Error {
         /// The target commit.
         to: Checksum,
     },
+    /// A composefs image whose fs-verity digest is not the value of the
+    /// `ostree.composefs.digest.v0` key of its commit.
+    ///
+    /// A write of an image refuses the image with this error and installs
+    /// nothing.
+    #[error(
+        "composefs image of commit {commit}: the commit records the digest {}, the image has {}",
+        crate::composefs::digest_hex(.expected),
+        crate::composefs::digest_hex(.actual)
+    )]
+    ComposefsDigestMismatch {
+        /// The commit of the image.
+        commit: Checksum,
+        /// The digest that the commit records.
+        expected: [u8; 32],
+        /// The fs-verity digest of the image.
+        actual: [u8; 32],
+    },
 }
 
 impl From<rustix::io::Errno> for Error {

@@ -55,6 +55,9 @@ pub fn pack_entry(entry: &SizeEntry, out: &mut Vec<u8>) {
 /// - [`Error::InvalidVarint`] if a size is not a valid varint.
 ///   [`varint::decode`] lists the reasons.
 /// - [`Error::InvalidObjectType`] if the type byte is not in the range 1 to 9.
+///   The value 100 of [`ObjectType::ComposefsImage`] is refused too: an
+///   `ostree.sizes` entry names the objects of the commit, and the image is
+///   not one of them.
 /// - [`Error::InvalidSizeEntry`] with the reason `entry has trailing bytes` if
 ///   more than one byte follows the two sizes.
 pub fn unpack_entry(buf: &[u8]) -> Result<SizeEntry> {
@@ -69,7 +72,12 @@ pub fn unpack_entry(buf: &[u8]) -> Result<SizeEntry> {
     pos += m;
     let objtype = match buf.len() - pos {
         0 => None,
-        1 => Some(ObjectType::from_u32(u32::from(buf[pos]))?),
+        1 => match ObjectType::from_u32(u32::from(buf[pos]))? {
+            ObjectType::ComposefsImage => {
+                return Err(Error::InvalidObjectType(u32::from(buf[pos])));
+            }
+            ty => Some(ty),
+        },
         _ => return Err(Error::InvalidSizeEntry("entry has trailing bytes")),
     };
     Ok(SizeEntry {
@@ -151,6 +159,25 @@ mod tests {
         assert!(matches!(
             unpack_entry(&buf),
             Err(Error::InvalidSizeEntry("entry has trailing bytes"))
+        ));
+    }
+
+    #[test]
+    fn rejects_the_composefs_image_type() {
+        let mut buf = Vec::new();
+        pack_entry(
+            &SizeEntry {
+                checksum: csum(0x03),
+                compressed: 5,
+                unpacked: 6,
+                objtype: None,
+            },
+            &mut buf,
+        );
+        buf.push(100);
+        assert!(matches!(
+            unpack_entry(&buf),
+            Err(Error::InvalidObjectType(100))
         ));
     }
 

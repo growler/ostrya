@@ -608,12 +608,13 @@ fn missing_sends_batches_of_max_have() {
 
 /// The object types that neither `Have` nor the object stream of a client
 /// carries.
-const OFF_WIRE: [ObjectType; 5] = [
+const OFF_WIRE: [ObjectType; 6] = [
     ObjectType::TombstoneCommit,
     ObjectType::CommitMeta,
     ObjectType::PayloadLink,
     ObjectType::FileXattrs,
     ObjectType::FileXattrsLink,
+    ObjectType::ComposefsImage,
 ];
 
 #[test]

@@ -121,7 +121,9 @@ pub use checkout::{CheckoutFilterFn, CheckoutMode, CheckoutOptions, OverwriteMod
 #[doc(hidden)]
 pub use commit::CommitOptions;
 #[doc(hidden)]
-pub use composefs::{ComposefsOptions, VerityPolicy};
+pub use composefs::{
+    ComposefsImageAdd, ComposefsImageState, ComposefsOptions, StagedComposefsImage, VerityPolicy,
+};
 #[doc(hidden)]
 pub use config::{
     MinFreeSpace, Remote, RepoConfig, SignVerify, SizeSpec, SizeUnit, Tristate, valid_remote_name,
@@ -144,8 +146,8 @@ pub use fetch::{
 pub use file::{ContentReader, FileKind, FileObject};
 #[doc(hidden)]
 pub use fsck::{
-    FsckBindingError, FsckBindingErrorKind, FsckError, FsckErrorKind, FsckFailure, FsckOptions,
-    FsckPhase, FsckReport,
+    FsckBindingError, FsckBindingErrorKind, FsckError, FsckErrorKind, FsckFailure, FsckImageError,
+    FsckImageErrorKind, FsckOptions, FsckPhase, FsckReport,
 };
 #[cfg(feature = "sign-gpg")]
 #[doc(hidden)]

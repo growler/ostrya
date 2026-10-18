@@ -520,8 +520,8 @@ The command exists and the matrix exercises an option it does not accept.
 `--base=REV`, `--tree=dir=PATH or tar=TARFILE or ref=COMMIT`, `--consume`,
 `--tar-autocreate-parents`, `--tar-pathname-filter=REGEX,REPLACEMENT`,
 `--gpg-sign=KEY-ID`, `--gpg-homedir=HOMEDIR`, `--sign=KEY_ID`,
-`--sign-from-file=PATH`, `--sign-type=NAME`, and the port extension
-`--tag=NAME`.
+`--sign-from-file=PATH`, `--sign-type=NAME`, and the port extensions
+`--tag=NAME` and `--generate-composefs`.
 Missing:
 `--selinux-policy=PATH`, `-P/--selinux-policy-from-base`,
 `--selinux-labeling-epoch`.
@@ -3852,9 +3852,10 @@ it. Cookie-jar support needs its own design pass against that refusal.
 
 ## Port extensions with no counterpart in the tool
 
-The tool has no push, no pull over ssh, and no server. `receive`, `push`,
-`push-tree`, `serve`, and `send` are commands of the port alone, so no
-matrix cell compares them with the tool. `pull`, `remote refs`, and `remote
+The tool has no push, no pull over ssh, no server, and no composefs image
+object. `receive`, `push`, `push-tree`, `serve`, `send`, and
+`composefs-image` are commands of the port alone, so no matrix cell compares
+them with the tool. `pull`, `remote refs`, and `remote
 summary` also read a remote over ssh, for an ssh address in the `pull-url`
 key or in `--url` of `pull` (`pull`). The receiving repository stays a
 normal repository: the tool reads it, checks it with `ostree fsck`, and
@@ -4522,6 +4523,57 @@ ostrya send [--repo=PATH] [--client=NAME]
   holds two keys.
 - `crates/ostrya/tests/send.rs` and `crates/ostrya-cli/tests/send.rs` hold
   the tests.
+
+### `composefs-image`
+
+```text
+ostrya composefs-image [--repo=PATH] (--add=REV | --get-path=REV | --check=REV)
+```
+
+- The command takes no feature. It takes exactly one of `--add`,
+  `--get-path`, and `--check`. With none or with two, the option parser
+  writes the usage text and the error, and the command exits 1.
+- `--add` builds the composefs image of the commit and stores it as
+  `objects/<xx>/<commit>.cfs`. The commit must carry
+  `ostree.composefs.digest.v0`. A commit without the key, or with a value
+  that is not an `ay` of 32 bytes, gets `error: MESSAGE` at exit 1, and the
+  command stores nothing. The command checks the digest of the image
+  against the key before it installs the image. A valid stored image stays,
+  and an image whose digest is not the key or that does not read is
+  replaced. A partial commit is
+  not refused, and the build fails if an object of its tree is absent. On
+  success the command writes nothing.
+- `--get-path` prints the absolute path of the image, also for a relative
+  `--repo`. It does not read the image. If the image is absent, the command
+  writes `error: commit CHECKSUM has no composefs image` and exits 1.
+- `--check` reads the whole image and computes its fs-verity digest. It
+  writes nothing and exits 0 if the digest is the key. It writes one
+  `error:` line and exits 1 if the image is absent, if the commit does not
+  carry the key, or if the digests are different. The line for different
+  digests names both digests.
+- `commit --generate-composefs` stores the image with a new commit. The
+  option turns on `--generate-composefs-metadata`, so the commit is the
+  commit that the tool writes with `--generate-composefs-metadata`. The tool
+  refuses `--generate-composefs` as an unknown option.
+- The tool has no image object. A repository that holds an image is a port
+  repository, and the cross-checks with the tool run on repositories with
+  no image. `../format-reference.md`, "The composefs image object", states
+  the object.
+- `prune` removes an image with its commit and removes an image whose
+  commit is absent. No count of its output includes an image.
+- `fsck` checks each image against the key of its commit after the object
+  walk. For an image whose digest is not the key, an image that does not
+  read, or an image whose commit has no key or a malformed key, it writes
+  one `composefs image of commit CHECKSUM: REASON` line to standard error,
+  and the run ends with `error: Repository corruption encountered` at exit
+  1. `--delete` unlinks such an image, and no image marks a commit as
+  partial. If the commit of an image is present and does not load, `fsck`
+  writes the same line and keeps the image. For an image whose commit is
+  absent, it writes `Composefs image with no commit: CHECKSUM` to standard
+  output, and this line is not an error. A repository with no image gets
+  none of these lines.
+- `crates/ostrya/tests/composefs_image.rs` and
+  `crates/ostrya-cli/tests/cli.rs` hold the tests.
 
 ### ssh access with `authorized_keys`
 

@@ -14,6 +14,7 @@ use std::time::{Duration, Instant};
 
 use futures_io::AsyncWrite;
 
+pub mod composefs;
 pub mod modes;
 pub mod pipe;
 #[cfg(feature = "receive")]

@@ -11,10 +11,33 @@
 //!
 //! [`ComposefsOptions`] and [`VerityPolicy`] select the verity form of the
 //! image.
+//!
+//! # The image object
+//!
+//! A repository can store the image of a commit as an object of the type
+//! [`ObjectType::ComposefsImage`], at `objects/<xx>/<commit>.cfs`. The object
+//! is a sidecar of the commit, as the detached metadata is. Its name is the
+//! checksum of the commit, and its bytes are the image that an export with
+//! [`ComposefsOptions::RECORDED`] writes. So its fs-verity digest is the value
+//! of the `ostree.composefs.digest.v0` key of the commit.
+//!
+//! - [`Transaction::build_composefs_image`] writes the image of a tree to the
+//!   staging directory, and [`Transaction::attach_composefs_image`] stages it
+//!   as the image of a commit.
+//! - [`Transaction::write_composefs_image`] stages the image of a commit in
+//!   one call.
+//! - [`Repo::add_composefs_image`] stores the image of a commit in its own
+//!   transaction.
+//! - [`Repo::check_composefs_image`] compares a stored image with the key of
+//!   its commit, and [`Repo::composefs_image_path`] gives its path.
+//!
+//! Each write refuses a commit without the key and an image whose digest is
+//! not the key. A write never holds the whole image in memory.
 
 use std::future::Future;
 use std::io::BufWriter;
-use std::os::fd::{BorrowedFd, OwnedFd};
+use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
+use std::path::PathBuf;
 use std::pin::Pin;
 
 use ostrya_composefs::{
@@ -31,6 +54,7 @@ use crate::file::{FileKind, FileObject};
 use crate::repo::Repo;
 use crate::transaction::Transaction;
 use crate::tree::RepoTree;
+use crate::write::{ImageTemp, discard_image_temp, link_image_blocking, write_image_temp_blocking};
 
 /// The empty top-level directories that the `ostree` command adds to each
 /// exported image.
@@ -43,7 +67,7 @@ const COMPOSEFS_DIGEST_KEY: &str = "ostree.composefs.digest.v0";
 /// The GVariant type of the digest value, a 32-byte `ay`.
 const DIGEST_SIGNATURE: &str = "ay";
 /// The size of each chunk that the hasher reads from a backing object.
-const DIGEST_CHUNK: usize = 128 * 1024;
+pub(crate) const DIGEST_CHUNK: usize = 128 * 1024;
 /// The bytes that one xattr spends from the composefs xattr budget of an
 /// inode, in addition to its name and its value.
 const XATTR_ENTRY_COST: usize = 7;
@@ -155,7 +179,104 @@ impl ComposefsOptions {
     };
 }
 
-/// Methods that compute the composefs digest of a staged tree.
+/// The result of a write of the composefs image of a commit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComposefsImageAdd {
+    /// The repository holds no image of the commit. The write adds one.
+    Added,
+    /// The repository holds an image of the commit, and its digest is the key
+    /// of the commit. The write changes nothing.
+    ///
+    /// An image that the same transaction staged before gives this result
+    /// too.
+    AlreadyValid,
+    /// The repository holds an image of the commit, and its digest is not the
+    /// key of the commit or the image does not read. The write replaces it.
+    Replaced,
+}
+
+/// The state of the stored composefs image of a commit, as
+/// [`Repo::check_composefs_image`] gives it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ComposefsImageState {
+    /// The image is present, and its fs-verity digest is the key of the
+    /// commit.
+    Valid,
+    /// The commit carries the key, and the repository holds no image of it.
+    Absent,
+    /// The commit does not carry `ostree.composefs.digest.v0`.
+    ///
+    /// The call does not look for an image in this state.
+    NoKey,
+    /// The image is present, and its fs-verity digest is not the key of the
+    /// commit.
+    Mismatch {
+        /// The digest that the commit records.
+        expected: [u8; 32],
+        /// The fs-verity digest of the stored image.
+        actual: [u8; 32],
+    },
+}
+
+/// A composefs image that a transaction wrote to its staging directory and
+/// that is not the image of a commit yet.
+///
+/// [`Transaction::build_composefs_image`] gives it, and
+/// [`Transaction::attach_composefs_image`] takes it. A drop removes the image
+/// file.
+pub struct StagedComposefsImage<'txn> {
+    txn: &'txn Transaction,
+    /// The image file. `None` after the attach took it.
+    image: Option<ImageTemp>,
+    digest: [u8; 32],
+}
+
+impl StagedComposefsImage<'_> {
+    /// Returns the fs-verity digest of the image.
+    ///
+    /// The value is the one that `ostree.composefs.digest.v0` holds for a
+    /// commit of the tree.
+    pub fn digest(&self) -> &[u8; 32] {
+        &self.digest
+    }
+}
+
+impl StagedComposefsImage<'_> {
+    /// Removes the image file on the blocking pool.
+    ///
+    /// If the call cannot hand the staging directory to the blocking pool, it
+    /// keeps the image file, and the drop removes it.
+    async fn discard(mut self) {
+        let Some(image) = self.image.take() else {
+            return;
+        };
+        match self.txn.staging_fd().try_clone_to_owned() {
+            Ok(staging) => {
+                ostrya_rt::unblock(move || discard_image_temp(staging.as_fd(), &image.temp)).await;
+            }
+            Err(_) => self.image = Some(image),
+        }
+    }
+}
+
+impl std::fmt::Debug for StagedComposefsImage<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StagedComposefsImage")
+            .field("digest", &digest_hex(&self.digest))
+            .finish_non_exhaustive()
+    }
+}
+
+impl Drop for StagedComposefsImage<'_> {
+    fn drop(&mut self) {
+        if let Some(image) = self.image.take() {
+            discard_image_temp(self.txn.staging_fd(), &image.temp);
+        }
+    }
+}
+
+/// Methods that compute the composefs digest of a staged tree and stage the
+/// composefs image of a commit.
 impl Transaction {
     /// Returns the composefs image digest of a tree that this transaction
     /// staged.
@@ -196,6 +317,232 @@ impl Transaction {
         )
         .await?;
         image_digest(dir).await
+    }
+
+    /// Writes the composefs image of a tree to the staging directory of this
+    /// transaction.
+    ///
+    /// The image is the image that an export with
+    /// [`ComposefsOptions::RECORDED`] writes for the same tree, so
+    /// [`StagedComposefsImage::digest`] is the value of
+    /// [`composefs_digest`](Transaction::composefs_digest). The call reads the
+    /// objects of the tree as `composefs_digest` reads them. A caller that
+    /// writes a new commit takes the digest for the key
+    /// `ostree.composefs.digest.v0` of the commit, writes the commit, and then
+    /// gives the image to [`attach_composefs_image`](Transaction::attach_composefs_image).
+    /// The tree is then read one time.
+    ///
+    /// The writer computes the fs-verity digest as it writes the image, and
+    /// it holds no image-sized buffer. The image file has the mode 0644. If
+    /// `[ex-integrity] fsverity` is not `no`, the call seals the file and
+    /// compares the digest that the kernel reads with the digest of the
+    /// writer. If the `fsync` and `per-object-fsync` values of the
+    /// transaction are both on, the call syncs the file. Each value comes from
+    /// [`set_fsync`](Transaction::set_fsync) or
+    /// [`set_per_object_fsync`](Transaction::set_per_object_fsync) if the
+    /// transaction has an override, and else from `[core] fsync` or
+    /// `[core] per-object-fsync`.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Unsupported`] if the repository mode is `bare-split-xattrs`.
+    /// - The errors of [`composefs_digest`](Transaction::composefs_digest).
+    /// - [`Error::Unsupported`] if `[ex-integrity] fsverity` is `yes` and the
+    ///   seal fails.
+    /// - [`Error::InvalidFormat`] if the digest that the kernel reads for the
+    ///   sealed file is not the digest of the writer.
+    /// - [`Error::Core`] if `[core] fsync` or `[core] per-object-fsync` in the
+    ///   repository config is malformed.
+    /// - [`Error::InvalidFormat`] if `[ex-integrity] fsverity` in the
+    ///   repository config is malformed.
+    /// - [`Error::Io`] if a write to the image file or another file system
+    ///   operation fails.
+    pub async fn build_composefs_image(&self, root: &RepoTree) -> Result<StagedComposefsImage<'_>> {
+        if self.repo().mode() == RepoMode::BareSplitXattrs {
+            return Err(Error::Unsupported(
+                "bare-split-xattrs is read-only; the port does not write it".into(),
+            ));
+        }
+        let (fsync, per_object_fsync) = self.fsync_flags()?;
+        let verity = self.repo().config().fsverity()?;
+        let dir = composefs_model(
+            ObjectSource::Staged(self),
+            root,
+            &ComposefsOptions::RECORDED,
+        )
+        .await?;
+        let staging = self.staging_fd().try_clone_to_owned()?;
+        let image = ostrya_rt::unblock(move || {
+            write_image_temp_blocking(staging.as_fd(), &dir, fsync && per_object_fsync, verity)
+        })
+        .await?;
+        Ok(StagedComposefsImage {
+            txn: self,
+            digest: image.digest,
+            image: Some(image),
+        })
+    }
+
+    /// Stages `image` as the composefs image of `commit`.
+    ///
+    /// The commit comes from the staged set of this transaction, or else from
+    /// `objects/`. The call checks the digest of the image against the key
+    /// `ostree.composefs.digest.v0` of the commit, and refuses a mismatch. It
+    /// then compares the stored image of the commit with the key, if the
+    /// repository holds one. The call streams the stored image through the
+    /// fs-verity hasher.
+    ///
+    /// - With no stored image, the call stages the image and returns
+    ///   [`ComposefsImageAdd::Added`].
+    /// - With a stored image whose digest is the key, the call drops the image
+    ///   and returns [`ComposefsImageAdd::AlreadyValid`].
+    /// - With a stored image whose digest is not the key, or a stored image
+    ///   that does not read, the call stages the image and returns
+    ///   [`ComposefsImageAdd::Replaced`].
+    ///
+    /// If the call does not stage the image, it removes the image file.
+    ///
+    /// [`commit`](Transaction::commit) publishes a staged image after all the
+    /// other objects of the transaction. Its rename replaces the stored image
+    /// in one step. The image is a sidecar of the commit, so no field of
+    /// [`TransactionStats`](crate::TransactionStats) counts it, and
+    /// `ostree.sizes` has no entry for it. The image takes its size from the
+    /// free-space budget of the transaction.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidInput`] if `image` comes from another transaction.
+    /// - [`Error::InvalidInput`] if the commit does not carry
+    ///   `ostree.composefs.digest.v0`.
+    /// - [`Error::InvalidFormat`] if the first entry of that key is not a
+    ///   variant of type `ay` with 32 bytes.
+    /// - [`Error::ComposefsDigestMismatch`] if the digest of the image is not
+    ///   the value of the key.
+    /// - [`Error::ObjectNotFound`] if the commit object is not staged and not
+    ///   in the object store.
+    /// - [`Error::Core`] if the commit object does not parse.
+    /// - [`Error::InsufficientFreeSpace`] if the image needs more space than
+    ///   the free-space budget of the transaction holds.
+    /// - [`Error::Io`] if a file system operation fails, or if the commit
+    ///   object is larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
+    pub async fn attach_composefs_image(
+        &self,
+        commit: &Checksum,
+        image: StagedComposefsImage<'_>,
+    ) -> Result<ComposefsImageAdd> {
+        if !std::ptr::eq(image.txn, self) {
+            image.discard().await;
+            return Err(Error::InvalidInput(
+                "the composefs image comes from another transaction".into(),
+            ));
+        }
+        let checked = async {
+            let commit_obj = self.load_commit_staged_first(commit).await?;
+            let key = require_recorded_digest(&commit_obj, commit)?;
+            check_image_digest(commit, &key, &image)?;
+            self.image_state(commit, &key).await
+        }
+        .await;
+        self.finish_attach(commit, checked, image).await
+    }
+
+    /// Builds and stages the composefs image of `commit`.
+    ///
+    /// The call runs [`build_composefs_image`](Transaction::build_composefs_image)
+    /// over the root of the commit and
+    /// [`attach_composefs_image`](Transaction::attach_composefs_image) with
+    /// the result. If the repository holds a valid image of the commit
+    /// already, the call builds nothing and returns
+    /// [`ComposefsImageAdd::AlreadyValid`].
+    ///
+    /// The call does not refuse a partial commit. If an object of the tree is
+    /// absent, the build fails.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidInput`] if the commit does not carry
+    ///   `ostree.composefs.digest.v0`.
+    /// - [`Error::ComposefsDigestMismatch`] if the image of the tree does not
+    ///   have the digest that the commit records.
+    /// - The errors of
+    ///   [`build_composefs_image`](Transaction::build_composefs_image) and of
+    ///   [`attach_composefs_image`](Transaction::attach_composefs_image).
+    pub async fn write_composefs_image(&self, commit: &Checksum) -> Result<ComposefsImageAdd> {
+        let commit_obj = self.load_commit_staged_first(commit).await?;
+        let key = require_recorded_digest(&commit_obj, commit)?;
+        let Some(result) = self.image_state(commit, &key).await? else {
+            return Ok(ComposefsImageAdd::AlreadyValid);
+        };
+        let tree = RepoTree::from_parts(
+            self.repo().clone(),
+            commit_obj.root_dirtree,
+            commit_obj.root_dirmeta,
+        );
+        let image = self.build_composefs_image(&tree).await?;
+        let checked = check_image_digest(commit, &key, &image).map(|()| Some(result));
+        self.finish_attach(commit, checked, image).await
+    }
+
+    /// Stages `image` as the composefs image of `commit` after the checks of
+    /// [`attach_composefs_image`](Transaction::attach_composefs_image).
+    ///
+    /// `checked` is the result of the checks, as
+    /// [`image_state`](Transaction::image_state) gives it. On `Ok(Some(_))`,
+    /// the call links the image into the staging directory and returns the
+    /// result. On `Ok(None)` or `Err`, it removes the image file and returns
+    /// [`ComposefsImageAdd::AlreadyValid`] or the error.
+    async fn finish_attach(
+        &self,
+        commit: &Checksum,
+        checked: Result<Option<ComposefsImageAdd>>,
+        mut image: StagedComposefsImage<'_>,
+    ) -> Result<ComposefsImageAdd> {
+        let result = match checked {
+            Ok(Some(result)) => result,
+            Ok(None) => {
+                image.discard().await;
+                return Ok(ComposefsImageAdd::AlreadyValid);
+            }
+            Err(e) => {
+                image.discard().await;
+                return Err(e);
+            }
+        };
+        let staging = self.staging_fd().try_clone_to_owned()?;
+        let temp = image
+            .image
+            .take()
+            .expect("a staged composefs image holds its file until attached");
+        let mode = self.repo().mode();
+        let key = *commit;
+        let outcome =
+            ostrya_rt::unblock(move || link_image_blocking(staging.as_fd(), temp, &key, mode))
+                .await?;
+        self.record_image(*commit, outcome)?;
+        Ok(result)
+    }
+
+    /// Returns the result that a write of a valid image of `commit` gives:
+    /// `None` if the transaction staged an image of the commit or the
+    /// repository holds a valid one, so the write changes nothing.
+    ///
+    /// A stored image that does not read gives
+    /// [`ComposefsImageAdd::Replaced`], so the rename of the publish replaces
+    /// it.
+    async fn image_state(
+        &self,
+        commit: &Checksum,
+        key: &[u8; 32],
+    ) -> Result<Option<ComposefsImageAdd>> {
+        if self.is_staged(commit, ObjectType::ComposefsImage) {
+            return Ok(None);
+        }
+        Ok(match self.repo().stored_image_digest(commit).await {
+            Ok(None) => Some(ComposefsImageAdd::Added),
+            Ok(Some(digest)) if digest == *key => None,
+            Ok(Some(_)) | Err(Error::Io(_)) => Some(ComposefsImageAdd::Replaced),
+            Err(e) => return Err(e),
+        })
     }
 }
 
@@ -461,6 +808,189 @@ impl Repo {
         let bytes = commit_obj.serialize()?;
         txn.write_metadata(ObjectType::Commit, None, &bytes).await
     }
+
+    /// Builds and stores the composefs image of `commit`.
+    ///
+    /// The call begins a transaction before it reads the commit, runs
+    /// [`Transaction::write_composefs_image`], and commits the transaction.
+    /// The transaction holds the repository lock shared, so a prune cannot
+    /// remove the commit or its objects during the build. The transaction
+    /// applies the fsync policy, the fs-verity seal, and the free-space budget
+    /// of the repository. If the call fails, it stores nothing.
+    ///
+    /// The commit must carry `ostree.composefs.digest.v0`.
+    /// [`commit_add_composefs_metadata`](Repo::commit_add_composefs_metadata)
+    /// writes a commit with the key and does not store the image.
+    ///
+    /// # Errors
+    ///
+    /// - The errors of [`Repo::transaction`].
+    /// - The errors of [`Transaction::write_composefs_image`].
+    /// - The errors of [`Transaction::commit`].
+    pub async fn add_composefs_image(&self, commit: &Checksum) -> Result<ComposefsImageAdd> {
+        let txn = self.transaction().await?;
+        let result = txn.write_composefs_image(commit).await?;
+        txn.commit().await?;
+        Ok(result)
+    }
+
+    /// Returns the path of the composefs image object of `commit`.
+    ///
+    /// The path is [`path`](Repo::path) joined with
+    /// `objects/<xx>/<rest>.cfs`. The call does no I/O, so the image need not
+    /// exist. A relative [`path`](Repo::path) gives a relative result.
+    pub fn composefs_image_path(&self, commit: &Checksum) -> PathBuf {
+        self.path().join("objects").join(loose_path(
+            commit,
+            ObjectType::ComposefsImage,
+            self.mode(),
+        ))
+    }
+
+    /// Compares the stored composefs image of `commit` with the key
+    /// `ostree.composefs.digest.v0` of the commit.
+    ///
+    /// The call streams the image through the fs-verity hasher in chunks of
+    /// 128 KiB. It does not read the digest of a sealed image from the kernel.
+    /// [`ComposefsImageState`] lists the results.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::ObjectNotFound`] if the commit object is not in the object
+    ///   store.
+    /// - [`Error::Core`] if the commit object does not parse.
+    /// - [`Error::InvalidFormat`] if the first entry of
+    ///   `ostree.composefs.digest.v0` is not a variant of type `ay` with 32
+    ///   bytes.
+    /// - [`Error::Io`] if a read of the image or another file system operation
+    ///   fails, or if the commit object is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
+    pub async fn check_composefs_image(&self, commit: &Checksum) -> Result<ComposefsImageState> {
+        let bytes = self.load_object_bytes(ObjectType::Commit, commit).await?;
+        let commit_obj = Commit::parse(&bytes)?;
+        let Some(expected) = recorded_digest(&commit_obj)? else {
+            return Ok(ComposefsImageState::NoKey);
+        };
+        Ok(match self.stored_image_digest(commit).await? {
+            None => ComposefsImageState::Absent,
+            Some(actual) if actual == expected => ComposefsImageState::Valid,
+            Some(actual) => ComposefsImageState::Mismatch { expected, actual },
+        })
+    }
+
+    /// Returns the fs-verity digest of the stored composefs image of
+    /// `commit`, or `None` if the repository holds no image of it.
+    ///
+    /// The call streams the image on the blocking pool, as
+    /// [`stored_image_digest_blocking`] does.
+    pub(crate) async fn stored_image_digest(&self, commit: &Checksum) -> Result<Option<[u8; 32]>> {
+        let repo = self.clone();
+        let commit = *commit;
+        ostrya_rt::unblock(move || {
+            stored_image_digest_blocking(repo.objects_fd(), &commit, repo.mode())
+        })
+        .await
+    }
+}
+
+/// Returns the fs-verity digest of the stored composefs image of `commit`
+/// under `objects_fd`, or `None` if the image is absent.
+///
+/// The function reads the image in chunks of 128 KiB and feeds each chunk to
+/// the fs-verity hasher, so it holds no image-sized buffer.
+pub(crate) fn stored_image_digest_blocking(
+    objects_fd: BorrowedFd<'_>,
+    commit: &Checksum,
+    mode: RepoMode,
+) -> Result<Option<[u8; 32]>> {
+    use std::io::Read;
+
+    let path = loose_path(commit, ObjectType::ComposefsImage, mode);
+    let fd = match rustix::fs::openat(
+        objects_fd,
+        path.as_str(),
+        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW,
+        rustix::fs::Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(rustix::io::Errno::NOENT) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    let mut file = std::fs::File::from(fd);
+    let mut hasher = FsVerityHasher::new();
+    let mut buf = vec![0u8; DIGEST_CHUNK];
+    loop {
+        match file.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => hasher.update(&buf[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(e) => return Err(Error::Io(e)),
+        }
+    }
+    Ok(Some(hasher.finalize()))
+}
+
+/// Returns the digest that `commit` records under
+/// `ostree.composefs.digest.v0`, or `None` if the commit does not carry the
+/// key.
+///
+/// The value is the first entry of the key. It must be a variant of type `ay`
+/// with 32 bytes, or the call fails with [`Error::InvalidFormat`].
+pub(crate) fn recorded_digest(commit: &Commit) -> Result<Option<[u8; 32]>> {
+    let Some(entry) = commit.metadata.dict_get(COMPOSEFS_DIGEST_KEY) else {
+        return Ok(None);
+    };
+    entry
+        .as_variant()
+        .filter(|(ty, _)| ty.signature() == DIGEST_SIGNATURE)
+        .and_then(|(_, value)| value.as_bytes())
+        .and_then(|bytes| <[u8; 32]>::try_from(bytes).ok())
+        .map(Some)
+        .ok_or_else(|| {
+            Error::InvalidFormat(format!(
+                "the value of {COMPOSEFS_DIGEST_KEY} is not a variant of type \
+                 {DIGEST_SIGNATURE} with 32 bytes"
+            ))
+        })
+}
+
+/// Returns the digest that `commit_obj` records, as [`recorded_digest`] does.
+/// A commit without the key is refused with [`Error::InvalidInput`].
+fn require_recorded_digest(commit_obj: &Commit, commit: &Checksum) -> Result<[u8; 32]> {
+    recorded_digest(commit_obj)?.ok_or_else(|| {
+        Error::InvalidInput(format!(
+            "commit {commit} does not carry {COMPOSEFS_DIGEST_KEY}, so it has no composefs image"
+        ))
+    })
+}
+
+/// Refuses `image` with [`Error::ComposefsDigestMismatch`] if its digest is
+/// not `key`, the digest that `commit` records.
+fn check_image_digest(
+    commit: &Checksum,
+    key: &[u8; 32],
+    image: &StagedComposefsImage<'_>,
+) -> Result<()> {
+    if image.digest != *key {
+        return Err(Error::ComposefsDigestMismatch {
+            commit: *commit,
+            expected: *key,
+            actual: image.digest,
+        });
+    }
+    Ok(())
+}
+
+/// Returns the lowercase hex form of a 32-byte digest.
+pub(crate) fn digest_hex(digest: &[u8; 32]) -> String {
+    use std::fmt::Write;
+
+    digest
+        .iter()
+        .fold(String::with_capacity(64), |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
 }
 
 /// Builds the composefs tree model of `root` from the objects in `source`.
@@ -502,7 +1032,7 @@ async fn image_digest(dir: Directory) -> Result<[u8; 32]> {
 /// Returns the library error for an error of the writer. The writer holds the
 /// bounds that the image format states. The tree reaches these bounds, so a
 /// refusal of the writer is a refusal of the tree.
-fn writer_error(err: WriterError) -> Error {
+pub(crate) fn writer_error(err: WriterError) -> Error {
     match err {
         WriterError::Unsupported(msg) => Error::Unsupported(msg),
         WriterError::Io(err) => Error::Io(err),

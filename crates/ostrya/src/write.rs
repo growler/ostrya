@@ -1225,6 +1225,121 @@ pub(crate) fn stage_metadata_blocking(
     })
 }
 
+/// A composefs image in a temp file of the staging directory, not yet linked
+/// under its staging name.
+///
+/// [`write_image_temp_blocking`] makes it, and [`link_image_blocking`] links
+/// it.
+pub(crate) struct ImageTemp {
+    /// The descriptor that links an anonymous temp. It is read-only if the
+    /// image is sealed.
+    pub(crate) fd: OwnedFd,
+    /// The temp file.
+    pub(crate) temp: TempKind,
+    /// The fs-verity digest of the image bytes, which the writer computed as
+    /// it wrote them.
+    pub(crate) digest: [u8; 32],
+    /// The size of the image file in bytes.
+    pub(crate) size: u64,
+}
+
+/// Writes the composefs image of `dir` to a temp file in the staging
+/// directory.
+///
+/// The function runs these steps:
+///
+/// 1. It opens a temp file, as [`open_temp`] does.
+/// 2. It writes the image through a buffer of 128 KiB, and the writer
+///    computes the fs-verity digest of the bytes that it writes. No step holds
+///    the whole image.
+/// 3. It sets the mode 0644 with `fchmod`, so the umask does not change the
+///    mode. A seal needs write permission on the inode, and the mode gives it.
+/// 4. If `do_fsync` is set, it runs `fsync` on the file.
+/// 5. If `verity` is not [`Tristate::No`], it closes the writable descriptor,
+///    seals the file through a read-only descriptor, and reads the digest of
+///    the seal from the kernel. If the kernel digest is not the digest of the
+///    writer, the function fails. Under [`Tristate::Maybe`], a file that the
+///    file system did not seal has no kernel digest to compare.
+///
+/// On a failure, the function removes the temp file.
+pub(crate) fn write_image_temp_blocking(
+    staging_fd: BorrowedFd<'_>,
+    dir: &ostrya_composefs::Directory,
+    do_fsync: bool,
+    verity: Tristate,
+) -> Result<ImageTemp> {
+    let (fd, temp) = open_temp(staging_fd)?;
+    let pending = PendingTemp::new(staging_fd, temp);
+    let mut out =
+        std::io::BufWriter::with_capacity(crate::composefs::DIGEST_CHUNK, std::fs::File::from(fd));
+    let digest =
+        ostrya_composefs::write_image_to(dir, &mut out).map_err(crate::composefs::writer_error)?;
+    let file = out.into_inner().map_err(|e| Error::Io(e.into_error()))?;
+    rustix::fs::fchmod(file.as_fd(), Mode::from_raw_mode(FIXED_MODE))?;
+    if do_fsync {
+        rustix::fs::fsync(file.as_fd())?;
+    }
+    let size = size_of(file.as_fd())?;
+    let fd = if verity == Tristate::No {
+        OwnedFd::from(file)
+    } else {
+        let ro = reopen_ro(file.as_fd())?;
+        drop(file);
+        seal_regular(ro.as_fd(), verity)?;
+        match ostrya_sys::measure_verity(ro.as_fd()) {
+            Ok(sealed) if sealed != digest => {
+                return Err(Error::InvalidFormat(format!(
+                    "the fs-verity digest of the sealed composefs image is {}, and the \
+                     writer computed {}",
+                    crate::composefs::digest_hex(&sealed),
+                    crate::composefs::digest_hex(&digest)
+                )));
+            }
+            Ok(_) => {}
+            // `seal_regular` ignored the seal failure under `maybe`.
+            Err(_) if verity == Tristate::Maybe => {}
+            Err(e) => return Err(Error::Io(e.into())),
+        }
+        ro
+    };
+    Ok(ImageTemp {
+        fd,
+        temp: pending.into_inner(),
+        digest,
+        size,
+    })
+}
+
+/// Links a composefs image temp into the staging directory as the image of
+/// `commit`.
+///
+/// The function returns the outcome for the record of the object. The image
+/// is never a dedup hit: the caller decides if a stored image stays. On a
+/// failure, the function removes the temp file.
+pub(crate) fn link_image_blocking(
+    staging_fd: BorrowedFd<'_>,
+    image: ImageTemp,
+    commit: &Checksum,
+    mode: RepoMode,
+) -> Result<StageOutcome> {
+    let staging_name = flat_name(commit, ObjectType::ComposefsImage, mode);
+    materialize(staging_fd, image.fd.as_fd(), &image.temp, &staging_name)
+        .inspect_err(|_| cleanup_temp(staging_fd, &image.temp))?;
+    Ok(StageOutcome {
+        deduped: false,
+        on_disk_size: image.size,
+        blocks: Blocks::Written,
+        unpacked: 0,
+        staging_name,
+        dest: loose_path(commit, ObjectType::ComposefsImage, mode),
+    })
+}
+
+/// Removes the temp file of a composefs image that is not linked.
+pub(crate) fn discard_image_temp(staging_fd: BorrowedFd<'_>, temp: &TempKind) {
+    cleanup_temp(staging_fd, temp);
+}
+
 /// Imports one loose object of another repository into the staging directory.
 ///
 /// The function does not read the payload. It hardlinks the object, so the

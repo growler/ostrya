@@ -1,0 +1,33 @@
+.TH "OSTRYA\-COMPOSEFS\-IMAGE" "1" "" "ostrya" "User Commands"
+.SH NAME
+ostrya\-composefs\-image \- Store, locate, or check the composefs image of a commit
+.SH SYNOPSIS
+.nf
+ostrya composefs\-image [OPTIONS] <\-\-add <REV>|\-\-get\-path <REV>|\-\-check <REV>>
+.fi
+.SH DESCRIPTION
+Store, locate, or check the composefs image of a commit.
+.PP
+The image of a commit is the object \fB\%objects/<xx>/<commit>.cfs\fR\&. Its \%fs\-verity digest is the value of \fB\%ostree.composefs.digest.v0\fR in the metadata of the commit. The command takes exactly one of \%\-\-add, \%\-\-get\-path, and \%\-\-check.
+.PP
+\%\-\-add and \%\-\-check print nothing on success, and \%\-\-get\-path prints one line. If the action fails, the command writes one \fB\%error:\fR line to standard error and exits \%1. This command is an extension of ostrya.
+.SH OPTIONS
+.TP
+\fB\-\-add\fR \fIREV\fR
+Build and store the image of the commit REV.
+.IP
+The commit must carry \fB\%ostree.composefs.digest.v0\fR\&. The command builds the image of the tree, checks its digest against the key, and stores it. If a valid image is present already, the command does nothing. An image whose digest is not the key, or an image that does not read, is replaced. The command does not refuse a partial commit, and the build fails if an object of the tree is absent.
+.TP
+\fB\-\-get\-path\fR \fIREV\fR
+Print the absolute path of the image of the commit REV.
+.IP
+The command does not read the image. If the image is absent, the command exits \%1.
+.TP
+\fB\-\-check\fR \fIREV\fR
+Check the image of the commit REV against the key of the commit.
+.IP
+The command reads the whole image and computes its \%fs\-verity digest. It exits \%0 if the digest is the value of \fB\%ostree.composefs.digest.v0\fR\&. It exits \%1 if the image is absent, if the commit does not carry the key, or if the digests are different. The error line names the reason, and for different digests it names both digests.
+.PP
+The global options are listed in \fBostrya\fR(1).
+.SH SEE ALSO
+\fBostrya\fR(1)

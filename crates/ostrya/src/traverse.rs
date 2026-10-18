@@ -282,6 +282,11 @@ impl Repo {
     /// It also skips each entry of `objects/` that is not two hexadecimal
     /// characters, and each name that is not UTF-8.
     ///
+    /// The listing holds the sidecars of the commits too: each `.commitmeta`
+    /// object and each `.cfs` composefs image, of type
+    /// [`ObjectType::ComposefsImage`]. The checksum of a sidecar is the
+    /// checksum of its commit.
+    ///
     /// # Errors
     ///
     /// - [`Error::Io`] if the read of `objects/` or of a fanout directory
@@ -292,25 +297,32 @@ impl Repo {
         ostrya_rt::unblock(move || list_objects_blocking(repo.objects_fd())).await
     }
 
-    /// Returns the checksums of the loose objects of one type, in sorted order.
+    /// Returns the checksums of the commit objects and of the composefs image
+    /// objects, each in sorted order.
     ///
-    /// The listing is the listing of [`list_objects`](Repo::list_objects). It
-    /// reads the type from the extension of an entry before it parses the
-    /// name. So the method parses no name of another type.
-    pub(crate) async fn list_objects_of_type(&self, ty: ObjectType) -> Result<Vec<Checksum>> {
+    /// One listing pass of [`list_objects`](Repo::list_objects) gives both
+    /// lists. The pass reads the type from the extension of an entry before
+    /// it parses the name, so it parses no name of another type. A store with
+    /// no image gives an empty second list.
+    pub(crate) async fn list_commits_and_images(&self) -> Result<(Vec<Checksum>, Vec<Checksum>)> {
         let repo = self.clone();
-        let mut names = ostrya_rt::unblock(move || -> Result<Vec<Checksum>> {
-            let mut out = Vec::new();
+        let (mut commits, mut images) = ostrya_rt::unblock(move || -> Result<_> {
+            let mut commits = Vec::new();
+            let mut images = Vec::new();
             for_each_object(
                 repo.objects_fd(),
-                |candidate| candidate == ty,
-                |name| out.push(name.checksum),
+                |ty| matches!(ty, ObjectType::Commit | ObjectType::ComposefsImage),
+                |name| match name.ty {
+                    ObjectType::Commit => commits.push(name.checksum),
+                    _ => images.push(name.checksum),
+                },
             )?;
-            Ok(out)
+            Ok((commits, images))
         })
         .await?;
-        names.sort();
-        Ok(names)
+        commits.sort();
+        images.sort();
+        Ok((commits, images))
     }
 
     /// Returns the number of loose objects in `objects/` whose type `keep`
@@ -1264,6 +1276,25 @@ mod tests {
     /// Returns the reason that the decoder gives for `value`.
     fn reason(value: &Value) -> String {
         metadata_key_targets(value).unwrap_err()
+    }
+
+    /// A `.cfs` entry parses as the composefs image of the commit that has
+    /// the same checksum, and the `keep` filter applies to it.
+    #[test]
+    fn a_cfs_entry_parses_as_a_composefs_image() {
+        let hex = "b3c8e8525e8a5c3409bf6e6db5f5d656da77ae76d08cbc4f8b75b71879757a89";
+        let checksum = Checksum::from_hex(hex).unwrap();
+        let entry = format!("{}.cfs", &hex[2..]);
+        assert_eq!(
+            parse_object_entry(&hex[..2], &entry, &|_| true),
+            Some(ObjectName::new(checksum, ObjectType::ComposefsImage))
+        );
+        assert_eq!(
+            parse_object_entry(&hex[..2], &entry, &|ty| ty != ObjectType::ComposefsImage),
+            None
+        );
+        let type_str = format!("{}.composefs-image", &hex[2..]);
+        assert_eq!(parse_object_entry(&hex[..2], &type_str, &|_| true), None);
     }
 
     #[test]

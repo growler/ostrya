@@ -81,6 +81,9 @@ superblock meta-entry, and in a superblock fallback entry.
 
 The is-meta predicate is `t` in 2..=6, and the checksum rules use it ("Checksum
 computation"). Types 7, 8, and 9 are auxiliary types outside the metadata set.
+The port also has the type 100, `.cfs`, the composefs image of a commit. The
+tool does not know it. "The composefs image object" in "Port extensions"
+states it.
 The string form of an object name is `<hexchecksum>.<typestr>`. "Repository
 modes and on-disk storage" states which objects take the `z` suffix.
 
@@ -2440,6 +2443,7 @@ The part holds these items:
 - the credential file of a push over HTTP;
 - the ssh transport;
 - the commit of `push-tree`;
+- the composefs image object;
 - the mode `bare-user-shared`.
 
 The push protocol and the pull protocol each have a version number. Both
@@ -4815,6 +4819,65 @@ collection id on either side, both checksums are equal. The checks cover
 and next to `-m`, an explicit `--timestamp`, a second push onto the same
 branch, `--tag` and `--bind-ref` against `--bind-ref` of the tool, and
 `--orphan` on a new branch against `--parent=none`.
+
+## The composefs image object
+
+A repository of the port can store the composefs image of a commit as a
+loose object. The tool has no such object type. A run of `ostrya commit
+--generate-composefs` or `ostrya composefs-image --add` and a check of the
+stored file can verify each fact below.
+
+The object:
+
+- The type number is 100. The type string is `composefs-image`, and the
+  extension is `cfs` in every mode. So the string form of the object name is
+  `<commit>.composefs-image`.
+- The object name is the checksum of its commit, as for `.commitmeta`. The
+  loose path is `objects/<first 2 hex>/<remaining 62 hex>.cfs`.
+- The content is the image that an export of the commit with the verity
+  digests of the files writes ("composefs"). The repository stores it raw in
+  every mode, `archive` included, with no header and no compression. The
+  image depends on the tree alone, so `bare`, `bare-user`, and `archive`
+  store the same bytes for the same tree.
+- The file has the mode `0644` in every mode, whatever the umask, and no
+  extended attribute.
+
+The key rule:
+
+- An image exists only for a commit that carries `ostree.composefs.digest.v0`.
+  The fs-verity digest of the image is the value of that key.
+- The write reads the first entry of the key. Its value must be a variant of
+  type `ay` with 32 bytes. The write refuses a commit without the key, a value
+  of another form, and an image whose digest is not the value. It checks the
+  digest before it installs the image.
+- A stored image whose digest is the value stays as it is. The write replaces
+  a stored image whose digest is not the value and a stored image that does
+  not read.
+
+The write:
+
+- The writer computes the fs-verity digest of the bytes as it writes them, so
+  no step holds the whole image.
+- With `[ex-integrity] fsverity` not `no`, the write seals the image as it
+  seals the other objects ("Write path: fs-verity"). After the seal, it
+  compares the digest that the kernel measures with the digest of the writer.
+- A transaction renames its images into `objects/` after all its other
+  objects and before its refs. The rename replaces a stored image of the same
+  commit in one step.
+
+Other formats refuse the type:
+
+- `ostree.sizes` has no entry for the image, and the decoder refuses the type
+  byte 100.
+- A static delta carries no image. The parser of a part and of a fallback
+  entry refuses the type 100.
+- The push protocol and the pull protocol carry no image. `Have`, the
+  `missing` list, and `ObjectHeader` refuse the type 100.
+
+Prune removes the image with its commit, and removes an image whose commit is
+absent. A kept commit keeps its image. No prune count and no byte count of
+freed space includes the image. `port-plan.md`, "Prune sweep order", states
+the order of the removals.
 
 ## bare-user-shared mode
 

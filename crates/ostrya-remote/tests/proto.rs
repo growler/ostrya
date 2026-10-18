@@ -847,10 +847,10 @@ fn malformed_bodies_decode_to_protocol() {
         }
     }
 
-    for ty in [0, 5, 6, 7, 9] {
+    for ty in [0, 5, 6, 7, 9, 100] {
         assert_protocol(read_one(&frame(3, &names_body(ty, good()))));
     }
-    for (ty, enc) in [(0, 0), (5, 0), (7, 0), (9, 0), (2, 1), (1, 2)] {
+    for (ty, enc) in [(0, 0), (5, 0), (7, 0), (9, 0), (100, 0), (2, 1), (1, 2)] {
         assert_protocol(read_one(&frame(5, &header_body(ty, good(), enc))));
     }
     let mut w = FrameWriter::new(Vec::new());

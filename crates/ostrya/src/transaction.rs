@@ -31,7 +31,9 @@ pub use crate::write::{ContentWriter, FileMeta};
 
 /// The counts and sizes of the work of a transaction.
 ///
-/// [`commit`](Transaction::commit) returns them.
+/// [`commit`](Transaction::commit) returns them. No field counts a composefs
+/// image that the transaction stages, as no field counts detached commit
+/// metadata.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TransactionStats {
     /// The number of metadata objects offered for staging, dedup hits included.
@@ -1158,6 +1160,25 @@ impl Transaction {
         self.record_object(checksum, ty, mode, outcome, true, payload, false)
     }
 
+    /// Records a composefs image that the caller linked into the staging
+    /// directory as the image of `commit`.
+    ///
+    /// The image takes its size from the free-space budget. It adds no size
+    /// record and no statistic.
+    pub(crate) fn record_image(&self, commit: Checksum, outcome: StageOutcome) -> Result<()> {
+        let mode = self.repo.mode();
+        self.record_object(
+            commit,
+            ObjectType::ComposefsImage,
+            mode,
+            outcome,
+            false,
+            false,
+            false,
+        )
+        .map(|_| ())
+    }
+
     /// Records the outcome of a staged object, as [`record`](Transaction::record)
     /// does, with all flags.
     ///
@@ -1182,11 +1203,12 @@ impl Transaction {
     ) -> Result<Checksum> {
         let mut staged = self.staged.lock().unwrap();
         // The totals count each object offered, dedup hits included. They are
-        // the work that the caller asked for.
-        if ty == ObjectType::File {
-            staged.stats.content_total += 1;
-        } else {
-            staged.stats.metadata_total += 1;
+        // the work that the caller asked for. A composefs image is a sidecar
+        // of its commit, as `.commitmeta` is, and no statistic counts it.
+        match ty {
+            ObjectType::ComposefsImage => {}
+            ObjectType::File => staged.stats.content_total += 1,
+            _ => staged.stats.metadata_total += 1,
         }
         // An object that the object store holds already is inside the
         // `ostree.sizes` scope, as a freshly staged one is. `write_commit` reads
@@ -1246,14 +1268,16 @@ impl Transaction {
                 },
             );
         }
-        if ty == ObjectType::File {
-            staged.stats.content_written += 1;
-            staged.stats.content_bytes_written += outcome.on_disk_size;
-            if payload {
-                staged.stats.content_bytes_unpacked += outcome.unpacked;
+        match ty {
+            ObjectType::ComposefsImage => {}
+            ObjectType::File => {
+                staged.stats.content_written += 1;
+                staged.stats.content_bytes_written += outcome.on_disk_size;
+                if payload {
+                    staged.stats.content_bytes_unpacked += outcome.unpacked;
+                }
             }
-        } else {
-            staged.stats.metadata_written += 1;
+            _ => staged.stats.metadata_written += 1,
         }
         Ok(checksum)
     }
@@ -1301,7 +1325,9 @@ impl Transaction {
     ///    metadata of a commit. If a dict holds at least one entry, the call
     ///    reads `[ex-ostrya] gc-root-metadata-keys` for this check. On a
     ///    refusal the call publishes no object and writes nothing.
-    /// 2. The call renames each staged object into `objects/<xx>/`.
+    /// 2. The call renames each staged object into `objects/<xx>/`. The
+    ///    composefs images go after all other objects. The rename of an image
+    ///    replaces a stored image of the same commit.
     /// 3. The call writes the queued detached-metadata edits.
     /// 4. The call writes the queued refs. Each ref write is atomic: a temp
     ///    file, then a rename. The set of ref writes is not atomic as a whole.
@@ -1512,10 +1538,16 @@ impl Transaction {
     async fn publish(&self) -> Result<bool> {
         let objects: Vec<(String, String)> = {
             let staged = self.staged.lock().unwrap();
-            staged
+            // The composefs images go last. An image is then in `objects/`
+            // only after each object that its commit reaches.
+            let (images, others): (Vec<_>, Vec<_>) = staged
                 .objects
-                .values()
-                .map(|o| (o.staging_name.clone(), o.dest.clone()))
+                .iter()
+                .partition(|((_, ty), _)| *ty == ObjectType::ComposefsImage);
+            others
+                .into_iter()
+                .chain(images)
+                .map(|(_, o)| (o.staging_name.clone(), o.dest.clone()))
                 .collect()
         };
         if objects.is_empty() {
@@ -1623,6 +1655,9 @@ impl DetachedJob {
 const _: fn() = || {
     fn is_send_sync<T: Send + Sync>() {}
     is_send_sync::<Transaction>();
+    is_send_sync::<crate::StagedComposefsImage<'static>>();
+    is_send_sync::<crate::ComposefsImageAdd>();
+    is_send_sync::<crate::ComposefsImageState>();
 };
 
 /// A gate for the unit tests, at the commit step that writes detached metadata

@@ -8,8 +8,14 @@ use crate::mode::RepoMode;
 /// The numeric value of each variant is part of the wire format. It is the
 /// `u` member of the `(su)` serialization of an object name and the type byte
 /// of an `ostree.sizes` entry ([`SizeEntry`](crate::sizes::SizeEntry)).
+///
+/// The values 1 to 9 are the types of the ostree format.
+/// [`ComposefsImage`](Self::ComposefsImage) is a type of the port alone. A
+/// later version can add other types, so a `match` on this type needs a
+/// wildcard arm.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 #[repr(u32)]
+#[non_exhaustive]
 pub enum ObjectType {
     /// A content object: a file header and the payload (`.file` or `.filez`).
     File = 1,
@@ -38,6 +44,12 @@ pub enum ObjectType {
     ///
     /// Its name is the checksum of the `.file` object.
     FileXattrsLink = 9,
+    /// The composefs image of a commit (`.cfs`).
+    ///
+    /// Its name is the checksum of the commit. Its fs-verity digest is the
+    /// value of the `ostree.composefs.digest.v0` key of the commit. The
+    /// `ostree` tool does not know this type.
+    ComposefsImage = 100,
 }
 
 impl ObjectType {
@@ -50,7 +62,8 @@ impl ObjectType {
     ///
     /// # Errors
     ///
-    /// [`Error::InvalidObjectType`] if `v` is not in the range 1 to 9.
+    /// [`Error::InvalidObjectType`] if `v` is not in the range 1 to 9 and is
+    /// not 100.
     pub fn from_u32(v: u32) -> Result<ObjectType> {
         Ok(match v {
             1 => ObjectType::File,
@@ -62,6 +75,7 @@ impl ObjectType {
             7 => ObjectType::PayloadLink,
             8 => ObjectType::FileXattrs,
             9 => ObjectType::FileXattrsLink,
+            100 => ObjectType::ComposefsImage,
             _ => return Err(Error::InvalidObjectType(v)),
         })
     }
@@ -74,6 +88,9 @@ impl ObjectType {
     /// [`CommitMeta`](Self::CommitMeta), with the numeric values `2..=6`. The
     /// checksum rules of an object depend on this property. A metadata object
     /// is stored uncompressed, and its loose path never has the `z` suffix.
+    ///
+    /// [`ComposefsImage`](Self::ComposefsImage) is not a metadata type. Its
+    /// size has no cap.
     pub fn is_meta(self) -> bool {
         matches!(
             self,
@@ -85,6 +102,16 @@ impl ObjectType {
         )
     }
 
+    /// Returns `true` if the type is a sidecar of a commit.
+    ///
+    /// The sidecar types are [`CommitMeta`](Self::CommitMeta) and
+    /// [`ComposefsImage`](Self::ComposefsImage). The name of a sidecar object
+    /// is the checksum of its commit, and the content of the sidecar does not
+    /// go into that checksum.
+    pub fn is_commit_sidecar(self) -> bool {
+        matches!(self, ObjectType::CommitMeta | ObjectType::ComposefsImage)
+    }
+
     /// Returns the loose-path extension of the type in `mode`.
     ///
     /// The extension has no leading dot. The extension of a
@@ -93,8 +120,8 @@ impl ObjectType {
     /// on a `File` object in archive mode.
     ///
     /// The extensions of the other types do not depend on the mode. The
-    /// non-metadata types `payload-link`, `file-xattrs`, and
-    /// `file-xattrs-link` are stored uncompressed and have no `z` suffix.
+    /// non-metadata types `payload-link`, `file-xattrs`, `file-xattrs-link`,
+    /// and `cfs` are stored uncompressed and have no `z` suffix.
     pub fn extension(self, mode: RepoMode) -> &'static str {
         match self {
             ObjectType::File => match mode {
@@ -113,6 +140,7 @@ impl ObjectType {
             ObjectType::PayloadLink => "payload-link",
             ObjectType::FileXattrs => "file-xattrs",
             ObjectType::FileXattrsLink => "file-xattrs-link",
+            ObjectType::ComposefsImage => "cfs",
         }
     }
 
@@ -122,10 +150,23 @@ impl ObjectType {
     /// depend on the mode. A `File` object has the type string `file`, also in
     /// archive mode, where its loose path has the `z` suffix. The `ostree`
     /// command prints the form with no `z` in its object references.
+    ///
+    /// The type string of [`ComposefsImage`](Self::ComposefsImage) is
+    /// `composefs-image`, and its extension is `cfs`. For each other type the
+    /// type string is the extension in a bare mode.
     pub fn type_str(self) -> &'static str {
-        // Every extension but the archive `File` suffix is mode-independent,
-        // so the bare-mode extension is the canonical type string.
-        self.extension(RepoMode::Bare)
+        match self {
+            ObjectType::File => "file",
+            ObjectType::DirTree => "dirtree",
+            ObjectType::DirMeta => "dirmeta",
+            ObjectType::Commit => "commit",
+            ObjectType::TombstoneCommit => "tombstone-commit",
+            ObjectType::CommitMeta => "commitmeta",
+            ObjectType::PayloadLink => "payload-link",
+            ObjectType::FileXattrs => "file-xattrs",
+            ObjectType::FileXattrsLink => "file-xattrs-link",
+            ObjectType::ComposefsImage => "composefs-image",
+        }
     }
 
     /// Returns the type of a loose-path extension.
@@ -145,6 +186,7 @@ impl ObjectType {
             "payload-link" => ObjectType::PayloadLink,
             "file-xattrs" => ObjectType::FileXattrs,
             "file-xattrs-link" => ObjectType::FileXattrsLink,
+            "cfs" => ObjectType::ComposefsImage,
             _ => return None,
         })
     }
@@ -154,9 +196,12 @@ impl ObjectType {
 mod tests {
     use super::*;
 
+    /// The numeric value of each type.
+    const ALL: [u32; 10] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 100];
+
     #[test]
     fn numeric_tags_round_trip() {
-        for v in 1..=9u32 {
+        for v in ALL {
             assert_eq!(ObjectType::from_u32(v).unwrap().as_u32(), v);
         }
         assert!(matches!(
@@ -167,11 +212,17 @@ mod tests {
             ObjectType::from_u32(10),
             Err(Error::InvalidObjectType(10))
         ));
+        for v in [99, 101] {
+            assert!(matches!(
+                ObjectType::from_u32(v),
+                Err(Error::InvalidObjectType(n)) if n == v
+            ));
+        }
     }
 
     #[test]
     fn is_meta_covers_two_through_six() {
-        for v in 1..=9u32 {
+        for v in ALL {
             let ty = ObjectType::from_u32(v).unwrap();
             assert_eq!(ty.is_meta(), (2..=6).contains(&v), "type {v}");
         }
@@ -203,7 +254,7 @@ mod tests {
             RepoMode::Archive,
             RepoMode::BareUserShared,
         ];
-        for v in 1..=9u32 {
+        for v in ALL {
             let ty = ObjectType::from_u32(v).unwrap();
             for mode in modes {
                 assert_eq!(ObjectType::from_extension(ty.extension(mode)), Some(ty));
@@ -213,5 +264,28 @@ mod tests {
         assert_eq!(ObjectType::from_extension("filez"), Some(ObjectType::File));
         assert_eq!(ObjectType::from_extension("unknown"), None);
         assert_eq!(ObjectType::from_extension(""), None);
+        assert_eq!(ObjectType::from_extension("composefs-image"), None);
+    }
+
+    #[test]
+    fn type_str_is_the_bare_extension_except_for_the_image() {
+        for v in ALL {
+            let ty = ObjectType::from_u32(v).unwrap();
+            if ty == ObjectType::ComposefsImage {
+                assert_eq!(ty.type_str(), "composefs-image");
+                assert_eq!(ty.extension(RepoMode::Bare), "cfs");
+                assert_eq!(ty.extension(RepoMode::Archive), "cfs");
+            } else {
+                assert_eq!(ty.type_str(), ty.extension(RepoMode::Bare), "type {v}");
+            }
+        }
+    }
+
+    #[test]
+    fn commit_sidecars_are_commitmeta_and_the_image() {
+        for v in ALL {
+            let ty = ObjectType::from_u32(v).unwrap();
+            assert_eq!(ty.is_commit_sidecar(), v == 6 || v == 100, "type {v}");
+        }
     }
 }

@@ -69,6 +69,7 @@ fn z_suffix_is_file_and_archive_only() {
         (ObjectType::PayloadLink, "payload-link"),
         (ObjectType::FileXattrs, "file-xattrs"),
         (ObjectType::FileXattrsLink, "file-xattrs-link"),
+        (ObjectType::ComposefsImage, "cfs"),
     ];
     for (ty, ext) in aux {
         for mode in modes {

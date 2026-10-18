@@ -89,6 +89,13 @@ A file object in an archive repository.
 The detached metadata of a commit, for example its signatures.
 The checksum of a commit does not include it, so a signature can be added after the commit.
 .TP
+\fB\%.cfs\fR
+The composefs image of a commit, an extension of ostrya.
+Its name is the checksum of the commit, as for \fB\%.commitmeta\fR.
+Its fs\-verity digest is the value of the key \fB\%ostree.composefs.digest.v0\fR of the commit.
+Each mode stores it uncompressed, with the inode mode 0644.
+\fB\%ostrya commit \-\-generate\-composefs\fR and \fB\%ostrya composefs\-image \-\-add\fR write it, and \fB\%ostrya prune\fR removes it with its commit.
+.TP
 \fB\%.tombstone\-commit\fR
 A marker that records a commit that a prune deleted.
 \fB\%ostrya prune\fR writes it when the key \fB\%core.tombstone\-commits\fR is true.
@@ -288,6 +295,8 @@ These two are not files of the repository.
 These parts of the layout are extensions of ostrya:
 .IP \(bu 2
 the mode \fB\%bare\-user\-shared\fR and its permissions;
+.IP \(bu 2
+the object type \fB\%.cfs\fR, the composefs image of a commit;
 .IP \(bu 2
 the lock file \fB\%.update.lock\fR;
 .IP \(bu 2

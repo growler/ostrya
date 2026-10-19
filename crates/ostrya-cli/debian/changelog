@@ -1,3 +1,21 @@
+ostrya (0.5.0) unstable; urgency=medium
+
+  * Store the composefs image of a commit as a .cfs object. commit
+    --generate-composefs stores the image. Add composefs-image. Prune
+    removes the image with its commit, and fsck checks each image.
+  * Carry the composefs image in pull, push, send, serve, and static
+    deltas.
+  * Write each ref into the root summary, and write the summary of the
+    anonymous item under extensions/ostrya/summary/.
+  * Add summary -c/--client-groups.
+  * State archive-z2 in each served summary.
+  * Keep the summary of the anonymous item served after a mirror pull.
+  * Start a plain HTTP serve next to an HTTPS serve of one repository.
+  * Add the template unit ostrya-serve@.service and the sysusers.d file of
+    the user ostrya. Build ostrya-mountd from its own source package.
+
+ -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Mon, 19 Oct 2026 22:29:56 +0200
+
 ostrya (0.4.0) unstable; urgency=medium
 
   * Control the access to a served repository with client groups in the

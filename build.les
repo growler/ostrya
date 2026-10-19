@@ -1,0 +1,182 @@
+# build.les -- builds the ostrya Debian packages for each release. Local test
+# harness; not committed.
+#
+#   packages.ostrya_<distr>          the ostrya .deb for one release
+#                                    ("13" = trixie, "12" = bookworm),
+#                                    captured under /root/packages.
+#   packages.ostrya-mountd_<distr>   the ostrya-mountd .deb for one release,
+#                                    captured under /root/packages.
+#
+# Run:  debles check build.les   (then: debles lock / fetch / build / cp)
+
+_SNAPSHOT = datetime.from_iso("2026-09-12").to_iso()
+_RUST_VERSION = ["1.92.0", "2025-12-11"]
+_DEBEMAIL = "Alexey Naidyonov <alexey.naidyonov@gmail.com>"
+
+# The apt universe for one release: the main Debian archive (release, -updates,
+# -backports) plus the security archive, both pinned to _SNAPSHOT.
+def _debian(codename):
+    return universe(
+        archive(
+            url        = "https://ftp.debian.org/debian/",
+            snapshots  = "https://snapshot.debian.org/archive/debian/@SNAPSHOTID@/",
+            suites     = [
+                codename,
+                f"{codename}-updates",
+                f"{codename}-backports",
+            ],
+            components = ["main"],
+            snapshot   = _SNAPSHOT,
+        ),
+        archive(
+            url        = "https://security.debian.org/debian-security/",
+            snapshots  = "https://snapshot.debian.org/archive/debian-security/@SNAPSHOTID@/",
+            suites     = [f"{codename}-security"],
+            components = ["main"],
+            snapshot   = _SNAPSHOT,
+        ),
+    )
+
+# A layer that installs a fixed Rust toolchain from static.rust-lang.org into
+# /usr/opt/rust-<version> and links its bin/ and lib/ entries onto the default
+# PATH.
+def _rust(version, date):
+    def dist(date, stem):
+        return tarfile(
+            url = f"https://static.rust-lang.org/dist/{date}/{stem}.tar.xz",
+            target = "/usr/opt",
+        )
+    RUST_COMPONENTS = ["rustc", "cargo", "rust-std"]
+    stems = [f"{c}-{version}-{ARCH.triple('rust')}" for c in RUST_COMPONENTS]
+    return layer(
+        stage = [dist(date, stem) for stem in stems],
+        build_env = {
+            "RUST_VERSION": version,
+            "RUST_COMPONENTS": " ".join(stems),
+        },
+        build = r"""
+            set -e
+            prefix=/usr/opt/rust-${RUST_VERSION}
+            for component in ${RUST_COMPONENTS}; do
+                "usr/opt/${component}/install.sh" --prefix="${prefix}" --disable-ldconfig 2>/dev/null
+                rm -rf "usr/opt/${component}"
+                rm -f "${prefix}/lib/rustlib/uninstall.sh"
+            done
+            for b in "${prefix}"/bin/*; do ln -sf "../opt/rust-${RUST_VERSION}/bin/$(basename "$b")" usr/bin/; done
+            for l in "${prefix}"/lib/*;  do ln -sf "../opt/rust-${RUST_VERSION}/lib/$(basename "$l")" usr/lib/; done
+            ldconfig
+        """
+    )
+
+# Per-release configuration, keyed by Debian version number.
+_releases = {
+    "13": {
+        "universe": _debian("trixie"),
+    },
+    "12": {
+        "universe": _debian("bookworm"),
+        "base": {
+            "exclude": ["libelogind0", "usrmerge"],
+        },
+    },
+}
+
+def _base(version):
+    if version not in _releases:
+        fail(f'unknown debian version "{version}"')
+    return bootstrap(
+        universe = _releases[version].get("universe"),
+        env = {"VERSION_ID": version},
+        **_releases[version].get("base", {}),
+    )
+
+# build-essential supplies dpkg-buildpackage and the C compiler that builds the
+# vendored liblzma and PCRE2. devscripts supplies `dch --bpo`, and it only
+# recommends libdistro-info-perl. ca-certificates gives `cargo vendor` its TLS
+# roots.
+_build_packages = [
+    "build-essential",
+    "ca-certificates",
+    "debhelper",
+    "devscripts",
+    "libdistro-info-perl",
+]
+
+def _build_env(version):
+    return apply(
+        apply(_base(version), layer(require = _build_packages)),
+        _rust(*_RUST_VERSION),
+    )
+
+# Vendor the workspace so the package builds run offline. tests/ is staged
+# because ostrya-fetch includes tests/fixtures/tls in its unit tests. The
+# workspace .cargo/config.toml carries [env] PCRE2_SYS_STATIC, so the vendor
+# stanza is appended to it.
+_src = derive(
+    tree = apply(
+        _build_env(_releases.keys()[0]),
+        layer(stage = [
+            directory(url = "crates", target = "/root/ostrya/crates"),
+            directory(url = "tests",  target = "/root/ostrya/tests"),
+            file(url = "Cargo.toml",         target = "/root/ostrya/Cargo.toml"),
+            file(url = "Cargo.lock",         target = "/root/ostrya/Cargo.lock"),
+            file(url = "README.md",          target = "/root/ostrya/README.md"),
+            file(url = "LICENSE",            target = "/root/ostrya/LICENSE"),
+            file(url = ".cargo/config.toml", target = "/root/ostrya/.cargo/config.toml"),
+        ]),
+    ),
+    build = """
+        set -e
+        cd /root/ostrya
+        cargo vendor --locked vendor/
+        cat >> .cargo/config.toml <<EOT
+
+        [source.crates-io]
+        replace-with = "vendored-sources"
+        [source.vendored-sources]
+        directory = "vendor/"
+        EOT
+        mkdir -p "$(dirname "${TARGET}")"
+        cd /root
+        mv ostrya "${TARGET}"
+    """,
+    target = "/root/ostrya",
+)
+
+# Build the .deb of one source package for one release: rewrite the changelog
+# to a ~bpo entry with dch, run dpkg-buildpackage in crates/<crate>, and
+# capture the artifacts under /root/packages.
+def _build(version, crate):
+    return derive(
+        tree = apply(_build_env(version), layer(stage = [_src])),
+        env = {
+            "DEBEMAIL": _DEBEMAIL,
+            "VERSION_ID": version,
+            "CRATE": crate,
+        },
+        build = """
+            set -e
+            cd "/root/ostrya/crates/${CRATE}"
+            tstamp=$(dpkg-parsechangelog -SDate)
+            dch --bpo ${VERSION_ID} --date "${tstamp}" "Local backport"
+            env SOURCE_DATE_EPOCH="$(dpkg-parsechangelog -STimestamp)" \
+                DEB_BUILD_OPTIONS="parallel=$(nproc) nocheck" \
+                dpkg-buildpackage -d -us -uc
+            cd /root/ostrya/crates
+            mkdir -p "${TARGET}"
+            mv -f *.deb *.buildinfo *.changes "${TARGET}"
+        """,
+        target = "/root/packages",
+    )
+
+# The crate directory of each source package.
+_sources = {
+    "ostrya": "ostrya-cli",
+    "ostrya-mountd": "ostrya-mountd",
+}
+
+packages = {
+    f"{source}_{distr}": _build(distr, crate)
+    for source, crate in _sources.items()
+    for distr in _releases.keys()
+}

@@ -410,14 +410,23 @@ async fn split_repo(base: &Path, bare_path: &Path, bare: &Repo, commit: &Checksu
         );
         assert_eq!(id, name.checksum, "the hand-written split object");
     }
-    // The summary of the `anonymous` item needs its `.access` file. Both
+    // The summary of the `anonymous` item and its `.access` file. Both
     // repositories have the implicit groups and no collection id, so the
     // file of the `bare` repository holds the digest of this one.
-    let access = format!(
-        "extensions/ostrya/summary/{}.access",
+    let stem = format!(
+        "extensions/ostrya/summary/{}",
         Checksum::sha256(b"anonymous")
     );
-    for rel in ["refs/heads/main", "summary", "summary.sig", &access] {
+    let sig = format!("{stem}.sig");
+    let access = format!("{stem}.access");
+    for rel in [
+        "refs/heads/main",
+        "summary",
+        "summary.sig",
+        &stem,
+        &sig,
+        &access,
+    ] {
         copy(rel);
     }
     write_delta_files(&root);

@@ -477,7 +477,7 @@ fn a_stated_length_above_the_cap_ends_the_session() {
         let dir = TmpDir::new("pull-ssh-cap");
         let (remote, commit) = build_remote(dir.path()).await;
         let remote_path = dir.path().join("remote");
-        std::fs::remove_file(remote_path.join("summary")).unwrap();
+        std::fs::remove_file(served_summary(&remote_path)).unwrap();
         let mut long = format!("{}\n", commit.to_hex()).into_bytes();
         long.resize(2048, b'\n');
         std::fs::write(remote_path.join("refs/heads/test/main"), long).unwrap();
@@ -696,6 +696,15 @@ fn remote_fetch_summary_runs_the_ssh_keys_of_the_remote() {
     });
 }
 
+/// The file of the summary of the `anonymous` item of the repository at
+/// `root`, which a session serves as `summary`.
+fn served_summary(root: &Path) -> std::path::PathBuf {
+    root.join(format!(
+        "extensions/ostrya/summary/{}",
+        Checksum::sha256(b"anonymous")
+    ))
+}
+
 /// `PullSession::fetch_summary` over a stream returns the summary of the
 /// remote and its signature. A file that the remote does not serve is
 /// `None`. One session serves each call, and it ends with `Ok`.
@@ -704,8 +713,8 @@ fn a_pull_session_fetches_the_summary_over_a_stream() {
     block_on(async {
         let dir = TmpDir::new("pull-ssh-session-fetch-summary");
         let (remote, _commit) = build_remote(dir.path()).await;
-        let root = dir.path().join("remote");
-        let summary = std::fs::read(root.join("summary")).unwrap();
+        let served = served_summary(&dir.path().join("remote"));
+        let summary = std::fs::read(&served).unwrap();
         let (to_server, server_in) = pipe(PIPE_CAP);
         let (server_out, from_server) = pipe(PIPE_CAP);
         let (fetched, served) = within(
@@ -720,9 +729,9 @@ fn a_pull_session_fetches_the_summary_over_a_stream() {
                     .await
                     .unwrap();
                     let mut fetched = vec![session.fetch_summary().await.unwrap()];
-                    std::fs::write(root.join("summary.sig"), b"signature bytes").unwrap();
+                    std::fs::write(served.with_extension("sig"), b"signature bytes").unwrap();
                     fetched.push(session.fetch_summary().await.unwrap());
-                    std::fs::remove_file(root.join("summary")).unwrap();
+                    std::fs::remove_file(&served).unwrap();
                     fetched.push(session.fetch_summary().await.unwrap());
                     session.finish().await.unwrap();
                     fetched

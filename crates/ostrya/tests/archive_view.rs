@@ -794,10 +794,11 @@ fn summary_names(bytes: &[u8]) -> Vec<String> {
         .collect()
 }
 
-/// The view serves the summary of the item of the client: the files at the
-/// root for `anonymous`, and the files under `extensions/ostrya/summary/` for
-/// each other item. An item with no summary gets not found, and so does a
-/// direct request of a file under `extensions/ostrya/`.
+/// The view serves the summary of the item of the client: the files under
+/// `extensions/ostrya/summary/` for each item, `anonymous` included. It
+/// never serves the root summary, which holds each ref. An item with no
+/// summary gets not found, and so does a direct request of a file under
+/// `extensions/ostrya/`.
 #[test]
 fn the_summary_of_each_item_is_served() {
     let tmp = TmpDir::new("view-summary-items");
@@ -816,13 +817,17 @@ fn the_summary_of_each_item_is_served() {
         let root = repo.path();
 
         let anonymous = repo_access(&repo, "anonymous");
-        for path in ["summary", "summary.sig"] {
+        let anonymous_stem = Checksum::sha256(b"anonymous").to_hex();
+        for (path, suffix) in [("summary", ""), ("summary.sig", ".sig")] {
             assert!(serves(&view, path, &anonymous).await, "{path}");
             let (_, bytes) = read_all(view.get(path, &anonymous).await.unwrap()).await;
-            assert_eq!(bytes, fs::read(root.join(path)).unwrap(), "{path}");
+            let stored = format!("extensions/ostrya/summary/{anonymous_stem}{suffix}");
+            assert_eq!(bytes, fs::read(root.join(stored)).unwrap(), "{path}");
         }
         let (_, bytes) = read_all(view.get("summary", &anonymous).await.unwrap()).await;
         assert_eq!(summary_names(&bytes), ["pub/a"]);
+        let stored = fs::read(root.join("summary")).unwrap();
+        assert_eq!(summary_names(&stored), ["main", "pub/a", "pub/secret"]);
 
         let ci = repo_access(&repo, "ssh:ci");
         let stem = Checksum::sha256(b"ssh:ci").to_hex();

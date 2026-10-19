@@ -493,7 +493,10 @@ fn send_serves_the_summary_of_the_name() {
         "[ex-ostrya client \"puller\"]\nauth=ssh:puller\nallow=r:test/**\nsummary=true\n",
     );
     summary_update(&repo);
-    assert!(!repo.join("summary").exists());
+    // The root summary holds each ref, and the session never serves it.
+    let root = ostrya::Summary::parse(&std::fs::read(repo.join("summary")).unwrap()).unwrap();
+    let names: Vec<&str> = root.refs.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(names, ["secret", "test/main"]);
     let stem = ostrya::Checksum::sha256(b"ssh:puller");
     let stored = std::fs::read(repo.join(format!("extensions/ostrya/summary/{stem}"))).unwrap();
     let input = || {

@@ -591,8 +591,8 @@ fn remote_refs(repo: &str) -> Vec<String> {
     names
 }
 
-/// The `ostree` command pulls through the root summary of the `anonymous`
-/// item, whose group has a deny item. The summary lists the refs that the
+/// The `ostree` command pulls through the summary of the `anonymous` item,
+/// whose group has a deny item. The summary lists the refs that the
 /// group reads, and a pull of a denied ref fails.
 #[test]
 fn the_tool_pulls_through_the_summary_of_the_anonymous_item() {
@@ -637,6 +637,59 @@ fn the_tool_pulls_through_the_summary_of_the_anonymous_item() {
     assert_eq!(out.status.code(), Some(1), "{out:?}");
 }
 
+/// The root summary of a repository with client groups holds each ref, and
+/// the `ostree` command reads it. `ostree summary --view` shows what it
+/// shows for the summary that `ostree summary -u` writes, apart from the
+/// time of the write.
+#[test]
+fn the_tool_reads_the_root_summary_of_each_ref() {
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("root-summary");
+    let src = build_tree(tmp.path());
+    let path = tmp.path().join("server");
+    server_repo(&path, "archive", &src, &[]);
+    let repo = format!("--repo={}", path.display());
+    let src = src.to_str().unwrap();
+    ok(
+        ostrya(),
+        &[
+            &repo,
+            "commit",
+            "-b",
+            "other",
+            "-s",
+            "other",
+            "--no-xattrs",
+            src,
+        ],
+    );
+    let config = path.join("config");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str("[ex-ostrya client \"public\"]\nauth=anonymous\nallow=r:main\nsummary=true\n");
+    std::fs::write(&config, text).unwrap();
+    ok(ostrya(), &[&repo, "summary", "-u"]);
+    let view = |repo: &str| -> Vec<String> {
+        ok("ostree", &[repo, "summary", "--view"])
+            .lines()
+            .filter(|line| !line.contains("ostree.summary.last-modified"))
+            .map(str::to_owned)
+            .collect()
+    };
+    let port = view(&repo);
+    assert!(port.iter().any(|line| line.contains("* other")), "{port:?}");
+
+    let copy = tmp.path().join("copy");
+    ok(
+        "cp",
+        &["-a", path.to_str().unwrap(), copy.to_str().unwrap()],
+    );
+    let copy = format!("--repo={}", copy.display());
+    ok("ostree", &[&copy, "summary", "-u"]);
+    assert_eq!(port, view(&copy));
+}
+
 /// The `ostree` command pulls through the summary of a `tls:NAME` item, with
 /// the client certificate of `tls-client-cert-path` and
 /// `tls-client-key-path`. A client with no certificate gets 401 for the
@@ -671,7 +724,10 @@ fn the_tool_pulls_through_the_summary_of_a_tls_item() {
     text.push_str("[ex-ostrya client \"puller\"]\nauth=tls:puller\nallow=r:main\nsummary=true\n");
     std::fs::write(&config, text).unwrap();
     ok(ostrya(), &[&repo, "summary", "-u"]);
-    assert!(!path.join("summary").exists());
+    // The root summary holds each ref, and the server never serves it.
+    let root = ostrya::Summary::parse(&std::fs::read(path.join("summary")).unwrap()).unwrap();
+    let names: Vec<&str> = root.refs.iter().map(|r| r.name.as_str()).collect();
+    assert_eq!(names, ["main", "other"]);
     let server = Serving::start(
         &path,
         &[

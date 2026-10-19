@@ -33,9 +33,7 @@ use crate::config::RepoConfig;
 use crate::error::{Error, Result};
 use crate::file::{Contained, ContentReader, FileKind};
 use crate::repo::Repo;
-use crate::summary::{
-    ACCESS_SUFFIX, SIG_SUFFIX, SUMMARY_DIR, SUMMARY_FILE, SUMMARY_SIG_FILE, access_file_bytes,
-};
+use crate::summary::{ACCESS_SUFFIX, SIG_SUFFIX, SUMMARY_DIR, access_file_bytes};
 use crate::write::archive_level;
 
 /// The maximum number of `.filez` objects that one view deflates at one time.
@@ -56,7 +54,8 @@ pub const MAX_COMPRESSORS: usize = 16;
 ///   if the repository sets them. The view serves no other key.
 /// - `summary` and `summary.sig`: the view serves the files of the summary
 ///   of the item of the client, as stored (see
-///   [Read access](ArchiveView#read-access)).
+///   [Read access](ArchiveView#read-access)). It never serves `summary`
+///   and `summary.sig` at the repository root.
 /// - The files under `refs/` and `extensions/`, and the `.commit`,
 ///   `.dirtree`, `.dirmeta`, `.commitmeta`, and `.cfs` objects: the view
 ///   serves them as stored, to a client that reads them. A `.cfs` object is
@@ -97,10 +96,9 @@ pub const MAX_COMPRESSORS: usize = 16;
 /// `summary` and `summary.sig` give the files of the summary of the item of
 /// the client, which
 /// [`Repo::regenerate_summaries`](crate::Repo::regenerate_summaries) writes
-/// (section "Files"). For the `anonymous` item, they are `summary` and
-/// `summary.sig` at the repository root. For each other item, they are
-/// `extensions/ostrya/summary/HEX` and `extensions/ostrya/summary/HEX.sig`.
-/// For each request, the view opens the file first, and then reads the
+/// (section "Files"): `extensions/ostrya/summary/HEX` and
+/// `extensions/ostrya/summary/HEX.sig`, for each item, `anonymous`
+/// included. For each request, the view opens the file first, and then reads the
 /// `.access` file of the item:
 ///
 /// - An item with no summary ([`ReadAccess::summary_digest`] is `None`)
@@ -492,36 +490,26 @@ impl ArchiveView {
         let Some(files) = access.summary_files() else {
             return Ok(Summarized::Walked(Walked::NotFound));
         };
-        let anonymous = *access.item() == AuthItem::Anonymous;
-        let name = match (anonymous, sig) {
-            (true, false) => SUMMARY_FILE.to_owned(),
-            (true, true) => SUMMARY_SIG_FILE.to_owned(),
-            (false, false) => files.stem.clone(),
-            (false, true) => format!("{}{SIG_SUFFIX}", files.stem),
+        let name = if sig {
+            format!("{}{SIG_SUFFIX}", files.stem)
+        } else {
+            files.stem.clone()
         };
         let access_name = format!("{}{ACCESS_SUFFIX}", files.stem);
         let want = access_file_bytes(&files.digest);
         let repo = self.repo.clone();
         let summarized = ostrya_rt::unblock(move || -> io::Result<Summarized> {
-            // The one walk to the directory of the `.access` file.
+            // The one walk to the directory of the summary.
             let dir = match walk_dir(repo.repo_fd(), SUMMARY_DIR)? {
-                WalkedDir::Dir(dir) => Some(dir),
-                WalkedDir::Other(Walked::NotFound) => None,
+                WalkedDir::Dir(dir) => dir,
                 WalkedDir::Other(walked) => return Ok(Summarized::Walked(walked)),
             };
             for _ in 0..SUMMARY_TRIES {
-                let at = match (&dir, anonymous) {
-                    (_, true) => repo.repo_fd(),
-                    (Some(dir), false) => dir.as_fd(),
-                    (None, false) => return Ok(Summarized::Walked(Walked::NotFound)),
-                };
+                let at = dir.as_fd();
                 // The file first, so a write between the two opens cannot
                 // pair a matching `.access` file with a later file.
                 let file = walk(at, &name, false)?;
-                let current = match &dir {
-                    Some(dir) => walk(dir.as_fd(), &access_name, false)?,
-                    None => Walked::NotFound,
-                };
+                let current = walk(at, &access_name, false)?;
                 let file = match (current, file) {
                     (Walked::File(current, _), file) => {
                         if !holds(&current, &want)? {

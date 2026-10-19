@@ -326,10 +326,10 @@ enum Command {
     Sign(SignArgs),
     /// Regenerate, sign, or verify the repository summary.
     ///
-    /// With -u, the command writes the summary of each auth item of the
-    /// client groups from the refs of the repository, and signs each one
-    /// with the given keys. The summary of the `anonymous` item is `summary`
-    /// at the repository root. With --verify, it verifies the signatures in
+    /// With -u, the command writes the root summary `summary`, which holds
+    /// each ref, and the summary of each auth item of the client groups, from
+    /// the refs of the repository. It signs each one with the given keys.
+    /// With --verify, it verifies the signatures in
     /// `summary.sig`, and --verify takes precedence over -u. Without these
     /// two options, a KEY-ID or a --keys-file signs each existing summary.
     /// The read options --raw, -v, --list-metadata-keys, and
@@ -515,13 +515,12 @@ enum Command {
     /// the request gets 404, and the command writes one `error:` line that
     /// names the item and tells the operator to run `ostrya summary -u`, one
     /// time for each item in each run. The responses of `summary` and
-    /// `summary.sig` carry `Cache-Control: private`. Also with no client
-    /// group, the summary needs the `.access` file of the `anonymous` item.
-    /// A mirror pull removes that file, and `summary` gets 404 until
-    /// `ostrya summary -u`. `ostree summary -u` leaves the file in place. In
-    /// a repository where `ostrya summary -u` never ran, a `summary` that it
-    /// wrote gets 404. Else the server serves that `summary` while the file
-    /// matches.
+    /// `summary.sig` carry `Cache-Control: private`. The server never serves
+    /// the root `summary`, which holds each ref, so a `summary` that
+    /// `ostree summary -u` or a mirror pull writes is not served. Also with no
+    /// client group, the server serves the summary of the `anonymous` item,
+    /// which `ostrya summary -u` writes. A mirror pull removes the `.access`
+    /// file of that item, and `summary` gets 404 until `ostrya summary -u`.
     ///
     /// The server takes its settings from `[ex-ostrya server]` of the
     /// repository config. Each option of the command with the name of a key
@@ -541,7 +540,8 @@ enum Command {
     /// under `refs/mirrors/` whose name is not a collection id, the command
     /// writes one `warning:` line that names it, one time in each run. With
     /// `[core] auto-update-summary=true`, each push that changes a ref writes
-    /// each summary again, signed with the key groups of `sign-summary`.
+    /// the root summary and each summary of an item again, signed with the
+    /// key groups of `sign-summary`.
     #[cfg(feature = "serve")]
     Serve(ServeArgs),
     /// Serve one pull session over standard input and standard output.
@@ -2125,23 +2125,21 @@ struct SignArgs {
 
 #[derive(Args)]
 struct SummaryArgs {
-    /// Regenerate the summary of each auth item from the refs of the
-    /// repository.
+    /// Regenerate the root summary and the summary of each auth item from the
+    /// refs of the repository.
     ///
+    /// The root summary `summary` holds each ref, whatever the client groups.
     /// An auth item has a summary when one or more of its client groups has
     /// `summary=true`. With no client group, the `anonymous` item has a
     /// summary that holds each ref. The summary of an item holds the refs that
     /// the item reads in each namespace whose selected group has
     /// `summary=true`. A namespace whose selected group has `summary=false`
-    /// adds no ref. The summary of the `anonymous`
-    /// item is `summary` at the repository root, and the summary of each other
-    /// item is under `extensions/ostrya/summary/`. The command writes each
-    /// summary and replaces its signature file. Each summary gets a signature
-    /// of each --gpg-sign key, each --sign key, and each KEY-ID and
-    /// --keys-file key, in this order. The command writes the `.access` file
-    /// of each item last, and removes the files of each item that has no
-    /// summary. When the `anonymous` item has no summary, the command removes
-    /// `summary` and `summary.sig`.
+    /// adds no ref. The summary of each item, `anonymous` included, is under
+    /// `extensions/ostrya/summary/`. The command writes each summary and
+    /// replaces its signature file. Each summary gets a signature of each
+    /// --gpg-sign key, each --sign key, and each KEY-ID and --keys-file key,
+    /// in this order. The command writes the `.access` file of each item
+    /// last, and removes the files of each item that has no summary.
     ///
     /// The command checks every -m value, every key, and the client groups
     /// before the regeneration, so a refusal leaves each summary as it was.

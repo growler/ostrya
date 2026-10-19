@@ -422,8 +422,13 @@ fn remote_refs_and_remote_summary_read_the_remote_over_ssh() {
     assert!(view.status.success(), "{}", stderr(&view));
     assert_eq!(stdout(&out), stdout(&view));
 
-    std::fs::remove_file(setup.src.join("summary")).unwrap();
-    let _ = std::fs::remove_file(setup.src.join("summary.sig"));
+    // The server serves the summary of the `anonymous` item.
+    let served = setup.src.join(format!(
+        "extensions/ostrya/summary/{}",
+        ostrya::Checksum::sha256(b"anonymous")
+    ));
+    std::fs::remove_file(&served).unwrap();
+    let _ = std::fs::remove_file(served.with_extension("sig"));
     let out = setup.client(&["remote", "refs", "origin"], &[]);
     assert_failed(
         &out,

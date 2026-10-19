@@ -335,11 +335,13 @@ checksum of the mirror ref. `ID` is not a key of
 `ostree.summary.collection-map`. The summary writer of the port does the
 same.
 
-The port writes one summary for each auth item of the client groups. The
-summary of the `anonymous` item is the file `summary` at the repository
-root. A repository with no client group has two implicit groups, and the
-summary of their `anonymous` item holds each ref. "Summaries of auth items"
-states the summaries of the other items and the refs of each summary.
+The file `summary` at the repository root is the root summary. It holds
+each local ref and each collection ref, whatever the client groups, and it
+is the summary that the tool writes for the same refs. A local reader reads
+it, for example `summary -v` and a local pull. `ostrya serve` and
+`ostrya send` never serve it. The port also writes one summary for each auth
+item of the client groups. "Summaries of auth items" states these summaries
+and the refs of each one.
 
 Field 1, `a{sv}`, is the global metadata. GVariant does not sort a dict again,
 so the insertion order is the on-disk order. The writer writes the keys in
@@ -3882,7 +3884,8 @@ The pull writes `refs/mirrors/ID/REF`. In a repository with
 
 ## Summaries of auth items
 
-The port writes one summary for each auth item that has a summary. An auth
+The port writes the root summary ("Summary -- `(a(s(taya{sv}))a{sv})`") and
+one summary for each auth item that has a summary. An auth
 item has a summary when one or more of its client groups has
 `summary=true` (`ostrya-config(1)`, "Client keys"). Each other item has no
 summary. The two implicit groups of a repository with no client group set
@@ -3926,11 +3929,11 @@ deltas:
 the item in its parsed form (`ostrya-config(1)`, "Authentication items"). For example,
 the text of `net:2001:0db8::/56` is `net:2001:db8::/56`.
 
-- The summary of the `anonymous` item is `summary` and `summary.sig` in the
-  repository root, where the tool writes them.
-- The summary of each other item is `extensions/ostrya/summary/HEX` and
-  `extensions/ostrya/summary/HEX.sig`. The signature file has the format of
-  "Summary signature -- `a{sv}`".
+- The root summary is `summary` and `summary.sig` in the repository root,
+  where the tool writes them. It has no `.access` file.
+- The summary of each item, `anonymous` included, is
+  `extensions/ostrya/summary/HEX` and `extensions/ostrya/summary/HEX.sig`.
+  The signature file has the format of "Summary signature -- `a{sv}`".
 - Each item with a summary, `anonymous` included, has
   `extensions/ostrya/summary/HEX.access`. The file holds the access digest of
   the item in 64 lowercase hex digits and a newline.
@@ -3987,8 +3990,13 @@ text, so a new group name keeps the digest.
 
 ### The write of the summaries
 
-`ostrya summary -u` writes the summary of each item that has a summary, one
-item at a time, in the order of the first group of each item in the config:
+`ostrya summary -u` first writes the root summary. It builds the summary
+and makes each signature, removes the old `summary.sig`, writes `summary`,
+and writes the new `summary.sig` when a key signs. With
+`[core] fsync=true`, it then syncs the repository root.
+
+Then it writes the summary of each item that has a summary, one item at a
+time, in the order of the first group of each item in the config:
 
 1. It builds the summary and makes each signature. A summary with the bytes
    of an earlier summary of the run takes the signatures of that summary.
@@ -4006,16 +4014,14 @@ the write of step 4, and the directory of the summary before step 4. A crash
 then cannot leave an `.access` file next to a summary of another digest.
 
 A summary is at most 64 MiB (67108864 bytes). The command refuses a larger
-summary before it writes a file of the item, and each reader of a summary in
-the port refuses a larger file. The items before the refusal keep their new
-files, and the item of the refusal and the items after it keep their old
-files.
+summary before it writes a file of the summary, and each reader of a
+summary in the port refuses a larger file. The summaries before the refusal
+keep their new files, and the summary of the refusal and the summaries after
+it keep their old files. The root summary comes first.
 
 Then it removes the files under `extensions/ostrya/summary/` of each item
 that has no summary, the `.access` files first. It removes the temp files of
-these names, and `HEX` and `HEX.sig` of the `anonymous` item. It leaves each
-other entry of the directory. When the `anonymous` item has no summary, it
-removes `summary` and `summary.sig` in the repository root.
+these names. It leaves each other entry of the directory.
 
 The command checks every `-m` value, every key, and the client groups before
 it writes a file. A refusal leaves each summary as it was. The command holds
@@ -4023,8 +4029,8 @@ the repository lock shared and the update lock for the whole run ("The
 update lock").
 
 With `[core] auto-update-summary=true`, a push through `ostrya serve` or
-`ostrya receive` that changes a ref writes each summary again, as
-`ostrya summary -u` does. The key groups of `sign-summary` sign them, GPG
+`ostrya receive` that changes a ref writes the root summary and each
+summary of an item again, as `ostrya summary -u` does. The key groups of `sign-summary` sign them, GPG
 keys first. A one-way stream writes no summary.
 
 A mirror pull that writes `summary` removes the `.access` file of the
@@ -4034,8 +4040,9 @@ A mirror pull that writes `summary` removes the `.access` file of the
 
 The server computes the access digest of each item at start. A request for
 `summary` or `summary.sig`, over HTTP and over a stream, gets the file of the
-summary of the identified item ("The files of a summary"). The request gets
-the answer of an absent path in these cases:
+summary of the identified item under `extensions/ostrya/summary/` ("The
+files of a summary"). The server never serves the root summary. The request
+gets the answer of an absent path in these cases:
 
 - The item has no summary.
 - The file does not exist.
@@ -4117,7 +4124,8 @@ repository root in this way:
   stored. "Read access" states which of these files a client gets.
   `extensions/ostrya` and each path under it are absent.
 - `summary` and `summary.sig` are the files of the summary of the auth item
-  of the client, as stored ("The serve of a summary").
+  of the client, as stored ("The serve of a summary"). The root summary is
+  never served.
 - In each other mode, the view builds a `.filez` object on request. The
   object is the framed archive header of the logical metadata that the mode
   stores, then the payload in raw DEFLATE at `[archive] zlib-level`. An

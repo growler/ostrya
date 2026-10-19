@@ -32380,8 +32380,8 @@ fn summary_reading_options_match_the_tool() {
 }
 
 /// `--auth-group=NAME` reads the summary of the item of the client group
-/// `NAME`. With no client group, the names of the implicit groups read the
-/// root summary. The command refuses a group that does not exist, a group
+/// `NAME`. With no client group, the names of the implicit groups read a
+/// summary with the bytes of the root summary. The command refuses a group that does not exist, a group
 /// with `summary=false`, a group with more than one item, and the option
 /// with `-u`, with `--verify`, with a signing key, and with no read option.
 #[test]
@@ -32428,7 +32428,10 @@ fn summary_auth_group_reads_the_summary_of_one_item() {
         String::from_utf8_lossy(&missing.stderr)
     );
     ostrya(&[&repo_arg, "summary", "-u"], None, &[]).ok();
-    assert!(!repo.join("summary").exists());
+    let root = ostrya(&[&repo_arg, "summary", "-v"], None, &[]);
+    root.ok();
+    let root = String::from_utf8_lossy(&root.stdout);
+    assert!(root.contains("main") && root.contains("secret"), "{root}");
     let view = ostrya(&[&repo_arg, "summary", "--auth-group=ci", "-v"], None, &[]);
     view.ok();
     let view = String::from_utf8_lossy(&view.stdout);

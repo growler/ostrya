@@ -239,8 +239,8 @@ struct Edit<'a> {
 ///
 /// After the transaction commit, this function removes the partial marker of
 /// each commit of the session. If the policy regenerates the summary and a ref
-/// changed, it builds, signs, and writes the summary of each auth item of the
-/// client groups of the config. A failure of these last steps is a warning of
+/// changed, it builds, signs, and writes the root summary and the summary of
+/// each auth item of the client groups of the config. A failure of these last steps is a warning of
 /// the report.
 ///
 /// # Failure of the transaction commit
@@ -1953,7 +1953,7 @@ fn queue_edit(txn: &Transaction, edit: Edit<'_>) -> Checked<()> {
 /// first.
 ///
 /// The call reads the client groups of the config of `repo`, and writes the
-/// summary of each auth item as
+/// root summary and the summary of each auth item as
 /// [`regenerate_summaries`](Repo::regenerate_summaries) does, under the
 /// update lock that the caller holds. Each summary gets the new signatures
 /// alone. A failure of one summary leaves the summaries after it as they

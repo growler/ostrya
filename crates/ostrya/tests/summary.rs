@@ -2228,10 +2228,9 @@ fn fixed() -> SummaryOptions {
 
 /// Each item with a summary gets the refs that its groups with
 /// `summary=true` read: the local refs in field 0, and the collection refs
-/// in the collection map. The summary of `anonymous` is at the root, and
-/// each summary has the same `ostree.summary.last-modified`. An item with no
-/// summary gets no file, and each `.access` file holds the digest of its
-/// item.
+/// in the collection map. The root summary holds each ref, and each summary
+/// has the same `ostree.summary.last-modified`. An item with no summary gets
+/// no file, and each `.access` file holds the digest of its item.
 #[test]
 fn each_item_gets_the_summary_of_its_groups() {
     let (_tmp, repo_dir) = writable_fixture("summary", "items-groups");
@@ -2251,18 +2250,23 @@ fn each_item_gets_the_summary_of_its_groups() {
         let report = repo.regenerate_summaries(&fixed(), &[]).await.unwrap();
         assert!(report.invalid_collection_dirs.is_empty());
 
-        let anonymous = Summary::parse(&repo.read_summary().await.unwrap().unwrap()).unwrap();
+        let root = Summary::parse(&repo.read_summary().await.unwrap().unwrap()).unwrap();
+        assert_eq!(ref_names(&root), ["main", "other"]);
+        let map = root.collection_map().unwrap();
+        assert_eq!(map.len(), 1);
+        assert_eq!(map[0].0, "org.example.M");
+
+        let anonymous = summary_of(&repo, "anonymous").await;
         assert_eq!(ref_names(&anonymous), ["main"]);
         let map = anonymous.collection_map().unwrap();
         assert_eq!(map.len(), 1);
         assert_eq!(map[0].0, "org.example.M");
         assert_eq!(map[0].1[0].name, "m");
-        assert_eq!(summary_of(&repo, "anonymous").await, anonymous);
 
         let ci = summary_of(&repo, "ssh:ci").await;
         assert_eq!(ref_names(&ci), ["main", "other"]);
         assert!(ci.metadata_value("ostree.summary.collection-map").is_none());
-        for summary in [&anonymous, &ci] {
+        for summary in [&root, &anonymous, &ci] {
             assert_eq!(
                 summary.metadata_value("ostree.summary.last-modified"),
                 anonymous.metadata_value("ostree.summary.last-modified")
@@ -2275,7 +2279,6 @@ fn each_item_gets_the_summary_of_its_groups() {
                 .is_none()
         );
         assert!(!item_file(&repo_dir, "ssh:ops", ".access").exists());
-        assert!(!item_file(&repo_dir, "anonymous", "").exists());
 
         let access = ostrya::access::ClientAccess::from_config(repo.config(), repo.path()).unwrap();
         for text in ["anonymous", "ssh:ci"] {
@@ -2286,6 +2289,39 @@ fn each_item_gets_the_summary_of_its_groups() {
                 "{text}"
             );
         }
+    });
+}
+
+/// The client groups do not change the root summary: with groups that hide
+/// refs from each item, the root summary has the bytes of the root summary
+/// with no client group, and its signature file.
+#[test]
+fn the_root_summary_does_not_follow_the_client_groups() {
+    let (_tmp, repo_dir) = writable_fixture("summary", "items-root");
+    block_on(async {
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        let (_, main) = repo.list_refs(None).await.unwrap()[0].clone();
+        set_mirror(&repo, "org.example.M", "m", &main).await;
+        let signer = ostrya::DummySigner::new(b"sig".to_vec());
+        repo.regenerate_summaries(&fixed(), &[&signer])
+            .await
+            .unwrap();
+        let summary = std::fs::read(repo_dir.join("summary")).unwrap();
+        let sig = std::fs::read(repo_dir.join("summary.sig")).unwrap();
+
+        let repo = with_groups(
+            &repo_dir,
+            "[ex-ostrya client \"public\"]\nauth=anonymous\nallow=r:main\nsummary=true\n\
+             [ex-ostrya client \"ci\"]\nauth=ssh:ci\nallow=r:other\nsummary=true\n",
+        )
+        .await;
+        repo.regenerate_summaries(&fixed(), &[&signer])
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(repo_dir.join("summary")).unwrap(), summary);
+        assert_eq!(std::fs::read(repo_dir.join("summary.sig")).unwrap(), sig);
+        assert_eq!(ref_names(&summary_of(&repo, "anonymous").await), ["main"]);
+        assert_eq!(ref_names(&summary_of(&repo, "ssh:ci").await), ["other"]);
     });
 }
 
@@ -2341,9 +2377,10 @@ fn the_delta_map_follows_the_refs_of_the_summary() {
 }
 
 /// With no client group, the root summary holds each local ref and each
-/// collection ref, and lists each delta. The summary directory holds the
-/// `.access` file of `anonymous` alone. A directory under `refs/mirrors/`
-/// whose name is not a collection id is in the report and in no summary.
+/// collection ref. The summary directory holds the summary of `anonymous`,
+/// with the bytes of the root summary, and its `.access` file. A directory
+/// under `refs/mirrors/` whose name is not a collection id is in the report
+/// and in no summary.
 #[test]
 fn with_no_client_group_the_root_summary_holds_each_ref() {
     let (_tmp, repo_dir) = writable_fixture("summary", "items-implicit");
@@ -2359,18 +2396,24 @@ fn with_no_client_group_the_root_summary_holds_each_ref() {
         let map = summary.collection_map().unwrap();
         assert_eq!(map.len(), 1);
         assert_eq!(map[0].0, "org.example.M");
-        let dir: Vec<String> = std::fs::read_dir(repo_dir.join("extensions/ostrya/summary"))
+        let mut dir: Vec<String> = std::fs::read_dir(repo_dir.join("extensions/ostrya/summary"))
             .unwrap()
             .map(|entry| entry.unwrap().file_name().into_string().unwrap())
             .collect();
-        assert_eq!(dir, [format!("{}.access", Checksum::sha256(b"anonymous"))]);
+        dir.sort();
+        let stem = Checksum::sha256(b"anonymous");
+        assert_eq!(dir, [stem.to_hex(), format!("{stem}.access")]);
+        assert_eq!(
+            repo.read_summary_of(&item("anonymous")).await.unwrap(),
+            repo.read_summary().await.unwrap()
+        );
     });
 }
 
 /// A write removes the files of each item that has no summary: the
 /// `.access` file, the summary, and its signature file. With no summary of
-/// `anonymous`, it removes `summary` and `summary.sig` at the root. It
-/// removes a temp file of a summary file, and leaves each other entry.
+/// `anonymous`, it still writes the root summary. It removes a temp file of
+/// a summary file, and leaves each other entry.
 #[test]
 fn the_files_of_an_item_with_no_summary_are_removed() {
     let (_tmp, repo_dir) = writable_fixture("summary", "items-removed");
@@ -2382,12 +2425,13 @@ fn the_files_of_an_item_with_no_summary_are_removed() {
         repo.regenerate_summaries(&fixed(), &[&signer])
             .await
             .unwrap();
-        let ci_files = [
-            item_file(&repo_dir, "ssh:ci", ""),
-            item_file(&repo_dir, "ssh:ci", ".sig"),
-            item_file(&repo_dir, "ssh:ci", ".access"),
-        ];
-        for file in &ci_files {
+        let item_files: Vec<_> = ["ssh:ci", "anonymous"]
+            .into_iter()
+            .flat_map(|text| {
+                ["", ".sig", ".access"].map(|suffix| item_file(&repo_dir, text, suffix))
+            })
+            .collect();
+        for file in &item_files {
             assert!(file.exists(), "{file:?}");
         }
         assert!(repo_dir.join("summary.sig").exists());
@@ -2408,13 +2452,13 @@ fn the_files_of_an_item_with_no_summary_are_removed() {
         std::fs::write(repo_dir.join("config"), text).unwrap();
         let repo = Repo::open(&repo_dir).await.unwrap();
         repo.regenerate_summary(&fixed()).await.unwrap();
-        for file in &ci_files {
+        for file in &item_files {
             assert!(!file.exists(), "{file:?}");
         }
-        for name in ["summary", "summary.sig"] {
-            assert!(!repo_dir.join(name).exists(), "{name}");
-        }
-        assert!(!item_file(&repo_dir, "anonymous", ".access").exists());
+        let root = Summary::parse(&repo.read_summary().await.unwrap().unwrap()).unwrap();
+        assert_eq!(ref_names(&root), ["main", "other"]);
+        // An unsigned write removes the old signatures.
+        assert!(!repo_dir.join("summary.sig").exists());
         assert!(!dir.join(&temp).exists());
         assert!(!dir.join(&other).exists());
         assert_eq!(std::fs::read(dir.join("notes")).unwrap(), b"keep");
@@ -2455,8 +2499,9 @@ fn a_new_group_name_keeps_the_access_file() {
     });
 }
 
-/// A write with signers signs each summary. A signing with no write adds a
-/// signature to each existing summary.
+/// A write with signers signs the root summary and each summary of an item,
+/// `anonymous` included. A signing with no write adds a signature to each
+/// existing summary.
 #[test]
 fn each_summary_is_signed() {
     let (_tmp, repo_dir) = writable_fixture("summary", "items-signed");
@@ -2474,6 +2519,7 @@ fn each_summary_is_signed() {
         };
         let sigs = [
             repo_dir.join("summary.sig"),
+            item_file(&repo_dir, "anonymous", ".sig"),
             item_file(&repo_dir, "ssh:ci", ".sig"),
         ];
         for sig in &sigs {
@@ -2593,8 +2639,9 @@ fn a_changed_access_file_goes_before_the_summary() {
         let before = std::fs::read(&access).unwrap();
 
         // The same digest keeps the file through a failed write.
-        std::fs::remove_file(repo_dir.join("summary")).unwrap();
-        std::fs::create_dir_all(repo_dir.join("summary/block")).unwrap();
+        let file = item_file(&repo_dir, "anonymous", "");
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir_all(file.join("block")).unwrap();
         repo.regenerate_summary(&fixed()).await.unwrap_err();
         assert_eq!(std::fs::read(&access).unwrap(), before);
 
@@ -2609,7 +2656,7 @@ fn a_changed_access_file_goes_before_the_summary() {
         repo.regenerate_summary(&fixed()).await.unwrap_err();
         assert!(!access.exists());
 
-        std::fs::remove_dir_all(repo_dir.join("summary")).unwrap();
+        std::fs::remove_dir_all(&file).unwrap();
         repo.regenerate_summary(&fixed()).await.unwrap();
         let after = std::fs::read(&access).unwrap();
         assert_ne!(after, before);

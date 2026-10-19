@@ -2534,14 +2534,13 @@ and `summary.sig` as they stood (`cli-behavior.md`, "CLI output formats",
   state;
 - the summaries of the client groups. The tool reads no client group, and
   `summary -u` writes one `summary` of each local ref and each mirror ref.
-  The port writes one summary for each auth item that a group with
-  `summary=true` carries, under `extensions/ostrya/summary/`, with an
-  `.access` file for each item (`../format-reference.md`, "Summaries of auth
-  items"). The root `summary` is the summary of the `anonymous` item, and it
-  holds the refs that the groups of `anonymous` read. When `anonymous` has
-  no summary, the port removes `summary` and `summary.sig`. A repository
-  with no client group has the implicit groups, so the root `summary` holds
-  each ref, as the tool writes it. A malformed client group refuses
+  The port writes the same root `summary`, which holds each ref whatever the
+  client groups. It also writes one summary for each auth item that a group
+  with `summary=true` carries, `anonymous` included, under
+  `extensions/ostrya/summary/`, with an `.access` file for each item
+  (`../format-reference.md`, "Summaries of auth items"). `ostrya serve` and
+  `ostrya send` serve these summaries, and never the root `summary`. A
+  malformed client group refuses
   `summary -u` at exit 1 before any write, and the tool ignores the group.
   For each directory under `refs/mirrors/` whose name is not a collection
   id, the port writes one `warning:` line to standard error and leaves the

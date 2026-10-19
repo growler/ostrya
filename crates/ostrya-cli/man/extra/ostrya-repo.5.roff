@@ -175,7 +175,8 @@ In the names below, \fB\%<hex>\fR is the SHA\-256 digest, in 64 lowercase hex di
 \fB\%ostrya serve\fR serves no path under \fB\%extensions/ostrya/\fR.
 .TP
 \fB\%<repo>/extensions/ostrya/summary/<hex>\fR, \fB\%<hex>.sig\fR
-The summary of an item other than \fB\%anonymous\fR, and its signatures, in the formats of \fB\%summary\fR and \fB\%summary.sig\fR.
+The summary of an item, \fB\%anonymous\fR included, and its signatures, in the formats of \fB\%summary\fR and \fB\%summary.sig\fR.
+\fB\%ostrya serve\fR and \fB\%ostrya send\fR serve these files as \fB\%summary\fR and \fB\%summary.sig\fR.
 .TP
 \fB\%<repo>/extensions/ostrya/summary/<hex>.access\fR
 The access digest of an item, in 64 lowercase hex digits and a newline.
@@ -194,10 +195,12 @@ The index of the static deltas that end at the commit \fB\%<to>\fR.
 Each entry maps a delta name to the SHA\-256 checksum of its superblock.
 .TP
 \fB\%<repo>/summary\fR
-The summary: the refs and their commits, the static deltas, and the repository metadata.
-It is the summary of the authentication item \fB\%anonymous\fR.
-\fB\%ostrya summary \-u\fR writes it, and removes it when \fB\%anonymous\fR has no summary.
-A pull reads it from the remote.
+The root summary: each ref and its commit, the static deltas, and the repository metadata.
+It holds each local ref and each collection ref, whatever the client groups.
+\fB\%ostrya summary \-u\fR writes it.
+\fB\%ostrya summary \-v\fR and a local pull read it.
+\fB\%ostrya serve\fR and \fB\%ostrya send\fR never serve it.
+A web server that serves the repository directory as files serves it, and with it the name of each ref.
 A summary is at most 64 MiB: \fB\%ostrya summary \-u\fR refuses a larger summary, and ostrya refuses to read a larger file.
 .TP
 \fB\%<repo>/summary.sig\fR
@@ -293,7 +296,8 @@ The view refuses \fB\%tmp/\fR, \fB\%state/\fR, each name that starts with \fB\%.
 The client groups of the config give the read rights of each client, as \fB\%ostrya\-config\fR(1) states in "Read access".
 A ref under \fB\%refs/heads/\fR or \fB\%refs/mirrors/ID/\fR is served when the group of the client has \fB\%r\fR on its name.
 \fB\%refs/remotes/\fR and each other path under \fB\%refs/\fR are not served.
-\fB\%summary\fR and \fB\%summary.sig\fR give \fB\%summary\fR and \fB\%summary.sig\fR to \fB\%anonymous\fR, and the files under \fB\%extensions/ostrya/summary/\fR to each other item.
+\fB\%summary\fR and \fB\%summary.sig\fR give the files of the item of the client under \fB\%extensions/ostrya/summary/\fR, \fB\%anonymous\fR included.
+The view never serves \fB\%summary\fR and \fB\%summary.sig\fR of the repository root.
 An item with no summary, and an item whose \fB\%.access\fR file does not hold its access digest, get the answer of an absent path.
 Objects, deltas, \fB\%config\fR, and the other files under \fB\%extensions/\fR are served to each identified client.
 \fB\%ostrya serve\fR also serves \fB\%/_ostrya/refs/v1\fR, a list of refs that match a pattern, and \fB\%/_ostrya/receive/v1/\fR, the endpoint of a push over HTTP.

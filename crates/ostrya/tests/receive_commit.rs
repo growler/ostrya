@@ -2560,10 +2560,10 @@ fn summary_is_regenerated_and_signed_from_the_built_bytes() {
     assert!(!repo.path().join("summary.sig").exists());
 }
 
-/// The session writes the summary of each auth item of the client groups of
-/// the config, signs each one, and writes the `.access` file of each item.
-/// An item with no summary gets no file, and with no summary of `anonymous`
-/// the root holds no summary.
+/// The session writes the root summary and the summary of each auth item of
+/// the client groups of the config, signs each one, and writes the `.access`
+/// file of each item. An item with no summary gets no file. With no summary
+/// of `anonymous`, the root summary holds each ref.
 #[test]
 fn the_session_writes_the_summary_of_each_item() {
     let tmp = TmpDir::new("recv-summary-items");
@@ -2591,7 +2591,17 @@ fn the_session_writes_the_summary_of_each_item() {
         false,
     ));
     assert_eq!(report.warnings, vec![]);
-    assert!(!repo.path().join("summary").exists());
+    let root = block_on(repo.read_summary()).unwrap().unwrap();
+    assert_eq!(
+        Summary::parse(&root).unwrap().lookup("test/main"),
+        Some(fixture_commit())
+    );
+    let sig = std::fs::read(repo.path().join("summary.sig")).unwrap();
+    let sig = ostrya::from_bytes(&ostrya::Type::parse("a{sv}").unwrap(), &sig).unwrap();
+    assert_eq!(
+        signatures(&sig, ED25519_KEY),
+        vec![ed25519_signature(SERVER_SECRET_B64, &root)]
+    );
     let ci = ostrya::access::AuthItem::parse("ssh:ci").unwrap();
     let bytes = block_on(repo.read_summary_of(&ci)).unwrap().unwrap();
     let summary = Summary::parse(&bytes).unwrap();

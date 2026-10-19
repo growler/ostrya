@@ -4,10 +4,11 @@
 //! of the repository and holds a dict of global metadata. A pull reads it to
 //! resolve refs and to find static deltas.
 //!
-//! - [`Repo::regenerate_summaries`] writes the summary of each auth item of
-//!   the client groups, with the options in [`SummaryOptions`], signs each
-//!   one, and returns a [`SummaryReport`]. The summary of the `anonymous`
-//!   item is `summary`. [`Repo::regenerate_summary`] writes them unsigned.
+//! - [`Repo::regenerate_summaries`] writes the root summary `summary`, which
+//!   holds each ref, and the summary of each auth item of the client groups,
+//!   with the options in [`SummaryOptions`]. It signs each one, and returns
+//!   a [`SummaryReport`]. [`Repo::regenerate_summary`] writes them
+//!   unsigned.
 //! - [`Repo::sign_summary`] and [`Repo::sign_summary_all`] add signatures to
 //!   each summary. [`Repo::verify_summary`] verifies the signatures in
 //!   `summary.sig`.
@@ -592,7 +593,7 @@ pub struct SummaryOptions {
 
 /// Methods that write, read, sign, and verify the summary.
 impl Repo {
-    /// Writes the summary of each auth item, unsigned.
+    /// Writes the root summary and the summary of each auth item, unsigned.
     ///
     /// The call is [`regenerate_summaries`](Repo::regenerate_summaries) with
     /// no signer. It drops the report.
@@ -604,8 +605,14 @@ impl Repo {
         self.regenerate_summaries(opts, &[]).await.map(drop)
     }
 
-    /// Writes the summary of each auth item that has a summary, and signs
-    /// each summary with `signers`.
+    /// Writes the root summary and the summary of each auth item that has a
+    /// summary, and signs each summary with `signers`.
+    ///
+    /// The root summary holds each ref of the repository, whatever the
+    /// client groups. It is the summary that the `ostree` command writes for
+    /// the same refs. A local reader reads it, for example
+    /// [`read_summary`](Repo::read_summary) and a local pull. A server never
+    /// serves it.
     ///
     /// The client groups of the config ([`ClientAccess::from_config`]) give
     /// the auth items. An item has a summary when one or more of its groups
@@ -622,16 +629,21 @@ impl Repo {
     /// `HEX` below is the SHA-256 digest, in 64 lowercase hex digits, of the
     /// text of the item ([`AuthItem`] `Display`).
     ///
-    /// - The summary of the `anonymous` item is `summary` and `summary.sig`
-    ///   at the repository root.
-    /// - The summary of each other item is `extensions/ostrya/summary/HEX`
-    ///   and `extensions/ostrya/summary/HEX.sig`.
+    /// - The root summary is `summary` and `summary.sig` at the repository
+    ///   root.
+    /// - The summary of each item, `anonymous` included, is
+    ///   `extensions/ostrya/summary/HEX` and
+    ///   `extensions/ostrya/summary/HEX.sig`.
     /// - Each item with a summary, `anonymous` included, has
     ///   `extensions/ostrya/summary/HEX.access`. It holds the access digest
     ///   of the item ([`ClientAccess::summary_digest`]) in 64 lowercase hex
     ///   digits and a newline.
     ///
-    /// The call handles one item at a time, in the order of
+    /// The call first builds and signs the root summary. It removes the old
+    /// `summary.sig`, writes `summary`, and writes the new `summary.sig` if
+    /// `signers` is not empty.
+    ///
+    /// Then the call handles one item at a time, in the order of
     /// [`ClientAccess::items`]. It builds the summary and makes each
     /// signature. Then it writes the files of the item in this order:
     ///
@@ -644,7 +656,8 @@ impl Repo {
     /// So while the `.access` file of an item holds a digest, the summary
     /// next to it is a summary of that digest. Each file is written
     /// atomically, with the mode `0644`. If `[core] fsync` is `true`, the
-    /// call syncs the data of each file. It also syncs the directory of the
+    /// call syncs the data of each file and the repository root after the
+    /// write of the root summary. It also syncs the directory of the
     /// `.access` file after the removal of step 1 and after the write of
     /// step 3, and the directory of the summary before step 3.
     ///
@@ -652,10 +665,7 @@ impl Repo {
     /// Under `extensions/ostrya/summary/`, it removes each file
     /// `HEX`, `HEX.sig`, and `HEX.access` of no item with a summary, the
     /// `.access` files first, and each temp file of these names that an
-    /// interrupted write left. It removes `HEX` and `HEX.sig` of the
-    /// `anonymous` item. It leaves each other entry. When the `anonymous`
-    /// item has no summary, it removes `summary` and `summary.sig` at the
-    /// repository root.
+    /// interrupted write left. It leaves each other entry.
     ///
     /// The call creates `extensions/`, `extensions/ostrya/`, and
     /// `extensions/ostrya/summary/` with the mode `0775`, less the
@@ -665,7 +675,8 @@ impl Repo {
     ///
     /// # Refs
     ///
-    /// The summary of an item holds the refs that the item reads in each
+    /// The root summary holds each local ref and each collection ref. The
+    /// summary of an item holds the refs that the item reads in each
     /// namespace whose selected group has `summary=true`, by the rules of
     /// [`build_ref_listing`](Repo::build_ref_listing) with empty selectors
     /// for the local refs and for the collection refs. A namespace whose
@@ -716,7 +727,7 @@ impl Repo {
     /// The entries are in the order of the delta names.
     ///
     /// When the summary holds each local ref and each collection ref of the
-    /// repository, the map holds each delta. Else it holds the deltas whose
+    /// repository, as the root summary does, the map holds each delta. Else it holds the deltas whose
     /// target commit is the commit of a ref in the summary.
     ///
     /// The `ostree` command writes the map in hash-table order. This order
@@ -753,15 +764,15 @@ impl Repo {
     /// call removes each signature file of the summaries that it writes. If
     /// a signer fails, the summaries before the summary of the failure keep
     /// their new files, and the summary of the failure and the summaries
-    /// after it keep their old files.
+    /// after it keep their old files. The root summary comes first.
     ///
     /// # Size
     ///
     /// A summary is at most 64 MiB (67108864 bytes), the cap of each reader
     /// of a summary in this crate. The call refuses a larger summary before
-    /// it writes a file of the item. The items before it keep their new
-    /// files, and the item of the refusal and the items after it keep their
-    /// old files. The names of the refs give a lower bound of the size, so
+    /// it writes a file of the summary. The summaries before it keep their
+    /// new files, and the summary of the refusal and the summaries after it
+    /// keep their old files. The root summary comes first. The names of the refs give a lower bound of the size, so
     /// the call can refuse a summary before it reads the commits of its refs.
     ///
     /// # Locks
@@ -900,47 +911,54 @@ impl Repo {
             })
             .collect();
         // The signature file of each distinct summary of the run, by the
-        // SHA-256 digest of its bytes. Two items whose summaries have the
-        // same bytes share one signature file, so each signer signs each
-        // distinct summary one time.
+        // SHA-256 digest of its bytes. Two summaries with the same bytes
+        // share one signature file, so each signer signs each distinct
+        // summary one time.
         let mut signed: HashMap<Checksum, Vec<u8>> = HashMap::new();
+        let mut sign = async |bytes: &[u8]| -> std::result::Result<_, SummaryFailure> {
+            if signers.is_empty() {
+                return Ok(None);
+            }
+            let key = Checksum::sha256(bytes);
+            if let Some(signatures) = signed.get(&key) {
+                return Ok(Some(signatures.clone()));
+            }
+            let signatures = sign_summary_bytes(bytes, signers)
+                .await
+                .map_err(|(key, error)| SummaryFailure {
+                    step: SummaryStep::Sign,
+                    key,
+                    error,
+                })?;
+            if let Some(signatures) = &signatures {
+                signed.insert(key, signatures.clone());
+            }
+            Ok(signatures)
+        };
+        // The root summary holds each ref, whatever the client groups.
+        let bytes = self
+            .selection_summary(&run, &run.every, opts)
+            .await
+            .map_err(build)?;
+        let signatures = sign(&bytes).await?;
+        let repo = self.clone();
+        ostrya_rt::unblock(move || put_root_summary_blocking(&repo, &bytes, signatures, fsync))
+            .await
+            .map_err(write)?;
         for (item, files) in &items {
             let bytes = self.item_summary(&run, item, opts).await.map_err(build)?;
-            let signatures = if signers.is_empty() {
-                None
-            } else {
-                let key = Checksum::sha256(&bytes);
-                match signed.get(&key) {
-                    Some(signatures) => Some(signatures.clone()),
-                    None => {
-                        let signatures =
-                            sign_summary_bytes(&bytes, signers)
-                                .await
-                                .map_err(|(key, error)| SummaryFailure {
-                                    step: SummaryStep::Sign,
-                                    key,
-                                    error,
-                                })?;
-                        if let Some(signatures) = &signatures {
-                            signed.insert(key, signatures.clone());
-                        }
-                        signatures
-                    }
-                }
-            };
+            let signatures = sign(&bytes).await?;
             let repo = self.clone();
-            let item = item.clone();
             let files = files.clone();
             ostrya_rt::unblock(move || {
-                put_item_summary_blocking(&repo, &item, &bytes, signatures, &files, fsync)
+                put_item_summary_blocking(&repo, &bytes, signatures, &files, fsync)
             })
             .await
             .map_err(write)?;
         }
         let kept: HashSet<String> = items.iter().map(|(_, files)| files.stem.clone()).collect();
-        let anonymous = items.iter().any(|(item, _)| *item == AuthItem::Anonymous);
         let repo = self.clone();
-        ostrya_rt::unblock(move || remove_other_summaries_blocking(&repo, &kept, anonymous, fsync))
+        ostrya_rt::unblock(move || remove_other_summaries_blocking(&repo, &kept, fsync))
             .await
             .map_err(write)?;
         Ok(SummaryReport {
@@ -1426,10 +1444,9 @@ impl Repo {
     /// Returns the bytes of the summary of the auth item `item`, or `None` if
     /// the file does not exist.
     ///
-    /// The summary of the `anonymous` item is `summary` at the repository
-    /// root, which [`read_summary`](Repo::read_summary) reads. The summary of
-    /// each other item is `extensions/ostrya/summary/HEX`, where `HEX` is the
-    /// SHA-256 digest of the text of the item
+    /// The summary of each item, `anonymous` included, is
+    /// `extensions/ostrya/summary/HEX`, where `HEX` is the SHA-256 digest of
+    /// the text of the item
     /// ([`regenerate_summaries`](Repo::regenerate_summaries), "Files"). The call
     /// opens each component with no symlink followed. It does not compare the
     /// `.access` file of the item with the client groups. The call refuses a
@@ -1443,9 +1460,6 @@ impl Repo {
     /// - [`Error::Io`] if the read fails, for example if the file is a
     ///   symlink.
     pub async fn read_summary_of(&self, item: &AuthItem) -> Result<Option<Vec<u8>>> {
-        if *item == AuthItem::Anonymous {
-            return self.read_summary().await;
-        }
         let repo = self.clone();
         let name = summary_stem(item);
         ostrya_rt::unblock(
@@ -2465,8 +2479,8 @@ pub(crate) fn remove_root_file_blocking(repo_fd: BorrowedFd<'_>, name: &str) -> 
     }
 }
 
-/// The directory of the summaries of the auth items other than
-/// `anonymous`, and of the `.access` file of each item with a summary.
+/// The directory of the summaries of the auth items, and of the `.access`
+/// file of each item with a summary.
 pub(crate) const SUMMARY_DIR: &str = "extensions/ostrya/summary";
 /// The components of [`SUMMARY_DIR`], from the repository root.
 const SUMMARY_DIR_PARTS: [&str; 3] = ["extensions", "ostrya", "summary"];
@@ -2560,8 +2574,6 @@ fn is_stem(name: &str) -> bool {
 /// `HEX.sig`, or `HEX.access`, or a temp file of one of these names.
 struct SummaryEntry<'a> {
     stem: &'a str,
-    /// `""`, [`SIG_SUFFIX`], or [`ACCESS_SUFFIX`].
-    suffix: &'a str,
     /// `true` for a temp file of [`put_root_file_blocking`].
     temp: bool,
 }
@@ -2584,7 +2596,7 @@ fn summary_entry(name: &str) -> Option<SummaryEntry<'_>> {
     if !is_stem(stem) || !matches!(suffix, "" | SIG_SUFFIX | ACCESS_SUFFIX) {
         return None;
     }
-    Some(SummaryEntry { stem, suffix, temp })
+    Some(SummaryEntry { stem, temp })
 }
 
 /// Returns the stem of each summary in `dir`, the open [`SUMMARY_DIR`],
@@ -2623,7 +2635,48 @@ async fn sign_summary_bytes(
         .map_err(|e| (None, e))
 }
 
-/// Writes the files of the summary of `item`, whose access digest and file
+/// Writes `summary` and `summary.sig` at the repository root: the summary
+/// `bytes` and the signature file `signatures`.
+fn put_root_summary_blocking(
+    repo: &Repo,
+    bytes: &[u8],
+    signatures: Option<Vec<u8>>,
+    fsync: bool,
+) -> Result<()> {
+    put_summary_files_blocking(
+        repo.repo_fd(),
+        SUMMARY_FILE,
+        SUMMARY_SIG_FILE,
+        bytes,
+        signatures,
+        fsync,
+    )
+}
+
+/// Writes the summary `bytes` to `file` and the signature file `signatures`
+/// to `sig`, both under `at`, after it removes the old `sig`. With `fsync`,
+/// the call syncs `at` last.
+fn put_summary_files_blocking(
+    at: BorrowedFd<'_>,
+    file: &str,
+    sig: &str,
+    bytes: &[u8],
+    signatures: Option<Vec<u8>>,
+    fsync: bool,
+) -> Result<()> {
+    // The old signatures never pair with the new summary.
+    remove_root_file_blocking(at, sig)?;
+    put_root_file_blocking(at, file, bytes, fsync)?;
+    if let Some(signatures) = signatures {
+        put_root_file_blocking(at, sig, &signatures, fsync)?;
+    }
+    if fsync {
+        rustix::fs::fsync(at)?;
+    }
+    Ok(())
+}
+
+/// Writes the files of the summary of an item, whose access digest and file
 /// stem are `files`.
 ///
 /// When the `.access` file of the item holds another digest, the call
@@ -2640,7 +2693,6 @@ async fn sign_summary_bytes(
 /// `.access` file keeps the order of the two renames.
 fn put_item_summary_blocking(
     repo: &Repo,
-    item: &AuthItem,
     bytes: &[u8],
     signatures: Option<Vec<u8>>,
     files: &SummaryFiles,
@@ -2654,28 +2706,14 @@ fn put_item_summary_blocking(
     if held == Some(false) && remove_root_file_blocking(dir.as_fd(), &access)? && fsync {
         rustix::fs::fsync(&dir)?;
     }
-    let (at, file, sig) = if *item == AuthItem::Anonymous {
-        (
-            repo.repo_fd(),
-            SUMMARY_FILE.to_owned(),
-            SUMMARY_SIG_FILE.to_owned(),
-        )
-    } else {
-        (
-            dir.as_fd(),
-            files.stem.clone(),
-            format!("{}{SIG_SUFFIX}", files.stem),
-        )
-    };
-    // The old signatures never pair with the new summary.
-    remove_root_file_blocking(at, &sig)?;
-    put_root_file_blocking(at, &file, bytes, fsync)?;
-    if let Some(signatures) = signatures {
-        put_root_file_blocking(at, &sig, &signatures, fsync)?;
-    }
-    if fsync {
-        rustix::fs::fsync(at)?;
-    }
+    put_summary_files_blocking(
+        dir.as_fd(),
+        &files.stem,
+        &format!("{}{SIG_SUFFIX}", files.stem),
+        bytes,
+        signatures,
+        fsync,
+    )?;
     // An `.access` file that holds the digest stays as it is.
     if held != Some(true) {
         put_root_file_blocking(dir.as_fd(), &access, &want, fsync)?;
@@ -2707,29 +2745,16 @@ fn holds_blocking(dir: BorrowedFd<'_>, name: &str, want: &[u8]) -> Result<Option
 
 /// Removes the files of each item with no summary.
 ///
-/// `kept` holds the stem of each item with a summary, and `anonymous` is
-/// `true` when the `anonymous` item has a summary. Under [`SUMMARY_DIR`],
-/// the call removes each [`SummaryEntry`] of a stem outside `kept`, the
-/// `.access` files first, each temp file, and the summary and the signature
-/// file of the `anonymous` item. Without `anonymous`, it removes `summary`
-/// and `summary.sig` at the repository root.
-fn remove_other_summaries_blocking(
-    repo: &Repo,
-    kept: &HashSet<String>,
-    anonymous: bool,
-    fsync: bool,
-) -> Result<()> {
-    let anonymous_stem = summary_stem(&AuthItem::Anonymous);
+/// `kept` holds the stem of each item with a summary. Under
+/// [`SUMMARY_DIR`], the call removes each [`SummaryEntry`] of a stem outside
+/// `kept`, the `.access` files first, and each temp file.
+fn remove_other_summaries_blocking(repo: &Repo, kept: &HashSet<String>, fsync: bool) -> Result<()> {
     if let Some(dir) = open_summary_dir(repo.repo_fd(), None, false)? {
         let mut gone: Vec<String> = crate::delta::dir_child_names(&dir)?
             .into_iter()
             .filter(|name| match summary_entry(name) {
                 None => false,
-                Some(entry) => {
-                    entry.temp
-                        || !kept.contains(entry.stem)
-                        || (entry.stem == anonymous_stem && entry.suffix != ACCESS_SUFFIX)
-                }
+                Some(entry) => entry.temp || !kept.contains(entry.stem),
             })
             .collect();
         // The server stops serving a summary at the removal of its
@@ -2741,13 +2766,6 @@ fn remove_other_summaries_blocking(
         }
         if fsync && removed {
             rustix::fs::fsync(&dir)?;
-        }
-    }
-    if !anonymous {
-        let summary = remove_root_file_blocking(repo.repo_fd(), SUMMARY_FILE)?;
-        let sig = remove_root_file_blocking(repo.repo_fd(), SUMMARY_SIG_FILE)?;
-        if fsync && (summary || sig) {
-            rustix::fs::fsync(repo.repo_fd())?;
         }
     }
     Ok(())

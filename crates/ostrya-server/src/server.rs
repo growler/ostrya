@@ -96,9 +96,8 @@ const ACCEPT_BACKOFF: Duration = Duration::from_millis(100);
 ///   gets the rights of the `anonymous` item under the two implicit groups of
 ///   a config with no client group, with the collection id of the
 ///   repository. Each local ref and each mirror ref are served, and
-///   `refs/remotes/` is not. `summary` and `summary.sig` are the files at
-///   the repository root, with the `.access` file of the `anonymous` item of
-///   these implicit groups.
+///   `refs/remotes/` is not. `summary` and `summary.sig` give the files of
+///   the summary of the `anonymous` item of these implicit groups.
 /// - The HTTP layer removes a `#` fragment before the routing, so the server
 ///   does not see a fragment.
 /// - The server percent-decodes the request path. Outside the ref listing,

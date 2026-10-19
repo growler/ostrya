@@ -647,14 +647,13 @@ The summary of an item holds the refs that the item reads in each namespace whos
 A namespace whose selected group has \fB\%summary=false\fR adds no ref, and no other group takes its place.
 The claims of a client certificate do not apply.
 .PP
-\fB\%ostrya summary \-u\fR writes the summary of each item.
-The summary of \fB\%anonymous\fR is \fB\%summary\fR in the repository root.
-The summary of each other item is under \fB\%extensions/ostrya/summary/\fR (see \fBostrya\-repo\fR(5)).
+\fB\%ostrya summary \-u\fR writes the summary of each item under \fB\%extensions/ostrya/summary/\fR, \fB\%anonymous\fR included (see \fBostrya\-repo\fR(5)).
+It also writes \fB\%summary\fR in the repository root, which holds each ref, whatever the client groups.
 The command also writes the access digest of each item: a digest of \fB\%collection\-id\fR of \fB\%[core]\fR and of the namespace, \fB\%allow\fR, \fB\%deny\fR, and \fB\%summary\fR of each group of the item, a group with \fB\%summary=false\fR too.
 So the digest changes when a change to the config can change the refs of the summary.
 The group names are not in the digest.
 .PP
-\fB\%ostrya serve\fR and \fB\%ostrya send\fR serve \fB\%summary\fR and \fB\%summary.sig\fR of the identified item.
+\fB\%ostrya serve\fR and \fB\%ostrya send\fR serve \fB\%summary\fR and \fB\%summary.sig\fR of the identified item, and never the files in the repository root.
 An item with no summary gets the answer of an absent path.
 When a change to the config changes the access digest of an item, the summary of the item gets the answer of an absent path until \fB\%ostrya summary \-u\fR, and the server writes one error that names the item.
 .SS "No client group"

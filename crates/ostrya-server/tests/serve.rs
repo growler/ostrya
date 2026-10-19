@@ -1407,10 +1407,10 @@ fn ask_with_token(method: &str, target: &str, token: &str) -> String {
 }
 
 /// `summary` and `summary.sig` give the files of the summary of the item of
-/// the client: the files at the root for `anonymous`, and the files under
-/// `extensions/ostrya/summary/` for a token item. An item with no summary
-/// gets 404. A 200 and a 404 carry `Cache-Control: private`, and a 401 does
-/// not.
+/// the client under `extensions/ostrya/summary/`, for `anonymous` and for a
+/// token item. The root summary, which holds each ref, is never served. An
+/// item with no summary gets 404. A 200 and a 404 carry
+/// `Cache-Control: private`, and a 401 does not.
 #[test]
 fn the_summary_of_each_item_is_served() {
     let tmp = TmpDir::new("read-summary");
@@ -1430,19 +1430,22 @@ fn the_summary_of_each_item_is_served() {
     let signer = ostrya::DummySigner::new(b"sig".to_vec());
     block_on(repo.regenerate_summaries(&ostrya::SummaryOptions::default(), &[&signer])).unwrap();
     let stem = Checksum::sha256(format!("token-sha256:{}", digest("ci-token")).as_bytes());
+    let anonymous_stem = Checksum::sha256(b"anonymous");
     let stored = |rel: &str| std::fs::read(path.join(rel)).unwrap();
     let ci_summary = stored(&format!("extensions/ostrya/summary/{stem}"));
     let ci_sig = stored(&format!("extensions/ostrya/summary/{stem}.sig"));
-    let (root_summary, root_sig) = (stored("summary"), stored("summary.sig"));
-    assert_eq!(listed_names(&root_summary), ["pub/a"]);
+    let anonymous_summary = stored(&format!("extensions/ostrya/summary/{anonymous_stem}"));
+    let anonymous_sig = stored(&format!("extensions/ostrya/summary/{anonymous_stem}.sig"));
+    assert_eq!(listed_names(&stored("summary")), ["main", "pub/a"]);
+    assert_eq!(listed_names(&anonymous_summary), ["pub/a"]);
     assert_eq!(listed_names(&ci_summary), ["main", "pub/a"]);
     let mut opts = with_policies(policies);
     opts.allow_cleartext_credentials = true;
     with_server(repo, opts, |addrs| async move {
         let addr = addrs[0];
         for (token, target, want) in [
-            (None, "/summary", &root_summary),
-            (None, "/summary.sig", &root_sig),
+            (None, "/summary", &anonymous_summary),
+            (None, "/summary.sig", &anonymous_sig),
             (Some("ci-token"), "/summary", &ci_summary),
             (Some("ci-token"), "/summary.sig", &ci_sig),
         ] {
@@ -1518,7 +1521,9 @@ fn stale_until_written(name: &str, before: &str, after: &str) {
     };
     let (repo, _) = with_groups(&path, &group(before));
     block_on(repo.regenerate_summary(&ostrya::SummaryOptions::default())).unwrap();
-    let written = std::fs::read(path.join("summary")).unwrap();
+    let written = block_on(repo.read_summary_of(&AuthItem::Anonymous))
+        .unwrap()
+        .unwrap();
     assert_eq!(listed_names(&written), ["pub/a"]);
     let config = path.join("config");
     let text = std::fs::read_to_string(&config).unwrap();

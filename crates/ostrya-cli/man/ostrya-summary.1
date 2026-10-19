@@ -8,7 +8,7 @@ ostrya summary [OPTIONS] [KEY_ID]...
 .SH DESCRIPTION
 Regenerate, sign, or verify the repository summary.
 .PP
-With \%\-u, the command writes the summary of each auth item of the client groups from the refs of the repository, and signs each one with the given keys. The summary of the \fB\%anonymous\fR item is \fB\%summary\fR at the repository root. With \%\-\-verify, it verifies the signatures in \fB\%summary.sig\fR, and \%\-\-verify takes precedence over \%\-u. Without these two options, a \%KEY\-ID or a \%\-\-keys\-file signs each existing summary. The read options \%\-\-raw, \%\-v, \%\-\-list\-metadata\-keys, and \%\-\-print\-metadata\-key print the local summary, or with \%\-\-auth\-group the summary of the item of one client group. If no option gives an action, the command exits \%1.
+With \%\-u, the command writes the root summary \fB\%summary\fR, which holds each ref, and the summary of each auth item of the client groups, from the refs of the repository. It signs each one with the given keys. With \%\-\-verify, it verifies the signatures in \fB\%summary.sig\fR, and \%\-\-verify takes precedence over \%\-u. Without these two options, a \%KEY\-ID or a \%\-\-keys\-file signs each existing summary. The read options \%\-\-raw, \%\-v, \%\-\-list\-metadata\-keys, and \%\-\-print\-metadata\-key print the local summary, or with \%\-\-auth\-group the summary of the item of one client group. If no option gives an action, the command exits \%1.
 .SH ARGUMENTS
 .TP
 \fIKEY_ID...\fR
@@ -18,9 +18,9 @@ This is an ostrya extension. With \%\-u, the keys sign each summary after every 
 .SH OPTIONS
 .TP
 \fB\-u\fR, \fB\-\-update\fR
-Regenerate the summary of each auth item from the refs of the repository.
+Regenerate the root summary and the summary of each auth item from the refs of the repository.
 .IP
-An auth item has a summary when one or more of its client groups has \fB\%summary=true\fR\&. With no client group, the \fB\%anonymous\fR item has a summary that holds each ref. The summary of an item holds the refs that the item reads in each namespace whose selected group has \fB\%summary=true\fR\&. A namespace whose selected group has \fB\%summary=false\fR adds no ref. The summary of the \fB\%anonymous\fR item is \fB\%summary\fR at the repository root, and the summary of each other item is under \fB\%extensions/ostrya/summary/\fR\&. The command writes each summary and replaces its signature file. Each summary gets a signature of each \%\-\-gpg\-sign key, each \%\-\-sign key, and each \%KEY\-ID and \%\-\-keys\-file key, in this order. The command writes the \fB\%\&.access\fR file of each item last, and removes the files of each item that has no summary. When the \fB\%anonymous\fR item has no summary, the command removes \fB\%summary\fR and \fB\%summary.sig\fR\&.
+The root summary \fB\%summary\fR holds each ref, whatever the client groups. An auth item has a summary when one or more of its client groups has \fB\%summary=true\fR\&. With no client group, the \fB\%anonymous\fR item has a summary that holds each ref. The summary of an item holds the refs that the item reads in each namespace whose selected group has \fB\%summary=true\fR\&. A namespace whose selected group has \fB\%summary=false\fR adds no ref. The summary of each item, \fB\%anonymous\fR included, is under \fB\%extensions/ostrya/summary/\fR\&. The command writes each summary and replaces its signature file. Each summary gets a signature of each \%\-\-gpg\-sign key, each \%\-\-sign key, and each \%KEY\-ID and \%\-\-keys\-file key, in this order. The command writes the \fB\%\&.access\fR file of each item last, and removes the files of each item that has no summary.
 .IP
 The command checks every \%\-m value, every key, and the client groups before the regeneration, so a refusal leaves each summary as it was. For each directory under \fB\%refs/mirrors/\fR whose name is not a collection id, the command writes one \fB\%warning:\fR line to standard error. It prints nothing else.
 .TP

@@ -2771,21 +2771,6 @@ fn remove_other_summaries_blocking(repo: &Repo, kept: &HashSet<String>, fsync: b
     Ok(())
 }
 
-/// Removes the `.access` file of the `anonymous` item, so that no server
-/// serves `summary` and `summary.sig` until the next run of the writer. A
-/// file that does not exist is no error. With `fsync`, the call syncs the
-/// directory when it removed the file.
-pub(crate) fn remove_anonymous_access_blocking(repo_fd: BorrowedFd<'_>, fsync: bool) -> Result<()> {
-    let Some(dir) = open_summary_dir(repo_fd, None, false)? else {
-        return Ok(());
-    };
-    let name = format!("{}{ACCESS_SUFFIX}", summary_stem(&AuthItem::Anonymous));
-    if remove_root_file_blocking(dir.as_fd(), &name)? && fsync {
-        rustix::fs::fsync(&dir)?;
-    }
-    Ok(())
-}
-
 /// Returns the commit of each ref of `selection`, each one time.
 fn commits_of(selection: &RefSelection) -> HashSet<Checksum> {
     selection

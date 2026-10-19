@@ -44,10 +44,7 @@ use crate::object::{MAX_FILE_HEADER_SIZE, MAX_METADATA_SIZE};
 use crate::read::CommitState;
 use crate::remote::{Endpoint, PullSession, StreamSessionOptions};
 use crate::repo::Repo;
-use crate::summary::{
-    SUMMARY_FILE, SUMMARY_SIG_FILE, Summary, put_root_file_blocking,
-    remove_anonymous_access_blocking,
-};
+use crate::summary::{SUMMARY_FILE, SUMMARY_SIG_FILE, Summary, put_root_file_blocking};
 use crate::transaction::Transaction;
 use crate::traverse::reaches_at_least;
 use crate::verify::PullTrust;
@@ -889,11 +886,6 @@ impl Repo {
             // refs and the `.commitmeta` files. The pull then fails with those
             // files in place and the summary as it was.
             self.write_locked(move |repo| {
-                // The client groups of this repository did not build the
-                // summary of the remote, so the `.access` file of the
-                // `anonymous` item goes first. A server of this repository
-                // then serves no summary until the next summary write.
-                remove_anonymous_access_blocking(repo.repo_fd(), fsync)?;
                 put_root_file_blocking(repo.repo_fd(), SUMMARY_FILE, &bytes, fsync)?;
                 // The signature covers those bytes, so the pull copies it with
                 // them. A client that pulls from this repository with

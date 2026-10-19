@@ -5111,6 +5111,8 @@ fn pull_url_override_states_its_own_policy() {
     );
 }
 
+/// A mirror pull copies the summary of the remote and writes no file under
+/// `extensions/ostrya/summary`.
 #[test]
 fn pull_mirror_writes_local_refs_and_copies_the_summary() {
     let tmp = TmpDir::new("pull-mirror");
@@ -5119,6 +5121,19 @@ fn pull_mirror_writes_local_refs_and_copies_the_summary() {
     let server = FileServer::start(&remote);
     let dest = build_dest(base, "dest");
     configure_remote(&dest, &server.url(), "gpg-verify=false\n");
+    ostrya(
+        &["summary", "--repo", dest.to_str().unwrap(), "-u"],
+        None,
+        &[],
+    )
+    .ok();
+    let stem = dest.join(format!(
+        "extensions/ostrya/summary/{}",
+        Checksum::sha256(b"anonymous").to_hex()
+    ));
+    let access = stem.with_extension("access");
+    let item_summary = std::fs::read(&stem).unwrap();
+    let item_access = std::fs::read(&access).unwrap();
 
     // A mirror pull that names no ref takes every ref that the summary lists.
     ostrya(
@@ -5141,6 +5156,8 @@ fn pull_mirror_writes_local_refs_and_copies_the_summary() {
         std::fs::read(remote.join("summary")).unwrap(),
         "the mirror did not copy the remote's summary"
     );
+    assert_eq!(std::fs::read(&stem).unwrap(), item_summary);
+    assert_eq!(std::fs::read(&access).unwrap(), item_access);
 }
 
 #[test]

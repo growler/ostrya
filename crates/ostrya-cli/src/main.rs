@@ -519,8 +519,7 @@ enum Command {
     /// the root `summary`, which holds each ref, so a `summary` that
     /// `ostree summary -u` or a mirror pull writes is not served. Also with no
     /// client group, the server serves the summary of the `anonymous` item,
-    /// which `ostrya summary -u` writes. A mirror pull removes the `.access`
-    /// file of that item, and `summary` gets 404 until `ostrya summary -u`.
+    /// which `ostrya summary -u` writes.
     ///
     /// The server takes its settings from `[ex-ostrya server]` of the
     /// repository config. Each option of the command with the name of a key
@@ -2631,10 +2630,8 @@ struct PullArgs {
     /// remote lists, and fails if the remote serves no summary. This pull also
     /// copies the `summary` and `summary.sig` of the remote to this
     /// repository. If the remote has no `summary.sig`, the `summary.sig` of
-    /// this repository stays as it is. The pull removes the `.access` file of
-    /// the `anonymous` item under `extensions/ostrya/summary/`, so `ostrya
-    /// serve` serves no summary until `ostrya summary -u`. A pull of named
-    /// refs copies no summary.
+    /// this repository stays as it is. A pull of named refs copies no
+    /// summary.
     #[arg(long)]
     mirror: bool,
     /// The number of parents of each pulled commit to follow.

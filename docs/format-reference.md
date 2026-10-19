@@ -4033,8 +4033,8 @@ With `[core] auto-update-summary=true`, a push through `ostrya serve` or
 summary of an item again, as `ostrya summary -u` does. The key groups of `sign-summary` sign them, GPG
 keys first. A one-way stream writes no summary.
 
-A mirror pull that writes `summary` removes the `.access` file of the
-`anonymous` item under the same hold of the update lock.
+A mirror pull that writes `summary` writes no file under
+`extensions/ostrya/summary/`.
 
 ### The serve of a summary
 

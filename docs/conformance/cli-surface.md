@@ -4357,11 +4357,8 @@ ostrya serve [--repo=PATH] [--listen=ADDR:PORT]...
   access digest of the current client groups gets 404, and the command
   writes one `error:` line that names the item, one time for each item in
   each run. A 200 and a 404 of the two paths carry `Cache-Control:
-  private`. A mirror pull removes the `.access` file of `anonymous`, so the
-  command serves its `summary` only after `summary -u`. `ostree summary -u`
-  leaves that file in place. In a repository where `summary -u` of the port
-  never ran, the command serves no `summary` of the tool. Else it serves
-  that `summary` while the `.access` file matches.
+  private`. The command never serves the root `summary`, so it serves no
+  `summary` that the tool writes.
   `../format-reference.md`, "Read access" and "Summaries of auth items",
   state the rules. The tool has no such rights. A `session` request
   takes the policy of the client group that carries the item in the

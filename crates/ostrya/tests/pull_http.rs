@@ -42,10 +42,11 @@ use ostrya::remote::{Endpoint, PullSession, StreamSessionOptions};
 use ostrya::sign::Ed25519Verifier;
 use ostrya::verify::{PullTrust, TrustedKeys};
 use ostrya::{
-    AdvertisedDelta, Checksum, CommitModifierFlags, CommitState, CreateOptions, DeltaEndianness,
-    DeltaOptions, DeltaSuperblock, DetachedMetadataFilter, Ed25519Signer, Error, FilterResult,
-    FsckOptions, PullFlags, PullOptions, PullStats, PullVerify, Repo, RepoMode, SummaryOptions,
-    TimestampCheck, TreeEntry, Type, Value, static_delta_relative_dir,
+    AdvertisedDelta, ArchiveAnswer, ArchiveView, Checksum, CommitModifierFlags, CommitState,
+    CreateOptions, DeltaEndianness, DeltaOptions, DeltaSuperblock, DetachedMetadataFilter,
+    Ed25519Signer, Error, FilterResult, FsckOptions, PullFlags, PullOptions, PullStats, PullVerify,
+    Repo, RepoMode, SummaryOptions, TimestampCheck, TreeEntry, Type, Value,
+    static_delta_relative_dir,
 };
 use ostrya_rt::{TcpListener, block_on, spawn};
 use proxy::{TestProxy, Tunnel};
@@ -1168,7 +1169,8 @@ fn an_empty_ref_list_with_no_branches_fails() {
 /// `refs/heads`. It copies the summary and its signature without change. Here
 /// the signature bytes are arbitrary. The remote turns on no summary
 /// verification, so the pull copies the bytes and does not read them. The
-/// pull removes the `.access` file of the `anonymous` item.
+/// pull writes no file under `extensions/ostrya/summary`, and the archive
+/// view serves the summary of the `anonymous` item from there.
 #[test]
 fn a_mirror_pull_writes_local_refs_and_copies_the_summary() {
     block_on(async {
@@ -1180,11 +1182,13 @@ fn a_mirror_pull_writes_local_refs_and_copies_the_summary() {
         dest.regenerate_summary(&ostrya::SummaryOptions::default())
             .await
             .unwrap();
-        let access = dir.path().join(format!(
-            "dest/extensions/ostrya/summary/{}.access",
+        let stem = dir.path().join(format!(
+            "dest/extensions/ostrya/summary/{}",
             Checksum::sha256(b"anonymous")
         ));
-        assert!(access.exists());
+        let access = stem.with_extension("access");
+        let item_summary = std::fs::read(&stem).unwrap();
+        let item_access = std::fs::read(&access).unwrap();
 
         dest.pull(
             "origin",
@@ -1215,7 +1219,20 @@ fn a_mirror_pull_writes_local_refs_and_copies_the_summary() {
         // bytes.
         let signature = std::fs::read(dir.path().join("dest/summary.sig")).unwrap();
         assert_eq!(signature, SUMMARY_SIG);
-        assert!(!access.exists());
+
+        assert_eq!(std::fs::read(&stem).unwrap(), item_summary);
+        assert_eq!(std::fs::read(&access).unwrap(), item_access);
+        let view = ArchiveView::new(dest.clone());
+        let anonymous = common::repo_access(&dest, "anonymous");
+        let served = match view.get("summary", &anonymous).await.unwrap() {
+            ArchiveAnswer::Stream { mut body, .. } => {
+                let mut out = Vec::new();
+                body.read_to_end(&mut out).await.unwrap();
+                out
+            }
+            other => panic!("not served: {other:?}"),
+        };
+        assert_eq!(served, item_summary);
     });
 }
 

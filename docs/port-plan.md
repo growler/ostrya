@@ -495,9 +495,8 @@ repository lock shared first:
   So two processes that sign one commit keep both signatures.
 - `Repo::sign_summary` and `Repo::sign_summary_all` take the locks before
   the read of the first summary and hold them until the last signature file
-  is written. A mirror pull writes `summary` and `summary.sig`, and removes
-  the `.access` file of the `anonymous` item, under a second hold, after its
-  commit.
+  is written. A mirror pull writes `summary` and `summary.sig` under a
+  second hold, after its commit.
 - The receive commit and `Repo::regenerate_summaries` commit their
   transactions through the crate-private `Transaction::commit_under`, which
   takes a reference to the held lock and does not take it again.

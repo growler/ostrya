@@ -1,0 +1,12 @@
+#!/bin/sh
+set -e
+
+# Create the user of ostrya-serve@.service from the sysusers.d file of the
+# package.
+if [ "$1" = "configure" ] && command -v systemd-sysusers >/dev/null 2>&1; then
+    systemd-sysusers ${DPKG_ROOT:+--root="$DPKG_ROOT"} ostrya.conf
+fi
+
+#DEBHELPER#
+
+exit 0

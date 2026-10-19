@@ -337,8 +337,16 @@ users.users.alice.extraGroups = [ "ostrya-mount" ];
 `nixosModules.default` imports the two modules. `nixosModules.ostrya-serve`
 and `nixosModules.ostrya-mountd` give each module alone.
 
-The Debian packaging is in `crates/ostrya-cli/debian`. It builds two
-packages: `ostrya`, with the `ostrya` command, and `ostrya-mountd`, with the
+The Debian packaging has two source packages. `crates/ostrya-cli/debian`
+builds the package `ostrya`, with the `ostrya` command, the template unit
+`ostrya-serve@.service`, and the sysusers.d file of the user `ostrya`. The
+instance `ostrya-serve@NAME.service` runs `ostrya serve` as the user `ostrya`
+with the settings of the environment file `/etc/ostrya/serve/NAME.conf`:
+`OSTRYA_REPO` gives the path of the repository, and `OSTRYA_SERVE_ARGS` gives
+the other arguments of `ostrya serve`. Two instances can serve the same
+repository, for example one with plain HTTP and one with HTTPS. The package
+does not enable the unit. The unit is in `crates/ostrya-cli/systemd`.
+`crates/ostrya-mountd/debian` builds the package `ostrya-mountd`, with the
 mount daemon at `/usr/sbin/ostrya-mountd`, its systemd units, and the
 sysusers.d file of the group `ostrya-mount`. The package does not enable the
 socket unit. The units are in `crates/ostrya-mountd/systemd`. The Nix package

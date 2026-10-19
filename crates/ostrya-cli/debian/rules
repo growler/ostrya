@@ -8,35 +8,28 @@ export DEB_BUILD_MAINT_OPTIONS = hardening=+all
 override_dh_auto_configure:
 	cargo fetch --locked
 
-# One cargo run builds both binaries, so the crates that they share build
-# once, with one set of features.
 override_dh_auto_build:
-	cargo build --release --locked -p ostrya-cli -p ostrya-mountd \
-		--bin ostrya --bin ostrya-mountd
+	cargo build --release --locked -p ostrya-cli --bin ostrya
 
 # The suite drives the ostree binary as its oracle and reaches the network,
 # so a package build passes nocheck.
 override_dh_auto_test:
 ifeq (,$(filter nocheck,$(DEB_BUILD_OPTIONS)))
-	cargo test --locked -p ostrya-cli -p ostrya-mountd --all-targets -- --nocapture
+	cargo test --locked -p ostrya-cli --all-targets -- --nocapture
 endif
 
-# The units and the sysusers.d file of the daemon are in
-# crates/ostrya-mountd/systemd. Debhelper compat 13 runs no
-# dh_installsysusers, so ostrya-mountd.postinst runs systemd-sysusers.
+# The unit and the sysusers.d file of ostrya serve are in systemd/. Debhelper
+# compat 13 runs no dh_installsysusers, so ostrya.postinst runs
+# systemd-sysusers.
 override_dh_auto_install:
 	install -Dm755 $(CURDIR)/../../target/release/ostrya \
 		$(CURDIR)/debian/ostrya/usr/bin/ostrya
-	install -Dm755 $(CURDIR)/../../target/release/ostrya-mountd \
-		$(CURDIR)/debian/ostrya-mountd/usr/sbin/ostrya-mountd
-	for unit in ostrya-mountd.socket ostrya-mountd.service ostrya-mountd@.service; do \
-		install -Dm644 $(CURDIR)/../ostrya-mountd/systemd/$$unit \
-			$(CURDIR)/debian/ostrya-mountd/usr/lib/systemd/system/$$unit; \
-	done
-	install -Dm644 $(CURDIR)/../ostrya-mountd/systemd/ostrya-mountd.sysusers \
-		$(CURDIR)/debian/ostrya-mountd/usr/lib/sysusers.d/ostrya-mountd.conf
+	install -Dm644 $(CURDIR)/systemd/ostrya-serve@.service \
+		$(CURDIR)/debian/ostrya/usr/lib/systemd/system/ostrya-serve@.service
+	install -Dm644 $(CURDIR)/systemd/ostrya.sysusers \
+		$(CURDIR)/debian/ostrya/usr/lib/sysusers.d/ostrya.conf
 
-# The package installs the units and does not enable or start them.
+# The package installs the unit and does not enable or start it.
 override_dh_installsystemd:
 	dh_installsystemd --no-enable --no-start
 

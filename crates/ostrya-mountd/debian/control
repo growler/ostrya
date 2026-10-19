@@ -1,0 +1,26 @@
+# The build dependencies do not include cargo and rustc. The build
+# environment installs a pinned Rust toolchain into /usr/opt. The default
+# features of ostrya-mountd compile liblzma from its vendored source, and the
+# binary links it statically. So the build needs a C compiler from
+# build-essential and no -dev package.
+Source: ostrya-mountd
+Section: utils
+Priority: optional
+Maintainer: Alexey Naidyonov <alexey.naidyonov@gmail.com>
+Build-Depends:
+ debhelper-compat (= 13)
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+Homepage: https://github.com/growler/ostrya
+
+Package: ostrya-mountd
+Architecture: linux-any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Recommends: systemd
+Description: composefs mount daemon of ostrya
+ ostrya-mountd mounts a commit of an ostrya repository as a composefs tree
+ for a caller in its own user namespace, for example a rootless container
+ tool. The members of the group ostrya-mount can connect to the daemon.
+ .
+ This package contains the daemon, its systemd units, and the sysusers.d
+ file of the group. The package does not enable the socket unit.

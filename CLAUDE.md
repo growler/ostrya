@@ -584,17 +584,19 @@ until the maintainer asks for that step in words.
    Read the diff of `crates/ostrya-cli/man/`. Each change must come from a
    change to the help text or to a file in `crates/ostrya-cli/man/extra/`.
 4. Add an entry for the new version at the top of
-   `crates/ostrya-cli/debian/changelog`. The Debian package takes its
-   version from this entry, so each release needs one, and its version is
-   the workspace version. Use the form of the entries in the file: the line
-   `ostrya (<version>) unstable; urgency=medium`, one `*` item for each
-   change to the `ostrya` command or its package, and the line of the
-   maintainer with the date in the `date -R` format. If the command and the
-   package do not change, the one item is `New upstream release.`
+   `crates/ostrya-cli/debian/changelog` and of
+   `crates/ostrya-mountd/debian/changelog`. Each Debian package takes its
+   version from its entry, so each release needs one in each file, and its
+   version is the workspace version. Use the form of the entries in the
+   file: the line `<source> (<version>) unstable; urgency=medium`, where
+   `<source>` is `ostrya` or `ostrya-mountd`, one `*` item for each change
+   to the command or its package, and the line of the maintainer with the
+   date in the `date -R` format. If the command and the package do not
+   change, the one item is `New upstream release.`
 5. Run the gates of `.github/workflows/ci.yml`. Run the tests with
    `OSTRYA_REQUIRE_MULTIGROUP=1 OSTRYA_REQUIRE_GNUPG=1`, as CI does.
 6. Commit as `chore(release): bump the workspace version to <version>`. The
-   commit includes the man pages of step 3 and the changelog entry of
+   commit includes the man pages of step 3 and the changelog entries of
    step 4.
 7. Run `cargo publish --workspace --dry-run --locked`. This uploads nothing.
    It refuses an uncommitted tracked file, so it comes after the commit. Fix

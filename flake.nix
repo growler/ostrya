@@ -106,7 +106,7 @@
         in
         {
           packages = {
-            inherit (pkgs) ostrya;
+            inherit (pkgs) ostrya ostrya-mountd;
             default = pkgs.ostrya;
           };
 
@@ -127,7 +127,18 @@
       inherit overlays;
 
       # Each item of `services.ostrya-serve.instances` runs one `ostrya serve`
-      # process. The package defaults to the `ostrya` of this flake.
-      nixosModules.default = import ./nix/module.nix { inherit self; };
+      # process. `services.ostrya-mountd` runs the socket-activated mount
+      # daemon. The packages default to those of this flake. `default` imports
+      # the two modules.
+      nixosModules = {
+        ostrya-serve = import ./nix/module.nix { inherit self; };
+        ostrya-mountd = import ./nix/mountd-module.nix { inherit self; };
+        default = {
+          imports = [
+            self.nixosModules.ostrya-serve
+            self.nixosModules.ostrya-mountd
+          ];
+        };
+      };
     };
 }

@@ -319,6 +319,24 @@ services.ostrya-serve.instances =
   };
 ```
 
+The flake gives the mount daemon as the package `ostrya-mountd`. The option
+`services.ostrya-mountd.enable` installs the units of the daemon, enables the
+socket unit, and creates the group `ostrya-mount`. The options `socketConfig`
+and `serviceConfig` add settings to the units. The example below serves all
+connections with one process and lets the user `alice` mount through the
+daemon:
+
+```nix
+services.ostrya-mountd = {
+  enable = true;
+  socketConfig.Accept = false;
+};
+users.users.alice.extraGroups = [ "ostrya-mount" ];
+```
+
+`nixosModules.default` imports the two modules. `nixosModules.ostrya-serve`
+and `nixosModules.ostrya-mountd` give each module alone.
+
 The Debian packaging is in `crates/ostrya-cli/debian`. It builds two
 packages: `ostrya`, with the `ostrya` command, and `ostrya-mountd`, with the
 mount daemon at `/usr/sbin/ostrya-mountd`, its systemd units, and the

@@ -71,19 +71,22 @@ jobs:
           cargo build -p ostrya-cli
           ! readelf -d target/debug/ostrya | grep -qi pcre2
 
-      # `ostrya-cli` carries `lzma-static` in its default set, so the shipped
-      # binary needs no runtime liblzma (`CLAUDE.md`, goal 1). The library's
-      # own default set leaves the feature off, so the binary's default build
-      # is the one configuration that holds the invariant, and dropping the
-      # feature from that set is what this step catches. The assertion reads
+      # `ostrya-cli` and `ostrya-mountd` carry `lzma-static` in their default
+      # sets, so the shipped binaries need no runtime liblzma (`CLAUDE.md`,
+      # goal 1). The library's own default set leaves the feature off, so the
+      # default build of each binary is the one configuration that holds the
+      # invariant, and dropping the feature from that set is what this step
+      # catches. The assertion reads
       # the resolved feature list rather than the linked binary, because
       # `liblzma-sys` builds the vendored xz sources wherever `pkg-config`
       # reports a system liblzma older than 5.8.0, which makes a `readelf`
       # check pass on such a runner with the feature off.
-      - name: The shipped binary links xz statically
+      - name: The shipped binaries link xz statically
         run: |
-          cargo tree -p ostrya-cli -e normal,build -f "{p} {f}" \
-            | grep -qE 'liblzma-sys v[0-9.]+ .*\bstatic\b'
+          for package in ostrya-cli ostrya-mountd; do
+            cargo tree -p "$package" -e normal,build -f "{p} {f}" \
+              | grep -qE 'liblzma-sys v[0-9.]+ .*\bstatic\b'
+          done
 
       # Every package in the graph, under every feature, must carry a
       # permissive license (`CLAUDE.md`, "Requirement: permissive licenses
@@ -192,9 +195,13 @@ jobs:
           cargo check -p ostrya-cli --no-default-features --features smol,serve
 
       # The composefs mount library compiles on the smol backend with its own
-      # feature set.
+      # feature set, with and without the handler of the mount daemon, and so
+      # does the daemon.
       - name: ostrya-mount on the smol backend compiles
-        run: cargo check -p ostrya-mount --no-default-features --features smol
+        run: |
+          cargo check -p ostrya-mount --no-default-features --features smol
+          cargo check -p ostrya-mount --no-default-features --features smol,server
+          cargo check -p ostrya-mountd --no-default-features --features smol
 
       # `Repo::send` takes no feature of `ostrya`, so `ostrya send` compiles
       # without `receive`, `push`, and `serve`.
@@ -249,14 +256,15 @@ jobs:
       # `default-features = false`, and each dependent forwards `smol` and
       # `tokio` itself. So a tokio build of `ostrya` holds no `smol`, with and
       # without the `receive` and the `push` features, and so does a tokio
-      # build of `ostrya-server` and of `ostrya-mount`. `ostrya-remote` is a
-      # regular dependency of `ostrya`, so each of these builds holds it. This
-      # fails when one path turns the smol backend on.
+      # build of `ostrya-server`, of `ostrya-mount` with and without `server`,
+      # and of `ostrya-mountd`. `ostrya-remote` is a regular dependency of
+      # `ostrya`, so each of these builds holds it. This fails when one path
+      # turns the smol backend on.
       # `cargo tree -i` exits non-zero both when the package is absent and on
       # any other failure, so the step also reads the error text.
       - name: A tokio build holds no smol
         run: |
-          for build in ostrya:tokio ostrya:tokio,receive ostrya:tokio,push ostrya-server:tokio ostrya-mount:tokio; do
+          for build in ostrya:tokio ostrya:tokio,receive ostrya:tokio,push ostrya-server:tokio ostrya-mount:tokio ostrya-mount:tokio,server ostrya-mountd:tokio; do
             package=${build%%:*}
             features=${build#*:}
             if out=$(cargo tree -p "$package" --no-default-features --features "$features" -i smol 2>&1); then

@@ -3,7 +3,8 @@
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::Path;
 
-use ostrya::{Checksum, ComposefsOptions, Repo};
+use ostrya::{Checksum, Repo, VerityPolicy};
+use rustix::mount::MountAttrFlags;
 
 use crate::error::{Error, Result};
 use crate::options::{MountOptions, OverlayVerity, check_mode, verity_for};
@@ -32,32 +33,36 @@ pub struct Direct {
 }
 
 /// The values that each mount of a repository takes from it.
-struct RepoPlan {
+pub(crate) struct RepoPlan {
     /// The `verity` option of the composefs overlay.
-    verity: OverlayVerity,
-    /// The options of a built image.
-    build: ComposefsOptions,
+    pub(crate) verity: OverlayVerity,
+    /// The verity policy of a built image.
+    pub(crate) build: VerityPolicy,
 }
 
 impl RepoPlan {
     /// Refuses a repository that cannot be mounted, and reads the verity
     /// choice from its config.
-    fn new(repo: &Repo) -> Result<RepoPlan> {
+    pub(crate) fn new(repo: &Repo) -> Result<RepoPlan> {
         check_mode(repo.mode())?;
         let (verity, policy) = verity_for(repo.config().fsverity()?);
         Ok(RepoPlan {
             verity,
-            build: ComposefsOptions { verity: policy },
+            build: policy,
         })
     }
 
     /// Returns the settings of a mount with `opts`, with `source` as the
     /// label if `opts` gives none.
+    ///
+    /// The plan adds no attribute flag and no ID mapping.
     fn plan(&self, opts: &MountOptions, source: impl FnOnce() -> String) -> Plan {
         Plan {
             verity: self.verity,
             access: opts.access,
             source: opts.source.clone().unwrap_or_else(source),
+            attrs: MountAttrFlags::empty(),
+            idmap: None,
         }
     }
 }
@@ -115,8 +120,10 @@ impl Direct {
     ///
     /// With `[ex-integrity] fsverity=yes`, the image carries the fs-verity
     /// digest of each backing object, and the overlay mounts with
-    /// `verity=require`. With another value, the image carries no digest, and
-    /// the overlay mounts with `verity=off`.
+    /// `verity=require`. The call takes each digest from the kernel and reads
+    /// no content. A backing object with no fs-verity seal fails the call,
+    /// because the overlay cannot open it. With another value, the image
+    /// carries no digest, and the overlay mounts with `verity=off`.
     ///
     /// Returns a descriptor of the root of the new mount. The descriptor
     /// keeps the mount in use, so close it before [`Direct::unmount`].
@@ -125,7 +132,9 @@ impl Direct {
     ///
     /// - [`Error::UnsupportedMode`] for an `archive` repository.
     /// - [`Error::Repo`] with the errors of [`Repo::export_composefs_to`],
-    ///   and if `[ex-integrity] fsverity` in the config is malformed.
+    ///   if `[ex-integrity] fsverity` in the config is malformed, and with
+    ///   [`ostrya::Error::Unsupported`] if `[ex-integrity] fsverity` is `yes`
+    ///   and a backing object has no fs-verity seal.
     /// - [`Error::Sys`] if the memory file cannot be created or sealed, or if
     ///   a system call of the mount fails. [`Direct::mount_image`] lists the
     ///   steps.
@@ -137,11 +146,7 @@ impl Direct {
         opts: &MountOptions,
     ) -> Result<OwnedFd> {
         let repo_plan = RepoPlan::new(repo)?;
-        let image = ostrya_sys::sealable_memfd(&format!("ostrya-cfs-{commit}"))
-            .map_err(|e| Error::sys("memfd_create", e))?;
-        repo.export_composefs_to(commit, &repo_plan.build, image.as_fd())
-            .await?;
-        ostrya_sys::seal_contents(&image).map_err(|e| Error::sys("seal memfd", e))?;
+        let image = build_image(repo, commit, &repo_plan, u64::MAX).await?;
         let plan = repo_plan.plan(opts, || commit.to_hex());
         run(image, repo, target, plan).await
     }
@@ -227,6 +232,25 @@ impl Direct {
         let target = target.to_owned();
         ostrya_rt::unblock(move || unmount_overlay(&target)).await
     }
+}
+
+/// Builds the composefs image of `commit` into a sealed memory file.
+///
+/// The build refuses an image larger than `max_size` bytes before it writes
+/// a byte. Under [`VerityPolicy::Computed`], it takes the digest of each
+/// backing object from the kernel, and refuses an object with no seal.
+pub(crate) async fn build_image(
+    repo: &Repo,
+    commit: &Checksum,
+    repo_plan: &RepoPlan,
+    max_size: u64,
+) -> Result<OwnedFd> {
+    let image = ostrya_sys::sealable_memfd(&format!("ostrya-cfs-{commit}"))
+        .map_err(|e| Error::sys("memfd_create", e))?;
+    repo.export_composefs_for_mount(commit, repo_plan.build, image.as_fd(), max_size)
+        .await?;
+    ostrya_sys::seal_contents(&image).map_err(|e| Error::sys("seal memfd", e))?;
+    Ok(image)
 }
 
 /// Runs the blocking mount steps on the blocking pool.

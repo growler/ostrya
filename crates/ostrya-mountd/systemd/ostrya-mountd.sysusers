@@ -1,0 +1,3 @@
+# The group of the socket of ostrya-mountd. Its members can mount composefs
+# trees through the daemon.
+g ostrya-mount -

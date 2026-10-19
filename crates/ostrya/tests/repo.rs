@@ -370,3 +370,115 @@ fn write_config_replaces_the_document_and_keeps_the_mode() {
     // If the keyring is already absent, the removal succeeds.
     block_on(reopened.remove_remote_keyring("origin")).expect("remove keyring again");
 }
+
+/// Creates a `bare-user` repository `repo` under `tmp` and returns a
+/// descriptor of `tmp`.
+fn strict_fixture(tmp: &TmpDir) -> std::fs::File {
+    block_on(Repo::create(
+        &tmp.path().join("repo"),
+        CreateOptions::new(RepoMode::BareUser),
+    ))
+    .expect("create");
+    std::fs::File::open(tmp.path()).unwrap()
+}
+
+/// Runs `open` on a new thread and waits at most 10 seconds for it, so that
+/// an open that blocks fails the test.
+fn open_in_time(
+    open: impl FnOnce() -> ostrya::Result<Repo> + Send + 'static,
+) -> ostrya::Result<Repo> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = tx.send(open());
+    });
+    rx.recv_timeout(std::time::Duration::from_secs(10))
+        .expect("the open returns in time")
+}
+
+/// The strict open mode refuses a `config` that is a symlink. The default
+/// open follows it.
+#[test]
+fn the_strict_open_refuses_a_symlinked_config() {
+    let tmp = TmpDir::new("strict-link");
+    let parent = strict_fixture(&tmp);
+    let repo = tmp.path().join("repo");
+    std::fs::rename(repo.join("config"), tmp.path().join("real-config")).unwrap();
+    std::os::unix::fs::symlink("../real-config", repo.join("config")).unwrap();
+
+    let fd = std::os::fd::AsFd::as_fd(&parent);
+    block_on(Repo::open_at(fd, Path::new("repo"))).expect("the default open follows it");
+    let err = block_on(Repo::open_at_strict(fd, Path::new("repo"))).unwrap_err();
+    match err {
+        ostrya::Error::Io(e) => assert_eq!(e.raw_os_error(), Some(eloop()), "{e}"),
+        other => panic!("{other}"),
+    }
+}
+
+/// The strict open mode refuses a `config` that is a FIFO, and the open does
+/// not wait for a writer.
+#[test]
+fn the_strict_open_refuses_a_fifo_config() {
+    let tmp = TmpDir::new("strict-fifo");
+    let parent = strict_fixture(&tmp);
+    let repo = tmp.path().join("repo");
+    std::fs::remove_file(repo.join("config")).unwrap();
+    rustix::fs::mknodat(
+        rustix::fs::CWD,
+        repo.join("config"),
+        rustix::fs::FileType::Fifo,
+        rustix::fs::Mode::from_raw_mode(0o644),
+        0,
+    )
+    .unwrap();
+
+    let err = open_in_time(move || {
+        block_on(Repo::open_at_strict(
+            std::os::fd::AsFd::as_fd(&parent),
+            Path::new("repo"),
+        ))
+    })
+    .unwrap_err();
+    match err {
+        ostrya::Error::Io(e) => {
+            assert_eq!(e.kind(), std::io::ErrorKind::InvalidData, "{e}");
+            assert!(e.to_string().contains("not a regular file"), "{e}");
+        }
+        other => panic!("{other}"),
+    }
+}
+
+/// A handle in the strict open mode refuses a metadata object that is a
+/// symlink. A handle of the default open follows it.
+#[test]
+fn the_strict_open_refuses_a_symlinked_metadata_object() {
+    let tmp = TmpDir::new("strict-meta");
+    let parent = strict_fixture(&tmp);
+    let fanout = tmp.path().join("repo/objects/ab");
+    std::fs::create_dir_all(&fanout).unwrap();
+    let rest = "c".repeat(62);
+    std::os::unix::fs::symlink("../../config", fanout.join(format!("{rest}.dirtree"))).unwrap();
+    let checksum: ostrya::Checksum = format!("ab{rest}").parse().unwrap();
+
+    let fd = std::os::fd::AsFd::as_fd(&parent);
+    let plain = block_on(Repo::open_at(fd, Path::new("repo"))).unwrap();
+    let bytes = block_on(plain.load_object_bytes(ostrya::ObjectType::DirTree, &checksum))
+        .expect("the default handle follows the symlink");
+    assert!(bytes.starts_with(b"[core]"));
+
+    let strict = block_on(Repo::open_at_strict(fd, Path::new("repo"))).unwrap();
+    let err =
+        block_on(strict.load_object_bytes(ostrya::ObjectType::DirTree, &checksum)).unwrap_err();
+    match err {
+        ostrya::Error::Io(e) => assert_eq!(e.raw_os_error(), Some(eloop()), "{e}"),
+        other => panic!("{other}"),
+    }
+    let err = block_on(strict.metadata_reader(ostrya::ObjectType::DirTree, &checksum))
+        .err()
+        .expect("the strict reader refuses the symlink");
+    assert!(matches!(err, ostrya::Error::Io(_)), "{err}");
+}
+
+/// Returns the error number `ELOOP`.
+fn eloop() -> i32 {
+    rustix::io::Errno::LOOP.raw_os_error()
+}

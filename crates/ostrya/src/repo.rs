@@ -118,6 +118,10 @@ struct RepoInner {
     // it. It is a record of the argument of the caller, and no I/O uses it.
     // Each access goes through `repo_fd` and `objects_fd`.
     path: PathBuf,
+    // The strict open mode of `Repo::open_at_strict`: the reads of `config`,
+    // of the metadata objects, and of the composefs image follow no symlink,
+    // do not block on a FIFO, and refuse a file that is not a regular file.
+    strict: bool,
     // The repository lock. The first acquire of the repository lock creates
     // it, and the handle keeps it for its full life. So all clones of this
     // handle share one `.lock` descriptor and one in-process hold count.
@@ -162,6 +166,7 @@ struct Materials {
     repo_fd: OwnedFd,
     objects_fd: OwnedFd,
     config: Vec<u8>,
+    strict: bool,
 }
 
 /// Methods that open or create a repository and begin a transaction.
@@ -183,7 +188,8 @@ impl Repo {
     pub async fn open(path: &Path) -> Result<Repo> {
         let path = path.to_owned();
         let stored = path.clone();
-        let materials = ostrya_rt::unblock(move || open_materials(rustix::fs::CWD, &path)).await?;
+        let materials =
+            ostrya_rt::unblock(move || open_materials(rustix::fs::CWD, &path, false)).await?;
         Repo::assemble(materials, stored)
     }
 
@@ -206,7 +212,36 @@ impl Repo {
         let dir = dir.try_clone_to_owned()?;
         let path = path.to_owned();
         let stored = path.clone();
-        let materials = ostrya_rt::unblock(move || open_materials(&dir, &path)).await?;
+        let materials = ostrya_rt::unblock(move || open_materials(&dir, &path, false)).await?;
+        Repo::assemble(materials, stored)
+    }
+
+    /// Opens the repository at `path`, relative to the directory `dir`, in
+    /// the strict open mode. A process that reads a repository of another
+    /// user with more privileges than that user opens it in this mode.
+    ///
+    /// The handle is the handle of [`open_at`](Repo::open_at), with these
+    /// changes:
+    ///
+    /// - The open of `objects` follows no symlink.
+    /// - The reads of `config`, of each metadata object, and of the stored
+    ///   composefs image open the file with `O_NOFOLLOW` and `O_NONBLOCK`,
+    ///   and refuse a file that is not a regular file. A symlink, a FIFO, or
+    ///   a device at such a path fails the read and does not block it.
+    ///
+    /// The function is not a stable API.
+    ///
+    /// # Errors
+    ///
+    /// - The errors of [`open_at`](Repo::open_at).
+    /// - [`Error::Io`] if `objects` or `config` is a symlink, or if `config`
+    ///   is not a regular file.
+    #[doc(hidden)]
+    pub async fn open_at_strict(dir: BorrowedFd<'_>, path: &Path) -> Result<Repo> {
+        let dir = dir.try_clone_to_owned()?;
+        let path = path.to_owned();
+        let stored = path.clone();
+        let materials = ostrya_rt::unblock(move || open_materials(&dir, &path, true)).await?;
         Repo::assemble(materials, stored)
     }
 
@@ -559,7 +594,17 @@ impl Repo {
     /// The handle keeps the config that it read at the open.
     pub(crate) async fn read_config_file(&self) -> Result<RepoConfig> {
         let repo = self.clone();
-        ostrya_rt::unblock(move || read_config_blocking(repo.repo_fd())).await
+        ostrya_rt::unblock(move || {
+            let bytes = read_file(repo.repo_fd(), CONFIG, repo.is_strict())?;
+            parse_config(&bytes)
+        })
+        .await
+    }
+
+    /// Returns `true` if the handle opened in the strict open mode of
+    /// [`open_at_strict`](Repo::open_at_strict).
+    pub(crate) fn is_strict(&self) -> bool {
+        self.inner.strict
     }
 
     /// Returns the descriptor of the repository root. Descriptor-relative
@@ -585,6 +630,7 @@ impl Repo {
                 objects_fd: materials.objects_fd,
                 config,
                 path,
+                strict: materials.strict,
                 lock: Mutex::new(None),
                 update_lock: Mutex::new(None),
             }),
@@ -606,7 +652,7 @@ pub(crate) fn check_config_size(bytes: &[u8]) -> Result<()> {
 /// Reads `config` at the repository root and parses it, as the open of a
 /// handle does. Blocks the calling thread.
 pub(crate) fn read_config_blocking(repo_fd: BorrowedFd<'_>) -> Result<RepoConfig> {
-    let bytes = read_file(repo_fd, CONFIG)?;
+    let bytes = read_file(repo_fd, CONFIG, false)?;
     parse_config(&bytes)
 }
 
@@ -642,10 +688,11 @@ fn free_budget(repo_fd: BorrowedFd<'_>, min_free: MinFreeSpace) -> Result<u64> {
     Ok(available.saturating_sub(reserved))
 }
 
-/// Opens an existing repository directory and gathers its materials.
-fn open_materials<Fd: AsFd>(dir: Fd, path: &Path) -> std::io::Result<Materials> {
+/// Opens an existing repository directory and gathers its materials, in the
+/// strict open mode if `strict` is set.
+fn open_materials<Fd: AsFd>(dir: Fd, path: &Path, strict: bool) -> std::io::Result<Materials> {
     let repo_fd = open_dir(dir, path)?;
-    materials_from_repo(repo_fd)
+    materials_from_repo(repo_fd, strict)
 }
 
 /// Makes sure that the repository layout and the config exist, then gathers
@@ -661,18 +708,28 @@ fn create_materials<Fd: AsFd>(
         mkdir_idempotent(&repo_fd, Path::new(sub), opts.mode)?;
     }
     write_initial_config(&repo_fd, opts)?;
-    materials_from_repo(repo_fd)
+    materials_from_repo(repo_fd, false)
 }
 
 /// Opens the `objects/` directory and reads the config, given the descriptor
-/// of the repository root.
-fn materials_from_repo(repo_fd: OwnedFd) -> std::io::Result<Materials> {
-    let objects_fd = open_dir(&repo_fd, Path::new("objects"))?;
-    let config = read_file(&repo_fd, CONFIG)?;
+/// of the repository root. In the strict open mode, the open of `objects/`
+/// follows no symlink.
+fn materials_from_repo(repo_fd: OwnedFd, strict: bool) -> std::io::Result<Materials> {
+    let objects_fd = match strict {
+        true => rustix::fs::openat(
+            &repo_fd,
+            "objects",
+            OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
+            Mode::empty(),
+        )?,
+        false => open_dir(&repo_fd, Path::new("objects"))?,
+    };
+    let config = read_file(&repo_fd, CONFIG, strict)?;
     Ok(Materials {
         repo_fd,
         objects_fd,
         config,
+        strict,
     })
 }
 
@@ -691,8 +748,10 @@ fn open_dir<Fd: AsFd>(dir: Fd, path: &Path) -> std::io::Result<OwnedFd> {
 /// [`MAX_CONFIG_SIZE`].
 ///
 /// The parse can then refuse a file over the cap, and the read stops there.
-fn read_file<Fd: AsFd>(dir: Fd, path: &str) -> std::io::Result<Vec<u8>> {
-    let fd = rustix::fs::openat(dir, path, OFlags::RDONLY | OFlags::CLOEXEC, Mode::empty())?;
+/// In the strict open mode, the open follows no symlink and does not block,
+/// and a file that is not a regular file is refused.
+fn read_file<Fd: AsFd>(dir: Fd, path: &str, strict: bool) -> std::io::Result<Vec<u8>> {
+    let fd = crate::object::open_regular_file(dir.as_fd(), path, strict)?;
     let mut buf = Vec::new();
     std::fs::File::from(fd)
         .take(MAX_CONFIG_SIZE + 1)

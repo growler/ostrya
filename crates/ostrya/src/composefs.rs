@@ -53,7 +53,7 @@ use std::pin::Pin;
 use futures_io::AsyncRead;
 use ostrya_composefs::{
     Content, Directory, Error as WriterError, FsVerityHasher, Image, Metadata, Node, Regular,
-    Symlink, build_image, write_image_to,
+    Symlink, build_image, write_image_to, write_image_unhashed_to,
 };
 use ostrya_core::{
     Checksum, Commit, DirMeta, DirTree, ObjectType, RepoMode, Type, Value, Xattrs, loose_path,
@@ -193,6 +193,28 @@ impl ComposefsOptions {
     };
 }
 
+/// The way the export gets the fs-verity digest of each backed file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Digests {
+    /// The digest that the kernel holds for a sealed object, or else the
+    /// digest of the streamed payload. [`VerityPolicy::Computed`] gives it.
+    Computed,
+    /// The digest that the kernel holds for a sealed object. An object with
+    /// no seal is refused, and no payload is read.
+    Sealed,
+    /// No digest. [`VerityPolicy::Disabled`] gives it.
+    Disabled,
+}
+
+impl From<VerityPolicy> for Digests {
+    fn from(policy: VerityPolicy) -> Digests {
+        match policy {
+            VerityPolicy::Computed => Digests::Computed,
+            VerityPolicy::Disabled => Digests::Disabled,
+        }
+    }
+}
+
 /// The result of a write of the composefs image of a commit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ComposefsImageAdd {
@@ -327,7 +349,7 @@ impl Transaction {
         let dir = composefs_model(
             ObjectSource::Staged(self),
             root,
-            &ComposefsOptions::RECORDED,
+            ComposefsOptions::RECORDED.verity.into(),
         )
         .await?;
         image_digest(dir).await
@@ -382,7 +404,7 @@ impl Transaction {
         let dir = composefs_model(
             ObjectSource::Staged(self),
             root,
-            &ComposefsOptions::RECORDED,
+            ComposefsOptions::RECORDED.verity.into(),
         )
         .await?;
         let staging = self.staging_fd().try_clone_to_owned()?;
@@ -856,7 +878,9 @@ impl Repo {
         commit: &Checksum,
         opts: &ComposefsOptions,
     ) -> Result<Image> {
-        let dir = self.composefs_export_model(commit, opts).await?;
+        let dir = self
+            .composefs_export_model(commit, opts.verity.into())
+            .await?;
         ostrya_rt::unblock(move || build_image(&dir))
             .await
             .map_err(writer_error)
@@ -894,7 +918,9 @@ impl Repo {
         opts: &ComposefsOptions,
         out: BorrowedFd<'_>,
     ) -> Result<[u8; 32]> {
-        let dir = self.composefs_export_model(commit, opts).await?;
+        let dir = self
+            .composefs_export_model(commit, opts.verity.into())
+            .await?;
         // The blocking pool needs an owned handle, so the call duplicates the
         // descriptor of the caller for the closure to move.
         let fd = out.try_clone_to_owned()?;
@@ -903,29 +929,74 @@ impl Repo {
             .map_err(writer_error)
     }
 
+    /// Writes the composefs image of `commit` to `out` for a mount, and
+    /// returns the size of the image in bytes.
+    ///
+    /// The image is the image of
+    /// [`export_composefs_to`](Repo::export_composefs_to) with `verity`, with
+    /// these changes:
+    ///
+    /// - Under [`VerityPolicy::Computed`], the call takes the fs-verity digest
+    ///   of each backed file from the kernel alone, and reads no payload. An
+    ///   object with no seal, or with a seal of other parameters, fails the
+    ///   call. An overlay with `verity=require` cannot open such an object.
+    /// - The call computes no fs-verity digest of the image.
+    /// - The call computes the size of the image before it writes, and
+    ///   refuses an image larger than `max_size` bytes with no write.
+    ///
+    /// The function is not a stable API.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Unsupported`] if a backed file has no seal under
+    ///   [`VerityPolicy::Computed`], or if the image is larger than
+    ///   `max_size` bytes.
+    /// - The errors of [`export_composefs_to`](Repo::export_composefs_to).
+    #[doc(hidden)]
+    pub async fn export_composefs_for_mount(
+        &self,
+        commit: &Checksum,
+        verity: VerityPolicy,
+        out: BorrowedFd<'_>,
+        max_size: u64,
+    ) -> Result<u64> {
+        let digests = match verity {
+            VerityPolicy::Computed => Digests::Sealed,
+            VerityPolicy::Disabled => Digests::Disabled,
+        };
+        let dir = self.composefs_export_model(commit, digests).await?;
+        let fd = out.try_clone_to_owned()?;
+        ostrya_rt::unblock(move || {
+            let mut out = BufWriter::with_capacity(DIGEST_CHUNK, std::fs::File::from(fd));
+            write_image_unhashed_to(&dir, &mut out, max_size)
+        })
+        .await
+        .map_err(writer_error)
+    }
+
     /// Returns the composefs tree model of the root of `commit`. The two
     /// export entry points share this step.
     async fn composefs_export_model(
         &self,
         commit: &Checksum,
-        opts: &ComposefsOptions,
+        digests: Digests,
     ) -> Result<Directory> {
         let (commit_obj, _) = self.load_commit(commit).await?;
-        self.composefs_commit_model(&commit_obj, opts).await
+        self.composefs_commit_model(&commit_obj, digests).await
     }
 
     /// Returns the composefs tree model of the root of a loaded commit.
     async fn composefs_commit_model(
         &self,
         commit_obj: &Commit,
-        opts: &ComposefsOptions,
+        digests: Digests,
     ) -> Result<Directory> {
         let tree = RepoTree::from_parts(
             self.clone(),
             commit_obj.root_dirtree,
             commit_obj.root_dirmeta,
         );
-        composefs_model(ObjectSource::Repo(self), &tree, opts).await
+        composefs_model(ObjectSource::Repo(self), &tree, digests).await
     }
 
     /// Stages a new commit that records the composefs image digest of
@@ -992,7 +1063,7 @@ impl Repo {
             )));
         }
         let dir = self
-            .composefs_commit_model(&commit_obj, &ComposefsOptions::RECORDED)
+            .composefs_commit_model(&commit_obj, ComposefsOptions::RECORDED.verity.into())
             .await?;
         let fs_verity = image_digest(dir).await?;
         let digest_type = Type::parse(DIGEST_SIGNATURE).map_err(ostrya_core::Error::from)?;
@@ -1120,7 +1191,7 @@ impl Repo {
                 mut file,
                 len,
                 sealed,
-            }) = open_stored_image_blocking(repo.objects_fd(), &commit, repo.mode())?
+            }) = open_stored_image_blocking(&repo, &commit)?
             else {
                 return Err(Error::ObjectNotFound {
                     checksum: commit,
@@ -1155,10 +1226,7 @@ impl Repo {
     pub(crate) async fn stored_image_digest(&self, commit: &Checksum) -> Result<Option<[u8; 32]>> {
         let repo = self.clone();
         let commit = *commit;
-        ostrya_rt::unblock(move || {
-            stored_image_digest_blocking(repo.objects_fd(), &commit, repo.mode())
-        })
-        .await
+        ostrya_rt::unblock(move || stored_image_digest_blocking(&repo, &commit)).await
     }
 
     /// Opens the stored composefs image of `commit` for reading, and returns
@@ -1174,7 +1242,7 @@ impl Repo {
         let repo = self.clone();
         let commit = *commit;
         ostrya_rt::unblock(move || {
-            let image = open_stored_image_blocking(repo.objects_fd(), &commit, repo.mode())?;
+            let image = open_stored_image_blocking(&repo, &commit)?;
             Ok(image.map(|image| (image.file, image.len)))
         })
         .await
@@ -1191,15 +1259,11 @@ struct StoredImage {
     sealed: bool,
 }
 
-/// Opens the stored composefs image of `commit` under `objects_fd` for
-/// reading, and reads its size and its fs-verity attribute with one `statx`
-/// of the open file. Returns `None` if the image is absent.
-fn open_stored_image_blocking(
-    objects_fd: BorrowedFd<'_>,
-    commit: &Checksum,
-    mode: RepoMode,
-) -> Result<Option<StoredImage>> {
-    let Some(file) = open_image_blocking(objects_fd, commit, mode)? else {
+/// Opens the stored composefs image of `commit` in `repo` for reading, and
+/// reads its size and its fs-verity attribute with one `statx` of the open
+/// file. Returns `None` if the image is absent.
+fn open_stored_image_blocking(repo: &Repo, commit: &Checksum) -> Result<Option<StoredImage>> {
+    let Some(file) = open_image_blocking(repo, commit)? else {
         return Ok(None);
     };
     let stat = rustix::fs::statx(
@@ -1215,37 +1279,46 @@ fn open_stored_image_blocking(
     }))
 }
 
-/// Opens the stored composefs image of `commit` under `objects_fd` for
-/// reading, or returns `None` if the image is absent.
-fn open_image_blocking(
-    objects_fd: BorrowedFd<'_>,
-    commit: &Checksum,
-    mode: RepoMode,
-) -> Result<Option<std::fs::File>> {
-    let path = loose_path(commit, ObjectType::ComposefsImage, mode);
-    match rustix::fs::openat(
-        objects_fd,
-        path.as_str(),
-        rustix::fs::OFlags::RDONLY | rustix::fs::OFlags::CLOEXEC | rustix::fs::OFlags::NOFOLLOW,
-        rustix::fs::Mode::empty(),
-    ) {
-        Ok(fd) => Ok(Some(std::fs::File::from(fd))),
-        Err(rustix::io::Errno::NOENT) => Ok(None),
-        Err(e) => Err(e.into()),
+/// Opens the stored composefs image of `commit` in `repo` for reading, or
+/// returns `None` if the image is absent.
+///
+/// The open follows no symlink. In the strict open mode of
+/// [`Repo::open_at_strict`], it also does not wait on a FIFO, and it refuses
+/// a file that is not a regular file.
+fn open_image_blocking(repo: &Repo, commit: &Checksum) -> Result<Option<std::fs::File>> {
+    use rustix::fs::{FileType, Mode, OFlags};
+
+    let path = loose_path(commit, ObjectType::ComposefsImage, repo.mode());
+    let mut flags = OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW;
+    if repo.is_strict() {
+        flags |= OFlags::NONBLOCK | OFlags::NOCTTY;
     }
+    let fd = match rustix::fs::openat(repo.objects_fd(), path.as_str(), flags, Mode::empty()) {
+        Ok(fd) => fd,
+        Err(rustix::io::Errno::NOENT) => return Ok(None),
+        Err(e) => return Err(e.into()),
+    };
+    if repo.is_strict()
+        && FileType::from_raw_mode(rustix::fs::fstat(&fd)?.st_mode) != FileType::RegularFile
+    {
+        return Err(Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "the composefs image is not a regular file",
+        )));
+    }
+    Ok(Some(std::fs::File::from(fd)))
 }
 
-/// Returns the fs-verity digest of the stored composefs image of `commit`
-/// under `objects_fd`, or `None` if the image is absent.
+/// Returns the fs-verity digest of the stored composefs image of `commit` in
+/// `repo`, or `None` if the image is absent.
 ///
 /// The function reads the image in chunks of 128 KiB and feeds each chunk to
 /// the fs-verity hasher, so it holds no image-sized buffer.
 pub(crate) fn stored_image_digest_blocking(
-    objects_fd: BorrowedFd<'_>,
+    repo: &Repo,
     commit: &Checksum,
-    mode: RepoMode,
 ) -> Result<Option<[u8; 32]>> {
-    let Some(mut file) = open_image_blocking(objects_fd, commit, mode)? else {
+    let Some(mut file) = open_image_blocking(repo, commit)? else {
         return Ok(None);
     };
     Ok(Some(image_file_digest(&mut file)?))
@@ -1341,13 +1414,13 @@ pub(crate) fn digest_hex(digest: &[u8; 32]) -> String {
 async fn composefs_model(
     source: ObjectSource<'_>,
     root: &RepoTree,
-    opts: &ComposefsOptions,
+    digests: Digests,
 ) -> Result<Directory> {
     let mut dir = build_directory(
         source,
         *root.dirtree_checksum(),
         *root.dirmeta_checksum(),
-        opts.verity,
+        digests,
     )
     .await?;
     inject_top_level_dirs(&mut dir);
@@ -1388,18 +1461,18 @@ fn build_directory(
     source: ObjectSource<'_>,
     dirtree: Checksum,
     dirmeta: Checksum,
-    verity: VerityPolicy,
+    digests: Digests,
 ) -> TreeFuture<'_> {
     Box::pin(async move {
         let meta = source.dirmeta(&dirmeta).await?;
         let mut dir = Directory::new(dirmeta_to_metadata(&meta)?);
         let tree = source.dirtree(&dirtree).await?;
         for (name, checksum) in tree.files {
-            let node = file_node(source, &checksum, verity).await?;
+            let node = file_node(source, &checksum, digests).await?;
             dir.children.insert(name.into_bytes(), node);
         }
         for (name, subtree, submeta) in tree.dirs {
-            let sub = build_directory(source, subtree, submeta, verity).await?;
+            let sub = build_directory(source, subtree, submeta, digests).await?;
             dir.children.insert(name.into_bytes(), Node::Directory(sub));
         }
         Ok(dir)
@@ -1411,19 +1484,17 @@ fn build_directory(
 /// - A symlink stores its target inline.
 /// - An empty regular file has no backing.
 /// - A regular file with content redirects to its `.file` loose path. Under
-///   [`VerityPolicy::Computed`], it carries the fs-verity digest of its
-///   content.
+///   [`Digests::Computed`] and [`Digests::Sealed`], it carries the fs-verity
+///   digest of its content.
 ///
-/// The call reads the file object under both policies, because the metadata
-/// of the inode comes from it.
+/// The call reads the file object in each mode, because the metadata of the
+/// inode comes from it.
 async fn file_node(
     source: ObjectSource<'_>,
     checksum: &Checksum,
-    verity: VerityPolicy,
+    digests: Digests,
 ) -> Result<Node> {
-    let file = source
-        .file(checksum, verity == VerityPolicy::Computed)
-        .await?;
+    let file = source.file(checksum, digests != Digests::Disabled).await?;
     let meta = file_to_metadata(&file)?;
     match &file.kind {
         FileKind::Symlink { target } => Ok(Node::Symlink(Symlink {
@@ -1434,9 +1505,15 @@ async fn file_node(
             let content = if *size == 0 {
                 Content::Empty
             } else {
-                let digest = match verity {
-                    VerityPolicy::Computed => Some(content_fs_verity(&file).await?),
-                    VerityPolicy::Disabled => None,
+                let digest = match digests {
+                    Digests::Computed => Some(content_fs_verity(&file).await?),
+                    Digests::Sealed => Some(file.kernel_fs_verity().ok_or_else(|| {
+                        Error::Unsupported(format!(
+                            "the file object {checksum} has no fs-verity seal with SHA-256, \
+                             4096-byte blocks, and no salt"
+                        ))
+                    })?),
+                    Digests::Disabled => None,
                 };
                 Content::Backed {
                     size: *size,

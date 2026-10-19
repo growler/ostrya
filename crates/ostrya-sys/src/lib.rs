@@ -1,14 +1,19 @@
 #![deny(unsafe_code)]
 
 //! Wrappers for the Linux fs-verity ioctls, a read-only memory map, the loop
-//! device, and a sealed memory file.
+//! device, a sealed memory file, namespace descriptors, ID-mapped mounts,
+//! and socket credentials.
 //!
 //! A caller seals a file with fs-verity and reads the digest and the
 //! parameters that the kernel holds for the sealed file. The seal has the
 //! parameters that ostree uses: SHA-256, 4096-byte blocks, and no salt. A
 //! caller can also map a file read-only. On Linux, a caller attaches a file
 //! to a loop device, and writes bytes to a memory file that it then seals.
-//! The only dependency of the crate is `rustix`.
+//! It reads the type and the owner of a namespace, sets an ID mapping on a
+//! detached mount, reads the groups of the peer of a Unix socket, and takes
+//! the socket that systemd passes. The crate depends on `rustix`. On Linux
+//! it also depends on `libc`, for the two calls that `rustix` does not give:
+//! `mount_setattr` and `SO_PEERGROUPS`.
 //!
 //! # Entry points
 //!
@@ -20,6 +25,14 @@
 //!   [`LoopConfig`]. Linux only.
 //! - [`sealable_memfd`] creates a memory file that accepts seals, and
 //!   [`seal_contents`] seals its bytes and its size. Linux only.
+//! - [`ns_type`] returns the type of a namespace, and [`ns_owner_userns`]
+//!   returns the user namespace that owns it. Linux only.
+//! - [`mount_setattr_idmap`] sets an ID mapping on a detached mount. Linux
+//!   only.
+//! - [`peer_groups`] returns the supplementary groups of the peer of a Unix
+//!   socket. Linux only.
+//! - [`systemd_listen_fd`] takes the one socket that systemd passes. Linux
+//!   only.
 //!
 //! # Examples
 //!
@@ -48,8 +61,8 @@
 // All other library crates of ostrya are `#![forbid(unsafe_code)]`. This crate
 // holds the `rustix` calls that need `unsafe` and that no safe `rustix` wrapper
 // gives. The crate root is `#![deny(unsafe_code)]`. Each of the modules `imp`,
-// `mmap`, and `loop_dev` has a scoped `#![allow(unsafe_code)]`, so the audited
-// `unsafe` code stays in these three modules.
+// `mmap`, `loop_dev`, `ns`, and `sock` has a scoped `#![allow(unsafe_code)]`,
+// so the audited `unsafe` code stays in these five modules.
 
 mod imp {
     #![allow(unsafe_code)]
@@ -541,6 +554,10 @@ pub use loop_dev::{
 };
 #[cfg(target_os = "linux")]
 pub use memfd::{seal_contents, sealable_memfd};
+#[cfg(target_os = "linux")]
+pub use ns::{mount_setattr_idmap, ns_owner_userns, ns_type};
+#[cfg(target_os = "linux")]
+pub use sock::{peer_groups, systemd_listen_fd};
 
 #[cfg(target_os = "linux")]
 mod loop_dev {
@@ -867,6 +884,305 @@ mod memfd {
     }
 }
 
+#[cfg(target_os = "linux")]
+mod ns {
+    #![allow(unsafe_code)]
+
+    use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd, RawFd};
+
+    use rustix::io::{Errno, Result};
+    use rustix::ioctl::{Ioctl, IoctlOutput, Opcode, ioctl, opcode};
+    use rustix::thread::LinkNameSpaceType;
+
+    /// The ioctl group of the namespace file descriptors.
+    const NSIO: u8 = 0xb7;
+    /// `NS_GET_USERNS = _IO(0xb7, 0x1)`: the owner user namespace.
+    const NS_GET_USERNS: Opcode = opcode::none(NSIO, 0x1);
+    /// `NS_GET_NSTYPE = _IO(0xb7, 0x3)`: the `CLONE_NEW*` type.
+    const NS_GET_NSTYPE: Opcode = opcode::none(NSIO, 0x3);
+
+    /// A namespace ioctl that takes no argument and returns an integer as
+    /// the result of the call.
+    struct NoArg {
+        opcode: Opcode,
+    }
+
+    // SAFETY: the two namespace requests that use this type take no argument
+    // and read no user memory, so the null pointer of `as_ptr` is never read.
+    // The calls change no user memory, so `IS_MUTATING` is false.
+    // `output_from_ptr` reads nothing through the pointer. It returns the
+    // non-negative integer that a successful call returns.
+    unsafe impl Ioctl for NoArg {
+        type Output = IoctlOutput;
+
+        const IS_MUTATING: bool = false;
+
+        fn opcode(&self) -> Opcode {
+            self.opcode
+        }
+
+        fn as_ptr(&mut self) -> *mut core::ffi::c_void {
+            core::ptr::null_mut()
+        }
+
+        unsafe fn output_from_ptr(
+            out: IoctlOutput,
+            _: *mut core::ffi::c_void,
+        ) -> Result<Self::Output> {
+            Ok(out)
+        }
+    }
+
+    /// Returns the type of the namespace that `fd` refers to.
+    ///
+    /// `fd` is a descriptor of a namespace file, for example an open
+    /// `/proc/<pid>/ns/user`.
+    ///
+    /// # Errors
+    ///
+    /// - `ENOTTY` if `fd` does not refer to a namespace.
+    /// - `EOPNOTSUPP` if the kernel returns a type that rustix does not
+    ///   name.
+    /// - Another `Errno` from `NS_GET_NSTYPE`.
+    pub fn ns_type(fd: impl AsFd) -> Result<LinkNameSpaceType> {
+        // SAFETY: `NS_GET_NSTYPE` takes no argument. The kernel reads and
+        // writes no user memory and returns the type as the result.
+        let raw = unsafe {
+            ioctl(
+                fd,
+                NoArg {
+                    opcode: NS_GET_NSTYPE,
+                },
+            )?
+        };
+        let raw = u32::try_from(raw).map_err(|_| Errno::INVAL)?;
+        [
+            LinkNameSpaceType::Time,
+            LinkNameSpaceType::Mount,
+            LinkNameSpaceType::ControlGroup,
+            LinkNameSpaceType::HostNameAndNISDomainName,
+            LinkNameSpaceType::InterProcessCommunication,
+            LinkNameSpaceType::User,
+            LinkNameSpaceType::ProcessID,
+            LinkNameSpaceType::Network,
+        ]
+        .into_iter()
+        .find(|ty| *ty as u32 == raw)
+        .ok_or(Errno::OPNOTSUPP)
+    }
+
+    /// Returns a descriptor of the user namespace that owns the namespace
+    /// `fd`.
+    ///
+    /// The new descriptor has the close-on-exec flag.
+    ///
+    /// # Errors
+    ///
+    /// - `ENOTTY` if `fd` does not refer to a namespace.
+    /// - `EINVAL` if `fd` refers to a user namespace with no parent, the
+    ///   initial user namespace.
+    /// - `EPERM` if the owner is outside the user namespace of the process.
+    /// - Another `Errno` from `NS_GET_USERNS`.
+    pub fn ns_owner_userns(fd: impl AsFd) -> Result<OwnedFd> {
+        // SAFETY: `NS_GET_USERNS` takes no argument. The kernel reads and
+        // writes no user memory. A successful call returns a new descriptor
+        // that no other value owns, so `OwnedFd` takes ownership of it.
+        unsafe {
+            let raw = ioctl(
+                fd,
+                NoArg {
+                    opcode: NS_GET_USERNS,
+                },
+            )?;
+            Ok(OwnedFd::from_raw_fd(raw as RawFd))
+        }
+    }
+
+    /// Sets an ID mapping on the detached mount `mount`, with the user
+    /// namespace `userns`.
+    ///
+    /// The call is `mount_setattr(2)` with `AT_EMPTY_PATH` and
+    /// `MOUNT_ATTR_IDMAP`. After the call, the mount shows each file owner
+    /// through the mapping of `userns`: the owner `0` in the file system
+    /// shows as the user that `0` in `userns` maps to. rustix has no
+    /// `mount_setattr`, so the call goes through the `syscall` function of
+    /// libc.
+    ///
+    /// # Errors
+    ///
+    /// - `EPERM` if the process has no `CAP_SYS_ADMIN` in the user namespace
+    ///   that owns the mount, or none in `userns`.
+    /// - `EINVAL` if `mount` is not a detached mount that was never attached,
+    ///   if it has a mapping already, if `userns` is the initial user
+    ///   namespace, or if the file system does not support ID-mapped mounts.
+    /// - `EBADF` if `userns` is not a descriptor of a user namespace.
+    /// - `ENOSYS` before Linux 5.12.
+    /// - Another `Errno` from `mount_setattr`.
+    pub fn mount_setattr_idmap(mount: impl AsFd, userns: impl AsFd) -> Result<()> {
+        let attr = libc::mount_attr {
+            attr_set: libc::MOUNT_ATTR_IDMAP,
+            attr_clr: 0,
+            propagation: 0,
+            userns_fd: u64::try_from(userns.as_fd().as_raw_fd()).map_err(|_| Errno::BADF)?,
+        };
+        // SAFETY: the arguments are the descriptor of the mount, a pointer to
+        // an empty C string that lives for the call, the flags, a pointer to
+        // a `mount_attr` that lives for the call, and its size. The kernel
+        // only reads the path and the struct, and holds no pointer after the
+        // call returns. `libc::mount_attr` is the 32-byte UAPI struct. The
+        // call creates and closes no descriptor.
+        let ret = unsafe {
+            libc::syscall(
+                libc::SYS_mount_setattr,
+                mount.as_fd().as_raw_fd(),
+                c"".as_ptr(),
+                libc::AT_EMPTY_PATH as libc::c_uint,
+                &raw const attr,
+                size_of::<libc::mount_attr>(),
+            )
+        };
+        if ret < 0 {
+            return Err(Errno::from_io_error(&std::io::Error::last_os_error()).unwrap_or(Errno::IO));
+        }
+        Ok(())
+    }
+
+    const _: () = assert!(size_of::<libc::mount_attr>() == 32);
+}
+
+#[cfg(target_os = "linux")]
+mod sock {
+    #![allow(unsafe_code)]
+
+    use std::ffi::OsStr;
+    use std::os::fd::{AsFd, AsRawFd, FromRawFd, OwnedFd};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    use rustix::io::{Errno, FdFlags, Result, fcntl_setfd};
+
+    /// The descriptor of the first socket that systemd passes,
+    /// `SD_LISTEN_FDS_START`.
+    const LISTEN_FD: i32 = 3;
+
+    /// The number of groups that the first `SO_PEERGROUPS` call has space
+    /// for.
+    const FIRST_GROUPS: usize = 64;
+
+    /// Returns the raw ids of the supplementary groups of the peer of the
+    /// Unix socket `sock`. The peer must have at most `max` groups.
+    ///
+    /// The kernel records the groups when the peer connects, or when it
+    /// creates the socket pair. The list is in the order of the kernel.
+    ///
+    /// # Errors
+    ///
+    /// - `ERANGE` if the peer has more than `max` groups.
+    /// - `ENODATA` if the socket has no peer credentials, for example a
+    ///   listening socket.
+    /// - `ENOTSOCK` if `sock` is not a socket, and `ENOPROTOOPT` if it is not
+    ///   a Unix socket.
+    /// - Another `Errno` from `getsockopt(SO_PEERGROUPS)`.
+    pub fn peer_groups(sock: impl AsFd, max: usize) -> Result<Vec<u32>> {
+        let fd = sock.as_fd().as_raw_fd();
+        let mut groups: Vec<libc::gid_t> = vec![0; FIRST_GROUPS.min(max)];
+        loop {
+            let mut len = libc::socklen_t::try_from(groups.len() * size_of::<libc::gid_t>())
+                .map_err(|_| Errno::RANGE)?;
+            // SAFETY: the buffer holds `len` bytes and lives for the call.
+            // The kernel writes at most `len` bytes to it, and writes the
+            // length of its data or the length that it needs to `len`.
+            let ret = unsafe {
+                libc::getsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_PEERGROUPS,
+                    groups.as_mut_ptr().cast(),
+                    &raw mut len,
+                )
+            };
+            let need = len as usize / size_of::<libc::gid_t>();
+            if ret == 0 {
+                groups.truncate(need);
+                return Ok(groups);
+            }
+            let errno = Errno::from_io_error(&std::io::Error::last_os_error()).unwrap_or(Errno::IO);
+            if errno != Errno::RANGE || need <= groups.len() || need > max {
+                return Err(errno);
+            }
+            groups.resize(need, 0);
+        }
+    }
+
+    /// Set when [`systemd_listen_fd`] takes the descriptor.
+    static TAKEN: AtomicBool = AtomicBool::new(false);
+
+    /// Returns the one socket that systemd passes to the process, and sets
+    /// its close-on-exec flag.
+    ///
+    /// systemd passes the socket as descriptor 3 and sets the environment
+    /// variables `LISTEN_PID` and `LISTEN_FDS`. The call accepts them only
+    /// when `LISTEN_PID` is the process id of this process and `LISTEN_FDS`
+    /// is `1`. It returns `None` if neither variable is set. The call takes
+    /// the descriptor once in the life of the process. It leaves the
+    /// environment as it is, so a child process that the caller starts must
+    /// not inherit the two variables.
+    ///
+    /// # Errors
+    ///
+    /// - `EINVAL` if only one of the two variables is set, if `LISTEN_PID`
+    ///   is not the process id of this process, or if `LISTEN_FDS` is not
+    ///   `1`.
+    /// - `EALREADY` if an earlier call took the descriptor.
+    /// - `EBADF` if descriptor 3 is not open.
+    pub fn systemd_listen_fd() -> Result<Option<OwnedFd>> {
+        let pid = std::env::var_os("LISTEN_PID");
+        let fds = std::env::var_os("LISTEN_FDS");
+        if !listen_vars_match(pid.as_deref(), fds.as_deref(), std::process::id())? {
+            return Ok(None);
+        }
+        if TAKEN.swap(true, Ordering::SeqCst) {
+            return Err(Errno::ALREADY);
+        }
+        // SAFETY: `fcntl(F_GETFD)` takes a raw descriptor number and reads no
+        // memory of the process. A closed descriptor 3 gives `EBADF` and no
+        // other effect. No Rust value holds the descriptor during the call.
+        let flags = unsafe { libc::fcntl(LISTEN_FD, libc::F_GETFD) };
+        if flags < 0 {
+            return Err(Errno::from_io_error(&std::io::Error::last_os_error()).unwrap_or(Errno::IO));
+        }
+        // SAFETY: the probe shows that descriptor 3 is open. systemd passed
+        // it to this process for its own use, and `TAKEN` makes sure that one
+        // `OwnedFd` alone takes it.
+        let fd = unsafe { OwnedFd::from_raw_fd(LISTEN_FD) };
+        fcntl_setfd(
+            &fd,
+            FdFlags::from_bits_retain(flags as u32) | FdFlags::CLOEXEC,
+        )?;
+        Ok(Some(fd))
+    }
+
+    /// Checks the values of `LISTEN_PID` and `LISTEN_FDS` for the process
+    /// `own_pid`. Returns `false` if neither is set.
+    pub(crate) fn listen_vars_match(
+        pid: Option<&OsStr>,
+        fds: Option<&OsStr>,
+        own_pid: u32,
+    ) -> Result<bool> {
+        match (pid, fds) {
+            (None, None) => Ok(false),
+            (Some(pid), Some(fds)) => {
+                let pid_ok = pid.to_str().and_then(|s| s.parse::<u32>().ok()) == Some(own_pid);
+                if pid_ok && fds == "1" {
+                    Ok(true)
+                } else {
+                    Err(Errno::INVAL)
+                }
+            }
+            _ => Err(Errno::INVAL),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -1181,5 +1497,149 @@ mod linux_tests {
         drop(image);
         drop(dev);
         wait_detached(number, &backing);
+    }
+}
+
+/// Tests of the namespace, ID-mapping, and socket helpers. They run as any
+/// user.
+#[cfg(all(test, target_os = "linux"))]
+mod ns_sock_tests {
+    use super::{
+        mount_setattr_idmap, ns_owner_userns, ns_type, peer_groups, sock::listen_vars_match,
+        systemd_listen_fd,
+    };
+    use std::ffi::OsStr;
+    use std::os::fd::{AsFd, AsRawFd, OwnedFd};
+    use std::process::Command;
+
+    use rustix::fs::{CWD, Mode, OFlags, fstat, openat};
+    use rustix::io::{Errno, FdFlags};
+    use rustix::thread::LinkNameSpaceType;
+
+    /// The name of the ignored test that the descriptor test runs in a child
+    /// process.
+    const LISTEN_CHILD: &str = "ns_sock_tests::listen_fd_child";
+
+    /// Opens `/proc/thread-self/ns/<name>`.
+    fn own_ns(name: &str) -> OwnedFd {
+        openat(
+            CWD,
+            format!("/proc/thread-self/ns/{name}"),
+            OFlags::RDONLY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap()
+    }
+
+    /// Returns the device and the inode of `fd`.
+    fn dev_ino(fd: impl AsFd) -> (u64, u64) {
+        let st = fstat(fd).unwrap();
+        (st.st_dev, st.st_ino)
+    }
+
+    #[test]
+    fn a_namespace_has_its_type() {
+        assert_eq!(ns_type(own_ns("user")).unwrap(), LinkNameSpaceType::User);
+        assert_eq!(ns_type(own_ns("mnt")).unwrap(), LinkNameSpaceType::Mount);
+        assert_eq!(ns_type(own_ns("net")).unwrap(), LinkNameSpaceType::Network);
+        let file = std::fs::File::open("/proc/self/status").unwrap();
+        assert_eq!(ns_type(&file).unwrap_err(), Errno::NOTTY);
+    }
+
+    #[test]
+    fn the_user_namespace_of_the_process_owns_its_mount_namespace() {
+        let owner = ns_owner_userns(own_ns("mnt")).unwrap();
+        assert_eq!(dev_ino(&owner), dev_ino(own_ns("user")));
+        assert_eq!(ns_type(&owner).unwrap(), LinkNameSpaceType::User);
+        let flags = rustix::io::fcntl_getfd(&owner).unwrap();
+        assert!(flags.contains(FdFlags::CLOEXEC));
+    }
+
+    /// A directory descriptor is not a detached mount. Without the privilege
+    /// the kernel refuses the call with `EPERM`. With it, the kernel refuses
+    /// the descriptor or the initial user namespace with `EINVAL`.
+    #[test]
+    fn an_idmap_of_a_plain_directory_is_refused() {
+        let dir = openat(
+            CWD,
+            "/",
+            OFlags::DIRECTORY | OFlags::RDONLY | OFlags::CLOEXEC,
+            Mode::empty(),
+        )
+        .unwrap();
+        let err = mount_setattr_idmap(&dir, own_ns("user")).unwrap_err();
+        assert!(matches!(err, Errno::PERM | Errno::INVAL), "{err}");
+    }
+
+    #[test]
+    fn the_peer_groups_of_a_socket_pair_are_the_groups_of_the_process() {
+        let (a, _b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut got: Vec<u32> = peer_groups(&a, 4096).unwrap();
+        got.sort_unstable();
+        let status = std::fs::read_to_string("/proc/self/status").unwrap();
+        let mut want: Vec<u32> = status
+            .lines()
+            .find_map(|line| line.strip_prefix("Groups:"))
+            .unwrap()
+            .split_whitespace()
+            .map(|g| g.parse().unwrap())
+            .collect();
+        want.sort_unstable();
+        assert_eq!(got, want);
+        if !want.is_empty() {
+            assert_eq!(peer_groups(&a, want.len() - 1).unwrap_err(), Errno::RANGE);
+        }
+
+        let file = std::fs::File::open("/proc/self/status").unwrap();
+        assert_eq!(peer_groups(&file, 4096).unwrap_err(), Errno::NOTSOCK);
+    }
+
+    #[test]
+    fn the_listen_variables_must_name_this_process_and_one_socket() {
+        let s = |v: &'static str| Some(OsStr::new(v));
+        assert_eq!(listen_vars_match(None, None, 42), Ok(false));
+        assert_eq!(listen_vars_match(s("42"), s("1"), 42), Ok(true));
+        assert_eq!(listen_vars_match(s("41"), s("1"), 42), Err(Errno::INVAL));
+        assert_eq!(listen_vars_match(s("42"), s("2"), 42), Err(Errno::INVAL));
+        assert_eq!(listen_vars_match(s("42"), s("0"), 42), Err(Errno::INVAL));
+        assert_eq!(listen_vars_match(s("x"), s("1"), 42), Err(Errno::INVAL));
+        assert_eq!(listen_vars_match(s("42"), None, 42), Err(Errno::INVAL));
+        assert_eq!(listen_vars_match(None, s("1"), 42), Err(Errno::INVAL));
+    }
+
+    /// A child process with the systemd variables and an open descriptor 3
+    /// takes the descriptor once.
+    #[test]
+    fn a_passed_descriptor_is_taken_once() {
+        let exe = std::env::current_exe().unwrap();
+        let out = Command::new("/bin/sh")
+            .arg("-c")
+            .arg(r#"export LISTEN_PID=$$ LISTEN_FDS=1; exec "$0" "$@" 3</dev/null"#)
+            .arg(&exe)
+            .args([LISTEN_CHILD, "--exact", "--ignored", "--nocapture"])
+            .output()
+            .unwrap();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "{}\n{stdout}\n{}",
+            out.status,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
+    /// The body of the child process of [`a_passed_descriptor_is_taken_once`].
+    /// Outside that child, the test does nothing.
+    #[test]
+    #[ignore = "runs in a child process with LISTEN_PID and LISTEN_FDS"]
+    fn listen_fd_child() {
+        if std::env::var_os("LISTEN_PID").is_none() {
+            return;
+        }
+        let fd = systemd_listen_fd().unwrap().unwrap();
+        assert_eq!(fd.as_raw_fd(), 3);
+        let flags = rustix::io::fcntl_getfd(&fd).unwrap();
+        assert!(flags.contains(FdFlags::CLOEXEC));
+        assert_eq!(systemd_listen_fd().unwrap_err(), Errno::ALREADY);
     }
 }

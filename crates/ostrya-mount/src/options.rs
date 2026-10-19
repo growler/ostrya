@@ -33,7 +33,9 @@ pub struct MountOptions {
     /// The source label of the mount, which `/proc/self/mountinfo` shows.
     ///
     /// If the value is `None`, a mount of a commit takes the checksum of the
-    /// commit, and a mount of an image of the caller takes `composefs`.
+    /// commit, and a mount of an image of the caller takes `composefs`. The
+    /// kernel takes a label of at most 255 bytes, and
+    /// [`Helper`](crate::Helper) refuses a longer one before it connects.
     pub source: Option<String>,
 }
 

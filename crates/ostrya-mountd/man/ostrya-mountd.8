@@ -1,0 +1,207 @@
+.TH "OSTRYA\-MOUNTD" "8" "" "ostrya" "System Administration Commands"
+.SH NAME
+ostrya\-mountd \- Mount composefs trees of ostrya repositories for unprivileged callers
+.SH SYNOPSIS
+.nf
+ostrya\-mountd [OPTIONS]
+.fi
+.SH DESCRIPTION
+Mount composefs trees of ostrya repositories for unprivileged callers.
+.PP
+\%ostrya\-mountd mounts a commit of an ostrya repository as a composefs tree for a caller in its own user namespace. The caller is the \fB\%Helper\fR client of the \%ostrya\-mount library. It connects to the socket of the daemon and sends the repository path, the commit, the target path, and descriptors of its user namespace and its mount namespace. The daemon mounts the tree, moves the mount onto the target in the mount namespace of the caller, and sends back a descriptor of the root of the mount.
+.PP
+The daemon must run as root in the initial user namespace. Systemd starts it through socket activation, or a parent process starts it with \%\-\-listen.
+.SH OPTIONS
+.TP
+\fB\-\-listen\fR \fIPATH\fR
+Create a socket at PATH and serve it (standalone mode).
+.IP
+The daemon refuses PATH if a file that is not a socket is there. It removes an old socket at PATH, binds a new \fB\%SOCK_SEQPACKET\fR socket, gives it the mode \%0666, and removes it when it exits. The option is refused when \fB\%LISTEN_PID\fR or \fB\%LISTEN_FDS\fR is set.
+.TP
+\fB\-\-parent\-pid\fR \fIPID\fR
+Exit when the process PID exits (standalone mode).
+.IP
+The daemon watches the process through a pidfd. It exits with status \%1 when the process exits. The option needs \%\-\-listen.
+.TP
+\fB\-\-idle\-timeout\fR \fISECS\fR
+Exit after SECS seconds with no connection.
+.IP
+The time starts again after each connection. The option applies to the standalone mode and to socket activation with \fB\%Accept=no\fR\&. Default: \%300.
+.TP
+\fB\-\-max\-image\-size\fR \fIBYTES\fR
+Refuse to build an image larger than BYTES bytes.
+.IP
+A request for a built image fails with the code \fB\%repository\fR if the image is larger. The daemon computes the size before it writes the image, so a refused image takes no memory. The limit does not apply to a stored image. The default is \%100 MiB. Default: \%104857600.
+.TP
+\fB\-V\fR, \fB\-\-version\fR
+Print version.
+.SH MODES
+The daemon serves connections from one of three sources. It selects the
+source from the options and from the environment.
+.TP
+\fBSocket activation with Accept=no\fR
+systemd passes the listening socket as descriptor 3. The daemon accepts
+the connections and serves each one in turn. It exits with status 0 when
+no connection comes in the idle time of \fB\-\-idle\-timeout\fR. systemd
+starts it again at the next connection.
+.TP
+\fBSocket activation with Accept=yes\fR
+systemd passes one connection as descriptor 3. The daemon serves the
+request of the connection and exits. The exit status is 0 if the daemon
+replies with a mount, and 1 if it replies with an error.
+.TP
+\fBStandalone\fR
+\fB\-\-listen\fR gives the path of a new socket. The daemon accepts the
+connections and serves each one in turn. It exits with status 0 when no
+connection comes in the idle time, and with status 1 when the process of
+\fB\-\-parent\-pid\fR exits. It removes the socket when it exits.
+.PP
+The daemon tells the two modes of socket activation apart by the
+\fBSO_ACCEPTCONN\fR option of descriptor 3. In each mode, the daemon serves
+one connection at a time. A request that fails does not stop the daemon.
+.PP
+The package installs the units \fBostrya\-mountd.socket\fR,
+\fBostrya\-mountd@.service\fR, and \fBostrya\-mountd.service\fR, and does not
+enable them. The socket unit listens at \fB/run/ostrya/mountd.sock\fR with
+the mode 0660 and the group \fBostrya\-mount\fR. It has \fBAccept=yes\fR, so
+systemd starts one instance of \fBostrya\-mountd@.service\fR for each
+connection. To serve all connections with one process and
+\fBAccept=no\fR, add a drop-in to the socket unit:
+.PP
+.nf
+# /etc/systemd/system/ostrya\-mountd.socket.d/accept.conf
+[Socket]
+Accept=no
+.fi
+.PP
+Then run \fBsystemctl daemon\-reload\fR and restart the socket unit. With
+\fBAccept=no\fR, systemd starts \fBostrya\-mountd.service\fR.
+.SH REQUESTS
+The client is the \fBHelper\fR mounter of the \fBostrya\-mount\fR library.
+Each connection carries one request. The request gives the image, stored
+or built, the access, read-only or read-write, the commit, the source
+label, and the absolute paths of the repository and of the target as the
+caller sees them. It also carries a descriptor of a user namespace and a
+descriptor of a mount namespace.
+.PP
+The daemon does these steps:
+.IP 1. 4
+It refuses the request if the user namespace is the initial user
+namespace, or if the user namespace does not own the mount namespace.
+.IP 2. 4
+A worker process enters the mount namespace. With the user, the group,
+and the supplementary groups of the caller, it opens the target, the
+repository directory, and its \fBobjects\fR directory. The opens of the
+repository and of \fBobjects\fR follow no symlink in the last component.
+The worker refuses a target or a repository on FUSE, and an
+\fBobjects\fR directory that is the root of a mount or that is on another
+mount than the repository directory.
+.IP 3. 4
+The daemon reads the repository through a copy of its mount that holds no
+mount below it. Each read of a file of the repository follows no symlink,
+does not wait on a FIFO, and refuses a file that is not a regular file.
+The daemon checks that the \fBobjects\fR directory of the repository is the
+directory that the worker opened, and refuses an \fBarchive\fR repository.
+For a stored image, it compares the fs-verity digest of the image with the
+key \fBostree.composefs.digest.v0\fR of the commit. For a built image, it
+writes the image to a sealed memory file. It refuses a built image larger
+than \fB\-\-max\-image\-size\fR before it writes the image.
+.IP 4. 4
+The daemon attaches the image to a loop device and mounts it as EROFS
+with the ID mapping of the user namespace of the request. It stacks the
+composefs overlay on it, with the \fBobjects\fR directory as the data
+layer.
+.IP 5. 4
+The worker enters the user namespace as its user 0 and mounts the top
+overlay on the composefs overlay, with the \fBuserxattr\fR option. For a
+read-only request, the top overlay is read-only. For a read-write request,
+it has the upper directory \fItarget\fB/overlay\fR and the work directory
+\fItarget\fB/work\fR. The worker moves the top overlay onto the target.
+.PP
+A connection has 60 seconds for the request and the reply. At that time,
+the daemon kills the worker and replies with an error of the code
+\fBtimeout\fR.
+.PP
+If the target already carries an overlay mount with the source label and
+the access of the request, the daemon mounts nothing and replies with the
+root of that mount. The client unmounts in its own process, with no
+request to the daemon.
+.SH FILES
+.TP
+\fB/run/ostrya/mountd.sock\fR
+The socket of the packaged socket unit.
+.TP
+\fB/usr/lib/systemd/system/ostrya\-mountd.socket\fR
+The socket unit.
+.TP
+\fB/usr/lib/systemd/system/ostrya\-mountd@.service\fR
+The service of one connection, for \fBAccept=yes\fR.
+.TP
+\fB/usr/lib/systemd/system/ostrya\-mountd.service\fR
+The service of the listening socket, for \fBAccept=no\fR.
+.TP
+\fB/usr/lib/sysusers.d/ostrya\-mountd.conf\fR
+Creates the system group \fBostrya\-mount\fR.
+.SH ENVIRONMENT
+.TP
+\fBLISTEN_PID\fR, \fBLISTEN_FDS\fR
+systemd sets these variables for socket activation. The daemon accepts
+them only if \fBLISTEN_PID\fR is its process id and \fBLISTEN_FDS\fR is 1.
+If one of them is set, the daemon refuses \fB\-\-listen\fR. The worker
+process does not get them.
+.TP
+\fBOSTRYA_MOUNTD_SOCKET\fR
+The client reads this variable, and the daemon does not. It gives the
+path of the socket. The default is \fB/run/ostrya/mountd.sock\fR. A client
+that is root in the initial user namespace does not read it, and a client
+whose real user or group id is not its effective one does not read it.
+.SH SECURITY
+.IP \(bu 2
+The access to the socket is the trust boundary. A member of the group of
+the socket can read each file below a directory named \fBobjects\fR that
+it can open, in a directory that it can open, because overlayfs reads the
+data layer with the credentials of the mounter, the daemon. This includes
+objects of other commits, and files whose mode refuses a read by the
+caller.
+.IP \(bu 2
+The daemon mounts a stored image only after its digest matches the key
+of the commit. The caller can write both the image and the commit, so the
+check does not limit the objects that an image can name.
+.IP \(bu 2
+Each mount of the daemon has \fBnosuid\fR and \fBnodev\fR. The top overlay
+belongs to the user namespace of the caller, so the caller can clear the
+two flags on it. A device node in the tree then still does not open, and
+a setuid file changes no id outside that user namespace.
+.IP \(bu 2
+The daemon reads the repository with blocking calls that the time limit
+of a connection cannot stop. It therefore refuses a repository and a
+target on FUSE, reads the repository through a copy of its mount with no
+mount below it, and does not wait on a FIFO. The daemon serves one
+connection at a time, so a client can delay the other clients for at most
+60 seconds.
+.IP \(bu 2
+The daemon refuses a request from the initial user namespace. A root
+caller on the host mounts with the \fBDirect\fR mounter of the library.
+.IP \(bu 2
+The daemon does not check a signature of the commit.
+.IP \(bu 2
+A built image stays in a memory file of the daemon until the unmount. Its
+memory counts against the memory cgroup of the daemon.
+\fB\-\-max\-image\-size\fR limits the size of one image.
+.SH EXIT STATUS
+.TP
+\fB0\fR
+The daemon stopped after the idle time, or served the connection of
+\fBAccept=yes\fR.
+.TP
+\fB1\fR
+The daemon failed, the process of \fB\-\-parent\-pid\fR exited, or the
+request of \fBAccept=yes\fR failed.
+.TP
+\fB2\fR
+The options or the environment are not valid.
+.SH SEE ALSO
+\fBostrya\fR(1),
+\fBostrya\-repo\fR(5),
+\fBsystemd.socket\fR(5),
+\fBsysusers.d\fR(5)

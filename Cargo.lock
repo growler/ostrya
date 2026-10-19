@@ -1796,6 +1796,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "ostrya-mountd"
+version = "0.4.0"
+dependencies = [
+ "clap",
+ "ostrya",
+ "ostrya-mount",
+ "ostrya-rt",
+ "ostrya-sys",
+ "rustix",
+]
+
+[[package]]
 name = "ostrya-remote"
 version = "0.4.0"
 dependencies = [
@@ -1852,6 +1864,7 @@ dependencies = [
 name = "ostrya-sys"
 version = "0.4.0"
 dependencies = [
+ "libc",
  "rustix",
 ]
 

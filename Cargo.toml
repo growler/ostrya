@@ -11,6 +11,7 @@ members = [
     "crates/ostrya-sys",
     "crates/ostrya",
     "crates/ostrya-mount",
+    "crates/ostrya-mountd",
     "crates/ostrya-server",
     "crates/ostrya-cli",
     "crates/ostrya-conformance",

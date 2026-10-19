@@ -14,7 +14,7 @@ use rustix::fs::{AtFlags, CWD, Mode, OFlags, StatxAttributes, StatxFlags, openat
 use rustix::io::Errno;
 use rustix::mount::{
     FsMountFlags, FsOpenFlags, MountAttrFlags, MoveMountFlags, UnmountFlags, fsconfig_create,
-    fsconfig_set_flag, fsconfig_set_string, fsmount, fsopen, move_mount, unmount,
+    fsconfig_set_fd, fsconfig_set_flag, fsconfig_set_string, fsmount, fsopen, move_mount, unmount,
 };
 
 use crate::error::{ATTACH_STEP, Error, Result};
@@ -26,7 +26,7 @@ use crate::options::{Access, OverlayVerity};
 pub(crate) const IMAGE_BLOCK: u64 = 4096;
 
 /// The `f_type` that `statfs` reports for overlayfs.
-const OVERLAYFS_SUPER_MAGIC: u64 = 0x794c_7630;
+pub(crate) const OVERLAYFS_SUPER_MAGIC: u64 = 0x794c_7630;
 
 /// The number of names that [`TempDir::new`] tries before it fails.
 const TEMP_ATTEMPTS: u32 = 100;
@@ -40,6 +40,56 @@ pub(crate) struct Plan {
     pub(crate) access: Access,
     /// The source label of the mount.
     pub(crate) source: String,
+    /// The attribute flags that each mount of the tree adds, for example
+    /// `MOUNT_ATTR_NOSUID`.
+    pub(crate) attrs: MountAttrFlags,
+    /// The user namespace whose mapping the EROFS mount takes, or `None` for
+    /// a mount with no ID mapping.
+    pub(crate) idmap: Option<OwnedFd>,
+}
+
+/// The upper and the work directory of a read-write mount.
+#[derive(Debug)]
+pub(crate) struct Layout {
+    /// The upper directory, `<target>/overlay`.
+    pub(crate) upper: OwnedFd,
+    /// The work directory, `<target>/work`.
+    pub(crate) work: OwnedFd,
+}
+
+impl Layout {
+    /// Creates `overlay` and `work` under the target `target_fd` if they are
+    /// absent, and opens them.
+    pub(crate) fn ensure(target_fd: BorrowedFd<'_>) -> Result<Layout> {
+        Ok(Layout {
+            upper: ensure_layout_dir(target_fd, "overlay")?,
+            work: ensure_layout_dir(target_fd, "work")?,
+        })
+    }
+}
+
+/// The options of the overlay on the composefs mount.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct UpperOptions {
+    /// Keeps the overlay xattrs in the `user.overlay.` namespace. An overlay
+    /// that a process mounts inside a user namespace needs it.
+    pub(crate) userxattr: bool,
+    /// The attribute flags that the mount adds to `MOUNT_ATTR_NOATIME`.
+    pub(crate) attrs: MountAttrFlags,
+    /// The way the overlay takes each layer.
+    pub(crate) layers: LayerRef,
+}
+
+/// The way an overlay takes a layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LayerRef {
+    /// The `/proc/self/fd/N` path of the descriptor of the layer. The kernel
+    /// resolves the path in the mount namespace of the process.
+    Path,
+    /// The descriptor of the layer itself, with `FSCONFIG_SET_FD`. This form
+    /// needs no `/proc` in the mount namespace of the process.
+    #[cfg_attr(not(feature = "server"), allow(dead_code))]
+    Fd,
 }
 
 /// Mounts the EROFS image `image` over the backing objects in `objects` at
@@ -47,11 +97,12 @@ pub(crate) struct Plan {
 ///
 /// The function attaches the image to a loop device, mounts the device as
 /// EROFS, and stacks the composefs overlay on it. For [`Access::ReadWrite`]
-/// it stacks a second overlay with an upper directory. Each layer is
-/// attached at a temp directory while the next layer takes it, because
-/// overlayfs takes each layer by path. The new mount goes onto `target` as
-/// the last step, so a failure leaves `target` unchanged, except for the
-/// upper and the work directory of a read-write mount.
+/// it stacks a second overlay with an upper directory. overlayfs takes each
+/// layer by the `/proc/self/fd/N` path of its detached mount. The composefs
+/// layer of a read-write mount is attached at a temp directory while the
+/// upper overlay takes it. The new mount goes onto `target` as the last step,
+/// so a failure leaves `target` unchanged, except for the upper and the work
+/// directory of a read-write mount.
 pub(crate) fn mount_tree(
     image: OwnedFd,
     objects: BorrowedFd<'_>,
@@ -61,39 +112,64 @@ pub(crate) fn mount_tree(
     let target_fd = open_dir(CWD, target).map_err(|e| Error::sys("open target", e))?;
     let layout = match plan.access {
         Access::ReadOnly => None,
-        Access::ReadWrite => Some((
-            ensure_layout_dir(target_fd.as_fd(), "overlay")?,
-            ensure_layout_dir(target_fd.as_fd(), "work")?,
-        )),
+        Access::ReadWrite => Some(Layout::ensure(target_fd.as_fd())?),
     };
 
-    let erofs = erofs_mount(image.as_fd())?;
-    // The loop device holds its own reference to the image.
-    drop(image);
-    let erofs = TempMount::attach(erofs)?;
-    let composefs = composefs_overlay(erofs.as_fd(), objects, plan)?;
-    // The overlay holds its own reference to each layer.
-    drop(erofs);
-
+    let composefs = build_composefs(image, objects, plan)?;
     let top = match layout {
         None => composefs,
-        Some((upper, work)) => {
+        Some(layout) => {
             let lower = TempMount::attach(composefs)?;
-            upper_overlay(lower.as_fd(), upper.as_fd(), work.as_fd(), &plan.source)?
+            let opts = UpperOptions {
+                userxattr: false,
+                attrs: plan.attrs,
+                layers: LayerRef::Path,
+            };
+            top_overlay(lower.as_fd(), Some(&layout), &plan.source, opts)?
         }
     };
     // The descriptor of the root stays valid when the mount moves, so it is
     // opened before the move, and no step can fail after it.
     let root = open_dir(&top, ".").map_err(|e| Error::sys("open mount root", e))?;
+    move_onto(top, target_fd.as_fd())?;
+    Ok(root)
+}
+
+/// Mounts the EROFS image `image` and stacks the read-only composefs overlay
+/// on it, with the backing objects in `objects`. Returns the detached
+/// overlay mount.
+///
+/// With [`Plan::idmap`], the EROFS mount takes the ID mapping of that user
+/// namespace before the overlay takes it. The overlay takes the detached
+/// EROFS mount as its layer.
+pub(crate) fn build_composefs(
+    image: OwnedFd,
+    objects: BorrowedFd<'_>,
+    plan: &Plan,
+) -> Result<OwnedFd> {
+    let erofs = erofs_mount(image.as_fd(), plan.attrs)?;
+    // The loop device holds its own reference to the image.
+    drop(image);
+    if let Some(userns) = &plan.idmap {
+        ostrya_sys::mount_setattr_idmap(&erofs, userns)
+            .map_err(|e| Error::sys("mount_setattr idmap", e))?;
+    }
+    let composefs = composefs_overlay(erofs.as_fd(), objects, plan)?;
+    // The overlay holds its own reference to each layer.
+    drop(erofs);
+    Ok(composefs)
+}
+
+/// Moves the detached mount `top` onto the directory `target_fd`.
+pub(crate) fn move_onto(top: OwnedFd, target_fd: BorrowedFd<'_>) -> Result<()> {
     move_mount(
         &top,
         "",
-        &target_fd,
+        target_fd,
         "",
         MoveMountFlags::MOVE_MOUNT_F_EMPTY_PATH | MoveMountFlags::MOVE_MOUNT_T_EMPTY_PATH,
     )
-    .map_err(|e| Error::sys("move_mount to target", e))?;
-    Ok(root)
+    .map_err(|e| Error::sys("move_mount to target", e))
 }
 
 /// Unmounts the overlay mount at `target`.
@@ -115,7 +191,10 @@ pub(crate) fn unmount_overlay(target: &Path) -> Result<()> {
 }
 
 /// Opens the directory at `path` under `dir` read-only.
-fn open_dir(dir: impl AsFd, path: impl rustix::path::Arg) -> rustix::io::Result<OwnedFd> {
+pub(crate) fn open_dir(
+    dir: impl AsFd,
+    path: impl rustix::path::Arg,
+) -> rustix::io::Result<OwnedFd> {
     openat(
         dir,
         path,
@@ -126,7 +205,7 @@ fn open_dir(dir: impl AsFd, path: impl rustix::path::Arg) -> rustix::io::Result<
 
 /// Returns the `/proc/self/fd/N` path of `fd`, the form in which overlayfs
 /// and EROFS take a layer or a device.
-fn fd_path(fd: BorrowedFd<'_>) -> String {
+pub(crate) fn fd_path(fd: BorrowedFd<'_>) -> String {
     format!("/proc/self/fd/{}", fd.as_raw_fd())
 }
 
@@ -143,12 +222,12 @@ fn attach_loop(image: BorrowedFd<'_>) -> Result<LoopDevice> {
     LoopDevice::attach(image, &cfg).map_err(|e| Error::sys(ATTACH_STEP, e))
 }
 
-/// Mounts `image` as EROFS through a loop device, and returns the detached
-/// mount.
+/// Mounts `image` as EROFS through a loop device, with the attribute flags
+/// `attrs` added, and returns the detached mount.
 ///
 /// The mount holds the loop device open. The device is auto-clearing, so it
 /// detaches when the last mount of it goes away.
-fn erofs_mount(image: BorrowedFd<'_>) -> Result<OwnedFd> {
+fn erofs_mount(image: BorrowedFd<'_>, attrs: MountAttrFlags) -> Result<OwnedFd> {
     let dev = attach_loop(image)?;
     let fs =
         fsopen("erofs", FsOpenFlags::FSOPEN_CLOEXEC).map_err(|e| Error::sys("fsopen erofs", e))?;
@@ -160,15 +239,15 @@ fn erofs_mount(image: BorrowedFd<'_>) -> Result<OwnedFd> {
     let mount = fsmount(
         &fs,
         FsMountFlags::FSMOUNT_CLOEXEC,
-        MountAttrFlags::MOUNT_ATTR_RDONLY | MountAttrFlags::MOUNT_ATTR_NOATIME,
+        MountAttrFlags::MOUNT_ATTR_RDONLY | MountAttrFlags::MOUNT_ATTR_NOATIME | attrs,
     )
     .map_err(|e| Error::sys("fsmount erofs", e))?;
     Ok(mount)
 }
 
 /// Stacks the read-only composefs overlay: the EROFS mount `erofs` as the
-/// metadata layer, and the object store `objects` as the data layer. Returns
-/// the detached mount.
+/// metadata layer, and the object store `objects` as the data layer. The
+/// mount adds the attribute flags of `plan`. Returns the detached mount.
 fn composefs_overlay(
     erofs: BorrowedFd<'_>,
     objects: BorrowedFd<'_>,
@@ -190,45 +269,94 @@ fn composefs_overlay(
     fsmount(
         &fs,
         FsMountFlags::FSMOUNT_CLOEXEC,
-        MountAttrFlags::MOUNT_ATTR_RDONLY | MountAttrFlags::MOUNT_ATTR_NOATIME,
+        MountAttrFlags::MOUNT_ATTR_RDONLY | MountAttrFlags::MOUNT_ATTR_NOATIME | plan.attrs,
     )
     .map_err(|e| Error::sys("fsmount composefs overlay", e))
 }
 
-/// Stacks the writable overlay on the composefs mount `lower`, with the upper
-/// directory `upper` and the work directory `work`. Returns the detached
+/// Stacks an overlay on the composefs mount `lower` and returns the detached
 /// mount.
-fn upper_overlay(
+///
+/// With `layout`, the overlay is writable, with the upper and the work
+/// directory of `layout`. With no `layout`, the overlay is read-only. Its
+/// layers are `lower` and, below it, an empty read-only tmpfs, because
+/// overlayfs refuses one lower layer with no upper directory. The tmpfs adds
+/// no entry to the tree.
+///
+/// `lower` names the root of a mount. overlayfs takes each layer in the form
+/// of [`UpperOptions::layers`].
+pub(crate) fn top_overlay(
     lower: BorrowedFd<'_>,
-    upper: BorrowedFd<'_>,
-    work: BorrowedFd<'_>,
+    layout: Option<&Layout>,
     source: &str,
+    opts: UpperOptions,
 ) -> Result<OwnedFd> {
     let fs = fsopen("overlay", FsOpenFlags::FSOPEN_CLOEXEC)
         .map_err(|e| Error::sys("fsopen overlay", e))?;
-    configure(&fs, "fsconfig upper overlay", |fs| {
+    let empty = match layout {
+        Some(_) => None,
+        None => Some(empty_layer()?),
+    };
+    let layer = |fs: &OwnedFd, key: &str, fd: BorrowedFd<'_>| match opts.layers {
+        LayerRef::Path => fsconfig_set_string(fs, key, fd_path(fd)),
+        LayerRef::Fd => fsconfig_set_fd(fs, key, fd),
+    };
+    configure(&fs, "fsconfig top overlay", |fs| {
         fsconfig_set_string(fs, "source", source)?;
+        if opts.userxattr {
+            fsconfig_set_flag(fs, "userxattr")?;
+        }
         // The module parameters of the host give the defaults of `metacopy`
         // and `redirect_dir`. The mount sets both, so the upper directory has
         // the same form on each host: a file that the mount copies up holds
         // its data, and no directory is a redirect. `nofollow` keeps this also
-        // on a host that sets `redirect_always_follow`. A `rename(2)` of a
-        // lower directory that is not copied up then gives `EXDEV`. The lower
-        // layer is the composefs overlay, which does not show its own
-        // `trusted.overlay.*` xattrs, so no redirect of that layer is lost.
+        // on a host that sets `redirect_always_follow`, where `userxattr`
+        // with `follow` fails. A `rename(2)` of a lower directory that is not
+        // copied up then gives `EXDEV`. The lower layer is the composefs
+        // overlay, which does not show its own `trusted.overlay.*` xattrs, so
+        // no redirect of that layer is lost.
         fsconfig_set_string(fs, "metacopy", "off")?;
         fsconfig_set_string(fs, "redirect_dir", "nofollow")?;
-        fsconfig_set_string(fs, "lowerdir", fd_path(lower))?;
-        fsconfig_set_string(fs, "upperdir", fd_path(upper))?;
-        fsconfig_set_string(fs, "workdir", fd_path(work))?;
+        layer(fs, "lowerdir+", lower)?;
+        if let Some(empty) = &empty {
+            layer(fs, "lowerdir+", empty.as_fd())?;
+        }
+        if let Some(layout) = layout {
+            layer(fs, "upperdir", layout.upper.as_fd())?;
+            layer(fs, "workdir", layout.work.as_fd())?;
+        }
+        fsconfig_create(fs)
+    })?;
+    let rdonly = match layout {
+        Some(_) => MountAttrFlags::empty(),
+        None => MountAttrFlags::MOUNT_ATTR_RDONLY,
+    };
+    fsmount(
+        &fs,
+        FsMountFlags::FSMOUNT_CLOEXEC,
+        MountAttrFlags::MOUNT_ATTR_NOATIME | rdonly | opts.attrs,
+    )
+    .map_err(|e| Error::sys("fsmount top overlay", e))
+}
+
+/// Mounts an empty, read-only tmpfs and returns the detached mount.
+fn empty_layer() -> Result<OwnedFd> {
+    let fs =
+        fsopen("tmpfs", FsOpenFlags::FSOPEN_CLOEXEC).map_err(|e| Error::sys("fsopen tmpfs", e))?;
+    configure(&fs, "fsconfig tmpfs", |fs| {
+        fsconfig_set_string(fs, "mode", "0755")?;
+        fsconfig_set_flag(fs, "ro")?;
         fsconfig_create(fs)
     })?;
     fsmount(
         &fs,
         FsMountFlags::FSMOUNT_CLOEXEC,
-        MountAttrFlags::MOUNT_ATTR_NOATIME,
+        MountAttrFlags::MOUNT_ATTR_RDONLY
+            | MountAttrFlags::MOUNT_ATTR_NOSUID
+            | MountAttrFlags::MOUNT_ATTR_NODEV
+            | MountAttrFlags::MOUNT_ATTR_NOEXEC,
     )
-    .map_err(|e| Error::sys("fsmount upper overlay", e))
+    .map_err(|e| Error::sys("fsmount tmpfs", e))
 }
 
 /// Runs the `fsconfig` calls of `steps` on the file system context `fs`. On
@@ -359,7 +487,12 @@ impl AsFd for TempMount {
 
 impl Drop for TempMount {
     fn drop(&mut self) {
-        let _ = unmount(&self.dir.path, UnmountFlags::DETACH);
+        // The unmount follows no symlink at the temp path, so it can only
+        // detach a mount at the directory itself.
+        let _ = unmount(
+            &self.dir.path,
+            UnmountFlags::DETACH | UnmountFlags::NOFOLLOW,
+        );
     }
 }
 

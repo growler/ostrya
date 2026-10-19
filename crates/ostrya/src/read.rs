@@ -116,7 +116,12 @@ impl Repo {
         checksum: &Checksum,
     ) -> Result<Vec<u8>> {
         let path = loose_path(checksum, ty, self.mode());
-        match object::read_meta_object(self.objects_fd(), &path, MAX_METADATA_SIZE) {
+        match object::read_meta_object_with(
+            self.objects_fd(),
+            &path,
+            MAX_METADATA_SIZE,
+            self.is_strict(),
+        ) {
             Ok(bytes) => Ok(bytes),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Err(Error::ObjectNotFound {
                 checksum: *checksum,
@@ -154,7 +159,9 @@ impl Repo {
         let path = loose_path(checksum, ty, self.mode());
         let repo = self.clone();
         let key = *checksum;
-        let res = ostrya_rt::unblock(move || open_meta_file(repo.objects_fd(), &path)).await;
+        let res =
+            ostrya_rt::unblock(move || open_meta_file(repo.objects_fd(), &path, repo.is_strict()))
+                .await;
         match res {
             Ok((file, size)) => Ok(MetadataReader {
                 file: FileReader::with_len_hint(file, size),
@@ -395,16 +402,18 @@ impl Repo {
 /// streaming path and the buffered path refuse an oversized object with the
 /// same error.
 ///
-/// This function does not check the file type. `object::read_meta_object`
-/// also refuses an object that is not a regular file.
+/// This function checks the file type only in the strict open mode of
+/// `object::open_regular_file`. `object::read_meta_object` also refuses an
+/// object that is not a regular file.
 ///
 /// This check and the running total in [`MetadataReader`] both read
 /// [`MAX_METADATA_SIZE`], so the open and the read hold one bound.
 fn open_meta_file(
     dir: rustix::fd::BorrowedFd<'_>,
     path: &str,
+    strict: bool,
 ) -> std::io::Result<(std::fs::File, u64)> {
-    let fd = object::open_object(dir, path)?;
+    let fd = object::open_regular_file(dir, path, strict)?;
     let stat = rustix::fs::fstat(&fd)?;
     let size = stat.st_size.max(0) as u64;
     if size > MAX_METADATA_SIZE {

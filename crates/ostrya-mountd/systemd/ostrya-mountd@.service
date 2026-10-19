@@ -1,0 +1,16 @@
+[Unit]
+Description=ostrya composefs mount daemon (one connection)
+Documentation=man:ostrya-mountd(8)
+# A failed connection leaves no failed instance unit behind.
+CollectMode=inactive-or-failed
+
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/sbin/ostrya-mountd
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+StandardOutput=journal
+StandardError=journal

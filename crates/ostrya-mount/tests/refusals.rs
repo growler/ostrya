@@ -8,6 +8,8 @@
 //!   a stored image with one byte changed;
 //! - an image of the caller that is empty or whose size is not a multiple of
 //!   4096 bytes;
+//! - a built mount with `[ex-integrity] fsverity=yes` and an object with no
+//!   fs-verity seal;
 //! - an unmount of a directory that is not an overlay mount.
 //!
 //! Each refusal leaves the target empty.
@@ -18,21 +20,24 @@ use std::os::fd::AsFd;
 use std::path::Path;
 
 use ostrya::{ObjectType, RepoMode};
-use ostrya_mount::{Access, Direct, Error, MountOptions};
+use ostrya_mount::{Access, Direct, Error, Helper, HelperCode, MountOptions, Mounter};
 use ostrya_rt::block_on;
 
 use common::{Key, TmpDir, build_source, commit_tree, new_repo};
 
 /// Compile-time checks that the public types are `Send + Sync`, and that the
-/// futures of the mount calls are `Send`.
+/// futures of the mount calls of each front end are `Send`.
 #[allow(dead_code)]
 fn public_types_are_send_and_sync() {
     fn send_sync<T: Send + Sync>() {}
     fn send<T: Send>(_: &T) {}
     send_sync::<Direct>();
+    send_sync::<Helper>();
+    send_sync::<Mounter>();
     send_sync::<MountOptions>();
     send_sync::<Access>();
     send_sync::<Error>();
+    send_sync::<HelperCode>();
 
     let fut = async {
         let repo = ostrya::Repo::open(Path::new("/")).await.unwrap();
@@ -45,6 +50,14 @@ fn public_types_are_send_and_sync() {
         let file = std::fs::File::open("/").unwrap();
         let _ = direct.mount_image(file.as_fd(), &repo, target, &opts).await;
         let _ = direct.unmount(target).await;
+        let helper = Helper::new().unwrap();
+        let _ = helper.mount_stored(&repo, &commit, target, &opts).await;
+        let _ = helper.mount_built(&repo, &commit, target, &opts).await;
+        let _ = helper.unmount(target).await;
+        let mounter = Mounter::from_env().unwrap();
+        let _ = mounter.mount_stored(&repo, &commit, target, &opts).await;
+        let _ = mounter.mount_built(&repo, &commit, target, &opts).await;
+        let _ = mounter.unmount(target).await;
     };
     send(&fut);
 }
@@ -170,6 +183,38 @@ fn an_image_of_the_caller_needs_whole_blocks() {
                 .unwrap_err();
             assert!(matches!(err, Error::InvalidImage(_)), "{size}: {err}");
         }
+    });
+    assert_empty(&target);
+}
+
+/// With `[ex-integrity] fsverity=yes`, a built mount takes the digest of each
+/// backing object from the kernel. An object with no seal fails the build
+/// before any mount step.
+#[test]
+fn a_built_mount_with_verity_needs_sealed_objects() {
+    let scratch = TmpDir::new("unsealed");
+    let base = scratch.path().join("tree");
+    build_source(&base);
+    let target = scratch.path().join("mnt");
+    std::fs::create_dir(&target).unwrap();
+    block_on(async {
+        let root = scratch.path().join("repo");
+        let repo = new_repo(&root, RepoMode::BareUser, "[ex-integrity]\nfsverity=no\n").await;
+        let commit = commit_tree(&repo, &base, 1, Key::None).await;
+        let cfg = root.join("config");
+        let text = std::fs::read_to_string(&cfg)
+            .unwrap()
+            .replace("fsverity=no", "fsverity=yes");
+        std::fs::write(&cfg, text).unwrap();
+        let repo = ostrya::Repo::open(&root).await.unwrap();
+        let err = Direct::new()
+            .mount_built(&repo, &commit, &target, &MountOptions::default())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Repo(ostrya::Error::Unsupported(text)) if text.contains("no fs-verity seal")),
+            "{err}"
+        );
     });
     assert_empty(&target);
 }

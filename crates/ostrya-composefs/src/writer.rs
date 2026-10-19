@@ -945,8 +945,8 @@ static ZEROS: [u8; BLOCK] = [0u8; BLOCK];
 
 /// The emitting pass.
 ///
-/// The pass writes each byte to `sink`, gives the same bytes to `hasher`, and
-/// counts them in `offset`. The layout arithmetic reads the count through
+/// The pass writes each byte to `sink`, gives the same bytes to `hasher` if
+/// the pass has one, and counts them in `offset`. The layout arithmetic reads the count through
 /// `Output::len`.
 ///
 /// The pass keeps the first sink error in `error`. After that error, it stops
@@ -955,7 +955,7 @@ static ZEROS: [u8; BLOCK] = [0u8; BLOCK];
 /// needs the count.
 struct EmitPass<'a, W: Write> {
     sink: W,
-    hasher: FsVerityHasher,
+    hasher: Option<FsVerityHasher>,
     offset: usize,
     layout: &'a Layout,
     error: Option<io::Error>,
@@ -965,7 +965,9 @@ impl<W: Write> Output for EmitPass<'_, W> {
     fn write(&mut self, data: &[u8]) {
         self.offset += data.len();
         if self.error.is_none() {
-            self.hasher.update(data);
+            if let Some(hasher) = &mut self.hasher {
+                hasher.update(data);
+            }
             if let Err(err) = self.sink.write_all(data) {
                 self.error = Some(err);
             }
@@ -1135,9 +1137,20 @@ pub(crate) fn plan(root: &Directory) -> Result<Plan, Error> {
 /// Runs the emitting pass of `plan` through `out` and returns the fs-verity
 /// digest.
 pub(crate) fn emit(plan: &Plan, out: &mut impl Write) -> io::Result<[u8; 32]> {
+    let digest = emit_with(plan, out, Some(FsVerityHasher::new()))?;
+    Ok(digest.expect("the pass has a hasher"))
+}
+
+/// Runs the emitting pass of `plan` through `out`. Returns the fs-verity
+/// digest if the pass has `hasher`, and `None` otherwise.
+fn emit_with(
+    plan: &Plan,
+    out: &mut impl Write,
+    hasher: Option<FsVerityHasher>,
+) -> io::Result<Option<[u8; 32]>> {
     let mut pass = EmitPass {
         sink: out,
-        hasher: FsVerityHasher::new(),
+        hasher,
         offset: 0,
         layout: &plan.layout,
         error: None,
@@ -1166,7 +1179,7 @@ pub(crate) fn emit(plan: &Plan, out: &mut impl Write) -> io::Result<[u8; 32]> {
         return Err(err);
     }
     sink.flush()?;
-    Ok(hasher.finalize())
+    Ok(hasher.map(FsVerityHasher::finalize))
 }
 
 /// Writes the composefs EROFS image of the tree at `root` through `out`.
@@ -1232,6 +1245,36 @@ pub(crate) fn emit(plan: &Plan, out: &mut impl Write) -> io::Result<[u8; 32]> {
 /// larger than the limits on [`Metadata::xattrs`].
 pub fn write_image_to(root: &Directory, out: &mut impl Write) -> Result<[u8; 32], Error> {
     Ok(emit(&plan(root)?, out)?)
+}
+
+/// Writes the composefs EROFS image of the tree at `root` through `out`, and
+/// computes no fs-verity digest. Returns the size of the image in bytes.
+///
+/// The bytes are the bytes of [`write_image_to`]. The call computes the size
+/// of the image before it writes, and refuses an image larger than
+/// `max_size` bytes with no write.
+///
+/// The function is not a stable API.
+///
+/// # Errors
+///
+/// - [`Error::Unsupported`] if the image is larger than `max_size` bytes.
+/// - The errors of [`write_image_to`].
+#[doc(hidden)]
+pub fn write_image_unhashed_to(
+    root: &Directory,
+    out: &mut impl Write,
+    max_size: u64,
+) -> Result<u64, Error> {
+    let plan = plan(root)?;
+    let size = plan.size as u64;
+    if size > max_size {
+        return Err(Error::Unsupported(format!(
+            "the image is {size} bytes, more than the limit of {max_size} bytes"
+        )));
+    }
+    emit_with(&plan, out, None)?;
+    Ok(size)
 }
 
 #[cfg(test)]

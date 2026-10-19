@@ -1,6 +1,6 @@
 [package]
 name = "ostrya-sys"
-description = "Audited unsafe rustix syscall wrappers for ostrya (fs-verity ioctls, read-only mmap, loop device, sealed memfd)"
+description = "Audited unsafe syscall wrappers for ostrya (fs-verity ioctls, read-only mmap, loop device, sealed memfd, namespaces, idmapped mounts, socket credentials)"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -13,4 +13,10 @@ rustix = { version = "1", default-features = false, features = [
     "std",
     "mm",
     "fs",
+    "thread",
 ] }
+
+# `mount_setattr` for an ID-mapped mount and `SO_PEERGROUPS`. rustix gives
+# neither call. Each call into libc is in this crate.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { version = "0.2.186", default-features = false }

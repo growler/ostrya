@@ -1092,3 +1092,74 @@ fn digest_metadata_runs_in_an_archive_repository() {
         );
     });
 }
+
+/// The export for a mount writes the bytes of the export, refuses an image
+/// over its size limit with no write, and under `Computed` takes the digest
+/// of each backing object from the kernel alone. An unsealed object fails
+/// the export. The sealed part skips if the file system has no fs-verity.
+#[test]
+fn the_mount_export_writes_the_export_and_refuses_an_unsealed_object() {
+    let scratch = TmpDir::new("composefs-mount-export");
+    let repo_dir = scratch_fixture_repo(&scratch, "bare-user");
+    let image_path = scratch.path().join("mount.cfs");
+
+    block_on(async {
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        let commit = Checksum::from_hex(COMMIT).unwrap();
+        let disabled = ComposefsOptions {
+            verity: VerityPolicy::Disabled,
+        };
+        let want = repo.export_composefs(&commit, &disabled).await.unwrap();
+
+        let file = std::fs::File::create(&image_path).unwrap();
+        let size = repo
+            .export_composefs_for_mount(&commit, VerityPolicy::Disabled, file.as_fd(), u64::MAX)
+            .await
+            .unwrap();
+        drop(file);
+        assert_eq!(size, want.bytes.len() as u64);
+        assert_eq!(std::fs::read(&image_path).unwrap(), want.bytes);
+
+        let file = std::fs::File::create(&image_path).unwrap();
+        let err = repo
+            .export_composefs_for_mount(&commit, VerityPolicy::Disabled, file.as_fd(), size - 1)
+            .await
+            .unwrap_err();
+        drop(file);
+        assert!(
+            matches!(&err, Error::Unsupported(text) if text.contains("more than the limit")),
+            "{err}"
+        );
+        assert_eq!(std::fs::metadata(&image_path).unwrap().len(), 0);
+
+        let file = std::fs::File::create(&image_path).unwrap();
+        let err = repo
+            .export_composefs_for_mount(&commit, VerityPolicy::Computed, file.as_fd(), u64::MAX)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Unsupported(text) if text.contains("no fs-verity seal")),
+            "{err}"
+        );
+    });
+
+    let Some(sealed) = seal_file_objects(&repo_dir) else {
+        eprintln!("skipping the sealed part of the mount export check");
+        return;
+    };
+    assert!(sealed > 0);
+    block_on(async {
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        let commit = Checksum::from_hex(COMMIT).unwrap();
+        let want = repo
+            .export_composefs(&commit, &ComposefsOptions::RECORDED)
+            .await
+            .unwrap();
+        let file = std::fs::File::create(&image_path).unwrap();
+        repo.export_composefs_for_mount(&commit, VerityPolicy::Computed, file.as_fd(), u64::MAX)
+            .await
+            .unwrap();
+        drop(file);
+        assert_eq!(std::fs::read(&image_path).unwrap(), want.bytes);
+    });
+}

@@ -12,6 +12,9 @@ readme = "README.md"
 default = ["smol"]
 smol = ["ostrya/smol", "ostrya-rt/smol"]
 tokio = ["ostrya/tokio", "ostrya-rt/tokio"]
+# The connection handler and the worker of `ostrya-mountd`. The module is
+# hidden and is not a stable API.
+server = ["rustix/thread"]
 
 # The crate builds on Linux alone.
 [package.metadata.docs.rs]
@@ -24,9 +27,13 @@ ostrya-rt = { workspace = true }
 ostrya-sys = { workspace = true }
 thiserror = "2"
 # The new mount API (`fsopen`, `fsconfig`, `fsmount`, `move_mount`) and the
-# unmount. Each of these calls is safe in rustix.
+# unmount. `net` gives the socket of the mount daemon and the descriptors
+# that go over it. `thread`, which the `server` feature turns on, gives
+# `setns` and the switch of the ids in the worker of the daemon. Each of
+# these calls is safe in rustix.
 rustix = { version = "1", default-features = false, features = [
     "std",
     "fs",
     "mount",
+    "net",
 ] }

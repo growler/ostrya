@@ -26,13 +26,25 @@ cargo test                                        # smol (default)
 cargo test -p ostrya --no-default-features --features tokio
 ```
 
-The mount tests of `ostrya-sys` and `ostrya-mount` need `CAP_SYS_ADMIN` in the
-initial user namespace, so they skip for another user. Run them as root on a
-file system with fs-verity. If `OSTRYA_REQUIRE_MOUNT` is set, a missing
-privilege or a file system without fs-verity fails them:
+The mount tests of `ostrya-sys`, `ostrya-mount`, and `ostrya-mountd` need
+`CAP_SYS_ADMIN` in the initial user namespace, so they skip for another user.
+Run them as root on a file system with fs-verity. If `OSTRYA_REQUIRE_MOUNT` is
+set, a missing privilege or a file system without fs-verity fails them:
 
 ```sh
-OSTRYA_REQUIRE_MOUNT=1 cargo test -p ostrya-sys -p ostrya-mount
+OSTRYA_REQUIRE_MOUNT=1 cargo test -p ostrya-sys -p ostrya-mount -p ostrya-mountd
+```
+
+The tests of `ostrya-mountd` also need `setpriv`, `unshare`, `nsenter`, and
+user namespaces for an unprivileged user. They run each client as the user
+65534 in its own user namespace, and keep their repositories and targets in
+`/var/tmp`, where that user can reach them.
+
+The unit tests of the protocol and of the daemon handler in `ostrya-mount`
+need the `server` feature:
+
+```sh
+cargo test -p ostrya-mount --features server
 ```
 
 ## Golden fixtures
@@ -63,3 +75,11 @@ OSTRYA_BLESS_MAN=1 cargo test -p ostrya-cli --bin ostrya man_pages
 
 The hand-written sections, for example ENVIRONMENT and EXAMPLES, are in
 `crates/ostrya-cli/man/extra/<page>.roff`.
+
+The man page `ostrya-mountd(8)` is in `crates/ostrya-mountd/man/`, and its
+hand-written sections are in
+`crates/ostrya-mountd/man/extra/ostrya-mountd.8.roff`. Write it again with:
+
+```sh
+OSTRYA_BLESS_MAN=1 cargo test -p ostrya-mountd man_page
+```

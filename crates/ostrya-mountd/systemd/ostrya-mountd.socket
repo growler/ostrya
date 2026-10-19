@@ -1,0 +1,12 @@
+[Unit]
+Description=ostrya composefs mount daemon socket
+Documentation=man:ostrya-mountd(8)
+
+[Socket]
+ListenSequentialPacket=/run/ostrya/mountd.sock
+SocketMode=0660
+SocketGroup=ostrya-mount
+Accept=yes
+
+[Install]
+WantedBy=sockets.target

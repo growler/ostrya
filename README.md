@@ -77,7 +77,9 @@ Ostrya adds these functions, which the `ostree` command does not have:
   it.
 - composefs mounts. The library `ostrya-mount` mounts a commit as a composefs
   tree on Linux, from its stored image or from an image that it builds in
-  memory. The mount reads the objects of the repository in place.
+  memory. The mount reads the objects of the repository in place. Root in the
+  initial user namespace mounts directly. A process in its own user namespace
+  asks the mount daemon `ostrya-mountd`, which runs as root.
 - Library functions: a staging tree with a tree merge, and the import of an
   overlay changeset.
 
@@ -246,7 +248,8 @@ The project is a Cargo workspace of these crates:
   format.
 - `ostrya-rt`: the internal async runtime layer, for `smol` or `tokio`.
 - `ostrya-sys`: wrappers for the Linux fs-verity ioctls, a read-only memory
-  map, the loop device, and a sealed memory file.
+  map, the loop device, a sealed memory file, namespace descriptors, ID-mapped
+  mounts, and socket credentials.
 - `ostrya-sign`: the signing engines: dummy, ed25519, spki, and GPG.
 - `ostrya-fetch`: the async HTTP/1.1 and HTTP/2 client, with TLS over
   `rustls`.
@@ -256,7 +259,10 @@ The project is a Cargo workspace of these crates:
   digest.
 - `ostrya-server`: the HTTP server of one repository, for pull and push.
 - `ostrya`: the library.
-- `ostrya-mount`: the composefs mount of a commit on Linux.
+- `ostrya-mount`: the composefs mount of a commit on Linux, and the client of
+  the mount daemon.
+- `ostrya-mountd`: the mount daemon `ostrya-mountd`. It is not published to
+  crates.io.
 - `ostrya-cli`: the `ostrya` command. It is not published to crates.io.
 - `ostrya-conformance`: the conformance harness that compares Ostrya with the
   `ostree` command. It is not published to crates.io.
@@ -313,8 +319,12 @@ services.ostrya-serve.instances =
   };
 ```
 
-The Debian packaging is in `crates/ostrya-cli/debian`. The Nix package and the
-Debian package install the man pages.
+The Debian packaging is in `crates/ostrya-cli/debian`. It builds two
+packages: `ostrya`, with the `ostrya` command, and `ostrya-mountd`, with the
+mount daemon at `/usr/sbin/ostrya-mountd`, its systemd units, and the
+sysusers.d file of the group `ostrya-mount`. The package does not enable the
+socket unit. The units are in `crates/ostrya-mountd/systemd`. The Nix package
+and the Debian packages install the man pages.
 
 `CONTRIBUTING.md` gives the procedures for development: the tests, the golden
 fixtures, and the man pages.

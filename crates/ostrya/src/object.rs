@@ -37,12 +37,32 @@ pub(crate) const MAX_FILE_HEADER_SIZE: u64 = 1024 * 1024;
 
 /// Opens a loose object for reading, relative to a directory descriptor.
 pub(crate) fn open_object(dir: rustix::fd::BorrowedFd<'_>, path: &str) -> std::io::Result<OwnedFd> {
-    Ok(rustix::fs::openat(
-        dir,
-        path,
-        OFlags::RDONLY | OFlags::CLOEXEC,
-        Mode::empty(),
-    )?)
+    open_regular_file(dir, path, false)
+}
+
+/// Opens the file at `path` under `dir` for reading.
+///
+/// If `strict` is set, the open follows no symlink and does not wait on a
+/// FIFO, and a file that is not a regular file is refused with the kind
+/// `ErrorKind::InvalidData`. A symlink fails the open with `ELOOP`. This is
+/// the strict open mode of [`Repo::open_at_strict`](crate::Repo::open_at_strict).
+pub(crate) fn open_regular_file(
+    dir: rustix::fd::BorrowedFd<'_>,
+    path: &str,
+    strict: bool,
+) -> std::io::Result<OwnedFd> {
+    let mut flags = OFlags::RDONLY | OFlags::CLOEXEC;
+    if strict {
+        flags |= OFlags::NOFOLLOW | OFlags::NONBLOCK | OFlags::NOCTTY;
+    }
+    let fd = rustix::fs::openat(dir, path, flags, Mode::empty())?;
+    if strict && FileType::from_raw_mode(rustix::fs::fstat(&fd)?.st_mode) != FileType::RegularFile {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{path} is not a regular file"),
+        ));
+    }
+    Ok(fd)
 }
 
 /// Returns the error of a metadata read for an object larger than the size cap.
@@ -66,6 +86,17 @@ pub(crate) fn read_meta_object(
     cap: u64,
 ) -> std::io::Result<Vec<u8>> {
     read_meta_fd(open_object(dir, path)?, cap)
+}
+
+/// Reads a whole metadata object, as [`read_meta_object`] does, in the strict
+/// open mode of [`open_regular_file`] if `strict` is set.
+pub(crate) fn read_meta_object_with(
+    dir: rustix::fd::BorrowedFd<'_>,
+    path: &str,
+    cap: u64,
+    strict: bool,
+) -> std::io::Result<Vec<u8>> {
+    read_meta_fd(open_regular_file(dir, path, strict)?, cap)
 }
 
 /// Reads a whole metadata object from an open descriptor.

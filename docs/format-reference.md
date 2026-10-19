@@ -2454,10 +2454,12 @@ The part holds these items:
 - the ssh transport;
 - the commit of `push-tree`;
 - the composefs image object;
+- the protocol of the composefs mount daemon;
 - the mode `bare-user-shared`.
 
-The push protocol and the pull protocol each have a version number. Both
-versions are 1. The two numbers are separate, and each one changes on its own.
+The push protocol, the pull protocol, and the protocol of the mount daemon
+each have a version number. All three versions are 1. The numbers are
+separate, and each one changes on its own.
 Over HTTP, the paths `/_ostrya/receive/v1/` and `/_ostrya/refs/v1` hold the
 version. The pull over HTTP sends no version message.
 
@@ -5049,6 +5051,164 @@ The application:
   image to be present. A pull does not fetch a fallback image as a fallback.
   It requests the image of the commit by the rules of "The pull over HTTP and
   over a stream".
+
+## The mount daemon protocol
+
+`ostrya-mountd` mounts a commit as a composefs tree for a client in its own
+user namespace. The client is the `Helper` mounter of `ostrya-mount`. The
+tool has no such daemon. A run of the daemon and a client, with a trace of
+the system calls of both, can verify each fact.
+
+The transport:
+
+- The socket is a Unix socket of the type `SOCK_SEQPACKET`. The path of the
+  packaged socket is `/run/ostrya/mountd.sock`. A client that is not root in
+  the initial user namespace reads another path from the environment
+  variable `OSTRYA_MOUNTD_SOCKET`.
+- Each packet holds one message. The first byte of a message is its kind.
+  Each integer is big-endian.
+- A connection carries one request. The client closes the connection after
+  the reply. The daemon serves one connection at a time.
+- A connection has 60 seconds from the accept to the reply. The daemon
+  waits for each message of the client at most until the end of that time.
+  At the end of that time, it stops the request, kills its worker process,
+  and sends `Error` with `timeout`. The daemon does not wait for the close
+  after the reply.
+
+The messages:
+
+- `Hello`, from the client: `[0x01][version: u8]`.
+- `HelloReply`, from the daemon: `[0x02][version: u8]`.
+- `Request`, from the client: `[0x03][op: u8][access: u8][commit: 32
+  bytes][repo_len: u16][source_len: u16][target_len: u16][repo][source]
+  [target]`. One `SCM_RIGHTS` control message goes with the bytes. It holds
+  two descriptors in this order: a user namespace and a mount namespace.
+  - `op` is 1 for the stored image of the commit and 2 for an image that
+    the daemon builds.
+  - `access` is 0 for read-only and 1 for read-write.
+  - `commit` is the binary checksum of the commit.
+  - `repo` and `target` are absolute paths, as the client sees them.
+    `source` is the source label of the mount in UTF-8. An empty `source`
+    is the checksum of the commit in hex.
+  - `repo` and `target` are at most 4096 bytes each, and `source` is at
+    most 255 bytes, the longest string option that the kernel takes. No
+    field holds a NUL byte.
+- `Mounted`, from the daemon: `[0x04]`. One `SCM_RIGHTS` control message
+  holds a read-only descriptor of the root of the mount.
+- `Error`, from the daemon: `[0x05][code: u8][errno: i32][text]`. `errno`
+  is the error number of the call that failed, or 0. `text` is UTF-8 and at
+  most 4096 bytes. The client reads an `errno` outside the range from 1 to
+  4095 as no error number.
+
+`Hello`, `HelloReply`, and `Error` carry no descriptor.
+
+The codes of `Error`:
+
+- 1, `protocol`: a message that breaks the protocol.
+- 2, `version`: the client speaks another version.
+- 3, `namespace`: the namespaces of the request fail a check.
+- 4, `access`: the caller cannot open the repository, its `objects`
+  directory, or the target, or the daemon refuses one of them. Examples
+  are a target on FUSE and an `objects` directory that is the root of a
+  mount.
+- 5, `repository`: the repository refuses the mount. Examples are a
+  repository on FUSE, an `archive` repository, a commit without
+  `ostree.composefs.digest.v0`, an absent image, an image whose digest is
+  not the key, and a built image larger than the limit of the daemon.
+- 6, `mount`: a system call of the mount failed.
+- 7, `internal`: the daemon failed for another reason.
+- 8, `timeout`: no message of the client in time, or a request that does
+  not complete in the 60 seconds of its connection.
+
+The exchange:
+
+1. The client sends `Hello` with its version.
+2. If the daemon does not speak that version, it sends `Error` with
+   `version`. Else it sends `HelloReply` with its version.
+3. If the version of `HelloReply` is not the version of the client, the
+   client closes the connection.
+4. The client sends `Request`.
+5. The daemon sends `Mounted` or `Error`.
+
+Each side refuses a message that the kernel truncated (`MSG_TRUNC` or
+`MSG_CTRUNC`), a message longer than the longest message of its kind, a
+message with a wrong count of descriptors, a message of an unknown kind, and
+a field that breaks a rule above. The daemon answers such a message with
+`Error` and `protocol`. A first message that is not `Hello` is `protocol`.
+Each side receives descriptors with the close-on-exec flag.
+
+The checks of the daemon, in order:
+
+1. It sets the receive timeout of the socket (`SO_RCVTIMEO`) to the end of
+   the time of the connection. Then it reads the user, the group, and the
+   supplementary groups of the client from the socket (`SO_PEERCRED` and
+   `SO_PEERGROUPS`). A client with more than 4096 supplementary groups is
+   `access`.
+2. The first descriptor must be a user namespace and the second a mount
+   namespace. The user namespace must not be the user namespace of the
+   daemon, which is the initial one. It must own the mount namespace. The
+   daemon compares the namespaces by device and inode. A failed check is
+   `namespace`. The daemon does not check that the client is a member of the
+   two namespaces.
+3. In the mount namespace of the request, with the user, the group, and the
+   supplementary groups of the client, it opens `target`, `repo`, and the
+   `objects` directory in `repo`. The opens of `repo` and `objects` follow
+   no symlink in the last component. A failed open is `access`.
+4. A target on FUSE (`statfs` type `0x65735546`) is `access`. A repository
+   on FUSE is `repository`.
+5. The `objects` directory must not be the root of a mount, and it must be
+   on the mount of `repo`. The daemon compares the mount ids that `statx`
+   gives. A failed check is `access`.
+6. The daemon reads the repository through an `open_tree(OPEN_TREE_CLONE)`
+   copy of the mount of `repo`, which holds no mount below `repo`. The
+   `objects` directory that the repository opens must have the device and
+   the inode of the directory that the client opened. Else the request is
+   `access`. The reads of `config`, of the metadata objects, and of the
+   image open each file with `O_NOFOLLOW` and `O_NONBLOCK`, and refuse a
+   file that is not a regular file.
+7. A stored image must have the digest that the commit key records. The
+   daemon checks no signature of the commit.
+8. A built image larger than the limit of the daemon is `repository`. The
+   daemon computes the size before it writes the image. The default limit
+   is 104857600 bytes.
+
+The mount:
+
+- The image goes on a read-only, auto-clearing loop device with 4096-byte
+  blocks.
+- The EROFS mount has the flags `ro`, `nosuid`, `nodev`, and `noatime`, and
+  the ID mapping of the user namespace of the request.
+- The composefs overlay has the flags `ro`, `nosuid`, `nodev`, and
+  `noatime`, and the options `metacopy=on`, `redirect_dir=on`, the `verity`
+  value that the repository selects, `lowerdir+` with the EROFS mount, and
+  `datadir+` with the `objects` directory. Its source is the label.
+- User 0 and group 0 of the user namespace of the request mount the top
+  overlay in that namespace. It has the flags `nosuid`, `nodev`, and
+  `noatime`, and the options `userxattr`, `metacopy=off`,
+  `redirect_dir=nofollow`, and `lowerdir+` with a copy of the composefs
+  overlay. Its source is the label. Each layer goes to the kernel as a
+  descriptor (`FSCONFIG_SET_FD`).
+  - A read-only request adds the flag `ro` and a second `lowerdir+` with an
+    empty, read-only tmpfs. overlayfs refuses one lower layer with no upper
+    directory.
+  - A read-write request adds the upper directory `<target>/overlay` and
+    the work directory `<target>/work`.
+- The daemon moves the top overlay onto `target` in the mount namespace of
+  the request.
+
+The superblock of the top overlay belongs to the user namespace of the
+request. The client can clear `nosuid` and `nodev` on the mount. The kernel
+then still refuses to open a device node in the tree, and a setuid file
+changes no id outside that user namespace.
+
+If `target` is the root of an overlay mount whose line in
+`/proc/self/mountinfo`, found by the mount id that `statx` gives, has the
+label as its source and `ro` (read-only) or `rw` (read-write) in its
+superblock options, the daemon mounts nothing and sends `Mounted` with the
+root of that mount.
+
+The client unmounts in its own process. The protocol has no unmount
+message.
 
 ## bare-user-shared mode
 

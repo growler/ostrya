@@ -1,0 +1,37 @@
+[package]
+name = "ostrya-mountd"
+description = "Mount daemon of ostrya: mounts composefs trees for callers in their own user namespace"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+[[bin]]
+name = "ostrya-mountd"
+path = "src/main.rs"
+
+[features]
+default = ["smol", "lzma-static"]
+smol = ["ostrya-mount/smol", "ostrya-rt/smol"]
+tokio = ["ostrya-mount/tokio", "ostrya-rt/tokio"]
+# The shipped binary links xz statically, so it needs no runtime liblzma.
+lzma-static = ["ostrya/lzma-static"]
+
+[dependencies]
+# The repository code. The daemon names it for its `lzma-static` feature.
+ostrya = { workspace = true }
+ostrya-mount = { workspace = true, features = ["server"] }
+ostrya-rt = { workspace = true }
+# The socket that systemd passes.
+ostrya-sys = { workspace = true }
+clap = { version = "4", features = ["derive"] }
+# The listening socket, `poll` on it, and the pidfd of the parent.
+rustix = { version = "1", default-features = false, features = [
+    "std",
+    "fs",
+    "net",
+    "event",
+    "process",
+] }

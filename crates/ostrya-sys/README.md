@@ -5,14 +5,19 @@ known as _ironwood tree_\] is a pure-Rust, async implementation of the
 ostree repository system, written from scratch.
 
 Wrappers for the Linux fs-verity ioctls, a read-only memory map, the loop
-device, and a sealed memory file.
+device, a sealed memory file, namespace descriptors, ID-mapped mounts,
+and socket credentials.
 
 A caller seals a file with fs-verity and reads the digest and the
 parameters that the kernel holds for the sealed file. The seal has the
 parameters that ostree uses: SHA-256, 4096-byte blocks, and no salt. A
 caller can also map a file read-only. On Linux, a caller attaches a file
 to a loop device, and writes bytes to a memory file that it then seals.
-The only dependency of the crate is `rustix`.
+It reads the type and the owner of a namespace, sets an ID mapping on a
+detached mount, reads the groups of the peer of a Unix socket, and takes
+the socket that systemd passes. The crate depends on `rustix`. On Linux
+it also depends on `libc`, for the two calls that `rustix` does not give:
+`mount_setattr` and `SO_PEERGROUPS`.
 
 API documentation: <https://docs.rs/ostrya-sys>
 
@@ -26,6 +31,14 @@ API documentation: <https://docs.rs/ostrya-sys>
   `LoopConfig`. Linux only.
 - `sealable_memfd` creates a memory file that accepts seals, and
   `seal_contents` seals its bytes and its size. Linux only.
+- `ns_type` returns the type of a namespace, and `ns_owner_userns`
+  returns the user namespace that owns it. Linux only.
+- `mount_setattr_idmap` sets an ID mapping on a detached mount. Linux
+  only.
+- `peer_groups` returns the supplementary groups of the peer of a Unix
+  socket. Linux only.
+- `systemd_listen_fd` takes the one socket that systemd passes. Linux
+  only.
 
 ## Examples
 

@@ -1,7 +1,8 @@
 # The build dependencies do not include cargo and rustc. The build
 # environment installs a pinned Rust toolchain into /usr/opt. The default
-# features of ostrya-cli compile liblzma and PCRE2 from their vendored
-# sources and link them statically, so the build needs a C compiler from
+# features of ostrya-cli and ostrya-mountd compile liblzma from its vendored
+# source, and those of ostrya-cli also compile PCRE2. Each binary links
+# these libraries statically. So the build needs a C compiler from
 # build-essential and no -dev package.
 Source: ostrya
 Section: utils
@@ -23,3 +24,15 @@ Description: OSTree repository tool in pure Rust
  .
  This package contains the ostrya command-line tool. It initializes,
  commits to, checks out, pulls into, and serves ostree repositories.
+
+Package: ostrya-mountd
+Architecture: linux-any
+Depends: ${shlibs:Depends}, ${misc:Depends}
+Recommends: systemd
+Description: composefs mount daemon of ostrya
+ ostrya-mountd mounts a commit of an ostrya repository as a composefs tree
+ for a caller in its own user namespace, for example a rootless container
+ tool. The members of the group ostrya-mount can connect to the daemon.
+ .
+ This package contains the daemon, its systemd units, and the sysusers.d
+ file of the group. The package does not enable the socket unit.

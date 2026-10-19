@@ -768,13 +768,7 @@ fn sealed_digest_at(
     if !probe {
         return None;
     }
-    let fd = rustix::fs::openat(
-        dir_fd,
-        path,
-        OFlags::RDONLY | OFlags::CLOEXEC | OFlags::NOFOLLOW,
-        Mode::empty(),
-    )
-    .ok()?;
+    let fd = rustix::fs::openat(dir_fd, path, OBJECT_OPEN, Mode::empty()).ok()?;
     sealed_digest(fd.as_fd(), size, probe)
 }
 

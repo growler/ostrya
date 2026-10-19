@@ -1,0 +1,15 @@
+[Unit]
+Description=ostrya composefs mount daemon
+Documentation=man:ostrya-mountd(8)
+
+# The socket unit starts this service when a drop-in sets Accept=no.
+[Service]
+Type=simple
+User=root
+Group=root
+ExecStart=/usr/sbin/ostrya-mountd
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+StandardOutput=journal
+StandardError=journal

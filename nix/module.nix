@@ -294,7 +294,10 @@ in
       HTTPS. The `[ex-ostrya server]` keys of the repository config apply to
       each instance that serves that repository. Thus, for such a pair, give
       the TLS files in the `tls` options of the HTTPS instance, and not in the
-      `tls-cert` and `tls-key` keys.
+      `tls-cert` and `tls-key` keys. An instance with no TLS and no header
+      of a forwarded certificate ignores the `tls-client-ca` key. The `tls:`
+      and `tls-sha256:` items of the client groups match no request on an
+      instance with no client CA.
     '';
   };
 

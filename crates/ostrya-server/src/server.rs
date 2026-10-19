@@ -253,9 +253,6 @@ fn receive(
 ///   `trusted_proxy_header` is `None`, or the reverse.
 /// - [`Error::Options`] if `client_ca_pem` is set, and `tls` and
 ///   `trusted_proxy_client_cert` are `None`.
-/// - [`Error::Options`] if a client group of `receive` carries a `tls:*`,
-///   `tls:NAME`, or `tls-sha256:HEX` item and `client_ca_pem` is `None`. The
-///   message names the group and the item.
 /// - [`Error::Tls`] if `client_ca_pem` gives no verifier: it does not decode
 ///   as PEM, holds no certificate, or holds a certificate that rustls
 ///   refuses as a trust anchor.
@@ -370,19 +367,6 @@ fn check_proxies(opts: &ServeOptions) -> Result<()> {
         return Err(Error::Options(
             "a client CA with no TLS and no forwarded certificate header".into(),
         ));
-    }
-    if opts.client_ca_pem.is_none()
-        && let Some(policies) = &opts.receive
-    {
-        for group in policies.access().groups() {
-            if let Some(item) = group.auth().iter().find(|item| item.is_tls()) {
-                return Err(Error::Options(format!(
-                    "[ex-ostrya client \"{}\"] carries the item {item}, and the server has \
-                     no client CA",
-                    group.name()
-                )));
-            }
-        }
     }
     Ok(())
 }
@@ -700,18 +684,15 @@ mod tests {
         check_proxies(&ServeOptions::default()).unwrap();
     }
 
-    /// A `tls:` item needs a client CA.
+    /// A `tls:` item needs no client CA.
     #[test]
-    fn a_tls_item_needs_a_client_ca() {
+    fn a_tls_item_needs_no_client_ca() {
         let tmp = TmpRepo::new("bind-no-ca");
         let opts = ServeOptions {
             receive: Some(tmp.policies("[ex-ostrya client \"c\"]\nauth=tls:*\nallow=w:**\n")),
             ..ServeOptions::default()
         };
-        assert_eq!(
-            refused(&opts),
-            "[ex-ostrya client \"c\"] carries the item tls:*, and the server has no client CA"
-        );
+        check_proxies(&opts).unwrap();
     }
 
     /// A client CA that gives no verifier is a TLS error of `bind`, before

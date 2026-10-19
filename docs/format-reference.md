@@ -4476,7 +4476,12 @@ applies:
    this order: `tls-sha256:HEX`, `tls:NAME`, `tls:*`. A certificate that
    matches no item gets 403. From a trusted proxy with
    `trusted-proxy-client-cert`, the certificate comes from that header
-   alone, and never from the TLS handshake.
+   alone, and never from the TLS handshake. A server with no
+   `tls-client-ca` gets no client certificate, so its `tls-sha256:HEX`,
+   `tls:NAME`, and `tls:*` items match no request. The other items of
+   their groups still match. `ostrya serve` with no `tls-cert` and no
+   `trusted-proxy-client-cert` ignores the `tls-client-ca` key, so a plain
+   HTTP server and an HTTPS server can serve one repository.
 5. A request whose client address is in the network of a `net:` item gets
    that item. When two items match, the item with the longer prefix wins.
 6. A request gets the `anonymous` item, if a group has it.

@@ -331,6 +331,7 @@ It needs \fB\%tls\-cert\fR.
 \fB\%tls\-client\-ca\fR (string)
 The PEM CA certificates that verify a client certificate.
 It needs \fB\%tls\-cert\fR or \fB\%trusted\-proxy\-client\-cert\fR.
+A server with neither of them ignores the key, so a plain HTTP server can use the config of an HTTPS server.
 The server verifies the certificate of the TLS handshake and the certificate that a proxy forwards with these certificates.
 .TP
 \fB\%trusted\-proxy\fR (list of CIDR)
@@ -485,6 +486,7 @@ A request whose client address is in \fB\%CIDR\fR.
 .PP
 \fB\%HEX\fR is 64 lowercase hex digits.
 \fB\%NAME\fR and \fB\%USER\fR do not start or end with white space.
+On a server with no \fB\%tls\-client\-ca\fR, the \fB\%tls:\fR and \fB\%tls\-sha256:\fR items match no request, and the other items of their groups still match.
 Two items are the same when their values are equal after the parse, so \fB\%net:2001:0db8::/56\fR and \fB\%net:2001:db8::/56\fR are the same item.
 .SS "Access modes and patterns"
 An allow item is \fB\%[MODES:]PATTERN\fR.
@@ -663,15 +665,13 @@ A \fB\%verify\fR, \fB\%sign\fR, or \fB\%sign\-summary\fR value names a trust gro
 \fB\%ostrya serve\fR also refuses to start in these cases.
 It runs these checks after each option replaces the key of its name:
 .IP \(bu 2
-A \fB\%tls:\fR or \fB\%tls\-sha256:\fR item exists, and the server has no \fB\%tls\-client\-ca\fR.
-.IP \(bu 2
 \fB\%trusted\-proxy\-client\-cert\fR is set, and the server has no \fB\%tls\-client\-ca\fR or no \fB\%trusted\-proxy\fR.
 .IP \(bu 2
 \fB\%trusted\-proxy\fR is set, and the server has no \fB\%trusted\-proxy\-header\fR, or the reverse.
 .IP \(bu 2
 \fB\%tls\-cert\fR is set and \fB\%tls\-key\fR is not, or the reverse.
 .IP \(bu 2
-\fB\%tls\-client\-ca\fR is set, and \fB\%tls\-cert\fR and \fB\%trusted\-proxy\-client\-cert\fR are not.
+\fB\%\-\-tls\-client\-ca\fR is given, and \fB\%tls\-cert\fR and \fB\%trusted\-proxy\-client\-cert\fR are not set.
 .SS "Trust keys"
 A trust group takes the remote keys \fB\%gpg\-verify\fR (default false here), \fB\%gpgkeypath\fR, \fB\%sign\-verify\fR, \fB\%verification\-ENGINE\-key\fR, and \fB\%verification\-ENGINE\-file\fR.
 It trusts the keys that it names, and no system key store or keyring.

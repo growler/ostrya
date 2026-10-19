@@ -90,7 +90,10 @@ impl fmt::Debug for ServerTls {
 ///    exactly one CN, of type UTF8String or PrintableString. From a trusted
 ///    proxy with a header of a forwarded certificate, the certificate comes
 ///    from that header alone, and never from the TLS handshake (see
-///    [Forwarded certificate](ServeOptions#forwarded-certificate)).
+///    [Forwarded certificate](ServeOptions#forwarded-certificate)). With no
+///    [`client_ca_pem`](ServeOptions::client_ca_pem), a request has no
+///    client certificate, so the `tls-sha256:HEX`, `tls:NAME`, and `tls:*`
+///    items match no request. The other items of their groups still match.
 /// 5. A request whose client address is in the network of a `net:` item gets
 ///    that item. When two items match, the item with the longer prefix wins.
 /// 6. A request gets the `anonymous` item, if one exists.

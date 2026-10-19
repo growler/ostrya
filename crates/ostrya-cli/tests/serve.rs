@@ -873,7 +873,6 @@ fn the_tool_pulls_loose_past_unserved_deltas() {
 /// - `--policy`, `--push-credentials`, `--allow-anonymous-push`,
 ///   `--read-only`, and `--client-ca`, which it does not take,
 /// - `[ex-ostrya receive]` in the config,
-/// - a client group with a TLS item and no client CA,
 /// - a key group whose key it cannot read,
 /// - a TLS file that it cannot use, or that is larger than the size cap,
 /// - a TLS file with no partner, from an option or from a key,
@@ -916,7 +915,6 @@ fn serve_refuses_what_it_cannot_serve() {
     };
     let server = |name: &str, keys: &str| with_groups(name, &format!("[ex-ostrya server]\n{keys}"));
     let removed = with_groups("removed", "[ex-ostrya receive]\naccept=true\n");
-    let tls_item = with_groups("tls-item", "[ex-ostrya client \"c\"]\nauth=tls:*\n");
     let bad_key = with_groups(
         "bad-key",
         "[ex-ostrya key \"k\"]\ntype=ed25519\nsecret-key-file=/nonexistent/ostrya/k\n",
@@ -965,7 +963,6 @@ fn serve_refuses_what_it_cannot_serve() {
             "--client-ca",
         ),
         (&[&removed, "serve", listen], "[ex-ostrya client \"NAME\"]"),
-        (&[&tls_item, "serve", listen], "tls-client-ca"),
         (&[&bad_key, "serve", listen], "/nonexistent/ostrya/k"),
         (
             &[&repo, "serve", listen, "--parallel-uploads=32"],
@@ -996,7 +993,6 @@ fn serve_refuses_what_it_cannot_serve() {
         (&[&repo, "serve", listen, &enc_cert, &enc_key], "passphrase"),
         (&[&repo, "serve", listen, &big_cert, &key], "size cap"),
         (&[&cert_key, "serve", listen], tls_pair),
-        (&[&ca_key, "serve", listen], ca_alone),
         (
             &[&ca_key, "serve", listen, &key],
             "tls-key is set, and tls-cert is not",
@@ -1528,6 +1524,66 @@ fn serve_runs_the_receive_endpoint_with_anonymous_push() {
         response.contains("client group 'push' opens no push session"),
         "{response}"
     );
+}
+
+/// One repository with the `tls-client-ca` key, an anonymous group, and a
+/// group of a `tls:NAME` item has two servers at the same time: one over
+/// plain HTTP, and one over HTTPS with `--tls-cert` and `--tls-key`. Both
+/// start. The plain HTTP server ignores the key, and a request gets the
+/// anonymous group. The HTTPS server verifies the client certificate
+/// against the CA of the key, and `ostrya push-tree` with that certificate
+/// sets the ref.
+#[test]
+fn serve_starts_with_a_tls_item_and_no_client_ca() {
+    let tmp = TmpDir::new("tls-item");
+    let path = tmp.path().join("repo");
+    let repo = format!("--repo={}", path.display());
+    ok(ostrya(), &[&repo, "init", "--mode=archive"]);
+    let config = path.join("config");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(&format!(
+        "[ex-ostrya server]\ntls-client-ca={}\n\
+         [ex-ostrya client \"anonymous\"]\nauth=anonymous\nallow=r:**\n\
+         [ex-ostrya client \"builder\"]\nauth=tls:ostrya test\nallow=wc:**\n",
+        fixture("ca.pem").display()
+    ));
+    std::fs::write(&config, text).unwrap();
+    let plain = Serving::start(&path, &[]);
+    assert!(plain.url.starts_with("http://"), "{}", plain.url);
+    let response = raw(&plain.url, session_request("main"));
+    assert!(response.starts_with("HTTP/1.1 403 "), "{response}");
+    assert!(
+        response.contains("client group 'anonymous' opens no push session"),
+        "{response}"
+    );
+    let tls = Serving::start(
+        &path,
+        &[
+            &format!("--tls-cert={}", fixture("server.pem").display()),
+            &format!("--tls-key={}", fixture("server.key.pem").display()),
+        ],
+    );
+    assert!(tls.url.starts_with("https://"), "{}", tls.url);
+    let src = tmp.path().join("tree");
+    std::fs::create_dir(&src).unwrap();
+    std::fs::write(src.join("file"), "content\n").unwrap();
+    let commit = ok(
+        ostrya(),
+        &[
+            "push-tree",
+            &tls.url,
+            src.to_str().unwrap(),
+            "--onto",
+            "main",
+            &format!("--tls-ca-path={}", fixture("ca.pem").display()),
+            &format!("--tls-client-cert-path={}", fixture("client.pem").display()),
+            &format!(
+                "--tls-client-key-path={}",
+                fixture("client.key.pem").display()
+            ),
+        ],
+    );
+    assert_eq!(ok(ostrya(), &[&repo, "rev-parse", "main"]), commit);
 }
 
 /// With a `token-sha256` item and an anonymous item, and with no

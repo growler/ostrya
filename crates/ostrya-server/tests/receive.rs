@@ -1645,37 +1645,49 @@ fn tls_items_alone_refuse_a_client_with_no_certificate() {
     });
 }
 
-/// `bind` refuses a client group with a `tls:` or `tls-sha256:` item and no
-/// client CA, over plain HTTP and over TLS. The message names the group and
-/// the item.
+/// With no client CA, a `tls:` or `tls-sha256:` item matches no request, over
+/// plain HTTP and over TLS with a client that offers a certificate. A group
+/// with the TLS item alone does not get the request, and the request gets
+/// the `net:` item of another group. The other items of the group of a TLS
+/// item still identify a request.
 #[test]
-fn a_tls_item_with_no_client_ca_is_refused() {
+fn a_tls_item_with_no_client_ca_matches_no_request() {
     let tmp = TmpDir::new("no-client-ca");
     let repo = receiver(tmp.path(), RepoMode::Archive, "");
     let by_digest = format!("tls-sha256:{}", client_cert_digest());
-    for (item, tls) in [
-        ("tls:ostrya test", false),
-        ("tls:*", true),
-        (by_digest.as_str(), false),
-    ] {
-        let mut opts = options_with(
-            &repo,
-            &format!("{ANONYMOUS_PUSH}[ex-ostrya client \"certs\"]\nauth={item}\nallow=w:**\n"),
+    for item in ["tls:ostrya test", "tls:*", by_digest.as_str()] {
+        let alone = format!(
+            "[ex-ostrya client \"certs\"]\nauth={item}\nallow=w:**\n\
+             [ex-ostrya client \"local\"]\nauth=net:127.0.0.1\nallow=r:**\n"
         );
-        if tls {
-            with_tls(&mut opts);
-            opts.client_ca_pem = None;
-        }
-        let refused = block_on(ostrya_server::bind(repo.clone(), opts));
-        match refused.err().unwrap() {
-            ostrya_server::Error::Options(message) => assert_eq!(
-                message,
-                format!(
-                    "[ex-ostrya client \"certs\"] carries the item {item}, and the server \
-                     has no client CA"
-                )
-            ),
-            other => panic!("{item}: {other}"),
+        let mixed =
+            format!("[ex-ostrya client \"certs\"]\nauth={item};net:127.0.0.1\nallow=w:**\n");
+        for (groups, refused) in [(alone, true), (mixed, false)] {
+            for tls in [false, true] {
+                let mut opts = options_with(&repo, &groups);
+                if tls {
+                    with_tls(&mut opts);
+                    opts.client_ca_pem = None;
+                }
+                with_server(repo.clone(), opts, |plain, addr| async move {
+                    let client = if tls {
+                        Client::tls(addr, false, Some((CLIENT_CERT_PEM, CLIENT_KEY_PEM))).await
+                    } else {
+                        plain
+                    };
+                    if refused {
+                        let reply = client.post(SESSION, encode(&[hello()]).await).await;
+                        let error = reply.error(403, ErrorCode::Unauthorized);
+                        assert_eq!(
+                            error.message, "client group 'local' opens no push session",
+                            "{item}"
+                        );
+                    } else {
+                        let id = client.open().await;
+                        assert_eq!(client.delete(&id).await.status, 204, "{item}");
+                    }
+                });
+            }
         }
     }
 }

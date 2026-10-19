@@ -720,7 +720,8 @@ fn a_cleartext_credential_needs_the_switch() {
     let root = tree(tmp.path(), "tree", 2, 100);
     let server = repo(tmp.path(), "server");
     let alice = tmp.file("alice", format!("{ALICE}\n").as_bytes());
-    // Plain HTTP has no client CA, so the group carries no `tls:` item.
+    // Plain HTTP has no client CA, so a `tls:` item matches no request, and
+    // the group carries none.
     let groups = format!(
         "[ex-ostrya client \"builders\"]\nauth=token-sha256:{}\nallow=wc:**\n",
         Checksum::sha256(ALICE.as_bytes()).to_hex()

@@ -485,7 +485,9 @@ pub struct ServerSettings {
     /// `tls-key`: the PEM private key of `tls-cert`.
     pub tls_key: Option<PathBuf>,
     /// `tls-client-ca`: the PEM CA certificates that verify a client
-    /// certificate.
+    /// certificate. A server with no `tls-cert` and no
+    /// `trusted-proxy-client-cert` ignores the key (see
+    /// [`overridden_by`](ServerSettings::overridden_by)).
     pub tls_client_ca: Option<PathBuf>,
     /// `trusted-proxy`: the networks of the peers whose forwarding data the
     /// server reads. An empty value is refused.
@@ -528,6 +530,11 @@ impl ServerSettings {
     /// `flags` keeps the value of `self`. A list in `flags` replaces the
     /// whole list of `self`.
     ///
+    /// When the result has no `tls_cert` and no `trusted_proxy_client_cert`,
+    /// it has no `tls_client_ca` from `self`. Thus a plain HTTP server ignores
+    /// the `tls-client-ca` key, and can share the config of an HTTPS server.
+    /// A `tls_client_ca` in `flags` stays.
+    ///
     /// # Examples
     ///
     /// ```
@@ -569,7 +576,7 @@ impl ServerSettings {
             body_timeout,
             sign_summary,
         } = flags;
-        ServerSettings {
+        let mut merged = ServerSettings {
             listen: pick(listen, &self.listen),
             tls_cert: pick(tls_cert, &self.tls_cert),
             tls_key: pick(tls_key, &self.tls_key),
@@ -590,7 +597,14 @@ impl ServerSettings {
             parallel_uploads: pick(parallel_uploads, &self.parallel_uploads),
             body_timeout: pick(body_timeout, &self.body_timeout),
             sign_summary: pick(sign_summary, &self.sign_summary),
+        };
+        if tls_client_ca.is_none()
+            && merged.tls_cert.is_none()
+            && merged.trusted_proxy_client_cert.is_none()
+        {
+            merged.tls_client_ca = None;
         }
+        merged
     }
 }
 
@@ -921,8 +935,6 @@ impl ClientAccess {
     /// the command line in place of the keys that they replace. The call
     /// refuses these cases:
     ///
-    /// - A group carries a `tls:*`, `tls:NAME`, or `tls-sha256:HEX` item,
-    ///   and `tls_client_ca` is `None`.
     /// - `trusted_proxy_client_cert` is set, and `tls_client_ca` is `None`.
     /// - `trusted_proxy_client_cert` is set, and `trusted_proxy` is `None`.
     /// - `trusted_proxy` is set, and `trusted_proxy_header` is `None`.
@@ -935,21 +947,10 @@ impl ClientAccess {
     ///
     /// [`Error::InvalidFormat`] for each case above.
     pub fn check_server(&self, merged: &ServerSettings) -> Result<()> {
-        if merged.tls_client_ca.is_none() {
-            for group in &self.groups {
-                if let Some(item) = group.auth.iter().find(|item| item.is_tls()) {
-                    return Err(Error::InvalidFormat(format!(
-                        "{} carries the item {item}, and the server has no tls-client-ca",
-                        group.header()
-                    )));
-                }
-            }
-            if merged.trusted_proxy_client_cert.is_some() {
-                return Err(Error::InvalidFormat(
-                    "trusted-proxy-client-cert is set, and the server has no tls-client-ca"
-                        .to_owned(),
-                ));
-            }
+        if merged.tls_client_ca.is_none() && merged.trusted_proxy_client_cert.is_some() {
+            return Err(Error::InvalidFormat(
+                "trusted-proxy-client-cert is set, and the server has no tls-client-ca".to_owned(),
+            ));
         }
         if merged.trusted_proxy_client_cert.is_some() && merged.trusted_proxy.is_none() {
             return Err(Error::InvalidFormat(
@@ -1471,26 +1472,23 @@ secret-key-file=/etc/ostrya/release.secret
         }
     }
 
-    /// A TLS item needs `tls-client-ca`, and so does a proxy certificate
-    /// header.
+    /// A TLS item needs no `tls-client-ca`, and a proxy certificate header
+    /// needs it.
     #[test]
-    fn a_tls_item_needs_the_client_ca() {
+    fn a_proxy_certificate_header_needs_the_client_ca() {
         for item_text in [
             "tls:*",
             "tls:n",
             "tls-sha256:0000000000000000000000000000000000000000000000000000000000000000",
         ] {
-            let access = access(&format!(
-                "[ex-ostrya client \"c\"]\nauth=anonymous;{item_text}\n"
-            ));
+            let access = access(&format!("[ex-ostrya client \"c\"]\nauth={item_text}\n"));
             access.check_server(&settings()).unwrap();
+            access.check_server(&ServerSettings::default()).unwrap();
             let merged = ServerSettings {
                 tls_client_ca: None,
                 ..settings()
             };
-            let message = check(&access, &merged);
-            assert!(message.contains(item_text), "{message}");
-            assert!(message.contains("tls-client-ca"), "{message}");
+            access.check_server(&merged).unwrap();
         }
         let access = access("[ex-ostrya client \"c\"]\nauth=anonymous\n");
         access.check_server(&ServerSettings::default()).unwrap();
@@ -1665,6 +1663,36 @@ secret-key-file=/etc/ostrya/release.secret
                 ..keys.clone()
             }
         );
+    }
+
+    /// The `tls-client-ca` key stays with `tls-cert` or
+    /// `trusted-proxy-client-cert`, from a key or from a flag. With neither,
+    /// the key goes, and the flag stays, so that `check_server` refuses it.
+    #[test]
+    fn a_plain_server_ignores_the_client_ca_key() {
+        let ca = |path: &str| ServerSettings {
+            tls_client_ca: Some(path.into()),
+            ..ServerSettings::default()
+        };
+        let merged = ca("/key/ca.pem").overridden_by(&ServerSettings::default());
+        assert_eq!(merged, ServerSettings::default());
+        access("").check_server(&merged).unwrap();
+        let merged = ca("/key/ca.pem").overridden_by(&ca("flag/ca.pem"));
+        assert_eq!(merged, ca("flag/ca.pem"));
+        assert!(check(&access(""), &merged).contains("tls-client-ca"));
+        let flags = ServerSettings {
+            tls_cert: Some("flag/c.pem".into()),
+            tls_key: Some("flag/k.pem".into()),
+            ..ServerSettings::default()
+        };
+        let merged = ca("/key/ca.pem").overridden_by(&flags);
+        assert_eq!(merged.tls_client_ca, Some("/key/ca.pem".into()));
+        let keys = ServerSettings {
+            trusted_proxy_client_cert: Some("X-Key".into()),
+            ..ca("/key/ca.pem")
+        };
+        let merged = keys.overridden_by(&ServerSettings::default());
+        assert_eq!(merged.tls_client_ca, Some("/key/ca.pem".into()));
     }
 
     /// `tls-cert` and `tls-key` go together, and `tls-client-ca` needs

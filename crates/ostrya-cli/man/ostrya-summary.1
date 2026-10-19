@@ -8,7 +8,7 @@ ostrya summary [OPTIONS] [KEY_ID]...
 .SH DESCRIPTION
 Regenerate, sign, or verify the repository summary.
 .PP
-With \%\-u, the command writes the root summary \fB\%summary\fR, which holds each ref, and the summary of each auth item of the client groups, from the refs of the repository. It signs each one with the given keys. With \%\-\-verify, it verifies the signatures in \fB\%summary.sig\fR, and \%\-\-verify takes precedence over \%\-u. Without these two options, a \%KEY\-ID or a \%\-\-keys\-file signs each existing summary. The read options \%\-\-raw, \%\-v, \%\-\-list\-metadata\-keys, and \%\-\-print\-metadata\-key print the local summary, or with \%\-\-auth\-group the summary of the item of one client group. If no option gives an action, the command exits \%1.
+With \%\-u, the command writes the root summary \fB\%summary\fR, which holds each ref, and the summary of each auth item of the client groups, from the refs of the repository. It signs each one with the given keys. With \%\-u \%\-c, it writes the summaries of the auth items alone, and leaves \fB\%summary\fR and \fB\%summary.sig\fR as they are. With \%\-\-verify, it verifies the signatures in \fB\%summary.sig\fR, and \%\-\-verify takes precedence over \%\-u. Without \%\-u and \%\-\-verify, a \%KEY\-ID or a \%\-\-keys\-file signs each existing summary. The read options \%\-\-raw, \%\-v, \%\-\-list\-metadata\-keys, and \%\-\-print\-metadata\-key print the local summary, or with \%\-\-auth\-group the summary of the item of one client group. If no option gives an action, the command exits \%1.
 .SH ARGUMENTS
 .TP
 \fIKEY_ID...\fR
@@ -22,7 +22,12 @@ Regenerate the root summary and the summary of each auth item from the refs of t
 .IP
 The root summary \fB\%summary\fR holds each ref, whatever the client groups. An auth item has a summary when one or more of its client groups has \fB\%summary=true\fR\&. With no client group, the \fB\%anonymous\fR item has a summary that holds each ref. The summary of an item holds the refs that the item reads in each namespace whose selected group has \fB\%summary=true\fR\&. A namespace whose selected group has \fB\%summary=false\fR adds no ref. The summary of each item, \fB\%anonymous\fR included, is under \fB\%extensions/ostrya/summary/\fR\&. The root summary states the mode of the repository. The summary of an item states \fB\%archive\-z2\fR, the mode that \fB\%ostrya serve\fR serves. In a mode other than \fB\%archive\fR, the summary of an item names no static delta. The command writes each summary and replaces its signature file. Each summary gets a signature of each \%\-\-gpg\-sign key, each \%\-\-sign key, and each \%KEY\-ID and \%\-\-keys\-file key, in this order. The command writes the \fB\%\&.access\fR file of each item last, and removes the files of each item that has no summary.
 .IP
-The command checks every \%\-m value, every key, and the client groups before the regeneration, so a refusal leaves each summary as it was. For each directory under \fB\%refs/mirrors/\fR whose name is not a collection id, the command writes one \fB\%warning:\fR line to standard error. It prints nothing else.
+The command checks every \%\-m value, every key, and the client groups before the regeneration, so a refusal leaves each summary as it was. For each directory under \fB\%refs/mirrors/\fR whose name is not a collection id, the command writes one \fB\%warning:\fR line to standard error. It prints nothing else. With \%\-c, the command does not write the root summary.
+.TP
+\fB\-c\fR, \fB\-\-client\-groups\fR
+With \%\-u, write the summaries of the auth items alone.
+.IP
+This is an ostrya extension. The command writes and signs the summary of each auth item under \fB\%extensions/ostrya/summary/\fR, and removes the files of each item that has no summary, as \%\-u does. It leaves \fB\%summary\fR and \fB\%summary.sig\fR in the repository root as they are. In a repository with a collection id, it writes no \fB\%ostree\-metadata\fR anchor commit. The option needs \%\-u.
 .TP
 \fB\-v\fR, \fB\-\-view\fR
 View a report of the local summary file.
@@ -77,7 +82,7 @@ A fixed value makes the output reproducible. Without this option, the command us
 \fB\-\-metadata\-commit\-timestamp\fR \fIMETADATA_COMMIT_TIMESTAMP\fR
 The timestamp of the collection anchor commit, in Unix epoch seconds.
 .IP
-The anchor commit is the \fB\%ostree\-metadata\fR commit. Without this option, the timestamp is \fB\%SOURCE_DATE_EPOCH\fR if it is set, or else the current time. Only \%\-u reads it, and only a repository with a collection id uses it.
+The anchor commit is the \fB\%ostree\-metadata\fR commit. Without this option, the timestamp is \fB\%SOURCE_DATE_EPOCH\fR if it is set, or else the current time. Only \%\-u without \%\-c reads it, and only a repository with a collection id uses it.
 .TP
 \fB\-\-keys\-file\fR \fIPATH\fR
 Read keys from a file, in the format of \fB\%ostrya sign\fR\&.

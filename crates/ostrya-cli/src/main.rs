@@ -329,9 +329,11 @@ enum Command {
     /// With -u, the command writes the root summary `summary`, which holds
     /// each ref, and the summary of each auth item of the client groups, from
     /// the refs of the repository. It signs each one with the given keys.
-    /// With --verify, it verifies the signatures in
-    /// `summary.sig`, and --verify takes precedence over -u. Without these
-    /// two options, a KEY-ID or a --keys-file signs each existing summary.
+    /// With -u -c, it writes the summaries of the auth items alone, and leaves
+    /// `summary` and `summary.sig` as they are. With --verify, it verifies
+    /// the signatures in `summary.sig`, and --verify takes precedence over
+    /// -u. Without -u and --verify, a KEY-ID or a --keys-file signs each
+    /// existing summary.
     /// The read options --raw, -v, --list-metadata-keys, and
     /// --print-metadata-key print the local summary, or with --auth-group the
     /// summary of the item of one client group. If no option gives an
@@ -2150,9 +2152,20 @@ struct SummaryArgs {
     /// before the regeneration, so a refusal leaves each summary as it was.
     /// For each directory under `refs/mirrors/` whose name is not a
     /// collection id, the command writes one `warning:` line to standard
-    /// error. It prints nothing else.
+    /// error. It prints nothing else. With -c, the command does not write the
+    /// root summary.
     #[arg(short = 'u', long)]
     update: bool,
+    /// With -u, write the summaries of the auth items alone.
+    ///
+    /// This is an ostrya extension. The command writes and signs the summary
+    /// of each auth item under `extensions/ostrya/summary/`, and removes the
+    /// files of each item that has no summary, as -u does. It leaves `summary`
+    /// and `summary.sig` in the repository root as they are. In a repository
+    /// with a collection id, it writes no `ostree-metadata` anchor commit.
+    /// The option needs -u.
+    #[arg(short = 'c', long, requires = "update")]
+    client_groups: bool,
     /// View a report of the local summary file.
     ///
     /// The report holds each ref, the refs of each collection, and the global
@@ -2239,8 +2252,8 @@ struct SummaryArgs {
     ///
     /// The anchor commit is the `ostree-metadata` commit. Without this option,
     /// the timestamp is `SOURCE_DATE_EPOCH` if it is set, or else the current
-    /// time. Only -u reads it, and only a repository with a collection id uses
-    /// it.
+    /// time. Only -u without -c reads it, and only a repository with a
+    /// collection id uses it.
     #[arg(long)]
     metadata_commit_timestamp: Option<u64>,
     /// Read keys from a file, in the format of `ostrya sign`.
@@ -11859,6 +11872,7 @@ async fn summary_update(repo: &Repo, args: &SummaryArgs) -> Result<()> {
         last_modified: args.last_modified,
         metadata_commit_timestamp: args.metadata_commit_timestamp,
         additional_metadata,
+        auth_items_only: args.client_groups,
     };
     let report = repo
         .regenerate_summaries(&opts, &signer_refs(&signers))
@@ -14001,6 +14015,25 @@ mod tests {
                 "dir",
             ];
             assert!(Cli::try_parse_from(args).is_err(), "{removed}");
+        }
+    }
+
+    /// `-c` and `--client-groups` of `summary` need `-u`.
+    #[test]
+    fn the_client_groups_of_summary_need_update() {
+        use clap::error::ErrorKind;
+        for args in [
+            &["ostrya", "summary", "-c"][..],
+            &["ostrya", "summary", "--client-groups", "-v"],
+        ] {
+            let err = Cli::try_parse_from(args).map(|_| ()).unwrap_err();
+            assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument, "{args:?}");
+        }
+        for args in [
+            &["ostrya", "summary", "-u", "-c"][..],
+            &["ostrya", "summary", "--update", "--client-groups"],
+        ] {
+            Cli::try_parse_from(args).map(|_| ()).unwrap();
         }
     }
 

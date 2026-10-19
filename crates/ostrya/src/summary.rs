@@ -8,7 +8,8 @@
 //!   holds each ref, and the summary of each auth item of the client groups,
 //!   with the options in [`SummaryOptions`]. It signs each one, and returns
 //!   a [`SummaryReport`]. [`Repo::regenerate_summary`] writes them
-//!   unsigned.
+//!   unsigned. With [`SummaryOptions::auth_items_only`], the two calls write
+//!   the summaries of the auth items alone.
 //! - [`Repo::sign_summary`] and [`Repo::sign_summary_all`] add signatures to
 //!   each summary. [`Repo::verify_summary`] verifies the signatures in
 //!   `summary.sig`.
@@ -219,9 +220,13 @@ struct SummaryRun {
     last_modified: u64,
     /// The selection of each ref of the repository.
     every: RefSelection,
-    /// The facts of the commit of each ref of `every`.
+    /// The facts of the commit of each ref of `every`. With
+    /// [`SummaryOptions::auth_items_only`], the facts of the commit of each
+    /// ref of `every` that an item with a summary reads.
     facts: HashMap<Checksum, CommitFacts>,
-    /// Each static delta of the repository, sorted by name.
+    /// Each static delta of the repository, sorted by name. With
+    /// [`SummaryOptions::auth_items_only`], empty when no summary of an item
+    /// of the run names a delta.
     deltas: Vec<DeltaDigest>,
 }
 
@@ -592,7 +597,8 @@ fn malformed(what: &str) -> Error {
     Error::InvalidFormat(format!("malformed summary: {what}"))
 }
 
-/// The options of [`Repo::regenerate_summary`].
+/// The options of [`Repo::regenerate_summary`] and
+/// [`Repo::regenerate_summaries`].
 #[derive(Debug, Default, Clone)]
 pub struct SummaryOptions {
     /// The `ostree.summary.last-modified` timestamp, in seconds since the Unix
@@ -607,7 +613,8 @@ pub struct SummaryOptions {
     ///
     /// If `None`, the timestamp resolves as for each commit: `SOURCE_DATE_EPOCH`
     /// if it is set, else the current time. A repository with no collection id
-    /// ignores this field.
+    /// ignores this field. A call with [`SummaryOptions::auth_items_only`]
+    /// set to `true` writes no anchor commit, so it also ignores this field.
     pub metadata_commit_timestamp: Option<u64>,
     /// The keys that the caller adds to the global metadata dict.
     ///
@@ -621,11 +628,21 @@ pub struct SummaryOptions {
     /// key, whatever its name, the empty key included. A repository with a
     /// collection id refuses each caller key.
     pub additional_metadata: Vec<(String, Value)>,
+    /// The switch that writes the summaries of the auth items alone.
+    ///
+    /// If it is `false` (the default), the call writes the root summary and
+    /// the summary of each auth item. If it is `true`, the call writes the
+    /// summary of each auth item and removes the files of each item with no
+    /// summary, as with `false`. It leaves `summary` and `summary.sig` at the
+    /// repository root as they are, and no signer signs them. In a repository
+    /// with a collection id, the call writes no anchor commit.
+    pub auth_items_only: bool,
 }
 
 /// Methods that write, read, sign, and verify the summary.
 impl Repo {
-    /// Writes the root summary and the summary of each auth item, unsigned.
+    /// Writes the summaries that
+    /// [`regenerate_summaries`](Repo::regenerate_summaries) writes, unsigned.
     ///
     /// The call is [`regenerate_summaries`](Repo::regenerate_summaries) with
     /// no signer. It drops the report.
@@ -652,6 +669,10 @@ impl Repo {
     /// implicit groups, which set `summary=true`, so the `anonymous` item has
     /// a summary that holds each ref.
     ///
+    /// If [`SummaryOptions::auth_items_only`] is `true`, the call writes the
+    /// summaries of the auth items alone. It does not build, sign, or write
+    /// the root summary, and it writes no anchor commit.
+    ///
     /// The checks of [`SummaryOptions::additional_metadata`] and of the
     /// client groups come before each write and before each lock. A refusal
     /// writes nothing, the anchor commit included.
@@ -671,7 +692,8 @@ impl Repo {
     ///   of the item ([`ClientAccess::summary_digest`]) in 64 lowercase hex
     ///   digits and a newline.
     ///
-    /// The call first builds and signs the root summary. It removes the old
+    /// Unless [`SummaryOptions::auth_items_only`] is set, the call first
+    /// builds and signs the root summary. It removes the old
     /// `summary.sig`, writes `summary`, and writes the new `summary.sig` if
     /// `signers` is not empty.
     ///
@@ -781,8 +803,10 @@ impl Repo {
     ///
     /// # Collection id
     ///
-    /// If the repository sets `[core] collection-id`, the call first writes a
-    /// new anchor commit to `refs/heads/ostree-metadata`. The anchor commit:
+    /// If the repository sets `[core] collection-id` and
+    /// [`SummaryOptions::auth_items_only`] is `false`, the call first writes
+    /// a new anchor commit to `refs/heads/ostree-metadata`. The anchor
+    /// commit:
     ///
     /// - has an empty root tree, with uid 0, gid 0, and the mode `0o40755`,
     /// - holds the collection id in `ostree.collection-binding`, and
@@ -791,8 +815,9 @@ impl Repo {
     /// - has the timestamp that
     ///   [`SummaryOptions::metadata_commit_timestamp`] states.
     ///
-    /// Each regeneration adds a commit to the chain, and a summary whose item
-    /// reads `ostree-metadata` lists the new checksum of the anchor commit.
+    /// Each regeneration that writes an anchor commit adds a commit to the
+    /// chain, and a summary whose item reads `ostree-metadata` lists the new
+    /// checksum of the anchor commit.
     ///
     /// The `ostree` command copies the caller keys into the metadata of the
     /// anchor commit. ostrya does not reproduce the order of these keys, so a
@@ -808,7 +833,8 @@ impl Repo {
     /// call removes each signature file of the summaries that it writes. If
     /// a signer fails, the summaries before the summary of the failure keep
     /// their new files, and the summary of the failure and the summaries
-    /// after it keep their old files. The root summary comes first.
+    /// after it keep their old files. The root summary, when the call writes
+    /// it, comes first.
     ///
     /// # Size
     ///
@@ -816,8 +842,9 @@ impl Repo {
     /// of a summary in this crate. The call refuses a larger summary before
     /// it writes a file of the summary. The summaries before it keep their
     /// new files, and the summary of the refusal and the summaries after it
-    /// keep their old files. The root summary comes first. The names of the refs give a lower bound of the size, so
-    /// the call can refuse a summary before it reads the commits of its refs.
+    /// keep their old files. The root summary, when the call writes it, comes
+    /// first. The names of the refs give a lower bound of the size, so the
+    /// call can refuse a summary before it reads the commits of its refs.
     ///
     /// # Locks
     ///
@@ -896,11 +923,13 @@ impl Repo {
 
         // The repository lock comes before the update lock. The anchor
         // transaction takes the repository lock shared too, before the update
-        // lock, so its staging directory is made outside the update lock.
+        // lock, so its staging directory is made outside the update lock. A
+        // run that writes the summaries of the auth items alone writes no
+        // anchor.
         let repo_lock = self.lock_repo(LockKind::Shared).await?;
         let txn = match &collection_id {
-            Some(_) => Some(self.transaction().await?),
-            None => None,
+            Some(_) if !opts.auth_items_only => Some(self.transaction().await?),
+            _ => None,
         };
         let held = self.lock_update().await?;
 
@@ -921,11 +950,13 @@ impl Repo {
         Ok(report)
     }
 
-    /// Writes the summary of each item of `access`, as
-    /// [`regenerate_summaries`](Repo::regenerate_summaries) states, and
+    /// Writes the root summary, unless [`SummaryOptions::auth_items_only`] is
+    /// set, and the summary of each item of `access`, as
+    /// [`regenerate_summaries`](Repo::regenerate_summaries) states. Then it
     /// removes the files of each other item.
     ///
-    /// The caller holds the update lock, and the anchor commit is in place.
+    /// The caller holds the update lock, and the anchor commit of the run, if
+    /// the run writes one, is in place.
     /// The call checks no value of [`SummaryOptions::additional_metadata`].
     /// A failure names the step at which the call stopped.
     pub(crate) async fn write_summaries(
@@ -980,15 +1011,17 @@ impl Repo {
             Ok(signatures)
         };
         // The root summary holds each ref, whatever the client groups.
-        let bytes = self
-            .selection_summary(&run, &run.every, SummaryKind::Root, opts)
-            .await
-            .map_err(build)?;
-        let signatures = sign(&bytes).await?;
-        let repo = self.clone();
-        ostrya_rt::unblock(move || put_root_summary_blocking(&repo, &bytes, signatures, fsync))
-            .await
-            .map_err(write)?;
+        if !opts.auth_items_only {
+            let bytes = self
+                .selection_summary(&run, &run.every, SummaryKind::Root, opts)
+                .await
+                .map_err(build)?;
+            let signatures = sign(&bytes).await?;
+            let repo = self.clone();
+            ostrya_rt::unblock(move || put_root_summary_blocking(&repo, &bytes, signatures, fsync))
+                .await
+                .map_err(write)?;
+        }
         for (item, files) in &items {
             let bytes = self.item_summary(&run, item, opts).await.map_err(build)?;
             let signatures = sign(&bytes).await?;
@@ -1014,6 +1047,10 @@ impl Repo {
     /// each ref of the repository, the facts of the commits of these refs,
     /// the static deltas, and the `ostree.summary.last-modified` value of
     /// each summary.
+    ///
+    /// With [`SummaryOptions::auth_items_only`], the call reads the commits
+    /// of the refs that the items with a summary read, and reads the static
+    /// deltas only when a summary of an item names deltas.
     async fn summary_run(
         &self,
         access: Arc<ClientAccess>,
@@ -1028,8 +1065,43 @@ impl Repo {
             None,
         );
         let every = self.select_refs(&all, Some(&all), &everyone, None).await?;
-        let facts = self.commit_facts(commits_of(&every)).await?;
-        let deltas = self.static_delta_digests().await?;
+        let (facts, deltas) = if opts.auth_items_only {
+            // The run writes no root summary, so it reads only what the
+            // summaries of the items use. `summary_bytes` reads each commit
+            // that the walk of an item finds.
+            let items: Vec<&AuthItem> = access
+                .items()
+                .filter(|item| access.summary_files(item).is_some())
+                .collect();
+            let commits: HashSet<Checksum> = if access.has_client_groups() {
+                items
+                    .iter()
+                    .filter_map(|item| {
+                        let read = ReadAccess::for_summary(access.clone(), (*item).clone());
+                        every.readable(&read)
+                    })
+                    .flat_map(|selection| commits_of(&selection))
+                    .collect()
+            } else {
+                commits_of(&every)
+            };
+            let facts = if commits.is_empty() {
+                HashMap::new()
+            } else {
+                self.commit_facts(commits).await?
+            };
+            let deltas = if items.is_empty() || !SummaryKind::Served.names_deltas(self.mode()) {
+                Vec::new()
+            } else {
+                self.static_delta_digests().await?
+            };
+            (facts, deltas)
+        } else {
+            (
+                self.commit_facts(commits_of(&every)).await?,
+                self.static_delta_digests().await?,
+            )
+        };
         Ok(SummaryRun {
             access,
             last_modified,

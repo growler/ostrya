@@ -427,6 +427,7 @@ The timestamp resolves as for any commit: the explicit value, then
 anchor with the previous anchor as its parent, so the checksum changes on each
 run. The first generation on a new repository has no parent and is
 reproducible. The anchor ref is in field 0 by name, as any other local ref.
+`ostrya summary -u -c` writes no anchor commit.
 
 The port adds no caller key to the anchor. In a repository with a collection
 id it refuses any caller key before the anchor advances and before any write
@@ -4044,6 +4045,10 @@ it keep their old files. The root summary comes first.
 Then it removes the files under `extensions/ostrya/summary/` of each item
 that has no summary, the `.access` files first. It removes the temp files of
 these names. It leaves each other entry of the directory.
+
+`ostrya summary -u -c` writes the summaries of the items alone. It does not
+build, sign, or write the root summary, so `summary` and `summary.sig` stay
+as they are. The steps for each item and the removal are the same.
 
 The command checks every `-m` value, every key, and the client groups before
 it writes a file. A refusal leaves each summary as it was. The command holds

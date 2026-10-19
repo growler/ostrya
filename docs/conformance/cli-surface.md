@@ -2421,19 +2421,23 @@ inventory is the oracle and the port writes the bytes the tool writes.
 `--gpg-sign=KEY-ID`, `--gpg-homedir`, `--sign=KEY-ID`, `--sign-type`, and the
 port extensions `-s` (the short form of `--sign-type`), `--verify`,
 `--last-modified`, `--metadata-commit-timestamp`, `--keys-file`, `--keys-dir`,
-`--remote`, `--auth-group=NAME`, and a positional `KEY_ID...`. Nothing is
-missing. `--auth-group=NAME` reads the summary of the auth item of the client
-group `NAME` with `-v`, `--raw`, `--list-metadata-keys`, and
-`--print-metadata-key` (`../format-reference.md`, "Summaries of auth
-items"). The port refuses it at exit 1 for a group that does not exist, a
-group with `summary=false`, a group whose `auth` list holds more than one
-item, and with `-u`, `--verify`, a signing key, or no read option. With no
-client group, `NAME` is `anonymous` or `anonymous-collections`, the implicit
-groups. The tool refuses
-`--verify`, `--keys-file`, `--keys-dir`, and `-s` with `error: Unknown option
-<arg>` at exit 1, and verifies a summary signature through a remote alone. A
-symlink under `refs/` that names a directory ends `summary -u` with exit 1 in
-both implementations, in different words ("P1", `refs`). The port's `summary
+`--remote`, `--auth-group=NAME`, `-c/--client-groups`, and a positional
+`KEY_ID...`. Nothing is missing. `--auth-group=NAME` reads the summary of the
+auth item of the client group `NAME` with `-v`, `--raw`,
+`--list-metadata-keys`, and `--print-metadata-key` (`../format-reference.md`,
+"Summaries of auth items"). The port refuses it at exit 1 for a group that does
+not exist, a group with `summary=false`, a group whose `auth` list holds more
+than one item, and with `-u`, `--verify`, a signing key, or no read option.
+With no client group, `NAME` is `anonymous` or `anonymous-collections`, the
+implicit groups. `-c/--client-groups` needs `-u`. With it, `-u` writes and
+signs the summary of each auth item, removes the files of each item with no
+summary, and leaves `summary` and `summary.sig` as they are. In a repository
+with a collection id it writes no anchor commit. The port refuses `-c` with no
+`-u` at exit 1. The tool refuses `--verify`, `--keys-file`, `--keys-dir`, `-s`,
+`-c`, and `--client-groups` with `error: Unknown option <arg>` at exit 1, and
+verifies a summary signature through a remote alone. A symlink under `refs/`
+that names a directory ends `summary -u` with exit 1 in both implementations,
+in different words ("P1", `refs`). The port's `summary
 --verify` reads the key sources of its `sign --verify` (`cli-behavior.md`, "CLI
 output formats", `sign`, "The key sources of `sign`"). On this command the tool
 binds `-v` to `--view`, and `--verbose` has no short form. The port carries the
@@ -2539,8 +2543,9 @@ and `summary.sig` as they stood (`cli-behavior.md`, "CLI output formats",
   with `summary=true` carries, `anonymous` included, under
   `extensions/ostrya/summary/`, with an `.access` file for each item
   (`../format-reference.md`, "Summaries of auth items"). `ostrya serve` and
-  `ostrya send` serve these summaries, and never the root `summary`. A
-  malformed client group refuses
+  `ostrya send` serve these summaries, and never the root `summary`.
+  `summary -u -c` writes these summaries alone. A malformed client group
+  refuses
   `summary -u` at exit 1 before any write, and the tool ignores the group.
   For each directory under `refs/mirrors/` whose name is not a collection
   id, the port writes one `warning:` line to standard error and leaves the

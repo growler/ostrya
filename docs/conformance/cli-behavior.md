@@ -4588,7 +4588,9 @@ signatures in one write of `summary.sig`. The order of the signatures is the
 order that `../format-reference.md`, "Summary signature -- `a{sv}`", states.
 The port writes one summary for each auth item of the client groups, with
 the same signatures, as `../format-reference.md`, "Summaries of auth items",
-states.
+states. With the port extension `-c`, the port writes the summaries of the
+auth items alone, and leaves `summary` and `summary.sig` as they are
+(`cli-surface.md`, "P2", `summary`).
 
 #### The reading options
 
@@ -4641,6 +4643,7 @@ reports `zzz.last: 42` in the report and `uint32 704643072` under `--raw`.
   - a key that the metadata dict does not hold
   - each refusal of `summary`, "The `-u` checks"
   - in the port, each refusal of `--auth-group`
+  - in the port, `-c` with no `-u`
 
 A `summary` file can hold bytes that are not a document of the summary type.
 Only a program other than the tool and the port writes such a file into a

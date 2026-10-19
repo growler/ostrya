@@ -197,7 +197,7 @@ Each entry maps a delta name to the SHA\-256 checksum of its superblock.
 \fB\%<repo>/summary\fR
 The root summary: each ref and its commit, the static deltas, and the repository metadata.
 It holds each local ref and each collection ref, whatever the client groups, and states the mode of the repository.
-\fB\%ostrya summary \-u\fR writes it.
+\fB\%ostrya summary \-u\fR writes it, and \fB\%ostrya summary \-u \-c\fR leaves it as it is.
 \fB\%ostrya summary \-v\fR and a local pull read it.
 \fB\%ostrya serve\fR and \fB\%ostrya send\fR never serve it.
 A web server that serves the repository directory as files serves it, and with it the name of each ref.
@@ -207,6 +207,7 @@ A summary is at most 64 MiB: \fB\%ostrya summary \-u\fR refuses a larger summary
 The signatures of the summary.
 \fB\%ostrya summary \-u \-\-sign\fR and \fB\%\-\-gpg\-sign\fR write it.
 A regeneration of the summary with no key removes it.
+\fB\%ostrya summary \-u \-c\fR leaves it as it is.
 .TP
 \fB\%<repo>/<remote>.trustedkeys.gpg\fR
 The trusted GPG keyring of the remote \fB\%<remote>\fR.

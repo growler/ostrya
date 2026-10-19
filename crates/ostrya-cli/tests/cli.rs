@@ -32496,6 +32496,110 @@ fn summary_auth_group_reads_the_summary_of_one_item() {
     }
 }
 
+/// `-u -c` and `-u --client-groups` write and sign the summary of each auth
+/// item, and leave `summary` and `summary.sig` as they are. With --verify,
+/// the command verifies `summary.sig` and writes nothing. The command
+/// refuses `-c` with no `-u`, and the refusal changes no file.
+#[test]
+fn summary_client_groups_write_the_summaries_of_the_auth_items_alone() {
+    let tmp = TmpDir::new("summary-client-groups");
+    let base = tmp.path();
+    build_fixture_source(base);
+    let src = base.join("src");
+    let src = src.to_str().unwrap();
+    let repo = create_repo(base, RepoMode::Archive);
+    let repo_arg = format!("--repo={}", repo.display());
+    ostrya(
+        &[&repo_arg, "commit", "-b", "main", "-s", "main", src],
+        None,
+        &[],
+    )
+    .ok();
+    let config = repo.join("config");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(
+        "[ex-ostrya client \"public\"]\nauth=anonymous\nallow=r:main\nsummary=true\n\
+         [ex-ostrya client \"ci\"]\nauth=ssh:ci\nallow=r:**\nsummary=true\n",
+    );
+    std::fs::write(&config, text).unwrap();
+    let sign = format!("--sign={ED25519_SECRET_B64}");
+    let sign2 = format!("--sign={ED25519_SECRET2_B64}");
+    let item_sigs = || {
+        ["anonymous", "ssh:ci"].map(|text| {
+            let stem = Checksum::sha256(text.as_bytes());
+            std::fs::read(repo.join(format!("extensions/ostrya/summary/{stem}.sig"))).unwrap()
+        })
+    };
+    let view = |extra: &[&str]| {
+        let mut all = vec![repo_arg.as_str(), "summary", "-v"];
+        all.extend_from_slice(extra);
+        let run = ostrya(&all, None, &[]);
+        run.ok();
+        String::from_utf8_lossy(&run.stdout).into_owned()
+    };
+
+    for (flag, branch) in [("-c", "added"), ("--client-groups", "added2")] {
+        ostrya(&[&repo_arg, "summary", "-u", &sign], None, &[]).ok();
+        let root = summary_files(&repo);
+        assert!(root.1.is_some(), "{flag}: the root summary is signed");
+        let sigs = item_sigs();
+        ostrya(
+            &[&repo_arg, "commit", "-b", branch, "-s", branch, src],
+            None,
+            &[],
+        )
+        .ok();
+        ostrya(&[&repo_arg, "summary", "-u", flag, &sign2], None, &[]).ok();
+        assert_eq!(summary_files(&repo), root, "{flag}");
+        assert!(!view(&[]).contains(branch), "{flag}");
+        assert!(view(&["--auth-group=ci"]).contains(branch), "{flag}");
+        for (old, new) in sigs.iter().zip(item_sigs()) {
+            assert_ne!(old, &new, "{flag}");
+        }
+    }
+
+    let root = summary_files(&repo);
+    let sigs = item_sigs();
+    for flag in ["-c", "--client-groups"] {
+        let run = ostrya(
+            &[
+                &repo_arg,
+                "summary",
+                "-u",
+                flag,
+                "--verify",
+                ED25519_PUBLIC_B64,
+            ],
+            None,
+            &[],
+        );
+        run.ok();
+        assert_eq!(
+            String::from_utf8_lossy(&run.stdout),
+            "signature 1: good\nverification OK\n",
+            "{flag}"
+        );
+        assert_eq!(summary_files(&repo), root, "{flag}");
+        assert_eq!(item_sigs(), sigs, "{flag}");
+    }
+    for args in [
+        &["-c"][..],
+        &["-c", "-v"],
+        &["--client-groups", "--raw"],
+        &["-c", &sign],
+    ] {
+        let mut all = vec![repo_arg.as_str(), "summary"];
+        all.extend_from_slice(args);
+        let run = ostrya(&all, None, &[]);
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert_eq!(run.status.code(), Some(1), "{args:?}: {stderr}");
+        assert!(run.stdout.is_empty(), "{args:?}");
+        assert!(stderr.contains("--update"), "{args:?}: {stderr}");
+        assert_eq!(summary_files(&repo), root, "{args:?}");
+        assert_eq!(item_sigs(), sigs, "{args:?}");
+    }
+}
+
 /// The `summary` argument handling of ostrya, where it differs from the
 /// `ostree` command:
 ///
@@ -33328,10 +33432,10 @@ fn summary_gpg_sign_matches_the_tool() {
     }
 }
 
-/// In a collection repository, ostrya refuses `-m` before the regeneration.
-/// The `ostree` command puts the caller keys into the `ostree-metadata` anchor
-/// commit. The refusal does not change `summary`, `summary.sig`, or the anchor
-/// ref.
+/// In a collection repository, ostrya refuses `-m` before the regeneration,
+/// with -c too. The `ostree` command puts the caller keys into the
+/// `ostree-metadata` anchor commit. The refusal does not change `summary`,
+/// `summary.sig`, the anchor ref, or `extensions/`.
 #[test]
 fn summary_add_metadata_in_a_collection_repository_is_refused() {
     if !ostree_supports_ed25519() {
@@ -33355,27 +33459,31 @@ fn summary_add_metadata_in_a_collection_repository_is_refused() {
     let before = summary_files(&port);
     assert!(before.1.is_some(), "the fixture carries a signature");
     let anchor_before = anchor(&port);
+    let extensions = port.join("extensions").exists();
 
-    let run = ostrya(
-        &[
-            "summary",
-            &format!("--repo={}", port.display()),
-            "-u",
-            "-m",
-            "k=uint32 1",
-            &k1,
-        ],
-        None,
-        &[],
-    );
-    assert_eq!(run.status.code(), Some(1), "the port took -m");
-    assert!(run.stdout.is_empty());
-    assert_eq!(
-        first_stderr_line(&run),
-        "error: unsupported: summary metadata keys in a repository with a collection id"
-    );
-    assert_eq!(summary_files(&port), before, "the port changed the files");
-    assert_eq!(anchor(&port), anchor_before, "the port moved the anchor");
+    for extra in [&[][..], &["-c"]] {
+        let repo_arg = format!("--repo={}", port.display());
+        let head = ["summary", repo_arg.as_str(), "-u", "-m", "k=uint32 1", &k1];
+        let run = ostrya(&[&head[..], extra].concat(), None, &[]);
+        assert_eq!(run.status.code(), Some(1), "the port took -m {extra:?}");
+        assert!(run.stdout.is_empty(), "{extra:?}");
+        assert_eq!(
+            first_stderr_line(&run),
+            "error: unsupported: summary metadata keys in a repository with a collection id",
+            "{extra:?}"
+        );
+        assert_eq!(
+            summary_files(&port),
+            before,
+            "the port changed the files {extra:?}"
+        );
+        assert_eq!(
+            anchor(&port),
+            anchor_before,
+            "the port moved the anchor {extra:?}"
+        );
+        assert_eq!(port.join("extensions").exists(), extensions, "{extra:?}");
+    }
 
     // `ostree` accepts the run and stores the key in the anchor commit.
     let tool_arg = format!("--repo={}", tool.display());

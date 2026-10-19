@@ -622,6 +622,7 @@ It also writes \fB\%summary\fR in the repository root, which holds each ref, wha
 The command also writes the access digest of each item: a digest of \fB\%collection\-id\fR of \fB\%[core]\fR and of the namespace, \fB\%allow\fR, \fB\%deny\fR, and \fB\%summary\fR of each group of the item, a group with \fB\%summary=false\fR too.
 So the digest changes when a change to the config can change the refs of the summary.
 The group names are not in the digest.
+\fB\%ostrya summary \-u \-c\fR writes the summary of each item alone, and leaves \fB\%summary\fR and \fB\%summary.sig\fR in the repository root as they are.
 .PP
 \fB\%ostrya serve\fR and \fB\%ostrya send\fR serve \fB\%summary\fR and \fB\%summary.sig\fR of the identified item, and never the files in the repository root.
 An item with no summary gets the answer of an absent path.

@@ -17,13 +17,14 @@ mod common;
 use std::path::Path;
 use std::process::Command;
 
+use common::modes::{WRITABLE, build_tree, repo_of};
 use common::{
     TmpDir, anyone, fixture_root, ostree_available, ostree_supports_ed25519, read_access,
 };
 use ostrya::base64;
 use ostrya::{
     AdvertisedDelta, Checksum, DeltaOptions, Ed25519Signer, Ed25519Verifier, RefSelector, Repo,
-    Summary, SummaryOptions, Value,
+    RepoMode, Summary, SummaryOptions, Value,
 };
 use ostrya_rt::block_on;
 
@@ -1129,6 +1130,50 @@ fn a_ref_listing_advertises_the_indexed_deltas_of_its_commits() {
             metadata_keys(&Summary::parse(&listing).unwrap()),
             ["ostree.summary.mode"]
         );
+    });
+}
+
+/// The ref listing states `archive-z2` in each mode. In `archive` mode it
+/// names the indexed delta, and a `delta-indexes` that is a regular file
+/// fails it. In `bare-user` mode it names no delta and reads nothing under
+/// `delta-indexes/`, so the same file does not fail it.
+#[test]
+fn a_ref_listing_names_deltas_in_archive_mode_alone() {
+    let tmp = TmpDir::new("listing-modes");
+    let src = build_tree(tmp.path());
+    block_on(async {
+        for mode in [RepoMode::Archive, RepoMode::BareUser] {
+            let (path, repo, commit) = repo_of(tmp.path(), mode, &src).await;
+            let opts = DeltaOptions {
+                timestamp: Some(FIXED_EPOCH),
+                ..DeltaOptions::default()
+            };
+            repo.generate_static_delta(None, &commit, &opts)
+                .await
+                .unwrap();
+            repo.reindex_static_deltas().await.unwrap();
+            let listing = Summary::parse(&list(&repo, &[]).await.unwrap()).unwrap();
+            assert_eq!(
+                listing.metadata_value("ostree.summary.mode"),
+                Some(&Value::Str("archive-z2".into())),
+                "{mode:?}"
+            );
+            if mode == RepoMode::Archive {
+                assert_eq!(delta_names(&listing), [commit.to_hex()]);
+            } else {
+                assert_eq!(metadata_keys(&listing), ["ostree.summary.mode"]);
+            }
+
+            std::fs::remove_dir_all(path.join("delta-indexes")).unwrap();
+            std::fs::write(path.join("delta-indexes"), b"").unwrap();
+            let listing = list(&repo, &[]).await;
+            if mode == RepoMode::Archive {
+                assert!(matches!(listing, Err(ostrya::Error::Io(_))), "{listing:?}");
+            } else {
+                let listing = Summary::parse(&listing.unwrap()).unwrap();
+                assert_eq!(metadata_keys(&listing), ["ostree.summary.mode"]);
+            }
+        }
     });
 }
 
@@ -2373,6 +2418,89 @@ fn the_delta_map_follows_the_refs_of_the_summary() {
         let none = summary_of(&repo, "ssh:none").await;
         assert!(none.refs.is_empty());
         assert!(none.metadata_value("ostree.static-deltas").is_none());
+    });
+}
+
+/// In each mode, the root summary states the mode of the repository, and the
+/// summary of `anonymous` states `archive-z2`, the mode of the archive view
+/// that serves it.
+#[test]
+fn the_summary_of_an_item_states_archive_z2_in_each_mode() {
+    let tmp = TmpDir::new("items-modes");
+    let src = build_tree(tmp.path());
+    block_on(async {
+        for mode in WRITABLE {
+            let (_, repo, _) = repo_of(tmp.path(), mode, &src).await;
+            repo.regenerate_summary(&fixed()).await.unwrap();
+            let root = Summary::parse(&repo.read_summary().await.unwrap().unwrap()).unwrap();
+            assert_eq!(
+                root.metadata_value("ostree.summary.mode"),
+                Some(&Value::Str(mode.as_mode_str().into())),
+                "{mode:?}"
+            );
+            let served = summary_of(&repo, "anonymous").await;
+            assert_eq!(
+                served.metadata_value("ostree.summary.mode"),
+                Some(&Value::Str("archive-z2".into())),
+                "{mode:?}"
+            );
+        }
+    });
+}
+
+/// In a `bare-user` repository with an indexed delta, the root summary names
+/// the delta and holds `ostree.summary.indexed-deltas`. The summary of
+/// `anonymous` holds neither key, and it drops the caller keys of the two
+/// names. Both summaries keep each other caller key.
+#[test]
+fn the_summary_of_an_item_outside_archive_mode_names_no_delta() {
+    let tmp = TmpDir::new("items-bare-deltas");
+    let src = build_tree(tmp.path());
+    block_on(async {
+        let (_, repo, commit) = repo_of(tmp.path(), RepoMode::BareUser, &src).await;
+        let opts = DeltaOptions {
+            timestamp: Some(FIXED_EPOCH),
+            ..DeltaOptions::default()
+        };
+        repo.generate_static_delta(None, &commit, &opts)
+            .await
+            .unwrap();
+        repo.reindex_static_deltas().await.unwrap();
+        repo.regenerate_summary(&SummaryOptions {
+            additional_metadata: vec![
+                string_entry("ostree.static-deltas", "x"),
+                string_entry("ostree.summary.indexed-deltas", "x"),
+                string_entry("k", "v"),
+            ],
+            ..fixed()
+        })
+        .await
+        .unwrap();
+
+        let root = Summary::parse(&repo.read_summary().await.unwrap().unwrap()).unwrap();
+        assert_eq!(delta_names(&root), [commit.to_hex()]);
+        assert_eq!(
+            metadata_keys(&root),
+            [
+                "ostree.summary.mode",
+                "ostree.summary.last-modified",
+                "ostree.summary.tombstone-commits",
+                "ostree.static-deltas",
+                "ostree.summary.indexed-deltas",
+                "k",
+            ]
+        );
+        let served = summary_of(&repo, "anonymous").await;
+        assert!(delta_names(&served).is_empty());
+        assert_eq!(
+            metadata_keys(&served),
+            [
+                "ostree.summary.mode",
+                "ostree.summary.last-modified",
+                "ostree.summary.tombstone-commits",
+                "k",
+            ]
+        );
     });
 }
 

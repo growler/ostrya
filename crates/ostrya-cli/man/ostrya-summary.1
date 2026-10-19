@@ -20,7 +20,7 @@ This is an ostrya extension. With \%\-u, the keys sign each summary after every 
 \fB\-u\fR, \fB\-\-update\fR
 Regenerate the root summary and the summary of each auth item from the refs of the repository.
 .IP
-The root summary \fB\%summary\fR holds each ref, whatever the client groups. An auth item has a summary when one or more of its client groups has \fB\%summary=true\fR\&. With no client group, the \fB\%anonymous\fR item has a summary that holds each ref. The summary of an item holds the refs that the item reads in each namespace whose selected group has \fB\%summary=true\fR\&. A namespace whose selected group has \fB\%summary=false\fR adds no ref. The summary of each item, \fB\%anonymous\fR included, is under \fB\%extensions/ostrya/summary/\fR\&. The command writes each summary and replaces its signature file. Each summary gets a signature of each \%\-\-gpg\-sign key, each \%\-\-sign key, and each \%KEY\-ID and \%\-\-keys\-file key, in this order. The command writes the \fB\%\&.access\fR file of each item last, and removes the files of each item that has no summary.
+The root summary \fB\%summary\fR holds each ref, whatever the client groups. An auth item has a summary when one or more of its client groups has \fB\%summary=true\fR\&. With no client group, the \fB\%anonymous\fR item has a summary that holds each ref. The summary of an item holds the refs that the item reads in each namespace whose selected group has \fB\%summary=true\fR\&. A namespace whose selected group has \fB\%summary=false\fR adds no ref. The summary of each item, \fB\%anonymous\fR included, is under \fB\%extensions/ostrya/summary/\fR\&. The root summary states the mode of the repository. The summary of an item states \fB\%archive\-z2\fR, the mode that \fB\%ostrya serve\fR serves. In a mode other than \fB\%archive\fR, the summary of an item names no static delta. The command writes each summary and replaces its signature file. Each summary gets a signature of each \%\-\-gpg\-sign key, each \%\-\-sign key, and each \%KEY\-ID and \%\-\-keys\-file key, in this order. The command writes the \fB\%\&.access\fR file of each item last, and removes the files of each item that has no summary.
 .IP
 The command checks every \%\-m value, every key, and the client groups before the regeneration, so a refusal leaves each summary as it was. For each directory under \fB\%refs/mirrors/\fR whose name is not a collection id, the command writes one \fB\%warning:\fR line to standard error. It prints nothing else.
 .TP
@@ -47,7 +47,7 @@ If the global metadata has no such key, the command exits \%1.
 \fB\-m\fR, \fB\-\-add\-metadata\fR \fIKEY=VALUE\fR
 Add a metadata field to the summary, as \%KEY=VALUE.
 .IP
-VALUE is in the GVariant text form. The option can occur more than once. Only \%\-u reads it. If the summary writes KEY as one of its own entries, the summary keeps its own value. A repository with a collection id refuses this option.
+VALUE is in the GVariant text form. The option can occur more than once. Only \%\-u reads it. If the summary writes KEY as one of its own entries, the summary keeps its own value. In a mode other than \fB\%archive\fR, the summary of an auth item drops \fB\%ostree.static\-deltas\fR and \fB\%ostree.summary.indexed\-deltas\fR\&. A repository with a collection id refuses this option.
 .TP
 \fB\-\-sign\fR \fIKEY\-ID\fR
 Sign the summary with this key.

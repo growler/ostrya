@@ -484,7 +484,8 @@ enum Command {
     /// Serve the repository over HTTP as an archive repository for pull.
     ///
     /// The repository can be in any mode that ostrya reads. In a mode other
-    /// than `archive`, the server builds each `.filez` object on request. The
+    /// than `archive`, the server builds each `.filez` object on request and
+    /// serves no file under `deltas/` and `delta-indexes/`. The
     /// server also answers the ref listing at `/_ostrya/refs/v1`, and has
     /// the receive endpoint of a push. The client groups of the repository
     /// config give the read rights and the push rights. The server
@@ -510,7 +511,9 @@ enum Command {
     /// ref.
     ///
     /// `summary` and `summary.sig` give the summary of the auth item of the
-    /// client, which `ostrya summary -u` writes. An item with no summary gets
+    /// client, which `ostrya summary -u` writes. The summary of an item and
+    /// the ref listing state the mode `archive-z2`. In a mode other than
+    /// `archive`, they name no static delta. An item with no summary gets
     /// 404. When the summary of the item does not match the client groups,
     /// the request gets 404, and the command writes one `error:` line that
     /// names the item and tells the operator to run `ostrya summary -u`, one
@@ -2134,7 +2137,10 @@ struct SummaryArgs {
     /// the item reads in each namespace whose selected group has
     /// `summary=true`. A namespace whose selected group has `summary=false`
     /// adds no ref. The summary of each item, `anonymous` included, is under
-    /// `extensions/ostrya/summary/`. The command writes each summary and
+    /// `extensions/ostrya/summary/`. The root summary states the mode of the
+    /// repository. The summary of an item states `archive-z2`, the mode that
+    /// `ostrya serve` serves. In a mode other than `archive`, the summary of
+    /// an item names no static delta. The command writes each summary and
     /// replaces its signature file. Each summary gets a signature of each
     /// --gpg-sign key, each --sign key, and each KEY-ID and --keys-file key,
     /// in this order. The command writes the `.access` file of each item
@@ -2181,7 +2187,9 @@ struct SummaryArgs {
     ///
     /// VALUE is in the GVariant text form. The option can occur more than once.
     /// Only -u reads it. If the summary writes KEY as one of its own entries,
-    /// the summary keeps its own value. A repository with a collection id
+    /// the summary keeps its own value. In a mode other than `archive`, the
+    /// summary of an auth item drops `ostree.static-deltas` and
+    /// `ostree.summary.indexed-deltas`. A repository with a collection id
     /// refuses this option.
     #[arg(short = 'm', long = "add-metadata", value_name = "KEY=VALUE")]
     add_metadata: Vec<String>,

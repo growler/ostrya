@@ -284,14 +284,14 @@ fn the_archive_view_is_served_over_http() {
 
         // A change of the repository config shows in the next answer.
         let mut text = std::fs::read_to_string(path.join("config")).unwrap();
-        text.push_str("indexed-deltas=true\n");
+        text.push_str("collection-id=org.example.Served\n");
         std::fs::write(path.join("config"), text).unwrap();
         assert!(
             fetch(&fetcher, "config")
                 .await
                 .unwrap()
                 .0
-                .ends_with(b"mode=archive-z2\nindexed-deltas=true\n")
+                .ends_with(b"mode=archive-z2\ncollection-id=org.example.Served\n")
         );
     });
 }

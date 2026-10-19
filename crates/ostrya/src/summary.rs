@@ -179,6 +179,38 @@ pub(crate) struct SummaryFailure {
     pub(crate) error: Error,
 }
 
+/// The kind of a summary that the writer builds.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SummaryKind {
+    /// The root summary, which a local reader reads. It states the mode of
+    /// the repository.
+    Root,
+    /// The summary of an auth item, which a server serves through the
+    /// archive view. It states the mode `archive-z2`.
+    Served,
+}
+
+impl SummaryKind {
+    /// Returns the mode that a summary of this kind states in a repository
+    /// of the mode `mode`.
+    fn mode(self, mode: RepoMode) -> RepoMode {
+        match self {
+            SummaryKind::Root => mode,
+            SummaryKind::Served => RepoMode::Archive,
+        }
+    }
+
+    /// Returns `true` if a summary of this kind in a repository of the mode
+    /// `mode` names static deltas.
+    ///
+    /// The archive view serves `deltas/` and `delta-indexes/` in an
+    /// `archive` repository alone, so outside that mode a served summary
+    /// names no delta.
+    fn names_deltas(self, mode: RepoMode) -> bool {
+        self == SummaryKind::Root || mode.is_archive()
+    }
+}
+
 /// The state of one run of [`Repo::write_summaries`].
 struct SummaryRun {
     /// The client groups that give the items.
@@ -703,7 +735,9 @@ impl Repo {
     /// global metadata dict. Its entries have a fixed order, and the byte
     /// identity of the file depends on this order:
     ///
-    /// 1. `ostree.summary.mode`, the mode of the repository.
+    /// 1. `ostree.summary.mode`. The root summary states the mode of the
+    ///    repository. The summary of an item states `archive-z2`, the mode
+    ///    of the [`ArchiveView`](crate::ArchiveView) that serves it.
     /// 2. `ostree.summary.last-modified`, big-endian
     ///    ([`SummaryOptions::last_modified`]). Each summary of one call has
     ///    the same value.
@@ -713,11 +747,14 @@ impl Repo {
     /// 5. `ostree.summary.collection-map`, if the summary holds a collection
     ///    ref.
     /// 6. `ostree.summary.indexed-deltas`, the value of `[core]
-    ///    indexed-deltas`.
+    ///    indexed-deltas`. The summary of an item outside `archive` mode
+    ///    has no such entry.
     /// 7. `ostree.summary.collection-id`, if `[core] collection-id` is set.
     ///
     /// The keys of [`SummaryOptions::additional_metadata`] come after these
-    /// entries, in each summary.
+    /// entries, in each summary. The summary of an item outside `archive`
+    /// mode drops the caller keys `ostree.static-deltas` and
+    /// `ostree.summary.indexed-deltas`.
     ///
     /// # Static deltas
     ///
@@ -725,6 +762,13 @@ impl Repo {
     /// SHA-256 digest of its `superblock`, as an `ay` variant. A pull uses
     /// the map to find a delta and to verify the superblock that it fetches.
     /// The entries are in the order of the delta names.
+    ///
+    /// The root summary names deltas in each mode. The summary of an item
+    /// names deltas in an `archive` repository alone, because the
+    /// [`ArchiveView`](crate::ArchiveView) serves `deltas/` and
+    /// `delta-indexes/` in that mode alone. The summary of an item outside
+    /// `archive` mode has no `ostree.static-deltas` and no
+    /// `ostree.summary.indexed-deltas`.
     ///
     /// When the summary holds each local ref and each collection ref of the
     /// repository, as the root summary does, the map holds each delta. Else it holds the deltas whose
@@ -937,7 +981,7 @@ impl Repo {
         };
         // The root summary holds each ref, whatever the client groups.
         let bytes = self
-            .selection_summary(&run, &run.every, opts)
+            .selection_summary(&run, &run.every, SummaryKind::Root, opts)
             .await
             .map_err(build)?;
         let signatures = sign(&bytes).await?;
@@ -1025,21 +1069,25 @@ impl Repo {
         } else {
             &run.every
         };
-        self.selection_summary(run, selection, opts).await
+        self.selection_summary(run, selection, SummaryKind::Served, opts)
+            .await
     }
 
-    /// Returns the bytes of the summary of the refs `selection` in the run
-    /// `run`.
+    /// Returns the bytes of the summary of the kind `kind` of the refs
+    /// `selection` in the run `run`.
     async fn selection_summary(
         &self,
         run: &SummaryRun,
         selection: &RefSelection,
+        kind: SummaryKind,
         opts: &SummaryOptions,
     ) -> Result<Vec<u8>> {
         // A summary of each ref lists each delta. Each other summary lists
         // the deltas to the commits of its refs, because another delta can
         // name a commit that the item does not read.
-        let deltas: Vec<&DeltaDigest> = if same_refs(selection, &run.every) {
+        let deltas: Vec<&DeltaDigest> = if !kind.names_deltas(self.mode()) {
+            Vec::new()
+        } else if same_refs(selection, &run.every) {
             run.deltas.iter().collect()
         } else {
             let commits = commits_of(selection);
@@ -1060,31 +1108,34 @@ impl Repo {
         self.summary_bytes(
             &selection.local,
             &selection.collections,
-            &run.facts,
+            run,
             deltas,
-            run.last_modified,
+            kind,
             &opts.additional_metadata,
         )
         .await
     }
 
-    /// Returns the bytes of a summary of the local refs `local` and of the
-    /// collection refs `collections`, with the delta map `deltas`.
+    /// Returns the bytes of a summary of the kind `kind` of the local refs
+    /// `local` and of the collection refs `collections`, with the delta map
+    /// `deltas`.
     ///
     /// `local` and each list of `collections` are sorted byte-wise by name.
-    /// `facts` holds the facts of the commits of the run. The call reads
-    /// each other commit one time.
+    /// The call takes the facts of the commits and the
+    /// `ostree.summary.last-modified` value of the run `run`. It reads each
+    /// other commit one time.
     /// The global metadata has the order of
     /// [`regenerate_summaries`](Repo::regenerate_summaries), "Global metadata".
     async fn summary_bytes(
         &self,
         local: &[(String, Checksum)],
         collections: &BTreeMap<String, Vec<(String, Checksum)>>,
-        facts: &HashMap<Checksum, CommitFacts>,
+        run: &SummaryRun,
         deltas: Option<Value>,
-        last_modified: u64,
+        kind: SummaryKind,
         added: &[(String, Value)],
     ) -> Result<Vec<u8>> {
+        let facts = &run.facts;
         // The names give a lower bound of the size of the summary, so a
         // summary over the cap is refused before the commit reads and the
         // build.
@@ -1144,16 +1195,20 @@ impl Repo {
             Some(variant(COLLECTION_MAP_SIGNATURE, Value::Array(values))?)
         };
 
+        let names_deltas = kind.names_deltas(self.mode());
         let mut metadata = Value::Array(Vec::new());
         append_dict_entry(
             &mut metadata,
             MODE_KEY,
-            variant("s", Value::Str(self.mode().as_mode_str().to_owned()))?,
+            variant(
+                "s",
+                Value::Str(kind.mode(self.mode()).as_mode_str().to_owned()),
+            )?,
         )?;
         append_dict_entry(
             &mut metadata,
             LAST_MODIFIED_KEY,
-            variant("t", big_endian_u64(last_modified))?,
+            variant("t", big_endian_u64(run.last_modified))?,
         )?;
         append_dict_entry(
             &mut metadata,
@@ -1166,11 +1221,13 @@ impl Repo {
         if let Some(map) = collection_map {
             append_dict_entry(&mut metadata, COLLECTION_MAP_KEY, map)?;
         }
-        append_dict_entry(
-            &mut metadata,
-            INDEXED_DELTAS_KEY,
-            variant("b", Value::Bool(self.config().indexed_deltas()?))?,
-        )?;
+        if names_deltas {
+            append_dict_entry(
+                &mut metadata,
+                INDEXED_DELTAS_KEY,
+                variant("b", Value::Bool(self.config().indexed_deltas()?))?,
+            )?;
+        }
         if let Some(cid) = self.config().collection_id() {
             append_dict_entry(
                 &mut metadata,
@@ -1179,6 +1236,11 @@ impl Repo {
             )?;
         }
         for (key, value) in caller_entries(&metadata, added) {
+            // A summary that names no static delta takes no delta key of the
+            // caller.
+            if !names_deltas && (key == STATIC_DELTAS_KEY || key == INDEXED_DELTAS_KEY) {
+                continue;
+            }
             append_dict_entry(&mut metadata, key, value.clone())?;
         }
 
@@ -1281,7 +1343,8 @@ impl Repo {
     ///
     /// The global metadata dict holds these entries, in this order:
     ///
-    /// 1. `ostree.summary.mode`, the mode of the repository.
+    /// 1. `ostree.summary.mode`, `archive-z2`, the mode of the
+    ///    [`ArchiveView`](crate::ArchiveView).
     /// 2. `ostree.static-deltas`, if the index files advertise a delta.
     /// 3. `ostree.summary.collection-map`, if the listing holds a collection
     ///    ref.
@@ -1291,13 +1354,16 @@ impl Repo {
     /// encoding of the same keys in a summary. The dict holds no
     /// `ostree.summary.last-modified`.
     ///
-    /// The deltas come from the index files under `delta-indexes/` alone,
-    /// which [`reindex_static_deltas`](Repo::reindex_static_deltas) writes.
+    /// In an `archive` repository, the deltas come from the index files under
+    /// `delta-indexes/` alone, which
+    /// [`reindex_static_deltas`](Repo::reindex_static_deltas) writes.
     /// The call reads the index file of the commit of each listed ref, a
     /// collection ref included. Then it reads the index file of each source
     /// commit that an index file names, until it finds no new commit. A
     /// commit with no index file adds no delta. The map is sorted by delta
-    /// name.
+    /// name. In every other mode, the listing names no delta, and the call
+    /// reads nothing under `delta-indexes/`, because the view serves no
+    /// delta in these modes.
     ///
     /// # Size
     ///
@@ -1328,15 +1394,16 @@ impl Repo {
     /// - [`Error::Remote`] with
     ///   [`LimitExceeded`](crate::remote::Error::LimitExceeded) if the
     ///   listing is larger than [`MAX_REF_LISTING`] bytes.
-    /// - [`Error::InvalidFormat`] if a ref file is not UTF-8, or if an index
-    ///   file is larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE),
-    ///   does not decode as a delta index, or names a delta to another commit.
+    /// - [`Error::InvalidFormat`] if a ref file is not UTF-8, or, in an
+    ///   `archive` repository, if an index file is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE), does not decode as
+    ///   a delta index, or names a delta to another commit.
     /// - [`Error::Core`] if a ref file holds no checksum, or if a commit
     ///   object does not parse.
     /// - [`Error::ObjectNotFound`] if a listed ref names a commit that is not
     ///   in the object store.
     /// - [`Error::Io`] if a read fails, for example if `delta-indexes/` is not
-    ///   a directory.
+    ///   a directory in an `archive` repository.
     ///
     /// A failure of one selected ref or of one index file fails the whole
     /// listing. The call does not read a ref that the selectors do not
@@ -1386,14 +1453,22 @@ impl Repo {
 
         // The global metadata other than the map comes before the commit
         // reads, so its length is in the floor before a commit is in memory.
-        let commits = local.iter().chain(collections.values().flatten());
-        let deltas = self
-            .walk_delta_indexes(commits.map(|(_, commit)| *commit))
-            .await?;
+        // The listing has the kind of a served summary.
+        let kind = SummaryKind::Served;
+        let deltas = if kind.names_deltas(self.mode()) {
+            let commits = local.iter().chain(collections.values().flatten());
+            self.walk_delta_indexes(commits.map(|(_, commit)| *commit))
+                .await?
+        } else {
+            Vec::new()
+        };
         check_floor(floor + deltas.len() as u64 * DELTA_ENTRY_FLOOR, cap)?;
         let mut head = vec![dict_entry(
             MODE_KEY,
-            variant("s", Value::Str(self.mode().as_mode_str().to_owned()))?,
+            variant(
+                "s",
+                Value::Str(kind.mode(self.mode()).as_mode_str().to_owned()),
+            )?,
         )?];
         if !deltas.is_empty() {
             head.push(dict_entry(
@@ -3882,7 +3957,10 @@ mod tests {
                 let (local, collections) = summary_refs(&summary);
                 assert_eq!(local, walked.local, "{text}");
                 assert_eq!(collections, walked.collections, "{text}");
-                let built = repo.selection_summary(&run, &walked, &opts).await.unwrap();
+                let built = repo
+                    .selection_summary(&run, &walked, SummaryKind::Served, &opts)
+                    .await
+                    .unwrap();
                 assert_eq!(bytes, built, "{text}");
                 if run.every.readable(&read).is_none() {
                     assert!(local.contains(&("shadow".to_owned(), first)), "{text}");

@@ -49,13 +49,15 @@ pub const MAX_COMPRESSORS: usize = 16;
 /// # Routing
 ///
 /// - `config`: the view builds it for each request. It holds a `[core]`
-///   group with `repo_version=1` and `mode=archive-z2`. Then come
-///   `collection-id` and `indexed-deltas`, with the values of the repository,
-///   if the repository sets them. The view serves no other key.
+///   group with `repo_version=1` and `mode=archive-z2`. Then comes
+///   `collection-id`, and in an `archive` repository `indexed-deltas`, with
+///   the values of the repository, if the repository sets them. The view
+///   serves no other key.
 /// - `summary` and `summary.sig`: the view serves the files of the summary
 ///   of the item of the client, as stored (see
-///   [Read access](ArchiveView#read-access)). It never serves `summary`
-///   and `summary.sig` at the repository root.
+///   [Read access](ArchiveView#read-access)). Such a summary states the mode
+///   `archive-z2`. The view never serves `summary` and `summary.sig` at the
+///   repository root.
 /// - The files under `refs/` and `extensions/`, and the `.commit`,
 ///   `.dirtree`, `.dirmeta`, `.commitmeta`, and `.cfs` objects: the view
 ///   serves them as stored, to a client that reads them. A `.cfs` object is
@@ -66,7 +68,7 @@ pub const MAX_COMPRESSORS: usize = 16;
 /// - In every other mode, the view builds a `.filez` object on request from
 ///   the stored content object. [`get`](ArchiveView::get) states the format
 ///   of the body. The files under `deltas/` and `delta-indexes/` are not
-///   found in these modes.
+///   found in these modes, and the summary of an item names no delta.
 /// - A `.file` path is not found. Every path outside these families is not
 ///   found.
 /// - The view refuses a path with an empty component, or with a `.` at the
@@ -295,6 +297,7 @@ impl ArchiveView {
         match classify(path, self.repo.mode()) {
             Route::Config => Ok(ArchiveAnswer::Bytes(built_config(
                 &*self.current_config().await?,
+                self.repo.mode(),
             ))),
             Route::Stored {
                 anchor,
@@ -357,7 +360,9 @@ impl ArchiveView {
     pub async fn head(&self, path: &str, access: &ReadAccess) -> Result<ArchiveHead> {
         match classify(path, self.repo.mode()) {
             Route::Config => Ok(ArchiveHead::Found {
-                len: Some(built_config(&*self.current_config().await?).len() as u64),
+                len: Some(
+                    built_config(&*self.current_config().await?, self.repo.mode()).len() as u64,
+                ),
             }),
             Route::Stored {
                 anchor,
@@ -692,9 +697,17 @@ impl ConfigKey {
 }
 
 /// Returns the `config` of an archive repository with the values of `config`.
-fn built_config(config: &RepoConfig) -> Vec<u8> {
+///
+/// `indexed-deltas` is copied in an `archive` repository alone, because the
+/// view serves `delta-indexes/` in that mode alone.
+fn built_config(config: &RepoConfig, mode: RepoMode) -> Vec<u8> {
     let mut out = String::from("[core]\nrepo_version=1\nmode=archive-z2\n");
-    for key in ["collection-id", "indexed-deltas"] {
+    let keys: &[&str] = if mode.is_archive() {
+        &["collection-id", "indexed-deltas"]
+    } else {
+        &["collection-id"]
+    };
+    for key in keys {
         if let Some(value) = config.keyfile().get_value("core", key) {
             out.push_str(key);
             out.push('=');
@@ -1347,16 +1360,30 @@ mod tests {
     #[test]
     fn the_built_config_copies_two_keys() {
         assert_eq!(
-            built_config(&config_of(
-                "[core]\nrepo_version=1\nmode=bare-user\n[remote \"o\"]\nurl=x\n"
-            )),
+            built_config(
+                &config_of("[core]\nrepo_version=1\nmode=bare-user\n[remote \"o\"]\nurl=x\n"),
+                RepoMode::BareUser
+            ),
             b"[core]\nrepo_version=1\nmode=archive-z2\n"
         );
         assert_eq!(
-            built_config(&config_of(
-                "[core]\nindexed-deltas=true\nmode=bare\nrepo_version=1\n\
-                 collection-id=org.example.Repo\n[ex-ostrya]\nk=v\n"
-            )),
+            built_config(
+                &config_of(
+                    "[core]\nindexed-deltas=true\nmode=bare\nrepo_version=1\n\
+                     collection-id=org.example.Repo\n[ex-ostrya]\nk=v\n"
+                ),
+                RepoMode::Bare
+            ),
+            b"[core]\nrepo_version=1\nmode=archive-z2\ncollection-id=org.example.Repo\n"
+        );
+        assert_eq!(
+            built_config(
+                &config_of(
+                    "[core]\nindexed-deltas=true\nmode=archive-z2\nrepo_version=1\n\
+                     collection-id=org.example.Repo\n[ex-ostrya]\nk=v\n"
+                ),
+                RepoMode::Archive
+            ),
             b"[core]\nrepo_version=1\nmode=archive-z2\ncollection-id=org.example.Repo\n\
               indexed-deltas=true\n"
         );

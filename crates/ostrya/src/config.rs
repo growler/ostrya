@@ -351,8 +351,12 @@ impl RepoConfig {
 
     /// Returns `true` if the repository indexes its static deltas.
     ///
-    /// The key is `[core] indexed-deltas`, and the default is `true`. The
-    /// summary writes this value as `ostree.summary.indexed-deltas`.
+    /// The key is `[core] indexed-deltas`, and the default is `true`. A
+    /// summary that names deltas writes this value as
+    /// `ostree.summary.indexed-deltas`: the root summary, and in an `archive`
+    /// repository the summary of each auth item
+    /// ([`Repo::regenerate_summaries`](crate::Repo::regenerate_summaries),
+    /// "Static deltas").
     ///
     /// # Errors
     ///

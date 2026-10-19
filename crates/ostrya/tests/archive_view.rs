@@ -64,7 +64,8 @@ async fn parse_filez(bytes: &[u8]) -> (FileHeader, u64, Vec<u8>) {
 
 /// In every mode, the view serves the `config` of an `archive` repository.
 /// After the repository sets the collection id and `indexed-deltas`, the served
-/// `config` carries them. A change to the repository `config` shows in the next
+/// `config` carries the collection id, and in `archive` mode alone
+/// `indexed-deltas`. A change to the repository `config` shows in the next
 /// answer.
 #[test]
 fn the_config_is_built_in_every_mode() {
@@ -87,27 +88,29 @@ fn the_config_is_built_in_every_mode() {
                 .unwrap();
             guard.write_config(&keyfile).await.unwrap();
             guard.finish().await.unwrap();
+            // The view serves `delta-indexes/` in `archive` mode alone.
+            let built = |id: &str, deltas: &str| {
+                let mut text = format!("collection-id={id}\n");
+                if mode == RepoMode::Archive {
+                    text.push_str(&format!("indexed-deltas={deltas}\n"));
+                }
+                [BASE_CONFIG, text.as_bytes()].concat()
+            };
             assert_eq!(
                 get(&view, "config").await.1,
-                [
-                    BASE_CONFIG,
-                    b"collection-id=org.example.View\nindexed-deltas=true\n"
-                ]
-                .concat(),
+                built("org.example.View", "true"),
                 "{mode:?}"
             );
 
             // An edit in place keeps the inode and changes the size.
             let text = fs::read_to_string(path.join("config")).unwrap();
-            let edited = text.replace("indexed-deltas=true", "indexed-deltas=false");
+            let edited = text
+                .replace("indexed-deltas=true", "indexed-deltas=false")
+                .replace("org.example.View", "org.example.Viewed");
             fs::write(path.join("config"), edited).unwrap();
             assert_eq!(
                 get(&view, "config").await.1,
-                [
-                    BASE_CONFIG,
-                    b"collection-id=org.example.View\nindexed-deltas=false\n"
-                ]
-                .concat(),
+                built("org.example.Viewed", "false"),
                 "{mode:?}"
             );
         }
@@ -174,8 +177,9 @@ fn a_config_write_past_the_cap_is_refused() {
 }
 
 /// The view serves refs, metadata objects, the summary, and extensions byte for
-/// byte, with the length of the file. In `archive` mode, the view serves the
-/// stored `.filez` the same way.
+/// byte, with the length of the file. The served summary is the summary of
+/// the `anonymous` item. In `archive` mode, the view serves the stored
+/// `.filez` the same way.
 #[test]
 fn stored_files_are_served_as_stored() {
     let tmp = TmpDir::new("view-stored");
@@ -205,8 +209,17 @@ fn stored_files_are_served_as_stored() {
                     paths.push(object_path(ObjectType::File, &name.checksum));
                 }
             }
+            let anonymous = format!(
+                "extensions/ostrya/summary/{}",
+                Checksum::sha256(b"anonymous")
+            );
             for served in paths {
-                let stored = fs::read(path.join(&served)).unwrap();
+                let file = if served == "summary" {
+                    &anonymous
+                } else {
+                    &served
+                };
+                let stored = fs::read(path.join(file)).unwrap();
                 let (len, bytes) = get(&view, &served).await;
                 assert_eq!(len, Some(stored.len() as u64), "{mode:?} {served}");
                 assert_eq!(bytes, stored, "{mode:?} {served}");
@@ -784,6 +797,15 @@ const SUMMARY_GROUPS: &str = "[ex-ostrya client \"public\"]\nauth=anonymous\nall
                               [ex-ostrya client \"ci\"]\nauth=ssh:ci\nallow=r:**\nsummary=true\n\
                               [ex-ostrya client \"ops\"]\nauth=ssh:ops\nallow=r:**\n";
 
+/// Returns the `ostree.summary.mode` value of a summary.
+fn summary_mode(bytes: &[u8]) -> String {
+    let summary = ostrya::Summary::parse(bytes).unwrap();
+    match summary.metadata_value("ostree.summary.mode") {
+        Some(ostrya::Value::Str(mode)) => mode.clone(),
+        other => panic!("{other:?}"),
+    }
+}
+
 /// Returns the names of the refs in field 0 of a summary.
 fn summary_names(bytes: &[u8]) -> Vec<String> {
     ostrya::Summary::parse(bytes)
@@ -796,9 +818,10 @@ fn summary_names(bytes: &[u8]) -> Vec<String> {
 
 /// The view serves the summary of the item of the client: the files under
 /// `extensions/ostrya/summary/` for each item, `anonymous` included. It
-/// never serves the root summary, which holds each ref. An item with no
-/// summary gets not found, and so does a direct request of a file under
-/// `extensions/ostrya/`.
+/// never serves the root summary, which holds each ref. The served summary
+/// of the `bare-user` repository states `archive-z2`, and the root summary
+/// states `bare-user`. An item with no summary gets not found, and so does a
+/// direct request of a file under `extensions/ostrya/`.
 #[test]
 fn the_summary_of_each_item_is_served() {
     let tmp = TmpDir::new("view-summary-items");
@@ -826,8 +849,10 @@ fn the_summary_of_each_item_is_served() {
         }
         let (_, bytes) = read_all(view.get("summary", &anonymous).await.unwrap()).await;
         assert_eq!(summary_names(&bytes), ["pub/a"]);
+        assert_eq!(summary_mode(&bytes), "archive-z2");
         let stored = fs::read(root.join("summary")).unwrap();
         assert_eq!(summary_names(&stored), ["main", "pub/a", "pub/secret"]);
+        assert_eq!(summary_mode(&stored), "bare-user");
 
         let ci = repo_access(&repo, "ssh:ci");
         let stem = Checksum::sha256(b"ssh:ci").to_hex();

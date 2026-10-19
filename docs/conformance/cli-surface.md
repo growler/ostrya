@@ -4297,8 +4297,9 @@ ostrya serve [--repo=PATH] [--listen=ADDR:PORT]...
 - The command serves the repository over HTTP as an archive repository, for
   pull, in every mode the port reads. The served `config` is
   `[core]\nrepo_version=1\nmode=archive-z2\n`, followed by
-  `collection-id=ID\n` and `indexed-deltas=VALUE\n` when the repository
-  sets them. In a mode other than `archive` each `.filez` object is built on
+  `collection-id=ID\n` when the repository config sets it. In an `archive`
+  repository, `indexed-deltas=VALUE\n` comes next when the repository config
+  sets it. In a mode other than `archive` each `.filez` object is built on
   request at `[archive] zlib-level`, and `deltas/` and `delta-indexes/` are
   not served. The `.cfs` composefs image of a commit is served as stored in
   every mode. A path the server refuses and a path it does not find both get
@@ -4453,20 +4454,23 @@ ostrya serve [--repo=PATH] [--listen=ADDR:PORT]...
   one by one, so a commit that runs when the process ends can stop after it
   wrote some of its refs and before it wrote the others.
 - `ostree pull` from the command, over HTTP and HTTPS, from a repository in
-  each mode the port reads, passes `ostree fsck` on the pulled repository,
-  in `crates/ostrya-cli/tests/serve.rs`. The summary of a
-  `bare-user-shared` repository states that mode in `ostree.summary.mode`,
-  and the tool refuses that summary with `error: Invalid mode
-  'bare-user-shared' in repository configuration`. A pull from such a
-  repository with no summary succeeds. The gap is recorded and kept: a pull
-  of the tool from a `bare-user-shared` repository is no goal of the port.
+  each mode the port reads, with a summary, passes `ostree fsck` on the
+  pulled repository, in `crates/ostrya-cli/tests/serve.rs`. The served
+  summary states `archive-z2` in `ostree.summary.mode` in each mode,
+  `bare-user-shared` included.
+- In a `bare-user` repository with a static delta, `ostrya summary --view`
+  of the root summary names the delta. The served summary names no delta.
+  A `bare-user` client of the tool pulls the objects loose, and
+  `--require-static-deltas` fails the pull with `error: Fetch configured to
+  require static deltas, but no summary deltas or delta index found`, in
+  `crates/ostrya-cli/tests/serve.rs`.
 - When the group of `anonymous` has `summary=false`, the command serves no
   summary, so `ostree pull` requests `refs/heads/NAME`. A pull of a ref that
   the group of `anonymous` reads succeeds and passes `ostree fsck`. A ref
   that the group does not read gets 404, and the tool 2026.1 exits 1 with
   `error: While fetching URL/refs/heads/NAME: Server returned HTTP 404`, in
   `crates/ostrya-cli/tests/serve.rs`.
-- `ostree remote refs` and `ostree pull` read the root summary of the
+- `ostree remote refs` and `ostree pull` read the summary of the
   `anonymous` item of a group with a deny item. The summary lists the refs
   that the group reads, the pull passes `ostree fsck`, and a pull of a
   denied ref exits 1. Over HTTPS with `tls-client-cert-path` and

@@ -913,7 +913,10 @@ The tool selects a delta and requests the delta files by these rules:
 - Under `--require-static-deltas`, the tool refuses a remote that serves no
   summary, with no delta probe: `error: Fetch configured to require static
   deltas, but no summary deltas or delta index found`. This refusal also applies
-  where the client holds the commit, and under `--commit-metadata-only`.
+  where the client holds the commit, and under `--commit-metadata-only`. The
+  same message ends a pull into `bare-user` from a remote whose summary has
+  no `ostree.static-deltas` and that answers 404 for each path under
+  `delta-indexes/`.
 - With a summary, under `--require-static-deltas`, the tool refuses a commit
   that the client does not hold complete in two cases. In the first case, the
   pull can take no delta that the index or the summary names. In the second

@@ -118,8 +118,8 @@ Write a \fB\%.tombstone\-commit\fR object for each commit that \fB\%ostrya prune
 The summary records the value as \fB\%ostree.summary.tombstone\-commits\fR.
 .TP
 \fB\%indexed\-deltas\fR (boolean, default true)
-The summary records the value as \fB\%ostree.summary.indexed\-deltas\fR.
-\fB\%ostrya serve\fR copies the key into the \fB\%config\fR that it serves.
+The root summary records the value as \fB\%ostree.summary.indexed\-deltas\fR.
+In an archive repository, the summary of each authentication item also records it, and \fB\%ostrya serve\fR copies the key into the \fB\%config\fR that it serves.
 .TP
 \fB\%auto\-update\-summary\fR (boolean, default false)
 Write each summary again after a push changes a ref, as \fB\%ostrya summary \-u\fR writes them.

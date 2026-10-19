@@ -420,13 +420,11 @@ fn pull(path: &Path, mode: &str, url: &str, pki: Option<&Pki>, rev: &str) -> Str
 }
 
 /// The `ostree` command pulls from a repository of each mode that ostrya
-/// reads, over HTTP and over HTTPS. Each pulled repository passes
-/// `ostree fsck`.
+/// reads, with a summary, over HTTP and over HTTPS. Each pulled repository
+/// passes `ostree fsck`.
 ///
-/// The summary of a `bare-user-shared` repository states that mode in
-/// `ostree.summary.mode`. `ostree` cannot parse this value, so the pull from
-/// that repository runs with no summary. The test also checks that a pull
-/// with the summary fails with the error of `ostree`.
+/// The served summary states `archive-z2` in each mode, so the pull from a
+/// `bare-user-shared` repository reads the summary too.
 #[test]
 fn the_tool_pulls_from_every_mode() {
     if !ostree_available() {
@@ -450,12 +448,10 @@ fn the_tool_pulls_from_every_mode() {
             mode
         };
         let commit = server_repo(&path, initial, &src, &[]);
-        if mode != "bare-user-shared" {
-            ok(
-                ostrya(),
-                &[&format!("--repo={}", path.display()), "summary", "-u"],
-            );
-        }
+        ok(
+            ostrya(),
+            &[&format!("--repo={}", path.display()), "summary", "-u"],
+        );
         if mode == "bare-split-xattrs" {
             split_xattrs(&path);
             ok("ostree", &[&format!("--repo={}", path.display()), "fsck"]);
@@ -470,25 +466,6 @@ fn the_tool_pulls_from_every_mode() {
         let dest = tmp.path().join(format!("{mode}-https"));
         let pulled = pull(&dest, "archive", &secure.url, Some(&pki), "main");
         assert_eq!(pulled, commit, "{mode} over https");
-        if mode == "bare-user-shared" {
-            ok(
-                ostrya(),
-                &[&format!("--repo={}", path.display()), "summary", "-u"],
-            );
-            let repo = client(
-                &tmp.path().join("shared-summary"),
-                "archive",
-                &plain.url,
-                None,
-            );
-            let out = run("ostree", &[&repo, "pull", "origin", "main"]);
-            assert!(!out.status.success());
-            let stderr = String::from_utf8_lossy(&out.stderr);
-            assert!(
-                stderr.contains("Invalid mode 'bare-user-shared'"),
-                "{stderr}"
-            );
-        }
     }
 }
 
@@ -860,13 +837,13 @@ fn the_summary_merges_the_own_mirrors_as_the_tool_does() {
     assert_eq!(ids, ["org.example.Other"]);
 }
 
-/// The summary of a repository in a mode other than `archive` names a delta
-/// that the view does not serve. A `bare-user` client of the `ostree` command
-/// fetches the objects loose. With `--require-static-deltas`, the pull fails.
-/// The client is `bare-user` because an `archive` client of `ostree` uses no
-/// delta.
+/// In a `bare-user` repository with an indexed delta, the root summary names
+/// the delta. The served summary states `archive-z2` and names no delta, so
+/// a `bare-user` client of the `ostree` command fetches the objects loose.
+/// With `--require-static-deltas`, the pull fails. The client is `bare-user`
+/// because an `archive` client of `ostree` uses no delta.
 #[test]
-fn the_tool_pulls_loose_past_unserved_deltas() {
+fn the_served_summary_of_a_bare_repository_names_no_delta() {
     if !ostree_available() {
         return;
     }
@@ -886,6 +863,7 @@ fn the_tool_pulls_loose_past_unserved_deltas() {
             &commit,
         ],
     );
+    ok(ostrya(), &[&repo, "static-delta", "reindex"]);
     ok(ostrya(), &[&repo, "summary", "-u"]);
     let summary = ok(ostrya(), &[&repo, "summary", "--view"]);
     assert!(
@@ -896,14 +874,21 @@ fn the_tool_pulls_loose_past_unserved_deltas() {
     );
     assert!(path.join("deltas").exists());
     let server = Serving::start(&path, &[]);
-    let pulled = pull(
-        &tmp.path().join("loose"),
-        "bare-user",
-        &server.url,
-        None,
-        "main",
+    let client_repo = client(&tmp.path().join("loose"), "bare-user", &server.url, None);
+    let served = ok("ostree", &[&client_repo, "remote", "summary", "origin"]);
+    assert!(
+        served.contains("Repository Mode (ostree.summary.mode): archive-z2"),
+        "{served}"
     );
-    assert_eq!(pulled, commit);
+    assert!(!served.contains("ostree.static-deltas"), "{served}");
+    assert!(
+        !served.contains("ostree.summary.indexed-deltas"),
+        "{served}"
+    );
+    ok("ostree", &[&client_repo, "pull", "origin", "main"]);
+    ok("ostree", &[&client_repo, "fsck"]);
+    let pulled = ok("ostree", &[&client_repo, "rev-parse", "origin:main"]);
+    assert_eq!(pulled.trim(), commit);
 
     let client_repo = client(&tmp.path().join("required"), "bare-user", &server.url, None);
     let out = run(
@@ -919,7 +904,10 @@ fn the_tool_pulls_loose_past_unserved_deltas() {
     assert!(!out.status.success());
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("error: Static deltas required, but none found for"),
+        stderr.contains(
+            "error: Fetch configured to require static deltas, but no summary deltas \
+             or delta index found"
+        ),
         "{stderr}"
     );
 }

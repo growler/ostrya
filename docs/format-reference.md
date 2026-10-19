@@ -348,7 +348,9 @@ so the insertion order is the on-disk order. The writer writes the keys in
 this order, and a key is absent when its condition is false:
 
 - `ostree.summary.mode` -> `s`, the repository mode string (for example
-  `archive-z2`, `bare`, `bare-user`).
+  `archive-z2`, `bare`, `bare-user`). The root summary states the mode of
+  the repository. The summary of an auth item states `archive-z2`, the mode
+  of the archive view that serves it ("The archive view").
 - `ostree.summary.last-modified` -> `t` big-endian, the generation time. It is
   wall-clock time, and `SOURCE_DATE_EPOCH` does not set it.
 - `ostree.summary.tombstone-commits` -> `b`, the `[core] tombstone-commits`
@@ -356,7 +358,9 @@ this order, and a key is absent when its condition is false:
 - `ostree.static-deltas` -> `a{sv}`: delta name (`FROM-TO` or `TO`, in hex) ->
   `ay`, the SHA-256 of the `superblock` file of the delta (32 bytes). Present
   only when the repository has static deltas. A summary of the port that does
-  not hold each ref lists fewer deltas ("Summaries of auth items"). The port
+  not hold each ref lists fewer deltas ("Summaries of auth items"). Outside
+  the `archive` mode, the summary of an auth item has no such key ("The refs
+  and the deltas of a summary"). The port
   writes the entries in
   name order (`conformance/cli-surface.md`, "P2", `summary`, records the order
   of the tool). Observed behavior: the tool writes the key between
@@ -369,7 +373,8 @@ this order, and a key is absent when its condition is false:
   directory under `refs/mirrors/` whose name fails the collection-id rule is
   not in the map of the port.
 - `ostree.summary.indexed-deltas` -> `b`, the `[core] indexed-deltas` value
-  (default true). Always present.
+  (default true). Always present in the root summary. Outside the `archive`
+  mode, the summary of an auth item has no such key.
 - `ostree.summary.collection-id` -> `s`, present only when
   `[core] collection-id` is set.
 - `ostree.summary.expires` -> `t` big-endian, which the summary reports read.
@@ -383,10 +388,14 @@ and serve no index.
 
 The keys that a caller adds with `summary -m` come after the keys of the
 writer. When the writer writes a key in the same run, its value has precedence
-over the caller value. These keys are the four keys that are always present,
-and `ostree.static-deltas`, `ostree.summary.collection-map`, and
-`ostree.summary.collection-id` in a run that writes them. The writer keeps each
-other caller key, whatever its name, and the empty key.
+over the caller value. These keys are `ostree.summary.mode`,
+`ostree.summary.last-modified`, and `ostree.summary.tombstone-commits`, which
+are always present, and `ostree.static-deltas`, `ostree.summary.collection-map`,
+`ostree.summary.indexed-deltas`, and `ostree.summary.collection-id` in a
+summary that holds them. The writer keeps each other caller key, whatever its
+name, and the empty key. Outside the `archive` mode, the summary of an auth
+item drops the caller keys `ostree.static-deltas` and
+`ostree.summary.indexed-deltas`, so it names no delta.
 
 A repeated caller key is stored once, with its last value. The value is the
 GVariant text form. The port appends the caller keys in the order of their
@@ -3778,7 +3787,8 @@ reads `refs/mirrors/ID/` of the collection id of the repository alone.
 
 The global metadata dict holds these entries, in this order:
 
-1. `ostree.summary.mode`: the mode of the repository.
+1. `ostree.summary.mode`: `archive-z2`, the mode of the archive view ("The
+   archive view").
 2. `ostree.static-deltas`: when the walk below finds a delta.
 3. `ostree.summary.collection-map`: when the listing holds a collection ref.
 4. `ostree.summary.collection-id`: when the repository has a collection id.
@@ -3786,8 +3796,9 @@ The global metadata dict holds these entries, in this order:
 This is the order of the same keys in a summary. The dict holds no
 `ostree.summary.last-modified`.
 
-The deltas come from the index files under `delta-indexes/` ("Static delta
-index files"). The server reads the index file of the commit of each listed
+In an `archive` repository, the deltas come from the index files under
+`delta-indexes/` ("Static delta index files"). The server reads the index
+file of the commit of each listed
 ref, in field 0 and in the map. Then it reads the index file of each source
 commit that an index file names, until it finds no new commit. The map is
 sorted by delta name. These index files fail the listing:
@@ -3800,6 +3811,10 @@ A `delta-indexes` path that is not a directory also fails the listing. An
 absent `delta-indexes/` gives no delta. A commit with no index file adds no
 delta, and an index path that is not a regular file counts as no index file.
 If an index file names one delta two times, the first entry applies.
+
+In every other mode, the listing names no delta, and the server reads nothing
+under `delta-indexes/`. The archive view serves no file under `deltas/` and
+`delta-indexes/` in these modes.
 
 A listing is at most 128 MiB. The server refuses a larger listing and never
 cuts it short. The collection map counts toward this size. The server checks
@@ -3912,10 +3927,17 @@ local ref, and a summary holds it only when the item reads it.
 
 The global metadata has the keys and the order of "Summary --
 `(a(s(taya{sv}))a{sv})`". Each summary of one run has the same
-`ostree.summary.last-modified`. `[core] indexed-deltas` sets
-`ostree.summary.indexed-deltas` in each summary. The caller keys of
-`summary -m` go into each summary. `ostree.static-deltas` lists these
-deltas:
+`ostree.summary.last-modified`. The summary of an item states `archive-z2` in
+`ostree.summary.mode` in each mode, because the archive view serves the
+repository as an `archive` repository. The caller keys of `summary -m` go into
+each summary.
+
+Outside the `archive` mode, the summary of an item has no
+`ostree.static-deltas` and no `ostree.summary.indexed-deltas`, and it drops
+these two caller keys. The archive view serves no file under `deltas/` and
+`delta-indexes/` in these modes. In an `archive` repository,
+`[core] indexed-deltas` sets `ostree.summary.indexed-deltas` in the summary
+of each item, and `ostree.static-deltas` lists these deltas:
 
 - When the summary holds each local ref and each collection ref of the
   repository, the map lists each delta.
@@ -4110,8 +4132,9 @@ stream ("Get and GetReply"). The view answers a path relative to the
 repository root in this way:
 
 - The view builds `config`: `[core]\nrepo_version=1\nmode=archive-z2\n`, then
-  `collection-id=ID\n` and then `indexed-deltas=VALUE\n` when the repository
-  config sets them. Each value is as the repository config writes it. The
+  `collection-id=ID\n` when the repository config sets it. In an `archive`
+  repository, `indexed-deltas=VALUE\n` comes next when the repository config
+  sets it. Each value is as the repository config writes it. The
   view serves no other key and no other group. The view parses the
   repository config again when its inode number, size, modification time, or
   change time differs from the last parse. The next answer then shows the
@@ -4134,9 +4157,9 @@ repository root in this way:
 - The file of a built `.filez` can hold another size than its header states.
   Then the body fails during the transfer, after the status and the headers
   went out.
-- In these modes, `deltas/` and `delta-indexes/` are absent, and the view
-  serves a summary that names a delta unchanged. A pull then fetches the
-  objects loose (`conformance/cli-behavior.md`, "HTTP pull surface").
+- In these modes, `deltas/` and `delta-indexes/` are absent. The summary of
+  an item and the ref listing name no delta ("The refs and the deltas of a
+  summary", "The ref listing"), so a pull fetches the objects loose.
 - The view serves a ref alias under `refs/` as the ref that it names, when
   that ref is a regular file under `refs/`. The view resolves `.` and `..` in
   the alias body by name, from the directory of the alias, with no lookup in
@@ -4213,9 +4236,10 @@ precedence over the result of the object lookup. So a missing object in a
 repository with a bad `config` or `zlib-level` gets 404 for `HEAD` and 500
 for `GET`.
 
-The summary of a `bare-user-shared` repository states that mode in
-`ostree.summary.mode`. `conformance/cli-surface.md`, "P2", `serve`, records
-the pull of the tool from this summary.
+The summary of an item states `archive-z2` in `ostree.summary.mode` in each
+mode, `bare-user-shared` included. So the tool pulls with a summary from a
+`bare-user-shared` repository. The root summary states `bare-user-shared`,
+and the view never serves it.
 
 ### Read access
 

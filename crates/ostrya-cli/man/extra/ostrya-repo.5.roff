@@ -176,6 +176,7 @@ In the names below, \fB\%<hex>\fR is the SHA\-256 digest, in 64 lowercase hex di
 .TP
 \fB\%<repo>/extensions/ostrya/summary/<hex>\fR, \fB\%<hex>.sig\fR
 The summary of an item, \fB\%anonymous\fR included, and its signatures, in the formats of \fB\%summary\fR and \fB\%summary.sig\fR.
+The summary states the mode \fB\%archive\-z2\fR, and in a mode other than archive it names no static delta.
 \fB\%ostrya serve\fR and \fB\%ostrya send\fR serve these files as \fB\%summary\fR and \fB\%summary.sig\fR.
 .TP
 \fB\%<repo>/extensions/ostrya/summary/<hex>.access\fR
@@ -195,7 +196,7 @@ Each entry maps a delta name to the SHA\-256 checksum of its superblock.
 .TP
 \fB\%<repo>/summary\fR
 The root summary: each ref and its commit, the static deltas, and the repository metadata.
-It holds each local ref and each collection ref, whatever the client groups.
+It holds each local ref and each collection ref, whatever the client groups, and states the mode of the repository.
 \fB\%ostrya summary \-u\fR writes it.
 \fB\%ostrya summary \-v\fR and a local pull read it.
 \fB\%ostrya serve\fR and \fB\%ostrya send\fR never serve it.
@@ -273,13 +274,16 @@ ostrya sets no group owner.
 \fB\%ostrya serve\fR and \fB\%ostrya send\fR read the repository through an archive view.
 The view serves these paths:
 .IP \(bu 2
-\fB\%config\fR, which the view makes and does not read from disk: \fB\%[core]\fR with \fB\%repo_version=1\fR, \fB\%mode=archive\-z2\fR, and the \fB\%collection\-id\fR and \fB\%indexed\-deltas\fR keys of the repository if they are set.
+\fB\%config\fR, which the view makes and does not read from disk: \fB\%[core]\fR with \fB\%repo_version=1\fR, \fB\%mode=archive\-z2\fR, and the \fB\%collection\-id\fR key of the repository if it is set.
+In an archive repository, the view also copies the \fB\%indexed\-deltas\fR key if it is set.
 .IP \(bu 2
 \fB\%refs/\fR and \fB\%extensions/\fR, as stored.
 An alias ref is served as its target.
 \fB\%extensions/ostrya/\fR is not served.
 .IP \(bu 2
 \fB\%summary\fR and \fB\%summary.sig\fR: the files of the summary of the authentication item of the client, as stored.
+This summary states the mode \fB\%archive\-z2\fR.
+In a mode other than archive, it names no static delta.
 .IP \(bu 2
 The metadata objects, as stored.
 .IP \(bu 2

@@ -94,7 +94,8 @@ reference, or reading material.
    libraries of macOS and Windows").
    `rustix` handles the syscalls a portable async file API cannot express
    (fd-relative opens and metadata, xattrs, statx, FICLONE reflink, O_TMPFILE +
-   linkat, OFD locks); streaming file I/O goes through the runtime's async file.
+   linkat, `fcntl` record locks); streaming file I/O goes through the runtime's 
+   async file.
 2. Async, with a feature-gated runtime backend behind the internal
    `ostrya-rt` crate: `smol` by default, `tokio` optional. Only `ostrya-rt`
    knows the backend.
@@ -173,8 +174,11 @@ code in the same change that alters behavior.
 - `docs/conformance/cli-surface.md` -- the CLI surface that the conformance
   matrix needs, and each difference between the `ostree` command and the
   port.
-- `docs/port-plan.md` -- architecture, testing strategy, the phased roadmap, and
-  the locked decisions.
+- `docs/decisions.md` -- the design decisions and the alternatives that were
+  rejected, with the reason for each.
+- `docs/roadmap.md` -- the work that is not done: planned features, gaps in
+  the commands and the library, open decisions, and gaps in the tests.
+- `CONTRIBUTING.md` -- the golden fixtures and the test gates.
 - The rustdoc of each crate -- the public Rust API. The design principles
   of the API are in `crates/ostrya/README.md`, "Design".
 
@@ -244,7 +248,7 @@ When proposing a dependency, state:
 
 This keeps the dependency surface small and preserves the no-C-linkage
 guarantee. The already-agreed foundation crates are listed in
-`docs/port-plan.md`; adding even those to a specific manifest still warrants a
+`docs/decisions.md`, "Foundation crates"; adding even those to a specific manifest still warrants a
 confirming note.
 
 At the start of each phase, before writing any code, list the crates that phase
@@ -313,8 +317,13 @@ term below is measured on the resolved dependency graph.
   the ICU4X packages. The workspace pins 1.92, so the requirement holds.
 - The call costs about 235 KiB of the stripped `target/release/ostrya`, the
   binary `cargo build --release -p ostrya-cli` writes with its default feature
-  set. `docs/port-plan.md`, Phase 23, states the counterfactual the figure is
-  measured against and the two byte counts.
+  set. Two builds of one tree under one toolchain are compared. The second
+  build stubs the call to give the `Location` value back unresolved and drops
+  `url` from the manifest, because the stub alone leaves the crate in the
+  link. `cargo tree -p ostrya-cli -i url` confirms that the second build
+  reaches no `url` package. The first binary measures 13,491,736 bytes and
+  the second 13,251,224, a difference of 240,512 bytes. Rebuilds of one tree
+  are a few hundred bytes apart.
 
 ### Authorized: the `pkcs8` crate
 
@@ -505,8 +514,14 @@ dependency graph.
 - The read of the subject CN and of the URI SANs costs about 106 KiB of the
   stripped `target/release/ostrya`, the binary
   `cargo build --release -p ostrya-cli` writes with its default feature
-  set. `docs/port-plan.md`, Phase 26, states the counterfactual the figure
-  is measured against and the two byte counts.
+  set. Two builds of one tree under one toolchain are compared. The second
+  build stubs the read in `crates/ostrya-server/src/cert.rs` to give no CN,
+  no end of the validity period, and no claims, and drops `x509-cert` from
+  `crates/ostrya-server/Cargo.toml`, because the stub alone leaves the crate
+  in the link. `cargo tree -p ostrya-cli -i x509-cert` confirms that the
+  second build reaches no `x509-cert` package. The first binary measures
+  20,271,128 bytes and the second 20,162,840, a difference of 108,288 bytes.
+  A rebuild of the first tree gives the same byte count.
 
 ## Requirement: permissive licenses only
 
@@ -542,8 +557,8 @@ by hand before it is accepted.
   produced by running the `ostree` tool as a black box, and cross-check both
   directions: the tool reads what the port writes, and the port reads what the
   tool writes.
-- Follow the phased roadmap. Each phase is small and is reviewed and approved
-  before the next begins.
+- Work in phases. Each phase is small and is reviewed and approved before
+  the next begins.
 - `#![forbid(unsafe_code)]` everywhere except two audited sites: a small `sys`
   module that wraps the few `rustix` calls that require it, and the
   allocation-counting test harness (`crates/ostrya-gvariant/tests/alloc.rs`),
@@ -569,9 +584,7 @@ not push the tag and do not run `cargo publish` without the dry-run flag
 until the maintainer asks for that step in words.
 
 1. Set the new version in `[workspace.package] version` and in the path
-   versions of `[workspace.dependencies]` in the root `Cargo.toml`. If
-   `docs/port-plan.md` names the version in the paragraph of the phase that
-   ships, change that sentence too.
+   versions of `[workspace.dependencies]` in the root `Cargo.toml`.
 2. Run `cargo update --workspace`, so that `Cargo.lock` has the new version
    of each member.
 3. Write the man pages of the `ostrya` command again from the `clap`

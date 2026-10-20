@@ -466,6 +466,13 @@ impl RepoConfig {
     /// keeps. With `traverse_parent` set, as `ostrya prune` runs, that is at
     /// least what the `ostree` command keeps.
     ///
+    /// A repository must not root on a key that its upstream strips with
+    /// [`detached_metadata_exclude`](RepoConfig::detached_metadata_exclude). No
+    /// call checks this rule, because the fault spans two configurations and
+    /// neither one shows it alone. A stripped key is in no detached metadata
+    /// that this repository receives, so it adds no root there, and a prune
+    /// deletes the commits that the key would keep, with no report.
+    ///
     /// Four write methods also read this key, when a dict that they check
     /// holds at least one entry:
     /// [`Transaction::write_commit`](crate::Transaction::write_commit),
@@ -647,8 +654,10 @@ impl Repo {
     ///
     /// # Edits
     ///
-    /// The call writes the document as given. If a caller removes `[core] mode`
-    /// or `[core] repo_version`, [`Repo::open`] refuses the written file. To
+    /// The call writes the document as given and does not check it. The
+    /// `ostree` command also writes the document of `config unset core.mode`
+    /// with no check. If a caller removes `[core] mode` or
+    /// `[core] repo_version`, [`Repo::open`] refuses the written file. To
     /// change a key, a caller reads the current document through
     /// [`RepoConfig::keyfile`], changes it with the setters and removers of
     /// [`KeyFile`], and writes it back.

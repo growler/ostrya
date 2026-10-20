@@ -414,6 +414,10 @@ pub enum TimestampCheck {
 /// applies to a superblock, because a static delta carries sign-api
 /// signatures alone. A superblock with no signature of an engine of the
 /// policy passes, and the commit that the delta gives still gets its checks.
+/// The removal of a signature from a delta thus gives no gain: the delta map
+/// of the summary or of the delta index names the superblock by its digest,
+/// the superblock names each object that the delta gives, and the commit gets
+/// the checks of any other commit.
 /// If each such signature of a superblock is from a key that is not trusted,
 /// the pull fails with [`Error::Signature`].
 ///

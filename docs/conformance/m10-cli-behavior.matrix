@@ -11,13 +11,8 @@
 # control the working directory and the environment of the invocation, which a
 # `run:` line does not state; each names a probe.
 #
-# This file carries Phase 17a's cases -- `init` and the global `--repo`
-# conventions -- Phase 17b's -- `refs`, `rev-parse`, and `cat` -- Phase 17b1's
-# -- `commit` parenting -- Phase 17c's -- `commit --owner-uid/--owner-gid/
-# --timestamp/--no-xattrs` and `checkout -U/--subpath` -- and Phase 17d's --
-# `show`, `log`, `ls`, and `config get`, together with the GVariant text form
-# they share (`../port-plan.md`).
-# Later sub-phases add records here as their own subcommands and options land.
+# This file has one section for each subcommand, or for a group of options of
+# one subcommand.
 #
 # The `repo-with-commit` setup binds one branch, `conformance`, holding one
 # commit of corpus `C0`, so a cell needing a second ref, a nested ref name, an
@@ -1310,7 +1305,7 @@ note: `REV^` walking one generation, `REV^^` walking two, and the root
  commit's parent reported as `error: Commit <checksum> has no parent`. Needs a
  parent chain, which the setup's single commit does not hold; the cited test
  builds one by committing three times onto one branch, each commit taking the
- tip the one before it left (Phase 17b1 of `../port-plan.md`). The cited
+ tip the one before it left. The cited
  test also covers `-S` reporting more than one commit, and the `~N` and `^N`
  non-syntaxes, where both report `error: Invalid refspec <rev>`; the same
  repository serves all three.
@@ -1638,8 +1633,7 @@ note: the same pair where the revision is a ref pointing at an absent commit,
 
 # ---------------------------------------------------------------------------
 # commit -- the branch-name guard the case rule of a 64-character name carries,
-# the parenting Phase 17b1 landed, and the tree-and-time options Phase 17c
-# landed (`../port-plan.md`).
+# the parenting, and the tree-and-time options.
 # ---------------------------------------------------------------------------
 
 family: M10
@@ -1768,8 +1762,7 @@ note: the bases the `repo tree` setup cannot bind, which need a repository
 
 # ---------------------------------------------------------------------------
 # commit -- parenting: the branch tip a commit inherits, the two forms that ask
-# for a root commit, and the ref a commit must name (Phase 17b1 of
-# `../port-plan.md`).
+# for a root commit, and the ref a commit must name.
 #
 # A parent is a field of the commit object, so a cell that states one reads the
 # new commit with a second invocation. Those cells cite `evidence:`; the cells
@@ -2458,8 +2451,8 @@ note: the counters over a growing tree, which one `run:` line cannot state: the
  block's shape.
 
 # ---------------------------------------------------------------------------
-# checkout -- the unprivileged mode, the subpath, and the composefs switches
-# (`../port-plan.md`). No oracle reads a cell's own checkout destination: the
+# checkout -- the unprivileged mode, the subpath, and the composefs switches.
+# No oracle reads a cell's own checkout destination: the
 # `manifest` oracle checks the setup's revision out itself, faithfully, into
 # work space of its own. The cells that state a destination tree therefore cite
 # the test that walks both implementations' destinations, and the cells here run
@@ -12957,9 +12950,9 @@ note: --min-fallback-size, --max-bsdiff-size, and --max-chunk-size are decimal
  delta and the port's. The port patches a 1,024-byte edit with bspatch at
  --max-bsdiff-size=1, which a 1-byte limit does not allow, and not at 0. The
  bspatch count is not compared: the two generators choose bspatch by different
- rules (`port-plan.md`, Phase 15b). The port refuses a value outside whole
- decimal digits, which the tool accepts (`cli-surface.md`, "P2");
- `static-delta/generate-size-junk-refused` below states it.
+ rules (`format-reference.md`, "Diff-source pairing"). The port refuses a
+ value outside whole decimal digits, which the tool accepts (`cli-surface.md`,
+ "P2"); `static-delta/generate-size-junk-refused` below states it.
 
 family: M10
 subcommand: static-delta
@@ -14487,7 +14480,7 @@ severity: interop
 loss: a static delta into an `archive` destination. The tool refuses it with
  `Can't use static deltas in an archive repo` at exit 1 and writes nothing; the
  port applies the delta, and the tool's `fsck` accepts what it wrote
- (`port-plan.md`, Phase 16d).
+ (`cli-surface.md`, "P2", `pull`).
 evidence: ostrya_cli::cli::pull_local_static_delta_divergences
 spec: cli-surface.md#p2----options-missing-from-commands-that-exist
 note: the two reach different exit statuses, so no oracle reads the pair.

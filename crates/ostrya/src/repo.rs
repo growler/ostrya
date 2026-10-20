@@ -175,6 +175,13 @@ impl Repo {
     ///
     /// The handle stores `path` as given, and [`path`](Repo::path) returns it.
     ///
+    /// The handle holds a descriptor of the repository root and one of
+    /// `objects/`, which each repository has. The call opens no descriptor of
+    /// `tmp/` and does not read the boot id. A repository that is served
+    /// read-only can have no `tmp/`, and the call opens it. A transaction
+    /// reads the boot id when it begins, as the `ostree` command does. Each
+    /// write that needs `tmp/` opens it, and creates it if it is absent.
+    ///
     /// # Errors
     ///
     /// - [`Error::Io`] if `path` is not a directory, if it has no `objects`

@@ -91,6 +91,12 @@ project.
   adapts its stream with `tokio_util::compat`.
 - Each I/O entry point is an `async fn`. A filter callback and an xattr callback
   are synchronous.
+- `rustix` makes the namespace and metadata syscalls: the opens relative to a
+  descriptor, stat, link, rename, the xattrs, reflink, `O_TMPFILE` with `linkat`,
+  the record locks, and the syncs. These calls are synchronous. They run on the
+  blocking pool of `ostrya-rt` in steps that each group several calls, and not
+  one step for each call. The content of a file streams through the `File` and
+  `FileReader` of `ostrya-rt`, over a descriptor that the `rustix` layer opened.
 - To cancel an operation, drop its future. To cancel on a signal, race the future
   against that signal.
 - Each fallible operation returns `ostrya::Error`, one enum for the crate.

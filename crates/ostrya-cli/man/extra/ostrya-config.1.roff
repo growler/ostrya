@@ -264,6 +264,9 @@ A pull, a push that \fB\%ostrya receive\fR or \fB\%ostrya serve\fR stores, a ser
 A program that writes the bytes of a metadata object through the ostrya library does not check the values.
 The port builds the binding keys of the anchor commit of a collection, so the anchor commit that \fB\%ostrya summary \-u\fR, \fB\%ostrya receive\fR, and \fB\%ostrya serve\fR write takes no check.
 A prune that reaches a commit with a defective value from one of these paths fails.
+Do not list a key here that the upstream of the repository lists in its \fB\%detached\-metadata\-exclude\fR.
+A pull from that upstream stores no detached metadata entry with such a key, so the entry keeps no commit, and a prune deletes the commits that it would keep.
+No command checks this rule, because each of the two configurations is correct alone.
 .TP
 \fB\%detached\-metadata\-exclude\fR (list)
 Detached metadata keys that are not stored.

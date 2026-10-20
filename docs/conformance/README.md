@@ -13,7 +13,8 @@ The goal is full interoperability wherever it is possible:
 - the same holds for HTTP pull, static deltas, tar, composefs, and signatures.
 
 Scope is repository and commit management. The sysroot and deployment surface
-(`ostree admin`) is out of scope, in line with Phase 20 of `../port-plan.md`.
+(`ostree admin`) is out of scope (`../roadmap.md`, "Sysroot and deployments
+(optional)").
 
 Three companion documents sit beside the record files. `harness.md` specifies
 the program that executes the records and reports what each cell proved.
@@ -161,8 +162,8 @@ invoking user's ids compares validly between them.
   and populated: operation against mode, in both directions.
 - `m10-cli-behavior.matrix` -- `ostrya`'s CLI surface against the `ostree`
   tool's: option acceptance, stdout/stderr text, and exit status, per
-  subcommand. This is the family Phase 17 (`../port-plan.md`) builds out and
-  gates on. The reference behavior is the tool's own observed output, recorded
+  subcommand. This family is the conformance gate of the `ostrya` command.
+  The reference behavior is the tool's own observed output, recorded
   the same way every other fact in this directory is. A cell is one CLI
   invocation, so a record carries a `subcommand` and a `cell` identifier tail
   in place of M0/M1's corpus and mode grid.
@@ -231,7 +232,7 @@ Recognized descriptive fields: `family`, `corpus`, `op`, `modes`, `src-mode`,
 The `spec:` field holds one or more `<document>#<anchor>` values. The document
 name resolves in this directory, which holds `cli-behavior.md`,
 `cli-surface.md`, and `harness.md`, and then in `../`, which holds
-`format-reference.md` and `port-plan.md`. The anchor is the fragment GitHub
+`format-reference.md`, `decisions.md`, and `roadmap.md`. The anchor is the fragment GitHub
 derives from the heading text: the text lowercased, with every character outside
 letters, digits, hyphens, and underscores dropped, and every space turned into a
 hyphen. A heading of the form `P2 -- options missing from commands that exist`

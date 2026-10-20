@@ -883,6 +883,14 @@ same names and modes. In `bare-user-shared` it then sets the modes that
 "bare-user-shared mode" states. These locks are advisory and
 cross-process, and the checksums and the object bytes do not depend on them.
 
+The port takes a classic `fcntl` record lock (`F_SETLK`) on `.lock` and on
+the staging lock sibling, in the same kinds. Record locks and OFD locks share
+one lock space, so the port and the tool exclude each other on one
+repository. This was verified in both directions: each side held its lock
+while the other side tried to take the lock. A record lock belongs to the
+process, so the port keeps one descriptor for each lock file in a process
+(`crates/ostrya/src/lock.rs`).
+
 `[core] lock-timeout-secs` sets the limit of the wait for `.lock`. The port
 reads the value in this way:
 
@@ -1024,6 +1032,72 @@ the age test like each other entry. With a very small or negative
 `tmp-expiry-secs`, the reap of another transaction can unlink such an entry
 before its rename. The write then fails with `ENOENT`, and the ref or the object
 stays unchanged.
+
+### Prune removal order
+
+The port's prune removes what it dooms in the order below. Thus a run that
+stops part way through leaves no commit object whose tree it started to
+remove. A pull reads a commit with no `.commitpartial` marker as complete, so
+such a commit is damage that no reader reports.
+
+1. The commit phase. For each doomed commit, the port writes the tombstone
+   where the run writes tombstones, unlinks the commit object, and then
+   unlinks its `.commitmeta` and its composefs image. Then it unlinks each
+   `.commitmeta` and each composefs image whose commit is absent.
+2. The barrier. If `[core] fsync` is true, the port syncs each `objects/`
+   fanout directory in which the commit phase removed an entry, one time for
+   each directory. If `[core] fsync` is false, a crash gives no guarantee of
+   the order in which the removals reach the disk.
+3. The content phase. The port removes each other doomed object, in any
+   order.
+4. The leftover sweep. See below.
+
+The commit goes before its `.commitmeta`. A `.commitmeta` with no commit is
+unreachable, and the next prune removes it. The reverse order leaves a commit
+with no signatures.
+
+A `--delete-commit` run removes the named commit in the order of the commit
+phase, and syncs its fanout directory before the other phases start.
+
+No phase before the leftover sweep removes a `state/<commit>.commitpartial`
+marker. The commit can already be partial. If a crash made the unlink of the
+marker durable and not the unlink of the commit, a partial commit would look
+complete.
+
+The order changes no count. The port reads the size of each doomed object
+before its unlink and counts the object one time. A `.commitmeta` or a
+composefs image that the commit phase removes with its commit is in no count.
+An object that is absent when the port reads its size is in no count. A
+`--no-prune` run goes through the same phases, removes nothing, and reports
+the counts that the removal would give.
+
+A run that stops part way through leaves two kinds of entries that no later
+walk finds: the static deltas of the commits it removed, and the markers of
+these commits. Each run with no `--no-prune` and no `--static-deltas-only`
+removes them after the content phase:
+
+- each static delta whose target commit is absent from the store. A delta
+  whose source commit is absent and whose target commit is present stays. A
+  delta name that does not decode names no commit, and its entry stays.
+- each `state/<commit>.commitpartial` marker whose commit is absent from the
+  store. A name that is not a marker name in lowercase hex stays.
+
+A `--static-deltas-only` run removes the deltas of the commit it names and
+nothing more. It removes no marker, and it keeps a delta name that does not
+decode.
+
+The leftover sweep depends on the repository lock. Each pull writes its
+marker inside its transaction, which holds the lock shared until the commit
+is published. The prune holds the lock exclusive. Thus no pull is between the
+write of a marker and the store of its commit while the sweep runs. `fsck`
+writes a marker with no lock, but only for a commit that it read from the
+store. If `[core] locking` is false, a prune can remove the marker of a
+concurrent pull, and the static delta of a commit that another writer stores
+after the prune lists the store.
+
+The leftover sweep is a port behavior. The tool's handling of a static delta
+whose target commit is absent, and of a marker whose commit is absent, is not
+observed.
 
 ### Static delta directories
 
@@ -5038,8 +5112,8 @@ byte 100.
 
 Prune removes the image with its commit, and removes an image whose commit is
 absent. A kept commit keeps its image. No prune count and no byte count of
-freed space includes the image. `port-plan.md`, "Prune sweep order", states
-the order of the removals.
+freed space includes the image. "Prune removal order" states the order of
+the removals.
 
 ### The composefs image in a static delta
 

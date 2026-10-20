@@ -563,7 +563,11 @@ impl Transaction {
     ///
     /// The payload is the `.filez` bytes of an archive remote. The call writes
     /// the fetched bytes to the staging file unchanged. It does not inflate
-    /// and compress them again.
+    /// and compress them again. A deflate costs about ten times an inflate, so
+    /// a pull into an archive repository spends no deflate on such an object.
+    /// The stored bytes are the bytes of the remote, as the `ostree` command
+    /// stores them, so a byte-level compare of two archive repositories finds
+    /// no change in the object.
     ///
     /// The call stores `framed_header` exactly as given, with the uncompressed
     /// size that it declares. It does not change that size to the size that

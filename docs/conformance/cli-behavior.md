@@ -986,6 +986,87 @@ checks that remote against the binding of the commit:
 
 `cli-surface.md`, "P2", `pull`, records the port side.
 
+#### Content objects in an archive destination
+
+A pull from an archive remote into an archive repository stores each `.filez`
+with the bytes that the remote serves. The tool does not inflate and compress
+the object again. Measured with `cmp` over a pull between two archive
+repositories: the four content objects of the destination are byte-identical
+to the objects of the remote. The port stores the same bytes
+(`ostrya::pull_http::an_archive_pull_reproduces_filez_bytes_from_a_tool_built_remote`).
+
+#### Proxy
+
+These records come from libostree 2026.1, against a local origin server and a
+local forward proxy that logs each request line.
+
+- `http_proxy` applies to an `http` origin. The request carries the
+  absolute-form target and the `Host` header of the origin.
+- The tool does not read `HTTP_PROXY`. It reads each other variable in upper
+  case too: `ALL_PROXY`, `HTTPS_PROXY`, and `NO_PROXY` all apply.
+- If a variable is set in both cases, the tool reads the lower case. With
+  `all_proxy` naming a proxy that answers and `ALL_PROXY` naming a dead port,
+  the pull goes through the proxy. With the two values exchanged, the pull
+  fails.
+- `all_proxy` applies to each scheme. `https_proxy` does not apply to an
+  `http` origin, and `http_proxy` does not apply to an `https` origin.
+- The tool reaches an `https` origin behind `https_proxy` through a `CONNECT`
+  tunnel. TLS ends at the origin.
+- `no_proxy` matches the host text of the URL, and not the address that the
+  host resolves to. So `no_proxy=localhost` does not exempt a `127.0.0.1`
+  origin. A comma list, an entry equal to the host, and `*` each exempt an
+  origin. An empty value exempts nothing.
+- The remote `proxy` key wins over the environment in both directions. With
+  the key naming a proxy that answers and `http_proxy` naming a dead port, the
+  pull goes through the proxy of the key. With the key naming a dead port and
+  `http_proxy` naming a proxy that answers, the pull fails with `[7] Could not
+  connect to server`, and the proxy of the variable logs no request. A
+  `no_proxy` entry that matches the origin host exempts the origin from the
+  key too.
+- A proxy value with white space at its start or end fails the pull with
+  `[5] Could not resolve proxy name`. The tool writes no ref and sends no
+  request to the proxy. This holds for the remote `proxy` key, with trailing
+  spaces or with a `\s` escape at the start, and for `http_proxy` with
+  trailing spaces. In the list below, a padded value is a value with white
+  space at its start or end.
+  - A leading or trailing space, tab, LF, CR, VT, FF, U+00A0, or U+2003 is
+    refused.
+  - A value of white space alone counts as set. It hides the upper-case name,
+    and the tool refuses it.
+  - The message holds no part of the value.
+  - The tool trims each `no_proxy` entry. `no_proxy=" 127.0.0.1 "` exempts a
+    `127.0.0.1` origin, and `no_proxy=" "` exempts nothing.
+  - A remote `proxy` key with a clean value wins, and the tool does not read
+    the variable.
+  - The tool refuses only the variable that the request uses. These cases do
+    not fail the pull: a padded `http_proxy` with a `no_proxy` entry that
+    matches the origin or with `no_proxy=*`, a padded `https_proxy` or
+    `HTTPS_PROXY` for an `http` origin, a padded `all_proxy` beside a clean
+    `http_proxy`, a padded `ALL_PROXY` beside a clean `all_proxy`, and a
+    padded `HTTP_PROXY`.
+
+`cli-surface.md`, "P2", `pull`, records the port side.
+
+#### `tls-permissive`
+
+These records come from libostree 2026.1, against a local TLS origin server.
+
+- `tls-permissive=true` ignores `tls-ca-path`. A CA that signed nothing in the
+  chain serves, and so does a path that names an absent file. Without
+  `tls-permissive`, the same absent path fails the pull with `[77] Problem
+  with the SSL CA cert (path? access rights?)`.
+- `tls-permissive=true` keeps the host name check. A leaf certificate with
+  `SAN DNS:localhost` alone serves `https://localhost:PORT` and fails
+  `https://127.0.0.1:PORT`. A chain failure and a name failure give the same
+  text, `[60] SSL peer certificate or SSH remote key was not OK`, so the
+  message of the tool does not tell them apart.
+- The tool reads `tls-permissive` as a key-file boolean. It accepts `true`
+  and `1`. `yes` and `TRUE` fail before any network work.
+
+The page `ostree.repo-config(5)` states a wider rule: "If this variable is
+set, any certificate will be accepted." The measurement shows that the host
+name check stays. `cli-surface.md`, "P2", `pull`, records the port side.
+
 #### Ref list and mirror pulls
 
 The tool resolves an empty ref list by the kind of pull:
@@ -3669,6 +3750,8 @@ The command escapes the value with the writer escapes of
 `unset` takes a key. If the command removes the last key of a group, the group
 header stays in the file with no entries. If the document does not hold
 the key or the group, the command succeeds and does not change the file.
+`unset` removes each key that it is given, `core.mode` included. The command
+does not check the document that it writes.
 
 The rewritten document keeps the groups and the keys that the operation did
 not touch, in the order that it read them. It drops the comment lines and the
@@ -4876,7 +4959,7 @@ This rule selects the deltas that `list`, `reindex`, the
 
 `cli-surface.md`, "P2", `prune`, records two more rules of the port prune. One
 is for a delta name that does not decode. The other is for a delta whose target
-commit is absent. `../port-plan.md`, "Prune sweep order (DONE)", states the
+commit is absent. `../format-reference.md`, "Prune removal order", states the
 two rules.
 
 #### `list`

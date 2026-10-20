@@ -377,7 +377,11 @@ The design documents in `docs/` are the source of truth:
   command.
 - `docs/conformance/cli-surface.md`: the command surface of Ostrya, and each
   difference from the `ostree` command.
-- `docs/port-plan.md`: the architecture, the test strategy, and the roadmap.
+- `docs/decisions.md`: the design decisions, and the alternatives that were
+  rejected.
+- `docs/roadmap.md`: the work that is not done.
+
+`CONTRIBUTING.md` describes the golden fixtures and the test gates.
 
 ## License
 

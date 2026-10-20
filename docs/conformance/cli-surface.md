@@ -1,7 +1,7 @@
 # CLI surface required by the conformance matrix
 
-This file states the command-line surface Phase 17 implements. It is derived
-from two roles:
+This file states the command-line surface of the `ostrya` command. It is
+derived from two roles:
 
 - harness driver -- the interoperability harness invokes the command to build or
   operate a repository in a matrix cell;
@@ -458,8 +458,7 @@ deliberately not reproduced:
   against the tail of either fingerprint, so the whole fingerprint of either
   key reaches it as well;
 - the verdict the report states rests on the port's own trust and validity
-  policy, which `../port-plan.md`, "Phase 13d -- GPG signing and verification
-  (DONE)", enumerates against GnuPG 2.4.9.
+  policy, which "GPG verification differences" compares with GnuPG 2.4.9.
   Seven differences stand there, and each one can make a `show` verdict part
   from the tool's: the fixed digest policy, the GnuPG keybox refusal, the
   refusal a keyring the parser rejects draws, the 256-bit minimum digest an
@@ -599,7 +598,9 @@ vendors PCRE2 10.46 and links it statically. One pattern reaches one engine
 family, and the option parts from the tool in four places: the reason string in
 a compile failure, the unit that same line's offset counts in, the exit path a
 match-time refusal takes, and the PCRE2 version each side carries ("Scope of CLI
-compatibility"). The cited test for this option is
+compatibility"). `../decisions.md`, "The expression engine of
+`--tar-pathname-filter`", states why the port takes PCRE2. The cited test for
+this option is
 `ostrya_cli::cli::commit_tar_pathname_filter_matches_the_tool` in
 `crates/ostrya-cli/tests/cli.rs`.
 
@@ -1237,7 +1238,8 @@ the object: the bytes, the inode mode, the owner, and the xattrs that the tool
 writes where its write succeeds, as root. With `fsverity=maybe` the port seals
 these objects, and the tool ignores each enable failure under `maybe`.
 `../format-reference.md`, "Write path: fs-verity (ex-integrity)", gives the
-write order of each, and `../port-plan.md`, Phase pre13, records the decision.
+write order of each. The port gives no value a meaning of its own here, so the
+refusal rule of "Scope of CLI compatibility" does not apply.
 
 Two wordings the port reproduces are the tool's own and read as defects. The
 first is the editor-failure line, which carries no separator between the closing
@@ -1371,8 +1373,8 @@ equal lengths; the first divergence below gives the general case.
   two repositories stay interoperable. The harness's own `inventory` oracle
   reports the stored size of each loose object, so it parts on the same payloads
   wherever an archive-mode cell names it. The cause is `miniz_oxide` against
-  zlib, and the no-C rule keeps the port on `miniz_oxide` (`../port-plan.md`,
-  "Decisions").
+  zlib, and the no-C rule keeps the port on `miniz_oxide` (`../decisions.md`,
+  "Foundation crates").
 - The kernel search's place in the fault order parts. The tool runs it after the
   tree walk and before the timestamp is read and before the empty-key check, so
   `--bootable --timestamp=bogus` over a kernel-less tree reports `error: No such
@@ -1800,7 +1802,7 @@ the durability policy:
   node behind them. A `..` component parts from the `.` forms: the port refuses
   a value that carries one after a name, `--subpath=/dir/..` and
   `--subpath=/dir/../f` among them, at exit 1 with `subpath not found`, which is
-  the tool's answer, and Phase 24 records the rule. A value carrying no name
+  the tool's answer. A value carrying no name
   component at all, `--subpath=..` among them, names the whole tree in the port
   and exits 1 in the tool. Both accept a leading-slash and a relative spelling
   of a name that exists, and `/` names the whole tree in both. Under `--allow-noent`
@@ -1985,7 +1987,7 @@ stand:
     no test compares. In the port, the header of a hardlink member carries
     mtime 0, mode 0, and owner 0:0;
 - the extended attributes. The port emits one `SCHILY.xattr.<name>` record per
-  stored xattr and this tool version emits none, which Phase 10 recorded
+  stored xattr and this tool version emits none
   (`../format-reference.md`, "tar"). `--no-xattrs` drops the port's records, so
   the option is what brings the two streams into agreement over an
   xattr-bearing tree, and it leaves the tool's stream unchanged;
@@ -1997,7 +1999,7 @@ stand:
   adds). The port reads a path, so a trailing slash names the same directory as
   the form without it. The two agree on `--subpath=/dir/..`, which the port
   refuses at exit 1. A `..` component that follows a name component names an
-  entry no directory holds, which Phase 24 recorded. A `.` component falls
+  entry no directory holds. A `.` component falls
   away, and a value that carries no name component names the whole tree. Of
   those values the tool takes `/` alone, so `--subpath=.`, `--subpath=..`, and
   `--subpath=/..` write a tree in the port where the tool exits 1. The two
@@ -2066,8 +2068,8 @@ the store and each `state/<commit>.commitpartial` marker whose commit is
 absent. These are the leftovers of a run that stopped part way through. Every
 prune skips a delta name that does not decode and leaves that entry in place.
 This is a port behavior. The tool's handling of the two leftovers is not
-observed. `../port-plan.md`, "Prune sweep order (DONE)", states the rule and
-the order in which the port's prune removes a commit and its content.
+observed. `../format-reference.md`, "Prune removal order", states the rule
+and the order in which the port's prune removes a commit and its content.
 
 Both implementations hold the repository lock for the whole of a prune, and
 both take it exclusive. Measured against `ostree` 2026.1 on an archive
@@ -2199,8 +2201,7 @@ That is the out-of-band ref name of "P1", and the pair is stated there.
 Two repository config keys in the `[ex-ostrya]` group are port extensions with
 no option and no counterpart in the tool. They part `ostrya` from `ostree` on a
 repository that sets one, and the divergence is by intent
-(`format-reference.md`, "Configuration keys of the port";
-`port-plan.md`, Phase 22):
+(`format-reference.md`, "Configuration keys of the port"):
 
 - `gc-root-metadata-keys` names metadata keys a prune reads for further
   reachable commits. `ostrya prune` roots on them; `ostree prune` does not, and
@@ -2493,8 +2494,7 @@ and `summary.sig` as they stood (`cli-behavior.md`, "CLI output formats",
   `mode, n, b, last-modified, indexed-deltas, tombstone-commits`. The port
   stores the standard order and then the user keys in first-occurrence order.
   Rebuilding a hash-table order is the engine rule 2 forbids, and
-  `commit --bootable` carries the same class of divergence
-  (`../port-plan.md`, Phase 17f, `F9`). The key set and every value agree, the
+  `commit --bootable` carries the same class of divergence ("P2", `commit`). The key set and every value agree, the
   report follows the stored order, and some key sets keep the standard order in
   the tool, where the two `summary` files agree byte for byte;
 - the entry order of the `ostree.static-deltas` map of a summary that lists two
@@ -2895,7 +2895,7 @@ order, as in the tool. Only a little-endian host is observed.
   discards, and the object then travels whole, as in the tool. The port
   bounds the diff attempt by the maximum chunk size of its chunker, so an
   unrelated same-path rewrite of a large object is spliced with no suffix
-  sort first (`../port-plan.md`, Phase 15b). The pairing decides the size of
+  sort first (`crates/ostrya/src/deltagen.rs`, `BSDIFF_CONTENT_LIMIT`). The pairing decides the size of
   a delta and the delta bytes. The objects that the delta delivers are the
   same. The pairing is the port's own choice, in the same sense as the
   parameters of the chunker;
@@ -3024,6 +3024,33 @@ the files before the fetcher refuses a `file://` address. A file larger than
 before any request, and the message names the key and the path: `error:
 invalid input: tls-ca-path 'PATH' is over 1 MiB`. A file that cannot be read
 is refused with a message that names the key and the path too.
+
+`tls-permissive=true` takes the certificate chain as the server presents it,
+and keeps the host name check. The tool was measured on two terms of the key
+(`cli-behavior.md`, "HTTP pull surface", "`tls-permissive`"): the host name
+check stays, and `tls-ca-path` is ignored. The port follows both. It also
+drops the expiry check of the chain, which was not measured: libcurl peer
+verification that ignores the CA path also ignores the validity dates.
+`ostree.repo-config(5)` states that with the key "any certificate will be
+accepted". The port follows the measurement, so it refuses a certificate that
+does not name the host of the request.
+
+The port reads the proxy of a pull by the rules of the tool (`cli-behavior.md`,
+"HTTP pull surface", "Proxy"). `remote refs` and `remote summary` read it by
+the same rules. Two differences stand:
+
+- A `no_proxy` entry that matches the origin host does not exempt the origin
+  from the remote `proxy` key. In the port, a pull through the key reaches each
+  origin through the proxy that the key names.
+- The port checks each proxy variable that it reads for white space at the
+  start or the end, when it builds the fetcher. The tool checks only the
+  variable that a request uses. So the port refuses a padded variable that the
+  request does not use: a padded `http_proxy` that `no_proxy` exempts, a
+  padded `https_proxy` or `HTTPS_PROXY` for an `http` origin, and a padded
+  `all_proxy` beside a clean `http_proxy`. A padded `ALL_PROXY` beside a clean
+  `all_proxy` and a padded `HTTP_PROXY` fail the pull in neither. The message
+  of the port names the variable and holds no part of the value. The tool
+  writes `[5] Could not resolve proxy name`.
 
 The port also pulls over ssh, which the tool does not do. The address of a
 pull is `--url`, then the `pull-url` key of the remote, then its `url` key. A
@@ -3226,8 +3253,10 @@ or a ref (`cli-behavior.md`, "HTTP pull surface", "Depth less than -1").
 `--untrusted` over a `file://` remote changes what the tool does; the port
 fetches no `file://` remote. Under `--require-static-deltas` into `archive`
 the tool refuses with `error: Can't use static deltas in an archive repo`, and
-the port takes the delta, with or without `--subpath`, which is the capability
-difference `../port-plan.md`, Phase 16d, records.
+the port takes the delta, with or without `--subpath`. This is a capability
+difference: the delta applier of the port writes each object through the
+content writer of the transaction, which stores the object in the form that
+the destination mode needs.
 
 The tool cannot pull a signed delta. A from-scratch delta and a from-to delta
 that `static-delta generate --sign` signed both fail a pull of the tool with
@@ -3238,8 +3267,19 @@ verification configured and with verification off (`cli-behavior.md`,
 The port verifies a fetched delta with the sign-api engines that the commit
 policy names, before it requests a part. It applies a delta that a trusted
 key signed, and refuses a delta that another key signed. It accepts a delta
-with no signature under those engines. `../port-plan.md`, "Phase 16e --
-Signature verification during a pull (DONE)", states the port rule.
+with no signature under those engines. The summary advertisement names the
+superblock, the superblock names what the delta writes, and the pull checks
+the commit that the delta delivers as it checks each other commit. So a delta
+with its signature removed gets nothing past the checks.
+
+The port checks a commit that a delta delivers against the `.commitmeta` that
+the pull fetches and stores, which is the metadata that a later verify of the
+stored commit reads. The tool checks it against the copy of the detached
+metadata in the superblock (`../format-reference.md`, "Superblock fields").
+So a delta that was generated before its commit was signed again fails a tool
+pull that the current `.commitmeta` satisfies. The port writes the copy when
+it generates a delta, so a tool pull that verifies accepts a delta that the
+port generated for a signed commit.
 
 `--require-static-deltas` refuses where the tool refuses
 (`cli-behavior.md`, "HTTP pull surface", "Delta selection in a pull"): a
@@ -3320,8 +3360,8 @@ differences stand:
   The port keeps its own walk order and concurrency;
 - `pull-local` from `bare-user` into `bare-user-only`. The tool hardlinks each
   object and prints `0 bytes content written`. The port writes each object
-  afresh where it accepts it, which is the difference `../port-plan.md`, Phase
-  16b, records, and counts its payload;
+  afresh where it accepts it, as the `pull-local` paragraph below states, and
+  counts its payload;
 - the terminal progress line. The port pads each line to 80 bytes and does not
   read the terminal width, where the tool pads to the width counted in bytes.
   The port counts its progress totals over the units of work its own walk
@@ -3365,7 +3405,7 @@ port's own words. `--require-static-deltas` applies the delta the source's
 summary advertises, with the objects, the refs, and the statistics line of the
 tool, and refuses where the tool refuses (`cli-behavior.md`, "HTTP pull
 surface", "Static deltas over pull-local"). `--disable-static-deltas` changes
-nothing, since `pull-local` reads no delta by default. Six differences stand:
+nothing, since `pull-local` reads no delta by default. Seven differences stand:
 
 - a value given to a GPG switch. The tool reads and discards the value, so
   `--gpg-verify=false` turns the check on. The port's `pull-local` takes both
@@ -3392,8 +3432,19 @@ nothing, since `pull-local` reads no delta by default. Six differences stand:
   inode, so a seal of a hardlinked object also seals the copy in the source
   repository. The port links no object into a repository whose `fsverity` is
   not `no`. It copies each object and seals the copy
-  (`../format-reference.md`, "Write path: fs-verity (ex-integrity)", and
-  `../port-plan.md`, Phase 16b). The object bytes agree.
+  (`../format-reference.md`, "Write path: fs-verity (ex-integrity)"). A
+  repository that is sealed in part keeps its integrity guarantee only for the
+  objects that it wrote itself. The object bytes agree;
+- an import from `bare-user` into `bare-user-only`. The tool hardlinks each
+  content object, whatever its mode and owner. The destination then shares an
+  inode whose mode and `user.ostreemeta` xattr `bare-user-only` does not
+  describe, and `ostree fsck` of the destination reports the imported object
+  corrupt. The port copies the payload onto a new inode with the canonical
+  mode and no xattr. It refuses an object whose logical header is not in the
+  canonical form of `bare-user-only` -- a non-zero uid or gid, an xattr, or a
+  regular-file mode with bits outside `0755` -- because the object would get a
+  name that its stored form does not hash to. What the port imports passes its
+  own `fsck` and the `fsck` of the tool.
 
 `sign` accepts the whole tool option set and adds `--gpg-homedir`,
 `--remote`, the `gpg` engine, and the `spki` engine. The tool build at hand,
@@ -3804,8 +3855,7 @@ records. Twelve divergences stand:
   reader. Where the bytes the packet walk stops at stand inside a later
   certificate run, the answers part further: the port refuses the whole file,
   and the tool reads the certificates standing ahead of that point and trusts
-  them (`../port-plan.md`, "Phase 13d -- GPG signing and verification
-  (DONE)", the divergence for a keyring the parser rejects).
+  them ("GPG verification differences", item 3).
 
   Both rules hold inside one offered stream as well: where a stream carries two
   states of one key the port keeps the first, unless a later one revokes the key
@@ -3820,9 +3870,8 @@ records. Twelve divergences stand:
   the remote's keyring and `cert2.gpg` in the `OSTREE_GPG_HOME` directory. The
   tool answers on which certificate it reads first. The port reads the
   revocation whichever one stands first, and reads the newest expiry statement
-  of the two whichever one stands first. Those are the sixth and the seventh
-  verify divergences `../port-plan.md`, "Phase 13d -- GPG signing and
-  verification (DONE)", records;
+  of the two whichever one stands first. Those are items 6 and 7 of
+  "GPG verification differences";
 - a `gpg --export-secret-keys` stream offered to `remote gpg-import` is refused
   by the port and taken by the tool, which imports the public part of each key it
   holds and lists it afterwards. The port reads a keyring as transferable public
@@ -3864,7 +3913,7 @@ three at exit 1 and write no keyring. For `remote gpg-import` with no
 carried: the port fetches a summary without a cache directory of its own. The
 port's fetcher serves `http` and `https` alone, where the tool also reads a
 `file://` remote, so a `file://` URL reports `fetch url scheme file: only http
-and https are fetched` (`../port-plan.md`, Phase 16a).
+and https are fetched`.
 
 `remote refs` and `remote summary` find the remote by the address rule of
 `pull`, with no `--url`: the `pull-url` key, then the `url` key. For an ssh
@@ -3877,6 +3926,103 @@ The fetcher refuses a `Cookie` header at construction when a mirror is
 cleartext `http`, unless the caller sets
 `FetcherOptions::allow_cleartext_credentials`. `pull` has no option that sets
 it. Cookie-jar support needs its own design pass against that refusal.
+
+## GPG verification differences
+
+The port verifies a GPG signature in the process, under its own trust and
+validity policy. The rustdoc of `GpgVerifier` and of the module `gpg::verify`
+in `crates/ostrya` states each rule of the policy, and the `gpgv` 2.4.9
+behavior that the rule reproduces. `crates/ostrya/tests/verify_gpg_agreement.rs`
+compares the port with `gpgv` over a fixture matrix, and declares each
+difference that its fixtures reach.
+
+Seven differences from GnuPG 2.4.9 stand. None of them is a fact of the
+repository. Each one can make a verdict of the port part from the verdict of
+the tool, in `show`, in a `pull` that verifies, and in the keyring reads of
+`remote gpg-import` and `remote gpg-list-keys`.
+
+1. The digest policy. The port refuses MD5 and accepts SHA-1, which are the
+   answers of `gpgv` 2.4.9 at its defaults. The port set is fixed. The GnuPG
+   set is configurable and changes between versions.
+   `gpg --verify --allow-weak-digest-algos <sig> <data>` reports `GOODSIG`
+   over an MD5 data signature that the port refuses.
+   `gpgv --weak-digest SHA1 --keyring <ring> <sig> <data>` reports
+   `ERRSIG ... 5` over a SHA-1 data signature that the port accepts.
+2. The GnuPG keybox. The port refuses a keyring file or a keyring blob that
+   carries the `KBXf` magic at byte offset 8, and the message names the path
+   or the blob. `gpgv --keyring <homedir>/pubring.kbx <sig> <data>` reads the
+   keybox and reports `GOODSIG`.
+3. A keyring that the parser refuses. The port refuses the whole file if the
+   parser refuses the keyring, or if the packet stream of the keyring does not
+   frame to its end. A command that reads the file exits non-zero, and the
+   message names the keyring. No key of the file gets into the trusted set.
+   The tools read such a keyring up to the packet at which they stop, and what
+   they trust then depends on the position of that packet:
+   - A keyring holds one intact certificate and then 40 bytes of a second
+     certificate. `ostree show --gpg-verify-remote=<remote> <ref>` reports
+     `Can't check signature: public key not found` and exits 0.
+     `gpgv --keyring <keyring> <sig> <data>` reports
+     `keyring_get_keyblock: read error: Invalid packet`,
+     `keydb_search failed: Invalid keyring`, `ERRSIG ... 9`, and `NO_PUBKEY`,
+     and exits 2. Neither tool trusts the intact certificate.
+   - A keyring holds one intact certificate and then a second certificate
+     whose primary key packet is followed by a Trust packet with an
+     indeterminate length. Over a signature of the first certificate, `gpgv`
+     reports `GOODSIG` at exit 0. Over a signature of the second certificate,
+     it reports `[don't know]: indeterminate length for invalid packet type
+     12`, `keydb_search failed: Invalid packet`, `ERRSIG`, and `NO_PUBKEY` at
+     exit 2. `gpg --list-keys` over the file lists the first key alone.
+     `ostree show --gpg-verify-remote=<remote> <ref>` reports
+     `Good signature from "..."` for the first certificate and
+     `Can't check signature: public key not found` for the second.
+4. The digest of an Ed25519 key. An Ed25519 key or an EdDSA-legacy key with a
+   digest of less than 256 bits verifies nothing in the port. So a SHA-1 or a
+   SHA-224 data signature of such a key gives the fields of a signature that
+   does not verify. The `pgp` crate requires a digest of at least 256 bits for
+   this verification (0.20.0, `src/crypto/ed25519.rs`, `MIN_HASH_LEN_BITS`).
+   `gpg --digest-algo SHA1 --detach-sign --local-user <ed25519 key>` writes
+   such a signature, and `gpgv --keyring <ring> <sig> <data>` reports
+   `GOODSIG` over it.
+5. The input limits. The port refuses, by name, a stored signature blob over
+   1 MiB or with more than 64 signature packets, and a keyring over 4 MiB or
+   with more than 256 certificates. `gpgv` reads an input of each of these
+   four shapes and reports on it.
+6. A revocation in a second certificate of a key. The trusted set can hold
+   several certificates for one key. The port reads each of them for a
+   revocation, so a revocation in any one of them refuses the signature.
+   `gpgv` and the tool read the first certificate that their keyrings hold for
+   the key:
+   - A keyring holds an export of a key with no revocation, and then a revoked
+     export of the same key. `gpgv --keyring <keyring> <sig> <data>` reports
+     `GOODSIG`, and `ostree show <ref>` reports `Good signature from "..."`.
+     With the two exports in the opposite order, each tool reports the
+     revocation.
+   - Two keyring files of the `OSTREE_GPG_HOME` directory hold the two
+     exports. The tool answers on the sort order of the two file names.
+   - The `<remote>.trustedkeys.gpg` of the remote holds the export with no
+     revocation, and the `OSTREE_GPG_HOME` directory holds the revoked export.
+     `ostree show --gpg-verify-remote=<remote> <ref>` reports
+     `Good signature from "..."`, and `ostrya show` reports that the signature
+     is not good.
+
+   The port refuses the signature in each of these orders.
+7. The key expiry of two exports of one certificate. The two exports can
+   state two key expiries, and the port takes the newest statement of the two.
+   `gpgv --keyring` over a file that holds both exports answers on their load
+   order:
+   - An export whose expiry is in the past, and then an export that removes
+     the expiry: `gpgv` reports `EXPKEYSIG`, and the port reports a good
+     signature. Here the port accepts where `gpgv` refuses.
+   - The two exports in the opposite order: both report a good signature.
+
+   `gpg --import` of the two exports merges them into one keyblock, and the
+   merged keyring answers on the newest statement, as the port does. `gpgv
+   --keyring` over the merged keyring gives the same verdict for each import
+   order. Three pairs of exports of one certificate were measured: a one-day
+   expiry extended to ten years, the same expiry removed, and an expiry in the
+   past given to a key that stated no expiry. The merged keyring and the port
+   agree on all three pairs. `gpgv` over the two exports concatenated answers
+   on the export that is first.
 
 ## Port extensions with no counterpart in the tool
 
@@ -4887,30 +5033,9 @@ The cells of `m10-cli-behavior.matrix` compare the output of the port with the
 output of the tool. This file records each difference in output at its
 command.
 
-## Ordering
+## Open work
 
-1. `init`, which unblocks every port-created cell. Done, Phase 17a.
-2. `--repo` in the leading position, the current-directory default, and
-   `OSTREE_REPO`, so one command template serves both implementations and the
-   harness stops carrying a per-implementation option table. Done, Phase 17a.
-3. `refs`, `rev-parse`, and `cat`, the postcondition checks in nearly every
-   cell. Done, Phase 17b. `cat` joined this step rather than step 5: it needs no
-   variant printer, and it reads a file object over the same path `refs` and
-   `rev-parse` opened.
-4. `commit` parenting, which `rev-parse REV^` and `log` both read and which
-   step 3 exposed. Done, Phase 17b1.
-5. The P2 option gaps on `commit` and `checkout`, which the corpora need:
-   `--owner-uid`, `--owner-gid`, `--timestamp`, `--no-xattrs`, `-U`, `--subpath`.
-   Done, Phase 17c.
-6. `show`, `log`, `ls`, and `config get`, together with the variant printer.
-   Done, Phase 17d.
-7. `config set`/`unset`, `remote`, and the two GPG keyring commands, which need
-   the config write path. Done, Phase 17e.
-8. The remaining P2 gaps. Phase 17f, decomposed per command in
-   `phase-17-cli-conformance-plan.md`.
-9. The rest of P3. Phase 17g, decomposed in the same file.
-
-That file holds the per-option status of both sub-phases, including any option
-deliberately skipped. An option marked `skip` there is moved out of the
-`Missing:` list above and stated as a divergence in its command's text, the way
-`remote add-cookie` and `remote refs --cache-dir` already stand.
+`../roadmap.md`, "P3 commands", lists the commands of "P3" that the port does
+not carry. An option that the port does not carry by decision is not in a
+`Missing:` list. The text of its command states it as a difference, as it
+states `remote add-cookie` and `remote refs --cache-dir`.

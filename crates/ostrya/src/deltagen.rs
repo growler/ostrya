@@ -153,7 +153,12 @@ pub struct DeltaOptions {
     /// The superblock timestamp, in seconds since the Unix epoch.
     ///
     /// `None` uses the current time, as the `ostree` command does. A fixed
-    /// value makes the output reproducible.
+    /// value makes the output reproducible for one liblzma version.
+    ///
+    /// The generation packs the metadata objects first, by object type and
+    /// then by checksum, and then the content objects by checksum. So one
+    /// input gives the same parts. Each part is the output of liblzma at xz
+    /// preset 8, and another liblzma version can write other bytes.
     pub timestamp: Option<u64>,
     /// A directory that receives the superblock and the part files.
     ///

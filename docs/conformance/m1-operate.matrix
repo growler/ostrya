@@ -159,8 +159,9 @@ outcome: full
 severity: interop
 identity: n-a
 oracle: exit-status
-evidence: port-plan.md decision 8
-spec: port-plan.md#decisions
+evidence: ostrya::maintenance::the_tool_prune_waits_on_a_lock_the_port_holds,
+ ostrya::maintenance::prune_waits_while_the_tool_holds_the_repository
+spec: format-reference.md#repository-lock-and-staging
 note: The port takes a classic fcntl record lock, which shares a lock space with
  the tool's OFD locks, so the two exclude each other. Verified by holding each
  side's lock while the other acquires.
@@ -458,8 +459,9 @@ outcome: full
 severity: interop
 identity: n-a
 oracle: exit-status
-evidence: port-plan.md decision 8
-spec: port-plan.md#decisions
+evidence: ostrya::maintenance::the_tool_prune_waits_on_a_lock_the_port_holds,
+ ostrya::maintenance::prune_waits_while_the_tool_holds_the_repository
+spec: format-reference.md#repository-lock-and-staging
 
 family: M1
 created-by: p

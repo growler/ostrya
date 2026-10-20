@@ -133,6 +133,42 @@ The XATTR_FILTER field hashes each xattr name with xxHash32. The xxHash32 in
 `crates/ostrya-composefs/src/xxhash.rs` is written in the tree to add no
 crate. The golden filter bytes verify it.
 
+## The composefs image object
+
+The port stores the composefs image of a commit as an object of the type 100
+(`format-reference.md`, "The composefs image object"). The `ostree` command
+does not know this type. A read of a port repository that holds images by
+the `ostree` command is not a goal. The cross-checks in which the `ostree`
+command reads the output of the port cover repositories and static deltas
+with no image. The port reads the repositories and the static deltas of the
+`ostree` command.
+
+## The mount daemon
+
+`ostrya-mountd` mounts a commit as composefs for a caller in a user
+namespace of its own. The kernel forced these choices:
+
+- Each request runs in a worker process, the daemon binary run again. The
+  kernel refuses `setns(CLONE_NEWUSER)` in a process with more than one
+  thread. A process that enters a user namespace cannot go back to its
+  parent namespace. Thus a thread of the runtime pool cannot do the steps
+  on the side of the caller.
+- The worker gives the daemon `open_tree(OPEN_TREE_CLONE)` copies of the
+  repository directory and of `objects`. overlayfs takes a layer only from
+  the mount namespace of the mounter or from a detached mount, and the
+  daemon mounts in its own mount namespace.
+- The worker makes an `open_tree(OPEN_TREE_CLONE)` copy of the composefs
+  mount of the daemon. overlayfs takes a detached layer only from a process
+  with `CAP_SYS_ADMIN` in the user namespace that owns the detached mount.
+  The daemon makes the composefs mount in the initial user namespace, so the
+  top overlay of the worker on the detached mount of the daemon fails with
+  EPERM. The copy belongs to the user namespace of the caller.
+
+The daemon checks that the sent user namespace owns the sent mount
+namespace, and that it is not the initial user namespace. It does not check
+that the peer is a member of the namespaces that it sends. A client such as
+ostree-podman sends the namespaces of podman, which are not its own.
+
 ## The spki sign engine
 
 The spki engine is pure Rust over `p256`: deterministic ECDSA on NIST P-256
@@ -183,6 +219,39 @@ needs `unsafe` code.
 The request body is a `Body` type of the fetcher, so `http-body-util` is not
 a dependency. The `basic` authorization header is encoded by
 `ostrya-core::base64`, so no base64 crate is a dependency.
+
+## The client access of `ostrya serve`
+
+- The reader of the PROXY protocol, v1 and v2, is written in the tree, with
+  no crate. The CIDR match of `trusted-proxy` and of a `net:` item is
+  `std::net::IpAddr` and a prefix length, with no crate.
+- A forwarded certificate in base64 DER is decoded by `ostrya::base64`, so
+  no base64 crate is a dependency.
+- The server keeps each verified forwarded certificate in a cache. One
+  verification costs 23 to 52 µs of CPU, and each request from a proxy
+  carries the certificate, each object `GET` included.
+
+## The protocol versions
+
+Protocol version 1 changed in place for the client groups, the server
+commit, the collection selectors of the ref listing, and the object type
+100. No deployment ran version 1 when these changes came, so the version
+number did not change. Thus a receiver that does not take the type 100
+refuses a sender that sends an image.
+
+## GC anchor keys
+
+- `Repo::prune` reads `[ex-ostrya] gc-root-metadata-keys` and merges the
+  keys of the caller into the list. The config key is the policy of the
+  repository, and it only adds roots. Thus a library caller cannot remove a
+  config key from a run, and a run keeps at least what the same run with no
+  config key keeps.
+- A commit write refuses a value of an anchor key that a prune refuses.
+  Else the commit enters the store, and each later prune that reaches it
+  fails.
+- The library does not know where an entry of a metadata dict comes from.
+  Thus the check cannot exempt a value that `ostrya commit --keep-metadata`
+  copies from the parent commit.
 
 ## The pull scheduler
 

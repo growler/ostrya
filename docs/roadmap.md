@@ -84,6 +84,13 @@ for it.
 - `cat`, `log`, `ls`, `checkout` and `export` print `object not found:
   Commit <checksum>` for an absent commit. `show` and `fsck` print the text
   of the `ostree` command.
+- `ostrya serve` reads the key groups before `check_server` runs, so a start
+  that a check refuses reads the key files first. A fix needs a second read
+  of the client groups or a new constructor of `ReceivePolicies`.
+- `ostrya commit --tag` checks in the CLI that the ref is absent, before the
+  lock and again before the commit. The library has no API for this check. A
+  ref that another writer makes during the publish step is replaced.
+  `conformance/cli-surface.md` states this.
 
 ## Gaps in the library
 
@@ -102,6 +109,15 @@ for it.
 - A config key that marks weak refs by a name pattern. `Repo::prune` takes
   the classification as a function, and `[ex-ostrya] gc-root-metadata-keys`
   marks roots by a metadata key.
+- An option that turns off the keys of `[ex-ostrya] gc-root-metadata-keys`
+  for one run of `Repo::prune`. It comes when a caller needs a run that
+  keeps less than the policy of the repository.
+- The rules of the one-way stream come from code alone (`StreamPolicy`), and
+  they can name remote refs. No client group applies to the stream. A later
+  command, for example `ostrya repo import`, can replace the stream.
+- The archive view serves `deltas/` in the `archive` mode alone. Outside
+  that mode, the summary of an auth item and the ref listing name no static
+  delta.
 
 ## Open decisions
 

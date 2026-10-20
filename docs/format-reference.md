@@ -3096,6 +3096,8 @@ no I/O, and each failure is `ref-denied`:
     no remote ref.
 11. A ref of `Hello` needs `r` in the effective rights of the group
     (`ostrya-config(1)`, "Access modes and patterns"). `d` does not add `r`.
+    `HelloReply` gives the current commit of each ref of `Hello`, so this
+    check keeps a client from reading a ref through a push session.
 
 `ostrya receive` and `ostrya serve` give a session the client group that
 carries the auth item of the client in the namespace of `Hello`
@@ -3380,7 +3382,8 @@ failed check ends the session, and the session writes nothing:
 Checks 7 and 8 of a `Commit` with no server commit do not apply. The server
 writes the binding keys, and `verify` and `allow-unsigned` of the client group
 do not apply. The trust in a server commit comes from the authentication of
-the client and from `sign`.
+the client and from `sign`. A client group that must verify the commits of
+its clients takes a mirror push.
 
 The server then makes the staged objects durable and takes the update lock.
 Under the lock it reads the branch and the tags in the namespace of the
@@ -4316,8 +4319,10 @@ repository with a bad `config` or `zlib-level` gets 404 for `HEAD` and 500
 for `GET`.
 
 The summary of an item states `archive-z2` in `ostree.summary.mode` in each
-mode, `bare-user-shared` included. So the tool pulls with a summary from a
-`bare-user-shared` repository. The root summary states `bare-user-shared`,
+mode, `bare-user-shared` included. Observed behavior: the tool refuses a
+summary that states `bare-user-shared`. So the tool pulls with a summary from
+a `bare-user-shared` repository only because the summary states
+`archive-z2`. The root summary states `bare-user-shared`,
 and the view never serves it.
 
 ### Read access
@@ -4692,6 +4697,9 @@ header of a client address:
   item is a hop with no address.
 - `X-Real-IP`: one hop, in the forms of an `X-Forwarded-For` item.
 
+In each form, `PORT` is decimal digits with a value of 65535 at most. A hop
+with a larger port is a hop with no address.
+
 The lines of the header join in their order. The server walks the hops from
 the right, and skips each hop whose address is in `trusted-proxy`. The first
 other hop is the client. When all hops are trusted, the client is the
@@ -4738,7 +4746,7 @@ cache keeps no refusal.
 From a trusted proxy, the header of `trusted-proxy-client-cert` alone gives
 the certificate. The server does not use the certificate of the TLS
 handshake, which is the certificate of the proxy. A request with no such
-header gives no certificate. From a peer that is not in `trusted-proxy`, and
+header gives no certificate. From a peer that is not in `trusted-proxy`, or
 with no `trusted-proxy-client-cert`, the certificate of the TLS handshake
 applies.
 
@@ -5101,6 +5109,8 @@ The transfer:
   the copy in the same way.
 - A receiver that holds an image of the commit takes no second copy. It does
   not read the stored image.
+- No key of a client group applies to the image. A push session that may
+  write a commit may also send its image.
 - A pull and a push send the image also for a commit that the receiver holds
   with no image.
 - No object count of a pull, a push, or a receive includes the image. Each
@@ -5142,7 +5152,8 @@ The selection, where `n` is the size of the image in bytes:
 - The image is a fallback entry if `--min-fallback-size` is not 0 and `n` is
   at least its threshold. It is also a fallback entry if `n` is larger than
   `--max-chunk-size` or larger than 128 MiB. So the bound applies also when
-  `--min-fallback-size` is 0.
+  `--min-fallback-size` is 0. The applier holds a whole part in memory, so
+  the bound limits the memory that an image in a part needs.
 - The image is a fallback entry in each delta of `--inline`, whatever `n`
   is. The generator and the applier hold an inline part in memory, so no
   inline part carries the image.

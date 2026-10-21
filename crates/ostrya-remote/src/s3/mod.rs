@@ -15,10 +15,13 @@
 //!   an address, and gives the URL of the bucket.
 //! - [`S3Endpoint`] holds a location, the credentials, and the HTTP options.
 //!   [`S3Endpoint::resolve`] builds one from an address with [`resolve`].
+//!   [`S3Endpoint::pull_options`] gives the options of the signed fetcher of
+//!   a pull.
 //! - [`Bucket`] is the client of a bucket repository: it gets, puts, and
 //!   deletes the objects of the keys of a repository, and lists them. Its
 //!   results are [`Object`], [`ObjectStream`], [`PutIfAbsent`], [`Listing`]
-//!   with each [`Listed`] object, and [`Upload`].
+//!   with each [`Listed`] object, and [`Upload`]. [`Bucket::from_fetcher`]
+//!   opens it over the signed fetcher of a pull.
 //!
 //! The module reads static key pairs alone. It does not assume a role, run a
 //! credential process, or read an SSO token.

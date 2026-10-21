@@ -53,7 +53,7 @@ use crate::write::FileMeta;
 use super::chain::Edges;
 use super::delta::{self, CommitCheck, DeltaJob, DeltaPlan, DeltaSource, PART_CAP};
 use super::drive::Slots;
-use super::source::{RemoteSource, RootFiles, Transfer, http_error, session_error};
+use super::source::{Connection, RemoteSource, RootFiles, Transfer, http_error, session_error};
 use super::subpath::{Scope, Subpaths};
 use super::verify::Verification;
 use super::{
@@ -112,6 +112,9 @@ impl Repo {
     /// An [`Endpoint::Http`] gives an HTTP pull through the fetcher, and an
     /// [`Endpoint::Ssh`] gives a pull over ssh. The fetcher gets each mirror
     /// as written, and it refuses a scheme other than `http` and `https`.
+    /// With the `s3` feature, an `Endpoint::S3` gives an HTTP pull through a
+    /// fetcher that signs each request. The module [`pull`](mod@crate::pull)
+    /// states its rules in "Bucket repository".
     ///
     /// The pull reads the trust of the remote with
     /// [`PullTrust::from_remote`] before it opens the session. So a refused
@@ -559,7 +562,9 @@ impl Repo {
     /// - [`Error::Fetch`], [`Error::HttpStatus`], [`Error::FetchTooLarge`],
     ///   [`Error::ContentEncoded`], or [`Error::RedirectLimit`] if an HTTP
     ///   request fails after its retries.
-    /// - [`Error::Remote`] if the session of a pull over ssh fails.
+    /// - [`Error::Remote`] if the session of a pull over ssh fails, or if a
+    ///   read of `summary.sig`, `summary`, or `config` from a bucket
+    ///   repository fails.
     /// - [`Error::LockTimeout`] if the wait for the repository lock or the
     ///   update lock passes `[core] lock-timeout-secs`.
     /// - [`Error::Io`] for an I/O error of the file system.
@@ -597,13 +602,13 @@ impl Repo {
         // fetcher and no ssh client.
         let trust = PullTrust::from_remote(self, remote, &opts.verify).await?;
         let (endpoint, stream) = session_options(endpoint, opts.max_outstanding_fetches);
-        let session = connect(endpoint, stream).await?;
+        let connection = connect(endpoint, stream).await?;
         // The trust and the session now hold what these fields gave.
         opts.verify = PullVerify::default();
         opts.max_outstanding_fetches = None;
         opts.remote = opts.remote.or_else(|| Some(remote.to_owned()));
         self.run_session(
-            session,
+            connection,
             trust,
             opts,
             Wanted::Config(remote),
@@ -744,7 +749,7 @@ impl Repo {
             }
         };
         self.run_session(
-            session,
+            session.into(),
             trust,
             opts,
             Wanted::Named,
@@ -755,7 +760,8 @@ impl Repo {
         .await
     }
 
-    /// Runs a pull through `session` to its end, under `trust`.
+    /// Runs a pull through the session of `connection` to its end, under
+    /// `trust`.
     ///
     /// The caller made each check of `opts` that applies to its entry.
     /// [`remote`](PullOptions::remote) gives the prefix of the written refs,
@@ -765,7 +771,7 @@ impl Repo {
     #[allow(clippy::too_many_arguments)]
     pub(super) async fn run_session(
         &self,
-        session: PullSession,
+        connection: Connection,
         trust: PullTrust,
         opts: PullOptions,
         wanted: Wanted<'_>,
@@ -774,7 +780,7 @@ impl Repo {
         started: Instant,
     ) -> Result<PullStats> {
         let counters = PullCounters::new(opts.progress.as_ref());
-        let source = RemoteSource::new(session, counters.transferred_sinks());
+        let source = RemoteSource::new(connection, counters.transferred_sinks());
         let verification = Verification::from_trust(trust);
         // The state of `pull_from` is on the heap, which keeps the future of
         // each entry small.
@@ -1125,7 +1131,10 @@ impl Repo {
     ///
     /// Over HTTP, the call requests `summary.sig` and then `summary`. Over
     /// ssh, the two requests are in flight together, and the session ends
-    /// before the call returns.
+    /// before the call returns. For an `s3://` address, the bucket client
+    /// reads the two files. The default overrides do not set
+    /// `allow_cleartext_credentials`, so the call refuses an `http://` S3
+    /// endpoint.
     ///
     /// # Errors
     ///
@@ -1142,15 +1151,16 @@ impl Repo {
     /// - [`Error::Fetch`], [`Error::HttpStatus`] other than 404,
     ///   [`Error::ContentEncoded`], or [`Error::RedirectLimit`] if an HTTP
     ///   request fails after its retries.
-    /// - [`Error::Remote`] if the ssh session fails.
+    /// - [`Error::Remote`] if the ssh session fails, or if a read from a
+    ///   bucket repository fails.
     pub async fn remote_fetch_summary(
         &self,
         remote: &str,
     ) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>)> {
         let endpoint =
             resolve_pull(Some(self.config()), remote, EndpointOverrides::default()).await?;
-        let session = connect(endpoint, StreamSessionOptions::default()).await?;
-        let source = RemoteSource::new(session, Vec::new());
+        let connection = connect(endpoint, StreamSessionOptions::default()).await?;
+        let source = RemoteSource::new(connection, Vec::new());
         let read = source.summary_files().await;
         source.finish(read).await
     }
@@ -1985,6 +1995,13 @@ pub(super) fn session_options(
                 max_outstanding,
             },
         ),
+        #[cfg(feature = "s3")]
+        Endpoint::S3(mut s3) => {
+            if let Some(n) = max_outstanding {
+                s3.http.max_outstanding = n;
+            }
+            (Endpoint::S3(s3), StreamSessionOptions::default())
+        }
         // `connect` refuses each other endpoint.
         other => (other, StreamSessionOptions::default()),
     }
@@ -1994,15 +2011,39 @@ pub(super) fn session_options(
 ///
 /// Over ssh, the session takes the options `stream`. Over HTTP, the options
 /// of the endpoint give the request limit, and `stream` must be the default.
+///
+/// An S3 endpoint gives an HTTP session whose fetcher signs each request,
+/// and the bucket client of the repository over the same fetcher, which
+/// reads the files at its root. An S3 endpoint has the rules of an HTTP
+/// endpoint for `stream`.
 pub(super) async fn connect(
     endpoint: Endpoint,
     stream: StreamSessionOptions,
-) -> Result<PullSession> {
+) -> Result<Connection> {
     match endpoint {
         Endpoint::Http(http) => PullSession::connect(Endpoint::Http(http), stream)
             .await
+            .map(Connection::from)
             .map_err(http_error),
-        ssh @ Endpoint::Ssh { .. } => Ok(PullSession::connect(ssh, stream).await?),
+        ssh @ Endpoint::Ssh { .. } => Ok(PullSession::connect(ssh, stream).await?.into()),
+        // The future is boxed, so that the future of an ssh connect does not
+        // hold the construction of the fetcher.
+        #[cfg(feature = "s3")]
+        Endpoint::S3(s3) => {
+            let session = Box::pin(PullSession::connect(Endpoint::S3(s3.clone()), stream))
+                .await
+                .map_err(http_error)?;
+            let PullSession::Http(fetcher) = &session else {
+                unreachable!("an S3 endpoint opens an HTTP session");
+            };
+            // The bucket client shares the fetcher of the session, so the
+            // pull builds one fetcher.
+            let bucket = crate::remote::s3::Bucket::from_fetcher(&s3, fetcher.clone());
+            Ok(Connection {
+                session,
+                bucket: Some(bucket),
+            })
+        }
         _ => Err(crate::endpoint::neither_ssh_nor_http("a pull")),
     }
 }

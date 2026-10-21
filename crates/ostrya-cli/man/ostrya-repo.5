@@ -324,7 +324,7 @@ the temporary names \fB\%tmp/.ostrya\-ref\-*\fR, \fB\%tmp/.ostrya\-meta\-*\fR, a
 .IP \(bu 2
 the config groups \fB\%[ex\-ostrya]\fR, \fB\%[ex\-ostrya server]\fR, \fB\%[ex\-ostrya client "NAME"]\fR, \fB\%[ex\-ostrya trust "NAME"]\fR, and \fB\%[ex\-ostrya key "NAME"]\fR;
 .IP \(bu 2
-the remote keys \fB\%push\-url\fR, \fB\%ssh\-command\fR, \fB\%receive\-command\fR, \fB\%push\-token\-file\fR, \fB\%push\-user\fR, \fB\%pull\-url\fR, and \fB\%send\-command\fR.
+the remote keys \fB\%push\-url\fR, \fB\%ssh\-command\fR, \fB\%receive\-command\fR, \fB\%push\-token\-file\fR, \fB\%push\-user\fR, \fB\%pull\-url\fR, \fB\%send\-command\fR, \fB\%s3\-region\fR, \fB\%s3\-endpoint\fR, \fB\%s3\-addressing\fR, and \fB\%s3\-profile\fR.
 .PP
 The \fB\%ostree\fR tool keeps the extension keys when it writes \fB\%config\fR, and ignores them.
 .PP
@@ -348,6 +348,15 @@ The system trusted keys of the signature engine \fB\%<engine>\fR, which is \fB\%
 .TQ
 \fB\%/usr/share/ostree/revoked.<engine>\fR, \fB\%/usr/share/ostree/revoked.<engine>.d/\fR
 The system revoked keys of the signature engine \fB\%<engine>\fR.
+.TP
+\fB\%~/.aws/credentials\fR, \fB\%~/.aws/config\fR
+The shared AWS credentials file and config file of a pull from an \fB\%s3://\fR address.
+A pull through the ostrya library built with its feature \fB\%s3\fR reads them.
+The \fB\%ostrya\fR command of this release refuses an \fB\%s3://\fR address, and does not read them.
+\fB\%AWS_SHARED_CREDENTIALS_FILE\fR and \fB\%AWS_CONFIG_FILE\fR name other paths.
+ostrya reads the section \fB\%[PROFILE]\fR of the credentials file, and the sections \fB\%[default]\fR, \fB\%[profile NAME]\fR, and \fB\%[services NAME]\fR of the config file.
+ostrya reads at most 1 MiB of each file, and refuses a larger file.
+ostrya does not write these files.
 .PP
 \fB\%ostrya serve\fR also reads the files that these keys of \fB\%[ex\-ostrya server]\fR name, in the repository directory or outside it:
 .TP

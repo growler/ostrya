@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
-use ostrya_fetch::Proxy;
+use ostrya_fetch::{FetchRequest, Fetched, Fetcher, Proxy};
 use ostrya_remote::Error;
 use ostrya_remote::s3::{Address, Bucket, Credentials, Listed, Location, PutIfAbsent, S3Endpoint};
 use ostrya_rt::{TcpListener, block_on, spawn};
@@ -325,6 +325,79 @@ fn each_request_is_signed_and_carries_the_encoded_target() {
             seen[1].header("x-amz-content-sha256"),
             Some("1be2e452b46d7a0d9656bbb1f768e8248eba1b75baed65f5d99eafa948899a6a")
         );
+    });
+}
+
+/// A client over the fetcher of a pull, whose mirror is the repository URL,
+/// sends each request to the key under the bucket URL. It keeps the rules of
+/// an absent key and of an absent bucket, and the fetcher keeps its mirror.
+#[test]
+fn a_client_over_the_fetcher_of_a_pull_names_the_keys_under_the_bucket() {
+    block_on(async {
+        let stand_in = StandIn::start(Arc::new(|seen: &Seen, _| {
+            if seen.target.contains("list-type=2") {
+                respond(200, &list_page(&[], None))
+            } else if seen.target.ends_with("/config") {
+                respond(404, &s3_error("NoSuchKey"))
+            } else if seen.target.ends_with("/summary.sig") {
+                respond(404, &s3_error("NoSuchBucket"))
+            } else {
+                respond(200, b"bytes")
+            }
+        }))
+        .await;
+        let endpoint = stand_in.endpoint("s3://bucket/repo");
+        let fetcher = Fetcher::new(endpoint.pull_options().unwrap())
+            .await
+            .unwrap();
+        let bucket = Bucket::from_fetcher(&endpoint, fetcher.clone());
+        assert_eq!(bucket.location(), &endpoint.location);
+        let summary = bucket.get("summary", 1024).await.unwrap().unwrap();
+        assert_eq!(summary.bytes, b"bytes");
+        assert_eq!(bucket.get("config", 1024).await.unwrap(), None);
+        let err = bucket.get("summary.sig", 1024).await.unwrap_err();
+        let Error::S3 { status, code, .. } = &err else {
+            panic!("{err}");
+        };
+        assert_eq!(*status, 404);
+        assert_eq!(code.as_deref(), Some("NoSuchBucket"));
+        bucket.list("refs/heads/").await.unwrap();
+        bucket.put("refs/heads/main", b"0".to_vec()).await.unwrap();
+        let key = commit_key('a');
+        let Fetched::Body(mut body) = fetcher.fetch(FetchRequest::path(&key)).await.unwrap() else {
+            panic!("a fetch with no validators gives a body");
+        };
+        let mut bytes = Vec::new();
+        body.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes, b"bytes");
+
+        let seen = stand_in.seen();
+        let targets: Vec<(&str, &str)> = seen
+            .iter()
+            .map(|s| (s.method.as_str(), s.target.as_str()))
+            .collect();
+        let object = format!("/bucket/repo/{key}");
+        assert_eq!(
+            targets,
+            [
+                ("GET", "/bucket/repo/summary"),
+                ("GET", "/bucket/repo/config"),
+                ("GET", "/bucket/repo/summary.sig"),
+                (
+                    "GET",
+                    "/bucket/?list-type=2&prefix=repo%2Frefs%2Fheads%2F&encoding-type=url"
+                ),
+                ("PUT", "/bucket/repo/refs/heads/main"),
+                ("GET", object.as_str()),
+            ]
+        );
+        for request in &seen {
+            let authorization = request.header("authorization").unwrap();
+            assert!(
+                authorization.starts_with("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/"),
+                "{authorization}"
+            );
+        }
     });
 }
 

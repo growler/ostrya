@@ -2,7 +2,8 @@
 //!
 //! - [`Repo::pull_local`] reads a local repository directly.
 //! - [`Repo::pull`] fetches from an HTTP remote, or over ssh from a remote
-//!   with an ssh address.
+//!   with an ssh address. With the `s3` feature, it also fetches from a
+//!   bucket repository at an `s3://` address.
 //! - [`Repo::pull_with_session`] reads through a
 //!   [`PullSession`](crate::remote::PullSession) that the caller opened,
 //!   under a [`PullTrust`](crate::verify::PullTrust) that the caller gives.
@@ -168,6 +169,33 @@
 //! temp file before the refetch. The pull does not fetch a body again if
 //! it refused the body for its content. An object that spends the count
 //! fails its step, and the first failed step ends the pull.
+//!
+//! # Bucket repository
+//!
+//! With the `s3` feature, [`Repo::pull`] reads a bucket repository at an
+//! `s3://` address, and [`resolve_pull`](crate::endpoint::resolve_pull)
+//! gives its endpoint. The pull is an HTTP pull through a fetcher that signs
+//! each request with AWS Signature Version 4. The fetcher has one mirror,
+//! the URL of the bucket repository, and follows no redirect.
+//!
+//! [`Repo::pull`] and [`Repo::remote_fetch_summary`] read `summary.sig`,
+//! `summary`, and `config` through the bucket client of `ostrya-remote`,
+//! which shares the fetcher of the pull. The bucket client reads the S3
+//! error document of a failed request. So a wrong secret key gives
+//! [`Error::Remote`] with the S3 code `SignatureDoesNotMatch`, and an absent
+//! bucket is an error, not a repository with no summary. A session that the caller opens for
+//! [`Repo::pull_with_session`] reads these files through its fetcher.
+//!
+//! The credentials of the pull need the permissions `s3:GetObject` and
+//! `s3:ListBucket` on the bucket. Without `s3:ListBucket`, AWS answers the
+//! read of an absent key with 403 `AccessDenied` in place of 404. The pull
+//! reads a 403 as an error, so an absent optional file, for example
+//! `summary.sig` or a `.commitmeta` object, then fails the pull.
+//!
+//! The pull never asks a bucket repository for `_ostrya/refs/v1`.
+//! [`Repo::pull_collection`] refuses a remote at an `s3://` address before
+//! it resolves the endpoint, so the refusal reads no AWS variable and no AWS
+//! file.
 //!
 //! [`Fetcher`]: crate::fetch::Fetcher
 
@@ -873,7 +901,7 @@ pub struct PullOptions {
     pub overrides: crate::endpoint::EndpointOverrides,
     /// The number of fetches that a pull from a remote keeps in flight.
     ///
-    /// For an HTTP endpoint, a value replaces
+    /// For an HTTP endpoint and an S3 endpoint, a value replaces
     /// [`max_outstanding`](crate::fetch::FetcherOptions::max_outstanding) of
     /// the endpoint, and `None` keeps the value of the endpoint.
     /// [`resolve_pull`](crate::endpoint::resolve_pull) sets 8. For an ssh

@@ -32,19 +32,22 @@ receive = []
 # refspecs, and the object source over a repository, on the push wire protocol
 # of ostrya-remote.
 push = []
+# The pull from a bucket repository at an `s3://` address, with requests that
+# the SigV4 signer of ostrya-remote signs.
+s3 = ["ostrya-remote/s3"]
 # Builds xz from source and links it statically, so the build needs no
 # runtime liblzma. The feature is off by default, and a build without it
 # takes the system liblzma.
 lzma-static = ["liblzma/static"]
 
 # The crate documentation links items of the signing and verification
-# engines, of the receive policy, and of the push client, and a feature gates
-# each item. docs.rs adds these five features to the default set, and the links
-# then resolve.
+# engines, of the receive policy, of the push client, and of the S3 support,
+# and a feature gates each item. docs.rs adds these six features to the
+# default set, and the links then resolve.
 # The `tokio` and `lzma-static` features change no documented item, so the
 # list omits them.
 [package.metadata.docs.rs]
-features = ["sign-spki", "verify-gpg", "sign-gpg", "receive", "push"]
+features = ["sign-spki", "verify-gpg", "sign-gpg", "receive", "push", "s3"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]

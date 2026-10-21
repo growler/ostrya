@@ -57,6 +57,19 @@ skip if `rclone` is not on `PATH`. If `OSTRYA_REQUIRE_S3` is set, a missing
 OSTRYA_REQUIRE_S3=1 cargo test -p ostrya-remote --features s3
 ```
 
+The tests of a pull from an `s3://` address in `crates/ostrya/tests/pull_s3.rs`
+need the `s3` and `verify-gpg` features. They serve a copy of the `archive`
+fixture with `rclone serve s3`. One test signs the summary of the copy with
+the `ostree` command and a new key of `gpg`. A test skips if `rclone`, the
+`ostree` command, or `gpg` is absent. `OSTRYA_REQUIRE_S3`,
+`OSTRYA_REQUIRE_OSTREE`, and `OSTRYA_REQUIRE_GNUPG` turn each skip into a
+failure:
+
+```sh
+OSTRYA_REQUIRE_S3=1 OSTRYA_REQUIRE_OSTREE=1 OSTRYA_REQUIRE_GNUPG=1 \
+    cargo test -p ostrya --features s3,verify-gpg --test pull_s3
+```
+
 ## Golden fixtures
 
 The golden fixtures are in `tests/fixtures/`. The `ostree` tool wrote them,
@@ -191,8 +204,9 @@ test:
   ownership gate.
 - `OSTRYA_REQUIRE_MOUNT` -- `CAP_SYS_ADMIN` and fs-verity, for the mount
   tests (see "Tests").
-- `OSTRYA_REQUIRE_S3` -- `rclone`, for the tests of the bucket client
-  against `rclone serve s3` (see "Tests").
+- `OSTRYA_REQUIRE_S3` -- `rclone`, for the tests of the bucket client and
+  of the pull from an `s3://` address against `rclone serve s3` (see
+  "Tests").
 
 The CI test job sets `OSTRYA_REQUIRE_GNUPG` and `OSTRYA_REQUIRE_MULTIGROUP`.
 

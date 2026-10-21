@@ -1033,15 +1033,67 @@ impl Remote<'_> {
 
     /// Returns the `pull-url` key: the pull address of this remote.
     ///
-    /// The value is an ssh address, or an `http://` or `https://` URL. If the
-    /// key is set, a pull from this remote uses it and ignores `url`. The key
-    /// is an ostrya extension, and the `ostree` command does not read it.
+    /// The value is an ssh address, an `http://` or `https://` URL, or the
+    /// `s3://BUCKET[/PREFIX]` address of a bucket repository. If the key is
+    /// set, a pull from this remote uses it and ignores `url`. The key is an
+    /// ostrya extension, and the `ostree` command does not read it.
     ///
     /// # Errors
     ///
     /// [`Error::Core`] if the value holds a malformed escape sequence.
     pub fn pull_url(&self) -> Result<Option<String>> {
         self.string("pull-url")
+    }
+
+    /// Returns the `s3-region` key: the region of the signature of each
+    /// request to the `s3://` address of this remote.
+    ///
+    /// The key is an ostrya extension. [`resolve_pull`](crate::endpoint::resolve_pull)
+    /// states the order of the sources of the region.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Core`] if the value holds a malformed escape sequence.
+    pub fn s3_region(&self) -> Result<Option<String>> {
+        self.string("s3-region")
+    }
+
+    /// Returns the `s3-endpoint` key: the `http://` or `https://` URL of the
+    /// S3 server of the `s3://` address of this remote.
+    ///
+    /// The key is an ostrya extension.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Core`] if the value holds a malformed escape sequence.
+    pub fn s3_endpoint(&self) -> Result<Option<String>> {
+        self.string("s3-endpoint")
+    }
+
+    /// Returns the `s3-addressing` key: the addressing style of the bucket of
+    /// the `s3://` address of this remote, `path` or `virtual`.
+    ///
+    /// The key is an ostrya extension. The call returns the value as written.
+    /// A pull refuses each other value.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Core`] if the value holds a malformed escape sequence.
+    pub fn s3_addressing(&self) -> Result<Option<String>> {
+        self.string("s3-addressing")
+    }
+
+    /// Returns the `s3-profile` key: the profile of the shared AWS files for
+    /// the `s3://` address of this remote.
+    ///
+    /// The key is an ostrya extension. A profile that this key names turns
+    /// off the key pair, the region, and the endpoint of the environment.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Core`] if the value holds a malformed escape sequence.
+    pub fn s3_profile(&self) -> Result<Option<String>> {
+        self.string("s3-profile")
     }
 
     /// Returns the `send-command` key: the remote command of a pull over ssh.

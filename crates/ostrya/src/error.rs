@@ -504,6 +504,8 @@ pub enum Error {
     /// - an error of the session stream
     /// - on the client side, a push request that the client refuses
     ///   ([`InvalidInput`](crate::remote::Error::InvalidInput))
+    /// - with the `s3` feature, an error response of an S3 server to a read
+    ///   of the bucket client in a pull
     ///
     /// The variant is in every build.
     #[error(transparent)]

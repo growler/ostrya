@@ -19,6 +19,8 @@ pub mod modes;
 pub mod pipe;
 #[cfg(feature = "receive")]
 pub mod receive;
+#[cfg(feature = "s3")]
+pub mod s3;
 
 /// Returns the read rights of an anonymous client under the two implicit
 /// groups of a config with no client group.

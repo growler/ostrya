@@ -39,10 +39,10 @@ const S3_ADDRESS: &str = "an s3:// address needs credentials, which Endpoint::pa
 const S3_ADDRESS: &str = "an s3:// address needs the S3 support of ostrya-remote, and this build has none: turn on \
      the feature s3";
 
-/// The refusal of an S3 endpoint by a session constructor.
+/// The refusal of an S3 endpoint by a push session constructor.
 #[cfg(feature = "s3")]
-const S3_SESSION: &str = "an S3 endpoint opens no push session and no pull session: open its \
-     client with s3::Bucket::new";
+const S3_SESSION: &str = "an S3 endpoint opens no push session: open its client with \
+     s3::Bucket::new";
 
 /// The longest wait for a pending message after a failed write, and for the
 /// exit of the ssh client. It applies to a session that
@@ -93,10 +93,12 @@ pub enum Endpoint {
     /// A bucket repository: the location, the credentials, and the HTTP
     /// options of its client.
     ///
-    /// [`s3::Bucket::new`](crate::s3::Bucket::new) opens its client. No push
-    /// session and no pull session opens to it:
-    /// [`PushSession::prepare`], [`PushSession::connect`], and
-    /// [`PullSession::connect`] refuse it.
+    /// [`s3::Bucket::new`](crate::s3::Bucket::new) opens its client.
+    /// [`PullSession::connect`] opens an HTTP pull session to it, with the
+    /// options of
+    /// [`S3Endpoint::pull_options`](crate::s3::S3Endpoint::pull_options). No
+    /// push session opens to it: [`PushSession::prepare`] and
+    /// [`PushSession::connect`] refuse it.
     #[cfg(feature = "s3")]
     #[cfg_attr(docsrs, doc(cfg(feature = "s3")))]
     S3(crate::s3::S3Endpoint),
@@ -548,6 +550,11 @@ impl PullSession {
     /// [`Fetcher::new`](ostrya_fetch::Fetcher::new), and the result is
     /// [`PullSession::Http`]. The call sends no HTTP request.
     ///
+    /// For an `Endpoint::S3`, the call builds the fetcher from the options
+    /// that `S3Endpoint::pull_options` gives, and the result is
+    /// [`PullSession::Http`]. The fetcher signs each request. The call sends
+    /// no HTTP request.
+    ///
     /// Under the tokio backend, the call must run within a runtime that has
     /// the IO driver and the time driver enabled, as [`PushSession::connect`]
     /// states.
@@ -585,9 +592,13 @@ impl PullSession {
     ///   endpoint.
     /// - [`Error::InvalidInput`] if the options of an HTTP endpoint name no
     ///   mirror.
-    /// - [`Error::InvalidInput`] for an `Endpoint::S3`.
+    /// - [`Error::InvalidInput`] for an `Endpoint::S3` if the signer refuses
+    ///   its region, or if `opts` sets a field.
     /// - [`Error::Fetch`] if [`Fetcher::new`](ostrya_fetch::Fetcher::new)
-    ///   refuses the options of an HTTP endpoint.
+    ///   refuses the options of an HTTP endpoint or of an `Endpoint::S3`. An
+    ///   example is an S3 endpoint at an `http://` URL with
+    ///   [`allow_cleartext_credentials`](ostrya_fetch::FetcherOptions::allow_cleartext_credentials)
+    ///   set to `false`.
     pub async fn connect(endpoint: Endpoint, opts: StreamSessionOptions) -> Result<PullSession> {
         match endpoint {
             Endpoint::Ssh { address, options } => StreamSession::connect(&address, &options, opts)
@@ -599,7 +610,10 @@ impl PullSession {
                 Box::pin(http::prepare_pull(http, opts)).await?,
             )),
             #[cfg(feature = "s3")]
-            Endpoint::S3(_) => Err(Error::InvalidInput(S3_SESSION.into())),
+            // The S3 endpoint gives the options of a signed HTTP pull.
+            Endpoint::S3(s3) => Ok(PullSession::Http(
+                Box::pin(http::prepare_pull(s3.pull_options()?, opts)).await?,
+            )),
         }
     }
 }

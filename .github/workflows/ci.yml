@@ -187,6 +187,17 @@ jobs:
       - name: The push feature without the receive feature compiles
         run: cargo check -p ostrya --no-default-features --features smol,push
 
+      # The pull from an `s3://` address compiles without a GPG feature and
+      # without the push and receive features.
+      - name: The s3 feature without other features compiles
+        run: cargo check -p ostrya --no-default-features --features smol,s3
+
+      # A build without the s3 feature refuses an `s3://` address, and the
+      # refusal shows no userinfo of the address. The tests of these arms
+      # compile only without the feature.
+      - name: The endpoint tests without the s3 feature pass
+        run: cargo test -p ostrya --no-default-features --features smol --lib endpoint::
+
       # The HTTP server compiles on the smol backend with its own feature set,
       # and `ostrya serve` compiles without `ostrya receive`.
       - name: ostrya-server on the smol backend compiles
@@ -257,16 +268,16 @@ jobs:
       # The workspace entries of the runtime-dependent crates carry
       # `default-features = false`, and each dependent forwards `smol` and
       # `tokio` itself. So a tokio build of `ostrya` holds no `smol`, with and
-      # without the `receive` and the `push` features, and so does a tokio
-      # build of `ostrya-server`, of `ostrya-mount` with and without `server`,
-      # and of `ostrya-mountd`. `ostrya-remote` is a regular dependency of
+      # without the `receive`, the `push`, and the `s3` features, and so does
+      # a tokio build of `ostrya-server`, of `ostrya-mount` with and without
+      # `server`, and of `ostrya-mountd`. `ostrya-remote` is a regular dependency of
       # `ostrya`, so each of these builds holds it. This fails when one path
       # turns the smol backend on.
       # `cargo tree -i` exits non-zero both when the package is absent and on
       # any other failure, so the step also reads the error text.
       - name: A tokio build holds no smol
         run: |
-          for build in ostrya:tokio ostrya:tokio,receive ostrya:tokio,push ostrya-server:tokio ostrya-mount:tokio ostrya-mount:tokio,server ostrya-mountd:tokio; do
+          for build in ostrya:tokio ostrya:tokio,receive ostrya:tokio,push ostrya:tokio,s3 ostrya-server:tokio ostrya-mount:tokio ostrya-mount:tokio,server ostrya-mountd:tokio; do
             package=${build%%:*}
             features=${build#*:}
             if out=$(cargo tree -p "$package" --no-default-features --features "$features" -i smol 2>&1); then

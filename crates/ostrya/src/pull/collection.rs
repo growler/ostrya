@@ -179,18 +179,30 @@ enum Transport {
     Ssh(Box<Endpoint>, StreamSessionOptions),
 }
 
+/// Returns the refusal of a remote at an `s3://` address by a pull of
+/// collection refs.
+#[cfg(feature = "s3")]
+fn s3_refusal() -> Error {
+    Error::Unsupported(
+        "a pull of collection refs takes an ssh or an HTTP remote, and this remote is an S3 \
+         bucket repository, which serves no collection ref"
+            .into(),
+    )
+}
+
 impl Transport {
     /// Returns the transport of `endpoint`, with the request limit
     /// `max_outstanding` of the caller.
     ///
     /// For an HTTP endpoint, the call builds the fetcher. For an ssh
     /// endpoint, it checks the command line of the ssh client. It sends no
-    /// request and starts no ssh client.
+    /// request and starts no ssh client. It refuses an S3 endpoint: a bucket
+    /// repository serves no collection ref and no ref listing.
     async fn new(endpoint: Endpoint, max_outstanding: Option<usize>) -> Result<Transport> {
         let (endpoint, stream) = session_options(endpoint, max_outstanding);
         Ok(match endpoint {
             Endpoint::Http(_) => {
-                let PullSession::Http(fetcher) = connect(endpoint, stream).await? else {
+                let PullSession::Http(fetcher) = connect(endpoint, stream).await?.session else {
                     unreachable!("an HTTP endpoint opens an HTTP session");
                 };
                 Transport::Http(fetcher)
@@ -202,6 +214,8 @@ impl Transport {
                 StreamSession::check_command_line(address, options)?;
                 Transport::Ssh(Box::new(endpoint), stream)
             }
+            #[cfg(feature = "s3")]
+            Endpoint::S3(_) => return Err(s3_refusal()),
             _ => {
                 return Err(crate::endpoint::neither_ssh_nor_http(
                     "a pull of collection refs",
@@ -215,7 +229,8 @@ impl Transport {
         match self {
             Transport::Http(fetcher) => Ok(PullSession::Http(fetcher.clone())),
             Transport::Ssh(endpoint, stream) => {
-                connect(Endpoint::clone(endpoint), stream.clone()).await
+                let connection = connect(Endpoint::clone(endpoint), stream.clone()).await?;
+                Ok(connection.session)
             }
         }
     }
@@ -410,6 +425,10 @@ impl Repo {
     /// - For each ssh remote, [`Error::Remote`] if the ssh command or the
     ///   send command is empty or holds only white space, or if the
     ///   `OSTRYA_SSH_COMMAND` environment variable is not UTF-8.
+    /// - With the `s3` feature, [`Error::Unsupported`] for a remote at an
+    ///   `s3://` address. A bucket repository serves no collection ref and
+    ///   no ref listing. The refusal comes before the resolution of the
+    ///   endpoint, so it reads no AWS variable and no AWS file.
     ///
     /// These errors stop the pull after the probe, before its first object
     /// request:
@@ -465,6 +484,12 @@ impl Repo {
         // stops the pull.
         let mut candidates = Vec::with_capacity(remotes.len());
         for name in first_of_each(remotes.iter().copied()) {
+            // The refusal of a bucket repository comes before the resolution,
+            // which reads the AWS environment and files.
+            #[cfg(feature = "s3")]
+            if crate::endpoint::pulls_from_s3(self.config(), name) {
+                return Err(s3_refusal());
+            }
             let endpoint = resolve_pull(Some(self.config()), name, opts.overrides.clone()).await?;
             let trust = PullTrust::from_remote(self, name, &opts.verify).await?;
             let transport = Transport::new(endpoint, opts.max_outstanding_fetches).await?;
@@ -552,7 +577,7 @@ impl Repo {
             };
             let pulled = self
                 .run_session(
-                    session,
+                    session.into(),
                     candidate.trust,
                     run,
                     Wanted::Pinned(&pinned),
@@ -748,7 +773,7 @@ async fn probe(candidate: &Candidate<'_>, id: &str, names: &[&str]) -> Result<Pr
     let http = matches!(session, PullSession::Http(_));
     // The probe reads files that a pull reads before its count starts, so it
     // counts no byte.
-    let source = RemoteSource::new(session, Vec::new());
+    let source = RemoteSource::new(session.into(), Vec::new());
     let verification = Verification::from_trust(candidate.trust.clone());
     match probe_source(&source, &verification, id, names, http).await {
         Ok((listed, summary)) => Ok(Probed {
@@ -1082,6 +1107,91 @@ mod tests {
 
     use super::*;
     use crate::fetch::FetcherOptions;
+
+    /// A pull of collection refs refuses an S3 endpoint, and names S3, before
+    /// it connects to the server.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn the_transport_refuses_an_s3_endpoint_before_a_request() {
+        use crate::remote::s3::{Address, Credentials, Location, S3Endpoint};
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let location = Location::new(
+            Address::parse("s3://bkt/repo").unwrap(),
+            "us-east-1",
+            Some(&url),
+            None,
+        )
+        .unwrap();
+        let credentials =
+            Credentials::new("AKIDEXAMPLE".into(), "SECRETEXAMPLE".into(), None).unwrap();
+        let mut s3 = S3Endpoint::new(location, credentials);
+        s3.http.allow_cleartext_credentials = true;
+        s3.http.proxy = crate::fetch::Proxy::None;
+        match ostrya_rt::block_on(Transport::new(Endpoint::S3(s3), None)) {
+            Err(Error::Unsupported(msg)) => assert!(msg.contains("S3"), "{msg}"),
+            Err(e) => panic!("{e:?}"),
+            Ok(_) => panic!("a collection pull from an S3 endpoint"),
+        }
+        assert_eq!(
+            listener.accept().map(drop).map_err(|e| e.kind()),
+            Err(std::io::ErrorKind::WouldBlock),
+            "the refusal connects to no server"
+        );
+    }
+
+    /// A pull of collection refs refuses a remote at an `s3://` address
+    /// before it resolves the endpoint, so the refusal reads no AWS file and
+    /// needs no key pair. The resolution of the remote here fails, whatever
+    /// the AWS environment and files hold: with no key pair, and with a key
+    /// pair, because the S3 endpoint is `http://` and the pull does not allow
+    /// cleartext credentials.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn a_collection_pull_refuses_an_s3_remote_before_the_resolution() {
+        let dir = std::env::temp_dir().join(format!(
+            "ostrya-collection-s3-{}-{}",
+            std::process::id(),
+            crate::write::unique()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        ostrya_rt::block_on(async {
+            drop(
+                Repo::create(&dir, crate::CreateOptions::new(crate::RepoMode::Archive))
+                    .await
+                    .unwrap(),
+            );
+            let mut config = std::fs::read_to_string(dir.join("config")).unwrap();
+            config.push_str(
+                "\n[remote \"bkt\"]\npull-url=s3://bkt/repo\ns3-endpoint=http://127.0.0.1:9\n",
+            );
+            std::fs::write(dir.join("config"), config).unwrap();
+            let repo = Repo::open(&dir).await.unwrap();
+            let mut opts = CollectionPullOptions::default();
+            opts.pull.refs = vec!["exampleos/stable".to_owned()];
+            match repo.pull_collection("org.example.Os", &["bkt"], opts).await {
+                Err(Error::Unsupported(msg)) => {
+                    assert!(msg.contains("S3 bucket repository"), "{msg}")
+                }
+                Err(e) => panic!("{e:?}"),
+                Ok(_) => panic!("a collection pull from an S3 remote"),
+            }
+            let resolved = crate::endpoint::resolve_pull_in(
+                Some(repo.config()),
+                "bkt",
+                EndpointOverrides::default(),
+                &crate::remote::s3::Environment::Variables(Vec::new()),
+            )
+            .await;
+            assert!(
+                matches!(resolved, Err(Error::InvalidInput(_))),
+                "{resolved:?}"
+            );
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn csum(byte: u8) -> Checksum {
         Checksum::from_bytes([byte; 32])

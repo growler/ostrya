@@ -3110,7 +3110,10 @@ mod tests {
         )
         .await
         .unwrap();
-        RemoteSource::new(crate::remote::PullSession::Stream(session), Vec::new())
+        RemoteSource::new(
+            crate::remote::PullSession::Stream(session).into(),
+            Vec::new(),
+        )
     }
 
     /// From a remote, the record file keeps each superblock and the
@@ -3340,7 +3343,10 @@ mod tests {
         let session = crate::remote::StreamSession::over_stream(input, output, Default::default())
             .await
             .unwrap();
-        let source = RemoteSource::new(crate::remote::PullSession::Stream(session), Vec::new());
+        let source = RemoteSource::new(
+            crate::remote::PullSession::Stream(session).into(),
+            Vec::new(),
+        );
         (source, requests)
     }
 

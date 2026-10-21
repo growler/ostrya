@@ -467,9 +467,75 @@ header on it, and the first one needs the crate `md-5` in a manifest.
 without the attribute a crate that matches each variant compiles alone and
 fails when another crate of the same build turns `s3` on. A variant with no
 feature gate was rejected: `S3Endpoint` and the types that it holds then
-compile in each build. The session constructors refuse `Endpoint::S3`, and
-`Endpoint::parse` refuses an `s3://` address, because the endpoint needs
-credentials that the parse does not read.
+compile in each build. The push session constructors refuse `Endpoint::S3`.
+`PullSession::connect` opens an HTTP pull session to it, with the fetcher
+options of `S3Endpoint::pull_options`. `Endpoint::parse` refuses an `s3://`
+address, because the endpoint needs credentials that the parse does not
+read.
+
+## The S3 pull
+
+`resolve_pull` gives `Endpoint::S3` for an `s3://` address, and the variant
+is the mark of a pull from a bucket repository. `Endpoint::Http` with a
+signer was rejected: such an endpoint has no mark of S3, and the pull needs
+the mark for two rules. The pull reads the root files through the bucket
+client, and `Repo::pull_collection` refuses the remote.
+
+The fetcher of the pull has the one mirror of the repository URL, the SigV4
+signer, and `max_redirects` set to 0. A redirect to another origin carries
+no signature, so a redirect of S3 to the region of the bucket fails at the
+other origin. With no redirect, the pull fails at the first answer, and the
+bucket client names the region.
+
+`summary.sig`, `summary`, and `config` go through `s3::Bucket::get`, and the
+objects, the deltas, and the ref files go through the signed fetcher of the
+pull. A fetch keeps no body of an error response, so through the fetcher a
+wrong secret key is a bare 403, and a 404 of an absent bucket reads as a
+repository with no summary. The bucket client reads the S3 error document.
+Thus a wrong secret key gives `Error::S3` with the code
+`SignatureDoesNotMatch`, a bucket of another region gives `Error::S3Region`,
+and 404 `NoSuchBucket` is an error. `ostrya::Error::Remote` carries each of
+them. `s3::Bucket::from_fetcher` opens the bucket client over a clone of
+the fetcher of the pull, so the pull builds one fetcher: one read of the
+trust store and one connection pool. A second fetcher from
+`s3::Bucket::new` was rejected: it reads the trust store again and opens its
+own connections. The bucket client names each request by its URL under the
+bucket URL, so it reads the keys of the repository through the fetcher
+whose mirror is the repository URL. The clone has no byte counter, so these
+reads do not count in `PullStats::bytes_transferred`, as the reads of the
+root files over HTTP do not.
+
+A pull from a bucket repository needs the permissions `s3:GetObject` and
+`s3:ListBucket` on the bucket. Without `s3:ListBucket`, AWS answers the read
+of an absent key with 403 `AccessDenied` in place of 404. The pull then fails
+at an absent optional file, for example `summary.sig` or the `.commitmeta`
+of a commit. A 403 stays an error: the same answer comes for a present key
+that the credentials cannot read, and a pull that reads it as absent
+continues without a signature or a file that the bucket holds.
+
+`EndpointOverrides` gets four fields with no feature gate: `s3_region`,
+`s3_endpoint`, `s3_addressing`, and `s3_profile`, each an `Option<String>`.
+A build without the feature `s3` has the same struct, so a caller that
+builds it compiles with and without the feature. `s3_addressing` is text,
+because the type `s3::Addressing` is behind the feature. The pull reads it
+with `Addressing::from_name` and refuses another value by the name
+`s3-addressing`. The keys of the same names follow the same rule. A field
+of the caller wins over its key, and `s3::resolve` gives each other source.
+
+An S3 field or an S3 key with an address that is not S3 is refused. An
+`s3://` address in the key `url` is refused, in each build, as an ssh
+address there is refused: the `ostree` command also reads `url`.
+
+`resolve_pull` refuses an `http://` S3 endpoint without
+`allow_cleartext_credentials`, because the signature is a credential. The
+check comes after the resolution, because the endpoint can come from the
+environment or from a profile. The rule applies to an S3 endpoint alone,
+and the resolution of a pull from an HTTP address does not change.
+
+`Repo::pull_collection` refuses an S3 remote before it resolves the
+endpoint, so the refusal reads no AWS variable and no AWS file. A bucket
+repository holds no collection ref, and no server answers `_ostrya/refs/v1`
+for it. `Repo::pull` does not send that request.
 
 ## The client access of `ostrya serve`
 

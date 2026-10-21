@@ -7,6 +7,13 @@
 //! If an HTTP request fails with a retryable failure, the HTTP source sends
 //! it again. `Repo::pull`, under `# Pull over ssh`, and
 //! `PullStats::bytes_transferred` state the rules that a caller sees.
+//!
+//! The HTTP source of a pull from an `s3://` address also holds a bucket
+//! client. It reads `summary.sig`, `summary`, and `config` through the
+//! bucket client, which reads the S3 error document of a failed request. So a
+//! wrong key, a bucket of another region, and an absent bucket give an S3
+//! error, and an absent bucket does not read as a repository with no
+//! summary. The bucket client counts no byte.
 
 use std::io;
 use std::pin::Pin;
@@ -19,10 +26,34 @@ use ostrya_core::RefSelector;
 
 use crate::error::{Error, Result};
 use crate::fetch::{Fetcher, Priority};
+#[cfg(feature = "s3")]
+use crate::remote::s3::Bucket;
 use crate::remote::{self, PullBody, PullSession, StreamSession};
 use crate::summary::{SUMMARY_FILE, SUMMARY_SIG_FILE};
 
 use super::http::{CONFIG_FILE, MAX_ROOT_FILE, fetch_optional, read_whole, ref_request_path};
+
+/// The session of a pull, and the bucket client of a pull from an `s3://`
+/// address.
+pub(crate) struct Connection {
+    /// The session.
+    pub(crate) session: PullSession,
+    /// The client of the bucket repository, which reads the files at the
+    /// root of the remote. It is `None` for each other remote.
+    #[cfg(feature = "s3")]
+    pub(crate) bucket: Option<Bucket>,
+}
+
+impl From<PullSession> for Connection {
+    /// Returns the connection of `session` with no bucket client.
+    fn from(session: PullSession) -> Connection {
+        Connection {
+            session,
+            #[cfg(feature = "s3")]
+            bucket: None,
+        }
+    }
+}
 
 /// The remote a pull reads from: the session of the pull, and the counters of
 /// the transferred bytes.
@@ -32,6 +63,10 @@ pub(crate) struct RemoteSource {
     session: PullSession,
     /// The counters that get the byte count of each body of a stream session.
     transferred: Vec<Arc<AtomicU64>>,
+    /// The client of the bucket repository of a pull from an `s3://`
+    /// address. It reads `summary.sig`, `summary`, and `config`.
+    #[cfg(feature = "s3")]
+    bucket: Option<Bucket>,
 }
 
 /// The transport of a remote source, for one request.
@@ -68,29 +103,28 @@ impl RootFiles {
     pub(crate) async fn config(&mut self, source: &RemoteSource) -> Result<Option<Vec<u8>>> {
         match self.config.take() {
             Some(config) => Ok(config),
-            None => {
-                source
-                    .read_optional(CONFIG_FILE, Priority::High, MAX_ROOT_FILE)
-                    .await
-            }
+            None => source.read_root(CONFIG_FILE).await,
         }
     }
 }
 
 impl RemoteSource {
-    /// Creates a source over `session`, which adds the byte count of each
-    /// body to each counter in `transferred`.
+    /// Creates a source over the session of `connection`, which adds the byte
+    /// count of each body to each counter in `transferred`.
     ///
     /// An HTTP session gets a handle on its fetcher with the counters. A
-    /// stream session adds the count of each body through [`Counted`].
-    pub(crate) fn new(session: PullSession, transferred: Vec<Arc<AtomicU64>>) -> RemoteSource {
-        let session = match session {
+    /// stream session adds the count of each body through [`Counted`]. The
+    /// bucket client of the connection gets no counter.
+    pub(crate) fn new(connection: Connection, transferred: Vec<Arc<AtomicU64>>) -> RemoteSource {
+        let session = match connection.session {
             PullSession::Http(fetcher) => PullSession::Http(fetcher.counted(transferred.clone())),
             stream => stream,
         };
         RemoteSource {
             session,
             transferred,
+            #[cfg(feature = "s3")]
+            bucket: connection.bucket,
         }
     }
 
@@ -128,6 +162,36 @@ impl RemoteSource {
         }
     }
 
+    /// Reads the file at `path` at the root of the remote whole, under
+    /// [`MAX_ROOT_FILE`], or returns `None` if the remote does not serve it.
+    ///
+    /// The bucket client reads the file if the source has one. Else the call
+    /// is [`read_optional`](RemoteSource::read_optional) at
+    /// [`Priority::High`].
+    async fn read_root(&self, path: &str) -> Result<Option<Vec<u8>>> {
+        #[cfg(feature = "s3")]
+        if let Some(bucket) = &self.bucket {
+            let object = bucket.get(path, MAX_ROOT_FILE).await.map_err(http_error)?;
+            return Ok(object.map(|object| object.bytes));
+        }
+        self.read_optional(path, Priority::High, MAX_ROOT_FILE)
+            .await
+    }
+
+    /// Reads the `summary` and the `summary.sig` of the remote over HTTP.
+    ///
+    /// The source asks for `summary.sig` first. The bucket client reads the
+    /// two files if the source has one.
+    async fn http_summary_files(&self) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>)> {
+        #[cfg(feature = "s3")]
+        if self.bucket.is_some() {
+            let signature = self.read_root(SUMMARY_SIG_FILE).await?;
+            let summary = self.read_root(SUMMARY_FILE).await?;
+            return Ok((summary, signature));
+        }
+        self.session.fetch_summary().await.map_err(http_error)
+    }
+
     /// Reads the `summary.sig` and the `summary` of the remote, and from the
     /// stream source also its `config`.
     ///
@@ -137,8 +201,7 @@ impl RemoteSource {
     pub(crate) async fn root_files(&self) -> Result<RootFiles> {
         match self.transfer() {
             Transfer::Http(_) => {
-                let (summary, signature) =
-                    self.session.fetch_summary().await.map_err(http_error)?;
+                let (summary, signature) = self.http_summary_files().await?;
                 Ok(RootFiles {
                     summary,
                     signature,
@@ -170,7 +233,7 @@ impl RemoteSource {
     /// requests in flight together.
     pub(crate) async fn summary_files(&self) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>)> {
         match self.transfer() {
-            Transfer::Http(_) => self.session.fetch_summary().await.map_err(http_error),
+            Transfer::Http(_) => self.http_summary_files().await,
             Transfer::Stream(stream) => {
                 let (signature, summary) = futures_lite::future::zip(
                     stream.read_optional(SUMMARY_SIG_FILE, MAX_ROOT_FILE),
@@ -380,7 +443,7 @@ mod tests {
             )
             .await
             .unwrap();
-            let source = RemoteSource::new(PullSession::Stream(session), Vec::new());
+            let source = RemoteSource::new(PullSession::Stream(session).into(), Vec::new());
             source
                 .read_optional("summary", Priority::High, 1 << 20)
                 .await

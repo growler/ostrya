@@ -3,15 +3,14 @@
 use std::collections::HashSet;
 use std::io::ErrorKind;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
 use futures_io::AsyncRead;
 use futures_lite::io::AsyncReadExt;
 use ostrya_fetch::{
-    Body, ErrorResponse, FetchRequest, Fetched, Fetcher, FetcherOptions, UploadBody, UploadMethod,
-    UploadRequest, Uploaded,
+    Body, ErrorResponse, FetchRequest, Fetched, Fetcher, UploadBody, UploadMethod, UploadRequest,
+    Uploaded,
 };
 use sha2::{Digest, Sha256};
 
@@ -20,7 +19,7 @@ use super::key::{
 };
 use super::sigv4::valid_region;
 use super::xml::{self, Doc, ErrorDoc, MAX_BODY, shown};
-use super::{Location, S3Endpoint, SigV4};
+use super::{Location, S3Endpoint};
 use crate::{Error, Result};
 
 /// The largest listing body and error body that the client reads: the limit
@@ -41,8 +40,9 @@ const MAX_EMPTY_PAGES: usize = 1000;
 /// The largest body of one `PUT`: 5 GiB, the S3 limit.
 const MAX_PUT: u64 = 5 * 1024 * 1024 * 1024;
 
-/// The largest capacity that a whole read reserves before the body arrives.
-/// A larger body grows the buffer as it arrives.
+/// The largest capacity that a whole read of a listing body or of an error
+/// body reserves before the body arrives. A larger body grows the buffer as
+/// it arrives.
 const MAX_RESERVE: u64 = XML_CAP;
 
 /// The capacity that a whole read of a body with no declared length reserves
@@ -55,10 +55,11 @@ const COMPARE_CHUNK: usize = 64 * 1024;
 
 /// The client of a bucket repository.
 ///
-/// [`Bucket::new`] opens it from an [`S3Endpoint`]. Each method takes a key
-/// or a list prefix relative to the prefix of the repository, and the client
-/// adds `PREFIX/`. A key in a result is relative to the prefix of the
-/// repository too.
+/// [`Bucket::new`] opens it from an [`S3Endpoint`], and
+/// [`Bucket::from_fetcher`] opens it over a fetcher that the caller built.
+/// Each method takes a key or a list prefix relative to the prefix of the
+/// repository, and the client adds `PREFIX/`. A key in a result is relative
+/// to the prefix of the repository too.
 ///
 /// # Keys
 ///
@@ -119,6 +120,9 @@ pub struct Bucket {
     fetcher: Fetcher,
     location: Location,
     max_retries: u32,
+    /// The bucket URL, if each request names its URL. It is `None` if the
+    /// request paths go under the one mirror of the fetcher, the bucket URL.
+    base: Option<String>,
 }
 
 impl std::fmt::Debug for Bucket {
@@ -285,7 +289,8 @@ impl Bucket {
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidInput`] if [`SigV4::new`] refuses the region.
+    /// - [`Error::InvalidInput`] if [`SigV4::new`](super::SigV4::new) refuses
+    ///   the region.
     /// - [`Error::Fetch`] if [`Fetcher::new`] refuses the options. An example
     ///   is an `http://` endpoint with
     ///   [`allow_cleartext_credentials`](ostrya_fetch::FetcherOptions::allow_cleartext_credentials)
@@ -294,19 +299,56 @@ impl Bucket {
     ///   token, or an `Authorization` header in the options.
     pub async fn new(endpoint: &S3Endpoint) -> Result<Bucket> {
         let location = endpoint.location.clone();
-        let signer = SigV4::new(endpoint.credentials.clone(), location.region())?;
-        let options = FetcherOptions {
-            mirrors: vec![location.bucket_url()],
-            signer: Some(Arc::new(signer)),
-            max_redirects: 0,
-            ..endpoint.http.clone()
-        };
+        let options = endpoint.signed_options(location.bucket_url())?;
         let fetcher = Fetcher::new(options).await.map_err(Error::Fetch)?;
         Ok(Bucket {
             fetcher,
             location,
             max_retries: endpoint.http.max_retries,
+            base: None,
         })
+    }
+
+    /// Opens the client of the bucket repository of `endpoint` over
+    /// `fetcher`.
+    ///
+    /// The call builds no fetcher and sends no request. The client shares
+    /// the connection pool, the admission limit, and the counters of
+    /// `fetcher`. The client names each request by its URL under the
+    /// [`bucket_url`](Location::bucket_url) of the location, so it does not
+    /// use the mirrors of `fetcher`. An example of `fetcher` is the fetcher
+    /// of a pull, from the options that
+    /// [`pull_options`](S3Endpoint::pull_options) gives, whose mirror is the
+    /// [`repository_url`](Location::repository_url).
+    ///
+    /// The client takes the location and the retry count of `endpoint`.
+    /// `fetcher` must sign each request with the credentials and the region
+    /// of `endpoint`, and follow no redirect, as the fetcher of
+    /// [`Bucket::new`] does. The call cannot check this.
+    ///
+    /// # Examples
+    ///
+    /// ```no_run
+    /// use ostrya_fetch::Fetcher;
+    /// use ostrya_remote::s3::{Bucket, Environment, S3Endpoint, Settings};
+    /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    /// let endpoint =
+    ///     S3Endpoint::resolve("s3://builds/exampleos", &Settings::default(), &Environment::Process)
+    ///         .await?;
+    /// let fetcher = Fetcher::new(endpoint.pull_options()?).await?;
+    /// let bucket = Bucket::from_fetcher(&endpoint, fetcher.clone());
+    /// // The fetcher reads the objects under the repository URL. The client
+    /// // reads `summary` with the S3 rules of an absent key and of an error.
+    /// let summary = bucket.get("summary", 1 << 20).await?;
+    /// # Ok(()) }
+    /// ```
+    pub fn from_fetcher(endpoint: &S3Endpoint, fetcher: Fetcher) -> Bucket {
+        Bucket {
+            fetcher,
+            location: endpoint.location.clone(),
+            max_retries: endpoint.http.max_retries,
+            base: Some(endpoint.location.bucket_url()),
+        }
     }
 
     /// Returns the location of the bucket repository.
@@ -342,10 +384,11 @@ impl Bucket {
         check_key(key)?;
         let full = self.full_key(key);
         let path = encode_path(&full);
+        let target = self.target(&path, "");
         let mut refetch = self.fetcher.refetching(FetchRequest {
             max_size: Some(max_size),
             max_error_body: Some(XML_CAP),
-            ..FetchRequest::path(&path)
+            ..target.fetch()
         });
         loop {
             let mut body = match refetch.fetch().await {
@@ -358,7 +401,9 @@ impl Bucket {
             };
             let etag = body.validators().etag.clone();
             let declared = body.content_length();
-            match read_whole(&mut body, declared, max_size).await {
+            // The fetcher refuses a declared length over `max_size`, so the
+            // read reserves a declared length whole.
+            match read_whole(&mut body, declared, max_size, max_size).await {
                 Ok(bytes) => return Ok(Some(Object { bytes, etag })),
                 Err(e) if e.kind() == ErrorKind::FileTooLarge => {
                     return Err(too_large(&full, max_size));
@@ -386,11 +431,12 @@ impl Bucket {
         check_key(key)?;
         let full = self.full_key(key);
         let path = encode_path(&full);
+        let target = self.target(&path, "");
         let fetched = self
             .fetcher
             .fetch(FetchRequest {
                 max_error_body: Some(XML_CAP),
-                ..FetchRequest::path(&path)
+                ..target.fetch()
             })
             .await;
         match fetched {
@@ -808,10 +854,11 @@ impl Bucket {
 
     /// Fetches the listing of `query` on the bucket, and returns its body.
     async fn fetch_listing(&self, query: &str) -> Result<Vec<u8>> {
+        let target = self.target("", query);
         let mut refetch = self.fetcher.refetching(FetchRequest {
             max_size: Some(XML_CAP),
             max_error_body: Some(XML_CAP),
-            ..FetchRequest::path_query("", query)
+            ..target.fetch()
         });
         loop {
             let mut body = match refetch.fetch().await {
@@ -828,7 +875,7 @@ impl Bucket {
                 Err(e) => return Err(Error::Fetch(e)),
             };
             let declared = body.content_length();
-            match read_whole(&mut body, declared, XML_CAP).await {
+            match read_whole(&mut body, declared, XML_CAP, MAX_RESERVE).await {
                 Ok(bytes) => return Ok(bytes),
                 Err(e) if e.kind() == ErrorKind::FileTooLarge => {
                     return Err(self.listing_too_large());
@@ -850,11 +897,12 @@ impl Bucket {
         body: UploadBody,
         headers: &[(String, String)],
     ) -> Result<Sent> {
+        let target = self.target(path, "");
         let request = UploadRequest {
             method,
             max_response: XML_CAP,
             headers,
-            ..UploadRequest::path(path, body)
+            ..target.upload(body)
         };
         match self.fetcher.upload(request).await {
             Ok(uploaded) => Ok(Sent::Reply(read_reply(uploaded).await)),
@@ -879,9 +927,10 @@ impl Bucket {
     ) -> Result<Compared> {
         let size = body.as_bytes().map_or(0, <[u8]>::len) as u64;
         let path = encode_path(full);
+        let target = self.target(&path, "");
         let mut refetch = self.fetcher.refetching(FetchRequest {
             max_error_body: Some(XML_CAP),
-            ..FetchRequest::path(&path)
+            ..target.fetch()
         });
         let (stored, etag) = loop {
             let mut stream = match refetch.fetch().await {
@@ -1025,6 +1074,16 @@ impl Bucket {
         Ok(decoded)
     }
 
+    /// Returns the target of a request to the encoded path `path`, relative
+    /// to the bucket URL, with the query `query`. An empty query is no query.
+    fn target<'a>(&self, path: &'a str, query: &'a str) -> RequestTarget<'a> {
+        match &self.base {
+            None => RequestTarget::Mirror { path, query },
+            Some(base) if query.is_empty() => RequestTarget::Url(format!("{base}/{path}")),
+            Some(base) => RequestTarget::Url(format!("{base}/{path}?{query}")),
+        }
+    }
+
     /// Returns the prefix of each key of the repository: `PREFIX/`, or empty
     /// for an address with no prefix.
     fn repository_prefix(&self) -> String {
@@ -1054,6 +1113,40 @@ impl Bucket {
             "S3: a listing page of {} is larger than {XML_CAP} bytes",
             self.location.address()
         ))
+    }
+}
+
+/// The target of one request of the client.
+enum RequestTarget<'a> {
+    /// A path and a query under the one mirror of the fetcher, the bucket
+    /// URL. An empty query is no query.
+    Mirror {
+        /// The encoded path.
+        path: &'a str,
+        /// The query.
+        query: &'a str,
+    },
+    /// The URL of the request, under the bucket URL.
+    Url(String),
+}
+
+impl RequestTarget<'_> {
+    /// Returns a fetch of the target with the default of each other field.
+    fn fetch(&self) -> FetchRequest<'_> {
+        match self {
+            RequestTarget::Mirror { path, query: "" } => FetchRequest::path(path),
+            RequestTarget::Mirror { path, query } => FetchRequest::path_query(path, query),
+            RequestTarget::Url(url) => FetchRequest::url(url),
+        }
+    }
+
+    /// Returns an upload of `body` to the target with the default of each
+    /// other field. An upload of the client carries no query.
+    fn upload(&self, body: UploadBody) -> UploadRequest<'_> {
+        match self {
+            RequestTarget::Mirror { path, .. } => UploadRequest::path(path, body),
+            RequestTarget::Url(url) => UploadRequest::url(url, body),
+        }
     }
 }
 
@@ -1093,7 +1186,9 @@ async fn read_reply(uploaded: Uploaded) -> Reply {
     let body = if withheld {
         None
     } else {
-        read_whole(&mut body, declared, XML_CAP).await.ok()
+        read_whole(&mut body, declared, XML_CAP, MAX_RESERVE)
+            .await
+            .ok()
     };
     Reply {
         status,
@@ -1138,18 +1233,19 @@ fn is_absent(status: u16, body: Option<&[u8]>) -> bool {
 /// with [`ErrorKind::FileTooLarge`].
 ///
 /// The vector reserves the `declared` length and one byte for the end of
-/// the body, up to [`MAX_RESERVE`] bytes before the body arrives. With no
-/// declared length, it reserves [`FIRST_READ`] bytes. It then doubles as the
-/// bytes arrive, and its capacity never passes the declared length or
-/// `limit` by more than one byte.
+/// the body, up to `reserve` bytes before the body arrives. With no
+/// declared length, it reserves [`FIRST_READ`] bytes, up to `reserve`. It
+/// then doubles as the bytes arrive, and its capacity never passes the
+/// declared length or `limit` by more than one byte.
 async fn read_whole(
     body: &mut (impl AsyncRead + Unpin),
     declared: Option<u64>,
     limit: u64,
+    reserve: u64,
 ) -> std::io::Result<Vec<u8>> {
     let most = declared.map_or(limit, |declared| declared.min(limit));
     let ceiling = usize::try_from(most.saturating_add(1)).unwrap_or(usize::MAX);
-    let first = usize::try_from(declared.unwrap_or(FIRST_READ).min(most).min(MAX_RESERVE))
+    let first = usize::try_from(declared.unwrap_or(FIRST_READ).min(most).min(reserve))
         .unwrap_or(0)
         .saturating_add(1);
     let mut bytes = vec![0u8; first];
@@ -1262,18 +1358,76 @@ mod tests {
             // No declared length: the vector doubles up to the limit and one
             // byte.
             let mut reader = futures_lite::io::Cursor::new(data.clone());
-            let bytes = read_whole(&mut reader, None, XML_CAP).await.unwrap();
+            let bytes = read_whole(&mut reader, None, XML_CAP, MAX_RESERVE)
+                .await
+                .unwrap();
             assert_eq!(bytes.len(), data.len());
             assert!(bytes.capacity() <= data.len() + 1, "{}", bytes.capacity());
             // A declared length: the vector reserves it and one byte.
             let mut reader = futures_lite::io::Cursor::new(data[..3000].to_vec());
-            let bytes = read_whole(&mut reader, Some(3000), XML_CAP).await.unwrap();
+            let bytes = read_whole(&mut reader, Some(3000), XML_CAP, MAX_RESERVE)
+                .await
+                .unwrap();
             assert_eq!(bytes.len(), 3000);
             assert!(bytes.capacity() <= 3001, "{}", bytes.capacity());
             // A body past the limit fails.
             let mut reader = futures_lite::io::Cursor::new(vec![b'x'; 11]);
-            let err = read_whole(&mut reader, None, 10).await.unwrap_err();
+            let err = read_whole(&mut reader, None, 10, MAX_RESERVE)
+                .await
+                .unwrap_err();
             assert_eq!(err.kind(), ErrorKind::FileTooLarge);
+        });
+    }
+
+    /// A read with a reserve over 4 MiB reserves a declared length whole, at
+    /// once. With no declared length, it reserves 8 KiB first.
+    #[test]
+    fn a_whole_read_reserves_a_declared_length_at_once() {
+        ostrya_rt::block_on(async {
+            let size = 2 * XML_CAP as usize + 5;
+            let limit = 4 * XML_CAP;
+            /// A reader that records the length of the buffer of its first
+            /// read.
+            struct First {
+                data: futures_lite::io::Cursor<Vec<u8>>,
+                first: Option<usize>,
+            }
+            impl AsyncRead for First {
+                fn poll_read(
+                    mut self: Pin<&mut Self>,
+                    cx: &mut Context<'_>,
+                    buf: &mut [u8],
+                ) -> Poll<std::io::Result<usize>> {
+                    self.first.get_or_insert(buf.len());
+                    Pin::new(&mut self.data).poll_read(cx, buf)
+                }
+            }
+            let mut reader = First {
+                data: futures_lite::io::Cursor::new(vec![b'x'; size]),
+                first: None,
+            };
+            let bytes = read_whole(&mut reader, Some(size as u64), limit, limit)
+                .await
+                .unwrap();
+            assert_eq!(bytes.len(), size);
+            assert_eq!(reader.first, Some(size + 1));
+            assert!(bytes.capacity() <= size + 1, "{}", bytes.capacity());
+            // The listing reserve caps the first read at 4 MiB.
+            let mut reader = First {
+                data: futures_lite::io::Cursor::new(vec![b'x'; size]),
+                first: None,
+            };
+            read_whole(&mut reader, Some(size as u64), limit, MAX_RESERVE)
+                .await
+                .unwrap();
+            assert_eq!(reader.first, Some(XML_CAP as usize + 1));
+            // No declared length: 8 KiB first, whatever the reserve.
+            let mut reader = First {
+                data: futures_lite::io::Cursor::new(vec![b'x'; size]),
+                first: None,
+            };
+            read_whole(&mut reader, None, limit, limit).await.unwrap();
+            assert_eq!(reader.first, Some(FIRST_READ as usize + 1));
         });
     }
 

@@ -129,7 +129,7 @@ The keys of a group \fB\%[remote "NAME"]\fR.
 The base URL of a pull over HTTP: \fB\%http://\fR or \fB\%https://\fR.
 When \fB\%pull\-url\fR is set, a pull uses it in place of this key.
 When \fB\%push\-url\fR is absent, a push uses this key if it starts with \fB\%http://\fR or \fB\%https://\fR.
-A pull refuses an ssh address in this key.
+A pull refuses an ssh address and an \fB\%s3://\fR address in this key.
 .TP
 \fB\%branches\fR (list)
 The refs that \fB\%ostrya pull NAME\fR fetches when the command names no ref.
@@ -196,8 +196,11 @@ These keys are extensions of ostrya.
 The \fB\%ostree\fR tool keeps them and ignores them.
 .TP
 \fB\%pull\-url\fR (string)
-The pull address: \fB\%ssh://[USER@]HOST[:PORT]/PATH\fR, \fB\%[USER@]HOST:PATH\fR, or an \fB\%http://\fR or \fB\%https://\fR URL.
+The pull address: \fB\%ssh://[USER@]HOST[:PORT]/PATH\fR, \fB\%[USER@]HOST:PATH\fR, an \fB\%http://\fR or \fB\%https://\fR URL, or \fB\%s3://BUCKET[/PREFIX]\fR.
 It has precedence over \fB\%url\fR, and \fB\%ostrya pull \-\-url\fR has precedence over it.
+A value that starts with \fB\%s3://\fR is the address of a bucket repository of an S3 server.
+The \fB\%ostrya\fR command of this release refuses such an address.
+A pull through the ostrya library built with its feature \fB\%s3\fR reads it.
 A value that starts with \fB\%ssh://\fR, or that holds no \fB\%://\fR, is an ssh address.
 A pull gives each other value to the HTTP client, which refuses a scheme other than \fB\%http\fR and \fB\%https\fR.
 A remote that the \fB\%ostree\fR tool also reads must keep an HTTP \fB\%url\fR.
@@ -205,6 +208,7 @@ A remote that the \fB\%ostree\fR tool also reads must keep an HTTP \fB\%url\fR.
 \fB\%push\-url\fR (string)
 The push address, in the forms of \fB\%pull\-url\fR.
 If this key is absent and \fB\%url\fR does not start with \fB\%http://\fR or \fB\%https://\fR, a push to the remote fails.
+A push refuses an \fB\%s3://\fR address.
 .TP
 \fB\%ssh\-command\fR (string, default ssh)
 The ssh command line of a push or a pull over ssh, split at ASCII white space with no quoting rule.
@@ -232,6 +236,37 @@ The user name of a Basic credential, with the token as the password.
 Without it, the push sends the token as a bearer token.
 A name that is empty or holds \fB\%:\fR is refused, and so is a name with no token file.
 \fB\%\-\-push\-user\fR has precedence over it.
+.TP
+\fB\%s3\-region\fR (string, default us\-east\-1)
+The region of the signature of each request to an \fB\%s3://\fR address, and the region of the AWS endpoint.
+A server that does not check the region needs no value.
+A server that checks its own region, and an AWS bucket outside \fB\%us\-east\-1\fR, need it.
+.TP
+\fB\%s3\-endpoint\fR (string)
+The \fB\%http://\fR or \fB\%https://\fR URL of the S3 server, with no path, no query, and no userinfo.
+The default is the AWS endpoint of the region.
+A pull refuses an \fB\%http://\fR endpoint, unless the caller permits cleartext credentials, because the signature of each request is a credential.
+.TP
+\fB\%s3\-addressing\fR (path or virtual)
+The addressing style of the bucket: the bucket in the path of each URL, or in the host name.
+The default is \fB\%virtual\fR for the AWS endpoint, and \fB\%path\fR for an \fB\%s3\-endpoint\fR and for a bucket name that holds a \fB\%.\fR.
+Each other value is refused.
+.TP
+\fB\%s3\-profile\fR (string)
+The profile of the shared AWS files of \fB\%ostrya\-repo\fR(5).
+The default is \fB\%AWS_PROFILE\fR, else \fB\%default\fR.
+A profile that this key names turns off the key pair, the region, and the endpoint of the environment.
+.PP
+The \fB\%ostrya\fR command of this release refuses an \fB\%s3://\fR address.
+The S3 keys, and the rules of a pull from an \fB\%s3://\fR address on this page, apply to a pull through the ostrya library built with its feature \fB\%s3\fR.
+.PP
+A pull refuses an S3 key in a remote whose \fB\%pull\-url\fR and \fB\%push\-url\fR hold no \fB\%s3://\fR address.
+So a remote can pull a bucket over its \fB\%https://\fR URL in \fB\%url\fR, and keep an \fB\%s3://\fR address in \fB\%push\-url\fR.
+For each S3 setting, the first source that sets it wins: the key, the environment, the profile in the shared config file, and the default.
+.PP
+The key pair of a pull from an \fB\%s3://\fR address needs the permissions \fB\%s3:GetObject\fR and \fB\%s3:ListBucket\fR on the bucket.
+Without \fB\%s3:ListBucket\fR, AWS answers the read of an absent key with 403 \fB\%AccessDenied\fR in place of 404.
+The pull reads a 403 as an error, so an absent optional file, for example \fB\%summary.sig\fR or a \fB\%.commitmeta\fR object, then stops the pull.
 .PP
 For an ssh address, a push reads \fB\%ssh\-command\fR and \fB\%receive\-command\fR, and ignores the HTTP keys.
 For an HTTP address, a push reads \fB\%push\-token\-file\fR, \fB\%push\-user\fR, \fB\%proxy\fR, and the TLS keys.
@@ -239,6 +274,8 @@ For an \fB\%http://\fR address, a push reads no file that a TLS key names, and d
 .PP
 For an ssh address, a pull reads \fB\%ssh\-command\fR and \fB\%send\-command\fR, and ignores \fB\%proxy\fR and the TLS keys.
 For an HTTP address, a pull ignores \fB\%ssh\-command\fR and \fB\%send\-command\fR.
+For an \fB\%s3://\fR address, a pull reads the S3 keys, \fB\%proxy\fR, and the TLS keys, and ignores \fB\%ssh\-command\fR, \fB\%send\-command\fR, \fB\%push\-token\-file\fR, and \fB\%push\-user\fR.
+It signs each request with the key pair of the environment or of the shared AWS files.
 .PP
 A push or a pull reads each file that it uses one time, before the first request.
 If ostrya cannot read a file that a TLS key or \fB\%push\-token\-file\fR names, the error names the key and the path, and holds no byte of the file.
@@ -718,6 +755,29 @@ ostrya does not read the remote groups in \fB\%remotes.d/\fR directories.
 \fB\%OSTRYA_SSH_COMMAND\fR
 The ssh command line.
 It has precedence over the \fB\%ssh\-command\fR key.
+.TP
+\fB\%AWS_ACCESS_KEY_ID\fR, \fB\%AWS_SECRET_ACCESS_KEY\fR, \fB\%AWS_SESSION_TOKEN\fR
+The key pair that signs each request to an \fB\%s3://\fR address, and its session token.
+They have precedence over the shared AWS files.
+.TP
+\fB\%AWS_REGION\fR, \fB\%AWS_DEFAULT_REGION\fR
+The region of an \fB\%s3://\fR address, if \fB\%s3\-region\fR is absent.
+\fB\%AWS_REGION\fR has precedence.
+.TP
+\fB\%AWS_ENDPOINT_URL_S3\fR, \fB\%AWS_ENDPOINT_URL\fR
+The endpoint of an \fB\%s3://\fR address, if \fB\%s3\-endpoint\fR is absent.
+\fB\%AWS_ENDPOINT_URL_S3\fR has precedence.
+.TP
+\fB\%AWS_PROFILE\fR
+The profile of the shared AWS files, if \fB\%s3\-profile\fR is absent.
+.TP
+\fB\%AWS_SHARED_CREDENTIALS_FILE\fR, \fB\%AWS_CONFIG_FILE\fR
+The paths of the shared AWS credentials file and config file.
+.PP
+A profile that \fB\%s3\-profile\fR names turns off \fB\%AWS_ACCESS_KEY_ID\fR, \fB\%AWS_SECRET_ACCESS_KEY\fR, \fB\%AWS_SESSION_TOKEN\fR, \fB\%AWS_REGION\fR, \fB\%AWS_DEFAULT_REGION\fR, \fB\%AWS_ENDPOINT_URL_S3\fR, and \fB\%AWS_ENDPOINT_URL\fR.
+.PP
+The AWS variables apply to a pull through the ostrya library built with its feature \fB\%s3\fR.
+The \fB\%ostrya\fR command of this release refuses an \fB\%s3://\fR address, and does not read them.
 .TP
 \fB\%http_proxy\fR, \fB\%https_proxy\fR, \fB\%HTTPS_PROXY\fR, \fB\%all_proxy\fR, \fB\%ALL_PROXY\fR, \fB\%no_proxy\fR, \fB\%NO_PROXY\fR
 The proxy of a remote whose \fB\%proxy\fR key is empty or absent.

@@ -1869,10 +1869,12 @@ fn an_s3_address_is_refused_by_the_parse() {
     }
 }
 
-/// An S3 endpoint opens no push session and no pull session.
+/// An S3 endpoint opens no push session. It opens an HTTP pull session
+/// with a signed fetcher, and an `http://` endpoint needs the cleartext
+/// permission for it.
 #[cfg(feature = "s3")]
 #[test]
-fn the_session_constructors_refuse_an_s3_endpoint() {
+fn an_s3_endpoint_opens_a_pull_session_and_no_push_session() {
     let location = crate::s3::Location::new(
         crate::s3::Address::parse("s3://bucket/repo").unwrap(),
         "us-east-1",
@@ -1882,7 +1884,8 @@ fn the_session_constructors_refuse_an_s3_endpoint() {
     .unwrap();
     let credentials =
         crate::s3::Credentials::new("AKIDEXAMPLE".into(), "SECRETEXAMPLE".into(), None).unwrap();
-    let endpoint = Endpoint::S3(crate::s3::S3Endpoint::new(location, credentials));
+    let mut s3 = crate::s3::S3Endpoint::new(location, credentials);
+    let endpoint = Endpoint::S3(s3.clone());
     assert!(!format!("{endpoint:?}").contains("SECRETEXAMPLE"));
     let push = ostrya_rt::block_on(PushSession::prepare(endpoint.clone()));
     let Err(Error::InvalidInput(message)) = push else {
@@ -1894,7 +1897,29 @@ fn the_session_constructors_refuse_an_s3_endpoint() {
         StreamSessionOptions::default(),
     ));
     assert!(
-        matches!(pull, Err(Error::InvalidInput(_))),
-        "a pull session to an S3 endpoint"
+        matches!(pull, Err(Error::Fetch(_))),
+        "a signed pull to an http:// endpoint with no cleartext permission"
+    );
+    s3.http.allow_cleartext_credentials = true;
+    s3.http.proxy = ostrya_fetch::Proxy::None;
+    let pull = ostrya_rt::block_on(PullSession::connect(
+        Endpoint::S3(s3.clone()),
+        StreamSessionOptions::default(),
+    ));
+    match pull {
+        Ok(PullSession::Http(_)) => {}
+        Ok(_) => panic!("an S3 endpoint opens an HTTP pull session"),
+        Err(e) => panic!("{e}"),
+    }
+    let limited = ostrya_rt::block_on(PullSession::connect(
+        Endpoint::S3(s3),
+        StreamSessionOptions {
+            agent: None,
+            max_outstanding: Some(2),
+        },
+    ));
+    assert!(
+        matches!(limited, Err(Error::InvalidInput(_))),
+        "the request limit of an S3 pull is in its HTTP options"
     );
 }

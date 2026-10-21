@@ -9,7 +9,8 @@
 //!
 //! With the `s3` feature, the `s3` module signs S3 requests, reads the
 //! settings and the credentials of an S3 endpoint, and holds the client of a
-//! bucket repository.
+//! bucket repository. [`PullSession::connect`] opens a pull session to an S3
+//! endpoint, over HTTP with a fetcher that signs each request.
 //!
 //! # Entry points
 //!

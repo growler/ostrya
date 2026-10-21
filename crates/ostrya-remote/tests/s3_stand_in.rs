@@ -7,6 +7,7 @@
 #![cfg(feature = "s3")]
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -15,6 +16,7 @@ use ostrya_fetch::{FetchRequest, Fetched, Fetcher, Proxy};
 use ostrya_remote::Error;
 use ostrya_remote::s3::{Address, Bucket, Credentials, Listed, Location, PutIfAbsent, S3Endpoint};
 use ostrya_rt::{TcpListener, block_on, spawn};
+use sha2::{Digest, Sha256};
 
 /// A request as the stand-in read it.
 #[derive(Clone, Debug)]
@@ -1316,6 +1318,666 @@ fn a_whole_read_holds_no_spare_capacity() {
             object.bytes.capacity() <= 3001,
             "{}",
             object.bytes.capacity()
+        );
+    });
+}
+
+/// The part size of the multipart tests: 5 MiB, the smallest part size.
+const PART: usize = 5 << 20;
+
+/// The upload id of the multipart tests, which holds characters that a query
+/// encodes.
+const UPLOAD_ID: &str = "up+id/1=";
+
+/// The upload id of the multipart tests, as the query of a request gives it.
+const UPLOAD_QUERY: &str = "uploadId=up%2Bid%2F1%3D";
+
+/// Returns `len` bytes of a pattern.
+fn pattern(len: usize) -> Vec<u8> {
+    (0..len).map(|at| (at * 31 % 251) as u8).collect()
+}
+
+/// Returns `bytes` in lowercase hex.
+fn hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// Returns the part number of the query of `seen`, if it has one.
+fn part_number(seen: &Seen) -> Option<u32> {
+    seen.target
+        .split(['?', '&'])
+        .find_map(|pair| pair.strip_prefix("partNumber="))
+        .and_then(|number| number.parse().ok())
+}
+
+/// The answer of a stand-in that takes each request of a multipart upload.
+///
+/// The start gives [`UPLOAD_ID`], part `N` gives the `ETag` `"etag-N"`, the
+/// completion gives the `ETag` `"whole-3"`, an abort gives 204, and a `PUT`
+/// with no query gives the `ETag` `"single"`.
+fn multipart(seen: &Seen) -> Answer {
+    let query = seen.target.split_once('?').map(|(_, query)| query);
+    match (seen.method.as_str(), query) {
+        ("POST", Some("uploads")) => respond(
+            200,
+            format!(
+                "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <InitiateMultipartUploadResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                 <Bucket>bucket</Bucket><Key>k</Key><UploadId>{UPLOAD_ID}</UploadId>\
+                 </InitiateMultipartUploadResult>"
+            )
+            .as_bytes(),
+        ),
+        ("PUT", Some(_)) => {
+            let etag = format!("\"etag-{}\"", part_number(seen).unwrap());
+            respond_with(200, &[("ETag", &etag)], b"")
+        }
+        ("POST", Some(_)) => respond(
+            200,
+            b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+              <CompleteMultipartUploadResult><ETag>&quot;whole-3&quot;</ETag>\
+              </CompleteMultipartUploadResult>",
+        ),
+        ("DELETE", Some(_)) => respond(204, b""),
+        ("PUT", None) => respond_with(200, &[("ETag", "\"single\"")], b""),
+        _ => respond(400, &s3_error("InvalidRequest")),
+    }
+}
+
+/// Returns the method and the target of each request that `stand_in` read.
+fn requests(stand_in: &StandIn) -> Vec<(String, String)> {
+    stand_in
+        .seen()
+        .into_iter()
+        .map(|seen| (seen.method, seen.target))
+        .collect()
+}
+
+/// Returns the request of `method` to `target`, as [`requests`] gives it.
+fn request(method: &str, target: &str) -> (String, String) {
+    (method.to_owned(), target.to_owned())
+}
+
+#[test]
+fn a_body_of_at_most_one_part_goes_in_one_put() {
+    block_on(async {
+        let stand_in = StandIn::start(Arc::new(|seen: &Seen, _| multipart(seen))).await;
+        let bucket = stand_in.bucket("s3://bucket/repo").await;
+        let key = commit_key('d');
+        for len in [0, 100, PART] {
+            let body = pattern(len);
+            let etag = bucket
+                .put_stream(&key, &body[..], PART as u64)
+                .await
+                .unwrap();
+            assert_eq!(etag.as_deref(), Some("\"single\""));
+            let seen = stand_in.seen();
+            let last = seen.last().unwrap();
+            assert_eq!(last.body, body, "{len}");
+        }
+        let target = format!("/bucket/repo/{key}");
+        assert_eq!(requests(&stand_in), vec![request("PUT", &target); 3]);
+    });
+}
+
+#[test]
+fn a_part_size_out_of_the_s3_limits_sends_no_request() {
+    block_on(async {
+        let stand_in = StandIn::start(Arc::new(|seen: &Seen, _| multipart(seen))).await;
+        let bucket = stand_in.bucket("s3://bucket/repo").await;
+        for part_size in [0, PART as u64 - 1, (5 << 30) + 1] {
+            let err = bucket
+                .put_stream("config", &b"x"[..], part_size)
+                .await
+                .unwrap_err();
+            assert!(matches!(&err, Error::InvalidInput(_)), "{err}");
+        }
+        let err = bucket
+            .put_stream("objects/zz", &b"x"[..], PART as u64)
+            .await
+            .unwrap_err();
+        assert!(matches!(&err, Error::InvalidInput(_)), "{err}");
+        assert!(stand_in.seen().is_empty());
+    });
+}
+
+#[test]
+fn a_body_of_several_parts_goes_in_a_signed_multipart_upload() {
+    block_on(async {
+        let stand_in = StandIn::start(Arc::new(|seen: &Seen, _| multipart(seen))).await;
+        let endpoint = stand_in.endpoint("s3://bucket/repo");
+        let fetcher = Fetcher::new(endpoint.pull_options().unwrap())
+            .await
+            .unwrap();
+        let key = commit_key('d');
+        let body = pattern(2 * PART + PART / 2);
+        // A client whose requests go under the mirror of its fetcher, and a
+        // client that names the URL of each request.
+        let buckets = [
+            stand_in.bucket("s3://bucket/repo").await,
+            Bucket::from_fetcher(&endpoint, fetcher),
+        ];
+        for bucket in buckets {
+            let start = stand_in.seen().len();
+            let etag = bucket
+                .put_stream(&key, &body[..], PART as u64)
+                .await
+                .unwrap();
+            assert_eq!(etag.as_deref(), Some("\"whole-3\""));
+            let seen = stand_in.seen().split_off(start);
+            let object = format!("/bucket/repo/{key}");
+            let targets: Vec<(&str, &str)> = seen
+                .iter()
+                .map(|s| (s.method.as_str(), s.target.as_str()))
+                .collect();
+            assert_eq!(
+                targets,
+                [
+                    ("POST", format!("{object}?uploads").as_str()),
+                    (
+                        "PUT",
+                        format!("{object}?partNumber=1&{UPLOAD_QUERY}").as_str()
+                    ),
+                    (
+                        "PUT",
+                        format!("{object}?partNumber=2&{UPLOAD_QUERY}").as_str()
+                    ),
+                    (
+                        "PUT",
+                        format!("{object}?partNumber=3&{UPLOAD_QUERY}").as_str()
+                    ),
+                    ("POST", format!("{object}?{UPLOAD_QUERY}").as_str()),
+                ]
+            );
+            for (part, request) in body.chunks(PART).zip(&seen[1..4]) {
+                assert_eq!(request.body, part);
+            }
+            assert!(seen[0].body.is_empty());
+            assert_eq!(
+                String::from_utf8(seen[4].body.clone()).unwrap(),
+                "<CompleteMultipartUpload xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+                 <Part><PartNumber>1</PartNumber><ETag>\"etag-1\"</ETag></Part>\
+                 <Part><PartNumber>2</PartNumber><ETag>\"etag-2\"</ETag></Part>\
+                 <Part><PartNumber>3</PartNumber><ETag>\"etag-3\"</ETag></Part>\
+                 </CompleteMultipartUpload>"
+            );
+            for request in &seen {
+                let authorization = request.header("authorization").unwrap();
+                assert!(
+                    authorization.starts_with("AWS4-HMAC-SHA256 Credential=AKIDEXAMPLE/"),
+                    "{authorization}"
+                );
+                assert_eq!(
+                    request.header("x-amz-content-sha256"),
+                    Some(hex(&Sha256::digest(&request.body)).as_str())
+                );
+            }
+        }
+    });
+}
+
+#[test]
+fn a_refused_part_aborts_the_upload() {
+    block_on(async {
+        let stand_in = StandIn::start(Arc::new(|seen: &Seen, _| {
+            if part_number(seen) == Some(2) {
+                respond(400, &s3_error("InvalidArgument"))
+            } else {
+                multipart(seen)
+            }
+        }))
+        .await;
+        let bucket = stand_in.bucket("s3://bucket/repo").await;
+        let key = commit_key('d');
+        let body = pattern(2 * PART + PART / 2);
+        let err = bucket
+            .put_stream(&key, &body[..], PART as u64)
+            .await
+            .unwrap_err();
+        let full = format!("repo/{key}");
+        assert!(
+            matches!(
+                &err,
+                Error::S3 { status: 400, code: Some(code), key: Some(named), .. }
+                    if code == "InvalidArgument" && *named == full
+            ),
+            "{err}"
+        );
+        let object = format!("/bucket/{full}");
+        assert_eq!(
+            requests(&stand_in),
+            [
+                request("POST", &format!("{object}?uploads")),
+                request("PUT", &format!("{object}?partNumber=1&{UPLOAD_QUERY}")),
+                request("PUT", &format!("{object}?partNumber=2&{UPLOAD_QUERY}")),
+                request("DELETE", &format!("{object}?{UPLOAD_QUERY}")),
+            ]
+        );
+    });
+}
+
+#[test]
+fn a_part_that_meets_a_slow_down_is_sent_again() {
+    block_on(async {
+        let refused = Arc::new(AtomicBool::new(false));
+        let stand_in = StandIn::start(Arc::new(move |seen: &Seen, _| {
+            if part_number(seen) == Some(2) && !refused.swap(true, Ordering::SeqCst) {
+                respond(503, &s3_error("SlowDown"))
+            } else {
+                multipart(seen)
+            }
+        }))
+        .await;
+        let bucket = stand_in.bucket("s3://bucket/repo").await;
+        let key = commit_key('d');
+        let body = pattern(2 * PART + PART / 2);
+        let etag = bucket
+            .put_stream(&key, &body[..], PART as u64)
+            .await
+            .unwrap();
+        assert_eq!(etag.as_deref(), Some("\"whole-3\""));
+        let seen = stand_in.seen();
+        let second: Vec<&Seen> = seen
+            .iter()
+            .filter(|seen| part_number(seen) == Some(2))
+            .collect();
+        assert_eq!(second.len(), 2);
+        assert_eq!(second[0].body, &body[PART..2 * PART]);
+        assert_eq!(second[1].body, second[0].body);
+        assert_eq!(
+            second[0].header("x-amz-content-sha256"),
+            second[1].header("x-amz-content-sha256")
+        );
+        assert!(!seen.iter().any(|seen| seen.method == "DELETE"));
+    });
+}
+
+#[test]
+fn a_part_with_no_etag_aborts_the_upload() {
+    block_on(async {
+        let stand_in = StandIn::start(Arc::new(|seen: &Seen, _| {
+            if part_number(seen).is_some() {
+                respond(200, b"")
+            } else {
+                multipart(seen)
+            }
+        }))
+        .await;
+        let bucket = stand_in.bucket("s3://bucket/repo").await;
+        let key = commit_key('d');
+        let err = bucket
+            .put_stream(&key, &pattern(PART + 1)[..], PART as u64)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Transport(message) if message.contains("no ETag")),
+            "{err}"
+        );
+        let methods: Vec<String> = stand_in.seen().into_iter().map(|s| s.method).collect();
+        assert_eq!(methods, ["POST", "PUT", "DELETE"]);
+    });
+}
+
+/// A reader that gives the bytes of `data`, and then fails.
+struct FailingAfter {
+    data: futures_lite::io::Cursor<Vec<u8>>,
+}
+
+impl futures_io::AsyncRead for FailingAfter {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut [u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match std::pin::Pin::new(&mut self.data).poll_read(cx, buf) {
+            std::task::Poll::Ready(Ok(0)) => std::task::Poll::Ready(Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "the source failed",
+            ))),
+            other => other,
+        }
+    }
+}
+
+#[test]
+fn a_failed_read_of_the_body_aborts_the_upload() {
+    block_on(async {
+        let stand_in = StandIn::start(Arc::new(|seen: &Seen, _| multipart(seen))).await;
+        let bucket = stand_in.bucket("s3://bucket/repo").await;
+        let key = commit_key('d');
+        // A failure in the first part comes before any request.
+        let body = FailingAfter {
+            data: futures_lite::io::Cursor::new(pattern(100)),
+        };
+        let err = bucket
+            .put_stream(&key, body, PART as u64)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Io(e) if e.kind() == std::io::ErrorKind::TimedOut),
+            "{err}"
+        );
+        assert!(stand_in.seen().is_empty());
+        // A failure in the second part comes after the upload started.
+        let body = FailingAfter {
+            data: futures_lite::io::Cursor::new(pattern(PART + 100)),
+        };
+        let err = bucket
+            .put_stream(&key, body, PART as u64)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Io(e) if e.kind() == std::io::ErrorKind::TimedOut),
+            "{err}"
+        );
+        let methods: Vec<String> = stand_in.seen().into_iter().map(|s| s.method).collect();
+        assert_eq!(methods, ["POST", "PUT", "DELETE"]);
+    });
+}
+
+#[test]
+fn an_error_document_after_a_200_to_the_completion_is_sent_again() {
+    block_on(async {
+        let failed = Arc::new(AtomicBool::new(false));
+        let stand_in = StandIn::start(Arc::new(move |seen: &Seen, _| {
+            let completes = seen.method == "POST" && seen.target.ends_with(UPLOAD_QUERY);
+            if completes && !failed.swap(true, Ordering::SeqCst) {
+                respond(200, &s3_error("InternalError"))
+            } else {
+                multipart(seen)
+            }
+        }))
+        .await;
+        let bucket = stand_in.bucket("s3://bucket/repo").await;
+        let key = commit_key('d');
+        let body = pattern(PART + 1);
+        let etag = bucket
+            .put_stream(&key, &body[..], PART as u64)
+            .await
+            .unwrap();
+        assert_eq!(etag.as_deref(), Some("\"whole-3\""));
+        let seen = stand_in.seen();
+        let methods: Vec<&str> = seen.iter().map(|s| s.method.as_str()).collect();
+        assert_eq!(methods, ["POST", "PUT", "PUT", "POST", "POST"]);
+        assert_eq!(seen[3].body, seen[4].body);
+    });
+}
+
+/// The answer of a stand-in whose completion gets `unsure` first and 404
+/// `NoSuchUpload` after it. A `GET` of the key gets `object`, and each other
+/// request gets the answer of [`multipart`].
+fn completed_before(
+    unsure: fn() -> Answer,
+    object: Arc<dyn Fn() -> Answer + Send + Sync>,
+) -> Handler {
+    let first = Arc::new(AtomicBool::new(false));
+    Arc::new(move |seen: &Seen, _| {
+        let completes = seen.method == "POST" && seen.target.ends_with(UPLOAD_QUERY);
+        if completes && !first.swap(true, Ordering::SeqCst) {
+            unsure()
+        } else if completes {
+            respond(404, &s3_error("NoSuchUpload"))
+        } else if seen.method == "GET" {
+            object()
+        } else {
+            multipart(seen)
+        }
+    })
+}
+
+/// Returns the answer to a `GET` whose head declares `declared` bytes, with
+/// no byte of the body after it.
+fn declared_object(declared: usize) -> Arc<dyn Fn() -> Answer + Send + Sync> {
+    Arc::new(move || Answer::Cut {
+        status: 200,
+        declared,
+        body: Vec::new(),
+    })
+}
+
+#[test]
+fn an_unsure_completion_reads_the_key_after_no_such_upload() {
+    block_on(async {
+        let body = pattern(PART + 1);
+        let absent: Arc<dyn Fn() -> Answer + Send + Sync> =
+            Arc::new(|| respond(404, &s3_error("NoSuchKey")));
+        let cases = [
+            (declared_object(body.len()), None),
+            (
+                declared_object(body.len() - 1),
+                Some(format!("an object of {} bytes", body.len() - 1)),
+            ),
+            (absent, Some("no object".to_owned())),
+        ];
+        for (object, held) in cases {
+            let stand_in = StandIn::start(completed_before(|| Answer::Close, object)).await;
+            let bucket = stand_in.bucket("s3://bucket/repo").await;
+            let key = commit_key('d');
+            let outcome = bucket.put_stream(&key, &body[..], PART as u64).await;
+            let methods: Vec<String> = stand_in.seen().into_iter().map(|s| s.method).collect();
+            // The last answer of the upload is 404 `NoSuchUpload`, so no
+            // abort goes.
+            assert_eq!(methods, ["POST", "PUT", "PUT", "POST", "POST", "GET"]);
+            let Some(held) = held else {
+                assert_eq!(outcome.unwrap(), None);
+                continue;
+            };
+            let err = outcome.unwrap_err();
+            let expected = format!(
+                "is 404 NoSuchUpload after a request with no known outcome, and the key holds \
+                 {held}, not the {} bytes of the parts",
+                body.len()
+            );
+            assert!(
+                matches!(&err, Error::Transport(message) if message.contains(&expected)),
+                "{err}"
+            );
+        }
+    });
+}
+
+#[test]
+fn a_completion_that_meets_a_gateway_timeout_reads_the_key_after_no_such_upload() {
+    block_on(async {
+        let body = pattern(PART + 1);
+        let unsure = || respond(504, &s3_error("GatewayTimeout"));
+        let stand_in = StandIn::start(completed_before(unsure, declared_object(body.len()))).await;
+        let bucket = stand_in.bucket("s3://bucket/repo").await;
+        let key = commit_key('d');
+        let etag = bucket
+            .put_stream(&key, &body[..], PART as u64)
+            .await
+            .unwrap();
+        assert_eq!(etag, None);
+        let methods: Vec<String> = stand_in.seen().into_iter().map(|s| s.method).collect();
+        assert_eq!(methods, ["POST", "PUT", "PUT", "POST", "POST", "GET"]);
+    });
+}
+
+#[test]
+fn a_part_of_an_absent_upload_sends_no_abort() {
+    block_on(async {
+        let stand_in = StandIn::start(Arc::new(|seen: &Seen, _| {
+            if part_number(seen).is_some() {
+                respond(404, &s3_error("NoSuchUpload"))
+            } else {
+                multipart(seen)
+            }
+        }))
+        .await;
+        let bucket = stand_in.bucket("s3://bucket/repo").await;
+        let key = commit_key('d');
+        let err = bucket
+            .put_stream(&key, &pattern(PART + 1)[..], PART as u64)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                Error::S3 { status: 404, code: Some(code), .. } if code == "NoSuchUpload"
+            ),
+            "{err}"
+        );
+        let methods: Vec<String> = stand_in.seen().into_iter().map(|s| s.method).collect();
+        assert_eq!(methods, ["POST", "PUT"]);
+    });
+}
+
+#[test]
+fn a_start_whose_body_did_not_arrive_is_sent_again() {
+    block_on(async {
+        // The head of a 200 declares a body that does not arrive.
+        let cut = || Answer::Cut {
+            status: 200,
+            declared: 100,
+            body: b"<InitiateMultipart".to_vec(),
+        };
+        // The first start fails in transit, and the second one gives the
+        // upload id.
+        let failed = Arc::new(AtomicBool::new(false));
+        let stand_in = StandIn::start(Arc::new(move |seen: &Seen, _| {
+            let starts = seen.target.ends_with("?uploads");
+            if starts && !failed.swap(true, Ordering::SeqCst) {
+                cut()
+            } else {
+                multipart(seen)
+            }
+        }))
+        .await;
+        let bucket = stand_in.bucket("s3://bucket/repo").await;
+        let key = commit_key('d');
+        let body = pattern(PART + 1);
+        let etag = bucket
+            .put_stream(&key, &body[..], PART as u64)
+            .await
+            .unwrap();
+        assert_eq!(etag.as_deref(), Some("\"whole-3\""));
+        let methods: Vec<String> = stand_in.seen().into_iter().map(|s| s.method).collect();
+        assert_eq!(methods, ["POST", "POST", "PUT", "PUT", "POST"]);
+        // Each start fails in transit: the client sends it two times again,
+        // and then fails with no upload id to abort.
+        let stand_in = StandIn::start(Arc::new(move |seen: &Seen, _| {
+            if seen.target.ends_with("?uploads") {
+                cut()
+            } else {
+                multipart(seen)
+            }
+        }))
+        .await;
+        let bucket = stand_in.bucket("s3://bucket/repo").await;
+        let err = bucket
+            .put_stream(&key, &body[..], PART as u64)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Transport(message) if message.contains("did not arrive")),
+            "{err}"
+        );
+        let methods: Vec<String> = stand_in.seen().into_iter().map(|s| s.method).collect();
+        assert_eq!(methods, ["POST", "POST", "POST"]);
+    });
+}
+
+#[test]
+fn an_etag_or_an_upload_id_over_1_kib_is_refused() {
+    block_on(async {
+        let key = commit_key('d');
+        let body = pattern(PART + 1);
+        // An `ETag` of 1 KiB is taken, and one byte more is refused.
+        for (len, taken) in [(1024, true), (1025, false)] {
+            let etag = format!("\"{}\"", "e".repeat(len - 2));
+            let stand_in = StandIn::start(Arc::new(move |seen: &Seen, _| {
+                if part_number(seen).is_some() {
+                    respond_with(200, &[("ETag", &etag)], b"")
+                } else {
+                    multipart(seen)
+                }
+            }))
+            .await;
+            let bucket = stand_in.bucket("s3://bucket/repo").await;
+            let outcome = bucket.put_stream(&key, &body[..], PART as u64).await;
+            let methods: Vec<String> = stand_in.seen().into_iter().map(|s| s.method).collect();
+            if taken {
+                assert_eq!(outcome.unwrap().as_deref(), Some("\"whole-3\""));
+                assert_eq!(methods, ["POST", "PUT", "PUT", "POST"]);
+            } else {
+                let err = outcome.unwrap_err();
+                assert!(
+                    matches!(
+                        &err,
+                        Error::Transport(message)
+                            if message.contains("an ETag of more than 1024 bytes")
+                    ),
+                    "{err}"
+                );
+                assert_eq!(methods, ["POST", "PUT", "DELETE"]);
+            }
+        }
+        // An upload id of more than 1 KiB is refused, and the client sends
+        // no part.
+        let stand_in = StandIn::start(Arc::new(|seen: &Seen, _| {
+            if seen.target.ends_with("?uploads") {
+                let id = "u".repeat(1025);
+                respond(
+                    200,
+                    format!(
+                        "<InitiateMultipartUploadResult><UploadId>{id}</UploadId>\
+                         </InitiateMultipartUploadResult>"
+                    )
+                    .as_bytes(),
+                )
+            } else {
+                multipart(seen)
+            }
+        }))
+        .await;
+        let bucket = stand_in.bucket("s3://bucket/repo").await;
+        let err = bucket
+            .put_stream(&key, &body[..], PART as u64)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                Error::Transport(message) if message.contains("UploadId has more than 1024 bytes")
+            ),
+            "{err}"
+        );
+        let methods: Vec<String> = stand_in.seen().into_iter().map(|s| s.method).collect();
+        assert_eq!(methods, ["POST"]);
+    });
+}
+
+#[test]
+fn an_abort_of_an_absent_upload_succeeds() {
+    block_on(async {
+        let stand_in = StandIn::start(Arc::new(|seen: &Seen, _| {
+            if seen.target.ends_with("uploadId=live") {
+                respond(204, b"")
+            } else if seen.target.ends_with("uploadId=gone") {
+                respond(404, &s3_error("NoSuchUpload"))
+            } else {
+                respond(403, &s3_error("AccessDenied"))
+            }
+        }))
+        .await;
+        let bucket = stand_in.bucket("s3://bucket/repo").await;
+        bucket.abort_upload("config", "live").await.unwrap();
+        bucket.abort_upload("config", "gone").await.unwrap();
+        let err = bucket.abort_upload("config", "denied").await.unwrap_err();
+        assert!(
+            matches!(&err, Error::S3 { status: 403, code: Some(code), .. } if code == "AccessDenied"),
+            "{err}"
+        );
+        let err = bucket.abort_upload("config", "").await.unwrap_err();
+        assert!(matches!(&err, Error::InvalidInput(_)), "{err}");
+        assert_eq!(
+            requests(&stand_in),
+            [
+                request("DELETE", "/bucket/repo/config?uploadId=live"),
+                request("DELETE", "/bucket/repo/config?uploadId=gone"),
+                request("DELETE", "/bucket/repo/config?uploadId=denied"),
+            ]
         );
     });
 }

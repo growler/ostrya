@@ -1481,6 +1481,34 @@ impl UploadBody {
             UploadForm::Channel(_) => None,
         }
     }
+
+    /// Returns the bytes of a body of [`bytes`](UploadBody::bytes) as a
+    /// vector, or the body unchanged.
+    ///
+    /// If no other body shares the buffer, the call gives the buffer back
+    /// with its capacity, and copies no byte. A caller can then fill the
+    /// vector again for a later request. A copy from
+    /// [`try_clone`](UploadBody::try_clone) shares the buffer, and so does an
+    /// upload that still holds the body. The call then returns the body as
+    /// the error, as it does for a [`channel`](UploadBody::channel) body.
+    ///
+    /// # Errors
+    ///
+    /// Returns the body unchanged if it is a streamed body, or if another
+    /// body shares its buffer.
+    pub fn into_vec(self) -> std::result::Result<Vec<u8>, UploadBody> {
+        match self.form {
+            UploadForm::Bytes(bytes) => match bytes.try_into_mut() {
+                Ok(bytes) => Ok(Vec::from(bytes)),
+                Err(bytes) => Err(UploadBody {
+                    form: UploadForm::Bytes(bytes),
+                }),
+            },
+            UploadForm::Channel(end) => Err(UploadBody {
+                form: UploadForm::Channel(end),
+            }),
+        }
+    }
 }
 
 impl From<Vec<u8>> for UploadBody {
@@ -9674,6 +9702,35 @@ mod tests {
         assert_eq!(first.as_ptr(), second.as_ptr());
         let (channel, _writer) = UploadBody::channel();
         assert!(channel.try_clone().is_none());
+    }
+
+    /// A body of bytes gives its buffer back when no copy shares it. A
+    /// shared body and a streamed body come back unchanged.
+    #[test]
+    fn a_bytes_body_gives_its_buffer_back_when_it_is_not_shared() {
+        // A vector with spare capacity, and a vector with none.
+        for mut bytes in [Vec::with_capacity(16), Vec::with_capacity(4)] {
+            bytes.extend_from_slice(b"part");
+            let (address, capacity) = (bytes.as_ptr(), bytes.capacity());
+            let body = UploadBody::bytes(bytes);
+            let copy = body.try_clone().expect("a bytes body has a copy");
+            let Err(body) = body.into_vec() else {
+                panic!("a shared body is not given back");
+            };
+            assert_eq!(body.as_bytes(), Some(&b"part"[..]));
+            drop(copy);
+            let Ok(bytes) = body.into_vec() else {
+                panic!("a body with no copy gives its buffer back");
+            };
+            assert_eq!(bytes, b"part");
+            assert_eq!(bytes.as_ptr(), address);
+            assert_eq!(bytes.capacity(), capacity);
+        }
+        let (channel, _writer) = UploadBody::channel();
+        let Err(channel) = channel.into_vec() else {
+            panic!("a streamed body has no buffer");
+        };
+        assert!(channel.as_bytes().is_none());
     }
 
     /// The `Debug` output of an upload request shows each header name and no

@@ -36,8 +36,9 @@ pub enum Error {
     /// A frame, a batch, or a metadata object over its limit.
     ///
     /// With the `s3` feature, the bucket client returns this variant for an
-    /// object over the size limit of the caller, and for a listing page over
-    /// 4 MiB.
+    /// object over the size limit of the caller, for a listing page over
+    /// 4 MiB, and for a body of `Bucket::put_stream` that is longer than
+    /// 10,000 parts. `s3::part_size` returns it for a part size over 5 GiB.
     #[error("limit-exceeded: {0}")]
     LimitExceeded(String),
     /// An object whose bytes do not hash to its name.
@@ -157,7 +158,8 @@ pub enum Error {
     /// source gives a key pair. The message holds no secret access key and no
     /// session token. It also returns it for a refused address of a bucket
     /// repository, endpoint URL, or location, for a key that is not a key of
-    /// a bucket repository, and for a refused list prefix.
+    /// a bucket repository, for a refused list prefix, for a part size
+    /// outside the range of 5 MiB to 5 GiB, and for an empty upload id.
     ///
     /// [`Endpoint::parse`](crate::transport::Endpoint::parse) returns this
     /// variant for an `s3://` address. The session constructors return it
@@ -183,6 +185,14 @@ pub enum Error {
     /// - With the `s3` feature, the server answers a read or a list of the
     ///   bucket client with 304. The request sends no validators, so the
     ///   answer cannot be used.
+    /// - With the `s3` feature, the bucket client cannot use an answer of a
+    ///   multipart upload: the answer that starts the upload has no upload
+    ///   id, an upload id of more than 1 KiB, or no body, the answer to a
+    ///   part has no `ETag` or an `ETag` of more than 1 KiB, or the body of
+    ///   the answer that completes the upload cannot be read.
+    /// - With the `s3` feature, a completion of a multipart upload whose
+    ///   outcome is not known gets a 404 `NoSuchUpload`, and the key holds no
+    ///   object or an object of another length.
     ///
     /// No wire code carries this variant.
     #[error("transport: {0}")]
@@ -203,7 +213,8 @@ pub enum Error {
     /// With the `s3` feature, the `s3` module returns this variant for a
     /// shared AWS file that exists and cannot be read. The error keeps the
     /// `io::ErrorKind` of the failure, and its message names the file and the
-    /// path.
+    /// path. The bucket client returns it for a failed read of the body of
+    /// `Bucket::put_stream`, with the error of the reader unchanged.
     #[error(transparent)]
     Io(#[from] std::io::Error),
     /// A failure of the walk or of the hash pass of a local tree.

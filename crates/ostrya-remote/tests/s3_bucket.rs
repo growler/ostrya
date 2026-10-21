@@ -623,3 +623,101 @@ fn a_bucket_without_a_prefix_works() {
         );
     });
 }
+
+/// The part size of the multipart tests: 5 MiB, the smallest part size.
+const PART: usize = 5 << 20;
+
+/// Returns `len` bytes of a pseudo-random sequence, the same for each run.
+fn noise(len: usize) -> Vec<u8> {
+    let mut state = 0x9e37_79b9_7f4a_7c15u64;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            (state >> 24) as u8
+        })
+        .collect()
+}
+
+/// A reader that gives the bytes of `data`, and then fails.
+struct FailingAfter {
+    data: futures_lite::io::Cursor<Vec<u8>>,
+}
+
+impl futures_io::AsyncRead for FailingAfter {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut [u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match std::pin::Pin::new(&mut self.data).poll_read(cx, buf) {
+            std::task::Poll::Ready(Ok(0)) => {
+                std::task::Poll::Ready(Err(std::io::Error::other("the source failed")))
+            }
+            other => other,
+        }
+    }
+}
+
+#[test]
+fn put_stream_writes_an_object_of_several_parts() {
+    if !runs("put_stream_writes_an_object_of_several_parts") {
+        return;
+    }
+    let rclone = Rclone::start("multipart", &["bkt"]);
+    let key = object_key(&Checksum::from_bytes([0x3c; 32]), "filez");
+    let body = noise(2 * PART + PART / 2 + 12_345);
+    block_on(async {
+        let bucket = rclone.bucket("s3://bkt/repo").await;
+        let etag = bucket
+            .put_stream(&key, &body[..], PART as u64)
+            .await
+            .unwrap()
+            .unwrap();
+        // The answer that completes an upload gives the `ETag` of the parts,
+        // with the number of the parts after a `-`.
+        assert!(etag.ends_with("-3\"") || etag.ends_with("-3"), "{etag}");
+        assert!(fs::read(rclone.root().join("bkt/repo").join(&key)).unwrap() == body);
+        let object = bucket.get(&key, 16 << 20).await.unwrap().unwrap();
+        assert!(object.bytes == body);
+        assert!(bucket.list_uploads().await.unwrap().is_empty());
+    });
+}
+
+#[test]
+fn put_stream_aborts_the_upload_after_a_failed_read() {
+    if !runs("put_stream_aborts_the_upload_after_a_failed_read") {
+        return;
+    }
+    let rclone = Rclone::start("multipart-abort", &["bkt"]);
+    let key = object_key(&Checksum::from_bytes([0x3d; 32]), "filez");
+    block_on(async {
+        let bucket = rclone.bucket("s3://bkt/repo").await;
+        let body = FailingAfter {
+            data: futures_lite::io::Cursor::new(noise(PART + 100)),
+        };
+        let err = bucket
+            .put_stream(&key, body, PART as u64)
+            .await
+            .unwrap_err();
+        assert!(matches!(&err, Error::Io(_)), "{err}");
+        assert!(bucket.list_uploads().await.unwrap().is_empty());
+        assert_eq!(bucket.get(&key, 16).await.unwrap(), None);
+    });
+}
+
+#[test]
+fn abort_upload_of_an_unknown_upload_succeeds() {
+    if !runs("abort_upload_of_an_unknown_upload_succeeds") {
+        return;
+    }
+    let rclone = Rclone::start("abort-unknown", &["bkt"]);
+    block_on(async {
+        let bucket = rclone.bucket("s3://bkt/repo").await;
+        bucket
+            .abort_upload("config", "no-such-upload")
+            .await
+            .unwrap();
+    });
+}

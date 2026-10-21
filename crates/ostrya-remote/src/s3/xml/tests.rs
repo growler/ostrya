@@ -198,6 +198,90 @@ fn the_results_of_a_multipart_upload_read_as_elements() {
 }
 
 #[test]
+fn the_start_of_an_upload_gives_its_upload_id_under_either_root() {
+    let id = "VXBsb2FkIElEIGZvciA2aWWpbmcncyBteS1tb3ZpZS5tMnRzIHVwbG9hZA";
+    assert_eq!(initiate(INITIATE).unwrap(), Doc::Result(id.to_owned()));
+    // The root of `rclone serve s3` 1.75.1, with no namespace.
+    let rclone = b"<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<InitiateMultipartUpload>\
+                   <Bucket>bkt</Bucket><Key>repo/config</Key><UploadId>a+b/c=</UploadId>\
+                   </InitiateMultipartUpload>";
+    assert_eq!(initiate(rclone).unwrap(), Doc::Result("a+b/c=".to_owned()));
+    let Doc::Error(doc) = initiate(ERROR).unwrap() else {
+        panic!("an error document");
+    };
+    assert_eq!(doc.code.as_deref(), Some("AuthorizationHeaderMalformed"));
+}
+
+#[test]
+fn the_start_of_an_upload_with_no_upload_id_is_refused() {
+    let message =
+        initiate(b"<InitiateMultipartUploadResult><Key>k</Key></InitiateMultipartUploadResult>")
+            .unwrap_err();
+    assert!(message.contains("no UploadId"), "{message}");
+    for body in [
+        &b"<InitiateMultipartUploadResult><UploadId></UploadId></InitiateMultipartUploadResult>"[..],
+        b"<InitiateMultipartUploadResult><UploadId/></InitiateMultipartUploadResult>",
+        b"<InitiateMultipartUploadResult><UploadId> \n</UploadId></InitiateMultipartUploadResult>",
+    ] {
+        let message = initiate(body).unwrap_err();
+        assert!(
+            message.contains("UploadId of the answer is empty"),
+            "{message}"
+        );
+    }
+    let message = initiate(COMPLETE).unwrap_err();
+    assert!(
+        message.contains("InitiateMultipartUploadResult or InitiateMultipartUpload or Error"),
+        "{message}"
+    );
+}
+
+#[test]
+fn the_completion_of_an_upload_gives_its_etag() {
+    assert_eq!(
+        complete(COMPLETE).unwrap(),
+        Doc::Result(Some("\"3858f62230ac3c915f300c664312c11f-9\"".to_owned()))
+    );
+    // S3 can send white space before the document while it completes the
+    // upload. A quote can come as a character reference.
+    let body = b"  \n  \n<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <CompleteMultipartUploadResult><ETag>&#34;abc-2&#34;</ETag>\
+                 </CompleteMultipartUploadResult>";
+    assert_eq!(
+        complete(body).unwrap(),
+        Doc::Result(Some("\"abc-2\"".to_owned()))
+    );
+    assert_eq!(
+        complete(b"<CompleteMultipartUploadResult/>").unwrap(),
+        Doc::Result(None)
+    );
+}
+
+#[test]
+fn an_empty_etag_of_the_completion_reads_as_absent() {
+    for body in [
+        &b"<CompleteMultipartUploadResult><ETag></ETag></CompleteMultipartUploadResult>"[..],
+        b"<CompleteMultipartUploadResult><ETag/></CompleteMultipartUploadResult>",
+        b"<CompleteMultipartUploadResult><ETag> \n\t</ETag></CompleteMultipartUploadResult>",
+    ] {
+        assert_eq!(complete(body).unwrap(), Doc::Result(None));
+    }
+}
+
+#[test]
+fn an_error_root_in_place_of_a_completion_is_an_error_document() {
+    // S3 can send an `Error` document after the head of a 200.
+    let body = b"  \n<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+                 <Error><Code>InternalError</Code><Message>retry</Message></Error>";
+    let Doc::Error(doc) = complete(body).unwrap() else {
+        panic!("an error document");
+    };
+    assert_eq!(doc.code.as_deref(), Some("InternalError"));
+    let message = complete(LIST_OBJECTS).unwrap_err();
+    assert!(message.contains("root element"), "{message}");
+}
+
+#[test]
 fn an_error_document_gives_its_code_message_and_region() {
     let doc = error(ERROR).unwrap();
     assert_eq!(doc.code.as_deref(), Some("AuthorizationHeaderMalformed"));

@@ -5542,3 +5542,50 @@ and the pages of the list of the multipart uploads with `key-marker` and
   one that no earlier page gave for that key marker. S3 sorts the uploads of
   one key by the time of their start, so the upload id markers of one key
   have no order.
+
+### Object uploads
+
+The bucket client writes an object from a stream with one `PUT` or with a
+multipart upload. It reads the stream in parts of one part size:
+
+- A body of at most one part goes in one `PUT KEY`.
+- A longer body goes in a multipart upload. `POST KEY?uploads` starts the
+  upload, and its answer gives the upload id in the element `UploadId`.
+  `PUT KEY?partNumber=N&uploadId=ID` sends each part, one part after the
+  other, with the part numbers 1 to the number of parts and no gap. Each
+  part other than the last one holds the part size. `POST KEY?uploadId=ID`
+  completes the upload. In the query, the upload id has the encoding of a
+  query value of SigV4.
+- A failure after the start of the upload sends one
+  `DELETE KEY?uploadId=ID`, which aborts the upload. A failure whose last
+  answer is a 404 with the code `NoSuchUpload` sends no abort, because the
+  server holds no such upload.
+
+The part size of an object of `N` bytes is the larger of 8 MiB and
+`(2N + 1 MiB) / 10,000`, rounded up to a whole MiB. It is 8 MiB up to
+41,942,515,712 bytes. An object that needs a part size over 5 GiB, more
+than 26,843,545,075,712 bytes, is refused. A part size is at least 5 MiB
+and at most 5 GiB, and an upload has at most 10,000 parts. These are the
+S3 limits.
+
+The body of the request that completes the upload is one line with no XML
+declaration:
+
+```xml
+<CompleteMultipartUpload xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Part><PartNumber>1</PartNumber><ETag>"ETAG1"</ETag></Part><Part><PartNumber>2</PartNumber><ETag>"ETAG2"</ETag></Part></CompleteMultipartUpload>
+```
+
+Each `ETag` is the `ETag` header of the answer to the part, with its
+quotes, and with `&`, `<`, and `>` escaped. The request has no
+`Content-Type`.
+
+The answer that starts an upload has the root
+`InitiateMultipartUploadResult`. `rclone serve s3` 1.75.1 writes the root
+`InitiateMultipartUpload` with no namespace, and the bucket client reads
+both. The answer that completes an upload has the root
+`CompleteMultipartUploadResult`, or the root `Error` after the head of a
+200. The `ETag` of the result is `"<MD5 of the MD5 values of the parts>-N"`,
+with `N` the number of parts, on `rclone serve s3` 1.75.1 and on
+SeaweedFS 4.36. A later read of the key on `rclone serve s3` 1.75.1 gives
+the MD5 of the whole object, and SeaweedFS 4.36 gives the value of the
+result.

@@ -332,14 +332,14 @@ fn is_format(c: char) -> bool {
     )
 }
 
-/// Reads `body` as a document of the root `root`, or as an S3 `Error`
-/// document. `on_end` gets the end of each element under `root`.
+/// Reads `body` as a document of one of the roots `roots`, or as an S3
+/// `Error` document. `on_end` gets the end of each element under the root.
 ///
 /// Returns the `Error` document if the root is `Error`, and `None` if the
-/// root is `root`.
+/// root is one of `roots`.
 fn read(
     body: &[u8],
-    root: &str,
+    roots: &[&str],
     mut on_end: impl FnMut(&[&str], &str) -> Result<(), String>,
 ) -> Result<Option<ErrorDoc>, String> {
     let mut error: Option<ErrorDoc> = None;
@@ -354,10 +354,11 @@ fn read(
             }
             Ok(())
         }
-        [first, rest @ ..] if *first == root => on_end(rest, text),
+        [first, rest @ ..] if roots.contains(first) => on_end(rest, text),
         [first, ..] => Err(format!(
-            "the root element is {}, and {root} or Error was expected",
-            shown(first)
+            "the root element is {}, and {} or Error was expected",
+            shown(first),
+            roots.join(" or ")
         )),
         [] => Ok(()),
     })?;
@@ -375,7 +376,7 @@ fn truncated(text: &str) -> Result<bool, String> {
 
 /// Reads an S3 `Error` document, or returns `None` if `body` is not one.
 pub(crate) fn error(body: &[u8]) -> Option<ErrorDoc> {
-    read(body, "Error", |_, _| Ok(())).ok().flatten()
+    read(body, &["Error"], |_, _| Ok(())).ok().flatten()
 }
 
 /// Reads one page of `ListObjectsV2`.
@@ -384,7 +385,7 @@ pub(crate) fn list_objects(body: &[u8]) -> Result<Doc<ObjectsPage>, String> {
     let mut key: Option<String> = None;
     let mut size: Option<u64> = None;
     let mut failure: Option<String> = None;
-    let outcome = read(body, "ListBucketResult", |path, text| {
+    let outcome = read(body, &["ListBucketResult"], |path, text| {
         match path {
             ["EncodingType"] => page.encoded = text.trim() == "url",
             ["IsTruncated"] => page.truncated = truncated(text)?,
@@ -414,7 +415,7 @@ pub(crate) fn list_uploads(body: &[u8]) -> Result<Doc<UploadsPage>, String> {
     let mut page = UploadsPage::default();
     let (mut key, mut id, mut initiated) = (None, None, None);
     let mut failure: Option<String> = None;
-    let outcome = read(body, "ListMultipartUploadsResult", |path, text| {
+    let outcome = read(body, &["ListMultipartUploadsResult"], |path, text| {
         match path {
             ["EncodingType"] => page.encoded = text.trim() == "url",
             ["IsTruncated"] => page.truncated = truncated(text)?,
@@ -435,6 +436,50 @@ pub(crate) fn list_uploads(body: &[u8]) -> Result<Doc<UploadsPage>, String> {
         Ok(())
     })?;
     finish(outcome, failure, page)
+}
+
+/// Reads the answer that starts a multipart upload, and returns its
+/// `UploadId`.
+///
+/// The root is `InitiateMultipartUploadResult`, the root of the AWS API
+/// reference, or `InitiateMultipartUpload`, which `rclone serve s3` 1.75.1
+/// writes. An `UploadId` that is absent, empty, or white space alone is
+/// refused.
+pub(crate) fn initiate(body: &[u8]) -> Result<Doc<String>, String> {
+    let mut id: Option<String> = None;
+    let outcome = read(
+        body,
+        &["InitiateMultipartUploadResult", "InitiateMultipartUpload"],
+        |path, text| {
+            if let ["UploadId"] = path {
+                id = Some(text.to_owned());
+            }
+            Ok(())
+        },
+    )?;
+    let (failure, id) = match id {
+        None => (Some("the answer has no UploadId".to_owned()), String::new()),
+        Some(id) if id.trim().is_empty() => {
+            (Some("the UploadId of the answer is empty".to_owned()), id)
+        }
+        Some(id) => (None, id),
+    };
+    finish(outcome, failure, id)
+}
+
+/// Reads the `CompleteMultipartUploadResult` document, and returns its
+/// `ETag`, as the server wrote it.
+///
+/// An `ETag` that is empty or white space alone reads as absent.
+pub(crate) fn complete(body: &[u8]) -> Result<Doc<Option<String>>, String> {
+    let mut etag: Option<String> = None;
+    let outcome = read(body, &["CompleteMultipartUploadResult"], |path, text| {
+        if let ["ETag"] = path {
+            etag = (!text.trim().is_empty()).then(|| text.to_owned());
+        }
+        Ok(())
+    })?;
+    finish(outcome, None, etag)
 }
 
 /// Returns the result of a typed reader: the `Error` document of `outcome`,

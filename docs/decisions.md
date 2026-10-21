@@ -462,6 +462,120 @@ The deletion of a key is one `DELETE` for each key. `DeleteObjects`
 (`POST ?delete`) was rejected: AWS requires a `Content-MD5` or a checksum
 header on it, and the first one needs the crate `md-5` in a manifest.
 
+`Bucket::put_stream` writes an object from a reader. A body of at most
+one part goes in one `PUT`, and a longer body goes in a multipart upload.
+The call holds one part buffer, and the parts of one object go one after
+the other. The first buffer starts at 8 KiB and doubles up to the part
+size, so a small object takes a small buffer. After a full part, the call
+reads one byte more, so a body of exactly one part goes in one `PUT`.
+
+After each part, the call takes the buffer back with `UploadBody::into_vec`
+of `ostrya-fetch`, and reads the next part into it with no fill of zeros.
+The retries of a part share its buffer, so the buffer comes back after the
+last request of the part. If the fetcher still holds the bytes, the next
+part takes a new buffer with the capacity of one part. Its length doubles
+from 8 KiB while the bytes arrive, so a short last part does not fill a
+whole part with zeros.
+
+`s3::part_size` gives the part size of an object of `N` bytes: the larger
+of 8 MiB and `(2N + 1 MiB) / 10,000`, rounded up to a whole MiB. A `.filez`
+of a file with `N` bytes of content is smaller than `2N + 1 MiB`, so
+10,000 parts hold it. The part size is 8 MiB up to 41,942,515,712 bytes.
+A part size over 5 GiB, the S3 limit of a part, gives
+`Error::LimitExceeded`. No value is clamped. A body that is longer than
+10,000 parts aborts the upload and gives `Error::LimitExceeded`.
+
+`put_stream` refuses a part size below 5 MiB or above 5 GiB. No test hook
+gives smaller parts. `rclone serve s3` 1.75.1 does not enforce the 5 MiB
+minimum, but SeaweedFS 4.36 refuses a small part at the completion with
+400 `EntityTooSmall`. The multipart tests use parts of 5 MiB.
+
+The retries of a multipart upload differ for each request:
+
+- The `POST` that starts the upload and each part are sent again after an
+  interrupted request and after a 408, 429, or 5xx, as a `PUT` is. A part
+  goes again with the same bytes.
+- The `POST` that starts the upload is also sent again after a 2xx whose
+  body did not arrive. Such an answer is an interrupted request, because
+  the client does not get the upload id. An interrupted start can leave an
+  upload that the client does not know. Such an upload holds storage until
+  an abort or a lifecycle rule of the bucket removes it, and this is
+  accepted.
+- The `POST` that completes the upload is also sent again after a 2xx
+  whose body cannot be read, and after a 200 whose body is an S3 `Error`
+  document. The AWS API reference states that a completion can fail after
+  the head of a 200.
+- An answer to a part with no `ETag` fails the upload, because the
+  completion cannot name the part.
+
+The client takes an upload id and an `ETag` of a part of at most 1 KiB
+each. A longer upload id fails the start, and the client sends no part. A
+longer `ETag` fails the upload as a missing `ETag` does, and the client
+aborts the upload. So the list of the `ETag` values holds at most 10,000
+values of 1 KiB, and the completion document has a limit.
+
+The outcome of a completion is unknown after an interrupted request,
+after a 408, 429, or 5xx, and after a 2xx that cannot be used. A gateway
+or a load balancer can give a 408, 429, or 5xx after the server completed
+the upload. A later request can then get a 404 with the code
+`NoSuchUpload`, because the earlier request completed the upload:
+`rclone serve s3` 1.75.1 gives this answer to a second completion, and
+SeaweedFS 4.36 gives 200 with the same `ETag`. After such a 404, the
+client reads the key, and accepts the object if the declared
+`Content-Length` equals the number of bytes of the parts. It reads no byte
+of the object. A compare of the bytes was rejected, because it reads the
+whole object again and the client holds one part alone. The completion has
+the default timeout of the fetcher.
+
+The check compares the length alone. It is sound for a key whose name sets
+its content, such as a content-addressed object or a static delta. For a
+key whose content changes, an older object of the same length passes the
+check. The check runs for each key, and this limit is accepted. An absent
+object and an object of another length give `Error::Transport`, whose
+message states that the completion got 404 `NoSuchUpload` and what the key
+holds. A failed read of the key gives the error of `Bucket::get_stream`.
+
+After each failure that comes after the start of an upload, the client
+sends one `DELETE KEY?uploadId=ID` and ignores its outcome, so the error of
+the failure is the error of the call. If the last answer to a request of
+the upload is a 404 `NoSuchUpload`, the server holds no such upload, and
+the client sends no abort. This is the case after the check of the key
+that follows such an answer to a completion. A dropped future sends no
+abort.
+`Bucket::abort_upload` takes a 404 `NoSuchUpload` as success: after a
+refused completion, `rclone serve s3` 1.75.1 removes the upload and gives
+404 `NoSuchUpload` to each later request of it, but `ListMultipartUploads`
+still gives the upload. SeaweedFS 4.36 keeps the upload after a refused
+completion.
+
+`Bucket::abort_upload` refuses an empty upload id with
+`Error::InvalidInput`, and sends no request. `rclone serve s3` 1.75.1 reads
+`DELETE KEY?uploadId=` with an empty value as a `DeleteObject`: it gave 204
+and removed the object.
+
+The answer that starts an upload has the root
+`InitiateMultipartUploadResult` in the AWS API reference and on SeaweedFS
+4.36, and `InitiateMultipartUpload` with no namespace on `rclone serve s3`
+1.75.1. The reader takes both roots, and refuses an absent or empty
+`UploadId`. An `ETag` of the completion result that is empty or white space
+alone reads as absent, so the `ETag` header of the answer applies.
+
+The completion document gives the `ETag` of each part as the answer to the
+part gave it, with its quotes, and with `&`, `<`, and `>` escaped. Both
+servers take an `ETag` with quotes, with no quotes, and with `&quot;`.
+
+The `ETag` that `put_stream` returns is not compared with the `ETag` of a
+later read. For an object of several parts, the completion gives
+`"<MD5 of the MD5 values of the parts>-N"` on both servers. A later read
+on `rclone serve s3` 1.75.1 gives the MD5 of the whole object, and
+SeaweedFS 4.36 keeps the value with `-N`.
+
+The signer hashes each part on the task of the call, as for each body of
+bytes (`SignPayload::Bytes`). The SHA-256 of 8 MiB takes about 4.8 ms on
+the dev host, about 1674 MiB/s. A part over about 16.7 MiB passes 10 ms.
+`s3::part_size` gives such a part to an object over about 78 GiB. This time
+is accepted.
+
 `Endpoint` of `ostrya-remote` has `#[non_exhaustive]`, and the variant
 `Endpoint::S3` is behind the feature `s3`. Cargo features are additive, so
 without the attribute a crate that matches each variant compiles alone and

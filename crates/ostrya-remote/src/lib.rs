@@ -158,6 +158,8 @@ fn bucket_futures_are_send(
     assert_send(&bucket.list("objects/"));
     assert_send(&bucket.list_delimited("objects/"));
     assert_send(&bucket.list_uploads());
+    assert_send(&bucket.put_stream("config", &b""[..], 8 << 20));
+    assert_send(&bucket.abort_upload("config", "id"));
 }
 
 /// The futures of a stream session can run on a multi-threaded executor.

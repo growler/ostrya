@@ -1854,3 +1854,47 @@ mod standin {
         }
     }
 }
+
+/// An `s3://` address needs credentials, so the parse refuses it and names
+/// the call that builds an S3 endpoint, or the feature that adds it.
+#[test]
+fn an_s3_address_is_refused_by_the_parse() {
+    for windows in [false, true] {
+        let message = refused("s3://bucket/repo", windows);
+        if cfg!(feature = "s3") {
+            assert!(message.contains("S3Endpoint::resolve"), "{message}");
+        } else {
+            assert!(message.contains("feature s3"), "{message}");
+        }
+    }
+}
+
+/// An S3 endpoint opens no push session and no pull session.
+#[cfg(feature = "s3")]
+#[test]
+fn the_session_constructors_refuse_an_s3_endpoint() {
+    let location = crate::s3::Location::new(
+        crate::s3::Address::parse("s3://bucket/repo").unwrap(),
+        "us-east-1",
+        Some("http://127.0.0.1:1"),
+        None,
+    )
+    .unwrap();
+    let credentials =
+        crate::s3::Credentials::new("AKIDEXAMPLE".into(), "SECRETEXAMPLE".into(), None).unwrap();
+    let endpoint = Endpoint::S3(crate::s3::S3Endpoint::new(location, credentials));
+    assert!(!format!("{endpoint:?}").contains("SECRETEXAMPLE"));
+    let push = ostrya_rt::block_on(PushSession::prepare(endpoint.clone()));
+    let Err(Error::InvalidInput(message)) = push else {
+        panic!("a push session to an S3 endpoint");
+    };
+    assert!(message.contains("s3::Bucket::new"), "{message}");
+    let pull = ostrya_rt::block_on(PullSession::connect(
+        endpoint,
+        StreamSessionOptions::default(),
+    ));
+    assert!(
+        matches!(pull, Err(Error::InvalidInput(_))),
+        "a pull session to an S3 endpoint"
+    );
+}

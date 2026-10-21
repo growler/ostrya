@@ -302,6 +302,175 @@ needs a region from the caller, the environment, or the config file. The
 region changes no byte of the repository, only the signature. A default
 that applies only with an endpoint of the caller was rejected.
 
+## Error responses of a fetch
+
+`ostrya_fetch::FetchRequest::max_error_body` asks a fetch to keep the
+unsuccessful response that it reports. `Error::HttpStatus` then carries an
+`ErrorResponse` with the headers of that response, and its body if the whole
+body is within the cap. A fetch that does not set the field reads no error
+body, as before. The bucket client of S3 needs the field: the code and the
+message of an S3 error, and the region of a bucket, are in the body and in
+the headers of the error response.
+
+- A fetch reads the body of a failure only if the failure order can make it
+  the reported failure. So it reads at most two bodies, one retryable and
+  one definitive, and keeps the body of the failure that it reports.
+- The read has one progress window from the arrival of the response head.
+  A body over the cap, a coded body, a stalled body, and a body that fails
+  in transit give the headers alone. The fetch keeps no part of a body.
+- The declared length of a body is a claim of the server, so the read
+  reserves at most 64 KiB before the body arrives. The capacity of a kept
+  body never passes the cap. A cap of `u64::MAX` and a response that
+  declares 1 PiB then cost no allocation of 1 PiB.
+- The read never changes the retry class of a status, and the kept bytes do
+  not count in the received counters.
+- `ostrya::Error::HttpStatus` does not carry the response. Its conversion
+  from the fetch error drops it, so the error type of the library keeps its
+  shape.
+- `Error::HttpStatus` of `ostrya-fetch` has no `#[non_exhaustive]`. A caller
+  outside the crate can build each variant, and a pattern names the new
+  field or ends in `..`.
+
+These alternatives were rejected:
+
+- `UploadMethod::Get`, a `GET` through `Fetcher::upload`, which gives each
+  final status with its headers and a capped body. The bucket client then
+  owns the retries of its `GET` requests, and a streamed object loses the
+  refetch of a failed body and the low-speed rule of a fetch. The
+  maintainer chose the change of the fetch.
+- A `Fetched::Status` variant, which makes each caller of `fetch` match an
+  unsuccessful status as a success.
+- A new `Error` variant for a status with a response. Each caller that
+  matches `Error::HttpStatus` then also matches the new variant.
+- A per-request switch of redirect following. `max_redirects` of the
+  fetcher already gives each redirect as a status at the limit of zero.
+- A truncated prefix of a body over the cap. The caller cannot tell a
+  truncated XML document from a malformed one.
+
+An upload gives each final status as an `Uploaded`. An answer other than
+2xx whose body declares a coding, or a `Content-Length` over
+`max_response`, keeps its status and its headers, and the upload withholds
+the body: `Uploaded::body_withheld` returns `true`, and the body reads as
+empty. A 2xx answer with such a body fails the upload with
+`Error::UploadInterrupted`. So a definitive refusal, for example
+a 403 behind a proxy that compresses it, keeps its status, and the bucket
+client of S3 does not send it again as an interrupted upload. An
+interrupted upload in place of the status was rejected: the caller loses
+the status, and repeats a request that the server refused.
+
+## The S3 bucket client
+
+`ostrya_remote::s3::Bucket` is the client of a bucket repository, in the
+module `s3` of `ostrya-remote`, under the feature `s3`. `ostrya-remote`
+holds the transports of push and pull and the type `Endpoint`, so the
+client side of S3 goes there with the signer and the credential chain. A
+new published crate `ostrya-s3` was rejected: it needs a `README.md`, a place
+in the release sequence, and the same dependencies.
+
+The XML bodies of the S3 responses are read with the crate `quick-xml`
+0.42.0, with no feature. The reader of the port refuses a `DOCTYPE`, accepts
+the five predefined entities and the character references of XML 1.0, and
+refuses each other reference. It refuses a body with an open element at its
+end, a second root, or an element deeper than 32 levels, and it reads at
+most 4 MiB of UTF-8. Two alternatives were rejected:
+
+- The crate `xml` 1.4.0. It reads the definitions of internal entities and
+  expands them, up to 1,000,000 bytes for each expansion. Its time is
+  quadratic in the depth of the elements: 40,000 levels took 831 ms, and a
+  body of 4 MiB of nested elements took more than 5 minutes. In a test
+  program, it cost 151,312 bytes of a stripped release binary, and
+  `quick-xml` cost 45,528 bytes. On a listing of 4 MiB, `quick-xml` took
+  22 ms and `xml` took 122 ms.
+- A reader written in the tree. `quick-xml` gives each event and each
+  reference to the caller, so the rules of the port are a short walker over
+  the events. A tokenizer of its own adds the code of the lexical rules of
+  XML, which the crate already has.
+
+The fetch, the stream, and the lists of the client are fetches with
+`max_error_body` of 4 MiB, and the fetcher of the client follows no redirect.
+So the client sees the `x-amz-bucket-region` header and the S3 `Error`
+document of each unsuccessful response. A region other than the region of
+the signature, from the header or from the `Region` element, gives
+`Error::S3Region`, which names both regions. A redirect of S3 to another
+region is never followed, because a hop to another origin carries no
+signature. The retries of a `GET` are the retries of the fetcher. The
+client sends a `PUT` and a `DELETE` again itself, after an interrupted
+upload and after a 408, 429, or 5xx, because an upload is never repeated by
+the fetcher. `UploadBody::try_clone` gives the second request the bytes of
+the first one with no copy.
+
+A 404 is an absent key only if its body arrived whole and holds the code
+`NoSuchKey` or no S3 code. A 404 with `NoSuchBucket` is an error, so a
+missing bucket never reads as an empty repository. A 404 whose body did not
+arrive, for example a body that stalls or fails in transit, can come from
+a missing bucket too, so it is an error with no code. The absent-key rule
+runs before the region check: a server that does not check the region of
+the signature, and names another region in the header of a 404, still
+gives an absent key. A region check on 301, 307, 400, and 403 alone was
+rejected, because S3 can name the region of a bucket with another status.
+
+A conditional `PUT` (`If-None-Match: *`) gives `PutIfAbsent::Created` only
+when a request of the call got a 2xx. A request whose outcome is not known,
+then a 412 or a failed request, makes the client read the key and compare
+its SHA-256 with the SHA-256 of the body. The same bytes give
+`PutIfAbsent::Matches`, other bytes give `PutIfAbsent::Present`, and an
+absent key after a failed request sends the request again. `Matches`
+states that the key holds the bytes of the body, and no answer names the
+writer. So a writer lock that sends its own body again tells a 2xx of its
+own request from bytes that the key held before the call. `rclone serve s3` 1.75.1 does not honor `If-None-Match: *`: a second
+conditional `PUT` writes over the object.
+
+The compare reads the object as a stream in chunks of 64 KiB, and holds no
+copy of the object. A response that declares a length other than the
+length of the body holds other bytes, and the client reads none of it. The
+client hashes the body of the request only for a compare, on the blocking
+pool of the runtime, so a `PUT` with no compare hashes its body once, in
+the signer.
+
+Each page of a list must move forward, or the list fails. Each key and
+common prefix of a page of `ListObjectsV2` comes after each one of the
+earlier pages, in the byte order of UTF-8. S3 can give a truncated page
+with no key and no common prefix, for example over many delete markers of a
+versioned bucket. The client follows such a page if its continuation token
+is new since the last page with a key or a common prefix. The client keeps
+the tokens of that run in a set, and a page with a key or a common prefix
+clears the set. A run of more than 1000 truncated pages with no key and no
+common prefix fails the list. So a server that gives the same page again,
+or empty pages with new tokens and no end, fails the list. A cap on the
+number of all pages was rejected: a repository has no fixed upper limit of
+keys. The cap on a run of empty pages bounds the set and the time of a
+list, and it does not limit the number of keys.
+
+For `ListMultipartUploads`, the `NextKeyMarker` of each truncated page does
+not come before the key marker of the page before it, in the byte order of
+UTF-8. While the key marker stays the same, the `NextUploadIdMarker` is one
+that no earlier page gave for that key marker. The set of these upload id
+markers clears when the key marker moves forward. S3 sorts the uploads of
+one key by the time of their start, and not by the upload id, so the
+upload id markers of one key have no order. A rule that the pair of the
+markers increases was rejected: it refuses a key with more than one page of
+incomplete multipart uploads.
+
+The request path of a key encodes each byte outside `A-Z a-z 0-9 - . _ ~ /`
+as `%XX`, which is the canonical URI of SigV4. So a `+` of a delta key goes
+as `%2B`, and the signature does not depend on how a server reads a raw `+`
+of a path. A listing asks for the encoding type `url`, and the client
+decodes `%XX` and reads a `+` as a space, as S3 and `rclone serve s3` write
+a space in that encoding.
+
+The deletion of a key is one `DELETE` for each key. `DeleteObjects`
+(`POST ?delete`) was rejected: AWS requires a `Content-MD5` or a checksum
+header on it, and the first one needs the crate `md-5` in a manifest.
+
+`Endpoint` of `ostrya-remote` has `#[non_exhaustive]`, and the variant
+`Endpoint::S3` is behind the feature `s3`. Cargo features are additive, so
+without the attribute a crate that matches each variant compiles alone and
+fails when another crate of the same build turns `s3` on. A variant with no
+feature gate was rejected: `S3Endpoint` and the types that it holds then
+compile in each build. The session constructors refuse `Endpoint::S3`, and
+`Endpoint::parse` refuses an `s3://` address, because the endpoint needs
+credentials that the parse does not read.
+
 ## The client access of `ostrya serve`
 
 - The reader of the PROXY protocol, v1 and v2, is written in the tree, with
@@ -368,6 +537,15 @@ when the port owns its set of members and expects the set to grow.
 - `ostrya_remote::s3::Origin` and `ostrya_remote::s3::Resolved` have the
   attribute. The port owns the set of sources of an S3 setting, and the set
   of resolved settings grows with the S3 support.
+- `ostrya_remote::transport::Endpoint` has the attribute, and
+  `Endpoint::S3` is behind the feature `s3`. A match outside
+  `ostrya-remote` needs a wildcard arm, so the build compiles with and
+  without the feature. "The S3 bucket client" states the reason.
+- `ostrya_remote::s3::S3Endpoint`, `Object`, `PutIfAbsent`, `Listing`,
+  `Listed`, and `Upload` have the attribute, and so do the variants
+  `ostrya_remote::Error::S3` and `ostrya_remote::Error::S3Region`. The bucket
+  client builds them, and the set of fields grows with the S3 support. A
+  caller builds an `S3Endpoint` with `S3Endpoint::new` and sets its fields.
 - No option struct of the `ostrya` crate has the attribute: `PruneOptions`,
   `PullOptions`, `TarExportOptions`, `TarImportOptions` and the others. The
   attribute stops a struct expression outside the defining crate,

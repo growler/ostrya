@@ -10,14 +10,15 @@ A caller pushes a local directory as a commit that the server makes with
 `push_tree`, or its own objects with a `PushSession`. A `PullSession` reads the summary and the ref listings of a remote. The
 crate has no repository knowledge, and it compiles on Linux, macOS, and Windows.
 
-With the `s3` feature, the `s3` module signs S3 requests and reads the
-settings and the credentials of an S3 endpoint.
+With the `s3` feature, the `s3` module signs S3 requests, reads the
+settings and the credentials of an S3 endpoint, and holds the client of a
+bucket repository.
 
 API documentation: <https://docs.rs/ostrya-remote>
 
 ## Entry points
 
-- `Endpoint::parse` reads an address into an `Endpoint`.
+- `Endpoint::parse` reads an ssh or HTTP address into an `Endpoint`.
 - `push_tree` pushes a local directory to an endpoint as one server commit.
 - `PushSession::connect` opens a push session to an endpoint.
 - `PushSession::prepare` checks an endpoint before the session opens.
@@ -33,13 +34,13 @@ API documentation: <https://docs.rs/ostrya-remote>
 - `session`: the push and pull sessions, their progress, and the one-way stream.
 - `transport`: the endpoints, the addresses, and the ssh and HTTP transports.
 - `tree`: the walk and the hash of a local directory.
-- `s3` (feature `s3`): S3 request signing, and the settings and credentials of an S3 endpoint.
+- `s3` (feature `s3`): S3 request signing, the settings and credentials of an S3 endpoint, the address of a bucket repository, and the bucket client.
 
 ## Features
 
 - `smol` (default): the `smol` backend of `ostrya-rt` for the ssh and HTTP transports.
 - `tokio`: the `tokio` backend of `ostrya-rt` for the ssh and HTTP transports.
-- `s3`: the `s3` module, which signs S3 requests with AWS Signature Version 4 and reads the AWS credentials.
+- `s3`: the `s3` module, which signs S3 requests with AWS Signature Version 4, reads the AWS credentials, and holds the bucket client.
 
 ## Examples
 

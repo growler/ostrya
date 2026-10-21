@@ -150,6 +150,14 @@ impl fmt::Debug for EndpointOverrides {
     }
 }
 
+/// Returns the refusal of an endpoint that is neither ssh nor HTTP, for
+/// example an S3 endpoint, by `operation`.
+pub(crate) fn neither_ssh_nor_http(operation: &str) -> Error {
+    Error::Unsupported(format!(
+        "{operation} takes an ssh or an HTTP endpoint, and this endpoint is neither"
+    ))
+}
+
 /// Resolves the remote `remote` to the endpoint of a pull.
 ///
 /// # Address
@@ -268,6 +276,7 @@ pub async fn resolve_pull(
                 },
             })
         }
+        _ => Err(neither_ssh_nor_http("a pull")),
     }
 }
 
@@ -506,6 +515,7 @@ pub async fn resolve_push(
         return match Endpoint::parse(remote)? {
             Endpoint::Http(http) => push_http(remote, None, remote, http, overrides).await,
             Endpoint::Ssh { address, .. } => push_ssh(None, address, overrides),
+            _ => Err(neither_ssh_nor_http("a push")),
         };
     }
     let section = config
@@ -531,6 +541,7 @@ pub async fn resolve_push(
     match Endpoint::parse(&address)? {
         Endpoint::Http(http) => push_http(remote, Some(&section), &address, http, overrides).await,
         Endpoint::Ssh { address, .. } => push_ssh(Some(&section), address, overrides),
+        _ => Err(neither_ssh_nor_http("a push")),
     }
 }
 

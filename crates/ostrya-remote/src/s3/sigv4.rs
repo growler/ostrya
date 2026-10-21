@@ -296,7 +296,7 @@ fn percent_decode(text: &str) -> Option<Vec<u8>> {
 /// Appends `bytes` to `out`, with each byte other than `A-Z`, `a-z`, `0-9`,
 /// `-`, `.`, `_`, and `~` as `%XX` in uppercase. A `/` is encoded if
 /// `encode_slash` is `true`.
-fn uri_encode(bytes: &[u8], encode_slash: bool, out: &mut String) {
+pub(super) fn uri_encode(bytes: &[u8], encode_slash: bool, out: &mut String) {
     const HEX: &[u8; 16] = b"0123456789ABCDEF";
     for &b in bytes {
         if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~') {

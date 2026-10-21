@@ -7,12 +7,13 @@
 //! [`push_tree`](fn@push_tree), or its own objects with a [`PushSession`]. A [`PullSession`] reads the summary and the ref listings of a remote. The
 //! crate has no repository knowledge, and it compiles on Linux, macOS, and Windows.
 //!
-//! With the `s3` feature, the `s3` module signs S3 requests and reads the
-//! settings and the credentials of an S3 endpoint.
+//! With the `s3` feature, the `s3` module signs S3 requests, reads the
+//! settings and the credentials of an S3 endpoint, and holds the client of a
+//! bucket repository.
 //!
 //! # Entry points
 //!
-//! - [`Endpoint::parse`] reads an address into an [`Endpoint`].
+//! - [`Endpoint::parse`] reads an ssh or HTTP address into an [`Endpoint`].
 //! - [`push_tree`](fn@push_tree) pushes a local directory to an endpoint as one server commit.
 //! - [`PushSession::connect`] opens a push session to an endpoint.
 //! - [`PushSession::prepare`] checks an endpoint before the session opens.
@@ -28,13 +29,13 @@
 //! - [`session`]: the push and pull sessions, their progress, and the one-way stream.
 //! - [`transport`]: the endpoints, the addresses, and the ssh and HTTP transports.
 //! - [`tree`]: the walk and the hash of a local directory.
-//! - `s3` (feature `s3`): S3 request signing, and the settings and credentials of an S3 endpoint.
+//! - `s3` (feature `s3`): S3 request signing, the settings and credentials of an S3 endpoint, the address of a bucket repository, and the bucket client.
 //!
 //! # Features
 //!
 //! - `smol` (default): the `smol` backend of `ostrya-rt` for the ssh and HTTP transports.
 //! - `tokio`: the `tokio` backend of `ostrya-rt` for the ssh and HTTP transports.
-//! - `s3`: the `s3` module, which signs S3 requests with AWS Signature Version 4 and reads the AWS credentials.
+//! - `s3`: the `s3` module, which signs S3 requests with AWS Signature Version 4, reads the AWS credentials, and holds the bucket client.
 //!
 //! # Examples
 //!
@@ -104,8 +105,8 @@ const _: fn() = || {
     assert_send_sync::<SshOptions>();
 };
 
-// The signer, the credentials, and the settings of an S3 endpoint move freely
-// across tasks and threads.
+// The signer, the credentials, the settings of an S3 endpoint, the bucket
+// client, and its results move freely across tasks and threads.
 #[cfg(feature = "s3")]
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
@@ -114,6 +115,16 @@ const _: fn() = || {
     assert_send_sync::<s3::Resolved>();
     assert_send_sync::<s3::Settings>();
     assert_send_sync::<s3::Environment>();
+    assert_send_sync::<s3::Address>();
+    assert_send_sync::<s3::Location>();
+    assert_send_sync::<s3::S3Endpoint>();
+    assert_send_sync::<s3::Bucket>();
+    assert_send_sync::<s3::Object>();
+    assert_send_sync::<s3::ObjectStream>();
+    assert_send_sync::<s3::PutIfAbsent>();
+    assert_send_sync::<s3::Listing>();
+    assert_send_sync::<s3::Listed>();
+    assert_send_sync::<s3::Upload>();
 };
 
 /// The future of the resolution of an S3 endpoint can run on a
@@ -123,6 +134,29 @@ const _: fn() = || {
 fn s3_resolve_future_is_send(settings: &s3::Settings, environment: &s3::Environment) {
     fn assert_send<T: Send>(_: &T) {}
     assert_send(&s3::resolve(settings, environment));
+}
+
+/// The futures of the bucket client and of the resolution of its endpoint can
+/// run on a multi-threaded executor.
+#[cfg(feature = "s3")]
+#[allow(dead_code)]
+fn bucket_futures_are_send(
+    endpoint: &s3::S3Endpoint,
+    bucket: &s3::Bucket,
+    settings: &s3::Settings,
+    environment: &s3::Environment,
+) {
+    fn assert_send<T: Send>(_: &T) {}
+    assert_send(&s3::S3Endpoint::resolve("s3://b/p", settings, environment));
+    assert_send(&s3::Bucket::new(endpoint));
+    assert_send(&bucket.get("config", 1));
+    assert_send(&bucket.get_stream("config"));
+    assert_send(&bucket.put("config", Vec::new()));
+    assert_send(&bucket.put_if_absent("config", Vec::new()));
+    assert_send(&bucket.delete("config"));
+    assert_send(&bucket.list("objects/"));
+    assert_send(&bucket.list_delimited("objects/"));
+    assert_send(&bucket.list_uploads());
 }
 
 /// The futures of a stream session can run on a multi-threaded executor.

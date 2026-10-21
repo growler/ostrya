@@ -571,6 +571,56 @@ feature `std`. Each term below is measured on the resolved dependency graph.
   the feature `s3` yet, so the stripped `target/release/ostrya` holds no
   code of the signer.
 
+### Authorized: the `quick-xml` crate
+
+`quick-xml` 0.42.0 is authorized for `crates/ostrya-remote` alone, as an
+optional dependency behind the feature `s3`. It reads the XML bodies of the
+S3 responses: `ListObjectsV2`, `ListMultipartUploads`, the results of
+`CreateMultipartUpload` and `CompleteMultipartUpload`, and the S3 `Error`
+document. The reader reads a body of at most 4 MiB from a buffer in memory.
+Each term below is measured on the resolved dependency graph.
+
+- License `MIT`.
+- `default-features = false` is mandatory, and no feature is turned on. The
+  default feature set is empty. The features `encoding`, `serialize`,
+  `serde-types`, `async-tokio`, `arbitrary`, `document-features`,
+  `escape-html`, and `overlapped-lists` stay off. `encoding` pulls
+  `encoding_rs` 0.8.42, under `(Apache-2.0 OR MIT) AND BSD-3-Clause`, with
+  a build script, and four more packages: `simdutf8`, `core_detect`,
+  `multiversion_no_op`, and `scopeguard`. S3 sends UTF-8 alone, so the
+  reader has no use for the feature.
+- The reader refuses a `DOCTYPE`. The crate does not read entity
+  definitions and does not expand an entity. It gives each reference to the
+  caller, and the caller accepts the five predefined entities and character
+  references alone. The crate has no depth limit, so the caller refuses a
+  body whose elements are deeper than 32 levels.
+- The graph holds 2 packages under 2 distinct names on the host target:
+  `quick-xml` 0.42.0 and `memchr` 2.8.3. No build of the workspace turns on
+  the feature `s3` by default, so `cargo tree -p quick-xml` does not reach
+  the crate. The graph is measured as the subtree of `quick-xml` in
+  `cargo tree --all-features -p ostrya-remote -e normal,build`. With
+  `--target all` it holds the same 2. `cargo metadata --format-version 1
+  --all-features` counts the same 2 for the closure.
+- No package in the graph declares a `links` key, and no package name in it
+  ends in `-sys`.
+- No package in the graph carries a build script.
+- Every license in the graph is permissive by the rule in "Requirement:
+  permissive licenses only": `quick-xml` states `MIT`, and `memchr` states
+  `Unlicense OR MIT`.
+- The highest minimum supported Rust version in the graph is 1.86, stated
+  by `quick-xml`. `memchr` states 1.61. The workspace pins 1.92, so the
+  requirement holds.
+- `quick-xml` sets `#![forbid(unsafe_code)]`. `memchr` holds `unsafe` code
+  for its SIMD paths, and it was already in the graph.
+- One package enters `Cargo.lock` with it: `quick-xml` 0.42.0. `memchr`
+  2.8.3 was already in the graph through `nom`, `pgp`, `serde_json`, and
+  `buffer-redux`. The lock file also gains the entry `quick-xml` in the
+  dependency list of `ostrya-remote`.
+- No cost to the binary is measured. No command path of `ostrya-cli` turns
+  on the feature `s3` yet, so the stripped `target/release/ostrya` holds no
+  code of the reader. In a test program, the reader of the S3 listing and
+  the S3 error costs 45,528 bytes of a stripped release binary.
+
 ## Requirement: permissive licenses only
 
 The library and everything it links -- every crate in the dependency graph,

@@ -32,12 +32,20 @@ pub enum Error {
     /// [`Fetcher::fetch`](crate::Fetcher::fetch) states the failure order. An
     /// upload returns each status in an [`Uploaded`](crate::Uploaded) and does
     /// not fail with this variant.
+    ///
+    /// A fetch that sets
+    /// [`max_error_body`](crate::FetchRequest::max_error_body) gets the
+    /// headers and the body of the reported response in `response`.
     #[error("http status {status} for {url}")]
     HttpStatus {
         /// The status of the response.
         status: u16,
         /// The URL of the hop that answered with the status.
         url: String,
+        /// The headers and the capped body of the response, if
+        /// [`FetchRequest::max_error_body`](crate::FetchRequest::max_error_body)
+        /// asked for them. `None` otherwise.
+        response: Option<Box<crate::ErrorResponse>>,
     },
     /// A redirect chain that reached the limit of
     /// [`max_redirects`](crate::FetcherOptions::max_redirects).
@@ -95,8 +103,10 @@ pub enum Error {
     ///   past the stall window.
     /// - No response head arrived within the response window.
     /// - The response head is one that the upload does not deliver. Such a
-    ///   head declares a coding, declares a length over the cap, or names a
-    ///   redirect that the upload cannot follow.
+    ///   head names a redirect that the upload cannot follow, or is a 2xx
+    ///   head that declares a coding or a length over the cap. An answer
+    ///   other than 2xx with such a body keeps its status, and the upload
+    ///   withholds the body.
     ///
     /// The server can have received the whole request and acted on it, so the
     /// outcome is unknown. The fetcher does not send the request again.
@@ -150,6 +160,7 @@ mod tests {
             Error::HttpStatus {
                 status: 407,
                 url: "https://h/x".into(),
+                response: None,
             },
         ] {
             assert!(unsent.is_unsent(), "{unsent}");

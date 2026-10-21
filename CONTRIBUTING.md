@@ -47,6 +47,16 @@ need the `server` feature:
 cargo test -p ostrya-mount --features server
 ```
 
+The tests of the bucket client in `ostrya-remote` need the `s3` feature. The
+tests in `crates/ostrya-remote/tests/s3_bucket.rs` run `rclone serve s3` on a
+scratch directory, with a key pair and a port that the server picks. They
+skip if `rclone` is not on `PATH`. If `OSTRYA_REQUIRE_S3` is set, a missing
+`rclone` fails them:
+
+```sh
+OSTRYA_REQUIRE_S3=1 cargo test -p ostrya-remote --features s3
+```
+
 ## Golden fixtures
 
 The golden fixtures are in `tests/fixtures/`. The `ostree` tool wrote them,
@@ -181,6 +191,8 @@ test:
   ownership gate.
 - `OSTRYA_REQUIRE_MOUNT` -- `CAP_SYS_ADMIN` and fs-verity, for the mount
   tests (see "Tests").
+- `OSTRYA_REQUIRE_S3` -- `rclone`, for the tests of the bucket client
+  against `rclone serve s3` (see "Tests").
 
 The CI test job sets `OSTRYA_REQUIRE_GNUPG` and `OSTRYA_REQUIRE_MULTIGROUP`.
 

@@ -13,10 +13,15 @@
 //! query string under each mirror, or an absolute URL. The fetcher sends a
 //! path and a query as written, so the caller escapes them.
 //!
+//! A failed fetch gives the status of the response. On request, it also gives
+//! the headers and a capped body of that response.
+//!
 //! # Entry points
 //!
 //! - [`Fetcher::new`] builds a fetcher from [`FetcherOptions`].
 //! - [`Fetcher::fetch`] sends a [`FetchRequest`] and returns a [`Fetched`].
+//! - [`ErrorResponse`] holds the headers and the capped body of an
+//!   unsuccessful response, if the request asks for them.
 //! - [`Body`] streams a response body in bounded chunks.
 //! - [`Fetcher::refetching`] returns a [`Refetch`], which fetches a failed body again.
 //! - [`Fetcher::upload`] sends an [`UploadRequest`] and returns an [`Uploaded`].
@@ -218,6 +223,11 @@ const UPLOAD_IDLE: Duration = Duration::from_secs(2);
 /// is larger, or if the response declares no length, the fetcher closes the
 /// connection.
 const DRAIN_LIMIT: u64 = 64 * 1024;
+
+/// The largest capacity that a kept error body reserves before its bytes
+/// arrive: 64 KiB. The declared length of the body is a claim of the server,
+/// so it does not size an allocation.
+const CAPTURE_RESERVE: u64 = 64 * 1024;
 
 /// The HTTP/2 flow-control window of each stream. The default of hyper is
 /// 64 KiB, which limits the throughput of one stream on a link with a high
@@ -930,9 +940,11 @@ pub struct FetcherOptions {
     /// attempt reports its own status.
     ///
     /// Zero follows nothing, so each of those statuses is then a definitive
-    /// answer. The count belongs to one attempt, so a repeated round counts
-    /// again from the destination that the route names. [`Fetcher::fetch`]
-    /// states the redirect rules. The default is 10.
+    /// answer. A fetch with [`FetchRequest::max_error_body`] then gets the
+    /// headers of the redirect, `Location` included, in its
+    /// [`Error::HttpStatus`]. The count belongs to one attempt, so a repeated
+    /// round counts again from the destination that the route names.
+    /// [`Fetcher::fetch`] states the redirect rules. The default is 10.
     pub max_redirects: u32,
     /// The number of requests in flight at one time.
     ///
@@ -1269,6 +1281,19 @@ pub struct FetchRequest<'a> {
     /// credential from that one destination. That choice turns a configuration
     /// mistake into a 401 that names nothing.
     pub allow_cleartext_credentials: bool,
+    /// The largest body of an unsuccessful response that the fetch keeps.
+    ///
+    /// With `Some(cap)`, a fetch that fails with [`Error::HttpStatus`] gives
+    /// the headers of the reported response in that error. It also gives the
+    /// body, if the whole body is `cap` bytes or less. `Some(0)` keeps the
+    /// headers and an empty body. [`ErrorResponse`] states when the body is
+    /// absent.
+    ///
+    /// `None` keeps nothing, and the fetch discards each unsuccessful
+    /// response. The default is `None`.
+    ///
+    /// [`Fetcher::fetch`] states the rules in its section "Error responses".
+    pub max_error_body: Option<u64>,
 }
 
 impl std::fmt::Debug for FetchRequest<'_> {
@@ -1281,6 +1306,7 @@ impl std::fmt::Debug for FetchRequest<'_> {
             headers,
             basic_auth,
             allow_cleartext_credentials,
+            max_error_body,
         } = self;
         let headers = RedactedHeaders {
             names: || headers.iter().map(|(name, _)| name.as_str()),
@@ -1293,6 +1319,7 @@ impl std::fmt::Debug for FetchRequest<'_> {
             .field("headers", &headers)
             .field("basic_auth", basic_auth)
             .field("allow_cleartext_credentials", allow_cleartext_credentials)
+            .field("max_error_body", max_error_body)
             .finish()
     }
 }
@@ -1334,6 +1361,7 @@ impl<'a> FetchRequest<'a> {
             headers: &[],
             basic_auth: None,
             allow_cleartext_credentials: false,
+            max_error_body: None,
         }
     }
 }
@@ -1427,6 +1455,32 @@ impl UploadBody {
         };
         (body, writer)
     }
+
+    /// Returns the bytes of a body of [`bytes`](UploadBody::bytes), or `None`
+    /// for a streamed body.
+    pub fn as_bytes(&self) -> Option<&[u8]> {
+        match &self.form {
+            UploadForm::Bytes(bytes) => Some(bytes),
+            UploadForm::Channel(_) => None,
+        }
+    }
+
+    /// Returns a second body with the same bytes, or `None` for a streamed
+    /// body.
+    ///
+    /// The two bodies of [`bytes`](UploadBody::bytes) share the one buffer, so
+    /// the call copies no byte. A caller sends the copy in a second request,
+    /// for example after the first one failed with
+    /// [`Error::UploadInterrupted`]. A [`channel`](UploadBody::channel) body
+    /// has one writer, so it has no copy.
+    pub fn try_clone(&self) -> Option<UploadBody> {
+        match &self.form {
+            UploadForm::Bytes(bytes) => Some(UploadBody {
+                form: UploadForm::Bytes(bytes.clone()),
+            }),
+            UploadForm::Channel(_) => None,
+        }
+    }
 }
 
 impl From<Vec<u8>> for UploadBody {
@@ -1467,9 +1521,11 @@ pub struct UploadRequest<'a> {
     pub priority: Priority,
     /// The largest response body, in bytes, for each status.
     ///
-    /// A larger `Content-Length` fails the upload with
-    /// [`Error::UploadInterrupted`]. If a body grows past the cap while it
-    /// streams, the read fails with
+    /// A larger `Content-Length` of a 2xx answer fails the upload with
+    /// [`Error::UploadInterrupted`]. An answer other than 2xx with a larger
+    /// `Content-Length` keeps its status, and its body is
+    /// [withheld](Uploaded::body_withheld). If a body grows past the cap
+    /// while it streams, the read fails with
     /// [`io::ErrorKind::FileTooLarge`](std::io::ErrorKind::FileTooLarge). The
     /// default is [`UploadRequest::DEFAULT_MAX_RESPONSE`].
     pub max_response: u64,
@@ -1590,6 +1646,8 @@ pub struct Uploaded {
     headers: hyper::HeaderMap,
     url: String,
     body: Body,
+    /// `true` if the upload withheld the body of an answer other than 2xx.
+    withheld: bool,
 }
 
 impl std::fmt::Debug for Uploaded {
@@ -1599,6 +1657,7 @@ impl std::fmt::Debug for Uploaded {
             headers,
             url,
             body,
+            withheld: _,
         } = self;
         let headers = RedactedHeaders {
             names: || headers.iter().map(|(name, _)| name.as_str()),
@@ -1630,6 +1689,17 @@ impl Uploaded {
         &self.url
     }
 
+    /// Returns `true` if the upload withheld the body of the response.
+    ///
+    /// An answer other than 2xx whose head declares a coding, or a
+    /// `Content-Length` over [`max_response`](UploadRequest::max_response),
+    /// comes with its status and its headers alone. Its body is not read:
+    /// [`into_body`](Uploaded::into_body) gives a body that reads as empty,
+    /// and the connection closes. [`Fetcher::upload`] states the rule.
+    pub fn body_withheld(&self) -> bool {
+        self.withheld
+    }
+
     /// Returns the HTTP version of the response.
     pub fn protocol(&self) -> Protocol {
         self.body.protocol()
@@ -1638,9 +1708,68 @@ impl Uploaded {
     /// Returns the response body, capped at
     /// [`max_response`](UploadRequest::max_response).
     ///
-    /// The body holds the admission permit until it ends or is dropped.
+    /// The body holds the admission permit until it ends or is dropped. A
+    /// [withheld](Uploaded::body_withheld) body reads as empty and holds no
+    /// permit.
     pub fn into_body(self) -> Body {
         self.body
+    }
+}
+
+/// The headers and the capped body of an unsuccessful response to a fetch.
+///
+/// [`Error::HttpStatus`] carries it if the request set
+/// [`max_error_body`](FetchRequest::max_error_body). A caller outside this
+/// crate builds one with [`new`](ErrorResponse::new).
+///
+/// The [`Debug`] output shows the name of each header, and `<redacted>` in
+/// place of its value. A header with several values shows its name once for
+/// each value. The body shows as its length.
+pub struct ErrorResponse {
+    headers: hyper::HeaderMap,
+    body: Option<Vec<u8>>,
+}
+
+impl std::fmt::Debug for ErrorResponse {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let ErrorResponse { headers, body } = self;
+        let headers = RedactedHeaders {
+            names: || headers.iter().map(|(name, _)| name.as_str()),
+        };
+        f.debug_struct("ErrorResponse")
+            .field("headers", &headers)
+            .field("body", &body.as_ref().map(Vec::len))
+            .finish()
+    }
+}
+
+impl ErrorResponse {
+    /// Creates a response of `headers` and `body`.
+    pub fn new(headers: hyper::HeaderMap, body: Option<Vec<u8>>) -> ErrorResponse {
+        ErrorResponse { headers, body }
+    }
+
+    /// Returns the headers of the response.
+    pub fn headers(&self) -> &hyper::HeaderMap {
+        &self.headers
+    }
+
+    /// Returns the whole body of the response.
+    ///
+    /// The body is `None` in these cases:
+    ///
+    /// - the response declared a `Content-Length` over the cap
+    /// - the body grew past the cap while it arrived
+    /// - the response declared a coding in `Content-Encoding` or
+    ///   `Transfer-Encoding`
+    /// - the body failed in transit
+    /// - the body did not arrive in full within one
+    ///   [`progress_timeout`](FetcherOptions::progress_timeout) from the
+    ///   arrival of the response head.
+    ///
+    /// The fetcher never keeps a part of a body.
+    pub fn body(&self) -> Option<&[u8]> {
+        self.body.as_deref()
     }
 }
 
@@ -2390,6 +2519,45 @@ impl Failure {
             Failure::Retry(e) | Failure::Fatal(e) | Failure::Final(e) => e,
         }
     }
+
+    /// Returns the cap of the error body that `keep` asks for in the class of
+    /// this failure, or `None` if the fetch keeps no response of this class.
+    fn kept_cap(&self, keep: Option<Keep>) -> Option<u64> {
+        let keep = keep?;
+        match self {
+            Failure::Retry(_) if keep.retryable => Some(keep.cap),
+            Failure::Fatal(_) if keep.definitive => Some(keep.cap),
+            _ => None,
+        }
+    }
+
+    /// Puts `kept` into the [`Error::HttpStatus`] of this failure. A failure
+    /// of another error stays as it is.
+    fn with_response(mut self, kept: ErrorResponse) -> Failure {
+        if let Failure::Retry(Error::HttpStatus { response, .. })
+        | Failure::Fatal(Error::HttpStatus { response, .. }) = &mut self
+        {
+            *response = Some(Box::new(kept));
+        }
+        self
+    }
+}
+
+/// The unsuccessful responses that one attempt of a fetch keeps.
+///
+/// A fetch reports one failure. So an attempt reads the body of a failure
+/// only if that failure can become the reported one. The flags follow the
+/// failure order of [`Fetcher::fetch`].
+#[derive(Clone, Copy)]
+struct Keep {
+    /// The largest body to keep: [`FetchRequest::max_error_body`].
+    cap: u64,
+    /// `true` if no failure is reported yet, so a retryable failure becomes
+    /// the reported one.
+    retryable: bool,
+    /// `true` if no definitive answer is reported yet, so a definitive answer
+    /// becomes the reported one.
+    definitive: bool,
 }
 
 /// A failed upload attempt, and the send state of the request.
@@ -2464,6 +2632,12 @@ type UploadResponse = (Response<Incoming>, Protocol, RequestEnd, Option<H1Sender
 /// 64 KiB or less, the fetcher reads the body to the end. The HTTP/1.1
 /// connection then goes back to the pool. If the declared length is larger, or
 /// if there is none, the fetcher closes the connection.
+///
+/// A fetch with [`FetchRequest::max_error_body`] reads the body of the
+/// unsuccessful response that it reports, up to that cap, with or without a
+/// declared length. If the body ends within the cap, the HTTP/1.1 connection
+/// goes back to the pool. If it grows past the cap, the fetcher closes the
+/// connection. [`Fetcher::fetch`] states the rule in "Error responses".
 ///
 /// A 404 is the usual answer for an object that the remote does not hold. So
 /// this rule saves a connection setup for each absent object.
@@ -2850,6 +3024,12 @@ impl Fetcher {
     /// the response that answered, which after a redirect is the URL of the
     /// last hop.
     ///
+    /// A fetch with [`max_error_body`](FetchRequest::max_error_body) and a
+    /// redirect limit of zero gets each redirect as an unsuccessful response.
+    /// So the caller reads its headers, for example `Location`, and its body.
+    /// A redirect with no usable `Location` is also such a response, at any
+    /// limit.
+    ///
     /// # Content coding
     ///
     /// A fetch gives the bytes that the remote stores. So each request carries
@@ -2866,6 +3046,41 @@ impl Fetcher {
     ///
     /// `chunked` frames a message, and the connection removes the framing. So a
     /// response with `chunked` alone gives the body as the remote wrote it.
+    ///
+    /// # Error responses
+    ///
+    /// A request with [`max_error_body`](FetchRequest::max_error_body) set
+    /// keeps the unsuccessful response that the fetch reports. The
+    /// [`Error::HttpStatus`] then carries an [`ErrorResponse`] with the
+    /// headers of that response, and its body if the whole body is within the
+    /// cap.
+    ///
+    /// - The fetch reads the body of a failure only if the failure order can
+    ///   make it the reported failure. So it reads at most two bodies: one
+    ///   retryable failure and one definitive answer. It keeps the body of the
+    ///   failure that it reports. If each round gets a 503, the error holds
+    ///   the body of the first 503. A 503 and then a 404 give the body of the
+    ///   404.
+    /// - The read takes place within one
+    ///   [`progress_timeout`](FetcherOptions::progress_timeout) from the
+    ///   arrival of the response head, and within
+    ///   [`fetch_timeout`](FetcherOptions::fetch_timeout). The
+    ///   [`low_speed`](FetcherOptions::low_speed) rule does not apply to it.
+    /// - The fetch does not read a body that declares a coding or a
+    ///   `Content-Length` over the cap. It discards such a body, and the error
+    ///   holds the headers alone.
+    /// - A body that grows past the cap, fails in transit, or does not end
+    ///   within the window gives the headers alone. The fetch keeps no part of
+    ///   such a body.
+    /// - The read never changes the retry class of the status.
+    /// - The bytes of a kept body do not count in the received counters of
+    ///   [`counted`](Fetcher::counted).
+    ///
+    /// Before a body arrives, the read reserves at most 64 KiB, whatever
+    /// length the response declares. The capacity of a kept body never passes
+    /// the cap. So the fetch holds at most two kept bodies of at most the cap
+    /// each, one retryable and one definitive, and one frame of the body that
+    /// it reads.
     ///
     /// # Errors
     ///
@@ -2907,7 +3122,9 @@ impl Fetcher {
     ///   expires.
     /// - [`Error::HttpStatus`] if a destination answers with a status other
     ///   than 200 and 304. This includes a redirect that the fetch does not
-    ///   follow: no usable `Location`, or a redirect limit of zero.
+    ///   follow: no usable `Location`, or a redirect limit of zero. With
+    ///   [`max_error_body`](FetchRequest::max_error_body), the error carries
+    ///   the response, as the rules of the error responses state.
     /// - [`Error::RedirectLimit`] if an attempt follows
     ///   [`max_redirects`](FetcherOptions::max_redirects) redirects, and the
     ///   next response names a URL to follow.
@@ -3118,7 +3335,14 @@ impl Fetcher {
                     }
                     Route::One(destination) => Cow::Borrowed(destination),
                 };
-                let failure = match self.attempt(&destination, request, headers).await {
+                // A fetch reads at most one body of each class, and keeps the
+                // body of the failure that it reports.
+                let keep = request.max_error_body.map(|cap| Keep {
+                    cap,
+                    retryable: reported.is_none(),
+                    definitive: !definitive,
+                });
+                let failure = match self.attempt(&destination, request, headers, keep).await {
                     Ok(Attempted::Body(mut body)) => {
                         body.permit = Some(permit);
                         return Ok((Fetched::Body(body), round));
@@ -3168,11 +3392,15 @@ impl Fetcher {
     /// If the first response answers the request, all three stay as they
     /// start. So the attempt builds no URL, copies no header list, and
     /// allocates no bookkeeping.
+    ///
+    /// `keep` names the unsuccessful responses whose headers and body the
+    /// attempt keeps in the failure. The attempt discards each other one.
     async fn attempt(
         &self,
         destination: &Destination,
         request: &FetchRequest<'_>,
         headers: &[(HeaderName, HeaderValue)],
+        keep: Option<Keep>,
     ) -> std::result::Result<Attempted, Failure> {
         // The origin that the route names. A credential and the client
         // certificate go to this origin alone.
@@ -3249,8 +3477,9 @@ impl Fetcher {
                     // There is no URL to follow. So the attempt reports the
                     // status of the hop, whatever the hop count is.
                     let failure = classify(status, url);
-                    self.discard(&key, response, reuse, drain_until).await;
-                    return Err(failure);
+                    return Err(self
+                        .conclude(&key, response, reuse, drain_until, failure, keep)
+                        .await);
                 };
                 // The limit stops the attempt at a URL that it can follow. So
                 // the attempt reads the limit after the `Location` names a URL.
@@ -3299,8 +3528,9 @@ impl Fetcher {
             }
             if status != StatusCode::OK {
                 let failure = classify(status, url);
-                self.discard(&key, response, reuse, drain_until).await;
-                return Err(failure);
+                return Err(self
+                    .conclude(&key, response, reuse, drain_until, failure, keep)
+                    .await);
             }
             // A coded body holds bytes other than the bytes that the remote
             // stores. So the declared length tells nothing about the object,
@@ -3484,15 +3714,126 @@ impl Fetcher {
         reuse: Option<H1Sender>,
         drain_until: Instant,
     ) {
+        let length = content_length(response.headers());
+        self.drain(key, length, response.into_body(), reuse, drain_until)
+            .await;
+    }
+
+    /// Ends an attempt with the unsuccessful response that `failure`
+    /// classifies, and returns the failure.
+    ///
+    /// If `keep` asks for a response of the class of the failure, the
+    /// function reads the response with [`capture`](Fetcher::capture) and
+    /// puts it into the failure. Else it discards the response.
+    async fn conclude(
+        &self,
+        key: &PoolKey,
+        response: Response<Incoming>,
+        reuse: Option<H1Sender>,
+        drain_until: Instant,
+        failure: Failure,
+        keep: Option<Keep>,
+    ) -> Failure {
+        match failure.kept_cap(keep) {
+            None => {
+                self.discard(key, response, reuse, drain_until).await;
+                failure
+            }
+            Some(cap) => {
+                let kept = self.capture(key, response, reuse, cap).await;
+                failure.with_response(kept)
+            }
+        }
+    }
+
+    /// Reads the headers and the body of an unsuccessful response, for the
+    /// error of the fetch.
+    ///
+    /// The function keeps the whole body if it is `cap` bytes or less, and
+    /// keeps no part of a larger body. It reads no body that declares a
+    /// coding or a length over the cap, and discards it as
+    /// [`discard`](Fetcher::discard) does. A body that grows past the cap, or
+    /// fails, closes its connection.
+    ///
+    /// Before the first byte, the function reserves at most
+    /// [`CAPTURE_RESERVE`] bytes, whatever length the response declares. The
+    /// capacity of the kept body never passes `cap`.
+    ///
+    /// All reads take place within one progress window from the call. The
+    /// read stops at the end of the window, and the body is then absent. The
+    /// bytes do not count in the received counters, because they are not part
+    /// of an object. A clean end of the body returns an HTTP/1.1 connection to
+    /// the pool.
+    async fn capture(
+        &self,
+        key: &PoolKey,
+        response: Response<Incoming>,
+        reuse: Option<H1Sender>,
+        cap: u64,
+    ) -> ErrorResponse {
+        let until = Instant::now() + self.inner.progress_timeout;
+        let (parts, mut body) = response.into_parts();
+        let headers = parts.headers;
+        let length = content_length(&headers);
+        if declared_coding(&headers).is_some() || length.is_some_and(|length| length > cap) {
+            self.drain(key, length, body, reuse, until).await;
+            return ErrorResponse::new(headers, None);
+        }
+        // The declared length is a claim of the server, so the reserve before
+        // the first byte stays small. The vector grows as the bytes arrive.
+        let reserve = length.unwrap_or(0).min(cap).min(CAPTURE_RESERVE);
+        let mut bytes = Vec::with_capacity(usize::try_from(reserve).unwrap_or(0));
+        let budget = until.saturating_duration_since(Instant::now());
+        let read = within(budget, async {
+            loop {
+                let frame = std::future::poll_fn(|cx| Pin::new(&mut body).poll_frame(cx)).await;
+                match frame {
+                    Some(Ok(frame)) => {
+                        // A trailer carries no bytes of the body.
+                        let Ok(data) = frame.into_data() else {
+                            continue;
+                        };
+                        if !extend_capped(&mut bytes, &data, cap) {
+                            return false;
+                        }
+                    }
+                    Some(Err(_)) => return false,
+                    None => return true,
+                }
+            }
+        })
+        .await;
+        if read != Some(true) {
+            // The rest of the response is still in flight, so the connection
+            // closes when `reuse` drops.
+            return ErrorResponse::new(headers, None);
+        }
+        if let Some(sender) = reuse {
+            self.inner.put_h1(key, sender);
+        }
+        ErrorResponse::new(headers, Some(bytes))
+    }
+
+    /// Reads a response body of the declared `length` to its end within
+    /// `drain_until`, and returns its HTTP/1.1 connection to the pool.
+    ///
+    /// [`discard`](Fetcher::discard) states the rule.
+    async fn drain(
+        &self,
+        key: &PoolKey,
+        length: Option<u64>,
+        mut body: Incoming,
+        reuse: Option<H1Sender>,
+        drain_until: Instant,
+    ) {
         let Some(sender) = reuse else { return };
-        if content_length(response.headers()).is_none_or(|length| length > DRAIN_LIMIT) {
+        if length.is_none_or(|length| length > DRAIN_LIMIT) {
             return;
         }
         let budget = drain_until.saturating_duration_since(Instant::now());
         if budget.is_zero() {
             return;
         }
-        let mut body = response.into_body();
         // The drain runs in the remaining window of the attempt. So a peer that
         // declares a short body and then stops costs the attempt no more than a
         // stalled body, whatever the hop count.
@@ -3577,6 +3918,21 @@ impl Fetcher {
     /// - each redirect if [`max_redirects`](FetcherOptions::max_redirects) is
     ///   0.
     ///
+    /// # Unsuccessful answers
+    ///
+    /// An answer other than 2xx returns an [`Uploaded`] with its status and
+    /// its headers, also when the upload cannot deliver its body. The upload
+    /// does not deliver a body that declares a coding in `Content-Encoding` or
+    /// `Transfer-Encoding`, or a `Content-Length` over
+    /// [`max_response`](UploadRequest::max_response). It withholds such a
+    /// body: [`Uploaded::body_withheld`] returns `true`, the body reads as
+    /// empty, and the connection closes. So a definitive refusal, for example
+    /// a 403 behind a proxy that compresses it, keeps its status, and the
+    /// caller does not take it for an interrupted upload.
+    ///
+    /// A 2xx answer with such a body fails the upload with
+    /// [`Error::UploadInterrupted`].
+    ///
     /// # Connections
     ///
     /// An upload uses the pooled HTTP/2 connection of its origin. It takes an
@@ -3615,8 +3971,8 @@ impl Fetcher {
     ///
     /// The stop of the body closes an HTTP/1.1 connection and resets an HTTP/2
     /// stream. The same applies to a response that the upload does not
-    /// deliver: a followed redirect, a refused coding, and a declared length
-    /// over the cap.
+    /// deliver: a followed redirect, a refused coding, a declared length over
+    /// the cap, and a withheld body.
     ///
     /// # Deadlines
     ///
@@ -3684,8 +4040,8 @@ impl Fetcher {
     /// - [`Error::Fetch`] if [`fetch_timeout`](FetcherOptions::fetch_timeout)
     ///   expires before the hand-over.
     /// - [`Error::UploadInterrupted`] if a failure occurs after the hand-over.
-    ///   This includes a refused redirect hop, a redirect past the limit, a
-    ///   response that declares a coding, and a `Content-Length` over
+    ///   This includes a refused redirect hop, a redirect past the limit, and
+    ///   a 2xx response that declares a coding or a `Content-Length` over
     ///   [`max_response`](UploadRequest::max_response). The message names the
     ///   cause.
     ///
@@ -3766,7 +4122,9 @@ impl Fetcher {
                 }
             },
         };
-        uploaded.body.permit = Some(permit);
+        if !uploaded.withheld {
+            uploaded.body.permit = Some(permit);
+        }
         Ok(uploaded)
     }
 
@@ -3920,53 +4278,70 @@ impl Fetcher {
                 *body = Some(BodyEnd::whole(bytes));
                 continue;
             }
-            if let Some(encoding) = declared_coding(response.headers()) {
-                return Err(undelivered(
-                    url,
-                    Error::ContentEncoded {
-                        url: url.to_string(),
-                        encoding,
-                    },
-                ));
-            }
+            let coding = declared_coding(response.headers());
             let content_length = content_length(response.headers());
-            if content_length.is_some_and(|length| length > plan.max_response) {
-                return Err(undelivered(
-                    url,
-                    Error::FetchTooLarge {
-                        limit: plan.max_response,
-                    },
-                ));
+            let over = content_length.is_some_and(|length| length > plan.max_response);
+            // An answer other than 2xx keeps its status and its headers, so a
+            // refusal of the server reaches the caller as a refusal. Its body
+            // is withheld, and the connection closes.
+            let withheld = !status.is_success() && (coding.is_some() || over);
+            if !withheld {
+                if let Some(encoding) = coding {
+                    return Err(undelivered(
+                        url,
+                        Error::ContentEncoded {
+                            url: url.to_string(),
+                            encoding,
+                        },
+                    ));
+                }
+                if over {
+                    return Err(undelivered(
+                        url,
+                        Error::FetchTooLarge {
+                            limit: plan.max_response,
+                        },
+                    ));
+                }
             }
             let protocol = match response.version() {
                 Version::HTTP_2 => Protocol::Http2,
                 _ => protocol,
             };
             let (parts, incoming) = response.into_parts();
+            // A withheld body ends at once. Its request body stops, and its
+            // HTTP/1.1 connection does not go back to the pool, because the
+            // rest of the response is still in flight.
+            let (reuse, request_body) = if withheld {
+                (None, None)
+            } else {
+                (reuse, Some(request_end))
+            };
             return Ok(Uploaded {
                 status: parts.status,
                 headers: parts.headers,
                 url: url.to_string(),
+                withheld,
                 body: Body {
                     incoming,
                     chunk: Bytes::new(),
                     received: 0,
                     max_size: Some(plan.max_response),
                     validators: Validators::default(),
-                    content_length,
+                    content_length: if withheld { None } else { content_length },
                     protocol,
                     inner: self.inner.clone(),
                     counters: self.received.clone(),
                     key,
                     reuse,
                     permit: None,
-                    done: false,
+                    done: withheld,
                     failed: None,
                     deadline: rt::Deadline::new(self.inner.progress_timeout),
                     waiting: false,
                     low_speed: None,
                     interrupted: None,
-                    request_body: Some(request_end),
+                    request_body,
                 },
             });
         }
@@ -6351,6 +6726,7 @@ fn classify(status: StatusCode, url: &str) -> Failure {
     let error = Error::HttpStatus {
         status: status.as_u16(),
         url: url.to_string(),
+        response: None,
     };
     if status.is_server_error()
         || status == StatusCode::REQUEST_TIMEOUT
@@ -6412,6 +6788,24 @@ fn interrupted(url: &str, message: String) -> UploadFailure {
 /// the cause.
 fn undelivered(url: &str, cause: Error) -> UploadFailure {
     interrupted(url, cause.to_string())
+}
+
+/// Appends `data` to `bytes` if the result holds at most `cap` bytes, and
+/// returns `false` otherwise.
+///
+/// The capacity of `bytes` doubles as it grows, and never passes `cap`.
+fn extend_capped(bytes: &mut Vec<u8>, data: &[u8], cap: u64) -> bool {
+    let needed = bytes.len().saturating_add(data.len());
+    if needed as u64 > cap {
+        return false;
+    }
+    if needed > bytes.capacity() {
+        let doubled = bytes.capacity().saturating_mul(2).max(needed);
+        let grown = usize::try_from(cap).map_or(doubled, |cap| doubled.min(cap));
+        bytes.reserve_exact(grown - bytes.len());
+    }
+    bytes.extend_from_slice(data);
+    true
 }
 
 /// Returns the message of an error and of its cause.
@@ -6549,6 +6943,7 @@ const _: fn() = || {
     assert_send_sync::<UploadWriter>();
     assert_send_sync::<UploadRequest<'static>>();
     assert_send_sync::<Uploaded>();
+    assert_send_sync::<ErrorResponse>();
 };
 
 #[cfg(test)]
@@ -9210,6 +9605,7 @@ mod tests {
         let headers = secret_headers();
         let request = FetchRequest {
             headers: &headers,
+            max_error_body: Some(4096),
             ..FetchRequest::path("summary")
         };
         let rendered = format!("{request:?}");
@@ -9219,9 +9615,65 @@ mod tests {
             format!(
                 "FetchRequest {{ target: Path(\"summary\"), priority: Normal, \
                  validators: None, max_size: None, headers: {SECRET_HEADERS_SHOWN}, \
-                 basic_auth: None, allow_cleartext_credentials: false }}"
+                 basic_auth: None, allow_cleartext_credentials: false, \
+                 max_error_body: Some(4096) }}"
             )
         );
+    }
+
+    /// The `Debug` output of a kept error response shows the name of each
+    /// header and the length of the body. It shows no header value and no
+    /// byte of the body, in the response and in the error that carries it.
+    #[test]
+    fn an_error_response_debug_holds_no_header_value_and_no_body() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            hyper::header::SET_COOKIE,
+            HeaderValue::from_static("session=QXZ"),
+        );
+        let response = ErrorResponse::new(headers, Some(b"SECRETBODY".to_vec()));
+        assert_eq!(
+            format!("{response:?}"),
+            "ErrorResponse { headers: [(\"set-cookie\", \"<redacted>\")], body: Some(10) }"
+        );
+        let error = Error::HttpStatus {
+            status: 403,
+            url: "https://h/x".into(),
+            response: Some(Box::new(response)),
+        };
+        let rendered = format!("{error:?}");
+        assert!(!rendered.contains("QXZ"), "{rendered}");
+        assert!(!rendered.contains("SECRETBODY"), "{rendered}");
+        assert_eq!(error.to_string(), "http status 403 for https://h/x");
+    }
+
+    /// An error response gives back the headers and the body that it was
+    /// built from.
+    #[test]
+    fn an_error_response_keeps_its_parts() {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert("x-amz-bucket-region", HeaderValue::from_static("eu-west-1"));
+        let response = ErrorResponse::new(headers.clone(), Some(b"<Error/>".to_vec()));
+        assert_eq!(response.headers(), &headers);
+        assert_eq!(response.body(), Some(&b"<Error/>"[..]));
+        let headless = ErrorResponse::new(hyper::HeaderMap::new(), None);
+        assert!(headless.headers().is_empty());
+        assert_eq!(headless.body(), None);
+    }
+
+    /// A body of bytes has a copy that shares its buffer. A streamed body has
+    /// no copy.
+    #[test]
+    fn a_bytes_body_clones_and_a_channel_body_does_not() {
+        let body = UploadBody::bytes(b"part".to_vec());
+        let copy = body.try_clone().expect("a bytes body has a copy");
+        let (UploadForm::Bytes(first), UploadForm::Bytes(second)) = (&body.form, &copy.form) else {
+            panic!("the copy of a bytes body is a bytes body");
+        };
+        assert_eq!(first, second);
+        assert_eq!(first.as_ptr(), second.as_ptr());
+        let (channel, _writer) = UploadBody::channel();
+        assert!(channel.try_clone().is_none());
     }
 
     /// The `Debug` output of an upload request shows each header name and no
@@ -9519,5 +9971,67 @@ mod tests {
             rendered.contains(r#"target: Url("https://example.com/repo?<redacted>#<redacted>")"#),
             "{rendered}"
         );
+    }
+
+    /// A kept error body with no declared length grows as its frames arrive,
+    /// and its capacity never passes the cap. The first frame of 10,000 bytes
+    /// and the frames of 16 KiB after it do not fall on the cap.
+    #[test]
+    fn a_kept_error_body_holds_no_capacity_past_the_cap() {
+        use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
+
+        const CAP: usize = 100_000;
+        rt::block_on(async {
+            let peer = rt::TcpListener::bind("127.0.0.1:0".parse().unwrap())
+                .await
+                .unwrap();
+            let port = peer.local_addr().unwrap().port();
+            drop(rt::spawn(async move {
+                while let Ok((mut stream, _peer)) = peer.accept().await {
+                    let mut request = [0u8; 1024];
+                    let _ = stream.read(&mut request).await;
+                    let mut answer =
+                        b"HTTP/1.1 404 Not Found\r\nTransfer-Encoding: chunked\r\n\r\n".to_vec();
+                    let mut left = CAP - 1;
+                    let mut size = 10_000;
+                    while left > 0 {
+                        let n = size.min(left);
+                        answer.extend_from_slice(format!("{n:x}\r\n").as_bytes());
+                        answer.resize(answer.len() + n, b'e');
+                        answer.extend_from_slice(b"\r\n");
+                        left -= n;
+                        size = 16 * 1024;
+                    }
+                    answer.extend_from_slice(b"0\r\n\r\n");
+                    for piece in answer.chunks(size) {
+                        if stream.write_all(piece).await.is_err() || stream.flush().await.is_err() {
+                            break;
+                        }
+                    }
+                }
+            }));
+            let fetcher = Fetcher::new(direct_options(format!("http://127.0.0.1:{port}")))
+                .await
+                .unwrap();
+            let request = FetchRequest {
+                max_error_body: Some(CAP as u64),
+                ..FetchRequest::path("config")
+            };
+            let err = within(Duration::from_secs(10), fetcher.fetch(request))
+                .await
+                .expect("the fetch ends within the limit")
+                .unwrap_err();
+            let Error::HttpStatus {
+                status: 404,
+                response: Some(response),
+                ..
+            } = err
+            else {
+                panic!("{err}");
+            };
+            let body = response.body.as_ref().expect("the body is kept");
+            assert_eq!(body.len(), CAP - 1);
+            assert!(body.capacity() <= CAP, "capacity {}", body.capacity());
+        });
     }
 }

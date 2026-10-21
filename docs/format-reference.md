@@ -2541,7 +2541,8 @@ The part holds these items:
 - the commit of `push-tree`;
 - the composefs image object;
 - the protocol of the composefs mount daemon;
-- the mode `bare-user-shared`.
+- the mode `bare-user-shared`;
+- the S3 bucket repository.
 
 The push protocol, the pull protocol, and the protocol of the mount daemon
 each have a version number. All three versions are 1. The numbers are
@@ -5455,3 +5456,89 @@ the repository serves as the lower layer of an image exported from any mode
 that holds the same tree. The fs-verity digest of each file covers the
 payload. The composefs uid mapping presents the owner at mount time, so the
 root-owned metadata is correct also inside a rootless container.
+
+## The S3 bucket repository
+
+A bucket repository is a repository in `archive` form in an S3 bucket. Each
+file of the repository is one object of the bucket. The key of the object is
+the path of the file under the prefix of the address. The bucket client of
+the port (`ostrya_remote::s3::Bucket`) reads and writes the objects with the
+S3 API. It signs each request with AWS Signature Version 4.
+
+### The address
+
+The address of a bucket repository is `s3://BUCKET[/PREFIX]`.
+
+- `BUCKET` is 3 to 63 characters: lowercase ASCII letters, digits, `.`, and
+  `-`. It starts and ends with a letter or a digit. It holds no `..`, and it
+  is not four decimal numbers that `.` separates.
+- `PREFIX` is one or more segments that `/` separates. Each segment is not
+  empty, is not `.` or `..`, and holds the characters `A-Z a-z 0-9 - . _ ~`
+  alone. One trailing `/` is dropped.
+- The address holds no userinfo, no port, no query, and no fragment.
+
+The endpoint and the addressing style give the URL of the bucket:
+
+- With no endpoint, the endpoint is AWS, `https://s3.REGION.amazonaws.com`.
+- An endpoint is an `http://` or an `https://` URL with no path, no query, no
+  fragment, and no userinfo.
+- Path style puts the bucket in the path: `ENDPOINT/BUCKET`. Virtual-host
+  style puts the bucket in the host: `SCHEME://BUCKET.HOST[:PORT]`.
+- The default style is virtual-host for AWS and path for an endpoint of the
+  caller. A bucket name that holds a `.` gets path style by default. A style
+  that the caller sets wins.
+- Virtual-host style is refused for a bucket name that holds a `.` over
+  `https`, and for an endpoint whose host is an IP address.
+
+### The keys of a bucket repository
+
+The keys are relative to the prefix, and each key starts with `PREFIX/`.
+With no prefix, a key has no leading `/`. The keys of a bucket repository
+are:
+
+- `config`, `summary`, `summary.sig`, and `extensions/ostrya/lock`
+- `objects/XX/<62 hex digits>.<ext>`, in lowercase hex, with `XX` the first
+  two digits of the checksum, and `<ext>` one of `commit`, `commitmeta`,
+  `dirtree`, `dirmeta`, `filez`, `tombstone-commit`, and `cfs`
+- `refs/heads/<name>`, with a ref name of "Ref name validation"
+- `deltas/<2>/<41>/<target>` and `deltas/<2>/<41>-<43>/<target>`, the layout
+  of "Static delta directories", with the checksums in modified base64 and
+  the target `superblock` or a part number with no leading zero
+- `delta-indexes/<2>/<41>.index`, the layout of "Static delta index files".
+
+The bucket client refuses each other key before it sends a request. A key
+from a listing that is not one of these keys is a stray key.
+
+The request path of a key encodes each byte other than `A-Z a-z 0-9 - . _ ~
+/` as `%XX` with uppercase hex digits. A `+` of a delta key goes as `%2B`,
+and a non-ASCII character of a ref name goes as the `%XX` of each of its
+UTF-8 bytes. The path is the canonical URI of SigV4.
+
+A list of a bucket repository is `ListObjectsV2` with the encoding type
+`url`. The `prefix` parameter of each list ends in `/`: `PREFIX/objects/XX/`,
+`PREFIX/objects/`, `PREFIX/refs/heads/`, `PREFIX/deltas/`, and `PREFIX/` for
+the list of the multipart uploads. Without the `/`, a list for `s3://b/repo`
+also gives the keys of `s3://b/repo2`. With no prefix, the list of the
+multipart uploads covers the whole bucket, and the bucket client keeps an
+upload only when its key is a key of a bucket repository.
+
+In a listing with the encoding type `url`, each `%XX` is the byte that it
+names and each `+` is a space. `rclone serve s3` 1.75.1 writes the key
+`a+b` as `a%2Bb`, the key `sp ace` as `sp+ace`, and the key `ü` as `%C3%BC`.
+
+The bucket client follows the pages of a list with `continuation-token`,
+and the pages of the list of the multipart uploads with `key-marker` and
+`upload-id-marker`. Each page must move forward, or the list fails:
+
+- Each decoded key and common prefix of a page of `ListObjectsV2` comes
+  after each one of the earlier pages, in the byte order of UTF-8.
+- A truncated page of `ListObjectsV2` with no key and no common prefix gives
+  a continuation token that no page gave after the last page with a key or
+  a common prefix, that page included. A run of more than 1000 such pages
+  fails the list.
+- The `NextKeyMarker` of each truncated page of `ListMultipartUploads` does
+  not come before the key marker of the page before it, in the byte order
+  of UTF-8. While the key marker stays the same, the `NextUploadIdMarker` is
+  one that no earlier page gave for that key marker. S3 sorts the uploads of
+  one key by the time of their start, so the upload id markers of one key
+  have no order.

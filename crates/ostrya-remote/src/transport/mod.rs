@@ -29,6 +29,21 @@ use crate::session::{
 pub(crate) use ssh::Transport;
 pub use ssh::{SshAddress, SshOptions, without_userinfo};
 
+/// The refusal of an `s3://` address by [`Endpoint::parse`].
+#[cfg(feature = "s3")]
+const S3_ADDRESS: &str = "an s3:// address needs credentials, which Endpoint::parse does not read: build the \
+     endpoint with s3::S3Endpoint::resolve";
+
+/// The refusal of an `s3://` address by [`Endpoint::parse`].
+#[cfg(not(feature = "s3"))]
+const S3_ADDRESS: &str = "an s3:// address needs the S3 support of ostrya-remote, and this build has none: turn on \
+     the feature s3";
+
+/// The refusal of an S3 endpoint by a session constructor.
+#[cfg(feature = "s3")]
+const S3_SESSION: &str = "an S3 endpoint opens no push session and no pull session: open its \
+     client with s3::Bucket::new";
+
 /// The longest wait for a pending message after a failed write, and for the
 /// exit of the ssh client. It applies to a session that
 /// [`PushSession::connect`] or [`StreamSession::connect`] opens.
@@ -41,7 +56,14 @@ const PENDING_READ_LIMIT: Duration = Duration::from_secs(5);
 ///
 /// The [`Debug`] output of [`Endpoint::Http`] is the output of
 /// [`FetcherOptions`](ostrya_fetch::FetcherOptions), which shows no
-/// credential, no header value, and no userinfo.
+/// credential, no header value, and no userinfo. The [`Debug`] output of
+/// `Endpoint::S3` is the output of `S3Endpoint`, which shows no secret
+/// access key and no session token.
+///
+/// The enum is `#[non_exhaustive]`, so a `match` outside this crate needs a
+/// wildcard arm. With the `s3` feature, it has the variant `Endpoint::S3`.
+/// A crate that matches each variant compiles with and without that
+/// feature.
 ///
 /// # HTTP addresses
 ///
@@ -54,6 +76,7 @@ const PENDING_READ_LIMIT: Duration = Duration::from_secs(5);
 // endpoint for each remote, so a box saves no work, and the variant stays
 // inline.
 #[allow(clippy::large_enum_variant)]
+#[non_exhaustive]
 pub enum Endpoint {
     /// An ssh address and the options of the ssh client.
     Ssh {
@@ -67,6 +90,16 @@ pub enum Endpoint {
     /// [`mirrors`](ostrya_fetch::FetcherOptions::mirrors) holds the address:
     /// exactly one mirror for a push, one or more for a pull.
     Http(ostrya_fetch::FetcherOptions),
+    /// A bucket repository: the location, the credentials, and the HTTP
+    /// options of its client.
+    ///
+    /// [`s3::Bucket::new`](crate::s3::Bucket::new) opens its client. No push
+    /// session and no pull session opens to it:
+    /// [`PushSession::prepare`], [`PushSession::connect`], and
+    /// [`PullSession::connect`] refuse it.
+    #[cfg(feature = "s3")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "s3")))]
+    S3(crate::s3::S3Endpoint),
 }
 
 impl Endpoint {
@@ -78,12 +111,17 @@ impl Endpoint {
     /// address. Each other address gives [`Endpoint::Ssh`] with the default
     /// [`SshOptions`].
     ///
+    /// An `s3://` address is refused. An S3 endpoint needs credentials, and
+    /// this call reads none. With the `s3` feature,
+    /// `s3::S3Endpoint::resolve` builds the endpoint.
+    ///
     /// # Errors
     ///
     /// - [`Error::InvalidInput`] if `address` is not one of the
     ///   [ssh forms](SshAddress#forms) or the
     ///   [HTTP forms](Endpoint#http-addresses), or if the parse refuses a
     ///   part of it. No refusal shows the userinfo of the address.
+    /// - [`Error::InvalidInput`] if `address` starts with `s3://`.
     ///
     /// # Examples
     ///
@@ -111,6 +149,9 @@ impl Endpoint {
 /// Parses `address` as [`Endpoint::parse`] does, with the Windows rules of an
 /// ssh address if `windows` is `true`.
 fn parse_endpoint(address: &str, windows: bool) -> Result<Endpoint> {
+    if address.starts_with("s3://") {
+        return Err(Error::InvalidInput(S3_ADDRESS.into()));
+    }
     if address.starts_with("http://") || address.starts_with("https://") {
         // The message of the fetcher holds no userinfo.
         ostrya_fetch::check_base_url(address)
@@ -277,6 +318,7 @@ impl PushSession {
     ///   exactly one mirror, or if
     ///   [`check_base_url`](ostrya_fetch::check_base_url) refuses the mirror.
     ///   The message holds no userinfo.
+    /// - [`Error::InvalidInput`] for an `Endpoint::S3`.
     /// - [`Error::Fetch`] if [`Fetcher::new`](ostrya_fetch::Fetcher::new)
     ///   refuses the options. Examples:
     ///   - a credential to an `http://` address, with
@@ -373,6 +415,8 @@ async fn prepare_with(endpoint: Endpoint, env: Option<&OsStr>) -> Result<Prepare
         // The HTTP preparation builds the fetcher. Its future is boxed, so
         // that the future of an ssh connect does not hold it.
         Endpoint::Http(http) => Ok(Prepared::Http(Box::pin(http::prepare(http)).await?)),
+        #[cfg(feature = "s3")]
+        Endpoint::S3(_) => Err(Error::InvalidInput(S3_SESSION.into())),
     }
 }
 
@@ -541,6 +585,7 @@ impl PullSession {
     ///   endpoint.
     /// - [`Error::InvalidInput`] if the options of an HTTP endpoint name no
     ///   mirror.
+    /// - [`Error::InvalidInput`] for an `Endpoint::S3`.
     /// - [`Error::Fetch`] if [`Fetcher::new`](ostrya_fetch::Fetcher::new)
     ///   refuses the options of an HTTP endpoint.
     pub async fn connect(endpoint: Endpoint, opts: StreamSessionOptions) -> Result<PullSession> {
@@ -553,6 +598,8 @@ impl PullSession {
             Endpoint::Http(http) => Ok(PullSession::Http(
                 Box::pin(http::prepare_pull(http, opts)).await?,
             )),
+            #[cfg(feature = "s3")]
+            Endpoint::S3(_) => Err(Error::InvalidInput(S3_SESSION.into())),
         }
     }
 }

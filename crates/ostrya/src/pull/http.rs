@@ -1985,6 +1985,8 @@ pub(super) fn session_options(
                 max_outstanding,
             },
         ),
+        // `connect` refuses each other endpoint.
+        other => (other, StreamSessionOptions::default()),
     }
 }
 
@@ -2001,6 +2003,7 @@ pub(super) async fn connect(
             .await
             .map_err(http_error),
         ssh @ Endpoint::Ssh { .. } => Ok(PullSession::connect(ssh, stream).await?),
+        _ => Err(crate::endpoint::neither_ssh_nor_http("a pull")),
     }
 }
 

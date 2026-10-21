@@ -33,7 +33,7 @@ use hyper::body::{Body as _, Bytes, Frame, Incoming, SizeHint};
 use hyper::header::{HeaderMap, HeaderName};
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
-use ostrya::fetch::{Error, RequestSigner, SignPayload, SignRequest};
+use ostrya::fetch::{Error, ErrorResponse, RequestSigner, SignPayload, SignRequest};
 use ostrya::{
     BasicAuth, BearerToken, Checksum, ClientIdentity, FetchRequest, Fetched, Fetcher,
     FetcherOptions, LowSpeed, Priority, Protocol, Proxy, TlsOptions, TrustRoots, UploadBody,
@@ -1163,7 +1163,9 @@ fn a_missing_object_reports_its_status_without_retrying() {
             .await
             .unwrap_err();
         match err {
-            Error::HttpStatus { status, ref url } => {
+            Error::HttpStatus {
+                status, ref url, ..
+            } => {
                 assert_eq!(status, 404);
                 assert!(url.ends_with("/objects/ab/cd.filez"), "{url}");
             }
@@ -2680,7 +2682,7 @@ fn a_limit_of_zero_follows_nothing() {
         options.max_redirects = 0;
         let fetcher = Fetcher::new(options).await.unwrap();
         let err = fetch_error(&fetcher, "config").await;
-        let Error::HttpStatus { status, url } = &err else {
+        let Error::HttpStatus { status, url, .. } = &err else {
             panic!("{err}");
         };
         assert_eq!(*status, 302);
@@ -2878,7 +2880,7 @@ fn an_empty_location_names_no_url() {
             .await
             .unwrap();
         let err = fetch_error(&fetcher, "config").await;
-        let Error::HttpStatus { status, url } = &err else {
+        let Error::HttpStatus { status, url, .. } = &err else {
             panic!("{err}");
         };
         assert_eq!(*status, 302);
@@ -2911,7 +2913,7 @@ fn at_the_limit_a_redirect_reports_what_it_carried() {
         options.max_redirects = 2;
         let fetcher = Fetcher::new(options).await.unwrap();
         let err = fetch_error(&fetcher, "config").await;
-        let Error::HttpStatus { status, url } = &err else {
+        let Error::HttpStatus { status, url, .. } = &err else {
             panic!("{err}");
         };
         assert_eq!(*status, 302);
@@ -4218,6 +4220,441 @@ fn a_low_speed_rule_with_a_zero_is_refused() {
     });
 }
 
+// --- error responses -------------------------------------------------------
+
+/// The body of the S3-shaped error that the error response tests send.
+const ERROR_XML: &[u8] = b"<Error><Code>AccessDenied</Code><Message>no</Message></Error>";
+
+/// The 100 KiB body of an error response that is longer than the drain limit
+/// of a discarded response.
+static LARGE_ERROR: [u8; 100 * 1024] = [b'e'; 100 * 1024];
+
+/// Returns a response with `status`, the header `x-amz-request-id: 42`, and
+/// `body` with a declared length.
+fn error_answer(status: u16, body: &'static [u8]) -> Response<TestBody> {
+    Response::builder()
+        .status(status)
+        .header("x-amz-request-id", "42")
+        .body(TestBody::measured(body))
+        .unwrap()
+}
+
+/// Fetches `path` with an error body cap of `cap`, and returns the status
+/// and the kept response of the failed fetch.
+async fn kept_error(fetcher: &Fetcher, path: &str, cap: u64) -> (u16, Option<Box<ErrorResponse>>) {
+    let request = FetchRequest {
+        max_error_body: Some(cap),
+        ..FetchRequest::path(path)
+    };
+    match fetcher.fetch(request).await {
+        Ok(_) => panic!("the fetch of {path} was expected to fail"),
+        Err(Error::HttpStatus {
+            status, response, ..
+        }) => (status, response),
+        Err(other) => panic!("unexpected error: {other}"),
+    }
+}
+
+/// A request with an error body cap gets the headers and the body of the
+/// unsuccessful response, over HTTP/1.1 and over HTTP/2.
+#[test]
+fn an_error_response_is_kept_when_the_request_asks_for_it() {
+    block_on(async {
+        let transports = [
+            (Transport::Cleartext, false, Protocol::Http11),
+            (
+                Transport::Tls {
+                    alpn: vec!["h2"],
+                    client_auth: ClientAuth::None,
+                },
+                true,
+                Protocol::Http2,
+            ),
+        ];
+        for (transport, tls, protocol) in transports {
+            let server = TestServer::start(
+                transport,
+                Arc::new(|_seen: &Seen, _count: usize| error_answer(403, ERROR_XML)),
+            )
+            .await;
+            let mut options = direct_options(server.url(tls));
+            options.tls = tls_options(None);
+            let fetcher = Fetcher::new(options).await.unwrap();
+            let (status, response) = kept_error(&fetcher, "config", 1024).await;
+            assert_eq!(status, 403, "{protocol:?}");
+            let response = response.expect("the response is kept");
+            assert_eq!(response.headers()["x-amz-request-id"], "42", "{protocol:?}");
+            assert_eq!(response.body(), Some(ERROR_XML), "{protocol:?}");
+            assert_eq!(server.requests(), 1, "{protocol:?}");
+        }
+    });
+}
+
+/// A request with no error body cap keeps nothing of the response.
+#[test]
+fn an_error_response_is_not_kept_by_default() {
+    block_on(async {
+        let server = TestServer::start(
+            Transport::Cleartext,
+            Arc::new(|_seen: &Seen, _count: usize| error_answer(403, ERROR_XML)),
+        )
+        .await;
+        let fetcher = Fetcher::new(direct_options(server.url(false)))
+            .await
+            .unwrap();
+        let err = fetch_error(&fetcher, "config").await;
+        let Error::HttpStatus {
+            status, response, ..
+        } = &err
+        else {
+            panic!("{err}");
+        };
+        assert_eq!(*status, 403);
+        assert!(response.is_none(), "{err:?}");
+    });
+}
+
+/// A kept body that ends within the cap returns its HTTP/1.1 connection to
+/// the pool. The body is longer than the drain limit of a discarded response,
+/// so without the read each fetch opens a connection.
+#[test]
+fn a_kept_error_body_returns_its_connection_to_the_pool() {
+    block_on(async {
+        let server = TestServer::start(
+            Transport::Cleartext,
+            Arc::new(|_seen: &Seen, _count: usize| error_answer(404, &LARGE_ERROR)),
+        )
+        .await;
+        let fetcher = Fetcher::new(direct_options(server.url(false)))
+            .await
+            .unwrap();
+        for _ in 0..4 {
+            let (status, response) = kept_error(&fetcher, "config", 1024 * 1024).await;
+            assert_eq!(status, 404);
+            assert_eq!(response.unwrap().body(), Some(&LARGE_ERROR[..]));
+        }
+        assert_eq!(server.requests(), 4);
+        assert_eq!(server.connections(), 1);
+    });
+}
+
+/// A declared length over the cap keeps the headers and no body. A cap of
+/// zero keeps an empty body.
+#[test]
+fn a_declared_error_body_over_the_cap_keeps_the_headers_alone() {
+    block_on(async {
+        let server = TestServer::start(
+            Transport::Cleartext,
+            Arc::new(|seen: &Seen, _count: usize| {
+                if seen.path == "/empty" {
+                    error_answer(404, b"")
+                } else {
+                    error_answer(404, b"0123456789")
+                }
+            }),
+        )
+        .await;
+        let fetcher = Fetcher::new(direct_options(server.url(false)))
+            .await
+            .unwrap();
+
+        let (_, response) = kept_error(&fetcher, "config", 9).await;
+        let response = response.unwrap();
+        assert_eq!(response.headers()["x-amz-request-id"], "42");
+        assert_eq!(response.body(), None);
+
+        let (_, response) = kept_error(&fetcher, "config", 10).await;
+        assert_eq!(response.unwrap().body(), Some(&b"0123456789"[..]));
+
+        let (_, response) = kept_error(&fetcher, "config", 0).await;
+        assert_eq!(response.unwrap().body(), None);
+
+        let (_, response) = kept_error(&fetcher, "empty", 0).await;
+        assert_eq!(response.unwrap().body(), Some(&b""[..]));
+    });
+}
+
+/// A body with no declared length that grows past the cap gives no body and
+/// closes its connection. Such a body within the cap is kept whole.
+#[test]
+fn an_undeclared_error_body_that_outgrows_the_cap_closes_its_connection() {
+    block_on(async {
+        let server = TestServer::start(
+            Transport::Cleartext,
+            Arc::new(|_seen: &Seen, _count: usize| {
+                Response::builder()
+                    .status(404)
+                    .body(TestBody::chunked(&[b'c'; 100], 4))
+                    .unwrap()
+            }),
+        )
+        .await;
+        let fetcher = Fetcher::new(direct_options(server.url(false)))
+            .await
+            .unwrap();
+
+        let (_, response) = kept_error(&fetcher, "config", 50).await;
+        assert_eq!(response.unwrap().body(), None);
+        let (_, response) = kept_error(&fetcher, "config", 100).await;
+        assert_eq!(response.unwrap().body(), Some(&[b'c'; 100][..]));
+        // The first body stopped before its end, so its connection closed.
+        // The second body ended, so its connection is idle in the pool.
+        assert_eq!(server.connections(), 2);
+        let (_, response) = kept_error(&fetcher, "config", 100).await;
+        assert!(response.unwrap().body().is_some());
+        assert_eq!(server.connections(), 2);
+    });
+}
+
+/// With a redirect limit of zero, a 301 and a 307 are unsuccessful responses.
+/// The error carries their headers, `Location` included, and their body. The
+/// fetch sends nothing to the URL of the `Location`.
+#[test]
+fn with_a_redirect_limit_of_zero_a_redirect_keeps_its_headers() {
+    block_on(async {
+        let target = TestServer::start(Transport::Cleartext, always(b"elsewhere")).await;
+        let location = format!("{}/config", target.url(false));
+        for status in [301u16, 307] {
+            let named = location.clone();
+            let server = TestServer::start(
+                Transport::Cleartext,
+                Arc::new(move |_seen: &Seen, _count: usize| {
+                    Response::builder()
+                        .status(status)
+                        .header("location", named.as_str())
+                        .header("x-amz-bucket-region", "eu-central-1")
+                        .body(TestBody::measured(ERROR_XML))
+                        .unwrap()
+                }),
+            )
+            .await;
+            let mut options = direct_options(server.url(false));
+            options.max_redirects = 0;
+            let fetcher = Fetcher::new(options).await.unwrap();
+            let (got, response) = kept_error(&fetcher, "config", 4096).await;
+            assert_eq!(got, status);
+            let response = response.unwrap();
+            assert_eq!(response.headers()["location"], location.as_str());
+            assert_eq!(response.headers()["x-amz-bucket-region"], "eu-central-1");
+            assert_eq!(response.body(), Some(ERROR_XML));
+            assert_eq!(server.requests(), 1);
+        }
+        assert_eq!(target.requests(), 0);
+    });
+}
+
+/// A redirect with no `Location` reports its status at any limit, and the
+/// error keeps its response.
+#[test]
+fn a_redirect_without_a_location_keeps_its_response() {
+    block_on(async {
+        let server = TestServer::start(
+            Transport::Cleartext,
+            Arc::new(|_seen: &Seen, _count: usize| error_answer(302, ERROR_XML)),
+        )
+        .await;
+        let fetcher = Fetcher::new(direct_options(server.url(false)))
+            .await
+            .unwrap();
+        let (status, response) = kept_error(&fetcher, "config", 4096).await;
+        assert_eq!(status, 302);
+        let response = response.unwrap();
+        assert_eq!(response.headers()["x-amz-request-id"], "42");
+        assert_eq!(response.body(), Some(ERROR_XML));
+        assert_eq!(server.requests(), 1);
+    });
+}
+
+/// A retryable status that ends the rounds reports the body of the first
+/// attempt, because the fetch reports the first retryable failure.
+#[test]
+fn a_retried_status_reports_the_body_of_the_first_attempt() {
+    block_on(async {
+        let server = TestServer::start(
+            Transport::Cleartext,
+            Arc::new(|_seen: &Seen, count: usize| {
+                let body: &'static [u8] = match count {
+                    1 => b"attempt 1",
+                    2 => b"attempt 2",
+                    _ => b"attempt 3",
+                };
+                error_answer(503, body)
+            }),
+        )
+        .await;
+        let mut options = direct_options(server.url(false));
+        options.max_retries = 2;
+        let fetcher = Fetcher::new(options).await.unwrap();
+        let (status, response) = kept_error(&fetcher, "config", 4096).await;
+        assert_eq!(status, 503);
+        assert_eq!(response.unwrap().body(), Some(&b"attempt 1"[..]));
+        assert_eq!(server.requests(), 3);
+    });
+}
+
+/// A definitive answer after a retryable failure is the reported failure, and
+/// the error carries its own body.
+#[test]
+fn a_definitive_status_after_retries_reports_its_own_body() {
+    block_on(async {
+        let server = TestServer::start(
+            Transport::Cleartext,
+            Arc::new(|_seen: &Seen, count: usize| {
+                if count == 1 {
+                    error_answer(503, b"busy")
+                } else {
+                    error_answer(404, b"absent")
+                }
+            }),
+        )
+        .await;
+        let mut options = direct_options(server.url(false));
+        options.max_retries = 3;
+        let fetcher = Fetcher::new(options).await.unwrap();
+        let (status, response) = kept_error(&fetcher, "config", 4096).await;
+        assert_eq!(status, 404);
+        assert_eq!(response.unwrap().body(), Some(&b"absent"[..]));
+        assert_eq!(server.requests(), 2);
+    });
+}
+
+/// A body that stops before its declared end gives the status and the
+/// headers within one progress window, and no body.
+#[test]
+fn a_stalled_error_body_reports_the_status_without_a_body() {
+    block_on(async {
+        let addr = stalling_server(
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 64\r\nx-amz-request-id: 42\r\n\r\nshort",
+        )
+        .await;
+        let mut options = direct_options(format!("http://{addr}"));
+        options.progress_timeout = Duration::from_millis(200);
+        let fetcher = Fetcher::new(options).await.unwrap();
+        let start = Instant::now();
+        let (status, response) = kept_error(&fetcher, "config", 4096).await;
+        assert_eq!(status, 404);
+        let response = response.unwrap();
+        assert_eq!(response.headers()["x-amz-request-id"], "42");
+        assert_eq!(response.body(), None);
+        assert!(
+            start.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            start.elapsed()
+        );
+    });
+}
+
+/// A coded error body holds bytes other than the bytes that the server
+/// means. So the fetch keeps the headers and no body.
+#[test]
+fn a_coded_error_response_keeps_the_headers_alone() {
+    block_on(async {
+        let server = TestServer::start(
+            Transport::Cleartext,
+            Arc::new(|_seen: &Seen, _count: usize| {
+                Response::builder()
+                    .status(403)
+                    .header("content-encoding", "gzip")
+                    .body(TestBody::measured(b"\x1f\x8b coded"))
+                    .unwrap()
+            }),
+        )
+        .await;
+        let fetcher = Fetcher::new(direct_options(server.url(false)))
+            .await
+            .unwrap();
+        let (status, response) = kept_error(&fetcher, "config", 4096).await;
+        assert_eq!(status, 403);
+        let response = response.unwrap();
+        assert_eq!(response.headers()["content-encoding"], "gzip");
+        assert_eq!(response.body(), None);
+    });
+}
+
+/// A refetch carries the error body cap of its request.
+#[test]
+fn refetching_keeps_the_error_response() {
+    block_on(async {
+        let server = TestServer::start(
+            Transport::Cleartext,
+            Arc::new(|_seen: &Seen, _count: usize| error_answer(404, ERROR_XML)),
+        )
+        .await;
+        let fetcher = Fetcher::new(direct_options(server.url(false)))
+            .await
+            .unwrap();
+        let mut refetch = fetcher.refetching(FetchRequest {
+            max_error_body: Some(4096),
+            ..FetchRequest::path("config")
+        });
+        let err = refetch.fetch().await.unwrap_err();
+        let Error::HttpStatus {
+            status, response, ..
+        } = &err
+        else {
+            panic!("{err}");
+        };
+        assert_eq!(*status, 404);
+        assert_eq!(response.as_ref().unwrap().body(), Some(ERROR_XML));
+    });
+}
+
+/// The declared length of an error body is a claim of the server. With a cap
+/// of `u64::MAX`, a response that declares 1 PiB and sends 7 bytes costs no
+/// allocation of the declared length. The body fails in transit, so the
+/// error keeps the headers alone.
+#[test]
+fn a_declared_error_body_length_is_not_reserved_before_the_body_arrives() {
+    block_on(async {
+        let addr = truncating_server(
+            b"HTTP/1.1 404 Not Found\r\nContent-Length: 1125899906842624\r\n\r\n<Error>",
+        )
+        .await;
+        let fetcher = Fetcher::new(FetcherOptions {
+            max_retries: 0,
+            ..direct_options(format!("http://{addr}"))
+        })
+        .await
+        .unwrap();
+        let (status, response) = kept_error(&fetcher, "config", u64::MAX).await;
+        assert_eq!(status, 404);
+        assert_eq!(response.expect("the headers are kept").body(), None);
+    });
+}
+
+/// The library error of a failed fetch has the same status, URL, and message
+/// with and without a kept response.
+#[test]
+fn a_kept_response_does_not_change_the_converted_library_error() {
+    block_on(async {
+        let server = TestServer::start(
+            Transport::Cleartext,
+            Arc::new(|_seen: &Seen, _count: usize| error_answer(404, ERROR_XML)),
+        )
+        .await;
+        let fetcher = Fetcher::new(direct_options(server.url(false)))
+            .await
+            .unwrap();
+        let kept = fetcher
+            .fetch(FetchRequest {
+                max_error_body: Some(4096),
+                ..FetchRequest::path("config")
+            })
+            .await
+            .unwrap_err();
+        let plain = fetch_error(&fetcher, "config").await;
+        assert_eq!(kept.to_string(), plain.to_string());
+        let kept = ostrya::Error::from(kept);
+        let plain = ostrya::Error::from(plain);
+        assert_eq!(kept.to_string(), plain.to_string());
+        let ostrya::Error::HttpStatus { status, url } = &kept else {
+            panic!("{kept}");
+        };
+        assert_eq!(*status, 404);
+        assert_eq!(url, &format!("{}/config", server.url(false)));
+    });
+}
+
 // --- uploads ---------------------------------------------------------------
 
 /// The longest time that an upload test runs. Then the test fails, so it does
@@ -5337,13 +5774,13 @@ fn an_upload_follows_307_and_308_for_a_whole_body_alone() {
     }));
 }
 
-/// If the declared response length is more than the cap, the upload fails after
-/// its one request, for each status.
+/// If the declared length of a 2xx response is more than the cap, the upload
+/// fails after its one request.
 #[test]
 fn a_declared_response_over_the_cap_fails_after_one_request() {
     block_on(bounded(async {
         static LARGE: [u8; 4096] = [b'r'; 4096];
-        for status in [200, 422] {
+        for status in [200, 201] {
             let server = TestServer::start(
                 Transport::Cleartext,
                 Arc::new(move |_seen, _count| {
@@ -5378,6 +5815,50 @@ fn a_declared_response_over_the_cap_fails_after_one_request() {
             assert!(!err.is_unsent());
             assert_eq!(server.requests(), 1);
             assert_eq!(live.requests(), 0);
+        }
+    }));
+}
+
+/// An answer other than 2xx keeps its status and headers when its body cannot
+/// be delivered: a declared coding, or a declared length over the cap. The
+/// body is withheld and reads as empty. The upload is not interrupted, so a
+/// caller does not send a refused request again.
+#[test]
+fn an_error_answer_with_an_undeliverable_body_keeps_its_status() {
+    block_on(bounded(async {
+        static LARGE: [u8; 4096] = [b'r'; 4096];
+        let answers: [(u16, bool); 3] = [(403, true), (404, true), (422, false)];
+        for (status, coded) in answers {
+            let server = TestServer::start(
+                Transport::Cleartext,
+                Arc::new(move |_seen, _count| {
+                    let mut response = Response::builder()
+                        .status(status)
+                        .header("x-amz-request-id", "42");
+                    if coded {
+                        response = response.header("content-encoding", "gzip");
+                    }
+                    response.body(TestBody::measured(&LARGE)).unwrap()
+                }),
+            )
+            .await;
+            let fetcher = Fetcher::new(direct_options(server.url(false)))
+                .await
+                .unwrap();
+            let max_response = if coded { 1 << 20 } else { 1024 };
+            let uploaded = fetcher
+                .upload(UploadRequest {
+                    method: UploadMethod::Put,
+                    max_response,
+                    ..UploadRequest::path("objects", b"hello".to_vec().into())
+                })
+                .await
+                .unwrap_or_else(|err| panic!("{status}: {err}"));
+            assert_eq!(uploaded.status(), status);
+            assert!(uploaded.body_withheld(), "{status}");
+            assert_eq!(uploaded.headers()["x-amz-request-id"], "42");
+            assert!(read_uploaded(uploaded).await.is_empty(), "{status}");
+            assert_eq!(server.requests(), 1);
         }
     }));
 }
@@ -6949,5 +7430,36 @@ fn a_put_follows_307_and_308_for_a_whole_body() {
             assert_eq!(seen[1].path, "/moved");
             assert_body(&seen[1], &data);
         }
+    }));
+}
+
+/// The copy of a body of bytes sends the same bytes in a second request. A
+/// streamed body has no copy.
+#[test]
+fn a_cloned_body_sends_the_same_bytes() {
+    block_on(bounded(async {
+        let data = upload_data(100_000);
+        let server = TestServer::start(Transport::Cleartext, always(b"accepted")).await;
+        let fetcher = Fetcher::new(upload_options(server.url(false)))
+            .await
+            .unwrap();
+        let body = UploadBody::bytes(data.clone());
+        let copy = body.try_clone().unwrap();
+        for body in [body, copy] {
+            let uploaded = fetcher
+                .upload(UploadRequest {
+                    method: UploadMethod::Put,
+                    ..UploadRequest::path("objects", body)
+                })
+                .await
+                .unwrap();
+            assert_eq!(uploaded.status(), 200);
+            assert_eq!(read_uploaded(uploaded).await, b"accepted");
+        }
+        let seen = server.seen();
+        assert_body(&seen[0], &data);
+        assert_body(&seen[1], &data);
+        let (channel, _writer) = UploadBody::channel();
+        assert!(channel.try_clone().is_none());
     }));
 }

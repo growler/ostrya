@@ -16,12 +16,17 @@ The `Target` of a request is a path under each mirror, a path with a
 query string under each mirror, or an absolute URL. The fetcher sends a
 path and a query as written, so the caller escapes them.
 
+A failed fetch gives the status of the response. On request, it also gives
+the headers and a capped body of that response.
+
 API documentation: <https://docs.rs/ostrya-fetch>
 
 ## Entry points
 
 - `Fetcher::new` builds a fetcher from `FetcherOptions`.
 - `Fetcher::fetch` sends a `FetchRequest` and returns a `Fetched`.
+- `ErrorResponse` holds the headers and the capped body of an
+  unsuccessful response, if the request asks for them.
 - `Body` streams a response body in bounded chunks.
 - `Fetcher::refetching` returns a `Refetch`, which fetches a failed body again.
 - `Fetcher::upload` sends an `UploadRequest` and returns an `Uploaded`.

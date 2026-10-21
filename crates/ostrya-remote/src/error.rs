@@ -34,6 +34,10 @@ pub enum Error {
     #[error("protocol: {0}")]
     Protocol(String),
     /// A frame, a batch, or a metadata object over its limit.
+    ///
+    /// With the `s3` feature, the bucket client returns this variant for an
+    /// object over the size limit of the caller, and for a listing page over
+    /// 4 MiB.
     #[error("limit-exceeded: {0}")]
     LimitExceeded(String),
     /// An object whose bytes do not hash to its name.
@@ -151,7 +155,13 @@ pub enum Error {
     /// environment variable, or a shared AWS file that is larger than 1 MiB
     /// or that the reader of the files refuses. It also returns it when no
     /// source gives a key pair. The message holds no secret access key and no
-    /// session token.
+    /// session token. It also returns it for a refused address of a bucket
+    /// repository, endpoint URL, or location, for a key that is not a key of
+    /// a bucket repository, and for a refused list prefix.
+    ///
+    /// [`Endpoint::parse`](crate::transport::Endpoint::parse) returns this
+    /// variant for an `s3://` address. The session constructors return it
+    /// for an S3 endpoint.
     #[error("invalid input: {0}")]
     InvalidInput(String),
     /// A failure of the transport under the session.
@@ -166,6 +176,13 @@ pub enum Error {
     ///   - a frame other than an `Error` message with an error status
     ///   - a `HelloReply` with no session id of 64 lowercase hex digits
     ///   - a frame other than an `Error` message in answer to `DELETE`
+    /// - With the `s3` feature, the bucket client cannot use a listing: the
+    ///   XML reader refuses the body, a truncated page has no marker of the
+    ///   next page, a page does not move past the earlier pages, or a key is
+    ///   outside the prefix of the request.
+    /// - With the `s3` feature, the server answers a read or a list of the
+    ///   bucket client with 304. The request sends no validators, so the
+    ///   answer cannot be used.
     ///
     /// No wire code carries this variant.
     #[error("transport: {0}")]
@@ -173,7 +190,9 @@ pub enum Error {
     /// A failure of the HTTP client of the session.
     ///
     /// The client cannot be built, a request cannot be sent, or a request
-    /// fails after it is sent. No wire code carries this variant.
+    /// fails after it is sent. With the `s3` feature, the bucket client
+    /// returns this variant for the same failures. No wire code carries this
+    /// variant.
     #[error(transparent)]
     Fetch(ostrya_fetch::Error),
     /// An I/O error of the underlying stream.
@@ -206,6 +225,62 @@ pub enum Error {
         /// The I/O error, with the `io::ErrorKind` of the failure.
         #[source]
         source: std::io::Error,
+    },
+    /// An error response of an S3 server to a request of the bucket client.
+    ///
+    /// `code` and `message` come from the `Code` and the `Message` elements
+    /// of the S3 `Error` document in the body. Both are `None` if the body
+    /// holds no such document, is larger than 4 MiB, declares a coding, or
+    /// did not arrive.
+    /// `code` and `message` have each control character and each format
+    /// character (Unicode categories Cc and Cf) replaced with U+FFFD, and
+    /// each holds at most 512 bytes.
+    ///
+    /// The bucket client also returns this variant for an `Error` document
+    /// that S3 sends with a 2xx status. Then `status` is that status.
+    ///
+    /// The message names the code `RequestTimeTooSkewed` and states that the
+    /// clock of this host is not in step with the clock of the server. A
+    /// wrong secret access key gives the code `SignatureDoesNotMatch`.
+    ///
+    /// No wire code carries this variant.
+    #[cfg(feature = "s3")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "s3")))]
+    #[non_exhaustive]
+    #[error("{}", crate::s3::describe_status(*.status, .code.as_deref(), .message.as_deref(), .key.as_deref()))]
+    S3 {
+        /// The status of the response.
+        status: u16,
+        /// The `Code` element, or `None` if the body holds no S3 error.
+        code: Option<String>,
+        /// The `Message` element, or `None` if the body holds no S3 error.
+        message: Option<String>,
+        /// The full key of the object, with the prefix of the repository, or
+        /// `None` for a request on the bucket, for example a list.
+        key: Option<String>,
+    },
+    /// A bucket in a region other than the region of the signature.
+    ///
+    /// The bucket client returns this variant for an unsuccessful response
+    /// whose `x-amz-bucket-region` header, or whose `Region` element of the
+    /// S3 `Error` document, names a region other than the region of the
+    /// location.
+    ///
+    /// No wire code carries this variant.
+    #[cfg(feature = "s3")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "s3")))]
+    #[non_exhaustive]
+    #[error(
+        "the bucket {bucket} is in the region {bucket_region}, and the requests are signed for \
+         the region {region}: set the region to {bucket_region}"
+    )]
+    S3Region {
+        /// The name of the bucket.
+        bucket: String,
+        /// The region of the signature.
+        region: String,
+        /// The region that the server names for the bucket.
+        bucket_region: String,
     },
 }
 
@@ -311,6 +386,7 @@ impl Error {
     /// - [`Error::Fetch`]
     /// - [`Error::Io`]
     /// - [`Error::Walk`]
+    /// - `Error::S3` and `Error::S3Region`, with the `s3` feature
     pub fn code(&self) -> Option<ErrorCode> {
         Some(match self {
             Error::VersionUnsupported(_) => ErrorCode::VersionUnsupported,
@@ -337,6 +413,8 @@ impl Error {
             | Error::Fetch(_)
             | Error::Io(_)
             | Error::Walk { .. } => return None,
+            #[cfg(feature = "s3")]
+            Error::S3 { .. } | Error::S3Region { .. } => return None,
         })
     }
 
@@ -377,6 +455,8 @@ impl Error {
             | Error::Fetch(_)
             | Error::Io(_)
             | Error::Walk { .. } => (ErrorCode::Internal, self.to_string()),
+            #[cfg(feature = "s3")]
+            Error::S3 { .. } | Error::S3Region { .. } => (ErrorCode::Internal, self.to_string()),
             Error::VersionUnsupported(m)
             | Error::LockingDisabled(m)
             | Error::Unauthorized(m)

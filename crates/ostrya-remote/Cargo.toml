@@ -12,10 +12,10 @@ readme = "README.md"
 default = ["smol"]
 smol = ["ostrya-rt/smol", "ostrya-fetch/smol"]
 tokio = ["ostrya-rt/tokio", "ostrya-fetch/tokio"]
-# The `s3` module: the SigV4 signer of an S3 request, and the settings and the
+# The `s3` module: the SigV4 signer of an S3 request, the settings and the
 # credentials of an S3 endpoint from the caller, the environment, and the
-# shared AWS files.
-s3 = ["dep:sha2", "dep:hmac"]
+# shared AWS files, the address of a bucket repository, and the bucket client.
+s3 = ["dep:sha2", "dep:hmac", "dep:quick-xml"]
 
 # The `s3` module is behind a feature. docs.rs adds the feature to the default
 # set, so the module is documented.
@@ -39,6 +39,9 @@ futures-lite = "2"
 # HMAC-SHA256.
 sha2 = { version = "0.10", default-features = false, features = ["std"], optional = true }
 hmac = { version = "0.12.1", optional = true }
+# The bucket client of the `s3` feature reads the XML bodies of the S3
+# responses: the listings and the error document.
+quick-xml = { version = "0.42.0", default-features = false, optional = true }
 
 # The tree walk opens each file with `O_NOFOLLOW | O_NONBLOCK` on Unix, so a
 # file that became a symlink or a fifo answers the open rather than being

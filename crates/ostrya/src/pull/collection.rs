@@ -202,6 +202,11 @@ impl Transport {
                 StreamSession::check_command_line(address, options)?;
                 Transport::Ssh(Box::new(endpoint), stream)
             }
+            _ => {
+                return Err(crate::endpoint::neither_ssh_nor_http(
+                    "a pull of collection refs",
+                ));
+            }
         })
     }
 

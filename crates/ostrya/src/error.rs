@@ -381,7 +381,8 @@ pub enum Error {
     /// this variant.
     ///
     /// A [`fetch::Error::HttpStatus`](crate::fetch::Error::HttpStatus) converts
-    /// to this variant.
+    /// to this variant. The conversion drops the headers and the body of the
+    /// response that the fetch error can carry.
     #[error("http status {status} for {url}")]
     HttpStatus {
         /// The status of the response.
@@ -570,7 +571,7 @@ impl From<crate::fetch::Error> for Error {
 
         match err {
             F::Fetch(message) => Error::Fetch(message),
-            F::HttpStatus { status, url } => Error::HttpStatus { status, url },
+            F::HttpStatus { status, url, .. } => Error::HttpStatus { status, url },
             F::RedirectLimit { url, hops } => Error::RedirectLimit { url, hops },
             F::FetchTooLarge { limit } => Error::FetchTooLarge { limit },
             F::ContentEncoded { url, encoding } => Error::ContentEncoded { url, encoding },
@@ -834,6 +835,7 @@ mod tests {
                 F::HttpStatus {
                     status: 404,
                     url: url(),
+                    response: None,
                 },
                 ErrorKind::NotFound,
             ),
@@ -841,6 +843,7 @@ mod tests {
                 F::HttpStatus {
                     status: 401,
                     url: url(),
+                    response: None,
                 },
                 ErrorKind::PermissionDenied,
             ),
@@ -848,6 +851,7 @@ mod tests {
                 F::HttpStatus {
                     status: 403,
                     url: url(),
+                    response: None,
                 },
                 ErrorKind::PermissionDenied,
             ),
@@ -855,6 +859,7 @@ mod tests {
                 F::HttpStatus {
                     status: 500,
                     url: url(),
+                    response: None,
                 },
                 ErrorKind::Other,
             ),
@@ -887,7 +892,7 @@ mod tests {
             let rendered = fetch.to_string();
             let namesake = match &fetch {
                 F::Fetch(m) => Error::Fetch(m.clone()),
-                F::HttpStatus { status, url } => Error::HttpStatus {
+                F::HttpStatus { status, url, .. } => Error::HttpStatus {
                     status: *status,
                     url: url.clone(),
                 },

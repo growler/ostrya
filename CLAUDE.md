@@ -523,6 +523,54 @@ dependency graph.
   20,271,128 bytes and the second 20,162,840, a difference of 108,288 bytes.
   A rebuild of the first tree gives the same byte count.
 
+### Authorized: the `hmac` crate
+
+`hmac` 0.12.1 is authorized for `crates/ostrya-remote` alone, as an optional
+dependency behind the feature `s3`. It supplies HMAC-SHA256 to the SigV4
+signer in `crates/ostrya-remote/src/s3/sigv4.rs`, which derives the signing
+key and the signature with it. `sha2` 0.10, a foundation crate, enters the
+same manifest behind the same feature with `default-features = false` and the
+feature `std`. Each term below is measured on the resolved dependency graph.
+
+- License `MIT OR Apache-2.0`.
+- No feature is turned on. The resolved set holds the feature `reset`,
+  which `rfc6979` under `pgp` turns on.
+- The crate takes `digest` alone. The graph holds 19 packages under 19
+  distinct names on the host target, measured with
+  `cargo tree -p hmac -e normal,build`, which reads the features the
+  workspace resolves: `hmac` 0.12.1, `digest` 0.10.7, `block-buffer` 0.10.4,
+  `generic-array` 0.14.7, `typenum` 1.20.1, `zeroize` 1.9.0,
+  `zeroize_derive` 1.5.0, `proc-macro2` 1.0.106, `quote` 1.0.46, `syn`
+  2.0.118, `unicode-ident` 1.0.24, `version_check` 0.9.5, `const-oid` 0.9.6,
+  `crypto-common` 0.1.7, `rand_core` 0.6.4, `getrandom` 0.2.17, `cfg-if`
+  1.0.4, `libc` 0.2.186, and `subtle` 2.6.1. Other crates of the workspace
+  turn on the features of `digest`, `crypto-common`, and `generic-array` that
+  pull in `const-oid`, `rand_core`, and `zeroize`. With `--target all` it
+  holds 20, adding `wasi` 0.11.1+wasi-snapshot-preview1, which `getrandom`
+  reaches on a WASI target. `cargo metadata --format-version 1
+  --all-features` counts the same 20 for the closure.
+- No package in the graph declares a `links` key, and no package name in it
+  ends in `-sys`.
+- Four packages carry a build script: `generic-array`, `libc`,
+  `proc-macro2`, and `quote`. All four were already in the graph.
+- Every license in the graph is permissive by the rule in "Requirement:
+  permissive licenses only": 12 packages state `MIT OR Apache-2.0`, 3 state
+  `Apache-2.0 OR MIT`, `generic-array` states `MIT`, `subtle` states
+  `BSD-3-Clause`, `unicode-ident` states `(MIT OR Apache-2.0) AND Unicode-3.0`,
+  `version_check` states the legacy `MIT/Apache-2.0` form the CI license
+  guard normalizes, and `wasi` states
+  `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT`.
+- The highest minimum supported Rust version in the graph is 1.85, stated
+  by `zeroize` and `zeroize_derive`. `hmac` states none. The workspace pins
+  1.92, so the requirement holds.
+- The crate was in the graph through `pbkdf2`, under `pkcs8` of
+  `crates/ostrya-fetch`, so no package entered `Cargo.lock` with it. The one
+  change to the lock file is the two entries `hmac` and `sha2` in the
+  dependency list of `ostrya-remote`.
+- No cost to the binary is measured. No command path of `ostrya-cli` turns on
+  the feature `s3` yet, so the stripped `target/release/ostrya` holds no
+  code of the signer.
+
 ## Requirement: permissive licenses only
 
 The library and everything it links -- every crate in the dependency graph,

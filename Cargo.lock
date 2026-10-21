@@ -1813,11 +1813,13 @@ version = "0.5.0"
 dependencies = [
  "futures-io",
  "futures-lite",
+ "hmac",
  "libc",
  "ostrya-core",
  "ostrya-fetch",
  "ostrya-gvariant",
  "ostrya-rt",
+ "sha2",
  "thiserror",
 ]
 

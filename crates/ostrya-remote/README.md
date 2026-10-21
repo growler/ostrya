@@ -10,6 +10,9 @@ A caller pushes a local directory as a commit that the server makes with
 `push_tree`, or its own objects with a `PushSession`. A `PullSession` reads the summary and the ref listings of a remote. The
 crate has no repository knowledge, and it compiles on Linux, macOS, and Windows.
 
+With the `s3` feature, the `s3` module signs S3 requests and reads the
+settings and the credentials of an S3 endpoint.
+
 API documentation: <https://docs.rs/ostrya-remote>
 
 ## Entry points
@@ -30,11 +33,13 @@ API documentation: <https://docs.rs/ostrya-remote>
 - `session`: the push and pull sessions, their progress, and the one-way stream.
 - `transport`: the endpoints, the addresses, and the ssh and HTTP transports.
 - `tree`: the walk and the hash of a local directory.
+- `s3` (feature `s3`): S3 request signing, and the settings and credentials of an S3 endpoint.
 
 ## Features
 
 - `smol` (default): the `smol` backend of `ostrya-rt` for the ssh and HTTP transports.
 - `tokio`: the `tokio` backend of `ostrya-rt` for the ssh and HTTP transports.
+- `s3`: the `s3` module, which signs S3 requests with AWS Signature Version 4 and reads the AWS credentials.
 
 ## Examples
 

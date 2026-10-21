@@ -1,10 +1,14 @@
 #![forbid(unsafe_code)]
+#![cfg_attr(docsrs, feature(doc_cfg))]
 
 //! The wire codec and the client sessions of the ostrya push and pull.
 //!
 //! A caller pushes a local directory as a commit that the server makes with
 //! [`push_tree`](fn@push_tree), or its own objects with a [`PushSession`]. A [`PullSession`] reads the summary and the ref listings of a remote. The
 //! crate has no repository knowledge, and it compiles on Linux, macOS, and Windows.
+//!
+//! With the `s3` feature, the `s3` module signs S3 requests and reads the
+//! settings and the credentials of an S3 endpoint.
 //!
 //! # Entry points
 //!
@@ -24,11 +28,13 @@
 //! - [`session`]: the push and pull sessions, their progress, and the one-way stream.
 //! - [`transport`]: the endpoints, the addresses, and the ssh and HTTP transports.
 //! - [`tree`]: the walk and the hash of a local directory.
+//! - `s3` (feature `s3`): S3 request signing, and the settings and credentials of an S3 endpoint.
 //!
 //! # Features
 //!
 //! - `smol` (default): the `smol` backend of `ostrya-rt` for the ssh and HTTP transports.
 //! - `tokio`: the `tokio` backend of `ostrya-rt` for the ssh and HTTP transports.
+//! - `s3`: the `s3` module, which signs S3 requests with AWS Signature Version 4 and reads the AWS credentials.
 //!
 //! # Examples
 //!
@@ -45,6 +51,8 @@
 mod error;
 pub mod proto;
 mod push_tree;
+#[cfg(feature = "s3")]
+pub mod s3;
 pub mod session;
 pub mod transport;
 pub mod tree;
@@ -95,6 +103,27 @@ const _: fn() = || {
     assert_send_sync::<SshAddress>();
     assert_send_sync::<SshOptions>();
 };
+
+// The signer, the credentials, and the settings of an S3 endpoint move freely
+// across tasks and threads.
+#[cfg(feature = "s3")]
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<s3::SigV4>();
+    assert_send_sync::<s3::Credentials>();
+    assert_send_sync::<s3::Resolved>();
+    assert_send_sync::<s3::Settings>();
+    assert_send_sync::<s3::Environment>();
+};
+
+/// The future of the resolution of an S3 endpoint can run on a
+/// multi-threaded executor.
+#[cfg(feature = "s3")]
+#[allow(dead_code)]
+fn s3_resolve_future_is_send(settings: &s3::Settings, environment: &s3::Environment) {
+    fn assert_send<T: Send>(_: &T) {}
+    assert_send(&s3::resolve(settings, environment));
+}
 
 /// The futures of a stream session can run on a multi-threaded executor.
 #[allow(dead_code)]

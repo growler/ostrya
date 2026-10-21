@@ -46,7 +46,10 @@ feature set and its graph.
 - `futures-io` and `futures-lite` -- the async traits and the combinators
   that the library is written against.
 - `pin-project-lite` -- pin projection for the stream wrapper types.
-- `sha2` -- SHA-256, for object checksums and for fs-verity digests.
+- `sha2` -- SHA-256, for object checksums, for fs-verity digests, and for
+  the SigV4 signer of the `s3` feature of `ostrya-remote`.
+- `hmac` -- HMAC-SHA256 for the SigV4 signer, in `ostrya-remote` under its
+  `s3` feature. See "SigV4 and the AWS credentials".
 - `miniz_oxide` -- the raw DEFLATE encoder of archive-mode content objects.
   `ostrya-core` takes it directly, so the stored `.filez` bytes for a given
   `[archive] zlib-level` are the same under each feature set. The golden
@@ -251,6 +254,54 @@ This is less than the limit of 10 ms for work on the task, so the fetcher
 gives the signer the bytes and does not hash the body itself. A streamed body
 reaches the signer as `SignPayload::Streamed`, with no bytes.
 
+## SigV4 and the AWS credentials
+
+`ostrya_remote::s3::SigV4` is the AWS Signature Version 4 code, written in
+the tree over `sha2` and the `hmac` crate 0.12.1. The algorithm is a fixed
+sequence of hashes and string joins, and the AWS documentation gives worked
+examples with full inputs and outputs. The unit tests check the signer
+against these examples. `hmac` was in `Cargo.lock` before the feature, so no
+package entered the graph. Two alternatives were rejected:
+
+- HMAC-SHA256 written in the tree too, over `sha2`. It adds no manifest
+  entry, but it is cryptographic code that the RustCrypto crate `hmac`
+  already supplies, and that crate is in the graph.
+- A SigV4 crate, for example `aws-sigv4` or `rusty-s3`. Each one brings
+  packages that are not in `Cargo.lock`, and `rusty-s3` makes presigned URLs
+  alone, which "Request signing in the fetcher" rejects.
+
+`ostrya_remote::s3::resolve` reads static key pairs alone: the environment
+variables, then the shared credentials file, then the shared config file,
+with an optional session token. A profile section that names another source
+(`role_arn`, `source_profile`, `credential_process`, `web_identity_token_file`,
+or a key that starts with `sso_`) is refused with an error that names the
+file, the section, and the key. The chain does not skip to the next source,
+so the port never signs with an identity other than the one that the profile
+names. If the environment gives the key pair, these keys are not read. The
+full chain of the AWS SDKs, with STS, IMDSv2, and the container endpoint, was
+rejected: it is a large part of the work, and each source needs a test
+server of its own.
+
+A profile that the caller names skips the key pair, the region, and the
+endpoint of the environment (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
+`AWS_SESSION_TOKEN`, `AWS_REGION`, `AWS_DEFAULT_REGION`,
+`AWS_ENDPOINT_URL_S3`, and `AWS_ENDPOINT_URL`). The chain reads the shared
+files for that profile alone. Without this rule, a named profile `prod` with
+`AWS_ENDPOINT_URL` set for a test server sends requests that the key of
+`prod` signs to the test server, and `AWS_ACCESS_KEY_ID` wins over the named
+profile. A profile from `AWS_PROFILE`, or the profile `default`, keeps the
+order of the AWS documentation, where the keys of the environment win. The
+order of the AWS documentation in all cases was rejected for these two
+reasons.
+
+When no source gives a region, the region is `us-east-1`. SigV4 puts the
+region into the scope of each signature, so each request carries a region.
+A server that does not check the region then needs an endpoint alone. A
+server that checks its own region, and an AWS bucket outside `us-east-1`,
+needs a region from the caller, the environment, or the config file. The
+region changes no byte of the repository, only the signature. A default
+that applies only with an endpoint of the caller was rejected.
+
 ## The client access of `ostrya serve`
 
 - The reader of the PROXY protocol, v1 and v2, is written in the tree, with
@@ -314,6 +365,9 @@ when the port owns its set of members and expects the set to grow.
 - `ostrya_fetch::UploadMethod` and `ostrya_fetch::SignPayload` have the
   attribute. The fetcher owns the set of upload methods and the set of body
   forms that a signer gets.
+- `ostrya_remote::s3::Origin` and `ostrya_remote::s3::Resolved` have the
+  attribute. The port owns the set of sources of an S3 setting, and the set
+  of resolved settings grows with the S3 support.
 - No option struct of the `ostrya` crate has the attribute: `PruneOptions`,
   `PullOptions`, `TarExportOptions`, `TarImportOptions` and the others. The
   attribute stops a struct expression outside the defining crate,

@@ -145,6 +145,13 @@ pub enum Error {
     /// The session refuses a call with an argument or source data that it
     /// cannot send. It also refuses a call while another call runs, and a
     /// call on a broken session.
+    ///
+    /// With the `s3` feature, the `s3` module returns this variant for a
+    /// refused value: a key pair, a region, a profile name, a setting of an
+    /// environment variable, or a shared AWS file that is larger than 1 MiB
+    /// or that the reader of the files refuses. It also returns it when no
+    /// source gives a key pair. The message holds no secret access key and no
+    /// session token.
     #[error("invalid input: {0}")]
     InvalidInput(String),
     /// A failure of the transport under the session.
@@ -173,6 +180,11 @@ pub enum Error {
     ///
     /// An end of file inside a frame or an object has the kind
     /// `UnexpectedEof`.
+    ///
+    /// With the `s3` feature, the `s3` module returns this variant for a
+    /// shared AWS file that exists and cannot be read. The error keeps the
+    /// `io::ErrorKind` of the failure, and its message names the file and the
+    /// path.
     #[error(transparent)]
     Io(#[from] std::io::Error),
     /// A failure of the walk or of the hash pass of a local tree.

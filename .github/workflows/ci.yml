@@ -229,6 +229,8 @@ jobs:
             cargo check --target "$target" -p ostrya-gvariant -p ostrya-core -p ostrya-rt -p ostrya-remote
             cargo check --target "$target" -p ostrya-rt --no-default-features --features tokio
             cargo check --target "$target" -p ostrya-remote --no-default-features --features tokio
+            cargo check --target "$target" -p ostrya-remote --features s3
+            cargo check --target "$target" -p ostrya-remote --no-default-features --features tokio,s3
             cargo check --target "$target" -p ostrya-sign --features sign-spki,sign-gpg
             cargo check --target "$target" -p ostrya-sign --no-default-features --features tokio,sign-spki,sign-gpg
           done

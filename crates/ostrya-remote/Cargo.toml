@@ -12,6 +12,16 @@ readme = "README.md"
 default = ["smol"]
 smol = ["ostrya-rt/smol", "ostrya-fetch/smol"]
 tokio = ["ostrya-rt/tokio", "ostrya-fetch/tokio"]
+# The `s3` module: the SigV4 signer of an S3 request, and the settings and the
+# credentials of an S3 endpoint from the caller, the environment, and the
+# shared AWS files.
+s3 = ["dep:sha2", "dep:hmac"]
+
+# The `s3` module is behind a feature. docs.rs adds the feature to the default
+# set, so the module is documented.
+[package.metadata.docs.rs]
+features = ["s3"]
+rustdoc-args = ["--cfg", "docsrs"]
 
 [dependencies]
 ostrya-gvariant = { workspace = true }
@@ -24,6 +34,11 @@ ostrya-fetch = { workspace = true }
 thiserror = "2"
 futures-io = "0.3"
 futures-lite = "2"
+# The SigV4 signer of the `s3` feature hashes the canonical request and the
+# body with SHA-256, and derives the signing key and the signature with
+# HMAC-SHA256.
+sha2 = { version = "0.10", default-features = false, features = ["std"], optional = true }
+hmac = { version = "0.12.1", optional = true }
 
 # The tree walk opens each file with `O_NOFOLLOW | O_NONBLOCK` on Unix, so a
 # file that became a symlink or a fifo answers the open rather than being

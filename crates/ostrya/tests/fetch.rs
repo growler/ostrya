@@ -33,7 +33,7 @@ use hyper::body::{Body as _, Bytes, Frame, Incoming, SizeHint};
 use hyper::header::{HeaderMap, HeaderName};
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
-use ostrya::fetch::Error;
+use ostrya::fetch::{Error, RequestSigner, SignPayload, SignRequest};
 use ostrya::{
     BasicAuth, BearerToken, Checksum, ClientIdentity, FetchRequest, Fetched, Fetcher,
     FetcherOptions, LowSpeed, Priority, Protocol, Proxy, TlsOptions, TrustRoots, UploadBody,
@@ -6245,6 +6245,709 @@ fn an_empty_streamed_post_declares_a_length_of_zero() {
             assert_eq!(seen.header("content-length"), Some("0"));
             assert_eq!(seen.header("transfer-encoding"), None);
             assert_body(seen, b"");
+        }
+    }));
+}
+
+// --- request signing -------------------------------------------------------
+
+/// The body of a request that [`StampSigner`] signed.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SignedBody {
+    Empty,
+    /// The length and the SHA-256 digest of a body given whole.
+    Bytes(u64, [u8; 32]),
+    Streamed,
+}
+
+/// A request that [`StampSigner`] signed, as the signer got it.
+#[derive(Clone, Debug)]
+struct Signed {
+    method: String,
+    authority: String,
+    path: String,
+    query: Option<String>,
+    body: SignedBody,
+}
+
+/// A signer that records each request that it signs. Call `n` returns
+/// `x-stamp: <n>` and `authorization: Stamp <n>`. If `fail` holds a message,
+/// each call records the request and fails with that message.
+#[derive(Debug, Default)]
+struct StampSigner {
+    signed: Mutex<Vec<Signed>>,
+    fail: Option<&'static str>,
+}
+
+impl StampSigner {
+    fn signed(&self) -> Vec<Signed> {
+        self.signed.lock().unwrap().clone()
+    }
+}
+
+impl RequestSigner for StampSigner {
+    fn sign(&self, request: &SignRequest<'_>) -> Result<Vec<(String, String)>, Error> {
+        let body = match request.payload {
+            SignPayload::Empty => SignedBody::Empty,
+            SignPayload::Bytes(bytes) => SignedBody::Bytes(bytes.len() as u64, sha256(bytes)),
+            SignPayload::Streamed => SignedBody::Streamed,
+            other => panic!("unknown payload {other:?}"),
+        };
+        let mut signed = self.signed.lock().unwrap();
+        signed.push(Signed {
+            method: request.method.to_owned(),
+            authority: request.authority.to_owned(),
+            path: request.path.to_owned(),
+            query: request.query.map(str::to_owned),
+            body,
+        });
+        if let Some(message) = self.fail {
+            return Err(Error::Fetch(message.to_owned()));
+        }
+        let n = signed.len();
+        Ok(vec![
+            ("x-stamp".to_owned(), n.to_string()),
+            ("authorization".to_owned(), format!("Stamp {n}")),
+        ])
+    }
+}
+
+/// Returns `options` with `signer` and the permission to sign for a
+/// cleartext origin.
+fn signing(options: FetcherOptions, signer: &Arc<StampSigner>) -> FetcherOptions {
+    FetcherOptions {
+        signer: Some(signer.clone()),
+        allow_cleartext_credentials: true,
+        ..options
+    }
+}
+
+/// Returns the values of `name` that `seen` carried.
+fn values(seen: &Seen, name: &str) -> Vec<String> {
+    seen.headers
+        .get_all(name)
+        .iter()
+        .map(|value| value.to_str().unwrap().to_owned())
+        .collect()
+}
+
+/// Returns the authority of a request as the server got it: the `Host` header
+/// of an HTTP/1.1 request, or the authority of the URI of an HTTP/2 request.
+fn wire_authority(seen: &Seen) -> String {
+    match seen.target.parse::<hyper::Uri>().unwrap().authority() {
+        Some(authority) => authority.as_str().to_owned(),
+        None => seen.header("host").unwrap().to_owned(),
+    }
+}
+
+/// The signer signs each attempt, a retry included, with the method, the
+/// authority of the `Host` header, the path, and the query of that attempt.
+/// Its headers replace the headers of the same name.
+#[test]
+fn a_signer_stamps_each_attempt_and_each_retry() {
+    block_on(bounded(async {
+        let handler: Handler = Arc::new(|_seen, count| {
+            if count == 1 {
+                return Response::builder()
+                    .status(StatusCode::SERVICE_UNAVAILABLE)
+                    .body(TestBody::empty())
+                    .unwrap();
+            }
+            Response::builder()
+                .status(StatusCode::OK)
+                .body(TestBody::measured(b"signed"))
+                .unwrap()
+        });
+        let server = TestServer::start(Transport::Cleartext, handler).await;
+        let signer = Arc::new(StampSigner::default());
+        let fetcher = Fetcher::new(signing(direct_options(server.url(false)), &signer))
+            .await
+            .unwrap();
+
+        let (bytes, _) = fetch_bytes(&fetcher, "objects/ab/cd.file").await;
+        assert_eq!(bytes, b"signed");
+        let seen = server.seen();
+        assert_eq!(seen.len(), 2);
+        let signed = signer.signed();
+        assert_eq!(signed.len(), 2);
+        for (n, (seen, signed)) in seen.iter().zip(&signed).enumerate() {
+            let stamp = n + 1;
+            assert_eq!(values(seen, "x-stamp"), [stamp.to_string()]);
+            assert_eq!(values(seen, "authorization"), [format!("Stamp {stamp}")]);
+            assert_eq!(signed.method, "GET");
+            assert_eq!(signed.authority, seen.header("host").unwrap());
+            assert_eq!(
+                signed.authority,
+                format!("localhost:{}", server.addr.port())
+            );
+            assert_eq!(signed.path, "/objects/ab/cd.file");
+            assert_eq!(signed.query, None);
+            assert_eq!(signed.body, SignedBody::Empty);
+        }
+
+        let headers = vec![("X-Stamp".to_owned(), "caller".to_owned())];
+        let fetched = fetcher
+            .fetch(FetchRequest {
+                headers: &headers,
+                ..FetchRequest::path_query("summary", "a=1&b=%2F")
+            })
+            .await
+            .unwrap();
+        assert_eq!(read_body(fetched).await, b"signed");
+        let seen = &server.seen()[2];
+        assert_eq!(seen.target, "/summary?a=1&b=%2F");
+        assert_eq!(values(seen, "x-stamp"), ["3"]);
+        let signed = &signer.signed()[2];
+        assert_eq!(signed.path, "/summary");
+        assert_eq!(signed.query.as_deref(), Some("a=1&b=%2F"));
+    }));
+}
+
+/// The signer gets the bytes of a `PUT` body given whole, no bytes for a
+/// streamed body, and an empty body for a `DELETE`, over HTTP/1.1 and over
+/// HTTP/2. The authority is the authority that the request carries.
+#[test]
+fn a_signer_stamps_put_bytes_delete_and_streamed_over_http1_and_http2() {
+    block_on(bounded(async {
+        let data = upload_data(70_000);
+        let streamed = upload_data(100_001);
+        for alpn in ["http/1.1", "h2"] {
+            let server = TestServer::start(tls_transport(alpn), always_status(204)).await;
+            let signer = Arc::new(StampSigner::default());
+            let fetcher = Fetcher::new(signing(upload_options(server.url(true)), &signer))
+                .await
+                .unwrap();
+
+            let uploaded = fetcher
+                .upload(UploadRequest {
+                    method: UploadMethod::Put,
+                    ..UploadRequest::path("objects/put", data.clone().into())
+                })
+                .await
+                .unwrap();
+            assert_eq!(uploaded.status(), 204);
+
+            let (body, writer) = UploadBody::channel();
+            let (uploaded, written) = upload_streamed(
+                &fetcher,
+                UploadRequest {
+                    method: UploadMethod::Put,
+                    ..UploadRequest::path("objects/streamed", body)
+                },
+                writer,
+                &streamed,
+            )
+            .await;
+            written.unwrap();
+            assert_eq!(uploaded.unwrap().status(), 204);
+
+            let uploaded = fetcher
+                .upload(UploadRequest {
+                    method: UploadMethod::Delete,
+                    ..UploadRequest::path("objects/put", Vec::new().into())
+                })
+                .await
+                .unwrap();
+            assert_eq!(uploaded.status(), 204);
+
+            let seen = server.seen();
+            let signed = signer.signed();
+            assert_eq!(seen.len(), 3, "{alpn}");
+            assert_eq!(signed.len(), 3, "{alpn}");
+            assert_body(&seen[0], &data);
+            assert_body(&seen[1], &streamed);
+            assert_body(&seen[2], b"");
+            let expected = [
+                (
+                    "PUT",
+                    "/objects/put",
+                    SignedBody::Bytes(data.len() as u64, sha256(&data)),
+                ),
+                ("PUT", "/objects/streamed", SignedBody::Streamed),
+                ("DELETE", "/objects/put", SignedBody::Empty),
+            ];
+            for (n, (method, path, body)) in expected.into_iter().enumerate() {
+                assert_eq!(seen[n].method, method, "{alpn}");
+                assert_eq!(seen[n].path, path, "{alpn}");
+                assert_eq!(values(&seen[n], "x-stamp"), [(n + 1).to_string()]);
+                assert_eq!(signed[n].method, method, "{alpn}");
+                assert_eq!(signed[n].path, path, "{alpn}");
+                assert_eq!(signed[n].query, None, "{alpn}");
+                assert_eq!(signed[n].body, body, "{alpn}");
+                assert_eq!(signed[n].authority, wire_authority(&seen[n]), "{alpn}");
+                assert_eq!(
+                    signed[n].authority,
+                    format!("localhost:{}", server.addr.port())
+                );
+            }
+        }
+    }));
+}
+
+/// A hop at another origin gets no signature. A hop back to the named origin
+/// in the same attempt gets none either. The same applies to a `PUT` that
+/// follows a 307.
+#[test]
+fn a_cross_origin_hop_carries_no_signature() {
+    block_on(bounded(async {
+        let named_url = Arc::new(Mutex::new(String::new()));
+        let back = named_url.clone();
+        let hop = TestServer::start(
+            Transport::Cleartext,
+            Arc::new(move |_seen, _count| redirect(302, &format!("{}/back", back.lock().unwrap()))),
+        )
+        .await;
+        let named = TestServer::start(
+            Transport::Cleartext,
+            redirect_once(format!("{}/hopped", hop.url(false)), b"back home"),
+        )
+        .await;
+        *named_url.lock().unwrap() = named.url(false);
+        let signer = Arc::new(StampSigner::default());
+        let fetcher = Fetcher::new(signing(direct_options(named.url(false)), &signer))
+            .await
+            .unwrap();
+
+        let (bytes, _) = fetch_bytes(&fetcher, "config").await;
+        assert_eq!(bytes, b"back home");
+        assert_eq!(signer.signed().len(), 1);
+        let first = &named.seen()[0];
+        assert_eq!(values(first, "x-stamp"), ["1"]);
+        assert_eq!(values(first, "authorization"), ["Stamp 1"]);
+        let hopped = &hop.seen()[0];
+        assert_eq!(hopped.path, "/hopped");
+        assert_eq!(hopped.header("x-stamp"), None);
+        assert_eq!(hopped.header("authorization"), None);
+        let back = &named.seen()[1];
+        assert_eq!(back.path, "/back");
+        assert_eq!(back.header("x-stamp"), None);
+        assert_eq!(back.header("authorization"), None);
+
+        let landing = TestServer::start(Transport::Cleartext, always(b"landed")).await;
+        let location = format!("{}/landed", landing.url(false));
+        let named = TestServer::start(
+            Transport::Cleartext,
+            Arc::new(move |_seen, _count| redirect(307, &location)),
+        )
+        .await;
+        let signer = Arc::new(StampSigner::default());
+        let fetcher = Fetcher::new(signing(direct_options(named.url(false)), &signer))
+            .await
+            .unwrap();
+        let data = upload_data(70_000);
+        let uploaded = fetcher
+            .upload(UploadRequest {
+                method: UploadMethod::Put,
+                ..UploadRequest::path("objects/put", data.clone().into())
+            })
+            .await
+            .unwrap();
+        assert_eq!(uploaded.status(), 200);
+        assert_eq!(signer.signed().len(), 1);
+        assert_eq!(values(&named.seen()[0], "x-stamp"), ["1"]);
+        let landed = &landing.seen()[0];
+        assert_eq!(landed.method, "PUT");
+        assert_eq!(landed.header("x-stamp"), None);
+        assert_eq!(landed.header("authorization"), None);
+        assert_body(landed, &data);
+    }));
+}
+
+/// A redirect hop at the named origin is signed again, with its own path and
+/// query.
+#[test]
+fn a_same_origin_redirect_is_signed_again() {
+    block_on(bounded(async {
+        let server = TestServer::start(
+            Transport::Cleartext,
+            redirect_once("/moved?b=2".to_owned(), b"moved"),
+        )
+        .await;
+        let signer = Arc::new(StampSigner::default());
+        let fetcher = Fetcher::new(signing(direct_options(server.url(false)), &signer))
+            .await
+            .unwrap();
+
+        let (bytes, _) = fetch_bytes(&fetcher, "first").await;
+        assert_eq!(bytes, b"moved");
+        let signed = signer.signed();
+        assert_eq!(signed.len(), 2);
+        assert_eq!(signed[0].path, "/first");
+        assert_eq!(signed[0].query, None);
+        assert_eq!(signed[1].path, "/moved");
+        assert_eq!(signed[1].query.as_deref(), Some("b=2"));
+        let seen = server.seen();
+        assert_eq!(values(&seen[0], "x-stamp"), ["1"]);
+        assert_eq!(values(&seen[1], "x-stamp"), ["2"]);
+    }));
+}
+
+/// An error of the signer ends the request with that error. The request
+/// reaches no server, and the fetcher tries no other mirror and no other
+/// round. An upload that fails this way is unsent.
+#[test]
+fn a_signer_error_fails_the_request_without_a_retry() {
+    block_on(bounded(async {
+        let first = TestServer::start(Transport::Cleartext, always(b"first")).await;
+        let second = TestServer::start(Transport::Cleartext, always(b"second")).await;
+        let signer = Arc::new(StampSigner {
+            fail: Some("the signing key is locked"),
+            ..StampSigner::default()
+        });
+        let options = FetcherOptions {
+            mirrors: vec![first.url(false), second.url(false)],
+            max_retries: 3,
+            ..direct_options("unused")
+        };
+        let fetcher = Fetcher::new(signing(options, &signer)).await.unwrap();
+
+        let err = fetch_error(&fetcher, "config").await;
+        assert!(
+            matches!(&err, Error::Fetch(message) if message == "the signing key is locked"),
+            "{err}"
+        );
+        assert_eq!(signer.signed().len(), 1);
+
+        let err = upload_error(
+            &fetcher,
+            UploadRequest {
+                method: UploadMethod::Put,
+                ..UploadRequest::path("objects/put", upload_data(1000).into())
+            },
+        )
+        .await;
+        assert!(
+            matches!(&err, Error::Fetch(message) if message == "the signing key is locked"),
+            "{err}"
+        );
+        assert!(err.is_unsent());
+        assert_eq!(signer.signed().len(), 2);
+        assert_eq!(first.requests(), 0);
+        assert_eq!(second.requests(), 0);
+    }));
+}
+
+/// A signer that fails call number `fail_on` and passes each other call to
+/// `stamp`.
+#[derive(Debug, Default)]
+struct FailOnSigner {
+    calls: AtomicUsize,
+    fail_on: usize,
+    stamp: StampSigner,
+}
+
+impl FailOnSigner {
+    fn new(fail_on: usize) -> FailOnSigner {
+        FailOnSigner {
+            fail_on,
+            ..FailOnSigner::default()
+        }
+    }
+}
+
+impl RequestSigner for FailOnSigner {
+    fn sign(&self, request: &SignRequest<'_>) -> Result<Vec<(String, String)>, Error> {
+        if self.calls.fetch_add(1, Ordering::SeqCst) + 1 == self.fail_on {
+            return Err(Error::Fetch("the signing key is locked".to_owned()));
+        }
+        self.stamp.sign(request)
+    }
+}
+
+/// Returns the options of a fetcher at `url` with `signer` and the
+/// permission to sign for a cleartext origin.
+fn failing_on(url: impl Into<String>, signer: &Arc<FailOnSigner>) -> FetcherOptions {
+    FetcherOptions {
+        signer: Some(signer.clone()),
+        allow_cleartext_credentials: true,
+        ..direct_options(url)
+    }
+}
+
+/// A fetcher with a signer refuses a credential of a request before
+/// admission: basic-auth credentials, a bearer token, or an `Authorization`
+/// header. The signer is not called, and no request reaches the server.
+#[test]
+fn a_request_credential_beside_a_signer_is_refused() {
+    block_on(bounded(async {
+        let server = TestServer::start(Transport::Cleartext, always(b"unused")).await;
+        let signer = Arc::new(StampSigner::default());
+        let fetcher = Fetcher::new(signing(direct_options(server.url(false)), &signer))
+            .await
+            .unwrap();
+        let auth = basic_auth("u", "p");
+        let token = BearerToken {
+            token: "t0k3n".into(),
+        };
+        let header = vec![("Authorization".to_owned(), "Basic dTpw".to_owned())];
+        let refused = |err: &Error, other: &str| {
+            assert!(
+                matches!(err, Error::Fetch(message)
+                    if message.contains("request signer")
+                        && message.contains(other)
+                        && message.contains("pass one of them")),
+                "{err}"
+            );
+            assert!(err.is_unsent());
+        };
+
+        for (request, other) in [
+            (
+                FetchRequest {
+                    basic_auth: Some(&auth),
+                    ..FetchRequest::path("config")
+                },
+                "basic-auth credentials",
+            ),
+            (
+                FetchRequest {
+                    headers: &header,
+                    ..FetchRequest::path("config")
+                },
+                "an authorization header",
+            ),
+        ] {
+            let Err(err) = fetcher.fetch(request).await else {
+                panic!("the fetch was expected to fail");
+            };
+            refused(&err, other);
+        }
+
+        for (request, other) in [
+            (
+                UploadRequest {
+                    basic_auth: Some(&auth),
+                    ..UploadRequest::path("objects", b"hello".to_vec().into())
+                },
+                "basic-auth credentials",
+            ),
+            (
+                UploadRequest {
+                    bearer_token: Some(&token),
+                    ..UploadRequest::path("objects", b"hello".to_vec().into())
+                },
+                "a bearer token",
+            ),
+            (
+                UploadRequest {
+                    headers: &header,
+                    method: UploadMethod::Put,
+                    ..UploadRequest::path("objects", b"hello".to_vec().into())
+                },
+                "an authorization header",
+            ),
+        ] {
+            refused(&upload_error(&fetcher, request).await, other);
+        }
+
+        assert!(signer.signed().is_empty());
+        assert_eq!(server.requests(), 0);
+        assert_eq!(server.connections(), 0);
+    }));
+}
+
+/// A header of the signer replaces a header of the same name that the fetcher
+/// sets for each request. One value reaches the wire.
+#[test]
+fn a_signer_header_replaces_a_fetcher_header_of_the_same_name() {
+    block_on(bounded(async {
+        let server = TestServer::start(Transport::Cleartext, always(b"signed")).await;
+        let signer = Arc::new(StampSigner::default());
+        let options = FetcherOptions {
+            headers: vec![
+                ("X-Stamp".to_owned(), "fetcher".to_owned()),
+                ("X-Trace".to_owned(), "kept".to_owned()),
+            ],
+            ..direct_options(server.url(false))
+        };
+        let fetcher = Fetcher::new(signing(options, &signer)).await.unwrap();
+
+        fetch_bytes(&fetcher, "config").await;
+        let uploaded = fetcher
+            .upload(UploadRequest {
+                method: UploadMethod::Put,
+                ..UploadRequest::path("objects", b"hello".to_vec().into())
+            })
+            .await
+            .unwrap();
+        read_uploaded(uploaded).await;
+
+        let seen = server.seen();
+        assert_eq!(seen.len(), 2);
+        for (n, seen) in seen.iter().enumerate() {
+            assert_eq!(values(seen, "x-stamp"), [(n + 1).to_string()]);
+            assert_eq!(values(seen, "x-trace"), ["kept"]);
+        }
+    }));
+}
+
+/// An error of the signer leaves the HTTP/1.1 connection that the request
+/// took unused, and the connection goes back to the pool. The next fetch, and
+/// the next upload, send their requests over it.
+#[test]
+fn a_signer_error_returns_the_http1_connection_to_the_pool() {
+    block_on(bounded(async {
+        let server = TestServer::start(Transport::Cleartext, always(b"pooled")).await;
+        let signer = Arc::new(FailOnSigner::new(1));
+        let fetcher = Fetcher::new(failing_on(server.url(false), &signer))
+            .await
+            .unwrap();
+        let err = fetch_error(&fetcher, "config").await;
+        assert!(
+            matches!(&err, Error::Fetch(message) if message == "the signing key is locked"),
+            "{err}"
+        );
+        let (bytes, _) = fetch_bytes(&fetcher, "config").await;
+        assert_eq!(bytes, b"pooled");
+        assert_eq!(server.requests(), 1);
+        assert_eq!(server.connections(), 1);
+
+        let server = TestServer::start(Transport::Cleartext, always(b"pooled")).await;
+        let signer = Arc::new(FailOnSigner::new(1));
+        let fetcher = Fetcher::new(failing_on(server.url(false), &signer))
+            .await
+            .unwrap();
+        let request = || UploadRequest {
+            method: UploadMethod::Put,
+            ..UploadRequest::path("objects", b"hello".to_vec().into())
+        };
+        let err = upload_error(&fetcher, request()).await;
+        assert!(
+            matches!(&err, Error::Fetch(message) if message == "the signing key is locked"),
+            "{err}"
+        );
+        assert!(err.is_unsent());
+        let uploaded = fetcher.upload(request()).await.unwrap();
+        assert_eq!(read_uploaded(uploaded).await, b"pooled");
+        assert_eq!(server.requests(), 1);
+        assert_eq!(server.connections(), 1);
+    }));
+}
+
+/// An error of the signer on a redirect hop of an upload comes after the
+/// first hop sent the request. So it fails the upload with
+/// [`Error::UploadInterrupted`] for the URL of that hop.
+#[test]
+fn a_signer_error_on_an_upload_redirect_hop_interrupts_the_upload() {
+    block_on(bounded(async {
+        let server = TestServer::start(
+            Transport::Cleartext,
+            Arc::new(|_seen, count| {
+                if count == 1 {
+                    redirect(307, "/moved")
+                } else {
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(TestBody::measured(b"landed"))
+                        .unwrap()
+                }
+            }),
+        )
+        .await;
+        let signer = Arc::new(FailOnSigner::new(2));
+        let fetcher = Fetcher::new(failing_on(server.url(false), &signer))
+            .await
+            .unwrap();
+        let err = upload_error(
+            &fetcher,
+            UploadRequest {
+                method: UploadMethod::Put,
+                ..UploadRequest::path("objects", upload_data(1000).into())
+            },
+        )
+        .await;
+        let moved = format!("{}/moved", server.url(false));
+        assert!(
+            matches!(&err, Error::UploadInterrupted { url, message }
+                if *url == moved && message.contains("the signing key is locked")),
+            "{err}"
+        );
+        assert!(!err.is_unsent());
+        let seen = server.seen();
+        assert_eq!(seen.len(), 1);
+        assert_eq!(values(&seen[0], "x-stamp"), ["1"]);
+    }));
+}
+
+/// A `PUT` of a body given whole declares its length, over cleartext, over
+/// HTTP/1.1, and over HTTP/2. An empty `PUT` declares a length of zero.
+#[test]
+fn a_put_declares_its_length_over_http1_and_http2() {
+    block_on(bounded(async {
+        let data = upload_data(100_000);
+        for (transport, tls) in [
+            (Transport::Cleartext, false),
+            (tls_transport("http/1.1"), true),
+            (tls_transport("h2"), true),
+        ] {
+            let server = TestServer::start(transport, always(b"accepted")).await;
+            let fetcher = Fetcher::new(upload_options(server.url(tls))).await.unwrap();
+            for body in [data.clone(), Vec::new()] {
+                let uploaded = fetcher
+                    .upload(UploadRequest {
+                        method: UploadMethod::Put,
+                        ..UploadRequest::path("objects", body.into())
+                    })
+                    .await
+                    .unwrap();
+                assert_eq!(uploaded.status(), 200);
+                assert_eq!(read_uploaded(uploaded).await, b"accepted");
+            }
+
+            let seen = server.seen();
+            assert_eq!(seen[0].method, "PUT");
+            assert_eq!(seen[0].header("content-length"), Some("100000"));
+            assert_eq!(seen[0].header("transfer-encoding"), None);
+            assert_body(&seen[0], &data);
+            assert_eq!(seen[1].method, "PUT");
+            assert_eq!(seen[1].header("content-length"), Some("0"));
+            assert_eq!(seen[1].header("transfer-encoding"), None);
+            assert_body(&seen[1], b"");
+        }
+    }));
+}
+
+/// A `PUT` of a body given whole follows a 307 or a 308. It keeps the method
+/// and sends the bytes again.
+#[test]
+fn a_put_follows_307_and_308_for_a_whole_body() {
+    block_on(bounded(async {
+        let data = upload_data(70_000);
+        for status in [307, 308] {
+            let server = TestServer::start(
+                Transport::Cleartext,
+                Arc::new(move |_seen, count| {
+                    if count == 1 {
+                        redirect(status, "/moved")
+                    } else {
+                        Response::builder()
+                            .status(StatusCode::OK)
+                            .body(TestBody::measured(b"landed"))
+                            .unwrap()
+                    }
+                }),
+            )
+            .await;
+            let fetcher = Fetcher::new(direct_options(server.url(false)))
+                .await
+                .unwrap();
+            let uploaded = fetcher
+                .upload(UploadRequest {
+                    method: UploadMethod::Put,
+                    ..UploadRequest::path("objects", data.clone().into())
+                })
+                .await
+                .unwrap();
+            assert_eq!(uploaded.status(), 200);
+            assert_eq!(uploaded.url(), format!("{}/moved", server.url(false)));
+            assert_eq!(read_uploaded(uploaded).await, b"landed");
+            let seen = server.seen();
+            assert_eq!(seen.len(), 2);
+            assert_eq!(seen[0].method, "PUT");
+            assert_body(&seen[0], &data);
+            assert_eq!(seen[1].method, "PUT");
+            assert_eq!(seen[1].path, "/moved");
+            assert_body(&seen[1], &data);
         }
     }));
 }

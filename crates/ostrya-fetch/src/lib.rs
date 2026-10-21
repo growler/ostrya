@@ -5,8 +5,9 @@
 //!
 //! A caller builds a [`Fetcher`] from the mirrors, headers, credentials, proxy,
 //! TLS configuration, retry limits, and deadlines of one remote. The fetcher
-//! downloads files with `GET` and sends uploads with `POST` or `DELETE`. A
-//! response body streams in bounded chunks, so no object is held whole in memory.
+//! downloads files with `GET` and sends uploads with `POST`, `PUT`, or
+//! `DELETE`. A response body streams in bounded chunks, so no object is held
+//! whole in memory.
 //!
 //! The [`Target`] of a request is a path under each mirror, a path with a
 //! query string under each mirror, or an absolute URL. The fetcher sends a
@@ -20,6 +21,7 @@
 //! - [`Fetcher::refetching`] returns a [`Refetch`], which fetches a failed body again.
 //! - [`Fetcher::upload`] sends an [`UploadRequest`] and returns an [`Uploaded`].
 //! - [`UploadBody`] gives an upload body whole or streams it from an [`UploadWriter`].
+//! - [`RequestSigner`] signs each attempt through [`FetcherOptions::signer`].
 //! - [`Error`] is the error of each fallible operation of the crate.
 //!
 //! # Modules
@@ -147,6 +149,25 @@ const AMBIGUOUS_BEARER: &str =
 /// token, for the reason that [`AMBIGUOUS_AUTHORIZATION`] states.
 const BASIC_AND_BEARER: &str =
     "basic-auth credentials and a bearer token both set Authorization: pass one of them";
+
+/// The message for a fetcher that has a request signer, and basic-auth
+/// credentials on the fetcher or on a request. A signer sets the headers of
+/// its signature, which can include `Authorization`, so the reason of
+/// [`AMBIGUOUS_AUTHORIZATION`] applies.
+const SIGNER_AND_BASIC: &str =
+    "a request signer and basic-auth credentials both authorize the request: pass one of them";
+
+/// The message for a fetcher that has a request signer, and a bearer token on
+/// the fetcher or on a request, for the reason that [`SIGNER_AND_BASIC`]
+/// states.
+const SIGNER_AND_BEARER: &str =
+    "a request signer and a bearer token both authorize the request: pass one of them";
+
+/// The message for a fetcher that has a request signer, and an
+/// `Authorization` header on the fetcher or on a request, for the reason that
+/// [`SIGNER_AND_BASIC`] states.
+const SIGNER_AND_AUTHORIZATION: &str =
+    "a request signer and an authorization header both authorize the request: pass one of them";
 
 /// The message for a layer that sets a `Host` header. The header states the
 /// authority of the destination, and the fetcher reads it from the URL.
@@ -284,6 +305,99 @@ impl std::fmt::Debug for BearerToken {
         f.debug_struct("BearerToken")
             .field("token", &"<redacted>")
             .finish()
+    }
+}
+
+/// A signer that adds the headers of a request signature to each attempt.
+///
+/// [`FetcherOptions::signer`] holds the signer of a fetcher. The fetcher calls
+/// [`sign`](RequestSigner::sign) once for each request that it sends to the
+/// origin that the route names. This includes each retry, each round, and
+/// each redirect hop at that origin. The call occurs after the fetcher takes
+/// the connection, so a signature with a date is fresh when the request
+/// leaves. An upload over a pooled HTTP/1.1 connection that the server closed
+/// continues over a new connection, and the fetcher calls the signer again.
+///
+/// A redirect hop at another origin gets no signature. No later hop of that
+/// attempt gets one, also a hop back to the named origin.
+///
+/// The fetcher calls the signer on the task of the request. A signer that
+/// hashes a body given whole does that work on the task, on each call.
+///
+/// The [`Debug`] output of a signer must show no secret, because the
+/// [`Debug`] output of [`FetcherOptions`] includes it.
+pub trait RequestSigner: Send + Sync + std::fmt::Debug {
+    /// Returns the headers that sign `request`. Each one replaces a header of
+    /// the same name.
+    ///
+    /// The fetcher refuses a returned header as it refuses a request header:
+    /// an invalid name or value, a `Host` header, and a header that the
+    /// connection layer sets. Each returned value is marked sensitive, so an
+    /// HTTP/2 connection never adds it to its header compression table. Two
+    /// returned headers of one name both go on the wire.
+    ///
+    /// # Errors
+    ///
+    /// The fetcher passes an error of this method through unchanged, and the
+    /// request ends with it. The request sends nothing for the attempt, and
+    /// the fetcher tries no other destination and no other round. An error on
+    /// a redirect hop of an upload ends the upload with
+    /// [`Error::UploadInterrupted`], because the first hop sent the request.
+    /// Usually, the error is [`Error::Fetch`].
+    fn sign(&self, request: &SignRequest<'_>) -> Result<Vec<(String, String)>>;
+}
+
+/// The parts of one attempt that a signer signs, as the request carries them.
+#[derive(Clone, Copy, Debug)]
+pub struct SignRequest<'a> {
+    /// The method: `GET`, `POST`, `PUT`, or `DELETE`.
+    pub method: &'a str,
+    /// The `host[:port]` of the request, which is the `Host` header of an
+    /// HTTP/1.1 request and the `:authority` of an HTTP/2 request.
+    ///
+    /// It has no default port of the scheme. An IPv6 literal keeps its
+    /// brackets.
+    pub authority: &'a str,
+    /// The path of the request target, as the request carries it. It includes
+    /// the base path of a mirror, and the escapes of the caller.
+    pub path: &'a str,
+    /// The query string of the request target, without the `?`.
+    ///
+    /// It is `None` if the target has no `?`. A target that ends in `?` has an
+    /// empty query.
+    pub query: Option<&'a str>,
+    /// The body of the request.
+    pub payload: SignPayload<'a>,
+}
+
+/// The body of a signed request.
+///
+/// The [`Debug`] output of [`Bytes`](SignPayload::Bytes) shows the length of
+/// the body, and not its bytes.
+#[derive(Clone, Copy, Eq, PartialEq)]
+#[non_exhaustive]
+pub enum SignPayload<'a> {
+    /// No body: a `GET` or a `DELETE`.
+    Empty,
+    /// The whole body of a `POST` or a `PUT` that [`UploadBody::bytes`] gives.
+    /// An empty body is also this variant.
+    ///
+    /// The signer gets the whole body on each attempt, and it runs on the task
+    /// that sends the request. So the time to hash the body on that task grows
+    /// with the size of the body.
+    Bytes(&'a [u8]),
+    /// The body of a `POST` or a `PUT` that streams from an [`UploadWriter`].
+    /// Its bytes are not known when the fetcher calls the signer.
+    Streamed,
+}
+
+impl std::fmt::Debug for SignPayload<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SignPayload::Empty => f.write_str("Empty"),
+            SignPayload::Bytes(bytes) => f.debug_tuple("Bytes").field(&bytes.len()).finish(),
+            SignPayload::Streamed => f.write_str("Streamed"),
+        }
     }
 }
 
@@ -669,7 +783,8 @@ impl std::fmt::Debug for RedactedUrls<'_> {
 /// place of its value. The output also shows no password of `basic_auth`, no
 /// token of `bearer_token`, no client key or passphrase, and no userinfo of a
 /// proxy URL. Each mirror URL shows with no userinfo. A query shows as
-/// `?<redacted>`, and a fragment shows as `#<redacted>`.
+/// `?<redacted>`, and a fragment shows as `#<redacted>`. The signer shows as
+/// its own [`Debug`] output shows it.
 #[derive(Clone)]
 pub struct FetcherOptions {
     /// The base URLs, tried in order for each request that names a
@@ -708,6 +823,7 @@ pub struct FetcherOptions {
     ///   [`basic_auth`](FetcherOptions::basic_auth)
     /// - an `Authorization` header beside
     ///   [`bearer_token`](FetcherOptions::bearer_token)
+    /// - an `Authorization` header beside [`signer`](FetcherOptions::signer)
     /// - an invalid header name or value.
     pub headers: Vec<(String, String)>,
     /// The credentials for `Authorization: Basic`, sent with each request.
@@ -720,9 +836,10 @@ pub struct FetcherOptions {
     /// [`allow_cleartext_credentials`](FetcherOptions::allow_cleartext_credentials)
     /// is `true`. [`Fetcher::new`] refuses a cleartext mirror, so the
     /// credentials go in cleartext only with that permission. An
-    /// `Authorization` entry in [`headers`](FetcherOptions::headers) or a
-    /// [`bearer_token`](FetcherOptions::bearer_token) beside these also fails
-    /// [`Fetcher::new`], because each of them sets the same header.
+    /// `Authorization` entry in [`headers`](FetcherOptions::headers), a
+    /// [`bearer_token`](FetcherOptions::bearer_token), or a
+    /// [`signer`](FetcherOptions::signer) beside these also fails
+    /// [`Fetcher::new`], because each of them can set the same header.
     pub basic_auth: Option<BasicAuth>,
     /// The token for `Authorization: Bearer`, sent with each request.
     ///
@@ -734,27 +851,49 @@ pub struct FetcherOptions {
     ///
     /// [`Fetcher::new`] refuses a token that does not have the token68 syntax
     /// that [`BearerToken`] states. It also refuses the token beside
-    /// [`basic_auth`](FetcherOptions::basic_auth), or beside an
-    /// `Authorization` entry in [`headers`](FetcherOptions::headers), because
-    /// each of them sets the same header.
+    /// [`basic_auth`](FetcherOptions::basic_auth), beside an
+    /// `Authorization` entry in [`headers`](FetcherOptions::headers), or
+    /// beside a [`signer`](FetcherOptions::signer), because each of them can
+    /// set the same header.
     ///
     /// Each mirror must be `https`, unless
     /// [`allow_cleartext_credentials`](FetcherOptions::allow_cleartext_credentials)
     /// is `true`.
     pub bearer_token: Option<BearerToken>,
+    /// The signer that adds a signature to each attempt at the origin that
+    /// the route names.
+    ///
+    /// [`RequestSigner`] states when the fetcher calls the signer. The headers
+    /// of the signer replace the headers of the same name in each layer: the
+    /// fetcher and the request. A redirect hop at another origin gets no
+    /// signature. The default is `None`.
+    ///
+    /// The signer is a credential. [`Fetcher::new`] refuses it beside
+    /// [`basic_auth`](FetcherOptions::basic_auth), beside
+    /// [`bearer_token`](FetcherOptions::bearer_token), and beside an
+    /// `Authorization` entry in [`headers`](FetcherOptions::headers), because
+    /// a signature can set the same header. For the same reason, a fetch or an
+    /// upload with a credential of its own fails before admission: basic-auth
+    /// credentials, a bearer token, or an `Authorization` request header.
+    ///
+    /// Each mirror must be `https`, unless
+    /// [`allow_cleartext_credentials`](FetcherOptions::allow_cleartext_credentials)
+    /// is `true`.
+    pub signer: Option<Arc<dyn RequestSigner>>,
     /// The permission for a credential to reach a cleartext origin.
     ///
     /// If this is `true`, [`Fetcher::new`] does not refuse a cleartext mirror
     /// beside a credential: [`basic_auth`](FetcherOptions::basic_auth),
-    /// [`bearer_token`](FetcherOptions::bearer_token), or a credential header
-    /// in [`headers`](FetcherOptions::headers). A fetch or an upload also does
+    /// [`bearer_token`](FetcherOptions::bearer_token),
+    /// [`signer`](FetcherOptions::signer), or a credential header in
+    /// [`headers`](FetcherOptions::headers). A fetch or an upload also does
     /// not refuse a credential for a cleartext destination, whatever the flag
     /// of the request is. [`FetchRequest::allow_cleartext_credentials`] states
     /// that rule.
     ///
     /// The redirect rules apply with this flag. A hop at another origin gets no
-    /// credential, and a hop from `https` to `http` is refused. The default is
-    /// `false`.
+    /// credential and no signature, and a hop from `https` to `http` is
+    /// refused. The default is `false`.
     ///
     /// A caller sets it for a server on a loopback address, or for a server
     /// behind a proxy that terminates TLS.
@@ -880,6 +1019,7 @@ impl Default for FetcherOptions {
             headers: Vec::new(),
             basic_auth: None,
             bearer_token: None,
+            signer: None,
             allow_cleartext_credentials: false,
             tls: TlsOptions::default(),
             proxy: Proxy::default(),
@@ -902,6 +1042,7 @@ impl std::fmt::Debug for FetcherOptions {
             headers,
             basic_auth,
             bearer_token,
+            signer,
             allow_cleartext_credentials,
             tls,
             proxy,
@@ -922,6 +1063,7 @@ impl std::fmt::Debug for FetcherOptions {
             .field("headers", &headers)
             .field("basic_auth", basic_auth)
             .field("bearer_token", bearer_token)
+            .field("signer", signer)
             .field("allow_cleartext_credentials", allow_cleartext_credentials)
             .field("tls", tls)
             .field("proxy", proxy)
@@ -1074,12 +1216,22 @@ pub struct FetchRequest<'a> {
     /// Credentials beside an `Authorization` header in one layer give two
     /// answers to one question. [`Fetcher::new`] refuses them on the fetcher,
     /// and the fetch refuses them on a request.
+    ///
+    /// A fetcher with a [`signer`](FetcherOptions::signer) takes no
+    /// credential of a request. [`basic_auth`](FetchRequest::basic_auth) or
+    /// an `Authorization` entry in these headers then fails the fetch before
+    /// admission with [`Error::Fetch`]. [`Fetcher::new`] refuses layers 3 and
+    /// 4 beside a signer. So the signature is the one credential of the
+    /// request, and each header that the signer returns replaces the header
+    /// of the same name.
     pub headers: &'a [(String, String)],
     /// Credentials that replace the credentials of the fetcher for this
     /// request.
     ///
     /// These set the `Authorization` header, so an `Authorization` entry in
-    /// [`headers`](FetchRequest::headers) beside them fails the fetch.
+    /// [`headers`](FetchRequest::headers) beside them fails the fetch. A
+    /// [`signer`](FetcherOptions::signer) of the fetcher beside them also
+    /// fails the fetch before admission with [`Error::Fetch`].
     ///
     /// The fetcher encodes the header value for each request. A caller that
     /// sends one credential over many requests can encode the `Authorization`
@@ -1109,7 +1261,7 @@ pub struct FetchRequest<'a> {
     /// `Authorization`, `Proxy-Authorization`, or `Cookie` entry in the merged
     /// headers. [`FetcherOptions::basic_auth`] and
     /// [`FetcherOptions::bearer_token`] are `Authorization` entries in the
-    /// merged headers.
+    /// merged headers. [`FetcherOptions::signer`] is also a credential.
     ///
     /// If a fetch carries a credential and a destination that it can reach is
     /// `http`, the fetch fails before admission with [`Error::Fetch`]. The
@@ -1200,12 +1352,18 @@ pub enum Fetched {
 
 /// The method of an upload.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+#[non_exhaustive]
 pub enum UploadMethod {
     /// `POST`, which sends the body.
     ///
     /// This is the default.
     #[default]
     Post,
+    /// `PUT`, which sends the body.
+    ///
+    /// The retry and the redirect rules of [`Post`](UploadMethod::Post)
+    /// apply.
+    Put,
     /// `DELETE`, which sends no body.
     ///
     /// The request takes an empty [`UploadBody::bytes`]. Any other body fails
@@ -1226,9 +1384,9 @@ pub enum UploadMethod {
 ///
 /// If a channel body is dropped before an upload sends it, or after its upload
 /// ends, each write of its writer fails with
-/// [`io::ErrorKind::BrokenPipe`](std::io::ErrorKind::BrokenPipe). If a `POST`
-/// body is at its end when the fetcher hands over the request, the request
-/// declares a `Content-Length` of zero.
+/// [`io::ErrorKind::BrokenPipe`](std::io::ErrorKind::BrokenPipe). If the body
+/// of a `POST` or a `PUT` is at its end when the fetcher hands over the
+/// request, the request declares a `Content-Length` of zero.
 pub struct UploadBody {
     form: UploadForm,
 }
@@ -1324,17 +1482,19 @@ pub struct UploadRequest<'a> {
     ///
     /// They replace the credentials of the fetcher.
     ///
-    /// Beside [`bearer_token`](UploadRequest::bearer_token), or beside an
-    /// `Authorization` entry in [`headers`](UploadRequest::headers), they fail
-    /// the upload before admission with [`Error::Fetch`].
+    /// Beside [`bearer_token`](UploadRequest::bearer_token), beside an
+    /// `Authorization` entry in [`headers`](UploadRequest::headers), or beside
+    /// a [`signer`](FetcherOptions::signer) of the fetcher, they fail the
+    /// upload before admission with [`Error::Fetch`].
     pub basic_auth: Option<&'a BasicAuth>,
     /// A token for `Authorization: Bearer`, for this request.
     ///
     /// It replaces the credentials of the fetcher.
     ///
-    /// Beside [`basic_auth`](UploadRequest::basic_auth), or beside an
-    /// `Authorization` entry in [`headers`](UploadRequest::headers), it fails
-    /// the upload before admission with [`Error::Fetch`].
+    /// Beside [`basic_auth`](UploadRequest::basic_auth), beside an
+    /// `Authorization` entry in [`headers`](UploadRequest::headers), or beside
+    /// a [`signer`](FetcherOptions::signer) of the fetcher, it fails the
+    /// upload before admission with [`Error::Fetch`].
     pub bearer_token: Option<&'a BearerToken>,
     /// The permission for a credential to reach a cleartext origin.
     ///
@@ -1562,6 +1722,13 @@ impl Destination {
     /// the origin names it with this string.
     fn origin_url(&self) -> &str {
         &self.url[..self.path_at]
+    }
+
+    /// Returns the `host[:port]` of this destination as text, which is the
+    /// value of the `Host` header in `authority`. An HTTP/2 request carries
+    /// the same text in its `:authority`, because it carries the absolute URL.
+    fn authority_text(&self) -> &str {
+        &self.url[scheme_len(&self.url)..self.path_at]
     }
 }
 
@@ -2168,6 +2335,8 @@ struct Inner {
     /// `true` if a credential can reach a cleartext destination. A fetch and
     /// an upload then skip the cleartext check.
     allow_cleartext_credentials: bool,
+    /// The signer of each attempt at the origin that the route names.
+    signer: Option<Arc<dyn RequestSigner>>,
     max_retries: u32,
     max_redirects: u32,
     connect_timeout: Duration,
@@ -2209,13 +2378,16 @@ enum Failure {
     Retry(Error),
     /// A definitive answer, which a retry gets again.
     Fatal(Error),
+    /// A failure of the request itself, which no destination and no round
+    /// avoids. The request ends with it.
+    Final(Error),
 }
 
 impl Failure {
-    /// Returns the error of the failure, of either kind.
+    /// Returns the error of the failure, of any kind.
     fn into_error(self) -> Error {
         match self {
-            Failure::Retry(e) | Failure::Fatal(e) => e,
+            Failure::Retry(e) | Failure::Fatal(e) | Failure::Final(e) => e,
         }
     }
 }
@@ -2367,12 +2539,13 @@ impl Fetcher {
     ///   [`allow_cleartext_credentials`](FetcherOptions::allow_cleartext_credentials)
     ///   is `false`. The credentials are
     ///   [`basic_auth`](FetcherOptions::basic_auth),
-    ///   [`bearer_token`](FetcherOptions::bearer_token), and an
-    ///   `Authorization`, `Proxy-Authorization`, or `Cookie` header.
+    ///   [`bearer_token`](FetcherOptions::bearer_token),
+    ///   [`signer`](FetcherOptions::signer), and an `Authorization`,
+    ///   `Proxy-Authorization`, or `Cookie` header.
     /// - [`Error::Fetch`] if two of these are set:
     ///   [`basic_auth`](FetcherOptions::basic_auth),
-    ///   [`bearer_token`](FetcherOptions::bearer_token), and an
-    ///   `Authorization` header.
+    ///   [`bearer_token`](FetcherOptions::bearer_token),
+    ///   [`signer`](FetcherOptions::signer), and an `Authorization` header.
     /// - [`Error::Fetch`] if [`basic_auth`](FetcherOptions::basic_auth) does
     ///   not give a valid header value, or if
     ///   [`bearer_token`](FetcherOptions::bearer_token) does not have the
@@ -2422,8 +2595,16 @@ impl Fetcher {
             (Some(_), Some(_)) => return Err(Error::Fetch(BASIC_AND_BEARER.into())),
             (Some(_), None) => Some("basic-auth credentials"),
             (None, Some(_)) => Some("the bearer token"),
+            (None, None) if options.signer.is_some() => Some("the signature of the request signer"),
             (None, None) => None,
         };
+        if options.signer.is_some() {
+            refuse_beside_signer(
+                &options.headers,
+                options.basic_auth.is_some(),
+                options.bearer_token.is_some(),
+            )?;
+        }
         if let Some(credential) = credential
             && let Some(url) = cleartext
         {
@@ -2510,6 +2691,7 @@ impl Fetcher {
                 proxies,
                 tls,
                 allow_cleartext_credentials: options.allow_cleartext_credentials,
+                signer: options.signer,
                 max_retries: options.max_retries,
                 max_redirects: options.max_redirects,
                 connect_timeout: options.connect_timeout,
@@ -2646,6 +2828,10 @@ impl Fetcher {
     /// named origin. At that time, the operator of the other origin has the
     /// request.
     ///
+    /// The [`signer`](FetcherOptions::signer) follows the same rule. It signs
+    /// each hop at the named origin again, with the path and the query of that
+    /// hop. It signs no hop at another origin, and no hop after it.
+    ///
     /// All other headers go to each hop, also the `User-Agent` and the
     /// `Accept-Encoding` of the fetcher. The fetcher presents a configured
     /// client certificate to the origin that the route names and to no other
@@ -2697,6 +2883,10 @@ impl Fetcher {
     ///   `Host`, or is a header that the connection layer sets.
     /// - [`Error::Fetch`] before admission, if an `Authorization` header is
     ///   beside [`basic_auth`](FetchRequest::basic_auth).
+    /// - [`Error::Fetch`] before admission, if the fetcher has a
+    ///   [`signer`](FetcherOptions::signer) and the request carries
+    ///   [`basic_auth`](FetchRequest::basic_auth) or an `Authorization`
+    ///   header.
     /// - [`Error::Fetch`] before admission, if a credential can reach a
     ///   cleartext destination, and neither
     ///   [`allow_cleartext_credentials`](FetchRequest::allow_cleartext_credentials)
@@ -2709,6 +2899,10 @@ impl Fetcher {
     ///   rules state.
     /// - [`Error::Fetch`] if hyper cannot build a request, for example from an
     ///   invalid validator value.
+    /// - The error of the [`signer`](FetcherOptions::signer), unchanged, if it
+    ///   fails. An [`Error::Fetch`] if it returns a header that a request
+    ///   cannot carry. The fetch asks no other destination and repeats no
+    ///   round.
     /// - [`Error::Fetch`] if [`fetch_timeout`](FetcherOptions::fetch_timeout)
     ///   expires.
     /// - [`Error::HttpStatus`] if a destination answers with a status other
@@ -2753,6 +2947,9 @@ impl Fetcher {
         // all of them before admission, and reports a failure of them one
         // time. The fetch takes no permit and opens no socket for it.
         let route = self.route(request.target)?;
+        if self.inner.signer.is_some() {
+            refuse_beside_signer(request.headers, request.basic_auth.is_some(), false)?;
+        }
         let headers = merge_headers(
             &self.inner.headers,
             request.headers,
@@ -2816,7 +3013,8 @@ impl Fetcher {
         route: &Route<'_>,
         headers: &[(HeaderName, HeaderValue)],
     ) -> Result<()> {
-        if !headers.iter().any(|(name, _)| is_credential(name)) {
+        // A signer is a credential, as an `Authorization` header is.
+        if self.inner.signer.is_none() && !headers.iter().any(|(name, _)| is_credential(name)) {
             return Ok(());
         }
         let Some(origin) = self.matching_origin(route, |origin| !origin.tls) else {
@@ -2942,6 +3140,7 @@ impl Fetcher {
                             definitive = true;
                         }
                     }
+                    Failure::Final(e) => return Err(e),
                 }
             }
             // If `retryable` is `true`, one or more destinations had a
@@ -2980,6 +3179,9 @@ impl Fetcher {
         let named = &destination.origin;
         let mut hop = Cow::Borrowed(destination);
         let mut headers = Cow::Borrowed(headers);
+        // The signer signs each hop at the named origin. It stays out of the
+        // attempt after a hop at another origin, as a credential does.
+        let mut signer = self.inner.signer.as_deref();
         let mut followed = 0u32;
         let progress_timeout = self.inner.progress_timeout;
         // One progress window applies to all drains of this attempt, whatever
@@ -3011,11 +3213,14 @@ impl Fetcher {
             };
             let url = hop.url();
             let (response, protocol, reuse) = match head_until {
-                None => self.send(&hop, &key, via, request, &headers).await?,
+                None => {
+                    self.send(&hop, &key, via, request, &headers, signer)
+                        .await?
+                }
                 Some((until, low)) => {
                     // The send is in a box under the window. So the attempt
                     // holds one inline copy of its state.
-                    let sent = Box::pin(self.send(&hop, &key, via, request, &headers));
+                    let sent = Box::pin(self.send(&hop, &key, via, request, &headers, signer));
                     match within(until.saturating_duration_since(Instant::now()), sent).await {
                         Some(result) => result?,
                         None => return Err(Failure::Retry(too_slow(url, low))),
@@ -3076,6 +3281,10 @@ impl Fetcher {
                 // origin other than the named origin. They stay removed for the
                 // rest of the attempt, also on a redirect back to the named
                 // origin. At that time, the other operator controls the request.
+                // The same applies to the signer.
+                if next.origin != *named {
+                    signer = None;
+                }
                 if next.origin != *named && headers.iter().any(|(name, _)| is_credential(name)) {
                     let scoped = headers
                         .iter()
@@ -3148,6 +3357,10 @@ impl Fetcher {
     /// The function returns the response, its protocol, and the HTTP/1.1
     /// connection of the response. That connection goes back to the pool after
     /// the response is read to its end.
+    ///
+    /// A `signer` signs the request after the connection is taken. So the
+    /// wait for a connect is not part of the age of the signature. If the
+    /// signer fails, an HTTP/1.1 connection goes back to the pool unused.
     async fn send(
         &self,
         hop: &Destination,
@@ -3155,13 +3368,14 @@ impl Fetcher {
         via: Via<'_>,
         request: &FetchRequest<'_>,
         headers: &[(HeaderName, HeaderValue)],
+        signer: Option<&dyn RequestSigner>,
     ) -> std::result::Result<(Response<Incoming>, Protocol, Option<H1Sender>), Failure> {
         let url = hop.url();
         let origin = &key.origin;
         let connect_timeout = self.inner.connect_timeout;
         let progress_timeout = self.inner.progress_timeout;
-        let sender = match self.inner.take_conn(key) {
-            Some(sender) => sender,
+        let (sender, idle_since) = match self.inner.take_conn(key) {
+            Some(taken) => taken,
             None => {
                 // The open of a connection is the largest state of a fetch: the
                 // TLS handshake and the state of hyper. It is also the rarest,
@@ -3174,7 +3388,7 @@ impl Fetcher {
                 // fetch multiplies the saving.
                 let opened = within(connect_timeout, Box::pin(self.connect(key, via))).await;
                 match opened {
-                    Some(result) => result?,
+                    Some(result) => (result?, None),
                     None => {
                         return Err(Failure::Retry(connect_timed_out(
                             origin,
@@ -3185,10 +3399,25 @@ impl Fetcher {
                 }
             }
         };
+        let headers = match signer {
+            None => Cow::Borrowed(headers),
+            Some(signer) => match signed(signer, &Method::GET, hop, SignPayload::Empty, headers) {
+                Ok(signed) => signed,
+                Err(failure) => {
+                    // The connection carried no request, so it goes back to
+                    // the pool as it came.
+                    if let Sender::H1(sender) = sender {
+                        let since = idle_since.unwrap_or_else(Instant::now);
+                        self.inner.put_idle_h1(key, sender, since);
+                    }
+                    return Err(failure);
+                }
+            },
+        };
         match sender {
             Sender::H1(mut sender) => {
                 let http_request = self
-                    .build_request(hop, request, headers, Protocol::Http11, via)
+                    .build_request(hop, request, &headers, Protocol::Http11, via)
                     .map_err(Failure::Fatal)?;
                 // The request and the wait for the response head share the
                 // progress window, because the head is the first bytes of the
@@ -3206,7 +3435,7 @@ impl Fetcher {
             }
             Sender::H2(mut sender) => {
                 let http_request = self
-                    .build_request(hop, request, headers, Protocol::Http2, via)
+                    .build_request(hop, request, &headers, Protocol::Http2, via)
                     .map_err(Failure::Fatal)?;
                 let sent = within(progress_timeout, async {
                     sender.ready().await?;
@@ -3287,10 +3516,10 @@ impl Fetcher {
     ///
     /// Each final status returns an [`Uploaded`], also 408, 429, and 5xx. The
     /// mirrors, the proxy, TLS, the client certificate, the headers, the
-    /// credentials, and the cleartext rule apply to an upload as they apply to
-    /// [`fetch`](Fetcher::fetch). An upload can also carry a [`BearerToken`] of
-    /// its own as its credential. The fetcher sets no `Content-Type` header and
-    /// no `Expect` header.
+    /// credentials, the signer, and the cleartext rule apply to an upload as
+    /// they apply to [`fetch`](Fetcher::fetch). An upload can also carry a
+    /// [`BearerToken`] of its own as its credential. The fetcher sets no
+    /// `Content-Type` header and no `Expect` header.
     ///
     /// The hand-over gives the request to hyper. A failure before the
     /// hand-over returns the error that a fetch returns. A failure after the
@@ -3333,7 +3562,8 @@ impl Fetcher {
     /// For a body given whole, the upload follows a 307 or a 308. It keeps the
     /// method and sends the bytes again. The redirect rules of
     /// [`fetch`](Fetcher::fetch) apply: the redirect limit, the refusal of a
-    /// hop from `https` to `http`, and the scope of the credentials.
+    /// hop from `https` to `http`, and the scope of the credentials and of the
+    /// signer.
     ///
     /// The first hop sends the request. So a failure on a later hop, a refused
     /// hop, and a redirect past the limit each fail the upload with
@@ -3427,6 +3657,11 @@ impl Fetcher {
     ///   meet: [`basic_auth`](UploadRequest::basic_auth),
     ///   [`bearer_token`](UploadRequest::bearer_token), and an `Authorization`
     ///   header. A bearer token that is not token68 also fails.
+    /// - [`Error::Fetch`] before admission, if the fetcher has a
+    ///   [`signer`](FetcherOptions::signer) and the request carries one of
+    ///   these credentials: [`basic_auth`](UploadRequest::basic_auth),
+    ///   [`bearer_token`](UploadRequest::bearer_token), or an `Authorization`
+    ///   header.
     /// - [`Error::Fetch`] before admission, if a credential can reach a
     ///   cleartext destination, and neither
     ///   [`allow_cleartext_credentials`](UploadRequest::allow_cleartext_credentials)
@@ -3439,6 +3674,11 @@ impl Fetcher {
     ///   hand-over: a failed connect, handshake, or proxy `CONNECT`, or an
     ///   expired deadline.
     /// - [`Error::Fetch`] if hyper cannot build the request.
+    /// - The error of the [`signer`](FetcherOptions::signer), unchanged, if it
+    ///   fails before the hand-over. An [`Error::Fetch`] if it returns a
+    ///   header that a request cannot carry. The upload asks no other
+    ///   destination and repeats no round. A failure of the signer on a
+    ///   redirect hop is a failure after the hand-over.
     /// - [`Error::Fetch`] if the writer of a streamed body is dropped before
     ///   the hand-over.
     /// - [`Error::Fetch`] if [`fetch_timeout`](FetcherOptions::fetch_timeout)
@@ -3477,6 +3717,9 @@ impl Fetcher {
         // As for a fetch, the checks of the request run before admission.
         // The check of the body that a DELETE does not send runs there too.
         let route = self.route(target)?;
+        if self.inner.signer.is_some() {
+            refuse_beside_signer(headers, basic_auth.is_some(), bearer_token.is_some())?;
+        }
         let headers = merge_headers(&self.inner.headers, headers, basic_auth, bearer_token)?;
         if !allow_cleartext_credentials && !self.inner.allow_cleartext_credentials {
             self.check_cleartext(&route, &headers)?;
@@ -3484,6 +3727,7 @@ impl Fetcher {
         self.check_trust_anchors(&route)?;
         let method = match method {
             UploadMethod::Post => Method::POST,
+            UploadMethod::Put => Method::PUT,
             UploadMethod::Delete => Method::DELETE,
         };
         let (end, bytes) = match body.form {
@@ -3583,6 +3827,7 @@ impl Fetcher {
                             definitive = true;
                         }
                     }
+                    Err(UploadFailure::Unsent(Failure::Final(e))) => return Err(e),
                 }
             }
             if !retryable || round >= self.inner.max_retries {
@@ -3611,6 +3856,7 @@ impl Fetcher {
         let named = &destination.origin;
         let mut hop = Cow::Borrowed(destination);
         let mut headers = Cow::Borrowed(plan.headers);
+        let mut signer = self.inner.signer.as_deref();
         let mut followed = 0u32;
         loop {
             let via = self.inner.proxies.via(&hop.origin);
@@ -3624,7 +3870,7 @@ impl Fetcher {
             };
             let url = hop.url();
             let sent = self
-                .upload_send(&hop, &key, via, plan, &headers, body, handed)
+                .upload_send(&hop, &key, via, plan, &headers, signer, body, handed)
                 .await;
             let (response, protocol, request_end, reuse) = match sent {
                 Ok(sent) => sent,
@@ -3656,8 +3902,11 @@ impl Fetcher {
                 if next.origin.tls && !self.inner.has_trust_anchors {
                     return Err(undelivered(url, no_trust_anchors(next.origin_url())));
                 }
-                // As for a fetch, a credential stays with the origin that the
-                // route names.
+                // As for a fetch, a credential and the signer stay with the
+                // origin that the route names.
+                if next.origin != *named {
+                    signer = None;
+                }
                 if next.origin != *named && headers.iter().any(|(name, _)| is_credential(name)) {
                     let scoped = headers
                         .iter()
@@ -3742,6 +3991,12 @@ impl Fetcher {
     /// end of the request body before the response head arrived, and the
     /// response does not close the connection. In each other case, the
     /// connection closes at the end of the exchange.
+    ///
+    /// A `signer` signs the request over each connection that the function
+    /// takes or opens, when the connection is ready and before the function
+    /// starts the request. So a request that goes again over a new connection
+    /// carries a new signature. If the signer fails, an HTTP/1.1 connection
+    /// goes back to the pool unused.
     #[allow(clippy::too_many_arguments)]
     async fn upload_send(
         &self,
@@ -3750,6 +4005,7 @@ impl Fetcher {
         via: Via<'_>,
         plan: &UploadPlan<'_>,
         headers: &[(HeaderName, HeaderValue)],
+        signer: Option<&dyn RequestSigner>,
         body: &mut Option<BodyEnd>,
         handed: &AtomicBool,
     ) -> std::result::Result<UploadResponse, UploadFailure> {
@@ -3770,13 +4026,13 @@ impl Fetcher {
         loop {
             // If a pooled HTTP/1.1 connection fails before hyper writes the
             // request, the server closed it while it was idle.
-            let stale_h1 = matches!(pooled, Some(Sender::H1(_)));
-            let mut sender = match pooled.take() {
-                Some(sender) => sender,
+            let stale_h1 = matches!(pooled, Some((Sender::H1(_), _)));
+            let (mut sender, idle_since) = match pooled.take() {
+                Some(taken) => taken,
                 None => {
                     let connect_timeout = self.inner.connect_timeout;
                     match within(connect_timeout, Box::pin(self.connect(key, via))).await {
-                        Some(Ok(sender)) => sender,
+                        Some(Ok(sender)) => (sender, None),
                         Some(Err(failure)) => return unsent(failure),
                         None => {
                             return unsent(Failure::Retry(connect_timed_out(
@@ -3792,10 +4048,6 @@ impl Fetcher {
                 Sender::H1(_) => Protocol::Http11,
                 Sender::H2(_) => Protocol::Http2,
             };
-            let mut head = match self.upload_head(hop, plan, headers, protocol, via) {
-                Ok(head) => head,
-                Err(e) => return unsent(Failure::Fatal(e)),
-            };
             let ready = match &mut sender {
                 Sender::H1(sender) => within(progress_timeout, sender.ready()).await,
                 Sender::H2(sender) => within(progress_timeout, sender.ready()).await,
@@ -3806,15 +4058,48 @@ impl Fetcher {
                 Some(Err(e)) => return unsent(Failure::Retry(transport(url, e))),
                 None => return unsent(Failure::Retry(stalled(url, progress_timeout))),
             }
+            // The signature is made when the connection is ready to carry the
+            // request. So a connection that fails here costs no signature, and
+            // the wait for a stream slot is not part of the age of the
+            // signature.
+            let signed_headers = match signer {
+                None => Cow::Borrowed(headers),
+                Some(signer) => {
+                    // The signer reads a body given whole as the slice that
+                    // the request sends, with no copy. A streamed body is not
+                    // known yet.
+                    let payload = match &plan.bytes {
+                        _ if plan.method == Method::DELETE => SignPayload::Empty,
+                        Some(bytes) => SignPayload::Bytes(bytes),
+                        None => SignPayload::Streamed,
+                    };
+                    match signed(signer, &plan.method, hop, payload, headers) {
+                        Ok(signed) => signed,
+                        Err(failure) => {
+                            // The connection carried no request, so it goes
+                            // back to the pool as it came.
+                            if let Sender::H1(sender) = sender {
+                                let since = idle_since.unwrap_or_else(Instant::now);
+                                self.inner.put_idle_h1(key, sender, since);
+                            }
+                            return unsent(failure);
+                        }
+                    }
+                }
+            };
+            let mut head = match self.upload_head(hop, plan, &signed_headers, protocol, via) {
+                Ok(head) => head,
+                Err(e) => return unsent(Failure::Fatal(e)),
+            };
             let empty = match exchange.hand_over(progress_timeout) {
                 Ok(empty) => empty,
                 Err(reason) => return unsent(Failure::Fatal(not_sent(url, reason))),
             };
-            // A `POST` whose body is at its end states its length. hyper writes
-            // no length for an HTTP/1.1 request at the end of its body. The
-            // method defines content, so a server that waits for the framing
-            // reads `0`.
-            if empty && plan.method == Method::POST {
+            // A `POST` or a `PUT` whose body is at its end states its length.
+            // hyper writes no length for an HTTP/1.1 request at the end of its
+            // body. Each of the two methods defines content, so a server that
+            // waits for the framing reads `0`. A `DELETE` sends no body.
+            if empty && plan.method != Method::DELETE {
                 head.headers_mut()
                     .insert(hyper::header::CONTENT_LENGTH, HeaderValue::from_static("0"));
             }
@@ -4207,19 +4492,23 @@ impl Fetcher {
 
 impl Inner {
     /// Returns a pooled connection for `key`, if one is still usable.
-    fn take_conn(&self, key: &PoolKey) -> Option<Sender> {
+    ///
+    /// An HTTP/1.1 connection comes with the instant at which it became idle.
+    /// [`Inner::put_idle_h1`] takes that instant back if the connection
+    /// carried no request.
+    fn take_conn(&self, key: &PoolKey) -> Option<(Sender, Option<Instant>)> {
         let mut pool = self.pool.lock().expect("fetcher pool mutex");
         let entry = pool.get_mut(key)?;
         if let Some(h2) = &entry.h2 {
             if h2.is_closed() {
                 entry.h2 = None;
             } else {
-                return Some(Sender::H2(h2.clone()));
+                return Some((Sender::H2(h2.clone()), None));
             }
         }
         while let Some(h1) = entry.h1.pop() {
             if !h1.sender.is_closed() {
-                return Some(Sender::H1(h1.sender));
+                return Some((Sender::H1(h1.sender), Some(h1.since)));
             }
         }
         None
@@ -4239,12 +4528,15 @@ impl Inner {
     ///
     /// An older idle connection stays in the pool for a fetch. If a fetch over
     /// it fails, the fetcher sends the fetch again.
-    fn take_upload(&self, key: &PoolKey) -> Option<Sender> {
+    ///
+    /// An HTTP/1.1 connection comes with the instant at which it became idle,
+    /// as [`Inner::take_conn`] gives it.
+    fn take_upload(&self, key: &PoolKey) -> Option<(Sender, Option<Instant>)> {
         let mut pool = self.pool.lock().expect("fetcher pool mutex");
         let entry = pool.get_mut(key)?;
         match &entry.h2 {
             Some(h2) if h2.is_closed() => entry.h2 = None,
-            Some(h2) => return Some(Sender::H2(h2.clone())),
+            Some(h2) => return Some((Sender::H2(h2.clone()), None)),
             None => {}
         }
         while let Some(h1) = entry.h1.last() {
@@ -4255,7 +4547,10 @@ impl Inner {
             if h1.since.elapsed() >= UPLOAD_IDLE {
                 return None;
             }
-            return entry.h1.pop().map(|h1| Sender::H1(h1.sender));
+            return entry
+                .h1
+                .pop()
+                .map(|h1| (Sender::H1(h1.sender), Some(h1.since)));
         }
         None
     }
@@ -4267,13 +4562,20 @@ impl Inner {
     /// allocation. The lookup by reference keeps that allocation off the warm
     /// path of each object fetch.
     fn put_h1(&self, key: &PoolKey, sender: H1Sender) {
+        self.put_idle_h1(key, sender, Instant::now());
+    }
+
+    /// Returns an HTTP/1.1 connection to the pool that has been idle since
+    /// `since`.
+    ///
+    /// A connection that the fetcher took and did not use goes back with the
+    /// instant at which it became idle. So [`Inner::take_upload`] reads its
+    /// true idle time.
+    fn put_idle_h1(&self, key: &PoolKey, sender: H1Sender, since: Instant) {
         if sender.is_closed() {
             return;
         }
-        let idle = IdleH1 {
-            sender,
-            since: Instant::now(),
-        };
+        let idle = IdleH1 { sender, since };
         let mut pool = self.pool.lock().expect("fetcher pool mutex");
         if let Some(entry) = pool.get_mut(key) {
             entry.h1.push(idle);
@@ -5161,6 +5463,94 @@ fn merge_headers<'a>(
     );
     headers.extend(added);
     Ok(Cow::Owned(headers))
+}
+
+/// Refuses a credential beside a request signer: basic-auth credentials if
+/// `basic_auth` is `true`, a bearer token if `bearer_token` is `true`, or an
+/// `Authorization` entry in `headers`.
+///
+/// A signature can set `Authorization`, as each of these can. So the signer
+/// goes alone, and a choice of one sends a credential that the caller did not
+/// choose. [`Fetcher::new`] refuses these on the fetcher, and a fetch and an
+/// upload refuse them on a request.
+fn refuse_beside_signer(
+    headers: &[(String, String)],
+    basic_auth: bool,
+    bearer_token: bool,
+) -> Result<()> {
+    if basic_auth {
+        return Err(Error::Fetch(SIGNER_AND_BASIC.into()));
+    }
+    if bearer_token {
+        return Err(Error::Fetch(SIGNER_AND_BEARER.into()));
+    }
+    if headers.iter().any(|(name, _)| {
+        HeaderName::try_from(name.as_str()).is_ok_and(|name| name == hyper::header::AUTHORIZATION)
+    }) {
+        return Err(Error::Fetch(SIGNER_AND_AUTHORIZATION.into()));
+    }
+    Ok(())
+}
+
+/// Returns the [`SignRequest`] of one request of `method` to `hop`, with
+/// `payload`.
+///
+/// The path and the query come from the origin-form target of the hop, which
+/// splits at its first `?`. The authority is the text of the `Host` header.
+fn sign_request<'a>(
+    method: &'a Method,
+    hop: &'a Destination,
+    payload: SignPayload<'a>,
+) -> SignRequest<'a> {
+    let target = hop.target();
+    let (path, query) = match target.split_once('?') {
+        Some((path, query)) => (path, Some(query)),
+        None => (target, None),
+    };
+    SignRequest {
+        method: method.as_str(),
+        authority: hop.authority_text(),
+        path,
+        query,
+        payload,
+    }
+}
+
+/// Returns `headers` with the headers that `signer` gives for one request of
+/// `method` to `hop`, with `payload`.
+///
+/// [`merge_headers`] merges the headers of the signer as headers of a
+/// request. So each one replaces a header of the same name, and a `Host`
+/// header or a header of the connection layer is refused. Each value of the
+/// signer is marked sensitive, because a signature header such as a session
+/// token is a credential whatever its name is. An error of the signer, or a
+/// refused header, is a [`Failure::Final`].
+fn signed<'a>(
+    signer: &dyn RequestSigner,
+    method: &Method,
+    hop: &Destination,
+    payload: SignPayload<'_>,
+    headers: &'a [(HeaderName, HeaderValue)],
+) -> std::result::Result<Cow<'a, [(HeaderName, HeaderValue)]>, Failure> {
+    let added = signer
+        .sign(&sign_request(method, hop, payload))
+        .map_err(Failure::Final)?;
+    let merged = merge_headers(headers, &added, None, None).map_err(Failure::Final)?;
+    if added.is_empty() {
+        return Ok(merged);
+    }
+    // A name of the signer replaces each header of that name, so each entry
+    // of such a name holds a value of the signer.
+    let mut merged = merged.into_owned();
+    for (name, value) in &mut merged {
+        if added
+            .iter()
+            .any(|(added, _)| name.as_str().eq_ignore_ascii_case(added))
+        {
+            value.set_sensitive(true);
+        }
+    }
+    Ok(Cow::Owned(merged))
 }
 
 /// Resolves the proxy configuration into the state that a fetch reads.
@@ -8556,6 +8946,201 @@ mod tests {
         rt::block_on(Fetcher::new(options)).unwrap();
     }
 
+    /// A signer that returns one fixed header, or fails if it holds no header.
+    #[derive(Debug)]
+    struct FixedSigner {
+        header: Option<(String, String)>,
+    }
+
+    impl RequestSigner for FixedSigner {
+        fn sign(&self, _request: &SignRequest<'_>) -> Result<Vec<(String, String)>> {
+            match &self.header {
+                Some(header) => Ok(vec![header.clone()]),
+                None => Err(Error::Fetch("the signer has no key".into())),
+            }
+        }
+    }
+
+    fn fixed_signer() -> Option<Arc<dyn RequestSigner>> {
+        Some(Arc::new(FixedSigner {
+            header: Some(("authorization".into(), "Fixed x".into())),
+        }))
+    }
+
+    /// The constructor refuses a signer beside another value for
+    /// `Authorization`. A signer is a credential, so a cleartext mirror fails
+    /// the constructor unless the fetcher permits it.
+    #[test]
+    fn a_signer_is_refused_beside_basic_auth_a_bearer_token_or_an_authorization_header() {
+        let beside_basic = FetcherOptions {
+            signer: fixed_signer(),
+            basic_auth: Some(BasicAuth {
+                user: "u".into(),
+                password: "p".into(),
+            }),
+            ..tls_options("https://example.com")
+        };
+        let beside_bearer = FetcherOptions {
+            signer: fixed_signer(),
+            bearer_token: Some(BearerToken {
+                token: "t0k3n".into(),
+            }),
+            ..tls_options("https://example.com")
+        };
+        let beside_header = FetcherOptions {
+            signer: fixed_signer(),
+            headers: vec![("Authorization".into(), "Basic aaa".into())],
+            ..tls_options("https://example.com")
+        };
+        for (options, other) in [
+            (beside_basic, "basic-auth credentials"),
+            (beside_bearer, "a bearer token"),
+            (beside_header, "an authorization header"),
+        ] {
+            let err = rt::block_on(Fetcher::new(options)).unwrap_err();
+            assert!(matches!(err, Error::Fetch(_)), "{err}");
+            let message = err.to_string();
+            assert!(message.contains("request signer"), "{message}");
+            assert!(message.contains(other), "{message}");
+            assert!(message.contains("pass one of them"), "{message}");
+        }
+
+        // Another header goes beside the signer.
+        let options = FetcherOptions {
+            signer: fixed_signer(),
+            headers: vec![("x-trace".into(), "abc".into())],
+            ..tls_options("https://example.com")
+        };
+        rt::block_on(Fetcher::new(options)).unwrap();
+
+        let cleartext = "http://cleartext.example/repo";
+        let options = FetcherOptions {
+            signer: fixed_signer(),
+            ..tls_options(cleartext)
+        };
+        let err = rt::block_on(Fetcher::new(options)).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("request signer"), "{message}");
+        assert!(message.contains(cleartext), "{message}");
+        assert!(
+            message.contains("FetcherOptions::allow_cleartext_credentials"),
+            "{message}"
+        );
+        let options = FetcherOptions {
+            signer: fixed_signer(),
+            allow_cleartext_credentials: true,
+            ..tls_options(cleartext)
+        };
+        rt::block_on(Fetcher::new(options)).unwrap();
+    }
+
+    /// The request that a signer gets names the method, the authority of the
+    /// `Host` header, and the path and the query of the request target.
+    #[test]
+    fn a_sign_request_carries_the_wire_authority_path_and_query() {
+        let get = Method::GET;
+        let put = Method::PUT;
+
+        // A mirror with a base path and the default port of its scheme.
+        let mirror = parse_mirror("https://Example.com:443/base/repo/").unwrap();
+        let hop = mirror.destination("objects/ab/cd.file", None);
+        let request = sign_request(&get, &hop, SignPayload::Empty);
+        assert_eq!(request.method, "GET");
+        assert_eq!(request.authority, "Example.com");
+        assert_eq!(request.authority, hop.authority.to_str().unwrap());
+        assert_eq!(request.path, "/base/repo/objects/ab/cd.file");
+        assert_eq!(request.query, None);
+        assert_eq!(request.payload, SignPayload::Empty);
+
+        // A port other than the default, and a query.
+        let mirror = parse_mirror("http://example.com:8080").unwrap();
+        let hop = mirror.destination("summary", Some("x-id=1&b=%2F"));
+        let request = sign_request(&get, &hop, SignPayload::Empty);
+        assert_eq!(request.authority, "example.com:8080");
+        assert_eq!(request.path, "/summary");
+        assert_eq!(request.query, Some("x-id=1&b=%2F"));
+
+        // An IPv6 literal keeps its brackets. An empty query is not `None`.
+        let body = b"abc";
+        let hop = parse_url("https://[::1]:8443/a/b?").unwrap();
+        let request = sign_request(&put, &hop, SignPayload::Bytes(body));
+        assert_eq!(request.method, "PUT");
+        assert_eq!(request.authority, "[::1]:8443");
+        assert_eq!(request.path, "/a/b");
+        assert_eq!(request.query, Some(""));
+        assert_eq!(request.payload, SignPayload::Bytes(b"abc"));
+        assert_eq!(format!("{:?}", request.payload), "Bytes(3)");
+
+        let hop = parse_url("https://[::1]/").unwrap();
+        let request = sign_request(&put, &hop, SignPayload::Streamed);
+        assert_eq!(request.authority, "[::1]");
+        assert_eq!(request.path, "/");
+        assert_eq!(request.query, None);
+    }
+
+    /// The headers of a signer replace the headers of the same name, and each
+    /// of their values is marked sensitive, whatever its name is. A refused
+    /// header and an error of the signer end the request.
+    #[test]
+    fn signed_headers_replace_their_names_and_failures_are_final() {
+        let fetcher = rt::block_on(Fetcher::new(FetcherOptions {
+            headers: vec![("x-amz-date".into(), "old".into())],
+            ..tls_options("https://example.com")
+        }))
+        .unwrap();
+        let hop = parse_url("https://example.com/x").unwrap();
+        let signer = FixedSigner {
+            header: Some(("x-amz-date".into(), "new".into())),
+        };
+        let merged = signed(
+            &signer,
+            &Method::GET,
+            &hop,
+            SignPayload::Empty,
+            &fetcher.inner.headers,
+        )
+        .ok()
+        .unwrap();
+        let dates = merged
+            .iter()
+            .filter(|(name, _)| name == "x-amz-date")
+            .map(|(_, value)| value.to_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(dates, ["new"]);
+        for (name, value) in merged.iter() {
+            assert_eq!(value.is_sensitive(), name == "x-amz-date", "{name}");
+        }
+
+        // A header that is not a credential by its name is sensitive too, so
+        // an HTTP/2 connection never indexes a session token.
+        let signer = FixedSigner {
+            header: Some(("X-Amz-Security-Token".into(), "session".into())),
+        };
+        let merged = signed(&signer, &Method::GET, &hop, SignPayload::Empty, &[])
+            .ok()
+            .unwrap();
+        assert_eq!(merged.len(), 1);
+        assert!(merged[0].1.is_sensitive());
+
+        let signer = FixedSigner {
+            header: Some(("authorization".into(), "Fixed x".into())),
+        };
+        let merged = signed(&signer, &Method::GET, &hop, SignPayload::Empty, &[])
+            .ok()
+            .unwrap();
+        assert!(merged[0].1.is_sensitive());
+
+        for signer in [
+            FixedSigner { header: None },
+            FixedSigner {
+                header: Some(("host".into(), "elsewhere".into())),
+            },
+        ] {
+            let failure = signed(&signer, &Method::GET, &hop, SignPayload::Empty, &[]);
+            assert!(matches!(failure, Err(Failure::Final(Error::Fetch(_)))));
+        }
+    }
+
     #[test]
     fn fetcher_options_debug_holds_no_bearer_token() {
         let options = FetcherOptions {
@@ -8609,7 +9194,7 @@ mod tests {
             format!(
                 "FetcherOptions {{ mirrors: [\"https://example.com/\"], \
                  headers: {SECRET_HEADERS_SHOWN}, basic_auth: None, bearer_token: None, \
-                 allow_cleartext_credentials: false, \
+                 signer: None, allow_cleartext_credentials: false, \
                  tls: TlsOptions {{ roots: System, client_identity: None }}, \
                  proxy: Environment, http2: true, max_retries: 5, max_redirects: 10, \
                  max_outstanding: 8, connect_timeout: 30s, progress_timeout: 60s, \

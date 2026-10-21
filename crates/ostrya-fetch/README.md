@@ -8,8 +8,9 @@ An async HTTP/1.1 and HTTP/2 client over rustls, for the mirrors of a remote.
 
 A caller builds a `Fetcher` from the mirrors, headers, credentials, proxy,
 TLS configuration, retry limits, and deadlines of one remote. The fetcher
-downloads files with `GET` and sends uploads with `POST` or `DELETE`. A
-response body streams in bounded chunks, so no object is held whole in memory.
+downloads files with `GET` and sends uploads with `POST`, `PUT`, or
+`DELETE`. A response body streams in bounded chunks, so no object is held
+whole in memory.
 
 The `Target` of a request is a path under each mirror, a path with a
 query string under each mirror, or an absolute URL. The fetcher sends a
@@ -25,6 +26,7 @@ API documentation: <https://docs.rs/ostrya-fetch>
 - `Fetcher::refetching` returns a `Refetch`, which fetches a failed body again.
 - `Fetcher::upload` sends an `UploadRequest` and returns an `Uploaded`.
 - `UploadBody` gives an upload body whole or streams it from an `UploadWriter`.
+- `RequestSigner` signs each attempt through `FetcherOptions::signer`.
 - `Error` is the error of each fallible operation of the crate.
 
 ## Modules

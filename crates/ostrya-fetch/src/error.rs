@@ -14,8 +14,8 @@ pub enum Error {
     ///
     /// The causes include an option value, a mirror URL, a header, or a TLS
     /// configuration that the fetcher cannot use. They also include a refused
-    /// credential, a refused redirect hop, and a transport failure or an
-    /// expired deadline that outlived the retries.
+    /// credential, a refused redirect hop, an error of the request signer, and
+    /// a transport failure or an expired deadline that outlived the retries.
     /// [`Fetcher::fetch`](crate::Fetcher::fetch) and
     /// [`Fetcher::upload`](crate::Fetcher::upload) list the cases.
     #[error("fetch: {0}")]

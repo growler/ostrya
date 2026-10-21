@@ -220,6 +220,37 @@ The request body is a `Body` type of the fetcher, so `http-body-util` is not
 a dependency. The `basic` authorization header is encoded by
 `ostrya-core::base64`, so no base64 crate is a dependency.
 
+## Request signing in the fetcher
+
+`ostrya_fetch::RequestSigner` is a hook that adds headers to each attempt.
+The fetcher calls it after it takes the connection, for each retry, each
+round, and each redirect hop at the origin that the route names. A hop at
+another origin gets no signature. A signer is a credential: the fetcher
+refuses it beside basic-auth credentials, a bearer token, or an
+`Authorization` header, and toward a cleartext mirror without the permission
+of the caller. The same refusal applies to these credentials on a fetch or
+an upload: the request fails before admission, and the signer is not called.
+Each header value of the signer is marked sensitive, so an HTTP/2
+connection never adds it to its header compression table.
+
+A presigned query for each target was rejected, for three reasons:
+
+- A signature with a date must be fresh when the request leaves. A retry
+  after a backoff, or a request that waits for a connection, needs a new
+  date. The hook signs each attempt.
+- The signature stays in a credential header, which the fetcher marks
+  sensitive and keeps from other origins. A presigned signature is part of
+  the URL, and each error message of the fetcher prints the URL.
+- A signed `PUT` with the signature in its headers signs the hash of the
+  body.
+
+The signer gets a body given whole as a slice of the request body, with no
+copy, and hashes it on the task of the request, on each call. On the
+development host, the SHA-256 of 8 MiB takes about 4.8 ms in a release build.
+This is less than the limit of 10 ms for work on the task, so the fetcher
+gives the signer the bytes and does not hash the body itself. A streamed body
+reaches the signer as `SignPayload::Streamed`, with no bytes.
+
 ## The client access of `ostrya serve`
 
 - The reader of the PROXY protocol, v1 and v2, is written in the tree, with
@@ -280,6 +311,9 @@ when the port owns its set of members and expects the set to grow.
 - `ostrya::Error` has the attribute. Its variants are the error vocabulary of
   the port, and a new failure mode adds a variant.
 - `TrustRoots` has the attribute. The port owns the set of trust settings.
+- `ostrya_fetch::UploadMethod` and `ostrya_fetch::SignPayload` have the
+  attribute. The fetcher owns the set of upload methods and the set of body
+  forms that a signer gets.
 - No option struct of the `ostrya` crate has the attribute: `PruneOptions`,
   `PullOptions`, `TarExportOptions`, `TarImportOptions` and the others. The
   attribute stops a struct expression outside the defining crate,

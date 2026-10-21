@@ -50,6 +50,10 @@ const PENDING_READ_LIMIT: Duration = Duration::from_secs(5);
 /// userinfo. It also refuses a query, a fragment, an empty host, and a port
 /// that is not a number from 0 to 65535.
 #[derive(Debug, Clone)]
+// The HTTP variant is much larger than the ssh variant. A caller builds one
+// endpoint for each remote, so a box saves no work, and the variant stays
+// inline.
+#[allow(clippy::large_enum_variant)]
 pub enum Endpoint {
     /// An ssh address and the options of the ssh client.
     Ssh {

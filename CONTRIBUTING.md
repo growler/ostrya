@@ -88,6 +88,23 @@ OSTRYA_REQUIRE_S3=1 OSTRYA_REQUIRE_SEAWEEDFS=1 \
     cargo test -p ostrya --features s3 --test bucket_lock
 ```
 
+The tests of the init of a bucket repository and of the push to a bucket
+repository in `crates/ostrya/tests/push_s3.rs` need the `push` and `s3`
+features. They call the library alone and read no AWS variable. Most of
+them run against the stand-in S3 server, which can refuse or delay the
+requests of one method to a key and change its objects before a request,
+so the tests cover each failure state of a push. The tests of a push and a pull, of a
+multipart upload, and of a wrong secret key run against `weed mini` of
+SeaweedFS. `rclone serve s3` ignores `If-None-Match`, so the tests against
+it check that the init and the push are refused. A test skips if `rclone` or
+`weed` is not on `PATH`, and the two variables turn each skip into a
+failure:
+
+```sh
+OSTRYA_REQUIRE_S3=1 OSTRYA_REQUIRE_SEAWEEDFS=1 \
+    cargo test -p ostrya --features push,s3 --test push_s3
+```
+
 ## Golden fixtures
 
 The golden fixtures are in `tests/fixtures/`. The `ostree` tool wrote them,
@@ -224,10 +241,11 @@ test:
   tests (see "Tests").
 - `OSTRYA_REQUIRE_S3` -- `rclone`, for the tests of the bucket client, of
   the pull from an `s3://` address, and of a bucket repository against
-  `rclone serve s3` (see "Tests").
+  `rclone serve s3`: the writer lock, the listing, the init, and the push
+  (see "Tests").
 - `OSTRYA_REQUIRE_SEAWEEDFS` -- `weed` of SeaweedFS, for the tests of the
-  writer lock and of the object listing of a bucket repository against
-  `weed mini` (see "Tests").
+  writer lock, of the object listing, of the init, and of the push to a
+  bucket repository against `weed mini` (see "Tests").
 
 The CI test job sets `OSTRYA_REQUIRE_GNUPG` and `OSTRYA_REQUIRE_MULTIGROUP`.
 

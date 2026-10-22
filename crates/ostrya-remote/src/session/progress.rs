@@ -136,10 +136,48 @@ impl PushProgress {
         self.inner.snapshot()
     }
 
-    /// Sets the phase of the handle. A tree push sets the phases of its scan
-    /// before a session opens.
-    pub(crate) fn set_phase(&self, phase: PushPhase) {
+    /// Sets the phase of the handle, and calls the hook if the phase
+    /// changed.
+    ///
+    /// A session and a tree push set the phase on their own. A client that
+    /// uploads with no session, for example a push to a bucket repository,
+    /// calls this method.
+    pub fn set_phase(&self, phase: PushPhase) {
         self.inner.set_phase(phase);
+    }
+
+    /// Adds `objects` to [`objects_needed`](PushProgressSnapshot::objects_needed)
+    /// and `content_bytes` to [`bytes_total`](PushProgressSnapshot::bytes_total).
+    ///
+    /// A client that uploads with no session calls this method before its
+    /// first upload. The call does not call the hook. The next change of the
+    /// phase gives the hook the new counters.
+    pub fn add_upload(&self, objects: u64, content_bytes: u64) {
+        self.inner
+            .objects_needed
+            .fetch_add(objects, Ordering::Relaxed);
+        self.inner
+            .bytes_total
+            .fetch_add(content_bytes, Ordering::Relaxed);
+    }
+
+    /// Adds one to [`objects_sent`](PushProgressSnapshot::objects_sent), and
+    /// calls the hook.
+    ///
+    /// A client that uploads with no session calls this method after each
+    /// object that it uploaded.
+    pub fn object_uploaded(&self) {
+        self.inner.object_sent();
+    }
+
+    /// Adds `n` to [`content_bytes`](PushProgressSnapshot::content_bytes),
+    /// and calls the hook if the count reaches the next multiple of 102,400
+    /// bytes (100 KiB).
+    ///
+    /// A client that uploads with no session calls this method as it reads
+    /// the content of the file objects that it uploads.
+    pub fn add_content(&self, n: u64) {
+        self.inner.content(n);
     }
 }
 
@@ -402,4 +440,40 @@ fn object_count(names: &[ObjectName]) -> u64 {
         .iter()
         .filter(|n| n.ty != ObjectType::ComposefsImage)
         .count() as u64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// The methods of a client with no session change the snapshot, and call
+    /// the hook at a new phase, at each uploaded object, and at each 100 KiB
+    /// step of the content.
+    #[test]
+    fn the_upload_methods_change_the_snapshot_and_call_the_hook() {
+        let calls: Arc<Mutex<Vec<PushProgressSnapshot>>> = Arc::default();
+        let seen = Arc::clone(&calls);
+        let progress = PushProgress::with_hook(Arc::new(move |snapshot| {
+            seen.lock().unwrap().push(*snapshot);
+        }));
+        progress.set_phase(PushPhase::Scanning);
+        assert!(calls.lock().unwrap().is_empty(), "the phase did not change");
+        progress.add_upload(3, 250_000);
+        assert!(calls.lock().unwrap().is_empty(), "add_upload calls no hook");
+        progress.set_phase(PushPhase::Uploading);
+        let last = *calls.lock().unwrap().last().unwrap();
+        assert_eq!(last.phase, PushPhase::Uploading);
+        assert_eq!((last.objects_needed, last.bytes_total), (3, 250_000));
+
+        progress.add_content(100_000);
+        assert_eq!(calls.lock().unwrap().len(), 1, "below the first step");
+        progress.add_content(2_400);
+        assert_eq!(calls.lock().unwrap().len(), 2, "at the first step");
+        progress.object_uploaded();
+        let last = *calls.lock().unwrap().last().unwrap();
+        assert_eq!(calls.lock().unwrap().len(), 3);
+        assert_eq!((last.objects_sent, last.content_bytes), (1, 102_400));
+        assert_eq!(progress.snapshot(), last);
+    }
 }

@@ -99,6 +99,10 @@ impl Repo {
     ///
     /// # Errors
     ///
+    /// - [`Error::Remote`] with
+    ///   [`InvalidInput`](crate::remote::Error::InvalidInput) if the endpoint
+    ///   is an `s3://` address. A bucket repository has no server that makes
+    ///   a commit.
     /// - [`Error::Remote`] with the error of [`PushSession::prepare`] if the
     ///   endpoint does not apply, or if the HTTP client cannot be built.
     /// - [`Error::Remote`] with the error of
@@ -110,6 +114,13 @@ impl Repo {
         endpoint: Endpoint,
         opts: PushOntoOptions,
     ) -> Result<PushOutcome> {
+        #[cfg(feature = "s3")]
+        if matches!(endpoint, Endpoint::S3(_)) {
+            return Err(invalid(
+                "a push onto a branch takes an ssh or an HTTP endpoint, and this endpoint is an \
+                 s3:// address",
+            ));
+        }
         let transport = PushSession::prepare(endpoint).await?;
         let onto = self.plan_onto(&opts).await?;
         let session = transport.open(&onto.refs, session_options(&opts)).await?;

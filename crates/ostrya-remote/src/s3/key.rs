@@ -1,9 +1,13 @@
 //! The keys of a bucket repository, and their encoding in a request.
 
-use ostrya_core::{Checksum, is_ref_name};
+use ostrya_core::{Checksum, is_collection_id, is_ref_name};
 
 use super::sigv4::uri_encode;
 use crate::{Error, Result};
+
+/// The longest collection id of a key under `refs/mirrors/`: 255 bytes. The
+/// id is the name of one directory.
+const MAX_COLLECTION_ID_LEN: usize = 255;
 
 /// The keys of a bucket repository that hold one file each.
 const SINGLE_KEYS: [&str; 4] = ["config", "summary", "summary.sig", "extensions/ostrya/lock"];
@@ -29,6 +33,8 @@ const OBJECT_EXTENSIONS: [&str; 7] = [
 /// - `objects/XX/<62 hex digits>.<ext>`, with lowercase hex digits and an
 ///   extension of [`OBJECT_EXTENSIONS`]
 /// - `refs/heads/<name>`, with a name that [`is_ref_name`] accepts
+/// - `refs/mirrors/<id>/<name>`, with an id of at most 255 bytes that
+///   [`is_collection_id`] accepts, and a name that [`is_ref_name`] accepts
 /// - `deltas/<2>/<41>/<target>` and `deltas/<2>/<41>-<43>/<target>`, with
 ///   checksums in modified base64, and the target `superblock` or a part
 ///   number with no leading zero
@@ -42,6 +48,11 @@ pub(crate) fn is_repository_key(key: &str) -> bool {
     }
     if let Some(name) = key.strip_prefix("refs/heads/") {
         return is_ref_name(name);
+    }
+    if let Some(rest) = key.strip_prefix("refs/mirrors/") {
+        return rest.split_once('/').is_some_and(|(id, name)| {
+            id.len() <= MAX_COLLECTION_ID_LEN && is_collection_id(id) && is_ref_name(name)
+        });
     }
     if let Some(rest) = key.strip_prefix("deltas/") {
         return is_delta_key(rest);
@@ -257,6 +268,9 @@ mod tests {
             "refs/heads/exampleos/x86_64/stable".to_owned(),
             "refs/heads/a-b.c_d9".to_owned(),
             "refs/heads/grün".to_owned(),
+            "refs/mirrors/org.example.Os/main".to_owned(),
+            "refs/mirrors/org.example.Os/exampleos/x86_64/stable".to_owned(),
+            format!("refs/mirrors/org.{}/main", "a".repeat(251)),
             format!("deltas/{}/{}/superblock", &to[..2], &to[2..]),
             format!("deltas/{}/{}/0", &to[..2], &to[2..]),
             format!("deltas/{}/{}/12", &to[..2], &to[2..]),
@@ -297,6 +311,11 @@ mod tests {
             "refs/heads/a//b".to_owned(),
             "refs/heads/a b".to_owned(),
             "refs/mirrors/x".to_owned(),
+            "refs/mirrors/org.example.Os/".to_owned(),
+            "refs/mirrors//main".to_owned(),
+            "refs/mirrors/nodot/main".to_owned(),
+            "refs/mirrors/org.example.Os/-x".to_owned(),
+            format!("refs/mirrors/org.{}/main", "a".repeat(252)),
             "refs/remotes/origin/main".to_owned(),
             format!("deltas/{}/{}/01", &to[..2], &to[2..]),
             format!("deltas/{}/{}/meta", &to[..2], &to[2..]),

@@ -96,6 +96,9 @@ const COMPARE_CHUNK: usize = 64 * 1024;
 ///   `tombstone-commit`, or `cfs`
 /// - `refs/heads/<name>`, with a ref name that
 ///   [`is_ref_name`](ostrya_core::is_ref_name) accepts
+/// - `refs/mirrors/<id>/<name>`, with an id of at most 255 bytes that
+///   [`is_collection_id`](ostrya_core::is_collection_id) accepts, and a ref
+///   name that [`is_ref_name`](ostrya_core::is_ref_name) accepts
 /// - `deltas/<2>/<41>/<target>` and `deltas/<2>/<41>-<43>/<target>`, with
 ///   checksums in modified base64, and the target `superblock` or a part
 ///   number with no leading zero

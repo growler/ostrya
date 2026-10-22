@@ -4102,6 +4102,9 @@ async fn push(repo: Repo, name: &str, verbose: bool, args: PushArgs) -> Result<(
         force: args.force,
         detached_metadata_filter,
         progress,
+        summary_signers: Vec::new(),
+        break_lock: false,
+        part_size: None,
     };
     let pushed = repo.push(endpoint, opts).await;
     // The bar is cleared before any line of the result or of the error.

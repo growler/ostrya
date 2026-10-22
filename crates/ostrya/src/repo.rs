@@ -25,7 +25,7 @@ const CONFIG: &str = "config";
 
 /// The largest `config` file that a read accepts, in bytes. A read refuses a
 /// larger file with [`Error::InvalidFormat`].
-const MAX_CONFIG_SIZE: u64 = 1024 * 1024;
+pub(crate) const MAX_CONFIG_SIZE: u64 = 1024 * 1024;
 
 /// The mode that a directory create requests. The process umask reduces it.
 const DIR_MODE: u32 = 0o775;

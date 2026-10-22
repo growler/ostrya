@@ -173,7 +173,7 @@ impl RepoSource {
     /// [`detached`](RepoSource::detached) does. The read, the parse, the
     /// filter, and the serialization of a partial result run in one call on
     /// the blocking pool.
-    async fn detached_bytes(&self, commit: &Checksum) -> Result<Option<Vec<u8>>> {
+    pub(super) async fn detached_bytes(&self, commit: &Checksum) -> Result<Option<Vec<u8>>> {
         let repo = self.repo.clone();
         let filter = self.filter.clone();
         let commit = *commit;

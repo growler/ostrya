@@ -1211,13 +1211,7 @@ impl Repo {
         // The names give a lower bound of the size of the summary, so a
         // summary over the cap is refused before the commit reads and the
         // build.
-        check_summary_size(
-            local
-                .iter()
-                .map(|(name, _)| name.len() as u64 + REF_ENTRY_FLOOR)
-                .sum::<u64>()
-                + collection_map_floor(collections),
-        )?;
+        check_summary_size(summary_floor(local, collections))?;
         // A ref can name a commit that the facts of the run do not hold, if
         // the walk of an item read a ref of `refs/heads` that the full
         // selection did not read, or if the ref changed after the full
@@ -1233,94 +1227,20 @@ impl Repo {
         } else {
             self.commit_facts(missing).await?
         };
-        let entry = |name: &str, commit: &Checksum| {
-            let fact = facts
-                .get(commit)
-                .or_else(|| read.get(commit))
-                .expect("the facts of each commit are in one of the two maps");
-            ref_entry(
-                name,
-                fact.size,
-                commit,
-                fact.version.as_deref(),
-                fact.timestamp,
-            )
-        };
-        let ref_entries = local
-            .iter()
-            .map(|(name, commit)| entry(name, commit))
-            .collect::<Result<Vec<_>>>()?;
-        let collection_map = if collections.is_empty() {
-            None
-        } else {
-            let mut values = Vec::with_capacity(collections.len());
-            for (collection, refs) in collections {
-                let ref_values = refs
-                    .iter()
-                    .map(|(name, commit)| entry(name, commit))
-                    .collect::<Result<Vec<_>>>()?;
-                values.push(Value::Tuple(vec![
-                    Value::Str(collection.clone()),
-                    Value::Array(ref_values),
-                ]));
-            }
-            Some(variant(COLLECTION_MAP_SIGNATURE, Value::Array(values))?)
-        };
-
-        let names_deltas = kind.names_deltas(self.mode());
-        let mut metadata = Value::Array(Vec::new());
-        append_dict_entry(
-            &mut metadata,
-            MODE_KEY,
-            variant(
-                "s",
-                Value::Str(kind.mode(self.mode()).as_mode_str().to_owned()),
-            )?,
-        )?;
-        append_dict_entry(
-            &mut metadata,
-            LAST_MODIFIED_KEY,
-            variant("t", big_endian_u64(run.last_modified))?,
-        )?;
-        append_dict_entry(
-            &mut metadata,
-            TOMBSTONE_KEY,
-            variant("b", Value::Bool(self.config().tombstone_commits()?))?,
-        )?;
-        if let Some(deltas) = deltas {
-            append_dict_entry(&mut metadata, STATIC_DELTAS_KEY, deltas)?;
-        }
-        if let Some(map) = collection_map {
-            append_dict_entry(&mut metadata, COLLECTION_MAP_KEY, map)?;
-        }
-        if names_deltas {
-            append_dict_entry(
-                &mut metadata,
-                INDEXED_DELTAS_KEY,
-                variant("b", Value::Bool(self.config().indexed_deltas()?))?,
-            )?;
-        }
-        if let Some(cid) = self.config().collection_id() {
-            append_dict_entry(
-                &mut metadata,
-                COLLECTION_ID_KEY,
-                variant("s", Value::Str(cid.to_owned()))?,
-            )?;
-        }
-        for (key, value) in caller_entries(&metadata, added) {
-            // A summary that names no static delta takes no delta key of the
-            // caller.
-            if !names_deltas && (key == STATIC_DELTAS_KEY || key == INDEXED_DELTAS_KEY) {
-                continue;
-            }
-            append_dict_entry(&mut metadata, key, value.clone())?;
-        }
-
-        let summary = Value::Tuple(vec![Value::Array(ref_entries), metadata]);
-        let ty = Type::parse(SUMMARY_SIGNATURE).map_err(ostrya_core::Error::from)?;
-        let bytes = to_bytes(&ty, &summary).map_err(ostrya_core::Error::from)?;
-        check_summary_size(bytes.len() as u64)?;
-        Ok(bytes)
+        let lookup = |commit: &Checksum| facts.get(commit).or_else(|| read.get(commit));
+        build_summary(SummaryParts {
+            local,
+            collections,
+            facts: &lookup,
+            deltas,
+            mode: kind.mode(self.mode()),
+            names_deltas: kind.names_deltas(self.mode()),
+            tombstone_commits: self.config().tombstone_commits()?,
+            indexed_deltas: self.config().indexed_deltas()?,
+            collection_id: self.config().collection_id(),
+            last_modified: run.last_modified,
+            added,
+        })
     }
 
     /// Returns a ref listing: a summary of the local refs that `refs`
@@ -1866,7 +1786,7 @@ impl Repo {
     /// The call reads the commits in one pass on the blocking pool. It reads
     /// each commit object one time, under the size cap of a metadata object,
     /// and holds one commit in memory at a time.
-    async fn commit_facts(
+    pub(crate) async fn commit_facts(
         &self,
         commits: HashSet<Checksum>,
     ) -> Result<HashMap<Checksum, CommitFacts>> {
@@ -1993,10 +1913,31 @@ pub(crate) fn serialize_signature_dict(dict: &Value) -> Result<Vec<u8>> {
 }
 
 /// The facts about one commit object that a ref entry of the summary holds.
-struct CommitFacts {
-    size: u64,
-    version: Option<String>,
-    timestamp: u64,
+pub(crate) struct CommitFacts {
+    /// The size of the commit object in bytes.
+    pub(crate) size: u64,
+    /// The `ostree.commit.version` of the commit.
+    pub(crate) version: Option<String>,
+    /// The timestamp of the commit.
+    pub(crate) timestamp: u64,
+}
+
+impl CommitFacts {
+    /// Returns the facts of the commit object `bytes`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Core`] if the bytes are not a commit object.
+    pub(crate) fn parse(bytes: &[u8]) -> Result<CommitFacts> {
+        // Commit objects are stored uncompressed, so the size on disk is the
+        // serialized length that the `ostree` command reports.
+        let parsed = Commit::parse(bytes)?;
+        Ok(CommitFacts {
+            size: bytes.len() as u64,
+            version: parsed.version().map(str::to_owned),
+            timestamp: parsed.timestamp,
+        })
+    }
 }
 
 /// Reads the size, the version, and the timestamp of the commit `commit`.
@@ -2014,16 +1955,152 @@ fn read_commit_facts(repo: &Repo, commit: &Checksum) -> Result<CommitFacts> {
                 },
                 _ => Error::Io(e),
             })?;
-    // Commit objects are stored uncompressed, so the size on disk is the
-    // serialized length that the `ostree` command reports.
-    let size = bytes.len() as u64;
-    let parsed = Commit::parse(&bytes)?;
-    drop(bytes);
-    Ok(CommitFacts {
-        size,
-        version: parsed.version().map(str::to_owned),
-        timestamp: parsed.timestamp,
-    })
+    CommitFacts::parse(&bytes)
+}
+
+/// The inputs of [`build_summary`].
+pub(crate) struct SummaryParts<'a> {
+    /// The refs of field 0, sorted byte-wise by name.
+    pub(crate) local: &'a [(String, Checksum)],
+    /// The refs of `ostree.summary.collection-map`, by collection id, each
+    /// list sorted byte-wise by name.
+    pub(crate) collections: &'a BTreeMap<String, Vec<(String, Checksum)>>,
+    /// The facts of each commit of the refs. A ref whose commit has no facts
+    /// is a defect of the caller.
+    pub(crate) facts: &'a dyn Fn(&Checksum) -> Option<&'a CommitFacts>,
+    /// The `ostree.static-deltas` value, or `None` for no delta.
+    pub(crate) deltas: Option<Value>,
+    /// The mode that `ostree.summary.mode` states.
+    pub(crate) mode: RepoMode,
+    /// `true` if the summary names static deltas, and so states
+    /// `ostree.summary.indexed-deltas`.
+    pub(crate) names_deltas: bool,
+    /// The value of `ostree.summary.tombstone-commits`.
+    pub(crate) tombstone_commits: bool,
+    /// The value of `ostree.summary.indexed-deltas`.
+    pub(crate) indexed_deltas: bool,
+    /// The value of `ostree.summary.collection-id`, or `None` for no key.
+    pub(crate) collection_id: Option<&'a str>,
+    /// The value of `ostree.summary.last-modified`.
+    pub(crate) last_modified: u64,
+    /// The keys of the caller, as [`SummaryOptions::additional_metadata`]
+    /// states them.
+    pub(crate) added: &'a [(String, Value)],
+}
+
+/// Returns the bytes of a summary of `parts`.
+///
+/// The global metadata has the order of
+/// [`regenerate_summaries`](Repo::regenerate_summaries), "Global metadata".
+/// The call refuses a summary larger than [`SUMMARY_READ_CAP`].
+pub(crate) fn build_summary(parts: SummaryParts<'_>) -> Result<Vec<u8>> {
+    let SummaryParts {
+        local,
+        collections,
+        facts,
+        deltas,
+        mode,
+        names_deltas,
+        tombstone_commits,
+        indexed_deltas,
+        collection_id,
+        last_modified,
+        added,
+    } = parts;
+    let entry = |name: &str, commit: &Checksum| {
+        let fact = facts(commit).expect("the caller gives the facts of each commit");
+        ref_entry(
+            name,
+            fact.size,
+            commit,
+            fact.version.as_deref(),
+            fact.timestamp,
+        )
+    };
+    let ref_entries = local
+        .iter()
+        .map(|(name, commit)| entry(name, commit))
+        .collect::<Result<Vec<_>>>()?;
+    let collection_map = if collections.is_empty() {
+        None
+    } else {
+        let mut values = Vec::with_capacity(collections.len());
+        for (collection, refs) in collections {
+            let ref_values = refs
+                .iter()
+                .map(|(name, commit)| entry(name, commit))
+                .collect::<Result<Vec<_>>>()?;
+            values.push(Value::Tuple(vec![
+                Value::Str(collection.clone()),
+                Value::Array(ref_values),
+            ]));
+        }
+        Some(variant(COLLECTION_MAP_SIGNATURE, Value::Array(values))?)
+    };
+
+    let mut metadata = Value::Array(Vec::new());
+    append_dict_entry(
+        &mut metadata,
+        MODE_KEY,
+        variant("s", Value::Str(mode.as_mode_str().to_owned()))?,
+    )?;
+    append_dict_entry(
+        &mut metadata,
+        LAST_MODIFIED_KEY,
+        variant("t", big_endian_u64(last_modified))?,
+    )?;
+    append_dict_entry(
+        &mut metadata,
+        TOMBSTONE_KEY,
+        variant("b", Value::Bool(tombstone_commits))?,
+    )?;
+    if let Some(deltas) = deltas {
+        append_dict_entry(&mut metadata, STATIC_DELTAS_KEY, deltas)?;
+    }
+    if let Some(map) = collection_map {
+        append_dict_entry(&mut metadata, COLLECTION_MAP_KEY, map)?;
+    }
+    if names_deltas {
+        append_dict_entry(
+            &mut metadata,
+            INDEXED_DELTAS_KEY,
+            variant("b", Value::Bool(indexed_deltas))?,
+        )?;
+    }
+    if let Some(cid) = collection_id {
+        append_dict_entry(
+            &mut metadata,
+            COLLECTION_ID_KEY,
+            variant("s", Value::Str(cid.to_owned()))?,
+        )?;
+    }
+    for (key, value) in caller_entries(&metadata, added) {
+        // A summary that names no static delta takes no delta key of the
+        // caller.
+        if !names_deltas && (key == STATIC_DELTAS_KEY || key == INDEXED_DELTAS_KEY) {
+            continue;
+        }
+        append_dict_entry(&mut metadata, key, value.clone())?;
+    }
+
+    let summary = Value::Tuple(vec![Value::Array(ref_entries), metadata]);
+    let ty = Type::parse(SUMMARY_SIGNATURE).map_err(ostrya_core::Error::from)?;
+    let bytes = to_bytes(&ty, &summary).map_err(ostrya_core::Error::from)?;
+    check_summary_size(bytes.len() as u64)?;
+    Ok(bytes)
+}
+
+/// Returns a lower bound of the size of a summary of the refs `local` and
+/// `collections`, from the names alone.
+pub(crate) fn summary_floor(
+    local: &[(String, Checksum)],
+    collections: &BTreeMap<String, Vec<(String, Checksum)>>,
+) -> u64 {
+    local
+        .iter()
+        .map(|(name, _)| name.len() as u64 + REF_ENTRY_FLOOR)
+        .sum::<u64>()
+        + collection_map_floor(collections)
 }
 
 /// Returns the fewest bytes that the `ostree.commit.version` entry with the
@@ -2149,7 +2226,7 @@ fn write_ref_listing(
 /// offset of the end of the id. Each ref adds the floor of a ref entry,
 /// [`REF_ENTRY_FLOOR`] and the name. The padding and the framing offsets of
 /// the arrays are not in the count.
-fn collection_map_floor(collections: &BTreeMap<String, Vec<(String, Checksum)>>) -> u64 {
+pub(crate) fn collection_map_floor(collections: &BTreeMap<String, Vec<(String, Checksum)>>) -> u64 {
     if collections.is_empty() {
         return 0;
     }
@@ -2530,7 +2607,7 @@ fn big_endian_u64(value: u64) -> Value {
 ///
 /// The call does not read `SOURCE_DATE_EPOCH`, as the `ostree` command does
 /// not.
-fn resolve_last_modified(explicit: Option<u64>) -> Result<u64> {
+pub(crate) fn resolve_last_modified(explicit: Option<u64>) -> Result<u64> {
     if let Some(timestamp) = explicit {
         return Ok(timestamp);
     }
@@ -2589,7 +2666,7 @@ pub(crate) fn read_root_file_blocking(
 
 /// Refuses a summary of `size` bytes, or of at least `size` bytes, when
 /// `size` is larger than [`SUMMARY_READ_CAP`], the cap of each reader.
-fn check_summary_size(size: u64) -> Result<()> {
+pub(crate) fn check_summary_size(size: u64) -> Result<()> {
     if size > SUMMARY_READ_CAP {
         return Err(Error::InvalidFormat(format!(
             "the summary is larger than its cap of {SUMMARY_READ_CAP} bytes"
@@ -2761,7 +2838,7 @@ fn item_summary_stems(dir: &OwnedFd) -> Result<Vec<String>> {
 /// `signers`, in order, or `None` with no signer.
 ///
 /// A failure of a signer gives the name of its key with the error.
-async fn sign_summary_bytes(
+pub(crate) async fn sign_summary_bytes(
     bytes: &[u8],
     signers: &[&dyn Signer],
 ) -> std::result::Result<Option<Vec<u8>>, (Option<String>, Error)> {
@@ -3276,6 +3353,84 @@ mod tests {
                 "the build refreshes no anchor"
             );
             assert_eq!(repo.read_summary().await.unwrap().unwrap(), written);
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The summary of a bucket repository with a collection id has the bytes
+    /// of the root summary of a local repository with the same refs,
+    /// commits, deltas, `config`, and `last-modified`, when the local run
+    /// writes no anchor commit. The refs are in `refs/heads/` and in
+    /// `refs/mirrors/ID/` of another collection.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn the_bucket_summary_has_the_bytes_of_the_local_root_summary() {
+        use crate::bucket::BucketRefs;
+        use crate::refs::CollectionRef;
+
+        let dir = std::env::temp_dir().join(format!(
+            "ostrya-bucket-summary-{}-{}",
+            std::process::id(),
+            crate::write::unique()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        ostrya_rt::block_on(async {
+            let mut create = crate::CreateOptions::new(ostrya_core::RepoMode::Archive);
+            create.collection_id = Some("org.example.A".into());
+            let repo = Repo::create(&dir, create).await.unwrap();
+            let first = commit_at(&repo, 1_700_000_000).await;
+            let second = commit_at(&repo, 1_700_000_100).await;
+            let mut refs = BucketRefs::default();
+            for (name, commit) in [("main", first), ("a/b", second)] {
+                repo.set_ref_immediate(name, Some(&commit)).await.unwrap();
+                refs.heads.insert(name.into(), commit);
+            }
+            for (name, commit) in [("main", second), ("z", first)] {
+                let cref = CollectionRef::new("org.example.B", name);
+                repo.set_collection_ref_immediate(&cref, Some(&commit))
+                    .await
+                    .unwrap();
+                refs.mirrors
+                    .entry("org.example.B".into())
+                    .or_default()
+                    .insert(name.into(), commit);
+            }
+            let opts = SummaryOptions {
+                last_modified: Some(1_700_000_000),
+                ..SummaryOptions::default()
+            };
+            let access = Arc::new(ClientAccess::from_config(repo.config(), repo.path()).unwrap());
+            let run = repo.summary_run(access, &opts).await.unwrap();
+            let local = repo
+                .selection_summary(&run, &run.every, SummaryKind::Root, &opts)
+                .await
+                .unwrap();
+
+            let (heads, collections) = crate::bucket::summary_refs(&refs);
+            let facts = repo
+                .commit_facts([first, second].into_iter().collect())
+                .await
+                .unwrap();
+            let lookup = |commit: &Checksum| facts.get(commit);
+            let config = repo.config();
+            let bucket = build_summary(SummaryParts {
+                local: &heads,
+                collections: &collections,
+                facts: &lookup,
+                deltas: None,
+                mode: config.mode(),
+                names_deltas: true,
+                tombstone_commits: config.tombstone_commits().unwrap(),
+                indexed_deltas: config.indexed_deltas().unwrap(),
+                collection_id: config.collection_id(),
+                last_modified: 1_700_000_000,
+                added: &[],
+            })
+            .unwrap();
+            assert_eq!(bucket, local);
+            let parsed = Summary::parse(&bucket).unwrap();
+            assert_eq!(parsed.collection_map().unwrap().len(), 1);
+            assert!(parsed.metadata_value(COLLECTION_ID_KEY).is_some());
         });
         let _ = std::fs::remove_dir_all(&dir);
     }

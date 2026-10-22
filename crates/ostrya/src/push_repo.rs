@@ -21,6 +21,8 @@ mod export;
 mod negotiate;
 mod onto;
 mod refspec;
+#[cfg(feature = "s3")]
+mod s3;
 mod source;
 #[cfg(test)]
 mod test_repo;

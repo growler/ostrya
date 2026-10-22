@@ -78,6 +78,8 @@ ostrya refuses to open a repository without this key, or with another value.
 The collection ID of the repository.
 The summary records it, and the collection refs below \fB\%refs/mirrors/\fR use it.
 \fB\%ostrya init \-\-collection\-id\fR writes it.
+In the \fB\%config\fR of a bucket repository, the init of the ostrya library built with its feature \fB\%s3\fR writes it, and it never changes.
+\fB\%ostrya\-repo\fR(5) describes the \fB\%config\fR of a bucket repository.
 .TP
 \fB\%fsync\fR (boolean, default true)
 Sync each write to disk before it completes.
@@ -135,6 +137,7 @@ The keys of the group \fB\%[archive]\fR.
 .TP
 \fB\%zlib\-level\fR (integer, default 6)
 The DEFLATE level of the \fB\%.filez\fR objects that ostrya writes into an archive repository, and that \fB\%ostrya serve\fR makes from another mode.
+A push to an \fB\%s3://\fR address through the ostrya library built with its feature \fB\%s3\fR also makes each \fB\%.filez\fR of a repository of another mode at this level.
 A value less than 1 gives 1, and a value more than 9 gives 9.
 .SH INTEGRITY KEYS
 The keys of the group \fB\%[ex\-integrity]\fR.
@@ -159,7 +162,7 @@ The keys of a group \fB\%[remote "NAME"]\fR.
 The base URL of a pull over HTTP: \fB\%http://\fR or \fB\%https://\fR.
 When \fB\%pull\-url\fR is set, a pull uses it in place of this key.
 When \fB\%push\-url\fR is absent, a push uses this key if it starts with \fB\%http://\fR or \fB\%https://\fR.
-A pull refuses an ssh address and an \fB\%s3://\fR address in this key.
+A pull refuses an ssh address and an \fB\%s3://\fR address in this key, and a push refuses an \fB\%s3://\fR address in it.
 .TP
 \fB\%branches\fR (list)
 The refs that \fB\%ostrya pull NAME\fR fetches when the command names no ref.
@@ -214,7 +217,7 @@ A key that needs a passphrase is refused.
 .TP
 \fB\%tls\-permissive\fR (boolean, default false)
 A pull accepts each certificate chain, and still checks the host name.
-A push to an \fB\%https://\fR address refuses \fB\%true\fR.
+A push to an \fB\%https://\fR address or to an \fB\%s3://\fR address refuses \fB\%true\fR.
 .TP
 \fB\%proxy\fR (string)
 The \fB\%http://\fR proxy URL of each request to the remote.
@@ -238,7 +241,9 @@ A remote that the \fB\%ostree\fR tool also reads must keep an HTTP \fB\%url\fR.
 \fB\%push\-url\fR (string)
 The push address, in the forms of \fB\%pull\-url\fR.
 If this key is absent and \fB\%url\fR does not start with \fB\%http://\fR or \fB\%https://\fR, a push to the remote fails.
-A push refuses an \fB\%s3://\fR address.
+The \fB\%ostrya\fR command of this release refuses an \fB\%s3://\fR address.
+A push through the ostrya library built with its feature \fB\%s3\fR writes the bucket repository at an \fB\%s3://\fR address.
+The bucket repository needs a \fB\%config\fR first, which the init of the library writes.
 .TP
 \fB\%ssh\-command\fR (string, default ssh)
 The ssh command line of a push or a pull over ssh, split at ASCII white space with no quoting rule.
@@ -259,12 +264,14 @@ A file whose first line is the token of a push over HTTP.
 A relative path is relative to the current directory of the command, and ostrya does not expand \fB\%~\fR.
 The token is token68: letters, digits, \fB\%\-\fR, \fB\%.\fR, \fB\%_\fR, \fB\%~\fR, \fB\%+\fR, and \fB\%/\fR, then zero or more \fB\%=\fR.
 A push to an \fB\%http://\fR address refuses to send it, unless the command has \fB\%\-\-allow\-cleartext\-credentials\fR.
+A push to an \fB\%s3://\fR address refuses it.
 \fB\%\-\-push\-token\-file\fR has precedence over it.
 .TP
 \fB\%push\-user\fR (string)
 The user name of a Basic credential, with the token as the password.
 Without it, the push sends the token as a bearer token.
 A name that is empty or holds \fB\%:\fR is refused, and so is a name with no token file.
+A push to an \fB\%s3://\fR address refuses it.
 \fB\%\-\-push\-user\fR has precedence over it.
 .TP
 \fB\%s3\-region\fR (string, default us\-east\-1)
@@ -275,7 +282,7 @@ A server that checks its own region, and an AWS bucket outside \fB\%us\-east\-1\
 \fB\%s3\-endpoint\fR (string)
 The \fB\%http://\fR or \fB\%https://\fR URL of the S3 server, with no path, no query, and no userinfo.
 The default is the AWS endpoint of the region.
-A pull refuses an \fB\%http://\fR endpoint, unless the caller permits cleartext credentials, because the signature of each request is a credential.
+A pull and a push refuse an \fB\%http://\fR endpoint, unless the caller permits cleartext credentials, because the signature of each request is a credential.
 .TP
 \fB\%s3\-addressing\fR (path or virtual)
 The addressing style of the bucket: the bucket in the path of each URL, or in the host name.
@@ -288,9 +295,9 @@ The default is \fB\%AWS_PROFILE\fR, else \fB\%default\fR.
 A profile that this key names turns off the key pair, the region, and the endpoint of the environment.
 .PP
 The \fB\%ostrya\fR command of this release refuses an \fB\%s3://\fR address.
-The S3 keys, and the rules of a pull from an \fB\%s3://\fR address on this page, apply to a pull through the ostrya library built with its feature \fB\%s3\fR.
+The S3 keys, and the rules of a pull from and a push to an \fB\%s3://\fR address on this page, apply to a pull and a push through the ostrya library built with its feature \fB\%s3\fR.
 .PP
-A pull refuses an S3 key in a remote whose \fB\%pull\-url\fR and \fB\%push\-url\fR hold no \fB\%s3://\fR address.
+A pull and a push refuse an S3 key in a remote whose \fB\%pull\-url\fR and \fB\%push\-url\fR hold no \fB\%s3://\fR address.
 So a remote can pull a bucket over its \fB\%https://\fR URL in \fB\%url\fR, and keep an \fB\%s3://\fR address in \fB\%push\-url\fR.
 For each S3 setting, the first source that sets it wins: the key, the environment, the profile in the shared config file, and the default.
 .PP
@@ -298,9 +305,15 @@ The key pair of a pull from an \fB\%s3://\fR address needs the permissions \fB\%
 Without \fB\%s3:ListBucket\fR, AWS answers the read of an absent key with 403 \fB\%AccessDenied\fR in place of 404.
 The pull reads a 403 as an error, so an absent optional file, for example \fB\%summary.sig\fR or a \fB\%.commitmeta\fR object, then stops the pull.
 .PP
+The key pair of a push to an \fB\%s3://\fR address needs the permissions \fB\%s3:GetObject\fR, \fB\%s3:PutObject\fR, \fB\%s3:ListBucket\fR, \fB\%s3:DeleteObject\fR, and \fB\%s3:AbortMultipartUpload\fR on the bucket.
+The key pair of the init of a bucket repository needs \fB\%s3:GetObject\fR, \fB\%s3:PutObject\fR, \fB\%s3:ListBucket\fR, and \fB\%s3:DeleteObject\fR.
+Each of the two takes and removes the writer lock of the bucket repository, which \fB\%ostrya\-repo\fR(5) describes.
+.PP
 For an ssh address, a push reads \fB\%ssh\-command\fR and \fB\%receive\-command\fR, and ignores the HTTP keys.
 For an HTTP address, a push reads \fB\%push\-token\-file\fR, \fB\%push\-user\fR, \fB\%proxy\fR, and the TLS keys.
 For an \fB\%http://\fR address, a push reads no file that a TLS key names, and does not read \fB\%tls\-permissive\fR.
+For an \fB\%s3://\fR address, a push through the ostrya library built with its feature \fB\%s3\fR reads the S3 keys, \fB\%proxy\fR, and the TLS keys.
+It refuses \fB\%tls\-permissive=true\fR, \fB\%push\-token\-file\fR, and \fB\%push\-user\fR, and ignores \fB\%ssh\-command\fR, \fB\%send\-command\fR, and \fB\%receive\-command\fR.
 .PP
 For an ssh address, a pull reads \fB\%ssh\-command\fR and \fB\%send\-command\fR, and ignores \fB\%proxy\fR and the TLS keys.
 For an HTTP address, a pull ignores \fB\%ssh\-command\fR and \fB\%send\-command\fR.
@@ -806,7 +819,7 @@ The paths of the shared AWS credentials file and config file.
 .PP
 A profile that \fB\%s3\-profile\fR names turns off \fB\%AWS_ACCESS_KEY_ID\fR, \fB\%AWS_SECRET_ACCESS_KEY\fR, \fB\%AWS_SESSION_TOKEN\fR, \fB\%AWS_REGION\fR, \fB\%AWS_DEFAULT_REGION\fR, \fB\%AWS_ENDPOINT_URL_S3\fR, and \fB\%AWS_ENDPOINT_URL\fR.
 .PP
-The AWS variables apply to a pull through the ostrya library built with its feature \fB\%s3\fR.
+The AWS variables apply to a pull and a push through the ostrya library built with its feature \fB\%s3\fR.
 The \fB\%ostrya\fR command of this release refuses an \fB\%s3://\fR address, and does not read them.
 .TP
 \fB\%http_proxy\fR, \fB\%https_proxy\fR, \fB\%HTTPS_PROXY\fR, \fB\%all_proxy\fR, \fB\%ALL_PROXY\fR, \fB\%no_proxy\fR, \fB\%NO_PROXY\fR

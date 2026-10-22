@@ -765,8 +765,8 @@ with a flag was rejected.
 the lock from other errors. `BucketRepo::lock`, `BucketRepo::lock_holder`,
 `WriterLock`, `LockHolder`, `LockOperation`, and `BucketRepo::list_objects`
 are public, so another tool on the bucket client keeps the exclusion.
-`BucketRepo::open` sends no request. A push takes the lock before it reads
-`config`, and a new repository has no `config`.
+`BucketRepo::open` sends no request. An init and a push take the lock
+before they read `config`.
 
 `BucketRepo::list_objects` sends one list of each of the 256 fan-out
 prefixes. The lists are futures of one set that the call polls, with no
@@ -777,6 +777,111 @@ holds the keys of its earlier pages while it waits for the next page. With
 2 of any, so almost each key of the repository is in memory before the
 first list ends. A set that holds the 256 lists at one time was rejected
 for this reason.
+
+## The S3 push
+
+`Repo::push_to_bucket` writes commits to a bucket repository with no
+session, and `Repo::push` with `Endpoint::S3` calls it. It gives
+`BucketPushOutcome`: the `PushOutcome` and the holder of a lock that
+`break_lock` deleted. `Repo::push` drops the holder. A field in
+`PushOutcome` was rejected: the type is in `ostrya-remote`, it has no
+`#[non_exhaustive]`, and a session push has no writer lock.
+
+`RepoPushOptions` gets `summary_signers: Vec<Arc<dyn Signer>>`, `break_lock`,
+and the hidden `part_size`, with no feature gate, as `EndpointOverrides`
+gets its S3 fields. A gate behind the feature `s3` was rejected: a caller
+that builds the struct then compiles in one feature set alone. The struct
+gets a written `Debug`, which names each signer, as `DeltaOptions` does. A
+push over ssh or HTTP refuses each of the three fields. `part_size` lets a
+test send an object in parts of 5 MiB. `Bucket::put_stream` still refuses a
+part below 5 MiB, because SeaweedFS 4.36 refuses it at the completion.
+
+The push runs all local checks of a session push before it takes the writer
+lock, so a local refusal takes no lock and sends no request. The
+fast-forward check needs the refs of the bucket, so it comes after the
+lock.
+
+The collection of a push selects its namespace by the rule of the receive
+push, with the `config` of the bucket in the role of the server. A bucket
+repository can have a `[core] collection-id`, and it is then the primary
+server of that collection. It can also mirror other collections under
+`refs/mirrors/ID/`. A bucket repository with no collection id and with the
+refs of `refs/heads/` alone was rejected: a bucket repository must serve as
+the primary server of a collection and as a mirror of several collections.
+The summary holds `ostree.summary.collection-id` and
+`ostree.summary.collection-map` from the builder of the local summary, and
+no `ostree-metadata` anchor commit.
+
+`BucketRepo::init` writes the `config`, with an optional collection id,
+under the writer lock with the operation `init`. It refuses a bucket that
+holds a `config`, so the collection id of a bucket repository never
+changes. A push to a bucket with no `config` is refused. A push that writes
+the `config` of a new bucket was rejected: the collection id is then set by
+the first push, with no step of its own.
+
+Each writer refuses a bucket repository that holds `refs/mirrors/ID/` of its
+own collection id. The rule of a local repository, in which such a mirror
+ref takes the place of the head of the same name, was rejected for a
+bucket: a push writes the refs of the own collection under `refs/heads/`
+alone, so no writer of the port makes that state.
+
+A push refuses an update whose new ref set holds, in one ref directory, a
+name that is a directory of another name. A bucket has no directories, so
+the two keys can both exist, but a local repository cannot hold the two
+refs, and a pull into one fails.
+
+After a failure before the ref writes, the push releases its lock and
+returns the first error. An error of that release is dropped: the lock
+stays, and the next writer names it. After `Error::BucketLockLost` and
+`Error::BucketLocked`, the push releases no lock, because the lock is the
+lock of another writer.
+
+When one upload fails, the push starts no new upload, waits for the uploads
+in flight, and returns the first error. Each failed `put_stream` aborts its
+own multipart upload. A drop of the uploads in flight was rejected: a
+dropped `put_stream` sends no abort, so it leaves open multipart uploads
+that hold storage.
+
+The push uploads a `.commitmeta` when the listing does not hold it, when
+its size in the listing differs, or when a read of it gives other bytes.
+So a second push with no change uploads no object. A `.commitmeta` that the
+detached metadata filter empties uploads nothing, and the bucket keeps its
+copy, as a pull with such a filter keeps the copy of the destination. An
+upload of an empty file and a delete of the bucket copy were rejected:
+each one removes metadata that the filter of the push did not name.
+
+The push builds and signs the summary after the uploads and before the
+first ref write. Then it checks the lock, writes the refs, checks the lock
+again, and writes `summary` and `summary.sig`. So each refusal of the
+summary build and each failure of a signer comes before any ref changes.
+A build after the ref writes was rejected: a refusal that depends on the
+state of the bucket, for example a commit object of the bucket that does
+not have the checksum of its name, then moves the refs on each run and
+never writes the summary. The writer reads `tombstone-commits` and
+`indexed-deltas` with the `config`, so a value that is not a boolean
+refuses the push before its first upload.
+
+The push walks no tree of a commit that the listing of the bucket holds.
+Each writer uploads a commit object after each object of its tree, so a
+commit object in the bucket has its whole tree in the bucket, and the fsck
+checks this rule. A walk of each source commit, as a push over a session
+does, was rejected: a push with no change then reads each dirtree of its
+commits and uploads nothing. The push still adds the composefs image of
+each source commit, because the local repository can make the image after
+the commit went up.
+
+The holder of a lock that `break_lock` deleted is in `BucketPushOutcome`
+and in the result of `BucketRepo::init` on success alone. A push or an
+init that breaks the lock and then fails returns its error with no holder.
+A holder in the error was rejected: it changes the error type of each
+writer for one case, and a caller can read the holder with
+`BucketRepo::lock_holder` before it breaks the lock.
+
+`PushProgress` gets the public methods `set_phase`, `add_upload`,
+`object_uploaded`, and `add_content`, so a client that uploads with no
+session counts into the handle of the caller. The progress bar of the
+`ostrya` command reads the same handle with no change. A progress type of
+its own for the bucket push was rejected for this reason.
 
 ## The client access of `ostrya serve`
 
@@ -854,9 +959,9 @@ when the port owns its set of members and expects the set to grow.
   `ostrya_remote::Error::S3Region`. The bucket client builds them, and the
   set of fields grows with the S3 support. A caller builds an `S3Endpoint`
   with `S3Endpoint::new` and sets its fields.
-- `ostrya::bucket::LockOperation`, `LockHolder`, and `ObjectListing` have
-  the attribute. The port builds them, and a later version can add an
-  operation or a field.
+- `ostrya::bucket::LockOperation`, `LockHolder`, `ObjectListing`, and
+  `BucketPushOutcome` have the attribute. The port builds them, and a later
+  version can add an operation or a field.
 - No option struct of the `ostrya` crate has the attribute: `PruneOptions`,
   `PullOptions`, `TarExportOptions`, `TarImportOptions` and the others. The
   attribute stops a struct expression outside the defining crate,

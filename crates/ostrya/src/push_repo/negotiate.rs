@@ -2,6 +2,7 @@
 //! opens, the commit walk, the two `Have` rounds, and the ref updates.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
 
 use futures_io::{AsyncRead, AsyncWrite};
 use ostrya_core::{Checksum, Commit, CommitLink, ObjectName, ObjectType};
@@ -19,12 +20,15 @@ use crate::remote::{
     SessionOptions,
 };
 use crate::repo::Repo;
+use crate::sign::Signer;
 
 /// The options of [`Repo::push`] and [`Repo::push_over_stream`].
 ///
 /// The struct is not `#[non_exhaustive]`. A caller can build it with
 /// `..Default::default()`.
-#[derive(Debug, Clone, Default)]
+///
+/// The [`Debug`] output shows the name of each summary signer.
+#[derive(Clone, Default)]
 pub struct RepoPushOptions {
     /// The refspecs, each `SRC[:DST]`, split at the last `:`.
     ///
@@ -69,6 +73,11 @@ pub struct RepoPushOptions {
     /// collection. The server writes the refs of the collection of its own
     /// collection id as its local refs, under `refs/heads/`. It writes the
     /// refs of each other collection under `refs/mirrors/ID/`.
+    ///
+    /// A push to a bucket repository takes the `config` of the bucket in the
+    /// role of the server: no collection, or the `[core] collection-id` of
+    /// the bucket, writes `refs/heads/DST`, and each other collection writes
+    /// `refs/mirrors/ID/DST`, also in a bucket with no collection id.
     pub collection: Option<String>,
     /// The tags that the push creates at the source commit.
     ///
@@ -95,11 +104,68 @@ pub struct RepoPushOptions {
     pub detached_metadata_filter: DetachedMetadataFilter,
     /// A progress handle that receives the counters of the session.
     pub progress: Option<PushProgress>,
+    /// The engines that sign the summary of a push to a bucket repository.
+    ///
+    /// Each engine signs once, in order. A bucket repository with a
+    /// `summary.sig` refuses a push with no signer. A push over ssh or HTTP
+    /// refuses a signer.
+    pub summary_signers: Vec<Arc<dyn Signer>>,
+    /// The switch that removes the writer lock of a bucket repository before
+    /// the push takes its own.
+    ///
+    /// A push over ssh or HTTP refuses `true`.
+    pub break_lock: bool,
+    /// The part size of a multipart upload to a bucket repository, for
+    /// tests. `None` takes the part size rule of the bucket client.
+    ///
+    /// The bucket client refuses a part size below 5 MiB. A push over ssh
+    /// or HTTP refuses a value.
+    #[doc(hidden)]
+    pub part_size: Option<u64>,
+}
+
+impl std::fmt::Debug for RepoPushOptions {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let signers: Vec<&str> = self
+            .summary_signers
+            .iter()
+            .map(|signer| signer.name())
+            .collect();
+        f.debug_struct("RepoPushOptions")
+            .field("refspecs", &self.refspecs)
+            .field("depth", &self.depth)
+            .field("collection", &self.collection)
+            .field("tags", &self.tags)
+            .field("compression", &self.compression)
+            .field("force", &self.force)
+            .field("detached_metadata_filter", &self.detached_metadata_filter)
+            .field("progress", &self.progress)
+            .field("summary_signers", &signers)
+            .field("break_lock", &self.break_lock)
+            .field("part_size", &self.part_size)
+            .finish()
+    }
+}
+
+/// Refuses the fields of `opts` that apply to a push to a bucket repository
+/// alone.
+fn refuse_bucket_fields(opts: &RepoPushOptions) -> Result<()> {
+    let set = [
+        ("summary signers", !opts.summary_signers.is_empty()),
+        ("break_lock", opts.break_lock),
+        ("part_size", opts.part_size.is_some()),
+    ];
+    match set.iter().find(|(_, set)| *set) {
+        Some((name, _)) => Err(invalid(format!(
+            "{name} applies to a push to an s3:// address"
+        ))),
+        None => Ok(()),
+    }
 }
 
 /// A commit of a chain, as the local repository holds it.
 #[derive(Debug, Clone, Copy)]
-enum Local {
+pub(super) enum Local {
     /// The repository holds the commit and does not mark it partial.
     Held(CommitLink),
     /// The repository marks the commit partial.
@@ -109,7 +175,7 @@ enum Local {
 }
 
 /// Returns the parts of a parsed commit that the push reads.
-fn link_of(commit: &Commit) -> CommitLink {
+pub(super) fn link_of(commit: &Commit) -> CommitLink {
     CommitLink {
         parent: commit.parent,
         root_dirtree: commit.root_dirtree,
@@ -118,26 +184,26 @@ fn link_of(commit: &Commit) -> CommitLink {
 }
 
 /// The local work of a push before the session opens.
-struct Plan {
-    repo: Repo,
+pub(super) struct Plan {
+    pub(super) repo: Repo,
     /// The repository lock, held shared until the push returns.
-    _lock: LockGuard,
+    pub(super) _lock: LockGuard,
     /// The `DST` of each target, in the order of the refspecs, then each
     /// tag: the refs of `Hello`.
-    refs: Vec<String>,
-    targets: Vec<PushTarget>,
+    pub(super) refs: Vec<String>,
+    pub(super) targets: Vec<PushTarget>,
     /// The collection id that `Hello` names.
-    collection: Option<String>,
+    pub(super) collection: Option<String>,
     /// The source commits, each once, in the order of the targets, with the
     /// `ostree.collection-binding` of each.
-    sources: Vec<(Checksum, Option<String>)>,
+    pub(super) sources: Vec<(Checksum, Option<String>)>,
     /// The history commits of each target, from the parent of its source
     /// commit on, as the walk read them. A delete has none. The negotiation
     /// drops the chains when it has the commits to offer.
-    chains: Vec<Vec<Checksum>>,
+    pub(super) chains: Vec<Vec<Checksum>>,
     /// Each commit the walk read. The negotiation drops the map after the
     /// tree walk.
-    commits: HashMap<Checksum, Local>,
+    pub(super) commits: HashMap<Checksum, Local>,
 }
 
 /// Methods that push commits to a remote.
@@ -172,15 +238,38 @@ impl Repo {
     /// need the IO driver. The time limits of the session need the time
     /// driver.
     ///
+    /// # Bucket repository
+    ///
+    /// With the `s3` feature, an `Endpoint::S3` goes to
+    /// `Repo::push_to_bucket`, which writes the bucket repository with no
+    /// session. The call gives the outcome of that push and drops the holder
+    /// of a lock that [`break_lock`](RepoPushOptions::break_lock) removed.
+    /// Each other endpoint refuses
+    /// [`summary_signers`](RepoPushOptions::summary_signers),
+    /// [`break_lock`](RepoPushOptions::break_lock), and a part size.
+    ///
     /// # Errors
     ///
+    /// - [`Error::Remote`] with
+    ///   [`InvalidInput`](crate::remote::Error::InvalidInput) if the endpoint
+    ///   is not a bucket repository and `opts` sets a summary signer,
+    ///   `break_lock`, or a part size. The push then takes no lock.
     /// - [`Error::Remote`] with the error of [`PushSession::prepare`] if the
     ///   endpoint does not apply, or if the HTTP client cannot be built.
     /// - [`Error::Remote`] with the error of
     ///   [`PreparedSession::open`](crate::remote::PreparedSession::open) if the
     ///   session does not open.
     /// - Each error of [`push_over_stream`](Repo::push_over_stream).
+    /// - For an `Endpoint::S3`, each error of `Repo::push_to_bucket`.
     pub async fn push(&self, endpoint: Endpoint, opts: RepoPushOptions) -> Result<PushOutcome> {
+        #[cfg(feature = "s3")]
+        let endpoint = match endpoint {
+            Endpoint::S3(s3) => {
+                return Ok(Box::pin(self.push_to_bucket(s3, opts)).await?.outcome);
+            }
+            other => other,
+        };
+        refuse_bucket_fields(&opts)?;
         let transport = PushSession::prepare(endpoint).await?;
         let plan = self.plan_push(&opts).await?;
         let session = transport
@@ -279,6 +368,9 @@ impl Repo {
     /// # Errors
     ///
     /// - [`Error::Remote`] with [`InvalidInput`](crate::remote::Error::InvalidInput)
+    ///   if `opts` sets a summary signer, `break_lock`, or a part size, which
+    ///   apply to a push to a bucket repository alone.
+    /// - [`Error::Remote`] with [`InvalidInput`](crate::remote::Error::InvalidInput)
     ///   if `depth` is less than `-1`, or if `collection` or the
     ///   `ostree.collection-binding` of a source commit fails
     ///   [`is_collection_id`](crate::is_collection_id) or is longer than 255
@@ -353,6 +445,7 @@ impl Repo {
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
+        refuse_bucket_fields(&opts)?;
         let plan = self.plan_push(&opts).await?;
         let session =
             PushSession::over_stream(input, output, &plan.refs, plan.session_options(&opts))
@@ -362,7 +455,7 @@ impl Repo {
 
     /// Runs the refusals and the commit walk of a push, under the repository
     /// lock held shared.
-    async fn plan_push(&self, opts: &RepoPushOptions) -> Result<Plan> {
+    pub(super) async fn plan_push(&self, opts: &RepoPushOptions) -> Result<Plan> {
         if let Some(depth) = opts.depth
             && depth < -1
         {
@@ -464,7 +557,7 @@ impl Repo {
     ///
     /// One blocking call reads the object and the partial marker, and parses
     /// the link of the commit.
-    async fn history_commit(
+    pub(super) async fn history_commit(
         &self,
         checksum: &Checksum,
         commits: &mut HashMap<Checksum, Local>,
@@ -589,7 +682,7 @@ pub(super) fn collection_id_refusal(id: &str) -> Option<String> {
 /// no binding passes here, and the check after `HelloReply` decides it.
 /// A binding that [`collection_id_refusal`] refuses is
 /// [`InvalidInput`](crate::remote::Error::InvalidInput).
-fn hello_collection(
+pub(super) fn hello_collection(
     requested: Option<&str>,
     sources: &[(Checksum, Option<String>)],
 ) -> Result<Option<String>> {
@@ -634,23 +727,43 @@ fn hello_collection(
 /// local refs of the server. Each other commit is
 /// [`BindingMismatch`](crate::remote::Error::BindingMismatch).
 fn check_namespace(server: &ServerInfo, sources: &[(Checksum, Option<String>)]) -> Result<()> {
-    let namespace = match &server.collection {
+    check_bindings(
+        server.collection.as_deref(),
+        server.binding_collection(),
+        sources,
+    )
+}
+
+/// Checks the collection binding of each source commit against the
+/// namespace that a push writes.
+///
+/// `collection` is the id of a collection namespace, or `None` for the local
+/// refs. `binding` is the id that a bound commit must name: the collection
+/// of the namespace, or the collection id of the repository for its local
+/// refs. A commit with no binding needs the local refs. Each other commit is
+/// [`BindingMismatch`](crate::remote::Error::BindingMismatch).
+pub(super) fn check_bindings(
+    collection: Option<&str>,
+    binding: Option<&str>,
+    sources: &[(Checksum, Option<String>)],
+) -> Result<()> {
+    let namespace = match collection {
         Some(id) => format!("the collection '{id}'"),
         None => "the local refs".to_owned(),
     };
-    for (checksum, binding) in sources {
-        match (binding.as_deref(), server.binding_collection()) {
+    for (checksum, bound) in sources {
+        match (bound.as_deref(), binding) {
             (Some(bound), Some(id)) if bound == id => {}
             (Some(bound), _) => {
                 return Err(binding_mismatch(format!(
-                    "commit {checksum} is bound to the collection '{bound}', and the session \
-                     writes {namespace} of the server"
+                    "commit {checksum} is bound to the collection '{bound}', and the push \
+                     writes {namespace}"
                 )));
             }
-            (None, _) if server.collection.is_some() => {
+            (None, _) if collection.is_some() => {
                 return Err(binding_mismatch(format!(
-                    "commit {checksum} has no collection binding, and the session writes \
-                     {namespace} of the server"
+                    "commit {checksum} has no collection binding, and the push writes \
+                     {namespace}"
                 )));
             }
             (None, _) => {}
@@ -737,14 +850,7 @@ impl Plan {
             let Some(source) = target.commit else {
                 continue;
             };
-            let history: &[Checksum] = match (opts.depth, server.tip(&target.dst)) {
-                (Some(_), _) => chain,
-                (None, Some(tip)) => match chain.iter().position(|c| *c == tip) {
-                    Some(at) => &chain[..at],
-                    None => &[],
-                },
-                (None, None) => &[],
-            };
+            let history = offered_history(opts.depth, server.tip(&target.dst), chain);
             for commit in std::iter::once(&source).chain(history) {
                 if offered.insert(*commit) {
                     names.push(ObjectName::new(*commit, ObjectType::Commit));
@@ -853,6 +959,27 @@ impl Plan {
             })
             .chain(tags)
             .collect())
+    }
+}
+
+/// Returns the history commits of a chain that a push offers.
+///
+/// With a `depth`, the push offers the whole `chain`. With no depth, it cuts
+/// the chain at the tip `tip` of the destination, the tip excluded. If the
+/// chain does not hold the tip, or the destination has no tip, the push
+/// offers no history commit.
+pub(super) fn offered_history(
+    depth: Option<i32>,
+    tip: Option<Checksum>,
+    chain: &[Checksum],
+) -> &[Checksum] {
+    match (depth, tip) {
+        (Some(_), _) => chain,
+        (None, Some(tip)) => match chain.iter().position(|c| *c == tip) {
+            Some(at) => &chain[..at],
+            None => &[],
+        },
+        (None, None) => &[],
     }
 }
 
@@ -989,5 +1116,80 @@ mod tests {
             &server(Some("org.example.B"), None),
             &sources(&[os]),
         ));
+    }
+
+    /// The namespace of a push to a bucket repository: the local refs take
+    /// the collection id of the bucket as their binding, and a collection
+    /// namespace takes its own id.
+    #[test]
+    fn the_bindings_must_agree_with_the_namespace_of_the_push() {
+        let a = Some("org.example.A");
+        let b = Some("org.example.B");
+        // The local refs of a bucket with no collection id.
+        check_bindings(None, None, &sources(&[None])).unwrap();
+        let message = mismatch(check_bindings(None, None, &sources(&[a])));
+        assert!(
+            message.contains("and the push writes the local refs"),
+            "{message}"
+        );
+        // The local refs of a bucket with the collection id A.
+        check_bindings(None, a, &sources(&[a, None])).unwrap();
+        mismatch(check_bindings(None, a, &sources(&[b])));
+        // The namespace of the collection B.
+        check_bindings(b, b, &sources(&[b, b])).unwrap();
+        let message = mismatch(check_bindings(b, b, &sources(&[None])));
+        assert!(message.contains("no collection binding"), "{message}");
+        assert!(
+            message.contains("the collection 'org.example.B'"),
+            "{message}"
+        );
+        mismatch(check_bindings(b, b, &sources(&[a])));
+    }
+
+    /// With no depth, the history ends before the tip of the destination.
+    #[test]
+    fn the_offered_history_ends_before_the_tip() {
+        let chain = [csum(1), csum(2), csum(3)];
+        assert_eq!(offered_history(Some(0), Some(csum(2)), &chain), chain);
+        assert_eq!(
+            offered_history(None, Some(csum(3)), &chain),
+            [csum(1), csum(2)]
+        );
+        assert_eq!(offered_history(None, Some(csum(1)), &chain), []);
+        assert!(offered_history(None, Some(csum(9)), &chain).is_empty());
+        assert!(offered_history(None, None, &chain).is_empty());
+    }
+
+    /// A field of a push to a bucket repository is refused for each other
+    /// push.
+    #[test]
+    fn the_bucket_fields_are_refused_for_a_session_push() {
+        refuse_bucket_fields(&RepoPushOptions::default()).unwrap();
+        for (opts, name) in [
+            (
+                RepoPushOptions {
+                    break_lock: true,
+                    ..RepoPushOptions::default()
+                },
+                "break_lock",
+            ),
+            (
+                RepoPushOptions {
+                    part_size: Some(5 << 20),
+                    ..RepoPushOptions::default()
+                },
+                "part_size",
+            ),
+        ] {
+            match refuse_bucket_fields(&opts) {
+                Err(Error::Remote(crate::remote::Error::InvalidInput(message))) => {
+                    assert_eq!(
+                        message,
+                        format!("{name} applies to a push to an s3:// address")
+                    );
+                }
+                other => panic!("{name}: {other:?}"),
+            }
+        }
     }
 }

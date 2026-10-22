@@ -31,6 +31,8 @@ const HOSTNAME_FILE: &str = "/proc/sys/kernel/hostname";
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
 pub enum LockOperation {
+    /// The init of a new bucket repository.
+    Init,
     /// A push.
     Push,
     /// A prune.
@@ -42,10 +44,11 @@ pub enum LockOperation {
 }
 
 impl LockOperation {
-    /// Returns the value of the key `operation`: `push`, `prune`, `summary`,
-    /// or `fsck`.
+    /// Returns the value of the key `operation`: `init`, `push`, `prune`,
+    /// `summary`, or `fsck`.
     pub fn as_str(self) -> &'static str {
         match self {
+            LockOperation::Init => "init",
             LockOperation::Push => "push",
             LockOperation::Prune => "prune",
             LockOperation::Summary => "summary",
@@ -572,6 +575,7 @@ mod tests {
     #[test]
     fn the_operations_have_their_key_values() {
         let values: Vec<&str> = [
+            LockOperation::Init,
             LockOperation::Push,
             LockOperation::Prune,
             LockOperation::Summary,
@@ -580,7 +584,7 @@ mod tests {
         .into_iter()
         .map(LockOperation::as_str)
         .collect();
-        assert_eq!(values, ["push", "prune", "summary", "fsck"]);
+        assert_eq!(values, ["init", "push", "prune", "summary", "fsck"]);
     }
 
     #[test]

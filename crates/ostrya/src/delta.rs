@@ -1023,7 +1023,7 @@ pub(crate) fn dir_child_names(dir: &OwnedFd) -> Result<Vec<String>> {
 /// Returns the source and target commit of a delta from its
 /// `deltas/<fanout>/<leaf>` directory names. The leaf holds a `-`, which
 /// base64 never holds, if and only if the delta is from a source commit.
-fn parse_delta_dir(fanout: &str, leaf: &str) -> Result<(Option<Checksum>, Checksum)> {
+pub(crate) fn parse_delta_dir(fanout: &str, leaf: &str) -> Result<(Option<Checksum>, Checksum)> {
     match leaf.split_once('-') {
         Some((from_rest, to_b64)) => Ok((
             Some(Checksum::from_base64_modified(&format!(

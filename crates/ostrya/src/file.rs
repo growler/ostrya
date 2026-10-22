@@ -421,35 +421,45 @@ impl Repo {
         checksums: &[Checksum],
         stored: bool,
     ) -> Result<u64> {
-        let mode = self.mode();
-        let dir = self.objects_fd();
         let mut total = 0u64;
         for checksum in checksums {
-            let path = loose_path(checksum, ObjectType::File, mode);
-            let statat = || {
-                rustix::fs::statat(dir, path.as_str(), AtFlags::SYMLINK_NOFOLLOW)
-                    .map_err(|e| map_object_error(e, checksum, ObjectType::File))
-            };
-            let size = match mode {
-                RepoMode::Archive if stored => statat()?.st_size.max(0) as u64,
-                RepoMode::Archive => match load_archive(dir, &path, checksum, false)?.kind {
-                    FileKind::Regular { size } => size,
-                    FileKind::Symlink { .. } => 0,
-                },
-                RepoMode::BareUser | RepoMode::BareUserShared => {
-                    bare_user_payload_size(dir, &path, checksum)?
-                }
-                RepoMode::Bare | RepoMode::BareUserOnly | RepoMode::BareSplitXattrs => {
-                    let stat = statat()?;
-                    match FileType::from_raw_mode(stat.st_mode) {
-                        FileType::Symlink => 0,
-                        _ => stat.st_size.max(0) as u64,
-                    }
-                }
-            };
-            total = total.saturating_add(size);
+            total = total.saturating_add(self.object_content_size_blocking(checksum, stored)?);
         }
         Ok(total)
+    }
+
+    /// Returns the content bytes of the file object `checksum`, as
+    /// [`content_size_blocking`](Repo::content_size_blocking) counts them.
+    #[cfg_attr(not(feature = "push"), allow(dead_code))]
+    pub(crate) fn object_content_size_blocking(
+        &self,
+        checksum: &Checksum,
+        stored: bool,
+    ) -> Result<u64> {
+        let mode = self.mode();
+        let dir = self.objects_fd();
+        let path = loose_path(checksum, ObjectType::File, mode);
+        let statat = || {
+            rustix::fs::statat(dir, path.as_str(), AtFlags::SYMLINK_NOFOLLOW)
+                .map_err(|e| map_object_error(e, checksum, ObjectType::File))
+        };
+        Ok(match mode {
+            RepoMode::Archive if stored => statat()?.st_size.max(0) as u64,
+            RepoMode::Archive => match load_archive(dir, &path, checksum, false)?.kind {
+                FileKind::Regular { size } => size,
+                FileKind::Symlink { .. } => 0,
+            },
+            RepoMode::BareUser | RepoMode::BareUserShared => {
+                bare_user_payload_size(dir, &path, checksum)?
+            }
+            RepoMode::Bare | RepoMode::BareUserOnly | RepoMode::BareSplitXattrs => {
+                let stat = statat()?;
+                match FileType::from_raw_mode(stat.st_mode) {
+                    FileType::Symlink => 0,
+                    _ => stat.st_size.max(0) as u64,
+                }
+            }
+        })
     }
 
     /// Loads a file object as [`Repo::open_file`] does, on the calling thread,

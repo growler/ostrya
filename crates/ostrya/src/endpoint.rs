@@ -7,7 +7,8 @@
 //! value of the caller wins over its remote key.
 //!
 //! With the `s3` feature, [`resolve_pull`] also gives the endpoint of a pull
-//! from an `s3://` address. It reads the AWS credentials and settings from the
+//! from an `s3://` address, and `resolve_push` the endpoint of a push to an
+//! `s3://` address. They read the AWS credentials and settings from the
 //! environment of the process and from the shared AWS files. A build without
 //! the feature refuses an `s3://` address.
 //!
@@ -26,7 +27,8 @@
 //! The trust policy of the remote keys is in the resolvers. [`resolve_pull`]
 //! maps `tls-permissive=true` to [`TrustRoots::DangerousAcceptAnyChain`], for
 //! an HTTP address and for an `s3://` address. `resolve_push` refuses
-//! `tls-permissive=true` for an `https://` address.
+//! `tls-permissive=true` for an `https://` address and for an `s3://`
+//! address.
 //! A caller that builds an [`Endpoint`] itself sets the trust policy of its
 //! own.
 
@@ -78,12 +80,14 @@ pub struct EndpointOverrides {
     pub url: Option<String>,
     /// The token file of a push. It wins over the key `push-token-file`.
     ///
-    /// [`resolve_pull`] refuses it.
+    /// [`resolve_pull`] refuses it. `resolve_push` refuses it for an
+    /// `s3://` address.
     pub push_token_file: Option<PathBuf>,
     /// The user name of a Basic credential of a push. It wins over the key
     /// `push-user`. The token is the password.
     ///
-    /// [`resolve_pull`] refuses it.
+    /// [`resolve_pull`] refuses it. `resolve_push` refuses it for an
+    /// `s3://` address.
     pub push_user: Option<String>,
     /// The PEM file of the trust anchors. It wins over the key `tls-ca-path`.
     pub tls_ca_path: Option<PathBuf>,
@@ -117,26 +121,22 @@ pub struct EndpointOverrides {
     /// The region of the signature of each request to an `s3://` address. It
     /// wins over the key `s3-region`.
     ///
-    /// [`resolve_pull`] refuses it for another address, and `resolve_push`
-    /// refuses it.
+    /// [`resolve_pull`] and `resolve_push` refuse it for another address.
     pub s3_region: Option<String>,
     /// The `http://` or `https://` URL of the S3 server of an `s3://` address.
     /// It wins over the key `s3-endpoint`.
     ///
-    /// [`resolve_pull`] refuses it for another address, and `resolve_push`
-    /// refuses it.
+    /// [`resolve_pull`] and `resolve_push` refuse it for another address.
     pub s3_endpoint: Option<String>,
     /// The addressing style of the bucket of an `s3://` address: `path` or
     /// `virtual`. It wins over the key `s3-addressing`.
     ///
-    /// [`resolve_pull`] refuses it for another address, and `resolve_push`
-    /// refuses it.
+    /// [`resolve_pull`] and `resolve_push` refuse it for another address.
     pub s3_addressing: Option<String>,
     /// The profile of the shared AWS files for an `s3://` address. It wins
     /// over the key `s3-profile`.
     ///
-    /// [`resolve_pull`] refuses it for another address, and `resolve_push`
-    /// refuses it.
+    /// [`resolve_pull`] and `resolve_push` refuse it for another address.
     pub s3_profile: Option<String>,
 }
 
@@ -591,11 +591,9 @@ async fn pull_s3(
     remote: &str,
     section: Option<&Remote<'_>>,
     address: &str,
-    mut o: EndpointOverrides,
+    o: EndpointOverrides,
     env: &S3Environment,
 ) -> Result<Endpoint> {
-    use remote::s3::{Addressing, S3Endpoint, Settings};
-
     // Each name is the remote key of the field.
     let ssh_fields = [
         ("ssh-command", o.ssh_command.is_some()),
@@ -606,13 +604,47 @@ async fn pull_s3(
             "{name} applies to a pull over ssh, and this pull reads an s3:// address"
         )));
     }
+    let refusals = S3Refusals {
+        invalid: Error::InvalidInput,
+        remote: Error::Pull,
+    };
+    s3_endpoint(remote, section, address, o, env, refusals).await
+}
+
+/// The errors of the refusals of [`s3_endpoint`].
+#[cfg(feature = "s3")]
+struct S3Refusals {
+    /// The error of a value that the caller or a key gives.
+    invalid: fn(String) -> Error,
+    /// The error of a remote whose keys do not go together.
+    remote: fn(String) -> Error,
+}
+
+/// Completes the S3 endpoint of the `s3://` address `address` of `remote`,
+/// from the S3 fields and the HTTP fields of `o`, the keys of `section`, and
+/// `env`.
+///
+/// The call reads no ssh field of `o`. It refuses an addressing style other
+/// than `path` and `virtual`, and an `http://` endpoint with no
+/// `allow_cleartext_credentials`.
+#[cfg(feature = "s3")]
+async fn s3_endpoint(
+    remote: &str,
+    section: Option<&Remote<'_>>,
+    address: &str,
+    mut o: EndpointOverrides,
+    env: &S3Environment,
+    refusals: S3Refusals,
+) -> Result<Endpoint> {
+    use remote::s3::{Addressing, S3Endpoint, Settings};
+
     let region = or_key(o.s3_region.take(), section, |s| s.s3_region())?;
     let endpoint = or_key(o.s3_endpoint.take(), section, |s| s.s3_endpoint())?;
     let addressing = or_key(o.s3_addressing.take(), section, |s| s.s3_addressing())?;
     let profile = or_key(o.s3_profile.take(), section, |s| s.s3_profile())?;
     let addressing = match addressing {
         Some(name) => Some(Addressing::from_name(&name).ok_or_else(|| {
-            Error::InvalidInput(format!(
+            (refusals.invalid)(format!(
                 "s3-addressing '{name}' is neither path nor virtual"
             ))
         })?),
@@ -624,11 +656,14 @@ async fn pull_s3(
         addressing,
         profile,
     };
-    let http = PullHttp::read(remote, section, o)?;
+    let http = PullHttp::read(remote, section, o).map_err(|e| match e {
+        Error::Pull(msg) => (refusals.remote)(msg),
+        other => other,
+    })?;
     let mut endpoint = S3Endpoint::resolve(address, &settings, env)
         .await
         .map_err(|e| match e {
-            remote::Error::InvalidInput(msg) => Error::InvalidInput(msg),
+            remote::Error::InvalidInput(msg) => (refusals.invalid)(msg),
             remote::Error::Io(e) => Error::Io(e),
             other => Error::Remote(other),
         })?;
@@ -637,7 +672,7 @@ async fn pull_s3(
         .get(..7)
         .is_some_and(|scheme| scheme.eq_ignore_ascii_case("http://"));
     if cleartext && !http.allow_cleartext_credentials {
-        return Err(Error::InvalidInput(format!(
+        return Err((refusals.invalid)(format!(
             "the S3 endpoint '{url}' is http://, so the signature of each request would \
              travel in cleartext: use https, or set allow-cleartext-credentials"
         )));
@@ -777,12 +812,19 @@ impl PullHttp {
 /// # Address
 ///
 /// A value with a `:` or a `/` is an address, by the rule of
-/// [`is_push_address`](crate::is_push_address). [`Endpoint::parse`] reads
-/// it, and the function reads no configuration. Each other value is the name
-/// of a remote section of `config`. The address of the section is its key
-/// `push-url`. If `push-url` is absent, a key `url` that starts with
-/// `http://` or `https://` is the address. The function reads `url` only if
-/// `push-url` is absent.
+/// [`is_push_address`](crate::is_push_address). An address that starts with
+/// `s3://` is the address of a bucket repository. [`Endpoint::parse`] reads
+/// each other address. The function reads no configuration for an address.
+/// Each other value is the name of a remote section of `config`. The address
+/// of the section is its key `push-url`. If `push-url` is absent, a key `url`
+/// that starts with `http://` or `https://` is the address. The function
+/// reads `url` only if `push-url` is absent. The key `url` cannot hold an
+/// `s3://` address, because the `ostree` command also reads it.
+///
+/// The S3 keys are `s3-region`, `s3-endpoint`, `s3-addressing`, and
+/// `s3-profile`. For a remote name, the function refuses a section that sets
+/// one of them if neither `pull-url` nor `push-url` of the section holds an
+/// `s3://` address.
 ///
 /// # HTTP address
 ///
@@ -822,21 +864,45 @@ impl PullHttp {
 /// `receive-command`, gives [`SshOptions::remote_command`]. The function does
 /// not read the HTTP keys of the section.
 ///
+/// # S3 address
+///
+/// The address `s3://BUCKET[/PREFIX]` names a bucket repository. A build
+/// with the `s3` feature gives `Endpoint::S3` with the values that
+/// [`resolve_pull`] gives for the same address: the region, the endpoint,
+/// the addressing style, and the profile of the fields and the keys, the
+/// settings and the key pair of the environment and of the shared AWS
+/// files, and the HTTP options of the TLS keys, the key `proxy`, and the
+/// HTTP fields. The push takes the retry count, the number of requests in
+/// flight, and the low-speed rule of a pull. [`Repo::push`](crate::Repo::push)
+/// writes the bucket repository through the bucket client of the endpoint.
+///
+/// The signer gives the credential of each request, so the function refuses
+/// the fields and the keys `push-token-file` and `push-user`. It ignores the
+/// keys `ssh-command`, `send-command`, and `receive-command`.
+///
 /// # Errors
 ///
 /// The function makes each refusal that needs no file before it reads a file.
 /// Each refusal of the list is [`Error::Remote`] with
 /// [`InvalidInput`](crate::remote::Error::InvalidInput):
 ///
-/// - The caller sets `url`, `s3_region`, `s3_endpoint`, `s3_addressing`, or
-///   `s3_profile`.
+/// - The caller sets `url`.
 /// - `config` holds no section for the name, or the section has no push
 ///   address. The message shows a `url` that is no push address without the
-///   text up to its last `@`.
-/// - The address is `https://`, and the section sets `tls-permissive=true`,
-///   because a push verifies the certificate chain of the server.
-/// - The address is HTTP, and the caller sets `ssh_command` or
+///   text up to its last `@`. A `url` that holds an `s3://` address is no
+///   push address.
+/// - The section sets an S3 key, and neither `pull-url` nor `push-url` holds
+///   an `s3://` address. The message names the key.
+/// - The address is HTTP or ssh, and the caller sets `s3_region`,
+///   `s3_endpoint`, `s3_addressing`, or `s3_profile`. The message names the
+///   first such field by its key.
+/// - The address is `https://` or `s3://`, and the section sets
+///   `tls-permissive=true`, because a push verifies the certificate chain of
+///   the server.
+/// - The address is HTTP or `s3://`, and the caller sets `ssh_command` or
 ///   `remote_command`.
+/// - The address is `s3://`, and the caller or the section sets
+///   `push-token-file` or `push-user`.
 /// - A client certificate has no key, or a key has no certificate.
 /// - A `push_user` has no token file, or is empty, or holds `:`.
 /// - The address is `http://`, the push has a token file, and the caller
@@ -846,6 +912,15 @@ impl PullHttp {
 /// - The address is ssh, and the caller sets a field of an HTTP address. The
 ///   message names the first such field and shows the address without its
 ///   user.
+/// - The address is `s3://`, and its addressing style is neither `path` nor
+///   `virtual`.
+/// - The address is `s3://`, the endpoint is `http://`, and the caller does
+///   not set `allow_cleartext_credentials`. The signature of each request
+///   would go to the server in cleartext. The check comes after the read of
+///   the shared AWS files, because the endpoint can come from them.
+/// - For an `s3://` address, a refusal of `S3Endpoint::resolve` of
+///   `ostrya_remote::s3`: a refused address, a refused setting, or no key
+///   pair.
 ///
 /// These errors are also possible:
 ///
@@ -853,6 +928,10 @@ impl PullHttp {
 ///   does not parse.
 /// - [`Error::Unsupported`] if the key `proxy` has white space at its start
 ///   or its end.
+/// - [`Error::Unsupported`] for an `s3://` address in a build without the
+///   `s3` feature. The message names the feature.
+/// - [`Error::Io`] for an `s3://` address if a shared AWS file exists and
+///   cannot be read.
 /// - The errors of [`read_token_file`] and [`read_pem_file`].
 /// - [`Error::Core`] if a key that the function reads holds a malformed
 ///   escape sequence, or if `tls-permissive` is not a boolean.
@@ -862,47 +941,155 @@ pub async fn resolve_push(
     remote_or_address: &str,
     overrides: EndpointOverrides,
 ) -> Result<Endpoint> {
+    resolve_push_in(
+        config,
+        remote_or_address,
+        overrides,
+        &S3Environment::default(),
+    )
+    .await
+}
+
+/// Resolves `remote_or_address` to the endpoint of a push, as
+/// [`resolve_push`] does, with `env` as the environment of an `s3://`
+/// address.
+#[cfg(feature = "push")]
+#[cfg_attr(not(feature = "s3"), allow(unused_variables))]
+pub(crate) async fn resolve_push_in(
+    config: Option<&RepoConfig>,
+    remote_or_address: &str,
+    overrides: EndpointOverrides,
+    env: &S3Environment,
+) -> Result<Endpoint> {
     let remote = remote_or_address;
     if overrides.url.is_some() {
         return Err(push_invalid("url applies to a pull, and this is a push"));
     }
-    if let Some(name) = s3_field(&overrides) {
-        return Err(push_invalid(format!(
-            "{name} applies to a pull from an s3:// address, and this is a push"
+    let (section, address) = if crate::is_push_address(remote) {
+        (None, remote.to_owned())
+    } else {
+        let section = config
+            .and_then(|config| config.remote(remote))
+            .ok_or_else(|| push_invalid(format!("no remote '{remote}' is configured")))?;
+        check_s3_keys(remote, Some(&section)).map_err(|e| match e {
+            Error::Pull(msg) => push_invalid(msg),
+            other => other,
+        })?;
+        let address = match section.push_url()? {
+            Some(push_url) => push_url,
+            None => match section.url()? {
+                Some(url) if url.starts_with("http://") || url.starts_with("https://") => url,
+                Some(url) if is_s3(&url) => {
+                    return Err(push_invalid(format!(
+                        "remote '{remote}' has no push-url, and its url '{}' is an s3:// \
+                         address; the port reads an s3:// address from push-url alone",
+                        remote::without_userinfo(&url)
+                    )));
+                }
+                Some(url) => {
+                    return Err(push_invalid(format!(
+                        "remote '{remote}' has no push-url, and its url '{}' is no push address",
+                        remote::without_userinfo(&url)
+                    )));
+                }
+                None => {
+                    return Err(push_invalid(format!(
+                        "remote '{remote}' has no push-url and no url"
+                    )));
+                }
+            },
+        };
+        (Some(section), address)
+    };
+    if is_s3(&address) {
+        // The name of an address in a message is the address without its
+        // userinfo, which can hold a key pair.
+        #[cfg(feature = "s3")]
+        let name = match section {
+            Some(_) => std::borrow::Cow::Borrowed(remote),
+            None => remote::without_userinfo(remote),
+        };
+        #[cfg(feature = "s3")]
+        return Box::pin(push_s3(&name, section.as_ref(), &address, overrides, env)).await;
+        #[cfg(not(feature = "s3"))]
+        return Err(Error::Unsupported(format!(
+            "the push address '{}' is an s3:// address, and this build of ostrya has no S3 \
+             support: turn on the feature s3 of ostrya",
+            remote::without_userinfo(&address)
         )));
     }
-    if crate::is_push_address(remote) {
-        return match Endpoint::parse(remote)? {
-            Endpoint::Http(http) => push_http(remote, None, remote, http, overrides).await,
-            Endpoint::Ssh { address, .. } => push_ssh(None, address, overrides),
-            _ => Err(neither_ssh_nor_http("a push")),
-        };
-    }
-    let section = config
-        .and_then(|config| config.remote(remote))
-        .ok_or_else(|| push_invalid(format!("no remote '{remote}' is configured")))?;
-    let address = match section.push_url()? {
-        Some(push_url) => push_url,
-        None => match section.url()? {
-            Some(url) if url.starts_with("http://") || url.starts_with("https://") => url,
-            Some(url) => {
-                return Err(push_invalid(format!(
-                    "remote '{remote}' has no push-url, and its url '{}' is no push address",
-                    remote::without_userinfo(&url)
-                )));
-            }
-            None => {
-                return Err(push_invalid(format!(
-                    "remote '{remote}' has no push-url and no url"
-                )));
-            }
-        },
-    };
     match Endpoint::parse(&address)? {
-        Endpoint::Http(http) => push_http(remote, Some(&section), &address, http, overrides).await,
-        Endpoint::Ssh { address, .. } => push_ssh(Some(&section), address, overrides),
+        Endpoint::Http(http) => {
+            if let Some(name) = s3_field(&overrides) {
+                return Err(push_invalid(format!(
+                    "{name} applies to an s3:// address, and '{}' is an HTTP address",
+                    remote::without_userinfo(&address)
+                )));
+            }
+            push_http(remote, section.as_ref(), &address, http, overrides).await
+        }
+        Endpoint::Ssh { address, .. } => {
+            if let Some(name) = s3_field(&overrides) {
+                return Err(push_invalid(format!(
+                    "{name} applies to an s3:// address, and '{}' is an ssh address",
+                    address.without_user()
+                )));
+            }
+            push_ssh(section.as_ref(), address, overrides)
+        }
         _ => Err(neither_ssh_nor_http("a push")),
     }
+}
+
+/// Completes the endpoint of a push of `remote` to the `s3://` address
+/// `address`, from `o`, the keys of `section`, and `env`.
+#[cfg(all(feature = "push", feature = "s3"))]
+async fn push_s3(
+    remote: &str,
+    section: Option<&Remote<'_>>,
+    address: &str,
+    o: EndpointOverrides,
+    env: &S3Environment,
+) -> Result<Endpoint> {
+    let shown = remote::without_userinfo(address);
+    let (token_key, user_key) = match section {
+        Some(section) => (
+            section.push_token_file()?.is_some(),
+            section.push_user()?.is_some(),
+        ),
+        None => (false, false),
+    };
+    let http_fields = [
+        ("push-token-file", o.push_token_file.is_some() || token_key),
+        ("push-user", o.push_user.is_some() || user_key),
+    ];
+    if let Some((name, _)) = http_fields.iter().find(|(_, set)| *set) {
+        return Err(push_invalid(format!(
+            "{name} applies to an HTTP address, and '{shown}' is an s3:// address"
+        )));
+    }
+    let ssh_fields = [
+        ("ssh-command", o.ssh_command.is_some()),
+        ("receive-command", o.remote_command.is_some()),
+    ];
+    if let Some((name, _)) = ssh_fields.iter().find(|(_, set)| *set) {
+        return Err(push_invalid(format!(
+            "{name} applies to an ssh address, and '{shown}' is an s3:// address"
+        )));
+    }
+    if let Some(section) = section
+        && section.tls_permissive()?
+    {
+        return Err(push_invalid(format!(
+            "remote '{remote}' sets tls-permissive=true, which a push refuses: a \
+             push verifies the certificate chain of the server"
+        )));
+    }
+    let refusals = S3Refusals {
+        invalid: |msg| push_invalid(msg),
+        remote: |msg| push_invalid(msg),
+    };
+    s3_endpoint(remote, section, address, o, env, refusals).await
 }
 
 /// Completes `http`, the options of an HTTP push to `address`, from `o` and
@@ -2858,18 +3045,77 @@ mod tests {
             ssh(push(None, "h:x", o));
         }
 
-        /// The push refuses each S3 field, for a remote name and for an
-        /// address.
+        /// The push refuses each S3 field for an HTTP address and for an
+        /// ssh address, for a remote name and for an address.
         #[test]
-        fn the_push_refuses_the_s3_fields() {
+        fn the_push_refuses_the_s3_fields_for_another_address() {
             for (name, o) in s3_fields() {
-                for remote in ["https", "ssh://h/r"] {
+                for (remote, shown) in [
+                    ("https", "'https://ex.com/repo' is an HTTP address"),
+                    ("https://ex.com/r", "'https://ex.com/r' is an HTTP address"),
+                    ("ssh://u-QXZ@h/r", "'ssh://h/r' is an ssh address"),
+                ] {
                     assert_eq!(
                         refused(push(Some(&config(CONFIG)), remote, o.clone())),
-                        format!(
-                            "{name} applies to a pull from an s3:// address, and this is a push"
-                        )
+                        format!("{name} applies to an s3:// address, and {shown}")
                     );
+                }
+            }
+        }
+
+        /// A `url` with an `s3://` address is no push address, and the
+        /// message names the `s3://` form with no userinfo.
+        #[test]
+        fn an_s3_address_in_url_is_no_push_address() {
+            let config = config(S3_SECTIONS);
+            for name in ["s3-url", "s3-url-user"] {
+                assert_eq!(
+                    refused(push(Some(&config), name, EndpointOverrides::default())),
+                    format!(
+                        "remote '{name}' has no push-url, and its url 's3://bkt/repo' is an \
+                         s3:// address; the port reads an s3:// address from push-url alone"
+                    )
+                );
+            }
+        }
+
+        /// An S3 key in a remote with no `s3://` address is refused for a
+        /// push too.
+        #[test]
+        fn an_s3_key_with_no_s3_address_is_refused_by_the_push() {
+            let config = config(S3_SECTIONS);
+            assert_eq!(
+                refused(push(
+                    Some(&config),
+                    "stray-key",
+                    EndpointOverrides::default()
+                )),
+                "remote 'stray-key': s3-profile applies to an s3:// address, and neither \
+                 pull-url nor push-url holds one"
+            );
+        }
+
+        /// A build without the `s3` feature refuses an `s3://` push address,
+        /// and the message names the feature and shows no userinfo.
+        #[cfg(not(feature = "s3"))]
+        #[test]
+        fn a_build_without_s3_refuses_an_s3_push_address() {
+            let config = config(S3_SECTIONS);
+            for result in [
+                push(Some(&config), "push", EndpointOverrides::default()),
+                push(
+                    None,
+                    "s3://AKID-QXZ:s@bkt/repo",
+                    EndpointOverrides::default(),
+                ),
+            ] {
+                match result {
+                    Err(Error::Unsupported(msg)) => {
+                        assert!(msg.contains("the feature s3 of ostrya"), "{msg}");
+                        assert!(msg.contains("'s3://bkt/repo'"), "{msg}");
+                        assert!(!msg.contains("QXZ"), "{msg}");
+                    }
+                    other => panic!("{other:?}"),
                 }
             }
         }
@@ -3413,6 +3659,190 @@ mod tests {
                 ..EndpointOverrides::default()
             };
             assert!(matches!(pull_in(None, "r", o, &env), Err(Error::Io(_))));
+        }
+
+        #[cfg(feature = "push")]
+        fn push_in(
+            config: Option<&RepoConfig>,
+            remote: &str,
+            o: EndpointOverrides,
+            env: &Environment,
+        ) -> Result<Endpoint> {
+            ostrya_rt::block_on(resolve_push_in(config, remote, o, env))
+        }
+
+        #[cfg(feature = "push")]
+        fn push_refused<T: fmt::Debug>(result: Result<T>) -> String {
+            match result {
+                Err(Error::Remote(remote::Error::InvalidInput(msg))) => msg,
+                other => panic!("expected InvalidInput, got {other:?}"),
+            }
+        }
+
+        /// An `s3://` address and an `s3://` `push-url` give an S3 endpoint
+        /// with the keys of the remote.
+        #[cfg(feature = "push")]
+        #[test]
+        fn an_s3_push_address_gives_an_s3_endpoint() {
+            let dir = Dir::new();
+            let config = config(S3_SECTIONS);
+            let s3 = s3_of(push_in(
+                Some(&config),
+                "push",
+                EndpointOverrides::default(),
+                &env(&dir, &[]),
+            ));
+            assert_eq!(
+                s3.location.repository_url(),
+                "https://bkt.s3.eu-west-1.amazonaws.com/repo"
+            );
+            assert_eq!(s3.credentials.access_key_id(), "AKIDEXAMPLE");
+            assert_eq!(s3.http.max_retries, 5);
+            assert_eq!(s3.http.max_outstanding, 8);
+            let o = EndpointOverrides {
+                s3_endpoint: Some("http://127.0.0.1:9000".into()),
+                allow_cleartext_credentials: true,
+                ..EndpointOverrides::default()
+            };
+            let s3 = s3_of(push_in(None, "s3://bkt/x", o, &env(&dir, &[])));
+            assert_eq!(s3.location.repository_url(), "http://127.0.0.1:9000/bkt/x");
+            assert!(s3.http.allow_cleartext_credentials);
+        }
+
+        /// A push to an `s3://` address refuses the token file and the user
+        /// of an HTTP push, as fields and as keys, and the ssh fields.
+        #[cfg(feature = "push")]
+        #[test]
+        fn an_s3_push_refuses_the_fields_of_another_transport() {
+            let dir = Dir::new();
+            let d = EndpointOverrides::default;
+            for (name, o) in [
+                (
+                    "push-token-file",
+                    EndpointOverrides {
+                        push_token_file: Some("/t".into()),
+                        ..d()
+                    },
+                ),
+                (
+                    "push-user",
+                    EndpointOverrides {
+                        push_user: Some("u".into()),
+                        ..d()
+                    },
+                ),
+            ] {
+                assert_eq!(
+                    push_refused(push_in(None, "s3://u-QXZ@bkt/r", o, &env(&dir, &[]))),
+                    format!(
+                        "{name} applies to an HTTP address, and 's3://bkt/r' is an s3:// \
+                         address"
+                    )
+                );
+            }
+            for (key, name) in [
+                ("push-token-file=/t", "push-token-file"),
+                ("push-user=u", "push-user"),
+            ] {
+                let config = config(&format!("[remote \"r\"]\npush-url=s3://bkt/r\n{key}\n"));
+                assert_eq!(
+                    push_refused(push_in(Some(&config), "r", d(), &env(&dir, &[]))),
+                    format!(
+                        "{name} applies to an HTTP address, and 's3://bkt/r' is an s3:// \
+                         address"
+                    )
+                );
+            }
+            for (name, o) in [
+                (
+                    "ssh-command",
+                    EndpointOverrides {
+                        ssh_command: Some(vec!["ssh".into()]),
+                        ..d()
+                    },
+                ),
+                (
+                    "receive-command",
+                    EndpointOverrides {
+                        remote_command: Some("ostrya receive".into()),
+                        ..d()
+                    },
+                ),
+            ] {
+                assert_eq!(
+                    push_refused(push_in(None, "s3://bkt/r", o, &env(&dir, &[]))),
+                    format!(
+                        "{name} applies to an ssh address, and 's3://bkt/r' is an s3:// address"
+                    )
+                );
+            }
+            // The ssh keys of the section do not apply, and pass.
+            let config = config(
+                "[remote \"r\"]\npush-url=s3://bkt/r\nssh-command=ssh\n\
+                 receive-command=x\nsend-command=y\n",
+            );
+            s3_of(push_in(Some(&config), "r", d(), &env(&dir, &[])));
+        }
+
+        /// A push refuses `tls-permissive=true` for an `s3://` address, and
+        /// an `http://` endpoint with no cleartext permission.
+        #[cfg(feature = "push")]
+        #[test]
+        fn an_s3_push_verifies_the_chain_and_refuses_cleartext() {
+            let dir = Dir::new();
+            let config =
+                config("[remote \"permissive\"]\npush-url=s3://bkt/repo\ntls-permissive=true\n");
+            assert_eq!(
+                push_refused(push_in(
+                    Some(&config),
+                    "permissive",
+                    EndpointOverrides::default(),
+                    &env(&dir, &[])
+                )),
+                "remote 'permissive' sets tls-permissive=true, which a push refuses: a push \
+                 verifies the certificate chain of the server"
+            );
+            let env = env(&dir, &[("AWS_ENDPOINT_URL", "http://127.0.0.1:9000")]);
+            assert!(
+                push_refused(push_in(
+                    None,
+                    "s3://bkt/r",
+                    EndpointOverrides::default(),
+                    &env
+                ))
+                .contains("is http://, so the signature of each request would travel")
+            );
+            let o = EndpointOverrides {
+                url: None,
+                tls_client_cert_path: Some("/c".into()),
+                ..EndpointOverrides::default()
+            };
+            assert_eq!(
+                push_refused(push_in(None, "s3://bkt/r", o, &env)),
+                "remote 's3://bkt/r': a client certificate needs both tls-client-cert-path \
+                 and tls-client-key-path"
+            );
+        }
+
+        /// A refusal of an `s3://` push address names the address without
+        /// its userinfo.
+        #[test]
+        fn a_refusal_of_an_s3_push_address_shows_no_userinfo() {
+            let dir = Dir::new();
+            let env = env(&dir, &[("AWS_ENDPOINT_URL", "http://127.0.0.1:9000")]);
+            let o = EndpointOverrides {
+                url: None,
+                tls_client_cert_path: Some("/c".into()),
+                ..EndpointOverrides::default()
+            };
+            let message = push_refused(push_in(None, "s3://AKID:SECRET@bkt/r", o, &env));
+            assert!(!message.contains("AKID"), "{message}");
+            assert!(!message.contains("SECRET"), "{message}");
+            assert_eq!(
+                message,
+                "remote 's3://bkt/r': a client certificate needs both tls-client-cert-path \
+                 and tls-client-key-path"
+            );
         }
 
         /// The `Debug` output of the S3 endpoint shows no secret.

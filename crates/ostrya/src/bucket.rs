@@ -3,8 +3,32 @@
 //! A [`BucketRepo`] holds the [`Bucket`] client of one bucket repository.
 //! Each file of the repository is one object of the bucket, under the prefix
 //! of the address `s3://BUCKET[/PREFIX]`. A pull reads a bucket repository
-//! through [`Repo::pull`](crate::Repo::pull). A `BucketRepo` adds the writer
-//! lock and the listing of the objects.
+//! through [`Repo::pull`](crate::Repo::pull). A `BucketRepo` adds the init,
+//! the writer lock, and the listing of the objects. With the `push` feature,
+//! `Repo::push_to_bucket` writes commits to a bucket repository.
+//!
+//! # Init
+//!
+//! [`BucketRepo::init`] writes the `config` of a new bucket repository under
+//! the writer lock, with `If-None-Match: *`. The `config` holds the group
+//! `[core]` with `repo_version=1` and `mode=archive-z2`, and
+//! `collection-id=ID` when the caller gives an id. A bucket repository with
+//! a collection id is the primary server of that collection. The init
+//! refuses a bucket that holds a `config`, so the collection id of a bucket
+//! repository never changes. A push needs the `config`.
+//!
+//! # The push
+//!
+//! A push writes the objects of its commits, builds and signs the summary,
+//! and then writes the ref files, the `summary`, and the `summary.sig`,
+//! under the writer lock. A commit object goes up only after each object of
+//! its tree, so a commit object in the bucket has its whole tree in the
+//! bucket, also after a push that failed. For this reason, a push walks no
+//! tree of a commit that the bucket holds. The refs of the collection id of
+//! the bucket, or of a push with no collection, are under `refs/heads/`. The
+//! refs of each other collection are under `refs/mirrors/ID/`.
+//! `Repo::push_to_bucket` states the steps, the namespaces, and the failure
+//! states.
 //!
 //! # The writer lock
 //!
@@ -80,14 +104,43 @@
 //! ```
 
 use crate::error::Result;
-use crate::remote::s3::{Address, Bucket, S3Endpoint};
+use crate::remote::PushOutcome;
+use crate::remote::s3::{Address, Bucket, PutIfAbsent, S3Endpoint};
 
 mod listing;
 mod lock;
+mod state;
+mod summary;
 
 pub use listing::ObjectListing;
 pub use lock::{LockHolder, LockOperation, WriterLock};
 pub(crate) use lock::{describe_locked, describe_lost};
+#[cfg(test)]
+pub(crate) use state::summary_refs;
+#[cfg_attr(not(feature = "push"), allow(unused_imports))]
+pub(crate) use state::{BucketRefs, check_prefixes};
+#[cfg_attr(not(feature = "push"), allow(unused_imports))]
+pub(crate) use summary::{SignedSummary, SummaryInput};
+
+/// The result of `Repo::push_to_bucket`, the push to a bucket repository.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct BucketPushOutcome {
+    /// The ref outcomes and the statistics of the push.
+    ///
+    /// Each ref outcome names the destination of its refspec. The namespace
+    /// of the push decides its key: `refs/heads/DST` or
+    /// `refs/mirrors/ID/DST`. The commit is `None`.
+    pub outcome: PushOutcome,
+    /// The holder of the lock that the break of the lock deleted, or `None`
+    /// if the push deleted no lock.
+    ///
+    /// The holder is reported on success alone. A push that breaks the lock
+    /// and then fails returns its error, and the holder of the deleted lock
+    /// is not in it. [`BucketRepo::lock_holder`] reads the holder before the
+    /// push.
+    pub broken_lock: Option<LockHolder>,
+}
 
 /// A bucket repository: a repository in `archive` form in an S3 bucket.
 ///
@@ -202,6 +255,83 @@ impl BucketRepo {
         self.read_holder().await
     }
 
+    /// Writes the `config` of a new bucket repository.
+    ///
+    /// The call takes the writer lock for [`LockOperation::Init`], writes
+    /// `config` with `If-None-Match: *`, and releases the lock. The `config`
+    /// holds the group `[core]` with `repo_version=1` and `mode=archive-z2`,
+    /// each on one line, and `collection-id=ID` after them when
+    /// `collection_id` is `Some`. The bucket repository is then the primary
+    /// server of that collection. The init writes no summary and no ref.
+    ///
+    /// With `break_lock`, the call removes the writer lock of another writer
+    /// first, as [`lock`](BucketRepo::lock) states. It returns the holder of
+    /// the deleted lock, or `None` if it deleted no lock. The holder is
+    /// reported on success alone: an init that breaks the lock and then
+    /// fails returns its error, and the holder of the deleted lock is not in
+    /// it. [`lock_holder`](BucketRepo::lock_holder) reads the holder before
+    /// the init.
+    ///
+    /// A failure before the write of `config` changes nothing but the lock,
+    /// and the call releases the lock. A failure after the write leaves the
+    /// `config`, and the bucket repository is ready for a push. A crash
+    /// leaves the lock, as for each writer.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidInput`](crate::Error::InvalidInput) if
+    ///   `collection_id` fails [`is_collection_id`](crate::is_collection_id)
+    ///   or is longer than 255 bytes. The call then sends no request.
+    /// - [`Error::InvalidInput`](crate::Error::InvalidInput) if the bucket
+    ///   holds a `config`. The call leaves it unchanged, so the collection id
+    ///   of a bucket repository never changes.
+    /// - The errors of [`lock`](BucketRepo::lock) and of
+    ///   [`WriterLock::release`].
+    /// - [`Error::Remote`](crate::Error::Remote) for an error of the bucket
+    ///   client. The call releases the lock first, and drops an error of that
+    ///   release.
+    pub async fn init(
+        &self,
+        collection_id: Option<&str>,
+        break_lock: bool,
+    ) -> Result<Option<LockHolder>> {
+        if let Some(id) = collection_id
+            && !state::is_namespace_id(id)
+        {
+            return Err(crate::Error::InvalidInput(format!(
+                "the collection id '{}' of a bucket repository fails the collection id rule or \
+                 is longer than 255 bytes",
+                id.escape_debug()
+            )));
+        }
+        let lock = self.lock(LockOperation::Init, break_lock).await?;
+        let broken = lock.broken().cloned();
+        let present = match self
+            .bucket
+            .put_if_absent("config", config_bytes(collection_id))
+            .await
+        {
+            Ok(PutIfAbsent::Created { .. })
+            | Ok(PutIfAbsent::Matches { .. })
+            | Ok(PutIfAbsent::Refused { .. }) => false,
+            Ok(_) => true,
+            Err(e) => {
+                let _ = lock.release().await;
+                return Err(e.into());
+            }
+        };
+        if present {
+            let _ = lock.release().await;
+            return Err(crate::Error::InvalidInput(format!(
+                "the bucket repository {} holds a config already; its collection id never \
+                 changes",
+                self.address()
+            )));
+        }
+        lock.release().await?;
+        Ok(broken)
+    }
+
     /// Lists the objects of the repository.
     ///
     /// The call sends one list of each fan-out prefix `objects/XX/`. At
@@ -217,6 +347,28 @@ impl BucketRepo {
     pub async fn list_objects(&self) -> Result<ObjectListing> {
         self.list_fanouts().await
     }
+
+    /// Returns the bound of the requests in flight.
+    #[cfg_attr(not(feature = "push"), allow(dead_code))]
+    pub(crate) fn max_outstanding(&self) -> usize {
+        self.max_outstanding
+    }
+}
+
+/// Returns the bytes of the `config` of a new bucket repository, with the
+/// collection id `collection_id`.
+fn config_bytes(collection_id: Option<&str>) -> Vec<u8> {
+    let mut text = String::from("[core]\nrepo_version=1\nmode=archive-z2\n");
+    if let Some(id) = collection_id {
+        text.push_str(&format!("collection-id={id}\n"));
+    }
+    text.into_bytes()
+}
+
+/// Returns the error of a request of the caller that the bucket repository
+/// refuses.
+pub(crate) fn invalid(msg: impl Into<String>) -> crate::Error {
+    crate::Error::Remote(crate::remote::Error::InvalidInput(msg.into()))
 }
 
 const _: fn() = || {
@@ -226,4 +378,28 @@ const _: fn() = || {
     assert_send_sync::<LockHolder>();
     assert_send_sync::<LockOperation>();
     assert_send_sync::<ObjectListing>();
+    assert_send_sync::<BucketPushOutcome>();
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_config_of_a_new_bucket_repository_has_three_or_four_lines() {
+        assert_eq!(
+            config_bytes(None),
+            b"[core]\nrepo_version=1\nmode=archive-z2\n"
+        );
+        assert_eq!(
+            config_bytes(Some("org.example.Os")),
+            b"[core]\nrepo_version=1\nmode=archive-z2\ncollection-id=org.example.Os\n"
+        );
+        let config = crate::config::RepoConfig::parse(
+            std::str::from_utf8(&config_bytes(Some("org.example.Os"))).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(config.mode(), ostrya_core::RepoMode::Archive);
+        assert_eq!(config.collection_id(), Some("org.example.Os"));
+    }
+}

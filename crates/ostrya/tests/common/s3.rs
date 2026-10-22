@@ -10,7 +10,8 @@
 //!   scratch directory, with one bucket and the same key pair.
 //! - [`StandIn`] is an S3 server in the process that holds its objects in
 //!   memory. A test sets the conditional headers that it honors, the
-//!   requests that it interrupts, and the requests that get 503.
+//!   requests that it interrupts, refuses, or delays, and the requests that
+//!   get 503.
 //!
 //! A test skips when `rclone` or `weed` is not on `PATH`, and writes the
 //! reason to standard error. With `OSTRYA_REQUIRE_S3` set, a missing
@@ -370,6 +371,17 @@ pub struct State {
     /// A method and a change that the server runs before the first request
     /// of the method.
     pub before: Option<(&'static str, Change)>,
+    /// A method, a key, and a change that the server runs before the first
+    /// request of the method to the key, with the prefix of the repository.
+    pub before_key: Option<(&'static str, String, Change)>,
+    /// A method and a key prefix: each request of the method to a key that
+    /// starts with the prefix gets 403 `AccessDenied` and changes nothing.
+    pub refuse: Option<(&'static str, String)>,
+    /// A method, a key, and a time: the server waits that time before it
+    /// acts on each request of the method to the key, with the prefix of the
+    /// repository. The wait holds no lock, so the server serves the other
+    /// connections in the meantime.
+    pub delay: Option<(&'static str, String, Duration)>,
     /// A method and a count `n`: the server answers the `n`-th request of
     /// the method with 503 `SlowDown`, and does not act on it.
     pub slow_down: Option<(&'static str, usize)>,
@@ -425,6 +437,9 @@ impl StandIn {
             requests: Vec::new(),
             close_after: None,
             before: None,
+            before_key: None,
+            refuse: None,
+            delay: None,
             slow_down: None,
             etag_on_get: true,
             counts: BTreeMap::new(),
@@ -476,6 +491,19 @@ fn serve(mut stream: TcpStream, state: &Mutex<State>) {
     let _ = stream.set_nodelay(true);
     let mut buffer = Vec::new();
     while let Some(request) = read_request(&mut stream, &mut buffer) {
+        let key = request_key(&request.target);
+        let delay = state
+            .lock()
+            .unwrap()
+            .delay
+            .as_ref()
+            .filter(|(method, wanted, _)| {
+                *method == request.method && key.as_deref() == Some(wanted.as_str())
+            })
+            .map(|(_, _, time)| *time);
+        if let Some(time) = delay {
+            std::thread::sleep(time);
+        }
         let (status, headers, body, close) = {
             let mut state = state.lock().unwrap();
             state
@@ -493,6 +521,16 @@ fn serve(mut stream: TcpStream, state: &Mutex<State>) {
                 let (_, change) = state.before.take().unwrap();
                 change(&mut state.objects);
             }
+            if let Some((method, wanted, _)) = &state.before_key
+                && *method == request.method
+                && key.as_deref() == Some(wanted.as_str())
+            {
+                let (_, _, change) = state.before_key.take().unwrap();
+                change(&mut state.objects);
+            }
+            let refused = state.refuse.as_ref().is_some_and(|(method, prefix)| {
+                *method == request.method && key.as_deref().is_some_and(|k| k.starts_with(prefix))
+            });
             let close = state
                 .close_after
                 .is_some_and(|(method, n)| method == request.method && n == count);
@@ -501,6 +539,8 @@ fn serve(mut stream: TcpStream, state: &Mutex<State>) {
                 .is_some_and(|(method, n)| method == request.method && n == count);
             let (status, headers, body) = if slow_down {
                 (503, Vec::new(), s3_error("SlowDown"))
+            } else if refused {
+                (403, Vec::new(), s3_error("AccessDenied"))
             } else {
                 answer(&mut state, &request)
             };
@@ -583,6 +623,13 @@ fn answer(state: &mut State, request: &Request) -> (u16, Vec<(String, String)>, 
     }
 }
 
+/// Returns the key of the bucket `bkt` that the request target `target`
+/// names, with the prefix of the repository, or `None` for another target.
+fn request_key(target: &str) -> Option<String> {
+    let path = target.split_once('?').map_or(target, |(path, _)| path);
+    path.strip_prefix("/bkt/").map(decode)
+}
+
 /// Returns the answer to the `ListObjectsV2` request with the query `query`.
 fn list(state: &State, query: &str) -> (u16, Vec<(String, String)>, Vec<u8>) {
     let parameter = |name: &str| {
@@ -608,9 +655,12 @@ fn list(state: &State, query: &str) -> (u16, Vec<(String, String)>, Vec<u8>) {
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
     );
+    // The listing states the encoding type `url`, so each key goes in that
+    // encoding, and a `+` of a delta key goes as `%2B`.
     for (key, stored) in &page {
         body.push_str(&format!(
-            "<Contents><Key>{key}</Key><Size>{}</Size></Contents>",
+            "<Contents><Key>{}</Key><Size>{}</Size></Contents>",
+            encode(key),
             stored.bytes.len()
         ));
     }
@@ -622,6 +672,20 @@ fn list(state: &State, query: &str) -> (u16, Vec<(String, String)>, Vec<u8>) {
     }
     body.push_str("<EncodingType>url</EncodingType></ListBucketResult>");
     (200, Vec::new(), body.into_bytes())
+}
+
+/// Returns `text` with each byte other than `A-Z`, `a-z`, `0-9`, `-`, `.`,
+/// `_`, `~`, and `/` as `%XX`.
+fn encode(text: &str) -> String {
+    let mut encoded = String::with_capacity(text.len());
+    for byte in text.bytes() {
+        if byte.is_ascii_alphanumeric() || b"-._~/".contains(&byte) {
+            encoded.push(byte as char);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
 }
 
 /// Returns `text` with each `%XX` decoded.

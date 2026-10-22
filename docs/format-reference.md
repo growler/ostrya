@@ -5501,6 +5501,9 @@ are:
   two digits of the checksum, and `<ext>` one of `commit`, `commitmeta`,
   `dirtree`, `dirmeta`, `filez`, `tombstone-commit`, and `cfs`
 - `refs/heads/<name>`, with a ref name of "Ref name validation"
+- `refs/mirrors/<id>/<name>`, with a collection id of at most 255 bytes that
+  the collection id rule of "Ref name validation" accepts, and a ref name of
+  "Ref name validation"
 - `deltas/<2>/<41>/<target>` and `deltas/<2>/<41>-<43>/<target>`, the layout
   of "Static delta directories", with the checksums in modified base64 and
   the target `superblock` or a part number with no leading zero
@@ -5516,8 +5519,8 @@ UTF-8 bytes. The path is the canonical URI of SigV4.
 
 A list of a bucket repository is `ListObjectsV2` with the encoding type
 `url`. The `prefix` parameter of each list ends in `/`: `PREFIX/objects/XX/`,
-`PREFIX/objects/`, `PREFIX/refs/heads/`, `PREFIX/deltas/`, and `PREFIX/` for
-the list of the multipart uploads. Without the `/`, a list for `s3://b/repo`
+`PREFIX/objects/`, `PREFIX/refs/`, `PREFIX/deltas/`, and `PREFIX/` for the
+list of the multipart uploads. Without the `/`, a list for `s3://b/repo`
 also gives the keys of `s3://b/repo2`. With no prefix, the list of the
 multipart uploads covers the whole bucket, and the bucket client keeps an
 upload only when its key is a key of a bucket repository.
@@ -5542,6 +5545,34 @@ and the pages of the list of the multipart uploads with `key-marker` and
   one that no earlier page gave for that key marker. S3 sorts the uploads of
   one key by the time of their start, so the upload id markers of one key
   have no order.
+
+### The config of a bucket repository
+
+The `config` of a bucket repository is a key file. The init of the port
+writes it, and each writer reads it. A push to a bucket repository with no
+`config` is refused, so the init comes first.
+
+The init writes these lines, and the last one only with a collection id:
+
+```text
+[core]
+repo_version=1
+mode=archive-z2
+collection-id=<id>
+```
+
+A bucket repository with a collection id is the primary server of that
+collection. Its refs of that collection are under `refs/heads/`. The init
+refuses a bucket that holds a `config`, so the collection id of a bucket
+repository never changes.
+
+A writer refuses a `config` that does not parse as a repository config,
+that states a mode other than `archive-z2` and `archive`, whose
+`collection-id` fails the collection id rule or is longer than 255 bytes, or
+whose `tombstone-commits` or `indexed-deltas` is not a boolean. The writer
+refuses it before it changes the bucket.
+The summary takes `mode`, `tombstone-commits`, `indexed-deltas`, and
+`collection-id` of `[core]` ("The summary of a bucket repository").
 
 ### Object uploads
 
@@ -5590,11 +5621,21 @@ SeaweedFS 4.36. A later read of the key on `rclone serve s3` 1.75.1 gives
 the MD5 of the whole object, and SeaweedFS 4.36 gives the value of the
 result.
 
+A push to a bucket repository takes the part size of the size of each
+object: the size of the stored file, or for a `.filez` that the push builds
+from a repository of another mode, the size of the payload. A `.filez` of
+`N` bytes of content is smaller than `2N + 1 MiB`. The push holds one part
+buffer for each upload in flight, and runs at most `max_outstanding`
+uploads, 8 by default. With parts of 8 MiB, the part buffers then hold
+about 64 MiB. A part can take a new buffer while the fetcher still holds the
+buffer of the part before it, so the bound is not exact.
+
 ### The writer lock
 
 The key `PREFIX/extensions/ostrya/lock` holds the writer lock of a bucket
-repository. A writer holds the lock while it changes the repository: a
-push, a prune, an update of the summary, and an fsck that deletes objects.
+repository. A writer holds the lock while it changes the repository: an
+init, a push, a prune, an update of the summary, and an fsck that deletes
+objects.
 A read takes no lock. The `ostree` command does not read the key.
 
 The lock is a key file with one group, in this order:
@@ -5617,7 +5658,7 @@ started=<seconds since the epoch, UTC>
 - `host` is the host name, with the escapes of a string value of a key
   file: `\s` for a space at the start, and `\\` for a backslash. The value
   is empty if the host name cannot be read.
-- `operation` is `push`, `prune`, `summary`, or `fsck`.
+- `operation` is `init`, `push`, `prune`, `summary`, or `fsck`.
 - `started` is the time of the take.
 
 A body that is not UTF-8, that is not a key file, that has no group
@@ -5688,3 +5729,161 @@ Observed behavior of the servers:
   `If-Match: *`.
 - On both servers, a `PUT` gives a quoted `ETag`, and a later `GET` of the
   same bytes gives the same value.
+
+### Init of a bucket repository
+
+The init writes the `config` of a new bucket repository, with an optional
+collection id:
+
+1. It refuses a collection id that fails the collection id rule or is
+   longer than 255 bytes. It sends no request before this check.
+2. It takes the writer lock with `operation=init`.
+3. It writes `config` with `If-None-Match: *`. A key that holds a `config`
+   refuses the init, and the `config` stays as it is.
+4. It releases the writer lock.
+
+The init writes no summary and no ref. A failure before the write of
+`config` changes nothing but the lock, and the init releases the lock. A
+failure after the write leaves the `config`, and the bucket repository is
+then ready for a push. A crash leaves the lock, as for each writer.
+
+### The push to a bucket repository
+
+A push writes the commits of a set of refspecs to a bucket repository with
+no session. Each object goes up in the bytes of an `archive` repository:
+the stored file of an `archive` repository, and for each other mode a
+`.filez` that the push builds at the `[archive] zlib-level` of the local
+repository. The steps of a push are:
+
+1. The local checks: the depth, the collection, the refspecs, the source
+   commits, and the bindings, as for a push over a session. A local refusal
+   changes nothing in the bucket. The push refuses tags, a compression, and
+   a refspec that deletes a ref.
+2. The take of the writer lock with `operation=push`.
+3. The read of `config` and of the presence of `summary.sig`, then the read
+   of the ref files and the listing of the objects of the 256 fan-out
+   prefixes. Each pair of reads runs at the same time. The push trusts the
+   listing alone. A bucket repository with no `config` refuses the push. A
+   bucket repository with a `summary.sig` refuses a push with no summary
+   signer, so a push never changes a signed bucket repository into an
+   unsigned one.
+4. The selection of the namespace and the check of the bindings, then the
+   check of each ref update. Each tip of a ref in the bucket must be an
+   ancestor of the new commit in the local repository, unless the push is
+   forced. A tip that the local repository does not hold, or marks partial,
+   is no ancestor. The fast-forward rule and the force apply to each ref in
+   its own namespace.
+5. The walk: each source commit and its history, cut at the tip of the ref
+   in the bucket, as a push over a session offers them. The trees of the
+   commits that the bucket lacks, and the composefs image of each source
+   commit and of each commit that the bucket lacks, if the local repository
+   holds the image. The walk reads no tree of a commit that the listing
+   holds, because a commit object in the bucket has its whole tree in the
+   bucket. Each ref of the new ref set must name a commit that the bucket
+   holds or that the push uploads, else the push is refused.
+6. The upload of each tree object and image that the listing lacks, and of
+   the `.commitmeta` of each commit that the bucket lacks and of each source
+   commit, at most `max_outstanding` uploads at a time. The bytes of a
+   `.commitmeta` are the stored `.commitmeta` without the keys that the
+   detached metadata filter of the push removes. The push skips a
+   `.commitmeta` that the bucket holds with the same bytes: the listing
+   holds its key with the same size, and a read of the key gives the same
+   bytes. A commit with no detached metadata after the filter uploads
+   nothing, and the bucket keeps its copy. After a failed upload, the push
+   starts no new upload and waits for the uploads in flight.
+7. The upload of each commit object that the bucket lacks.
+8. The build and the signature of the summary ("The summary of a bucket
+   repository"). A refusal of the build and a failure of a signer come
+   before the first ref write, so they change no ref.
+9. A check of the writer lock, then the write of each ref file that
+   changes, in the order of the refspecs. A ref file holds the checksum in
+   lowercase hex and a newline.
+10. A check of the writer lock, then the write of `summary`, also when no
+    ref changed, and then of `summary.sig`.
+11. The release of the writer lock.
+
+The namespace of a push is the collection of the push, else the
+`ostree.collection-binding` of the source commits, else none. The `config`
+of the bucket takes the role of the server of a push over a session:
+
+| Namespace | Collection id of the bucket | Ref keys | A bound commit names |
+| --- | --- | --- | --- |
+| none | any | `refs/heads/DST` | the collection id of the bucket |
+| `ID` | `ID` | `refs/heads/DST` | `ID` |
+| `ID` | another id, or none | `refs/mirrors/ID/DST` | `ID` |
+
+A commit with no binding goes to `refs/heads/` alone. Each other commit
+refuses the push.
+
+A push refuses an update whose new ref set holds, in one ref directory, a
+name that is a directory of another name, for example `a` and `a/b` in
+`refs/heads/`. Each `refs/mirrors/ID/` is a ref directory of its own.
+
+A commit object goes up only after each object of its tree. So a commit
+object in the bucket has its whole tree in the bucket at each point of a
+push, also of a push that failed. This is the bucket form of the
+`.commitpartial` marker, which a bucket repository does not hold.
+
+A push that fails leaves one of these states:
+
+- A failure before the ref writes changes no ref. This covers each refusal
+  of the summary build and each failure of a summary signer. The objects
+  that went up stay, and a run again uploads only the rest. The push
+  releases its lock.
+- A failure of a ref write leaves some refs moved and the old summary. A run
+  again finds those refs at their new commits, writes the other refs, and
+  writes the summary.
+- A failure of the summary write leaves the new refs and the old summary,
+  or the new summary and the old `summary.sig`. A run again writes both.
+- A check of the lock that finds another lock, or no lock, stops the push
+  before its next write. The push then releases no lock.
+- A failure of the release, or a crash, leaves the lock. The next writer
+  fails and names the holder, and a break of the lock removes it.
+- A crash during a multipart upload leaves the upload open. It holds
+  storage until a lifecycle rule of the bucket aborts it. A failed upload
+  aborts its own multipart upload.
+
+### The summary of a bucket repository
+
+The summary of a bucket repository is the root summary alone. A writer
+writes no summary of an auth item and no file under
+`extensions/ostrya/summary/`.
+
+- Field 0 holds the refs of `refs/heads/`, sorted byte-wise by name.
+- `ostree.summary.collection-map` holds the refs of each `refs/mirrors/ID/`
+  with a ref, by collection id. A bucket repository with a collection id
+  holds no `refs/mirrors/ID/` of that id: each writer refuses it.
+- `ostree.summary.mode`, `ostree.summary.tombstone-commits`,
+  `ostree.summary.indexed-deltas`, and `ostree.summary.collection-id` come
+  from `mode`, `tombstone-commits`, `indexed-deltas`, and `collection-id` of
+  `[core]` in the `config` of the bucket.
+- `ostree.static-deltas` holds each delta of `deltas/` with a superblock,
+  sorted by delta name, with the SHA-256 of its superblock. A delta
+  directory with no superblock is not in the map. A superblock key whose
+  directory names do not decode as a delta, and a superblock larger than
+  128 MiB in the listing or in its read, refuse the writer.
+- `ostree.summary.last-modified` is the time of the write.
+- The facts of a ref entry come from the local object store when the local
+  repository holds the commit. Else the writer reads the commit object from
+  the bucket and checks it against its name. The commit object must be in
+  the listing, and the writer reads at most its size in the listing.
+
+These are the bytes of the root summary of a local repository with the same
+refs, commits, deltas, `config`, and `last-modified`, with one difference
+outside the summary builder. A local repository with a collection id writes
+a new `ostree-metadata` anchor commit to `refs/heads/ostree-metadata` before
+its summary, so its ref set holds one more ref. A bucket repository writes
+no anchor commit.
+
+A ref key under `refs/` other than `refs/heads/<name>` and
+`refs/mirrors/<id>/<name>`, a ref file that does not hold 64 lowercase hex
+digits and a newline, and a ref whose commit the bucket does not hold
+refuse the writer before it changes the bucket.
+
+The writer builds and signs the summary before it changes the bucket. It
+then checks the lock, writes `summary`, and then writes `summary.sig` if a
+summary signer signed the summary. A push writes its ref files between the
+build and the write of the summary. Between the two writes, a reader
+sees the new summary and the old signature, and a reader that verifies the
+summary refuses it. A reader never accepts a summary that its signature
+does not cover. A read after the writer ends finds a matching pair.

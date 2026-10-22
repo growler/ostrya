@@ -465,17 +465,6 @@ fn pull_address(
     }
 }
 
-/// Returns `true` if the key `pull-url` of the section of `remote` in
-/// `config` holds an `s3://` address.
-///
-/// The function reads `config` alone, and it reads no file and no
-/// environment. It returns `false` for an address that [`resolve_pull`]
-/// refuses, so that [`resolve_pull`] reports the refusal.
-#[cfg(feature = "s3")]
-pub(crate) fn pulls_from_s3(config: &RepoConfig, remote: &str) -> bool {
-    pull_address_is_s3(Some(config), remote, None) == Some(true)
-}
-
 /// Returns `Some(true)` if the address of a pull of `remote` is an `s3://`
 /// address, `Some(false)` if it is an HTTP or an ssh address, and `None` if
 /// [`resolve_pull`] refuses the address.

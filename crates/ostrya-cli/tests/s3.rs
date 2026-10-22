@@ -1230,10 +1230,39 @@ fn the_s3_options_of_a_pull_are_refused_for_an_address_that_is_not_s3() {
     }
 }
 
+/// Stores each file under the directory `dir` in `server`, at its path
+/// under `dir` with the prefix `repo/`.
+fn store_tree(server: &StandIn, dir: &Path) {
+    let mut pending = vec![dir.to_path_buf()];
+    while let Some(at) = pending.pop() {
+        for entry in std::fs::read_dir(&at).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                let key = path.strip_prefix(dir).unwrap().to_str().unwrap();
+                let bytes = std::fs::read(&path).unwrap();
+                server.state().store(&format!("repo/{key}"), &bytes);
+            }
+        }
+    }
+}
+
+/// A pull with `--collection` reads a candidate at an `s3://` address from
+/// the summary of its bucket repository. It refuses each `--s3-*` option.
+/// It takes `--allow-cleartext-credentials` when the pull address of each
+/// candidate is `s3://`, and refuses it with a candidate that is not S3.
 #[test]
-fn a_pull_of_a_collection_refuses_the_s3_options_and_an_s3_remote() {
+fn a_pull_of_a_collection_reads_an_s3_remote() {
     let scratch = Scratch::new("pull-collection");
     let server = StandIn::start();
+    // The bucket repository is a copy of a local repository of the
+    // collection, with its summary.
+    let source = scratch.repo("source");
+    scratch.append_config(&source, &format!("collection-id={ID}\n"));
+    let tip = scratch.commit(&source, "main", "one");
+    scratch.ok(&[&source, "summary", "-u"]);
+    store_tree(&server, &scratch.path().join("source"));
     let repo = scratch.repo("local");
     scratch.append_config(
         &repo,
@@ -1243,27 +1272,70 @@ fn a_pull_of_a_collection_refuses_the_s3_options_and_an_s3_remote() {
             server.endpoint()
         ),
     );
-    for (option, name) in [
-        (CLEARTEXT, CLEARTEXT),
-        ("--s3-region=eu-west-1", "--s3-region"),
-    ] {
-        let message =
-            scratch.fails(&[&repo, "pull", &format!("--collection={ID}"), "main", option]);
-        assert_eq!(
-            message,
-            format!(
-                "error: {name} applies to an s3:// address, and a pull with --collection reads \
-                 no s3:// address\n"
-            ),
-            "{option}"
-        );
-    }
-    let out = scratch.run(&[&repo, "pull", &format!("--collection={ID}"), "main"]);
-    assert!(!out.status.success());
+    let collection = format!("--collection={ID}");
+    let message = scratch.fails(&[&repo, "pull", &collection, "main", "--s3-region=eu-west-1"]);
+    assert_eq!(
+        message,
+        "error: --s3-region applies to one remote, and a pull with --collection takes the S3 \
+         settings of each candidate from the config\n"
+    );
+    // The library refuses the `http://` endpoint with no switch.
+    let message = scratch.fails(&[&repo, "pull", &collection, "main"]);
+    assert!(message.contains("allow-cleartext-credentials"), "{message}");
+    assert!(server.state().requests.is_empty());
+
+    let out = scratch.run(&[&repo, "pull", &collection, "main", CLEARTEXT]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    let written =
+        std::fs::read_to_string(scratch.path().join(format!("local/refs/mirrors/{ID}/main")))
+            .unwrap();
+    assert_eq!(written.trim(), tip);
     assert!(
-        stderr(&out).contains("this remote is an S3 bucket repository"),
-        "{}",
-        stderr(&out)
+        !server
+            .state()
+            .requests
+            .iter()
+            .any(|(_, target)| target.contains("_ostrya/refs/v1"))
+    );
+    let requests = server.state().requests.len();
+    assert_eq!(authorizations(&server).len(), requests);
+
+    // A candidate that is not S3 refuses the switch, before any request.
+    scratch.append_config(
+        &repo,
+        &format!("\n[remote \"h\"]\nurl=https://ex.com/repo\ncollection-id={ID}\n"),
+    );
+    let message = scratch.fails(&[&repo, "pull", &collection, "main", CLEARTEXT]);
+    assert_eq!(
+        message,
+        "error: --allow-cleartext-credentials applies to an s3:// address, and the pull \
+         address of remote 'h' is not one\n"
+    );
+    assert_eq!(server.state().requests.len(), requests);
+}
+
+/// A candidate whose pull address the resolver refuses passes the check of
+/// --allow-cleartext-credentials, and the pull gives the refusal of the
+/// resolver before any request.
+#[test]
+fn a_pull_of_a_collection_gives_the_refusal_of_the_resolver_with_the_switch() {
+    let scratch = Scratch::new("pull-collection-url-key");
+    let server = StandIn::start();
+    let repo = scratch.repo("local");
+    scratch.append_config(
+        &repo,
+        &format!(
+            "\n[remote \"r\"]\npull-url={ADDRESS}\ncollection-id={ID}\ngpg-verify=false\n\
+             s3-endpoint={}\n[remote \"b\"]\nurl=s3://bkt/repo\ncollection-id={ID}\n",
+            server.endpoint()
+        ),
+    );
+    let collection = format!("--collection={ID}");
+    let message = scratch.fails(&[&repo, "pull", &collection, "main", CLEARTEXT]);
+    assert_eq!(
+        message,
+        "error: pull: remote 'b': url 's3://bkt/repo' is an s3:// address; the port reads an \
+         s3:// address from pull-url alone\n"
     );
     assert!(server.state().requests.is_empty());
 }

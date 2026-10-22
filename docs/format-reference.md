@@ -3913,12 +3913,14 @@ Before its first request, the pull refuses a `REF` whose entry `ID/REF` is
 longer than 4,096 bytes or has more than 256 parts, or whose request target
 alone over HTTP (item 2 below) is longer than 16 KiB. It resolves the address
 and the trust of each candidate. It also builds the HTTP client of each HTTP
-candidate, and checks the ssh command and the send command of each ssh
-candidate. An error in the config of any candidate stops the pull.
+candidate and of each candidate at an `s3://` address, and checks the ssh
+command and the send command of each ssh candidate. An error in the config of
+any candidate stops the pull.
 
 The pull asks each candidate in turn for the commit of each ref. It opens one
 session to each candidate: an ssh client over ssh, or the HTTP client over
-HTTP. The pull from a selected candidate uses the same session.
+HTTP and to an `s3://` address. The pull from a selected candidate uses the
+same session.
 
 1. If the remote config asks for a signature on the summary
    (`gpg-verify-summary`, `sign-verify-summary`), the pull reads `summary.sig`
@@ -3941,6 +3943,14 @@ HTTP. The pull from a selected candidate uses the same session.
    no listing and no summary lists no ref. Over a stream session, the server
    always serves the listing.
 
+A candidate at an `s3://` address is a bucket repository ("The S3 bucket
+repository"), which serves no ref listing. The pull sends it no listing
+request, and reads the refs from its summary alone. It reads `summary`, and
+under a summary policy first `summary.sig`, through the bucket client, as a
+pull from that remote does. A bucket repository with no `summary` is skipped.
+The pull takes the commit that the summary lists for a ref, also when the ref
+file of the bucket names another commit.
+
 In the listing or the summary, the refs of `ID` are in field 0 when
 `ostree.summary.collection-id` is `ID`. Otherwise they are in
 `ostree.summary.collection-map` under `ID`, and the pull ignores field 0. The
@@ -3949,10 +3959,11 @@ timestamp of each ref is its `ostree.commit.timestamp`, a big-endian `t`.
 A candidate is skipped, with a warning, when a request fails, when a listing
 request gets a status from 500 to 599, when the listing or the summary does
 not parse, when the summary fails its signature check, when a listed name
-fails the ref-name rule, or when a listed ref has no `ostree.commit.timestamp`
-of type `t`. The pull fails when each candidate is skipped, when no candidate
-lists a requested `REF`, and, with no `REF`, when no candidate lists a ref of
-`ID`. These failures come before the first object request.
+fails the ref-name rule, when a listed ref has no `ostree.commit.timestamp` of
+type `t`, or when a bucket repository has no `summary`. The pull fails when
+each candidate is skipped, when no candidate lists a requested `REF`, and,
+with no `REF`, when no candidate lists a ref of `ID`. These failures come
+before the first object request.
 
 For each ref, the pull selects the candidate with the newest listed
 timestamp. A tie goes to the first candidate in the config. After the
@@ -3962,7 +3973,8 @@ the order of the config, as a pull from that remote does at the listed commit
 (`conformance/cli-behavior.md`, "HTTP pull surface"). It uses one transaction
 for each such candidate. If the probe read the refs from the summary, the pull
 uses those bytes. Otherwise it reads the `summary.sig` and the `summary` of
-the candidate. It reads the `config` of the candidate, and no ref file. The
+the candidate. It reads the `config` of the candidate, and no ref file. It
+reads the `config` of a bucket repository through the bucket client. The
 keys of that candidate verify its commits. A failure of a selected candidate
 stops the pull, and the refs of the earlier candidates stay written.
 
@@ -5936,6 +5948,10 @@ are the rules of the summary builder of the port for a bucket repository.
 The summary of a bucket repository is the root summary alone. A writer
 writes no summary of an auth item and no file under
 `extensions/ostrya/summary/`.
+
+A pull of collection refs reads the refs of a bucket repository from its
+summary alone ("The pull of collection refs"). So a bucket repository with
+no summary serves no collection ref.
 
 - Field 0 holds the refs of `refs/heads/`, sorted byte-wise by name.
 - `ostree.summary.collection-map` holds the refs of each `refs/mirrors/ID/`

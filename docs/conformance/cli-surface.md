@@ -3929,7 +3929,9 @@ The fetcher refuses a `Cookie` header at construction when a mirror is
 cleartext `http`, unless the caller sets
 `FetcherOptions::allow_cleartext_credentials`. `pull` takes
 `--allow-cleartext-credentials` for an `s3://` address alone, and refuses it
-for each other address, so no option of `pull` sets it for an HTTP remote.
+for each other address. `pull --collection` refuses it when a candidate
+has an HTTP or an ssh address. So no option of `pull` sets it for an HTTP
+remote.
 Cookie-jar support needs its own design pass against that refusal.
 
 ## GPG verification differences
@@ -4415,17 +4417,27 @@ allow-cleartext-credentials`.
   address is `--url`, else `pull-url`, else `url`. A pull address that the
   resolver refuses, for example `s3://` in `url` or a remote that the
   config does not describe, gives the refusal of the resolver, also with
-  these options. `pull --collection` refuses each of
-  them: `error: OPTION applies to an s3:// address, and a pull with
-  --collection reads no s3:// address`. A pull of a collection from an S3
-  remote is refused.
+  these options. `pull --collection` refuses each S3 option: `error: OPTION
+  applies to one remote, and a pull with --collection takes the S3 settings
+  of each candidate from the config`. It refuses
+  `--allow-cleartext-credentials` when the pull address of a candidate is
+  an HTTP or an ssh address: `error: --allow-cleartext-credentials applies
+  to an s3:// address, and the pull address of remote 'NAME' is not one`.
+  `NAME` is the first such candidate in the config. A candidate whose pull
+  address the resolver refuses gives the refusal of the resolver, also with
+  this option, and the pull sends no request.
+- `pull --collection` reads the refs of a candidate at an `s3://` address
+  from the summary of its bucket repository alone, and sends it no ref
+  listing request. A candidate with no summary is skipped with a warning
+  (`format-reference.md`, "The pull of collection refs").
 - A pull of a named ref reads the ref file of the bucket when the summary
   does not list the ref, so a bucket repository with no summary serves
   `pull REMOTE REF`. `remote refs`, `remote summary`, a pull with
-  `--mirror` and no ref, and a pull that verifies the signature of the
-  summary need a summary, and a push writes none. A pull of a ref that
-  the summary lists takes the commit of the summary. So after a push moves
-  that ref, the pull takes the old commit until an update of the summary.
+  `--mirror` and no ref, a pull that verifies the signature of the summary,
+  and `pull --collection` need a summary, and a push writes none. A pull of
+  a ref that the summary lists takes the commit of the summary. So after a
+  push moves that ref, the pull takes the old commit until an update of the
+  summary.
 - `s3://` in the key `url` is refused by `pull`, `remote refs`, `remote
   summary`, and `push`: the tool also reads `url`, and it reads no `s3://`
   address.

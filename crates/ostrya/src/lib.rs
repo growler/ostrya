@@ -48,7 +48,7 @@
 //! - `sign-gpg`: `GpgSigner`, which signs with the `gpg` command. It turns on `verify-gpg`.
 //! - `receive`: the `receive` module, the receive side of a push.
 //! - `push`: `Repo::push`, `Repo::push_onto`, and `Repo::export_stream`, the push from a repository.
-//! - `s3`: the pull from a bucket repository at an `s3://` address, the `bucket` module, the `s3` module of `ostrya-remote`, and with `push`, the push of commits and of a local directory to a bucket repository.
+//! - `s3`: the pull from a bucket repository at an `s3://` address and the pull of collection refs from one, the `bucket` module, the `s3` module of `ostrya-remote`, and with `push`, the push of commits and of a local directory to a bucket repository.
 //! - `lzma-static`: xz built from source and linked statically, with no runtime liblzma.
 //!
 //! # Examples

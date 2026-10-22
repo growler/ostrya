@@ -2884,11 +2884,19 @@ struct PullArgs {
     /// each candidate for the commit of each ref, through the ref listing of
     /// the server or else through its summary. Under `gpg-verify-summary` or
     /// `sign-verify-summary`, it reads the refs from the verified summary
-    /// alone. For each ref, it selects the candidate with the newest commit,
-    /// and a tie goes to the first candidate in the config. A candidate that
-    /// fails to answer is skipped with a warning. The pull from each selected
-    /// candidate is a pull of its own, so a failure of a later candidate keeps
-    /// the refs of the earlier ones. The keys of the selected candidate apply.
+    /// alone. A candidate at an `s3://` address is a bucket repository: the
+    /// pull reads its refs from its summary alone, and skips it if it has no
+    /// summary. A build without the feature `s3` refuses an `s3://`
+    /// candidate, and the pull fails before its first request. The S3
+    /// settings of each candidate come from the config, and the command
+    /// refuses the `--s3-*` options. It refuses --allow-cleartext-credentials
+    /// if the pull address of a candidate is an HTTP or an ssh address. For
+    /// each ref, it selects the candidate with the newest commit, and a tie
+    /// goes to the first candidate in the config. A candidate that fails to
+    /// answer is skipped with a warning. The pull from each selected
+    /// candidate is a pull of its own, so a failure of a later candidate
+    /// keeps the refs of the earlier ones. The keys of the selected candidate
+    /// apply.
     /// Each commit must be bound to ID. If a commit has a ref binding, the
     /// binding must hold the ref. The pull writes `refs/mirrors/ID/REF`, or
     /// `refs/heads/REF` if the `collection-id` of this repository is ID.
@@ -5332,14 +5340,31 @@ async fn pull(
     // The S3 options apply to a pull from an `s3://` address alone.
     #[cfg(feature = "s3")]
     let base = match &from {
-        PullFrom::Collection { .. } => {
-            if let Some(option) = args.s3.first_set() {
+        PullFrom::Collection { remotes, .. } => {
+            if let Some(option) = args.s3.s3.first_set() {
                 exit_error(&format!(
-                    "{option} applies to an s3:// address, and a pull with --collection reads \
-                     no s3:// address"
+                    "{option} applies to one remote, and a pull with --collection takes the S3 \
+                     settings of each candidate from the config"
                 ));
             }
-            ostrya::endpoint::EndpointOverrides::default()
+            // A candidate whose address the resolver refuses passes this
+            // check, so that the resolver states its refusal.
+            let cleartext = args.s3.allow_cleartext_credentials;
+            if cleartext
+                && let Some(remote) = remotes.iter().find(|remote| {
+                    ostrya::endpoint::pull_address_is_s3(Some(repo.config()), remote, None)
+                        == Some(false)
+                })
+            {
+                exit_error(&format!(
+                    "--allow-cleartext-credentials applies to an s3:// address, and the pull \
+                     address of remote '{remote}' is not one"
+                ));
+            }
+            ostrya::endpoint::EndpointOverrides {
+                allow_cleartext_credentials: cleartext,
+                ..Default::default()
+            }
         }
         PullFrom::Remote(remote) => args.s3.pull_overrides(&repo, remote, args.url.as_deref()),
     };

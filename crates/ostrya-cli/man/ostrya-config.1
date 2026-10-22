@@ -175,6 +175,7 @@ The collection that the remote serves.
 \fB\%ostrya pull \-\-collection ID\fR takes each remote whose \fB\%collection\-id\fR is \fB\%ID\fR as a candidate, in the order of the config.
 A pull that names the remote does not read this key.
 \fB\%ostrya pull \-\-collection\fR reads the key of each remote, so a value with a malformed escape sequence in any remote fails that command.
+A candidate whose \fB\%pull\-url\fR is an \fB\%s3://\fR address serves the refs that the summary of its bucket repository lists, and the pull skips such a candidate if its bucket repository has no summary.
 .SS "Verification"
 .TP
 \fB\%gpg\-verify\fR (boolean, default true)

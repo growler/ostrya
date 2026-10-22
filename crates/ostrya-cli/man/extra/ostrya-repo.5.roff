@@ -336,7 +336,8 @@ The summary of the repository and its signatures.
 A push writes no summary, and leaves these two keys as they are.
 A pull of a named ref reads the ref file when the summary does not list the ref.
 A pull of a ref that the summary lists takes the commit of the summary, so after a push moves that ref, the pull takes the old commit until an update of the summary.
-A pull with \fB\%\-\-mirror\fR and no named ref, a pull that verifies the signature of the summary, \fB\%ostrya remote refs\fR, and \fB\%ostrya remote summary\fR need a summary.
+A pull with \fB\%\-\-mirror\fR and no named ref, a pull that verifies the signature of the summary, \fB\%ostrya pull \-\-collection\fR, \fB\%ostrya remote refs\fR, and \fB\%ostrya remote summary\fR need a summary.
+\fB\%ostrya pull \-\-collection\fR reads the refs of the collection from the summary alone, and skips a bucket repository with no summary.
 .TP
 \fB\%objects/<xx>/<62 hex digits>.<ext>\fR
 The objects, in lowercase hex.

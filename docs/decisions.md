@@ -606,7 +606,7 @@ read.
 is the mark of a pull from a bucket repository. `Endpoint::Http` with a
 signer was rejected: such an endpoint has no mark of S3, and the pull needs
 the mark for two rules. The pull reads the root files through the bucket
-client, and `Repo::pull_collection` refuses the remote.
+client, and `Repo::pull_collection` reads no ref listing from the remote.
 
 The fetcher of the pull has the one mirror of the repository URL, the SigV4
 signer, and `max_redirects` set to 0. A redirect to another origin carries
@@ -659,10 +659,40 @@ check comes after the resolution, because the endpoint can come from the
 environment or from a profile. The rule applies to an S3 endpoint alone,
 and the resolution of a pull from an HTTP address does not change.
 
-`Repo::pull_collection` refuses an S3 remote before it resolves the
-endpoint, so the refusal reads no AWS variable and no AWS file. A bucket
-repository holds no collection ref, and no server answers `_ostrya/refs/v1`
-for it. `Repo::pull` does not send that request.
+`Repo::pull_collection` reads the refs of a remote at an `s3://` address
+from the summary of its bucket repository alone. No server answers
+`_ostrya/refs/v1` for a bucket repository, so the pull does not send that
+request, and `Repo::pull` does not send it either. The probe reads
+`summary`, and under a summary policy first `summary.sig`, through the
+bucket client. So an absent bucket and a wrong secret key skip the remote
+with the S3 code. The pull from a selected bucket repository reads its
+`config` through the same client. A bucket repository with no `summary`
+fails the probe, and the pull skips it with an event. A bucket repository
+with no summary that lists no ref was rejected: the remote then gives no
+sign of the reason that it serves no ref.
+
+A list of the ref keys of the bucket, as a source of the collection refs,
+was rejected. The summary is the one signed source of the refs of a bucket
+repository, so a remote under a summary policy reads it in each case.
+`ostrya remote refs` reads the summary too. A probe from a list costs a
+`ListObjectsV2` of `refs/`, a read of each ref file, and a read of each
+commit for its timestamp. A check of the summary against the ref files of
+the bucket was rejected for the same cost. So a ref file that names a newer
+commit than the summary has no effect: the pull takes the commit of the
+summary, as `Repo::pull` takes it for a ref that the summary lists. The
+pull does not compare the `collection-id` of the bucket `config` with
+`ostree.summary.collection-id`: the summary alone states the collection of
+each ref, as for an HTTP remote.
+
+A listing request to S3, with a 404 read as no listing, was rejected. S3
+answers the read of an absent key with 403 when the credentials have no
+`s3:ListBucket`, and the request costs one round trip at each probe for no
+answer.
+
+The check of the length of each requested name against the limits of a ref
+listing request applies also when each remote is a bucket repository. The
+check reads the arguments alone, before the resolution of the remotes, so
+one rule applies to each pull of collection refs.
 
 ## The writer lock of a bucket repository
 

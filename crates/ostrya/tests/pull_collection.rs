@@ -1129,3 +1129,566 @@ fn the_pull_reads_the_summaries_of_the_tool() {
         common::tool_fsck(&root.join("dest"));
     });
 }
+
+// --- bucket repositories -----------------------------------------------------
+
+/// The pull of collection refs from bucket repositories at `s3://`
+/// addresses.
+///
+/// Most cases serve the bucket `bkt` from the S3 stand-in of
+/// `common/s3.rs`, which accepts each signature and keeps each request. Two
+/// cases serve it from `rclone serve s3`, which checks each signature. A
+/// case copies the files of a local `archive` repository, its summary
+/// included, into the bucket.
+///
+/// `Repo::pull_collection` reads the key pair from the environment of the
+/// process. So each test runs its case in a child process of this test
+/// binary, which gets the key pair, the two shared AWS files at absent
+/// paths, no other AWS variable, and no proxy variable. The rclone cases
+/// skip when `rclone` is absent, and `OSTRYA_REQUIRE_S3` turns the skip into
+/// a failure.
+#[cfg(feature = "s3")]
+mod s3_remote {
+    use std::path::Path;
+    use std::process::Command;
+
+    use super::*;
+    use crate::common::s3::{ACCESS_KEY, Rclone, SECRET_KEY, StandIn, rclone_available};
+
+    /// The variable that names the case of the child process.
+    const CASE: &str = "OSTRYA_TEST_S3_CASE";
+
+    /// The proxy variables that the fetcher reads. The child process gets
+    /// none of them, so it connects to the server directly.
+    const PROXY_VARIABLES: [&str; 7] = [
+        "http_proxy",
+        "HTTP_PROXY",
+        "https_proxy",
+        "HTTPS_PROXY",
+        "all_proxy",
+        "ALL_PROXY",
+        "no_proxy",
+    ];
+
+    /// The request target of a key of the bucket repository `s3://bkt/repo`
+    /// on the stand-in.
+    fn target(key: &str) -> String {
+        format!("/bkt/repo/{key}")
+    }
+
+    /// Runs the case `case` in a child process with the secret key `secret`.
+    fn run_case(case: &str, secret: &str) {
+        let scratch = TmpDir::new("pull-collection-s3-env");
+        let mut child = Command::new(std::env::current_exe().unwrap());
+        child
+            .args([
+                "s3_remote::subprocess",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env(CASE, case)
+            .env("AWS_ACCESS_KEY_ID", ACCESS_KEY)
+            .env("AWS_SECRET_ACCESS_KEY", secret)
+            .env("AWS_CONFIG_FILE", scratch.path().join("absent-aws-config"))
+            .env(
+                "AWS_SHARED_CREDENTIALS_FILE",
+                scratch.path().join("absent-aws-credentials"),
+            );
+        for (name, _) in std::env::vars_os() {
+            let text = name.to_string_lossy();
+            if text.starts_with("AWS_") && !child.get_envs().any(|(set, _)| set == name) {
+                child.env_remove(&name);
+            }
+        }
+        for name in PROXY_VARIABLES {
+            child.env_remove(name);
+        }
+        let output = child.output().expect("re-execute this test binary");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            output.status.success() && stdout.contains("1 passed"),
+            "the child of the case {case} reported {}:\n{stdout}{}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+
+    /// Runs a case of a test of this module.
+    ///
+    /// This test does its work only when a test of this module runs this
+    /// binary again with the variables set.
+    #[test]
+    #[ignore = "helper process for the tests of bucket repositories"]
+    fn subprocess() {
+        let Some(case) = std::env::var_os(CASE) else {
+            return;
+        };
+        block_on(async {
+            match case.to_str().unwrap() {
+                "collection-map" => collection_map().await,
+                "field-0" => field_0().await,
+                "across-transports" => across_transports().await,
+                "no-summary" => no_summary().await,
+                "summary-policy" => summary_policy().await,
+                "stale-summary" => stale_summary().await,
+                "absent-bucket" => absent_bucket().await,
+                "rclone" => rclone(false).await,
+                "rclone-wrong-secret" => rclone(true).await,
+                other => panic!("unknown case {other}"),
+            }
+        });
+    }
+
+    /// Stores each file under the directory `dir` in `server`, at its path
+    /// under `dir` with the prefix `repo/`.
+    fn store_tree(server: &StandIn, dir: &Path) {
+        let mut pending = vec![dir.to_path_buf()];
+        while let Some(at) = pending.pop() {
+            for entry in std::fs::read_dir(&at).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    let key = path.strip_prefix(dir).unwrap().to_str().unwrap();
+                    let bytes = std::fs::read(&path).unwrap();
+                    server.state().store(&format!("repo/{key}"), &bytes);
+                }
+            }
+        }
+    }
+
+    /// Returns the keys of a remote at the address `address` on the server
+    /// at `url`.
+    fn bucket(url: &str, address: &str) -> String {
+        format!("pull-url={address}\ns3-endpoint={url}\n")
+    }
+
+    /// Creates the destination repository at `dir/name`, with the collection
+    /// id `own` and the remotes `remotes`: each a name and its keys.
+    async fn bucket_dest(
+        dir: &Path,
+        name: &str,
+        own: Option<&str>,
+        remotes: &[(&str, &str)],
+    ) -> Repo {
+        drop(create(dir, name, own).await);
+        let config = dir.join(name).join("config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        for (remote, keys) in remotes {
+            text.push_str(&format!(
+                "\n[remote \"{remote}\"]\ngpg-verify=false\ncollection-id={ID}\n{keys}"
+            ));
+        }
+        std::fs::write(&config, text).unwrap();
+        Repo::open(&dir.join(name)).await.unwrap()
+    }
+
+    /// Returns the options of [`options`] that allow the `http://`
+    /// endpoint of the server.
+    fn bucket_options(
+        refs: &[&str],
+    ) -> (CollectionPullOptions, Arc<Mutex<Vec<CollectionPullEvent>>>) {
+        let (mut opts, events) = options(refs);
+        opts.pull.overrides.allow_cleartext_credentials = true;
+        (opts, events)
+    }
+
+    /// Asserts that each request to `server` is signed, and that no request
+    /// asks for the ref listing.
+    fn assert_signed_with_no_listing(server: &StandIn) {
+        let state = server.state();
+        assert!(state.authorizations.iter().all(Option::is_some));
+        assert!(
+            !state
+                .requests
+                .iter()
+                .any(|(_, target)| target.contains(LISTING)),
+            "{:?}",
+            state.requests
+        );
+    }
+
+    /// Returns the number of requests to `server` for the key `key` of the
+    /// bucket repository.
+    fn requests_for(server: &StandIn, key: &str) -> usize {
+        let wanted = target(key);
+        server
+            .state()
+            .requests
+            .iter()
+            .filter(|(_, target)| *target == wanted)
+            .count()
+    }
+
+    /// Returns `true` if `server` received a request for an object of the
+    /// bucket repository.
+    fn bucket_objects_requested(server: &StandIn) -> bool {
+        let objects = target("objects/");
+        server
+            .state()
+            .requests
+            .iter()
+            .any(|(_, target)| target.starts_with(&objects))
+    }
+
+    /// Returns the single skip event of `events`, as the remote and the
+    /// message.
+    fn skipped(events: &Mutex<Vec<CollectionPullEvent>>) -> (String, String) {
+        let events = events.lock().unwrap();
+        match &events[..] {
+            [
+                CollectionPullEvent::RemoteSkipped {
+                    remote, message, ..
+                },
+            ] => (remote.clone(), message.clone()),
+            other => panic!("{other:?}"),
+        }
+    }
+
+    /// A bucket repository with no collection id holds the ref of the
+    /// collection under `refs/mirrors/ID/`, and its summary lists it in the
+    /// collection map. A pull of the named ref and a pull of each ref read
+    /// the summary alone, then the `config`, and write the collection ref.
+    #[test]
+    fn a_bucket_serves_the_refs_of_its_collection_map() {
+        run_case("collection-map", SECRET_KEY);
+    }
+
+    async fn collection_map() {
+        let dir = TmpDir::new("pull-collection-s3-map");
+        let source = create(dir.path(), "source", None).await;
+        let tip = commit(&source, dir.path(), "a", Some(ID), REF, FIXED_TS, BOUND).await;
+        summarize(&source).await;
+        for refs in [&[REF][..], &[]] {
+            let server = StandIn::start();
+            store_tree(&server, &dir.path().join("source"));
+            let keys = bucket(&server.endpoint(), "s3://bkt/repo");
+            let name = format!("dest-{}", refs.len());
+            let dest = bucket_dest(dir.path(), &name, None, &[("bkt", &keys)]).await;
+            let (opts, events) = bucket_options(refs);
+            let pulled = dest.pull_collection(ID, &["bkt"], opts).await.unwrap();
+            assert!(events.lock().unwrap().is_empty());
+            assert_eq!(pulled.refs.len(), 1);
+            assert_eq!(pulled.refs[0].remote, "bkt");
+            assert_eq!(pulled.refs[0].commit, tip);
+            assert_eq!(pulled.refs[0].timestamp, FIXED_TS);
+            assert_eq!(mirror(&dest, REF).await, Some(tip));
+            assert!(dest.list_refs(None).await.unwrap().is_empty());
+            assert!(dest.fsck(&FsckOptions::default()).await.unwrap().is_ok());
+            let requests = server.state().requests.clone();
+            assert_eq!(
+                requests[..2],
+                [
+                    ("GET".to_owned(), target("summary")),
+                    ("GET".to_owned(), target("config")),
+                ]
+            );
+            assert_eq!(requests_for(&server, "summary.sig"), 0);
+            assert_eq!(requests_for(&server, "summary"), 1);
+            assert_signed_with_no_listing(&server);
+        }
+    }
+
+    /// A bucket repository whose summary states the collection id lists the
+    /// refs of the collection in field 0. A destination of the same
+    /// collection writes the local ref.
+    #[test]
+    fn a_bucket_of_the_collection_serves_field_0() {
+        run_case("field-0", SECRET_KEY);
+    }
+
+    async fn field_0() {
+        let dir = TmpDir::new("pull-collection-s3-field-0");
+        let source = create(dir.path(), "source", Some(ID)).await;
+        let tip = commit(&source, dir.path(), "a", None, REF, FIXED_TS, BOUND).await;
+        summarize(&source).await;
+        let server = StandIn::start();
+        store_tree(&server, &dir.path().join("source"));
+        let keys = bucket(&server.endpoint(), "s3://bkt/repo");
+        let dest = bucket_dest(dir.path(), "dest", Some(ID), &[("bkt", &keys)]).await;
+        let (opts, events) = bucket_options(&[REF]);
+        let pulled = dest.pull_collection(ID, &["bkt"], opts).await.unwrap();
+        assert!(events.lock().unwrap().is_empty());
+        assert_eq!(pulled.refs[0].commit, tip);
+        assert_eq!(dest.resolve_rev(REF, false).await.unwrap(), Some(tip));
+        assert!(dest.list_mirror_refs().await.unwrap().is_empty());
+        assert_signed_with_no_listing(&server);
+    }
+
+    /// An HTTP remote and a bucket repository serve the collection. The
+    /// newest commit wins across the two transports, and the pull takes the
+    /// objects from the selected remote alone.
+    #[test]
+    fn the_newest_commit_wins_across_http_and_s3() {
+        run_case("across-transports", SECRET_KEY);
+    }
+
+    async fn across_transports() {
+        for bucket_newer in [true, false] {
+            let dir = TmpDir::new("pull-collection-s3-across");
+            let (http_ts, bucket_ts) = if bucket_newer {
+                (FIXED_TS, FIXED_TS + 10)
+            } else {
+                (FIXED_TS + 10, FIXED_TS)
+            };
+            let a = create(dir.path(), "a", Some(ID)).await;
+            let http_tip = commit(&a, dir.path(), "a", None, REF, http_ts, BOUND).await;
+            summarize(&a).await;
+            let source = create(dir.path(), "source", None).await;
+            let bucket_tip =
+                commit(&source, dir.path(), "b", Some(ID), REF, bucket_ts, BOUND).await;
+            summarize(&source).await;
+            let server_a = RepoServer::start(&dir.path().join("a"), false).await;
+            let server = StandIn::start();
+            store_tree(&server, &dir.path().join("source"));
+            let http = format!("url={}\n", server_a.url());
+            let keys = bucket(&server.endpoint(), "s3://bkt/repo");
+            let dest = bucket_dest(dir.path(), "dest", None, &[("a", &http), ("bkt", &keys)]).await;
+            let (opts, events) = bucket_options(&[REF]);
+            let pulled = dest.pull_collection(ID, &["a", "bkt"], opts).await.unwrap();
+            assert!(events.lock().unwrap().is_empty());
+            let (winner, tip) = if bucket_newer {
+                ("bkt", bucket_tip)
+            } else {
+                ("a", http_tip)
+            };
+            assert_eq!(pulled.refs[0].remote, winner);
+            assert_eq!(mirror(&dest, REF).await, Some(tip));
+            assert_eq!(objects_requested(&server_a), !bucket_newer);
+            assert_eq!(bucket_objects_requested(&server), bucket_newer);
+            assert_signed_with_no_listing(&server);
+        }
+    }
+
+    /// A bucket repository with no `summary` fails the probe, and the next
+    /// remote serves the ref. A bucket repository alone with no `summary`
+    /// fails the pull before an object request, and the pull writes nothing.
+    #[test]
+    fn a_bucket_with_no_summary_is_skipped() {
+        run_case("no-summary", SECRET_KEY);
+    }
+
+    async fn no_summary() {
+        let dir = TmpDir::new("pull-collection-s3-no-summary");
+        let source = create(dir.path(), "source", None).await;
+        commit(
+            &source,
+            dir.path(),
+            "b",
+            Some(ID),
+            REF,
+            FIXED_TS + 10,
+            BOUND,
+        )
+        .await;
+        let a = create(dir.path(), "a", Some(ID)).await;
+        let tip = commit(&a, dir.path(), "a", None, REF, FIXED_TS, BOUND).await;
+        summarize(&a).await;
+        let server_a = RepoServer::start(&dir.path().join("a"), false).await;
+        let server = StandIn::start();
+        store_tree(&server, &dir.path().join("source"));
+        let http = format!("url={}\n", server_a.url());
+        let keys = bucket(&server.endpoint(), "s3://bkt/repo");
+
+        let dest = bucket_dest(dir.path(), "dest", None, &[("bkt", &keys), ("a", &http)]).await;
+        let (opts, events) = bucket_options(&[REF]);
+        let pulled = dest.pull_collection(ID, &["bkt", "a"], opts).await.unwrap();
+        assert_eq!(pulled.refs[0].remote, "a");
+        assert_eq!(mirror(&dest, REF).await, Some(tip));
+        let (remote, message) = skipped(&events);
+        assert_eq!(remote, "bkt");
+        assert!(
+            message.contains("the bucket repository has no summary"),
+            "{message}"
+        );
+
+        let alone = bucket_dest(dir.path(), "alone", None, &[("bkt", &keys)]).await;
+        let (opts, events) = bucket_options(&[REF]);
+        let err = alone.pull_collection(ID, &["bkt"], opts).await.unwrap_err();
+        assert!(matches!(err, Error::Pull(_)), "{err:?}");
+        assert_eq!(skipped(&events).0, "bkt");
+        assert_nothing_written(&alone).await;
+        assert!(!bucket_objects_requested(&server));
+        assert_signed_with_no_listing(&server);
+    }
+
+    /// Under a summary policy, the pull reads `summary.sig` and then
+    /// `summary` through the bucket client, and verifies the summary. A
+    /// summary that an untrusted key signed, and a summary with no
+    /// `summary.sig`, skip the bucket repository.
+    #[test]
+    fn a_summary_policy_verifies_the_summary_of_a_bucket() {
+        run_case("summary-policy", SECRET_KEY);
+    }
+
+    async fn summary_policy() {
+        for signer in [Some(SECRET_B64), Some(OTHER_SECRET_B64), None] {
+            let dir = TmpDir::new("pull-collection-s3-policy");
+            let source = create(dir.path(), "source", None).await;
+            let tip = commit(&source, dir.path(), "a", Some(ID), REF, FIXED_TS, BOUND).await;
+            summarize(&source).await;
+            if let Some(secret) = signer {
+                let signer = Ed25519Signer::from_base64(secret).unwrap();
+                source.sign_summary(&signer).await.unwrap();
+            }
+            let server = StandIn::start();
+            store_tree(&server, &dir.path().join("source"));
+            let keys = format!(
+                "{}sign-verify-summary=ed25519\nverification-ed25519-key={PUBLIC_B64}\n",
+                bucket(&server.endpoint(), "s3://bkt/repo")
+            );
+            let dest = bucket_dest(dir.path(), "dest", None, &[("bkt", &keys)]).await;
+            let (opts, events) = bucket_options(&[REF]);
+            let pulled = dest.pull_collection(ID, &["bkt"], opts).await;
+            let requests = server.state().requests.clone();
+            assert_eq!(
+                requests[..2],
+                [
+                    ("GET".to_owned(), target("summary.sig")),
+                    ("GET".to_owned(), target("summary")),
+                ]
+            );
+            if signer == Some(SECRET_B64) {
+                let pulled = pulled.unwrap();
+                assert!(events.lock().unwrap().is_empty());
+                assert_eq!(pulled.refs[0].commit, tip);
+                assert_eq!(mirror(&dest, REF).await, Some(tip));
+                assert_eq!(requests_for(&server, "summary.sig"), 1);
+                assert_eq!(requests_for(&server, "summary"), 1);
+            } else {
+                assert!(matches!(pulled, Err(Error::Pull(_))), "{pulled:?}");
+                assert_eq!(skipped(&events).0, "bkt");
+                assert_nothing_written(&dest).await;
+                assert!(!bucket_objects_requested(&server));
+            }
+            assert_signed_with_no_listing(&server);
+        }
+    }
+
+    /// A ref file of the bucket repository that names a newer commit than
+    /// its summary: the pull takes the commit of the summary, and reads no
+    /// ref file.
+    #[test]
+    fn a_stale_summary_gives_the_commit_of_the_summary() {
+        run_case("stale-summary", SECRET_KEY);
+    }
+
+    async fn stale_summary() {
+        let dir = TmpDir::new("pull-collection-s3-stale");
+        let source = create(dir.path(), "source", None).await;
+        let old = commit(&source, dir.path(), "a", Some(ID), REF, FIXED_TS, BOUND).await;
+        summarize(&source).await;
+        let new = commit(
+            &source,
+            dir.path(),
+            "b",
+            Some(ID),
+            REF,
+            FIXED_TS + 10,
+            BOUND,
+        )
+        .await;
+        let server = StandIn::start();
+        store_tree(&server, &dir.path().join("source"));
+        assert_eq!(
+            server.state().objects[&format!("repo/refs/mirrors/{ID}/{REF}")].bytes,
+            format!("{new}\n").into_bytes()
+        );
+        let keys = bucket(&server.endpoint(), "s3://bkt/repo");
+        let dest = bucket_dest(dir.path(), "dest", None, &[("bkt", &keys)]).await;
+        let (opts, _) = bucket_options(&[REF]);
+        let pulled = dest.pull_collection(ID, &["bkt"], opts).await.unwrap();
+        assert_eq!(pulled.refs[0].commit, old);
+        assert_eq!(mirror(&dest, REF).await, Some(old));
+        let refs = target("refs/");
+        assert!(
+            !server
+                .state()
+                .requests
+                .iter()
+                .any(|(_, target)| target.starts_with(&refs))
+        );
+    }
+
+    /// A remote whose bucket the server does not hold is skipped with the S3
+    /// code `NoSuchBucket`, which the bucket client reads, and the next
+    /// remote serves the ref.
+    #[test]
+    fn an_absent_bucket_is_skipped_with_the_s3_error() {
+        run_case("absent-bucket", SECRET_KEY);
+    }
+
+    async fn absent_bucket() {
+        let dir = TmpDir::new("pull-collection-s3-absent");
+        let source = create(dir.path(), "source", None).await;
+        let tip = commit(&source, dir.path(), "a", Some(ID), REF, FIXED_TS, BOUND).await;
+        summarize(&source).await;
+        let server = StandIn::start();
+        store_tree(&server, &dir.path().join("source"));
+        let gone = bucket(&server.endpoint(), "s3://other/repo");
+        let keys = bucket(&server.endpoint(), "s3://bkt/repo");
+        let dest = bucket_dest(dir.path(), "dest", None, &[("gone", &gone), ("bkt", &keys)]).await;
+        let (opts, events) = bucket_options(&[REF]);
+        let pulled = dest
+            .pull_collection(ID, &["gone", "bkt"], opts)
+            .await
+            .unwrap();
+        assert_eq!(pulled.refs[0].remote, "bkt");
+        assert_eq!(mirror(&dest, REF).await, Some(tip));
+        let (remote, message) = skipped(&events);
+        assert_eq!(remote, "gone");
+        assert!(message.contains("NoSuchBucket"), "{message}");
+        assert_signed_with_no_listing(&server);
+    }
+
+    /// `rclone serve s3` checks the signature of each request. The pull
+    /// reads the collection map of the summary of a bucket directory, and
+    /// writes the collection ref. A wrong secret key skips the remote with
+    /// the S3 code `SignatureDoesNotMatch`, and the pull writes nothing.
+    #[test]
+    fn a_bucket_on_rclone_serves_the_refs_of_a_collection() {
+        if !rclone_available("a_bucket_on_rclone_serves_the_refs_of_a_collection") {
+            return;
+        }
+        run_case("rclone", SECRET_KEY);
+        run_case("rclone-wrong-secret", "wrong-secret-key");
+    }
+
+    async fn rclone(wrong_secret: bool) {
+        let dir = TmpDir::new("pull-collection-s3-rclone");
+        let source = create(dir.path(), "source", None).await;
+        let tip = commit(&source, dir.path(), "a", Some(ID), REF, FIXED_TS, BOUND).await;
+        summarize(&source).await;
+        drop(source);
+        // rclone keeps the listing of each directory, so the files of the
+        // bucket directory are in place before the server starts.
+        let root = dir.path().join("root");
+        std::fs::create_dir_all(root.join("bkt")).unwrap();
+        let status = Command::new("cp")
+            .arg("-r")
+            .arg(dir.path().join("source"))
+            .arg(root.join("bkt").join("repo"))
+            .status()
+            .unwrap();
+        assert!(status.success(), "cp -r");
+        let server = Rclone::start(dir.path(), &root);
+        let keys = bucket(&server.endpoint(), "s3://bkt/repo");
+        let dest = bucket_dest(dir.path(), "dest", None, &[("bkt", &keys)]).await;
+        let (opts, events) = bucket_options(&[REF]);
+        let pulled = dest.pull_collection(ID, &["bkt"], opts).await;
+        if wrong_secret {
+            assert!(matches!(pulled, Err(Error::Pull(_))), "{pulled:?}");
+            let (remote, message) = skipped(&events);
+            assert_eq!(remote, "bkt");
+            assert!(message.contains("SignatureDoesNotMatch"), "{message}");
+            assert_nothing_written(&dest).await;
+        } else {
+            let pulled = pulled.unwrap();
+            assert!(events.lock().unwrap().is_empty());
+            assert_eq!(pulled.refs[0].commit, tip);
+            assert_eq!(mirror(&dest, REF).await, Some(tip));
+            assert!(dest.fsck(&FsckOptions::default()).await.unwrap().is_ok());
+        }
+    }
+}

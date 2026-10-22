@@ -2047,26 +2047,42 @@ pub(super) async fn connect(
             .map(Connection::from)
             .map_err(http_error),
         ssh @ Endpoint::Ssh { .. } => Ok(PullSession::connect(ssh, stream).await?.into()),
-        // The future is boxed, so that the future of an ssh connect does not
-        // hold the construction of the fetcher.
         #[cfg(feature = "s3")]
         Endpoint::S3(s3) => {
-            let session = Box::pin(PullSession::connect(Endpoint::S3(s3.clone()), stream))
-                .await
-                .map_err(http_error)?;
-            let PullSession::Http(fetcher) = &session else {
-                unreachable!("an S3 endpoint opens an HTTP session");
-            };
+            let fetcher = s3_fetcher(&s3, stream).await?;
             // The bucket client shares the fetcher of the session, so the
             // pull builds one fetcher.
             let bucket = crate::remote::s3::Bucket::from_fetcher(&s3, fetcher.clone());
             Ok(Connection {
-                session,
+                session: PullSession::Http(fetcher),
                 bucket: Some(bucket),
             })
         }
         _ => Err(crate::endpoint::neither_ssh_nor_http("a pull")),
     }
+}
+
+/// Builds the signed fetcher of a pull from the bucket repository of `s3`.
+///
+/// The fetcher takes the options that `S3Endpoint::pull_options` gives, and
+/// `stream` has the rules of an HTTP endpoint. The fetcher is the fetcher
+/// that [`PullSession::connect`] builds for an S3 endpoint. The call sends no
+/// request.
+#[cfg(feature = "s3")]
+pub(super) async fn s3_fetcher(
+    s3: &crate::remote::s3::S3Endpoint,
+    stream: StreamSessionOptions,
+) -> Result<Fetcher> {
+    let options = s3.pull_options().map_err(http_error)?;
+    // The future is boxed, so that the future of an ssh connect does not
+    // hold the construction of the fetcher.
+    let session = Box::pin(PullSession::connect(Endpoint::Http(options), stream))
+        .await
+        .map_err(http_error)?;
+    let PullSession::Http(fetcher) = session else {
+        unreachable!("an HTTP endpoint opens an HTTP session");
+    };
+    Ok(fetcher)
 }
 
 /// Makes the checks of [`Repo::pull_with_session`] over `opts`, and returns

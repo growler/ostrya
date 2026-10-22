@@ -168,7 +168,7 @@ impl RemoteSource {
     /// The bucket client reads the file if the source has one. Else the call
     /// is [`read_optional`](RemoteSource::read_optional) at
     /// [`Priority::High`].
-    async fn read_root(&self, path: &str) -> Result<Option<Vec<u8>>> {
+    pub(crate) async fn read_root(&self, path: &str) -> Result<Option<Vec<u8>>> {
         #[cfg(feature = "s3")]
         if let Some(bucket) = &self.bucket {
             let object = bucket.get(path, MAX_ROOT_FILE).await.map_err(http_error)?;
@@ -272,13 +272,29 @@ impl RemoteSource {
         }
     }
 
-    /// Returns the session of the source, which stays open.
+    /// Returns `true` if the source reads the files at the root of the
+    /// remote through a bucket client.
+    ///
+    /// A bucket repository serves no ref listing.
+    pub(crate) fn has_bucket(&self) -> bool {
+        #[cfg(feature = "s3")]
+        return self.bucket.is_some();
+        #[cfg(not(feature = "s3"))]
+        false
+    }
+
+    /// Returns the connection of the source, whose session stays open.
     ///
     /// Over HTTP, the fetcher handle of the session keeps the counters of
-    /// the source. A new source over the session adds the counters that its
-    /// caller gives.
-    pub(crate) fn into_session(self) -> PullSession {
-        self.session
+    /// the source. A new source over the connection adds the counters that
+    /// its caller gives. The connection keeps the bucket client of the
+    /// source.
+    pub(crate) fn into_connection(self) -> Connection {
+        Connection {
+            session: self.session,
+            #[cfg(feature = "s3")]
+            bucket: self.bucket,
+        }
     }
 
     /// Ends the source with `result`, the result of the pull so far.

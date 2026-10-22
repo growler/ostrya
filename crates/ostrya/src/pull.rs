@@ -193,9 +193,9 @@
 //! `summary.sig` or a `.commitmeta` object, then fails the pull.
 //!
 //! The pull never asks a bucket repository for `_ostrya/refs/v1`.
-//! [`Repo::pull_collection`] refuses a remote at an `s3://` address before
-//! it resolves the endpoint, so the refusal reads no AWS variable and no AWS
-//! file.
+//! [`Repo::pull_collection`] reads the refs of a remote at an `s3://`
+//! address from its `summary` alone, through the bucket client, and skips a
+//! bucket repository with no `summary`.
 //!
 //! [`Fetcher`]: crate::fetch::Fetcher
 

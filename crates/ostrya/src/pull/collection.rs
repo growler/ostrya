@@ -22,9 +22,11 @@ use ostrya_core::{Checksum, RefSelector, Value, is_collection_id};
 
 use crate::endpoint::{EndpointOverrides, resolve_pull};
 use crate::error::{Error, Result};
-use crate::fetch::{Fetcher, Priority};
+use crate::fetch::Fetcher;
 use crate::refs::{MAX_COLLECTION_ID_LEN, check_ref_path};
 use crate::remote::proto::{MAX_REF_ENTRY_LEN, MAX_REF_ENTRY_PARTS, MAX_REF_PATTERNS};
+#[cfg(feature = "s3")]
+use crate::remote::s3::{Bucket, S3Endpoint};
 use crate::remote::{Endpoint, PullSession, StreamSession, StreamSessionOptions};
 use crate::repo::Repo;
 use crate::send::write_escaped;
@@ -34,8 +36,10 @@ use crate::summary::{
 };
 use crate::verify::PullTrust;
 
-use super::http::{MAX_ROOT_FILE, Pinned, Wanted, connect, session_options};
-use super::source::RemoteSource;
+#[cfg(feature = "s3")]
+use super::http::s3_fetcher;
+use super::http::{Pinned, Wanted, connect, session_options};
+use super::source::{Connection, RemoteSource};
 use super::subpath::Subpaths;
 use super::verify::Verification;
 use super::{
@@ -106,8 +110,8 @@ pub enum CollectionPullEvent {
     ///
     /// The pull selects no ref from this remote. The causes are a failed
     /// connection or request, a listing or a summary that does not parse, a
-    /// listed ref with no valid timestamp, and a summary that the policy of
-    /// the remote refuses.
+    /// listed ref with no valid timestamp, a summary that the policy of the
+    /// remote refuses, and a bucket repository with no summary.
     #[non_exhaustive]
     RemoteSkipped {
         /// The name of the remote.
@@ -177,27 +181,20 @@ enum Transport {
     /// An ssh endpoint and the options of its session. The pull checks the
     /// command line of its ssh client before its first request.
     Ssh(Box<Endpoint>, StreamSessionOptions),
-}
-
-/// Returns the refusal of a remote at an `s3://` address by a pull of
-/// collection refs.
-#[cfg(feature = "s3")]
-fn s3_refusal() -> Error {
-    Error::Unsupported(
-        "a pull of collection refs takes an ssh or an HTTP remote, and this remote is an S3 \
-         bucket repository, which serves no collection ref"
-            .into(),
-    )
+    /// The signed fetcher of a bucket repository at an `s3://` address, and
+    /// its endpoint, which gives the bucket client of each session. The pull
+    /// builds the fetcher before its first request.
+    #[cfg(feature = "s3")]
+    S3(Fetcher, Box<S3Endpoint>),
 }
 
 impl Transport {
     /// Returns the transport of `endpoint`, with the request limit
     /// `max_outstanding` of the caller.
     ///
-    /// For an HTTP endpoint, the call builds the fetcher. For an ssh
-    /// endpoint, it checks the command line of the ssh client. It sends no
-    /// request and starts no ssh client. It refuses an S3 endpoint: a bucket
-    /// repository serves no collection ref and no ref listing.
+    /// For an HTTP endpoint and an S3 endpoint, the call builds the fetcher.
+    /// For an ssh endpoint, it checks the command line of the ssh client. It
+    /// sends no request and starts no ssh client.
     async fn new(endpoint: Endpoint, max_outstanding: Option<usize>) -> Result<Transport> {
         let (endpoint, stream) = session_options(endpoint, max_outstanding);
         Ok(match endpoint {
@@ -215,7 +212,7 @@ impl Transport {
                 Transport::Ssh(Box::new(endpoint), stream)
             }
             #[cfg(feature = "s3")]
-            Endpoint::S3(_) => return Err(s3_refusal()),
+            Endpoint::S3(s3) => Transport::S3(s3_fetcher(&s3, stream).await?, Box::new(s3)),
             _ => {
                 return Err(crate::endpoint::neither_ssh_nor_http(
                     "a pull of collection refs",
@@ -225,13 +222,20 @@ impl Transport {
     }
 
     /// Opens a session to the remote.
-    async fn open(&self) -> Result<PullSession> {
+    ///
+    /// The connection to a bucket repository holds a bucket client over the
+    /// fetcher of the session.
+    async fn open(&self) -> Result<Connection> {
         match self {
-            Transport::Http(fetcher) => Ok(PullSession::Http(fetcher.clone())),
+            Transport::Http(fetcher) => Ok(PullSession::Http(fetcher.clone()).into()),
             Transport::Ssh(endpoint, stream) => {
-                let connection = connect(Endpoint::clone(endpoint), stream.clone()).await?;
-                Ok(connection.session)
+                connect(Endpoint::clone(endpoint), stream.clone()).await
             }
+            #[cfg(feature = "s3")]
+            Transport::S3(fetcher, s3) => Ok(Connection {
+                session: PullSession::Http(fetcher.clone()),
+                bucket: Some(Bucket::from_fetcher(s3, fetcher.clone())),
+            }),
         }
     }
 }
@@ -250,8 +254,9 @@ struct Probed {
     listed: Vec<Listed>,
     /// The `summary` of the remote, if the probe read the refs from it.
     summary: Option<Arc<Vec<u8>>>,
-    /// The open session to the remote, for the pull from it.
-    session: PullSession,
+    /// The open session to the remote, and its bucket client, for the pull
+    /// from it.
+    session: Connection,
 }
 
 /// The remote that the pull selected for one ref.
@@ -285,21 +290,23 @@ impl Repo {
     /// remote with [`resolve_pull`], with
     /// [`overrides`](PullOptions::overrides), and the trust of each remote
     /// with [`PullTrust::from_remote`], with [`verify`](PullOptions::verify).
-    /// It also builds the fetcher of each HTTP remote, which sends no
-    /// request, and checks the command line of the ssh client of each ssh
-    /// remote, which starts no ssh client. So an error in the config of one
-    /// remote, for example a TLS file that does not parse or an empty
-    /// `send-command`, stops the pull before the first request. Each pull
-    /// from a remote applies the keys of that remote: `gpg-verify`,
-    /// `sign-verify`, and their key sources.
+    /// It also builds the fetcher of each HTTP remote and of each remote at
+    /// an `s3://` address, which sends no request, and checks the command
+    /// line of the ssh client of each ssh remote, which starts no ssh client.
+    /// So an error in the config of one remote, for example a TLS file that
+    /// does not parse, an empty `send-command`, or an `s3://` remote with no
+    /// key pair, stops the pull before the first request. Each pull from a
+    /// remote applies the keys of that remote: `gpg-verify`, `sign-verify`,
+    /// and their key sources.
     ///
     /// # Probe
     ///
     /// The pull asks each remote in turn for the commit of each ref. It
     /// opens one session to each remote: an ssh client over ssh, or the
-    /// fetcher and its connections over HTTP. The pull from a selected
-    /// remote uses the same session. The pull ends the session of each other
-    /// remote after the selection, and an error of that end has no effect.
+    /// fetcher and its connections over HTTP and to an `s3://` address. The
+    /// pull from a selected remote uses the same session. The pull ends the
+    /// session of each other remote after the selection, and an error of
+    /// that end has no effect.
     ///
     /// - If the policy of the remote covers the summary
     ///   (`gpg-verify-summary`, `sign-verify-summary`), the pull reads the
@@ -321,6 +328,14 @@ impl Repo {
     ///   of the remote. An HTTP remote serves no listing when it answers the
     ///   request with a status from 400 to 499. A remote with no listing and
     ///   no summary lists no ref.
+    /// - A remote at an `s3://` address is a bucket repository, which serves
+    ///   no ref listing. The pull sends it no listing request, and reads the
+    ///   refs from its `summary` alone, with the S3 client of the bucket, as
+    ///   [`Repo::pull`] reads the `summary`, the `summary.sig`, and the
+    ///   `config` of a bucket repository. A bucket repository with no
+    ///   `summary` fails the probe. The pull takes the commit that the
+    ///   summary lists, also when the ref file of the bucket names a newer
+    ///   commit.
     ///
     /// If the `ostree.summary.collection-id` of the listing or of the
     /// summary is `collection_id`, the refs of the collection are in the ref
@@ -334,8 +349,9 @@ impl Repo {
     /// pull asks the next remote. The causes are a connection or a request
     /// that fails, for example a listing request that gets a status from 500
     /// to 599, a listing or a summary that does not parse, a summary that the
-    /// policy refuses, a listed name that the ref-name rule refuses, and a
-    /// listed ref with no `ostree.commit.timestamp` of type `t`.
+    /// policy refuses, a listed name that the ref-name rule refuses, a listed
+    /// ref with no `ostree.commit.timestamp` of type `t`, and a bucket
+    /// repository with no `summary`.
     ///
     /// # Selection
     ///
@@ -417,18 +433,15 @@ impl Repo {
     ///   alone over HTTP is longer than 16 KiB.
     /// - The errors of [`resolve_pull`] and of [`PullTrust::from_remote`],
     ///   for each remote.
-    /// - For each HTTP remote, the errors of [`Repo::pull`] that come from
-    ///   the build of its fetcher: [`Error::Unsupported`] for a mirror
-    ///   scheme other than `http` and `https` or a refused proxy, and
-    ///   [`Error::Fetch`] for a mirror that is not a valid absolute URL, an
-    ///   invalid header, or TLS material that does not parse.
+    /// - For each HTTP remote and each remote at an `s3://` address, the
+    ///   errors of [`Repo::pull`] that come from the build of its fetcher:
+    ///   [`Error::Unsupported`] for a mirror scheme other than `http` and
+    ///   `https` or a refused proxy, and [`Error::Fetch`] for a mirror that is
+    ///   not a valid absolute URL, an invalid header, or TLS material that
+    ///   does not parse.
     /// - For each ssh remote, [`Error::Remote`] if the ssh command or the
     ///   send command is empty or holds only white space, or if the
     ///   `OSTRYA_SSH_COMMAND` environment variable is not UTF-8.
-    /// - With the `s3` feature, [`Error::Unsupported`] for a remote at an
-    ///   `s3://` address. A bucket repository serves no collection ref and
-    ///   no ref listing. The refusal comes before the resolution of the
-    ///   endpoint, so it reads no AWS variable and no AWS file.
     ///
     /// These errors stop the pull after the probe, before its first object
     /// request:
@@ -484,12 +497,6 @@ impl Repo {
         // stops the pull.
         let mut candidates = Vec::with_capacity(remotes.len());
         for name in first_of_each(remotes.iter().copied()) {
-            // The refusal of a bucket repository comes before the resolution,
-            // which reads the AWS environment and files.
-            #[cfg(feature = "s3")]
-            if crate::endpoint::pulls_from_s3(self.config(), name) {
-                return Err(s3_refusal());
-            }
             let endpoint = resolve_pull(Some(self.config()), name, opts.overrides.clone()).await?;
             let trust = PullTrust::from_remote(self, name, &opts.verify).await?;
             let transport = Transport::new(endpoint, opts.max_outstanding_fetches).await?;
@@ -577,7 +584,7 @@ impl Repo {
             };
             let pulled = self
                 .run_session(
-                    session.into(),
+                    session,
                     candidate.trust,
                     run,
                     Wanted::Pinned(&pinned),
@@ -643,9 +650,9 @@ fn take_unselected<S, M>(
 ///
 /// The pull reads nothing more from these remotes, so an error of an end has
 /// no effect, and the call drops it.
-async fn end_sessions(sessions: impl IntoIterator<Item = PullSession>) {
-    for session in sessions {
-        let _ = session.finish().await;
+async fn end_sessions(sessions: impl IntoIterator<Item = Connection>) {
+    for connection in sessions {
+        let _ = connection.session.finish().await;
     }
 }
 
@@ -769,17 +776,17 @@ fn name_cost(id: &str, name: &str) -> usize {
 /// The probe opens a session. If the probe fails, it ends the session. If
 /// the probe succeeds, it gives the session back for the pull.
 async fn probe(candidate: &Candidate<'_>, id: &str, names: &[&str]) -> Result<Probed> {
-    let session = candidate.transport.open().await?;
-    let http = matches!(session, PullSession::Http(_));
+    let connection = candidate.transport.open().await?;
+    let http = matches!(connection.session, PullSession::Http(_));
     // The probe reads files that a pull reads before its count starts, so it
     // counts no byte.
-    let source = RemoteSource::new(session.into(), Vec::new());
+    let source = RemoteSource::new(connection, Vec::new());
     let verification = Verification::from_trust(candidate.trust.clone());
     match probe_source(&source, &verification, id, names, http).await {
         Ok((listed, summary)) => Ok(Probed {
             listed,
             summary,
-            session: source.into_session(),
+            session: source.into_connection(),
         }),
         Err(e) => source.finish(Err(e)).await,
     }
@@ -792,9 +799,10 @@ type Refs = (Vec<Listed>, Option<Arc<Vec<u8>>>);
 /// ref of the collection if `names` is empty.
 ///
 /// If `verification` checks the summary, the refs come from the summary,
-/// after its check. Otherwise they come from the ref listing, or from the
-/// summary of a remote with no ref listing. `http` applies the byte limit of
-/// an HTTP request to the listing requests.
+/// after its check. A bucket repository serves no ref listing, so its refs
+/// come from its summary. Otherwise they come from the ref listing, or from
+/// the summary of a remote with no ref listing. `http` applies the byte limit
+/// of an HTTP request to the listing requests.
 async fn probe_source(
     source: &RemoteSource,
     verification: &Verification,
@@ -803,8 +811,9 @@ async fn probe_source(
     http: bool,
 ) -> Result<Refs> {
     // No signature covers the ref listing. So under a policy that covers the
-    // summary, the summary alone tells the refs.
-    if verification.checks_summary() {
+    // summary, the summary alone tells the refs. A bucket repository serves
+    // no ref listing.
+    if verification.checks_summary() || source.has_bucket() {
         return summary_refs(source, verification, id, names).await;
     }
     if names.is_empty() {
@@ -875,8 +884,9 @@ async fn read_listing(
 ///
 /// If `verification` checks the summary, the call reads `summary.sig` too,
 /// and verifies the summary before it reads the refs. Otherwise it reads
-/// `summary` alone. A remote with no summary lists no ref, if no policy
-/// applies to its summary.
+/// `summary` alone. If no policy applies to its summary, a remote with no
+/// summary lists no ref. A bucket repository with no summary fails the call,
+/// because its summary is the one source of its refs.
 async fn summary_refs(
     source: &RemoteSource,
     verification: &Verification,
@@ -890,11 +900,16 @@ async fn summary_refs(
             .await?;
         summary
     } else {
-        source
-            .read_optional(SUMMARY_FILE, Priority::High, MAX_ROOT_FILE)
-            .await?
+        source.read_root(SUMMARY_FILE).await?
     };
     let Some(bytes) = summary else {
+        if source.has_bucket() {
+            return Err(Error::Pull(
+                "the bucket repository has no summary, and a pull of collection refs reads \
+                 the refs of a bucket repository from its summary"
+                    .into(),
+            ));
+        }
         return Ok((Vec::new(), None));
     };
     let bytes = Arc::new(bytes);
@@ -1108,11 +1123,11 @@ mod tests {
     use super::*;
     use crate::fetch::FetcherOptions;
 
-    /// A pull of collection refs refuses an S3 endpoint, and names S3, before
-    /// it connects to the server.
+    /// The transport of an S3 endpoint builds its fetcher and connects to no
+    /// server. Each session that it opens holds a bucket client.
     #[cfg(feature = "s3")]
     #[test]
-    fn the_transport_refuses_an_s3_endpoint_before_a_request() {
+    fn the_transport_of_an_s3_endpoint_sends_no_request() {
         use crate::remote::s3::{Address, Credentials, Location, S3Endpoint};
 
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
@@ -1130,27 +1145,31 @@ mod tests {
         let mut s3 = S3Endpoint::new(location, credentials);
         s3.http.allow_cleartext_credentials = true;
         s3.http.proxy = crate::fetch::Proxy::None;
-        match ostrya_rt::block_on(Transport::new(Endpoint::S3(s3), None)) {
-            Err(Error::Unsupported(msg)) => assert!(msg.contains("S3"), "{msg}"),
-            Err(e) => panic!("{e:?}"),
-            Ok(_) => panic!("a collection pull from an S3 endpoint"),
-        }
+        ostrya_rt::block_on(async {
+            let transport = Transport::new(Endpoint::S3(s3), None).await.unwrap();
+            assert!(matches!(transport, Transport::S3(..)));
+            let connection = transport.open().await.unwrap();
+            assert!(matches!(connection.session, PullSession::Http(_)));
+            assert!(connection.bucket.is_some());
+        });
         assert_eq!(
             listener.accept().map(drop).map_err(|e| e.kind()),
             Err(std::io::ErrorKind::WouldBlock),
-            "the refusal connects to no server"
+            "the transport connects to no server"
         );
     }
 
-    /// A pull of collection refs refuses a remote at an `s3://` address
-    /// before it resolves the endpoint, so the refusal reads no AWS file and
-    /// needs no key pair. The resolution of the remote here fails, whatever
-    /// the AWS environment and files hold: with no key pair, and with a key
-    /// pair, because the S3 endpoint is `http://` and the pull does not allow
-    /// cleartext credentials.
+    /// A pull of collection refs resolves a remote at an `s3://` address,
+    /// and so applies the rules of the S3 endpoint before its first request.
+    /// The endpoint of the remote here is `http://`, and the pull does not
+    /// allow cleartext credentials. So the pull fails with
+    /// [`Error::InvalidInput`] and connects to no server, whatever the AWS
+    /// environment and files hold: with no key pair, and with a key pair.
     #[cfg(feature = "s3")]
     #[test]
-    fn a_collection_pull_refuses_an_s3_remote_before_the_resolution() {
+    fn a_collection_pull_resolves_an_s3_remote() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
         let dir = std::env::temp_dir().join(format!(
             "ostrya-collection-s3-{}-{}",
             std::process::id(),
@@ -1164,32 +1183,25 @@ mod tests {
                     .unwrap(),
             );
             let mut config = std::fs::read_to_string(dir.join("config")).unwrap();
-            config.push_str(
-                "\n[remote \"bkt\"]\npull-url=s3://bkt/repo\ns3-endpoint=http://127.0.0.1:9\n",
-            );
+            config.push_str(&format!(
+                "\n[remote \"bkt\"]\npull-url=s3://bkt/repo\ns3-endpoint=http://{}\n",
+                listener.local_addr().unwrap()
+            ));
             std::fs::write(dir.join("config"), config).unwrap();
             let repo = Repo::open(&dir).await.unwrap();
             let mut opts = CollectionPullOptions::default();
             opts.pull.refs = vec!["exampleos/stable".to_owned()];
             match repo.pull_collection("org.example.Os", &["bkt"], opts).await {
-                Err(Error::Unsupported(msg)) => {
-                    assert!(msg.contains("S3 bucket repository"), "{msg}")
-                }
+                Err(Error::InvalidInput(_)) => {}
                 Err(e) => panic!("{e:?}"),
-                Ok(_) => panic!("a collection pull from an S3 remote"),
+                Ok(_) => panic!("a collection pull over a refused endpoint"),
             }
-            let resolved = crate::endpoint::resolve_pull_in(
-                Some(repo.config()),
-                "bkt",
-                EndpointOverrides::default(),
-                &crate::remote::s3::Environment::Variables(Vec::new()),
-            )
-            .await;
-            assert!(
-                matches!(resolved, Err(Error::InvalidInput(_))),
-                "{resolved:?}"
-            );
         });
+        assert_eq!(
+            listener.accept().map(drop).map_err(|e| e.kind()),
+            Err(std::io::ErrorKind::WouldBlock),
+            "the refusal connects to no server"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

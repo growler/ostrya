@@ -409,6 +409,15 @@ the signature, and names another region in the header of a 404, still
 gives an absent key. A region check on 301, 307, 400, and 403 alone was
 rejected, because S3 can name the region of a bucket with another status.
 
+`Bucket::get_strict` reads a key by a strict rule: a 404 is an absent key
+only if its body arrived whole and holds the code `NoSuchKey`. The
+reachability walk over a bucket repository reads each commit and each
+dirtree with it. A false absent key hides a subtree from the walk, and each
+object of that subtree then reads as unreachable. So in the walk, a 404
+with an empty body, or with a body that is not an S3 `Error` document, for
+example a page of a proxy, is an error. The other readers of a bucket keep
+the rule above.
+
 A conditional `PUT` (`If-None-Match: *`) gives `PutIfAbsent::Created` only
 when a request of the call got a 2xx. A request whose outcome is not known,
 then a 412 or a failed request, makes the client read the key and compare

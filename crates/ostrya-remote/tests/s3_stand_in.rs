@@ -467,6 +467,43 @@ fn an_absent_key_and_an_absent_bucket_differ() {
     });
 }
 
+/// A strict read takes a 404 with the code `NoSuchKey` alone as an absent
+/// key. A 404 with an empty body or with a page that is not an S3 `Error`
+/// document is an error with no code.
+#[test]
+fn a_strict_read_takes_no_such_key_alone_as_absent() {
+    block_on(async {
+        let stand_in = StandIn::start(Arc::new(|seen: &Seen, _| {
+            if seen.target.ends_with("/config") {
+                respond(404, &s3_error("NoSuchKey"))
+            } else if seen.target.ends_with("/summary") {
+                respond(404, b"")
+            } else {
+                respond(404, b"<html><body>Not Found</body></html>")
+            }
+        }))
+        .await;
+        let bucket = stand_in.bucket("s3://bucket/repo").await;
+        assert_eq!(bucket.get_strict("config", 1024).await.unwrap(), None);
+        for key in ["summary", "summary.sig"] {
+            assert_eq!(bucket.get(key, 1024).await.unwrap(), None);
+            let err = bucket.get_strict(key, 1024).await.unwrap_err();
+            let Error::S3 {
+                status,
+                code,
+                key: named,
+                ..
+            } = &err
+            else {
+                panic!("{err}");
+            };
+            assert_eq!(*status, 404);
+            assert_eq!(*code, None);
+            assert_eq!(named.as_deref(), Some(format!("repo/{key}").as_str()));
+        }
+    });
+}
+
 #[test]
 fn a_slow_down_is_retried() {
     block_on(async {

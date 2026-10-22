@@ -15,11 +15,11 @@ use ostrya_core::{Checksum, MAX_METADATA_SIZE, ObjectName, ObjectType};
 
 use super::invalid;
 use super::s3::{
-    BucketState, CompressorPool, Counts, Job, Namespace, Origin, Update, Uploads, fail, object_key,
-    read_state, write_bucket_refs,
+    BucketState, CompressorPool, Counts, Job, Namespace, Origin, Update, Uploads, fail, read_state,
+    write_bucket_refs,
 };
 use crate::bucket::{
-    BucketPushOutcome, BucketRepo, BucketWriteOptions, LockOperation, check_prefixes,
+    BucketPushOutcome, BucketRepo, BucketWriteOptions, LockOperation, check_prefixes, object_key,
 };
 use crate::error::{Error, Result};
 use crate::remote::{

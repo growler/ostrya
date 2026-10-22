@@ -423,7 +423,8 @@ impl Bucket {
     /// `NoSuchBucket`, is an error, so a missing bucket never reads as an
     /// empty repository. A 404 whose body did not arrive is an error too,
     /// with no code. An absent key is not an error, whatever region its
-    /// response names.
+    /// response names. [`get_strict`](Bucket::get_strict) reads a key by a
+    /// strict rule.
     ///
     /// The bytes have the capacity of the object and one byte, if the
     /// response declares the length of the object.
@@ -439,6 +440,35 @@ impl Bucket {
     /// - [`Error::Fetch`] for a failure of the fetcher, and [`Error::Io`] for
     ///   a body that failed in transit after the last refetch.
     pub async fn get(&self, key: &str, max_size: u64) -> Result<Option<Object>> {
+        self.get_whole(key, max_size, is_absent).await
+    }
+
+    /// Reads the object of `key` whole, or returns `None` if the key holds no
+    /// object, by a strict rule of an absent key.
+    ///
+    /// A 404 is an absent key only if its body arrived whole and holds the
+    /// code `NoSuchKey`. Each other 404 is an error, also a 404 with an empty
+    /// body or with a body that is not an S3 `Error` document, for example a
+    /// page of a proxy. Use this call where a false absent key causes a loss
+    /// of data. Else the call is [`get`](Bucket::get).
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`get`](Bucket::get). A 404 that is not an absent key
+    /// gives [`Error::S3`] with the status 404, and with no code if the body
+    /// holds no S3 code.
+    pub async fn get_strict(&self, key: &str, max_size: u64) -> Result<Option<Object>> {
+        self.get_whole(key, max_size, is_no_such_key).await
+    }
+
+    /// Reads the object of `key` whole, as [`get`](Bucket::get) does, with
+    /// `absent` as the rule of an absent key.
+    async fn get_whole(
+        &self,
+        key: &str,
+        max_size: u64,
+        absent: fn(u16, Option<&[u8]>) -> bool,
+    ) -> Result<Option<Object>> {
         check_key(key)?;
         let full = self.full_key(key);
         let path = encode_path(&full);
@@ -453,7 +483,7 @@ impl Bucket {
                 Ok(Fetched::Body(body)) => body,
                 Ok(Fetched::NotModified) => return Err(not_modified(&full)),
                 Err(e) => {
-                    self.absent_or_error(e, &full, max_size)?;
+                    self.absent_or_error(e, &full, max_size, absent)?;
                     return Ok(None);
                 }
             };
@@ -504,7 +534,7 @@ impl Bucket {
             }
             Ok(Fetched::NotModified) => Err(not_modified(&full)),
             Err(e) => {
-                self.absent_or_error(e, &full, u64::MAX)?;
+                self.absent_or_error(e, &full, u64::MAX, is_absent)?;
                 Ok(None)
             }
         }
@@ -1490,7 +1520,7 @@ impl Bucket {
                 Ok(Fetched::Body(stream)) => stream,
                 Ok(Fetched::NotModified) => return Err(not_modified(full)),
                 Err(e) => {
-                    self.absent_or_error(e, full, u64::MAX)?;
+                    self.absent_or_error(e, full, u64::MAX, is_absent)?;
                     return Ok(Compared::Absent);
                 }
             };
@@ -1527,18 +1557,25 @@ impl Bucket {
     }
 
     /// Returns `Ok` if the failed fetch `e` of the object `full` states that
-    /// the key holds no object, and the error of the fetch otherwise.
+    /// the key holds no object by the rule `absent`, and the error of the
+    /// fetch otherwise.
     ///
     /// The absent-key rule runs before the region check, so an absent key is
     /// never a region error.
-    fn absent_or_error(&self, e: ostrya_fetch::Error, full: &str, max_size: u64) -> Result<()> {
+    fn absent_or_error(
+        &self,
+        e: ostrya_fetch::Error,
+        full: &str,
+        max_size: u64,
+        absent: fn(u16, Option<&[u8]>) -> bool,
+    ) -> Result<()> {
         match e {
             ostrya_fetch::Error::FetchTooLarge { .. } => Err(too_large(full, max_size)),
             ostrya_fetch::Error::HttpStatus {
                 status, response, ..
             } => {
                 let response = response.as_deref();
-                if is_absent(status, response.and_then(ErrorResponse::body)) {
+                if absent(status, response.and_then(ErrorResponse::body)) {
                     Ok(())
                 } else {
                     Err(self.status_error(status, response, Some(full)))
@@ -2017,6 +2054,21 @@ fn is_absent(status: u16, body: Option<&[u8]>) -> bool {
         })
 }
 
+/// Returns `true` if an answer with `status` and the whole body `body`
+/// states an absent key by the strict rule: a 404 whose body holds the code
+/// `NoSuchKey`.
+///
+/// `body` is `None` if the body did not arrive whole. A 404 with no S3 code
+/// can come from a proxy or from a missing bucket, so it is not an absent
+/// key.
+fn is_no_such_key(status: u16, body: Option<&[u8]>) -> bool {
+    status == 404
+        && body
+            .and_then(xml::error)
+            .and_then(|doc| doc.code)
+            .is_some_and(|code| code.trim() == "NoSuchKey")
+}
+
 /// Reads `body` to its end, and refuses a body larger than `limit` bytes
 /// with [`ErrorKind::FileTooLarge`].
 ///
@@ -2137,6 +2189,22 @@ mod tests {
         assert!(!is_absent(404, Some(&coded("NoSuchBucket"))));
         assert!(!is_absent(404, None));
         assert!(!is_absent(403, Some(b"")));
+    }
+
+    #[test]
+    fn a_strict_absent_key_is_a_404_whose_body_has_no_such_key() {
+        let coded = |code: &str| format!("<Error><Code>{code}</Code></Error>").into_bytes();
+        assert!(is_no_such_key(404, Some(&coded("NoSuchKey"))));
+        assert!(is_no_such_key(404, Some(&coded(" NoSuchKey\n"))));
+        assert!(!is_no_such_key(404, Some(b"")));
+        assert!(!is_no_such_key(404, Some(b"<html>Not Found</html>")));
+        assert!(!is_no_such_key(
+            404,
+            Some(b"<Error><Message>m</Message></Error>")
+        ));
+        assert!(!is_no_such_key(404, Some(&coded("NoSuchBucket"))));
+        assert!(!is_no_such_key(404, None));
+        assert!(!is_no_such_key(403, Some(&coded("NoSuchKey"))));
     }
 
     #[test]

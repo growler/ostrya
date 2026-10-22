@@ -155,6 +155,7 @@ fn bucket_futures_are_send(
     assert_send(&s3::S3Endpoint::resolve("s3://b/p", settings, environment));
     assert_send(&s3::Bucket::new(endpoint));
     assert_send(&bucket.get("config", 1));
+    assert_send(&bucket.get_strict("config", 1));
     assert_send(&bucket.get_stream("config"));
     assert_send(&bucket.put("config", Vec::new()));
     assert_send(&bucket.put_if_absent("config", Vec::new()));

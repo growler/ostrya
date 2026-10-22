@@ -384,7 +384,8 @@ impl Repo {
         }
         let bound = ParentBound::depth(max_depth);
         let mut reachable = HashSet::new();
-        self.collect_reachable(
+        collect_reachable(
+            self,
             vec![(*commit, bound, Arrival::Root)],
             bound,
             &GcRoots::parents_only(),
@@ -433,15 +434,7 @@ impl Repo {
         roots: impl IntoIterator<Item = Checksum>,
         max_depth: i32,
     ) -> Result<HashSet<ObjectName>> {
-        let bound = ParentBound::depth(max_depth);
-        self.traverse_reachable_gc(
-            roots.into_iter().map(|c| (c, bound)),
-            bound,
-            &GcRoots::parents_only(),
-            &HashSet::new(),
-            None,
-        )
-        .await
+        walk_reachable(self, roots, max_depth).await
     }
 
     /// Returns the name of each object that one of `roots` reaches over the
@@ -474,234 +467,7 @@ impl Repo {
         bounded_roots: &HashSet<Checksum>,
         pending_delete: Option<Checksum>,
     ) -> Result<HashSet<ObjectName>> {
-        let seeds = roots
-            .into_iter()
-            .map(|(c, bound)| (c, bound, Arrival::Root))
-            .collect();
-        let mut reachable = HashSet::new();
-        self.collect_reachable(
-            seeds,
-            root_bound,
-            gc,
-            bounded_roots,
-            pending_delete,
-            &mut reachable,
-        )
-        .await?;
-        Ok(reachable)
-    }
-
-    /// Adds to `reachable` the name of each object that `seeds` reach.
-    ///
-    /// `seeds` pairs each root commit with the bound of its `parent` chain and
-    /// with the kind of its arrival. The walk adds the name of each object that
-    /// a reached object refers to. To read the children of a commit or a
-    /// dirtree, the walk must load it. So an absent commit or dirtree adds its
-    /// own name and no name below it. A commit or a dirtree that does not
-    /// parse stops the walk with an error.
-    ///
-    /// If more than one root reaches a commit, the walk expands the commit
-    /// under the bound that reaches furthest. So the reachable set does not
-    /// depend on the order of the roots. If an earlier expansion of the commit
-    /// reaches at least as far, the walk skips the arrival. Otherwise it
-    /// expands the commit again, to follow its parents further.
-    ///
-    /// A commit that `bounded_roots` names has its own bound. The walk drops
-    /// each `parent`-edge arrival at such a commit. So the bound of the seed
-    /// replaces the bound that the arrival inherited.
-    ///
-    /// A commit that `gc.weak_roots` names also has its own bounds, and no
-    /// seed of the caller adds it to the walk. The first arrival at such a
-    /// commit pushes one seed for each bound that the map records, at most
-    /// one of each kind. Then the walk drops a `parent`-edge arrival as it
-    /// drops one for `bounded_roots`, so the pushed seeds replace the
-    /// inherited bound.
-    ///
-    /// An arrival at a weak-ref commit that is a root itself stays. The commit
-    /// expands under the bound of the arrival and under the pushed seeds. The
-    /// pushed seeds go through the same memoization as each other entry. The
-    /// walk skips a commit that an earlier expansion covers, and expands again
-    /// a commit that a further bound reaches.
-    ///
-    /// A commit takes its weak seeds once. Each extra entry is either skipped
-    /// or strictly extends the recorded depth or timestamp. So the walk ends.
-    ///
-    /// A conditional arrival is an arrival over a [`ParentBound::Since`]
-    /// `parent` edge. If the timestamp of the commit is below the bound, the
-    /// arrival adds nothing and records no expansion. So a root that names the
-    /// same commit still keeps it. The walk memoizes the rejection, so a second
-    /// child that arrives under the same bound reads no commit.
-    ///
-    /// The walk seeds each commit that a metadata-key edge names at
-    /// `root_bound`. Each such seed is the same entry, so the walk pushes it
-    /// at the first edge alone. The walk reads the commit `pending_delete`
-    /// names as absent.
-    async fn collect_reachable(
-        &self,
-        seeds: Vec<(Checksum, ParentBound, Arrival)>,
-        root_bound: ParentBound,
-        gc: &GcRoots,
-        bounded_roots: &HashSet<Checksum>,
-        pending_delete: Option<Checksum>,
-        reachable: &mut HashSet<ObjectName>,
-    ) -> Result<()> {
-        let mut commit_stack = seeds;
-        let mut seen_commits: HashMap<Checksum, Expanded> = HashMap::new();
-        let mut seen_dirtrees: HashSet<Checksum> = HashSet::new();
-        // The commits for which the walk pushed a weak-ref seed. A pushed seed
-        // matches `weak_roots` again when the walk pops it. This set stops the
-        // walk from a second push of the seed.
-        let mut weak_seeded: HashSet<Checksum> = HashSet::new();
-        // The commits for which a metadata-key edge pushed a seed. A second
-        // edge to the same commit pushes the same entry, which adds nothing.
-        let mut anchor_seeded: HashSet<Checksum> = HashSet::new();
-
-        while let Some((commit_checksum, bound, arrival)) = commit_stack.pop() {
-            // When the walk reaches the commit of a weak ref over any edge,
-            // the commit takes the bound of the name of that ref. The seed is
-            // a `Root` arrival, so the bound belongs to the commit. Under a
-            // `Since` bound, the walk keeps the commit whatever its timestamp,
-            // as it keeps the target of a strong ref.
-            //
-            // This test comes before the `inherited` drop and applies to each
-            // kind of arrival. A metadata-key edge pushes a `Root` arrival at
-            // the global bound of the run. If the rule tested `inherited`
-            // alone, that arrival can expand the commit at the global bound
-            // while the bound of the weak ref reaches further. Then the sweep
-            // deletes the ancestry of a ref that stays.
-            if let Some(bounds) = gc.weak_roots.get(&commit_checksum)
-                && weak_seeded.insert(commit_checksum)
-            {
-                for weak_bound in bounds.seeds() {
-                    commit_stack.push((commit_checksum, weak_bound, Arrival::Root));
-                }
-            }
-
-            // A commit with its own bound takes that bound, whatever bound the
-            // `parent` edge had left. The seed holds that bound. So the walk
-            // drops the arrival here, and the expansion of the seed replaces
-            // it. The walk drops an arrival at the commit of a weak ref in the
-            // same way, because the pushed weak-ref seed holds its bound.
-            if arrival.inherited()
-                && (bounded_roots.contains(&commit_checksum)
-                    || gc.weak_roots.contains_key(&commit_checksum))
-            {
-                continue;
-            }
-
-            let seen = seen_commits
-                .get(&commit_checksum)
-                .copied()
-                .unwrap_or_default();
-            if seen.covers(bound) {
-                continue;
-            }
-            if arrival == Arrival::TimedParent && seen.rejects(bound) {
-                continue;
-            }
-
-            let loaded = if pending_delete == Some(commit_checksum) {
-                None
-            } else {
-                self.try_load_commit(&commit_checksum).await?
-            };
-
-            // The walk does not keep a commit that the timestamp bound rejects,
-            // and records no expansion for it. So a ref that names the commit
-            // still reaches it. The walk records the rejection, so a second
-            // child under the same bound does not read the commit again.
-            if arrival == Arrival::TimedParent
-                && let ParentBound::Since(since) = bound
-                && let Some(commit) = &loaded
-                && commit.timestamp < since
-            {
-                seen_commits
-                    .entry(commit_checksum)
-                    .or_default()
-                    .reject(since);
-                continue;
-            }
-
-            seen_commits
-                .entry(commit_checksum)
-                .or_default()
-                .record(bound);
-            reachable.insert(ObjectName::new(commit_checksum, ObjectType::Commit));
-
-            let Some(commit) = loaded else {
-                continue;
-            };
-
-            if gc.traverse_tree {
-                reachable.insert(ObjectName::new(commit.root_dirmeta, ObjectType::DirMeta));
-                self.walk_tree(commit.root_dirtree, &mut seen_dirtrees, reachable)
-                    .await?;
-            }
-
-            if !gc.metadata_keys.is_empty() {
-                self.push_metadata_key_edges(
-                    &commit_checksum,
-                    &commit.metadata,
-                    gc,
-                    root_bound,
-                    &mut anchor_seeded,
-                    &mut commit_stack,
-                )
-                .await?;
-            }
-
-            if gc.traverse_parent
-                && let Some(parent) = commit.parent
-            {
-                match bound {
-                    ParentBound::Depth(0) => {}
-                    ParentBound::Depth(depth) => {
-                        let next = if depth < 0 { -1 } else { depth - 1 };
-                        commit_stack.push((parent, ParentBound::Depth(next), Arrival::Parent));
-                    }
-                    ParentBound::Since(since) => {
-                        commit_stack.push((
-                            parent,
-                            ParentBound::Since(since),
-                            Arrival::TimedParent,
-                        ));
-                    }
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Adds to `reachable` the name of each dirtree, dirmeta, and file object
-    /// that `root_dirtree` reaches.
-    ///
-    /// An absent dirtree adds its own name only. A dirtree that does not parse
-    /// stops the walk with an error.
-    async fn walk_tree(
-        &self,
-        root_dirtree: Checksum,
-        seen_dirtrees: &mut HashSet<Checksum>,
-        reachable: &mut HashSet<ObjectName>,
-    ) -> Result<()> {
-        let mut stack = vec![root_dirtree];
-        while let Some(dirtree_checksum) = stack.pop() {
-            if !seen_dirtrees.insert(dirtree_checksum) {
-                continue;
-            }
-            reachable.insert(ObjectName::new(dirtree_checksum, ObjectType::DirTree));
-
-            let Some(dirtree) = self.try_load_dirtree(&dirtree_checksum).await? else {
-                continue;
-            };
-            for (_, file_checksum) in dirtree.files {
-                reachable.insert(ObjectName::new(file_checksum, ObjectType::File));
-            }
-            for (_, subtree, submeta) in dirtree.dirs {
-                reachable.insert(ObjectName::new(submeta, ObjectType::DirMeta));
-                stack.push(subtree);
-            }
-        }
-        Ok(())
+        walk_reachable_gc(self, roots, root_bound, gc, bounded_roots, pending_delete).await
     }
 
     /// Adds the names of one tree to `seen` and `out`.
@@ -785,84 +551,6 @@ impl Repo {
         Ok(())
     }
 
-    /// Pushes onto the walk each commit that the configured metadata keys
-    /// name.
-    ///
-    /// The method reads each entry with the key from `metadata`, the metadata
-    /// of the commit, and then from its detached metadata. So one key name
-    /// gives edges from both. A dict that holds the key more than one time
-    /// gives the edges of each entry, and the entries can have different
-    /// shapes. A key that no dict holds adds nothing.
-    ///
-    /// The value of each entry is an `aay`, an `a(say)`, or an `a{s(say)}`.
-    /// The walk reads the 32-byte checksums alone and ignores each string.
-    /// If a value does not have one of these shapes, or holds a checksum that
-    /// is not 32 bytes, the walk fails with [`Error::InvalidGcRoot`]. If the
-    /// walk does not follow an edge, a sweep deletes the objects of that edge.
-    /// So a value that the walk cannot read stops the walk.
-    ///
-    /// With more than one defect, the error names the first in this order:
-    /// the order of the keys in [`GcRoots::metadata_keys`], then the metadata
-    /// of the commit before its detached metadata, then the order of the
-    /// entries in the dict, then the order of the elements in the value.
-    ///
-    /// The method pushes a commit only if `seeded` does not hold it, and
-    /// adds the commit to `seeded`. It decodes each value also when it pushes
-    /// no commit, so the errors stay the same.
-    ///
-    /// The method reads the detached metadata once for each expansion of a
-    /// commit, and only if the walk has metadata keys. The walk can reach a
-    /// commit again at a depth that follows more parents. It then expands the
-    /// commit a second time and reads the detached metadata again.
-    async fn push_metadata_key_edges(
-        &self,
-        commit: &Checksum,
-        metadata: &Value,
-        gc: &GcRoots,
-        root_bound: ParentBound,
-        seeded: &mut HashSet<Checksum>,
-        stack: &mut Vec<(Checksum, ParentBound, Arrival)>,
-    ) -> Result<()> {
-        let detached = self.read_commit_detached_metadata(commit).await?;
-        for key in &gc.metadata_keys {
-            for source in [Some(metadata), detached.as_ref()].into_iter().flatten() {
-                for value in dict_values(source, key) {
-                    for_each_metadata_key_target(value, |target| {
-                        if seeded.insert(target) {
-                            stack.push((target, root_bound, Arrival::Root));
-                        }
-                    })
-                    .map_err(|reason| Error::InvalidGcRoot {
-                        commit: *commit,
-                        metadata_key: key.clone(),
-                        reason,
-                    })?;
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Loads and parses a commit for the lenient walk.
-    ///
-    /// Returns `None` if the repository does not hold the commit.
-    async fn try_load_commit(&self, checksum: &Checksum) -> Result<Option<Commit>> {
-        match self.load_object_bytes(ObjectType::Commit, checksum).await {
-            Ok(bytes) => Ok(Some(Commit::parse(&bytes)?)),
-            Err(Error::ObjectNotFound { .. }) => Ok(None),
-            Err(e) => Err(e),
-        }
-    }
-
-    /// Loads and parses a dirtree, or returns `None` if it is absent.
-    async fn try_load_dirtree(&self, checksum: &Checksum) -> Result<Option<ostrya_core::DirTree>> {
-        match self.load_dirtree(checksum).await {
-            Ok(dirtree) => Ok(Some(dirtree)),
-            Err(Error::ObjectNotFound { .. }) => Ok(None),
-            Err(e) => Err(e),
-        }
-    }
-
     /// Returns the commit checksum of each ref in `refs/heads`,
     /// `refs/remotes`, and `refs/mirrors`.
     ///
@@ -904,6 +592,386 @@ impl Repo {
             Ok(out)
         })
         .await
+    }
+}
+
+/// A store of metadata objects that the reachability walk reads.
+///
+/// [`Repo`] reads its loose objects, and a bucket repository reads the keys
+/// of its objects. The walk parses the bytes itself, so each store gives the
+/// same result for the same objects.
+pub(crate) trait MetadataSource: Sync {
+    /// Returns the bytes of the metadata object of `ty` and `checksum`, or
+    /// `None` if the store does not hold the object.
+    ///
+    /// `None` must mean that the object is absent. The walk adds no name
+    /// below an absent commit or dirtree. So a failed read that gives `None`
+    /// hides a subtree from the walk, and each other failure is an error. A
+    /// bucket repository gives `None` only for a 404 with the code
+    /// `NoSuchKey`.
+    fn load_metadata(
+        &self,
+        ty: ObjectType,
+        checksum: Checksum,
+    ) -> impl Future<Output = Result<Option<Vec<u8>>>> + Send;
+}
+
+impl MetadataSource for Repo {
+    async fn load_metadata(&self, ty: ObjectType, checksum: Checksum) -> Result<Option<Vec<u8>>> {
+        match self.load_object_bytes(ty, &checksum).await {
+            Ok(bytes) => Ok(Some(bytes)),
+            Err(Error::ObjectNotFound { .. }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// Returns the name of each object of `store` that one of `roots` and its
+/// parents reach.
+///
+/// The walk is the walk of [`Repo::traverse_reachable`], and `max_depth`
+/// has the same meaning.
+pub(crate) async fn walk_reachable<S: MetadataSource>(
+    store: &S,
+    roots: impl IntoIterator<Item = Checksum>,
+    max_depth: i32,
+) -> Result<HashSet<ObjectName>> {
+    let bound = ParentBound::depth(max_depth);
+    walk_reachable_gc(
+        store,
+        roots.into_iter().map(|c| (c, bound)),
+        bound,
+        &GcRoots::parents_only(),
+        &HashSet::new(),
+        None,
+    )
+    .await
+}
+
+/// Returns the name of each object of `store` that one of `roots` reaches
+/// over the edges of `gc`.
+///
+/// The walk is the walk of [`Repo::traverse_reachable_gc`], and the
+/// arguments have the same meaning.
+pub(crate) async fn walk_reachable_gc<S: MetadataSource>(
+    store: &S,
+    roots: impl IntoIterator<Item = (Checksum, ParentBound)>,
+    root_bound: ParentBound,
+    gc: &GcRoots,
+    bounded_roots: &HashSet<Checksum>,
+    pending_delete: Option<Checksum>,
+) -> Result<HashSet<ObjectName>> {
+    let seeds = roots
+        .into_iter()
+        .map(|(c, bound)| (c, bound, Arrival::Root))
+        .collect();
+    let mut reachable = HashSet::new();
+    collect_reachable(
+        store,
+        seeds,
+        root_bound,
+        gc,
+        bounded_roots,
+        pending_delete,
+        &mut reachable,
+    )
+    .await?;
+    Ok(reachable)
+}
+
+/// Adds to `reachable` the name of each object that `seeds` reach.
+///
+/// `seeds` pairs each root commit with the bound of its `parent` chain and
+/// with the kind of its arrival. The walk adds the name of each object that
+/// a reached object refers to. To read the children of a commit or a
+/// dirtree, the walk must load it. So an absent commit or dirtree adds its
+/// own name and no name below it. A commit or a dirtree that does not
+/// parse stops the walk with an error.
+///
+/// If more than one root reaches a commit, the walk expands the commit
+/// under the bound that reaches furthest. So the reachable set does not
+/// depend on the order of the roots. If an earlier expansion of the commit
+/// reaches at least as far, the walk skips the arrival. Otherwise it
+/// expands the commit again, to follow its parents further.
+///
+/// A commit that `bounded_roots` names has its own bound. The walk drops
+/// each `parent`-edge arrival at such a commit. So the bound of the seed
+/// replaces the bound that the arrival inherited.
+///
+/// A commit that `gc.weak_roots` names also has its own bounds, and no
+/// seed of the caller adds it to the walk. The first arrival at such a
+/// commit pushes one seed for each bound that the map records, at most
+/// one of each kind. Then the walk drops a `parent`-edge arrival as it
+/// drops one for `bounded_roots`, so the pushed seeds replace the
+/// inherited bound.
+///
+/// An arrival at a weak-ref commit that is a root itself stays. The commit
+/// expands under the bound of the arrival and under the pushed seeds. The
+/// pushed seeds go through the same memoization as each other entry. The
+/// walk skips a commit that an earlier expansion covers, and expands again
+/// a commit that a further bound reaches.
+///
+/// A commit takes its weak seeds once. Each extra entry is either skipped
+/// or strictly extends the recorded depth or timestamp. So the walk ends.
+///
+/// A conditional arrival is an arrival over a [`ParentBound::Since`]
+/// `parent` edge. If the timestamp of the commit is below the bound, the
+/// arrival adds nothing and records no expansion. So a root that names the
+/// same commit still keeps it. The walk memoizes the rejection, so a second
+/// child that arrives under the same bound reads no commit.
+///
+/// The walk seeds each commit that a metadata-key edge names at
+/// `root_bound`. Each such seed is the same entry, so the walk pushes it
+/// at the first edge alone. The walk reads the commit `pending_delete`
+/// names as absent.
+async fn collect_reachable<S: MetadataSource>(
+    store: &S,
+    seeds: Vec<(Checksum, ParentBound, Arrival)>,
+    root_bound: ParentBound,
+    gc: &GcRoots,
+    bounded_roots: &HashSet<Checksum>,
+    pending_delete: Option<Checksum>,
+    reachable: &mut HashSet<ObjectName>,
+) -> Result<()> {
+    let mut commit_stack = seeds;
+    let mut seen_commits: HashMap<Checksum, Expanded> = HashMap::new();
+    let mut seen_dirtrees: HashSet<Checksum> = HashSet::new();
+    // The commits for which the walk pushed a weak-ref seed. A pushed seed
+    // matches `weak_roots` again when the walk pops it. This set stops the
+    // walk from a second push of the seed.
+    let mut weak_seeded: HashSet<Checksum> = HashSet::new();
+    // The commits for which a metadata-key edge pushed a seed. A second
+    // edge to the same commit pushes the same entry, which adds nothing.
+    let mut anchor_seeded: HashSet<Checksum> = HashSet::new();
+
+    while let Some((commit_checksum, bound, arrival)) = commit_stack.pop() {
+        // When the walk reaches the commit of a weak ref over any edge,
+        // the commit takes the bound of the name of that ref. The seed is
+        // a `Root` arrival, so the bound belongs to the commit. Under a
+        // `Since` bound, the walk keeps the commit whatever its timestamp,
+        // as it keeps the target of a strong ref.
+        //
+        // This test comes before the `inherited` drop and applies to each
+        // kind of arrival. A metadata-key edge pushes a `Root` arrival at
+        // the global bound of the run. If the rule tested `inherited`
+        // alone, that arrival can expand the commit at the global bound
+        // while the bound of the weak ref reaches further. Then the sweep
+        // deletes the ancestry of a ref that stays.
+        if let Some(bounds) = gc.weak_roots.get(&commit_checksum)
+            && weak_seeded.insert(commit_checksum)
+        {
+            for weak_bound in bounds.seeds() {
+                commit_stack.push((commit_checksum, weak_bound, Arrival::Root));
+            }
+        }
+
+        // A commit with its own bound takes that bound, whatever bound the
+        // `parent` edge had left. The seed holds that bound. So the walk
+        // drops the arrival here, and the expansion of the seed replaces
+        // it. The walk drops an arrival at the commit of a weak ref in the
+        // same way, because the pushed weak-ref seed holds its bound.
+        if arrival.inherited()
+            && (bounded_roots.contains(&commit_checksum)
+                || gc.weak_roots.contains_key(&commit_checksum))
+        {
+            continue;
+        }
+
+        let seen = seen_commits
+            .get(&commit_checksum)
+            .copied()
+            .unwrap_or_default();
+        if seen.covers(bound) {
+            continue;
+        }
+        if arrival == Arrival::TimedParent && seen.rejects(bound) {
+            continue;
+        }
+
+        let loaded = if pending_delete == Some(commit_checksum) {
+            None
+        } else {
+            try_load_commit(store, &commit_checksum).await?
+        };
+
+        // The walk does not keep a commit that the timestamp bound rejects,
+        // and records no expansion for it. So a ref that names the commit
+        // still reaches it. The walk records the rejection, so a second
+        // child under the same bound does not read the commit again.
+        if arrival == Arrival::TimedParent
+            && let ParentBound::Since(since) = bound
+            && let Some(commit) = &loaded
+            && commit.timestamp < since
+        {
+            seen_commits
+                .entry(commit_checksum)
+                .or_default()
+                .reject(since);
+            continue;
+        }
+
+        seen_commits
+            .entry(commit_checksum)
+            .or_default()
+            .record(bound);
+        reachable.insert(ObjectName::new(commit_checksum, ObjectType::Commit));
+
+        let Some(commit) = loaded else {
+            continue;
+        };
+
+        if gc.traverse_tree {
+            reachable.insert(ObjectName::new(commit.root_dirmeta, ObjectType::DirMeta));
+            walk_tree(store, commit.root_dirtree, &mut seen_dirtrees, reachable).await?;
+        }
+
+        if !gc.metadata_keys.is_empty() {
+            push_metadata_key_edges(
+                store,
+                &commit_checksum,
+                &commit.metadata,
+                gc,
+                root_bound,
+                &mut anchor_seeded,
+                &mut commit_stack,
+            )
+            .await?;
+        }
+
+        if gc.traverse_parent
+            && let Some(parent) = commit.parent
+        {
+            match bound {
+                ParentBound::Depth(0) => {}
+                ParentBound::Depth(depth) => {
+                    let next = if depth < 0 { -1 } else { depth - 1 };
+                    commit_stack.push((parent, ParentBound::Depth(next), Arrival::Parent));
+                }
+                ParentBound::Since(since) => {
+                    commit_stack.push((parent, ParentBound::Since(since), Arrival::TimedParent));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Adds to `reachable` the name of each dirtree, dirmeta, and file object
+/// that `root_dirtree` reaches.
+///
+/// An absent dirtree adds its own name only. A dirtree that does not parse
+/// stops the walk with an error.
+async fn walk_tree<S: MetadataSource>(
+    store: &S,
+    root_dirtree: Checksum,
+    seen_dirtrees: &mut HashSet<Checksum>,
+    reachable: &mut HashSet<ObjectName>,
+) -> Result<()> {
+    let mut stack = vec![root_dirtree];
+    while let Some(dirtree_checksum) = stack.pop() {
+        if !seen_dirtrees.insert(dirtree_checksum) {
+            continue;
+        }
+        reachable.insert(ObjectName::new(dirtree_checksum, ObjectType::DirTree));
+
+        let Some(dirtree) = try_load_dirtree(store, &dirtree_checksum).await? else {
+            continue;
+        };
+        for (_, file_checksum) in dirtree.files {
+            reachable.insert(ObjectName::new(file_checksum, ObjectType::File));
+        }
+        for (_, subtree, submeta) in dirtree.dirs {
+            reachable.insert(ObjectName::new(submeta, ObjectType::DirMeta));
+            stack.push(subtree);
+        }
+    }
+    Ok(())
+}
+
+/// Pushes onto the walk each commit that the configured metadata keys
+/// name.
+///
+/// The function reads each entry with the key from `metadata`, the metadata
+/// of the commit, and then from its detached metadata. So one key name
+/// gives edges from both. A dict that holds the key more than one time
+/// gives the edges of each entry, and the entries can have different
+/// shapes. A key that no dict holds adds nothing.
+///
+/// The value of each entry is an `aay`, an `a(say)`, or an `a{s(say)}`.
+/// The walk reads the 32-byte checksums alone and ignores each string.
+/// If a value does not have one of these shapes, or holds a checksum that
+/// is not 32 bytes, the walk fails with [`Error::InvalidGcRoot`]. If the
+/// walk does not follow an edge, a sweep deletes the objects of that edge.
+/// So a value that the walk cannot read stops the walk.
+///
+/// With more than one defect, the error names the first in this order:
+/// the order of the keys in [`GcRoots::metadata_keys`], then the metadata
+/// of the commit before its detached metadata, then the order of the
+/// entries in the dict, then the order of the elements in the value.
+///
+/// The function pushes a commit only if `seeded` does not hold it, and
+/// adds the commit to `seeded`. It decodes each value also when it pushes
+/// no commit, so the errors stay the same.
+///
+/// The function reads the detached metadata once for each expansion of a
+/// commit, and only if the walk has metadata keys. The walk can reach a
+/// commit again at a depth that follows more parents. It then expands the
+/// commit a second time and reads the detached metadata again.
+async fn push_metadata_key_edges<S: MetadataSource>(
+    store: &S,
+    commit: &Checksum,
+    metadata: &Value,
+    gc: &GcRoots,
+    root_bound: ParentBound,
+    seeded: &mut HashSet<Checksum>,
+    stack: &mut Vec<(Checksum, ParentBound, Arrival)>,
+) -> Result<()> {
+    let detached = match store.load_metadata(ObjectType::CommitMeta, *commit).await? {
+        Some(bytes) => {
+            ostrya_rt::unblock(move || crate::commit::parse_detached_metadata(&bytes)).await?
+        }
+        None => None,
+    };
+    for key in &gc.metadata_keys {
+        for source in [Some(metadata), detached.as_ref()].into_iter().flatten() {
+            for value in dict_values(source, key) {
+                for_each_metadata_key_target(value, |target| {
+                    if seeded.insert(target) {
+                        stack.push((target, root_bound, Arrival::Root));
+                    }
+                })
+                .map_err(|reason| Error::InvalidGcRoot {
+                    commit: *commit,
+                    metadata_key: key.clone(),
+                    reason,
+                })?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Loads and parses a commit for the lenient walk.
+///
+/// Returns `None` if the store does not hold the commit.
+async fn try_load_commit<S: MetadataSource>(
+    store: &S,
+    checksum: &Checksum,
+) -> Result<Option<Commit>> {
+    match store.load_metadata(ObjectType::Commit, *checksum).await? {
+        Some(bytes) => Ok(Some(Commit::parse(&bytes)?)),
+        None => Ok(None),
+    }
+}
+
+/// Loads and parses a dirtree, or returns `None` if it is absent.
+async fn try_load_dirtree<S: MetadataSource>(
+    store: &S,
+    checksum: &Checksum,
+) -> Result<Option<ostrya_core::DirTree>> {
+    match store.load_metadata(ObjectType::DirTree, *checksum).await? {
+        Some(bytes) => Ok(Some(ostrya_core::DirTree::parse(&bytes)?)),
+        None => Ok(None),
     }
 }
 

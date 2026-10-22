@@ -10,8 +10,8 @@
 //!   scratch directory, with one bucket and the same key pair.
 //! - [`StandIn`] is an S3 server in the process that holds its objects in
 //!   memory. A test sets the conditional headers that it honors, the
-//!   requests that it interrupts, refuses, or delays, and the requests that
-//!   get 503.
+//!   requests that it interrupts, refuses, or delays, the requests that get
+//!   503, and the keys whose `GET` gets 404 with a body of the test.
 //!
 //! A test skips when `rclone` or `weed` is not on `PATH`, and writes the
 //! reason to standard error. With `OSTRYA_REQUIRE_S3` set, a missing
@@ -393,6 +393,9 @@ pub struct State {
     /// A method and a count `n`: the server answers the `n`-th request of
     /// the method with 503 `SlowDown`, and does not act on it.
     pub slow_down: Option<(&'static str, usize)>,
+    /// A key and a body: each `GET` of the key, with the prefix of the
+    /// repository, gets 404 with that body.
+    pub not_found: Option<(String, Vec<u8>)>,
     /// `true` if the answer to a `GET` of a key has the `ETag` of the
     /// object.
     pub etag_on_get: bool,
@@ -451,6 +454,7 @@ impl StandIn {
             refuse: None,
             delay: None,
             slow_down: None,
+            not_found: None,
             etag_on_get: true,
             counts: BTreeMap::new(),
             etags: 0,
@@ -550,10 +554,19 @@ fn serve(mut stream: TcpStream, state: &Mutex<State>) {
             let slow_down = state
                 .slow_down
                 .is_some_and(|(method, n)| method == request.method && n == count);
+            let not_found = state
+                .not_found
+                .as_ref()
+                .filter(|(wanted, _)| {
+                    request.method == "GET" && key.as_deref() == Some(wanted.as_str())
+                })
+                .map(|(_, body)| body.clone());
             let (status, headers, body) = if slow_down {
                 (503, Vec::new(), s3_error("SlowDown"))
             } else if refused {
                 (403, Vec::new(), s3_error("AccessDenied"))
+            } else if let Some(body) = not_found {
+                (404, Vec::new(), body)
             } else {
                 answer(&mut state, &request)
             };

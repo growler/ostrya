@@ -27,7 +27,7 @@ use futures_io::AsyncRead;
 use futures_lite::AsyncReadExt;
 use futures_lite::future::zip;
 use futures_lite::io::Cursor;
-use ostrya_core::{Checksum, DeflateReader, ObjectName, ObjectType, RepoMode, is_ref_name};
+use ostrya_core::{Checksum, DeflateReader, ObjectName, ObjectType, is_ref_name};
 use sha2::{Digest, Sha256};
 
 use super::invalid;
@@ -37,6 +37,7 @@ use crate::access::{AuthItem, ClientAccess, ReadAccess};
 use crate::archive::{ArchiveAnswer, ArchiveView};
 use crate::bucket::{
     BucketPushOutcome, BucketRepo, LockOperation, ObjectListing, WriterLock, check_prefixes,
+    object_key,
 };
 use crate::error::{Error, Result};
 use crate::hashing::VerifyingReader;
@@ -785,11 +786,6 @@ pub(super) async fn fail(lock: WriterLock<'_>, e: Error) -> Error {
     e
 }
 
-/// Returns the bucket key of the object `name`.
-pub(super) fn object_key(name: &ObjectName) -> String {
-    format!("objects/{}", name.loose_path(RepoMode::Archive))
-}
-
 /// One upload of a push.
 #[derive(Clone, Copy)]
 pub(super) enum Job {
@@ -1219,6 +1215,8 @@ impl AsyncRead for Counted<'_> {
 
 #[cfg(test)]
 mod tests {
+    use ostrya_core::RepoMode;
+
     use super::super::test_repo::{Scratch, commit_tree};
     use super::*;
 

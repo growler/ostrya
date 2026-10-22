@@ -374,8 +374,7 @@ impl Repo {
             Err(Error::ObjectNotFound { .. }) => return Ok(None),
             Err(e) => return Err(e),
         };
-        // A zero-length file marks deleted metadata. It is not an empty dict.
-        crate::summary::parse_signature_dict(&bytes)
+        parse_detached_metadata(&bytes)
     }
 
     /// Loads the bytes of the commit object `checksum` and its detached
@@ -514,6 +513,20 @@ pub(crate) fn check_gc_anchors<'a>(
         }
     }
     Ok(())
+}
+
+/// Parses `bytes`, the contents of a `.commitmeta` file, as detached
+/// metadata.
+///
+/// Returns `None` for a zero-length file. Such a file marks deleted
+/// metadata. It is not an empty dict. The parse blocks the thread, so an
+/// async caller runs it on the blocking pool.
+///
+/// # Errors
+///
+/// [`Error::Core`] if `bytes` does not parse as an `a{sv}` dict.
+pub(crate) fn parse_detached_metadata(bytes: &[u8]) -> Result<Option<Value>> {
+    crate::summary::parse_signature_dict(bytes)
 }
 
 /// Appends one entry to an `a{sv}` dict value, after its existing entries.

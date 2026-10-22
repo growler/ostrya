@@ -114,6 +114,8 @@
 //! # Ok(()) }
 //! ```
 
+use ostrya_core::{ObjectName, RepoMode};
+
 use crate::error::Result;
 use crate::remote::PushOutcome;
 use crate::remote::s3::{Address, Bucket, PutIfAbsent, S3Endpoint};
@@ -125,6 +127,7 @@ mod state;
 // build and the write of the summary stay for an explicit summary update.
 #[allow(dead_code)]
 mod summary;
+mod walk;
 
 pub use listing::ObjectListing;
 pub use lock::{LockHolder, LockOperation, WriterLock};
@@ -410,6 +413,11 @@ fn config_bytes(collection_id: Option<&str>, zlib_level: Option<u8>) -> Vec<u8> 
         text.push_str(&format!("\n[archive]\nzlib-level={level}\n"));
     }
     text.into_bytes()
+}
+
+/// Returns the bucket key of the object `name`.
+pub(crate) fn object_key(name: &ObjectName) -> String {
+    format!("objects/{}", name.loose_path(RepoMode::Archive))
 }
 
 /// Returns the error of a request of the caller that the bucket repository

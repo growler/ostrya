@@ -4,11 +4,11 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use futures_lite::AsyncReadExt;
-use ostrya_core::{Checksum, ObjectName, ObjectType, RepoMode, loose_path};
+use ostrya_core::{Checksum, ObjectName, ObjectType};
 use sha2::{Digest, Sha256};
 
 use super::state::{BucketRefs, summary_refs};
-use super::{BucketRepo, ObjectListing, WriterLock};
+use super::{BucketRepo, ObjectListing, WriterLock, object_key};
 use crate::config::RepoConfig;
 use crate::delta::{MAX_SUPERBLOCK, parse_delta_dir};
 use crate::deltagen::{DeltaDigest, delta_name, summary_delta_map};
@@ -233,10 +233,7 @@ impl BucketRepo {
         commit: &Checksum,
         listed: Option<u64>,
     ) -> Result<CommitFacts> {
-        let key = format!(
-            "objects/{}",
-            loose_path(commit, ObjectType::Commit, RepoMode::Archive)
-        );
+        let key = object_key(&ObjectName::new(*commit, ObjectType::Commit));
         let cap = match listed {
             Some(size) if size > MAX_METADATA_SIZE => {
                 return Err(self.malformed(format!(

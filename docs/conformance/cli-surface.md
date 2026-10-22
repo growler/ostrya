@@ -3055,7 +3055,8 @@ the same rules. Two differences stand:
 The port also pulls over ssh, which the tool does not do. The address of a
 pull is `--url`, then the `pull-url` key of the remote, then its `url` key. A
 value that starts with `ssh://`, or that holds no `://`, is an ssh address.
-Any other value goes to the fetcher as written. For an ssh address, `pull`
+A value that starts with `s3://` is the address of a bucket repository
+("Bucket repositories"). Any other value goes to the fetcher as written. For an ssh address, `pull`
 runs the ssh client with the remote command `ostrya send --repo='PATH'`
 (`send`). `pull` has no option for the ssh command or for the remote
 command: the `OSTRYA_SSH_COMMAND` environment variable, and then the
@@ -3918,14 +3919,18 @@ and https are fetched`.
 `remote refs` and `remote summary` find the remote by the address rule of
 `pull`, with no `--url`: the `pull-url` key, then the `url` key. For an ssh
 address they read `summary.sig` and `summary` over ssh from `ostrya send`,
-with the ssh command and the remote command of `pull`. The tool reads `url`
-alone.
+with the ssh command and the remote command of `pull`. For an `s3://`
+address they read the two files from the bucket repository with signed
+requests, and take the S3 options of `pull` ("Bucket repositories"). The
+tool reads `url` alone.
 
 `remote add-cookie`, `remote delete-cookie`, and `remote list-cookies` stay out.
 The fetcher refuses a `Cookie` header at construction when a mirror is
 cleartext `http`, unless the caller sets
-`FetcherOptions::allow_cleartext_credentials`. `pull` has no option that sets
-it. Cookie-jar support needs its own design pass against that refusal.
+`FetcherOptions::allow_cleartext_credentials`. `pull` takes
+`--allow-cleartext-credentials` for an `s3://` address alone, and refuses it
+for each other address, so no option of `pull` sets it for an HTTP remote.
+Cookie-jar support needs its own design pass against that refusal.
 
 ## GPG verification differences
 
@@ -4026,15 +4031,17 @@ the tool, in `show`, in a `pull` that verifies, and in the keyring reads of
 
 ## Port extensions with no counterpart in the tool
 
-The tool has no push, no pull over ssh, no server, and no composefs image
-object. `receive`, `push`, `push-tree`, `serve`, `send`, and
-`composefs-image` are commands of the port alone, so no matrix cell compares
-them with the tool. `pull`, `remote refs`, and `remote
-summary` also read a remote over ssh, for an ssh address in the `pull-url`
-key or in `--url` of `pull` (`pull`). The receiving repository stays a
-normal repository: the tool reads it, checks it with `ostree fsck`, and
-pulls from it with `ostree pull-local`. The tool pulls from `serve` with
-`ostree pull`.
+The tool has no push, no pull over ssh, no server, no composefs image
+object, and no bucket repository. `receive`, `push`, `push-tree`, `serve`,
+`send`, `composefs-image`, and `remote init` are commands of the port
+alone, so no matrix cell compares them with the tool. `pull`, `remote
+refs`, and `remote summary` also read a remote over ssh, for an ssh address
+in the `pull-url` key or in `--url` of `pull` (`pull`), and a bucket
+repository in an S3 bucket, for an `s3://` address in the same places
+("Bucket repositories"). The receiving repository stays a normal
+repository: the tool reads it, checks it with `ostree fsck`, and pulls from
+it with `ostree pull-local`. The tool pulls from `serve` with `ostree
+pull`.
 
 ### `receive`
 
@@ -4089,6 +4096,11 @@ ostrya push [--repo=PATH] REMOTE SRC[:DST]...
             [--push-token-file=FILE] [--push-user=NAME]
             [--tls-client-cert-path=FILE] [--tls-client-key-path=FILE]
             [--tls-ca-path=FILE] [--allow-cleartext-credentials]
+ostrya push [--repo=PATH] REMOTE|s3://BUCKET[/PREFIX] SRC[:DST]...
+            [--collection=ID] [--depth=N] [--force] [--break-lock]
+            [--s3-region=REGION] [--s3-endpoint=URL]
+            [--s3-addressing=path|virtual] [--s3-profile=PROFILE]
+            [--allow-cleartext-credentials]
 ostrya push [--repo=PATH] REMOTE REF --onto=BRANCH
             [--collection=ID] [--tag=NAME]... [--bind-ref=NAME]...
             [--orphan] [--timestamp=TIME] [--compress[=LEVEL]]
@@ -4098,10 +4110,11 @@ ostrya push [--repo=PATH] REMOTE REF --onto=BRANCH
 - The `push` feature of `ostrya-cli` builds the command. It is in the
   default set.
 - `REMOTE` is a remote of the repository config with a push address, an
-  ssh address, or an `http://` or `https://` address. To an ssh address the
-  push runs the ssh client with the remote command `ostrya receive
-  --repo='PATH'`. To an HTTP address the push sends its requests to the
-  receive endpoint of `serve`.
+  ssh address, an `http://` or `https://` address, or an `s3://` address.
+  To an ssh address the push runs the ssh client with the remote command
+  `ostrya receive --repo='PATH'`. To an HTTP address the push sends its
+  requests to the receive endpoint of `serve`. To an `s3://` address the
+  push writes a bucket repository ("Bucket repositories").
 - Each refspec is `SRC[:DST]`. `SRC` is a revision of the local repository.
   `DST` is the ref of the server, and it defaults to `SRC` when `SRC` is a
   ref. `:DST` deletes the ref `DST` of the server.
@@ -4319,6 +4332,109 @@ ostrya push [--repo=PATH] REMOTE REF --onto=BRANCH
   `error: MESSAGE` to standard error and exits 1. The refs of the server
   have changed at that point.
 
+### Bucket repositories
+
+```text
+ostrya remote init [--repo=PATH] NAME|s3://BUCKET[/PREFIX]
+                   [--collection-id=ID] [--break-lock]
+                   [the S3 options] [--allow-cleartext-credentials]
+```
+
+A bucket repository is a repository in `archive` form in an S3 bucket, at
+the address `s3://BUCKET[/PREFIX]` (`../format-reference.md`, "The S3
+bucket repository"). The tool has no such repository, so no matrix cell
+compares these commands with the tool. The `s3` feature of `ostrya-cli`
+builds the S3 options, `--break-lock`, and `remote init`. It is in the
+default set.
+
+The S3 options are `--s3-region=REGION`, `--s3-endpoint=URL`,
+`--s3-addressing=path|virtual`, and `--s3-profile=PROFILE`. `push`, `pull`,
+`remote refs`, `remote summary`, and `remote init` take them. Each one wins
+over the remote key of the same name, then the environment, then the
+profile in the shared AWS config file, then the default
+(`ostrya-config(1)`, "REMOTE KEYS"). A profile that `--s3-profile` or
+`s3-profile` names skips the key pair, the region, and the endpoint of the
+environment. The option parser refuses an `--s3-addressing` value other
+than `path` and `virtual`. An `http://` S3 endpoint needs
+`--allow-cleartext-credentials`, because the signature of each request is
+a credential: `error: invalid input: the S3 endpoint 'URL' is http://, so
+the signature of each request would travel in cleartext: use https, or set
+allow-cleartext-credentials`.
+
+- `remote init` writes the `config` of a new bucket repository, with
+  `collection-id=ID` for `--collection-id=ID`. With an address, the command
+  opens no repository. With a remote name, the address is the `push-url`
+  key when it holds an `s3://` address, else the `pull-url` key when it
+  holds one. The command never reads `url`, and refuses each other remote
+  with `error: invalid input: remote 'NAME' holds no s3:// address in
+  push-url or pull-url`. It refuses an address that is not `s3://`, a
+  collection id that fails the collection-id rule before any request, and
+  a bucket repository that holds a `config`, which stays as it is. It
+  writes nothing to standard output.
+- `push` to an `s3://` address, or to a remote whose push address is one,
+  writes the objects that the bucket does not hold, then the ref files,
+  under the writer lock of the bucket repository. It writes no summary,
+  and a summary of the bucket stays as it is. The bucket repository needs
+  a `config`, else `error: invalid input: the bucket repository ADDRESS has
+  no config; init it first`. `--collection` selects the namespace with the
+  `config` of the bucket in the role of the server: the collection id of
+  the bucket, or no collection, gives `refs/heads/NAME`, and each other
+  collection gives `refs/mirrors/ID/NAME`. The push refuses `--tag`,
+  `--compress`, `--onto`, a delete refspec, `--push-token-file`,
+  `--push-user`, the keys `push-token-file` and `push-user`, and the ssh
+  options. It reads the environment and the shared AWS files before it
+  refuses `--tag` and `--compress`, and sends no request for either
+  refusal. The ref lines and the exit status are those of a push over a
+  session.
+- `--break-lock` of `push` and of `remote init` removes the writer lock of
+  another writer, then takes a new lock. After a command that succeeds, the
+  holder of the removed lock goes to standard error in one line:
+  `warning: removed the writer lock of HOLDER`. Without the option, a
+  locked bucket repository refuses the command with `error: the bucket
+  repository ADDRESS is locked: another writer holds the writer lock:
+  HOLDER`. `--break-lock` conflicts with `--onto`.
+- `push` refuses `--break-lock` and each S3 option for an HTTP or an ssh
+  destination, before the remote resolves: `error: OPTION applies to an
+  s3:// address, and the push address of 'REMOTE' is not one`. `REMOTE` is
+  the operand without its userinfo. The destination of a remote name is
+  its `push-url`, else its `url`.
+- `pull`, `remote refs`, and `remote summary` take the S3 options and
+  `--allow-cleartext-credentials`, and refuse each of them when the pull
+  address is an HTTP or an ssh address: `error: OPTION applies to an s3://
+  address, and the pull address of remote 'NAME' is not one`. The pull
+  address is `--url`, else `pull-url`, else `url`. A pull address that the
+  resolver refuses, for example `s3://` in `url` or a remote that the
+  config does not describe, gives the refusal of the resolver, also with
+  these options. `pull --collection` refuses each of
+  them: `error: OPTION applies to an s3:// address, and a pull with
+  --collection reads no s3:// address`. A pull of a collection from an S3
+  remote is refused.
+- A pull of a named ref reads the ref file of the bucket when the summary
+  does not list the ref, so a bucket repository with no summary serves
+  `pull REMOTE REF`. `remote refs`, `remote summary`, a pull with
+  `--mirror` and no ref, and a pull that verifies the signature of the
+  summary need a summary, and a push writes none. A pull of a ref that
+  the summary lists takes the commit of the summary. So after a push moves
+  that ref, the pull takes the old commit until an update of the summary.
+- `s3://` in the key `url` is refused by `pull`, `remote refs`, `remote
+  summary`, and `push`: the tool also reads `url`, and it reads no `s3://`
+  address.
+- `remote add NAME s3://BUCKET[/PREFIX]` writes the address to `pull-url`
+  and `push-url`, after the branches, and writes no `url`. It does not check
+  the address, also in a build without the feature `s3`. `--set` writes the
+  S3 keys. A pull or a push refuses a bad address or a bad key when it uses
+  the remote. `remote show-url` and `remote list -u` refuse such a remote
+  with `error: No "url" option in remote "NAME"`, as for each remote with
+  no `url`.
+- A push to a bucket repository shows no progress bar while it lists the
+  bucket and walks the commits. The bar starts with the uploads.
+- A build without the feature `s3` has no S3 option, no `--break-lock`, no
+  `--allow-cleartext-credentials` on `pull`, `remote refs`, and `remote
+  summary`, and no `remote init`. It refuses an `s3://` address with
+  `error: unsupported: the pull address 'ADDRESS' is an s3:// address, and
+  this build of ostrya has no S3 support: turn on the feature s3 of
+  ostrya`, and with the same text for a push address.
+
 ### `push-tree`
 
 ```text
@@ -4362,6 +4478,13 @@ ostrya push-tree [--repo=PATH] REMOTE DIR --onto=BRANCH
   with `error: SOURCE_DATE_EPOCH is not a Unix timestamp: ...` at exit 1.
   With neither, the push sends no timestamp, and the server takes its own
   clock.
+- The command then refuses a push address that is an `s3://` address: an
+  `s3://` operand, or a remote whose `push-url`, else `url`, holds one. The
+  message is `error: push-tree does not write a bucket repository, and the
+  push address of 'REMOTE' is an s3:// address`. The refusal comes before
+  the resolve, so the command reads no AWS variable and no AWS file. A build
+  without the feature `s3` refuses the address in the resolve, with the
+  message of the feature.
 - The command then resolves `REMOTE` and makes the transport ready. It
   refuses an option of the other transport and a bad HTTP option. It reads
   the token file of an HTTP push, and the TLS files of an `https://` push.

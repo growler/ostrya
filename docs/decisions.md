@@ -787,14 +787,13 @@ session, and `Repo::push` with `Endpoint::S3` calls it. It gives
 `PushOutcome` was rejected: the type is in `ostrya-remote`, it has no
 `#[non_exhaustive]`, and a session push has no writer lock.
 
-`RepoPushOptions` gets `summary_signers: Vec<Arc<dyn Signer>>`, `break_lock`,
-and the hidden `part_size`, with no feature gate, as `EndpointOverrides`
-gets its S3 fields. A gate behind the feature `s3` was rejected: a caller
-that builds the struct then compiles in one feature set alone. The struct
-gets a written `Debug`, which names each signer, as `DeltaOptions` does. A
-push over ssh or HTTP refuses each of the three fields. `part_size` lets a
-test send an object in parts of 5 MiB. `Bucket::put_stream` still refuses a
-part below 5 MiB, because SeaweedFS 4.36 refuses it at the completion.
+`RepoPushOptions` gets `break_lock` and the hidden `part_size`, with no
+feature gate, as `EndpointOverrides` gets its S3 fields. A gate behind the
+feature `s3` was rejected: a caller that builds the struct then compiles in
+one feature set alone. A push over ssh or HTTP refuses each of the two
+fields. `part_size` lets a test send an object in parts of 5 MiB.
+`Bucket::put_stream` still refuses a part below 5 MiB, because SeaweedFS
+4.36 refuses it at the completion.
 
 The push runs all local checks of a session push before it takes the writer
 lock, so a local refusal takes no lock and sends no request. The
@@ -825,10 +824,22 @@ ref takes the place of the head of the same name, was rejected for a
 bucket: a push writes the refs of the own collection under `refs/heads/`
 alone, so no writer of the port makes that state.
 
-A push refuses an update whose new ref set holds, in one ref directory, a
-name that is a directory of another name. A bucket has no directories, so
-the two keys can both exist, but a local repository cannot hold the two
-refs, and a pull into one fails.
+A push reads the ref files of the ref directory of its namespace alone:
+`refs/heads/` for a push into the own collection or with no collection, and
+`refs/mirrors/ID/` for a mirror push. For the refusal of `refs/mirrors/ID/`
+of the own collection id, it lists that directory alone. The check that
+each ref names a commit that the bucket holds or that the push uploads,
+and the check of the directory prefixes, cover the ref directory of the
+namespace alone. A key or a ref file of another namespace that breaks a
+rule does not refuse the push, and the fsck of a bucket repository checks
+it. A read of all refs of the bucket at each push was rejected: the cost of
+the push then grows with the refs of each namespace, also of the namespaces
+that the push does not write, and only a summary write needs all refs.
+
+A push refuses an update whose new ref set holds, in the ref directory of
+its namespace, a name that is a directory of another name. A bucket has no
+directories, so the two keys can both exist, but a local repository cannot
+hold the two refs, and a pull into one fails.
 
 After a failure before the ref writes, the push releases its lock and
 returns the first error. An error of that release is dropped: the lock
@@ -850,16 +861,22 @@ copy, as a pull with such a filter keeps the copy of the destination. An
 upload of an empty file and a delete of the bucket copy were rejected:
 each one removes metadata that the filter of the push did not name.
 
-The push builds and signs the summary after the uploads and before the
-first ref write. Then it checks the lock, writes the refs, checks the lock
-again, and writes `summary` and `summary.sig`. So each refusal of the
-summary build and each failure of a signer comes before any ref changes.
-A build after the ref writes was rejected: a refusal that depends on the
-state of the bucket, for example a commit object of the bucket that does
-not have the checksum of its name, then moves the refs on each run and
-never writes the summary. The writer reads `tombstone-commits` and
-`indexed-deltas` with the `config`, so a value that is not a boolean
-refuses the push before its first upload.
+The push writes no summary. The update of the summary of a bucket
+repository is always explicit, as in a local `archive` repository with no
+`auto-update-summary`. A push leaves a `summary` and a `summary.sig` of the
+bucket as they are, so they can list old refs, and a pull of a named ref
+reads the ref file when the summary does not list the ref. The writer
+still reads `tombstone-commits` and `indexed-deltas` with the `config`, so
+a value that is not a boolean refuses the push before its first upload.
+
+A summary write on each push, signed by the signers of a field
+`summary_signers` of `RepoPushOptions`, with a refusal of a push with no
+signer to a bucket repository with a `summary.sig`, is rejected. With it,
+each push needs the signing keys of the summary, and reads the commit of
+each ref and each superblock of the bucket. One rule, the explicit update,
+writes the summary. `RepoPushOptions` has no field for the signers of a
+summary. The summary builder of a bucket repository stays in the crate for
+the explicit update.
 
 The push walks no tree of a commit that the listing of the bucket holds.
 Each writer uploads a commit object after each object of its tree, so a
@@ -882,6 +899,78 @@ writer for one case, and a caller can read the holder with
 session counts into the handle of the caller. The progress bar of the
 `ostrya` command reads the same handle with no change. A progress type of
 its own for the bucket push was rejected for this reason.
+
+## The `ostrya` command and bucket repositories
+
+`ostrya-cli` turns on the feature `s3` of `ostrya` in its default set, so
+the shipped binary reads and writes bucket repositories. The feature gates
+the S3 options, `--break-lock`, and `remote init`, as the features `push`,
+`serve`, and `send` gate their commands. A build without the feature
+refuses an `s3://` address with the message of the library, which names
+the feature.
+
+The init of a bucket repository is `ostrya remote init NAME|ADDRESS`, with
+`--collection-id`, `--break-lock`, the S3 options, and
+`--allow-cleartext-credentials`. A group `repo` with a command
+`repo init-s3` was rejected: `remote` already holds the commands that act on
+a remote, and the init needs no local repository. With an address, the
+command opens no repository. With a remote name, it reads the remote from
+the config of the repository.
+
+`endpoint::resolve_bucket` gives the endpoint of each writer of a bucket
+repository other than a push. For a remote name, the address is `push-url`
+when it is `s3://`, else `pull-url` when it is `s3://`, and else the remote
+is refused. The key `url` is never read. The function makes the refusals of
+a push to an `s3://` address: `tls-permissive=true`, `push-token-file`,
+`push-user`, and the ssh fields. A resolver for each writer was rejected,
+because each writer takes the same address and the same refusals.
+
+`endpoint::pull_address_is_s3` tells if the pull address of a remote,
+`--url`, else `pull-url`, else `url`, is `s3://`, an HTTP or an ssh
+address, or an address that `resolve_pull` refuses, with no file and no
+environment. The command refuses `--allow-cleartext-credentials` and the
+four `--s3-*` options of `pull`, `remote refs`, and `remote summary` when
+the address is an HTTP or an ssh address, with the name of the option. For
+an address that `resolve_pull` refuses, the command passes the options on,
+and `resolve_pull` states its refusal. A refusal of the options for such an
+address was rejected: its message hides the real refusal, for example an
+`s3://` address in `url` or a remote that the config does not describe.
+`Repo::remote_fetch_summary_with` takes the overrides of the caller, so
+`remote refs` and `remote summary` take the S3 options.
+`Repo::remote_fetch_summary` stays, with the default overrides. For
+`push`, the command reads the push address of the remote, `push-url`, else
+`url`, and refuses `--break-lock` and the `--s3-*` options for an HTTP or
+an ssh destination with the name of the option. A refusal by the library,
+which names the remote key, was rejected for these options, because the
+key names do not tell the user which option to remove.
+
+`ostrya push` calls `Repo::push_to_bucket` for an S3 endpoint, because
+`Repo::push` drops the holder of a broken lock. The holder goes to standard
+error in one line, `warning: removed the writer lock of HOLDER`, after a
+push or an init that succeeds. `--break-lock` conflicts with `--onto`.
+
+`ostrya remote add NAME s3://...` writes `pull-url` and `push-url` after the
+branches, and writes no `url`, also in a build without the feature `s3`.
+The command does not parse the address. A pull or a push refuses a bad
+address when it uses the remote. `remote show-url` and `remote list -u`
+then fail for the remote, because it has no `url`.
+
+`resolve_push` reads the environment and the shared AWS files before the
+library refuses `--tag` and `--compress` for an S3 destination. A check of
+these options in the command before the resolution was rejected: it copies
+a rule of the library, and the read of the files sends no request.
+
+A push to a bucket repository shows no progress bar while it lists the
+bucket and walks the commits, because the bar of `push` shows nothing in
+the phase `Scanning`. A bar of its own for the listing was rejected for
+this release.
+
+The tests of the S3 options run against the stand-in of
+`crates/ostrya/tests/common/s3.rs`, which keeps the `Authorization` header
+of each request, so a test of `--s3-region` and of `--s3-profile` needs no
+rclone. CI installs `rclone` and sets `OSTRYA_REQUIRE_S3`, and a CI step
+builds `ostrya-cli` without the feature `s3` and runs
+`crates/ostrya-cli/tests/s3_absent.rs`.
 
 ## The client access of `ostrya serve`
 

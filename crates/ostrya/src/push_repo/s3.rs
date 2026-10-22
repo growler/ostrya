@@ -8,13 +8,12 @@
 //! `refs/heads/` or `refs/mirrors/ID/`.
 //!
 //! The writes go in this order: the tree objects, the composefs images, and
-//! the detached metadata, then the commit objects, the ref files, `summary`,
-//! and `summary.sig`. The push builds and signs the summary before the first
-//! ref write. A commit object goes up only after each object of its tree, so
-//! a commit object in the bucket has its whole tree in the bucket at each
-//! point of a run, also of a run that failed. A run again lists the objects
-//! and uploads only the rest, and it walks no tree of a commit that the
-//! bucket holds.
+//! the detached metadata, then the commit objects and the ref files. The push
+//! writes no `summary` and no `summary.sig`. A commit object goes up only
+//! after each object of its tree, so a commit object in the bucket has its
+//! whole tree in the bucket at each point of a run, also of a run that
+//! failed. A run again lists the objects and uploads only the rest, and it
+//! walks no tree of a commit that the bucket holds.
 
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
@@ -33,8 +32,7 @@ use super::source::RepoSource;
 use crate::access::{AuthItem, ClientAccess, ReadAccess};
 use crate::archive::{ArchiveAnswer, ArchiveView};
 use crate::bucket::{
-    BucketPushOutcome, BucketRefs, BucketRepo, LockOperation, ObjectListing, SignedSummary,
-    SummaryInput, WriterLock, check_prefixes,
+    BucketPushOutcome, BucketRepo, LockOperation, ObjectListing, WriterLock, check_prefixes,
 };
 use crate::error::{Error, Result};
 use crate::pull::drive::Slots;
@@ -53,12 +51,18 @@ enum Namespace {
 }
 
 impl Namespace {
+    /// Returns the ref directory of the namespace, `refs/heads/` or
+    /// `refs/mirrors/ID/`.
+    fn dir(&self) -> String {
+        match self {
+            Namespace::Local { .. } => "refs/heads/".to_owned(),
+            Namespace::Mirror { id } => format!("refs/mirrors/{id}/"),
+        }
+    }
+
     /// Returns the bucket key of the ref `name` of the namespace.
     fn key(&self, name: &str) -> String {
-        match self {
-            Namespace::Local { .. } => format!("refs/heads/{name}"),
-            Namespace::Mirror { id } => format!("refs/mirrors/{id}/{name}"),
-        }
+        format!("{}{name}", self.dir())
     }
 }
 
@@ -118,12 +122,6 @@ struct Update {
 struct Uploaded {
     /// The updates, in the order of the refspecs.
     updates: Vec<Update>,
-    /// The refs of the bucket with the updates.
-    refs: BucketRefs,
-    /// The listing of the objects of the bucket before the uploads.
-    listing: ObjectListing,
-    /// The `config` of the bucket.
-    config: crate::config::RepoConfig,
     stats: PushStats,
 }
 
@@ -154,6 +152,11 @@ impl Repo {
     /// bucket alone: it uploads each object of its walk that the listing does
     /// not hold.
     ///
+    /// The push writes no `summary` and no `summary.sig`. A `summary` and a
+    /// `summary.sig` that the bucket holds stay as they are, so they do not
+    /// show the refs that the push writes. A pull of a named ref reads the
+    /// ref file of the bucket when the summary does not list the ref.
+    ///
     /// # Steps
     ///
     /// 1. The push refuses the options that it cannot carry, and runs the
@@ -164,11 +167,12 @@ impl Repo {
     /// 2. It takes the writer lock of the bucket repository for
     ///    [`LockOperation::Push`], with
     ///    [`break_lock`](RepoPushOptions::break_lock).
-    /// 3. It reads the `config` and the presence of `summary.sig`, then the
-    ///    refs and the listing of the objects. Each pair of reads runs at the
-    ///    same time. It selects the namespace and checks the bindings. For
-    ///    each ref, the tip of the ref in the bucket must be an ancestor of
-    ///    the new commit in the local repository, unless
+    /// 3. It reads the `config` and selects the namespace. Then at the same
+    ///    time it reads the ref files of the ref directory of the namespace,
+    ///    lists `refs/mirrors/` of the collection id of the bucket, and lists
+    ///    the objects. It reads no ref file of another namespace. It checks
+    ///    the bindings. For each ref, the tip of the ref in the bucket must
+    ///    be an ancestor of the new commit in the local repository, unless
     ///    [`force`](RepoPushOptions::force) is set. A tip that the local
     ///    repository does not hold, or marks partial, is no ancestor.
     /// 4. It walks the commits to offer: each source commit and its history,
@@ -188,18 +192,9 @@ impl Repo {
     ///    commit with no detached metadata after the filter, which leaves the
     ///    bucket copy.
     /// 6. It uploads each commit object that the bucket lacks.
-    /// 7. It builds the summary of the bucket repository and signs it with
-    ///    [`summary_signers`](RepoPushOptions::summary_signers). The summary
-    ///    holds the refs of `refs/heads/` in field 0, and the refs of
-    ///    `refs/mirrors/ID/` in `ostree.summary.collection-map`, with the
-    ///    `ostree.summary.collection-id` of the `config`. It is the root
-    ///    summary of a local repository with the same refs, commits,
-    ///    deltas, and `config`, with no `ostree-metadata` anchor commit.
-    /// 8. It checks the writer lock, then writes each ref file that changes,
+    /// 7. It checks the writer lock, then writes each ref file that changes,
     ///    in the order of the refspecs.
-    /// 9. It checks the writer lock, then writes `summary`, also when no ref
-    ///    changed, and then `summary.sig`.
-    /// 10. It releases the writer lock.
+    /// 8. It releases the writer lock.
     ///
     /// # Namespace
     ///
@@ -217,7 +212,7 @@ impl Repo {
     ///
     /// The push sets the phase `Scanning` for the checks and the walk,
     /// `Uploading` for the uploads of the objects, and `Committing` for the
-    /// summary, the refs, and the writes of the summary. The objects that it
+    /// writes of the refs. The objects that it
     /// uploads, other than the composefs images, count as needed and as
     /// sent. The content of an `archive` repository counts with the stored
     /// bytes of each `.filez` as the push reads them. In each other mode,
@@ -228,25 +223,19 @@ impl Repo {
     ///
     /// # Failure states
     ///
-    /// - A failure before the ref writes changes no ref. This covers each
-    ///   refusal of the summary build and each failure of a summary signer.
-    ///   The objects that went up stay, and a run again uploads only the
-    ///   rest. The push releases the lock, and returns the first error. An
+    /// - A failure before the ref writes changes no ref. The objects that
+    ///   went up stay, and a run again uploads only the rest. The push releases the lock, and returns the first error. An
     ///   error of the release is dropped: the lock then stays, and the next
     ///   writer names it. When one upload fails, the push starts no new
     ///   upload and waits for the uploads in flight. A failed upload aborts
     ///   its own multipart upload.
-    /// - A failure of a ref write leaves some refs moved and the old summary.
-    ///   A run again finds the moved refs at their new commits, writes the
-    ///   other refs, and writes the summary.
-    /// - A failure of the summary write leaves the new refs and the old
-    ///   summary, or the new summary and the old `summary.sig`. A run again
-    ///   writes both.
+    /// - A failure of a ref write leaves some refs moved. A run again finds
+    ///   the moved refs at their new commits, and writes the other refs.
     /// - A check of the lock that finds another lock, or no lock, stops the
     ///   push before its next write with
     ///   [`Error::BucketLockLost`], and the push releases no lock.
-    /// - A failure of the release, or a crash, leaves the lock. The refs and
-    ///   the summary are written at that point. The next writer gets
+    /// - A failure of the release, or a crash, leaves the lock. The refs are
+    ///   written at that point. The next writer gets
     ///   [`Error::BucketLocked`], and a push with `break_lock` removes the
     ///   lock and names its holder in [`BucketPushOutcome::broken_lock`].
     ///   The holder is reported on success alone: a push that breaks the
@@ -273,20 +262,17 @@ impl Repo {
     /// - The errors of [`BucketRepo::lock`].
     /// - [`Error::Remote`] with
     ///   [`InvalidInput`](crate::remote::Error::InvalidInput) if the bucket
-    ///   repository has no `config`, if it has a `summary.sig` and `opts`
-    ///   has no summary signer, or if one ref directory of the new ref set
-    ///   holds a name that is a directory of another name.
+    ///   repository has no `config`, or if the ref directory of the namespace
+    ///   holds a name that is a directory of another name after the push.
     /// - [`Error::InvalidFormat`] if the `config` of the bucket is malformed,
     ///   states a mode other than `archive-z2` and `archive`, or holds a
     ///   `tombstone-commits` or `indexed-deltas` that is no boolean, if a key
-    ///   under `refs/` is no ref of `refs/heads/` or of `refs/mirrors/ID/`,
-    ///   if the bucket holds `refs/mirrors/ID/` of its own collection id, if
-    ///   a ref file is malformed, or if a ref of the bucket names a commit
-    ///   that the bucket does not hold. The push then uploads nothing. Also,
-    ///   before the ref writes, if a commit object of the bucket that a ref
-    ///   names is larger than its cap or does not have the checksum of its
-    ///   name, if a superblock key under `deltas/` names no delta, or if a
-    ///   superblock or the summary is larger than its cap.
+    ///   under the ref directory of the namespace is no ref name, if the
+    ///   bucket holds `refs/mirrors/ID/` of its own collection id, if a ref
+    ///   file of the namespace is malformed, or if a ref of the namespace
+    ///   names a commit that the bucket does not hold. The push then uploads
+    ///   nothing. The push does not check the keys and the ref files of the
+    ///   other namespaces.
     /// - [`Error::Remote`] with
     ///   [`BindingMismatch`](crate::remote::Error::BindingMismatch) if the
     ///   binding of a source commit does not agree with the namespace.
@@ -296,13 +282,10 @@ impl Repo {
     /// - [`Error::ObjectNotFound`] if the local repository lacks an object of
     ///   the walk.
     /// - [`Error::BucketLockLost`] if a check of the writer lock fails.
-    /// - [`Error::Signature`] that names the key of a summary signer that
-    ///   fails, before the ref writes.
     /// - [`Error::Remote`] for an error of the bucket client, for example
     ///   [`S3`](crate::remote::Error::S3) for an error response.
     /// - [`Error::Io`] and [`Error::Core`] for a failed read of the local
-    ///   repository, and [`Error::Core`] for a commit object of the bucket
-    ///   that does not parse, before the ref writes.
+    ///   repository.
     pub async fn push_to_bucket(
         &self,
         endpoint: S3Endpoint,
@@ -325,15 +308,15 @@ impl Repo {
         let start = Instant::now();
         let lock = bucket.lock(LockOperation::Push, opts.break_lock).await?;
         let broken_lock = lock.broken().cloned();
-        let (updates, mut stats, summary) =
-            match self.prepare_bucket(&bucket, &mut plan, &opts).await {
-                Ok(prepared) => prepared,
+        let Uploaded { updates, mut stats } =
+            match self.upload_to_bucket(&bucket, &mut plan, &opts).await {
+                Ok(uploaded) => uploaded,
                 Err(e) => return Err(fail(lock, e).await),
             };
-        if let Err(e) = write_bucket_refs(&bucket, &lock, &updates).await {
-            return Err(fail(lock, e).await);
+        if let Some(progress) = progress {
+            progress.set_phase(PushPhase::Committing);
         }
-        if let Err(e) = bucket.write_summary(&lock, summary).await {
+        if let Err(e) = write_bucket_refs(&bucket, &lock, &updates).await {
             return Err(fail(lock, e).await);
         }
         lock.release().await?;
@@ -356,37 +339,6 @@ impl Repo {
         })
     }
 
-    /// Runs the steps of a push to `bucket` before the ref writes: the
-    /// uploads, then the build and the signature of the summary.
-    async fn prepare_bucket(
-        &self,
-        bucket: &BucketRepo,
-        plan: &mut Plan,
-        opts: &RepoPushOptions,
-    ) -> Result<(Vec<Update>, PushStats, SignedSummary)> {
-        let Uploaded {
-            updates,
-            refs,
-            listing,
-            config,
-            stats,
-        } = self.upload_to_bucket(bucket, plan, opts).await?;
-        if let Some(progress) = opts.progress.as_ref() {
-            progress.set_phase(PushPhase::Committing);
-        }
-        let summary = bucket
-            .prepare_summary(SummaryInput {
-                refs: &refs,
-                config: &config,
-                local: Some(self),
-                listing: Some(&listing),
-                signers: &opts.summary_signers,
-                last_modified: None,
-            })
-            .await?;
-        Ok((updates, stats, summary))
-    }
-
     /// Runs the steps of a push to `bucket` from the read of its state to
     /// the upload of the commit objects.
     async fn upload_to_bucket(
@@ -395,26 +347,31 @@ impl Repo {
         plan: &mut Plan,
         opts: &RepoPushOptions,
     ) -> Result<Uploaded> {
-        let address = bucket.address().to_string();
-        let (config, signed) = zip(bucket.read_config(), bucket.is_signed()).await;
-        let Some(config) = config? else {
+        let Some(config) = bucket.read_config().await? else {
             return Err(invalid(format!(
-                "the bucket repository {address} has no config; init it first"
+                "the bucket repository {} has no config; init it first",
+                bucket.address()
             )));
         };
         let bucket_id = config.collection_id();
-        let (refs, listing) = zip(bucket.read_refs(bucket_id), bucket.list_objects()).await;
-        let mut refs = refs?;
-        if signed? && opts.summary_signers.is_empty() {
-            return Err(invalid(format!(
-                "the bucket repository {address} has a signed summary, and the push has no \
-                 summary signer; a push does not change a signed bucket repository into an \
-                 unsigned one"
-            )));
-        }
-
-        // The namespace and the bindings.
         let ns = namespace(plan.collection.as_deref(), bucket_id);
+        // The push reads the ref directory of its namespace alone, and lists
+        // `refs/mirrors/` of the collection id of the bucket.
+        let own_mirrors = async {
+            match bucket_id {
+                Some(own) => bucket.refuse_own_mirror_refs(own).await,
+                None => Ok(()),
+            }
+        };
+        let ((dir, own_mirrors), listing) = zip(
+            zip(bucket.read_ref_dir(&ns.dir()), own_mirrors),
+            bucket.list_objects(),
+        )
+        .await;
+        own_mirrors?;
+        let dir = dir?;
+
+        // The bindings.
         match &ns {
             Namespace::Local { binding } => {
                 check_bindings(None, binding.as_deref(), &plan.sources)?
@@ -423,10 +380,6 @@ impl Repo {
         }
 
         // The ref checks, in the directory of the namespace.
-        let dir = match &ns {
-            Namespace::Local { .. } => refs.heads.clone(),
-            Namespace::Mirror { id } => refs.mirrors.get(id).cloned().unwrap_or_default(),
-        };
         let mut updated = dir.clone();
         for target in &plan.targets {
             let commit = target.commit.expect("a push to a bucket refuses a delete");
@@ -457,31 +410,21 @@ impl Repo {
                 new,
             });
         }
-        match &ns {
-            Namespace::Local { .. } => refs.heads = updated,
-            Namespace::Mirror { id } => {
-                refs.mirrors.insert(id.clone(), updated);
-            }
-        }
 
         let listing = listing?;
         let walk = self.bucket_walk(plan, &updates, &listing, opts).await?;
         // The walk is the last reader of the commits of the plan.
         drop(std::mem::take(&mut plan.commits));
-        // Each ref of the new ref set names a commit that the bucket holds
-        // or that the push uploads, so a ref of the bucket that names an
-        // absent commit refuses the push before its first upload.
-        if let Some(absent) = refs
-            .heads
-            .values()
-            .chain(refs.mirrors.values().flat_map(|dir| dir.values()))
-            .find(|commit| {
-                !walk.missing.contains(commit)
-                    && !listing
-                        .objects
-                        .contains_key(&ObjectName::new(**commit, ObjectType::Commit))
-            })
-        {
+        // Each ref of the new ref set of the namespace names a commit that
+        // the bucket holds or that the push uploads, so a ref of the
+        // namespace that names an absent commit refuses the push before its
+        // first upload.
+        if let Some(absent) = updated.values().find(|commit| {
+            !walk.missing.contains(commit)
+                && !listing
+                    .objects
+                    .contains_key(&ObjectName::new(**commit, ObjectType::Commit))
+        }) {
             return Err(bucket.malformed(format!(
                 "a ref names the commit {absent}, which the bucket does not hold"
             )));
@@ -543,9 +486,6 @@ impl Repo {
         let bytes = counts.bytes.load(Ordering::Relaxed);
         Ok(Uploaded {
             updates,
-            refs,
-            listing,
-            config,
             stats: PushStats {
                 objects_total: walk.offered as u64 + walk.tree_objects as u64,
                 objects_needed: needed,

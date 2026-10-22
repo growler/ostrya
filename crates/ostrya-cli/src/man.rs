@@ -254,7 +254,8 @@ fn push_nested(out: &mut String, title: &str, cmd: &Command, globals: &HashSet<S
     feature = "receive",
     feature = "push",
     feature = "serve",
-    feature = "send"
+    feature = "send",
+    feature = "s3"
 ))]
 #[test]
 fn man_pages_match_the_committed_files() {
@@ -322,7 +323,8 @@ fn man_pages_match_the_committed_files() {
     feature = "receive",
     feature = "push",
     feature = "serve",
-    feature = "send"
+    feature = "send",
+    feature = "s3"
 ))]
 fn is_page_file(name: &str) -> bool {
     name.rsplit_once('.').is_some_and(|(stem, section)| {

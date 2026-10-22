@@ -1,7 +1,8 @@
 //! The pull from a remote, over HTTP or over ssh.
 //!
-//! [`Repo::pull`], [`Repo::pull_with_session`], and
-//! [`Repo::remote_fetch_summary`] are the entry points. [`Repo::pull`] holds
+//! [`Repo::pull`], [`Repo::pull_with_session`],
+//! [`Repo::remote_fetch_summary`], and [`Repo::remote_fetch_summary_with`]
+//! are the entry points. [`Repo::pull`] holds
 //! the rules of the pull. [`Repo::pull`] and [`Repo::pull_with_session`] run
 //! one engine.
 //!
@@ -1115,26 +1116,46 @@ impl Repo {
         })
     }
 
-    /// Fetches the `summary` and `summary.sig` files of a remote.
+    /// Fetches the `summary` and `summary.sig` files of a remote, as
+    /// [`remote_fetch_summary_with`](Repo::remote_fetch_summary_with) does
+    /// with the default overrides.
+    ///
+    /// The default overrides do not set `allow_cleartext_credentials`, so the
+    /// call refuses an `http://` S3 endpoint.
+    ///
+    /// # Errors
+    ///
+    /// The errors of
+    /// [`remote_fetch_summary_with`](Repo::remote_fetch_summary_with).
+    pub async fn remote_fetch_summary(
+        &self,
+        remote: &str,
+    ) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>)> {
+        self.remote_fetch_summary_with(remote, EndpointOverrides::default())
+            .await
+    }
+
+    /// Fetches the `summary` and `summary.sig` files of a remote, with the
+    /// overrides `overrides` of the caller.
     ///
     /// Returns the bytes of `summary` and of `summary.sig`, in this order. A
     /// file that the remote does not serve is `None`. Each file has a cap of
     /// 64 MiB.
     ///
     /// The call reaches the remote as [`pull`](Repo::pull) does. It resolves
-    /// the endpoint of `remote` with [`resolve_pull`] and the default
-    /// overrides. It then reads the address from `pull-url` or `url`, and
-    /// over HTTP it uses the TLS material and the proxy of the remote. Over
-    /// ssh, the remote keys `ssh-command` and `send-command` give the
+    /// the endpoint of `remote` with [`resolve_pull`] and `overrides`. The
+    /// address is [`EndpointOverrides::url`], else `pull-url`, else `url`.
+    /// Over HTTP, the call uses the TLS material and the proxy of the remote.
+    /// Over ssh, the remote keys `ssh-command` and `send-command` give the
     /// commands. The `OSTRYA_SSH_COMMAND` environment variable has precedence
-    /// over `ssh-command`.
+    /// over `ssh-command`. For an `s3://` address, the S3 fields of
+    /// `overrides` win over the S3 keys of the remote, and
+    /// `allow_cleartext_credentials` permits an `http://` S3 endpoint.
     ///
     /// Over HTTP, the call requests `summary.sig` and then `summary`. Over
     /// ssh, the two requests are in flight together, and the session ends
     /// before the call returns. For an `s3://` address, the bucket client
-    /// reads the two files. The default overrides do not set
-    /// `allow_cleartext_credentials`, so the call refuses an `http://` S3
-    /// endpoint.
+    /// reads the two files with signed requests.
     ///
     /// # Errors
     ///
@@ -1153,12 +1174,12 @@ impl Repo {
     ///   request fails after its retries.
     /// - [`Error::Remote`] if the ssh session fails, or if a read from a
     ///   bucket repository fails.
-    pub async fn remote_fetch_summary(
+    pub async fn remote_fetch_summary_with(
         &self,
         remote: &str,
+        overrides: EndpointOverrides,
     ) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>)> {
-        let endpoint =
-            resolve_pull(Some(self.config()), remote, EndpointOverrides::default()).await?;
+        let endpoint = resolve_pull(Some(self.config()), remote, overrides).await?;
         let connection = connect(endpoint, StreamSessionOptions::default()).await?;
         let source = RemoteSource::new(connection, Vec::new());
         let read = source.summary_files().await;

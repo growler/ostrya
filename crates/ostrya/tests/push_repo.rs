@@ -1392,19 +1392,7 @@ fn the_content_bytes_end_at_the_byte_total() {
 fn a_session_push_refuses_the_bucket_fields() {
     let dir = TmpDir::new("push-repo-bucket-fields");
     let client = new_repo(&dir, RepoMode::Archive, "");
-    // A fixed ed25519 key pair, as the summary tests sign with.
-    let secret =
-        "o74ME/dmhvDeYf64dDJQY8kX2piK0M/nyIRWVi30i6DCOzRsHVcvgYToz6zOb5OvK/v8nH6KfLR3dfdsn6ZSyQ==";
-    let signer: Arc<dyn ostrya::sign::Signer> =
-        Arc::new(ostrya::Ed25519Signer::from_base64(secret).unwrap());
     for (name, opts) in [
-        (
-            "summary signers",
-            RepoPushOptions {
-                summary_signers: vec![signer],
-                ..RepoPushOptions::default()
-            },
-        ),
         (
             "break_lock",
             RepoPushOptions {

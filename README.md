@@ -53,6 +53,13 @@ Ostrya adds these functions, which the `ostree` command does not have:
   sign it. `ostrya receive` is the server side of a push over ssh.
 - Pull over ssh. `ostrya pull` reads from an ssh address, and `ostrya send` is
   the server side.
+- S3 bucket repositories. A bucket repository is a repository in `archive`
+  form in an S3 bucket, at an `s3://BUCKET[/PREFIX]` address, with no server
+  program. `ostrya remote init` creates one, `ostrya push` writes commits to
+  it under a writer lock, and `ostrya pull`, `ostrya remote refs`, and
+  `ostrya remote summary` read it. Each request is signed with AWS Signature
+  Version 4 and the AWS credentials of the environment or of the shared AWS
+  files.
 - HTTP server. `ostrya serve` serves a repository of any mode to the pull of
   `ostree` and of Ostrya, and receives pushes. It identifies a client by a
   bearer token, a Basic credential, a TLS client certificate, or a network
@@ -133,8 +140,8 @@ The `ostrya` command has these subcommands:
 - `sign` and `summary`: sign and verify commits, and generate the summary.
 - `static-delta`: list, generate, apply, and index static deltas.
 - `prune` and `fsck`: delete unreachable objects and verify the repository.
-- `composefs-image`, `push`, `push-tree`, `receive`, `send`, and `serve`: the
-  port extensions.
+- `composefs-image`, `push`, `push-tree`, `receive`, `send`, `serve`, and
+  `remote init`: the port extensions.
 
 Each subcommand has a man page, for example `ostrya-commit(1)`. The page
 `ostrya-repo(5)` describes the layout of a repository, and the page
@@ -211,6 +218,8 @@ The features of the `ostrya` crate are:
 - `sign-gpg`: GPG signing through the `gpg` command. It turns on `verify-gpg`.
 - `push`: the client side of a push.
 - `receive`: the server side of a push.
+- `s3`: the pull from a bucket repository in an S3 bucket, its init and its
+  writer lock, and with `push`, the push to it.
 - `lzma-static`: xz built from source and linked statically.
 
 ## Design

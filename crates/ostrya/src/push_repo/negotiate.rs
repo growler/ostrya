@@ -2,7 +2,6 @@
 //! opens, the commit walk, the two `Have` rounds, and the ref updates.
 
 use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
 
 use futures_io::{AsyncRead, AsyncWrite};
 use ostrya_core::{Checksum, Commit, CommitLink, ObjectName, ObjectType};
@@ -20,15 +19,12 @@ use crate::remote::{
     SessionOptions,
 };
 use crate::repo::Repo;
-use crate::sign::Signer;
 
 /// The options of [`Repo::push`] and [`Repo::push_over_stream`].
 ///
 /// The struct is not `#[non_exhaustive]`. A caller can build it with
 /// `..Default::default()`.
-///
-/// The [`Debug`] output shows the name of each summary signer.
-#[derive(Clone, Default)]
+#[derive(Clone, Debug, Default)]
 pub struct RepoPushOptions {
     /// The refspecs, each `SRC[:DST]`, split at the last `:`.
     ///
@@ -104,12 +100,6 @@ pub struct RepoPushOptions {
     pub detached_metadata_filter: DetachedMetadataFilter,
     /// A progress handle that receives the counters of the session.
     pub progress: Option<PushProgress>,
-    /// The engines that sign the summary of a push to a bucket repository.
-    ///
-    /// Each engine signs once, in order. A bucket repository with a
-    /// `summary.sig` refuses a push with no signer. A push over ssh or HTTP
-    /// refuses a signer.
-    pub summary_signers: Vec<Arc<dyn Signer>>,
     /// The switch that removes the writer lock of a bucket repository before
     /// the push takes its own.
     ///
@@ -124,34 +114,10 @@ pub struct RepoPushOptions {
     pub part_size: Option<u64>,
 }
 
-impl std::fmt::Debug for RepoPushOptions {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let signers: Vec<&str> = self
-            .summary_signers
-            .iter()
-            .map(|signer| signer.name())
-            .collect();
-        f.debug_struct("RepoPushOptions")
-            .field("refspecs", &self.refspecs)
-            .field("depth", &self.depth)
-            .field("collection", &self.collection)
-            .field("tags", &self.tags)
-            .field("compression", &self.compression)
-            .field("force", &self.force)
-            .field("detached_metadata_filter", &self.detached_metadata_filter)
-            .field("progress", &self.progress)
-            .field("summary_signers", &signers)
-            .field("break_lock", &self.break_lock)
-            .field("part_size", &self.part_size)
-            .finish()
-    }
-}
-
 /// Refuses the fields of `opts` that apply to a push to a bucket repository
 /// alone.
 fn refuse_bucket_fields(opts: &RepoPushOptions) -> Result<()> {
     let set = [
-        ("summary signers", !opts.summary_signers.is_empty()),
         ("break_lock", opts.break_lock),
         ("part_size", opts.part_size.is_some()),
     ];
@@ -245,15 +211,14 @@ impl Repo {
     /// session. The call gives the outcome of that push and drops the holder
     /// of a lock that [`break_lock`](RepoPushOptions::break_lock) removed.
     /// Each other endpoint refuses
-    /// [`summary_signers`](RepoPushOptions::summary_signers),
-    /// [`break_lock`](RepoPushOptions::break_lock), and a part size.
+    /// [`break_lock`](RepoPushOptions::break_lock) and a part size.
     ///
     /// # Errors
     ///
     /// - [`Error::Remote`] with
     ///   [`InvalidInput`](crate::remote::Error::InvalidInput) if the endpoint
-    ///   is not a bucket repository and `opts` sets a summary signer,
-    ///   `break_lock`, or a part size. The push then takes no lock.
+    ///   is not a bucket repository and `opts` sets `break_lock` or a part
+    ///   size. The push then takes no lock.
     /// - [`Error::Remote`] with the error of [`PushSession::prepare`] if the
     ///   endpoint does not apply, or if the HTTP client cannot be built.
     /// - [`Error::Remote`] with the error of
@@ -368,8 +333,8 @@ impl Repo {
     /// # Errors
     ///
     /// - [`Error::Remote`] with [`InvalidInput`](crate::remote::Error::InvalidInput)
-    ///   if `opts` sets a summary signer, `break_lock`, or a part size, which
-    ///   apply to a push to a bucket repository alone.
+    ///   if `opts` sets `break_lock` or a part size, which apply to a push to
+    ///   a bucket repository alone.
     /// - [`Error::Remote`] with [`InvalidInput`](crate::remote::Error::InvalidInput)
     ///   if `depth` is less than `-1`, or if `collection` or the
     ///   `ostree.collection-binding` of a source commit fails

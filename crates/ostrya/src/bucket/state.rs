@@ -102,7 +102,9 @@ impl BucketRepo {
     ///   malformed state: the repository holds the refs of its own
     ///   collection under `refs/heads/`.
     /// - [`Error::Remote`] for an error of the bucket client.
-    #[cfg_attr(not(feature = "push"), allow(dead_code))]
+    // A push reads the ref directory of its namespace alone. The read of all
+    // refs stays for an explicit summary update, which lists each ref.
+    #[allow(dead_code)]
     pub(crate) async fn read_refs(&self, own: Option<&str>) -> Result<BucketRefs> {
         let listing = self.bucket.list("refs/").await?;
         let mut keys = Vec::with_capacity(listing.objects.len());
@@ -110,12 +112,7 @@ impl BucketRepo {
             let key = listed.key.as_str();
             match ref_key(key) {
                 Some(RefKey::Mirror(id, _)) if Some(id) == own => {
-                    return Err(self.malformed(format!(
-                        "it holds the ref key '{}' under refs/mirrors/ of its own collection id; \
-                         a bucket repository holds the refs of its own collection under \
-                         refs/heads/",
-                        key.escape_debug()
-                    )));
+                    return Err(self.own_mirror_ref(key));
                 }
                 Some(_) => keys.push(key),
                 None => {
@@ -128,6 +125,98 @@ impl BucketRepo {
             }
         }
         let mut refs = BucketRefs::default();
+        for (key, commit) in self.read_ref_files(keys).await? {
+            match ref_key(key) {
+                Some(RefKey::Head(name)) => {
+                    refs.heads.insert(name.to_owned(), commit);
+                }
+                Some(RefKey::Mirror(id, name)) => {
+                    refs.mirrors
+                        .entry(id.to_owned())
+                        .or_default()
+                        .insert(name.to_owned(), commit);
+                }
+                None => unreachable!("each key passed the rule"),
+            }
+        }
+        Ok(refs)
+    }
+
+    /// Reads the refs of the ref directory `dir`, `refs/heads/` or
+    /// `refs/mirrors/ID/`: one list of `dir`, then a read of each ref file.
+    /// The call reads no key outside `dir`.
+    ///
+    /// The part of each key after `dir` passes the ref name rule. A ref file
+    /// holds 64 lowercase hex digits and a newline. At most
+    /// `max_outstanding` reads run at a time.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidFormat`] if a key under `dir` is no ref name, if a
+    ///   ref file is malformed, or if a listed ref file is gone at its read.
+    /// - [`Error::Remote`] for an error of the bucket client.
+    #[cfg_attr(not(feature = "push"), allow(dead_code))]
+    pub(crate) async fn read_ref_dir(&self, dir: &str) -> Result<BTreeMap<String, Checksum>> {
+        let listing = self.bucket.list(dir).await?;
+        let mut keys = Vec::with_capacity(listing.objects.len());
+        for listed in &listing.objects {
+            let key = listed.key.as_str();
+            match key.strip_prefix(dir) {
+                Some(name) if is_ref_name(name) => keys.push(key),
+                _ => {
+                    return Err(self.malformed(format!(
+                        "it holds the key '{}' under {dir}, which is no ref of {dir}",
+                        key.escape_debug()
+                    )));
+                }
+            }
+        }
+        Ok(self
+            .read_ref_files(keys)
+            .await?
+            .into_iter()
+            .map(|(key, commit)| (key[dir.len()..].to_owned(), commit))
+            .collect())
+    }
+
+    /// Refuses a repository that holds a key under `refs/mirrors/` of its
+    /// own collection id `own`. The call lists that directory alone.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidFormat`] if the repository holds such a key: the
+    ///   repository holds the refs of its own collection under
+    ///   `refs/heads/`.
+    /// - [`Error::Remote`] for an error of the bucket client.
+    #[cfg_attr(not(feature = "push"), allow(dead_code))]
+    pub(crate) async fn refuse_own_mirror_refs(&self, own: &str) -> Result<()> {
+        let listing = self.bucket.list(&format!("refs/mirrors/{own}/")).await?;
+        match listing.objects.first() {
+            Some(listed) => Err(self.own_mirror_ref(&listed.key)),
+            None => Ok(()),
+        }
+    }
+
+    /// Returns the error of the ref key `key` under `refs/mirrors/` of the
+    /// own collection id.
+    fn own_mirror_ref(&self, key: &str) -> Error {
+        self.malformed(format!(
+            "it holds the ref key '{}' under refs/mirrors/ of its own collection id; a bucket \
+             repository holds the refs of its own collection under refs/heads/",
+            key.escape_debug()
+        ))
+    }
+
+    /// Reads the ref file of each key of `keys`, at most `max_outstanding`
+    /// reads at a time, and returns each key with its commit.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidFormat`] if a ref file is malformed, or if a ref
+    ///   file is gone at its read.
+    /// - [`Error::Remote`] for an error of the bucket client.
+    async fn read_ref_files<'k>(&self, keys: Vec<&'k str>) -> Result<Vec<(&'k str, Checksum)>> {
+        let mut out = Vec::with_capacity(keys.len());
         let mut reads = Slots::new(self.max_outstanding);
         let mut pending = keys.into_iter();
         loop {
@@ -162,20 +251,9 @@ impl BucketRepo {
                     key.escape_debug()
                 ))
             })?;
-            match ref_key(key) {
-                Some(RefKey::Head(name)) => {
-                    refs.heads.insert(name.to_owned(), commit);
-                }
-                Some(RefKey::Mirror(id, name)) => {
-                    refs.mirrors
-                        .entry(id.to_owned())
-                        .or_default()
-                        .insert(name.to_owned(), commit);
-                }
-                None => unreachable!("each key passed the rule"),
-            }
+            out.push((key, commit));
         }
-        Ok(refs)
+        Ok(out)
     }
 
     /// Returns `true` if the key `summary.sig` holds an object.
@@ -187,7 +265,9 @@ impl BucketRepo {
     /// # Errors
     ///
     /// [`Error::Remote`] for an error of the bucket client.
-    #[cfg_attr(not(feature = "push"), allow(dead_code))]
+    // No writer of this version writes the summary of a bucket repository,
+    // so no writer reads the presence of its signature.
+    #[allow(dead_code)]
     pub(crate) async fn is_signed(&self) -> Result<bool> {
         match self.bucket.get("summary.sig", SUMMARY_READ_CAP).await {
             Ok(object) => Ok(object.is_some()),

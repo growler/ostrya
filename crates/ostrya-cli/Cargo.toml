@@ -13,7 +13,7 @@ name = "ostrya"
 path = "src/main.rs"
 
 [features]
-default = ["smol", "spki", "gpg", "receive", "push", "serve", "send", "lzma-static"]
+default = ["smol", "spki", "gpg", "receive", "push", "serve", "send", "s3", "lzma-static"]
 smol = ["ostrya/smol", "ostrya-rt/smol", "ostrya-server?/smol"]
 tokio = ["ostrya/tokio", "ostrya-rt/tokio", "ostrya-server?/tokio"]
 spki = ["ostrya/sign-spki"]
@@ -27,6 +27,10 @@ serve = ["dep:ostrya-server"]
 # `ostrya send`, the server side of a pull over ssh. `Repo::send` takes no
 # feature of `ostrya`, so the feature gates the subcommand alone.
 send = []
+# The pull from and the push to a bucket repository at an `s3://` address,
+# `remote init`, and the S3 options of `push`, `pull`, `remote refs`, and
+# `remote summary`.
+s3 = ["ostrya/s3"]
 # The shipped binary links xz statically, so it needs no runtime liblzma.
 lzma-static = ["ostrya/lzma-static"]
 

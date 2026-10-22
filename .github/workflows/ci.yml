@@ -198,6 +198,13 @@ jobs:
       - name: The endpoint tests without the s3 feature pass
         run: cargo test -p ostrya --no-default-features --features smol --lib endpoint::
 
+      # The `ostrya` command built without the s3 feature has no S3 option and
+      # no `remote init`, and refuses an `s3://` address with a message that
+      # names the feature. The test file of these arms compiles only without
+      # the feature.
+      - name: ostrya-cli without the s3 feature refuses an s3 address
+        run: cargo test -p ostrya-cli --no-default-features --features smol,push --test s3_absent
+
       # The HTTP server compiles on the smol backend with its own feature set,
       # and `ostrya serve` compiles without `ostrya receive`.
       - name: ostrya-server on the smol backend compiles
@@ -292,18 +299,37 @@ jobs:
             fi
           done
 
+      # The S3 tests run `rclone serve s3`, which rclone 1.65 added. The
+      # `rclone` package of the runner is older, so this step installs the
+      # release archive of the rclone project, with a pinned version and
+      # SHA-256.
+      - name: Install rclone
+        run: |
+          cd "$RUNNER_TEMP"
+          version=v1.75.1
+          archive=rclone-$version-linux-amd64.zip
+          curl -fsSLO "https://downloads.rclone.org/$version/$archive"
+          echo "982b5aa772841168f8e380f139e9e787b2a105403e32b94da8676a0e1c0a13ab  $archive" \
+            | sha256sum -c -
+          unzip -q "$archive"
+          sudo install -m 0755 "rclone-$version-linux-amd64/rclone" /usr/local/bin/rclone
+          rclone version
+
       # The local-pull ownership-gate tests need the process to belong to more
       # than one group. The GPG cases need `gpg` to build their fixtures, and
       # the agreement gate needs `gpgv` as its reference. Each skips itself
       # where the arrangement is absent. The runner user belongs to several
       # groups and the image carries both binaries, so this job demands the
       # coverage rather than accepting a silent skip: OSTRYA_REQUIRE_MULTIGROUP
-      # and OSTRYA_REQUIRE_GNUPG turn those skips into a failure.
+      # and OSTRYA_REQUIRE_GNUPG turn those skips into a failure. The S3 tests
+      # need `rclone`, which the step above installs, and OSTRYA_REQUIRE_S3
+      # turns their skip into a failure.
       - name: Test
         run: cargo test --workspace --all-features
         env:
           OSTRYA_REQUIRE_MULTIGROUP: "1"
           OSTRYA_REQUIRE_GNUPG: "1"
+          OSTRYA_REQUIRE_S3: "1"
 
       # A record carrying `evidence:` cites a library test by name, so a rename
       # would void its cells with no signal. This resolves every citation

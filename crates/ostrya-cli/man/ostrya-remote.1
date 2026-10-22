@@ -33,6 +33,8 @@ A name has one or more characters. Each character is a letter, a digit, \fB\%\-\
 The base URL of the remote, or \fB\%metalink=URL\fR for a metalink remote.
 .IP
 The command writes a base URL to the \fB\%url\fR key. For \fB\%metalink=URL\fR, it writes URL to the \fB\%metalink\fR key and writes no \fB\%url\fR key. The pull of ostrya does not read the \fB\%metalink\fR key.
+.IP
+The command writes an \fB\%s3://BUCKET[/PREFIX]\fR address to the \fB\%pull\-url\fR and \fB\%push\-url\fR keys, after the branches, and writes no \fB\%url\fR key. It does not check the address. A pull or a push refuses a bad address when it uses the remote. \%\-\-set writes the \%S3 keys \fB\%s3\-region\fR, \fB\%s3\-endpoint\fR, \fB\%s3\-addressing\fR, and \fB\%s3\-profile\fR\&. \fB\%show\-url\fR and \fB\%list \-u\fR refuse a remote with no \fB\%url\fR key.
 .TP
 \fIBRANCHES...\fR
 The refs that a pull of this remote takes if the pull names no ref.
@@ -90,6 +92,62 @@ The key names a different URL for the content objects. The pull of ostrya does n
 A globally unique id for the remote as a collection of refs.
 .IP
 The command writes the value to the \fB\%collection\-id\fR key of the remote.
+.SS "init"
+Create a bucket repository in an \%S3 bucket.
+.PP
+The command writes the \fB\%config\fR of a new bucket repository at the \fB\%s3://\fR address of NAME, or at the address \fB\%s3://BUCKET[/PREFIX]\fR\&. The \fB\%config\fR holds the group \fB\%[core]\fR with \fB\%repo_version=1\fR and \fB\%mode=archive\-z2\fR, and \fB\%collection\-id=ID\fR with \%\-\-collection\-id. A bucket repository with a collection id is the primary server of that collection, and a push of the refs of another collection writes them under \fB\%refs/mirrors/ID/\fR\&. The command writes no ref and no summary, and prints nothing on success.
+.PP
+The command takes the writer lock of the bucket repository, writes the \fB\%config\fR only if the bucket repository holds none, and removes the lock. It refuses a bucket repository that holds a \fB\%config\fR, so the collection id of a bucket repository never changes. A push needs the \fB\%config\fR\&. The command needs the \%S3 permissions \fB\%s3:GetObject\fR, \fB\%s3:PutObject\fR, \fB\%s3:ListBucket\fR, and \fB\%s3:DeleteObject\fR\&.
+.PP
+With an address, the command needs no repository and reads no \fB\%\-\-repo\fR, current directory, or \fB\%OSTREE_REPO\fR\&. With a remote name, it reads the remote from the config of the repository. With \%\-\-break\-lock, an init that removed the writer lock of another writer writes one \fB\%warning: removed the writer lock of HOLDER\fR line to standard error.
+.PP
+.nf
+ostrya remote init [OPTIONS] [NAME]
+.fi
+.PP
+Arguments:
+.TP
+\fINAME\fR
+The remote name or the address \fB\%s3://BUCKET[/PREFIX]\fR\&. Required.
+.IP
+The address of a remote is its \fB\%push\-url\fR key if that key holds an \fB\%s3://\fR address, else its \fB\%pull\-url\fR key if that key holds an \fB\%s3://\fR address. The command refuses a remote with neither, and never reads the \fB\%url\fR key.
+.PP
+Options:
+.TP
+\fB\-\-collection\-id\fR \fIID\fR
+Write \fB\%collection\-id=ID\fR into the \fB\%config\fR of the bucket repository.
+.IP
+The command refuses an ID that fails the \%collection\-id rule or is longer than \%255 bytes, before any request.
+.TP
+\fB\-\-break\-lock\fR
+Remove the writer lock of another writer of the bucket repository.
+.IP
+The command reads the lock, deletes it, and then takes its own lock. It writes the holder of the removed lock to standard error after an init that succeeds. Use it only when the holder is gone, for example after a crash.
+.TP
+\fB\-\-s3\-region\fR \fIREGION\fR
+The region of the signature of each request to the \%S3 server.
+.IP
+It wins over the \fB\%s3\-region\fR key of the remote, over \fB\%AWS_REGION\fR and \fB\%AWS_DEFAULT_REGION\fR, and over the \fB\%region\fR of the AWS profile. The default is \fB\%us\-east\-1\fR\&. The command refuses this option for an address that is not \fB\%s3://\fR\&.
+.TP
+\fB\-\-s3\-endpoint\fR \fIURL\fR
+The \fB\%http://\fR or \fB\%https://\fR URL of the \%S3 server, with no path.
+.IP
+It wins over the \fB\%s3\-endpoint\fR key of the remote, over \fB\%AWS_ENDPOINT_URL_S3\fR and \fB\%AWS_ENDPOINT_URL\fR, and over the endpoint of the AWS profile. Without each of them, the server is AWS. An \fB\%http://\fR URL needs \%\-\-allow\-cleartext\-credentials. The command refuses this option for an address that is not \fB\%s3://\fR\&.
+.TP
+\fB\-\-s3\-addressing\fR \fISTYLE\fR
+The addressing style of the bucket: \fB\%path\fR or \fB\%virtual\fR\&.
+.IP
+\fB\%path\fR puts the bucket in the path of each request, and \fB\%virtual\fR puts it in the host name. The option wins over the \fB\%s3\-addressing\fR key of the remote and over the \fB\%addressing_style\fR of the AWS profile. The default is \fB\%virtual\fR for AWS and \fB\%path\fR for a set server. A bucket name that holds a \fB\%\&.\fR gets \fB\%path\fR by default. The command refuses this option for an address that is not \fB\%s3://\fR\&. Possible values: path, virtual.
+.TP
+\fB\-\-s3\-profile\fR \fIPROFILE\fR
+The profile of the shared AWS files.
+.IP
+It wins over the \fB\%s3\-profile\fR key of the remote and over \fB\%AWS_PROFILE\fR\&. A profile that this option or the key names skips the key pair, the region, and the endpoint of the environment. The default profile is \fB\%default\fR\&. The command refuses this option for an address that is not \fB\%s3://\fR\&.
+.TP
+\fB\-\-allow\-cleartext\-credentials\fR
+Send the signature of each request to an \fB\%http://\fR \%S3 server.
+.IP
+The signature is a credential. Without this switch, the command refuses an \fB\%http://\fR \%S3 server before any request. Use it for a server on a loopback address or behind a proxy that terminates TLS. No key of the remote sets this switch. The command refuses it for an address that is not \fB\%s3://\fR\&.
 .SS "delete"
 Delete a remote repository and its trusted GPG keyring.
 .PP
@@ -141,7 +199,7 @@ The remote to report. Required.
 .SS "refs"
 List the refs that a remote publishes in its summary.
 .PP
-The command fetches the summary of the remote over HTTP or ssh, as a pull does. It prints one \fB\%NAME:REF\fR line for each ref, in the order of the summary. It does not verify the signature of the summary. If the remote has no summary file, the command fails.
+The command fetches the summary of the remote over HTTP or ssh, as a pull does. From an \fB\%s3://\fR address in \fB\%pull\-url\fR, it reads the summary of the bucket repository with signed requests. It prints one \fB\%NAME:REF\fR line for each ref, in the order of the summary. It does not verify the signature of the summary. If the remote has no summary file, the command fails. A push to a bucket repository writes no summary.
 .PP
 .nf
 ostrya remote refs [OPTIONS] [NAME]
@@ -156,10 +214,35 @@ Options:
 .TP
 \fB\-r\fR, \fB\-\-revision\fR
 Print the commit checksum of each ref after a tab.
+.TP
+\fB\-\-s3\-region\fR \fIREGION\fR
+The region of the signature of each request to the \%S3 server.
+.IP
+It wins over the \fB\%s3\-region\fR key of the remote, over \fB\%AWS_REGION\fR and \fB\%AWS_DEFAULT_REGION\fR, and over the \fB\%region\fR of the AWS profile. The default is \fB\%us\-east\-1\fR\&. The command refuses this option for an address that is not \fB\%s3://\fR\&.
+.TP
+\fB\-\-s3\-endpoint\fR \fIURL\fR
+The \fB\%http://\fR or \fB\%https://\fR URL of the \%S3 server, with no path.
+.IP
+It wins over the \fB\%s3\-endpoint\fR key of the remote, over \fB\%AWS_ENDPOINT_URL_S3\fR and \fB\%AWS_ENDPOINT_URL\fR, and over the endpoint of the AWS profile. Without each of them, the server is AWS. An \fB\%http://\fR URL needs \%\-\-allow\-cleartext\-credentials. The command refuses this option for an address that is not \fB\%s3://\fR\&.
+.TP
+\fB\-\-s3\-addressing\fR \fISTYLE\fR
+The addressing style of the bucket: \fB\%path\fR or \fB\%virtual\fR\&.
+.IP
+\fB\%path\fR puts the bucket in the path of each request, and \fB\%virtual\fR puts it in the host name. The option wins over the \fB\%s3\-addressing\fR key of the remote and over the \fB\%addressing_style\fR of the AWS profile. The default is \fB\%virtual\fR for AWS and \fB\%path\fR for a set server. A bucket name that holds a \fB\%\&.\fR gets \fB\%path\fR by default. The command refuses this option for an address that is not \fB\%s3://\fR\&. Possible values: path, virtual.
+.TP
+\fB\-\-s3\-profile\fR \fIPROFILE\fR
+The profile of the shared AWS files.
+.IP
+It wins over the \fB\%s3\-profile\fR key of the remote and over \fB\%AWS_PROFILE\fR\&. A profile that this option or the key names skips the key pair, the region, and the endpoint of the environment. The default profile is \fB\%default\fR\&. The command refuses this option for an address that is not \fB\%s3://\fR\&.
+.TP
+\fB\-\-allow\-cleartext\-credentials\fR
+Send the signature of each request to an \fB\%http://\fR \%S3 server.
+.IP
+The signature is a credential. Without this switch, the command refuses an \fB\%http://\fR \%S3 server before any request. Use it for a server on a loopback address or behind a proxy that terminates TLS. No key of the remote sets this switch. The command refuses it for an address that is not \fB\%s3://\fR\&.
 .SS "summary"
 Report the summary of a remote.
 .PP
-The command fetches the summary of the remote over HTTP or ssh, as a pull does. It does not verify the signature of the summary. If the remote has no summary file, the command fails.
+The command fetches the summary of the remote over HTTP or ssh, as a pull does. From an \fB\%s3://\fR address in \fB\%pull\-url\fR, it reads the summary of the bucket repository with signed requests. It does not verify the signature of the summary. If the remote has no summary file, the command fails. A push to a bucket repository writes no summary.
 .PP
 The default report gives each ref with its commit size, its commit checksum, and its metadata. The global metadata of the summary follows the refs. The report shows each timestamp in UTC.
 .PP
@@ -188,6 +271,31 @@ The command prints the value in the GVariant text form, with its type. If the gl
 Show the raw variant data.
 .IP
 The command prints the full summary in the GVariant text form, with the \%big\-endian fields converted.
+.TP
+\fB\-\-s3\-region\fR \fIREGION\fR
+The region of the signature of each request to the \%S3 server.
+.IP
+It wins over the \fB\%s3\-region\fR key of the remote, over \fB\%AWS_REGION\fR and \fB\%AWS_DEFAULT_REGION\fR, and over the \fB\%region\fR of the AWS profile. The default is \fB\%us\-east\-1\fR\&. The command refuses this option for an address that is not \fB\%s3://\fR\&.
+.TP
+\fB\-\-s3\-endpoint\fR \fIURL\fR
+The \fB\%http://\fR or \fB\%https://\fR URL of the \%S3 server, with no path.
+.IP
+It wins over the \fB\%s3\-endpoint\fR key of the remote, over \fB\%AWS_ENDPOINT_URL_S3\fR and \fB\%AWS_ENDPOINT_URL\fR, and over the endpoint of the AWS profile. Without each of them, the server is AWS. An \fB\%http://\fR URL needs \%\-\-allow\-cleartext\-credentials. The command refuses this option for an address that is not \fB\%s3://\fR\&.
+.TP
+\fB\-\-s3\-addressing\fR \fISTYLE\fR
+The addressing style of the bucket: \fB\%path\fR or \fB\%virtual\fR\&.
+.IP
+\fB\%path\fR puts the bucket in the path of each request, and \fB\%virtual\fR puts it in the host name. The option wins over the \fB\%s3\-addressing\fR key of the remote and over the \fB\%addressing_style\fR of the AWS profile. The default is \fB\%virtual\fR for AWS and \fB\%path\fR for a set server. A bucket name that holds a \fB\%\&.\fR gets \fB\%path\fR by default. The command refuses this option for an address that is not \fB\%s3://\fR\&. Possible values: path, virtual.
+.TP
+\fB\-\-s3\-profile\fR \fIPROFILE\fR
+The profile of the shared AWS files.
+.IP
+It wins over the \fB\%s3\-profile\fR key of the remote and over \fB\%AWS_PROFILE\fR\&. A profile that this option or the key names skips the key pair, the region, and the endpoint of the environment. The default profile is \fB\%default\fR\&. The command refuses this option for an address that is not \fB\%s3://\fR\&.
+.TP
+\fB\-\-allow\-cleartext\-credentials\fR
+Send the signature of each request to an \fB\%http://\fR \%S3 server.
+.IP
+The signature is a credential. Without this switch, the command refuses an \fB\%http://\fR \%S3 server before any request. Use it for a server on a loopback address or behind a proxy that terminates TLS. No key of the remote sets this switch. The command refuses it for an address that is not \fB\%s3://\fR\&.
 .SS "gpg\-import"
 Import GPG keys into the trusted keyring of a remote.
 .PP

@@ -27,14 +27,11 @@ use common::s3::{Rclone, Seaweed, StandIn, endpoint, rclone_available, seaweed_a
 use ostrya::bucket::{BucketPushOutcome, BucketRepo};
 use ostrya::remote::s3::S3Endpoint;
 use ostrya::remote::{Compression, Endpoint, PullSession, StreamSessionOptions};
-use ostrya::sign::Ed25519Verifier;
-use ostrya::summary::Summary;
-use ostrya::verify::{PullTrust, TrustedKeys};
+use ostrya::verify::PullTrust;
 use ostrya::{
     Checksum, Commit, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions,
     DetachedMetadataFilter, DictBuilder, DirTree, Ed25519Signer, Error, MutableTree, ObjectType,
-    PullOptions, PushOntoOptions, Repo, RepoMode, RepoPushOptions, SignFuture, Signer,
-    SummaryOptions, Value,
+    PullOptions, PushOntoOptions, Repo, RepoMode, RepoPushOptions, Value,
 };
 use ostrya_rt::block_on;
 
@@ -47,10 +44,9 @@ const LOCK: &str = "repo/extensions/ostrya/lock";
 /// The key of the config in the bucket.
 const CONFIG: &str = "repo/config";
 
-/// A fixed ed25519 key pair that signs the summary.
+/// A fixed ed25519 key that signs the commits.
 const SECRET_B64: &str =
     "o74ME/dmhvDeYf64dDJQY8kX2piK0M/nyIRWVi30i6DCOzRsHVcvgYToz6zOb5OvK/v8nH6KfLR3dfdsn6ZSyQ==";
-const PUBLIC_B64: &str = "wjs0bB1XL4GE6M+szm+Tryv7/Jx+iny0d3X3bJ+mUsk=";
 
 /// The collection ids of the tests.
 const A: &str = "org.example.A";
@@ -255,13 +251,6 @@ async fn objects_of(repo: &Repo, commit: &Checksum) -> BTreeSet<String> {
         .into_iter()
         .map(|name| object_path(name.ty, &name.checksum))
         .collect()
-}
-
-/// Returns the trusted keys of [`PUBLIC_B64`].
-fn trusted() -> TrustedKeys {
-    let public = ostrya::base64::decode(PUBLIC_B64).unwrap();
-    let verifier = Ed25519Verifier::new([public], Vec::<Vec<u8>>::new()).unwrap();
-    TrustedKeys::new(vec![Arc::new(verifier)]).unwrap()
 }
 
 /// Returns the signer of [`SECRET_B64`].
@@ -695,11 +684,7 @@ fn a_second_push_with_no_change_uploads_no_object_and_writes_no_ref() {
             .unwrap();
         assert_eq!(
             puts(&server),
-            [
-                "repo/extensions/ostrya/lock",
-                "repo/extensions/ostrya/lock",
-                "repo/summary"
-            ]
+            ["repo/extensions/ostrya/lock", "repo/extensions/ostrya/lock"]
         );
         assert_eq!(outcome.outcome.stats.objects_needed, 0);
         assert_eq!(outcome.outcome.refs[0].old, Some(tip));
@@ -733,8 +718,7 @@ fn a_push_of_a_commit_that_the_bucket_holds_reads_no_tree() {
             [
                 "repo/extensions/ostrya/lock",
                 "repo/extensions/ostrya/lock",
-                "repo/refs/heads/other",
-                "repo/summary"
+                "repo/refs/heads/other"
             ]
         );
         assert_eq!(ref_of(&server, "repo/refs/heads/other"), Some(tip));
@@ -765,8 +749,7 @@ fn a_push_after_a_new_signature_uploads_the_commitmeta_alone() {
             [
                 "repo/extensions/ostrya/lock".to_owned(),
                 "repo/extensions/ostrya/lock".to_owned(),
-                format!("repo/{meta_target}"),
-                "repo/summary".to_owned()
+                format!("repo/{meta_target}")
             ]
         );
         let local =
@@ -888,8 +871,7 @@ fn an_interrupted_push_leaves_whole_trees_and_a_run_again_completes() {
                 "repo/extensions/ostrya/lock".to_owned(),
                 "repo/extensions/ostrya/lock".to_owned(),
                 key(ObjectType::Commit, &tip),
-                "repo/refs/heads/main".to_owned(),
-                "repo/summary".to_owned()
+                "repo/refs/heads/main".to_owned()
             ]
         );
         assert_eq!(ref_of(&server, "repo/refs/heads/main"), Some(tip));
@@ -971,7 +953,6 @@ fn a_failure_at_the_refs_leaves_some_refs_and_a_run_again_writes_the_rest() {
             .unwrap_err();
         assert_eq!(ref_of(&server, "repo/refs/heads/a"), Some(tip));
         assert_eq!(ref_of(&server, "repo/refs/heads/b"), None);
-        assert!(!server.state().objects.contains_key("repo/summary"));
         assert!(!server.state().objects.contains_key(LOCK));
         server.state().refuse = None;
         server.state().requests.clear();
@@ -983,130 +964,12 @@ fn a_failure_at_the_refs_leaves_some_refs_and_a_run_again_writes_the_rest() {
             [
                 "repo/extensions/ostrya/lock",
                 "repo/extensions/ostrya/lock",
-                "repo/refs/heads/b",
-                "repo/summary"
+                "repo/refs/heads/b"
             ]
         );
         let olds: Vec<Option<Checksum>> = outcome.outcome.refs.iter().map(|r| r.old).collect();
         assert_eq!(olds, [Some(tip), None]);
-        let summary = Summary::parse(&server.state().objects["repo/summary"].bytes).unwrap();
-        assert_eq!(summary.lookup("a"), Some(tip));
-        assert_eq!(summary.lookup("b"), Some(tip));
-    });
-}
-
-#[test]
-fn a_failure_at_the_summary_is_repaired_by_a_run_again() {
-    let scratch = TmpDir::new("push-s3-summary-failure");
-    block_on(async {
-        let server = StandIn::start();
-        init(&server.endpoint(), None).await;
-        let repo = archive(&scratch.path().join("src")).await;
-        let tip = commit(&repo, "main", None, "one", None).await;
-        let signed = || RepoPushOptions {
-            summary_signers: vec![signer()],
-            ..opts(&["main"])
-        };
-        server.state().refuse = Some(("PUT", "repo/summary".to_owned()));
-        push(&repo, &server.endpoint(), signed()).await.unwrap_err();
-        assert_eq!(ref_of(&server, "repo/refs/heads/main"), Some(tip));
-        assert!(!server.state().objects.contains_key("repo/summary"));
-        server.state().refuse = Some(("PUT", "repo/summary.sig".to_owned()));
-        push(&repo, &server.endpoint(), signed()).await.unwrap_err();
-        assert!(server.state().objects.contains_key("repo/summary"));
-        assert!(!server.state().objects.contains_key("repo/summary.sig"));
-        server.state().refuse = None;
-        push(&repo, &server.endpoint(), signed()).await.unwrap();
-        let s3 = endpoint(&server.endpoint(), ADDRESS);
-        let trust = PullTrust::unverified().with_summary(trusted());
-        let pulled = pull_back(s3, &scratch.path().join("pulled"), &["main"], trust).await;
-        assert_eq!(pulled.resolve_rev("main", false).await.unwrap(), Some(tip));
-    });
-}
-
-/// A summary signer that always fails.
-struct FailingSigner;
-
-impl Signer for FailingSigner {
-    fn name(&self) -> &str {
-        "failing"
-    }
-
-    fn metadata_key(&self) -> &str {
-        "ostree.sign.failing"
-    }
-
-    fn sign<'a>(&'a self, _data: &'a [u8]) -> SignFuture<'a> {
-        Box::pin(async {
-            Err(ostrya::sign::Error::Signature(
-                "the test signer fails".to_owned(),
-            ))
-        })
-    }
-}
-
-#[test]
-fn a_failed_summary_signer_changes_no_ref() {
-    let scratch = TmpDir::new("push-s3-failed-signer");
-    block_on(async {
-        let server = StandIn::start();
-        init(&server.endpoint(), None).await;
-        let repo = archive(&scratch.path().join("src")).await;
-        let first = commit(&repo, "main", None, "one", None).await;
-        push(&repo, &server.endpoint(), opts(&["main"]))
-            .await
-            .unwrap();
-        let summary = server.state().objects["repo/summary"].clone();
-        commit(&repo, "main", Some(first), "two", None).await;
-        let signed = RepoPushOptions {
-            summary_signers: vec![signer(), Arc::new(FailingSigner)],
-            ..opts(&["main"])
-        };
-        match push(&repo, &server.endpoint(), signed).await {
-            Err(Error::Signature(message)) => {
-                assert!(message.contains("with the failing key"), "{message}");
-                assert!(message.contains("the test signer fails"), "{message}");
-            }
-            other => panic!("{other:?}"),
-        }
-        assert_eq!(ref_of(&server, "repo/refs/heads/main"), Some(first));
-        assert_eq!(server.state().objects["repo/summary"], summary);
-        assert!(!server.state().objects.contains_key("repo/summary.sig"));
-        assert!(!server.state().objects.contains_key(LOCK));
-    });
-}
-
-#[test]
-fn a_commit_object_of_the_bucket_with_other_bytes_changes_no_ref() {
-    let scratch = TmpDir::new("push-s3-corrupt-commit");
-    block_on(async {
-        let server = StandIn::start();
-        init(&server.endpoint(), None).await;
-        // A ref of the bucket names a commit whose object holds other
-        // bytes. The local repository does not hold that commit, so the
-        // summary reads it from the bucket.
-        let other = Checksum::from_bytes([0xcd; 32]);
-        let other_ref = format!("{}\n", other.to_hex());
-        {
-            let mut state = server.state();
-            state.store(&key(ObjectType::Commit, &other), b"other bytes");
-            state.store("repo/refs/heads/other", other_ref.as_bytes());
-        }
-        let repo = archive(&scratch.path().join("src")).await;
-        let tip = commit(&repo, "main", None, "one", None).await;
-        let message = malformed(push(&repo, &server.endpoint(), opts(&["main"])).await);
-        assert!(message.contains("has the checksum"), "{message}");
-        assert_eq!(ref_of(&server, "repo/refs/heads/main"), None);
-        assert_eq!(ref_of(&server, "repo/refs/heads/other"), Some(other));
-        assert!(!server.state().objects.contains_key("repo/summary"));
-        assert!(!server.state().objects.contains_key(LOCK));
-        // The objects of the push went up.
-        assert!(
-            server
-                .state()
-                .objects
-                .contains_key(&key(ObjectType::Commit, &tip))
-        );
+        assert_eq!(ref_of(&server, "repo/refs/heads/b"), Some(tip));
     });
 }
 
@@ -1124,15 +987,16 @@ fn a_lock_broken_before_the_refs_stops_the_push() {
             .unwrap_err();
         assert!(matches!(err, Error::BucketLockLost { .. }), "{err}");
         assert!(keys(&server, "repo/refs/").is_empty());
-        assert!(!server.state().objects.contains_key("repo/summary"));
         assert_eq!(server.state().objects[LOCK].bytes, DEAD_LOCK.as_bytes());
         assert_trees_whole(&server);
     });
 }
 
+/// A lock that another writer takes during the ref writes fails the
+/// release, and the push removes no lock.
 #[test]
-fn a_lock_broken_before_the_summary_stops_the_push() {
-    let scratch = TmpDir::new("push-s3-lost-summary");
+fn a_lock_broken_during_the_ref_writes_fails_the_release() {
+    let scratch = TmpDir::new("push-s3-lost-release");
     block_on(async {
         let server = StandIn::start();
         init(&server.endpoint(), None).await;
@@ -1144,7 +1008,6 @@ fn a_lock_broken_before_the_summary_stops_the_push() {
             .unwrap_err();
         assert!(matches!(err, Error::BucketLockLost { .. }), "{err}");
         assert_eq!(ref_of(&server, "repo/refs/heads/b"), Some(tip));
-        assert!(!server.state().objects.contains_key("repo/summary"));
         assert_eq!(server.state().objects[LOCK].bytes, DEAD_LOCK.as_bytes());
     });
 }
@@ -1162,9 +1025,8 @@ fn a_failed_release_leaves_the_lock_and_break_lock_removes_it() {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("AccessDenied"), "{err}");
-        // The refs and the summary are written.
+        // The refs are written.
         assert_eq!(ref_of(&server, "repo/refs/heads/main"), Some(tip));
-        assert!(server.state().objects.contains_key("repo/summary"));
         server.state().refuse = None;
         let held = match push(&repo, &server.endpoint(), opts(&["main"])).await {
             Err(Error::BucketLocked { holder, .. }) => *holder.expect("the holder"),
@@ -1255,67 +1117,48 @@ fn a_wrong_secret_gives_signature_does_not_match() {
     });
 }
 
+/// A push writes no summary. A summary and a signature that the bucket holds
+/// stay as they are, and a pull of a named ref reads the ref file.
 #[test]
-fn a_signed_bucket_repository_refuses_a_push_with_no_signer() {
-    let scratch = TmpDir::new("push-s3-signed");
-    block_on(async {
-        let server = StandIn::start();
-        init(&server.endpoint(), None).await;
-        server.state().store("repo/summary.sig", b"signed");
-        let repo = archive(&scratch.path().join("src")).await;
-        commit(&repo, "main", None, "one", None).await;
-        server.state().requests.clear();
-        let message = refused(push(&repo, &server.endpoint(), opts(&["main"])).await);
-        assert!(message.contains("has a signed summary"), "{message}");
-        assert_eq!(
-            puts(&server),
-            ["repo/extensions/ostrya/lock", "repo/extensions/ostrya/lock"]
-        );
-        assert!(!server.state().objects.contains_key(LOCK));
-    });
-}
-
-#[test]
-fn a_push_with_a_signer_writes_summary_and_summary_sig() {
-    let scratch = TmpDir::new("push-s3-signer");
+fn a_push_writes_no_summary_and_keeps_an_existing_one() {
+    let scratch = TmpDir::new("push-s3-keeps-summary");
     block_on(async {
         let server = StandIn::start();
         init(&server.endpoint(), None).await;
         let repo = archive(&scratch.path().join("src")).await;
         let tip = commit(&repo, "main", None, "one", None).await;
-        let signed = RepoPushOptions {
-            summary_signers: vec![signer()],
-            ..opts(&["main"])
-        };
-        push(&repo, &server.endpoint(), signed).await.unwrap();
-        assert!(server.state().objects.contains_key("repo/summary.sig"));
+        push(&repo, &server.endpoint(), opts(&["main"]))
+            .await
+            .unwrap();
+        assert!(!server.state().objects.contains_key("repo/summary"));
+        assert!(!server.state().objects.contains_key("repo/summary.sig"));
+        {
+            let mut state = server.state();
+            state.store("repo/summary", b"old summary");
+            state.store("repo/summary.sig", b"old signature");
+        }
+        let before = server.state().objects.clone();
+        let next = commit(&repo, "main", Some(tip), "two", None).await;
+        server.state().requests.clear();
+        push(&repo, &server.endpoint(), opts(&["main", "main:other"]))
+            .await
+            .unwrap();
+        assert!(!puts(&server).iter().any(|t| t.contains("summary")));
+        for key in ["repo/summary", "repo/summary.sig"] {
+            assert_eq!(server.state().objects[key], before[key], "{key}");
+        }
+        assert_eq!(ref_of(&server, "repo/refs/heads/main"), Some(next));
+        // With no summary, the pull reads the ref files.
+        server.state().objects.remove("repo/summary");
+        server.state().objects.remove("repo/summary.sig");
         let s3 = endpoint(&server.endpoint(), ADDRESS);
-        let trust = PullTrust::unverified().with_summary(trusted());
-        let pulled = pull_back(s3, &scratch.path().join("pulled"), &["main"], trust).await;
-        assert_eq!(pulled.resolve_rev("main", false).await.unwrap(), Some(tip));
-        // A changed summary fails the check of its signature.
-        let mut summary = server.state().objects["repo/summary"].bytes.clone();
-        let middle = summary.len() / 2;
-        summary[middle] ^= 1;
-        server.state().store("repo/summary", &summary);
-        let other = dest(&scratch.path().join("tampered")).await;
-        let session = PullSession::connect(
-            Endpoint::S3(endpoint(&server.endpoint(), ADDRESS)),
-            StreamSessionOptions::default(),
-        )
-        .await
-        .unwrap();
-        let pulled = other
-            .pull_with_session(
-                session,
-                PullTrust::unverified().with_summary(trusted()),
-                PullOptions {
-                    refs: vec!["main".into()],
-                    ..PullOptions::default()
-                },
-            )
-            .await;
-        assert!(matches!(pulled, Err(Error::Signature(_))), "{pulled:?}");
+        let path = scratch.path().join("pulled");
+        let pulled = pull_back(s3, &path, &["main", "other"], PullTrust::unverified()).await;
+        assert_eq!(pulled.resolve_rev("main", false).await.unwrap(), Some(next));
+        assert_eq!(
+            pulled.resolve_rev("other", false).await.unwrap(),
+            Some(next)
+        );
     });
 }
 
@@ -1662,30 +1505,120 @@ fn assert_unchanged(server: &StandIn) {
 }
 
 #[test]
-fn a_key_under_refs_remotes_refuses_the_push() {
-    let (server, result) = push_onto_seed(
-        "push-s3-remotes",
-        PLAIN,
-        &[("repo/refs/remotes/origin/main", b"x")],
-    );
-    let message = malformed(result);
-    assert!(message.contains("refs/remotes/origin/main"), "{message}");
-    assert_unchanged(&server);
-}
-
-#[test]
-fn a_mirror_directory_with_an_invalid_collection_id_refuses_the_push() {
+fn a_key_under_refs_heads_that_is_no_ref_name_refuses_the_push() {
     let ref_body = format!("{}\n", "ab".repeat(32));
     let (server, result) = push_onto_seed(
-        "push-s3-bad-mirror",
+        "push-s3-bad-head",
         PLAIN,
-        &[("repo/refs/mirrors/nodot/x", ref_body.as_bytes())],
+        &[("repo/refs/heads/-x", ref_body.as_bytes())],
     );
     let message = malformed(result);
-    assert!(message.contains("refs/mirrors/nodot/x"), "{message}");
+    assert!(message.contains("refs/heads/-x"), "{message}");
     assert_unchanged(&server);
 }
 
+/// Returns the keys under `refs/` that `server` got a `GET` of, and the
+/// prefixes under `refs/` that it listed, without the prefix of the
+/// repository.
+fn ref_reads(server: &StandIn) -> (Vec<String>, BTreeSet<String>) {
+    let state = server.state();
+    let mut gets = Vec::new();
+    let mut lists = BTreeSet::new();
+    for (method, target) in &state.requests {
+        if method != "GET" {
+            continue;
+        }
+        match target.split_once('?') {
+            Some((_, query)) => {
+                let prefix = query
+                    .split('&')
+                    .find_map(|pair| pair.strip_prefix("prefix="))
+                    .unwrap_or_default()
+                    .replace("%2F", "/");
+                if let Some(prefix) = prefix.strip_prefix("repo/refs/") {
+                    lists.insert(format!("refs/{prefix}"));
+                }
+            }
+            None => {
+                if let Some(key) = target.strip_prefix("/bkt/repo/refs/") {
+                    gets.push(format!("refs/{key}"));
+                }
+            }
+        }
+    }
+    gets.sort();
+    (gets, lists)
+}
+
+/// A push lists and reads the ref directory of its namespace alone, and
+/// lists `refs/mirrors/` of the collection id of the bucket. A key or a ref
+/// file of another namespace that breaks a rule does not refuse the push.
+#[test]
+fn a_push_reads_no_ref_file_of_another_namespace() {
+    let scratch = TmpDir::new("push-s3-own-namespace");
+    block_on(async {
+        let server = StandIn::start();
+        init(&server.endpoint(), Some(A)).await;
+        let absent = format!("{}\n", "cd".repeat(32));
+        {
+            let mut state = server.state();
+            state.store("repo/refs/remotes/origin/main", b"x");
+            state.store("repo/refs/mirrors/nodot/x", absent.as_bytes());
+            state.store(&format!("repo/refs/mirrors/{C}/main"), absent.as_bytes());
+            state.store(&format!("repo/refs/mirrors/{C}/bad"), b"bad");
+        }
+        let repo = archive(&scratch.path().join("src")).await;
+        let main = commit(&repo, "main", None, "one", None).await;
+        let mirrored = commit(&repo, "bound-b", None, "b", bound(B)).await;
+        push(&repo, &server.endpoint(), opts(&["main"]))
+            .await
+            .unwrap();
+        push(&repo, &server.endpoint(), opts(&["bound-b:main"]))
+            .await
+            .unwrap();
+        let next = commit(&repo, "main", Some(main), "two", None).await;
+        let next_mirrored = commit(&repo, "bound-b", Some(mirrored), "b2", bound(B)).await;
+
+        server.state().requests.clear();
+        push(&repo, &server.endpoint(), opts(&["main"]))
+            .await
+            .unwrap();
+        let (gets, lists) = ref_reads(&server);
+        assert_eq!(gets, ["refs/heads/main"]);
+        assert_eq!(
+            lists,
+            BTreeSet::from(["refs/heads/".to_owned(), format!("refs/mirrors/{A}/")])
+        );
+        assert_eq!(ref_of(&server, "repo/refs/heads/main"), Some(next));
+
+        server.state().requests.clear();
+        push(&repo, &server.endpoint(), opts(&["bound-b:main"]))
+            .await
+            .unwrap();
+        let (gets, lists) = ref_reads(&server);
+        assert_eq!(gets, [format!("refs/mirrors/{B}/main")]);
+        assert_eq!(
+            lists,
+            BTreeSet::from([format!("refs/mirrors/{A}/"), format!("refs/mirrors/{B}/")])
+        );
+        assert_eq!(
+            ref_of(&server, &format!("repo/refs/mirrors/{B}/main")),
+            Some(next_mirrored)
+        );
+        // The keys of the other namespaces stay as they are.
+        assert_eq!(
+            server.state().objects["repo/refs/remotes/origin/main"].bytes,
+            b"x"
+        );
+        assert_eq!(
+            server.state().objects[&format!("repo/refs/mirrors/{C}/bad")].bytes,
+            b"bad"
+        );
+    });
+}
+
+/// A ref key under `refs/mirrors/` of the collection id of the bucket
+/// refuses a push into each namespace.
 #[test]
 fn the_mirror_refs_of_the_own_collection_id_refuse_the_push() {
     let ref_body = format!("{}\n", "ab".repeat(32));
@@ -1694,6 +1627,22 @@ fn the_mirror_refs_of_the_own_collection_id_refuse_the_push() {
         &format!("{PLAIN}collection-id={A}\n"),
         &[(&format!("repo/refs/mirrors/{A}/x"), ref_body.as_bytes())],
     );
+    let message = malformed(result);
+    assert!(message.contains("its own collection id"), "{message}");
+    assert!(
+        message.contains(&format!("refs/mirrors/{A}/x")),
+        "{message}"
+    );
+    assert_unchanged(&server);
+    let (gets, _) = ref_reads(&server);
+    assert!(gets.is_empty(), "{gets:?}");
+
+    let scratch = TmpDir::new("push-s3-own-mirror-into-mirror");
+    let result = block_on(async {
+        let repo = archive(&scratch.path().join("src")).await;
+        commit(&repo, "bound-b", None, "b", bound(B)).await;
+        push(&repo, &server.endpoint(), opts(&["bound-b:main"])).await
+    });
     let message = malformed(result);
     assert!(message.contains("its own collection id"), "{message}");
     assert_unchanged(&server);
@@ -1757,144 +1706,6 @@ fn a_bucket_config_with_a_value_that_is_no_boolean_refuses_the_push() {
         assert_unchanged(&server);
         assert!(keys(&server, "repo/refs/").is_empty());
     }
-}
-
-// ---------------------------------------------------------------------------
-// Summary.
-// ---------------------------------------------------------------------------
-
-/// Returns the `ostree.summary.last-modified` value of `summary`.
-fn last_modified(summary: &Summary) -> u64 {
-    match summary.metadata_value("ostree.summary.last-modified") {
-        Some(Value::U64(value)) => u64::from_be(*value),
-        other => panic!("{other:?}"),
-    }
-}
-
-#[test]
-fn the_summary_of_a_push_has_the_bytes_of_a_local_summary() {
-    let scratch = TmpDir::new("push-s3-summary-bytes");
-    block_on(async {
-        let server = StandIn::start();
-        init(&server.endpoint(), None).await;
-        let repo = archive(&scratch.path().join("src")).await;
-        let first = commit(&repo, "main", None, "one", None).await;
-        commit(&repo, "main", Some(first), "two", None).await;
-        commit(&repo, "bound-b", None, "b", bound(B)).await;
-        commit(&repo, "bound-c", None, "c", bound(C)).await;
-        for spec in [
-            "main",
-            "main:x/y",
-            "bound-b:main",
-            "bound-c:main",
-            "bound-c:other",
-        ] {
-            push(&repo, &server.endpoint(), opts(&[spec]))
-                .await
-                .unwrap();
-        }
-        let bucket_summary = server.state().objects["repo/summary"].bytes.clone();
-        let parsed = Summary::parse(&bucket_summary).unwrap();
-        assert_eq!(parsed.collection_map().unwrap().len(), 2);
-
-        // The same files in a local repository give the same root summary.
-        let path = scratch.path().join("local");
-        drop(archive(&path).await);
-        let objects = server.state().objects.clone();
-        for (key, stored) in &objects {
-            let relative = &key["repo/".len()..];
-            if relative.starts_with("extensions/") || relative.starts_with("summary") {
-                continue;
-            }
-            let file = path.join(relative);
-            std::fs::create_dir_all(file.parent().unwrap()).unwrap();
-            std::fs::write(file, &stored.bytes).unwrap();
-        }
-        let local = Repo::open(&path).await.unwrap();
-        let summary_opts = SummaryOptions {
-            last_modified: Some(last_modified(&parsed)),
-            ..SummaryOptions::default()
-        };
-        local.regenerate_summary(&summary_opts).await.unwrap();
-        assert_eq!(local.read_summary().await.unwrap().unwrap(), bucket_summary);
-    });
-}
-
-#[test]
-fn the_summary_has_the_collection_id_and_the_map() {
-    let scratch = TmpDir::new("push-s3-summary-collections");
-    block_on(async {
-        let server = StandIn::start();
-        init(&server.endpoint(), Some(A)).await;
-        let repo = archive(&scratch.path().join("src")).await;
-        let main = commit(&repo, "main", None, "one", bound(A)).await;
-        let mirrored = commit(&repo, "bound-b", None, "b", bound(B)).await;
-        push(&repo, &server.endpoint(), opts(&["main"]))
-            .await
-            .unwrap();
-        push(&repo, &server.endpoint(), opts(&["bound-b:stable"]))
-            .await
-            .unwrap();
-        let summary = Summary::parse(&server.state().objects["repo/summary"].bytes).unwrap();
-        assert_eq!(
-            summary.metadata_value("ostree.summary.collection-id"),
-            Some(&Value::Str(A.into()))
-        );
-        let names: Vec<(&str, Checksum)> = summary
-            .refs
-            .iter()
-            .map(|entry| (entry.name.as_str(), entry.commit))
-            .collect();
-        assert_eq!(names, [("main", main)]);
-        let map = summary.collection_map().unwrap();
-        assert_eq!(map.len(), 1);
-        assert_eq!(map[0].0, B);
-        assert_eq!(map[0].1.len(), 1);
-        assert_eq!(
-            (map[0].1[0].name.as_str(), map[0].1[0].commit),
-            ("stable", mirrored)
-        );
-    });
-}
-
-#[test]
-fn the_summary_lists_the_deltas_of_the_bucket() {
-    let scratch = TmpDir::new("push-s3-summary-deltas");
-    block_on(async {
-        let server = StandIn::start();
-        init(&server.endpoint(), None).await;
-        let mut bytes = [7u8; 32];
-        bytes[0] = 0xfb;
-        bytes[1] = 0xff;
-        let to = Checksum::from_bytes(bytes);
-        let b64 = to.to_base64_modified();
-        assert!(b64.contains('+'), "{b64}");
-        let superblock = b"a superblock".to_vec();
-        let other = Checksum::from_bytes([3u8; 32]).to_base64_modified();
-        {
-            let mut state = server.state();
-            state.store(
-                &format!("repo/deltas/{}/{}/superblock", &b64[..2], &b64[2..]),
-                &superblock,
-            );
-            // A delta directory with no superblock is not in the map.
-            state.store(
-                &format!("repo/deltas/{}/{}/0", &other[..2], &other[2..]),
-                b"part",
-            );
-        }
-        let repo = archive(&scratch.path().join("src")).await;
-        commit(&repo, "main", None, "one", None).await;
-        push(&repo, &server.endpoint(), opts(&["main"]))
-            .await
-            .unwrap();
-        let summary = Summary::parse(&server.state().objects["repo/summary"].bytes).unwrap();
-        let deltas = summary.static_deltas().unwrap();
-        assert_eq!(deltas.len(), 1);
-        assert_eq!(deltas[0].from, None);
-        assert_eq!(deltas[0].to, to);
-        assert_eq!(deltas[0].superblock, Checksum::sha256(&superblock));
-    });
 }
 
 /// The future of a push to a bucket repository can run on a multi-threaded

@@ -5733,7 +5733,8 @@ Observed behavior of the servers:
 ### Init of a bucket repository
 
 The init writes the `config` of a new bucket repository, with an optional
-collection id:
+collection id. `ostrya remote init` runs it, with the `s3://` address of
+its operand or of a remote:
 
 1. It refuses a collection id that fails the collection id rule or is
    longer than 255 bytes. It sends no request before this check.
@@ -5760,15 +5761,17 @@ repository. The steps of a push are:
    changes nothing in the bucket. The push refuses tags, a compression, and
    a refspec that deletes a ref.
 2. The take of the writer lock with `operation=push`.
-3. The read of `config` and of the presence of `summary.sig`, then the read
-   of the ref files and the listing of the objects of the 256 fan-out
-   prefixes. Each pair of reads runs at the same time. The push trusts the
-   listing alone. A bucket repository with no `config` refuses the push. A
-   bucket repository with a `summary.sig` refuses a push with no summary
-   signer, so a push never changes a signed bucket repository into an
-   unsigned one.
-4. The selection of the namespace and the check of the bindings, then the
-   check of each ref update. Each tip of a ref in the bucket must be an
+3. The read of `config` and the selection of the namespace. Then, at the
+   same time, the listing and the read of the ref files of the ref
+   directory of the namespace, `refs/heads/` or `refs/mirrors/ID/`, the
+   listing of `refs/mirrors/` of the collection id of the bucket, and the
+   listing of the objects of the 256 fan-out prefixes. The push reads no
+   ref file of another namespace, and does not check the keys under
+   `refs/` outside its ref directory. A key under
+   `refs/mirrors/` of the collection id of the bucket refuses the push. The
+   push trusts the listing of the objects alone. A bucket repository with
+   no `config` refuses the push.
+4. The check of the bindings, then the check of each ref update. Each tip of a ref in the bucket must be an
    ancestor of the new commit in the local repository, unless the push is
    forced. A tip that the local repository does not hold, or marks partial,
    is no ancestor. The fast-forward rule and the force apply to each ref in
@@ -5779,8 +5782,9 @@ repository. The steps of a push are:
    commit and of each commit that the bucket lacks, if the local repository
    holds the image. The walk reads no tree of a commit that the listing
    holds, because a commit object in the bucket has its whole tree in the
-   bucket. Each ref of the new ref set must name a commit that the bucket
-   holds or that the push uploads, else the push is refused.
+   bucket. Each ref of the new ref set of the ref directory of the
+   namespace must name a commit that the bucket holds or that the push
+   uploads, else the push is refused.
 6. The upload of each tree object and image that the listing lacks, and of
    the `.commitmeta` of each commit that the bucket lacks and of each source
    commit, at most `max_outstanding` uploads at a time. The bytes of a
@@ -5792,15 +5796,16 @@ repository. The steps of a push are:
    nothing, and the bucket keeps its copy. After a failed upload, the push
    starts no new upload and waits for the uploads in flight.
 7. The upload of each commit object that the bucket lacks.
-8. The build and the signature of the summary ("The summary of a bucket
-   repository"). A refusal of the build and a failure of a signer come
-   before the first ref write, so they change no ref.
-9. A check of the writer lock, then the write of each ref file that
+8. A check of the writer lock, then the write of each ref file that
    changes, in the order of the refspecs. A ref file holds the checksum in
    lowercase hex and a newline.
-10. A check of the writer lock, then the write of `summary`, also when no
-    ref changed, and then of `summary.sig`.
-11. The release of the writer lock.
+9. The release of the writer lock.
+
+The push writes no `summary` and no `summary.sig`. A `summary` and a
+`summary.sig` that the bucket holds stay as they are, so they do not show
+the refs that the push writes, as in a local `archive` repository with no
+`auto-update-summary`. A pull of a named ref reads the ref file
+`refs/heads/<name>` when the summary does not list the ref.
 
 The namespace of a push is the collection of the push, else the
 `ostree.collection-binding` of the source commits, else none. The `config`
@@ -5815,9 +5820,10 @@ of the bucket takes the role of the server of a push over a session:
 A commit with no binding goes to `refs/heads/` alone. Each other commit
 refuses the push.
 
-A push refuses an update whose new ref set holds, in one ref directory, a
-name that is a directory of another name, for example `a` and `a/b` in
-`refs/heads/`. Each `refs/mirrors/ID/` is a ref directory of its own.
+A push refuses an update whose new ref set holds, in the ref directory of
+its namespace, a name that is a directory of another name, for example `a`
+and `a/b` in `refs/heads/`. Each `refs/mirrors/ID/` is a ref directory of
+its own.
 
 A commit object goes up only after each object of its tree. So a commit
 object in the bucket has its whole tree in the bucket at each point of a
@@ -5826,15 +5832,10 @@ push, also of a push that failed. This is the bucket form of the
 
 A push that fails leaves one of these states:
 
-- A failure before the ref writes changes no ref. This covers each refusal
-  of the summary build and each failure of a summary signer. The objects
-  that went up stay, and a run again uploads only the rest. The push
-  releases its lock.
-- A failure of a ref write leaves some refs moved and the old summary. A run
-  again finds those refs at their new commits, writes the other refs, and
-  writes the summary.
-- A failure of the summary write leaves the new refs and the old summary,
-  or the new summary and the old `summary.sig`. A run again writes both.
+- A failure before the ref writes changes no ref. The objects that went up
+  stay, and a run again uploads only the rest. The push releases its lock.
+- A failure of a ref write leaves some refs moved. A run again finds those
+  refs at their new commits, and writes the other refs.
 - A check of the lock that finds another lock, or no lock, stops the push
   before its next write. The push then releases no lock.
 - A failure of the release, or a crash, leaves the lock. The next writer
@@ -5844,6 +5845,11 @@ A push that fails leaves one of these states:
   aborts its own multipart upload.
 
 ### The summary of a bucket repository
+
+The summary of a bucket repository is written by an explicit summary update
+alone. A push and the init write no summary. This version of the port has
+no command that writes the summary of a bucket repository. The rules below
+are the rules of the summary builder of the port for a bucket repository.
 
 The summary of a bucket repository is the root summary alone. A writer
 writes no summary of an auth item and no file under
@@ -5882,8 +5888,7 @@ refuse the writer before it changes the bucket.
 
 The writer builds and signs the summary before it changes the bucket. It
 then checks the lock, writes `summary`, and then writes `summary.sig` if a
-summary signer signed the summary. A push writes its ref files between the
-build and the write of the summary. Between the two writes, a reader
+summary signer signed the summary. Between the two writes, a reader
 sees the new summary and the old signature, and a reader that verifies the
 summary refuses it. A reader never accepts a summary that its signature
 does not cover. A read after the writer ends finds a matching pair.

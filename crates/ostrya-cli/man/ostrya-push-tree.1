@@ -12,7 +12,7 @@ The command walks DIR and sends the objects of its tree that the server does not
 .PP
 The client group needs \fB\%c\fR on the branch. A server that runs receive hooks takes no server commit and answers \%ref\-denied. The push sends the server commit in one frame, which an ostrya server limits to \%1 MiB. The reply names the branch and each \%\-\-tag, and must also fit in one frame. In a commit, an \%\-\-add\-metadata value can hold two levels of containers fewer than a variant. The push checks the two frames and the depth of each value before it sends an object.
 .PP
-The command makes its checks before the ssh client starts or the first HTTP request goes. It resolves REMOTE before it reads \%\-\-body\-file. A refusal of the remote thus reads no body file.
+The command makes its checks before the ssh client starts or the first HTTP request goes. It resolves REMOTE before it reads \%\-\-body\-file. A refusal of the remote thus reads no body file. The command refuses an \fB\%s3://\fR push address, because it does not write a bucket repository.
 .PP
 On success, standard output carries the commit checksum alone. Under \%\-\-verbose, one statistics line goes to standard error. On a terminal, standard error shows the progress bar of \fB\%push\fR while the push runs. On failure, the command writes \fB\%error: MESSAGE\fR to standard error and nothing to standard output, and exits \%1.
 .SH ARGUMENTS
@@ -139,7 +139,7 @@ With it, the push does not use the trust store of the host. It wins over the \fB
 \fB\-\-allow\-cleartext\-credentials\fR
 Send the token to an \fB\%http://\fR address.
 .IP
-Without this switch, the command refuses a token to such an address before any request. Use it for a server on a loopback address or behind a proxy that terminates TLS. No key of the remote sets this switch. The command refuses it for an ssh address.
+Without this switch, the command refuses a token to such an address before any request. Use it for a server on a loopback address or behind a proxy that terminates TLS. No key of the remote sets this switch. The command refuses it for an ssh address. For a \fB\%push\fR to an \fB\%s3://\fR address, the switch permits an \fB\%http://\fR \%S3 server, to which the signature of each request goes in cleartext.
 .PP
 The global options are listed in \fBostrya\fR(1).
 .SH SEE ALSO

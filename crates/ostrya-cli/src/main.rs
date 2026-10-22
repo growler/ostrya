@@ -18,7 +18,7 @@
 //!   `diff`.
 //! - Pull: `pull`, `pull-local`.
 //! - ostrya extensions: `composefs-image`, `push`, `push-tree`, `receive`,
-//!   `send`, `serve`.
+//!   `send`, `serve`, `remote init`.
 //!
 //! # Features
 //!
@@ -30,6 +30,8 @@
 //! - `push` (default): `push` and `push-tree`.
 //! - `serve` (default): `serve`, the HTTP server of a repository.
 //! - `send` (default): `send`, the server side of a pull over ssh.
+//! - `s3` (default): the pull from and the push to a bucket repository at an
+//!   `s3://` address, `remote init`, and the S3 options.
 //! - `lzma-static` (default): a static liblzma, so the binary needs no
 //!   liblzma at run time.
 //!
@@ -420,7 +422,7 @@ enum Command {
     /// 1 otherwise.
     #[cfg(feature = "receive")]
     Receive(ReceiveArgs),
-    /// Push commits to a remote over ssh or HTTP and update its refs.
+    /// Push commits to a remote over ssh or HTTP, or to a bucket repository.
     ///
     /// The command resolves REMOTE and sends the objects that the server does
     /// not have. The server then updates all the refs of the refspecs in one
@@ -433,6 +435,22 @@ enum Command {
     /// the namespace of the push on the server: the local refs or one
     /// collection. The server writes the refs of a collection other than its
     /// own collection id under `refs/mirrors/ID/`.
+    ///
+    /// To an `s3://` address, the push writes a bucket repository in an S3
+    /// bucket with signed requests, and needs no server program. The bucket
+    /// repository needs a `config`, which `remote init` writes. The push
+    /// holds the writer lock of the bucket repository, uploads each object
+    /// that the bucket does not hold, in archive form, and then writes the ref
+    /// files. A commit object goes up after each object of its tree. The
+    /// bucket gets the `.filez` bytes at the `[archive] zlib-level` of this
+    /// repository. The `config` of the bucket takes the role of the server
+    /// for --collection: its collection id gives `refs/heads/`, and each
+    /// other collection gives `refs/mirrors/ID/`. The push writes no summary,
+    /// and a summary of the bucket stays as it is. A pull of a ref that the
+    /// summary lists takes the commit of the summary, so after the push moves
+    /// that ref, the pull takes the old commit until an update of the
+    /// summary. The push refuses --onto,
+    /// --tag, --compress, a delete refspec, and the token and ssh options.
     ///
     /// With --onto, the push sends the tree of one local commit, and the
     /// server makes a new commit over it on the branch BRANCH. The server
@@ -447,9 +465,13 @@ enum Command {
     ///
     /// Under --verbose, one statistics line goes to standard error. If
     /// standard error is a terminal and `TERM` is set and is not `dumb`,
-    /// standard error shows a progress bar while the push runs. On failure,
-    /// the command writes `error: MESSAGE` to standard error and nothing to
-    /// standard output, and exits 1.
+    /// standard error shows a progress bar while the push runs. A push to a
+    /// bucket repository shows no bar while it lists the bucket and walks the
+    /// commits. With --break-lock, a push that removed the writer lock of
+    /// another writer writes one `warning: removed the writer lock of HOLDER`
+    /// line to standard error. On failure, the command writes `error:
+    /// MESSAGE` to standard error and nothing to standard output, and exits
+    /// 1.
     #[cfg(feature = "push")]
     Push(PushArgs),
     /// Push a directory over ssh or HTTP, and let the server commit it.
@@ -473,7 +495,8 @@ enum Command {
     ///
     /// The command makes its checks before the ssh client starts or the first
     /// HTTP request goes. It resolves REMOTE before it reads --body-file. A
-    /// refusal of the remote thus reads no body file.
+    /// refusal of the remote thus reads no body file. The command refuses an
+    /// `s3://` push address, because it does not write a bucket repository.
     ///
     /// On success, standard output carries the commit checksum alone. Under
     /// --verbose, one statistics line goes to standard error. On a terminal,
@@ -1587,6 +1610,32 @@ enum RemoteCommand {
     /// valid remote name. If the remote exists, the command fails, unless
     /// --if-not-exists or --force is given.
     Add(RemoteAddArgs),
+    /// Create a bucket repository in an S3 bucket.
+    ///
+    /// The command writes the `config` of a new bucket repository at the
+    /// `s3://` address of NAME, or at the address `s3://BUCKET[/PREFIX]`. The
+    /// `config` holds the group `[core]` with `repo_version=1` and
+    /// `mode=archive-z2`, and `collection-id=ID` with --collection-id. A bucket
+    /// repository with a collection id is the primary server of that
+    /// collection, and a push of the refs of another collection writes them
+    /// under `refs/mirrors/ID/`. The command writes no ref and no summary,
+    /// and prints nothing on success.
+    ///
+    /// The command takes the writer lock of the bucket repository, writes the
+    /// `config` only if the bucket repository holds none, and removes the
+    /// lock. It refuses a bucket repository that holds a `config`, so the
+    /// collection id of a bucket repository never changes. A push needs the
+    /// `config`. The command needs the S3 permissions `s3:GetObject`,
+    /// `s3:PutObject`, `s3:ListBucket`, and `s3:DeleteObject`.
+    ///
+    /// With an address, the command needs no repository and reads no
+    /// `--repo`, current directory, or `OSTREE_REPO`. With a remote name, it
+    /// reads the remote from the config of the repository. With
+    /// --break-lock, an init that removed the writer lock of another writer
+    /// writes one `warning: removed the writer lock of HOLDER` line to
+    /// standard error.
+    #[cfg(feature = "s3")]
+    Init(RemoteInitArgs),
     /// Delete a remote repository and its trusted GPG keyring.
     ///
     /// The command removes the keyring `NAME.trustedkeys.gpg` at the root of
@@ -1609,15 +1658,20 @@ enum RemoteCommand {
     /// List the refs that a remote publishes in its summary.
     ///
     /// The command fetches the summary of the remote over HTTP or ssh, as a
-    /// pull does. It prints one `NAME:REF` line for each ref, in the order of
-    /// the summary. It does not verify the signature of the summary. If the
-    /// remote has no summary file, the command fails.
+    /// pull does. From an `s3://` address in `pull-url`, it reads the summary
+    /// of the bucket repository with signed requests. It prints one
+    /// `NAME:REF` line for each ref, in the order of the summary. It does not
+    /// verify the signature of the summary. If the remote has no summary
+    /// file, the command fails. A push to a bucket repository writes no
+    /// summary.
     Refs(RemoteRefsArgs),
     /// Report the summary of a remote.
     ///
     /// The command fetches the summary of the remote over HTTP or ssh, as a
-    /// pull does. It does not verify the signature of the summary. If the
-    /// remote has no summary file, the command fails.
+    /// pull does. From an `s3://` address in `pull-url`, it reads the summary
+    /// of the bucket repository with signed requests. It does not verify the
+    /// signature of the summary. If the remote has no summary file, the
+    /// command fails. A push to a bucket repository writes no summary.
     ///
     /// The default report gives each ref with its commit size, its commit
     /// checksum, and its metadata. The global metadata of the summary follows
@@ -1651,6 +1705,8 @@ impl RemoteCommand {
     fn name(&self) -> &'static str {
         match self {
             RemoteCommand::Add(_) => "add",
+            #[cfg(feature = "s3")]
+            RemoteCommand::Init(_) => "init",
             RemoteCommand::Delete(_) => "delete",
             RemoteCommand::List(_) => "list",
             RemoteCommand::ShowUrl(_) => "show-url",
@@ -1746,11 +1802,48 @@ struct RemoteAddArgs {
     /// The command writes a base URL to the `url` key. For `metalink=URL`, it
     /// writes URL to the `metalink` key and writes no `url` key. The pull of
     /// ostrya does not read the `metalink` key.
+    ///
+    /// The command writes an `s3://BUCKET[/PREFIX]` address to the
+    /// `pull-url` and `push-url` keys, after the branches, and writes no
+    /// `url` key. It does not check the address. A pull or a push refuses a
+    /// bad address when it uses the remote. --set writes the S3 keys
+    /// `s3-region`, `s3-endpoint`, `s3-addressing`, and `s3-profile`.
+    /// `show-url` and `list -u` refuse a remote with no `url` key.
     url: Option<String>,
     /// The refs that a pull of this remote takes if the pull names no ref.
     ///
     /// The command writes them to the `branches` key.
     branches: Vec<String>,
+}
+
+#[cfg(feature = "s3")]
+#[derive(Args)]
+struct RemoteInitArgs {
+    /// Write `collection-id=ID` into the `config` of the bucket repository.
+    ///
+    /// The command refuses an ID that fails the collection-id rule or is
+    /// longer than 255 bytes, before any request.
+    #[arg(long, value_name = "ID")]
+    collection_id: Option<String>,
+    /// Remove the writer lock of another writer of the bucket repository.
+    ///
+    /// The command reads the lock, deletes it, and then takes its own lock.
+    /// It writes the holder of the removed lock to standard error after an
+    /// init that succeeds. Use it only when the holder is gone, for example
+    /// after a crash.
+    #[arg(long)]
+    break_lock: bool,
+    #[command(flatten)]
+    s3: S3AccessArgs,
+    // ostrya checks this operand after the repository resolves, unless it is
+    // an address.
+    /// The remote name or the address `s3://BUCKET[/PREFIX]`. Required.
+    ///
+    /// The address of a remote is its `push-url` key if that key holds an
+    /// `s3://` address, else its `pull-url` key if that key holds an `s3://`
+    /// address. The command refuses a remote with neither, and never reads the
+    /// `url` key.
+    name: Option<String>,
 }
 
 #[derive(Args)]
@@ -1788,6 +1881,9 @@ struct RemoteRefsArgs {
     /// Print the commit checksum of each ref after a tab.
     #[arg(short = 'r', long)]
     revision: bool,
+    #[cfg(feature = "s3")]
+    #[command(flatten)]
+    s3: S3AccessArgs,
     // ostrya checks this operand after the repository resolves.
     /// The remote to list. Required.
     name: Option<String>,
@@ -1814,6 +1910,9 @@ struct RemoteSummaryArgs {
     /// big-endian fields converted.
     #[arg(long)]
     raw: bool,
+    #[cfg(feature = "s3")]
+    #[command(flatten)]
+    s3: S3AccessArgs,
     // ostrya checks this operand after the repository resolves.
     /// The remote to report. Required.
     name: Option<String>,
@@ -2606,13 +2705,152 @@ struct DeltaGenerateArgs {
     swap_endianness: bool,
 }
 
+/// The options of a command that reads or writes a bucket repository at an
+/// `s3://` address.
+///
+/// Each option wins over the key of the remote with its name, and over the
+/// environment and the shared AWS files. A command refuses each option for
+/// an address that is not `s3://`.
+#[cfg(feature = "s3")]
+#[derive(Args, Default)]
+struct S3Args {
+    /// The region of the signature of each request to the S3 server.
+    ///
+    /// It wins over the `s3-region` key of the remote, over `AWS_REGION` and
+    /// `AWS_DEFAULT_REGION`, and over the `region` of the AWS profile. The
+    /// default is `us-east-1`. The command refuses this option for an
+    /// address that is not `s3://`.
+    #[arg(long, value_name = "REGION")]
+    s3_region: Option<String>,
+    /// The `http://` or `https://` URL of the S3 server, with no path.
+    ///
+    /// It wins over the `s3-endpoint` key of the remote, over
+    /// `AWS_ENDPOINT_URL_S3` and `AWS_ENDPOINT_URL`, and over the endpoint of
+    /// the AWS profile. Without each of them, the server is AWS. An `http://`
+    /// URL needs --allow-cleartext-credentials. The command refuses this
+    /// option for an address that is not `s3://`.
+    #[arg(long, value_name = "URL")]
+    s3_endpoint: Option<String>,
+    /// The addressing style of the bucket: `path` or `virtual`.
+    ///
+    /// `path` puts the bucket in the path of each request, and `virtual` puts
+    /// it in the host name. The option wins over the `s3-addressing` key of
+    /// the remote and over the `addressing_style` of the AWS profile. The
+    /// default is `virtual` for AWS and `path` for a set server. A bucket
+    /// name that holds a `.` gets `path` by default. The command refuses this
+    /// option for an address that is not `s3://`.
+    #[arg(long, value_name = "STYLE", value_parser = ["path", "virtual"])]
+    s3_addressing: Option<String>,
+    /// The profile of the shared AWS files.
+    ///
+    /// It wins over the `s3-profile` key of the remote and over
+    /// `AWS_PROFILE`. A profile that this option or the key names skips the
+    /// key pair, the region, and the endpoint of the environment. The
+    /// default profile is `default`. The command refuses this option for an
+    /// address that is not `s3://`.
+    #[arg(long, value_name = "PROFILE")]
+    s3_profile: Option<String>,
+}
+
+#[cfg(feature = "s3")]
+impl S3Args {
+    /// Returns the name of the first option that is set, or `None` if no
+    /// option is set.
+    fn first_set(&self) -> Option<&'static str> {
+        [
+            ("--s3-region", self.s3_region.is_some()),
+            ("--s3-endpoint", self.s3_endpoint.is_some()),
+            ("--s3-addressing", self.s3_addressing.is_some()),
+            ("--s3-profile", self.s3_profile.is_some()),
+        ]
+        .into_iter()
+        .find(|(_, set)| *set)
+        .map(|(name, _)| name)
+    }
+
+    /// Moves the options into the S3 fields of `overrides`.
+    fn apply(self, overrides: &mut ostrya::endpoint::EndpointOverrides) {
+        overrides.s3_region = self.s3_region;
+        overrides.s3_endpoint = self.s3_endpoint;
+        overrides.s3_addressing = self.s3_addressing;
+        overrides.s3_profile = self.s3_profile;
+    }
+}
+
+/// The S3 options of a command that has no other HTTP credential, with the
+/// permission of an `http://` S3 server.
+#[cfg(feature = "s3")]
+#[derive(Args)]
+struct S3AccessArgs {
+    #[command(flatten)]
+    s3: S3Args,
+    /// Send the signature of each request to an `http://` S3 server.
+    ///
+    /// The signature is a credential. Without this switch, the command
+    /// refuses an `http://` S3 server before any request. Use it for a
+    /// server on a loopback address or behind a proxy that terminates TLS. No
+    /// key of the remote sets this switch. The command refuses it for an
+    /// address that is not `s3://`.
+    #[arg(long)]
+    allow_cleartext_credentials: bool,
+}
+
+#[cfg(feature = "s3")]
+impl S3AccessArgs {
+    /// Returns the name of the first option that is set, or `None` if no
+    /// option is set.
+    fn first_set(&self) -> Option<&'static str> {
+        self.s3.first_set().or(self
+            .allow_cleartext_credentials
+            .then_some("--allow-cleartext-credentials"))
+    }
+
+    /// Returns the endpoint overrides of the options.
+    fn into_overrides(self) -> ostrya::endpoint::EndpointOverrides {
+        let mut overrides = ostrya::endpoint::EndpointOverrides {
+            allow_cleartext_credentials: self.allow_cleartext_credentials,
+            ..Default::default()
+        };
+        self.s3.apply(&mut overrides);
+        overrides
+    }
+
+    /// Returns the endpoint overrides of the options for a pull of `remote`
+    /// from the address `url` or from the address of the remote.
+    ///
+    /// If an option is set and the address of the pull is an HTTP or an ssh
+    /// address, the process exits with an error that names the option. An
+    /// address that the resolver refuses keeps the options, so that the
+    /// resolver states its refusal.
+    fn pull_overrides(
+        self,
+        repo: &Repo,
+        remote: &str,
+        url: Option<&str>,
+    ) -> ostrya::endpoint::EndpointOverrides {
+        if let Some(name) = self.first_set()
+            && ostrya::endpoint::pull_address_is_s3(Some(repo.config()), remote, url) == Some(false)
+        {
+            exit_error(&format!(
+                "{name} applies to an s3:// address, and the pull address of remote \
+                 '{remote}' is not one"
+            ));
+        }
+        self.into_overrides()
+    }
+}
+
 #[derive(Args)]
 struct PullArgs {
-    /// Fetch from this address, an HTTP URL or an ssh address.
+    /// Fetch from this address, an HTTP URL, an ssh address, or an `s3://`
+    /// address.
     ///
     /// The address replaces the configured `pull-url` or `url` of the remote.
     /// An address that starts with `ssh://`, or that holds no `://`, is an
-    /// ssh address. With this option, a pull can use a remote that the config
+    /// ssh address. `s3://BUCKET[/PREFIX]` is the address of a bucket
+    /// repository in an S3 bucket, which the pull reads with signed requests.
+    /// A build without the feature `s3` refuses it. With this option, a pull
+    /// can use a remote that the config
     /// does not describe. The config gives no keys for such a remote, and
     /// `gpg-verify` keeps its default of true. So the pull requires a GPG
     /// signature on each commit, unless the command line states its own
@@ -2843,6 +3081,9 @@ struct PullArgs {
     /// `--sign-verify-summary=false` requires none.
     #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
     sign_verify_summary: Option<bool>,
+    #[cfg(feature = "s3")]
+    #[command(flatten)]
+    s3: S3AccessArgs,
     // ostrya checks this operand after the repository resolves, in the order
     // of the `ostree` command.
     /// The remote to pull from, a `[remote "<name>"]` section of the config.
@@ -3136,6 +3377,11 @@ struct PushArgs {
     /// With --onto, ID alone names the namespace, and the bindings of the
     /// local commit do not apply. Without ID, the server commit goes to the
     /// local refs of the server.
+    ///
+    /// To a bucket repository, the `config` of the bucket takes the role of
+    /// the server. No namespace, or the collection id of the bucket, writes
+    /// `refs/heads/NAME`. Each other collection writes
+    /// `refs/mirrors/ID/NAME`, also in a bucket with no collection id.
     #[arg(long, value_name = "ID")]
     collection: Option<String>,
     /// Create the ref NAME on the server at the source commit.
@@ -3224,19 +3470,37 @@ struct PushArgs {
     compress: Option<u8>,
     #[command(flatten)]
     connect: PushConnectArgs,
+    #[cfg(feature = "s3")]
+    #[command(flatten)]
+    s3: S3Args,
+    /// Remove the writer lock of another writer of a bucket repository.
+    ///
+    /// The push reads the lock, deletes it, and then takes its own lock. It
+    /// writes the holder of the removed lock to standard error after a push
+    /// that succeeds. Use it only when the holder is gone, for example after
+    /// a crash: a writer whose lock is removed stops at its next check. The
+    /// command refuses this option for an address that is not `s3://`, and
+    /// with --onto.
+    #[cfg(feature = "s3")]
+    #[arg(long, conflicts_with = "onto")]
+    break_lock: bool,
     // ostrya checks this operand after the repository resolves.
-    /// The remote: a remote name or an ssh or HTTP address. Required.
+    /// The remote: a remote name, or an ssh, HTTP, or `s3://` address.
+    /// Required.
     ///
     /// A value with a `:` or a `/` is an address:
-    /// `ssh://[USER@]HOST[:PORT]/PATH`, `[USER@]HOST:PATH`, `http://`, or
-    /// `https://`. Each other value names a `[remote "<name>"]` section in
-    /// the config of this repository. The push address of the section is its
-    /// `push-url` key. If `push-url` is absent, a `url` key with an `http://`
-    /// or `https://` address is the push address.
+    /// `ssh://[USER@]HOST[:PORT]/PATH`, `[USER@]HOST:PATH`, `http://`,
+    /// `https://`, or `s3://BUCKET[/PREFIX]`. Each other value names a
+    /// `[remote "<name>"]` section in the config of this repository. The push
+    /// address of the section is its `push-url` key. If `push-url` is absent,
+    /// a `url` key with an `http://` or `https://` address is the push
+    /// address. The `url` key holds no `s3://` address.
     ///
     /// To an ssh address, the push runs the ssh client with the receive
     /// command on the remote side. To an HTTP address, the push sends its
-    /// requests to the receive endpoint of `ostrya serve`.
+    /// requests to the receive endpoint of `ostrya serve`. To an `s3://`
+    /// address, the push writes the bucket repository at that address. A
+    /// build without the feature `s3` refuses an `s3://` address.
     remote: Option<String>,
     /// The refspecs, each `SRC[:DST]`. At least one refspec is required.
     ///
@@ -3262,7 +3526,7 @@ struct PushArgs {
 /// `http://` or `https://` address. An option of the other transport is
 /// refused. Each option wins over the key of the remote that has its name.
 #[cfg(feature = "push")]
-#[derive(Args)]
+#[derive(Args, Default)]
 struct PushConnectArgs {
     /// The ssh command, split at ASCII whitespace.
     ///
@@ -3327,7 +3591,9 @@ struct PushConnectArgs {
     /// Without this switch, the command refuses a token to such an address
     /// before any request. Use it for a server on a loopback address or behind
     /// a proxy that terminates TLS. No key of the remote sets this switch. The
-    /// command refuses it for an ssh address.
+    /// command refuses it for an ssh address. For a `push` to an `s3://`
+    /// address, the switch permits an `http://` S3 server, to which the
+    /// signature of each request goes in cleartext.
     #[arg(long)]
     allow_cleartext_credentials: bool,
 }
@@ -3714,6 +3980,18 @@ async fn run(repo: Option<&Path>, verbose: bool, command: Command) -> Result<()>
             let Some(sub) = args.command else {
                 exit_with_error(name, "No \"remote\" subcommand specified");
             };
+            // An init at an address needs no repository. An address holds a
+            // `:` or a `/`, and a remote name holds neither.
+            #[cfg(feature = "s3")]
+            if let RemoteCommand::Init(init) = &sub
+                && init.name.as_deref().is_some_and(|n| n.contains([':', '/']))
+            {
+                let nested = sub.name();
+                let RemoteCommand::Init(init) = sub else {
+                    unreachable!("the subcommand is init");
+                };
+                return remote_init(None, nested, init).await;
+            }
             let (repo, _) = resolve_repo(repo, verbose, name).await;
             remote(repo, sub).await
         }
@@ -4062,20 +4340,27 @@ async fn send(repo: Repo, client: ostrya::access::AuthItem) -> Result<()> {
         .await
 }
 
-/// Pushes the commits that the refspecs name to a remote over ssh or HTTP.
+/// Pushes the commits that the refspecs name to a remote over ssh or HTTP, or
+/// to a bucket repository at an `s3://` address.
 ///
 /// The push updates the refs of the remote in one transaction. Standard output
 /// carries one line for each ref, in the order of the refspecs and then of
 /// the tags, and nothing else. Under `--verbose`, one statistics line goes to
 /// standard error. A failure writes nothing to standard output.
 ///
+/// The S3 options and `--break-lock` are refused for a destination that is
+/// not `s3://`, before the remote resolves. A push to a bucket repository
+/// goes through `Repo::push_to_bucket`, and a writer lock that `--break-lock`
+/// removed gives one warning line on standard error.
+///
 /// On a terminal, standard error shows the progress bar of [`PushBar`] while
 /// the push runs.
 #[cfg(feature = "push")]
-async fn push(repo: Repo, name: &str, verbose: bool, args: PushArgs) -> Result<()> {
-    let Some(remote) = args.remote.as_deref() else {
+async fn push(repo: Repo, name: &str, verbose: bool, mut args: PushArgs) -> Result<()> {
+    let Some(remote) = args.remote.clone() else {
         exit_with_error(name, "REMOTE must be specified");
     };
+    let remote = remote.as_str();
     if args.refspecs.is_empty() {
         exit_with_error(name, "REFSPEC must be specified");
     }
@@ -4086,11 +4371,25 @@ async fn push(repo: Repo, name: &str, verbose: bool, args: PushArgs) -> Result<(
     {
         exit_error(&format!("Invalid collection ID {id}"));
     }
+    #[cfg(feature = "s3")]
+    if push_destination_is_s3(&repo, remote) == Some(false) {
+        let option = args
+            .s3
+            .first_set()
+            .or(args.break_lock.then_some("--break-lock"));
+        if let Some(option) = option {
+            exit_error(&format!(
+                "{option} applies to an s3:// address, and the push address of '{}' is not \
+                 one",
+                ostrya::remote::without_userinfo(remote)
+            ));
+        }
+    }
     if args.onto.is_some() {
         return push_onto(repo, verbose, args).await;
     }
     let detached_metadata_filter = detached_metadata_filter(&repo)?;
-    let overrides = push_overrides(args.connect);
+    let overrides = push_overrides(&mut args);
     let endpoint = ostrya::endpoint::resolve_push(Some(repo.config()), remote, overrides).await?;
     let (progress, bar) = PushBar::start();
     let opts = ostrya::RepoPushOptions {
@@ -4102,14 +4401,31 @@ async fn push(repo: Repo, name: &str, verbose: bool, args: PushArgs) -> Result<(
         force: args.force,
         detached_metadata_filter,
         progress,
-        summary_signers: Vec::new(),
-        break_lock: false,
-        part_size: None,
+        #[cfg(feature = "s3")]
+        break_lock: args.break_lock,
+        ..Default::default()
     };
-    let pushed = repo.push(endpoint, opts).await;
-    // The bar is cleared before any line of the result or of the error.
-    bar.finish();
-    let outcome = pushed?;
+    let outcome = match endpoint {
+        #[cfg(feature = "s3")]
+        ostrya::remote::Endpoint::S3(s3) => {
+            let pushed = repo.push_to_bucket(s3, opts).await;
+            // The bar is cleared before any line of the result or of the
+            // error.
+            bar.finish();
+            let pushed = pushed?;
+            if let Some(holder) = &pushed.broken_lock {
+                eprintln!("warning: removed the writer lock of {holder}");
+            }
+            pushed.outcome
+        }
+        endpoint => {
+            let pushed = repo.push(endpoint, opts).await;
+            // The bar is cleared before any line of the result or of the
+            // error.
+            bar.finish();
+            pushed?
+        }
+    };
     // The remote holds the new refs at this point. If the write to standard
     // output fails, for example on a full device or a closed pipe, `main`
     // prints the error line and exits 1.
@@ -4136,20 +4452,22 @@ async fn push(repo: Repo, name: &str, verbose: bool, args: PushArgs) -> Result<(
 /// Under `--verbose`, one statistics line goes to standard error. A failure
 /// writes nothing to standard output.
 #[cfg(feature = "push")]
-async fn push_onto(repo: Repo, verbose: bool, args: PushArgs) -> Result<()> {
-    let (Some(remote), Some(onto)) = (args.remote.as_deref(), args.onto) else {
+async fn push_onto(repo: Repo, verbose: bool, mut args: PushArgs) -> Result<()> {
+    let (Some(remote), Some(onto)) = (args.remote.take(), args.onto.take()) else {
         unreachable!("the caller checked REMOTE and --onto");
     };
-    let [rev] = &args.refspecs[..] else {
+    let remote = remote.as_str();
+    let refspecs = std::mem::take(&mut args.refspecs);
+    let [rev] = &refspecs[..] else {
         exit_error(&format!(
             "--onto takes one REF, and {} were given",
-            args.refspecs.len()
+            refspecs.len()
         ));
     };
     let timestamp = args.timestamp.as_deref().map(|text| {
         parse_timestamp(text).unwrap_or_else(|| exit_error(&format!("Could not parse '{text}'")))
     });
-    let overrides = push_overrides(args.connect);
+    let overrides = push_overrides(&mut args);
     let endpoint = ostrya::endpoint::resolve_push(Some(repo.config()), remote, overrides).await?;
     let (progress, bar) = PushBar::start();
     let opts = ostrya::PushOntoOptions {
@@ -4203,6 +4521,39 @@ fn push_compression(level: Option<u8>) -> ostrya::remote::Compression {
     }
 }
 
+/// Returns `true` if the destination of `push` is an `s3://` address, or
+/// `None` if the command cannot tell.
+///
+/// An address is the destination. For a remote name, the destination is the
+/// push address of its section: `push-url`, else `url`. A remote that the
+/// config does not describe, a section with neither key, and a key that does
+/// not read give `None`, and the resolver then states the refusal.
+#[cfg(all(feature = "push", feature = "s3"))]
+fn push_destination_is_s3(repo: &Repo, remote: &str) -> Option<bool> {
+    if ostrya::is_push_address(remote) {
+        return Some(remote.starts_with("s3://"));
+    }
+    let section = repo.config().remote(remote)?;
+    let address = match section.push_url().ok()? {
+        Some(address) => address,
+        None => section.url().ok()??,
+    };
+    Some(address.starts_with("s3://"))
+}
+
+/// Returns the endpoint overrides of the transport options of `push`.
+///
+/// The options are those of [`connect_overrides`], and the S3 options, which
+/// the call takes out of `args`.
+#[cfg(feature = "push")]
+#[cfg_attr(not(feature = "s3"), allow(unused_mut))]
+fn push_overrides(args: &mut PushArgs) -> ostrya::endpoint::EndpointOverrides {
+    let mut overrides = connect_overrides(std::mem::take(&mut args.connect));
+    #[cfg(feature = "s3")]
+    std::mem::take(&mut args.s3).apply(&mut overrides);
+    overrides
+}
+
 /// Returns the endpoint overrides of the ssh and HTTP options of a push.
 ///
 /// The options are `--ssh-command`, `--receive-command`, and the HTTP options.
@@ -4210,7 +4561,7 @@ fn push_compression(level: Option<u8>) -> ostrya::remote::Compression {
 /// option of the other transport. The ssh command is split at ASCII
 /// whitespace.
 #[cfg(feature = "push")]
-fn push_overrides(args: PushConnectArgs) -> ostrya::endpoint::EndpointOverrides {
+fn connect_overrides(args: PushConnectArgs) -> ostrya::endpoint::EndpointOverrides {
     let ssh_command = args.ssh_command.map(|command| {
         command
             .split_ascii_whitespace()
@@ -4244,9 +4595,10 @@ fn push_overrides(args: PushConnectArgs) -> ostrya::endpoint::EndpointOverrides 
 /// 3. The command checks the other options that it reads itself, before a
 ///    repository opens. The body file is not in this step. The timestamp is
 ///    `--timestamp`, else `SOURCE_DATE_EPOCH`, else none.
-/// 4. The command resolves the remote. It refuses an option of the other
-///    transport and the bad HTTP options. It reads the token file of an HTTP
-///    push, and the TLS files of an `https://` push.
+/// 4. The command refuses a push address that is an `s3://` address. It
+///    resolves the remote. It refuses an option of the other transport and
+///    the bad HTTP options. It reads the token file of an HTTP push, and the
+///    TLS files of an `https://` push.
 /// 5. The command makes the transport ready.
 /// 6. The command reads the body file.
 ///
@@ -4311,11 +4663,19 @@ async fn push_tree(
     };
     // The transport is made ready before the body file is read. A refusal of
     // the remote or of its options then reads no body file.
-    let overrides = push_overrides(args.connect);
+    let overrides = connect_overrides(args.connect);
     let endpoint = if ostrya::is_push_address(remote) {
+        #[cfg(feature = "s3")]
+        if remote.starts_with("s3://") {
+            refuse_bucket_tree_push(remote);
+        }
         ostrya::endpoint::resolve_push(None, remote, overrides).await?
     } else {
         let (repo, _) = resolve_repo(repo, verbose, name).await;
+        #[cfg(feature = "s3")]
+        if push_destination_is_s3(&repo, remote) == Some(true) {
+            refuse_bucket_tree_push(remote);
+        }
         ostrya::endpoint::resolve_push(Some(repo.config()), remote, overrides).await?
     };
     let transport = ostrya::remote::PushSession::prepare(endpoint).await?;
@@ -4344,6 +4704,20 @@ async fn push_tree(
     // The bar is cleared before any line of the result or of the error.
     bar.finish();
     print_server_commit(verbose, pushed?)
+}
+
+/// Exits with the refusal of `push-tree` to the bucket repository of
+/// `remote`, a remote name or an `s3://` address.
+///
+/// The refusal comes before the resolve of the remote, so the command reads
+/// no AWS variable and no AWS file.
+#[cfg(all(feature = "push", feature = "s3"))]
+fn refuse_bucket_tree_push(remote: &str) -> ! {
+    exit_error(&format!(
+        "push-tree does not write a bucket repository, and the push address of '{}' is an \
+         s3:// address",
+        ostrya::remote::without_userinfo(remote)
+    ))
 }
 
 /// Returns the entry filter of the owner and permission options of `push-tree`.
@@ -4827,7 +5201,8 @@ fn update_interval(frequency: Option<u32>) -> std::time::Duration {
     }
 }
 
-/// Fetches refs and their objects from an HTTP remote, or over ssh.
+/// Fetches refs and their objects from an HTTP remote, over ssh, or from a
+/// bucket repository at an `s3://` address.
 ///
 /// If standard output is a terminal, it carries a progress line that is
 /// redrawn every `redraw`. The statistics line is then drawn over the progress
@@ -4851,6 +5226,22 @@ async fn pull(
             None => exit_with_error(name, "REMOTE must be specified"),
         },
     };
+    // The S3 options apply to a pull from an `s3://` address alone.
+    #[cfg(feature = "s3")]
+    let base = match &from {
+        PullFrom::Collection { .. } => {
+            if let Some(option) = args.s3.first_set() {
+                exit_error(&format!(
+                    "{option} applies to an s3:// address, and a pull with --collection reads \
+                     no s3:// address"
+                ));
+            }
+            ostrya::endpoint::EndpointOverrides::default()
+        }
+        PullFrom::Remote(remote) => args.s3.pull_overrides(&repo, remote, args.url.as_deref()),
+    };
+    #[cfg(not(feature = "s3"))]
+    let base = ostrya::endpoint::EndpointOverrides::default();
     let mut localcache_repos = Vec::with_capacity(args.localcache_repo.len());
     for path in &args.localcache_repo {
         localcache_repos.push(Repo::open(path).await?);
@@ -4905,7 +5296,7 @@ async fn pull(
         low_speed_time: low_speed
             .seconds
             .map(|seconds| std::time::Duration::from_secs(seconds.into())),
-        ..Default::default()
+        ..base
     };
     let line = progress
         .clone()
@@ -10430,11 +10821,13 @@ async fn remote(repo: Repo, sub: RemoteCommand) -> Result<()> {
     let nested = sub.name();
     match sub {
         RemoteCommand::Add(args) => remote_add(&repo, nested, args).await,
+        #[cfg(feature = "s3")]
+        RemoteCommand::Init(args) => remote_init(Some(&repo), nested, args).await,
         RemoteCommand::Delete(args) => remote_delete(&repo, nested, args).await,
         RemoteCommand::List(args) => remote_list(&repo, &args),
         RemoteCommand::ShowUrl(args) => remote_show_url(&repo, nested, &args),
-        RemoteCommand::Refs(args) => remote_refs(&repo, nested, &args).await,
-        RemoteCommand::Summary(args) => remote_summary(&repo, nested, &args).await,
+        RemoteCommand::Refs(args) => remote_refs(&repo, nested, args).await,
+        RemoteCommand::Summary(args) => remote_summary(&repo, nested, args).await,
         RemoteCommand::GpgImport(args) => remote_gpg_import(&repo, nested, args).await,
         RemoteCommand::GpgListKeys(args) => remote_gpg_list_keys(&repo, nested, &args).await,
     }
@@ -10496,12 +10889,13 @@ fn remote_url(section: &ostrya::Remote<'_>, name: &str) -> Result<String> {
 ///
 /// 1. the URL or the metalink
 /// 2. the branch list
-/// 3. the content URL
-/// 4. the custom backend
-/// 5. the `--set` pairs, in the order of the command line
-/// 6. the GPG switch
-/// 7. the verification keys of the ed25519 and spki engines
-/// 8. the collection id
+/// 3. for an `s3://` address, `pull-url` and `push-url` in place of the URL
+/// 4. the content URL
+/// 5. the custom backend
+/// 6. the `--set` pairs, in the order of the command line
+/// 7. the GPG switch
+/// 8. the verification keys of the ed25519 and spki engines
+/// 9. the collection id
 ///
 /// # Locks
 ///
@@ -10549,8 +10943,12 @@ async fn remote_add(repo: &Repo, nested: &str, args: RemoteAddArgs) -> Result<()
             keyfile.remove_group(&group);
         }
 
+        // The `ostree` command also reads `url`, and it reads no `s3://`
+        // address, so an `s3://` address goes to the keys of the port alone.
+        let s3 = url.starts_with("s3://");
         match url.strip_prefix("metalink=") {
             Some(metalink) => keyfile.set_string(&group, "metalink", metalink)?,
+            None if s3 => {}
             None => keyfile.set_string(&group, "url", url)?,
         }
         if !args.branches.is_empty() {
@@ -10562,6 +10960,10 @@ async fn remote_add(repo: &Repo, nested: &str, args: RemoteAddArgs) -> Result<()
                 list.push(';');
             }
             keyfile.set_string(&group, "branches", &list)?;
+        }
+        if s3 {
+            keyfile.set_string(&group, "pull-url", url)?;
+            keyfile.set_string(&group, "push-url", url)?;
         }
         if let Some(contenturl) = &args.contenturl {
             keyfile.set_string(&group, "contenturl", contenturl)?;
@@ -10659,6 +11061,29 @@ fn parse_sign_verify_spec(spec: &str) -> (&str, &str, bool) {
     }
 }
 
+/// Writes the `config` of a new bucket repository.
+///
+/// The operand is a remote of the config of `repo`, or an `s3://` address,
+/// for which `repo` can be `None`. The endpoint comes from
+/// `ostrya::endpoint::resolve_bucket`, and the init from
+/// `BucketRepo::init`. A writer lock that `--break-lock` removed gives one
+/// warning line on standard error.
+#[cfg(feature = "s3")]
+async fn remote_init(repo: Option<&Repo>, nested: &str, args: RemoteInitArgs) -> Result<()> {
+    let target = remote_operand(nested, args.name.as_deref());
+    let config = repo.map(Repo::config);
+    let endpoint =
+        ostrya::endpoint::resolve_bucket(config, target, args.s3.into_overrides()).await?;
+    let bucket = ostrya::bucket::BucketRepo::open(&endpoint).await?;
+    let broken = bucket
+        .init(args.collection_id.as_deref(), args.break_lock)
+        .await?;
+    if let Some(holder) = broken {
+        eprintln!("warning: removed the writer lock of {holder}");
+    }
+    Ok(())
+}
+
 /// Deletes the trusted keyring and then the configuration section of a remote.
 ///
 /// Both steps run under one update guard. The section is looked up first in
@@ -10722,14 +11147,19 @@ fn remote_show_url(repo: &Repo, nested: &str, args: &RemoteNameArgs) -> Result<(
     Ok(())
 }
 
-/// Returns the summary that a remote publishes.
+/// Returns the summary that a remote publishes, with the endpoint overrides
+/// `overrides`.
 ///
-/// If the remote publishes no summary, the process exits with the refusal of
-/// the `ostree` command. `absent` is the message for the subcommand that
-/// asks.
-async fn fetch_remote_summary(repo: &Repo, name: &str, absent: &str) -> Result<Summary> {
-    require_remote(repo, name);
-    let (bytes, _signature) = repo.remote_fetch_summary(name).await?;
+/// The caller checked that the remote exists. If the remote publishes no
+/// summary, the process exits with the refusal of the `ostree` command.
+/// `absent` is the message for the subcommand that asks.
+async fn fetch_remote_summary(
+    repo: &Repo,
+    name: &str,
+    absent: &str,
+    overrides: ostrya::endpoint::EndpointOverrides,
+) -> Result<Summary> {
+    let (bytes, _signature) = repo.remote_fetch_summary_with(name, overrides).await?;
     let Some(bytes) = bytes else {
         exit_error(absent);
     };
@@ -10738,12 +11168,18 @@ async fn fetch_remote_summary(repo: &Repo, name: &str, absent: &str) -> Result<S
 
 /// Lists the refs in the summary of a remote, each with the prefix of the
 /// remote.
-async fn remote_refs(repo: &Repo, nested: &str, args: &RemoteRefsArgs) -> Result<()> {
+async fn remote_refs(repo: &Repo, nested: &str, args: RemoteRefsArgs) -> Result<()> {
     let name = remote_operand(nested, args.name.as_deref());
+    require_remote(repo, name);
+    #[cfg(feature = "s3")]
+    let overrides = args.s3.pull_overrides(repo, name, None);
+    #[cfg(not(feature = "s3"))]
+    let overrides = ostrya::endpoint::EndpointOverrides::default();
     let summary = fetch_remote_summary(
         repo,
         name,
         "Remote refs not available; server has no summary file",
+        overrides,
     )
     .await?;
     for entry in &summary.refs {
@@ -10760,10 +11196,14 @@ async fn remote_refs(repo: &Repo, nested: &str, args: &RemoteRefsArgs) -> Result
 ///
 /// The output is the raw variant, the metadata keys, one metadata value, or
 /// the summary report.
-async fn remote_summary(repo: &Repo, nested: &str, args: &RemoteSummaryArgs) -> Result<()> {
+async fn remote_summary(repo: &Repo, nested: &str, args: RemoteSummaryArgs) -> Result<()> {
     let name = remote_operand(nested, args.name.as_deref());
     require_remote(repo, name);
-    let (bytes, _) = repo.remote_fetch_summary(name).await?;
+    #[cfg(feature = "s3")]
+    let overrides = args.s3.pull_overrides(repo, name, None);
+    #[cfg(not(feature = "s3"))]
+    let overrides = ostrya::endpoint::EndpointOverrides::default();
+    let (bytes, _) = repo.remote_fetch_summary_with(name, overrides).await?;
     let Some(bytes) = bytes else {
         exit_error("Remote server has no summary file");
     };

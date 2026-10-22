@@ -567,9 +567,19 @@ feature `std`. Each term below is measured on the resolved dependency graph.
   `crates/ostrya-fetch`, so no package entered `Cargo.lock` with it. The one
   change to the lock file is the two entries `hmac` and `sha2` in the
   dependency list of `ostrya-remote`.
-- No cost to the binary is measured. No command path of `ostrya-cli` turns on
-  the feature `s3` yet, so the stripped `target/release/ostrya` holds no
-  code of the signer.
+- The signer is in the binary of `ostrya-cli`, which turns on the feature
+  `s3` in its default set. The cost of `hmac` alone is not measured.
+  The feature `s3` costs 1,054,848 bytes of the stripped
+  `target/release/ostrya`, the binary `cargo build --release -p ostrya-cli`
+  writes with its default feature set, which holds `s3`. Two builds of one
+  tree under one toolchain are compared. The second build takes the default
+  set without `s3`: `--no-default-features --features
+  smol,spki,gpg,receive,push,serve,send,lzma-static`. `cargo tree -p
+  ostrya-cli -i quick-xml` with these features reaches no `quick-xml`
+  package. The first binary measures 22,756,264 bytes and the second
+  21,701,416. A rebuild of the first tree gives the same byte count. The
+  cost covers each part of the S3 support: the signer, the XML reader, the
+  bucket client, the pull, the push, the writer lock, and the commands.
 
 ### Authorized: the `quick-xml` crate
 
@@ -595,10 +605,11 @@ Each term below is measured on the resolved dependency graph.
   references alone. The crate has no depth limit, so the caller refuses a
   body whose elements are deeper than 32 levels.
 - The graph holds 2 packages under 2 distinct names on the host target:
-  `quick-xml` 0.42.0 and `memchr` 2.8.3. No build of the workspace turns on
-  the feature `s3` by default, so `cargo tree -p quick-xml` does not reach
-  the crate. The graph is measured as the subtree of `quick-xml` in
-  `cargo tree --all-features -p ostrya-remote -e normal,build`. With
+  `quick-xml` 0.42.0 and `memchr` 2.8.3, measured with
+  `cargo tree -p quick-xml -e normal,build`, which reaches the crate through
+  the default set of `ostrya-cli`. The subtree of `quick-xml` in
+  `cargo tree --all-features -p ostrya-remote -e normal,build` holds the
+  same 2. With
   `--target all` it holds the same 2. `cargo metadata --format-version 1
   --all-features` counts the same 2 for the closure.
 - No package in the graph declares a `links` key, and no package name in it
@@ -616,10 +627,20 @@ Each term below is measured on the resolved dependency graph.
   2.8.3 was already in the graph through `nom`, `pgp`, `serde_json`, and
   `buffer-redux`. The lock file also gains the entry `quick-xml` in the
   dependency list of `ostrya-remote`.
-- No cost to the binary is measured. No command path of `ostrya-cli` turns
-  on the feature `s3` yet, so the stripped `target/release/ostrya` holds no
-  code of the reader. In a test program, the reader of the S3 listing and
-  the S3 error costs 45,528 bytes of a stripped release binary.
+- The reader is in the binary of `ostrya-cli`, which turns on the feature
+  `s3` in its default set. In a test program, the reader of the S3 listing
+  and the S3 error costs 45,528 bytes of a stripped release binary.
+  The feature `s3` costs 1,054,848 bytes of the stripped
+  `target/release/ostrya`, the binary `cargo build --release -p ostrya-cli`
+  writes with its default feature set, which holds `s3`. Two builds of one
+  tree under one toolchain are compared. The second build takes the default
+  set without `s3`: `--no-default-features --features
+  smol,spki,gpg,receive,push,serve,send,lzma-static`. `cargo tree -p
+  ostrya-cli -i quick-xml` with these features reaches no `quick-xml`
+  package. The first binary measures 22,756,264 bytes and the second
+  21,701,416. A rebuild of the first tree gives the same byte count. The
+  cost covers each part of the S3 support: the signer, the XML reader, the
+  bucket client, the pull, the push, the writer lock, and the commands.
 
 ## Requirement: permissive licenses only
 
@@ -705,7 +726,8 @@ until the maintainer asks for that step in words.
    date in the `date -R` format. If the command and the package do not
    change, the one item is `New upstream release.`
 5. Run the gates of `.github/workflows/ci.yml`. Run the tests with
-   `OSTRYA_REQUIRE_MULTIGROUP=1 OSTRYA_REQUIRE_GNUPG=1`, as CI does.
+   `OSTRYA_REQUIRE_MULTIGROUP=1 OSTRYA_REQUIRE_GNUPG=1 OSTRYA_REQUIRE_S3=1`,
+   as CI does.
 6. Commit as `chore(release): bump the workspace version to <version>`. The
    commit includes the man pages of step 3 and the changelog entries of
    step 4.

@@ -313,23 +313,29 @@ These two are not files of the repository.
 A bucket repository is a repository in archive form in an S3 bucket, at the address \fB\%s3://BUCKET[/PREFIX]\fR.
 Each file of the repository is one object of the bucket.
 The key of the object is the path of the file under \fB\%PREFIX/\fR.
-The ostrya library built with its feature \fB\%s3\fR reads a bucket repository and takes its writer lock.
-With its feature \fB\%push\fR too, the library creates a bucket repository with an init, and writes commits to it with a push.
-The \fB\%ostrya\fR command of this release refuses an \fB\%s3://\fR address.
+\fB\%ostrya remote init\fR creates a bucket repository, \fB\%ostrya push\fR writes commits to it, and \fB\%ostrya pull\fR, \fB\%ostrya remote refs\fR, and \fB\%ostrya remote summary\fR read it.
+The init and the push take the writer lock of the bucket repository.
+In the ostrya library, the feature \fB\%s3\fR gives the read, the init, and the writer lock, and the features \fB\%s3\fR and \fB\%push\fR give the push.
+The \fB\%ostrya\fR command built without its feature \fB\%s3\fR refuses an \fB\%s3://\fR address.
+.PP
+A push that stops before its end can leave an incomplete multipart upload, which holds storage in the bucket.
+Set a lifecycle rule \fB\%AbortIncompleteMultipartUpload\fR on the bucket, so that the S3 server aborts such an upload after a number of days.
 .PP
 These are the keys of a bucket repository:
 .TP
 \fB\%config\fR
 The config of the repository.
-The init writes it with the group \fB\%[core]\fR and the keys \fB\%repo_version=1\fR and \fB\%mode=archive\-z2\fR, and with \fB\%collection\-id\fR when the caller gives a collection id.
+The init writes it with the group \fB\%[core]\fR and the keys \fB\%repo_version=1\fR and \fB\%mode=archive\-z2\fR, and with \fB\%collection\-id\fR when the caller gives a collection id, for example with \fB\%ostrya remote init \-\-collection\-id\fR.
 A bucket repository with a collection id is the primary server of that collection.
 The init refuses a bucket that holds a \fB\%config\fR, so the collection id of a bucket repository never changes.
 A push needs the \fB\%config\fR, and refuses a mode other than \fB\%archive\-z2\fR and \fB\%archive\fR, a collection id that fails the collection\-id rule, and a \fB\%tombstone\-commits\fR or \fB\%indexed\-deltas\fR that is not a boolean.
 .TP
 \fB\%summary\fR, \fB\%summary.sig\fR
 The summary of the repository and its signatures.
-A push writes them after the refs: the refs of \fB\%refs/heads/\fR in the summary, the refs of each \fB\%refs/mirrors/<id>/\fR in its collection map, and the collection id of the \fB\%config\fR.
-A push refuses a repository with a \fB\%summary.sig\fR when it has no summary signer.
+A push writes no summary, and leaves these two keys as they are.
+A pull of a named ref reads the ref file when the summary does not list the ref.
+A pull of a ref that the summary lists takes the commit of the summary, so after a push moves that ref, the pull takes the old commit until an update of the summary.
+A pull with \fB\%\-\-mirror\fR and no named ref, a pull that verifies the signature of the summary, \fB\%ostrya remote refs\fR, and \fB\%ostrya remote summary\fR need a summary.
 .TP
 \fB\%objects/<xx>/<62 hex digits>.<ext>\fR
 The objects, in lowercase hex.
@@ -342,7 +348,9 @@ The refs of the repository, and of its own collection.
 \fB\%refs/mirrors/<id>/<name>\fR
 The refs of the collection \fB\%<id>\fR, which the repository mirrors.
 \fB\%<id>\fR passes the collection\-id rule and is at most 255 bytes.
-Each writer refuses a key under \fB\%refs/\fR outside these two forms, and the refs of \fB\%refs/mirrors/\fR of the own collection id.
+Each writer refuses the refs of \fB\%refs/mirrors/\fR of the own collection id.
+A push reads the ref files of the ref directory that it writes alone, and refuses a key in that directory that is not a ref name.
+It does not check the keys under \fB\%refs/\fR outside that directory.
 .TP
 \fB\%deltas/\fR, \fB\%delta\-indexes/\fR
 The static deltas and their index files, in the layout of the section STATIC DELTAS.
@@ -400,9 +408,8 @@ The system trusted keys of the signature engine \fB\%<engine>\fR, which is \fB\%
 The system revoked keys of the signature engine \fB\%<engine>\fR.
 .TP
 \fB\%~/.aws/credentials\fR, \fB\%~/.aws/config\fR
-The shared AWS credentials file and config file of a pull from or a push to an \fB\%s3://\fR address.
-A pull and a push through the ostrya library built with its feature \fB\%s3\fR read them.
-The \fB\%ostrya\fR command of this release refuses an \fB\%s3://\fR address, and does not read them.
+The shared AWS credentials file and config file of a command that reads or writes a bucket repository at an \fB\%s3://\fR address.
+The \fB\%ostrya\fR command built without its feature \fB\%s3\fR refuses an \fB\%s3://\fR address, and does not read them.
 \fB\%AWS_SHARED_CREDENTIALS_FILE\fR and \fB\%AWS_CONFIG_FILE\fR name other paths.
 ostrya reads the section \fB\%[PROFILE]\fR of the credentials file, and the sections \fB\%[default]\fR, \fB\%[profile NAME]\fR, and \fB\%[services NAME]\fR of the config file.
 ostrya reads at most 1 MiB of each file, and refuses a larger file.

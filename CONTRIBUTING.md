@@ -105,6 +105,30 @@ OSTRYA_REQUIRE_S3=1 OSTRYA_REQUIRE_SEAWEEDFS=1 \
     cargo test -p ostrya --features push,s3 --test push_s3
 ```
 
+The tests of the `ostrya` command with a bucket repository in
+`crates/ostrya-cli/tests/s3.rs` need the `s3` feature, and most of them the
+`push` feature. They run the built `ostrya` with the key pair of the tests,
+the shared AWS files at absent paths in a scratch directory, a scratch
+`HOME`, and no other AWS variable and no proxy variable. Most of them run
+against the stand-in S3 server, which keeps the `Authorization` header of
+each request, so the tests of `--s3-region` and `--s3-profile` need no
+rclone. One test reads a copy of the `archive` fixture through `rclone
+serve s3`, and one test runs an init, a push, and a pull against `weed
+mini`. The two variables turn each skip into a failure:
+
+```sh
+OSTRYA_REQUIRE_S3=1 OSTRYA_REQUIRE_SEAWEEDFS=1 \
+    cargo test -p ostrya-cli --test s3
+```
+
+The tests in `crates/ostrya-cli/tests/s3_absent.rs` run in a build without
+the `s3` feature alone. They check that a pull and a push refuse an `s3://`
+address with a message that names the feature:
+
+```sh
+cargo test -p ostrya-cli --no-default-features --features smol,push --test s3_absent
+```
+
 ## Golden fixtures
 
 The golden fixtures are in `tests/fixtures/`. The `ostree` tool wrote them,
@@ -241,13 +265,17 @@ test:
   tests (see "Tests").
 - `OSTRYA_REQUIRE_S3` -- `rclone`, for the tests of the bucket client, of
   the pull from an `s3://` address, and of a bucket repository against
-  `rclone serve s3`: the writer lock, the listing, the init, and the push
-  (see "Tests").
+  `rclone serve s3`: the writer lock, the listing, the init, the push, and
+  the commands of the `ostrya` command (see "Tests").
 - `OSTRYA_REQUIRE_SEAWEEDFS` -- `weed` of SeaweedFS, for the tests of the
   writer lock, of the object listing, of the init, and of the push to a
-  bucket repository against `weed mini` (see "Tests").
+  bucket repository against `weed mini`, through the library and through
+  the `ostrya` command (see "Tests").
 
-The CI test job sets `OSTRYA_REQUIRE_GNUPG` and `OSTRYA_REQUIRE_MULTIGROUP`.
+The CI test job sets `OSTRYA_REQUIRE_GNUPG`, `OSTRYA_REQUIRE_MULTIGROUP`, and
+`OSTRYA_REQUIRE_S3`. It installs `rclone` from the release archive of the
+rclone project, because the `rclone` package of the runner has no
+`serve s3`.
 
 ### GPG verification against `gpgv`
 

@@ -19,14 +19,15 @@
 //!
 //! # The push
 //!
-//! A push writes the objects of its commits, builds and signs the summary,
-//! and then writes the ref files, the `summary`, and the `summary.sig`,
-//! under the writer lock. A commit object goes up only after each object of
-//! its tree, so a commit object in the bucket has its whole tree in the
-//! bucket, also after a push that failed. For this reason, a push walks no
-//! tree of a commit that the bucket holds. The refs of the collection id of
-//! the bucket, or of a push with no collection, are under `refs/heads/`. The
-//! refs of each other collection are under `refs/mirrors/ID/`.
+//! A push writes the objects of its commits, and then the ref files, under
+//! the writer lock. It writes no `summary` and no `summary.sig`, and leaves
+//! the ones that the bucket holds as they are. A commit object goes up only
+//! after each object of its tree, so a commit object in the bucket has its
+//! whole tree in the bucket, also after a push that failed. For this reason,
+//! a push walks no tree of a commit that the bucket holds. The refs of the
+//! collection id of the bucket, or of a push with no collection, are under
+//! `refs/heads/`. The refs of each other collection are under
+//! `refs/mirrors/ID/`.
 //! `Repo::push_to_bucket` states the steps, the namespaces, and the failure
 //! states.
 //!
@@ -110,17 +111,18 @@ use crate::remote::s3::{Address, Bucket, PutIfAbsent, S3Endpoint};
 mod listing;
 mod lock;
 mod state;
+// No writer of this version writes the summary of a bucket repository. The
+// build and the write of the summary stay for an explicit summary update.
+#[allow(dead_code)]
 mod summary;
 
 pub use listing::ObjectListing;
 pub use lock::{LockHolder, LockOperation, WriterLock};
 pub(crate) use lock::{describe_locked, describe_lost};
+#[cfg_attr(not(feature = "push"), allow(unused_imports))]
+pub(crate) use state::check_prefixes;
 #[cfg(test)]
-pub(crate) use state::summary_refs;
-#[cfg_attr(not(feature = "push"), allow(unused_imports))]
-pub(crate) use state::{BucketRefs, check_prefixes};
-#[cfg_attr(not(feature = "push"), allow(unused_imports))]
-pub(crate) use summary::{SignedSummary, SummaryInput};
+pub(crate) use state::{BucketRefs, summary_refs};
 
 /// The result of `Repo::push_to_bucket`, the push to a bucket repository.
 #[derive(Debug, Clone, PartialEq, Eq)]

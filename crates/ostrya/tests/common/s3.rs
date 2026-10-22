@@ -365,6 +365,9 @@ pub struct State {
     pub honor_if_match: bool,
     /// The method and the target of each request, in order.
     pub requests: Vec<(String, String)>,
+    /// The `Authorization` header of each request, in the order of
+    /// `requests`, or `None` for a request with no such header.
+    pub authorizations: Vec<Option<String>>,
     /// A method and a count `n`: the server acts on the `n`-th request of
     /// the method, then closes its connection with no response.
     pub close_after: Option<(&'static str, usize)>,
@@ -417,9 +420,10 @@ impl State {
 /// An S3 server in the process, over HTTP/1.1 on a loopback port, with one
 /// bucket `bkt`.
 ///
-/// The server accepts each signature. It answers `GET`, `PUT`, and `DELETE`
-/// of a key, and `ListObjectsV2` with pages of at most 1000 keys. One
-/// thread serves each connection.
+/// The server accepts each signature, and keeps the `Authorization` header of
+/// each request. It answers `GET`, `PUT`, and `DELETE` of a key, and
+/// `ListObjectsV2` with pages of at most 1000 keys. One thread serves each
+/// connection.
 pub struct StandIn {
     addr: SocketAddr,
     state: Arc<Mutex<State>>,
@@ -435,6 +439,7 @@ impl StandIn {
             honor_if_none_match: true,
             honor_if_match: true,
             requests: Vec::new(),
+            authorizations: Vec::new(),
             close_after: None,
             before: None,
             before_key: None,
@@ -509,6 +514,9 @@ fn serve(mut stream: TcpStream, state: &Mutex<State>) {
             state
                 .requests
                 .push((request.method.clone(), request.target.clone()));
+            state
+                .authorizations
+                .push(request.header("authorization").map(str::to_owned));
             let count = {
                 let count = state.counts.entry(request.method.clone()).or_default();
                 *count += 1;

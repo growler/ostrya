@@ -5589,3 +5589,102 @@ with `N` the number of parts, on `rclone serve s3` 1.75.1 and on
 SeaweedFS 4.36. A later read of the key on `rclone serve s3` 1.75.1 gives
 the MD5 of the whole object, and SeaweedFS 4.36 gives the value of the
 result.
+
+### The writer lock
+
+The key `PREFIX/extensions/ostrya/lock` holds the writer lock of a bucket
+repository. A writer holds the lock while it changes the repository: a
+push, a prune, an update of the summary, and an fsck that deletes objects.
+A read takes no lock. The `ostree` command does not read the key.
+
+The lock is a key file with one group, in this order:
+
+```text
+[lock]
+id=<64 lowercase hex digits>
+host=<host name>
+pid=<process id>
+operation=push
+started=<seconds since the epoch, UTC>
+```
+
+- `id` identifies one run of one writer. A reader compares it with its own
+  id alone. The port writes the SHA-256, in lowercase hex, of the text
+  `HOST\nPID\nNANOS\nCOUNTER`: the host name, the process id, the time in
+  nanoseconds since the epoch, and a counter of the process. Two runs give
+  the same id only with the same host, process id, nanosecond, and counter
+  value.
+- `host` is the host name, with the escapes of a string value of a key
+  file: `\s` for a space at the start, and `\\` for a backslash. The value
+  is empty if the host name cannot be read.
+- `operation` is `push`, `prune`, `summary`, or `fsck`.
+- `started` is the time of the take.
+
+A body that is not UTF-8, that is not a key file, that has no group
+`[lock]`, or that is larger than 64 KiB is the lock of an unknown writer.
+An `id` that is not 64 lowercase hex digits names no writer. A take fails
+on such a lock, and a break removes it.
+
+A writer sends these requests:
+
+- Take: `PUT` of the body with `If-None-Match: *`. A 412 fails the
+  operation. On a server that honors the header, a take with no break does
+  not change the bucket. After a request with an unknown outcome, the
+  writer reads the key. The body of the take there means that the take
+  holds the lock, because no other run writes its `id`.
+- Probe: after the take, a second `PUT` of the same body with
+  `If-None-Match: *`. A 412 shows that the server honors the header. The
+  writer then reads the lock: with the own `id`, the writer holds the lock.
+  Another `id` or no lock fails the operation, and the writer removes no
+  lock. A 2xx shows that the server ignores the header, so the lock gives
+  no exclusion: the writer removes its lock and fails. On such a server,
+  the take wrote over a lock that the key held, so that lock is gone. After
+  a probe request with an unknown outcome, the writer reads the key. Other
+  bytes there give the same steps as a 412. The body of the take there,
+  with a 412 to a later request of the probe, shows that the server honors
+  the header, and the writer holds the lock. The body of the take with no
+  such 412 removes the lock and fails. The probe changes no byte of the
+  lock.
+- Check: `GET` of the lock, and a compare of its `id` with the own `id`.
+  Another `id`, no `id`, or no lock stops the writer before its next change.
+- Release: `GET` of the lock. With the own `id`, `DELETE` with `If-Match`
+  and the `ETag` of the `GET`. A 412 leaves the lock, and the writer reports
+  that its lock was broken. A `GET` with no `ETag` gives a `DELETE` with no
+  condition. A `DELETE` that removed the lock, but whose answer did not
+  arrive, is sent again. If another writer took the lock between the two
+  requests, the second one gets 412, and the writer reports that its lock
+  was broken, although its release was complete.
+- Break: `GET` of the lock, `DELETE` with `If-Match` and the `ETag` of the
+  `GET`, and then a take. The break removes the lock that it read, whatever
+  its `id`. A `GET` with no `ETag` fails the break, and the writer deletes
+  no lock. After a 412, the writer reads the lock again. A lock there fails
+  the break, because another writer changed the lock after the `GET`. No
+  lock there means that its holder removed it, and the writer goes on to
+  the take. If the take fails, the lock that the break deleted stays
+  deleted.
+
+The lock has no expiry time. A lock that a writer leaves when it ends with
+no release stays until a break removes it.
+
+The lock has two windows:
+
+- A writer that breaks the lock and takes its own after a check, and before
+  the change that the check guards, does not stop that change.
+- On a server that ignores `If-Match`, a writer that breaks the lock and
+  takes its own between the `GET` and the `DELETE` of a release or of a
+  break loses its lock.
+
+Observed behavior of the servers:
+
+- `rclone serve s3` 1.75.1 ignores `If-None-Match: *` on `PUT`: a second
+  conditional `PUT` gives 200 and writes the object. It ignores `If-Match`
+  on `DELETE`: a wrong `ETag` gives 204 and deletes the object, and an
+  absent key gives 204. So the probe refuses each writer on this server.
+- SeaweedFS 4.36 honors both headers. A conditional `PUT` to a key that
+  holds an object gives 412 `PreconditionFailed`, and the object stays. A
+  `DELETE` with a wrong `ETag` gives 412, and the object stays. A `DELETE`
+  with the `ETag` of a `GET`, with its quotes or without them, gives 204.
+  A `DELETE` with `If-Match` on an absent key gives 412, also with
+  `If-Match: *`.
+- On both servers, a `PUT` gives a quoted `ETag`, and a later `GET` of the
+  same bytes gives the same value.

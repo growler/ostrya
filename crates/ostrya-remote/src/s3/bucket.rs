@@ -122,7 +122,8 @@ const COMPARE_CHUNK: usize = 64 * 1024;
 /// after a 408, 429, or 5xx, at most
 /// [`max_retries`](ostrya_fetch::FetcherOptions::max_retries) times. The
 /// delay starts at 250 ms, doubles each time, and stops at 2 s.
-/// [`put_if_absent`](Bucket::put_if_absent) states its own rule, and
+/// [`put_if_absent`](Bucket::put_if_absent) and
+/// [`delete_if_match`](Bucket::delete_if_match) state their own rules, and
 /// [`put_stream`](Bucket::put_stream) states more rules for the `POST`
 /// requests of a multipart upload.
 ///
@@ -230,19 +231,45 @@ pub enum PutIfAbsent {
     },
     /// The key held an object, and the call wrote nothing. The server
     /// answered 412 to the first request, or a read of the key after a
-    /// request with an unknown outcome found other bytes.
+    /// request with an unknown outcome found other bytes. Or a read after a
+    /// 412 that followed a request with an unknown outcome found no object.
     Present,
     /// The key holds the bytes of the body, and no answer of the server
     /// states which writer put them there.
     ///
-    /// A request of this call had an unknown outcome. Then a 412 or a failed
-    /// request followed, and a read of the key found the same bytes. A
-    /// request of this call can have written them, or an earlier writer of
-    /// the same bytes.
+    /// A request of this call had an unknown outcome. Then a failed request
+    /// followed, and a read of the key found the same bytes. A request of
+    /// this call can have written them, or an earlier writer of the same
+    /// bytes.
     Matches {
         /// The `ETag` of the read of the key, as the server wrote it.
         etag: Option<String>,
     },
+    /// The key holds the bytes of the body, and the server answered 412 to
+    /// a request of this call.
+    ///
+    /// A request of this call had an unknown outcome. Then a request got
+    /// 412, and a read of the key found the same bytes. A request of this
+    /// call can have written them, or an earlier writer of the same bytes.
+    /// The 412 shows that the server honors `If-None-Match`.
+    Refused {
+        /// The `ETag` of the read of the key, as the server wrote it.
+        etag: Option<String>,
+    },
+}
+
+/// The outcome of [`Bucket::delete_if_match`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum DeleteIfMatch {
+    /// The key holds no object after the call. A request of the call
+    /// deleted it, or the key was absent at a read after a request with an
+    /// unknown outcome.
+    Deleted,
+    /// The key did not hold an object with the `ETag` at the first request:
+    /// the server answered 412, or the key was absent. Or the read after a
+    /// request with an unknown outcome found an object.
+    NotMatched,
 }
 
 /// The keys and the common prefixes of a list.
@@ -630,7 +657,7 @@ impl Bucket {
     /// the retry count. A 412 after such a status, or after an interrupted
     /// request, can answer a request of this call. So the client then reads
     /// the key and compares it in the same way: the same bytes give
-    /// [`PutIfAbsent::Matches`], and other bytes or an absent key give
+    /// [`PutIfAbsent::Refused`], and other bytes or an absent key give
     /// [`PutIfAbsent::Present`].
     ///
     /// The compare reads the object as a stream, in chunks of 64 KiB. A
@@ -671,7 +698,7 @@ impl Bucket {
                         return Ok(PutIfAbsent::Present);
                     }
                     return Ok(match self.compare(&full, &body, &mut digest).await? {
-                        Compared::Same(etag) => PutIfAbsent::Matches { etag },
+                        Compared::Same(etag) => PutIfAbsent::Refused { etag },
                         Compared::Other | Compared::Absent => PutIfAbsent::Present,
                     });
                 }
@@ -725,6 +752,82 @@ impl Bucket {
                 Sent::Reply(reply) if is_retryable(reply.status) && round < self.max_retries => {}
                 Sent::Reply(reply) => return Err(self.reply_error(reply, Some(&full))),
                 Sent::Interrupted(_) if round < self.max_retries => {}
+                Sent::Interrupted(e) => return Err(Error::Fetch(e)),
+            }
+            round += 1;
+            ostrya_rt::Timer::after(backoff(round)).await;
+        }
+    }
+
+    /// Deletes the object of `key` if its `ETag` is `etag`.
+    ///
+    /// The request is `DELETE KEY` with `If-Match: ETAG`. `etag` goes as the
+    /// server wrote it, for example the [`etag`](Object::etag) of a read. A
+    /// 2xx gives [`DeleteIfMatch::Deleted`]. A 412 or an absent key to the
+    /// first request gives [`DeleteIfMatch::NotMatched`].
+    /// [`get`](Bucket::get) states the rule of an absent key. SeaweedFS 4.36
+    /// answers 412 for an absent key.
+    ///
+    /// The client sends the request again by the rule of [`Bucket`]. A 412
+    /// or an absent key after a request with an unknown outcome can answer a
+    /// request of this call. So the client then reads the key as
+    /// [`get_stream`](Bucket::get_stream) does, and reads no byte of the
+    /// object. An absent key gives [`DeleteIfMatch::Deleted`], and an object
+    /// gives [`DeleteIfMatch::NotMatched`].
+    ///
+    /// A server that does not honor `If-Match` deletes the object whatever
+    /// its `ETag` is, and gives [`DeleteIfMatch::Deleted`].
+    /// `rclone serve s3` 1.75.1 is such a server.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidInput`] if `key` is not a key of a bucket repository,
+    ///   or if `etag` is empty or longer than 1 KiB. The client then sends no
+    ///   request.
+    /// - [`Error::S3`] and [`Error::S3Region`] for an unsuccessful response.
+    /// - [`Error::Fetch`] for a failure of the fetcher, also after the last
+    ///   request that the client sent again.
+    /// - The errors of [`get_stream`](Bucket::get_stream) for the read of
+    ///   the key.
+    pub async fn delete_if_match(&self, key: &str, etag: &str) -> Result<DeleteIfMatch> {
+        check_key(key)?;
+        if etag.is_empty() || etag.len() > MAX_UPLOAD_TOKEN {
+            return Err(Error::InvalidInput(format!(
+                "S3: the ETag of a conditional delete of {key} is empty or longer than \
+                 {MAX_UPLOAD_TOKEN} bytes"
+            )));
+        }
+        let full = self.full_key(key);
+        let path = encode_path(&full);
+        let headers = [("If-Match".to_owned(), etag.to_owned())];
+        let mut round = 0;
+        // `true` after a request whose outcome is not known.
+        let mut unsure = false;
+        loop {
+            let empty = UploadBody::bytes(Vec::new());
+            match self
+                .send(UploadMethod::Delete, &path, "", empty, &headers)
+                .await?
+            {
+                Sent::Reply(reply) if is_success(reply.status) => {
+                    return Ok(DeleteIfMatch::Deleted);
+                }
+                Sent::Reply(reply)
+                    if reply.status == 412 || is_absent(reply.status, reply.body.as_deref()) =>
+                {
+                    if !unsure {
+                        return Ok(DeleteIfMatch::NotMatched);
+                    }
+                    return Ok(match self.get_stream(key).await? {
+                        Some(_) => DeleteIfMatch::NotMatched,
+                        None => DeleteIfMatch::Deleted,
+                    });
+                }
+                Sent::Reply(reply) if is_retryable(reply.status) && round < self.max_retries => {
+                    unsure = true;
+                }
+                Sent::Reply(reply) => return Err(self.reply_error(reply, Some(&full))),
+                Sent::Interrupted(_) if round < self.max_retries => unsure = true,
                 Sent::Interrupted(e) => return Err(Error::Fetch(e)),
             }
             round += 1;

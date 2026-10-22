@@ -19,8 +19,9 @@
 //!   a pull.
 //! - [`Bucket`] is the client of a bucket repository: it gets, puts, and
 //!   deletes the objects of the keys of a repository, and lists them. Its
-//!   results are [`Object`], [`ObjectStream`], [`PutIfAbsent`], [`Listing`]
-//!   with each [`Listed`] object, and [`Upload`]. [`Bucket::put_stream`]
+//!   results are [`Object`], [`ObjectStream`], [`PutIfAbsent`],
+//!   [`DeleteIfMatch`], [`Listing`] with each [`Listed`] object, and
+//!   [`Upload`]. [`Bucket::put_stream`]
 //!   writes an object from a reader, in a multipart upload if the object is
 //!   longer than one part, and [`part_size`] gives the part size of an
 //!   object. [`Bucket::from_fetcher`] opens it over the signed fetcher of a
@@ -56,7 +57,9 @@ mod sigv4;
 mod xml;
 
 pub use address::Address;
-pub use bucket::{Bucket, Listed, Listing, Object, ObjectStream, PutIfAbsent, Upload, part_size};
+pub use bucket::{
+    Bucket, DeleteIfMatch, Listed, Listing, Object, ObjectStream, PutIfAbsent, Upload, part_size,
+};
 pub use chain::{Addressing, Environment, Origin, Resolved, Setting, Settings, resolve};
 pub use credentials::Credentials;
 pub use endpoint::S3Endpoint;

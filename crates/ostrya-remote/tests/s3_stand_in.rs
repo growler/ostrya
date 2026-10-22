@@ -14,7 +14,9 @@ use std::time::Duration;
 use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
 use ostrya_fetch::{FetchRequest, Fetched, Fetcher, Proxy};
 use ostrya_remote::Error;
-use ostrya_remote::s3::{Address, Bucket, Credentials, Listed, Location, PutIfAbsent, S3Endpoint};
+use ostrya_remote::s3::{
+    Address, Bucket, Credentials, DeleteIfMatch, Listed, Location, PutIfAbsent, S3Endpoint,
+};
 use ostrya_rt::{TcpListener, block_on, spawn};
 use sha2::{Digest, Sha256};
 
@@ -1139,9 +1141,10 @@ fn an_unusable_listing_names_no_text_of_the_body() {
 
 /// The key held the bytes of the body before the call. The first request
 /// gets a 503, and the second gets a 412. The read finds the same bytes, but
-/// no answer states that a request of this call wrote them.
+/// no answer states that a request of this call wrote them. The 412 shows
+/// that the server honors the header.
 #[test]
-fn a_conditional_put_after_an_unsure_request_reports_matching_bytes() {
+fn a_conditional_put_refused_after_an_unsure_request_reports_matching_bytes() {
     block_on(async {
         let stand_in = StandIn::start(Arc::new(|seen: &Seen, count| match seen.method.as_str() {
             "PUT" if count == 1 => respond(503, &s3_error("SlowDown")),
@@ -1155,7 +1158,7 @@ fn a_conditional_put_after_an_unsure_request_reports_matching_bytes() {
             .put_if_absent("extensions/ostrya/lock", b"lock".to_vec())
             .await
             .unwrap();
-        assert_eq!(outcome, PutIfAbsent::Matches { etag: None });
+        assert_eq!(outcome, PutIfAbsent::Refused { etag: None });
         let methods: Vec<String> = stand_in.seen().into_iter().map(|s| s.method).collect();
         assert_eq!(methods, ["PUT", "PUT", "GET"]);
     });
@@ -1979,5 +1982,99 @@ fn an_abort_of_an_absent_upload_succeeds() {
                 request("DELETE", "/bucket/repo/config?uploadId=denied"),
             ]
         );
+    });
+}
+
+#[test]
+fn a_conditional_delete_sends_the_etag_and_reads_412_and_404_as_not_matched() {
+    block_on(async {
+        let stand_in = StandIn::start(Arc::new(|seen: &Seen, _| match seen.header("if-match") {
+            Some("\"held\"") => respond(204, b""),
+            Some("\"other\"") => respond(412, &s3_error("PreconditionFailed")),
+            _ => respond(404, &s3_error("NoSuchKey")),
+        }))
+        .await;
+        let bucket = stand_in.bucket("s3://bucket/repo").await;
+        let key = "extensions/ostrya/lock";
+        assert_eq!(
+            bucket.delete_if_match(key, "\"held\"").await.unwrap(),
+            DeleteIfMatch::Deleted
+        );
+        assert_eq!(
+            bucket.delete_if_match(key, "\"other\"").await.unwrap(),
+            DeleteIfMatch::NotMatched
+        );
+        assert_eq!(
+            bucket.delete_if_match(key, "\"absent\"").await.unwrap(),
+            DeleteIfMatch::NotMatched
+        );
+        let seen = stand_in.seen();
+        assert_eq!(seen.len(), 3);
+        for request in &seen {
+            assert_eq!(request.method, "DELETE");
+            assert_eq!(request.target, "/bucket/repo/extensions/ostrya/lock");
+        }
+        assert_eq!(seen[0].header("if-match"), Some("\"held\""));
+    });
+}
+
+#[test]
+fn a_conditional_delete_after_an_unsure_request_reads_the_key() {
+    block_on(async {
+        // The first request is interrupted, and the second one gets a 412.
+        // The read finds no object, so a request of the call deleted it.
+        let deleted = StandIn::start(Arc::new(|seen: &Seen, count| {
+            match (seen.method.as_str(), count) {
+                ("DELETE", 1) => Answer::Close,
+                ("DELETE", _) => respond(412, &s3_error("PreconditionFailed")),
+                _ => respond(404, &s3_error("NoSuchKey")),
+            }
+        }))
+        .await;
+        let bucket = deleted.bucket("s3://bucket/repo").await;
+        assert_eq!(
+            bucket
+                .delete_if_match("extensions/ostrya/lock", "\"held\"")
+                .await
+                .unwrap(),
+            DeleteIfMatch::Deleted
+        );
+        let methods: Vec<String> = deleted.seen().into_iter().map(|s| s.method).collect();
+        assert_eq!(methods, ["DELETE", "DELETE", "GET"]);
+
+        // The read finds an object, so the key holds another object.
+        let held = StandIn::start(Arc::new(|seen: &Seen, count| {
+            match (seen.method.as_str(), count) {
+                ("DELETE", 1) => respond(503, &s3_error("SlowDown")),
+                ("DELETE", _) => respond(412, &s3_error("PreconditionFailed")),
+                _ => respond_with(200, &[("ETag", "\"new\"")], b"new lock"),
+            }
+        }))
+        .await;
+        let bucket = held.bucket("s3://bucket/repo").await;
+        assert_eq!(
+            bucket
+                .delete_if_match("extensions/ostrya/lock", "\"held\"")
+                .await
+                .unwrap(),
+            DeleteIfMatch::NotMatched
+        );
+        let methods: Vec<String> = held.seen().into_iter().map(|s| s.method).collect();
+        assert_eq!(methods, ["DELETE", "DELETE", "GET"]);
+    });
+}
+
+#[test]
+fn a_conditional_delete_with_no_usable_etag_sends_no_request() {
+    block_on(async {
+        let stand_in = StandIn::start(Arc::new(|_: &Seen, _| respond(204, b""))).await;
+        let bucket = stand_in.bucket("s3://bucket/repo").await;
+        let key = "extensions/ostrya/lock";
+        let err = bucket.delete_if_match(key, "").await.unwrap_err();
+        assert!(matches!(&err, Error::InvalidInput(_)), "{err}");
+        let long = "e".repeat(1025);
+        let err = bucket.delete_if_match(key, &long).await.unwrap_err();
+        assert!(matches!(&err, Error::InvalidInput(_)), "{err}");
+        assert!(stand_in.seen().is_empty());
     });
 }

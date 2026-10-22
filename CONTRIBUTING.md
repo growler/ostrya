@@ -70,6 +70,24 @@ OSTRYA_REQUIRE_S3=1 OSTRYA_REQUIRE_OSTREE=1 OSTRYA_REQUIRE_GNUPG=1 \
     cargo test -p ostrya --features s3,verify-gpg --test pull_s3
 ```
 
+The tests of the writer lock and of the object listing of a bucket
+repository in `crates/ostrya/tests/bucket_lock.rs` need the `s3` feature.
+Most of them run against a stand-in S3 server in the test process, and they
+never skip. The other tests run against `rclone serve s3` and against
+`weed mini` of SeaweedFS. A SeaweedFS test starts `weed mini` with a data
+directory in a scratch directory, one bucket, the key pair of the tests, and
+a free port for each component that it picks, so it never uses a default
+port. The harness waits until a read of the bucket stops getting
+`NoSuchBucket`. A drop of the server kills it and removes its sockets in
+`/tmp`. A
+test skips if `rclone` or `weed` is not on `PATH`. `OSTRYA_REQUIRE_S3` and
+`OSTRYA_REQUIRE_SEAWEEDFS` turn each skip into a failure:
+
+```sh
+OSTRYA_REQUIRE_S3=1 OSTRYA_REQUIRE_SEAWEEDFS=1 \
+    cargo test -p ostrya --features s3 --test bucket_lock
+```
+
 ## Golden fixtures
 
 The golden fixtures are in `tests/fixtures/`. The `ostree` tool wrote them,
@@ -204,9 +222,12 @@ test:
   ownership gate.
 - `OSTRYA_REQUIRE_MOUNT` -- `CAP_SYS_ADMIN` and fs-verity, for the mount
   tests (see "Tests").
-- `OSTRYA_REQUIRE_S3` -- `rclone`, for the tests of the bucket client and
-  of the pull from an `s3://` address against `rclone serve s3` (see
-  "Tests").
+- `OSTRYA_REQUIRE_S3` -- `rclone`, for the tests of the bucket client, of
+  the pull from an `s3://` address, and of a bucket repository against
+  `rclone serve s3` (see "Tests").
+- `OSTRYA_REQUIRE_SEAWEEDFS` -- `weed` of SeaweedFS, for the tests of the
+  writer lock and of the object listing of a bucket repository against
+  `weed mini` (see "Tests").
 
 The CI test job sets `OSTRYA_REQUIRE_GNUPG` and `OSTRYA_REQUIRE_MULTIGROUP`.
 

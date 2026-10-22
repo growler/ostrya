@@ -413,11 +413,15 @@ A conditional `PUT` (`If-None-Match: *`) gives `PutIfAbsent::Created` only
 when a request of the call got a 2xx. A request whose outcome is not known,
 then a 412 or a failed request, makes the client read the key and compare
 its SHA-256 with the SHA-256 of the body. The same bytes give
-`PutIfAbsent::Matches`, other bytes give `PutIfAbsent::Present`, and an
-absent key after a failed request sends the request again. `Matches`
-states that the key holds the bytes of the body, and no answer names the
+`PutIfAbsent::Refused` after a 412 and `PutIfAbsent::Matches` after a
+failed request, other bytes give `PutIfAbsent::Present`, and an absent key
+after a failed request sends the request again. `Matches` and `Refused`
+state that the key holds the bytes of the body, and no answer names the
 writer. So a writer lock that sends its own body again tells a 2xx of its
-own request from bytes that the key held before the call. `rclone serve s3` 1.75.1 does not honor `If-None-Match: *`: a second
+own request from bytes that the key held before the call. `Refused` also
+states that the server answered 412, so the server honors the header,
+and a writer lock that probes the header does not read a 412 after a 503
+`SlowDown` as an unknown outcome. `rclone serve s3` 1.75.1 does not honor `If-None-Match: *`: a second
 conditional `PUT` writes over the object.
 
 The compare reads the object as a stream in chunks of 64 KiB, and holds no
@@ -426,6 +430,15 @@ length of the body holds other bytes, and the client reads none of it. The
 client hashes the body of the request only for a compare, on the blocking
 pool of the runtime, so a `PUT` with no compare hashes its body once, in
 the signer.
+
+A conditional `DELETE` (`If-Match` with an `ETag`) gives
+`DeleteIfMatch::Deleted` for a 2xx, and `DeleteIfMatch::NotMatched` for a
+412 or an absent key to the first request. SeaweedFS 4.36 answers 412 also
+for an absent key, so a 412 after a request with an unknown outcome can
+answer a delete of this call. The client then reads the key with
+`Bucket::get_stream` and reads no byte of the object: an absent key gives
+`Deleted`, and an object gives `NotMatched`. `rclone serve s3` 1.75.1 does
+not honor `If-Match`, and deletes the object whatever its `ETag` is.
 
 Each page of a list must move forward, or the list fails. Each key and
 common prefix of a page of `ListObjectsV2` comes after each one of the
@@ -651,6 +664,120 @@ endpoint, so the refusal reads no AWS variable and no AWS file. A bucket
 repository holds no collection ref, and no server answers `_ostrya/refs/v1`
 for it. `Repo::pull` does not send that request.
 
+## The writer lock of a bucket repository
+
+S3 has no transaction over more than one object, so two writers on one
+bucket repository race in two ways. Two pushes, or a push and an update of
+the summary, each read the refs and each write a summary that does not hold
+the ref of the other. A prune removes an object that no ref reaches, and at
+the same time a push finds the object in its listing, does not upload it,
+and writes a ref that reaches it. Each writer therefore holds a writer lock,
+one object at `extensions/ostrya/lock`, which it writes with
+`If-None-Match: *` and removes at the end. A read takes no lock.
+`docs/format-reference.md`, "The writer lock", gives the body and the
+requests. `ostrya::bucket` holds the lock, and `BucketRepo` is in `ostrya`,
+because the push, the fsck, and the prune of a bucket repository need the
+parsers and the summary builder of the crate.
+
+Two alternatives were rejected:
+
+- Conditional writes on the ref files and the summary, and a documented
+  rule that a prune runs when no push runs. Conditional writes do not stop
+  the race of a prune and a push.
+- A lock with a lease: an expiry time in the lock, which the holder writes
+  again during a long run, and a take of an expired lock with `If-Match`.
+  It adds a dependency on the clocks of the hosts, and a run that stops
+  writing the lock in time loses it during a change.
+
+The lock has no lease. A lock that a crashed writer leaves stays until a
+break of the lock removes it.
+
+The `id` of a run is the SHA-256 of the host name, the process id, the time
+in nanoseconds, and a counter of the process, in lowercase hex. The id
+needs no random source: `getrandom` is authorized for `ostrya-server` alone.
+The host name comes from `/proc/sys/kernel/hostname`, because `ostrya`
+builds on Linux alone. The feature `system` of `rustix`, for `uname`, was
+rejected: it changes a feature of a dependency and gives the same value on
+Linux.
+
+After the take, the writer sends the same body with `If-None-Match: *`
+again. A server that writes the probe gives no exclusion, and the writer
+removes its lock and fails with `Error::BucketNoExclusion`. The library has
+no option that lets a writer run on such a server. `rclone serve s3` 1.75.1
+ignores the header, so no writer runs on it. The tests of a writer run on
+SeaweedFS 4.36, which honors the header, and on a stand-in server in the
+test process, and the tests on `rclone serve s3` check the refusal. An
+option that lets a writer run with no exclusion was rejected, and so was a
+test proxy in front of `rclone serve s3` that gives the headers their
+meaning.
+
+A probe with an unknown outcome, whose read finds the body of the take,
+removes the lock and fails, and the operator runs the operation again. A
+second probe was rejected: it adds a retry loop to a case that a run again
+covers. A probe that gets 412 after a request with an unknown outcome, and
+whose read finds the body of the take, holds the lock: the 412 shows that
+the server honors the header.
+
+After a probe that gives `PutIfAbsent::Present`, the writer reads the lock
+and holds it only with its own `id`. `Present` also comes from an
+interrupted probe whose read finds other bytes. On a server that honors the
+header, another writer then broke the lock and took its own. On a server
+that ignores the header, another writer wrote over the probe. The client
+cannot tell the two cases apart, so the take fails with
+`Error::BucketLocked` and the holder that the read found, and removes no
+lock. The read costs one `GET` for each take. A take that returns a lock
+that the key does not hold was rejected: the writer stops only at its first
+check.
+
+The release and the break read the lock and its `ETag`, and send `DELETE`
+with `If-Match` and that `ETag`. The writer does not probe for `If-Match`:
+on a server that ignores the header, the conditional delete is a delete
+with no condition. A break removes only the lock that it read. A 412 to the
+delete of a break fails the take with `Error::BucketLocked`, which names
+the new holder. If the read after the 412 finds no lock, its holder
+removed it, and the break goes on to the take. A delete with no condition
+on a break was rejected: it can remove the lock of another writer that
+broke the lock after the read. So a break whose `GET` gives no `ETag`
+fails, and deletes no lock.
+
+A release whose `DELETE` removed the lock, but whose answer did not
+arrive, sends the `DELETE` again. If another writer took the lock between
+the two requests, the release fails with `Error::BucketLockLost`, although
+it was complete. The documentation of the release states this case. A
+third outcome of `Bucket::delete_if_match` for it was rejected: another
+writer holds the lock at the end of the release, as the error states.
+
+A lock body that the port cannot read is the lock of an unknown writer: a
+take fails with `Error::BucketLocked`, a check fails with
+`Error::BucketLockLost`, and a break removes the lock. An error that stops
+each writer and the break was rejected, because the operator then deletes
+the object by hand.
+
+A take that gets 412 and then reads no lock fails with
+`Error::BucketLocked` with no holder, and makes no second attempt. A
+release that finds another `id` or no lock fails with
+`Error::BucketLockLost`. The writes of the run were done under its last
+check, and the error tells the operator that another writer ran. A success
+with a flag was rejected.
+
+`ostrya::Error` has the variants `BucketLocked`, `BucketLockLost`, and
+`BucketNoExclusion` behind the feature `s3`, so a caller tells a refusal of
+the lock from other errors. `BucketRepo::lock`, `BucketRepo::lock_holder`,
+`WriterLock`, `LockHolder`, `LockOperation`, and `BucketRepo::list_objects`
+are public, so another tool on the bucket client keeps the exclusion.
+`BucketRepo::open` sends no request. A push takes the lock before it reads
+`config`, and a new repository has no `config`.
+
+`BucketRepo::list_objects` sends one list of each of the 256 fan-out
+prefixes. The lists are futures of one set that the call polls, with no
+spawned task. At most `max_outstanding` lists are in the set at a time, the
+admission limit of the fetcher. A list of a prefix with more than one page
+holds the keys of its earlier pages while it waits for the next page. With
+256 lists in the set, the fetcher admits page 1 of each prefix before page
+2 of any, so almost each key of the repository is in memory before the
+first list ends. A set that holds the 256 lists at one time was rejected
+for this reason.
+
 ## The client access of `ostrya serve`
 
 - The reader of the PROXY protocol, v1 and v2, is written in the tree, with
@@ -721,11 +848,15 @@ when the port owns its set of members and expects the set to grow.
   `Endpoint::S3` is behind the feature `s3`. A match outside
   `ostrya-remote` needs a wildcard arm, so the build compiles with and
   without the feature. "The S3 bucket client" states the reason.
-- `ostrya_remote::s3::S3Endpoint`, `Object`, `PutIfAbsent`, `Listing`,
-  `Listed`, and `Upload` have the attribute, and so do the variants
-  `ostrya_remote::Error::S3` and `ostrya_remote::Error::S3Region`. The bucket
-  client builds them, and the set of fields grows with the S3 support. A
-  caller builds an `S3Endpoint` with `S3Endpoint::new` and sets its fields.
+- `ostrya_remote::s3::S3Endpoint`, `Object`, `PutIfAbsent`,
+  `DeleteIfMatch`, `Listing`, `Listed`, and `Upload` have the attribute, and
+  so do the variants `ostrya_remote::Error::S3` and
+  `ostrya_remote::Error::S3Region`. The bucket client builds them, and the
+  set of fields grows with the S3 support. A caller builds an `S3Endpoint`
+  with `S3Endpoint::new` and sets its fields.
+- `ostrya::bucket::LockOperation`, `LockHolder`, and `ObjectListing` have
+  the attribute. The port builds them, and a later version can add an
+  operation or a field.
 - No option struct of the `ostrya` crate has the attribute: `PruneOptions`,
   `PullOptions`, `TarExportOptions`, `TarImportOptions` and the others. The
   attribute stops a struct expression outside the defining crate,

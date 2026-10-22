@@ -539,6 +539,70 @@ pub enum Error {
         /// The fs-verity digest of the image.
         actual: [u8; 32],
     },
+    /// The writer lock of a bucket repository that another writer holds.
+    ///
+    /// The take of the lock found a lock. On a server that honors
+    /// `If-None-Match`, a take with no break of the lock did not change the
+    /// bucket. After a break of the lock, the lock that the break deleted
+    /// stays deleted. If the probe after the take found the lock of another
+    /// writer, or no lock, the lock of the take is gone, and the call
+    /// removed no lock. [`bucket`](crate::bucket) states the writer lock.
+    #[cfg(feature = "s3")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "s3")))]
+    #[error(
+        "the bucket repository {address} is locked: {}",
+        crate::bucket::describe_locked(.holder.as_deref())
+    )]
+    BucketLocked {
+        /// The address of the repository, `s3://BUCKET[/PREFIX]`.
+        address: String,
+        /// The holder that the lock names, or `None` if the lock was gone
+        /// at the read after the take or the probe. A new run can then take
+        /// the lock.
+        holder: Option<Box<crate::bucket::LockHolder>>,
+    },
+    /// A writer lock of a bucket repository that another writer broke.
+    ///
+    /// A check or a release of the lock found a lock with another id, a
+    /// lock that names no id, or no lock. A writer that gets this error
+    /// stops before its next change.
+    ///
+    /// A release whose delete removed the lock, but whose answer did not
+    /// arrive, sends the delete again. If another writer took the lock
+    /// between the two requests, the release gives this error with the
+    /// holder of the new lock, although the release removed the lock of this
+    /// writer before the other writer took its own.
+    #[cfg(feature = "s3")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "s3")))]
+    #[error(
+        "the writer lock of {address} was broken: {}",
+        crate::bucket::describe_lost(.holder.as_deref())
+    )]
+    BucketLockLost {
+        /// The address of the repository, `s3://BUCKET[/PREFIX]`.
+        address: String,
+        /// The holder of the lock that the key holds, or `None` if the key
+        /// holds no lock.
+        holder: Option<Box<crate::bucket::LockHolder>>,
+    },
+    /// An S3 server that writes over an object in spite of
+    /// `If-None-Match: *`.
+    ///
+    /// The writer lock gives no exclusion on such a server, so no writer
+    /// runs on it. The take removes its lock before it gives this error. On
+    /// such a server, the take writes over a lock that the key holds, so the
+    /// lock of another writer that the key held is gone after the call.
+    #[cfg(feature = "s3")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "s3")))]
+    #[error(
+        "the S3 server of {address} does not honor If-None-Match, so the writer lock gives no \
+         exclusion and no writer can run on it; if the removal of the lock of this run failed, \
+         the lock stays until a break of the lock"
+    )]
+    BucketNoExclusion {
+        /// The address of the repository, `s3://BUCKET[/PREFIX]`.
+        address: String,
+    },
 }
 
 impl From<rustix::io::Errno> for Error {

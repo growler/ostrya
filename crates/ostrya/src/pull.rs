@@ -226,7 +226,7 @@ use crate::write::FileMeta;
 mod chain;
 mod collection;
 mod delta;
-mod drive;
+pub(crate) mod drive;
 #[doc(hidden)]
 pub mod http;
 mod source;

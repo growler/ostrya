@@ -31,6 +31,7 @@
 //! - Push and receive: [`remote`], the wire protocol of `ostrya-remote`, and `receive`.
 //! - Client access: [`access`], the client groups and the server settings of the config, the claims of a client certificate, and the read rights of a client.
 //! - Remote resolution: [`endpoint`], which reads the keys and files of a remote for a pull or a push.
+//! - Bucket repositories: `bucket`, a repository in an S3 bucket, with the writer lock and the listing of the objects.
 //! - Signing: [`sign`], `gpg`, and `spki`.
 //! - Signature trust: [`verify`], the trusted keys and the trust of one pull.
 //! - Maintenance: [`prune`], [`fsck`], [`diff`], [`update`], and [`config`].
@@ -44,7 +45,7 @@
 //! - `sign-gpg`: `GpgSigner`, which signs with the `gpg` command. It turns on `verify-gpg`.
 //! - `receive`: the `receive` module, the receive side of a push.
 //! - `push`: `Repo::push`, `Repo::push_onto`, and `Repo::export_stream`, the push from a repository.
-//! - `s3`: the pull from a bucket repository at an `s3://` address, and the `s3` module of `ostrya-remote`.
+//! - `s3`: the pull from a bucket repository at an `s3://` address, the `bucket` module, and the `s3` module of `ostrya-remote`.
 //! - `lzma-static`: xz built from source and linked statically, with no runtime liblzma.
 //!
 //! # Examples
@@ -62,6 +63,8 @@ pub mod access;
 pub mod archive;
 pub mod bootable;
 mod bspatch;
+#[cfg(feature = "s3")]
+pub mod bucket;
 pub mod checkout;
 pub mod commit;
 pub mod composefs;
@@ -117,6 +120,9 @@ mod write;
 pub use archive::{ArchiveAnswer, ArchiveHead, ArchiveView};
 #[doc(hidden)]
 pub use bootable::{BootableMetadata, BootableRefusal};
+#[cfg(feature = "s3")]
+#[doc(hidden)]
+pub use bucket::{BucketRepo, LockHolder, LockOperation, ObjectListing, WriterLock};
 #[doc(hidden)]
 pub use checkout::{CheckoutFilterFn, CheckoutMode, CheckoutOptions, OverwriteMode};
 #[doc(hidden)]

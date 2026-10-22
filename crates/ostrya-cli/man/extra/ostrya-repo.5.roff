@@ -306,6 +306,39 @@ An item with no summary, and an item whose \fB\%.access\fR file does not hold it
 Objects, deltas, \fB\%config\fR, and the other files under \fB\%extensions/\fR are served to each identified client.
 \fB\%ostrya serve\fR also serves \fB\%/_ostrya/refs/v1\fR, a list of refs that match a pattern, and \fB\%/_ostrya/receive/v1/\fR, the endpoint of a push over HTTP.
 These two are not files of the repository.
+.SH BUCKET REPOSITORIES
+A bucket repository is a repository in archive form in an S3 bucket, at the address \fB\%s3://BUCKET[/PREFIX]\fR.
+Each file of the repository is one object of the bucket.
+The key of the object is the path of the file under \fB\%PREFIX/\fR.
+The ostrya library built with its feature \fB\%s3\fR reads a bucket repository and takes its writer lock.
+The \fB\%ostrya\fR command of this release refuses an \fB\%s3://\fR address.
+.PP
+These are the keys of a bucket repository:
+.TP
+\fB\%config\fR, \fB\%summary\fR, \fB\%summary.sig\fR
+The files at the root of the repository.
+.TP
+\fB\%objects/<xx>/<62 hex digits>.<ext>\fR
+The objects, in lowercase hex.
+\fB\%<ext>\fR is \fB\%commit\fR, \fB\%commitmeta\fR, \fB\%dirtree\fR, \fB\%dirmeta\fR, \fB\%filez\fR, \fB\%tombstone\-commit\fR, or \fB\%cfs\fR.
+Each other key under \fB\%objects/\fR is a stray key.
+.TP
+\fB\%refs/heads/<name>\fR
+The refs.
+.TP
+\fB\%deltas/\fR, \fB\%delta\-indexes/\fR
+The static deltas and their index files, in the layout of the section STATIC DELTAS.
+.TP
+\fB\%extensions/ostrya/lock\fR
+The writer lock.
+A writer holds it while it changes the repository, and removes it at the end.
+A read takes no lock.
+The lock is a key file with the group \fB\%[lock]\fR and the keys \fB\%id\fR, \fB\%host\fR, \fB\%pid\fR, \fB\%operation\fR, and \fB\%started\fR.
+\fB\%id\fR is 64 lowercase hex digits, and identifies one run of one writer.
+\fB\%operation\fR is \fB\%push\fR, \fB\%prune\fR, \fB\%summary\fR, or \fB\%fsck\fR.
+\fB\%started\fR is the time at which the writer took the lock, in seconds since the epoch, UTC.
+The lock has no expiry time: a lock that a writer leaves stays until a break of the lock removes it.
+The \fB\%ostree\fR tool does not read this key.
 .SH EXTENSIONS
 These parts of the layout are extensions of ostrya:
 .IP \(bu 2
@@ -316,6 +349,8 @@ the object type \fB\%.cfs\fR, the composefs image of a commit;
 the lock file \fB\%.update.lock\fR;
 .IP \(bu 2
 the directory \fB\%extensions/ostrya/summary/\fR and its files;
+.IP \(bu 2
+the writer lock \fB\%extensions/ostrya/lock\fR of a bucket repository;
 .IP \(bu 2
 the temporary names \fB\%tmp/.ostrya\-ref\-*\fR, \fB\%tmp/.ostrya\-meta\-*\fR, and \fB\%<name>.tmp\-<pid>\-<n>\fR;
 .IP \(bu 2

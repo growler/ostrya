@@ -28,8 +28,8 @@ serve = ["dep:ostrya-server"]
 # feature of `ostrya`, so the feature gates the subcommand alone.
 send = []
 # The pull from and the push to a bucket repository at an `s3://` address,
-# `remote init`, and the S3 options of `push`, `pull`, `remote refs`, and
-# `remote summary`.
+# `remote init`, and the S3 options of `push`, `push-tree`, `pull`,
+# `remote refs`, and `remote summary`.
 s3 = ["ostrya/s3"]
 # The shipped binary links xz statically, so it needs no runtime liblzma.
 lzma-static = ["ostrya/lzma-static"]

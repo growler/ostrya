@@ -2,7 +2,8 @@
 //!
 //! The push writes the bucket repository with no session. It reads the
 //! objects through the archive view of the local repository, so each local
-//! mode gives the bytes of an `archive` repository. The `config` of the
+//! mode gives the bytes of an `archive` repository. The view builds each
+//! `.filez` at the `[archive] zlib-level` of the bucket. The `config` of the
 //! bucket takes the role of the server of a session push: its collection id
 //! and the bindings of the source commits select the namespace of the refs,
 //! `refs/heads/` or `refs/mirrors/ID/`.
@@ -15,16 +16,19 @@
 //! failed. A run again lists the objects and uploads only the rest, and it
 //! walks no tree of a commit that the bucket holds.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
 use futures_io::AsyncRead;
+use futures_lite::AsyncReadExt;
 use futures_lite::future::zip;
-use ostrya_core::{Checksum, ObjectName, ObjectType, RepoMode, is_ref_name};
+use futures_lite::io::Cursor;
+use ostrya_core::{Checksum, DeflateReader, ObjectName, ObjectType, RepoMode, is_ref_name};
+use sha2::{Digest, Sha256};
 
 use super::invalid;
 use super::negotiate::{Local, Plan, RepoPushOptions, check_bindings, offered_history};
@@ -35,14 +39,20 @@ use crate::bucket::{
     BucketPushOutcome, BucketRepo, LockOperation, ObjectListing, WriterLock, check_prefixes,
 };
 use crate::error::{Error, Result};
+use crate::hashing::VerifyingReader;
 use crate::pull::drive::Slots;
 use crate::remote::s3::{S3Endpoint, part_size};
-use crate::remote::{Compression, PushOutcome, PushPhase, PushProgress, PushStats, RefOutcome};
+use crate::remote::tree::TreeModel;
+use crate::remote::{
+    Compression, Encoding, ObjectData, ObjectSource, PushOutcome, PushPhase, PushProgress,
+    PushStats, RefOutcome,
+};
 use crate::repo::Repo;
+use crate::write::archive_level;
 
 /// The namespace of the refs that a push writes.
 #[derive(Debug, Clone, PartialEq, Eq)]
-enum Namespace {
+pub(super) enum Namespace {
     /// `refs/heads/`. `binding` is the collection id of the bucket
     /// repository, the id that a bound commit must name.
     Local { binding: Option<String> },
@@ -53,7 +63,7 @@ enum Namespace {
 impl Namespace {
     /// Returns the ref directory of the namespace, `refs/heads/` or
     /// `refs/mirrors/ID/`.
-    fn dir(&self) -> String {
+    pub(super) fn dir(&self) -> String {
         match self {
             Namespace::Local { .. } => "refs/heads/".to_owned(),
             Namespace::Mirror { id } => format!("refs/mirrors/{id}/"),
@@ -61,7 +71,7 @@ impl Namespace {
     }
 
     /// Returns the bucket key of the ref `name` of the namespace.
-    fn key(&self, name: &str) -> String {
+    pub(super) fn key(&self, name: &str) -> String {
         format!("{}{name}", self.dir())
     }
 }
@@ -79,6 +89,72 @@ fn namespace(collection: Option<&str>, bucket_id: Option<&str>) -> Namespace {
             binding: bucket_id.map(str::to_owned),
         },
     }
+}
+
+/// The state of a bucket repository that a push reads under the writer
+/// lock.
+pub(super) struct BucketState {
+    /// The DEFLATE level of each `.filez` that the push builds: the
+    /// `[archive] zlib-level` of the `config`, 6 if it has none, clamped to 1
+    /// to 9.
+    pub(super) level: u8,
+    /// The namespace of the push.
+    pub(super) ns: Namespace,
+    /// The refs of the ref directory of the namespace, by name.
+    pub(super) dir: BTreeMap<String, Checksum>,
+    /// The objects of the bucket.
+    pub(super) listing: ObjectListing,
+}
+
+/// Reads the state of `bucket` for a push whose commits name the collection
+/// `collection`.
+///
+/// The call reads the `config` and selects the namespace. Then at the same
+/// time it reads the ref files of the ref directory of the namespace, lists
+/// `refs/mirrors/` of the collection id of the bucket, and lists the
+/// objects. It reads no ref file of another namespace.
+///
+/// # Errors
+///
+/// - [`Error::Remote`] with
+///   [`InvalidInput`](crate::remote::Error::InvalidInput) if the bucket
+///   repository has no `config`.
+/// - The errors of [`BucketRepo::read_config`], of
+///   [`BucketRepo::read_ref_dir`], of [`BucketRepo::refuse_own_mirror_refs`],
+///   and of [`BucketRepo::list_objects`].
+pub(super) async fn read_state(
+    bucket: &BucketRepo,
+    collection: Option<&str>,
+) -> Result<BucketState> {
+    let Some(config) = bucket.read_config().await? else {
+        return Err(invalid(format!(
+            "the bucket repository {} has no config; init it first",
+            bucket.address()
+        )));
+    };
+    let level = archive_level(config.zlib_level()?);
+    let bucket_id = config.collection_id();
+    let ns = namespace(collection, bucket_id);
+    // The push reads the ref directory of its namespace alone, and lists
+    // `refs/mirrors/` of the collection id of the bucket.
+    let own_mirrors = async {
+        match bucket_id {
+            Some(own) => bucket.refuse_own_mirror_refs(own).await,
+            None => Ok(()),
+        }
+    };
+    let ((dir, own_mirrors), listing) = zip(
+        zip(bucket.read_ref_dir(&ns.dir()), own_mirrors),
+        bucket.list_objects(),
+    )
+    .await;
+    own_mirrors?;
+    Ok(BucketState {
+        level,
+        ns,
+        dir: dir?,
+        listing: listing?,
+    })
 }
 
 /// Refuses the options that a push to a bucket repository cannot carry:
@@ -107,15 +183,15 @@ fn refuse_options(opts: &RepoPushOptions) -> Result<()> {
 }
 
 /// One ref update of a push, after the checks against the bucket.
-struct Update {
-    /// The `DST` of the refspec.
-    dst: String,
+pub(super) struct Update {
+    /// The `DST` of the refspec, or the branch of a tree push.
+    pub(super) dst: String,
     /// The bucket key of the ref.
-    key: String,
+    pub(super) key: String,
     /// The commit of the ref in the bucket before the push.
-    old: Option<Checksum>,
+    pub(super) old: Option<Checksum>,
     /// The commit that the ref takes.
-    new: Checksum,
+    pub(super) new: Checksum,
 }
 
 /// The work of a push before the ref writes, and its counts.
@@ -127,12 +203,12 @@ struct Uploaded {
 
 /// The counts of the uploads of one push.
 #[derive(Default)]
-struct Counts {
+pub(super) struct Counts {
     /// The bytes of each object body and detached metadata that the push
     /// read and uploaded.
-    bytes: AtomicU64,
+    pub(super) bytes: AtomicU64,
     /// The objects other than composefs images that the push uploaded.
-    objects: AtomicU64,
+    pub(super) objects: AtomicU64,
 }
 
 /// Methods that push commits to a bucket repository.
@@ -148,9 +224,9 @@ impl Repo {
     /// [`BucketRepo::init`] writes. Each object goes up in archive form: the
     /// stored file of an `archive` repository, and for each other mode a
     /// `.filez` that the push builds at the `[archive] zlib-level` of the
-    /// local repository. The push trusts the listing of the objects of the
-    /// bucket alone: it uploads each object of its walk that the listing does
-    /// not hold.
+    /// `config` of the bucket, 6 if the `config` has none, clamped to 1 to 9.
+    /// The push trusts the listing of the objects of the bucket alone: it
+    /// uploads each object of its walk that the listing does not hold.
     ///
     /// The push writes no `summary` and no `summary.sig`. A `summary` and a
     /// `summary.sig` that the bucket holds stay as they are, so they do not
@@ -265,12 +341,13 @@ impl Repo {
     ///   repository has no `config`, or if the ref directory of the namespace
     ///   holds a name that is a directory of another name after the push.
     /// - [`Error::InvalidFormat`] if the `config` of the bucket is malformed,
-    ///   states a mode other than `archive-z2` and `archive`, or holds a
-    ///   `tombstone-commits` or `indexed-deltas` that is no boolean, if a key
-    ///   under the ref directory of the namespace is no ref name, if the
-    ///   bucket holds `refs/mirrors/ID/` of its own collection id, if a ref
-    ///   file of the namespace is malformed, or if a ref of the namespace
-    ///   names a commit that the bucket does not hold. The push then uploads
+    ///   states a mode other than `archive-z2` and `archive`, holds a
+    ///   `tombstone-commits` or `indexed-deltas` that is no boolean, or holds
+    ///   a `zlib-level` that is no integer, if a key under the ref directory
+    ///   of the namespace is no ref name, if the bucket holds
+    ///   `refs/mirrors/ID/` of its own collection id, if a ref file of the
+    ///   namespace is malformed, or if a ref of the namespace names a commit
+    ///   that the bucket does not hold. The push then uploads
     ///   nothing. The push does not check the keys and the ref files of the
     ///   other namespaces.
     /// - [`Error::Remote`] with
@@ -347,29 +424,12 @@ impl Repo {
         plan: &mut Plan,
         opts: &RepoPushOptions,
     ) -> Result<Uploaded> {
-        let Some(config) = bucket.read_config().await? else {
-            return Err(invalid(format!(
-                "the bucket repository {} has no config; init it first",
-                bucket.address()
-            )));
-        };
-        let bucket_id = config.collection_id();
-        let ns = namespace(plan.collection.as_deref(), bucket_id);
-        // The push reads the ref directory of its namespace alone, and lists
-        // `refs/mirrors/` of the collection id of the bucket.
-        let own_mirrors = async {
-            match bucket_id {
-                Some(own) => bucket.refuse_own_mirror_refs(own).await,
-                None => Ok(()),
-            }
-        };
-        let ((dir, own_mirrors), listing) = zip(
-            zip(bucket.read_ref_dir(&ns.dir()), own_mirrors),
-            bucket.list_objects(),
-        )
-        .await;
-        own_mirrors?;
-        let dir = dir?;
+        let BucketState {
+            level,
+            ns,
+            dir,
+            listing,
+        } = read_state(bucket, plan.collection.as_deref()).await?;
 
         // The bindings.
         match &ns {
@@ -411,7 +471,6 @@ impl Repo {
             });
         }
 
-        let listing = listing?;
         let walk = self.bucket_walk(plan, &updates, &listing, opts).await?;
         // The walk is the last reader of the commits of the plan.
         drop(std::mem::take(&mut plan.commits));
@@ -444,7 +503,7 @@ impl Repo {
             progress.set_phase(PushPhase::Uploading);
         }
 
-        let view = ArchiveView::new(self.clone());
+        let view = ArchiveView::with_zlib_level(self.clone(), level);
         let access = ReadAccess::new(
             Arc::new(ClientAccess::implicit(self.config().collection_id())),
             AuthItem::Anonymous,
@@ -452,13 +511,15 @@ impl Repo {
         );
         let source = RepoSource::new(self.clone(), opts.detached_metadata_filter.clone());
         let uploads = Uploads {
-            repo: self,
             bucket,
-            view: &view,
-            access: &access,
-            source: &source,
+            origin: Origin::Repo {
+                repo: self,
+                view: &view,
+                access: &access,
+                source: &source,
+                sizes: &sizes,
+            },
             listing: &listing,
-            sizes: &sizes,
             part: opts.part_size,
             progress,
             counts: &counts,
@@ -692,7 +753,7 @@ struct Walk {
 
 /// Checks the writer lock, then writes the ref file of each update that
 /// changes a ref, in order.
-async fn write_bucket_refs(
+pub(super) async fn write_bucket_refs(
     bucket: &BucketRepo,
     lock: &WriterLock<'_>,
     updates: &[Update],
@@ -717,7 +778,7 @@ async fn write_bucket_refs(
 ///
 /// The call releases the lock and drops an error of the release, unless the
 /// failure is a lost lock or a lock of another writer.
-async fn fail(lock: WriterLock<'_>, e: Error) -> Error {
+pub(super) async fn fail(lock: WriterLock<'_>, e: Error) -> Error {
     if !matches!(e, Error::BucketLockLost { .. } | Error::BucketLocked { .. }) {
         let _ = lock.release().await;
     }
@@ -725,13 +786,13 @@ async fn fail(lock: WriterLock<'_>, e: Error) -> Error {
 }
 
 /// Returns the bucket key of the object `name`.
-fn object_key(name: &ObjectName) -> String {
+pub(super) fn object_key(name: &ObjectName) -> String {
     format!("objects/{}", name.loose_path(RepoMode::Archive))
 }
 
 /// One upload of a push.
 #[derive(Clone, Copy)]
-enum Job {
+pub(super) enum Job {
     /// An object, as a stream.
     Object(ObjectName),
     /// The detached metadata of a commit.
@@ -739,22 +800,124 @@ enum Job {
 }
 
 /// The uploads of the objects of one push.
-struct Uploads<'a> {
-    repo: &'a Repo,
-    bucket: &'a BucketRepo,
-    view: &'a ArchiveView,
-    access: &'a ReadAccess,
-    /// The source of the detached metadata, with the filter of the push.
-    source: &'a RepoSource,
+pub(super) struct Uploads<'a> {
+    pub(super) bucket: &'a BucketRepo,
+    /// The source of the objects.
+    pub(super) origin: Origin<'a>,
     /// The listing of the objects of the bucket before the uploads.
-    listing: &'a ObjectListing,
-    /// The payload size of each file whose `.filez` the push builds, if the
-    /// pass over the files read it.
-    sizes: &'a HashMap<Checksum, u64>,
+    pub(super) listing: &'a ObjectListing,
     /// The part size of the caller, or `None` for the part size rule.
-    part: Option<u64>,
-    progress: Option<&'a PushProgress>,
-    counts: &'a Counts,
+    pub(super) part: Option<u64>,
+    pub(super) progress: Option<&'a PushProgress>,
+    pub(super) counts: &'a Counts,
+}
+
+/// The source of the objects of a push to a bucket repository.
+pub(super) enum Origin<'a> {
+    /// A local repository, through its archive view.
+    Repo {
+        repo: &'a Repo,
+        view: &'a ArchiveView,
+        access: &'a ReadAccess,
+        /// The source of the detached metadata, with the filter of the push.
+        source: &'a RepoSource,
+        /// The payload size of each file whose `.filez` the push builds, if
+        /// the pass over the files read it.
+        sizes: &'a HashMap<Checksum, u64>,
+    },
+    /// The model of a local directory, whose `.filez` objects the push
+    /// builds at `level` with the compressors of `compressors`.
+    Tree {
+        model: &'a TreeModel,
+        level: u8,
+        compressors: &'a CompressorPool,
+    },
+}
+
+/// The body of one object upload.
+struct Body<'a> {
+    /// The number of bytes of the body, if it is known.
+    len: Option<u64>,
+    body: BodyData<'a>,
+    /// The payload size of a file whose `.filez` the push builds, which
+    /// counts as content after the upload, if it is known.
+    payload: Option<u64>,
+    /// `true` if the bytes of the body count as content as the push reads
+    /// them: the stored `.filez` of an `archive` repository.
+    stored_content: bool,
+}
+
+/// The bytes of one object upload.
+enum BodyData<'a> {
+    /// A stream.
+    Stream(Box<dyn AsyncRead + Unpin + Send + 'a>),
+    /// Bytes in memory: a dirtree or a dirmeta object of a tree push.
+    Bytes(Vec<u8>),
+}
+
+/// The raw-DEFLATE compressor of the payload of one file of a tree push.
+type FileDeflate = DeflateReader<Box<dyn AsyncRead + Unpin + Send>>;
+
+/// The compressors of a tree push that no upload body holds.
+///
+/// A body leases one compressor, and gives it back when the body drops. At
+/// most `max_outstanding` bodies exist at a time, so the pool holds at most
+/// that many compressors.
+#[derive(Default)]
+pub(super) struct CompressorPool {
+    idle: Mutex<Vec<FileDeflate>>,
+}
+
+impl CompressorPool {
+    /// Leases a compressor over `source` at `level`.
+    ///
+    /// The lease reuses an idle compressor if one is there.
+    fn lease(&self, source: Box<dyn AsyncRead + Unpin + Send>, level: u8) -> Leased<'_> {
+        let idle = self.idle.lock().expect("tree push compressor mutex").pop();
+        let reader = match idle {
+            Some(mut reader) => {
+                reader.reset(source, level);
+                reader
+            }
+            None => DeflateReader::new(source, level),
+        };
+        Leased {
+            reader: Some(reader),
+            pool: self,
+        }
+    }
+}
+
+/// A compressor that one upload body holds.
+struct Leased<'a> {
+    reader: Option<FileDeflate>,
+    pool: &'a CompressorPool,
+}
+
+impl AsyncRead for Leased<'_> {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<std::io::Result<usize>> {
+        let reader = self.reader.as_mut().expect("a lease holds its compressor");
+        Pin::new(reader).poll_read(cx, buf)
+    }
+}
+
+impl Drop for Leased<'_> {
+    fn drop(&mut self) {
+        if let Some(mut reader) = self.reader.take() {
+            // The file closes now. The compressor and its buffers stay for
+            // the next body.
+            *reader.get_mut() = Box::new(futures_lite::io::empty());
+            self.pool
+                .idle
+                .lock()
+                .expect("tree push compressor mutex")
+                .push(reader);
+        }
+    }
 }
 
 impl Uploads<'_> {
@@ -762,7 +925,7 @@ impl Uploads<'_> {
     ///
     /// After the first failure, the call starts no new upload, waits for
     /// the uploads in flight, and returns the first error.
-    async fn all(&self, jobs: impl Iterator<Item = Job>) -> Result<()> {
+    pub(super) async fn all(&self, jobs: impl Iterator<Item = Job>) -> Result<()> {
         let mut slots = Slots::new(self.bucket.max_outstanding());
         let mut pending = jobs;
         let mut first = None;
@@ -790,48 +953,59 @@ impl Uploads<'_> {
     /// Uploads the object `name` as a stream.
     async fn one(&self, name: ObjectName) -> Result<()> {
         let key = object_key(&name);
-        let missing = || Error::ObjectNotFound {
-            checksum: name.checksum,
-            ty: name.ty,
-        };
-        let (len, body) = match self.view.get(&key, self.access).await? {
-            ArchiveAnswer::Stream { len, body } => (len, body),
-            ArchiveAnswer::NotFound | ArchiveAnswer::Refused => return Err(missing()),
-            other => {
-                return Err(Error::InvalidFormat(format!(
-                    "the archive view gave {other:?} for the object {key}"
-                )));
-            }
-        };
         let file = name.ty == ObjectType::File;
-        // The view builds a `.filez` with no length. The payload size of the
-        // file bounds the size of the `.filez`, and counts as content after
-        // the upload.
-        let built = len.is_none();
-        let payload = match self.sizes.get(&name.checksum) {
-            _ if !built => None,
-            Some(size) => Some(*size),
-            None if self.part.is_some() && self.progress.is_none() => None,
-            None => {
-                let repo = self.repo.clone();
-                let checksum = name.checksum;
-                Some(
-                    ostrya_rt::unblock(move || repo.object_content_size_blocking(&checksum, false))
-                        .await?,
-                )
+        let Body {
+            len,
+            body,
+            payload,
+            stored_content,
+        } = match self.origin {
+            Origin::Repo {
+                repo,
+                view,
+                access,
+                sizes,
+                ..
+            } => {
+                self.repo_body(repo, view, access, sizes, &key, &name)
+                    .await?
             }
+            Origin::Tree {
+                model,
+                level,
+                compressors,
+            } => tree_body(model, level, compressors, &name).await?,
         };
         let part = match self.part {
             Some(part) => part,
             None => part_size(len.or(payload).unwrap_or(0))?,
         };
         let read = AtomicU64::new(0);
-        let counted = Counted {
-            inner: body,
-            read: &read,
-            progress: self.progress.filter(|_| file && !built),
+        let body = match body {
+            // Bytes of at most one part go in one `PUT`, with no copy.
+            BodyData::Bytes(bytes) if bytes.len() as u64 <= part => {
+                let len = bytes.len() as u64;
+                self.bucket.bucket().put(&key, bytes).await?;
+                read.store(len, Ordering::Relaxed);
+                None
+            }
+            BodyData::Bytes(bytes) => Some(Box::new(Cursor::new(bytes)) as Box<_>),
+            BodyData::Stream(body) => Some(body),
         };
-        self.bucket.bucket().put_stream(&key, counted, part).await?;
+        if let Some(body) = body {
+            let counted = Counted {
+                inner: body,
+                read: &read,
+                progress: self.progress.filter(|_| file && stored_content),
+            };
+            let put = self.bucket.bucket().put_stream(&key, counted, part).await;
+            if let (Err(e), Origin::Tree { model, .. }) = (&put, &self.origin)
+                && let Some(e) = changed_file(model, &name, e)
+            {
+                return Err(e);
+            }
+            put?;
+        }
         self.counts
             .bytes
             .fetch_add(read.load(Ordering::Relaxed), Ordering::Relaxed);
@@ -847,6 +1021,55 @@ impl Uploads<'_> {
         Ok(())
     }
 
+    /// Returns the body of the object `name` of a local repository, at the
+    /// key `key`, from the archive view.
+    async fn repo_body(
+        &self,
+        repo: &Repo,
+        view: &ArchiveView,
+        access: &ReadAccess,
+        sizes: &HashMap<Checksum, u64>,
+        key: &str,
+        name: &ObjectName,
+    ) -> Result<Body<'static>> {
+        let missing = || Error::ObjectNotFound {
+            checksum: name.checksum,
+            ty: name.ty,
+        };
+        let (len, body) = match view.get(key, access).await? {
+            ArchiveAnswer::Stream { len, body } => (len, body),
+            ArchiveAnswer::NotFound | ArchiveAnswer::Refused => return Err(missing()),
+            other => {
+                return Err(Error::InvalidFormat(format!(
+                    "the archive view gave {other:?} for the object {key}"
+                )));
+            }
+        };
+        // The view builds a `.filez` with no length. The payload size of the
+        // file bounds the size of the `.filez`, and counts as content after
+        // the upload.
+        let built = len.is_none();
+        let payload = match sizes.get(&name.checksum) {
+            _ if !built => None,
+            Some(size) => Some(*size),
+            None if self.part.is_some() && self.progress.is_none() => None,
+            None => {
+                let repo = repo.clone();
+                let checksum = name.checksum;
+                Some(
+                    ostrya_rt::unblock(move || repo.object_content_size_blocking(&checksum, false))
+                        .await?,
+                )
+            }
+        };
+        Ok(Body {
+            len,
+            body: BodyData::Stream(body),
+            payload,
+            stored_content: !built,
+        })
+    }
+
     /// Uploads the detached metadata of `commit` if the bucket does not hold
     /// it with the same bytes.
     ///
@@ -856,7 +1079,10 @@ impl Uploads<'_> {
     /// not hold the key, when the size in the listing differs, or when a
     /// read of the key gives other bytes.
     async fn metadata(&self, commit: Checksum) -> Result<()> {
-        let Some(bytes) = self.source.detached_bytes(&commit).await? else {
+        let Origin::Repo { source, .. } = self.origin else {
+            unreachable!("a tree push uploads no detached metadata");
+        };
+        let Some(bytes) = source.detached_bytes(&commit).await? else {
             return Ok(());
         };
         let name = ObjectName::new(commit, ObjectType::CommitMeta);
@@ -880,10 +1106,96 @@ impl Uploads<'_> {
     }
 }
 
+/// Returns the body of the object `name` of the tree `model`.
+///
+/// A dirtree or a dirmeta object is its serialized bytes, in memory. A
+/// symlink is the framed archive header alone. A regular file is the framed
+/// archive header, then its payload in raw DEFLATE at `level`, through a
+/// compressor of `compressors`. The payload goes through a reader that hashes
+/// the header and the payload, and fails at the end of the payload if the
+/// checksum is not that of `name`. So a file that changed after the hash pass
+/// fails the upload before its last part goes up.
+async fn tree_body<'a>(
+    model: &TreeModel,
+    level: u8,
+    compressors: &'a CompressorPool,
+    name: &ObjectName,
+) -> Result<Body<'a>> {
+    let data = model.open(name, Encoding::Raw).await?;
+    let (header, size, payload) = match data {
+        ObjectData::Content {
+            header,
+            size,
+            payload,
+        } => (header, size, payload),
+        ObjectData::Encoded { mut reader, .. } => {
+            let mut bytes = Vec::new();
+            reader.read_to_end(&mut bytes).await?;
+            return Ok(Body {
+                len: Some(bytes.len() as u64),
+                body: BodyData::Bytes(bytes),
+                payload: None,
+                stored_content: false,
+            });
+        }
+    };
+    let mut framed = Vec::new();
+    header.write_framed_archive(size, &mut framed)?;
+    let body: Box<dyn AsyncRead + Unpin + Send + 'a> = match payload {
+        // A symlink is the archive header alone.
+        None => Box::new(Cursor::new(framed)),
+        Some(payload) => {
+            let mut prefix = Vec::new();
+            header.write_framed(&mut prefix)?;
+            let mut hasher = Sha256::new();
+            hasher.update(&prefix);
+            drop(prefix);
+            let verified = VerifyingReader::new(name.checksum, hasher, payload);
+            Box::new(Cursor::new(framed).chain(compressors.lease(Box::new(verified), level)))
+        }
+    };
+    Ok(Body {
+        len: None,
+        body: BodyData::Stream(body),
+        payload: Some(size),
+        stored_content: false,
+    })
+}
+
+/// Returns the error of a failed upload of the file `name` of the tree
+/// `model` when the failure is a read of the file, or `None` for another
+/// failure.
+///
+/// A read that finds other bytes than the hash pass gives
+/// [`ChecksumMismatch`](crate::remote::Error::ChecksumMismatch), and each
+/// other failed read gives [`Walk`](crate::remote::Error::Walk). Each names
+/// the path of the file.
+fn changed_file(model: &TreeModel, name: &ObjectName, e: &crate::remote::Error) -> Option<Error> {
+    let crate::remote::Error::Io(io) = e else {
+        return None;
+    };
+    if name.ty != ObjectType::File {
+        return None;
+    }
+    let path = model.source_path(name)?;
+    let error = if io.kind() == std::io::ErrorKind::InvalidData {
+        crate::remote::Error::ChecksumMismatch(format!(
+            "the file {} changed after the hash pass: {io}",
+            path.display()
+        ))
+    } else {
+        crate::remote::Error::Walk {
+            path,
+            source: std::io::Error::new(io.kind(), io.to_string()),
+        }
+    };
+    Some(Error::Remote(error))
+}
+
 /// A body that counts the bytes that it gives, and gives them to a progress
 /// handle as content bytes.
 struct Counted<'a> {
-    inner: Box<dyn AsyncRead + Unpin + Send>,
+    inner: Box<dyn AsyncRead + Unpin + Send + 'a>,
     read: &'a AtomicU64,
     progress: Option<&'a PushProgress>,
 }

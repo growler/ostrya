@@ -56,7 +56,8 @@ Ostrya adds these functions, which the `ostree` command does not have:
 - S3 bucket repositories. A bucket repository is a repository in `archive`
   form in an S3 bucket, at an `s3://BUCKET[/PREFIX]` address, with no server
   program. `ostrya remote init` creates one, `ostrya push` writes commits to
-  it under a writer lock, and `ostrya pull`, `ostrya remote refs`, and
+  it, and `ostrya push-tree` writes a directory to it as a new commit, each
+  under a writer lock. `ostrya pull`, `ostrya remote refs`, and
   `ostrya remote summary` read it. Each request is signed with AWS Signature
   Version 4 and the AWS credentials of the environment or of the shared AWS
   files.
@@ -219,7 +220,8 @@ The features of the `ostrya` crate are:
 - `push`: the client side of a push.
 - `receive`: the server side of a push.
 - `s3`: the pull from a bucket repository in an S3 bucket, its init and its
-  writer lock, and with `push`, the push to it.
+  writer lock, and with `push`, the push of commits and of a directory to
+  it.
 - `lzma-static`: xz built from source and linked statically.
 
 ## Design

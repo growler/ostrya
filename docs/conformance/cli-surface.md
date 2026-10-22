@@ -4336,7 +4336,7 @@ ostrya push [--repo=PATH] REMOTE REF --onto=BRANCH
 
 ```text
 ostrya remote init [--repo=PATH] NAME|s3://BUCKET[/PREFIX]
-                   [--collection-id=ID] [--break-lock]
+                   [--collection-id=ID] [--zlib-level=LEVEL] [--break-lock]
                    [the S3 options] [--allow-cleartext-credentials]
 ```
 
@@ -4348,8 +4348,9 @@ builds the S3 options, `--break-lock`, and `remote init`. It is in the
 default set.
 
 The S3 options are `--s3-region=REGION`, `--s3-endpoint=URL`,
-`--s3-addressing=path|virtual`, and `--s3-profile=PROFILE`. `push`, `pull`,
-`remote refs`, `remote summary`, and `remote init` take them. Each one wins
+`--s3-addressing=path|virtual`, and `--s3-profile=PROFILE`. `push`,
+`push-tree`, `pull`, `remote refs`, `remote summary`, and `remote init`
+take them. Each one wins
 over the remote key of the same name, then the environment, then the
 profile in the shared AWS config file, then the default
 (`ostrya-config(1)`, "REMOTE KEYS"). A profile that `--s3-profile` or
@@ -4362,7 +4363,11 @@ the signature of each request would travel in cleartext: use https, or set
 allow-cleartext-credentials`.
 
 - `remote init` writes the `config` of a new bucket repository, with
-  `collection-id=ID` for `--collection-id=ID`. With an address, the command
+  `collection-id=ID` for `--collection-id=ID`, and with the group
+  `[archive]` and `zlib-level=LEVEL` for `--zlib-level=LEVEL`. The option
+  parser refuses a `LEVEL` outside 1 to 9 before any request. A push builds
+  each `.filez` at that level, and at level 6 with no `[archive]` group.
+  With an address, the command
   opens no repository. With a remote name, the address is the `push-url`
   key when it holds an `s3://` address, else the `pull-url` key when it
   holds one. The command never reads `url`, and refuses each other remote
@@ -4385,19 +4390,24 @@ allow-cleartext-credentials`.
   options. It reads the environment and the shared AWS files before it
   refuses `--tag` and `--compress`, and sends no request for either
   refusal. The ref lines and the exit status are those of a push over a
-  session.
-- `--break-lock` of `push` and of `remote init` removes the writer lock of
-  another writer, then takes a new lock. After a command that succeeds, the
-  holder of the removed lock goes to standard error in one line:
-  `warning: removed the writer lock of HOLDER`. Without the option, a
-  locked bucket repository refuses the command with `error: the bucket
-  repository ADDRESS is locked: another writer holds the writer lock:
-  HOLDER`. `--break-lock` conflicts with `--onto`.
-- `push` refuses `--break-lock` and each S3 option for an HTTP or an ssh
-  destination, before the remote resolves: `error: OPTION applies to an
-  s3:// address, and the push address of 'REMOTE' is not one`. `REMOTE` is
-  the operand without its userinfo. The destination of a remote name is
-  its `push-url`, else its `url`.
+  session. The push uploads the stored `.filez` of an `archive` repository
+  as it is, and builds the `.filez` of each other mode at the
+  `[archive] zlib-level` of the `config` of the bucket.
+- `push-tree` to an `s3://` address, or to a remote whose push address is
+  one, makes the commit on the client and writes it to the bucket
+  repository (`push-tree`).
+- `--break-lock` of `push`, `push-tree`, and `remote init` removes the
+  writer lock of another writer, then takes a new lock. After a command
+  that succeeds, the holder of the removed lock goes to standard error in
+  one line: `warning: removed the writer lock of HOLDER`. Without the
+  option, a locked bucket repository refuses the command with `error: the
+  bucket repository ADDRESS is locked: another writer holds the writer
+  lock: HOLDER`. `--break-lock` of `push` conflicts with `--onto`.
+- `push` and `push-tree` refuse `--break-lock` and each S3 option for an
+  HTTP or an ssh destination, before the remote resolves: `error: OPTION
+  applies to an s3:// address, and the push address of 'REMOTE' is not
+  one`. `REMOTE` is the operand without its userinfo. The destination of a
+  remote name is its `push-url`, else its `url`.
 - `pull`, `remote refs`, and `remote summary` take the S3 options and
   `--allow-cleartext-credentials`, and refuse each of them when the pull
   address is an HTTP or an ssh address: `error: OPTION applies to an s3://
@@ -4450,10 +4460,13 @@ ostrya push-tree [--repo=PATH] REMOTE DIR --onto=BRANCH
                  [--push-token-file=FILE] [--push-user=NAME]
                  [--tls-client-cert-path=FILE] [--tls-client-key-path=FILE]
                  [--tls-ca-path=FILE] [--allow-cleartext-credentials]
+                 [--s3-region=REGION] [--s3-endpoint=URL]
+                 [--s3-addressing=path|virtual] [--s3-profile=PROFILE]
+                 [--break-lock]
 ```
 
 - The `push` feature of `ostrya-cli` builds the command. It is in the
-  default set.
+  default set. The feature `s3` adds the S3 options and `--break-lock`.
 - The command walks the directory `DIR` and sends the objects of its tree
   that the server does not hold. The server then makes one commit over the
   tree, moves `BRANCH` to it, and creates each `--tag` at it, in one
@@ -4477,24 +4490,23 @@ ostrya push-tree [--repo=PATH] REMOTE DIR --onto=BRANCH
   variable. A `SOURCE_DATE_EPOCH` that is not a count of seconds is refused
   with `error: SOURCE_DATE_EPOCH is not a Unix timestamp: ...` at exit 1.
   With neither, the push sends no timestamp, and the server takes its own
-  clock.
-- The command then refuses a push address that is an `s3://` address: an
-  `s3://` operand, or a remote whose `push-url`, else `url`, holds one. The
-  message is `error: push-tree does not write a bucket repository, and the
-  push address of 'REMOTE' is an s3:// address`. The refusal comes before
-  the resolve, so the command reads no AWS variable and no AWS file. A build
-  without the feature `s3` refuses the address in the resolve, with the
-  message of the feature.
-- The command then resolves `REMOTE` and makes the transport ready. It
-  refuses an option of the other transport and a bad HTTP option. It reads
-  the token file of an HTTP push, and the TLS files of an `https://` push.
+  clock. A push to a bucket repository then takes the clock of the host.
+- The command then refuses `--break-lock` and the `--s3-*` options for a
+  push address that is not an `s3://` address, as `push` does: `error:
+  OPTION applies to an s3:// address, and the push address of 'REMOTE' is
+  not one`. A build without the feature `s3` refuses an `s3://` address in
+  the resolve, with the message of the feature.
+- The command then resolves `REMOTE` and makes the transport ready, or
+  builds the client of the bucket repository. It refuses an option of the
+  other transport and a bad HTTP option. It reads the token file of an HTTP
+  push, and the TLS files of an `https://` push.
 - The command then reads `--body-file`. So a refusal of the remote or of
   its options reads no body file.
 - Each of these refusals comes before the walk. No ssh client starts, and
   no HTTP request is sent.
-- `REMOTE` is an ssh address, an `http://` or `https://` address, or a
-  remote name that the config of the local repository holds with a push
-  address. The command reads the local
+- `REMOTE` is an ssh address, an `http://` or `https://` address, an
+  `s3://BUCKET[/PREFIX]` address, or a remote name that the config of the
+  local repository holds with a push address. The command reads the local
   repository for a remote name alone, from `--repo`, then the current
   directory, then `OSTREE_REPO`. For an address the command opens no
   repository, and it ignores `--repo`.
@@ -4539,6 +4551,31 @@ ostrya push-tree [--repo=PATH] REMOTE DIR --onto=BRANCH
 - On success the command writes the checksum of the new commit as one line
   to standard output and exits 0. Under `-v` it writes the statistics line
   of `push` to standard error.
+- To an `s3://` destination, the command writes the bucket repository that
+  `remote init` created, through `BucketRepo::push_tree`
+  (`../format-reference.md`, "The tree push to a bucket repository"). The
+  push makes the commit on the client, with the rules of the server
+  commit and the `config` of the bucket in the role of the server:
+  - The parent is the commit of `BRANCH` in the bucket. `--orphan` makes a
+    commit with no parent, and on a `BRANCH` that exists it replaces the
+    commit of `BRANCH` with no check.
+  - `--collection=ID` selects the namespace as `push` does: the collection
+    id of the bucket, or no `ID`, writes `refs/heads/BRANCH`, and each other
+    `ID` writes `refs/mirrors/ID/BRANCH`. `ostree.collection-binding` holds
+    the collection id of the namespace.
+  - `--tag` is refused with `error: invalid input: a push to an s3://
+    address creates no tag, and the push names tags`, before any request.
+    `BRANCH` `ostree-metadata` in `refs/heads/` of a bucket with a
+    collection id is refused with `error: ref-denied: ...`.
+  - The push uploads each `.filez` at `--compress=LEVEL`, else at the
+    `[archive] zlib-level` of the bucket, else at level 6.
+  - `--break-lock` removes the writer lock of another writer, and writes
+    `warning: removed the writer lock of HOLDER` to standard error after a
+    push that succeeds.
+  - `--allow-cleartext-credentials` permits an `http://` S3 server, as for
+    `push`.
+  - The push signs no commit and writes no summary. A file that changes
+    after the hash pass fails the push, and no ref changes.
 - While the push runs, the command draws the progress bar of `push` on
   standard error, with the same rules and the same known gaps. The bar
   shows nothing during the walk and the hash pass.

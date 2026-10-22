@@ -21,6 +21,7 @@ API documentation: <https://docs.rs/ostrya-remote>
 
 - `Endpoint::parse` reads an ssh or HTTP address into an `Endpoint`.
 - `push_tree` pushes a local directory to an endpoint as one server commit.
+- `scan_tree` checks the options of a tree push and scans the directory, for a writer that makes the commit itself.
 - `PushSession::connect` opens a push session to an endpoint.
 - `PushSession::prepare` checks an endpoint before the session opens.
 - `PushSession::over_stream` opens a push session over a pair of byte streams.

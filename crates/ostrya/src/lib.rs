@@ -13,7 +13,8 @@
 //! `Repo::push_onto` asks a remote to commit the tree of a local commit. With
 //! the `receive` feature, the `receive` module takes a push on the server side.
 //! With the `push` and `s3` features, `Repo::push_to_bucket` writes commits to
-//! a bucket repository in an S3 bucket, and `BucketRepo::init` creates one.
+//! a bucket repository in an S3 bucket, `BucketRepo::push_tree` writes a local
+//! directory to one as a new commit, and `BucketRepo::init` creates one.
 //!
 //! # Entry points
 //! - [`Repo::open`] and [`Repo::create`] give a [`Repo`], the handle of a repository.
@@ -47,7 +48,7 @@
 //! - `sign-gpg`: `GpgSigner`, which signs with the `gpg` command. It turns on `verify-gpg`.
 //! - `receive`: the `receive` module, the receive side of a push.
 //! - `push`: `Repo::push`, `Repo::push_onto`, and `Repo::export_stream`, the push from a repository.
-//! - `s3`: the pull from a bucket repository at an `s3://` address, the `bucket` module, the `s3` module of `ostrya-remote`, and with `push`, the push to a bucket repository.
+//! - `s3`: the pull from a bucket repository at an `s3://` address, the `bucket` module, the `s3` module of `ostrya-remote`, and with `push`, the push of commits and of a local directory to a bucket repository.
 //! - `lzma-static`: xz built from source and linked statically, with no runtime liblzma.
 //!
 //! # Examples
@@ -101,6 +102,8 @@ pub mod receive;
 pub mod refs;
 mod rollsum;
 mod send;
+#[cfg(any(feature = "receive", all(feature = "push", feature = "s3")))]
+mod server_commit;
 pub mod sign;
 #[cfg(feature = "sign-spki")]
 pub mod spki {
@@ -125,7 +128,8 @@ pub use bootable::{BootableMetadata, BootableRefusal};
 #[cfg(feature = "s3")]
 #[doc(hidden)]
 pub use bucket::{
-    BucketPushOutcome, BucketRepo, LockHolder, LockOperation, ObjectListing, WriterLock,
+    BucketPushOutcome, BucketRepo, BucketWriteOptions, LockHolder, LockOperation, ObjectListing,
+    WriterLock,
 };
 #[doc(hidden)]
 pub use checkout::{CheckoutFilterFn, CheckoutMode, CheckoutOptions, OverwriteMode};

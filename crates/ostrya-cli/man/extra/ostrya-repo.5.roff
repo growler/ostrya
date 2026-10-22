@@ -310,9 +310,10 @@ These two are not files of the repository.
 A bucket repository is a repository in archive form in an S3 bucket, at the address \fB\%s3://BUCKET[/PREFIX]\fR.
 Each file of the repository is one object of the bucket.
 The key of the object is the path of the file under \fB\%PREFIX/\fR.
-\fB\%ostrya remote init\fR creates a bucket repository, \fB\%ostrya push\fR writes commits to it, and \fB\%ostrya pull\fR, \fB\%ostrya remote refs\fR, and \fB\%ostrya remote summary\fR read it.
-The init and the push take the writer lock of the bucket repository.
-In the ostrya library, the feature \fB\%s3\fR gives the read, the init, and the writer lock, and the features \fB\%s3\fR and \fB\%push\fR give the push.
+\fB\%ostrya remote init\fR creates a bucket repository, \fB\%ostrya push\fR writes commits to it, \fB\%ostrya push\-tree\fR writes a directory to it as a new commit, and \fB\%ostrya pull\fR, \fB\%ostrya remote refs\fR, and \fB\%ostrya remote summary\fR read it.
+The init and the two pushes take the writer lock of the bucket repository.
+\fB\%ostrya push\-tree\fR makes the commit on the client, with the parent from the ref file of the branch, and signs no commit.
+In the ostrya library, the feature \fB\%s3\fR gives the read, the init, and the writer lock, and the features \fB\%s3\fR and \fB\%push\fR give the two pushes.
 The \fB\%ostrya\fR command built without its feature \fB\%s3\fR refuses an \fB\%s3://\fR address.
 .PP
 A push that stops before its end can leave an incomplete multipart upload, which holds storage in the bucket.
@@ -323,9 +324,12 @@ These are the keys of a bucket repository:
 \fB\%config\fR
 The config of the repository.
 The init writes it with the group \fB\%[core]\fR and the keys \fB\%repo_version=1\fR and \fB\%mode=archive\-z2\fR, and with \fB\%collection\-id\fR when the caller gives a collection id, for example with \fB\%ostrya remote init \-\-collection\-id\fR.
+With a zlib level, for example with \fB\%ostrya remote init \-\-zlib\-level\fR, the group \fB\%[archive]\fR with the key \fB\%zlib\-level\fR follows.
 A bucket repository with a collection id is the primary server of that collection.
 The init refuses a bucket that holds a \fB\%config\fR, so the collection id of a bucket repository never changes.
-A push needs the \fB\%config\fR, and refuses a mode other than \fB\%archive\-z2\fR and \fB\%archive\fR, a collection id that fails the collection\-id rule, and a \fB\%tombstone\-commits\fR or \fB\%indexed\-deltas\fR that is not a boolean.
+A push needs the \fB\%config\fR, and refuses a mode other than \fB\%archive\-z2\fR and \fB\%archive\fR, a collection id that fails the collection\-id rule, a \fB\%tombstone\-commits\fR or \fB\%indexed\-deltas\fR that is not a boolean, and a \fB\%zlib\-level\fR that is not an integer.
+A push builds each \fB\%.filez\fR that it uploads at the \fB\%zlib\-level\fR of this \fB\%config\fR, 6 when the key is absent.
+A push of commits from an archive repository uploads each \fB\%.filez\fR as it is stored.
 .TP
 \fB\%summary\fR, \fB\%summary.sig\fR
 The summary of the repository and its signatures.

@@ -16,6 +16,7 @@
 //!
 //! - [`Endpoint::parse`] reads an ssh or HTTP address into an [`Endpoint`].
 //! - [`push_tree`](fn@push_tree) pushes a local directory to an endpoint as one server commit.
+//! - [`scan_tree`] checks the options of a tree push and scans the directory, for a writer that makes the commit itself.
 //! - [`PushSession::connect`] opens a push session to an endpoint.
 //! - [`PushSession::prepare`] checks an endpoint before the session opens.
 //! - [`PushSession::over_stream`] opens a push session over a pair of byte streams.
@@ -62,7 +63,9 @@ pub mod tree;
 pub use error::{Error, ErrorCode, Result};
 #[doc(hidden)]
 pub use proto::{Encoding, Expected, RefOutcome, RefState, RefUpdate};
-pub use push_tree::{TreePushOptions, push_tree, push_tree_over_stream, push_tree_prepared};
+pub use push_tree::{
+    ScannedTree, TreePushOptions, push_tree, push_tree_over_stream, push_tree_prepared, scan_tree,
+};
 #[doc(hidden)]
 pub use session::{
     BoxFuture, Compression, DetachedMetadata, ObjectData, ObjectReader, ObjectSource, PullBody,
@@ -93,6 +96,7 @@ const _: fn() = || {
     assert_send_sync::<Box<dyn ObjectReader>>();
     assert_send_sync::<PreparedSession>();
     assert_send_sync::<tree::TreeModel>();
+    assert_send_sync::<ScannedTree>();
     assert_send_sync::<tree::EntryMeta>();
     assert_send_sync::<tree::EntryKind>();
     assert_send_sync::<tree::EntryAction>();
@@ -217,6 +221,14 @@ fn scan_future_is_send(root: &std::path::Path, options: tree::ScanOptions) {
     fn assert_send<T: Send>(_: &T) {}
     assert_send(&options);
     assert_send(&tree::TreeModel::scan(root, options));
+}
+
+/// The future of the checks and the scan of a tree push moves to another
+/// thread.
+#[allow(dead_code)]
+fn scan_tree_future_is_send(root: &std::path::Path, opts: TreePushOptions) {
+    fn assert_send<T: Send>(_: &T) {}
+    assert_send(&scan_tree(root, opts));
 }
 
 /// The futures of the session calls can run on a multi-threaded executor.

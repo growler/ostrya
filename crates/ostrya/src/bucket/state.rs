@@ -40,7 +40,8 @@ impl BucketRepo {
     /// The config must state the mode `archive-z2` or `archive`, and a
     /// `[core] collection-id` must pass the collection id rule and be at most
     /// 255 bytes. `[core] tombstone-commits` and `[core] indexed-deltas`, which
-    /// the summary takes, must be booleans if they are set.
+    /// the summary takes, must be booleans if they are set. `[archive]
+    /// zlib-level`, which a push takes, must be an integer if it is set.
     ///
     /// # Errors
     ///
@@ -82,6 +83,11 @@ impl BucketRepo {
                 self.malformed(format!("its config has a key that is no boolean: {e}"))
             })?;
         }
+        config.zlib_level().map_err(|e| {
+            self.malformed(format!(
+                "its config has a zlib-level that is no integer: {e}"
+            ))
+        })?;
         Ok(Some(config))
     }
 

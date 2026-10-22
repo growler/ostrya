@@ -259,6 +259,15 @@ impl TreeModel {
         names
     }
 
+    /// Returns the path on the local filesystem of the entry that gives the
+    /// object `name`, or `None` for an object that the tree does not give.
+    ///
+    /// The entry is the first one in walk order that gives the object. The
+    /// call reads no file.
+    pub fn source_path(&self, name: &ObjectName) -> Option<PathBuf> {
+        self.source(name).map(|index| self.os_path(index))
+    }
+
     /// An empty model of the walk root `root`.
     pub(super) fn new(root: &Path) -> TreeModel {
         TreeModel {

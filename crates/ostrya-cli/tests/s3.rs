@@ -1,7 +1,8 @@
 #![forbid(unsafe_code)]
 
 //! `ostrya` with a bucket repository at an `s3://` address: `remote init`,
-//! `push`, `pull`, `remote refs`, `remote summary`, and `remote add`.
+//! `push`, `push-tree`, `pull`, `remote refs`, `remote summary`, and
+//! `remote add`.
 //!
 //! Most tests run against the S3 stand-in of
 //! `crates/ostrya/tests/common/s3.rs`, which holds its objects in memory,
@@ -364,6 +365,43 @@ fn remote_init_refuses_an_invalid_collection_id_before_a_request() {
     ]);
     assert!(message.contains("'nodot'"), "{message}");
     assert!(server.state().requests.is_empty());
+}
+
+#[test]
+fn remote_init_writes_the_zlib_level_and_refuses_one_outside_1_to_9() {
+    let scratch = Scratch::new("init-level");
+    let server = StandIn::start();
+    let endpoint = endpoint_of(&server);
+    for level in ["0", "10", "x"] {
+        let out = scratch.run(&[
+            "remote",
+            "init",
+            ADDRESS,
+            &endpoint,
+            CLEARTEXT,
+            &format!("--zlib-level={level}"),
+        ]);
+        assert!(!out.status.success(), "{level}");
+        assert!(
+            stderr(&out).contains("--zlib-level"),
+            "{level}: {}",
+            stderr(&out)
+        );
+    }
+    assert!(server.state().requests.is_empty());
+    let out = scratch.ok(&[
+        "remote",
+        "init",
+        ADDRESS,
+        &endpoint,
+        CLEARTEXT,
+        "--zlib-level=9",
+    ]);
+    assert_eq!(out, "");
+    assert_eq!(
+        object(&server, CONFIG).unwrap(),
+        format!("{PLAIN}\n[archive]\nzlib-level=9\n").as_bytes()
+    );
 }
 
 #[test]
@@ -883,13 +921,37 @@ fn a_push_with_break_lock_removes_a_lock_and_prints_its_holder() {
     assert_eq!(stderr(&out), "");
 }
 
-/// `push-tree` refuses an `s3://` operand and a remote whose push address
-/// is one, before it reads the AWS environment.
+/// Writes a small tree with `marker` in the scratch directory and returns
+/// its path.
+#[cfg(feature = "push")]
+fn tree(scratch: &Scratch, marker: &str) -> String {
+    let tree = scratch.path().join(format!("push-tree-{marker}"));
+    std::fs::create_dir_all(tree.join("dir")).unwrap();
+    std::fs::write(tree.join("a"), format!("{marker}\n")).unwrap();
+    std::fs::write(tree.join("dir/b"), b"beta\n").unwrap();
+    tree.to_str().unwrap().to_owned()
+}
+
+/// Returns the parent of the commit object `commit` of `server`.
+#[cfg(feature = "push")]
+fn parent_of(server: &StandIn, commit: &str) -> Option<String> {
+    let key = format!("repo/objects/{}/{}.commit", &commit[..2], &commit[2..]);
+    let bytes = object(server, &key).expect("the commit object");
+    ostrya::Commit::parse(&bytes)
+        .unwrap()
+        .parent
+        .map(|parent| parent.to_hex())
+}
+
+/// `push-tree` to an `s3://` address and to a remote whose push address is
+/// one prints the new commit. The second push takes the first commit as its
+/// parent.
 #[cfg(feature = "push")]
 #[test]
-fn push_tree_refuses_an_s3_destination() {
+fn push_tree_to_an_s3_address_and_remote_prints_the_commit() {
     let scratch = Scratch::new("push-tree");
     let server = StandIn::start();
+    init(&scratch, &server, None);
     let repo = scratch.repo("local");
     scratch.append_config(
         &repo,
@@ -898,33 +960,139 @@ fn push_tree_refuses_an_s3_destination() {
             server.endpoint()
         ),
     );
-    let tree = scratch.path().join("tree");
-    std::fs::create_dir_all(&tree).unwrap();
-    std::fs::write(tree.join("a"), b"a\n").unwrap();
-    let dir = tree.to_str().unwrap();
-    for (remote, shown) in [
-        (ADDRESS, ADDRESS),
-        ("s3://key:secret@bkt/repo", "s3://bkt/repo"),
-        ("r", "r"),
-    ] {
-        // No key pair: a read of the AWS environment would fail with
-        // another message.
-        let out = scratch.run_with(
-            &[&repo, "push-tree", remote, dir, "--onto=main"],
-            &[("AWS_ACCESS_KEY_ID", None), ("AWS_SECRET_ACCESS_KEY", None)],
-        );
-        assert!(!out.status.success(), "{remote}");
-        assert!(out.stdout.is_empty(), "{remote}: {}", stdout(&out));
-        assert_eq!(
-            stderr(&out),
-            format!(
-                "error: push-tree does not write a bucket repository, and the push address \
-                 of '{shown}' is an s3:// address\n"
-            ),
-            "{remote}"
-        );
-    }
+    let endpoint = endpoint_of(&server);
+    let timestamp = format!("--timestamp=@{TS}");
+    let dir = tree(&scratch, "one");
+    let out = scratch.run(&[
+        "push-tree",
+        ADDRESS,
+        &dir,
+        "--onto=main",
+        &endpoint,
+        CLEARTEXT,
+        &timestamp,
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stderr(&out), "");
+    let first = stdout(&out).trim().to_owned();
+    assert_eq!(stdout(&out), format!("{first}\n"));
+    assert_eq!(first.len(), 64);
+    assert_eq!(ref_of(&server, "repo/refs/heads/main").unwrap(), first);
+    assert_eq!(parent_of(&server, &first), None);
+    let dir = tree(&scratch, "two");
+    let second = scratch.ok(&[&repo, "push-tree", "r", &dir, "--onto=main", CLEARTEXT]);
+    let second = second.trim();
+    assert_eq!(ref_of(&server, "repo/refs/heads/main").unwrap(), second);
+    assert_eq!(parent_of(&server, second), Some(first));
+    assert!(object(&server, "repo/summary").is_none());
+    assert!(object(&server, LOCK).is_none());
+    // `--collection` with another id writes the mirror refs.
+    let mirrored = scratch.ok(&[
+        "push-tree",
+        ADDRESS,
+        &dir,
+        "--onto=main",
+        &endpoint,
+        CLEARTEXT,
+        &format!("--collection={ID}"),
+    ]);
+    assert_eq!(
+        ref_of(&server, &format!("repo/refs/mirrors/{ID}/main")).unwrap(),
+        mirrored.trim()
+    );
+}
+
+#[cfg(feature = "push")]
+#[test]
+fn push_tree_with_break_lock_removes_a_lock_and_prints_its_holder() {
+    let scratch = Scratch::new("push-tree-break");
+    let server = StandIn::start();
+    init(&scratch, &server, None);
+    server.state().store(LOCK, DEAD_LOCK.as_bytes());
+    let endpoint = endpoint_of(&server);
+    let dir = tree(&scratch, "one");
+    let args = [
+        "push-tree",
+        ADDRESS,
+        dir.as_str(),
+        "--onto=main",
+        &endpoint,
+        CLEARTEXT,
+    ];
+    let message = scratch.fails(&args);
+    assert!(message.contains("is locked"), "{message}");
+    assert!(object(&server, "repo/refs/heads/main").is_none());
+    let out = scratch.run(&[&args[..], &["--break-lock"]].concat());
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stderr(&out), format!("{DEAD_LOCK_LINE}\n"));
+    assert_eq!(
+        stdout(&out).trim(),
+        ref_of(&server, "repo/refs/heads/main").unwrap()
+    );
+    assert!(object(&server, LOCK).is_none());
+}
+
+/// A push of a tree to an `s3://` address refuses `--tag` before any
+/// request.
+#[cfg(feature = "push")]
+#[test]
+fn push_tree_to_an_s3_address_refuses_a_tag() {
+    let scratch = Scratch::new("push-tree-tag");
+    let server = StandIn::start();
+    init(&scratch, &server, None);
+    server.state().requests.clear();
+    let endpoint = endpoint_of(&server);
+    let dir = tree(&scratch, "one");
+    let message = scratch.fails(&[
+        "push-tree",
+        ADDRESS,
+        &dir,
+        "--onto=main",
+        "--tag=v1",
+        &endpoint,
+        CLEARTEXT,
+    ]);
+    assert_eq!(
+        message,
+        "error: invalid input: a push to an s3:// address creates no tag, and the push names \
+         tags\n"
+    );
     assert!(server.state().requests.is_empty());
+}
+
+/// The S3 options and `--break-lock` of `push-tree` are refused for an HTTP
+/// or an ssh destination, with the name of the option.
+#[cfg(feature = "push")]
+#[test]
+fn the_s3_options_of_push_tree_are_refused_for_an_http_or_ssh_destination() {
+    let scratch = Scratch::new("push-tree-not-s3");
+    let repo = scratch.repo("local");
+    scratch.append_config(&repo, "\n[remote \"h\"]\npush-url=https://ex.com/repo\n");
+    let dir = tree(&scratch, "one");
+    for (option, name) in [
+        ("--s3-region=eu-west-1", "--s3-region"),
+        ("--s3-endpoint=https://s3.ex.com", "--s3-endpoint"),
+        ("--s3-addressing=path", "--s3-addressing"),
+        ("--s3-profile=p", "--s3-profile"),
+        ("--break-lock", "--break-lock"),
+    ] {
+        for (destination, shown) in [
+            ("https://u:p@ex.com/repo", "https://ex.com/repo"),
+            ("ssh://h/srv/repo", "ssh://h/srv/repo"),
+            ("h", "h"),
+        ] {
+            let message =
+                scratch.fails(&[&repo, "push-tree", destination, &dir, "--onto=main", option]);
+            assert_eq!(
+                message,
+                format!(
+                    "error: {name} applies to an s3:// address, and the push address of \
+                     '{shown}' is not one\n"
+                ),
+                "{option} {destination}"
+            );
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

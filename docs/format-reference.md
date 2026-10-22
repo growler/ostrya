@@ -5552,13 +5552,18 @@ The `config` of a bucket repository is a key file. The init of the port
 writes it, and each writer reads it. A push to a bucket repository with no
 `config` is refused, so the init comes first.
 
-The init writes these lines, and the last one only with a collection id:
+The init writes these lines. The line `collection-id` comes only with a
+collection id, and the empty line and the group `[archive]` come only with
+a zlib level:
 
 ```text
 [core]
 repo_version=1
 mode=archive-z2
 collection-id=<id>
+
+[archive]
+zlib-level=<level>
 ```
 
 A bucket repository with a collection id is the primary server of that
@@ -5568,11 +5573,17 @@ repository never changes.
 
 A writer refuses a `config` that does not parse as a repository config,
 that states a mode other than `archive-z2` and `archive`, whose
-`collection-id` fails the collection id rule or is longer than 255 bytes, or
-whose `tombstone-commits` or `indexed-deltas` is not a boolean. The writer
-refuses it before it changes the bucket.
+`collection-id` fails the collection id rule or is longer than 255 bytes,
+whose `tombstone-commits` or `indexed-deltas` is not a boolean, or whose
+`zlib-level` is not an integer. The writer refuses it before it changes the
+bucket.
 The summary takes `mode`, `tombstone-commits`, `indexed-deltas`, and
 `collection-id` of `[core]` ("The summary of a bucket repository").
+
+A push builds each `.filez` that it uploads at the `[archive] zlib-level`
+of the `config`, as a local `archive` repository writes its `.filez`
+objects. A `config` with no `zlib-level` gives the level 6. A value outside
+1 to 9 is clamped to that range, as for a local repository.
 
 ### Object uploads
 
@@ -5733,11 +5744,12 @@ Observed behavior of the servers:
 ### Init of a bucket repository
 
 The init writes the `config` of a new bucket repository, with an optional
-collection id. `ostrya remote init` runs it, with the `s3://` address of
-its operand or of a remote:
+collection id and an optional zlib level. `ostrya remote init` runs it,
+with the `s3://` address of its operand or of a remote:
 
 1. It refuses a collection id that fails the collection id rule or is
-   longer than 255 bytes. It sends no request before this check.
+   longer than 255 bytes, and a zlib level outside 1 to 9. It sends no
+   request before these checks.
 2. It takes the writer lock with `operation=init`.
 3. It writes `config` with `If-None-Match: *`. A key that holds a `config`
    refuses the init, and the `config` stays as it is.
@@ -5753,8 +5765,9 @@ then ready for a push. A crash leaves the lock, as for each writer.
 A push writes the commits of a set of refspecs to a bucket repository with
 no session. Each object goes up in the bytes of an `archive` repository:
 the stored file of an `archive` repository, and for each other mode a
-`.filez` that the push builds at the `[archive] zlib-level` of the local
-repository. The steps of a push are:
+`.filez` that the push builds at the `[archive] zlib-level` of the `config`
+of the bucket ("The config of a bucket repository"). The steps of a push
+are:
 
 1. The local checks: the depth, the collection, the refspecs, the source
    commits, and the bindings, as for a push over a session. A local refusal
@@ -5843,6 +5856,75 @@ A push that fails leaves one of these states:
 - A crash during a multipart upload leaves the upload open. It holds
   storage until a lifecycle rule of the bucket aborts it. A failed upload
   aborts its own multipart upload.
+
+### The tree push to a bucket repository
+
+A tree push writes a local directory to a bucket repository as one new
+commit, with no session. `ostrya push-tree` with an `s3://` destination
+runs it. The bucket has no server, so the client makes the commit. The
+commit is the server commit of "Server commit" and "The commit of
+`push-tree`", with the `config` of the bucket in the role of the server:
+
+- The parent is the commit of the ref file of the branch in the namespace,
+  which the push reads under the writer lock. With `orphan`, or when the
+  branch is absent, the commit has no parent. With `orphan` on a branch
+  that exists, the new commit replaces the tip with no check.
+- `ostree.ref-binding` holds the branch and each bound name, sorted.
+- `ostree.collection-binding` holds the collection id of the bucket in
+  `refs/heads/`, and the collection id of the namespace in
+  `refs/mirrors/ID/`. The key is absent in `refs/heads/` of a bucket with no
+  collection id. The namespace follows the table of "The push to a bucket
+  repository", with the collection of the push as the namespace.
+- The timestamp is the value of the push, else the system clock of the
+  client.
+- The metadata entries, the subject, the body, and the root dirtree and
+  root dirmeta are those of the push, in the order of "Server commit".
+
+With equal inputs, the commit is the commit that the receive side of a
+session tree push writes, byte for byte.
+
+The steps of a tree push are:
+
+1. The local checks of the options, as for a session tree push, and the
+   walk and the hash of the tree. A tree push to a bucket refuses tags. A
+   local refusal and a failed walk send no request.
+2. The take of the writer lock with `operation=push`.
+3. The read of `config` and the selection of the namespace, then the read of
+   the ref files of the ref directory of the namespace, the listing of
+   `refs/mirrors/` of the collection id of the bucket, and the listing of the
+   objects, as for a push of commits.
+4. The checks of the refs. The branch `ostree-metadata` in `refs/heads/` of
+   a bucket with a collection id is refused, as a server refuses it. The
+   ref directory must hold no name that is a directory of another name
+   after the push. Each ref of the namespace other than the branch, and the
+   parent, must name a commit that the listing holds. A failed check
+   uploads nothing.
+5. The build of the commit object. A commit object larger than the
+   metadata size cap of "Foundational constants", 128 MiB, is refused
+   before an upload. A tree push to a bucket has no frame, so the 1 MiB
+   `Commit` frame of an ostrya server does not limit the commit.
+6. The upload of each object of the tree that the listing lacks, at most
+   `max_outstanding` uploads at a time. A dirtree and a dirmeta object go
+   up as their bytes. A symlink goes up as the framed archive header alone.
+   A regular file goes up as the framed archive header, then its payload in
+   raw DEFLATE. The level is the level of the compression of the push,
+   else the `[archive] zlib-level` of the `config` of the bucket.
+7. The upload of the commit object, if the listing lacks it.
+8. A check of the writer lock, then the write of the ref file of the branch,
+   if the branch moves.
+9. The release of the writer lock.
+
+The push reads each file as a stream and hashes its header and its payload
+again. A file that changed after the hash pass fails the read at the end of
+the payload. The bucket client then has not sent the last part of the
+object: a single `PUT` is not sent, and a multipart upload is aborted. The
+push uploads no commit object and writes no ref.
+
+A tree push writes no `summary`, no `summary.sig`, and no `.commitmeta`, and
+it signs no commit. A signature of the commit comes from a pull of the
+commit into a local repository, a sign there, and a push of the commit,
+which then uploads the `.commitmeta` alone. The failure states are those of
+a push of commits.
 
 ### The summary of a bucket repository
 

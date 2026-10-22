@@ -13,7 +13,11 @@
 //! the options of [`PushOntoOptions`].
 //! [`Repo::export_stream`](crate::Repo::export_stream) writes the commits of a
 //! set of ref updates as one one-way stream, with the options of
-//! [`ExportStreamOptions`]. The private submodules read the refspecs of a push
+//! [`ExportStreamOptions`]. With the `s3` feature, `Repo::push_to_bucket`
+//! pushes the commits of a set of refspecs to a bucket repository, and
+//! `BucketRepo::push_tree` pushes a local directory to a bucket repository as
+//! a new commit. The private
+//! submodules read the refspecs of a push
 //! against the local repository. They also give the objects of its commits to
 //! a push session.
 
@@ -23,6 +27,8 @@ mod onto;
 mod refspec;
 #[cfg(feature = "s3")]
 mod s3;
+#[cfg(feature = "s3")]
+mod s3_tree;
 mod source;
 #[cfg(test)]
 mod test_repo;

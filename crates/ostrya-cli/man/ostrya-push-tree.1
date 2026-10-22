@@ -1,26 +1,28 @@
 .TH "OSTRYA\-PUSH\-TREE" "1" "" "ostrya" "User Commands"
 .SH NAME
-ostrya\-push\-tree \- Push a directory over ssh or HTTP, and let the server commit it
+ostrya\-push\-tree \- Push a directory as a new commit to a server or a bucket repository
 .SH SYNOPSIS
 .nf
 ostrya push\-tree [OPTIONS] [REMOTE] [DIR]
 .fi
 .SH DESCRIPTION
-Push a directory over ssh or HTTP, and let the server commit it.
+Push a directory as a new commit to a server or a bucket repository.
 .PP
 The command walks DIR and sends the objects of its tree that the server does not have. The server then makes one commit over the tree, moves the branch of \%\-\-onto to it, and creates each \%\-\-tag at it, in one transaction. The parent of the commit is the commit of the branch on the server. The server writes the bindings of its namespace and signs the commit with the keys of the client group. The tree holds no extended attributes. The option names and the value forms are those of \fB\%commit\fR\&.
 .PP
 The client group needs \fB\%c\fR on the branch. A server that runs receive hooks takes no server commit and answers \%ref\-denied. The push sends the server commit in one frame, which an ostrya server limits to \%1 MiB. The reply names the branch and each \%\-\-tag, and must also fit in one frame. In a commit, an \%\-\-add\-metadata value can hold two levels of containers fewer than a variant. The push checks the two frames and the depth of each value before it sends an object.
 .PP
-The command makes its checks before the ssh client starts or the first HTTP request goes. It resolves REMOTE before it reads \%\-\-body\-file. A refusal of the remote thus reads no body file. The command refuses an \fB\%s3://\fR push address, because it does not write a bucket repository.
+The command makes its checks before the ssh client starts or the first HTTP request goes. It resolves REMOTE before it reads \%\-\-body\-file. A refusal of the remote thus reads no body file. For an \fB\%s3://\fR push address, the command makes the commit itself and writes the bucket repository.
 .PP
 On success, standard output carries the commit checksum alone. Under \%\-\-verbose, one statistics line goes to standard error. On a terminal, standard error shows the progress bar of \fB\%push\fR while the push runs. On failure, the command writes \fB\%error: MESSAGE\fR to standard error and nothing to standard output, and exits \%1.
 .SH ARGUMENTS
 .TP
 \fIREMOTE\fR
-The remote: a remote name or an ssh or HTTP address. Required.
+The remote: a remote name, or an ssh, HTTP, or \fB\%s3://\fR address. Required.
 .IP
-A value with a \fB\%:\fR or a \fB\%/\fR is an address: an ssh, \fB\%http://\fR, or \fB\%https://\fR address. An address opens no repository, and the command ignores \%\-\-repo for it. Each other value names a \fB\%[remote "<name>"]\fR section with a push address. The section is in the config of the repository that \%\-\-repo, the current directory, or \fB\%OSTREE_REPO\fR names.
+A value with a \fB\%:\fR or a \fB\%/\fR is an address: an ssh, \fB\%http://\fR, \fB\%https://\fR, or \fB\%s3://BUCKET[/PREFIX]\fR address. An address opens no repository, and the command ignores \%\-\-repo for it. Each other value names a \fB\%[remote "<name>"]\fR section with a push address. The section is in the config of the repository that \%\-\-repo, the current directory, or \fB\%OSTREE_REPO\fR names.
+.IP
+To an \fB\%s3://\fR address, the push writes the bucket repository at that address, which \fB\%remote init\fR created. A build without the feature \fB\%s3\fR refuses an \fB\%s3://\fR address.
 .TP
 \fIDIR\fR
 The directory to commit. Required.
@@ -32,11 +34,13 @@ The branch of the server that the server commit moves. Required.
 The server makes the commit over the tree of DIR. Its parent is the commit of BRANCH on the server, or none if BRANCH is absent. The server moves BRANCH to the commit. The client group needs \fB\%c\fR on BRANCH. A server that runs receive hooks takes no server commit and answers \%ref\-denied.
 .IP
 The command refuses a name that holds \fB\%:\fR, a name that the \%ref\-name rule refuses, which includes a name with \fB\%^\fR, and a name of \%64 lowercase hex characters, because a revision reads such a name as a commit checksum.
+.IP
+To a bucket repository, the push makes the commit itself, as the server makes it. The parent is the commit of BRANCH in the bucket, which the push reads under the writer lock, or none if BRANCH is absent. The push then writes the ref file of BRANCH. In a bucket repository with a collection id, the push refuses the BRANCH \fB\%ostree\-metadata\fR in \fB\%refs/heads/\fR\&. The push signs no commit.
 .TP
 \fB\-\-tag\fR \fINAME\fR
 Create the ref NAME on the server at the new commit.
 .IP
-The option can occur more than once. The \fB\%ostree.ref\-binding\fR of the commit holds NAME. A tag that exists on the server gets \%ref\-mismatch before the push sends an object. NAME passes the rules of BRANCH, is not BRANCH, and occurs once. The client group needs \fB\%t\fR or \fB\%w\fR on NAME.
+The option can occur more than once. The \fB\%ostree.ref\-binding\fR of the commit holds NAME. A tag that exists on the server gets \%ref\-mismatch before the push sends an object. NAME passes the rules of BRANCH, is not BRANCH, and occurs once. The client group needs \fB\%t\fR or \fB\%w\fR on NAME. A push to a bucket repository refuses this option.
 .TP
 \fB\-\-bind\-ref\fR \fINAME\fR
 Bind the commit to NAME, and create no ref.
@@ -46,12 +50,14 @@ The option can occur more than once. The \fB\%ostree.ref\-binding\fR of the comm
 \fB\-\-orphan\fR
 Make a commit with no parent.
 .IP
-If BRANCH exists on the server, the client group needs \fB\%c\fR and \fB\%d\fR on it, else the server answers \%non\-fast\-forward.
+If BRANCH exists on the server, the client group needs \fB\%c\fR and \fB\%d\fR on it, else the server answers \%non\-fast\-forward. In a bucket repository, the new commit replaces the commit of BRANCH with no check.
 .TP
 \fB\-\-collection\fR \fIID\fR
 Write the refs of the collection ID on the server.
 .IP
 The server writes the refs of its own collection id under \fB\%refs/heads/\fR, and the refs of each other collection under \fB\%refs/mirrors/ID/\fR\&. \fB\%ostree.collection\-binding\fR of the commit holds ID. Without this option, the push writes the local refs of the server, and the binding is the collection id of the server, if it has one. The command refuses an ID that fails the \%collection\-id rule or is longer than \%255 bytes before it starts the transport.
+.IP
+To a bucket repository, the \fB\%config\fR of the bucket takes the role of the server: the collection id of the bucket, or no ID, writes \fB\%refs/heads/BRANCH\fR, and each other ID writes \fB\%refs/mirrors/ID/BRANCH\fR, also in a bucket with no collection id.
 .TP
 \fB\-s\fR, \fB\-\-subject\fR \fISUBJECT\fR
 The commit subject.
@@ -79,7 +85,7 @@ Each occurrence adds one key. The metadata holds each \%\-\-add\-metadata\-strin
 \fB\-\-timestamp\fR \fITIMESTAMP\fR
 Set the timestamp of the commit.
 .IP
-The value is \fB\%@SECONDS\fR since the Unix epoch, or a date and time with a UTC offset (\fB\%2020\-01\-02T03:04:05Z\fR). Without this option, the push sends the \fB\%SOURCE_DATE_EPOCH\fR environment variable. If that variable is not set, the push sends no timestamp, and the server takes its own clock. The command refuses a \fB\%SOURCE_DATE_EPOCH\fR that is not a count of seconds.
+The value is \fB\%@SECONDS\fR since the Unix epoch, or a date and time with a UTC offset (\fB\%2020\-01\-02T03:04:05Z\fR). Without this option, the push sends the \fB\%SOURCE_DATE_EPOCH\fR environment variable. If that variable is not set, the push sends no timestamp, and the server takes its own clock. A push to a bucket repository then takes the clock of this host. The command refuses a \fB\%SOURCE_DATE_EPOCH\fR that is not a count of seconds.
 .TP
 \fB\-\-owner\-uid\fR \fIUID\fR
 Set the user id of the owner of the committed files.
@@ -100,6 +106,8 @@ The commit then does not depend on the owner or on the host. A symlink keeps its
 Send the content objects deflated at LEVEL, \%1 to \%9.
 .IP
 The value needs the \fB\%=\fR form, and \%\-\-compress alone gives level \%6. Without this option, the push sends the content objects raw.
+.IP
+A push to a bucket repository uploads each file as a \fB\%\&.filez\fR\&. It builds the \fB\%\&.filez\fR at LEVEL, else at the \fB\%[archive] zlib\-level\fR of the \fB\%config\fR of the bucket, else at level \%6.
 .TP
 \fB\-\-ssh\-command\fR \fICMD\fR
 The ssh command, split at ASCII whitespace.
@@ -139,7 +147,32 @@ With it, the push does not use the trust store of the host. It wins over the \fB
 \fB\-\-allow\-cleartext\-credentials\fR
 Send the token to an \fB\%http://\fR address.
 .IP
-Without this switch, the command refuses a token to such an address before any request. Use it for a server on a loopback address or behind a proxy that terminates TLS. No key of the remote sets this switch. The command refuses it for an ssh address. For a \fB\%push\fR to an \fB\%s3://\fR address, the switch permits an \fB\%http://\fR \%S3 server, to which the signature of each request goes in cleartext.
+Without this switch, the command refuses a token to such an address before any request. Use it for a server on a loopback address or behind a proxy that terminates TLS. No key of the remote sets this switch. The command refuses it for an ssh address. For a \fB\%push\fR or a \fB\%push\-tree\fR to an \fB\%s3://\fR address, the switch permits an \fB\%http://\fR \%S3 server, to which the signature of each request goes in cleartext.
+.TP
+\fB\-\-s3\-region\fR \fIREGION\fR
+The region of the signature of each request to the \%S3 server.
+.IP
+It wins over the \fB\%s3\-region\fR key of the remote, over \fB\%AWS_REGION\fR and \fB\%AWS_DEFAULT_REGION\fR, and over the \fB\%region\fR of the AWS profile. The default is \fB\%us\-east\-1\fR\&. The command refuses this option for an address that is not \fB\%s3://\fR\&.
+.TP
+\fB\-\-s3\-endpoint\fR \fIURL\fR
+The \fB\%http://\fR or \fB\%https://\fR URL of the \%S3 server, with no path.
+.IP
+It wins over the \fB\%s3\-endpoint\fR key of the remote, over \fB\%AWS_ENDPOINT_URL_S3\fR and \fB\%AWS_ENDPOINT_URL\fR, and over the endpoint of the AWS profile. Without each of them, the server is AWS. An \fB\%http://\fR URL needs \%\-\-allow\-cleartext\-credentials. The command refuses this option for an address that is not \fB\%s3://\fR\&.
+.TP
+\fB\-\-s3\-addressing\fR \fISTYLE\fR
+The addressing style of the bucket: \fB\%path\fR or \fB\%virtual\fR\&.
+.IP
+\fB\%path\fR puts the bucket in the path of each request, and \fB\%virtual\fR puts it in the host name. The option wins over the \fB\%s3\-addressing\fR key of the remote and over the \fB\%addressing_style\fR of the AWS profile. The default is \fB\%virtual\fR for AWS and \fB\%path\fR for a set server. A bucket name that holds a \fB\%\&.\fR gets \fB\%path\fR by default. The command refuses this option for an address that is not \fB\%s3://\fR\&. Possible values: path, virtual.
+.TP
+\fB\-\-s3\-profile\fR \fIPROFILE\fR
+The profile of the shared AWS files.
+.IP
+It wins over the \fB\%s3\-profile\fR key of the remote and over \fB\%AWS_PROFILE\fR\&. A profile that this option or the key names skips the key pair, the region, and the endpoint of the environment. The default profile is \fB\%default\fR\&. The command refuses this option for an address that is not \fB\%s3://\fR\&.
+.TP
+\fB\-\-break\-lock\fR
+Remove the writer lock of another writer of a bucket repository.
+.IP
+The push reads the lock, deletes it, and then takes its own lock. It writes the holder of the removed lock to standard error after a push that succeeds. Use it only when the holder is gone, for example after a crash: a writer whose lock is removed stops at its next check. The command refuses this option for an address that is not \fB\%s3://\fR\&.
 .PP
 The global options are listed in \fBostrya\fR(1).
 .SH SEE ALSO

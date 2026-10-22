@@ -900,6 +900,68 @@ session counts into the handle of the caller. The progress bar of the
 `ostrya` command reads the same handle with no change. A progress type of
 its own for the bucket push was rejected for this reason.
 
+A push builds each `.filez` at the `[archive] zlib-level` of the `config`
+of the bucket. The level of the local repository was rejected: two pushes
+of one commit from two repositories then upload other bytes for one
+object, and the bucket has no level of its own. A `.filez` of a local
+`archive` repository still goes up as it is stored, at the level of that
+repository, because a build again costs a deflate of each file. The push of
+commits still refuses a compression. `BucketRepo::init` takes the level as
+an argument, and writes the group `[archive]` with it. With no level, the
+`config` has no `[archive]` group, and a writer takes the level 6, as a
+local repository does.
+
+`BucketRepo::push_tree` writes a local directory to a bucket repository as
+one new commit. It takes `TreePushOptions` of `ostrya-remote` and a new
+`BucketWriteOptions` with `break_lock` and the hidden `part_size`, and it
+gives `BucketPushOutcome` with the new commit in `PushOutcome::commit`. The
+struct is `#[non_exhaustive]`, so a later writer option is additive. Two
+fields in `TreePushOptions` were rejected: the struct is in `ostrya-remote`
+and has no `#[non_exhaustive]`, and a session push has no writer lock.
+
+The bucket has no server, so the client makes the commit, with the commit
+builder of the receive side of a session tree push. The two writers share
+one crate-private function, so the same inputs give the same bytes.
+`ostrya_remote::scan_tree` runs the checks of the options of a session tree
+push and the scan, and gives the model of the tree and the checked fields
+of the commit. It also checks the depth of each metadata value, which a
+session push checks after the session opens. A copy of the checks in
+`ostrya` was rejected: the two writers then refuse different options. The
+size limits of the two writers are different: a session push refuses a
+`Commit` frame over the `max-frame` of the server, 1 MiB for an ostrya
+server, and a bucket push has no frame and refuses a commit object over
+`MAX_METADATA_SIZE`.
+
+The tree push takes the writer lock with the operation `push`. A new
+operation for the tree push was rejected: the operation tells the operator
+which writer holds the lock, and the two pushes make the same kind of
+change. The parent is the tip of the branch that the push reads under the
+lock, so each tree push is a fast-forward. With `orphan` on a branch that
+exists, the new commit replaces the tip with no check. A right of the
+client, as the `d` of a server, was rejected: a bucket has no client
+groups, and the writer of a bucket can write each ref.
+
+A tree push to a bucket refuses tags. A tag of a server commit needs a
+check that the tag is absent and a write of two refs, and the push of
+commits creates no tag either. The anchor ref `ostree-metadata` in
+`refs/heads/` of a bucket with a collection id is refused, as a server
+refuses it.
+
+A tree push signs no commit. A signer in the options was rejected for this
+release: the signing engines are in `ostrya`, and a session tree push signs
+on the server. To sign the commit, a user pulls it into a local
+repository, signs it there, and pushes it with `Repo::push_to_bucket`,
+which then uploads the `.commitmeta` alone. `docs/roadmap.md` records the
+gap.
+
+The tree push reads each file again as a stream, hashes its header and its
+payload, and fails at the end of the payload if the checksum is not the
+checksum of the scan. The bucket client reads one byte past each full part
+before it sends the part, so the last part never goes up, and a failed
+multipart upload is aborted. So a file that changed after the scan leaves
+no object of it in the bucket. A check by a server, as in a session push,
+does not exist for a bucket.
+
 ## The `ostrya` command and bucket repositories
 
 `ostrya-cli` turns on the feature `s3` of `ostrya` in its default set, so
@@ -964,6 +1026,17 @@ A push to a bucket repository shows no progress bar while it lists the
 bucket and walks the commits, because the bar of `push` shows nothing in
 the phase `Scanning`. A bar of its own for the listing was rejected for
 this release.
+
+`ostrya push-tree` takes an `s3://` destination, and calls
+`BucketRepo::push_tree`. It takes the S3 options and `--break-lock`, and
+refuses them for an HTTP or an ssh destination, with the rule and the
+message of `push`. The command prints the new commit, as for a session
+tree push, and the holder of a broken lock on standard error. The timestamp
+of the commit is `--timestamp`, else `SOURCE_DATE_EPOCH`, else the clock of
+the host, which the library reads. `--compress=LEVEL` sets the level of the
+`.filez` objects of the push in place of the level of the bucket.
+`ostrya remote init` takes `--zlib-level LEVEL`, which `clap` checks for 1
+to 9 before any request.
 
 The tests of the S3 options run against the stand-in of
 `crates/ostrya/tests/common/s3.rs`, which keeps the `Authorization` header

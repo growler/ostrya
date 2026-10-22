@@ -474,7 +474,7 @@ enum Command {
     /// 1.
     #[cfg(feature = "push")]
     Push(PushArgs),
-    /// Push a directory over ssh or HTTP, and let the server commit it.
+    /// Push a directory as a new commit to a server or a bucket repository.
     ///
     /// The command walks DIR and sends the objects of its tree that the server
     /// does not have. The server then makes one commit over the tree, moves
@@ -495,8 +495,9 @@ enum Command {
     ///
     /// The command makes its checks before the ssh client starts or the first
     /// HTTP request goes. It resolves REMOTE before it reads --body-file. A
-    /// refusal of the remote thus reads no body file. The command refuses an
-    /// `s3://` push address, because it does not write a bucket repository.
+    /// refusal of the remote thus reads no body file. For an `s3://` push
+    /// address, the command makes the commit itself and writes the bucket
+    /// repository.
     ///
     /// On success, standard output carries the commit checksum alone. Under
     /// --verbose, one statistics line goes to standard error. On a terminal,
@@ -1618,8 +1619,9 @@ enum RemoteCommand {
     /// `mode=archive-z2`, and `collection-id=ID` with --collection-id. A bucket
     /// repository with a collection id is the primary server of that
     /// collection, and a push of the refs of another collection writes them
-    /// under `refs/mirrors/ID/`. The command writes no ref and no summary,
-    /// and prints nothing on success.
+    /// under `refs/mirrors/ID/`. With --zlib-level, the group `[archive]`
+    /// with `zlib-level=LEVEL` follows. The command writes no ref and no
+    /// summary, and prints nothing on success.
     ///
     /// The command takes the writer lock of the bucket repository, writes the
     /// `config` only if the bucket repository holds none, and removes the
@@ -1825,6 +1827,19 @@ struct RemoteInitArgs {
     /// longer than 255 bytes, before any request.
     #[arg(long, value_name = "ID")]
     collection_id: Option<String>,
+    /// Write `[archive] zlib-level=LEVEL`, 1 to 9, into the `config` of the
+    /// bucket repository.
+    ///
+    /// A push builds each `.filez` that it uploads at this level. Without
+    /// this option, the `config` has no `[archive]` group, and a push takes
+    /// the level 6. The command refuses a value outside 1 to 9 before any
+    /// request.
+    #[arg(
+        long,
+        value_name = "LEVEL",
+        value_parser = clap::value_parser!(u8).range(1..=9)
+    )]
+    zlib_level: Option<u8>,
     /// Remove the writer lock of another writer of the bucket repository.
     ///
     /// The command reads the lock, deletes it, and then takes its own lock.
@@ -3591,9 +3606,9 @@ struct PushConnectArgs {
     /// Without this switch, the command refuses a token to such an address
     /// before any request. Use it for a server on a loopback address or behind
     /// a proxy that terminates TLS. No key of the remote sets this switch. The
-    /// command refuses it for an ssh address. For a `push` to an `s3://`
-    /// address, the switch permits an `http://` S3 server, to which the
-    /// signature of each request goes in cleartext.
+    /// command refuses it for an ssh address. For a `push` or a `push-tree`
+    /// to an `s3://` address, the switch permits an `http://` S3 server, to
+    /// which the signature of each request goes in cleartext.
     #[arg(long)]
     allow_cleartext_credentials: bool,
 }
@@ -3613,6 +3628,13 @@ struct PushTreeArgs {
     /// rule refuses, which includes a name with `^`, and a name of 64
     /// lowercase hex characters, because a revision reads such a name as a
     /// commit checksum.
+    ///
+    /// To a bucket repository, the push makes the commit itself, as the
+    /// server makes it. The parent is the commit of BRANCH in the bucket,
+    /// which the push reads under the writer lock, or none if BRANCH is
+    /// absent. The push then writes the ref file of BRANCH. In a bucket
+    /// repository with a collection id, the push refuses the BRANCH
+    /// `ostree-metadata` in `refs/heads/`. The push signs no commit.
     #[arg(long, value_name = "BRANCH")]
     onto: Option<String>,
     /// Create the ref NAME on the server at the new commit.
@@ -3621,7 +3643,7 @@ struct PushTreeArgs {
     /// commit holds NAME. A tag that exists on the server gets ref-mismatch
     /// before the push sends an object. NAME passes the rules of BRANCH, is
     /// not BRANCH, and occurs once. The client group needs `t` or `w` on
-    /// NAME.
+    /// NAME. A push to a bucket repository refuses this option.
     #[arg(long = "tag", value_name = "NAME")]
     tags: Vec<String>,
     /// Bind the commit to NAME, and create no ref.
@@ -3634,7 +3656,8 @@ struct PushTreeArgs {
     /// Make a commit with no parent.
     ///
     /// If BRANCH exists on the server, the client group needs `c` and `d` on
-    /// it, else the server answers non-fast-forward.
+    /// it, else the server answers non-fast-forward. In a bucket repository,
+    /// the new commit replaces the commit of BRANCH with no check.
     #[arg(long)]
     orphan: bool,
     /// Write the refs of the collection ID on the server.
@@ -3646,6 +3669,11 @@ struct PushTreeArgs {
     /// and the binding is the collection id of the server, if it has one.
     /// The command refuses an ID that fails the collection-id rule or is
     /// longer than 255 bytes before it starts the transport.
+    ///
+    /// To a bucket repository, the `config` of the bucket takes the role of
+    /// the server: the collection id of the bucket, or no ID, writes
+    /// `refs/heads/BRANCH`, and each other ID writes
+    /// `refs/mirrors/ID/BRANCH`, also in a bucket with no collection id.
     #[arg(long, value_name = "ID")]
     collection: Option<String>,
     /// The commit subject.
@@ -3684,8 +3712,9 @@ struct PushTreeArgs {
     /// UTC offset (`2020-01-02T03:04:05Z`). Without this option, the push
     /// sends the `SOURCE_DATE_EPOCH` environment variable. If that variable is
     /// not set, the push sends no timestamp, and the server takes its own
-    /// clock. The command refuses a `SOURCE_DATE_EPOCH` that is not a count
-    /// of seconds.
+    /// clock. A push to a bucket repository then takes the clock of this
+    /// host. The command refuses a `SOURCE_DATE_EPOCH` that is not a count of
+    /// seconds.
     #[arg(long, value_name = "TIMESTAMP")]
     timestamp: Option<String>,
     /// Set the user id of the owner of the committed files.
@@ -3711,6 +3740,10 @@ struct PushTreeArgs {
     ///
     /// The value needs the `=` form, and --compress alone gives level 6.
     /// Without this option, the push sends the content objects raw.
+    ///
+    /// A push to a bucket repository uploads each file as a `.filez`. It
+    /// builds the `.filez` at LEVEL, else at the `[archive] zlib-level` of
+    /// the `config` of the bucket, else at level 6.
     #[arg(
         long,
         value_name = "LEVEL",
@@ -3722,13 +3755,32 @@ struct PushTreeArgs {
     compress: Option<u8>,
     #[command(flatten)]
     connect: PushConnectArgs,
-    /// The remote: a remote name or an ssh or HTTP address. Required.
+    #[cfg(feature = "s3")]
+    #[command(flatten)]
+    s3: S3Args,
+    /// Remove the writer lock of another writer of a bucket repository.
     ///
-    /// A value with a `:` or a `/` is an address: an ssh, `http://`, or
-    /// `https://` address. An address opens no repository, and the command
-    /// ignores --repo for it. Each other value names a `[remote "<name>"]`
-    /// section with a push address. The section is in the config of the
-    /// repository that --repo, the current directory, or `OSTREE_REPO` names.
+    /// The push reads the lock, deletes it, and then takes its own lock. It
+    /// writes the holder of the removed lock to standard error after a push
+    /// that succeeds. Use it only when the holder is gone, for example after
+    /// a crash: a writer whose lock is removed stops at its next check. The
+    /// command refuses this option for an address that is not `s3://`.
+    #[cfg(feature = "s3")]
+    #[arg(long)]
+    break_lock: bool,
+    /// The remote: a remote name, or an ssh, HTTP, or `s3://` address.
+    /// Required.
+    ///
+    /// A value with a `:` or a `/` is an address: an ssh, `http://`,
+    /// `https://`, or `s3://BUCKET[/PREFIX]` address. An address opens no
+    /// repository, and the command ignores --repo for it. Each other value
+    /// names a `[remote "<name>"]` section with a push address. The section
+    /// is in the config of the repository that --repo, the current directory,
+    /// or `OSTREE_REPO` names.
+    ///
+    /// To an `s3://` address, the push writes the bucket repository at that
+    /// address, which `remote init` created. A build without the feature
+    /// `s3` refuses an `s3://` address.
     remote: Option<String>,
     /// The directory to commit. Required.
     dir: Option<PathBuf>,
@@ -4582,10 +4634,13 @@ fn connect_overrides(args: PushConnectArgs) -> ostrya::endpoint::EndpointOverrid
 }
 
 /// Pushes the directory DIR to a remote over ssh or HTTP, and asks the server
-/// to commit it onto the branch of `--onto`.
+/// to commit it onto the branch of `--onto`, or pushes it to a bucket
+/// repository as a new commit.
 ///
 /// The server moves the branch to the new commit and creates each tag at it
-/// in one transaction.
+/// in one transaction. A push to a bucket repository goes through
+/// `BucketRepo::push_tree`, and a writer lock that `--break-lock` removed
+/// gives one warning line on standard error.
 ///
 /// # Check order
 ///
@@ -4595,11 +4650,13 @@ fn connect_overrides(args: PushConnectArgs) -> ostrya::endpoint::EndpointOverrid
 /// 3. The command checks the other options that it reads itself, before a
 ///    repository opens. The body file is not in this step. The timestamp is
 ///    `--timestamp`, else `SOURCE_DATE_EPOCH`, else none.
-/// 4. The command refuses a push address that is an `s3://` address. It
-///    resolves the remote. It refuses an option of the other transport and
-///    the bad HTTP options. It reads the token file of an HTTP push, and the
-///    TLS files of an `https://` push.
-/// 5. The command makes the transport ready.
+/// 4. The command refuses the S3 options and `--break-lock` for a push
+///    address that is not an `s3://` address. It resolves the remote. It
+///    refuses an option of the other transport and the bad HTTP options. It
+///    reads the token file of an HTTP push, and the TLS files of an
+///    `https://` push.
+/// 5. The command makes the transport ready, or builds the client of the
+///    bucket repository.
 /// 6. The command reads the body file.
 ///
 /// The push refuses the other bad names and options before the scan. All of
@@ -4663,22 +4720,32 @@ async fn push_tree(
     };
     // The transport is made ready before the body file is read. A refusal of
     // the remote or of its options then reads no body file.
-    let overrides = connect_overrides(args.connect);
+    #[cfg(feature = "s3")]
+    let s3_set = args
+        .s3
+        .first_set()
+        .or(args.break_lock.then_some("--break-lock"));
+    #[cfg_attr(not(feature = "s3"), allow(unused_mut))]
+    let mut overrides = connect_overrides(args.connect);
+    #[cfg(feature = "s3")]
+    args.s3.apply(&mut overrides);
     let endpoint = if ostrya::is_push_address(remote) {
         #[cfg(feature = "s3")]
-        if remote.starts_with("s3://") {
-            refuse_bucket_tree_push(remote);
-        }
+        refuse_s3_options(remote, Some(remote.starts_with("s3://")), &s3_set);
         ostrya::endpoint::resolve_push(None, remote, overrides).await?
     } else {
         let (repo, _) = resolve_repo(repo, verbose, name).await;
         #[cfg(feature = "s3")]
-        if push_destination_is_s3(&repo, remote) == Some(true) {
-            refuse_bucket_tree_push(remote);
-        }
+        refuse_s3_options(remote, push_destination_is_s3(&repo, remote), &s3_set);
         ostrya::endpoint::resolve_push(Some(repo.config()), remote, overrides).await?
     };
-    let transport = ostrya::remote::PushSession::prepare(endpoint).await?;
+    let target = match endpoint {
+        #[cfg(feature = "s3")]
+        ostrya::remote::Endpoint::S3(s3) => {
+            TreeTarget::Bucket(ostrya::bucket::BucketRepo::open(&s3).await?)
+        }
+        endpoint => TreeTarget::Session(ostrya::remote::PushSession::prepare(endpoint).await?),
+    };
     // The body file can be large, so it is read after the other checks.
     let body = match args.body_file.as_deref() {
         Some(path) => Some(refuse!(read_body_file(path))),
@@ -4700,24 +4767,60 @@ async fn push_tree(
         hash_jobs: None,
         progress,
     };
-    let pushed = ostrya::remote::push_tree_prepared(transport, dir, opts).await;
-    // The bar is cleared before any line of the result or of the error.
-    bar.finish();
-    print_server_commit(verbose, pushed?)
+    let outcome = match target {
+        #[cfg(feature = "s3")]
+        TreeTarget::Bucket(bucket) => {
+            let write = {
+                let mut write = ostrya::bucket::BucketWriteOptions::default();
+                write.break_lock = args.break_lock;
+                write
+            };
+            let pushed = bucket.push_tree(dir, opts, write).await;
+            // The bar is cleared before any line of the result or of the
+            // error.
+            bar.finish();
+            let pushed = pushed?;
+            if let Some(holder) = &pushed.broken_lock {
+                eprintln!("warning: removed the writer lock of {holder}");
+            }
+            pushed.outcome
+        }
+        TreeTarget::Session(transport) => {
+            let pushed = ostrya::remote::push_tree_prepared(transport, dir, opts).await;
+            // The bar is cleared before any line of the result or of the
+            // error.
+            bar.finish();
+            pushed?
+        }
+    };
+    print_server_commit(verbose, outcome)
 }
 
-/// Exits with the refusal of `push-tree` to the bucket repository of
-/// `remote`, a remote name or an `s3://` address.
+/// The destination of `push-tree`: a transport that is ready, or a bucket
+/// repository.
+#[cfg(feature = "push")]
+enum TreeTarget {
+    Session(ostrya::remote::PreparedSession),
+    #[cfg(feature = "s3")]
+    Bucket(ostrya::bucket::BucketRepo),
+}
+
+/// Exits with the refusal of the first option of `set` when the push address
+/// of `remote` is not an `s3://` address.
 ///
-/// The refusal comes before the resolve of the remote, so the command reads
-/// no AWS variable and no AWS file.
+/// `s3` is `Some(true)` for an `s3://` push address, `Some(false)` for
+/// another address, and `None` if the command cannot tell. For `None`, the
+/// resolver states its refusal.
 #[cfg(all(feature = "push", feature = "s3"))]
-fn refuse_bucket_tree_push(remote: &str) -> ! {
-    exit_error(&format!(
-        "push-tree does not write a bucket repository, and the push address of '{}' is an \
-         s3:// address",
-        ostrya::remote::without_userinfo(remote)
-    ))
+fn refuse_s3_options(remote: &str, s3: Option<bool>, set: &Option<&'static str>) {
+    if s3 == Some(false)
+        && let Some(option) = set
+    {
+        exit_error(&format!(
+            "{option} applies to an s3:// address, and the push address of '{}' is not one",
+            ostrya::remote::without_userinfo(remote)
+        ));
+    }
 }
 
 /// Returns the entry filter of the owner and permission options of `push-tree`.
@@ -11076,7 +11179,11 @@ async fn remote_init(repo: Option<&Repo>, nested: &str, args: RemoteInitArgs) ->
         ostrya::endpoint::resolve_bucket(config, target, args.s3.into_overrides()).await?;
     let bucket = ostrya::bucket::BucketRepo::open(&endpoint).await?;
     let broken = bucket
-        .init(args.collection_id.as_deref(), args.break_lock)
+        .init(
+            args.collection_id.as_deref(),
+            args.zlib_level,
+            args.break_lock,
+        )
         .await?;
     if let Some(holder) = broken {
         eprintln!("warning: removed the writer lock of {holder}");

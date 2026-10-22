@@ -16,7 +16,8 @@ the `push` feature, `Repo::push` sends commits to a remote, and `Repo::push_onto
 asks a remote to commit the tree of a local commit. With the `receive` feature,
 the `receive` module takes a push on the server side. With the `push` and `s3`
 features, `Repo::push_to_bucket` writes commits to a bucket repository in an S3
-bucket, and `BucketRepo::init` creates one.
+bucket, `BucketRepo::push_tree` writes a local directory to one as a new commit,
+and `BucketRepo::init` creates one.
 
 API documentation: <https://docs.rs/ostrya>
 
@@ -69,8 +70,8 @@ API documentation: <https://docs.rs/ostrya>
 - `push`: `Repo::push`, `Repo::push_onto`, and `Repo::export_stream`, the push
   from a repository.
 - `s3`: the pull from a bucket repository at an `s3://` address, the `bucket`
-  module, the `s3` module of `ostrya-remote`, and with `push`, the push to a
-  bucket repository.
+  module, the `s3` module of `ostrya-remote`, and with `push`, the push of
+  commits and of a local directory to a bucket repository.
 - `lzma-static`: xz built from source and linked statically, with no runtime
   liblzma.
 

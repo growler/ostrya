@@ -289,6 +289,80 @@ where
     push.run(session, model).await
 }
 
+/// A tree that [`scan_tree`] walked and hashed, with the checked inputs of
+/// its commit.
+///
+/// A writer that makes the commit itself takes this value in place of a
+/// session. An example is the push of a tree to a bucket repository in the
+/// `ostrya` crate.
+#[non_exhaustive]
+pub struct ScannedTree {
+    /// The model of the tree, which is the source of its objects.
+    pub model: TreeModel,
+    /// The commit that the options describe.
+    ///
+    /// The root dirtree and the root dirmeta are those of
+    /// [`model`](ScannedTree::model). The metadata entries are the bytes of
+    /// each value as a `v` in normal form, in the order of the options. A
+    /// commit can hold each value.
+    pub commit: ServerCommit,
+    /// The collection id of the namespace that the push writes, from
+    /// [`TreePushOptions::collection`].
+    pub collection: Option<String>,
+    /// The encoding of the content objects, from
+    /// [`TreePushOptions::compression`].
+    pub compression: Compression,
+    /// The progress handle, from [`TreePushOptions::progress`].
+    pub progress: Option<PushProgress>,
+}
+
+/// Checks `opts` and scans the directory `root`, with no transport.
+///
+/// The call refuses each value that [`push_tree_over_stream`] refuses before
+/// its scan, as its [Refusals](push_tree_over_stream#refusals) state. It also
+/// refuses a metadata value that a commit cannot hold, which a session push
+/// refuses after the session opens. It does not check the `max-frame` of a
+/// server, which limits the `Commit` frame of a session push. The writer
+/// applies its own size limit to the commit. Then it walks and hashes the
+/// tree with [`TreeModel::scan`], with `entry_filter` and `hash_jobs`, and
+/// sets the phases of the scan in the progress handle. The call sends nothing
+/// and writes nothing.
+///
+/// # Errors
+///
+/// - [`Error::InvalidInput`] for each value of
+///   [Refusals](push_tree_over_stream#refusals), and if `hash_jobs` is
+///   `Some(0)`.
+/// - [`Error::InvalidInput`] if a commit cannot hold a value of `metadata`.
+///   In a commit, a value can hold two levels of containers fewer than a
+///   variant.
+/// - [`Error::Walk`] if the walk or the hash pass fails. [`TreeModel::scan`]
+///   gives the `io::ErrorKind` of each case.
+///
+/// [`Error::InvalidInput`]: crate::Error::InvalidInput
+/// [`Error::Walk`]: crate::Error::Walk
+pub async fn scan_tree(root: &Path, opts: TreePushOptions) -> Result<ScannedTree> {
+    let (scan, push) = Prepared::new(opts)?;
+    crate::proto::check_server_commit_metadata(&push.commit)?;
+    let model = push.scan(root, scan).await?;
+    let Prepared {
+        mut commit,
+        collection,
+        compression,
+        progress,
+        ..
+    } = push;
+    commit.root_dirtree = model.root_dirtree();
+    commit.root_dirmeta = model.root_dirmeta();
+    Ok(ScannedTree {
+        model,
+        commit,
+        collection,
+        compression,
+        progress,
+    })
+}
+
 /// The checked options of a tree push, without the options of the scan.
 struct Prepared {
     /// The refs of `Hello`: the branch, then each tag.
@@ -731,6 +805,53 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    /// `scan_tree` refuses a metadata value that a commit cannot hold before
+    /// the walk, and gives the commit the root checksums of the model.
+    #[test]
+    fn scan_tree_checks_the_depth_and_fills_the_roots() {
+        let root =
+            std::env::temp_dir().join(format!("ostrya-remote-scan-tree-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("dir")).unwrap();
+        std::fs::write(root.join("dir/file"), b"file").unwrap();
+        let deep = (0..126).fold(Value::Byte(1), |value, _| {
+            Value::Maybe(Some(Box::new(value)))
+        });
+        let ty = (0..126).fold(Type::Byte, |ty, _| Type::maybe(ty));
+        let absent = root.join("absent");
+        // The walk root is absent, so a refusal shows that the check runs
+        // before the walk.
+        match ostrya_rt::block_on(scan_tree(
+            &absent,
+            TreePushOptions {
+                metadata: vec![("deep".into(), Value::variant(ty, deep))],
+                ..onto("main")
+            },
+        )) {
+            Err(Error::InvalidInput(m)) => assert!(m.contains("cannot hold"), "{m}"),
+            other => panic!("{:?}", other.map(|_| ())),
+        }
+        let scanned = ostrya_rt::block_on(scan_tree(
+            &root,
+            TreePushOptions {
+                collection: Some("org.example.A".into()),
+                compression: Compression::Deflate { level: 3 },
+                ..onto("main")
+            },
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let scanned = scanned.unwrap();
+        assert_eq!(scanned.commit.root_dirtree, scanned.model.root_dirtree());
+        assert_eq!(scanned.commit.root_dirmeta, scanned.model.root_dirmeta());
+        assert_eq!(scanned.commit.branch, "main");
+        assert_eq!(scanned.commit.timestamp, Some(1));
+        assert_eq!(scanned.collection.as_deref(), Some("org.example.A"));
+        assert_eq!(scanned.compression, Compression::Deflate { level: 3 });
+        // Two dirtrees, one dirmeta that the two directories share, and the
+        // file.
+        assert_eq!(scanned.model.object_names().len(), 4);
     }
 
     #[test]

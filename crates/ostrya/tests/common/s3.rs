@@ -205,8 +205,13 @@ impl Seaweed {
     /// `bucket`.
     ///
     /// The harness picks free ports, and picks new ones if the server ends
-    /// before it is ready, at most three times.
+    /// before it is ready, at most three times. One start at a time runs in
+    /// the process, from the pick of the ports until the server is ready. A
+    /// port that the harness picks is free again until the server binds it,
+    /// so two starts at the same time can pick the same port.
     pub fn start(scratch: &Path, bucket: &str) -> Seaweed {
+        static STARTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _start = STARTS.lock().unwrap_or_else(|e| e.into_inner());
         let config = scratch.join("weed-s3.json");
         std::fs::write(
             &config,

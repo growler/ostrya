@@ -137,7 +137,7 @@ With it, the push does not use the trust store of the host. It wins over the \fB
 \fB\-\-allow\-cleartext\-credentials\fR
 Send the token to an \fB\%http://\fR address.
 .IP
-Without this switch, the command refuses a token to such an address before any request. Use it for a server on a loopback address or behind a proxy that terminates TLS. No key of the remote sets this switch. The command refuses it for an ssh address. For a \fB\%push\fR to an \fB\%s3://\fR address, the switch permits an \fB\%http://\fR \%S3 server, to which the signature of each request goes in cleartext.
+Without this switch, the command refuses a token to such an address before any request. Use it for a server on a loopback address or behind a proxy that terminates TLS. No key of the remote sets this switch. The command refuses it for an ssh address. For a \fB\%push\fR or a \fB\%push\-tree\fR to an \fB\%s3://\fR address, the switch permits an \fB\%http://\fR \%S3 server, to which the signature of each request goes in cleartext.
 .TP
 \fB\-\-s3\-region\fR \fIREGION\fR
 The region of the signature of each request to the \%S3 server.

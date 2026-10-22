@@ -61,7 +61,7 @@ const DEAD_LOCK: &str = "[lock]\nid=99999999999999999999999999999999999999999999
 /// server at `url`, with the collection id `id`.
 async fn init(url: &str, id: Option<&str>) {
     let repo = BucketRepo::open(&endpoint(url, ADDRESS)).await.unwrap();
-    assert_eq!(repo.init(id, false).await.unwrap(), None);
+    assert_eq!(repo.init(id, None, false).await.unwrap(), None);
 }
 
 /// Returns the options of a push of `refspecs`.
@@ -332,7 +332,7 @@ fn a_second_init_is_refused_and_keeps_the_config() {
             .await
             .unwrap();
         for id in [None, Some(B)] {
-            match repo.init(id, false).await {
+            match repo.init(id, None, false).await {
                 Err(Error::InvalidInput(message)) => {
                     assert!(message.contains("holds a config already"), "{message}");
                     assert!(message.contains(ADDRESS), "{message}");
@@ -361,7 +361,7 @@ fn init_refuses_an_invalid_collection_id_before_a_request() {
         for id in ["", "nodot", long.as_str()] {
             assert!(
                 matches!(
-                    repo.init(Some(id), false).await,
+                    repo.init(Some(id), None, false).await,
                     Err(Error::InvalidInput(_))
                 ),
                 "{id}"
@@ -380,10 +380,10 @@ fn init_breaks_the_lock_of_a_killed_writer() {
             .await
             .unwrap();
         assert!(matches!(
-            repo.init(None, false).await,
+            repo.init(None, None, false).await,
             Err(Error::BucketLocked { .. })
         ));
-        let broken = repo.init(None, true).await.unwrap().unwrap();
+        let broken = repo.init(None, None, true).await.unwrap().unwrap();
         assert_eq!(broken.host.as_deref(), Some("deadhost"));
         assert!(server.state().objects.contains_key(CONFIG));
     });
@@ -399,9 +399,9 @@ fn init_on_seaweedfs() {
     block_on(async {
         let s3 = endpoint(&server.endpoint(), ADDRESS);
         let repo = BucketRepo::open(&s3).await.unwrap();
-        assert_eq!(repo.init(Some(A), false).await.unwrap(), None);
+        assert_eq!(repo.init(Some(A), None, false).await.unwrap(), None);
         assert!(matches!(
-            repo.init(None, false).await,
+            repo.init(None, None, false).await,
             Err(Error::InvalidInput(_))
         ));
         let config = repo.bucket().get("config", 4096).await.unwrap().unwrap();
@@ -426,7 +426,7 @@ fn init_on_rclone_is_refused() {
         let repo = BucketRepo::open(&endpoint(&server.endpoint(), ADDRESS))
             .await
             .unwrap();
-        let err = repo.init(None, false).await.unwrap_err();
+        let err = repo.init(None, None, false).await.unwrap_err();
         assert!(matches!(err, Error::BucketNoExclusion { .. }), "{err}");
     });
     assert!(!root.join("bkt/repo/config").exists());
@@ -499,6 +499,67 @@ fn a_push_of_an_archive_repository_keeps_the_stored_filez_bytes() {
             let local = std::fs::read(path.join(object_path(ObjectType::File, &file))).unwrap();
             assert_eq!(state.objects[&key(ObjectType::File, &file)].bytes, local);
         }
+    });
+}
+
+/// The stored `.filez` of an `archive` repository goes up as it is, at the
+/// level of the repository, also when the `config` of the bucket names
+/// another level. A push from a `bare-user` repository builds each `.filez`
+/// at the level of the bucket, which gives other bytes.
+#[test]
+fn a_push_of_an_archive_repository_keeps_its_level_over_the_level_of_the_bucket() {
+    let scratch = TmpDir::new("push-s3-filez-level");
+    let src = build_tree(scratch.path());
+    let text: Vec<u8> = (0..20_000u32)
+        .flat_map(|i| format!("line {} of a text file\n", i % 977).into_bytes())
+        .collect();
+    std::fs::write(src.join("text"), text).unwrap();
+    block_on(async {
+        let path = scratch.path().join("archive-level-1");
+        drop(
+            Repo::create(&path, CreateOptions::new(RepoMode::Archive))
+                .await
+                .unwrap(),
+        );
+        let config = path.join("config");
+        let mut config_text = std::fs::read_to_string(&config).unwrap();
+        config_text.push_str("\n[archive]\nzlib-level=1\n");
+        std::fs::write(&config, config_text).unwrap();
+        let repo = Repo::open(&path).await.unwrap();
+        let tip = common::modes::commit(&repo, &src).await;
+        let (_, built_repo, built_tip) = repo_of(scratch.path(), RepoMode::BareUser, &src).await;
+        assert_eq!(built_tip, tip);
+
+        let stored = StandIn::start();
+        let built = StandIn::start();
+        for server in [&stored, &built] {
+            let bucket = BucketRepo::open(&endpoint(&server.endpoint(), ADDRESS))
+                .await
+                .unwrap();
+            assert_eq!(bucket.init(None, Some(9), false).await.unwrap(), None);
+        }
+        push(&repo, &stored.endpoint(), opts(&["main"]))
+            .await
+            .unwrap();
+        push(&built_repo, &built.endpoint(), opts(&["main"]))
+            .await
+            .unwrap();
+
+        let files = common::modes::file_objects(&repo, &tip).await;
+        assert!(!files.is_empty());
+        let (stored, built) = (stored.state(), built.state());
+        let mut rebuilt = 0;
+        for file in files {
+            let local = std::fs::read(path.join(object_path(ObjectType::File, &file))).unwrap();
+            let file_key = key(ObjectType::File, &file);
+            assert_eq!(stored.objects[&file_key].bytes, local, "{file}");
+            if built.objects[&file_key].bytes != local {
+                rebuilt += 1;
+            }
+        }
+        // The level of the bucket gives other bytes for a file that DEFLATE
+        // shrinks.
+        assert!(rebuilt > 0);
     });
 }
 

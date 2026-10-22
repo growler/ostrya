@@ -118,6 +118,12 @@ for it.
 - The archive view serves `deltas/` in the `archive` mode alone. Outside
   that mode, the summary of an auth item and the ref listing name no static
   delta.
+- A signed tree push to a bucket repository. `BucketRepo::push_tree` and
+  `ostrya push-tree` to an `s3://` address sign no commit. A user pulls the
+  commit into a local repository, signs it there, and pushes it with
+  `Repo::push_to_bucket` or `ostrya push`, which then uploads the
+  `.commitmeta` alone. A signer in the options of the tree push, as the
+  signing options of `commit`, closes the gap.
 
 ## Open decisions
 

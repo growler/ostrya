@@ -13,9 +13,10 @@
 //! the writer lock, with `If-None-Match: *`. The `config` holds the group
 //! `[core]` with `repo_version=1` and `mode=archive-z2`, and
 //! `collection-id=ID` when the caller gives an id. A bucket repository with
-//! a collection id is the primary server of that collection. The init
-//! refuses a bucket that holds a `config`, so the collection id of a bucket
-//! repository never changes. A push needs the `config`.
+//! a collection id is the primary server of that collection. When the caller
+//! gives a zlib level, the group `[archive]` with `zlib-level=LEVEL` follows.
+//! The init refuses a bucket that holds a `config`, so the collection id of a
+//! bucket repository never changes. A push needs the `config`.
 //!
 //! # The push
 //!
@@ -27,8 +28,17 @@
 //! a push walks no tree of a commit that the bucket holds. The refs of the
 //! collection id of the bucket, or of a push with no collection, are under
 //! `refs/heads/`. The refs of each other collection are under
-//! `refs/mirrors/ID/`.
-//! `Repo::push_to_bucket` states the steps, the namespaces, and the failure
+//! `refs/mirrors/ID/`. A push builds each `.filez` that it uploads at the
+//! `[archive] zlib-level` of the `config` of the bucket, 6 if the `config`
+//! has none, clamped to 1 to 9.
+//!
+//! With the `push` feature, two writers push:
+//!
+//! - `Repo::push_to_bucket` writes the commits of a local repository.
+//! - `BucketRepo::push_tree` writes a local directory as a new commit, which
+//!   it makes on the client as the receive side of a tree push makes it.
+//!
+//! Each of the two states its steps, its namespaces, and its failure
 //! states.
 //!
 //! # The writer lock
@@ -124,15 +134,17 @@ pub(crate) use state::check_prefixes;
 #[cfg(test)]
 pub(crate) use state::{BucketRefs, summary_refs};
 
-/// The result of `Repo::push_to_bucket`, the push to a bucket repository.
+/// The result of a push to a bucket repository: `Repo::push_to_bucket` or
+/// `BucketRepo::push_tree`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct BucketPushOutcome {
     /// The ref outcomes and the statistics of the push.
     ///
-    /// Each ref outcome names the destination of its refspec. The namespace
-    /// of the push decides its key: `refs/heads/DST` or
-    /// `refs/mirrors/ID/DST`. The commit is `None`.
+    /// Each ref outcome names the destination of its refspec, or the branch
+    /// of a tree push. The namespace of the push decides its key:
+    /// `refs/heads/DST` or `refs/mirrors/ID/DST`. The commit is `None` for
+    /// `Repo::push_to_bucket`, and the new commit for `BucketRepo::push_tree`.
     pub outcome: PushOutcome,
     /// The holder of the lock that the break of the lock deleted, or `None`
     /// if the push deleted no lock.
@@ -142,6 +154,24 @@ pub struct BucketPushOutcome {
     /// is not in it. [`BucketRepo::lock_holder`] reads the holder before the
     /// push.
     pub broken_lock: Option<LockHolder>,
+}
+
+/// The options of a writer of a bucket repository other than its own
+/// inputs.
+///
+/// `BucketRepo::push_tree` takes them. A caller sets the fields of
+/// [`default`](Default::default), because the struct is
+/// `#[non_exhaustive]`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub struct BucketWriteOptions {
+    /// Remove the writer lock of another writer before the writer takes its
+    /// own, as [`BucketRepo::lock`] states.
+    pub break_lock: bool,
+    /// The part size of a multipart upload, at least 5 MiB, or `None` for
+    /// the rule of [`part_size`](crate::remote::s3::part_size). For tests.
+    #[doc(hidden)]
+    pub part_size: Option<u64>,
 }
 
 /// A bucket repository: a repository in `archive` form in an S3 bucket.
@@ -264,7 +294,10 @@ impl BucketRepo {
     /// holds the group `[core]` with `repo_version=1` and `mode=archive-z2`,
     /// each on one line, and `collection-id=ID` after them when
     /// `collection_id` is `Some`. The bucket repository is then the primary
-    /// server of that collection. The init writes no summary and no ref.
+    /// server of that collection. When `zlib_level` is `Some`, an empty line
+    /// and the group `[archive]` with `zlib-level=LEVEL` follow. Without it,
+    /// the `config` has no `[archive]` group, and a writer takes the level 6.
+    /// The init writes no summary and no ref.
     ///
     /// With `break_lock`, the call removes the writer lock of another writer
     /// first, as [`lock`](BucketRepo::lock) states. It returns the holder of
@@ -283,7 +316,8 @@ impl BucketRepo {
     ///
     /// - [`Error::InvalidInput`](crate::Error::InvalidInput) if
     ///   `collection_id` fails [`is_collection_id`](crate::is_collection_id)
-    ///   or is longer than 255 bytes. The call then sends no request.
+    ///   or is longer than 255 bytes, or if `zlib_level` is outside 1 to 9.
+    ///   The call then sends no request.
     /// - [`Error::InvalidInput`](crate::Error::InvalidInput) if the bucket
     ///   holds a `config`. The call leaves it unchanged, so the collection id
     ///   of a bucket repository never changes.
@@ -295,6 +329,7 @@ impl BucketRepo {
     pub async fn init(
         &self,
         collection_id: Option<&str>,
+        zlib_level: Option<u8>,
         break_lock: bool,
     ) -> Result<Option<LockHolder>> {
         if let Some(id) = collection_id
@@ -306,11 +341,18 @@ impl BucketRepo {
                 id.escape_debug()
             )));
         }
+        if let Some(level) = zlib_level
+            && !(1..=9).contains(&level)
+        {
+            return Err(crate::Error::InvalidInput(format!(
+                "the zlib level {level} of a bucket repository is outside 1 to 9"
+            )));
+        }
         let lock = self.lock(LockOperation::Init, break_lock).await?;
         let broken = lock.broken().cloned();
         let present = match self
             .bucket
-            .put_if_absent("config", config_bytes(collection_id))
+            .put_if_absent("config", config_bytes(collection_id, zlib_level))
             .await
         {
             Ok(PutIfAbsent::Created { .. })
@@ -358,11 +400,14 @@ impl BucketRepo {
 }
 
 /// Returns the bytes of the `config` of a new bucket repository, with the
-/// collection id `collection_id`.
-fn config_bytes(collection_id: Option<&str>) -> Vec<u8> {
+/// collection id `collection_id` and the zlib level `zlib_level`.
+fn config_bytes(collection_id: Option<&str>, zlib_level: Option<u8>) -> Vec<u8> {
     let mut text = String::from("[core]\nrepo_version=1\nmode=archive-z2\n");
     if let Some(id) = collection_id {
         text.push_str(&format!("collection-id={id}\n"));
+    }
+    if let Some(level) = zlib_level {
+        text.push_str(&format!("\n[archive]\nzlib-level={level}\n"));
     }
     text.into_bytes()
 }
@@ -381,6 +426,7 @@ const _: fn() = || {
     assert_send_sync::<LockOperation>();
     assert_send_sync::<ObjectListing>();
     assert_send_sync::<BucketPushOutcome>();
+    assert_send_sync::<BucketWriteOptions>();
 };
 
 #[cfg(test)]
@@ -390,18 +436,37 @@ mod tests {
     #[test]
     fn the_config_of_a_new_bucket_repository_has_three_or_four_lines() {
         assert_eq!(
-            config_bytes(None),
+            config_bytes(None, None),
             b"[core]\nrepo_version=1\nmode=archive-z2\n"
         );
         assert_eq!(
-            config_bytes(Some("org.example.Os")),
+            config_bytes(Some("org.example.Os"), None),
             b"[core]\nrepo_version=1\nmode=archive-z2\ncollection-id=org.example.Os\n"
         );
         let config = crate::config::RepoConfig::parse(
-            std::str::from_utf8(&config_bytes(Some("org.example.Os"))).unwrap(),
+            std::str::from_utf8(&config_bytes(Some("org.example.Os"), None)).unwrap(),
         )
         .unwrap();
         assert_eq!(config.mode(), ostrya_core::RepoMode::Archive);
         assert_eq!(config.collection_id(), Some("org.example.Os"));
+        assert_eq!(config.zlib_level().unwrap(), 6);
+    }
+
+    #[test]
+    fn a_zlib_level_adds_the_archive_group() {
+        let bytes = config_bytes(Some("org.example.Os"), Some(9));
+        assert_eq!(
+            bytes,
+            b"[core]\nrepo_version=1\nmode=archive-z2\ncollection-id=org.example.Os\n\n\
+              [archive]\nzlib-level=9\n"
+        );
+        let config =
+            crate::config::RepoConfig::parse(std::str::from_utf8(&bytes).unwrap()).unwrap();
+        assert_eq!(config.zlib_level().unwrap(), 9);
+        assert_eq!(config.collection_id(), Some("org.example.Os"));
+        assert_eq!(
+            config_bytes(None, Some(1)),
+            b"[core]\nrepo_version=1\nmode=archive-z2\n\n[archive]\nzlib-level=1\n"
+        );
     }
 }

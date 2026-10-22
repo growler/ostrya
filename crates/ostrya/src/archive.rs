@@ -140,6 +140,9 @@ pub struct ArchiveView {
     /// One permit, held by the request that reads a changed `config`.
     refresh: Arc<Gate>,
     compressors: Arc<Compressors>,
+    /// The DEFLATE level of each built `.filez`, or `None` for the
+    /// `[archive] zlib-level` of `config`.
+    level: Option<u8>,
     /// How many times the view read `config`, for the tests of the reuse.
     #[cfg(test)]
     config_reads: std::sync::atomic::AtomicUsize,
@@ -241,6 +244,7 @@ impl ArchiveView {
             repo,
             config: Mutex::new(None),
             refresh: Arc::new(Gate::new(1)),
+            level: None,
             #[cfg(test)]
             config_reads: std::sync::atomic::AtomicUsize::new(0),
             compressors: Arc::new(Compressors {
@@ -249,6 +253,17 @@ impl ArchiveView {
                 #[cfg(test)]
                 leases: std::sync::atomic::AtomicUsize::new(0),
             }),
+        }
+    }
+
+    /// Creates the view over `repo` that builds each `.filez` at the DEFLATE
+    /// level `level`, 1 to 9, in place of the `[archive] zlib-level` of the
+    /// repository.
+    #[cfg(all(feature = "push", feature = "s3"))]
+    pub(crate) fn with_zlib_level(repo: Repo, level: u8) -> ArchiveView {
+        ArchiveView {
+            level: Some(level),
+            ..ArchiveView::new(repo)
         }
     }
 
@@ -544,18 +559,23 @@ impl ArchiveView {
     /// Builds a `.filez` from the stored content object `checksum`.
     ///
     /// The `statx` of `config` and the load of the object share one call on
-    /// the blocking pool.
+    /// the blocking pool. A view with a fixed level reads no `config`.
     async fn built_filez(&self, checksum: &Checksum) -> Result<ArchiveAnswer> {
         let repo = self.repo.clone();
         let key = *checksum;
+        let fixed = self.level;
         let (stat, loaded) = ostrya_rt::unblock(move || {
             (
-                config_statx(repo.repo_fd()),
+                fixed.is_none().then(|| config_statx(repo.repo_fd())),
                 repo.load_contained_blocking(&key),
             )
         })
         .await;
-        let level = archive_level(self.config_for(&stat?).await?.zlib_level()?);
+        let level = match (fixed, stat) {
+            (Some(level), _) => level,
+            (None, Some(stat)) => archive_level(self.config_for(&stat?).await?.zlib_level()?),
+            (None, None) => unreachable!("a view with no fixed level reads the statx of config"),
+        };
         let contained: Contained = match object_answer(loaded)? {
             Object::Found(contained) => contained,
             Object::NotFound => return Ok(ArchiveAnswer::NotFound),

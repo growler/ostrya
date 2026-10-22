@@ -95,7 +95,7 @@ The command writes the value to the \fB\%collection\-id\fR key of the remote.
 .SS "init"
 Create a bucket repository in an \%S3 bucket.
 .PP
-The command writes the \fB\%config\fR of a new bucket repository at the \fB\%s3://\fR address of NAME, or at the address \fB\%s3://BUCKET[/PREFIX]\fR\&. The \fB\%config\fR holds the group \fB\%[core]\fR with \fB\%repo_version=1\fR and \fB\%mode=archive\-z2\fR, and \fB\%collection\-id=ID\fR with \%\-\-collection\-id. A bucket repository with a collection id is the primary server of that collection, and a push of the refs of another collection writes them under \fB\%refs/mirrors/ID/\fR\&. The command writes no ref and no summary, and prints nothing on success.
+The command writes the \fB\%config\fR of a new bucket repository at the \fB\%s3://\fR address of NAME, or at the address \fB\%s3://BUCKET[/PREFIX]\fR\&. The \fB\%config\fR holds the group \fB\%[core]\fR with \fB\%repo_version=1\fR and \fB\%mode=archive\-z2\fR, and \fB\%collection\-id=ID\fR with \%\-\-collection\-id. A bucket repository with a collection id is the primary server of that collection, and a push of the refs of another collection writes them under \fB\%refs/mirrors/ID/\fR\&. With \%\-\-zlib\-level, the group \fB\%[archive]\fR with \fB\%zlib\-level=LEVEL\fR follows. The command writes no ref and no summary, and prints nothing on success.
 .PP
 The command takes the writer lock of the bucket repository, writes the \fB\%config\fR only if the bucket repository holds none, and removes the lock. It refuses a bucket repository that holds a \fB\%config\fR, so the collection id of a bucket repository never changes. A push needs the \fB\%config\fR\&. The command needs the \%S3 permissions \fB\%s3:GetObject\fR, \fB\%s3:PutObject\fR, \fB\%s3:ListBucket\fR, and \fB\%s3:DeleteObject\fR\&.
 .PP
@@ -118,6 +118,11 @@ Options:
 Write \fB\%collection\-id=ID\fR into the \fB\%config\fR of the bucket repository.
 .IP
 The command refuses an ID that fails the \%collection\-id rule or is longer than \%255 bytes, before any request.
+.TP
+\fB\-\-zlib\-level\fR \fILEVEL\fR
+Write \fB\%[archive] zlib\-level=LEVEL\fR, \%1 to \%9, into the \fB\%config\fR of the bucket repository.
+.IP
+A push builds each \fB\%\&.filez\fR that it uploads at this level. Without this option, the \fB\%config\fR has no \fB\%[archive]\fR group, and a push takes the level \%6. The command refuses a value outside \%1 to \%9 before any request.
 .TP
 \fB\-\-break\-lock\fR
 Remove the writer lock of another writer of the bucket repository.

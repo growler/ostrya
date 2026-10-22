@@ -2,8 +2,8 @@
 
 //! `ostrya` built without the feature `s3`.
 //!
-//! A pull and a push refuse an `s3://` address with a message that names
-//! the feature. `remote add` writes an `s3://` address as a build with the
+//! A pull, a push, and a tree push refuse an `s3://` address with a message
+//! that names the feature. `remote add` writes an `s3://` address as a build with the
 //! feature does. `remote init` and the S3 options do not exist. The tests
 //! run in a build with no default features, for example
 //! `cargo test -p ostrya-cli --no-default-features --features smol,push --test s3_absent`.
@@ -99,6 +99,45 @@ fn a_push_to_an_s3_address_names_the_feature() {
     let out = ostrya(&repo, &["push", "s3://bkt/repo", "main"]);
     assert!(!out.status.success());
     assert!(stderr(&out).contains(FEATURE), "{}", stderr(&out));
+}
+
+#[cfg(feature = "push")]
+#[test]
+fn a_push_tree_to_an_s3_address_names_the_feature() {
+    let scratch = Scratch::new("push-tree");
+    let repo = repo(&scratch);
+    let tree = scratch.path().join("tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(tree.join("a"), b"a\n").unwrap();
+    let out = ostrya(
+        &repo,
+        &[
+            "push-tree",
+            "s3://bkt/repo",
+            tree.to_str().unwrap(),
+            "--onto=main",
+        ],
+    );
+    assert!(!out.status.success());
+    assert!(stderr(&out).contains(FEATURE), "{}", stderr(&out));
+    for args in [
+        &["push-tree", "--break-lock", "r", "dir", "--onto=main"][..],
+        &[
+            "push-tree",
+            "--s3-region=eu-west-1",
+            "r",
+            "dir",
+            "--onto=main",
+        ][..],
+    ] {
+        let out = ostrya(&repo, args);
+        assert!(!out.status.success(), "{args:?}");
+        assert!(
+            stderr(&out).contains("unexpected argument"),
+            "{args:?}: {}",
+            stderr(&out)
+        );
+    }
 }
 
 #[test]

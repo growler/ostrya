@@ -18,7 +18,7 @@
 //!   `diff`.
 //! - Pull: `pull`, `pull-local`.
 //! - ostrya extensions: `composefs-image`, `push`, `push-tree`, `receive`,
-//!   `send`, `serve`, `remote init`, `remote fsck`.
+//!   `send`, `serve`, `remote init`, `remote fsck`, `remote prune`.
 //!
 //! # Features
 //!
@@ -31,7 +31,8 @@
 //! - `serve` (default): `serve`, the HTTP server of a repository.
 //! - `send` (default): `send`, the server side of a pull over ssh.
 //! - `s3` (default): the pull from and the push to a bucket repository at an
-//!   `s3://` address, `remote init`, `remote fsck`, and the S3 options.
+//!   `s3://` address, `remote init`, `remote fsck`, `remote prune`, and the
+//!   S3 options.
 //! - `lzma-static` (default): a static liblzma, so the binary needs no
 //!   liblzma at run time.
 //!
@@ -1696,6 +1697,62 @@ enum RemoteCommand {
     /// reads the remote from the config of the repository.
     #[cfg(feature = "s3")]
     Fsck(RemoteFsckArgs),
+    /// Delete the unreachable objects of a bucket repository in an S3 bucket.
+    ///
+    /// The command prunes the bucket repository at the `s3://` address of
+    /// NAME, or at the address `s3://BUCKET[/PREFIX]`, as `ostrya prune`
+    /// prunes a local repository with the same options. The commit of each
+    /// ref is a root. Without --refs-only and --keep-younger-than, each
+    /// commit of the bucket is a root too. The commits that the summary names
+    /// are roots, and the command keeps them with no parent. A kept commit
+    /// keeps its detached metadata and its composefs image. Without
+    /// --refs-only and --keep-younger-than, the command also deletes the
+    /// detached metadata and the composefs image of a parent commit that the
+    /// bucket does not hold, which `ostrya prune` can keep.
+    ///
+    /// The command deletes each object that no root reaches, then each
+    /// static delta and each `state/<commit>.commitpartial` marker whose
+    /// commit is not in the bucket after the run, and aborts each incomplete
+    /// multipart upload. It deletes the commit objects first, so a run that
+    /// stops leaves a bucket repository that a reader can use, and the next
+    /// run deletes the rest. It deletes no ref, no `.tombstone-commit`, and
+    /// no key under `delta-indexes/`.
+    ///
+    /// The command reads each commit and dirtree that the walk reaches with
+    /// one GET, one at a time, and checks its checksum. A commit or a dirtree
+    /// whose bytes do not match its name stops the command before its first
+    /// delete. Run `ostrya remote fsck --delete` to repair such an object.
+    ///
+    /// The command writes no summary, and keeps each commit that the summary
+    /// names. A summary that names a deleted static delta stays as it is
+    /// until an explicit update of the summary.
+    ///
+    /// The command prints the lines of `ostrya prune`: `Total objects: N`,
+    /// then `Deleted N objects, SIZE freed`, or with --no-prune `Would
+    /// delete: N objects, freeing SIZE`, or `No unreachable objects`. The
+    /// counts leave out the detached metadata, the composefs images, and the
+    /// static deltas. Then, for each count that is not zero, it prints
+    /// `Deleted N static deltas`, `Deleted N partial-commit markers`, and
+    /// `Aborted N incomplete multipart uploads`, or with --no-prune `Would
+    /// delete N static deltas`, `Would delete N partial-commit markers`, and
+    /// `Would abort N incomplete multipart uploads`.
+    ///
+    /// The command takes the writer lock of the bucket repository, also with
+    /// --no-prune, and removes it at the end. It needs the S3 permissions of
+    /// a push, `s3:GetObject`, `s3:PutObject`, `s3:ListBucket`,
+    /// `s3:DeleteObject`, and `s3:AbortMultipartUpload`, and also
+    /// `s3:ListBucketMultipartUploads`. It refuses a bucket repository whose
+    /// `config` sets `[core] tombstone-commits` to true or sets
+    /// `[ex-ostrya] gc-root-metadata-keys`.
+    ///
+    /// With an address, the command needs no repository and reads no
+    /// `--repo`, current directory, or `OSTREE_REPO`. With a remote name, it
+    /// reads the remote from the config of the repository. With
+    /// --break-lock, a prune that removed the writer lock of another writer
+    /// writes one `warning: removed the writer lock of HOLDER` line to
+    /// standard error.
+    #[cfg(feature = "s3")]
+    Prune(RemotePruneArgs),
     /// Delete a remote repository and its trusted GPG keyring.
     ///
     /// The command removes the keyring `NAME.trustedkeys.gpg` at the root of
@@ -1769,6 +1826,8 @@ impl RemoteCommand {
             RemoteCommand::Init(_) => "init",
             #[cfg(feature = "s3")]
             RemoteCommand::Fsck(_) => "fsck",
+            #[cfg(feature = "s3")]
+            RemoteCommand::Prune(_) => "prune",
             RemoteCommand::Delete(_) => "delete",
             RemoteCommand::List(_) => "list",
             RemoteCommand::ShowUrl(_) => "show-url",
@@ -2057,6 +2116,60 @@ struct RemoteGpgImportArgs {
     /// match ignores the case of ASCII letters. If a value names no key of the
     /// source, the command fails.
     key_ids: Vec<String>,
+}
+
+#[cfg(feature = "s3")]
+#[derive(Args)]
+struct RemotePruneArgs {
+    /// Delete each commit and object that no ref reaches.
+    ///
+    /// Without this option, each commit of the bucket is a root of the walk.
+    /// A commit that no ref names then stays, with the objects that it
+    /// reaches.
+    #[arg(long)]
+    refs_only: bool,
+    /// The number of parents of each ref to keep.
+    ///
+    /// The value -1 keeps all history. The value 0 keeps only the commit that
+    /// the ref names, and so does each negative value other than -1. The bound
+    /// deletes commits only if the walk starts from the refs alone: with
+    /// --refs-only or --keep-younger-than.
+    #[arg(long, default_value_t = -1, allow_negative_numbers = true, overrides_with = "depth")]
+    depth: i32,
+    /// Delete the history of each ref that is older than DATE.
+    ///
+    /// DATE is `@SECONDS` since the Unix epoch, or a date and time with a UTC
+    /// offset, for example `2024-05-01T12:00:00Z` or `2024-05-01 12:00+02:00`.
+    /// The command refuses each other form before any request. The commit
+    /// that a ref names stays at all ages. The walk starts from the refs
+    /// alone, as with --refs-only. This bound replaces --depth.
+    #[arg(long, value_name = "DATE", overrides_with = "keep_younger_than")]
+    keep_younger_than: Option<String>,
+    /// Compute and print the statistics, and delete nothing.
+    ///
+    /// The command still takes and removes the writer lock, so it needs the
+    /// permissions of a writer.
+    #[arg(long)]
+    no_prune: bool,
+    /// Remove the writer lock of another writer of the bucket repository.
+    ///
+    /// The command reads the lock, deletes it, and then takes its own lock.
+    /// It writes the holder of the removed lock to standard error after a
+    /// prune that succeeds. Use it only when the holder is gone, for example
+    /// after a crash.
+    #[arg(long)]
+    break_lock: bool,
+    #[command(flatten)]
+    s3: S3AccessArgs,
+    // ostrya checks this operand after the repository resolves, unless it is
+    // an address.
+    /// The remote name or the address `s3://BUCKET[/PREFIX]`. Required.
+    ///
+    /// The address of a remote is its `push-url` key if that key holds an
+    /// `s3://` address, else its `pull-url` key if that key holds an `s3://`
+    /// address. The command refuses a remote with neither, and never reads the
+    /// `url` key.
+    name: Option<String>,
 }
 
 #[derive(Args)]
@@ -4161,6 +4274,20 @@ async fn run(repo: Option<&Path>, verbose: bool, command: Command) -> Result<()>
                     unreachable!("the subcommand is fsck");
                 };
                 return remote_fsck(None, nested, fsck).await;
+            }
+            // So does a prune at an address.
+            #[cfg(feature = "s3")]
+            if let RemoteCommand::Prune(prune) = &sub
+                && prune
+                    .name
+                    .as_deref()
+                    .is_some_and(|n| n.contains([':', '/']))
+            {
+                let nested = sub.name();
+                let RemoteCommand::Prune(prune) = sub else {
+                    unreachable!("the subcommand is prune");
+                };
+                return remote_prune(None, nested, prune).await;
             }
             let (repo, _) = resolve_repo(repo, verbose, name).await;
             remote(repo, sub).await
@@ -11063,6 +11190,8 @@ async fn remote(repo: Repo, sub: RemoteCommand) -> Result<()> {
         RemoteCommand::Init(args) => remote_init(Some(&repo), nested, args).await,
         #[cfg(feature = "s3")]
         RemoteCommand::Fsck(args) => remote_fsck(Some(&repo), nested, args).await,
+        #[cfg(feature = "s3")]
+        RemoteCommand::Prune(args) => remote_prune(Some(&repo), nested, args).await,
         RemoteCommand::Delete(args) => remote_delete(&repo, nested, args).await,
         RemoteCommand::List(args) => remote_list(&repo, &args),
         RemoteCommand::ShowUrl(args) => remote_show_url(&repo, nested, &args),
@@ -11380,6 +11509,88 @@ async fn remote_fsck(repo: Option<&Repo>, nested: &str, args: RemoteFsckArgs) ->
     )
     .and_then(|()| out.flush())
     .map_err(Error::Io)?;
+    Ok(())
+}
+
+/// Prunes the bucket repository of a remote or of an address, for `ostrya
+/// remote prune`.
+///
+/// `repo` is `None` for an address. The `--keep-younger-than` value is read
+/// before any request. The lines go to standard output as the help text
+/// states, and a writer lock that `--break-lock` removed gives one warning
+/// line on standard error.
+#[cfg(feature = "s3")]
+async fn remote_prune(repo: Option<&Repo>, nested: &str, args: RemotePruneArgs) -> Result<()> {
+    use std::io::Write;
+    let target = remote_operand(nested, args.name.as_deref());
+    let keep_younger_than = match args.keep_younger_than.as_deref() {
+        Some(text) => match parse_timestamp(text) {
+            Some(seconds) => Some(seconds),
+            None => exit_error(&format!("Could not parse '{text}'")),
+        },
+        None => None,
+    };
+    let config = repo.map(Repo::config);
+    let endpoint =
+        ostrya::endpoint::resolve_bucket(config, target, args.s3.into_overrides()).await?;
+    let opts = PruneOptions {
+        refs_only: args.refs_only,
+        depth: args.depth,
+        no_prune: args.no_prune,
+        keep_younger_than,
+        ..PruneOptions::default()
+    };
+    let mut bucket_opts = ostrya::bucket::BucketPruneOptions::default();
+    bucket_opts.break_lock = args.break_lock;
+    let bucket = ostrya::bucket::BucketRepo::open(&endpoint).await?;
+    let report = bucket.prune(&opts, &bucket_opts).await?;
+    let stats = &report.stats;
+    let mut out = std::io::stdout().lock();
+    writeln!(out, "Total objects: {}", stats.total_objects).map_err(Error::Io)?;
+    if stats.pruned_objects == 0 {
+        writeln!(out, "No unreachable objects")
+    } else if args.no_prune {
+        writeln!(
+            out,
+            "Would delete: {} objects, freeing {}",
+            stats.pruned_objects,
+            format_size(stats.freed_bytes)
+        )
+    } else {
+        writeln!(
+            out,
+            "Deleted {} objects, {} freed",
+            stats.pruned_objects,
+            format_size(stats.freed_bytes)
+        )
+    }
+    .map_err(Error::Io)?;
+    let (delete, abort) = if args.no_prune {
+        ("Would delete", "Would abort")
+    } else {
+        ("Deleted", "Aborted")
+    };
+    for (verb, count, what) in [
+        (delete, report.deleted_deltas.len(), "static deltas"),
+        (
+            delete,
+            report.deleted_markers.len(),
+            "partial-commit markers",
+        ),
+        (
+            abort,
+            report.aborted_uploads.len(),
+            "incomplete multipart uploads",
+        ),
+    ] {
+        if count != 0 {
+            writeln!(out, "{verb} {count} {what}").map_err(Error::Io)?;
+        }
+    }
+    out.flush().map_err(Error::Io)?;
+    if let Some(holder) = &report.broken_lock {
+        eprintln!("warning: removed the writer lock of {holder}");
+    }
     Ok(())
 }
 

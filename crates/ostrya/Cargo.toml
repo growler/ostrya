@@ -34,7 +34,8 @@ receive = []
 push = []
 # The pull from a bucket repository at an `s3://` address, with requests that
 # the SigV4 signer of ostrya-remote signs, and the `bucket` module: the init,
-# the writer lock, the object listing, and the fsck of a bucket repository.
+# the writer lock, the object listing, the fsck, and the prune of a bucket
+# repository.
 # With `push`, the push to a bucket repository.
 s3 = ["ostrya-remote/s3"]
 # Builds xz from source and links it statically, so the build needs no

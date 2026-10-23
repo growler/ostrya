@@ -4,8 +4,9 @@
 //! Each file of the repository is one object of the bucket, under the prefix
 //! of the address `s3://BUCKET[/PREFIX]`. A pull reads a bucket repository
 //! through [`Repo::pull`](crate::Repo::pull). A `BucketRepo` adds the init,
-//! the writer lock, the listing of the objects, and the fsck. With the `push`
-//! feature, `Repo::push_to_bucket` writes commits to a bucket repository.
+//! the writer lock, the listing of the objects, the fsck, and the prune. With
+//! the `push` feature, `Repo::push_to_bucket` writes commits to a bucket
+//! repository.
 //!
 //! # Init
 //!
@@ -151,6 +152,46 @@
 //! with the report of the changes that completed: run the fsck with
 //! `delete` again before a push.
 //!
+//! # The prune
+//!
+//! [`BucketRepo::prune`] deletes the objects that no root reaches, and gives
+//! a [`BucketPruneReport`]. It takes the [`PruneOptions`](crate::PruneOptions)
+//! of [`Repo::prune`](crate::Repo::prune), and refuses each option other than
+//! `refs_only`, `depth`, `keep_younger_than`, and `no_prune`. The run takes
+//! the writer lock with the operation `prune`, also with `no_prune`.
+//!
+//! - The roots are the commits of the refs, the commits that the `summary`
+//!   names, and, unless the roots are on the refs alone, each commit of the
+//!   listing. The objects that the run keeps are the objects that a local
+//!   prune keeps with the same options, refs, and objects, and the objects
+//!   of the commits of the summary. Unless the roots are on the refs alone,
+//!   the run also deletes the detached metadata and the composefs image of
+//!   a parent commit that the listing does not hold.
+//! - The walk reads each commit and dirtree that it reaches, one at a time,
+//!   and checks each one against its name. An object that the listing does
+//!   not hold is absent, and the walk sends no request for it. A commit or a
+//!   dirtree whose bytes do not match its name stops the run before its
+//!   first delete. A run of the fsck with `delete` repairs such an object.
+//! - The run deletes the commits first, each with its detached metadata and
+//!   its composefs image, then the detached metadata and the composefs images
+//!   whose commits are absent, then each other object, then the static
+//!   deltas whose target commits are absent, each superblock before the
+//!   other keys of its delta, then the partial-commit markers whose commits
+//!   are absent. Then it aborts each incomplete multipart upload. The run
+//!   checks the lock before each of these steps that has a change to make,
+//!   and after each 1000 deletes or aborts of a step. The four steps are:
+//!   the commits with the detached metadata and the composefs images of
+//!   absent commits, the other objects, the static deltas with the markers,
+//!   and the aborts.
+//! - The run deletes no ref, no `.tombstone-commit`, and no key under
+//!   `delta-indexes/`, and writes no summary. A summary that names a deleted
+//!   static delta stays as it is until an explicit update of the summary.
+//!
+//! A run that fails after its first delete leaves a bucket repository that a
+//! reader can use, and a later run deletes the rest. An object that only a
+//! dirtree that the fsck deleted reaches is unreachable, so the prune
+//! deletes it, and a push of the commit of that dirtree uploads it again.
+//!
 //! # Examples
 //!
 //! ```no_run
@@ -169,15 +210,19 @@
 //! # Ok(()) }
 //! ```
 
+use std::future::Future;
+
 use ostrya_core::{ObjectName, RepoMode};
 
 use crate::error::Result;
+use crate::pull::drive::Slots;
 use crate::remote::PushOutcome;
 use crate::remote::s3::{Address, Bucket, PutIfAbsent, S3Endpoint};
 
 mod fsck;
 mod listing;
 mod lock;
+mod prune;
 mod state;
 // No writer of this version writes the summary of a bucket repository. The
 // build and the write of the summary stay for an explicit summary update.
@@ -189,6 +234,7 @@ pub use fsck::{BucketFinding, BucketFindingKind, BucketFsckOptions, BucketFsckRe
 pub use listing::ObjectListing;
 pub use lock::{LockHolder, LockOperation, WriterLock};
 pub(crate) use lock::{describe_locked, describe_lost};
+pub use prune::{BucketPruneOptions, BucketPruneReport};
 #[cfg(test)]
 pub(crate) use state::{BucketRefs, summary_refs};
 #[cfg_attr(not(feature = "push"), allow(unused_imports))]
@@ -483,6 +529,57 @@ pub(crate) fn invalid(msg: impl Into<String>) -> crate::Error {
     crate::Error::Remote(crate::remote::Error::InvalidInput(msg.into()))
 }
 
+/// Returns the error of a writer that failed with `e` while it held `lock`.
+///
+/// The call releases the lock and drops an error of the release, unless the
+/// failure is a lost lock or a lock of another writer.
+pub(crate) async fn release_on_error(lock: WriterLock<'_>, e: crate::Error) -> crate::Error {
+    if !matches!(
+        e,
+        crate::Error::BucketLockLost { .. } | crate::Error::BucketLocked { .. }
+    ) {
+        let _ = lock.release().await;
+    }
+    e
+}
+
+/// Runs each future of `ops`, at most `max` at a time, and gives the output
+/// of each one that succeeds to `done`.
+///
+/// After a failure, the call starts no new future, waits for the futures in
+/// flight, and returns the first failure. So `done` sees each change that
+/// completed.
+async fn each_slot<'a, T, Fut>(
+    max: usize,
+    ops: impl Iterator<Item = Fut>,
+    mut done: impl FnMut(T),
+) -> Result<()>
+where
+    Fut: Future<Output = Result<T>> + Send + 'a,
+{
+    let mut slots = Slots::new(max);
+    let mut ops = ops;
+    let mut failure = None;
+    loop {
+        while failure.is_none()
+            && slots.has_room()
+            && let Some(op) = ops.next()
+        {
+            slots.push(op);
+        }
+        let Some(result) = slots.next_ready().await else {
+            break;
+        };
+        match result {
+            Ok(output) => done(output),
+            Err(e) => {
+                failure.get_or_insert(e);
+            }
+        }
+    }
+    failure.map_or(Ok(()), Err)
+}
+
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<BucketRepo>();
@@ -496,6 +593,8 @@ const _: fn() = || {
     assert_send_sync::<BucketFsckReport>();
     assert_send_sync::<BucketFinding>();
     assert_send_sync::<BucketFindingKind>();
+    assert_send_sync::<BucketPruneOptions>();
+    assert_send_sync::<BucketPruneReport>();
 };
 
 #[cfg(test)]

@@ -1082,6 +1082,9 @@ removes them after the content phase:
 - each `state/<commit>.commitpartial` marker whose commit is absent from the
   store. A name that is not a marker name in lowercase hex stays.
 
+The prune of a bucket repository deletes its keys in the same order
+("The prune of a bucket repository").
+
 A `--static-deltas-only` run removes the deltas of the commit it names and
 nothing more. It removes no marker, and it keeps a delta name that does not
 decode.
@@ -5952,7 +5955,7 @@ a push of commits.
 ### The summary of a bucket repository
 
 The summary of a bucket repository is written by an explicit summary update
-alone. A push and the init write no summary. This version of the port has
+alone. A push, the init, and the prune write no summary. This version of the port has
 no command that writes the summary of a bucket repository. The rules below
 are the rules of the summary builder of the port for a bucket repository.
 
@@ -6129,7 +6132,8 @@ The repair runs after the checks:
    repository. A commit that holds a marker gets no new one, and a commit
    whose own object is bad gets none. Then the delete of each marker that
    a run without the repair gives a `marker` note. A marker of a commit
-   that the listing does not hold stays.
+   that the listing does not hold stays until a prune ("The prune of a
+   bucket repository").
 2. A check of the lock, and the delete of each object of a `mismatch` and a
    `corrupt` finding: the commit objects, then the objects of the trees,
    then the composefs images. A bad commit object goes also when a ref names
@@ -6154,3 +6158,112 @@ commit has a marker uploads the objects of the tree that the bucket lacks,
 and then deletes the marker ("The push to a bucket repository"). A push of a
 ref whose commit object the repair deleted uploads the commit again. The
 pull of the port reads no key under `state/`.
+
+### The prune of a bucket repository
+
+The prune deletes the objects of a bucket repository that no root reaches.
+`ostrya remote prune` runs it. The prune takes the options `--refs-only`,
+`--depth`, `--keep-younger-than`, and `--no-prune` of `ostrya prune`, with
+the same meaning. The library refuses each other option of the local prune
+before a request. The prune keeps the objects of the listing that a local
+prune with the same options keeps in a repository with the same refs and
+objects, and also the objects of the commits that the summary names. One
+difference applies: without `--refs-only` and `--keep-younger-than`, the
+prune also deletes the `.commitmeta` and the `.cfs` of a parent commit that
+the listing does not hold. The local prune keeps these when its bound
+reaches that parent.
+
+The roots are:
+
+- the commit of each ref of `refs/heads/` and `refs/mirrors/<id>/`, under
+  the bound of `--depth` or `--keep-younger-than`. A ref whose commit the
+  bucket does not hold is no error, and it keeps nothing.
+- the commit of each ref of the summary, in field 0 and in
+  `ostree.summary.collection-map`, with no parent. A summary that does not
+  parse, or that is larger than 64 MiB, fails the run before its first
+  delete. With no summary, these roots are absent.
+- without `--refs-only` and `--keep-younger-than`, each commit of the
+  listing. Each root then keeps no parent, because each parent in the
+  listing is a root of its own. The walk reads each commit one time. The
+  kept objects of the listing do not change, with one exception: the walk
+  does not reach a parent commit that the listing does not hold, so the
+  prune deletes the `.commitmeta` and the `.cfs` of that commit.
+
+The walk reads each commit and each dirtree that it reaches with one `GET`,
+one at a time. It reads at most the size of the object in the listing, and
+at most the metadata size cap of 128 MiB. The SHA-256 of the bytes of each
+commit and dirtree must be the checksum of its name, and the bytes must
+parse. Else the run fails before its first delete, and a run of the fsck
+with the repair deletes the bad object. The walk sends no request for an
+object that the listing does not hold, and reads it as absent: an absent
+commit or dirtree keeps its own name and no object below it. A listed
+object that is gone at its read fails the run. With `--refs-only` or
+`--keep-younger-than`, the walk can read a commit again when it reaches the
+commit under a bound that goes further.
+
+A kept commit keeps its `.commitmeta` and its `.cfs`. A partial commit that
+the prune keeps keeps its marker. An object that only a dirtree that the
+fsck deleted reaches is not reachable, so the prune deletes it. A push of
+the commit of that dirtree uploads the object again.
+
+The steps of the prune are:
+
+1. The read of `config`, by the strict rule of an absent key. An absent
+   `config`, a `config` that breaks a rule of "The config of a bucket
+   repository", a `config` that sets `[core] tombstone-commits=true`, and a
+   `config` that sets `[ex-ostrya] gc-root-metadata-keys` refuse the run
+   before it takes the lock. The prune writes no tombstone, and reads no
+   metadata key.
+2. The take of the writer lock with `operation=prune`. A run with
+   `--no-prune` takes the lock too.
+3. At the same time: the list of `refs/` and the read of each ref file, the
+   listing of the objects of the 256 fan-out prefixes, the list of
+   `deltas/`, the list of `state/`, the list of the incomplete multipart
+   uploads, and the read of `summary`. A key under `refs/` other than
+   `refs/heads/<name>`, and `refs/mirrors/<id>/<name>` with an id other
+   than the collection id of the bucket, fails the run. So does a ref file
+   that does not hold 64 lowercase hex digits and a newline.
+4. The walk. A run with `--no-prune` then releases the lock, and reports
+   the counts and the deletes that a run without it does.
+5. The commits. One `DELETE` of each commit object to delete, then of its
+   `.commitmeta` and then of its `.cfs` if these go too, in one slot for
+   each commit. Then the `.commitmeta` and the `.cfs` of each commit that
+   the listing does not hold.
+6. Each other object to delete. A `.tombstone-commit` stays.
+7. The static deltas whose target commit is not in the bucket after the
+   run: first the `superblock` of each, and then each other key of these
+   deltas. A delta directory with no superblock goes too. A key under
+   `deltas/` that is not a key of a bucket repository, and a directory whose
+   names do not decode as a delta, stay. `delta-indexes/` does not change.
+   Then the `state/<checksum>.commitpartial` marker of each commit that is
+   not in the bucket after the run. A marker goes after the commit object of
+   its commit. Each other key under `state/` stays.
+8. The abort of each incomplete multipart upload of the repository, with
+   `DELETE KEY?uploadId=ID`.
+9. The release of the lock.
+
+The run checks the lock before each of the steps 5 to 8 that has a key to
+delete or an upload to abort, and again after each 1000 deletes or aborts
+of a step. A lock with another `id`, or no lock, stops the run before its
+next delete, and the run releases no lock. Each delete is one `DELETE` of
+one key. At most `max_outstanding` deletes or aborts run at a time. After a
+failed delete, the run starts no new one, waits for the ones in flight,
+releases the lock, and fails. A `DELETE` of a key that holds no object is a
+success.
+
+The counts are the counts of "Prune removal order": the total of the objects
+of the listing, the objects to delete, and their size in the listing. The
+counts leave out each `.commitmeta`, each `.cfs`, each `.tombstone-commit`,
+and the static deltas. A delete of a key that holds no object counts too.
+The prune deletes no ref.
+
+A run that stops after its first delete leaves a bucket repository that a
+reader can use: the commits go first, so each commit object in the bucket
+has each object of its tree that it had before the run. The objects of the
+deleted commits, their deltas, and their markers stay until the next run.
+
+The prune writes no summary. The commits of the summary are roots, so the
+prune deletes no commit that the summary names. A static delta of the
+summary whose target commit is not in the bucket goes, and the summary that
+names it stays as it is until an explicit update of the summary. A pull that
+trusts that summary can then ask for an absent delta.

@@ -148,9 +148,6 @@ impl BucketRepo {
     ///   malformed state: the repository holds the refs of its own
     ///   collection under `refs/heads/`.
     /// - [`Error::Remote`] for an error of the bucket client.
-    // A push reads the ref directory of its namespace alone. The read of all
-    // refs stays for an explicit summary update, which lists each ref.
-    #[allow(dead_code)]
     pub(crate) async fn read_refs(&self, own: Option<&str>) -> Result<BucketRefs> {
         let listing = self.bucket.list("refs/").await?;
         let mut keys = Vec::with_capacity(listing.objects.len());

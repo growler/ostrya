@@ -38,7 +38,7 @@ use crate::access::{AuthItem, ClientAccess, ReadAccess};
 use crate::archive::{ArchiveAnswer, ArchiveView};
 use crate::bucket::{
     BucketPushOutcome, BucketRepo, LockOperation, ObjectListing, WriterLock, check_prefixes,
-    marker_key, object_key,
+    marker_key, object_key, release_on_error,
 };
 use crate::error::{Error, Result};
 use crate::hashing::VerifyingReader;
@@ -402,13 +402,13 @@ impl Repo {
             mut stats,
         } = match self.upload_to_bucket(&bucket, &mut plan, &opts).await {
             Ok(uploaded) => uploaded,
-            Err(e) => return Err(fail(lock, e).await),
+            Err(e) => return Err(release_on_error(lock, e).await),
         };
         if let Some(progress) = progress {
             progress.set_phase(PushPhase::Committing);
         }
         if let Err(e) = write_bucket_refs(&bucket, &lock, &cleared, &updates).await {
-            return Err(fail(lock, e).await);
+            return Err(release_on_error(lock, e).await);
         }
         lock.release().await?;
         stats.elapsed = start.elapsed();
@@ -825,17 +825,6 @@ pub(super) async fn write_bucket_refs(
             .await?;
     }
     Ok(())
-}
-
-/// Returns the error of a push that failed while it held `lock`.
-///
-/// The call releases the lock and drops an error of the release, unless the
-/// failure is a lost lock or a lock of another writer.
-pub(super) async fn fail(lock: WriterLock<'_>, e: Error) -> Error {
-    if !matches!(e, Error::BucketLockLost { .. } | Error::BucketLocked { .. }) {
-        let _ = lock.release().await;
-    }
-    e
 }
 
 /// One upload of a push.

@@ -1016,8 +1016,9 @@ does not exist for a bucket.
 
 `ostrya-cli` turns on the feature `s3` of `ostrya` in its default set, so
 the shipped binary reads and writes bucket repositories. The feature gates
-the S3 options, `--break-lock`, `remote init`, and `remote fsck`, as the
-features `push`, `serve`, and `send` gate their commands. A build without
+the S3 options, `--break-lock`, `remote init`, `remote fsck`, and
+`remote prune`, as the features `push`, `serve`, and `send` gate their
+commands. A build without
 the feature refuses an `s3://` address with the message of the library,
 which names the feature.
 
@@ -1229,6 +1230,114 @@ output, and one line for each finding on standard error, as `ostrya fsck`
 does. A note starts with `note: `. A report with an error exits 1, and a
 report with notes alone exits 0.
 
+## The prune of a bucket repository
+
+The prune of a bucket repository is `BucketRepo::prune` and the command
+`ostrya remote prune NAME|ADDRESS`, for the reasons of the fsck: the group
+`remote` holds the commands that act on a remote. `ostrya prune` with an
+`s3://` value of `--repo`, and a new group `ostrya bucket`, were rejected.
+
+The walk is the walk of the local prune, `traverse::walk_reachable_gc`,
+over a source of metadata objects that the local repository and the bucket
+both give. So the bucket prune has the roots and the bounds of
+`Repo::prune` with no copy, and the tests of the local prune gate the walk.
+A walk for the bucket alone, with a copy of the rules of the bounds, was
+rejected: a later change to one copy can miss the other. The walk reads one
+object at a time. A walk that reads in parallel is a later change.
+
+`BucketRepo::prune` takes the `PruneOptions` of the local prune and a
+`BucketPruneOptions` with `break_lock`. It takes `refs_only`, `depth`,
+`keep_younger_than`, and `no_prune`, and refuses each other option that is
+not at its default, before a request, with `Error::InvalidInput` that
+names the first such field in the order of the fields. A type of options
+for the bucket alone was rejected: the four options have the meaning of the
+local prune, and a later option of the local prune that the bucket takes
+then needs no new field. `delete_commit` and `static_deltas_only` need a
+tombstone, `only_branch`, `retain_branch_depth`, and `weak_ref_filter` read
+names of the local ref space, `commit_only` leaves objects with no commit,
+and `gc_root_metadata_keys` and `traverse_parent` read the metadata of each
+commit. These stay for a later version.
+
+The result is `BucketPruneReport`: the `PruneStats` of the local prune,
+whose `deleted_refs` is always empty, and the deleted deltas, the deleted
+markers, the aborted uploads, and the holder of a broken lock. With
+`no_prune`, the lists name what a run deletes. A `PruneStats` alone was
+rejected, because the command prints the deltas, the markers, and the
+uploads, and the holder of a broken lock needs a place on success.
+
+When the roots are not on the refs alone, each commit of the listing is a
+root, so each root, the ref targets and the commits of the summary
+included, keeps no parent. The walk reads each commit one time. With the
+bound of the local prune, the walk reads a commit again at each greater
+depth, which is a `GET` for each read. The kept objects of the listing are
+the same, with one exception. The walk does not reach a parent commit that
+the listing does not hold, so the prune deletes the `.commitmeta` and the
+`.cfs` of that commit. The local prune keeps them when its bound reaches
+that parent. These objects have no commit object, and a push of the commit
+uploads them again. A rule that keeps them too was rejected: it needs the
+parent of each commit that the walk reads, and the walk gives the names of
+the reached objects alone. With `refs_only` or `keep_younger_than`, the
+walk keeps the bounds of the local prune and its reads again. A commit of
+the summary that a ref also names is a root under the bound of the ref
+alone, so the walk does not read it again.
+
+The walk reads an object that the listing does not hold as absent, with no
+request. The run holds the writer lock, so no writer adds an object during
+the run. Each read takes at most the size of the object in the listing, and
+the run checks the SHA-256 of each commit and dirtree that it reads. A bad
+object fails the run before its first delete, with a message that names
+`ostrya remote fsck --delete`. A walk with no check was rejected: a dirtree
+with other bytes names other children, and the prune then deletes objects
+that a commit of the bucket reaches. `BucketRepo::traverse_reachable`, which
+is not a stable API, keeps its reads with no listing and no check.
+
+The commits that the summary names, in field 0 and in the collection map,
+are roots with no parent. The prune writes no summary, so the summary that
+a pull reads after a prune can still name the commits of refs that moved
+before the prune. With these roots, such a pull finds its commits. A
+summary that does not parse fails the run before its first delete. A
+prune that ignores the summary was rejected, because it can break a pull
+that trusts the summary until an update of the summary. The deltas that
+the summary names get no such rule: a delta whose target commit goes, goes
+too, as in the local prune. The summary then names an absent delta until an
+update of the summary, and the fsck reports it as a `summary` error.
+
+A run with `no_prune` takes the writer lock too, so its counts describe a
+state that no writer changes during the run. Thus a dry run needs the
+permissions of a writer.
+
+The prune refuses a `config` that sets `[core] tombstone-commits=true`,
+because it writes no tombstone, and a `config` that sets
+`[ex-ostrya] gc-root-metadata-keys`, because it reads no metadata key. A
+run that ignores the keys was rejected: it deletes commits that the
+repository policy keeps. The refusal comes before the lock.
+
+The prune deletes a delta directory whose target commit is absent also when
+it has no superblock, and deletes the superblock first when it has one. A
+run that stops between the two deletes then leaves a directory with no
+superblock, and the next run deletes it. A key under `deltas/` that fails
+`ostrya_remote::s3::is_repository_key` stays, as a stray key. The key rule
+is exported for this check, so the prune and the bucket client take one
+rule. `delta-indexes/` does not change, as in the local prune.
+
+The run checks the lock before each step that has a change to make, and
+after each 1000 deletes or aborts of a step. The steps are the commits with
+the `.commitmeta` and the `.cfs` of absent commits, the other objects, the
+static deltas with the markers, and the aborts. One check for each delete was
+rejected: it doubles the requests of a run. The check gives no exclusion of
+its own, as "The writer lock of a bucket repository" states.
+
+Each delete is one `DELETE` of one key, in parallel under the admission
+limit of the fetcher. `DeleteObjects` was rejected: AWS needs a
+`Content-MD5` or a checksum header on it, and the first needs a crate.
+
+A failed run gives the error of the failure, and releases the lock unless
+the lock was lost or held by another writer. An error that holds the
+deletes that completed, as the error of the fsck repair holds its report,
+was rejected: the deletes of a prune leave a bucket repository that a
+reader can use, and a run again completes the prune. A lost lock at the
+release is an error, as for a push.
+
 ## The client access of `ostrya serve`
 
 - The reader of the PROXY protocol, v1 and v2, is written in the tree, with
@@ -1306,16 +1415,16 @@ when the port owns its set of members and expects the set to grow.
   set of fields grows with the S3 support. A caller builds an `S3Endpoint`
   with `S3Endpoint::new` and sets its fields.
 - `ostrya::bucket::LockOperation`, `LockHolder`, `ObjectListing`,
-  `BucketPushOutcome`, `BucketFsckReport`, `BucketFinding`, and
-  `BucketFindingKind` have the attribute. The port builds them, and a later
+  `BucketPushOutcome`, `BucketFsckReport`, `BucketFinding`,
+  `BucketFindingKind`, and `BucketPruneReport` have the attribute. The port builds them, and a later
   version can add an operation, a field, or a kind of finding.
 - The option structs of the `ostrya` crate do not have the attribute:
   `PruneOptions`, `PullOptions`, `TarExportOptions`, `TarImportOptions` and
   the others. The attribute stops a struct expression outside the defining
   crate, `..Default::default()` included. Thus a new field in one of these
   option structs is a breaking change, and it takes a minor version before
-  1.0. The option structs of the bucket writers, `BucketWriteOptions` and
-  `BucketFsckOptions`, have the attribute. A caller starts from
+  1.0. The option structs of the bucket writers, `BucketWriteOptions`,
+  `BucketFsckOptions`, and `BucketPruneOptions`, have the attribute. A caller starts from
   `Default::default()` and sets the fields, so a later field is additive.
 - `ostrya_server::ServeOptions` and `ostrya_mount::MountOptions` have the
   attribute. A caller starts from `Default::default()` and sets the fields.

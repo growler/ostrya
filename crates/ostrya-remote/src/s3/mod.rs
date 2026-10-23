@@ -26,6 +26,7 @@
 //!   longer than one part, and [`part_size`] gives the part size of an
 //!   object. [`Bucket::from_fetcher`] opens it over the signed fetcher of a
 //!   pull.
+//! - [`is_repository_key`] tells if a key is a key of a bucket repository.
 //!
 //! The module reads static key pairs alone. It does not assume a role, run a
 //! credential process, or read an SSO token.
@@ -63,6 +64,7 @@ pub use bucket::{
 pub use chain::{Addressing, Environment, Origin, Resolved, Setting, Settings, resolve};
 pub use credentials::Credentials;
 pub use endpoint::S3Endpoint;
+pub use key::is_repository_key;
 pub use location::Location;
 pub use sigv4::SigV4;
 

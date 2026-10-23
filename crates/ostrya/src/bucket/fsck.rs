@@ -20,7 +20,7 @@ use super::listing::is_fanout_prefix;
 use super::lock::{LOCK_KEY, LockHolder, LockOperation, WriterLock};
 use super::state::{BucketRefs, PARTIAL_STATE_BYTE, RefKey, RefRead, marker_key, ref_key};
 use super::summary::SuperblockKey;
-use super::{BucketRepo, ObjectListing, object_key};
+use super::{BucketRepo, ObjectListing, each_slot, object_key, release_on_error};
 use crate::deltagen::delta_name;
 use crate::error::{Error, Result};
 use crate::object::MAX_METADATA_SIZE;
@@ -521,9 +521,7 @@ impl BucketRepo {
                 .fsck_run(&mut run, opts, own.as_deref(), Some(&lock))
                 .await
             {
-                if !matches!(e, Error::BucketLockLost { .. } | Error::BucketLocked { .. }) {
-                    let _ = lock.release().await;
-                }
+                let e = release_on_error(lock, e).await;
                 if run.changed {
                     return Err(Error::BucketRepairIncomplete {
                         address: self.address().to_string(),
@@ -1835,43 +1833,6 @@ impl BucketRepo {
         }
         Ok(())
     }
-}
-
-/// Runs each future of `ops`, at most `max` at a time, and gives the output
-/// of each one that succeeds to `done`.
-///
-/// After a failure, the call starts no new future, waits for the futures in
-/// flight, and returns the first failure. So `done` sees each change that
-/// completed.
-async fn each_slot<'a, T, Fut>(
-    max: usize,
-    ops: impl Iterator<Item = Fut>,
-    mut done: impl FnMut(T),
-) -> Result<()>
-where
-    Fut: Future<Output = Result<T>> + Send + 'a,
-{
-    let mut slots = Slots::new(max);
-    let mut ops = ops;
-    let mut failure = None;
-    loop {
-        while failure.is_none()
-            && slots.has_room()
-            && let Some(op) = ops.next()
-        {
-            slots.push(op);
-        }
-        let Some(result) = slots.next_ready().await else {
-            break;
-        };
-        match result {
-            Ok(output) => done(output),
-            Err(e) => {
-                failure.get_or_insert(e);
-            }
-        }
-    }
-    failure.map_or(Ok(()), Err)
 }
 
 /// Returns the number of the dirtree `tree` in `index`, and gives a new

@@ -312,13 +312,16 @@ Each file of the repository is one object of the bucket.
 The key of the object is the path of the file under \fB\%PREFIX/\fR.
 \fB\%ostrya remote init\fR creates a bucket repository, \fB\%ostrya push\fR writes commits to it, \fB\%ostrya push\-tree\fR writes a directory to it as a new commit, and \fB\%ostrya pull\fR, \fB\%ostrya remote refs\fR, and \fB\%ostrya remote summary\fR read it.
 \fB\%ostrya remote fsck\fR checks it, and with \fB\%\-\-delete\fR repairs it.
-The init, the two pushes, and the repair take the writer lock of the bucket repository.
+\fB\%ostrya remote prune\fR deletes the objects that no root reaches.
+The init, the two pushes, the repair, and the prune take the writer lock of the bucket repository.
+The prune takes the lock also with \fB\%\-\-no\-prune\fR.
 \fB\%ostrya push\-tree\fR makes the commit on the client, with the parent from the ref file of the branch, and signs no commit.
-In the ostrya library, the feature \fB\%s3\fR gives the read, the init, the writer lock, and the fsck, and the features \fB\%s3\fR and \fB\%push\fR give the two pushes.
+In the ostrya library, the feature \fB\%s3\fR gives the read, the init, the writer lock, the fsck, and the prune, and the features \fB\%s3\fR and \fB\%push\fR give the two pushes.
 The \fB\%ostrya\fR command built without its feature \fB\%s3\fR refuses an \fB\%s3://\fR address.
 .PP
 A push that stops before its end can leave an incomplete multipart upload, which holds storage in the bucket.
-Set a lifecycle rule \fB\%AbortIncompleteMultipartUpload\fR on the bucket, so that the S3 server aborts such an upload after a number of days.
+\fB\%ostrya remote prune\fR aborts each such upload of the repository.
+Also set a lifecycle rule \fB\%AbortIncompleteMultipartUpload\fR on the bucket, so that the S3 server aborts such an upload after a number of days.
 .PP
 These are the keys of a bucket repository:
 .TP
@@ -328,13 +331,16 @@ The init writes it with the group \fB\%[core]\fR and the keys \fB\%repo_version=
 With a zlib level, for example with \fB\%ostrya remote init \-\-zlib\-level\fR, the group \fB\%[archive]\fR with the key \fB\%zlib\-level\fR follows.
 A bucket repository with a collection id is the primary server of that collection.
 The init refuses a bucket that holds a \fB\%config\fR, so the collection id of a bucket repository never changes.
-A push needs the \fB\%config\fR, and refuses a mode other than \fB\%archive\-z2\fR and \fB\%archive\fR, a collection id that fails the collection\-id rule, a \fB\%tombstone\-commits\fR or \fB\%indexed\-deltas\fR that is not a boolean, and a \fB\%zlib\-level\fR that is not an integer.
+A push and a prune need the \fB\%config\fR, and refuse a mode other than \fB\%archive\-z2\fR and \fB\%archive\fR, a collection id that fails the collection\-id rule, a \fB\%tombstone\-commits\fR or \fB\%indexed\-deltas\fR that is not a boolean, and a \fB\%zlib\-level\fR that is not an integer.
 A push builds each \fB\%.filez\fR that it uploads at the \fB\%zlib\-level\fR of this \fB\%config\fR, 6 when the key is absent.
 A push of commits from an archive repository uploads each \fB\%.filez\fR as it is stored.
+A prune also refuses a \fB\%config\fR that sets \fB\%tombstone\-commits=true\fR in \fB\%[core]\fR or \fB\%gc\-root\-metadata\-keys\fR in \fB\%[ex\-ostrya]\fR.
 .TP
 \fB\%summary\fR, \fB\%summary.sig\fR
 The summary of the repository and its signatures.
-A push writes no summary, and leaves these two keys as they are.
+A push and a prune write no summary, and leave these two keys as they are.
+A prune keeps each commit that the summary names, with no parent.
+A summary that names a static delta that a prune deleted stays as it is until an update of the summary.
 A pull of a named ref reads the ref file when the summary does not list the ref.
 A pull of a ref that the summary lists takes the commit of the summary, so after a push moves that ref, the pull takes the old commit until an update of the summary.
 A pull with \fB\%\-\-mirror\fR and no named ref, a pull that verifies the signature of the summary, \fB\%ostrya pull \-\-collection\fR, \fB\%ostrya remote refs\fR, and \fB\%ostrya remote summary\fR need a summary.
@@ -346,6 +352,7 @@ The objects, in lowercase hex.
 \fB\%<ext>\fR is \fB\%commit\fR, \fB\%commitmeta\fR, \fB\%dirtree\fR, \fB\%dirmeta\fR, \fB\%filez\fR, \fB\%tombstone\-commit\fR, or \fB\%cfs\fR.
 Each other key under \fB\%objects/\fR is a stray key.
 \fB\%ostrya remote fsck\fR reports each stray key, and no command deletes one.
+\fB\%ostrya remote prune\fR deletes each object that no root reaches, and leaves each \fB\%tombstone\-commit\fR.
 .TP
 \fB\%refs/heads/<name>\fR
 The refs of the repository, and of its own collection.
@@ -359,12 +366,15 @@ It does not check the keys under \fB\%refs/\fR outside that directory.
 .TP
 \fB\%deltas/\fR, \fB\%delta\-indexes/\fR
 The static deltas and their index files, in the layout of the section STATIC DELTAS.
+\fB\%ostrya remote prune\fR deletes each delta whose target commit is not in the bucket after the prune, the \fB\%superblock\fR first, also a delta with no superblock.
+It leaves each key under \fB\%deltas/\fR that is not a key of a bucket repository, and each key under \fB\%delta\-indexes/\fR.
 .TP
 \fB\%state/<checksum>.commitpartial\fR
 The marker of a commit whose tree misses objects, with the one byte \fB\%0x66\fR, in lowercase hex.
 \fB\%ostrya remote fsck \-\-delete\fR writes it for each commit that reaches a missing or a bad object of a tree, before it deletes the bad objects, and deletes the marker of each commit whose tree is whole.
 A push of a ref whose commit has a marker uploads the objects of the tree that the bucket lacks, and then deletes the marker.
 After a repair that failed, run \fB\%ostrya remote fsck \-\-delete\fR again before a push: until then, the bad objects of a commit with a marker can stay in the bucket, and a push uploads no object that the bucket holds.
+\fB\%ostrya remote prune\fR deletes the marker of each commit that is not in the bucket after the prune, and keeps each other key under \fB\%state/\fR.
 Each other commit object of a bucket repository has its whole tree in the bucket.
 .TP
 \fB\%extensions/ostrya/lock\fR

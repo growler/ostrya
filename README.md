@@ -59,7 +59,8 @@ Ostrya adds these functions, which the `ostree` command does not have:
   it, and `ostrya push-tree` writes a directory to it as a new commit, each
   under a writer lock. `ostrya pull`, `ostrya remote refs`, and
   `ostrya remote summary` read it. `ostrya remote fsck` checks it, and with
-  `--delete` repairs it. Each request is signed with AWS Signature
+  `--delete` repairs it. `ostrya remote prune` deletes its unreachable
+  objects under the writer lock. Each request is signed with AWS Signature
   Version 4 and the AWS credentials of the environment or of the shared AWS
   files.
 - HTTP server. `ostrya serve` serves a repository of any mode to the pull of
@@ -143,7 +144,7 @@ The `ostrya` command has these subcommands:
 - `static-delta`: list, generate, apply, and index static deltas.
 - `prune` and `fsck`: delete unreachable objects and verify the repository.
 - `composefs-image`, `push`, `push-tree`, `receive`, `send`, `serve`,
-  `remote init`, and `remote fsck`: the port extensions.
+  `remote init`, `remote fsck`, and `remote prune`: the port extensions.
 
 Each subcommand has a man page, for example `ostrya-commit(1)`. The page
 `ostrya-repo(5)` describes the layout of a repository, and the page

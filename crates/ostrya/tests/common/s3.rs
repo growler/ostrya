@@ -13,7 +13,7 @@
 //!   requests that it interrupts, refuses, or delays, the requests that get
 //!   503, the lists that get 403, the keys whose `GET` gets 404 with a body
 //!   of the test, the key whose body it cuts, and the incomplete multipart
-//!   uploads that it lists.
+//!   uploads that it lists and aborts.
 //!
 //! A test skips when `rclone` or `weed` is not on `PATH`, and writes the
 //! reason to standard error. With `OSTRYA_REQUIRE_S3` set, a missing
@@ -416,6 +416,10 @@ pub struct State {
     /// A method and a key prefix: each request of the method to a key that
     /// starts with the prefix gets 403 `AccessDenied` and changes nothing.
     pub refuse: Option<(&'static str, String)>,
+    /// A method, a key prefix, and a count `n`: the `n`-th request of the
+    /// method to a key that starts with the prefix, and each later one, gets
+    /// 403 `AccessDenied` and changes nothing.
+    pub refuse_from: Option<(&'static str, String, usize)>,
     /// A list that gets 403 `AccessDenied`: the prefix of a
     /// `ListObjectsV2`, with the prefix of the repository, or `uploads` for
     /// each `ListMultipartUploads`.
@@ -441,10 +445,13 @@ pub struct State {
     pub truncate: Option<(String, usize, usize)>,
     /// The incomplete multipart uploads that `ListMultipartUploads` gives:
     /// the key with the prefix of the repository, the upload id, and the
-    /// `Initiated` time.
+    /// `Initiated` time. A `DELETE KEY?uploadId=ID` removes the upload, and
+    /// gets 404 `NoSuchUpload` if the list holds no such upload.
     pub uploads: Vec<(String, String, String)>,
     /// The number of requests of each method.
     counts: BTreeMap<String, usize>,
+    /// The number of requests that [`State::refuse_from`] matched.
+    refuse_from_count: usize,
     /// The number of each `ETag`.
     etags: u64,
 }
@@ -473,8 +480,8 @@ impl State {
 /// bucket `bkt`.
 ///
 /// The server accepts each signature, and keeps the `Authorization` header of
-/// each request. It answers `GET`, `PUT`, and `DELETE` of a key,
-/// `ListObjectsV2` with pages of at most 1000 keys, `ListObjectsV2` with the
+/// each request. It answers `GET`, `PUT`, and `DELETE` of a key, the abort
+/// of an upload, `ListObjectsV2` with pages of at most 1000 keys, `ListObjectsV2` with the
 /// delimiter `/` in one page, and `ListMultipartUploads` in one page. One
 /// thread serves each connection.
 pub struct StandIn {
@@ -497,6 +504,7 @@ impl StandIn {
             before: None,
             before_key: None,
             refuse: None,
+            refuse_from: None,
             refuse_list: None,
             delay: None,
             slow_down: None,
@@ -505,6 +513,7 @@ impl StandIn {
             truncate: None,
             uploads: Vec::new(),
             counts: BTreeMap::new(),
+            refuse_from_count: 0,
             etags: 0,
         }));
         let shared = state.clone();
@@ -593,11 +602,22 @@ fn serve(mut stream: TcpStream, state: &Mutex<State>) {
                 let (_, _, change) = state.before_key.take().unwrap();
                 change(&mut state.objects);
             }
-            let refused = state.refuse.as_ref().is_some_and(|(method, prefix)| {
-                *method == request.method && key.as_deref().is_some_and(|k| k.starts_with(prefix))
-            }) || (request.method == "GET"
-                && state.refuse_list.is_some()
-                && list_name(&request.target) == state.refuse_list);
+            let from = state.refuse_from.as_ref().and_then(|(method, prefix, n)| {
+                (*method == request.method && key.as_deref().is_some_and(|k| k.starts_with(prefix)))
+                    .then_some(*n)
+            });
+            let refused_from = from.is_some_and(|n| {
+                state.refuse_from_count += 1;
+                state.refuse_from_count >= n
+            });
+            let refused = refused_from
+                || state.refuse.as_ref().is_some_and(|(method, prefix)| {
+                    *method == request.method
+                        && key.as_deref().is_some_and(|k| k.starts_with(prefix))
+                })
+                || (request.method == "GET"
+                    && state.refuse_list.is_some()
+                    && list_name(&request.target) == state.refuse_list);
             let close = state
                 .close_after
                 .is_some_and(|(method, n)| method == request.method && n == count);
@@ -702,6 +722,22 @@ fn answer(state: &mut State, request: &Request) -> (u16, Vec<(String, String)>, 
             (200, vec![("ETag".to_owned(), etag)], Vec::new())
         }
         "DELETE" => {
+            if let Some(id) = query
+                .split('&')
+                .filter_map(|pair| pair.split_once('='))
+                .find(|(name, _)| *name == "uploadId")
+                .map(|(_, value)| decode(value))
+            {
+                let Some(at) = state
+                    .uploads
+                    .iter()
+                    .position(|(upload, upload_id, _)| *upload == key && *upload_id == id)
+                else {
+                    return (404, Vec::new(), s3_error("NoSuchUpload"));
+                };
+                state.uploads.remove(at);
+                return (204, Vec::new(), Vec::new());
+            }
             if let Some(wanted) = request.header("if-match")
                 && state.honor_if_match
             {

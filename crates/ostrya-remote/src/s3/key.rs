@@ -27,11 +27,14 @@ const OBJECT_EXTENSIONS: [&str; 7] = [
 /// Returns `true` if `key`, relative to the prefix of the repository, is a
 /// key of a bucket repository.
 ///
-/// The keys are:
+/// Each call of [`Bucket`](super::Bucket) on a key refuses each other key,
+/// and [`Bucket::list_uploads`](super::Bucket::list_uploads) gives the
+/// uploads of these keys alone. The keys are:
 ///
 /// - `config`, `summary`, `summary.sig`, and `extensions/ostrya/lock`
 /// - `objects/XX/<62 hex digits>.<ext>`, with lowercase hex digits and an
-///   extension of [`OBJECT_EXTENSIONS`]
+///   extension `commit`, `commitmeta`, `dirtree`, `dirmeta`, `filez`,
+///   `tombstone-commit`, or `cfs`
 /// - `refs/heads/<name>`, with a name that [`is_ref_name`] accepts
 /// - `refs/mirrors/<id>/<name>`, with an id of at most 255 bytes that
 ///   [`is_collection_id`] accepts, and a name that [`is_ref_name`] accepts
@@ -41,7 +44,7 @@ const OBJECT_EXTENSIONS: [&str; 7] = [
 /// - `delta-indexes/<2>/<41>.index`, with a checksum in modified base64
 /// - `state/<64 hex digits>.commitpartial`, with lowercase hex digits: the
 ///   marker of a partial commit.
-pub(crate) fn is_repository_key(key: &str) -> bool {
+pub fn is_repository_key(key: &str) -> bool {
     if SINGLE_KEYS.contains(&key) {
         return true;
     }

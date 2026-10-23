@@ -381,7 +381,7 @@ impl PruneOptions {
 
     /// Returns the bound of a branch that no `retain_branch_depth` entry names
     /// and that `only_branch` leaves at the global setting.
-    fn global_bound(&self) -> ParentBound {
+    pub(crate) fn global_bound(&self) -> ParentBound {
         match self.keep_younger_than {
             Some(since) => ParentBound::Since(since),
             None => ParentBound::depth(self.depth),
@@ -392,7 +392,7 @@ impl PruneOptions {
     ///
     /// A time bound, a branch selection, and a depth for one branch each have
     /// the same effect as `refs_only`.
-    fn roots_on_refs_alone(&self) -> bool {
+    pub(crate) fn roots_on_refs_alone(&self) -> bool {
         self.refs_only
             || self.keep_younger_than.is_some()
             || !self.only_branch.is_empty()
@@ -459,7 +459,7 @@ fn merge_metadata_keys(config: Vec<String>, caller: &[String]) -> Vec<String> {
 /// narrows the counts to commit objects, which is what the
 /// `ostree` command reports. Static deltas are not loose objects, so they are
 /// outside both counts.
-fn counted(ty: ObjectType, commit_only: bool) -> bool {
+pub(crate) fn counted(ty: ObjectType, commit_only: bool) -> bool {
     if commit_only {
         ty == ObjectType::Commit
     } else {

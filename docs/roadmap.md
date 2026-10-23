@@ -124,6 +124,10 @@ for it.
   `Repo::push_to_bucket` or `ostrya push`, which then uploads the
   `.commitmeta` alone. A signer in the options of the tree push, as the
   signing options of `commit`, closes the gap.
+- A parallel reachability walk of the bucket prune. `BucketRepo::prune`
+  reads one commit or dirtree at a time, so a run costs one round trip for
+  each metadata object that it reaches. The `Slots` driver of the pull has
+  the necessary shape.
 
 ## Open decisions
 

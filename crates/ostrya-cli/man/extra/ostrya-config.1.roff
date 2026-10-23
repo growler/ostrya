@@ -88,6 +88,7 @@ A value outside 0 to 100 is refused.
 \fB\%tombstone\-commits\fR (boolean, default false)
 Write a \fB\%.tombstone\-commit\fR object for each commit that \fB\%ostrya prune\fR deletes.
 The summary records the value as \fB\%ostree.summary.tombstone\-commits\fR.
+\fB\%ostrya remote prune\fR writes no tombstone, so it refuses a bucket repository whose \fB\%config\fR sets this key to true.
 .TP
 \fB\%indexed\-deltas\fR (boolean, default true)
 The root summary records the value as \fB\%ostree.summary.indexed\-deltas\fR.
@@ -219,7 +220,7 @@ The push address, in the forms of \fB\%pull\-url\fR.
 If this key is absent and \fB\%url\fR does not start with \fB\%http://\fR or \fB\%https://\fR, a push to the remote fails.
 \fB\%ostrya push\fR and \fB\%ostrya push\-tree\fR write the bucket repository at an \fB\%s3://\fR address.
 The bucket repository needs a \fB\%config\fR first, which \fB\%ostrya remote init\fR writes.
-\fB\%ostrya remote init\fR and \fB\%ostrya remote fsck\fR take the \fB\%s3://\fR address of this key, else the \fB\%s3://\fR address of \fB\%pull\-url\fR.
+\fB\%ostrya remote init\fR, \fB\%ostrya remote fsck\fR, and \fB\%ostrya remote prune\fR take the \fB\%s3://\fR address of this key, else the \fB\%s3://\fR address of \fB\%pull\-url\fR.
 .TP
 \fB\%ssh\-command\fR (string, default ssh)
 The ssh command line of a push or a pull over ssh, split at ASCII white space with no quoting rule.
@@ -283,12 +284,13 @@ The pull reads a 403 as an error, so an absent optional file, for example \fB\%s
 .PP
 The key pair of a push or a tree push to an \fB\%s3://\fR address needs the permissions \fB\%s3:GetObject\fR, \fB\%s3:PutObject\fR, \fB\%s3:ListBucket\fR, \fB\%s3:DeleteObject\fR, and \fB\%s3:AbortMultipartUpload\fR on the bucket.
 The key pair of the init of a bucket repository needs \fB\%s3:GetObject\fR, \fB\%s3:PutObject\fR, \fB\%s3:ListBucket\fR, and \fB\%s3:DeleteObject\fR.
+The key pair of \fB\%ostrya remote prune\fR needs the permissions of a push and \fB\%s3:ListBucketMultipartUploads\fR, also with \fB\%\-\-no\-prune\fR.
 Each of these writers takes and removes the writer lock of the bucket repository, which \fB\%ostrya\-repo\fR(5) describes.
 .PP
 For an ssh address, a push reads \fB\%ssh\-command\fR and \fB\%receive\-command\fR, and ignores the HTTP keys.
 For an HTTP address, a push reads \fB\%push\-token\-file\fR, \fB\%push\-user\fR, \fB\%proxy\fR, and the TLS keys.
 For an \fB\%http://\fR address, a push reads no file that a TLS key names, and does not read \fB\%tls\-permissive\fR.
-For an \fB\%s3://\fR address, a push, a tree push, \fB\%ostrya remote init\fR, and \fB\%ostrya remote fsck\fR read the S3 keys, \fB\%proxy\fR, and the TLS keys.
+For an \fB\%s3://\fR address, a push, a tree push, \fB\%ostrya remote init\fR, \fB\%ostrya remote fsck\fR, and \fB\%ostrya remote prune\fR read the S3 keys, \fB\%proxy\fR, and the TLS keys.
 It refuses \fB\%tls\-permissive=true\fR, \fB\%push\-token\-file\fR, and \fB\%push\-user\fR, and ignores \fB\%ssh\-command\fR, \fB\%send\-command\fR, and \fB\%receive\-command\fR.
 .PP
 For an ssh address, a pull reads \fB\%ssh\-command\fR and \fB\%send\-command\fR, and ignores \fB\%proxy\fR and the TLS keys.
@@ -305,6 +307,7 @@ The group is an extension of ostrya, and the \fB\%ostree\fR tool ignores it.
 \fB\%gc\-root\-metadata\-keys\fR (list)
 Metadata keys that hold more roots for a prune.
 Each prune reads this key: a prune of \fB\%ostrya prune\fR, and a prune of a program that uses the ostrya library.
+\fB\%ostrya remote prune\fR reads no metadata key, so it refuses a bucket repository whose \fB\%config\fR sets this key.
 Such a program can add metadata keys to a prune, but it cannot remove a key of this list.
 A value that has a malformed escape sequence fails the prune before the repository lock, and the prune deletes nothing.
 A prune reads each entry with such a key, in the metadata and in the detached metadata of a commit.
@@ -795,7 +798,7 @@ The paths of the shared AWS credentials file and config file.
 .PP
 A profile that \fB\%s3\-profile\fR or \fB\%\-\-s3\-profile\fR names turns off \fB\%AWS_ACCESS_KEY_ID\fR, \fB\%AWS_SECRET_ACCESS_KEY\fR, \fB\%AWS_SESSION_TOKEN\fR, \fB\%AWS_REGION\fR, \fB\%AWS_DEFAULT_REGION\fR, \fB\%AWS_ENDPOINT_URL_S3\fR, and \fB\%AWS_ENDPOINT_URL\fR.
 .PP
-The commands that read and write a bucket repository at an \fB\%s3://\fR address read the AWS variables: \fB\%ostrya pull\fR, \fB\%ostrya push\fR, \fB\%ostrya push\-tree\fR, \fB\%ostrya remote init\fR, \fB\%ostrya remote fsck\fR, \fB\%ostrya remote refs\fR, and \fB\%ostrya remote summary\fR.
+The commands that read and write a bucket repository at an \fB\%s3://\fR address read the AWS variables: \fB\%ostrya pull\fR, \fB\%ostrya push\fR, \fB\%ostrya push\-tree\fR, \fB\%ostrya remote init\fR, \fB\%ostrya remote fsck\fR, \fB\%ostrya remote prune\fR, \fB\%ostrya remote refs\fR, and \fB\%ostrya remote summary\fR.
 The \fB\%ostrya\fR command built without its feature \fB\%s3\fR refuses an \fB\%s3://\fR address, and does not read them.
 .TP
 \fB\%http_proxy\fR, \fB\%https_proxy\fR, \fB\%HTTPS_PROXY\fR, \fB\%all_proxy\fR, \fB\%ALL_PROXY\fR, \fB\%no_proxy\fR, \fB\%NO_PROXY\fR

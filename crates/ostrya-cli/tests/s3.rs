@@ -2,7 +2,7 @@
 
 //! `ostrya` with a bucket repository at an `s3://` address: `remote init`,
 //! `push`, `push-tree`, `pull`, `remote refs`, `remote summary`, `remote
-//! fsck`, and `remote add`.
+//! fsck`, `remote prune`, and `remote add`.
 //!
 //! Most tests run against the S3 stand-in of
 //! `crates/ostrya/tests/common/s3.rs`, which holds its objects in memory,
@@ -449,6 +449,7 @@ fn an_http_s3_endpoint_needs_allow_cleartext_credentials() {
     ]);
     let mut runs: Vec<Vec<&str>> = vec![
         vec!["remote", "init", ADDRESS, &endpoint],
+        vec!["remote", "prune", ADDRESS, &endpoint],
         vec![&repo, "pull", "r", "main"],
         vec![&repo, "remote", "refs", "r"],
         vec![&repo, "remote", "summary", "r"],
@@ -1686,6 +1687,197 @@ fn remote_fsck_of_a_remote_takes_its_address_and_its_summary_keys() {
     );
     let message = scratch.fails(&["remote", "fsck", "https://ex.com/r"]);
     assert!(message.starts_with("error: "), "{message}");
+}
+
+// ---------------------------------------------------------------------------
+// remote prune
+// ---------------------------------------------------------------------------
+
+/// Makes a local repository `local` with the commits `one` and `two` on
+/// `main`, and copies its objects and its ref files into the bucket
+/// repository at [`ADDRESS`] of `server`, with the config [`PLAIN`].
+/// Returns the `--repo` option of the local repository, and the two commits.
+fn prune_fixture(scratch: &Scratch, server: &StandIn) -> (String, String, String) {
+    let repo = scratch.repo("local");
+    let one = scratch.commit(&repo, "main", "one");
+    let two = scratch.commit(&repo, "main", "two");
+    let local = scratch.path().join("local");
+    for sub in ["objects", "refs"] {
+        let mut pending = vec![local.join(sub)];
+        while let Some(at) = pending.pop() {
+            for entry in std::fs::read_dir(&at).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    let key = path.strip_prefix(&local).unwrap().to_str().unwrap();
+                    let bytes = std::fs::read(&path).unwrap();
+                    server.state().store(&format!("repo/{key}"), &bytes);
+                }
+            }
+        }
+    }
+    server.state().store(CONFIG, PLAIN.as_bytes());
+    (repo, one, two)
+}
+
+/// Returns the number of keys under `repo/objects/` of `server`.
+fn object_count(server: &StandIn) -> usize {
+    server
+        .state()
+        .objects
+        .keys()
+        .filter(|key| key.starts_with("repo/objects/"))
+        .count()
+}
+
+#[test]
+fn remote_prune_prints_the_lines_of_prune_and_exits_0() {
+    let scratch = Scratch::new("prune-lines");
+    let server = StandIn::start();
+    let (_, one, _) = prune_fixture(&scratch, &server);
+    let total = object_count(&server);
+    let absent = "ab".repeat(32);
+    server
+        .state()
+        .store(&format!("repo/state/{absent}.commitpartial"), &[0x66]);
+    server.state().uploads.push((
+        format!("repo/objects/{}/{}.filez", &absent[..2], &absent[2..]),
+        "u1".to_owned(),
+        "2026-10-22T10:00:00.000Z".to_owned(),
+    ));
+    let endpoint = endpoint_of(&server);
+    let args = [
+        "remote",
+        "prune",
+        "--refs-only",
+        "--depth=0",
+        ADDRESS,
+        &endpoint,
+        CLEARTEXT,
+    ];
+    let mut dry = args.to_vec();
+    dry.push("--no-prune");
+    let out = scratch.run(&dry);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stderr(&out), "");
+    let lines: Vec<String> = stdout(&out).lines().map(str::to_owned).collect();
+    assert_eq!(lines.len(), 4, "{lines:?}");
+    assert_eq!(lines[0], format!("Total objects: {total}"));
+    assert!(
+        lines[1].starts_with("Would delete: 3 objects, freeing "),
+        "{}",
+        lines[1]
+    );
+    assert_eq!(lines[2], "Would delete 1 partial-commit markers");
+    assert_eq!(lines[3], "Would abort 1 incomplete multipart uploads");
+    assert_eq!(object_count(&server), total);
+    let out = scratch.ok(&args);
+    let lines: Vec<&str> = out.lines().collect();
+    assert_eq!(lines.len(), 4, "{lines:?}");
+    assert_eq!(lines[0], format!("Total objects: {total}"));
+    assert!(lines[1].starts_with("Deleted 3 objects, "), "{}", lines[1]);
+    assert!(lines[1].ends_with(" freed"), "{}", lines[1]);
+    assert_eq!(lines[2], "Deleted 1 partial-commit markers");
+    assert_eq!(lines[3], "Aborted 1 incomplete multipart uploads");
+    assert_eq!(object_count(&server), total - 3);
+    let commit = format!("repo/objects/{}/{}.commit", &one[..2], &one[2..]);
+    assert!(object(&server, &commit).is_none());
+    assert!(object(&server, LOCK).is_none());
+    assert_eq!(
+        scratch.ok(&args),
+        format!("Total objects: {}\nNo unreachable objects\n", total - 3)
+    );
+}
+
+#[test]
+fn remote_prune_of_a_remote_takes_push_url_then_pull_url() {
+    let scratch = Scratch::new("prune-remote");
+    let server = StandIn::start();
+    let (repo, _, _) = prune_fixture(&scratch, &server);
+    let total = object_count(&server);
+    scratch.append_config(
+        &repo,
+        &format!(
+            "\n[remote \"push\"]\npull-url=s3://bkt/other\npush-url={ADDRESS}\ns3-endpoint={0}\n\
+             \n[remote \"pull\"]\npull-url={ADDRESS}\ns3-endpoint={0}\n\
+             \n[remote \"http\"]\nurl=https://ex.com/r\n",
+            server.endpoint()
+        ),
+    );
+    assert_eq!(
+        scratch.ok(&[&repo, "remote", "prune", "push", CLEARTEXT]),
+        format!("Total objects: {total}\nNo unreachable objects\n")
+    );
+    let out = scratch.ok(&[
+        &repo,
+        "remote",
+        "prune",
+        "--refs-only",
+        "--depth",
+        "0",
+        "pull",
+        CLEARTEXT,
+    ]);
+    assert!(out.contains("\nDeleted 3 objects, "), "{out}");
+    let message = scratch.fails(&[&repo, "remote", "prune", "http", CLEARTEXT]);
+    assert_eq!(
+        message,
+        "error: invalid input: remote 'http' holds no s3:// address in push-url or pull-url\n"
+    );
+}
+
+#[test]
+fn remote_prune_refuses_a_bad_date_and_an_option_of_the_local_prune_before_a_request() {
+    let scratch = Scratch::new("prune-refusals");
+    let server = StandIn::start();
+    let endpoint = endpoint_of(&server);
+    let message = scratch.fails(&[
+        "remote",
+        "prune",
+        "--keep-younger-than=yesterday",
+        ADDRESS,
+        &endpoint,
+        CLEARTEXT,
+    ]);
+    assert_eq!(message, "error: Could not parse 'yesterday'\n");
+    for option in [
+        "--delete-commit=main",
+        "--commit-only",
+        "--only-branch=main",
+    ] {
+        let message = scratch.fails(&["remote", "prune", option, ADDRESS, &endpoint, CLEARTEXT]);
+        assert!(
+            message.contains("unexpected argument"),
+            "{option}: {message}"
+        );
+    }
+    let message = scratch.fails(&["remote", "prune", "https://ex.com/r", &endpoint]);
+    assert!(message.starts_with("error: "), "{message}");
+    assert!(server.state().requests.is_empty());
+}
+
+#[test]
+fn remote_prune_with_break_lock_removes_a_lock_and_prints_its_holder() {
+    let scratch = Scratch::new("prune-break-lock");
+    let server = StandIn::start();
+    prune_fixture(&scratch, &server);
+    server.state().store(LOCK, DEAD_LOCK.as_bytes());
+    let endpoint = endpoint_of(&server);
+    let message = scratch.fails(&["remote", "prune", ADDRESS, &endpoint, CLEARTEXT]);
+    assert!(message.contains("is locked"), "{message}");
+    let out = scratch.run(&[
+        "remote",
+        "prune",
+        "--break-lock",
+        ADDRESS,
+        &endpoint,
+        CLEARTEXT,
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stderr(&out), format!("{DEAD_LOCK_LINE}\n"));
+    assert!(stdout(&out).ends_with("No unreachable objects\n"));
+    assert!(object(&server, LOCK).is_none());
 }
 
 // ---------------------------------------------------------------------------

@@ -15,11 +15,12 @@ use ostrya_core::{Checksum, MAX_METADATA_SIZE, ObjectName, ObjectType};
 
 use super::invalid;
 use super::s3::{
-    BucketState, CompressorPool, Counts, Job, Namespace, Origin, Update, Uploads, fail, read_state,
+    BucketState, CompressorPool, Counts, Job, Namespace, Origin, Update, Uploads, read_state,
     write_bucket_refs,
 };
 use crate::bucket::{
     BucketPushOutcome, BucketRepo, BucketWriteOptions, LockOperation, check_prefixes, object_key,
+    release_on_error,
 };
 use crate::error::{Error, Result};
 use crate::remote::{
@@ -177,14 +178,14 @@ impl BucketRepo {
         let Uploaded { update, mut stats } = match self.upload_tree(&scanned, write.part_size).await
         {
             Ok(uploaded) => uploaded,
-            Err(e) => return Err(fail(lock, e).await),
+            Err(e) => return Err(release_on_error(lock, e).await),
         };
         if let Some(progress) = &scanned.progress {
             progress.set_phase(PushPhase::Committing);
         }
         let updates = [update];
         if let Err(e) = write_bucket_refs(self, &lock, &[], &updates).await {
-            return Err(fail(lock, e).await);
+            return Err(release_on_error(lock, e).await);
         }
         lock.release().await?;
         stats.elapsed = start.elapsed();

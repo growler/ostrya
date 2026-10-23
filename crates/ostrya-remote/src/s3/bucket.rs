@@ -653,8 +653,10 @@ impl Bucket {
     /// A dropped future sends no abort, so the upload stays open, and it
     /// holds storage in the bucket. [`list_uploads`](Bucket::list_uploads)
     /// gives each such upload, and [`abort_upload`](Bucket::abort_upload)
-    /// aborts it. To remove such uploads with no call of the client, set a
-    /// lifecycle rule on the bucket that aborts incomplete multipart uploads.
+    /// aborts it. The prune of a bucket repository of the `ostrya` crate
+    /// aborts each such upload. To remove such uploads with no call of the
+    /// client, set a lifecycle rule on the bucket that aborts incomplete
+    /// multipart uploads.
     ///
     /// # Errors
     ///

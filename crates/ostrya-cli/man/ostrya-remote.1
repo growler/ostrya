@@ -222,6 +222,85 @@ It wins over the \fB\%s3\-profile\fR key of the remote and over \fB\%AWS_PROFILE
 Send the signature of each request to an \fB\%http://\fR \%S3 server.
 .IP
 The signature is a credential. Without this switch, the command refuses an \fB\%http://\fR \%S3 server before any request. Use it for a server on a loopback address or behind a proxy that terminates TLS. No key of the remote sets this switch. The command refuses it for an address that is not \fB\%s3://\fR\&.
+.SS "prune"
+Delete the unreachable objects of a bucket repository in an \%S3 bucket.
+.PP
+The command prunes the bucket repository at the \fB\%s3://\fR address of NAME, or at the address \fB\%s3://BUCKET[/PREFIX]\fR, as \fB\%ostrya prune\fR prunes a local repository with the same options. The commit of each ref is a root. Without \%\-\-refs\-only and \%\-\-keep\-younger\-than, each commit of the bucket is a root too. The commits that the summary names are roots, and the command keeps them with no parent. A kept commit keeps its detached metadata and its composefs image. Without \%\-\-refs\-only and \%\-\-keep\-younger\-than, the command also deletes the detached metadata and the composefs image of a parent commit that the bucket does not hold, which \fB\%ostrya prune\fR can keep.
+.PP
+The command deletes each object that no root reaches, then each static delta and each \fB\%state/<commit>.commitpartial\fR marker whose commit is not in the bucket after the run, and aborts each incomplete multipart upload. It deletes the commit objects first, so a run that stops leaves a bucket repository that a reader can use, and the next run deletes the rest. It deletes no ref, no \fB\%\&.tombstone\-commit\fR, and no key under \fB\%delta\-indexes/\fR\&.
+.PP
+The command reads each commit and dirtree that the walk reaches with one GET, one at a time, and checks its checksum. A commit or a dirtree whose bytes do not match its name stops the command before its first delete. Run \fB\%ostrya remote fsck \-\-delete\fR to repair such an object.
+.PP
+The command writes no summary, and keeps each commit that the summary names. A summary that names a deleted static delta stays as it is until an explicit update of the summary.
+.PP
+The command prints the lines of \fB\%ostrya prune\fR: \fB\%Total objects: N\fR, then \fB\%Deleted N objects, SIZE freed\fR, or with \%\-\-no\-prune \fB\%Would delete: N objects, freeing SIZE\fR, or \fB\%No unreachable objects\fR\&. The counts leave out the detached metadata, the composefs images, and the static deltas. Then, for each count that is not zero, it prints \fB\%Deleted N static deltas\fR, \fB\%Deleted N partial\-commit markers\fR, and \fB\%Aborted N incomplete multipart uploads\fR, or with \%\-\-no\-prune \fB\%Would delete N static deltas\fR, \fB\%Would delete N partial\-commit markers\fR, and \fB\%Would abort N incomplete multipart uploads\fR\&.
+.PP
+The command takes the writer lock of the bucket repository, also with \%\-\-no\-prune, and removes it at the end. It needs the \%S3 permissions of a push, \fB\%s3:GetObject\fR, \fB\%s3:PutObject\fR, \fB\%s3:ListBucket\fR, \fB\%s3:DeleteObject\fR, and \fB\%s3:AbortMultipartUpload\fR, and also \fB\%s3:ListBucketMultipartUploads\fR\&. It refuses a bucket repository whose \fB\%config\fR sets \fB\%[core] tombstone\-commits\fR to true or sets \fB\%[ex\-ostrya] gc\-root\-metadata\-keys\fR\&.
+.PP
+With an address, the command needs no repository and reads no \fB\%\-\-repo\fR, current directory, or \fB\%OSTREE_REPO\fR\&. With a remote name, it reads the remote from the config of the repository. With \%\-\-break\-lock, a prune that removed the writer lock of another writer writes one \fB\%warning: removed the writer lock of HOLDER\fR line to standard error.
+.PP
+.nf
+ostrya remote prune [OPTIONS] [NAME]
+.fi
+.PP
+Arguments:
+.TP
+\fINAME\fR
+The remote name or the address \fB\%s3://BUCKET[/PREFIX]\fR\&. Required.
+.IP
+The address of a remote is its \fB\%push\-url\fR key if that key holds an \fB\%s3://\fR address, else its \fB\%pull\-url\fR key if that key holds an \fB\%s3://\fR address. The command refuses a remote with neither, and never reads the \fB\%url\fR key.
+.PP
+Options:
+.TP
+\fB\-\-refs\-only\fR
+Delete each commit and object that no ref reaches.
+.IP
+Without this option, each commit of the bucket is a root of the walk. A commit that no ref names then stays, with the objects that it reaches.
+.TP
+\fB\-\-depth\fR \fIDEPTH\fR
+The number of parents of each ref to keep.
+.IP
+The value \%\-1 keeps all history. The value \%0 keeps only the commit that the ref names, and so does each negative value other than \%\-1. The bound deletes commits only if the walk starts from the refs alone: with \%\-\-refs\-only or \%\-\-keep\-younger\-than. Default: \%\-1.
+.TP
+\fB\-\-keep\-younger\-than\fR \fIDATE\fR
+Delete the history of each ref that is older than DATE.
+.IP
+DATE is \fB\%@SECONDS\fR since the Unix epoch, or a date and time with a UTC offset, for example \fB\%2024\-05\-01T12:00:00Z\fR or \fB\%2024\-05\-01 12:00+02:00\fR\&. The command refuses each other form before any request. The commit that a ref names stays at all ages. The walk starts from the refs alone, as with \%\-\-refs\-only. This bound replaces \%\-\-depth.
+.TP
+\fB\-\-no\-prune\fR
+Compute and print the statistics, and delete nothing.
+.IP
+The command still takes and removes the writer lock, so it needs the permissions of a writer.
+.TP
+\fB\-\-break\-lock\fR
+Remove the writer lock of another writer of the bucket repository.
+.IP
+The command reads the lock, deletes it, and then takes its own lock. It writes the holder of the removed lock to standard error after a prune that succeeds. Use it only when the holder is gone, for example after a crash.
+.TP
+\fB\-\-s3\-region\fR \fIREGION\fR
+The region of the signature of each request to the \%S3 server.
+.IP
+It wins over the \fB\%s3\-region\fR key of the remote, over \fB\%AWS_REGION\fR and \fB\%AWS_DEFAULT_REGION\fR, and over the \fB\%region\fR of the AWS profile. The default is \fB\%us\-east\-1\fR\&. The command refuses this option for an address that is not \fB\%s3://\fR\&.
+.TP
+\fB\-\-s3\-endpoint\fR \fIURL\fR
+The \fB\%http://\fR or \fB\%https://\fR URL of the \%S3 server, with no path.
+.IP
+It wins over the \fB\%s3\-endpoint\fR key of the remote, over \fB\%AWS_ENDPOINT_URL_S3\fR and \fB\%AWS_ENDPOINT_URL\fR, and over the endpoint of the AWS profile. Without each of them, the server is AWS. An \fB\%http://\fR URL needs \%\-\-allow\-cleartext\-credentials. The command refuses this option for an address that is not \fB\%s3://\fR\&.
+.TP
+\fB\-\-s3\-addressing\fR \fISTYLE\fR
+The addressing style of the bucket: \fB\%path\fR or \fB\%virtual\fR\&.
+.IP
+\fB\%path\fR puts the bucket in the path of each request, and \fB\%virtual\fR puts it in the host name. The option wins over the \fB\%s3\-addressing\fR key of the remote and over the \fB\%addressing_style\fR of the AWS profile. The default is \fB\%virtual\fR for AWS and \fB\%path\fR for a set server. A bucket name that holds a \fB\%\&.\fR gets \fB\%path\fR by default. The command refuses this option for an address that is not \fB\%s3://\fR\&. Possible values: path, virtual.
+.TP
+\fB\-\-s3\-profile\fR \fIPROFILE\fR
+The profile of the shared AWS files.
+.IP
+It wins over the \fB\%s3\-profile\fR key of the remote and over \fB\%AWS_PROFILE\fR\&. A profile that this option or the key names skips the key pair, the region, and the endpoint of the environment. The default profile is \fB\%default\fR\&. The command refuses this option for an address that is not \fB\%s3://\fR\&.
+.TP
+\fB\-\-allow\-cleartext\-credentials\fR
+Send the signature of each request to an \fB\%http://\fR \%S3 server.
+.IP
+The signature is a credential. Without this switch, the command refuses an \fB\%http://\fR \%S3 server before any request. Use it for a server on a loopback address or behind a proxy that terminates TLS. No key of the remote sets this switch. The command refuses it for an address that is not \fB\%s3://\fR\&.
 .SS "delete"
 Delete a remote repository and its trusted GPG keyring.
 .PP

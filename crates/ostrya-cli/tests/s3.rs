@@ -1891,6 +1891,33 @@ fn remote_prune_with_break_lock_removes_a_lock_and_prints_its_holder() {
     assert!(object(&server, LOCK).is_none());
 }
 
+#[test]
+fn remote_prune_refuses_break_lock_with_no_prune_before_a_request() {
+    let scratch = Scratch::new("prune-dry-break-lock");
+    let server = StandIn::start();
+    server.state().store(LOCK, DEAD_LOCK.as_bytes());
+    let endpoint = endpoint_of(&server);
+    for [first, second] in [
+        ["--no-prune", "--break-lock"],
+        ["--break-lock", "--no-prune"],
+    ] {
+        let out = scratch.run(&[
+            "remote", "prune", first, second, ADDRESS, &endpoint, CLEARTEXT,
+        ]);
+        assert_eq!(out.status.code(), Some(1), "{first} {second}");
+        assert!(out.stdout.is_empty());
+        let message = stderr(&out);
+        assert!(
+            message.contains("cannot be used with")
+                && message.contains("'--break-lock'")
+                && message.contains("'--no-prune'"),
+            "{message}"
+        );
+    }
+    assert!(server.state().requests.is_empty());
+    assert_eq!(object(&server, LOCK).as_deref(), Some(DEAD_LOCK.as_bytes()));
+}
+
 // ---------------------------------------------------------------------------
 // remote summary -u
 // ---------------------------------------------------------------------------

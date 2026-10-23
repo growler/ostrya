@@ -160,7 +160,8 @@
 //! a [`BucketPruneReport`]. It takes the [`PruneOptions`](crate::PruneOptions)
 //! of [`Repo::prune`](crate::Repo::prune), and refuses each option other than
 //! `refs_only`, `depth`, `keep_younger_than`, and `no_prune`. The run takes
-//! the writer lock with the operation `prune`, also with `no_prune`.
+//! the writer lock with the operation `prune`, also with `no_prune`, and
+//! refuses `break_lock` with `no_prune`.
 //!
 //! - The roots are the commits of the refs, the commits that the `summary`
 //!   names, and, unless the roots are on the refs alone, each commit of the

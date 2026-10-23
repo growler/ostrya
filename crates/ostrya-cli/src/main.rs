@@ -2271,7 +2271,7 @@ struct RemotePruneArgs {
     /// Compute and print the statistics, and delete nothing.
     ///
     /// The command still takes and removes the writer lock, so it needs the
-    /// permissions of a writer.
+    /// permissions of a writer. This option conflicts with --break-lock.
     #[arg(long)]
     no_prune: bool,
     /// Remove the writer lock of another writer of the bucket repository.
@@ -2279,8 +2279,8 @@ struct RemotePruneArgs {
     /// The command reads the lock, deletes it, and then takes its own lock.
     /// It writes the holder of the removed lock to standard error after a
     /// prune that succeeds. Use it only when the holder is gone, for example
-    /// after a crash.
-    #[arg(long)]
+    /// after a crash. This option conflicts with --no-prune.
+    #[arg(long, conflicts_with = "no_prune")]
     break_lock: bool,
     #[command(flatten)]
     s3: S3AccessArgs,

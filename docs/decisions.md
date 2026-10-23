@@ -1372,7 +1372,14 @@ update of the summary, and the fsck reports it as a `summary` error.
 
 A run with `no_prune` takes the writer lock too, so its counts describe a
 state that no writer changes during the run. Thus a dry run needs the
-permissions of a writer.
+permissions of a writer. The prune refuses `break_lock` together with
+`no_prune`, with `Error::InvalidInput`, before a request. Thus a dry run
+never removes the lock of another writer. A removed lock makes that writer
+fail at its next check of the lock. `ostrya remote prune` refuses
+`--break-lock` with `--no-prune` in the option parser. A refusal in the
+option parser alone was rejected: a library caller can set both options. A
+dry run that takes no lock, as the fsck with no repair, was rejected: its
+counts then describe a state that a concurrent push can change.
 
 The prune refuses a `config` that sets `[core] tombstone-commits=true`,
 because it writes no tombstone, and a `config` that sets

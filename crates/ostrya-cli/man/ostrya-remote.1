@@ -272,12 +272,12 @@ DATE is \fB\%@SECONDS\fR since the Unix epoch, or a date and time with a UTC off
 \fB\-\-no\-prune\fR
 Compute and print the statistics, and delete nothing.
 .IP
-The command still takes and removes the writer lock, so it needs the permissions of a writer.
+The command still takes and removes the writer lock, so it needs the permissions of a writer. This option conflicts with \%\-\-break\-lock.
 .TP
 \fB\-\-break\-lock\fR
 Remove the writer lock of another writer of the bucket repository.
 .IP
-The command reads the lock, deletes it, and then takes its own lock. It writes the holder of the removed lock to standard error after a prune that succeeds. Use it only when the holder is gone, for example after a crash.
+The command reads the lock, deletes it, and then takes its own lock. It writes the holder of the removed lock to standard error after a prune that succeeds. Use it only when the holder is gone, for example after a crash. This option conflicts with \%\-\-no\-prune.
 .TP
 \fB\-\-s3\-region\fR \fIREGION\fR
 The region of the signature of each request to the \%S3 server.

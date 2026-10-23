@@ -6249,13 +6249,15 @@ The prune deletes the objects of a bucket repository that no root reaches.
 `ostrya remote prune` runs it. The prune takes the options `--refs-only`,
 `--depth`, `--keep-younger-than`, and `--no-prune` of `ostrya prune`, with
 the same meaning. The library refuses each other option of the local prune
-before a request. The prune keeps the objects of the listing that a local
-prune with the same options keeps in a repository with the same refs and
-objects, and also the objects of the commits that the summary names. One
-difference applies: without `--refs-only` and `--keep-younger-than`, the
-prune also deletes the `.commitmeta` and the `.cfs` of a parent commit that
-the listing does not hold. The local prune keeps these when its bound
-reaches that parent.
+before a request. The prune also refuses `--break-lock` together with
+`--no-prune` before a request. Thus a run with `--no-prune` removes no
+writer lock of another writer. The prune keeps the objects of the listing
+that a local prune with the same options keeps in a repository with the
+same refs and objects, and also the objects of the commits that the summary
+names. One difference applies: without `--refs-only` and
+`--keep-younger-than`, the prune also deletes the `.commitmeta` and the
+`.cfs` of a parent commit that the listing does not hold. The local prune
+keeps these when its bound reaches that parent.
 
 The roots are:
 

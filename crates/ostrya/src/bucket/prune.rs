@@ -33,7 +33,8 @@ pub(super) const UNBLOCK_SIZE: usize = 1024 * 1024;
 #[non_exhaustive]
 pub struct BucketPruneOptions {
     /// Remove the writer lock of another writer before the run takes its
-    /// own, as [`BucketRepo::lock`] states.
+    /// own, as [`BucketRepo::lock`] states. The run refuses this option with
+    /// [`no_prune`](PruneOptions::no_prune).
     pub break_lock: bool,
 }
 
@@ -178,7 +179,9 @@ impl BucketRepo {
     /// [`depth`](PruneOptions::depth),
     /// [`keep_younger_than`](PruneOptions::keep_younger_than), and
     /// [`no_prune`](PruneOptions::no_prune), as [`Repo::prune`](crate::Repo::prune)
-    /// takes them. Each other option must keep its default value.
+    /// takes them. Each other option must keep its default value. With
+    /// `no_prune`, [`break_lock`](BucketPruneOptions::break_lock) must be
+    /// false.
     ///
     /// # Roots
     ///
@@ -241,6 +244,9 @@ impl BucketRepo {
     ///   `depth`, `keep_younger_than`, and `no_prune` is not at its default
     ///   value. The message names the first such field, in the order of the
     ///   fields. The run then sends no request.
+    /// - [`Error::InvalidInput`] if `no_prune` and
+    ///   [`break_lock`](BucketPruneOptions::break_lock) are both set. The run
+    ///   then sends no request.
     /// - [`Error::Remote`] with
     ///   [`InvalidInput`](crate::remote::Error::InvalidInput) if the bucket
     ///   repository has no `config`, or if its `config` sets
@@ -291,6 +297,13 @@ impl BucketRepo {
         bucket_opts: &BucketPruneOptions,
     ) -> Result<BucketPruneReport> {
         refuse_options(opts)?;
+        if opts.no_prune && bucket_opts.break_lock {
+            return Err(Error::InvalidInput(
+                "the prune of a bucket repository takes no break_lock with no_prune; a run with \
+                 no_prune never removes the writer lock of another writer"
+                    .to_owned(),
+            ));
+        }
         let Some(config) = self.read_config_strict().await? else {
             return Err(invalid(format!(
                 "the bucket repository {} has no config; init it first",

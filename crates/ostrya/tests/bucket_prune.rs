@@ -865,8 +865,36 @@ fn each_refused_option_fails_before_a_request() {
                 "{field}: {err}"
             );
         }
+        let mut break_lock = BucketPruneOptions::default();
+        break_lock.break_lock = true;
+        let dry = PruneOptions {
+            no_prune: true,
+            ..refs_only(0)
+        };
+        let err = f.bucket.prune(&dry, &break_lock).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidInput(m)
+                if m.contains("break_lock") && m.contains("no_prune")),
+            "{err}"
+        );
+        // A refused field of the prune options comes first.
+        let refused = PruneOptions {
+            commit_only: true,
+            no_prune: true,
+            ..PruneOptions::default()
+        };
+        let err = f.bucket.prune(&refused, &break_lock).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidInput(m)
+                if m.contains("option commit_only;") && !m.contains("break_lock")),
+            "{err}"
+        );
         assert!(f.server.state().requests.is_empty());
         assert_eq!(f.snapshot(), before);
+        // Without the break, the dry run takes the lock and fails on it.
+        f.server.state().store(LOCK, DEAD_LOCK.as_bytes());
+        let err = f.prune(&dry).await.unwrap_err();
+        assert!(matches!(err, Error::BucketLocked { .. }), "{err}");
     });
 }
 

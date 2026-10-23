@@ -4445,8 +4445,9 @@ allow-cleartext-credentials`.
   takes the writer lock, also with `--no-prune`, writes no summary, and
   refuses a bucket repository whose `config` sets
   `[core] tombstone-commits=true` or `[ex-ostrya] gc-root-metadata-keys`.
-  A commit or a dirtree whose bytes do not match its name fails the command
-  before its first delete.
+  The option parser refuses `--break-lock` with `--no-prune`. A commit or a
+  dirtree whose bytes do not match its name fails the command before its
+  first delete.
 - `remote summary -u` writes the summary of a bucket repository
   (`../format-reference.md`, "The summary of a bucket repository"). It
   takes the address of its operand as `remote init` does, with no
@@ -4521,7 +4522,8 @@ allow-cleartext-credentials`.
   `summary.sig` that can fail to match. Without the
   option, a locked bucket repository refuses the command with `error: the
   bucket repository ADDRESS is locked: another writer holds the writer
-  lock: HOLDER`. `--break-lock` of `push` conflicts with `--onto`.
+  lock: HOLDER`. `--break-lock` of `push` conflicts with `--onto`, and
+  `--break-lock` of `remote prune` conflicts with `--no-prune`.
 - `push` and `push-tree` refuse `--break-lock` and each S3 option for an
   HTTP or an ssh destination, before the remote resolves: `error: OPTION
   applies to an s3:// address, and the push address of 'REMOTE' is not

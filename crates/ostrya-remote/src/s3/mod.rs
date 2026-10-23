@@ -25,7 +25,7 @@
 //!   writes an object from a reader, in a multipart upload if the object is
 //!   longer than one part, and [`part_size`] gives the part size of an
 //!   object. [`Bucket::from_fetcher`] opens it over the signed fetcher of a
-//!   pull.
+//!   pull, and [`Bucket::counted`] adds byte counters to its fetcher.
 //! - [`is_repository_key`] tells if a key is a key of a bucket repository.
 //!
 //! The module reads static key pairs alone. It does not assume a role, run a

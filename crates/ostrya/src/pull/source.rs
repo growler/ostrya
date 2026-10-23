@@ -13,7 +13,8 @@
 //! bucket client, which reads the S3 error document of a failed request. So a
 //! wrong key, a bucket of another region, and an absent bucket give an S3
 //! error, and an absent bucket does not read as a repository with no
-//! summary. The bucket client counts no byte.
+//! summary. The bucket client adds the byte count of each body to the
+//! counters of the source, as the fetcher of the session does.
 
 use std::io;
 use std::pin::Pin;
@@ -64,7 +65,8 @@ pub(crate) struct RemoteSource {
     /// The counters that get the byte count of each body of a stream session.
     transferred: Vec<Arc<AtomicU64>>,
     /// The client of the bucket repository of a pull from an `s3://`
-    /// address. It reads `summary.sig`, `summary`, and `config`.
+    /// address. It reads `summary.sig`, `summary`, and `config`, and adds the
+    /// byte count of each body to the counters of the source itself.
     #[cfg(feature = "s3")]
     bucket: Option<Bucket>,
 }
@@ -114,7 +116,8 @@ impl RemoteSource {
     ///
     /// An HTTP session gets a handle on its fetcher with the counters. A
     /// stream session adds the count of each body through [`Counted`]. The
-    /// bucket client of the connection gets no counter.
+    /// bucket client of the connection gets the counters through
+    /// `Bucket::counted`.
     pub(crate) fn new(connection: Connection, transferred: Vec<Arc<AtomicU64>>) -> RemoteSource {
         let session = match connection.session {
             PullSession::Http(fetcher) => PullSession::Http(fetcher.counted(transferred.clone())),
@@ -122,9 +125,11 @@ impl RemoteSource {
         };
         RemoteSource {
             session,
-            transferred,
             #[cfg(feature = "s3")]
-            bucket: connection.bucket,
+            bucket: connection
+                .bucket
+                .map(|bucket| bucket.counted(transferred.clone())),
+            transferred,
         }
     }
 
@@ -180,14 +185,22 @@ impl RemoteSource {
 
     /// Reads the `summary` and the `summary.sig` of the remote over HTTP.
     ///
-    /// The source asks for `summary.sig` first. The bucket client reads the
-    /// two files if the source has one.
+    /// The source asks for `summary.sig` first. If the source has a bucket
+    /// client, the bucket client reads the two files, and an error of
+    /// `summary.sig` stops the read of `summary` and is the error of the call.
+    /// If the fetcher also admits two requests at once, the two requests are
+    /// in flight together. A source with no bucket client asks for `summary`
+    /// after `summary.sig`.
     async fn http_summary_files(&self) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>)> {
         #[cfg(feature = "s3")]
         if self.bucket.is_some() {
-            let signature = self.read_root(SUMMARY_SIG_FILE).await?;
-            let summary = self.read_root(SUMMARY_FILE).await?;
-            return Ok((summary, signature));
+            // The read of `summary` gives its error as a value. So an error of
+            // `summary.sig` stops the read of `summary`, and an error of
+            // `summary` waits for the result of `summary.sig`.
+            let summary = async { Ok::<_, Error>(self.read_root(SUMMARY_FILE).await) };
+            let (signature, summary) =
+                futures_lite::future::try_zip(self.read_root(SUMMARY_SIG_FILE), summary).await?;
+            return Ok((summary?, signature));
         }
         self.session.fetch_summary().await.map_err(http_error)
     }
@@ -197,7 +210,9 @@ impl RemoteSource {
     ///
     /// An absent file is `None`. The source asks for the files in the order
     /// of the `ostree` command. The stream source keeps the three requests in
-    /// flight together.
+    /// flight together. If the fetcher admits two requests at once, the bucket
+    /// client keeps the requests of `summary.sig` and `summary` in flight
+    /// together.
     pub(crate) async fn root_files(&self) -> Result<RootFiles> {
         match self.transfer() {
             Transfer::Http(_) => {
@@ -230,7 +245,8 @@ impl RemoteSource {
     ///
     /// An absent file is `None`. The source asks for `summary.sig` first, in
     /// the order of the `ostree` command. The stream source keeps the two
-    /// requests in flight together.
+    /// requests in flight together. The bucket client does the same if the
+    /// fetcher admits two requests at once.
     pub(crate) async fn summary_files(&self) -> Result<(Option<Vec<u8>>, Option<Vec<u8>>)> {
         match self.transfer() {
             Transfer::Http(_) => self.http_summary_files().await,
@@ -286,9 +302,9 @@ impl RemoteSource {
     /// Returns the connection of the source, whose session stays open.
     ///
     /// Over HTTP, the fetcher handle of the session keeps the counters of
-    /// the source. A new source over the connection adds the counters that
-    /// its caller gives. The connection keeps the bucket client of the
-    /// source.
+    /// the source. The connection keeps the bucket client of the source,
+    /// which keeps the counters of the source too. A new source over the
+    /// connection adds the counters that its caller gives.
     pub(crate) fn into_connection(self) -> Connection {
         Connection {
             session: self.session,

@@ -1151,6 +1151,10 @@ fn the_pull_reads_the_summaries_of_the_tool() {
 mod s3_remote {
     use std::path::Path;
     use std::process::Command;
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::time::Duration;
+
+    use ostrya::PullProgress;
 
     use super::*;
     use crate::common::s3::{ACCESS_KEY, Rclone, SECRET_KEY, StandIn, rclone_available};
@@ -1228,6 +1232,7 @@ mod s3_remote {
             match case.to_str().unwrap() {
                 "collection-map" => collection_map().await,
                 "field-0" => field_0().await,
+                "live-count" => live_count().await,
                 "across-transports" => across_transports().await,
                 "no-summary" => no_summary().await,
                 "summary-policy" => summary_policy().await,
@@ -1416,6 +1421,69 @@ mod s3_remote {
         assert_signed_with_no_listing(&server);
     }
 
+    /// The live count of a pull from a bucket repository includes the bytes
+    /// of `summary` and `summary.sig` until the pull reads the `config`, as
+    /// over HTTP. The count of the stats starts after the root files.
+    #[test]
+    fn the_live_count_of_a_bucket_pull_includes_the_summary() {
+        run_case("live-count", SECRET_KEY);
+    }
+
+    async fn live_count() {
+        let dir = TmpDir::new("pull-collection-s3-live-count");
+        let source = create(dir.path(), "source", Some(ID)).await;
+        let tip = commit(&source, dir.path(), "a", None, REF, FIXED_TS, BOUND).await;
+        summarize(&source).await;
+        let signer = Ed25519Signer::from_base64(SECRET_B64).unwrap();
+        source.sign_summary(&signer).await.unwrap();
+        let server = StandIn::start();
+        store_tree(&server, &dir.path().join("source"));
+        let keys = bucket(&server.endpoint(), "s3://bkt/repo");
+        let dest = bucket_dest(dir.path(), "dest", Some(ID), &[("bkt", &keys)]).await;
+        let progress = PullProgress::new();
+        let at_config = Arc::new(AtomicU64::new(u64::MAX));
+        let root = {
+            let mut state = server.state();
+            let (seen, stored) = (progress.clone(), Arc::clone(&at_config));
+            state.before_key = Some((
+                "GET",
+                "repo/config".to_owned(),
+                Box::new(move |_| {
+                    stored.store(seen.snapshot().bytes_transferred, Ordering::Relaxed);
+                }),
+            ));
+            state.objects["repo/summary"].bytes.len()
+                + state.objects["repo/summary.sig"].bytes.len()
+        };
+        let stats = dest
+            .pull(
+                "bkt",
+                PullOptions {
+                    refs: vec![REF.to_owned()],
+                    progress: Some(progress.clone()),
+                    overrides: EndpointOverrides {
+                        allow_cleartext_credentials: true,
+                        ..EndpointOverrides::default()
+                    },
+                    ..PullOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            dest.resolve_rev(&format!("bkt:{REF}"), false)
+                .await
+                .unwrap(),
+            Some(tip)
+        );
+        assert_eq!(at_config.load(Ordering::Relaxed), root as u64);
+        assert_eq!(
+            progress.snapshot().bytes_transferred,
+            stats.bytes_transferred
+        );
+        assert_signed_with_no_listing(&server);
+    }
+
     /// An HTTP remote and a bucket repository serve the collection. The
     /// newest commit wins across the two transports, and the pull takes the
     /// objects from the selected remote alone.
@@ -1513,10 +1581,14 @@ mod s3_remote {
         assert_signed_with_no_listing(&server);
     }
 
-    /// Under a summary policy, the pull reads `summary.sig` and then
-    /// `summary` through the bucket client, and verifies the summary. A
-    /// summary that an untrusted key signed, and a summary with no
-    /// `summary.sig`, skip the bucket repository.
+    /// Under a summary policy, the pull reads `summary.sig` and `summary`
+    /// through the bucket client, and verifies the summary. The two requests
+    /// are in flight together: in the first pull, the server waits before it
+    /// answers `summary.sig`, and logs `summary` first. The pull asks for
+    /// `summary.sig` first: in the second pull, with a fetch limit of one,
+    /// the server logs `summary.sig` first. A summary that an untrusted key
+    /// signed, and a summary with no `summary.sig`, skip the bucket
+    /// repository.
     #[test]
     fn a_summary_policy_verifies_the_summary_of_a_bucket() {
         run_case("summary-policy", SECRET_KEY);
@@ -1534,21 +1606,35 @@ mod s3_remote {
             }
             let server = StandIn::start();
             store_tree(&server, &dir.path().join("source"));
+            if signer == Some(SECRET_B64) {
+                server.state().delay = Some((
+                    "GET",
+                    "repo/summary.sig".to_owned(),
+                    Duration::from_millis(500),
+                ));
+            }
             let keys = format!(
                 "{}sign-verify-summary=ed25519\nverification-ed25519-key={PUBLIC_B64}\n",
                 bucket(&server.endpoint(), "s3://bkt/repo")
             );
             let dest = bucket_dest(dir.path(), "dest", None, &[("bkt", &keys)]).await;
-            let (opts, events) = bucket_options(&[REF]);
+            let (mut opts, events) = bucket_options(&[REF]);
+            if signer == Some(OTHER_SECRET_B64) {
+                opts.pull.max_outstanding_fetches = Some(1);
+            }
             let pulled = dest.pull_collection(ID, &["bkt"], opts).await;
             let requests = server.state().requests.clone();
-            assert_eq!(
-                requests[..2],
-                [
-                    ("GET".to_owned(), target("summary.sig")),
-                    ("GET".to_owned(), target("summary")),
-                ]
-            );
+            let summary = ("GET".to_owned(), target("summary"));
+            let signature = ("GET".to_owned(), target("summary.sig"));
+            let mut first = requests[..2].to_vec();
+            if signer == Some(SECRET_B64) {
+                assert_eq!(first, [summary, signature]);
+            } else if signer == Some(OTHER_SECRET_B64) {
+                assert_eq!(first, [signature, summary]);
+            } else {
+                first.sort();
+                assert_eq!(first, [summary, signature]);
+            }
             if signer == Some(SECRET_B64) {
                 let pulled = pulled.unwrap();
                 assert!(events.lock().unwrap().is_empty());

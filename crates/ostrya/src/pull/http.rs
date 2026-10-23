@@ -174,7 +174,9 @@ impl Repo {
     ///   a [`static_deltas`](PullOptions::static_deltas) chain and the
     ///   `.commitmeta` of the commit of the step, the superblock first, as
     ///   `# Static deltas` states. The HTTP source sends these requests one at
-    ///   a time.
+    ///   a time, except `summary.sig` and `summary` of a bucket repository.
+    ///   The module [`pull`](mod@crate::pull) states that exception in
+    ///   "Bucket repository".
     /// - The stream source ends its session before the transaction commits.
     ///   It closes the input of the server and, over ssh, waits for the ssh
     ///   client.
@@ -1155,7 +1157,9 @@ impl Repo {
     /// Over HTTP, the call requests `summary.sig` and then `summary`. Over
     /// ssh, the two requests are in flight together, and the session ends
     /// before the call returns. For an `s3://` address, the bucket client
-    /// reads the two files with signed requests.
+    /// reads the two files with signed requests. It asks for `summary.sig`
+    /// first. If the fetcher admits two requests at once, the two requests
+    /// are in flight together.
     ///
     /// # Errors
     ///

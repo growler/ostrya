@@ -675,9 +675,29 @@ trust store and one connection pool. A second fetcher from
 `s3::Bucket::new` was rejected: it reads the trust store again and opens its
 own connections. The bucket client names each request by its URL under the
 bucket URL, so it reads the keys of the repository through the fetcher
-whose mirror is the repository URL. The clone has no byte counter, so these
-reads do not count in `PullStats::bytes_transferred`, as the reads of the
-root files over HTTP do not.
+whose mirror is the repository URL. The source of the pull gives the bucket
+client the byte counters of the pull through `s3::Bucket::counted`. So these
+reads count in the live progress of the pull until the count starts again,
+as the reads of the root files over HTTP do, and
+`PullStats::bytes_transferred` does not include them. These alternatives
+were rejected:
+
+- `s3::Bucket::with_fetcher`, which takes the counted fetcher of the pull.
+  A client from `s3::Bucket::new` sends its request paths under the one
+  mirror of its fetcher, the bucket URL. Over the fetcher of the pull, whose
+  mirror is the repository URL, such a client adds the key prefix two times,
+  unless the call forces a base URL.
+- An `S3Endpoint` in the connection of the pull, so that the source opens
+  the bucket client over its counted fetcher. That needs more code in three
+  files.
+
+The bucket client asks for `summary.sig` first and for `summary` next. If
+the fetcher admits two requests at once, the bucket client keeps the two
+requests in flight together, as the stream source does. So a pull of an
+`s3://` remote, and a collection probe of it under a summary policy, wait
+for one round trip for the two files in place of two. A pull over HTTP with
+no bucket client keeps the order of the `ostree` command: `summary.sig`,
+and then `summary`.
 
 A pull from a bucket repository needs the permissions `s3:GetObject` and
 `s3:ListBucket` on the bucket. Without `s3:ListBucket`, AWS answers the read
@@ -714,13 +734,15 @@ and the resolution of a pull from an HTTP address does not change.
 from the summary of its bucket repository alone. No server answers
 `_ostrya/refs/v1` for a bucket repository, so the pull does not send that
 request, and `Repo::pull` does not send it either. The probe reads
-`summary`, and under a summary policy first `summary.sig`, through the
-bucket client. So an absent bucket and a wrong secret key skip the remote
-with the S3 code. The pull from a selected bucket repository reads its
-`config` through the same client. A bucket repository with no `summary`
-fails the probe, and the pull skips it with an event. A bucket repository
-with no summary that lists no ref was rejected: the remote then gives no
-sign of the reason that it serves no ref.
+`summary` through the bucket client. Under a summary policy it also reads
+`summary.sig`: it asks for `summary.sig` first, and if the fetcher admits
+two requests at once, the two requests are in flight together. So an absent
+bucket and a wrong secret key skip the remote with the S3 code. The pull
+from a selected bucket repository reads its `config` through the same
+client. A bucket repository with no `summary` fails the probe, and the pull
+skips it with an event. A bucket repository with no summary that lists no
+ref was rejected: the remote then gives no sign of the reason that it serves
+no ref.
 
 A list of the ref keys of the bucket, as a source of the collection refs,
 was rejected. The summary is the one signed source of the refs of a bucket

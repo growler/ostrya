@@ -7,7 +7,7 @@
 #![cfg(feature = "s3")]
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -402,6 +402,32 @@ fn a_client_over_the_fetcher_of_a_pull_names_the_keys_under_the_bucket() {
                 "{authorization}"
             );
         }
+    });
+}
+
+/// A client from `counted` adds the body bytes of each read to its counters,
+/// and the client that it came from does not.
+#[test]
+fn a_counted_client_counts_the_bytes_of_a_get() {
+    block_on(async {
+        let stand_in = StandIn::start(Arc::new(|_: &Seen, _| respond(200, b"bytes"))).await;
+        let endpoint = stand_in.endpoint("s3://bucket/repo");
+        let fetcher = Fetcher::new(endpoint.pull_options().unwrap())
+            .await
+            .unwrap();
+        let bucket = Bucket::from_fetcher(&endpoint, fetcher);
+        let received = Arc::new(AtomicU64::new(0));
+        let counted = bucket.counted(vec![Arc::clone(&received)]);
+        assert_eq!(counted.location(), bucket.location());
+
+        let summary = counted.get("summary", 1024).await.unwrap().unwrap();
+        assert_eq!(summary.bytes, b"bytes");
+        assert_eq!(received.load(Ordering::Relaxed), 5);
+        bucket.get("summary", 1024).await.unwrap().unwrap();
+        assert_eq!(received.load(Ordering::Relaxed), 5);
+
+        let targets: Vec<String> = stand_in.seen().into_iter().map(|s| s.target).collect();
+        assert_eq!(targets, ["/bucket/repo/summary", "/bucket/repo/summary"]);
     });
 }
 

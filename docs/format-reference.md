@@ -3948,9 +3948,11 @@ same session.
 
 A candidate at an `s3://` address is a bucket repository ("The S3 bucket
 repository"), which serves no ref listing. The pull sends it no listing
-request, and reads the refs from its summary alone. It reads `summary`, and
-under a summary policy first `summary.sig`, through the bucket client, as a
-pull from that remote does. A bucket repository with no `summary` is skipped.
+request, and reads the refs from its summary alone. It reads `summary`
+through the bucket client, as a pull from that remote does. Under a summary
+policy it also reads `summary.sig`: it asks for `summary.sig` first, and if
+the fetcher admits two requests at once, the two requests are in flight
+together. A bucket repository with no `summary` is skipped.
 The pull takes the commit that the summary lists for a ref, also when the ref
 file of the bucket names another commit.
 

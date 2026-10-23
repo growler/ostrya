@@ -180,7 +180,10 @@
 //!
 //! [`Repo::pull`] and [`Repo::remote_fetch_summary`] read `summary.sig`,
 //! `summary`, and `config` through the bucket client of `ostrya-remote`,
-//! which shares the fetcher of the pull. The bucket client reads the S3
+//! which shares the fetcher of the pull. The bucket client asks for
+//! `summary.sig` first. If the fetcher admits two requests at once, the
+//! bucket client keeps the requests of `summary.sig` and `summary` in
+//! flight together. The bucket client reads the S3
 //! error document of a failed request. So a wrong secret key gives
 //! [`Error::Remote`] with the S3 code `SignatureDoesNotMatch`, and an absent
 //! bucket is an error, not a repository with no summary. A session that the caller opens for

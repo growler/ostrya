@@ -3,6 +3,8 @@
 use std::collections::HashSet;
 use std::io::ErrorKind;
 use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -81,6 +83,7 @@ const COMPARE_CHUNK: usize = 64 * 1024;
 ///
 /// [`Bucket::new`] opens it from an [`S3Endpoint`], and
 /// [`Bucket::from_fetcher`] opens it over a fetcher that the caller built.
+/// [`Bucket::counted`] gives a client whose fetcher adds byte counters.
 /// Each method takes a key or a list prefix relative to the prefix of the
 /// repository, and the client adds `PREFIX/`. A key in a result is relative
 /// to the prefix of the repository too.
@@ -408,6 +411,24 @@ impl Bucket {
             location: endpoint.location.clone(),
             max_retries: endpoint.http.max_retries,
             base: Some(endpoint.location.bucket_url()),
+        }
+    }
+
+    /// Returns a client of the same bucket repository whose fetcher adds
+    /// counters of received body bytes.
+    ///
+    /// The fetcher of the new client is [`Fetcher::counted`] of the fetcher
+    /// of this client with `received`, so it has the counters of this client
+    /// and the counters of `received`. [`Fetcher::counted`] states which
+    /// bytes each counter gets. The new client has the location, the retry
+    /// count, and the request URLs of this client. The counters of this
+    /// client do not change.
+    pub fn counted(&self, received: Vec<Arc<AtomicU64>>) -> Bucket {
+        Bucket {
+            fetcher: self.fetcher.counted(received),
+            location: self.location.clone(),
+            max_retries: self.max_retries,
+            base: self.base.clone(),
         }
     }
 

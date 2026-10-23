@@ -187,10 +187,10 @@ impl BucketRepo {
     /// # Signers
     ///
     /// A bucket repository that holds a `summary.sig` refuses an update with
-    /// no signer, before the update changes the bucket. So an update never
-    /// makes a signed bucket repository unsigned. An update with a signer
-    /// writes `summary.sig` in place of the old one. The update never
-    /// deletes `summary.sig`.
+    /// no signer. The refusal changes nothing in the bucket but the probe key
+    /// of the writer lock. So an update never makes a signed bucket
+    /// repository unsigned. An update with a signer writes `summary.sig` in
+    /// place of the old one. The update never deletes `summary.sig`.
     ///
     /// Between the two writes of step 7, a reader sees the new summary and
     /// the old `summary.sig`. A reader that verifies the summary refuses it
@@ -230,11 +230,12 @@ impl BucketRepo {
     ///   [`Error::Io`](crate::Error::Io) for a read of a superblock that
     ///   fails in transit.
     ///
-    /// A failure before step 7 changes nothing in the bucket. A failure
-    /// between the two writes of step 7 leaves the window above, and a run
-    /// again writes a matching pair. After each failure other than a lost
-    /// lock or a lock of another writer, the update releases its lock and
-    /// drops an error of that release.
+    /// A failure before step 7 changes nothing in the bucket but the probe
+    /// key of the writer lock. A failure between the two writes of step 7
+    /// leaves the window above, and a run again writes a matching pair.
+    /// After each failure other than a lost lock or a lock of another
+    /// writer, the update releases its lock and drops an error of that
+    /// release.
     ///
     /// # Examples
     ///

@@ -10,7 +10,13 @@ use crate::{Error, Result};
 const MAX_COLLECTION_ID_LEN: usize = 255;
 
 /// The keys of a bucket repository that hold one file each.
-const SINGLE_KEYS: [&str; 4] = ["config", "summary", "summary.sig", "extensions/ostrya/lock"];
+const SINGLE_KEYS: [&str; 5] = [
+    "config",
+    "summary",
+    "summary.sig",
+    "extensions/ostrya/lock",
+    "extensions/ostrya/lock-probe",
+];
 
 /// The extensions of an object key. A bucket repository is in `archive`
 /// form, so a file object is `filez`.
@@ -31,7 +37,8 @@ const OBJECT_EXTENSIONS: [&str; 7] = [
 /// and [`Bucket::list_uploads`](super::Bucket::list_uploads) gives the
 /// uploads of these keys alone. The keys are:
 ///
-/// - `config`, `summary`, `summary.sig`, and `extensions/ostrya/lock`
+/// - `config`, `summary`, `summary.sig`, `extensions/ostrya/lock`, and
+///   `extensions/ostrya/lock-probe`
 /// - `objects/XX/<62 hex digits>.<ext>`, with lowercase hex digits and an
 ///   extension `commit`, `commitmeta`, `dirtree`, `dirmeta`, `filez`,
 ///   `tombstone-commit`, or `cfs`
@@ -274,6 +281,7 @@ mod tests {
             "summary".to_owned(),
             "summary.sig".to_owned(),
             "extensions/ostrya/lock".to_owned(),
+            "extensions/ostrya/lock-probe".to_owned(),
             "refs/heads/main".to_owned(),
             "refs/heads/exampleos/x86_64/stable".to_owned(),
             "refs/heads/a-b.c_d9".to_owned(),
@@ -308,6 +316,8 @@ mod tests {
             "config/".to_owned(),
             "summary.sig.tmp".to_owned(),
             "extensions/ostrya/other".to_owned(),
+            "extensions/ostrya/lock-probe/x".to_owned(),
+            "extensions/ostrya/lock-probe2".to_owned(),
             format!("objects/{}/{}.commit", &hex[..2], &hex[2..63]),
             format!("objects/AB/{}.commit", &hex[2..]),
             format!("objects/ab/{}.commit", hex[2..].to_uppercase()),

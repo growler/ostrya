@@ -40,7 +40,8 @@ pub struct BucketPruneOptions {
 /// The result of [`BucketRepo::prune`].
 ///
 /// With [`no_prune`](PruneOptions::no_prune), each list names what a run
-/// without `no_prune` deletes or aborts, and the run changes nothing.
+/// without `no_prune` deletes or aborts, and the run changes nothing but the
+/// probe key of the writer lock.
 #[derive(Clone, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub struct BucketPruneReport {

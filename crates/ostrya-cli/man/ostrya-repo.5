@@ -411,6 +411,15 @@ The lock is a key file with the group \fB\%[lock]\fR and the keys \fB\%id\fR, \f
 \fB\%started\fR is the time at which the writer took the lock, in seconds since the epoch, UTC.
 The lock has no expiry time: a lock that a writer leaves stays until a break of the lock removes it.
 The \fB\%ostree\fR tool does not read this key.
+.TP
+\fB\%extensions/ostrya/lock\-probe\fR
+The probe of the writer lock.
+Its body is 18 ASCII bytes: the text \fB\%ostrya lock probe\fR and a line feed.
+Before a writer sends a request to the lock, it writes the probe with \fB\%If\-None\-Match: *\fR, and writes it again if the first request wrote it.
+A server that writes the second request ignores the header, so the lock gives no exclusion: the writer stops, and it writes no lock.
+A take of the lock writes the key if it is absent, and no writer deletes it.
+Do not delete the key, and do not set an expiry rule on it: a delete between the two requests of a probe stops the writer.
+The \fB\%ostree\fR tool does not read this key.
 .SH EXTENSIONS
 These parts of the layout are extensions of ostrya:
 .IP \(bu 2
@@ -422,7 +431,7 @@ the lock file \fB\%.update.lock\fR;
 .IP \(bu 2
 the directory \fB\%extensions/ostrya/summary/\fR and its files;
 .IP \(bu 2
-the writer lock \fB\%extensions/ostrya/lock\fR and the markers \fB\%state/<checksum>.commitpartial\fR of a bucket repository;
+the writer lock \fB\%extensions/ostrya/lock\fR, its probe \fB\%extensions/ostrya/lock\-probe\fR, and the markers \fB\%state/<checksum>.commitpartial\fR of a bucket repository;
 .IP \(bu 2
 the temporary names \fB\%tmp/.ostrya\-ref\-*\fR, \fB\%tmp/.ostrya\-meta\-*\fR, and \fB\%<name>.tmp\-<pid>\-<n>\fR;
 .IP \(bu 2

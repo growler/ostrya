@@ -541,12 +541,10 @@ pub enum Error {
     },
     /// The writer lock of a bucket repository that another writer holds.
     ///
-    /// The take of the lock found a lock. On a server that honors
-    /// `If-None-Match`, a take with no break of the lock did not change the
-    /// bucket. After a break of the lock, the lock that the break deleted
-    /// stays deleted. If the probe after the take found the lock of another
-    /// writer, or no lock, the lock of the take is gone, and the call
-    /// removed no lock. [`bucket`](crate::bucket) states the writer lock.
+    /// The take of the lock found a lock. A take with no break of the lock
+    /// wrote only the probe key. After a break of the lock, the lock that
+    /// the break deleted stays deleted. [`bucket`](crate::bucket) states the
+    /// writer lock.
     #[cfg(feature = "s3")]
     #[cfg_attr(docsrs, doc(cfg(feature = "s3")))]
     #[error(
@@ -557,8 +555,7 @@ pub enum Error {
         /// The address of the repository, `s3://BUCKET[/PREFIX]`.
         address: String,
         /// The holder that the lock names, or `None` if the lock was gone
-        /// at the read after the take or the probe. A new run can then take
-        /// the lock.
+        /// at the read after the take. A new run can then take the lock.
         holder: Option<Box<crate::bucket::LockHolder>>,
     },
     /// A writer lock of a bucket repository that another writer broke.
@@ -589,15 +586,14 @@ pub enum Error {
     /// `If-None-Match: *`.
     ///
     /// The writer lock gives no exclusion on such a server, so no writer
-    /// runs on it. The take removes its lock before it gives this error. On
-    /// such a server, the take writes over a lock that the key holds, so the
-    /// lock of another writer that the key held is gone after the call.
+    /// runs on it. The probe of the take finds this before a request to the
+    /// lock key, so the call wrote no lock, and a lock that the key holds
+    /// does not change.
     #[cfg(feature = "s3")]
     #[cfg_attr(docsrs, doc(cfg(feature = "s3")))]
     #[error(
         "the S3 server of {address} does not honor If-None-Match, so the writer lock gives no \
-         exclusion and no writer can run on it; if the removal of the lock of this run failed, \
-         the lock stays until a break of the lock"
+         exclusion and no writer can run on it; the run wrote no lock"
     )]
     BucketNoExclusion {
         /// The address of the repository, `s3://BUCKET[/PREFIX]`.

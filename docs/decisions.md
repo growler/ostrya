@@ -748,34 +748,49 @@ builds on Linux alone. The feature `system` of `rustix`, for `uname`, was
 rejected: it changes a feature of a dependency and gives the same value on
 Linux.
 
-After the take, the writer sends the same body with `If-None-Match: *`
-again. A server that writes the probe gives no exclusion, and the writer
-removes its lock and fails with `Error::BucketNoExclusion`. The library has
-no option that lets a writer run on such a server. `rclone serve s3` 1.75.1
-ignores the header, so no writer runs on it. The tests of a writer run on
-SeaweedFS 4.36, which honors the header, and on a stand-in server in the
-test process, and the tests on `rclone serve s3` check the refusal. An
-option that lets a writer run with no exclusion was rejected, and so was a
-test proxy in front of `rclone serve s3` that gives the headers their
-meaning.
+Before a request to the lock key, the writer probes that the server honors
+`If-None-Match`, on the key `extensions/ostrya/lock-probe`. It sends the
+fixed body `ostrya lock probe\n` with `If-None-Match: *`, and sends it again
+if the first request wrote the key. A 412 to either request shows that the
+server honors the header. A server that writes the second request gives no
+exclusion, and the writer fails with `Error::BucketNoExclusion` before a
+request to the lock key, so a lock that the key holds does not change. The
+library has no option that lets a writer run on such a server.
+`rclone serve s3` 1.75.1 ignores the header, so no writer runs on it. The
+tests of a writer run on SeaweedFS 4.36, which honors the header, and on a
+stand-in server in the test process, and the tests on `rclone serve s3`
+check the refusal. An option that lets a writer run with no exclusion was
+rejected, and so was a test proxy in front of `rclone serve s3` that gives
+the headers their meaning.
 
-A probe with an unknown outcome, whose read finds the body of the take,
-removes the lock and fails, and the operator runs the operation again. A
-second probe was rejected: it adds a retry loop to a case that a run again
-covers. A probe that gets 412 after a request with an unknown outcome, and
-whose read finds the body of the take, holds the lock: the 412 shows that
-the server honors the header.
+A second probe request with an unknown outcome, whose read finds the probe
+body, fails the take before a request to the lock key, and the operator
+runs the operation again. `PutIfAbsent::Present` counts as a 412. It also
+comes from a read after an interrupted request that finds other bytes, and
+only a program other than the port writes other bytes to the probe key. The
+probe runs on each take. A cache of an earlier result was rejected: the
+server in front of a bucket can change between runs, and the probe costs
+one `PUT` on a bucket that holds the key.
 
-After a probe that gives `PutIfAbsent::Present`, the writer reads the lock
-and holds it only with its own `id`. `Present` also comes from an
-interrupted probe whose read finds other bytes. On a server that honors the
-header, another writer then broke the lock and took its own. On a server
-that ignores the header, another writer wrote over the probe. The client
-cannot tell the two cases apart, so the take fails with
-`Error::BucketLocked` and the holder that the read found, and removes no
-lock. The read costs one `GET` for each take. A take that returns a lock
-that the key does not hold was rejected: the writer stops only at its first
-check.
+Three alternatives of the probe were rejected:
+
+- A probe after the take: a second `PUT` of the lock body to the lock key.
+  On a server that ignores the header, the take writes over the live lock
+  of another writer, and the removal after the failed probe deletes the
+  key. The other writer then stops in the middle of its run, at its next
+  check, with `Error::BucketLockLost`.
+- A delete of the probe key after the probe. A delete between the two
+  requests of the probe of another writer lets the second request of that
+  writer write the key, and that writer fails with
+  `Error::BucketNoExclusion` on a server that honors the header. So no
+  writer deletes the key.
+- A body for each run, for example with the id of the run. After a
+  request with an unknown outcome, put-if-absent reads the key and
+  compares its bytes with the body, and other bytes give
+  `PutIfAbsent::Present`, which the probe counts as a 412. With the same
+  bytes from each writer, the probe of another writer on a server that
+  ignores the header cannot give other bytes and a false 412. Such a body
+  also leaves the data of a host in a key that no writer deletes.
 
 The release and the break read the lock and its `ETag`, and send `DELETE`
 with `If-Match` and that `ETag`. The writer does not probe for `If-Match`:
@@ -1399,7 +1414,8 @@ key leaves a superblock that the bucket holds out of the map, and the
 update writes a summary that does not name the delta.
 
 A bucket repository that holds a `summary.sig` refuses an update with no
-signer before it changes the bucket, and no option turns the refusal off.
+signer, and no option turns the refusal off. The refusal changes nothing in
+the bucket but the probe key of the writer lock.
 A signed bucket repository is a signed bucket repository by the presence
 of the key `summary.sig` alone. The probe takes the strict rule of an
 absent key, so only an answer 404 `NoSuchKey` is an absent key, and it
@@ -1435,10 +1451,10 @@ repository with no ref gets a summary with an empty field 0, as a local
 repository with no ref does.
 
 A ref name that is a directory of another ref name of the same directory,
-as `a` is of `a/b`, refuses the update before it changes the bucket, with
-the check of the push. A local repository cannot hold both refs:
-`refs/heads/a` is a file, and `refs/heads/a/b` needs a directory at the
-same path.
+as `a` is of `a/b`, refuses the update with the check of the push. The
+refusal changes nothing in the bucket but the probe key of the writer lock.
+A local repository cannot hold both refs: `refs/heads/a` is a file, and
+`refs/heads/a/b` needs a directory at the same path.
 
 `ostrya remote summary -u` prints nothing on standard output on success,
 as `ostrya summary -u` prints nothing. A lock that `--break-lock` removed

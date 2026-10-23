@@ -54,30 +54,31 @@
 //! `extensions/ostrya/lock`. [`BucketRepo::lock`] takes it, and
 //! [`WriterLock::release`] removes it. A read takes no lock.
 //!
+//! - Before a request to the lock key, a probe writes the fixed body
+//!   `ostrya lock probe\n` to the key `extensions/ostrya/lock-probe` with
+//!   `If-None-Match: *`. If the request wrote the key, the probe sends it
+//!   again. A server that honors the header refuses one of the two requests
+//!   with 412. A server that writes the second request gives no exclusion.
+//!   The writer then fails with
+//!   [`Error::BucketNoExclusion`](crate::Error::BucketNoExclusion), and it
+//!   wrote no lock. `rclone serve s3` 1.75.1 is such a server, and
+//!   SeaweedFS 4.36 honors the header. No writer deletes the probe key.
 //! - The take writes the lock with `If-None-Match: *`. If the key holds a
 //!   lock, the take fails with
 //!   [`Error::BucketLocked`](crate::Error::BucketLocked), which names the
-//!   holder. On a server that honors the header, a take with no break of
-//!   the lock then does not change the bucket.
-//! - After the take, a probe writes the same body with `If-None-Match: *`
-//!   again. A server that honors the header refuses the probe with 412.
-//!   The writer then reads the lock, and the take holds the lock if the
-//!   lock holds the id of the writer. A server that writes the probe gives
-//!   no exclusion. The writer then removes its lock and fails with
-//!   [`Error::BucketNoExclusion`](crate::Error::BucketNoExclusion). On such
-//!   a server, the take writes over a lock that the key holds, so the lock
-//!   of the other writer is gone after the call. `rclone serve s3` 1.75.1
-//!   is such a server, and SeaweedFS 4.36 honors the header.
+//!   holder. A take with no break of the lock then writes only the probe
+//!   key.
 //! - [`WriterLock::check`] reads the lock and compares its id with the id of
 //!   the writer. A writer checks before each change that the lock guards.
 //!   A lock with another id, or no lock, gives
 //!   [`Error::BucketLockLost`](crate::Error::BucketLockLost).
 //! - [`WriterLock::release`] reads the lock, and deletes it with `If-Match`
 //!   and the `ETag` of the read if it holds the id of the writer.
-//! - With `break_lock`, [`BucketRepo::lock`] first deletes the lock that the
-//!   key holds, with `If-Match` and the `ETag` of its read, and then takes
-//!   its own. [`WriterLock::broken`] gives the holder of the deleted lock.
-//!   If the take after the delete fails, the deleted lock stays deleted.
+//! - With `break_lock`, [`BucketRepo::lock`] deletes the lock that the key
+//!   holds after the probe, with `If-Match` and the `ETag` of its read, and
+//!   then takes its own. [`WriterLock::broken`] gives the holder of the
+//!   deleted lock. If the take after the delete fails, the deleted lock
+//!   stays deleted.
 //!
 //! The lock has no lease. A lock that a writer leaves when it ends with no
 //! release stays until a break of the lock removes it. A dropped
@@ -363,48 +364,50 @@ impl BucketRepo {
 
     /// Takes the writer lock for `operation`.
     ///
-    /// The take writes the lock body with `If-None-Match: *`, and a probe
-    /// then writes the same body again. The [module
-    /// documentation](self#the-writer-lock) states the rules. With
-    /// `break_lock`, the call first reads the lock that the key holds and
-    /// deletes it with `If-Match` and the `ETag` of the read.
+    /// The call first probes that the server honors `If-None-Match`, on the
+    /// probe key, and then writes the lock body with `If-None-Match: *`. The
+    /// [module documentation](self#the-writer-lock) states the rules. With
+    /// `break_lock`, the call reads the lock that the key holds after the
+    /// probe, and deletes it with `If-Match` and the `ETag` of the read.
     /// [`WriterLock::broken`] then gives its holder. If the delete gets 412
     /// and a read after it finds no lock, the call goes on to the take, and
     /// [`WriterLock::broken`] gives `None`.
+    ///
+    /// The probe sends no request to the lock key. It writes the probe body
+    /// to the probe key with `If-None-Match: *`, and a 412 shows that the
+    /// server honors the header. If the first request wrote the key, or had
+    /// an unknown outcome and a read found the probe body, the probe sends a
+    /// second request. A server that writes the second request does not
+    /// honor the header. If the second request has an unknown outcome and a
+    /// read finds the probe body, the call fails, and the probe sends no
+    /// third request. A read after a request with an unknown outcome that
+    /// finds other bytes counts as a 412. Only a program other than ostrya
+    /// writes other bytes to the probe key. The probe runs on each take, and
+    /// no writer deletes the probe key.
     ///
     /// A take whose request has an unknown outcome reads the key. If the key
     /// holds the body of this take, the lock is taken: the body holds an id
     /// that no other run makes.
     ///
-    /// A probe that gets 412 reads the lock. A probe whose request has an
-    /// unknown outcome reads the key, and a read that finds other bytes
-    /// gives the same result as a 412. The call then returns the lock only
-    /// if the lock holds the id of this take. A probe whose request has an
-    /// unknown outcome, and whose read finds the body of this take, holds
-    /// the lock only if a later request of the probe gets 412: a 412 shows
-    /// that the server honors the header.
-    ///
     /// # Errors
     ///
     /// - [`Error::BucketLocked`](crate::Error::BucketLocked) if the key
     ///   holds a lock. The holder is `None` if the lock was gone at the read
-    ///   after the take. Also if the read after a probe finds the lock of
-    ///   another writer, or no lock. The lock of this take is then gone, and
-    ///   the call removes no lock. A probe whose read after an interrupted
-    ///   request finds other bytes gives this error also on a server that
-    ///   does not honor the header. With `break_lock`, also if the lock
-    ///   changed between the read and the delete, or if another writer took
-    ///   the lock after the delete.
+    ///   after the take. With `break_lock`, also if the lock changed between
+    ///   the read and the delete, or if another writer took the lock after
+    ///   the delete.
     /// - [`Error::BucketNoExclusion`](crate::Error::BucketNoExclusion) if the
-    ///   server writes the probe. The call removes its lock first.
+    ///   server writes the second request of the probe. The call then sent
+    ///   no request to the lock key.
     /// - [`Error::Remote`](crate::Error::Remote) with
     ///   [`Transport`](crate::remote::Error::Transport) if the probe had an
-    ///   unknown outcome and the key holds the body of this take, with no
-    ///   412 after it. The call removes its lock first, and the message
-    ///   states if the lock was removed. Also with `break_lock`, if the read
-    ///   of the lock gives no `ETag`. The call then deletes no lock.
+    ///   unknown outcome: the probe key holds the probe body, and no request
+    ///   of the probe got 412. The call then sent no request to the lock
+    ///   key. Also with `break_lock`, if the read of the lock gives no
+    ///   `ETag`. The call then deletes no lock.
     /// - [`Error::Remote`](crate::Error::Remote) for an error of the bucket
-    ///   client. After a failed probe, the call removes its lock first.
+    ///   client. An error of the probe comes before a request to the lock
+    ///   key.
     pub async fn lock(&self, operation: LockOperation, break_lock: bool) -> Result<WriterLock<'_>> {
         self.take_lock(operation, break_lock).await
     }
@@ -441,10 +444,10 @@ impl BucketRepo {
     /// it. [`lock_holder`](BucketRepo::lock_holder) reads the holder before
     /// the init.
     ///
-    /// A failure before the write of `config` changes nothing but the lock,
-    /// and the call releases the lock. A failure after the write leaves the
-    /// `config`, and the bucket repository is ready for a push. A crash
-    /// leaves the lock, as for each writer.
+    /// A failure before the write of `config` changes nothing but the lock
+    /// and the probe key, and the call releases the lock. A failure after
+    /// the write leaves the `config`, and the bucket repository is ready for
+    /// a push. A crash leaves the lock, as for each writer.
     ///
     /// # Errors
     ///

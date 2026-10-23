@@ -5518,7 +5518,8 @@ The keys are relative to the prefix, and each key starts with `PREFIX/`.
 With no prefix, a key has no leading `/`. The keys of a bucket repository
 are:
 
-- `config`, `summary`, `summary.sig`, and `extensions/ostrya/lock`
+- `config`, `summary`, `summary.sig`, `extensions/ostrya/lock`, and
+  `extensions/ostrya/lock-probe`
 - `objects/XX/<62 hex digits>.<ext>`, in lowercase hex, with `XX` the first
   two digits of the checksum, and `<ext>` one of `commit`, `commitmeta`,
   `dirtree`, `dirmeta`, `filez`, `tombstone-commit`, and `cfs`
@@ -5601,8 +5602,8 @@ A writer refuses a `config` that does not parse as a repository config,
 that states a mode other than `archive-z2` and `archive`, whose
 `collection-id` fails the collection id rule or is longer than 255 bytes,
 whose `tombstone-commits` or `indexed-deltas` is not a boolean, or whose
-`zlib-level` is not an integer. The writer refuses it before it changes the
-bucket.
+`zlib-level` is not an integer. The refusal changes nothing in the bucket
+but the probe key of the writer lock.
 The summary takes `mode`, `tombstone-commits`, `indexed-deltas`, and
 `collection-id` of `[core]` ("The summary of a bucket repository").
 
@@ -5675,6 +5676,15 @@ init, a push, a prune, an update of the summary, and an fsck that deletes
 objects.
 A read takes no lock. The `ostree` command does not read the key.
 
+The key `PREFIX/extensions/ostrya/lock-probe` holds the probe of the writer
+lock. Its body is 18 ASCII bytes: the text `ostrya lock probe` and a line
+feed, in hex `6f 73 74 72 79 61 20 6c 6f 63 6b 20 70 72 6f 62 65 0a`. Each
+version of the port writes the same bytes. A take writes the key if it is
+absent, and no writer deletes it. Do not delete the key, and do not
+set an expiry rule on it. A delete between the two requests of a probe
+gives a false result of no exclusion. The result is safe, because the
+writer then writes no lock. The `ostree` command does not read the key.
+
 The lock is a key file with one group, in this order:
 
 ```text
@@ -5705,24 +5715,25 @@ on such a lock, and a break removes it.
 
 A writer sends these requests:
 
-- Take: `PUT` of the body with `If-None-Match: *`. A 412 fails the
-  operation. On a server that honors the header, a take with no break does
-  not change the bucket. After a request with an unknown outcome, the
-  writer reads the key. The body of the take there means that the take
-  holds the lock, because no other run writes its `id`.
-- Probe: after the take, a second `PUT` of the same body with
-  `If-None-Match: *`. A 412 shows that the server honors the header. The
-  writer then reads the lock: with the own `id`, the writer holds the lock.
-  Another `id` or no lock fails the operation, and the writer removes no
-  lock. A 2xx shows that the server ignores the header, so the lock gives
-  no exclusion: the writer removes its lock and fails. On such a server,
-  the take wrote over a lock that the key held, so that lock is gone. After
-  a probe request with an unknown outcome, the writer reads the key. Other
-  bytes there give the same steps as a 412. The body of the take there,
-  with a 412 to a later request of the probe, shows that the server honors
-  the header, and the writer holds the lock. The body of the take with no
-  such 412 removes the lock and fails. The probe changes no byte of the
-  lock.
+- Probe: before a request to the lock key, `PUT` of the probe body to the
+  probe key with `If-None-Match: *`. A 412 shows that the server honors the
+  header. A 2xx gives a second `PUT` of the same body. A 412 to the second
+  request shows that the server honors the header. A 2xx to it shows that
+  the server ignores the header, so the lock gives no exclusion. The writer
+  then fails, and it wrote no lock. A lock that the key holds does not
+  change. After a request with an unknown outcome, the writer reads the
+  probe key. The probe body there after the first request gives the second
+  request. The probe body there after the second request fails the
+  operation with an unknown outcome, and the writer writes no lock. Other
+  bytes there count as a 412. Only a program other than the port writes
+  other bytes to the probe key. A 412 to a request after an unknown outcome
+  shows that the server honors the header. Each take runs the probe, and a
+  writer keeps no result of an earlier probe.
+- Take: after the probe, `PUT` of the body with `If-None-Match: *`. A 412
+  fails the operation. A take with no break then writes only the probe key.
+  After a request with an unknown outcome, the writer reads the key. The
+  body of the take there means that the take holds the lock, because no
+  other run writes its `id`.
 - Check: `GET` of the lock, and a compare of its `id` with the own `id`.
   Another `id`, no `id`, or no lock stops the writer before its next change.
 - Release: `GET` of the lock. With the own `id`, `DELETE` with `If-Match`
@@ -5732,14 +5743,14 @@ A writer sends these requests:
   arrive, is sent again. If another writer took the lock between the two
   requests, the second one gets 412, and the writer reports that its lock
   was broken, although its release was complete.
-- Break: `GET` of the lock, `DELETE` with `If-Match` and the `ETag` of the
-  `GET`, and then a take. The break removes the lock that it read, whatever
-  its `id`. A `GET` with no `ETag` fails the break, and the writer deletes
-  no lock. After a 412, the writer reads the lock again. A lock there fails
-  the break, because another writer changed the lock after the `GET`. No
-  lock there means that its holder removed it, and the writer goes on to
-  the take. If the take fails, the lock that the break deleted stays
-  deleted.
+- Break: after the probe, `GET` of the lock, `DELETE` with `If-Match` and
+  the `ETag` of the `GET`, and then a take. The break removes the lock that
+  it read, whatever its `id`. A `GET` with no `ETag` fails the break, and
+  the writer deletes no lock. After a 412, the writer reads the lock
+  again. A lock there fails the break, because another writer changed the
+  lock after the `GET`. No lock there means that its holder removed it,
+  and the writer goes on to the take. If the take fails, the lock that the
+  break deleted stays deleted.
 
 The lock has no expiry time. A lock that a writer leaves when it ends with
 no release stays until a break removes it.
@@ -5757,7 +5768,8 @@ Observed behavior of the servers:
 - `rclone serve s3` 1.75.1 ignores `If-None-Match: *` on `PUT`: a second
   conditional `PUT` gives 200 and writes the object. It ignores `If-Match`
   on `DELETE`: a wrong `ETag` gives 204 and deletes the object, and an
-  absent key gives 204. So the probe refuses each writer on this server.
+  absent key gives 204. So the probe refuses each writer on this server
+  before a request to the lock key.
 - SeaweedFS 4.36 honors both headers. A conditional `PUT` to a key that
   holds an object gives 412 `PreconditionFailed`, and the object stays. A
   `DELETE` with a wrong `ETag` gives 412, and the object stays. A `DELETE`
@@ -5782,9 +5794,10 @@ with the `s3://` address of its operand or of a remote:
 4. It releases the writer lock.
 
 The init writes no summary and no ref. A failure before the write of
-`config` changes nothing but the lock, and the init releases the lock. A
-failure after the write leaves the `config`, and the bucket repository is
-then ready for a push. A crash leaves the lock, as for each writer.
+`config` changes nothing but the lock and the probe key, and the init
+releases the lock. A failure after the write leaves the `config`, and the
+bucket repository is then ready for a push. A crash leaves the lock, as for
+each writer.
 
 ### The push to a bucket repository
 
@@ -6027,7 +6040,8 @@ The steps of the update are:
    `summary.sig` if a summary signer signed the summary.
 8. The release of the lock.
 
-These states refuse the update before it changes the bucket:
+These states refuse the update, and the refusal changes nothing in the
+bucket but the probe key of the writer lock:
 
 - a ref key under `refs/` other than `refs/heads/<name>` and
   `refs/mirrors/<id>/<name>`;

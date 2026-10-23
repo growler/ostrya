@@ -48,6 +48,9 @@ const ADDRESS: &str = "s3://bkt/repo";
 /// The key of the writer lock in the bucket.
 const LOCK: &str = "repo/extensions/ostrya/lock";
 
+/// The key of the probe of the lock in the bucket.
+const PROBE: &str = "repo/extensions/ostrya/lock-probe";
+
 /// The key of the config in the bucket.
 const CONFIG: &str = "repo/config";
 
@@ -314,7 +317,8 @@ fn init_writes_the_config_with_no_collection_id() {
             b"[core]\nrepo_version=1\nmode=archive-z2\n"
         );
         assert!(!state.objects.contains_key(LOCK));
-        assert_eq!(state.objects.len(), 1);
+        assert_eq!(state.objects.len(), 2);
+        assert!(state.objects.contains_key(PROBE));
     });
 }
 
@@ -582,11 +586,8 @@ fn a_push_to_a_bucket_with_no_config_is_refused() {
             message,
             format!("the bucket repository {ADDRESS} has no config; init it first")
         );
-        assert_eq!(
-            puts(&server),
-            ["repo/extensions/ostrya/lock", "repo/extensions/ostrya/lock"]
-        );
-        assert!(server.state().objects.is_empty());
+        assert_eq!(puts(&server), [PROBE, PROBE, LOCK]);
+        assert_eq!(keys(&server, "repo/"), [PROBE]);
     });
 }
 
@@ -750,10 +751,7 @@ fn a_second_push_with_no_change_uploads_no_object_and_writes_no_ref() {
         let outcome = push(&repo, &server.endpoint(), opts(&["main"]))
             .await
             .unwrap();
-        assert_eq!(
-            puts(&server),
-            ["repo/extensions/ostrya/lock", "repo/extensions/ostrya/lock"]
-        );
+        assert_eq!(puts(&server), [PROBE, LOCK]);
         assert_eq!(outcome.outcome.stats.objects_needed, 0);
         assert_eq!(outcome.outcome.refs[0].old, Some(tip));
     });
@@ -784,7 +782,7 @@ fn a_push_of_a_commit_that_the_bucket_holds_reads_no_tree() {
         assert_eq!(
             puts(&server),
             [
-                "repo/extensions/ostrya/lock",
+                "repo/extensions/ostrya/lock-probe",
                 "repo/extensions/ostrya/lock",
                 "repo/refs/heads/other"
             ]
@@ -815,7 +813,7 @@ fn a_push_after_a_new_signature_uploads_the_commitmeta_alone() {
         assert_eq!(
             puts(&server),
             [
-                "repo/extensions/ostrya/lock".to_owned(),
+                "repo/extensions/ostrya/lock-probe".to_owned(),
                 "repo/extensions/ostrya/lock".to_owned(),
                 format!("repo/{meta_target}")
             ]
@@ -936,7 +934,7 @@ fn an_interrupted_push_leaves_whole_trees_and_a_run_again_completes() {
         assert_eq!(
             puts(&server),
             [
-                "repo/extensions/ostrya/lock".to_owned(),
+                "repo/extensions/ostrya/lock-probe".to_owned(),
                 "repo/extensions/ostrya/lock".to_owned(),
                 key(ObjectType::Commit, &tip),
                 "repo/refs/heads/main".to_owned()
@@ -1030,7 +1028,7 @@ fn a_failure_at_the_refs_leaves_some_refs_and_a_run_again_writes_the_rest() {
         assert_eq!(
             puts(&server),
             [
-                "repo/extensions/ostrya/lock",
+                "repo/extensions/ostrya/lock-probe",
                 "repo/extensions/ostrya/lock",
                 "repo/refs/heads/b"
             ]
@@ -1112,7 +1110,7 @@ fn a_failed_release_leaves_the_lock_and_break_lock_removes_it() {
 }
 
 #[test]
-fn a_push_to_a_server_that_ignores_if_none_match_changes_nothing() {
+fn a_push_to_a_server_that_ignores_if_none_match_writes_only_the_probe() {
     let scratch = TmpDir::new("push-s3-no-exclusion");
     block_on(async {
         let server = StandIn::start();
@@ -1125,7 +1123,7 @@ fn a_push_to_a_server_that_ignores_if_none_match_changes_nothing() {
             .unwrap_err();
         assert!(matches!(err, Error::BucketNoExclusion { .. }), "{err}");
         let all = keys(&server, "repo/");
-        assert_eq!(all, [CONFIG]);
+        assert_eq!(all, [CONFIG, PROBE]);
     });
 }
 

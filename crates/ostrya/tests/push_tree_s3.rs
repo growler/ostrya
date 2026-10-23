@@ -43,6 +43,9 @@ const ADDRESS: &str = "s3://bkt/repo";
 /// The key of the writer lock in the bucket.
 const LOCK: &str = "repo/extensions/ostrya/lock";
 
+/// The key of the probe of the lock in the bucket.
+const PROBE: &str = "repo/extensions/ostrya/lock-probe";
+
 /// The key of the config in the bucket.
 const CONFIG: &str = "repo/config";
 
@@ -741,8 +744,8 @@ fn a_tree_push_to_a_bucket_with_no_config_is_refused() {
             message,
             format!("the bucket repository {ADDRESS} has no config; init it first")
         );
-        assert_eq!(puts(&server), [LOCK, LOCK]);
-        assert!(server.state().objects.is_empty());
+        assert_eq!(puts(&server), [PROBE, PROBE, LOCK]);
+        assert_eq!(keys(&server, "repo/"), [PROBE]);
     });
 }
 
@@ -1018,7 +1021,7 @@ fn a_lock_broken_before_the_ref_stops_the_push() {
 }
 
 #[test]
-fn a_tree_push_to_a_server_that_ignores_if_none_match_changes_nothing() {
+fn a_tree_push_to_a_server_that_ignores_if_none_match_writes_only_the_probe() {
     let scratch = TmpDir::new("push-tree-s3-no-exclusion");
     let src = build_src(scratch.path());
     block_on(async {
@@ -1029,7 +1032,7 @@ fn a_tree_push_to_a_server_that_ignores_if_none_match_changes_nothing() {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::BucketNoExclusion { .. }), "{err}");
-        assert_eq!(keys(&server, "repo/"), [CONFIG]);
+        assert_eq!(keys(&server, "repo/"), [CONFIG, PROBE]);
     });
 }
 

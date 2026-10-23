@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use common::TmpDir;
 use common::modes::object_path;
-use common::s3::{StandIn, endpoint};
+use common::s3::{PROBE_BODY, PROBE_KEY, StandIn, endpoint};
 use ostrya::bucket::{
     BucketFindingKind, BucketFsckOptions, BucketRepo, BucketSummaryOptions, BucketSummaryReport,
 };
@@ -109,6 +109,9 @@ impl Fixture {
         fixture.put("config", config.as_bytes());
         fixture.put_ref("refs/heads/main", &c2);
         fixture.put_ref("refs/heads/side", &s1);
+        // A bucket that a writer took the lock of holds the probe, so each
+        // take sends one probe.
+        fixture.put(PROBE_KEY, PROBE_BODY);
         fixture
     }
 
@@ -188,6 +191,15 @@ impl Fixture {
             .filter(|(method, _)| method != "GET")
             .map(|(method, key)| format!("{method} {key}"))
             .collect()
+    }
+
+    /// Returns `true` if each request other than a `GET` writes the lock or
+    /// the probe of the lock.
+    fn lock_writes_alone(&self) -> bool {
+        self.writes().iter().all(|write| {
+            write.ends_with("extensions/ostrya/lock")
+                || write.ends_with("extensions/ostrya/lock-probe")
+        })
     }
 
     /// Returns the prefix of each list, without the prefix of the
@@ -620,7 +632,7 @@ fn the_update_reads_each_ref_commit_once_and_writes_the_summary_alone() {
         assert_eq!(
             f.writes(),
             [
-                "PUT extensions/ostrya/lock",
+                "PUT extensions/ostrya/lock-probe",
                 "PUT extensions/ostrya/lock",
                 "PUT summary",
                 "PUT summary.sig",
@@ -656,13 +668,7 @@ fn a_signed_bucket_refuses_an_update_with_no_signer() {
             "{err}"
         );
         assert_eq!(f.snapshot(), before);
-        assert!(
-            f.writes()
-                .iter()
-                .all(|write| write.ends_with("extensions/ostrya/lock")),
-            "{:?}",
-            f.writes()
-        );
+        assert!(f.lock_writes_alone(), "{:?}", f.writes());
         assert!(f.get("extensions/ostrya/lock").is_none());
         // An unsigned bucket takes an update with no signer.
         f.remove("summary.sig");
@@ -692,13 +698,7 @@ fn a_404_that_is_no_absent_key_fails_the_probe_of_the_signature() {
             "{err}"
         );
         assert_eq!(f.snapshot(), before);
-        assert!(
-            f.writes()
-                .iter()
-                .all(|write| write.ends_with("extensions/ostrya/lock")),
-            "{:?}",
-            f.writes()
-        );
+        assert!(f.lock_writes_alone(), "{:?}", f.writes());
         assert!(f.get("extensions/ostrya/lock").is_none());
     });
 }
@@ -725,13 +725,7 @@ fn a_404_that_is_no_absent_key_on_a_superblock_refuses_the_update() {
             "{err}"
         );
         assert_eq!(f.snapshot(), before);
-        assert!(
-            f.writes()
-                .iter()
-                .all(|write| write.ends_with("extensions/ostrya/lock")),
-            "{:?}",
-            f.writes()
-        );
+        assert!(f.lock_writes_alone(), "{:?}", f.writes());
         assert!(f.get("extensions/ostrya/lock").is_none());
         // A superblock that is gone at its read, with `NoSuchKey`, is not in
         // the map.
@@ -807,13 +801,7 @@ fn a_bad_ref_or_commit_refuses_the_update_and_changes_nothing() {
                 "{case}: {err}"
             );
             assert_eq!(f.snapshot(), before, "{case}");
-            assert!(
-                f.writes()
-                    .iter()
-                    .all(|write| write.ends_with("extensions/ostrya/lock")),
-                "{case}: {:?}",
-                f.writes()
-            );
+            assert!(f.lock_writes_alone(), "{case}: {:?}", f.writes());
         });
     }
 }

@@ -19,7 +19,7 @@ use std::path::Path;
 
 use common::TmpDir;
 use common::modes::object_path;
-use common::s3::{Rclone, StandIn, endpoint, rclone_available};
+use common::s3::{PROBE_BODY, PROBE_KEY, Rclone, StandIn, endpoint, rclone_available};
 use ostrya::bucket::{
     BucketFsckOptions, BucketPruneOptions, BucketPruneReport, BucketRepo, BucketSummaryOptions,
 };
@@ -104,6 +104,9 @@ impl Fixture {
         fixture.put("config", config.as_bytes());
         fixture.put_ref("refs/heads/main", &c3);
         fixture.put_ref("refs/heads/side", &s1);
+        // A bucket that a writer took the lock of holds the probe, so each
+        // take sends one probe.
+        fixture.put(PROBE_KEY, PROBE_BODY);
         fixture
     }
 
@@ -1136,13 +1139,13 @@ fn the_run_checks_the_lock_once_for_each_step_with_a_change() {
         let report = f.prune(&refs_only(0)).await.unwrap();
         assert!(!report.deleted_deltas.is_empty());
         assert!(!report.deleted_markers.is_empty());
-        // One read at the take, one check for each of the four steps, and
-        // one read at the release.
-        assert_eq!(lock_gets(&f), 1 + 4 + 1);
+        // One check for each of the four steps, and one read at the
+        // release. The take reads no lock.
+        assert_eq!(lock_gets(&f), 4 + 1);
         // The commits and the other objects alone.
         let f = Fixture::new(None).await;
         f.prune(&refs_only(0)).await.unwrap();
-        assert_eq!(lock_gets(&f), 1 + 2 + 1);
+        assert_eq!(lock_gets(&f), 2 + 1);
     });
 }
 
@@ -1275,8 +1278,8 @@ fn a_time_bound_keeps_the_commit_of_each_ref_at_any_age() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_prune_on_rclone_is_refused_and_changes_nothing() {
-    if !rclone_available("a_prune_on_rclone_is_refused_and_changes_nothing") {
+fn a_prune_on_rclone_is_refused_and_writes_only_the_probe() {
+    if !rclone_available("a_prune_on_rclone_is_refused_and_writes_only_the_probe") {
         return;
     }
     block_on(async {
@@ -1301,7 +1304,44 @@ fn a_prune_on_rclone_is_refused_and_changes_nothing() {
             .await
             .unwrap_err();
         assert!(matches!(err, Error::BucketNoExclusion { .. }), "{err}");
-        assert_eq!(common::file_inventory(&root, "bkt"), before);
+        let mut expected = before;
+        expected.push((format!("bkt/repo/{PROBE_KEY}"), PROBE_BODY.to_vec()));
+        expected.sort();
+        assert_eq!(common::file_inventory(&root, "bkt"), expected);
+    });
+}
+
+#[cfg(feature = "push")]
+#[test]
+fn the_probe_of_the_lock_is_no_finding_of_fsck_and_a_prune_keeps_it() {
+    block_on(async {
+        let f = Fixture::new(None).await;
+        // The bucket starts empty, so the init and the push write the probe.
+        f.server.state().objects.clear();
+        let s3 = endpoint(&f.server.endpoint(), ADDRESS);
+        f.bucket.init(None, None, false).await.unwrap();
+        let opts = ostrya::RepoPushOptions {
+            refspecs: vec!["main".to_owned()],
+            ..ostrya::RepoPushOptions::default()
+        };
+        f.local.push_to_bucket(s3, opts).await.unwrap();
+        assert_eq!(f.get(PROBE_KEY).as_deref(), Some(PROBE_BODY));
+        // The fsck gives no finding on a key under `extensions/`.
+        let report = f.bucket.fsck(&BucketFsckOptions::default()).await.unwrap();
+        assert!(
+            !report.has_errors()
+                && !report
+                    .findings
+                    .iter()
+                    .any(|found| found.key.starts_with("extensions/")),
+            "{:#?}",
+            report.findings
+        );
+        f.bucket
+            .prune(&refs_only(0), &BucketPruneOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(f.get(PROBE_KEY).as_deref(), Some(PROBE_BODY));
     });
 }
 

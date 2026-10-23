@@ -40,6 +40,9 @@ const ADDRESS: &str = "s3://bkt/repo";
 /// The key of the writer lock in the bucket.
 const LOCK: &str = "repo/extensions/ostrya/lock";
 
+/// The key of the probe of the writer lock in the bucket.
+const PROBE: &str = "repo/extensions/ostrya/lock-probe";
+
 /// The key of the config in the bucket.
 const CONFIG: &str = "repo/config";
 
@@ -281,7 +284,7 @@ fn remote_init_at_an_address_writes_the_config_and_needs_no_repository() {
     assert_eq!(object(&server, CONFIG).unwrap(), PLAIN.as_bytes());
     assert!(object(&server, LOCK).is_none());
     let keys: Vec<String> = server.state().objects.keys().cloned().collect();
-    assert_eq!(keys, [CONFIG]);
+    assert_eq!(keys, [CONFIG, PROBE]);
 }
 
 #[test]
@@ -761,7 +764,8 @@ fn a_push_to_a_bucket_with_no_config_is_refused() {
         message,
         "error: invalid input: the bucket repository s3://bkt/repo has no config; init it first\n"
     );
-    assert!(server.state().objects.is_empty());
+    let keys: Vec<String> = server.state().objects.keys().cloned().collect();
+    assert_eq!(keys, [PROBE]);
 }
 
 /// `--tag`, `--compress`, `--onto`, and a delete refspec are refused for an

@@ -41,6 +41,13 @@ pub const ACCESS_KEY: &str = "ostryatest";
 /// The secret access key of the server.
 pub const SECRET_KEY: &str = "ostryasecret";
 
+/// The key of the probe of the writer lock, relative to the prefix of the
+/// repository.
+pub const PROBE_KEY: &str = "extensions/ostrya/lock-probe";
+
+/// The body that the probe of the writer lock writes.
+pub const PROBE_BODY: &[u8] = b"ostrya lock probe\n";
+
 /// The environment variable that turns the skip for a missing `rclone` into
 /// a failure.
 pub const REQUIRE_S3: &str = "OSTRYA_REQUIRE_S3";

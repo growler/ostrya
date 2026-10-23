@@ -90,7 +90,8 @@ const COMPARE_CHUNK: usize = 64 * 1024;
 /// The client refuses a key that is not a key of a bucket repository, before
 /// it sends a request:
 ///
-/// - `config`, `summary`, `summary.sig`, and `extensions/ostrya/lock`
+/// - `config`, `summary`, `summary.sig`, `extensions/ostrya/lock`, and
+///   `extensions/ostrya/lock-probe`
 /// - `objects/XX/<62 hex digits>.<ext>`, in lowercase hex, with the
 ///   extension `commit`, `commitmeta`, `dirtree`, `dirmeta`, `filez`,
 ///   `tombstone-commit`, or `cfs`

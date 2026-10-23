@@ -14,6 +14,13 @@ use crate::remote::s3::{DeleteIfMatch, PutIfAbsent};
 /// The key of the lock, relative to the prefix of the repository.
 pub(super) const LOCK_KEY: &str = "extensions/ostrya/lock";
 
+/// The key of the probe that shows that the server honors `If-None-Match`,
+/// relative to the prefix of the repository. No writer deletes it.
+pub(super) const PROBE_KEY: &str = "extensions/ostrya/lock-probe";
+
+/// The body of the probe: fixed ASCII bytes, the same in each version.
+const PROBE_BODY: &[u8] = b"ostrya lock probe\n";
+
 /// The group of the lock body.
 const GROUP: &str = "lock";
 
@@ -135,6 +142,7 @@ impl BucketRepo {
         operation: LockOperation,
         break_lock: bool,
     ) -> Result<WriterLock<'_>> {
+        self.probe_exclusion().await?;
         let broken = if break_lock {
             self.break_lock().await?
         } else {
@@ -146,62 +154,60 @@ impl BucketRepo {
             .duration_since(UNIX_EPOCH)
             .map_or(0, |since| since.as_secs());
         let body = lock_body(&id, &host, std::process::id(), operation, started)?.into_bytes();
-        match self.bucket.put_if_absent(LOCK_KEY, body.clone()).await? {
+        match self.bucket.put_if_absent(LOCK_KEY, body).await? {
             PutIfAbsent::Created { .. }
             | PutIfAbsent::Matches { .. }
-            | PutIfAbsent::Refused { .. } => {}
-            _ => return Err(self.locked(self.read_lock(false).await?)),
+            | PutIfAbsent::Refused { .. } => Ok(WriterLock {
+                repo: self,
+                id,
+                broken,
+            }),
+            _ => Err(self.locked(self.read_lock(false).await?)),
         }
-        let lock = WriterLock {
-            repo: self,
-            id,
-            broken,
-        };
-        let failure = match self.bucket.put_if_absent(LOCK_KEY, body).await {
-            // The key held an object at the probe. A probe whose read after
-            // an interrupted request found other bytes gives this too, so
-            // the read tells if the key holds the lock of this take.
-            Ok(PutIfAbsent::Present) => match self.read_lock(false).await {
-                Ok(Some(held)) if lock.is_own(&held.holder) => return Ok(lock),
-                // Another writer holds the key, or no writer does. The lock
-                // of this take is gone, so the call removes no lock.
-                Ok(other) => return Err(self.locked(other)),
-                Err(e) => ProbeFailure::Error(e),
-            },
-            // The server honors the header, and the key holds the body of
-            // this take.
-            Ok(PutIfAbsent::Refused { .. }) => return Ok(lock),
-            Ok(PutIfAbsent::Created { .. }) => ProbeFailure::NoExclusion,
-            Ok(_) => ProbeFailure::Unknown,
-            Err(e) => ProbeFailure::Error(e.into()),
-        };
-        // The error of the probe is the error of the call. A lock that the
-        // removal leaves stays until a break of the lock.
-        let removal = lock.remove().await;
-        Err(match failure {
-            ProbeFailure::NoExclusion => Error::BucketNoExclusion {
+    }
+
+    /// Shows that the server honors `If-None-Match`, before a request to the
+    /// lock key.
+    ///
+    /// The probe sends put-if-absent of the probe body to the probe key, and
+    /// sends it again if the first request wrote the key or gave no answer
+    /// that shows a 412. A 412 to either request shows that the server
+    /// honors the header. A second request that the server writes shows
+    /// that it does not.
+    async fn probe_exclusion(&self) -> Result<()> {
+        match self
+            .bucket
+            .put_if_absent(PROBE_KEY, PROBE_BODY.to_vec())
+            .await?
+        {
+            // The key held an object, or the server answered 412. If a
+            // program other than ostrya wrote other bytes to the key, the
+            // read after a request with an unknown outcome gives this too,
+            // and the probe takes it as a 412.
+            PutIfAbsent::Present | PutIfAbsent::Refused { .. } => return Ok(()),
+            PutIfAbsent::Created { .. } | PutIfAbsent::Matches { .. } => {}
+            _ => return Err(self.unknown_probe()),
+        }
+        match self
+            .bucket
+            .put_if_absent(PROBE_KEY, PROBE_BODY.to_vec())
+            .await?
+        {
+            PutIfAbsent::Present | PutIfAbsent::Refused { .. } => Ok(()),
+            PutIfAbsent::Created { .. } => Err(Error::BucketNoExclusion {
                 address: self.address().to_string(),
-            },
-            ProbeFailure::Unknown => {
-                let removal = match removal {
-                    Ok(()) => "the call removed the lock of this run".to_owned(),
-                    Err(Error::BucketLockLost { .. }) => {
-                        "the key holds no lock of this run".to_owned()
-                    }
-                    Err(e) => format!(
-                        "the removal of the lock of this run failed, so the lock stays until a \
-                         break of the lock: {e}"
-                    ),
-                };
-                Error::Remote(crate::remote::Error::Transport(format!(
-                    "the probe of the writer lock of {} had an unknown outcome, so it is not \
-                     known if the server honors If-None-Match; {removal}; run the operation \
-                     again",
-                    self.address()
-                )))
-            }
-            ProbeFailure::Error(e) => e,
-        })
+            }),
+            _ => Err(self.unknown_probe()),
+        }
+    }
+
+    /// Returns the error of a probe with an unknown outcome.
+    fn unknown_probe(&self) -> Error {
+        Error::Remote(crate::remote::Error::Transport(format!(
+            "the probe of the writer lock of {} had an unknown outcome, so it is not known if \
+             the server honors If-None-Match; the run wrote no lock; run the operation again",
+            self.address()
+        )))
     }
 
     /// Reads the lock that the key holds, as [`BucketRepo::lock_holder`]
@@ -270,17 +276,6 @@ impl BucketRepo {
     }
 }
 
-/// A probe that does not show that the server honors `If-None-Match`.
-enum ProbeFailure {
-    /// The server wrote the probe.
-    NoExclusion,
-    /// The probe had an unknown outcome, and the key holds the body of the
-    /// take.
-    Unknown,
-    /// An error of the bucket client.
-    Error(Error),
-}
-
 impl WriterLock<'_> {
     /// Returns the id of the lock, in 64 lowercase hex digits.
     pub fn id(&self) -> &str {
@@ -334,11 +329,6 @@ impl WriterLock<'_> {
     ///   the lock, if another writer took the lock after the removal.
     /// - [`Error::Remote`] for an error of the bucket client.
     pub async fn release(self) -> Result<()> {
-        self.remove().await
-    }
-
-    /// Removes the lock if it holds the id of this lock.
-    async fn remove(&self) -> Result<()> {
         let bucket = &self.repo.bucket;
         let held = match self.repo.read_lock(false).await? {
             Some(held) if self.is_own(&held.holder) => held,
@@ -635,7 +625,18 @@ mod tests {
             "{absent}"
         );
         let open = Error::BucketNoExclusion { address: address() };
-        assert!(open.to_string().contains("s3://bkt/repo"), "{open}");
+        assert_eq!(
+            open.to_string(),
+            "the S3 server of s3://bkt/repo does not honor If-None-Match, so the writer lock \
+             gives no exclusion and no writer can run on it; the run wrote no lock"
+        );
+    }
+
+    #[test]
+    fn the_probe_body_is_fixed_ascii() {
+        assert_eq!(PROBE_KEY, "extensions/ostrya/lock-probe");
+        assert_eq!(PROBE_BODY, b"ostrya lock probe\n");
+        assert_eq!(PROBE_BODY.len(), 18);
     }
 
     #[test]

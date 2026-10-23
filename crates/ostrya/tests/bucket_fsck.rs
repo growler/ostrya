@@ -22,7 +22,7 @@ use std::sync::Arc;
 
 use common::TmpDir;
 use common::modes::object_path;
-use common::s3::{Rclone, StandIn, endpoint, rclone_available};
+use common::s3::{PROBE_BODY, PROBE_KEY, Rclone, StandIn, endpoint, rclone_available};
 use ostrya::bucket::{
     BucketFinding, BucketFindingKind, BucketFsckOptions, BucketFsckReport, BucketRepo,
     BucketSummaryOptions,
@@ -108,6 +108,9 @@ impl Fixture {
         fixture.put("config", config.as_bytes());
         fixture.put_ref("refs/heads/main", &head);
         fixture.put_ref("refs/heads/side", &side);
+        // A bucket that a writer took the lock of holds the probe, so each
+        // take sends one probe.
+        fixture.put(PROBE_KEY, PROBE_BODY);
         fixture
     }
 
@@ -1272,7 +1275,7 @@ fn the_repair_marks_the_commits_and_deletes_the_bad_objects_in_order() {
             .filter(|(method, _)| method != "GET")
             .collect();
         let mut expected = vec![
-            ("PUT".to_owned(), "extensions/ostrya/lock".to_owned()),
+            ("PUT".to_owned(), PROBE_KEY.to_owned()),
             ("PUT".to_owned(), "extensions/ostrya/lock".to_owned()),
         ];
         for (commit, _) in &wanted {
@@ -1309,7 +1312,9 @@ fn the_repair_marks_the_commits_and_deletes_the_bad_objects_in_order() {
             .map(|(_, key)| key)
             .collect();
         assert!(
-            writes.iter().all(|key| key == "extensions/ostrya/lock"),
+            writes
+                .iter()
+                .all(|key| key == "extensions/ostrya/lock" || key == PROBE_KEY),
             "{writes:?}"
         );
     });
@@ -1460,7 +1465,9 @@ fn a_push_of_a_marked_commit_uploads_its_missing_objects_and_clears_the_marker()
         let writes: Vec<(String, String)> = f
             .requests()
             .into_iter()
-            .filter(|(method, key)| method != "GET" && key != "extensions/ostrya/lock")
+            .filter(|(method, key)| {
+                method != "GET" && key != "extensions/ostrya/lock" && key != PROBE_KEY
+            })
             .collect();
         assert_eq!(
             writes,
@@ -1820,7 +1827,7 @@ fn a_marker_of_a_whole_tree_is_a_note_and_the_repair_deletes_it() {
         assert_eq!(
             writes,
             [
-                ("PUT".to_owned(), "extensions/ostrya/lock".to_owned()),
+                ("PUT".to_owned(), PROBE_KEY.to_owned()),
                 ("PUT".to_owned(), "extensions/ostrya/lock".to_owned()),
                 ("DELETE".to_owned(), marker.clone()),
                 ("DELETE".to_owned(), "extensions/ostrya/lock".to_owned()),
@@ -2022,7 +2029,10 @@ fn a_read_only_fsck_on_rclone_and_a_refused_repair() {
         opts.delete = true;
         let err = bucket.fsck(&opts).await.unwrap_err();
         assert!(matches!(err, Error::BucketNoExclusion { .. }), "{err}");
-        assert_eq!(common::file_inventory(&root, "bkt"), before);
+        let mut expected = before;
+        expected.push((format!("bkt/repo/{PROBE_KEY}"), PROBE_BODY.to_vec()));
+        expected.sort();
+        assert_eq!(common::file_inventory(&root, "bkt"), expected);
         // A wrong secret fails the run.
         let mut s3 = endpoint(&server.endpoint(), ADDRESS);
         s3.credentials = ostrya::remote::s3::Credentials::new(

@@ -11,7 +11,9 @@
 //!
 //! The [`Target`] of a request is a path under each mirror, a path with a
 //! query string under each mirror, or an absolute URL. The fetcher sends a
-//! path and a query as written, so the caller escapes them.
+//! path and a query as written, so the caller escapes them. A fetcher with a
+//! [`RequestSigner`] sends a path in the form that
+//! [`RequestSigner::request_path`] gives.
 //!
 //! A failed fetch gives the status of the response. On request, it also gives
 //! the headers and a capped body of that response.
@@ -26,7 +28,8 @@
 //! - [`Fetcher::refetching`] returns a [`Refetch`], which fetches a failed body again.
 //! - [`Fetcher::upload`] sends an [`UploadRequest`] and returns an [`Uploaded`].
 //! - [`UploadBody`] gives an upload body whole or streams it from an [`UploadWriter`].
-//! - [`RequestSigner`] signs each attempt through [`FetcherOptions::signer`].
+//! - [`RequestSigner`] signs each attempt through [`FetcherOptions::signer`],
+//!   and gives the form of each request path.
 //! - [`Error`] is the error of each fallible operation of the crate.
 //!
 //! # Modules
@@ -334,9 +337,36 @@ impl std::fmt::Debug for BearerToken {
 /// The fetcher calls the signer on the task of the request. A signer that
 /// hashes a body given whole does that work on the task, on each call.
 ///
+/// The path of a [`Target::Path`] or a [`Target::PathQuery`] goes through
+/// [`request_path`](RequestSigner::request_path) before the fetcher adds it
+/// to the base path of a mirror. So a signer that signs a canonical form of
+/// the path gets a request that carries that form. A [`Target::Url`] goes on
+/// the wire as written.
+///
 /// The [`Debug`] output of a signer must show no secret, because the
 /// [`Debug`] output of [`FetcherOptions`] includes it.
 pub trait RequestSigner: Send + Sync + std::fmt::Debug {
+    /// Returns `path`, the path of a [`Target::Path`] or a
+    /// [`Target::PathQuery`], in the form that the request carries.
+    ///
+    /// The fetcher calls this method once for each fetch and each upload
+    /// with a path target, before admission. It adds the result to the base
+    /// path of each mirror, in place of `path`. The fetcher does not call it
+    /// for a [`Target::Url`], or for the query of a [`Target::PathQuery`].
+    ///
+    /// The default returns `path` unchanged. A signer whose signature covers
+    /// a canonical form of the path returns that form, so the request
+    /// carries the bytes that the signature covers.
+    ///
+    /// # Errors
+    ///
+    /// The fetcher passes an error of this method through unchanged, and the
+    /// request ends with it before admission. Usually, the error is
+    /// [`Error::Fetch`].
+    fn request_path<'a>(&self, path: &'a str) -> Result<Cow<'a, str>> {
+        Ok(Cow::Borrowed(path))
+    }
+
     /// Returns the headers that sign `request`. Each one replaces a header of
     /// the same name.
     ///
@@ -804,7 +834,9 @@ pub struct FetcherOptions {
     /// is a scheme, an authority, and a path. A query string or userinfo fails
     /// [`Fetcher::new`], so neither part of a base URL reaches the wire. A
     /// request target is the base path, then `/` and the request path, then
-    /// `?` and the query of a [`Target::PathQuery`].
+    /// `?` and the query of a [`Target::PathQuery`]. With a
+    /// [`signer`](FetcherOptions::signer), the request path is the path that
+    /// [`RequestSigner::request_path`] gives.
     ///
     /// An empty list serves [`Target::Url`] requests alone. The default is an
     /// empty list.
@@ -1170,7 +1202,9 @@ pub struct FetchRequest<'a> {
     /// The fetcher adds a path to the base path as written, so the path carries
     /// the escapes that the server expects. A path holds no `?` and no `#`,
     /// because neither is part of a path. Either one fails the fetch before
-    /// admission.
+    /// admission. If the fetcher has a
+    /// [`signer`](FetcherOptions::signer), the fetcher adds the path that
+    /// [`RequestSigner::request_path`] gives in place of the path.
     ///
     /// The fetcher adds `?` and the query of [`Target::PathQuery`] after the
     /// path, as written, so the query carries the escapes that the server
@@ -1897,9 +1931,10 @@ impl Destination {
 /// list. A URL target names one destination, which the fetch parses once.
 #[derive(Debug)]
 enum Route<'a> {
-    /// Each mirror in order, for this request path and query string.
+    /// Each mirror in order, for this request path and query string. The
+    /// path is in the form that the signer of the fetcher gives.
     Mirrors {
-        path: &'a str,
+        path: Cow<'a, str>,
         query: Option<&'a str>,
     },
     /// The one destination that a URL target names.
@@ -3226,7 +3261,8 @@ impl Fetcher {
     ///
     /// A URL target names its one destination, which this function parses. A
     /// path target, with or without a query, goes to the mirrors, so a
-    /// fetcher with no mirror has no destination for it.
+    /// fetcher with no mirror has no destination for it. The signer of the
+    /// fetcher, if there is one, gives the form of the path.
     fn route<'a>(&self, target: Target<'a>) -> Result<Route<'a>> {
         let (path, query) = match target {
             Target::Url(url) => return Ok(Route::One(parse_url(url)?)),
@@ -3243,6 +3279,10 @@ impl Fetcher {
                 target.describe()
             )));
         }
+        let path = match &self.inner.signer {
+            Some(signer) => signer.request_path(path)?,
+            None => Cow::Borrowed(path),
+        };
         Ok(Route::Mirrors { path, query })
     }
 
@@ -7305,7 +7345,7 @@ mod tests {
             let Route::Mirrors { path, query } = route else {
                 panic!("a path query target goes to the mirrors");
             };
-            assert_eq!((path, query), ("_ostrya/refs/v1", Some("pattern=a")));
+            assert_eq!((&*path, query), ("_ostrya/refs/v1", Some("pattern=a")));
 
             let refused = [
                 ("p?x", "q", "no query and no fragment"),
@@ -9499,6 +9539,78 @@ mod tests {
         assert_eq!(request.authority, "[::1]");
         assert_eq!(request.path, "/");
         assert_eq!(request.query, None);
+    }
+
+    /// A signer that gives each `+` of a request path as `%2B`, as a signer of
+    /// a canonical path does.
+    #[derive(Debug)]
+    struct PlusSigner;
+
+    impl RequestSigner for PlusSigner {
+        fn sign(&self, _request: &SignRequest<'_>) -> Result<Vec<(String, String)>> {
+            Ok(Vec::new())
+        }
+
+        fn request_path<'a>(&self, path: &'a str) -> Result<Cow<'a, str>> {
+            Ok(Cow::Owned(path.replace('+', "%2B")))
+        }
+    }
+
+    /// The path of a path target goes through the signer, and the request
+    /// target carries the form that the signer gives. The query does not.
+    /// With no signer, or with a signer that keeps the default method, the
+    /// path goes as written. A URL target goes as written with each signer.
+    #[test]
+    fn a_signer_gives_the_form_of_a_request_path() {
+        rt::block_on(async {
+            let cases: [(Option<Arc<dyn RequestSigner>>, &str); 3] = [
+                (None, "/r/deltas/a+/b"),
+                (fixed_signer(), "/r/deltas/a+/b"),
+                (Some(Arc::new(PlusSigner)), "/r/deltas/a%2B/b"),
+            ];
+            for (signer, want) in cases {
+                let fetcher = Fetcher::new(FetcherOptions {
+                    signer,
+                    allow_cleartext_credentials: true,
+                    ..direct_options("http://example.com/r")
+                })
+                .await
+                .unwrap();
+                let targets = [
+                    (Target::Path("deltas/a+/b"), want.to_owned()),
+                    (
+                        Target::PathQuery {
+                            path: "deltas/a+/b",
+                            query: "x=a+",
+                        },
+                        format!("{want}?x=a+"),
+                    ),
+                ];
+                for (target, wire) in targets {
+                    let Route::Mirrors { path, query } = fetcher.route(target).unwrap() else {
+                        panic!("a path target goes to the mirrors");
+                    };
+                    let destination = fetcher.inner.mirrors[0].destination(&path, query);
+                    let request = fetcher
+                        .build_request(
+                            &destination,
+                            &FetchRequest::for_target(target),
+                            &fetcher.inner.headers,
+                            Protocol::Http11,
+                            Via::Direct,
+                        )
+                        .unwrap();
+                    assert_eq!(request.uri(), wire.as_str(), "{target:?}");
+                }
+                let Route::One(destination) = fetcher
+                    .route(Target::Url("http://example.com/r/deltas/a+/b"))
+                    .unwrap()
+                else {
+                    panic!("a url target names one destination");
+                };
+                assert_eq!(destination.target(), "/r/deltas/a+/b");
+            }
+        });
     }
 
     /// The headers of a signer replace the headers of the same name, and each

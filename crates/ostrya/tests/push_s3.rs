@@ -2181,6 +2181,45 @@ fn the_ostree_command_checks_and_pulls_a_push_on_seaweedfs() {
     assert_eq!(tool_tip(&client), Some(repos[1].2));
 }
 
+/// Commits onto `first` in `repo` until the name of the delta from `first`
+/// holds a `+`, and pushes the commit to the server at `url`. Then puts each
+/// part of the delta into the bucket and writes the summary, which lists the
+/// one delta. Returns the commit and the name of the delta.
+async fn push_delta_with_a_plus(repo: &Repo, url: &str, first: Checksum) -> (Checksum, String) {
+    // The name of a delta holds the modified base64 of its two commits.
+    // `commit` sets a fixed timestamp, so the checksums and the name are
+    // fixed too, and the name of the first delta holds a `+`. The loop is a
+    // guard for a change to the commits.
+    let mut n = 0;
+    let (second, delta) = loop {
+        let second = commit(repo, "main", Some(first), &format!("second {n}"), None).await;
+        let delta = repo
+            .generate_static_delta(Some(&first), &second, &ostrya::DeltaOptions::default())
+            .await
+            .unwrap();
+        let delta = delta.to_str().unwrap().to_owned();
+        if delta.contains('+') {
+            break (second, delta);
+        }
+        n += 1;
+    };
+    push(repo, url, opts(&["main"])).await.unwrap();
+    let bucket = BucketRepo::open(&endpoint(url, ADDRESS)).await.unwrap();
+    for entry in std::fs::read_dir(repo.path().join(&delta)).unwrap() {
+        let entry = entry.unwrap();
+        let name = entry.file_name().into_string().unwrap();
+        let bytes = std::fs::read(entry.path()).unwrap();
+        bucket
+            .bucket()
+            .put(&format!("{delta}/{name}"), bytes)
+            .await
+            .unwrap();
+    }
+    let opts = ostrya::bucket::BucketSummaryOptions::default();
+    assert_eq!(bucket.update_summary(&opts).await.unwrap().deltas, 1);
+    (second, delta)
+}
+
 /// A delta whose key holds `+` goes into the bucket next to a push, and a
 /// summary update lists it. The `ostree` command pulls it with
 /// `--require-static-deltas` into a `bare-user` repository, and the port
@@ -2218,41 +2257,7 @@ fn a_delta_whose_key_holds_a_plus_pulls_with_the_ostree_command_and_the_port_on_
     tool_ok(&[&client, "pull", "w", "main"]);
     let (second, delta) = block_on(async {
         let repo = Repo::open(&local).await.unwrap();
-        // The key of a delta holds the modified base64 of its two commits,
-        // so about three keys in four hold a `+`, and each key holds one if
-        // the part of `first` holds one.
-        let mut n = 0;
-        let (second, delta) = loop {
-            let second = commit(&repo, "main", Some(first), &format!("second {n}"), None).await;
-            let delta = repo
-                .generate_static_delta(Some(&first), &second, &ostrya::DeltaOptions::default())
-                .await
-                .unwrap();
-            let delta = delta.to_str().unwrap().to_owned();
-            if delta.contains('+') {
-                break (second, delta);
-            }
-            n += 1;
-        };
-        push(&repo, &server.endpoint(), opts(&["main"]))
-            .await
-            .unwrap();
-        let bucket = BucketRepo::open(&endpoint(&server.endpoint(), ADDRESS))
-            .await
-            .unwrap();
-        for entry in std::fs::read_dir(local.join(&delta)).unwrap() {
-            let entry = entry.unwrap();
-            let name = entry.file_name().into_string().unwrap();
-            let bytes = std::fs::read(entry.path()).unwrap();
-            bucket
-                .bucket()
-                .put(&format!("{delta}/{name}"), bytes)
-                .await
-                .unwrap();
-        }
-        let opts = ostrya::bucket::BucketSummaryOptions::default();
-        assert_eq!(bucket.update_summary(&opts).await.unwrap().deltas, 1);
-        (second, delta)
+        push_delta_with_a_plus(&repo, &server.endpoint(), first).await
     });
     tool_ok(&[&client, "pull", "--require-static-deltas", "w", "main"]);
     assert_eq!(tool_tip(&client), Some(second), "{delta}");
@@ -2274,6 +2279,76 @@ fn a_delta_whose_key_holds_a_plus_pulls_with_the_ostree_command_and_the_port_on_
             .await
             .unwrap();
         assert_eq!(repo.resolve_rev("main", false).await.unwrap(), Some(second));
+    });
+}
+
+/// A pull over `s3://` with no bucket client sends each `+` of a delta key as
+/// `%2B`, which is the path that SigV4 signs. The stand-in reads both forms
+/// as one key, so the request log shows the form on the wire.
+#[test]
+fn a_pull_over_s3_sends_a_plus_of_a_delta_key_as_2b() {
+    let scratch = TmpDir::new("push-s3-delta-plus");
+    block_on(async {
+        let server = StandIn::start();
+        init(&server.endpoint(), None).await;
+        let local = scratch.path().join("src");
+        let repo = archive(&local).await;
+        let first = commit(&repo, "main", None, "first", None).await;
+        push(&repo, &server.endpoint(), opts(&["main"]))
+            .await
+            .unwrap();
+        let port = scratch.path().join("port");
+        let s3 = endpoint(&server.endpoint(), ADDRESS);
+        let pulled = pull_back(s3, &port, &["main"], PullTrust::unverified()).await;
+        assert_eq!(
+            pulled.resolve_rev("main", false).await.unwrap(),
+            Some(first)
+        );
+        let (second, delta) = push_delta_with_a_plus(&repo, &server.endpoint(), first).await;
+        {
+            let mut state = server.state();
+            state.requests.clear();
+            state.authorizations.clear();
+        }
+
+        let session = PullSession::connect(
+            Endpoint::S3(endpoint(&server.endpoint(), ADDRESS)),
+            StreamSessionOptions::default(),
+        )
+        .await
+        .unwrap();
+        let opts = PullOptions {
+            refs: vec!["main".to_owned()],
+            require_static_deltas: true,
+            ..PullOptions::default()
+        };
+        pulled
+            .pull_with_session(session, PullTrust::unverified(), opts)
+            .await
+            .unwrap();
+        assert_eq!(
+            pulled.resolve_rev("main", false).await.unwrap(),
+            Some(second)
+        );
+        let state = server.state();
+        let reads: Vec<&str> = state
+            .requests
+            .iter()
+            .filter(|(method, _)| method == "GET")
+            .map(|(_, target)| target.as_str())
+            .filter(|target| {
+                target.starts_with("/bkt/repo/deltas/")
+                    || target.starts_with("/bkt/repo/delta-indexes/")
+            })
+            .collect();
+        assert!(
+            reads.iter().all(|target| !target.contains('+')),
+            "{reads:?}"
+        );
+        assert!(
+            reads.iter().any(|target| target.contains("%2B")),
+            "{delta}: {reads:?}"
+        );
     });
 }
 

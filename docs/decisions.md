@@ -628,6 +628,39 @@ no signature, so a redirect of S3 to the region of the bucket fails at the
 other origin. With no redirect, the pull fails at the first answer, and the
 bucket client names the region.
 
+The pull sends the path of each request in the canonical form of SigV4.
+The modified base64 of a delta name holds `+`, and SigV4 signs a `+` of a
+path as `%2B`. With a raw `+` on the wire, the signature depends on how the
+server reads a raw `+` of a path. `RequestSigner` of `ostrya-fetch` has the
+provided method `request_path`. The fetcher gives it the path of each
+`Target::Path` and `Target::PathQuery`, and sends the path that it returns.
+A fetcher with no signer does not call it, and the default method returns
+the path unchanged. So such a fetcher sends the path as the caller writes
+it. `SigV4` returns the canonical path. It refuses a path that holds an
+escaped `/`, or an escaped `.` that makes a `.` or a `..` segment, because
+the decoded path names another key.
+A `Target::Url` goes as written, and `SigV4` refuses a request whose path
+is not in the canonical form. So no signature covers a path other than the
+path on the wire.
+
+This refusal has a known cost. AWS accepts a path with a raw `$`, an escape
+with lowercase hex digits, or `%7E`, but `SigV4` refuses such a path in a
+`Target::Url`, in the `Location` of a redirect to the same origin, and in
+the base path of a mirror. No path of the port gets there: the S3 options
+set `max_redirects` to 0, and each URL target of the bucket client comes
+from `encode_path`.
+
+Three alternatives were rejected:
+
+- A new field of `FetcherOptions` that sets the form of the path. A caller
+  that builds `FetcherOptions` with a struct literal and no `..` then fails
+  to compile.
+- The encoding of the delta paths in the delta source of the pull that the
+  bucket client gives. The pull without a bucket client,
+  `PullSession::connect` with `Endpoint::S3`, then sends a raw `+`.
+- The encoding of the delta paths in each HTTP pull. That changes the bytes
+  that a plain HTTP pull sends, and such a pull has no signature to match.
+
 `summary.sig`, `summary`, and `config` go through `s3::Bucket::get`, and the
 objects, the deltas, and the ref files go through the signed fetcher of the
 pull. A fetch keeps no body of an error response, so through the fetcher a

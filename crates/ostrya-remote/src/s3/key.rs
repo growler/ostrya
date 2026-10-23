@@ -129,7 +129,8 @@ pub(crate) fn check_list_prefix(prefix: &str) -> Result<()> {
 /// `0-9`, `-`, `.`, `_`, `~`, and `/` as `%XX` in uppercase.
 ///
 /// This is the canonical URI of SigV4, so the signature of a key does not
-/// depend on how a server reads a raw `+` of a path.
+/// depend on how a server reads a raw `+` of a path. A pull over `s3://`
+/// sends each path in the same form, through `SigV4::request_path`.
 pub(crate) fn encode_path(key: &str) -> String {
     let mut path = String::with_capacity(key.len());
     uri_encode(key.as_bytes(), false, &mut path);

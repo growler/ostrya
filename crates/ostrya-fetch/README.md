@@ -14,7 +14,9 @@ whole in memory.
 
 The `Target` of a request is a path under each mirror, a path with a
 query string under each mirror, or an absolute URL. The fetcher sends a
-path and a query as written, so the caller escapes them.
+path and a query as written, so the caller escapes them. A fetcher with a
+`RequestSigner` sends a path in the form that
+`RequestSigner::request_path` gives.
 
 A failed fetch gives the status of the response. On request, it also gives
 the headers and a capped body of that response.
@@ -31,7 +33,8 @@ API documentation: <https://docs.rs/ostrya-fetch>
 - `Fetcher::refetching` returns a `Refetch`, which fetches a failed body again.
 - `Fetcher::upload` sends an `UploadRequest` and returns an `Uploaded`.
 - `UploadBody` gives an upload body whole or streams it from an `UploadWriter`.
-- `RequestSigner` signs each attempt through `FetcherOptions::signer`.
+- `RequestSigner` signs each attempt through `FetcherOptions::signer`,
+  and gives the form of each request path.
 - `Error` is the error of each fallible operation of the crate.
 
 ## Modules

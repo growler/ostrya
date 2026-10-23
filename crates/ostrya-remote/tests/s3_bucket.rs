@@ -505,8 +505,8 @@ fn a_key_with_plus_round_trips() {
         let listing = bucket.list("deltas/").await.unwrap();
         let keys: Vec<&str> = listing.objects.iter().map(|o| o.key.as_str()).collect();
         assert_eq!(keys, [key.as_str()]);
-        // The client sends `+` as `%2B`, and a request with a raw `+` reads
-        // the same object.
+        // The client sends `+` as `%2B`. A signed fetcher sends a raw `+` of
+        // a path target as `%2B` too, and reads the same object.
         assert_eq!(
             bucket.get(&key, 64).await.unwrap().unwrap().bytes,
             b"superblock"
@@ -521,6 +521,27 @@ fn a_key_with_plus_round_trips() {
         let mut bytes = Vec::new();
         body.read_to_end(&mut bytes).await.unwrap();
         assert_eq!(bytes, b"superblock");
+        let uploaded = fetcher
+            .upload(UploadRequest {
+                method: UploadMethod::Put,
+                ..UploadRequest::path(&raw, UploadBody::bytes(b"superblock".to_vec()))
+            })
+            .await
+            .unwrap();
+        assert_eq!(uploaded.status(), 200);
+        let escaped = raw.replace('+', "%2B");
+        assert_eq!(
+            uploaded.url(),
+            format!("http://127.0.0.1:{}/bkt/{escaped}", rclone.port)
+        );
+        // A URL target goes as written, so the signer refuses its raw `+`.
+        let url = format!("http://127.0.0.1:{}/bkt/{raw}", rclone.port);
+        let err = fetcher.fetch(FetchRequest::url(&url)).await.unwrap_err();
+        let ostrya_fetch::Error::Fetch(msg) = &err else {
+            panic!("expected a refusal, got {err:?}");
+        };
+        assert!(msg.contains("canonical form"), "{msg}");
+        assert!(msg.contains(&format!("/bkt/{raw}")), "{msg}");
 
         // The files that the test wrote before the first request.
         let bucket = rclone.bucket("s3://bkt/enc").await;

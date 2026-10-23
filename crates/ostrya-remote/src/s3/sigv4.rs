@@ -1,5 +1,6 @@
 //! The AWS Signature Version 4 of an S3 request.
 
+use std::borrow::Cow;
 use std::sync::{Mutex, PoisonError};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -49,10 +50,23 @@ const STREAMED: &str =
 ///
 /// The canonical path and the canonical query decode each percent escape of
 /// the request, and encode again each byte other than `A-Z`, `a-z`, `0-9`,
-/// `-`, `.`, `_`, and `~` as `%XX`. A `/` of the path stays as it is, and a
-/// `/` of the query is encoded. A `+` of the path is a literal `+` and is
-/// encoded as `%2B`. The path is not normalized: `//`, `/./`, and `/../` stay
-/// as they are.
+/// `-`, `.`, `_`, and `~` as `%XX` in uppercase. A `/` of the path stays as it
+/// is, and a `/` of the query is encoded. A `+` of the path is a literal `+`
+/// and is encoded as `%2B`. The path is not normalized: `//`, `/./`, and
+/// `/../` stay as they are.
+///
+/// The path that the request carries must be in the canonical form, so that
+/// the signature covers the path on the wire.
+/// [`request_path`](RequestSigner::request_path) gives the path of a
+/// [`Target::Path`](ostrya_fetch::Target::Path) or a
+/// [`Target::PathQuery`](ostrya_fetch::Target::PathQuery) in that form, so
+/// the fetcher sends a `+` of such a path as `%2B`. It refuses such a path
+/// if it holds an escaped `/`, or an escaped `.` that makes a `.` or a `..`
+/// segment, because the decoded path names another key. The signer refuses a
+/// request whose path is in another form, with
+/// [`Error::Fetch`](ostrya_fetch::Error::Fetch). An example is the path of a
+/// [`Target::Url`](ostrya_fetch::Target::Url) that holds a raw `+`, a `$`,
+/// or an escape with lowercase hex digits.
 ///
 /// The signer refuses a query that holds a `+`, because a server reads a `+`
 /// of a query as a space. A query sends a literal `+` as `%2B`, and the
@@ -147,7 +161,18 @@ impl SigV4 {
         };
         let amz_date = amz_date(now)?;
         let date = &amz_date[..8];
-        let uri = canonical_uri(request.path)?;
+        // The canonical URI of an empty path is `/`.
+        let uri = match canonical_path(request.path)? {
+            Cow::Borrowed("") => "/",
+            Cow::Borrowed(path) => path,
+            Cow::Owned(canonical) => {
+                return Err(ostrya_fetch::Error::Fetch(format!(
+                    "SigV4: the request path {:?} is not in its canonical form {canonical:?}, \
+                     so the signature would cover a path other than the path on the wire",
+                    request.path
+                )));
+            }
+        };
         let query = canonical_query(request.query)?;
         let mut headers = vec![
             ("host", request.authority),
@@ -157,7 +182,7 @@ impl SigV4 {
         if let Some(token) = self.credentials.session_token() {
             headers.push(("x-amz-security-token", token));
         }
-        let creq = canonical_request(request.method, &uri, &query, &headers, &payload_hash);
+        let creq = canonical_request(request.method, uri, &query, &headers, &payload_hash);
         let scope = format!("{date}/{}/s3/aws4_request", self.region);
         let key = self.signing_key_of(date);
         let signature = hex(&hmac_sha256(
@@ -199,6 +224,35 @@ impl SigV4 {
 }
 
 impl RequestSigner for SigV4 {
+    /// Returns `path` in the canonical form of SigV4: each percent escape
+    /// decoded, and each byte other than `A-Z`, `a-z`, `0-9`, `-`, `.`, `_`,
+    /// `~`, and `/` encoded again as `%XX` in uppercase.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Fetch`](ostrya_fetch::Error::Fetch) if `path` holds a
+    /// malformed percent escape, or an escape whose decoded form changes the
+    /// path. An escaped `/` adds a segment, and an escaped `.` can make a `.`
+    /// or a `..` segment. Either one makes the path name another key.
+    fn request_path<'a>(&self, path: &'a str) -> ostrya_fetch::Result<Cow<'a, str>> {
+        let canonical = canonical_path(path)?;
+        if let Cow::Owned(canonical) = &canonical {
+            let given = path.split('/');
+            let segments = canonical.split('/');
+            if given.clone().count() != segments.clone().count()
+                || given
+                    .zip(segments)
+                    .any(|(given, segment)| given != segment && matches!(segment, "." | ".."))
+            {
+                return Err(ostrya_fetch::Error::Fetch(format!(
+                    "SigV4: the canonical form {canonical:?} of the request path {path:?} \
+                     decodes an escaped '/' or an escaped '.' segment, so it names another key"
+                )));
+            }
+        }
+        Ok(canonical)
+    }
+
     fn sign(&self, request: &SignRequest<'_>) -> ostrya_fetch::Result<Vec<(String, String)>> {
         self.sign_at(request, SystemTime::now())
     }
@@ -311,19 +365,58 @@ pub(super) fn uri_encode(bytes: &[u8], encode_slash: bool, out: &mut String) {
     }
 }
 
-/// Returns the canonical URI of the request path `path`.
-fn canonical_uri(path: &str) -> ostrya_fetch::Result<String> {
-    if path.is_empty() {
-        return Ok("/".into());
+/// Returns `path` with each percent escape decoded, and each byte other
+/// than `A-Z`, `a-z`, `0-9`, `-`, `.`, `_`, `~`, and `/` encoded again as
+/// `%XX` in uppercase. A path in that form comes back borrowed.
+fn canonical_path(path: &str) -> ostrya_fetch::Result<Cow<'_, str>> {
+    if is_canonical_path(path) {
+        return Ok(Cow::Borrowed(path));
     }
     let decoded = percent_decode(path).ok_or_else(|| {
         ostrya_fetch::Error::Fetch(format!(
             "SigV4: the request path {path:?} holds a malformed percent escape"
         ))
     })?;
-    let mut uri = String::with_capacity(decoded.len());
-    uri_encode(&decoded, false, &mut uri);
-    Ok(uri)
+    let mut canonical = String::with_capacity(path.len());
+    uri_encode(&decoded, false, &mut canonical);
+    Ok(Cow::Owned(canonical))
+}
+
+/// Returns `true` if `path` is in the form that [`canonical_path`] gives.
+///
+/// Each byte of such a path is `A-Z`, `a-z`, `0-9`, `-`, `.`, `_`, `~`, or
+/// `/`, or starts an escape `%XX` in uppercase whose byte is none of these.
+fn is_canonical_path(path: &str) -> bool {
+    let unreserved = |b: u8| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'.' | b'_' | b'~');
+    let upper_hex = |b: u8| match b {
+        b'0'..=b'9' => Some(b - b'0'),
+        b'A'..=b'F' => Some(b - b'A' + 10),
+        _ => None,
+    };
+    let bytes = path.as_bytes();
+    let mut at = 0;
+    while at < bytes.len() {
+        let b = bytes[at];
+        if unreserved(b) || b == b'/' {
+            at += 1;
+            continue;
+        }
+        if b != b'%' {
+            return false;
+        }
+        let (Some(high), Some(low)) = (
+            bytes.get(at + 1).copied().and_then(upper_hex),
+            bytes.get(at + 2).copied().and_then(upper_hex),
+        ) else {
+            return false;
+        };
+        let decoded = high << 4 | low;
+        if unreserved(decoded) || decoded == b'/' {
+            return false;
+        }
+        at += 3;
+    }
+    true
 }
 
 /// Returns the canonical query string of the request query `query`.
@@ -482,7 +575,7 @@ mod tests {
     }
 
     fn uri(path: &str) -> String {
-        canonical_uri(path).unwrap()
+        canonical_path(path).unwrap().into_owned()
     }
 
     fn query(query: Option<&str>) -> String {
@@ -732,7 +825,7 @@ mod tests {
         let request = SignRequest {
             method: "PUT",
             payload: SignPayload::Bytes(b"Welcome to Amazon S3."),
-            ..get(HOST, "/test$file.text", None)
+            ..get(HOST, "/test%24file.text", None)
         };
         let signed = signer(None).sign_at(&request, at(EXAMPLE_SECS)).unwrap();
         assert_eq!(
@@ -764,9 +857,17 @@ mod tests {
             assert_eq!(uri(&format!("/{path}")), want, "{path}");
         }
         assert_eq!(uri("//a/./b/../c"), "//a/./b/../c");
-        assert_eq!(uri(""), "/");
+        let sigv4 = signer(None);
+        assert_eq!(
+            sigv4
+                .sign_at(&get(HOST, "", None), at(EXAMPLE_SECS))
+                .unwrap(),
+            sigv4
+                .sign_at(&get(HOST, "/", None), at(EXAMPLE_SECS))
+                .unwrap(),
+        );
         for bad in ["/%", "/%4", "/%zz", "/a%g0"] {
-            let err = canonical_uri(bad).unwrap_err();
+            let err = canonical_path(bad).unwrap_err();
             assert!(
                 matches!(&err, ostrya_fetch::Error::Fetch(msg) if msg.contains("malformed")),
                 "{bad}: {err:?}"
@@ -840,16 +941,156 @@ mod tests {
     }
 
     #[test]
-    fn a_raw_plus_in_the_path_is_signed_as_2b() {
+    fn a_path_in_another_form_than_the_canonical_form_is_refused() {
         let sigv4 = signer(None);
-        let raw = sigv4
-            .sign_at(&get(HOST, "/a+b", None), at(EXAMPLE_SECS))
-            .unwrap();
+        for (bad, canonical) in [
+            ("/deltas/ab/c+d/superblock", "/deltas/ab/c%2Bd/superblock"),
+            ("/a$b", "/a%24b"),
+            ("/a%2bb", "/a%2Bb"),
+            ("/%7E", "/~"),
+            ("/bkt/repo/%2Fsummary", "/bkt/repo//summary"),
+            ("/bkt/objects/%2E%2E/config", "/bkt/objects/../config"),
+        ] {
+            let err = sigv4
+                .sign_at(&get(HOST, bad, None), at(EXAMPLE_SECS))
+                .unwrap_err();
+            let ostrya_fetch::Error::Fetch(msg) = &err else {
+                panic!("{bad}: expected a refusal, got {err:?}");
+            };
+            assert!(msg.contains(&format!("{bad:?}")), "{bad}: {msg}");
+            assert!(msg.contains(&format!("{canonical:?}")), "{bad}: {msg}");
+        }
+        for good in [
+            "/deltas/ab/c%2Bd/superblock",
+            "/",
+            "/bkt/repo/refs/heads/gr%C3%BCn",
+        ] {
+            sigv4
+                .sign_at(&get(HOST, good, None), at(EXAMPLE_SECS))
+                .unwrap();
+        }
         let escaped = sigv4
             .sign_at(&get(HOST, "/a%2Bb", None), at(EXAMPLE_SECS))
             .unwrap();
-        assert_eq!(raw, escaped);
-        assert_eq!(uri("/a+b"), "/a%2Bb");
+        let creq = canonical_request(
+            "GET",
+            "/a%2Bb",
+            "",
+            &[
+                ("host", HOST),
+                ("x-amz-content-sha256", EMPTY_SHA256),
+                ("x-amz-date", "20130524T000000Z"),
+            ],
+            EMPTY_SHA256,
+        );
+        assert_eq!(signature(&escaped), example_signature(&creq));
+    }
+
+    #[test]
+    fn the_request_path_is_the_canonical_path() {
+        let sigv4 = signer(None);
+        for (path, want) in [
+            ("deltas/ab/c+d/superblock", "deltas/ab/c%2Bd/superblock"),
+            ("a$b", "a%24b"),
+            ("a%2bb", "a%2Bb"),
+            ("%7E", "~"),
+            ("refs/heads/grün", "refs/heads/gr%C3%BCn"),
+            ("objects/ab/cd.commit", "objects/ab/cd.commit"),
+            ("", ""),
+        ] {
+            let once = sigv4.request_path(path).unwrap();
+            assert_eq!(once, want, "{path}");
+            assert_eq!(sigv4.request_path(&once).unwrap(), want, "{path}");
+        }
+        assert!(matches!(
+            sigv4.request_path("objects/ab/cd.commit").unwrap(),
+            Cow::Borrowed(_)
+        ));
+        let err = sigv4.request_path("a%zz").unwrap_err();
+        assert!(
+            matches!(&err, ostrya_fetch::Error::Fetch(msg) if msg.contains("malformed")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_request_path_whose_escape_names_another_key_is_refused() {
+        let sigv4 = signer(None);
+        for (bad, canonical) in [
+            ("%2Fsummary", "/summary"),
+            ("a%2Fb", "a/b"),
+            ("a%2fb", "a/b"),
+            ("objects/%2E%2E/config", "objects/../config"),
+            ("objects/.%2e/config", "objects/../config"),
+            ("%2E/x", "./x"),
+        ] {
+            let err = sigv4.request_path(bad).unwrap_err();
+            let ostrya_fetch::Error::Fetch(msg) = &err else {
+                panic!("{bad}: expected a refusal, got {err:?}");
+            };
+            assert!(msg.contains(&format!("{bad:?}")), "{bad}: {msg}");
+            assert!(msg.contains(&format!("{canonical:?}")), "{bad}: {msg}");
+        }
+        for (good, want) in [
+            ("deltas/ab/c+d/superblock", "deltas/ab/c%2Bd/superblock"),
+            ("refs/heads/gr%C3%BCn", "refs/heads/gr%C3%BCn"),
+            ("summary.sig", "summary.sig"),
+            ("a%2Eb/c", "a.b/c"),
+            ("objects/../config", "objects/../config"),
+        ] {
+            assert_eq!(sigv4.request_path(good).unwrap(), want, "{good}");
+        }
+    }
+
+    #[test]
+    fn the_check_of_a_canonical_path_agrees_with_the_decode_and_encode() {
+        for path in [
+            "",
+            "/",
+            "summary.sig",
+            "deltas/ab/c+d/superblock",
+            "deltas/ab/c%2Bd/superblock",
+            "refs/heads/gr%C3%BCn",
+            "refs/heads/gr%c3%bcn",
+            "refs/heads/grün",
+            "a%2Fb",
+            "a%2Eb",
+            "%7E",
+            "%7e",
+            "%41",
+            "%20",
+            "%FF",
+            "a b",
+            "a$b",
+            "%",
+            "%4",
+            "%zz",
+            "%G0",
+            "-._~/AZaz09",
+        ] {
+            let recoded = percent_decode(path).map(|decoded| {
+                let mut out = String::new();
+                uri_encode(&decoded, false, &mut out);
+                out
+            });
+            assert_eq!(
+                is_canonical_path(path),
+                recoded.as_deref() == Some(path),
+                "{path}"
+            );
+            match canonical_path(path) {
+                Ok(canonical) => assert_eq!(Some(&*canonical), recoded.as_deref(), "{path}"),
+                Err(_) => assert_eq!(recoded, None, "{path}"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_path_of_a_key_is_its_canonical_uri() {
+        for key in ["repo/config", "deltas/a+/b_c~d", "refs/heads/grün", "a b%"] {
+            let path = format!("/{}", crate::s3::key::encode_path(key));
+            assert_eq!(uri(&path), path, "{key}");
+        }
     }
 
     #[test]

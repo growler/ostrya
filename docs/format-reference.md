@@ -5537,10 +5537,13 @@ are:
 The bucket client refuses each other key before it sends a request. A key
 from a listing that is not one of these keys is a stray key.
 
-The request path of a key encodes each byte other than `A-Z a-z 0-9 - . _ ~
-/` as `%XX` with uppercase hex digits. A `+` of a delta key goes as `%2B`,
+Each request of the bucket client and of an S3 pull sends the path of a key
+in the canonical form of SigV4: each byte other than `A-Z a-z 0-9 - . _ ~ /`
+goes as `%XX` with uppercase hex digits. A `+` of a delta key goes as `%2B`,
 and a non-ASCII character of a ref name goes as the `%XX` of each of its
-UTF-8 bytes. The path is the canonical URI of SigV4.
+UTF-8 bytes. The path is the canonical URI of SigV4, so the signature covers
+the path on the wire. The signer refuses a request whose path is in another
+form.
 
 A list of a bucket repository is `ListObjectsV2` with the encoding type
 `url`. The `prefix` parameter of each list ends in `/`: `PREFIX/objects/XX/`,

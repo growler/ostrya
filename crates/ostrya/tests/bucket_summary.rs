@@ -900,7 +900,7 @@ fn a_server_that_ignores_if_none_match_gets_no_summary() {
 }
 
 #[test]
-fn a_failed_write_of_the_signature_releases_the_lock_and_a_run_again_repairs_it() {
+fn a_failed_write_of_the_signature_names_the_mismatch_and_a_run_again_repairs_it() {
     block_on(async {
         let f = Fixture::new(None).await;
         f.update().await.unwrap();
@@ -908,7 +908,37 @@ fn a_failed_write_of_the_signature_releases_the_lock_and_a_run_again_repairs_it(
         f.put_ref("refs/heads/new", &f.c1);
         f.server.state().refuse = Some(("PUT", "repo/summary.sig".to_owned()));
         let err = f.update().await.unwrap_err();
-        assert!(matches!(err, Error::Remote(_)), "{err}");
+        let Error::BucketSummaryIncomplete {
+            address,
+            summary_written: true,
+            report,
+            error,
+        } = &err
+        else {
+            panic!("{err:?}");
+        };
+        assert_eq!(address, ADDRESS);
+        assert_eq!(report.refs, 3);
+        assert_eq!(report.signers, ["ed25519"]);
+        assert_eq!(report.broken_lock, None);
+        let text = err.to_string();
+        assert!(
+            text.starts_with(&format!(
+                "the summary update of the bucket repository {ADDRESS} wrote summary, and the \
+                 write of summary.sig failed: "
+            )),
+            "{text}"
+        );
+        assert!(text.contains("ostrya remote summary -u"), "{text}");
+        assert!(
+            matches!(
+                &**error,
+                Error::Remote(ostrya::remote::Error::S3 { status: 403, .. })
+            ),
+            "{error:?}"
+        );
+        let source = std::error::Error::source(&err).unwrap();
+        assert_eq!(source.to_string(), error.to_string());
         assert!(f.get("extensions/ostrya/lock").is_none());
         // The new summary and the old signature: a check of the signature
         // fails.
@@ -918,10 +948,14 @@ fn a_failed_write_of_the_signature_releases_the_lock_and_a_run_again_repairs_it(
         opts.summary_keys = Some(keys(false));
         let report = f.bucket.fsck(&opts).await.unwrap();
         assert!(
-            report
-                .findings
-                .iter()
-                .any(|finding| finding.kind == BucketFindingKind::Summary && finding.error),
+            report.findings.iter().any(|finding| {
+                finding.kind == BucketFindingKind::Summary
+                    && finding.error
+                    && finding.key == "summary.sig"
+                    && finding
+                        .detail
+                        .ends_with("a summary update with these signers writes a matching pair")
+            }),
             "{:#?}",
             report.findings
         );
@@ -930,6 +964,128 @@ fn a_failed_write_of_the_signature_releases_the_lock_and_a_run_again_repairs_it(
         let report = f.bucket.fsck(&opts).await.unwrap();
         assert!(report.findings.is_empty(), "{:#?}", report.findings);
     });
+}
+
+#[test]
+fn a_failed_write_of_the_signature_carries_the_holder_of_a_broken_lock() {
+    block_on(async {
+        let f = Fixture::new(None).await;
+        f.server.state().store(LOCK, DEAD_LOCK.as_bytes());
+        f.server.state().refuse = Some(("PUT", "repo/summary.sig".to_owned()));
+        let mut opts = signed();
+        opts.break_lock = true;
+        let err = f.bucket.update_summary(&opts).await.unwrap_err();
+        let Error::BucketSummaryIncomplete { report, .. } = &err else {
+            panic!("{err:?}");
+        };
+        let holder = report.broken_lock.as_ref().unwrap();
+        assert_eq!(holder.id.as_deref(), Some("9".repeat(64).as_str()));
+        assert!(f.get("summary").is_some());
+        assert!(f.get("summary.sig").is_none());
+        assert!(f.get("extensions/ostrya/lock").is_none());
+    });
+}
+
+#[test]
+fn a_write_of_the_summary_with_an_unknown_outcome_names_the_mismatch() {
+    // A connection that closes after the server wrote the summary, and an
+    // answer 503 with no write.
+    for (case, interrupted) in [("interrupted", true), ("503", false)] {
+        block_on(async {
+            let f = Fixture::new(None).await;
+            f.update().await.unwrap();
+            let old_summary = f.get("summary").unwrap();
+            let old_sig = f.get("summary.sig").unwrap();
+            f.put_ref("refs/heads/new", &f.c1);
+            let mut once = endpoint(&f.server.endpoint(), ADDRESS);
+            once.http.max_retries = 0;
+            let bucket = BucketRepo::open(&once).await.unwrap();
+            {
+                let mut state = f.server.state();
+                // The update sends the probe of the lock, the lock, and then
+                // the summary.
+                let puts = state
+                    .requests
+                    .iter()
+                    .filter(|(method, _)| method == "PUT")
+                    .count();
+                if interrupted {
+                    state.close_after = Some(("PUT", puts + 3));
+                } else {
+                    state.slow_down = Some(("PUT", puts + 3));
+                }
+            }
+            let err = bucket.update_summary(&signed()).await.unwrap_err();
+            let Error::BucketSummaryIncomplete {
+                summary_written: false,
+                report,
+                error,
+                ..
+            } = &err
+            else {
+                panic!("{case}: {err:?}");
+            };
+            assert_eq!(report.refs, 3, "{case}");
+            let text = err.to_string();
+            assert!(
+                text.starts_with(&format!(
+                    "the summary update of the bucket repository {ADDRESS} failed to write \
+                     summary with an unknown outcome: "
+                )),
+                "{case}: {text}"
+            );
+            assert!(text.contains("ostrya remote summary -u"), "{case}: {text}");
+            let source = std::error::Error::source(&err).unwrap();
+            assert_eq!(source.to_string(), error.to_string(), "{case}");
+            if interrupted {
+                assert!(
+                    matches!(&**error, Error::Remote(ostrya::remote::Error::Fetch(_))),
+                    "{error:?}"
+                );
+                assert_eq!(f.summary().lookup("new"), Some(f.c1));
+            } else {
+                assert!(
+                    matches!(
+                        &**error,
+                        Error::Remote(ostrya::remote::Error::S3 { status: 503, .. })
+                    ),
+                    "{error:?}"
+                );
+                assert_eq!(f.get("summary"), Some(old_summary));
+            }
+            // The second update sent no write of the signature.
+            assert_eq!(f.get("summary.sig"), Some(old_sig), "{case}");
+            let sig_writes = f
+                .writes()
+                .iter()
+                .filter(|w| *w == "PUT summary.sig")
+                .count();
+            assert_eq!(sig_writes, 1, "{case}: {:?}", f.writes());
+            assert!(f.get("extensions/ostrya/lock").is_none(), "{case}");
+        });
+    }
+}
+
+#[test]
+fn a_refused_write_of_the_summary_is_the_error_of_the_bucket_client() {
+    for (case, opts) in [("signed", signed()), ("unsigned", unsigned())] {
+        block_on(async {
+            let f = Fixture::new(None).await;
+            f.put_ref("refs/heads/new", &f.c1);
+            let before = f.snapshot();
+            f.server.state().refuse = Some(("PUT", "repo/summary".to_owned()));
+            let err = f.bucket.update_summary(&opts).await.unwrap_err();
+            assert!(
+                matches!(
+                    &err,
+                    Error::Remote(ostrya::remote::Error::S3 { status: 403, .. })
+                ),
+                "{case}: {err:?}"
+            );
+            assert_eq!(f.snapshot(), before, "{case}");
+            assert!(f.get("extensions/ostrya/lock").is_none(), "{case}");
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------

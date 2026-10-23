@@ -6056,9 +6056,31 @@ bucket but the probe key of the writer lock:
 
 Between the two writes of step 7, a reader sees the new summary and the old
 signature, and a reader that verifies the summary refuses it. A reader
-never accepts a summary that its signature does not cover. A read after the
-update ends finds a matching pair. A failure between the two writes leaves
-that state, and a run again writes a matching pair.
+never accepts a summary that its signature does not cover. A read after an
+update that succeeds finds a matching pair.
+
+An update with a summary signer fails with an error that states the state
+of the pair in two cases:
+
+- The write of `summary.sig` fails after the server accepted the write of
+  `summary`. The bucket holds the new summary. It can hold the old
+  `summary.sig` or no `summary.sig`. A write of `summary.sig` with an
+  unknown outcome can also have written the new `summary.sig`, and the pair
+  then matches.
+- The write of `summary` fails with an unknown outcome: the HTTP client
+  failed, or the last answer was 408, 429, or 5xx. The bucket can hold
+  the new summary with the old `summary.sig` or with no `summary.sig`.
+
+The error names `ostrya remote summary -u`. Before the error, the update
+tries to release its lock. An update again with the same signers writes a
+matching pair. A refusal of the write of `summary`, for example an answer
+403, gives the error of the bucket client. A refusal of the first request
+of that write changes nothing. A refusal of a request that the bucket
+client sent again can leave the new summary with the old `summary.sig`,
+because an earlier request can have written `summary`. An update with no
+summary signer gives the error of the bucket client in each case. A
+process that stops between the two writes gives no error. The fsck with
+the summary keys reports each such pair as an error on `summary.sig`.
 
 ### The fsck of a bucket repository
 
@@ -6147,7 +6169,11 @@ Each finding has one kind, and is an error or a note:
   signature, names a ref at a commit that the bucket does not hold, or
   names a delta whose superblock is absent or has another SHA-256. With the
   summary keys, an absent `summary` or `summary.sig` is an error too. A
-  `summary` or a `summary.sig` larger than 64 MiB is one error.
+  `summary` or a `summary.sig` larger than 64 MiB is one error. The detail
+  of a `summary.sig` that the summary keys do not verify states that a
+  summary update with the summary signers writes a matching pair. The
+  detail of an absent `summary.sig` states that a summary update with the
+  summary signers writes a `summary.sig`.
 - `summary`, an error: with a summary in the bucket, a delta map of the
   bucket that the run cannot build. This is a key
   `deltas/<fanout>/<leaf>/superblock` whose directory names do not decode

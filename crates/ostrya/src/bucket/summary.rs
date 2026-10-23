@@ -88,9 +88,10 @@ pub struct BucketSummaryReport {
     /// The holder of the lock that the break of the lock deleted, or `None`
     /// if the run deleted no lock.
     ///
-    /// The holder is reported on success alone. A run that breaks the lock
-    /// and then fails returns its error, and the holder of the deleted lock
-    /// is not in it.
+    /// The holder is reported on success, and in the report of
+    /// [`Error::BucketSummaryIncomplete`](crate::Error::BucketSummaryIncomplete).
+    /// A run that breaks the lock and then fails with another error returns
+    /// that error, and the holder of the deleted lock is not in it.
     pub broken_lock: Option<LockHolder>,
 }
 
@@ -195,7 +196,7 @@ impl BucketRepo {
     /// Between the two writes of step 7, a reader sees the new summary and
     /// the old `summary.sig`. A reader that verifies the summary refuses it
     /// in that window, because the old signatures do not cover the new
-    /// bytes. A read after the update ends finds a matching pair.
+    /// bytes. A read after an update that succeeds finds a matching pair.
     ///
     /// # Errors
     ///
@@ -224,18 +225,37 @@ impl BucketRepo {
     /// - [`Error::BucketLockLost`](crate::Error::BucketLockLost) if the check
     ///   of the lock or the release fails. A failed check stops the update
     ///   before it writes `summary`. The update then releases no lock.
-    /// - [`Error::Remote`](crate::Error::Remote) for an error of the bucket
-    ///   client, also for an answer 404 that is not `NoSuchKey` to the probe
-    ///   of `summary.sig` or to the read of a superblock, and
+    /// - [`Error::BucketSummaryIncomplete`](crate::Error::BucketSummaryIncomplete)
+    ///   if `opts` has a signer, and the write of `summary.sig` fails after
+    ///   the write of `summary`, or the write of `summary` fails with an
+    ///   unknown outcome: the HTTP client failed, or the last answer was
+    ///   408, 429, or 5xx. The error holds the report of the update.
+    /// - [`Error::Remote`](crate::Error::Remote) for each other error of the
+    ///   bucket client, also for an answer 404 that is not `NoSuchKey` to the
+    ///   probe of `summary.sig` or to the read of a superblock, and
     ///   [`Error::Io`](crate::Error::Io) for a read of a superblock that
-    ///   fails in transit.
+    ///   fails in transit. A refusal of the write of `summary`, for example
+    ///   an answer 403, gives this error. A refusal of the first request of
+    ///   that write changes nothing. A refusal of a request that the bucket
+    ///   client sent again can leave the new `summary` with the old
+    ///   `summary.sig`, because an earlier request can have written
+    ///   `summary`. [`BucketRepo::fsck`] with
+    ///   [`summary_keys`](crate::bucket::BucketFsckOptions::summary_keys)
+    ///   reports that state.
     ///
     /// A failure before step 7 changes nothing in the bucket but the probe
-    /// key of the writer lock. A failure between the two writes of step 7
-    /// leaves the window above, and a run again writes a matching pair.
-    /// After each failure other than a lost lock or a lock of another
-    /// writer, the update releases its lock and drops an error of that
-    /// release.
+    /// key of the writer lock. After
+    /// [`Error::BucketSummaryIncomplete`](crate::Error::BucketSummaryIncomplete),
+    /// the bucket can hold a `summary.sig` that does not cover its
+    /// `summary`, or no `summary.sig`, and a reader that verifies the
+    /// summary refuses it. An update again with the same signers writes a
+    /// matching pair. [`BucketRepo::fsck`] with
+    /// [`summary_keys`](crate::bucket::BucketFsckOptions::summary_keys)
+    /// reports such a pair as an error on `summary.sig`. A process that
+    /// stops between the two writes gives no error, and only that fsck finds
+    /// the pair. After each failure other than a lost lock or a lock of
+    /// another writer, the update releases its lock and drops an error of
+    /// that release.
     ///
     /// # Examples
     ///
@@ -267,7 +287,12 @@ impl BucketRepo {
         let broken_lock = lock.broken().cloned();
         let mut report = match self.summary_update(&config, opts, &lock).await {
             Ok(report) => report,
-            Err(e) => return Err(release_on_error(lock, e).await),
+            Err(mut e) => {
+                if let crate::Error::BucketSummaryIncomplete { report, .. } = &mut e {
+                    report.broken_lock = broken_lock;
+                }
+                return Err(release_on_error(lock, e).await);
+            }
         };
         lock.release().await?;
         report.broken_lock = broken_lock;
@@ -313,7 +338,7 @@ impl BucketRepo {
             last_modified: summary.last_modified,
             broken_lock: None,
         };
-        self.write_summary(lock, summary).await?;
+        self.write_summary(lock, summary, &report).await?;
         Ok(report)
     }
 
@@ -395,16 +420,44 @@ impl BucketRepo {
     /// Checks the writer lock, and writes `summary`, then `summary.sig` if a
     /// signer signed the summary. The call never deletes `summary.sig`.
     ///
+    /// `report` is the report of the update, which the error of a signed
+    /// write that is incomplete holds.
+    ///
     /// # Errors
     ///
     /// - The errors of [`WriterLock::check`].
-    /// - [`Error::Remote`](crate::Error::Remote) for an error of the bucket
-    ///   client.
-    async fn write_summary(&self, lock: &WriterLock<'_>, summary: SignedSummary) -> Result<()> {
+    /// - [`Error::BucketSummaryIncomplete`](crate::Error::BucketSummaryIncomplete)
+    ///   if a signer signed the summary, and the write of `summary.sig` fails,
+    ///   or the write of `summary` fails with an unknown outcome.
+    /// - [`Error::Remote`](crate::Error::Remote) for each other error of the
+    ///   bucket client.
+    async fn write_summary(
+        &self,
+        lock: &WriterLock<'_>,
+        summary: SignedSummary,
+        report: &BucketSummaryReport,
+    ) -> Result<()> {
         lock.check().await?;
-        self.bucket.put("summary", summary.bytes).await?;
-        if let Some(signatures) = summary.signatures {
-            self.bucket.put("summary.sig", signatures).await?;
+        let Some(signatures) = summary.signatures else {
+            self.bucket.put("summary", summary.bytes).await?;
+            return Ok(());
+        };
+        let incomplete = |summary_written, error| crate::Error::BucketSummaryIncomplete {
+            address: self.address().to_string(),
+            summary_written,
+            report: Box::new(report.clone()),
+            error: Box::new(error),
+        };
+        if let Err(e) = self.bucket.put("summary", summary.bytes).await {
+            let e = crate::Error::from(e);
+            return Err(if outcome_unknown(&e) {
+                incomplete(false, e)
+            } else {
+                e
+            });
+        }
+        if let Err(e) = self.bucket.put("summary.sig", signatures).await {
+            return Err(incomplete(true, e.into()));
         }
         Ok(())
     }
@@ -638,6 +691,47 @@ fn signer_error(key: &str, error: crate::Error) -> crate::Error {
     }
 }
 
+/// Returns `true` if the write that failed with `e` can have changed the key.
+///
+/// The rule follows the retry rule of the bucket client, `is_retryable` and
+/// `send_retrying` in `ostrya_remote::s3::bucket`: the client sends a request
+/// again after an interrupted request and after a 408, 429, or 5xx answer.
+/// Each error of the fetcher counts, also a request that was not sent: such
+/// an error can end the retries after an interrupted request.
+fn outcome_unknown(e: &crate::Error) -> bool {
+    match e {
+        crate::Error::Remote(crate::remote::Error::Fetch(_)) => true,
+        crate::Error::Remote(crate::remote::Error::S3 { status, .. }) => status_unknown(*status),
+        _ => false,
+    }
+}
+
+/// Returns `true` for an answer status after which the bucket client sends
+/// a request again: 408, 429, and 5xx.
+fn status_unknown(status: u16) -> bool {
+    status == 408 || status == 429 || (500..600).contains(&status)
+}
+
+/// Returns the text of
+/// [`Error::BucketSummaryIncomplete`](crate::Error::BucketSummaryIncomplete)
+/// after the address, with `summary_written` and the failure `error` of the
+/// write.
+pub(crate) fn describe_summary_incomplete(summary_written: bool, error: &crate::Error) -> String {
+    if summary_written {
+        format!(
+            "wrote summary, and the write of summary.sig failed: {error}; summary.sig can be \
+             absent or not cover the new summary, so a pull that verifies the summary can \
+             refuse it; run `ostrya remote summary -u` again with the same summary signers"
+        )
+    } else {
+        format!(
+            "failed to write summary with an unknown outcome: {error}; summary.sig can be \
+             absent or not cover the summary of the bucket, so a pull that verifies the summary \
+             can refuse it; run `ostrya remote summary -u` again with the same summary signers"
+        )
+    }
+}
+
 /// Refuses an update of the summary of the bucket repository at `address`
 /// with `signers` signers, when the repository holds a `summary.sig`, as
 /// `signed` states, and the update has no signer.
@@ -694,6 +788,61 @@ mod tests {
             }
             other => panic!("{other:?}"),
         }
+    }
+
+    #[test]
+    fn a_failed_write_has_an_unknown_outcome_by_the_retry_rule() {
+        for status in [408, 429, 500, 503, 599] {
+            assert!(status_unknown(status), "{status}");
+        }
+        for status in [200, 400, 403, 404, 409, 412, 499, 600] {
+            assert!(!status_unknown(status), "{status}");
+        }
+        let fetch = |e| crate::Error::Remote(crate::remote::Error::Fetch(e));
+        assert!(outcome_unknown(&fetch(
+            crate::fetch::Error::UploadInterrupted {
+                url: "http://h/bkt/repo/summary".into(),
+                message: "connection closed".into(),
+            }
+        )));
+        assert!(outcome_unknown(&fetch(crate::fetch::Error::Fetch(
+            "connection refused".into()
+        ))));
+        assert!(!outcome_unknown(&invalid("a refused key")));
+        assert!(!outcome_unknown(&crate::Error::Io(std::io::Error::other(
+            "a failed read"
+        ))));
+        assert!(!outcome_unknown(&crate::Error::Signature("no key".into())));
+    }
+
+    #[test]
+    fn the_incomplete_summary_update_names_the_state_and_the_repair() {
+        let incomplete = |summary_written| crate::Error::BucketSummaryIncomplete {
+            address: "s3://bkt/repo".into(),
+            summary_written,
+            report: Box::new(BucketSummaryReport {
+                refs: 1,
+                deltas: 0,
+                signers: vec!["ed25519".into()],
+                last_modified: 0,
+                broken_lock: None,
+            }),
+            error: Box::new(invalid("a refused key")),
+        };
+        assert_eq!(
+            incomplete(true).to_string(),
+            "the summary update of the bucket repository s3://bkt/repo wrote summary, and the \
+             write of summary.sig failed: invalid input: a refused key; summary.sig can be \
+             absent or not cover the new summary, so a pull that verifies the summary can \
+             refuse it; run `ostrya remote summary -u` again with the same summary signers"
+        );
+        assert_eq!(
+            incomplete(false).to_string(),
+            "the summary update of the bucket repository s3://bkt/repo failed to write summary \
+             with an unknown outcome: invalid input: a refused key; summary.sig can be absent \
+             or not cover the summary of the bucket, so a pull that verifies the summary can \
+             refuse it; run `ostrya remote summary -u` again with the same summary signers"
+        );
     }
 
     #[test]

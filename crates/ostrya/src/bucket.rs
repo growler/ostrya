@@ -221,7 +221,10 @@
 //! signer. Only a run with no signer probes `summary.sig`, by the strict
 //! rule of an absent key. Between the two writes, a reader that verifies
 //! the summary refuses it, because the old signatures do not cover the new
-//! summary. A read after the run ends finds a matching pair.
+//! summary. A read after a run that succeeds finds a matching pair. A
+//! signed run that can leave a pair that does not match gives
+//! [`Error::BucketSummaryIncomplete`](crate::Error::BucketSummaryIncomplete):
+//! run the update again with the same signers.
 //!
 //! # Examples
 //!
@@ -267,6 +270,7 @@ pub use prune::{BucketPruneOptions, BucketPruneReport};
 pub(crate) use state::{BucketRefs, summary_refs};
 #[cfg_attr(not(feature = "push"), allow(unused_imports))]
 pub(crate) use state::{check_prefixes, marker_key};
+pub(crate) use summary::describe_summary_incomplete;
 pub use summary::{BucketSummaryOptions, BucketSummaryReport};
 
 /// The result of a push to a bucket repository: `Repo::push_to_bucket` or

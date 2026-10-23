@@ -624,6 +624,39 @@ pub enum Error {
         #[source]
         error: Box<Error>,
     },
+    /// A signed summary update of a bucket repository whose `summary` and
+    /// `summary.sig` can fail to match.
+    ///
+    /// [`BucketRepo::update_summary`](crate::bucket::BucketRepo::update_summary)
+    /// with a summary signer gives this error if the write of `summary.sig`
+    /// fails after the write of `summary`, or if the write of `summary` fails
+    /// with an unknown outcome. The bucket can then hold a `summary.sig`
+    /// that does not cover its `summary`, or no `summary.sig`, and a pull
+    /// that verifies the summary then refuses it. A summary update again
+    /// with the same signers writes a matching pair. Before it gives this
+    /// error, the update tries to release its lock, and drops an error of
+    /// that release.
+    #[cfg(feature = "s3")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "s3")))]
+    #[error(
+        "the summary update of the bucket repository {address} {}",
+        crate::bucket::describe_summary_incomplete(*.summary_written, .error)
+    )]
+    BucketSummaryIncomplete {
+        /// The address of the repository, `s3://BUCKET[/PREFIX]`.
+        address: String,
+        /// `true` if the server accepted the write of `summary` and the
+        /// write of `summary.sig` failed. `false` if the write of `summary`
+        /// failed with an unknown outcome: the HTTP client failed, or the
+        /// last answer was 408, 429, or 5xx.
+        summary_written: bool,
+        /// The report of the update, as a success gives it, with the holder
+        /// of a broken lock.
+        report: Box<crate::bucket::BucketSummaryReport>,
+        /// The failure of the write.
+        #[source]
+        error: Box<Error>,
+    },
 }
 
 impl From<rustix::io::Errno> for Error {

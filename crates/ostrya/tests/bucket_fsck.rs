@@ -923,6 +923,15 @@ fn the_signature_of_the_summary_verifies_with_the_keys_of_the_run() {
         opts.summary_keys = Some(keys(true));
         let report = f.bucket.fsck(&opts).await.unwrap();
         assert_eq!(kinds(&report), [(Summary, "summary.sig".to_owned(), true)]);
+        assert!(
+            report.findings[0].detail.ends_with(
+                "; if the keys of the run are the keys of the summary signers, summary.sig \
+                 does not cover the summary, and a summary update with these signers writes a \
+                 matching pair"
+            ),
+            "{}",
+            report.findings[0].detail
+        );
         // The same bucket with no keys verifies nothing, and reads no
         // summary.sig.
         f.server.state().requests.clear();
@@ -933,7 +942,11 @@ fn the_signature_of_the_summary_verifies_with_the_keys_of_the_run() {
         opts.summary_keys = Some(keys(false));
         let report = f.bucket.fsck(&opts).await.unwrap();
         assert_eq!(kinds(&report), [(Summary, "summary.sig".to_owned(), true)]);
-        assert!(report.findings[0].detail.contains("no summary.sig"));
+        assert_eq!(
+            report.findings[0].detail,
+            "the run verifies the signature of the summary, and the bucket holds no \
+             summary.sig; a summary update with the summary signers writes a summary.sig"
+        );
         f.server.state().objects.remove("repo/summary");
         let report = f.bucket.fsck(&opts).await.unwrap();
         assert_eq!(kinds(&report), [(Summary, "summary".to_owned(), true)]);

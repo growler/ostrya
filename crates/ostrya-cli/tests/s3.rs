@@ -1683,6 +1683,11 @@ fn remote_fsck_of_a_remote_takes_its_address_and_its_summary_keys() {
         "{}",
         stderr(&out)
     );
+    assert!(
+        stderr(&out).contains("a summary update with these signers writes a matching pair\n"),
+        "{}",
+        stderr(&out)
+    );
     // The same bucket at its address verifies no signature.
     let endpoint = endpoint_of(&server);
     scratch.ok(&["remote", "fsck", ADDRESS, &endpoint, CLEARTEXT]);
@@ -2172,6 +2177,60 @@ fn remote_summary_update_of_a_signed_bucket_needs_a_signing_key() {
     assert!(message.contains("holds a summary.sig"), "{message}");
     assert_eq!(object(&server, "repo/summary").unwrap(), summary);
     assert!(object(&server, LOCK).is_none());
+}
+
+#[test]
+fn remote_summary_update_with_a_failed_write_of_the_signature_names_the_mismatch() {
+    let scratch = Scratch::new("summary-update-sig-fails");
+    let server = StandIn::start();
+    prune_fixture(&scratch, &server);
+    let endpoint = endpoint_of(&server);
+    let sign = format!("--sign={SECRET_B64}");
+    server.state().refuse = Some(("PUT", "repo/summary.sig".to_owned()));
+    let prefix = format!(
+        "error: the summary update of the bucket repository {ADDRESS} wrote summary, and the \
+         write of summary.sig failed: "
+    );
+    let out = scratch.run(&[
+        "remote", "summary", "-u", &sign, ADDRESS, &endpoint, CLEARTEXT,
+    ]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "");
+    assert!(stderr(&out).starts_with(&prefix), "{}", stderr(&out));
+    assert!(
+        stderr(&out).contains("ostrya remote summary -u"),
+        "{}",
+        stderr(&out)
+    );
+    assert!(object(&server, "repo/summary").is_some());
+    assert!(object(&server, "repo/summary.sig").is_none());
+    assert!(object(&server, LOCK).is_none());
+    // A removed lock gives its warning line before the error line.
+    server.state().store(LOCK, DEAD_LOCK.as_bytes());
+    let out = scratch.run(&[
+        "remote",
+        "summary",
+        "-u",
+        "--break-lock",
+        &sign,
+        ADDRESS,
+        &endpoint,
+        CLEARTEXT,
+    ]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "");
+    let err = stderr(&out);
+    assert!(
+        err.starts_with(&format!("{DEAD_LOCK_LINE}\n{prefix}")),
+        "{err}"
+    );
+    assert!(object(&server, LOCK).is_none());
+    // A run again with the same key writes a matching pair.
+    server.state().refuse = None;
+    scratch.ok(&[
+        "remote", "summary", "-u", &sign, ADDRESS, &endpoint, CLEARTEXT,
+    ]);
+    assert!(object(&server, "repo/summary.sig").is_some());
 }
 
 #[test]

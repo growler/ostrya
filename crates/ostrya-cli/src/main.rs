@@ -1817,7 +1817,10 @@ enum RemoteCommand {
     /// Each --gpg-sign key, each --sign key, and each --keys-file key signs
     /// the summary, in this order. The command writes `summary`, and then
     /// `summary.sig` when it has a key. Between the two writes, a pull that
-    /// verifies the summary refuses it. The command never deletes
+    /// verifies the summary refuses it. If the write of `summary.sig` fails
+    /// after the write of `summary`, the command fails with an error that
+    /// states that the two keys can fail to match, and a run again with the
+    /// same keys writes a matching pair. The command never deletes
     /// `summary.sig`, so a bucket repository that holds one refuses an update
     /// with no signing key.
     ///
@@ -11935,7 +11938,8 @@ async fn remote_refs(repo: &Repo, nested: &str, args: RemoteRefsArgs) -> Result<
 /// options, with the checks of `ostrya summary -u`, before any request. The
 /// refusal of `--keys-file` under the gpg engine and the refusal of a key
 /// file with no key name the options of this command. A writer lock that `--break-lock` removed gives one warning
-/// line on standard error.
+/// line on standard error, also before the error of a signed update whose
+/// `summary` and `summary.sig` can fail to match.
 #[cfg(feature = "s3")]
 async fn remote_summary_update(
     repo: Option<&Repo>,
@@ -11961,7 +11965,19 @@ async fn remote_summary_update(
     opts.last_modified = args.last_modified;
     opts.break_lock = args.break_lock;
     let bucket = ostrya::bucket::BucketRepo::open(&endpoint).await?;
-    let report = bucket.update_summary(&opts).await?;
+    // A signed update whose summary and summary.sig can fail to match gives
+    // the warning of a removed lock, then the error line.
+    let report = match bucket.update_summary(&opts).await {
+        Ok(report) => report,
+        Err(e) => {
+            if let Error::BucketSummaryIncomplete { report, .. } = &e
+                && let Some(holder) = &report.broken_lock
+            {
+                eprintln!("warning: removed the writer lock of {holder}");
+            }
+            return Err(e);
+        }
+    };
     if let Some(holder) = &report.broken_lock {
         eprintln!("warning: removed the writer lock of {holder}");
     }

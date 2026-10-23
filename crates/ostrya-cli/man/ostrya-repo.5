@@ -362,6 +362,7 @@ The summary of the repository and its signatures.
 The summary holds the refs of \fB\%refs/heads/\fR, the refs of each \fB\%refs/mirrors/<id>/\fR in its collection map, and each static delta with a superblock.
 The update never deletes \fB\%summary.sig\fR, so a bucket repository that holds one refuses an update with no signing key.
 Between the two writes, a pull that verifies the summary refuses it.
+If the write of \fB\%summary.sig\fR fails after the write of \fB\%summary\fR, the update fails with an error that states that the two keys can fail to match, and an update again with the same signing keys writes a matching pair.
 A push and a prune write no summary, and leave these two keys as they are.
 A prune keeps each commit that the summary names, with no parent.
 A summary that names a static delta that a prune deleted stays as it is until an update of the summary.

@@ -1432,6 +1432,50 @@ rejected: the update does not delete `summary.sig`, so an update with no
 signer leaves an old signature that does not cover the new summary, and
 each reader that verifies the summary then refuses it.
 
+The update writes `summary` and then `summary.sig`. S3 has no write of two
+keys in one operation, so a reader that verifies the summary refuses it
+between the two writes. An update with a signer gives
+`Error::BucketSummaryIncomplete` when it can leave a pair that does not
+match: the write of `summary.sig` fails after the server accepted the
+write of `summary`, or the write of `summary` fails with an unknown
+outcome. An unknown outcome is a failure of the HTTP client or a last
+answer 408, 429, or 5xx, by the retry rule of the bucket client. A failure
+of the HTTP client before the request was sent counts too, because it can
+end the retries after an interrupted request. The error holds the report
+of the update, with the holder of a broken lock, and the failure of the
+write. Its message states the state of the pair and names
+`ostrya remote summary -u` with the same signers. The update tries to
+release the lock, and drops an error of that release. A refusal of the
+write of `summary`, for example an answer 403, keeps the error of the
+bucket client, and so does an update with no signer. A refusal of the
+first request of that write changes nothing. A refusal of a request that
+the bucket client sent again can leave the new summary with the old
+`summary.sig`, because an earlier request can have written `summary`. A
+process that stops between the two writes gives no error. The fsck with
+the summary keys reports such a pair as an error on `summary.sig`, and its
+detail states that a summary update with the signers writes a matching
+pair. For an absent `summary.sig`, the detail states that a summary update
+with the signers writes a `summary.sig`. The repair of the fsck does not
+change for these findings, because only a signer can write a matching
+pair. These alternatives were rejected:
+
+- A write of `summary.sig` first: the window is the same, with the order
+  of the two keys reversed.
+- A read of the old summary before the write, and a write of it again
+  after a failure: the read takes up to 64 MiB, and the second write can
+  fail too.
+- More attempts of the write of `summary.sig` in the update, after the
+  retries of the bucket client: a 403 does not change with a new attempt.
+- A probe of `summary.sig` in an update with a signer, to state in the
+  error if the bucket holds an old `summary.sig`: the probe costs one more
+  request for a detail of the text.
+- `Error::BucketSummaryIncomplete` for a refusal of the write of `summary`
+  after a request that the bucket client sent again: the bucket client
+  returns the last answer alone. A result that tells the update of an
+  earlier interrupted request, or of an earlier answer 408, 429, or 5xx,
+  changes the public error API of `ostrya-remote`. The trigger is rare,
+  and the fsck with the summary keys finds the pair that it leaves.
+
 The update reads each commit of a ref with one `GET`, at most the cap of a
 metadata object, and checks its SHA-256 against its name. It sends no
 list of `objects/`. A listing of the 256 fan-out prefixes was rejected: it

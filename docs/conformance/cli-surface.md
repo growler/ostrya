@@ -4475,7 +4475,20 @@ allow-cleartext-credentials`.
   signature covers; give a summary signer`. The command refuses a ref whose
   commit the bucket does not hold, a key under `refs/` that is no ref key,
   and a ref name that is a directory of another ref name, before it changes
-  the bucket. The command does not carry these options of `ostrya summary`:
+  the bucket. With a key, a write of `summary.sig` that fails after the
+  write of `summary` gives ``error: the summary update of the bucket
+  repository ADDRESS wrote summary, and the write of summary.sig failed:
+  REASON; summary.sig can be absent or not cover the new summary, so a pull
+  that verifies the summary can refuse it; run `ostrya remote summary -u`
+  again with the same summary signers``, and exits 1. With a key, a write of
+  `summary` with an unknown outcome gives ``error: the summary update of the
+  bucket repository ADDRESS failed to write summary with an unknown
+  outcome: REASON; summary.sig can be absent or not cover the summary of
+  the bucket, so a pull that verifies the summary can refuse it; run
+  `ostrya remote summary -u` again with the same summary signers``, and
+  exits 1. The command tries to remove its writer lock before either
+  error, and a run again with the same keys writes a matching pair.
+  The command does not carry these options of `ostrya summary`:
   `-m`/`--add-metadata`, `-c`/`--client-groups`,
   `--metadata-commit-timestamp`, `--keys-dir`, and the positional KEY-ID.
 - `push` to an `s3://` address, or to a remote whose push address is one,
@@ -4503,7 +4516,9 @@ allow-cleartext-credentials`.
   --delete`, `remote prune`, and `remote summary -u` removes the writer lock
   of another writer, then takes a new lock. After a command
   that succeeds, the holder of the removed lock goes to standard error in
-  one line: `warning: removed the writer lock of HOLDER`. Without the
+  one line: `warning: removed the writer lock of HOLDER`. `remote summary
+  -u` also writes this line before the error of a summary and a
+  `summary.sig` that can fail to match. Without the
   option, a locked bucket repository refuses the command with `error: the
   bucket repository ADDRESS is locked: another writer holds the writer
   lock: HOLDER`. `--break-lock` of `push` conflicts with `--onto`.

@@ -1024,7 +1024,7 @@ impl BucketRepo {
                     true,
                     "summary.sig",
                     "the run verifies the signature of the summary, and the bucket holds no \
-                     summary.sig"
+                     summary.sig; a summary update with the summary signers writes a summary.sig"
                         .to_owned(),
                 );
                 return Ok(());
@@ -1051,7 +1051,16 @@ impl BucketRepo {
         {
             Ok(()) => Ok(()),
             Err(Error::Signature(message)) => {
-                run.add(BucketFindingKind::Summary, true, "summary.sig", message);
+                run.add(
+                    BucketFindingKind::Summary,
+                    true,
+                    "summary.sig",
+                    format!(
+                        "{message}; if the keys of the run are the keys of the summary signers, \
+                         summary.sig does not cover the summary, and a summary update with these \
+                         signers writes a matching pair"
+                    ),
+                );
                 Ok(())
             }
             Err(e) => Err(e),

@@ -231,7 +231,7 @@ The command deletes each object that no root reaches, then each static delta and
 .PP
 The command reads each commit and dirtree that the walk reaches with one GET, one at a time, and checks its checksum. A commit or a dirtree whose bytes do not match its name stops the command before its first delete. Run \fB\%ostrya remote fsck \-\-delete\fR to repair such an object.
 .PP
-The command writes no summary, and keeps each commit that the summary names. A summary that names a deleted static delta stays as it is until an explicit update of the summary.
+The command writes no summary, and keeps each commit that the summary names. A summary that names a deleted static delta stays as it is until \fB\%ostrya remote summary \-u\fR writes the summary again.
 .PP
 The command prints the lines of \fB\%ostrya prune\fR: \fB\%Total objects: N\fR, then \fB\%Deleted N objects, SIZE freed\fR, or with \%\-\-no\-prune \fB\%Would delete: N objects, freeing SIZE\fR, or \fB\%No unreachable objects\fR\&. The counts leave out the detached metadata, the composefs images, and the static deltas. Then, for each count that is not zero, it prints \fB\%Deleted N static deltas\fR, \fB\%Deleted N partial\-commit markers\fR, and \fB\%Aborted N incomplete multipart uploads\fR, or with \%\-\-no\-prune \fB\%Would delete N static deltas\fR, \fB\%Would delete N partial\-commit markers\fR, and \fB\%Would abort N incomplete multipart uploads\fR\&.
 .PP
@@ -352,7 +352,7 @@ The remote to report. Required.
 .SS "refs"
 List the refs that a remote publishes in its summary.
 .PP
-The command fetches the summary of the remote over HTTP or ssh, as a pull does. From an \fB\%s3://\fR address in \fB\%pull\-url\fR, it reads the summary of the bucket repository with signed requests. It prints one \fB\%NAME:REF\fR line for each ref, in the order of the summary. It does not verify the signature of the summary. If the remote has no summary file, the command fails. A push to a bucket repository writes no summary.
+The command fetches the summary of the remote over HTTP or ssh, as a pull does. From an \fB\%s3://\fR address in \fB\%pull\-url\fR, it reads the summary of the bucket repository with signed requests. It prints one \fB\%NAME:REF\fR line for each ref, in the order of the summary. It does not verify the signature of the summary. If the remote has no summary file, the command fails. A push to a bucket repository writes no summary, and \fB\%ostrya remote summary \-u\fR writes it.
 .PP
 .nf
 ostrya remote refs [OPTIONS] [NAME]
@@ -393,11 +393,17 @@ Send the signature of each request to an \fB\%http://\fR \%S3 server.
 .IP
 The signature is a credential. Without this switch, the command refuses an \fB\%http://\fR \%S3 server before any request. Use it for a server on a loopback address or behind a proxy that terminates TLS. No key of the remote sets this switch. The command refuses it for an address that is not \fB\%s3://\fR\&.
 .SS "summary"
-Report the summary of a remote.
+Report the summary of a remote, or write the summary of a bucket repository.
 .PP
-The command fetches the summary of the remote over HTTP or ssh, as a pull does. From an \fB\%s3://\fR address in \fB\%pull\-url\fR, it reads the summary of the bucket repository with signed requests. It does not verify the signature of the summary. If the remote has no summary file, the command fails. A push to a bucket repository writes no summary.
+The command fetches the summary of the remote over HTTP or ssh, as a pull does. From an \fB\%s3://\fR address in \fB\%pull\-url\fR, it reads the summary of the bucket repository with signed requests. It does not verify the signature of the summary. If the remote has no summary file, the command fails. A push to a bucket repository writes no summary, and \%\-u writes it.
 .PP
 The default report gives each ref with its commit size, its commit checksum, and its metadata. The global metadata of the summary follows the refs. The report shows each timestamp in UTC.
+.PP
+With \%\-u, the command writes the summary of the bucket repository at the \fB\%s3://\fR address of NAME, or at the address \fB\%s3://BUCKET[/PREFIX]\fR, and prints nothing. This is an ostrya extension, and a build without the feature \fB\%s3\fR does not have it. The summary lists each ref of \fB\%refs/heads/\fR, and the refs of each \fB\%refs/mirrors/ID/\fR in its collection map. It names each static delta with a superblock. Its bytes are the bytes of the root summary that \fB\%ostrya summary \-u\fR writes for a local repository with the same refs, commits, deltas, and config, when that command writes no \fB\%ostree\-metadata\fR anchor commit. The command reads the commit of each ref from the bucket, and checks its checksum. It refuses a ref whose commit the bucket does not hold, a key under \fB\%refs/\fR outside \fB\%refs/heads/\fR and \fB\%refs/mirrors/ID/\fR, and a ref name that is a directory of another ref name, as \fB\%a\fR is of \fB\%a/b\fR\&.
+.PP
+Each \%\-\-gpg\-sign key, each \%\-\-sign key, and each \%\-\-keys\-file key signs the summary, in this order. The command writes \fB\%summary\fR, and then \fB\%summary.sig\fR when it has a key. Between the two writes, a pull that verifies the summary refuses it. The command never deletes \fB\%summary.sig\fR, so a bucket repository that holds one refuses an update with no signing key.
+.PP
+The command takes the writer lock of the bucket repository, and removes it at the end. It needs the \%S3 permissions \fB\%s3:GetObject\fR, \fB\%s3:PutObject\fR, \fB\%s3:ListBucket\fR, and \fB\%s3:DeleteObject\fR\&. With an address, it needs no repository and reads no \fB\%\-\-repo\fR, current directory, or \fB\%OSTREE_REPO\fR\&. With a remote name, it reads the remote from the config of the repository. With \%\-\-break\-lock, an update that removed the writer lock of another writer writes one \fB\%warning: removed the writer lock of HOLDER\fR line to standard error.
 .PP
 .nf
 ostrya remote summary [OPTIONS] [NAME]
@@ -407,6 +413,8 @@ Arguments:
 .TP
 \fINAME\fR
 The remote to report. Required.
+.IP
+With \%\-u, the remote name or the address \fB\%s3://BUCKET[/PREFIX]\fR\&. The address of a remote is then its \fB\%push\-url\fR key if that key holds an \fB\%s3://\fR address, else its \fB\%pull\-url\fR key if that key holds an \fB\%s3://\fR address. The command refuses a remote with neither, and never reads the \fB\%url\fR key.
 .PP
 Options:
 .TP
@@ -424,6 +432,46 @@ The command prints the value in the GVariant text form, with its type. If the gl
 Show the raw variant data.
 .IP
 The command prints the full summary in the GVariant text form, with the \%big\-endian fields converted.
+.TP
+\fB\-u\fR, \fB\-\-update\fR
+Write the summary of the bucket repository of NAME, or at the address NAME.
+.IP
+This is an ostrya extension. The option conflicts with \%\-\-raw, \%\-\-list\-metadata\-keys, and \%\-\-print\-metadata\-key. The command prints nothing.
+.TP
+\fB\-\-gpg\-sign\fR \fIKEY\-ID\fR
+With \%\-u, sign the summary with the GPG key that this selector names.
+.IP
+The option uses the gpg engine for each \%\-\-sign\-type. Each occurrence adds one signature. The option needs \%\-u.
+.TP
+\fB\-\-gpg\-homedir\fR \fIDIR\fR
+With \%\-u, the GnuPG home directory where gpg resolves signing keys.
+.IP
+Only the gpg engine reads it: for \%\-\-gpg\-sign, and for \%\-\-sign under the gpg engine. The option needs \%\-u.
+.TP
+\fB\-\-sign\fR \fIKEY\-ID\fR
+With \%\-u, sign the summary with this key.
+.IP
+The \%\-\-sign\-type option selects the engine. For \%ed25519 and spki, the key is the \%base64 of the secret key. For gpg, the key is a selector, as for \%\-\-gpg\-sign. Each occurrence adds one signature. The option needs \%\-u.
+.TP
+\fB\-s\fR, \fB\-\-sign\-type\fR \fINAME\fR
+With \%\-u, the signature engine for \%\-\-sign and \%\-\-keys\-file.
+.IP
+The names are \fB\%ed25519\fR, \fB\%spki\fR, and \fB\%gpg\fR, and the command refuses any other name. The default is \fB\%ed25519\fR\&. If the option occurs more than once, the last value wins. The option needs \%\-u.
+.TP
+\fB\-\-keys\-file\fR \fIPATH\fR
+With \%\-u, sign the summary with the keys of this file, in the format of \fB\%ostrya sign\fR\&.
+.IP
+The command reads every file, and each key adds one signature after each \%\-\-sign key. The gpg engine refuses this option. The option needs \%\-u.
+.TP
+\fB\-\-break\-lock\fR
+With \%\-u, remove the writer lock of another writer of the bucket repository.
+.IP
+The command reads the lock, deletes it, and then takes its own lock. It writes the holder of the removed lock to standard error after an update that succeeds. Use it only when the holder is gone, for example after a crash. The option needs \%\-u.
+.TP
+\fB\-\-last\-modified\fR \fISECONDS\fR
+With \%\-u, set \fB\%ostree.summary.last\-modified\fR, in seconds since the Unix epoch.
+.IP
+A fixed value makes the output reproducible. Without this option, the command uses the current time. \fB\%SOURCE_DATE_EPOCH\fR does not change this value. The option needs \%\-u.
 .TP
 \fB\-\-s3\-region\fR \fIREGION\fR
 The region of the signature of each request to the \%S3 server.

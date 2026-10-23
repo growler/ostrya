@@ -979,7 +979,7 @@ impl BucketRepo {
             named.push((name, delta.superblock));
         }
         let digests: HashMap<String, Checksum> = self
-            .superblock_digests(read, true)
+            .superblock_digests(read)
             .await?
             .into_iter()
             .map(|delta| (delta.name, delta.digest))

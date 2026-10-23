@@ -919,8 +919,8 @@ signer to a bucket repository with a `summary.sig`, is rejected. With it,
 each push needs the signing keys of the summary, and reads the commit of
 each ref and each superblock of the bucket. One rule, the explicit update,
 writes the summary. `RepoPushOptions` has no field for the signers of a
-summary. The summary builder of a bucket repository stays in the crate for
-the explicit update.
+summary. `BucketRepo::update_summary` is the explicit update ("The summary
+update of a bucket repository").
 
 The push walks no tree of a commit that the listing of the bucket holds,
 unless the commit has a partial-commit marker under `state/`. Each writer
@@ -1016,9 +1016,9 @@ does not exist for a bucket.
 
 `ostrya-cli` turns on the feature `s3` of `ostrya` in its default set, so
 the shipped binary reads and writes bucket repositories. The feature gates
-the S3 options, `--break-lock`, `remote init`, `remote fsck`, and
-`remote prune`, as the features `push`, `serve`, and `send` gate their
-commands. A build without
+the S3 options, `--break-lock`, `remote init`, `remote fsck`,
+`remote prune`, and `remote summary -u`, as the features `push`, `serve`,
+and `send` gate their commands. A build without
 the feature refuses an `s3://` address with the message of the library,
 which names the feature.
 
@@ -1338,6 +1338,110 @@ was rejected: the deletes of a prune leave a bucket repository that a
 reader can use, and a run again completes the prune. A lost lock at the
 release is an error, as for a push.
 
+## The summary update of a bucket repository
+
+The summary update of a bucket repository is `BucketRepo::update_summary`
+and the mode `-u` of `ostrya remote summary NAME|ADDRESS`. `-u`/`--update`
+is the option name of `ostrya summary`, and `ostree remote summary` has no
+`-u`. The maintainer rejected a new subcommand `remote update-summary`,
+which leaves the surface of `remote summary` of the `ostree` command as it
+is, and selected the option name of `ostrya summary`. With an address,
+the command opens no repository. Without `-u`, `remote summary` keeps its
+behavior and takes a remote name alone.
+
+`BucketRepo::update_summary` takes a `BucketSummaryOptions` with the
+summary signers, `last_modified`, and `break_lock`, and gives a
+`BucketSummaryReport`: the number of refs of field 0 and of the collection
+map, the number of deltas, the name of the engine of each signer in the
+order of the signatures, the `last-modified` value that it wrote, and the
+holder of a broken lock. The options struct has a hand-written `Debug` that
+names the engines of the signers, as `DeltaOptions` does.
+
+The update reads the `config` before it takes the lock, as the prune does,
+so a bucket repository with no `config` refuses the update with no lock
+`PUT`. It reads the refs under the lock. An update with no signer probes
+`summary.sig` under the lock, at the same time as the read of the refs. An
+update with a signer sends no probe: the refusal below is the one reader of
+the probe, and it applies to an update with no signer alone. A probe in
+each update was rejected: it costs one request for no use.
+
+The update reads the commit objects of the refs and the superblocks at the
+same time. Each of the two reads at most `max_outstanding` keys at a time,
+and the fetcher holds the requests in flight to `max_outstanding`. A
+failure of a commit read takes precedence over a failure of a superblock
+read in the error that the update gives.
+
+Each read of a superblock takes the strict rule of an absent key, as the
+fsck does. A superblock gone with an answer 404 `NoSuchKey` is left out of
+`ostree.static-deltas`, as the local scan leaves out a superblock that went
+away. The lenient rule was rejected: with it, a 404 that is not an absent
+key leaves a superblock that the bucket holds out of the map, and the
+update writes a summary that does not name the delta.
+
+A bucket repository that holds a `summary.sig` refuses an update with no
+signer before it changes the bucket, and no option turns the refusal off.
+A signed bucket repository is a signed bucket repository by the presence
+of the key `summary.sig` alone. The probe takes the strict rule of an
+absent key, so only an answer 404 `NoSuchKey` is an absent key, and it
+drops the stream after the headers, so it reads no byte of the body. A
+probe with the lenient rule was rejected: with it, a 404 that is not an
+absent key lets an update with no signer go on, and its summary then has
+no signature that covers it. A read of the body was rejected: the body can
+be as large as the cap of a summary, 64 MiB. The update never deletes
+`summary.sig`. The local writer removes the old signature file before it
+writes the summary. A delete in the bucket was rejected: a reader of a
+bucket sees each write at once, so a delete first gives a window in which
+the bucket repository has no `summary.sig`. An opt-out of the refusal was
+rejected: the update does not delete `summary.sig`, so an update with no
+signer leaves an old signature that does not cover the new summary, and
+each reader that verifies the summary then refuses it.
+
+The update reads each commit of a ref with one `GET`, at most the cap of a
+metadata object, and checks its SHA-256 against its name. It sends no
+list of `objects/`. A listing of the 256 fan-out prefixes was rejected: it
+costs 256 requests or more for each update, and the read of the commit
+finds an absent commit too. The hash and the parse of a commit object
+larger than 1 MiB run on the blocking pool, as in the prune. The summary
+builder lost its input of a local repository and of a listing: the push
+writes no summary, so no caller gave them.
+
+The update writes `ostree.summary.tombstone-commits` from the `config`, as
+the local summary does, and refuses no value of it. It ignores
+`[ex-ostrya] gc-root-metadata-keys`, which the summary does not read. A
+ref whose commit has a partial-commit marker is in the summary, and the
+update reads no key under `state/`: the marker tells a push to upload the
+missing objects, and the commit object is in the bucket. A bucket
+repository with no ref gets a summary with an empty field 0, as a local
+repository with no ref does.
+
+A ref name that is a directory of another ref name of the same directory,
+as `a` is of `a/b`, refuses the update before it changes the bucket, with
+the check of the push. A local repository cannot hold both refs:
+`refs/heads/a` is a file, and `refs/heads/a/b` needs a directory at the
+same path.
+
+`ostrya remote summary -u` prints nothing on standard output on success,
+as `ostrya summary -u` prints nothing. A lock that `--break-lock` removed
+gives one `warning: removed the writer lock of HOLDER` line on standard
+error, as for the other writers. The command takes `--gpg-sign`,
+`--gpg-homedir`, `--sign`, `--sign-type`, `--keys-file`, `--break-lock`,
+and `--last-modified`, and each one needs `-u`. `-u` conflicts with
+`--raw`, `--list-metadata-keys`, and `--print-metadata-key`. The command
+builds the signers with the code of `ostrya summary -u`, in the same order
+and with the same checks. Two refusals name the options of
+`remote summary -u`, which has no KEY-ID operand: `--keys-file` under the
+gpg engine, and a key file with no key. The command does not carry these
+options of `ostrya summary`:
+
+- `-m`/`--add-metadata`: the summary of a bucket repository holds the keys
+  of the builder alone, so the update and a local update of a copy write
+  the same bytes.
+- `-c`/`--client-groups`: a bucket repository has no auth items.
+- `--metadata-commit-timestamp`: the update writes no anchor commit.
+- the positional KEY-ID: the operand of `remote summary` is the remote or
+  the address.
+- `--keys-dir`: it serves a verify alone.
+
 ## The client access of `ostrya serve`
 
 - The reader of the PROXY protocol, v1 and v2, is written in the tree, with
@@ -1416,7 +1520,8 @@ when the port owns its set of members and expects the set to grow.
   with `S3Endpoint::new` and sets its fields.
 - `ostrya::bucket::LockOperation`, `LockHolder`, `ObjectListing`,
   `BucketPushOutcome`, `BucketFsckReport`, `BucketFinding`,
-  `BucketFindingKind`, and `BucketPruneReport` have the attribute. The port builds them, and a later
+  `BucketFindingKind`, `BucketPruneReport`, and `BucketSummaryReport` have
+  the attribute. The port builds them, and a later
   version can add an operation, a field, or a kind of finding.
 - The option structs of the `ostrya` crate do not have the attribute:
   `PruneOptions`, `PullOptions`, `TarExportOptions`, `TarImportOptions` and
@@ -1424,7 +1529,8 @@ when the port owns its set of members and expects the set to grow.
   crate, `..Default::default()` included. Thus a new field in one of these
   option structs is a breaking change, and it takes a minor version before
   1.0. The option structs of the bucket writers, `BucketWriteOptions`,
-  `BucketFsckOptions`, and `BucketPruneOptions`, have the attribute. A caller starts from
+  `BucketFsckOptions`, `BucketPruneOptions`, and `BucketSummaryOptions`,
+  have the attribute. A caller starts from
   `Default::default()` and sets the fields, so a later field is additive.
 - `ostrya_server::ServeOptions` and `ostrya_mount::MountOptions` have the
   attribute. A caller starts from `Default::default()` and sets the fields.

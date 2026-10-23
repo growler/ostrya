@@ -4,8 +4,8 @@
 //!
 //! A pull, a push, and a tree push refuse an `s3://` address with a message
 //! that names the feature. `remote add` writes an `s3://` address as a build with the
-//! feature does. `remote init`, `remote prune`, and the S3 options do not
-//! exist. The tests run in a build with no default features, for example
+//! feature does. `remote init`, `remote prune`, `remote summary -u`, and the
+//! S3 options do not exist. The tests run in a build with no default features, for example
 //! `cargo test -p ostrya-cli --no-default-features --features smol,push --test s3_absent`.
 
 #![cfg(not(feature = "s3"))]
@@ -163,6 +163,7 @@ fn remote_init_and_the_s3_options_do_not_exist() {
     for args in [
         &["remote", "init", "s3://bkt/repo"][..],
         &["remote", "prune", "s3://bkt/repo"][..],
+        &["remote", "summary", "-u", "s3://bkt/repo"][..],
         &["pull", "--s3-region=eu-west-1", "r", "main"][..],
         &["pull", "--allow-cleartext-credentials", "r", "main"][..],
         &["remote", "refs", "--s3-endpoint=https://s3.ex.com", "r"][..],

@@ -12,7 +12,6 @@ use crate::pull::drive::Slots;
 use crate::refs::MAX_COLLECTION_ID_LEN;
 use crate::remote::s3::Object;
 use crate::repo::MAX_CONFIG_SIZE;
-use crate::summary::SUMMARY_READ_CAP;
 
 /// The size of a ref file: 64 hex digits and a newline.
 const REF_FILE_SIZE: u64 = 65;
@@ -332,22 +331,21 @@ impl BucketRepo {
 
     /// Returns `true` if the key `summary.sig` holds an object.
     ///
-    /// The call reads the object to its end, so the connection stays open
-    /// for the next request. An object larger than [`SUMMARY_READ_CAP`] is
-    /// present, and the call reads no more of it.
+    /// The call opens the body of the key as a stream, by the strict rule of
+    /// an absent key of
+    /// [`Bucket::get_stream_strict`](crate::remote::s3::Bucket::get_stream_strict),
+    /// and drops the stream after the headers. It reads no byte of the body.
     ///
     /// # Errors
     ///
-    /// [`Error::Remote`] for an error of the bucket client.
-    // No writer of this version writes the summary of a bucket repository,
-    // so no writer reads the presence of its signature.
-    #[allow(dead_code)]
-    pub(crate) async fn is_signed(&self) -> Result<bool> {
-        match self.bucket.get("summary.sig", SUMMARY_READ_CAP).await {
-            Ok(object) => Ok(object.is_some()),
-            Err(crate::remote::Error::LimitExceeded(_)) => Ok(true),
-            Err(e) => Err(e.into()),
-        }
+    /// [`Error::Remote`] for an error of the bucket client, also for a 404
+    /// that is not an absent key.
+    pub(super) async fn is_signed(&self) -> Result<bool> {
+        Ok(self
+            .bucket
+            .get_stream_strict("summary.sig")
+            .await?
+            .is_some())
     }
 
     /// Returns the error of a bucket repository whose content breaks a rule.
@@ -426,7 +424,6 @@ fn parse_ref_file(bytes: &[u8]) -> Option<Checksum> {
 /// writer refuses a bucket repository with `refs/mirrors/` of its own
 /// collection id, so the two inputs are the inputs of the root summary of a
 /// local repository with the same refs and the same `[core] collection-id`.
-#[cfg_attr(not(feature = "push"), allow(dead_code))]
 #[allow(clippy::type_complexity)]
 pub(crate) fn summary_refs(
     refs: &BucketRefs,
@@ -453,7 +450,6 @@ pub(crate) fn summary_refs(
 ///
 /// One pass looks up, for each name, each part of the name before a `/` as
 /// a name of the directory.
-#[cfg_attr(not(feature = "push"), allow(dead_code))]
 pub(crate) fn check_prefixes(dir: &BTreeMap<String, Checksum>) -> Result<()> {
     for name in dir.keys() {
         for (at, _) in name.match_indices('/') {

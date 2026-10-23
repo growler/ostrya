@@ -23,7 +23,7 @@ const CHECK_INTERVAL: usize = 1000;
 
 /// The size above which the walk hashes a metadata object on the blocking
 /// pool: 1 MiB.
-const UNBLOCK_SIZE: usize = 1024 * 1024;
+pub(super) const UNBLOCK_SIZE: usize = 1024 * 1024;
 
 /// The options of [`BucketRepo::prune`] other than the [`PruneOptions`].
 ///

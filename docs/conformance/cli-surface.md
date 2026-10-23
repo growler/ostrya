@@ -3922,7 +3922,9 @@ address they read `summary.sig` and `summary` over ssh from `ostrya send`,
 with the ssh command and the remote command of `pull`. For an `s3://`
 address they read the two files from the bucket repository with signed
 requests, and take the S3 options of `pull` ("Bucket repositories"). The
-tool reads `url` alone.
+tool reads `url` alone. `remote summary -u` writes the summary of a bucket
+repository, and is a port extension ("Bucket repositories"). The tool has
+no `-u` on `remote summary`.
 
 `remote add-cookie`, `remote delete-cookie`, and `remote list-cookies` stay out.
 The fetcher refuses a `Cookie` header at construction when a mirror is
@@ -4348,14 +4350,20 @@ ostrya remote prune [--repo=PATH] NAME|s3://BUCKET[/PREFIX]
                     [--refs-only] [--depth=DEPTH] [--keep-younger-than=DATE]
                     [--no-prune] [--break-lock]
                     [the S3 options] [--allow-cleartext-credentials]
+ostrya remote summary -u [--repo=PATH] NAME|s3://BUCKET[/PREFIX]
+                      [--gpg-sign=KEY-ID] [--gpg-homedir=DIR]
+                      [--sign=KEY-ID] [-s|--sign-type=NAME]
+                      [--keys-file=PATH] [--break-lock]
+                      [--last-modified=SECONDS]
+                      [the S3 options] [--allow-cleartext-credentials]
 ```
 
 A bucket repository is a repository in `archive` form in an S3 bucket, at
 the address `s3://BUCKET[/PREFIX]` (`../format-reference.md`, "The S3
 bucket repository"). The tool has no such repository, so no matrix cell
 compares these commands with the tool. The `s3` feature of `ostrya-cli`
-builds the S3 options, `--break-lock`, `remote init`, `remote fsck`, and
-`remote prune`. It is in the default set.
+builds the S3 options, `--break-lock`, `remote init`, `remote fsck`,
+`remote prune`, and `remote summary -u`. It is in the default set.
 
 The S3 options are `--s3-region=REGION`, `--s3-endpoint=URL`,
 `--s3-addressing=path|virtual`, and `--s3-profile=PROFILE`. `push`,
@@ -4439,10 +4447,42 @@ allow-cleartext-credentials`.
   `[core] tombstone-commits=true` or `[ex-ostrya] gc-root-metadata-keys`.
   A commit or a dirtree whose bytes do not match its name fails the command
   before its first delete.
+- `remote summary -u` writes the summary of a bucket repository
+  (`../format-reference.md`, "The summary of a bucket repository"). It
+  takes the address of its operand as `remote init` does, with no
+  repository for an address. The summary holds the refs of `refs/heads/`
+  in field 0 and the refs of each `refs/mirrors/ID/` in the collection map,
+  and names each static delta with a superblock. With the same
+  `--last-modified`, its `summary` holds the bytes that `ostrya summary -u`
+  writes in a copy of the bucket repository with no collection id. With the
+  same ed25519 keys, `summary.sig` holds the same bytes too. The command
+  takes the writer lock, writes `summary` and then, with a key,
+  `summary.sig`, writes nothing to standard output, and exits 0. The
+  signing options are those of `ostrya summary -u`: each `--gpg-sign` key,
+  each `--sign` key, and each `--keys-file` key signs, in this order, with
+  the engine of `-s`/`--sign-type`, `ed25519` by default, and with the
+  refusals of `ostrya summary -u`. Two of these refusals name the options
+  of `remote summary -u`: `--keys-file` under the gpg engine gives
+  `error: signature: gpg signing takes --gpg-sign and --sign KEY-ID
+  arguments; --keys-file serves the other engines`, and a key file with no
+  key gives `error: signature: no signing key given; pass --sign or
+  --keys-file`. The option parser refuses each signing option and
+  `--break-lock` without `-u`, and refuses `-u` with `--raw`,
+  `--list-metadata-keys`, and `--print-metadata-key`. A bucket repository
+  that holds a `summary.sig` refuses an update with no key: `error: invalid
+  input: the bucket repository ADDRESS holds a summary.sig, and an update of
+  its summary with no summary signer would leave a summary that no
+  signature covers; give a summary signer`. The command refuses a ref whose
+  commit the bucket does not hold, a key under `refs/` that is no ref key,
+  and a ref name that is a directory of another ref name, before it changes
+  the bucket. The command does not carry these options of `ostrya summary`:
+  `-m`/`--add-metadata`, `-c`/`--client-groups`,
+  `--metadata-commit-timestamp`, `--keys-dir`, and the positional KEY-ID.
 - `push` to an `s3://` address, or to a remote whose push address is one,
   writes the objects that the bucket does not hold, then the ref files,
   under the writer lock of the bucket repository. It writes no summary,
-  and a summary of the bucket stays as it is. The bucket repository needs
+  and a summary of the bucket stays as it is until `remote summary -u`
+  writes it. The bucket repository needs
   a `config`, else `error: invalid input: the bucket repository ADDRESS has
   no config; init it first`. `--collection` selects the namespace with the
   `config` of the bucket in the role of the server: the collection id of
@@ -4460,8 +4500,8 @@ allow-cleartext-credentials`.
   one, makes the commit on the client and writes it to the bucket
   repository (`push-tree`).
 - `--break-lock` of `push`, `push-tree`, `remote init`, `remote fsck
-  --delete`, and `remote prune` removes the writer lock of another writer, then takes a new
-  lock. After a command
+  --delete`, `remote prune`, and `remote summary -u` removes the writer lock
+  of another writer, then takes a new lock. After a command
   that succeeds, the holder of the removed lock goes to standard error in
   one line: `warning: removed the writer lock of HOLDER`. Without the
   option, a locked bucket repository refuses the command with `error: the
@@ -4496,10 +4536,10 @@ allow-cleartext-credentials`.
   does not list the ref, so a bucket repository with no summary serves
   `pull REMOTE REF`. `remote refs`, `remote summary`, a pull with
   `--mirror` and no ref, a pull that verifies the signature of the summary,
-  and `pull --collection` need a summary, and a push writes none. A pull of
-  a ref that the summary lists takes the commit of the summary. So after a
-  push moves that ref, the pull takes the old commit until an update of the
-  summary.
+  and `pull --collection` need a summary, and a push writes none:
+  `remote summary -u` writes it. A pull of a ref that the summary lists
+  takes the commit of the summary. So after a push moves that ref, the pull
+  takes the old commit until `remote summary -u` writes the summary again.
 - `s3://` in the key `url` is refused by `pull`, `remote refs`, `remote
   summary`, and `push`: the tool also reads `url`, and it reads no `s3://`
   address.
@@ -4514,7 +4554,8 @@ allow-cleartext-credentials`.
   bucket and walks the commits. The bar starts with the uploads.
 - A build without the feature `s3` has no S3 option, no `--break-lock`, no
   `--allow-cleartext-credentials` on `pull`, `remote refs`, and `remote
-  summary`, and no `remote init`, `remote fsck`, and `remote prune`. It
+  summary`, and no `remote init`, `remote fsck`, `remote prune`, and
+  `remote summary -u`. It
   refuses an `s3://` address with
   `error: unsupported: the pull address 'ADDRESS' is an s3:// address, and
   this build of ostrya has no S3 support: turn on the feature s3 of

@@ -316,10 +316,11 @@ The key of the object is the path of the file under \fB\%PREFIX/\fR.
 \fB\%ostrya remote init\fR creates a bucket repository, \fB\%ostrya push\fR writes commits to it, \fB\%ostrya push\-tree\fR writes a directory to it as a new commit, and \fB\%ostrya pull\fR, \fB\%ostrya remote refs\fR, and \fB\%ostrya remote summary\fR read it.
 \fB\%ostrya remote fsck\fR checks it, and with \fB\%\-\-delete\fR repairs it.
 \fB\%ostrya remote prune\fR deletes the objects that no root reaches.
-The init, the two pushes, the repair, and the prune take the writer lock of the bucket repository.
+\fB\%ostrya remote summary \-u\fR writes its summary.
+The init, the two pushes, the repair, the prune, and the summary update take the writer lock of the bucket repository.
 The prune takes the lock also with \fB\%\-\-no\-prune\fR.
 \fB\%ostrya push\-tree\fR makes the commit on the client, with the parent from the ref file of the branch, and signs no commit.
-In the ostrya library, the feature \fB\%s3\fR gives the read, the init, the writer lock, the fsck, and the prune, and the features \fB\%s3\fR and \fB\%push\fR give the two pushes.
+In the ostrya library, the feature \fB\%s3\fR gives the read, the init, the writer lock, the fsck, the prune, and the summary update, and the features \fB\%s3\fR and \fB\%push\fR give the two pushes.
 The \fB\%ostrya\fR command built without its feature \fB\%s3\fR refuses an \fB\%s3://\fR address.
 .PP
 A push that stops before its end can leave an incomplete multipart upload, which holds storage in the bucket.
@@ -334,13 +335,17 @@ The init writes it with the group \fB\%[core]\fR and the keys \fB\%repo_version=
 With a zlib level, for example with \fB\%ostrya remote init \-\-zlib\-level\fR, the group \fB\%[archive]\fR with the key \fB\%zlib\-level\fR follows.
 A bucket repository with a collection id is the primary server of that collection.
 The init refuses a bucket that holds a \fB\%config\fR, so the collection id of a bucket repository never changes.
-A push and a prune need the \fB\%config\fR, and refuse a mode other than \fB\%archive\-z2\fR and \fB\%archive\fR, a collection id that fails the collection\-id rule, a \fB\%tombstone\-commits\fR or \fB\%indexed\-deltas\fR that is not a boolean, and a \fB\%zlib\-level\fR that is not an integer.
+A push, a prune, and a summary update need the \fB\%config\fR, and refuse a mode other than \fB\%archive\-z2\fR and \fB\%archive\fR, a collection id that fails the collection\-id rule, a \fB\%tombstone\-commits\fR or \fB\%indexed\-deltas\fR that is not a boolean, and a \fB\%zlib\-level\fR that is not an integer.
 A push builds each \fB\%.filez\fR that it uploads at the \fB\%zlib\-level\fR of this \fB\%config\fR, 6 when the key is absent.
 A push of commits from an archive repository uploads each \fB\%.filez\fR as it is stored.
 A prune also refuses a \fB\%config\fR that sets \fB\%tombstone\-commits=true\fR in \fB\%[core]\fR or \fB\%gc\-root\-metadata\-keys\fR in \fB\%[ex\-ostrya]\fR.
 .TP
 \fB\%summary\fR, \fB\%summary.sig\fR
 The summary of the repository and its signatures.
+\fB\%ostrya remote summary \-u\fR writes them, \fB\%summary\fR first and then \fB\%summary.sig\fR when it has a signing key.
+The summary holds the refs of \fB\%refs/heads/\fR, the refs of each \fB\%refs/mirrors/<id>/\fR in its collection map, and each static delta with a superblock.
+The update never deletes \fB\%summary.sig\fR, so a bucket repository that holds one refuses an update with no signing key.
+Between the two writes, a pull that verifies the summary refuses it.
 A push and a prune write no summary, and leave these two keys as they are.
 A prune keeps each commit that the summary names, with no parent.
 A summary that names a static delta that a prune deleted stays as it is until an update of the summary.

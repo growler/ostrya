@@ -449,8 +449,8 @@ enum Command {
     /// other collection gives `refs/mirrors/ID/`. The push writes no summary,
     /// and a summary of the bucket stays as it is. A pull of a ref that the
     /// summary lists takes the commit of the summary, so after the push moves
-    /// that ref, the pull takes the old commit until an update of the
-    /// summary. The push refuses --onto,
+    /// that ref, the pull takes the old commit until `ostrya remote summary
+    /// -u` writes the summary again. The push refuses --onto,
     /// --tag, --compress, a delete refspec, and the token and ssh options.
     ///
     /// With --onto, the push sends the tree of one local commit, and the
@@ -1725,7 +1725,7 @@ enum RemoteCommand {
     ///
     /// The command writes no summary, and keeps each commit that the summary
     /// names. A summary that names a deleted static delta stays as it is
-    /// until an explicit update of the summary.
+    /// until `ostrya remote summary -u` writes the summary again.
     ///
     /// The command prints the lines of `ostrya prune`: `Total objects: N`,
     /// then `Deleted N objects, SIZE freed`, or with --no-prune `Would
@@ -1780,19 +1780,51 @@ enum RemoteCommand {
     /// `NAME:REF` line for each ref, in the order of the summary. It does not
     /// verify the signature of the summary. If the remote has no summary
     /// file, the command fails. A push to a bucket repository writes no
-    /// summary.
+    /// summary, and `ostrya remote summary -u` writes it.
     Refs(RemoteRefsArgs),
-    /// Report the summary of a remote.
+    /// Report the summary of a remote, or write the summary of a bucket
+    /// repository.
     ///
     /// The command fetches the summary of the remote over HTTP or ssh, as a
     /// pull does. From an `s3://` address in `pull-url`, it reads the summary
     /// of the bucket repository with signed requests. It does not verify the
     /// signature of the summary. If the remote has no summary file, the
-    /// command fails. A push to a bucket repository writes no summary.
+    /// command fails. A push to a bucket repository writes no summary, and
+    /// -u writes it.
     ///
     /// The default report gives each ref with its commit size, its commit
     /// checksum, and its metadata. The global metadata of the summary follows
     /// the refs. The report shows each timestamp in UTC.
+    ///
+    /// With -u, the command writes the summary of the bucket repository at
+    /// the `s3://` address of NAME, or at the address `s3://BUCKET[/PREFIX]`,
+    /// and prints nothing. This is an ostrya extension, and a build without
+    /// the feature `s3` does not have it. The summary lists each ref of
+    /// `refs/heads/`, and the refs of each `refs/mirrors/ID/` in its
+    /// collection map. It names each static delta with a superblock. Its bytes
+    /// are the bytes of the root summary that `ostrya summary -u` writes for a
+    /// local repository with the same refs, commits, deltas, and config, when
+    /// that command writes no `ostree-metadata` anchor commit. The command
+    /// reads the commit of each ref from the bucket, and checks its checksum.
+    /// It refuses a ref whose commit the bucket does not hold, a key under
+    /// `refs/` outside `refs/heads/` and `refs/mirrors/ID/`, and a ref name
+    /// that is a directory of another ref name, as `a` is of `a/b`.
+    ///
+    /// Each --gpg-sign key, each --sign key, and each --keys-file key signs
+    /// the summary, in this order. The command writes `summary`, and then
+    /// `summary.sig` when it has a key. Between the two writes, a pull that
+    /// verifies the summary refuses it. The command never deletes
+    /// `summary.sig`, so a bucket repository that holds one refuses an update
+    /// with no signing key.
+    ///
+    /// The command takes the writer lock of the bucket repository, and
+    /// removes it at the end. It needs the S3 permissions `s3:GetObject`,
+    /// `s3:PutObject`, `s3:ListBucket`, and `s3:DeleteObject`. With an
+    /// address, it needs no repository and reads no `--repo`, current
+    /// directory, or `OSTREE_REPO`. With a remote name, it reads the remote
+    /// from the config of the repository. With --break-lock, an update that
+    /// removed the writer lock of another writer writes one `warning: removed
+    /// the writer lock of HOLDER` line to standard error.
     Summary(RemoteSummaryArgs),
     /// Import GPG keys into the trusted keyring of a remote.
     ///
@@ -2083,11 +2115,95 @@ struct RemoteSummaryArgs {
     /// big-endian fields converted.
     #[arg(long)]
     raw: bool,
+    /// Write the summary of the bucket repository of NAME, or at the address
+    /// NAME.
+    ///
+    /// This is an ostrya extension. The option conflicts with --raw,
+    /// --list-metadata-keys, and --print-metadata-key. The command prints
+    /// nothing.
+    #[cfg(feature = "s3")]
+    #[arg(
+        short = 'u',
+        long,
+        conflicts_with_all = ["raw", "list_metadata_keys", "print_metadata_key"]
+    )]
+    update: bool,
+    /// With -u, sign the summary with the GPG key that this selector names.
+    ///
+    /// The option uses the gpg engine for each --sign-type. Each occurrence
+    /// adds one signature. The option needs -u.
+    #[cfg(feature = "s3")]
+    #[arg(long, value_name = "KEY-ID", requires = "update")]
+    gpg_sign: Vec<String>,
+    /// With -u, the GnuPG home directory where gpg resolves signing keys.
+    ///
+    /// Only the gpg engine reads it: for --gpg-sign, and for --sign under the
+    /// gpg engine. The option needs -u.
+    #[cfg(feature = "s3")]
+    #[arg(long, value_name = "DIR", requires = "update")]
+    gpg_homedir: Option<PathBuf>,
+    /// With -u, sign the summary with this key.
+    ///
+    /// The --sign-type option selects the engine. For ed25519 and spki, the key
+    /// is the base64 of the secret key. For gpg, the key is a selector, as for
+    /// --gpg-sign. Each occurrence adds one signature. The option needs -u.
+    #[cfg(feature = "s3")]
+    #[arg(long, value_name = "KEY-ID", requires = "update")]
+    sign: Vec<String>,
+    /// With -u, the signature engine for --sign and --keys-file.
+    ///
+    /// The names are `ed25519`, `spki`, and `gpg`, and the command refuses any
+    /// other name. The default is `ed25519`. If the option occurs more than
+    /// once, the last value wins. The option needs -u.
+    #[cfg(feature = "s3")]
+    #[arg(
+        short = 's',
+        long = "sign-type",
+        value_name = "NAME",
+        overrides_with = "sign_type",
+        requires = "update"
+    )]
+    sign_type: Option<String>,
+    /// With -u, sign the summary with the keys of this file, in the format of
+    /// `ostrya sign`.
+    ///
+    /// The command reads every file, and each key adds one signature after
+    /// each --sign key. The gpg engine refuses this option. The option needs
+    /// -u.
+    #[cfg(feature = "s3")]
+    #[arg(long, value_name = "PATH", requires = "update")]
+    keys_file: Vec<std::ffi::OsString>,
+    /// With -u, remove the writer lock of another writer of the bucket
+    /// repository.
+    ///
+    /// The command reads the lock, deletes it, and then takes its own lock.
+    /// It writes the holder of the removed lock to standard error after an
+    /// update that succeeds. Use it only when the holder is gone, for example
+    /// after a crash. The option needs -u.
+    #[cfg(feature = "s3")]
+    #[arg(long, requires = "update")]
+    break_lock: bool,
+    /// With -u, set `ostree.summary.last-modified`, in seconds since the Unix
+    /// epoch.
+    ///
+    /// A fixed value makes the output reproducible. Without this option, the
+    /// command uses the current time. `SOURCE_DATE_EPOCH` does not change this
+    /// value. The option needs -u.
+    #[cfg(feature = "s3")]
+    #[arg(long, value_name = "SECONDS", requires = "update")]
+    last_modified: Option<u64>,
     #[cfg(feature = "s3")]
     #[command(flatten)]
     s3: S3AccessArgs,
-    // ostrya checks this operand after the repository resolves.
+    // ostrya checks this operand after the repository resolves, unless -u is
+    // given and the operand is an address.
     /// The remote to report. Required.
+    ///
+    /// With -u, the remote name or the address `s3://BUCKET[/PREFIX]`. The
+    /// address of a remote is then its `push-url` key if that key holds an
+    /// `s3://` address, else its `pull-url` key if that key holds an `s3://`
+    /// address. The command refuses a remote with neither, and never reads
+    /// the `url` key.
     name: Option<String>,
 }
 
@@ -4288,6 +4404,21 @@ async fn run(repo: Option<&Path>, verbose: bool, command: Command) -> Result<()>
                     unreachable!("the subcommand is prune");
                 };
                 return remote_prune(None, nested, prune).await;
+            }
+            // So does a summary update at an address.
+            #[cfg(feature = "s3")]
+            if let RemoteCommand::Summary(summary) = &sub
+                && summary.update
+                && summary
+                    .name
+                    .as_deref()
+                    .is_some_and(|n| n.contains([':', '/']))
+            {
+                let nested = sub.name();
+                let RemoteCommand::Summary(summary) = sub else {
+                    unreachable!("the subcommand is summary");
+                };
+                return remote_summary_update(None, nested, summary).await;
             }
             let (repo, _) = resolve_repo(repo, verbose, name).await;
             remote(repo, sub).await
@@ -11196,6 +11327,10 @@ async fn remote(repo: Repo, sub: RemoteCommand) -> Result<()> {
         RemoteCommand::List(args) => remote_list(&repo, &args),
         RemoteCommand::ShowUrl(args) => remote_show_url(&repo, nested, &args),
         RemoteCommand::Refs(args) => remote_refs(&repo, nested, args).await,
+        #[cfg(feature = "s3")]
+        RemoteCommand::Summary(args) if args.update => {
+            remote_summary_update(Some(&repo), nested, args).await
+        }
         RemoteCommand::Summary(args) => remote_summary(&repo, nested, args).await,
         RemoteCommand::GpgImport(args) => remote_gpg_import(&repo, nested, args).await,
         RemoteCommand::GpgListKeys(args) => remote_gpg_list_keys(&repo, nested, &args).await,
@@ -11785,6 +11920,46 @@ async fn remote_refs(repo: &Repo, nested: &str, args: RemoteRefsArgs) -> Result<
         } else {
             println!("{name}:{}", entry.name);
         }
+    }
+    Ok(())
+}
+
+/// Writes the summary of the bucket repository of a remote or of an address,
+/// for `ostrya remote summary -u`.
+///
+/// `repo` is `None` for an address. The signers come from the signing
+/// options, with the checks of `ostrya summary -u`, before any request. The
+/// refusal of `--keys-file` under the gpg engine and the refusal of a key
+/// file with no key name the options of this command. A writer lock that `--break-lock` removed gives one warning
+/// line on standard error.
+#[cfg(feature = "s3")]
+async fn remote_summary_update(
+    repo: Option<&Repo>,
+    nested: &str,
+    args: RemoteSummaryArgs,
+) -> Result<()> {
+    let target = remote_operand(nested, args.name.as_deref());
+    let signers = summary_signers(&SummarySigning {
+        gpg_sign: &args.gpg_sign,
+        sign: &args.sign,
+        sign_type: args.sign_type.as_deref(),
+        keys_file: &args.keys_file,
+        key_id: &[],
+        gpg_homedir: args.gpg_homedir.as_deref(),
+        remote: true,
+    })
+    .await?;
+    let config = repo.map(Repo::config);
+    let endpoint =
+        ostrya::endpoint::resolve_bucket(config, target, args.s3.into_overrides()).await?;
+    let mut opts = ostrya::bucket::BucketSummaryOptions::default();
+    opts.summary_signers = signers.into_iter().map(Arc::from).collect();
+    opts.last_modified = args.last_modified;
+    opts.break_lock = args.break_lock;
+    let bucket = ostrya::bucket::BucketRepo::open(&endpoint).await?;
+    let report = bucket.update_summary(&opts).await?;
+    if let Some(holder) = &report.broken_lock {
+        eprintln!("warning: removed the writer lock of {holder}");
     }
     Ok(())
 }
@@ -12743,7 +12918,7 @@ async fn summary(repo: Repo, repo_path: PathBuf, args: SummaryArgs) -> Result<()
         None => None,
     };
     if args.verify {
-        let engine = summary_sign_type(&args);
+        let engine = summary_sign_type(&args.signing());
         let verifier = summary_verifier(&repo_path, engine, &args)?;
         let outcome = repo.verify_summary(&[verifier.as_ref()]).await?;
         report_verify(&outcome);
@@ -12773,7 +12948,8 @@ async fn summary(repo: Repo, repo_path: PathBuf, args: SummaryArgs) -> Result<()
     // an ostrya extension. Signing comes before each read option. Each signer
     // is built before the first signature is written.
     if !args.key_id.is_empty() || !args.keys_file.is_empty() {
-        let signers = summary_extension_signers(&args, summary_sign_type(&args)).await?;
+        let signing = args.signing();
+        let signers = summary_extension_signers(&signing, summary_sign_type(&signing)).await?;
         return repo.sign_summary_all(&signer_refs(&signers)).await;
     }
     if !reading {
@@ -12847,12 +13023,47 @@ fn summary_nothing_to_do() -> Error {
     )
 }
 
+/// The signing options of a summary update: of `ostrya summary -u`, and of
+/// `ostrya remote summary -u`, which has no KEY-ID.
+struct SummarySigning<'a> {
+    /// The `--gpg-sign` selectors.
+    gpg_sign: &'a [String],
+    /// The `--sign` keys.
+    sign: &'a [String],
+    /// The `--sign-type` value.
+    sign_type: Option<&'a str>,
+    /// The `--keys-file` paths.
+    keys_file: &'a [std::ffi::OsString],
+    /// The positional KEY-IDs.
+    key_id: &'a [String],
+    /// The `--gpg-homedir` directory.
+    gpg_homedir: Option<&'a Path>,
+    /// `true` for `ostrya remote summary -u`, whose refusals name its own
+    /// options.
+    remote: bool,
+}
+
+impl SummaryArgs {
+    /// Returns the signing options of the command line.
+    fn signing(&self) -> SummarySigning<'_> {
+        SummarySigning {
+            gpg_sign: &self.gpg_sign,
+            sign: &self.sign,
+            sign_type: self.sign_type.as_deref(),
+            keys_file: &self.keys_file,
+            key_id: &self.key_id,
+            gpg_homedir: self.gpg_homedir.as_deref(),
+            remote: false,
+        }
+    }
+}
+
 /// Returns the engine that `--sign-type` names.
 ///
 /// If no engine has the name, the process exits with the refusal of the
 /// `ostree` command.
-fn summary_sign_type(args: &SummaryArgs) -> SignType {
-    match sign_type_from_name(args.sign_type.as_deref().unwrap_or(DEFAULT_SIGN_TYPE)) {
+fn summary_sign_type(args: &SummarySigning<'_>) -> SignType {
+    match sign_type_from_name(args.sign_type.unwrap_or(DEFAULT_SIGN_TYPE)) {
         Ok(engine) => engine,
         Err(message) => exit_error(&message),
     }
@@ -12882,31 +13093,7 @@ async fn summary_update(repo: &Repo, args: &SummaryArgs) -> Result<()> {
         Ok(entries) => entries,
         Err(message) => exit_error(&message),
     };
-    let homedir = args.gpg_homedir.as_deref();
-    let mut signers = match resolve_gpg_selectors(&args.gpg_sign, homedir).await? {
-        Ok(signers) => signers,
-        Err(message) => exit_error(&message),
-    };
-    let extension = !args.key_id.is_empty() || !args.keys_file.is_empty();
-    if !args.sign.is_empty() || extension {
-        let engine = summary_sign_type(args);
-        if engine == SignType::Gpg {
-            match resolve_gpg_selectors(&args.sign, homedir).await? {
-                Ok(resolved) => signers.extend(resolved),
-                Err(message) => exit_error(&message),
-            }
-        } else {
-            for key in &args.sign {
-                match sign_api_signer(engine, key.as_bytes(), homedir) {
-                    Ok(signer) => signers.push(signer),
-                    Err(message) => exit_error(&message),
-                }
-            }
-        }
-        if extension {
-            signers.extend(summary_extension_signers(args, engine).await?);
-        }
-    }
+    let signers = summary_signers(&args.signing()).await?;
 
     let opts = SummaryOptions {
         last_modified: args.last_modified,
@@ -12934,6 +13121,42 @@ async fn summary_update(repo: &Repo, args: &SummaryArgs) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Returns the signers of a summary update, in the order of the signatures:
+/// each `--gpg-sign` key, each `--sign` key, and then the positional and
+/// `--keys-file` keys.
+///
+/// The steps 2 to 5 of the checks of [`summary_update`] run here, in that
+/// order. Under the gpg engine, a `--sign` key and a positional key are looked
+/// up as a `--gpg-sign` selector is.
+async fn summary_signers(args: &SummarySigning<'_>) -> Result<Vec<Box<dyn Signer>>> {
+    let homedir = args.gpg_homedir;
+    let mut signers = match resolve_gpg_selectors(args.gpg_sign, homedir).await? {
+        Ok(signers) => signers,
+        Err(message) => exit_error(&message),
+    };
+    let extension = !args.key_id.is_empty() || !args.keys_file.is_empty();
+    if !args.sign.is_empty() || extension {
+        let engine = summary_sign_type(args);
+        if engine == SignType::Gpg {
+            match resolve_gpg_selectors(args.sign, homedir).await? {
+                Ok(resolved) => signers.extend(resolved),
+                Err(message) => exit_error(&message),
+            }
+        } else {
+            for key in args.sign {
+                match sign_api_signer(engine, key.as_bytes(), homedir) {
+                    Ok(signer) => signers.push(signer),
+                    Err(message) => exit_error(&message),
+                }
+            }
+        }
+        if extension {
+            signers.extend(summary_extension_signers(args, engine).await?);
+        }
+    }
+    Ok(signers)
 }
 
 /// Returns a borrow of each boxed signer, in order, for a batch signing call.
@@ -12983,7 +13206,7 @@ async fn summary_read(
 /// This is an ostrya extension. The keys are read strictly, as `ostrya sign`
 /// reads them. A gpg selector is looked up before the signer is returned.
 async fn summary_extension_signers(
-    args: &SummaryArgs,
+    args: &SummarySigning<'_>,
     engine: SignType,
 ) -> Result<Vec<Box<dyn Signer>>> {
     match engine {
@@ -13002,7 +13225,7 @@ async fn summary_extension_signers(
 
 /// Returns an spki signer for each summary secret key.
 #[cfg(feature = "spki")]
-fn summary_signers_spki(args: &SummaryArgs) -> Result<Vec<Box<dyn Signer>>> {
+fn summary_signers_spki(args: &SummarySigning<'_>) -> Result<Vec<Box<dyn Signer>>> {
     summary_secret_keys(args)?
         .iter()
         .map(|key| {
@@ -13015,19 +13238,23 @@ fn summary_signers_spki(args: &SummaryArgs) -> Result<Vec<Box<dyn Signer>>> {
 
 /// Returns an error, because this build has no spki engine.
 #[cfg(not(feature = "spki"))]
-fn summary_signers_spki(_: &SummaryArgs) -> Result<Vec<Box<dyn Signer>>> {
+fn summary_signers_spki(_: &SummarySigning<'_>) -> Result<Vec<Box<dyn Signer>>> {
     Err(unsupported_type("spki"))
 }
 
 /// Returns a gpg signer for each positional KEY-ID of `summary`.
 #[cfg(feature = "gpg")]
-async fn summary_signers_gpg(args: &SummaryArgs) -> Result<Vec<Box<dyn Signer>>> {
+async fn summary_signers_gpg(args: &SummarySigning<'_>) -> Result<Vec<Box<dyn Signer>>> {
     if !args.keys_file.is_empty() {
-        return Err(Error::Signature(
-            "gpg signing takes KEY-ID arguments; --keys-file keyrings serve verify".into(),
-        ));
+        let message = if args.remote {
+            "gpg signing takes --gpg-sign and --sign KEY-ID arguments; --keys-file serves the \
+             other engines"
+        } else {
+            "gpg signing takes KEY-ID arguments; --keys-file keyrings serve verify"
+        };
+        return Err(Error::Signature(message.into()));
     }
-    match resolve_gpg_selectors(&args.key_id, args.gpg_homedir.as_deref()).await? {
+    match resolve_gpg_selectors(args.key_id, args.gpg_homedir).await? {
         Ok(signers) => Ok(signers),
         Err(message) => exit_error(&message),
     }
@@ -13035,7 +13262,7 @@ async fn summary_signers_gpg(args: &SummaryArgs) -> Result<Vec<Box<dyn Signer>>>
 
 /// Returns an error, because this build has no gpg engine.
 #[cfg(not(feature = "gpg"))]
-async fn summary_signers_gpg(_: &SummaryArgs) -> Result<Vec<Box<dyn Signer>>> {
+async fn summary_signers_gpg(_: &SummarySigning<'_>) -> Result<Vec<Box<dyn Signer>>> {
     Err(unsupported_type("gpg"))
 }
 
@@ -13043,15 +13270,18 @@ async fn summary_signers_gpg(_: &SummaryArgs) -> Result<Vec<Box<dyn Signer>>> {
 ///
 /// These are the KEY-IDs and the non-blank lines of each `--keys-file`. At
 /// least one key is required.
-fn summary_secret_keys(args: &SummaryArgs) -> Result<Vec<String>> {
-    let mut keys = args.key_id.clone();
-    for path in &args.keys_file {
+fn summary_secret_keys(args: &SummarySigning<'_>) -> Result<Vec<String>> {
+    let mut keys = args.key_id.to_vec();
+    for path in args.keys_file {
         keys.extend(read_key_lines(Path::new(path))?);
     }
     if keys.is_empty() {
-        return Err(Error::Signature(
-            "no signing key given; pass a key argument or --keys-file".into(),
-        ));
+        let message = if args.remote {
+            "no signing key given; pass --sign or --keys-file"
+        } else {
+            "no signing key given; pass a key argument or --keys-file"
+        };
+        return Err(Error::Signature(message.into()));
     }
     Ok(keys)
 }

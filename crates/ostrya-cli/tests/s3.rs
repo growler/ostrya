@@ -2,7 +2,7 @@
 
 //! `ostrya` with a bucket repository at an `s3://` address: `remote init`,
 //! `push`, `push-tree`, `pull`, `remote refs`, `remote summary`, `remote
-//! fsck`, `remote prune`, and `remote add`.
+//! summary -u`, `remote fsck`, `remote prune`, and `remote add`.
 //!
 //! Most tests run against the S3 stand-in of
 //! `crates/ostrya/tests/common/s3.rs`, which holds its objects in memory,
@@ -1881,6 +1881,353 @@ fn remote_prune_with_break_lock_removes_a_lock_and_prints_its_holder() {
 }
 
 // ---------------------------------------------------------------------------
+// remote summary -u
+// ---------------------------------------------------------------------------
+
+/// Writes each key of the bucket repository at [`ADDRESS`] of `server`
+/// under the directory `name` of the scratch directory, with the
+/// directories of a repository, and returns its `--repo` option. Keys under
+/// `extensions/` stay out.
+fn dump(scratch: &Scratch, server: &StandIn, name: &str) -> String {
+    let dir = scratch.path().join(name);
+    let objects: Vec<(String, Vec<u8>)> = server
+        .state()
+        .objects
+        .iter()
+        .map(|(key, stored)| (key.clone(), stored.bytes.clone()))
+        .collect();
+    for (key, bytes) in objects {
+        let Some(rel) = key.strip_prefix("repo/") else {
+            continue;
+        };
+        if rel.starts_with("extensions/") {
+            continue;
+        }
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+    for sub in ["tmp", "refs/heads", "refs/remotes", "refs/mirrors", "state"] {
+        std::fs::create_dir_all(dir.join(sub)).unwrap();
+    }
+    let repo = format!("--repo={}", dir.display());
+    // The host of the tests can have little free space.
+    scratch.append_config(&repo, "min-free-space-percent=0\n");
+    repo
+}
+
+#[test]
+fn remote_summary_update_at_an_address_needs_no_repository_and_prints_nothing() {
+    let scratch = Scratch::new("summary-update");
+    let server = StandIn::start();
+    let (repo, _, two) = prune_fixture(&scratch, &server);
+    let endpoint = endpoint_of(&server);
+    let out = scratch.run(&["remote", "summary", "-u", ADDRESS, &endpoint, CLEARTEXT]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "");
+    assert_eq!(stderr(&out), "");
+    assert!(object(&server, "repo/summary").is_some());
+    assert!(object(&server, "repo/summary.sig").is_none());
+    assert!(object(&server, LOCK).is_none());
+    scratch.append_config(
+        &repo,
+        &format!(
+            "\n[remote \"r\"]\npull-url={ADDRESS}\ns3-endpoint={}\n",
+            server.endpoint()
+        ),
+    );
+    assert_eq!(
+        scratch.ok(&[&repo, "remote", "refs", "-r", "r", CLEARTEXT]),
+        format!("r:main\t{two}\n")
+    );
+}
+
+#[test]
+fn remote_summary_update_of_a_remote_takes_push_url_then_pull_url() {
+    let scratch = Scratch::new("summary-update-remote");
+    let server = StandIn::start();
+    let (repo, _, _) = prune_fixture(&scratch, &server);
+    scratch.append_config(
+        &repo,
+        &format!(
+            "\n[remote \"push\"]\npull-url=s3://bkt/other\npush-url={ADDRESS}\ns3-endpoint={0}\n\
+             \n[remote \"pull\"]\npull-url={ADDRESS}\ns3-endpoint={0}\n\
+             \n[remote \"http\"]\nurl=https://ex.com/r\n",
+            server.endpoint()
+        ),
+    );
+    assert_eq!(
+        scratch.ok(&[&repo, "remote", "summary", "-u", "push", CLEARTEXT]),
+        ""
+    );
+    assert!(object(&server, "repo/summary").is_some());
+    assert!(object(&server, "other/summary").is_none());
+    server.state().objects.remove("repo/summary");
+    assert_eq!(
+        scratch.ok(&[&repo, "remote", "summary", "-u", "pull", CLEARTEXT]),
+        ""
+    );
+    assert!(object(&server, "repo/summary").is_some());
+    let message = scratch.fails(&[&repo, "remote", "summary", "-u", "http", CLEARTEXT]);
+    assert_eq!(
+        message,
+        "error: invalid input: remote 'http' holds no s3:// address in push-url or pull-url\n"
+    );
+    let message = scratch.fails(&["remote", "summary", "-u", "https://ex.com/r"]);
+    assert!(message.starts_with("error: "), "{message}");
+}
+
+#[test]
+fn remote_summary_update_conflicts_with_the_read_options_and_its_options_need_it() {
+    let scratch = Scratch::new("summary-update-options");
+    let server = StandIn::start();
+    let endpoint = endpoint_of(&server);
+    for option in ["--raw", "--list-metadata-keys", "--print-metadata-key=k"] {
+        let message = scratch.fails(&[
+            "remote", "summary", "-u", option, ADDRESS, &endpoint, CLEARTEXT,
+        ]);
+        assert!(
+            message.contains("cannot be used with"),
+            "{option}: {message}"
+        );
+    }
+    let sign = format!("--sign={SECRET_B64}");
+    for option in [
+        "--gpg-sign=KEY",
+        "--gpg-homedir=/nonexistent",
+        sign.as_str(),
+        "--sign-type=ed25519",
+        "--keys-file=/nonexistent",
+        "--break-lock",
+        "--last-modified=1",
+    ] {
+        let message = scratch.fails(&["remote", "summary", option, ADDRESS, &endpoint, CLEARTEXT]);
+        assert!(
+            message.contains("required arguments were not provided")
+                && message.contains("--update"),
+            "{option}: {message}"
+        );
+    }
+    for option in ["-m", "-c", "--metadata-commit-timestamp=1", "--keys-dir=/x"] {
+        let message = scratch.fails(&[
+            "remote", "summary", "-u", option, ADDRESS, &endpoint, CLEARTEXT,
+        ]);
+        assert!(
+            message.contains("unexpected argument"),
+            "{option}: {message}"
+        );
+    }
+    // An engine that does not exist is refused before any request.
+    let message = scratch.fails(&[
+        "remote",
+        "summary",
+        "-u",
+        "--sign-type=rsa",
+        &sign,
+        ADDRESS,
+        &endpoint,
+        CLEARTEXT,
+    ]);
+    assert!(message.starts_with("error: "), "{message}");
+    assert!(server.state().requests.is_empty());
+}
+
+#[test]
+fn remote_summary_update_refuses_a_key_file_with_the_options_of_the_command() {
+    let scratch = Scratch::new("summary-update-key-file");
+    let server = StandIn::start();
+    let endpoint = endpoint_of(&server);
+    let blank = scratch.path().join("blank");
+    std::fs::write(&blank, "\n\n").unwrap();
+    let keys_file = format!("--keys-file={}", blank.display());
+    let message = scratch.fails(&[
+        "remote", "summary", "-u", &keys_file, ADDRESS, &endpoint, CLEARTEXT,
+    ]);
+    assert_eq!(
+        message,
+        "error: signature: no signing key given; pass --sign or --keys-file\n"
+    );
+    #[cfg(feature = "gpg")]
+    {
+        let message = scratch.fails(&[
+            "remote",
+            "summary",
+            "-u",
+            "--sign-type=gpg",
+            &keys_file,
+            ADDRESS,
+            &endpoint,
+            CLEARTEXT,
+        ]);
+        assert_eq!(
+            message,
+            "error: signature: gpg signing takes --gpg-sign and --sign KEY-ID arguments; \
+             --keys-file serves the other engines\n"
+        );
+    }
+    assert!(server.state().requests.is_empty());
+}
+
+#[test]
+fn remote_summary_update_signs_with_ed25519_and_a_pull_verifies_it() {
+    let scratch = Scratch::new("summary-update-sign");
+    let server = StandIn::start();
+    let (_, _, two) = prune_fixture(&scratch, &server);
+    let endpoint = endpoint_of(&server);
+    let keys = scratch.path().join("keys");
+    std::fs::write(&keys, format!("{SECRET_B64}\n")).unwrap();
+    let last_modified = format!("--last-modified={TS}");
+    scratch.ok(&[
+        "remote",
+        "summary",
+        "-u",
+        &format!("--keys-file={}", keys.display()),
+        &last_modified,
+        ADDRESS,
+        &endpoint,
+        CLEARTEXT,
+    ]);
+    let by_file = object(&server, "repo/summary.sig").unwrap();
+    scratch.ok(&[
+        "remote",
+        "summary",
+        "-u",
+        &format!("--sign={SECRET_B64}"),
+        "-s",
+        "ed25519",
+        &last_modified,
+        ADDRESS,
+        &endpoint,
+        CLEARTEXT,
+    ]);
+    assert_eq!(object(&server, "repo/summary.sig").unwrap(), by_file);
+    let dest = scratch.repo("dest");
+    scratch.append_config(
+        &dest,
+        &format!(
+            "\n[remote \"good\"]\npull-url={ADDRESS}\ns3-endpoint={0}\ngpg-verify=false\n\
+             sign-verify-summary=true\nverification-ed25519-key={PUBLIC_B64}\n\
+             \n[remote \"wrong\"]\npull-url={ADDRESS}\ns3-endpoint={0}\ngpg-verify=false\n\
+             sign-verify-summary=true\nverification-ed25519-key={OTHER_PUBLIC_B64}\n",
+            server.endpoint()
+        ),
+    );
+    scratch.ok(&[&dest, "pull", "good", "main", CLEARTEXT]);
+    assert_eq!(scratch.ok(&[&dest, "rev-parse", "good:main"]).trim(), two);
+    scratch.fails(&[&dest, "pull", "wrong", "main", CLEARTEXT]);
+}
+
+#[test]
+fn remote_summary_update_with_last_modified_writes_the_bytes_of_summary_u() {
+    let scratch = Scratch::new("summary-update-bytes");
+    let server = StandIn::start();
+    prune_fixture(&scratch, &server);
+    let endpoint = endpoint_of(&server);
+    let last_modified = format!("--last-modified={TS}");
+    let sign = format!("--sign={SECRET_B64}");
+    scratch.ok(&[
+        "remote",
+        "summary",
+        "-u",
+        &sign,
+        &last_modified,
+        ADDRESS,
+        &endpoint,
+        CLEARTEXT,
+    ]);
+    let copy = dump(&scratch, &server, "copy");
+    scratch.ok(&[&copy, "summary", "-u", &sign, &last_modified]);
+    for file in ["summary", "summary.sig"] {
+        assert_eq!(
+            std::fs::read(scratch.path().join("copy").join(file)).unwrap(),
+            object(&server, &format!("repo/{file}")).unwrap(),
+            "{file}"
+        );
+    }
+}
+
+#[test]
+fn remote_summary_update_of_a_signed_bucket_needs_a_signing_key() {
+    let scratch = Scratch::new("summary-update-signed");
+    let server = StandIn::start();
+    prune_fixture(&scratch, &server);
+    let endpoint = endpoint_of(&server);
+    scratch.ok(&[
+        "remote",
+        "summary",
+        "-u",
+        &format!("--sign={SECRET_B64}"),
+        ADDRESS,
+        &endpoint,
+        CLEARTEXT,
+    ]);
+    let summary = object(&server, "repo/summary").unwrap();
+    let message = scratch.fails(&["remote", "summary", "-u", ADDRESS, &endpoint, CLEARTEXT]);
+    assert!(message.contains("holds a summary.sig"), "{message}");
+    assert_eq!(object(&server, "repo/summary").unwrap(), summary);
+    assert!(object(&server, LOCK).is_none());
+}
+
+#[test]
+fn remote_summary_update_with_break_lock_removes_a_lock_and_prints_its_holder() {
+    let scratch = Scratch::new("summary-update-break-lock");
+    let server = StandIn::start();
+    prune_fixture(&scratch, &server);
+    server.state().store(LOCK, DEAD_LOCK.as_bytes());
+    let endpoint = endpoint_of(&server);
+    let message = scratch.fails(&["remote", "summary", "-u", ADDRESS, &endpoint, CLEARTEXT]);
+    assert!(message.contains("is locked"), "{message}");
+    assert!(object(&server, "repo/summary").is_none());
+    let out = scratch.run(&[
+        "remote",
+        "summary",
+        "-u",
+        "--break-lock",
+        ADDRESS,
+        &endpoint,
+        CLEARTEXT,
+    ]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stdout(&out), "");
+    assert_eq!(stderr(&out), format!("{DEAD_LOCK_LINE}\n"));
+    assert!(object(&server, "repo/summary").is_some());
+    assert!(object(&server, LOCK).is_none());
+}
+
+#[cfg(feature = "push")]
+#[test]
+fn a_push_and_remote_summary_u_serve_remote_refs_and_a_mirror_pull() {
+    let scratch = Scratch::new("summary-update-chain");
+    let server = StandIn::start();
+    init(&scratch, &server, None);
+    let endpoint = endpoint_of(&server);
+    let src = scratch.repo("src");
+    let tip = scratch.commit(&src, "main", "one");
+    scratch.ok(&[&src, "push", ADDRESS, "main", &endpoint, CLEARTEXT]);
+    let dest = scratch.repo("dest");
+    scratch.ok(&[
+        &dest,
+        "remote",
+        "add",
+        "--no-gpg-verify",
+        "r",
+        ADDRESS,
+        &format!("--set=s3-endpoint={}", server.endpoint()),
+    ]);
+    scratch.fails(&[&dest, "remote", "refs", "r", CLEARTEXT]);
+    assert_eq!(
+        scratch.ok(&[&dest, "remote", "summary", "-u", "r", CLEARTEXT]),
+        ""
+    );
+    assert_eq!(
+        scratch.ok(&[&dest, "remote", "refs", "r", CLEARTEXT]),
+        "r:main\n"
+    );
+    scratch.ok(&[&dest, "pull", "--mirror", "r", CLEARTEXT]);
+    assert_eq!(scratch.ok(&[&dest, "rev-parse", "main"]).trim(), tip);
+}
+
+// ---------------------------------------------------------------------------
 // remote refs, remote summary, remote add
 // ---------------------------------------------------------------------------
 
@@ -1981,8 +2328,8 @@ fn copy_tree(from: &Path, to: &Path) {
 /// `remote refs`, `remote summary`, `remote fsck`, and `pull` read a copy of
 /// the `archive` fixture through `rclone serve s3`, which checks each
 /// signature. A wrong secret gives `SignatureDoesNotMatch`, and `remote
-/// init`, `remote fsck --delete`, and `push` are refused, because the server
-/// does not honor `If-None-Match`.
+/// init`, `remote fsck --delete`, `remote summary -u`, and `push` are
+/// refused, because the server does not honor `If-None-Match`.
 #[test]
 fn rclone_serves_a_bucket_to_each_reader_and_refuses_each_writer() {
     if !rclone_available("rclone_serves_a_bucket_to_each_reader_and_refuses_each_writer") {
@@ -2042,6 +2389,13 @@ fn rclone_serves_a_bucket_to_each_reader_and_refuses_each_writer() {
         message.contains("does not honor If-None-Match"),
         "{message}"
     );
+    let summary = std::fs::read(bucket.join("summary")).unwrap();
+    let message = scratch.fails(&[&dest, "remote", "summary", "-u", "r", CLEARTEXT]);
+    assert!(
+        message.contains("does not honor If-None-Match"),
+        "{message}"
+    );
+    assert_eq!(std::fs::read(bucket.join("summary")).unwrap(), summary);
     let endpoint = format!("--s3-endpoint={}", server.endpoint());
     let message = scratch.fails(&["remote", "init", "s3://bkt/fresh", &endpoint, CLEARTEXT]);
     assert!(
@@ -2099,4 +2453,20 @@ fn seaweedfs_takes_an_init_a_push_and_a_pull() {
         "main",
     ]);
     assert_eq!(scratch.ok(&[&dest, "rev-parse", "x:main"]).trim(), tip);
+    assert_eq!(
+        scratch.ok(&["remote", "summary", "-u", ADDRESS, &endpoint, CLEARTEXT]),
+        ""
+    );
+    scratch.ok(&[
+        &dest,
+        "remote",
+        "add",
+        "--no-gpg-verify",
+        "w",
+        ADDRESS,
+        &format!("--set=s3-endpoint={}", server.endpoint()),
+    ]);
+    let report = scratch.ok(&[&dest, "remote", "summary", "w", CLEARTEXT]);
+    assert!(report.contains(&format!("* ({ID}, main)")), "{report}");
+    assert!(report.contains(&tip), "{report}");
 }

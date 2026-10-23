@@ -20,7 +20,9 @@ use std::path::Path;
 use common::TmpDir;
 use common::modes::object_path;
 use common::s3::{Rclone, StandIn, endpoint, rclone_available};
-use ostrya::bucket::{BucketFsckOptions, BucketPruneOptions, BucketPruneReport, BucketRepo};
+use ostrya::bucket::{
+    BucketFsckOptions, BucketPruneOptions, BucketPruneReport, BucketRepo, BucketSummaryOptions,
+};
 use ostrya::remote::{Endpoint, PullSession, StreamSessionOptions};
 use ostrya::verify::PullTrust;
 use ostrya::{
@@ -691,6 +693,45 @@ fn the_deltas_of_absent_targets_go_with_the_superblock_first() {
         assert!(deltas.iter().all(|key| !key.starts_with(&dir)));
         assert_eq!(f.get(&index), Some(b"index".to_vec()));
         assert_eq!(f.get("summary"), Some(summary));
+    });
+}
+
+#[test]
+fn a_summary_update_after_a_prune_names_no_deleted_delta() {
+    block_on(async {
+        let (f, _) = Fixture::rich().await;
+        f.local
+            .regenerate_summary(&SummaryOptions::default())
+            .await
+            .unwrap();
+        let summary = std::fs::read(f.local.path().join("summary")).unwrap();
+        f.put("summary", &summary);
+        let report = f.prune(&refs_only(0)).await.unwrap();
+        assert_eq!(report.deleted_deltas, [f.c1.to_hex()]);
+        let advertised = |f: &Fixture| -> Vec<Checksum> {
+            Summary::parse(&f.get("summary").unwrap())
+                .unwrap()
+                .static_deltas()
+                .unwrap()
+                .into_iter()
+                .map(|delta| delta.to)
+                .collect()
+        };
+        assert!(advertised(&f).contains(&f.c1));
+        f.bucket
+            .update_summary(&BucketSummaryOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(advertised(&f), [f.c3]);
+        let report = f.bucket.fsck(&BucketFsckOptions::default()).await.unwrap();
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|finding| finding.kind == ostrya::bucket::BucketFindingKind::Summary),
+            "{:#?}",
+            report.findings
+        );
     });
 }
 

@@ -5954,37 +5954,46 @@ a push of commits.
 
 ### The summary of a bucket repository
 
-The summary of a bucket repository is written by an explicit summary update
-alone. A push, the init, and the prune write no summary. This version of the port has
-no command that writes the summary of a bucket repository. The rules below
-are the rules of the summary builder of the port for a bucket repository.
+The summary update writes the summary of a bucket repository. It is the
+one writer of `summary` and `summary.sig`: a push, the init, the fsck, and
+the prune write no summary. `ostrya remote summary -u` runs it, with the
+`s3://` address of its operand or of a remote.
 
-The summary of a bucket repository is the root summary alone. A writer
-writes no summary of an auth item and no file under
-`extensions/ostrya/summary/`.
+The summary of a bucket repository is the root summary alone. The update
+writes no summary of an auth item, no file under
+`extensions/ostrya/summary/`, and no anchor commit.
 
 A pull of collection refs reads the refs of a bucket repository from its
 summary alone ("The pull of collection refs"). So a bucket repository with
 no summary serves no collection ref.
 
-- Field 0 holds the refs of `refs/heads/`, sorted byte-wise by name.
+- Field 0 holds the refs of `refs/heads/`, sorted byte-wise by name. A
+  bucket repository with no ref gets a summary with an empty field 0.
 - `ostree.summary.collection-map` holds the refs of each `refs/mirrors/ID/`
   with a ref, by collection id. A bucket repository with a collection id
   holds no `refs/mirrors/ID/` of that id: each writer refuses it.
 - `ostree.summary.mode`, `ostree.summary.tombstone-commits`,
   `ostree.summary.indexed-deltas`, and `ostree.summary.collection-id` come
   from `mode`, `tombstone-commits`, `indexed-deltas`, and `collection-id` of
-  `[core]` in the `config` of the bucket.
+  `[core]` in the `config` of the bucket, as the local summary takes them
+  from a local `config`. A `config` that sets `tombstone-commits=true` gives
+  `ostree.summary.tombstone-commits` the value true.
 - `ostree.static-deltas` holds each delta of `deltas/` with a superblock,
   sorted by delta name, with the SHA-256 of its superblock. A delta
-  directory with no superblock is not in the map. A superblock key whose
-  directory names do not decode as a delta, and a superblock larger than
-  128 MiB in the listing or in its read, refuse the writer.
-- `ostree.summary.last-modified` is the time of the write.
-- The facts of a ref entry come from the local object store when the local
-  repository holds the commit. Else the writer reads the commit object from
-  the bucket and checks it against its name. The commit object must be in
-  the listing, and the writer reads at most its size in the listing.
+  directory with no superblock is not in the map. Each read of a superblock
+  takes the strict rule of an absent key. A superblock that is gone at its
+  read, with an answer 404 `NoSuchKey`, is not in the map, and each other
+  answer 404 refuses the update. A superblock key whose directory names do
+  not decode as a delta, and a superblock larger than 128 MiB in the
+  listing or in its read, refuse the update.
+- `ostree.summary.last-modified` is the time of the write, or the value of
+  the caller.
+- The facts of a ref entry come from the commit object in the bucket. The
+  update reads each commit object of a ref with one `GET`, at most the
+  128 MiB cap of a metadata object, and checks its SHA-256 against its
+  name. It sends no list of `objects/`. A ref whose commit has a
+  partial-commit marker under `state/` is in the summary as each other ref,
+  and the update reads no key under `state/`.
 
 These are the bytes of the root summary of a local repository with the same
 refs, commits, deltas, `config`, and `last-modified`, with one difference
@@ -5993,17 +6002,42 @@ a new `ostree-metadata` anchor commit to `refs/heads/ostree-metadata` before
 its summary, so its ref set holds one more ref. A bucket repository writes
 no anchor commit.
 
-A ref key under `refs/` other than `refs/heads/<name>` and
-`refs/mirrors/<id>/<name>`, a ref file that does not hold 64 lowercase hex
-digits and a newline, and a ref whose commit the bucket does not hold
-refuse the writer before it changes the bucket.
+The steps of the update are:
 
-The writer builds and signs the summary before it changes the bucket. It
-then checks the lock, writes `summary`, and then writes `summary.sig` if a
-summary signer signed the summary. Between the two writes, a reader
-sees the new summary and the old signature, and a reader that verifies the
-summary refuses it. A reader never accepts a summary that its signature
-does not cover. A read after the writer ends finds a matching pair.
+1. The read of `config`, by the strict rule of an absent key. A bucket with
+   no `config` refuses the update before the lock.
+2. The take of the writer lock with `operation=summary`.
+3. The list of `refs/` with a read of each ref file. An update with no
+   summary signer probes `summary.sig` at the same time. The probe reads
+   the headers of the key alone, and only an answer 404 `NoSuchKey` is an
+   absent key. An update with a summary signer sends no request for
+   `summary.sig` before its write.
+4. The refusals below.
+5. At the same time: the reads of the commit objects, and the list of
+   `deltas/` with the read of each superblock as a stream.
+6. The build and the signatures of the summary.
+7. A check of the lock, the write of `summary`, and then the write of
+   `summary.sig` if a summary signer signed the summary.
+8. The release of the lock.
+
+These states refuse the update before it changes the bucket:
+
+- a ref key under `refs/` other than `refs/heads/<name>` and
+  `refs/mirrors/<id>/<name>`;
+- a ref file that does not hold 64 lowercase hex digits and a newline;
+- a ref name of `refs/heads/` or of one `refs/mirrors/<id>/` that is a
+  directory of another ref name of the same directory, as `a` is of `a/b`;
+- a ref whose commit the bucket does not hold, and a commit object of a ref
+  that does not have the checksum of its name;
+- a `summary.sig` in the bucket and no summary signer. The update never
+  deletes `summary.sig`, so it never makes a signed bucket repository
+  unsigned.
+
+Between the two writes of step 7, a reader sees the new summary and the old
+signature, and a reader that verifies the summary refuses it. A reader
+never accepts a summary that its signature does not cover. A read after the
+update ends finds a matching pair. A failure between the two writes leaves
+that state, and a run again writes a matching pair.
 
 ### The fsck of a bucket repository
 
@@ -6118,7 +6152,7 @@ Each finding has one kind, and is an error or a note:
 - `lock`, a note: a writer lock at the start or at the end of the run, or a
   lock of the run that is gone at its release.
 
-The summary of a bucket repository changes only with an explicit update,
+The summary of a bucket repository changes only with the summary update,
 and a push writes no summary. So a summary that lists old refs is a note.
 A summary that a pull trusts and that leads the pull to an absent object is
 an error.
@@ -6265,5 +6299,5 @@ deleted commits, their deltas, and their markers stay until the next run.
 The prune writes no summary. The commits of the summary are roots, so the
 prune deletes no commit that the summary names. A static delta of the
 summary whose target commit is not in the bucket goes, and the summary that
-names it stays as it is until an explicit update of the summary. A pull that
-trusts that summary can then ask for an absent delta.
+names it stays as it is until the summary update writes the summary again. A
+pull that trusts that summary can then ask for an absent delta.

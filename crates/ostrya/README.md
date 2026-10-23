@@ -51,7 +51,8 @@ API documentation: <https://docs.rs/ostrya>
 - Remote resolution: `endpoint`, which reads the keys and files of a remote for a
   pull or a push.
 - Bucket repositories: `bucket`, a repository in an S3 bucket, with the init,
-  the writer lock, the listing of the objects, the fsck, and the prune.
+  the writer lock, the listing of the objects, the fsck, the prune, and the
+  summary update.
 - Signing: `sign`, `gpg`, and `spki`.
 - Signature trust: `verify`, the trusted keys and the trust of one pull.
 - Maintenance: `prune`, `fsck`, `diff`, `update`, and `config`.
@@ -70,9 +71,10 @@ API documentation: <https://docs.rs/ostrya>
 - `push`: `Repo::push`, `Repo::push_onto`, and `Repo::export_stream`, the push
   from a repository.
 - `s3`: the pull from a bucket repository at an `s3://` address and the pull
-  of collection refs from one, the `bucket` module with the fsck and the prune
-  of a bucket repository, the `s3` module of `ostrya-remote`, and with `push`,
-  the push of commits and of a local directory to a bucket repository.
+  of collection refs from one, the `bucket` module with the fsck, the prune,
+  and the summary update of a bucket repository, the `s3` module of
+  `ostrya-remote`, and with `push`, the push of commits and of a local
+  directory to a bucket repository.
 - `lzma-static`: xz built from source and linked statically, with no runtime
   liblzma.
 

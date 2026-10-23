@@ -4,9 +4,9 @@
 //! Each file of the repository is one object of the bucket, under the prefix
 //! of the address `s3://BUCKET[/PREFIX]`. A pull reads a bucket repository
 //! through [`Repo::pull`](crate::Repo::pull). A `BucketRepo` adds the init,
-//! the writer lock, the listing of the objects, the fsck, and the prune. With
-//! the `push` feature, `Repo::push_to_bucket` writes commits to a bucket
-//! repository.
+//! the writer lock, the listing of the objects, the fsck, the prune, and the
+//! update of the summary. With the `push` feature, `Repo::push_to_bucket`
+//! writes commits to a bucket repository.
 //!
 //! # Init
 //!
@@ -23,7 +23,8 @@
 //!
 //! A push writes the objects of its commits, and then the ref files, under
 //! the writer lock. It writes no `summary` and no `summary.sig`, and leaves
-//! the ones that the bucket holds as they are. A commit object goes up only
+//! the ones that the bucket holds as they are, until
+//! [`BucketRepo::update_summary`] writes them. A commit object goes up only
 //! after each object of its tree, so a commit object in the bucket has its
 //! whole tree in the bucket, also after a push that failed. The one exception
 //! is a commit with a partial-commit marker `state/<checksum>.commitpartial`,
@@ -119,7 +120,7 @@
 //!   whose superblock is absent or has another digest, are errors. A summary
 //!   that differs from the ref files or from the deltas in other ways, and an
 //!   absent summary, are notes: the summary of a bucket repository changes
-//!   only with an explicit update.
+//!   only with [`BucketRepo::update_summary`].
 //! - The keys under `objects/` that are no object keys.
 //! - Each commit object of the listing, each dirtree and dirmeta of the tree
 //!   of each commit, each `.filez` of these trees, and each composefs image
@@ -185,12 +186,41 @@
 //!   and the aborts.
 //! - The run deletes no ref, no `.tombstone-commit`, and no key under
 //!   `delta-indexes/`, and writes no summary. A summary that names a deleted
-//!   static delta stays as it is until an explicit update of the summary.
+//!   static delta stays as it is until [`BucketRepo::update_summary`] writes
+//!   the summary again.
 //!
 //! A run that fails after its first delete leaves a bucket repository that a
 //! reader can use, and a later run deletes the rest. An object that only a
 //! dirtree that the fsck deleted reaches is unreachable, so the prune
 //! deletes it, and a push of the commit of that dirtree uploads it again.
+//!
+//! # The summary update
+//!
+//! [`BucketRepo::update_summary`] is the one writer of `summary` and
+//! `summary.sig`, and gives a [`BucketSummaryReport`]. The run takes the
+//! writer lock with the operation `summary`. It reads the refs, the commit
+//! object of each ref, and the superblock of each static delta, and writes
+//! the root summary of the bucket repository:
+//!
+//! - Field 0 holds the refs of `refs/heads/`, and
+//!   `ostree.summary.collection-map` holds the refs of each
+//!   `refs/mirrors/ID/`.
+//! - `ostree.static-deltas` holds each delta with a superblock, with the
+//!   SHA-256 of its superblock. Each read of a superblock takes the strict
+//!   rule of an absent key, so only a superblock gone with an answer 404
+//!   `NoSuchKey` is left out, and each other 404 fails the run.
+//! - The other keys come from the `[core]` group of the `config` of the
+//!   bucket.
+//!
+//! The bytes are the bytes of the root summary that a local repository
+//! with the same refs, commits, deltas, `config`, and `last-modified` writes,
+//! with no `ostree-metadata` anchor commit. The run writes `summary`, and
+//! then `summary.sig` when it has a signer. It never deletes `summary.sig`,
+//! and a bucket repository that holds a `summary.sig` refuses a run with no
+//! signer. Only a run with no signer probes `summary.sig`, by the strict
+//! rule of an absent key. Between the two writes, a reader that verifies
+//! the summary refuses it, because the old signatures do not cover the new
+//! summary. A read after the run ends finds a matching pair.
 //!
 //! # Examples
 //!
@@ -224,9 +254,6 @@ mod listing;
 mod lock;
 mod prune;
 mod state;
-// No writer of this version writes the summary of a bucket repository. The
-// build and the write of the summary stay for an explicit summary update.
-#[allow(dead_code)]
 mod summary;
 mod walk;
 
@@ -239,6 +266,7 @@ pub use prune::{BucketPruneOptions, BucketPruneReport};
 pub(crate) use state::{BucketRefs, summary_refs};
 #[cfg_attr(not(feature = "push"), allow(unused_imports))]
 pub(crate) use state::{check_prefixes, marker_key};
+pub use summary::{BucketSummaryOptions, BucketSummaryReport};
 
 /// The result of a push to a bucket repository: `Repo::push_to_bucket` or
 /// `BucketRepo::push_tree`.
@@ -595,6 +623,8 @@ const _: fn() = || {
     assert_send_sync::<BucketFindingKind>();
     assert_send_sync::<BucketPruneOptions>();
     assert_send_sync::<BucketPruneReport>();
+    assert_send_sync::<BucketSummaryOptions>();
+    assert_send_sync::<BucketSummaryReport>();
 };
 
 #[cfg(test)]

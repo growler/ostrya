@@ -23,6 +23,7 @@ use common::modes::object_path;
 use common::s3::{Rclone, StandIn, endpoint, rclone_available};
 use ostrya::bucket::{
     BucketFinding, BucketFindingKind, BucketFsckOptions, BucketFsckReport, BucketRepo,
+    BucketSummaryOptions,
 };
 use ostrya::verify::TrustedKeys;
 use ostrya::{
@@ -1339,6 +1340,68 @@ fn a_push_of_a_marked_commit_uploads_its_missing_objects_and_clears_the_marker()
         let report = f.repair().await.unwrap();
         assert_eq!(report.cleared_partial, sorted(&[f.first, f.side]));
         assert!(f.fsck().await.commits_partial.is_empty());
+    });
+}
+
+#[test]
+fn a_summary_update_after_a_repair_lists_a_marked_ref_target_and_refuses_a_deleted_one() {
+    block_on(async {
+        let f = Fixture::new(None).await;
+        let nested = f.entry(&f.head, &["sub", "deep"], "nested", false).await;
+        f.remove(ObjectType::File, &nested);
+        let report = f.repair().await.unwrap();
+        assert!(
+            report
+                .marked_partial
+                .iter()
+                .any(|(commit, _)| *commit == f.head)
+        );
+        let opts = BucketSummaryOptions::default();
+        f.bucket.update_summary(&opts).await.unwrap();
+        let summary = f.get("summary").unwrap();
+        let parsed = ostrya::Summary::parse(&summary).unwrap();
+        assert_eq!(parsed.lookup("main"), Some(f.head));
+        let report = f.fsck().await;
+        assert!(
+            !report.findings.iter().any(|found| found.kind == Summary),
+            "{:#?}",
+            report.findings
+        );
+        // A repair deletes the commit object of `side`, whose bytes are
+        // bad, and the update then refuses the ref of `side`.
+        let other = f.object(ObjectType::Commit, &f.head);
+        f.replace(ObjectType::Commit, &f.side, &other);
+        let report = f.repair().await.unwrap();
+        assert!(
+            report
+                .deleted_ref_targets
+                .iter()
+                .any(|(commit, _)| *commit == f.side),
+            "{report:#?}"
+        );
+        let err = f.bucket.update_summary(&opts).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::InvalidFormat(m) if m.contains("which the bucket does not hold")),
+            "{err}"
+        );
+        assert_eq!(f.get("summary"), Some(summary));
+        assert!(!f.server.state().objects.contains_key(LOCK));
+        // A push of `side` uploads the commit again, and the update then
+        // succeeds.
+        #[cfg(feature = "push")]
+        {
+            let push = ostrya::RepoPushOptions {
+                refspecs: vec!["side".to_owned()],
+                ..ostrya::RepoPushOptions::default()
+            };
+            f.local
+                .push_to_bucket(endpoint(&f.server.endpoint(), ADDRESS), push)
+                .await
+                .unwrap();
+            f.bucket.update_summary(&opts).await.unwrap();
+            let parsed = ostrya::Summary::parse(&f.get("summary").unwrap()).unwrap();
+            assert_eq!(parsed.lookup("side"), Some(f.side));
+        }
     });
 }
 

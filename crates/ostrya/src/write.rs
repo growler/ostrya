@@ -799,8 +799,9 @@ impl Transaction {
 /// The function stores nothing. The payload must inflate to exactly
 /// `declared` bytes, with no bytes after its DEFLATE end. It must hash to
 /// `expected` under `header`. This is the check of an object whose bytes are
-/// discarded because the repository already holds the object.
-#[cfg(feature = "receive")]
+/// discarded because the repository already holds the object, and of an
+/// object of a bucket repository that the fsck reads.
+#[cfg(any(feature = "receive", feature = "s3"))]
 pub(crate) async fn check_archive_payload<R: AsyncRead + Unpin>(
     expected: &Checksum,
     header: &FileHeader,

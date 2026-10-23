@@ -415,8 +415,13 @@ reachability walk over a bucket repository reads each commit and each
 dirtree with it. A false absent key hides a subtree from the walk, and each
 object of that subtree then reads as unreachable. So in the walk, a 404
 with an empty body, or with a body that is not an S3 `Error` document, for
-example a page of a proxy, is an error. The other readers of a bucket keep
-the rule above.
+example a page of a proxy, is an error. The fsck of a bucket repository
+reads each object with the strict rule too: `Bucket::get_strict` for a
+metadata object and `Bucket::get_stream_strict` for a `.filez` and a
+`.cfs`. A false absent key there gives a false finding, and with the repair
+a marker on a commit whose tree is whole. `get_stream_strict` shares the
+code of `get_stream`, as `get_strict` shares the code of `get`. The other
+readers of a bucket keep the rule above.
 
 A conditional `PUT` (`If-None-Match: *`) gives `PutIfAbsent::Created` only
 when a request of the call got a 2xx. A request whose outcome is not known,
@@ -917,14 +922,20 @@ writes the summary. `RepoPushOptions` has no field for the signers of a
 summary. The summary builder of a bucket repository stays in the crate for
 the explicit update.
 
-The push walks no tree of a commit that the listing of the bucket holds.
-Each writer uploads a commit object after each object of its tree, so a
-commit object in the bucket has its whole tree in the bucket, and the fsck
-checks this rule. A walk of each source commit, as a push over a session
-does, was rejected: a push with no change then reads each dirtree of its
-commits and uploads nothing. The push still adds the composefs image of
-each source commit, because the local repository can make the image after
-the commit went up.
+The push walks no tree of a commit that the listing of the bucket holds,
+unless the commit has a partial-commit marker under `state/`. Each writer
+uploads a commit object after each object of its tree, so a commit object
+in the bucket has its whole tree in the bucket, or a marker that the repair
+of the fsck wrote, and the fsck checks this rule. A walk of each source
+commit, as a push over a session does, was rejected: a push with no change
+then reads each dirtree of its commits and uploads nothing. The push lists
+`state/` only if the listing holds an offered commit, walks the tree of
+each offered commit with a marker, uploads the objects that the listing
+lacks, and deletes the marker after a check of the lock and before the ref
+writes. The commit object of such a commit does not go up again. A tree
+push lists no `state/`: the tree of its parent does not change. The push
+still adds the composefs image of each source commit, because the local
+repository can make the image after the commit went up.
 
 The holder of a lock that `break_lock` deleted is in `BucketPushOutcome`
 and in the result of `BucketRepo::init` on success alone. A push or an
@@ -1005,10 +1016,10 @@ does not exist for a bucket.
 
 `ostrya-cli` turns on the feature `s3` of `ostrya` in its default set, so
 the shipped binary reads and writes bucket repositories. The feature gates
-the S3 options, `--break-lock`, and `remote init`, as the features `push`,
-`serve`, and `send` gate their commands. A build without the feature
-refuses an `s3://` address with the message of the library, which names
-the feature.
+the S3 options, `--break-lock`, `remote init`, and `remote fsck`, as the
+features `push`, `serve`, and `send` gate their commands. A build without
+the feature refuses an `s3://` address with the message of the library,
+which names the feature.
 
 The init of a bucket repository is `ostrya remote init NAME|ADDRESS`, with
 `--collection-id`, `--break-lock`, the S3 options, and
@@ -1083,6 +1094,140 @@ of each request, so a test of `--s3-region` and of `--s3-profile` needs no
 rclone. CI installs `rclone` and sets `OSTRYA_REQUIRE_S3`, and a CI step
 builds `ostrya-cli` without the feature `s3` and runs
 `crates/ostrya-cli/tests/s3_absent.rs`.
+
+## The fsck of a bucket repository
+
+The fsck of a bucket repository is `BucketRepo::fsck` and the command
+`ostrya remote fsck NAME|ADDRESS`. The group `remote` holds the commands
+that act on a remote, and the init of a bucket repository is there. Two
+other commands were rejected: `ostrya fsck` with an `s3://` value of
+`--repo`, which gives `--repo` a second meaning, and most of whose options
+have no meaning for a bucket, and a new group `ostrya bucket`.
+
+The fsck reads and checks each object that a commit reaches, as the local
+fsck does. Its cost is the download of these objects. An option that checks
+the metadata objects alone, and the presence and the size of each content
+object from the listing, was rejected: it does not find a `.filez` whose
+bytes changed.
+
+The repair, `delete`, writes a partial-commit marker
+`state/<checksum>.commitpartial` for each commit that reaches a missing or a
+bad object of a tree, and then deletes each bad object. It deletes no commit
+because of a bad object of its tree. The push walks the tree of an offered
+commit with a marker, uploads the objects that the bucket lacks, and deletes
+the marker, so a push of the ref repairs the commit with no option. The key
+`state/<checksum>.commitpartial` is the path of the marker of a local
+repository, and a copy of the bucket directory opened as a local repository
+sees the commit as partial. These alternatives were rejected:
+
+- No repair of a commit that a ref names. The commit stays broken until a
+  deletion of its ref, which no command of the port makes.
+- A delete of each commit that reaches a bad object, also a commit that a
+  ref names. Each push to the namespace of the ref is then refused, because
+  a ref names a commit that the bucket does not hold, and so is the update
+  of the summary, until a push of the ref.
+- A delete of each such commit that no ref names, and a marker on each ref
+  target. It deletes commits of the history, and the local fsck deletes no
+  commit: it marks each commit that reaches a missing or a deleted
+  object.
+- An option of the push that walks the tree of each offered commit that the
+  bucket holds. It needs a manual step, and each such push reads each
+  dirtree of its commits.
+
+A commit object whose own bytes are bad goes, also when a ref names it. No
+reader can use it: a pull and the build of a summary both check its
+checksum. A push of the ref uploads it again, because the listing does not
+hold it. A commit whose object goes gets no marker. The report names each
+ref of such a commit, because until the push of the ref, each push to its
+namespace is refused. The repair does not check the `.cfs` of such a
+commit, and does not delete it: the digest of bad bytes has no meaning, and
+the local fsck keeps the image of a commit that it deletes as an orphan.
+
+The repair also deletes the marker of each commit whose tree the run finds
+whole, and a run without the repair gives a note for such a marker. The
+push deletes the marker of an offered commit alone, and the offer stops at
+the tip of the ref in the bucket. So with no such delete, the marker of a
+commit of the history stays after a push repaired its tree.
+
+A repair that fails after its first change gives
+`Error::BucketRepairIncomplete`. The error holds the report, with each
+marker and each delete that completed, and states that the repair must run
+again before a push. The marker goes up before the delete of the bad
+objects, so a failure between the two leaves a marker on a commit whose bad
+objects are still in the bucket, and a push of that commit uploads no
+object that the listing holds and deletes the marker. The push does not
+change for this state. Two changes of the push were rejected: an upload of
+each tree object of a marked commit that the local repository holds, and a
+read and a check of each listed tree object of a marked commit before the
+delete of the marker. Each costs each push of a marked commit the upload or
+the download of its whole tree, for a state that only a failed repair
+leaves.
+
+The repair needs a valid `config`. A run with `delete` reads `config` before
+it takes the lock, and an absent or a bad `config` refuses the repair: the
+run then checks the bucket, writes no key, and takes no lock. A wrong
+address thus never loses an object. A push refuses a bucket with no
+`config` in the same way.
+
+The summary of a bucket repository changes only with an explicit update,
+and a push writes none. So a summary that differs from the ref files or the
+deltas is a note, and an absent summary is a note when the run verifies no
+signature. A summary that a pull trusts and that leads the pull to an
+absent object is an error: a summary ref whose commit is absent, a summary
+delta whose superblock is absent or has another digest, a summary that does
+not parse, and a signature that does not verify. A summary that differs is
+an error in no case, because each fsck after a push then fails until an
+update of the summary.
+
+`BucketFsckOptions::summary_keys` takes the summary keys as
+`TrustedKeys`, and `PullTrust::summary_keys` gives the summary keys of a
+remote. `ostrya remote fsck NAME` reads the remote with the commit checks
+off, so it reads no commit keyring. A field of the type `PullTrust` was
+rejected: the fsck verifies no commit, and the type holds the commit keys
+too. The options have no progress field. With `#[non_exhaustive]`, a later
+field is additive.
+
+A finding names the commits that reach its object. The walk keeps no list
+of the files of a dirtree, so when a finding names an object of a tree, a
+second pass reads each dirtree one more time. It gives each dirtree a
+32-bit number, keeps each edge from a dirtree to its parent as two numbers
+in one sorted list, and keeps the dirtrees that hold each bad object. The
+cost is one more `GET` for each dirtree, and only with such a finding. A
+list of parents for each dirtree in a map was rejected: it costs one heap
+allocation for each dirtree.
+
+The summary of a bucket gives the delta map that a pull reads. With a
+summary in the bucket, a delta map of the bucket that the run cannot build
+is a `summary` error: a superblock key whose directory names do not decode
+as a delta, or a superblock larger than its cap. The summary builder fails
+on the same keys. The run reads the superblocks of the deltas that the
+summary advertises alone, and takes the names of the other deltas from the
+list of `deltas/`.
+
+A run without the repair takes no lock, and the listing of the 256 fan-out
+prefixes is no snapshot, so a push or a prune during the run can give a
+false `missing` finding. Before the run records a `missing` finding for an
+object that the listing does not hold, it reads the object again. An object
+that the bucket holds now gives a note. Else the run reads each commit of
+the finding again, and a finding whose commits are all gone is dropped. The
+read opens the object as a stream and takes none of its body: the bucket
+client has no `HEAD`, and the key rule refuses a list with the key as its
+prefix.
+
+The hash and the parse of a metadata object larger than 1 MiB, and the
+parse of a summary, run on the blocking pool, as the parse of a commit and
+of a summary of a pull does. The reads of the other slots go on in the
+meantime.
+
+A body of a `.filez` or a `.cfs` that fails in transit is read again once
+from its start, and a second failure fails the run. A failure of the run on
+the first failure was rejected: the fsck reads the whole bucket, and one
+failed connection then stops the run.
+
+`ostrya remote fsck` prints the counts and the result line on standard
+output, and one line for each finding on standard error, as `ostrya fsck`
+does. A note starts with `note: `. A report with an error exits 1, and a
+report with notes alone exits 0.
 
 ## The client access of `ostrya serve`
 
@@ -1160,14 +1305,18 @@ when the port owns its set of members and expects the set to grow.
   `ostrya_remote::Error::S3Region`. The bucket client builds them, and the
   set of fields grows with the S3 support. A caller builds an `S3Endpoint`
   with `S3Endpoint::new` and sets its fields.
-- `ostrya::bucket::LockOperation`, `LockHolder`, `ObjectListing`, and
-  `BucketPushOutcome` have the attribute. The port builds them, and a later
-  version can add an operation or a field.
-- No option struct of the `ostrya` crate has the attribute: `PruneOptions`,
-  `PullOptions`, `TarExportOptions`, `TarImportOptions` and the others. The
-  attribute stops a struct expression outside the defining crate,
-  `..Default::default()` included. Thus a new field in one of these option
-  structs is a breaking change, and it takes a minor version before 1.0.
+- `ostrya::bucket::LockOperation`, `LockHolder`, `ObjectListing`,
+  `BucketPushOutcome`, `BucketFsckReport`, `BucketFinding`, and
+  `BucketFindingKind` have the attribute. The port builds them, and a later
+  version can add an operation, a field, or a kind of finding.
+- The option structs of the `ostrya` crate do not have the attribute:
+  `PruneOptions`, `PullOptions`, `TarExportOptions`, `TarImportOptions` and
+  the others. The attribute stops a struct expression outside the defining
+  crate, `..Default::default()` included. Thus a new field in one of these
+  option structs is a breaking change, and it takes a minor version before
+  1.0. The option structs of the bucket writers, `BucketWriteOptions` and
+  `BucketFsckOptions`, have the attribute. A caller starts from
+  `Default::default()` and sets the fields, so a later field is additive.
 - `ostrya_server::ServeOptions` and `ostrya_mount::MountOptions` have the
   attribute. A caller starts from `Default::default()` and sets the fields.
 - `ostrya_gvariant::Type` and `ostrya_gvariant::Value` do not have the

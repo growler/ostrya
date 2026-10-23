@@ -12,7 +12,7 @@ use crate::error::{Error, Result};
 use crate::remote::s3::{DeleteIfMatch, PutIfAbsent};
 
 /// The key of the lock, relative to the prefix of the repository.
-const LOCK_KEY: &str = "extensions/ostrya/lock";
+pub(super) const LOCK_KEY: &str = "extensions/ostrya/lock";
 
 /// The group of the lock body.
 const GROUP: &str = "lock";

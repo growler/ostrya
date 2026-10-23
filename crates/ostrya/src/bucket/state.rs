@@ -1,7 +1,7 @@
 //! The state of a bucket repository that a writer reads: the `config`, the
 //! refs, and the presence of a summary signature.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use ostrya_core::{Checksum, RepoMode, is_collection_id, is_ref_name};
 
@@ -10,11 +10,17 @@ use crate::config::RepoConfig;
 use crate::error::{Error, Result};
 use crate::pull::drive::Slots;
 use crate::refs::MAX_COLLECTION_ID_LEN;
+use crate::remote::s3::Object;
 use crate::repo::MAX_CONFIG_SIZE;
 use crate::summary::SUMMARY_READ_CAP;
 
 /// The size of a ref file: 64 hex digits and a newline.
 const REF_FILE_SIZE: u64 = 65;
+
+/// The one byte of a partial-commit marker, as the `ostree` command writes
+/// it into a `.commitpartial` marker when its fsck finds a commit incomplete
+/// (observed).
+pub(super) const PARTIAL_STATE_BYTE: u8 = 0x66;
 
 /// The refs of a bucket repository.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -25,8 +31,19 @@ pub(crate) struct BucketRefs {
     pub(crate) mirrors: BTreeMap<String, BTreeMap<String, Checksum>>,
 }
 
+/// The result of the read of one ref file.
+pub(super) enum RefRead {
+    /// The file names the commit.
+    Commit(Checksum),
+    /// The key held no object at the read.
+    Gone,
+    /// The file breaks the rule of a ref file. The text states the rule,
+    /// after the subject "the ref file".
+    Malformed(String),
+}
+
 /// One ref key of a bucket repository.
-enum RefKey<'a> {
+pub(super) enum RefKey<'a> {
     /// `refs/heads/NAME`.
     Head(&'a str),
     /// `refs/mirrors/ID/NAME`.
@@ -50,7 +67,30 @@ impl BucketRepo {
     /// - [`Error::Remote`] for an error of the bucket client.
     #[cfg_attr(not(feature = "push"), allow(dead_code))]
     pub(crate) async fn read_config(&self) -> Result<Option<RepoConfig>> {
-        let object = match self.bucket.get("config", MAX_CONFIG_SIZE).await {
+        let read = self.bucket.get("config", MAX_CONFIG_SIZE).await;
+        self.check_config(read)
+    }
+
+    /// Reads the `config` of the repository as
+    /// [`read_config`](BucketRepo::read_config) does, by the strict rule of
+    /// an absent key of [`Bucket::get_strict`](crate::remote::s3::Bucket::get_strict).
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`read_config`](BucketRepo::read_config). A 404 that is
+    /// not an absent key gives [`Error::Remote`].
+    pub(super) async fn read_config_strict(&self) -> Result<Option<RepoConfig>> {
+        let read = self.bucket.get_strict("config", MAX_CONFIG_SIZE).await;
+        self.check_config(read)
+    }
+
+    /// Returns the `config` of the read `read`, after the checks of
+    /// [`read_config`](BucketRepo::read_config).
+    fn check_config(
+        &self,
+        read: std::result::Result<Option<Object>, crate::remote::Error>,
+    ) -> Result<Option<RepoConfig>> {
+        let object = match read {
             Ok(Some(object)) => object,
             Ok(None) => return Ok(None),
             Err(crate::remote::Error::LimitExceeded(_)) => {
@@ -229,37 +269,68 @@ impl BucketRepo {
             while reads.has_room()
                 && let Some(key) = pending.next()
             {
-                let bucket = &self.bucket;
-                reads.push(async move { (key, bucket.get(key, REF_FILE_SIZE).await) });
+                reads.push(async move { (key, self.read_ref_file(key).await) });
             }
             let Some((key, read)) = reads.next_ready().await else {
                 break;
             };
-            let bytes = match read {
-                Ok(Some(object)) => object.bytes,
-                Ok(None) => {
+            match read? {
+                RefRead::Commit(commit) => out.push((key, commit)),
+                RefRead::Gone => {
                     return Err(self.malformed(format!(
                         "the ref file '{}' was in the listing and is gone",
                         key.escape_debug()
                     )));
                 }
-                Err(crate::remote::Error::LimitExceeded(_)) => {
-                    return Err(self.malformed(format!(
-                        "the ref file '{}' is larger than {REF_FILE_SIZE} bytes",
-                        key.escape_debug()
-                    )));
+                RefRead::Malformed(why) => {
+                    return Err(
+                        self.malformed(format!("the ref file '{}' {why}", key.escape_debug()))
+                    );
                 }
-                Err(e) => return Err(e.into()),
-            };
-            let commit = parse_ref_file(&bytes).ok_or_else(|| {
-                self.malformed(format!(
-                    "the ref file '{}' does not hold 64 lowercase hex digits and a newline",
-                    key.escape_debug()
-                ))
-            })?;
-            out.push((key, commit));
+            }
         }
         Ok(out)
+    }
+
+    /// Reads the ref file at `key`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Remote`] for an error of the bucket client.
+    async fn read_ref_file(&self, key: &str) -> Result<RefRead> {
+        ref_read(self.bucket.get(key, REF_FILE_SIZE).await)
+    }
+
+    /// Reads the ref file at `key`, by the strict rule of an absent key of
+    /// [`Bucket::get_strict`](crate::remote::s3::Bucket::get_strict).
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Remote`] for an error of the bucket client, also for a 404
+    /// that is not an absent key.
+    pub(super) async fn read_ref_file_strict(&self, key: &str) -> Result<RefRead> {
+        ref_read(self.bucket.get_strict(key, REF_FILE_SIZE).await)
+    }
+
+    /// Returns each commit that has a partial-commit marker: one list of
+    /// `state/`.
+    ///
+    /// A marker is the key `state/<checksum>.commitpartial`, in lowercase
+    /// hex. It marks a commit whose tree misses objects. Each other key under
+    /// `state/` is ignored.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Remote`] for an error of the bucket client.
+    pub(crate) async fn partial_commits(&self) -> Result<BTreeSet<Checksum>> {
+        Ok(self
+            .bucket
+            .list("state/")
+            .await?
+            .objects
+            .iter()
+            .filter_map(|listed| marker_commit(&listed.key))
+            .collect())
     }
 
     /// Returns `true` if the key `summary.sig` holds an object.
@@ -297,12 +368,47 @@ pub(crate) fn is_namespace_id(id: &str) -> bool {
 
 /// Returns the ref that the key `key` names, or `None` for a key that is no
 /// ref key.
-fn ref_key(key: &str) -> Option<RefKey<'_>> {
+pub(super) fn ref_key(key: &str) -> Option<RefKey<'_>> {
     if let Some(name) = key.strip_prefix("refs/heads/") {
         return is_ref_name(name).then_some(RefKey::Head(name));
     }
     let (id, name) = key.strip_prefix("refs/mirrors/")?.split_once('/')?;
     (is_namespace_id(id) && is_ref_name(name)).then_some(RefKey::Mirror(id, name))
+}
+
+/// Returns the key of the partial-commit marker of `commit`.
+pub(crate) fn marker_key(commit: &Checksum) -> String {
+    format!("state/{}.commitpartial", commit.to_hex())
+}
+
+/// Returns the commit of the partial-commit marker `key`, or `None` for a key
+/// of another form.
+fn marker_commit(key: &str) -> Option<Checksum> {
+    let hex = key.strip_prefix("state/")?.strip_suffix(".commitpartial")?;
+    if hex.len() != 64 || !hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return None;
+    }
+    Checksum::from_hex(hex).ok()
+}
+
+/// Returns the result of the read `read` of a ref file.
+fn ref_read(read: std::result::Result<Option<Object>, crate::remote::Error>) -> Result<RefRead> {
+    let bytes = match read {
+        Ok(Some(object)) => object.bytes,
+        Ok(None) => return Ok(RefRead::Gone),
+        Err(crate::remote::Error::LimitExceeded(_)) => {
+            return Ok(RefRead::Malformed(format!(
+                "is larger than {REF_FILE_SIZE} bytes"
+            )));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    Ok(match parse_ref_file(&bytes) {
+        Some(commit) => RefRead::Commit(commit),
+        None => {
+            RefRead::Malformed("does not hold 64 lowercase hex digits and a newline".to_owned())
+        }
+    })
 }
 
 /// Returns the commit of the ref file `bytes`: 64 lowercase hex digits and a
@@ -397,6 +503,23 @@ mod tests {
             String::new(),
         ] {
             assert_eq!(parse_ref_file(body.as_bytes()), None, "{body:?}");
+        }
+    }
+
+    #[test]
+    fn a_marker_key_names_one_commit_in_lowercase_hex() {
+        let commit = Checksum::from_bytes([0xab; 32]);
+        let key = marker_key(&commit);
+        assert_eq!(key, format!("state/{}.commitpartial", "ab".repeat(32)));
+        assert_eq!(marker_commit(&key), Some(commit));
+        for key in [
+            format!("state/{}.commitpartial", "AB".repeat(32)),
+            format!("state/{}.commitpartial", "a".repeat(63)),
+            format!("state/{}.commit", "ab".repeat(32)),
+            format!("state/x/{}.commitpartial", "ab".repeat(32)),
+            "state/other".to_owned(),
+        ] {
+            assert_eq!(marker_commit(&key), None, "{key}");
         }
     }
 

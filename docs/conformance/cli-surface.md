@@ -4035,8 +4035,8 @@ the tool, in `show`, in a `pull` that verifies, and in the keyring reads of
 
 The tool has no push, no pull over ssh, no server, no composefs image
 object, and no bucket repository. `receive`, `push`, `push-tree`, `serve`,
-`send`, `composefs-image`, and `remote init` are commands of the port
-alone, so no matrix cell compares them with the tool. `pull`, `remote
+`send`, `composefs-image`, `remote init`, and `remote fsck` are commands of
+the port alone, so no matrix cell compares them with the tool. `pull`, `remote
 refs`, and `remote summary` also read a remote over ssh, for an ssh address
 in the `pull-url` key or in `--url` of `pull` (`pull`), and a bucket
 repository in an S3 bucket, for an `s3://` address in the same places
@@ -4340,19 +4340,22 @@ ostrya push [--repo=PATH] REMOTE REF --onto=BRANCH
 ostrya remote init [--repo=PATH] NAME|s3://BUCKET[/PREFIX]
                    [--collection-id=ID] [--zlib-level=LEVEL] [--break-lock]
                    [the S3 options] [--allow-cleartext-credentials]
+ostrya remote fsck [--repo=PATH] NAME|s3://BUCKET[/PREFIX]
+                   [--delete [--break-lock]] [-q|--quiet]
+                   [the S3 options] [--allow-cleartext-credentials]
 ```
 
 A bucket repository is a repository in `archive` form in an S3 bucket, at
 the address `s3://BUCKET[/PREFIX]` (`../format-reference.md`, "The S3
 bucket repository"). The tool has no such repository, so no matrix cell
 compares these commands with the tool. The `s3` feature of `ostrya-cli`
-builds the S3 options, `--break-lock`, and `remote init`. It is in the
-default set.
+builds the S3 options, `--break-lock`, `remote init`, and `remote fsck`. It
+is in the default set.
 
 The S3 options are `--s3-region=REGION`, `--s3-endpoint=URL`,
 `--s3-addressing=path|virtual`, and `--s3-profile=PROFILE`. `push`,
-`push-tree`, `pull`, `remote refs`, `remote summary`, and `remote init`
-take them. Each one wins
+`push-tree`, `pull`, `remote refs`, `remote summary`, `remote init`, and
+`remote fsck` take them. Each one wins
 over the remote key of the same name, then the environment, then the
 profile in the shared AWS config file, then the default
 (`ostrya-config(1)`, "REMOTE KEYS"). A profile that `--s3-profile` or
@@ -4378,6 +4381,38 @@ allow-cleartext-credentials`.
   collection id that fails the collection-id rule before any request, and
   a bucket repository that holds a `config`, which stays as it is. It
   writes nothing to standard output.
+- `remote fsck` checks a bucket repository (`../format-reference.md`, "The
+  fsck of a bucket repository"). It takes the address of its operand as
+  `remote init` does, with no repository for an address. Unless `-q` is
+  given, it first writes `Listed N objects`, `Checked C commits and O
+  objects, B bytes`, and `N objects not reached by a commit` to standard
+  output, then `N composefs images with no commit` and `N partial commits`
+  when the count is not zero. It writes one line for each finding to
+  standard error, sorted by key and then by kind: `KIND KEY: DETAIL`, then
+  `; in commits C1, C2` when the finding names commits. A note starts with
+  `note: `. A report with an error ends with `error: Bucket repository
+  corruption encountered` and exit status 1. Else the command writes `fsck
+  of the bucket repository ADDRESS: no errors found` and exits 0. Notes
+  alone give exit status 0. A failed write to standard output, for example
+  on a full device, gives `error: i/o error: ...` and exit status 1. With
+  a remote name, the command verifies the signature of the summary with
+  the summary keys of the remote, `gpg-verify-summary` and
+  `sign-verify-summary`. With an address, it verifies no signature, and no
+  option changes this.
+- `remote fsck --delete` takes the writer lock, writes the marker
+  `state/<checksum>.commitpartial` of each commit that reaches a missing or
+  a bad object of a tree, deletes the marker of each commit whose tree is
+  whole, and deletes each bad object. It writes `Marking commit as partial:
+  COMMIT (REF, ...)`, `Deleted the partial-commit marker of commit COMMIT`,
+  `Deleted KEY`, and `Deleted the commit object of a ref: COMMIT (REF,
+  ...)` lines to standard output. A bucket repository with no valid
+  `config` refuses the repair: the run writes a `config` line and changes
+  nothing. The option parser refuses `--break-lock` without `--delete`. A
+  push of a ref whose commit has a marker uploads the missing objects and
+  removes the marker. A repair that fails after its first change writes
+  the report with the changes that completed, then `error: the repair of
+  the bucket repository ADDRESS is incomplete: REASON; run the fsck with
+  delete again before a push`, and exits 1.
 - `push` to an `s3://` address, or to a remote whose push address is one,
   writes the objects that the bucket does not hold, then the ref files,
   under the writer lock of the bucket repository. It writes no summary,
@@ -4398,8 +4433,9 @@ allow-cleartext-credentials`.
 - `push-tree` to an `s3://` address, or to a remote whose push address is
   one, makes the commit on the client and writes it to the bucket
   repository (`push-tree`).
-- `--break-lock` of `push`, `push-tree`, and `remote init` removes the
-  writer lock of another writer, then takes a new lock. After a command
+- `--break-lock` of `push`, `push-tree`, `remote init`, and `remote fsck
+  --delete` removes the writer lock of another writer, then takes a new
+  lock. After a command
   that succeeds, the holder of the removed lock goes to standard error in
   one line: `warning: removed the writer lock of HOLDER`. Without the
   option, a locked bucket repository refuses the command with `error: the
@@ -4452,7 +4488,8 @@ allow-cleartext-credentials`.
   bucket and walks the commits. The bar starts with the uploads.
 - A build without the feature `s3` has no S3 option, no `--break-lock`, no
   `--allow-cleartext-credentials` on `pull`, `remote refs`, and `remote
-  summary`, and no `remote init`. It refuses an `s3://` address with
+  summary`, and no `remote init` and `remote fsck`. It refuses an `s3://`
+  address with
   `error: unsupported: the pull address 'ADDRESS' is an s3:// address, and
   this build of ostrya has no S3 support: turn on the feature s3 of
   ostrya`, and with the same text for a push address.

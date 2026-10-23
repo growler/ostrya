@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 
 //! `ostrya` with a bucket repository at an `s3://` address: `remote init`,
-//! `push`, `push-tree`, `pull`, `remote refs`, `remote summary`, and
-//! `remote add`.
+//! `push`, `push-tree`, `pull`, `remote refs`, `remote summary`, `remote
+//! fsck`, and `remote add`.
 //!
 //! Most tests run against the S3 stand-in of
 //! `crates/ostrya/tests/common/s3.rs`, which holds its objects in memory,
@@ -107,6 +107,12 @@ impl Scratch {
     /// scratch directory, which is no repository. Each pair of `env` sets a
     /// variable, or removes it with `None`.
     fn run_with(&self, args: &[&str], env: &[(&str, Option<&str>)]) -> Output {
+        self.command(args, env).output().unwrap()
+    }
+
+    /// Returns the command of [`run_with`](Scratch::run_with), which a test
+    /// can change before it runs.
+    fn command(&self, args: &[&str], env: &[(&str, Option<&str>)]) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_ostrya"));
         command
             .args(args)
@@ -130,7 +136,7 @@ impl Scratch {
                 None => command.env_remove(name),
             };
         }
-        command.output().unwrap()
+        command
     }
 
     /// Runs `ostrya` with `args`, as [`run_with`](Scratch::run_with) does with
@@ -1341,6 +1347,348 @@ fn a_pull_of_a_collection_gives_the_refusal_of_the_resolver_with_the_switch() {
 }
 
 // ---------------------------------------------------------------------------
+// remote fsck
+// ---------------------------------------------------------------------------
+
+/// The secret key of the ed25519 signer of the summary.
+const SECRET_B64: &str =
+    "o74ME/dmhvDeYf64dDJQY8kX2piK0M/nyIRWVi30i6DCOzRsHVcvgYToz6zOb5OvK/v8nH6KfLR3dfdsn6ZSyQ==";
+/// The public key of [`SECRET_B64`].
+const PUBLIC_B64: &str = "wjs0bB1XL4GE6M+szm+Tryv7/Jx+iny0d3X3bJ+mUsk=";
+/// A public key of no signer of the tests.
+const OTHER_PUBLIC_B64: &str = "5WYA48XDLt1Tw6UD6mF5sMzJRCXqpaUjPPrO2C37pto=";
+
+/// Makes a local repository `local` with the ref `main`, writes its summary,
+/// and copies its objects, its ref files, and its summary into the bucket
+/// repository at [`ADDRESS`] of `server`, with the config [`PLAIN`].
+/// Returns the `--repo` option of the local repository and the commit.
+fn fsck_fixture(scratch: &Scratch, server: &StandIn, summary: &[&str]) -> (String, String) {
+    let repo = scratch.repo("local");
+    let tip = scratch.commit(&repo, "main", "one");
+    let mut args = vec![repo.as_str(), "summary", "-u"];
+    args.extend_from_slice(summary);
+    scratch.ok(&args);
+    let local = scratch.path().join("local");
+    for sub in ["objects", "refs"] {
+        let dir = local.join(sub);
+        let mut pending = vec![dir.clone()];
+        while let Some(at) = pending.pop() {
+            for entry in std::fs::read_dir(&at).unwrap() {
+                let path = entry.unwrap().path();
+                if path.is_dir() {
+                    pending.push(path);
+                } else {
+                    let key = path.strip_prefix(&local).unwrap().to_str().unwrap();
+                    let bytes = std::fs::read(&path).unwrap();
+                    server.state().store(&format!("repo/{key}"), &bytes);
+                }
+            }
+        }
+    }
+    for file in ["summary", "summary.sig"] {
+        if let Ok(bytes) = std::fs::read(local.join(file)) {
+            server.state().store(&format!("repo/{file}"), &bytes);
+        }
+    }
+    server.state().store(CONFIG, PLAIN.as_bytes());
+    (repo, tip)
+}
+
+/// Returns the key of each `.filez` object of `server`, sorted.
+fn filez_keys(server: &StandIn) -> Vec<String> {
+    server
+        .state()
+        .objects
+        .keys()
+        .filter(|key| key.ends_with(".filez"))
+        .cloned()
+        .collect()
+}
+
+#[test]
+fn remote_fsck_of_a_clean_bucket_prints_the_counts_and_exits_0() {
+    let scratch = Scratch::new("fsck-clean");
+    let server = StandIn::start();
+    fsck_fixture(&scratch, &server, &[]);
+    let endpoint = endpoint_of(&server);
+    let objects = server
+        .state()
+        .objects
+        .keys()
+        .filter(|key| key.starts_with("repo/objects/"))
+        .count();
+    let out = scratch.run(&["remote", "fsck", ADDRESS, &endpoint, CLEARTEXT]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(stderr(&out), "");
+    let lines: Vec<String> = stdout(&out).lines().map(str::to_owned).collect();
+    assert_eq!(lines.len(), 4, "{lines:?}");
+    assert_eq!(lines[0], format!("Listed {objects} objects"));
+    assert!(
+        lines[1].starts_with(&format!("Checked 1 commits and {} objects, ", objects - 1)),
+        "{}",
+        lines[1]
+    );
+    assert_eq!(lines[2], "0 objects not reached by a commit");
+    assert_eq!(
+        lines[3],
+        format!("fsck of the bucket repository {ADDRESS}: no errors found")
+    );
+    assert_eq!(
+        scratch.ok(&["remote", "fsck", "-q", ADDRESS, &endpoint, CLEARTEXT]),
+        format!("fsck of the bucket repository {ADDRESS}: no errors found\n")
+    );
+    // A run with no --delete writes nothing.
+    assert!(
+        server
+            .state()
+            .requests
+            .iter()
+            .all(|(method, _)| method == "GET")
+    );
+}
+
+#[test]
+fn remote_fsck_of_a_corrupt_bucket_prints_each_finding_and_exits_1() {
+    let scratch = Scratch::new("fsck-corrupt");
+    let server = StandIn::start();
+    let (_, tip) = fsck_fixture(&scratch, &server, &[]);
+    let gone = filez_keys(&server)[0].clone();
+    server.state().objects.remove(&gone);
+    server.state().store(LOCK, DEAD_LOCK.as_bytes());
+    let endpoint = endpoint_of(&server);
+    let out = scratch.run(&["remote", "fsck", "-q", ADDRESS, &endpoint, CLEARTEXT]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(stdout(&out), "");
+    let key = gone.strip_prefix("repo/").unwrap();
+    assert_eq!(
+        stderr(&out),
+        format!(
+            "note: lock extensions/ostrya/lock: a writer held the lock at the start of the run: \
+             operation push, host deadhost, pid 99, started at 1700000000 seconds since the \
+             epoch, UTC, id {}\n\
+             missing {key}: the listing does not hold the object; in commits {tip}\n\
+             error: Bucket repository corruption encountered\n",
+            "9".repeat(64)
+        )
+    );
+}
+
+#[test]
+fn remote_fsck_reports_a_stale_summary_as_a_note() {
+    let scratch = Scratch::new("fsck-stale");
+    let server = StandIn::start();
+    let (_, tip) = fsck_fixture(&scratch, &server, &[]);
+    server
+        .state()
+        .store("repo/refs/heads/other", format!("{tip}\n").as_bytes());
+    let endpoint = endpoint_of(&server);
+    let out = scratch.run(&["remote", "fsck", "-q", ADDRESS, &endpoint, CLEARTEXT]);
+    assert!(out.status.success(), "{}", stderr(&out));
+    assert_eq!(
+        stderr(&out),
+        "note: summary summary: the summary is older than the refs or the deltas: 1 ref(s) \
+         differ from the ref files: refs/heads/other\n"
+    );
+}
+
+#[test]
+fn remote_fsck_with_delete_marks_the_commit_and_deletes_the_bad_object() {
+    let scratch = Scratch::new("fsck-delete");
+    let server = StandIn::start();
+    let (_, tip) = fsck_fixture(&scratch, &server, &[]);
+    let keys = filez_keys(&server);
+    let other = object(&server, &keys[1]).unwrap();
+    server.state().store(&keys[0], &other);
+    server.state().store(LOCK, DEAD_LOCK.as_bytes());
+    let endpoint = endpoint_of(&server);
+    let message = scratch.fails(&["remote", "fsck", "--delete", ADDRESS, &endpoint, CLEARTEXT]);
+    assert!(message.contains("is locked"), "{message}");
+    let out = scratch.run(&[
+        "remote",
+        "fsck",
+        "-q",
+        "--delete",
+        "--break-lock",
+        ADDRESS,
+        &endpoint,
+        CLEARTEXT,
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    let key = keys[0].strip_prefix("repo/").unwrap();
+    assert_eq!(
+        stdout(&out),
+        format!("Marking commit as partial: {tip} (refs/heads/main)\nDeleted {key}\n")
+    );
+    let err = stderr(&out);
+    assert!(err.starts_with(&format!("mismatch {key}: ")), "{err}");
+    assert!(err.contains(&format!("\n{DEAD_LOCK_LINE}\n")), "{err}");
+    assert!(
+        err.ends_with("error: Bucket repository corruption encountered\n"),
+        "{err}"
+    );
+    assert!(object(&server, &keys[0]).is_none());
+    assert_eq!(
+        object(&server, &format!("repo/state/{tip}.commitpartial")).unwrap(),
+        [0x66]
+    );
+    assert!(object(&server, LOCK).is_none());
+    // The option parser refuses --break-lock without --delete.
+    server.state().requests.clear();
+    let message = scratch.fails(&[
+        "remote",
+        "fsck",
+        "--break-lock",
+        ADDRESS,
+        &endpoint,
+        CLEARTEXT,
+    ]);
+    assert!(message.contains("--delete"), "{message}");
+    assert!(server.state().requests.is_empty());
+}
+
+#[test]
+fn remote_fsck_with_delete_prints_the_changes_of_a_repair_that_fails() {
+    let scratch = Scratch::new("fsck-incomplete");
+    let server = StandIn::start();
+    let (_, tip) = fsck_fixture(&scratch, &server, &[]);
+    let keys = filez_keys(&server);
+    let other = object(&server, &keys[1]).unwrap();
+    server.state().store(&keys[0], &other);
+    server.state().refuse = Some(("DELETE", keys[0].clone()));
+    let endpoint = endpoint_of(&server);
+    let out = scratch.run(&[
+        "remote", "fsck", "-q", "--delete", ADDRESS, &endpoint, CLEARTEXT,
+    ]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        stdout(&out),
+        format!("Marking commit as partial: {tip} (refs/heads/main)\n")
+    );
+    let err = stderr(&out);
+    let key = keys[0].strip_prefix("repo/").unwrap();
+    assert!(err.starts_with(&format!("mismatch {key}: ")), "{err}");
+    let last = err.lines().last().unwrap();
+    assert!(
+        last.starts_with(&format!(
+            "error: the repair of the bucket repository {ADDRESS} is incomplete: "
+        )) && last.ends_with("; run the fsck with delete again before a push"),
+        "{err}"
+    );
+    assert!(!err.contains("corruption encountered"), "{err}");
+    assert!(object(&server, &keys[0]).is_some());
+}
+
+#[test]
+fn remote_fsck_with_delete_names_the_ref_of_a_deleted_commit_and_clears_a_marker() {
+    let scratch = Scratch::new("fsck-refs");
+    let server = StandIn::start();
+    let (repo, tip) = fsck_fixture(&scratch, &server, &[]);
+    let second = scratch.commit(&repo, "side", "two");
+    let local = scratch.path().join("local");
+    let commit_key = |commit: &str| format!("objects/{}/{}.commit", &commit[..2], &commit[2..]);
+    for key in [commit_key(&second), "refs/heads/side".to_owned()] {
+        let bytes = std::fs::read(local.join(&key)).unwrap();
+        server.state().store(&format!("repo/{key}"), &bytes);
+    }
+    // The bytes of `side` are the bytes of `main`, and `main` has a marker
+    // of a whole tree.
+    let main = object(&server, &format!("repo/{}", commit_key(&tip))).unwrap();
+    server
+        .state()
+        .store(&format!("repo/{}", commit_key(&second)), &main);
+    server
+        .state()
+        .store(&format!("repo/state/{tip}.commitpartial"), &[0x66]);
+    let endpoint = endpoint_of(&server);
+    let out = scratch.run(&[
+        "remote", "fsck", "-q", "--delete", ADDRESS, &endpoint, CLEARTEXT,
+    ]);
+    assert_eq!(out.status.code(), Some(1), "{}", stderr(&out));
+    assert_eq!(
+        stdout(&out),
+        format!(
+            "Deleted the partial-commit marker of commit {tip}\n\
+             Deleted {}\n\
+             Deleted the commit object of a ref: {second} (refs/heads/side)\n",
+            commit_key(&second)
+        )
+    );
+    assert!(object(&server, &format!("repo/state/{tip}.commitpartial")).is_none());
+    // The next run reports the ref.
+    let out = scratch.run(&["remote", "fsck", "-q", ADDRESS, &endpoint, CLEARTEXT]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr(&out).starts_with(&format!(
+            "ref refs/heads/side: names the commit {second}, which the bucket does not hold\n"
+        )),
+        "{}",
+        stderr(&out)
+    );
+}
+
+/// A count line that standard output cannot take, here on `/dev/full`,
+/// gives the error line and exit 1.
+#[cfg(target_os = "linux")]
+#[test]
+fn remote_fsck_with_a_failed_write_of_the_counts_exits_one() {
+    let scratch = Scratch::new("fsck-dev-full");
+    let server = StandIn::start();
+    fsck_fixture(&scratch, &server, &[]);
+    let endpoint = endpoint_of(&server);
+    let out = scratch
+        .command(&["remote", "fsck", ADDRESS, &endpoint, CLEARTEXT], &[])
+        .stdout(std::fs::File::create("/dev/full").unwrap())
+        .stderr(Stdio::piped())
+        .output()
+        .unwrap();
+    let err = stderr(&out);
+    assert_eq!(out.status.code(), Some(1), "{err}");
+    assert!(err.starts_with("error: "), "{err}");
+    assert!(err.contains("os error 28"), "{err}");
+}
+
+#[test]
+fn remote_fsck_of_a_remote_takes_its_address_and_its_summary_keys() {
+    let scratch = Scratch::new("fsck-remote");
+    let server = StandIn::start();
+    let (repo, _) = fsck_fixture(&scratch, &server, &[&format!("--sign={SECRET_B64}")]);
+    assert!(object(&server, "repo/summary.sig").is_some());
+    scratch.append_config(
+        &repo,
+        &format!(
+            "\n[remote \"good\"]\npull-url=s3://bkt/other\npush-url={ADDRESS}\n\
+             s3-endpoint={0}\nsign-verify-summary=true\nverification-ed25519-key={PUBLIC_B64}\n\
+             \n[remote \"wrong\"]\npull-url={ADDRESS}\ns3-endpoint={0}\n\
+             sign-verify-summary=true\nverification-ed25519-key={OTHER_PUBLIC_B64}\n\
+             \n[remote \"http\"]\nurl=https://ex.com/r\n",
+            server.endpoint()
+        ),
+    );
+    let out = scratch.ok(&[&repo, "remote", "fsck", "-q", "good", CLEARTEXT]);
+    assert_eq!(
+        out,
+        format!("fsck of the bucket repository {ADDRESS}: no errors found\n")
+    );
+    let out = scratch.run(&[&repo, "remote", "fsck", "-q", "wrong", CLEARTEXT]);
+    assert_eq!(out.status.code(), Some(1));
+    assert!(
+        stderr(&out).starts_with("summary summary.sig: "),
+        "{}",
+        stderr(&out)
+    );
+    // The same bucket at its address verifies no signature.
+    let endpoint = endpoint_of(&server);
+    scratch.ok(&["remote", "fsck", ADDRESS, &endpoint, CLEARTEXT]);
+    let message = scratch.fails(&[&repo, "remote", "fsck", "http", CLEARTEXT]);
+    assert_eq!(
+        message,
+        "error: invalid input: remote 'http' holds no s3:// address in push-url or pull-url\n"
+    );
+    let message = scratch.fails(&["remote", "fsck", "https://ex.com/r"]);
+    assert!(message.starts_with("error: "), "{message}");
+}
+
+// ---------------------------------------------------------------------------
 // remote refs, remote summary, remote add
 // ---------------------------------------------------------------------------
 
@@ -1438,10 +1786,11 @@ fn copy_tree(from: &Path, to: &Path) {
     assert!(status.success(), "cp -r {}", from.display());
 }
 
-/// `remote refs`, `remote summary`, and `pull` read a copy of the `archive`
-/// fixture through `rclone serve s3`, which checks each signature. A wrong
-/// secret gives `SignatureDoesNotMatch`, and `remote init` and `push` are
-/// refused, because the server does not honor `If-None-Match`.
+/// `remote refs`, `remote summary`, `remote fsck`, and `pull` read a copy of
+/// the `archive` fixture through `rclone serve s3`, which checks each
+/// signature. A wrong secret gives `SignatureDoesNotMatch`, and `remote
+/// init`, `remote fsck --delete`, and `push` are refused, because the server
+/// does not honor `If-None-Match`.
 #[test]
 fn rclone_serves_a_bucket_to_each_reader_and_refuses_each_writer() {
     if !rclone_available("rclone_serves_a_bucket_to_each_reader_and_refuses_each_writer") {
@@ -1490,6 +1839,16 @@ fn rclone_serves_a_bucket_to_each_reader_and_refuses_each_writer() {
         stderr(&out).contains("SignatureDoesNotMatch"),
         "{}",
         stderr(&out)
+    );
+    let fsck = scratch.ok(&[&dest, "remote", "fsck", "-q", "r", CLEARTEXT]);
+    assert_eq!(
+        fsck,
+        format!("fsck of the bucket repository {ADDRESS}: no errors found\n")
+    );
+    let message = scratch.fails(&[&dest, "remote", "fsck", "--delete", "r", CLEARTEXT]);
+    assert!(
+        message.contains("does not honor If-None-Match"),
+        "{message}"
     );
     let endpoint = format!("--s3-endpoint={}", server.endpoint());
     let message = scratch.fails(&["remote", "init", "s3://bkt/fresh", &endpoint, CLEARTEXT]);

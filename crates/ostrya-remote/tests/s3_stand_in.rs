@@ -505,6 +505,40 @@ fn a_strict_read_takes_no_such_key_alone_as_absent() {
 }
 
 #[test]
+fn a_strict_stream_takes_no_such_key_alone_as_absent() {
+    block_on(async {
+        let stand_in = StandIn::start(Arc::new(|seen: &Seen, _| {
+            if seen.target.ends_with("/config") {
+                respond(404, &s3_error("NoSuchKey"))
+            } else if seen.target.ends_with("/summary") {
+                respond(404, b"")
+            } else {
+                respond(404, b"<html><body>Not Found</body></html>")
+            }
+        }))
+        .await;
+        let bucket = stand_in.bucket("s3://bucket/repo").await;
+        assert!(bucket.get_stream_strict("config").await.unwrap().is_none());
+        for key in ["summary", "summary.sig"] {
+            assert!(bucket.get_stream(key).await.unwrap().is_none());
+            let err = bucket.get_stream_strict(key).await.unwrap_err();
+            let Error::S3 {
+                status,
+                code,
+                key: named,
+                ..
+            } = &err
+            else {
+                panic!("{err}");
+            };
+            assert_eq!(*status, 404);
+            assert_eq!(*code, None);
+            assert_eq!(named.as_deref(), Some(format!("repo/{key}").as_str()));
+        }
+    });
+}
+
+#[test]
 fn a_slow_down_is_retried() {
     block_on(async {
         let stand_in = StandIn::start(Arc::new(|_: &Seen, count| {

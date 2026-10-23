@@ -5519,7 +5519,9 @@ are:
 - `deltas/<2>/<41>/<target>` and `deltas/<2>/<41>-<43>/<target>`, the layout
   of "Static delta directories", with the checksums in modified base64 and
   the target `superblock` or a part number with no leading zero
-- `delta-indexes/<2>/<41>.index`, the layout of "Static delta index files".
+- `delta-indexes/<2>/<41>.index`, the layout of "Static delta index files"
+- `state/<64 hex digits>.commitpartial`, in lowercase hex: the
+  partial-commit marker of a commit ("The fsck of a bucket repository").
 
 The bucket client refuses each other key before it sends a request. A key
 from a listing that is not one of these keys is a stray key.
@@ -5531,8 +5533,10 @@ UTF-8 bytes. The path is the canonical URI of SigV4.
 
 A list of a bucket repository is `ListObjectsV2` with the encoding type
 `url`. The `prefix` parameter of each list ends in `/`: `PREFIX/objects/XX/`,
-`PREFIX/objects/`, `PREFIX/refs/`, `PREFIX/deltas/`, and `PREFIX/` for the
-list of the multipart uploads. Without the `/`, a list for `s3://b/repo`
+`PREFIX/objects/`, `PREFIX/refs/`, `PREFIX/deltas/`, `PREFIX/state/`, and
+`PREFIX/` for the list of the multipart uploads. The fsck lists
+`PREFIX/objects/` with `delimiter=/` too, and lists in full each common prefix
+of that list that is not a fan-out prefix. Without the `/`, a list for `s3://b/repo`
 also gives the keys of `s3://b/repo2`. With no prefix, the list of the
 multipart uploads covers the whole bucket, and the bucket client keeps an
 upload only when its key is a key of a bucket repository.
@@ -5803,11 +5807,13 @@ are:
    its own namespace.
 5. The walk: each source commit and its history, cut at the tip of the ref
    in the bucket, as a push over a session offers them. The trees of the
-   commits that the bucket lacks, and the composefs image of each source
-   commit and of each commit that the bucket lacks, if the local repository
-   holds the image. The walk reads no tree of a commit that the listing
+   commits that the bucket lacks and of the offered commits with a
+   partial-commit marker under `state/`, and the composefs image of each
+   source commit and of each walked commit, if the local repository holds
+   the image. The walk reads no tree of another commit that the listing
    holds, because a commit object in the bucket has its whole tree in the
-   bucket. Each ref of the new ref set of the ref directory of the
+   bucket. The push lists `state/` only if the listing holds an offered
+   commit. Each ref of the new ref set of the ref directory of the
    namespace must name a commit that the bucket holds or that the push
    uploads, else the push is refused.
 6. The upload of each tree object and image that the listing lacks, and of
@@ -5821,9 +5827,11 @@ are:
    nothing, and the bucket keeps its copy. After a failed upload, the push
    starts no new upload and waits for the uploads in flight.
 7. The upload of each commit object that the bucket lacks.
-8. A check of the writer lock, then the write of each ref file that
-   changes, in the order of the refspecs. A ref file holds the checksum in
-   lowercase hex and a newline.
+8. A check of the writer lock, the delete of the marker of each walked
+   commit with a marker, at most `max_outstanding` deletes at a time, then
+   the write of each ref file that changes, in
+   the order of the refspecs. A ref file holds the checksum in lowercase hex
+   and a newline. A marker of a commit that the push does not offer stays.
 9. The release of the writer lock.
 
 The push writes no `summary` and no `summary.sig`. A `summary` and a
@@ -5852,8 +5860,11 @@ its own.
 
 A commit object goes up only after each object of its tree. So a commit
 object in the bucket has its whole tree in the bucket at each point of a
-push, also of a push that failed. This is the bucket form of the
-`.commitpartial` marker, which a bucket repository does not hold.
+push, also of a push that failed, or it has a partial-commit marker
+`state/<checksum>.commitpartial`. The repair of the fsck writes the marker
+before it deletes an object of the tree of the commit. A push of the commit
+uploads the objects of the tree that the bucket lacks before it deletes the
+marker.
 
 A push that fails leaves one of these states:
 
@@ -5990,3 +6001,156 @@ summary signer signed the summary. Between the two writes, a reader
 sees the new summary and the old signature, and a reader that verifies the
 summary refuses it. A reader never accepts a summary that its signature
 does not cover. A read after the writer ends finds a matching pair.
+
+### The fsck of a bucket repository
+
+The fsck checks a bucket repository. `ostrya remote fsck` runs it. Without
+a repair, the fsck takes no writer lock and writes no key. Each read of
+`config`, of a ref file, of `summary`, of `summary.sig`, of a superblock,
+and of an object takes the strict rule of an absent key: only a 404 with
+the code `NoSuchKey` is an absent key, and each other 404 fails the run. At
+most `max_outstanding` reads run at a time.
+
+The steps of the fsck are:
+
+1. With the repair, the read of `config`. A `config` that is absent or
+   breaks a rule of "The config of a bucket repository" refuses the repair,
+   and the run then writes no key and takes no lock. Else the take of the
+   writer lock with `operation=fsck`. A lock of another writer fails the run
+   before the read of an object. Without the repair, the read of the lock.
+2. The check of `config`.
+3. At the same time: the list of `refs/` and the read of each ref file, the
+   listing of the objects of the 256 fan-out prefixes, the list of
+   `objects/` with `delimiter=/`, the list of `state/`, and the list of the
+   incomplete multipart uploads. Each key under `refs/` must be
+   `refs/heads/<name>`, or `refs/mirrors/<id>/<name>` with an id other than
+   the collection id of the bucket, and each ref file must hold 64
+   lowercase hex digits and a newline. Each key under `objects/` that is
+   not an object key is a stray key. Each ref must name a commit of the
+   listing. The list of the uploads needs a permission of its own, so a
+   refusal of it fails the run before the read of an object.
+4. The read of `summary`, and at the same time of `summary.sig` when the
+   run verifies the signature of the summary. The list of `deltas/`, and
+   the read of the superblock of each delta that the summary advertises.
+5. The read of each commit object of the listing, whole, up to its size in
+   the listing and to the metadata size cap of 128 MiB. An object that is
+   larger than its listed size is read again up to the cap. The SHA-256 of
+   the bytes must be the checksum of the name, and the bytes must parse as
+   a commit.
+6. The walk of the tree of each commit that parses, also of a commit whose
+   bytes do not match its name. The run reads each dirtree and each dirmeta
+   once, and checks its checksum and its parse. A dirtree that does not
+   parse ends its subtree.
+7. The read of each `.filez` of the trees as a stream, in chunks of 64 KiB.
+   The framed archive header must parse. A symlink has no payload. The
+   payload of a regular file must inflate to the size that the header
+   declares, with no bytes after its DEFLATE end, and the content checksum
+   must be the checksum of the name. A body that fails in transit is read
+   again once from its start. A second failure in transit fails the run.
+8. The read of each `.cfs` whose commit is in the listing, as a stream. Its
+   fs-verity digest must be the value of `ostree.composefs.digest.v0` of the
+   commit. A `.cfs` whose commit is not in the listing is counted and is no
+   finding. With the repair, so is a `.cfs` whose commit object the repair
+   deletes. A body that fails in transit is read again as for a `.filez`.
+9. The count of the objects of the listing that no commit reaches. A
+   `.commitmeta` and a `.cfs` of a commit of the listing are reached. The
+   run reads no such object.
+10. Without the repair, the read again of each object of a `missing`
+    finding that the listing does not hold, and then of the commits of each
+    such object that is still absent. Each read opens the object as a
+    stream and takes none of its body.
+11. With the repair, the repair below and the release of the lock. Without
+    the repair, the read of the lock again.
+
+When a finding names a missing or a bad object of a tree, the run reads
+each dirtree of the trees one more time, and names the commits that reach
+the object.
+
+A run without the repair takes no lock, so a writer can change the bucket
+during the run. The listing of the 256 fan-out prefixes is no snapshot: a
+push can upload an object under a prefix that the run listed before, and
+its commit under a prefix that the run lists after. A prune can remove a
+commit and its objects after the run read the commit. So before the run
+records a `missing` finding for an object that the listing does not hold,
+it reads the object again. If the key holds an object now, the finding is a
+note. Else the run reads each commit of the finding again, and the finding
+names only the commits that the bucket still holds. If the bucket holds
+none of them, the run records no finding. A commit or a `.cfs` that is
+gone at its read gives no finding. A run with the repair holds the lock, so
+no writer changes the bucket during the run.
+
+Each finding has one kind, and is an error or a note:
+
+- `config`, an error: `config` is absent, or breaks a rule.
+- `ref`, an error: a key under `refs/` that is no ref key, a ref file that
+  does not parse or is gone at its read, a ref under `refs/mirrors/` of the
+  own collection id, or a ref whose commit the bucket does not hold.
+- `summary`, an error: the summary does not parse, fails the check of its
+  signature, names a ref at a commit that the bucket does not hold, or
+  names a delta whose superblock is absent or has another SHA-256. With the
+  summary keys, an absent `summary` or `summary.sig` is an error too. A
+  `summary` or a `summary.sig` larger than 64 MiB is one error.
+- `summary`, an error: with a summary in the bucket, a delta map of the
+  bucket that the run cannot build. This is a key
+  `deltas/<fanout>/<leaf>/superblock` whose directory names do not decode
+  as a delta, or a superblock larger than its cap. The run then does not
+  compare the deltas. With no summary, the run does not list `deltas/`.
+- `summary`, a note: an absent summary with no summary keys, or a summary
+  that differs from the ref files or from the deltas of the bucket in
+  another way.
+- `stray`, an error: a key under `objects/` that is no object key.
+- `missing`, an error: an object of a tree that the listing does not hold,
+  or that is gone at its read.
+- `missing`, a note: without the repair, an object of a tree that the
+  listing does not hold, and that the read again finds.
+- `mismatch`, an error: an object whose bytes do not have the checksum of
+  its name, or a `.cfs` with another fs-verity digest.
+- `corrupt`, an error: an object that does not parse, a `.filez` that does
+  not inflate as its header declares, an object over the metadata size cap,
+  or a `.cfs` whose commit records no digest that the run reads.
+- `marker`, a note: without the repair, the partial-commit marker of a
+  commit that the run walked, whose tree has no `missing`, `mismatch`, or
+  `corrupt` finding, and whose own object has none.
+- `upload`, a note: an incomplete multipart upload.
+- `lock`, a note: a writer lock at the start or at the end of the run, or a
+  lock of the run that is gone at its release.
+
+The summary of a bucket repository changes only with an explicit update,
+and a push writes no summary. So a summary that lists old refs is a note.
+A summary that a pull trusts and that leads the pull to an absent object is
+an error.
+
+The repair runs after the checks:
+
+1. A check of the lock, and the write of the partial-commit marker
+   `state/<checksum>.commitpartial` for each commit that reaches a tree
+   object of a `missing`, a `mismatch`, or a `corrupt` finding. The marker
+   holds the one byte `0x66`, as the `.commitpartial` marker of a local
+   repository. A commit that holds a marker gets no new one, and a commit
+   whose own object is bad gets none. Then the delete of each marker that
+   a run without the repair gives a `marker` note. A marker of a commit
+   that the listing does not hold stays.
+2. A check of the lock, and the delete of each object of a `mismatch` and a
+   `corrupt` finding: the commit objects, then the objects of the trees,
+   then the composefs images. A bad commit object goes also when a ref names
+   it, and the report names each such ref. A bad `.cfs` goes, and its
+   commit stays.
+
+At most `max_outstanding` writes and deletes run at a time. After a failed
+write or delete, the repair starts no new one, and waits for the ones in
+flight. A failure after the first check of the lock gives an error that
+holds the report, with each marker and each delete that completed, and
+that states that the repair is incomplete. The bucket can then hold the
+marker of a commit whose bad objects are still in the bucket. A push of
+that commit uploads no object that the listing holds, and then deletes the
+marker, so the bad objects stay with no marker. Run the fsck with the repair
+again before a push.
+
+The repair deletes no commit because of a bad object of its tree, so each
+ref keeps its commit, unless the object of the commit is bad. A ref whose
+commit object the repair deleted is a `ref` error in the next run, and a
+summary that names the commit is a `summary` error. A push of a ref whose
+commit has a marker uploads the objects of the tree that the bucket lacks,
+and then deletes the marker ("The push to a bucket repository"). A push of a
+ref whose commit object the repair deleted uploads the commit again. The
+pull of the port reads no key under `state/`.

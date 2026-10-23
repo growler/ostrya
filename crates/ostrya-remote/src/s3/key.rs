@@ -38,7 +38,9 @@ const OBJECT_EXTENSIONS: [&str; 7] = [
 /// - `deltas/<2>/<41>/<target>` and `deltas/<2>/<41>-<43>/<target>`, with
 ///   checksums in modified base64, and the target `superblock` or a part
 ///   number with no leading zero
-/// - `delta-indexes/<2>/<41>.index`, with a checksum in modified base64.
+/// - `delta-indexes/<2>/<41>.index`, with a checksum in modified base64
+/// - `state/<64 hex digits>.commitpartial`, with lowercase hex digits: the
+///   marker of a partial commit.
 pub(crate) fn is_repository_key(key: &str) -> bool {
     if SINGLE_KEYS.contains(&key) {
         return true;
@@ -59,6 +61,11 @@ pub(crate) fn is_repository_key(key: &str) -> bool {
     }
     if let Some(rest) = key.strip_prefix("delta-indexes/") {
         return is_delta_index_key(rest);
+    }
+    if let Some(rest) = key.strip_prefix("state/") {
+        return rest
+            .strip_suffix(".commitpartial")
+            .is_some_and(|hex| is_lower_hex(hex, 64));
     }
     false
 }
@@ -276,6 +283,7 @@ mod tests {
             format!("deltas/{}/{}/12", &to[..2], &to[2..]),
             format!("deltas/{}/{}-{to}/superblock", &from[..2], &from[2..]),
             format!("delta-indexes/{}/{}.index", &to[..2], &to[2..]),
+            format!("state/{hex}.commitpartial"),
         ];
         for ext in OBJECT_EXTENSIONS {
             keys.push(format!("objects/{}/{}.{ext}", &hex[..2], &hex[2..]));
@@ -325,6 +333,12 @@ mod tests {
             format!("deltas/{}/{}/superblock", &to[..3], &to[3..]),
             "deltas/AA/!!!/superblock".to_owned(),
             format!("delta-indexes/{}/{}.idx", &to[..2], &to[2..]),
+            format!("state/{}.commitpartial", hex.to_uppercase()),
+            format!("state/{}.commitpartial", &hex[..63]),
+            format!("state/{hex}0.commitpartial"),
+            format!("state/{hex}.commit"),
+            format!("state/{hex}"),
+            format!("state/ab/{hex}.commitpartial"),
         ];
         for key in keys {
             assert!(!is_repository_key(&key), "{key}");

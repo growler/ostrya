@@ -311,9 +311,10 @@ A bucket repository is a repository in archive form in an S3 bucket, at the addr
 Each file of the repository is one object of the bucket.
 The key of the object is the path of the file under \fB\%PREFIX/\fR.
 \fB\%ostrya remote init\fR creates a bucket repository, \fB\%ostrya push\fR writes commits to it, \fB\%ostrya push\-tree\fR writes a directory to it as a new commit, and \fB\%ostrya pull\fR, \fB\%ostrya remote refs\fR, and \fB\%ostrya remote summary\fR read it.
-The init and the two pushes take the writer lock of the bucket repository.
+\fB\%ostrya remote fsck\fR checks it, and with \fB\%\-\-delete\fR repairs it.
+The init, the two pushes, and the repair take the writer lock of the bucket repository.
 \fB\%ostrya push\-tree\fR makes the commit on the client, with the parent from the ref file of the branch, and signs no commit.
-In the ostrya library, the feature \fB\%s3\fR gives the read, the init, and the writer lock, and the features \fB\%s3\fR and \fB\%push\fR give the two pushes.
+In the ostrya library, the feature \fB\%s3\fR gives the read, the init, the writer lock, and the fsck, and the features \fB\%s3\fR and \fB\%push\fR give the two pushes.
 The \fB\%ostrya\fR command built without its feature \fB\%s3\fR refuses an \fB\%s3://\fR address.
 .PP
 A push that stops before its end can leave an incomplete multipart upload, which holds storage in the bucket.
@@ -338,11 +339,13 @@ A pull of a named ref reads the ref file when the summary does not list the ref.
 A pull of a ref that the summary lists takes the commit of the summary, so after a push moves that ref, the pull takes the old commit until an update of the summary.
 A pull with \fB\%\-\-mirror\fR and no named ref, a pull that verifies the signature of the summary, \fB\%ostrya pull \-\-collection\fR, \fB\%ostrya remote refs\fR, and \fB\%ostrya remote summary\fR need a summary.
 \fB\%ostrya pull \-\-collection\fR reads the refs of the collection from the summary alone, and skips a bucket repository with no summary.
+\fB\%ostrya remote fsck\fR reports a summary that differs from the ref files or from the deltas as a note, and a summary that names a commit or a delta that the bucket does not hold as an error.
 .TP
 \fB\%objects/<xx>/<62 hex digits>.<ext>\fR
 The objects, in lowercase hex.
 \fB\%<ext>\fR is \fB\%commit\fR, \fB\%commitmeta\fR, \fB\%dirtree\fR, \fB\%dirmeta\fR, \fB\%filez\fR, \fB\%tombstone\-commit\fR, or \fB\%cfs\fR.
 Each other key under \fB\%objects/\fR is a stray key.
+\fB\%ostrya remote fsck\fR reports each stray key, and no command deletes one.
 .TP
 \fB\%refs/heads/<name>\fR
 The refs of the repository, and of its own collection.
@@ -356,6 +359,13 @@ It does not check the keys under \fB\%refs/\fR outside that directory.
 .TP
 \fB\%deltas/\fR, \fB\%delta\-indexes/\fR
 The static deltas and their index files, in the layout of the section STATIC DELTAS.
+.TP
+\fB\%state/<checksum>.commitpartial\fR
+The marker of a commit whose tree misses objects, with the one byte \fB\%0x66\fR, in lowercase hex.
+\fB\%ostrya remote fsck \-\-delete\fR writes it for each commit that reaches a missing or a bad object of a tree, before it deletes the bad objects, and deletes the marker of each commit whose tree is whole.
+A push of a ref whose commit has a marker uploads the objects of the tree that the bucket lacks, and then deletes the marker.
+After a repair that failed, run \fB\%ostrya remote fsck \-\-delete\fR again before a push: until then, the bad objects of a commit with a marker can stay in the bucket, and a push uploads no object that the bucket holds.
+Each other commit object of a bucket repository has its whole tree in the bucket.
 .TP
 \fB\%extensions/ostrya/lock\fR
 The writer lock.
@@ -378,7 +388,7 @@ the lock file \fB\%.update.lock\fR;
 .IP \(bu 2
 the directory \fB\%extensions/ostrya/summary/\fR and its files;
 .IP \(bu 2
-the writer lock \fB\%extensions/ostrya/lock\fR of a bucket repository;
+the writer lock \fB\%extensions/ostrya/lock\fR and the markers \fB\%state/<checksum>.commitpartial\fR of a bucket repository;
 .IP \(bu 2
 the temporary names \fB\%tmp/.ostrya\-ref\-*\fR, \fB\%tmp/.ostrya\-meta\-*\fR, and \fB\%<name>.tmp\-<pid>\-<n>\fR;
 .IP \(bu 2

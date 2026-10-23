@@ -47,6 +47,17 @@ pub(crate) struct SummaryInput<'a> {
     pub(crate) last_modified: Option<u64>,
 }
 
+/// One superblock key of a bucket repository, whose directory names decode
+/// as a delta.
+pub(crate) struct SuperblockKey {
+    /// The name of the delta, as [`DeltaDigest`] names it.
+    pub(crate) name: String,
+    /// The target commit of the delta.
+    to: Checksum,
+    /// The key `deltas/<fanout>/<leaf>/superblock`.
+    key: String,
+}
+
 /// A summary and its signature file, which
 /// [`BucketRepo::write_summary`] writes.
 pub(crate) struct SignedSummary {
@@ -285,11 +296,27 @@ impl BucketRepo {
     /// - [`Error::Remote`](crate::Error::Remote) for an error of the bucket
     ///   client, and [`Error::Io`](crate::Error::Io) for a read that fails in
     ///   transit.
-    #[cfg_attr(not(feature = "push"), allow(dead_code))]
     pub(crate) async fn delta_digests(&self) -> Result<Vec<DeltaDigest>> {
+        let keys = self.superblock_keys().await?;
+        self.superblock_digests(keys, false).await
+    }
+
+    /// Lists `deltas/`, and returns the key of each superblock
+    /// `deltas/<fanout>/<leaf>/superblock`, sorted by the name of its delta.
+    /// Each other key under `deltas/` is ignored. The call reads no
+    /// superblock.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidFormat`](crate::Error::InvalidFormat) if the
+    ///   directory names of a superblock key do not decode as a delta, or if
+    ///   the listed size of a superblock is larger than its cap.
+    /// - [`Error::Remote`](crate::Error::Remote) for an error of the bucket
+    ///   client.
+    pub(crate) async fn superblock_keys(&self) -> Result<Vec<SuperblockKey>> {
         let listing = self.bucket.list("deltas/").await?;
-        let mut superblocks = Vec::new();
-        for listed in &listing.objects {
+        let mut keys = Vec::new();
+        for listed in listing.objects {
             let Some(dir) = listed.key.strip_suffix("/superblock") else {
                 continue;
             };
@@ -306,26 +333,57 @@ impl BucketRepo {
             if listed.size > MAX_SUPERBLOCK {
                 return Err(self.superblock_too_large(&listed.key));
             }
-            superblocks.push((from, to, listed.key.as_str()));
+            keys.push(SuperblockKey {
+                name: delta_name(from.as_ref(), &to),
+                to,
+                key: listed.key,
+            });
         }
+        keys.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(keys)
+    }
+
+    /// Reads each superblock of `keys` as a stream, to take its SHA-256, at
+    /// most `max_outstanding` reads at a time, and returns the deltas, sorted
+    /// by name.
+    ///
+    /// A superblock that is gone at its read is skipped. With `strict`, a
+    /// read takes the strict rule of an absent key of
+    /// [`Bucket::get_stream_strict`](crate::remote::s3::Bucket::get_stream_strict).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidFormat`](crate::Error::InvalidFormat) if a
+    ///   superblock is larger than its cap.
+    /// - [`Error::Remote`](crate::Error::Remote) for an error of the bucket
+    ///   client, and [`Error::Io`](crate::Error::Io) for a read that fails in
+    ///   transit.
+    pub(crate) async fn superblock_digests(
+        &self,
+        keys: Vec<SuperblockKey>,
+        strict: bool,
+    ) -> Result<Vec<DeltaDigest>> {
         let mut out = Vec::new();
         let mut reads = Slots::new(self.max_outstanding);
-        let mut pending = superblocks.into_iter();
+        let mut pending = keys.into_iter();
         loop {
             while reads.has_room()
-                && let Some((from, to, key)) = pending.next()
+                && let Some(key) = pending.next()
             {
-                reads.push(async move { (from, to, self.superblock_digest(key).await) });
+                reads.push(async move {
+                    let digest = self.superblock_digest(&key.key, strict).await;
+                    (key, digest)
+                });
             }
-            let Some((from, to, digest)) = reads.next_ready().await else {
+            let Some((key, digest)) = reads.next_ready().await else {
                 break;
             };
             let Some(digest) = digest? else {
                 continue;
             };
             out.push(DeltaDigest {
-                name: delta_name(from.as_ref(), &to),
-                to,
+                name: key.name,
+                to: key.to,
                 digest,
             });
         }
@@ -335,8 +393,14 @@ impl BucketRepo {
 
     /// Returns the SHA-256 of the superblock at `key`, or `None` if the key
     /// holds no object. The call reads the superblock in chunks of 64 KiB.
-    async fn superblock_digest(&self, key: &str) -> Result<Option<Checksum>> {
-        let Some(mut stream) = self.bucket.get_stream(key).await? else {
+    /// With `strict`, the read takes the strict rule of an absent key.
+    async fn superblock_digest(&self, key: &str, strict: bool) -> Result<Option<Checksum>> {
+        let stream = if strict {
+            self.bucket.get_stream_strict(key).await?
+        } else {
+            self.bucket.get_stream(key).await?
+        };
+        let Some(mut stream) = stream else {
             return Ok(None);
         };
         let mut hasher = Sha256::new();

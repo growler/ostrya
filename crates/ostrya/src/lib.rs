@@ -34,7 +34,7 @@
 //! - Push and receive: [`remote`], the wire protocol of `ostrya-remote`, and `receive`.
 //! - Client access: [`access`], the client groups and the server settings of the config, the claims of a client certificate, and the read rights of a client.
 //! - Remote resolution: [`endpoint`], which reads the keys and files of a remote for a pull or a push.
-//! - Bucket repositories: `bucket`, a repository in an S3 bucket, with the init, the writer lock, and the listing of the objects.
+//! - Bucket repositories: `bucket`, a repository in an S3 bucket, with the init, the writer lock, the listing of the objects, and the fsck.
 //! - Signing: [`sign`], `gpg`, and `spki`.
 //! - Signature trust: [`verify`], the trusted keys and the trust of one pull.
 //! - Maintenance: [`prune`], [`fsck`], [`diff`], [`update`], and [`config`].
@@ -48,7 +48,7 @@
 //! - `sign-gpg`: `GpgSigner`, which signs with the `gpg` command. It turns on `verify-gpg`.
 //! - `receive`: the `receive` module, the receive side of a push.
 //! - `push`: `Repo::push`, `Repo::push_onto`, and `Repo::export_stream`, the push from a repository.
-//! - `s3`: the pull from a bucket repository at an `s3://` address and the pull of collection refs from one, the `bucket` module, the `s3` module of `ostrya-remote`, and with `push`, the push of commits and of a local directory to a bucket repository.
+//! - `s3`: the pull from a bucket repository at an `s3://` address and the pull of collection refs from one, the `bucket` module with the fsck of a bucket repository, the `s3` module of `ostrya-remote`, and with `push`, the push of commits and of a local directory to a bucket repository.
 //! - `lzma-static`: xz built from source and linked statically, with no runtime liblzma.
 //!
 //! # Examples
@@ -128,8 +128,8 @@ pub use bootable::{BootableMetadata, BootableRefusal};
 #[cfg(feature = "s3")]
 #[doc(hidden)]
 pub use bucket::{
-    BucketPushOutcome, BucketRepo, BucketWriteOptions, LockHolder, LockOperation, ObjectListing,
-    WriterLock,
+    BucketFinding, BucketFindingKind, BucketFsckOptions, BucketFsckReport, BucketPushOutcome,
+    BucketRepo, BucketWriteOptions, LockHolder, LockOperation, ObjectListing, WriterLock,
 };
 #[doc(hidden)]
 pub use checkout::{CheckoutFilterFn, CheckoutMode, CheckoutOptions, OverwriteMode};

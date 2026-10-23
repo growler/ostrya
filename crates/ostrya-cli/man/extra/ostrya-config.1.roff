@@ -155,6 +155,7 @@ A build without GPG support refuses \fB\%true\fR.
 .TP
 \fB\%gpg\-verify\-summary\fR (boolean, default false)
 A pull checks the GPG signature of the summary in \fB\%summary.sig\fR.
+\fB\%ostrya remote fsck NAME\fR checks the signature of the summary of a bucket repository with these keys too.
 .TP
 \fB\%gpgkeypath\fR (list)
 More keyring files, or directories of \fB\%*.gpg\fR keyrings, that \fB\%gpg\-verify\fR trusts.
@@ -170,6 +171,7 @@ The keys are in the two keys below and in the system key stores of \fB\%ostrya\-
 \fB\%sign\-verify\-summary\fR (boolean or list, default false)
 A pull checks the signature of the summary with the signature engines.
 It is independent of \fB\%sign\-verify\fR.
+\fB\%ostrya remote fsck NAME\fR checks the signature of the summary of a bucket repository with these engines too.
 .TP
 \fB\%verification\-ENGINE\-key\fR (string)
 One trusted public key of the engine \fB\%ENGINE\fR, in base64.
@@ -217,7 +219,7 @@ The push address, in the forms of \fB\%pull\-url\fR.
 If this key is absent and \fB\%url\fR does not start with \fB\%http://\fR or \fB\%https://\fR, a push to the remote fails.
 \fB\%ostrya push\fR and \fB\%ostrya push\-tree\fR write the bucket repository at an \fB\%s3://\fR address.
 The bucket repository needs a \fB\%config\fR first, which \fB\%ostrya remote init\fR writes.
-\fB\%ostrya remote init\fR takes the \fB\%s3://\fR address of this key, else the \fB\%s3://\fR address of \fB\%pull\-url\fR.
+\fB\%ostrya remote init\fR and \fB\%ostrya remote fsck\fR take the \fB\%s3://\fR address of this key, else the \fB\%s3://\fR address of \fB\%pull\-url\fR.
 .TP
 \fB\%ssh\-command\fR (string, default ssh)
 The ssh command line of a push or a pull over ssh, split at ASCII white space with no quoting rule.
@@ -286,7 +288,7 @@ Each of these writers takes and removes the writer lock of the bucket repository
 For an ssh address, a push reads \fB\%ssh\-command\fR and \fB\%receive\-command\fR, and ignores the HTTP keys.
 For an HTTP address, a push reads \fB\%push\-token\-file\fR, \fB\%push\-user\fR, \fB\%proxy\fR, and the TLS keys.
 For an \fB\%http://\fR address, a push reads no file that a TLS key names, and does not read \fB\%tls\-permissive\fR.
-For an \fB\%s3://\fR address, a push, a tree push, and \fB\%ostrya remote init\fR read the S3 keys, \fB\%proxy\fR, and the TLS keys.
+For an \fB\%s3://\fR address, a push, a tree push, \fB\%ostrya remote init\fR, and \fB\%ostrya remote fsck\fR read the S3 keys, \fB\%proxy\fR, and the TLS keys.
 It refuses \fB\%tls\-permissive=true\fR, \fB\%push\-token\-file\fR, and \fB\%push\-user\fR, and ignores \fB\%ssh\-command\fR, \fB\%send\-command\fR, and \fB\%receive\-command\fR.
 .PP
 For an ssh address, a pull reads \fB\%ssh\-command\fR and \fB\%send\-command\fR, and ignores \fB\%proxy\fR and the TLS keys.
@@ -793,7 +795,7 @@ The paths of the shared AWS credentials file and config file.
 .PP
 A profile that \fB\%s3\-profile\fR or \fB\%\-\-s3\-profile\fR names turns off \fB\%AWS_ACCESS_KEY_ID\fR, \fB\%AWS_SECRET_ACCESS_KEY\fR, \fB\%AWS_SESSION_TOKEN\fR, \fB\%AWS_REGION\fR, \fB\%AWS_DEFAULT_REGION\fR, \fB\%AWS_ENDPOINT_URL_S3\fR, and \fB\%AWS_ENDPOINT_URL\fR.
 .PP
-The commands that read and write a bucket repository at an \fB\%s3://\fR address read the AWS variables: \fB\%ostrya pull\fR, \fB\%ostrya push\fR, \fB\%ostrya push\-tree\fR, \fB\%ostrya remote init\fR, \fB\%ostrya remote refs\fR, and \fB\%ostrya remote summary\fR.
+The commands that read and write a bucket repository at an \fB\%s3://\fR address read the AWS variables: \fB\%ostrya pull\fR, \fB\%ostrya push\fR, \fB\%ostrya push\-tree\fR, \fB\%ostrya remote init\fR, \fB\%ostrya remote fsck\fR, \fB\%ostrya remote refs\fR, and \fB\%ostrya remote summary\fR.
 The \fB\%ostrya\fR command built without its feature \fB\%s3\fR refuses an \fB\%s3://\fR address, and does not read them.
 .TP
 \fB\%http_proxy\fR, \fB\%https_proxy\fR, \fB\%HTTPS_PROXY\fR, \fB\%all_proxy\fR, \fB\%ALL_PROXY\fR, \fB\%no_proxy\fR, \fB\%NO_PROXY\fR

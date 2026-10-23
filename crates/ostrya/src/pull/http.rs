@@ -3003,7 +3003,7 @@ pub(super) async fn read_whole<R: AsyncRead + Unpin>(
 /// function refuses a length above [`MAX_FILE_HEADER_SIZE`] before it
 /// allocates the buffer. That bound holds for each fetch in flight, because
 /// each content object has one header.
-async fn read_archive_header<R: AsyncRead + Unpin>(
+pub(crate) async fn read_archive_header<R: AsyncRead + Unpin>(
     mut stream: R,
 ) -> Result<(FileHeader, u64, Vec<u8>, R)> {
     let mut prefix = [0u8; 8];

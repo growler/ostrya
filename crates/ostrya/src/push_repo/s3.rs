@@ -13,10 +13,11 @@
 //! writes no `summary` and no `summary.sig`. A commit object goes up only
 //! after each object of its tree, so a commit object in the bucket has its
 //! whole tree in the bucket at each point of a run, also of a run that
-//! failed. A run again lists the objects and uploads only the rest, and it
-//! walks no tree of a commit that the bucket holds.
+//! failed, or a partial-commit marker that the fsck wrote. A run again lists
+//! the objects and uploads only the rest, and it walks no tree of a commit
+//! that the bucket holds with no marker.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
@@ -37,7 +38,7 @@ use crate::access::{AuthItem, ClientAccess, ReadAccess};
 use crate::archive::{ArchiveAnswer, ArchiveView};
 use crate::bucket::{
     BucketPushOutcome, BucketRepo, LockOperation, ObjectListing, WriterLock, check_prefixes,
-    object_key,
+    marker_key, object_key,
 };
 use crate::error::{Error, Result};
 use crate::hashing::VerifyingReader;
@@ -199,6 +200,10 @@ pub(super) struct Update {
 struct Uploaded {
     /// The updates, in the order of the refspecs.
     updates: Vec<Update>,
+    /// The commits whose partial-commit marker the push deletes before the
+    /// ref writes: each offered commit with a marker, whose tree the push
+    /// walked.
+    cleared: Vec<Checksum>,
     stats: PushStats,
 }
 
@@ -255,11 +260,14 @@ impl Repo {
     /// 4. It walks the commits to offer: each source commit and its history,
     ///    as [`Repo::push_over_stream`] offers them, with the tip of the ref
     ///    in the bucket in the role of the server tip. It walks the tree of
-    ///    each offered commit that the listing lacks, and adds the composefs
-    ///    image of each source commit and of each walked commit that the
-    ///    local repository holds. It walks no tree of a commit that the
-    ///    listing holds: each writer uploads a commit object after its tree,
-    ///    so a commit object in the bucket has its whole tree in the bucket.
+    ///    each offered commit that the listing lacks, and of each offered
+    ///    commit with a partial-commit marker `state/<checksum>.commitpartial`,
+    ///    and adds the composefs image of each source commit and of each
+    ///    walked commit that the local repository holds. It walks no tree of
+    ///    another commit that the listing holds: each writer uploads a commit
+    ///    object after its tree, so a commit object in the bucket has its
+    ///    whole tree in the bucket, or a marker that
+    ///    [`BucketRepo::fsck`] wrote.
     /// 5. It uploads each tree object and image that the listing lacks, and
     ///    the detached metadata of each commit that the bucket lacks and of
     ///    each source commit, after
@@ -269,8 +277,10 @@ impl Repo {
     ///    commit with no detached metadata after the filter, which leaves the
     ///    bucket copy.
     /// 6. It uploads each commit object that the bucket lacks.
-    /// 7. It checks the writer lock, then writes each ref file that changes,
-    ///    in the order of the refspecs.
+    /// 7. It checks the writer lock, deletes the marker of each walked commit
+    ///    with a marker, then writes each ref file that changes, in the order
+    ///    of the refspecs. A marker of a commit that the push does not offer
+    ///    stays.
     /// 8. It releases the writer lock.
     ///
     /// # Namespace
@@ -386,15 +396,18 @@ impl Repo {
         let start = Instant::now();
         let lock = bucket.lock(LockOperation::Push, opts.break_lock).await?;
         let broken_lock = lock.broken().cloned();
-        let Uploaded { updates, mut stats } =
-            match self.upload_to_bucket(&bucket, &mut plan, &opts).await {
-                Ok(uploaded) => uploaded,
-                Err(e) => return Err(fail(lock, e).await),
-            };
+        let Uploaded {
+            updates,
+            cleared,
+            mut stats,
+        } = match self.upload_to_bucket(&bucket, &mut plan, &opts).await {
+            Ok(uploaded) => uploaded,
+            Err(e) => return Err(fail(lock, e).await),
+        };
         if let Some(progress) = progress {
             progress.set_phase(PushPhase::Committing);
         }
-        if let Err(e) = write_bucket_refs(&bucket, &lock, &updates).await {
+        if let Err(e) = write_bucket_refs(&bucket, &lock, &cleared, &updates).await {
             return Err(fail(lock, e).await);
         }
         lock.release().await?;
@@ -472,7 +485,9 @@ impl Repo {
             });
         }
 
-        let walk = self.bucket_walk(plan, &updates, &listing, opts).await?;
+        let walk = self
+            .bucket_walk(bucket, plan, &updates, &listing, opts)
+            .await?;
         // The walk is the last reader of the commits of the plan.
         drop(std::mem::take(&mut plan.commits));
         // Each ref of the new ref set of the namespace names a commit that
@@ -548,6 +563,7 @@ impl Repo {
         let bytes = counts.bytes.load(Ordering::Relaxed);
         Ok(Uploaded {
             updates,
+            cleared: walk.marked,
             stats: PushStats {
                 objects_total: walk.offered as u64 + walk.tree_objects as u64,
                 objects_needed: needed,
@@ -603,14 +619,18 @@ impl Repo {
         (sizes, total)
     }
 
-    /// Returns the commits and the objects of a push to a bucket repository
-    /// whose listing is `listing`.
+    /// Returns the commits and the objects of a push to the bucket
+    /// repository `bucket`, whose listing is `listing`.
     ///
     /// The walk reads the tree of each offered commit that the listing
-    /// lacks. A commit object in the bucket has its whole tree in the
-    /// bucket, so the walk reads no tree of a commit that the listing holds.
+    /// lacks, and of each offered commit with a partial-commit marker. A
+    /// commit object in the bucket has its whole tree in the bucket, or a
+    /// marker, so the walk reads no tree of another commit that the listing
+    /// holds. The walk lists the markers under `state/` only if the listing
+    /// holds an offered commit.
     async fn bucket_walk(
         &self,
+        bucket: &BucketRepo,
         plan: &mut Plan,
         updates: &[Update],
         listing: &ObjectListing,
@@ -642,9 +662,21 @@ impl Repo {
             .copied()
             .collect();
         let missing: HashSet<Checksum> = missing_commits.iter().copied().collect();
+        // The offered commits that the bucket holds with a marker. The walk
+        // reads their trees as the trees of the missing commits.
+        let partial = if missing_commits.len() < offered.len() {
+            bucket.partial_commits().await?
+        } else {
+            BTreeSet::new()
+        };
+        let marked: Vec<Checksum> = offered
+            .iter()
+            .filter(|commit| holds(commit, ObjectType::Commit) && partial.contains(*commit))
+            .copied()
+            .collect();
         let mut seen = HashSet::new();
         let mut tree_names = Vec::new();
-        for commit in &missing_commits {
+        for commit in missing_commits.iter().chain(&marked) {
             let Local::Held(link) = plan.commits[commit] else {
                 unreachable!("an offered commit is held");
             };
@@ -664,12 +696,13 @@ impl Repo {
         let repo = self.clone();
         let images_of: Vec<Checksum> = missing_commits
             .iter()
+            .chain(&marked)
             .copied()
             .chain(
                 plan.sources
                     .iter()
                     .map(|(c, _)| *c)
-                    .filter(|c| !missing.contains(c)),
+                    .filter(|c| !missing.contains(c) && !marked.contains(c)),
             )
             .collect();
         let images = ostrya_rt::unblock(move || -> Result<Vec<ObjectName>> {
@@ -700,6 +733,7 @@ impl Repo {
             offered: offered.len(),
             missing_commits,
             missing,
+            marked,
             tree_objects,
             upload,
             metadata,
@@ -743,6 +777,9 @@ struct Walk {
     missing_commits: Vec<Checksum>,
     /// The commits of `missing_commits`, for a lookup.
     missing: HashSet<Checksum>,
+    /// The offered commits that the bucket holds with a partial-commit
+    /// marker, in the order of the offer. The walk read their trees.
+    marked: Vec<Checksum>,
     /// The number of tree objects of the walk.
     tree_objects: usize,
     /// The tree objects and the composefs images that the listing lacks.
@@ -752,14 +789,29 @@ struct Walk {
     metadata: Vec<Checksum>,
 }
 
-/// Checks the writer lock, then writes the ref file of each update that
-/// changes a ref, in order.
+/// Checks the writer lock, deletes the partial-commit marker of each commit
+/// of `cleared`, then writes the ref file of each update that changes a ref,
+/// in order.
 pub(super) async fn write_bucket_refs(
     bucket: &BucketRepo,
     lock: &WriterLock<'_>,
+    cleared: &[Checksum],
     updates: &[Update],
 ) -> Result<()> {
     lock.check().await?;
+    let mut deletes = Slots::new(bucket.max_outstanding());
+    let mut pending = cleared.iter();
+    loop {
+        while deletes.has_room()
+            && let Some(commit) = pending.next()
+        {
+            deletes.push(async move { bucket.bucket().delete(&marker_key(commit)).await });
+        }
+        let Some(deleted) = deletes.next_ready().await else {
+            break;
+        };
+        deleted?;
+    }
     for update in updates {
         if update.old == Some(update.new) {
             continue;

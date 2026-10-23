@@ -87,6 +87,15 @@ fn object_name(key: &str) -> Option<ObjectName> {
     Some(ObjectName::new(Checksum::from_bytes(checksum), ty))
 }
 
+/// Returns `true` if `prefix` is a fan-out prefix `objects/XX/`, with two
+/// lowercase hex digits.
+pub(super) fn is_fanout_prefix(prefix: &str) -> bool {
+    prefix
+        .strip_prefix("objects/")
+        .and_then(|rest| rest.strip_suffix('/'))
+        .is_some_and(|fanout| fanout.len() == 2 && fanout.bytes().all(|b| lower_hex(b).is_some()))
+}
+
 /// Returns the value of the lowercase hex digit `digit`.
 fn lower_hex(digit: u8) -> Option<u8> {
     match digit {
@@ -119,6 +128,23 @@ mod tests {
                 Some(ObjectName::new(Checksum::from_hex(&hex).unwrap(), ty)),
                 "{ext}"
             );
+        }
+    }
+
+    #[test]
+    fn a_fanout_prefix_is_two_lowercase_hex_digits() {
+        assert!(is_fanout_prefix("objects/ab/"));
+        assert!(is_fanout_prefix("objects/09/"));
+        for prefix in [
+            "objects/AB/",
+            "objects/zz/",
+            "objects/abc/",
+            "objects/a/",
+            "objects/ab",
+            "objects//",
+            "refs/ab/",
+        ] {
+            assert!(!is_fanout_prefix(prefix), "{prefix}");
         }
     }
 

@@ -157,6 +157,7 @@ fn bucket_futures_are_send(
     assert_send(&bucket.get("config", 1));
     assert_send(&bucket.get_strict("config", 1));
     assert_send(&bucket.get_stream("config"));
+    assert_send(&bucket.get_stream_strict("config"));
     assert_send(&bucket.put("config", Vec::new()));
     assert_send(&bucket.put_if_absent("config", Vec::new()));
     assert_send(&bucket.delete("config"));

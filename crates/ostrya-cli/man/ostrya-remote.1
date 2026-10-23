@@ -153,6 +153,75 @@ It wins over the \fB\%s3\-profile\fR key of the remote and over \fB\%AWS_PROFILE
 Send the signature of each request to an \fB\%http://\fR \%S3 server.
 .IP
 The signature is a credential. Without this switch, the command refuses an \fB\%http://\fR \%S3 server before any request. Use it for a server on a loopback address or behind a proxy that terminates TLS. No key of the remote sets this switch. The command refuses it for an address that is not \fB\%s3://\fR\&.
+.SS "fsck"
+Check a bucket repository in an \%S3 bucket.
+.PP
+The command reads the bucket repository at the \fB\%s3://\fR address of NAME, or at the address \fB\%s3://BUCKET[/PREFIX]\fR, and checks the \fB\%config\fR, the ref files, the summary, the keys under \fB\%objects/\fR, each commit, each object of the tree of each commit, and each composefs image of a commit. It reads each object that a commit reaches, so its cost is the download of these objects.
+.PP
+Unless \%\-q is given, the command first prints the counts: \fB\%Listed N objects\fR, \fB\%Checked C commits and O objects, B bytes\fR, and \fB\%N objects not reached by a commit\fR, then \fB\%N composefs images with no commit\fR and \fB\%N partial commits\fR when the count is not zero. It writes one line for each finding to standard error, sorted by key: \fB\%KIND KEY: DETAIL\fR, and \fB\%; in commits C1, C2\fR when the finding names commits. A note starts with \fB\%note: \fR\&. A report with an error ends with \fB\%error: Bucket repository corruption encountered\fR on standard error, and the command exits \%1. Else the command prints \fB\%fsck of the bucket repository ADDRESS: no errors found\fR, and exits \%0. A stale summary, an absent summary, a marker of a commit whose tree is whole, an incomplete multipart upload, and a writer lock are notes. A failed write to standard output gives an error line and exit \%1.
+.PP
+With a remote name, the command verifies the signature of the summary with the summary keys of the remote, as a pull with \fB\%gpg\-verify\-summary\fR or \fB\%sign\-verify\-summary\fR does. With an address, it verifies no signature.
+.PP
+A run without \%\-\-delete takes no lock, so a writer can change the bucket during the run. Before the command reports an object that the listing does not hold, it reads the object again: an object that is in the bucket now gives a note, and an object whose commits are all gone now gives no line.
+.PP
+With \%\-\-delete, the command takes the writer lock, writes the marker \fB\%state/<checksum>.commitpartial\fR for each commit that reaches a bad or a missing object of a tree, deletes the marker of each commit whose tree is whole, and deletes each bad object. It prints \fB\%Marking commit as partial: COMMIT\fR with the refs of the commit, \fB\%Deleted the partial\-commit marker of commit COMMIT\fR, \fB\%Deleted KEY\fR for each deleted object, and \fB\%Deleted the commit object of a ref: COMMIT\fR with the refs of each deleted commit that a ref names. A push of a ref whose commit has a marker uploads the missing objects of its tree, and removes the marker. The command refuses \%\-\-delete for a bucket repository with no valid \fB\%config\fR, and then changes nothing.
+.PP
+If the repair fails after its first change, the command prints the report with the changes that completed, then an error line that states that the repair is incomplete, and exits \%1. Run the command with \%\-\-delete again before a push: until then, a marker can be in the bucket while the bad objects of its commit stay, and a push of the commit then uploads no object for them and removes the marker.
+.PP
+With an address, the command needs no repository and reads no \fB\%\-\-repo\fR, current directory, or \fB\%OSTREE_REPO\fR\&. With a remote name, it reads the remote from the config of the repository.
+.PP
+.nf
+ostrya remote fsck [OPTIONS] [NAME]
+.fi
+.PP
+Arguments:
+.TP
+\fINAME\fR
+The remote name or the address \fB\%s3://BUCKET[/PREFIX]\fR\&. Required.
+.IP
+The address of a remote is its \fB\%push\-url\fR key if that key holds an \fB\%s3://\fR address, else its \fB\%pull\-url\fR key if that key holds an \fB\%s3://\fR address. The command refuses a remote with neither, and never reads the \fB\%url\fR key.
+.PP
+Options:
+.TP
+\fB\-\-delete\fR
+Repair the bucket repository.
+.IP
+The command takes the writer lock, writes a \%partial\-commit marker for each commit that reaches a bad or a missing object of a tree, deletes the marker of each commit whose tree is whole, and then deletes each object whose bytes do not match its name or do not parse. It deletes no commit because of a bad object of its tree.
+.TP
+\fB\-\-break\-lock\fR
+Remove the writer lock of another writer of the bucket repository.
+.IP
+The command reads the lock, deletes it, and then takes its own lock. It writes the holder of the removed lock to standard error after the report of the run. Use it only when the holder is gone, for example after a crash.
+.TP
+\fB\-q\fR, \fB\-\-quiet\fR
+Do not print the counts.
+.IP
+The command still prints the findings, the actions of \%\-\-delete, and the final result line.
+.TP
+\fB\-\-s3\-region\fR \fIREGION\fR
+The region of the signature of each request to the \%S3 server.
+.IP
+It wins over the \fB\%s3\-region\fR key of the remote, over \fB\%AWS_REGION\fR and \fB\%AWS_DEFAULT_REGION\fR, and over the \fB\%region\fR of the AWS profile. The default is \fB\%us\-east\-1\fR\&. The command refuses this option for an address that is not \fB\%s3://\fR\&.
+.TP
+\fB\-\-s3\-endpoint\fR \fIURL\fR
+The \fB\%http://\fR or \fB\%https://\fR URL of the \%S3 server, with no path.
+.IP
+It wins over the \fB\%s3\-endpoint\fR key of the remote, over \fB\%AWS_ENDPOINT_URL_S3\fR and \fB\%AWS_ENDPOINT_URL\fR, and over the endpoint of the AWS profile. Without each of them, the server is AWS. An \fB\%http://\fR URL needs \%\-\-allow\-cleartext\-credentials. The command refuses this option for an address that is not \fB\%s3://\fR\&.
+.TP
+\fB\-\-s3\-addressing\fR \fISTYLE\fR
+The addressing style of the bucket: \fB\%path\fR or \fB\%virtual\fR\&.
+.IP
+\fB\%path\fR puts the bucket in the path of each request, and \fB\%virtual\fR puts it in the host name. The option wins over the \fB\%s3\-addressing\fR key of the remote and over the \fB\%addressing_style\fR of the AWS profile. The default is \fB\%virtual\fR for AWS and \fB\%path\fR for a set server. A bucket name that holds a \fB\%\&.\fR gets \fB\%path\fR by default. The command refuses this option for an address that is not \fB\%s3://\fR\&. Possible values: path, virtual.
+.TP
+\fB\-\-s3\-profile\fR \fIPROFILE\fR
+The profile of the shared AWS files.
+.IP
+It wins over the \fB\%s3\-profile\fR key of the remote and over \fB\%AWS_PROFILE\fR\&. A profile that this option or the key names skips the key pair, the region, and the endpoint of the environment. The default profile is \fB\%default\fR\&. The command refuses this option for an address that is not \fB\%s3://\fR\&.
+.TP
+\fB\-\-allow\-cleartext\-credentials\fR
+Send the signature of each request to an \fB\%http://\fR \%S3 server.
+.IP
+The signature is a credential. Without this switch, the command refuses an \fB\%http://\fR \%S3 server before any request. Use it for a server on a loopback address or behind a proxy that terminates TLS. No key of the remote sets this switch. The command refuses it for an address that is not \fB\%s3://\fR\&.
 .SS "delete"
 Delete a remote repository and its trusted GPG keyring.
 .PP

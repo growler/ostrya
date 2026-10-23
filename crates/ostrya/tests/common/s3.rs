@@ -11,7 +11,9 @@
 //! - [`StandIn`] is an S3 server in the process that holds its objects in
 //!   memory. A test sets the conditional headers that it honors, the
 //!   requests that it interrupts, refuses, or delays, the requests that get
-//!   503, and the keys whose `GET` gets 404 with a body of the test.
+//!   503, the lists that get 403, the keys whose `GET` gets 404 with a body
+//!   of the test, the key whose body it cuts, and the incomplete multipart
+//!   uploads that it lists.
 //!
 //! A test skips when `rclone` or `weed` is not on `PATH`, and writes the
 //! reason to standard error. With `OSTRYA_REQUIRE_S3` set, a missing
@@ -313,6 +315,35 @@ impl Seaweed {
     pub fn endpoint(&self) -> String {
         format!("http://127.0.0.1:{}", self.s3_port())
     }
+
+    /// Writes `body` at `key` of the bucket `bucket` through the HTTP API of
+    /// the filer, with no signature. The S3 client refuses a key that is not
+    /// a key of a bucket repository, and this call writes any key.
+    pub fn put_raw(&self, bucket: &str, key: &str, body: &[u8]) {
+        let port = self.ports[WEED_PORTS
+            .iter()
+            .position(|flag| *flag == "filer.port")
+            .unwrap()];
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        let head = format!(
+            "PUT /buckets/{bucket}/{key} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n\
+             Content-Type: application/octet-stream\r\nContent-Length: {}\r\n\
+             Connection: close\r\n\r\n",
+            body.len()
+        );
+        stream.write_all(head.as_bytes()).unwrap();
+        stream.write_all(body).unwrap();
+        let mut answer = String::new();
+        let _ = stream.read_to_string(&mut answer);
+        let status = answer.split(' ').nth(1).unwrap_or_default();
+        assert!(
+            status.starts_with('2'),
+            "the filer refused the write of {key}: {answer}"
+        );
+    }
 }
 
 impl Drop for Seaweed {
@@ -385,6 +416,10 @@ pub struct State {
     /// A method and a key prefix: each request of the method to a key that
     /// starts with the prefix gets 403 `AccessDenied` and changes nothing.
     pub refuse: Option<(&'static str, String)>,
+    /// A list that gets 403 `AccessDenied`: the prefix of a
+    /// `ListObjectsV2`, with the prefix of the repository, or `uploads` for
+    /// each `ListMultipartUploads`.
+    pub refuse_list: Option<String>,
     /// A method, a key, and a time: the server waits that time before it
     /// acts on each request of the method to the key, with the prefix of the
     /// repository. The wait holds no lock, so the server serves the other
@@ -399,6 +434,15 @@ pub struct State {
     /// `true` if the answer to a `GET` of a key has the `ETag` of the
     /// object.
     pub etag_on_get: bool,
+    /// A key, a count of bytes `n`, and a count of times: the answer to a
+    /// `GET` of the key, with the prefix of the repository, declares the
+    /// length of the object, sends its first `n` bytes, and closes the
+    /// connection. The count of times goes down by one with each such answer.
+    pub truncate: Option<(String, usize, usize)>,
+    /// The incomplete multipart uploads that `ListMultipartUploads` gives:
+    /// the key with the prefix of the repository, the upload id, and the
+    /// `Initiated` time.
+    pub uploads: Vec<(String, String, String)>,
     /// The number of requests of each method.
     counts: BTreeMap<String, usize>,
     /// The number of each `ETag`.
@@ -429,9 +473,10 @@ impl State {
 /// bucket `bkt`.
 ///
 /// The server accepts each signature, and keeps the `Authorization` header of
-/// each request. It answers `GET`, `PUT`, and `DELETE` of a key, and
-/// `ListObjectsV2` with pages of at most 1000 keys. One thread serves each
-/// connection.
+/// each request. It answers `GET`, `PUT`, and `DELETE` of a key,
+/// `ListObjectsV2` with pages of at most 1000 keys, `ListObjectsV2` with the
+/// delimiter `/` in one page, and `ListMultipartUploads` in one page. One
+/// thread serves each connection.
 pub struct StandIn {
     addr: SocketAddr,
     state: Arc<Mutex<State>>,
@@ -452,10 +497,13 @@ impl StandIn {
             before: None,
             before_key: None,
             refuse: None,
+            refuse_list: None,
             delay: None,
             slow_down: None,
             not_found: None,
             etag_on_get: true,
+            truncate: None,
+            uploads: Vec::new(),
             counts: BTreeMap::new(),
             etags: 0,
         }));
@@ -518,7 +566,7 @@ fn serve(mut stream: TcpStream, state: &Mutex<State>) {
         if let Some(time) = delay {
             std::thread::sleep(time);
         }
-        let (status, headers, body, close) = {
+        let (status, headers, body, close, cut) = {
             let mut state = state.lock().unwrap();
             state
                 .requests
@@ -547,7 +595,9 @@ fn serve(mut stream: TcpStream, state: &Mutex<State>) {
             }
             let refused = state.refuse.as_ref().is_some_and(|(method, prefix)| {
                 *method == request.method && key.as_deref().is_some_and(|k| k.starts_with(prefix))
-            });
+            }) || (request.method == "GET"
+                && state.refuse_list.is_some()
+                && list_name(&request.target) == state.refuse_list);
             let close = state
                 .close_after
                 .is_some_and(|(method, n)| method == request.method && n == count);
@@ -570,7 +620,17 @@ fn serve(mut stream: TcpStream, state: &Mutex<State>) {
             } else {
                 answer(&mut state, &request)
             };
-            (status, headers, body, close)
+            let mut cut = None;
+            if let Some((wanted, n, times)) = &mut state.truncate
+                && request.method == "GET"
+                && status == 200
+                && *times > 0
+                && key.as_deref() == Some(wanted.as_str())
+            {
+                *times -= 1;
+                cut = Some(*n);
+            }
+            (status, headers, body, close, cut)
         };
         if close {
             let _ = stream.shutdown(std::net::Shutdown::Both);
@@ -584,6 +644,13 @@ fn serve(mut stream: TcpStream, state: &Mutex<State>) {
             head.push_str(&format!("{name}: {value}\r\n"));
         }
         head.push_str("\r\n");
+        if let Some(n) = cut {
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(&body[..n.min(body.len())]);
+            let _ = stream.flush();
+            let _ = stream.shutdown(std::net::Shutdown::Both);
+            return;
+        }
         if stream.write_all(head.as_bytes()).is_err()
             || stream.write_all(&body).is_err()
             || stream.flush().is_err()
@@ -605,6 +672,9 @@ fn answer(state: &mut State, request: &Request) -> (u16, Vec<(String, String)>, 
     };
     let key = decode(key);
     if key.is_empty() && request.method == "GET" {
+        if query.split('&').any(|pair| pair == "uploads") {
+            return list_uploads(state, query);
+        }
         return list(state, query);
     }
     match request.method.as_str() {
@@ -656,6 +726,24 @@ fn request_key(target: &str) -> Option<String> {
     path.strip_prefix("/bkt/").map(decode)
 }
 
+/// Returns the name of the list that the request target `target` asks
+/// for: `uploads` for a `ListMultipartUploads`, else the prefix of a
+/// `ListObjectsV2`. Returns `None` for a target that is no list.
+fn list_name(target: &str) -> Option<String> {
+    let (path, query) = target.split_once('?')?;
+    if path != "/bkt/" {
+        return None;
+    }
+    if query.split('&').any(|pair| pair == "uploads") {
+        return Some("uploads".to_owned());
+    }
+    query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(name, _)| *name == "prefix")
+        .map(|(_, value)| decode(value))
+}
+
 /// Returns the answer to the `ListObjectsV2` request with the query `query`.
 fn list(state: &State, query: &str) -> (u16, Vec<(String, String)>, Vec<u8>) {
     let parameter = |name: &str| {
@@ -666,6 +754,9 @@ fn list(state: &State, query: &str) -> (u16, Vec<(String, String)>, Vec<u8>) {
             .map(|(_, value)| decode(value))
     };
     let prefix = parameter("prefix").unwrap_or_default();
+    if parameter("delimiter").as_deref() == Some("/") {
+        return list_delimited(state, &prefix);
+    }
     let after = parameter("continuation-token");
     let start = match &after {
         Some(after) => Bound::Excluded(after.as_str()),
@@ -697,6 +788,75 @@ fn list(state: &State, query: &str) -> (u16, Vec<(String, String)>, Vec<u8>) {
         _ => body.push_str("<IsTruncated>false</IsTruncated>"),
     }
     body.push_str("<EncodingType>url</EncodingType></ListBucketResult>");
+    (200, Vec::new(), body.into_bytes())
+}
+
+/// Returns the answer to a `ListObjectsV2` request with the delimiter `/`
+/// and the prefix `prefix`, in one page.
+fn list_delimited(state: &State, prefix: &str) -> (u16, Vec<(String, String)>, Vec<u8>) {
+    let mut keys = Vec::new();
+    let mut prefixes: Vec<String> = Vec::new();
+    for (key, stored) in state
+        .objects
+        .range::<str, _>((Bound::Included(prefix), Bound::Unbounded))
+        .take_while(|(key, _)| key.starts_with(prefix))
+    {
+        match key[prefix.len()..].find('/') {
+            Some(at) => {
+                let common = &key[..prefix.len() + at + 1];
+                if prefixes.last().map(String::as_str) != Some(common) {
+                    prefixes.push(common.to_owned());
+                }
+            }
+            None => keys.push((key, stored.bytes.len())),
+        }
+    }
+    let mut body = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <ListBucketResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">",
+    );
+    for (key, size) in keys {
+        body.push_str(&format!(
+            "<Contents><Key>{}</Key><Size>{size}</Size></Contents>",
+            encode(key)
+        ));
+    }
+    for common in prefixes {
+        body.push_str(&format!(
+            "<CommonPrefixes><Prefix>{}</Prefix></CommonPrefixes>",
+            encode(&common)
+        ));
+    }
+    body.push_str(
+        "<IsTruncated>false</IsTruncated><EncodingType>url</EncodingType></ListBucketResult>",
+    );
+    (200, Vec::new(), body.into_bytes())
+}
+
+/// Returns the answer to a `ListMultipartUploads` request with the query
+/// `query`, in one page: each upload of [`State::uploads`] under the prefix.
+fn list_uploads(state: &State, query: &str) -> (u16, Vec<(String, String)>, Vec<u8>) {
+    let prefix = query
+        .split('&')
+        .filter_map(|pair| pair.split_once('='))
+        .find(|(name, _)| *name == "prefix")
+        .map(|(_, value)| decode(value))
+        .unwrap_or_default();
+    let mut body = String::from(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <ListMultipartUploadsResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+         <Bucket>bkt</Bucket><EncodingType>url</EncodingType><IsTruncated>false</IsTruncated>",
+    );
+    for (key, id, initiated) in &state.uploads {
+        if key.starts_with(&prefix) {
+            body.push_str(&format!(
+                "<Upload><Key>{}</Key><UploadId>{id}</UploadId><Initiated>{initiated}</Initiated>\
+                 </Upload>",
+                encode(key)
+            ));
+        }
+    }
+    body.push_str("</ListMultipartUploadsResult>");
     (200, Vec::new(), body.into_bytes())
 }
 

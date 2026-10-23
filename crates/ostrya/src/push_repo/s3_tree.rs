@@ -183,7 +183,7 @@ impl BucketRepo {
             progress.set_phase(PushPhase::Committing);
         }
         let updates = [update];
-        if let Err(e) = write_bucket_refs(self, &lock, &updates).await {
+        if let Err(e) = write_bucket_refs(self, &lock, &[], &updates).await {
             return Err(fail(lock, e).await);
         }
         lock.release().await?;

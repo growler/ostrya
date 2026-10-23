@@ -4,8 +4,8 @@
 //! Each file of the repository is one object of the bucket, under the prefix
 //! of the address `s3://BUCKET[/PREFIX]`. A pull reads a bucket repository
 //! through [`Repo::pull`](crate::Repo::pull). A `BucketRepo` adds the init,
-//! the writer lock, and the listing of the objects. With the `push` feature,
-//! `Repo::push_to_bucket` writes commits to a bucket repository.
+//! the writer lock, the listing of the objects, and the fsck. With the `push`
+//! feature, `Repo::push_to_bucket` writes commits to a bucket repository.
 //!
 //! # Init
 //!
@@ -24,8 +24,12 @@
 //! the writer lock. It writes no `summary` and no `summary.sig`, and leaves
 //! the ones that the bucket holds as they are. A commit object goes up only
 //! after each object of its tree, so a commit object in the bucket has its
-//! whole tree in the bucket, also after a push that failed. For this reason,
-//! a push walks no tree of a commit that the bucket holds. The refs of the
+//! whole tree in the bucket, also after a push that failed. The one exception
+//! is a commit with a partial-commit marker `state/<checksum>.commitpartial`,
+//! which the fsck writes. For this reason, a push walks no tree of a commit
+//! that the bucket holds, unless the commit has a marker. The push then
+//! uploads the objects of the tree that the bucket lacks, and deletes the
+//! marker before it writes the ref files. The refs of the
 //! collection id of the bucket, or of a push with no collection, are under
 //! `refs/heads/`. The refs of each other collection are under
 //! `refs/mirrors/ID/`. A push builds each `.filez` that it uploads at the
@@ -94,7 +98,58 @@
 //! `max_outstanding` lists run at a time, as [`BucketRepo::new`] states.
 //! The [`ObjectListing`] holds each object with its size, and each
 //! stray key under a fan-out prefix. A key outside the fan-out prefixes,
-//! for example `objects/abc`, is not in it.
+//! for example `objects/abc`, is not in it. The fsck finds such a key with
+//! one more list of `objects/` with the delimiter `/`.
+//!
+//! # The fsck
+//!
+//! [`BucketRepo::fsck`] checks a bucket repository, and gives a
+//! [`BucketFsckReport`]. Each [`BucketFinding`] is an error or a note. The
+//! run checks:
+//!
+//! - The `config`, as a writer reads it.
+//! - The ref files under `refs/`: each key is a ref of `refs/heads/` or of
+//!   `refs/mirrors/ID/`, with an `ID` other than the collection id of the
+//!   bucket, each file holds a checksum, and each commit of a ref is in the
+//!   bucket.
+//! - The summary: it parses, and with
+//!   [`summary_keys`](BucketFsckOptions::summary_keys), its signature
+//!   verifies. A summary ref whose commit is absent, and a summary delta
+//!   whose superblock is absent or has another digest, are errors. A summary
+//!   that differs from the ref files or from the deltas in other ways, and an
+//!   absent summary, are notes: the summary of a bucket repository changes
+//!   only with an explicit update.
+//! - The keys under `objects/` that are no object keys.
+//! - Each commit object of the listing, each dirtree and dirmeta of the tree
+//!   of each commit, each `.filez` of these trees, and each composefs image
+//!   of a commit. Each object must be in the listing, have the checksum of
+//!   its name, and parse. A `.filez` must inflate to its declared size with
+//!   no bytes after its payload. The fs-verity digest of an image must be the
+//!   digest that its commit records.
+//! - The partial-commit markers of the commits whose trees are whole, the
+//!   incomplete multipart uploads, and a writer lock at the start or at the
+//!   end of the run. These are notes.
+//!
+//! A run without [`delete`](BucketFsckOptions::delete) takes no lock, so a
+//! writer can change the bucket during the run, and the listing of the 256
+//! fan-out prefixes is no snapshot. Before the run reports an object that
+//! the listing does not hold, it reads the object again, and then the
+//! commits of the object. An object that is in the bucket now is a note, and
+//! an object whose commits are all gone is no finding.
+//!
+//! With `delete`, the run takes the writer lock with the operation `fsck`.
+//! It writes the marker `state/<checksum>.commitpartial`, with the one byte
+//! `0x66`, for each commit that reaches a missing or a bad object of a tree,
+//! deletes the marker of each commit whose tree is whole, and then deletes
+//! each bad object. It deletes no commit because of a bad object of its
+//! tree, so each ref keeps its commit, unless the object of the commit is
+//! bad. A commit object whose own bytes are bad goes, also when a ref names
+//! it, the report names the ref, and a push of the ref uploads the commit
+//! again. A push of a ref whose commit has a marker uploads the missing
+//! objects of its tree. A repair that fails after its first change gives
+//! [`Error::BucketRepairIncomplete`](crate::Error::BucketRepairIncomplete),
+//! with the report of the changes that completed: run the fsck with
+//! `delete` again before a push.
 //!
 //! # Examples
 //!
@@ -120,6 +175,7 @@ use crate::error::Result;
 use crate::remote::PushOutcome;
 use crate::remote::s3::{Address, Bucket, PutIfAbsent, S3Endpoint};
 
+mod fsck;
 mod listing;
 mod lock;
 mod state;
@@ -129,13 +185,14 @@ mod state;
 mod summary;
 mod walk;
 
+pub use fsck::{BucketFinding, BucketFindingKind, BucketFsckOptions, BucketFsckReport};
 pub use listing::ObjectListing;
 pub use lock::{LockHolder, LockOperation, WriterLock};
 pub(crate) use lock::{describe_locked, describe_lost};
-#[cfg_attr(not(feature = "push"), allow(unused_imports))]
-pub(crate) use state::check_prefixes;
 #[cfg(test)]
 pub(crate) use state::{BucketRefs, summary_refs};
+#[cfg_attr(not(feature = "push"), allow(unused_imports))]
+pub(crate) use state::{check_prefixes, marker_key};
 
 /// The result of a push to a bucket repository: `Repo::push_to_bucket` or
 /// `BucketRepo::push_tree`.
@@ -435,6 +492,10 @@ const _: fn() = || {
     assert_send_sync::<ObjectListing>();
     assert_send_sync::<BucketPushOutcome>();
     assert_send_sync::<BucketWriteOptions>();
+    assert_send_sync::<BucketFsckOptions>();
+    assert_send_sync::<BucketFsckReport>();
+    assert_send_sync::<BucketFinding>();
+    assert_send_sync::<BucketFindingKind>();
 };
 
 #[cfg(test)]

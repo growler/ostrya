@@ -603,6 +603,31 @@ pub enum Error {
         /// The address of the repository, `s3://BUCKET[/PREFIX]`.
         address: String,
     },
+    /// A repair of a bucket repository that failed after its first change.
+    ///
+    /// [`BucketRepo::fsck`](crate::bucket::BucketRepo::fsck) with
+    /// [`delete`](crate::bucket::BucketFsckOptions::delete) gives this error
+    /// if a step of the repair fails after the check of the lock before its
+    /// first write. The repair is incomplete: the bucket can hold a
+    /// partial-commit marker of a commit whose bad objects are still in the
+    /// bucket. A push of such a commit then uploads no object for them and
+    /// deletes the marker. Run the fsck with `delete` again before a push.
+    #[cfg(feature = "s3")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "s3")))]
+    #[error(
+        "the repair of the bucket repository {address} is incomplete: {error}; run the fsck \
+         with delete again before a push"
+    )]
+    BucketRepairIncomplete {
+        /// The address of the repository, `s3://BUCKET[/PREFIX]`.
+        address: String,
+        /// The report of the run: the findings, and each marker write and
+        /// each delete that completed before the failure.
+        report: Box<crate::bucket::BucketFsckReport>,
+        /// The failure of the repair.
+        #[source]
+        error: Box<Error>,
+    },
 }
 
 impl From<rustix::io::Errno> for Error {

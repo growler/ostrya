@@ -18,7 +18,7 @@
 //!   `diff`.
 //! - Pull: `pull`, `pull-local`.
 //! - ostrya extensions: `composefs-image`, `push`, `push-tree`, `receive`,
-//!   `send`, `serve`, `remote init`.
+//!   `send`, `serve`, `remote init`, `remote fsck`.
 //!
 //! # Features
 //!
@@ -31,7 +31,7 @@
 //! - `serve` (default): `serve`, the HTTP server of a repository.
 //! - `send` (default): `send`, the server side of a pull over ssh.
 //! - `s3` (default): the pull from and the push to a bucket repository at an
-//!   `s3://` address, `remote init`, and the S3 options.
+//!   `s3://` address, `remote init`, `remote fsck`, and the S3 options.
 //! - `lzma-static` (default): a static liblzma, so the binary needs no
 //!   liblzma at run time.
 //!
@@ -1638,6 +1638,64 @@ enum RemoteCommand {
     /// standard error.
     #[cfg(feature = "s3")]
     Init(RemoteInitArgs),
+    /// Check a bucket repository in an S3 bucket.
+    ///
+    /// The command reads the bucket repository at the `s3://` address of NAME,
+    /// or at the address `s3://BUCKET[/PREFIX]`, and checks the `config`, the
+    /// ref files, the summary, the keys under `objects/`, each commit, each
+    /// object of the tree of each commit, and each composefs image of a
+    /// commit. It reads each object that a commit reaches, so its cost is the
+    /// download of these objects.
+    ///
+    /// Unless -q is given, the command first prints the counts: `Listed N
+    /// objects`, `Checked C commits and O objects, B bytes`, and `N objects
+    /// not reached by a commit`, then `N composefs images with no commit` and
+    /// `N partial commits` when the count is not zero. It writes one line for
+    /// each finding to standard error, sorted by key: `KIND KEY: DETAIL`, and
+    /// `; in commits C1, C2` when the finding names commits. A note starts
+    /// with `note: `. A report with an error ends with `error: Bucket
+    /// repository corruption encountered` on standard error, and the command
+    /// exits 1. Else the command prints `fsck of the bucket repository
+    /// ADDRESS: no errors found`, and exits 0. A stale summary, an absent
+    /// summary, a marker of a commit whose tree is whole, an incomplete
+    /// multipart upload, and a writer lock are notes. A failed write to
+    /// standard output gives an error line and exit 1.
+    ///
+    /// With a remote name, the command verifies the signature of the summary
+    /// with the summary keys of the remote, as a pull with
+    /// `gpg-verify-summary` or `sign-verify-summary` does. With an address,
+    /// it verifies no signature.
+    ///
+    /// A run without --delete takes no lock, so a writer can change the
+    /// bucket during the run. Before the command reports an object that the
+    /// listing does not hold, it reads the object again: an object that is
+    /// in the bucket now gives a note, and an object whose commits are all
+    /// gone now gives no line.
+    ///
+    /// With --delete, the command takes the writer lock, writes the marker
+    /// `state/<checksum>.commitpartial` for each commit that reaches a bad or
+    /// a missing object of a tree, deletes the marker of each commit whose
+    /// tree is whole, and deletes each bad object. It prints `Marking commit
+    /// as partial: COMMIT` with the refs of the commit, `Deleted the
+    /// partial-commit marker of commit COMMIT`, `Deleted KEY` for each
+    /// deleted object, and `Deleted the commit object of a ref: COMMIT` with
+    /// the refs of each deleted commit that a ref names. A push of a ref
+    /// whose commit has a marker uploads the missing objects of its tree,
+    /// and removes the marker. The command refuses --delete for a bucket
+    /// repository with no valid `config`, and then changes nothing.
+    ///
+    /// If the repair fails after its first change, the command prints the
+    /// report with the changes that completed, then an error line that
+    /// states that the repair is incomplete, and exits 1. Run the command
+    /// with --delete again before a push: until then, a marker can be in the
+    /// bucket while the bad objects of its commit stay, and a push of the
+    /// commit then uploads no object for them and removes the marker.
+    ///
+    /// With an address, the command needs no repository and reads no
+    /// `--repo`, current directory, or `OSTREE_REPO`. With a remote name, it
+    /// reads the remote from the config of the repository.
+    #[cfg(feature = "s3")]
+    Fsck(RemoteFsckArgs),
     /// Delete a remote repository and its trusted GPG keyring.
     ///
     /// The command removes the keyring `NAME.trustedkeys.gpg` at the root of
@@ -1709,6 +1767,8 @@ impl RemoteCommand {
             RemoteCommand::Add(_) => "add",
             #[cfg(feature = "s3")]
             RemoteCommand::Init(_) => "init",
+            #[cfg(feature = "s3")]
+            RemoteCommand::Fsck(_) => "fsck",
             RemoteCommand::Delete(_) => "delete",
             RemoteCommand::List(_) => "list",
             RemoteCommand::ShowUrl(_) => "show-url",
@@ -1848,6 +1908,45 @@ struct RemoteInitArgs {
     /// after a crash.
     #[arg(long)]
     break_lock: bool,
+    #[command(flatten)]
+    s3: S3AccessArgs,
+    // ostrya checks this operand after the repository resolves, unless it is
+    // an address.
+    /// The remote name or the address `s3://BUCKET[/PREFIX]`. Required.
+    ///
+    /// The address of a remote is its `push-url` key if that key holds an
+    /// `s3://` address, else its `pull-url` key if that key holds an `s3://`
+    /// address. The command refuses a remote with neither, and never reads the
+    /// `url` key.
+    name: Option<String>,
+}
+
+#[cfg(feature = "s3")]
+#[derive(Args)]
+struct RemoteFsckArgs {
+    /// Repair the bucket repository.
+    ///
+    /// The command takes the writer lock, writes a partial-commit marker for
+    /// each commit that reaches a bad or a missing object of a tree, deletes
+    /// the marker of each commit whose tree is whole, and then deletes each
+    /// object whose bytes do not match its name or do not parse. It deletes
+    /// no commit because of a bad object of its tree.
+    #[arg(long)]
+    delete: bool,
+    /// Remove the writer lock of another writer of the bucket repository.
+    ///
+    /// The command reads the lock, deletes it, and then takes its own lock.
+    /// It writes the holder of the removed lock to standard error after the
+    /// report of the run. Use it only when the holder is gone, for example
+    /// after a crash.
+    #[arg(long, requires = "delete")]
+    break_lock: bool,
+    /// Do not print the counts.
+    ///
+    /// The command still prints the findings, the actions of --delete, and
+    /// the final result line.
+    #[arg(short, long)]
+    quiet: bool,
     #[command(flatten)]
     s3: S3AccessArgs,
     // ostrya checks this operand after the repository resolves, unless it is
@@ -4051,6 +4150,17 @@ async fn run(repo: Option<&Path>, verbose: bool, command: Command) -> Result<()>
                     unreachable!("the subcommand is init");
                 };
                 return remote_init(None, nested, init).await;
+            }
+            // So does a fsck at an address.
+            #[cfg(feature = "s3")]
+            if let RemoteCommand::Fsck(fsck) = &sub
+                && fsck.name.as_deref().is_some_and(|n| n.contains([':', '/']))
+            {
+                let nested = sub.name();
+                let RemoteCommand::Fsck(fsck) = sub else {
+                    unreachable!("the subcommand is fsck");
+                };
+                return remote_fsck(None, nested, fsck).await;
             }
             let (repo, _) = resolve_repo(repo, verbose, name).await;
             remote(repo, sub).await
@@ -10951,6 +11061,8 @@ async fn remote(repo: Repo, sub: RemoteCommand) -> Result<()> {
         RemoteCommand::Add(args) => remote_add(&repo, nested, args).await,
         #[cfg(feature = "s3")]
         RemoteCommand::Init(args) => remote_init(Some(&repo), nested, args).await,
+        #[cfg(feature = "s3")]
+        RemoteCommand::Fsck(args) => remote_fsck(Some(&repo), nested, args).await,
         RemoteCommand::Delete(args) => remote_delete(&repo, nested, args).await,
         RemoteCommand::List(args) => remote_list(&repo, &args),
         RemoteCommand::ShowUrl(args) => remote_show_url(&repo, nested, &args),
@@ -11211,6 +11323,148 @@ async fn remote_init(repo: Option<&Repo>, nested: &str, args: RemoteInitArgs) ->
         )
         .await?;
     if let Some(holder) = broken {
+        eprintln!("warning: removed the writer lock of {holder}");
+    }
+    Ok(())
+}
+
+/// Checks the bucket repository of a remote or of an address, and with
+/// `--delete` repairs it, for `ostrya remote fsck`.
+///
+/// `repo` is `None` for an address. With a remote name, the summary keys
+/// come from `PullTrust::from_remote` with the commit checks off, so the
+/// command reads no commit keyring. The report goes to standard output and
+/// standard error as the help text states, and a report with an error exits
+/// 1.
+#[cfg(feature = "s3")]
+async fn remote_fsck(repo: Option<&Repo>, nested: &str, args: RemoteFsckArgs) -> Result<()> {
+    use std::io::Write;
+    let target = remote_operand(nested, args.name.as_deref());
+    let config = repo.map(Repo::config);
+    let endpoint =
+        ostrya::endpoint::resolve_bucket(config, target, args.s3.into_overrides()).await?;
+    let mut opts = ostrya::bucket::BucketFsckOptions::default();
+    opts.delete = args.delete;
+    opts.break_lock = args.break_lock;
+    if let Some(repo) = repo {
+        let verify = ostrya::PullVerify {
+            gpg: Some(false),
+            sign: Some(false),
+            ..ostrya::PullVerify::default()
+        };
+        let trust = ostrya::verify::PullTrust::from_remote(repo, target, &verify).await?;
+        opts.summary_keys = trust.summary_keys().cloned();
+    }
+    let bucket = ostrya::bucket::BucketRepo::open(&endpoint).await?;
+    // A repair that failed after its first change gives the report of the
+    // markers and the deletes that completed, then the error line.
+    let report = match bucket.fsck(&opts).await {
+        Ok(report) => report,
+        Err(e) => {
+            if let Error::BucketRepairIncomplete { report, .. } = &e {
+                print_bucket_fsck(report, args.quiet)?;
+            }
+            return Err(e);
+        }
+    };
+    print_bucket_fsck(&report, args.quiet)?;
+    if report.has_errors() {
+        eprintln!("error: Bucket repository corruption encountered");
+        exit_process(1);
+    }
+    let mut out = std::io::stdout().lock();
+    writeln!(
+        out,
+        "fsck of the bucket repository {}: no errors found",
+        bucket.address()
+    )
+    .and_then(|()| out.flush())
+    .map_err(Error::Io)?;
+    Ok(())
+}
+
+/// Prints the report of a fsck of a bucket repository: the counts unless
+/// `quiet` is set, and each action of the repair, on standard output, and
+/// each finding on standard error.
+///
+/// A failed write, for example on a full device, gives [`Error::Io`], and
+/// `main` prints the error line and exits 1.
+#[cfg(feature = "s3")]
+fn print_bucket_fsck(report: &ostrya::bucket::BucketFsckReport, quiet: bool) -> Result<()> {
+    use std::io::Write;
+    let mut out = std::io::stdout().lock();
+    if !quiet {
+        writeln!(out, "Listed {} objects", report.objects_listed).map_err(Error::Io)?;
+        writeln!(
+            out,
+            "Checked {} commits and {} objects, {} bytes",
+            report.commits_checked, report.objects_checked, report.bytes_read
+        )
+        .map_err(Error::Io)?;
+        writeln!(
+            out,
+            "{} objects not reached by a commit",
+            report.objects_unreached
+        )
+        .map_err(Error::Io)?;
+        if !report.orphan_images.is_empty() {
+            writeln!(
+                out,
+                "{} composefs images with no commit",
+                report.orphan_images.len()
+            )
+            .map_err(Error::Io)?;
+        }
+        if !report.commits_partial.is_empty() {
+            writeln!(out, "{} partial commits", report.commits_partial.len()).map_err(Error::Io)?;
+        }
+    }
+    out.flush().map_err(Error::Io)?;
+    {
+        // One buffer for all the lines: standard error has no buffer of its
+        // own.
+        let mut err = std::io::BufWriter::new(std::io::stderr().lock());
+        for finding in &report.findings {
+            if finding.error {
+                writeln!(err, "{finding}")
+            } else {
+                writeln!(err, "note: {finding}")
+            }
+            .map_err(Error::Io)?;
+        }
+        err.flush().map_err(Error::Io)?;
+    }
+    let with_refs = |commit: &ostrya::Checksum, refs: &[String]| {
+        if refs.is_empty() {
+            commit.to_string()
+        } else {
+            format!("{commit} ({})", refs.join(", "))
+        }
+    };
+    for (commit, refs) in &report.marked_partial {
+        writeln!(
+            out,
+            "Marking commit as partial: {}",
+            with_refs(commit, refs)
+        )
+        .map_err(Error::Io)?;
+    }
+    for commit in &report.cleared_partial {
+        writeln!(out, "Deleted the partial-commit marker of commit {commit}").map_err(Error::Io)?;
+    }
+    for key in &report.deleted {
+        writeln!(out, "Deleted {key}").map_err(Error::Io)?;
+    }
+    for (commit, refs) in &report.deleted_ref_targets {
+        writeln!(
+            out,
+            "Deleted the commit object of a ref: {}",
+            with_refs(commit, refs)
+        )
+        .map_err(Error::Io)?;
+    }
+    out.flush().map_err(Error::Io)?;
+    if let Some(holder) = &report.broken_lock {
         eprintln!("warning: removed the writer lock of {holder}");
     }
     Ok(())

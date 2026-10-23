@@ -109,7 +109,7 @@ impl TrustedKeys {
     }
 
     /// Returns the policy of this set.
-    #[cfg(feature = "receive")]
+    #[cfg(any(feature = "receive", feature = "s3"))]
     pub(crate) fn policy(&self) -> &Policy {
         &self.policy
     }
@@ -214,6 +214,15 @@ impl PullTrust {
             summary: Some(keys),
             ..self
         }
+    }
+
+    /// Returns the keys that the pull checks the summary of the remote
+    /// against, or `None` if the pull does not check the summary.
+    ///
+    /// With the `s3` feature, `BucketRepo::fsck` takes these keys in
+    /// `BucketFsckOptions::summary_keys`.
+    pub fn summary_keys(&self) -> Option<&TrustedKeys> {
+        self.summary.as_ref()
     }
 
     /// Reads the trust that [`Repo::pull`] uses for a pull from `remote`.

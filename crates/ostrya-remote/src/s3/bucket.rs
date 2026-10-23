@@ -176,7 +176,8 @@ pub struct Object {
     pub etag: Option<String>,
 }
 
-/// The body of an object that [`Bucket::get_stream`] gives.
+/// The body of an object that [`Bucket::get_stream`] and
+/// [`Bucket::get_stream_strict`] give.
 ///
 /// A read gives the bytes in bounded chunks, as a [`Body`] does. The stream
 /// holds an admission permit of the fetcher until it ends or is dropped. A
@@ -516,6 +517,32 @@ impl Bucket {
     /// [`Error::Transport`] for a 304. A read of the stream fails with an I/O
     /// error if the body fails in transit.
     pub async fn get_stream(&self, key: &str) -> Result<Option<ObjectStream>> {
+        self.open_stream(key, is_absent).await
+    }
+
+    /// Opens the body of the object of `key` as a stream, or returns `None`
+    /// if the key holds no object, by the strict rule of an absent key of
+    /// [`get_strict`](Bucket::get_strict).
+    ///
+    /// The stream holds no more than one chunk of the object in memory.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`get_stream`](Bucket::get_stream). A 404 that is not an
+    /// absent key gives [`Error::S3`] with the status 404, and with no code
+    /// if the body holds no S3 code.
+    pub async fn get_stream_strict(&self, key: &str) -> Result<Option<ObjectStream>> {
+        self.open_stream(key, is_no_such_key).await
+    }
+
+    /// Opens the body of the object of `key` as a stream, as
+    /// [`get_stream`](Bucket::get_stream) does, with `absent` as the rule of
+    /// an absent key.
+    async fn open_stream(
+        &self,
+        key: &str,
+        absent: fn(u16, Option<&[u8]>) -> bool,
+    ) -> Result<Option<ObjectStream>> {
         check_key(key)?;
         let full = self.full_key(key);
         let path = encode_path(&full);
@@ -534,7 +561,7 @@ impl Bucket {
             }
             Ok(Fetched::NotModified) => Err(not_modified(&full)),
             Err(e) => {
-                self.absent_or_error(e, &full, u64::MAX, is_absent)?;
+                self.absent_or_error(e, &full, u64::MAX, absent)?;
                 Ok(None)
             }
         }

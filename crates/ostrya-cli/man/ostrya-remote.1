@@ -168,6 +168,8 @@ With \%\-\-delete, the command takes the writer lock, writes the marker \fB\%sta
 .PP
 If the repair fails after its first change, the command prints the report with the changes that completed, then an error line that states that the repair is incomplete, and exits \%1. Run the command with \%\-\-delete again before a push: until then, a marker can be in the bucket while the bad objects of its commit stay, and a push of the commit then uploads no object for them and removes the marker.
 .PP
+The command needs the \%S3 permissions \fB\%s3:GetObject\fR, \fB\%s3:ListBucket\fR, and \fB\%s3:ListBucketMultipartUploads\fR\&. With \%\-\-delete, it also needs \fB\%s3:PutObject\fR and \fB\%s3:DeleteObject\fR\&.
+.PP
 With an address, the command needs no repository and reads no \fB\%\-\-repo\fR, current directory, or \fB\%OSTREE_REPO\fR\&. With a remote name, it reads the remote from the config of the repository.
 .PP
 .nf

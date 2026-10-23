@@ -12,7 +12,9 @@
 //! serve s3`, which checks each signature and refuses each writer, and
 //! against `weed mini` of SeaweedFS. A test on a real server skips when its
 //! program is absent. `OSTRYA_REQUIRE_S3` and `OSTRYA_REQUIRE_SEAWEEDFS` turn
-//! each skip into a failure.
+//! each skip into a failure. The test on SeaweedFS also pulls the push with
+//! the `ostree` command, and skips that part when `ostree` is absent.
+//! `OSTRYA_REQUIRE_OSTREE` turns that skip into a failure.
 //!
 //! Each run of `ostrya` gets the key pair of the servers, the two shared AWS
 //! files at absent paths in the scratch directory, a scratch `HOME`, and no
@@ -2419,14 +2421,19 @@ fn rclone_serves_a_bucket_to_each_reader_and_refuses_each_writer() {
 // SeaweedFS
 // ---------------------------------------------------------------------------
 
+/// `ostrya` inits a bucket repository on SeaweedFS, pushes to it, and pulls
+/// from it. The `ostree` command pulls the push with no signature over the
+/// S3 port of the bucket, with the anonymous read. After `remote summary
+/// -u`, `ostree remote refs` reads the ref from the summary.
 #[cfg(feature = "push")]
 #[test]
 fn seaweedfs_takes_an_init_a_push_and_a_pull() {
-    if !seaweed_available("seaweedfs_takes_an_init_a_push_and_a_pull") {
+    let test = "seaweedfs_takes_an_init_a_push_and_a_pull";
+    if !seaweed_available(test) {
         return;
     }
     let scratch = Scratch::new("seaweed");
-    let server = Seaweed::start(scratch.path(), "bkt");
+    let server = Seaweed::start_anonymous(scratch.path(), "bkt");
     let endpoint = format!("--s3-endpoint={}", server.endpoint());
     scratch.ok(&[
         "remote",
@@ -2453,10 +2460,24 @@ fn seaweedfs_takes_an_init_a_push_and_a_pull() {
         "main",
     ]);
     assert_eq!(scratch.ok(&[&dest, "rev-parse", "x:main"]).trim(), tip);
+    let tool = ostree_available(&format!("the ostree pull of {test}"));
+    let client = format!("--repo={}", scratch.path().join("client").display());
+    if tool {
+        ostree(&[&client, "init", "--mode=bare-user"]);
+        ostree(&[&client, "config", "set", "core.min-free-space-percent", "0"]);
+        let url = server.url("bkt", "repo");
+        ostree(&[&client, "remote", "add", "--no-gpg-verify", "w", &url]);
+        ostree(&[&client, "pull", "w", "main"]);
+        assert_eq!(ostree(&[&client, "rev-parse", "w:main"]).trim(), tip);
+        ostree(&[&client, "fsck"]);
+    }
     assert_eq!(
         scratch.ok(&["remote", "summary", "-u", ADDRESS, &endpoint, CLEARTEXT]),
         ""
     );
+    if tool {
+        assert_eq!(ostree(&[&client, "remote", "refs", "w"]), "w:main\n");
+    }
     scratch.ok(&[
         &dest,
         "remote",
@@ -2469,4 +2490,38 @@ fn seaweedfs_takes_an_init_a_push_and_a_pull() {
     let report = scratch.ok(&[&dest, "remote", "summary", "w", CLEARTEXT]);
     assert!(report.contains(&format!("* ({ID}, main)")), "{report}");
     assert!(report.contains(&tip), "{report}");
+}
+
+/// The environment variable that turns the skip for an absent `ostree`
+/// command into a failure.
+#[cfg(feature = "push")]
+const REQUIRE_OSTREE: &str = "OSTRYA_REQUIRE_OSTREE";
+
+/// Returns `true` if the `ostree` command runs. With [`REQUIRE_OSTREE`] set,
+/// an absent command fails the test. Else the function writes the reason of
+/// the skip of `test` to standard error.
+#[cfg(feature = "push")]
+fn ostree_available(test: &str) -> bool {
+    let found = Command::new("ostree")
+        .arg("--version")
+        .output()
+        .is_ok_and(|out| out.status.success());
+    assert!(
+        found || std::env::var_os(REQUIRE_OSTREE).is_none(),
+        "{REQUIRE_OSTREE} is set and `ostree` is not installed, so the \
+         tool-comparison tests cannot run"
+    );
+    if !found {
+        eprintln!("skipping {test}: ostree is not installed");
+    }
+    found
+}
+
+/// Runs the `ostree` command with `args`, asserts that it succeeds, and
+/// returns its standard output.
+#[cfg(feature = "push")]
+fn ostree(args: &[&str]) -> String {
+    let out = Command::new("ostree").args(args).output().unwrap();
+    assert!(out.status.success(), "ostree {args:?}: {}", stderr(&out));
+    stdout(&out)
 }

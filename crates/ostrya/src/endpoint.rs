@@ -1119,7 +1119,7 @@ async fn push_s3(
 /// of a bucket repository other than a push.
 ///
 /// [`BucketRepo::init`](crate::bucket::BucketRepo::init) is such a writer.
-/// [`resolve_push`] gives the endpoint of a push.
+/// `resolve_push` gives the endpoint of a push.
 ///
 /// # Address
 ///
@@ -1131,7 +1131,7 @@ async fn push_s3(
 ///
 /// # Endpoint
 ///
-/// The function gives the S3 endpoint that [`resolve_push`] gives for the
+/// The function gives the S3 endpoint that `resolve_push` gives for the
 /// same `s3://` address and the same section, and makes the same refusals.
 /// The signer gives the credential of each request, so the function refuses
 /// the fields and the keys `push-token-file` and `push-user`, and the ssh

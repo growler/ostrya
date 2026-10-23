@@ -510,17 +510,56 @@ pub fn ostree_available() -> bool {
 
 /// Runs `ostree fsck` on `root` and asserts that it passes.
 pub fn tool_fsck(root: &Path) {
-    let out = Command::new("ostree")
-        .arg("fsck")
-        .arg(format!("--repo={}", root.display()))
-        .output()
-        .unwrap();
+    let out = tool_fsck_output(root, &[]);
     assert!(
         out.status.success(),
         "ostree fsck failed on {}: {}",
         root.display(),
         String::from_utf8_lossy(&out.stderr)
     );
+}
+
+/// Runs `ostree fsck` with `args` on `root`, and returns its output with no
+/// check of the exit status.
+pub fn tool_fsck_output(root: &Path, args: &[&str]) -> std::process::Output {
+    Command::new("ostree")
+        .arg("fsck")
+        .arg(format!("--repo={}", root.display()))
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+/// Writes each key of the bucket repository of `bucket` under `dir`, with
+/// the directories of a repository, so the `ostree` command opens it. Keys
+/// under `extensions/` stay out.
+///
+/// The dump reads each key through the S3 client and copies its body to
+/// its file through a buffer of fixed size. The harness of `common::s3`
+/// holds this function apart, because the tests of `ostrya-cli` include
+/// that file and have no `futures-lite`.
+#[cfg(feature = "s3")]
+pub async fn dump_bucket(bucket: &ostrya::remote::s3::Bucket, dir: &Path) {
+    let mut keys: Vec<String> = ["config", "summary", "summary.sig"]
+        .into_iter()
+        .map(str::to_owned)
+        .collect();
+    for prefix in ["objects/", "refs/", "deltas/", "delta-indexes/", "state/"] {
+        let listing = bucket.list(prefix).await.unwrap();
+        keys.extend(listing.objects.into_iter().map(|listed| listed.key));
+    }
+    for key in keys {
+        let Some(stream) = bucket.get_stream(&key).await.unwrap() else {
+            continue;
+        };
+        let path = dir.join(&key);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        let file = futures_lite::io::AssertAsync::new(std::fs::File::create(&path).unwrap());
+        futures_lite::io::copy(stream, file).await.unwrap();
+    }
+    for sub in s3::REPO_DIRS {
+        std::fs::create_dir_all(dir.join(sub)).unwrap();
+    }
 }
 
 /// The environment variable that turns the skip for a missing ed25519 engine

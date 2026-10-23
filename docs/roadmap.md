@@ -8,27 +8,6 @@ documents, and in the rustdoc of its crate. The design decisions are in
 
 ## Planned features
 
-### S3 push and pull
-
-A feature `s3` adds push to and pull from an S3 bucket.
-
-- Push writes the objects, the refs and the summary of a repository into a
-  bucket. Push is a port extension.
-- Pull reads from a bucket directly.
-- A pushed bucket is a static repository. Thus the `ostree` command can pull
-  from it over the HTTP endpoint of the bucket.
-- The S3 work is SigV4 request signing, the bucket and prefix addressing, and
-  multipart upload for large objects. It runs over the fetcher of
-  `ostrya-fetch`. `Target::PathQuery` carries a presigned query for each
-  target.
-- The credentials come from the standard AWS environment and profile chain.
-- The choice between a SigV4 crate and signing written in the tree is made
-  when the work starts. A crate needs the confirmation of the maintainer.
-
-Verification: push a fixture repository to an S3-compatible test server and
-pull it back with no change. The `ostree` command pulls the pushed bucket
-over plain HTTP.
-
 ### P3 commands
 
 The `ostrya` command does not carry these commands of the `ostree` command.
@@ -71,6 +50,11 @@ for it.
   pulls collection refs.
 - `Repo::pull_local` refuses a subpath. It refuses `collection_id` unless
   `no_ref_writes` is set.
+- The HTTP pull of the port reads a 403 for an optional file as an error,
+  for example for `summary.sig`, a `.commitmeta` object, or the superblock
+  of a static delta. So the HTTP pull of the port stops at the first absent
+  optional file of a bucket repository whose anonymous policy gives no
+  `s3:ListBucket` (`ostrya-repo(5)`, section BUCKET REPOSITORIES).
 
 ## Gaps in the commands
 
@@ -118,6 +102,23 @@ for it.
 - The archive view serves `deltas/` in the `archive` mode alone. Outside
   that mode, the summary of an auth item and the ref listing name no static
   delta.
+
+## Gaps of bucket repositories
+
+A bucket repository is a repository at an `s3://` address
+(`format-reference.md`, "The S3 bucket repository"). These parts of the
+work on a local repository are not carried for it:
+
+- The deletion of a ref, and weak refs.
+- These options of `prune`: `--delete-commit`, `--only-branch`,
+  `--retain-branch-depth`, `--commit-only`, `--static-deltas-only`, and the
+  gc root metadata keys. `ostrya remote prune` refuses a bucket `config`
+  that sets `[ex-ostrya] gc-root-metadata-keys`.
+- Tombstone commits. `ostrya remote prune` refuses a bucket `config` that
+  sets `[core] tombstone-commits=true`.
+- These options of `fsck`: `--add-tombstones`, `--all`, `--verify-bindings`,
+  `--verify-back-refs`, and `--no-mark-partial`.
+- `push --onto`, and tags.
 - A signed tree push to a bucket repository. `BucketRepo::push_tree` and
   `ostrya push-tree` to an `s3://` address sign no commit. A user pulls the
   commit into a local repository, signs it there, and pushes it with
@@ -128,6 +129,30 @@ for it.
   reads one commit or dirtree at a time, so a run costs one round trip for
   each metadata object that it reaches. The `Slots` driver of the pull has
   the necessary shape.
+- A static delta that the push generates or uploads. The push uploads no
+  delta, and a delta comes into the bucket from another writer.
+- The summaries of auth items under `extensions/ostrya/summary/`, and the
+  client groups of `ostrya summary -u -c`.
+- `-m`/`--add-metadata` on a summary update. Each later summary update
+  drops the key, as `ostrya summary -u` drops it in a local repository.
+- Refs under `refs/remotes/`. The summary update refuses them.
+- The anchor commit `ostree-metadata` in a bucket repository with a
+  collection id.
+- Credential sources other than the key pairs of the environment and of the
+  shared AWS files: EC2 instance metadata, ECS container credentials, web
+  identity, SSO, `credential_process`, and an assumed role.
+- A `Cache-Control` header on the mutable keys: `summary`, `summary.sig`,
+  and the ref files.
+- Server-side encryption headers, ACL headers, and storage classes.
+- An anonymous S3 pull of the port, with no signature. The port pulls a
+  bucket repository from its `s3://` address alone, with signed requests.
+- `Bucket::list_uploads` has no cap on a run of truncated pages with no
+  upload. A server that gives such pages with a new upload id marker for
+  one key holds the list with no end. `Bucket::list` fails after more than
+  1000 truncated pages in a row with no key and no common prefix.
+- The tree push to a bucket has a small compressor pool of its own, next to
+  `Compressors` in `crates/ostrya/src/archive.rs`. A merge needs
+  `Compressors` to be generic over its source.
 
 ## Open decisions
 
@@ -190,3 +215,26 @@ until each one is made.
     uses the signature of the primary key.
   - The differential matrix has no cell for public-key algorithm 27
     (`Ed25519`), because `gpg` 2.4.9 writes algorithm 22.
+- No test runs against AWS. These answers of AWS are not observed: a
+  bucket of another region in path style and in virtual-host style, a
+  `DeleteObject` with an `If-Match` of another `ETag`, a raw `+` of a
+  delta key in the path of an unsigned `GET` of the `ostree` command, and
+  the unsigned reads under the anonymous bucket policy of `ostrya-repo(5)`.
+  The answers of the stand-in of the tests follow the AWS API reference.
+- CI installs neither `weed` nor the `ostree` command. So in CI, the tests
+  on SeaweedFS and the cross-checks with the `ostree` command skip, the
+  writer tests of a bucket repository run on the stand-in of the tests
+  alone, and `ostree fsck` and `ostree pull` of a bucket repository do not
+  run.
+- The answers of SeaweedFS to a `ListObjectsV2` with a trailing `/` in the
+  path of the bucket, and its form of a key with `+` in a listing with
+  `encoding-type=url`, are not recorded.
+- No test makes a `GET` of a bucket repository fail after the last retry of
+  the fetcher. The stand-in of the tests has no setting for it.
+- No test of `Repo::pull_collection` reads a summary that
+  `BucketRepo::update_summary` wrote, and no library test runs a summary
+  update against `rclone serve s3`. The test of `ostrya remote summary -u`
+  on rclone covers the refusal.
+- `cargo clippy -p ostrya-cli --all-targets` with a feature set other than
+  the default set fails in `crates/ostrya-cli/src/man.rs` on items with no
+  use. CI does not run it.

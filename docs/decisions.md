@@ -665,7 +665,11 @@ of the caller wins over its key, and `s3::resolve` gives each other source.
 
 An S3 field or an S3 key with an address that is not S3 is refused. An
 `s3://` address in the key `url` is refused, in each build, as an ssh
-address there is refused: the `ostree` command also reads `url`.
+address there is refused: the `ostree` command also reads `url`. An
+`s3://` address in `url` for a remote that the port alone reads, with a
+note in the documentation, was rejected: the config has no mark of such a
+remote, and the `ostree` command refuses the remote at each pull and each
+`remote refs` with `error: Invalid URI scheme in s3://BUCKET/PREFIX`.
 
 `resolve_pull` refuses an `http://` S3 endpoint without
 `allow_cleartext_credentials`, because the signature is a credential. The
@@ -903,7 +907,10 @@ So a second push with no change uploads no object. A `.commitmeta` that the
 detached metadata filter empties uploads nothing, and the bucket keeps its
 copy, as a pull with such a filter keeps the copy of the destination. An
 upload of an empty file and a delete of the bucket copy were rejected:
-each one removes metadata that the filter of the push did not name.
+each one removes metadata that the filter of the push did not name. An
+upload of each `.commitmeta` of each source commit at each run was
+rejected: a second push with no change then uploads the `.commitmeta` of
+each source commit.
 
 The push writes no summary. The update of the summary of a bucket
 repository is always explicit, as in a local `archive` repository with no
@@ -912,6 +919,15 @@ bucket as they are, so they can list old refs, and a pull of a named ref
 reads the ref file when the summary does not list the ref. The writer
 still reads `tombstone-commits` and `indexed-deltas` with the `config`, so
 a value that is not a boolean refuses the push before its first upload.
+
+The push uploads no static delta. A delta comes into a bucket repository
+from another writer, for example as a copy of a delta directory of a local
+`archive` repository, and a summary update lists each delta with a
+superblock. An upload of the deltas of the local repository that end at a
+pushed commit, in the `archive` mode alone, was rejected: the deltas of the
+bucket then follow the content and the mode of the local repository, so
+two pushes of one commit from two repositories leave different deltas in
+the bucket.
 
 A summary write on each push, signed by the signers of a field
 `summary_signers` of `RepoPushOptions`, with a refusal of a push with no
@@ -1015,7 +1031,11 @@ does not exist for a bucket.
 ## The `ostrya` command and bucket repositories
 
 `ostrya-cli` turns on the feature `s3` of `ostrya` in its default set, so
-the shipped binary reads and writes bucket repositories. The feature gates
+the shipped binary reads and writes bucket repositories. The feature is
+off by default in `ostrya-remote` and in `ostrya`, so a build of the
+library that reads no bucket compiles no SigV4 signer and no XML reader.
+The feature off in all crates was rejected: the shipped binary then
+refuses each `s3://` address. The feature gates
 the S3 options, `--break-lock`, `remote init`, `remote fsck`,
 `remote prune`, and `remote summary -u`, as the features `push`, `serve`,
 and `send` gate their commands. A build without
@@ -1441,6 +1461,55 @@ options of `ostrya summary`:
 - the positional KEY-ID: the operand of `remote summary` is the remote or
   the address.
 - `--keys-dir`: it serves a verify alone.
+
+## The `ostree` command and a bucket repository
+
+A bucket repository has the layout of a static `archive` repository, so
+the `ostree` command pulls it over HTTP, and the port writes nothing for
+it. The URL is `https://BUCKET.s3.REGION.amazonaws.com/PREFIX`, or the URL
+of the endpoint in path style, `ENDPOINT/BUCKET/PREFIX`. The `ostree`
+command sends no signature, so the bucket policy gives anonymous
+`s3:GetObject` on the keys that the `ostree` command reads: `PREFIX/config`,
+`PREFIX/summary`, `PREFIX/summary.sig`, `PREFIX/objects/*`,
+`PREFIX/refs/*`, `PREFIX/deltas/*`, and `PREFIX/delta-indexes/*`. The
+writer lock under `PREFIX/extensions/` holds the host name and the pid of
+the writer, and the `ostree` command reads no key under
+`PREFIX/extensions/`, so the policy gives no key there. An anonymous
+`s3:GetObject` on `PREFIX/*` with a Deny statement on
+`PREFIX/extensions/*` for each principal was rejected: the Deny also
+refuses the signed `GET` of the lock by a writer of the port.
+
+S3 answers a read of an absent key with 403 when the caller has no
+`s3:ListBucket`. The `ostree` command reads a 403 for `summary.sig`,
+`summary`, a delta index, a superblock, and a `.commitmeta` as an absent
+file, and a 403 for `config` after a summary fails the pull
+(`conformance/cli-behavior.md`, "A 403 for an optional file"). The init
+writes `config`, so an anonymous policy with `s3:GetObject` alone serves a
+pull of the `ostree` command. A rule that also gives anonymous
+`s3:ListBucket` was not taken, because no read of the `ostree` command
+needs it.
+
+The port pulls a bucket repository from its `s3://` address alone, with
+signed requests. An anonymous S3 pull of the port is not in this release.
+The S3 pull reads a 403 as an error ("The S3 pull"), and the HTTP pull of
+the port reads a 403 for an optional file as an error too. So the HTTP
+pull of the port stops at the first absent optional file of a bucket
+repository under the anonymous policy (`roadmap.md`, "Gaps in pull").
+
+The tests that check a bucket repository with the `ostree` command run
+`ostree fsck` on a dump of the bucket, which the S3 client of the port
+writes to a directory. SeaweedFS keeps no tree of files of a bucket on disk,
+and no writer of the port runs on `rclone serve s3`, which honors no
+conditional write. The `ostree` command pulls from the S3 port of SeaweedFS
+with the identity `anonymous` and the action `Read`. The read-only port of
+the filer was not taken, because the S3 port serves the same reads. Under
+this identity, the S3 port answers an unsigned `GET` of an absent key with
+404 `NoSuchKey`, and an unsigned list with 403 `AccessDenied`. AWS answers
+the same `GET` with 403 under the anonymous policy, so the tests cover the
+reads of the `ostree` command after a 403 on the stand-in alone, which
+answers 403 for the keys of a test. The compare of the findings of the
+bucket fsck with the findings of `ostree fsck -a` runs on a dump of the
+stand-in, which makes each corruption with no write through S3.
 
 ## The client access of `ostrya serve`
 

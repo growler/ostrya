@@ -7,7 +7,9 @@
 //! then change the bucket. Other tests run against `rclone serve s3`, which
 //! refuses each writer, and against `weed mini` of SeaweedFS. A test on a
 //! real server skips when its program is absent. `OSTRYA_REQUIRE_S3` and
-//! `OSTRYA_REQUIRE_SEAWEEDFS` turn each skip into a failure.
+//! `OSTRYA_REQUIRE_SEAWEEDFS` turn each skip into a failure. One test runs
+//! `ostree fsck` on a dump of the stand-in, and skips when `ostree` is
+//! absent. `OSTRYA_REQUIRE_OSTREE` turns that skip into a failure.
 
 #![cfg(feature = "s3")]
 
@@ -580,6 +582,151 @@ fn the_findings_on_the_objects_are_those_of_the_local_fsck() {
             .collect();
         assert_eq!(bucket, local);
         assert_eq!(bucket.len(), 3);
+    });
+}
+
+/// One finding on an object: the object name, the kind, and the commits
+/// that reach the object, sorted.
+type ObjectFinding = (String, &'static str, Vec<Checksum>);
+
+/// Returns the finding of each line that `ostree fsck -a` writes to standard
+/// error.
+///
+/// A line names the commits that reach the object. For a commit object, the
+/// line names the commit itself. If a ref names the commit, a line with no
+/// commits comes first, and then the line that names the commit. So the
+/// commit itself is not in the commits of the finding, and the two lines
+/// give one finding. The fsck of a bucket names no commit for a commit
+/// object.
+fn tool_findings(stderr: &str) -> BTreeSet<ObjectFinding> {
+    let mut findings = BTreeSet::new();
+    for line in stderr.lines() {
+        if line.starts_with("Marking commit as partial: ")
+            || line == "error: Repository corruption encountered"
+        {
+            continue;
+        }
+        let (commits, rest) = match line.strip_prefix("In commits ") {
+            Some(rest) => rest.split_once(": ").unwrap(),
+            None => match line.strip_prefix("Object missing in commits ") {
+                Some(rest) => {
+                    let (commits, object) = rest.split_once(": ").unwrap();
+                    findings.insert((object.to_owned(), "missing", parse_commits(commits)));
+                    continue;
+                }
+                None => ("", line),
+            },
+        };
+        let (object, detail) = rest
+            .strip_prefix("fsck ")
+            .and_then(|rest| rest.split_once(": "))
+            .unwrap_or_else(|| panic!("a line of ostree fsck: {line}"));
+        let object = match object.strip_prefix("content object ") {
+            Some(checksum) => format!("{checksum}.file"),
+            None => object.to_owned(),
+        };
+        let kind = if detail.contains("; checksum expected=") {
+            "mismatch"
+        } else {
+            "corrupt"
+        };
+        let own = object.strip_suffix(".commit");
+        let commits = parse_commits(commits)
+            .into_iter()
+            .filter(|commit| Some(commit.to_hex().as_str()) != own)
+            .collect();
+        findings.insert((object, kind, commits));
+    }
+    findings
+}
+
+/// Returns the commits of a list `<c>, <c>`, sorted.
+fn parse_commits(list: &str) -> Vec<Checksum> {
+    let commits: Vec<Checksum> = list
+        .split(", ")
+        .filter(|commit| !commit.is_empty())
+        .map(|commit| Checksum::from_hex(commit).unwrap())
+        .collect();
+    sorted(&commits)
+}
+
+/// Asserts that `ostree fsck -a` on a dump of the bucket of `f` to `dump`
+/// gives the same `count` findings on the objects as the fsck of the
+/// bucket, and exits 0 only if the fsck of the bucket finds no error.
+async fn assert_tool_agrees(f: &Fixture, dump: &str, count: usize) {
+    let dir = f.tmp.path().join(dump);
+    f.server.dump("repo", &dir);
+    let out = common::tool_fsck_output(&dir, &["-a"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let tool = tool_findings(&stderr);
+    let report = f.fsck().await;
+    let bucket: BTreeSet<ObjectFinding> = report
+        .findings
+        .iter()
+        .filter(|found| found.error)
+        .map(|found| {
+            (
+                found.object.unwrap().to_string(),
+                found.kind.as_str(),
+                found.commits.clone(),
+            )
+        })
+        .collect();
+    assert_eq!(bucket, tool, "{dump}: {stderr}");
+    assert_eq!(tool.len(), count, "{dump}: {stderr}");
+    assert_eq!(
+        out.status.success(),
+        !report.has_errors(),
+        "{dump}: {stderr}"
+    );
+}
+
+/// `ostree fsck -a` on a dump of the bucket gives the same findings on the
+/// objects as the fsck of the bucket, and exits 0 only if the fsck of the
+/// bucket finds no error. One fixture is clean, and then gets the changes
+/// that keep the walk: a filez with the bytes of another file, a changed
+/// dirmeta, and a removed file. A changed dirtree and a changed commit
+/// change the walk, so each gets a fixture of its own.
+#[test]
+fn the_findings_agree_with_ostree_fsck_on_a_dump_of_the_bucket() {
+    if !common::ostree_available() {
+        eprintln!(
+            "skipping the_findings_agree_with_ostree_fsck_on_a_dump_of_the_bucket: \
+             ostree is not installed"
+        );
+        return;
+    }
+    block_on(async {
+        let f = Fixture::new(None).await;
+        assert_tool_agrees(&f, "clean", 0).await;
+        let head_file = f.entry(&f.head, &[], "file", false).await;
+        let first_file = f.entry(&f.first, &[], "file", false).await;
+        let other = f.object(ObjectType::File, &first_file);
+        f.replace(ObjectType::File, &head_file, &other);
+        // Each directory of each commit has the one dirmeta.
+        let meta = f.local.load_commit(&f.side).await.unwrap().0.root_dirmeta;
+        let mut changed = f.object(ObjectType::DirMeta, &meta);
+        changed[0] ^= 1;
+        f.replace(ObjectType::DirMeta, &meta, &changed);
+        let nested = f.entry(&f.head, &["sub", "deep"], "nested", false).await;
+        f.remove(ObjectType::File, &nested);
+        assert_tool_agrees(&f, "objects", 3).await;
+
+        let f = Fixture::new(None).await;
+        let other = f.object(ObjectType::DirTree, &f.root(&f.head).await);
+        f.replace(ObjectType::DirTree, &f.root(&f.side).await, &other);
+        assert_tool_agrees(&f, "dirtree", 1).await;
+
+        let f = Fixture::new(None).await;
+        let other = f.object(ObjectType::Commit, &f.side);
+        f.replace(ObjectType::Commit, &f.first, &other);
+        assert_tool_agrees(&f, "commit", 1).await;
+
+        // A ref names `head`.
+        let f = Fixture::new(None).await;
+        let other = f.object(ObjectType::Commit, &f.first);
+        f.replace(ObjectType::Commit, &f.head, &other);
+        assert_tool_agrees(&f, "ref-commit", 1).await;
     });
 }
 

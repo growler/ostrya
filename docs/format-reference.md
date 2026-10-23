@@ -5480,6 +5480,13 @@ the path of the file under the prefix of the address. The bucket client of
 the port (`ostrya_remote::s3::Bucket`) reads and writes the objects with the
 S3 API. It signs each request with AWS Signature Version 4.
 
+The keys have the layout of a static `archive` repository, which the
+`ostree` command reads over HTTP with no signature, at the URL of the bucket
+followed by `/PREFIX`. The `ostree` command reads no key under
+`extensions/`. `conformance/cli-behavior.md`, "A 403 for an optional
+file", records the reads of the `ostree` command with a bucket policy that
+gives no `s3:ListBucket`.
+
 ### The address
 
 The address of a bucket repository is `s3://BUCKET[/PREFIX]`.

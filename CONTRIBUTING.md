@@ -96,13 +96,59 @@ requests of one method to a key and change its objects before a request,
 so the tests cover each failure state of a push. The tests of a push and a pull, of a
 multipart upload, and of a wrong secret key run against `weed mini` of
 SeaweedFS. `rclone serve s3` ignores `If-None-Match`, so the tests against
-it check that the init and the push are refused. A test skips if `rclone` or
-`weed` is not on `PATH`, and the two variables turn each skip into a
-failure:
+it check that the init and the push are refused. Other tests pull a pushed
+bucket with the `ostree` command over HTTP with no signature: from the
+stand-in, which answers 403 for the keys of a test, and from the S3 port of
+`weed mini`, which the harness starts with the identity `anonymous` and the
+action `Read`. They run `ostree fsck` on a dump of the bucket, which the S3
+client of the port writes to a scratch directory, because SeaweedFS keeps no
+tree of files on disk. A test skips if `rclone`, `weed`, the `ostree`
+command, or the ed25519 engine of the `ostree` command is absent, and the
+four variables turn each skip into a failure:
+
+```sh
+OSTRYA_REQUIRE_S3=1 OSTRYA_REQUIRE_SEAWEEDFS=1 OSTRYA_REQUIRE_OSTREE=1 \
+    OSTRYA_REQUIRE_OSTREE_ED25519=1 \
+    cargo test -p ostrya --features push,s3 --test push_s3
+```
+
+The tests of the tree push to a bucket repository in
+`crates/ostrya/tests/push_tree_s3.rs` need the `push` and `s3` features.
+Most of them run against the stand-in S3 server, and the others against
+`weed mini` and `rclone serve s3`:
 
 ```sh
 OSTRYA_REQUIRE_S3=1 OSTRYA_REQUIRE_SEAWEEDFS=1 \
-    cargo test -p ostrya --features push,s3 --test push_s3
+    cargo test -p ostrya --features push,s3 --test push_tree_s3
+```
+
+The tests of the reachability walk, of the fsck, of the prune, and of the
+summary update of a bucket repository in
+`crates/ostrya/tests/bucket_walk.rs`, `bucket_fsck.rs`, `bucket_prune.rs`,
+and `bucket_summary.rs` need the `s3` feature. The tests against `weed mini`
+also need the `push` feature, and the GPG test of the summary update needs
+the `sign-gpg` feature. Most of the tests copy the files of a local
+`archive` repository into the stand-in S3 server, and then change the
+bucket. The others run against `rclone serve s3` and `weed mini`. A test of
+`bucket_fsck.rs` compares the findings of the fsck with the findings of
+`ostree fsck -a` on a dump of the stand-in, and a test of `bucket_prune.rs`
+runs `ostree fsck` on such a dump. A test skips if `rclone`, `weed`, the
+`ostree` command, or `gpg` is absent, and the four variables turn each skip
+into a failure:
+
+```sh
+OSTRYA_REQUIRE_S3=1 OSTRYA_REQUIRE_SEAWEEDFS=1 OSTRYA_REQUIRE_OSTREE=1 \
+    OSTRYA_REQUIRE_GNUPG=1 cargo test -p ostrya --features push,s3,sign-gpg \
+    --test bucket_walk --test bucket_fsck --test bucket_prune --test bucket_summary
+```
+
+The module `s3_remote` of `crates/ostrya/tests/pull_collection.rs` needs the
+`s3` feature. It pulls collection refs from a bucket repository on the
+stand-in S3 server and on `rclone serve s3`, each case in a child process
+with the key pair of the tests:
+
+```sh
+OSTRYA_REQUIRE_S3=1 cargo test -p ostrya --features s3 --test pull_collection s3_remote
 ```
 
 The tests of the `ostrya` command with a bucket repository in
@@ -114,10 +160,12 @@ against the stand-in S3 server, which keeps the `Authorization` header of
 each request, so the tests of `--s3-region` and `--s3-profile` need no
 rclone. One test reads a copy of the `archive` fixture through `rclone
 serve s3`, and one test runs an init, a push, and a pull against `weed
-mini`. The two variables turn each skip into a failure:
+mini`. That test also pulls the push from the S3 port of `weed mini` with
+the `ostree` command, and skips this part if the `ostree` command is
+absent. The three variables turn each skip into a failure:
 
 ```sh
-OSTRYA_REQUIRE_S3=1 OSTRYA_REQUIRE_SEAWEEDFS=1 \
+OSTRYA_REQUIRE_S3=1 OSTRYA_REQUIRE_SEAWEEDFS=1 OSTRYA_REQUIRE_OSTREE=1 \
     cargo test -p ostrya-cli --test s3
 ```
 
@@ -254,9 +302,13 @@ program sets the related variable, and then an absent program fails the
 test:
 
 - `OSTRYA_REQUIRE_OSTREE` -- the `ostree` tool, for the cross-checks. Some
-  of these tests are the `evidence:` of a conformance record.
+  of these tests are the `evidence:` of a conformance record. The
+  cross-checks include the pull and the fsck of a bucket repository by the
+  tool.
 - `OSTRYA_REQUIRE_OSTREE_ED25519` -- the ed25519 engine of the `ostree`
-  tool, which `ostree --version` shows as `sign-ed25519`.
+  tool, which `ostree --version` shows as `sign-ed25519`. The ed25519
+  cross-checks include the verify of the signed summary of a bucket
+  repository by the tool.
 - `OSTRYA_REQUIRE_GNUPG` -- `gpg` and `gpgv`, for each GPG test.
 - `OSTRYA_REQUIRE_MULTIGROUP` -- a second group of the process, for the
   ownership tests of `pull-local`. These tests are the only coverage of the
@@ -264,13 +316,15 @@ test:
 - `OSTRYA_REQUIRE_MOUNT` -- `CAP_SYS_ADMIN` and fs-verity, for the mount
   tests (see "Tests").
 - `OSTRYA_REQUIRE_S3` -- `rclone`, for the tests of the bucket client, of
-  the pull from an `s3://` address, and of a bucket repository against
-  `rclone serve s3`: the writer lock, the listing, the init, the push, and
-  the commands of the `ostrya` command (see "Tests").
-- `OSTRYA_REQUIRE_SEAWEEDFS` -- `weed` of SeaweedFS, for the tests of the
-  writer lock, of the object listing, of the init, and of the push to a
-  bucket repository against `weed mini`, through the library and through
-  the `ostrya` command (see "Tests").
+  the pull from an `s3://` address, of the pull of collection refs, and of
+  a bucket repository against `rclone serve s3`: the writer lock, the
+  listing, the init, the push, the tree push, the fsck, the prune, and the
+  commands of the `ostrya` command (see "Tests").
+- `OSTRYA_REQUIRE_SEAWEEDFS` -- `weed` of SeaweedFS, for the tests of a
+  bucket repository against `weed mini`: the writer lock, the object
+  listing, the init, the push, the tree push, the fsck, the prune, the
+  summary update, and the pull of the `ostree` command, through the library
+  and through the `ostrya` command (see "Tests").
 
 The CI test job sets `OSTRYA_REQUIRE_GNUPG`, `OSTRYA_REQUIRE_MULTIGROUP`, and
 `OSTRYA_REQUIRE_S3`. It installs `rclone` from the release archive of the

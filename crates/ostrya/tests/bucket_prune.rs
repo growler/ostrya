@@ -335,25 +335,6 @@ fn copy_dir(from: &Path, to: &Path) {
     assert!(status.success(), "cp -a {}", from.display());
 }
 
-/// Writes each key of the repository in the stand-in under `dir`, with the
-/// directories of a repository, so the `ostree` command can read it.
-fn dump(f: &Fixture, dir: &Path) {
-    for (key, bytes) in f.snapshot() {
-        let Some(rel) = key.strip_prefix("repo/") else {
-            continue;
-        };
-        if rel.starts_with("extensions/") {
-            continue;
-        }
-        let path = dir.join(rel);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, bytes).unwrap();
-    }
-    for sub in ["tmp", "refs/heads", "refs/remotes", "refs/mirrors", "state"] {
-        std::fs::create_dir_all(dir.join(sub)).unwrap();
-    }
-}
-
 /// Pulls `refs` from the bucket of `f` into a new `archive` repository, and
 /// returns it.
 async fn pull(f: &Fixture, server: &str, refs: &[&str]) -> Repo {
@@ -410,7 +391,7 @@ fn a_prune_after_a_ref_move_deletes_the_old_commits_and_a_pull_works() {
         assert_eq!(pulled.resolve_rev("main", false).await.unwrap(), Some(f.c3));
         if common::ostree_available() {
             let dir = f.tmp.path().join("dump");
-            dump(&f, &dir);
+            f.server.dump("repo", &dir);
             common::tool_fsck(&dir);
         } else {
             eprintln!("skipping the ostree fsck of the pruned bucket: ostree is not installed");

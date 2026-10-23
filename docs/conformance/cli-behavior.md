@@ -986,6 +986,41 @@ checks that remote against the binding of the commit:
 
 `cli-surface.md`, "P2", `pull`, records the port side.
 
+#### A 403 for an optional file
+
+S3 answers a read of an absent key with 403 `AccessDenied` when the caller
+has no `s3:ListBucket` on the bucket. These records come from libostree
+2026.1. The server is an HTTP server that answers 403 for the keys of each
+case. The remote is a bucket repository that `ostrya push` wrote, with one
+commit, no detached metadata, and no static delta. A case "with a summary"
+also has the summary that `ostrya remote summary -u` writes. The client is
+a `bare-user` repository that pulls one ref.
+
+- A 403 for `summary.sig`, with a summary: the pull sends the requests of
+  "Request order with a summary", and exits 0.
+- A 403 for the delta index, with a summary: the same requests, and exit 0.
+- A 403 for `objects/<commit>.commitmeta`, with a summary: the same
+  requests, and exit 0. The commit gets no detached metadata.
+- A 403 for the superblock `deltas/<to_b64[0:2]>/<to_b64[2:]>/superblock`,
+  with no summary: the pull sends the requests of "Request order with no
+  summary", and exits 0.
+- A 403 for each absent key, with a summary: `summary.sig`, the delta index,
+  and the `.commitmeta` get 403. The pull sends the requests of "Request
+  order with a summary", and exits 0.
+- A 403 for each absent key, with no summary: `summary.sig`, `summary`, the
+  superblock, and the `.commitmeta` get 403. The pull fetches
+  `refs/heads/<ref>` in place of the summary, sends the requests of "Request
+  order with no summary", and exits 0.
+- A 403 for `config`, with a summary: the pull requests `summary.sig`,
+  `summary`, and `config`, and no request follows. It exits 1 with
+  `error: While fetching <url>/config: Server returned HTTP 403`.
+
+So the tool reads a 403 for `summary.sig`, `summary`, a delta index, a
+superblock, and a `.commitmeta` as a 404. In each case, no request carries
+an `Authorization` header, and the tool requests no key under
+`extensions/`. The request path holds each `+` of a modified base64
+checksum as `+`, with no percent-encoding.
+
 #### Content objects in an archive destination
 
 A pull from an archive remote into an archive repository stores each `.filez`

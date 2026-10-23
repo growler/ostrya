@@ -10,6 +10,13 @@
 //! A test on a real server skips when its program is absent.
 //! `OSTRYA_REQUIRE_SEAWEEDFS` and `OSTRYA_REQUIRE_S3` turn each skip into a
 //! failure. No test reads the AWS environment.
+//!
+//! The tests of the `ostree` command pull a pushed bucket over HTTP with no
+//! signature: from the stand-in, and from the S3 port of SeaweedFS with the
+//! identity `anonymous`. They run `ostree fsck` on a dump of the bucket,
+//! because SeaweedFS keeps no tree of files on disk. A test skips when
+//! `ostree` is absent, and `OSTRYA_REQUIRE_OSTREE` turns the skip into a
+//! failure.
 
 #![cfg(all(feature = "push", feature = "s3"))]
 
@@ -1767,6 +1774,509 @@ fn a_bucket_config_with_a_value_that_is_no_boolean_refuses_the_push() {
         assert_unchanged(&server);
         assert!(keys(&server, "repo/refs/").is_empty());
     }
+}
+
+// ---------------------------------------------------------------------------
+// The `ostree` command.
+// ---------------------------------------------------------------------------
+
+/// The public key of [`SECRET_B64`].
+const PUBLIC_B64: &str = "wjs0bB1XL4GE6M+szm+Tryv7/Jx+iny0d3X3bJ+mUsk=";
+
+/// A public key of no signer of the tests.
+const OTHER_PUBLIC_B64: &str = "5WYA48XDLt1Tw6UD6mF5sMzJRCXqpaUjPPrO2C37pto=";
+
+/// Returns `true` if the `ostree` command runs. Else the function writes the
+/// reason of the skip of `test` to standard error. With
+/// `OSTRYA_REQUIRE_OSTREE` set, an absent command fails the test.
+fn tool_available(test: &str) -> bool {
+    let found = common::ostree_available();
+    if !found {
+        eprintln!("skipping {test}: ostree is not installed");
+    }
+    found
+}
+
+/// Runs the `ostree` command with `args`, and returns its output with no
+/// check of the exit status.
+fn tool(args: &[&str]) -> std::process::Output {
+    std::process::Command::new("ostree")
+        .args(args)
+        .output()
+        .unwrap()
+}
+
+/// Runs the `ostree` command with `args`, asserts that it succeeds, and
+/// returns its standard output.
+fn tool_ok(args: &[&str]) -> String {
+    let out = tool(args);
+    assert!(
+        out.status.success(),
+        "ostree {args:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8(out.stdout).unwrap()
+}
+
+/// Creates a repository of the `ostree` command at `path` with `mode`, with
+/// the remote `w` at `url` and the remote keys `keys`, and returns its
+/// `--repo` option. The remote verifies no GPG signature.
+fn tool_client(path: &Path, mode: &str, url: &str, keys: &[&str]) -> String {
+    let repo = format!("--repo={}", path.display());
+    tool_ok(&[&repo, "init", &format!("--mode={mode}")]);
+    // The host of the tests can have little free space.
+    tool_ok(&[&repo, "config", "set", "core.min-free-space-percent", "0"]);
+    let sets: Vec<String> = keys.iter().map(|key| format!("--set={key}")).collect();
+    let mut add = vec![repo.as_str(), "remote", "add", "--no-gpg-verify"];
+    add.extend(sets.iter().map(String::as_str));
+    add.extend(["w", url]);
+    tool_ok(&add);
+    repo
+}
+
+/// Returns the commit that the ref `w:main` of the client `repo` names, or
+/// `None`.
+fn tool_tip(repo: &str) -> Option<Checksum> {
+    let out = tool(&[repo, "rev-parse", "w:main"]);
+    out.status
+        .success()
+        .then(|| Checksum::from_hex(String::from_utf8(out.stdout).unwrap().trim()).unwrap())
+}
+
+/// Returns the options of a summary update with the signer of
+/// [`SECRET_B64`].
+fn signed_summary() -> ostrya::bucket::BucketSummaryOptions {
+    let mut opts = ostrya::bucket::BucketSummaryOptions::default();
+    opts.summary_signers = vec![signer()];
+    opts
+}
+
+/// Returns the key of the delta index of `to`, relative to the prefix of the
+/// repository.
+fn delta_index(to: &Checksum) -> String {
+    let b64 = to.to_base64_modified();
+    format!("delta-indexes/{}/{}.index", &b64[..2], &b64[2..])
+}
+
+/// Returns the key of the superblock of the delta from scratch to `to`,
+/// relative to the prefix of the repository.
+fn scratch_superblock(to: &Checksum) -> String {
+    let b64 = to.to_base64_modified();
+    format!("deltas/{}/{}/superblock", &b64[..2], &b64[2..])
+}
+
+/// Returns the keys that `server` got a request for, relative to the
+/// prefix of the repository. Asserts that each request is a `GET` with no
+/// `Authorization` header.
+fn unsigned_reads(server: &StandIn) -> Vec<String> {
+    let state = server.state();
+    state
+        .requests
+        .iter()
+        .zip(&state.authorizations)
+        .map(|((method, target), authorization)| {
+            assert_eq!(method, "GET", "{target}");
+            assert_eq!(*authorization, None, "{target}");
+            target.strip_prefix("/bkt/repo/").unwrap().to_owned()
+        })
+        .collect()
+}
+
+/// Inits the bucket repository of `server`, pushes a commit of `content` on
+/// `main` from a new repository in `scratch`, and returns the commit. With
+/// `summary` set, a summary update follows the push. The requests of the
+/// setup are then cleared.
+async fn pushed(scratch: &Path, server: &StandIn, content: &str, summary: bool) -> Checksum {
+    init(&server.endpoint(), None).await;
+    let repo = archive(&scratch.join(format!("src-{content}"))).await;
+    let tip = commit(&repo, "main", None, content, None).await;
+    push(&repo, &server.endpoint(), opts(&["main"]))
+        .await
+        .unwrap();
+    if summary {
+        let bucket = BucketRepo::open(&endpoint(&server.endpoint(), ADDRESS))
+            .await
+            .unwrap();
+        let opts = ostrya::bucket::BucketSummaryOptions::default();
+        bucket.update_summary(&opts).await.unwrap();
+    }
+    let mut state = server.state();
+    state.requests.clear();
+    state.authorizations.clear();
+    tip
+}
+
+/// The `ostree` command reads a 403 for `summary.sig`, `summary`, the delta
+/// index, the superblock of a delta, and a `.commitmeta` as an absent key,
+/// and the pull goes on. A 403 for `config` after a summary fails the pull.
+/// So a pull over the anonymous policy of a bucket needs no
+/// `s3:ListBucket`.
+#[test]
+fn the_ostree_command_reads_a_403_as_an_absent_key_and_fails_on_config_alone() {
+    if !tool_available("the_ostree_command_reads_a_403_as_an_absent_key_and_fails_on_config_alone")
+    {
+        return;
+    }
+    let scratch = TmpDir::new("push-s3-tool-403");
+    let with_summary = StandIn::start();
+    let no_summary = StandIn::start();
+    let (tip_with, tip_without) = block_on(async {
+        (
+            pushed(scratch.path(), &with_summary, "with", true).await,
+            pushed(scratch.path(), &no_summary, "without", false).await,
+        )
+    });
+    // The case, whether the bucket holds a summary, and the refused key, or
+    // `None` for a 403 for each absent key.
+    let cases = [
+        ("summary.sig", true, Some("summary.sig")),
+        ("config", true, Some("config")),
+        ("index", true, Some("index")),
+        ("commitmeta", true, Some("commitmeta")),
+        ("superblock", false, Some("superblock")),
+        ("absent keys with a summary", true, None),
+        ("absent keys with no summary", false, None),
+    ];
+    for (n, (case, summary, refused)) in cases.into_iter().enumerate() {
+        let (server, tip) = if summary {
+            (&with_summary, tip_with)
+        } else {
+            (&no_summary, tip_without)
+        };
+        let commitmeta = object_path(ObjectType::CommitMeta, &tip);
+        // The first requests of the pull.
+        let first = if summary {
+            ["summary.sig", "summary", "config"]
+                .map(str::to_owned)
+                .to_vec()
+        } else {
+            ["summary.sig", "summary", "refs/heads/main"]
+                .map(str::to_owned)
+                .to_vec()
+        };
+        let delta = if summary {
+            delta_index(&tip)
+        } else {
+            scratch_superblock(&tip)
+        };
+        let first: Vec<String> = first
+            .into_iter()
+            .chain([
+                delta,
+                commitmeta.clone(),
+                object_path(ObjectType::Commit, &tip),
+            ])
+            .collect();
+        {
+            let mut state = server.state();
+            state.requests.clear();
+            state.authorizations.clear();
+            state.refuse = None;
+            state.forbid_absent = refused.is_none();
+            if let Some(key) = refused {
+                let key = match key {
+                    "index" => delta_index(&tip),
+                    "superblock" => scratch_superblock(&tip),
+                    "commitmeta" => commitmeta,
+                    key => key.to_owned(),
+                };
+                state.refuse = Some(("GET", format!("repo/{key}")));
+            }
+        }
+        let client = tool_client(
+            &scratch.path().join(format!("client-{n}")),
+            "bare-user",
+            &server.url("repo"),
+            &[],
+        );
+        let out = tool(&[&client, "pull", "w", "main"]);
+        let reads = unsigned_reads(server);
+        if case == "config" {
+            assert_eq!(out.status.code(), Some(1), "{case}");
+            assert_eq!(reads, first[..3], "{case}");
+            let stderr = String::from_utf8_lossy(&out.stderr);
+            assert!(
+                stderr.contains(&format!("{}/config", server.url("repo"))),
+                "{stderr}"
+            );
+            assert_eq!(tool_tip(&client), None, "{case}");
+            continue;
+        }
+        assert!(
+            out.status.success(),
+            "{case}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert_eq!(reads[..first.len()], first, "{case}");
+        assert_eq!(tool_tip(&client), Some(tip), "{case}");
+    }
+}
+
+/// The lock of a writer is in the bucket. The `ostree` command pulls with
+/// no signature on a request, and reads no key under `extensions/`.
+#[test]
+fn the_ostree_command_pulls_from_the_stand_in_with_no_signature_and_reads_no_extensions_key() {
+    if !tool_available(
+        "the_ostree_command_pulls_from_the_stand_in_with_no_signature_and_reads_no_extensions_key",
+    ) {
+        return;
+    }
+    let scratch = TmpDir::new("push-s3-tool-extensions");
+    let server = StandIn::start();
+    let tip = block_on(pushed(scratch.path(), &server, "one", true));
+    server.state().store(LOCK, DEAD_LOCK.as_bytes());
+    let client = tool_client(
+        &scratch.path().join("client"),
+        "archive",
+        &server.url("repo"),
+        &[],
+    );
+    tool_ok(&[&client, "pull", "w", "main"]);
+    assert_eq!(tool_tip(&client), Some(tip));
+    let reads = unsigned_reads(&server);
+    assert!(
+        reads.iter().all(|key| !key.starts_with("extensions/")),
+        "{reads:?}"
+    );
+}
+
+/// The `ostree` command verifies the ed25519 signature of a summary that
+/// the port writes, and refuses the summary under another key.
+#[test]
+fn the_ostree_command_verifies_an_ed25519_summary_that_the_port_signs() {
+    let test = "the_ostree_command_verifies_an_ed25519_summary_that_the_port_signs";
+    if !tool_available(test) {
+        return;
+    }
+    if !common::ostree_supports_ed25519() {
+        eprintln!("skipping {test}: ostree has no ed25519 engine");
+        return;
+    }
+    let scratch = TmpDir::new("push-s3-tool-signed");
+    let server = StandIn::start();
+    let tip = block_on(async {
+        let tip = pushed(scratch.path(), &server, "one", false).await;
+        let bucket = BucketRepo::open(&endpoint(&server.endpoint(), ADDRESS))
+            .await
+            .unwrap();
+        bucket.update_summary(&signed_summary()).await.unwrap();
+        tip
+    });
+    for (n, key, verifies) in [(0, PUBLIC_B64, true), (1, OTHER_PUBLIC_B64, false)] {
+        let client = tool_client(
+            &scratch.path().join(format!("client-{n}")),
+            "bare-user",
+            &server.url("repo"),
+            &[
+                "sign-verify-summary=true",
+                &format!("verification-ed25519-key={key}"),
+            ],
+        );
+        let out = tool(&[&client, "pull", "w", "main"]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(out.status.success(), verifies, "{key}: {stderr}");
+        assert_eq!(
+            stderr.contains("ed25519: Signature couldn't be verified"),
+            !verifies,
+            "{key}: {stderr}"
+        );
+        assert_eq!(tool_tip(&client), verifies.then_some(tip), "{key}");
+    }
+}
+
+/// A push from an `archive` repository and from a `bare-user-only`
+/// repository to two prefixes. The push from the `archive` repository has
+/// an object of three parts, which goes up as a multipart upload. The
+/// `ostree` command checks a dump of each prefix, and pulls each one with no
+/// signature over the S3 port, with no summary. After a summary update with
+/// an ed25519 signer, it pulls the second prefix with the summary verified.
+#[test]
+fn the_ostree_command_checks_and_pulls_a_push_on_seaweedfs() {
+    let test = "the_ostree_command_checks_and_pulls_a_push_on_seaweedfs";
+    if !seaweed_available(test) || !tool_available(test) {
+        return;
+    }
+    let scratch = TmpDir::new("push-s3-weed-tool");
+    let large_src = build_tree(&scratch.path().join("large"));
+    std::fs::write(large_src.join("large"), incompressible(12 << 20)).unwrap();
+    let src = build_tree(scratch.path());
+    let sources = [
+        ("repo", RepoMode::Archive, large_src),
+        ("repo2", RepoMode::BareUserOnly, src),
+    ];
+    let repos = block_on(async {
+        let mut repos = Vec::new();
+        for (prefix, mode, src) in &sources {
+            let (path, _, tip) = repo_of(scratch.path(), *mode, src).await;
+            repos.push((*prefix, path, tip));
+        }
+        repos
+    });
+    // The start of the server runs its own `block_on`, so it comes between
+    // the two of the test.
+    let server = Seaweed::start_anonymous(scratch.path(), "bkt");
+    block_on(async {
+        for (prefix, path, _) in &repos {
+            let s3 = endpoint(&server.endpoint(), &format!("s3://bkt/{prefix}"));
+            let bucket = BucketRepo::open(&s3).await.unwrap();
+            assert_eq!(bucket.init(None, None, false).await.unwrap(), None);
+            let repo = Repo::open(path).await.unwrap();
+            let push_opts = RepoPushOptions {
+                part_size: Some(5 << 20),
+                ..opts(&["main"])
+            };
+            repo.push_to_bucket(s3, push_opts).await.unwrap();
+            let listing = bucket.bucket().list("objects/").await.unwrap();
+            let large: Vec<&str> = listing
+                .objects
+                .iter()
+                .filter(|listed| listed.size > 10 << 20)
+                .map(|listed| listed.key.as_str())
+                .collect();
+            if *prefix == "repo" {
+                // The `ETag` of a multipart upload ends in the count of its
+                // parts.
+                let stream = bucket.bucket().get_stream(large[0]).await.unwrap();
+                let etag = stream.unwrap().etag().map(str::to_owned);
+                assert!(
+                    etag.as_ref().is_some_and(|etag| etag.ends_with("-3\"")),
+                    "{etag:?}"
+                );
+            } else {
+                assert_eq!(large, Vec::<&str>::new());
+            }
+            common::dump_bucket(
+                bucket.bucket(),
+                &scratch.path().join(format!("dump-{prefix}")),
+            )
+            .await;
+        }
+    });
+    for (prefix, _, tip) in &repos {
+        common::tool_fsck(&scratch.path().join(format!("dump-{prefix}")));
+        let path = scratch.path().join(format!("client-{prefix}"));
+        let client = tool_client(&path, "archive", &server.url("bkt", prefix), &[]);
+        tool_ok(&[&client, "pull", "w", "main"]);
+        assert_eq!(tool_tip(&client), Some(*tip), "{prefix}");
+    }
+    common::tool_fsck(&scratch.path().join("client-repo2"));
+    if !common::ostree_supports_ed25519() {
+        eprintln!("skipping the signed summary of {test}: ostree has no ed25519 engine");
+        return;
+    }
+    block_on(async {
+        let bucket = BucketRepo::open(&endpoint(&server.endpoint(), "s3://bkt/repo2"))
+            .await
+            .unwrap();
+        bucket.update_summary(&signed_summary()).await.unwrap();
+    });
+    let client = tool_client(
+        &scratch.path().join("client-signed"),
+        "bare-user",
+        &server.url("bkt", "repo2"),
+        &[
+            "sign-verify-summary=true",
+            &format!("verification-ed25519-key={PUBLIC_B64}"),
+        ],
+    );
+    tool_ok(&[&client, "pull", "w", "main"]);
+    assert_eq!(tool_tip(&client), Some(repos[1].2));
+}
+
+/// A delta whose key holds `+` goes into the bucket next to a push, and a
+/// summary update lists it. The `ostree` command pulls it with
+/// `--require-static-deltas` into a `bare-user` repository, and the port
+/// pulls it over `s3://` with
+/// [`require_static_deltas`](PullOptions::require_static_deltas).
+#[test]
+fn a_delta_whose_key_holds_a_plus_pulls_with_the_ostree_command_and_the_port_on_seaweedfs() {
+    let test =
+        "a_delta_whose_key_holds_a_plus_pulls_with_the_ostree_command_and_the_port_on_seaweedfs";
+    if !seaweed_available(test) || !tool_available(test) {
+        return;
+    }
+    let scratch = TmpDir::new("push-s3-weed-delta");
+    let server = Seaweed::start_anonymous(scratch.path(), "bkt");
+    let url = server.url("bkt", "repo");
+    let local = scratch.path().join("src");
+    let (first, port) = block_on(async {
+        init(&server.endpoint(), None).await;
+        let repo = archive(&local).await;
+        let first = commit(&repo, "main", None, "first", None).await;
+        push(&repo, &server.endpoint(), opts(&["main"]))
+            .await
+            .unwrap();
+        let port = scratch.path().join("port");
+        let s3 = endpoint(&server.endpoint(), ADDRESS);
+        let pulled = pull_back(s3, &port, &["main"], PullTrust::unverified()).await;
+        assert_eq!(
+            pulled.resolve_rev("main", false).await.unwrap(),
+            Some(first)
+        );
+        (first, port)
+    });
+    let client_path = scratch.path().join("client");
+    let client = tool_client(&client_path, "bare-user", &url, &[]);
+    tool_ok(&[&client, "pull", "w", "main"]);
+    let (second, delta) = block_on(async {
+        let repo = Repo::open(&local).await.unwrap();
+        // The key of a delta holds the modified base64 of its two commits,
+        // so about three keys in four hold a `+`, and each key holds one if
+        // the part of `first` holds one.
+        let mut n = 0;
+        let (second, delta) = loop {
+            let second = commit(&repo, "main", Some(first), &format!("second {n}"), None).await;
+            let delta = repo
+                .generate_static_delta(Some(&first), &second, &ostrya::DeltaOptions::default())
+                .await
+                .unwrap();
+            let delta = delta.to_str().unwrap().to_owned();
+            if delta.contains('+') {
+                break (second, delta);
+            }
+            n += 1;
+        };
+        push(&repo, &server.endpoint(), opts(&["main"]))
+            .await
+            .unwrap();
+        let bucket = BucketRepo::open(&endpoint(&server.endpoint(), ADDRESS))
+            .await
+            .unwrap();
+        for entry in std::fs::read_dir(local.join(&delta)).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().into_string().unwrap();
+            let bytes = std::fs::read(entry.path()).unwrap();
+            bucket
+                .bucket()
+                .put(&format!("{delta}/{name}"), bytes)
+                .await
+                .unwrap();
+        }
+        let opts = ostrya::bucket::BucketSummaryOptions::default();
+        assert_eq!(bucket.update_summary(&opts).await.unwrap().deltas, 1);
+        (second, delta)
+    });
+    tool_ok(&[&client, "pull", "--require-static-deltas", "w", "main"]);
+    assert_eq!(tool_tip(&client), Some(second), "{delta}");
+    common::tool_fsck(&client_path);
+    block_on(async {
+        let repo = Repo::open(&port).await.unwrap();
+        let session = PullSession::connect(
+            Endpoint::S3(endpoint(&server.endpoint(), ADDRESS)),
+            StreamSessionOptions::default(),
+        )
+        .await
+        .unwrap();
+        let opts = PullOptions {
+            refs: vec!["main".to_owned()],
+            require_static_deltas: true,
+            ..PullOptions::default()
+        };
+        repo.pull_with_session(session, PullTrust::unverified(), opts)
+            .await
+            .unwrap();
+        assert_eq!(repo.resolve_rev("main", false).await.unwrap(), Some(second));
+    });
 }
 
 /// The future of a push to a bucket repository can run on a multi-threaded

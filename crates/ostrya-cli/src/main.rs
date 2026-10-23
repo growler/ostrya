@@ -1692,6 +1692,10 @@ enum RemoteCommand {
     /// bucket while the bad objects of its commit stay, and a push of the
     /// commit then uploads no object for them and removes the marker.
     ///
+    /// The command needs the S3 permissions `s3:GetObject`, `s3:ListBucket`,
+    /// and `s3:ListBucketMultipartUploads`. With --delete, it also needs
+    /// `s3:PutObject` and `s3:DeleteObject`.
+    ///
     /// With an address, the command needs no repository and reads no
     /// `--repo`, current directory, or `OSTREE_REPO`. With a remote name, it
     /// reads the remote from the config of the repository.

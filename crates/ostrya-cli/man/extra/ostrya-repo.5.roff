@@ -324,6 +324,22 @@ A push that stops before its end can leave an incomplete multipart upload, which
 \fB\%ostrya remote prune\fR aborts each such upload of the repository.
 Also set a lifecycle rule \fB\%AbortIncompleteMultipartUpload\fR on the bucket, so that the S3 server aborts such an upload after a number of days.
 .PP
+A bucket repository has the layout of a static archive repository, so the \fB\%ostree\fR command pulls it over HTTP, and the bucket needs no change.
+The URL of the remote in the \fB\%ostree\fR command is \fB\%https://BUCKET.s3.REGION.amazonaws.com/PREFIX\fR, or \fB\%ENDPOINT/BUCKET/PREFIX\fR in path style.
+The \fB\%ostree\fR command sends no signature, so the bucket policy must give anonymous \fB\%s3:GetObject\fR on \fB\%PREFIX/config\fR, \fB\%PREFIX/summary\fR, \fB\%PREFIX/summary.sig\fR, \fB\%PREFIX/objects/*\fR, \fB\%PREFIX/refs/*\fR, \fB\%PREFIX/deltas/*\fR, and \fB\%PREFIX/delta\-indexes/*\fR.
+Give no anonymous read under \fB\%PREFIX/extensions/\fR.
+The writer lock under \fB\%PREFIX/extensions/\fR holds the host name and the pid of the writer, and the \fB\%ostree\fR command reads no key under \fB\%PREFIX/extensions/\fR.
+A Deny statement on \fB\%PREFIX/extensions/*\fR for each principal also refuses the signed read of the writer lock by a writer.
+.PP
+S3 answers a read of an absent key with 403 when the caller has no \fB\%s3:ListBucket\fR on the bucket.
+The \fB\%ostree\fR command reads a 403 for \fB\%summary.sig\fR, \fB\%summary\fR, a delta index, the superblock of a static delta, and a \fB\%.commitmeta\fR object as an absent file, and the pull continues.
+So the anonymous policy needs no \fB\%s3:ListBucket\fR.
+After a summary, the \fB\%ostree\fR command reads \fB\%config\fR, and a 403 for it stops the pull.
+The init writes \fB\%config\fR, and the anonymous \fB\%s3:GetObject\fR on \fB\%PREFIX/config\fR gives it.
+.PP
+The \fB\%ostrya\fR command pulls a bucket repository from its \fB\%s3://\fR address alone, with signed requests.
+Its HTTP pull reads a 403 for an optional file as an error, so it stops at the first absent optional file of a bucket repository under this policy.
+.PP
 These are the keys of a bucket repository:
 .TP
 \fB\%config\fR

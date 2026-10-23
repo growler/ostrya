@@ -314,12 +314,16 @@ For each S3 setting, the first source that sets it wins: the option, the key, th
 The key pair of a pull from an \fB\%s3://\fR address needs the permissions \fB\%s3:GetObject\fR and \fB\%s3:ListBucket\fR on the bucket.
 Without \fB\%s3:ListBucket\fR, AWS answers the read of an absent key with 403 \fB\%AccessDenied\fR in place of 404.
 The pull reads a 403 as an error, so an absent optional file, for example \fB\%summary.sig\fR or a \fB\%.commitmeta\fR object, then stops the pull.
+The \fB\%ostree\fR command pulls a bucket repository with no signature, and reads a 403 for an optional file as an absent file.
+\fB\%ostrya\-repo\fR(5), section BUCKET REPOSITORIES, gives the bucket policy for a pull with the \fB\%ostree\fR command.
 .PP
 The key pair of a push or a tree push to an \fB\%s3://\fR address needs the permissions \fB\%s3:GetObject\fR, \fB\%s3:PutObject\fR, \fB\%s3:ListBucket\fR, \fB\%s3:DeleteObject\fR, and \fB\%s3:AbortMultipartUpload\fR on the bucket.
 The key pair of the init of a bucket repository needs \fB\%s3:GetObject\fR, \fB\%s3:PutObject\fR, \fB\%s3:ListBucket\fR, and \fB\%s3:DeleteObject\fR.
 The key pair of \fB\%ostrya remote prune\fR needs the permissions of a push and \fB\%s3:ListBucketMultipartUploads\fR, also with \fB\%\-\-no\-prune\fR.
 The key pair of \fB\%ostrya remote summary \-u\fR needs \fB\%s3:GetObject\fR, \fB\%s3:PutObject\fR, \fB\%s3:ListBucket\fR, and \fB\%s3:DeleteObject\fR.
 Each of these writers takes and removes the writer lock of the bucket repository, which \fB\%ostrya\-repo\fR(5) describes.
+The key pair of \fB\%ostrya remote fsck\fR needs \fB\%s3:GetObject\fR, \fB\%s3:ListBucket\fR, and \fB\%s3:ListBucketMultipartUploads\fR.
+With \fB\%\-\-delete\fR, it also needs \fB\%s3:PutObject\fR and \fB\%s3:DeleteObject\fR, and the repair takes and removes the writer lock.
 .PP
 For an ssh address, a push reads \fB\%ssh\-command\fR and \fB\%receive\-command\fR, and ignores the HTTP keys.
 For an HTTP address, a push reads \fB\%push\-token\-file\fR, \fB\%push\-user\fR, \fB\%proxy\fR, and the TLS keys.

@@ -7,13 +7,16 @@
 //!   hour. So a test writes each file of the served directory before the
 //!   server starts.
 //! - [`Seaweed`] runs `weed mini` of SeaweedFS on a data directory in the
-//!   scratch directory, with one bucket and the same key pair.
+//!   scratch directory, with one bucket and the same key pair. On request,
+//!   the identity `anonymous` reads with no signature.
 //! - [`StandIn`] is an S3 server in the process that holds its objects in
 //!   memory. A test sets the conditional headers that it honors, the
 //!   requests that it interrupts, refuses, or delays, the requests that get
 //!   503, the lists that get 403, the keys whose `GET` gets 404 with a body
-//!   of the test, the key whose body it cuts, and the incomplete multipart
-//!   uploads that it lists and aborts.
+//!   of the test, the `GET` of an absent key that gets 403, the key whose
+//!   body it cuts, and the incomplete multipart uploads that it lists and
+//!   aborts. The server answers a request with no signature too, so the
+//!   `ostree` command pulls from it over HTTP.
 //!
 //! A test skips when `rclone` or `weed` is not on `PATH`, and writes the
 //! reason to standard error. With `OSTRYA_REQUIRE_S3` set, a missing
@@ -212,15 +215,32 @@ impl Seaweed {
     /// port that the harness picks is free again until the server binds it,
     /// so two starts at the same time can pick the same port.
     pub fn start(scratch: &Path, bucket: &str) -> Seaweed {
+        Seaweed::start_with(scratch, bucket, false)
+    }
+
+    /// Starts the server as [`Seaweed::start`] does, with the identity
+    /// `anonymous` and the action `Read`. The S3 port then answers a `GET`
+    /// with no signature, and the `ostree` command pulls over
+    /// [`Seaweed::url`]. A list with no signature gets 403.
+    pub fn start_anonymous(scratch: &Path, bucket: &str) -> Seaweed {
+        Seaweed::start_with(scratch, bucket, true)
+    }
+
+    fn start_with(scratch: &Path, bucket: &str, anonymous: bool) -> Seaweed {
         static STARTS: std::sync::Mutex<()> = std::sync::Mutex::new(());
         let _start = STARTS.lock().unwrap_or_else(|e| e.into_inner());
         let config = scratch.join("weed-s3.json");
+        let reader = if anonymous {
+            ",{\"name\":\"anonymous\",\"actions\":[\"Read\"]}"
+        } else {
+            ""
+        };
         std::fs::write(
             &config,
             format!(
                 "{{\"identities\":[{{\"name\":\"tester\",\"credentials\":[{{\"accessKey\":\
                  \"{ACCESS_KEY}\",\"secretKey\":\"{SECRET_KEY}\"}}],\"actions\":[\"Admin\",\
-                 \"Read\",\"Write\",\"List\",\"Tagging\"]}}]}}"
+                 \"Read\",\"Write\",\"List\",\"Tagging\"]}}{reader}]}}"
             ),
         )
         .unwrap();
@@ -268,6 +288,10 @@ impl Seaweed {
     ///
     /// The S3 port of `weed mini` answers before the server makes the
     /// bucket, and a read of a key then gets 404 `NoSuchBucket`.
+    ///
+    /// Each test puts its repository at the prefix `repo`, and a new server
+    /// holds no `repo/config`. If the bucket holds it, another server took
+    /// a port that the harness picked, and the function panics.
     fn wait_ready(&mut self, bucket: &str) -> bool {
         let deadline = Instant::now() + Duration::from_secs(30);
         while !answers(self.s3_port()) {
@@ -282,19 +306,25 @@ impl Seaweed {
         }
         let client = ostrya_rt::block_on(Bucket::new(&endpoint(
             &self.endpoint(),
-            &format!("s3://{bucket}"),
+            &format!("s3://{bucket}/repo"),
         )))
         .unwrap();
         loop {
-            match ostrya_rt::block_on(client.get("config", 1)) {
+            let read = ostrya_rt::block_on(client.get("config", 1 << 16));
+            if self.child.try_wait().unwrap().is_some() {
+                return false;
+            }
+            match read {
                 Err(ostrya::remote::Error::S3 {
                     code: Some(code), ..
                 }) if code == "NoSuchBucket" => {}
-                Ok(_) => return true,
+                Ok(None) => return true,
+                Ok(Some(_)) => panic!(
+                    "the bucket {bucket} on the S3 port {} holds repo/config at the start, \
+                     so another server took a port that the harness picked",
+                    self.s3_port()
+                ),
                 Err(e) => panic!("weed mini did not answer a read of the bucket {bucket}: {e}"),
-            }
-            if self.child.try_wait().unwrap().is_some() {
-                return false;
             }
             assert!(
                 Instant::now() < deadline,
@@ -314,6 +344,12 @@ impl Seaweed {
     /// Returns the endpoint URL of the S3 server.
     pub fn endpoint(&self) -> String {
         format!("http://127.0.0.1:{}", self.s3_port())
+    }
+
+    /// Returns the URL of the repository at `prefix` of the bucket `bucket`
+    /// on the S3 port, in path style.
+    pub fn url(&self, bucket: &str, prefix: &str) -> String {
+        format!("{}/{bucket}/{prefix}", self.endpoint())
     }
 
     /// Writes `body` at `key` of the bucket `bucket` through the HTTP API of
@@ -435,6 +471,9 @@ pub struct State {
     /// A key and a body: each `GET` of the key, with the prefix of the
     /// repository, gets 404 with that body.
     pub not_found: Option<(String, Vec<u8>)>,
+    /// `true` if a `GET` of an absent key gets 403 `AccessDenied`, as S3
+    /// answers a caller with no `s3:ListBucket` on the bucket.
+    pub forbid_absent: bool,
     /// `true` if the answer to a `GET` of a key has the `ETag` of the
     /// object.
     pub etag_on_get: bool,
@@ -509,6 +548,7 @@ impl StandIn {
             delay: None,
             slow_down: None,
             not_found: None,
+            forbid_absent: false,
             etag_on_get: true,
             truncate: None,
             uploads: Vec::new(),
@@ -536,7 +576,39 @@ impl StandIn {
     pub fn state(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().unwrap()
     }
+
+    /// Returns the URL of the repository at `prefix` of the bucket `bkt`, in
+    /// path style.
+    pub fn url(&self, prefix: &str) -> String {
+        format!("{}/bkt/{prefix}", self.endpoint())
+    }
+
+    /// Writes each key under `prefix/` under `dir`, with the directories of
+    /// a repository, so `Repo::open` and the `ostree` command open it. Keys
+    /// under `extensions/` stay out.
+    pub fn dump(&self, prefix: &str, dir: &Path) {
+        let start = format!("{prefix}/");
+        let state = self.state();
+        for (key, stored) in &state.objects {
+            let Some(rel) = key.strip_prefix(&start) else {
+                continue;
+            };
+            if rel.starts_with("extensions/") {
+                continue;
+            }
+            let path = dir.join(rel);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, &stored.bytes).unwrap();
+        }
+        for sub in REPO_DIRS {
+            std::fs::create_dir_all(dir.join(sub)).unwrap();
+        }
+    }
 }
+
+/// The directories of a repository that a dump of a bucket makes, so a
+/// repository with no key under them opens.
+pub const REPO_DIRS: [&str; 5] = ["tmp", "refs/heads", "refs/remotes", "refs/mirrors", "state"];
 
 /// A request that the stand-in read.
 struct Request {
@@ -708,6 +780,7 @@ fn answer(state: &mut State, request: &Request) -> (u16, Vec<(String, String)>, 
                 },
                 stored.bytes.clone(),
             ),
+            None if state.forbid_absent => (403, Vec::new(), s3_error("AccessDenied")),
             None => (404, Vec::new(), s3_error("NoSuchKey")),
         },
         "PUT" => {

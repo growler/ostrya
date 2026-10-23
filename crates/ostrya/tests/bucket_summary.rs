@@ -347,26 +347,6 @@ async fn pull(dir: &Path, url: &str, refs: &[&str], trust: PullTrust) -> ostrya:
     Ok(repo)
 }
 
-/// Writes each key of the repository in the stand-in under `dir`, with the
-/// directories of a repository, so `Repo::open` opens it. Keys under
-/// `extensions/` stay out.
-fn dump(f: &Fixture, dir: &Path) {
-    for (key, bytes) in f.snapshot() {
-        let Some(rel) = key.strip_prefix("repo/") else {
-            continue;
-        };
-        if rel.starts_with("extensions/") {
-            continue;
-        }
-        let path = dir.join(rel);
-        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-        std::fs::write(path, bytes).unwrap();
-    }
-    for sub in ["tmp", "refs/heads", "refs/remotes", "refs/mirrors", "state"] {
-        std::fs::create_dir_all(dir.join(sub)).unwrap();
-    }
-}
-
 /// Asserts that a fsck of `bucket` gives no `Summary` finding.
 async fn assert_no_summary_finding(bucket: &BucketRepo) {
     let report = bucket.fsck(&BucketFsckOptions::default()).await.unwrap();
@@ -452,7 +432,7 @@ fn the_summary_has_the_bytes_of_the_local_summary_of_a_copy() {
         assert_eq!(report.refs, 4);
         assert_eq!(report.deltas, 2);
         let dir = f.tmp.path().join("copy");
-        dump(&f, &dir);
+        f.server.dump("repo", &dir);
         let copy = Repo::open(&dir).await.unwrap();
         let opts = SummaryOptions {
             last_modified: Some(T0),

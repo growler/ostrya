@@ -467,11 +467,14 @@ pub struct State {
     /// `ListObjectsV2`, with the prefix of the repository, or `uploads` for
     /// each `ListMultipartUploads`.
     pub refuse_list: Option<String>,
-    /// A method, a key, and a time: the server waits that time before it
-    /// acts on each request of the method to the key, with the prefix of the
-    /// repository. The wait holds no lock, so the server serves the other
-    /// connections in the meantime.
+    /// A method, a key prefix, and a time: the server waits that time before
+    /// it acts on each request of the method to a key that starts with the
+    /// prefix, with the prefix of the repository. The wait holds no lock, so
+    /// the server serves the other connections in the meantime.
     pub delay: Option<(&'static str, String, Duration)>,
+    /// The most requests that [`State::delay`] matched that the server held
+    /// in their waits at one time.
+    pub max_delayed: usize,
     /// A method and a count `n`: the server answers the `n`-th request of
     /// the method with 503 `SlowDown`, and does not act on it.
     pub slow_down: Option<(&'static str, usize)>,
@@ -498,6 +501,9 @@ pub struct State {
     counts: BTreeMap<String, usize>,
     /// The number of requests that [`State::refuse_from`] matched.
     refuse_from_count: usize,
+    /// The number of requests that [`State::delay`] matched and that the
+    /// server holds in their waits.
+    delayed: usize,
     /// The number of each `ETag`.
     etags: u64,
 }
@@ -553,6 +559,7 @@ impl StandIn {
             refuse_from: None,
             refuse_list: None,
             delay: None,
+            max_delayed: 0,
             slow_down: None,
             not_found: None,
             forbid_absent: false,
@@ -561,6 +568,7 @@ impl StandIn {
             uploads: Vec::new(),
             counts: BTreeMap::new(),
             refuse_from_count: 0,
+            delayed: 0,
             etags: 0,
         }));
         let shared = state.clone();
@@ -642,17 +650,27 @@ fn serve(mut stream: TcpStream, state: &Mutex<State>) {
     let mut buffer = Vec::new();
     while let Some(request) = read_request(&mut stream, &mut buffer) {
         let key = request_key(&request.target);
-        let delay = state
-            .lock()
-            .unwrap()
-            .delay
-            .as_ref()
-            .filter(|(method, wanted, _)| {
-                *method == request.method && key.as_deref() == Some(wanted.as_str())
-            })
-            .map(|(_, _, time)| *time);
+        let delay = {
+            let mut state = state.lock().unwrap();
+            let delay = state
+                .delay
+                .as_ref()
+                .filter(|(method, prefix, _)| {
+                    *method == request.method
+                        && key
+                            .as_deref()
+                            .is_some_and(|k| k.starts_with(prefix.as_str()))
+                })
+                .map(|(_, _, time)| *time);
+            if delay.is_some() {
+                state.delayed += 1;
+                state.max_delayed = state.max_delayed.max(state.delayed);
+            }
+            delay
+        };
         if let Some(time) = delay {
             std::thread::sleep(time);
+            state.lock().unwrap().delayed -= 1;
         }
         let (status, headers, body, close, cut) = {
             let mut state = state.lock().unwrap();

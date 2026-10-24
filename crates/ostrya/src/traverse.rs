@@ -17,6 +17,7 @@ use rustix::fs::{Mode, OFlags};
 use rustix::io::Errno;
 
 use crate::error::{Error, Result};
+use crate::pull::drive::Slots;
 use crate::refs::walk_ref_dir;
 use crate::repo::Repo;
 
@@ -614,6 +615,14 @@ pub(crate) trait MetadataSource: Sync {
         ty: ObjectType,
         checksum: Checksum,
     ) -> impl Future<Output = Result<Option<Vec<u8>>>> + Send;
+
+    /// Returns the number of dirtree reads that the walk of one tree can
+    /// have in flight at a time.
+    ///
+    /// The default is one, and zero is one. [`Repo`] keeps the default.
+    fn max_reads(&self) -> usize {
+        1
+    }
 }
 
 impl MetadataSource for Repo {
@@ -724,6 +733,9 @@ pub(crate) async fn walk_reachable_gc<S: MetadataSource>(
 /// `root_bound`. Each such seed is the same entry, so the walk pushes it
 /// at the first edge alone. The walk reads the commit `pending_delete`
 /// names as absent.
+///
+/// The walk reads the commits one at a time. It walks the tree of a commit
+/// with [`walk_tree`] before it reads the next commit.
 async fn collect_reachable<S: MetadataSource>(
     store: &S,
     seeds: Vec<(Checksum, ParentBound, Arrival)>,
@@ -861,6 +873,14 @@ async fn collect_reachable<S: MetadataSource>(
 ///
 /// An absent dirtree adds its own name only. A dirtree that does not parse
 /// stops the walk with an error.
+///
+/// The walk reads at most [`max_reads`](MetadataSource::max_reads) dirtrees
+/// at a time. It adds the name of a dirtree when it starts the read, so it
+/// reads each dirtree once. With a limit of one, the walk reads the
+/// dirtrees in depth-first order, and starts each read after the read
+/// before it ends. With a higher limit, the first read that fails in time
+/// gives the error, and the walk drops the other reads in flight. If no
+/// read fails, the set does not depend on the limit.
 async fn walk_tree<S: MetadataSource>(
     store: &S,
     root_dirtree: Checksum,
@@ -868,13 +888,23 @@ async fn walk_tree<S: MetadataSource>(
     reachable: &mut HashSet<ObjectName>,
 ) -> Result<()> {
     let mut stack = vec![root_dirtree];
-    while let Some(dirtree_checksum) = stack.pop() {
-        if !seen_dirtrees.insert(dirtree_checksum) {
-            continue;
+    let mut reads = Slots::new(store.max_reads());
+    loop {
+        while reads.has_room()
+            && let Some(dirtree_checksum) = stack.pop()
+        {
+            if !seen_dirtrees.insert(dirtree_checksum) {
+                continue;
+            }
+            reachable.insert(ObjectName::new(dirtree_checksum, ObjectType::DirTree));
+            reads.push(async move { try_load_dirtree(store, &dirtree_checksum).await });
         }
-        reachable.insert(ObjectName::new(dirtree_checksum, ObjectType::DirTree));
-
-        let Some(dirtree) = try_load_dirtree(store, &dirtree_checksum).await? else {
+        // The loop above stops on an empty stack or on a full set. So an
+        // empty set means that the stack is empty too.
+        let Some(loaded) = reads.next_ready().await else {
+            break;
+        };
+        let Some(dirtree) = loaded? else {
             continue;
         };
         for (_, file_checksum) in dirtree.files {
@@ -1310,6 +1340,8 @@ fn read_ref_target(dir: BorrowedFd<'_>, name: &str) -> Result<Option<Checksum>> 
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
     use ostrya_core::Type;
 
     use super::*;
@@ -1488,5 +1520,171 @@ mod tests {
             .collect();
         assert_eq!(values, ["first", "second"]);
         assert_eq!(dict_values(&Value::Str("k".into()), "k").count(), 0);
+    }
+
+    /// A store in memory that records its reads in order and counts the
+    /// reads in flight. Each read yields once before it ends, so the reads
+    /// of a walk overlap.
+    struct Counted {
+        objects: HashMap<ObjectName, Vec<u8>>,
+        limit: usize,
+        reads: std::sync::Mutex<Vec<ObjectName>>,
+        in_flight: AtomicUsize,
+        high_water: AtomicUsize,
+    }
+
+    impl Counted {
+        fn new(objects: HashMap<ObjectName, Vec<u8>>, limit: usize) -> Counted {
+            Counted {
+                objects,
+                limit,
+                reads: Default::default(),
+                in_flight: AtomicUsize::new(0),
+                high_water: AtomicUsize::new(0),
+            }
+        }
+    }
+
+    impl MetadataSource for Counted {
+        async fn load_metadata(
+            &self,
+            ty: ObjectType,
+            checksum: Checksum,
+        ) -> Result<Option<Vec<u8>>> {
+            let name = ObjectName::new(checksum, ty);
+            self.reads.lock().unwrap().push(name);
+            let now = self.in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            self.high_water.fetch_max(now, Ordering::SeqCst);
+            futures_lite::future::yield_now().await;
+            self.in_flight.fetch_sub(1, Ordering::SeqCst);
+            Ok(self.objects.get(&name).cloned())
+        }
+
+        fn max_reads(&self) -> usize {
+            self.limit
+        }
+    }
+
+    /// Adds the dirtree of `tree` to `objects` and `expected`, and returns
+    /// its checksum.
+    fn put_dirtree(
+        objects: &mut HashMap<ObjectName, Vec<u8>>,
+        expected: &mut HashSet<ObjectName>,
+        tree: &ostrya_core::DirTree,
+    ) -> Checksum {
+        let bytes = tree.serialize().unwrap();
+        let checksum = Checksum::sha256(&bytes);
+        let name = ObjectName::new(checksum, ObjectType::DirTree);
+        objects.insert(name, bytes);
+        expected.insert(name);
+        checksum
+    }
+
+    /// Returns the objects of one commit, the commit, and the names that
+    /// the commit reaches. The root directory holds 12 directories, and each
+    /// of these holds 3 directories with one file of its own. So the tree
+    /// holds 49 dirtrees.
+    fn wide_tree() -> (HashMap<ObjectName, Vec<u8>>, Checksum, HashSet<ObjectName>) {
+        let mut objects = HashMap::new();
+        let mut expected = HashSet::new();
+        let dirmeta = Checksum::sha256(b"dirmeta");
+        expected.insert(ObjectName::new(dirmeta, ObjectType::DirMeta));
+        let mut root = ostrya_core::DirTree::default();
+        for outer in 0..12 {
+            let mut middle = ostrya_core::DirTree::default();
+            for inner in 0..3 {
+                let file = Checksum::sha256(format!("file {outer} {inner}").as_bytes());
+                expected.insert(ObjectName::new(file, ObjectType::File));
+                let leaf = ostrya_core::DirTree {
+                    files: vec![("f".to_owned(), file)],
+                    dirs: Vec::new(),
+                };
+                let leaf = put_dirtree(&mut objects, &mut expected, &leaf);
+                middle.dirs.push((format!("e{inner}"), leaf, dirmeta));
+            }
+            let middle = put_dirtree(&mut objects, &mut expected, &middle);
+            root.dirs.push((format!("d{outer:02}"), middle, dirmeta));
+        }
+        let root = put_dirtree(&mut objects, &mut expected, &root);
+        let commit = Commit {
+            metadata: Value::Array(Vec::new()),
+            parent: None,
+            related: Vec::new(),
+            subject: String::new(),
+            body: String::new(),
+            timestamp: 0,
+            root_dirtree: root,
+            root_dirmeta: dirmeta,
+        };
+        let bytes = commit.serialize().unwrap();
+        let checksum = Checksum::sha256(&bytes);
+        let name = ObjectName::new(checksum, ObjectType::Commit);
+        objects.insert(name, bytes);
+        expected.insert(name);
+        (objects, checksum, expected)
+    }
+
+    /// The walk of one tree has at most the limit of the store in flight,
+    /// and the reads overlap when the limit allows it. Each limit gives the
+    /// same set and reads each object once. With a limit of one, the walk
+    /// reads the dirtrees in depth-first order.
+    #[test]
+    fn a_tree_walk_runs_at_most_the_limit_of_reads_at_a_time() {
+        let (objects, commit, expected) = wide_tree();
+        let commit_name = ObjectName::new(commit, ObjectType::Commit);
+        let mut depth_first = vec![commit_name];
+        let mut stack = vec![Commit::parse(&objects[&commit_name]).unwrap().root_dirtree];
+        while let Some(dirtree) = stack.pop() {
+            let name = ObjectName::new(dirtree, ObjectType::DirTree);
+            depth_first.push(name);
+            let parsed = ostrya_core::DirTree::parse(&objects[&name]).unwrap();
+            stack.extend(parsed.dirs.iter().map(|(_, subtree, _)| *subtree));
+        }
+        for limit in [1, 4, 8] {
+            let store = Counted::new(objects.clone(), limit);
+            let reached = ostrya_rt::block_on(walk_reachable(&store, [commit], 0)).unwrap();
+            assert_eq!(reached, expected, "limit {limit}");
+            let reads = store.reads.lock().unwrap();
+            let once: HashSet<ObjectName> = reads.iter().copied().collect();
+            assert_eq!(reads.len(), objects.len(), "limit {limit}");
+            assert_eq!(once.len(), objects.len(), "limit {limit}");
+            let high_water = store.high_water.load(Ordering::SeqCst);
+            if limit == 1 {
+                assert_eq!(*reads, depth_first);
+                assert_eq!(high_water, 1);
+            } else {
+                assert!(
+                    high_water > 1 && high_water <= limit,
+                    "limit {limit}: {high_water}"
+                );
+            }
+        }
+    }
+
+    /// A dirtree that does not parse gives the same error at each limit.
+    #[test]
+    fn a_dirtree_that_does_not_parse_fails_the_walk_at_each_limit() {
+        let (mut objects, commit, _) = wide_tree();
+        let root = Commit::parse(&objects[&ObjectName::new(commit, ObjectType::Commit)])
+            .unwrap()
+            .root_dirtree;
+        let root =
+            ostrya_core::DirTree::parse(&objects[&ObjectName::new(root, ObjectType::DirTree)])
+                .unwrap();
+        let (_, sibling, _) = root.dirs[5];
+        objects.insert(
+            ObjectName::new(sibling, ObjectType::DirTree),
+            b"not a dirtree".to_vec(),
+        );
+        let errors: Vec<String> = [1, 4]
+            .into_iter()
+            .map(|limit| {
+                let store = Counted::new(objects.clone(), limit);
+                let err = ostrya_rt::block_on(walk_reachable(&store, [commit], 0)).unwrap_err();
+                assert!(matches!(err, Error::Core(_)), "limit {limit}: {err}");
+                err.to_string()
+            })
+            .collect();
+        assert_eq!(errors[0], errors[1]);
     }
 }

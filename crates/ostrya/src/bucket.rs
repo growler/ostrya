@@ -170,8 +170,10 @@
 //!   of the commits of the summary. Unless the roots are on the refs alone,
 //!   the run also deletes the detached metadata and the composefs image of
 //!   a parent commit that the listing does not hold.
-//! - The walk reads each commit and dirtree that it reaches, one at a time,
-//!   and checks each one against its name. An object that the listing does
+//! - The walk reads each commit and dirtree that it reaches, and checks
+//!   each one against its name. It reads the commits one at a time, and at
+//!   most `max_outstanding` dirtrees of the tree of one commit at a time,
+//!   as [`BucketRepo::new`] gives it. An object that the listing does
 //!   not hold is absent, and the walk sends no request for it. A commit or a
 //!   dirtree whose bytes do not match its name stops the run before its
 //!   first delete. A run of the fsck with `delete` repairs such an object.
@@ -320,7 +322,7 @@ pub struct BucketWriteOptions {
 #[derive(Debug)]
 pub struct BucketRepo {
     bucket: Bucket,
-    /// The bound of the lists in flight.
+    /// The bound of the requests in flight of the repository.
     max_outstanding: usize,
 }
 
@@ -330,7 +332,8 @@ impl BucketRepo {
     /// The call builds the bucket client, as [`Bucket::new`] does. It sends
     /// no request and reads no object of the bucket. The
     /// [`max_outstanding`](crate::fetch::FetcherOptions::max_outstanding) of
-    /// the HTTP options of `endpoint` bounds the lists in flight.
+    /// the HTTP options of `endpoint` bounds the requests in flight of the
+    /// repository, as [`new`](BucketRepo::new) states.
     ///
     /// # Errors
     ///
@@ -346,10 +349,11 @@ impl BucketRepo {
     /// Returns the bucket repository of the client `bucket`. The call sends
     /// no request.
     ///
-    /// At most `max_outstanding` lists of
-    /// [`list_objects`](BucketRepo::list_objects) run at a time. A value of
-    /// zero is one. The admission limit of the fetcher of `bucket` is the
-    /// value to give.
+    /// `max_outstanding` bounds the requests in flight of a call on the
+    /// repository: the lists of [`list_objects`](BucketRepo::list_objects),
+    /// the reads of the ref files and of the objects, the uploads and the
+    /// other writes, and the deletes and the aborts. A value of zero is one.
+    /// The admission limit of the fetcher of `bucket` is the value to give.
     pub fn new(bucket: Bucket, max_outstanding: usize) -> BucketRepo {
         BucketRepo {
             bucket,

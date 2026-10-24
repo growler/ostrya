@@ -16,6 +16,7 @@ mod common;
 use std::collections::{BTreeMap, BTreeSet};
 use std::os::fd::AsFd;
 use std::path::Path;
+use std::time::Duration;
 
 use common::TmpDir;
 use common::modes::object_path;
@@ -23,6 +24,7 @@ use common::s3::{PROBE_BODY, PROBE_KEY, Rclone, StandIn, endpoint, rclone_availa
 use ostrya::bucket::{
     BucketFsckOptions, BucketPruneOptions, BucketPruneReport, BucketRepo, BucketSummaryOptions,
 };
+use ostrya::remote::s3::Bucket;
 use ostrya::remote::{Endpoint, PullSession, StreamSessionOptions};
 use ostrya::verify::PullTrust;
 use ostrya::{
@@ -276,8 +278,21 @@ async fn commit(
     std::fs::write(tree.join("file"), content).unwrap();
     std::fs::write(tree.join("sub/deep/nested"), "the same in each commit\n").unwrap();
     std::os::unix::fs::symlink("file", tree.join("link")).unwrap();
+    commit_tree(repo, &tree, branch, content, parent, timestamp).await
+}
+
+/// Commits the directory `tree` with the subject `subject` at the time
+/// `timestamp`. Sets the ref `branch` to the commit if it is given.
+async fn commit_tree(
+    repo: &Repo,
+    tree: &Path,
+    branch: Option<&str>,
+    subject: &str,
+    parent: Option<Checksum>,
+    timestamp: u64,
+) -> Checksum {
     let txn = repo.transaction().await.unwrap();
-    let dfd = std::fs::File::open(&tree).unwrap();
+    let dfd = std::fs::File::open(tree).unwrap();
     let mut modifier = CommitModifier::new(
         CommitModifierFlags::CANONICAL_PERMISSIONS | CommitModifierFlags::SKIP_XATTRS,
     );
@@ -290,7 +305,7 @@ async fn commit(
         .write_commit(
             CommitOptions {
                 parent,
-                subject: Some(content.to_owned()),
+                subject: Some(subject.to_owned()),
                 timestamp: Some(timestamp),
                 ..CommitOptions::default()
             },
@@ -1060,6 +1075,54 @@ fn an_object_whose_bytes_do_not_match_its_name_fails_the_run_before_a_delete() {
         let err = f.prune(&refs_only(0)).await.unwrap_err();
         assert!(matches!(&err, Error::InvalidFormat(_)), "{err}");
         assert_eq!(f.deletes(), ["extensions/ostrya/lock"]);
+    });
+}
+
+#[test]
+fn the_walk_of_a_run_reads_at_most_max_outstanding_dirtrees_at_a_time() {
+    block_on(async {
+        let f = Fixture::new(None).await;
+        // The root of the tree holds 16 directories, each with a file of its
+        // own, so the walk can read 16 dirtrees at a time.
+        let tree = f.tmp.path().join("tree-wide");
+        for n in 0..16 {
+            let dir = tree.join(format!("d{n:02}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("file"), format!("file {n}\n")).unwrap();
+        }
+        let wide = commit_tree(&f.local, &tree, Some("main"), "wide", Some(f.c3), T0 + 300).await;
+        f.copy("objects");
+        f.put_ref("refs/heads/main", &wide);
+        let opts = PruneOptions {
+            no_prune: true,
+            ..refs_only(0)
+        };
+        let mut reports = Vec::new();
+        for limit in [1, 4] {
+            let client = Bucket::new(&endpoint(&f.server.endpoint(), ADDRESS))
+                .await
+                .unwrap();
+            let bucket = BucketRepo::new(client, limit);
+            {
+                let mut state = f.server.state();
+                // Each read of the walk is a `GET` of a key under `objects/`.
+                state.delay = Some(("GET", "repo/objects/".to_owned(), Duration::from_millis(25)));
+                state.max_delayed = 0;
+            }
+            let report = bucket
+                .prune(&opts, &BucketPruneOptions::default())
+                .await
+                .unwrap();
+            let max = f.server.state().max_delayed;
+            if limit == 1 {
+                assert_eq!(max, 1);
+            } else {
+                assert!(max > 1 && max <= limit, "limit {limit}: {max}");
+            }
+            reports.push(report);
+        }
+        assert_eq!(reports[0], reports[1]);
+        assert!(reports[0].stats.pruned_objects > 0);
     });
 }
 

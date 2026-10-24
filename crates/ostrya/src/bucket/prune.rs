@@ -79,7 +79,11 @@ pub struct BucketPruneReport {
 /// The run holds the writer lock, so an object that the listing does not
 /// hold is absent, and the source sends no request for it. A read takes at
 /// most the size of the object in the listing. The source checks the
-/// SHA-256 of each commit and dirtree that it reads against its name.
+/// SHA-256 of each commit and dirtree that it reads against its name. The
+/// walk of one tree has at most `max_outstanding` reads in flight. Each read
+/// holds the bytes of its object in memory, so the reads in flight hold at
+/// most `max_outstanding` objects, each at most its size in the listing and
+/// at most [`MAX_METADATA_SIZE`].
 struct ListedObjects<'a> {
     repo: &'a BucketRepo,
     listing: &'a ObjectListing,
@@ -128,6 +132,10 @@ impl MetadataSource for ListedObjects<'_> {
             )));
         }
         Ok(Some(bytes))
+    }
+
+    fn max_reads(&self) -> usize {
+        self.repo.max_outstanding
     }
 }
 
@@ -196,10 +204,13 @@ impl BucketRepo {
     /// further.
     ///
     /// The walk reads each commit and dirtree that it reaches with one `GET`,
-    /// one at a time, and checks its SHA-256 against its name. It sends no
-    /// request for an object that the listing does not hold, and reads such
-    /// an object as absent. An absent commit or dirtree keeps its own name
-    /// and nothing below it.
+    /// and checks its SHA-256 against its name. It reads the commits one at
+    /// a time, and at most `max_outstanding` dirtrees of the tree of one
+    /// commit at a time, as [`new`](BucketRepo::new) gives it. If more than
+    /// one read fails, the error is the error of the first read that fails
+    /// in time. The walk sends no request for an object that the listing
+    /// does not hold, and reads such an object as absent. An absent commit
+    /// or dirtree keeps its own name and nothing below it.
     ///
     /// # Steps
     ///

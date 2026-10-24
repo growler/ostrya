@@ -1332,8 +1332,25 @@ over a source of metadata objects that the local repository and the bucket
 both give. So the bucket prune has the roots and the bounds of
 `Repo::prune` with no copy, and the tests of the local prune gate the walk.
 A walk for the bucket alone, with a copy of the rules of the bounds, was
-rejected: a later change to one copy can miss the other. The walk reads one
-object at a time. A walk that reads in parallel is a later change.
+rejected: a later change to one copy can miss the other.
+
+The walk reads the commits one at a time, and walks the tree of a commit
+before it reads the next commit. It reads the dirtrees of one tree with the
+`Slots` driver of the pull, at most `max_reads` of the source at a time. The
+local repository gives one, so the local walk reads one object at a time. A
+bucket repository gives `max_outstanding`. With a limit of one, the walk
+reads the dirtrees in depth-first order, and starts each read after the
+read before it ends. If more than one read fails, the first read that fails
+in time gives the error, and the walk drops the other reads in flight, as
+the bucket fsck does. These alternatives were rejected:
+
+- A prefetch in the source of the bucket prune of each commit and each
+  dirtree of the listing. It reads objects that no root reaches, and holds
+  them in memory.
+- A batch of the subdirectories of one dirtree. A dirtree with few
+  subdirectories does not use the limit.
+- A batch across the frontier, with each read of a batch done before the
+  next batch starts. Each batch waits for its slowest read.
 
 `BucketRepo::prune` takes the `PruneOptions` of the local prune and a
 `BucketPruneOptions` with `break_lock`. It takes `refs_only`, `depth`,

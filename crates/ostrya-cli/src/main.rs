@@ -1723,9 +1723,11 @@ enum RemoteCommand {
     /// no key under `delta-indexes/`.
     ///
     /// The command reads each commit and dirtree that the walk reaches with
-    /// one GET, one at a time, and checks its checksum. A commit or a dirtree
-    /// whose bytes do not match its name stops the command before its first
-    /// delete. Run `ostrya remote fsck --delete` to repair such an object.
+    /// one GET, and checks its checksum. It reads the commits one at a time,
+    /// and at most 8 dirtrees of the tree of one commit at a time. A commit
+    /// or a dirtree whose bytes do not match its name stops the command
+    /// before its first delete. Run `ostrya remote fsck --delete` to repair
+    /// such an object.
     ///
     /// The command writes no summary, and keeps each commit that the summary
     /// names. A summary that names a deleted static delta stays as it is

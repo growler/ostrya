@@ -125,10 +125,20 @@ work on a local repository are not carried for it:
   `Repo::push_to_bucket` or `ostrya push`, which then uploads the
   `.commitmeta` alone. A signer in the options of the tree push, as the
   signing options of `commit`, closes the gap.
-- A parallel reachability walk of the bucket prune. `BucketRepo::prune`
-  reads one commit or dirtree at a time, so a run costs one round trip for
-  each metadata object that it reaches. The `Slots` driver of the pull has
-  the necessary shape.
+- A shared frontier in the reachability walk of the bucket prune.
+  `BucketRepo::prune` reads the commits one at a time, and walks the tree
+  of each commit before it reads the next commit. The walk knows the
+  children of a dirtree only after its read ends. So the n dirtrees that a
+  commit adds, from the root dirtree to the change, are n reads in
+  sequence at each `max_outstanding`, and the commit costs 1 + n round
+  trips. For example, 1,000 linear commits that each change the file
+  `/usr/lib/x/y/file` cost 6 round trips each: about 120 s at 20 ms for
+  each round trip, at a limit of 1 and of 8. Parallel commit reads do not
+  make a linear history shorter, because the walk knows the parent of a
+  commit only after it reads the commit. They help only across separate
+  roots. A frontier that the tree walks of all commits share removes the
+  chain of each commit: C linear commits then cost about C + n round trips
+  in place of C x (1 + n).
 - A static delta that the push generates or uploads. The push uploads no
   delta, and a delta comes into the bucket from another writer.
 - The summaries of auth items under `extensions/ostrya/summary/`, and the

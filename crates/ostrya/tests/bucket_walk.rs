@@ -15,12 +15,14 @@ mod common;
 use std::collections::HashSet;
 use std::os::fd::AsFd;
 use std::path::Path;
+use std::time::Duration;
 
 use common::TmpDir;
 use common::modes::object_path;
 use common::s3::{StandIn, endpoint};
 use ostrya::bucket::BucketRepo;
 use ostrya::remote;
+use ostrya::remote::s3::Bucket;
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, Error,
     MutableTree, ObjectName, ObjectType, Repo, RepoMode,
@@ -154,8 +156,14 @@ async fn commit(repo: &Repo, base: &Path, name: &str, parent: Option<Checksum>) 
     std::fs::create_dir_all(tree.join("sub/deep")).unwrap();
     std::fs::write(tree.join("file"), name).unwrap();
     std::fs::write(tree.join("sub/deep/nested"), "the same in each commit\n").unwrap();
+    commit_tree(repo, &tree, name, parent).await
+}
+
+/// Commits the directory `tree` with the subject `name`. Sets the ref of
+/// the name without its digits to the commit.
+async fn commit_tree(repo: &Repo, tree: &Path, name: &str, parent: Option<Checksum>) -> Checksum {
     let txn = repo.transaction().await.unwrap();
-    let dfd = std::fs::File::open(&tree).unwrap();
+    let dfd = std::fs::File::open(tree).unwrap();
     let mut modifier = CommitModifier::new(
         CommitModifierFlags::CANONICAL_PERMISSIONS | CommitModifierFlags::SKIP_XATTRS,
     );
@@ -263,6 +271,46 @@ fn the_bucket_walk_reads_commits_and_dirtrees_alone() {
         requests.sort();
         assert!(!wanted.is_empty());
         assert_eq!(requests, wanted);
+    });
+}
+
+#[test]
+fn the_bucket_walk_reads_at_most_max_outstanding_dirtrees_at_a_time() {
+    block_on(async {
+        let f = Fixture::new().await;
+        // The root of the tree holds 16 directories, each with a file of its
+        // own, so the walk can read 16 dirtrees at a time.
+        let tree = f._tmp.path().join("tree-wide");
+        for n in 0..16 {
+            let dir = tree.join(format!("d{n:02}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("file"), format!("file {n}\n")).unwrap();
+        }
+        let wide = commit_tree(&f.local, &tree, "wide", Some(f.chain[2])).await;
+        for (name, bytes) in common::file_inventory(f.local.path(), "objects") {
+            f.server.state().store(&format!("repo/{name}"), &bytes);
+        }
+        let local = f.local.traverse_reachable([wide], 0).await.unwrap();
+        for limit in [1, 4] {
+            let client = Bucket::new(&endpoint(&f.server.endpoint(), ADDRESS))
+                .await
+                .unwrap();
+            let bucket = BucketRepo::new(client, limit);
+            {
+                let mut state = f.server.state();
+                // Each read of the walk is a `GET` of a key under `objects/`.
+                state.delay = Some(("GET", "repo/objects/".to_owned(), Duration::from_millis(25)));
+                state.max_delayed = 0;
+            }
+            let set = bucket.traverse_reachable([wide], 0).await.unwrap();
+            let max = f.server.state().max_delayed;
+            if limit == 1 {
+                assert_eq!(max, 1);
+            } else {
+                assert!(max > 1 && max <= limit, "limit {limit}: {max}");
+            }
+            assert_eq!(set, local, "limit {limit}");
+        }
     });
 }
 

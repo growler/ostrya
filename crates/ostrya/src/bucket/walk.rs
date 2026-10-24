@@ -12,7 +12,7 @@ use crate::traverse::{MetadataSource, walk_reachable};
 /// Reads each object with
 /// [`Bucket::get_strict`](crate::remote::s3::Bucket::get_strict). So only a
 /// 404 with the code `NoSuchKey` gives `None`, and each other 404 is an
-/// error.
+/// error. At most `max_outstanding` reads of dirtrees run at a time.
 impl MetadataSource for BucketRepo {
     async fn load_metadata(&self, ty: ObjectType, checksum: Checksum) -> Result<Option<Vec<u8>>> {
         let key = object_key(&ObjectName::new(checksum, ty));
@@ -20,6 +20,10 @@ impl MetadataSource for BucketRepo {
             Ok(object) => Ok(object.map(|object| object.bytes)),
             Err(e) => Err(read_error(e, &key, |what| self.malformed(what))),
         }
+    }
+
+    fn max_reads(&self) -> usize {
+        self.max_outstanding
     }
 }
 
@@ -48,9 +52,16 @@ impl BucketRepo {
     /// [`Repo::traverse_reachable`](crate::Repo::traverse_reachable) over the
     /// objects of the bucket, with the same depths. It reads the commits and
     /// the dirtrees that it reaches, and does not verify the checksum of the
-    /// bytes. Each read is one `GET`. The walk reads each dirtree once. It
+    /// bytes. Each read is one `GET`. The walk reads the commits one at a
+    /// time. It reads the dirtrees of the tree of one commit at most
+    /// `max_outstanding` at a time, as [`new`](BucketRepo::new) gives it,
+    /// before it reads the next commit. The walk reads each dirtree once. It
     /// can read a commit again when it expands the commit again at a greater
     /// depth. The call takes no writer lock.
+    ///
+    /// Each read holds the bytes of its object in memory, so the reads in
+    /// flight hold at most `max_outstanding` objects, each at most
+    /// [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
     ///
     /// An object is absent only if its `GET` gets a 404 with the code
     /// `NoSuchKey`. Each other 404 is an error. For a missing key, S3 gives
@@ -68,6 +79,10 @@ impl BucketRepo {
     ///   a dirtree is larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
     /// - [`Error::Remote`](crate::Error::Remote) for an error of the bucket
     ///   client, also for a 404 without the code `NoSuchKey` and for a 403.
+    ///
+    /// If more than one read fails, the error is the error of the first
+    /// read that fails in time. The walk then drops the other reads in
+    /// flight.
     #[doc(hidden)]
     pub async fn traverse_reachable(
         &self,

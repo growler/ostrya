@@ -6277,17 +6277,22 @@ The roots are:
   does not reach a parent commit that the listing does not hold, so the
   prune deletes the `.commitmeta` and the `.cfs` of that commit.
 
-The walk reads each commit and each dirtree that it reaches with one `GET`,
-one at a time. It reads at most the size of the object in the listing, and
-at most the metadata size cap of 128 MiB. The SHA-256 of the bytes of each
-commit and dirtree must be the checksum of its name, and the bytes must
-parse. Else the run fails before its first delete, and a run of the fsck
-with the repair deletes the bad object. The walk sends no request for an
-object that the listing does not hold, and reads it as absent: an absent
-commit or dirtree keeps its own name and no object below it. A listed
-object that is gone at its read fails the run. With `--refs-only` or
-`--keep-younger-than`, the walk can read a commit again when it reaches the
-commit under a bound that goes further.
+The walk reads each commit and each dirtree that it reaches with one `GET`.
+It reads the commits one at a time. It reads the dirtrees of the tree of
+one commit at most `max_outstanding` at a time, and reads the next commit
+after the last of these reads. If more than one read fails, the first read
+that fails in time gives the error of the run, and the walk drops the other
+reads in flight. It reads at most the size of the object in the listing, and
+at most the metadata size cap of 128 MiB. Each read holds the bytes of its
+object in memory, so the reads in flight hold at most `max_outstanding`
+objects. The SHA-256 of the bytes of each commit and dirtree must be the
+checksum of its name, and the bytes must parse. Else the run fails before
+its first delete, and a run of the fsck with the repair deletes the bad
+object. The walk sends no request for an object that the listing does not
+hold, and reads it as absent: an absent commit or dirtree keeps its own name
+and no object below it. A listed object that is gone at its read fails the
+run. With `--refs-only` or `--keep-younger-than`, the walk can read a commit
+again when it reaches the commit under a bound that goes further.
 
 A kept commit keeps its `.commitmeta` and its `.cfs`. A partial commit that
 the prune keeps keeps its marker. An object that only a dirtree that the

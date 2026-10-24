@@ -7,7 +7,7 @@ use ostrya_core::{Checksum, ObjectName, ObjectType};
 use super::BucketRepo;
 use crate::error::Result;
 use crate::pull::drive::Slots;
-use crate::remote::s3::Listed;
+use crate::remote::s3::{Listed, is_repository_key};
 
 /// The number of fan-out prefixes `objects/XX/`.
 const FANOUT: usize = 256;
@@ -21,9 +21,8 @@ pub struct ObjectListing {
     pub objects: HashMap<ObjectName, u64>,
     /// Each stray key under a fan-out prefix, with its size, sorted by key.
     ///
-    /// A stray key is a key whose name is not `XX/<62 hex digits>.<ext>`, in
-    /// lowercase hex, with `<ext>` one of `commit`, `commitmeta`, `dirtree`,
-    /// `dirmeta`, `filez`, `tombstone-commit`, and `cfs`.
+    /// A stray key is a key under `objects/XX/` that [`is_repository_key`]
+    /// refuses.
     pub strays: Vec<Listed>,
 }
 
@@ -39,7 +38,7 @@ impl BucketRepo {
                 && let Some(fanout) = fanouts.next()
             {
                 let bucket = &self.bucket;
-                let prefix = format!("objects/{fanout:02x}/");
+                let prefix = fanout_prefix(fanout as u8);
                 lists.push(async move { bucket.list(&prefix).await });
             }
             let Some(list) = lists.next_ready().await else {
@@ -61,30 +60,27 @@ impl BucketRepo {
 
 /// Returns the object that the key `key` names, or `None` for a stray key.
 ///
-/// The key is `objects/XX/<62 hex digits>.<ext>`, in lowercase hex.
+/// The key is a key under `objects/` that [`is_repository_key`] accepts.
 fn object_name(key: &str) -> Option<ObjectName> {
-    let rest = key.strip_prefix("objects/")?;
-    let (fanout, name) = rest.split_once('/')?;
+    if !is_repository_key(key) {
+        return None;
+    }
+    let (fanout, name) = key.strip_prefix("objects/")?.split_once('/')?;
     let (digits, ext) = name.split_once('.')?;
-    let ty = match ext {
-        "commit" => ObjectType::Commit,
-        "commitmeta" => ObjectType::CommitMeta,
-        "dirtree" => ObjectType::DirTree,
-        "dirmeta" => ObjectType::DirMeta,
-        "filez" => ObjectType::File,
-        "tombstone-commit" => ObjectType::TombstoneCommit,
-        "cfs" => ObjectType::ComposefsImage,
-        _ => return None,
-    };
+    let ty = ObjectType::from_extension(ext)?;
     if fanout.len() != 2 || digits.len() != 62 {
         return None;
     }
-    let mut hex = fanout.bytes().chain(digits.bytes());
-    let mut checksum = [0u8; 32];
-    for byte in &mut checksum {
-        *byte = (lower_hex(hex.next()?)? << 4) | lower_hex(hex.next()?)?;
-    }
-    Some(ObjectName::new(Checksum::from_bytes(checksum), ty))
+    let mut hex = [0u8; 64];
+    hex[..2].copy_from_slice(fanout.as_bytes());
+    hex[2..].copy_from_slice(digits.as_bytes());
+    let checksum = Checksum::from_hex_lower(std::str::from_utf8(&hex).ok()?).ok()?;
+    Some(ObjectName::new(checksum, ty))
+}
+
+/// Returns the fan-out prefix `objects/XX/` of the fan-out `fanout`.
+fn fanout_prefix(fanout: u8) -> String {
+    format!("objects/{fanout:02x}/")
 }
 
 /// Returns `true` if `prefix` is a fan-out prefix `objects/XX/`, with two
@@ -93,16 +89,8 @@ pub(super) fn is_fanout_prefix(prefix: &str) -> bool {
     prefix
         .strip_prefix("objects/")
         .and_then(|rest| rest.strip_suffix('/'))
-        .is_some_and(|fanout| fanout.len() == 2 && fanout.bytes().all(|b| lower_hex(b).is_some()))
-}
-
-/// Returns the value of the lowercase hex digit `digit`.
-fn lower_hex(digit: u8) -> Option<u8> {
-    match digit {
-        b'0'..=b'9' => Some(digit - b'0'),
-        b'a'..=b'f' => Some(digit - b'a' + 10),
-        _ => None,
-    }
+        .and_then(|digits| u8::from_str_radix(digits, 16).ok())
+        .is_some_and(|fanout| fanout_prefix(fanout) == prefix)
 }
 
 #[cfg(test)]
@@ -142,6 +130,7 @@ mod tests {
             "objects/a/",
             "objects/ab",
             "objects//",
+            "objects/+a/",
             "refs/ab/",
         ] {
             assert!(!is_fanout_prefix(prefix), "{prefix}");
@@ -164,6 +153,29 @@ mod tests {
             "objects/ab/zz".to_owned(),
             format!("refs/ab/{digits}.commit"),
         ] {
+            assert_eq!(object_name(&key), None, "{key}");
+        }
+    }
+
+    #[test]
+    fn an_extension_of_a_bare_repository_is_a_stray() {
+        let digits = "cd".repeat(31);
+        for ext in ["file", "payload-link", "file-xattrs", "file-xattrs-link"] {
+            assert!(ObjectType::from_extension(ext).is_some(), "{ext}");
+            let key = format!("objects/ab/{digits}.{ext}");
+            assert_eq!(object_name(&key), None, "{key}");
+        }
+    }
+
+    #[test]
+    fn a_repository_key_outside_objects_is_no_object() {
+        for key in [
+            "config".to_owned(),
+            "summary".to_owned(),
+            "refs/heads/main".to_owned(),
+            format!("state/{}.commitpartial", "ab".repeat(32)),
+        ] {
+            assert!(is_repository_key(&key), "{key}");
             assert_eq!(object_name(&key), None, "{key}");
         }
     }

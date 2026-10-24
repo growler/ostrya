@@ -156,7 +156,7 @@ impl BucketRepo {
     ///    [`break_lock`](BucketSummaryOptions::break_lock).
     /// 3. The refs: one list of `refs/` and a read of each ref file. With no
     ///    signer in `opts`, the probe of `summary.sig` runs at the same time.
-    ///    The probe reads the headers of the key alone. Only an answer 404
+    ///    The probe is a `GET` with `Range: bytes=0-0`. Only an answer 404
     ///    `NoSuchKey` is an absent key. With a signer, the update sends no
     ///    request for `summary.sig` before its write.
     /// 4. The refusals of the ref names and of the signers, below.

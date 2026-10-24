@@ -1639,6 +1639,85 @@ fn an_object_that_a_writer_adds_during_the_run_is_a_note() {
 }
 
 #[test]
+fn the_read_again_of_ten_large_objects_sends_a_range_and_uses_one_connection() {
+    block_on(async {
+        let tmp = TmpDir::new("bucket-fsck-range");
+        let local = Repo::create(
+            &tmp.path().join("repo"),
+            CreateOptions::new(RepoMode::Archive),
+        )
+        .await
+        .unwrap();
+        let tree = tmp.path().join("tree-large");
+        std::fs::create_dir_all(&tree).unwrap();
+        for n in 0..10 {
+            std::fs::write(tree.join(format!("large{n}")), format!("large {n}\n")).unwrap();
+        }
+        let large = commit(&local, tmp.path(), "main", "large", None).await;
+        let server = StandIn::start();
+        let mut s3 = endpoint(&server.endpoint(), ADDRESS);
+        s3.http.max_outstanding = 1;
+        let bucket = BucketRepo::open(&s3).await.unwrap();
+        let (parsed, _) = local.load_commit(&large).await.unwrap();
+        let root = local.load_dirtree(&parsed.root_dirtree).await.unwrap();
+        let mut keys = Vec::new();
+        {
+            let mut state = server.state();
+            for (name, bytes) in common::file_inventory(local.path(), "objects") {
+                state.store(&format!("repo/{name}"), &bytes);
+            }
+            state.store("repo/config", PLAIN.as_bytes());
+            state.store(
+                "repo/refs/heads/main",
+                format!("{}\n", large.to_hex()).as_bytes(),
+            );
+            for (name, checksum) in &root.files {
+                if name.starts_with("large") {
+                    let key = format!("repo/{}", object_path(ObjectType::File, checksum));
+                    assert!(state.objects.remove(&key).is_some(), "{key}");
+                    keys.push(key);
+                }
+            }
+        }
+        assert_eq!(keys.len(), 10);
+        // A writer puts back each object, at 1 MiB, after the listing, at the
+        // read of the commit.
+        let back = keys.clone();
+        server.state().before_key = Some((
+            "GET",
+            format!("repo/{}", object_path(ObjectType::Commit, &large)),
+            Box::new(move |objects| {
+                for key in back {
+                    let stored = common::s3::Stored {
+                        bytes: vec![0x5a; 1 << 20],
+                        etag: "\"back\"".into(),
+                    };
+                    objects.insert(key, stored);
+                }
+            }),
+        ));
+        let report = bucket.fsck(&BucketFsckOptions::default()).await.unwrap();
+        assert!(!report.has_errors(), "{:#?}", report.findings);
+        let state = server.state();
+        let rechecks: Vec<(Option<String>, usize)> = state
+            .requests
+            .iter()
+            .zip(state.ranges.iter().zip(&state.connections))
+            .filter(|((method, target), _)| {
+                method == "GET" && keys.iter().any(|key| target.ends_with(key.as_str()))
+            })
+            .map(|(_, (range, connection))| (range.clone(), *connection))
+            .collect();
+        assert_eq!(rechecks.len(), 10, "{rechecks:?}");
+        let first = rechecks[0].1;
+        for (range, connection) in &rechecks {
+            assert_eq!(range.as_deref(), Some("bytes=0-0"));
+            assert_eq!(*connection, first, "{rechecks:?}");
+        }
+    });
+}
+
+#[test]
 fn a_missing_object_of_commits_that_a_writer_removes_during_the_run_names_the_rest() {
     block_on(async {
         let f = Fixture::new(None).await;
@@ -2126,6 +2205,15 @@ fn a_fsck_and_a_repair_on_seaweedfs() {
         // key, and an incomplete upload.
         let head_file = f.entry(&f.head, &[], "file", false).await;
         let first_file = f.entry(&f.first, &[], "file", false).await;
+        // A check finds the object of a key, and finds no summary yet.
+        let client = bucket.bucket();
+        assert!(
+            client
+                .exists_strict(&object_path(ObjectType::File, &head_file))
+                .await
+                .unwrap()
+        );
+        assert!(!client.exists_strict("summary").await.unwrap());
         let other = f.object(ObjectType::File, &first_file);
         bucket
             .bucket()

@@ -1680,8 +1680,8 @@ impl BucketRepo {
     /// A run with no lock does not stop a writer, and the listing of the 256
     /// fan-out prefixes is no snapshot. An object that a read finds now
     /// makes its finding a note. A finding whose commits are all gone is
-    /// dropped. Each read opens the object as a stream, and reads none of
-    /// its body.
+    /// dropped. Each read asks for the first byte of the object alone, so
+    /// its connection serves the next read.
     async fn fsck_recheck(&self, run: &mut Run) -> Result<()> {
         if run.unlisted.is_empty() {
             return Ok(());
@@ -1737,16 +1737,17 @@ impl BucketRepo {
     /// strict rule of an absent key, at most `max_outstanding` reads at a
     /// time.
     ///
-    /// Each read opens the object as a stream and drops it, so the read
-    /// takes none of its body.
+    /// Each read is a check of
+    /// [`Bucket::exists_strict`](crate::remote::s3::Bucket::exists_strict),
+    /// which asks for the first byte of the object alone.
     async fn held_objects(&self, names: Vec<ObjectName>) -> Result<HashSet<ObjectName>> {
         let mut held = HashSet::new();
         let bucket = &self.bucket;
         each_slot(
             self.max_outstanding,
             names.into_iter().map(|name| async move {
-                let stream = bucket.get_stream_strict(&object_key(&name)).await?;
-                Ok((name, stream.is_some()))
+                let present = bucket.exists_strict(&object_key(&name)).await?;
+                Ok((name, present))
             }),
             |(name, present)| {
                 if present {

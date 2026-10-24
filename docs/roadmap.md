@@ -163,6 +163,15 @@ work on a local repository are not carried for it:
 - The tree push to a bucket has a small compressor pool of its own, next to
   `Compressors` in `crates/ostrya/src/archive.rs`. A merge needs
   `Compressors` to be generic over its source.
+- Two reads of a bucket open a `GET` stream for its headers alone, and drop
+  it. The read of a key after a completion of a multipart upload with no
+  known outcome reads the declared length and the `ETag` of the object.
+  The read of a writer lock larger than 64 KiB reads its `ETag`. For a
+  large object, the server starts to send the body, and the drop closes
+  the connection. A read with `Range: bytes=0-0` closes the gap. The read
+  after a completion needs the total length of the `Content-Range` header
+  of a 206. `ostrya_fetch::Body` gives the `ETag` of a 206, and does not
+  give its `Content-Range` header.
 
 ## Open decisions
 

@@ -447,6 +447,13 @@ pub struct State {
     /// The `Authorization` header of each request, in the order of
     /// `requests`, or `None` for a request with no such header.
     pub authorizations: Vec<Option<String>>,
+    /// The `Range` header of each request, in the order of `requests`, or
+    /// `None` for a request with no such header.
+    pub ranges: Vec<Option<String>>,
+    /// The number of the connection of each request, in the order of
+    /// `requests`. The server numbers each connection that it accepts, from
+    /// zero.
+    pub connections: Vec<usize>,
     /// A method and a count `n`: the server acts on the `n`-th request of
     /// the method, then closes its connection with no response.
     pub close_after: Option<(&'static str, usize)>,
@@ -531,11 +538,14 @@ impl State {
 /// An S3 server in the process, over HTTP/1.1 on a loopback port, with one
 /// bucket `bkt`.
 ///
-/// The server accepts each signature, and keeps the `Authorization` header of
-/// each request. It answers `GET`, `PUT`, and `DELETE` of a key, the abort
-/// of an upload, `ListObjectsV2` with pages of at most 1000 keys, `ListObjectsV2` with the
-/// delimiter `/` in one page, and `ListMultipartUploads` in one page. One
-/// thread serves each connection.
+/// The server accepts each signature, and keeps the `Authorization` header,
+/// the `Range` header, and the number of the connection of each request. It
+/// answers a `GET` with `Range: bytes=0-0` with 206 and the first byte of
+/// the object, or with 416 for an object of zero bytes. It answers `GET`,
+/// `PUT`, and `DELETE` of a key, the abort of an upload, `ListObjectsV2`
+/// with pages of at most 1000 keys, `ListObjectsV2` with the delimiter `/`
+/// in one page, and `ListMultipartUploads` in one page. One thread serves
+/// each connection.
 pub struct StandIn {
     addr: SocketAddr,
     state: Arc<Mutex<State>>,
@@ -552,6 +562,8 @@ impl StandIn {
             honor_if_match: true,
             requests: Vec::new(),
             authorizations: Vec::new(),
+            ranges: Vec::new(),
+            connections: Vec::new(),
             close_after: None,
             before: None,
             before_key: None,
@@ -573,10 +585,10 @@ impl StandIn {
         }));
         let shared = state.clone();
         std::thread::spawn(move || {
-            for stream in listener.incoming() {
+            for (connection, stream) in listener.incoming().enumerate() {
                 let Ok(stream) = stream else { return };
                 let state = shared.clone();
-                std::thread::spawn(move || serve(stream, &state));
+                std::thread::spawn(move || serve(stream, connection, &state));
             }
         });
         StandIn { addr, state }
@@ -642,8 +654,8 @@ impl Request {
     }
 }
 
-/// Serves the requests of one connection.
-fn serve(mut stream: TcpStream, state: &Mutex<State>) {
+/// Serves the requests of the connection with the number `connection`.
+fn serve(mut stream: TcpStream, connection: usize, state: &Mutex<State>) {
     // The head and the body of an answer go in two writes. With Nagle's
     // algorithm, the body then waits for the delayed ACK of the client.
     let _ = stream.set_nodelay(true);
@@ -680,6 +692,10 @@ fn serve(mut stream: TcpStream, state: &Mutex<State>) {
             state
                 .authorizations
                 .push(request.header("authorization").map(str::to_owned));
+            state
+                .ranges
+                .push(request.header("range").map(str::to_owned));
+            state.connections.push(connection);
             let count = {
                 let count = state.counts.entry(request.method.clone()).or_default();
                 *count += 1;
@@ -796,6 +812,19 @@ fn answer(state: &mut State, request: &Request) -> (u16, Vec<(String, String)>, 
     }
     match request.method.as_str() {
         "GET" => match state.objects.get(&key) {
+            Some(stored) if request.header("range") == Some("bytes=0-0") => {
+                if stored.bytes.is_empty() {
+                    return (416, Vec::new(), s3_error("InvalidRange"));
+                }
+                let mut headers = vec![(
+                    "Content-Range".to_owned(),
+                    format!("bytes 0-0/{}", stored.bytes.len()),
+                )];
+                if state.etag_on_get {
+                    headers.push(("ETag".to_owned(), stored.etag.clone()));
+                }
+                (206, headers, stored.bytes[..1].to_vec())
+            }
             Some(stored) => (
                 200,
                 if state.etag_on_get {

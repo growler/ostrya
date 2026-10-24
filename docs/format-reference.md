@@ -6033,8 +6033,8 @@ The steps of the update are:
    no `config` refuses the update before the lock.
 2. The take of the writer lock with `operation=summary`.
 3. The list of `refs/` with a read of each ref file. An update with no
-   summary signer probes `summary.sig` at the same time. The probe reads
-   the headers of the key alone, and only an answer 404 `NoSuchKey` is an
+   summary signer probes `summary.sig` at the same time. The probe is a
+   `GET` with `Range: bytes=0-0`, and only an answer 404 `NoSuchKey` is an
    absent key. An update with a summary signer sends no request for
    `summary.sig` before its write.
 4. The refusals below.
@@ -6142,8 +6142,8 @@ The steps of the fsck are:
    run reads no such object.
 10. Without the repair, the read again of each object of a `missing`
     finding that the listing does not hold, and then of the commits of each
-    such object that is still absent. Each read opens the object as a
-    stream and takes none of its body.
+    such object that is still absent. Each read is a `GET` with
+    `Range: bytes=0-0`, by the strict rule of an absent key.
 11. With the repair, the repair below and the release of the lock. Without
     the repair, the read of the lock again.
 

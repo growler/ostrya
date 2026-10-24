@@ -331,21 +331,17 @@ impl BucketRepo {
 
     /// Returns `true` if the key `summary.sig` holds an object.
     ///
-    /// The call opens the body of the key as a stream, by the strict rule of
-    /// an absent key of
-    /// [`Bucket::get_stream_strict`](crate::remote::s3::Bucket::get_stream_strict),
-    /// and drops the stream after the headers. It reads no byte of the body.
+    /// The call is a check of
+    /// [`Bucket::exists_strict`](crate::remote::s3::Bucket::exists_strict),
+    /// by the strict rule of an absent key. It asks for the first byte of the
+    /// key alone.
     ///
     /// # Errors
     ///
     /// [`Error::Remote`] for an error of the bucket client, also for a 404
     /// that is not an absent key.
     pub(super) async fn is_signed(&self) -> Result<bool> {
-        Ok(self
-            .bucket
-            .get_stream_strict("summary.sig")
-            .await?
-            .is_some())
+        Ok(self.bucket.exists_strict("summary.sig").await?)
     }
 
     /// Returns the error of a bucket repository whose content breaks a rule.

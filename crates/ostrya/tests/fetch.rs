@@ -2000,6 +2000,76 @@ fn a_declared_length_over_the_cap_fails_before_streaming() {
     });
 }
 
+/// A 206 answers a request with a `Range` header. The fetch gives the part
+/// as the body, with the status 206, and the connection serves the next
+/// fetch. A fetch with no `Range` header gets the whole object with 200.
+#[test]
+fn a_ranged_fetch_takes_a_206_as_its_body_and_keeps_its_connection() {
+    block_on(async {
+        let handler: Handler = Arc::new(|seen, _count| match seen.header("range") {
+            Some(_) => Response::builder()
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header("content-range", "bytes 0-0/6")
+                .body(TestBody::measured(b"o"))
+                .unwrap(),
+            None => Response::builder()
+                .status(StatusCode::OK)
+                .body(TestBody::measured(b"object"))
+                .unwrap(),
+        });
+        let server = TestServer::start(Transport::Cleartext, handler).await;
+        let fetcher = Fetcher::new(direct_options(server.url(false)))
+            .await
+            .unwrap();
+
+        let headers = vec![("Range".to_owned(), "bytes=0-0".to_owned())];
+        for ranged in [true, true, false] {
+            let request = FetchRequest {
+                headers: if ranged { &headers } else { &[] },
+                ..FetchRequest::path("objects/ab/cd.filez")
+            };
+            let Fetched::Body(mut body) = fetcher.fetch(request).await.unwrap() else {
+                panic!("unexpected 304");
+            };
+            assert_eq!(body.status(), if ranged { 206 } else { 200 });
+            let mut out = Vec::new();
+            body.read_to_end(&mut out).await.unwrap();
+            assert_eq!(out, if ranged { &b"o"[..] } else { b"object" });
+        }
+        let seen = server.seen();
+        assert_eq!(seen[0].header("range"), Some("bytes=0-0"));
+        assert_eq!(seen[2].header("range"), None);
+        assert_eq!(server.connections(), 1);
+    });
+}
+
+/// A 206 to a request with no `Range` header holds a part of the object that
+/// the caller did not ask for. The fetch fails with the status, and does not
+/// ask again.
+#[test]
+fn a_206_to_a_fetch_with_no_range_is_an_error() {
+    block_on(async {
+        let handler: Handler = Arc::new(|_seen, _count| {
+            Response::builder()
+                .status(StatusCode::PARTIAL_CONTENT)
+                .header("content-range", "bytes 0-0/6")
+                .body(TestBody::measured(b"o"))
+                .unwrap()
+        });
+        let server = TestServer::start(Transport::Cleartext, handler).await;
+        let fetcher = Fetcher::new(direct_options(server.url(false)))
+            .await
+            .unwrap();
+
+        let err = fetch_error(&fetcher, "objects/ab/cd.filez").await;
+        assert!(
+            matches!(err, Error::HttpStatus { status: 206, .. }),
+            "{err}"
+        );
+        assert_eq!(server.requests(), 1);
+    });
+}
+
 #[test]
 fn a_fetch_error_converts_into_the_library_error() {
     block_on(async {

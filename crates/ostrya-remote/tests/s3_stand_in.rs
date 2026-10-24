@@ -2,15 +2,16 @@
 //!
 //! The stand-in is a small HTTP/1.1 responder on a loopback port. A test
 //! gives it a handler that answers each request, or closes the connection
-//! after it read the request. The stand-in records each request.
+//! after it read the request. The stand-in records each request, and counts
+//! the connections that it accepts.
 
 #![cfg(feature = "s3")]
 
 use std::borrow::Cow;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
 use ostrya_fetch::{
@@ -60,6 +61,10 @@ enum Answer {
         declared: usize,
         body: Vec<u8>,
     },
+    /// A chunked response, which declares no length. The stand-in sends
+    /// `body` as one chunk, then sends nothing more until the client closes
+    /// the connection.
+    Stall { status: u16, body: Vec<u8> },
 }
 
 /// A handler gets the request and the 1-based count of the requests that the
@@ -69,6 +74,8 @@ type Handler = Arc<dyn Fn(&Seen, usize) -> Answer + Send + Sync>;
 struct StandIn {
     addr: SocketAddr,
     seen: Arc<Mutex<Vec<Seen>>>,
+    /// The number of connections that the stand-in accepted.
+    accepted: Arc<AtomicUsize>,
 }
 
 impl StandIn {
@@ -79,8 +86,11 @@ impl StandIn {
         let addr = listener.local_addr().unwrap();
         let seen: Arc<Mutex<Vec<Seen>>> = Arc::default();
         let task_seen = seen.clone();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let task_accepted = accepted.clone();
         drop(spawn(async move {
             while let Ok((mut stream, _)) = listener.accept().await {
+                task_accepted.fetch_add(1, Ordering::Relaxed);
                 let handler = handler.clone();
                 let seen = task_seen.clone();
                 drop(spawn(async move {
@@ -104,6 +114,20 @@ impl StandIn {
                                 let _ = stream.write_all(head.as_bytes()).await;
                                 let _ = stream.write_all(&body).await;
                                 let _ = stream.flush().await;
+                                return;
+                            }
+                            Answer::Stall { status, body } => {
+                                let head = format!(
+                                    "HTTP/1.1 {status} Answer\r\n\
+                                     Transfer-Encoding: chunked\r\n\r\n{:x}\r\n",
+                                    body.len()
+                                );
+                                let _ = stream.write_all(head.as_bytes()).await;
+                                let _ = stream.write_all(&body).await;
+                                let _ = stream.write_all(b"\r\n").await;
+                                let _ = stream.flush().await;
+                                let mut chunk = [0u8; 1024];
+                                while let Ok(1..) = stream.read(&mut chunk).await {}
                                 return;
                             }
                             Answer::Respond {
@@ -131,11 +155,20 @@ impl StandIn {
                 }));
             }
         }));
-        StandIn { addr, seen }
+        StandIn {
+            addr,
+            seen,
+            accepted,
+        }
     }
 
     fn seen(&self) -> Vec<Seen> {
         self.seen.lock().unwrap().clone()
+    }
+
+    /// Returns the number of connections that the stand-in accepted.
+    fn connections(&self) -> usize {
+        self.accepted.load(Ordering::Relaxed)
     }
 
     /// Returns the endpoint of `address` on the stand-in, signed for
@@ -1408,6 +1441,135 @@ fn a_304_to_a_read_or_a_list_is_a_transport_error() {
     });
 }
 
+#[test]
+fn a_check_for_a_present_object_sends_a_range_and_reuses_one_connection() {
+    block_on(async {
+        let stand_in = StandIn::start(Arc::new(|_: &Seen, _| {
+            respond_with(206, &[("Content-Range", "bytes 0-0/1048576")], b"x")
+        }))
+        .await;
+        let bucket = stand_in.bucket("s3://bucket/repo").await;
+        let key = commit_key('a');
+        for _ in 0..10 {
+            assert!(bucket.exists_strict(&key).await.unwrap());
+        }
+        let seen = stand_in.seen();
+        assert_eq!(seen.len(), 10);
+        for request in &seen {
+            assert_eq!(request.method, "GET");
+            assert_eq!(request.target, format!("/bucket/repo/{key}"));
+            assert_eq!(request.header("range"), Some("bytes=0-0"));
+        }
+        assert_eq!(stand_in.connections(), 1);
+    });
+}
+
+/// A 206, a 200, and a 416 are an object. A 404 is an absent key by the rule
+/// of the check, and each other status is an error.
+#[test]
+fn a_check_reads_each_status_by_its_rule() {
+    block_on(async {
+        let stand_in = StandIn::start(Arc::new(|seen: &Seen, _| {
+            let key = seen.target.trim_start_matches("/bucket/repo/");
+            match key {
+                "config" => respond_with(206, &[("Content-Range", "bytes 0-0/9")], b"["),
+                "summary" => respond(200, b"s"),
+                "summary.sig" => respond(200, &vec![b's'; 1 << 20]),
+                "refs/heads/empty" => respond(416, &s3_error("InvalidRange")),
+                "refs/heads/absent" => respond(404, &s3_error("NoSuchKey")),
+                "refs/heads/bare" => respond(404, b""),
+                "refs/heads/denied" => respond(403, &s3_error("AccessDenied")),
+                _ => respond(304, b""),
+            }
+        }))
+        .await;
+        let bucket = stand_in.bucket("s3://bucket/repo").await;
+        for key in ["config", "summary", "summary.sig", "refs/heads/empty"] {
+            assert!(bucket.exists(key).await.unwrap(), "{key}");
+            assert!(bucket.exists_strict(key).await.unwrap(), "{key}");
+        }
+        assert!(!bucket.exists("refs/heads/absent").await.unwrap());
+        assert!(!bucket.exists_strict("refs/heads/absent").await.unwrap());
+        assert!(!bucket.exists("refs/heads/bare").await.unwrap());
+        let err = bucket.exists_strict("refs/heads/bare").await.unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                Error::S3 {
+                    status: 404,
+                    code: None,
+                    ..
+                }
+            ),
+            "{err}"
+        );
+        let err = bucket.exists("refs/heads/denied").await.unwrap_err();
+        assert!(
+            matches!(&err, Error::S3 { status: 403, code: Some(code), .. } if code == "AccessDenied"),
+            "{err}"
+        );
+        let err = bucket.exists_strict("refs/heads/other").await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Transport(message) if message.contains("304")),
+            "{err}"
+        );
+        for request in stand_in.seen() {
+            assert_eq!(request.header("range"), Some("bytes=0-0"), "{request:?}");
+        }
+    });
+}
+
+/// A server that ignores the range answers 200 with the whole object. The
+/// fetcher reads a short body to its end, so the connection serves the next
+/// check. A large body closes the connection.
+#[test]
+fn a_check_on_a_server_that_ignores_the_range_drains_a_short_body_and_closes_a_large_one() {
+    block_on(async {
+        let stand_in = StandIn::start(Arc::new(|seen: &Seen, _| {
+            if seen.target.ends_with("/config") {
+                respond(200, &[b'c'; 4096])
+            } else {
+                respond(200, &vec![b's'; 1 << 20])
+            }
+        }))
+        .await;
+        let bucket = stand_in.bucket("s3://bucket/repo").await;
+        assert!(bucket.exists_strict("config").await.unwrap());
+        assert!(bucket.exists_strict("config").await.unwrap());
+        assert_eq!(stand_in.connections(), 1);
+        assert!(bucket.exists_strict("summary").await.unwrap());
+        assert!(bucket.exists_strict("config").await.unwrap());
+        assert_eq!(stand_in.connections(), 2);
+    });
+}
+
+/// A body with no declared length is not read, so a server that stalls the
+/// body does not hold the check until the progress timeout.
+#[test]
+fn a_check_does_not_read_a_body_with_no_declared_length() {
+    block_on(async {
+        let stand_in = StandIn::start(Arc::new(|seen: &Seen, _| {
+            let status = if seen.target.ends_with("/config") {
+                206
+            } else {
+                200
+            };
+            Answer::Stall {
+                status,
+                body: b"x".to_vec(),
+            }
+        }))
+        .await;
+        let bucket = stand_in.bucket("s3://bucket/repo").await;
+        for key in ["config", "summary"] {
+            let started = Instant::now();
+            assert!(bucket.exists_strict(key).await.unwrap(), "{key}");
+            assert!(started.elapsed() < Duration::from_secs(2), "{key}");
+        }
+        assert_eq!(stand_in.connections(), 2);
+    });
+}
+
 /// A whole read reserves the declared length and one byte for the end of the
 /// body. So the bytes of an object hold no doubled buffer.
 #[test]
@@ -2334,6 +2496,7 @@ fn a_conditional_delete_after_an_unsure_request_reads_the_key() {
         );
         let methods: Vec<String> = deleted.seen().into_iter().map(|s| s.method).collect();
         assert_eq!(methods, ["DELETE", "DELETE", "GET"]);
+        assert_eq!(deleted.seen()[2].header("range"), Some("bytes=0-0"));
 
         // The read finds an object, so the key holds another object.
         let held = StandIn::start(Arc::new(|seen: &Seen, count| {
@@ -2354,6 +2517,7 @@ fn a_conditional_delete_after_an_unsure_request_reads_the_key() {
         );
         let methods: Vec<String> = held.seen().into_iter().map(|s| s.method).collect();
         assert_eq!(methods, ["DELETE", "DELETE", "GET"]);
+        assert_eq!(held.seen()[2].header("range"), Some("bytes=0-0"));
     });
 }
 

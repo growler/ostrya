@@ -678,6 +678,39 @@ fn a_signed_bucket_refuses_an_update_with_no_signer() {
 }
 
 #[test]
+fn the_probe_of_the_signature_sends_a_range() {
+    block_on(async {
+        let f = Fixture::new(None).await;
+        f.update().await.unwrap();
+        // The probe of a present signature and of an absent one.
+        for present in [true, false] {
+            if !present {
+                f.remove("summary.sig");
+            }
+            {
+                let mut state = f.server.state();
+                state.requests.clear();
+                state.ranges.clear();
+                state.connections.clear();
+            }
+            let updated = f.bucket.update_summary(&unsigned()).await;
+            assert_eq!(updated.is_err(), present, "{updated:?}");
+            let state = f.server.state();
+            let probes: Vec<&Option<String>> = state
+                .requests
+                .iter()
+                .zip(&state.ranges)
+                .filter(|((method, target), _)| {
+                    method == "GET" && target == "/bkt/repo/summary.sig"
+                })
+                .map(|(_, range)| range)
+                .collect();
+            assert_eq!(probes, [&Some("bytes=0-0".to_owned())], "{present}");
+        }
+    });
+}
+
+#[test]
 fn a_404_that_is_no_absent_key_fails_the_probe_of_the_signature() {
     block_on(async {
         let f = Fixture::new(None).await;

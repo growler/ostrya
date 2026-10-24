@@ -1265,6 +1265,12 @@ pub struct FetchRequest<'a> {
     /// content coding. A response that declares a coding fails with
     /// [`Error::ContentEncoded`], whichever layer asked for it.
     ///
+    /// A `Range` entry, in either layer, makes a 206 a successful answer. The
+    /// fetch then gives the part of the object as a [`Body`], whose
+    /// [`status`](Body::status) is 206. A 206 to a request with no `Range`
+    /// entry fails the fetch with [`Error::HttpStatus`]. The size cap and the
+    /// content coding rules apply to a 206 as to a 200.
+    ///
     /// A `Host` entry fails the fetch, because the header comes from the URL. A
     /// header that the connection layer sets fails at both layers: a framing
     /// name or a hop-by-hop name. The connection owns the framing of a request
@@ -3171,11 +3177,12 @@ impl Fetcher {
     /// specification. The body then holds bytes other than the bytes that the
     /// checksum of the object names.
     ///
-    /// A 200 response fails the attempt definitively with
-    /// [`Error::ContentEncoded`] in two cases: a `Content-Encoding` other than
-    /// `identity`, or a `Transfer-Encoding` other than `chunked` and
-    /// `identity`. This applies whichever layer asked for the coding. A caller
-    /// that wants a coded body decodes it outside the fetcher.
+    /// A 200 response, or a 206 response to a request with a `Range` header,
+    /// fails the attempt definitively with [`Error::ContentEncoded`] in two
+    /// cases: a `Content-Encoding` other than `identity`, or a
+    /// `Transfer-Encoding` other than `chunked` and `identity`. This applies
+    /// whichever layer asked for the coding. A caller that wants a coded body
+    /// decodes it outside the fetcher.
     ///
     /// `chunked` frames a message, and the connection removes the framing. So a
     /// response with `chunked` alone gives the body as the remote wrote it.
@@ -3254,7 +3261,8 @@ impl Fetcher {
     /// - [`Error::Fetch`] if [`fetch_timeout`](FetcherOptions::fetch_timeout)
     ///   expires.
     /// - [`Error::HttpStatus`] if a destination answers with a status other
-    ///   than 200 and 304. This includes a redirect that the fetch does not
+    ///   than 200 and 304, and other than 206 to a request with a `Range`
+    ///   header. This includes a redirect that the fetch does not
     ///   follow: no usable `Location`, or a redirect limit of zero. With
     ///   [`max_error_body`](FetchRequest::max_error_body), the error carries
     ///   the response, as the rules of the error responses state.
@@ -3664,7 +3672,12 @@ impl Fetcher {
                 followed += 1;
                 continue;
             }
-            if status != StatusCode::OK {
+            // A 206 answers a request that names a range. A 206 to any other
+            // request holds a part of the object that the caller did not ask
+            // for, so it is an unsuccessful status.
+            let ranged = status == StatusCode::PARTIAL_CONTENT
+                && headers.iter().any(|(name, _)| name == hyper::header::RANGE);
+            if status != StatusCode::OK && !ranged {
                 let failure = classify(status, url);
                 return Err(self
                     .conclude(&key, response, reuse, drain_until, failure, keep)
@@ -3701,6 +3714,7 @@ impl Fetcher {
                 chunk: Bytes::new(),
                 received: 0,
                 max_size: request.max_size,
+                status: status.as_u16(),
                 validators,
                 content_length,
                 protocol,
@@ -4466,6 +4480,7 @@ impl Fetcher {
                     chunk: Bytes::new(),
                     received: 0,
                     max_size: Some(plan.max_response),
+                    status: parts.status.as_u16(),
                     validators: Validators::default(),
                     content_length: if withheld { None } else { content_length },
                     protocol,
@@ -5137,8 +5152,10 @@ impl Inner {
 /// Each refetch spends one repeat of
 /// [`max_retries`](FetcherOptions::max_retries), the count that also limits
 /// the rounds of the fetch. So the rounds of each fetch and the refetches
-/// between them share one budget. A refetch asks for the whole body again,
-/// from the first destination, and sends no `Range` request.
+/// between them share one budget. A refetch sends the request again, from
+/// the first destination. It sends the `Range` header of the request again,
+/// if the request has one, and adds no `Range` header of its own. So a
+/// refetch asks for the whole body again, or for the same part of it.
 ///
 /// A body that fails in another way is not fetched again, because another
 /// fetch fails in the same way. Examples are the size cap and a failure of
@@ -5248,6 +5265,7 @@ pub struct Body {
     /// the bytes still in `chunk`. The size cap applies to this count.
     received: u64,
     max_size: Option<u64>,
+    status: u16,
     validators: Validators,
     content_length: Option<u64>,
     protocol: Protocol,
@@ -5369,6 +5387,16 @@ impl std::fmt::Debug for Body {
 }
 
 impl Body {
+    /// Returns the status of the response that carries the body.
+    ///
+    /// The status of a fetch is 200, or 206 for a request with a `Range`
+    /// header. A caller that sends `Range` reads the status to tell a part of
+    /// the object from the whole object. The status of the body of an upload
+    /// is [`Uploaded::status`].
+    pub fn status(&self) -> u16 {
+        self.status
+    }
+
     /// Returns the validators to send on the next fetch of this target.
     pub fn validators(&self) -> &Validators {
         &self.validators

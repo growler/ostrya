@@ -302,6 +302,10 @@ fn get_stream_reads_a_large_object() {
     let expected: [u8; 32] = digest.finalize().into();
     block_on(async {
         let bucket = rclone.bucket("s3://bkt/repo").await;
+        // A check finds the object, and finds no summary.
+        assert!(bucket.exists_strict(&key).await.unwrap());
+        assert!(!bucket.exists_strict("summary").await.unwrap());
+        assert!(!bucket.exists("summary").await.unwrap());
         let mut stream = bucket.get_stream(&key).await.unwrap().unwrap();
         assert_eq!(stream.content_length(), Some(64 << 20));
         assert!(stream.etag().is_some());

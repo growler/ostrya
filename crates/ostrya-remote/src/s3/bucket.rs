@@ -123,10 +123,12 @@ const UNBLOCK_SIZE: usize = 1024 * 1024;
 ///
 /// # Requests
 ///
-/// The `GET` requests (get, get stream, and the lists) are fetches. The
-/// fetcher repeats a fetch after a transport failure or a 408, 429, or 5xx,
-/// as [`Fetcher::fetch`] states, and fetches a failed body of a whole read
-/// again.
+/// The `GET` requests (get, get stream, the checks for an object, and the
+/// lists) are fetches. The fetcher repeats a fetch after a transport failure
+/// or a 408, 429, or 5xx, as [`Fetcher::fetch`] states, and fetches a failed
+/// body of a whole read again. A check for an object is a `GET` with
+/// `Range: bytes=0-0`, as [`exists`](Bucket::exists) states. The signature
+/// does not cover the `Range` header.
 ///
 /// The client sends a `PUT`, a `DELETE`, and the `POST` that starts a
 /// multipart upload again after
@@ -594,6 +596,95 @@ impl Bucket {
         }
     }
 
+    /// Returns `true` if the key `key` holds an object.
+    ///
+    /// The request is `GET KEY` with `Range: bytes=0-0`, and the client reads
+    /// at most one byte of the object. A 206 and a 200 are an object. A 416
+    /// is an object too, because a server gives it for an object of zero
+    /// bytes. A server that ignores the range answers 200 with the whole
+    /// object. The client then refuses a declared length over one byte, and
+    /// reads no byte of it. The fetcher reads a declared body of at most
+    /// 64 KiB to its end, so the connection goes back to the pool. A larger
+    /// body, or a body with no declared length, closes the connection.
+    ///
+    /// The client reads a body that declares a length of at most one byte to
+    /// its end, so the connection goes back to the pool. If the body fails
+    /// after the status, the status decides, and the key holds an object. The
+    /// client does not read a body with no declared length, and its
+    /// connection closes. So a server that stalls such a body does not hold
+    /// the check until the progress timeout.
+    ///
+    /// [`get`](Bucket::get) states the rule of an absent key.
+    /// [`exists_strict`](Bucket::exists_strict) reads a key by the strict
+    /// rule.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidInput`] if `key` is not a key of a bucket repository.
+    /// - [`Error::S3`] and [`Error::S3Region`] for an unsuccessful response.
+    /// - [`Error::Transport`] if the server answers with 304. The request
+    ///   sends no validators, so the answer cannot be used.
+    /// - [`Error::Fetch`] for a failure of the fetcher.
+    pub async fn exists(&self, key: &str) -> Result<bool> {
+        self.probe(key, is_absent).await
+    }
+
+    /// Returns `true` if the key `key` holds an object, by the strict rule of
+    /// an absent key of [`get_strict`](Bucket::get_strict).
+    ///
+    /// [`exists`](Bucket::exists) states the request and the rules of an
+    /// object.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`exists`](Bucket::exists). A 404 that is not an absent
+    /// key gives [`Error::S3`] with the status 404, and with no code if the
+    /// body holds no S3 code.
+    pub async fn exists_strict(&self, key: &str) -> Result<bool> {
+        self.probe(key, is_no_such_key).await
+    }
+
+    /// Returns `true` if the key `key` holds an object, as
+    /// [`exists`](Bucket::exists) does, with `absent` as the rule of an
+    /// absent key.
+    async fn probe(&self, key: &str, absent: fn(u16, Option<&[u8]>) -> bool) -> Result<bool> {
+        check_key(key)?;
+        let full = self.full_key(key);
+        let path = encode_path(&full);
+        let target = self.target(&path, "");
+        let range = [("Range".to_owned(), "bytes=0-0".to_owned())];
+        let fetched = self
+            .fetcher
+            .fetch(FetchRequest {
+                headers: &range,
+                max_size: Some(1),
+                max_error_body: Some(XML_CAP),
+                ..target.fetch()
+            })
+            .await;
+        match fetched {
+            Ok(Fetched::Body(mut body)) => {
+                // The end of a declared body returns the connection to the
+                // pool. A failure drops the connection, and the status still
+                // decides. A body with no declared length is not read, so a
+                // server that stalls it does not hold the check, and the drop
+                // closes the connection.
+                if body.content_length().is_some_and(|length| length <= 1) {
+                    let mut bytes = [0u8; 8];
+                    while let Ok(1..) = body.read(&mut bytes).await {}
+                }
+                Ok(true)
+            }
+            Ok(Fetched::NotModified) => Err(not_modified(&full)),
+            Err(ostrya_fetch::Error::FetchTooLarge { .. }) => Ok(true),
+            Err(ostrya_fetch::Error::HttpStatus { status: 416, .. }) => Ok(true),
+            Err(e) => {
+                self.absent_or_error(e, &full, 1, absent)?;
+                Ok(false)
+            }
+        }
+    }
+
     /// Writes `body` to `key`, and returns the `ETag` of the response.
     ///
     /// The request is idempotent, so the client sends it again by the rule
@@ -869,9 +960,9 @@ impl Bucket {
     /// The client sends the request again by the rule of [`Bucket`]. A 412
     /// or an absent key after a request with an unknown outcome can answer a
     /// request of this call. So the client then reads the key as
-    /// [`get_stream`](Bucket::get_stream) does, and reads no byte of the
-    /// object. An absent key gives [`DeleteIfMatch::Deleted`], and an object
-    /// gives [`DeleteIfMatch::NotMatched`].
+    /// [`exists`](Bucket::exists) does. An absent key gives
+    /// [`DeleteIfMatch::Deleted`], and an object gives
+    /// [`DeleteIfMatch::NotMatched`].
     ///
     /// A server that does not honor `If-Match` deletes the object whatever
     /// its `ETag` is, and gives [`DeleteIfMatch::Deleted`].
@@ -885,8 +976,7 @@ impl Bucket {
     /// - [`Error::S3`] and [`Error::S3Region`] for an unsuccessful response.
     /// - [`Error::Fetch`] for a failure of the fetcher, also after the last
     ///   request that the client sent again.
-    /// - The errors of [`get_stream`](Bucket::get_stream) for the read of
-    ///   the key.
+    /// - The errors of [`exists`](Bucket::exists) for the read of the key.
     pub async fn delete_if_match(&self, key: &str, etag: &str) -> Result<DeleteIfMatch> {
         check_key(key)?;
         if etag.is_empty() || etag.len() > MAX_UPLOAD_TOKEN {
@@ -916,9 +1006,10 @@ impl Bucket {
                     if !unsure {
                         return Ok(DeleteIfMatch::NotMatched);
                     }
-                    return Ok(match self.get_stream(key).await? {
-                        Some(_) => DeleteIfMatch::NotMatched,
-                        None => DeleteIfMatch::Deleted,
+                    return Ok(if self.exists(key).await? {
+                        DeleteIfMatch::NotMatched
+                    } else {
+                        DeleteIfMatch::Deleted
                     });
                 }
                 Sent::Reply(reply) if is_retryable(reply.status) && round < self.max_retries => {

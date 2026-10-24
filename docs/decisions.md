@@ -428,6 +428,38 @@ a marker on a commit whose tree is whole. `get_stream_strict` shares the
 code of `get_stream`, as `get_strict` shares the code of `get`. The other
 readers of a bucket keep the rule above.
 
+`Bucket::exists` and `Bucket::exists_strict` check that a key holds an
+object, by the rule of `get` and by the rule of `get_strict`. A check is a
+`GET` with `Range: bytes=0-0` and a size cap of one byte. A 206 and a 200
+are an object. A 416 is an object too, because a server gives it for an
+object of zero bytes. No object of a bucket repository has zero bytes, so
+the rule costs nothing. The client reads a body that declares a length of
+at most one byte to its end, so the connection goes back to the pool. A
+failure of the body after the status does not change the answer, because
+the status decides, and the drop of the body closes the connection. The
+client does not read a body with no declared length, and the drop of the
+body closes its connection. A read of such a body was rejected: a server
+that sends no byte and stalls holds the check, and one of the
+`max_outstanding` places of the caller, until the progress timeout. A
+server that ignores the range answers 200 with the whole object. The fetcher then refuses a declared
+length over one byte with `FetchTooLarge`, and the check takes that refusal
+as an object. The fetcher reads a declared body of at most 64 KiB to its
+end, so the connection goes back to the pool. It closes the connection of
+a larger body, or of a body with no declared length. The fetcher takes a
+206 as a body only for a request with a `Range` header. A 206 to another
+request is `Error::HttpStatus`, because it holds a part of the object that
+the caller did not ask for. The SigV4 signature does not cover the `Range`
+header, so the signer signs a check as it signs each other `GET`.
+
+A `HEAD` was rejected. The response to a `HEAD` has no body, so a 404 to a
+`HEAD` holds no S3 code, and the strict rule cannot tell `NoSuchKey` from
+`NoSuchBucket` or from a page of a proxy. A `GET` with no range was
+rejected. For a large object, the server starts to send the body, and the
+drop of the stream closes the connection. So many checks open many
+connections, and each one uses bandwidth. `rclone serve s3` 1.75.1 answers
+a check with 200, `Content-Range: bytes 0-0/<size>`, and one byte.
+SeaweedFS 4.36 answers it with 206 and one byte.
+
 A conditional `PUT` (`If-None-Match: *`) gives `PutIfAbsent::Created` only
 when a request of the call got a 2xx. A request whose outcome is not known,
 then a 412 or a failed request, makes the client read the key and compare
@@ -456,9 +488,9 @@ A conditional `DELETE` (`If-Match` with an `ETag`) gives
 `DeleteIfMatch::Deleted` for a 2xx, and `DeleteIfMatch::NotMatched` for a
 412 or an absent key to the first request. SeaweedFS 4.36 answers 412 also
 for an absent key, so a 412 after a request with an unknown outcome can
-answer a delete of this call. The client then reads the key with
-`Bucket::get_stream` and reads no byte of the object: an absent key gives
-`Deleted`, and an object gives `NotMatched`. `rclone serve s3` 1.75.1 does
+answer a delete of this call. The client then checks the key with
+`Bucket::exists`, which asks for the first byte of the object alone: an
+absent key gives `Deleted`, and an object gives `NotMatched`. `rclone serve s3` 1.75.1 does
 not honor `If-Match`, and deletes the object whatever its `ETag` is.
 
 Each page of a list must move forward, or the list fails. Each key and
@@ -1314,9 +1346,10 @@ false `missing` finding. Before the run records a `missing` finding for an
 object that the listing does not hold, it reads the object again. An object
 that the bucket holds now gives a note. Else the run reads each commit of
 the finding again, and a finding whose commits are all gone is dropped. The
-read opens the object as a stream and takes none of its body: the bucket
-client has no `HEAD`, and the key rule refuses a list with the key as its
-prefix.
+read is a check of `Bucket::exists_strict`, which asks for the first byte
+of the object alone, so its connection serves the next read. A `HEAD`
+cannot apply the strict rule, and the key rule refuses a list with the key
+as its prefix.
 
 The hash and the parse of a metadata object larger than 1 MiB, and the
 parse of a summary, run on the blocking pool, as the parse of a commit and
@@ -1509,9 +1542,10 @@ A bucket repository that holds a `summary.sig` refuses an update with no
 signer, and no option turns the refusal off. The refusal changes nothing in
 the bucket but the probe key of the writer lock.
 A signed bucket repository is a signed bucket repository by the presence
-of the key `summary.sig` alone. The probe takes the strict rule of an
-absent key, so only an answer 404 `NoSuchKey` is an absent key, and it
-drops the stream after the headers, so it reads no byte of the body. A
+of the key `summary.sig` alone. The probe is a check of
+`Bucket::exists_strict`. It takes the strict rule of an absent key, so only
+an answer 404 `NoSuchKey` is an absent key, and it asks for the first byte
+of the key alone. A
 probe with the lenient rule was rejected: with it, a 404 that is not an
 absent key lets an update with no signer go on, and its summary then has
 no signature that covers it. A read of the body was rejected: the body can

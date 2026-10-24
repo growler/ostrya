@@ -248,11 +248,16 @@ A presigned query for each target was rejected, for three reasons:
   body.
 
 The signer gets a body given whole as a slice of the request body, with no
-copy, and hashes it on the task of the request, on each call. On the
-development host, the SHA-256 of 8 MiB takes about 4.8 ms in a release build.
-This is less than the limit of 10 ms for work on the task, so the fetcher
-gives the signer the bytes and does not hash the body itself. A streamed body
-reaches the signer as `SignPayload::Streamed`, with no bytes.
+copy. A body of `UploadBody::bytes` reaches the signer as
+`SignPayload::Bytes`, and the signer hashes it on the task of the request,
+on each call. A body of `UploadBody::bytes_with_sha256` carries the SHA-256
+that the caller computed. It reaches the signer as `SignPayload::Sha256`,
+with the slice and the digest, so the signer hashes no byte of it. The
+upload gives the same digest to the signer of each attempt, each retry, and
+each redirect hop, and a copy of the body keeps the digest. The fetcher does
+not check the digest, and it does not hash a body itself: `ostrya-fetch`
+has no SHA-256 code. A streamed body reaches the signer as
+`SignPayload::Streamed`, with no bytes.
 
 ## SigV4 and the AWS credentials
 
@@ -440,10 +445,12 @@ conditional `PUT` writes over the object.
 
 The compare reads the object as a stream in chunks of 64 KiB, and holds no
 copy of the object. A response that declares a length other than the
-length of the body holds other bytes, and the client reads none of it. The
-client hashes the body of the request only for a compare, on the blocking
-pool of the runtime, so a `PUT` with no compare hashes its body once, in
-the signer.
+length of the body holds other bytes, and the client reads none of it. For
+a body of more than 1 MiB, the client computes the SHA-256 of the body on
+the blocking pool of the runtime, once before the first request. The signer
+of each request and the compare use that digest. For a body of 1 MiB or
+less, the signer hashes the body on the task of each request, and the
+compare computes the digest on the blocking pool at the first compare.
 
 A conditional `DELETE` (`If-Match` with an `ETag`) gives
 `DeleteIfMatch::Deleted` for a 2xx, and `DeleteIfMatch::NotMatched` for a
@@ -597,11 +604,17 @@ later read. For an object of several parts, the completion gives
 on `rclone serve s3` 1.75.1 gives the MD5 of the whole object, and
 SeaweedFS 4.36 keeps the value with `-N`.
 
-The signer hashes each part on the task of the call, as for each body of
-bytes (`SignPayload::Bytes`). The SHA-256 of 8 MiB takes about 4.8 ms on
-the dev host, about 1674 MiB/s. A part over about 16.7 MiB passes 10 ms.
-`s3::part_size` gives such a part to an object over about 78 GiB. This time
-is accepted.
+The bucket client hashes a body of more than 1 MiB once, on the blocking
+pool of the runtime, before the first request of the body. The rule applies
+to each part of a multipart upload, to the body of `put`, `put_if_absent`,
+and a `put_stream` of one part, and to the document that completes an
+upload. The body moves to the pool and back with no copy, so the buffer of
+a part comes back for the next part. The client gives the digest with
+`UploadBody::bytes_with_sha256`, so the signer gets `SignPayload::Sha256`,
+and each retry of the body signs the same digest. The compare of
+`put_if_absent` uses that digest too. The signer hashes a body of 1 MiB or
+less on the task of each request, as `SignPayload::Bytes`. The SHA-256 of
+8 MiB takes about 4.8 ms on the dev host, so 1 MiB takes about 0.6 ms.
 
 `Endpoint` of `ostrya-remote` has `#[non_exhaustive]`, and the variant
 `Endpoint::S3` is behind the feature `s3`. Cargo features are additive, so

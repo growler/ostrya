@@ -6738,6 +6738,9 @@ enum SignedBody {
     Empty,
     /// The length and the SHA-256 digest of a body given whole.
     Bytes(u64, [u8; 32]),
+    /// The length of a body given whole, and the digest that the caller
+    /// gave with it.
+    Sha256(u64, [u8; 32]),
     Streamed,
 }
 
@@ -6771,6 +6774,7 @@ impl RequestSigner for StampSigner {
         let body = match request.payload {
             SignPayload::Empty => SignedBody::Empty,
             SignPayload::Bytes(bytes) => SignedBody::Bytes(bytes.len() as u64, sha256(bytes)),
+            SignPayload::Sha256 { bytes, sha256 } => SignedBody::Sha256(bytes.len() as u64, sha256),
             SignPayload::Streamed => SignedBody::Streamed,
             other => panic!("unknown payload {other:?}"),
         };
@@ -6885,13 +6889,16 @@ fn a_signer_stamps_each_attempt_and_each_retry() {
 }
 
 /// The signer gets the bytes of a `PUT` body given whole, no bytes for a
-/// streamed body, and an empty body for a `DELETE`, over HTTP/1.1 and over
-/// HTTP/2. The authority is the authority that the request carries.
+/// streamed body, an empty body for a `DELETE`, and the digest of the caller
+/// for a body given with its SHA-256, over HTTP/1.1 and over HTTP/2. The
+/// authority is the authority that the request carries.
 #[test]
 fn a_signer_stamps_put_bytes_delete_and_streamed_over_http1_and_http2() {
     block_on(bounded(async {
         let data = upload_data(70_000);
         let streamed = upload_data(100_001);
+        // The signer gets the digest as the caller gave it.
+        let digest = [0x5a; 32];
         for alpn in ["http/1.1", "h2"] {
             let server = TestServer::start(tls_transport(alpn), always_status(204)).await;
             let signer = Arc::new(StampSigner::default());
@@ -6931,13 +6938,26 @@ fn a_signer_stamps_put_bytes_delete_and_streamed_over_http1_and_http2() {
                 .unwrap();
             assert_eq!(uploaded.status(), 204);
 
+            let uploaded = fetcher
+                .upload(UploadRequest {
+                    method: UploadMethod::Put,
+                    ..UploadRequest::path(
+                        "objects/digest",
+                        UploadBody::bytes_with_sha256(data.clone(), digest),
+                    )
+                })
+                .await
+                .unwrap();
+            assert_eq!(uploaded.status(), 204);
+
             let seen = server.seen();
             let signed = signer.signed();
-            assert_eq!(seen.len(), 3, "{alpn}");
-            assert_eq!(signed.len(), 3, "{alpn}");
+            assert_eq!(seen.len(), 4, "{alpn}");
+            assert_eq!(signed.len(), 4, "{alpn}");
             assert_body(&seen[0], &data);
             assert_body(&seen[1], &streamed);
             assert_body(&seen[2], b"");
+            assert_body(&seen[3], &data);
             let expected = [
                 (
                     "PUT",
@@ -6946,6 +6966,11 @@ fn a_signer_stamps_put_bytes_delete_and_streamed_over_http1_and_http2() {
                 ),
                 ("PUT", "/objects/streamed", SignedBody::Streamed),
                 ("DELETE", "/objects/put", SignedBody::Empty),
+                (
+                    "PUT",
+                    "/objects/digest",
+                    SignedBody::Sha256(data.len() as u64, digest),
+                ),
             ];
             for (n, (method, path, body)) in expected.into_iter().enumerate() {
                 assert_eq!(seen[n].method, method, "{alpn}");
@@ -7060,6 +7085,59 @@ fn a_same_origin_redirect_is_signed_again() {
         let seen = server.seen();
         assert_eq!(values(&seen[0], "x-stamp"), ["1"]);
         assert_eq!(values(&seen[1], "x-stamp"), ["2"]);
+    }));
+}
+
+/// A `PUT` that follows a 307 at the named origin is signed again, with the
+/// digest that the caller gave with the body.
+#[test]
+fn a_same_origin_upload_redirect_signs_the_digest_again() {
+    block_on(bounded(async {
+        let server = TestServer::start(
+            Transport::Cleartext,
+            Arc::new(|_seen, count| {
+                if count == 1 {
+                    redirect(307, "/moved")
+                } else {
+                    Response::builder()
+                        .status(StatusCode::OK)
+                        .body(TestBody::measured(b"landed"))
+                        .unwrap()
+                }
+            }),
+        )
+        .await;
+        let signer = Arc::new(StampSigner::default());
+        let fetcher = Fetcher::new(signing(direct_options(server.url(false)), &signer))
+            .await
+            .unwrap();
+        let data = upload_data(70_000);
+        let digest = sha256(&data);
+        let uploaded = fetcher
+            .upload(UploadRequest {
+                method: UploadMethod::Put,
+                ..UploadRequest::path(
+                    "objects",
+                    UploadBody::bytes_with_sha256(data.clone(), digest),
+                )
+            })
+            .await
+            .unwrap();
+        assert_eq!(uploaded.status(), 200);
+        assert_eq!(read_uploaded(uploaded).await, b"landed");
+        let signed = signer.signed();
+        assert_eq!(signed.len(), 2);
+        assert_eq!(signed[0].path, "/objects");
+        assert_eq!(signed[1].path, "/moved");
+        for signed in &signed {
+            assert_eq!(signed.method, "PUT");
+            assert_eq!(signed.body, SignedBody::Sha256(data.len() as u64, digest));
+        }
+        let seen = server.seen();
+        assert_eq!(values(&seen[0], "x-stamp"), ["1"]);
+        assert_eq!(values(&seen[1], "x-stamp"), ["2"]);
+        assert_body(&seen[0], &data);
+        assert_body(&seen[1], &data);
     }));
 }
 

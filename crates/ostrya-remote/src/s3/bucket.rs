@@ -79,6 +79,11 @@ const FIRST_READ: u64 = 8 * 1024;
 /// the object of the key: 64 KiB.
 const COMPARE_CHUNK: usize = 64 * 1024;
 
+/// The size above which the client hashes a body on the blocking pool, once
+/// before the first request: 1 MiB. The signer hashes a smaller body on the
+/// task of each request.
+const UNBLOCK_SIZE: usize = 1024 * 1024;
+
 /// The client of a bucket repository.
 ///
 /// [`Bucket::new`] opens it from an [`S3Endpoint`], and
@@ -595,6 +600,10 @@ impl Bucket {
     /// of [`Bucket`]. A second request shares the bytes of the first one, so
     /// the client holds one copy of the body.
     ///
+    /// The client hashes a body of more than 1 MiB once, on the blocking pool
+    /// of the runtime, before the first request. Each request signs that
+    /// digest. The signer hashes a smaller body on the task of each request.
+    ///
     /// # Errors
     ///
     /// - [`Error::InvalidInput`] if `key` is not a key of a bucket repository,
@@ -607,7 +616,7 @@ impl Bucket {
         check_put_size(key, &body)?;
         let full = self.full_key(key);
         let path = encode_path(&full);
-        self.put_body(&full, &path, UploadBody::bytes(body)).await
+        self.put_body(&full, &path, upload_body(body).await).await
     }
 
     /// Writes the bytes that `body` gives to `key`, and returns the `ETag`
@@ -636,8 +645,11 @@ impl Bucket {
     /// the buffer back and reads the next part into it. If the fetcher still
     /// holds the bytes of a part, the next part takes a new buffer. After a
     /// full part, the call reads one byte more to find if the body goes on.
-    /// The signer hashes each part on the task of the call, before each
-    /// request.
+    /// The call hashes each part of more than 1 MiB once, on the blocking
+    /// pool of the runtime, before the first request of the part. The part
+    /// moves to the pool and back with no copy, and each request of the part
+    /// signs that digest. The signer hashes a smaller part on the task of
+    /// each request.
     ///
     /// The client takes an upload id and an `ETag` of a part of at most
     /// 1 KiB each. So the `ETag` values of an upload and the document that
@@ -746,9 +758,10 @@ impl Bucket {
     ///
     /// The compare reads the object as a stream, in chunks of 64 KiB. A
     /// response that declares a length other than the length of `body`
-    /// holds other bytes, and the client reads none of it. The SHA-256 of
-    /// `body` is computed only for a compare, on the blocking pool of the
-    /// runtime.
+    /// holds other bytes, and the client reads none of it. The client
+    /// computes the SHA-256 of `body` on the blocking pool of the runtime:
+    /// for a body of more than 1 MiB once before the first request, which
+    /// each request signs, and for a smaller body at the first compare.
     ///
     /// A server that does not honor `If-None-Match` writes the object over
     /// the one that the key holds, and gives [`PutIfAbsent::Created`].
@@ -762,13 +775,14 @@ impl Bucket {
         check_put_size(key, &body)?;
         let full = self.full_key(key);
         let path = encode_path(&full);
-        let body = UploadBody::bytes(body);
+        let body = upload_body(body).await;
         let headers = [("If-None-Match".to_owned(), "*".to_owned())];
         let mut round = 0;
         // `true` after a request whose outcome is not known.
         let mut unsure = false;
-        // The SHA-256 of `body`, computed at the first compare that needs it.
-        let mut digest: Option<[u8; 32]> = None;
+        // The SHA-256 of `body`: the digest of a large body, or else computed
+        // at the first compare that needs it.
+        let mut digest = body.sha256();
         loop {
             match self
                 .send(UploadMethod::Put, &path, "", copy(&body), &headers)
@@ -1309,7 +1323,7 @@ impl Bucket {
         let first = parts.next().await.map_err(|stop| stop.error(&full))?;
         if first.last {
             return self
-                .put_body(&full, &path, UploadBody::bytes(first.bytes))
+                .put_body(&full, &path, upload_body(first.bytes).await)
                 .await;
         }
         let upload_id = self.create_upload(&full, &path).await?;
@@ -1361,7 +1375,7 @@ impl Bucket {
             parts.recycle(body);
             part = parts.next().await.map_err(|stop| stop.error(full))?;
         }
-        let body = UploadBody::bytes(complete_body(&etags));
+        let body = upload_body(complete_body(&etags)).await;
         drop(etags);
         self.complete_upload(key, full, path, query, body, sent)
             .await
@@ -1431,7 +1445,7 @@ impl Bucket {
     ) -> std::result::Result<(String, UploadBody), Failed> {
         let number = part.number;
         let query = format!("partNumber={number}&{query}");
-        let body = UploadBody::bytes(part.bytes);
+        let body = upload_body(part.bytes).await;
         let reply = self
             .send_retrying(UploadMethod::Put, path, &query, &body)
             .await?;
@@ -2021,6 +2035,22 @@ fn complete_body(etags: &[String]) -> Vec<u8> {
     body.into_bytes()
 }
 
+/// Returns the body of `bytes`.
+///
+/// A body of more than [`UNBLOCK_SIZE`] bytes moves to the blocking pool,
+/// which hashes it and gives it back with its SHA-256, with no copy of its
+/// bytes. A smaller body has no digest, and the signer hashes it.
+async fn upload_body(bytes: Vec<u8>) -> UploadBody {
+    if bytes.len() <= UNBLOCK_SIZE {
+        return UploadBody::bytes(bytes);
+    }
+    ostrya_rt::unblock(move || {
+        let sha256 = Sha256::digest(&bytes).into();
+        UploadBody::bytes_with_sha256(bytes, sha256)
+    })
+    .await
+}
+
 /// Returns a second body with the bytes of `body`.
 fn copy(body: &UploadBody) -> UploadBody {
     body.try_clone()
@@ -2528,6 +2558,29 @@ mod tests {
             assert_eq!(last.bytes.as_ptr(), address);
             assert_eq!(last.bytes.capacity(), size);
             assert_eq!(parts.body.zeros, zeros);
+        });
+    }
+
+    #[test]
+    fn a_body_over_the_limit_comes_back_from_the_pool_with_its_digest() {
+        ostrya_rt::block_on(async {
+            let small = upload_body(vec![1; UNBLOCK_SIZE]).await;
+            assert_eq!(small.sha256(), None);
+            assert_eq!(small.as_bytes().map(<[u8]>::len), Some(UNBLOCK_SIZE));
+
+            let mut bytes = Vec::with_capacity(UNBLOCK_SIZE + 8);
+            bytes.resize(UNBLOCK_SIZE + 1, 2);
+            let digest: [u8; 32] = Sha256::digest(&bytes).into();
+            let (address, capacity) = (bytes.as_ptr(), bytes.capacity());
+            let body = upload_body(bytes).await;
+            assert_eq!(body.sha256(), Some(digest));
+            assert_eq!(body.as_bytes().map(<[u8]>::as_ptr), Some(address));
+            // The buffer of the body comes back for the next part.
+            let mut parts = Parts::new(&[][..], UNBLOCK_SIZE + 1, 2);
+            parts.recycle(body);
+            let spare = parts.spare.take().expect("the buffer comes back");
+            assert_eq!(spare.as_ptr(), address);
+            assert_eq!(spare.capacity(), capacity);
         });
     }
 

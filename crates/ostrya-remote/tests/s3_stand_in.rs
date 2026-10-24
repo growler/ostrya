@@ -6,13 +6,16 @@
 
 #![cfg(feature = "s3")]
 
+use std::borrow::Cow;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
-use ostrya_fetch::{FetchRequest, Fetched, Fetcher, Proxy};
+use ostrya_fetch::{
+    FetchRequest, Fetched, Fetcher, Proxy, RequestSigner, SignPayload, SignRequest,
+};
 use ostrya_remote::Error;
 use ostrya_remote::s3::{
     Address, Bucket, Credentials, DeleteIfMatch, Listed, Location, PutIfAbsent, S3Endpoint,
@@ -1656,8 +1659,69 @@ fn a_refused_part_aborts_the_upload() {
     });
 }
 
+/// The body of a request as [`Recording`] got it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SignedBody {
+    Empty,
+    /// A body given whole, with its length.
+    Bytes(usize),
+    /// A body given whole with the SHA-256 of the caller.
+    Sha256([u8; 32]),
+    Streamed,
+}
+
+/// A signer that records the body of each request that it signs, and
+/// passes the request to the signer of the endpoint.
+#[derive(Debug)]
+struct Recording {
+    inner: Arc<dyn RequestSigner>,
+    bodies: Mutex<Vec<SignedBody>>,
+}
+
+impl Recording {
+    fn bodies(&self) -> Vec<SignedBody> {
+        self.bodies.lock().unwrap().clone()
+    }
+}
+
+impl RequestSigner for Recording {
+    fn request_path<'a>(&self, path: &'a str) -> ostrya_fetch::Result<Cow<'a, str>> {
+        self.inner.request_path(path)
+    }
+
+    fn sign(&self, request: &SignRequest<'_>) -> ostrya_fetch::Result<Vec<(String, String)>> {
+        let body = match request.payload {
+            SignPayload::Empty => SignedBody::Empty,
+            SignPayload::Bytes(bytes) => SignedBody::Bytes(bytes.len()),
+            SignPayload::Sha256 { sha256, .. } => SignedBody::Sha256(sha256),
+            SignPayload::Streamed => SignedBody::Streamed,
+            other => panic!("unknown payload {other:?}"),
+        };
+        self.bodies.lock().unwrap().push(body);
+        self.inner.sign(request)
+    }
+}
+
+/// Returns a client of `endpoint` whose fetcher signs through a
+/// [`Recording`] signer, and that signer.
+async fn recording_bucket(endpoint: &S3Endpoint) -> (Bucket, Arc<Recording>) {
+    let mut options = endpoint.pull_options().unwrap();
+    let signer = Arc::new(Recording {
+        inner: options.signer.take().unwrap(),
+        bodies: Mutex::default(),
+    });
+    options.signer = Some(signer.clone());
+    let fetcher = Fetcher::new(options).await.unwrap();
+    (Bucket::from_fetcher(endpoint, fetcher), signer)
+}
+
+/// Returns the SHA-256 of `bytes`.
+fn sha256(bytes: &[u8]) -> [u8; 32] {
+    Sha256::digest(bytes).into()
+}
+
 #[test]
-fn a_part_that_meets_a_slow_down_is_sent_again() {
+fn a_part_that_meets_a_slow_down_is_sent_again_with_its_digest() {
     block_on(async {
         let refused = Arc::new(AtomicBool::new(false));
         let stand_in = StandIn::start(Arc::new(move |seen: &Seen, _| {
@@ -1668,7 +1732,7 @@ fn a_part_that_meets_a_slow_down_is_sent_again() {
             }
         }))
         .await;
-        let bucket = stand_in.bucket("s3://bucket/repo").await;
+        let (bucket, signer) = recording_bucket(&stand_in.endpoint("s3://bucket/repo")).await;
         let key = commit_key('d');
         let body = pattern(2 * PART + PART / 2);
         let etag = bucket
@@ -1689,6 +1753,138 @@ fn a_part_that_meets_a_slow_down_is_sent_again() {
             second[1].header("x-amz-content-sha256")
         );
         assert!(!seen.iter().any(|seen| seen.method == "DELETE"));
+
+        let parts: Vec<&[u8]> = body.chunks(PART).collect();
+        let digests: Vec<[u8; 32]> = parts.iter().map(|part| sha256(part)).collect();
+        // The start, part 1, part 2 twice, part 3, and the completion.
+        let sent: Vec<&[u8]> = seen.iter().map(|seen| seen.body.as_slice()).collect();
+        assert_eq!(
+            sent,
+            [
+                &[][..],
+                parts[0],
+                parts[1],
+                parts[1],
+                parts[2],
+                &seen[5].body
+            ]
+        );
+        assert_eq!(part_number(&seen[3]), Some(2));
+        // The start sends an empty body given whole.
+        assert_eq!(
+            signer.bodies(),
+            [
+                SignedBody::Bytes(0),
+                SignedBody::Sha256(digests[0]),
+                SignedBody::Sha256(digests[1]),
+                SignedBody::Sha256(digests[1]),
+                SignedBody::Sha256(digests[2]),
+                SignedBody::Bytes(seen[5].body.len()),
+            ]
+        );
+        let signed = [
+            sha256(&seen[0].body),
+            digests[0],
+            digests[1],
+            digests[1],
+            digests[2],
+            sha256(&seen[5].body),
+        ];
+        for (request, digest) in seen.iter().zip(signed) {
+            assert_eq!(
+                request.header("x-amz-content-sha256"),
+                Some(hex(&digest).as_str())
+            );
+        }
+    });
+}
+
+#[test]
+fn a_put_over_1_mib_signs_with_its_digest_and_a_smaller_put_with_its_bytes() {
+    block_on(async {
+        let stand_in = StandIn::start(Arc::new(|seen: &Seen, _| multipart(seen))).await;
+        let (bucket, signer) = recording_bucket(&stand_in.endpoint("s3://bucket/repo")).await;
+        let large = pattern((1 << 20) + 1);
+        let limit = pattern(1 << 20);
+        bucket.put(&commit_key('a'), large.clone()).await.unwrap();
+        bucket.put(&commit_key('b'), limit.clone()).await.unwrap();
+        let created = bucket
+            .put_if_absent(&commit_key('c'), b"small".to_vec())
+            .await
+            .unwrap();
+        assert!(
+            matches!(created, PutIfAbsent::Created { .. }),
+            "{created:?}"
+        );
+        let created = bucket
+            .put_if_absent(&commit_key('e'), large.clone())
+            .await
+            .unwrap();
+        assert!(
+            matches!(created, PutIfAbsent::Created { .. }),
+            "{created:?}"
+        );
+        assert_eq!(
+            signer.bodies(),
+            [
+                SignedBody::Sha256(sha256(&large)),
+                SignedBody::Bytes(limit.len()),
+                SignedBody::Bytes(5),
+                SignedBody::Sha256(sha256(&large)),
+            ]
+        );
+        for request in stand_in.seen() {
+            assert_eq!(
+                request.header("x-amz-content-sha256"),
+                Some(hex(&sha256(&request.body)).as_str())
+            );
+        }
+    });
+}
+
+/// A conditional `PUT` of a body of more than 1 MiB signs the SHA-256 of the
+/// body on each attempt. The first request gets a 503, and the second gets
+/// a 412. The compare then uses the same digest: the bytes of the body give
+/// `Refused`, and other bytes of the same length give `Present`.
+#[test]
+fn a_conditional_put_over_1_mib_compares_with_the_digest_that_it_signs() {
+    block_on(async {
+        let body = pattern((1 << 20) + 1);
+        let digest = sha256(&body);
+        let mut other = body.clone();
+        *other.last_mut().unwrap() ^= 1;
+        for (stored, outcome) in [
+            (body.clone(), PutIfAbsent::Refused { etag: None }),
+            (other, PutIfAbsent::Present),
+        ] {
+            let stand_in = StandIn::start(Arc::new(move |seen: &Seen, count| {
+                match seen.method.as_str() {
+                    "PUT" if count == 1 => respond(503, &s3_error("SlowDown")),
+                    "PUT" => respond(412, &s3_error("PreconditionFailed")),
+                    "GET" => respond(200, &stored),
+                    _ => respond(500, b""),
+                }
+            }))
+            .await;
+            let (bucket, signer) = recording_bucket(&stand_in.endpoint("s3://bucket/repo")).await;
+            assert_eq!(
+                bucket
+                    .put_if_absent("extensions/ostrya/lock", body.clone())
+                    .await
+                    .unwrap(),
+                outcome
+            );
+            let methods: Vec<String> = stand_in.seen().into_iter().map(|s| s.method).collect();
+            assert_eq!(methods, ["PUT", "PUT", "GET"]);
+            assert_eq!(
+                signer.bodies(),
+                [
+                    SignedBody::Sha256(digest),
+                    SignedBody::Sha256(digest),
+                    SignedBody::Empty,
+                ]
+            );
+        }
     });
 }
 

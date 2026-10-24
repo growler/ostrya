@@ -75,9 +75,11 @@ const STREAMED: &str =
 /// # Body
 ///
 /// The signer hashes a body that the fetcher gives whole
-/// ([`SignPayload::Bytes`]). It refuses a streamed body
-/// ([`SignPayload::Streamed`]), because the signature holds the hash of the
-/// body.
+/// ([`SignPayload::Bytes`]), on the task of the request, on each call. For a
+/// body whose SHA-256 the caller gave ([`SignPayload::Sha256`]), the signer
+/// signs that digest and hashes no byte of the body. It refuses a streamed
+/// body ([`SignPayload::Streamed`]), because the signature holds the hash of
+/// the body.
 ///
 /// # Cleartext
 ///
@@ -156,6 +158,7 @@ impl SigV4 {
         let payload_hash = match request.payload {
             SignPayload::Empty => EMPTY_SHA256.to_owned(),
             SignPayload::Bytes(bytes) => hex(&Sha256::digest(bytes)),
+            SignPayload::Sha256 { sha256, .. } => hex(&sha256),
             // `Streamed`, and each body form that a later fetcher adds.
             _ => return Err(ostrya_fetch::Error::Fetch(STREAMED.into())),
         };
@@ -832,6 +835,44 @@ mod tests {
             header(&signed, "x-amz-content-sha256"),
             "44ce7dd67c959e0d3524ffac1771dfbba87d2b6b4b4e99e42034a8b803f8b072"
         );
+    }
+
+    #[test]
+    fn a_precomputed_digest_signs_as_the_body() {
+        let body = b"Welcome to Amazon S3.";
+        let sha256: [u8; 32] = Sha256::digest(body).into();
+        let put = |payload| SignRequest {
+            method: "PUT",
+            payload,
+            ..get(HOST, "/test%24file.text", None)
+        };
+        let sigv4 = signer(None);
+        let hashed = sigv4
+            .sign_at(&put(SignPayload::Bytes(body)), at(EXAMPLE_SECS))
+            .unwrap();
+        let given = sigv4
+            .sign_at(
+                &put(SignPayload::Sha256 {
+                    bytes: body,
+                    sha256,
+                }),
+                at(EXAMPLE_SECS),
+            )
+            .unwrap();
+        assert_eq!(given, hashed);
+        // The signer signs the digest as given, and does not hash the body.
+        let other = [0xab; 32];
+        let signed = sigv4
+            .sign_at(
+                &put(SignPayload::Sha256 {
+                    bytes: body,
+                    sha256: other,
+                }),
+                at(EXAMPLE_SECS),
+            )
+            .unwrap();
+        assert_eq!(header(&signed, "x-amz-content-sha256"), "ab".repeat(32));
+        assert_ne!(signature(&signed), signature(&hashed));
     }
 
     #[test]

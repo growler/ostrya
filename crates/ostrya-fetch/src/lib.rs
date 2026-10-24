@@ -335,7 +335,10 @@ impl std::fmt::Debug for BearerToken {
 /// attempt gets one, also a hop back to the named origin.
 ///
 /// The fetcher calls the signer on the task of the request. A signer that
-/// hashes a body given whole does that work on the task, on each call.
+/// hashes a body given whole does that work on the task, on each call. A
+/// caller with a large body gives the SHA-256 of the body with
+/// [`UploadBody::bytes_with_sha256`], so that the signer gets
+/// [`SignPayload::Sha256`] and hashes no byte of the body.
 ///
 /// The path of a [`Target::Path`] or a [`Target::PathQuery`] goes through
 /// [`request_path`](RequestSigner::request_path) before the fetcher adds it
@@ -412,8 +415,9 @@ pub struct SignRequest<'a> {
 
 /// The body of a signed request.
 ///
-/// The [`Debug`] output of [`Bytes`](SignPayload::Bytes) shows the length of
-/// the body, and not its bytes.
+/// The [`Debug`] output of [`Bytes`](SignPayload::Bytes) and of
+/// [`Sha256`](SignPayload::Sha256) shows the length of the body, and not its
+/// bytes.
 #[derive(Clone, Copy, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum SignPayload<'a> {
@@ -424,8 +428,23 @@ pub enum SignPayload<'a> {
     ///
     /// The signer gets the whole body on each attempt, and it runs on the task
     /// that sends the request. So the time to hash the body on that task grows
-    /// with the size of the body.
+    /// with the size of the body. For a large body,
+    /// [`UploadBody::bytes_with_sha256`] gives the signer the SHA-256 of the
+    /// body as [`Sha256`](SignPayload::Sha256).
     Bytes(&'a [u8]),
+    /// The whole body of a `POST` or a `PUT` that
+    /// [`UploadBody::bytes_with_sha256`] gives, with the SHA-256 of the body
+    /// that the caller computed.
+    ///
+    /// The fetcher does not check the digest. A wrong digest signs other
+    /// bytes than the bytes that the request sends, and the server refuses
+    /// the request.
+    Sha256 {
+        /// The whole body.
+        bytes: &'a [u8],
+        /// The SHA-256 of `bytes`, as the caller gave it.
+        sha256: [u8; 32],
+    },
     /// The body of a `POST` or a `PUT` that streams from an [`UploadWriter`].
     /// Its bytes are not known when the fetcher calls the signer.
     Streamed,
@@ -436,6 +455,9 @@ impl std::fmt::Debug for SignPayload<'_> {
         match self {
             SignPayload::Empty => f.write_str("Empty"),
             SignPayload::Bytes(bytes) => f.debug_tuple("Bytes").field(&bytes.len()).finish(),
+            SignPayload::Sha256 { bytes, .. } => {
+                f.debug_tuple("Sha256").field(&bytes.len()).finish()
+            }
             SignPayload::Streamed => f.write_str("Streamed"),
         }
     }
@@ -1440,6 +1462,8 @@ pub enum UploadMethod {
 /// - [`bytes`](UploadBody::bytes) gives the whole body. The request declares
 ///   its `Content-Length`, and hyper takes the bytes in frames of 64 KiB. A
 ///   followed redirect sends the bytes again.
+///   [`bytes_with_sha256`](UploadBody::bytes_with_sha256) also gives the
+///   SHA-256 of the body to the signer.
 /// - [`channel`](UploadBody::channel) streams the body. The caller writes the
 ///   body into the [`UploadWriter`] while the upload runs. Over HTTP/1.1, the
 ///   body travels chunked.
@@ -1455,8 +1479,12 @@ pub struct UploadBody {
 
 /// The two forms of an [`UploadBody`].
 enum UploadForm {
-    /// The whole body, which each hop of the upload sends.
-    Bytes(Bytes),
+    /// The whole body, which each hop of the upload sends, and the SHA-256
+    /// of the body if the caller gave it.
+    Bytes {
+        bytes: Bytes,
+        sha256: Option<[u8; 32]>,
+    },
     /// The reading end of a body that an [`UploadWriter`] fills.
     Channel(BodyEnd),
 }
@@ -1467,7 +1495,30 @@ impl UploadBody {
     /// The request sends the vector in frames cut from it with no copy.
     pub fn bytes(bytes: Vec<u8>) -> UploadBody {
         UploadBody {
-            form: UploadForm::Bytes(Bytes::from(bytes)),
+            form: UploadForm::Bytes {
+                bytes: Bytes::from(bytes),
+                sha256: None,
+            },
+        }
+    }
+
+    /// Creates a body of `bytes`, whose SHA-256 is `sha256`.
+    ///
+    /// The body is a body of [`bytes`](UploadBody::bytes). A signer gets it
+    /// as [`SignPayload::Sha256`] with `sha256`, so a signer that signs the
+    /// SHA-256 of the body hashes no byte of it on the task of the request.
+    /// Each retry and each redirect hop of the upload uses the same digest,
+    /// and so does a copy from [`try_clone`](UploadBody::try_clone).
+    ///
+    /// The fetcher does not check the digest. A wrong digest signs other
+    /// bytes than the bytes that the request sends, and the server refuses
+    /// the request.
+    pub fn bytes_with_sha256(bytes: Vec<u8>, sha256: [u8; 32]) -> UploadBody {
+        UploadBody {
+            form: UploadForm::Bytes {
+                bytes: Bytes::from(bytes),
+                sha256: Some(sha256),
+            },
         }
     }
 
@@ -1494,7 +1545,17 @@ impl UploadBody {
     /// for a streamed body.
     pub fn as_bytes(&self) -> Option<&[u8]> {
         match &self.form {
-            UploadForm::Bytes(bytes) => Some(bytes),
+            UploadForm::Bytes { bytes, .. } => Some(bytes),
+            UploadForm::Channel(_) => None,
+        }
+    }
+
+    /// Returns the SHA-256 of a body of
+    /// [`bytes_with_sha256`](UploadBody::bytes_with_sha256), or `None` for
+    /// another body.
+    pub fn sha256(&self) -> Option<[u8; 32]> {
+        match &self.form {
+            UploadForm::Bytes { sha256, .. } => *sha256,
             UploadForm::Channel(_) => None,
         }
     }
@@ -1503,14 +1564,18 @@ impl UploadBody {
     /// body.
     ///
     /// The two bodies of [`bytes`](UploadBody::bytes) share the one buffer, so
-    /// the call copies no byte. A caller sends the copy in a second request,
-    /// for example after the first one failed with
-    /// [`Error::UploadInterrupted`]. A [`channel`](UploadBody::channel) body
-    /// has one writer, so it has no copy.
+    /// the call copies no byte. The copy keeps the SHA-256 of a body of
+    /// [`bytes_with_sha256`](UploadBody::bytes_with_sha256). A caller sends
+    /// the copy in a second request, for example after the first one failed
+    /// with [`Error::UploadInterrupted`]. A [`channel`](UploadBody::channel)
+    /// body has one writer, so it has no copy.
     pub fn try_clone(&self) -> Option<UploadBody> {
         match &self.form {
-            UploadForm::Bytes(bytes) => Some(UploadBody {
-                form: UploadForm::Bytes(bytes.clone()),
+            UploadForm::Bytes { bytes, sha256 } => Some(UploadBody {
+                form: UploadForm::Bytes {
+                    bytes: bytes.clone(),
+                    sha256: *sha256,
+                },
             }),
             UploadForm::Channel(_) => None,
         }
@@ -1521,7 +1586,9 @@ impl UploadBody {
     ///
     /// If no other body shares the buffer, the call gives the buffer back
     /// with its capacity, and copies no byte. A caller can then fill the
-    /// vector again for a later request. A copy from
+    /// vector again for a later request. The vector does not keep the
+    /// SHA-256 of a body of
+    /// [`bytes_with_sha256`](UploadBody::bytes_with_sha256). A copy from
     /// [`try_clone`](UploadBody::try_clone) shares the buffer, and so does an
     /// upload that still holds the body. The call then returns the body as
     /// the error, as it does for a [`channel`](UploadBody::channel) body.
@@ -1532,10 +1599,10 @@ impl UploadBody {
     /// body shares its buffer.
     pub fn into_vec(self) -> std::result::Result<Vec<u8>, UploadBody> {
         match self.form {
-            UploadForm::Bytes(bytes) => match bytes.try_into_mut() {
+            UploadForm::Bytes { bytes, sha256 } => match bytes.try_into_mut() {
                 Ok(bytes) => Ok(Vec::from(bytes)),
                 Err(bytes) => Err(UploadBody {
-                    form: UploadForm::Bytes(bytes),
+                    form: UploadForm::Bytes { bytes, sha256 },
                 }),
             },
             UploadForm::Channel(end) => Err(UploadBody {
@@ -1554,7 +1621,7 @@ impl From<Vec<u8>> for UploadBody {
 impl std::fmt::Debug for UploadBody {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.form {
-            UploadForm::Bytes(bytes) => f.debug_tuple("Bytes").field(&bytes.len()).finish(),
+            UploadForm::Bytes { bytes, .. } => f.debug_tuple("Bytes").field(&bytes.len()).finish(),
             UploadForm::Channel(_) => f.write_str("Channel"),
         }
     }
@@ -2641,6 +2708,9 @@ struct UploadPlan<'a> {
     /// The bytes of a body given whole, which a followed redirect sends again.
     /// A streamed body has none, so the upload follows no redirect of it.
     bytes: Option<Bytes>,
+    /// The SHA-256 of `bytes` that the caller gave, which the signer of each
+    /// attempt and each hop gets.
+    sha256: Option<[u8; 32]>,
     max_response: u64,
     response_timeout: Duration,
 }
@@ -4154,9 +4224,9 @@ impl Fetcher {
             UploadMethod::Put => Method::PUT,
             UploadMethod::Delete => Method::DELETE,
         };
-        let (end, bytes) = match body.form {
-            UploadForm::Bytes(bytes) => (BodyEnd::whole(&bytes), Some(bytes)),
-            UploadForm::Channel(end) => (end, None),
+        let (end, bytes, sha256) = match body.form {
+            UploadForm::Bytes { bytes, sha256 } => (BodyEnd::whole(&bytes), Some(bytes), sha256),
+            UploadForm::Channel(end) => (end, None, None),
         };
         if method == Method::DELETE && !bytes.as_ref().is_some_and(Bytes::is_empty) {
             return Err(Error::Fetch(format!(
@@ -4169,6 +4239,7 @@ impl Fetcher {
             method,
             headers: &headers,
             bytes,
+            sha256,
             max_response,
             response_timeout: response_timeout.unwrap_or(self.inner.progress_timeout),
         };
@@ -4509,12 +4580,14 @@ impl Fetcher {
                 None => Cow::Borrowed(headers),
                 Some(signer) => {
                     // The signer reads a body given whole as the slice that
-                    // the request sends, with no copy. A streamed body is not
+                    // the request sends, with no copy, and with the digest
+                    // of the caller if it gave one. A streamed body is not
                     // known yet.
-                    let payload = match &plan.bytes {
+                    let payload = match (&plan.bytes, plan.sha256) {
                         _ if plan.method == Method::DELETE => SignPayload::Empty,
-                        Some(bytes) => SignPayload::Bytes(bytes),
-                        None => SignPayload::Streamed,
+                        (Some(bytes), Some(sha256)) => SignPayload::Sha256 { bytes, sha256 },
+                        (Some(bytes), None) => SignPayload::Bytes(bytes),
+                        (None, _) => SignPayload::Streamed,
                     };
                     match signed(signer, &plan.method, hop, payload, headers) {
                         Ok(signed) => signed,
@@ -9807,7 +9880,9 @@ mod tests {
     fn a_bytes_body_clones_and_a_channel_body_does_not() {
         let body = UploadBody::bytes(b"part".to_vec());
         let copy = body.try_clone().expect("a bytes body has a copy");
-        let (UploadForm::Bytes(first), UploadForm::Bytes(second)) = (&body.form, &copy.form) else {
+        let (UploadForm::Bytes { bytes: first, .. }, UploadForm::Bytes { bytes: second, .. }) =
+            (&body.form, &copy.form)
+        else {
             panic!("the copy of a bytes body is a bytes body");
         };
         assert_eq!(first, second);
@@ -9843,6 +9918,45 @@ mod tests {
             panic!("a streamed body has no buffer");
         };
         assert!(channel.as_bytes().is_none());
+    }
+
+    /// A body with a digest keeps the digest in a copy and in a body that
+    /// is not given back. The buffer that comes back holds no digest. The
+    /// `Debug` output of its payload shows the length of the body.
+    #[test]
+    fn a_body_with_a_digest_keeps_it_in_a_copy_and_gives_the_buffer_back() {
+        let digest = [7u8; 32];
+        let mut bytes = Vec::with_capacity(16);
+        bytes.extend_from_slice(b"part");
+        let (address, capacity) = (bytes.as_ptr(), bytes.capacity());
+        let body = UploadBody::bytes_with_sha256(bytes, digest);
+        assert_eq!(body.sha256(), Some(digest));
+        assert_eq!(body.as_bytes(), Some(&b"part"[..]));
+        assert_eq!(format!("{body:?}"), "Bytes(4)");
+        let copy = body.try_clone().expect("a bytes body has a copy");
+        assert_eq!(copy.sha256(), Some(digest));
+        assert_eq!(copy.as_bytes(), Some(&b"part"[..]));
+        let Err(body) = body.into_vec() else {
+            panic!("a shared body is not given back");
+        };
+        assert_eq!(body.sha256(), Some(digest));
+        drop(copy);
+        let Ok(bytes) = body.into_vec() else {
+            panic!("a body with no copy gives its buffer back");
+        };
+        assert_eq!(bytes, b"part");
+        assert_eq!(bytes.as_ptr(), address);
+        assert_eq!(bytes.capacity(), capacity);
+        assert_eq!(UploadBody::bytes(bytes).sha256(), None);
+        let (channel, _writer) = UploadBody::channel();
+        assert_eq!(channel.sha256(), None);
+
+        let payload = SignPayload::Sha256 {
+            bytes: b"abc",
+            sha256: digest,
+        };
+        assert_eq!(format!("{payload:?}"), "Sha256(3)");
+        assert_ne!(payload, SignPayload::Bytes(b"abc"));
     }
 
     /// The `Debug` output of an upload request shows each header name and no

@@ -75,7 +75,7 @@ The push sends the objects of the tree of the local commit that the server does 
 .IP
 The push sends no parent, no commit object, and no detached metadata, so no signature of the local commit reaches the server. The server signs the new commit with the keys of its own client group.
 .IP
-The client group needs \fB\%c\fR on BRANCH. A server that runs receive hooks takes no server commit and answers \%ref\-denied. The push sends the server commit in one frame, which an ostrya server limits to \%1 MiB. The reply names BRANCH and each \%\-\-tag, and must also fit in one frame. The push checks the two frames against the limit of the server before it sends an object.
+The client group needs \fB\%c\fR on BRANCH. A server whose receive hooks take no server commit answers \%ref\-denied. The push sends the server commit in one frame, which an ostrya server limits to \%1 MiB. The reply names BRANCH and each \%\-\-tag, and must also fit in one frame. The push checks the two frames against the limit of the server before it sends an object.
 .IP
 BRANCH passes the \%ref\-name rule, has no \fB\%:\fR, and is not \%64 lowercase hex characters. With \%\-\-onto, the command takes exactly one REF, a revision of this repository, and does not split it at \fB\%:\fR\&. The local commit must not be partial, and must have no related objects. \%\-\-onto conflicts with \%\-\-depth and \%\-\-force.
 .TP

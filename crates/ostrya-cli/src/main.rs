@@ -486,13 +486,13 @@ enum Command {
     /// extended attributes. The option names and the value forms are those
     /// of `commit`.
     ///
-    /// The client group needs `c` on the branch. A server that runs receive
-    /// hooks takes no server commit and answers ref-denied. The push sends
-    /// the server commit in one frame, which an ostrya server limits to
-    /// 1 MiB. The reply names the branch and each --tag, and must also fit
-    /// in one frame. In a commit, an --add-metadata value can hold two levels
-    /// of containers fewer than a variant. The push checks the two frames
-    /// and the depth of each value before it sends an object.
+    /// The client group needs `c` on the branch. A server whose receive hooks
+    /// take no server commit answers ref-denied. The push sends the server
+    /// commit in one frame, which an ostrya server limits to 1 MiB. The reply
+    /// names the branch and each --tag, and must also fit in one frame. In a
+    /// commit, an --add-metadata value can hold two levels of containers
+    /// fewer than a variant. The push checks the two frames and the depth of
+    /// each value before it sends an object.
     ///
     /// The command makes its checks before the ssh client starts or the first
     /// HTTP request goes. It resolves REMOTE before it reads --body-file. A
@@ -3777,12 +3777,12 @@ struct PushArgs {
     /// so no signature of the local commit reaches the server. The server
     /// signs the new commit with the keys of its own client group.
     ///
-    /// The client group needs `c` on BRANCH. A server that runs receive hooks
-    /// takes no server commit and answers ref-denied. The push sends the
-    /// server commit in one frame, which an ostrya server limits to 1 MiB.
-    /// The reply names BRANCH and each --tag, and must also fit in one
-    /// frame. The push checks the two frames against the limit of the
-    /// server before it sends an object.
+    /// The client group needs `c` on BRANCH. A server whose receive hooks
+    /// take no server commit answers ref-denied. The push sends the server
+    /// commit in one frame, which an ostrya server limits to 1 MiB. The reply
+    /// names BRANCH and each --tag, and must also fit in one frame. The push
+    /// checks the two frames against the limit of the server before it sends
+    /// an object.
     ///
     /// BRANCH passes the ref-name rule, has no `:`, and is not 64 lowercase
     /// hex characters. With --onto, the command takes exactly one REF, a
@@ -3966,8 +3966,8 @@ struct PushTreeArgs {
     /// The server makes the commit over the tree of DIR. Its parent is the
     /// commit of BRANCH on the server, or none if BRANCH is absent. The
     /// server moves BRANCH to the commit. The client group needs `c` on
-    /// BRANCH. A server that runs receive hooks takes no server commit and
-    /// answers ref-denied.
+    /// BRANCH. A server whose receive hooks take no server commit answers
+    /// ref-denied.
     ///
     /// The command refuses a name that holds `:`, a name that the ref-name
     /// rule refuses, which includes a name with `^`, and a name of 64

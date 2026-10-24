@@ -196,7 +196,8 @@ impl ReceiveService {
     /// host.
     ///
     /// [`commit`](Self::commit) calls [`ReceiveHooks::before_update`] of
-    /// `hooks` just before the update lock. It calls
+    /// `hooks` just before the update lock, or
+    /// [`ReceiveHooks::before_server_commit`] for a server commit. It calls
     /// [`ReceiveHooks::after_update`] after the release of the update lock.
     /// `None` gives a session with no hooks.
     ///
@@ -369,8 +370,10 @@ impl ReceiveService {
     /// # Hooks
     ///
     /// In a session with hooks, the call runs [`ReceiveHooks::before_update`]
-    /// just before the update lock. It runs [`ReceiveHooks::after_update`]
-    /// after the release of the update lock, also when no ref changes.
+    /// just before the update lock. For a server commit, it runs
+    /// [`ReceiveHooks::before_server_commit`] in its place. It runs
+    /// [`ReceiveHooks::after_update`] after the release of the update lock,
+    /// also when no ref changes.
     /// [`ReceiveHooks`] states when each hook runs, the entries of the host,
     /// the locks, and the result of an error or a panic in a hook.
     ///
@@ -452,14 +455,16 @@ impl ReceiveService {
     /// - [`remote::Error::RefDenied`] if the policy gives no `c` on the branch
     ///   of a server commit, or neither `t` nor `w` on a tag, if the branch or
     ///   a tag is the collection anchor ref in the local refs of a repository
-    ///   with a collection id, or if the session has hooks.
+    ///   with a collection id.
     /// - [`remote::Error::RefDenied`] if a ref path fails a check under the
     ///   update lock: a ref is an alias, a ref write cannot replace a path, or
     ///   one update names a directory of another.
     /// - [`remote::Error::RefDenied`] or [`remote::Error::Internal`] if
-    ///   `before_update` refuses with
+    ///   `before_update` or `before_server_commit` refuses with
     ///   [`HookRefusal::denied`](super::HookRefusal::denied) or
-    ///   [`HookRefusal::internal`](super::HookRefusal::internal).
+    ///   [`HookRefusal::internal`](super::HookRefusal::internal). A host that
+    ///   does not implement `before_server_commit` refuses each server commit
+    ///   with `ref-denied`.
     /// - [`remote::Error::MissingObjects`] if a new commit, or an object of the
     ///   tree of a commit of the session, is neither staged nor present.
     /// - [`remote::Error::BindingMismatch`] if the ref binding of a new commit

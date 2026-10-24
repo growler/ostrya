@@ -8,8 +8,9 @@
 //! - the authentication of the host and the HTTP/2 windows of the endpoint
 //! - the stop of the endpoint with `shutdown`
 //! - the hooks of the host: an entry of the host in the detached metadata, a
-//!   per-name lock in the carried value, an error of `after_update`, and a
-//!   ref that moves during `before_update`
+//!   per-name lock in the carried value, an error of `after_update`, a ref
+//!   that moves during `before_update`, and a server commit that the hooks
+//!   take
 //!
 //! A compile-time check pins the auto traits of the public types.
 
@@ -37,11 +38,11 @@ use hyper::http::request::Parts;
 use hyper::server::conn::http2;
 use hyper::service::service_fn;
 use hyper::{Request, Response, StatusCode};
-use ostrya::remote::proto::Hello;
+use ostrya::remote::proto::{Hello, ServerCommit};
 use ostrya::remote::tree::{ScanOptions, TreeModel};
 use ostrya::remote::{
     self, BoxFuture, Compression, Encoding, Endpoint, Expected, ObjectData, ObjectSource,
-    PushOutcome, PushSession, RefUpdate, SessionOptions, TreePushOptions, push_tree,
+    PushOutcome, PushSession, RefOutcome, RefUpdate, SessionOptions, TreePushOptions, push_tree,
 };
 use ostrya::{
     Checksum, Commit, CreateOptions, HookFuture, HookRefusal, HostEntry, ObjectName, ObjectType,
@@ -459,6 +460,11 @@ struct HostState {
     /// The held names that each `after_update` saw before it dropped the
     /// carried value.
     held_in_after: Mutex<Vec<Vec<String>>>,
+    server_commit_calls: AtomicUsize,
+    /// If `true`, `before_server_commit` refuses with `HookRefusal::denied`.
+    deny_server_commit: AtomicBool,
+    /// The refs of each report that `after_update` of [`ServerHooks`] got.
+    server_reports: Mutex<Vec<Vec<RefOutcome>>>,
 }
 
 /// The text of the error of `after_update`.
@@ -534,13 +540,70 @@ impl ReceiveHooks for HostHooks {
     }
 }
 
+/// The hooks of [`HostHooks`] that also take a server commit.
+/// `before_server_commit` refuses if [`HostState::deny_server_commit`] is
+/// set. Else it locks the names of the branch and the tags, and carries the
+/// guard. `after_update` records the refs of the report, then
+/// goes to [`HostHooks::after_update`], which releases the locks.
+struct ServerHooks {
+    inner: HostHooks,
+}
+
+impl ReceiveHooks for ServerHooks {
+    fn before_update<'a>(
+        &'a self,
+        updates: &'a [RefUpdate],
+    ) -> HookFuture<'a, Result<UpdatePlan, HookRefusal>> {
+        self.inner.before_update(updates)
+    }
+
+    fn before_server_commit<'a>(
+        &'a self,
+        commit: &'a ServerCommit,
+    ) -> HookFuture<'a, Result<Box<dyn Any + Send>, HookRefusal>> {
+        Box::pin(async move {
+            self.inner
+                .state
+                .server_commit_calls
+                .fetch_add(1, Ordering::SeqCst);
+            if self.inner.state.deny_server_commit.load(Ordering::SeqCst) {
+                return Err(HookRefusal::denied("the host refuses the release"));
+            }
+            let names = std::iter::once(&commit.branch)
+                .chain(&commit.tags)
+                .cloned()
+                .collect();
+            let Some(guard) = self.inner.locks.try_lock(names) else {
+                return Err(HookRefusal::internal("a ref of the push is locked"));
+            };
+            Ok(Box::new(guard) as Box<dyn Any + Send>)
+        })
+    }
+
+    fn after_update<'a>(
+        &'a self,
+        report: &'a ReceiveReport,
+        carried: Box<dyn Any + Send>,
+    ) -> HookFuture<'a, Result<(), String>> {
+        self.inner
+            .state
+            .server_reports
+            .lock()
+            .unwrap()
+            .push(report.refs.clone());
+        self.inner.after_update(report, carried)
+    }
+}
+
 /// The authentication of a host with hooks: a bearer token of `alice` or of
 /// `bob`. Each session gets the default policy and the hooks of its
-/// principal.
+/// principal: [`ServerHooks`] if `server_commits` is `true`, else
+/// [`HostHooks`].
 struct HookAuth {
     repo: Repo,
     locks: Arc<NameLocks>,
     state: Arc<HostState>,
+    server_commits: bool,
 }
 
 impl ReceiveAuth for HookAuth {
@@ -572,9 +635,14 @@ impl ReceiveAuth for HookAuth {
             locks: self.locks.clone(),
             state: self.state.clone(),
         };
+        let hooks: Arc<dyn ReceiveHooks> = if self.server_commits {
+            Arc::new(ServerHooks { inner: hooks })
+        } else {
+            Arc::new(hooks)
+        };
         Ok(SessionSetup {
             policy: Arc::new(pushing_policy()),
-            hooks: Some(Arc::new(hooks)),
+            hooks: Some(hooks),
         })
     }
 }
@@ -698,8 +766,8 @@ async fn push_commit(
 /// through a mounted endpoint. Every push sends the same commit that the
 /// client built over the same tree.
 ///
-/// A tree push, which asks for a server commit, gets `ref-denied` from a
-/// session with hooks.
+/// A tree push, which asks for a server commit, gets `ref-denied` from
+/// hooks that do not implement `before_server_commit`.
 ///
 /// The entry of the first uploader stays at the second push. An error of
 /// `after_update` gets 500 with the ref written and no report. A ref that
@@ -729,6 +797,7 @@ fn the_hooks_of_the_host_run_in_a_push_through_a_mounted_endpoint() {
         repo: receiver.clone(),
         locks: locks.clone(),
         state: state.clone(),
+        server_commits: false,
     };
     let endpoint = Arc::new(ReceiveEndpoint::new(receiver.clone(), auth, options).unwrap());
     let seen = Arc::new(Seen::default());
@@ -754,7 +823,8 @@ fn the_hooks_of_the_host_run_in_a_push_through_a_mounted_endpoint() {
             async {
                 let resolve = |name: &'static str| receiver.resolve_rev(name, false);
 
-                // A server commit gets `ref-denied` before the hooks run.
+                // Hooks that take no server commit refuse it with
+                // `ref-denied`, and neither of the other hooks runs.
                 let options = TreePushOptions {
                     onto: "rel/s".into(),
                     ..TreePushOptions::default()
@@ -845,6 +915,131 @@ fn the_hooks_of_the_host_run_in_a_push_through_a_mounted_endpoint() {
         .await;
     });
     assert_eq!(reports.load(Ordering::SeqCst), 2);
+}
+
+/// Hooks that implement `before_server_commit` take a tree push through a
+/// mounted endpoint. Two pushes with `push_tree` go to `rel/s`. Each push
+/// gets 200. The first one creates the branch, and the second one moves it
+/// from the first commit to a new commit. `after_update` gets the same refs
+/// as the client. The lock of the branch is held in `after_update`, and free
+/// after each push. `before_update` does not run.
+///
+/// A third push gets `HookRefusal::denied` from `before_server_commit`. It
+/// gets 422 and `ref-denied`, the branch stays at the second commit, and
+/// `after_update` does not run.
+#[test]
+fn the_hooks_of_the_host_take_a_tree_push_through_a_mounted_endpoint() {
+    let tmp = TmpDir::new("server-hooks");
+    let small = small_tree(tmp.path());
+    let receiver = block_on(Repo::create(
+        &tmp.path().join("receiver"),
+        CreateOptions::new(RepoMode::Archive),
+    ))
+    .unwrap();
+
+    let locks = Arc::new(NameLocks::default());
+    let state = Arc::new(HostState::default());
+    let auth = HookAuth {
+        repo: receiver.clone(),
+        locks: locks.clone(),
+        state: state.clone(),
+        server_commits: true,
+    };
+    let endpoint =
+        Arc::new(ReceiveEndpoint::new(receiver.clone(), auth, EndpointOptions::default()).unwrap());
+    let seen = Arc::new(Seen::default());
+    let push_options = || TreePushOptions {
+        onto: "rel/s".into(),
+        timestamp: Some(1_700_000_000),
+        ..TreePushOptions::default()
+    };
+
+    block_on(async {
+        let config = ostrya_fetch::server_config(SERVER_CERT_PEM, SERVER_KEY_PEM, None, None)
+            .await
+            .unwrap();
+        let listener = rt::TcpListener::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let url = format!("https://127.0.0.1:{port}{MOUNT}");
+        let serving = host(listener, config, endpoint.clone(), seen.clone());
+        future::or(
+            async {
+                serving.await;
+                unreachable!("the host serves until the test ends");
+            },
+            async {
+                let first = push_tree(connect(&url, "alice-token"), &small, push_options())
+                    .await
+                    .unwrap();
+                let c1 = first.commit.expect("the server names its commit");
+                assert_eq!(
+                    first.refs,
+                    [RefOutcome {
+                        name: "rel/s".into(),
+                        old: None,
+                        new: Some(c1),
+                    }]
+                );
+                assert!(locks.held().is_empty());
+
+                let second = push_tree(connect(&url, "bob-token"), &small, push_options())
+                    .await
+                    .unwrap();
+                let c2 = second.commit.expect("the server names its commit");
+                assert_ne!(c1, c2);
+                assert_eq!(
+                    second.refs,
+                    [RefOutcome {
+                        name: "rel/s".into(),
+                        old: Some(c1),
+                        new: Some(c2),
+                    }]
+                );
+                assert_eq!(
+                    receiver.resolve_rev("rel/s", false).await.unwrap(),
+                    Some(c2)
+                );
+                assert!(locks.held().is_empty());
+
+                state.deny_server_commit.store(true, Ordering::SeqCst);
+                let denied = push_tree(connect(&url, "alice-token"), &small, push_options()).await;
+                match denied {
+                    Err(remote::Error::RefDenied(m)) => {
+                        assert_eq!(m, "the host refuses the release")
+                    }
+                    other => panic!("expected ref-denied, got {other:?}"),
+                }
+                assert_eq!(
+                    receiver.resolve_rev("rel/s", false).await.unwrap(),
+                    Some(c2)
+                );
+                assert!(locks.held().is_empty());
+
+                assert_eq!(
+                    seen.commit_statuses(),
+                    [
+                        StatusCode::OK,
+                        StatusCode::OK,
+                        StatusCode::UNPROCESSABLE_ENTITY
+                    ]
+                );
+                assert_eq!(
+                    *state.server_reports.lock().unwrap(),
+                    [first.refs, second.refs]
+                );
+                assert_eq!(
+                    *state.held_in_after.lock().unwrap(),
+                    vec![vec!["rel/s".to_owned()]; 2]
+                );
+                assert_eq!(state.server_commit_calls.load(Ordering::SeqCst), 3);
+                assert_eq!(state.before_calls.load(Ordering::SeqCst), 0);
+                assert_eq!(state.after_calls.load(Ordering::SeqCst), 2);
+            },
+        )
+        .await;
+    });
 }
 
 /// A request body with the shape of the body of a router: `Send` and

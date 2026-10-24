@@ -1,6 +1,7 @@
 //! The server commit of a `Commit` message: a commit that the server makes
 //! from a tree and the fields that the client sends.
 
+use std::any::Any;
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, LazyLock};
 
@@ -10,7 +11,7 @@ use super::finish::{
     Checked, Named, check_ref_paths, missing_objects, protocol, publish, queue_ref, ref_denied,
     report, sign_server_commit,
 };
-use super::hooks::ReceiveHooks;
+use super::hooks::{self, HookRefusal, ReceiveHooks};
 use super::policy::SessionPolicy;
 use super::session::{Failure, ReceiveReport};
 use super::walk;
@@ -55,20 +56,31 @@ static VALUE_IN_COMMIT: LazyLock<Type> =
 ///    on the branch (`limit-exceeded`).
 /// 3. The session holds no detached metadata dict and no composefs image,
 ///    and staged no commit object (`protocol`).
-/// 4. The session has no hooks, no ref is the collection anchor ref of the
-///    local refs of a repository with a collection id, and `policy` gives
-///    the rule of the server commit (`ref-denied`).
+/// 4. No ref is the collection anchor ref of the local refs of a repository
+///    with a collection id, and `policy` gives the rule of the server commit
+///    (`ref-denied`).
 /// 5. The tree of the commit is complete (`missing-objects`).
 ///
 /// The bindings and the signature verification of a commit that the client
 /// built do not apply.
 ///
+/// # Hooks
+///
+/// After the checks, the staged objects become durable. If `hooks` are given,
+/// [`ReceiveHooks::before_server_commit`] runs next with `sc`, immediately
+/// before the update lock. If the hook refuses, the session ends with the
+/// code of the refusal. The default method of the trait refuses with
+/// `ref-denied`, so a host without the method refuses each server commit at
+/// this step.
+///
+/// If a failure occurs after the hook, the carried value drops once, after
+/// the release of the update lock. `after_update` does not run.
+///
 /// # Under the update lock
 ///
-/// After the checks, the staged objects become durable. Then this function
-/// takes the update lock and reads the refs. The checks of the ref paths of
-/// [`finish`](super::finish::finish) apply, with a write to each ref. The
-/// branch comes first, then each tag in order:
+/// Then this function takes the update lock and reads the refs. The checks of
+/// the ref paths of [`finish`](super::finish::finish) apply, with a write to
+/// each ref. The branch comes first, then each tag in order:
 ///
 /// - `orphan` on a branch that is present needs `d` on the branch
 ///   (`non-fast-forward`).
@@ -84,6 +96,14 @@ static VALUE_IN_COMMIT: LazyLock<Type> =
 ///
 /// The steps of [`publish`] follow. The report holds the outcome of the
 /// branch, then the outcome of each tag.
+///
+/// # After the update lock
+///
+/// [`publish`] releases the update lock. If `hooks` are given,
+/// [`ReceiveHooks::after_update`] runs next with the report and the carried
+/// value. An error of the hook is `internal`, with the message cut at 4096
+/// bytes at a character boundary. After an error of the hook, the refs stay
+/// written.
 #[allow(clippy::too_many_arguments)]
 pub(super) async fn finish(
     repo: &Repo,
@@ -107,11 +127,6 @@ pub(super) async fn finish(
     check_metadata(&sc)?;
     check_reply_fits(&sc)?;
     check_session_objects(&txn, &commit_meta, &images)?;
-    if hooks.is_some() {
-        return Err(ref_denied(
-            "the session has the hooks of a host, which take no server commit".into(),
-        ));
-    }
     if named.is_local() && repo.config().collection_id().is_some() {
         for name in refs(&sc) {
             if name == OSTREE_METADATA_REF {
@@ -132,6 +147,18 @@ pub(super) async fn finish(
     }
     txn.sync_staged().await.map_err(Failure::Internal)?;
 
+    // Declared before the update lock, so on each failure the carried value
+    // drops after the lock is released. On success it goes to `after_update`,
+    // after the lock is released.
+    let carried: Option<Box<dyn Any + Send>> = match hooks {
+        None => None,
+        Some(hooks) => Some(
+            hooks
+                .before_server_commit(&sc)
+                .await
+                .map_err(HookRefusal::into_failure)?,
+        ),
+    };
     let held = repo.lock_update().await.map_err(Failure::Internal)?;
     let anchor = policy.regenerates_summary() && repo.config().collection_id().is_some();
     let (states, anchor_parent) = repo
@@ -176,7 +203,18 @@ pub(super) async fn finish(
     };
     let bytes = commit_bytes(&sc, tip, timestamp, collection_id)
         .map_err(|e| Failure::Internal(e.into()))?;
-    let ServerCommit { branch, tags, .. } = sc;
+    // The commit bytes hold the other fields of the server commit. They are
+    // freed here, so they are not held while the hook of the host runs.
+    let ServerCommit {
+        branch,
+        tags,
+        bind_refs,
+        subject,
+        body,
+        metadata,
+        ..
+    } = sc;
+    drop((bind_refs, subject, body, metadata));
     let commit = txn
         .write_metadata(ObjectType::Commit, None, &bytes)
         .await
@@ -204,8 +242,19 @@ pub(super) async fn finish(
         vec![commit],
     ))
     .await?;
+    // The state of the checks is freed here, so it is not held while the
+    // hook of the host runs.
+    drop((paths, states, current));
+
     let refs = outcomes(branch, tags, tip, commit);
-    Ok(report(policy, named.namespace, refs, stats, warnings))
+    let report = report(policy, named.namespace, refs, stats, warnings);
+    if let (Some(hooks), Some(carried)) = (hooks, carried)
+        && let Err(mut message) = hooks.after_update(&report, carried).await
+    {
+        hooks::cut(&mut message);
+        return Err(Failure::Wire(remote::Error::Internal(message)));
+    }
+    Ok(report)
 }
 
 /// Returns the names of the refs of `sc`: the branch, then each tag.

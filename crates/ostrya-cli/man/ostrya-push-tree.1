@@ -10,7 +10,7 @@ Push a directory as a new commit to a server or a bucket repository.
 .PP
 The command walks DIR and sends the objects of its tree that the server does not have. The server then makes one commit over the tree, moves the branch of \%\-\-onto to it, and creates each \%\-\-tag at it, in one transaction. The parent of the commit is the commit of the branch on the server. The server writes the bindings of its namespace and signs the commit with the keys of the client group. The tree holds no extended attributes. The option names and the value forms are those of \fB\%commit\fR\&.
 .PP
-The client group needs \fB\%c\fR on the branch. A server that runs receive hooks takes no server commit and answers \%ref\-denied. The push sends the server commit in one frame, which an ostrya server limits to \%1 MiB. The reply names the branch and each \%\-\-tag, and must also fit in one frame. In a commit, an \%\-\-add\-metadata value can hold two levels of containers fewer than a variant. The push checks the two frames and the depth of each value before it sends an object.
+The client group needs \fB\%c\fR on the branch. A server whose receive hooks take no server commit answers \%ref\-denied. The push sends the server commit in one frame, which an ostrya server limits to \%1 MiB. The reply names the branch and each \%\-\-tag, and must also fit in one frame. In a commit, an \%\-\-add\-metadata value can hold two levels of containers fewer than a variant. The push checks the two frames and the depth of each value before it sends an object.
 .PP
 The command makes its checks before the ssh client starts or the first HTTP request goes. It resolves REMOTE before it reads \%\-\-body\-file. A refusal of the remote thus reads no body file. For an \fB\%s3://\fR push address, the command makes the commit itself and writes the bucket repository.
 .PP
@@ -31,7 +31,7 @@ The directory to commit. Required.
 \fB\-\-onto\fR \fIBRANCH\fR
 The branch of the server that the server commit moves. Required.
 .IP
-The server makes the commit over the tree of DIR. Its parent is the commit of BRANCH on the server, or none if BRANCH is absent. The server moves BRANCH to the commit. The client group needs \fB\%c\fR on BRANCH. A server that runs receive hooks takes no server commit and answers \%ref\-denied.
+The server makes the commit over the tree of DIR. Its parent is the commit of BRANCH on the server, or none if BRANCH is absent. The server moves BRANCH to the commit. The client group needs \fB\%c\fR on BRANCH. A server whose receive hooks take no server commit answers \%ref\-denied.
 .IP
 The command refuses a name that holds \fB\%:\fR, a name that the \%ref\-name rule refuses, which includes a name with \fB\%^\fR, and a name of \%64 lowercase hex characters, because a revision reads such a name as a commit checksum.
 .IP

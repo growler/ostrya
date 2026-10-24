@@ -232,15 +232,17 @@ pub struct SessionSetup {
     /// The endpoint opens the session with
     /// [`ReceiveService::hello_with_hooks`](ostrya::ReceiveService::hello_with_hooks).
     /// The commit of the session calls [`ReceiveHooks::before_update`] just
-    /// before the update lock. It calls [`ReceiveHooks::after_update`] after
-    /// it releases the update lock.
+    /// before the update lock, or [`ReceiveHooks::before_server_commit`] for
+    /// a server commit. It calls [`ReceiveHooks::after_update`] after it
+    /// releases the update lock.
     ///
     /// # Refusals and errors of a hook
     ///
-    /// - A refusal of `before_update` with
+    /// - A refusal of `before_update` or `before_server_commit` with
     ///   [`HookRefusal::denied`](ostrya::HookRefusal::denied) gets 422 with
-    ///   `ref-denied`.
-    /// - A refusal of `before_update` with
+    ///   `ref-denied`. Hooks that do not implement `before_server_commit`
+    ///   refuse each server commit in this way.
+    /// - A refusal of `before_update` or `before_server_commit` with
     ///   [`HookRefusal::internal`](ostrya::HookRefusal::internal) gets 500
     ///   with `internal`.
     /// - An error of `after_update` gets 500 with `internal`. The refs and
@@ -262,8 +264,8 @@ pub struct SessionSetup {
     /// - The idle timeout, a `DELETE`, and
     ///   [`ReceiveEndpoint::shutdown`](crate::ReceiveEndpoint::shutdown) do
     ///   not end it.
-    /// - During `before_update`, it also holds a shared lock of the
-    ///   repository, so a prune waits.
+    /// - During `before_update` or `before_server_commit`, it also holds a
+    ///   shared lock of the repository, so a prune waits.
     ///
     /// Because the response to `commit` waits for both hooks, the host must
     /// limit the time of its hooks.
@@ -285,5 +287,13 @@ pub struct SessionSetup {
     ///   409, and `delete-denied` gets 422.
     /// - Under the update lock, if the stored dict changed after the plan, a
     ///   merged dict over the size limit gets 422 with `limit-exceeded`.
+    ///
+    /// The commit of a server commit runs these checks after
+    /// `before_server_commit` returns, under the update lock:
+    ///
+    /// - The checks of the ref paths get 422 with `ref-denied`.
+    /// - `orphan` on a branch that is present, which the policy does not
+    ///   allow, gets 409 with `non-fast-forward`.
+    /// - A tag that is present gets 409 with `ref-mismatch`.
     pub hooks: Option<Arc<dyn ReceiveHooks>>,
 }

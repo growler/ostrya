@@ -1031,8 +1031,8 @@ impl PushSession {
     /// - An `Error` message from the server, as the [`Error`] variant of its
     ///   code. An ostrya server sends it before it changes a ref. Examples
     ///   are [`Error::RefDenied`] for a client with no `c` on the branch, or
-    ///   for a server that runs hooks, and [`Error::RefMismatch`] for a tag
-    ///   that exists.
+    ///   for a server whose hooks take no server commit, and
+    ///   [`Error::RefMismatch`] for a tag that exists.
     /// - [`Error::Fetch`] over HTTP, if the client did not hand the request
     ///   over to a connection.
     /// - [`Error::CommitOutcomeUnknown`] for each other end of the session

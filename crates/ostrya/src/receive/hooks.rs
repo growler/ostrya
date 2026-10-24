@@ -1,7 +1,8 @@
 //! The hooks that a host gives one receive session.
 //!
 //! The first hook runs before the update lock of the commit and returns
-//! detached-metadata entries. The second hook runs after the release of the
+//! detached-metadata entries. The server-commit hook runs in its place for a
+//! `Commit` with a server commit. The last hook runs after the release of the
 //! update lock.
 
 use std::any::Any;
@@ -11,6 +12,7 @@ use std::pin::Pin;
 use ostrya_core::{Checksum, Value};
 
 use super::session::{Failure, ReceiveReport};
+use crate::remote::proto::ServerCommit;
 use crate::remote::{self, RefUpdate};
 
 /// The future that a hook returns.
@@ -42,15 +44,11 @@ pub(super) fn cut(message: &mut String) {
 /// receive endpoint of `ostrya-server` gives the hooks that its
 /// `SessionSetup` holds.
 ///
-/// A session with hooks refuses a `Commit` with a
-/// [server commit](crate::remote::proto::ServerCommit) with `ref-denied`.
-/// Neither hook runs for that `Commit`.
-///
 /// # When `before_update` runs
 ///
 /// In a session with hooks, [`before_update`](Self::before_update) runs once
-/// in each `Commit`, just before the update lock. Before the hook, the commit
-/// runs all its checks of these items:
+/// in each `Commit` with ref updates, just before the update lock. Before the
+/// hook, the commit runs all its checks of these items:
 ///
 /// - the ref names
 /// - the size of the reply
@@ -82,6 +80,48 @@ pub(super) fn cut(message: &mut String) {
 /// these checks fails, no ref changes. If the commit fails after the hook, the
 /// carried value drops once, after the release of the update lock, and
 /// `after_update` does not run.
+///
+/// # A server commit
+///
+/// For a `Commit` with a [`ServerCommit`],
+/// [`before_server_commit`](Self::before_server_commit) runs once in place of
+/// `before_update`. Before the hook, the commit runs all its checks of these
+/// items:
+///
+/// - the ref names and the form of the message
+/// - the depth of the metadata values
+/// - the size of the reply
+/// - the objects of the session
+/// - the collection anchor ref and the rule of the policy
+/// - the completeness of the tree
+///
+/// Then the staged objects become durable, and the hook runs, just before the
+/// update lock. If the commit fails one of these checks, it does not call the
+/// hook.
+///
+/// The hook gets the server commit as the client sent it. The new commit does
+/// not exist yet, because the server builds it under the update lock. The
+/// hook gives no detached-metadata entries.
+///
+/// These checks run after the hook, under the update lock, in this order:
+///
+/// 1. the `ref-denied` refusals of a ref path
+/// 2. `non-fast-forward` for `orphan` on a branch that is present, if the rule
+///    does not allow it
+/// 3. `ref-mismatch` for a tag that is present
+///
+/// If one of these checks fails, no ref changes. The carried value drops
+/// once, after the release of the update lock, and `after_update` does not
+/// run.
+///
+/// In `after_update`, the report holds the branch first. Its `old` is the
+/// commit of the branch before the write, or `None` for a new branch. Its
+/// `new` is the server commit. Then the report holds each tag, with `old`
+/// set to `None`.
+///
+/// A host that does not implement `before_server_commit` refuses each server
+/// commit with `ref-denied`, after the staged objects become durable and
+/// before the update lock.
 ///
 /// # The entries of the host
 ///
@@ -155,7 +195,8 @@ pub(super) fn cut(message: &mut String) {
 /// - the release of the update lock
 ///
 /// The hook gets the [`ReceiveReport`] that the commit returns and the
-/// carried value of the plan. From then on, the hook owns the carried value.
+/// carried value of the plan or of `before_server_commit`. From then on, the
+/// hook owns the carried value.
 ///
 /// The transaction commit is not atomic. It writes the detached metadata,
 /// then each ref, and then runs `fsync` on the ref directories. If one of
@@ -183,14 +224,17 @@ pub(super) fn cut(message: &mut String) {
 ///
 /// The host must obey two rules:
 ///
-/// - It never takes a lock that `before_update` takes while it holds the
-///   update lock or an [`UpdateGuard`](crate::UpdateGuard).
+/// - It never takes a lock that `before_update` or `before_server_commit`
+///   takes while it holds the update lock or an
+///   [`UpdateGuard`](crate::UpdateGuard).
 /// - It never waits for an exclusive repository lock, for example the lock
-///   of a prune, while it holds a lock that `before_update` takes.
+///   of a prune, while it holds a lock that `before_update` or
+///   `before_server_commit` takes.
 ///
-/// The host can put the guards of its locks in [`UpdatePlan::carried`]. Then
-/// the guards stay held from `before_update`, across the wait for the update
-/// lock and the ref update, until `after_update` drops the carried value.
+/// The host can put the guards of its locks in [`UpdatePlan::carried`] or in
+/// the value that `before_server_commit` returns. Then the guards stay held
+/// from the hook, across the wait for the update lock and the ref update,
+/// until `after_update` drops the carried value.
 /// `carried` is a `Box<dyn Any + Send>`, which is `'static`, so each guard in
 /// it must be an owned guard. The session does not examine the contents of
 /// `carried`.
@@ -205,8 +249,9 @@ pub(super) fn cut(message: &mut String) {
 /// The guards in the carried value are still held, so the two rules still
 /// apply. While the hook holds the carried value, it never waits for an
 /// exclusive repository lock, for example the lock of a prune. Another session
-/// can hold the shared repository lock and wait in `before_update` for a lock
-/// in the carried value. Then the hook and that session deadlock.
+/// can hold the shared repository lock and wait in `before_update` or
+/// `before_server_commit` for a lock in the carried value. Then the hook and
+/// that session deadlock.
 ///
 /// # Cancellation
 ///
@@ -239,12 +284,35 @@ pub trait ReceiveHooks: Send + Sync {
         updates: &'a [RefUpdate],
     ) -> HookFuture<'a, Result<UpdatePlan, HookRefusal>>;
 
+    /// Returns the carried value of a `Commit` with the server commit
+    /// `commit`.
+    ///
+    /// The value goes to [`after_update`](Self::after_update). If the commit
+    /// fails after this hook, the value drops once, after the release of the
+    /// update lock, and `after_update` does not run.
+    ///
+    /// The default method refuses each server commit with `ref-denied`.
+    ///
+    /// # Errors
+    ///
+    /// If the hook returns a [`HookRefusal`], the commit fails with the code
+    /// of the refusal, and no ref changes.
+    fn before_server_commit<'a>(
+        &'a self,
+        _commit: &'a ServerCommit,
+    ) -> HookFuture<'a, Result<Box<dyn Any + Send>, HookRefusal>> {
+        Box::pin(std::future::ready(Err(HookRefusal::denied(
+            "the hooks of the host take no server commit",
+        ))))
+    }
+
     /// Takes the report of a successful commit and the carried value of the
     /// plan.
     ///
     /// The hook runs only if the transaction commit succeeds. The carried
     /// value is the value of the plan of
-    /// [`before_update`](Self::before_update).
+    /// [`before_update`](Self::before_update), or the value that
+    /// [`before_server_commit`](Self::before_server_commit) returns.
     ///
     /// # Errors
     ///
@@ -292,7 +360,8 @@ pub struct HostEntry {
     pub keep_existing: bool,
 }
 
-/// A refusal of the commit from [`ReceiveHooks::before_update`].
+/// A refusal of the commit from [`ReceiveHooks::before_update`] or
+/// [`ReceiveHooks::before_server_commit`].
 ///
 /// If the hook returns a refusal, no ref changes.
 #[derive(Debug)]

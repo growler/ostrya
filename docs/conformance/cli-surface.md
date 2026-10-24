@@ -4224,8 +4224,8 @@ ostrya push [--repo=PATH] REMOTE REF --onto=BRANCH
     A longer frame is refused with `error: limit-exceeded: ...` before the
     push sends an object.
   - The client group needs `c` on `BRANCH`, and `t` or `w` on each tag. A
-    server that runs receive hooks takes no server commit, and the push
-    fails with `error: ref-denied: ...`.
+    server whose receive hooks take no server commit refuses the push, and
+    the push fails with `error: ref-denied: ...`.
 - `--depth=N` sends `N` parents of each source commit, and `-1` the whole
   chain. Without it, the push sends the chain back to the commit of the ref
   on the server. When the server does not hold the ref, or the local chain
@@ -4677,8 +4677,8 @@ ostrya push-tree [--repo=PATH] REMOTE DIR --onto=BRANCH
   `error: limit-exceeded: ...`. The reply names `BRANCH` and each tag. Each
   refusal comes before the push sends an object.
 - The client group needs `c` on `BRANCH`, and `t` or `w` on each tag. A
-  server that runs receive hooks takes no server commit, and the push fails
-  with `error: ref-denied: ...`.
+  server whose receive hooks take no server commit refuses the push, and the
+  push fails with `error: ref-denied: ...`.
 - `--compress`, `--ssh-command`, `--receive-command`, and the HTTP options
   have the meaning they have in `push`.
 - On success the command writes the checksum of the new commit as one line

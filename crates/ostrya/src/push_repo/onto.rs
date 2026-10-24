@@ -208,7 +208,7 @@ impl Repo {
     /// - [`Error::Remote`] with the error of the server if the server refuses
     ///   the session, an object, or the server commit. An example is
     ///   [`RefDenied`](crate::remote::Error::RefDenied) if the client has no
-    ///   `c` on the branch, or if the server runs hooks, which take no server
+    ///   `c` on the branch, or if the hooks of the server take no server
     ///   commit.
     /// - [`Error::Remote`] with the error of the session if the stream or the
     ///   protocol fails. If the reply to `Commit` is lost, the error is

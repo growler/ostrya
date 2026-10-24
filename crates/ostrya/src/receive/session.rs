@@ -270,9 +270,8 @@ impl Repo {
     /// 3. The session holds no detached metadata and staged no commit object
     ///    (`protocol`).
     /// 4. The rights (`ref-denied`): the branch needs `c`, and each tag needs
-    ///    `t` or `w`. A session with hooks, and a branch or a tag
-    ///    `ostree-metadata` in the local refs of a repository with a
-    ///    collection id, are refused.
+    ///    `t` or `w`. A branch or a tag `ostree-metadata` in the local refs of
+    ///    a repository with a collection id is refused.
     /// 5. The tree of the commit is complete (`missing-objects`).
     ///
     /// The bindings and the signature verification of the policy do not

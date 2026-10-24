@@ -6,6 +6,8 @@
 //! - the refusals of the hook
 //! - the drop of the carried value
 //! - `after_update`, which runs after the release of the update lock
+//! - `before_server_commit`, which runs in place of `before_update` for a
+//!   server commit
 
 #![cfg(feature = "receive")]
 
@@ -20,11 +22,11 @@ use std::time::Duration;
 use common::receive::{
     Obj, assert_staging_removed, body, fixture_objects, is_root, new_repo, policy_allowing,
 };
-use common::{COMMIT, TmpDir, foreign_holder, lock_holder_main};
+use common::{COMMIT, ROOT_DIRMETA, ROOT_DIRTREE, TmpDir, foreign_holder, lock_holder_main};
 use ostrya::remote::proto::{CommitRequest, Hello, ServerCommit};
-use ostrya::remote::{self, Encoding, Expected, RefUpdate};
+use ostrya::remote::{self, Encoding, Expected, RefOutcome, RefUpdate};
 use ostrya::{
-    Checksum, DetachedMetadataFilter, Error, HookFuture, HookRefusal, HostEntry, LockKind,
+    Checksum, Commit, DetachedMetadataFilter, Error, HookFuture, HookRefusal, HostEntry, LockKind,
     MAX_METADATA_SIZE, ObjectType, ReceiveHooks, ReceivePolicy, ReceiveReport, ReceiveService,
     Repo, RepoMode, Type, UpdatePlan, Value,
 };
@@ -164,6 +166,83 @@ impl Drop for LockProbe {
         .join()
         .unwrap();
         self.seen.lock().unwrap().push(taken);
+    }
+}
+
+type ServerFn = dyn Fn(&ServerCommit) -> Result<Box<dyn Any + Send>, HookRefusal> + Send + Sync;
+
+/// A hook that gives the result of `server` for a server commit. It records
+/// the branch and the tags of each server commit that it gets.
+/// `before_update` and `after_update` go to `inner`.
+struct ServerHook {
+    inner: Arc<Hook>,
+    server: Box<ServerFn>,
+    seen: Mutex<Vec<(String, Vec<String>)>>,
+}
+
+impl ReceiveHooks for ServerHook {
+    fn before_update<'a>(
+        &'a self,
+        updates: &'a [RefUpdate],
+    ) -> HookFuture<'a, Result<UpdatePlan, HookRefusal>> {
+        self.inner.before_update(updates)
+    }
+
+    fn before_server_commit<'a>(
+        &'a self,
+        commit: &'a ServerCommit,
+    ) -> HookFuture<'a, Result<Box<dyn Any + Send>, HookRefusal>> {
+        self.seen
+            .lock()
+            .unwrap()
+            .push((commit.branch.clone(), commit.tags.clone()));
+        let result = (self.server)(commit);
+        Box::pin(async move { result })
+    }
+
+    fn after_update<'a>(
+        &'a self,
+        report: &'a ReceiveReport,
+        carried: Box<dyn Any + Send>,
+    ) -> HookFuture<'a, Result<(), String>> {
+        self.inner.after_update(report, carried)
+    }
+}
+
+impl ServerHook {
+    fn new(
+        inner: Arc<Hook>,
+        server: impl Fn(&ServerCommit) -> Result<Box<dyn Any + Send>, HookRefusal>
+        + Send
+        + Sync
+        + 'static,
+    ) -> Arc<ServerHook> {
+        Arc::new(ServerHook {
+            inner,
+            server: Box::new(server),
+            seen: Mutex::new(Vec::new()),
+        })
+    }
+
+    /// A hook whose server-commit hook gives a carried value that counts its
+    /// drops in `drops`. Its `after_update` drops the carried value and
+    /// succeeds.
+    fn giving(drops: &Arc<AtomicUsize>) -> Arc<ServerHook> {
+        let drops = drops.clone();
+        ServerHook::new(Hook::giving(Vec::new(), &drops), move |_| {
+            Ok(Box::new(DropCount(drops.clone())))
+        })
+    }
+
+    /// The count of the calls of the server-commit hook.
+    fn calls(&self) -> usize {
+        self.seen.lock().unwrap().len()
+    }
+
+    /// The branch and the tags of each server commit that the hook got, in
+    /// order.
+    fn seen(&self) -> Vec<(String, Vec<String>)> {
+        self.seen.lock().unwrap().clone()
     }
 }
 
@@ -408,50 +487,432 @@ fn writing_after(repo: &Repo, drops: &Arc<AtomicUsize>) -> Arc<Hook> {
 // Server commits.
 // ---------------------------------------------------------------------------
 
-/// A server commit in a session with hooks is `ref-denied`. Neither hook
-/// runs, and no ref is written.
-#[test]
-fn a_server_commit_with_hooks_is_ref_denied() {
-    let tmp = TmpDir::new("hooks-server-commit");
-    let repo = new_repo(&tmp, RepoMode::Archive, "");
-    let drops = Arc::new(AtomicUsize::new(0));
-    let hook = Hook::giving(Vec::new(), &drops);
-    let (service, _) = block_on(ReceiveService::hello_with_hooks(
-        repo.clone(),
-        Arc::new(policy_allowing(&["c:**"])),
-        Some(hook.clone() as Arc<dyn ReceiveHooks>),
-        1,
-        hello(&["main"]),
-    ))
-    .unwrap();
-    let tree: Vec<Obj> = fixture_objects(Encoding::Raw)
+/// The timestamp of each server commit of the tests.
+const TIMESTAMP: u64 = 1_700_000_000;
+
+/// The objects of the fixture tree, without the fixture commit.
+fn tree() -> Vec<Obj> {
+    fixture_objects(Encoding::Raw)
         .into_iter()
         .filter(|o| o.ty != ObjectType::Commit)
+        .collect()
+}
+
+/// A server commit on `branch` with `tags` over the fixture tree, with
+/// [`TIMESTAMP`].
+fn server_commit(branch: &str, tags: &[&str]) -> ServerCommit {
+    ServerCommit {
+        branch: branch.into(),
+        tags: tags.iter().map(|t| t.to_string()).collect(),
+        bind_refs: Vec::new(),
+        root_dirtree: Checksum::from_hex(ROOT_DIRTREE).unwrap(),
+        root_dirmeta: Checksum::from_hex(ROOT_DIRMETA).unwrap(),
+        subject: String::new(),
+        body: String::new(),
+        metadata: Vec::new(),
+        timestamp: Some(TIMESTAMP),
+        orphan: false,
+    }
+}
+
+/// Runs one session of `repo` with `hooks` under a policy with `c` and `t`
+/// on each ref: one object stream of `objects`, then `Commit` with the
+/// server commit `sc`. Returns the service for the steps after the commit,
+/// and the result of the commit.
+fn run_server(
+    repo: &Repo,
+    hooks: Option<Arc<dyn ReceiveHooks>>,
+    objects: &[Obj],
+    sc: ServerCommit,
+) -> (ReceiveService, ostrya::Result<ReceiveReport>) {
+    run_server_with(repo, policy_allowing(&["c:**", "t:**"]), hooks, objects, sc)
+}
+
+/// [`run_server`] with `policy`.
+fn run_server_with(
+    repo: &Repo,
+    policy: ReceivePolicy,
+    hooks: Option<Arc<dyn ReceiveHooks>>,
+    objects: &[Obj],
+    sc: ServerCommit,
+) -> (ReceiveService, ostrya::Result<ReceiveReport>) {
+    let names: Vec<&str> = std::iter::once(sc.branch.as_str())
+        .chain(sc.tags.iter().map(String::as_str))
         .collect();
-    block_on(service.objects(&body(&tree)[..])).unwrap();
+    let (service, _) = block_on(ReceiveService::hello_with_hooks(
+        repo.clone(),
+        Arc::new(policy),
+        hooks,
+        1,
+        hello(&names),
+    ))
+    .unwrap();
+    block_on(service.objects(&body(objects)[..])).unwrap();
     let result = block_on(service.commit(CommitRequest {
         updates: Vec::new(),
         force: false,
-        server_commit: Some(Box::new(ServerCommit {
-            branch: "main".into(),
-            tags: Vec::new(),
-            bind_refs: Vec::new(),
-            root_dirtree: Checksum::from_hex(common::ROOT_DIRTREE).unwrap(),
-            root_dirmeta: Checksum::from_hex(common::ROOT_DIRMETA).unwrap(),
-            subject: String::new(),
-            body: String::new(),
-            metadata: Vec::new(),
-            timestamp: None,
-            orphan: false,
-        })),
+        server_commit: Some(Box::new(sc)),
     }));
-    match result {
-        Err(Error::Remote(remote::Error::RefDenied(m))) => assert!(m.contains("hooks"), "{m}"),
-        other => panic!("expected ref-denied, got {other:?}"),
+    (service, result)
+}
+
+/// The commit that the local ref `name` names, if the ref is present.
+fn ref_of(repo: &Repo, name: &str) -> Option<Checksum> {
+    std::fs::read_to_string(repo.path().join("refs/heads").join(name))
+        .ok()
+        .map(|text| Checksum::from_hex(text.trim()).unwrap())
+}
+
+fn outcome(name: &str, old: Option<Checksum>, new: Checksum) -> RefOutcome {
+    RefOutcome {
+        name: name.into(),
+        old,
+        new: Some(new),
     }
-    assert_eq!(hook.calls(), 0);
-    assert_eq!(hook.after_calls(), 0);
+}
+
+/// Writes a server commit on `main` with the tag `v1` in a session with no
+/// hooks, and returns the commit.
+fn main_with_v1(repo: &Repo) -> Checksum {
+    let (_, result) = run_server(repo, None, &tree(), server_commit("main", &["v1"]));
+    result.unwrap().refs[0].new.unwrap()
+}
+
+/// A host that does not implement `before_server_commit` refuses a server
+/// commit with `ref-denied`. Neither of the other hooks runs, and no ref is
+/// written. The refusal comes after the checks of the server commit: a tree
+/// with missing objects fails as `missing-objects`.
+#[test]
+fn a_host_without_the_server_commit_hook_refuses_with_ref_denied() {
+    for complete in [true, false] {
+        let tmp = TmpDir::new("hooks-server-commit");
+        let repo = new_repo(&tmp, RepoMode::Archive, "");
+        let drops = Arc::new(AtomicUsize::new(0));
+        let hook = Hook::giving(Vec::new(), &drops);
+        let objects = if complete { tree() } else { Vec::new() };
+        let (service, result) = run_server(
+            &repo,
+            Some(hook.clone()),
+            &objects,
+            server_commit("main", &[]),
+        );
+        match (complete, result) {
+            (true, Err(Error::Remote(remote::Error::RefDenied(m)))) => {
+                assert!(m.contains("take no server commit"), "{m}")
+            }
+            (false, Err(Error::Remote(remote::Error::MissingObjects { .. }))) => {}
+            (_, other) => panic!("complete {complete}: {other:?}"),
+        }
+        assert_eq!(hook.calls(), 0);
+        assert_eq!(hook.after_calls(), 0);
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+        assert!(common::file_inventory(repo.path(), "refs").is_empty());
+        assert_staging_removed(repo.path());
+        assert_aborted(&service, &format!("complete {complete}"));
+    }
+}
+
+/// A host that implements `before_server_commit` does not get a server
+/// commit that fails a check before the hook. A branch without `c` fails as
+/// `ref-denied` with the message of the policy, and a tree with missing
+/// objects fails as `missing-objects`. No hook runs, the carried value is
+/// not made, and no ref is written.
+#[test]
+fn the_checks_of_a_server_commit_run_before_the_hook() {
+    for case in ["no c", "missing objects"] {
+        let tmp = TmpDir::new("hooks-sc-checks");
+        let repo = new_repo(&tmp, RepoMode::Archive, "");
+        let drops = Arc::new(AtomicUsize::new(0));
+        let hook = ServerHook::giving(&drops);
+        let (allow, objects) = match case {
+            "no c" => (&["wtd:**"][..], tree()),
+            _ => (&["c:**", "t:**"][..], Vec::new()),
+        };
+        let (service, result) = run_server_with(
+            &repo,
+            policy_allowing(allow),
+            Some(hook.clone()),
+            &objects,
+            server_commit("main", &["v1"]),
+        );
+        match (case, result) {
+            ("no c", Err(Error::Remote(remote::Error::RefDenied(m)))) => {
+                assert_eq!(m, "the policy gives no c on ref 'main'")
+            }
+            ("missing objects", Err(Error::Remote(remote::Error::MissingObjects { .. }))) => {}
+            (_, other) => panic!("{case}: {other:?}"),
+        }
+        assert_eq!(hook.calls(), 0, "{case}");
+        assert_eq!(hook.inner.calls(), 0, "{case}");
+        assert_eq!(hook.inner.after_calls(), 0, "{case}");
+        assert_eq!(drops.load(Ordering::SeqCst), 0, "{case}");
+        assert!(common::file_inventory(repo.path(), "refs").is_empty());
+        assert_staging_removed(repo.path());
+        assert_aborted(&service, case);
+    }
+}
+
+/// A host hook accepts a server commit to a new branch with a tag, then to
+/// the present branch with another tag. The hook gets the names of the
+/// branch and the tags. `after_update` gets the report: the branch moves
+/// from `None`, then from the first commit, to the server commit, and each
+/// tag moves from `None`. The carried value stays held until `after_update`
+/// drops it.
+#[test]
+fn a_host_hook_accepts_a_server_commit() {
+    let tmp = TmpDir::new("hooks-sc-accept");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    let drops = Arc::new(AtomicUsize::new(0));
+    let in_after = Arc::new(Mutex::new(Vec::new()));
+    let (after_drops, after_seen) = (drops.clone(), in_after.clone());
+    let inner = Hook::with_after(
+        |_| Err(HookRefusal::internal("a server commit has no ref updates")),
+        move |_, carried| {
+            let carried = carried
+                .downcast::<DropCount>()
+                .expect("the carried value of the hook");
+            after_seen
+                .lock()
+                .unwrap()
+                .push(after_drops.load(Ordering::SeqCst));
+            drop(carried);
+            Box::pin(async { Ok(()) })
+        },
+    );
+    let carried = drops.clone();
+    let hook = ServerHook::new(inner, move |_| Ok(Box::new(DropCount(carried.clone()))));
+
+    let hooks = Some(hook.clone() as Arc<dyn ReceiveHooks>);
+    let (_, first) = run_server(&repo, hooks, &tree(), server_commit("main", &["v1"]));
+    let first = first.unwrap();
+    let c1 = first.refs[0].new.unwrap();
+    assert_eq!(
+        first.refs,
+        [outcome("main", None, c1), outcome("v1", None, c1)]
+    );
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
+
+    let hooks = Some(hook.clone() as Arc<dyn ReceiveHooks>);
+    let (_, second) = run_server(&repo, hooks, &[], server_commit("main", &["v2"]));
+    let second = second.unwrap();
+    let c2 = second.refs[0].new.unwrap();
+    assert_ne!(c1, c2);
+    assert_eq!(
+        second.refs,
+        [outcome("main", Some(c1), c2), outcome("v2", None, c2)]
+    );
+    let bytes = block_on(repo.load_object_bytes(ObjectType::Commit, &c2)).unwrap();
+    assert_eq!(Commit::parse(&bytes).unwrap().parent, Some(c1));
+
+    assert_eq!(
+        hook.seen(),
+        [
+            ("main".to_owned(), vec!["v1".to_owned()]),
+            ("main".to_owned(), vec!["v2".to_owned()]),
+        ]
+    );
+    assert_eq!(hook.inner.calls(), 0);
+    assert_eq!(hook.inner.after_calls(), 2);
+    assert_eq!(hook.inner.reports(), [first, second]);
+    assert_eq!(in_after.lock().unwrap().as_slice(), [0, 1]);
+    assert_eq!(drops.load(Ordering::SeqCst), 2);
+    assert_eq!(ref_of(&repo, "main"), Some(c2));
+    assert_eq!(ref_of(&repo, "v1"), Some(c1));
+    assert_eq!(ref_of(&repo, "v2"), Some(c2));
+}
+
+/// The server-commit hook runs before the update lock. With
+/// `lock-timeout-secs=0`, an update guard that the hook takes on another
+/// thread does not get the timeout. If another process holds the update
+/// lock, the commit gets the timeout after the hook. Then `after_update` does
+/// not run, the carried value drops once, and no ref is written.
+#[test]
+fn the_server_commit_hook_runs_before_the_update_lock() {
+    let tmp = TmpDir::new("hooks-sc-lock");
+    let repo = new_repo(&tmp, RepoMode::Archive, "lock-timeout-secs=0\n");
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let probe = (repo.clone(), seen.clone());
+    let hook = ServerHook::new(Hook::giving(Vec::new(), &Arc::default()), move |_| {
+        drop(LockProbe {
+            repo: probe.0.clone(),
+            seen: probe.1.clone(),
+        });
+        Ok(Box::new(()))
+    });
+    let (_, result) = run_server(
+        &repo,
+        Some(hook.clone()),
+        &tree(),
+        server_commit("main", &[]),
+    );
+    result.unwrap();
+    assert_eq!(hook.calls(), 1);
+    assert_eq!(seen.lock().unwrap().as_slice(), [Ok(())]);
+
+    let tmp = TmpDir::new("hooks-sc-lock");
+    let repo = new_repo(&tmp, RepoMode::Archive, "lock-timeout-secs=0\n");
+    let drops = Arc::new(AtomicUsize::new(0));
+    let hook = ServerHook::giving(&drops);
+    let holder = foreign_holder(repo.path(), ".update.lock");
+    let (_, result) = run_server(
+        &repo,
+        Some(hook.clone()),
+        &tree(),
+        server_commit("main", &[]),
+    );
+    drop(holder);
+    assert!(
+        matches!(&result, Err(Error::LockTimeout { .. })),
+        "{result:?}"
+    );
+    assert_eq!(hook.calls(), 1);
+    assert_eq!(hook.inner.after_calls(), 0);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
     assert!(common::file_inventory(repo.path(), "refs").is_empty());
+}
+
+/// A refusal of the server-commit hook keeps its code: `HookRefusal::denied`
+/// fails as `ref-denied` and `HookRefusal::internal` as `internal`, each with
+/// its message. The session writes no ref, removes the staging directory,
+/// and ends. If a message is longer than 4096 bytes, the session cuts it at a
+/// character boundary. Each case runs on a new branch, and on a branch that
+/// is present. A branch that is present stays at its commit.
+#[test]
+fn a_server_commit_hook_refusal_keeps_its_code() {
+    let long = format!("a{}", "\u{e9}".repeat(3000));
+    for (present, denied, message) in [false, true].into_iter().flat_map(|present| {
+        [
+            (present, true, "no such release".to_owned()),
+            (present, false, "the database is down".to_owned()),
+            (present, true, long.clone()),
+        ]
+    }) {
+        let case = format!("present {present} denied {denied}");
+        let tmp = TmpDir::new("hooks-sc-refusal");
+        let repo = new_repo(&tmp, RepoMode::Archive, "");
+        let first = present.then(|| main_with_v1(&repo));
+        let given = message.clone();
+        let hook = ServerHook::new(Hook::giving(Vec::new(), &Arc::default()), move |_| {
+            Err(if denied {
+                HookRefusal::denied(given.clone())
+            } else {
+                HookRefusal::internal(given.clone())
+            })
+        });
+        let (service, result) = run_server(
+            &repo,
+            Some(hook.clone()),
+            &tree(),
+            server_commit("main", &["v2"]),
+        );
+        let got = match (denied, result) {
+            (true, Err(Error::Remote(remote::Error::RefDenied(m)))) => m,
+            (false, Err(Error::Remote(remote::Error::Internal(m)))) => m,
+            (_, other) => panic!("{case}: {other:?}"),
+        };
+        if message.len() > 4096 {
+            assert_eq!(got.len(), 4095);
+            assert!(message.starts_with(&got));
+        } else {
+            assert_eq!(got, message);
+        }
+        assert_eq!(hook.calls(), 1);
+        assert_eq!(hook.inner.after_calls(), 0);
+        assert_eq!(ref_of(&repo, "main"), first, "{case}");
+        assert_eq!(ref_of(&repo, "v1"), first, "{case}");
+        assert_eq!(ref_of(&repo, "v2"), None, "{case}");
+        assert_staging_removed(repo.path());
+        assert_aborted(&service, &case);
+    }
+}
+
+/// The carried value of a server commit drops after the release of the
+/// update lock: on success, for a tag that is present (`ref-mismatch`), and
+/// for `orphan` on a present branch without `d` (`non-fast-forward`). On a
+/// failure, the carried value drops once, `after_update` does not run, and
+/// no ref changes.
+#[test]
+fn the_carried_value_of_a_server_commit_drops_after_the_update_lock_is_released() {
+    let cases = [
+        ("success", server_commit("main", &["v2"])),
+        ("present tag", server_commit("main", &["v1"])),
+        (
+            "orphan",
+            ServerCommit {
+                orphan: true,
+                ..server_commit("main", &[])
+            },
+        ),
+    ];
+    for (case, sc) in cases {
+        let tmp = TmpDir::new("hooks-sc-lock-free");
+        let repo = new_repo(&tmp, RepoMode::Archive, "lock-timeout-secs=0\n");
+        let first = main_with_v1(&repo);
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let probe = (repo.clone(), seen.clone());
+        let hook = ServerHook::new(Hook::giving(Vec::new(), &Arc::default()), move |_| {
+            Ok(Box::new(LockProbe {
+                repo: probe.0.clone(),
+                seen: probe.1.clone(),
+            }))
+        });
+        let (_, result) = run_server(&repo, Some(hook.clone()), &[], sc);
+        match (case, &result) {
+            ("success", Ok(report)) => {
+                assert_eq!(ref_of(&repo, "main"), report.refs[0].new);
+                assert_eq!(hook.inner.after_calls(), 1);
+            }
+            ("present tag", Err(Error::Remote(remote::Error::RefMismatch { name, .. }))) => {
+                assert_eq!(name, "v1")
+            }
+            ("orphan", Err(Error::Remote(remote::Error::NonFastForward(_)))) => {}
+            _ => panic!("{case}: {result:?}"),
+        }
+        if result.is_err() {
+            assert_eq!(hook.inner.after_calls(), 0, "{case}");
+            assert_eq!(ref_of(&repo, "main"), Some(first), "{case}");
+            assert_eq!(ref_of(&repo, "v1"), Some(first), "{case}");
+            assert_eq!(ref_of(&repo, "v2"), None, "{case}");
+        }
+        assert_eq!(hook.calls(), 1, "{case}");
+        assert_eq!(seen.lock().unwrap().as_slice(), [Ok(())], "{case}");
+    }
+}
+
+/// An error of `after_update` after a server commit fails the commit as
+/// `internal`, with its message. The refs stay written, and the session
+/// removes the staging directory and ends as aborted.
+#[test]
+fn an_after_update_error_of_a_server_commit_is_internal_with_the_refs_written() {
+    let tmp = TmpDir::new("hooks-sc-after-error");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    let drops = Arc::new(AtomicUsize::new(0));
+    let inner = Hook::with_after(
+        |_| Err(HookRefusal::internal("a server commit has no ref updates")),
+        |_, carried| {
+            drop(carried);
+            Box::pin(async { Err("the database is down".to_owned()) })
+        },
+    );
+    let carried = drops.clone();
+    let hook = ServerHook::new(inner, move |_| Ok(Box::new(DropCount(carried.clone()))));
+    let (service, result) = run_server(
+        &repo,
+        Some(hook.clone()),
+        &tree(),
+        server_commit("main", &["v1"]),
+    );
+    match result {
+        Err(Error::Remote(remote::Error::Internal(m))) => assert_eq!(m, "the database is down"),
+        other => panic!("expected internal, got {other:?}"),
+    }
+    let commit = ref_of(&repo, "main").expect("the branch is written");
+    assert_eq!(ref_of(&repo, "v1"), Some(commit));
+    assert_staging_removed(repo.path());
+    assert_aborted(&service, "after_update error");
+    assert_eq!(hook.calls(), 1);
+    assert_eq!(hook.inner.after_calls(), 1);
+    assert_eq!(drops.load(Ordering::SeqCst), 1);
 }
 
 // ---------------------------------------------------------------------------

@@ -2997,14 +2997,17 @@ give the condition of each refusal.
 - `ref-denied` -- no client group covers the namespace of `Hello`, the client
   group opens no push session, a ref of `Hello` has no `r`, an update writes
   a commit without `w` or `t`, or an update names a ref that a push does not
-  write. A server commit gets this code without `c` on its branch, without
-  `t` or `w` on a tag, or in a session with the hooks of a host application.
+  write. A server commit gets this code without `c` on its branch, or without
+  `t` or `w` on a tag. A hook of a host application can also refuse a commit
+  with ref updates or a server commit with this code.
 - `signature-required` -- a commit has a signature that does not verify, or
   has no signature and the client group requires one.
 - `binding-mismatch` -- the ref binding of a commit does not name its target
   ref, or its collection binding does not name the collection of the
   namespace of the session.
-- `internal` -- a failure on the server side, for example an I/O error.
+- `internal` -- a failure on the server side, for example an I/O error. A
+  hook of a host application can also refuse a commit with ref updates or a
+  server commit with this code.
 
 An unknown code in a received `Error` is `protocol`. A server error with no
 wire code goes out as `internal` with the text of the error. "Abort, abandon,
@@ -3372,7 +3375,6 @@ failed check ends the session, and the session writes nothing:
 3. A detached metadata dict of the session, a composefs image of the
    session, and a commit object that the session staged, are `protocol`.
 4. These are `ref-denied`:
-   - a session with the hooks of a host application;
    - a branch or a tag `ostree-metadata` in the local refs of a repository
      with a collection id;
    - a remote ref `REMOTE:NAME`;
@@ -3389,10 +3391,16 @@ do not apply. The trust in a server commit comes from the authentication of
 the client and from `sign`. A client group that must verify the commits of
 its clients takes a mirror push.
 
-The server then makes the staged objects durable and takes the update lock.
-Under the lock it reads the branch and the tags in the namespace of the
-session, and check 10 applies, with a write to each of these refs. Then the
-server checks the branch, and then each tag, in order:
+The server then makes the staged objects durable. In a session with the
+hooks of a host application, the hook of the host gets the server commit
+next. The hook can refuse with `ref-denied` or `internal`, and no ref
+changes. A host whose hooks take no server commit refuses with `ref-denied`
+at this step.
+
+The server then takes the update lock. Under the lock it reads the branch and
+the tags in the namespace of the session, and check 10 applies, with a write
+to each of these refs. Then the server checks the branch, and then each tag,
+in order:
 
 - A server commit with `orphan` on a branch that is present is
   `non-fast-forward`, unless the branch has `d`.
@@ -3488,8 +3496,8 @@ push-tree` ("The commit of `push-tree`"). Each client follows these rules:
   refused server commit sends no object.
 - The client offers the objects of the tree and sends the objects that the
   server lacks. It sends no commit object and no detached metadata.
-- A host with hooks answers `ref-denied` (check 4). The client has no
-  fallback to a commit that it builds.
+- A host whose hooks take no server commit answers `ref-denied`. The client
+  has no fallback to a commit that it builds.
 - The `CommitReply` must hold the branch, then each tag, in order. Each entry
   must have one new commit, the same for each entry, and a tag must have no
   old commit. Any other reply is `CommitOutcomeUnknown` on the client. The
@@ -3556,11 +3564,12 @@ that a receive uses. A receive uses them in this order:
    transaction commit. Under `[core] locking=false`, a one-way stream takes
    no repository lock.
 2. At `Commit`, after check 9, the server takes the update lock. Under the
-   lock it reads the refs again and runs checks 10 to 12. For a server
-   commit, the server also builds, writes, and signs the commit under the
-   lock, because the commit bytes exist only after the read of the tip
-   ("Server commit"). A GPG signature then holds the lock for the time of the
-   `gpg` run.
+   lock it reads the refs again and runs checks 10 to 12. For a server commit,
+   the server takes the update lock after check 5 of "Server commit" and
+   after the hook of the host application. The server also builds, writes,
+   and signs the commit under the lock, because the commit bytes exist only
+   after the read of the tip ("Server commit"). A GPG signature then holds the
+   lock for the time of the `gpg` run.
 3. The server queues the detached metadata and the ref writes in the
    transaction. The policy regenerates the summary when
    `[core] auto-update-summary` is true ("Config file (`<repo>/config`,

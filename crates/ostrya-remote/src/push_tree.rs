@@ -260,7 +260,7 @@ pub async fn push_tree_prepared(
 ///   no reply that the client can read.
 /// - An `Error` message from the server, as the [`Error`] variant of its code.
 ///   An example is [`Error::RefDenied`] if the client has no `c` on the
-///   branch, or if the server runs hooks, which take no server commit.
+///   branch, or if the hooks of the server take no server commit.
 ///
 /// [`Error`]: crate::Error
 /// [`Error::InvalidInput`]: crate::Error::InvalidInput

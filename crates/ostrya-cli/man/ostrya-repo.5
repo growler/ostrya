@@ -462,6 +462,13 @@ The system trusted keys of the signature engine \fB\%<engine>\fR, which is \fB\%
 .TQ
 \fB\%/usr/share/ostree/revoked.<engine>\fR, \fB\%/usr/share/ostree/revoked.<engine>.d/\fR
 The system revoked keys of the signature engine \fB\%<engine>\fR.
+Each file of the trusted and revoked keys, and each file in a \fB\%.d\fR directory, has the form of its engine.
+An \fB\%ed25519\fR file holds one base64 key on each line.
+An \fB\%spki\fR file holds PEM \fB\%PUBLIC KEY\fR blocks, and ostrya ignores the text outside the blocks.
+An empty file, or a file of white space only, adds no keys.
+In an \fB\%spki\fR file, white space is space, horizontal tab, line feed, form feed, and carriage return.
+ostrya refuses an \fB\%spki\fR file with a block of another label, a block that does not decode, or no block.
+A refused file fails the verify, also a file of the revoked keys.
 .TP
 \fB\%~/.aws/credentials\fR, \fB\%~/.aws/config\fR
 The shared AWS credentials file and config file of a command that reads or writes a bucket repository at an \fB\%s3://\fR address.

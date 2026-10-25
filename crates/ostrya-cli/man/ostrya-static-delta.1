@@ -50,14 +50,14 @@ The signature engine: \fB\%ed25519\fR or \fB\%spki\fR\&.
 The default is \fB\%ed25519\fR\&. The command reads this option also with no key source, and refuses any other name, \fB\%gpg\fR included. If the option occurs more than once, the last value wins.
 .TP
 \fB\-\-keys\-file\fR \fIPATH\fR
-Read public keys from a file, one \%base64 key per line.
+Read public keys from a file.
 .IP
-If the option occurs more than once, the last value wins. With this option or a \%KEY\-ID, the command does not read \%\-\-keys\-dir. The path must name a regular file of \%1 MiB or less.
+For \%ed25519, the file has one \%base64 key per line. For spki, it has PEM \fB\%PUBLIC KEY\fR blocks. If the option occurs more than once, the last value wins. With this option or a \%KEY\-ID, the command does not read \%\-\-keys\-dir. The path must name a regular file of \%1 MiB or less.
 .TP
 \fB\-\-keys\-dir\fR \fIPATH\fR
 Read \fB\%trusted.<type>\fR and \fB\%revoked.<type>\fR from this directory.
 .IP
-The command also reads the files in \fB\%trusted.<type>.d/\fR and \fB\%revoked.<type>.d/\fR\&. If the option occurs more than once, the last value wins. An empty value names the working directory.
+The command also reads the files in \fB\%trusted.<type>.d/\fR and \fB\%revoked.<type>.d/\fR\&. An \%ed25519 file has one \%base64 key per line, and an spki file has PEM \fB\%PUBLIC KEY\fR blocks. If the option occurs more than once, the last value wins. An empty value names the working directory.
 .SS "generate"
 Generate a static delta and print what it is generated from and to.
 .PP
@@ -246,13 +246,13 @@ The signature engine: \fB\%ed25519\fR or \fB\%spki\fR\&.
 The default is \fB\%ed25519\fR\&. The command refuses any other name, \fB\%gpg\fR included. If the option occurs more than once, the last value wins.
 .TP
 \fB\-\-keys\-file\fR \fIPATH\fR
-Read public keys from a file, one \%base64 key per line.
+Read public keys from a file.
 .IP
-If the option occurs more than once, the last value wins. With this option or a \%KEY\-ID, the command does not read \%\-\-keys\-dir or the system key directories. The path must name a regular file of \%1 MiB or less. The command takes an empty value as given, and refuses it because it is not a regular file.
+For \%ed25519, the file has one \%base64 key per line. For spki, it has PEM \fB\%PUBLIC KEY\fR blocks. If the option occurs more than once, the last value wins. With this option or a \%KEY\-ID, the command does not read \%\-\-keys\-dir or the system key directories. The path must name a regular file of \%1 MiB or less. The command takes an empty value as given, and refuses it because it is not a regular file.
 .TP
 \fB\-\-keys\-dir\fR \fIPATH\fR
 Read \fB\%trusted.<type>\fR and \fB\%revoked.<type>\fR from this directory.
 .IP
-The command also reads the files in \fB\%trusted.<type>.d/\fR and \fB\%revoked.<type>.d/\fR\&. It then does not read the system key directories. If the option occurs more than once, the last value wins. An empty value names the working directory.
+The command also reads the files in \fB\%trusted.<type>.d/\fR and \fB\%revoked.<type>.d/\fR\&. It then does not read the system key directories. An \%ed25519 file has one \%base64 key per line, and an spki file has PEM \fB\%PUBLIC KEY\fR blocks. If the option occurs more than once, the last value wins. An empty value names the working directory.
 .SH SEE ALSO
 \fBostrya\fR(1)

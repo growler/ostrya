@@ -108,7 +108,7 @@ pub mod sign;
 #[cfg(feature = "sign-spki")]
 pub mod spki {
     //! The spki signing engine: ECDSA signatures on P-256 with SPKI public keys.
-    pub use ostrya_sign::{SpkiSigner, SpkiVerifier};
+    pub use ostrya_sign::{SpkiSigner, SpkiVerifier, spki_public_keys};
 }
 mod staging;
 pub mod staging_tree;
@@ -224,7 +224,7 @@ pub use sign::{
 };
 #[cfg(feature = "sign-spki")]
 #[doc(hidden)]
-pub use spki::{SpkiSigner, SpkiVerifier};
+pub use spki::{SpkiSigner, SpkiVerifier, spki_public_keys};
 #[doc(hidden)]
 pub use staging_tree::{
     MergeOptions, RootDirmeta, StagedFileWriter, StagingEntry, StagingLookup, StagingTree,

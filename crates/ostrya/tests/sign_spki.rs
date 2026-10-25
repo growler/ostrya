@@ -35,8 +35,7 @@ use ostrya::{
 };
 use ostrya_rt::block_on;
 
-/// The SubjectPublicKeyInfo DER of the embedded key in base64 (a `trusted.spki`
-/// line).
+/// The SubjectPublicKeyInfo DER of the embedded key in base64.
 const PUBLIC_SPKI_B64: &str = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE8X83xylD3ibci0xjFKMR4bwUtTU/\
 YLloVEDxomUS2SHAfFnN3LHVVNYjok0Zm2RiiU7XpDnRAG1Ua8eR8SKbLQ==";
 /// The PEM `PUBLIC KEY` form of the same key.
@@ -209,7 +208,7 @@ fn spki_trusted_revoked_directory_convention() {
     let keys_dir = base.join("keys");
     let trusted_d = keys_dir.join("trusted.spki.d");
     std::fs::create_dir_all(&trusted_d).unwrap();
-    std::fs::write(trusted_d.join("mykey"), format!("{PUBLIC_SPKI_B64}\n")).unwrap();
+    std::fs::write(trusted_d.join("mykey"), PUBLIC_PEM).unwrap();
 
     block_on(async {
         let (repo, commit) = build_committed_repo(base).await;
@@ -233,7 +232,7 @@ fn spki_trusted_revoked_directory_convention() {
         // If the key is revoked, the effective trusted set does not hold it.
         let revoked_d = keys_dir.join("revoked.spki.d");
         std::fs::create_dir_all(&revoked_d).unwrap();
-        std::fs::write(revoked_d.join("bad"), format!("{PUBLIC_SPKI_B64}\n")).unwrap();
+        std::fs::write(revoked_d.join("bad"), PUBLIC_PEM).unwrap();
         let keys = load_sign_keys_from(&[keys_dir.as_path()], "spki").unwrap();
         assert_eq!(keys.revoked.len(), 1);
         let verifier = SpkiVerifier::from_sign_keys(keys).unwrap();
@@ -245,6 +244,148 @@ fn spki_trusted_revoked_directory_convention() {
                 .valid,
             "a revoked key must not verify"
         );
+    });
+}
+
+/// Returns whether the keys of the store at `keys_dir` verify the signed
+/// `commit` of `repo`.
+async fn store_verifies(repo: &Repo, commit: &Checksum, keys_dir: &Path) -> bool {
+    let keys = load_sign_keys_from(&[keys_dir], "spki").unwrap();
+    let verifier = SpkiVerifier::from_sign_keys(keys).unwrap();
+    repo.verify_commit(commit, &[&verifier])
+        .await
+        .unwrap()
+        .valid
+}
+
+/// Returns the message of the refusal of the store at `keys_dir`.
+fn store_refusal(keys_dir: &Path) -> String {
+    match load_sign_keys_from(&[keys_dir], "spki").unwrap_err() {
+        ostrya::Error::Signature(m) => m,
+        other => panic!("not a signature error: {other}"),
+    }
+}
+
+/// The files of the key store hold PEM `PUBLIC KEY` blocks. A file of base64
+/// lines, or a file with a block of another label, refuses the load, also in
+/// a `.d` directory and for the revoked set. The refusal names the file. An
+/// empty file adds no keys.
+#[test]
+fn spki_key_store_files_hold_pem_blocks() {
+    let tmp = TmpDir::new("spki-store-pem");
+    let base = tmp.path();
+    let certificate = wrap_pem("CERTIFICATE", PUBLIC_SPKI_B64);
+    block_on(async {
+        let (repo, commit) = build_committed_repo(base).await;
+        repo.sign_commit(&commit, &SpkiSigner::from_base64(SECRET_SEC1_B64).unwrap())
+            .await
+            .unwrap();
+        let store = |name: &str| {
+            let dir = base.join(name);
+            std::fs::create_dir_all(dir.join("trusted.spki.d")).unwrap();
+            std::fs::create_dir_all(dir.join("revoked.spki.d")).unwrap();
+            dir
+        };
+
+        // A PEM `trusted.spki` verifies.
+        let dir = store("pem");
+        std::fs::write(dir.join("trusted.spki"), PUBLIC_PEM).unwrap();
+        assert!(store_verifies(&repo, &commit, &dir).await);
+
+        // A `trusted.spki` of base64 lines is refused.
+        let dir = store("lines");
+        std::fs::write(dir.join("trusted.spki"), format!("{PUBLIC_SPKI_B64}\n")).unwrap();
+        let file = dir.join("trusted.spki");
+        assert_eq!(
+            store_refusal(&dir),
+            format!(
+                "the key file '{}' holds no PEM PUBLIC KEY block",
+                file.display()
+            )
+        );
+
+        // An empty `trusted.spki` adds no keys. A PEM file with CRLF line
+        // ends in `trusted.spki.d` adds its key.
+        let dir = store("empty");
+        std::fs::write(dir.join("trusted.spki"), "").unwrap();
+        std::fs::write(
+            dir.join("trusted.spki.d/crlf"),
+            PUBLIC_PEM.replace('\n', "\r\n"),
+        )
+        .unwrap();
+        assert!(store_verifies(&repo, &commit, &dir).await);
+
+        // A PEM `revoked.spki` revokes the key.
+        let dir = store("revoked");
+        std::fs::write(dir.join("trusted.spki"), PUBLIC_PEM).unwrap();
+        std::fs::write(dir.join("revoked.spki"), PUBLIC_PEM).unwrap();
+        assert!(!store_verifies(&repo, &commit, &dir).await);
+
+        // A `revoked.spki` of base64 lines refuses the load.
+        let dir = store("revoked-lines");
+        std::fs::write(dir.join("trusted.spki"), PUBLIC_PEM).unwrap();
+        std::fs::write(dir.join("revoked.spki"), format!("{PUBLIC_SPKI_B64}\n")).unwrap();
+        assert!(store_refusal(&dir).ends_with("holds no PEM PUBLIC KEY block"));
+
+        // A PEM file in `revoked.spki.d` revokes the key.
+        let dir = store("revoked-d");
+        std::fs::write(dir.join("trusted.spki"), PUBLIC_PEM).unwrap();
+        std::fs::write(dir.join("revoked.spki.d/key"), PUBLIC_PEM).unwrap();
+        assert!(!store_verifies(&repo, &commit, &dir).await);
+
+        // A CERTIFICATE block in `revoked.spki.d` refuses the load.
+        let dir = store("revoked-certificate");
+        std::fs::write(dir.join("trusted.spki"), PUBLIC_PEM).unwrap();
+        std::fs::write(dir.join("revoked.spki.d/cert"), &certificate).unwrap();
+        let file = dir.join("revoked.spki.d/cert");
+        assert_eq!(
+            store_refusal(&dir),
+            format!(
+                "the key file '{}', line 1: unexpected label \"CERTIFICATE\"",
+                file.display()
+            )
+        );
+
+        // A file of base64 lines in `trusted.spki.d` refuses the load by its
+        // name.
+        let dir = store("trusted-d-lines");
+        std::fs::write(dir.join("trusted.spki"), PUBLIC_PEM).unwrap();
+        std::fs::write(
+            dir.join("trusted.spki.d/lines"),
+            format!("{PUBLIC_SPKI_B64}\n"),
+        )
+        .unwrap();
+        let file = dir.join("trusted.spki.d/lines");
+        assert_eq!(
+            store_refusal(&dir),
+            format!(
+                "the key file '{}' holds no PEM PUBLIC KEY block",
+                file.display()
+            )
+        );
+
+        // A CERTIFICATE block in `trusted.spki.d` refuses the load by its
+        // name.
+        let dir = store("trusted-d-certificate");
+        std::fs::write(dir.join("trusted.spki.d/cert"), &certificate).unwrap();
+        let file = dir.join("trusted.spki.d/cert");
+        assert_eq!(
+            store_refusal(&dir),
+            format!(
+                "the key file '{}', line 1: unexpected label \"CERTIFICATE\"",
+                file.display()
+            )
+        );
+
+        // A CERTIFICATE block beside a valid block in `trusted.spki` refuses
+        // the load.
+        let dir = store("trusted-certificate");
+        std::fs::write(
+            dir.join("trusted.spki"),
+            format!("{PUBLIC_PEM}{certificate}"),
+        )
+        .unwrap();
+        assert!(store_refusal(&dir).ends_with("line 5: unexpected label \"CERTIFICATE\""));
     });
 }
 

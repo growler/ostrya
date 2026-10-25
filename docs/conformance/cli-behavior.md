@@ -1293,8 +1293,12 @@ Each configuration key selects one check:
 - `verification-<engine>-key` holds one key. A list under either separator
   fails with `error: Failed loading 'ed25519' keys from inline
   verification-key`.
-- `verification-<engine>-file` holds one key on each line. The tool accepts a
+- `verification-ed25519-file` holds one key on each line. The tool accepts a
   commit that the key of any line signed.
+- `verification-spki-file` holds PEM `PUBLIC KEY` blocks, under the rules of
+  `static-delta`, "spki public key files". A file that the tool reads as no
+  key, for example an empty file or a file of base64 lines, fails each pull
+  with `error: Failed loading 'spki' keys from '<path>`, with no closing quote.
 - `gpgkeypath` is a list of keyring files and directories, separated by `;`.
   The tool adds each entry to the trusted set. A remote with an imported
   `<remote>.trustedkeys.gpg` and a `gpgkeypath` that names an empty directory
@@ -4567,8 +4571,10 @@ options are `-s`/`--sign-type=NAME`, `--keys-file=PATH`, and
 
 Under the `ed25519` engine, `sign --verify` takes the key sources that
 `static-delta`, "Key sources", states. The port also applies them to the
-`spki` engine. The tool decodes a KEY-ID and a `--keys-file` line with the
-lenient base64 reader of `commit --sign` (`commit`, "Signing").
+`spki` engine. The tool decodes a KEY-ID and an ed25519 `--keys-file` line
+with the lenient base64 reader of `commit --sign` (`commit`, "Signing"). An
+spki `--keys-file` and each spki file of the key store hold PEM `PUBLIC KEY`
+blocks (`static-delta`, "spki public key files").
 
 Where a key source does not load, the tool refuses the run at exit 1, with
 nothing on standard output. The refusals are:
@@ -5126,9 +5132,10 @@ of step 3.
 #### Key sources
 
 These rules apply to the `ed25519` engine. The port also applies them to the
-`spki` engine.
+`spki` engine, where a `--keys-file` and each file of the key store hold PEM
+`PUBLIC KEY` blocks ("spki public key files").
 
-- The tool trusts each positional KEY-ID and each line of the last
+- The tool trusts each positional KEY-ID and each key of the last
   `--keys-file`, in that load order. It does not read an earlier
   `--keys-file`.
 - With a KEY-ID or a `--keys-file`, the tool reads no `--keys-dir` and no
@@ -5151,15 +5158,50 @@ states.
 
 A `--keys-file` must be a regular file, with symlinks followed. An absent path,
 a directory, a FIFO, and the empty path report `error: File object '<path>' is
-not a regular file`. Each line is one key, with a trailing `\r` removed. A file
-with no key line reports `error: signature: <type>: no valid keys in file
-'<path>'`.
+not a regular file`. In an ed25519 file, each line is one key, with a trailing
+`\r` removed. A file with no key line reports `error: signature: <type>: no
+valid keys in file '<path>'`.
 
 A line of two or more whitespace bytes is a key of 0 bytes. Over a line of 0 or
 1 byte, `verify` and `sign --verify` of the tool stop on `SIGSEGV` after a GLib
 assertion. A lone `\r` is such a line. The tool reads a file of more than 1 MiB
 whole and verifies with its keys. `cli-surface.md`, "P2", `static-delta`,
 records the port side.
+
+#### spki public key files
+
+The `ostree` 2026.1 build with OpenSSL on the NixOS development host reads a
+`--keys-file` of the spki engine, each spki file of the key store, and
+`verification-spki-file` as PEM `PUBLIC KEY` blocks. Observed on 2026-10-25:
+
+- The tool removes the leading and trailing spaces and tabs of a line, then
+  compares the line with a boundary. A boundary line with other text on it is
+  plain text.
+- The label compare is exact and case-sensitive. A block of another label
+  refuses the run with `error: Unexpected label "<label>"`, also beside a valid
+  `PUBLIC KEY` block.
+- A BEGIN line with no END line refuses the run with `PEM trailer not found`.
+  A file with CR line ends only gives the same error.
+- An END label that is not the BEGIN label refuses the run with `Unmatched PEM
+  header`. An END line and a BEGIN line on one line give the same error.
+- Base64 lines and other text outside the blocks are ignored.
+- A BEGIN line in a block: the tool reads the body lines before the inner
+  BEGIN line as the block.
+- The tool reads a body of any line width, with blank lines, white space in a
+  body line, characters that are not base64, and data after the padding.
+- A `PUBLIC KEY` block that does not decode: the tool loads the file and fails
+  when a verify reaches the key of that block. The result depends on the order
+  of the keys.
+- An empty `--keys-file`, or a file of white space only, reports `error:
+  signature: spki: no valid keys in file '<path>'`.
+- A trusted file of the key store with one of the errors above, or with a
+  block of another label, is dropped with no message. The tool loads the other
+  files.
+- A revoked file of the key store with one of these errors revokes no key, or
+  the keys of the blocks before the first error, with no message. A
+  `revoked.spki` of base64 lines revokes no key.
+
+`cli-surface.md`, "P2", `static-delta`, records the port side.
 
 #### `apply-offline`
 

@@ -181,7 +181,12 @@ It is independent of \fB\%sign\-verify\fR.
 One trusted public key of the engine \fB\%ENGINE\fR, in base64.
 .TP
 \fB\%verification\-ENGINE\-file\fR (string)
-A file of trusted public keys of the engine \fB\%ENGINE\fR, one key on each line.
+A file of trusted public keys of the engine \fB\%ENGINE\fR.
+An \fB\%ed25519\fR file holds one base64 key on each line.
+An \fB\%spki\fR file holds PEM \fB\%PUBLIC KEY\fR blocks, and ostrya ignores the text outside the blocks.
+ostrya refuses an \fB\%spki\fR file with a block of another label, a block that does not decode, or no block.
+An empty file, or a file of white space only, adds no keys.
+In an \fB\%spki\fR file, white space is space, horizontal tab, line feed, form feed, and carriage return.
 .SS "TLS and proxy"
 A relative path is relative to the current directory of the command.
 ostrya does not expand \fB\%~\fR.
@@ -744,6 +749,7 @@ It runs these checks after each option replaces the key of its name:
 \fB\%\-\-tls\-client\-ca\fR is given, and \fB\%tls\-cert\fR and \fB\%trusted\-proxy\-client\-cert\fR are not set.
 .SS "Trust keys"
 A trust group takes the remote keys \fB\%gpg\-verify\fR (default false here), \fB\%gpgkeypath\fR, \fB\%sign\-verify\fR, \fB\%verification\-ENGINE\-key\fR, and \fB\%verification\-ENGINE\-file\fR.
+A \fB\%verification\-ENGINE\-file\fR has the form of the remote key: base64 lines for \fB\%ed25519\fR, and PEM \fB\%PUBLIC KEY\fR blocks for \fB\%spki\fR.
 It trusts the keys that it names, and no system key store or keyring.
 A trust group that turns on no check is refused.
 \fB\%gpgkeypath\fR without \fB\%gpg\-verify=true\fR is refused, and so is \fB\%gpg\-verify=true\fR with no \fB\%gpgkeypath\fR.

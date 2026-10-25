@@ -1953,10 +1953,50 @@ is DER-encoded ECDSA: an ASN.1 `SEQUENCE` of the two integers `r` and `s`,
 about 70 to 72 bytes. A public key is the X.509 SubjectPublicKeyInfo DER, the
 base64 body of a PEM `PUBLIC KEY` block. A secret key is base64, and the
 decoded bytes are a PKCS#8 `PrivateKeyInfo` DER, a SEC1 `ECPrivateKey` DER, or
-a raw 32-byte scalar. The key store has the form of the ed25519 store:
+a raw 32-byte scalar. The key store has the layout of the ed25519 store:
 `trusted.spki`, `revoked.spki`, and their `.d` directories under `/etc/ostree`
-and `<datadir>/ostree`, with one base64 SubjectPublicKeyInfo per line. Its
-effective trusted set is also the trusted set minus the revoked set.
+and `<datadir>/ostree`. Its effective trusted set is also the trusted set
+minus the revoked set.
+
+An inline public key, as a positional key of a verify or
+`verification-spki-key`, is the base64 of the SubjectPublicKeyInfo DER.
+
+A public key file holds PEM `PUBLIC KEY` blocks, and each block holds one
+SubjectPublicKeyInfo DER. These files are public key files: each file of the
+key store, a `--keys-file` of a verify, and `verification-spki-file`. The
+rules of a public key file:
+
+- A line ends at LF. One CR at the end of a line is removed, so CRLF line
+  ends are read. A CR at another position is a byte of the line.
+- The reader removes the leading and trailing spaces and tabs of a line, then
+  compares the line with a boundary. A block starts at the line
+  `-----BEGIN LABEL-----` and stops at the line `-----END LABEL-----`, where
+  `LABEL` is not empty. A line with other text is not a boundary line.
+- Text outside the blocks is ignored. The text can hold any byte. A stray END
+  line and a line of base64 text outside a block are also ignored.
+- A body line is not empty and holds no CR. The crate `pem-rfc7468` decodes
+  the body in the form of RFC 7468: lines of 64 base64 characters, the last
+  line shorter or equal, and no headers.
+- An empty file, or a file of white space only, holds no key. White space is
+  space, horizontal tab, LF, form feed, and CR.
+
+The reader refuses the whole file, also when other blocks of the file are
+valid, in these conditions:
+
+- A block has a label other than `PUBLIC KEY`. The label compare is exact and
+  case-sensitive.
+- An END line has a label other than the label of its block.
+- A BEGIN line is in a block.
+- A block has no END line. A file with CR line ends only is one line, so it
+  has no END line.
+- A `PUBLIC KEY` block does not decode, or it holds no public key of the
+  engine.
+- The file is not empty or white space, and holds no block. A file of base64
+  lines is in this group.
+
+A refused file of the key store fails the verify, also a file of the revoked
+set. `conformance/cli-surface.md`, "P2", `static-delta`, records the
+differences from the tool.
 
 Design target: the public ostree documentation gives the public key container
 and the key store layout. The curve, the hash, the DER signature encoding, and

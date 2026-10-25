@@ -2576,7 +2576,9 @@ and `<dir>/superblock/..` names `<dir>`. `verify` and `apply-offline` take
 `spki` in a build that carries the engine, the sign-type rule this section
 states for `commit --sign-type`. `reindex` takes `--to=REV`, which rewrites or
 removes the index file of one target and reads REV by the rule of one half of a
-delta name; the last `--to` wins. Thirty-seven differences stand on `show`,
+delta name; the last `--to` wins. A `--keys-file` and each key-store file of
+the spki engine hold PEM `PUBLIC KEY` blocks (`format-reference.md`, "Signing
+details", "spki"). Forty-three differences stand on `show`,
 `delete`, `list`, `indexes`, `verify`, `apply-offline`, and `reindex`.
 
 - a superblock file over 128 MiB (134217728 bytes). The port refuses it in
@@ -2757,7 +2759,8 @@ delta name; the last `--to` wins. Thirty-seven differences stand on `show`,
   verifies the signature, in either order of the keys. Where no key verifies
   it, the tool names each key in the failure line at exit 1 and writes no
   object;
-- a `verify --keys-file` line of the wrong length beside a valid line. A line
+- an ed25519 `verify --keys-file` line of the wrong length beside a valid
+  line. A line
   of two or more whitespace bytes is a key of 0 bytes and counts as such a
   line. The tool loads the valid lines, prints `Verification OK` or
   `Verification fails`, and then exits 1 with the invalid-key error. The port
@@ -2767,13 +2770,14 @@ delta name; the last `--to` wins. Thirty-seven differences stand on `show`,
   more such lines, the tool writes a GLib warning and names the first line in
   an error that carries the `Invalid ed25519 public key:` prefix twice. The
   port names the first line with the prefix once;
-- a `--keys-file` line of 0 or 1 byte, a lone `\r` included, under `verify`,
+- an ed25519 `--keys-file` line of 0 or 1 byte, a lone `\r` included, under
+  `verify`,
   `sign --verify`, or `summary --verify`. The tool's `verify` and `sign
   --verify` die on `SIGSEGV` after a GLib assertion. The port skips an empty line and a
   lone `\r` line. It refuses any other 1-byte line, whitespace included, at
   exit 1 with `error: Invalid ed25519 public key: Ill-formed input: expected
   32 bytes, got 0 bytes` and nothing on standard output;
-- a key-store line of 0 or 1 byte, under `verify`, `sign --verify`, or
+- an ed25519 key-store line of 0 or 1 byte, under `verify`, `sign --verify`, or
   `summary --verify`. The tool's `verify` and `sign --verify` die on `SIGSEGV`
   after a GLib assertion. The port skips an empty line and a line of whitespace, and
   refuses any other 1-byte line with its strict base64 error;
@@ -2792,13 +2796,52 @@ delta name; the last `--to` wins. Thirty-seven differences stand on `show`,
   opened: Permission denied (os error 13)` and nothing on standard output. The
   port's `sign --verify` and `summary --verify` refuse such a file the same
   way;
-- a key-store line (`--keys-dir` or the system key directories) that does not
+- an ed25519 key-store line (`--keys-dir` or the system key directories) that
+  does not
   decode to a valid key, in the trusted or the revoked set. The tool skips the
   line with a GLib warning and verifies with the other keys. The port refuses
   the run with `error: signature: ed25519 public key must be 32 bytes, got
   <n>` and nothing on standard output. The store reader also decodes strictly,
   where the tool decodes leniently. The port's `sign --verify` and `summary
   --verify` read the store with the same reader;
+- an empty `--keys-file` of the spki engine, or a file of white space only
+  (space, horizontal tab, LF, form feed, and CR), under `verify`,
+  `sign --verify`, or `summary --verify`. The tool refuses the
+  run with `error: signature: spki: no valid keys in file '<path>'`. The port
+  reads the file as no keys, so the run reports `error: signature: spki: no
+  keys loaded` when no other source holds a key. An empty
+  `verification-spki-file` of a remote is the same case: the tool refuses each
+  pull with `error: Failed loading 'spki' keys from '<path>`, and the port
+  adds no keys;
+- an spki key-store file that the reader refuses: a file with no block, a
+  block of another label, a block with no END line, or an END label that is
+  not the BEGIN label. In the trusted set, the tool drops the file with no
+  message and loads the other files. In `revoked.spki` and the files of
+  `revoked.spki.d/`, the tool revokes no key of the file, or the keys of the
+  blocks before the first error, with no message. A `revoked.spki` of base64
+  lines thus revokes nothing. The port refuses the run at exit 1 with an
+  `error: signature:` line that names the file, in the trusted and the
+  revoked set;
+- a BEGIN line in an spki block. The tool reads the body lines before the
+  inner BEGIN line as the block. The port refuses the file;
+- an spki `PUBLIC KEY` block that does not decode: a body that is not a key
+  DER, a header line, text that is not base64, or an empty body. The tool
+  loads the file and fails when a verify reaches the key of that block, so
+  the result depends on the order of the keys. The port refuses the file
+  when it loads the keys;
+- the body form of an spki `PUBLIC KEY` block. The tool reads a body of any
+  line width, with blank lines, white space in a body line, characters that
+  are not base64, and data after the padding. The port refuses a body line
+  that is empty, or that holds a CR after it removes the one CR at the end of
+  the line. The crate `pem-rfc7468` then decodes the body in the form of RFC
+  7468: lines of 64 base64 characters, the last line shorter or equal, and no
+  headers. The port refuses each other body;
+- the wording of the refusal of an spki key file. The tool writes `error:
+  signature: spki: no valid keys in file '<path>'` for a `--keys-file` with no
+  block, and `error: Unexpected label "<label>"` for a block of another label.
+  The port writes `error: signature: the key file '<path>' holds no PEM
+  PUBLIC KEY block` and `error: signature: the key file '<path>', line <n>:
+  unexpected label "<label>"`. Both exit 1 with nothing on standard output;
 - `--keys-dir` naming a regular file, under `verify`, `sign --verify`, or
   `summary --verify`. The tool's `verify` and `sign --verify` report `error:
   signature: ed25519: no keys loaded`, and a later `--keys-dir` replaces the
@@ -3461,8 +3504,11 @@ judged before revocation (`cli-behavior.md`, "CLI output formats",
 `static-delta`, "Key sources"). Over a commit either implementation signed,
 the verdict and the exit status agree for these rules, and so do the refusals
 `no keys loaded`, `File object '<path>' is not a regular file`, and `no valid
-keys in file '<path>'`, byte for byte. The key-file entries under `static-delta`
-above also hold for `sign --verify`. Nine differences stand.
+keys in file '<path>'` of `ed25519`, byte for byte. Under `spki`, a
+`--keys-file` and each key-store file hold PEM `PUBLIC KEY` blocks, the form
+that the `ostree` 2026.1 build with OpenSSL on the NixOS development host
+reads. The key-file entries under `static-delta` above, the spki entries
+included, also hold for `sign --verify`. Nine differences stand.
 
 - the verdict report. The exit status agrees. The two reports part as
   follows:

@@ -868,13 +868,7 @@ fn read_sign_keys(
         keys.trusted.push(base64::decode(inline.trim())?);
     }
     if let Some(path) = path {
-        for line in read_verification_file(engine, &path)?.lines() {
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            keys.trusted.push(base64::decode(line)?);
-        }
+        keys.trusted.extend(read_verification_file(engine, &path)?);
     }
     if system {
         let store = load_sign_keys(engine)?;
@@ -928,14 +922,19 @@ fn read_keyring_blocking(repo_fd: BorrowedFd<'_>, name: &str) -> Result<Option<V
     read_keyring_fd(fd, name).map(Some)
 }
 
-/// Reads one `verification-<engine>-file`, up to [`MAX_KEY_FILE`] bytes, under
-/// the rule that [`read_key_source`] states.
+/// Reads the keys of one `verification-<engine>-file`, up to [`MAX_KEY_FILE`]
+/// bytes, under the rule that [`read_key_source`] states.
 ///
 /// The function opens the path once and reads it through the ceiling, so the
 /// keys come from the bytes that the ceiling admits. It refuses a file of
 /// another kind, a file over the ceiling, and a file that it cannot read. Each
 /// error names the file, so an operator can find the entry that names it.
-fn read_verification_file(engine: &str, path: &str) -> Result<String> {
+///
+/// A file of the spki engine holds PEM `PUBLIC KEY` blocks, which
+/// `spki_public_keys` reads. An empty file adds no keys. A file of another
+/// engine holds one base64 key on each line, and the function skips a line of
+/// white space only.
+fn read_verification_file(engine: &str, path: &str) -> Result<Vec<Vec<u8>>> {
     let subject = format!("the '{engine}' key file '{path}'");
     // `NONBLOCK` makes a fifo answer the open at once. Without it, the open
     // waits for a writer. On a regular file, the flag has no effect on the
@@ -946,10 +945,19 @@ fn read_verification_file(engine: &str, path: &str) -> Result<String> {
         Mode::empty(),
     )
     .map_err(|e| Error::Signature(format!("{subject} cannot be read: {e}")))?;
-    Ok(key_text(
-        read_key_source(std::fs::File::from(fd), &subject, MAX_KEY_FILE)?,
-        &subject,
-    )?)
+    let bytes = read_key_source(std::fs::File::from(fd), &subject, MAX_KEY_FILE)?;
+    #[cfg(feature = "sign-spki")]
+    if engine == "spki" {
+        return Ok(crate::spki::spki_public_keys(&bytes, &subject)?);
+    }
+    let mut keys = Vec::new();
+    for line in key_text(bytes, &subject)?.lines() {
+        let line = line.trim();
+        if !line.is_empty() {
+            keys.push(base64::decode(line)?);
+        }
+    }
+    Ok(keys)
 }
 
 #[cfg(test)]
@@ -1333,6 +1341,105 @@ mod tests {
                 && m.contains("regular file")),
             "{err}"
         );
+    }
+
+    /// A `verification-spki-file` holds PEM `PUBLIC KEY` blocks. A file of
+    /// base64 lines is refused by its name. An empty file adds no keys, so the
+    /// engine has no key.
+    #[cfg(feature = "sign-spki")]
+    #[test]
+    fn an_spki_key_file_holds_pem_blocks() {
+        const SPKI_B64: &str = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE8X83xylD3ibci0xjFKMR4bwUtTU/\
+                                YLloVEDxomUS2SHAfFnN3LHVVNYjok0Zm2RiiU7XpDnRAG1Ua8eR8SKbLQ==";
+        let dir = std::env::temp_dir().join(format!(
+            "ostrya-verify-spkifile-{}-{}",
+            std::process::id(),
+            crate::write::unique()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let write = |name: &str, text: &str| {
+            let path = dir.join(name);
+            std::fs::write(&path, text).unwrap();
+            path.display().to_string()
+        };
+        let pem = write(
+            "pem",
+            &format!(
+                "-----BEGIN PUBLIC KEY-----\n{}\n{}\n-----END PUBLIC KEY-----\n",
+                &SPKI_B64[..64],
+                &SPKI_B64[64..]
+            ),
+        );
+        let lines = write("lines", &format!("{SPKI_B64}\n"));
+        let empty = write("empty", "");
+        let read = |path: &str| read_sign_keys("spki", None, Some(path.to_owned()), false);
+        let by_pem = read(&pem);
+        let by_lines = read(&lines);
+        let by_empty = read(&empty);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let keys = by_pem.unwrap().expect("the PEM file holds a key");
+        assert_eq!(keys.trusted, [base64::decode(SPKI_B64).unwrap()]);
+        let err = by_lines.expect_err("a file of base64 lines has to be refused");
+        assert!(
+            matches!(&err, Error::Signature(m) if m.ends_with(&format!(
+                "the 'spki' key file '{lines}' holds no PEM PUBLIC KEY block"
+            ))),
+            "{err}"
+        );
+        assert!(by_empty.unwrap().is_none());
+    }
+
+    /// An inline `verification-spki-key` and a PEM `verification-spki-file`
+    /// add their keys together. A signature of each key verifies.
+    #[cfg(feature = "sign-spki")]
+    #[test]
+    fn an_spki_inline_key_and_key_file_are_both_trusted() {
+        use crate::sign::Signer;
+        use crate::spki::SpkiSigner;
+
+        let inline = SpkiSigner::from_secret_key(&[7; 32]).unwrap();
+        let in_file = SpkiSigner::from_secret_key(&[9; 32]).unwrap();
+        let b64 = base64::encode(&in_file.public_key_der());
+        let lines: Vec<&str> = b64
+            .as_bytes()
+            .chunks(64)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect();
+        let dir = std::env::temp_dir().join(format!(
+            "ostrya-verify-spkiboth-{}-{}",
+            std::process::id(),
+            crate::write::unique()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pem");
+        std::fs::write(
+            &path,
+            format!(
+                "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----\n",
+                lines.join("\n")
+            ),
+        )
+        .unwrap();
+        let read = read_sign_keys(
+            "spki",
+            Some(base64::encode(&inline.public_key_der())),
+            Some(path.display().to_string()),
+            false,
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        let keys = read.unwrap().expect("both sources hold a key");
+        assert_eq!(
+            keys.trusted,
+            [inline.public_key_der(), in_file.public_key_der()]
+        );
+        let verifier = build_verifier(Engine::Spki, keys).unwrap().unwrap();
+        for signer in [&inline, &in_file] {
+            let signature = ostrya_rt::block_on(signer.sign(PAYLOAD)).unwrap();
+            let outcome = ostrya_rt::block_on(verifier.verify(PAYLOAD, &[signature])).unwrap();
+            assert!(outcome.valid);
+        }
     }
 
     /// The trust source reads the `verification-*` keys of its group. The

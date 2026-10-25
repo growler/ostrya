@@ -4081,6 +4081,145 @@ fn sign_verify_spki_selects_the_engine() {
     assert!(verified.stdout_trimmed().contains("verification OK"));
 }
 
+/// The spki key files of a verify hold PEM `PUBLIC KEY` blocks:
+///
+/// - `sign --verify --keys-file` and `summary --verify --keys-file` verify
+///   with the key of a PEM file.
+/// - A file of base64 lines, and a file with a `PRIVATE KEY` block, refuse the
+///   run of each command.
+/// - An empty file adds no keys, so the run of each command has no key.
+/// - `--keys-dir` reads a PEM `trusted.spki`.
+#[cfg(feature = "spki")]
+#[test]
+fn spki_verify_key_files_hold_pem_blocks() {
+    const SECRET_PKCS8_B64: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg2L708EsnnzHER0SYasMNIUcGv63QapC/3kVsoPerzKGhRANCAATxfzfHKUPeJtyLTGMUoxHhvBS1NT9guWhUQPGiZRLZIcB8Wc3csdVU1iOiTRmbZGKJTtekOdEAbVRrx5HxIpst";
+    const PUBLIC_SPKI_B64: &str = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE8X83xylD3ibci0xjFKMR4bwUtTU/YLloVEDxomUS2SHAfFnN3LHVVNYjok0Zm2RiiU7XpDnRAG1Ua8eR8SKbLQ==";
+    let pem = |label: &str, b64: &str| {
+        let lines: Vec<&str> = b64
+            .as_bytes()
+            .chunks(64)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect();
+        format!(
+            "-----BEGIN {label}-----\n{}\n-----END {label}-----\n",
+            lines.join("\n")
+        )
+    };
+
+    let tmp = TmpDir::new("sign-spki-pem");
+    let base = tmp.path();
+    let repo = commit_fixture(base);
+    let repo_s = repo.to_str().unwrap();
+    let repo_arg = format!("--repo={repo_s}");
+    let sign = format!("--sign={SECRET_PKCS8_B64}");
+    ostrya(
+        &[
+            "sign",
+            "--repo",
+            repo_s,
+            "-s",
+            "spki",
+            COMMIT,
+            SECRET_PKCS8_B64,
+        ],
+        None,
+        &[],
+    )
+    .ok();
+    ostrya(
+        &[
+            "summary",
+            &repo_arg,
+            "-u",
+            "--last-modified=1700000000",
+            "--sign-type=spki",
+            &sign,
+        ],
+        None,
+        &[],
+    )
+    .ok();
+
+    let file = |name: &str, text: &str| {
+        let path = base.join(name);
+        std::fs::write(&path, text).unwrap();
+        path.display().to_string()
+    };
+    let public = file("public.pem", &pem("PUBLIC KEY", PUBLIC_SPKI_B64));
+    let lines = file("public.lines", &format!("{PUBLIC_SPKI_B64}\n"));
+    let private = file(
+        "mixed.pem",
+        &format!(
+            "{}{}",
+            pem("PUBLIC KEY", PUBLIC_SPKI_B64),
+            pem("PRIVATE KEY", SECRET_PKCS8_B64)
+        ),
+    );
+    let empty = file("empty", "");
+    let keys_dir = base.join("keys");
+    std::fs::create_dir(&keys_dir).unwrap();
+    std::fs::write(
+        keys_dir.join("trusted.spki"),
+        pem("PUBLIC KEY", PUBLIC_SPKI_B64),
+    )
+    .unwrap();
+
+    let sign_verify = |option: String| {
+        ostrya(
+            &["sign", &repo_arg, "--verify", "-s", "spki", &option, COMMIT],
+            None,
+            &[],
+        )
+    };
+    let summary_verify = |option: String| {
+        ostrya(
+            &[
+                "summary",
+                &repo_arg,
+                "--verify",
+                "--sign-type=spki",
+                &option,
+            ],
+            None,
+            &[],
+        )
+    };
+    for run in [
+        sign_verify(format!("--keys-file={public}")),
+        sign_verify(format!("--keys-dir={}", keys_dir.display())),
+        summary_verify(format!("--keys-file={public}")),
+    ] {
+        run.ok();
+        assert_eq!(run.stdout_trimmed(), "signature 1: good\nverification OK");
+    }
+    for (path, stderr) in [
+        (
+            &lines,
+            format!("error: signature: the key file '{lines}' holds no PEM PUBLIC KEY block\n"),
+        ),
+        (
+            &private,
+            format!(
+                "error: signature: the key file '{private}', line 5: unexpected label \
+                 \"PRIVATE KEY\"\n"
+            ),
+        ),
+        (
+            &empty,
+            "error: signature: spki: no keys loaded\n".to_owned(),
+        ),
+    ] {
+        for run in [
+            sign_verify(format!("--keys-file={path}")),
+            summary_verify(format!("--keys-file={path}")),
+        ] {
+            assert_eq!(run.status.code(), Some(1), "{path}");
+            assert!(run.stdout.is_empty(), "{path}");
+            assert_eq!(String::from_utf8_lossy(&run.stderr), stderr, "{path}");
+        }
+    }
+}
+
 #[cfg(feature = "gpg")]
 #[test]
 fn sign_verify_delete_gpg() {
@@ -35504,7 +35643,10 @@ fn static_delta_verify_refuses_invalid_keys_before_output() {
 /// - The last `--sign-type` wins.
 ///
 /// A build with the `spki` engine verifies a delta that ostrya signs with
-/// this engine.
+/// this engine. Its `--keys-file` holds PEM `PUBLIC KEY` blocks. A file of
+/// base64 lines and a file with a `CERTIFICATE` block are refused, and an
+/// empty file adds no keys. `apply-offline` reads its `--keys-file` by the
+/// same rule.
 #[test]
 fn static_delta_verify_sign_types() {
     let tmp = TmpDir::new("delta-verify-types");
@@ -35591,6 +35733,95 @@ fn static_delta_verify_sign_types() {
             "Verification fails\n",
             "error: no signature for 'ostree.sign.spki' in static-delta superblock\n",
             "spki over an ed25519-signed delta",
+        );
+
+        // A `--keys-file` of the spki engine holds PEM `PUBLIC KEY` blocks. A
+        // file of base64 lines is refused before the superblock is read.
+        let pem = base.join("public.pem");
+        std::fs::write(
+            &pem,
+            format!(
+                "-----BEGIN PUBLIC KEY-----\n{}\n{}\n-----END PUBLIC KEY-----\n",
+                &PUBLIC_SPKI_B64[..64],
+                &PUBLIC_SPKI_B64[64..]
+            ),
+        )
+        .unwrap();
+        let pem_arg = format!("--keys-file={}", pem.display());
+        assert_verify_run(
+            &run(&["--sign-type=spki", &pem_arg, superblock]),
+            0,
+            "Verification OK\n",
+            "",
+            "spki PEM keys file",
+        );
+        let lines = base.join("public.lines");
+        std::fs::write(&lines, format!("{PUBLIC_SPKI_B64}\n")).unwrap();
+        let lines_arg = format!("--keys-file={}", lines.display());
+        assert_verify_run(
+            &run(&["--sign-type=spki", &lines_arg, superblock]),
+            1,
+            "",
+            &format!(
+                "error: signature: the key file '{}' holds no PEM PUBLIC KEY block\n",
+                lines.display()
+            ),
+            "spki keys file of base64 lines",
+        );
+        let empty = base.join("empty.pem");
+        std::fs::write(&empty, "").unwrap();
+        let empty_arg = format!("--keys-file={}", empty.display());
+        assert_verify_run(
+            &run(&["--sign-type=spki", &empty_arg, superblock]),
+            1,
+            "",
+            "error: signature: spki: no keys loaded\n",
+            "empty spki keys file",
+        );
+        let other = base.join("other.pem");
+        std::fs::write(
+            &other,
+            format!(
+                "-----BEGIN PUBLIC KEY-----\n{}\n{}\n-----END PUBLIC KEY-----\n\
+                 -----BEGIN CERTIFICATE-----\n{}\n{}\n-----END CERTIFICATE-----\n",
+                &PUBLIC_SPKI_B64[..64],
+                &PUBLIC_SPKI_B64[64..],
+                &PUBLIC_SPKI_B64[..64],
+                &PUBLIC_SPKI_B64[64..]
+            ),
+        )
+        .unwrap();
+        let other_arg = format!("--keys-file={}", other.display());
+        assert_verify_run(
+            &run(&["--sign-type=spki", &other_arg, superblock]),
+            1,
+            "",
+            &format!(
+                "error: signature: the key file '{}', line 5: unexpected label \
+                 \"CERTIFICATE\"\n",
+                other.display()
+            ),
+            "spki keys file with a CERTIFICATE block",
+        );
+
+        // `apply-offline` reads its spki `--keys-file` by the same rule.
+        assert_apply_cases(
+            base,
+            COMMIT,
+            &[
+                (
+                    &["--sign-type=spki", "--keys-file=public.pem", "spki"],
+                    ApplyOutcome::Applied,
+                ),
+                (
+                    &["--sign-type=spki", "--keys-file=public.lines", "spki"],
+                    ApplyOutcome::Refused(
+                        "error: signature: the key file 'public.lines' holds no PEM PUBLIC KEY \
+                         block\n"
+                            .to_owned(),
+                    ),
+                ),
+            ],
         );
     }
 }

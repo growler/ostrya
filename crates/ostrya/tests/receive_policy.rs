@@ -591,6 +591,71 @@ fn a_trust_group_needs_readable_keys() {
     .unwrap();
 }
 
+/// The `verification-spki-file` of a trust group holds PEM `PUBLIC KEY`
+/// blocks. A file of base64 lines, and a file with a block of another label,
+/// are refused by their names. An empty file adds no keys.
+#[cfg(feature = "sign-spki")]
+#[test]
+fn a_trust_group_spki_file_holds_pem_blocks() {
+    const SPKI_B64: &str = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE8X83xylD3ibci0xjFKMR4bwUtTU/\
+                            YLloVEDxomUS2SHAfFnN3LHVVNYjok0Zm2RiiU7XpDnRAG1Ua8eR8SKbLQ==";
+    let dir = TmpDir::new("receive-spki-keyfile");
+    let pem = dir.path().join("keys.pem");
+    std::fs::write(
+        &pem,
+        format!(
+            "-----BEGIN PUBLIC KEY-----\n{}\n{}\n-----END PUBLIC KEY-----\n",
+            &SPKI_B64[..64],
+            &SPKI_B64[64..]
+        ),
+    )
+    .unwrap();
+    let trust = |file: &Path| {
+        format!(
+            "[ex-ostrya trust \"t\"]\nsign-verify=spki\nverification-spki-file={}\n",
+            file.display()
+        )
+    };
+    policy_with(dir.path(), "", &trust(&pem)).unwrap();
+    let lines = dir.path().join("keys.spki");
+    std::fs::write(&lines, format!("{SPKI_B64}\n")).unwrap();
+    let err = refusal(&trust(&lines));
+    assert!(
+        matches!(&err, Error::Signature(m)
+            if m.contains(&format!("'{}' holds no PEM PUBLIC KEY block", lines.display()))),
+        "{err}"
+    );
+    // An empty file adds no keys, so the group has no key.
+    let empty = dir.path().join("empty.spki");
+    std::fs::write(&empty, "").unwrap();
+    let err = refusal(&trust(&empty));
+    assert!(
+        matches!(&err, Error::Signature(m)
+            if m.contains("no trusted key for signature engine 'spki'")),
+        "{err}"
+    );
+    // A block of another label refuses the file by its name.
+    let certificate = dir.path().join("certificate.spki");
+    std::fs::write(
+        &certificate,
+        format!(
+            "-----BEGIN CERTIFICATE-----\n{}\n{}\n-----END CERTIFICATE-----\n",
+            &SPKI_B64[..64],
+            &SPKI_B64[64..]
+        ),
+    )
+    .unwrap();
+    let err = refusal(&trust(&certificate));
+    assert!(
+        matches!(&err, Error::Signature(m)
+        if m.contains(&format!(
+            "'{}', line 1: unexpected label \"CERTIFICATE\"",
+            certificate.display()
+        ))),
+        "{err}"
+    );
+}
+
 /// The verification keys of a remote do not reach a trust group.
 #[test]
 fn a_remote_key_is_not_a_trust_group_key() {

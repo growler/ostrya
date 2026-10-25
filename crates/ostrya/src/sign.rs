@@ -369,13 +369,18 @@ const SYSTEM_KEY_ROOTS: [&str; 2] = ["/etc/ostree", "/usr/share/ostree"];
 /// The errors of [`load_sign_keys_from`]:
 ///
 /// - [`Error::Signature`] if a key file cannot be opened or read, is not a
-///   regular file, is larger than [`MAX_KEY_FILE`], or is not valid UTF-8.
-/// - [`Error::Core`] if a line of a key file is not valid base64.
+///   regular file, or is larger than [`MAX_KEY_FILE`].
+/// - [`Error::Signature`] if an ed25519 key file is not valid UTF-8, or if
+///   the reader of PEM `PUBLIC KEY` blocks refuses an spki key file.
+/// - [`Error::Core`] if a line of an ed25519 key file is not valid base64.
 /// - [`Error::Io`] if a `.d` directory cannot be read.
+/// - [`Error::Unsupported`] if `sign_type` is `spki` and the build has no
+///   `sign-spki` feature.
 ///
 /// [`Error::Signature`]: crate::Error::Signature
 /// [`Error::Core`]: crate::Error::Core
 /// [`Error::Io`]: crate::Error::Io
+/// [`Error::Unsupported`]: crate::Error::Unsupported
 pub fn load_sign_keys(sign_type: &str) -> crate::Result<SignKeys> {
     let roots: Vec<PathBuf> = SYSTEM_KEY_ROOTS.iter().map(PathBuf::from).collect();
     let refs: Vec<&Path> = roots.iter().map(PathBuf::as_path).collect();
@@ -460,8 +465,16 @@ impl FromSystemKeys for crate::spki::SpkiVerifier {
 /// a symlink to a regular file. The call follows a symlink at `trusted.<type>`
 /// or `revoked.<type>`.
 ///
-/// Each line of a file holds one base64 key. The call skips an empty line and
-/// a line of white space only. Each other line must decode.
+/// The form of a file depends on `sign_type`:
+///
+/// - `spki`: the file holds PEM `PUBLIC KEY` blocks. The function
+///   `spki_public_keys` of the `spki` module reads the file and states the
+///   rules. An empty file, or a file of white space only, adds no keys. Each
+///   other file that the reader refuses fails the call, also a file of the
+///   revoked set.
+/// - Each other type: each line of a file holds one base64 key. The call skips
+///   an empty line and a line of white space only. Each other line must
+///   decode.
 ///
 /// The call reads each file with [`read_key_source`]: only a regular file, and
 /// only up to [`MAX_KEY_FILE`] bytes. The error for a file names that file.
@@ -471,29 +484,47 @@ impl FromSystemKeys for crate::spki::SpkiVerifier {
 /// - [`Error::Signature`] with the message
 ///   `the key file '<path>' cannot be opened: <e>` if the open of a file fails
 ///   for a reason other than a missing file.
-/// - [`Error::Signature`] if a file cannot be read, is not a regular file, is
-///   larger than [`MAX_KEY_FILE`], or is not valid UTF-8.
-///   [`read_key_source`] and [`key_text`] give the messages.
-/// - [`Error::Core`] if a line is not valid base64.
+/// - [`Error::Signature`] if a file cannot be read, is not a regular file, or
+///   is larger than [`MAX_KEY_FILE`]. [`read_key_source`] gives the messages.
+/// - [`Error::Signature`] if a file of a type other than `spki` is not valid
+///   UTF-8. [`key_text`] gives the message.
+/// - [`Error::Signature`] if `spki_public_keys` refuses an `spki` file.
+/// - [`Error::Core`] if a line of a file of a type other than `spki` is not
+///   valid base64.
 /// - [`Error::Io`] if a `.d` directory cannot be read, or if it is not a
 ///   directory.
+/// - [`Error::Unsupported`] if `sign_type` is `spki` and the build has no
+///   `sign-spki` feature.
 ///
 /// [`Error::Signature`]: crate::Error::Signature
 /// [`Error::Core`]: crate::Error::Core
 /// [`Error::Io`]: crate::Error::Io
+/// [`Error::Unsupported`]: crate::Error::Unsupported
 pub fn load_sign_keys_from(roots: &[&Path], sign_type: &str) -> crate::Result<SignKeys> {
+    #[cfg(not(feature = "sign-spki"))]
+    if sign_type == "spki" {
+        return Err(crate::Error::Unsupported(
+            "the spki key store needs the feature 'sign-spki'".into(),
+        ));
+    }
     let mut keys = SignKeys::default();
     for root in roots {
-        collect_keys(root, &format!("trusted.{sign_type}"), &mut keys.trusted)?;
-        collect_keys(root, &format!("revoked.{sign_type}"), &mut keys.revoked)?;
+        collect_keys(root, sign_type, "trusted", &mut keys.trusted)?;
+        collect_keys(root, sign_type, "revoked", &mut keys.revoked)?;
     }
     Ok(keys)
 }
 
-/// Reads the keys of `<root>/<base>` and of each regular file in
-/// `<root>/<base>.d/` into `out`.
-fn collect_keys(root: &Path, base: &str, out: &mut Vec<Vec<u8>>) -> crate::Result<()> {
-    read_key_lines(&root.join(base), out)?;
+/// Reads the keys of `<root>/<set>.<sign_type>` and of each regular file in
+/// `<root>/<set>.<sign_type>.d/` into `out`.
+fn collect_keys(
+    root: &Path,
+    sign_type: &str,
+    set: &str,
+    out: &mut Vec<Vec<u8>>,
+) -> crate::Result<()> {
+    let base = format!("{set}.{sign_type}");
+    read_store_file(&root.join(&base), sign_type, out)?;
     let dir = root.join(format!("{base}.d"));
     let entries = match std::fs::read_dir(&dir) {
         Ok(entries) => entries,
@@ -509,20 +540,29 @@ fn collect_keys(root: &Path, base: &str, out: &mut Vec<Vec<u8>>) -> crate::Resul
     }
     files.sort();
     for file in files {
-        read_key_lines(&file, out)?;
+        read_store_file(&file, sign_type, out)?;
     }
     Ok(())
 }
 
 /// Reads the keys of one key file of the store into `out`.
 ///
-/// The file holds one base64 key on each line. The read obeys the rules of
-/// [`read_key_source`]. A missing file is not an error.
-fn read_key_lines(path: &Path, out: &mut Vec<Vec<u8>>) -> crate::Result<()> {
+/// A file of the spki engine holds PEM `PUBLIC KEY` blocks, which
+/// `spki_public_keys` reads. A file of
+/// another engine holds one base64 key on each line. The read obeys the rules
+/// of [`read_key_source`]. A missing file is not an error.
+fn read_store_file(path: &Path, sign_type: &str, out: &mut Vec<Vec<u8>>) -> crate::Result<()> {
     let subject = format!("the key file '{}'", path.display());
     let Some(bytes) = read_key_path(path, &subject, MAX_KEY_FILE)? else {
         return Ok(());
     };
+    #[cfg(feature = "sign-spki")]
+    if sign_type == "spki" {
+        out.extend(crate::spki::spki_public_keys(&bytes, &subject)?);
+        return Ok(());
+    }
+    #[cfg(not(feature = "sign-spki"))]
+    let _ = sign_type;
     for line in key_text(bytes, &subject)?.lines() {
         let line = line.trim();
         if line.is_empty() {

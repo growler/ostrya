@@ -38,14 +38,14 @@ The engine selects the key format and the \%detached\-metadata key that holds th
 \fB\-\-keys\-file\fR \fIPATH\fR
 Read keys from a file.
 .IP
-For \%ed25519 and spki, the file has \%base64 keys, one per line: secret keys to sign, public keys to verify and delete. Signing and delete read every file. For an \%ed25519 or spki verify, the last value wins. With this option or a \%KEY\-ID, that verify does not read \%\-\-keys\-dir or the system key directories.
+For \%ed25519, the file has \%base64 keys, one per line: secret keys to sign, public keys to verify and delete. For spki, the file has \%base64 keys, one per line, to sign and delete, and PEM \fB\%PUBLIC KEY\fR blocks to verify. Signing and delete read every file. For an \%ed25519 or spki verify, the last value wins. With this option or a \%KEY\-ID, that verify does not read \%\-\-keys\-dir or the system key directories.
 .IP
 For gpg, the file is a binary or armored keyring for verify and delete, and every file is read. These keyrings then replace the global trusted set and the keyrings of \%\-\-remote. A gpg signing run refuses this option.
 .TP
 \fB\-\-keys\-dir\fR \fIPATH\fR
 Read the keys of an \%ed25519 or spki verify from this directory.
 .IP
-The verify reads \fB\%trusted.<type>\fR, \fB\%revoked.<type>\fR, and the files in \fB\%trusted.<type>.d/\fR and \fB\%revoked.<type>.d/\fR\&. It then does not read the system key directories \fB\%/etc/ostree\fR and \fB\%/usr/share/ostree\fR\&. If the option occurs more than once, the last value wins. An empty value names the working directory. The gpg engine refuses this option.
+The verify reads \fB\%trusted.<type>\fR, \fB\%revoked.<type>\fR, and the files in \fB\%trusted.<type>.d/\fR and \fB\%revoked.<type>.d/\fR\&. It then does not read the system key directories \fB\%/etc/ostree\fR and \fB\%/usr/share/ostree\fR\&. An \%ed25519 file has one \%base64 key per line, and an spki file has PEM \fB\%PUBLIC KEY\fR blocks. If the option occurs more than once, the last value wins. An empty value names the working directory. The gpg engine refuses this option.
 .TP
 \fB\-\-gpg\-homedir\fR \fIGPG_HOMEDIR\fR
 The GnuPG home directory where gpg resolves signing keys.

@@ -1860,6 +1860,7 @@ dependencies = [
  "ostrya-core",
  "ostrya-rt",
  "p256",
+ "pem-rfc7468",
  "thiserror",
 ]
 

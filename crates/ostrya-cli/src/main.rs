@@ -70,7 +70,7 @@ use ostrya::{
 #[cfg(feature = "gpg")]
 use ostrya::{GpgSigner, GpgVerifier, SignatureInfo};
 #[cfg(feature = "spki")]
-use ostrya::{SpkiSigner, SpkiVerifier};
+use ostrya::{SpkiSigner, SpkiVerifier, spki_public_keys};
 
 use pcre2::bytes::{CaptureLocations, RegexBuilder};
 
@@ -2528,9 +2528,11 @@ struct SignArgs {
     sign_type: SignType,
     /// Read keys from a file.
     ///
-    /// For ed25519 and spki, the file has base64 keys, one per line: secret
-    /// keys to sign, public keys to verify and delete. Signing and delete read
-    /// every file. For an ed25519 or spki verify, the last value wins. With
+    /// For ed25519, the file has base64 keys, one per line: secret keys to
+    /// sign, public keys to verify and delete. For spki, the file has base64
+    /// keys, one per line, to sign and delete, and PEM `PUBLIC KEY` blocks to
+    /// verify. Signing and delete read every file. For an ed25519 or spki
+    /// verify, the last value wins. With
     /// this option or a KEY-ID, that verify does not read --keys-dir or the
     /// system key directories.
     ///
@@ -2543,9 +2545,11 @@ struct SignArgs {
     ///
     /// The verify reads `trusted.<type>`, `revoked.<type>`, and the files in
     /// `trusted.<type>.d/` and `revoked.<type>.d/`. It then does not read the
-    /// system key directories `/etc/ostree` and `/usr/share/ostree`. If the
-    /// option occurs more than once, the last value wins. An empty value names
-    /// the working directory. The gpg engine refuses this option.
+    /// system key directories `/etc/ostree` and `/usr/share/ostree`. An
+    /// ed25519 file has one base64 key per line, and an spki file has PEM
+    /// `PUBLIC KEY` blocks. If the option occurs more than once, the last
+    /// value wins. An empty value names the working directory. The gpg engine
+    /// refuses this option.
     #[arg(long, value_name = "PATH", overrides_with = "keys_dir")]
     keys_dir: Option<std::ffi::OsString>,
     /// The GnuPG home directory where gpg resolves signing keys.
@@ -2720,9 +2724,11 @@ struct SummaryArgs {
     ///
     /// The verify reads `trusted.<type>`, `revoked.<type>`, and the files in
     /// `trusted.<type>.d/` and `revoked.<type>.d/`. It then does not read the
-    /// system key directories `/etc/ostree` and `/usr/share/ostree`. If the
-    /// option occurs more than once, the last value wins. An empty value names
-    /// the working directory. A gpg verify refuses this option.
+    /// system key directories `/etc/ostree` and `/usr/share/ostree`. An
+    /// ed25519 file has one base64 key per line, and an spki file has PEM
+    /// `PUBLIC KEY` blocks. If the option occurs more than once, the last
+    /// value wins. An empty value names the working directory. A gpg verify
+    /// refuses this option.
     #[arg(long, value_name = "PATH", overrides_with = "keys_dir")]
     keys_dir: Option<std::ffi::OsString>,
     /// The GnuPG home directory where gpg resolves signing keys.
@@ -2861,11 +2867,12 @@ struct DeltaVerifyArgs {
     /// included. If the option occurs more than once, the last value wins.
     #[arg(long = "sign-type", value_name = "NAME", overrides_with = "sign_type")]
     sign_type: Option<String>,
-    /// Read public keys from a file, one base64 key per line.
+    /// Read public keys from a file.
     ///
-    /// If the option occurs more than once, the last value wins. With this
-    /// option or a KEY-ID, the command does not read --keys-dir or the system
-    /// key directories. The path must name a regular file of 1 MiB or less.
+    /// For ed25519, the file has one base64 key per line. For spki, it has PEM
+    /// `PUBLIC KEY` blocks. If the option occurs more than once, the last value
+    /// wins. With this option or a KEY-ID, the command does not read --keys-dir
+    /// or the system key directories. The path must name a regular file of 1 MiB or less.
     /// The command takes an empty value as given, and refuses it because it is
     /// not a regular file.
     #[arg(long, value_name = "PATH", overrides_with = "keys_file")]
@@ -2874,8 +2881,9 @@ struct DeltaVerifyArgs {
     ///
     /// The command also reads the files in `trusted.<type>.d/` and
     /// `revoked.<type>.d/`. It then does not read the system key directories.
-    /// If the option occurs more than once, the last value wins. An empty value
-    /// names the working directory.
+    /// An ed25519 file has one base64 key per line, and an spki file has PEM
+    /// `PUBLIC KEY` blocks. If the option occurs more than once, the last value
+    /// wins. An empty value names the working directory.
     #[arg(long, value_name = "PATH", overrides_with = "keys_dir")]
     keys_dir: Option<std::ffi::OsString>,
     // ostrya checks this operand after the repository resolves.
@@ -2899,18 +2907,21 @@ struct DeltaApplyArgs {
     /// occurs more than once, the last value wins.
     #[arg(long = "sign-type", value_name = "NAME", overrides_with = "sign_type")]
     sign_type: Option<String>,
-    /// Read public keys from a file, one base64 key per line.
+    /// Read public keys from a file.
     ///
-    /// If the option occurs more than once, the last value wins. With this
-    /// option or a KEY-ID, the command does not read --keys-dir. The path must
+    /// For ed25519, the file has one base64 key per line. For spki, it has PEM
+    /// `PUBLIC KEY` blocks. If the option occurs more than once, the last value
+    /// wins. With this option or a KEY-ID, the command does not read
+    /// --keys-dir. The path must
     /// name a regular file of 1 MiB or less.
     #[arg(long, value_name = "PATH", overrides_with = "keys_file")]
     keys_file: Option<std::ffi::OsString>,
     /// Read `trusted.<type>` and `revoked.<type>` from this directory.
     ///
     /// The command also reads the files in `trusted.<type>.d/` and
-    /// `revoked.<type>.d/`. If the option occurs more than once, the last value
-    /// wins. An empty value names the working directory.
+    /// `revoked.<type>.d/`. An ed25519 file has one base64 key per line, and an
+    /// spki file has PEM `PUBLIC KEY` blocks. If the option occurs more than
+    /// once, the last value wins. An empty value names the working directory.
     #[arg(long, value_name = "PATH", overrides_with = "keys_dir")]
     keys_dir: Option<std::ffi::OsString>,
     // ostrya checks this operand after the repository resolves.
@@ -6700,19 +6711,25 @@ fn lexical_path(path: &Path) -> PathBuf {
 
 /// Loads the keys of an ed25519 or spki verify.
 ///
-/// The verify is `sign --verify`, `summary --verify`, or `static-delta
-/// verify`. The trusted keys are each `key_ids` entry, then each line of
-/// `keys_file`. If neither is given, the trusted and revoked keys come from
-/// `keys_dir`, or from the system key directories if `keys_dir` is absent.
+/// The verify is `sign --verify`, `summary --verify`, `static-delta verify`,
+/// or `static-delta apply-offline`. The trusted keys are each `key_ids` entry,
+/// then each key of `keys_file`. If neither is given, the trusted and revoked
+/// keys come from `keys_dir`, or from the system key directories if `keys_dir`
+/// is absent.
 ///
 /// If no trusted key is present before revocation, the error is
-/// `{type}: no keys loaded`. A key that is not valid refuses the run.
+/// `{type}: no keys loaded`. A key that is not valid refuses the run. A build
+/// without the `spki` feature refuses the spki engine before it reads a key.
 fn load_verify_keys(
     engine: SignType,
     key_ids: &[String],
     keys_file: Option<&Path>,
     keys_dir: Option<&Path>,
 ) -> Result<VerifyKeys> {
+    #[cfg(not(feature = "spki"))]
+    if engine == SignType::Spki {
+        return Err(unsupported_type("spki"));
+    }
     let name = sign_type_name(engine);
     let mut trusted: Vec<Vec<u8>> = key_ids
         .iter()
@@ -6762,13 +6779,20 @@ fn verify_key_bytes(engine: SignType, text: &[u8]) -> Vec<u8> {
 
 /// Reads the public keys of a `--keys-file` for an ed25519 or spki verify.
 ///
-/// The file holds one key on each line. The rules:
+/// The rules for each engine:
 ///
 /// - The path must name a regular file, with symlinks followed. This check
 ///   comes before the open, so the command refuses a FIFO and does not wait
 ///   on it.
 /// - The file is read up to [`VERIFY_KEYS_FILE_LIMIT`] bytes. A larger file is
 ///   refused.
+///
+/// An spki file holds PEM `PUBLIC KEY` blocks, which `spki_public_keys` of
+/// the `ostrya` crate reads. An empty file, or a file of white space only,
+/// adds no keys.
+///
+/// An ed25519 file holds one key on each line:
+///
 /// - Each line is read as bytes, with a trailing `\r` removed.
 /// - A line that is then empty is skipped. Every other line, also a line of
 ///   whitespace, is decoded as a key.
@@ -6787,6 +6811,13 @@ fn read_verify_keys_file(engine: SignType, path: &Path) -> Result<Vec<Vec<u8>>> 
         return Err(Error::Signature(format!(
             "the key file '{shown}' is over the {VERIFY_KEYS_FILE_LIMIT}-byte ceiling"
         )));
+    }
+    #[cfg(feature = "spki")]
+    if engine == SignType::Spki {
+        return Ok(spki_public_keys(
+            &bytes,
+            &format!("the key file '{shown}'"),
+        )?);
     }
     let keys: Vec<Vec<u8>> = bytes
         .split(|&byte| byte == b'\n')

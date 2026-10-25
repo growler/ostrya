@@ -9,6 +9,7 @@ use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
 use p256::pkcs8::{DecodePrivateKey, DecodePublicKey, EncodePublicKey};
 use p256::{EncodedPoint, SecretKey};
 
+use crate::pem;
 use crate::{
     Error, Result, SignFuture, SignKeys, SignatureInfo, Signer, Verifier, VerifyFuture,
     VerifyOutcome,
@@ -21,6 +22,8 @@ const SPKI_SIGN_TYPE: &str = "spki";
 const SPKI_METADATA_KEY: &str = "ostree.sign.spki";
 /// The byte length of a raw P-256 scalar (a bare secret key).
 const P256_SCALAR_LEN: usize = 32;
+/// The label of the PEM blocks of a public key file.
+const PUBLIC_KEY_LABEL: &[u8] = b"PUBLIC KEY";
 
 /// The signer of the spki engine.
 ///
@@ -133,9 +136,10 @@ impl Signer for SpkiSigner {
 /// A blob in neither form does not verify.
 ///
 /// A public key is a SubjectPublicKeyInfo DER, which is the base64 body of a
-/// PEM `PUBLIC KEY` block. The verifier also accepts a bare SEC1 point. In the
-/// system key store, each line of the `trusted.spki` and `revoked.spki` files
-/// is the base64 of a SubjectPublicKeyInfo DER.
+/// PEM `PUBLIC KEY` block. The verifier also accepts a bare SEC1 point. A
+/// public key file holds PEM `PUBLIC KEY` blocks, and [`spki_public_keys`]
+/// reads it. The `trusted.spki` and `revoked.spki` files of the system key
+/// store are public key files.
 ///
 /// # Examples
 ///
@@ -210,19 +214,21 @@ impl SpkiVerifier {
         SpkiVerifier::new(keys.trusted, keys.revoked)
     }
 
-    /// Creates a verifier that trusts one PEM public key.
+    /// Creates a verifier that trusts each key of the PEM text `pem`.
     ///
-    /// The PEM block starts with `-----BEGIN PUBLIC KEY-----` and holds a
-    /// SubjectPublicKeyInfo.
+    /// The function reads `pem` as [`spki_public_keys`] reads a public key
+    /// file. Each `PUBLIC KEY` block of the text holds one key. An empty text,
+    /// or a text of white space only, gives a verifier that trusts no key.
     ///
     /// # Errors
     ///
-    /// - [`Error::Signature`] if `pem` is not a PEM P-256 public key. The
-    ///   message starts with `spki public key: `.
-    pub fn from_pem(pem: &str) -> Result<SpkiVerifier> {
-        let vk = VerifyingKey::from_public_key_pem(pem)
-            .map_err(|e| Error::Signature(format!("spki public key: {e}")))?;
-        Ok(SpkiVerifier { trusted: vec![vk] })
+    /// - [`Error::Signature`] if [`spki_public_keys`] refuses the text. The
+    ///   message starts with `the spki public key text`.
+    pub fn from_pem(pem: impl AsRef<[u8]>) -> Result<SpkiVerifier> {
+        let keys = public_keys(pem.as_ref(), "the spki public key text")?;
+        Ok(SpkiVerifier {
+            trusted: keys.into_iter().map(|(_, vk)| vk).collect(),
+        })
     }
 
     /// Returns `true` if the verifier trusts no key.
@@ -260,6 +266,90 @@ impl Verifier for SpkiVerifier {
     }
 }
 
+/// Reads the public keys of a public key file of the spki engine.
+///
+/// `text` is the content of the file. The file holds PEM `PUBLIC KEY` blocks,
+/// and each block holds one key. The function returns the
+/// SubjectPublicKeyInfo DER of each block, in the order of the file. Each
+/// error message names the file with `subject`.
+///
+/// # Rules
+///
+/// - A line ends at LF, and one CR at the end of a line is removed. A CR at
+///   another position is a byte of the line. The text can hold any byte
+///   outside the blocks.
+/// - Leading and trailing spaces and tabs of a line are removed before the
+///   line is compared with a boundary. A block starts at the line
+///   `-----BEGIN LABEL-----` and stops at the line `-----END LABEL-----`. A
+///   line with other text is not a boundary line.
+/// - Text outside the blocks is ignored. A line of base64 text outside a
+///   block is also ignored.
+/// - A body line is not empty and holds no CR. `pem-rfc7468` decodes the
+///   body in the form of RFC 7468: lines of 64 base64 characters, the last
+///   line shorter or equal, and no headers.
+/// - An empty text, or a text of white space only, holds no key. White space
+///   is space, horizontal tab, LF, form feed, and CR. The function returns an
+///   empty list.
+///
+/// # Errors
+///
+/// [`Error::Signature`] if the function refuses the file. The function
+/// refuses the whole file, also when other blocks of the file are valid. A
+/// message names the line of the block where it can. The function refuses
+/// the file in these conditions:
+///
+/// - A block has no END line, or its END label is not its BEGIN label.
+/// - A BEGIN line is in a block.
+/// - A block has a label other than `PUBLIC KEY`. The message is
+///   `<subject>, line <n>: unexpected label "<label>"`.
+/// - A `PUBLIC KEY` block does not decode, or does not hold a public key
+///   that [`SpkiVerifier::new`] accepts.
+/// - The text is not empty or white space, and holds no block. The message is
+///   `<subject> holds no PEM PUBLIC KEY block`.
+pub fn spki_public_keys(text: &[u8], subject: &str) -> Result<Vec<Vec<u8>>> {
+    let keys = public_keys(text, subject)?;
+    Ok(keys.into_iter().map(|(der, _)| der).collect())
+}
+
+/// Reads the public keys of a public key file as [`spki_public_keys`] does,
+/// and returns the DER and the decoded key of each block.
+fn public_keys(text: &[u8], subject: &str) -> Result<Vec<(Vec<u8>, VerifyingKey)>> {
+    if text.iter().all(u8::is_ascii_whitespace) {
+        return Ok(Vec::new());
+    }
+    let refuse = |what: String| Error::Signature(format!("{subject}, {what}"));
+    let blocks = pem::split(text).map_err(refuse)?;
+    if let Some(other) = blocks.iter().find(|b| b.label != PUBLIC_KEY_LABEL) {
+        return Err(refuse(format!(
+            "line {}: unexpected label \"{}\"",
+            other.line,
+            other.label_text()
+        )));
+    }
+    if blocks.is_empty() {
+        return Err(Error::Signature(format!(
+            "{subject} holds no PEM PUBLIC KEY block"
+        )));
+    }
+    let mut keys = Vec::with_capacity(blocks.len());
+    for block in &blocks {
+        let der = block.decode().map_err(|e| {
+            refuse(format!(
+                "line {}: the PUBLIC KEY block does not decode: {e}",
+                block.line
+            ))
+        })?;
+        let vk = decode_verifying_key(&der).map_err(|_| {
+            refuse(format!(
+                "line {}: the PUBLIC KEY block holds no P-256 public key",
+                block.line
+            ))
+        })?;
+        keys.push((der, vk));
+    }
+    Ok(keys)
+}
+
 /// Decodes secret-key bytes into a [`SigningKey`]. The bytes are a PKCS#8
 /// `PrivateKeyInfo` DER, a SEC1 `ECPrivateKey` DER, or a raw 32-byte scalar.
 fn decode_signing_key(bytes: &[u8]) -> Result<SigningKey> {
@@ -291,4 +381,137 @@ fn decode_verifying_key(bytes: &[u8]) -> Result<VerifyingKey> {
     Err(Error::Signature(
         "spki public key: expected SubjectPublicKeyInfo DER or a SEC1 point".into(),
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use futures_lite::future::block_on;
+
+    use super::*;
+
+    /// The subject of the reader in the tests.
+    const SUBJECT: &str = "the key file 'k'";
+
+    /// Returns a signer of the scalar `[byte; 32]`.
+    fn signer(byte: u8) -> SpkiSigner {
+        SpkiSigner::from_secret_key(&[byte; 32]).unwrap()
+    }
+
+    /// Returns a PEM block of `label` around `der`, with 64-column lines.
+    fn pem_block(label: &str, der: &[u8]) -> String {
+        let b64 = base64::encode(der);
+        let mut text = format!("-----BEGIN {label}-----\n");
+        for chunk in b64.as_bytes().chunks(64) {
+            text.push_str(std::str::from_utf8(chunk).unwrap());
+            text.push('\n');
+        }
+        text.push_str(&format!("-----END {label}-----\n"));
+        text
+    }
+
+    /// Returns the message of a refusal of the reader.
+    fn refusal(text: &str) -> String {
+        match spki_public_keys(text.as_bytes(), SUBJECT).unwrap_err() {
+            Error::Signature(m) => m,
+            other => panic!("not a signature error: {other}"),
+        }
+    }
+
+    #[test]
+    fn one_block_gives_its_key() {
+        let der = signer(7).public_key_der();
+        let text = pem_block("PUBLIC KEY", &der);
+        assert_eq!(spki_public_keys(text.as_bytes(), SUBJECT).unwrap(), [der]);
+    }
+
+    #[test]
+    fn two_blocks_give_two_keys_in_order() {
+        let (a, b) = (signer(7).public_key_der(), signer(9).public_key_der());
+        let text = format!(
+            "first\n{}between\n{}after\n",
+            pem_block("PUBLIC KEY", &a),
+            pem_block("PUBLIC KEY", &b)
+        );
+        assert_eq!(spki_public_keys(text.as_bytes(), SUBJECT).unwrap(), [a, b]);
+    }
+
+    #[test]
+    fn empty_and_white_space_text_give_no_keys() {
+        for text in ["", "\n", " \t\r\n\n"] {
+            assert!(
+                spki_public_keys(text.as_bytes(), SUBJECT)
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+    }
+
+    #[test]
+    fn base64_lines_are_refused() {
+        let line = base64::encode(&signer(7).public_key_der());
+        assert_eq!(
+            refusal(&format!("{line}\n")),
+            "the key file 'k' holds no PEM PUBLIC KEY block"
+        );
+    }
+
+    #[test]
+    fn another_label_refuses_the_file() {
+        let key = pem_block("PUBLIC KEY", &signer(7).public_key_der());
+        for label in ["CERTIFICATE", "PRIVATE KEY", "public key"] {
+            let other = pem_block(label, &signer(9).public_key_der());
+            assert_eq!(
+                refusal(&format!("{key}{other}")),
+                format!("the key file 'k', line 5: unexpected label \"{label}\""),
+            );
+        }
+    }
+
+    #[test]
+    fn a_block_that_is_not_a_key_refuses_the_file() {
+        let key = pem_block("PUBLIC KEY", &signer(7).public_key_der());
+        let not_a_key = pem_block("PUBLIC KEY", b"not a key");
+        assert_eq!(
+            refusal(&format!("{key}{not_a_key}")),
+            "the key file 'k', line 5: the PUBLIC KEY block holds no P-256 public key"
+        );
+        let blank = "-----BEGIN PUBLIC KEY-----\n\n-----END PUBLIC KEY-----\n";
+        assert!(
+            refusal(blank)
+                .starts_with("the key file 'k', line 1: the PUBLIC KEY block does not decode: ")
+        );
+    }
+
+    #[test]
+    fn cr_line_ends_are_refused() {
+        let text = pem_block("PUBLIC KEY", &signer(7).public_key_der()).replace('\n', "\r");
+        assert!(refusal(&text).ends_with("has no END line"));
+    }
+
+    #[test]
+    fn a_split_error_names_the_file() {
+        assert_eq!(
+            refusal("-----BEGIN PUBLIC KEY-----\n"),
+            "the key file 'k', line 1: the block \"PUBLIC KEY\" has no END line"
+        );
+    }
+
+    #[test]
+    fn from_pem_trusts_each_block() {
+        let (a, b) = (signer(7), signer(9));
+        let text = format!(
+            "{}{}",
+            pem_block("PUBLIC KEY", &a.public_key_der()),
+            pem_block("PUBLIC KEY", &b.public_key_der())
+        );
+        let verifier = SpkiVerifier::from_pem(&text).unwrap();
+        let signature = block_on(b.sign(b"data")).unwrap();
+        assert!(
+            block_on(verifier.verify(b"data", &[signature]))
+                .unwrap()
+                .valid
+        );
+        assert!(SpkiVerifier::from_pem("").unwrap().is_empty());
+        assert!(SpkiVerifier::from_pem(base64::encode(&a.public_key_der())).is_err());
+    }
 }

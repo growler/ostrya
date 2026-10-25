@@ -878,8 +878,11 @@ impl Remote<'_> {
 
     /// Returns the path of a file of trusted keys for one sign-api engine.
     ///
-    /// The key is `verification-<engine>-file`. The file holds one key on each
-    /// line.
+    /// The key is `verification-<engine>-file`. The form of the file depends
+    /// on the engine:
+    ///
+    /// - `ed25519`: the file holds one base64 key on each line.
+    /// - `spki`: the file holds PEM `PUBLIC KEY` blocks.
     ///
     /// # Errors
     ///

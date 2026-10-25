@@ -119,7 +119,7 @@ impl ServerSigner {
     ///
     /// - [`Error::Signature`] if the verifier does not accept the DER public
     ///   key of `signer`. The message is
-    ///   `spki public key: expected SubjectPublicKeyInfo DER or a SEC1 point`.
+    ///   `spki public key: expected SubjectPublicKeyInfo DER`.
     #[cfg(feature = "sign-spki")]
     pub fn spki(signer: crate::spki::SpkiSigner) -> Result<ServerSigner> {
         let verifier =
@@ -420,21 +420,38 @@ mod tests {
         assert!(matches!(err, Error::InvalidFormat(_)), "{err}");
     }
 
-    /// The spki search recognizes the signature of the key in the two forms
-    /// that the verifier reads, DER and fixed-width `r || s`. It does not
-    /// recognize the signature of another key.
+    /// The spki search recognizes the DER signature of the key, the form
+    /// that the verifier reads. It does not recognize the fixed-width
+    /// `r || s` form of the same signature, or the signature of another key.
     #[cfg(feature = "sign-spki")]
     #[test]
-    fn an_spki_key_recognizes_its_own_signature() {
+    fn an_spki_key_recognizes_its_own_der_signature_alone() {
         use crate::spki::SpkiSigner;
 
-        let server = ServerSigner::spki(SpkiSigner::from_secret_key(&[3u8; 32]).unwrap()).unwrap();
-        let other = ServerSigner::spki(SpkiSigner::from_secret_key(&[5u8; 32]).unwrap()).unwrap();
+        // Two P-256 secret keys, base64 of the PKCS#8 DER.
+        let server = ServerSigner::spki(
+            SpkiSigner::from_base64(concat!(
+                "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg2L708EsnnzHER0SYasMNIUcG",
+                "v63QapC/3kVsoPerzKGhRANCAATxfzfHKUPeJtyLTGMUoxHhvBS1NT9guWhUQPGiZRLZIcB8Wc3",
+                "csdVU1iOiTRmbZGKJTtekOdEAbVRrx5HxIpst",
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let other = ServerSigner::spki(
+            SpkiSigner::from_base64(concat!(
+                "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgU5tYPz/hTTxfsSTPOxD/H9U+",
+                "IkBj5qWV4/H3D1NBfRChRANCAAQPyTr9rh2d6WiYOi3oxNiE3ppTP2g5JP2xX9D7rEKnzixp",
+                "MqVuqA9XnzQr5GlCYd71m/D7BnYIqS4MytNawYrR",
+            ))
+            .unwrap(),
+        )
+        .unwrap();
         let key = server.signer().metadata_key().to_owned();
 
         let der = signature(&server);
         assert!(has_signed(&server, Some(&dict_with(&key, der.clone()))));
-        assert!(has_signed(
+        assert!(!has_signed(
             &server,
             Some(&dict_with(&key, fixed_width(&der)))
         ));

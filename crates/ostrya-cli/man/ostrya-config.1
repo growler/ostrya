@@ -209,6 +209,9 @@ It is independent of \fB\%sign\-verify\fR.
 .TP
 \fB\%verification\-ENGINE\-key\fR (string)
 One trusted public key of the engine \fB\%ENGINE\fR, in base64.
+An \fB\%spki\fR key is the base64 of a SubjectPublicKeyInfo DER.
+The base64 of an \fB\%spki\fR key can hold line breaks, written as the escape \fB\%\en\fR, and ostrya removes each white space character before the decode.
+ostrya refuses an \fB\%spki\fR key that is the base64 of a raw SEC1 point, of the full PEM text, or of a secret key.
 .TP
 \fB\%verification\-ENGINE\-file\fR (string)
 A file of trusted public keys of the engine \fB\%ENGINE\fR.
@@ -779,7 +782,9 @@ It runs these checks after each option replaces the key of its name:
 \fB\%\-\-tls\-client\-ca\fR is given, and \fB\%tls\-cert\fR and \fB\%trusted\-proxy\-client\-cert\fR are not set.
 .SS "Trust keys"
 A trust group takes the remote keys \fB\%gpg\-verify\fR (default false here), \fB\%gpgkeypath\fR, \fB\%sign\-verify\fR, \fB\%verification\-ENGINE\-key\fR, and \fB\%verification\-ENGINE\-file\fR.
-A \fB\%verification\-ENGINE\-file\fR has the form of the remote key: base64 lines for \fB\%ed25519\fR, and PEM \fB\%PUBLIC KEY\fR blocks for \fB\%spki\fR.
+A \fB\%verification\-ENGINE\-key\fR and a \fB\%verification\-ENGINE\-file\fR have the form of the remote keys.
+An \fB\%spki\fR key is the base64 of a SubjectPublicKeyInfo DER, and it can hold line breaks.
+A \fB\%verification\-ENGINE\-file\fR holds base64 lines for \fB\%ed25519\fR, and PEM \fB\%PUBLIC KEY\fR blocks for \fB\%spki\fR.
 It trusts the keys that it names, and no system key store or keyring.
 A trust group that turns on no check is refused.
 \fB\%gpgkeypath\fR without \fB\%gpg\-verify=true\fR is refused, and so is \fB\%gpg\-verify=true\fR with no \fB\%gpgkeypath\fR.
@@ -797,7 +802,7 @@ The key is necessary.
 \fB\%secret\-key\-file\fR (string)
 For \fB\%ed25519\fR and \fB\%spki\fR: a regular file of at most 1 MiB that holds exactly one line that is not blank, a base64 secret key.
 For \fB\%ed25519\fR, the key is the 64\-byte seed and public key.
-For \fB\%spki\fR, the key is a PKCS#8 DER, a SEC1 DER, or a 32\-byte P\-256 scalar, as \fB\%ostrya sign\fR takes it.
+For \fB\%spki\fR, the key is a PKCS#8 DER or a SEC1 DER that names the P\-256 curve, as \fB\%ostrya sign\fR takes it.
 .TP
 \fB\%gpg\-key\fR (string)
 For \fB\%gpg\fR: a selector that names exactly one secret key.

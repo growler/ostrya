@@ -1400,7 +1400,7 @@ ref in both: a key that cannot sign leaves the ref where it stood and publishes
 nothing, and a ref write that cannot happen leaves the commit and its
 `.commitmeta` durable in `objects/` with no ref. Both write the same
 `.commitmeta` bytes for a given ed25519 key set, and each one's GPG signature
-verifies through the other's `show --gpg-verify-remote`. Eight divergences
+verifies through the other's `show --gpg-verify-remote`. Nine divergences
 stand.
 
 - `--sign-type` names an engine the port carries and this tool build does not.
@@ -1501,6 +1501,29 @@ stand.
   name, and `show --list-detached-metadata-keys` sorts, so the two agree there.
   With one engine, or with both engines and no user key, the two agree on the
   stored order too.
+- An inline `spki` secret key of `--sign` parts in its decode and in the
+  wording of its refusal. Observed with the `ostree` 2026.1 build with
+  OpenSSL on the NixOS development host (`cli-behavior.md`, "CLI output
+  formats", `static-delta`, "spki inline keys"). The tool skips each
+  character outside the base64 alphabet, and it signs with a value that
+  holds `!`, or text after the padding. The port removes each space,
+  horizontal tab, LF, form feed, and CR, and decodes the rest by the rule of
+  `format-reference.md`, "Signing details", "spki". It refuses a value with
+  another character outside the alphabet at exit 1 with an `error: invalid
+  base64:` line, and moves no ref. The port signs with a key whose base64
+  ends in `==` and has no `=` or one `=` at the end, where the tool refuses
+  that key at exit 1. Both sign with three or four `=` at the end of that
+  key, and with a last character whose unused low bits are not zero. Both
+  sign with a PKCS#8 key or a SEC1 key whose base64 holds LF or CRLF line
+  breaks. Both refuse a raw 32-byte scalar, a SEC1 key with no `parameters`
+  field, a SEC1 key whose `parameters` field names secp384r1, and the base64
+  of the full PEM text at exit 1, and move no ref. The tool reports `error:
+  Not able to sign the cobject: openssl: Failed to initialize spki key`. The
+  port reports `error: signature: spki secret key: expected PKCS#8 DER or
+  SEC1 DER`. For a SEC1 key with no `parameters` field it reports `error:
+  signature: spki secret key: the SEC1 key does not name its curve`, and for
+  a SEC1 key of another curve `error: signature: spki secret key: the SEC1
+  key names a curve other than P-256`.
 
 The branch-name term of the signing step's fault order is observable only over
 a name the ref-name rule refuses. `-b 'bad//name' --sign=zzz` reports
@@ -2447,7 +2470,7 @@ every other subcommand, together with the top level, keeps `-v/--verbose`. `-m`,
 `--sign`, and `--gpg-sign` are read with `-u` alone, and both implementations
 check every one of them before the regeneration, so a refusal leaves `summary`
 and `summary.sig` as they stood (`cli-behavior.md`, "CLI output formats",
-`summary`, "The `-u` checks"). Thirteen differences stand.
+`summary`, "The `-u` checks"). Fourteen differences stand.
 
 - `-v` does not turn on the debug stream. The tool binds `-v` to `--view` and
   `--verbose` together and writes `OT: using fuse: 0` for a read-only view; the
@@ -2536,6 +2559,11 @@ and `summary.sig` as they stood (`cli-behavior.md`, "CLI output formats",
   regeneration with `error: signature: ed25519 secret key: signature error:
   Mismatched Keypair detected`, and `summary` and `summary.sig` keep their
   state;
+- an inline `spki` secret key of `--sign`, the class `commit --sign` records
+  above. The decode parts as there. The tool reports `error: openssl: Failed
+  to initialize spki key` where the port reports its `error: signature: spki
+  secret key:` line. Both exit 1 before the regeneration, and `summary` and
+  `summary.sig` keep their state;
 - the summaries of the client groups. The tool reads no client group, and
   `summary -u` writes one `summary` of each local ref and each mirror ref.
   The port writes the same root `summary`, which holds each ref whatever the
@@ -2578,7 +2606,7 @@ states for `commit --sign-type`. `reindex` takes `--to=REV`, which rewrites or
 removes the index file of one target and reads REV by the rule of one half of a
 delta name; the last `--to` wins. A `--keys-file` and each key-store file of
 the spki engine hold PEM `PUBLIC KEY` blocks (`format-reference.md`, "Signing
-details", "spki"). Forty-three differences stand on `show`,
+details", "spki"). Forty-four differences stand on `show`,
 `delete`, `list`, `indexes`, `verify`, `apply-offline`, and `reindex`.
 
 - a superblock file over 128 MiB (134217728 bytes). The port refuses it in
@@ -2842,6 +2870,16 @@ details", "spki"). Forty-three differences stand on `show`,
   The port writes `error: signature: the key file '<path>' holds no PEM
   PUBLIC KEY block` and `error: signature: the key file '<path>', line <n>:
   unexpected label "<label>"`. Both exit 1 with nothing on standard output;
+- an spki positional key of `verify` that is not the base64 of a
+  SubjectPublicKeyInfo DER: the base64 of a raw SEC1 point, of the full PEM
+  text, or of a PKCS#8 secret key. Observed with the `ostree` 2026.1 build with OpenSSL on the NixOS development host
+  (`cli-behavior.md`, "CLI output formats", `static-delta`, "spki inline
+  keys"). Before a valid key, the tool prints `Verification OK` at exit 0.
+  Alone, or after a valid key, it prints `Verification fails` and reports
+  `error: openssl: Failed to initialize spki key` at exit 1. The port refuses
+  the run at exit 1 before it reads the superblock, in each position of the
+  key, with `error: signature: spki public key: expected SubjectPublicKeyInfo
+  DER` and nothing on standard output;
 - `--keys-dir` naming a regular file, under `verify`, `sign --verify`, or
   `summary --verify`. The tool's `verify` and `sign --verify` report `error:
   signature: ed25519: no keys loaded`, and a later `--keys-dir` replaces the
@@ -2874,7 +2912,7 @@ refusal writes no object.
 "CLI output formats", `static-delta`). The byte order starts from the host
 order, as in the tool. Only a little-endian host is observed.
 
-`static-delta generate` carries nineteen differences. Three of them are open.
+`static-delta generate` carries twenty differences. Three of them are open.
 
 - the composefs image of the target commit. The port puts the stored image
   of a commit that carries `ostree.composefs.digest.v0` in the delta, in a
@@ -3000,8 +3038,9 @@ order, as in the tool. Only a little-endian host is observed.
   writes `error: object not found: Commit <hex>` and creates no directory.
   Both exit 1 after the block, and neither lists a delta;
 - a bad signing key. The tool writes the parts and then refuses the key, so it
-  leaves part `0` and writes no superblock. Both exit 1 after the block with
-  the same error line. The other results part as follows:
+  leaves part `0` and writes no superblock. Both exit 1 after the block. For
+  an ed25519 key, the error line is the same. The other results part as
+  follows:
   - The port reads the keys before it writes a part, and it signs the
     superblock before it writes it. So a bad ed25519 or spki key writes no
     file.
@@ -3014,6 +3053,11 @@ order, as in the tool. Only a little-endian host is observed.
     the earlier superblock at the delta location before it writes the first
     part. So that superblock is gone too. Under `--inline`
     the port writes no part, so the earlier superblock and its parts stay;
+- an inline `spki` secret key of `--sign`, the class `commit --sign` records
+  ("P2", `commit`). The decode parts as there. The tool reports `error:
+  openssl: Failed to initialize spki key` after its statistics lines, where
+  the port reports its `error: signature: spki secret key:` line after the
+  block. Both exit 1 and write no superblock;
 - an unknown `--sign-type`. The tool ignores it where no key is given, and
   refuses it with `error: Requested signature type is not implemented` after
   the parts are written where a key is given. `clap` refuses it at exit 1
@@ -3022,8 +3066,8 @@ order, as in the tool. Only a little-endian host is observed.
 The port adds `--output-dir=DIR`, which writes the superblock and the parts to
 DIR, `--timestamp`, `--reindex`, `--gpg-homedir`, and `-s` for
 `--sign-type`. `-n` reads the repository's superblock also under
-`--output-dir`. The port reads a `--sign` key with the lenient base64 reader
-`commit --sign` uses.
+`--output-dir`. The port reads an ed25519 `--sign` key with the lenient base64
+reader `commit --sign` uses.
 
 `pull` accepts a large set already. Missing: `--cache-dir`, `--dry-run`. The
 port adds `--force-copy`, `--sign-verify`, and `--sign-verify-summary`. It also adds the valued forms
@@ -3508,7 +3552,7 @@ keys in file '<path>'` of `ed25519`, byte for byte. Under `spki`, a
 `--keys-file` and each key-store file hold PEM `PUBLIC KEY` blocks, the form
 that the `ostree` 2026.1 build with OpenSSL on the NixOS development host
 reads. The key-file entries under `static-delta` above, the spki entries
-included, also hold for `sign --verify`. Nine differences stand.
+included, also hold for `sign --verify`. Twelve differences stand.
 
 - the verdict report. The exit status agrees. The two reports part as
   follows:
@@ -3582,7 +3626,26 @@ included, also hold for `sign --verify`. Nine differences stand.
   with no positional KEY-ID writes `error: signature: delete requires at
   least one KEY-ID`. Beside a positional secret key, the tool writes the
   warning, signs with the positional key, and exits 0. The port refuses at
-  exit 1 and writes nothing.
+  exit 1 and writes nothing;
+- an spki positional key of `--verify` that is not the base64 of a
+  SubjectPublicKeyInfo DER: the base64 of a raw SEC1 point, compressed or
+  uncompressed, of the full PEM text, or of a PKCS#8 secret key. Observed
+  with the `ostree` 2026.1 build with OpenSSL on the NixOS development host
+  (`cli-behavior.md`, "CLI output formats", `static-delta`, "spki inline
+  keys"). The tool skips the key with no message. Beside a valid key it
+  verifies at exit 0, and alone it reports `error: No valid signatures
+  found` at exit 1. The port refuses the run at exit 1 before verification,
+  with `error: signature: spki public key: expected SubjectPublicKeyInfo DER`
+  and nothing on standard output;
+- an inline spki secret key of a signing run, the class `commit --sign`
+  records ("P2", `commit`). The decode parts as there. The tool reports
+  `error: Not able to sign the cobject: openssl: Failed to initialize spki
+  key` where the port reports its `error: signature: spki secret key:` line.
+  Both exit 1 and write no signature;
+- the fixed-width `r || s` form of an ECDSA signature under `-s spki`. The
+  tool verifies a commit whose only spki signature is the `r || s` form at
+  exit 0, observed on 2026-10-24 with the build above. The port writes
+  `signature 1: no public key` and `verification FAILED` at exit 1.
 
 ## P3 -- shell-suite surface with no matrix weight
 
@@ -3613,7 +3676,7 @@ No matrix cell needs these. The shell suite invokes them.
 `remote` landed in Phase 17e: `add`, `delete`, `list`, `show-url`, `refs`,
 `summary`, `gpg-import`, and `gpg-list-keys`, with the option set the tool
 carries on each and the output formats `cli-behavior.md`, "`remote`",
-records. Twelve divergences stand:
+records. Thirteen divergences stand:
 
 - the tool's `remote` accepts no `--repo` of its own -- `ostree remote --repo=R
   list` reports `error: Unknown option --repo=R`, where the leading position
@@ -3632,6 +3695,14 @@ records. Twelve divergences stand:
   implemented` from the tool, whose build carries the ed25519 engine alone, and
   the port accepts it where it is built with the `spki` feature. Each refuses an
   engine it does not carry in those same words;
+- a `verification-spki-key` that is not the base64 of a SubjectPublicKeyInfo
+  DER: the base64 of a raw SEC1 point, of the full PEM text, or of a PKCS#8
+  secret key. The `ostree` 2026.1 build with OpenSSL on the NixOS development
+  host fails each pull with `error: Can't verify commit <checksum>: openssl:
+  Failed to initialize spki key` (`cli-behavior.md`, "Signature verification
+  during a pull", "The verification keys"). The port refuses each pull at exit 1 before it fetches, with
+  `error: signature: spki public key: expected SubjectPublicKeyInfo DER`.
+  Both fail also when `verification-spki-file` holds the valid key;
 - `remote gpg-list-keys` reports the key fingerprint, the creation instant, and
   the user ids in the tool's own shape, and leaves out the `(revoked)` marker
   the tool prints after a revoked key's fingerprint and after each of its

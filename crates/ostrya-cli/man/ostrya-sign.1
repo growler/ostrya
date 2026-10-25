@@ -17,7 +17,7 @@ The commit to operate on (a checksum or a ref). Required.
 \fIKEY_ID...\fR
 Key identifiers: \%base64 keys, or gpg key selectors.
 .IP
-For \%ed25519 and spki, each \%KEY\-ID is a \%base64 key: a secret key to sign, or a public key to verify and delete. For gpg, each \%KEY\-ID is a signing key that gpg resolves (a fingerprint, key id, or user id). A gpg signing run needs at least one \%KEY\-ID. With \%\-\-delete, the gpg \%KEY\-IDs are the fingerprints to remove.
+For \%ed25519 and spki, each \%KEY\-ID is a \%base64 key: a secret key to sign, or a public key to verify and delete. An spki secret key is a \%PKCS#8 DER, or a \%SEC1 DER that names the \%P\-256 curve. An spki public key is a SubjectPublicKeyInfo DER. The \%base64 of an spki key can hold line breaks. For gpg, each \%KEY\-ID is a signing key that gpg resolves (a fingerprint, key id, or user id). A gpg signing run needs at least one \%KEY\-ID. With \%\-\-delete, the gpg \%KEY\-IDs are the fingerprints to remove.
 .SH OPTIONS
 .TP
 \fB\-d\fR, \fB\-\-delete\fR

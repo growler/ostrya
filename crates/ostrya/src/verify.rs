@@ -857,6 +857,13 @@ async fn sign_keys(engine: &str, source: &KeySource<'_>) -> Result<Option<SignKe
 ///
 /// The function decodes the inline key and reads the key file. If `system` is
 /// `true`, it adds the keys of the system key store.
+///
+/// The inline key is base64. For the spki engine, the function removes each
+/// white space character of the key before the decode, so the key can hold
+/// the line breaks of a PEM body. White space is space, horizontal tab, LF,
+/// form feed, and CR. For the other engines, the function removes the leading
+/// and trailing white space alone. Then it decodes the key with
+/// `base64::decode`.
 fn read_sign_keys(
     engine: &str,
     inline: Option<String>,
@@ -864,7 +871,10 @@ fn read_sign_keys(
     system: bool,
 ) -> Result<Option<SignKeys>> {
     let mut keys = SignKeys::default();
-    if let Some(inline) = inline {
+    if let Some(mut inline) = inline {
+        if engine == "spki" {
+            inline.retain(|c| !c.is_ascii_whitespace());
+        }
         keys.trusted.push(base64::decode(inline.trim())?);
     }
     if let Some(path) = path {
@@ -980,6 +990,21 @@ mod tests {
     const PUBLIC_B64: &str = "wjs0bB1XL4GE6M+szm+Tryv7/Jx+iny0d3X3bJ+mUsk=";
 
     const PAYLOAD: &[u8] = b"the commit bytes";
+
+    /// A P-256 secret key, base64 of the PKCS#8 DER.
+    #[cfg(feature = "sign-spki")]
+    const SPKI_SECRET_A: &str = concat!(
+        "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg2L708EsnnzHER0SYasMNIUcG",
+        "v63QapC/3kVsoPerzKGhRANCAATxfzfHKUPeJtyLTGMUoxHhvBS1NT9guWhUQPGiZRLZIcB8Wc3",
+        "csdVU1iOiTRmbZGKJTtekOdEAbVRrx5HxIpst",
+    );
+    /// A second P-256 secret key, base64 of the PKCS#8 DER.
+    #[cfg(feature = "sign-spki")]
+    const SPKI_SECRET_B: &str = concat!(
+        "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgU5tYPz/hTTxfsSTPOxD/H9U+",
+        "IkBj5qWV4/H3D1NBfRChRANCAAQPyTr9rh2d6WiYOi3oxNiE3ppTP2g5JP2xX9D7rEKnzixp",
+        "MqVuqA9XnzQr5GlCYd71m/D7BnYIqS4MytNawYrR",
+    );
 
     /// The ed25519 signature of `secret` over [`PAYLOAD`], in its dict.
     fn ed25519_signed(secret: &str) -> Value {
@@ -1398,8 +1423,8 @@ mod tests {
         use crate::sign::Signer;
         use crate::spki::SpkiSigner;
 
-        let inline = SpkiSigner::from_secret_key(&[7; 32]).unwrap();
-        let in_file = SpkiSigner::from_secret_key(&[9; 32]).unwrap();
+        let inline = SpkiSigner::from_base64(SPKI_SECRET_A).unwrap();
+        let in_file = SpkiSigner::from_base64(SPKI_SECRET_B).unwrap();
         let b64 = base64::encode(&in_file.public_key_der());
         let lines: Vec<&str> = b64
             .as_bytes()
@@ -1440,6 +1465,55 @@ mod tests {
             let outcome = ostrya_rt::block_on(verifier.verify(PAYLOAD, &[signature])).unwrap();
             assert!(outcome.valid);
         }
+    }
+
+    /// An inline `verification-spki-key` is the base64 of a
+    /// SubjectPublicKeyInfo DER, and it can hold line breaks. A SEC1 point,
+    /// the base64 of the PEM text, and a PKCS#8 secret key are refused when
+    /// the verifier is built.
+    #[cfg(feature = "sign-spki")]
+    #[test]
+    fn an_spki_inline_key_is_a_subject_public_key_info() {
+        use crate::spki::SpkiSigner;
+
+        let der = SpkiSigner::from_base64(SPKI_SECRET_A)
+            .unwrap()
+            .public_key_der();
+        let b64 = base64::encode(&der);
+        let (head, tail) = b64.split_at(64);
+        for inline in [
+            b64.clone(),
+            format!("{head}\n{tail}\n"),
+            format!("{head}\r\n{tail}\r\n"),
+            format!(" {head}\t{tail} "),
+        ] {
+            let keys = read_sign_keys("spki", Some(inline), None, false)
+                .unwrap()
+                .expect("the inline key is a key");
+            assert_eq!(keys.trusted, std::slice::from_ref(&der));
+            assert!(build_verifier(Engine::Spki, keys).unwrap().is_some());
+        }
+
+        let pem = format!("-----BEGIN PUBLIC KEY-----\n{head}\n{tail}\n-----END PUBLIC KEY-----\n");
+        let point = der[der.len() - 65..].to_vec();
+        let secret = base64::decode(SPKI_SECRET_A).unwrap();
+        for bytes in [point, pem.into_bytes(), secret] {
+            let keys = read_sign_keys("spki", Some(base64::encode(&bytes)), None, false)
+                .unwrap()
+                .expect("the inline key decodes");
+            match build_verifier(Engine::Spki, keys) {
+                Err(Error::Signature(m)) => {
+                    assert_eq!(m, "spki public key: expected SubjectPublicKeyInfo DER");
+                }
+                Err(other) => panic!("not a signature error: {other}"),
+                Ok(_) => panic!("the key has to be refused"),
+            }
+        }
+
+        // An ed25519 inline key keeps its strict decode, with no white space
+        // inside the key.
+        let (a, b) = PUBLIC_B64.split_at(20);
+        assert!(read_sign_keys("ed25519", Some(format!("{a}\n{b}")), None, false).is_err());
     }
 
     /// The trust source reads the `verification-*` keys of its group. The

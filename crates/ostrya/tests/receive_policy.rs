@@ -656,6 +656,62 @@ fn a_trust_group_spki_file_holds_pem_blocks() {
     );
 }
 
+/// The `verification-spki-key` of a trust group is the base64 of a
+/// SubjectPublicKeyInfo DER. It can hold line breaks as `\n` escapes of the
+/// key file. A SEC1 point and the base64 of the PEM text are refused.
+#[cfg(feature = "sign-spki")]
+#[test]
+fn a_trust_group_spki_key_is_a_subject_public_key_info() {
+    const SPKI_B64: &str = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE8X83xylD3ibci0xjFKMR4bwUtTU/\
+                            YLloVEDxomUS2SHAfFnN3LHVVNYjok0Zm2RiiU7XpDnRAG1Ua8eR8SKbLQ==";
+    let trust = |key: &str| {
+        format!("[ex-ostrya trust \"t\"]\nsign-verify=spki\nverification-spki-key={key}\n")
+    };
+    let (head, tail) = SPKI_B64.split_at(64);
+    policy(&trust(SPKI_B64)).unwrap();
+    policy(&trust(&format!("{head}\\n{tail}\\n"))).unwrap();
+    policy(&trust(&format!("{head}\\r\\n{tail}"))).unwrap();
+
+    let der = base64::decode(SPKI_B64).unwrap();
+    let point = base64::encode(&der[der.len() - 65..]);
+    let pem = base64::encode(
+        format!("-----BEGIN PUBLIC KEY-----\n{head}\n{tail}\n-----END PUBLIC KEY-----\n")
+            .as_bytes(),
+    );
+    for key in [point, pem] {
+        let err = refusal(&trust(&key));
+        assert!(
+            matches!(&err, Error::Signature(m)
+                if m.contains("spki public key: expected SubjectPublicKeyInfo DER")),
+            "{err}"
+        );
+    }
+}
+
+/// The `secret-key-file` of an spki key group refuses a raw 32-byte P-256
+/// scalar.
+#[cfg(feature = "sign-spki")]
+#[test]
+fn an_spki_key_group_refuses_a_raw_scalar() {
+    let dir = TmpDir::new("receive-signer-spki-scalar");
+    let file = dir.path().join("secret.spki");
+    std::fs::write(&file, "2L708EsnnzHER0SYasMNIUcGv63QapC/3kVsoPerzKE=\n").unwrap();
+    let err = policy_with(
+        dir.path(),
+        "",
+        &format!(
+            "[ex-ostrya key \"k\"]\ntype=spki\nsecret-key-file={}\n",
+            file.display()
+        ),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(&err, Error::Signature(m)
+            if m.contains("spki secret key: expected PKCS#8 DER or SEC1 DER")),
+        "{err}"
+    );
+}
+
 /// The verification keys of a remote do not reach a trust group.
 #[test]
 fn a_remote_key_is_not_a_trust_group_key() {

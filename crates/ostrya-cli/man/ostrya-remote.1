@@ -61,7 +61,7 @@ The command writes \fB\%gpg\-verify=false\fR and \fB\%sign\-verify=false\fR\&. T
 \fB\-\-sign\-verify\fR \fIKEYTYPE=[inline|file]:PUBKEY\fR
 Trust this public key for the \%ed25519 or the spki engine.
 .IP
-The value is \%KEYTYPE=inline:PUBKEY or \%KEYTYPE=file:PATH. KEYTYPE is \fB\%ed25519\fR, or \fB\%spki\fR in a build with the \fB\%spki\fR feature. The command writes the key \fB\%verification\-KEYTYPE\-key\fR for an inline key, or \fB\%verification\-KEYTYPE\-file\fR for a file. It then writes \fB\%sign\-verify\fR with the engine of each \%\-\-sign\-verify, separated by commas. The option can occur more than once, and it conflicts with \%\-\-no\-sign\-verify.
+The value is \%KEYTYPE=inline:PUBKEY or \%KEYTYPE=file:PATH. KEYTYPE is \fB\%ed25519\fR, or \fB\%spki\fR in a build with the \fB\%spki\fR feature. The command writes the key \fB\%verification\-KEYTYPE\-key\fR for an inline key, or \fB\%verification\-KEYTYPE\-file\fR for a file. It then writes \fB\%sign\-verify\fR with the engine of each \%\-\-sign\-verify, separated by commas. The option can occur more than once, and it conflicts with \%\-\-no\-sign\-verify. An spki PUBKEY is the \%base64 of a SubjectPublicKeyInfo DER.
 .TP
 \fB\-\-if\-not\-exists\fR
 If the remote exists, do nothing.
@@ -453,7 +453,7 @@ Only the gpg engine reads it: for \%\-\-gpg\-sign, and for \%\-\-sign under the 
 \fB\-\-sign\fR \fIKEY\-ID\fR
 With \%\-u, sign the summary with this key.
 .IP
-The \%\-\-sign\-type option selects the engine. For \%ed25519 and spki, the key is the \%base64 of the secret key. For gpg, the key is a selector, as for \%\-\-gpg\-sign. Each occurrence adds one signature. The option needs \%\-u.
+The \%\-\-sign\-type option selects the engine. For \%ed25519 and spki, the key is the \%base64 of the secret key. An spki secret key is a \%PKCS#8 DER, or a \%SEC1 DER that names the \%P\-256 curve, and its \%base64 can hold line breaks. For gpg, the key is a selector, as for \%\-\-gpg\-sign. Each occurrence adds one signature. The option needs \%\-u.
 .TP
 \fB\-s\fR, \fB\-\-sign\-type\fR \fINAME\fR
 With \%\-u, the signature engine for \%\-\-sign and \%\-\-keys\-file.

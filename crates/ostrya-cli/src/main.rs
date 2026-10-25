@@ -1085,11 +1085,12 @@ struct CommitArgs {
     ///
     /// For `ed25519` and `spki`, the key is the base64 of the secret key. An
     /// `ed25519` secret key is 64 bytes: the 32-byte seed, then the 32-byte
-    /// public key. For `gpg`, the key is a key ID. Each occurrence adds one
-    /// signature. --sign-type selects the engine. The command reads every key
-    /// before it makes the first signature, so a bad key gives no signature.
-    /// The order is the --sign keys, then the --sign-from-file keys, then the
-    /// --gpg-sign keys.
+    /// public key. An `spki` secret key is a PKCS#8 DER, or a SEC1 DER that
+    /// names the P-256 curve, and its base64 can hold line breaks. For `gpg`,
+    /// the key is a key ID. Each occurrence adds one signature. --sign-type
+    /// selects the engine. The command reads every key before it makes the
+    /// first signature, so a bad key gives no signature. The order is the
+    /// --sign keys, then the --sign-from-file keys, then the --gpg-sign keys.
     #[arg(long, value_name = "KEY_ID")]
     sign: Vec<String>,
     /// Sign the commit with the key on the first line of this file.
@@ -1912,7 +1913,8 @@ struct RemoteAddArgs {
     /// writes the key `verification-KEYTYPE-key` for an inline key, or
     /// `verification-KEYTYPE-file` for a file. It then writes `sign-verify`
     /// with the engine of each --sign-verify, separated by commas. The option
-    /// can occur more than once, and it conflicts with --no-sign-verify.
+    /// can occur more than once, and it conflicts with --no-sign-verify. An
+    /// spki PUBKEY is the base64 of a SubjectPublicKeyInfo DER.
     #[arg(long, value_name = "KEYTYPE=[inline|file]:PUBKEY")]
     sign_verify: Vec<String>,
     /// If the remote exists, do nothing.
@@ -2154,8 +2156,10 @@ struct RemoteSummaryArgs {
     /// With -u, sign the summary with this key.
     ///
     /// The --sign-type option selects the engine. For ed25519 and spki, the key
-    /// is the base64 of the secret key. For gpg, the key is a selector, as for
-    /// --gpg-sign. Each occurrence adds one signature. The option needs -u.
+    /// is the base64 of the secret key. An spki secret key is a PKCS#8 DER, or
+    /// a SEC1 DER that names the P-256 curve, and its base64 can hold line
+    /// breaks. For gpg, the key is a selector, as for --gpg-sign. Each
+    /// occurrence adds one signature. The option needs -u.
     #[cfg(feature = "s3")]
     #[arg(long, value_name = "KEY-ID", requires = "update")]
     sign: Vec<String>,
@@ -2575,7 +2579,10 @@ struct SignArgs {
     /// Key identifiers: base64 keys, or gpg key selectors.
     ///
     /// For ed25519 and spki, each KEY-ID is a base64 key: a secret key to
-    /// sign, or a public key to verify and delete. For gpg, each KEY-ID is a
+    /// sign, or a public key to verify and delete. An spki secret key is a
+    /// PKCS#8 DER, or a SEC1 DER that names the P-256 curve. An spki public key
+    /// is a SubjectPublicKeyInfo DER. The base64 of an spki key can hold line
+    /// breaks. For gpg, each KEY-ID is a
     /// signing key that gpg resolves (a fingerprint, key id, or user id). A
     /// gpg signing run needs at least one KEY-ID. With --delete, the gpg
     /// KEY-IDs are the fingerprints to remove.
@@ -2664,8 +2671,10 @@ struct SummaryArgs {
     /// Sign the summary with this key.
     ///
     /// The --sign-type option selects the engine. For ed25519 and spki, the key
-    /// is the base64 of the secret key. For gpg, the key is a selector, as for
-    /// --gpg-sign. Each occurrence adds one signature. Only -u reads it.
+    /// is the base64 of the secret key. An spki secret key is a PKCS#8 DER, or
+    /// a SEC1 DER that names the P-256 curve, and its base64 can hold line
+    /// breaks. For gpg, the key is a selector, as for --gpg-sign. Each
+    /// occurrence adds one signature. Only -u reads it.
     #[arg(long, value_name = "KEY-ID")]
     sign: Vec<String>,
     /// Sign the summary with the GPG key that this selector names.
@@ -2894,7 +2903,8 @@ struct DeltaVerifyArgs {
     delta: Option<String>,
     /// Trusted public keys in base64.
     ///
-    /// An ed25519 key must decode to 32 bytes.
+    /// An ed25519 key must decode to 32 bytes. An spki key is a
+    /// SubjectPublicKeyInfo DER, and its base64 can hold line breaks.
     key_id: Vec<String>,
 }
 
@@ -2933,7 +2943,8 @@ struct DeltaApplyArgs {
     path: Option<PathBuf>,
     /// Trusted public keys in base64.
     ///
-    /// An ed25519 key must decode to 32 bytes.
+    /// An ed25519 key must decode to 32 bytes. An spki key is a
+    /// SubjectPublicKeyInfo DER, and its base64 can hold line breaks.
     key_id: Vec<String>,
 }
 
@@ -3020,7 +3031,9 @@ struct DeltaGenerateArgs {
     /// Sign the generated delta with this key.
     ///
     /// The option can occur more than once. The key is a base64 secret key for
-    /// ed25519 and spki, and a KEY-ID for gpg, as for `ostrya sign`.
+    /// ed25519 and spki, and a KEY-ID for gpg, as for `ostrya sign`. An spki
+    /// secret key is a PKCS#8 DER, or a SEC1 DER that names the P-256 curve, and
+    /// its base64 can hold line breaks.
     #[arg(long = "sign")]
     sign: Vec<String>,
     /// The signature engine for --sign and --keys-file.
@@ -6760,9 +6773,12 @@ fn load_verify_keys(
 /// Decodes one public key of an ed25519 or spki verify.
 ///
 /// The decoder is [`lenient_base64`], the lenient base64 reader of the
-/// `ostree` command. Text that is not UTF-8 decodes to no byte. An ed25519 key
-/// with a length other than 32 bytes refuses the run in the words of `ostree`.
-/// The spki engine checks its own keys.
+/// `ostree` command. It skips each character outside the base64 alphabet, so
+/// an spki key can hold the line breaks of a PEM body. Text that is not UTF-8
+/// decodes to no byte. An ed25519 key with a length other than 32 bytes
+/// refuses the run in the words of `ostree`. The spki engine checks its own
+/// keys when the verifier is built: a key that is not a SubjectPublicKeyInfo
+/// DER, for example a SEC1 point, refuses the run.
 fn verify_key_bytes(engine: SignType, text: &[u8]) -> Vec<u8> {
     let key = match std::str::from_utf8(text) {
         Ok(_) => lenient_base64(text),
@@ -13666,11 +13682,16 @@ fn secret_key_lines(args: &SignArgs) -> Result<Vec<String>> {
 /// Returns the decoded public keys for an ed25519 or spki verify or delete.
 ///
 /// These are the KEY-IDs and the `--keys-file` lines, each a base64-encoded
-/// key.
+/// key. An spki KEY-ID decodes as [`verify_key_bytes`] decodes it, so it can
+/// hold the line breaks of a PEM body. The other KEY-IDs and the lines decode
+/// strictly.
 fn public_key_bytes(args: &SignArgs) -> Result<Vec<Vec<u8>>> {
     let mut keys = Vec::new();
     for key in &args.key_id {
-        keys.push(base64::decode(key.trim())?);
+        keys.push(match args.sign_type {
+            SignType::Spki => verify_key_bytes(SignType::Spki, key.as_bytes()),
+            _ => base64::decode(key.trim())?,
+        });
     }
     for path in &args.keys_file {
         for line in read_key_lines(Path::new(path))? {

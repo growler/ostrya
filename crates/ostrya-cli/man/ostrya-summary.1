@@ -57,7 +57,7 @@ VALUE is in the GVariant text form. The option can occur more than once. Only \%
 \fB\-\-sign\fR \fIKEY\-ID\fR
 Sign the summary with this key.
 .IP
-The \%\-\-sign\-type option selects the engine. For \%ed25519 and spki, the key is the \%base64 of the secret key. For gpg, the key is a selector, as for \%\-\-gpg\-sign. Each occurrence adds one signature. Only \%\-u reads it.
+The \%\-\-sign\-type option selects the engine. For \%ed25519 and spki, the key is the \%base64 of the secret key. An spki secret key is a \%PKCS#8 DER, or a \%SEC1 DER that names the \%P\-256 curve, and its \%base64 can hold line breaks. For gpg, the key is a selector, as for \%\-\-gpg\-sign. Each occurrence adds one signature. Only \%\-u reads it.
 .TP
 \fB\-\-gpg\-sign\fR \fIKEY\-ID\fR
 Sign the summary with the GPG key that this selector names.

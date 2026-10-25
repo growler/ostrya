@@ -4081,6 +4081,190 @@ fn sign_verify_spki_selects_the_engine() {
     assert!(verified.stdout_trimmed().contains("verification OK"));
 }
 
+/// The inline keys of the spki engine:
+///
+/// - A secret key of `sign`, `commit --sign`, and `static-delta generate
+///   --sign` is the base64 of a PKCS#8 DER or of a SEC1 DER that names its
+///   curve, also with LF or CRLF line breaks.
+/// - A raw 32-byte scalar and a SEC1 key with no `parameters` field refuse the
+///   run at exit 1. The run writes nothing on standard output, and no
+///   signature, ref, or superblock.
+/// - A public key of `sign --verify` and `sign -d` is the base64 of a
+///   SubjectPublicKeyInfo DER, also with line breaks. A SEC1 point, the base64
+///   of the PEM text, and a PKCS#8 secret key refuse the verify at exit 1.
+/// - A commit whose only spki signature is the fixed-width `r || s` form of a
+///   valid signature does not verify.
+#[cfg(feature = "spki")]
+#[test]
+fn spki_inline_key_forms() {
+    const SECRET_PKCS8_B64: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg2L708EsnnzHER0SYasMNIUcGv63QapC/3kVsoPerzKGhRANCAATxfzfHKUPeJtyLTGMUoxHhvBS1NT9guWhUQPGiZRLZIcB8Wc3csdVU1iOiTRmbZGKJTtekOdEAbVRrx5HxIpst";
+    const SECRET_SEC1_B64: &str = "MHcCAQEEINi+9PBLJ58xxEdEmGrDDSFHBr+t0GqQv95FbKD3q8yhoAoGCCqGSM49AwEHoUQDQgAE8X83xylD3ibci0xjFKMR4bwUtTU/YLloVEDxomUS2SHAfFnN3LHVVNYjok0Zm2RiiU7XpDnRAG1Ua8eR8SKbLQ==";
+    // The same SEC1 key with no `parameters` field.
+    const SECRET_SEC1_NO_CURVE_B64: &str = "MGsCAQEEINi+9PBLJ58xxEdEmGrDDSFHBr+t0GqQv95FbKD3q8yhoUQDQgAE8X83xylD3ibci0xjFKMR4bwUtTU/YLloVEDxomUS2SHAfFnN3LHVVNYjok0Zm2RiiU7XpDnRAG1Ua8eR8SKbLQ==";
+    // The same SEC1 key with a `parameters` field that names secp384r1.
+    const SECRET_SEC1_P384_B64: &str = "MHQCAQEEINi+9PBLJ58xxEdEmGrDDSFHBr+t0GqQv95FbKD3q8yhoAcGBSuBBAAioUQDQgAE8X83xylD3ibci0xjFKMR4bwUtTU/YLloVEDxomUS2SHAfFnN3LHVVNYjok0Zm2RiiU7XpDnRAG1Ua8eR8SKbLQ==";
+    // The raw 32-byte scalar of the same key.
+    const SECRET_SCALAR_B64: &str = "2L708EsnnzHER0SYasMNIUcGv63QapC/3kVsoPerzKE=";
+    const PUBLIC_SPKI_B64: &str = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE8X83xylD3ibci0xjFKMR4bwUtTU/YLloVEDxomUS2SHAfFnN3LHVVNYjok0Zm2RiiU7XpDnRAG1Ua8eR8SKbLQ==";
+    let broken = |b64: &str, line_end: &str| {
+        b64.as_bytes()
+            .chunks(64)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect::<Vec<_>>()
+            .join(line_end)
+    };
+
+    let tmp = TmpDir::new("spki-inline");
+    let base = tmp.path();
+    let repo = commit_fixture(base);
+    let repo_arg = format!("--repo={}", repo.display());
+    let commitmeta = repo.join(format!(
+        "objects/{}/{}.commitmeta",
+        &COMMIT[..2],
+        &COMMIT[2..]
+    ));
+    let run = |args: &[&str]| {
+        let mut full = vec![repo_arg.as_str()];
+        full.extend_from_slice(args);
+        ostrya(&full, None, &[])
+    };
+    let assert_refused = |out: &Run, stderr: &str, what: &str| {
+        assert_eq!(out.status.code(), Some(1), "{what}");
+        assert!(out.stdout.is_empty(), "{what}");
+        assert_eq!(String::from_utf8_lossy(&out.stderr), stderr, "{what}");
+    };
+    let expected = "error: signature: spki secret key: expected PKCS#8 DER or SEC1 DER\n";
+    let no_curve = "error: signature: spki secret key: the SEC1 key does not name its curve\n";
+    let other_curve =
+        "error: signature: spki secret key: the SEC1 key names a curve other than P-256\n";
+
+    // The refused secret keys write no signature.
+    for (key, stderr) in [
+        (SECRET_SCALAR_B64, expected),
+        (SECRET_SEC1_NO_CURVE_B64, no_curve),
+        (SECRET_SEC1_P384_B64, other_curve),
+    ] {
+        assert_refused(&run(&["sign", "-s", "spki", COMMIT, key]), stderr, key);
+        assert!(!commitmeta.exists(), "{key}");
+        let sign = format!("--sign={key}");
+        let tree = format!("--tree=ref={COMMIT}");
+        let commit = run(&[
+            "commit",
+            "-b",
+            BRANCH,
+            "-s",
+            "refused",
+            "--sign-type=spki",
+            &sign,
+            &tree,
+        ]);
+        assert_refused(&commit, stderr, key);
+        assert_eq!(resolve(&repo, BRANCH).as_deref(), Some(COMMIT), "{key}");
+        let out = format!("--output-dir={}", base.join("delta").display());
+        let generate = run(&[
+            "static-delta",
+            "generate",
+            "--empty",
+            "--to",
+            COMMIT,
+            "--sign-type=spki",
+            &sign,
+            &out,
+        ]);
+        assert_eq!(generate.status.code(), Some(1), "{key}");
+        assert_eq!(String::from_utf8_lossy(&generate.stderr), stderr, "{key}");
+        assert!(!base.join("delta/superblock").exists(), "{key}");
+    }
+
+    // A PKCS#8 key and a SEC1 key sign, with LF and CRLF line breaks.
+    let mut signatures = 0;
+    for key in [SECRET_PKCS8_B64, SECRET_SEC1_B64] {
+        for text in [broken(key, "\n"), broken(key, "\r\n")] {
+            run(&["sign", "-s", "spki", COMMIT, &text]).ok();
+            signatures += 1;
+        }
+    }
+
+    // A public key verifies, also with line breaks.
+    let verify = |key: &str| run(&["sign", "--verify", "-s", "spki", COMMIT, key]);
+    for key in [
+        PUBLIC_SPKI_B64.to_owned(),
+        broken(PUBLIC_SPKI_B64, "\n"),
+        broken(PUBLIC_SPKI_B64, "\r\n"),
+    ] {
+        let out = verify(&key);
+        out.ok();
+        assert!(out.stdout_trimmed().ends_with("verification OK"));
+    }
+
+    // Other public forms refuse the verify.
+    let der = base64::decode(PUBLIC_SPKI_B64).unwrap();
+    let point = base64::encode(&der[der.len() - 65..]);
+    let pem_text = base64::encode(
+        format!(
+            "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----\n",
+            broken(PUBLIC_SPKI_B64, "\n")
+        )
+        .as_bytes(),
+    );
+    for key in [point.as_str(), pem_text.as_str(), SECRET_PKCS8_B64] {
+        assert_refused(
+            &verify(key),
+            "error: signature: spki public key: expected SubjectPublicKeyInfo DER\n",
+            key,
+        );
+    }
+
+    // `sign -d` takes a public key with line breaks.
+    let deleted = run(&[
+        "sign",
+        "-d",
+        "-s",
+        "spki",
+        COMMIT,
+        &broken(PUBLIC_SPKI_B64, "\n"),
+    ]);
+    assert_eq!(
+        deleted.ok().stdout_trimmed(),
+        format!("Deleted {signatures} signature(s)")
+    );
+
+    // A commit whose only spki signature is the `r || s` form of a valid
+    // signature does not verify.
+    block_on(async {
+        let repo = Repo::open(&repo).await.unwrap();
+        let checksum = Checksum::from_hex(COMMIT).unwrap();
+        let payload = repo
+            .load_object_bytes(ObjectType::Commit, &checksum)
+            .await
+            .unwrap();
+        let signer = ostrya::SpkiSigner::from_base64(SECRET_PKCS8_B64).unwrap();
+        let der = ostrya::Signer::sign(&signer, &payload).await.unwrap();
+        // SEQUENCE { INTEGER r, INTEGER s }, each with a short-form length.
+        let mut fixed = Vec::with_capacity(64);
+        let mut at = 2;
+        for _ in 0..2 {
+            let len = usize::from(der[at + 1]);
+            let int = &der[at + 2..at + 2 + len];
+            let int = &int[int.len().saturating_sub(32)..];
+            fixed.extend(std::iter::repeat_n(0u8, 32 - int.len()));
+            fixed.extend_from_slice(int);
+            at += 2 + len;
+        }
+        let mut dict = Value::Array(Vec::new());
+        ostrya::sign::append_signature(&mut dict, "ostree.sign.spki", fixed).unwrap();
+        repo.write_commit_detached_metadata(&checksum, Some(&dict))
+            .await
+            .unwrap();
+    });
+    let out = verify(PUBLIC_SPKI_B64);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        out.stdout_trimmed(),
+        "signature 1: no public key\nverification FAILED"
+    );
+}
+
 /// The spki key files of a verify hold PEM `PUBLIC KEY` blocks:
 ///
 /// - `sign --verify --keys-file` and `summary --verify --keys-file` verify
@@ -35734,6 +35918,31 @@ fn static_delta_verify_sign_types() {
             "error: no signature for 'ostree.sign.spki' in static-delta superblock\n",
             "spki over an ed25519-signed delta",
         );
+
+        // An inline key is the base64 of a SubjectPublicKeyInfo DER, also
+        // with line breaks. A SEC1 point refuses the run before the superblock
+        // is read, also beside a valid key.
+        let broken = format!("{}\n{}\n", &PUBLIC_SPKI_B64[..64], &PUBLIC_SPKI_B64[64..]);
+        assert_verify_run(
+            &run(&["--sign-type=spki", superblock, &broken]),
+            0,
+            "Verification OK\n",
+            "",
+            "spki key with line breaks",
+        );
+        let der = base64::decode(PUBLIC_SPKI_B64).unwrap();
+        let point = base64::encode(&der[der.len() - 65..]);
+        for keys in [vec![point.as_str()], vec![point.as_str(), PUBLIC_SPKI_B64]] {
+            let mut args = vec!["--sign-type=spki", superblock];
+            args.extend(keys);
+            assert_verify_run(
+                &run(&args),
+                1,
+                "",
+                "error: signature: spki public key: expected SubjectPublicKeyInfo DER\n",
+                "spki SEC1 point",
+            );
+        }
 
         // A `--keys-file` of the spki engine holds PEM `PUBLIC KEY` blocks. A
         // file of base64 lines is refused before the superblock is read.

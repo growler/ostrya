@@ -51,7 +51,8 @@ csdVU1iOiTRmbZGKJTtekOdEAbVRrx5HxIpst";
 const SECRET_SEC1_B64: &str = "MHcCAQEEINi+9PBLJ58xxEdEmGrDDSFHBr+t0GqQv95FbKD3q8yhoAoGCCqGSM49AwEHoUQD\
 QgAE8X83xylD3ibci0xjFKMR4bwUtTU/YLloVEDxomUS2SHAfFnN3LHVVNYjok0Zm2RiiU7XpDn\
 RAG1Ua8eR8SKbLQ==";
-/// The matching secret key as the raw 32-byte P-256 scalar (hex).
+/// The matching secret key as the raw 32-byte P-256 scalar (hex). It is not
+/// a secret key form of the engine.
 const SECRET_SCALAR_HEX: &str = "D8BEF4F04B279F31C44744986AC30D214706BFADD06A90BFDE456CA0F7ABCCA1";
 
 /// Wraps `b64` into a PEM block of `kind`, with one 64-character line for each
@@ -178,15 +179,56 @@ fn spki_stranger_verifier() -> SpkiVerifier {
     .unwrap()
 }
 
+/// Returns `b64` with `line_end` after each 64 characters, as in a PEM body.
+fn with_line_breaks(b64: &str, line_end: &str) -> String {
+    b64.as_bytes()
+        .chunks(64)
+        .map(|c| std::str::from_utf8(c).unwrap())
+        .collect::<Vec<_>>()
+        .join(line_end)
+}
+
+/// Returns the SEC1 DER of the embedded key with no `parameters` field.
+///
+/// The function removes the `[0]` element that names the curve from
+/// [`SECRET_SEC1_B64`] and sets the outer length again.
+fn sec1_without_parameters() -> Vec<u8> {
+    let mut der = base64::decode(SECRET_SEC1_B64).unwrap();
+    assert_eq!(der[..2], [0x30, 0x77]);
+    assert_eq!(der[39..51], from_hex("A00A06082A8648CE3D030107"));
+    der.drain(39..51);
+    der[1] = 0x6b;
+    der
+}
+
+/// Returns the SEC1 DER of the embedded key with a `parameters` field that
+/// names secp384r1.
+///
+/// The function replaces the `[0]` element of [`SECRET_SEC1_B64`] and sets the
+/// outer length again.
+fn sec1_of_another_curve() -> Vec<u8> {
+    let mut der = base64::decode(SECRET_SEC1_B64).unwrap();
+    assert_eq!(der[39..51], from_hex("A00A06082A8648CE3D030107"));
+    der.splice(39..51, from_hex("A00706052B81040022"));
+    der[1] = 0x74;
+    der
+}
+
 #[test]
 fn spki_secret_key_encodings_agree() {
-    // The same key decodes from base64 of PKCS#8 DER, of SEC1 DER, and of the
-    // raw 32-byte scalar. Each form gives the embedded public key.
+    // The same key decodes from base64 of PKCS#8 DER and of SEC1 DER, also
+    // with the LF or CRLF line breaks of a PEM body. Each form gives the
+    // embedded public key.
     let want = public_spki_der();
-    let scalar_b64 = base64::encode(&from_hex(SECRET_SCALAR_HEX));
-    for secret in [SECRET_PKCS8_B64, SECRET_SEC1_B64, &scalar_b64] {
-        let signer = SpkiSigner::from_base64(secret).unwrap();
-        assert_eq!(signer.public_key_der(), want, "secret form {secret}");
+    for secret in [SECRET_PKCS8_B64, SECRET_SEC1_B64] {
+        for text in [
+            secret.to_owned(),
+            with_line_breaks(secret, "\n"),
+            format!("{}\r\n", with_line_breaks(secret, "\r\n")),
+        ] {
+            let signer = SpkiSigner::from_base64(&text).unwrap();
+            assert_eq!(signer.public_key_der(), want, "secret form {text:?}");
+        }
     }
     // The PKCS#8 PEM constructor gives the same public key.
     let pkcs8_pem = wrap_pem("PRIVATE KEY", SECRET_PKCS8_B64);
@@ -199,6 +241,87 @@ fn spki_secret_key_encodings_agree() {
     // A malformed secret returns a signature error. The constructor does not
     // panic.
     assert!(SpkiSigner::from_base64("bm90LWEta2V5").is_err());
+}
+
+/// Returns the message of a signature error of the spki secret key reader.
+fn secret_refusal(b64: &str) -> String {
+    match SpkiSigner::from_base64(b64) {
+        Err(ostrya::sign::Error::Signature(m)) => m,
+        Err(other) => panic!("not a signature error: {other}"),
+        Ok(_) => panic!("the secret key {b64:?} has to be refused"),
+    }
+}
+
+#[test]
+fn spki_secret_key_refused_forms() {
+    // The raw 32-byte scalar of the embedded key.
+    let scalar_b64 = base64::encode(&from_hex(SECRET_SCALAR_HEX));
+    assert_eq!(
+        secret_refusal(&scalar_b64),
+        "spki secret key: expected PKCS#8 DER or SEC1 DER"
+    );
+    // A SEC1 key with no `parameters` field.
+    assert_eq!(
+        secret_refusal(&base64::encode(&sec1_without_parameters())),
+        "spki secret key: the SEC1 key does not name its curve"
+    );
+    // A SEC1 key whose `parameters` field names secp384r1.
+    assert_eq!(
+        secret_refusal(&base64::encode(&sec1_of_another_curve())),
+        "spki secret key: the SEC1 key names a curve other than P-256"
+    );
+    // The base64 of the full PEM text.
+    let pem = wrap_pem("PRIVATE KEY", SECRET_PKCS8_B64);
+    assert_eq!(
+        secret_refusal(&base64::encode(pem.as_bytes())),
+        "spki secret key: expected PKCS#8 DER or SEC1 DER"
+    );
+    // A character outside the base64 alphabet, also at the end.
+    assert!(SpkiSigner::from_base64(&format!("{SECRET_PKCS8_B64}!")).is_err());
+}
+
+/// Returns the fixed-width `r || s` form of a DER ECDSA signature over P-256.
+fn fixed_width(der: &[u8]) -> Vec<u8> {
+    // SEQUENCE { INTEGER r, INTEGER s }, each with a short-form length.
+    assert_eq!(der[0], 0x30);
+    let mut out = Vec::with_capacity(64);
+    let mut at = 2;
+    for _ in 0..2 {
+        assert_eq!(der[at], 0x02);
+        let len = usize::from(der[at + 1]);
+        let int = &der[at + 2..at + 2 + len];
+        let int = &int[int.len().saturating_sub(32)..];
+        out.extend(std::iter::repeat_n(0u8, 32 - int.len()));
+        out.extend_from_slice(int);
+        at += 2 + len;
+    }
+    out
+}
+
+/// A commit whose only spki signature is the fixed-width `r || s` form of a
+/// valid signature does not verify. The DER form of the same signature
+/// verifies.
+#[test]
+fn spki_fixed_width_signature_does_not_verify() {
+    let tmp = TmpDir::new("spki-fixed-width");
+    let base = tmp.path();
+    block_on(async {
+        let (repo, commit) = build_committed_repo(base).await;
+        let signer = SpkiSigner::from_base64(SECRET_PKCS8_B64).unwrap();
+        let der = signer.sign(&commit_bytes(base, &commit)).await.unwrap();
+        let verifier = SpkiVerifier::new([public_spki_der()], Vec::<Vec<u8>>::new()).unwrap();
+
+        for (blob, valid) in [(fixed_width(&der), false), (der, true)] {
+            let mut dict = ostrya::Value::Array(Vec::new());
+            ostrya::sign::append_signature(&mut dict, signer.metadata_key(), blob).unwrap();
+            repo.write_commit_detached_metadata(&commit, Some(&dict))
+                .await
+                .unwrap();
+            let outcome = repo.verify_commit(&commit, &[&verifier]).await.unwrap();
+            assert_eq!(outcome.valid, valid);
+            assert_eq!(outcome.signatures.len(), 1);
+        }
+    });
 }
 
 #[test]

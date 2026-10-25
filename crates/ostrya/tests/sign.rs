@@ -680,7 +680,13 @@ fn signing_items_resolve_at_their_public_paths() {
 
     #[cfg(feature = "sign-spki")]
     {
-        let signer = ostrya::spki::SpkiSigner::from_secret_key(&[1u8; 32]).unwrap();
+        // A P-256 secret key, base64 of the PKCS#8 DER.
+        let signer = ostrya::spki::SpkiSigner::from_base64(concat!(
+            "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg2L708EsnnzHER0SYasMNIUcG",
+            "v63QapC/3kVsoPerzKGhRANCAATxfzfHKUPeJtyLTGMUoxHhvBS1NT9guWhUQPGiZRLZIcB8Wc3",
+            "csdVU1iOiTRmbZGKJTtekOdEAbVRrx5HxIpst",
+        ))
+        .unwrap();
         assert_eq!(Signer::name(&signer), "spki");
     }
     #[cfg(feature = "sign-gpg")]

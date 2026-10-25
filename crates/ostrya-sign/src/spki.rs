@@ -3,11 +3,16 @@
 //! The docs of `SpkiSigner` and `SpkiVerifier` hold the signature and key
 //! formats.
 
+use std::borrow::Cow;
+
 use ostrya_core::base64;
 use p256::ecdsa::signature::{Signer as _, Verifier as _};
 use p256::ecdsa::{Signature, SigningKey, VerifyingKey};
-use p256::pkcs8::{DecodePrivateKey, DecodePublicKey, EncodePublicKey};
-use p256::{EncodedPoint, SecretKey};
+use p256::elliptic_curve::zeroize::Zeroizing;
+use p256::pkcs8::der::asn1::{ContextSpecific, ObjectIdentifier, OctetStringRef};
+use p256::pkcs8::der::{self, Decode, Reader, SliceReader, TagNumber};
+use p256::pkcs8::{AssociatedOid, DecodePrivateKey, DecodePublicKey, EncodePublicKey};
+use p256::{EncodedPoint, NistP256, SecretKey};
 
 use crate::pem;
 use crate::{
@@ -20,8 +25,6 @@ use crate::{
 const SPKI_SIGN_TYPE: &str = "spki";
 /// The key of the spki engine in the detached-metadata dict.
 const SPKI_METADATA_KEY: &str = "ostree.sign.spki";
-/// The byte length of a raw P-256 scalar (a bare secret key).
-const P256_SCALAR_LEN: usize = 32;
 /// The label of the PEM blocks of a public key file.
 const PUBLIC_KEY_LABEL: &[u8] = b"PUBLIC KEY";
 
@@ -46,18 +49,24 @@ pub struct SpkiSigner {
 impl SpkiSigner {
     /// Creates a signer from a base64 secret key.
     ///
-    /// The function removes the leading and trailing white space of
-    /// `secret_b64`, for example the newline at the end of a key file. Then it
-    /// decodes the base64 text and reads the bytes as
+    /// The function removes each white space character of `secret_b64`, at
+    /// any position. White space is space, horizontal tab, LF, form feed, and
+    /// CR. So the text can hold the line breaks of a PEM body, LF or CRLF.
+    /// Then the function decodes the base64 text and reads the bytes as
     /// [`from_secret_key`](Self::from_secret_key) does.
     ///
     /// # Errors
     ///
-    /// - [`Error::Core`] if `secret_b64` is not valid base64 text.
+    /// - [`Error::Core`] if the text is not valid base64 after the white space
+    ///   is removed. A character outside the base64 alphabet is not valid.
     /// - [`Error::Signature`] if the decoded bytes are in no secret-key form
     ///   that [`from_secret_key`](Self::from_secret_key) accepts.
     pub fn from_base64(secret_b64: &str) -> Result<SpkiSigner> {
-        SpkiSigner::from_secret_key(&base64::decode(secret_b64.trim())?)
+        let der = match without_white_space(secret_b64) {
+            Cow::Borrowed(text) => base64::decode(text),
+            Cow::Owned(text) => base64::decode(&Zeroizing::new(text)),
+        };
+        SpkiSigner::from_secret_key(&Zeroizing::new(der?))
     }
 
     /// Creates a signer from the bytes of a secret key.
@@ -65,14 +74,20 @@ impl SpkiSigner {
     /// The function accepts these forms of `bytes`:
     ///
     /// - a PKCS#8 `PrivateKeyInfo` DER
-    /// - a SEC1 `ECPrivateKey` DER
-    /// - a raw 32-byte P-256 scalar
+    /// - a SEC1 `ECPrivateKey` DER with a `parameters` field that names the
+    ///   P-256 curve
     ///
     /// # Errors
     ///
+    /// - [`Error::Signature`] if `bytes` is a SEC1 `ECPrivateKey` DER with no
+    ///   `parameters` field. The message is `spki secret key: the SEC1 key
+    ///   does not name its curve`.
+    /// - [`Error::Signature`] if `bytes` is a SEC1 `ECPrivateKey` DER with a
+    ///   `parameters` field that names a curve other than P-256. The message
+    ///   is `spki secret key: the SEC1 key names a curve other than P-256`.
     /// - [`Error::Signature`] if the function cannot read `bytes` in one of
-    ///   these forms. The message is `spki secret key: expected PKCS#8 DER,
-    ///   SEC1 DER, or a 32-byte P-256 scalar`.
+    ///   these forms. The message is `spki secret key: expected PKCS#8 DER or
+    ///   SEC1 DER`. A raw 32-byte scalar is in no accepted form.
     pub fn from_secret_key(bytes: &[u8]) -> Result<SpkiSigner> {
         Ok(SpkiSigner {
             signing_key: decode_signing_key(bytes)?,
@@ -131,15 +146,15 @@ impl Signer for SpkiSigner {
 ///
 /// # Formats
 ///
-/// A signature is in DER form, the form that [`SpkiSigner`] writes. The
-/// verifier also accepts the fixed-width 64-byte `r || s` form.
-/// A blob in neither form does not verify.
+/// A signature is in DER form, the form that [`SpkiSigner`] writes. A blob
+/// in another form does not verify. The fixed-width 64-byte `r || s` form is
+/// such a blob.
 ///
 /// A public key is a SubjectPublicKeyInfo DER, which is the base64 body of a
-/// PEM `PUBLIC KEY` block. The verifier also accepts a bare SEC1 point. A
-/// public key file holds PEM `PUBLIC KEY` blocks, and [`spki_public_keys`]
-/// reads it. The `trusted.spki` and `revoked.spki` files of the system key
-/// store are public key files.
+/// PEM `PUBLIC KEY` block. A bare SEC1 point is not a public key of the
+/// verifier. A public key file holds PEM `PUBLIC KEY` blocks, and
+/// [`spki_public_keys`] reads it. The `trusted.spki` and `revoked.spki` files
+/// of the system key store are public key files.
 ///
 /// # Examples
 ///
@@ -147,7 +162,12 @@ impl Signer for SpkiSigner {
 /// use futures_lite::future::block_on;
 /// use ostrya_sign::{Signer, SpkiSigner, SpkiVerifier, Verifier};
 ///
-/// let signer = SpkiSigner::from_secret_key(&[7u8; 32])?;
+/// // The base64 of a PKCS#8 DER P-256 secret key.
+/// let signer = SpkiSigner::from_base64(concat!(
+///     "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg2L708EsnnzHER0SYasMNIUcG",
+///     "v63QapC/3kVsoPerzKGhRANCAATxfzfHKUPeJtyLTGMUoxHhvBS1NT9guWhUQPGiZRLZIcB8Wc3",
+///     "csdVU1iOiTRmbZGKJTtekOdEAbVRrx5HxIpst",
+/// ))?;
 /// let der = signer.public_key_der();
 /// let verifier = SpkiVerifier::new([der], Vec::<&[u8]>::new())?;
 /// let signature = block_on(signer.sign(b"commit bytes"))?;
@@ -174,9 +194,9 @@ impl SpkiVerifier {
     ///
     /// # Errors
     ///
-    /// - [`Error::Signature`] if a key in `trusted` or `revoked` is neither a
-    ///   SubjectPublicKeyInfo DER nor a SEC1 point. The message is
-    ///   `spki public key: expected SubjectPublicKeyInfo DER or a SEC1 point`.
+    /// - [`Error::Signature`] if a key in `trusted` or `revoked` is not a
+    ///   SubjectPublicKeyInfo DER. The message is
+    ///   `spki public key: expected SubjectPublicKeyInfo DER`.
     pub fn new<T, R>(trusted: T, revoked: R) -> Result<SpkiVerifier>
     where
         T: IntoIterator,
@@ -248,9 +268,9 @@ impl Verifier for SpkiVerifier {
     fn verify<'a>(&'a self, data: &'a [u8], signatures: &'a [Vec<u8>]) -> VerifyFuture<'a> {
         let mut outcome = VerifyOutcome::default();
         for blob in signatures {
-            // The verifier accepts a DER signature (the form of this engine)
-            // or the fixed-width r || s form.
-            let sig = Signature::from_der(blob).or_else(|_| Signature::from_slice(blob));
+            // The verifier reads a DER signature alone, the form of this
+            // engine. A blob in another form does not verify.
+            let sig = Signature::from_der(blob);
             let valid = match sig {
                 Ok(sig) => self.trusted.iter().any(|k| k.verify(data, &sig).is_ok()),
                 Err(_) => false,
@@ -351,36 +371,72 @@ fn public_keys(text: &[u8], subject: &str) -> Result<Vec<(Vec<u8>, VerifyingKey)
 }
 
 /// Decodes secret-key bytes into a [`SigningKey`]. The bytes are a PKCS#8
-/// `PrivateKeyInfo` DER, a SEC1 `ECPrivateKey` DER, or a raw 32-byte scalar.
+/// `PrivateKeyInfo` DER, or a SEC1 `ECPrivateKey` DER that names the P-256
+/// curve.
+///
+/// The check of the curve applies to a bare SEC1 key alone. The
+/// `ECPrivateKey` in a PKCS#8 key can have no `parameters` field, because the
+/// `AlgorithmIdentifier` of the PKCS#8 key names the curve.
 fn decode_signing_key(bytes: &[u8]) -> Result<SigningKey> {
     if let Ok(key) = SigningKey::from_pkcs8_der(bytes) {
         return Ok(key);
     }
     if let Ok(secret) = SecretKey::from_sec1_der(bytes) {
-        return Ok(SigningKey::from(&secret));
+        return match sec1_curve(bytes) {
+            Ok(Some(curve)) if curve == NistP256::OID => Ok(SigningKey::from(&secret)),
+            Ok(Some(_)) => Err(Error::Signature(
+                "spki secret key: the SEC1 key names a curve other than P-256".into(),
+            )),
+            Ok(None) => Err(Error::Signature(
+                "spki secret key: the SEC1 key does not name its curve".into(),
+            )),
+            Err(_) => Err(not_a_secret_key()),
+        };
     }
-    if bytes.len() == P256_SCALAR_LEN
-        && let Ok(key) = SigningKey::from_slice(bytes)
-    {
-        return Ok(key);
+    Err(not_a_secret_key())
+}
+
+/// Returns the error for secret-key bytes in no accepted form.
+fn not_a_secret_key() -> Error {
+    Error::Signature("spki secret key: expected PKCS#8 DER or SEC1 DER".into())
+}
+
+/// Returns `text` with each ASCII white space character removed.
+///
+/// The function copies `text` only if it holds white space.
+fn without_white_space(text: &str) -> Cow<'_, str> {
+    if !text.bytes().any(|b| b.is_ascii_whitespace()) {
+        return Cow::Borrowed(text);
     }
-    Err(Error::Signature(
-        "spki secret key: expected PKCS#8 DER, SEC1 DER, or a 32-byte P-256 scalar".into(),
-    ))
+    let mut out = String::with_capacity(text.len());
+    out.extend(text.chars().filter(|c| !c.is_ascii_whitespace()));
+    Cow::Owned(out)
+}
+
+/// Returns the curve OID of the `parameters` field of a SEC1 `ECPrivateKey`
+/// DER, or `None` if the key has no `parameters` field.
+///
+/// The structure is `SEQUENCE { version INTEGER, privateKey OCTET STRING,
+/// parameters [0] ECParameters OPTIONAL, publicKey [1] BIT STRING OPTIONAL }`.
+/// The function reads a named curve alone. Other `ECParameters` give an
+/// error.
+fn sec1_curve(bytes: &[u8]) -> der::Result<Option<ObjectIdentifier>> {
+    let mut reader = SliceReader::new(bytes)?;
+    let curve = reader.sequence(|seq| {
+        u8::decode(seq)?;
+        OctetStringRef::decode(seq)?;
+        let parameters = ContextSpecific::<ObjectIdentifier>::decode_explicit(seq, TagNumber::N0)?;
+        seq.read_slice(seq.remaining_len())?;
+        Ok(parameters.map(|field| field.value))
+    })?;
+    reader.finish(curve)
 }
 
 /// Decodes public-key bytes into a [`VerifyingKey`]. The bytes are a
-/// SubjectPublicKeyInfo DER or a bare SEC1 point.
+/// SubjectPublicKeyInfo DER.
 fn decode_verifying_key(bytes: &[u8]) -> Result<VerifyingKey> {
-    if let Ok(vk) = VerifyingKey::from_public_key_der(bytes) {
-        return Ok(vk);
-    }
-    if let Ok(vk) = VerifyingKey::from_sec1_bytes(bytes) {
-        return Ok(vk);
-    }
-    Err(Error::Signature(
-        "spki public key: expected SubjectPublicKeyInfo DER or a SEC1 point".into(),
-    ))
+    VerifyingKey::from_public_key_der(bytes)
+        .map_err(|_| Error::Signature("spki public key: expected SubjectPublicKeyInfo DER".into()))
 }
 
 #[cfg(test)]
@@ -394,7 +450,9 @@ mod tests {
 
     /// Returns a signer of the scalar `[byte; 32]`.
     fn signer(byte: u8) -> SpkiSigner {
-        SpkiSigner::from_secret_key(&[byte; 32]).unwrap()
+        SpkiSigner {
+            signing_key: SigningKey::from_slice(&[byte; 32]).unwrap(),
+        }
     }
 
     /// Returns a PEM block of `label` around `der`, with 64-column lines.
@@ -513,5 +571,192 @@ mod tests {
         );
         assert!(SpkiVerifier::from_pem("").unwrap().is_empty());
         assert!(SpkiVerifier::from_pem(base64::encode(&a.public_key_der())).is_err());
+    }
+
+    /// The SubjectPublicKeyInfo DER of the fixture key, in base64.
+    const PUBLIC_SPKI_B64: &str = concat!(
+        "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE8X83xylD3ibci0xjFKMR4bwUtTU/",
+        "YLloVEDxomUS2SHAfFnN3LHVVNYjok0Zm2RiiU7XpDnRAG1Ua8eR8SKbLQ==",
+    );
+    /// The secret key of the fixture, base64 of the PKCS#8 DER.
+    const SECRET_PKCS8_B64: &str = concat!(
+        "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg2L708EsnnzHER0SYasMNIUcG",
+        "v63QapC/3kVsoPerzKGhRANCAATxfzfHKUPeJtyLTGMUoxHhvBS1NT9guWhUQPGiZRLZIcB8Wc3",
+        "csdVU1iOiTRmbZGKJTtekOdEAbVRrx5HxIpst",
+    );
+    /// The secret key of the fixture, base64 of the SEC1 DER with the curve
+    /// in its `parameters` field.
+    const SECRET_SEC1_B64: &str = concat!(
+        "MHcCAQEEINi+9PBLJ58xxEdEmGrDDSFHBr+t0GqQv95FbKD3q8yhoAoGCCqGSM49AwEHoUQD",
+        "QgAE8X83xylD3ibci0xjFKMR4bwUtTU/YLloVEDxomUS2SHAfFnN3LHVVNYjok0Zm2RiiU7XpDn",
+        "RAG1Ua8eR8SKbLQ==",
+    );
+
+    /// Returns `b64` with a line break after each 64 characters.
+    fn wrapped(b64: &str, line_end: &str) -> String {
+        b64.as_bytes()
+            .chunks(64)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect::<Vec<_>>()
+            .join(line_end)
+    }
+
+    /// Returns the message of a signature error.
+    fn message<T>(result: Result<T>) -> String {
+        match result {
+            Err(Error::Signature(m)) => m,
+            Err(other) => panic!("not a signature error: {other}"),
+            Ok(_) => panic!("the call has to fail"),
+        }
+    }
+
+    #[test]
+    fn inline_secret_keys_in_pkcs8_and_sec1_are_accepted() {
+        let want = base64::decode(PUBLIC_SPKI_B64).unwrap();
+        for b64 in [SECRET_PKCS8_B64, SECRET_SEC1_B64] {
+            for text in [
+                b64.to_owned(),
+                wrapped(b64, "\n"),
+                wrapped(b64, "\r\n"),
+                format!(" \t{}\n", wrapped(b64, "\n\x0c")),
+            ] {
+                let signer = SpkiSigner::from_base64(&text).unwrap();
+                assert_eq!(signer.public_key_der(), want, "{text:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_raw_scalar_is_refused() {
+        let scalar = [7u8; 32];
+        let refused = "spki secret key: expected PKCS#8 DER or SEC1 DER";
+        assert_eq!(message(SpkiSigner::from_secret_key(&scalar)), refused);
+        assert_eq!(
+            message(SpkiSigner::from_base64(&base64::encode(&scalar))),
+            refused
+        );
+    }
+
+    #[test]
+    fn a_sec1_key_with_no_curve_is_refused() {
+        let secret = SecretKey::from_slice(&[7u8; 32]).unwrap();
+        // This encoder writes no `parameters` field.
+        let der = secret.to_sec1_der().unwrap();
+        assert_eq!(sec1_curve(&der).unwrap(), None);
+        assert_eq!(
+            message(SpkiSigner::from_secret_key(&der)),
+            "spki secret key: the SEC1 key does not name its curve"
+        );
+        let named = base64::decode(SECRET_SEC1_B64).unwrap();
+        assert_eq!(
+            sec1_curve(&named).unwrap(),
+            Some(ObjectIdentifier::new_unwrap("1.2.840.10045.3.1.7"))
+        );
+    }
+
+    #[test]
+    fn a_sec1_key_of_another_curve_is_refused() {
+        // The SEC1 key of the fixture, with secp384r1 in its `parameters`
+        // field.
+        let der = base64::decode(concat!(
+            "MHQCAQEEINi+9PBLJ58xxEdEmGrDDSFHBr+t0GqQv95FbKD3q8yhoAcGBSuBBAAioUQD",
+            "QgAE8X83xylD3ibci0xjFKMR4bwUtTU/YLloVEDxomUS2SHAfFnN3LHVVNYjok0Zm2RiiU7XpDn",
+            "RAG1Ua8eR8SKbLQ==",
+        ))
+        .unwrap();
+        assert_eq!(
+            sec1_curve(&der).unwrap(),
+            Some(ObjectIdentifier::new_unwrap("1.3.132.0.34"))
+        );
+        assert_eq!(
+            message(SpkiSigner::from_secret_key(&der)),
+            "spki secret key: the SEC1 key names a curve other than P-256"
+        );
+    }
+
+    #[test]
+    fn other_inline_secret_forms_are_refused() {
+        let pem_text = pem_block("PRIVATE KEY", &base64::decode(SECRET_PKCS8_B64).unwrap());
+        assert_eq!(
+            message(SpkiSigner::from_base64(&base64::encode(
+                pem_text.as_bytes()
+            ))),
+            "spki secret key: expected PKCS#8 DER or SEC1 DER"
+        );
+        assert!(SpkiSigner::from_base64(&pem_text).is_err());
+        for junk in [
+            format!("{SECRET_PKCS8_B64}!"),
+            format!("{}!{}", &SECRET_PKCS8_B64[..20], &SECRET_PKCS8_B64[20..]),
+            format!("{}\x0b{}", &SECRET_PKCS8_B64[..20], &SECRET_PKCS8_B64[20..]),
+        ] {
+            assert!(
+                matches!(SpkiSigner::from_base64(&junk), Err(Error::Core(_))),
+                "{junk:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_public_key_is_a_subject_public_key_info() {
+        let key = signer(7).signing_key.verifying_key().to_owned();
+        let uncompressed = key.to_public_key_der().unwrap().as_bytes().to_vec();
+        // The SubjectPublicKeyInfo of the compressed point: the header of the
+        // P-256 key, then a BIT STRING of 34 bytes.
+        let mut compressed = base64::decode("MDkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDIgA=").unwrap();
+        compressed.extend_from_slice(key.to_encoded_point(true).as_bytes());
+        for der in [&uncompressed, &compressed] {
+            assert!(
+                !SpkiVerifier::new([der], Vec::<&[u8]>::new())
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        let refused = "spki public key: expected SubjectPublicKeyInfo DER";
+        let point = key.to_encoded_point(false);
+        let point_compressed = key.to_encoded_point(true);
+        let pkcs8 = base64::decode(SECRET_PKCS8_B64).unwrap();
+        let pem_text = pem_block("PUBLIC KEY", &uncompressed);
+        for bytes in [
+            point.as_bytes(),
+            point_compressed.as_bytes(),
+            &pkcs8,
+            pem_text.as_bytes(),
+        ] {
+            assert_eq!(
+                message(SpkiVerifier::new([bytes], Vec::<&[u8]>::new())),
+                refused
+            );
+            assert_eq!(
+                message(SpkiVerifier::new([&uncompressed[..]], [bytes])),
+                refused
+            );
+        }
+    }
+
+    #[test]
+    fn a_pem_block_with_a_sec1_point_is_refused() {
+        let point = signer(7)
+            .signing_key
+            .verifying_key()
+            .to_encoded_point(false);
+        let text = pem_block("PUBLIC KEY", point.as_bytes());
+        assert_eq!(
+            message(SpkiVerifier::from_pem(&text)),
+            "the spki public key text, line 1: the PUBLIC KEY block holds no P-256 public key"
+        );
+    }
+
+    #[test]
+    fn a_fixed_width_signature_does_not_verify() {
+        let signer = signer(7);
+        let verifier = SpkiVerifier::new([signer.public_key_der()], Vec::<&[u8]>::new()).unwrap();
+        let der = block_on(signer.sign(b"data")).unwrap();
+        let fixed = Signature::from_der(&der).unwrap().to_bytes().to_vec();
+        assert_eq!(fixed.len(), 64);
+        let outcome = block_on(verifier.verify(b"data", &[fixed])).unwrap();
+        assert!(!outcome.valid);
+        assert!(outcome.signatures[0].key_missing);
+        assert!(block_on(verifier.verify(b"data", &[der])).unwrap().valid);
     }
 }

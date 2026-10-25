@@ -1950,16 +1950,37 @@ revoked set, so a key in both sets is refused.
 The signature key is `ostree.sign.spki`, and the algorithm is ECDSA over NIST
 P-256 with SHA-256, over the commit bytes of the other engines. The signature
 is DER-encoded ECDSA: an ASN.1 `SEQUENCE` of the two integers `r` and `s`,
-about 70 to 72 bytes. A public key is the X.509 SubjectPublicKeyInfo DER, the
-base64 body of a PEM `PUBLIC KEY` block. A secret key is base64, and the
-decoded bytes are a PKCS#8 `PrivateKeyInfo` DER, a SEC1 `ECPrivateKey` DER, or
-a raw 32-byte scalar. The key store has the layout of the ed25519 store:
-`trusted.spki`, `revoked.spki`, and their `.d` directories under `/etc/ostree`
-and `<datadir>/ostree`. Its effective trusted set is also the trusted set
-minus the revoked set.
+about 70 to 72 bytes. The verifier reads the DER form alone. A blob in another
+form does not verify, and the commit can carry other signatures. The
+fixed-width 64-byte `r || s` form of a valid signature is such a blob. A
+public key is the X.509 SubjectPublicKeyInfo DER, the base64 body of a PEM
+`PUBLIC KEY` block. A raw SEC1 point is not a public key. A secret key is a
+PKCS#8 `PrivateKeyInfo` DER, or a SEC1 `ECPrivateKey` DER with a `parameters`
+field that names the P-256 curve. A SEC1 key with no `parameters` field, a
+SEC1 key whose `parameters` field names another curve, and a raw 32-byte scalar
+are refused. The `ECPrivateKey` in a PKCS#8 key can have no
+`parameters` field, because the `AlgorithmIdentifier` of the PKCS#8 key names
+the curve. The key store has the layout of the ed25519 store: `trusted.spki`,
+`revoked.spki`, and their `.d` directories under `/etc/ostree` and
+`<datadir>/ostree`. Its effective trusted set is also the trusted set minus
+the revoked set.
+
+An inline secret key, as a positional key of `sign` or the value of a
+`--sign`, is the base64 of the secret key DER. The base64 text can hold the
+line breaks of a PEM body, LF or CRLF: the reader removes each space,
+horizontal tab, LF, form feed, and CR, then decodes the text. The decode
+removes each `=` at the end of the text, so the padding is optional, and more
+`=` than the padding is accepted. The decode does not check the unused low bits
+of the last character. It refuses an `=` at another position, one character
+after the last full group of four, and each other character outside the base64
+alphabet. The base64 of the full PEM text, with its `-----BEGIN` line, is
+refused.
 
 An inline public key, as a positional key of a verify or
-`verification-spki-key`, is the base64 of the SubjectPublicKeyInfo DER.
+`verification-spki-key`, is the base64 of the SubjectPublicKeyInfo DER, also
+with the line breaks of a PEM body. In the config file, a line break of
+`verification-spki-key` is the escape `\n`. The base64 of the full PEM text,
+the base64 of a raw SEC1 point, and the base64 of a secret key are refused.
 
 A public key file holds PEM `PUBLIC KEY` blocks, and each block holds one
 SubjectPublicKeyInfo DER. These files are public key files: each file of the

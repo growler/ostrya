@@ -1293,6 +1293,13 @@ Each configuration key selects one check:
 - `verification-<engine>-key` holds one key. A list under either separator
   fails with `error: Failed loading 'ed25519' keys from inline
   verification-key`.
+- `verification-spki-key` is the base64 of a SubjectPublicKeyInfo DER, also
+  with line breaks, which `ostree config set` writes as the escape `\n`. A key
+  in another form fails each pull with `error: Can't verify commit
+  <checksum>: openssl: Failed to initialize spki key`, also when
+  `verification-spki-file` holds the valid key. The base64 of a raw SEC1
+  point, of the full PEM text, and of a PKCS#8 secret key are such keys.
+  `static-delta`, "spki inline keys", names the tool build.
 - `verification-ed25519-file` holds one key on each line. The tool accepts a
   commit that the key of any line signed.
 - `verification-spki-file` holds PEM `PUBLIC KEY` blocks, under the rules of
@@ -2485,7 +2492,8 @@ the detached metadata of the commit by the rules of `../format-reference.md`,
 - `--sign=KEY_ID` adds one signature for each occurrence under the engine that
   `--sign-type` names, in command-line order, with no deduplication. For
   `ed25519` the value is the base64 form of the 64-byte secret key
-  (`../format-reference.md`, "ed25519").
+  (`../format-reference.md`, "ed25519"). For `spki` the value is the base64
+  of a secret key DER (`static-delta`, "spki inline keys").
 - `--sign-from-file=PATH` adds one signature for each occurrence. It reads the
   key from the first line of the file. The command ignores the rest of the
   file. A trailing newline is optional, and the decode skips surrounding
@@ -4574,7 +4582,8 @@ Under the `ed25519` engine, `sign --verify` takes the key sources that
 `spki` engine. The tool decodes a KEY-ID and an ed25519 `--keys-file` line
 with the lenient base64 reader of `commit --sign` (`commit`, "Signing"). An
 spki `--keys-file` and each spki file of the key store hold PEM `PUBLIC KEY`
-blocks (`static-delta`, "spki public key files").
+blocks (`static-delta`, "spki public key files"). An spki KEY-ID is the
+base64 of a SubjectPublicKeyInfo DER (`static-delta`, "spki inline keys").
 
 Where a key source does not load, the tool refuses the run at exit 1, with
 nothing on standard output. The refusals are:
@@ -5133,7 +5142,8 @@ of step 3.
 
 These rules apply to the `ed25519` engine. The port also applies them to the
 `spki` engine, where a `--keys-file` and each file of the key store hold PEM
-`PUBLIC KEY` blocks ("spki public key files").
+`PUBLIC KEY` blocks ("spki public key files"), and a KEY-ID is the base64 of
+a SubjectPublicKeyInfo DER ("spki inline keys").
 
 - The tool trusts each positional KEY-ID and each key of the last
   `--keys-file`, in that load order. It does not read an earlier
@@ -5202,6 +5212,49 @@ The `ostree` 2026.1 build with OpenSSL on the NixOS development host reads a
   `revoked.spki` of base64 lines revokes no key.
 
 `cli-surface.md`, "P2", `static-delta`, records the port side.
+
+#### spki inline keys
+
+The `ostree` 2026.1 build with OpenSSL on the NixOS development host reads an
+inline key of the spki engine as base64 text. Observed on 2026-10-25, with
+P-256 keys:
+
+- A secret key of `sign`, `commit --sign`, and `static-delta generate --sign`
+  is the base64 of a PKCS#8 DER or of a SEC1 DER. The tool signs with each of
+  the two, also when the base64 text holds LF or CRLF line breaks.
+- The decode of a secret key skips characters outside the base64 alphabet,
+  by the rule of `commit`, "Signing". A space, a tab, a form feed, or a `!`
+  at any position, the end included, does not stop the signature. Text after
+  the padding does not stop it either. A key whose base64 ends in `==` is
+  refused with no `=` and with one `=`. The tool signs with three or four `=`
+  at the end, and with a last character whose unused low bits are not zero.
+- These secret keys refuse the run at exit 1: a SEC1 key with no
+  `parameters` field, a SEC1 key whose `parameters` field names secp384r1,
+  the base64 of a raw 32-byte scalar, and the base64 of the full PEM text.
+  `sign` and `commit` report `error: Not able to sign the cobject: openssl:
+  Failed to initialize spki key`, and `commit` moves no ref. `static-delta
+  generate` writes its statistics lines, then reports `error: openssl: Failed
+  to initialize spki key`, and writes no superblock.
+- `summary -u --sign-type=spki --sign=KEY` with each of these secret keys
+  reports `error: openssl: Failed to initialize spki key` at exit 1, with
+  nothing on standard output. The repository holds a signed `summary`, and a
+  new ref that a regeneration adds to it. The SHA-256 of `summary` and of
+  `summary.sig` is the same before and after the run. A `summary -u` with no
+  key then writes a different `summary` and removes `summary.sig`.
+- A public key of `sign --verify` and `static-delta verify` is the base64 of
+  a SubjectPublicKeyInfo DER, also with the line breaks of a PEM body.
+- `sign --verify` with a positional key in another form: the base64 of a raw
+  SEC1 point, compressed or uncompressed, of the full PEM text, or of a
+  PKCS#8 secret key. Beside a valid key, in either order, the tool verifies
+  at exit 0 and writes no message for the other key. Alone, it reports
+  `error: No valid signatures found` at exit 1.
+- `static-delta verify --sign-type=spki` with a positional key of these forms.
+  Before a valid key, the tool prints `Verification OK` at exit 0. Alone, or
+  after a valid key, the tool prints `Verification fails` and reports
+  `error: openssl: Failed to initialize spki key` at exit 1.
+
+`cli-surface.md`, "P2", `commit`, `summary`, `static-delta`, `sign`, and
+`remote`, records the port side.
 
 #### `apply-offline`
 

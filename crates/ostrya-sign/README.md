@@ -25,8 +25,11 @@ API documentation: <https://docs.rs/ostrya-sign>
 
 - `smol` (default): with `sign-gpg`, `GpgSigner` runs `gpg` on `smol`.
 - `tokio`: with `sign-gpg`, `GpgSigner` runs `gpg` on `tokio`.
-- `sign-spki`: the spki engine, `SpkiSigner` and `SpkiVerifier`, and
-  `spki_public_keys`, which reads the keys of a public key file.
+- `sign-spki`: the spki engine, `SpkiSigner` and `SpkiVerifier`,
+  `spki_public_keys`, which reads the keys of a public key file,
+  `spki_secret_keys`, which reads the signers of a PEM secret key file,
+  and `spki_secret_key_lines`, which reads the signers of a file of base64
+  key lines.
 - `sign-gpg`: `GpgSigner`, which signs with the `gpg` command.
 
 ## Examples

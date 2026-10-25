@@ -770,9 +770,11 @@ The key is necessary.
 \fB\%dummy\fR is refused.
 .TP
 \fB\%secret\-key\-file\fR (string)
-For \fB\%ed25519\fR and \fB\%spki\fR: a regular file of at most 1 MiB that holds exactly one line that is not blank, a base64 secret key.
-For \fB\%ed25519\fR, the key is the 64\-byte seed and public key.
-For \fB\%spki\fR, the key is a PKCS#8 DER or a SEC1 DER that names the P\-256 curve, as \fB\%ostrya sign\fR takes it.
+For \fB\%ed25519\fR and \fB\%spki\fR: a regular file of at most 1 MiB.
+For \fB\%ed25519\fR, the file holds exactly one line that is not blank, the base64 of the 64\-byte seed and public key.
+For \fB\%spki\fR, the file holds PEM \fB\%PRIVATE KEY\fR blocks, each a PKCS#8 DER of a P\-256 key, as \fB\%ostrya sign \-\-keys\-file\fR takes them.
+Each block gives one signing key, in the order of the file.
+An empty file, a file with no block, a block with another label, and a block that holds no P\-256 PKCS#8 key are refused.
 .TP
 \fB\%gpg\-key\fR (string)
 For \fB\%gpg\fR: a selector that names exactly one secret key.

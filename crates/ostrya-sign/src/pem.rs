@@ -20,6 +20,8 @@
 //!
 //! The splitter works on bytes. The text outside the blocks can hold any byte.
 
+use p256::elliptic_curve::zeroize::Zeroizing;
+
 /// The prefix of a BEGIN line.
 const BEGIN: &[u8] = b"-----BEGIN ";
 /// The prefix of an END line.
@@ -57,9 +59,12 @@ impl Block<'_> {
     ///   the line number.
     /// - A message if `pem-rfc7468` refuses the block, or if the body holds no
     ///   data.
-    pub(crate) fn decode(&self) -> Result<Vec<u8>, String> {
+    ///
+    /// The block can hold a secret key, so the function wipes the copy of the
+    /// block that it builds, and the decoded bytes are wiped when they drop.
+    pub(crate) fn decode(&self) -> Result<Zeroizing<Vec<u8>>, String> {
         let boundaries = BEGIN.len() + END.len() + 2 * (self.label.len() + DASHES.len() + 1);
-        let mut text = Vec::with_capacity(self.body.len() + boundaries);
+        let mut text = Zeroizing::new(Vec::with_capacity(self.body.len() + boundaries));
         text.extend_from_slice(BEGIN);
         text.extend_from_slice(self.label);
         text.extend_from_slice(DASHES);
@@ -81,11 +86,29 @@ impl Block<'_> {
         text.extend_from_slice(self.label);
         text.extend_from_slice(DASHES);
         text.push(b'\n');
-        let (_, bytes) = pem_rfc7468::decode_vec(&text).map_err(|e| e.to_string())?;
+        // The decoder writes into a buffer that is wiped when it drops, also
+        // when a later line fails to decode.
+        let mut bytes = Zeroizing::new(Vec::new());
+        pem_rfc7468::Decoder::new(&text)
+            .and_then(|mut decoder| decoder.decode_to_end(&mut bytes).map(|_| ()))
+            .map_err(|e| headers_error(&text, e).to_string())?;
         if bytes.is_empty() {
             return Err("the block holds no data".into());
         }
         Ok(bytes)
+    }
+}
+
+/// Returns the error of a block `text` that `pem-rfc7468` refuses.
+///
+/// A body with a colon holds a header line, which is never base64. The
+/// function gives the header error for such a body in place of the base64
+/// error.
+fn headers_error(text: &[u8], err: pem_rfc7468::Error) -> pem_rfc7468::Error {
+    if matches!(err, pem_rfc7468::Error::Base64(_)) && text.contains(&b':') {
+        pem_rfc7468::Error::HeaderDisallowed
+    } else {
+        err
     }
 }
 

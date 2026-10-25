@@ -70,7 +70,7 @@ use ostrya::{
 #[cfg(feature = "gpg")]
 use ostrya::{GpgSigner, GpgVerifier, SignatureInfo};
 #[cfg(feature = "spki")]
-use ostrya::{SpkiSigner, SpkiVerifier, spki_public_keys};
+use ostrya::{SpkiSigner, SpkiVerifier, spki_public_keys, spki_secret_key_lines, spki_secret_keys};
 
 use pcre2::bytes::{CaptureLocations, RegexBuilder};
 
@@ -1093,12 +1093,16 @@ struct CommitArgs {
     /// --sign keys, then the --sign-from-file keys, then the --gpg-sign keys.
     #[arg(long, value_name = "KEY_ID")]
     sign: Vec<String>,
-    /// Sign the commit with the key on the first line of this file.
+    /// Sign the commit with the key of this file.
     ///
-    /// The command ignores the rest of the file. A NUL byte ends the line, and
-    /// the command refuses a first line of more than 65536 bytes. Each
-    /// occurrence adds one signature. The command refuses an empty path with
-    /// a message of its own.
+    /// Each occurrence adds one signature. For ed25519 and gpg, the key is on
+    /// the first line of the file, and the command ignores the rest of the
+    /// file. A NUL byte ends the line, and the command refuses a first line of
+    /// more than 65536 bytes. For spki, the file holds one PEM `PRIVATE KEY`
+    /// block, a PKCS#8 DER, and the command ignores the text outside the
+    /// block. The command refuses an spki file of more than one block. The
+    /// spki file is a regular file of at most 1 MiB. The command refuses an
+    /// empty path with a message of its own.
     #[arg(long, value_name = "PATH")]
     sign_from_file: Vec<std::ffi::OsString>,
     /// The signature engine of --sign and --sign-from-file.
@@ -2180,9 +2184,10 @@ struct RemoteSummaryArgs {
     /// With -u, sign the summary with the keys of this file, in the format of
     /// `ostrya sign`.
     ///
-    /// The command reads every file, and each key adds one signature after
-    /// each --sign key. The gpg engine refuses this option. The option needs
-    /// -u.
+    /// For ed25519, the file has base64 secret keys, one per line. For spki,
+    /// the file holds PEM `PRIVATE KEY` blocks, each a PKCS#8 DER. The command
+    /// reads every file, and each key adds one signature after each --sign
+    /// key. The gpg engine refuses this option. The option needs -u.
     #[cfg(feature = "s3")]
     #[arg(long, value_name = "PATH", requires = "update")]
     keys_file: Vec<std::ffi::OsString>,
@@ -2533,10 +2538,12 @@ struct SignArgs {
     /// Read keys from a file.
     ///
     /// For ed25519, the file has base64 keys, one per line: secret keys to
-    /// sign, public keys to verify and delete. For spki, the file has base64
-    /// keys, one per line, to sign and delete, and PEM `PUBLIC KEY` blocks to
-    /// verify. Signing and delete read every file. For an ed25519 or spki
-    /// verify, the last value wins. With
+    /// sign, public keys to verify and delete. For spki, the file holds PEM
+    /// `PRIVATE KEY` blocks, each a PKCS#8 DER, to sign, and PEM `PUBLIC KEY`
+    /// blocks to verify and delete. Each `PRIVATE KEY` block adds one
+    /// signature. Signing and delete read every file. A signing or delete file
+    /// is a regular file of at most 1 MiB. For an ed25519 or spki verify, the
+    /// last value wins. With
     /// this option or a KEY-ID, that verify does not read --keys-dir or the
     /// system key directories.
     ///
@@ -2722,9 +2729,11 @@ struct SummaryArgs {
     metadata_commit_timestamp: Option<u64>,
     /// Read keys from a file, in the format of `ostrya sign`.
     ///
-    /// For an ed25519 or spki verify, the last value wins. With this option or
-    /// a KEY-ID, that verify does not read --keys-dir or the system key
-    /// directories. A signing run reads every file. A gpg verify reads every
+    /// For spki, a signing file holds PEM `PRIVATE KEY` blocks, and a verify
+    /// file holds PEM `PUBLIC KEY` blocks. For an ed25519 or spki verify, the
+    /// last value wins. With this option or a KEY-ID, that verify does not read
+    /// --keys-dir or the system key directories. A signing run reads every
+    /// file. A gpg verify reads every
     /// file as a keyring, and a gpg signing run refuses this option. Without -u
     /// and --verify, the keys sign the existing summary.
     #[arg(long, value_name = "PATH")]
@@ -3039,10 +3048,15 @@ struct DeltaGenerateArgs {
     /// The signature engine for --sign and --keys-file.
     #[arg(short = 's', long = "sign-type", default_value = "ed25519")]
     sign_type: SignType,
-    /// Read signing keys from a file, in the format of `ostrya sign`.
+    /// Read signing keys from a file.
     ///
-    /// The option can occur more than once. The gpg engine refuses this
-    /// option.
+    /// For ed25519, the file has base64 secret keys, one per line, as for
+    /// `ostrya sign`. For spki, each line is the base64 of one secret key, a
+    /// PKCS#8 DER or a SEC1 DER that names the P-256 curve. A line ends at LF
+    /// or CRLF, and the last line can have no line end. The command refuses an
+    /// empty spki file, an empty line, and a line with white space. Each key
+    /// adds one signature. The option can occur more than once, and the
+    /// command reads every file. The gpg engine refuses this option.
     #[arg(long)]
     keys_file: Vec<PathBuf>,
     /// The GnuPG home directory where gpg resolves signing keys.
@@ -6984,6 +6998,10 @@ fn delta_signers(args: &DeltaGenerateArgs) -> Result<Vec<Arc<dyn Signer>>> {
                 .into(),
         ));
     }
+    #[cfg(feature = "spki")]
+    if args.sign_type == SignType::Spki {
+        return delta_spki_signers(args);
+    }
     let mut keys = args.sign.clone();
     for path in &args.keys_file {
         keys.extend(read_key_lines(path)?);
@@ -7001,6 +7019,44 @@ fn delta_signers(args: &DeltaGenerateArgs) -> Result<Vec<Arc<dyn Signer>>> {
             }
         })
         .collect()
+}
+
+/// Returns the signers of a `static-delta generate` run under spki.
+///
+/// There is one signer for each `--sign` value, then one for each line of
+/// each `--keys-file`, as [`delta_spki_key_lines`] reads the file. The
+/// command reads every file before it decodes a `--sign` value.
+#[cfg(feature = "spki")]
+fn delta_spki_signers(args: &DeltaGenerateArgs) -> Result<Vec<Arc<dyn Signer>>> {
+    let mut from_files = Vec::new();
+    for path in &args.keys_file {
+        from_files.extend(delta_spki_key_lines(path)?);
+    }
+    let mut signers: Vec<Arc<dyn Signer>> = Vec::with_capacity(args.sign.len() + from_files.len());
+    for key in &args.sign {
+        match sign_api_signer(SignType::Spki, key.as_bytes(), None) {
+            Ok(signer) => signers.push(Arc::from(signer)),
+            Err(message) => exit_error(&message),
+        }
+    }
+    signers.extend(
+        from_files
+            .into_iter()
+            .map(|signer| Arc::new(signer) as Arc<dyn Signer>),
+    );
+    Ok(signers)
+}
+
+/// Returns one spki signer for each line of a `static-delta generate`
+/// `--keys-file`.
+///
+/// The file is read as [`read_signing_key_file`] reads it.
+/// `spki_secret_key_lines` of the `ostrya` crate reads the lines and states
+/// the rules of the file.
+#[cfg(feature = "spki")]
+fn delta_spki_key_lines(path: &Path) -> Result<Vec<SpkiSigner>> {
+    let bytes = read_signing_key_file(path)?;
+    Ok(spki_secret_key_lines(bytes, &key_file_subject(path))?)
 }
 
 /// The literal `--parent` value that asks for a root commit.
@@ -7583,6 +7639,7 @@ async fn sign_staged_commit(
 ///
 /// - a key that does not decode
 /// - a key file that does not read
+/// - an spki key file of more than one `PRIVATE KEY` block
 /// - a gpg selector that does not name exactly one secret key
 ///
 /// A gpg selector is a `--gpg-sign` key, or a `--sign` or `--sign-from-file`
@@ -7621,6 +7678,10 @@ async fn collect_signers(
                 )));
             }
             for path in sign_from_file {
+                if engine == SignType::Spki {
+                    signers.push(refuse!(sign_from_file_spki(Path::new(path))));
+                    continue;
+                }
                 let key = refuse!(read_sign_key_file(Path::new(path)));
                 signers.push(refuse!(sign_api_signer(engine, &key, gpg_homedir)));
             }
@@ -7773,6 +7834,44 @@ fn sign_api_signer_spki(key: &str) -> std::result::Result<Box<dyn Signer>, Strin
 /// Returns an error, because this build has no spki engine.
 #[cfg(not(feature = "spki"))]
 fn sign_api_signer_spki(_: &str) -> std::result::Result<Box<dyn Signer>, String> {
+    Err("Requested signature type is not implemented".to_owned())
+}
+
+/// Returns the spki signer of one `--sign-from-file` file, which holds one
+/// `PRIVATE KEY` block.
+///
+/// The command reads the whole file, as [`read_signing_key_file`] reads it.
+/// An empty path, and a missing file, give the refusals of
+/// [`read_sign_key_file`]. A file of more than one block is refused.
+#[cfg(feature = "spki")]
+fn sign_from_file_spki(path: &Path) -> std::result::Result<Box<dyn Signer>, String> {
+    if path.as_os_str().is_empty() {
+        return Err("Operation not supported".to_owned());
+    }
+    let mut signers = match spki_key_file_signers(path) {
+        Ok(signers) => signers,
+        Err(Error::Io(err)) => {
+            return Err(format!(
+                "Error opening file {}: {}",
+                path.display(),
+                io_reason(&err)
+            ));
+        }
+        Err(err) => return Err(err.to_string()),
+    };
+    match (signers.pop(), signers.is_empty()) {
+        (Some(signer), true) => Ok(Box::new(signer)),
+        _ => Err(Error::Signature(format!(
+            "{} holds more than one PEM PRIVATE KEY block",
+            key_file_subject(path)
+        ))
+        .to_string()),
+    }
+}
+
+/// Returns an error, because this build has no spki engine.
+#[cfg(not(feature = "spki"))]
+fn sign_from_file_spki(_: &Path) -> std::result::Result<Box<dyn Signer>, String> {
     Err("Requested signature type is not implemented".to_owned())
 }
 
@@ -13292,17 +13391,15 @@ async fn summary_extension_signers(
     }
 }
 
-/// Returns an spki signer for each summary secret key.
+/// Returns an spki signer for each positional summary secret key, then for
+/// each `PRIVATE KEY` block of each `--keys-file`, in order.
 #[cfg(feature = "spki")]
 fn summary_signers_spki(args: &SummarySigning<'_>) -> Result<Vec<Box<dyn Signer>>> {
-    summary_secret_keys(args)?
-        .iter()
-        .map(|key| {
-            SpkiSigner::from_base64(key)
-                .map(|signer| Box::new(signer) as Box<dyn Signer>)
-                .map_err(Error::from)
-        })
-        .collect()
+    let signers = spki_signers(args.key_id, args.keys_file, no_summary_key(args.remote))?;
+    Ok(signers
+        .into_iter()
+        .map(|signer| Box::new(signer) as Box<dyn Signer>)
+        .collect())
 }
 
 /// Returns an error, because this build has no spki engine.
@@ -13345,14 +13442,21 @@ fn summary_secret_keys(args: &SummarySigning<'_>) -> Result<Vec<String>> {
         keys.extend(read_key_lines(Path::new(path))?);
     }
     if keys.is_empty() {
-        let message = if args.remote {
-            "no signing key given; pass --sign or --keys-file"
-        } else {
-            "no signing key given; pass a key argument or --keys-file"
-        };
-        return Err(Error::Signature(message.into()));
+        return Err(Error::Signature(no_summary_key(args.remote).into()));
     }
     Ok(keys)
+}
+
+/// Returns the refusal of a summary signing run with no key.
+///
+/// `remote` is `true` for `ostrya remote summary -u`, whose refusal names its
+/// own options.
+fn no_summary_key(remote: bool) -> &'static str {
+    if remote {
+        "no signing key given; pass --sign or --keys-file"
+    } else {
+        "no signing key given; pass a key argument or --keys-file"
+    }
 }
 
 /// Returns the verifier for `ostrya summary --verify`.
@@ -13416,13 +13520,55 @@ async fn add_signatures(repo: &Repo, commit: &Checksum, args: &SignArgs) -> Resu
 }
 
 /// Signs the commit with each spki secret key.
+///
+/// The signers are the positional keys, then the `PRIVATE KEY` blocks of each
+/// `--keys-file`. The command reads every key before the first signature, so
+/// a refused key writes no signature.
 #[cfg(feature = "spki")]
 async fn sign_spki(repo: &Repo, commit: &Checksum, args: &SignArgs) -> Result<()> {
-    for key in secret_key_lines(args)? {
-        repo.sign_commit(commit, &SpkiSigner::from_base64(&key)?)
-            .await?;
+    let signers = spki_signers(
+        &args.key_id,
+        &args.keys_file,
+        "no signing key given; pass a key argument or --keys-file",
+    )?;
+    for signer in &signers {
+        repo.sign_commit(commit, signer).await?;
     }
     Ok(())
+}
+
+/// Returns the spki signers of a signing run: one for each positional secret
+/// key, then one for each `PRIVATE KEY` block of each key file, in order.
+///
+/// `none` is the refusal if no key is given.
+#[cfg(feature = "spki")]
+fn spki_signers(
+    key_id: &[String],
+    keys_file: &[std::ffi::OsString],
+    none: &str,
+) -> Result<Vec<SpkiSigner>> {
+    let mut signers = Vec::new();
+    for key in key_id {
+        signers.push(SpkiSigner::from_base64(key)?);
+    }
+    for path in keys_file {
+        signers.extend(spki_key_file_signers(Path::new(path))?);
+    }
+    if signers.is_empty() {
+        return Err(Error::Signature(none.into()));
+    }
+    Ok(signers)
+}
+
+/// Returns one spki signer for each `PRIVATE KEY` block of the secret key
+/// file at `path`, in the order of the file.
+///
+/// The file is read as [`read_signing_key_file`] reads it. `spki_secret_keys`
+/// of the `ostrya` crate reads the blocks and states the rules of the file.
+#[cfg(feature = "spki")]
+fn spki_key_file_signers(path: &Path) -> Result<Vec<SpkiSigner>> {
+    let bytes = read_signing_key_file(path)?;
+    Ok(spki_secret_keys(bytes, &key_file_subject(path))?)
 }
 
 /// Returns an error, because this build has no spki engine.
@@ -13662,7 +13808,7 @@ fn gpg_trust(repo_path: &Path, args: &SignArgs) -> Result<GpgVerifier> {
     }
 }
 
-/// Returns the base64 secret keys for an ed25519 or spki signing run.
+/// Returns the base64 secret keys for an ed25519 signing run.
 ///
 /// These are the KEY-IDs and the non-blank lines of each `--keys-file`. At
 /// least one key is required.
@@ -13681,10 +13827,11 @@ fn secret_key_lines(args: &SignArgs) -> Result<Vec<String>> {
 
 /// Returns the decoded public keys for an ed25519 or spki verify or delete.
 ///
-/// These are the KEY-IDs and the `--keys-file` lines, each a base64-encoded
-/// key. An spki KEY-ID decodes as [`verify_key_bytes`] decodes it, so it can
-/// hold the line breaks of a PEM body. The other KEY-IDs and the lines decode
-/// strictly.
+/// These are the KEY-IDs and the keys of each `--keys-file`. An spki KEY-ID
+/// decodes as [`verify_key_bytes`] decodes it, so it can hold the line breaks
+/// of a PEM body. An spki `--keys-file` holds PEM `PUBLIC KEY` blocks, and
+/// [`spki_delete_keys`] reads it. The other KEY-IDs and the lines of an
+/// ed25519 `--keys-file` decode strictly.
 fn public_key_bytes(args: &SignArgs) -> Result<Vec<Vec<u8>>> {
     let mut keys = Vec::new();
     for key in &args.key_id {
@@ -13694,6 +13841,10 @@ fn public_key_bytes(args: &SignArgs) -> Result<Vec<Vec<u8>>> {
         });
     }
     for path in &args.keys_file {
+        if args.sign_type == SignType::Spki {
+            keys.extend(spki_delete_keys(Path::new(path))?);
+            continue;
+        }
         for line in read_key_lines(Path::new(path))? {
             keys.push(base64::decode(&line)?);
         }
@@ -13701,15 +13852,65 @@ fn public_key_bytes(args: &SignArgs) -> Result<Vec<Vec<u8>>> {
     Ok(keys)
 }
 
+/// Returns the public keys of an spki `-d` `--keys-file`.
+///
+/// The file is read as [`read_signing_key_file`] reads it. `spki_public_keys`
+/// of the `ostrya` crate reads its PEM `PUBLIC KEY` blocks, by the rules of a
+/// verify `--keys-file`.
+#[cfg(feature = "spki")]
+fn spki_delete_keys(path: &Path) -> Result<Vec<Vec<u8>>> {
+    let bytes = read_signing_key_file(path)?;
+    Ok(spki_public_keys(&bytes, &key_file_subject(path))?)
+}
+
+/// Returns an error, because this build has no spki engine.
+#[cfg(not(feature = "spki"))]
+fn spki_delete_keys(_: &Path) -> Result<Vec<Vec<u8>>> {
+    Err(unsupported_type("spki"))
+}
+
 /// Returns the non-blank lines of a key file, trimmed.
+///
+/// The file is read as [`read_signing_key_file`] reads it.
 fn read_key_lines(path: &Path) -> Result<Vec<String>> {
-    let content = std::fs::read_to_string(path).map_err(Error::Io)?;
+    let content = String::from_utf8(read_signing_key_file(path)?).map_err(|_| {
+        Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "stream did not contain valid UTF-8",
+        ))
+    })?;
     Ok(content
         .lines()
         .map(str::trim)
         .filter(|line| !line.is_empty())
         .map(str::to_owned)
         .collect())
+}
+
+/// Reads the whole key file at `path` for a signing run or a delete.
+///
+/// The read takes a regular file alone, of at most `MAX_KEY_FILE` bytes. It
+/// does not wait on a fifo. A missing file gives the I/O error of a missing
+/// file.
+///
+/// # Errors
+///
+/// - [`Error::Io`] if no file is at `path`.
+/// - [`Error::Signature`] if the file cannot be opened or read, is not a
+///   regular file, or is over the ceiling. The message names the file as
+///   [`key_file_subject`] does.
+fn read_signing_key_file(path: &Path) -> Result<Vec<u8>> {
+    let subject = key_file_subject(path);
+    match ostrya::sign::read_key_file(path, &subject, ostrya::sign::MAX_KEY_FILE)? {
+        Some(bytes) => Ok(bytes),
+        // ENOENT, so the message is the message of a failed open.
+        None => Err(Error::Io(std::io::Error::from_raw_os_error(2))),
+    }
+}
+
+/// Returns the name of the key file at `path` in a message.
+fn key_file_subject(path: &Path) -> String {
+    format!("the key file '{}'", path.display())
 }
 
 /// Returns the short name of an engine.

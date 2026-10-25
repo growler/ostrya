@@ -223,9 +223,9 @@ Sign the commit with this key.
 For \fB\%ed25519\fR and \fB\%spki\fR, the key is the \%base64 of the secret key. An \fB\%ed25519\fR secret key is \%64 bytes: the \%32\-byte seed, then the \%32\-byte public key. An \fB\%spki\fR secret key is a \%PKCS#8 DER, or a \%SEC1 DER that names the \%P\-256 curve, and its \%base64 can hold line breaks. For \fB\%gpg\fR, the key is a key ID. Each occurrence adds one signature. \%\-\-sign\-type selects the engine. The command reads every key before it makes the first signature, so a bad key gives no signature. The order is the \%\-\-sign keys, then the \%\-\-sign\-from\-file keys, then the \%\-\-gpg\-sign keys.
 .TP
 \fB\-\-sign\-from\-file\fR \fIPATH\fR
-Sign the commit with the key on the first line of this file.
+Sign the commit with the key of this file.
 .IP
-The command ignores the rest of the file. A NUL byte ends the line, and the command refuses a first line of more than \%65536 bytes. Each occurrence adds one signature. The command refuses an empty path with a message of its own.
+Each occurrence adds one signature. For \%ed25519 and gpg, the key is on the first line of the file, and the command ignores the rest of the file. A NUL byte ends the line, and the command refuses a first line of more than \%65536 bytes. For spki, the file holds one PEM \fB\%PRIVATE KEY\fR block, a \%PKCS#8 DER, and the command ignores the text outside the block. The command refuses an spki file of more than one block. The spki file is a regular file of at most \%1 MiB. The command refuses an empty path with a message of its own.
 .TP
 \fB\-\-sign\-type\fR \fINAME\fR
 The signature engine of \%\-\-sign and \%\-\-sign\-from\-file.

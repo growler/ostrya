@@ -403,16 +403,66 @@ fn an_ed25519_key_group_is_read() {
     );
 }
 
-/// `from_config` reads an spki key group from its base64 PKCS#8 form.
+/// The secret key of the first spki fixture, base64 of a PKCS#8 DER.
+#[cfg(feature = "sign-spki")]
+const SPKI_SECRET_A: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg2L708EsnnzHER0SYasMNIUcG\
+v63QapC/3kVsoPerzKGhRANCAATxfzfHKUPeJtyLTGMUoxHhvBS1NT9guWhUQPGiZRLZIcB8Wc3\
+csdVU1iOiTRmbZGKJTtekOdEAbVRrx5HxIpst";
+/// The secret key of the second spki fixture, base64 of a PKCS#8 DER.
+#[cfg(feature = "sign-spki")]
+const SPKI_SECRET_B: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQga/Vn02DKuHPztB29\
+97ybXVngf9XlVRkpxQl0PMHYB2GhRANCAARapiXxcZO+MwxDicFtiWeYWfMDNYF8\
+zlrMtaYLMVD5RNnxfTNPW/JLR8DreWpEAJCsrmwMcsVoL66GqkOOOx1R";
+
+/// Returns a PEM block of `label` around the base64 text `b64`, with
+/// 64-column lines.
+#[cfg(feature = "sign-spki")]
+fn pem_block(label: &str, b64: &str) -> String {
+    let mut text = format!("-----BEGIN {label}-----\n");
+    for chunk in b64.as_bytes().chunks(64) {
+        text.push_str(std::str::from_utf8(chunk).unwrap());
+        text.push('\n');
+    }
+    text.push_str(&format!("-----END {label}-----\n"));
+    text
+}
+
+/// Returns the refusal of an spki key group whose secret key file holds
+/// `contents`.
+#[cfg(feature = "sign-spki")]
+fn spki_key_group_refusal(contents: &str) -> Error {
+    let dir = TmpDir::new("receive-signer-spki-bad");
+    let file = dir.path().join("secret.spki");
+    std::fs::write(&file, contents).unwrap();
+    policy_with(
+        dir.path(),
+        "",
+        &format!(
+            "[ex-ostrya key \"k\"]\ntype=spki\nsecret-key-file={}\n",
+            file.display()
+        ),
+    )
+    .unwrap_err()
+}
+
+/// `from_config` reads an spki key group from PEM `PRIVATE KEY` blocks. Each
+/// block gives one signer, in the order of the file.
 #[cfg(feature = "sign-spki")]
 #[test]
 fn an_spki_key_group_is_read() {
-    const SECRET_PKCS8_B64: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg2L708EsnnzHER0SYasMNIUcG\
-v63QapC/3kVsoPerzKGhRANCAATxfzfHKUPeJtyLTGMUoxHhvBS1NT9guWhUQPGiZRLZIcB8Wc3\
-csdVU1iOiTRmbZGKJTtekOdEAbVRrx5HxIpst";
+    use ostrya::Signer as _;
+
     let dir = TmpDir::new("receive-signer-spki");
     let file = dir.path().join("secret.spki");
-    std::fs::write(&file, format!("{SECRET_PKCS8_B64}\n")).unwrap();
+    std::fs::write(
+        &file,
+        format!(
+            "a comment\n{}{}",
+            pem_block("PRIVATE KEY", SPKI_SECRET_A),
+            pem_block("PRIVATE KEY", SPKI_SECRET_B)
+        ),
+    )
+    .unwrap();
     let policies = policy_with(
         dir.path(),
         "",
@@ -423,8 +473,67 @@ csdVU1iOiTRmbZGKJTtekOdEAbVRrx5HxIpst";
     )
     .unwrap();
     let signers = &group(&policies, "c").signers;
-    assert_eq!(signers.len(), 1);
-    assert_eq!(signers[0].signer().name(), "spki");
+    assert_eq!(signers.len(), 2);
+    let payload = b"payload";
+    for (signer, secret) in signers.iter().zip([SPKI_SECRET_A, SPKI_SECRET_B]) {
+        assert_eq!(signer.signer().name(), "spki");
+        let expected = ostrya::SpkiSigner::from_base64(secret).unwrap();
+        assert_eq!(
+            block_on(signer.signer().sign(payload)).unwrap(),
+            block_on(expected.sign(payload)).unwrap(),
+            "the blocks sign in the order of the file"
+        );
+    }
+}
+
+/// The `secret-key-file` of an spki key group refuses each file that is not
+/// PEM `PRIVATE KEY` blocks of P-256 PKCS#8 keys. Each refusal names the
+/// group.
+#[cfg(feature = "sign-spki")]
+#[test]
+fn an_spki_key_group_file_holds_pem_blocks() {
+    let key = pem_block("PRIVATE KEY", SPKI_SECRET_A);
+    let public = pem_block(
+        "PUBLIC KEY",
+        "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE8X83xylD3ibci0xjFKMR4bwUtTU/\
+         YLloVEDxomUS2SHAfFnN3LHVVNYjok0Zm2RiiU7XpDnRAG1Ua8eR8SKbLQ==",
+    );
+    let sec1 = pem_block(
+        "EC PRIVATE KEY",
+        "MHcCAQEEINi+9PBLJ58xxEdEmGrDDSFHBr+t0GqQv95FbKD3q8yhoAoGCCqGSM49AwEHoUQD\
+         QgAE8X83xylD3ibci0xjFKMR4bwUtTU/YLloVEDxomUS2SHAfFnN3LHVVNYjok0Zm2RiiU7XpDn\
+         RAG1Ua8eR8SKbLQ==",
+    );
+    for (contents, part) in [
+        (String::new(), "holds no PEM PRIVATE KEY block"),
+        (" \n\t\n".to_owned(), "holds no PEM PRIVATE KEY block"),
+        (
+            format!("{SPKI_SECRET_A}\n"),
+            "holds no PEM PRIVATE KEY block",
+        ),
+        (
+            format!("{key}{sec1}"),
+            "unexpected label \"EC PRIVATE KEY\"",
+        ),
+        (public, "unexpected label \"PUBLIC KEY\""),
+        (
+            format!("{key}-----BEGIN PRIVATE KEY-----\n"),
+            "has no END line",
+        ),
+    ] {
+        let err = spki_key_group_refusal(&contents);
+        assert!(
+            matches!(&err, Error::Signature(m)
+                if m.contains("[ex-ostrya key \"k\"]: the secret key file '") && m.contains(part)),
+            "{contents:?}: {err}"
+        );
+    }
+    let err =
+        refusal("[ex-ostrya key \"k\"]\ntype=spki\nsecret-key-file=/nonexistent/ostrya/secret\n");
+    assert!(
+        matches!(&err, Error::Signature(m) if m.contains("[ex-ostrya key \"k\"]") && m.contains("does not exist")),
+        "{err}"
+    );
 }
 
 /// `from_config` reads a GPG key group. It refuses a selector that names no
@@ -689,25 +798,17 @@ fn a_trust_group_spki_key_is_a_subject_public_key_info() {
 }
 
 /// The `secret-key-file` of an spki key group refuses a raw 32-byte P-256
-/// scalar.
+/// scalar in a `PRIVATE KEY` block.
 #[cfg(feature = "sign-spki")]
 #[test]
 fn an_spki_key_group_refuses_a_raw_scalar() {
-    let dir = TmpDir::new("receive-signer-spki-scalar");
-    let file = dir.path().join("secret.spki");
-    std::fs::write(&file, "2L708EsnnzHER0SYasMNIUcGv63QapC/3kVsoPerzKE=\n").unwrap();
-    let err = policy_with(
-        dir.path(),
-        "",
-        &format!(
-            "[ex-ostrya key \"k\"]\ntype=spki\nsecret-key-file={}\n",
-            file.display()
-        ),
-    )
-    .unwrap_err();
+    let err = spki_key_group_refusal(&pem_block(
+        "PRIVATE KEY",
+        "2L708EsnnzHER0SYasMNIUcGv63QapC/3kVsoPerzKE=",
+    ));
     assert!(
         matches!(&err, Error::Signature(m)
-            if m.contains("spki secret key: expected PKCS#8 DER or SEC1 DER")),
+            if m.contains("line 1: the PRIVATE KEY block holds no P-256 PKCS#8 key")),
         "{err}"
     );
 }

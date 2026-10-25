@@ -87,7 +87,7 @@ The anchor commit is the \fB\%ostree\-metadata\fR commit. Without this option, t
 \fB\-\-keys\-file\fR \fIPATH\fR
 Read keys from a file, in the format of \fB\%ostrya sign\fR\&.
 .IP
-For an \%ed25519 or spki verify, the last value wins. With this option or a \%KEY\-ID, that verify does not read \%\-\-keys\-dir or the system key directories. A signing run reads every file. A gpg verify reads every file as a keyring, and a gpg signing run refuses this option. Without \%\-u and \%\-\-verify, the keys sign the existing summary.
+For spki, a signing file holds PEM \fB\%PRIVATE KEY\fR blocks, and a verify file holds PEM \fB\%PUBLIC KEY\fR blocks. For an \%ed25519 or spki verify, the last value wins. With this option or a \%KEY\-ID, that verify does not read \%\-\-keys\-dir or the system key directories. A signing run reads every file. A gpg verify reads every file as a keyring, and a gpg signing run refuses this option. Without \%\-u and \%\-\-verify, the keys sign the existing summary.
 .TP
 \fB\-\-keys\-dir\fR \fIPATH\fR
 Read the keys of an \%ed25519 or spki verify from this directory.

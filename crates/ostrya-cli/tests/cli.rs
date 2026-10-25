@@ -4404,6 +4404,517 @@ fn spki_verify_key_files_hold_pem_blocks() {
     }
 }
 
+/// An spki secret key file holds PEM `PRIVATE KEY` blocks:
+///
+/// - `sign --keys-file` and `summary -u --keys-file` sign once with each
+///   block, in the order of the file.
+/// - `commit --sign-from-file` signs with a file of one block, and refuses a
+///   file of more than one block.
+/// - Each of the three refuses the run at exit 1, with nothing written, for a
+///   file of base64 lines, an empty file, a block with another label, a block
+///   that is not a P-256 PKCS#8 key, and a block with no END line, also beside
+///   a valid block or a valid key on the command line.
+/// - `sign -d --keys-file` reads PEM `PUBLIC KEY` blocks.
+/// - `--sign-from-file` refuses a fifo at once.
+#[cfg(all(feature = "spki", unix))]
+#[test]
+fn spki_secret_key_files_hold_pem_blocks() {
+    const SECRET_A: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg2L708EsnnzHER0SYasMNIUcGv63QapC/3kVsoPerzKGhRANCAATxfzfHKUPeJtyLTGMUoxHhvBS1NT9guWhUQPGiZRLZIcB8Wc3csdVU1iOiTRmbZGKJTtekOdEAbVRrx5HxIpst";
+    const PUBLIC_A: &str = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE8X83xylD3ibci0xjFKMR4bwUtTU/YLloVEDxomUS2SHAfFnN3LHVVNYjok0Zm2RiiU7XpDnRAG1Ua8eR8SKbLQ==";
+    const SEC1_A: &str = "MHcCAQEEINi+9PBLJ58xxEdEmGrDDSFHBr+t0GqQv95FbKD3q8yhoAoGCCqGSM49AwEHoUQDQgAE8X83xylD3ibci0xjFKMR4bwUtTU/YLloVEDxomUS2SHAfFnN3LHVVNYjok0Zm2RiiU7XpDnRAG1Ua8eR8SKbLQ==";
+    const SECRET_B: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQga/Vn02DKuHPztB2997ybXVngf9XlVRkpxQl0PMHYB2GhRANCAARapiXxcZO+MwxDicFtiWeYWfMDNYF8zlrMtaYLMVD5RNnxfTNPW/JLR8DreWpEAJCsrmwMcsVoL66GqkOOOx1R";
+    const PUBLIC_B: &str = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEWqYl8XGTvjMMQ4nBbYlnmFnzAzWBfM5azLWmCzFQ+UTZ8X0zT1vyS0fA63lqRACQrK5sDHLFaC+uhqpDjjsdUQ==";
+    let pem = |label: &str, b64: &str| {
+        let lines: Vec<&str> = b64
+            .as_bytes()
+            .chunks(64)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect();
+        format!(
+            "-----BEGIN {label}-----\n{}\n-----END {label}-----\n",
+            lines.join("\n")
+        )
+    };
+
+    let tmp = TmpDir::new("sign-spki-secret-pem");
+    let base = tmp.path();
+    let repo = commit_fixture(base);
+    let repo_s = repo.to_str().unwrap();
+    let repo_arg = format!("--repo={repo_s}");
+    let src = base.join("src");
+    let src = src.to_str().unwrap();
+    let file = |name: &str, text: &str| {
+        let path = base.join(name);
+        std::fs::write(&path, text).unwrap();
+        path.display().to_string()
+    };
+    let two = file(
+        "two.pem",
+        &format!(
+            "a comment\n{}between\n{}",
+            pem("PRIVATE KEY", SECRET_A),
+            pem("PRIVATE KEY", SECRET_B)
+        ),
+    );
+    let public_a = file("a.pub", &pem("PUBLIC KEY", PUBLIC_A));
+    let public_b = file("b.pub", &pem("PUBLIC KEY", PUBLIC_B));
+    let key_a = pem("PRIVATE KEY", SECRET_A);
+    let refused: Vec<(String, String)> = [
+        (
+            "lines",
+            format!("{SECRET_A}\n"),
+            " holds no PEM PRIVATE KEY block",
+        ),
+        ("empty", String::new(), " holds no PEM PRIVATE KEY block"),
+        (
+            "blank",
+            " \n\t\n".to_owned(),
+            " holds no PEM PRIVATE KEY block",
+        ),
+        (
+            "ec.pem",
+            pem("EC PRIVATE KEY", SEC1_A),
+            ", line 1: unexpected label \"EC PRIVATE KEY\"",
+        ),
+        (
+            "public.pem",
+            pem("PUBLIC KEY", PUBLIC_A),
+            ", line 1: unexpected label \"PUBLIC KEY\"",
+        ),
+        (
+            "good-ec.pem",
+            format!("{key_a}{}", pem("EC PRIVATE KEY", SEC1_A)),
+            ", line 6: unexpected label \"EC PRIVATE KEY\"",
+        ),
+        (
+            "good-public.pem",
+            format!("{key_a}{}", pem("PRIVATE KEY", PUBLIC_A)),
+            ", line 6: the PRIVATE KEY block holds no P-256 PKCS#8 key",
+        ),
+        (
+            "no-end.pem",
+            format!("{key_a}-----BEGIN PRIVATE KEY-----\n"),
+            ", line 6: the block \"PRIVATE KEY\" has no END line",
+        ),
+    ]
+    .into_iter()
+    .map(|(name, text, tail)| {
+        let path = file(name, &text);
+        let stderr = format!("error: signature: the key file '{path}'{tail}\n");
+        (path, stderr)
+    })
+    .collect();
+    let refuses = |run: Run, stderr: &str, label: &str| {
+        assert_eq!(run.status.code(), Some(1), "{label}");
+        assert!(run.stdout.is_empty(), "{label}");
+        assert_eq!(String::from_utf8_lossy(&run.stderr), stderr, "{label}");
+    };
+
+    // `sign`: a refused file writes no `.commitmeta`, also beside a valid
+    // positional key.
+    let commitmeta = repo.join(format!(
+        "objects/{}/{}.commitmeta",
+        &COMMIT[..2],
+        &COMMIT[2..]
+    ));
+    for (path, stderr) in &refused {
+        let keys_file = format!("--keys-file={path}");
+        for args in [
+            vec!["sign", &repo_arg, "-s", "spki", &keys_file, COMMIT],
+            vec![
+                "sign", &repo_arg, "-s", "spki", &keys_file, COMMIT, SECRET_A,
+            ],
+        ] {
+            refuses(ostrya(&args, None, &[]), stderr, path);
+            assert!(!commitmeta.exists(), "{path}");
+        }
+    }
+    let sign_verify = |keys: &str| {
+        ostrya(
+            &[
+                "sign",
+                &repo_arg,
+                "--verify",
+                "-s",
+                "spki",
+                &format!("--keys-file={keys}"),
+                COMMIT,
+            ],
+            None,
+            &[],
+        )
+    };
+    ostrya(
+        &[
+            "sign",
+            &repo_arg,
+            "-s",
+            "spki",
+            &format!("--keys-file={two}"),
+            COMMIT,
+        ],
+        None,
+        &[],
+    )
+    .ok();
+    assert_eq!(
+        sign_verify(&public_a).ok().stdout_trimmed(),
+        "signature 1: good\nsignature 2: no public key\nverification OK"
+    );
+    assert_eq!(
+        sign_verify(&public_b).ok().stdout_trimmed(),
+        "signature 1: no public key\nsignature 2: good\nverification OK"
+    );
+
+    // `sign -d`: the `--keys-file` holds PEM `PUBLIC KEY` blocks.
+    let delete = |keys: &str| {
+        ostrya(
+            &[
+                "sign",
+                &repo_arg,
+                "-d",
+                "-s",
+                "spki",
+                &format!("--keys-file={keys}"),
+                COMMIT,
+                PUBLIC_B,
+            ],
+            None,
+            &[],
+        )
+    };
+    refuses(
+        delete(&two),
+        &format!(
+            "error: signature: the key file '{two}', line 2: unexpected label \"PRIVATE KEY\"\n"
+        ),
+        "delete with a secret key file",
+    );
+    assert_eq!(
+        delete(&public_a).ok().stdout_trimmed(),
+        "Deleted 2 signature(s)"
+    );
+
+    // `commit --sign-from-file`: a refused file moves no ref, also beside a
+    // valid `--sign` key.
+    let commit = |branch: &str, path: &str, sign: Option<&str>| {
+        let from_file = format!("--sign-from-file={path}");
+        let sign = sign.map(|key| format!("--sign={key}"));
+        let mut args = vec![
+            "commit",
+            &repo_arg,
+            "-b",
+            branch,
+            "-s",
+            "signed",
+            "--sign-type=spki",
+            &from_file,
+        ];
+        args.extend(sign.as_deref());
+        args.push(src);
+        ostrya(&args, None, &[])
+    };
+    for (path, stderr) in &refused {
+        for sign in [None, Some(SECRET_A)] {
+            refuses(commit("refused", path, sign), stderr, path);
+            assert!(!repo.join("refs/heads/refused").exists(), "{path}");
+        }
+    }
+    let fifo = base.join("fifo");
+    mkfifo_at(&fifo);
+    let fifo = fifo.display().to_string();
+    refuses(
+        commit("refused", &fifo, None),
+        &format!("error: signature: the key file '{fifo}' is not a regular file\n"),
+        "fifo",
+    );
+    refuses(
+        commit("refused", &two, None),
+        &format!(
+            "error: signature: the key file '{two}' holds more than one PEM PRIVATE KEY block\n"
+        ),
+        "two blocks",
+    );
+    assert!(!repo.join("refs/heads/refused").exists());
+    let one = file(
+        "one.pem",
+        &format!("a comment\n{}after\n", pem("PRIVATE KEY", SECRET_B)),
+    );
+    let signed = commit("signed", &one, None).ok().stdout_trimmed();
+    for (keys, report) in [
+        (&public_a, "signature 1: no public key"),
+        (&public_b, "signature 1: good\nverification OK"),
+    ] {
+        let run = ostrya(
+            &[
+                "sign",
+                &repo_arg,
+                "--verify",
+                "-s",
+                "spki",
+                &format!("--keys-file={keys}"),
+                &signed,
+            ],
+            None,
+            &[],
+        );
+        assert!(run.stdout_trimmed().starts_with(report), "{keys}");
+    }
+
+    // `summary -u --keys-file`: a refused file leaves the summary as it is.
+    let summary_with = |path: &str, key: Option<&str>| {
+        let keys_file = format!("--keys-file={path}");
+        let mut args = vec![
+            "summary",
+            &repo_arg,
+            "-u",
+            "--last-modified=1700000000",
+            "--sign-type=spki",
+            &keys_file,
+        ];
+        args.extend(key);
+        ostrya(&args, None, &[])
+    };
+    let summary = |path: &str| summary_with(path, None);
+    let read = |name: &str| std::fs::read(repo.join(name)).ok();
+    for (path, stderr) in &refused {
+        for key in [None, Some(SECRET_A)] {
+            refuses(summary_with(path, key), stderr, path);
+            assert_eq!(read("summary"), None, "{path}");
+            assert_eq!(read("summary.sig"), None, "{path}");
+        }
+    }
+    summary(&two).ok();
+    for (keys, report) in [
+        (
+            &public_a,
+            "signature 1: good\nsignature 2: no public key\nverification OK",
+        ),
+        (
+            &public_b,
+            "signature 1: no public key\nsignature 2: good\nverification OK",
+        ),
+    ] {
+        let run = ostrya(
+            &[
+                "summary",
+                &repo_arg,
+                "--verify",
+                "--sign-type=spki",
+                &format!("--keys-file={keys}"),
+            ],
+            None,
+            &[],
+        );
+        assert_eq!(run.ok().stdout_trimmed(), report);
+    }
+    let (summary_bytes, sig_bytes) = (read("summary"), read("summary.sig"));
+    for (path, stderr) in &refused {
+        refuses(summary(path), stderr, path);
+        assert_eq!(read("summary"), summary_bytes, "{path}");
+        assert_eq!(read("summary.sig"), sig_bytes, "{path}");
+    }
+}
+
+/// A `static-delta generate --keys-file` of the spki engine holds one base64
+/// secret key on each line. The run signs once with each line, and with each
+/// file. An empty file, an empty line, a line with white space, and a line
+/// that is not a key refuse the run at exit 1, after the header block and
+/// before the superblock. An ed25519 file still skips its blank lines.
+#[cfg(feature = "spki")]
+#[test]
+fn static_delta_generate_spki_keys_file_lines() {
+    const SECRET_A: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg2L708EsnnzHER0SYasMNIUcGv63QapC/3kVsoPerzKGhRANCAATxfzfHKUPeJtyLTGMUoxHhvBS1NT9guWhUQPGiZRLZIcB8Wc3csdVU1iOiTRmbZGKJTtekOdEAbVRrx5HxIpst";
+    const PUBLIC_A: &str = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE8X83xylD3ibci0xjFKMR4bwUtTU/YLloVEDxomUS2SHAfFnN3LHVVNYjok0Zm2RiiU7XpDnRAG1Ua8eR8SKbLQ==";
+    const SEC1_A: &str = "MHcCAQEEINi+9PBLJ58xxEdEmGrDDSFHBr+t0GqQv95FbKD3q8yhoAoGCCqGSM49AwEHoUQDQgAE8X83xylD3ibci0xjFKMR4bwUtTU/YLloVEDxomUS2SHAfFnN3LHVVNYjok0Zm2RiiU7XpDnRAG1Ua8eR8SKbLQ==";
+    const SECRET_B: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQga/Vn02DKuHPztB2997ybXVngf9XlVRkpxQl0PMHYB2GhRANCAARapiXxcZO+MwxDicFtiWeYWfMDNYF8zlrMtaYLMVD5RNnxfTNPW/JLR8DreWpEAJCsrmwMcsVoL66GqkOOOx1R";
+    const PUBLIC_B: &str = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEWqYl8XGTvjMMQ4nBbYlnmFnzAzWBfM5azLWmCzFQ+UTZ8X0zT1vyS0fA63lqRACQrK5sDHLFaC+uhqpDjjsdUQ==";
+
+    let tmp = TmpDir::new("delta-spki-keys-file");
+    let base = tmp.path();
+    let repo = commit_fixture(base);
+    let repo_s = repo.to_str().unwrap();
+    let file = |name: &str, text: &str| {
+        let path = base.join(name);
+        std::fs::write(&path, text).unwrap();
+        path.display().to_string()
+    };
+    let generate = |engine: &str, extra: &[&str]| {
+        let _ = std::fs::remove_dir_all(repo.join("deltas"));
+        let sign_type = format!("--sign-type={engine}");
+        let mut args = vec![
+            "static-delta",
+            "--repo",
+            repo_s,
+            "generate",
+            "--empty",
+            "--to",
+            COMMIT,
+            &sign_type,
+        ];
+        args.extend_from_slice(extra);
+        ostrya(&args, None, &[])
+    };
+    let verifies = |public: &str| {
+        ostrya(
+            &[
+                "static-delta",
+                "--repo",
+                repo_s,
+                "verify",
+                "--sign-type=spki",
+                COMMIT,
+                public,
+            ],
+            None,
+            &[],
+        )
+        .status
+        .success()
+    };
+    let keys_file = |path: &str| format!("--keys-file={path}");
+    let sign_a = format!("--sign={SECRET_A}");
+
+    for (label, extra, want) in [
+        (
+            "LF",
+            vec![keys_file(&file("lf", &format!("{SECRET_A}\n{SECRET_B}\n")))],
+            [true, true],
+        ),
+        (
+            "CRLF",
+            vec![keys_file(&file(
+                "crlf",
+                &format!("{SECRET_A}\r\n{SECRET_B}\r\n"),
+            ))],
+            [true, true],
+        ),
+        (
+            "no line end",
+            vec![keys_file(&file("open", &format!("{SECRET_A}\n{SECRET_B}")))],
+            [true, true],
+        ),
+        (
+            "SEC1",
+            vec![keys_file(&file("sec1", &format!("{SEC1_A}\n")))],
+            [true, false],
+        ),
+        (
+            "two files",
+            vec![
+                keys_file(&file("a", &format!("{SECRET_A}\n"))),
+                keys_file(&file("b", &format!("{SECRET_B}\n"))),
+            ],
+            [true, true],
+        ),
+        (
+            "--sign and a file",
+            vec![
+                sign_a.clone(),
+                keys_file(&file("b", &format!("{SECRET_B}\n"))),
+            ],
+            [true, true],
+        ),
+    ] {
+        let extra: Vec<&str> = extra.iter().map(String::as_str).collect();
+        generate("spki", &extra).ok();
+        assert_eq!([verifies(PUBLIC_A), verifies(PUBLIC_B)], want, "{label}");
+    }
+
+    let header = format!("Generating static delta:\n  From: empty\n  To:   {COMMIT}\n");
+    let pem = format!("-----BEGIN PRIVATE KEY-----\n{SECRET_A}\n-----END PRIVATE KEY-----\n");
+    for (name, text, tail, beside_sign) in [
+        ("empty", String::new(), " holds no key".to_owned(), false),
+        (
+            "empty-signed",
+            String::new(),
+            " holds no key".to_owned(),
+            true,
+        ),
+        (
+            "middle",
+            format!("{SECRET_A}\n\n{SECRET_B}\n"),
+            ", line 2 is empty".to_owned(),
+            false,
+        ),
+        (
+            "first",
+            format!("\n{SECRET_A}\n"),
+            ", line 1 is empty".to_owned(),
+            false,
+        ),
+        (
+            "last",
+            format!("{SECRET_A}\n\n"),
+            ", line 2 is empty".to_owned(),
+            false,
+        ),
+        (
+            "two-words",
+            format!("{SECRET_A} {SECRET_B}\n"),
+            ", line 1 holds white space".to_owned(),
+            false,
+        ),
+        (
+            "leading",
+            format!(" {SECRET_A}\n"),
+            ", line 1 holds white space".to_owned(),
+            false,
+        ),
+        (
+            "blank",
+            format!("{SECRET_A}\n \n"),
+            ", line 2 holds white space".to_owned(),
+            false,
+        ),
+        (
+            "pem",
+            pem.clone(),
+            ", line 1 holds white space".to_owned(),
+            false,
+        ),
+        (
+            "public",
+            format!("{SECRET_A}\n{PUBLIC_A}\n"),
+            ", line 2: spki secret key: expected PKCS#8 DER or SEC1 DER".to_owned(),
+            false,
+        ),
+    ] {
+        let path = file(name, &text);
+        let mut extra = vec![keys_file(&path)];
+        if beside_sign {
+            extra.insert(0, sign_a.clone());
+        }
+        let extra: Vec<&str> = extra.iter().map(String::as_str).collect();
+        let run = generate("spki", &extra);
+        assert_eq!(run.status.code(), Some(1), "{name}");
+        assert_eq!(String::from_utf8_lossy(&run.stdout), header, "{name}");
+        assert_eq!(
+            String::from_utf8_lossy(&run.stderr),
+            format!("error: signature: the key file '{path}'{tail}\n"),
+            "{name}"
+        );
+        assert!(!repo.join("deltas").exists(), "{name}");
+    }
+    let run = generate("spki", &[&keys_file(&file("junk", "not!base64\n"))]);
+    assert_eq!(run.status.code(), Some(1));
+    assert!(
+        String::from_utf8_lossy(&run.stderr).contains("junk', line 1: "),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    // An ed25519 file skips its blank lines.
+    generate(
+        "ed25519",
+        &[&keys_file(&file(
+            "ed25519",
+            &format!("\n{ED25519_SECRET_B64}\n\n"),
+        ))],
+    )
+    .ok();
+}
+
 #[cfg(feature = "gpg")]
 #[test]
 fn sign_verify_delete_gpg() {

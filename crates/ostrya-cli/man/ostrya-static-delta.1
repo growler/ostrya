@@ -138,9 +138,9 @@ The option can occur more than once. The key is a \%base64 secret key for \%ed25
 The signature engine for \%\-\-sign and \%\-\-keys\-file. Default: \%ed25519. Possible values: \%ed25519, spki, gpg.
 .TP
 \fB\-\-keys\-file\fR \fIKEYS_FILE\fR
-Read signing keys from a file, in the format of \fB\%ostrya sign\fR\&.
+Read signing keys from a file.
 .IP
-The option can occur more than once. The gpg engine refuses this option.
+For \%ed25519, the file has \%base64 secret keys, one per line, as for \fB\%ostrya sign\fR\&. For spki, each line is the \%base64 of one secret key, a \%PKCS#8 DER or a \%SEC1 DER that names the \%P\-256 curve. A line ends at LF or CRLF, and the last line can have no line end. The command refuses an empty spki file, an empty line, and a line with white space. Each key adds one signature. The option can occur more than once, and the command reads every file. The gpg engine refuses this option.
 .TP
 \fB\-\-gpg\-homedir\fR \fIGPG_HOMEDIR\fR
 The GnuPG home directory where gpg resolves signing keys.

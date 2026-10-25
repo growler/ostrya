@@ -463,7 +463,7 @@ The names are \fB\%ed25519\fR, \fB\%spki\fR, and \fB\%gpg\fR, and the command re
 \fB\-\-keys\-file\fR \fIPATH\fR
 With \%\-u, sign the summary with the keys of this file, in the format of \fB\%ostrya sign\fR\&.
 .IP
-The command reads every file, and each key adds one signature after each \%\-\-sign key. The gpg engine refuses this option. The option needs \%\-u.
+For \%ed25519, the file has \%base64 secret keys, one per line. For spki, the file holds PEM \fB\%PRIVATE KEY\fR blocks, each a \%PKCS#8 DER. The command reads every file, and each key adds one signature after each \%\-\-sign key. The gpg engine refuses this option. The option needs \%\-u.
 .TP
 \fB\-\-break\-lock\fR
 With \%\-u, remove the writer lock of another writer of the bucket repository.

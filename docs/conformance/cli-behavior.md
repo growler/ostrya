@@ -5256,6 +5256,57 @@ P-256 keys:
 `cli-surface.md`, "P2", `commit`, `summary`, `static-delta`, `sign`, and
 `remote`, records the port side.
 
+#### spki secret key files
+
+The `ostree` 2026.1 build with OpenSSL on the NixOS development host reads a
+secret key file of the spki engine. Observed on 2026-10-25, with P-256 keys:
+
+- `sign --keys-file` reads PEM `PRIVATE KEY` blocks, which hold PKCS#8 DER.
+  The tool writes one signature for each block. A file of three blocks gives
+  three signatures.
+- `commit --sign-from-file` reads PEM `PRIVATE KEY` blocks and signs with the
+  first block alone. A file of three blocks gives one signature, by the key of
+  the first block. A second block that does not decode, or a second block of
+  another label, does not stop the commit, which exits 0.
+- Text outside the blocks is ignored. A body with a blank line between two
+  base64 lines, and a body on one line of 184 characters, sign.
+- A first block of the label `EC PRIVATE KEY`, `RSA PRIVATE KEY`, or `PUBLIC
+  KEY` refuses the run with `error: Unexpected label "<label>"` at exit 1.
+  `sign` writes no signature, and `commit` moves no ref. `sign` refuses a block
+  of another label after a valid block in the same way.
+- `sign` with a valid block, then a `PRIVATE KEY` block that does not decode,
+  writes the signature of the first block, then reports `error: Not able to
+  sign the cobject: openssl: Failed to initialize spki key` at exit 1. With
+  the two blocks in the other order, both commands report this error at exit
+  1, and write no signature and move no ref.
+- An empty file, a file of white space only, and a file of one base64 PKCS#8
+  line stop `sign` and `commit` with SIGABRT, exit 134. The tool writes
+  `OSTree:ERROR:src/ostree/ot-main.c:324:ostree_run: assertion failed:
+  (success || error)` on standard error. `commit` moves no ref.
+- `sign -d --keys-file` with a `PRIVATE KEY` block exits 0 and writes one more
+  signature, by the key of the block. With a `PUBLIC KEY` block it reports
+  `error: Unexpected label "PUBLIC KEY"` at exit 1.
+- `summary` has no `--keys-file` option. `summary -u --keys-file=<path>`
+  reports `error: Unknown option --keys-file=<path>` at exit 1.
+- `static-delta generate --keys-file` reads one base64 secret key on each
+  line, and signs once with each line. Three lines give three signatures. LF
+  and CRLF line ends both work, and the last line can have no line end. A
+  line of the base64 of a SEC1 DER signs.
+  - A PEM `PRIVATE KEY` file, an empty line at any position, the first line
+    included, a line of one space, and a line that is not base64 refuse the
+    run with `error: openssl: Failed to initialize spki key` at exit 1. No
+    superblock is written, the part file stays in `deltas/`, and
+    `static-delta list` prints `(No static deltas)`.
+  - A line of two base64 keys with a space between them signs with the first
+    key alone. A line with a space before or after the key signs with the key.
+  - An empty file gives exit 0. The superblock holds an `ostree.sign.spki`
+    entry with no signature, and `static-delta show` prints `Signed: yes`.
+  - With two `--keys-file` options, the tool signs with the keys of the last
+    file alone. `--keys-file` and `--sign` add up, in either order.
+
+`cli-surface.md`, "P2", `commit`, `summary`, `static-delta`, `sign`, and
+`remote`, records the port side.
+
 #### `apply-offline`
 
 `apply-offline PATH [KEY-ID...]` applies one delta into the repository. The

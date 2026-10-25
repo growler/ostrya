@@ -74,13 +74,13 @@ pub(crate) async fn read(repo: &Repo) -> Result<(ClientAccess, Vec<Arc<ReceivePo
 
     // The second pass builds each key group and each trust group once, in
     // file order.
-    let mut signers: HashMap<&str, Arc<ServerSigner>> = HashMap::new();
+    let mut signers: HashMap<&str, Vec<Arc<ServerSigner>>> = HashMap::new();
     let mut trusts: HashMap<&str, Arc<TrustedKeys>> = HashMap::new();
     for (build, group) in builds {
         match build {
             Group::Key(name) => {
-                let signer = build_signer(name, &keys[name]).await?;
-                signers.insert(name, Arc::new(signer));
+                let built = build_signers(name, &keys[name]).await?;
+                signers.insert(name, built.into_iter().map(Arc::new).collect());
             }
             Group::Trust(name) => {
                 let keys = TrustedKeys::for_trust_group(repo, keyfile, name, group).await?;
@@ -93,7 +93,7 @@ pub(crate) async fn read(repo: &Repo) -> Result<(ClientAccess, Vec<Arc<ReceivePo
     let named = |names: &[String]| -> Vec<Arc<ServerSigner>> {
         names
             .iter()
-            .map(|name| Arc::clone(&signers[name.as_str()]))
+            .flat_map(|name| signers[name.as_str()].iter().map(Arc::clone))
             .collect()
     };
     let summary_signers = named(access.server().sign_summary.as_deref().unwrap_or_default());
@@ -317,8 +317,12 @@ fn gpg_key(group: &str, _key: String, _homedir: Option<String>) -> Result<KeySpe
     )))
 }
 
-/// Builds the signer of the key group `name`.
-async fn build_signer(name: &str, spec: &KeySpec) -> Result<ServerSigner> {
+/// Builds the signers of the key group `name`.
+///
+/// An ed25519 or GPG key group gives one signer. An spki key group gives one
+/// signer for each `PRIVATE KEY` block of its secret key file, in the order of
+/// the file.
+async fn build_signers(name: &str, spec: &KeySpec) -> Result<Vec<ServerSigner>> {
     let label = format!("[{KEY_PREFIX}{name}\"]");
     let in_group = |e: Error| match e {
         Error::Signature(message) => Error::Signature(format!("{label}: {message}")),
@@ -327,20 +331,24 @@ async fn build_signer(name: &str, spec: &KeySpec) -> Result<ServerSigner> {
     match spec {
         KeySpec::Ed25519 { file } => {
             let line = secret_key_line(file).await.map_err(in_group)?;
-            ServerSigner::ed25519(&ostrya_core::base64::decode(&line)?).map_err(in_group)
+            let signer =
+                ServerSigner::ed25519(&ostrya_core::base64::decode(&line)?).map_err(in_group)?;
+            Ok(vec![signer])
         }
         #[cfg(feature = "sign-spki")]
-        KeySpec::Spki { file } => {
-            let line = secret_key_line(file).await.map_err(in_group)?;
-            ServerSigner::spki(crate::spki::SpkiSigner::from_base64(&line)?).map_err(in_group)
-        }
+        KeySpec::Spki { file } => secret_key_blocks(file)
+            .await
+            .map_err(in_group)?
+            .into_iter()
+            .map(|signer| ServerSigner::spki(signer).map_err(in_group))
+            .collect(),
         #[cfg(feature = "sign-gpg")]
         KeySpec::Gpg { key, homedir } => {
             let mut signer = crate::gpg::GpgSigner::new(key.as_str());
             if let Some(dir) = homedir {
                 signer = signer.with_homedir(dir);
             }
-            ServerSigner::gpg(signer).await.map_err(in_group)
+            Ok(vec![ServerSigner::gpg(signer).await.map_err(in_group)?])
         }
     }
 }
@@ -374,6 +382,31 @@ fn read_secret_key_line(path: &str) -> Result<String> {
             "{subject} holds more than one key"
         ))),
     }
+}
+
+/// Returns the signers of the spki secret key file at `path`, one for each
+/// `PRIVATE KEY` block, in the order of the file.
+///
+/// The read runs on the blocking pool.
+#[cfg(feature = "sign-spki")]
+async fn secret_key_blocks(path: &str) -> Result<Vec<crate::spki::SpkiSigner>> {
+    let path = path.to_owned();
+    ostrya_rt::unblock(move || read_secret_key_blocks(&path)).await
+}
+
+/// Reads the signers of the spki secret key file at `path`, the blocking half
+/// of `secret_key_blocks`.
+///
+/// The read obeys the rule of every key source: a regular file alone, of at
+/// most [`MAX_KEY_FILE`] bytes. `spki_secret_keys` reads the blocks and states
+/// the rules of the file.
+#[cfg(feature = "sign-spki")]
+fn read_secret_key_blocks(path: &str) -> Result<Vec<crate::spki::SpkiSigner>> {
+    let subject = format!("the secret key file '{path}'");
+    let Some(bytes) = read_key_path(Path::new(path), &subject, MAX_KEY_FILE)? else {
+        return Err(Error::Signature(format!("{subject} does not exist")));
+    };
+    Ok(crate::spki::spki_secret_keys(bytes, &subject)?)
 }
 
 /// Returns the error for a key that `group` does not take.

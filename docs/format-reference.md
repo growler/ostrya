@@ -2019,6 +2019,41 @@ A refused file of the key store fails the verify, also a file of the revoked
 set. `conformance/cli-surface.md`, "P2", `static-delta`, records the
 differences from the tool.
 
+A secret key file holds PEM `PRIVATE KEY` blocks, and each block holds one
+PKCS#8 `PrivateKeyInfo` DER of a P-256 key. Each block gives one signer, in
+the order of the file. These files are secret key files: a `--keys-file` of
+`sign`, of `summary`, and of `remote summary -u`, a `--sign-from-file` of
+`commit` under `--sign-type=spki`, and the `secret-key-file` of an
+`[ex-ostrya key]` group of type `spki`. A `--sign-from-file` file holds one
+block. `commit` refuses a file of more than one block, and makes no
+signature. The reader reads a regular file alone,
+of at most 1 MiB. The lines, the boundary lines, the text outside the blocks,
+and the block bodies follow the rules of a public key file. The reader refuses
+the whole file, also when other blocks of the file are valid, in these
+conditions:
+
+- The file is empty, holds white space only, or holds no block. A file of
+  base64 lines is in this group.
+- A block has a label other than `PRIVATE KEY`. `EC PRIVATE KEY`,
+  `RSA PRIVATE KEY`, `ENCRYPTED PRIVATE KEY`, and `PUBLIC KEY` are such
+  labels.
+- An END line has a label other than the label of its block, a BEGIN line is
+  in a block, or a block has no END line.
+- A `PRIVATE KEY` block does not decode, or it holds no PKCS#8 DER of a P-256
+  key. A SEC1 DER and a raw scalar in a `PRIVATE KEY` block are refused.
+
+A command reads each secret key file before it makes the first signature, so
+a refused file gives no signature.
+
+A `--keys-file` of `static-delta generate` under `--sign-type=spki` holds one
+secret key on each line, the base64 of a PKCS#8 DER or of a SEC1 DER that
+names the P-256 curve. A line ends at LF, and one CR at the end of a line is
+removed. The last line can have no line end. The reader decodes each line
+strictly. It refuses the whole file if the file is empty, if a line is empty,
+if a line holds white space, or if a line is not the base64 of a secret key.
+Each line gives one signer, in the order of the file, after the signers of
+`--sign`. Each `--keys-file` adds its signers.
+
 Design target: the public ostree documentation gives the public key container
 and the key store layout. The curve, the hash, the DER signature encoding, and
 the key DER containers are the standard OpenSSL and RFC forms.

@@ -1400,7 +1400,7 @@ ref in both: a key that cannot sign leaves the ref where it stood and publishes
 nothing, and a ref write that cannot happen leaves the commit and its
 `.commitmeta` durable in `objects/` with no ref. Both write the same
 `.commitmeta` bytes for a given ed25519 key set, and each one's GPG signature
-verifies through the other's `show --gpg-verify-remote`. Nine divergences
+verifies through the other's `show --gpg-verify-remote`. Eleven divergences
 stand.
 
 - `--sign-type` names an engine the port carries and this tool build does not.
@@ -1488,6 +1488,34 @@ stand.
   tool and `error: Error opening file adir: Is a directory` from the port. Both
   carry the same reason, exit 1, and write no object and no ref; an absolute
   path reaches one line from both.
+- The blocks of an spki `--sign-from-file` file. This difference is in the
+  bytes of the repository. Observed with the `ostree` 2026.1 build with OpenSSL
+  on the NixOS development host (`cli-behavior.md`, "CLI output formats",
+  `static-delta`, "spki secret key files"). Both read PEM `PRIVATE KEY` blocks
+  and ignore the text outside them. The tool signs with the first block alone,
+  so a file of three blocks gives one signature, and a second block of another
+  label or a second block that does not decode does not stop the commit. The
+  port signs with a file of one block. It refuses a file of more than one
+  block at exit 1 with `error: signature: the key file '<path>' holds more
+  than one PEM PRIVATE KEY block`, and moves no ref. It refuses the whole file
+  at exit 1, and moves no ref, for a block of another label, a block that does
+  not decode, a block that holds no P-256 PKCS#8 key, and a block with no END
+  line, at any position. The message is `error: signature: the key file
+  '<path>', line <n>: <reason>`, where the tool reports `error: Unexpected
+  label "<label>"` for a first block of another label. The body rules of a public key file apply, so
+  the port refuses a body with a blank line, which the tool reads. The body
+  rules are those of a `PUBLIC KEY` block under `static-delta`.
+- An spki `--sign-from-file` file that holds no `PRIVATE KEY` block: an empty
+  file, a file of white space only, and a file of one base64 PKCS#8 line. The
+  tool ends on SIGABRT, exit 134. The port reports `error: signature: the key
+  file '<path>' holds no PEM PRIVATE KEY block` at exit 1. Both move no ref.
+  The port reads the spki file as a key source of the library: a regular file
+  of at most 1 MiB. It refuses a directory, a fifo, and a larger file with
+  `error: signature: the key file '<path>' is not a regular file` or `is over
+  the 1048576-byte ceiling`, and does not wait on a fifo. A missing file gives
+  `error: Error opening file <path>: No such file or directory`. The
+  65536-byte first-line rule and the NUL rule apply to `ed25519` and `gpg`
+  alone.
 - The order the `.commitmeta` dict stores its keys in parts over some key sets.
   The port stores insertion order always. The tool stores that same order over
   most sets and a name-dependent order over some of them: with
@@ -2459,7 +2487,10 @@ summary, and leaves `summary` and `summary.sig` as they are. In a repository
 with a collection id it writes no anchor commit. The port refuses `-c` with no
 `-u` at exit 1. The tool refuses `--verify`, `--keys-file`, `--keys-dir`, `-s`,
 `-c`, and `--client-groups` with `error: Unknown option <arg>` at exit 1, and
-verifies a summary signature through a remote alone. A symlink under `refs/`
+verifies a summary signature through a remote alone. A signing `--keys-file`
+of the spki engine holds PEM `PRIVATE KEY` blocks, the form of a `sign
+--keys-file`, and each block adds one signature
+(`../format-reference.md`, "Signing details"). A symlink under `refs/`
 that names a directory ends `summary -u` with exit 1 in both implementations,
 in different words ("P1", `refs`). The port's `summary
 --verify` reads the key sources of its `sign --verify` (`cli-behavior.md`, "CLI
@@ -2912,7 +2943,7 @@ refusal writes no object.
 "CLI output formats", `static-delta`). The byte order starts from the host
 order, as in the tool. Only a little-endian host is observed.
 
-`static-delta generate` carries twenty differences. Three of them are open.
+`static-delta generate` carries twenty-two differences. Two of them are open.
 
 - the composefs image of the target commit. The port puts the stored image
   of a commit that carries `ostree.composefs.digest.v0` in the delta, in a
@@ -2981,10 +3012,37 @@ order, as in the tool. Only a little-endian host is observed.
   same. The pairing is the port's own choice, in the same sense as the
   parameters of the chunker;
 - signing with a repeated `--keys-file`. This difference is in the bytes of
-  the repository and is open. The tool signs with the last `--keys-file`
-  alone. The port signs with each key of every file, so the superblock bytes
-  differ. A `--sign` value beside one `--keys-file` signs with both keys in
-  both implementations. `sign` carries the same difference;
+  the repository, and the port keeps it. The tool signs with the last
+  `--keys-file` alone. The port signs with each key of every file, so the
+  superblock bytes differ. A `--sign` value beside one `--keys-file` signs
+  with both keys in both implementations. `sign` carries the same difference;
+- the lines of an spki `--keys-file`. Observed with the `ostree` 2026.1 build
+  with OpenSSL on the NixOS development host (`cli-behavior.md`, "CLI output
+  formats", `static-delta`, "spki secret key files"). Both read one base64
+  secret key on each line, with LF or CRLF line ends, and refuse an empty line
+  and a line that is not base64. These lines and files part:
+  - An empty file. The tool writes a superblock whose `ostree.sign.spki`
+    entry holds no signature, at exit 0. The port refuses the run at exit 1
+    after the block with `error: signature: the key file '<path>' holds no
+    key`, and writes no superblock. This difference is in the bytes of the
+    repository.
+  - A line of two base64 keys with a space between them, and a line with a
+    space before or after the key. The tool signs with the first key of the
+    line. The port refuses the run at exit 1 after the block with `error:
+    signature: the key file '<path>', line <n> holds white space`, and
+    writes no superblock.
+  - The wording of a refused line. The tool writes `error: openssl: Failed
+    to initialize spki key` and leaves part `0`. The port writes `error:
+    signature: the key file '<path>', line <n> is empty` or `error:
+    signature: the key file '<path>', line <n>: <reason>`, before it writes a
+    part. Both exit 1 and write no superblock;
+- a signing `--keys-file` that is not a regular file, or that is over 1 MiB
+  (1048576 bytes), under each engine. The port reads the file as a key source
+  of the library and refuses it at exit 1 after the block with `error:
+  signature: the key file '<path>' is not a regular file` or `error:
+  signature: the key file '<path>' is over the 1048576-byte ceiling`. It does
+  not wait on a fifo. A missing file gives `error: i/o error: No such file or
+  directory (os error 2)`. The tool side is not observed;
 - the statistics. The tool writes seven or more lines to standard error on
   every run that reaches generation (`cli-behavior.md`, "CLI output
   formats", `static-delta`). The port writes nothing to standard error on
@@ -3552,7 +3610,10 @@ keys in file '<path>'` of `ed25519`, byte for byte. Under `spki`, a
 `--keys-file` and each key-store file hold PEM `PUBLIC KEY` blocks, the form
 that the `ostree` 2026.1 build with OpenSSL on the NixOS development host
 reads. The key-file entries under `static-delta` above, the spki entries
-included, also hold for `sign --verify`. Twelve differences stand.
+included, also hold for `sign --verify`. Under `spki`, a signing
+`--keys-file` holds PEM `PRIVATE KEY` blocks, each a PKCS#8 DER, and each
+block adds one signature. A `-d` `--keys-file` holds PEM `PUBLIC KEY` blocks,
+read as a `--keys-file` of `--verify`. Thirteen differences stand.
 
 - the verdict report. The exit status agrees. The two reports part as
   follows:
@@ -3600,8 +3661,8 @@ included, also hold for `sign --verify`. Twelve differences stand.
   second with `error: the argument '--sign-type <SIGN_TYPE>' cannot be used
   multiple times` at exit 1;
 - signing with a repeated `--keys-file`. This difference is in the bytes of
-  the repository and is open. The tool reads the last `--keys-file` when it
-  signs, so `sign COMMIT --keys-file=s1 --keys-file=s2` writes one signature,
+  the repository, and the port keeps it. The tool reads the last
+  `--keys-file` when it signs, so `sign COMMIT --keys-file=s1 --keys-file=s2` writes one signature,
   by the key of `s2`. The port reads every file and writes one signature for
   each key, so the `.commitmeta` bytes differ. A positional secret key beside
   one `--keys-file` signs with both keys in both implementations;
@@ -3616,17 +3677,49 @@ included, also hold for `sign --verify`. Twelve differences stand.
   signature that key verifies. It refuses a secret key with `error:
   signature: ed25519 public key must be 32 bytes, got 64` at exit 1 and
   writes nothing. The tool writes a signature where the port refuses, and the
-  port removes a signature where the tool refuses;
+  port removes a signature where the tool refuses. Under `spki` the tool
+  takes a `PRIVATE KEY` block in a `-d` `--keys-file` and writes one more
+  signature at exit 0, and refuses a `PUBLIC KEY` block with `error:
+  Unexpected label "PUBLIC KEY"` at exit 1 (`cli-behavior.md`, "CLI output
+  formats", `static-delta`, "spki secret key files"). The port reads `PUBLIC
+  KEY` blocks and removes each signature that a key of the file verifies. It
+  refuses a `PRIVATE KEY` block with `error: signature: the key file
+  '<path>', line <n>: unexpected label "PRIVATE KEY"` at exit 1;
 - a signing or delete `--keys-file` that is not a regular file, an empty
   `--keys-file=` included. With no positional KEY-ID both refuse at exit 1
   and write nothing. The tool writes the GLib warning `Can't open file
   '<path>' with keys` and `error: File object '<path>' is not a regular
-  file`. The port writes `error: i/o error: No such file or directory (os
-  error 2)`, or `Is a directory (os error 21)` for a directory, and `-d`
-  with no positional KEY-ID writes `error: signature: delete requires at
-  least one KEY-ID`. Beside a positional secret key, the tool writes the
-  warning, signs with the positional key, and exits 0. The port refuses at
-  exit 1 and writes nothing;
+  file`. The port reads a signing file and a `-d` file as a key source of
+  the library: a regular file of at most 1 MiB, with no wait on a
+  fifo. It writes `error: i/o error: No such file or directory (os error 2)`
+  for a missing file, `error: signature: the key file '<path>' is not a
+  regular file` for a directory or a fifo, and `error: signature: the key
+  file '<path>' is over the 1048576-byte ceiling` for a larger file. `-d`
+  with no positional KEY-ID writes `error: signature: delete
+  requires at least one KEY-ID`. Beside a positional secret key, the tool
+  writes the warning, signs with the positional key, and exits 0. The port
+  refuses at exit 1 and writes nothing;
+- an spki signing `--keys-file`. Observed with the `ostree` 2026.1 build with
+  OpenSSL on the NixOS development host (`cli-behavior.md`, "CLI output
+  formats", `static-delta`, "spki secret key files"). Both read PEM `PRIVATE
+  KEY` blocks, ignore the text outside them, and sign once with each block.
+  These files part:
+  - An empty file, a file of white space only, and a file of one base64
+    PKCS#8 line. The tool ends on SIGABRT, exit 134. The port refuses the run
+    at exit 1 with `error: signature: the key file '<path>' holds no PEM
+    PRIVATE KEY block`.
+  - A block that does not decode after a valid block. The tool writes the
+    signature of the valid block, then reports `error: Not able to sign the
+    cobject: openssl: Failed to initialize spki key` at exit 1. The port reads
+    every block before the first signature. It refuses the run at exit 1 with
+    an `error: signature: the key file '<path>', line <n>:` line and writes no
+    signature. A block of another label gives `error: Unexpected label
+    "<label>"` from the tool and the port line `unexpected label "<label>"`,
+    and neither writes a signature.
+  - A body with a blank line. The tool signs, and the port refuses the file.
+    The body rules are those of a `PUBLIC KEY` block under `static-delta`.
+  - A positional key beside a refused file. The port writes no signature,
+    also for the positional key;
 - an spki positional key of `--verify` that is not the base64 of a
   SubjectPublicKeyInfo DER: the base64 of a raw SEC1 point, compressed or
   uncompressed, of the full PEM text, or of a PKCS#8 secret key. Observed
@@ -4582,9 +4675,11 @@ allow-cleartext-credentials`.
   refusals of `ostrya summary -u`. Two of these refusals name the options
   of `remote summary -u`: `--keys-file` under the gpg engine gives
   `error: signature: gpg signing takes --gpg-sign and --sign KEY-ID
-  arguments; --keys-file serves the other engines`, and a key file with no
-  key gives `error: signature: no signing key given; pass --sign or
-  --keys-file`. The option parser refuses each signing option and
+  arguments; --keys-file serves the other engines`, and an ed25519 key file
+  with no key gives `error: signature: no signing key given; pass --sign or
+  --keys-file`. An spki `--keys-file` holds PEM `PRIVATE KEY` blocks, the
+  form of a `sign --keys-file`, and each block adds one signature. The
+  command reads each key file before the first request. The option parser refuses each signing option and
   `--break-lock` without `-u`, and refuses `-u` with `--raw`,
   `--list-metadata-keys`, and `--print-metadata-key`. A bucket repository
   that holds a `summary.sig` refuses an update with no key: `error: invalid

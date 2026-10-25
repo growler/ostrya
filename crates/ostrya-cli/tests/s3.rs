@@ -2155,6 +2155,79 @@ fn remote_summary_update_signs_with_ed25519_and_a_pull_verifies_it() {
     scratch.fails(&[&dest, "pull", "wrong", "main", CLEARTEXT]);
 }
 
+/// The spki `--keys-file` of `remote summary -u` holds PEM `PRIVATE KEY`
+/// blocks. A file of base64 lines is refused before any request.
+#[cfg(feature = "spki")]
+#[test]
+fn remote_summary_update_signs_with_an_spki_pem_key_file() {
+    const SECRET_PKCS8_B64: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg2L708EsnnzHER0SYasMNIUcGv63QapC/3kVsoPerzKGhRANCAATxfzfHKUPeJtyLTGMUoxHhvBS1NT9guWhUQPGiZRLZIcB8Wc3csdVU1iOiTRmbZGKJTtekOdEAbVRrx5HxIpst";
+    let scratch = Scratch::new("summary-update-spki-pem");
+    let server = StandIn::start();
+    let endpoint = endpoint_of(&server);
+    let lines = scratch.path().join("lines");
+    std::fs::write(&lines, format!("{SECRET_PKCS8_B64}\n")).unwrap();
+    let message = scratch.fails(&[
+        "remote",
+        "summary",
+        "-u",
+        "--sign-type=spki",
+        &format!("--keys-file={}", lines.display()),
+        ADDRESS,
+        &endpoint,
+        CLEARTEXT,
+    ]);
+    assert_eq!(
+        message,
+        format!(
+            "error: signature: the key file '{}' holds no PEM PRIVATE KEY block\n",
+            lines.display()
+        )
+    );
+    assert!(server.state().requests.is_empty());
+
+    prune_fixture(&scratch, &server);
+    let pem = scratch.path().join("key.pem");
+    let body: Vec<&str> = SECRET_PKCS8_B64
+        .as_bytes()
+        .chunks(64)
+        .map(|c| std::str::from_utf8(c).unwrap())
+        .collect();
+    std::fs::write(
+        &pem,
+        format!(
+            "-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
+            body.join("\n")
+        ),
+    )
+    .unwrap();
+    let last_modified = format!("--last-modified={TS}");
+    scratch.ok(&[
+        "remote",
+        "summary",
+        "-u",
+        "--sign-type=spki",
+        &format!("--keys-file={}", pem.display()),
+        &last_modified,
+        ADDRESS,
+        &endpoint,
+        CLEARTEXT,
+    ]);
+    let by_file = object(&server, "repo/summary.sig").unwrap();
+    scratch.ok(&[
+        "remote",
+        "summary",
+        "-u",
+        "--sign-type=spki",
+        &format!("--sign={SECRET_PKCS8_B64}"),
+        &last_modified,
+        ADDRESS,
+        &endpoint,
+        CLEARTEXT,
+    ]);
+    // The spki signer is deterministic, so the two runs write the same bytes.
+    assert_eq!(object(&server, "repo/summary.sig").unwrap(), by_file);
+}
+
 #[test]
 fn remote_summary_update_with_last_modified_writes_the_bytes_of_summary_u() {
     let scratch = Scratch::new("summary-update-bytes");

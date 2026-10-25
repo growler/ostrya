@@ -76,6 +76,9 @@ pub struct ReceivePolicy {
     pub allow_unsigned: bool,
     /// The keys that the server signs each new commit with, in order.
     ///
+    /// An spki key group gives one key for each block of its secret key file,
+    /// so the list can hold more keys than the client group names groups.
+    ///
     /// A new commit is a commit that becomes the new value of a ref. A server
     /// commit is a new commit too.
     pub signers: Vec<Arc<ServerSigner>>,
@@ -85,7 +88,8 @@ pub struct ReceivePolicy {
     /// `security.capability` or `security.selinux` extended attribute.
     pub allow_privileged: bool,
     /// The keys that the server signs each regenerated summary with, in
-    /// order.
+    /// order. An spki key group gives one key for each block of its secret
+    /// key file.
     pub summary_signers: Vec<Arc<ServerSigner>>,
     /// The switch that regenerates the summary of each auth item, as
     /// [`Repo::regenerate_summaries`](crate::Repo::regenerate_summaries)
@@ -195,6 +199,11 @@ impl ReceivePolicies {
     /// `ed25519` or `spki` key group takes `secret-key-file`. A `gpg` key group
     /// takes `gpg-key`, and `gpg-homedir` as an option.
     ///
+    /// The `secret-key-file` of an `ed25519` key group holds one base64 key on
+    /// one line. The `secret-key-file` of an `spki` key group holds PEM
+    /// `PRIVATE KEY` blocks, as `spki_secret_keys` of the `spki` module reads
+    /// them. Each block gives one key.
+    ///
     /// # Errors
     ///
     /// - Each error of [`ClientAccess::from_config`].
@@ -210,8 +219,11 @@ impl ReceivePolicies {
     ///   signing or verification engine that this build does not have.
     /// - [`Error::Signature`](crate::Error::Signature) if:
     ///   - a key source cannot be read
-    ///   - a secret key file does not exist, holds no key, or holds more than
-    ///     one key
+    ///   - a secret key file does not exist
+    ///   - a secret key file holds no key, or holds more than one key (an
+    ///     `ed25519` key group)
+    ///   - `spki_secret_keys` refuses the secret key file of an `spki` key
+    ///     group
     ///   - an engine refuses a key
     ///   - a GPG selector names no secret key or more than one, or `gpg` fails
     ///   - an engine that `sign-verify` names has no trusted key, or no engine

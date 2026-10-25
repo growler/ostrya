@@ -79,7 +79,8 @@ fn open_key_file(path: &Path) -> io::Result<File> {
 /// # Ceiling and file type
 ///
 /// If the source holds more than `ceiling` bytes, the function refuses the
-/// whole source by its name. A read of only the first `ceiling` bytes gives a
+/// whole source by its name. A source whose stated length is over `ceiling`
+/// is refused before the read. A read of only the first `ceiling` bytes gives a
 /// trusted set that is smaller than the set that the operator supplied. No
 /// message tells the operator about this difference.
 ///
@@ -107,6 +108,9 @@ pub fn read_key_source(file: File, subject: &str, ceiling: u64) -> Result<Vec<u8
         .map_err(|e| refuse(&format!("cannot be read: {e}")))?;
     if !metadata.file_type().is_file() {
         return Err(refuse("is not a regular file"));
+    }
+    if metadata.len() > ceiling {
+        return Err(refuse(&format!("is over the {ceiling}-byte ceiling")));
     }
     // The length that the handle states sets the capacity of the buffer, so the
     // read and its probe for the end need no growth. The `take` bound stays the

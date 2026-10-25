@@ -38,7 +38,7 @@ The engine selects the key format and the \%detached\-metadata key that holds th
 \fB\-\-keys\-file\fR \fIPATH\fR
 Read keys from a file.
 .IP
-For \%ed25519, the file has \%base64 keys, one per line: secret keys to sign, public keys to verify and delete. For spki, the file has \%base64 keys, one per line, to sign and delete, and PEM \fB\%PUBLIC KEY\fR blocks to verify. Signing and delete read every file. For an \%ed25519 or spki verify, the last value wins. With this option or a \%KEY\-ID, that verify does not read \%\-\-keys\-dir or the system key directories.
+For \%ed25519, the file has \%base64 keys, one per line: secret keys to sign, public keys to verify and delete. For spki, the file holds PEM \fB\%PRIVATE KEY\fR blocks, each a \%PKCS#8 DER, to sign, and PEM \fB\%PUBLIC KEY\fR blocks to verify and delete. Each \fB\%PRIVATE KEY\fR block adds one signature. Signing and delete read every file. A signing or delete file is a regular file of at most \%1 MiB. For an \%ed25519 or spki verify, the last value wins. With this option or a \%KEY\-ID, that verify does not read \%\-\-keys\-dir or the system key directories.
 .IP
 For gpg, the file is a binary or armored keyring for verify and delete, and every file is read. These keyrings then replace the global trusted set and the keyrings of \%\-\-remote. A gpg signing run refuses this option.
 .TP

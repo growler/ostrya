@@ -20,8 +20,11 @@
 //!
 //! - `smol` (default): with `sign-gpg`, `GpgSigner` runs `gpg` on `smol`.
 //! - `tokio`: with `sign-gpg`, `GpgSigner` runs `gpg` on `tokio`.
-//! - `sign-spki`: the spki engine, `SpkiSigner` and `SpkiVerifier`, and
-//!   `spki_public_keys`, which reads the keys of a public key file.
+//! - `sign-spki`: the spki engine, `SpkiSigner` and `SpkiVerifier`,
+//!   `spki_public_keys`, which reads the keys of a public key file,
+//!   `spki_secret_keys`, which reads the signers of a PEM secret key file,
+//!   and `spki_secret_key_lines`, which reads the signers of a file of base64
+//!   key lines.
 //! - `sign-gpg`: `GpgSigner`, which signs with the `gpg` command.
 //!
 //! # Examples
@@ -65,7 +68,9 @@ pub use gpg::GpgSigner;
 pub use keys::{MAX_KEY_FILE, SignKeys, key_text, read_key_file, read_key_source};
 pub use metadata::append_signature;
 #[cfg(feature = "sign-spki")]
-pub use spki::{SpkiSigner, SpkiVerifier, spki_public_keys};
+pub use spki::{
+    SpkiSigner, SpkiVerifier, spki_public_keys, spki_secret_key_lines, spki_secret_keys,
+};
 
 // The public types of this crate are `Send + Sync`, so they can move across
 // tasks and threads. The trait objects that `Repo::sign_commit` and

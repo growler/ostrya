@@ -211,6 +211,10 @@ and the tests that read them do not need the `ostree` tool.
 - `tls/` -- the TLS certificates and keys of the HTTPS tests.
   `tls/generate.sh` writes them, separately from `generate.sh`. Run it only
   to replace the certificates. Their validity is 100 years.
+- `spki/<type>/` -- the spki signature fixtures of one key type, now `p256`.
+  `spki/generate.sh` writes them, separately from `generate.sh`.
+  `spki/.gitattributes` marks the repository objects, the deltas, the delta
+  indexes, and the two `summary` files as binary.
 
 ### The fixture generator
 
@@ -234,6 +238,85 @@ the fixture does not need them make each content-addressed object and each
 ref stable. Thus a second run writes the same bytes into each tracked file.
 The script commits the same tree in each mode, and it fails if the commit
 checksums are different.
+
+### The spki fixtures
+
+Each `spki/<type>/` directory holds one key type. It holds these files:
+
+- `secret.pem` -- the secret key, one PKCS#8 `PRIVATE KEY` block. The key
+  is a test key and signs nothing else.
+- `public.pem` -- the public key, one `PUBLIC KEY` block.
+- `repo/` -- a copy of `generated/archive/repo`, to which the tool added
+  these items:
+  - the `.commitmeta` of the commit, with two spki signatures;
+  - a signed static delta from scratch to the commit, in the layout of a
+    superblock and one part;
+  - the delta index in `delta-indexes/`;
+  - the `summary` and its signature, `summary.sig`;
+  - the key `indexed-deltas=true` in `config`.
+- `MANIFEST` -- the key type, the `ostree` and `openssl` versions, the
+  commit, the delta, and the s class (`low` or `high`) of each signature.
+
+The tool read a different signing input for each signature. For the commit,
+`ostree sign --keys-file` read `secret.pem`. For the delta and the summary,
+`--sign` read the base64 body of `secret.pem` inline.
+
+These fixtures are separate from `generate.sh`. Each run makes a new key,
+and ECDSA takes a random nonce for each signature. Thus a run cannot write
+the same bytes again. Run the script only to replace the fixtures of one key
+type. The script deletes and writes `spki/<type>/` alone:
+
+```sh
+tests/fixtures/spki/generate.sh p256
+```
+
+The script needs an `ostree` build that shows `openssl` and `sign-spki` in
+`ostree --version`. The build on the NixOS development host has both. If one
+of the two is absent, the script stops before it writes anything. The script
+also runs `openssl` (OpenSSL 3 or LibreSSL) and `python3`. It reads
+`generated/archive/repo`. If that directory is absent, the script stops
+before it writes anything.
+
+The script makes these checks, and it stops if one fails:
+
+- `openssl` verifies each signature over the bytes that it signs: the commit
+  object, the `summary` file, and the superblock bytes in the signed
+  envelope. The `ostree` verify accepts blobs that no key signed, so this
+  check does not use the tool.
+- The delta and the summary each hold one signature.
+- `ostree static-delta verify` verifies the delta with `public.pem`.
+- `ostree fsck` accepts the repository. The script runs it before it writes
+  `spki/<type>/`.
+
+Git does not keep the empty `refs/mirrors` and `refs/remotes` directories.
+Before you run the tool on `spki/<type>/repo` in a checkout, create them.
+
+ECDSA gives a signature with a low s or with a high s, where a high s is
+greater than n/2 and n is the order of the curve. The first commit signature
+has a low s, and the second has a high s. The script signs again until it
+gets this order, and it stops after 64 tries. The test
+`p256_tool_commit_verifies_low_and_high_s` asserts the s class of each
+signature and that each signature verifies. Thus the test shows that the
+port accepts a high s that the tool writes. The s class of the delta and
+summary signatures is random. `MANIFEST` records it.
+
+A later ECDSA curve adds these items:
+
+- a case in the script, with its `genpkey` options and its group order;
+- a `spki/<type>/` directory;
+- tests under a `cfg` of its key feature. The `cfg` of the test file
+  becomes an `any()` list of the key features;
+- a bullet in the fixture layout.
+
+A key type that does not sign with ECDSA has no s class. Its case also
+replaces the steps that sign for a low s and a high s.
+
+The tests are in `crates/ostrya/tests/sign_spki_fixtures.rs`:
+
+```sh
+cargo test -p ostrya --no-default-features --features smol,sign-spki-p256 \
+    --test sign_spki_fixtures
+```
 
 ### Fixtures that the tool cannot write
 

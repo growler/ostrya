@@ -1,0 +1,7 @@
+# The repository files of the spki fixtures are serialized GVariant or
+# compressed object data, not text.
+*/repo/objects/** binary
+*/repo/deltas/** binary
+*/repo/delta-indexes/** binary
+*/repo/summary binary
+*/repo/summary.sig binary

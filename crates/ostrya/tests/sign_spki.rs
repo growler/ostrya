@@ -20,7 +20,7 @@
 //! The embedded keys are a fixed P-256 pair. The command `openssl genpkey
 //! -algorithm EC -pkeyopt ec_paramgen_curve:P-256` made them.
 
-#![cfg(feature = "sign-spki")]
+#![cfg(feature = "sign-spki-p256")]
 
 mod common;
 
@@ -30,8 +30,9 @@ use std::process::Command;
 
 use common::{TmpDir, openssl_available, ostree_available};
 use ostrya::{
-    Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, MutableTree, Repo,
-    RepoMode, Signer, SpkiSigner, SpkiVerifier, Verifier, base64, load_sign_keys_from,
+    Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, Ed25519Signer,
+    MutableTree, Repo, RepoMode, Signer, SpkiSigner, SpkiVerifier, Verifier, base64,
+    load_sign_keys_from,
 };
 use ostrya_rt::block_on;
 
@@ -320,6 +321,66 @@ fn spki_fixed_width_signature_does_not_verify() {
             let outcome = repo.verify_commit(&commit, &[&verifier]).await.unwrap();
             assert_eq!(outcome.valid, valid);
             assert_eq!(outcome.signatures.len(), 1);
+        }
+    });
+}
+
+/// A commit whose only spki signature is a blob that the trusted key does not
+/// verify does not verify. A signature of another key type beside a valid
+/// signature leaves the commit valid.
+#[test]
+fn spki_blobs_that_no_trusted_key_verifies() {
+    let tmp = TmpDir::new("spki-strict");
+    let base = tmp.path();
+    block_on(async {
+        let (repo, commit) = build_committed_repo(base).await;
+        let data = commit_bytes(base, &commit);
+        let signer = SpkiSigner::from_base64(SECRET_PKCS8_B64).unwrap();
+        let der = signer.sign(&data).await.unwrap();
+        let verifier = SpkiVerifier::new([public_spki_der()], Vec::<Vec<u8>>::new()).unwrap();
+        // The ed25519 key of test 1 in RFC 8032: the seed, then the public key.
+        let ed25519 = Ed25519Signer::from_secret_key(
+            &base64::decode(concat!(
+                "nWGxne/9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2DXWpgBgrEKt9VL/tPJZAc6",
+                "DuFy89qmIyWvAhpo9wdRGg==",
+            ))
+            .unwrap(),
+        )
+        .unwrap()
+        .sign(&data)
+        .await
+        .unwrap();
+        let mut trailing = der.clone();
+        trailing.push(0);
+        // The second INTEGER claims one byte more than the SEQUENCE holds.
+        let mut malformed = der.clone();
+        let at = 4 + usize::from(malformed[3]);
+        malformed[at + 1] += 1;
+        let random: Vec<u8> = (0u8..64)
+            .map(|i| i.wrapping_mul(37).wrapping_add(11))
+            .collect();
+
+        let cases = [
+            (vec![random], false),
+            (vec![vec![0x5a]], false),
+            (vec![trailing], false),
+            (vec![malformed], false),
+            (vec![ed25519.clone()], false),
+            (vec![ed25519, der], true),
+        ];
+        for (blobs, valid) in cases {
+            let mut dict = ostrya::Value::Array(Vec::new());
+            for blob in &blobs {
+                ostrya::sign::append_signature(&mut dict, signer.metadata_key(), blob.clone())
+                    .unwrap();
+            }
+            repo.write_commit_detached_metadata(&commit, Some(&dict))
+                .await
+                .unwrap();
+            let outcome = repo.verify_commit(&commit, &[&verifier]).await.unwrap();
+            assert_eq!(outcome.valid, valid, "{blobs:02x?}");
+            assert_eq!(outcome.signatures.len(), blobs.len());
+            assert!(!outcome.signatures[0].valid && outcome.signatures[0].key_missing);
         }
     });
 }

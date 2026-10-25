@@ -20,11 +20,13 @@
 //!
 //! - `smol` (default): with `sign-gpg`, `GpgSigner` runs `gpg` on `smol`.
 //! - `tokio`: with `sign-gpg`, `GpgSigner` runs `gpg` on `tokio`.
-//! - `sign-spki`: the spki engine, `SpkiSigner` and `SpkiVerifier`,
-//!   `spki_public_keys`, which reads the keys of a public key file,
-//!   `spki_secret_keys`, which reads the signers of a PEM secret key file,
-//!   and `spki_secret_key_lines`, which reads the signers of a file of base64
-//!   key lines.
+//! - `sign-spki`: the spki engine with each of its key types. It turns on
+//!   `sign-spki-p256`.
+//! - `sign-spki-p256`: the spki engine with the ECDSA P-256 key type. The
+//!   engine is `SpkiSigner` and `SpkiVerifier`, `spki_public_keys`, which
+//!   reads the keys of a public key file, `spki_secret_keys`, which reads the
+//!   signers of a PEM secret key file, and `spki_secret_key_lines`, which
+//!   reads the signers of a file of base64 key lines.
 //! - `sign-gpg`: `GpgSigner`, which signs with the `gpg` command.
 //!
 //! # Examples
@@ -54,11 +56,15 @@ mod error;
 mod gpg;
 mod keys;
 mod metadata;
-#[cfg(feature = "sign-spki")]
+#[cfg(any(feature = "sign-spki-p256"))]
 mod pem;
-#[cfg(feature = "sign-spki")]
+#[cfg(any(feature = "sign-spki-p256"))]
 mod spki;
 
+#[cfg(any(feature = "sign-spki-p256"))]
+pub use self::spki::{
+    SpkiSigner, SpkiVerifier, spki_public_keys, spki_secret_key_lines, spki_secret_keys,
+};
 pub use dummy::{DummySigner, DummyVerifier};
 pub use ed25519::{Ed25519Signer, Ed25519Verifier};
 pub use engine::{SignFuture, SignatureInfo, Signer, Verifier, VerifyFuture, VerifyOutcome};
@@ -67,10 +73,6 @@ pub use error::{Error, Result};
 pub use gpg::GpgSigner;
 pub use keys::{MAX_KEY_FILE, SignKeys, key_text, read_key_file, read_key_source};
 pub use metadata::append_signature;
-#[cfg(feature = "sign-spki")]
-pub use spki::{
-    SpkiSigner, SpkiVerifier, spki_public_keys, spki_secret_key_lines, spki_secret_keys,
-};
 
 // The public types of this crate are `Send + Sync`, so they can move across
 // tasks and threads. The trait objects that `Repo::sign_commit` and
@@ -87,9 +89,9 @@ const _: fn() = || {
     assert_send_sync::<SignatureInfo>();
     assert_send_sync::<SignKeys>();
     assert_send_sync::<Error>();
-    #[cfg(feature = "sign-spki")]
+    #[cfg(any(feature = "sign-spki-p256"))]
     assert_send_sync::<SpkiSigner>();
-    #[cfg(feature = "sign-spki")]
+    #[cfg(any(feature = "sign-spki-p256"))]
     assert_send_sync::<SpkiVerifier>();
     #[cfg(feature = "sign-gpg")]
     assert_send_sync::<GpgSigner>();

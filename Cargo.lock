@@ -1854,6 +1854,7 @@ dependencies = [
 name = "ostrya-sign"
 version = "0.5.0"
 dependencies = [
+ "der",
  "ed25519-dalek",
  "futures-lite",
  "libc",
@@ -1861,6 +1862,8 @@ dependencies = [
  "ostrya-rt",
  "p256",
  "pem-rfc7468",
+ "pkcs8",
+ "spki",
  "thiserror",
 ]
 

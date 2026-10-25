@@ -34,7 +34,7 @@ enum KeySpec {
     Ed25519 {
         file: String,
     },
-    #[cfg(feature = "sign-spki")]
+    #[cfg(any(feature = "sign-spki-p256"))]
     Spki {
         file: String,
     },
@@ -183,7 +183,7 @@ fn check_trust(keyfile: &KeyFile, group: &str) -> Result<()> {
     // only in a build that has it.
     let names_spki = matches!(&sign, SignVerify::Engines(names) if names.iter().any(|n| n == "spki"))
         || engine_keys.iter().any(|(_, engine)| *engine == "spki");
-    if cfg!(not(feature = "sign-spki")) && names_spki {
+    if cfg!(not(any(feature = "sign-spki-p256"))) && names_spki {
         return Err(Error::Unsupported(format!(
             "[{group}] names the spki engine, which this build has no engine for; \
              build with the sign-spki feature"
@@ -280,7 +280,7 @@ fn parse_key(keyfile: &KeyFile, group: &str) -> Result<KeySpec> {
 }
 
 /// Returns the spec of an spki key group whose keys passed their checks.
-#[cfg(feature = "sign-spki")]
+#[cfg(any(feature = "sign-spki-p256"))]
 fn spki_key(_group: &str, file: String) -> Result<KeySpec> {
     Ok(KeySpec::Spki { file })
 }
@@ -290,7 +290,7 @@ fn spki_key(_group: &str, file: String) -> Result<KeySpec> {
 ///
 /// The build cannot sign with the key, so the refusal stops the policy before
 /// it accepts a session.
-#[cfg(not(feature = "sign-spki"))]
+#[cfg(not(any(feature = "sign-spki-p256")))]
 fn spki_key(group: &str, _file: String) -> Result<KeySpec> {
     Err(Error::Unsupported(format!(
         "[{group}] is an spki key, which this build cannot sign with; build with \
@@ -335,7 +335,7 @@ async fn build_signers(name: &str, spec: &KeySpec) -> Result<Vec<ServerSigner>> 
                 ServerSigner::ed25519(&ostrya_core::base64::decode(&line)?).map_err(in_group)?;
             Ok(vec![signer])
         }
-        #[cfg(feature = "sign-spki")]
+        #[cfg(any(feature = "sign-spki-p256"))]
         KeySpec::Spki { file } => secret_key_blocks(file)
             .await
             .map_err(in_group)?
@@ -388,7 +388,7 @@ fn read_secret_key_line(path: &str) -> Result<String> {
 /// `PRIVATE KEY` block, in the order of the file.
 ///
 /// The read runs on the blocking pool.
-#[cfg(feature = "sign-spki")]
+#[cfg(any(feature = "sign-spki-p256"))]
 async fn secret_key_blocks(path: &str) -> Result<Vec<crate::spki::SpkiSigner>> {
     let path = path.to_owned();
     ostrya_rt::unblock(move || read_secret_key_blocks(&path)).await
@@ -400,7 +400,7 @@ async fn secret_key_blocks(path: &str) -> Result<Vec<crate::spki::SpkiSigner>> {
 /// The read obeys the rule of every key source: a regular file alone, of at
 /// most [`MAX_KEY_FILE`] bytes. `spki_secret_keys` reads the blocks and states
 /// the rules of the file.
-#[cfg(feature = "sign-spki")]
+#[cfg(any(feature = "sign-spki-p256"))]
 fn read_secret_key_blocks(path: &str) -> Result<Vec<crate::spki::SpkiSigner>> {
     let subject = format!("the secret key file '{path}'");
     let Some(bytes) = read_key_path(Path::new(path), &subject, MAX_KEY_FILE)? else {

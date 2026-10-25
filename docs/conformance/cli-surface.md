@@ -1400,7 +1400,7 @@ ref in both: a key that cannot sign leaves the ref where it stood and publishes
 nothing, and a ref write that cannot happen leaves the commit and its
 `.commitmeta` durable in `objects/` with no ref. Both write the same
 `.commitmeta` bytes for a given ed25519 key set, and each one's GPG signature
-verifies through the other's `show --gpg-verify-remote`. Eleven divergences
+verifies through the other's `show --gpg-verify-remote`. Twelve divergences
 stand.
 
 - `--sign-type` names an engine the port carries and this tool build does not.
@@ -1552,6 +1552,14 @@ stand.
   signature: spki secret key: the SEC1 key does not name its curve`, and for
   a SEC1 key of another curve `error: signature: spki secret key: the SEC1
   key names a curve other than P-256`.
+- An spki secret key with explicit curve parameters, of `--sign` or of
+  `--sign-from-file`, in a PKCS#8 key, in the `ECPrivateKey` of a PKCS#8 key,
+  or in a SEC1 key. The tool signs with such a key ("P2", `sign`). The port
+  refuses it at exit 1 with `error: signature: spki secret key: the EC key
+  has explicit curve parameters`, or the same reason after `error:
+  signature: the key file '<path>', line <n>: `, and moves no ref. A key of a
+  type or on a curve outside the set of the port is refused the same way, as
+  `sign` records.
 
 The branch-name term of the signing step's fault order is observable only over
 a name the ref-name rule refuses. `-b 'bad//name' --sign=zzz` reports
@@ -2910,7 +2918,12 @@ details", "spki"). Forty-four differences stand on `show`,
   `error: openssl: Failed to initialize spki key` at exit 1. The port refuses
   the run at exit 1 before it reads the superblock, in each position of the
   key, with `error: signature: spki public key: expected SubjectPublicKeyInfo
-  DER` and nothing on standard output;
+  DER` and nothing on standard output. A key with explicit curve parameters,
+  and a key of a type or on a curve outside the set of the port, are refused
+  in each key source of `verify`, `generate`, and `apply-offline`, as "P2",
+  `sign`, records. A line of the `--keys-file` of `generate` gives the reason
+  after `error: signature: the key file '<path>', line <n>: spki secret key:
+  `;
 - `--keys-dir` naming a regular file, under `verify`, `sign --verify`, or
   `summary --verify`. The tool's `verify` and `sign --verify` report `error:
   signature: ed25519: no keys loaded`, and a later `--keys-dir` replaces the
@@ -3613,7 +3626,7 @@ reads. The key-file entries under `static-delta` above, the spki entries
 included, also hold for `sign --verify`. Under `spki`, a signing
 `--keys-file` holds PEM `PRIVATE KEY` blocks, each a PKCS#8 DER, and each
 block adds one signature. A `-d` `--keys-file` holds PEM `PUBLIC KEY` blocks,
-read as a `--keys-file` of `--verify`. Thirteen differences stand.
+read as a `--keys-file` of `--verify`. Fifteen differences stand.
 
 - the verdict report. The exit status agrees. The two reports part as
   follows:
@@ -3735,10 +3748,53 @@ read as a `--keys-file` of `--verify`. Thirteen differences stand.
   `error: Not able to sign the cobject: openssl: Failed to initialize spki
   key` where the port reports its `error: signature: spki secret key:` line.
   Both exit 1 and write no signature;
-- the fixed-width `r || s` form of an ECDSA signature under `-s spki`. The
-  tool verifies a commit whose only spki signature is the `r || s` form at
-  exit 0, observed on 2026-10-24 with the build above. The port writes
-  `signature 1: no public key` and `verification FAILED` at exit 1.
+- a signature blob that no trusted key verifies, under `-s spki`. Observed on
+  2026-10-24 with the build above. Against one trusted P-256 key, the tool
+  verifies at exit 0 a commit whose only spki signature is one of these
+  blobs: 64 random bytes, 1 random byte, a valid DER signature with one more
+  byte after it, a DER `SEQUENCE` whose second integer is shorter than its
+  length field, the fixed-width `r || s` form of a valid signature, and that
+  form with one bit changed. 64 random bytes also verify against a P-384, an
+  SM2, a DSA, and a sect163k1 key. A commit signed by an untrusted Ed25519,
+  Ed448, RSA, RSA-PSS, ML-DSA, or SLH-DSA key verifies against a P-256,
+  P-384, secp256k1, SM2, or DSA key. A pull from a remote that trusts a P-256
+  key accepts a commit whose only signature is 64 random bytes, and a commit
+  signed by an untrusted Ed25519 key. With `sign-verify-summary=true`, the
+  same remote accepts a `summary.sig` whose only signature is 64 random
+  bytes. A well-formed DER signature with wrong `r` and `s` fails, and 64
+  random bytes fail against an Ed25519, an RSA, and an ML-DSA-44 key. The
+  port accepts a blob only when a trusted key of the key type of the blob
+  verifies it (`format-reference.md`, "Signing details", "spki"). For each
+  blob above it writes `signature 1: no public key` and `verification
+  FAILED` at exit 1. The pull and the summary verify of the port use the
+  same rule;
+- an spki key with explicit curve parameters, a `SEQUENCE` in the place of
+  the curve OID. Observed on 2026-10-24 with the build above: the tool signs
+  with a P-256 key made with `ec_param_enc:explicit`, and verifies the
+  signature with its public key. The port refuses such a key in each form, a
+  public key, a PKCS#8 key, the `ECPrivateKey` in a PKCS#8 key, and a SEC1
+  key, at exit 1 before it signs or verifies. An inline key gives `error:
+  signature: spki public key: the EC key has explicit curve parameters` or
+  `error: signature: spki secret key: the EC key has explicit curve
+  parameters`. A key file and a key-store file give `error: signature: the
+  key file '<path>', line <n>: the EC key has explicit curve parameters`, also
+  when the other blocks of the file are valid. A line of the `--keys-file` of
+  `static-delta generate` gives `error: signature: the key file '<path>', line
+  <n>: spki secret key: the EC key has explicit curve parameters`;
+- an spki key of a type or on a curve outside the set of the port. Observed
+  on 2026-10-24 with the build above: the tool signs and verifies with each
+  signature key type of OpenSSL 3.6.4, ECDSA on 85 named curves, SM2,
+  Ed25519, Ed448, RSA, RSA-PSS, DSA, ML-DSA, and SLH-DSA. The port takes
+  ECDSA on the P-256 curve alone. It refuses another key at exit 1 before it
+  signs or verifies, with `error: signature: spki public key: the key type
+  <name> is not supported` or `error: signature: spki public key: the curve
+  <name> is not supported`, and with `spki secret key` for a secret key.
+  `<name>` is a name such as `RSA`, `Ed25519`, or `P-384`, or the dotted OID.
+  A key file and a key-store file give the reason after `error: signature:
+  the key file '<path>', line <n>: `, also when the other blocks of the file
+  are valid. A line of the `--keys-file` of `static-delta generate` gives the
+  reason after `error: signature: the key file '<path>', line <n>: spki
+  secret key: `.
 
 ## P3 -- shell-suite surface with no matrix weight
 
@@ -3795,7 +3851,11 @@ records. Thirteen divergences stand:
   Failed to initialize spki key` (`cli-behavior.md`, "Signature verification
   during a pull", "The verification keys"). The port refuses each pull at exit 1 before it fetches, with
   `error: signature: spki public key: expected SubjectPublicKeyInfo DER`.
-  Both fail also when `verification-spki-file` holds the valid key;
+  Both fail also when `verification-spki-file` holds the valid key. A key
+  with explicit curve parameters, and a key of a type or on a curve outside
+  the set of the port, in `verification-spki-key` or
+  `verification-spki-file`, refuse each pull of the port the same way, as
+  "P2", `sign`, records;
 - `remote gpg-list-keys` reports the key fingerprint, the creation instant, and
   the user ids in the tool's own shape, and leaves out the `(revoked)` marker
   the tool prints after a revoked key's fingerprint and after each of its

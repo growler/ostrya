@@ -13089,7 +13089,7 @@ async fn summary(repo: Repo, repo_path: PathBuf, args: SummaryArgs) -> Result<()
         let engine = summary_sign_type(&args.signing());
         let verifier = summary_verifier(&repo_path, engine, &args)?;
         let outcome = repo.verify_summary(&[verifier.as_ref()]).await?;
-        report_verify(&outcome);
+        report_verify(&outcome, engine);
         if !outcome.valid {
             exit_process(1);
         }
@@ -13625,7 +13625,7 @@ async fn verify_signatures(
         engine => sign_api_verifier(engine, args)?,
     };
     let outcome = repo.verify_commit(commit, &[verifier.as_ref()]).await?;
-    report_verify(&outcome);
+    report_verify(&outcome, args.sign_type);
     if !outcome.valid {
         exit_process(1);
     }
@@ -13972,7 +13972,9 @@ fn unsupported_type(name: &str) -> Error {
 }
 
 /// Prints one line for each examined signature, and a final verdict.
-fn report_verify(outcome: &VerifyOutcome) {
+///
+/// A line gives the fingerprint of the key under the gpg engine alone.
+fn report_verify(outcome: &VerifyOutcome, engine: SignType) {
     if outcome.signatures.is_empty() {
         println!("no signatures found");
         return;
@@ -13986,7 +13988,7 @@ fn report_verify(outcome: &VerifyOutcome) {
             "BAD"
         };
         let mut line = format!("signature {}: {status}", i + 1);
-        if let Some(fpr) = &sig.fingerprint {
+        if let Some(fpr) = sig.fingerprint.as_ref().filter(|_| engine == SignType::Gpg) {
             line.push_str(&format!(" key {fpr}"));
         }
         match (&sig.user_name, &sig.user_email) {

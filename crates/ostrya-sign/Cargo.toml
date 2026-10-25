@@ -14,7 +14,11 @@ default = ["smol"]
 # ostrya-rt. A build without `sign-gpg` holds no runtime.
 smol = ["ostrya-rt?/smol"]
 tokio = ["ostrya-rt?/tokio"]
-sign-spki = ["dep:p256", "dep:pem-rfc7468"]
+# One feature for each key type of the spki engine. The code that each key
+# type shares compiles when one of them is on.
+sign-spki-p256 = ["dep:p256", "dep:der", "dep:spki", "dep:pkcs8", "dep:pem-rfc7468"]
+# The spki engine with each of its key types.
+sign-spki = ["sign-spki-p256"]
 sign-gpg = ["dep:ostrya-rt"]
 
 # docs.rs adds these two features to the default set, so the pages show the
@@ -22,6 +26,12 @@ sign-gpg = ["dep:ostrya-rt"]
 [package.metadata.docs.rs]
 features = ["sign-spki", "sign-gpg"]
 rustdoc-args = ["--cfg", "docsrs"]
+
+# The gates of the spki engine take the form `any(feature = ...)` over the key
+# features of the engine, so that each key feature adds one item to each gate.
+# A gate that names one feature is in this form too.
+[lints.clippy]
+non_minimal_cfg = "allow"
 
 [dependencies]
 ostrya-core = { workspace = true }
@@ -33,10 +43,16 @@ ed25519-dalek = { version = "2", default-features = false, features = [
 ] }
 p256 = { version = "0.13.2", default-features = false, features = [
     "ecdsa",
-    "pem",
     "pkcs8",
     "std",
 ], optional = true }
+der = { version = "0.7.10", default-features = false, features = [
+    "alloc",
+    "oid",
+    "zeroize",
+], optional = true }
+spki = { version = "0.7.3", default-features = false, optional = true }
+pkcs8 = { version = "0.10.2", default-features = false, optional = true }
 pem-rfc7468 = { version = "0.7.0", default-features = false, features = ["alloc"], optional = true }
 
 # The key file reader opens with `O_NONBLOCK` on Unix, so a fifo answers the

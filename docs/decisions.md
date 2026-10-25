@@ -174,16 +174,55 @@ ostree-podman sends the namespaces of podman, which are not its own.
 
 ## The spki sign engine
 
-The spki engine is pure Rust over `p256`: deterministic ECDSA on NIST P-256
-with SHA-256. The `ostree` command builds this engine only with OpenSSL.
-The engine is behind the `sign-spki` feature, so a build without it has no
-ECDSA crate tree.
+The spki engine is pure Rust over `p256`: ECDSA on NIST P-256 with SHA-256.
+The engine signs with RFC 6979 nonces, so one key and one data give the same
+signature bytes. The `ostree` command builds this engine only with OpenSSL,
+and it signs ECDSA with a random nonce. The two forms verify the same way.
 
-No available build of the `ostree` command has spki. The maintainer decided
-to cross-check the engine against the `openssl` command in both directions.
-`format-reference.md`, "Signing details", marks the spki facts as a design
-target. The test `spki_tool_cross_verify_pending` skips until a build of the
-`ostree` command with spki is available.
+The engine has one feature for each key type. `sign-spki-p256` gates the
+P-256 key type, and `sign-spki` turns on each key type. The code that the key
+types share -- the PEM splitter, the OID dispatch, and the key file readers --
+compiles when one key feature is on. This code takes `der`, `spki`, `pkcs8`,
+and `pem-rfc7468` as direct dependencies, and not through the re-exports of
+`p256`, so a key type that does not use `p256` builds the engine with no
+`p256`. A build with no key feature has no ECDSA crate tree. The gates of the
+shared code take the form `any(feature = ...)` over the key features, so each
+key feature adds one item to each gate. `ostrya` and `ostrya-sign` allow the
+clippy lint `non_minimal_cfg`, which refuses a gate of this form with one
+item. Two other forms were rejected. A hidden feature that each key feature
+turns on is a public feature of a published crate. A build script that sets a
+private cfg adds a build script to two crates.
+
+The algorithm OID of a key selects its key type, and the curve OID selects the
+curve of an EC key. The engine refuses each key type and each curve outside
+its set, and an EC key with explicit curve parameters. Explicit parameters let
+a key name a curve of its own. The `ostree` command signs and verifies with
+such a key. `conformance/cli-surface.md` records the differences.
+
+The verify is strict. A trusted key tries a blob only when the blob parses in
+the signature form of its key type, and a blob is valid only when a trusted
+key verifies it. The `ostree` command with OpenSSL reports a valid signature
+for blobs that no trusted key verifies. `conformance/cli-surface.md`, `sign`,
+records the observed results.
+
+The revocation compare and the fingerprint use one rule. The port encodes the
+SubjectPublicKeyInfo DER of a key again from the decoded key, with an
+uncompressed EC point. A trusted key whose DER is in the revoked set is not
+trusted. The fingerprint of a verified signature is the SHA-256 of this DER
+in lowercase hex. So two forms of one key give one key and one fingerprint. A
+compare of the typed values of each key type was rejected: the DER is a
+function of the decoded key and holds the algorithm OID, so one compare serves
+each key type. The GPG engine keeps its uppercase hex fingerprint. The report
+of `sign --verify` and `summary --verify` prints the fingerprint under the
+GPG engine alone.
+
+The build of the `ostree` command with OpenSSL on the development host has
+the spki engine. The test `spki_tool_cross_verify_pending` runs the
+cross-check with the `ostree` command when the command has the engine, and
+skips when the command reports the engine as not implemented. The test
+`spki_openssl_interop` cross-checks the engine against the `openssl` command
+in both directions. `format-reference.md`, "Signing details", marks the spki
+facts as a design target.
 
 ## GPG
 

@@ -401,7 +401,7 @@ fn engines(
 /// `sign-verify=ed25519;dummy`.
 pub(crate) const ALL_ENGINES: &[&str] = &[
     "ed25519",
-    #[cfg(feature = "sign-spki")]
+    #[cfg(any(feature = "sign-spki-p256"))]
     "spki",
 ];
 
@@ -781,7 +781,7 @@ async fn gpg_verifier(_repo: &Repo, source: &KeySource<'_>) -> Result<Arc<dyn Ve
 /// source.
 enum Engine {
     Ed25519,
-    #[cfg(feature = "sign-spki")]
+    #[cfg(any(feature = "sign-spki-p256"))]
     Spki,
 }
 
@@ -796,7 +796,7 @@ enum Engine {
 async fn sign_verifier(engine: &str, source: &KeySource<'_>) -> Result<Option<Arc<dyn Verifier>>> {
     let kind = match engine {
         "ed25519" => Engine::Ed25519,
-        #[cfg(feature = "sign-spki")]
+        #[cfg(any(feature = "sign-spki-p256"))]
         "spki" => Engine::Spki,
         _ => {
             return Err(Error::Unsupported(format!(
@@ -826,7 +826,7 @@ fn build_verifier(kind: Engine, keys: SignKeys) -> Result<Option<Arc<dyn Verifie
             let verifier = Ed25519Verifier::from_sign_keys(keys)?;
             (!verifier.is_empty()).then(|| Arc::new(verifier) as Arc<dyn Verifier>)
         }
-        #[cfg(feature = "sign-spki")]
+        #[cfg(any(feature = "sign-spki-p256"))]
         Engine::Spki => {
             let verifier = crate::spki::SpkiVerifier::from_sign_keys(keys)?;
             (!verifier.is_empty()).then(|| Arc::new(verifier) as Arc<dyn Verifier>)
@@ -956,7 +956,7 @@ fn read_verification_file(engine: &str, path: &str) -> Result<Vec<Vec<u8>>> {
     )
     .map_err(|e| Error::Signature(format!("{subject} cannot be read: {e}")))?;
     let bytes = read_key_source(std::fs::File::from(fd), &subject, MAX_KEY_FILE)?;
-    #[cfg(feature = "sign-spki")]
+    #[cfg(any(feature = "sign-spki-p256"))]
     if engine == "spki" {
         return Ok(crate::spki::spki_public_keys(&bytes, &subject)?);
     }
@@ -992,14 +992,14 @@ mod tests {
     const PAYLOAD: &[u8] = b"the commit bytes";
 
     /// A P-256 secret key, base64 of the PKCS#8 DER.
-    #[cfg(feature = "sign-spki")]
+    #[cfg(feature = "sign-spki-p256")]
     const SPKI_SECRET_A: &str = concat!(
         "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg2L708EsnnzHER0SYasMNIUcG",
         "v63QapC/3kVsoPerzKGhRANCAATxfzfHKUPeJtyLTGMUoxHhvBS1NT9guWhUQPGiZRLZIcB8Wc3",
         "csdVU1iOiTRmbZGKJTtekOdEAbVRrx5HxIpst",
     );
     /// A second P-256 secret key, base64 of the PKCS#8 DER.
-    #[cfg(feature = "sign-spki")]
+    #[cfg(feature = "sign-spki-p256")]
     const SPKI_SECRET_B: &str = concat!(
         "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgU5tYPz/hTTxfsSTPOxD/H9U+",
         "IkBj5qWV4/H3D1NBfRChRANCAAQPyTr9rh2d6WiYOi3oxNiE3ppTP2g5JP2xX9D7rEKnzixp",
@@ -1371,7 +1371,7 @@ mod tests {
     /// A `verification-spki-file` holds PEM `PUBLIC KEY` blocks. A file of
     /// base64 lines is refused by its name. An empty file adds no keys, so the
     /// engine has no key.
-    #[cfg(feature = "sign-spki")]
+    #[cfg(feature = "sign-spki-p256")]
     #[test]
     fn an_spki_key_file_holds_pem_blocks() {
         const SPKI_B64: &str = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE8X83xylD3ibci0xjFKMR4bwUtTU/\
@@ -1417,7 +1417,7 @@ mod tests {
 
     /// An inline `verification-spki-key` and a PEM `verification-spki-file`
     /// add their keys together. A signature of each key verifies.
-    #[cfg(feature = "sign-spki")]
+    #[cfg(feature = "sign-spki-p256")]
     #[test]
     fn an_spki_inline_key_and_key_file_are_both_trusted() {
         use crate::sign::Signer;
@@ -1471,7 +1471,7 @@ mod tests {
     /// SubjectPublicKeyInfo DER, and it can hold line breaks. A SEC1 point,
     /// the base64 of the PEM text, and a PKCS#8 secret key are refused when
     /// the verifier is built.
-    #[cfg(feature = "sign-spki")]
+    #[cfg(feature = "sign-spki-p256")]
     #[test]
     fn an_spki_inline_key_is_a_subject_public_key_info() {
         use crate::spki::SpkiSigner;

@@ -232,6 +232,14 @@ jobs:
       - name: ostrya-sign without a runtime compiles
         run: cargo check -p ostrya-sign --no-default-features --features sign-spki
 
+      # Each key feature of the spki engine turns on the code that the key
+      # types share. These two steps build the engine with the P-256 feature
+      # alone, and run the spki tests of `ostrya` in that build.
+      - name: ostrya-sign with the P-256 key feature alone compiles
+        run: cargo check -p ostrya-sign --no-default-features --features sign-spki-p256
+      - name: The spki tests pass with the P-256 key feature alone
+        run: cargo test -p ostrya --no-default-features --features smol,sign-spki-p256 --test sign_spki
+
       # The portable crates compile for macOS and Windows as well as Linux.
       # `cargo check` needs the standard library of each target and no linker,
       # so the Linux runner checks all three targets. Each portable crate that

@@ -95,6 +95,10 @@ pub struct SignatureInfo {
     /// `true` if this signature verified.
     pub valid: bool,
     /// The fingerprint of the signing key, if the engine gives one.
+    ///
+    /// The GPG engine gives the fingerprint of the key in uppercase hex. The
+    /// spki engine gives the SHA-256 of the SubjectPublicKeyInfo DER of the
+    /// key in lowercase hex, for a valid signature alone.
     pub fingerprint: Option<String>,
     /// The fingerprint of the primary key of the certificate of the signer.
     ///
@@ -125,7 +129,10 @@ pub struct SignatureInfo {
     /// of [`valid`](Self::valid) for each blob. This also applies to a
     /// malformed blob.
     pub key_missing: bool,
-    /// The name of the public-key algorithm, if the engine gives one (GPG).
+    /// The name of the public-key algorithm, if the engine gives one.
+    ///
+    /// The GPG engine gives the algorithm of the key. The spki engine gives
+    /// the key type, `p256`, for a valid signature alone.
     pub pubkey_algorithm: Option<String>,
     /// The name of the digest algorithm, if the engine gives one (GPG).
     pub hash_algorithm: Option<String>,

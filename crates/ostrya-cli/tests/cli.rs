@@ -4263,6 +4263,27 @@ fn spki_inline_key_forms() {
         out.stdout_trimmed(),
         "signature 1: no public key\nverification FAILED"
     );
+
+    // A commit whose only spki signature is 64 bytes that are no signature
+    // does not verify.
+    block_on(async {
+        let repo = Repo::open(&repo).await.unwrap();
+        let checksum = Checksum::from_hex(COMMIT).unwrap();
+        let blob: Vec<u8> = (0u8..64)
+            .map(|i| i.wrapping_mul(37).wrapping_add(11))
+            .collect();
+        let mut dict = Value::Array(Vec::new());
+        ostrya::sign::append_signature(&mut dict, "ostree.sign.spki", blob).unwrap();
+        repo.write_commit_detached_metadata(&checksum, Some(&dict))
+            .await
+            .unwrap();
+    });
+    let out = verify(PUBLIC_SPKI_B64);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        out.stdout_trimmed(),
+        "signature 1: no public key\nverification FAILED"
+    );
 }
 
 /// The spki key files of a verify hold PEM `PUBLIC KEY` blocks:

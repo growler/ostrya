@@ -63,7 +63,9 @@ API documentation: <https://docs.rs/ostrya>
 
 - `smol` (default): the `smol` backend of `ostrya-rt`.
 - `tokio`: the `tokio` backend of `ostrya-rt`.
-- `sign-spki`: the `spki` module, the spki signing engine.
+- `sign-spki`: the `spki` module, the spki signing engine with each of its
+  key types. It turns on `sign-spki-p256`.
+- `sign-spki-p256`: the `spki` module with the ECDSA P-256 key type alone.
 - `verify-gpg`: the `gpg` module, GPG verification and keyring management.
 - `sign-gpg`: `GpgSigner`, which signs with the `gpg` command. It turns on
   `verify-gpg`.

@@ -1950,20 +1950,60 @@ revoked set, so a key in both sets is refused.
 The signature key is `ostree.sign.spki`, and the algorithm is ECDSA over NIST
 P-256 with SHA-256, over the commit bytes of the other engines. The signature
 is DER-encoded ECDSA: an ASN.1 `SEQUENCE` of the two integers `r` and `s`,
-about 70 to 72 bytes. The verifier reads the DER form alone. A blob in another
-form does not verify, and the commit can carry other signatures. The
-fixed-width 64-byte `r || s` form of a valid signature is such a blob. A
-public key is the X.509 SubjectPublicKeyInfo DER, the base64 body of a PEM
-`PUBLIC KEY` block. A raw SEC1 point is not a public key. A secret key is a
+about 70 to 72 bytes. The port signs with RFC 6979 nonces, so one key and one
+data give the same signature bytes.
+
+A signature blob carries no key type. A trusted key tries a blob only when the
+blob parses in the signature form of the key type. For a P-256 key, the form
+is DER, and the parse is strict: a blob with bytes after the `SEQUENCE`, and a
+blob with a length that does not agree with its content, do not parse. A blob
+is valid only when a trusted key verifies it. A blob that no trusted key
+verifies is not valid. It is not an error, because the commit can carry other
+signatures. The fixed-width 64-byte `r || s` form of a valid signature, a
+signature by a key of another type, and random bytes are such blobs.
+
+A public key is the X.509 SubjectPublicKeyInfo DER, the base64 body of a PEM
+`PUBLIC KEY` block. The EC point in it is compressed (first byte `02` or
+`03`) or uncompressed (first byte `04`). The port refuses each other point
+form, such as the compact form (first byte `05`). A raw SEC1 point is not a
+public key. A secret key is a
 PKCS#8 `PrivateKeyInfo` DER, or a SEC1 `ECPrivateKey` DER with a `parameters`
-field that names the P-256 curve. A SEC1 key with no `parameters` field, a
-SEC1 key whose `parameters` field names another curve, and a raw 32-byte scalar
-are refused. The `ECPrivateKey` in a PKCS#8 key can have no
-`parameters` field, because the `AlgorithmIdentifier` of the PKCS#8 key names
-the curve. The key store has the layout of the ed25519 store: `trusted.spki`,
+field that names the P-256 curve. The port tells the two forms apart by their
+ASN.1 structure. A raw 32-byte scalar is refused.
+
+The algorithm OID of a SubjectPublicKeyInfo or of a PKCS#8 key selects the key
+type. For an EC key, the curve OID in the `parameters` field of the
+`AlgorithmIdentifier` selects the curve. The engine takes the key type
+`id-ecPublicKey` (1.2.840.10045.2.1) on the curve `prime256v1`
+(1.2.840.10045.3.1.7). The port refuses these keys:
+
+- a key of another type, for example RSA (1.2.840.113549.1.1.1) or Ed25519
+  (1.3.101.112);
+- an EC key on another curve, for example P-384 (1.3.132.0.34);
+- an EC key with no curve OID, or with a `NULL` in the `parameters` field;
+- an EC key with explicit curve parameters, a `SEQUENCE` in the place of the
+  curve OID. This applies to a SubjectPublicKeyInfo, to the
+  `AlgorithmIdentifier` of a PKCS#8 key, to the `ECPrivateKey` in a PKCS#8
+  key, and to a SEC1 key;
+- a SEC1 key with no `parameters` field, a SEC1 key whose `parameters` field
+  holds a value that is not a curve, such as a `NULL`, and a SEC1 key whose
+  `parameters` field names another curve. The version of a SEC1 key is 1;
+  a structure with another version is in no accepted form;
+- a PKCS#8 key whose `ECPrivateKey` has a `parameters` field that names a
+  curve other than the curve of its `AlgorithmIdentifier`, or that holds a
+  value that is not a curve. The
+  `ECPrivateKey` in a PKCS#8 key can have no `parameters` field.
+
+A key file, an inline key, or a file of the key store that holds one such key
+is refused whole, also when other keys in it are valid.
+
+The key store has the layout of the ed25519 store: `trusted.spki`,
 `revoked.spki`, and their `.d` directories under `/etc/ostree` and
 `<datadir>/ostree`. Its effective trusted set is also the trusted set minus
-the revoked set.
+the revoked set. The port compares a trusted key with a revoked key by the
+decoded key: it encodes the SubjectPublicKeyInfo DER of each key again, with
+an uncompressed EC point, and compares these bytes. So the compressed and the
+uncompressed form of one key match.
 
 An inline secret key, as a positional key of `sign` or the value of a
 `--sign`, is the base64 of the secret key DER. The base64 text can hold the

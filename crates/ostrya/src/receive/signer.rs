@@ -120,7 +120,7 @@ impl ServerSigner {
     /// - [`Error::Signature`] if the verifier does not accept the DER public
     ///   key of `signer`. The message is
     ///   `spki public key: expected SubjectPublicKeyInfo DER`.
-    #[cfg(feature = "sign-spki")]
+    #[cfg(any(feature = "sign-spki-p256"))]
     pub fn spki(signer: crate::spki::SpkiSigner) -> Result<ServerSigner> {
         let verifier =
             crate::spki::SpkiVerifier::new([signer.public_key_der()], Vec::<Vec<u8>>::new())?;
@@ -423,7 +423,7 @@ mod tests {
     /// The spki search recognizes the DER signature of the key, the form
     /// that the verifier reads. It does not recognize the fixed-width
     /// `r || s` form of the same signature, or the signature of another key.
-    #[cfg(feature = "sign-spki")]
+    #[cfg(feature = "sign-spki-p256")]
     #[test]
     fn an_spki_key_recognizes_its_own_der_signature_alone() {
         use crate::spki::SpkiSigner;
@@ -463,7 +463,7 @@ mod tests {
 
     /// Returns the fixed-width `r || s` form of a DER ECDSA signature over
     /// P-256.
-    #[cfg(feature = "sign-spki")]
+    #[cfg(feature = "sign-spki-p256")]
     fn fixed_width(der: &[u8]) -> Vec<u8> {
         // SEQUENCE { INTEGER r, INTEGER s }, each short-form length.
         assert_eq!(der[0], 0x30);

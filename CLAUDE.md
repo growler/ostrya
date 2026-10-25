@@ -356,6 +356,20 @@ term below is measured on the resolved dependency graph.
 - The highest minimum supported Rust version in the graph is 1.85. The
   workspace pins 1.92, so the requirement holds.
 
+`pkcs8` 0.10.2 is also authorized for `crates/ostrya-sign`, behind each key
+feature of the spki engine, now `sign-spki-p256`. It reads the
+`PrivateKeyInfo` of a PKCS#8 secret key, so the spki engine selects the key
+type from the algorithm OID before it decodes the key.
+
+- `default-features = false` is mandatory, and no feature is turned on.
+- `der` 0.7.10 and `spki` 0.7.3 enter the same manifest behind the same
+  features, with `default-features = false`. `der` takes the features
+  `alloc`, `oid`, and `zeroize`, and `spki` takes no feature. No record is
+  kept for these two crates.
+- No package enters `Cargo.lock`. `p256` already reached `pkcs8`, `der`, and
+  `spki` in `ostrya-sign`. The one change to the lock file is the three
+  entries `der`, `pkcs8`, and `spki` in the dependency list of `ostrya-sign`.
+
 ### Authorized: the `getrandom` crate
 
 `getrandom` 0.3.4 is authorized for `crates/ostrya-server` alone. It

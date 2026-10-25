@@ -20,7 +20,7 @@
 //!
 //! The splitter works on bytes. The text outside the blocks can hold any byte.
 
-use p256::elliptic_curve::zeroize::Zeroizing;
+use der::zeroize::Zeroizing;
 
 /// The prefix of a BEGIN line.
 const BEGIN: &[u8] = b"-----BEGIN ";

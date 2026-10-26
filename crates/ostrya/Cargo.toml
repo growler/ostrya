@@ -24,9 +24,10 @@ tokio = [
 ]
 # One feature for each key type of the spki engine.
 sign-spki-p256 = ["ostrya-sign/sign-spki-p256"]
+sign-spki-p384 = ["ostrya-sign/sign-spki-p384"]
 sign-spki-rsa = ["ostrya-sign/sign-spki-rsa"]
 # The spki engine with each of its key types.
-sign-spki = ["sign-spki-p256", "sign-spki-rsa", "ostrya-sign/sign-spki"]
+sign-spki = ["sign-spki-p256", "sign-spki-p384", "sign-spki-rsa", "ostrya-sign/sign-spki"]
 verify-gpg = ["dep:pgp"]
 sign-gpg = ["verify-gpg", "ostrya-sign/sign-gpg"]
 # The server side of a push: the receive policy, the checks it makes, and the

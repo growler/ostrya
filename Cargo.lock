@@ -1861,6 +1861,7 @@ dependencies = [
  "ostrya-core",
  "ostrya-rt",
  "p256",
+ "p384",
  "pem-rfc7468",
  "pkcs8",
  "rsa",

@@ -4,8 +4,8 @@
 #
 # Usage: [OPENSSL=<path of openssl>] generate.sh <key type>
 #
-# The key type is p256 or rsa. The `OPENSSL` variable names the `openssl`
-# command. The default is the `openssl` command on PATH.
+# The key type is p256, p384, or rsa. The `OPENSSL` variable names the
+# `openssl` command. The default is the `openssl` command on PATH.
 #
 # The script drives the `ostree` tool as a black box. It signs the commit of
 # tests/fixtures/generated/archive/repo with a new key, writes a signed static
@@ -14,10 +14,10 @@
 # committed, and the script runs only to replace one key type. It changes no
 # other directory.
 #
-# For p256 (ECDSA), the commit carries two signatures. ECDSA takes a random
-# nonce for each signature. The first signature has a low s, the second has a
-# high s (s > n/2). The tests read the s of each signature, so the order is
-# part of the fixture.
+# For p256 and p384 (ECDSA), the commit carries two signatures. ECDSA takes
+# a random nonce for each signature. The first signature has a low s, the
+# second has a high s (s > n/2). The tests read the s of each signature, so
+# the order is part of the fixture.
 #
 # For rsa (RSA PKCS#1 v1.5 with SHA-256), the commit carries one signature.
 # The signature is deterministic, so `openssl` signs each payload again with
@@ -51,6 +51,12 @@ case "${1:-}" in
             -pkeyopt ec_param_enc:named_curve)
         param=FFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
         ;;
+    p384)
+        kind=ecdsa
+        genkey=(genpkey -algorithm EC -pkeyopt ec_paramgen_curve:secp384r1
+            -pkeyopt ec_param_enc:named_curve)
+        param=FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFC7634D81F4372DDF581A0DB248B0A77AECEC196ACCC52973
+        ;;
     rsa)
         kind=rsa
         bits=2048
@@ -58,7 +64,7 @@ case "${1:-}" in
         param=$((bits / 8))
         ;;
     *)
-        echo "usage: $0 <key type>, where the key type is p256 or rsa" >&2
+        echo "usage: $0 <key type>, where the key type is p256, p384, or rsa" >&2
         exit 2
         ;;
 esac

@@ -125,7 +125,11 @@ impl ServerSigner {
     /// - [`Error::Signature`] if the verifier does not accept the DER public
     ///   key of `signer`. The message is
     ///   `spki public key: expected SubjectPublicKeyInfo DER`.
-    #[cfg(any(feature = "sign-spki-p256", feature = "sign-spki-rsa"))]
+    #[cfg(any(
+        feature = "sign-spki-p256",
+        feature = "sign-spki-p384",
+        feature = "sign-spki-rsa"
+    ))]
     pub fn spki(signer: crate::spki::SpkiSigner) -> Result<ServerSigner> {
         let verifier =
             crate::spki::SpkiVerifier::new([signer.public_key_der()], Vec::<Vec<u8>>::new())?;
@@ -234,13 +238,21 @@ impl ServerSigner {
 ///
 /// The signer copies the data of each call and gives the copy to the pool.
 /// The data is a commit object or a summary, whose size the format caps.
-#[cfg(any(feature = "sign-spki-p256", feature = "sign-spki-rsa"))]
+#[cfg(any(
+    feature = "sign-spki-p256",
+    feature = "sign-spki-p384",
+    feature = "sign-spki-rsa"
+))]
 struct Unblocked {
     /// The signer that does the work.
     inner: Arc<crate::spki::SpkiSigner>,
 }
 
-#[cfg(any(feature = "sign-spki-p256", feature = "sign-spki-rsa"))]
+#[cfg(any(
+    feature = "sign-spki-p256",
+    feature = "sign-spki-p384",
+    feature = "sign-spki-rsa"
+))]
 impl Signer for Unblocked {
     fn name(&self) -> &str {
         self.inner.name()

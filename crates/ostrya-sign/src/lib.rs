@@ -21,15 +21,17 @@
 //! - `smol` (default): with `sign-gpg`, `GpgSigner` runs `gpg` on `smol`.
 //! - `tokio`: with `sign-gpg`, `GpgSigner` runs `gpg` on `tokio`.
 //! - `sign-spki`: the spki engine with each of its key types. It turns on
-//!   `sign-spki-p256` and `sign-spki-rsa`.
+//!   `sign-spki-p256`, `sign-spki-p384`, and `sign-spki-rsa`.
 //! - `sign-spki-p256`: the spki engine with the ECDSA P-256 key type. The
 //!   engine is `SpkiSigner` and `SpkiVerifier`, `spki_public_keys`, which
 //!   reads the keys of a public key file, `spki_secret_keys`, which reads the
 //!   signers of a PEM secret key file, and `spki_secret_key_lines`, which
 //!   reads the signers of a file of base64 key lines.
+//! - `sign-spki-p384`: the spki engine with the ECDSA P-384 key type, ECDSA
+//!   signatures with SHA-256. The engine has the items of `sign-spki-p256`.
 //! - `sign-spki-rsa`: the spki engine with the RSA key type, PKCS#1 v1.5
 //!   signatures with SHA-256. The engine has the items of `sign-spki-p256`.
-//!   A build with one of the two key features refuses a key of the other
+//!   A build without one of the three key features refuses a key of that
 //!   type, with a message that names its feature.
 //! - `sign-gpg`: `GpgSigner`, which signs with the `gpg` command.
 //!
@@ -60,12 +62,24 @@ mod error;
 mod gpg;
 mod keys;
 mod metadata;
-#[cfg(any(feature = "sign-spki-p256", feature = "sign-spki-rsa"))]
+#[cfg(any(
+    feature = "sign-spki-p256",
+    feature = "sign-spki-p384",
+    feature = "sign-spki-rsa"
+))]
 mod pem;
-#[cfg(any(feature = "sign-spki-p256", feature = "sign-spki-rsa"))]
+#[cfg(any(
+    feature = "sign-spki-p256",
+    feature = "sign-spki-p384",
+    feature = "sign-spki-rsa"
+))]
 mod spki;
 
-#[cfg(any(feature = "sign-spki-p256", feature = "sign-spki-rsa"))]
+#[cfg(any(
+    feature = "sign-spki-p256",
+    feature = "sign-spki-p384",
+    feature = "sign-spki-rsa"
+))]
 pub use self::spki::{
     SpkiSigner, SpkiVerifier, spki_public_keys, spki_secret_key_lines, spki_secret_keys,
 };
@@ -93,9 +107,17 @@ const _: fn() = || {
     assert_send_sync::<SignatureInfo>();
     assert_send_sync::<SignKeys>();
     assert_send_sync::<Error>();
-    #[cfg(any(feature = "sign-spki-p256", feature = "sign-spki-rsa"))]
+    #[cfg(any(
+        feature = "sign-spki-p256",
+        feature = "sign-spki-p384",
+        feature = "sign-spki-rsa"
+    ))]
     assert_send_sync::<SpkiSigner>();
-    #[cfg(any(feature = "sign-spki-p256", feature = "sign-spki-rsa"))]
+    #[cfg(any(
+        feature = "sign-spki-p256",
+        feature = "sign-spki-p384",
+        feature = "sign-spki-rsa"
+    ))]
     assert_send_sync::<SpkiVerifier>();
     #[cfg(feature = "sign-gpg")]
     assert_send_sync::<GpgSigner>();

@@ -211,8 +211,8 @@ and the tests that read them do not need the `ostree` tool.
 - `tls/` -- the TLS certificates and keys of the HTTPS tests.
   `tls/generate.sh` writes them, separately from `generate.sh`. Run it only
   to replace the certificates. Their validity is 100 years.
-- `spki/<type>/` -- the spki signature fixtures of one key type, now `p256`
-  and `rsa`. `spki/generate.sh` writes them, separately from `generate.sh`.
+- `spki/<type>/` -- the spki signature fixtures of one key type, now `p256`,
+  `p384`, and `rsa`. `spki/generate.sh` writes them, separately from `generate.sh`.
   `spki/.gitattributes` marks the repository objects, the deltas, the delta
   indexes, and the two `summary` files as binary.
 - `spki/keys/` -- the key files of the tests of the spki engine.
@@ -252,15 +252,15 @@ Each `spki/<type>/` directory holds one key type. It holds these files:
 - `repo/` -- a copy of `generated/archive/repo`, to which the tool added
   these items:
   - the `.commitmeta` of the commit, with two spki signatures for `p256`
-    and one for `rsa`;
+    and `p384`, and one for `rsa`;
   - a signed static delta from scratch to the commit, in the layout of a
     superblock and one part;
   - the delta index in `delta-indexes/`;
   - the `summary` and its signature, `summary.sig`;
   - the key `indexed-deltas=true` in `config`.
 - `MANIFEST` -- the key type, the `ostree` and `openssl` versions, the
-  commit, the delta, and the class of each signature. For `p256`, the class
-  is the s class (`low` or `high`). For `rsa`, the class is the length of the
+  commit, the delta, and the class of each signature. For `p256` and
+  `p384`, the class is the s class (`low` or `high`). For `rsa`, the class is the length of the
   signature in bytes, `256`, and `modulus_bits` gives the size of the key,
   2048 bits.
 
@@ -276,12 +276,13 @@ type. The script deletes and writes `spki/<type>/` alone:
 
 ```sh
 tests/fixtures/spki/generate.sh p256
+OPENSSL=/path/to/openssl tests/fixtures/spki/generate.sh p384
 OPENSSL=/path/to/openssl tests/fixtures/spki/generate.sh rsa
 ```
 
 The `OPENSSL` variable names the `openssl` command. The default is the
-`openssl` command on `PATH`. Run `rsa` with OpenSSL 3.6.4, the library that
-the tool on the NixOS development host links.
+`openssl` command on `PATH`. Run `p384` and `rsa` with OpenSSL 3.6.4, the
+library that the tool on the NixOS development host links.
 
 The script needs an `ostree` build that shows `openssl` and `sign-spki` in
 `ostree --version`. The build on the NixOS development host has both. If one
@@ -312,11 +313,19 @@ Before you run the tool on `spki/<type>/repo` in a checkout, create them.
 ECDSA gives a signature with a low s or with a high s, where a high s is
 greater than n/2 and n is the order of the curve. The first commit signature
 has a low s, and the second has a high s. The script signs again until it
-gets this order, and it stops after 64 tries. The test
-`p256_tool_commit_verifies_low_and_high_s` asserts the s class of each
+gets this order, and it stops after 64 tries. The tests
+`p256_tool_commit_verifies_low_and_high_s` and
+`p384_tool_commit_verifies_low_and_high_s` assert the s class of each
 signature and that each signature verifies. Thus the test shows that the
 port accepts a high s that the tool writes. The s class of the delta and
 summary signatures is random. `MANIFEST` records it.
+
+The `p384` fixture also shows the digest. The tool signs the SHA-256 of the
+data with a P-384 key, and the port verifies a P-384 signature over the
+SHA-256 of the data. A round trip of the port alone does not find a wrong
+digest. The key of the `p384` fixture is not the P-384 key of the unit
+tests. The `p384` tests use that key, the key of RFC 6979, appendix A.2.6,
+as a key that signed no fixture.
 
 RSA has no s class. The `rsa` case of the script sets `kind=rsa`. The
 script signs the commit one time, and the class of each signature is its
@@ -327,18 +336,22 @@ A later ECDSA curve adds these items:
 - a case in the script, with `kind=ecdsa`, its `genpkey` options, and its
   group order in `param`;
 - a `spki/<type>/` directory;
-- a test module under a `cfg` of its key feature, and the key feature in
-  the `any()` list of the `cfg` of the test file;
+- a test module under a `cfg` of its key feature, with n/2 of the curve for
+  the s class, and the key feature in the `any()` list of the `cfg` of the
+  test file and of `has_high_s`;
 - a bullet in the fixture layout.
 
 The tests are in `crates/ostrya/tests/sign_spki_fixtures.rs`. The `cfg` of
 the file is an `any()` list of the key features. The tests of each key type
-are in one module, `p256` or `rsa`, under the `cfg` of its key feature. The
+are in one module, `p256`, `p384`, or `rsa`, under the `cfg` of its key
+feature. The
 items that the modules share are at the top level of the file. Run the tests
 of each key type with its key feature:
 
 ```sh
 cargo test -p ostrya --no-default-features --features smol,sign-spki-p256 \
+    --test sign_spki_fixtures
+cargo test -p ostrya --no-default-features --features smol,sign-spki-p384 \
     --test sign_spki_fixtures
 cargo test -p ostrya --no-default-features --features smol,sign-spki-rsa \
     --test sign_spki_fixtures

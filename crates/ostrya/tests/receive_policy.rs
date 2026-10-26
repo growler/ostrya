@@ -690,12 +690,20 @@ fn a_trust_group_key_no_axis_reads_is_refused() {
     }
     // This case puts an spki key under an axis that selects ed25519 alone.
     let err = refusal(&format!("{}verification-spki-key=AAAA\n", trust_t()));
-    #[cfg(any(feature = "sign-spki-p256", feature = "sign-spki-rsa"))]
+    #[cfg(any(
+        feature = "sign-spki-p256",
+        feature = "sign-spki-p384",
+        feature = "sign-spki-rsa"
+    ))]
     assert!(
         matches!(&err, Error::InvalidFormat(m) if m.contains("no check reads it")),
         "{err}"
     );
-    #[cfg(not(any(feature = "sign-spki-p256", feature = "sign-spki-rsa")))]
+    #[cfg(not(any(
+        feature = "sign-spki-p256",
+        feature = "sign-spki-p384",
+        feature = "sign-spki-rsa"
+    )))]
     assert!(matches!(err, Error::Unsupported(_)), "{err}");
 }
 
@@ -899,7 +907,11 @@ fn a_trust_group_gpg_axis_needs_a_certificate() {
 }
 
 /// The spki engine of a trust group needs the spki engine of the build.
-#[cfg(not(any(feature = "sign-spki-p256", feature = "sign-spki-rsa")))]
+#[cfg(not(any(
+    feature = "sign-spki-p256",
+    feature = "sign-spki-p384",
+    feature = "sign-spki-rsa"
+)))]
 #[test]
 fn a_trust_group_spki_axis_needs_the_engine() {
     let err = refusal("[ex-ostrya trust \"t\"]\nsign-verify=spki\nverification-spki-key=AAAA\n");
@@ -966,7 +978,11 @@ fn a_key_group_file_holds_one_key() {
 }
 
 /// An spki key group needs the spki engine.
-#[cfg(not(any(feature = "sign-spki-p256", feature = "sign-spki-rsa")))]
+#[cfg(not(any(
+    feature = "sign-spki-p256",
+    feature = "sign-spki-p384",
+    feature = "sign-spki-rsa"
+)))]
 #[test]
 fn an_spki_key_group_needs_the_engine() {
     let err = refusal("[ex-ostrya key \"k\"]\ntype=spki\nsecret-key-file=/nonexistent/ostrya/k\n");

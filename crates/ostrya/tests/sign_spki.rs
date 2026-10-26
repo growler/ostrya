@@ -203,14 +203,14 @@ fn sec1_without_parameters() -> Vec<u8> {
 }
 
 /// Returns the SEC1 DER of the embedded key with a `parameters` field that
-/// names secp384r1.
+/// names secp521r1.
 ///
 /// The function replaces the `[0]` element of [`SECRET_SEC1_B64`] and sets the
 /// outer length again.
 fn sec1_of_another_curve() -> Vec<u8> {
     let mut der = base64::decode(SECRET_SEC1_B64).unwrap();
     assert_eq!(der[39..51], from_hex("A00A06082A8648CE3D030107"));
-    der.splice(39..51, from_hex("A00706052B81040022"));
+    der.splice(39..51, from_hex("A00706052B81040023"));
     der[1] = 0x74;
     der
 }
@@ -266,10 +266,10 @@ fn spki_secret_key_refused_forms() {
         secret_refusal(&base64::encode(&sec1_without_parameters())),
         "spki secret key: the SEC1 key does not name its curve"
     );
-    // A SEC1 key whose `parameters` field names secp384r1.
+    // A SEC1 key whose `parameters` field names secp521r1.
     assert_eq!(
         secret_refusal(&base64::encode(&sec1_of_another_curve())),
-        "spki secret key: the SEC1 key names a curve other than P-256"
+        "spki secret key: the curve P-521 is not supported"
     );
     // The base64 of the full PEM text.
     let pem = wrap_pem("PRIVATE KEY", SECRET_PKCS8_B64);
@@ -737,6 +737,59 @@ fn spki_revoked_rsa_key_refuses_the_store_in_a_build_without_rsa() {
         format!(
             "the key file '{}', line 1: this build has no code for the key type RSA; build \
              with the sign-spki-rsa feature",
+            dir.join("revoked.spki").display()
+        )
+    );
+}
+
+/// The P-384 key of RFC 6979, appendix A.2.6, in a PEM `PUBLIC KEY` block.
+#[cfg(not(feature = "sign-spki-p384"))]
+const P384_PUBLIC_PEM: &str = "-----BEGIN PUBLIC KEY-----\n\
+MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAE7DpOQVtOGaRWhhgCn0J/pdqai8SukuAu\n\
+BqrlKGswDGTe+PDqkFWGYGSiVFFUgLwTgBXZty19VyROqO+awMYhiWcIpZNn+d+5\n\
+9UyoSz8cnbEoiyMcOuDU/nNE/SUzJkcg\n\
+-----END PUBLIC KEY-----\n";
+
+/// A build without the P-384 key type refuses a P-384 public key and a P-384
+/// secret key, with a message that names the feature of the curve.
+#[cfg(not(feature = "sign-spki-p384"))]
+#[test]
+fn spki_p384_key_names_the_feature_in_a_build_without_p384() {
+    let reason =
+        "this build has no code for the curve P-384; build with the sign-spki-p384 feature";
+    match SpkiVerifier::from_pem(P384_PUBLIC_PEM) {
+        Err(ostrya::sign::Error::Signature(m)) => {
+            assert_eq!(m, format!("the spki public key text, line 1: {reason}"))
+        }
+        Err(other) => panic!("not a signature error: {other}"),
+        Ok(_) => panic!("the P-384 public key has to be refused"),
+    }
+    // The secret key, base64 of the PKCS#8 DER.
+    let secret = concat!(
+        "MIG2AgEAMBAGByqGSM49AgEGBSuBBAAiBIGeMIGbAgEBBDBrnT2tLhuMHAWxmHW2ZZ9N4jw7Znvy",
+        "l7qapHdAeHE32JbVck5McKgl+HLJ6mDS7fWhZANiAATsOk5BW04ZpFaGGAKfQn+l2pqLxK6S4C4G",
+        "quUoazAMZN748OqQVYZgZKJUUVSAvBOAFdm3LX1XJE6o75rAxiGJZwilk2f537n1TKhLPxydsSiL",
+        "Ixw64NT+c0T9JTMmRyA=",
+    );
+    assert_eq!(secret_refusal(secret), format!("spki secret key: {reason}"));
+}
+
+/// In a build without the P-384 key type, a P-384 key in `revoked.spki`
+/// refuses the key store, so a revocation that the build cannot read fails
+/// closed.
+#[cfg(not(feature = "sign-spki-p384"))]
+#[test]
+fn spki_revoked_p384_key_refuses_the_store_in_a_build_without_p384() {
+    let tmp = TmpDir::new("spki-revoked-p384");
+    let dir = tmp.path().join("store");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("trusted.spki"), PUBLIC_PEM).unwrap();
+    std::fs::write(dir.join("revoked.spki"), P384_PUBLIC_PEM).unwrap();
+    assert_eq!(
+        store_refusal(&dir),
+        format!(
+            "the key file '{}', line 1: this build has no code for the curve P-384; build \
+             with the sign-spki-p384 feature",
             dir.join("revoked.spki").display()
         )
     );

@@ -426,7 +426,11 @@ impl FromSystemKeys for Ed25519Verifier {
     }
 }
 
-#[cfg(any(feature = "sign-spki-p256", feature = "sign-spki-rsa"))]
+#[cfg(any(
+    feature = "sign-spki-p256",
+    feature = "sign-spki-p384",
+    feature = "sign-spki-rsa"
+))]
 impl FromSystemKeys for crate::spki::SpkiVerifier {
     /// Creates an spki verifier from the system key store.
     ///
@@ -501,7 +505,11 @@ impl FromSystemKeys for crate::spki::SpkiVerifier {
 /// [`Error::Io`]: crate::Error::Io
 /// [`Error::Unsupported`]: crate::Error::Unsupported
 pub fn load_sign_keys_from(roots: &[&Path], sign_type: &str) -> crate::Result<SignKeys> {
-    #[cfg(not(any(feature = "sign-spki-p256", feature = "sign-spki-rsa")))]
+    #[cfg(not(any(
+        feature = "sign-spki-p256",
+        feature = "sign-spki-p384",
+        feature = "sign-spki-rsa"
+    )))]
     if sign_type == "spki" {
         return Err(crate::Error::Unsupported(
             "the spki key store needs the feature 'sign-spki'".into(),
@@ -556,12 +564,20 @@ fn read_store_file(path: &Path, sign_type: &str, out: &mut Vec<Vec<u8>>) -> crat
     let Some(bytes) = read_key_path(path, &subject, MAX_KEY_FILE)? else {
         return Ok(());
     };
-    #[cfg(any(feature = "sign-spki-p256", feature = "sign-spki-rsa"))]
+    #[cfg(any(
+        feature = "sign-spki-p256",
+        feature = "sign-spki-p384",
+        feature = "sign-spki-rsa"
+    ))]
     if sign_type == "spki" {
         out.extend(crate::spki::spki_public_keys(&bytes, &subject)?);
         return Ok(());
     }
-    #[cfg(not(any(feature = "sign-spki-p256", feature = "sign-spki-rsa")))]
+    #[cfg(not(any(
+        feature = "sign-spki-p256",
+        feature = "sign-spki-p384",
+        feature = "sign-spki-rsa"
+    )))]
     let _ = sign_type;
     for line in key_text(bytes, &subject)?.lines() {
         let line = line.trim();

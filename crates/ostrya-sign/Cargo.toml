@@ -17,9 +17,10 @@ tokio = ["ostrya-rt?/tokio"]
 # One feature for each key type of the spki engine. The code that each key
 # type shares compiles when one of them is on.
 sign-spki-p256 = ["dep:p256", "dep:der", "dep:spki", "dep:pkcs8", "dep:pem-rfc7468"]
+sign-spki-p384 = ["dep:p384", "dep:der", "dep:spki", "dep:pkcs8", "dep:pem-rfc7468"]
 sign-spki-rsa = ["dep:rsa", "dep:der", "dep:spki", "dep:pkcs8", "dep:pem-rfc7468"]
 # The spki engine with each of its key types.
-sign-spki = ["sign-spki-p256", "sign-spki-rsa"]
+sign-spki = ["sign-spki-p256", "sign-spki-p384", "sign-spki-rsa"]
 sign-gpg = ["dep:ostrya-rt"]
 
 # docs.rs adds these two features to the default set, so the pages show the
@@ -43,6 +44,11 @@ ed25519-dalek = { version = "2", default-features = false, features = [
     "zeroize",
 ] }
 p256 = { version = "0.13.2", default-features = false, features = [
+    "ecdsa",
+    "pkcs8",
+    "std",
+], optional = true }
+p384 = { version = "0.13.1", default-features = false, features = [
     "ecdsa",
     "pkcs8",
     "std",

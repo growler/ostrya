@@ -132,7 +132,7 @@ Without this option, the files go to \fB\%deltas/\fR of the repository. The comm
 \fB\-\-sign\fR \fISIGN\fR
 Sign the generated delta with this key.
 .IP
-The option can occur more than once. The key is a \%base64 secret key for \%ed25519 and spki, and a \%KEY\-ID for gpg, as for \fB\%ostrya sign\fR\&. An spki secret key is a \%PKCS#8 DER, a \%SEC1 DER that names the \%P\-256 curve, or a \%PKCS#1 DER of an RSA key, and its \%base64 can hold line breaks.
+The option can occur more than once. The key is a \%base64 secret key for \%ed25519 and spki, and a \%KEY\-ID for gpg, as for \fB\%ostrya sign\fR\&. An spki secret key is a \%PKCS#8 DER, a \%SEC1 DER that names the \%P\-256 or the \%P\-384 curve, or a \%PKCS#1 DER of an RSA key, and its \%base64 can hold line breaks.
 .TP
 \fB\-s\fR, \fB\-\-sign\-type\fR \fISIGN_TYPE\fR
 The signature engine for \%\-\-sign and \%\-\-keys\-file. Default: \%ed25519. Possible values: \%ed25519, spki, gpg.
@@ -140,7 +140,7 @@ The signature engine for \%\-\-sign and \%\-\-keys\-file. Default: \%ed25519. Po
 \fB\-\-keys\-file\fR \fIKEYS_FILE\fR
 Read signing keys from a file.
 .IP
-For \%ed25519, the file has \%base64 secret keys, one per line, as for \fB\%ostrya sign\fR\&. For spki, each line is the \%base64 of one secret key: a \%PKCS#8 DER, a \%SEC1 DER that names the \%P\-256 curve, or a \%PKCS#1 DER of an RSA key. A line ends at LF or CRLF, and the last line can have no line end. The command refuses an empty spki file, an empty line, and a line with white space. Each key adds one signature. The option can occur more than once, and the command reads every file. The gpg engine refuses this option.
+For \%ed25519, the file has \%base64 secret keys, one per line, as for \fB\%ostrya sign\fR\&. For spki, each line is the \%base64 of one secret key: a \%PKCS#8 DER, a \%SEC1 DER that names the \%P\-256 or the \%P\-384 curve, or a \%PKCS#1 DER of an RSA key. A line ends at LF or CRLF, and the last line can have no line end. The command refuses an empty spki file, an empty line, and a line with white space. Each key adds one signature. The option can occur more than once, and the command reads every file. The gpg engine refuses this option.
 .TP
 \fB\-\-gpg\-homedir\fR \fIGPG_HOMEDIR\fR
 The GnuPG home directory where gpg resolves signing keys.

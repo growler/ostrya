@@ -401,7 +401,11 @@ fn engines(
 /// `sign-verify=ed25519;dummy`.
 pub(crate) const ALL_ENGINES: &[&str] = &[
     "ed25519",
-    #[cfg(any(feature = "sign-spki-p256", feature = "sign-spki-rsa"))]
+    #[cfg(any(
+        feature = "sign-spki-p256",
+        feature = "sign-spki-p384",
+        feature = "sign-spki-rsa"
+    ))]
     "spki",
 ];
 
@@ -836,7 +840,11 @@ async fn gpg_verifier(_repo: &Repo, source: &KeySource<'_>) -> Result<Arc<dyn Ve
 /// source.
 enum Engine {
     Ed25519,
-    #[cfg(any(feature = "sign-spki-p256", feature = "sign-spki-rsa"))]
+    #[cfg(any(
+        feature = "sign-spki-p256",
+        feature = "sign-spki-p384",
+        feature = "sign-spki-rsa"
+    ))]
     Spki,
 }
 
@@ -851,7 +859,11 @@ enum Engine {
 async fn sign_verifier(engine: &str, source: &KeySource<'_>) -> Result<Option<Arc<dyn Verifier>>> {
     let kind = match engine {
         "ed25519" => Engine::Ed25519,
-        #[cfg(any(feature = "sign-spki-p256", feature = "sign-spki-rsa"))]
+        #[cfg(any(
+            feature = "sign-spki-p256",
+            feature = "sign-spki-p384",
+            feature = "sign-spki-rsa"
+        ))]
         "spki" => Engine::Spki,
         _ => {
             return Err(Error::Unsupported(format!(
@@ -881,7 +893,11 @@ fn build_verifier(kind: Engine, keys: SignKeys) -> Result<Option<Arc<dyn Verifie
             let verifier = Ed25519Verifier::from_sign_keys(keys)?;
             (!verifier.is_empty()).then(|| Arc::new(verifier) as Arc<dyn Verifier>)
         }
-        #[cfg(any(feature = "sign-spki-p256", feature = "sign-spki-rsa"))]
+        #[cfg(any(
+            feature = "sign-spki-p256",
+            feature = "sign-spki-p384",
+            feature = "sign-spki-rsa"
+        ))]
         Engine::Spki => {
             let verifier = crate::spki::SpkiVerifier::from_sign_keys(keys)?;
             (!verifier.is_empty()).then(|| Arc::new(verifier) as Arc<dyn Verifier>)
@@ -1011,7 +1027,11 @@ fn read_verification_file(engine: &str, path: &str) -> Result<Vec<Vec<u8>>> {
     )
     .map_err(|e| Error::Signature(format!("{subject} cannot be read: {e}")))?;
     let bytes = read_key_source(std::fs::File::from(fd), &subject, MAX_KEY_FILE)?;
-    #[cfg(any(feature = "sign-spki-p256", feature = "sign-spki-rsa"))]
+    #[cfg(any(
+        feature = "sign-spki-p256",
+        feature = "sign-spki-p384",
+        feature = "sign-spki-rsa"
+    ))]
     if engine == "spki" {
         return Ok(crate::spki::spki_public_keys(&bytes, &subject)?);
     }

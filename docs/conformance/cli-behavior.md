@@ -5232,8 +5232,8 @@ P-256 keys:
   refused with no `=` and with one `=`. The tool signs with three or four `=`
   at the end, and with a last character whose unused low bits are not zero.
 - These secret keys refuse the run at exit 1: a SEC1 key with no
-  `parameters` field, a SEC1 key whose `parameters` field names secp384r1,
-  the base64 of a raw 32-byte scalar, and the base64 of the full PEM text.
+  `parameters` field, a SEC1 key with its public point whose `parameters`
+  field names secp384r1, the base64 of a raw 32-byte scalar, and the base64 of the full PEM text.
   `sign` and `commit` report `error: Not able to sign the cobject: openssl:
   Failed to initialize spki key`, and `commit` moves no ref. `static-delta
   generate` writes its statistics lines, then reports `error: openssl: Failed
@@ -5338,6 +5338,54 @@ signs the commit of a new `archive` repository with `sign -s spki
   parameters field also verifies at exit 0. A SubjectPublicKeyInfo with no
   parameters field and the key of another 2048-bit key does not verify the
   signature, and the verify exits 1.
+
+`cli-surface.md`, "P2", `sign`, records the port side.
+
+#### spki P-384 keys
+
+The `ostree` 2026.1 build with OpenSSL on the NixOS development host signs
+and verifies with P-384 keys of the spki engine. Observed on 2026-10-26, with
+OpenSSL 3.6.4. `openssl genpkey -algorithm EC -pkeyopt
+ec_paramgen_curve:secp384r1 -pkeyopt ec_param_enc:named_curve` makes the
+keys. Each probe signs the commit of a new `archive` repository, and a key of
+another P-384 key verifies no signature of a probe, at exit 1:
+
+- `sign -s spki COMMIT KEY`, where `KEY` is the base64 of a SEC1
+  `ECPrivateKey` DER with the curve in its `parameters` field, signs at exit
+  0. `sign --verify -s spki --keys-file=<path>` with the PEM `PUBLIC KEY`
+  file of the key verifies the signature at exit 0.
+- `static-delta generate --empty --to=COMMIT --sign-type=spki
+  --keys-file=<path>`, where the file holds one line of the base64 of a
+  PKCS#8 DER, or one line of the base64 of a SEC1 DER, signs at exit 0.
+  `static-delta verify --sign-type=spki --keys-file=<path>` with the PEM
+  `PUBLIC KEY` file of the key prints `Verification OK`.
+- A PEM `PUBLIC KEY` file whose SubjectPublicKeyInfo holds the compressed
+  point of the key, from `openssl pkey -pubout -ec_conv_form compressed`,
+  verifies a signature of the key at exit 0.
+- The digest is SHA-256. `openssl dgst -sha256 -verify` verifies the
+  signature of the commit over the bytes of the commit object, and the
+  signature of the delta over the signed superblock payload. `openssl dgst
+  -sha384 -verify` reports `Verification failure` at exit 1.
+- `sign -s spki COMMIT KEY`, where `KEY` is the base64 of the SEC1 DER of a
+  P-256 key with secp521r1 in its `parameters` field, reports `error: Not
+  able to sign the cobject: openssl: Failed to initialize spki key` at exit
+  1.
+- A secret key whose `privateKey` is shorter than the field size signs, on
+  P-384 and on P-256. The probe key of P-384 holds the 32 low bytes of the
+  scalar of a P-384 key in 32 bytes, and the probe key of P-256 holds the 24
+  low bytes of the scalar of a P-256 key in 24 bytes. Each probe key has the
+  curve in its `parameters` field and no `publicKey` field. A control key
+  holds the same value with zero bytes on the left, in 48 and in 32 bytes.
+  For each key, these runs sign at exit 0: `sign -s spki COMMIT KEY` with the
+  base64 of the SEC1 DER and of the PKCS#8 DER, `sign -s spki
+  --keys-file=<path>` with a PEM `PRIVATE KEY` file, and `static-delta
+  generate --empty --to=COMMIT --sign-type=spki --keys-file=<path>` with one
+  line of the base64 of the SEC1 DER or of the PKCS#8 DER. The PEM `PUBLIC
+  KEY` file of the control key from `openssl pkey -pubout` verifies each
+  signature at exit 0, and the key of another key verifies none at exit 1.
+  So the tool reads a short scalar with zero bytes on the left. `openssl pkey
+  -inform DER -noout -text` prints the short key with the zero bytes on the
+  left.
 
 `cli-surface.md`, "P2", `sign`, records the port side.
 

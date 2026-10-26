@@ -4101,8 +4101,8 @@ fn spki_inline_key_forms() {
     const SECRET_SEC1_B64: &str = "MHcCAQEEINi+9PBLJ58xxEdEmGrDDSFHBr+t0GqQv95FbKD3q8yhoAoGCCqGSM49AwEHoUQDQgAE8X83xylD3ibci0xjFKMR4bwUtTU/YLloVEDxomUS2SHAfFnN3LHVVNYjok0Zm2RiiU7XpDnRAG1Ua8eR8SKbLQ==";
     // The same SEC1 key with no `parameters` field.
     const SECRET_SEC1_NO_CURVE_B64: &str = "MGsCAQEEINi+9PBLJ58xxEdEmGrDDSFHBr+t0GqQv95FbKD3q8yhoUQDQgAE8X83xylD3ibci0xjFKMR4bwUtTU/YLloVEDxomUS2SHAfFnN3LHVVNYjok0Zm2RiiU7XpDnRAG1Ua8eR8SKbLQ==";
-    // The same SEC1 key with a `parameters` field that names secp384r1.
-    const SECRET_SEC1_P384_B64: &str = "MHQCAQEEINi+9PBLJ58xxEdEmGrDDSFHBr+t0GqQv95FbKD3q8yhoAcGBSuBBAAioUQDQgAE8X83xylD3ibci0xjFKMR4bwUtTU/YLloVEDxomUS2SHAfFnN3LHVVNYjok0Zm2RiiU7XpDnRAG1Ua8eR8SKbLQ==";
+    // The same SEC1 key with a `parameters` field that names secp521r1.
+    const SECRET_SEC1_P521_B64: &str = "MHQCAQEEINi+9PBLJ58xxEdEmGrDDSFHBr+t0GqQv95FbKD3q8yhoAcGBSuBBAAjoUQDQgAE8X83xylD3ibci0xjFKMR4bwUtTU/YLloVEDxomUS2SHAfFnN3LHVVNYjok0Zm2RiiU7XpDnRAG1Ua8eR8SKbLQ==";
     // The raw 32-byte scalar of the same key.
     const SECRET_SCALAR_B64: &str = "2L708EsnnzHER0SYasMNIUcGv63QapC/3kVsoPerzKE=";
     const PUBLIC_SPKI_B64: &str = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE8X83xylD3ibci0xjFKMR4bwUtTU/YLloVEDxomUS2SHAfFnN3LHVVNYjok0Zm2RiiU7XpDnRAG1Ua8eR8SKbLQ==";
@@ -4136,14 +4136,13 @@ fn spki_inline_key_forms() {
     let expected =
         "error: signature: spki secret key: expected PKCS#8 DER, SEC1 DER, or PKCS#1 DER\n";
     let no_curve = "error: signature: spki secret key: the SEC1 key does not name its curve\n";
-    let other_curve =
-        "error: signature: spki secret key: the SEC1 key names a curve other than P-256\n";
+    let other_curve = "error: signature: spki secret key: the curve P-521 is not supported\n";
 
     // The refused secret keys write no signature.
     for (key, stderr) in [
         (SECRET_SCALAR_B64, expected),
         (SECRET_SEC1_NO_CURVE_B64, no_curve),
-        (SECRET_SEC1_P384_B64, other_curve),
+        (SECRET_SEC1_P521_B64, other_curve),
     ] {
         assert_refused(&run(&["sign", "-s", "spki", COMMIT, key]), stderr, key);
         assert!(!commitmeta.exists(), "{key}");
@@ -4844,6 +4843,180 @@ fn static_delta_generate_spki_keys_file_signs_with_an_rsa_key() {
         let _ = std::fs::remove_dir_all(repo.join("deltas"));
         let lines = base.join("lines");
         std::fs::write(&lines, format!("{}\n", base64_of(name))).unwrap();
+        let keys_file = format!("--keys-file={}", lines.display());
+        ostrya(
+            &[
+                "static-delta",
+                "--repo",
+                repo_s,
+                "generate",
+                "--empty",
+                "--to",
+                COMMIT,
+                "--sign-type=spki",
+                &keys_file,
+            ],
+            None,
+            &[],
+        )
+        .ok();
+        let verify = |keys_file: &str| {
+            ostrya(
+                &[
+                    "static-delta",
+                    "--repo",
+                    repo_s,
+                    "verify",
+                    "--sign-type=spki",
+                    keys_file,
+                    COMMIT,
+                ],
+                None,
+                &[],
+            )
+        };
+        verify(&public).ok();
+        assert_eq!(verify(&other).status.code(), Some(1), "{name}");
+    }
+}
+
+/// The P-384 key of RFC 6979, appendix A.2.6: the secret key as base64 of
+/// the PKCS#8 DER and of the SEC1 DER, and in a PEM `PRIVATE KEY` block, and
+/// the public key in PEM `PUBLIC KEY` blocks with an uncompressed and a
+/// compressed point.
+#[cfg(feature = "spki")]
+mod p384_key {
+    pub const SECRET_PKCS8_B64: &str = "MIG2AgEAMBAGByqGSM49AgEGBSuBBAAiBIGeMIGbAgEBBDBrnT2tLhuMHAWxmHW2ZZ9N4jw7Znvyl7qapHdAeHE32JbVck5McKgl+HLJ6mDS7fWhZANiAATsOk5BW04ZpFaGGAKfQn+l2pqLxK6S4C4GquUoazAMZN748OqQVYZgZKJUUVSAvBOAFdm3LX1XJE6o75rAxiGJZwilk2f537n1TKhLPxydsSiLIxw64NT+c0T9JTMmRyA=";
+    pub const SECRET_SEC1_B64: &str = "MIGkAgEBBDBrnT2tLhuMHAWxmHW2ZZ9N4jw7Znvyl7qapHdAeHE32JbVck5McKgl+HLJ6mDS7fWgBwYFK4EEACKhZANiAATsOk5BW04ZpFaGGAKfQn+l2pqLxK6S4C4GquUoazAMZN748OqQVYZgZKJUUVSAvBOAFdm3LX1XJE6o75rAxiGJZwilk2f537n1TKhLPxydsSiLIxw64NT+c0T9JTMmRyA=";
+    pub const SECRET_PEM: &str = "-----BEGIN PRIVATE KEY-----
+MIG2AgEAMBAGByqGSM49AgEGBSuBBAAiBIGeMIGbAgEBBDBrnT2tLhuMHAWxmHW2
+ZZ9N4jw7Znvyl7qapHdAeHE32JbVck5McKgl+HLJ6mDS7fWhZANiAATsOk5BW04Z
+pFaGGAKfQn+l2pqLxK6S4C4GquUoazAMZN748OqQVYZgZKJUUVSAvBOAFdm3LX1X
+JE6o75rAxiGJZwilk2f537n1TKhLPxydsSiLIxw64NT+c0T9JTMmRyA=
+-----END PRIVATE KEY-----
+";
+    pub const PUBLIC_PEM: &str = "-----BEGIN PUBLIC KEY-----
+MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAE7DpOQVtOGaRWhhgCn0J/pdqai8SukuAu
+BqrlKGswDGTe+PDqkFWGYGSiVFFUgLwTgBXZty19VyROqO+awMYhiWcIpZNn+d+5
+9UyoSz8cnbEoiyMcOuDU/nNE/SUzJkcg
+-----END PUBLIC KEY-----
+";
+    pub const PUBLIC_COMPRESSED_PEM: &str = "-----BEGIN PUBLIC KEY-----
+MEYwEAYHKoZIzj0CAQYFK4EEACIDMgAC7DpOQVtOGaRWhhgCn0J/pdqai8SukuAu
+BqrlKGswDGTe+PDqkFWGYGSiVFFUgLwT
+-----END PUBLIC KEY-----
+";
+}
+
+/// `ostrya sign` signs with a P-384 key of the spki engine, from a PEM
+/// `PRIVATE KEY` file and from the inline base64 of a SEC1 DER. `sign
+/// --verify` verifies each signature with the PEM `PUBLIC KEY` file of the
+/// uncompressed point and of the compressed point, and refuses the commit at
+/// exit 1 with the file of another P-384 key.
+#[cfg(all(feature = "spki", unix))]
+#[test]
+fn spki_signs_and_verifies_with_a_p384_key() {
+    let tmp = TmpDir::new("sign-spki-p384");
+    let base = tmp.path();
+    let repo = commit_fixture(base);
+    let repo_arg = format!("--repo={}", repo.to_str().unwrap());
+    let secret = base.join("secret.pem");
+    std::fs::write(&secret, p384_key::SECRET_PEM).unwrap();
+    let public = base.join("public.pem");
+    std::fs::write(&public, p384_key::PUBLIC_PEM).unwrap();
+    let compressed = base.join("compressed.pem");
+    std::fs::write(&compressed, p384_key::PUBLIC_COMPRESSED_PEM).unwrap();
+    let other =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/spki/p384/public.pem");
+    let verify = |file: &Path| {
+        let keys_file = format!("--keys-file={}", file.display());
+        ostrya(
+            &[
+                "sign", &repo_arg, "--verify", "-s", "spki", &keys_file, COMMIT,
+            ],
+            None,
+            &[],
+        )
+    };
+    let keys_file = format!("--keys-file={}", secret.display());
+    ostrya(
+        &["sign", &repo_arg, "-s", "spki", &keys_file, COMMIT],
+        None,
+        &[],
+    )
+    .ok();
+    // The signatures are deterministic, so the inline SEC1 key of the same
+    // key gives the same signature again.
+    ostrya(
+        &[
+            "sign",
+            &repo_arg,
+            "-s",
+            "spki",
+            COMMIT,
+            p384_key::SECRET_SEC1_B64,
+        ],
+        None,
+        &[],
+    )
+    .ok();
+    for file in [&public, &compressed] {
+        assert_eq!(
+            verify(file).ok().stdout_trimmed(),
+            "signature 1: good\nsignature 2: good\nverification OK"
+        );
+    }
+    assert_eq!(verify(&other).status.code(), Some(1));
+    let stored = block_on(async {
+        Repo::open(&repo)
+            .await
+            .unwrap()
+            .read_commit_detached_metadata(&Checksum::from_hex(COMMIT).unwrap())
+            .await
+            .unwrap()
+    })
+    .expect("the commit has detached metadata");
+    let value = stored.dict_get("ostree.sign.spki").unwrap();
+    let array = value.as_variant().map_or(value, |(_, inner)| inner);
+    let blobs: Vec<&[u8]> = array
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|blob| blob.as_bytes().unwrap())
+        .collect();
+    assert_eq!(blobs.len(), 2);
+    assert_eq!(blobs[0][0], 0x30);
+    assert_eq!(blobs[0], blobs[1]);
+}
+
+/// `static-delta generate --keys-file` signs with a P-384 key of the spki
+/// engine, from a line of the base64 of a SEC1 DER and from a line of the
+/// base64 of a PKCS#8 DER. `static-delta verify --keys-file` verifies the
+/// superblock with the PEM `PUBLIC KEY` file, and refuses it at exit 1 with
+/// the file of another P-384 key.
+#[cfg(feature = "spki")]
+#[test]
+fn static_delta_generate_spki_keys_file_signs_with_a_p384_key() {
+    let tmp = TmpDir::new("delta-spki-p384");
+    let base = tmp.path();
+    let repo = commit_fixture(base);
+    let repo_s = repo.to_str().unwrap();
+    let public_file = base.join("public.pem");
+    std::fs::write(&public_file, p384_key::PUBLIC_PEM).unwrap();
+    let public = format!("--keys-file={}", public_file.display());
+    let other = format!(
+        "--keys-file={}",
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/spki/p384/public.pem")
+            .display()
+    );
+    for (name, line) in [
+        ("sec1", p384_key::SECRET_SEC1_B64),
+        ("pkcs8", p384_key::SECRET_PKCS8_B64),
+    ] {
+        let _ = std::fs::remove_dir_all(repo.join("deltas"));
+        let lines = base.join("lines");
+        std::fs::write(&lines, format!("{line}\n")).unwrap();
         let keys_file = format!("--keys-file={}", lines.display());
         ostrya(
             &[

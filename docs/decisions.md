@@ -17,7 +17,7 @@ that `std` links.
 These C libraries are excluded, with the Rust path that replaces each:
 
 - `openssl-sys` -- TLS through `rustls` with the `rustls-graviola` provider,
-  and ECDSA through `p256`.
+  and ECDSA through `p256` and `p384`.
 - `libgpg-error` and `gpgme` -- GPG signing through the system `gpg` binary,
   and GPG verification through the `pgp` crate.
 - `libcurl` and `libsoup` -- HTTP through `hyper`.
@@ -174,12 +174,22 @@ ostree-podman sends the namespaces of podman, which are not its own.
 
 ## The spki sign engine
 
-The spki engine is pure Rust. It has two key types: ECDSA on NIST P-256 with
-SHA-256 over `p256`, and RSA PKCS#1 v1.5 with SHA-256 over `rsa` 0.9.10. The
-engine signs ECDSA with RFC 6979 nonces, so one key and one data give the same
-signature bytes. The `ostree` command builds this engine only with OpenSSL,
+The spki engine is pure Rust. It has three key types: ECDSA on NIST P-256
+with SHA-256 over `p256`, ECDSA on NIST P-384 with SHA-256 over `p384`, and
+RSA PKCS#1 v1.5 with SHA-256 over `rsa` 0.9.10. The engine signs ECDSA with
+RFC 6979 nonces, so one key and one data give the same signature bytes. The `ostree` command builds this engine only with OpenSSL,
 and it signs ECDSA with a random nonce. The two forms verify the same way.
 RSASSA-PKCS1-v1_5 (RFC 8017) is deterministic on both sides.
+
+The `ostree` command signs ECDSA with SHA-256 on each curve, also on P-384.
+The default `Signer` and `Verifier` of `p384` hash the data with SHA-384, so
+the engine does not call them. It hashes the data with SHA-256 and calls
+`sign_prehash` and `verify_prehash`. `sign_prehash` makes the RFC 6979 nonce
+of a prehash with HMAC-SHA-384. So a P-384 signature of the port is the same
+bytes for one key and one data, and it differs from the RFC 6979 test vectors
+for P-384 with SHA-256, which use HMAC-SHA-256. The verify does not depend on
+the nonce. A round trip of the port alone does not find a wrong digest, so
+the P-384 fixtures that the `ostree` command signs are part of the tests.
 
 The RSA signer blinds each private-key operation with a random value from the
 operating system. The blinding does not change the signature. RUSTSEC-2023-0071
@@ -223,8 +233,8 @@ types share -- the PEM splitter, the OID dispatch, and the key file readers --
 compiles when one key feature is on. This code takes `der`, `spki`, `pkcs8`,
 and `pem-rfc7468` as direct dependencies, and not through the re-exports of
 `p256`, so a key type that does not use `p256` builds the engine with no
-`p256`. `sign-spki-rsa` gates the RSA key type, and a build with it alone has
-no `p256`. A build with no key feature has no ECDSA crate tree. The gates of the
+`p256`. `sign-spki-p384` gates the P-384 key type, and `sign-spki-rsa` gates
+the RSA key type. A build with one of the two alone has no `p256`. A build with no key feature has no ECDSA crate tree. The gates of the
 shared code take the form `any(feature = ...)` over the key features, so each
 key feature adds one item to each gate. `ostrya` and `ostrya-sign` allow the
 clippy lint `non_minimal_cfg`, which refuses a gate of this form with one
@@ -234,7 +244,7 @@ private cfg adds a build script to two crates.
 
 A build without a key type refuses a key of that type, with the
 `Error::Signature` message `this build has no code for <the key type RSA |
-the curve P-256>; build with the <feature> feature`. A signature of that type
+the curve P-256 | the curve P-384>; build with the <feature> feature`. A signature of that type
 is a blob that no trusted key verifies. A revoked key that the build cannot
 read refuses the key store, so the revocation fails closed.
 

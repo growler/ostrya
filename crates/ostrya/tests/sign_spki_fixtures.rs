@@ -1,7 +1,7 @@
 //! Integration tests that verify spki signatures that the `ostree` tool wrote.
 //!
 //! The fixtures are in `tests/fixtures/spki/<key type>/`, where the key type is
-//! `p256` or `rsa`. Each fixture holds a key pair and a copy of the `archive`
+//! `p256`, `p384`, or `rsa`. Each fixture holds a key pair and a copy of the `archive`
 //! fixture repository. The `ostree` tool signed the commit of the repository,
 //! and wrote a signed static delta and a signed summary. The script
 //! `tests/fixtures/spki/generate.sh` wrote the fixtures.
@@ -9,8 +9,9 @@
 //! The tests of each key type are in one module, under the `cfg` of its key
 //! feature:
 //!
-//! - `p256`: the tool signed the commit two times. The first signature has a
-//!   low s, and the second has a high s. The tests verify each signature.
+//! - `p256` and `p384`: the tool signed the commit two times. The first
+//!   signature has a low s, and the second has a high s. The tests verify
+//!   each signature.
 //! - `rsa`: the tool signed the commit one time. RSA PKCS#1 v1.5 is
 //!   deterministic. Thus the tests also sign the commit, the summary, and the
 //!   superblock with the port, and compare the bytes with the signatures of
@@ -20,7 +21,11 @@
 //! new key, so a run gives new bytes. The fixtures are committed, and the
 //! script runs only to replace them.
 
-#![cfg(any(feature = "sign-spki-p256", feature = "sign-spki-rsa"))]
+#![cfg(any(
+    feature = "sign-spki-p256",
+    feature = "sign-spki-p384",
+    feature = "sign-spki-rsa"
+))]
 
 mod common;
 
@@ -97,6 +102,46 @@ fn spki_blobs(dict: &Value) -> Vec<Vec<u8>> {
         .collect()
 }
 
+/// Returns `true` if the s of the DER ECDSA-Sig-Value `der` is greater than
+/// `half_order`, the order n of the curve divided by 2 and rounded down,
+/// big-endian.
+///
+/// The function reads one SEQUENCE with a short-form length, two INTEGERs
+/// with short-form lengths in it, and no byte after them. It removes one
+/// leading 0x00 from the value of s and reads the remaining bytes, at most the
+/// length of `half_order`, as an unsigned big-endian number. It accepts a
+/// negative INTEGER and an INTEGER that is not minimal. The strict DER parse
+/// is the verify of the port. The test that calls this function also verifies
+/// each blob with the port.
+#[cfg(any(feature = "sign-spki-p256", feature = "sign-spki-p384"))]
+fn has_high_s(der: &[u8], half_order: &[u8]) -> bool {
+    assert!(
+        der.first() == Some(&0x30)
+            && der.get(1).map(|&len| usize::from(len)) == Some(der.len() - 2),
+        "the signature is not one DER SEQUENCE"
+    );
+    let mut at = 2;
+    let mut integers = Vec::with_capacity(2);
+    for _ in 0..2 {
+        assert_eq!(der.get(at), Some(&0x02), "the signature holds no INTEGER");
+        let len = usize::from(*der.get(at + 1).expect("the INTEGER has no length"));
+        assert!(len < 0x80, "the INTEGER length is not short form");
+        let value = der
+            .get(at + 2..at + 2 + len)
+            .expect("the INTEGER goes past the SEQUENCE");
+        integers.push(value);
+        at += 2 + len;
+    }
+    assert_eq!(at, der.len(), "bytes follow the two INTEGERs");
+    let s = integers[1];
+    let s = s.strip_prefix(&[0]).unwrap_or(s);
+    let width = half_order.len();
+    assert!(s.len() <= width, "s is longer than {width} bytes");
+    let mut padded = vec![0u8; width];
+    padded[width - s.len()..].copy_from_slice(s);
+    padded.as_slice() > half_order
+}
+
 #[cfg(feature = "sign-spki-p256")]
 mod p256 {
     use super::*;
@@ -127,43 +172,6 @@ mod p256 {
         .unwrap()
     }
 
-    /// Returns `true` if the s of the DER ECDSA-Sig-Value `der` over P-256 is
-    /// greater than n/2.
-    ///
-    /// The function reads one SEQUENCE with a short-form length, two INTEGERs
-    /// with short-form lengths in it, and no byte after them. It removes one
-    /// leading 0x00 from the value of s and reads the remaining bytes, at most
-    /// 32, as an unsigned big-endian number. It accepts a negative INTEGER and
-    /// an INTEGER that is not minimal. The strict DER parse is the verify of
-    /// the port. The test that calls this function also verifies each blob
-    /// with the port.
-    fn has_high_s(der: &[u8]) -> bool {
-        assert!(
-            der.first() == Some(&0x30)
-                && der.get(1).map(|&len| usize::from(len)) == Some(der.len() - 2),
-            "the signature is not one DER SEQUENCE"
-        );
-        let mut at = 2;
-        let mut integers = Vec::with_capacity(2);
-        for _ in 0..2 {
-            assert_eq!(der.get(at), Some(&0x02), "the signature holds no INTEGER");
-            let len = usize::from(*der.get(at + 1).expect("the INTEGER has no length"));
-            assert!(len < 0x80, "the INTEGER length is not short form");
-            let value = der
-                .get(at + 2..at + 2 + len)
-                .expect("the INTEGER goes past the SEQUENCE");
-            integers.push(value);
-            at += 2 + len;
-        }
-        assert_eq!(at, der.len(), "bytes follow the two INTEGERs");
-        let s = integers[1];
-        let s = s.strip_prefix(&[0]).unwrap_or(s);
-        assert!(s.len() <= 32, "s is longer than 32 bytes");
-        let mut padded = [0u8; 32];
-        padded[32 - s.len()..].copy_from_slice(s);
-        padded > P256_HALF_ORDER
-    }
-
     #[test]
     fn p256_fixture_keys_are_one_pair() {
         assert_fixture_keys_are_one_pair(TYPE);
@@ -187,8 +195,16 @@ mod p256 {
                 .expect("the commit has detached metadata");
             let blobs = spki_blobs(&dict);
             assert_eq!(blobs.len(), 2, "{}", regenerate(TYPE));
-            assert!(!has_high_s(&blobs[0]), "{}", regenerate(TYPE));
-            assert!(has_high_s(&blobs[1]), "{}", regenerate(TYPE));
+            assert!(
+                !has_high_s(&blobs[0], &P256_HALF_ORDER),
+                "{}",
+                regenerate(TYPE)
+            );
+            assert!(
+                has_high_s(&blobs[1], &P256_HALF_ORDER),
+                "{}",
+                regenerate(TYPE)
+            );
 
             let outcome = repo
                 .verify_commit(&commit(), &[&fixture_verifier(TYPE)])
@@ -253,6 +269,152 @@ mod p256 {
                 .unwrap();
             assert!(outcome.valid);
             assert!(outcome.signatures.iter().all(|info| info.valid));
+
+            let outcome = repo
+                .verify_static_delta(&dir, &[&stranger_verifier()])
+                .await
+                .unwrap();
+            assert!(
+                !outcome.valid,
+                "a key that signed no fixture must not verify"
+            );
+            assert_eq!(outcome.signatures.len(), 1);
+            assert!(!outcome.signatures[0].valid);
+        });
+    }
+}
+
+#[cfg(feature = "sign-spki-p384")]
+mod p384 {
+    use super::*;
+    use ostrya::base64;
+
+    /// The key type of the fixture.
+    const TYPE: &str = "p384";
+
+    /// The order n of P-384 divided by 2 and rounded down, big-endian. A
+    /// signature with an s above this value has a high s.
+    const P384_HALF_ORDER: [u8; 48] = [
+        0x7f, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xe3, 0xb1, 0xa6, 0xc0, 0xfa, 0x1b,
+        0x96, 0xef, 0xac, 0x0d, 0x06, 0xd9, 0x24, 0x58, 0x53, 0xbd, 0x76, 0x76, 0x0c, 0xb5, 0x66,
+        0x62, 0x94, 0xb9,
+    ];
+
+    /// A P-384 public key (SubjectPublicKeyInfo DER) in base64 that signed no
+    /// fixture: the key of RFC 6979, appendix A.2.6.
+    const OTHER_SPKI_B64: &str = "MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAE7DpOQVtOGaRWhhgCn0J/pdqai8SukuAu\
+    BqrlKGswDGTe+PDqkFWGYGSiVFFUgLwTgBXZty19VyROqO+awMYhiWcIpZNn+d+59UyoSz8cnbEoiyMcOuDU/nNE/SUzJkcg";
+
+    /// Returns a verifier that trusts a key that signed no fixture.
+    fn stranger_verifier() -> SpkiVerifier {
+        SpkiVerifier::new(
+            [base64::decode(OTHER_SPKI_B64).unwrap()],
+            Vec::<Vec<u8>>::new(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn p384_fixture_keys_are_one_pair() {
+        assert_fixture_keys_are_one_pair(TYPE);
+    }
+
+    /// The tool signed the commit of the P-384 fixture two times. The first
+    /// signature has a low s, and the second has a high s.
+    ///
+    /// The port verifies a P-384 signature over the SHA-256 of the data, so a
+    /// valid blob shows that the tool signs this hash. The port accepts a high
+    /// s, as for P-256.
+    #[test]
+    fn p384_tool_commit_verifies_low_and_high_s() {
+        block_on(async {
+            let repo = Repo::open(&fixture_dir(TYPE).join("repo")).await.unwrap();
+            let dict = repo
+                .read_commit_detached_metadata(&commit())
+                .await
+                .unwrap()
+                .expect("the commit has detached metadata");
+            let blobs = spki_blobs(&dict);
+            assert_eq!(blobs.len(), 2, "{}", regenerate(TYPE));
+            assert!(
+                !has_high_s(&blobs[0], &P384_HALF_ORDER),
+                "{}",
+                regenerate(TYPE)
+            );
+            assert!(
+                has_high_s(&blobs[1], &P384_HALF_ORDER),
+                "{}",
+                regenerate(TYPE)
+            );
+
+            let fingerprint = Checksum::sha256(&fixture_signer(TYPE).public_key_der()).to_hex();
+            let outcome = repo
+                .verify_commit(&commit(), &[&fixture_verifier(TYPE)])
+                .await
+                .unwrap();
+            assert!(outcome.valid);
+            assert_eq!(outcome.signatures.len(), 2, "{}", regenerate(TYPE));
+            // Each blob verifies. The second blob has a high s.
+            for info in &outcome.signatures {
+                assert!(info.valid);
+                assert_eq!(info.pubkey_algorithm.as_deref(), Some("p384"));
+                assert_eq!(info.fingerprint.as_deref(), Some(fingerprint.as_str()));
+            }
+
+            let outcome = repo
+                .verify_commit(&commit(), &[&stranger_verifier()])
+                .await
+                .unwrap();
+            assert!(
+                !outcome.valid,
+                "a key that signed no fixture must not verify"
+            );
+            assert_eq!(outcome.signatures.len(), 2);
+            assert!(
+                outcome
+                    .signatures
+                    .iter()
+                    .all(|info| info.key_missing && !info.valid)
+            );
+        });
+    }
+
+    #[test]
+    fn p384_tool_summary_verifies() {
+        block_on(async {
+            let repo = Repo::open(&fixture_dir(TYPE).join("repo")).await.unwrap();
+            let outcome = repo
+                .verify_summary(&[&fixture_verifier(TYPE)])
+                .await
+                .unwrap();
+            assert!(outcome.valid);
+            assert_eq!(outcome.signatures.len(), 1, "{}", regenerate(TYPE));
+            assert!(outcome.signatures[0].valid);
+
+            let outcome = repo.verify_summary(&[&stranger_verifier()]).await.unwrap();
+            assert!(
+                !outcome.valid,
+                "a key that signed no fixture must not verify"
+            );
+            assert_eq!(outcome.signatures.len(), 1);
+            assert!(!outcome.signatures[0].valid);
+        });
+    }
+
+    #[test]
+    fn p384_tool_delta_verifies() {
+        block_on(async {
+            let root = fixture_dir(TYPE).join("repo");
+            let repo = Repo::open(&root).await.unwrap();
+            let dir = root.join(static_delta_relative_dir(None, &commit()));
+            let outcome = repo
+                .verify_static_delta(&dir, &[&fixture_verifier(TYPE)])
+                .await
+                .unwrap();
+            assert!(outcome.valid);
+            assert_eq!(outcome.signatures.len(), 1, "{}", regenerate(TYPE));
+            assert!(outcome.signatures[0].valid);
 
             let outcome = repo
                 .verify_static_delta(&dir, &[&stranger_verifier()])

@@ -129,9 +129,10 @@ receive endpoint, the server signs with the RSA key of an `[ex-ostrya key]`
 group. A client can start such a signature and measure its time. The time of
 the operation can then disclose information about the private key. The port
 accepts this risk. Where a client that is not trusted can reach the endpoint,
-use a P-256 or an ed25519 key in an `[ex-ostrya key]` group. The signer
-blinds each RSA private-key operation with a random value from the operating
-system. Blinding makes the time signal smaller, and it does not remove it.
+use a P-256, a P-384, or an ed25519 key in an `[ex-ostrya key]` group. The
+signer blinds each RSA private-key operation with a random value from the
+operating system. Blinding makes the time signal smaller, and it does not
+remove it.
 RSA verification uses the public key alone, and the advisory does not apply
 to it. GPG private keys stay with GnuPG and its agent. The exception is
 reviewed when the tree takes a release of `rsa` with the fix.
@@ -156,8 +157,8 @@ operating system:
   `windows-link`, which emits them in the `raw-dylib` form. These crates link
   `ws2_32`, `crypt32`, and other system libraries. `getrandom` links
   `bcryptprimitives` in the `raw-dylib` form itself. `ostrya-sign` reaches
-  `getrandom` 0.2.17 through `p256` and `rsa`, and that version links
-  `bcrypt` and `advapi32` with `#[link]` attributes.
+  `getrandom` 0.2.17 through `p256`, `p384`, and `rsa`, and that version
+  links `bcrypt` and `advapi32` with `#[link]` attributes.
 
 These libraries are part of the operating system. The build compiles no C
 source for them, and the port ships no copy of them. No crate in the list
@@ -369,9 +370,10 @@ term below is measured on the resolved dependency graph.
   workspace pins 1.92, so the requirement holds.
 
 `pkcs8` 0.10.2 is also authorized for `crates/ostrya-sign`, behind each key
-feature of the spki engine, now `sign-spki-p256` and `sign-spki-rsa`. It
-reads the `PrivateKeyInfo` of a PKCS#8 secret key, so the spki engine selects
-the key type from the algorithm OID before it decodes the key.
+feature of the spki engine, now `sign-spki-p256`, `sign-spki-p384`, and
+`sign-spki-rsa`. It reads the `PrivateKeyInfo` of a PKCS#8 secret key, so the
+spki engine selects the key type from the algorithm OID before it decodes the
+key.
 
 - `default-features = false` is mandatory, and no feature is turned on.
 - `der` 0.7.10 and `spki` 0.7.3 enter the same manifest behind the same
@@ -453,6 +455,54 @@ dependency graph.
   about 10 seconds without it.
 - RUSTSEC-2023-0071 applies to the crate. "Advisory exceptions" states the
   terms.
+
+### Authorized: the `p384` crate
+
+`p384` 0.13.1 is authorized for `crates/ostrya-sign` alone, as an optional
+dependency behind the feature `sign-spki-p384`. It supplies ECDSA P-384 to
+the spki engine: the secret key from a PKCS#8 or a SEC1 key, the signer, and
+the verifier. The engine hashes the data with SHA-256 and calls
+`sign_prehash` and `verify_prehash`. Each term below is measured on the
+resolved dependency graph.
+
+- License `Apache-2.0 OR MIT`.
+- `default-features = false` is mandatory, with the features `ecdsa`,
+  `pkcs8`, and `std`, as `p256` takes. The features `pem` and `ecdh` stay
+  off. `pgp` takes the default features of `p384`, so a build with
+  `verify-gpg` also turns on `pem` and `ecdh`.
+- The feature `ecdsa` turns on `sha384`, so the default `Signer` and
+  `Verifier` of the crate hash with SHA-384. The engine does not call them. `sign_prehash` makes the
+  RFC 6979 nonce with HMAC-SHA-384 for each prehash, so a signature of the
+  engine is the same bytes on each run for the same key and data.
+- The graph holds 61 packages under 61 distinct names on the host target,
+  measured with `cargo tree -p p384 -e normal,build`, which reads the
+  features the workspace resolves. With `--target all` it holds 64 under 63
+  distinct names, adding `serde_derive` 1.0.229, `syn` 3.0.3, and `wasi`
+  0.11.1+wasi-snapshot-preview1. `cargo metadata --format-version 1
+  --all-features` counts the same 64 packages under 63 distinct names for
+  the closure, with `syn` at 2.0.118 and 3.0.3.
+- No package in the graph declares a `links` key, and no package name in it
+  ends in `-sys`.
+- Nine packages carry a build script: `generic-array`, `libc`,
+  `proc-macro2`, `quote`, `radium`, `serde`, `serde_core`, `serde_json`, and
+  `zmij`. All nine were already in the graph.
+- Every license in the graph is permissive by the rule in "Requirement:
+  permissive licenses only". On the host target, 27 packages state
+  `MIT OR Apache-2.0`, 20 state `Apache-2.0 OR MIT`, `bitvec`, `funty`,
+  `generic-array`, `radium`, `tap`, `wyz`, and `zmij` state `MIT`, `ff`,
+  `group`, and `version_check` state the legacy `MIT/Apache-2.0` form the CI
+  license guard normalizes, `memchr` states `Unlicense OR MIT`, `subtle`
+  states `BSD-3-Clause`, `flagset` states `Apache-2.0`, and `unicode-ident`
+  states `(MIT OR Apache-2.0) AND Unicode-3.0`. With `--target all`, `wasi`
+  states `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT`.
+- The highest minimum supported Rust version in the graph is 1.85, stated
+  by `base64ct`, `zeroize`, and `zeroize_derive`. `p384` states 1.65. The
+  workspace pins 1.92, so the requirement holds.
+- `p384`, `primeorder`, `ecdsa`, and `elliptic-curve` set
+  `#![forbid(unsafe_code)]`. `rfc6979` holds no `unsafe` code.
+- The crate was in the graph through `pgp`, under `verify-gpg` of
+  `crates/ostrya`, so no package enters `Cargo.lock`. The one change to the
+  lock file is the entry `p384` in the dependency list of `ostrya-sign`.
 
 ### Authorized: the `getrandom` crate
 

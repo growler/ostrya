@@ -23,11 +23,15 @@ sign-spki-rsa = ["dep:rsa", "dep:der", "dep:spki", "dep:pkcs8", "dep:pem-rfc7468
 # The spki engine with each of its key types.
 sign-spki = ["sign-spki-p256", "sign-spki-p384", "sign-spki-ed25519", "sign-spki-rsa"]
 sign-gpg = ["dep:ostrya-rt"]
+# The trait `X509Signer`. With a key feature other than `sign-spki-ed25519`,
+# also the X.509 signer of the spki engine. With a key feature, also the
+# verifier that trusts the keys of X.509 certificates.
+sign-x509 = ["dep:x509-cert"]
 
-# docs.rs adds these two features to the default set, so the pages show the
+# docs.rs adds these three features to the default set, so the pages show the
 # items that a feature gates, with a feature badge on each.
 [package.metadata.docs.rs]
-features = ["sign-spki", "sign-gpg"]
+features = ["sign-spki", "sign-gpg", "sign-x509"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 # The gates of the spki engine take the form `any(feature = ...)` over the key
@@ -69,6 +73,7 @@ rsa = { version = "0.9.10", default-features = false, features = [
     "u64_digit",
     "getrandom",
 ], optional = true }
+x509-cert = { version = "0.2.5", default-features = false, optional = true }
 
 # The key file reader opens with `O_NONBLOCK` on Unix, so a fifo answers the
 # open rather than waiting for a writer. `std` does not supply the value of

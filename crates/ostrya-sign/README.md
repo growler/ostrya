@@ -20,6 +20,8 @@ API documentation: <https://docs.rs/ostrya-sign>
 - `DummySigner` and `DummyVerifier` are the dummy engine for tests.
 - `append_signature` adds a signature to a detached-metadata dict.
 - `read_key_file` reads a key file, and `SignKeys` holds the keys.
+- `X509Signer`, with the feature `sign-x509`, is the trait of a signer
+  with an X.509 certificate chain, for a CMS signature.
 
 ## Features
 
@@ -43,6 +45,12 @@ API documentation: <https://docs.rs/ostrya-sign>
   A build without one of the four key features refuses a key of that
   type, with a message that names its feature.
 - `sign-gpg`: `GpgSigner`, which signs with the `gpg` command.
+- `sign-x509`: the trait `X509Signer`. With `sign-spki-p256`,
+  `sign-spki-p384`, or `sign-spki-rsa`, also `X509SpkiSigner`, the spki
+  signer with an X.509 certificate chain, which
+  `SpkiSigner::with_certificates` makes. With one of the four key
+  features, also `SpkiVerifier::from_certificates`, which trusts the keys
+  of X.509 certificates. The feature validates no certificate chain.
 
 ## Examples
 

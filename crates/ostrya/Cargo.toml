@@ -37,6 +37,9 @@ sign-spki = [
 ]
 verify-gpg = ["dep:pgp"]
 sign-gpg = ["verify-gpg", "ostrya-sign/sign-gpg"]
+# The trait `X509Signer`, and with the spki key features, the X.509 signer
+# and the X.509 verifier of the spki engine.
+sign-x509 = ["ostrya-sign/sign-x509"]
 # The server side of a push: the receive policy, the checks it makes, and the
 # session over the push wire protocol of ostrya-remote.
 receive = []
@@ -57,12 +60,13 @@ lzma-static = ["liblzma/static"]
 
 # The crate documentation links items of the signing and verification
 # engines, of the receive policy, of the push client, and of the S3 support,
-# and a feature gates each item. docs.rs adds these six features to the
-# default set, and the links then resolve.
+# and a feature gates each item. docs.rs adds these seven features to the
+# default set, and the links then resolve. `sign-x509` adds the X.509 items
+# of the signing engines to the pages.
 # The `tokio` and `lzma-static` features change no documented item, so the
 # list omits them.
 [package.metadata.docs.rs]
-features = ["sign-spki", "verify-gpg", "sign-gpg", "receive", "push", "s3"]
+features = ["sign-spki", "verify-gpg", "sign-gpg", "sign-x509", "receive", "push", "s3"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 # The gates of the spki engine take the form `any(feature = ...)` over the key

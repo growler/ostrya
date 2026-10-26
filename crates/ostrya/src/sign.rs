@@ -19,6 +19,9 @@
 //! - the dummy engine for tests: [`DummySigner`] and [`DummyVerifier`]
 //! - spki: feature `sign-spki`, or a key feature such as `sign-spki-p256`
 //! - GPG: features `verify-gpg` and `sign-gpg`
+//!
+//! With the feature `sign-x509`, the trait `X509Signer` gives the X.509
+//! certificate chain of a signer for a CMS signature.
 
 use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
@@ -29,6 +32,8 @@ use rustix::io::Errno;
 
 use crate::repo::Repo;
 
+#[cfg(feature = "sign-x509")]
+pub use ostrya_sign::X509Signer;
 pub use ostrya_sign::{
     DummySigner, DummyVerifier, Ed25519Signer, Ed25519Verifier, MAX_KEY_FILE, SignFuture, SignKeys,
     SignatureInfo, Signer, Verifier, VerifyFuture, VerifyOutcome, append_signature, key_text,

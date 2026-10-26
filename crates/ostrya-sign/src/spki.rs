@@ -10,6 +10,8 @@ mod ed25519;
 mod p384;
 #[cfg(feature = "sign-spki-rsa")]
 mod rsa;
+#[cfg(feature = "sign-x509")]
+mod x509;
 
 use std::borrow::Cow;
 use std::cell::OnceCell;
@@ -27,6 +29,15 @@ use p256::ecdsa::signature::{Signer as _, hazmat::PrehashVerifier as _};
 #[cfg(feature = "sign-spki-p256")]
 use p256::pkcs8::EncodePublicKey;
 
+#[cfg(all(
+    feature = "sign-x509",
+    any(
+        feature = "sign-spki-p256",
+        feature = "sign-spki-p384",
+        feature = "sign-spki-rsa"
+    )
+))]
+pub use self::x509::X509SpkiSigner;
 use crate::pem;
 use crate::{
     Error, Result, SignFuture, SignKeys, SignatureInfo, Signer, Verifier, VerifyFuture,
@@ -1198,6 +1209,13 @@ fn ec_curve(parameters: Option<AnyRef<'_>>) -> std::result::Result<ObjectIdentif
 /// Decodes a SubjectPublicKeyInfo DER into a public key.
 fn decode_public_key(der: &[u8]) -> std::result::Result<Public, Refusal> {
     let info = SubjectPublicKeyInfoRef::from_der(der).map_err(|_| Refusal::Form)?;
+    decode_public_key_info(info)
+}
+
+/// Decodes a SubjectPublicKeyInfo into a public key.
+fn decode_public_key_info(
+    info: SubjectPublicKeyInfoRef<'_>,
+) -> std::result::Result<Public, Refusal> {
     match key_type(&info.algorithm)? {
         #[cfg(feature = "sign-spki-p256")]
         KeyType::P256 => {

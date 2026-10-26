@@ -726,6 +726,36 @@ dependency graph.
   20,271,128 bytes and the second 20,162,840, a difference of 108,288 bytes.
   A rebuild of the first tree gives the same byte count.
 
+`x509-cert` 0.2.5 is also authorized for `crates/ostrya-sign`, as an
+optional dependency behind the feature `sign-x509`. It decodes the
+certificates of `SpkiSigner::with_certificates` and
+`SpkiVerifier::from_certificates`, which read the SubjectPublicKeyInfo of a
+certificate. The unit tests build test certificates with its types.
+
+- `default-features = false` is mandatory, and no feature is turned on.
+- In a build of `ostrya-sign`, the crate turns on the features `derive` and
+  `flagset` of `der` and the feature `db` of `const-oid`.
+- A build of `ostrya-sign` with `sign-x509` and `sign-spki-rsa` holds 57
+  packages under 57 distinct names on the host target, measured with
+  `cargo tree -p ostrya-sign --no-default-features --features
+  sign-x509,sign-spki-rsa -e normal,build`. With `--target all` it holds 60.
+  Against a build with `sign-spki-rsa` alone, the build adds `x509-cert`
+  0.2.5, `der_derive` 0.7.3, and `flagset` 0.4.7. A build with one other key
+  feature adds the same three packages. A build with `sign-x509` alone also
+  adds `der`, `spki`, and `const-oid`.
+- No package in the graph declares a `links` key, and no package name in it
+  ends in `-sys`. The three packages carry no build script.
+- `x509-cert` and `der_derive` state `Apache-2.0 OR MIT`, and `flagset`
+  states `Apache-2.0`. Each of the three states the minimum supported Rust
+  version 1.65.
+- `x509-cert` and `der_derive` set `#![forbid(unsafe_code)]`. `flagset`
+  holds `unsafe` code in `FlagSet::new_unchecked` and in the `From`
+  conversion of its macro.
+- No package enters `Cargo.lock`. The one change to the lock file is the
+  entry `x509-cert` in the dependency list of `ostrya-sign`.
+- `ostrya-cli` does not turn on `sign-x509`, so the size of the `ostrya`
+  binary does not change.
+
 ### Authorized: the `hmac` crate
 
 `hmac` 0.12.1 is authorized for `crates/ostrya-remote` alone, as an optional

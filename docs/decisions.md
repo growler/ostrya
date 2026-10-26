@@ -73,7 +73,9 @@ feature set and its graph.
 - `rustls`, `rustls-graviola`, `futures-rustls`, `rustls-native-certs` and
   `rustls-pemfile` -- TLS. See "TLS stack".
 - `url` and `pkcs8` -- in `ostrya-fetch`.
-- `getrandom` and `x509-cert` -- in `ostrya-server`.
+- `getrandom` -- in `ostrya-server`.
+- `x509-cert` -- in `ostrya-server`, and in `ostrya-sign` under the feature
+  `sign-x509`.
 - `thiserror` -- the error types.
 - `libc` -- in `ostrya-sys`, `ostrya-remote` and `ostrya-sign`.
 - `clap` -- command-line parsing, in `ostrya-cli` and `ostrya-mountd`.
@@ -320,6 +322,61 @@ when the first ECDSA or RSA key tries a blob. Each of these keys verifies the
 blob with this hash. A store of many keys then hashes a commit one time, and
 a blob that no key tries computes no hash. An Ed25519 key verifies with the
 data and computes no SHA-256.
+
+With the feature `sign-x509`, `ostrya-sign` has the trait `X509Signer`, with
+the supertrait `Signer`. The trait gives the values of a CMS `SignerInfo` for
+a signature with an X.509 certificate chain, for example an Authenticode
+signature of a UEFI image. `certificates()` gives the DER of each
+certificate: the certificate of the signer first, then the intermediate
+certificates in chain order. `signature_algorithm()` and
+`digest_algorithm()` give DER `AlgorithmIdentifier` values. `Signer::sign`
+hashes the data with the digest algorithm and signs the hash. For
+Authenticode, the data is the DER of the CMS signed attributes. The methods
+other than `sign` need no private key. So a signer whose key is in a hardware
+token, an HSM, or a key service can implement the trait with no change to
+the traits.
+
+`SpkiSigner::with_certificates` consumes a signer and gives an
+`X509SpkiSigner`, which implements `Signer` and `X509Signer`. `SpkiSigner`
+does not implement `X509Signer`, so `certificates()` always holds the
+certificate of the signer. The constructor refuses an empty list, and a
+first certificate whose key is not the key of the signer. It compares the
+two keys by the rule of the revocation compare. It decodes each intermediate
+certificate, and does not read its key.
+
+The signature algorithm of an RSA key is `rsaEncryption` with `NULL`
+parameters. `sha256WithRSAEncryption` is not used: `sbsign` and
+`systemd-sbsign` of Debian trixie write `rsaEncryption` with `NULL`, and
+firmware reads this form. The signature algorithm of a P-256 key and of a
+P-384 key is `ecdsa-with-SHA256` with no parameters, because the engine
+signs with SHA-256 on each curve. The digest algorithm is SHA-256 with
+`NULL` parameters. The engine keeps these values as DER constants.
+
+Ed25519 is outside the trait. An Ed25519 key signs the data and not a hash,
+and Authenticode for UEFI does not use Ed25519. `with_certificates` refuses
+an Ed25519 signer.
+
+The port builds no CMS structure and no Authenticode structure, and it reads
+no PE file. The caller builds these structures with the values of the trait.
+
+`SpkiVerifier::from_certificates` trusts the SubjectPublicKeyInfo of each
+certificate that it gets as DER or as PEM `CERTIFICATE` blocks. It validates
+no chain, no signature of a certificate, and no validity period. A key from
+a certificate, from a PEM `PUBLIC KEY` block, and from a SubjectPublicKeyInfo
+DER is one trusted key, with one fingerprint. The function trusts the key of
+an Ed25519 certificate.
+
+The engine decodes a certificate with `x509-cert`, which reads strict DER. A
+hand-written walk of the ASN.1 structure to the SubjectPublicKeyInfo was
+rejected: a strict decode of the full structure refuses each malformed
+certificate, and a walk to one field does not. `x509-cert` 0.2.5 was in the
+graph through `ostrya-server`, so no package enters `Cargo.lock`.
+
+The feature `sign-spki` does not turn on `sign-x509`. `X509SpkiSigner`
+needs `sign-x509` and one of the key features `sign-spki-p256`,
+`sign-spki-p384`, and `sign-spki-rsa`. `SpkiVerifier::from_certificates`
+needs `sign-x509` and one of the four key features. `sign-x509` alone gives
+the trait `X509Signer` alone.
 
 ## GPG
 

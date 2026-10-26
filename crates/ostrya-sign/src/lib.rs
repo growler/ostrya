@@ -15,6 +15,8 @@
 //! - [`DummySigner`] and [`DummyVerifier`] are the dummy engine for tests.
 //! - [`append_signature`] adds a signature to a detached-metadata dict.
 //! - [`read_key_file`] reads a key file, and [`SignKeys`] holds the keys.
+//! - `X509Signer`, with the feature `sign-x509`, is the trait of a signer
+//!   with an X.509 certificate chain, for a CMS signature.
 //!
 //! # Features
 //!
@@ -38,6 +40,12 @@
 //!   A build without one of the four key features refuses a key of that
 //!   type, with a message that names its feature.
 //! - `sign-gpg`: `GpgSigner`, which signs with the `gpg` command.
+//! - `sign-x509`: the trait `X509Signer`. With `sign-spki-p256`,
+//!   `sign-spki-p384`, or `sign-spki-rsa`, also `X509SpkiSigner`, the spki
+//!   signer with an X.509 certificate chain, which
+//!   `SpkiSigner::with_certificates` makes. With one of the four key
+//!   features, also `SpkiVerifier::from_certificates`, which trusts the keys
+//!   of X.509 certificates. The feature validates no certificate chain.
 //!
 //! # Examples
 //!
@@ -80,7 +88,18 @@ mod pem;
     feature = "sign-spki-rsa"
 ))]
 mod spki;
+#[cfg(feature = "sign-x509")]
+mod x509;
 
+#[cfg(all(
+    feature = "sign-x509",
+    any(
+        feature = "sign-spki-p256",
+        feature = "sign-spki-p384",
+        feature = "sign-spki-rsa"
+    )
+))]
+pub use self::spki::X509SpkiSigner;
 #[cfg(any(
     feature = "sign-spki-p256",
     feature = "sign-spki-p384",
@@ -98,12 +117,15 @@ pub use error::{Error, Result};
 pub use gpg::GpgSigner;
 pub use keys::{MAX_KEY_FILE, SignKeys, key_text, read_key_file, read_key_source};
 pub use metadata::append_signature;
+#[cfg(feature = "sign-x509")]
+pub use x509::X509Signer;
 
 // The public types of this crate are `Send + Sync`, so they can move across
 // tasks and threads. The trait objects that `Repo::sign_commit` and
 // `Repo::verify_commit` take are `Send + Sync` through the supertrait bounds.
 // The `&dyn Signer` and `&dyn Verifier` arguments of these two methods make
-// sure that the traits stay dyn-compatible.
+// sure that the traits stay dyn-compatible. The `&dyn X509Signer` below does
+// the same for `X509Signer`.
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<DummySigner>();
@@ -128,6 +150,17 @@ const _: fn() = || {
         feature = "sign-spki-rsa"
     ))]
     assert_send_sync::<SpkiVerifier>();
+    #[cfg(all(
+        feature = "sign-x509",
+        any(
+            feature = "sign-spki-p256",
+            feature = "sign-spki-p384",
+            feature = "sign-spki-rsa"
+        )
+    ))]
+    assert_send_sync::<X509SpkiSigner>();
     #[cfg(feature = "sign-gpg")]
     assert_send_sync::<GpgSigner>();
+    #[cfg(feature = "sign-x509")]
+    let _: Option<&dyn X509Signer> = None;
 };

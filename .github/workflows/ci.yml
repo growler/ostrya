@@ -196,7 +196,7 @@ jobs:
       # refusal shows no userinfo of the address. The tests of these arms
       # compile only without the feature.
       - name: The endpoint tests without the s3 feature pass
-        run: cargo test -p ostrya --no-default-features --features smol --lib endpoint::
+        run: 'cargo test -p ostrya --no-default-features --features smol --lib endpoint::'
 
       # The `ostrya` command built without the s3 feature has no S3 option and
       # no `remote init`, and refuses an `s3://` address with a message that
@@ -263,6 +263,22 @@ jobs:
       - name: The spki tests pass with the RSA key feature alone
         run: cargo test -p ostrya --no-default-features --features smol,sign-spki-rsa --test sign_spki_rsa --test sign_spki_fixtures
 
+      # `sign-x509` alone holds the trait `X509Signer` and no key type. With
+      # the RSA key feature, it holds the X.509 signer of the spki engine.
+      # With the Ed25519 key feature alone, it holds the X.509 verifier and
+      # no X.509 signer. These steps build the three forms with no warning,
+      # and run the unit tests of `ostrya-sign` in the first two.
+      - name: ostrya-sign with the X.509 feature alone compiles
+        run: cargo clippy -p ostrya-sign --no-default-features --features sign-x509 --all-targets -- -D warnings
+      - name: The ostrya-sign unit tests pass with the X.509 feature alone
+        run: cargo test -p ostrya-sign --no-default-features --features sign-x509 --lib
+      - name: ostrya-sign with the X.509 feature and the RSA key feature compiles
+        run: cargo clippy -p ostrya-sign --no-default-features --features sign-x509,sign-spki-rsa --all-targets -- -D warnings
+      - name: The ostrya-sign unit tests pass with the X.509 feature and the RSA key feature
+        run: cargo test -p ostrya-sign --no-default-features --features sign-x509,sign-spki-rsa --lib
+      - name: ostrya-sign with the X.509 feature and the Ed25519 key feature compiles
+        run: cargo clippy -p ostrya-sign --no-default-features --features sign-x509,sign-spki-ed25519 --all-targets -- -D warnings
+
       # The portable crates compile for macOS and Windows as well as Linux.
       # `cargo check` needs the standard library of each target and no linker,
       # so the Linux runner checks all three targets. Each portable crate that
@@ -280,8 +296,8 @@ jobs:
             cargo check --target "$target" -p ostrya-remote --no-default-features --features tokio
             cargo check --target "$target" -p ostrya-remote --features s3
             cargo check --target "$target" -p ostrya-remote --no-default-features --features tokio,s3
-            cargo check --target "$target" -p ostrya-sign --features sign-spki,sign-gpg
-            cargo check --target "$target" -p ostrya-sign --no-default-features --features tokio,sign-spki,sign-gpg
+            cargo check --target "$target" -p ostrya-sign --features sign-spki,sign-gpg,sign-x509
+            cargo check --target "$target" -p ostrya-sign --no-default-features --features tokio,sign-spki,sign-gpg,sign-x509
           done
 
       # `cargo check` does no code generation, so it does not assemble the

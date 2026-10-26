@@ -1867,6 +1867,7 @@ dependencies = [
  "rsa",
  "spki",
  "thiserror",
+ "x509-cert",
 ]
 
 [[package]]

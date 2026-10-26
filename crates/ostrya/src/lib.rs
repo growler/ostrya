@@ -50,6 +50,7 @@
 //! - `sign-spki-rsa`: the `spki` module with the RSA key type. A build without one of the four key features refuses a key of that type.
 //! - `verify-gpg`: the `gpg` module, GPG verification and keyring management.
 //! - `sign-gpg`: `GpgSigner`, which signs with the `gpg` command. It turns on `verify-gpg`.
+//! - `sign-x509`: `X509Signer`, the trait of a signer with an X.509 certificate chain for a CMS signature. With `sign-spki-p256`, `sign-spki-p384`, or `sign-spki-rsa`, also `X509SpkiSigner` and `SpkiSigner::with_certificates`. With one of the four key features, also `SpkiVerifier::from_certificates`.
 //! - `receive`: the `receive` module, the receive side of a push.
 //! - `push`: `Repo::push`, `Repo::push_onto`, and `Repo::export_stream`, the push from a repository.
 //! - `s3`: the pull from a bucket repository at an `s3://` address and the pull of collection refs from one, the `bucket` module with the fsck, the prune, and the summary update of a bucket repository, the `s3` module of `ostrya-remote`, and with `push`, the push of commits and of a local directory to a bucket repository.
@@ -118,6 +119,15 @@ pub mod sign;
 pub mod spki {
     //! The spki signing engine: ECDSA P-256 and P-384, Ed25519, and RSA
     //! PKCS#1 v1.5 signatures, with SPKI public keys.
+    #[cfg(all(
+        feature = "sign-x509",
+        any(
+            feature = "sign-spki-p256",
+            feature = "sign-spki-p384",
+            feature = "sign-spki-rsa"
+        )
+    ))]
+    pub use ostrya_sign::X509SpkiSigner;
     pub use ostrya_sign::{
         SpkiSigner, SpkiVerifier, spki_public_keys, spki_secret_key_lines, spki_secret_keys,
     };
@@ -228,12 +238,25 @@ pub use refs::{CollectionRef, CollectionRefEntry, RefAlias, validate_refspec};
 #[doc(hidden)]
 pub use repo::{CreateOptions, Repo};
 pub use send::{SendEvent, SendEventFn, SendOptions};
+#[cfg(feature = "sign-x509")]
+#[doc(hidden)]
+pub use sign::X509Signer;
 #[doc(hidden)]
 pub use sign::{
     DummySigner, DummyVerifier, Ed25519Signer, Ed25519Verifier, FromSystemKeys, SignFuture,
     SignKeys, SignatureInfo, Signer, Verifier, VerifyFuture, VerifyOutcome, load_sign_keys,
     load_sign_keys_from,
 };
+#[cfg(all(
+    feature = "sign-x509",
+    any(
+        feature = "sign-spki-p256",
+        feature = "sign-spki-p384",
+        feature = "sign-spki-rsa"
+    )
+))]
+#[doc(hidden)]
+pub use spki::X509SpkiSigner;
 #[cfg(any(
     feature = "sign-spki-p256",
     feature = "sign-spki-p384",

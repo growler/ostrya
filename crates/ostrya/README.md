@@ -74,6 +74,10 @@ API documentation: <https://docs.rs/ostrya>
 - `verify-gpg`: the `gpg` module, GPG verification and keyring management.
 - `sign-gpg`: `GpgSigner`, which signs with the `gpg` command. It turns on
   `verify-gpg`.
+- `sign-x509`: `X509Signer`, the trait of a signer with an X.509 certificate
+  chain for a CMS signature. With `sign-spki-p256`, `sign-spki-p384`, or
+  `sign-spki-rsa`, also `X509SpkiSigner` and `SpkiSigner::with_certificates`.
+  With one of the four key features, also `SpkiVerifier::from_certificates`.
 - `receive`: the `receive` module, the receive side of a push.
 - `push`: `Repo::push`, `Repo::push_onto`, and `Repo::export_stream`, the push
   from a repository.

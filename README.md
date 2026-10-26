@@ -225,6 +225,8 @@ The features of the `ostrya` crate are:
 - `sign-spki-rsa`: the spki signing engine with the RSA key type.
 - `verify-gpg`: GPG signature verification and key management.
 - `sign-gpg`: GPG signing through the `gpg` command. It turns on `verify-gpg`.
+- `sign-x509`: the X.509 certificate chain of a signer for a CMS signature,
+  and the trust of the keys of X.509 certificates.
 - `push`: the client side of a push.
 - `receive`: the server side of a push.
 - `s3`: the pull from a bucket repository in an S3 bucket, its init and its

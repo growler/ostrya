@@ -5389,6 +5389,85 @@ another P-384 key verifies no signature of a probe, at exit 1:
 
 `cli-surface.md`, "P2", `sign`, records the port side.
 
+#### spki Ed25519 keys
+
+The `ostree` 2026.1 build with OpenSSL on the NixOS development host signs
+and verifies with Ed25519 keys of the spki engine. Observed on 2026-10-26,
+with OpenSSL 3.6.4. `openssl genpkey -algorithm ED25519` makes the keys.
+Each probe signs the commit of a new `archive` repository, and the PEM
+`PUBLIC KEY` file of another Ed25519 key verifies no signature of a probe:
+
+- `sign -s spki COMMIT KEY`, where `KEY` is the base64 of the PKCS#8 DER of
+  the key, signs at exit 0. `sign -s spki --keys-file=<path>` with the PEM
+  `PRIVATE KEY` file of the key, and `commit --sign-type=spki
+  --sign-from-file=<path>` with the same file, sign at exit 0.
+- The signature is 64 bytes. It is the pure Ed25519 signature of RFC 8032
+  over the bytes of the commit object, with no prehash: `openssl pkeyutl
+  -sign -rawin` over these bytes writes the same 64 bytes. Two runs with one
+  key write the same `.commitmeta` bytes. The inline key and the key file
+  write the same bytes.
+- `sign --verify -s spki --keys-file=<path>` with the PEM `PUBLIC KEY` file
+  of the key writes `spki: Signature verified successfully with key
+  '302a300506032b6570032100<hex>'` at exit 0, where `<hex>` is the 32 bytes
+  of the key. The file of another key writes `error: spki: Signature
+  couldn't be verified with: key '<hex of its DER>'` at exit 1. The base64 of
+  the SubjectPublicKeyInfo DER as a positional key verifies the signature.
+- `static-delta generate --empty --to=COMMIT --sign-type=spki
+  --keys-file=<path>`, where the file holds one line of the base64 of the
+  PKCS#8 DER, signs at exit 0. `static-delta verify --sign-type=spki
+  --keys-file=<path>` with the PEM `PUBLIC KEY` file of the key prints
+  `Verification OK`. The file of another key prints `Verification fails` and
+  an `error: spki: Signature couldn't be verified with:` line, at exit 1.
+- `summary -u --sign-type=spki --sign=KEY` signs at exit 0. `summary.sig`
+  holds the signature of `openssl pkeyutl -sign -rawin` over the `summary`
+  file.
+
+The verify of the tool gives these results. Each blob is the only spki
+signature of the commit:
+
+- A public key of small order: the identity point, the 32 bytes `01 00 ..
+  00`. The blob of `R` = the identity point and `S` = 0 verifies at exit 0.
+  `openssl pkeyutl -verify -rawin` verifies it too.
+- The identity point in a non-canonical encoding, y = p + 1, the 32 bytes
+  `ee ff .. ff 7f`. The same blob verifies at exit 0. The verify line names
+  the key with these 32 bytes.
+- The identity point with x = 0 and the sign bit set, the 32 bytes `01 00 ..
+  00 80`. RFC 8032 refuses this encoding. The same blob verifies at exit 0,
+  and the verify line names the key with these 32 bytes. `openssl pkeyutl
+  -verify -rawin` verifies it too. With this key, the blob of `R` = these 32
+  bytes and `S` = 0 gives `error: spki: Signature couldn't be verified
+  with:` at exit 1.
+- A signature that verifies only under the cofactored equation: `R' = [r]B +
+  T`, where `T` is the point of order 2, and `S' = r + H(R' || A || M) a`,
+  for the key of secret scalar `a`. The tool reports `error: spki: Signature
+  couldn't be verified with:` at exit 1, and `openssl pkeyutl -verify
+  -rawin` refuses it.
+- A valid signature with `S + L` in place of `S`, where `L` is the order of
+  the group, so `S` is not reduced. The tool reports the same error at exit
+  1, and `openssl pkeyutl -verify -rawin` refuses it.
+
+The tool reads these PKCS#8 forms of the secret key:
+
+- A key of version 2, with the `version` 1, that holds the public key of the
+  seed in its `[1]` field signs at exit 0, inline and from a PEM `PRIVATE
+  KEY` file. The `.commitmeta` bytes are those of the version 1 form.
+- A key of version 2 that holds the public key of another key signs with the
+  seed at exit 0. The public key of the seed verifies the signature, and the
+  other public key does not.
+- A key with the `version` 1 and no public key signs at exit 0, and the
+  public key of the seed verifies the signature.
+- These keys refuse the run at exit 1 with `error: Not able to sign the
+  cobject: openssl: Failed to initialize spki key`: a key with the `version`
+  0 and a public key, a key with `NULL` parameters, a key whose `privateKey`
+  holds the bare seed with no inner `OCTET STRING`, the bare DER `04 20` and
+  the seed, and the 64 bytes of the seed and the public key, the form of the
+  ed25519 engine.
+- A PEM `PUBLIC KEY` file whose SubjectPublicKeyInfo has `NULL` parameters
+  refuses the verify at exit 1 with `error: openssl: Failed to initialize
+  spki key`.
+
+`cli-surface.md`, "P2", `sign`, records the port side.
+
 #### `apply-offline`
 
 `apply-offline PATH [KEY-ID...]` applies one delta into the repository. The

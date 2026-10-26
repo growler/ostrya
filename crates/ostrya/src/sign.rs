@@ -429,6 +429,7 @@ impl FromSystemKeys for Ed25519Verifier {
 #[cfg(any(
     feature = "sign-spki-p256",
     feature = "sign-spki-p384",
+    feature = "sign-spki-ed25519",
     feature = "sign-spki-rsa"
 ))]
 impl FromSystemKeys for crate::spki::SpkiVerifier {
@@ -508,6 +509,7 @@ pub fn load_sign_keys_from(roots: &[&Path], sign_type: &str) -> crate::Result<Si
     #[cfg(not(any(
         feature = "sign-spki-p256",
         feature = "sign-spki-p384",
+        feature = "sign-spki-ed25519",
         feature = "sign-spki-rsa"
     )))]
     if sign_type == "spki" {
@@ -567,6 +569,7 @@ fn read_store_file(path: &Path, sign_type: &str, out: &mut Vec<Vec<u8>>) -> crat
     #[cfg(any(
         feature = "sign-spki-p256",
         feature = "sign-spki-p384",
+        feature = "sign-spki-ed25519",
         feature = "sign-spki-rsa"
     ))]
     if sign_type == "spki" {
@@ -576,6 +579,7 @@ fn read_store_file(path: &Path, sign_type: &str, out: &mut Vec<Vec<u8>>) -> crat
     #[cfg(not(any(
         feature = "sign-spki-p256",
         feature = "sign-spki-p384",
+        feature = "sign-spki-ed25519",
         feature = "sign-spki-rsa"
     )))]
     let _ = sign_type;

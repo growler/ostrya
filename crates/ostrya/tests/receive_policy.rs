@@ -693,6 +693,7 @@ fn a_trust_group_key_no_axis_reads_is_refused() {
     #[cfg(any(
         feature = "sign-spki-p256",
         feature = "sign-spki-p384",
+        feature = "sign-spki-ed25519",
         feature = "sign-spki-rsa"
     ))]
     assert!(
@@ -702,6 +703,7 @@ fn a_trust_group_key_no_axis_reads_is_refused() {
     #[cfg(not(any(
         feature = "sign-spki-p256",
         feature = "sign-spki-p384",
+        feature = "sign-spki-ed25519",
         feature = "sign-spki-rsa"
     )))]
     assert!(matches!(err, Error::Unsupported(_)), "{err}");
@@ -910,6 +912,7 @@ fn a_trust_group_gpg_axis_needs_a_certificate() {
 #[cfg(not(any(
     feature = "sign-spki-p256",
     feature = "sign-spki-p384",
+    feature = "sign-spki-ed25519",
     feature = "sign-spki-rsa"
 )))]
 #[test]
@@ -981,6 +984,7 @@ fn a_key_group_file_holds_one_key() {
 #[cfg(not(any(
     feature = "sign-spki-p256",
     feature = "sign-spki-p384",
+    feature = "sign-spki-ed25519",
     feature = "sign-spki-rsa"
 )))]
 #[test]

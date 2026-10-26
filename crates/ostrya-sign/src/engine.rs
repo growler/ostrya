@@ -133,7 +133,8 @@ pub struct SignatureInfo {
     /// The name of the public-key algorithm, if the engine gives one.
     ///
     /// The GPG engine gives the algorithm of the key. The spki engine gives
-    /// the key type, `p256`, `p384`, or `rsa`, for a valid signature alone.
+    /// the key type, `p256`, `p384`, `ed25519`, or `rsa`, for a valid
+    /// signature alone.
     pub pubkey_algorithm: Option<String>,
     /// The name of the digest algorithm, if the engine gives one (GPG).
     pub hash_algorithm: Option<String>,

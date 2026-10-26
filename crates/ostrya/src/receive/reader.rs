@@ -37,6 +37,7 @@ enum KeySpec {
     #[cfg(any(
         feature = "sign-spki-p256",
         feature = "sign-spki-p384",
+        feature = "sign-spki-ed25519",
         feature = "sign-spki-rsa"
     ))]
     Spki {
@@ -190,6 +191,7 @@ fn check_trust(keyfile: &KeyFile, group: &str) -> Result<()> {
     if cfg!(not(any(
         feature = "sign-spki-p256",
         feature = "sign-spki-p384",
+        feature = "sign-spki-ed25519",
         feature = "sign-spki-rsa"
     ))) && names_spki
     {
@@ -292,6 +294,7 @@ fn parse_key(keyfile: &KeyFile, group: &str) -> Result<KeySpec> {
 #[cfg(any(
     feature = "sign-spki-p256",
     feature = "sign-spki-p384",
+    feature = "sign-spki-ed25519",
     feature = "sign-spki-rsa"
 ))]
 fn spki_key(_group: &str, file: String) -> Result<KeySpec> {
@@ -306,6 +309,7 @@ fn spki_key(_group: &str, file: String) -> Result<KeySpec> {
 #[cfg(not(any(
     feature = "sign-spki-p256",
     feature = "sign-spki-p384",
+    feature = "sign-spki-ed25519",
     feature = "sign-spki-rsa"
 )))]
 fn spki_key(group: &str, _file: String) -> Result<KeySpec> {
@@ -355,6 +359,7 @@ async fn build_signers(name: &str, spec: &KeySpec) -> Result<Vec<ServerSigner>> 
         #[cfg(any(
             feature = "sign-spki-p256",
             feature = "sign-spki-p384",
+            feature = "sign-spki-ed25519",
             feature = "sign-spki-rsa"
         ))]
         KeySpec::Spki { file } => secret_key_blocks(file)
@@ -412,6 +417,7 @@ fn read_secret_key_line(path: &str) -> Result<String> {
 #[cfg(any(
     feature = "sign-spki-p256",
     feature = "sign-spki-p384",
+    feature = "sign-spki-ed25519",
     feature = "sign-spki-rsa"
 ))]
 async fn secret_key_blocks(path: &str) -> Result<Vec<crate::spki::SpkiSigner>> {
@@ -428,6 +434,7 @@ async fn secret_key_blocks(path: &str) -> Result<Vec<crate::spki::SpkiSigner>> {
 #[cfg(any(
     feature = "sign-spki-p256",
     feature = "sign-spki-p384",
+    feature = "sign-spki-ed25519",
     feature = "sign-spki-rsa"
 ))]
 fn read_secret_key_blocks(path: &str) -> Result<Vec<crate::spki::SpkiSigner>> {

@@ -404,6 +404,7 @@ pub(crate) const ALL_ENGINES: &[&str] = &[
     #[cfg(any(
         feature = "sign-spki-p256",
         feature = "sign-spki-p384",
+        feature = "sign-spki-ed25519",
         feature = "sign-spki-rsa"
     ))]
     "spki",
@@ -843,6 +844,7 @@ enum Engine {
     #[cfg(any(
         feature = "sign-spki-p256",
         feature = "sign-spki-p384",
+        feature = "sign-spki-ed25519",
         feature = "sign-spki-rsa"
     ))]
     Spki,
@@ -862,6 +864,7 @@ async fn sign_verifier(engine: &str, source: &KeySource<'_>) -> Result<Option<Ar
         #[cfg(any(
             feature = "sign-spki-p256",
             feature = "sign-spki-p384",
+            feature = "sign-spki-ed25519",
             feature = "sign-spki-rsa"
         ))]
         "spki" => Engine::Spki,
@@ -896,6 +899,7 @@ fn build_verifier(kind: Engine, keys: SignKeys) -> Result<Option<Arc<dyn Verifie
         #[cfg(any(
             feature = "sign-spki-p256",
             feature = "sign-spki-p384",
+            feature = "sign-spki-ed25519",
             feature = "sign-spki-rsa"
         ))]
         Engine::Spki => {
@@ -1030,6 +1034,7 @@ fn read_verification_file(engine: &str, path: &str) -> Result<Vec<Vec<u8>>> {
     #[cfg(any(
         feature = "sign-spki-p256",
         feature = "sign-spki-p384",
+        feature = "sign-spki-ed25519",
         feature = "sign-spki-rsa"
     ))]
     if engine == "spki" {

@@ -651,6 +651,7 @@ fn signing_items_resolve_at_their_public_paths() {
     #[cfg(any(
         feature = "sign-spki-p256",
         feature = "sign-spki-p384",
+        feature = "sign-spki-ed25519",
         feature = "sign-spki-rsa"
     ))]
     from_system_keys::<ostrya::spki::SpkiVerifier>();

@@ -4,7 +4,7 @@
 #
 # Usage: [OPENSSL=<path of openssl>] generate.sh <key type>
 #
-# The key type is p256, p384, or rsa. The `OPENSSL` variable names the
+# The key type is p256, p384, ed25519, or rsa. The `OPENSSL` variable names the
 # `openssl` command. The default is the `openssl` command on PATH.
 #
 # The script drives the `ostree` tool as a black box. It signs the commit of
@@ -19,9 +19,10 @@
 # second has a high s (s > n/2). The tests read the s of each signature, so
 # the order is part of the fixture.
 #
-# For rsa (RSA PKCS#1 v1.5 with SHA-256), the commit carries one signature.
-# The signature is deterministic, so `openssl` signs each payload again with
-# the same key and must write the same bytes as the tool.
+# For ed25519 (pure Ed25519) and for rsa (RSA PKCS#1 v1.5 with SHA-256), the
+# commit carries one signature. The signature is deterministic, so `openssl`
+# signs each payload again with the same key and must write the same bytes as
+# the tool.
 #
 # The tool verifies some blobs that no key signed. For this reason `openssl`
 # verifies each signature again over the bytes that it signs.
@@ -41,9 +42,10 @@ die() {
     exit 1
 }
 
-# One case for each key type. `kind` is the signature algorithm, `ecdsa` or
-# `rsa`. `param` is the parameter of the blob check: for ECDSA the order n of
-# the curve in hex, for RSA the length of a signature in bytes.
+# One case for each key type. `kind` is the signature algorithm, `ecdsa`,
+# `ed25519`, or `rsa`. `param` is the parameter of the blob check: for ECDSA
+# the order n of the curve in hex, for Ed25519 and RSA the length of a
+# signature in bytes.
 case "${1:-}" in
     p256)
         kind=ecdsa
@@ -57,6 +59,11 @@ case "${1:-}" in
             -pkeyopt ec_param_enc:named_curve)
         param=FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFC7634D81F4372DDF581A0DB248B0A77AECEC196ACCC52973
         ;;
+    ed25519)
+        kind=ed25519
+        genkey=(genpkey -algorithm ED25519)
+        param=64
+        ;;
     rsa)
         kind=rsa
         bits=2048
@@ -64,7 +71,7 @@ case "${1:-}" in
         param=$((bits / 8))
         ;;
     *)
-        echo "usage: $0 <key type>, where the key type is p256, p384, or rsa" >&2
+        echo "usage: $0 <key type>, where the key type is p256, p384, ed25519, or rsa" >&2
         exit 2
         ;;
 esac
@@ -90,8 +97,8 @@ export OPENSSL_CONF=/dev/null
 # for a superblock it writes the signed superblock bytes to <dir>/payload. It
 # prints one class for each blob, in blob order. For `ecdsa`, it reads each
 # blob as a strict DER ECDSA-Sig-Value, and the class is the s class, `low` or
-# `high`. For `rsa`, the class is the length of the blob in bytes, and the
-# helper fails if the length is not the signature length.
+# `high`. For `ed25519` and `rsa`, the class is the length of the blob in
+# bytes, and the helper fails if the length is not the signature length.
 cat >"$WORK/sigs.py" <<'PY'
 import sys
 
@@ -169,7 +176,7 @@ if data.startswith(b"OSTSGNDT"):
 
 def length_class(blob):
     if len(blob) != int(param):
-        fail(f"an RSA signature of {len(blob)} bytes, not {param}")
+        fail(f"a {kind} signature of {len(blob)} bytes, not {param}")
     return str(len(blob))
 
 classes = []
@@ -187,17 +194,28 @@ classify() {
 
 # Prints the classes of the blobs in the file $1, after `openssl` verifies
 # each blob over the file $2. Without $2, the data is the signed superblock
-# payload. For RSA, `openssl` also signs the data, and its signature must be
-# the same bytes as each blob.
+# payload. For Ed25519 and RSA, `openssl` also signs the data, and its
+# signature must be the same bytes as each blob. Ed25519 signs the data
+# itself, with `pkeyutl -rawin`. ECDSA and RSA sign the SHA-256 of the data.
 verify() {
     local classes sig data=${2:-$WORK/blobs/payload}
     classes=$(classify "$1")
     for sig in "$WORK"/blobs/sig*.der; do
-        [ "$("$O" dgst -sha256 -verify "$WORK/public.pem" -signature "$sig" \
-            "$data")" = "Verified OK" ] ||
-            die "openssl does not verify $sig of $1"
+        if [ "$kind" = ed25519 ]; then
+            [ "$("$O" pkeyutl -verify -rawin -pubin -inkey "$WORK/public.pem" \
+                -sigfile "$sig" -in "$data")" = "Signature Verified Successfully" ] ||
+                die "openssl does not verify $sig of $1"
+            "$O" pkeyutl -sign -rawin -inkey "$WORK/secret.pem" -in "$data" \
+                -out "$WORK/openssl.sig"
+        else
+            [ "$("$O" dgst -sha256 -verify "$WORK/public.pem" -signature "$sig" \
+                "$data")" = "Verified OK" ] ||
+                die "openssl does not verify $sig of $1"
+        fi
         if [ "$kind" = rsa ]; then
             "$O" dgst -sha256 -sign "$WORK/secret.pem" -out "$WORK/openssl.sig" "$data"
+        fi
+        if [ "$kind" != ecdsa ]; then
             cmp -s "$WORK/openssl.sig" "$sig" ||
                 die "the openssl signature is not the same as $sig of $1"
         fi
@@ -230,8 +248,8 @@ META="$REPO/objects/${C:0:2}/${C:2}.commitmeta"
 sign() { ostree --repo="$REPO" sign -s spki --keys-file="$WORK/secret.pem" "$C"; }
 
 # The commit signatures. For ECDSA: one with a low s, then one with a high s.
-# The tool appends each signature to the detached metadata. For RSA: one
-# signature.
+# The tool appends each signature to the detached metadata. For Ed25519 and
+# RSA: one signature.
 if [ "$kind" = ecdsa ]; then
     for ((i = 1; ; i++)); do
         ((i <= TRIES)) || die "no low-s signature in $TRIES tries"
@@ -253,9 +271,9 @@ else
     sign
 fi
 commit_classes=$(verify "$META" "$OBJ")
-if [ "$kind" = rsa ]; then
+if [ "$kind" != ecdsa ]; then
     [ "$commit_classes" = "$param" ] ||
-        die "the commit does not hold one RSA signature: '$commit_classes'"
+        die "the commit does not hold one $kind signature: '$commit_classes'"
 fi
 
 # The delta from scratch, in the default layout of a superblock and parts.

@@ -1902,8 +1902,9 @@ signature blobs:
 
 - `ostree.gpgsigs` -- OpenPGP detached-signature blobs over the commit bytes.
 - `ostree.sign.ed25519` -- raw 64-byte ed25519 signatures.
-- `ostree.sign.spki` -- SPKI signatures: ECDSA over P-256 or P-384, or RSA
-  PKCS#1 v1.5. The tool carries this engine only in a build with OpenSSL.
+- `ostree.sign.spki` -- SPKI signatures: ECDSA over P-256 or P-384, Ed25519,
+  or RSA PKCS#1 v1.5. The tool carries this engine only in a build with
+  OpenSSL.
 - `ostree.sign.dummy` -- the test engine.
 
 ### Signing sequence
@@ -1958,6 +1959,10 @@ other engines. The key type selects the algorithm and the signature form:
   bytes. The port signs the SHA-256 of the data with RFC 6979
   nonces that HMAC-SHA-384 makes from this hash, so its signatures differ
   from the RFC 6979 test vectors for P-384 with SHA-256.
+- Ed25519: pure Ed25519 of RFC 8032, with no prehash and no context. The key
+  signs the data itself. The signature is 64 bytes, `R || S`, and the form
+  is deterministic. The ed25519 engine writes the same bytes for the same
+  seed and the same data, under the key `ostree.sign.ed25519`.
 - RSA: RSASSA-PKCS1-v1_5 with SHA-256. The signature is the raw signature, an
   unsigned big-endian integer with the length of the modulus in bytes, for
   example 256 bytes for a 2048-bit key. The signature form is deterministic.
@@ -1971,7 +1976,10 @@ key, the form is DER, and the parse is strict: a blob with bytes after the
 not parse. Each of the two integers must fit the field of the curve of the
 key, 32 bytes for P-256 and 48 bytes for P-384. So a P-384 key also tries a
 DER blob whose integers fit 32 bytes, such as the signature of a P-256 key.
-This verify fails, and the result does not change. An RSA key tries a blob
+This verify fails, and the result does not change. An Ed25519 key tries a
+blob of 64 bytes, and no other blob. It checks `[S]B = R + [k]A` with no
+cofactor, refuses an `S` that is not below the group order, and accepts a
+public key of small order. An RSA key tries a blob
 whose length is the length of its modulus, and no other blob. A store can hold keys of each type together. A blob
 is valid only when a trusted key verifies it. A blob that no trusted key
 verifies is not valid. It is not an error, because the commit can carry other
@@ -1983,8 +1991,12 @@ A public key is the X.509 SubjectPublicKeyInfo DER, the base64 body of a PEM
 `PUBLIC KEY` block. The EC point in it is compressed (first byte `02` or
 `03`) or uncompressed (first byte `04`). The port refuses each other point
 form, such as the compact form (first byte `05`). A raw SEC1 point is not a
-public key. The key of an RSA SubjectPublicKeyInfo is a PKCS#1
-`RSAPublicKey` DER, the modulus and the public exponent.
+public key. The key of an Ed25519 SubjectPublicKeyInfo is 32 bytes that must
+decode to a point on the curve. The port also accepts the encodings that
+RFC 8032 refuses: a y coordinate that is not below p, and x = 0 with the sign
+bit set. The port keeps the 32 bytes as they are given. The key of an RSA
+SubjectPublicKeyInfo is a PKCS#1 `RSAPublicKey` DER, the modulus and the
+public exponent.
 
 A secret key is one of these forms:
 
@@ -1999,6 +2011,17 @@ PKCS#8 key holds an `AlgorithmIdentifier`, a PKCS#1 key holds the modulus,
 an `INTEGER`, and a SEC1 key holds the secret scalar in an `OCTET STRING`.
 The version of a PKCS#1 key is 0 for two primes and 1 for more primes. A raw
 32-byte scalar is refused.
+
+An Ed25519 secret key is a PKCS#8 key alone. Its `privateKey` `OCTET STRING`
+holds an `OCTET STRING` of the 32-byte seed. A key of version 1, with the
+`version` 0, holds no public key. A key of version 2, with the `version` 1,
+holds the public key of the seed in its `[1]` field. Both forms give the
+same key and the same signatures. The port refuses a key of version 2 whose
+public key is not the public key of the seed, by a compare of the 32 bytes.
+It refuses a key of version 1 with a public key, a key of version 2 with no
+public key, a bare seed in the `privateKey` field, and a seed that is not 32
+bytes. A raw 32-byte seed, the `OCTET STRING` of the seed alone, and the
+64-byte secret key of the ed25519 engine are in no accepted form.
 
 The `privateKey` `OCTET STRING` of a SEC1 key holds the secret scalar as an
 unsigned big-endian integer. It can be shorter than the field size of the
@@ -2015,6 +2038,7 @@ type. For an EC key, the curve OID in the `parameters` field of the
 - `id-ecPublicKey` (1.2.840.10045.2.1) on the curve `prime256v1`
   (1.2.840.10045.3.1.7);
 - `id-ecPublicKey` on the curve `secp384r1` (1.3.132.0.34);
+- `id-Ed25519` (1.3.101.112) with no `parameters` field;
 - `rsaEncryption` (1.2.840.113549.1.1.1) with `NULL` parameters, with a
   modulus of 2048 to 16384 bits. The secret key has two primes. The public
   key of a key of more primes is a modulus and an exponent, and the engine
@@ -2023,10 +2047,13 @@ type. For an EC key, the curve OID in the `parameters` field of the
 The port refuses these keys:
 
 - a key of another type, for example RSASSA-PSS (1.2.840.113549.1.1.10) or
-  Ed25519 (1.3.101.112);
+  Ed448 (1.3.101.113);
 - a key of a type that the build has no code for. A build has the code for
   P-256 with the feature `sign-spki-p256`, for P-384 with the feature
-  `sign-spki-p384`, and for RSA with the feature `sign-spki-rsa`;
+  `sign-spki-p384`, for Ed25519 with the feature `sign-spki-ed25519`, and for
+  RSA with the feature `sign-spki-rsa`;
+- an `id-Ed25519` key with a `parameters` field, for example a `NULL`, in a
+  SubjectPublicKeyInfo and in a PKCS#8 key;
 - an `rsaEncryption` key with no `parameters` field, or with a value other
   than `NULL` in it;
 - an RSA key with a modulus of fewer than 2048 bits or more than 16384 bits;
@@ -2056,10 +2083,15 @@ The key store has the layout of the ed25519 store: `trusted.spki`,
 `<datadir>/ostree`. Its effective trusted set is also the trusted set minus
 the revoked set. The port compares a trusted key with a revoked key by the
 decoded key: it encodes the SubjectPublicKeyInfo DER of each key again, with
-an uncompressed EC point, or with `NULL` parameters and the modulus and the
-exponent of an RSA key, and compares these bytes. So the compressed and the
-uncompressed form of one key match, and two RSA keys of one modulus and one
-exponent match.
+an uncompressed EC point, with no parameters and the 32 bytes of an Ed25519
+key, or with `NULL` parameters and the modulus and the exponent of an RSA
+key, and compares these bytes. So the compressed and the uncompressed form of
+one key match, and two RSA keys of one modulus and one exponent match. The
+DER of an Ed25519 key holds the 32 bytes of the key as they were given. The
+port does not encode the point again, so two encodings of one point, such as
+a canonical encoding and an encoding with a y coordinate of p or more, do
+not match. The fingerprint of a verified signature is the SHA-256 of the
+same DER.
 
 An inline secret key, as a positional key of `sign` or the value of a
 `--sign`, is the base64 of the secret key DER. The base64 text can hold the
@@ -2116,7 +2148,7 @@ set. `conformance/cli-surface.md`, "P2", `static-delta`, records the
 differences from the tool.
 
 A secret key file holds PEM `PRIVATE KEY` blocks, and each block holds one
-PKCS#8 `PrivateKeyInfo` DER of a P-256, a P-384, or an RSA key. Each block
+PKCS#8 `PrivateKeyInfo` DER of a P-256, a P-384, an Ed25519, or an RSA key. Each block
 gives one signer, in the order of the file. These files are secret key files: a `--keys-file` of
 `sign`, of `summary`, and of `remote summary -u`, a `--sign-from-file` of
 `commit` under `--sign-type=spki`, and the `secret-key-file` of an
@@ -2154,7 +2186,9 @@ Each line gives one signer, in the order of the file, after the signers of
 Design target: the public ostree documentation gives the public key container
 and the key store layout. The curve, the hash, the DER signature encoding, and
 the key DER containers are the standard OpenSSL and RFC forms. The RSA
-signature and the RSA key structures are those of RFC 8017.
+signature and the RSA key structures are those of RFC 8017. The Ed25519
+signature is that of RFC 8032, and the Ed25519 key structures are those of
+RFC 8410.
 
 ### GPG
 

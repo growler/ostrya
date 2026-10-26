@@ -212,7 +212,8 @@ and the tests that read them do not need the `ostree` tool.
   `tls/generate.sh` writes them, separately from `generate.sh`. Run it only
   to replace the certificates. Their validity is 100 years.
 - `spki/<type>/` -- the spki signature fixtures of one key type, now `p256`,
-  `p384`, and `rsa`. `spki/generate.sh` writes them, separately from `generate.sh`.
+  `p384`, `ed25519`, and `rsa`. `spki/generate.sh` writes them, separately
+  from `generate.sh`.
   `spki/.gitattributes` marks the repository objects, the deltas, the delta
   indexes, and the two `summary` files as binary.
 - `spki/keys/` -- the key files of the tests of the spki engine.
@@ -252,7 +253,7 @@ Each `spki/<type>/` directory holds one key type. It holds these files:
 - `repo/` -- a copy of `generated/archive/repo`, to which the tool added
   these items:
   - the `.commitmeta` of the commit, with two spki signatures for `p256`
-    and `p384`, and one for `rsa`;
+    and `p384`, and one for `ed25519` and `rsa`;
   - a signed static delta from scratch to the commit, in the layout of a
     superblock and one part;
   - the delta index in `delta-indexes/`;
@@ -260,29 +261,31 @@ Each `spki/<type>/` directory holds one key type. It holds these files:
   - the key `indexed-deltas=true` in `config`.
 - `MANIFEST` -- the key type, the `ostree` and `openssl` versions, the
   commit, the delta, and the class of each signature. For `p256` and
-  `p384`, the class is the s class (`low` or `high`). For `rsa`, the class is the length of the
-  signature in bytes, `256`, and `modulus_bits` gives the size of the key,
-  2048 bits.
+  `p384`, the class is the s class (`low` or `high`). For `ed25519`, the
+  class is the length of the signature in bytes, `64`. For `rsa`, the class
+  is the length of the signature in bytes, `256`, and `modulus_bits` gives
+  the size of the key, 2048 bits.
 
 The tool read a different signing input for each signature. For the commit,
 `ostree sign --keys-file` read `secret.pem`. For the delta and the summary,
 `--sign` read the base64 body of `secret.pem` inline.
 
 These fixtures are separate from `generate.sh`. Each run makes a new key,
-and ECDSA takes a random nonce for each signature. RSA PKCS#1 v1.5 is
-deterministic, but its key is also new in each run. Thus a run cannot write
+and ECDSA takes a random nonce for each signature. Ed25519 and RSA PKCS#1
+v1.5 are deterministic, but their key is also new in each run. Thus a run cannot write
 the same bytes again. Run the script only to replace the fixtures of one key
 type. The script deletes and writes `spki/<type>/` alone:
 
 ```sh
 tests/fixtures/spki/generate.sh p256
 OPENSSL=/path/to/openssl tests/fixtures/spki/generate.sh p384
+OPENSSL=/path/to/openssl tests/fixtures/spki/generate.sh ed25519
 OPENSSL=/path/to/openssl tests/fixtures/spki/generate.sh rsa
 ```
 
 The `OPENSSL` variable names the `openssl` command. The default is the
-`openssl` command on `PATH`. Run `p384` and `rsa` with OpenSSL 3.6.4, the
-library that the tool on the NixOS development host links.
+`openssl` command on `PATH`. Run `p384`, `ed25519`, and `rsa` with OpenSSL
+3.6.4, the library that the tool on the NixOS development host links.
 
 The script needs an `ostree` build that shows `openssl` and `sign-spki` in
 `ostree --version`. The build on the NixOS development host has both. If one
@@ -297,9 +300,14 @@ The script makes these checks, and it stops if one fails:
   object, the `summary` file, and the superblock bytes in the signed
   envelope. The `ostree` verify accepts blobs that no key signed, so this
   check does not use the tool.
-- For `rsa`, `openssl dgst -sha256 -sign` signs the same bytes with
-  `secret.pem`. Its signature must be the same bytes as the signature of the
-  tool.
+- For `ed25519`, `openssl pkeyutl -verify -rawin` verifies each signature
+  over the bytes themselves. ECDSA and RSA verify with `openssl dgst
+  -sha256`.
+- For `ed25519`, `openssl pkeyutl -sign -rawin` signs the same bytes with
+  `secret.pem`. For `rsa`, `openssl dgst -sha256 -sign` signs them. The
+  signature must be the same bytes as the signature of the tool.
+- For `ed25519`, each signature is 64 bytes, and the commit holds one
+  signature.
 - For `rsa`, the key has 2048 bits, each signature is 256 bytes, and the
   commit holds one signature.
 - The delta and the summary each hold one signature.
@@ -327,9 +335,9 @@ digest. The key of the `p384` fixture is not the P-384 key of the unit
 tests. The `p384` tests use that key, the key of RFC 6979, appendix A.2.6,
 as a key that signed no fixture.
 
-RSA has no s class. The `rsa` case of the script sets `kind=rsa`. The
-script signs the commit one time, and the class of each signature is its
-length in bytes.
+Ed25519 and RSA have no s class. The `ed25519` case of the script sets
+`kind=ed25519`, and the `rsa` case sets `kind=rsa`. The script signs the
+commit one time, and the class of each signature is its length in bytes.
 
 A later ECDSA curve adds these items:
 
@@ -343,22 +351,24 @@ A later ECDSA curve adds these items:
 
 The tests are in `crates/ostrya/tests/sign_spki_fixtures.rs`. The `cfg` of
 the file is an `any()` list of the key features. The tests of each key type
-are in one module, `p256`, `p384`, or `rsa`, under the `cfg` of its key
-feature. The
-items that the modules share are at the top level of the file. Run the tests
-of each key type with its key feature:
+are in one module, `p256`, `p384`, `ed25519`, or `rsa`, under the `cfg` of
+its key feature. The items that the modules share are at the top level of
+the file. Run the tests of each key type with its key feature:
 
 ```sh
 cargo test -p ostrya --no-default-features --features smol,sign-spki-p256 \
     --test sign_spki_fixtures
 cargo test -p ostrya --no-default-features --features smol,sign-spki-p384 \
     --test sign_spki_fixtures
+cargo test -p ostrya --no-default-features --features smol,sign-spki-ed25519 \
+    --test sign_spki_fixtures
 cargo test -p ostrya --no-default-features --features smol,sign-spki-rsa \
     --test sign_spki_fixtures
 ```
 
-RSA PKCS#1 v1.5 is deterministic. Thus the `rsa` tests also sign with the
-port and compare the bytes with the signatures of the tool:
+Ed25519 and RSA PKCS#1 v1.5 are deterministic. Thus the `ed25519` and `rsa`
+tests also sign with the port and compare the bytes with the signatures of
+the tool:
 
 - The port signs the commit in a copy of the fixture repository, without
   the `.commitmeta` of the tool. The signature and the whole `.commitmeta`
@@ -369,7 +379,8 @@ port and compare the bytes with the signatures of the tool:
 
 The key of the `rsa` fixture is not one of the keys in `spki/keys/`. The
 `rsa` tests use `spki/keys/rsa-2048.pub.pem` as a key that signed no
-fixture.
+fixture. The `ed25519` tests use the public key of test 1 in RFC 8032, a
+constant in the tests, as a key that signed no fixture.
 
 ### The spki key fixtures
 

@@ -26,7 +26,8 @@ API documentation: <https://docs.rs/ostrya-sign>
 - `smol` (default): with `sign-gpg`, `GpgSigner` runs `gpg` on `smol`.
 - `tokio`: with `sign-gpg`, `GpgSigner` runs `gpg` on `tokio`.
 - `sign-spki`: the spki engine with each of its key types. It turns on
-  `sign-spki-p256`, `sign-spki-p384`, and `sign-spki-rsa`.
+  `sign-spki-p256`, `sign-spki-p384`, `sign-spki-ed25519`, and
+  `sign-spki-rsa`.
 - `sign-spki-p256`: the spki engine with the ECDSA P-256 key type. The
   engine is `SpkiSigner` and `SpkiVerifier`, `spki_public_keys`, which
   reads the keys of a public key file, `spki_secret_keys`, which reads the
@@ -34,9 +35,12 @@ API documentation: <https://docs.rs/ostrya-sign>
   reads the signers of a file of base64 key lines.
 - `sign-spki-p384`: the spki engine with the ECDSA P-384 key type, ECDSA
   signatures with SHA-256. The engine has the items of `sign-spki-p256`.
+- `sign-spki-ed25519`: the spki engine with the Ed25519 key type, pure
+  Ed25519 signatures of RFC 8032. The engine has the items of
+  `sign-spki-p256`. The ed25519 engine needs no feature.
 - `sign-spki-rsa`: the spki engine with the RSA key type, PKCS#1 v1.5
   signatures with SHA-256. The engine has the items of `sign-spki-p256`.
-  A build without one of the three key features refuses a key of that
+  A build without one of the four key features refuses a key of that
   type, with a message that names its feature.
 - `sign-gpg`: `GpgSigner`, which signs with the `gpg` command.
 

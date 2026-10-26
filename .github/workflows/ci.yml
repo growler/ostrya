@@ -250,6 +250,12 @@ jobs:
         run: cargo test -p ostrya-sign --no-default-features --features sign-spki-p384 --lib
       - name: The spki tests pass with the P-384 key feature alone
         run: cargo test -p ostrya --no-default-features --features smol,sign-spki-p384 --test sign_spki_p384 --test sign_spki_fixtures
+      - name: ostrya-sign with the Ed25519 key feature alone compiles
+        run: cargo clippy -p ostrya-sign --no-default-features --features sign-spki-ed25519 --all-targets -- -D warnings
+      - name: The ostrya-sign unit tests pass with the Ed25519 key feature alone
+        run: cargo test -p ostrya-sign --no-default-features --features sign-spki-ed25519 --lib
+      - name: The spki tests pass with the Ed25519 key feature alone
+        run: cargo test -p ostrya --no-default-features --features smol,sign-spki-ed25519 --test sign_spki_ed25519 --test sign_spki_fixtures
       - name: ostrya-sign with the RSA key feature alone compiles
         run: cargo clippy -p ostrya-sign --no-default-features --features sign-spki-rsa --all-targets -- -D warnings
       - name: The ostrya-sign unit tests pass with the RSA key feature alone

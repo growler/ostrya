@@ -62,7 +62,8 @@ feature set and its graph.
   dependencies and no `unsafe`. The port reads the streams with its own
   bspatch.
 - `smol-tar` -- async tar import and export.
-- `ed25519-dalek` -- the ed25519 sign engine, in `ostrya-sign`.
+- `ed25519-dalek` -- the ed25519 sign engine and the Ed25519 key type of the
+  spki sign engine, in `ostrya-sign`.
 - `p256` -- the spki sign engine, in `ostrya-sign`.
 - `pgp` -- OpenPGP keyring parsing and signature verification.
 - `hyper` -- the HTTP/1.1 and HTTP/2 engine of `ostrya-fetch` and
@@ -174,12 +175,14 @@ ostree-podman sends the namespaces of podman, which are not its own.
 
 ## The spki sign engine
 
-The spki engine is pure Rust. It has three key types: ECDSA on NIST P-256
-with SHA-256 over `p256`, ECDSA on NIST P-384 with SHA-256 over `p384`, and
-RSA PKCS#1 v1.5 with SHA-256 over `rsa` 0.9.10. The engine signs ECDSA with
-RFC 6979 nonces, so one key and one data give the same signature bytes. The `ostree` command builds this engine only with OpenSSL,
+The spki engine is pure Rust. It has four key types: ECDSA on NIST P-256
+with SHA-256 over `p256`, ECDSA on NIST P-384 with SHA-256 over `p384`,
+pure Ed25519 over `ed25519-dalek`, and RSA PKCS#1 v1.5 with SHA-256 over
+`rsa` 0.9.10. The engine signs ECDSA with RFC 6979 nonces, so one key and
+one data give the same signature bytes. The `ostree` command builds this engine only with OpenSSL,
 and it signs ECDSA with a random nonce. The two forms verify the same way.
-RSASSA-PKCS1-v1_5 (RFC 8017) is deterministic on both sides.
+Ed25519 (RFC 8032) and RSASSA-PKCS1-v1_5 (RFC 8017) are deterministic on
+both sides.
 
 The `ostree` command signs ECDSA with SHA-256 on each curve, also on P-384.
 The default `Signer` and `Verifier` of `p384` hash the data with SHA-384, so
@@ -190,6 +193,21 @@ bytes for one key and one data, and it differs from the RFC 6979 test vectors
 for P-384 with SHA-256, which use HMAC-SHA-256. The verify does not depend on
 the nonce. A round trip of the port alone does not find a wrong digest, so
 the P-384 fixtures that the `ostree` command signs are part of the tests.
+
+An Ed25519 key signs the data itself, with no prehash and no context. The
+signature is 64 bytes, `R || S`. The verify is `VerifyingKey::verify` of
+`ed25519-dalek`, the verify of the ed25519 engine. It checks `[S]B = R +
+[k]A` with no cofactor, refuses an `S` that is not below the group order,
+and accepts a public key of small order. The `ostree` command gives the same
+result for each of these cases. `verify_strict` was rejected: it refuses a
+public key of small order, which the `ostree` command accepts. The ed25519
+engine and the Ed25519 key type of the spki engine share no code. They write
+the same bytes for one seed and one data, under two metadata keys, and the
+verifier of each engine trusts only the keys of its own engine. The feature
+`pkcs8` of `ed25519-dalek` reads the SubjectPublicKeyInfo of a key and
+writes it again. The engine reads the fields of a PKCS#8 key itself, because
+the `KeypairBytes` of `ed25519` wipes its copy of the seed only with a
+feature that the build does not turn on.
 
 The RSA signer blinds each private-key operation with a random value from the
 operating system. The blinding does not change the signature. RUSTSEC-2023-0071
@@ -233,8 +251,9 @@ types share -- the PEM splitter, the OID dispatch, and the key file readers --
 compiles when one key feature is on. This code takes `der`, `spki`, `pkcs8`,
 and `pem-rfc7468` as direct dependencies, and not through the re-exports of
 `p256`, so a key type that does not use `p256` builds the engine with no
-`p256`. `sign-spki-p384` gates the P-384 key type, and `sign-spki-rsa` gates
-the RSA key type. A build with one of the two alone has no `p256`. A build with no key feature has no ECDSA crate tree. The gates of the
+`p256`. `sign-spki-p384` gates the P-384 key type, `sign-spki-ed25519`
+gates the Ed25519 key type, and `sign-spki-rsa` gates the RSA key type. A
+build with one of the three alone has no `p256`. A build with no key feature has no ECDSA crate tree. The gates of the
 shared code take the form `any(feature = ...)` over the key features, so each
 key feature adds one item to each gate. `ostrya` and `ostrya-sign` allow the
 clippy lint `non_minimal_cfg`, which refuses a gate of this form with one
@@ -244,7 +263,8 @@ private cfg adds a build script to two crates.
 
 A build without a key type refuses a key of that type, with the
 `Error::Signature` message `this build has no code for <the key type RSA |
-the curve P-256 | the curve P-384>; build with the <feature> feature`. A signature of that type
+the key type Ed25519 | the curve P-256 | the curve P-384>; build with the
+<feature> feature`. A signature of that type
 is a blob that no trusted key verifies. A revoked key that the build cannot
 read refuses the key store, so the revocation fails closed.
 
@@ -262,8 +282,11 @@ records the observed results.
 
 The revocation compare and the fingerprint use one rule. The port encodes the
 SubjectPublicKeyInfo DER of a key again from the decoded key, with an
-uncompressed EC point, or with `rsaEncryption` and `NULL` parameters for an
-RSA key. A trusted key whose DER is in the revoked set is not
+uncompressed EC point, with `id-Ed25519` and no parameters for an Ed25519
+key, or with `rsaEncryption` and `NULL` parameters for an RSA key. The DER of
+an Ed25519 key holds the 32 bytes of the key as they were given: the port
+does not encode the point again, so a non-canonical encoding of a point is a
+key of its own. A trusted key whose DER is in the revoked set is not
 trusted. The fingerprint of a verified signature is the SHA-256 of this DER
 in lowercase hex. So two forms of one key give one key and one fingerprint. A
 compare of the typed values of each key type was rejected: the DER is a
@@ -293,9 +316,10 @@ sign future in `ostrya-sign` that moves the work to the blocking pool was
 rejected, because the engine then needs a runtime.
 
 The spki verifier computes the SHA-256 of the data one time for each call,
-when the first trusted key tries a blob. Each key verifies the blob with this
-hash. A store of many keys then hashes a commit one time, and a blob that no
-key tries computes no hash.
+when the first ECDSA or RSA key tries a blob. Each of these keys verifies the
+blob with this hash. A store of many keys then hashes a commit one time, and
+a blob that no key tries computes no hash. An Ed25519 key verifies with the
+data and computes no SHA-256.
 
 ## GPG
 

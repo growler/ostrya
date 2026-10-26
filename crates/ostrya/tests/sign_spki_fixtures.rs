@@ -1,7 +1,7 @@
 //! Integration tests that verify spki signatures that the `ostree` tool wrote.
 //!
 //! The fixtures are in `tests/fixtures/spki/<key type>/`, where the key type is
-//! `p256`, `p384`, or `rsa`. Each fixture holds a key pair and a copy of the `archive`
+//! `p256`, `p384`, `ed25519`, or `rsa`. Each fixture holds a key pair and a copy of the `archive`
 //! fixture repository. The `ostree` tool signed the commit of the repository,
 //! and wrote a signed static delta and a signed summary. The script
 //! `tests/fixtures/spki/generate.sh` wrote the fixtures.
@@ -12,10 +12,10 @@
 //! - `p256` and `p384`: the tool signed the commit two times. The first
 //!   signature has a low s, and the second has a high s. The tests verify
 //!   each signature.
-//! - `rsa`: the tool signed the commit one time. RSA PKCS#1 v1.5 is
-//!   deterministic. Thus the tests also sign the commit, the summary, and the
-//!   superblock with the port, and compare the bytes with the signatures of
-//!   the tool.
+//! - `ed25519` and `rsa`: the tool signed the commit one time. Ed25519 and
+//!   RSA PKCS#1 v1.5 are deterministic. Thus the tests also sign the commit,
+//!   the summary, and the superblock with the port, and compare the bytes with
+//!   the signatures of the tool.
 //!
 //! The tests do not make the fixtures again. Each run of the script makes a
 //! new key, so a run gives new bytes. The fixtures are committed, and the
@@ -24,6 +24,7 @@
 #![cfg(any(
     feature = "sign-spki-p256",
     feature = "sign-spki-p384",
+    feature = "sign-spki-ed25519",
     feature = "sign-spki-rsa"
 ))]
 
@@ -100,6 +101,43 @@ fn spki_blobs(dict: &Value) -> Vec<Vec<u8>> {
         .iter()
         .map(|blob| blob.as_bytes().expect("a blob is a byte string").to_vec())
         .collect()
+}
+
+/// Returns the path of the `.commitmeta` of the fixture commit, relative to
+/// the repository.
+#[cfg(any(feature = "sign-spki-ed25519", feature = "sign-spki-rsa"))]
+fn commitmeta_path() -> String {
+    format!("objects/{}/{}.commitmeta", &COMMIT[..2], &COMMIT[2..])
+}
+
+/// Reads the signed superblock of the delta in the repository `root`.
+/// Returns the superblock bytes that the signatures sign, and the spki
+/// blobs.
+#[cfg(any(feature = "sign-spki-ed25519", feature = "sign-spki-rsa"))]
+fn read_signed_superblock(root: &std::path::Path) -> (Vec<u8>, Vec<Vec<u8>>) {
+    let path = root
+        .join(static_delta_relative_dir(None, &commit()))
+        .join("superblock");
+    let bytes = std::fs::read(path).unwrap();
+    let value = ostrya::from_bytes(&ostrya::Type::parse("(taya{sv})").unwrap(), &bytes).unwrap();
+    let fields = value.as_tuple().expect("the superblock is a tuple");
+    let payload = fields[1]
+        .as_bytes()
+        .expect("the signed superblock is a byte string")
+        .to_vec();
+    (payload, spki_blobs(&fields[2]))
+}
+
+/// Copies a directory tree with its attributes (`cp -a`).
+#[cfg(any(feature = "sign-spki-ed25519", feature = "sign-spki-rsa"))]
+fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
+    let status = std::process::Command::new("cp")
+        .args(["-a"])
+        .arg(from)
+        .arg(to)
+        .status()
+        .expect("run cp");
+    assert!(status.success(), "cp -a {from:?} {to:?} failed");
 }
 
 /// Returns `true` if the s of the DER ECDSA-Sig-Value `der` is greater than
@@ -430,11 +468,201 @@ mod p384 {
     }
 }
 
+#[cfg(feature = "sign-spki-ed25519")]
+mod ed25519 {
+    use super::*;
+    use common::TmpDir;
+    use ostrya::{Signer, Type, from_bytes};
+
+    /// The key type of the fixture.
+    const TYPE: &str = "ed25519";
+
+    /// The length in bytes of an Ed25519 signature.
+    const SIGNATURE_LEN: usize = 64;
+
+    /// The SubjectPublicKeyInfo DER of an Ed25519 key before its 32 key bytes:
+    /// the algorithm `id-Ed25519` with no parameters.
+    const SPKI_PREFIX: [u8; 12] = [
+        0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
+    ];
+
+    /// An Ed25519 public key that signed no fixture: the key of test 1 in
+    /// RFC 8032.
+    const OTHER_PUBLIC_KEY: [u8; 32] = [
+        0xd7, 0x5a, 0x98, 0x01, 0x82, 0xb1, 0x0a, 0xb7, 0xd5, 0x4b, 0xfe, 0xd3, 0xc9, 0x64, 0x07,
+        0x3a, 0x0e, 0xe1, 0x72, 0xf3, 0xda, 0xa6, 0x23, 0x25, 0xaf, 0x02, 0x1a, 0x68, 0xf7, 0x07,
+        0x51, 0x1a,
+    ];
+
+    /// Returns a verifier that trusts a key that signed no fixture.
+    fn stranger_verifier() -> SpkiVerifier {
+        SpkiVerifier::new(
+            [[&SPKI_PREFIX[..], &OTHER_PUBLIC_KEY].concat()],
+            Vec::<Vec<u8>>::new(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn ed25519_fixture_keys_are_one_pair() {
+        assert_fixture_keys_are_one_pair(TYPE);
+    }
+
+    #[test]
+    fn ed25519_tool_commit_verifies() {
+        block_on(async {
+            let repo = Repo::open(&fixture_dir(TYPE).join("repo")).await.unwrap();
+            let dict = repo
+                .read_commit_detached_metadata(&commit())
+                .await
+                .unwrap()
+                .expect("the commit has detached metadata");
+            let blobs = spki_blobs(&dict);
+            assert_eq!(blobs.len(), 1, "{}", regenerate(TYPE));
+            assert_eq!(blobs[0].len(), SIGNATURE_LEN, "{}", regenerate(TYPE));
+
+            let fingerprint = Checksum::sha256(&fixture_signer(TYPE).public_key_der()).to_hex();
+            let outcome = repo
+                .verify_commit(&commit(), &[&fixture_verifier(TYPE)])
+                .await
+                .unwrap();
+            assert!(outcome.valid);
+            assert_eq!(outcome.signatures.len(), 1);
+            let info = &outcome.signatures[0];
+            assert!(info.valid);
+            assert_eq!(info.pubkey_algorithm.as_deref(), Some("ed25519"));
+            assert_eq!(info.fingerprint.as_deref(), Some(fingerprint.as_str()));
+
+            let outcome = repo
+                .verify_commit(&commit(), &[&stranger_verifier()])
+                .await
+                .unwrap();
+            assert!(
+                !outcome.valid,
+                "a key that signed no fixture must not verify"
+            );
+            assert_eq!(outcome.signatures.len(), 1);
+            assert!(outcome.signatures[0].key_missing);
+            assert!(!outcome.signatures[0].valid);
+        });
+    }
+
+    #[test]
+    fn ed25519_tool_summary_verifies() {
+        block_on(async {
+            let repo = Repo::open(&fixture_dir(TYPE).join("repo")).await.unwrap();
+            let outcome = repo
+                .verify_summary(&[&fixture_verifier(TYPE)])
+                .await
+                .unwrap();
+            assert!(outcome.valid);
+            assert_eq!(outcome.signatures.len(), 1, "{}", regenerate(TYPE));
+            assert!(outcome.signatures[0].valid);
+
+            let outcome = repo.verify_summary(&[&stranger_verifier()]).await.unwrap();
+            assert!(
+                !outcome.valid,
+                "a key that signed no fixture must not verify"
+            );
+            assert_eq!(outcome.signatures.len(), 1);
+            assert!(!outcome.signatures[0].valid);
+        });
+    }
+
+    #[test]
+    fn ed25519_tool_delta_verifies() {
+        block_on(async {
+            let root = fixture_dir(TYPE).join("repo");
+            let repo = Repo::open(&root).await.unwrap();
+            let dir = root.join(static_delta_relative_dir(None, &commit()));
+            let outcome = repo
+                .verify_static_delta(&dir, &[&fixture_verifier(TYPE)])
+                .await
+                .unwrap();
+            assert!(outcome.valid);
+            assert_eq!(outcome.signatures.len(), 1, "{}", regenerate(TYPE));
+            assert!(outcome.signatures[0].valid);
+
+            let outcome = repo
+                .verify_static_delta(&dir, &[&stranger_verifier()])
+                .await
+                .unwrap();
+            assert!(
+                !outcome.valid,
+                "a key that signed no fixture must not verify"
+            );
+            assert_eq!(outcome.signatures.len(), 1);
+            assert!(!outcome.signatures[0].valid);
+        });
+    }
+
+    /// The port signs the commit of a copy of the fixture with the fixture
+    /// key. Ed25519 is deterministic, so the signature and the whole
+    /// `.commitmeta` file are the same bytes as the ones that the tool wrote.
+    #[test]
+    fn ed25519_port_commit_signature_is_the_tool_signature() {
+        let tmp = TmpDir::new("spki-ed25519-commit");
+        let root = tmp.path().join("repo");
+        let fixture = fixture_dir(TYPE).join("repo");
+        copy_tree(&fixture, &root);
+        let tool_meta = std::fs::read(fixture.join(commitmeta_path())).unwrap();
+        let tool_dict = from_bytes(&Type::parse("a{sv}").unwrap(), &tool_meta).unwrap();
+        let tool_blobs = spki_blobs(&tool_dict);
+        assert_eq!(tool_blobs.len(), 1, "{}", regenerate(TYPE));
+        std::fs::remove_file(root.join(commitmeta_path())).unwrap();
+
+        block_on(async {
+            let repo = Repo::open(&root).await.unwrap();
+            repo.sign_commit(&commit(), &fixture_signer(TYPE))
+                .await
+                .unwrap();
+            let dict = repo
+                .read_commit_detached_metadata(&commit())
+                .await
+                .unwrap()
+                .expect("the commit has detached metadata");
+            assert_eq!(spki_blobs(&dict), tool_blobs);
+        });
+        let port_meta = std::fs::read(root.join(commitmeta_path())).unwrap();
+        assert_eq!(
+            port_meta, tool_meta,
+            "the port and the tool write the same .commitmeta bytes"
+        );
+    }
+
+    /// The port signs the `summary` file and the signed superblock bytes of
+    /// the fixture with the fixture key. Each signature is the same bytes as
+    /// the signature that the tool wrote.
+    #[test]
+    fn ed25519_port_summary_and_delta_signatures_are_the_tool_signatures() {
+        block_on(async {
+            let root = fixture_dir(TYPE).join("repo");
+            let repo = Repo::open(&root).await.unwrap();
+            let signer = fixture_signer(TYPE);
+
+            let summary = repo
+                .read_summary()
+                .await
+                .unwrap()
+                .expect("the fixture has a summary");
+            let signatures = repo
+                .read_summary_signature()
+                .await
+                .unwrap()
+                .expect("the fixture has a summary.sig");
+            let tool = spki_blobs(&signatures);
+            assert_eq!(tool.len(), 1, "{}", regenerate(TYPE));
+            assert_eq!(signer.sign(&summary).await.unwrap(), tool[0]);
+
+            let (payload, tool) = read_signed_superblock(&root);
+            assert_eq!(tool.len(), 1, "{}", regenerate(TYPE));
+            assert_eq!(signer.sign(&payload).await.unwrap(), tool[0]);
+        });
+    }
+}
+
 #[cfg(feature = "sign-spki-rsa")]
 mod rsa {
-    use std::path::Path;
-    use std::process::Command;
-
     use super::*;
     use common::TmpDir;
     use ostrya::{Signer, Type, from_bytes};
@@ -452,40 +680,6 @@ mod rsa {
     fn stranger_verifier() -> SpkiVerifier {
         let pem = std::fs::read(fixture_root().join("../spki/keys/rsa-2048.pub.pem")).unwrap();
         SpkiVerifier::from_pem(pem).unwrap()
-    }
-
-    /// Returns the path of the `.commitmeta` of the fixture commit, relative to
-    /// the repository.
-    fn commitmeta_path() -> String {
-        format!("objects/{}/{}.commitmeta", &COMMIT[..2], &COMMIT[2..])
-    }
-
-    /// Reads the signed superblock of the delta in the repository `root`.
-    /// Returns the superblock bytes that the signatures sign, and the spki
-    /// blobs.
-    fn read_signed_superblock(root: &Path) -> (Vec<u8>, Vec<Vec<u8>>) {
-        let path = root
-            .join(static_delta_relative_dir(None, &commit()))
-            .join("superblock");
-        let bytes = std::fs::read(path).unwrap();
-        let value = from_bytes(&Type::parse("(taya{sv})").unwrap(), &bytes).unwrap();
-        let fields = value.as_tuple().expect("the superblock is a tuple");
-        let payload = fields[1]
-            .as_bytes()
-            .expect("the signed superblock is a byte string")
-            .to_vec();
-        (payload, spki_blobs(&fields[2]))
-    }
-
-    /// Copies a directory tree with its attributes (`cp -a`).
-    fn copy_tree(from: &Path, to: &Path) {
-        let status = Command::new("cp")
-            .args(["-a"])
-            .arg(from)
-            .arg(to)
-            .status()
-            .expect("run cp");
-        assert!(status.success(), "cp -a {from:?} {to:?} failed");
     }
 
     #[test]

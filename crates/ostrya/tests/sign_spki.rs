@@ -794,3 +794,49 @@ fn spki_revoked_p384_key_refuses_the_store_in_a_build_without_p384() {
         )
     );
 }
+
+/// The key of test 1 in RFC 8032, an Ed25519 key, in a PEM `PUBLIC KEY` block.
+#[cfg(not(feature = "sign-spki-ed25519"))]
+const ED25519_PUBLIC_PEM: &str = "-----BEGIN PUBLIC KEY-----\n\
+MCowBQYDK2VwAyEA11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=\n\
+-----END PUBLIC KEY-----\n";
+
+/// A build without the Ed25519 key type refuses an Ed25519 public key and an
+/// Ed25519 secret key, with a message that names the feature of the key type.
+#[cfg(not(feature = "sign-spki-ed25519"))]
+#[test]
+fn spki_ed25519_key_names_the_feature_in_a_build_without_ed25519() {
+    let reason = "this build has no code for the key type Ed25519; build with the \
+                  sign-spki-ed25519 feature";
+    match SpkiVerifier::from_pem(ED25519_PUBLIC_PEM) {
+        Err(ostrya::sign::Error::Signature(m)) => {
+            assert_eq!(m, format!("the spki public key text, line 1: {reason}"))
+        }
+        Err(other) => panic!("not a signature error: {other}"),
+        Ok(_) => panic!("the Ed25519 public key has to be refused"),
+    }
+    // The secret key, base64 of the PKCS#8 DER.
+    let secret = "MC4CAQAwBQYDK2VwBCIEIJ1hsZ3v/VpguoRK9JLsLMREScVpezJpGXA7rAMcrn9g";
+    assert_eq!(secret_refusal(secret), format!("spki secret key: {reason}"));
+}
+
+/// In a build without the Ed25519 key type, an Ed25519 key in `revoked.spki`
+/// refuses the key store, so a revocation that the build cannot read fails
+/// closed.
+#[cfg(not(feature = "sign-spki-ed25519"))]
+#[test]
+fn spki_revoked_ed25519_key_refuses_the_store_in_a_build_without_ed25519() {
+    let tmp = TmpDir::new("spki-revoked-ed25519");
+    let dir = tmp.path().join("store");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("trusted.spki"), PUBLIC_PEM).unwrap();
+    std::fs::write(dir.join("revoked.spki"), ED25519_PUBLIC_PEM).unwrap();
+    assert_eq!(
+        store_refusal(&dir),
+        format!(
+            "the key file '{}', line 1: this build has no code for the key type Ed25519; \
+             build with the sign-spki-ed25519 feature",
+            dir.join("revoked.spki").display()
+        )
+    );
+}

@@ -5054,6 +5054,243 @@ fn static_delta_generate_spki_keys_file_signs_with_a_p384_key() {
     }
 }
 
+/// The Ed25519 key of test 1 in RFC 8032: the secret key as base64 of the
+/// PKCS#8 version 1 DER and of the PKCS#8 version 2 DER, and in a PEM
+/// `PRIVATE KEY` block, and the public key in a PEM `PUBLIC KEY` block.
+#[cfg(feature = "spki")]
+mod ed25519_key {
+    pub const SECRET_PKCS8_V1_B64: &str =
+        "MC4CAQAwBQYDK2VwBCIEIJ1hsZ3v/VpguoRK9JLsLMREScVpezJpGXA7rAMcrn9g";
+    pub const SECRET_PKCS8_V2_B64: &str = "MFECAQEwBQYDK2VwBCIEIJ1hsZ3v/VpguoRK9JLsLMREScVpezJpGXA7rAMcrn9ggSEA11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=";
+    pub const SECRET_PEM: &str = "-----BEGIN PRIVATE KEY-----
+MC4CAQAwBQYDK2VwBCIEIJ1hsZ3v/VpguoRK9JLsLMREScVpezJpGXA7rAMcrn9g
+-----END PRIVATE KEY-----
+";
+    pub const PUBLIC_PEM: &str = "-----BEGIN PUBLIC KEY-----
+MCowBQYDK2VwAyEA11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=
+-----END PUBLIC KEY-----
+";
+}
+
+/// `ostrya sign` signs with an Ed25519 key of the spki engine, from a PEM
+/// `PRIVATE KEY` file and from the inline base64 of a PKCS#8 version 2 DER.
+/// The two signatures are the same 64 bytes. `sign --verify` verifies each
+/// signature with the PEM `PUBLIC KEY` file, and refuses the commit at exit 1
+/// with the file of another Ed25519 key.
+#[cfg(all(feature = "spki", unix))]
+#[test]
+fn spki_signs_and_verifies_with_an_ed25519_key() {
+    let tmp = TmpDir::new("sign-spki-ed25519");
+    let base = tmp.path();
+    let repo = commit_fixture(base);
+    let repo_arg = format!("--repo={}", repo.to_str().unwrap());
+    let secret = base.join("secret.pem");
+    std::fs::write(&secret, ed25519_key::SECRET_PEM).unwrap();
+    let public = base.join("public.pem");
+    std::fs::write(&public, ed25519_key::PUBLIC_PEM).unwrap();
+    let other =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/spki/ed25519/public.pem");
+    let verify = |file: &Path| {
+        let keys_file = format!("--keys-file={}", file.display());
+        ostrya(
+            &[
+                "sign", &repo_arg, "--verify", "-s", "spki", &keys_file, COMMIT,
+            ],
+            None,
+            &[],
+        )
+    };
+    let keys_file = format!("--keys-file={}", secret.display());
+    ostrya(
+        &["sign", &repo_arg, "-s", "spki", &keys_file, COMMIT],
+        None,
+        &[],
+    )
+    .ok();
+    ostrya(
+        &[
+            "sign",
+            &repo_arg,
+            "-s",
+            "spki",
+            COMMIT,
+            ed25519_key::SECRET_PKCS8_V2_B64,
+        ],
+        None,
+        &[],
+    )
+    .ok();
+    assert_eq!(
+        verify(&public).ok().stdout_trimmed(),
+        "signature 1: good\nsignature 2: good\nverification OK"
+    );
+    assert_eq!(verify(&other).status.code(), Some(1));
+    let stored = block_on(async {
+        Repo::open(&repo)
+            .await
+            .unwrap()
+            .read_commit_detached_metadata(&Checksum::from_hex(COMMIT).unwrap())
+            .await
+            .unwrap()
+    })
+    .expect("the commit has detached metadata");
+    let value = stored.dict_get("ostree.sign.spki").unwrap();
+    let array = value.as_variant().map_or(value, |(_, inner)| inner);
+    let blobs: Vec<&[u8]> = array
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|blob| blob.as_bytes().unwrap())
+        .collect();
+    assert_eq!(blobs.len(), 2);
+    assert_eq!(blobs[0].len(), 64);
+    assert_eq!(blobs[0], blobs[1]);
+}
+
+/// `ostrya sign` refuses an Ed25519 PKCS#8 version 2 key whose public key is
+/// another key, and an Ed25519 key with `NULL` parameters, at exit 1 with no
+/// signature. `sign --verify` refuses a public key file with `NULL`
+/// parameters.
+#[cfg(all(feature = "spki", unix))]
+#[test]
+fn spki_refuses_ed25519_keys_that_the_engine_does_not_take() {
+    // The seed of the key of test 1 in RFC 8032, with the public key of the
+    // Ed25519 tool fixture.
+    const OTHER_PUBLIC_V2_B64: &str = "MFECAQEwBQYDK2VwBCIEIJ1hsZ3v/VpguoRK9JLsLMREScVpezJpGXA7rAMcrn9ggSEAoFU/x5zOvDtxqoNOwA1/N1xjvNdrbx/o1drQEZvJJ+4=";
+    // The PKCS#8 key of test 1 in RFC 8032 with `NULL` parameters.
+    const NULL_SECRET_B64: &str =
+        "MDACAQAwBwYDK2VwBQAEIgQgnWGxne/9WmC6hEr0kuwsxERJxWl7MmkZcDusAxyuf2A=";
+    // The public key of test 1 in RFC 8032 with `NULL` parameters.
+    const NULL_PUBLIC_PEM: &str = "-----BEGIN PUBLIC KEY-----
+MCwwBwYDK2VwBQADIQDXWpgBgrEKt9VL/tPJZAc6DuFy89qmIyWvAhpo9wdRGg==
+-----END PUBLIC KEY-----
+";
+    let tmp = TmpDir::new("sign-spki-ed25519-refused");
+    let base = tmp.path();
+    let repo = commit_fixture(base);
+    let repo_arg = format!("--repo={}", repo.to_str().unwrap());
+    let commitmeta = repo.join(format!(
+        "objects/{}/{}.commitmeta",
+        &COMMIT[..2],
+        &COMMIT[2..]
+    ));
+    for (key, reason) in [
+        (
+            OTHER_PUBLIC_V2_B64,
+            "the public key of the PKCS#8 key is not the key of its secret key",
+        ),
+        (NULL_SECRET_B64, "the Ed25519 parameters are not absent"),
+    ] {
+        let out = ostrya(&["sign", &repo_arg, "-s", "spki", COMMIT, key], None, &[]);
+        assert_eq!(out.status.code(), Some(1), "{key}");
+        assert!(out.stdout.is_empty(), "{key}");
+        assert_eq!(
+            String::from_utf8_lossy(&out.stderr),
+            format!("error: signature: spki secret key: {reason}\n"),
+            "{key}"
+        );
+        assert!(!commitmeta.exists(), "{key}");
+    }
+
+    ostrya(
+        &[
+            "sign",
+            &repo_arg,
+            "-s",
+            "spki",
+            COMMIT,
+            ed25519_key::SECRET_PKCS8_V1_B64,
+        ],
+        None,
+        &[],
+    )
+    .ok();
+    let null_public = base.join("null.pem");
+    std::fs::write(&null_public, NULL_PUBLIC_PEM).unwrap();
+    let keys_file = format!("--keys-file={}", null_public.display());
+    let out = ostrya(
+        &[
+            "sign", &repo_arg, "--verify", "-s", "spki", &keys_file, COMMIT,
+        ],
+        None,
+        &[],
+    );
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        format!(
+            "error: signature: the key file '{}', line 1: the Ed25519 parameters are not \
+             absent\n",
+            null_public.display()
+        )
+    );
+}
+
+/// `static-delta generate --keys-file` signs with an Ed25519 key of the spki
+/// engine, from a line of the base64 of a PKCS#8 version 1 DER and from a
+/// line of the base64 of a PKCS#8 version 2 DER. `static-delta verify
+/// --keys-file` verifies the superblock with the PEM `PUBLIC KEY` file, and
+/// refuses it at exit 1 with the file of another Ed25519 key.
+#[cfg(feature = "spki")]
+#[test]
+fn static_delta_generate_spki_keys_file_signs_with_an_ed25519_key() {
+    let tmp = TmpDir::new("delta-spki-ed25519");
+    let base = tmp.path();
+    let repo = commit_fixture(base);
+    let repo_s = repo.to_str().unwrap();
+    let public_file = base.join("public.pem");
+    std::fs::write(&public_file, ed25519_key::PUBLIC_PEM).unwrap();
+    let public = format!("--keys-file={}", public_file.display());
+    let other = format!(
+        "--keys-file={}",
+        Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/spki/ed25519/public.pem")
+            .display()
+    );
+    for (name, line) in [
+        ("v1", ed25519_key::SECRET_PKCS8_V1_B64),
+        ("v2", ed25519_key::SECRET_PKCS8_V2_B64),
+    ] {
+        let _ = std::fs::remove_dir_all(repo.join("deltas"));
+        let lines = base.join("lines");
+        std::fs::write(&lines, format!("{line}\n")).unwrap();
+        let keys_file = format!("--keys-file={}", lines.display());
+        ostrya(
+            &[
+                "static-delta",
+                "--repo",
+                repo_s,
+                "generate",
+                "--empty",
+                "--to",
+                COMMIT,
+                "--sign-type=spki",
+                &keys_file,
+            ],
+            None,
+            &[],
+        )
+        .ok();
+        let verify = |keys_file: &str| {
+            ostrya(
+                &[
+                    "static-delta",
+                    "--repo",
+                    repo_s,
+                    "verify",
+                    "--sign-type=spki",
+                    keys_file,
+                    COMMIT,
+                ],
+                None,
+                &[],
+            )
+        };
+        verify(&public).ok();
+        assert_eq!(verify(&other).status.code(), Some(1), "{name}");
+    }
+}
+
 /// A `static-delta generate --keys-file` of the spki engine holds one base64
 /// secret key on each line. The run signs once with each line, and with each
 /// file. An empty file, an empty line, a line with white space, and a line

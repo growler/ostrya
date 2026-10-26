@@ -18,9 +18,10 @@ tokio = ["ostrya-rt?/tokio"]
 # type shares compiles when one of them is on.
 sign-spki-p256 = ["dep:p256", "dep:der", "dep:spki", "dep:pkcs8", "dep:pem-rfc7468"]
 sign-spki-p384 = ["dep:p384", "dep:der", "dep:spki", "dep:pkcs8", "dep:pem-rfc7468"]
+sign-spki-ed25519 = ["ed25519-dalek/pkcs8", "dep:der", "dep:spki", "dep:pkcs8", "dep:pem-rfc7468"]
 sign-spki-rsa = ["dep:rsa", "dep:der", "dep:spki", "dep:pkcs8", "dep:pem-rfc7468"]
 # The spki engine with each of its key types.
-sign-spki = ["sign-spki-p256", "sign-spki-p384", "sign-spki-rsa"]
+sign-spki = ["sign-spki-p256", "sign-spki-p384", "sign-spki-ed25519", "sign-spki-rsa"]
 sign-gpg = ["dep:ostrya-rt"]
 
 # docs.rs adds these two features to the default set, so the pages show the

@@ -128,6 +128,7 @@ impl ServerSigner {
     #[cfg(any(
         feature = "sign-spki-p256",
         feature = "sign-spki-p384",
+        feature = "sign-spki-ed25519",
         feature = "sign-spki-rsa"
     ))]
     pub fn spki(signer: crate::spki::SpkiSigner) -> Result<ServerSigner> {
@@ -241,6 +242,7 @@ impl ServerSigner {
 #[cfg(any(
     feature = "sign-spki-p256",
     feature = "sign-spki-p384",
+    feature = "sign-spki-ed25519",
     feature = "sign-spki-rsa"
 ))]
 struct Unblocked {
@@ -251,6 +253,7 @@ struct Unblocked {
 #[cfg(any(
     feature = "sign-spki-p256",
     feature = "sign-spki-p384",
+    feature = "sign-spki-ed25519",
     feature = "sign-spki-rsa"
 ))]
 impl Signer for Unblocked {

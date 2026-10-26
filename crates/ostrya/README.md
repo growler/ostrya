@@ -64,12 +64,13 @@ API documentation: <https://docs.rs/ostrya>
 - `smol` (default): the `smol` backend of `ostrya-rt`.
 - `tokio`: the `tokio` backend of `ostrya-rt`.
 - `sign-spki`: the `spki` module, the spki signing engine with each of its
-  key types. It turns on `sign-spki-p256`, `sign-spki-p384`, and
-  `sign-spki-rsa`.
+  key types. It turns on `sign-spki-p256`, `sign-spki-p384`,
+  `sign-spki-ed25519`, and `sign-spki-rsa`.
 - `sign-spki-p256`: the `spki` module with the ECDSA P-256 key type.
 - `sign-spki-p384`: the `spki` module with the ECDSA P-384 key type.
+- `sign-spki-ed25519`: the `spki` module with the Ed25519 key type.
 - `sign-spki-rsa`: the `spki` module with the RSA key type. A build without
-  one of the three key features refuses a key of that type.
+  one of the four key features refuses a key of that type.
 - `verify-gpg`: the `gpg` module, GPG verification and keyring management.
 - `sign-gpg`: `GpgSigner`, which signs with the `gpg` command. It turns on
   `verify-gpg`.

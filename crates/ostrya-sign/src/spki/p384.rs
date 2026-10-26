@@ -1,10 +1,10 @@
 //! The P-384 key type of the spki engine: ECDSA over NIST P-384 with SHA-256.
 //!
 //! The default `Signer` and `Verifier` of `p384` hash the data with SHA-384.
-//! The engine hashes the data with SHA-256, as for each key type, and signs
-//! and verifies this hash as a prehash. `ecdsa` makes the RFC 6979 nonce of a
-//! prehash with HMAC-SHA-384, so the signer gives the same bytes for the same
-//! key and the same data.
+//! The engine hashes the data with SHA-256, as for each ECDSA and RSA key
+//! type, and signs and verifies this hash as a prehash. `ecdsa` makes the
+//! RFC 6979 nonce of a prehash with HMAC-SHA-384, so the signer gives the
+//! same bytes for the same key and the same data.
 
 use ::p384::ecdsa::signature::hazmat::{PrehashSigner as _, PrehashVerifier as _};
 use ::p384::ecdsa::{Signature, SigningKey, VerifyingKey};
@@ -586,11 +586,19 @@ mod tests {
             );
         }
 
-        // The PKCS#8 DER of an Ed25519 key, the key of test 1 in RFC 8032.
-        let ed25519 = der("MC4CAQAwBQYDK2VwBCIEIJ1hsZ3v/VpguoRK9JLsLMRESeVpezJpGXA7rAMcrn9g");
+        // The PKCS#8 DER of an Ed448 key, with a 57-byte secret key.
+        let ed448 = tlv(
+            0x30,
+            &[
+                tlv(0x02, &[0]),
+                tlv(0x30, &oid("1.3.101.113")),
+                tlv(0x04, &tlv(0x04, &[7; 57])),
+            ]
+            .concat(),
+        );
         assert_eq!(
-            message(SpkiSigner::from_secret_key(&ed25519)),
-            "spki secret key: the key type Ed25519 is not supported"
+            message(SpkiSigner::from_secret_key(&ed448)),
+            "spki secret key: the key type Ed448 is not supported"
         );
     }
 

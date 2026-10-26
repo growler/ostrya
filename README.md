@@ -221,6 +221,7 @@ The features of the `ostrya` crate are:
 - `sign-spki`: the spki signing engine with each of its key types.
 - `sign-spki-p256`: the spki signing engine with the ECDSA P-256 key type.
 - `sign-spki-p384`: the spki signing engine with the ECDSA P-384 key type.
+- `sign-spki-ed25519`: the spki signing engine with the Ed25519 key type.
 - `sign-spki-rsa`: the spki signing engine with the RSA key type.
 - `verify-gpg`: GPG signature verification and key management.
 - `sign-gpg`: GPG signing through the `gpg` command. It turns on `verify-gpg`.

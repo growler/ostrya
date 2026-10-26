@@ -129,8 +129,8 @@ receive endpoint, the server signs with the RSA key of an `[ex-ostrya key]`
 group. A client can start such a signature and measure its time. The time of
 the operation can then disclose information about the private key. The port
 accepts this risk. Where a client that is not trusted can reach the endpoint,
-use a P-256, a P-384, or an ed25519 key in an `[ex-ostrya key]` group. The
-signer blinds each RSA private-key operation with a random value from the
+use an ed25519 key, or a P-256, a P-384, or an Ed25519 key of the spki
+engine, in an `[ex-ostrya key]` group. The signer blinds each RSA private-key operation with a random value from the
 operating system. Blinding makes the time signal smaller, and it does not
 remove it.
 RSA verification uses the public key alone, and the advisory does not apply
@@ -370,8 +370,8 @@ term below is measured on the resolved dependency graph.
   workspace pins 1.92, so the requirement holds.
 
 `pkcs8` 0.10.2 is also authorized for `crates/ostrya-sign`, behind each key
-feature of the spki engine, now `sign-spki-p256`, `sign-spki-p384`, and
-`sign-spki-rsa`. It reads the `PrivateKeyInfo` of a PKCS#8 secret key, so the
+feature of the spki engine, now `sign-spki-p256`, `sign-spki-p384`,
+`sign-spki-rsa`, and `sign-spki-ed25519`. It reads the `PrivateKeyInfo` of a PKCS#8 secret key, so the
 spki engine selects the key type from the algorithm OID before it decodes the
 key.
 
@@ -503,6 +503,61 @@ resolved dependency graph.
 - The crate was in the graph through `pgp`, under `verify-gpg` of
   `crates/ostrya`, so no package enters `Cargo.lock`. The one change to the
   lock file is the entry `p384` in the dependency list of `ostrya-sign`.
+
+### Authorized: the `pkcs8` feature of `ed25519-dalek`
+
+The feature `pkcs8` of `ed25519-dalek` 2.2.0, a foundation crate, is
+authorized for `crates/ostrya-sign` alone, behind the feature
+`sign-spki-ed25519`. It supplies the decode of an Ed25519
+SubjectPublicKeyInfo and the encode of the canonical SubjectPublicKeyInfo to
+the spki engine in `crates/ostrya-sign/src/spki/ed25519.rs`. The engine
+reads the seed of a PKCS#8 secret key itself, into a buffer that it wipes.
+Each term below is measured on the resolved dependency graph.
+
+- License: `ed25519-dalek` states `BSD-3-Clause`. The feature turns on
+  `ed25519/pkcs8`, and `ed25519` 2.2.3 states `Apache-2.0 OR MIT`.
+- The manifest keeps `default-features = false` with the features `std` and
+  `zeroize`, and `sign-spki-ed25519` adds `pkcs8`. The feature `pem` stays
+  off: it turns on `ed25519/pem` and `pkcs8/pem`, and the engine reads PEM
+  with `pem-rfc7468`. The feature `legacy_compatibility` stays off: it
+  accepts an `S` that is not reduced, which the `ostree` command refuses.
+- The resolved features of `ed25519-dalek` are `alloc`, `pkcs8`, `std`,
+  and `zeroize`. The resolved features of `ed25519` are `alloc`, `pkcs8`,
+  and `std`. The feature `zeroize` of `ed25519` is off, so
+  `ed25519::KeypairBytes` does not wipe its seed, and the engine does not use
+  it.
+- A build of `ostrya-sign` with `sign-spki-ed25519` alone holds 37 packages
+  under 37 distinct names on the host target, measured with
+  `cargo tree -p ostrya-sign --no-default-features --features
+  sign-spki-ed25519 -e normal,build`. The count includes `ostrya-sign`,
+  `ostrya-core`, and `ostrya-gvariant`. With `--target all` it holds 38,
+  adding `fiat-crypto` 0.2.9. Against a build of `ostrya-sign` with no
+  feature, the build adds `base64ct` 1.8.3, `const-oid` 0.9.6, `der` 0.7.10,
+  `pem-rfc7468` 0.7.0, `pkcs8` 0.10.2, and `spki` 0.7.3.
+- No package in the graph declares a `links` key, and no package name in it
+  ends in `-sys`.
+- Six packages carry a build script: `curve25519-dalek`, `generic-array`,
+  `libc`, `proc-macro2`, `quote`, and `thiserror`. All six were already in
+  the graph.
+- Every license in the graph is permissive by the rule in "Requirement:
+  permissive licenses only". With `--target all`, 16 packages state
+  `MIT OR Apache-2.0`, 9 state `Apache-2.0 OR MIT`, `generic-array` and the
+  three workspace crates state `MIT`, `curve25519-dalek`, `ed25519-dalek`,
+  and `subtle` state `BSD-3-Clause`, `curve25519-dalek-derive` and
+  `version_check` state the legacy `MIT/Apache-2.0` form the CI license
+  guard normalizes, `adler2` states `0BSD OR MIT OR Apache-2.0`,
+  `miniz_oxide` states `MIT OR Zlib OR Apache-2.0`, `fiat-crypto` states
+  `MIT OR Apache-2.0 OR BSD-1-Clause`, and `unicode-ident` states
+  `(MIT OR Apache-2.0) AND Unicode-3.0`.
+- The highest minimum supported Rust version in the graph is 1.85, stated
+  by `base64ct` and `zeroize`. `ed25519-dalek` states 1.81 and `ed25519`
+  states 1.60. The workspace pins 1.92, so the requirement holds.
+- `ed25519-dalek` sets `#![cfg_attr(not(test), forbid(unsafe_code))]`, and
+  `ed25519` sets `#![forbid(unsafe_code)]`. `curve25519-dalek` holds
+  `unsafe` code for its backends, and it was already in the graph.
+- No package enters `Cargo.lock`, and no entry of the lock file changes.
+  The entry `ed25519` already lists `pkcs8`, and the entry `ostrya-sign`
+  already lists `der`, `spki`, `pkcs8`, and `pem-rfc7468`.
 
 ### Authorized: the `getrandom` crate
 

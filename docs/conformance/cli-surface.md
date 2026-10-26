@@ -1543,8 +1543,10 @@ stand.
   that key at exit 1. Both sign with three or four `=` at the end of that
   key, and with a last character whose unused low bits are not zero. Both
   sign with a PKCS#8 key or a SEC1 key whose base64 holds LF or CRLF line
-  breaks, with the base64 of a PKCS#1 key of an RSA key, and with the base64
-  of a SEC1 key of a P-384 key (`cli-behavior.md`, "spki P-384 keys"). Both
+  breaks, with the base64 of a PKCS#1 key of an RSA key, with the base64
+  of a SEC1 key of a P-384 key (`cli-behavior.md`, "spki P-384 keys"), and
+  with the base64 of a PKCS#8 key of an Ed25519 key of version 1 or of
+  version 2 (`cli-behavior.md`, "spki Ed25519 keys"). Both
   sign with a SEC1 key or a PKCS#8 key of P-256 or of P-384 whose
   `privateKey` is shorter than the field size of the curve and that holds no
   public point, and read the scalar with zero bytes on the left. Both refuse
@@ -1565,8 +1567,9 @@ stand.
   refuses it at exit 1 with `error: signature: spki secret key: the EC key
   has explicit curve parameters`, or the same reason after `error:
   signature: the key file '<path>', line <n>: `, and moves no ref. A key of a
-  type or on a curve outside the set of the port, and an RSA key that the
-  port refuses, are refused the same way, as `sign` records.
+  type or on a curve outside the set of the port, an RSA key that the port
+  refuses, and a PKCS#8 key that the port refuses for its version or for its
+  Ed25519 public key, are refused the same way, as `sign` records.
 
 The branch-name term of the signing step's fault order is observable only over
 a name the ref-name rule refuses. `-b 'bad//name' --sign=zzz` reports
@@ -3634,7 +3637,7 @@ reads. The key-file entries under `static-delta` above, the spki entries
 included, also hold for `sign --verify`. Under `spki`, a signing
 `--keys-file` holds PEM `PRIVATE KEY` blocks, each a PKCS#8 DER, and each
 block adds one signature. A `-d` `--keys-file` holds PEM `PUBLIC KEY` blocks,
-read as a `--keys-file` of `--verify`. Eighteen differences stand.
+read as a `--keys-file` of `--verify`. Twenty differences stand.
 
 - the verdict report. The exit status agrees. The two reports part as
   follows:
@@ -3793,19 +3796,20 @@ read as a `--keys-file` of `--verify`. Eighteen differences stand.
   on 2026-10-24 with the build above: the tool signs and verifies with each
   signature key type of OpenSSL 3.6.4, ECDSA on 85 named curves, SM2,
   Ed25519, Ed448, RSA, RSA-PSS, DSA, ML-DSA, and SLH-DSA. The port takes
-  ECDSA on the P-256 and the P-384 curves, and RSA with the key type
-  `rsaEncryption`. It
+  ECDSA on the P-256 and the P-384 curves, Ed25519, and RSA with the key
+  type `rsaEncryption`. It
   refuses another key at exit 1 before it signs or verifies, with `error:
   signature: spki public key: the key type <name> is not supported` or
   `error: signature: spki public key: the curve <name> is not supported`,
   and with `spki secret key` for a secret key. `<name>` is a name such as
-  `RSASSA-PSS`, `Ed25519`, or `P-521`, or the dotted OID. A build of the port
+  `RSASSA-PSS`, `Ed448`, or `P-521`, or the dotted OID. A build of the port
   without the code of a key type refuses a key of that type the same way,
   with the reason `this build has no code for the key type RSA; build with
-  the sign-spki-rsa feature`, `this build has no code for the curve P-256;
-  build with the sign-spki-p256 feature`, or `this build has no code for the
-  curve P-384; build with the sign-spki-p384 feature`. The `ostrya` command
-  carries the three key types. A key file and a key-store file give the reason after `error:
+  the sign-spki-rsa feature`, `this build has no code for the key type
+  Ed25519; build with the sign-spki-ed25519 feature`, `this build has no code
+  for the curve P-256; build with the sign-spki-p256 feature`, or `this build
+  has no code for the curve P-384; build with the sign-spki-p384 feature`.
+  The `ostrya` command carries the four key types. A key file and a key-store file give the reason after `error:
   signature: the key file '<path>', line <n>: `, also when the other blocks
   of the file are valid. A line of the `--keys-file` of `static-delta
   generate` gives the reason after `error: signature: the key file '<path>',
@@ -3833,7 +3837,24 @@ read as a `--keys-file` of `--verify`. Eighteen differences stand.
   signature at exit 0 with an SPKI that has no parameters field, and with an
   SPKI that has an OID in the field. The port refuses such a key at exit 1
   before it verifies, with the reason `the rsaEncryption parameters are not
-  NULL`. It refuses a PKCS#8 secret key with such parameters the same way.
+  NULL`. It refuses a PKCS#8 secret key with such parameters the same way;
+- an Ed25519 PKCS#8 secret key of version 2 whose public key is not the
+  public key of its seed. Observed on 2026-10-26 with the build above
+  (`cli-behavior.md`, "CLI output formats", `static-delta`, "spki Ed25519
+  keys"): the tool signs with the seed at exit 0, and the public key of the
+  seed verifies the signature. The port compares the 32 bytes of the two
+  keys, and refuses such a key at exit 1 before it signs, with the reason
+  `the public key of the PKCS#8 key is not the key of its secret key`, in
+  the forms of the entries above;
+- a PKCS#8 secret key with the `version` 1 (version 2) and no public key.
+  Observed on 2026-10-26 with the build above, with an Ed25519 key ("spki
+  Ed25519 keys"): the tool signs at exit 0, and the public key of the key
+  verifies the signature. The port refuses such a key of each key type at
+  exit 1 before it signs. An inline key gives `error: signature: spki secret
+  key: expected PKCS#8 DER, SEC1 DER, or PKCS#1 DER`. A key file gives
+  `error: signature: the key file '<path>', line <n>: the PRIVATE KEY block
+  holds no valid PKCS#8 key`. A PKCS#8 key with the `version` 0 and a public
+  key is refused by both.
 
 ## P3 -- shell-suite surface with no matrix weight
 

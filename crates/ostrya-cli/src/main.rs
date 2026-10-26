@@ -2188,7 +2188,7 @@ struct RemoteSummaryArgs {
     ///
     /// For ed25519, the file has base64 secret keys, one per line. For spki,
     /// the file holds PEM `PRIVATE KEY` blocks, each a PKCS#8 DER of a P-256, a
-    /// P-384, or an RSA key. The command
+    /// P-384, an Ed25519, or an RSA key. The command
     /// reads every file, and each key adds one signature after each --sign
     /// key. The gpg engine refuses this option. The option needs -u.
     #[cfg(feature = "s3")]
@@ -2503,8 +2503,8 @@ enum SignType {
     /// ed25519 detached signatures (the sign-api default).
     #[value(name = "ed25519")]
     Ed25519,
-    /// SubjectPublicKeyInfo keys: ECDSA over NIST P-256 or P-384, or RSA PKCS#1
-    /// v1.5, each with SHA-256.
+    /// SubjectPublicKeyInfo keys: ECDSA over NIST P-256 or P-384 with SHA-256,
+    /// Ed25519, or RSA PKCS#1 v1.5 with SHA-256.
     #[value(name = "spki")]
     Spki,
     /// GPG (OpenPGP) detached signatures.
@@ -2543,8 +2543,8 @@ struct SignArgs {
     ///
     /// For ed25519, the file has base64 keys, one per line: secret keys to
     /// sign, public keys to verify and delete. For spki, the file holds PEM
-    /// `PRIVATE KEY` blocks, each a PKCS#8 DER of a P-256, a P-384, or an RSA
-    /// key, to sign, and PEM `PUBLIC KEY`
+    /// `PRIVATE KEY` blocks, each a PKCS#8 DER of a P-256, a P-384, an
+    /// Ed25519, or an RSA key, to sign, and PEM `PUBLIC KEY`
     /// blocks to verify and delete. Each `PRIVATE KEY` block adds one
     /// signature. Signing and delete read every file. A signing or delete file
     /// is a regular file of at most 1 MiB. For an ed25519 or spki verify, the

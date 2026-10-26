@@ -377,6 +377,7 @@ enum Command {
     /// --depth reaches, and the objects that these commits reach. When the
     /// link is possible, the pull hardlinks an object of the source into this
     /// repository. The pull writes local refs, or remote refs under --remote.
+    /// With --remote, the verification keys of the remote apply to the pull.
     /// It drops the detached metadata keys that
     /// `[ex-ostrya] detached-metadata-exclude` names.
     ///
@@ -4212,8 +4213,13 @@ struct PullLocalArgs {
     /// Write the pulled refs under this remote name.
     ///
     /// The refs go to `refs/remotes/<remote>/<ref>`. Without this option, they
-    /// are local refs. --gpg-verify and --gpg-verify-summary read the keys of
-    /// this remote.
+    /// are local refs. The verification keys of the `[remote "NAME"]` group
+    /// apply to the pull, as they apply to `ostrya pull` (see
+    /// ostrya-config(1)). If the config has no group for the name, the pull
+    /// makes only the checks that its switches ask for. Each switch wins over
+    /// its key: --gpg-verify and --gpg-verify-summary turn a check on, and
+    /// --no-gpg-verify, --no-gpg-verify-summary, --no-sign-verify, and
+    /// --no-sign-verify-summary turn a configured check off.
     #[arg(long)]
     remote: Option<String>,
     /// The number of parents of each pulled commit to follow.
@@ -4283,6 +4289,32 @@ struct PullLocalArgs {
     /// --remote, the command refuses this switch. The switch takes no value.
     #[arg(long)]
     gpg_verify_summary: bool,
+    /// Do not require a GPG signature on the commits.
+    ///
+    /// The switch turns off the `gpg-verify` key of the remote that --remote
+    /// names. It needs --remote and conflicts with --gpg-verify.
+    #[arg(long, requires = "remote", conflicts_with = "gpg_verify")]
+    no_gpg_verify: bool,
+    /// Do not require a GPG signature on the summary of the source.
+    ///
+    /// The switch turns off the `gpg-verify-summary` key of the remote that
+    /// --remote names. It needs --remote and conflicts with
+    /// --gpg-verify-summary.
+    #[arg(long, requires = "remote", conflicts_with = "gpg_verify_summary")]
+    no_gpg_verify_summary: bool,
+    /// Do not require an ed25519 or spki signature on the commits.
+    ///
+    /// The switch turns off the `sign-verify` key of the remote that --remote
+    /// names. It needs --remote.
+    #[arg(long, requires = "remote")]
+    no_sign_verify: bool,
+    /// Do not require an ed25519 or spki signature on the summary of the
+    /// source.
+    ///
+    /// The switch turns off the `sign-verify-summary` key of the remote that
+    /// --remote names. It needs --remote.
+    #[arg(long, requires = "remote")]
+    no_sign_verify_summary: bool,
     /// Apply the static delta that the summary of the source advertises.
     ///
     /// If the source advertises no delta for a commit, the command refuses the
@@ -6244,10 +6276,14 @@ async fn pull_local(repo: Repo, name: &str, args: PullLocalArgs) -> Result<()> {
                 per_object_fsync: args.per_object_fsync,
                 require_static_deltas: args.require_static_deltas,
                 disable_static_deltas: args.disable_static_deltas,
+                // `clap` refuses a switch together with its off switch, so
+                // each pair gives one value or none.
                 verify: PullVerify {
-                    gpg: args.gpg_verify.then_some(true),
-                    gpg_summary: args.gpg_verify_summary.then_some(true),
-                    ..PullVerify::default()
+                    gpg: (args.gpg_verify || args.no_gpg_verify).then_some(args.gpg_verify),
+                    gpg_summary: (args.gpg_verify_summary || args.no_gpg_verify_summary)
+                        .then_some(args.gpg_verify_summary),
+                    sign: args.no_sign_verify.then_some(false),
+                    sign_summary: args.no_sign_verify_summary.then_some(false),
                 },
                 detached_metadata_filter: detached_metadata_filter(&repo)?,
                 ..PullOptions::default()

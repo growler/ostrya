@@ -40876,6 +40876,246 @@ fn pull_local_gpg_switches_refuse_where_the_tool_refuses() {
     }
 }
 
+/// `pull-local --remote=NAME` of ostrya reads the verification keys of the
+/// `[remote "NAME"]` group, as `pull` does. The `ostree` command reads none of
+/// these keys. Over an unsigned commit:
+///
+/// - With `sign-verify=ed25519` and a trusted key, the tool imports the
+///   commit, and ostrya refuses it.
+/// - With a group that leaves `gpg-verify` at its default, the tool imports
+///   the commit, and ostrya refuses it. A build without the GPG engine
+///   refuses the check before it reads the source.
+/// - With a name that no group describes, both commands import the commit and
+///   write the same refs and objects.
+///
+/// Each refusal of ostrya writes no object and no ref.
+#[test]
+fn pull_local_remote_config_checks_part_from_the_tool() {
+    if !ostree_supports_ed25519() {
+        return;
+    }
+    let tmp = TmpDir::new("pull-local-remote-config");
+    let base = tmp.path();
+    let (src, _, c2) = pull_local_delta_source(base, "src", &[], false);
+    let s = src.to_str().unwrap().to_owned();
+    let sign = |dest: &Path| {
+        ostree_ok(
+            dest,
+            &[
+                "remote",
+                "add",
+                "--no-gpg-verify",
+                "origin",
+                "file:///nonexistent",
+            ],
+        );
+        ostree_ok(
+            dest,
+            &["config", "set", "remote \"origin\".sign-verify", "ed25519"],
+        );
+        ostree_ok(
+            dest,
+            &[
+                "config",
+                "set",
+                "remote \"origin\".verification-ed25519-key",
+                ED25519_PUBLIC_B64,
+            ],
+        );
+    };
+    let gpg = |dest: &Path| {
+        ostree_ok(dest, &["remote", "add", "origin", "file:///nonexistent"]);
+    };
+    let nothing = |_: &Path| {};
+    let rows: Vec<PullLocalRow> = vec![
+        (
+            "sign-verify",
+            &sign,
+            vec!["--remote=origin".into(), s.clone(), "main".into()],
+        ),
+        (
+            "gpg-default",
+            &gpg,
+            vec!["--remote=origin".into(), s.clone(), "main".into()],
+        ),
+        (
+            "no-section",
+            &nothing,
+            vec!["--remote=nosuch".into(), s.clone(), "main".into()],
+        ),
+    ];
+    for (name, setup, args) in rows {
+        let args: Vec<&str> = args.iter().map(String::as_str).collect();
+        let (ours, our_refs, our_objects) =
+            pull_local_case(base, name, "port", RepoMode::BareUser, setup, &args);
+        let (theirs, their_refs, their_objects) =
+            pull_local_case(base, name, "tool", RepoMode::BareUser, setup, &args);
+        // The refs of the case are remote refs, which `pull_local_case` does
+        // not list.
+        let refspec = if name == "no-section" {
+            "nosuch:main"
+        } else {
+            "origin:main"
+        };
+        let remote_ref = |who: &str| resolve(&base.join(format!("{name}-{who}/repo")), refspec);
+        let stderr = String::from_utf8_lossy(&ours.stderr);
+        assert_eq!(theirs.status.code(), Some(0), "{name}");
+        assert_eq!(remote_ref("tool").as_deref(), Some(c2.as_str()), "{name}");
+        assert!(!their_objects.is_empty(), "{name}");
+        if name == "no-section" {
+            assert_eq!(ours.status.code(), Some(0), "{name}: {stderr}");
+            assert_eq!(remote_ref("port").as_deref(), Some(c2.as_str()), "{name}");
+            assert_eq!(our_refs, their_refs, "{name}");
+            assert_eq!(our_objects, their_objects, "{name}");
+            continue;
+        }
+        assert_eq!(ours.status.code(), Some(1), "{name}: {stderr}");
+        assert_eq!(remote_ref("port"), None, "{name}");
+        assert!(our_refs.is_empty() && our_objects.is_empty(), "{name}");
+        let expected = if name == "sign-verify" {
+            "sign-api verification is enabled, but it carries no signature"
+        } else if cfg!(feature = "gpg") {
+            "GPG verification is enabled, but it carries no signature"
+        } else {
+            "verify-gpg"
+        };
+        assert!(stderr.contains(expected), "{name}: {stderr}");
+    }
+}
+
+/// Each off switch of `pull-local` turns off the check that the group of the
+/// remote turns on. Without the switch, the pull refuses the unsigned commit
+/// or the unsigned summary of the source, names the reason, and writes no
+/// object and no ref. With the switch, the pull imports the commit. A build
+/// without the GPG engine refuses a GPG check before it reads the source.
+#[test]
+fn pull_local_off_switches_turn_the_configured_checks_off() {
+    let tmp = TmpDir::new("pull-local-off-switches");
+    let base = tmp.path();
+    let src = build_remote(base, "src");
+    let src = src.to_str().unwrap();
+    let key = format!("verification-ed25519-key={ED25519_PUBLIC_B64}\n");
+    let no_summary_sig = "summary verification is enabled, but no summary.sig is published";
+    #[cfg(feature = "gpg")]
+    let (gpg_commit, gpg_summary) = (
+        "GPG verification is enabled, but it carries no signature",
+        no_summary_sig,
+    );
+    #[cfg(not(feature = "gpg"))]
+    let (gpg_commit, gpg_summary) = ("verify-gpg", "verify-gpg");
+    let cases = [
+        ("--no-gpg-verify", String::new(), gpg_commit),
+        (
+            "--no-gpg-verify-summary",
+            "gpg-verify=false\ngpg-verify-summary=true\n".to_owned(),
+            gpg_summary,
+        ),
+        (
+            "--no-sign-verify",
+            format!("gpg-verify=false\nsign-verify=ed25519\n{key}"),
+            "sign-api verification is enabled, but it carries no signature",
+        ),
+        (
+            "--no-sign-verify-summary",
+            format!("gpg-verify=false\nsign-verify-summary=ed25519\n{key}"),
+            no_summary_sig,
+        ),
+    ];
+    for (switch, extra, reason) in &cases {
+        for with_switch in [false, true] {
+            let dir = base.join(format!("{}-{with_switch}", switch.trim_start_matches('-')));
+            std::fs::create_dir_all(&dir).unwrap();
+            let dest = create_repo(&dir, RepoMode::Archive);
+            configure_remote(&dest, "file:///nonexistent", extra);
+            let repo_arg = format!("--repo={}", dest.display());
+            let mut args = vec!["pull-local", repo_arg.as_str(), "--remote=origin"];
+            if with_switch {
+                args.push(switch);
+            }
+            args.extend([src, BRANCH]);
+            let run = ostrya(&args, None, &[]);
+            if with_switch {
+                run.ok();
+                assert_eq!(
+                    resolve(&dest, "origin:test/main").as_deref(),
+                    Some(COMMIT),
+                    "{switch}"
+                );
+            } else {
+                let stderr = String::from_utf8_lossy(&run.stderr);
+                assert_eq!(run.status.code(), Some(1), "{switch}: {stderr}");
+                assert!(stderr.contains(reason), "{switch}: {stderr}");
+                assert!(loose_objects(&dest).is_empty(), "{switch}");
+                assert_eq!(
+                    std::fs::read_dir(dest.join("refs/heads")).unwrap().count(),
+                    0,
+                    "{switch}"
+                );
+                assert!(!dest.join("refs/remotes/origin").exists(), "{switch}");
+            }
+        }
+    }
+}
+
+/// `clap` refuses each off switch of `pull-local` with no `--remote`, and an
+/// off switch together with its GPG switch. The refusal comes before the
+/// command opens the source, so the source path names nothing, and the
+/// destination gets no object and no ref.
+#[test]
+fn pull_local_off_switches_need_a_remote() {
+    let tmp = TmpDir::new("pull-local-off-switches-remote");
+    let base = tmp.path();
+    let dest = create_repo(base, RepoMode::Archive);
+    let repo_arg = format!("--repo={}", dest.display());
+    let missing = base.join("nosuch");
+    let src = missing.to_str().unwrap();
+    for switch in [
+        "--no-gpg-verify",
+        "--no-gpg-verify-summary",
+        "--no-sign-verify",
+        "--no-sign-verify-summary",
+    ] {
+        let run = ostrya(&["pull-local", &repo_arg, switch, src, "main"], None, &[]);
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert_eq!(run.status.code(), Some(1), "{switch}: {stderr}");
+        assert!(
+            stderr.contains("the following required arguments were not provided")
+                && stderr.contains("--remote"),
+            "{switch}: {stderr}"
+        );
+    }
+    for (on, off) in [
+        ("--gpg-verify", "--no-gpg-verify"),
+        ("--gpg-verify-summary", "--no-gpg-verify-summary"),
+    ] {
+        let run = ostrya(
+            &[
+                "pull-local",
+                &repo_arg,
+                "--remote=origin",
+                on,
+                off,
+                src,
+                "main",
+            ],
+            None,
+            &[],
+        );
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert_eq!(run.status.code(), Some(1), "{on} {off}: {stderr}");
+        assert!(
+            stderr.contains("cannot be used with"),
+            "{on} {off}: {stderr}"
+        );
+    }
+    assert!(loose_objects(&dest).is_empty());
+    assert!(!dest.join("refs/remotes/origin").exists());
+    assert_eq!(
+        std::fs::read_dir(dest.join("refs/heads")).unwrap().count(),
+        0
+    );
+}
+
 /// `pull-local --gpg-verify` opens each source commit object as many times as
 /// the same pull with no verification. The verification reads the bytes that
 /// the walk of the chain read to find the parent. The pull opens each source
@@ -40963,7 +41203,7 @@ fn pull_local_gpg_verify_adds_no_commit_read() {
             })
             .collect()
     };
-    let unchecked = opens("unchecked", &[]);
+    let unchecked = opens("unchecked", &["--no-gpg-verify"]);
     let checked = opens("checked", &["--gpg-verify"]);
     assert_eq!(
         unchecked,

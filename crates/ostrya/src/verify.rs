@@ -274,7 +274,8 @@ impl PullTrust {
     /// Resolves the trust of a pull of `remote` from its config in `repo` and
     /// the overrides in `verify`.
     ///
-    /// The config section of `remote` supplies the policy and the keys. If a
+    /// The config section of `remote` supplies the policy and the keys.
+    /// `defaults` gives the policy of a remote that has no section. If a
     /// local pull names no remote and asks for a verification, this function
     /// fails with [`Error::Pull`]. The failure comes before the pull imports
     /// an object.
@@ -285,26 +286,24 @@ impl PullTrust {
         defaults: Defaults,
     ) -> Result<PullTrust> {
         let section = remote.and_then(|name| repo.config().remote(name));
-        let configured = defaults == Defaults::Config;
 
         let gpg_commit = switch(verify.gpg, || match &section {
-            Some(section) if configured => section.gpg_verify(),
+            Some(section) => section.gpg_verify(),
             // If an HTTP pull names a remote that the config does not
             // describe, the remote takes the default of a described remote.
-            None if configured => Ok(true),
-            _ => Ok(false),
+            None => Ok(defaults == Defaults::Config),
         })?;
         let gpg_summary = switch(verify.gpg_summary, || match &section {
-            Some(section) if configured => section.gpg_verify_summary(),
-            _ => Ok(false),
+            Some(section) => section.gpg_verify_summary(),
+            None => Ok(false),
         })?;
         let sign_commit = engines(verify.sign, || match &section {
-            Some(section) if configured => section.sign_verify(),
-            _ => Ok(SignVerify::Off),
+            Some(section) => section.sign_verify(),
+            None => Ok(SignVerify::Off),
         })?;
         let sign_summary = engines(verify.sign_summary, || match &section {
-            Some(section) if configured => section.sign_verify_summary(),
-            _ => Ok(SignVerify::Off),
+            Some(section) => section.sign_verify_summary(),
+            None => Ok(SignVerify::Off),
         })?;
 
         let asks_for_a_check = gpg_commit
@@ -361,10 +360,14 @@ const _: fn() = || {
 /// The source of the policy when the options of a pull state no policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Defaults {
-    /// Read the config of the remote. [`Repo::pull`] uses this source.
+    /// Read the config of the remote. A remote with no section takes the
+    /// defaults of a described remote, so the GPG check of the commits is on.
+    /// [`Repo::pull`] uses this source.
     Config,
-    /// Verify nothing. [`Repo::pull_local`] uses this source.
-    Off,
+    /// Read the config of the remote if the config has a section for it. A
+    /// remote with no section, or no remote, gives no check.
+    /// [`Repo::pull_local`] uses this source.
+    Section,
 }
 
 /// Resolves one boolean switch: the override of the pull, or else the config.

@@ -151,6 +151,11 @@ A pull that names the remote does not read this key.
 A candidate whose \fB\%pull\-url\fR is an \fB\%s3://\fR address serves the refs that the summary of its bucket repository lists, and the pull skips such a candidate if its bucket repository has no summary.
 \fB\%ostrya remote summary \-u\fR writes the summary of a bucket repository.
 .SS "Verification"
+These keys apply to \fB\%ostrya pull NAME\fR and to \fB\%ostrya pull\-local \-\-remote=NAME\fR.
+\fB\%ostrya remote fsck NAME\fR reads \fB\%gpg\-verify\-summary\fR, \fB\%sign\-verify\-summary\fR, and the trusted keys of these two checks.
+A switch of the command that turns a check on or off wins over its key.
+When the config has no group for \fB\%NAME\fR, \fB\%ostrya pull\-local\fR makes only the checks that its switches ask for.
+\fB\%ostree pull\-local\fR reads none of these keys.
 .TP
 \fB\%gpg\-verify\fR (boolean, default true)
 A pull checks the GPG signature of each commit that it fetches.

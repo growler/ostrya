@@ -2789,28 +2789,270 @@ async fn pull_main_with(dst: &Repo, src: &Repo, opts: PullOptions) -> Result<(),
     .map(|_| ())
 }
 
-/// A local pull verifies nothing by default. This is also true if the remote
-/// for its refs sets `gpg-verify` and `sign-verify`. `ostree pull-local` does
-/// the same: only its own flags turn on a verification, and the remote config
-/// does not.
+/// Creates a destination as [`dest_with_remote`] does. The remote turns the
+/// GPG check of the commits off and trusts the ed25519 key `public`.
+async fn dest_trusting(base: &Path, public: &str) -> Repo {
+    dest_with_remote(
+        base,
+        &format!("gpg-verify=false\nverification-ed25519-key={public}\n"),
+    )
+    .await
+}
+
+/// Returns the options of a pull of `main` under the remote `origin`, with
+/// the signature policy `verify`.
+fn origin_pull(verify: PullVerify) -> PullOptions {
+    PullOptions {
+        refs: vec!["main".to_owned()],
+        remote: Some("origin".to_owned()),
+        verify,
+        ..PullOptions::default()
+    }
+}
+
+/// Asserts that `dst` holds no local ref, no ref `origin:main`, not the
+/// commit `commit`, and no object. Each caller pulls into an empty
+/// destination, so an object in `dst` comes from the pull.
+async fn assert_nothing_pulled(dst: &Repo, commit: &Checksum) {
+    assert!(dst.list_refs(None).await.unwrap().is_empty());
+    assert_eq!(dst.resolve_rev("origin:main", true).await.unwrap(), None);
+    assert!(!dst.has_object(ObjectType::Commit, commit).await.unwrap());
+    assert!(dst.list_objects().await.unwrap().is_empty());
+}
+
+/// A local pull reads the verification keys of the remote section that it
+/// names. If the config has no section for the remote, the pull checks
+/// nothing, so a remote name can serve as a ref namespace alone.
 #[test]
-fn a_local_pull_checks_nothing_by_default() {
-    let tmp = TmpDir::new("pull-local-verify-default");
+fn a_remote_with_no_section_checks_nothing() {
+    let tmp = TmpDir::new("pull-local-verify-no-section");
     let base = tmp.path();
     block_on(async {
         let (_src_path, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
-        let dst = dest_with_remote(base, "gpg-verify=true\nsign-verify=true\n").await;
+        let (_dst_path, dst) = make_repo(base, "dst", RepoMode::Archive).await;
 
-        pull_main_with(
-            &dst,
-            &src,
-            PullOptions {
-                remote: Some("origin".to_owned()),
-                ..PullOptions::default()
-            },
+        pull_main_with(&dst, &src, origin_pull(PullVerify::default()))
+            .await
+            .unwrap();
+        assert_eq!(
+            dst.resolve_rev("origin:main", true).await.unwrap(),
+            Some(c2)
+        );
+    });
+}
+
+/// A remote section that leaves `gpg-verify` at its default, or sets it to
+/// `true`, turns on the GPG check of the commits. The source commits carry no
+/// signature, so the pull fails and imports nothing. A build without the GPG
+/// engine refuses the check before it reads the source.
+#[test]
+fn the_gpg_verify_of_a_section_checks_the_commits() {
+    let tmp = TmpDir::new("pull-local-verify-section-gpg");
+    let base = tmp.path();
+    block_on(async {
+        let (_src_path, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
+        for extra in ["", "gpg-verify=true\n"] {
+            let dst = dest_with_remote(base, extra).await;
+            let err = pull_main_with(&dst, &src, origin_pull(PullVerify::default()))
+                .await
+                .unwrap_err();
+            #[cfg(feature = "verify-gpg")]
+            assert!(
+                matches!(&err, Error::Signature(m)
+                    if m.contains("GPG verification is enabled, but it carries no signature")),
+                "{extra:?}: {err}"
+            );
+            #[cfg(not(feature = "verify-gpg"))]
+            assert!(
+                matches!(&err, Error::Unsupported(m) if m.contains("verify-gpg")),
+                "{extra:?}: {err}"
+            );
+            assert_nothing_pulled(&dst, &c2).await;
+            drop(dst);
+            std::fs::remove_dir_all(base.join("dst")).unwrap();
+        }
+    });
+}
+
+/// `gpg-verify-summary=true` in the remote section turns on the GPG check of
+/// the summary of the source. The source publishes no summary, so the pull
+/// fails and imports nothing.
+#[test]
+fn gpg_verify_summary_of_a_section_checks_the_summary() {
+    let tmp = TmpDir::new("pull-local-verify-section-gpg-summary");
+    let base = tmp.path();
+    block_on(async {
+        let (_src_path, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
+        let dst = dest_with_remote(base, "gpg-verify=false\ngpg-verify-summary=true\n").await;
+        let err = pull_main_with(&dst, &src, origin_pull(PullVerify::default()))
+            .await
+            .unwrap_err();
+        #[cfg(feature = "verify-gpg")]
+        assert!(
+            matches!(&err, Error::Signature(m) if m.contains("no summary is published")),
+            "{err}"
+        );
+        #[cfg(not(feature = "verify-gpg"))]
+        assert!(
+            matches!(&err, Error::Unsupported(m) if m.contains("verify-gpg")),
+            "{err}"
+        );
+        assert_nothing_pulled(&dst, &c2).await;
+    });
+}
+
+/// `sign-verify` in the remote section turns on the sign-api check of the
+/// commits. The pull refuses an unsigned commit and accepts it after the
+/// trusted key signs it.
+#[test]
+fn sign_verify_of_a_section_checks_the_commits() {
+    let tmp = TmpDir::new("pull-local-verify-section-sign");
+    let base = tmp.path();
+    block_on(async {
+        let (_src_path, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
+        let dst = dest_with_remote(
+            base,
+            &format!(
+                "gpg-verify=false\nsign-verify=ed25519\nverification-ed25519-key={PUBLIC_B64}\n"
+            ),
         )
+        .await;
+        let err = pull_main_with(&dst, &src, origin_pull(PullVerify::default()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m)
+                if m.contains("sign-api verification is enabled, but it carries no signature")),
+            "{err}"
+        );
+        assert_nothing_pulled(&dst, &c2).await;
+
+        let signer = Ed25519Signer::from_base64(SECRET_B64).unwrap();
+        src.sign_commit(&c2, &signer).await.unwrap();
+        pull_main_with(&dst, &src, origin_pull(PullVerify::default()))
+            .await
+            .unwrap();
+        assert_eq!(
+            dst.resolve_rev("origin:main", true).await.unwrap(),
+            Some(c2)
+        );
+    });
+}
+
+/// `sign-verify-summary` in the remote section turns on the sign-api check
+/// of the summary of the source. The pull refuses a summary with no
+/// `summary.sig` and accepts it after the trusted key signs it.
+#[test]
+fn sign_verify_summary_of_a_section_checks_the_summary() {
+    let tmp = TmpDir::new("pull-local-verify-section-sign-summary");
+    let base = tmp.path();
+    block_on(async {
+        let (_src_path, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
+        src.regenerate_summary(&SummaryOptions {
+            last_modified: Some(FIXED_TS),
+            ..SummaryOptions::default()
+        })
         .await
         .unwrap();
+        let dst = dest_with_remote(
+            base,
+            &format!(
+                "gpg-verify=false\nsign-verify-summary=ed25519\n\
+                 verification-ed25519-key={PUBLIC_B64}\n"
+            ),
+        )
+        .await;
+        let err = pull_main_with(&dst, &src, origin_pull(PullVerify::default()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m) if m.contains("no summary.sig")),
+            "{err}"
+        );
+        assert_nothing_pulled(&dst, &c2).await;
+
+        src.sign_summary(&Ed25519Signer::from_base64(SECRET_B64).unwrap())
+            .await
+            .unwrap();
+        pull_main_with(&dst, &src, origin_pull(PullVerify::default()))
+            .await
+            .unwrap();
+        assert_eq!(
+            dst.resolve_rev("origin:main", true).await.unwrap(),
+            Some(c2)
+        );
+    });
+}
+
+/// A field of `PullVerify` that is set wins over the key of the remote
+/// section. `Some(false)` turns a configured check off, and `Some(true)`
+/// turns on a check that the section turns off.
+#[test]
+fn a_set_field_wins_over_the_section() {
+    let tmp = TmpDir::new("pull-local-verify-field-wins");
+    let base = tmp.path();
+    block_on(async {
+        let (_src_path, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
+
+        let dst = dest_with_remote(
+            base,
+            &format!(
+                "gpg-verify=true\nsign-verify=ed25519\nverification-ed25519-key={PUBLIC_B64}\n"
+            ),
+        )
+        .await;
+        let off = PullVerify {
+            gpg: Some(false),
+            sign: Some(false),
+            ..PullVerify::default()
+        };
+        pull_main_with(&dst, &src, origin_pull(off)).await.unwrap();
+        assert_eq!(
+            dst.resolve_rev("origin:main", true).await.unwrap(),
+            Some(c2)
+        );
+        drop(dst);
+        std::fs::remove_dir_all(base.join("dst")).unwrap();
+
+        let dst = dest_with_remote(
+            base,
+            &format!(
+                "gpg-verify=false\nsign-verify=false\nverification-ed25519-key={PUBLIC_B64}\n"
+            ),
+        )
+        .await;
+        let on = PullVerify {
+            sign: Some(true),
+            ..PullVerify::default()
+        };
+        let err = pull_main_with(&dst, &src, origin_pull(on))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m)
+                if m.contains("sign-api verification is enabled, but it carries no signature")),
+            "{err}"
+        );
+        assert_nothing_pulled(&dst, &c2).await;
+        drop(dst);
+        std::fs::remove_dir_all(base.join("dst")).unwrap();
+
+        // The source publishes no summary, so each summary check that
+        // applies fails.
+        let dst = dest_with_remote(
+            base,
+            &format!(
+                "gpg-verify=false\ngpg-verify-summary=true\nsign-verify-summary=ed25519\n\
+                 verification-ed25519-key={PUBLIC_B64}\n"
+            ),
+        )
+        .await;
+        let off = PullVerify {
+            gpg_summary: Some(false),
+            sign_summary: Some(false),
+            ..PullVerify::default()
+        };
+        pull_main_with(&dst, &src, origin_pull(off)).await.unwrap();
         assert_eq!(
             dst.resolve_rev("origin:main", true).await.unwrap(),
             Some(c2)
@@ -2831,7 +3073,7 @@ fn a_local_pull_checks_the_commits_when_asked() {
         src.sign_commit(&c1, &signer).await.unwrap();
         src.sign_commit(&c2, &signer).await.unwrap();
 
-        let dst = dest_with_remote(base, &format!("verification-ed25519-key={PUBLIC_B64}\n")).await;
+        let dst = dest_trusting(base, PUBLIC_B64).await;
         let asked = PullOptions {
             remote: Some("origin".to_owned()),
             verify: PullVerify {
@@ -2849,11 +3091,7 @@ fn a_local_pull_checks_the_commits_when_asked() {
         drop(dst);
 
         std::fs::remove_dir_all(base.join("dst")).unwrap();
-        let dst = dest_with_remote(
-            base,
-            &format!("verification-ed25519-key={OTHER_PUBLIC_B64}\n"),
-        )
-        .await;
+        let dst = dest_trusting(base, OTHER_PUBLIC_B64).await;
         let err = pull_main_with(&dst, &src, asked).await.unwrap_err();
         assert!(
             matches!(&err, Error::Signature(m) if m.contains("is from a trusted key")),
@@ -2881,7 +3119,7 @@ fn the_filter_runs_after_the_signature_check() {
         src.sign_commit(&c1, &signer).await.unwrap();
         src.sign_commit(&c2, &signer).await.unwrap();
 
-        let dst = dest_with_remote(base, &format!("verification-ed25519-key={PUBLIC_B64}\n")).await;
+        let dst = dest_trusting(base, PUBLIC_B64).await;
         let opts = PullOptions {
             remote: Some("origin".to_owned()),
             verify: PullVerify {
@@ -2923,7 +3161,7 @@ fn a_local_pull_checks_the_source_summary_when_asked() {
         .await
         .unwrap();
 
-        let dst = dest_with_remote(base, &format!("verification-ed25519-key={PUBLIC_B64}\n")).await;
+        let dst = dest_trusting(base, PUBLIC_B64).await;
         let asked = PullOptions {
             remote: Some("origin".to_owned()),
             verify: PullVerify {
@@ -2965,7 +3203,7 @@ fn a_local_pull_checks_the_metadata_it_leaves_in_place() {
         src.sign_commit(&c1, &signer).await.unwrap();
         src.sign_commit(&c2, &signer).await.unwrap();
 
-        let dst = dest_with_remote(base, &format!("verification-ed25519-key={PUBLIC_B64}\n")).await;
+        let dst = dest_trusting(base, PUBLIC_B64).await;
         let asked = PullOptions {
             remote: Some("origin".to_owned()),
             verify: PullVerify {
@@ -4911,7 +5149,7 @@ fn signed_chain_pull(list: Vec<AdvertisedDelta>) -> PullOptions {
 /// remote `origin` against the key of `PUBLIC_B64`. The destination holds
 /// `commit` of `src` complete, with no ref.
 async fn signed_dst_holding(base: &Path, src: &Repo, commit: &Checksum) -> (PathBuf, Repo) {
-    let dst = dest_with_remote(base, &format!("verification-ed25519-key={PUBLIC_B64}\n")).await;
+    let dst = dest_trusting(base, PUBLIC_B64).await;
     hold_commit(&dst, src, commit).await;
     (base.join("dst"), dst)
 }

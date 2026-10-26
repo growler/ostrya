@@ -3554,16 +3554,22 @@ differences stand:
 `--untrusted`, `--bareuseronly-files`, `--disable-verify-bindings`,
 `--disable-fsync`, `--per-object-fsync`, `--gpg-verify`,
 `--gpg-verify-summary`, `--require-static-deltas`, `--disable-static-deltas`,
-and the port extensions `--force-copy` and `-L/--localcache-repo`. The two
-durability switches follow the `pull` paragraph above. An object hardlinked from
-the source is not synced, in both, so from `archive` into `archive`
-`--per-object-fsync` adds no call. The same three differences stand, with
-`refs/heads` in place of `refs/remotes/<remote>` and no summary: the count
-over corpus `C0` is 12 in the port and 11 in the tool, and 13 and 11 for a
-commit that carries detached metadata. `pull-local` takes neither `--subpath`
-nor `--http-trusted` in either: the tool reports `error: Unknown option
-<option>` at exit 1, and `clap` refuses the option at exit 1. The library's
-local pull refuses a subpath with `unsupported: a local pull takes no
+and the port extensions `--force-copy`, `-L/--localcache-repo`,
+`--no-gpg-verify`, `--no-gpg-verify-summary`, `--no-sign-verify`, and
+`--no-sign-verify-summary`. Each `--no-` switch turns off one verification key
+of the remote that `--remote` names. It needs `--remote`, and
+`--no-gpg-verify` and `--no-gpg-verify-summary` conflict with their GPG
+switches. `clap` refuses a `--no-` switch with no `--remote` at exit 1. The
+tool refuses each `--no-` switch with `error: Unknown option <option>` at
+exit 1. The two durability switches follow the `pull` paragraph above. An
+object hardlinked from the source is not synced, in both, so from `archive`
+into `archive` `--per-object-fsync` adds no call. The same three differences
+stand, with `refs/heads` in place of `refs/remotes/<remote>` and no summary:
+the count over corpus `C0` is 12 in the port and 11 in the tool, and 13 and 11
+for a commit that carries detached metadata. `pull-local` takes neither
+`--subpath` nor `--http-trusted` in either: the tool reports `error: Unknown
+option <option>` at exit 1, and `clap` refuses the option at exit 1. The
+library's local pull refuses a subpath with `unsupported: a local pull takes no
 subpath`. A `--depth` below `-1` is refused in both, as on `pull`: the tool
 ends on the same assertion (`SIGABRT`, exit 134 from a shell), and the port
 refuses the value at exit 1. The port opens the source repository and each
@@ -3576,8 +3582,16 @@ port's own words. `--require-static-deltas` applies the delta the source's
 summary advertises, with the objects, the refs, and the statistics line of the
 tool, and refuses where the tool refuses (`cli-behavior.md`, "HTTP pull
 surface", "Static deltas over pull-local"). `--disable-static-deltas` changes
-nothing, since `pull-local` reads no delta by default. Seven differences stand:
+nothing, since `pull-local` reads no delta by default. Eight differences stand:
 
+- the verification keys of the remote. The port reads `gpg-verify`,
+  `gpg-verify-summary`, `sign-verify`, and `sign-verify-summary` of the
+  `[remote "NAME"]` group that `--remote` names, as `pull` does. A name with
+  no group gives no check. The tool reads none of these keys, and makes only
+  the checks that its switches ask for. So over an unsigned commit, a group
+  with `sign-verify=ed25519` and a trusted key, or a group that leaves
+  `gpg-verify` at its default, makes the port refuse the commit that the tool
+  imports. The port writes no object and no ref;
 - a value given to a GPG switch. The tool reads and discards the value, so
   `--gpg-verify=false` turns the check on. The port's `pull-local` takes both
   switches with no value, and `clap` refuses the suffix at exit 1. The port

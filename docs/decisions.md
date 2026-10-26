@@ -390,6 +390,41 @@ resolution, subkey bindings, expiry, revocation, the signature class and the
 digest policy. No fallback to the `gpgv` binary exists, so one engine and one
 policy give each verdict.
 
+## The signature policy of a local pull
+
+`Repo::pull_local` takes each field of `PullVerify` that is `None` from the
+`[remote "NAME"]` section that `PullOptions::remote` names. The four keys
+apply: `gpg-verify` (default true), `gpg-verify-summary`, `sign-verify`, and
+`sign-verify-summary`. For a remote with a section, the defaults are those of
+`Repo::pull`. So a local pull and a pull over HTTP of one remote apply one
+policy. The rule is in the library, so each caller of `Repo::pull_local` gets
+it.
+
+A remote name with no section gives no check. So `--remote` can name a ref
+namespace alone. A field that is `Some(true)` turns on its check for a name
+with no section too, and with no key the check fails. `Repo::pull` applies the
+defaults of a described remote to a name with no section, so its GPG check of
+the commits is on.
+
+`ostrya pull-local` has the off switches `--no-gpg-verify`,
+`--no-gpg-verify-summary`, `--no-sign-verify`, and `--no-sign-verify-summary`.
+Each switch sets its field of `PullVerify` to `Some(false)` and needs
+`--remote`. `--no-gpg-verify` conflicts with `--gpg-verify`, and
+`--no-gpg-verify-summary` conflicts with `--gpg-verify-summary`. The command
+has no switch that turns on a sign-api check. The two GPG switches take no
+value. The `ostree` command reads `--gpg-verify=false` as `--gpg-verify`, so a
+valued form in the port would give that spelling a different meaning.
+
+Two alternatives were rejected:
+
+- The rule of the `ostree` command, where only a switch turns on a check. The
+  command reads none of the four keys for `pull-local`
+  (`conformance/cli-behavior.md`, "Signature verification during a pull").
+  So a local pull accepts an unsigned commit from a remote whose config
+  requires a signature, and a pull over HTTP of the same remote refuses it.
+- The config read with no off switch. A configured check would then apply
+  to each local pull of the remote, and a command line could not turn it off.
+
 ## TLS stack
 
 The fetcher uses `rustls` 0.23 with `rustls-graviola` 0.4 as the crypto

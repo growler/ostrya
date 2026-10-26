@@ -368,17 +368,22 @@ pub enum TimestampCheck {
 /// The signature policy of a pull.
 ///
 /// Each field overrides the remote config key of the same name. If a field is
-/// `None`, [`Repo::pull`] takes the value from the config of the remote:
+/// `None`, the pull takes the value from the `[remote "NAME"]` section of the
+/// remote:
 ///
 /// - `gpg-verify`, default `true`.
 /// - `gpg-verify-summary`, default `false`.
 /// - `sign-verify` and `sign-verify-summary`, both default off.
 ///
-/// If a field is `None`, [`Repo::pull_local`] does not verify those
-/// signatures. The `ostree` command has the same defaults for `pull` and
-/// `pull-local`. A `Some` field sets the policy whatever the config says.
-/// `Some(true)` on a sign-api field selects each engine of this build, as
-/// `sign-verify=true` does.
+/// [`Repo::pull`] applies these defaults also to a remote that the config
+/// does not describe. [`Repo::pull_local`] reads the section of the remote
+/// that [`PullOptions::remote`] names. If the local pull names no remote, or
+/// the config has no section for the remote, a `None` field gives no check.
+/// The `pull-local` command of `ostree` reads none of these keys.
+///
+/// A `Some` field sets the policy whatever the config says, so `Some(false)`
+/// turns a configured check off. `Some(true)` on a sign-api field selects
+/// each engine of this build, as `sign-verify=true` does.
 ///
 /// The keys come from the config section of a remote. If a pull names no
 /// remote and asks for a verification, it fails with [`Error::Pull`] before
@@ -747,6 +752,9 @@ pub struct PullOptions {
     pub refs: Vec<String>,
     /// The remote name under which the pull writes the refs
     /// (`refs/remotes/<remote>/<ref>`).
+    ///
+    /// For a local pull, the name also selects the `[remote "NAME"]` section
+    /// whose verification keys apply (see [`PullVerify`]).
     ///
     /// If the value is `None`, a local pull and [`Repo::pull_with_session`]
     /// write local refs under `refs/heads/`. [`Repo::pull`] then writes the
@@ -1380,6 +1388,21 @@ impl Repo {
     /// [`PullVerify`] states. The module [`pull`](self) states the rules of
     /// the `.commitpartial` markers.
     ///
+    /// # Remote config
+    ///
+    /// The pull reads the verification keys of the `[remote "NAME"]` section
+    /// that [`remote`](PullOptions::remote) names, as [`Repo::pull`] does.
+    /// Each field of [`verify`](PullOptions::verify) that is set wins over its
+    /// key. If the pull names no remote, or the config has no section for the
+    /// remote, the pull makes only the checks that the fields ask for. The
+    /// `pull-local` command of `ostree` reads none of these keys.
+    ///
+    /// A section with no `gpg-verify` key turns on the GPG check of the
+    /// commits. A build without the feature `verify-gpg`, which is the default
+    /// feature set, then refuses the pull with [`Error::Unsupported`] before
+    /// it reads `src`. To pull without the check, set `gpg-verify=false` in
+    /// the section, or set [`PullVerify::gpg`] to `Some(false)`.
+    ///
     /// # Sources
     ///
     /// The pull reads the source repository first, and then each of
@@ -1675,6 +1698,16 @@ impl Repo {
     ///   or if a name holds `:`, before the pull reads `src`.
     /// - [`Error::Pull`] if the options ask for a signature verification and
     ///   name no [`remote`](PullOptions::remote).
+    /// - [`Error::Unsupported`] if the policy asks for GPG verification and
+    ///   the build has no `verify-gpg` feature, or if `sign-verify` or
+    ///   `sign-verify-summary` names an engine that this build does not
+    ///   verify with. The pull makes these checks before it reads `src`.
+    /// - [`Error::Core`] if a verification key of the remote section is
+    ///   malformed: `gpg-verify` or `gpg-verify-summary` is not a boolean,
+    ///   or a sign-api key is not valid base64.
+    /// - [`Error::Signature`] if the policy selects a sign-api engine that has
+    ///   no trusted key, or if a keyring or a key file of the remote cannot
+    ///   be read.
     /// - [`Error::Pull`] if the pull requires static deltas and `src` has no
     ///   summary, or no delta for a commit. With a `static_deltas` list, the
     ///   pull needs no summary, and fails if no chain of the list reaches a
@@ -1735,7 +1768,7 @@ impl Repo {
             self,
             opts.remote.as_deref(),
             &opts.verify,
-            crate::verify::Defaults::Off,
+            crate::verify::Defaults::Section,
         )
         .await?;
         let verification = verify::Verification::from_trust(trust);

@@ -528,6 +528,24 @@ fn ostree_supports_ed25519() -> bool {
     false
 }
 
+/// Returns `true` if the `ostree` command carries its spki signing engine.
+/// `ostree --version` reports the engine as the `sign-spki` feature, next to
+/// the `openssl` feature that the engine needs, each on one line. An `ostree`
+/// build without the engine refuses every spki invocation with `Requested
+/// signature type is not implemented`. A test that runs on both builds asserts
+/// the behavior of the build at hand.
+fn ostree_has_spki() -> bool {
+    Command::new("ostree")
+        .arg("--version")
+        .output()
+        .map(|o| {
+            let stdout = String::from_utf8_lossy(&o.stdout);
+            let has = |feature: &str| stdout.lines().any(|line| line.trim() == feature);
+            has("- openssl") && has("- sign-spki")
+        })
+        .unwrap_or(false)
+}
+
 /// The commit a ref resolves to, read through the library.
 fn resolve(repo: &Path, refspec: &str) -> Option<String> {
     block_on(async {
@@ -34425,16 +34443,47 @@ fn summary_sign_refusals_keep_files() {
         assert_eq!(summary_files(&tool), before, "the tool changed `{label}`");
     }
 
-    // The `spki` engine, which the build of `ostree` does not have for this
-    // option: `ostree` refuses the name, and ostrya refuses the key that the
-    // engine cannot read. Both commands refuse before the regeneration.
+    // The `spki` engine with a key that it cannot read. An `ostree` build with
+    // the engine refuses the key, and a build without it refuses the name.
+    // ostrya refuses the key. Both commands refuse before the regeneration.
     let (port_run, tool_run) =
         summary_update_both(&port, &tool, &["--sign=zzz", &k1, "--sign-type=spki"], &[]);
     assert_eq!(
         first_stderr_line(&tool_run),
-        "error: Requested signature type is not implemented"
+        if ostree_has_spki() {
+            "error: openssl: Failed to initialize spki key"
+        } else {
+            "error: Requested signature type is not implemented"
+        }
     );
     assert_eq!(port_run.status.code(), Some(1));
+    assert_eq!(summary_files(&port), before);
+    assert_eq!(summary_files(&tool), before);
+
+    // The `gpg` engine, which the build of `ostree` does not have for this
+    // option: `ostree` refuses the name. ostrya with the engine refuses the
+    // selector, which is too short for a key lookup, and ostrya without the
+    // engine refuses the name. Both commands refuse before the regeneration.
+    let (port_run, tool_run) =
+        summary_update_both(&port, &tool, &["--sign=zzz", "--sign-type=gpg"], &[]);
+    for (who, run) in [("port", &port_run), ("tool", &tool_run)] {
+        assert_eq!(run.status.code(), Some(1), "the {who} took --sign-type=gpg");
+        assert!(run.stdout.is_empty(), "the {who} wrote to stdout");
+    }
+    assert_eq!(
+        first_stderr_line(&tool_run),
+        "error: Requested signature type is not implemented"
+    );
+    #[cfg(feature = "gpg")]
+    assert_eq!(
+        first_stderr_line(&port_run),
+        "error: Unable to lookup key ID zzz: GPGME: Invalid value"
+    );
+    #[cfg(not(feature = "gpg"))]
+    assert_eq!(
+        first_stderr_line(&port_run),
+        "error: Requested signature type is not implemented"
+    );
     assert_eq!(summary_files(&port), before);
     assert_eq!(summary_files(&tool), before);
 
@@ -38984,11 +39033,15 @@ fn static_delta_apply_offline_refusals_match_the_tool() {
 /// - `ostree` applies with a key that decodes to no curve point. ostrya
 ///   refuses. This is true over an unsigned delta. It is also true over a
 ///   signed delta, next to a key that verifies the delta, in each order.
-/// - `ostree` refuses `--sign-type=spki`. ostrya applies with it in a build
-///   that has the engine.
 ///
 /// Both commands refuse a part that does not open and a superblock that does
 /// not parse, with different messages.
+///
+/// The test also applies with `--sign-type=spki`. This case is not a recorded
+/// divergence, and it asserts the behavior of the `ostree` build at hand. An
+/// `ostree` build without the spki engine refuses the name. An `ostree` build
+/// with the engine applies the delta and writes the objects that ostrya
+/// writes. ostrya applies with it in a build that has the engine.
 #[test]
 fn static_delta_apply_offline_divergences_stand_as_recorded() {
     if !ostree_supports_ed25519() {
@@ -39063,12 +39116,22 @@ fn static_delta_apply_offline_divergences_stand_as_recorded() {
     }
     let (port, tool, port_objects, tool_objects) =
         run_both_into("spki", &["--sign-type=spki", &delta]);
-    assert_eq!(tool.status.code(), Some(1));
-    assert_eq!(tool_objects, []);
+    let tool_has_spki = ostree_has_spki();
+    if tool_has_spki {
+        assert_eq!(tool.status.code(), Some(0));
+        assert!(!tool_objects.is_empty());
+    } else {
+        assert_eq!(tool.status.code(), Some(1));
+        assert_eq!(tool_objects, []);
+    }
     #[cfg(feature = "spki")]
     {
         assert_eq!(port.status.code(), Some(0));
         assert!(!port_objects.is_empty());
+        if tool_has_spki {
+            assert_eq!((&port.stdout, &port.stderr), (&tool.stdout, &tool.stderr));
+            assert_eq!(port_objects, tool_objects);
+        }
     }
     #[cfg(not(feature = "spki"))]
     {

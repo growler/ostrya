@@ -12003,15 +12003,20 @@ cell: summary/sign-type-engine-port-carries
 setup: repo-with-commit
 outcome: lossy
 severity: interop
-loss: `--sign-type=spki` and `--sign-type=gpg` beside `--sign`. The tool's build
- carries neither engine for this option and refuses the name with
- `error: Requested signature type is not implemented`; the port carries both
- where it is built with them and reads the key, the divergence `commit
- --sign-type` already records (`cli-surface.md`, "summary").
+loss: `--sign-type=gpg` beside `--sign`. The tool's build carries no gpg
+ engine for this option and refuses the name with `error: Requested signature
+ type is not implemented`. The port carries the engine where it is built with
+ it and reads the key, the divergence `commit --sign-type` already records
+ (`cli-surface.md`, "summary"). Only a tool build without the spki engine
+ refuses `--sign-type=spki` in this way.
 evidence: ostrya_cli::cli::summary_sign_refusals_keep_files
 spec: cli-surface.md#p2----options-missing-from-commands-that-exist
-note: the cited test gives a key the spki engine cannot read, which both refuse
- at exit 1 in their own words before the regeneration.
+note: the cited test gives `--sign=zzz --sign-type=gpg`. The tool refuses the
+ name at exit 1 with `error: Requested signature type is not implemented`. The
+ port built with the `gpg` feature refuses the selector at exit 1 with `error:
+ Unable to lookup key ID zzz: GPGME: Invalid value`, and the port built without
+ it refuses the name in the words of the tool. Each refuses before the
+ regeneration and keeps `summary` and `summary.sig`.
 
 family: M10
 subcommand: summary

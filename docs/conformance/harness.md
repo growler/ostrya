@@ -431,6 +431,14 @@ describes the tool's build and states nothing about the port, and it would
 otherwise satisfy a test asserting the tool rejects a signature.
 `OSTRYA_REQUIRE_OSTREE_ED25519` turns the skip into a failure.
 
+The spki engine of the tool gates the tests in which the tool verifies the
+spki signatures of the port: `<type>_tool_verifies_port_signatures` in
+`crates/ostrya/tests/sign_spki_fixtures.rs`. Each test runs its port part
+first. The port signs the commit, a static delta, and the summary, and
+verifies the signatures of the delta and of the summary. Where `ostree
+--version` does not list the `openssl` and `sign-spki` features, the test
+then skips. `OSTRYA_REQUIRE_OSTREE_SPKI` turns the skip into a failure.
+
 ## Severity and exit status
 
 A record's `severity:` is `interop` or `identity`. An `interop` failure fails

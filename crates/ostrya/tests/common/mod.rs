@@ -597,6 +597,46 @@ pub fn ostree_supports_ed25519() -> bool {
     supported
 }
 
+/// The environment variable that turns the skip for a missing spki engine
+/// into a failure.
+///
+/// A harness that sets it declares that the installed `ostree` command has the
+/// spki engine. If the engine is absent in such a run, the harness is broken,
+/// so the test fails.
+pub const REQUIRE_OSTREE_SPKI: &str = "OSTRYA_REQUIRE_OSTREE_SPKI";
+
+/// Returns `true` if the `ostree` command has its spki signing engine.
+///
+/// `ostree --version` reports the engine as the `sign-spki` feature, next to
+/// the `openssl` feature that the engine needs. Each feature is one line of
+/// the list. The engine is a build option. A build of the command without the
+/// engine refuses each spki invocation with
+/// `Requested signature type is not implemented`.
+///
+/// Tests that tell the command to verify with spki skip if the engine is
+/// absent. Such a refusal describes the build of the command and states
+/// nothing about ostrya. Without the skip, the refusal also satisfies a test
+/// that asserts that the command rejects a signature. If
+/// [`REQUIRE_OSTREE_SPKI`] is set, an absent engine fails the test.
+pub fn ostree_supports_spki() -> bool {
+    let supported = ostree_available()
+        && Command::new("ostree")
+            .arg("--version")
+            .output()
+            .map(|o| {
+                let stdout = String::from_utf8_lossy(&o.stdout);
+                let has = |feature: &str| stdout.lines().any(|line| line.trim() == feature);
+                has("- openssl") && has("- sign-spki")
+            })
+            .unwrap_or(false);
+    assert!(
+        supported || std::env::var_os(REQUIRE_OSTREE_SPKI).is_none(),
+        "{REQUIRE_OSTREE_SPKI} is set and the installed `ostree` carries no \
+         spki engine, so the spki cross-check tests cannot run"
+    );
+    supported
+}
+
 /// Returns `true` if the `openssl` command is available for the cross-check
 /// tests.
 pub fn openssl_available() -> bool {
@@ -605,6 +645,17 @@ pub fn openssl_available() -> bool {
         .output()
         .map(|o| o.status.success())
         .unwrap_or(false)
+}
+
+/// Returns a PEM block of `kind` around the base64 text `b64`. The body has
+/// one line for each 64 characters, the line width of RFC 7468.
+pub fn wrap_pem(kind: &str, b64: &str) -> String {
+    let mut body = String::new();
+    for chunk in b64.as_bytes().chunks(64) {
+        body.push_str(std::str::from_utf8(chunk).unwrap());
+        body.push('\n');
+    }
+    format!("-----BEGIN {kind}-----\n{body}-----END {kind}-----\n")
 }
 
 /// The environment variable that turns the skip for an absent GnuPG binary

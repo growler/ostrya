@@ -105,6 +105,11 @@ for it.
 - `rsa` 0.10 with the fix for RUSTSEC-2023-0071. The RSA key type of the
   spki engine takes `rsa` 0.9.10, which has no fix. The move to a release
   with the fix comes with a review of the advisory exception in `CLAUDE.md`.
+- More key types in the spki engine. The engine takes ECDSA P-256, ECDSA
+  P-384, Ed25519, and RSA. The `ostree` command also signs and verifies with
+  ECDSA P-521 and ML-DSA. Each type can come later with its key feature, its
+  tool fixtures, and the cross-check with the `ostree` command. A type that
+  needs a new crate needs the authorization of the maintainer first.
 
 ## Gaps of bucket repositories
 
@@ -224,9 +229,6 @@ until each one is made.
   as `OSTRYA_REQUIRE_GNUPG` does for GnuPG.
 - No test compares `ostrya-composefs` with the `composefs-rs` writer. The
   golden tests compare with the images of the `ostree` command alone.
-- The spki engine is not checked against the `ostree` command. The test
-  `spki_tool_cross_verify_pending` skips until a build of the command with
-  spki is available.
 - GPG verification:
   - Three rules are not measured: a designation through signature subpacket
     12 on an expired self-signature, a revocation signature after its own

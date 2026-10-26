@@ -16,6 +16,8 @@ use std::sync::Arc;
 use common::TmpDir;
 #[cfg(feature = "verify-gpg")]
 use common::receive::GnupgHome;
+#[cfg(feature = "sign-spki-p256")]
+use common::wrap_pem;
 use ostrya::access::{AccessModes, AuthItem, Namespace};
 use ostrya::{
     CreateOptions, Error, ReceivePolicies, ReceivePolicy, ReceiveVerify, Repo, RepoMode,
@@ -414,19 +416,6 @@ const SPKI_SECRET_B: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQga/V
 97ybXVngf9XlVRkpxQl0PMHYB2GhRANCAARapiXxcZO+MwxDicFtiWeYWfMDNYF8\
 zlrMtaYLMVD5RNnxfTNPW/JLR8DreWpEAJCsrmwMcsVoL66GqkOOOx1R";
 
-/// Returns a PEM block of `label` around the base64 text `b64`, with
-/// 64-column lines.
-#[cfg(feature = "sign-spki-p256")]
-fn pem_block(label: &str, b64: &str) -> String {
-    let mut text = format!("-----BEGIN {label}-----\n");
-    for chunk in b64.as_bytes().chunks(64) {
-        text.push_str(std::str::from_utf8(chunk).unwrap());
-        text.push('\n');
-    }
-    text.push_str(&format!("-----END {label}-----\n"));
-    text
-}
-
 /// Returns the refusal of an spki key group whose secret key file holds
 /// `contents`.
 #[cfg(feature = "sign-spki-p256")]
@@ -458,8 +447,8 @@ fn an_spki_key_group_is_read() {
         &file,
         format!(
             "a comment\n{}{}",
-            pem_block("PRIVATE KEY", SPKI_SECRET_A),
-            pem_block("PRIVATE KEY", SPKI_SECRET_B)
+            wrap_pem("PRIVATE KEY", SPKI_SECRET_A),
+            wrap_pem("PRIVATE KEY", SPKI_SECRET_B)
         ),
     )
     .unwrap();
@@ -521,13 +510,13 @@ fn an_spki_key_group_reads_an_rsa_key() {
 #[cfg(feature = "sign-spki-p256")]
 #[test]
 fn an_spki_key_group_file_holds_pem_blocks() {
-    let key = pem_block("PRIVATE KEY", SPKI_SECRET_A);
-    let public = pem_block(
+    let key = wrap_pem("PRIVATE KEY", SPKI_SECRET_A);
+    let public = wrap_pem(
         "PUBLIC KEY",
         "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE8X83xylD3ibci0xjFKMR4bwUtTU/\
          YLloVEDxomUS2SHAfFnN3LHVVNYjok0Zm2RiiU7XpDnRAG1Ua8eR8SKbLQ==",
     );
-    let sec1 = pem_block(
+    let sec1 = wrap_pem(
         "EC PRIVATE KEY",
         "MHcCAQEEINi+9PBLJ58xxEdEmGrDDSFHBr+t0GqQv95FbKD3q8yhoAoGCCqGSM49AwEHoUQD\
          QgAE8X83xylD3ibci0xjFKMR4bwUtTU/YLloVEDxomUS2SHAfFnN3LHVVNYjok0Zm2RiiU7XpDn\
@@ -841,7 +830,7 @@ fn a_trust_group_spki_key_is_a_subject_public_key_info() {
 #[cfg(feature = "sign-spki-p256")]
 #[test]
 fn an_spki_key_group_refuses_a_raw_scalar() {
-    let err = spki_key_group_refusal(&pem_block(
+    let err = spki_key_group_refusal(&wrap_pem(
         "PRIVATE KEY",
         "2L708EsnnzHER0SYasMNIUcGv63QapC/3kVsoPerzKE=",
     ));

@@ -1403,12 +1403,13 @@ nothing, and a ref write that cannot happen leaves the commit and its
 verifies through the other's `show --gpg-verify-remote`. Twelve divergences
 stand.
 
-- `--sign-type` names an engine the port carries and this tool build does not.
-  The tool's build reports `error: Requested signature type is not implemented`
-  for `spki` and for `gpg`, where the port signs under `spki` when it is built
-  with the `spki` feature and under `gpg` when it is built with the `gpg`
-  feature. This is the rule `remote --sign-verify=spki=...` already carries:
-  each refuses an engine it does not carry in those same words. Every other
+- `--sign-type=gpg` names an engine the port carries and the tool build does
+  not. The tool's build reports `error: Requested signature type is not
+  implemented` for `gpg`, where the port signs under `gpg` when it is built
+  with the `gpg` feature. Under `spki` both sign: the `ostree` 2026.1 build
+  with OpenSSL on the NixOS development host, and the port when it is built
+  with the `spki` feature. A tool build without the features `openssl` and
+  `sign-spki` refuses `spki` with the same `not implemented` line. Every other
   name parts in neither implementation -- `dummy` reports `error: dummy
   signature type is only for ostree testing`, and a name no engine carries,
   the empty string, `ED25519`, and a whitespace-padded name each report
@@ -2579,14 +2580,17 @@ and `summary.sig` as they stood (`cli-behavior.md`, "CLI output formats",
   `static-delta` entry below records for the index files. The entries and each
   digest agree. For some sets the tool's order is name order by chance, and
   the two maps then agree;
-- `--sign-type` names an engine the port carries and this tool build does not,
-  the rule `commit --sign-type` already records. The tool's build reports
-  `error: Requested signature type is not implemented` for `spki` and `gpg`
-  beside `--sign`, where the port reads the key under `spki` when it is built
-  with the `spki` feature and under `gpg` when it is built with the `gpg`
-  feature. The port reads a `spki` key before the regeneration, and it looks
-  up a `gpg` selector given to `--sign` or as a positional key before the
-  regeneration, the way it looks up a `--gpg-sign` selector;
+- `--sign-type=gpg` names an engine the port carries and the tool build does
+  not, the rule `commit --sign-type` already records. The tool's build reports
+  `error: Requested signature type is not implemented` for `gpg` beside
+  `--sign`, where the port reads the key under `gpg` when it is built with the
+  `gpg` feature. The port looks up a `gpg` selector given to `--sign` or as a
+  positional key before the regeneration, the way it looks up a `--gpg-sign`
+  selector. Under `spki` both read the key before the regeneration: the
+  `ostree` 2026.1 build with OpenSSL on the NixOS development host, and the
+  port when it is built with the `spki` feature. A tool build without the
+  features `openssl` and `sign-spki` refuses `spki` with the same `not
+  implemented` line;
 - `-m` in a repository with a collection id. The tool adds the caller keys to
   the metadata of the `ostree-metadata` anchor commit as well. The two
   bindings win over a caller key of the same name, a repeated caller key takes
@@ -2655,7 +2659,7 @@ states for `commit --sign-type`. `reindex` takes `--to=REV`, which rewrites or
 removes the index file of one target and reads REV by the rule of one half of a
 delta name; the last `--to` wins. A `--keys-file` and each key-store file of
 the spki engine hold PEM `PUBLIC KEY` blocks (`format-reference.md`, "Signing
-details", "spki"). Forty-four differences stand on `show`,
+details", "spki"). Forty-three differences stand on `show`,
 `delete`, `list`, `indexes`, `verify`, `apply-offline`, and `reindex`.
 
 - a superblock file over 128 MiB (134217728 bytes). The port refuses it in
@@ -2805,9 +2809,6 @@ details", "spki"). Forty-four differences stand on `show`,
   exit 0 with no key source, and applies an unsigned delta at exit 0 under a
   key. Over a signed delta under a key, the tool reports `error: no signature
   for 'ostree.sign.dummy' in static-delta superblock` at exit 1;
-- `apply-offline --sign-type=spki`. The port applies the delta in a build that
-  carries the engine and checks spki signatures under a key source. The tool
-  reports `error: Requested signature type is not implemented` at exit 1;
 - the GLib warning before the unknown-sign-type error of `apply-offline`. The
   tool writes a GLib warning block on standard error and then `error:
   Requested signature type is not implemented`. The port writes the last line
@@ -3617,10 +3618,11 @@ nothing, since `pull-local` reads no delta by default. Seven differences stand:
   own `fsck` and the `fsck` of the tool.
 
 `sign` accepts the whole tool option set and adds `--gpg-homedir`,
-`--remote`, the `gpg` engine, and the `spki` engine. The tool build at hand,
-`ostree` 2026.1 with the `sign-ed25519` feature, refuses `-s spki` in signing,
-`--verify`, and `-d` with `error: Requested signature type is not
-implemented` at exit 1. Under `-s gpg` each `--keys-file` of a verify or a
+`--remote`, and the `gpg` engine. The `ostree` 2026.1 build with OpenSSL on
+the NixOS development host carries `-s spki` in signing, `--verify`, and
+`-d`. A tool build without the features `openssl` and `sign-spki` refuses
+`-s spki` in each with `error: Requested signature type is not implemented`
+at exit 1. Under `-s gpg` each `--keys-file` of a verify or a
 `-d` is a keyring, and every keyring given is read; a gpg signing run refuses
 `--keys-file`. Under `ed25519` and `spki`,
 `--verify` reads the key sources of `static-delta verify`: the positionals and
@@ -3885,7 +3887,7 @@ No matrix cell needs these. The shell suite invokes them.
 `remote` landed in Phase 17e: `add`, `delete`, `list`, `show-url`, `refs`,
 `summary`, `gpg-import`, and `gpg-list-keys`, with the option set the tool
 carries on each and the output formats `cli-behavior.md`, "`remote`",
-records. Thirteen divergences stand:
+records. Twelve divergences stand:
 
 - the tool's `remote` accepts no `--repo` of its own -- `ostree remote --repo=R
   list` reports `error: Unknown option --repo=R`, where the leading position
@@ -3900,10 +3902,6 @@ records. Thirteen divergences stand:
   separator was, and the port's with none. Removing a section any other section
   follows leaves the two files identical, and both documents reparse to the same
   configuration;
-- `--sign-verify=spki=...` reports `error: Requested signature type is not
-  implemented` from the tool, whose build carries the ed25519 engine alone, and
-  the port accepts it where it is built with the `spki` feature. Each refuses an
-  engine it does not carry in those same words;
 - a `verification-spki-key` that is not the base64 of a SubjectPublicKeyInfo
   DER: the base64 of a raw SEC1 point, of the full PEM text, or of a PKCS#8
   secret key. The `ostree` 2026.1 build with OpenSSL on the NixOS development

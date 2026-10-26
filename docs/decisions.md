@@ -295,13 +295,13 @@ each key type. The GPG engine keeps its uppercase hex fingerprint. The report
 of `sign --verify` and `summary --verify` prints the fingerprint under the
 GPG engine alone.
 
-The build of the `ostree` command with OpenSSL on the development host has
-the spki engine. The test `spki_tool_cross_verify_pending` runs the
-cross-check with the `ostree` command when the command has the engine, and
-skips when the command reports the engine as not implemented. The test
-`spki_openssl_interop` cross-checks the engine against the `openssl` command
-in both directions. `format-reference.md`, "Signing details", marks the spki
-facts as a design target.
+The OpenSSL build of the `ostree` command on the development host has the
+spki engine. The tests in `crates/ostrya/tests/sign_spki_fixtures.rs` compare
+the engine with this build in both directions for each key type: the port
+verifies the signatures of the fixtures that the tool wrote, and the tool
+verifies a commit, a summary, and a static delta that the port signs. Without
+this build, the second direction skips. The test `spki_openssl_interop`
+compares the engine with the `openssl` command in both directions.
 
 The spki signer signs in the call to `Signer::sign`, and its future is ready
 at once, so a program with no async runtime can sign and verify. An RSA

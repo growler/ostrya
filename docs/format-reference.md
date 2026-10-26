@@ -2183,8 +2183,12 @@ if a line holds white space, or if a line is not the base64 of a secret key.
 Each line gives one signer, in the order of the file, after the signers of
 `--sign`. Each `--keys-file` adds its signers.
 
-Design target: the public ostree documentation gives the public key container
-and the key store layout. The curve, the hash, the DER signature encoding, and
+Observed behavior: the spki signatures are checked against the `ostree`
+command in both directions, for ECDSA P-256, ECDSA P-384, Ed25519, and RSA.
+The port verifies the signatures of a commit, a summary, and a static delta
+that the tool wrote. The tool verifies the signatures of a commit, a summary,
+and a static delta that the port wrote. The fixtures are in
+`tests/fixtures/spki/`. The curve, the hash, the DER signature encoding, and
 the key DER containers are the standard OpenSSL and RFC forms. The RSA
 signature and the RSA key structures are those of RFC 8017. The Ed25519
 signature is that of RFC 8032, and the Ed25519 key structures are those of

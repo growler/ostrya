@@ -16,11 +16,15 @@ The document records:
 - the output format, the error text, and the exit status of the commands
   that "CLI output formats" lists
 
-The tool is `ostree` 2026.1, built with the `sign-ed25519` feature. This build
-refuses the `spki` signature engine with `error: Requested signature type is
-not implemented`. A statement about the tool with no label is observed
-behavior: a run of this build records the fact. Two labels mark the other
-statements:
+The tool is `ostree` 2026.1. A statement about the tool with no label is
+observed behavior: a run of the tool records the fact. The facts about the
+spki engine come from the build on the NixOS development host. `ostree
+--version` of this build lists the features `sign-ed25519`, `openssl`, and
+`sign-spki`, and the build links `libcrypto.so.3` of OpenSSL 3.6.4. Facts
+outside the spki engine also come from a build with the `sign-ed25519`
+feature and no spki engine. A build without the features `openssl` and
+`sign-spki` refuses the `spki` signature engine with `error: Requested
+signature type is not implemented`. Two labels mark the other statements:
 
 - Not observed: no run of the tool records the item that follows the label.
   Where the port has a rule for the item, the next sentence states it and
@@ -5103,9 +5107,8 @@ of step 3.
 2. The sign type. `ed25519` is the default, and the name follows the rule of
    `commit`, "Signing". `gpg`, the empty name, and each name that no engine of
    the build carries print `Sign-type not supported` on standard output. They
-   then report `error: Requested signature type is not implemented`.
-   `cli-surface.md`, "P2", `static-delta`, records the port side for
-   `spki`.
+   then report `error: Requested signature type is not implemented`. This
+   build carries `spki`, and `spki` passes this step.
 
    The tool takes `dummy` at this step. It reads the keys and then reports
    `Verification fails` with a reason, for example `no signature for
@@ -5468,6 +5471,85 @@ The tool reads these PKCS#8 forms of the secret key:
 
 `cli-surface.md`, "P2", `sign`, records the port side.
 
+#### spki key store and verify report
+
+The `ostree` 2026.1 build with OpenSSL on the NixOS development host reads the
+spki key store and reports a verify as follows. Observed on 2026-10-24 and on
+2026-10-26. The runs of 2026-10-24 used P-256 keys that `openssl genpkey`
+made. Later runs also used the keys of the fixtures in `tests/fixtures/spki/`:
+
+- `sign --verify --keys-dir=DIR` and `static-delta verify --keys-dir=DIR` read
+  `trusted.spki` and each file in `trusted.spki.d/` as PEM `PUBLIC KEY` blocks.
+  The tool reads the `.d` directory also when `trusted.spki` does not exist.
+- A `trusted.spki` of base64 SubjectPublicKeyInfo lines reports `error:
+  signature: spki: no keys loaded` at exit 1. An empty directory gives the same
+  error.
+- `revoked.spki` and each file in `revoked.spki.d/` hold PEM `PUBLIC KEY`
+  blocks. The tool removes a revoked key from the trusted set. Where the
+  revoked set removes each trusted key, the verify reports `error: spki: no
+  signatures found` at exit 1.
+- On success, `sign --verify` writes `spki: Signature verified successfully
+  with key '<hex>'`, where `<hex>` is a SubjectPublicKeyInfo DER in hex. With
+  the P-256 key that signed the commit and other keys in a `--keys-file` or a
+  key store, in each order, the line names the P-256 key.
+- On failure, `sign --verify` counts each pair of a signature and a trusted
+  key. With 1 to 3 pairs, the line is `error: spki: Signature couldn't be
+  verified with:`, then one `key '<hex>'` for each pair, joined by `; `. One
+  signature and two keys give the two keys, the last key of the file first.
+  Three signatures and one key give that key three times. With 4 or more
+  pairs, the line is `error: spki: Signature couldn't be verified; tried <n>
+  keys`, where `<n>` is the number of pairs. Two signatures and two keys give
+  `tried 4 keys`, and one signature and four keys give `tried 4 keys`.
+- The tool signs ECDSA with a random nonce. Four signatures of one P-256 key
+  over one commit are four different blobs. The tool does not make s low: the
+  P-256 and the P-384 fixtures each hold a signature with an s above half of
+  the order of the curve.
+
+The remote config of the spki engine:
+
+- `remote add --sign-verify=spki=inline:KEY` writes
+  `verification-spki-key=KEY` and `sign-verify=spki`. `remote add
+  --sign-verify=spki=file:PATH` writes `verification-spki-file=PATH` and
+  `sign-verify=spki`.
+- With both `verification-spki-key` and `verification-spki-file`, the trusted
+  set is the key and the keys of the file together. A commit that either key
+  signed pulls at exit 0.
+- `sign-verify=true` with `verification-spki-key` or `verification-spki-file`
+  turns on spki verification. A commit that the trusted key signed pulls at
+  exit 0. With a `verification-spki-key` of another key, the pull reports
+  `error: Can't verify commit <hex>: ed25519: commit have no signatures of my
+  type` at exit 1.
+- Under `sign-verify=spki` and `verification-spki-file`, a pull of an unsigned
+  commit reports `error: Can't verify commit <hex>: spki: commit have no
+  signatures of my type` at exit 1.
+
+`cli-surface.md`, "P2", `sign`, `static-delta`, and `remote`, records the port
+side.
+
+#### spki signatures of the port
+
+The `ostree` 2026.1 build with OpenSSL on the NixOS development host verifies
+the spki signatures that the port writes. Observed on 2026-10-26. The port
+signs a copy of the `archive` fixture with `secret.pem` of each fixture in
+`tests/fixtures/spki/`: P-256, P-384, Ed25519, and RSA. It signs the commit,
+writes a signed static delta from scratch to the commit, and writes a signed
+summary. With `public.pem` of the fixture:
+
+- `sign --verify -s spki --keys-file=<path>` writes `spki: Signature verified
+  successfully with key '<hex>'` at exit 0.
+- `static-delta verify --sign-type=spki --keys-file=<path>` prints
+  `Verification OK` at exit 0.
+- `remote summary` exits 0 in a client repository whose `file://` remote sets
+  `sign-verify-summary=true` and `verification-spki-file=<path>`.
+
+The PEM `PUBLIC KEY` file of another key of the same type, which signed
+nothing, fails each of the three verifies at exit 1. Standard error holds
+`spki: Signature couldn't be verified with:`, and `static-delta verify` prints
+`Verification fails`. The tests `<type>_tool_verifies_port_signatures` in
+`crates/ostrya/tests/sign_spki_fixtures.rs` make these checks. Against a
+trusted P-256 or P-384 key, the tool also verifies at exit 0 an ECDSA
+signature blob that it cannot parse (`cli-surface.md`, "P2", `sign`).
+
 #### `apply-offline`
 
 `apply-offline PATH [KEY-ID...]` applies one delta into the repository. The
@@ -5503,13 +5585,15 @@ this order, and each refusal writes no object and no ref:
 
 1. No PATH reports `error: PATH must be specified`. The tool opens the
    repository before this check.
-2. The sign type, also with no key source. `ed25519` is the default, and
-   `ed25519` with no key source checks nothing. `gpg`, the empty name, and each
-   name that no engine of the build carries report `error: Requested signature
-   type is not implemented`. Nothing goes to standard output. The tool writes a
-   GLib warning block on standard error before that line. `cli-surface.md`,
-   "P2", `static-delta`, records the port side for the warning, for `spki`,
-   and for `dummy`.
+2. The sign type, also with no key source. `ed25519` is the default.
+   `ed25519` and `spki` with no key source check nothing. `apply-offline
+   --sign-type=spki` with no key source applies an unsigned delta, a delta
+   that ed25519 signed, and a delta that spki signed, at exit 0 with both
+   streams empty. `gpg`, the empty name, and each name that no engine of the
+   build carries report `error: Requested signature type is not implemented`.
+   Nothing goes to standard output. The tool writes a GLib warning block on
+   standard error before that line. `cli-surface.md`, "P2", `static-delta`,
+   records the port side for the warning and for `dummy`.
 3. The keys load where a key source is given. A key source is a positional
    KEY-ID, a `--keys-file`, or a `--keys-dir`. The keys load under
    `static-delta`, "Key sources". The tool refuses here with the text of each

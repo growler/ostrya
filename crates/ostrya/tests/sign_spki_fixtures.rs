@@ -1,4 +1,5 @@
-//! Integration tests that verify spki signatures that the `ostree` tool wrote.
+//! Integration tests that compare the spki engine with the `ostree` tool in
+//! both directions.
 //!
 //! The fixtures are in `tests/fixtures/spki/<key type>/`, where the key type is
 //! `p256`, `p384`, `ed25519`, or `rsa`. Each fixture holds a key pair and a copy of the `archive`
@@ -20,6 +21,15 @@
 //! The tests do not make the fixtures again. Each run of the script makes a
 //! new key, so a run gives new bytes. The fixtures are committed, and the
 //! script runs only to replace them.
+//!
+//! In the other direction, the test `<key type>_tool_verifies_port_signatures`
+//! of each module signs a copy of the `archive` fixture repository with the
+//! fixture key. The port signs the commit, a static delta, and the summary.
+//! The tool then verifies each signature with the public key of the fixture,
+//! and refuses each signature with a key of the same type that signed nothing.
+//! This part needs a build of the tool with the features `openssl` and
+//! `sign-spki` in `ostree --version`. Without such a build the part skips, and
+//! `OSTRYA_REQUIRE_OSTREE_SPKI` turns the skip into a failure.
 
 #![cfg(any(
     feature = "sign-spki-p256",
@@ -31,11 +41,13 @@
 mod common;
 
 use std::path::PathBuf;
+use std::process::{Command, Output};
+use std::sync::Arc;
 
-use common::fixture_root;
+use common::{TmpDir, fixture_repo, fixture_root, ostree_supports_spki};
 use ostrya::{
-    Checksum, Repo, SpkiSigner, SpkiVerifier, Value, spki_public_keys, spki_secret_keys,
-    static_delta_relative_dir,
+    Checksum, DeltaOptions, Repo, Signer, SpkiSigner, SpkiVerifier, SummaryOptions, Value,
+    spki_public_keys, spki_secret_keys, static_delta_relative_dir,
 };
 use ostrya_rt::block_on;
 
@@ -129,7 +141,6 @@ fn read_signed_superblock(root: &std::path::Path) -> (Vec<u8>, Vec<Vec<u8>>) {
 }
 
 /// Copies a directory tree with its attributes (`cp -a`).
-#[cfg(any(feature = "sign-spki-ed25519", feature = "sign-spki-rsa"))]
 fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
     let status = std::process::Command::new("cp")
         .args(["-a"])
@@ -180,9 +191,162 @@ fn has_high_s(der: &[u8], half_order: &[u8]) -> bool {
     padded.as_slice() > half_order
 }
 
+/// Runs the `ostree` command with `args`, and returns its output with no check
+/// of the exit status.
+fn tool(args: &[&str]) -> Output {
+    Command::new("ostree")
+        .args(args)
+        .output()
+        .expect("run ostree")
+}
+
+/// The port signs a copy of the `archive` fixture with the secret key of the
+/// fixture of the key type `ty`: the commit, a static delta from scratch to
+/// the commit, and the summary. The port verifies the signatures of the delta
+/// and of the summary first.
+///
+/// The tool then verifies each signature with `public.pem` of the fixture,
+/// and refuses each signature with `stranger_pem`, a PEM `PUBLIC KEY` of the
+/// same key type that signed nothing. The tool verifies the summary through a
+/// client repository with one `file://` remote for each key. Each refusal must
+/// give the reason of a signature that does not verify, so a key that the tool
+/// cannot load does not satisfy the test.
+fn assert_tool_verifies_port_signatures(ty: &str, stranger_pem: &str) {
+    let tmp = TmpDir::new(&format!("spki-{ty}-tool-verifies"));
+    let root = tmp.path().join("repo");
+    copy_tree(&fixture_repo("archive"), &root);
+    block_on(async {
+        let repo = Repo::open(&root).await.unwrap();
+        let signer: Arc<dyn Signer> = Arc::new(fixture_signer(ty));
+        repo.sign_commit(&commit(), &*signer).await.unwrap();
+        let opts = DeltaOptions {
+            signers: vec![signer.clone()],
+            ..Default::default()
+        };
+        repo.generate_static_delta(None, &commit(), &opts)
+            .await
+            .unwrap();
+        repo.regenerate_summary(&SummaryOptions::default())
+            .await
+            .unwrap();
+        repo.sign_summary(&*signer).await.unwrap();
+
+        let verifier = fixture_verifier(ty);
+        let dir = root.join(static_delta_relative_dir(None, &commit()));
+        let outcome = repo.verify_static_delta(&dir, &[&verifier]).await.unwrap();
+        assert!(
+            outcome.valid,
+            "the port does not verify its delta signature"
+        );
+        let outcome = repo.verify_summary(&[&verifier]).await.unwrap();
+        assert!(
+            outcome.valid,
+            "the port does not verify its summary signature"
+        );
+    });
+
+    if !ostree_supports_spki() {
+        eprintln!("skipping: the installed `ostree` carries no spki engine");
+        return;
+    }
+    let stranger = tmp.path().join("stranger.pem");
+    std::fs::write(&stranger, stranger_pem).unwrap();
+    let public = fixture_dir(ty).join("public.pem");
+    let repo_arg = format!("--repo={}", root.display());
+    let refused = "spki: Signature couldn't be verified with:";
+    let client_arg = format!("--repo={}", tmp.path().join("client").display());
+    let init = tool(&[&client_arg, "init", "--mode=archive"]);
+    assert!(init.status.success(), "ostree init: {init:?}");
+    for (keys, trusted) in [(&public, true), (&stranger, false)] {
+        let keys_arg = format!("--keys-file={}", keys.display());
+        let label = format!("{ty} under {}", keys.display());
+
+        let out = tool(&[
+            &repo_arg, "sign", "--verify", "-s", "spki", &keys_arg, COMMIT,
+        ]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(if trusted { 0 } else { 1 }),
+            "ostree sign --verify, {label}: {stdout}{stderr}"
+        );
+        if trusted {
+            assert!(
+                stdout.starts_with("spki: Signature verified successfully with key '"),
+                "ostree sign --verify, {label}: {stdout}"
+            );
+        } else {
+            assert!(
+                stderr.contains(refused),
+                "ostree sign --verify, {label}: {stderr}"
+            );
+        }
+
+        let out = tool(&[
+            &repo_arg,
+            "static-delta",
+            "verify",
+            "--sign-type=spki",
+            &keys_arg,
+            COMMIT,
+        ]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(if trusted { 0 } else { 1 }),
+            "ostree static-delta verify, {label}: {stdout}{stderr}"
+        );
+        if trusted {
+            assert_eq!(
+                stdout, "Verification OK\n",
+                "ostree static-delta verify, {label}"
+            );
+        } else {
+            assert_eq!(
+                stdout, "Verification fails\n",
+                "ostree static-delta verify, {label}"
+            );
+            assert!(
+                stderr.contains(refused),
+                "ostree static-delta verify, {label}: {stderr}"
+            );
+        }
+
+        let remote = if trusted { "trusted" } else { "stranger" };
+        let add = tool(&[
+            &client_arg,
+            "remote",
+            "add",
+            "--set=gpg-verify=false",
+            "--set=gpg-verify-summary=false",
+            "--set=sign-verify-summary=true",
+            &format!("--set=verification-spki-file={}", keys.display()),
+            remote,
+            &format!("file://{}", root.display()),
+        ]);
+        assert!(add.status.success(), "ostree remote add: {add:?}");
+        let out = tool(&[&client_arg, "remote", "summary", remote]);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert_eq!(
+            out.status.code(),
+            Some(if trusted { 0 } else { 1 }),
+            "ostree remote summary, {label}: {stderr}"
+        );
+        if !trusted {
+            assert!(
+                stderr.contains(refused),
+                "ostree remote summary, {label}: {stderr}"
+            );
+        }
+    }
+}
+
 #[cfg(feature = "sign-spki-p256")]
 mod p256 {
     use super::*;
+    use common::wrap_pem;
     use ostrya::base64;
 
     /// The key type of the fixture.
@@ -213,6 +377,11 @@ mod p256 {
     #[test]
     fn p256_fixture_keys_are_one_pair() {
         assert_fixture_keys_are_one_pair(TYPE);
+    }
+
+    #[test]
+    fn p256_tool_verifies_port_signatures() {
+        assert_tool_verifies_port_signatures(TYPE, &wrap_pem("PUBLIC KEY", OTHER_SPKI_B64));
     }
 
     /// The tool signed the commit of the P-256 fixture two times. The first
@@ -325,6 +494,7 @@ mod p256 {
 #[cfg(feature = "sign-spki-p384")]
 mod p384 {
     use super::*;
+    use common::wrap_pem;
     use ostrya::base64;
 
     /// The key type of the fixture.
@@ -356,6 +526,11 @@ mod p384 {
     #[test]
     fn p384_fixture_keys_are_one_pair() {
         assert_fixture_keys_are_one_pair(TYPE);
+    }
+
+    #[test]
+    fn p384_tool_verifies_port_signatures() {
+        assert_tool_verifies_port_signatures(TYPE, &wrap_pem("PUBLIC KEY", OTHER_SPKI_B64));
     }
 
     /// The tool signed the commit of the P-384 fixture two times. The first
@@ -471,7 +646,7 @@ mod p384 {
 #[cfg(feature = "sign-spki-ed25519")]
 mod ed25519 {
     use super::*;
-    use common::TmpDir;
+    use common::wrap_pem;
     use ostrya::{Signer, Type, from_bytes};
 
     /// The key type of the fixture.
@@ -506,6 +681,12 @@ mod ed25519 {
     #[test]
     fn ed25519_fixture_keys_are_one_pair() {
         assert_fixture_keys_are_one_pair(TYPE);
+    }
+
+    #[test]
+    fn ed25519_tool_verifies_port_signatures() {
+        let spki = ostrya::base64::encode(&[&SPKI_PREFIX[..], &OTHER_PUBLIC_KEY].concat());
+        assert_tool_verifies_port_signatures(TYPE, &wrap_pem("PUBLIC KEY", &spki));
     }
 
     #[test]
@@ -664,7 +845,6 @@ mod ed25519 {
 #[cfg(feature = "sign-spki-rsa")]
 mod rsa {
     use super::*;
-    use common::TmpDir;
     use ostrya::{Signer, Type, from_bytes};
 
     /// The key type of the fixture.
@@ -673,18 +853,27 @@ mod rsa {
     /// The length in bytes of a signature of the 2048-bit fixture key.
     const SIGNATURE_LEN: usize = 256;
 
-    /// Returns a verifier that trusts an RSA key that signed no fixture.
+    /// Returns the PEM text of an RSA public key that signed no fixture.
     ///
     /// The key is `rsa-2048.pub.pem` of the key fixtures in
     /// `tests/fixtures/spki/keys/`.
+    fn stranger_pem() -> String {
+        std::fs::read_to_string(fixture_root().join("../spki/keys/rsa-2048.pub.pem")).unwrap()
+    }
+
+    /// Returns a verifier that trusts an RSA key that signed no fixture.
     fn stranger_verifier() -> SpkiVerifier {
-        let pem = std::fs::read(fixture_root().join("../spki/keys/rsa-2048.pub.pem")).unwrap();
-        SpkiVerifier::from_pem(pem).unwrap()
+        SpkiVerifier::from_pem(stranger_pem()).unwrap()
     }
 
     #[test]
     fn rsa_fixture_keys_are_one_pair() {
         assert_fixture_keys_are_one_pair(TYPE);
+    }
+
+    #[test]
+    fn rsa_tool_verifies_port_signatures() {
+        assert_tool_verifies_port_signatures(TYPE, &stranger_pem());
     }
 
     #[test]

@@ -3,12 +3,10 @@
 //! These tests use [`SpkiSigner`], [`SpkiVerifier`], and the key store of the
 //! sign API.
 //!
-//! The observed build of the `ostree` command has no spki engine. The engine
-//! needs OpenSSL, and this build does not include OpenSSL, so the
-//! cross-verification with the `ostree` command cannot run here. If the
-//! command reports the type
-//! as not implemented, [`spki_tool_cross_verify_pending`] skips. If a later
-//! build supports spki, the test runs the full cross-check.
+//! The tests in `sign_spki_fixtures.rs` compare the engine with the `ostree`
+//! command in both directions for each key type. The tests in which the
+//! command verifies the signatures of the engine need a build of the command
+//! with the features `openssl` and `sign-spki`.
 //!
 //! [`spki_openssl_interop`] runs the `openssl` command as a black box. It
 //! checks the standard formats in both directions, over the same P-256 key and
@@ -28,7 +26,7 @@ use std::os::fd::AsFd;
 use std::path::Path;
 use std::process::Command;
 
-use common::{TmpDir, openssl_available, ostree_available};
+use common::{TmpDir, openssl_available, wrap_pem};
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, Ed25519Signer,
     MutableTree, Repo, RepoMode, Signer, SpkiSigner, SpkiVerifier, Verifier, base64,
@@ -55,17 +53,6 @@ RAG1Ua8eR8SKbLQ==";
 /// The matching secret key as the raw 32-byte P-256 scalar (hex). It is not
 /// a secret key form of the engine.
 const SECRET_SCALAR_HEX: &str = "D8BEF4F04B279F31C44744986AC30D214706BFADD06A90BFDE456CA0F7ABCCA1";
-
-/// Wraps `b64` into a PEM block of `kind`, with one 64-character line for each
-/// chunk. `pem-rfc7468` expects this RFC 7468 line width.
-fn wrap_pem(kind: &str, b64: &str) -> String {
-    let mut body = String::new();
-    for chunk in b64.as_bytes().chunks(64) {
-        body.push_str(std::str::from_utf8(chunk).unwrap());
-        body.push('\n');
-    }
-    format!("-----BEGIN {kind}-----\n{body}-----END {kind}-----\n")
-}
 
 /// Decodes a hex string into bytes.
 fn from_hex(hex: &str) -> Vec<u8> {
@@ -661,46 +648,6 @@ fn spki_openssl_interop() {
             String::from_utf8_lossy(&verified.stderr)
         );
     });
-}
-
-#[test]
-fn spki_tool_cross_verify_pending() {
-    if !ostree_available() {
-        eprintln!("skipping: ostree tool not available");
-        return;
-    }
-    let tmp = TmpDir::new("spki-tool");
-    let base = tmp.path();
-    let repo_arg = format!("--repo={}", base.join("repo").display());
-    let commit = block_on(async {
-        let (repo, commit) = build_committed_repo(base).await;
-        repo.sign_commit(&commit, &SpkiSigner::from_base64(SECRET_SEC1_B64).unwrap())
-            .await
-            .unwrap();
-        commit
-    });
-
-    let out = Command::new("ostree")
-        .args([
-            &repo_arg,
-            "sign",
-            "--verify",
-            "--sign-type=spki",
-            &commit.to_hex(),
-            PUBLIC_SPKI_B64,
-        ])
-        .output()
-        .unwrap();
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    if stderr.contains("not implemented") || stderr.contains("not supported") {
-        eprintln!("skipping spki tool cross-verify: this ostree lacks spki ({stderr})");
-        return;
-    }
-    // An `ostree` command with spki must accept the signature of ostrya.
-    assert!(
-        out.status.success(),
-        "spki-capable tool rejected the port's signature: {stderr}"
-    );
 }
 
 /// A build without the RSA key type refuses an RSA public key, with a message

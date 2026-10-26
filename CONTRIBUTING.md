@@ -382,6 +382,30 @@ The key of the `rsa` fixture is not one of the keys in `spki/keys/`. The
 fixture. The `ed25519` tests use the public key of test 1 in RFC 8032, a
 constant in the tests, as a key that signed no fixture.
 
+The test `<type>_tool_verifies_port_signatures` of each module checks the
+other direction. The port signs a copy of `generated/archive/repo` with
+`secret.pem` of the fixture. It signs the commit, writes a signed static
+delta from scratch to the commit, and writes a signed summary. The tool then
+verifies each signature with `public.pem` of the fixture:
+
+- the commit with `ostree sign --verify -s spki --keys-file`;
+- the delta with `ostree static-delta verify --sign-type=spki --keys-file`;
+- the summary with `ostree remote summary`, through a client repository with
+  a `file://` remote that sets `sign-verify-summary=true` and
+  `verification-spki-file`.
+
+A key of the same type that signed no fixture must fail each verify, with
+the message of a signature that does not verify. The test uses the key that
+the other tests of the module use for this purpose. The tool part needs an
+`ostree` build that shows `openssl` and `sign-spki` in `ostree --version`.
+Without this build, the tool part skips. The variable
+`OSTRYA_REQUIRE_OSTREE_SPKI` turns the skip into a failure:
+
+```sh
+OSTRYA_REQUIRE_OSTREE=1 OSTRYA_REQUIRE_OSTREE_SPKI=1 \
+    cargo test -p ostrya --features sign-spki --test sign_spki_fixtures
+```
+
 ### The spki key fixtures
 
 `spki/keys/` holds the keys that the tests of the spki engine read. The
@@ -496,6 +520,10 @@ test:
   tool, which `ostree --version` shows as `sign-ed25519`. The ed25519
   cross-checks include the verify of the signed summary of a bucket
   repository by the tool.
+- `OSTRYA_REQUIRE_OSTREE_SPKI` -- the spki engine of the `ostree` tool,
+  which `ostree --version` shows as `openssl` and `sign-spki`. The spki
+  cross-checks include the verify by the tool of a commit, a summary, and a
+  static delta that the port signs with each key type.
 - `OSTRYA_REQUIRE_GNUPG` -- `gpg` and `gpgv`, for each GPG test.
 - `OSTRYA_REQUIRE_MULTIGROUP` -- a second group of the process, for the
   ownership tests of `pull-local`. These tests are the only coverage of the

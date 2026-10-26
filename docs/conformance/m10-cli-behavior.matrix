@@ -14631,6 +14631,208 @@ note: the port's switch needs `--remote`, and `clap` refuses it before the
 
 family: M10
 subcommand: pull-local
+cell: pull-local/sign-verify-no-key
+src-mode: archive
+dst-mode: bare-user
+setup: src-dst
+run: pull-local --repo=$DST --sign-verify --remote=origin $SRC conformance
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "no engine of this build has a trusted key"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "Unknown option --sign-verify"
+oracle: exit-status refs-bytes inventory
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::pull_local_sign_verify_checks_the_commits
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: `$DST` configures no remote, so the switch selects each engine of the
+ build and finds no trusted key. The port opens the source and refuses the
+ pull before it reads a ref or an object of the source. The tool refuses the
+ switch as an unknown option. Neither side writes an object or a ref. The
+ cited test makes this refusal for a remote with no section and for a remote
+ whose section has no verification key.
+
+family: M10
+subcommand: pull-local
+cell: pull-local/sign-verify-summary-no-key
+src-mode: archive
+dst-mode: bare-user
+setup: src-dst
+run: pull-local --repo=$DST --sign-verify-summary --remote=origin $SRC conformance
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "no engine of this build has a trusted key"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "Unknown option --sign-verify-summary"
+oracle: exit-status refs-bytes inventory
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::pull_local_sign_verify_summary_checks_the_summary
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: `$DST` configures no remote, so the switch selects each engine of the
+ build and finds no trusted key. The port opens the source and refuses the
+ pull before it reads a ref or an object of the source. The tool refuses the
+ switch as an unknown option. Neither side writes an object or a ref. The
+ cited test makes this refusal for a remote with no section and for a remote
+ whose section has no verification key.
+
+family: M10
+subcommand: pull-local
+cell: pull-local/sign-verify-no-remote
+src-mode: archive
+dst-mode: bare-user
+setup: src-dst
+run: pull-local --repo=$DST --sign-verify $SRC conformance
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "the following required arguments were not provided"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "Unknown option --sign-verify"
+oracle: exit-status refs-bytes inventory
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::pull_local_sign_switches_refuse_before_the_pull
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the port's switch needs `--remote`, and `clap` refuses it before the
+ command opens the source. The tool refuses the switch as an unknown option.
+ Neither side writes an object or a ref.
+
+family: M10
+subcommand: pull-local
+cell: pull-local/sign-verify-summary-no-remote
+src-mode: archive
+dst-mode: bare-user
+setup: src-dst
+run: pull-local --repo=$DST --sign-verify-summary $SRC conformance
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "the following required arguments were not provided"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "Unknown option --sign-verify-summary"
+oracle: exit-status refs-bytes inventory
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::pull_local_sign_switches_refuse_before_the_pull
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the port's switch needs `--remote`, and `clap` refuses it before the
+ command opens the source. The tool refuses the switch as an unknown option.
+ Neither side writes an object or a ref.
+
+family: M10
+subcommand: pull-local
+cell: pull-local/sign-verify-value-suffix
+src-mode: archive
+dst-mode: bare-user
+setup: src-dst
+run: pull-local --repo=$DST --sign-verify=false --remote=origin $SRC conformance
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "unexpected value 'false' for '--sign-verify'"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "Unknown option --sign-verify=false"
+oracle: exit-status refs-bytes inventory
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::pull_local_sign_switches_refuse_before_the_pull
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the port's switch takes no value, and `clap` refuses the suffix before
+ the command opens the source. The tool refuses the option as an unknown
+ option. Neither side writes an object or a ref.
+
+family: M10
+subcommand: pull-local
+cell: pull-local/sign-verify-summary-value-suffix
+src-mode: archive
+dst-mode: bare-user
+setup: src-dst
+run: pull-local --repo=$DST --sign-verify-summary=false --remote=origin $SRC conformance
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "unexpected value 'false' for '--sign-verify-summary'"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "Unknown option --sign-verify-summary=false"
+oracle: exit-status refs-bytes inventory
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::pull_local_sign_switches_refuse_before_the_pull
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the port's switch takes no value, and `clap` refuses the suffix before
+ the command opens the source. The tool refuses the option as an unknown
+ option. Neither side writes an object or a ref.
+
+family: M10
+subcommand: pull-local
+cell: pull-local/sign-verify-with-off-switch
+src-mode: archive
+dst-mode: bare-user
+setup: src-dst
+run: pull-local --repo=$DST --sign-verify --no-sign-verify --remote=origin $SRC conformance
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "cannot be used with"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "Unknown option --sign-verify"
+oracle: exit-status refs-bytes inventory
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::pull_local_sign_switches_refuse_before_the_pull
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the port's switch conflicts with its off switch, and `clap` refuses the
+ pair before the command opens the source. The tool refuses the first unknown
+ option of the command line. Neither side writes an object or a ref.
+
+family: M10
+subcommand: pull-local
+cell: pull-local/sign-verify-summary-with-off-switch
+src-mode: archive
+dst-mode: bare-user
+setup: src-dst
+run: pull-local --repo=$DST --sign-verify-summary --no-sign-verify-summary --remote=origin $SRC conformance
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "cannot be used with"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "Unknown option --sign-verify-summary"
+oracle: exit-status refs-bytes inventory
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::pull_local_sign_switches_refuse_before_the_pull
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the port's switch conflicts with its off switch, and `clap` refuses the
+ pair before the command opens the source. The tool refuses the first unknown
+ option of the command line. Neither side writes an object or a ref.
+
+family: M10
+subcommand: pull-local
+cell: pull-local/sign-switches-extension
+setup: src-dst
+outcome: lossy
+severity: interop
+loss: the tool has no `pull-local --sign-verify` or `--sign-verify-summary`;
+ it refuses each with `error: Unknown option <option>` at exit 1 and writes
+ nothing. The port's switches are extensions. They check the commits or the
+ summary of the source with each engine of the build and the keys of the
+ remote that `--remote` names. The port pulls a commit or a summary of a
+ trusted key at exit 0 (`cli-surface.md`, "P2", `pull-local`).
+evidence: ostrya_cli::cli::pull_local_sign_verify_checks_the_commits,
+ ostrya_cli::cli::pull_local_sign_verify_summary_checks_the_summary
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the setup configures no remote, so the cited tests build each remote
+ and its keys. A run here gets no trusted key, and the cells
+ `pull-local/sign-verify-no-key` and `pull-local/sign-verify-summary-no-key`
+ record that refusal.
+
+family: M10
+subcommand: pull-local
 cell: pull-local/require-static-deltas-no-summary
 src-mode: archive
 dst-mode: bare-user

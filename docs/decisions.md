@@ -313,7 +313,9 @@ group on the blocking pool, through `ostrya_rt::unblock`, so the signature
 does not hold the async executor. The trust check of the receive endpoint
 runs the verifiers of the sign-api axis on the blocking pool too, with a copy
 of the commit, because a client sets the number of signature blobs that the
-check verifies. The GPG verifier moves its own work to the blocking pool. A
+check verifies. The summary check of a pull runs these verifiers on the
+blocking pool, with a copy of the summary, because a summary can be as large
+as 64 MiB. The GPG verifier moves its own work to the blocking pool. A
 sign future in `ostrya-sign` that moves the work to the blocking pool was
 rejected, because the engine then needs a runtime.
 
@@ -409,11 +411,15 @@ the commits is on.
 `ostrya pull-local` has the off switches `--no-gpg-verify`,
 `--no-gpg-verify-summary`, `--no-sign-verify`, and `--no-sign-verify-summary`.
 Each switch sets its field of `PullVerify` to `Some(false)` and needs
-`--remote`. `--no-gpg-verify` conflicts with `--gpg-verify`, and
-`--no-gpg-verify-summary` conflicts with `--gpg-verify-summary`. The command
-has no switch that turns on a sign-api check. The two GPG switches take no
-value. The `ostree` command reads `--gpg-verify=false` as `--gpg-verify`, so a
-valued form in the port would give that spelling a different meaning.
+`--remote`. Each off switch conflicts with its positive switch.
+`--sign-verify` and `--sign-verify-summary` set `sign` and `sign_summary` to
+`Some(true)` and need `--remote`. Each one selects each engine of the build,
+as `ostrya pull --sign-verify` does. The two GPG switches and the two sign
+switches take no value. The `ostree` command reads `--gpg-verify=false` as
+`--gpg-verify`, so a valued form of a GPG switch in the port would give that
+spelling a different meaning. The `ostree` command has no `pull-local
+--sign-verify` or `--sign-verify-summary`, so the two sign switches take no
+value to match the GPG switches.
 
 Two alternatives were rejected:
 

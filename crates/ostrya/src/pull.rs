@@ -1785,25 +1785,36 @@ impl Repo {
         //
         // The pull reads
         // the summary and its signature under the size cap of a summary. It
-        // refuses a file there that is not a regular file.
+        // refuses a file there that is not a regular file. Under the summary
+        // verification, a missing file stops the pull before it reads the
+        // other file: with no `summary`, the pull does not open `summary.sig`,
+        // and with no `summary.sig`, it does not read `summary`.
         let fetching = opts.require_static_deltas && !opts.disable_static_deltas;
         // A commit-only pull ignores the list.
         let list_applies = edges.is_some() && !opts.flags.contains(PullFlags::COMMIT_ONLY);
         let reads_deltas = fetching || list_applies;
         let needs_summary = fetching && edges.is_none();
-        let summary = if verification.checks_summary() || needs_summary {
-            delta::read_local(
-                src,
-                crate::summary::SUMMARY_FILE,
-                crate::summary::SUMMARY_READ_CAP,
-            )
-            .await?
+        let checks_summary = verification.checks_summary();
+        let summary_file = if checks_summary || needs_summary {
+            delta::open_local(src, crate::summary::SUMMARY_FILE).await?
         } else {
             None
         };
-        if verification.checks_summary() {
-            let signature = delta::read_local(
-                src,
+        let signature_file = if checks_summary && summary_file.is_some() {
+            delta::open_local(src, crate::summary::SUMMARY_SIG_FILE).await?
+        } else {
+            None
+        };
+        verification.check_summary_files(summary_file.is_some(), signature_file.is_some())?;
+        let summary = delta::read_opened(
+            summary_file,
+            crate::summary::SUMMARY_FILE,
+            crate::summary::SUMMARY_READ_CAP,
+        )
+        .await?;
+        if checks_summary {
+            let signature = delta::read_opened(
+                signature_file,
                 crate::summary::SUMMARY_SIG_FILE,
                 crate::summary::SUMMARY_READ_CAP,
             )

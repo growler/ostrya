@@ -473,7 +473,6 @@ impl Policy {
     /// gets a copy of `payload`, and the signature blobs that the check reads
     /// for each verifier. The GPG verifier moves its own work to the
     /// blocking pool, so the GPG axis runs in the calling task.
-    #[cfg(feature = "receive")]
     pub(crate) async fn check_unblocked(
         &self,
         subject: &str,

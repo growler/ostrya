@@ -4217,9 +4217,10 @@ struct PullLocalArgs {
     /// apply to the pull, as they apply to `ostrya pull` (see
     /// ostrya-config(1)). If the config has no group for the name, the pull
     /// makes only the checks that its switches ask for. Each switch wins over
-    /// its key: --gpg-verify and --gpg-verify-summary turn a check on, and
-    /// --no-gpg-verify, --no-gpg-verify-summary, --no-sign-verify, and
-    /// --no-sign-verify-summary turn a configured check off.
+    /// its key: --gpg-verify, --gpg-verify-summary, --sign-verify, and
+    /// --sign-verify-summary turn a check on, and --no-gpg-verify,
+    /// --no-gpg-verify-summary, --no-sign-verify, and --no-sign-verify-summary
+    /// turn a configured check off.
     #[arg(long)]
     remote: Option<String>,
     /// The number of parents of each pulled commit to follow.
@@ -4289,6 +4290,24 @@ struct PullLocalArgs {
     /// --remote, the command refuses this switch. The switch takes no value.
     #[arg(long)]
     gpg_verify_summary: bool,
+    /// Require an ed25519 or spki signature on every commit that the pull
+    /// carries.
+    ///
+    /// The switch selects every engine of this build, and a valid signature of
+    /// one engine is sufficient. The trusted keys come from the
+    /// `verification-<engine>-key` and `verification-<engine>-file` keys of
+    /// the remote that --remote names, and from the system key store. The
+    /// switch needs --remote and takes no value.
+    #[arg(long, requires = "remote")]
+    sign_verify: bool,
+    /// Require an ed25519 or spki signature on the summary of the source.
+    ///
+    /// The switch selects every engine of this build, and takes the keys that
+    /// --sign-verify takes. If the source has no `summary` or no
+    /// `summary.sig`, the pull fails. The switch needs --remote and takes no
+    /// value.
+    #[arg(long, requires = "remote")]
+    sign_verify_summary: bool,
     /// Do not require a GPG signature on the commits.
     ///
     /// The switch turns off the `gpg-verify` key of the remote that --remote
@@ -4305,15 +4324,16 @@ struct PullLocalArgs {
     /// Do not require an ed25519 or spki signature on the commits.
     ///
     /// The switch turns off the `sign-verify` key of the remote that --remote
-    /// names. It needs --remote.
-    #[arg(long, requires = "remote")]
+    /// names. It needs --remote and conflicts with --sign-verify.
+    #[arg(long, requires = "remote", conflicts_with = "sign_verify")]
     no_sign_verify: bool,
     /// Do not require an ed25519 or spki signature on the summary of the
     /// source.
     ///
     /// The switch turns off the `sign-verify-summary` key of the remote that
-    /// --remote names. It needs --remote.
-    #[arg(long, requires = "remote")]
+    /// --remote names. It needs --remote and conflicts with
+    /// --sign-verify-summary.
+    #[arg(long, requires = "remote", conflicts_with = "sign_verify_summary")]
     no_sign_verify_summary: bool,
     /// Apply the static delta that the summary of the source advertises.
     ///
@@ -6282,8 +6302,9 @@ async fn pull_local(repo: Repo, name: &str, args: PullLocalArgs) -> Result<()> {
                     gpg: (args.gpg_verify || args.no_gpg_verify).then_some(args.gpg_verify),
                     gpg_summary: (args.gpg_verify_summary || args.no_gpg_verify_summary)
                         .then_some(args.gpg_verify_summary),
-                    sign: args.no_sign_verify.then_some(false),
-                    sign_summary: args.no_sign_verify_summary.then_some(false),
+                    sign: (args.sign_verify || args.no_sign_verify).then_some(args.sign_verify),
+                    sign_summary: (args.sign_verify_summary || args.no_sign_verify_summary)
+                        .then_some(args.sign_verify_summary),
                 },
                 detached_metadata_filter: detached_metadata_filter(&repo)?,
                 ..PullOptions::default()

@@ -41116,6 +41116,346 @@ fn pull_local_off_switches_need_a_remote() {
     );
 }
 
+/// Asserts that a refused local pull left `dest` with no loose object, no local
+/// ref, and no ref of the remote `origin`.
+fn assert_nothing_pulled(dest: &Path, what: &str) {
+    assert!(loose_objects(dest).is_empty(), "{what}");
+    assert_eq!(
+        std::fs::read_dir(dest.join("refs/heads")).unwrap().count(),
+        0,
+        "{what}"
+    );
+    assert!(!dest.join("refs/remotes/origin").exists(), "{what}");
+}
+
+/// A local pull with `--remote=origin` from `src` into a new archive
+/// repository under `base/<name>`. The remote `origin` has `gpg-verify=false`
+/// and the keys of `extra`. If `extra` is `None`, the config has no section for
+/// `origin`. Returns the run and the destination.
+fn pull_local_into_origin(
+    base: &Path,
+    name: &str,
+    src: &Path,
+    extra: Option<&str>,
+    switches: &[&str],
+) -> (Run, PathBuf) {
+    let dir = base.join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    let dest = create_repo(&dir, RepoMode::Archive);
+    if let Some(extra) = extra {
+        configure_remote(
+            &dest,
+            "file:///nonexistent",
+            &format!("gpg-verify=false\n{extra}"),
+        );
+    }
+    let repo_arg = format!("--repo={}", dest.display());
+    let mut args = vec!["pull-local", repo_arg.as_str(), "--remote=origin"];
+    args.extend_from_slice(switches);
+    args.extend([src.to_str().unwrap(), BRANCH]);
+    (ostrya(&args, None, &[]), dest)
+}
+
+/// A row of `pull_local_sign_verify_checks_the_commits`: the case, the source,
+/// the extra keys of the remote or `None` for no section, the switches, and the
+/// reason of a refusal, or `None` for a pull.
+type SignVerifyRow<'a> = (
+    &'a str,
+    PathBuf,
+    Option<String>,
+    Vec<&'a str>,
+    Option<&'a str>,
+);
+
+/// `pull-local --sign-verify` checks each commit with each engine of the build
+/// and the keys of the remote that `--remote` names, with ed25519 and spki
+/// keys:
+///
+/// - An unsigned commit and a commit of a key that the remote does not trust
+///   are refused. The pull names the reason and writes no object and no ref.
+/// - A remote whose section has no verification key, and a remote with no
+///   section, give no engine a trusted key, and the pull is refused.
+/// - A commit of a trusted key is pulled.
+/// - Under `sign-verify=ed25519`, a commit that only an spki key signed is
+///   refused. The switch selects the spki engine too, so with the switch the
+///   pull accepts the commit.
+#[test]
+fn pull_local_sign_verify_checks_the_commits() {
+    let tmp = TmpDir::new("pull-local-sign-verify");
+    let base = tmp.path();
+    // A source under `base/<name>` with the fixture commit, signed by `-s
+    // ENGINE KEY` when `sign` is given.
+    let source = |name: &str, sign: Option<(&str, &str)>| {
+        let dir = base.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = commit_fixture(&dir);
+        if let Some((engine, key)) = sign {
+            let repo_arg = format!("--repo={}", repo.display());
+            ostrya(&["sign", &repo_arg, "-s", engine, COMMIT, key], None, &[]).ok();
+        }
+        repo
+    };
+    let unsigned = source("unsigned", None);
+    let ed25519 = source("ed25519", Some(("ed25519", ED25519_SECRET_B64)));
+    let no_signature = "sign-api verification is enabled, but it carries no signature";
+    let untrusted = "no sign-api signature is from a trusted key";
+    let no_key = "signature verification is enabled, but no engine of this build has a trusted key";
+    let ed25519_key = |key: &str| Some(format!("verification-ed25519-key={key}\n"));
+    #[cfg_attr(not(feature = "spki"), allow(unused_mut))]
+    let mut rows: Vec<SignVerifyRow> = vec![
+        (
+            "ed25519-unsigned",
+            unsigned.clone(),
+            ed25519_key(ED25519_PUBLIC_B64),
+            vec!["--sign-verify"],
+            Some(no_signature),
+        ),
+        (
+            "ed25519-untrusted",
+            ed25519.clone(),
+            ed25519_key(ED25519_PUBLIC2_B64),
+            vec!["--sign-verify"],
+            Some(untrusted),
+        ),
+        (
+            "ed25519-trusted",
+            ed25519.clone(),
+            ed25519_key(ED25519_PUBLIC_B64),
+            vec!["--sign-verify"],
+            None,
+        ),
+        (
+            "no-key",
+            ed25519.clone(),
+            Some(String::new()),
+            vec!["--sign-verify"],
+            Some(no_key),
+        ),
+        (
+            "no-section",
+            ed25519.clone(),
+            None,
+            vec!["--sign-verify"],
+            Some(no_key),
+        ),
+    ];
+    #[cfg(feature = "spki")]
+    {
+        const SECRET_PKCS8_B64: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg2L708EsnnzHER0SYasMNIUcGv63QapC/3kVsoPerzKGhRANCAATxfzfHKUPeJtyLTGMUoxHhvBS1NT9guWhUQPGiZRLZIcB8Wc3csdVU1iOiTRmbZGKJTtekOdEAbVRrx5HxIpst";
+        const PUBLIC_SPKI_B64: &str = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE8X83xylD3ibci0xjFKMR4bwUtTU/YLloVEDxomUS2SHAfFnN3LHVVNYjok0Zm2RiiU7XpDnRAG1Ua8eR8SKbLQ==";
+        const OTHER_SPKI_B64: &str = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAECmz6W9QPu0HuggzW4vGvsnvQIl4Jyl/b9kVl8fm/qw/xJSQfCEzhnGMQzmyj2quUo96zvuxlCllcTkzsOhwEAg==";
+        let spki = source("spki", Some(("spki", SECRET_PKCS8_B64)));
+        let spki_key = |key: &str| Some(format!("verification-spki-key={key}\n"));
+        let both = Some(format!(
+            "sign-verify=ed25519\nverification-ed25519-key={ED25519_PUBLIC_B64}\n\
+             verification-spki-key={PUBLIC_SPKI_B64}\n"
+        ));
+        rows.extend([
+            (
+                "spki-unsigned",
+                unsigned.clone(),
+                spki_key(PUBLIC_SPKI_B64),
+                vec!["--sign-verify"],
+                Some(no_signature),
+            ),
+            (
+                "spki-untrusted",
+                spki.clone(),
+                spki_key(OTHER_SPKI_B64),
+                vec!["--sign-verify"],
+                Some(untrusted),
+            ),
+            (
+                "spki-trusted",
+                spki.clone(),
+                spki_key(PUBLIC_SPKI_B64),
+                vec!["--sign-verify"],
+                None,
+            ),
+            (
+                "engines-configured",
+                spki.clone(),
+                both.clone(),
+                vec![],
+                Some(no_signature),
+            ),
+            (
+                "engines-switch",
+                spki.clone(),
+                both,
+                vec!["--sign-verify"],
+                None,
+            ),
+        ]);
+    }
+    for (name, src, extra, switches, reason) in rows {
+        let (run, dest) = pull_local_into_origin(base, name, &src, extra.as_deref(), &switches);
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        match reason {
+            Some(reason) => {
+                assert_eq!(run.status.code(), Some(1), "{name}: {stderr}");
+                assert!(stderr.contains(reason), "{name}: {stderr}");
+                assert_nothing_pulled(&dest, name);
+            }
+            None => {
+                assert_eq!(run.status.code(), Some(0), "{name}: {stderr}");
+                assert_eq!(
+                    resolve(&dest, "origin:test/main").as_deref(),
+                    Some(COMMIT),
+                    "{name}"
+                );
+            }
+        }
+    }
+}
+
+/// `pull-local --sign-verify-summary` checks the summary of the source with
+/// each engine of the build and the keys of the remote, with ed25519 and spki
+/// keys. The commits carry no signature, and the pull does not check them. A
+/// source with no `summary`, a source with no `summary.sig`, and a summary of
+/// a key that the remote does not trust are refused. A remote whose section
+/// has no verification key, and a remote with no section, give no engine a
+/// trusted key, and the pull is refused. The pull names the reason and writes
+/// no object and no ref. A summary of a trusted key is pulled.
+#[test]
+fn pull_local_sign_verify_summary_checks_the_summary() {
+    let tmp = TmpDir::new("pull-local-sign-verify-summary");
+    let base = tmp.path();
+    let no_summary_dir = base.join("no-summary");
+    std::fs::create_dir_all(&no_summary_dir).unwrap();
+    let no_summary = commit_fixture(&no_summary_dir);
+    let no_sig = build_remote(base, "no-sig");
+    // A source under `base/<name>` with the fixture commit and a summary that
+    // `summary -u --sign=KEY` signs, with `--sign-type=ENGINE`.
+    let signed = |name: &str, engine: &str, key: &str| {
+        let repo = build_remote(base, name);
+        let repo_arg = format!("--repo={}", repo.display());
+        let sign_type = format!("--sign-type={engine}");
+        let sign = format!("--sign={key}");
+        ostrya(&["summary", &repo_arg, "-u", &sign_type, &sign], None, &[]).ok();
+        repo
+    };
+    #[cfg_attr(not(feature = "spki"), allow(unused_mut))]
+    let mut engines = vec![(
+        "ed25519",
+        signed("ed25519", "ed25519", ED25519_SECRET_B64),
+        ED25519_PUBLIC_B64,
+        ED25519_PUBLIC2_B64,
+    )];
+    #[cfg(feature = "spki")]
+    {
+        const SECRET_PKCS8_B64: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg2L708EsnnzHER0SYasMNIUcGv63QapC/3kVsoPerzKGhRANCAATxfzfHKUPeJtyLTGMUoxHhvBS1NT9guWhUQPGiZRLZIcB8Wc3csdVU1iOiTRmbZGKJTtekOdEAbVRrx5HxIpst";
+        const PUBLIC_SPKI_B64: &str = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE8X83xylD3ibci0xjFKMR4bwUtTU/YLloVEDxomUS2SHAfFnN3LHVVNYjok0Zm2RiiU7XpDnRAG1Ua8eR8SKbLQ==";
+        const OTHER_SPKI_B64: &str = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAECmz6W9QPu0HuggzW4vGvsnvQIl4Jyl/b9kVl8fm/qw/xJSQfCEzhnGMQzmyj2quUo96zvuxlCllcTkzsOhwEAg==";
+        engines.push((
+            "spki",
+            signed("spki", "spki", SECRET_PKCS8_B64),
+            PUBLIC_SPKI_B64,
+            OTHER_SPKI_B64,
+        ));
+    }
+    let no_key = "signature verification is enabled, but no engine of this build has a trusted key";
+    for (engine, src, trusted, other) in &engines {
+        let key = |public: &str| Some(format!("verification-{engine}-key={public}\n"));
+        for (case, src, extra, reason) in [
+            (
+                "no-summary",
+                &no_summary,
+                key(trusted),
+                Some("summary verification is enabled, but no summary is published"),
+            ),
+            (
+                "no-sig",
+                &no_sig,
+                key(trusted),
+                Some("summary verification is enabled, but no summary.sig is published"),
+            ),
+            (
+                "untrusted",
+                src,
+                key(other),
+                Some("the summary: no sign-api signature is from a trusted key"),
+            ),
+            ("trusted", src, key(trusted), None),
+            ("no-key", src, Some(String::new()), Some(no_key)),
+            ("no-section", src, None, Some(no_key)),
+        ] {
+            let name = format!("{engine}-{case}");
+            let (run, dest) = pull_local_into_origin(
+                base,
+                &name,
+                src,
+                extra.as_deref(),
+                &["--sign-verify-summary"],
+            );
+            let stderr = String::from_utf8_lossy(&run.stderr);
+            match reason {
+                Some(reason) => {
+                    assert_eq!(run.status.code(), Some(1), "{name}: {stderr}");
+                    assert!(stderr.contains(reason), "{name}: {stderr}");
+                    assert_nothing_pulled(&dest, &name);
+                }
+                None => {
+                    assert_eq!(run.status.code(), Some(0), "{name}: {stderr}");
+                    assert_eq!(
+                        resolve(&dest, "origin:test/main").as_deref(),
+                        Some(COMMIT),
+                        "{name}"
+                    );
+                }
+            }
+        }
+    }
+}
+
+/// `clap` refuses each sign switch of `pull-local` with no `--remote`, with a
+/// value, and together with its off switch, at exit 1. The refusal comes
+/// before the command opens the source, so the source path names nothing, and
+/// the destination gets no object and no ref.
+#[test]
+fn pull_local_sign_switches_refuse_before_the_pull() {
+    let tmp = TmpDir::new("pull-local-sign-switches");
+    let base = tmp.path();
+    let dest = create_repo(base, RepoMode::Archive);
+    let repo_arg = format!("--repo={}", dest.display());
+    let missing = base.join("nosuch");
+    let src = missing.to_str().unwrap();
+    for switch in ["--sign-verify", "--sign-verify-summary"] {
+        let valued = format!("{switch}=false");
+        let off = format!("--no-{}", switch.trim_start_matches("--"));
+        let cases: [(Vec<&str>, Vec<String>); 3] = [
+            (
+                vec![switch],
+                vec![
+                    "the following required arguments were not provided".to_owned(),
+                    "--remote".to_owned(),
+                ],
+            ),
+            (
+                vec![&valued, "--remote=origin"],
+                vec![format!("unexpected value 'false' for '{switch}'")],
+            ),
+            (
+                vec!["--remote=origin", switch, &off],
+                vec![format!("'{switch}' cannot be used with '{off}'")],
+            ),
+        ];
+        for (switches, texts) in cases {
+            let mut args = vec!["pull-local", repo_arg.as_str()];
+            args.extend_from_slice(&switches);
+            args.extend([src, "main"]);
+            let run = ostrya(&args, None, &[]);
+            let what = switches.join(" ");
+            let stderr = String::from_utf8_lossy(&run.stderr);
+            assert_eq!(run.status.code(), Some(1), "{what}: {stderr}");
+            for text in &texts {
+                assert!(stderr.contains(text.as_str()), "{what}: {stderr}");
+            }
+            assert_nothing_pulled(&dest, &what);
+        }
+    }
+}
+
 /// `pull-local --gpg-verify` opens each source commit object as many times as
 /// the same pull with no verification. The verification reads the bytes that
 /// the walk of the chain read to find the parent. The pull opens each source

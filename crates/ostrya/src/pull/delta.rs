@@ -1487,7 +1487,7 @@ fn open_local_blocking(
 ///
 /// The open runs on the blocking pool. [`open_local_blocking`] states the
 /// rules.
-async fn open_local(repo: &Repo, path: &str) -> Result<Option<(std::fs::File, u64)>> {
+pub(crate) async fn open_local(repo: &Repo, path: &str) -> Result<Option<(std::fs::File, u64)>> {
     let repo_fd = repo.repo_fd().try_clone_to_owned()?;
     let path = path.to_owned();
     ostrya_rt::unblock(move || open_local_blocking(repo_fd.as_fd(), &path)).await
@@ -1503,21 +1503,44 @@ pub(crate) async fn read_local(repo: &Repo, path: &str, cap: u64) -> Result<Opti
     let repo_fd = repo.repo_fd().try_clone_to_owned()?;
     let path = path.to_owned();
     ostrya_rt::unblock(move || {
-        use std::io::Read;
         let Some((file, len)) = open_local_blocking(repo_fd.as_fd(), &path)? else {
             return Ok(None);
         };
-        let hint = len.min(cap) + 1;
-        let mut bytes = Vec::with_capacity(usize::try_from(hint).unwrap_or(0));
-        file.take(cap + 1).read_to_end(&mut bytes)?;
-        if bytes.len() as u64 > cap {
-            return Err(Error::InvalidFormat(format!(
-                "{path} in the source repository exceeds the size ceiling of {cap} bytes"
-            )));
-        }
-        Ok(Some(bytes))
+        read_capped(file, len, &path, cap).map(Some)
     })
     .await
+}
+
+/// Reads the whole file that [`open_local`] opened at `path`, or `None` if
+/// `opened` is `None`.
+///
+/// The read runs on the blocking pool, under the cap rules of [`read_local`].
+pub(crate) async fn read_opened(
+    opened: Option<(std::fs::File, u64)>,
+    path: &str,
+    cap: u64,
+) -> Result<Option<Vec<u8>>> {
+    let Some((file, len)) = opened else {
+        return Ok(None);
+    };
+    let path = path.to_owned();
+    ostrya_rt::unblock(move || read_capped(file, len, &path, cap).map(Some)).await
+}
+
+/// Reads `file`, of length `len`, whole. If it is longer than `cap`, the
+/// function reads `cap` bytes and one more, then refuses the file at `path`
+/// with [`Error::InvalidFormat`].
+fn read_capped(file: std::fs::File, len: u64, path: &str, cap: u64) -> Result<Vec<u8>> {
+    use std::io::Read;
+    let hint = len.min(cap) + 1;
+    let mut bytes = Vec::with_capacity(usize::try_from(hint).unwrap_or(0));
+    file.take(cap + 1).read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > cap {
+        return Err(Error::InvalidFormat(format!(
+            "{path} in the source repository exceeds the size ceiling of {cap} bytes"
+        )));
+    }
+    Ok(bytes)
 }
 
 /// Returns the error of a pull that requires static deltas from a source with

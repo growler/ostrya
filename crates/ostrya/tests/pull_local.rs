@@ -3188,6 +3188,49 @@ fn a_local_pull_checks_the_source_summary_when_asked() {
     });
 }
 
+/// Under the summary verification, a missing `summary` or `summary.sig` stops
+/// the pull before it reads the other file:
+///
+/// - With no `summary`, the pull does not open `summary.sig`. A directory
+///   there would fail the open as a file that is not a regular file.
+/// - With no `summary.sig`, the pull does not read `summary`. A sparse
+///   `summary` one byte past the read cap of 64 MiB would fail the read.
+#[test]
+fn a_summary_check_refuses_a_missing_file_before_it_reads_the_other() {
+    let tmp = TmpDir::new("pull-local-verify-summary-missing");
+    let base = tmp.path();
+    block_on(async {
+        let (src_path, src, _c1, _c2) = source_repo(base, RepoMode::Archive).await;
+        let dst = dest_trusting(base, PUBLIC_B64).await;
+        let asked = PullOptions {
+            remote: Some("origin".to_owned()),
+            verify: PullVerify {
+                sign_summary: Some(true),
+                ..PullVerify::default()
+            },
+            ..PullOptions::default()
+        };
+
+        std::fs::create_dir(src_path.join("summary.sig")).unwrap();
+        let err = pull_main_with(&dst, &src, asked.clone()).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m) if m.contains("no summary is published")),
+            "{err}"
+        );
+        std::fs::remove_dir(src_path.join("summary.sig")).unwrap();
+
+        let summary = std::fs::File::create(src_path.join("summary")).unwrap();
+        summary.set_len((64 << 20) + 1).unwrap();
+        drop(summary);
+        let err = pull_main_with(&dst, &src, asked).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m) if m.contains("no summary.sig is published")),
+            "{err}"
+        );
+        assert!(dst.list_refs(None).await.unwrap().is_empty());
+    });
+}
+
 /// A local pull verifies the detached metadata that it keeps in place. If the
 /// source holds no `.commitmeta`, the pull keeps the `.commitmeta` of the
 /// destination and verifies that stored signature. If the source holds the

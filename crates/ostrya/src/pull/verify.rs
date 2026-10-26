@@ -68,8 +68,9 @@ impl Verification {
     /// command reports the same two cases. A policy that does not apply reads
     /// nothing.
     ///
-    /// The parse of `summary.sig` runs on the blocking pool, because the file
-    /// can be as large as the read cap of a summary.
+    /// The parse of `summary.sig` and the ed25519 and spki verifiers run on
+    /// the blocking pool, because each file can be as large as the read cap
+    /// of a summary.
     pub(crate) async fn check_summary(
         &self,
         summary: Option<&[u8]>,
@@ -79,20 +80,36 @@ impl Verification {
             return Ok(signature);
         }
         let Some(summary) = summary else {
-            return Err(Error::Signature(
-                "summary verification is enabled, but no summary is published".into(),
-            ));
+            return Err(no_summary());
         };
         let Some(signature) = signature else {
-            return Err(Error::Signature(
-                "summary verification is enabled, but no summary.sig is published".into(),
-            ));
+            return Err(no_summary_sig());
         };
         let (dict, signature) = super::parse_detached(signature).await;
         self.summary
-            .check("the summary", summary, dict?.as_ref())
+            .check_unblocked("the summary", summary, dict?.as_ref())
             .await?;
         Ok(Some(signature))
+    }
+
+    /// Refuses a summary check that misses a file, before the pull reads a
+    /// file.
+    ///
+    /// `summary` and `signature` tell if the source publishes `summary` and
+    /// `summary.sig`. A policy that applies needs both files, and the error
+    /// is the error of [`check_summary`](Self::check_summary) for the same
+    /// files. A policy that does not apply passes.
+    pub(crate) fn check_summary_files(&self, summary: bool, signature: bool) -> Result<()> {
+        if !self.summary.applies() {
+            return Ok(());
+        }
+        if !summary {
+            return Err(no_summary());
+        }
+        if !signature {
+            return Err(no_summary_sig());
+        }
+        Ok(())
     }
 
     /// Verifies a fetched static delta against the sign-api axis of the commit
@@ -127,6 +144,16 @@ impl Verification {
             ))),
         }
     }
+}
+
+/// Returns the error of a summary check with no `summary` to check.
+fn no_summary() -> Error {
+    Error::Signature("summary verification is enabled, but no summary is published".into())
+}
+
+/// Returns the error of a summary check with no `summary.sig` to check.
+fn no_summary_sig() -> Error {
+    Error::Signature("summary verification is enabled, but no summary.sig is published".into())
 }
 
 #[cfg(test)]

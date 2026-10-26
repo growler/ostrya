@@ -1253,8 +1253,12 @@ record the port side.
 ### Signature verification during a pull
 
 The pulls in this section are HTTP pulls of the tool from an archive repository
-that the tool built. Each refusal in this section leaves the
-destination with no ref and no object.
+that the tool built, unless a paragraph names a `file://` URL or `pull-local`.
+The HTTP texts are those of a commit that the destination does not hold.
+Each refusal in this section leaves the destination with no ref and no object.
+libostree 2024.8, 2025.7, and 2026.1 give the same ed25519 results and the
+same `pull-local` imports in this section. For each transport, the three
+releases give the same text.
 
 #### The verification keys
 
@@ -1276,15 +1280,30 @@ Each configuration key selects one check:
     with no GPG signature: `error: GPG verification enabled, but no signatures
     found`.
 - `sign-verify`, default off. The value is a boolean, or a list of engine names
-  split on `,` and `;`. `remote`, "`remote add`", states the keys that
-  `--sign-verify` and `--no-sign-verify` of `remote add` write. For an engine
-  given twice, `remote add` writes the name two times
-  (`sign-verify=ed25519,ed25519`), and the tool accepts that value. The tool
-  does not trim a name.
-  - `sign-verify=ed25519, ed25519`, and each name that no engine answers to:
-    `error: Requested signature type is not implemented`.
-  - A commit with no signature under the named engines: `error: Can't verify
-    commit: No signatures found`.
+  split on `;`. The tool does not trim a name. It drops an empty name at the
+  end of the list alone. A commit that the trusted key signed pulls at exit 0
+  under `ed25519;ed25519`, `ed25519;dummy`, and `ed25519;`.
+  `remote`, "`remote add`", states the keys that `--sign-verify` and
+  `--no-sign-verify` of `remote add` write. For an engine given twice, `remote
+  add` writes `sign-verify=ed25519,ed25519`. A pull of a commit that the
+  trusted key signed then fails.
+  - A `,` in the value, a space beside a name, an empty name before the last
+    name, and each name that no engine answers to: `error: Requested signature
+    type is not implemented`. The tool gives this text for `ed25519,ed25519`,
+    `ed25519, ed25519`, `ed25519,dummy`, `dummy,ed25519`, `ed25519,`,
+    `ed25519,spki`, `ed25519; ed25519`, ` ed25519`, `ed25519 `, and
+    `;ed25519`.
+  - A commit with no detached metadata: `error: Can't verify commit without
+    detached metadata`.
+  - A commit with detached metadata and no signature under the named engines:
+    `error: Can't verify commit: No signatures found`. A commit whose detached
+    metadata holds no signature, and a commit that an spki key alone signed,
+    give this text under `sign-verify=ed25519`. Under `sign-verify=true`, a
+    build with the spki engine reports the spki commit with `error: Can't
+    verify commit: signature: spki: no keys loaded` when no spki key is
+    configured. With no key for any engine, a build without the spki engine
+    reports the spki commit with `error: Can't verify commit: No signatures
+    found`.
   - A commit signed by an untrusted key: `error: Can't verify commit: ed25519:
     Signature couldn't be verified with: key '<hex of the trusted key>'`.
 - `sign-verify-summary`, default off. The tool reads this key alone:
@@ -1295,8 +1314,8 @@ Each configuration key selects one check:
     verification enabled, but no summary.sig found (use
     sign-verify-summary=false in remote config to disable)`.
 - `verification-<engine>-key` holds one key. A list under either separator
-  fails with `error: Failed loading 'ed25519' keys from inline
-  verification-key`.
+  fails with `` error: Failed loading 'ed25519' keys from inline
+  `verification-key` ``.
 - `verification-spki-key` is the base64 of a SubjectPublicKeyInfo DER, also
   with line breaks, which `ostree config set` writes as the escape `\n`. A key
   in another form fails each pull with `error: Can't verify commit
@@ -1326,23 +1345,73 @@ Each configuration key selects one check:
   with a key for each engine accepts a commit that ed25519 alone signed.
 - An engine that `sign-verify` names with no key fails with `error: No keys
   found for required signapi type <engine>`. `sign-verify=true` with no key for
-  any engine fails with `error: Can't verify commit: signature: ed25519: no keys
-  loaded`.
+  any engine fails a commit that an ed25519 key signed with `error: Can't
+  verify commit: signature: ed25519: no keys loaded`.
 - `verification-<engine>-key` alone verifies nothing. The check runs only where
   `sign-verify` or `sign-verify-summary` asks for it.
 - The tool checks each commit that the pull carries, the parents that `--depth`
   follows included. On a repeat pull, the tool checks again a commit that the
-  destination already holds.
+  destination already holds. That check names the commit and gives the texts
+  of a `file://` pull, also over HTTP.
+
+A pull from a `file://` URL gives other texts, and each text names the commit.
+A repeat pull over HTTP gives the ed25519 texts of this list:
+
+- A commit with no signature under the named engines, with or without detached
+  metadata: `error: Can't verify commit <checksum>: ed25519: commit have no
+  signatures of my type`. `sign-verify=true` and `sign-verify=ed25519;spki`
+  also give the engine name `ed25519`. These cases also give this text:
+  - `sign-verify=true` with no key, and a commit with no ed25519 signature;
+  - `sign-verify=true` or `sign-verify=ed25519;spki`, and a commit that an
+    spki key alone signed, where no trusted spki key verifies the commit.
+- Under `sign-verify=spki`, the text has the engine name `spki`: `error: Can't
+  verify commit <checksum>: spki: commit have no signatures of my type`. An
+  unsigned commit and a commit that an ed25519 key alone signed give it.
+  `static-delta`, "spki key store and verify report", records the spki remote
+  config.
+- A commit signed by an untrusted key: `error: Can't verify commit <checksum>:
+  ed25519: Signature couldn't be verified with: key '<hex of the trusted
+  key>'`.
+- A commit that an ed25519 key signed, and `sign-verify=true` with no key:
+  `error: Can't verify commit <checksum>: signature: ed25519: no keys loaded`.
 
 `pull-local` makes no check unless an option asks for it. It has the options
 `--gpg-verify` and `--gpg-verify-summary`. Each option needs `--remote`, or the
 tool refuses with `error: Must specify remote name to enable gpg verification`.
-The `gpg-verify=true` of the named remote does not turn on a check. A remote
-that the configuration does not describe holds no key. So its name satisfies
-`--remote`, and the tool refuses each signature.
+The `gpg-verify=true` of the named remote does not turn on a check, and the
+tool reads no sign-api key of that remote. A remote that the configuration does
+not describe holds no key. So its name satisfies `--remote`, and the tool
+refuses each signature. `pull-local` has no sign-api option. `pull-local
+--help` lists none, and `--sign-verify` fails with `error: Unknown option
+--sign-verify` at exit 1.
 
-The summary check of `pull-local` reads the `summary` and the `summary.sig` of
-the source repository. The refusals of `pull-local` are these:
+With `--remote=NAME`, the tool imports the commit at exit 0 and writes the ref
+under `refs/remotes/NAME/` in each of these cases:
+
+- `sign-verify=ed25519` or `sign-verify=true` with a trusted ed25519 key: an
+  unsigned commit, and a commit that an untrusted key signed;
+- `sign-verify=spki` with `verification-spki-file`: an unsigned commit, a
+  commit of an untrusted spki key, and a commit of an ed25519 key;
+- `sign-verify=ed25519;spki` with a key for each engine: an unsigned commit,
+  and a commit that an untrusted ed25519 key signed;
+- `sign-verify=ed25519` and `sign-verify=true` with no key;
+- `--depth=1` over a signed commit whose parent is unsigned;
+- a repeat pull of an unsigned commit that the destination holds;
+- `--commit-metadata-only` of an unsigned commit;
+- `sign-verify-summary=true` with a trusted key, and each of these sources:
+  - a source with no summary;
+  - a source with an unsigned summary;
+  - a source with a summary that the trusted key signed;
+  - a source with a summary that another key signed.
+
+`--gpg-verify` still applies. Beside `sign-verify=ed25519` and a commit of the
+trusted key, the pull fails on GPG alone, with the refusal of an unsigned
+commit in the list below. `pull` with the same remote config refuses the
+unsigned commit and the commits of untrusted keys.
+
+The `--gpg-verify-summary` check of `pull-local` reads the `summary` and the
+`summary.sig` of the source repository. The GPG refusals of `pull-local` are
+these:
 
 - an unsigned commit: `error: Commit <c>: GPG verification enabled, but no
   signatures found (use gpg-verify=false in remote config to disable)`
@@ -1368,8 +1437,10 @@ The tool cannot pull a signed delta. A from-scratch delta and a from-to delta
 that `static-delta generate --sign` signed both fail the pull with `error:
 Invalid checksum of length 0 expected 32`. The pull fails with verification
 configured and with verification off. `static-delta apply-offline` applies the
-same delta, and `static-delta show` reports `Signed: yes`. `cli-surface.md`,
-"P2", `pull`, records the port side.
+same delta, and `static-delta show` reports `Signed: yes`.
+
+Over a `file://` URL, the tool imports the commit at exit 0 in each case of
+this subsection. `cli-surface.md`, "P2", `pull`, records the port side.
 
 ## The fsync vocabulary
 

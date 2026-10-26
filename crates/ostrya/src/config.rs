@@ -753,7 +753,7 @@ impl<'a> Remote<'a> {
     /// Returns the accessors of a remote section over another group of
     /// `keyfile`. The group takes the key names and the value forms of a
     /// remote section.
-    #[cfg(feature = "receive")]
+    #[cfg_attr(not(feature = "receive"), allow(dead_code))]
     pub(crate) fn view(keyfile: &'a KeyFile, group: String) -> Remote<'a> {
         Remote { keyfile, group }
     }

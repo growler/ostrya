@@ -353,7 +353,6 @@ impl GpgVerifier {
     /// [`Error::Signature`]. An empty file and a directory with no `*.gpg`
     /// keyring are examples. A verifier with no trusted key refuses every
     /// commit.
-    #[cfg(feature = "receive")]
     pub(crate) fn from_keypath(key: &str, keypath: &[String]) -> Result<GpgVerifier> {
         let mut verifier = GpgVerifier::default();
         verifier.add_keyring_files(keypath_files(key, keypath)?)?;

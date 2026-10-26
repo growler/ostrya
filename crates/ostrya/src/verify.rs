@@ -12,7 +12,7 @@
 //! caller holds.
 
 // The module also builds the policy of a target from a key source: the
-// configuration section of a remote, or a trust group of the receive path.
+// configuration section of a remote, or a trust group.
 // The pull and the receive path share this build.
 
 #[cfg(feature = "verify-gpg")]
@@ -34,6 +34,8 @@ use crate::sign::{
     Ed25519Verifier, MAX_KEY_FILE, SignKeys, Verifier, key_text, load_sign_keys, read_key_source,
     signatures_for,
 };
+
+pub(crate) mod trust;
 
 /// The detached-metadata key of the dummy engine.
 const DUMMY_METADATA_KEY: &str = "ostree.sign.dummy";
@@ -611,7 +613,7 @@ pub(crate) enum KeySource<'a> {
     },
     /// A trust group, `[ex-ostrya trust "NAME"]`. The accessors of a remote
     /// section read it.
-    #[cfg(feature = "receive")]
+    #[cfg_attr(not(feature = "receive"), allow(dead_code))]
     Trust {
         /// The name of the group, which a refusal names.
         name: &'a str,
@@ -628,7 +630,6 @@ impl KeySource<'_> {
                 Some(section) => section.verification_key(engine),
                 None => Ok(None),
             },
-            #[cfg(feature = "receive")]
             KeySource::Trust { section, .. } => section.verification_key(engine),
         }
     }
@@ -640,7 +641,6 @@ impl KeySource<'_> {
                 Some(section) => section.verification_file(engine),
                 None => Ok(None),
             },
-            #[cfg(feature = "receive")]
             KeySource::Trust { section, .. } => section.verification_file(engine),
         }
     }
@@ -650,7 +650,6 @@ impl KeySource<'_> {
     fn system_store(&self) -> bool {
         match self {
             KeySource::Remote { .. } => true,
-            #[cfg(feature = "receive")]
             KeySource::Trust { .. } => false,
         }
     }
@@ -807,7 +806,6 @@ async fn gpg_verifier(repo: &Repo, source: &KeySource<'_>) -> Result<Arc<dyn Ver
             })
             .await?
         }
-        #[cfg(feature = "receive")]
         KeySource::Trust { name, section } => {
             let keypath = section.gpgkeypath()?;
             let key = format!("[ex-ostrya trust \"{name}\"] gpgkeypath");
@@ -829,7 +827,6 @@ async fn gpg_verifier(_repo: &Repo, source: &KeySource<'_>) -> Result<Arc<dyn Ve
             "remote '{name}' asks for GPG verification, which this build has no \
              engine for; build with the verify-gpg feature or set gpg-verify=false"
         ))),
-        #[cfg(feature = "receive")]
         KeySource::Trust { name, .. } => Err(Error::Unsupported(format!(
             "[ex-ostrya trust \"{name}\"] asks for GPG verification, which this \
              build has no engine for; build with the verify-gpg feature"
@@ -1601,7 +1598,6 @@ mod tests {
     /// The trust source reads the `verification-*` keys of its group. The
     /// remote keys of the same name do not reach it. The trust source reads no
     /// system key store, and a remote source reads one.
-    #[cfg(feature = "receive")]
     #[test]
     fn trust_source_reads_its_own_group() {
         let keyfile = ostrya_core::KeyFile::parse(

@@ -16,18 +16,16 @@ use std::sync::Arc;
 use ostrya_core::KeyFile;
 
 use crate::access::{ClientAccess, Group, classify};
-use crate::config::{Remote, SignVerify};
 use crate::error::{Error, Result};
 use crate::pull::DetachedMetadataFilter;
 use crate::repo::Repo;
 use crate::sign::{MAX_KEY_FILE, key_text, read_key_path};
+use crate::verify::trust::{check_trust, unknown_key};
 
 use super::{ReceivePolicy, ReceiveVerify, ServerSigner, TrustedKeys};
 
 /// The name prefix of a key group, before the quoted name.
 const KEY_PREFIX: &str = "ex-ostrya key \"";
-/// The sign-api engines that a trust group can name.
-const TRUST_ENGINES: &[&str] = &["ed25519", "spki"];
 
 /// One key group as the first pass reads it.
 enum KeySpec {
@@ -128,111 +126,6 @@ pub(crate) async fn read(repo: &Repo) -> Result<(ClientAccess, Vec<Arc<ReceivePo
         })
         .collect();
     Ok((access, policies))
-}
-
-/// Checks the trust group `group`.
-///
-/// Each key must be one that an axis reads. The group must turn on at least
-/// one axis.
-fn check_trust(keyfile: &KeyFile, group: &str) -> Result<()> {
-    let mut engine_keys: Vec<(&str, &str)> = Vec::new();
-    for key in keyfile.keys(group) {
-        match key {
-            "gpg-verify" | "gpgkeypath" | "sign-verify" => {}
-            "gpg-verify-summary" | "sign-verify-summary" => {
-                return Err(Error::InvalidFormat(format!(
-                    "[{group}] holds '{key}', and a push carries no summary"
-                )));
-            }
-            _ => match verification_engine(key) {
-                Some(engine) if TRUST_ENGINES.contains(&engine) => {
-                    engine_keys.push((key, engine));
-                }
-                Some(engine) => {
-                    return Err(Error::InvalidFormat(format!(
-                        "[{group}] holds '{key}', and '{engine}' is not ed25519 or spki"
-                    )));
-                }
-                None => return Err(unknown_key(group, key)),
-            },
-        }
-    }
-
-    let gpg = keyfile.get_bool(group, "gpg-verify")?.unwrap_or(false);
-    let sign = Remote::view(keyfile, group.to_owned()).sign_verify()?;
-    let engines: Vec<&str> = match &sign {
-        SignVerify::Off => Vec::new(),
-        SignVerify::All => TRUST_ENGINES.to_vec(),
-        SignVerify::Engines(names) => names.iter().map(String::as_str).collect(),
-    };
-    for engine in &engines {
-        if !TRUST_ENGINES.contains(engine) {
-            return Err(Error::InvalidFormat(format!(
-                "[{group}] sign-verify names '{engine}', which is not ed25519 or spki"
-            )));
-        }
-    }
-    if !gpg && engines.is_empty() {
-        return Err(Error::InvalidFormat(format!(
-            "[{group}] turns on no signature check: set gpg-verify=true or sign-verify"
-        )));
-    }
-
-    let keypath = keyfile.get_value(group, "gpgkeypath").is_some();
-    if keypath && !gpg {
-        return Err(Error::InvalidFormat(format!(
-            "[{group}] sets gpgkeypath, and gpg-verify is not true, so no check reads it"
-        )));
-    }
-    // `sign-verify=true` names every engine of the build, so it names spki
-    // only in a build that has it.
-    let names_spki = matches!(&sign, SignVerify::Engines(names) if names.iter().any(|n| n == "spki"))
-        || engine_keys.iter().any(|(_, engine)| *engine == "spki");
-    if cfg!(not(any(
-        feature = "sign-spki-p256",
-        feature = "sign-spki-p384",
-        feature = "sign-spki-ed25519",
-        feature = "sign-spki-rsa"
-    ))) && names_spki
-    {
-        return Err(Error::Unsupported(format!(
-            "[{group}] names the spki engine, which this build has no engine for; \
-             build with the sign-spki feature"
-        )));
-    }
-    for (key, engine) in engine_keys {
-        if !engines.contains(&engine) {
-            return Err(Error::InvalidFormat(format!(
-                "[{group}] holds '{key}', and sign-verify does not select {engine}, so \
-                 no check reads it"
-            )));
-        }
-    }
-    if gpg {
-        if cfg!(not(feature = "verify-gpg")) {
-            return Err(Error::Unsupported(format!(
-                "[{group}] asks for GPG verification, which this build has no engine \
-                 for; build with the verify-gpg feature"
-            )));
-        }
-        if Remote::view(keyfile, group.to_owned())
-            .gpgkeypath()?
-            .is_empty()
-        {
-            return Err(Error::InvalidFormat(format!(
-                "[{group}] sets gpg-verify=true, and gpgkeypath names no keyring"
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// Returns the engine that a `verification-ENGINE-key` or
-/// `verification-ENGINE-file` key names, or `None` for another key.
-fn verification_engine(key: &str) -> Option<&str> {
-    let rest = key.strip_prefix("verification-")?;
-    rest.strip_suffix("-key")
-        .or_else(|| rest.strip_suffix("-file"))
 }
 
 /// Reads the key group `group`.
@@ -443,27 +336,4 @@ fn read_secret_key_blocks(path: &str) -> Result<Vec<crate::spki::SpkiSigner>> {
         return Err(Error::Signature(format!("{subject} does not exist")));
     };
     Ok(crate::spki::spki_secret_keys(bytes, &subject)?)
-}
-
-/// Returns the error for a key that `group` does not take.
-fn unknown_key(group: &str, key: &str) -> Error {
-    Error::InvalidFormat(format!("[{group}] holds the unknown key '{key}'"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// `verification_engine` returns the engine that a verification key
-    /// names.
-    #[test]
-    fn verification_keys_name_their_engine() {
-        assert_eq!(
-            verification_engine("verification-ed25519-key"),
-            Some("ed25519")
-        );
-        assert_eq!(verification_engine("verification-spki-file"), Some("spki"));
-        assert_eq!(verification_engine("verification-x-y"), None);
-        assert_eq!(verification_engine("gpgkeypath"), None);
-    }
 }

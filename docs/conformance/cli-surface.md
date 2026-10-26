@@ -1499,7 +1499,7 @@ stand.
   block at exit 1 with `error: signature: the key file '<path>' holds more
   than one PEM PRIVATE KEY block`, and moves no ref. It refuses the whole file
   at exit 1, and moves no ref, for a block of another label, a block that does
-  not decode, a block that holds no P-256 PKCS#8 key, and a block with no END
+  not decode, a block that holds no valid PKCS#8 key, and a block with no END
   line, at any position. The message is `error: signature: the key file
   '<path>', line <n>: <reason>`, where the tool reports `error: Unexpected
   label "<label>"` for a first block of another label. The body rules of a public key file apply, so
@@ -1543,12 +1543,12 @@ stand.
   that key at exit 1. Both sign with three or four `=` at the end of that
   key, and with a last character whose unused low bits are not zero. Both
   sign with a PKCS#8 key or a SEC1 key whose base64 holds LF or CRLF line
-  breaks. Both refuse a raw 32-byte scalar, a SEC1 key with no `parameters`
+  breaks, and with the base64 of a PKCS#1 key of an RSA key. Both refuse a raw 32-byte scalar, a SEC1 key with no `parameters`
   field, a SEC1 key whose `parameters` field names secp384r1, and the base64
   of the full PEM text at exit 1, and move no ref. The tool reports `error:
   Not able to sign the cobject: openssl: Failed to initialize spki key`. The
-  port reports `error: signature: spki secret key: expected PKCS#8 DER or
-  SEC1 DER`. For a SEC1 key with no `parameters` field it reports `error:
+  port reports `error: signature: spki secret key: expected PKCS#8 DER, SEC1
+  DER, or PKCS#1 DER`. For a SEC1 key with no `parameters` field it reports `error:
   signature: spki secret key: the SEC1 key does not name its curve`, and for
   a SEC1 key of another curve `error: signature: spki secret key: the SEC1
   key names a curve other than P-256`.
@@ -1558,8 +1558,8 @@ stand.
   refuses it at exit 1 with `error: signature: spki secret key: the EC key
   has explicit curve parameters`, or the same reason after `error:
   signature: the key file '<path>', line <n>: `, and moves no ref. A key of a
-  type or on a curve outside the set of the port is refused the same way, as
-  `sign` records.
+  type or on a curve outside the set of the port, and an RSA key that the
+  port refuses, are refused the same way, as `sign` records.
 
 The branch-name term of the signing step's fault order is observable only over
 a name the ref-name rule refuses. `-b 'bad//name' --sign=zzz` reports
@@ -2919,8 +2919,8 @@ details", "spki"). Forty-four differences stand on `show`,
   the run at exit 1 before it reads the superblock, in each position of the
   key, with `error: signature: spki public key: expected SubjectPublicKeyInfo
   DER` and nothing on standard output. A key with explicit curve parameters,
-  and a key of a type or on a curve outside the set of the port, are refused
-  in each key source of `verify`, `generate`, and `apply-offline`, as "P2",
+  a key of a type or on a curve outside the set of the port, and an RSA key
+  that the port refuses, are refused in each key source of `verify`, `generate`, and `apply-offline`, as "P2",
   `sign`, records. A line of the `--keys-file` of `generate` gives the reason
   after `error: signature: the key file '<path>', line <n>: spki secret key:
   `;
@@ -3032,7 +3032,8 @@ order, as in the tool. Only a little-endian host is observed.
 - the lines of an spki `--keys-file`. Observed with the `ostree` 2026.1 build
   with OpenSSL on the NixOS development host (`cli-behavior.md`, "CLI output
   formats", `static-delta`, "spki secret key files"). Both read one base64
-  secret key on each line, with LF or CRLF line ends, and refuse an empty line
+  secret key on each line, a PKCS#8, a SEC1, or a PKCS#1 DER, with LF or CRLF
+  line ends, and refuse an empty line
   and a line that is not base64. These lines and files part:
   - An empty file. The tool writes a superblock whose `ostree.sign.spki`
     entry holds no signature, at exit 0. The port refuses the run at exit 1
@@ -3626,7 +3627,7 @@ reads. The key-file entries under `static-delta` above, the spki entries
 included, also hold for `sign --verify`. Under `spki`, a signing
 `--keys-file` holds PEM `PRIVATE KEY` blocks, each a PKCS#8 DER, and each
 block adds one signature. A `-d` `--keys-file` holds PEM `PUBLIC KEY` blocks,
-read as a `--keys-file` of `--verify`. Fifteen differences stand.
+read as a `--keys-file` of `--verify`. Eighteen differences stand.
 
 - the verdict report. The exit status agrees. The two reports part as
   follows:
@@ -3785,16 +3786,45 @@ read as a `--keys-file` of `--verify`. Fifteen differences stand.
   on 2026-10-24 with the build above: the tool signs and verifies with each
   signature key type of OpenSSL 3.6.4, ECDSA on 85 named curves, SM2,
   Ed25519, Ed448, RSA, RSA-PSS, DSA, ML-DSA, and SLH-DSA. The port takes
-  ECDSA on the P-256 curve alone. It refuses another key at exit 1 before it
-  signs or verifies, with `error: signature: spki public key: the key type
-  <name> is not supported` or `error: signature: spki public key: the curve
-  <name> is not supported`, and with `spki secret key` for a secret key.
-  `<name>` is a name such as `RSA`, `Ed25519`, or `P-384`, or the dotted OID.
-  A key file and a key-store file give the reason after `error: signature:
-  the key file '<path>', line <n>: `, also when the other blocks of the file
-  are valid. A line of the `--keys-file` of `static-delta generate` gives the
-  reason after `error: signature: the key file '<path>', line <n>: spki
-  secret key: `.
+  ECDSA on the P-256 curve, and RSA with the key type `rsaEncryption`. It
+  refuses another key at exit 1 before it signs or verifies, with `error:
+  signature: spki public key: the key type <name> is not supported` or
+  `error: signature: spki public key: the curve <name> is not supported`,
+  and with `spki secret key` for a secret key. `<name>` is a name such as
+  `RSASSA-PSS`, `Ed25519`, or `P-384`, or the dotted OID. A build of the port
+  without the code of a key type refuses a key of that type the same way,
+  with the reason `this build has no code for the key type RSA; build with
+  the sign-spki-rsa feature` or `this build has no code for the curve P-256;
+  build with the sign-spki-p256 feature`. The `ostrya` command carries both
+  key types. A key file and a key-store file give the reason after `error:
+  signature: the key file '<path>', line <n>: `, also when the other blocks
+  of the file are valid. A line of the `--keys-file` of `static-delta
+  generate` gives the reason after `error: signature: the key file '<path>',
+  line <n>: spki secret key: `. The RSA keys that the port refuses follow;
+- an RSA key with a modulus of fewer than 2048 bits or more than 16384 bits.
+  Observed on 2026-10-26 with the build above and keys of OpenSSL 3.6.4
+  (`cli-behavior.md`, "CLI output formats", `static-delta`, "spki RSA keys"):
+  the tool signs and verifies with a 512-bit and a 1024-bit key at exit 0.
+  With a 16386-bit key, the tool signs at exit 0, and its verify of the
+  signature reports `error: spki: Signature couldn't be verified with: key
+  '<hex>'` at exit 1. OpenSSL verifies no signature of a modulus above 16384
+  bits. The port refuses such a key, a public key and a secret key, at exit 1
+  before it signs or verifies, with the reason `the RSA modulus has <bits>
+  bits; the engine takes 2048 to 16384 bits`, in the forms of the entries
+  above;
+- an RSA secret key of more than two primes. Observed on 2026-10-26 with the
+  build above ("spki RSA keys"): the tool signs with a 2048-bit key of 3
+  primes, a 4096-bit key of 4 primes, and an 8192-bit key of 5 primes, and
+  verifies each signature at exit 0. The port refuses such a secret key, in
+  PKCS#8 and in PKCS#1 form, at exit 1 before it signs, with the reason `the
+  RSA key has more than two primes`. The port takes the public key of such a
+  key, and verifies a signature that the tool makes with it;
+- an `rsaEncryption` public key whose parameters are not `NULL`. Observed on
+  2026-10-26 with the build above ("spki RSA keys"): the tool verifies a
+  signature at exit 0 with an SPKI that has no parameters field, and with an
+  SPKI that has an OID in the field. The port refuses such a key at exit 1
+  before it verifies, with the reason `the rsaEncryption parameters are not
+  NULL`. It refuses a PKCS#8 secret key with such parameters the same way.
 
 ## P3 -- shell-suite surface with no matrix weight
 
@@ -3852,8 +3882,9 @@ records. Thirteen divergences stand:
   during a pull", "The verification keys"). The port refuses each pull at exit 1 before it fetches, with
   `error: signature: spki public key: expected SubjectPublicKeyInfo DER`.
   Both fail also when `verification-spki-file` holds the valid key. A key
-  with explicit curve parameters, and a key of a type or on a curve outside
-  the set of the port, in `verification-spki-key` or
+  with explicit curve parameters, a key of a type or on a curve outside the
+  set of the port, and an RSA key that the port refuses, in
+  `verification-spki-key` or
   `verification-spki-file`, refuse each pull of the port the same way, as
   "P2", `sign`, records;
 - `remote gpg-list-keys` reports the key fingerprint, the creation instant, and

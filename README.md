@@ -219,8 +219,8 @@ The features of the `ostrya` crate are:
 
 - `smol` (default) and `tokio`: the async runtime.
 - `sign-spki`: the spki signing engine with each of its key types.
-- `sign-spki-p256`: the spki signing engine with the ECDSA P-256 key type
-  alone.
+- `sign-spki-p256`: the spki signing engine with the ECDSA P-256 key type.
+- `sign-spki-rsa`: the spki signing engine with the RSA key type.
 - `verify-gpg`: GPG signature verification and key management.
 - `sign-gpg`: GPG signing through the `gpg` command. It turns on `verify-gpg`.
 - `push`: the client side of a push.

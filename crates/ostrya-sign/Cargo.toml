@@ -17,8 +17,9 @@ tokio = ["ostrya-rt?/tokio"]
 # One feature for each key type of the spki engine. The code that each key
 # type shares compiles when one of them is on.
 sign-spki-p256 = ["dep:p256", "dep:der", "dep:spki", "dep:pkcs8", "dep:pem-rfc7468"]
+sign-spki-rsa = ["dep:rsa", "dep:der", "dep:spki", "dep:pkcs8", "dep:pem-rfc7468"]
 # The spki engine with each of its key types.
-sign-spki = ["sign-spki-p256"]
+sign-spki = ["sign-spki-p256", "sign-spki-rsa"]
 sign-gpg = ["dep:ostrya-rt"]
 
 # docs.rs adds these two features to the default set, so the pages show the
@@ -54,6 +55,13 @@ der = { version = "0.7.10", default-features = false, features = [
 spki = { version = "0.7.3", default-features = false, optional = true }
 pkcs8 = { version = "0.10.2", default-features = false, optional = true }
 pem-rfc7468 = { version = "0.7.0", default-features = false, features = ["alloc"], optional = true }
+# `getrandom` supplies the random source that blinds each RSA private-key
+# operation.
+rsa = { version = "0.9.10", default-features = false, features = [
+    "sha2",
+    "u64_digit",
+    "getrandom",
+], optional = true }
 
 # The key file reader opens with `O_NONBLOCK` on Unix, so a fifo answers the
 # open rather than waiting for a writer. `std` does not supply the value of

@@ -120,11 +120,21 @@ C GObject surface.
 ## Advisory exceptions
 
 RUSTSEC-2023-0071 against `rsa` 0.9.10, the Marvin timing attack, has no
-patched version and holds a written exception. The advisory covers RSA
-private-key operations. This port performs public-key verification alone, RSA
-private keys stay with GnuPG and its agent, and no code path in the tree
-performs an RSA private-key operation. The exception is reviewed if a later
-phase adds such an operation.
+patched version in the 0.9 series and holds a written exception. The
+advisory covers RSA private-key operations. The fix is merged for the 0.10.0
+release candidates of `rsa`. The spki engine performs RSA private-key
+operations with `rsa` 0.9.10. In the CLI, `ostrya sign`, `commit`, `summary`,
+`remote summary`, and `static-delta generate` sign with an RSA key. On the
+receive endpoint, the server signs with the RSA key of an `[ex-ostrya key]`
+group. A client can start such a signature and measure its time. The time of
+the operation can then disclose information about the private key. The port
+accepts this risk. Where a client that is not trusted can reach the endpoint,
+use a P-256 or an ed25519 key in an `[ex-ostrya key]` group. The signer
+blinds each RSA private-key operation with a random value from the operating
+system. Blinding makes the time signal smaller, and it does not remove it.
+RSA verification uses the public key alone, and the advisory does not apply
+to it. GPG private keys stay with GnuPG and its agent. The exception is
+reviewed when the tree takes a release of `rsa` with the fix.
 
 RUSTSEC-2024-0447 against `pgp` is patched at 0.14.1. The tree takes 0.20.0,
 so the advisory is closed for the version in the graph.
@@ -145,7 +155,9 @@ operating system:
   `graviola` reaches. `windows-sys` gets its link attributes from
   `windows-link`, which emits them in the `raw-dylib` form. These crates link
   `ws2_32`, `crypt32`, and other system libraries. `getrandom` links
-  `bcryptprimitives` in the `raw-dylib` form itself.
+  `bcryptprimitives` in the `raw-dylib` form itself. `ostrya-sign` reaches
+  `getrandom` 0.2.17 through `p256` and `rsa`, and that version links
+  `bcrypt` and `advapi32` with `#[link]` attributes.
 
 These libraries are part of the operating system. The build compiles no C
 source for them, and the port ships no copy of them. No crate in the list
@@ -357,9 +369,9 @@ term below is measured on the resolved dependency graph.
   workspace pins 1.92, so the requirement holds.
 
 `pkcs8` 0.10.2 is also authorized for `crates/ostrya-sign`, behind each key
-feature of the spki engine, now `sign-spki-p256`. It reads the
-`PrivateKeyInfo` of a PKCS#8 secret key, so the spki engine selects the key
-type from the algorithm OID before it decodes the key.
+feature of the spki engine, now `sign-spki-p256` and `sign-spki-rsa`. It
+reads the `PrivateKeyInfo` of a PKCS#8 secret key, so the spki engine selects
+the key type from the algorithm OID before it decodes the key.
 
 - `default-features = false` is mandatory, and no feature is turned on.
 - `der` 0.7.10 and `spki` 0.7.3 enter the same manifest behind the same
@@ -369,6 +381,78 @@ type from the algorithm OID before it decodes the key.
 - No package enters `Cargo.lock`. `p256` already reached `pkcs8`, `der`, and
   `spki` in `ostrya-sign`. The one change to the lock file is the three
   entries `der`, `pkcs8`, and `spki` in the dependency list of `ostrya-sign`.
+
+### Authorized: the `rsa` crate
+
+`rsa` 0.9.10 is authorized for `crates/ostrya-sign` alone, as an optional
+dependency behind the feature `sign-spki-rsa`. It supplies RSA PKCS#1 v1.5
+signatures with SHA-256 to the spki engine in
+`crates/ostrya-sign/src/spki/rsa.rs`: the private key from its components,
+the signer, and the verifier. Each term below is measured on the resolved
+dependency graph.
+
+- License `MIT OR Apache-2.0`.
+- `default-features = false` is mandatory, with the features `sha2`,
+  `u64_digit`, and `getrandom`. `sha2` supplies the SHA-256 `DigestInfo`
+  prefix. `u64_digit` makes `num-bigint-dig` compute with 64-bit limbs.
+  `getrandom` supplies `OsRng`, which blinds each private-key operation. The
+  default features `std` and `pem` stay off: the engine reads PEM with
+  `pem-rfc7468` and gives each error its own message. The features `hazmat`,
+  `nightly`, `pkcs5`, and `serde` stay off. `pgp` takes the default features
+  of `rsa`, so a build with `verify-gpg` also turns on `std` and `pem`.
+- The engine does not use the key decoders of the crate.
+  `RsaPublicKey::new` caps the modulus at `RsaPublicKey::MAX_SIZE`, 4096
+  bits, and the SubjectPublicKeyInfo decoder calls it. The private-key
+  decoders apply no cap, and give general errors, such as `KeyMalformed`,
+  that do not state the reason of a refusal. The engine reads the key
+  structures with `pkcs1` 0.7.5, which `rsa` re-exports, checks the size and
+  the number of primes itself, so that it gives a message for each refusal,
+  and calls `RsaPublicKey::new_with_max_size` with 16384 bits.
+  `RsaPrivateKey::from_components` applies no cap and accepts more than two
+  primes, so the engine checks the number of primes before the call.
+- The graph holds 55 packages under 55 distinct names on the host target,
+  measured with `cargo tree -p rsa -e normal,build`, which reads the
+  features the workspace resolves. With `--target all` it holds 59, adding
+  `serde_derive` 1.0.229, `syn` 3.0.3, `wasi` 0.11.1+wasi-snapshot-preview1,
+  and `zerocopy-derive` 0.8.56. `cargo metadata --format-version 1
+  --all-features` counts the same 59 packages under 58 distinct names for
+  the closure, with `syn` at 2.0.118 and 3.0.3.
+- A build of `ostrya-sign` with `sign-spki-rsa` alone holds 54 packages
+  under 54 distinct names on the host target, measured with
+  `cargo tree -p ostrya-sign --no-default-features --features sign-spki-rsa
+  -e normal,build`. The count includes `ostrya-sign` and its other
+  dependencies. With `--target all` it holds 57. The graph holds no `p256`.
+- No package in the graph declares a `links` key, and no package name in it
+  ends in `-sys`.
+- Ten packages carry a build script: `generic-array`, `libc`, `libm`,
+  `num-bigint-dig`, `num-traits`, `proc-macro2`, `quote`, `serde`,
+  `serde_core`, and `zerocopy`. All ten were already in the graph.
+- Every license in the graph is permissive by the rule in "Requirement:
+  permissive licenses only". On the host target, 33 packages state
+  `MIT OR Apache-2.0`, 13 state `Apache-2.0 OR MIT`, `generic-array`,
+  `libm`, and `spin` state `MIT`, `num-bigint-dig` and `version_check` state
+  the legacy `MIT/Apache-2.0` form the CI license guard normalizes,
+  `zerocopy` states `BSD-2-Clause OR Apache-2.0 OR MIT`, `subtle` states
+  `BSD-3-Clause`, `flagset` states `Apache-2.0`, and `unicode-ident` states
+  `(MIT OR Apache-2.0) AND Unicode-3.0`. With `--target all`, `serde_derive`
+  and `syn` 3.0.3 state `MIT OR Apache-2.0`, `wasi` states
+  `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT`, and
+  `zerocopy-derive` states `BSD-2-Clause OR Apache-2.0 OR MIT`.
+- The highest minimum supported Rust version in the graph is 1.85, stated
+  by `base64ct`, `zeroize`, and `zeroize_derive`. `rsa` states 1.65. The
+  workspace pins 1.92, so the requirement holds.
+- `rsa` holds no `unsafe` code. `num-bigint-dig` holds two
+  `String::from_utf8_unchecked` calls in its text conversion.
+- The crate was in the graph through `pgp`, under `verify-gpg` of
+  `crates/ostrya`, so no package enters `Cargo.lock`. The lock file gains two
+  entries: `rsa` in the dependency list of `ostrya-sign`, and `sha2` in the
+  dependency list of `rsa`, which the feature `sha2` turns on.
+- The root `Cargo.toml` sets `opt-level = 3` in `profile.dev` for
+  `num-bigint-dig` and `rsa`. The unit test that signs and verifies with
+  keys of 2048, 8192, and 16384 bits takes less than 1 second with it, and
+  about 10 seconds without it.
+- RUSTSEC-2023-0071 applies to the crate. "Advisory exceptions" states the
+  terms.
 
 ### Authorized: the `getrandom` crate
 

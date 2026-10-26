@@ -453,7 +453,7 @@ Only the gpg engine reads it: for \%\-\-gpg\-sign, and for \%\-\-sign under the 
 \fB\-\-sign\fR \fIKEY\-ID\fR
 With \%\-u, sign the summary with this key.
 .IP
-The \%\-\-sign\-type option selects the engine. For \%ed25519 and spki, the key is the \%base64 of the secret key. An spki secret key is a \%PKCS#8 DER, or a \%SEC1 DER that names the \%P\-256 curve, and its \%base64 can hold line breaks. For gpg, the key is a selector, as for \%\-\-gpg\-sign. Each occurrence adds one signature. The option needs \%\-u.
+The \%\-\-sign\-type option selects the engine. For \%ed25519 and spki, the key is the \%base64 of the secret key. An spki secret key is a \%PKCS#8 DER, a \%SEC1 DER that names the \%P\-256 curve, or a \%PKCS#1 DER of an RSA key, and its \%base64 can hold line breaks. For gpg, the key is a selector, as for \%\-\-gpg\-sign. Each occurrence adds one signature. The option needs \%\-u.
 .TP
 \fB\-s\fR, \fB\-\-sign\-type\fR \fINAME\fR
 With \%\-u, the signature engine for \%\-\-sign and \%\-\-keys\-file.
@@ -463,7 +463,7 @@ The names are \fB\%ed25519\fR, \fB\%spki\fR, and \fB\%gpg\fR, and the command re
 \fB\-\-keys\-file\fR \fIPATH\fR
 With \%\-u, sign the summary with the keys of this file, in the format of \fB\%ostrya sign\fR\&.
 .IP
-For \%ed25519, the file has \%base64 secret keys, one per line. For spki, the file holds PEM \fB\%PRIVATE KEY\fR blocks, each a \%PKCS#8 DER. The command reads every file, and each key adds one signature after each \%\-\-sign key. The gpg engine refuses this option. The option needs \%\-u.
+For \%ed25519, the file has \%base64 secret keys, one per line. For spki, the file holds PEM \fB\%PRIVATE KEY\fR blocks, each a \%PKCS#8 DER of a \%P\-256 or an RSA key. The command reads every file, and each key adds one signature after each \%\-\-sign key. The gpg engine refuses this option. The option needs \%\-u.
 .TP
 \fB\-\-break\-lock\fR
 With \%\-u, remove the writer lock of another writer of the bucket repository.

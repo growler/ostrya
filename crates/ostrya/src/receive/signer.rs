@@ -115,17 +115,24 @@ impl ServerSigner {
     /// The verifier is a [`SpkiVerifier`](crate::spki::SpkiVerifier) that
     /// trusts the public key of `signer` alone.
     ///
+    /// The key signs on the blocking pool, because the spki signer does its
+    /// work in the call to [`Signer::sign`]. An RSA signature with a
+    /// 16384-bit key takes about 0.5 seconds of CPU time. The signer that
+    /// [`signer`](Self::signer) returns also signs on the blocking pool.
+    ///
     /// # Errors
     ///
     /// - [`Error::Signature`] if the verifier does not accept the DER public
     ///   key of `signer`. The message is
     ///   `spki public key: expected SubjectPublicKeyInfo DER`.
-    #[cfg(any(feature = "sign-spki-p256"))]
+    #[cfg(any(feature = "sign-spki-p256", feature = "sign-spki-rsa"))]
     pub fn spki(signer: crate::spki::SpkiSigner) -> Result<ServerSigner> {
         let verifier =
             crate::spki::SpkiVerifier::new([signer.public_key_der()], Vec::<Vec<u8>>::new())?;
         Ok(ServerSigner {
-            signer: Box::new(signer),
+            signer: Box::new(Unblocked {
+                inner: Arc::new(signer),
+            }),
             verifier: Arc::new(verifier),
             verifies_in_call: true,
         })
@@ -220,6 +227,35 @@ impl ServerSigner {
             .await;
         }
         any_verifies(self.verifier.as_ref(), payload, &blobs).await
+    }
+}
+
+/// A signer that signs on the blocking pool.
+///
+/// The signer copies the data of each call and gives the copy to the pool.
+/// The data is a commit object or a summary, whose size the format caps.
+#[cfg(any(feature = "sign-spki-p256", feature = "sign-spki-rsa"))]
+struct Unblocked {
+    /// The signer that does the work.
+    inner: Arc<crate::spki::SpkiSigner>,
+}
+
+#[cfg(any(feature = "sign-spki-p256", feature = "sign-spki-rsa"))]
+impl Signer for Unblocked {
+    fn name(&self) -> &str {
+        self.inner.name()
+    }
+
+    fn metadata_key(&self) -> &str {
+        self.inner.metadata_key()
+    }
+
+    fn sign<'a>(&'a self, data: &'a [u8]) -> crate::sign::SignFuture<'a> {
+        let inner = Arc::clone(&self.inner);
+        let data = data.to_vec();
+        Box::pin(ostrya_rt::unblock(move || {
+            futures_lite::future::block_on(inner.sign(&data))
+        }))
     }
 }
 
@@ -459,6 +495,50 @@ mod tests {
             &server,
             Some(&dict_with(&key, signature(&other)))
         ));
+    }
+
+    /// An spki server key of the RSA key type signs on the blocking pool, and
+    /// the search recognizes its own signature alone. It does not recognize
+    /// the signature of another key, or a blob of another length.
+    #[cfg(feature = "sign-spki-rsa")]
+    #[test]
+    fn an_rsa_spki_key_recognizes_its_own_signature_alone() {
+        use crate::spki::{SpkiSigner, spki_secret_keys};
+
+        /// Returns the server key of the key fixture file `name`.
+        fn server(name: &str) -> ServerSigner {
+            let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../../tests/fixtures/spki/keys")
+                .join(name);
+            let mut signers = spki_secret_keys(std::fs::read(path).unwrap(), name).unwrap();
+            assert_eq!(signers.len(), 1);
+            ServerSigner::spki(signers.remove(0)).unwrap()
+        }
+
+        let server_key = server("rsa-2048.pem");
+        let other = server("rsa-8192.pem");
+        let key = server_key.signer().metadata_key().to_owned();
+        assert_eq!(server_key.signer().name(), "spki");
+
+        let own = signature(&server_key);
+        assert_eq!(own.len(), 256);
+        assert!(has_signed(&server_key, Some(&dict_with(&key, own.clone()))));
+        assert!(!has_signed(
+            &server_key,
+            Some(&dict_with(&key, signature(&other)))
+        ));
+        assert!(!has_signed(
+            &server_key,
+            Some(&dict_with(&key, own[1..].to_vec()))
+        ));
+
+        // The key signs on the blocking pool, and gives the bytes of the
+        // signer that it holds.
+        let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/fixtures/spki/keys/rsa-2048.pem");
+        let text = std::fs::read_to_string(path).unwrap();
+        let direct = SpkiSigner::from_pkcs8_pem(&text).unwrap();
+        assert_eq!(ostrya_rt::block_on(direct.sign(PAYLOAD)).unwrap(), own);
     }
 
     /// Returns the fixed-width `r || s` form of a DER ECDSA signature over

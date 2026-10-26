@@ -233,12 +233,23 @@ jobs:
         run: cargo check -p ostrya-sign --no-default-features --features sign-spki
 
       # Each key feature of the spki engine turns on the code that the key
-      # types share. These two steps build the engine with the P-256 feature
-      # alone, and run the spki tests of `ostrya` in that build.
+      # types share. These steps build the engine with one key feature alone,
+      # with no warning, run the unit tests of `ostrya-sign` in that build,
+      # and run the spki tests of `ostrya` in that build. A build with one key
+      # feature refuses a key of the other type, and the tests of each build
+      # check the refusal.
       - name: ostrya-sign with the P-256 key feature alone compiles
-        run: cargo check -p ostrya-sign --no-default-features --features sign-spki-p256
+        run: cargo clippy -p ostrya-sign --no-default-features --features sign-spki-p256 --all-targets -- -D warnings
+      - name: The ostrya-sign unit tests pass with the P-256 key feature alone
+        run: cargo test -p ostrya-sign --no-default-features --features sign-spki-p256 --lib
       - name: The spki tests pass with the P-256 key feature alone
         run: cargo test -p ostrya --no-default-features --features smol,sign-spki-p256 --test sign_spki --test sign_spki_fixtures
+      - name: ostrya-sign with the RSA key feature alone compiles
+        run: cargo clippy -p ostrya-sign --no-default-features --features sign-spki-rsa --all-targets -- -D warnings
+      - name: The ostrya-sign unit tests pass with the RSA key feature alone
+        run: cargo test -p ostrya-sign --no-default-features --features sign-spki-rsa --lib
+      - name: The spki tests pass with the RSA key feature alone
+        run: cargo test -p ostrya --no-default-features --features smol,sign-spki-rsa --test sign_spki_rsa
 
       # The portable crates compile for macOS and Windows as well as Linux.
       # `cargo check` needs the standard library of each target and no linker,

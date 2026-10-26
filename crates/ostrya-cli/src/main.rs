@@ -1085,12 +1085,13 @@ struct CommitArgs {
     ///
     /// For `ed25519` and `spki`, the key is the base64 of the secret key. An
     /// `ed25519` secret key is 64 bytes: the 32-byte seed, then the 32-byte
-    /// public key. An `spki` secret key is a PKCS#8 DER, or a SEC1 DER that
-    /// names the P-256 curve, and its base64 can hold line breaks. For `gpg`,
-    /// the key is a key ID. Each occurrence adds one signature. --sign-type
-    /// selects the engine. The command reads every key before it makes the
-    /// first signature, so a bad key gives no signature. The order is the
-    /// --sign keys, then the --sign-from-file keys, then the --gpg-sign keys.
+    /// public key. An `spki` secret key is a PKCS#8 DER, a SEC1 DER that names
+    /// the P-256 curve, or a PKCS#1 DER of an RSA key, and its base64 can hold
+    /// line breaks. For `gpg`, the key is a key ID. Each occurrence adds one
+    /// signature. --sign-type selects the engine. The command reads every key
+    /// before it makes the first signature, so a bad key gives no signature.
+    /// The order is the --sign keys, then the --sign-from-file keys, then the
+    /// --gpg-sign keys.
     #[arg(long, value_name = "KEY_ID")]
     sign: Vec<String>,
     /// Sign the commit with the key of this file.
@@ -2160,9 +2161,10 @@ struct RemoteSummaryArgs {
     /// With -u, sign the summary with this key.
     ///
     /// The --sign-type option selects the engine. For ed25519 and spki, the key
-    /// is the base64 of the secret key. An spki secret key is a PKCS#8 DER, or
-    /// a SEC1 DER that names the P-256 curve, and its base64 can hold line
-    /// breaks. For gpg, the key is a selector, as for --gpg-sign. Each
+    /// is the base64 of the secret key. An spki secret key is a PKCS#8 DER, a
+    /// SEC1 DER that names the P-256 curve, or a PKCS#1 DER of an RSA key, and
+    /// its base64 can hold line breaks. For gpg, the key is a selector, as for
+    /// --gpg-sign. Each
     /// occurrence adds one signature. The option needs -u.
     #[cfg(feature = "s3")]
     #[arg(long, value_name = "KEY-ID", requires = "update")]
@@ -2185,7 +2187,8 @@ struct RemoteSummaryArgs {
     /// `ostrya sign`.
     ///
     /// For ed25519, the file has base64 secret keys, one per line. For spki,
-    /// the file holds PEM `PRIVATE KEY` blocks, each a PKCS#8 DER. The command
+    /// the file holds PEM `PRIVATE KEY` blocks, each a PKCS#8 DER of a P-256
+    /// or an RSA key. The command
     /// reads every file, and each key adds one signature after each --sign
     /// key. The gpg engine refuses this option. The option needs -u.
     #[cfg(feature = "s3")]
@@ -2500,7 +2503,8 @@ enum SignType {
     /// ed25519 detached signatures (the sign-api default).
     #[value(name = "ed25519")]
     Ed25519,
-    /// ECDSA over NIST P-256 with SHA-256.
+    /// SubjectPublicKeyInfo keys: ECDSA over NIST P-256 or RSA PKCS#1 v1.5,
+    /// each with SHA-256.
     #[value(name = "spki")]
     Spki,
     /// GPG (OpenPGP) detached signatures.
@@ -2539,7 +2543,8 @@ struct SignArgs {
     ///
     /// For ed25519, the file has base64 keys, one per line: secret keys to
     /// sign, public keys to verify and delete. For spki, the file holds PEM
-    /// `PRIVATE KEY` blocks, each a PKCS#8 DER, to sign, and PEM `PUBLIC KEY`
+    /// `PRIVATE KEY` blocks, each a PKCS#8 DER of a P-256 or an RSA key, to
+    /// sign, and PEM `PUBLIC KEY`
     /// blocks to verify and delete. Each `PRIVATE KEY` block adds one
     /// signature. Signing and delete read every file. A signing or delete file
     /// is a regular file of at most 1 MiB. For an ed25519 or spki verify, the
@@ -2587,9 +2592,9 @@ struct SignArgs {
     ///
     /// For ed25519 and spki, each KEY-ID is a base64 key: a secret key to
     /// sign, or a public key to verify and delete. An spki secret key is a
-    /// PKCS#8 DER, or a SEC1 DER that names the P-256 curve. An spki public key
-    /// is a SubjectPublicKeyInfo DER. The base64 of an spki key can hold line
-    /// breaks. For gpg, each KEY-ID is a
+    /// PKCS#8 DER, a SEC1 DER that names the P-256 curve, or a PKCS#1 DER of an
+    /// RSA key. An spki public key is a SubjectPublicKeyInfo DER. The base64 of
+    /// an spki key can hold line breaks. For gpg, each KEY-ID is a
     /// signing key that gpg resolves (a fingerprint, key id, or user id). A
     /// gpg signing run needs at least one KEY-ID. With --delete, the gpg
     /// KEY-IDs are the fingerprints to remove.
@@ -2678,9 +2683,10 @@ struct SummaryArgs {
     /// Sign the summary with this key.
     ///
     /// The --sign-type option selects the engine. For ed25519 and spki, the key
-    /// is the base64 of the secret key. An spki secret key is a PKCS#8 DER, or
-    /// a SEC1 DER that names the P-256 curve, and its base64 can hold line
-    /// breaks. For gpg, the key is a selector, as for --gpg-sign. Each
+    /// is the base64 of the secret key. An spki secret key is a PKCS#8 DER, a
+    /// SEC1 DER that names the P-256 curve, or a PKCS#1 DER of an RSA key, and
+    /// its base64 can hold line breaks. For gpg, the key is a selector, as for
+    /// --gpg-sign. Each
     /// occurrence adds one signature. Only -u reads it.
     #[arg(long, value_name = "KEY-ID")]
     sign: Vec<String>,
@@ -3041,8 +3047,8 @@ struct DeltaGenerateArgs {
     ///
     /// The option can occur more than once. The key is a base64 secret key for
     /// ed25519 and spki, and a KEY-ID for gpg, as for `ostrya sign`. An spki
-    /// secret key is a PKCS#8 DER, or a SEC1 DER that names the P-256 curve, and
-    /// its base64 can hold line breaks.
+    /// secret key is a PKCS#8 DER, a SEC1 DER that names the P-256 curve, or a
+    /// PKCS#1 DER of an RSA key, and its base64 can hold line breaks.
     #[arg(long = "sign")]
     sign: Vec<String>,
     /// The signature engine for --sign and --keys-file.
@@ -3051,8 +3057,9 @@ struct DeltaGenerateArgs {
     /// Read signing keys from a file.
     ///
     /// For ed25519, the file has base64 secret keys, one per line, as for
-    /// `ostrya sign`. For spki, each line is the base64 of one secret key, a
-    /// PKCS#8 DER or a SEC1 DER that names the P-256 curve. A line ends at LF
+    /// `ostrya sign`. For spki, each line is the base64 of one secret key: a
+    /// PKCS#8 DER, a SEC1 DER that names the P-256 curve, or a PKCS#1 DER of an
+    /// RSA key. A line ends at LF
     /// or CRLF, and the last line can have no line end. The command refuses an
     /// empty spki file, an empty line, and a line with white space. Each key
     /// adds one signature. The option can occur more than once, and the

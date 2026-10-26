@@ -259,7 +259,7 @@ fn spki_secret_key_refused_forms() {
     let scalar_b64 = base64::encode(&from_hex(SECRET_SCALAR_HEX));
     assert_eq!(
         secret_refusal(&scalar_b64),
-        "spki secret key: expected PKCS#8 DER or SEC1 DER"
+        "spki secret key: expected PKCS#8 DER, SEC1 DER, or PKCS#1 DER"
     );
     // A SEC1 key with no `parameters` field.
     assert_eq!(
@@ -275,7 +275,7 @@ fn spki_secret_key_refused_forms() {
     let pem = wrap_pem("PRIVATE KEY", SECRET_PKCS8_B64);
     assert_eq!(
         secret_refusal(&base64::encode(pem.as_bytes())),
-        "spki secret key: expected PKCS#8 DER or SEC1 DER"
+        "spki secret key: expected PKCS#8 DER, SEC1 DER, or PKCS#1 DER"
     );
     // A character outside the base64 alphabet, also at the end.
     assert!(SpkiSigner::from_base64(&format!("{SECRET_PKCS8_B64}!")).is_err());
@@ -700,5 +700,44 @@ fn spki_tool_cross_verify_pending() {
     assert!(
         out.status.success(),
         "spki-capable tool rejected the port's signature: {stderr}"
+    );
+}
+
+/// A build without the RSA key type refuses an RSA public key, with a message
+/// that names the feature of the key type.
+#[cfg(not(feature = "sign-spki-rsa"))]
+#[test]
+fn spki_rsa_key_names_the_feature_in_a_build_without_rsa() {
+    let pem = std::fs::read(common::fixture_root().join("../spki/keys/rsa-2048.pub.pem")).unwrap();
+    match SpkiVerifier::from_pem(pem) {
+        Err(ostrya::sign::Error::Signature(m)) => assert_eq!(
+            m,
+            "the spki public key text, line 1: this build has no code for the key type RSA; \
+             build with the sign-spki-rsa feature"
+        ),
+        Err(other) => panic!("not a signature error: {other}"),
+        Ok(_) => panic!("the RSA public key has to be refused"),
+    }
+}
+
+/// In a build without the RSA key type, an RSA key in `revoked.spki` refuses
+/// the key store, so a revocation that the build cannot read fails closed.
+#[cfg(not(feature = "sign-spki-rsa"))]
+#[test]
+fn spki_revoked_rsa_key_refuses_the_store_in_a_build_without_rsa() {
+    let tmp = TmpDir::new("spki-revoked-rsa");
+    let dir = tmp.path().join("store");
+    std::fs::create_dir_all(&dir).unwrap();
+    std::fs::write(dir.join("trusted.spki"), PUBLIC_PEM).unwrap();
+    let revoked =
+        std::fs::read(common::fixture_root().join("../spki/keys/rsa-2048.pub.pem")).unwrap();
+    std::fs::write(dir.join("revoked.spki"), revoked).unwrap();
+    assert_eq!(
+        store_refusal(&dir),
+        format!(
+            "the key file '{}', line 1: this build has no code for the key type RSA; build \
+             with the sign-spki-rsa feature",
+            dir.join("revoked.spki").display()
+        )
     );
 }

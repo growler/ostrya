@@ -215,6 +215,9 @@ and the tests that read them do not need the `ostree` tool.
   `spki/generate.sh` writes them, separately from `generate.sh`.
   `spki/.gitattributes` marks the repository objects, the deltas, the delta
   indexes, and the two `summary` files as binary.
+- `spki/keys/` -- the key files of the tests of the spki engine.
+  `spki/keys/generate.sh` writes them with OpenSSL 3, separately from the
+  other generators. `spki/keys/` is not a key type of `spki/generate.sh`.
 
 ### The fixture generator
 
@@ -317,6 +320,46 @@ The tests are in `crates/ostrya/tests/sign_spki_fixtures.rs`:
 cargo test -p ostrya --no-default-features --features smol,sign-spki-p256 \
     --test sign_spki_fixtures
 ```
+
+### The spki key fixtures
+
+`spki/keys/` holds the keys that the tests of the spki engine read. The
+tests do not make keys, because a large RSA key takes a long time to make.
+The directory holds these files:
+
+- `rsa-<bits>.pem` and `rsa-<bits>.pub.pem` -- two-prime RSA keys as a
+  PKCS#8 `PRIVATE KEY` block and a `PUBLIC KEY` block. `<bits>` is 1024,
+  2047, 2048, 8192, 16384, and 16386. The engine takes 2048 to 16384 bits,
+  so 2047 and 16386 are outside the range. OpenSSL 3.6.4 writes a key of
+  16384 bits for the request of 16385 bits, so 16386 bits is the smallest
+  size above the range.
+- `rsa-2048.pkcs1.pem` -- the 2048-bit key as a PKCS#1 `RSA PRIVATE KEY`
+  block.
+- `rsa-3prime.pem`, `rsa-3prime.pkcs1.pem`, and `rsa-3prime.pub.pem` -- a
+  2048-bit RSA key of three primes, in the PKCS#8 and the PKCS#1 form, and
+  its public key.
+- `rsa-pss.pem` and `rsa-pss.pub.pem` -- an `id-RSASSA-PSS` key.
+- `vector.data` and `rsa-2048.vector.sig` -- a test vector: a buffer, and the
+  signature of `openssl dgst -sha256 -sign rsa-2048.pem` over it. The tests
+  sign the buffer and compare the bytes, so `spki/.gitattributes` marks the
+  two files as binary.
+- `MANIFEST` -- the OpenSSL version that wrote the files.
+
+Each run makes new keys, so the files are committed. Run the script only to
+replace them. It needs OpenSSL 3, because LibreSSL cannot make a key of more
+than two primes. The `OPENSSL` variable names the `openssl` command:
+
+```sh
+OPENSSL=/path/to/openssl tests/fixtures/spki/keys/generate.sh
+```
+
+The script stops if `$OPENSSL version` does not start with `OpenSSL 3`, if a
+key does not have the number of bits that it asks for, or if `openssl` does
+not verify the test vector. The tests pin the fingerprint of
+`rsa-2048.pub.pem` in the constant `FINGERPRINT_2048`, in
+`crates/ostrya-sign/src/spki/rsa.rs` and in
+`crates/ostrya/tests/sign_spki_rsa.rs`. After a run, set the two constants to
+the new fingerprint.
 
 ### Fixtures that the tool cannot write
 

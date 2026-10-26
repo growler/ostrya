@@ -1902,8 +1902,8 @@ signature blobs:
 
 - `ostree.gpgsigs` -- OpenPGP detached-signature blobs over the commit bytes.
 - `ostree.sign.ed25519` -- raw 64-byte ed25519 signatures.
-- `ostree.sign.spki` -- SPKI/ECDSA signatures. The tool carries this engine
-  only in a build with OpenSSL.
+- `ostree.sign.spki` -- SPKI signatures: ECDSA over P-256, or RSA PKCS#1
+  v1.5. The tool carries this engine only in a build with OpenSSL.
 - `ostree.sign.dummy` -- the test engine.
 
 ### Signing sequence
@@ -1947,16 +1947,24 @@ revoked set, so a key in both sets is refused.
 
 ### spki
 
-The signature key is `ostree.sign.spki`, and the algorithm is ECDSA over NIST
-P-256 with SHA-256, over the commit bytes of the other engines. The signature
-is DER-encoded ECDSA: an ASN.1 `SEQUENCE` of the two integers `r` and `s`,
-about 70 to 72 bytes. The port signs with RFC 6979 nonces, so one key and one
-data give the same signature bytes.
+The signature key is `ostree.sign.spki`. The data is the commit bytes of the
+other engines. The key type selects the algorithm and the signature form:
+
+- P-256: ECDSA over NIST P-256 with SHA-256. The signature is DER-encoded
+  ECDSA: an ASN.1 `SEQUENCE` of the two integers `r` and `s`, about 70 to 72
+  bytes. The port signs with RFC 6979 nonces.
+- RSA: RSASSA-PKCS1-v1_5 with SHA-256. The signature is the raw signature, an
+  unsigned big-endian integer with the length of the modulus in bytes, for
+  example 256 bytes for a 2048-bit key. The signature form is deterministic.
+
+The port gives the same signature bytes for one key and one data.
 
 A signature blob carries no key type. A trusted key tries a blob only when the
 blob parses in the signature form of the key type. For a P-256 key, the form
 is DER, and the parse is strict: a blob with bytes after the `SEQUENCE`, and a
-blob with a length that does not agree with its content, do not parse. A blob
+blob with a length that does not agree with its content, do not parse. An RSA
+key tries a blob whose length is the length of its modulus, and no other
+blob. A store can hold keys of each type together. A blob
 is valid only when a trusted key verifies it. A blob that no trusted key
 verifies is not valid. It is not an error, because the commit can carry other
 signatures. The fixed-width 64-byte `r || s` form of a valid signature, a
@@ -1966,19 +1974,45 @@ A public key is the X.509 SubjectPublicKeyInfo DER, the base64 body of a PEM
 `PUBLIC KEY` block. The EC point in it is compressed (first byte `02` or
 `03`) or uncompressed (first byte `04`). The port refuses each other point
 form, such as the compact form (first byte `05`). A raw SEC1 point is not a
-public key. A secret key is a
-PKCS#8 `PrivateKeyInfo` DER, or a SEC1 `ECPrivateKey` DER with a `parameters`
-field that names the P-256 curve. The port tells the two forms apart by their
-ASN.1 structure. A raw 32-byte scalar is refused.
+public key. The key of an RSA SubjectPublicKeyInfo is a PKCS#1
+`RSAPublicKey` DER, the modulus and the public exponent.
+
+A secret key is one of these forms:
+
+- a PKCS#8 `PrivateKeyInfo` DER;
+- a SEC1 `ECPrivateKey` DER with a `parameters` field that names the P-256
+  curve;
+- a PKCS#1 `RSAPrivateKey` DER. A PKCS#1 key is RSA.
+
+The port tells the three forms apart by their ASN.1 structure. Each form is
+a `SEQUENCE` that starts with an `INTEGER` version. After the version, a
+PKCS#8 key holds an `AlgorithmIdentifier`, a PKCS#1 key holds the modulus,
+an `INTEGER`, and a SEC1 key holds the secret scalar in an `OCTET STRING`.
+The version of a PKCS#1 key is 0 for two primes and 1 for more primes. A raw
+32-byte scalar is refused.
 
 The algorithm OID of a SubjectPublicKeyInfo or of a PKCS#8 key selects the key
 type. For an EC key, the curve OID in the `parameters` field of the
-`AlgorithmIdentifier` selects the curve. The engine takes the key type
-`id-ecPublicKey` (1.2.840.10045.2.1) on the curve `prime256v1`
-(1.2.840.10045.3.1.7). The port refuses these keys:
+`AlgorithmIdentifier` selects the curve. The engine takes these key types:
 
-- a key of another type, for example RSA (1.2.840.113549.1.1.1) or Ed25519
-  (1.3.101.112);
+- `id-ecPublicKey` (1.2.840.10045.2.1) on the curve `prime256v1`
+  (1.2.840.10045.3.1.7);
+- `rsaEncryption` (1.2.840.113549.1.1.1) with `NULL` parameters, with a
+  modulus of 2048 to 16384 bits. The secret key has two primes. The public
+  key of a key of more primes is a modulus and an exponent, and the engine
+  takes it.
+
+The port refuses these keys:
+
+- a key of another type, for example RSASSA-PSS (1.2.840.113549.1.1.10) or
+  Ed25519 (1.3.101.112);
+- a key of a type that the build has no code for. A build has the code for
+  P-256 with the feature `sign-spki-p256`, and for RSA with the feature
+  `sign-spki-rsa`;
+- an `rsaEncryption` key with no `parameters` field, or with a value other
+  than `NULL` in it;
+- an RSA key with a modulus of fewer than 2048 bits or more than 16384 bits;
+- an RSA secret key of more than two primes, in PKCS#8 and in PKCS#1 form;
 - an EC key on another curve, for example P-384 (1.3.132.0.34);
 - an EC key with no curve OID, or with a `NULL` in the `parameters` field;
 - an EC key with explicit curve parameters, a `SEQUENCE` in the place of the
@@ -1995,15 +2029,19 @@ type. For an EC key, the curve OID in the `parameters` field of the
   `ECPrivateKey` in a PKCS#8 key can have no `parameters` field.
 
 A key file, an inline key, or a file of the key store that holds one such key
-is refused whole, also when other keys in it are valid.
+is refused whole, also when other keys in it are valid. A file of revoked keys
+that holds a key of a type that the build has no code for is refused, so the
+revocation fails closed.
 
 The key store has the layout of the ed25519 store: `trusted.spki`,
 `revoked.spki`, and their `.d` directories under `/etc/ostree` and
 `<datadir>/ostree`. Its effective trusted set is also the trusted set minus
 the revoked set. The port compares a trusted key with a revoked key by the
 decoded key: it encodes the SubjectPublicKeyInfo DER of each key again, with
-an uncompressed EC point, and compares these bytes. So the compressed and the
-uncompressed form of one key match.
+an uncompressed EC point, or with `NULL` parameters and the modulus and the
+exponent of an RSA key, and compares these bytes. So the compressed and the
+uncompressed form of one key match, and two RSA keys of one modulus and one
+exponent match.
 
 An inline secret key, as a positional key of `sign` or the value of a
 `--sign`, is the base64 of the secret key DER. The base64 text can hold the
@@ -2060,7 +2098,7 @@ set. `conformance/cli-surface.md`, "P2", `static-delta`, records the
 differences from the tool.
 
 A secret key file holds PEM `PRIVATE KEY` blocks, and each block holds one
-PKCS#8 `PrivateKeyInfo` DER of a P-256 key. Each block gives one signer, in
+PKCS#8 `PrivateKeyInfo` DER of a P-256 or an RSA key. Each block gives one signer, in
 the order of the file. These files are secret key files: a `--keys-file` of
 `sign`, of `summary`, and of `remote summary -u`, a `--sign-from-file` of
 `commit` under `--sign-type=spki`, and the `secret-key-file` of an
@@ -2079,15 +2117,16 @@ conditions:
   labels.
 - An END line has a label other than the label of its block, a BEGIN line is
   in a block, or a block has no END line.
-- A `PRIVATE KEY` block does not decode, or it holds no PKCS#8 DER of a P-256
-  key. A SEC1 DER and a raw scalar in a `PRIVATE KEY` block are refused.
+- A `PRIVATE KEY` block does not decode, or it holds no PKCS#8 key that the
+  engine takes. A SEC1 DER, a PKCS#1 DER, and a raw scalar in a
+  `PRIVATE KEY` block are refused.
 
 A command reads each secret key file before it makes the first signature, so
 a refused file gives no signature.
 
 A `--keys-file` of `static-delta generate` under `--sign-type=spki` holds one
-secret key on each line, the base64 of a PKCS#8 DER or of a SEC1 DER that
-names the P-256 curve. A line ends at LF, and one CR at the end of a line is
+secret key on each line, the base64 of a PKCS#8 DER, of a SEC1 DER that
+names the P-256 curve, or of a PKCS#1 DER. A line ends at LF, and one CR at the end of a line is
 removed. The last line can have no line end. The reader decodes each line
 strictly. It refuses the whole file if the file is empty, if a line is empty,
 if a line holds white space, or if a line is not the base64 of a secret key.
@@ -2096,7 +2135,8 @@ Each line gives one signer, in the order of the file, after the signers of
 
 Design target: the public ostree documentation gives the public key container
 and the key store layout. The curve, the hash, the DER signature encoding, and
-the key DER containers are the standard OpenSSL and RFC forms.
+the key DER containers are the standard OpenSSL and RFC forms. The RSA
+signature and the RSA key structures are those of RFC 8017.
 
 ### GPG
 

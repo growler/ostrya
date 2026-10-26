@@ -5,3 +5,7 @@
 */repo/delta-indexes/** binary
 */repo/summary binary
 */repo/summary.sig binary
+# The signature of the test vector is raw bytes. The test vector is a byte
+# buffer, and a line-end conversion changes its signature.
+keys/*.sig binary
+keys/vector.data binary

@@ -486,9 +486,38 @@ fn an_spki_key_group_is_read() {
     }
 }
 
+/// `from_config` reads an spki key group of an RSA key from a PEM `PRIVATE
+/// KEY` block. The key signs as the signer of the fixture file.
+#[cfg(feature = "sign-spki-rsa")]
+#[test]
+fn an_spki_key_group_reads_an_rsa_key() {
+    use ostrya::Signer as _;
+
+    let file = common::fixture_root().join("../spki/keys/rsa-2048.pem");
+    let dir = TmpDir::new("receive-signer-spki-rsa");
+    let policies = policy_with(
+        dir.path(),
+        "",
+        &format!(
+            "{CLIENT_C}sign=k\n[ex-ostrya key \"k\"]\ntype=spki\nsecret-key-file={}\n",
+            file.display()
+        ),
+    )
+    .unwrap();
+    let signers = &group(&policies, "c").signers;
+    assert_eq!(signers.len(), 1);
+    assert_eq!(signers[0].signer().name(), "spki");
+    let expected = ostrya::spki_secret_keys(std::fs::read(&file).unwrap(), "rsa-2048.pem")
+        .unwrap()
+        .remove(0);
+    let payload = b"payload";
+    let signature = block_on(signers[0].signer().sign(payload)).unwrap();
+    assert_eq!(signature.len(), 256);
+    assert_eq!(signature, block_on(expected.sign(payload)).unwrap());
+}
+
 /// The `secret-key-file` of an spki key group refuses each file that is not
-/// PEM `PRIVATE KEY` blocks of P-256 PKCS#8 keys. Each refusal names the
-/// group.
+/// PEM `PRIVATE KEY` blocks of PKCS#8 keys. Each refusal names the group.
 #[cfg(feature = "sign-spki-p256")]
 #[test]
 fn an_spki_key_group_file_holds_pem_blocks() {
@@ -661,12 +690,12 @@ fn a_trust_group_key_no_axis_reads_is_refused() {
     }
     // This case puts an spki key under an axis that selects ed25519 alone.
     let err = refusal(&format!("{}verification-spki-key=AAAA\n", trust_t()));
-    #[cfg(any(feature = "sign-spki-p256"))]
+    #[cfg(any(feature = "sign-spki-p256", feature = "sign-spki-rsa"))]
     assert!(
         matches!(&err, Error::InvalidFormat(m) if m.contains("no check reads it")),
         "{err}"
     );
-    #[cfg(not(any(feature = "sign-spki-p256")))]
+    #[cfg(not(any(feature = "sign-spki-p256", feature = "sign-spki-rsa")))]
     assert!(matches!(err, Error::Unsupported(_)), "{err}");
 }
 
@@ -808,7 +837,7 @@ fn an_spki_key_group_refuses_a_raw_scalar() {
     ));
     assert!(
         matches!(&err, Error::Signature(m)
-            if m.contains("line 1: the PRIVATE KEY block holds no P-256 PKCS#8 key")),
+            if m.contains("line 1: the PRIVATE KEY block holds no valid PKCS#8 key")),
         "{err}"
     );
 }
@@ -870,7 +899,7 @@ fn a_trust_group_gpg_axis_needs_a_certificate() {
 }
 
 /// The spki engine of a trust group needs the spki engine of the build.
-#[cfg(not(any(feature = "sign-spki-p256")))]
+#[cfg(not(any(feature = "sign-spki-p256", feature = "sign-spki-rsa")))]
 #[test]
 fn a_trust_group_spki_axis_needs_the_engine() {
     let err = refusal("[ex-ostrya trust \"t\"]\nsign-verify=spki\nverification-spki-key=AAAA\n");
@@ -937,7 +966,7 @@ fn a_key_group_file_holds_one_key() {
 }
 
 /// An spki key group needs the spki engine.
-#[cfg(not(any(feature = "sign-spki-p256")))]
+#[cfg(not(any(feature = "sign-spki-p256", feature = "sign-spki-rsa")))]
 #[test]
 fn an_spki_key_group_needs_the_engine() {
     let err = refusal("[ex-ostrya key \"k\"]\ntype=spki\nsecret-key-file=/nonexistent/ostrya/k\n");

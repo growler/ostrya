@@ -44,8 +44,9 @@ pub trait Signer: Send + Sync {
     ///
     /// - [`Error::Signature`] if the engine cannot make a signature.
     ///
-    /// The dummy, ed25519, and spki engines never return an error. The
-    /// `GpgSigner` type states its failure conditions.
+    /// The dummy and ed25519 engines never return an error. The spki engine
+    /// returns an error for an RSA key if the check of the private-key
+    /// operation fails. The `GpgSigner` type states its failure conditions.
     ///
     /// [`Error::Signature`]: crate::Error::Signature
     fn sign<'a>(&'a self, data: &'a [u8]) -> SignFuture<'a>;
@@ -132,7 +133,7 @@ pub struct SignatureInfo {
     /// The name of the public-key algorithm, if the engine gives one.
     ///
     /// The GPG engine gives the algorithm of the key. The spki engine gives
-    /// the key type, `p256`, for a valid signature alone.
+    /// the key type, `p256` or `rsa`, for a valid signature alone.
     pub pubkey_algorithm: Option<String>,
     /// The name of the digest algorithm, if the engine gives one (GPG).
     pub hash_algorithm: Option<String>,

@@ -772,9 +772,11 @@ The key is necessary.
 \fB\%secret\-key\-file\fR (string)
 For \fB\%ed25519\fR and \fB\%spki\fR: a regular file of at most 1 MiB.
 For \fB\%ed25519\fR, the file holds exactly one line that is not blank, the base64 of the 64\-byte seed and public key.
-For \fB\%spki\fR, the file holds PEM \fB\%PRIVATE KEY\fR blocks, each a PKCS#8 DER of a P\-256 key, as \fB\%ostrya sign \-\-keys\-file\fR takes them.
+For \fB\%spki\fR, the file holds PEM \fB\%PRIVATE KEY\fR blocks, each a PKCS#8 DER of a P\-256 or an RSA key, as \fB\%ostrya sign \-\-keys\-file\fR takes them.
 Each block gives one signing key, in the order of the file.
-An empty file, a file with no block, a block with another label, and a block that holds no P\-256 PKCS#8 key are refused.
+An empty file, a file with no block, a block with another label, and a block that holds no valid PKCS#8 key are refused.
+The time of an RSA signature can disclose information about the private key, and a client that pushes can start a signature and measure its time.
+Where a client that is not trusted can push, use a P\-256 key in an \fB\%spki\fR group, or an \fB\%ed25519\fR group.
 .TP
 \fB\%gpg\-key\fR (string)
 For \fB\%gpg\fR: a selector that names exactly one secret key.

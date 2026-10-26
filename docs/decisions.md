@@ -174,10 +174,48 @@ ostree-podman sends the namespaces of podman, which are not its own.
 
 ## The spki sign engine
 
-The spki engine is pure Rust over `p256`: ECDSA on NIST P-256 with SHA-256.
-The engine signs with RFC 6979 nonces, so one key and one data give the same
+The spki engine is pure Rust. It has two key types: ECDSA on NIST P-256 with
+SHA-256 over `p256`, and RSA PKCS#1 v1.5 with SHA-256 over `rsa` 0.9.10. The
+engine signs ECDSA with RFC 6979 nonces, so one key and one data give the same
 signature bytes. The `ostree` command builds this engine only with OpenSSL,
 and it signs ECDSA with a random nonce. The two forms verify the same way.
+RSASSA-PKCS1-v1_5 (RFC 8017) is deterministic on both sides.
+
+The RSA signer blinds each private-key operation with a random value from the
+operating system. The blinding does not change the signature. RUSTSEC-2023-0071
+applies to `rsa` 0.9.10, and `CLAUDE.md`, "Advisory exceptions", states the
+terms of the exception. `roadmap.md` records the move to a release of `rsa`
+with the fix.
+
+The engine takes an RSA modulus of 2048 to 16384 bits. OpenSSL verifies no
+signature of a modulus above 16384 bits: `openssl dgst -verify` writes
+`modulus too large`. The `ostree` command signs with such a key, and its
+verify then fails. The `ostree` command signs and verifies with a 512-bit
+key, and the port refuses it. `RsaPublicKey::new` of `rsa` 0.9.10 caps the
+modulus at 4096 bits, and the SubjectPublicKeyInfo decoder of the crate calls
+it. The private-key decoders of the crate apply no cap. They give general
+errors, such as `KeyMalformed`, that do not state the reason of a refusal. So
+the engine does not use the decoders of the crate. It reads the
+`RSAPublicKey` and `RSAPrivateKey` structures with the `pkcs1` crate that
+`rsa` exports, checks the size of the modulus and the number of primes, and
+gives a message for each refusal. It then calls
+`RsaPublicKey::new_with_max_size` with 16384 bits or
+`RsaPrivateKey::from_components`. A direct dependency on `pkcs1` was
+rejected, because the re-export gives the same crate.
+
+The engine refuses a secret key of more than two primes. The `ostree` command
+signs with keys of 3, 4, and 5 primes. `RsaPrivateKey::from_components` takes
+more than two primes, so the engine reads the version of the `RSAPrivateKey`
+before the call. The public key of a multi-prime key is a modulus and an
+exponent, and the engine takes it. The engine refuses an `rsaEncryption` key
+whose parameters are not `NULL`. The `ostree` command verifies with a key
+with no parameters field, and with a key with an OID in the field.
+
+The engine tells the three secret key forms apart by their ASN.1 structure.
+After the version, a PKCS#8 `PrivateKeyInfo` holds an `AlgorithmIdentifier`,
+a PKCS#1 `RSAPrivateKey` holds an `INTEGER`, and a SEC1 `ECPrivateKey` holds
+an `OCTET STRING`. A PKCS#1 key is RSA. The version of a PKCS#1 key is 0 or
+1, so a multi-prime PKCS#1 key gets the refusal of its primes.
 
 The engine has one feature for each key type. `sign-spki-p256` gates the
 P-256 key type, and `sign-spki` turns on each key type. The code that the key
@@ -185,13 +223,20 @@ types share -- the PEM splitter, the OID dispatch, and the key file readers --
 compiles when one key feature is on. This code takes `der`, `spki`, `pkcs8`,
 and `pem-rfc7468` as direct dependencies, and not through the re-exports of
 `p256`, so a key type that does not use `p256` builds the engine with no
-`p256`. A build with no key feature has no ECDSA crate tree. The gates of the
+`p256`. `sign-spki-rsa` gates the RSA key type, and a build with it alone has
+no `p256`. A build with no key feature has no ECDSA crate tree. The gates of the
 shared code take the form `any(feature = ...)` over the key features, so each
 key feature adds one item to each gate. `ostrya` and `ostrya-sign` allow the
 clippy lint `non_minimal_cfg`, which refuses a gate of this form with one
 item. Two other forms were rejected. A hidden feature that each key feature
 turns on is a public feature of a published crate. A build script that sets a
 private cfg adds a build script to two crates.
+
+A build without a key type refuses a key of that type, with the
+`Error::Signature` message `this build has no code for <the key type RSA |
+the curve P-256>; build with the <feature> feature`. A signature of that type
+is a blob that no trusted key verifies. A revoked key that the build cannot
+read refuses the key store, so the revocation fails closed.
 
 The algorithm OID of a key selects its key type, and the curve OID selects the
 curve of an EC key. The engine refuses each key type and each curve outside
@@ -207,7 +252,8 @@ records the observed results.
 
 The revocation compare and the fingerprint use one rule. The port encodes the
 SubjectPublicKeyInfo DER of a key again from the decoded key, with an
-uncompressed EC point. A trusted key whose DER is in the revoked set is not
+uncompressed EC point, or with `rsaEncryption` and `NULL` parameters for an
+RSA key. A trusted key whose DER is in the revoked set is not
 trusted. The fingerprint of a verified signature is the SHA-256 of this DER
 in lowercase hex. So two forms of one key give one key and one fingerprint. A
 compare of the typed values of each key type was rejected: the DER is a
@@ -223,6 +269,23 @@ skips when the command reports the engine as not implemented. The test
 `spki_openssl_interop` cross-checks the engine against the `openssl` command
 in both directions. `format-reference.md`, "Signing details", marks the spki
 facts as a design target.
+
+The spki signer signs in the call to `Signer::sign`, and its future is ready
+at once, so a program with no async runtime can sign and verify. An RSA
+signature with a 16384-bit key takes about 0.5 seconds of CPU time. The
+receive endpoint of `ostrya` signs with the spki key of an `[ex-ostrya key]`
+group on the blocking pool, through `ostrya_rt::unblock`, so the signature
+does not hold the async executor. The trust check of the receive endpoint
+runs the verifiers of the sign-api axis on the blocking pool too, with a copy
+of the commit, because a client sets the number of signature blobs that the
+check verifies. The GPG verifier moves its own work to the blocking pool. A
+sign future in `ostrya-sign` that moves the work to the blocking pool was
+rejected, because the engine then needs a runtime.
+
+The spki verifier computes the SHA-256 of the data one time for each call,
+when the first trusted key tries a blob. Each key verifies the blob with this
+hash. A store of many keys then hashes a commit one time, and a blob that no
+key tries computes no hash.
 
 ## GPG
 

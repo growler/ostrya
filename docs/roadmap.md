@@ -102,6 +102,9 @@ for it.
 - The archive view serves `deltas/` in the `archive` mode alone. Outside
   that mode, the summary of an auth item and the ref listing name no static
   delta.
+- `rsa` 0.10 with the fix for RUSTSEC-2023-0071. The RSA key type of the
+  spki engine takes `rsa` 0.9.10, which has no fix. The move to a release
+  with the fix comes with a review of the advisory exception in `CLAUDE.md`.
 
 ## Gaps of bucket repositories
 

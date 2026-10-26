@@ -37,3 +37,13 @@ ostrya-sys = { path = "crates/ostrya-sys", version = "0.5.0" }
 ostrya = { path = "crates/ostrya", version = "0.5.0", default-features = false }
 ostrya-mount = { path = "crates/ostrya-mount", version = "0.5.0", default-features = false }
 ostrya-server = { path = "crates/ostrya-server", version = "0.5.0", default-features = false }
+
+# The RSA code of the spki engine computes with `num-bigint-dig`. The unit
+# test that signs and verifies with keys of 2048, 8192, and 16384 bits takes
+# about 10 seconds in a test build with no optimization of these two crates,
+# and less than 1 second with it.
+[profile.dev.package.num-bigint-dig]
+opt-level = 3
+
+[profile.dev.package.rsa]
+opt-level = 3

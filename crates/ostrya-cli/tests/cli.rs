@@ -4133,7 +4133,8 @@ fn spki_inline_key_forms() {
         assert!(out.stdout.is_empty(), "{what}");
         assert_eq!(String::from_utf8_lossy(&out.stderr), stderr, "{what}");
     };
-    let expected = "error: signature: spki secret key: expected PKCS#8 DER or SEC1 DER\n";
+    let expected =
+        "error: signature: spki secret key: expected PKCS#8 DER, SEC1 DER, or PKCS#1 DER\n";
     let no_curve = "error: signature: spki secret key: the SEC1 key does not name its curve\n";
     let other_curve =
         "error: signature: spki secret key: the SEC1 key names a curve other than P-256\n";
@@ -4510,7 +4511,7 @@ fn spki_secret_key_files_hold_pem_blocks() {
         (
             "good-public.pem",
             format!("{key_a}{}", pem("PRIVATE KEY", PUBLIC_A)),
-            ", line 6: the PRIVATE KEY block holds no P-256 PKCS#8 key",
+            ", line 6: the PRIVATE KEY block holds no valid PKCS#8 key",
         ),
         (
             "no-end.pem",
@@ -4737,6 +4738,149 @@ fn spki_secret_key_files_hold_pem_blocks() {
     }
 }
 
+/// `ostrya sign` signs with an RSA key of the spki engine, from a PEM
+/// `PRIVATE KEY` file and from the inline base64 of a PKCS#1 DER. `sign
+/// --verify` verifies each signature with the PEM `PUBLIC KEY` file.
+#[cfg(all(feature = "spki", unix))]
+#[test]
+fn spki_signs_and_verifies_with_an_rsa_key() {
+    let keys = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/spki/keys");
+    let secret = keys.join("rsa-2048.pem").display().to_string();
+    let public = keys.join("rsa-2048.pub.pem").display().to_string();
+    let pkcs1 = std::fs::read_to_string(keys.join("rsa-2048.pkcs1.pem")).unwrap();
+    let pkcs1_b64: String = pkcs1
+        .lines()
+        .filter(|line| !line.starts_with("-----"))
+        .collect();
+
+    let tmp = TmpDir::new("sign-spki-rsa");
+    let repo = commit_fixture(tmp.path());
+    let repo_arg = format!("--repo={}", repo.to_str().unwrap());
+    let keys_file = format!("--keys-file={secret}");
+    let public_file = format!("--keys-file={public}");
+    let verify = || {
+        ostrya(
+            &[
+                "sign",
+                &repo_arg,
+                "--verify",
+                "-s",
+                "spki",
+                &public_file,
+                COMMIT,
+            ],
+            None,
+            &[],
+        )
+    };
+    ostrya(
+        &["sign", &repo_arg, "-s", "spki", &keys_file, COMMIT],
+        None,
+        &[],
+    )
+    .ok();
+    assert_eq!(
+        verify().ok().stdout_trimmed(),
+        "signature 1: good\nverification OK"
+    );
+    // RSA PKCS#1 v1.5 signatures are deterministic, so the inline PKCS#1 key
+    // of the same key gives the same signature again.
+    ostrya(
+        &["sign", &repo_arg, "-s", "spki", COMMIT, &pkcs1_b64],
+        None,
+        &[],
+    )
+    .ok();
+    assert_eq!(
+        verify().ok().stdout_trimmed(),
+        "signature 1: good\nsignature 2: good\nverification OK"
+    );
+    let stored = block_on(async {
+        Repo::open(&repo)
+            .await
+            .unwrap()
+            .read_commit_detached_metadata(&Checksum::from_hex(COMMIT).unwrap())
+            .await
+            .unwrap()
+    })
+    .expect("the commit has detached metadata");
+    let value = stored.dict_get("ostree.sign.spki").unwrap();
+    let array = value.as_variant().map_or(value, |(_, inner)| inner);
+    let blobs: Vec<&[u8]> = array
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|blob| blob.as_bytes().unwrap())
+        .collect();
+    assert_eq!(blobs.len(), 2);
+    assert_eq!(blobs[0].len(), 256);
+    assert_eq!(blobs[0], blobs[1]);
+}
+
+/// `static-delta generate --keys-file` signs with an RSA key of the spki
+/// engine, from a line of the base64 of a PKCS#1 DER and from a line of the
+/// base64 of a PKCS#8 DER. `static-delta verify --keys-file` verifies the
+/// superblock with the PEM `PUBLIC KEY` file, and refuses it at exit 1 with
+/// the file of another RSA key.
+#[cfg(feature = "spki")]
+#[test]
+fn static_delta_generate_spki_keys_file_signs_with_an_rsa_key() {
+    let keys = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/fixtures/spki/keys");
+    let public = format!("--keys-file={}", keys.join("rsa-2048.pub.pem").display());
+    let other = format!("--keys-file={}", keys.join("rsa-8192.pub.pem").display());
+    let base64_of = |name: &str| -> String {
+        std::fs::read_to_string(keys.join(name))
+            .unwrap()
+            .lines()
+            .filter(|line| !line.starts_with("-----"))
+            .collect()
+    };
+
+    let tmp = TmpDir::new("delta-spki-rsa");
+    let base = tmp.path();
+    let repo = commit_fixture(base);
+    let repo_s = repo.to_str().unwrap();
+    for name in ["rsa-2048.pkcs1.pem", "rsa-2048.pem"] {
+        let _ = std::fs::remove_dir_all(repo.join("deltas"));
+        let lines = base.join("lines");
+        std::fs::write(&lines, format!("{}\n", base64_of(name))).unwrap();
+        let keys_file = format!("--keys-file={}", lines.display());
+        ostrya(
+            &[
+                "static-delta",
+                "--repo",
+                repo_s,
+                "generate",
+                "--empty",
+                "--to",
+                COMMIT,
+                "--sign-type=spki",
+                &keys_file,
+            ],
+            None,
+            &[],
+        )
+        .ok();
+        let verify = |keys_file: &str| {
+            ostrya(
+                &[
+                    "static-delta",
+                    "--repo",
+                    repo_s,
+                    "verify",
+                    "--sign-type=spki",
+                    keys_file,
+                    COMMIT,
+                ],
+                None,
+                &[],
+            )
+        };
+        verify(&public).ok();
+        assert_eq!(verify(&other).status.code(), Some(1), "{name}");
+    }
+}
+
 /// A `static-delta generate --keys-file` of the spki engine holds one base64
 /// secret key on each line. The run signs once with each line, and with each
 /// file. An empty file, an empty line, a line with white space, and a line
@@ -4897,7 +5041,7 @@ fn static_delta_generate_spki_keys_file_lines() {
         (
             "public",
             format!("{SECRET_A}\n{PUBLIC_A}\n"),
-            ", line 2: spki secret key: expected PKCS#8 DER or SEC1 DER".to_owned(),
+            ", line 2: spki secret key: expected PKCS#8 DER, SEC1 DER, or PKCS#1 DER".to_owned(),
             false,
         ),
     ] {

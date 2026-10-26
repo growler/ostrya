@@ -5222,6 +5222,9 @@ P-256 keys:
 - A secret key of `sign`, `commit --sign`, and `static-delta generate --sign`
   is the base64 of a PKCS#8 DER or of a SEC1 DER. The tool signs with each of
   the two, also when the base64 text holds LF or CRLF line breaks.
+- Observed on 2026-10-26 with a 2048-bit RSA key: `sign -s spki COMMIT KEY`,
+  where `KEY` is the base64 of a PKCS#1 `RSAPrivateKey` DER, signs at exit 0.
+  `sign --verify` verifies the signature.
 - The decode of a secret key skips characters outside the base64 alphabet,
   by the rule of `commit`, "Signing". A space, a tab, a form feed, or a `!`
   at any position, the end included, does not stop the signature. Text after
@@ -5273,7 +5276,9 @@ secret key file of the spki engine. Observed on 2026-10-25, with P-256 keys:
 - A first block of the label `EC PRIVATE KEY`, `RSA PRIVATE KEY`, or `PUBLIC
   KEY` refuses the run with `error: Unexpected label "<label>"` at exit 1.
   `sign` writes no signature, and `commit` moves no ref. `sign` refuses a block
-  of another label after a valid block in the same way.
+  of another label after a valid block in the same way. Observed on
+  2026-10-26 with a 2048-bit RSA key: `sign --keys-file` with an `RSA PRIVATE
+  KEY` block reports `error: Unexpected label "RSA PRIVATE KEY"` at exit 1.
 - `sign` with a valid block, then a `PRIVATE KEY` block that does not decode,
   writes the signature of the first block, then reports `error: Not able to
   sign the cobject: openssl: Failed to initialize spki key` at exit 1. With
@@ -5291,7 +5296,11 @@ secret key file of the spki engine. Observed on 2026-10-25, with P-256 keys:
 - `static-delta generate --keys-file` reads one base64 secret key on each
   line, and signs once with each line. Three lines give three signatures. LF
   and CRLF line ends both work, and the last line can have no line end. A
-  line of the base64 of a SEC1 DER signs.
+  line of the base64 of a SEC1 DER signs. Observed on 2026-10-26 with a
+  2048-bit RSA key: a line of the base64 of a PKCS#1 `RSAPrivateKey` DER
+  signs at exit 0, and `static-delta verify --sign-type=spki
+  --keys-file=<path>` with the PEM `PUBLIC KEY` file of the key prints
+  `Verification OK`.
   - A PEM `PRIVATE KEY` file, an empty line at any position, the first line
     included, a line of one space, and a line that is not base64 refuse the
     run with `error: openssl: Failed to initialize spki key` at exit 1. No
@@ -5306,6 +5315,31 @@ secret key file of the spki engine. Observed on 2026-10-25, with P-256 keys:
 
 `cli-surface.md`, "P2", `commit`, `summary`, `static-delta`, `sign`, and
 `remote`, records the port side.
+
+#### spki RSA keys
+
+The `ostree` 2026.1 build with OpenSSL on the NixOS development host signs
+and verifies with RSA keys of the spki engine. Observed on 2026-10-26, with
+OpenSSL 3.6.4. `openssl genpkey -algorithm RSA` makes the keys. Each probe
+signs the commit of a new `archive` repository with `sign -s spki
+--keys-file=<path>` and a PEM `PRIVATE KEY` file, and verifies it with `sign
+--verify -s spki --keys-file=<path>` and a PEM `PUBLIC KEY` file:
+
+- A key of 512 bits and a key of 1024 bits sign and verify at exit 0.
+- A key of 16386 bits signs at exit 0. The verify of the signature reports
+  `error: spki: Signature couldn't be verified with: key '<hex>'` at exit 1.
+  `openssl dgst -sha256 -verify` with the same key reports
+  `rsa_ossl_public_decrypt:modulus too large` at exit 1. `genpkey` with
+  `rsa_keygen_bits:16385` writes a key of 16384 bits.
+- A 2048-bit key of 3 primes, a 4096-bit key of 4 primes, and an 8192-bit key
+  of 5 primes sign and verify at exit 0.
+- An `rsaEncryption` SubjectPublicKeyInfo with no parameters field verifies a
+  signature of its key at exit 0. A SubjectPublicKeyInfo with an OID in the
+  parameters field also verifies at exit 0. A SubjectPublicKeyInfo with no
+  parameters field and the key of another 2048-bit key does not verify the
+  signature, and the verify exits 1.
+
+`cli-surface.md`, "P2", `sign`, records the port side.
 
 #### `apply-offline`
 

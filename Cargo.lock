@@ -1863,6 +1863,7 @@ dependencies = [
  "p256",
  "pem-rfc7468",
  "pkcs8",
+ "rsa",
  "spki",
  "thiserror",
 ]
@@ -2294,6 +2295,7 @@ dependencies = [
  "pkcs1",
  "pkcs8",
  "rand_core",
+ "sha2",
  "signature",
  "spki",
  "subtle",

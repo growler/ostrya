@@ -43,8 +43,9 @@
 //! # Features
 //! - `smol` (default): the `smol` backend of `ostrya-rt`.
 //! - `tokio`: the `tokio` backend of `ostrya-rt`.
-//! - `sign-spki`: the `spki` module, the spki signing engine with each of its key types. It turns on `sign-spki-p256`.
-//! - `sign-spki-p256`: the `spki` module with the ECDSA P-256 key type alone.
+//! - `sign-spki`: the `spki` module, the spki signing engine with each of its key types. It turns on `sign-spki-p256` and `sign-spki-rsa`.
+//! - `sign-spki-p256`: the `spki` module with the ECDSA P-256 key type.
+//! - `sign-spki-rsa`: the `spki` module with the RSA key type. A build with one of the two key features refuses a key of the other type.
 //! - `verify-gpg`: the `gpg` module, GPG verification and keyring management.
 //! - `sign-gpg`: `GpgSigner`, which signs with the `gpg` command. It turns on `verify-gpg`.
 //! - `receive`: the `receive` module, the receive side of a push.
@@ -106,9 +107,10 @@ mod send;
 #[cfg(any(feature = "receive", all(feature = "push", feature = "s3")))]
 mod server_commit;
 pub mod sign;
-#[cfg(any(feature = "sign-spki-p256"))]
+#[cfg(any(feature = "sign-spki-p256", feature = "sign-spki-rsa"))]
 pub mod spki {
-    //! The spki signing engine: ECDSA signatures on P-256 with SPKI public keys.
+    //! The spki signing engine: ECDSA P-256 and RSA PKCS#1 v1.5 signatures,
+    //! with SPKI public keys.
     pub use ostrya_sign::{
         SpkiSigner, SpkiVerifier, spki_public_keys, spki_secret_key_lines, spki_secret_keys,
     };
@@ -225,7 +227,7 @@ pub use sign::{
     SignKeys, SignatureInfo, Signer, Verifier, VerifyFuture, VerifyOutcome, load_sign_keys,
     load_sign_keys_from,
 };
-#[cfg(any(feature = "sign-spki-p256"))]
+#[cfg(any(feature = "sign-spki-p256", feature = "sign-spki-rsa"))]
 #[doc(hidden)]
 pub use spki::{
     SpkiSigner, SpkiVerifier, spki_public_keys, spki_secret_key_lines, spki_secret_keys,

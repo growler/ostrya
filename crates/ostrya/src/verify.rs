@@ -401,7 +401,7 @@ fn engines(
 /// `sign-verify=ed25519;dummy`.
 pub(crate) const ALL_ENGINES: &[&str] = &[
     "ed25519",
-    #[cfg(any(feature = "sign-spki-p256"))]
+    #[cfg(any(feature = "sign-spki-p256", feature = "sign-spki-rsa"))]
     "spki",
 ];
 
@@ -455,6 +455,35 @@ impl Policy {
         payload: &[u8],
         signatures: Option<&Value>,
     ) -> Result<()> {
+        self.check_on(subject, payload, signatures, false).await
+    }
+
+    /// Verifies as [`check`](Self::check) does, and runs the verifiers of the
+    /// sign-api axis on the blocking pool.
+    ///
+    /// The ed25519 and spki verifiers do their work in the call. The pool
+    /// gets a copy of `payload`, and the signature blobs that the check reads
+    /// for each verifier. The GPG verifier moves its own work to the
+    /// blocking pool, so the GPG axis runs in the calling task.
+    #[cfg(feature = "receive")]
+    pub(crate) async fn check_unblocked(
+        &self,
+        subject: &str,
+        payload: &[u8],
+        signatures: Option<&Value>,
+    ) -> Result<()> {
+        self.check_on(subject, payload, signatures, true).await
+    }
+
+    /// Verifies as [`check`](Self::check) does. If `unblock` is `true`, the
+    /// verifiers of the sign-api axis run on the blocking pool.
+    async fn check_on(
+        &self,
+        subject: &str,
+        payload: &[u8],
+        signatures: Option<&Value>,
+        unblock: bool,
+    ) -> Result<()> {
         if let Some(gpg) = &self.gpg {
             check_axis(
                 subject,
@@ -462,11 +491,12 @@ impl Policy {
                 std::slice::from_ref(gpg),
                 payload,
                 signatures,
+                false,
             )
             .await?;
         }
         if let Some(engines) = &self.sign {
-            check_axis(subject, "sign-api", engines, payload, signatures).await?;
+            check_axis(subject, "sign-api", engines, payload, signatures, unblock).await?;
         }
         Ok(())
     }
@@ -496,7 +526,20 @@ pub(crate) async fn examine(
     payload: &[u8],
     signatures: Option<&Value>,
 ) -> Result<Found> {
+    examine_on(verifiers, payload, signatures, false).await
+}
+
+/// Verifies `payload` on one axis as [`examine`] does. If `unblock` is
+/// `true`, each verifier runs on the blocking pool, with a copy of `payload`
+/// and the blobs that the search reads for the verifier.
+async fn examine_on(
+    verifiers: &[Arc<dyn Verifier>],
+    payload: &[u8],
+    signatures: Option<&Value>,
+    unblock: bool,
+) -> Result<Found> {
     let mut found = Found::Nothing;
+    let mut copy: Option<Arc<[u8]>> = None;
     for verifier in verifiers {
         let blobs = match signatures {
             Some(dict) => signatures_for(dict, verifier.metadata_key()),
@@ -506,7 +549,17 @@ pub(crate) async fn examine(
             continue;
         }
         found = Found::Untrusted;
-        if verifier.verify(payload, &blobs).await?.valid {
+        let outcome = if unblock {
+            let payload = Arc::clone(copy.get_or_insert_with(|| Arc::from(payload)));
+            let verifier = Arc::clone(verifier);
+            ostrya_rt::unblock(move || {
+                futures_lite::future::block_on(verifier.verify(&payload, &blobs))
+            })
+            .await?
+        } else {
+            verifier.verify(payload, &blobs).await?
+        };
+        if outcome.valid {
             return Ok(Found::Valid);
         }
     }
@@ -514,15 +567,17 @@ pub(crate) async fn examine(
 }
 
 /// Verifies `payload` on one axis, and refuses it if no key of the axis signed
-/// it or if it carries no signature.
+/// it or if it carries no signature. If `unblock` is `true`, the verifiers
+/// run on the blocking pool.
 async fn check_axis(
     subject: &str,
     axis: &str,
     verifiers: &[Arc<dyn Verifier>],
     payload: &[u8],
     signatures: Option<&Value>,
+    unblock: bool,
 ) -> Result<()> {
-    match examine(verifiers, payload, signatures).await? {
+    match examine_on(verifiers, payload, signatures, unblock).await? {
         Found::Valid => Ok(()),
         Found::Untrusted => Err(Error::Signature(format!(
             "{subject}: no {axis} signature is from a trusted key"
@@ -781,7 +836,7 @@ async fn gpg_verifier(_repo: &Repo, source: &KeySource<'_>) -> Result<Arc<dyn Ve
 /// source.
 enum Engine {
     Ed25519,
-    #[cfg(any(feature = "sign-spki-p256"))]
+    #[cfg(any(feature = "sign-spki-p256", feature = "sign-spki-rsa"))]
     Spki,
 }
 
@@ -796,7 +851,7 @@ enum Engine {
 async fn sign_verifier(engine: &str, source: &KeySource<'_>) -> Result<Option<Arc<dyn Verifier>>> {
     let kind = match engine {
         "ed25519" => Engine::Ed25519,
-        #[cfg(any(feature = "sign-spki-p256"))]
+        #[cfg(any(feature = "sign-spki-p256", feature = "sign-spki-rsa"))]
         "spki" => Engine::Spki,
         _ => {
             return Err(Error::Unsupported(format!(
@@ -826,7 +881,7 @@ fn build_verifier(kind: Engine, keys: SignKeys) -> Result<Option<Arc<dyn Verifie
             let verifier = Ed25519Verifier::from_sign_keys(keys)?;
             (!verifier.is_empty()).then(|| Arc::new(verifier) as Arc<dyn Verifier>)
         }
-        #[cfg(any(feature = "sign-spki-p256"))]
+        #[cfg(any(feature = "sign-spki-p256", feature = "sign-spki-rsa"))]
         Engine::Spki => {
             let verifier = crate::spki::SpkiVerifier::from_sign_keys(keys)?;
             (!verifier.is_empty()).then(|| Arc::new(verifier) as Arc<dyn Verifier>)
@@ -956,7 +1011,7 @@ fn read_verification_file(engine: &str, path: &str) -> Result<Vec<Vec<u8>>> {
     )
     .map_err(|e| Error::Signature(format!("{subject} cannot be read: {e}")))?;
     let bytes = read_key_source(std::fs::File::from(fd), &subject, MAX_KEY_FILE)?;
-    #[cfg(any(feature = "sign-spki-p256"))]
+    #[cfg(any(feature = "sign-spki-p256", feature = "sign-spki-rsa"))]
     if engine == "spki" {
         return Ok(crate::spki::spki_public_keys(&bytes, &subject)?);
     }

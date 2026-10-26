@@ -249,7 +249,7 @@ jobs:
       - name: The ostrya-sign unit tests pass with the RSA key feature alone
         run: cargo test -p ostrya-sign --no-default-features --features sign-spki-rsa --lib
       - name: The spki tests pass with the RSA key feature alone
-        run: cargo test -p ostrya --no-default-features --features smol,sign-spki-rsa --test sign_spki_rsa
+        run: cargo test -p ostrya --no-default-features --features smol,sign-spki-rsa --test sign_spki_rsa --test sign_spki_fixtures
 
       # The portable crates compile for macOS and Windows as well as Linux.
       # `cargo check` needs the standard library of each target and no linker,

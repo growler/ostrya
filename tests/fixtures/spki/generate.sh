@@ -2,18 +2,26 @@
 #
 # Test fixtures for the spki signature engine.
 #
-# Usage: generate.sh <key type>
+# Usage: [OPENSSL=<path of openssl>] generate.sh <key type>
+#
+# The key type is p256 or rsa. The `OPENSSL` variable names the `openssl`
+# command. The default is the `openssl` command on PATH.
 #
 # The script drives the `ostree` tool as a black box. It signs the commit of
 # tests/fixtures/generated/archive/repo with a new key, writes a signed static
 # delta and a signed summary, and puts the result in spki/<key type>/. Each run
-# makes a new key, and ECDSA takes a random nonce for each signature, so a run
-# cannot give the same bytes again. The fixtures are committed, and the script
-# runs only to replace one key type. It changes no other directory.
+# makes a new key, so a run cannot give the same bytes again. The fixtures are
+# committed, and the script runs only to replace one key type. It changes no
+# other directory.
 #
-# The commit carries two signatures. The first has a low s, the second has a
+# For p256 (ECDSA), the commit carries two signatures. ECDSA takes a random
+# nonce for each signature. The first signature has a low s, the second has a
 # high s (s > n/2). The tests read the s of each signature, so the order is
 # part of the fixture.
+#
+# For rsa (RSA PKCS#1 v1.5 with SHA-256), the commit carries one signature.
+# The signature is deterministic, so `openssl` signs each payload again with
+# the same key and must write the same bytes as the tool.
 #
 # The tool verifies some blobs that no key signed. For this reason `openssl`
 # verifies each signature again over the bytes that it signs.
@@ -23,6 +31,7 @@ shopt -s inherit_errexit nullglob dotglob
 export LC_ALL=C
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+O="${OPENSSL:-openssl}"
 ARCHIVE="$SCRIPT_DIR/../generated/archive/repo"
 BRANCH=test/main
 TRIES=64
@@ -32,15 +41,24 @@ die() {
     exit 1
 }
 
-# One case for each key type. `order` is the order n of the curve in hex.
+# One case for each key type. `kind` is the signature algorithm, `ecdsa` or
+# `rsa`. `param` is the parameter of the blob check: for ECDSA the order n of
+# the curve in hex, for RSA the length of a signature in bytes.
 case "${1:-}" in
     p256)
+        kind=ecdsa
         genkey=(genpkey -algorithm EC -pkeyopt ec_paramgen_curve:prime256v1
             -pkeyopt ec_param_enc:named_curve)
-        order=FFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
+        param=FFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
+        ;;
+    rsa)
+        kind=rsa
+        bits=2048
+        genkey=(genpkey -algorithm RSA -pkeyopt "rsa_keygen_bits:$bits")
+        param=$((bits / 8))
         ;;
     *)
-        echo "usage: $0 <key type>, where the key type is p256" >&2
+        echo "usage: $0 <key type>, where the key type is p256 or rsa" >&2
         exit 2
         ;;
 esac
@@ -52,7 +70,7 @@ command -v ostree >/dev/null || die "the 'ostree' tool is not on PATH"
 features=$(ostree --version)
 grep -qx -- ' *- openssl' <<<"$features" && grep -qx -- ' *- sign-spki' <<<"$features" ||
     die "an spki-capable ostree build is needed (openssl and sign-spki in 'ostree --version')"
-command -v openssl >/dev/null || die "the 'openssl' command is not on PATH"
+command -v "$O" >/dev/null || die "cannot find the '$O' command"
 command -v python3 >/dev/null || die "the 'python3' command is not on PATH"
 [ -d "$ARCHIVE" ] || die "$ARCHIVE is missing: run tests/fixtures/generate.sh first"
 
@@ -64,12 +82,14 @@ export OPENSSL_CONF=/dev/null
 # The helper reads the `ostree.sign.spki` blobs of an `a{sv}` file or of a
 # signed superblock `(taya{sv})`. It writes each blob to <dir>/sig<i>.der, and
 # for a superblock it writes the signed superblock bytes to <dir>/payload. It
-# reads each blob as a strict DER ECDSA-Sig-Value and prints the s class of
-# each blob, `low` or `high`, in blob order.
+# prints one class for each blob, in blob order. For `ecdsa`, it reads each
+# blob as a strict DER ECDSA-Sig-Value, and the class is the s class, `low` or
+# `high`. For `rsa`, the class is the length of the blob in bytes, and the
+# helper fails if the length is not the signature length.
 cat >"$WORK/sigs.py" <<'PY'
 import sys
 
-path, outdir, order = sys.argv[1], sys.argv[2], int(sys.argv[3], 16)
+path, outdir, kind, param = sys.argv[1:5]
 
 def fail(msg):
     sys.exit(f"{path}: {msg}")
@@ -113,6 +133,7 @@ def spki_blobs(buf):
     fail("no ostree.sign.spki entry")
 
 def s_class(der):
+    order = int(param, 16)
     if len(der) < 8 or der[0] != 0x30 or der[1] != len(der) - 2:
         fail("bad DER SEQUENCE")
     pos, ints = 2, []
@@ -139,38 +160,60 @@ if data.startswith(b"OSTSGNDT"):
     payload_end = read_offset(data, len(data) - size, size)
     open(f"{outdir}/payload", "wb").write(data[8:payload_end])
     data = data[align8(payload_end):len(data) - size]
+
+def length_class(blob):
+    if len(blob) != int(param):
+        fail(f"an RSA signature of {len(blob)} bytes, not {param}")
+    return str(len(blob))
+
 classes = []
 for i, blob in enumerate(spki_blobs(data)):
     open(f"{outdir}/sig{i}.der", "wb").write(blob)
-    classes.append(s_class(blob))
+    classes.append(s_class(blob) if kind == "ecdsa" else length_class(blob))
 print(" ".join(classes))
 PY
 
-# Prints the s classes of the blobs in the file $1.
+# Prints the classes of the blobs in the file $1.
 classify() {
     rm -rf "$WORK/blobs" && mkdir "$WORK/blobs"
-    python3 "$WORK/sigs.py" "$1" "$WORK/blobs" "$order"
+    python3 "$WORK/sigs.py" "$1" "$WORK/blobs" "$kind" "$param"
 }
 
-# Prints the s classes of the blobs in the file $1, after `openssl` verifies
+# Prints the classes of the blobs in the file $1, after `openssl` verifies
 # each blob over the file $2. Without $2, the data is the signed superblock
-# payload.
+# payload. For RSA, `openssl` also signs the data, and its signature must be
+# the same bytes as each blob.
 verify() {
-    local classes sig
+    local classes sig data=${2:-$WORK/blobs/payload}
     classes=$(classify "$1")
     for sig in "$WORK"/blobs/sig*.der; do
-        [ "$(openssl dgst -sha256 -verify "$WORK/public.pem" -signature "$sig" \
-            "${2:-$WORK/blobs/payload}")" = "Verified OK" ] ||
+        [ "$("$O" dgst -sha256 -verify "$WORK/public.pem" -signature "$sig" \
+            "$data")" = "Verified OK" ] ||
             die "openssl does not verify $sig of $1"
+        if [ "$kind" = rsa ]; then
+            "$O" dgst -sha256 -sign "$WORK/secret.pem" -out "$WORK/openssl.sig" "$data"
+            cmp -s "$WORK/openssl.sig" "$sig" ||
+                die "the openssl signature is not the same as $sig of $1"
+        fi
     done
     echo "$classes"
 }
 
+# Returns success if $1 is the class of exactly one blob.
+one_blob() {
+    [[ -n $1 && $1 != *" "* ]]
+}
+
 # The key pair.
-openssl "${genkey[@]}" -out "$WORK/secret.pem"
+"$O" "${genkey[@]}" -out "$WORK/secret.pem"
 [ "$(head -n1 "$WORK/secret.pem")" = "-----BEGIN PRIVATE KEY-----" ] ||
     die "openssl did not write a PKCS#8 PRIVATE KEY block"
-openssl pkey -in "$WORK/secret.pem" -pubout -out "$WORK/public.pem"
+if [ "$kind" = rsa ]; then
+    modulus_bits=$("$O" pkey -in "$WORK/secret.pem" -text -noout |
+        sed -n '1s/^.*(\([0-9]*\) bit.*$/\1/p')
+    [ "$modulus_bits" = "$bits" ] || die "secret.pem has $modulus_bits bits, not $bits"
+fi
+"$O" pkey -in "$WORK/secret.pem" -pubout -out "$WORK/public.pem"
 B64=$(sed '1d;$d' "$WORK/secret.pem" | tr -d '\n')
 
 REPO="$WORK/repo"
@@ -180,24 +223,34 @@ OBJ="$REPO/objects/${C:0:2}/${C:2}.commit"
 META="$REPO/objects/${C:0:2}/${C:2}.commitmeta"
 sign() { ostree --repo="$REPO" sign -s spki --keys-file="$WORK/secret.pem" "$C"; }
 
-# The commit signatures: one with a low s, then one with a high s. The tool
-# appends each signature to the detached metadata.
-for ((i = 1; ; i++)); do
-    ((i <= TRIES)) || die "no low-s signature in $TRIES tries"
+# The commit signatures. For ECDSA: one with a low s, then one with a high s.
+# The tool appends each signature to the detached metadata. For RSA: one
+# signature.
+if [ "$kind" = ecdsa ]; then
+    for ((i = 1; ; i++)); do
+        ((i <= TRIES)) || die "no low-s signature in $TRIES tries"
+        rm -f "$META"
+        sign
+        classes=$(classify "$META")
+        [ "$classes" = low ] && break
+    done
+    cp "$META" "$WORK/meta.low"
+    for ((i = 1; ; i++)); do
+        ((i <= TRIES)) || die "no high-s signature in $TRIES tries"
+        cp "$WORK/meta.low" "$META"
+        sign
+        classes=$(classify "$META")
+        [ "$classes" = "low high" ] && break
+    done
+else
     rm -f "$META"
     sign
-    classes=$(classify "$META")
-    [ "$classes" = low ] && break
-done
-cp "$META" "$WORK/meta.low"
-for ((i = 1; ; i++)); do
-    ((i <= TRIES)) || die "no high-s signature in $TRIES tries"
-    cp "$WORK/meta.low" "$META"
-    sign
-    classes=$(classify "$META")
-    [ "$classes" = "low high" ] && break
-done
+fi
 commit_classes=$(verify "$META" "$OBJ")
+if [ "$kind" = rsa ]; then
+    [ "$commit_classes" = "$param" ] ||
+        die "the commit does not hold one RSA signature: '$commit_classes'"
+fi
 
 # The delta from scratch, in the default layout of a superblock and parts.
 ostree --repo="$REPO" static-delta generate --empty --to="$C" \
@@ -209,13 +262,13 @@ DELTA=$(ostree --repo="$REPO" static-delta list)
     die "the tool does not verify the static delta"
 SUPERBLOCK=$(find "$REPO/deltas" -name superblock)
 delta_class=$(verify "$SUPERBLOCK")
-[[ $delta_class = low || $delta_class = high ]] ||
+one_blob "$delta_class" ||
     die "the superblock does not hold one spki signature: '$delta_class'"
 
 # The summary, after the delta.
 ostree --repo="$REPO" summary -u --sign-type=spki --sign="$B64"
 summary_class=$(verify "$REPO/summary.sig" "$REPO/summary")
-[[ $summary_class = low || $summary_class = high ]] ||
+one_blob "$summary_class" ||
     die "summary.sig does not hold one spki signature: '$summary_class'"
 
 ostree --repo="$REPO" fsck >/dev/null
@@ -236,12 +289,17 @@ for entry in config objects refs deltas delta-indexes summary summary.sig; do
     fi
 done
 cp "$WORK/secret.pem" "$WORK/public.pem" "$OUT/"
+if [ "$kind" = ecdsa ]; then
+    random="The key and the ECDSA nonces are random"
+else
+    random="The key is random"
+fi
 cat >"$OUT/MANIFEST" <<EOF
 # spki test fixtures for the ostree Rust port, written by spki/generate.sh.
 # Generator: ostree $(sed -n "s/^ *Version: '\(.*\)'$/\1/p" <<<"$features") (black box).
-# The key and the ECDSA nonces are random, so a run gives new bytes.
+# $random, so a run gives new bytes.
 key_type=$TYPE
-openssl=$(openssl version)
+openssl=$("$O" version)
 branch=$BRANCH
 commit=$C
 delta=$DELTA
@@ -249,6 +307,9 @@ commit_signatures=$commit_classes
 summary_signature=$summary_class
 delta_signature=$delta_class
 EOF
+if [ "$kind" = rsa ]; then
+    echo "modulus_bits=$bits" >>"$OUT/MANIFEST"
+fi
 
 echo "wrote $OUT"
 echo "commit=$C commit_signatures=\"$commit_classes\""

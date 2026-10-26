@@ -1,0 +1,12 @@
+# spki test fixtures for the ostree Rust port, written by spki/generate.sh.
+# Generator: ostree 2026.1 (black box).
+# The key is random, so a run gives new bytes.
+key_type=rsa
+openssl=OpenSSL 3.6.4 25 Aug 2026 (Library: OpenSSL 3.6.4 25 Aug 2026)
+branch=test/main
+commit=b3c8e8525e8a5c3409bf6e6db5f5d656da77ae76d08cbc4f8b75b71879757a89
+delta=b3c8e8525e8a5c3409bf6e6db5f5d656da77ae76d08cbc4f8b75b71879757a89
+commit_signatures=256
+summary_signature=256
+delta_signature=256
+modulus_bits=2048

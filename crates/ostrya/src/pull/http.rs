@@ -49,6 +49,7 @@ use crate::summary::{SUMMARY_FILE, SUMMARY_SIG_FILE, Summary, put_root_file_bloc
 use crate::transaction::Transaction;
 use crate::traverse::reaches_at_least;
 use crate::verify::PullTrust;
+use crate::verify::trust::FieldGroup;
 use crate::write::FileMeta;
 
 use super::chain::Edges;
@@ -118,8 +119,9 @@ impl Repo {
     /// states its rules in "Bucket repository".
     ///
     /// The pull reads the trust of the remote with
-    /// [`PullTrust::from_remote`] before it opens the session. So a refused
-    /// policy starts no fetcher and no ssh client. Then the pull runs as
+    /// [`PullTrust::from_remote`] before it opens the session, with the trust
+    /// group of [`trust_group`](PullOptions::trust_group) if the field is set.
+    /// So a refused policy starts no fetcher and no ssh client. Then the pull runs as
     /// [`pull_with_session`](Repo::pull_with_session) with that session and
     /// that trust, with the `branches` key and the summary copy of this
     /// method.
@@ -486,6 +488,8 @@ impl Repo {
     ///   [`Error::InvalidInput`] if
     ///   [`valid_remote_name`](crate::config::valid_remote_name) refuses
     ///   `remote`.
+    /// - The errors of [`trust_group`](PullOptions::trust_group), if it is
+    ///   set.
     ///
     /// These errors stop the pull before it fetches an object:
     ///
@@ -603,11 +607,13 @@ impl Repo {
         let endpoint = resolve_pull(Some(self.config()), remote, overrides).await?;
         // The trust comes before the session, so a refused policy starts no
         // fetcher and no ssh client.
-        let trust = PullTrust::from_remote(self, remote, &opts.verify).await?;
+        let mut group = opts.trust_group.as_deref().map(FieldGroup::new);
+        let trust = PullTrust::for_pull(self, remote, &opts.verify, group.as_mut()).await?;
         let (endpoint, stream) = session_options(endpoint, opts.max_outstanding_fetches);
         let connection = connect(endpoint, stream).await?;
         // The trust and the session now hold what these fields gave.
         opts.verify = PullVerify::default();
+        opts.trust_group = None;
         opts.max_outstanding_fetches = None;
         opts.remote = opts.remote.or_else(|| Some(remote.to_owned()));
         self.run_session(
@@ -631,8 +637,9 @@ impl Repo {
     /// subpaths, the verification of signatures, the static deltas, and the
     /// statistics.
     ///
-    /// The pull reads no remote section of the config of this repository. It
-    /// reads the `[core]` keys that each transaction reads.
+    /// The pull reads no remote section and no trust group of the config of
+    /// this repository. It reads the `[core]` keys that each transaction
+    /// reads.
     ///
     /// # Refs
     ///
@@ -701,7 +708,8 @@ impl Repo {
     /// - [`Error::InvalidInput`] if [`refs`](PullOptions::refs) is empty, also
     ///   under `MIRROR`.
     /// - [`Error::InvalidInput`] if [`verify`](PullOptions::verify) is not the
-    ///   default. `trust` holds the keys.
+    ///   default, or if [`trust_group`](PullOptions::trust_group) is set.
+    ///   `trust` holds the keys.
     /// - [`Error::InvalidInput`] if
     ///   [`max_outstanding_fetches`](PullOptions::max_outstanding_fetches) is
     ///   set. The limit of the session applies.
@@ -2108,6 +2116,13 @@ async fn check_session_pull(opts: &mut PullOptions) -> Result<(Option<Subpaths>,
         return Err(Error::InvalidInput(
             "a pull with a session takes its signature policy from its trust, and \
              takes no verify option"
+                .into(),
+        ));
+    }
+    if opts.trust_group.is_some() {
+        return Err(Error::InvalidInput(
+            "a pull with a session takes its signature policy from its trust, and \
+             takes no trust group"
                 .into(),
         ));
     }

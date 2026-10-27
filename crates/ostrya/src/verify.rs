@@ -277,6 +277,12 @@ impl PullTrust {
     /// Each refusal of a trust group comes before the call reads a key
     /// source.
     ///
+    /// This call reads the key `trust` alone. [`Repo::pull`] and
+    /// [`Repo::pull_collection`] also read
+    /// [`PullOptions::trust_group`](crate::PullOptions::trust_group). The field
+    /// names a trust group that wins over the key, and the rules of this
+    /// section apply to that group.
+    ///
     /// # Errors
     ///
     /// - [`Error::InvalidInput`] if [`valid_remote_name`] refuses `remote`.
@@ -303,12 +309,27 @@ impl PullTrust {
     ///   build with no spki key feature, whatever the fields of `verify`.
     /// - [`Error::Io`] if a directory of keys cannot be listed.
     pub async fn from_remote(repo: &Repo, remote: &str, verify: &PullVerify) -> Result<PullTrust> {
+        PullTrust::for_pull(repo, remote, verify, None).await
+    }
+
+    /// Reads the trust of a pull from `remote`, as
+    /// [`from_remote`](PullTrust::from_remote) does, with the trust group
+    /// `group` of [`PullOptions::trust_group`](crate::PullOptions::trust_group).
+    ///
+    /// The call refuses a name that [`valid_remote_name`] refuses with
+    /// [`Error::InvalidInput`], before it reads a key source.
+    pub(crate) async fn for_pull(
+        repo: &Repo,
+        remote: &str,
+        verify: &PullVerify,
+        group: Option<&mut trust::FieldGroup<'_>>,
+    ) -> Result<PullTrust> {
         if !valid_remote_name(remote) {
             return Err(Error::InvalidInput(format!(
                 "invalid remote name: {remote}"
             )));
         }
-        PullTrust::resolve(repo, Some(remote), verify, Defaults::Config).await
+        PullTrust::resolve(repo, Some(remote), verify, group, Defaults::Config).await
     }
 
     /// Resolves the trust of a pull of `remote` from its config in `repo` and
@@ -319,19 +340,46 @@ impl PullTrust {
     /// local pull names no remote and asks for a verification, this function
     /// fails with [`Error::Pull`]. The failure comes before the pull imports
     /// an object.
+    ///
+    /// `group` is the trust group that the options of the pull name. It wins
+    /// over the key `trust` of the section, and the call then does not read
+    /// that key. With a trust group, the group sets the commit policy, and the
+    /// call ignores `defaults`. A pull with a trust group that names no remote
+    /// checks no summary. The call keeps the commit policy of the group in
+    /// `group`, and a later call with the same `group` and the same `verify`
+    /// reads no key source of the group again.
     pub(crate) async fn resolve(
         repo: &Repo,
         remote: Option<&str>,
         verify: &PullVerify,
+        group: Option<&mut trust::FieldGroup<'_>>,
         defaults: Defaults,
     ) -> Result<PullTrust> {
         let section = remote.and_then(|name| repo.config().remote(name));
-        // A remote with the key `trust` takes its commit keys from the trust
-        // group that the key names.
-        if let (Some(name), Some(section)) = (remote, &section)
+        // A trust group that the options of the pull name, or else the trust
+        // group that the key `trust` of the remote names, supplies the commit
+        // keys.
+        if let Some(group) = group {
+            let name = trust::GroupName::Field(group.name);
+            return trust::pull_trust(
+                repo,
+                remote,
+                section.as_ref(),
+                name,
+                verify,
+                &mut group.commit,
+            )
+            .await;
+        }
+        if let (Some(remote), Some(section)) = (remote, &section)
             && let Some(value) = section.trust()?
         {
-            return trust::pull_trust(repo, name, section, &value, verify).await;
+            let name = trust::GroupName::Key {
+                remote,
+                value: &value,
+            };
+            return trust::pull_trust(repo, Some(remote), Some(section), name, verify, &mut None)
+                .await;
         }
 
         let gpg_commit = switch(verify.gpg, || match &section {
@@ -352,11 +400,7 @@ impl PullTrust {
             || sign_summary != SignVerify::Off;
         let Some(name) = remote else {
             if asks_for_a_check {
-                return Err(Error::Pull(
-                    "a signature check takes its keys from a remote's configuration, \
-                     so the pull has to name a remote"
-                        .into(),
-                ));
+                return Err(no_remote());
             }
             return Ok(PullTrust::unverified());
         };
@@ -397,7 +441,19 @@ const _: fn() = || {
     assert_send_sync::<PullTrust>();
 };
 
+/// Returns the refusal of a check that takes its keys from the section of a
+/// remote, in a pull that names no remote.
+fn no_remote() -> Error {
+    Error::Pull(
+        "a signature check takes its keys from a remote's configuration, so the pull \
+         has to name a remote"
+            .into(),
+    )
+}
+
 /// The source of the policy when the options of a pull state no policy.
+///
+/// A trust group of the pull sets the commit policy whatever the source.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Defaults {
     /// Read the config of the remote. A remote with no section takes the

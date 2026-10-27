@@ -1,11 +1,11 @@
 //! The trust groups, `[ex-ostrya trust "NAME"]`: the check of a group, the
-//! build of its policy, and the trust of a pull from a remote with the key
-//! `trust`.
+//! build of its policy, and the trust of a pull that names a group.
 //!
 //! `check_trust` checks the keys and the values of a group. It reads no file
 //! and runs no program. `trust_group_policy` builds the policy of a group that
-//! passed the check. `pull_trust` resolves the trust of a pull from a remote
-//! whose section names a group in its key `trust`.
+//! passed the check. `pull_trust` resolves the trust of a pull that names a
+//! group: in the key `trust` of the section of its remote, or in
+//! `PullOptions::trust_group`.
 
 use ostrya_core::KeyFile;
 
@@ -14,7 +14,9 @@ use crate::error::{Error, Result};
 use crate::pull::PullVerify;
 use crate::repo::Repo;
 
-use super::{KeySource, Policy, PullTrust, TrustedKeys, Verifiers, build_policy, summary_switches};
+use super::{
+    KeySource, Policy, PullTrust, TrustedKeys, Verifiers, build_policy, no_remote, summary_switches,
+};
 
 /// The sign-api engines that a trust group can name.
 const TRUST_ENGINES: &[&str] = &["ed25519", "spki"];
@@ -52,46 +54,113 @@ pub(crate) async fn trust_group_policy(
     build_policy(repo, &source, &mut Verifiers::default(), gpg, &sign).await
 }
 
-/// Resolves the trust of a pull from `remote`, whose section `section` holds
-/// `trust=NAME`, with `NAME` in `value`.
+/// The source of the name of the trust group of a pull.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum GroupName<'a> {
+    /// The value of the key `trust` of the section of `remote`.
+    Key {
+        /// The name of the remote.
+        remote: &'a str,
+        /// The value of the key.
+        value: &'a str,
+    },
+    /// The value of [`PullOptions::trust_group`](crate::PullOptions::trust_group).
+    Field(&'a str),
+}
+
+impl GroupName<'_> {
+    /// Returns the name of the trust group.
+    fn value(&self) -> &str {
+        match self {
+            GroupName::Key { value, .. } | GroupName::Field(value) => value,
+        }
+    }
+}
+
+/// The trust group that [`PullOptions::trust_group`](crate::PullOptions::trust_group)
+/// names, with the commit policy of the group after a call of [`pull_trust`] built it.
 ///
-/// The trust group sets the commit policy, and the summary keys of the
-/// section set the summary policy. A field `Some(false)` of `verify` turns
-/// off its commit axis of the group. The summary fields of `verify`
-/// override the summary keys of the section.
+/// The commit policy of a group depends on the group and on the commit fields of
+/// `PullVerify` alone. A pull gives one value to the trust of each of its remotes, so
+/// it reads the key sources of the group one time.
+pub(crate) struct FieldGroup<'a> {
+    /// The name of the trust group.
+    pub(super) name: &'a str,
+    /// The commit policy of the group, or `None` before a call built it.
+    pub(super) commit: Option<Policy>,
+}
+
+impl<'a> FieldGroup<'a> {
+    /// Creates the trust group `name`, with no commit policy built.
+    pub(crate) fn new(name: &'a str) -> FieldGroup<'a> {
+        FieldGroup { name, commit: None }
+    }
+}
+
+/// Resolves the trust of a pull whose trust group `name` names.
+///
+/// `remote` is the remote of the pull, if the pull names one, and `section`
+/// is its section, if the config has one. The trust group sets the commit
+/// policy, and the summary keys of the section set the summary policy. A
+/// field `Some(false)` of `verify` turns off its commit axis of the group.
+/// The summary fields of `verify` override the summary keys of the section.
+/// A pull that names no remote checks no summary.
 ///
 /// The checks come in this order, and each one comes before the call reads a
 /// key source:
 ///
-/// 1. the value is a valid group name, and the group exists;
+/// 1. the name is a valid group name, and the group exists;
 /// 2. [`check_trust`] accepts the group;
 /// 3. `verify` does not turn on a commit check;
-/// 4. the section turns on no commit check, and holds no key source that no
+/// 4. a pull that names no remote does not turn on a summary check;
+/// 5. the section turns on no commit check, and holds no key source that no
 ///    summary check reads;
-/// 5. the summary keys of the section that `verify` does not override
+/// 6. the summary keys of the section that `verify` does not override
 ///    parse.
+///
+/// The first check refuses a name of the key `trust` with
+/// [`Error::InvalidFormat`], and a name of
+/// [`PullOptions::trust_group`](crate::PullOptions::trust_group) with
+/// [`Error::InvalidInput`]. The words of each refusal name the source of the
+/// name.
+///
+/// `commit` holds the commit policy of the group if an earlier call with the
+/// same group and the same `verify` built it. In that case the call reads no
+/// key source of the group. Otherwise the call builds the policy after the
+/// checks and keeps it in `commit`.
 pub(crate) async fn pull_trust(
     repo: &Repo,
-    remote: &str,
-    section: &Remote<'_>,
-    value: &str,
+    remote: Option<&str>,
+    section: Option<&Remote<'_>>,
+    name: GroupName<'_>,
     verify: &PullVerify,
+    commit: &mut Option<Policy>,
 ) -> Result<PullTrust> {
-    let head = || format!("[remote \"{remote}\"]");
-    if value.is_empty() || value.contains('"') || value.contains(char::is_control) {
-        return Err(Error::InvalidFormat(format!(
-            "malformed {} trust value '{value}': the value names a trust group, is \
-             not empty, and holds no '\"' and no control character",
-            head()
-        )));
+    let value = name.value();
+    let group = format!("ex-ostrya trust \"{value}\"");
+    if !valid_group_name(value) {
+        return Err(match name {
+            GroupName::Key { remote, .. } => Error::InvalidFormat(format!(
+                "malformed [remote \"{remote}\"] trust value '{value}': the value names a \
+                 trust group, is not empty, and holds no '\"' and no control character"
+            )),
+            GroupName::Field(_) => Error::InvalidInput(format!(
+                "malformed trust group name '{value}': the name is not empty, and holds \
+                 no '\"' and no control character"
+            )),
+        });
     }
     let keyfile = repo.config().keyfile();
-    let group = format!("ex-ostrya trust \"{value}\"");
     if !keyfile.has_group(&group) {
-        return Err(Error::InvalidFormat(format!(
-            "{} trust={value} names no [{group}] group",
-            head()
-        )));
+        return Err(match name {
+            GroupName::Key { remote, .. } => Error::InvalidFormat(format!(
+                "[remote \"{remote}\"] trust={value} names no [{group}] group"
+            )),
+            GroupName::Field(_) => Error::InvalidInput(format!(
+                "the pull names the trust group '{value}', and the config has no \
+                 [{group}] group"
+            )),
+        });
     }
     check_trust(keyfile, &group)?;
     for (field, check) in [
@@ -99,72 +168,131 @@ pub(crate) async fn pull_trust(
         (verify.sign, "the sign-api check"),
     ] {
         if field == Some(true) {
-            return Err(Error::InvalidInput(format!(
-                "remote '{remote}' takes its commit keys from [{group}], so a pull cannot \
-                 turn on {check} of the commits"
-            )));
+            return Err(Error::InvalidInput(match name {
+                GroupName::Key { remote, .. } => format!(
+                    "remote '{remote}' takes its commit keys from [{group}], so a pull \
+                     cannot turn on {check} of the commits"
+                ),
+                GroupName::Field(_) => format!(
+                    "the pull takes its commit keys from [{group}], so it cannot turn on \
+                     {check} of the commits"
+                ),
+            }));
         }
     }
-    refuse_commit_keys(remote, section, value)?;
-    let (gpg_summary, sign_summary) = summary_switches(Some(section), verify)?;
+    // With no remote, no section supplies the keys of a summary check.
+    if remote.is_none() && (verify.gpg_summary == Some(true) || verify.sign_summary == Some(true)) {
+        return Err(no_remote());
+    }
+    if let (Some(remote), Some(section)) = (remote, section)
+        && let Some(void) = void_commit_key(section)?
+    {
+        let VoidKey { holds, key, reason } = void;
+        return Err(Error::InvalidFormat(match name {
+            GroupName::Key { .. } => {
+                let verb = if holds { "holds " } else { "" };
+                format!("[remote \"{remote}\"] sets trust={value} and {verb}{key}{reason}")
+            }
+            GroupName::Field(_) => {
+                let verb = if holds { "holds" } else { "sets" };
+                format!(
+                    "the pull takes its commit keys from [{group}], and [remote \"{remote}\"] \
+                     {verb} {key}{reason}"
+                )
+            }
+        }));
+    }
+    let (gpg_summary, sign_summary) = summary_switches(section, verify)?;
 
-    let commit = trust_group_policy(
-        repo,
-        keyfile,
-        value,
-        &group,
-        verify.gpg != Some(false),
-        verify.sign != Some(false),
-    )
-    .await?;
-    let source = KeySource::Remote {
-        name: remote,
-        section: Some(section),
-        repo_keyring: true,
+    let commit = match commit.as_ref() {
+        Some(policy) => policy.clone(),
+        None => commit
+            .insert(
+                trust_group_policy(
+                    repo,
+                    keyfile,
+                    value,
+                    &group,
+                    verify.gpg != Some(false),
+                    verify.sign != Some(false),
+                )
+                .await?,
+            )
+            .clone(),
     };
-    let summary = build_policy(
-        repo,
-        &source,
-        &mut Verifiers::default(),
-        gpg_summary,
-        &sign_summary,
-    )
-    .await?;
+    let summary = match remote {
+        Some(remote) => {
+            let source = KeySource::Remote {
+                name: remote,
+                section,
+                repo_keyring: true,
+            };
+            build_policy(
+                repo,
+                &source,
+                &mut Verifiers::default(),
+                gpg_summary,
+                &sign_summary,
+            )
+            .await?
+        }
+        None => Policy::default(),
+    };
     Ok(PullTrust {
         commit: commit.applies().then(|| TrustedKeys::from_policy(commit)),
         summary: summary.applies().then(|| TrustedKeys::from_policy(summary)),
     })
 }
 
-/// Refuses a key of the remote section `section` that a trust group makes
-/// void: a key that turns on a commit check, and a key source that no summary
-/// check reads. `remote` names the section, and `value` is the `trust`
-/// value.
+/// Returns `true` if `name` is a valid name of a trust group: it is not
+/// empty, and holds no `"` and no control character.
+fn valid_group_name(name: &str) -> bool {
+    !name.is_empty() && !name.contains('"') && !name.contains(char::is_control)
+}
+
+/// A key of a remote section that a trust group makes void.
+struct VoidKey {
+    /// `true` if the section holds the key, and `false` if the section
+    /// sets the key to the value that `key` names.
+    holds: bool,
+    /// The key, as the refusal names it.
+    key: String,
+    /// The reason of the refusal, with its leading punctuation.
+    reason: String,
+}
+
+/// Returns the first key of the remote section `section` that a trust group
+/// makes void: a key that turns on a commit check, or a key source that no
+/// summary check reads. `None` if the section holds no such key.
 ///
 /// The rule reads the summary keys of the section, and no override of a pull.
-fn refuse_commit_keys(remote: &str, section: &Remote<'_>, value: &str) -> Result<()> {
-    let head = || format!("[remote \"{remote}\"] sets trust={value}");
+fn void_commit_key(section: &Remote<'_>) -> Result<Option<VoidKey>> {
+    let sets = |key: String, reason: &str| {
+        Some(VoidKey {
+            holds: false,
+            key,
+            reason: reason.to_owned(),
+        })
+    };
     if section.gpg_verify_key()? == Some(true) {
-        return Err(Error::InvalidFormat(format!(
-            "{} and gpg-verify=true: the trust group sets the commit checks, so set \
-             gpg-verify=false or remove the key",
-            head()
-        )));
+        return Ok(sets(
+            "gpg-verify=true".to_owned(),
+            ": the trust group sets the commit checks, so set gpg-verify=false or \
+             remove the key",
+        ));
     }
     if section.sign_verify()? != SignVerify::Off {
         let raw = section.get("sign-verify").unwrap_or_default();
-        return Err(Error::InvalidFormat(format!(
-            "{} and sign-verify={raw}: the trust group sets the commit checks, so \
-             remove sign-verify",
-            head()
-        )));
+        return Ok(sets(
+            format!("sign-verify={raw}"),
+            ": the trust group sets the commit checks, so remove sign-verify",
+        ));
     }
     if section.get("gpgkeypath").is_some() && !section.gpg_verify_summary()? {
-        return Err(Error::InvalidFormat(format!(
-            "{} and gpgkeypath, and gpg-verify-summary is not true, so no check \
-             reads it",
-            head()
-        )));
+        return Ok(sets(
+            "gpgkeypath".to_owned(),
+            ", and gpg-verify-summary is not true, so no check reads it",
+        ));
     }
     let summary = section.sign_verify_summary()?;
     let engines: Vec<&str> = match &summary {
@@ -176,14 +304,17 @@ fn refuse_commit_keys(remote: &str, section: &Remote<'_>, value: &str) -> Result
         if let Some(engine) = verification_engine(key)
             && !engines.contains(&engine)
         {
-            return Err(Error::InvalidFormat(format!(
-                "{} and holds '{key}', and sign-verify-summary does not select \
-                 {engine}, so no check reads it",
-                head()
-            )));
+            return Ok(Some(VoidKey {
+                holds: true,
+                key: format!("'{key}'"),
+                reason: format!(
+                    ", and sign-verify-summary does not select {engine}, so no check \
+                     reads it"
+                ),
+            }));
         }
     }
-    Ok(())
+    Ok(None)
 }
 
 /// Checks the trust group `group`.

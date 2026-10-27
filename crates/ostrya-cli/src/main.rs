@@ -4215,6 +4215,11 @@ struct ComposefsImageArgs {
 }
 
 #[derive(Args)]
+#[command(group(
+    clap::ArgGroup::new("key_source")
+        .args(["remote", "trust"])
+        .multiple(true)
+))]
 struct PullLocalArgs {
     /// Write the pulled refs under this remote name.
     ///
@@ -4226,12 +4231,25 @@ struct PullLocalArgs {
     /// its key: --gpg-verify, --gpg-verify-summary, --sign-verify, and
     /// --sign-verify-summary turn a check on, and --no-gpg-verify,
     /// --no-gpg-verify-summary, --no-sign-verify, and --no-sign-verify-summary
-    /// turn a configured check off. If the remote has the key `trust`, the
-    /// keys of the commits come from its trust group. The command then refuses
-    /// --gpg-verify and --sign-verify, and --no-gpg-verify and
-    /// --no-sign-verify turn off that check of the group.
+    /// turn a configured check off. If the remote has the key `trust`, or if
+    /// --trust is given, the keys of the commits come from the trust group.
+    /// The command then refuses --gpg-verify and --sign-verify, and
+    /// --no-gpg-verify and --no-sign-verify turn off that check of the group.
     #[arg(long)]
     remote: Option<String>,
+    /// Take the keys of the commits from the trust group
+    /// `[ex-ostrya trust "NAME"]` (see ostrya-config(1)).
+    ///
+    /// The option wins over the key `trust` of the remote that --remote
+    /// names. It needs no --remote, and --remote still names the refs. With
+    /// --remote, the summary keys of the remote apply, and the command
+    /// refuses a key of the remote that turns on a commit check. Without
+    /// --remote, the pull checks no summary, and the command refuses
+    /// --gpg-verify-summary. The command refuses --gpg-verify and
+    /// --sign-verify, and --no-gpg-verify and --no-sign-verify turn off that
+    /// check of the group.
+    #[arg(long, value_name = "NAME")]
+    trust: Option<String>,
     /// The number of parents of each pulled commit to follow.
     ///
     /// 0 takes the commit alone, and -1 takes the whole ancestry in the
@@ -4320,10 +4338,10 @@ struct PullLocalArgs {
     /// Do not require a GPG signature on the commits.
     ///
     /// The switch turns off the `gpg-verify` key of the remote that --remote
-    /// names. If the remote has the key `trust`, the switch turns off the GPG
-    /// check of its trust group. It needs --remote and conflicts with
-    /// --gpg-verify.
-    #[arg(long, requires = "remote", conflicts_with = "gpg_verify")]
+    /// names. With --trust, or if the remote has the key `trust`, the switch
+    /// turns off the GPG check of the trust group. It needs --remote or
+    /// --trust, and conflicts with --gpg-verify.
+    #[arg(long, requires = "key_source", conflicts_with = "gpg_verify")]
     no_gpg_verify: bool,
     /// Do not require a GPG signature on the summary of the source.
     ///
@@ -4335,10 +4353,10 @@ struct PullLocalArgs {
     /// Do not require an ed25519 or spki signature on the commits.
     ///
     /// The switch turns off the `sign-verify` key of the remote that --remote
-    /// names. If the remote has the key `trust`, the switch turns off the
-    /// sign-api check of its trust group. It needs --remote and conflicts with
-    /// --sign-verify.
-    #[arg(long, requires = "remote", conflicts_with = "sign_verify")]
+    /// names. With --trust, or if the remote has the key `trust`, the switch
+    /// turns off the sign-api check of the trust group. It needs --remote or
+    /// --trust, and conflicts with --sign-verify.
+    #[arg(long, requires = "key_source", conflicts_with = "sign_verify")]
     no_sign_verify: bool,
     /// Do not require an ed25519 or spki signature on the summary of the
     /// source.
@@ -6319,6 +6337,7 @@ async fn pull_local(repo: Repo, name: &str, args: PullLocalArgs) -> Result<()> {
                     sign_summary: (args.sign_verify_summary || args.no_sign_verify_summary)
                         .then_some(args.sign_verify_summary),
                 },
+                trust_group: args.trust,
                 detached_metadata_filter: detached_metadata_filter(&repo)?,
                 ..PullOptions::default()
             },

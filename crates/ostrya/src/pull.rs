@@ -387,16 +387,20 @@ pub enum TimestampCheck {
 ///
 /// The keys come from the config section of a remote. If a pull names no
 /// remote and asks for a verification, it fails with [`Error::Pull`] before
-/// it fetches anything.
+/// it fetches anything. With [`PullOptions::trust_group`], a local pull that
+/// names no remote takes its commit keys from the trust group, and refuses a
+/// summary field `Some(true)` with [`Error::Pull`].
 ///
 /// A remote with the key `trust=NAME` takes its commit policy from the trust
-/// group `[ex-ostrya trust "NAME"]`, and each pull reads the key. With a trust
-/// group, the pull refuses `Some(true)` in [`gpg`](PullVerify::gpg) and in
-/// [`sign`](PullVerify::sign) with [`Error::InvalidInput`]. `Some(false)` in
-/// one of the two fields turns that commit axis of the group off. The two
-/// summary fields override the summary keys of the remote, as they do without
-/// a trust group. [`PullTrust::from_remote`](crate::verify::PullTrust::from_remote)
-/// states the rules of the remote keys beside `trust`.
+/// group `[ex-ostrya trust "NAME"]`, and each pull reads the key.
+/// [`PullOptions::trust_group`] names a trust group for one pull, and wins
+/// over the key. With a trust group, the pull refuses `Some(true)` in
+/// [`gpg`](PullVerify::gpg) and in [`sign`](PullVerify::sign) with
+/// [`Error::InvalidInput`]. `Some(false)` in one of the two fields turns that
+/// commit axis of the group off. The two summary fields override the summary
+/// keys of the remote, as they do without a trust group.
+/// [`PullTrust::from_remote`](crate::verify::PullTrust::from_remote) states
+/// the rules of the remote keys beside `trust`.
 ///
 /// # Keys
 ///
@@ -742,7 +746,8 @@ impl std::fmt::Debug for DetachedMetadataFilter {
 ///   [`disable_static_deltas`](PullOptions::disable_static_deltas),
 ///   [`require_static_deltas`](PullOptions::require_static_deltas),
 ///   [`static_deltas`](PullOptions::static_deltas),
-///   [`verify`](PullOptions::verify), and
+///   [`verify`](PullOptions::verify),
+///   [`trust_group`](PullOptions::trust_group), and
 ///   [`detached_metadata_filter`](PullOptions::detached_metadata_filter).
 /// - Only a local pull reads [`collection_id`](PullOptions::collection_id).
 ///   A pull from a remote refuses it. [`Repo::pull_collection`] takes the
@@ -754,8 +759,8 @@ impl std::fmt::Debug for DetachedMetadataFilter {
 ///   [`timestamp_check`](PullOptions::timestamp_check), and
 ///   [`progress`](PullOptions::progress). A local pull refuses `subpaths`.
 /// - [`Repo::pull_with_session`] refuses an empty `refs`, a `verify` other
-///   than the default, `overrides` other than the default, and a set
-///   `max_outstanding_fetches`.
+///   than the default, a set `trust_group`, `overrides` other than the
+///   default, and a set `max_outstanding_fetches`.
 #[derive(Debug, Clone, Default)]
 pub struct PullOptions {
     /// The ref names to pull.
@@ -1019,6 +1024,53 @@ pub struct PullOptions {
     /// with [`Error::InvalidInput`]. Its
     /// [`PullTrust`](crate::verify::PullTrust) holds the keys.
     pub verify: PullVerify,
+    /// The name of the trust group `[ex-ostrya trust "NAME"]` that supplies
+    /// the commit keys of this pull.
+    ///
+    /// The group sets the commit policy of the pull, as the remote key
+    /// [`trust`](crate::config::Remote::trust) does. The field wins over that
+    /// key, and the pull then does not read the key. [`Repo::pull`],
+    /// [`Repo::pull_collection`], and [`Repo::pull_local`] read the field. A
+    /// local pull with the field needs no [`remote`](PullOptions::remote).
+    ///
+    /// The rules of a trust group apply, as
+    /// [`PullTrust::from_remote`](crate::verify::PullTrust::from_remote)
+    /// states them for the key:
+    ///
+    /// - `Some(true)` in [`PullVerify::gpg`] or [`PullVerify::sign`] is
+    ///   refused, and `Some(false)` turns that commit axis of the group off.
+    /// - The section of the remote of the pull must not turn on a commit check,
+    ///   and must not hold a key source that no summary check reads.
+    /// - The summary keys of the section of the remote set the summary policy,
+    ///   and the summary fields of [`verify`](PullOptions::verify) override
+    ///   them.
+    ///
+    /// A local pull that names no remote checks no summary, because no
+    /// section supplies the summary keys. It refuses `Some(true)` in
+    /// [`PullVerify::gpg_summary`] and in [`PullVerify::sign_summary`] with
+    /// [`Error::Pull`].
+    ///
+    /// [`Repo::pull_with_session`] refuses a value that is set with
+    /// [`Error::InvalidInput`]. Its [`PullTrust`](crate::verify::PullTrust)
+    /// holds the keys.
+    ///
+    /// # Errors
+    ///
+    /// Each pull that reads the field makes these checks before it reads a
+    /// key source, sends a request, or reads the source of a local pull:
+    ///
+    /// - [`Error::InvalidInput`] if the name is empty or holds a `"` or a
+    ///   control character, or if the config has no group of the name.
+    /// - [`Error::InvalidFormat`] if the group fails the check of a trust
+    ///   group.
+    /// - [`Error::InvalidInput`] if [`PullVerify::gpg`] or [`PullVerify::sign`]
+    ///   is `Some(true)`.
+    /// - [`Error::Pull`] if the pull names no remote, and
+    ///   [`PullVerify::gpg_summary`] or [`PullVerify::sign_summary`] is
+    ///   `Some(true)`.
+    /// - [`Error::InvalidFormat`] if the section of the remote turns on a
+    ///   commit check or holds a key source that no summary check reads.
+    pub trust_group: Option<String>,
     /// The properties of the detached metadata of a commit that this pull
     /// stores.
     ///
@@ -1713,7 +1765,11 @@ impl Repo {
     /// - [`Error::InvalidRefspec`] if the collection id or a name is invalid,
     ///   or if a name holds `:`, before the pull reads `src`.
     /// - [`Error::Pull`] if the options ask for a signature verification and
-    ///   name no [`remote`](PullOptions::remote).
+    ///   name no [`remote`](PullOptions::remote). With
+    ///   [`trust_group`](PullOptions::trust_group), only a summary check needs
+    ///   a remote.
+    /// - The errors of [`trust_group`](PullOptions::trust_group), before the
+    ///   pull reads `src`.
     /// - [`Error::InvalidFormat`] if the remote section holds a `trust` value
     ///   that is malformed or names no trust group, if the group fails the
     ///   check of a trust group, or if the section turns on a commit check or
@@ -1793,6 +1849,10 @@ impl Repo {
             self,
             opts.remote.as_deref(),
             &opts.verify,
+            opts.trust_group
+                .as_deref()
+                .map(crate::verify::trust::FieldGroup::new)
+                .as_mut(),
             crate::verify::Defaults::Section,
         )
         .await?;

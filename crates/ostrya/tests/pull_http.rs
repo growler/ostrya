@@ -5218,6 +5218,301 @@ fn a_trust_group_keeps_the_summary_check_of_a_pull_over_http() {
     });
 }
 
+/// Returns the options of a pull with the trust group option `group`.
+fn group_options(group: &str) -> PullOptions {
+    PullOptions {
+        trust_group: Some(group.to_owned()),
+        ..PullOptions::default()
+    }
+}
+
+/// Pulls `test/main` over HTTP with the trust group option `t`. The remote
+/// section holds no key `trust`, and the config holds the group with the keys
+/// of `group`. `own` is a key that the group trusts, and `other` is a key
+/// that it does not trust.
+///
+/// An unsigned commit and a commit of `other` are refused, and the pull
+/// publishes nothing. A commit of `own` is pulled.
+async fn assert_the_option_checks_the_commits(
+    dir: &Path,
+    group: &str,
+    own: &dyn Signer,
+    other: &dyn Signer,
+) {
+    let (remote, commit) = build_remote(dir).await;
+    let server = RepoServer::start(&dir.join("remote"), false).await;
+    let fresh_dest = || async {
+        let _ = std::fs::remove_dir_all(dir.join("dest"));
+        build_dest(
+            dir,
+            RepoMode::Archive,
+            &server.url(),
+            &format!("[ex-ostrya trust \"t\"]\n{group}"),
+        )
+        .await
+    };
+
+    let dest = fresh_dest().await;
+    let err = pull_main(&dest, group_options("t")).await.unwrap_err();
+    assert!(
+        matches!(&err, Error::Signature(m)
+            if m.contains("sign-api verification is enabled, but it carries no signature")),
+        "{err}"
+    );
+    assert_nothing_published(&dest).await;
+
+    remote.sign_commit(&commit, other).await.unwrap();
+    let dest = fresh_dest().await;
+    let err = pull_main(&dest, group_options("t")).await.unwrap_err();
+    assert!(
+        matches!(&err, Error::Signature(m) if m.contains("no sign-api signature is from a trusted key")),
+        "{err}"
+    );
+    assert_nothing_published(&dest).await;
+
+    remote
+        .write_commit_detached_metadata(&commit, None)
+        .await
+        .unwrap();
+    remote.sign_commit(&commit, own).await.unwrap();
+    let dest = fresh_dest().await;
+    pull_main(&dest, group_options("t")).await.unwrap();
+    assert_eq!(
+        dest.resolve_rev("origin:test/main", true).await.unwrap(),
+        Some(commit)
+    );
+}
+
+/// The trust group option of a pull over HTTP takes the keys of the commits
+/// from the group, with an ed25519 group and with an spki group.
+#[test]
+fn the_trust_group_option_checks_the_commits_of_a_pull_over_http() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-trust-option-commits");
+        let own = Ed25519Signer::from_base64(SECRET_B64).unwrap();
+        let other = Ed25519Signer::from_base64(OTHER_SECRET_B64).unwrap();
+        assert_the_option_checks_the_commits(dir.path(), &ed25519_group(), &own, &other).await;
+    });
+    #[cfg(feature = "sign-spki-p256")]
+    block_on(async {
+        use ostrya::SpkiSigner;
+
+        let dir = TmpDir::new("pull-http-trust-option-commits-spki");
+        let own = SpkiSigner::from_base64(concat!(
+            "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg2L708EsnnzHER0SYasMNIUcG",
+            "v63QapC/3kVsoPerzKGhRANCAATxfzfHKUPeJtyLTGMUoxHhvBS1NT9guWhUQPGiZRLZIcB8Wc3",
+            "csdVU1iOiTRmbZGKJTtekOdEAbVRrx5HxIpst",
+        ))
+        .unwrap();
+        let other = SpkiSigner::from_base64(concat!(
+            "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgU5tYPz/hTTxfsSTPOxD/H9U+",
+            "IkBj5qWV4/H3D1NBfRChRANCAAQPyTr9rh2d6WiYOi3oxNiE3ppTP2g5JP2xX9D7rEKnzixp",
+            "MqVuqA9XnzQr5GlCYd71m/D7BnYIqS4MytNawYrR",
+        ))
+        .unwrap();
+        let group = format!(
+            "sign-verify=spki\nverification-spki-key={}\n",
+            ostrya::base64::encode(&own.public_key_der())
+        );
+        assert_the_option_checks_the_commits(dir.path(), &group, &own, &other).await;
+    });
+}
+
+/// The trust group option of a pull over HTTP wins over the key `trust` of
+/// the remote, and the pull does not read the key. A key that names no group
+/// and an empty key are not read.
+#[test]
+fn the_trust_group_option_wins_over_the_remote_key_over_http() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-trust-option-wins");
+        let (remote, commit) = build_remote(dir.path()).await;
+        remote
+            .sign_commit(&commit, &Ed25519Signer::from_base64(SECRET_B64).unwrap())
+            .await
+            .unwrap();
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        for key in ["trust=nope\n", "trust=\n"] {
+            let _ = std::fs::remove_dir_all(dir.path().join("dest"));
+            let dest = build_dest(
+                dir.path(),
+                RepoMode::Archive,
+                &server.url(),
+                &format!("{key}[ex-ostrya trust \"t\"]\n{}", ed25519_group()),
+            )
+            .await;
+            pull_main(&dest, group_options("t")).await.unwrap();
+            assert_eq!(
+                dest.resolve_rev("origin:test/main", true).await.unwrap(),
+                Some(commit),
+                "{key:?}"
+            );
+        }
+    });
+}
+
+/// With the trust group option, an absent `gpg-verify` key of the remote
+/// gives no GPG check of the commits, so a pull over HTTP takes a commit with
+/// an ed25519 signature alone. The same pull without the option makes the
+/// GPG check of the default, which refuses the commit, or which a build with
+/// no GPG support refuses.
+#[test]
+fn the_trust_group_option_makes_no_gpg_check_when_gpg_verify_is_absent() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-trust-option-no-gpg-key");
+        let (remote, commit) = build_remote(dir.path()).await;
+        remote
+            .sign_commit(&commit, &Ed25519Signer::from_base64(SECRET_B64).unwrap())
+            .await
+            .unwrap();
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = build_dest(
+            dir.path(),
+            RepoMode::Archive,
+            &server.url(),
+            &format!("[ex-ostrya trust \"t\"]\n{}", ed25519_group()),
+        )
+        .await;
+        let dest_path = dir.path().join("dest");
+        let config = dest_path.join("config");
+        drop(dest);
+        let text = std::fs::read_to_string(&config)
+            .unwrap()
+            .replacen("gpg-verify=false\n", "", 1);
+        assert!(!text.contains("gpg-verify"), "{text}");
+        std::fs::write(&config, text).unwrap();
+        let dest = Repo::open(&dest_path).await.unwrap();
+
+        let err = pull_main(&dest, PullOptions::default()).await.unwrap_err();
+        let refused = if cfg!(feature = "verify-gpg") {
+            matches!(&err, Error::Signature(_))
+        } else {
+            matches!(&err, Error::Unsupported(_))
+        };
+        assert!(refused, "{err}");
+        assert_nothing_published(&dest).await;
+
+        pull_main(&dest, group_options("t")).await.unwrap();
+        assert_eq!(
+            dest.resolve_rev("origin:test/main", true).await.unwrap(),
+            Some(commit)
+        );
+    });
+}
+
+/// Each refusal of the trust group option comes before the first request of
+/// a pull over HTTP:
+///
+/// - a name that names no group, the empty name, and a name with a `"`;
+/// - `Some(true)` in `gpg` or in `sign`;
+/// - a remote key that turns on a commit check, and a key source of the
+///   remote that no summary check reads.
+#[test]
+fn the_trust_group_option_refuses_before_the_first_request() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-trust-option-refusals");
+        let _remote = build_signed_remote(dir.path(), Some(SECRET_B64)).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let group = format!("[ex-ostrya trust \"t\"]\n{}", ed25519_group());
+        let malformed = |name: &str| {
+            format!(
+                "invalid input: malformed trust group name '{name}': the name is not empty, \
+                 and holds no '\"' and no control character"
+            )
+        };
+        let head = "invalid format: the pull takes its commit keys from \
+                    [ex-ostrya trust \"t\"], and [remote \"origin\"]";
+        let commit_check = "the trust group sets the commit checks";
+        let gpg_on = PullVerify {
+            gpg: Some(true),
+            ..PullVerify::default()
+        };
+        let sign_on = PullVerify {
+            sign: Some(true),
+            ..PullVerify::default()
+        };
+        let input = |check: &str| {
+            format!(
+                "invalid input: the pull takes its commit keys from [ex-ostrya trust \"t\"], \
+                 so it cannot turn on {check} of the commits"
+            )
+        };
+        let rows: Vec<(&str, String, PullVerify, String)> = vec![
+            (
+                "nope",
+                group.clone(),
+                PullVerify::default(),
+                "invalid input: the pull names the trust group 'nope', and the config has \
+                 no [ex-ostrya trust \"nope\"] group"
+                    .to_owned(),
+            ),
+            ("", group.clone(), PullVerify::default(), malformed("")),
+            (
+                "a\"b",
+                group.clone(),
+                PullVerify::default(),
+                malformed("a\"b"),
+            ),
+            ("t", group.clone(), gpg_on, input("the GPG check")),
+            ("t", group.clone(), sign_on, input("the sign-api check")),
+            (
+                "t",
+                format!("gpg-verify=true\n{group}"),
+                PullVerify::default(),
+                format!(
+                    "{head} sets gpg-verify=true: {commit_check}, so set gpg-verify=false or \
+                     remove the key"
+                ),
+            ),
+            (
+                "t",
+                format!("sign-verify=true\n{group}"),
+                PullVerify::default(),
+                format!("{head} sets sign-verify=true: {commit_check}, so remove sign-verify"),
+            ),
+            (
+                "t",
+                format!("sign-verify=ed25519\n{group}"),
+                PullVerify::default(),
+                format!("{head} sets sign-verify=ed25519: {commit_check}, so remove sign-verify"),
+            ),
+            (
+                "t",
+                format!("gpgkeypath=/nonexistent.gpg\n{group}"),
+                PullVerify::default(),
+                format!(
+                    "{head} sets gpgkeypath, and gpg-verify-summary is not true, so no check \
+                     reads it"
+                ),
+            ),
+            (
+                "t",
+                format!("verification-ed25519-key={OTHER_PUBLIC_B64}\n{group}"),
+                PullVerify::default(),
+                format!(
+                    "{head} holds 'verification-ed25519-key', and sign-verify-summary does \
+                     not select ed25519, so no check reads it"
+                ),
+            ),
+        ];
+        for (name, extra, verify, reason) in rows {
+            let _ = std::fs::remove_dir_all(dir.path().join("dest"));
+            let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), &extra).await;
+            let err = pull_main(
+                &dest,
+                PullOptions {
+                    verify,
+                    ..group_options(name)
+                },
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(err.to_string(), reason, "{name:?} {extra:?}");
+            assert_nothing_published(&dest).await;
+            assert!(server.seen().is_empty(), "{extra:?}: {:?}", server.seen());
+        }
+    });
+}
+
 // --- subpaths ----------------------------------------------------------------
 
 /// Builds a source tree under `dir` with siblings of distinct content. The tree
@@ -8502,6 +8797,13 @@ fn a_session_pull_refuses_its_options_before_the_first_request() {
                 },
             ),
             (
+                "trust_group",
+                PullOptions {
+                    trust_group: Some("t".to_owned()),
+                    ..main()
+                },
+            ),
+            (
                 "max_outstanding_fetches",
                 PullOptions {
                     max_outstanding_fetches: Some(1),
@@ -8559,8 +8861,15 @@ fn a_session_pull_refuses_its_options_before_the_first_request() {
                     "a pull with a session takes its server from the session, and takes \
                      no endpoint overrides"
                 ),
+                ("trust_group", Error::InvalidInput(m)) => assert_eq!(
+                    m,
+                    "a pull with a session takes its signature policy from its trust, and \
+                     takes no trust group"
+                ),
                 ("subpath", Error::Pull(_)) => {}
-                ("collection_id" | "subpath" | "overrides", _) => panic!("{tag}: {err:?}"),
+                ("collection_id" | "subpath" | "overrides" | "trust_group", _) => {
+                    panic!("{tag}: {err:?}")
+                }
                 (_, Error::InvalidInput(_)) => {}
                 _ => panic!("{tag}: {err:?}"),
             }

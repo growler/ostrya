@@ -3560,16 +3560,22 @@ differences stand:
 `--gpg-verify-summary`, `--require-static-deltas`, `--disable-static-deltas`,
 and the port extensions `--force-copy`, `-L/--localcache-repo`,
 `--sign-verify`, `--sign-verify-summary`, `--no-gpg-verify`,
-`--no-gpg-verify-summary`, `--no-sign-verify`, and `--no-sign-verify-summary`.
-`--sign-verify` checks the commits and `--sign-verify-summary` checks the
-summary of the source. Each one selects each engine of the build, as
+`--no-gpg-verify-summary`, `--no-sign-verify`, `--no-sign-verify-summary`, and
+`--trust`. `--sign-verify` checks the commits and `--sign-verify-summary`
+checks the summary of the source. Each one selects each engine of the build, as
 `--sign-verify` of `pull` does, and takes no value. Each `--no-` switch turns
 off one verification key of the remote that `--remote` names, and conflicts
-with its positive switch. Each of the two sign switches and the four `--no-`
-switches needs `--remote`. `clap` refuses a sign switch or a `--no-` switch
-with no `--remote`, a sign switch with a value, and a switch together with its
-`--no-` switch at exit 1. The tool refuses each of these six switches with
-`error: Unknown option <option>` at exit 1. The two durability switches follow the `pull` paragraph above. An
+with its positive switch. `--trust=NAME` takes the keys of the commits from the
+trust group `[ex-ostrya trust "NAME"]`, and wins over the key `trust` of the
+remote. It needs no `--remote`. Without `--remote`, the pull checks no
+summary. The port refuses `--trust` together with `--gpg-verify` or
+`--sign-verify` at exit 1, and refuses a name that names no group at exit 1
+before it reads a ref or an object of the source. The two sign switches,
+`--no-gpg-verify-summary`, and `--no-sign-verify-summary` need `--remote`.
+`--no-gpg-verify` and `--no-sign-verify` need `--remote` or `--trust`. `clap`
+refuses a sign switch or a `--no-` switch with no such option, a sign switch
+with a value, and a switch together with its `--no-` switch at exit 1. The tool
+refuses each of these seven options with `error: Unknown option <option>` at exit 1. The two durability switches follow the `pull` paragraph above. An
 object hardlinked from the source is not synced, in both, so from `archive`
 into `archive` `--per-object-fsync` adds no call. The same three differences
 stand, with `refs/heads` in place of `refs/remotes/<remote>` and no summary:

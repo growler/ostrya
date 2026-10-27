@@ -75,6 +75,10 @@ for it.
   lock and again before the commit. The library has no API for this check. A
   ref that another writer makes during the publish step is replaced.
   `conformance/cli-surface.md` states this.
+- `ostrya pull --trust=NAME`, also with `--collection`. The library field
+  `PullOptions::trust_group` applies to each pull, and the command takes
+  `--trust` on `pull-local` alone (`decisions.md`, "The trust group of one
+  pull").
 
 ## Gaps in the library
 

@@ -35,6 +35,7 @@ use crate::summary::{
     collection_map_refs, parse_ref_list,
 };
 use crate::verify::PullTrust;
+use crate::verify::trust::FieldGroup;
 
 #[cfg(feature = "s3")]
 use super::http::s3_fetcher;
@@ -289,7 +290,8 @@ impl Repo {
     /// Before its first request, the pull resolves the endpoint of each
     /// remote with [`resolve_pull`], with
     /// [`overrides`](PullOptions::overrides), and the trust of each remote
-    /// with [`PullTrust::from_remote`], with [`verify`](PullOptions::verify).
+    /// with [`PullTrust::from_remote`], with [`verify`](PullOptions::verify)
+    /// and [`trust_group`](PullOptions::trust_group).
     /// It also builds the fetcher of each HTTP remote and of each remote at
     /// an `s3://` address, which sends no request, and checks the command
     /// line of the ssh client of each ssh remote, which starts no ssh client.
@@ -297,7 +299,8 @@ impl Repo {
     /// does not parse, an empty `send-command`, or an `s3://` remote with no
     /// key pair, stops the pull before the first request. Each pull from a
     /// remote applies the keys of that remote: `gpg-verify`, `sign-verify`,
-    /// and their key sources.
+    /// and their key sources. With `trust_group`, or with the key `trust` of
+    /// the remote, the trust group supplies the commit keys.
     ///
     /// # Probe
     ///
@@ -399,7 +402,8 @@ impl Repo {
     ///
     /// - [`refs`](PullOptions::refs) selects the refs, as stated above.
     /// - [`overrides`](PullOptions::overrides),
-    ///   [`verify`](PullOptions::verify), and
+    ///   [`verify`](PullOptions::verify),
+    ///   [`trust_group`](PullOptions::trust_group), and
     ///   [`max_outstanding_fetches`](PullOptions::max_outstanding_fetches)
     ///   apply to the probe and the pull of each remote.
     /// - [`progress`](PullOptions::progress) gets the counters of each pull
@@ -432,7 +436,8 @@ impl Repo {
     ///   [`MAX_REF_ENTRY_PARTS`] parts, or if the request target of the name
     ///   alone over HTTP is longer than 16 KiB.
     /// - The errors of [`resolve_pull`] and of [`PullTrust::from_remote`],
-    ///   for each remote.
+    ///   for each remote, and the errors of
+    ///   [`trust_group`](PullOptions::trust_group).
     /// - For each HTTP remote and each remote at an `s3://` address, the
     ///   errors of [`Repo::pull`] that come from the build of its fetcher:
     ///   [`Error::Unsupported`] for a mirror scheme other than `http` and
@@ -496,9 +501,12 @@ impl Repo {
         // before the first request, so an error in the config of one remote
         // stops the pull.
         let mut candidates = Vec::with_capacity(remotes.len());
+        // The trust group of the options keeps its commit policy, so the pull
+        // reads the key sources of the group one time for all the remotes.
+        let mut group = opts.trust_group.as_deref().map(FieldGroup::new);
         for name in first_of_each(remotes.iter().copied()) {
             let endpoint = resolve_pull(Some(self.config()), name, opts.overrides.clone()).await?;
-            let trust = PullTrust::from_remote(self, name, &opts.verify).await?;
+            let trust = PullTrust::for_pull(self, name, &opts.verify, group.as_mut()).await?;
             let transport = Transport::new(endpoint, opts.max_outstanding_fetches).await?;
             candidates.push(Candidate {
                 name,
@@ -578,6 +586,7 @@ impl Repo {
                     .map(|(name, _)| name.clone())
                     .collect(),
                 verify: PullVerify::default(),
+                trust_group: None,
                 max_outstanding_fetches: None,
                 overrides: EndpointOverrides::default(),
                 ..opts.clone()

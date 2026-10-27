@@ -410,8 +410,11 @@ the commits is on.
 
 `ostrya pull-local` has the off switches `--no-gpg-verify`,
 `--no-gpg-verify-summary`, `--no-sign-verify`, and `--no-sign-verify-summary`.
-Each switch sets its field of `PullVerify` to `Some(false)` and needs
-`--remote`. Each off switch conflicts with its positive switch.
+Each switch sets its field of `PullVerify` to `Some(false)`. The two summary
+off switches need `--remote`. `--no-gpg-verify` and `--no-sign-verify` need
+`--remote` or `--trust`, because each one also turns off an axis of the trust
+group that `--trust` names. Each off switch conflicts with its positive
+switch.
 `--sign-verify` and `--sign-verify-summary` set `sign` and `sign_summary` to
 `Some(true)` and need `--remote`. Each one selects each engine of the build,
 as `ostrya pull --sign-verify` does. The two GPG switches and the two sign
@@ -491,6 +494,39 @@ Three alternatives were rejected:
 - A refusal of each `Some` field of `PullVerify`. `Some(false)` makes the
   policy of the group smaller and never larger, and `ostrya remote fsck
   NAME` sets it. The summary fields do not touch the group.
+
+## The trust group of one pull
+
+`PullOptions::trust_group` names a trust group `[ex-ostrya trust "NAME"]` for
+one pull. The field applies to each pull that reads its policy from the
+config: `Repo::pull` over HTTP, over ssh, and from an `s3://` address,
+`Repo::pull_collection`, and `Repo::pull_local`. `Repo::pull_with_session`
+takes its keys from the trust of the caller, so it refuses the field with
+`Error::InvalidInput`.
+
+The field wins over the remote key `trust`, and the pull then does not read
+the key. The rules of "The trust group of a remote" apply to the group that
+the field names: the refusal of `Some(true)` in `PullVerify::gpg` and
+`PullVerify::sign`, the refusal of the commit keys of the remote, and the
+summary policy from the summary keys of the remote. A name that is malformed
+or names no group is `Error::InvalidInput`, because the name comes from the
+caller and not from the config.
+
+A local pull with the field needs no remote. With no remote, no section
+supplies the summary keys, so the pull checks no summary. A summary field that
+is `Some(true)` then fails with `Error::Pull`, as it does with no field.
+`PullOptions::remote` still names the ref namespace.
+
+The option `--trust=NAME` of the command is on `ostrya pull-local` alone.
+`ostrya pull --trust` is in `roadmap.md`.
+
+Two alternatives were rejected:
+
+- `--trust` on each pull command now. The library field gives each pull the
+  rule, and the option of the other commands can come later with no change
+  to the library.
+- A field that `Repo::pull_local` alone reads. A pull over HTTP with the same
+  options would then use the keys of the remote, with no message.
 
 ## TLS stack
 

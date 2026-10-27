@@ -732,7 +732,8 @@ pub(crate) fn remote_keyring_name(remote: &str) -> String {
 /// A typed accessor for one `[remote "<name>"]` section.
 ///
 /// A trust group, `[ex-ostrya trust "NAME"]`, takes the key names of a remote
-/// section. A pull from a remote with the key [`trust`](Remote::trust) and the
+/// section. A pull from a remote with the key [`trust`](Remote::trust), a pull
+/// with [`PullOptions::trust_group`](crate::PullOptions::trust_group), and the
 /// receive side read a trust group through this type.
 #[derive(Debug, Clone)]
 pub struct Remote<'a> {
@@ -900,8 +901,10 @@ impl Remote<'_> {
     /// With the key, the group sets the commit checks of the pull, and the
     /// summary keys of this section set the summary check.
     /// [`PullTrust::from_remote`](crate::verify::PullTrust::from_remote)
-    /// states the rules and the refusals. The key is an ostrya extension. The
-    /// `ostree` command keeps it and ignores it.
+    /// states the rules and the refusals.
+    /// [`PullOptions::trust_group`](crate::PullOptions::trust_group) wins over
+    /// the key, and a pull with that field does not read the key. The key is
+    /// an ostrya extension. The `ostree` command keeps it and ignores it.
     ///
     /// # Errors
     ///

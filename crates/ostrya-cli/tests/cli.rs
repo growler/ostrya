@@ -41553,6 +41553,212 @@ fn pull_local_reads_the_trust_group_of_the_remote() {
     assert_eq!(resolve(&dest, "origin:test/main").as_deref(), Some(COMMIT));
 }
 
+/// The trust group `[ex-ostrya trust "t"]`, which trusts the shared ed25519
+/// key, with no remote section.
+fn trust_group_alone() -> String {
+    format!(
+        "\n[ex-ostrya trust \"t\"]\nsign-verify=ed25519\n\
+         verification-ed25519-key={ED25519_PUBLIC_B64}\n"
+    )
+}
+
+/// A source repository under `base/<name>` with the fixture commit on
+/// `test/main`. If `signed` is true, the shared ed25519 key signs the commit.
+fn trust_source(base: &Path, name: &str, signed: bool) -> PathBuf {
+    let dir = base.join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    let src = commit_fixture(&dir);
+    if signed {
+        let repo_arg = format!("--repo={}", src.display());
+        ostrya(&["sign", &repo_arg, COMMIT, ED25519_SECRET_B64], None, &[]).ok();
+    }
+    src
+}
+
+/// A local pull of `test/main` from `src` into a new archive repository under
+/// `base/<name>`, whose config gets `config`, with the switches `switches`.
+/// Returns the run and the destination.
+fn pull_local_with_config(
+    base: &Path,
+    name: &str,
+    src: &Path,
+    config: &str,
+    switches: &[&str],
+) -> (Run, PathBuf) {
+    let dir = base.join(name);
+    std::fs::create_dir_all(&dir).unwrap();
+    let dest = create_repo(&dir, RepoMode::Archive);
+    append_config(&dest, config);
+    let repo_arg = format!("--repo={}", dest.display());
+    let mut args = vec!["pull-local", repo_arg.as_str()];
+    args.extend_from_slice(switches);
+    args.extend([src.to_str().unwrap(), BRANCH]);
+    (ostrya(&args, None, &[]), dest)
+}
+
+/// `pull-local --trust=t` takes the keys of the commits from the trust group
+/// `[ex-ostrya trust "t"]`, and needs no `--remote`. The port takes a commit
+/// of the key of the group into the local ref, and refuses an unsigned commit
+/// at exit 1 with no object and no ref. With `--remote=origin` and no section
+/// for it, the ref goes under `origin`.
+#[test]
+fn pull_local_trust_checks_the_commits() {
+    let tmp = TmpDir::new("pull-local-trust-option");
+    let base = tmp.path();
+    let unsigned = trust_source(base, "unsigned", false);
+    let signed = trust_source(base, "signed", true);
+    let group = trust_group_alone();
+
+    let (run, dest) = pull_local_with_config(base, "accepted", &signed, &group, &["--trust=t"]);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert_eq!(run.status.code(), Some(0), "{stderr}");
+    assert_eq!(resolve(&dest, BRANCH).as_deref(), Some(COMMIT));
+
+    let (run, dest) = pull_local_with_config(base, "refused", &unsigned, &group, &["--trust", "t"]);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert_eq!(run.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("sign-api verification is enabled, but it carries no signature"),
+        "{stderr}"
+    );
+    assert_nothing_pulled(&dest, "refused");
+
+    let (run, dest) = pull_local_with_config(
+        base,
+        "origin",
+        &signed,
+        &group,
+        &["--trust=t", "--remote=origin"],
+    );
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert_eq!(run.status.code(), Some(0), "{stderr}");
+    assert_eq!(resolve(&dest, "origin:test/main").as_deref(), Some(COMMIT));
+    assert_eq!(resolve(&dest, BRANCH), None);
+}
+
+/// `pull-local --trust=nope` with no group of the name, and the empty name
+/// `--trust=`, are refused at exit 1. The destination gets no object and no
+/// ref.
+#[test]
+fn pull_local_trust_refuses_a_group_that_does_not_exist() {
+    let tmp = TmpDir::new("pull-local-trust-no-group");
+    let base = tmp.path();
+    let signed = trust_source(base, "signed", true);
+    for (name, switch, stderr) in [
+        (
+            "nope",
+            "--trust=nope",
+            "error: invalid input: the pull names the trust group 'nope', and the config \
+             has no [ex-ostrya trust \"nope\"] group\n",
+        ),
+        (
+            "empty",
+            "--trust=",
+            "error: invalid input: malformed trust group name '': the name is not empty, \
+             and holds no '\"' and no control character\n",
+        ),
+    ] {
+        let (run, dest) =
+            pull_local_with_config(base, name, &signed, &trust_group_alone(), &[switch]);
+        assert_eq!(run.status.code(), Some(1), "{switch}");
+        assert_eq!(String::from_utf8_lossy(&run.stderr), stderr, "{switch}");
+        assert_nothing_pulled(&dest, switch);
+    }
+}
+
+/// With `--trust`, the command refuses a switch that turns on a commit check
+/// at exit 1, with no remote and with a remote. `--sign-verify` needs
+/// `--remote`, and `clap` refuses it without. With no remote, the pull
+/// checks no summary, and refuses `--gpg-verify-summary`. `--no-sign-verify`
+/// needs `--remote` or `--trust`: with `--trust` alone it turns the sign-api
+/// check of the group off, so the pull takes an unsigned commit.
+#[test]
+fn pull_local_trust_refuses_a_switch_that_turns_on_a_commit_check() {
+    let tmp = TmpDir::new("pull-local-trust-switches");
+    let base = tmp.path();
+    let unsigned = trust_source(base, "unsigned", false);
+    let group = trust_group_alone();
+    let refusal = |check: &str| {
+        format!(
+            "error: invalid input: the pull takes its commit keys from \
+             [ex-ostrya trust \"t\"], so it cannot turn on {check} of the commits\n"
+        )
+    };
+    for (name, switches, stderr) in [
+        (
+            "gpg",
+            vec!["--trust=t", "--gpg-verify"],
+            refusal("the GPG check"),
+        ),
+        (
+            "sign",
+            vec!["--trust=t", "--remote=origin", "--sign-verify"],
+            refusal("the sign-api check"),
+        ),
+        (
+            "gpg-summary",
+            vec!["--trust=t", "--gpg-verify-summary"],
+            "error: pull: a signature check takes its keys from a remote's configuration, \
+             so the pull has to name a remote\n"
+                .to_owned(),
+        ),
+    ] {
+        let (run, dest) = pull_local_with_config(base, name, &unsigned, &group, &switches);
+        assert_eq!(run.status.code(), Some(1), "{switches:?}");
+        assert_eq!(String::from_utf8_lossy(&run.stderr), stderr, "{switches:?}");
+        assert_nothing_pulled(&dest, name);
+    }
+
+    for (name, switches) in [
+        ("sign-no-remote", vec!["--trust=t", "--sign-verify"]),
+        ("off-no-source", vec!["--no-sign-verify"]),
+    ] {
+        let (run, dest) = pull_local_with_config(base, name, &unsigned, &group, &switches);
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert_eq!(run.status.code(), Some(1), "{switches:?}: {stderr}");
+        assert!(
+            stderr.contains("the following required arguments were not provided")
+                && stderr.contains("--remote"),
+            "{switches:?}: {stderr}"
+        );
+        assert_nothing_pulled(&dest, name);
+    }
+
+    let (run, dest) = pull_local_with_config(
+        base,
+        "off",
+        &unsigned,
+        &group,
+        &["--trust=t", "--no-sign-verify"],
+    );
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert_eq!(run.status.code(), Some(0), "{stderr}");
+    assert_eq!(resolve(&dest, BRANCH).as_deref(), Some(COMMIT));
+}
+
+/// `--trust=t` wins over the key `trust` of the remote that `--remote`
+/// names. The key names no group, and the command does not read it.
+#[test]
+fn pull_local_trust_wins_over_the_remote_key() {
+    let tmp = TmpDir::new("pull-local-trust-wins");
+    let base = tmp.path();
+    let signed = trust_source(base, "signed", true);
+    let config = format!(
+        "\n[remote \"origin\"]\nurl=file:///nonexistent\ntrust=nope\n{}",
+        trust_group_alone()
+    );
+    let (run, dest) = pull_local_with_config(
+        base,
+        "wins",
+        &signed,
+        &config,
+        &["--remote=origin", "--trust=t"],
+    );
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert_eq!(run.status.code(), Some(0), "{stderr}");
+    assert_eq!(resolve(&dest, "origin:test/main").as_deref(), Some(COMMIT));
+}
+
 /// `clap` refuses each sign switch of `pull-local` with no `--remote`, with a
 /// value, and together with its off switch, at exit 1. The refusal comes
 /// before the command opens the source, so the source path names nothing, and

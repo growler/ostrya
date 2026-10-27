@@ -2803,7 +2803,9 @@ The receive path of a server reads the client groups, the server group, the
 trust groups, and the key groups from `<repo>/config`. It also reads
 `[ex-ostrya] detached-metadata-exclude` and `[core] auto-update-summary` from
 `<repo>/config`. A pull from a remote with the key `trust` reads the one trust
-group that the key names.
+group that the key names. A pull with `PullOptions::trust_group`, which
+`ostrya pull-local --trust=NAME` sets, reads the one trust group that the
+field names, and does not read the key `trust`.
 
 The tool gives a quote no meaning in a group name, so the port splits the name
 of a group itself. The server group has the exact name `ex-ostrya server`. The

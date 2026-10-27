@@ -14559,9 +14559,9 @@ outcome: refused-both
 severity: interop
 evidence: ostrya_cli::cli::pull_local_off_switches_need_a_remote
 spec: cli-surface.md#p2----options-missing-from-commands-that-exist
-note: the port's switch needs `--remote`, and `clap` refuses it before the
- command opens the source. The tool refuses the switch as an unknown option.
- Neither side writes an object or a ref.
+note: the port's switch needs `--remote` or `--trust`, and `clap` refuses it
+ before the command opens the source. The tool refuses the switch as an
+ unknown option. Neither side writes an object or a ref.
 
 family: M10
 subcommand: pull-local
@@ -14603,9 +14603,9 @@ outcome: refused-both
 severity: interop
 evidence: ostrya_cli::cli::pull_local_off_switches_need_a_remote
 spec: cli-surface.md#p2----options-missing-from-commands-that-exist
-note: the port's switch needs `--remote`, and `clap` refuses it before the
- command opens the source. The tool refuses the switch as an unknown option.
- Neither side writes an object or a ref.
+note: the port's switch needs `--remote` or `--trust`, and `clap` refuses it
+ before the command opens the source. The tool refuses the switch as an
+ unknown option. Neither side writes an object or a ref.
 
 family: M10
 subcommand: pull-local
@@ -14830,6 +14830,46 @@ note: the setup configures no remote, so the cited tests build each remote
  and its keys. A run here gets no trusted key, and the cells
  `pull-local/sign-verify-no-key` and `pull-local/sign-verify-summary-no-key`
  record that refusal.
+
+family: M10
+subcommand: pull-local
+cell: pull-local/trust-no-group
+src-mode: archive
+dst-mode: bare-user
+setup: src-dst
+run: pull-local --repo=$DST --trust=t $SRC conformance
+expect-exit: 1
+expect-stdout: empty
+expect-stderr: contains "the pull names the trust group 't', and the config has no"
+ref-expect-exit: 1
+ref-expect-stdout: empty
+ref-expect-stderr: contains "Unknown option --trust"
+oracle: exit-status refs-bytes inventory
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::pull_local_trust_refuses_a_group_that_does_not_exist
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: `$DST` holds no trust group, so the port refuses the option before it
+ reads a ref or an object of the source. The tool refuses the option as an
+ unknown option. Neither side writes an object or a ref.
+
+family: M10
+subcommand: pull-local
+cell: pull-local/trust-extension
+setup: src-dst
+outcome: lossy
+severity: interop
+loss: the tool has no `pull-local --trust`; it refuses the option with
+ `error: Unknown option --trust=NAME` at exit 1 and writes nothing. The
+ port's option is an extension. It takes the keys of the commits from the
+ trust group `[ex-ostrya trust "NAME"]`, and needs no `--remote`. The port
+ pulls a commit of a key of the group at exit 0 (`cli-surface.md`, "P2",
+ `pull-local`).
+evidence: ostrya_cli::cli::pull_local_trust_checks_the_commits
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: the setup configures no trust group, so the cited test builds the group
+ and its key. A run here gets no group, and the cell
+ `pull-local/trust-no-group` records that refusal.
 
 family: M10
 subcommand: pull-local

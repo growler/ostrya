@@ -773,6 +773,43 @@ fn the_keys_of_the_selected_remote_apply() {
     });
 }
 
+/// The trust group option applies to the pull from each remote. The group
+/// trusts one key, and the remote section names no key. An unsigned commit
+/// fails the pull, and a commit of the key of the group passes.
+#[test]
+fn a_collection_pull_takes_the_trust_group_option() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-trust-group");
+        let a = create(dir.path(), "a", Some(ID)).await;
+        let tip = commit(&a, dir.path(), "a", None, REF, FIXED_TS, BOUND).await;
+        summarize(&a).await;
+        let server = RepoServer::start(&dir.path().join("a"), false).await;
+        let group = format!(
+            "[ex-ostrya trust \"t\"]\nsign-verify=ed25519\nverification-ed25519-key={PUBLIC_B64}\n"
+        );
+        let dest = dest(dir.path(), None, &[("a", &server.url(), &group)]).await;
+        let pull = || {
+            let (mut opts, _) = options(&[REF]);
+            opts.pull.trust_group = Some("t".to_owned());
+            dest.pull_collection(ID, &["a"], opts)
+        };
+
+        let err = pull().await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m) if m.contains("carries no signature")),
+            "{err:?}"
+        );
+        assert_nothing_written(&dest).await;
+
+        a.sign_commit(&tip, &Ed25519Signer::from_base64(SECRET_B64).unwrap())
+            .await
+            .unwrap();
+        let pulled = pull().await.unwrap();
+        assert_eq!(pulled.refs[0].remote, "a");
+        assert_eq!(mirror(&dest, REF).await, Some(tip));
+    });
+}
+
 // --- the place of the refs ---------------------------------------------------
 
 /// Into a repository whose own collection id is the pulled id, the pull

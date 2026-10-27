@@ -25,7 +25,12 @@ With none, the pull takes every local ref of the source, under \fB\%refs/heads\f
 \fB\-\-remote\fR \fIREMOTE\fR
 Write the pulled refs under this remote name.
 .IP
-The refs go to \fB\%refs/remotes/<remote>/<ref>\fR\&. Without this option, they are local refs. The verification keys of the \fB\%[remote "NAME"]\fR group apply to the pull, as they apply to \fB\%ostrya pull\fR (see \%ostrya\-config(1)). If the config has no group for the name, the pull makes only the checks that its switches ask for. Each switch wins over its key: \%\-\-gpg\-verify, \%\-\-gpg\-verify\-summary, \%\-\-sign\-verify, and \%\-\-sign\-verify\-summary turn a check on, and \%\-\-no\-gpg\-verify, \%\-\-no\-gpg\-verify\-summary, \%\-\-no\-sign\-verify, and \%\-\-no\-sign\-verify\-summary turn a configured check off. If the remote has the key \fB\%trust\fR, the keys of the commits come from its trust group. The command then refuses \%\-\-gpg\-verify and \%\-\-sign\-verify, and \%\-\-no\-gpg\-verify and \%\-\-no\-sign\-verify turn off that check of the group.
+The refs go to \fB\%refs/remotes/<remote>/<ref>\fR\&. Without this option, they are local refs. The verification keys of the \fB\%[remote "NAME"]\fR group apply to the pull, as they apply to \fB\%ostrya pull\fR (see \%ostrya\-config(1)). If the config has no group for the name, the pull makes only the checks that its switches ask for. Each switch wins over its key: \%\-\-gpg\-verify, \%\-\-gpg\-verify\-summary, \%\-\-sign\-verify, and \%\-\-sign\-verify\-summary turn a check on, and \%\-\-no\-gpg\-verify, \%\-\-no\-gpg\-verify\-summary, \%\-\-no\-sign\-verify, and \%\-\-no\-sign\-verify\-summary turn a configured check off. If the remote has the key \fB\%trust\fR, or if \%\-\-trust is given, the keys of the commits come from the trust group. The command then refuses \%\-\-gpg\-verify and \%\-\-sign\-verify, and \%\-\-no\-gpg\-verify and \%\-\-no\-sign\-verify turn off that check of the group.
+.TP
+\fB\-\-trust\fR \fINAME\fR
+Take the keys of the commits from the trust group \fB\%[ex\-ostrya trust "NAME"]\fR (see \%ostrya\-config(1)).
+.IP
+The option wins over the key \fB\%trust\fR of the remote that \%\-\-remote names. It needs no \%\-\-remote, and \%\-\-remote still names the refs. With \%\-\-remote, the summary keys of the remote apply, and the command refuses a key of the remote that turns on a commit check. Without \%\-\-remote, the pull checks no summary, and the command refuses \%\-\-gpg\-verify\-summary. The command refuses \%\-\-gpg\-verify and \%\-\-sign\-verify, and \%\-\-no\-gpg\-verify and \%\-\-no\-sign\-verify turn off that check of the group.
 .TP
 \fB\-\-depth\fR \fIDEPTH\fR
 The number of parents of each pulled commit to follow.
@@ -93,7 +98,7 @@ The switch selects every engine of this build, and takes the keys that \%\-\-sig
 \fB\-\-no\-gpg\-verify\fR
 Do not require a GPG signature on the commits.
 .IP
-The switch turns off the \fB\%gpg\-verify\fR key of the remote that \%\-\-remote names. If the remote has the key \fB\%trust\fR, the switch turns off the GPG check of its trust group. It needs \%\-\-remote and conflicts with \%\-\-gpg\-verify.
+The switch turns off the \fB\%gpg\-verify\fR key of the remote that \%\-\-remote names. With \%\-\-trust, or if the remote has the key \fB\%trust\fR, the switch turns off the GPG check of the trust group. It needs \%\-\-remote or \%\-\-trust, and conflicts with \%\-\-gpg\-verify.
 .TP
 \fB\-\-no\-gpg\-verify\-summary\fR
 Do not require a GPG signature on the summary of the source.
@@ -103,7 +108,7 @@ The switch turns off the \fB\%gpg\-verify\-summary\fR key of the remote that \%\
 \fB\-\-no\-sign\-verify\fR
 Do not require an \%ed25519 or spki signature on the commits.
 .IP
-The switch turns off the \fB\%sign\-verify\fR key of the remote that \%\-\-remote names. If the remote has the key \fB\%trust\fR, the switch turns off the \%sign\-api check of its trust group. It needs \%\-\-remote and conflicts with \%\-\-sign\-verify.
+The switch turns off the \fB\%sign\-verify\fR key of the remote that \%\-\-remote names. With \%\-\-trust, or if the remote has the key \fB\%trust\fR, the switch turns off the \%sign\-api check of the trust group. It needs \%\-\-remote or \%\-\-trust, and conflicts with \%\-\-sign\-verify.
 .TP
 \fB\-\-no\-sign\-verify\-summary\fR
 Do not require an \%ed25519 or spki signature on the summary of the source.

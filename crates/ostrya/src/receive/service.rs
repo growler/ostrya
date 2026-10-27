@@ -179,8 +179,9 @@ impl ReceiveService {
     /// - [`remote::Error::ModeRefused`] if the repository mode is `bare` and the
     ///   process does not run as root.
     /// - [`Error::Core`] or [`Error::InvalidFormat`] if `[core] fsync`,
-    ///   `[core] per-object-fsync`, `[ex-integrity] fsverity`, or, in an
-    ///   archive repository, `[archive] zlib-level` holds a malformed value.
+    ///   `[core] per-object-fsync`, `[ex-integrity] fsverity`,
+    ///   `[ex-ostrya] keep-detached-related`, or, in an archive repository,
+    ///   `[archive] zlib-level` holds a malformed value.
     /// - An I/O error from the file system, if a read of the staging
     ///   directory or of the refs of `Hello` fails.
     pub async fn hello(
@@ -261,7 +262,8 @@ impl ReceiveService {
     ///   [`hello`](Self::hello) states.
     /// - The open of the session transaction.
     /// - The reads of `[core] fsync`, `[core] per-object-fsync`,
-    ///   `[ex-integrity] fsverity`, and `[archive] zlib-level`.
+    ///   `[ex-integrity] fsverity`, `[ex-ostrya] keep-detached-related`, and
+    ///   `[archive] zlib-level`.
     /// - The refusal of a `bare` repository if the process does not run as
     ///   root.
     ///

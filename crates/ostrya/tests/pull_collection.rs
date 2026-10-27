@@ -902,6 +902,45 @@ fn the_timestamp_check_reads_the_collection_ref() {
     });
 }
 
+// --- detached metadata -------------------------------------------------------
+
+/// With `keep-detached-related=false` in the destination, the pull drops
+/// `ostrya.related` from the detached metadata that it stores, and stores
+/// each other property.
+#[test]
+fn the_switch_drops_the_related_key_of_a_collection_pull() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-keep-related");
+        let a = create(dir.path(), "a", Some(ID)).await;
+        let base = commit(&a, dir.path(), "base", None, "os/base", FIXED_TS, BOUND).await;
+        let tip = commit(&a, dir.path(), "a", None, REF, FIXED_TS, BOUND).await;
+        let kept = Value::Array(vec![entry("test.kept", "s", Value::Str("a".to_owned()))]);
+        a.write_commit_detached_metadata(&tip, Some(&kept))
+            .await
+            .unwrap();
+        a.add_detached_related(&tip, "layer/base", &base)
+            .await
+            .unwrap();
+        summarize(&a).await;
+        let server_a = RepoServer::start(&dir.path().join("a"), false).await;
+        drop(dest(dir.path(), None, &[("a", &server_a.url(), "")]).await);
+        let dest = reconfigure(dir.path(), "\n[ex-ostrya]\nkeep-detached-related=false\n").await;
+        assert!(!dest.config().keep_detached_related().unwrap());
+
+        let (opts, _) = options(&[REF]);
+        dest.pull_collection(ID, &["a"], opts).await.unwrap();
+
+        assert_eq!(mirror(&dest, REF).await, Some(tip));
+        let stored = dest
+            .read_commit_detached_metadata(&tip)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(stored.dict_get("test.kept").is_some(), "{stored:?}");
+        assert!(stored.dict_get("ostrya.related").is_none(), "{stored:?}");
+    });
+}
+
 // --- refusals ----------------------------------------------------------------
 
 /// The pull refuses each option that it cannot carry before its first

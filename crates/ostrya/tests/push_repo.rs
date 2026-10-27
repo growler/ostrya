@@ -933,6 +933,47 @@ fn the_filter_drops_the_excluded_keys_from_the_detached_metadata() {
     assert!(stored.dict_get("xa.drop").is_none());
 }
 
+/// With `keep-detached-related=false` in the config of the server, the
+/// session drops `ostrya.related` from the incoming dict and stores each other
+/// property. The client sends the key: the server reads its own switch.
+#[test]
+fn the_switch_of_the_server_drops_the_related_key() {
+    let pair = Pair::new(
+        "keep-related",
+        RepoMode::Archive,
+        RepoMode::Archive,
+        "\n[ex-ostrya]\nkeep-detached-related=false\n",
+    );
+    let c1 = commit(&pair.client, "main", None, "c1", None);
+    let c2 = commit(&pair.client, "main", Some(c1), "c2", None);
+    let mut builder = DictBuilder::new();
+    builder.insert_str("xa.keep", "kept");
+    let detached = builder.build();
+    block_on(async {
+        pair.client
+            .write_commit_detached_metadata(&c2, Some(&detached))
+            .await
+            .unwrap();
+        pair.client
+            .add_detached_related(&c2, "layer/base", &c1)
+            .await
+            .unwrap();
+    });
+    let held = block_on(pair.client.read_commit_detached_metadata(&c2))
+        .unwrap()
+        .unwrap();
+    assert!(held.dict_get("ostrya.related").is_some());
+
+    let (report, outcome) = push(&pair, opts(&["main"]));
+    report.unwrap();
+    outcome.unwrap();
+
+    assert_eq!(
+        block_on(pair.server.read_commit_detached_metadata(&c2)).unwrap(),
+        Some(detached)
+    );
+}
+
 /// A push whose filter keeps each property stores the `.commitmeta` bytes of
 /// the client unchanged on the server.
 #[test]

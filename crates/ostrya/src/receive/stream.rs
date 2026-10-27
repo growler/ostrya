@@ -96,8 +96,9 @@ impl Repo {
     /// - The errors of [`Repo::transaction`] if the session transaction cannot
     ///   open. These include [`Error::LockTimeout`] for the repository lock.
     /// - [`Error::Core`] or [`Error::InvalidFormat`] if `[core] fsync`,
-    ///   `[core] per-object-fsync`, `[ex-integrity] fsverity`, or
-    ///   `[archive] zlib-level` is malformed.
+    ///   `[core] per-object-fsync`, `[ex-integrity] fsverity`,
+    ///   `[ex-ostrya] keep-detached-related`, or `[archive] zlib-level` is
+    ///   malformed.
     /// - The errors of an object stream that [`Repo::receive`] lists:
     ///   `checksum-mismatch`, `mode-refused`, `limit-exceeded`, `protocol`,
     ///   and the wire code of the frame decoder.

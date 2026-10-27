@@ -2813,8 +2813,8 @@ remote. "The push token file of a client" states the grammar of the file that
 
 The receive path of a server reads the client groups, the server group, the
 trust groups, and the key groups from `<repo>/config`. It also reads
-`[ex-ostrya] detached-metadata-exclude` and `[core] auto-update-summary` from
-`<repo>/config`. A pull from a remote with the key `trust` reads the one trust
+`[ex-ostrya] detached-metadata-exclude`, `[ex-ostrya] keep-detached-related`,
+and `[core] auto-update-summary` from `<repo>/config`. A pull from a remote with the key `trust` reads the one trust
 group that the key names. A pull with `PullOptions::trust_group`, which
 `ostrya pull-local --trust=NAME` sets, reads the one trust group that the
 field names, and does not read the key `trust`.
@@ -2831,8 +2831,8 @@ SERVER GROUPS", states the refusals of a group name. "Ref patterns" states the
 grammar of a pattern of an allow item and of a deny item.
 
 No key changes the encoding or the checksum of an object.
-`detached-metadata-exclude` and the key `sign` of a client group change the
-bytes of a `.commitmeta` file. The commit checksum does not cover detached
+`detached-metadata-exclude`, `keep-detached-related`, and the key `sign` of a
+client group change the bytes of a `.commitmeta` file. The commit checksum does not cover detached
 metadata, so these keys change no commit checksum.
 
 Observed behavior: the tool keeps the `[ex-ostrya]` group and the groups
@@ -2943,6 +2943,47 @@ the key.
 
 A reader of the build sources reads the first `ostrya.related` entry of the
 dict.
+
+### The switch of the destination
+
+`[ex-ostrya] keep-detached-related` is a boolean with the default `true`. If
+it is `false`, each transfer that writes into the repository drops
+`ostrya.related` from each detached metadata dict that it stores:
+
+- a pull from a remote, also through a static delta;
+- a local pull;
+- a receive: the push session and the one-way stream;
+- a push to a bucket repository.
+
+The repository that stores the dict reads its own switch. A push to a bucket
+reads the key from the `config` of the bucket. The sender has no option for
+the key. A distribution repository sets `false`.
+
+The switch applies together with `detached-metadata-exclude`. Under `false`,
+the filter of that key gets no call for `ostrya.related`. The transfer then
+parses each `.commitmeta` that it stores, so a `.commitmeta` that is not an
+`a{sv}` dict fails the transfer.
+
+A pull, also a local pull and a pull through a static delta, and a push to
+a bucket replace the whole stored `.commitmeta` with the filtered dict. So a
+stored `ostrya.related` value stays only if the filtered dict is empty. If
+`ostrya.related` is the only key of a dict, the transfer writes nothing for
+the commit, and the destination keeps the `.commitmeta` that it holds. A
+receive merges the incoming dict into the stored dict, so a stored
+`ostrya.related` value stays.
+
+A local write ignores the switch and stores `ostrya.related`: a commit write,
+`Repo::write_commit_detached_metadata`, the commit of a transaction,
+`Repo::add_detached_related`, `Transaction::add_detached_related`, and a
+signature. The host entries of the receive hooks are local writes of the
+server, and the switch does not apply to them. The offline apply of a static
+delta writes no detached metadata, so the switch does not apply to it.
+
+A value that is not a boolean fails each transfer that reads it before the
+transfer writes an object or a ref. A pull fails before its first request,
+and a receive fails at `Hello` with `internal`. A push to a bucket fails
+before it uploads an object or a ref file, and changes nothing in the bucket
+but the probe key of the writer lock ("The config of a bucket repository").
 
 ### The local prune
 
@@ -3473,8 +3514,9 @@ this order:
    `[core] min-free-space-percent`, and `[core] min-free-space-size`. A
    malformed value is `internal`.
 2. The server reads `[core] fsync`, `[core] per-object-fsync`,
-   `[ex-integrity] fsverity`, and, in an `archive` repository,
-   `[archive] zlib-level`. A malformed value is `internal`.
+   `[ex-integrity] fsverity`, `[ex-ostrya] keep-detached-related`, and, in
+   an `archive` repository, `[archive] zlib-level`. A malformed value is
+   `internal`.
 3. In a `bare` repository, a new file in the staging directory must get the
    owner uid 0. Only root can store the owner of each file. Else the session
    is `mode-refused`.
@@ -3654,15 +3696,17 @@ Each failed check ends the session, and the session writes nothing:
 8. A new commit that the client built must pass the signature verification
    of the client group, else `signature-required`. The verification reads the stored detached
    metadata of the commit and the incoming dict together, before the
-   `detached-metadata-exclude` filter of step 9. A group with no `verify`
+   `detached-metadata-exclude` filter and the switch of step 9. A group with no `verify`
    checks no signature. A group with `verify=trust:NAME` checks each axis of
    the trust group. With `allow-unsigned=true`, a commit whose dict holds no
    blob under `ostree.gpgsigs`, `ostree.sign.ed25519`, `ostree.sign.spki`, and
    `ostree.sign.dummy` passes. A commit with a blob under one of these keys
    must pass the check, so a signature of an engine that the trust group does
    not read fails.
-9. The server applies the `detached-metadata-exclude` filter, makes the
-   staged objects durable, and signs each new commit one time with each key
+9. The server applies the `detached-metadata-exclude` filter. If
+   `[ex-ostrya] keep-detached-related` is `false`, it also drops
+   `ostrya.related` from each incoming dict ("The switch of the
+   destination"). The server then makes the staged objects durable, and signs each new commit one time with each key
    of the key `sign` of the client group. It walks the history of each update
    that needs the fast-forward check. The walk starts at the new commit and
    follows the parents until it reaches the commit of the ref, an absent
@@ -5960,9 +6004,10 @@ repository never changes.
 A writer refuses a `config` that does not parse as a repository config,
 that states a mode other than `archive-z2` and `archive`, whose
 `collection-id` fails the collection id rule or is longer than 255 bytes,
-whose `tombstone-commits` or `indexed-deltas` is not a boolean, or whose
-`zlib-level` is not an integer. The refusal changes nothing in the bucket
-but the probe key of the writer lock.
+whose `tombstone-commits`, `indexed-deltas`, or `[ex-ostrya]
+keep-detached-related` is not a boolean, or whose `zlib-level` is not an
+integer. The refusal changes nothing in the bucket but the probe key of the
+writer lock.
 The summary takes `mode`, `tombstone-commits`, `indexed-deltas`, and
 `collection-id` of `[core]` ("The summary of a bucket repository").
 
@@ -5970,6 +6015,11 @@ A push builds each `.filez` that it uploads at the `[archive] zlib-level`
 of the `config`, as a local `archive` repository writes its `.filez`
 objects. A `config` with no `zlib-level` gives the level 6. A value outside
 1 to 9 is clamped to that range, as for a local repository.
+
+A push reads `[ex-ostrya] keep-detached-related` of the `config`, with the
+default `true`. If it is `false`, the push drops `ostrya.related` from each
+`.commitmeta` that it uploads ("The switch of the destination"). The init
+writes no `[ex-ostrya]` group.
 
 ### Object uploads
 
@@ -6202,7 +6252,9 @@ are:
    the `.commitmeta` of each commit that the bucket lacks and of each source
    commit, at most `max_outstanding` uploads at a time. The bytes of a
    `.commitmeta` are the stored `.commitmeta` without the keys that the
-   detached metadata filter of the push removes. The push skips a
+   detached metadata filter of the push removes, and without
+   `ostrya.related` if `[ex-ostrya] keep-detached-related` of the `config`
+   of the bucket is `false`. The push skips a
    `.commitmeta` that the bucket holds with the same bytes: the listing
    holds its key with the same size, and a read of the key gives the same
    bytes. A commit with no detached metadata after the filter uploads

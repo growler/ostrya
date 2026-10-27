@@ -62,7 +62,7 @@ use super::{
     CheckedMeta, DetachedMetadataFilter, ModeChecks, PullCounters, PullFlags, PullOptions,
     PullStats, PullVerify, READ_CHUNK, RefPlace, TimestampBase, TipChecks, apply_durability,
     check_commit_signatures_filtered, check_depth, check_remote_option, check_static_deltas,
-    check_tip_refs, refuse_remote_collection, take_static_deltas,
+    check_tip_refs, keep_related, refuse_remote_collection, take_static_deltas,
 };
 
 /// The number of fetched content objects that stream into the object store at
@@ -229,6 +229,13 @@ impl Repo {
     /// object arrives, so no `.commitmeta` stays for a parent that the remote
     /// answers 404 for. [`pull_local`](Repo::pull_local) states when the
     /// transaction writes it and what a failure leaves.
+    ///
+    /// The pull stores the properties that
+    /// [`detached_metadata_filter`](PullOptions::detached_metadata_filter)
+    /// allows. If `[ex-ostrya] keep-detached-related` of this repository is
+    /// `false`
+    /// ([`RepoConfig::keep_detached_related`](crate::RepoConfig::keep_detached_related)),
+    /// the pull also drops `ostrya.related`, also through a static delta.
     ///
     /// # Composefs image
     ///
@@ -472,6 +479,8 @@ impl Repo {
     ///   one delta, or is set together with
     ///   [`disable_static_deltas`](PullOptions::disable_static_deltas) or with
     ///   [`subpaths`](PullOptions::subpaths).
+    /// - [`Error::Core`] if `[ex-ostrya] keep-detached-related` of this
+    ///   repository is not a boolean.
     /// - The errors of [`resolve_pull`]. Among them, [`Error::Io`] names the
     ///   key and the path of a PEM file that cannot be read, and a PEM file
     ///   over 1 MiB is [`Error::InvalidInput`].
@@ -600,6 +609,7 @@ impl Repo {
         refuse_remote_collection(&opts)?;
         check_remote_option(&opts)?;
         check_static_deltas(&opts)?;
+        keep_related(self, &mut opts)?;
         let edges = take_static_deltas(&mut opts).await?;
         // The endpoint is resolved first, so a remote the config does not
         // describe reports that before a policy is resolved for it.
@@ -639,7 +649,7 @@ impl Repo {
     ///
     /// The pull reads no remote section and no trust group of the config of
     /// this repository. It reads the `[core]` keys that each transaction
-    /// reads.
+    /// reads, and `[ex-ostrya] keep-detached-related`.
     ///
     /// # Refs
     ///
@@ -691,6 +701,8 @@ impl Repo {
     /// ref. It calls [`PullSession::finish`] before it returns the error, and
     /// ignores the result of that call.
     ///
+    /// - [`Error::Core`] if `[ex-ostrya] keep-detached-related` of this
+    ///   repository is not a boolean.
     /// - [`Error::Pull`] if a subpath does not start with `/`.
     /// - [`Error::InvalidInput`] if [`depth`](PullOptions::depth) is below
     ///   `-1`.
@@ -750,7 +762,11 @@ impl Repo {
         mut opts: PullOptions,
     ) -> Result<PullStats> {
         let started = Instant::now();
-        let (subpaths, edges) = match check_session_pull(&mut opts).await {
+        let checked = match keep_related(self, &mut opts) {
+            Ok(()) => check_session_pull(&mut opts).await,
+            Err(e) => Err(e),
+        };
+        let (subpaths, edges) = match checked {
             Ok(checked) => checked,
             Err(e) => {
                 // The refusal comes before the first request. The result of

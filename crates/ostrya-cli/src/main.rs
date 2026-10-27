@@ -376,7 +376,9 @@ enum Command {
     /// ref under `refs/remotes/<remote>/`, or under `refs/heads/` with
     /// --mirror. It verifies the signatures that the config of the remote or
     /// the verify options ask for. The pull does not store the detached
-    /// metadata keys that `[ex-ostrya] detached-metadata-exclude` names.
+    /// metadata keys that `[ex-ostrya] detached-metadata-exclude` names. With
+    /// `[ex-ostrya] keep-detached-related=false`, it also drops
+    /// `ostrya.related`.
     ///
     /// On success, the command prints one statistics line to standard output.
     /// If standard output is a terminal, a progress line shows while the pull
@@ -390,7 +392,9 @@ enum Command {
     /// repository. The pull writes local refs, or remote refs under --remote.
     /// With --remote, the verification keys of the remote apply to the pull.
     /// It drops the detached metadata keys that
-    /// `[ex-ostrya] detached-metadata-exclude` names.
+    /// `[ex-ostrya] detached-metadata-exclude` names. With
+    /// `[ex-ostrya] keep-detached-related=false`, it also drops
+    /// `ostrya.related`.
     ///
     /// On success, the command prints one statistics line to standard output:
     /// `M metadata, C content objects imported; SIZE content written`. Under
@@ -442,7 +446,9 @@ enum Command {
     /// transaction. Over ssh, the push runs the ssh client with the receive
     /// command on the remote side. Over HTTP, the push sends its requests to
     /// the receive endpoint of `ostrya serve`. The push drops the detached
-    /// metadata keys that `[ex-ostrya] detached-metadata-exclude` names.
+    /// metadata keys that `[ex-ostrya] detached-metadata-exclude` names. To an
+    /// `s3://` address, the push reads `[ex-ostrya] keep-detached-related` from
+    /// the `config` of the bucket, and with `false` drops `ostrya.related`.
     ///
     /// The collection bindings of the source commits, or --collection, give
     /// the namespace of the push on the server: the local refs or one

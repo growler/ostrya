@@ -203,6 +203,9 @@ impl<P: Deref<Target: SessionPolicy + Sized>> SessionCore<P> {
         // can fail on it.
         txn.fsync_flags().map_err(Failure::Internal)?;
         repo.config().fsverity().map_err(Failure::Internal)?;
+        repo.config()
+            .keep_detached_related()
+            .map_err(Failure::Internal)?;
         if mode.is_archive() {
             repo.config().zlib_level().map_err(Failure::Internal)?;
         }

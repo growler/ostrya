@@ -848,6 +848,19 @@ fn an_absent_or_bad_config_is_a_config_error() {
         );
         // The other checks still run.
         assert_eq!(report.commits_checked, 3);
+        f.put(
+            "config",
+            b"[core]\nrepo_version=1\nmode=archive-z2\n\
+              [ex-ostrya]\nkeep-detached-related=maybe\n",
+        );
+        let report = f.fsck().await;
+        let found = &report.findings[0];
+        assert_eq!(found.kind, Config);
+        assert!(
+            found.detail.contains("no boolean") && found.detail.contains("keep-detached-related"),
+            "{found}"
+        );
+        assert!(report.has_errors());
     });
 }
 

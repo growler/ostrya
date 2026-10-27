@@ -2456,6 +2456,225 @@ fn a_filter_that_skips_everything_keeps_the_destinations_own_metadata() {
     });
 }
 
+/// Appends `[ex-ostrya] keep-detached-related=VALUE` to the config of the
+/// repository at `dir`, and opens the repository again.
+async fn with_keep_related(dir: &Path, value: &str) -> Repo {
+    let config = dir.join("config");
+    let mut text = std::fs::read_to_string(&config).unwrap();
+    text.push_str(&format!("\n[ex-ostrya]\nkeep-detached-related={value}\n"));
+    std::fs::write(&config, text).unwrap();
+    Repo::open(dir).await.unwrap()
+}
+
+/// Returns the keys of the stored detached metadata of a commit, in order.
+async fn detached_keys(repo: &Repo, commit: &Checksum) -> Vec<String> {
+    let Some(Value::Array(entries)) = repo.read_commit_detached_metadata(commit).await.unwrap()
+    else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .map(|entry| entry.as_tuple().unwrap()[0].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// With `keep-detached-related=false` in the destination, the pull drops
+/// `ostrya.related` and stores each other property.
+#[test]
+fn the_switch_drops_the_related_key_and_keeps_the_rest() {
+    let tmp = TmpDir::new("pull-keep-related-false");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, c1, c2) = source_repo(base, RepoMode::Archive).await;
+        src.write_commit_detached_metadata(&c2, Some(&two_property_metadata()))
+            .await
+            .unwrap();
+        src.add_detached_related(&c2, "layer/base", &c1)
+            .await
+            .unwrap();
+        assert_eq!(
+            detached_keys(&src, &c2).await,
+            ["ostree.gpgsigs", "build.gc-roots", "ostrya.related"]
+        );
+
+        let (dst_dir, _dst) = make_repo(base, "dst", RepoMode::Archive).await;
+        let dst = with_keep_related(&dst_dir, "false").await;
+        dst.pull_local(
+            &src,
+            PullOptions {
+                refs: vec!["main".to_owned()],
+                ..PullOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            dst.read_commit_detached_metadata(&c2).await.unwrap(),
+            Some(two_property_metadata())
+        );
+    });
+}
+
+/// The switch and the filter of the options apply together. The pull does
+/// not call the filter for `ostrya.related`.
+#[test]
+fn the_switch_and_the_filter_apply_together() {
+    let tmp = TmpDir::new("pull-keep-related-filter");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, c1, c2) = source_repo(base, RepoMode::Archive).await;
+        src.write_commit_detached_metadata(&c2, Some(&two_property_metadata()))
+            .await
+            .unwrap();
+        src.add_detached_related(&c2, "layer/base", &c1)
+            .await
+            .unwrap();
+
+        let (dst_dir, _dst) = make_repo(base, "dst", RepoMode::Archive).await;
+        let dst = with_keep_related(&dst_dir, "false").await;
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let record = Arc::clone(&seen);
+        let filter = DetachedMetadataFilter::new(move |_, key, _| {
+            record.lock().unwrap().push(key.to_owned());
+            if key == "ostree.gpgsigs" {
+                FilterResult::Skip
+            } else {
+                FilterResult::Allow
+            }
+        });
+        dst.pull_local(
+            &src,
+            PullOptions {
+                refs: vec!["main".to_owned()],
+                detached_metadata_filter: filter,
+                ..PullOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(detached_keys(&dst, &c2).await, ["build.gc-roots"]);
+        assert_eq!(*seen.lock().unwrap(), ["ostree.gpgsigs", "build.gc-roots"]);
+    });
+}
+
+/// A dict that holds `ostrya.related` alone gives nothing to store under the
+/// switch. The destination keeps the `.commitmeta` that it holds.
+#[test]
+fn the_switch_keeps_the_destinations_own_metadata() {
+    let tmp = TmpDir::new("pull-keep-related-own");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, c1, c2) = source_repo(base, RepoMode::Archive).await;
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+        dst.pull_local(
+            &src,
+            PullOptions {
+                refs: vec!["main".to_owned()],
+                ..PullOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        let local = dict_of("local.signature", "the destination's own");
+        dst.write_commit_detached_metadata(&c2, Some(&local))
+            .await
+            .unwrap();
+        let before = std::fs::read(commitmeta_path(&dst_dir, &c2)).unwrap();
+        src.add_detached_related(&c2, "layer/base", &c1)
+            .await
+            .unwrap();
+        assert_eq!(detached_keys(&src, &c2).await, ["ostrya.related"]);
+
+        let dst = with_keep_related(&dst_dir, "false").await;
+        dst.pull_local(
+            &src,
+            PullOptions {
+                refs: vec!["main".to_owned()],
+                ..PullOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            std::fs::read(commitmeta_path(&dst_dir, &c2)).unwrap(),
+            before,
+            "the destination's own detached metadata stands"
+        );
+    });
+}
+
+/// With the default switch, the pull stores the `.commitmeta` of the source
+/// byte for byte, `ostrya.related` included. `true` gives the same result.
+#[test]
+fn the_default_switch_keeps_the_related_key() {
+    for value in [None, Some("true")] {
+        let tmp = TmpDir::new("pull-keep-related-default");
+        block_on(async {
+            let base = tmp.path();
+            let (src_dir, src, c1, c2) = source_repo(base, RepoMode::Archive).await;
+            src.write_commit_detached_metadata(&c2, Some(&two_property_metadata()))
+                .await
+                .unwrap();
+            src.add_detached_related(&c2, "layer/base", &c1)
+                .await
+                .unwrap();
+
+            let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+            let dst = match value {
+                Some(value) => with_keep_related(&dst_dir, value).await,
+                None => dst,
+            };
+            dst.pull_local(
+                &src,
+                PullOptions {
+                    refs: vec!["main".to_owned()],
+                    ..PullOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(
+                std::fs::read(commitmeta_path(&dst_dir, &c2)).unwrap(),
+                std::fs::read(commitmeta_path(&src_dir, &c2)).unwrap(),
+                "{value:?}: the stored bytes are the source's, byte for byte"
+            );
+        });
+    }
+}
+
+/// A switch that is not a boolean fails the pull before it reads the source.
+/// The pull writes no object and no ref.
+#[test]
+fn a_switch_that_is_no_boolean_refuses_the_pull() {
+    let tmp = TmpDir::new("pull-keep-related-malformed");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, _c1, _c2) = source_repo(base, RepoMode::Archive).await;
+        let (dst_dir, _dst) = make_repo(base, "dst", RepoMode::Archive).await;
+        let dst = with_keep_related(&dst_dir, "maybe").await;
+
+        let err = dst
+            .pull_local(
+                &src,
+                PullOptions {
+                    refs: vec!["main".to_owned()],
+                    ..PullOptions::default()
+                },
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, Error::Core(_)), "{err}");
+        assert!(err.to_string().contains("keep-detached-related"), "{err}");
+        assert!(dst.list_refs(None).await.unwrap().is_empty());
+        assert!(dst.list_objects().await.unwrap().is_empty());
+    });
+}
+
 /// Returns an `a{sv}` with one string property.
 fn dict_of(key: &str, value: &str) -> Value {
     Value::Array(vec![Value::Tuple(vec![
@@ -6340,6 +6559,47 @@ fn depth_one_through_a_local_chain_under_verification() {
             src.read_commit_detached_metadata(&c).await.unwrap()
         );
         assert_eq!(dst.resolve_rev("origin:main", true).await.unwrap(), Some(d));
+    });
+}
+
+/// A pull through a chain of static deltas under verification applies the
+/// switch of the destination. Discovery filters the `.commitmeta` of each
+/// commit of the chain, and the pull stores each signature without
+/// `ostrya.related`.
+#[test]
+fn the_switch_applies_through_a_local_chain_under_verification() {
+    let tmp = TmpDir::new("pull-chain-keep-related");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, commits) = chain_source(base, &["a", "b", "c"]).await;
+        let [a, b, c] = commits[..] else {
+            unreachable!()
+        };
+        sign_commits(&src, &[a, b, c]).await;
+        for commit in [b, c] {
+            src.add_detached_related(&commit, "layer/base", &a)
+                .await
+                .unwrap();
+        }
+        let (list, _dirs) = chain_list(&src, &[(a, b), (b, c)]).await;
+        let (dst_dir, _dst) = signed_dst_holding(base, &src, &a).await;
+        let dst = with_keep_related(&dst_dir, "false").await;
+
+        dst.pull_local(&src, signed_chain_pull(list)).await.unwrap();
+
+        for commit in [b, c] {
+            assert_complete(&src, &dst, &dst_dir, &commit).await;
+            assert_eq!(
+                detached_keys(&src, &commit).await,
+                ["ostree.sign.ed25519", "ostrya.related"]
+            );
+            assert_eq!(detached_keys(&dst, &commit).await, ["ostree.sign.ed25519"]);
+            assert_eq!(
+                detached_property(&dst, &commit, "ostree.sign.ed25519").await,
+                detached_property(&src, &commit, "ostree.sign.ed25519").await
+            );
+        }
+        assert_eq!(dst.resolve_rev("origin:main", true).await.unwrap(), Some(c));
     });
 }
 

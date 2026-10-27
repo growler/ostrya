@@ -95,6 +95,7 @@ The detached metadata of a commit, for example its signatures.
 The checksum of a commit does not include it, so a signature can be added after the commit.
 The key \fB\%ostrya.related\fR, an extension of ostrya, holds the build sources of the commit.
 \fB\%ostrya prune\fR keeps the build sources of each commit that it keeps.
+A transfer into a repository whose \fB\%config\fR sets \fB\%keep\-detached\-related=false\fR does not store the key, as \fB\%ostrya\-config\fR(1) states.
 .TP
 \fB\%.cfs\fR
 The composefs image of a commit, an extension of ostrya.
@@ -357,9 +358,10 @@ The init writes it with the group \fB\%[core]\fR and the keys \fB\%repo_version=
 With a zlib level, for example with \fB\%ostrya remote init \-\-zlib\-level\fR, the group \fB\%[archive]\fR with the key \fB\%zlib\-level\fR follows.
 A bucket repository with a collection id is the primary server of that collection.
 The init refuses a bucket that holds a \fB\%config\fR, so the collection id of a bucket repository never changes.
-A push, a prune, and a summary update need the \fB\%config\fR, and refuse a mode other than \fB\%archive\-z2\fR and \fB\%archive\fR, a collection id that fails the collection\-id rule, a \fB\%tombstone\-commits\fR or \fB\%indexed\-deltas\fR that is not a boolean, and a \fB\%zlib\-level\fR that is not an integer.
+A push, a prune, and a summary update need the \fB\%config\fR, and refuse a mode other than \fB\%archive\-z2\fR and \fB\%archive\fR, a collection id that fails the collection\-id rule, a \fB\%tombstone\-commits\fR, \fB\%indexed\-deltas\fR, or \fB\%keep\-detached\-related\fR that is not a boolean, and a \fB\%zlib\-level\fR that is not an integer.
 A push builds each \fB\%.filez\fR that it uploads at the \fB\%zlib\-level\fR of this \fB\%config\fR, 6 when the key is absent.
 A push of commits from an archive repository uploads each \fB\%.filez\fR as it is stored.
+A push removes \fB\%ostrya.related\fR from each \fB\%.commitmeta\fR that it uploads when this \fB\%config\fR sets \fB\%keep\-detached\-related=false\fR in \fB\%[ex\-ostrya]\fR.
 A prune also refuses a \fB\%config\fR that sets \fB\%tombstone\-commits=true\fR in \fB\%[core]\fR.
 .TP
 \fB\%summary\fR, \fB\%summary.sig\fR

@@ -173,8 +173,10 @@ struct Edit<'a> {
 /// # Before the update lock
 ///
 /// After the checks, the incoming detached metadata goes through the filter.
-/// Then the staged objects become durable. At the same time, each new commit
-/// gets a signature from each server key of its rules. A key makes no
+/// If `[ex-ostrya] keep-detached-related` of the repository is `false`, this
+/// step also drops `ostrya.related` from each incoming dict. Then the staged
+/// objects become durable. At the same time, each new commit gets a signature
+/// from each server key of its rules. A key makes no
 /// signature if it already signed the commit in one of these places:
 ///
 /// - The merge of the filtered incoming dict into the stored dict.
@@ -313,7 +315,7 @@ pub(super) async fn finish(
         .collect();
     let mut stored = read_stored_for(repo, &rules, &targets, &commit_meta).await?;
     check_signatures(&rules, &commit_meta, &targets, &stored).await?;
-    let incoming = filter_detached(policy, commit_meta).await?;
+    let incoming = filter_detached(repo, policy, commit_meta).await?;
     let edits = plan(&rules, &targets, &mut stored, incoming);
     // The dicts that no edit took. The merge of the host entries takes them,
     // so they stay only where the session has hooks.
@@ -1317,12 +1319,24 @@ async fn check_ref(
 /// Removes the keys that the filter excludes from each incoming detached
 /// metadata dict, on the blocking pool.
 ///
-/// The result leaves out a dict that the filter empties.
+/// If `[ex-ostrya] keep-detached-related` of `repo` is `false`, the filter
+/// also drops `ostrya.related`. The result leaves out a dict that the filter
+/// empties.
 async fn filter_detached(
+    repo: &Repo,
     policy: &dyn SessionPolicy,
     commit_meta: HashMap<Checksum, Bytes>,
 ) -> Checked<HashMap<Checksum, Bytes>> {
+    let keep_related = repo
+        .config()
+        .keep_detached_related()
+        .map_err(Failure::Internal)?;
     let filter = policy.metadata_filter().cloned();
+    let filter = if keep_related {
+        filter
+    } else {
+        Some(filter.unwrap_or_default().dropping_related(false))
+    };
     ostrya_rt::unblock(move || -> Result<_> {
         let mut incoming = HashMap::with_capacity(commit_meta.len());
         for (commit, bytes) in commit_meta {

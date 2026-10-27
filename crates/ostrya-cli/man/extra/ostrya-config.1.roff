@@ -351,6 +351,19 @@ Detached metadata keys that are not stored.
 \fB\%ostrya push\fR does not send these keys, also to an \fB\%s3://\fR address.
 \fB\%ostrya receive\fR and \fB\%ostrya serve\fR remove them from each commit that a push gives.
 \fB\%ostrya send\fR and \fB\%ostrya serve\fR serve a stored \fB\%.commitmeta\fR unchanged.
+.TP
+\fB\%keep\-detached\-related\fR (boolean, default true)
+Store the detached metadata key \fB\%ostrya.related\fR that a transfer gives.
+With false, \fB\%ostrya pull\fR, \fB\%ostrya pull\-local\fR, \fB\%ostrya receive\fR, and \fB\%ostrya serve\fR remove \fB\%ostrya.related\fR from each \fB\%.commitmeta\fR that they write.
+The rule applies together with \fB\%detached\-metadata\-exclude\fR.
+A local write ignores the key: \fB\%ostrya commit\fR, \fB\%ostrya sign\fR, and the add of a build source store \fB\%ostrya.related\fR.
+A pull, also through \fB\%ostrya pull\-local\fR and through a static delta, and a push to a bucket repository replace the whole stored \fB\%.commitmeta\fR with the filtered dict.
+So a stored \fB\%ostrya.related\fR stays only if the filtered dict is empty: the transfer then writes nothing, and the destination keeps its \fB\%.commitmeta\fR.
+\fB\%ostrya receive\fR and \fB\%ostrya serve\fR merge the incoming dict into the stored dict, so a stored value stays.
+A pull refuses a value that is not a boolean before its first request.
+\fB\%ostrya receive\fR and \fB\%ostrya serve\fR refuse it at the start of a session.
+In the \fB\%config\fR of a bucket repository, \fB\%ostrya push\fR to an \fB\%s3://\fR address reads the key and removes \fB\%ostrya.related\fR from each \fB\%.commitmeta\fR that it uploads.
+\fB\%ostrya push\fR, \fB\%ostrya push\-tree\fR, \fB\%ostrya remote prune\fR, and \fB\%ostrya remote summary \-u\fR refuse a bucket repository whose value is not a boolean, and \fB\%ostrya remote fsck\fR reports it as a \fB\%config\fR error.
 .SH CLIENT AND SERVER GROUPS
 Client groups control the access to a repository through \fB\%ostrya serve\fR, \fB\%ostrya receive\fR, and \fB\%ostrya send\fR.
 A client group states how a client authenticates, which refs it can read and change in one namespace, how the server verifies its commits, and which keys sign them.

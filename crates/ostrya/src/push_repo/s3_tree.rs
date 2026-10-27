@@ -220,6 +220,7 @@ impl BucketRepo {
             ns,
             dir,
             listing,
+            ..
         } = read_state(self, collection.as_deref()).await?;
         let binding = match &ns {
             Namespace::Local { binding } => binding.as_deref(),

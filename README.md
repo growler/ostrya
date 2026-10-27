@@ -76,7 +76,9 @@ Ostrya adds these functions, which the `ostree` command does not have:
   `ostrya.related` holds its build sources, which the library adds. A prune
   keeps the related commits of each kept commit, and gives a warning for a
   defective value. `ostrya remote prune` of a bucket repository keeps the
-  dependencies and reads no build source.
+  dependencies and reads no build source. With
+  `[ex-ostrya] keep-detached-related=false`, a transfer into the repository
+  does not store `ostrya.related`.
 - The `bare-user-shared` mode, for development. It is `bare-user` storage
   with the fixed file mode 0644, for a repository that one group shares.
 - composefs image objects. `ostrya commit --generate-composefs` and

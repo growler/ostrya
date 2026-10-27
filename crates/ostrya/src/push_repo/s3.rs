@@ -100,6 +100,9 @@ pub(super) struct BucketState {
     /// `[archive] zlib-level` of the `config`, 6 if it has none, clamped to 1
     /// to 9.
     pub(super) level: u8,
+    /// The `[ex-ostrya] keep-detached-related` of the `config`, `true` if it
+    /// has none.
+    pub(super) keep_related: bool,
     /// The namespace of the push.
     pub(super) ns: Namespace,
     /// The refs of the ref directory of the namespace, by name.
@@ -135,6 +138,7 @@ pub(super) async fn read_state(
         )));
     };
     let level = archive_level(config.zlib_level()?);
+    let keep_related = config.keep_detached_related()?;
     let bucket_id = config.collection_id();
     let ns = namespace(collection, bucket_id);
     // The push reads the ref directory of its namespace alone, and lists
@@ -153,6 +157,7 @@ pub(super) async fn read_state(
     own_mirrors?;
     Ok(BucketState {
         level,
+        keep_related,
         ns,
         dir: dir?,
         listing: listing?,
@@ -272,8 +277,10 @@ impl Repo {
     ///    the detached metadata of each commit that the bucket lacks and of
     ///    each source commit, after
     ///    [`detached_metadata_filter`](RepoPushOptions::detached_metadata_filter),
-    ///    at most `max_outstanding` uploads at a time. It skips a
-    ///    `.commitmeta` that the bucket holds with the same bytes, and a
+    ///    at most `max_outstanding` uploads at a time. If `[ex-ostrya]
+    ///    keep-detached-related` of the `config` of the bucket is `false`, it
+    ///    also drops `ostrya.related` from each dict that it uploads. It skips
+    ///    a `.commitmeta` that the bucket holds with the same bytes, and a
     ///    commit with no detached metadata after the filter, which leaves the
     ///    bucket copy.
     /// 6. It uploads each commit object that the bucket lacks.
@@ -353,12 +360,12 @@ impl Repo {
     ///   holds a name that is a directory of another name after the push.
     /// - [`Error::InvalidFormat`] if the `config` of the bucket is malformed,
     ///   states a mode other than `archive-z2` and `archive`, holds a
-    ///   `tombstone-commits` or `indexed-deltas` that is no boolean, or holds
-    ///   a `zlib-level` that is no integer, if a key under the ref directory
-    ///   of the namespace is no ref name, if the bucket holds
-    ///   `refs/mirrors/ID/` of its own collection id, if a ref file of the
-    ///   namespace is malformed, or if a ref of the namespace names a commit
-    ///   that the bucket does not hold. The push then uploads
+    ///   `tombstone-commits`, `indexed-deltas`, or `keep-detached-related`
+    ///   that is no boolean, or holds a `zlib-level` that is no integer, if a
+    ///   key under the ref directory of the namespace is no ref name, if the
+    ///   bucket holds `refs/mirrors/ID/` of its own collection id, if a ref
+    ///   file of the namespace is malformed, or if a ref of the namespace
+    ///   names a commit that the bucket does not hold. The push then uploads
     ///   nothing. The push does not check the keys and the ref files of the
     ///   other namespaces.
     /// - [`Error::Remote`] with
@@ -440,6 +447,7 @@ impl Repo {
     ) -> Result<Uploaded> {
         let BucketState {
             level,
+            keep_related,
             ns,
             dir,
             listing,
@@ -525,7 +533,12 @@ impl Repo {
             AuthItem::Anonymous,
             None,
         );
-        let source = RepoSource::new(self.clone(), opts.detached_metadata_filter.clone());
+        let source = RepoSource::new(
+            self.clone(),
+            opts.detached_metadata_filter
+                .clone()
+                .dropping_related(keep_related),
+        );
         let uploads = Uploads {
             bucket,
             origin: Origin::Repo {

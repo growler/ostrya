@@ -2106,10 +2106,25 @@ the rules.
   that also reads the `.commitmeta` of each commit that it reaches was
   rejected: it sends one more `GET` for each such commit.
 - No transfer follows a build source. A pull, a push, and the one-way stream
-  move `ostrya.related` as any other detached metadata key, and fetch no
-  commit that it names. A build cache needs the refs of its sources, and not
+  move `ostrya.related` as any other detached metadata key, under the switch
+  of the destination, and fetch no commit that it names. A build cache needs the refs of its sources, and not
   only the commits. A distributed build cache mirrors the refs of its build
   sources with the existing pull and push.
+- `[ex-ostrya] keep-detached-related=false` makes each transfer into the
+  repository drop `ostrya.related`: a pull, a pull-local, a receive, and a
+  push to a bucket. The repository that stores the dict reads its own
+  switch, and a push to a bucket reads the `config` of the bucket. A
+  distribution repository sets `false`, so the build sources of a builder
+  do not go to the clients. A local write ignores the switch: a commit
+  write and the add API always store the key, because the owner of the
+  repository writes the value. A pull, also a pull-local and a pull through
+  a static delta, and a push to a bucket replace the whole stored
+  `.commitmeta` with the filtered dict, so a stored value stays only if the
+  filtered dict is empty. A receive merges the incoming dict into the stored
+  dict, so a stored value stays. An option of the sender was rejected: the
+  rule belongs to the repository that stores the dict, and a sender that
+  does not set the option stores the key against the rule of the
+  destination.
 - A config key that names more metadata keys with commit checksums was
   rejected. A reader then needs the repository config to find the related
   commits, and one dict is valid in one repository and not valid in

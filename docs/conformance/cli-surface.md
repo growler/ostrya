@@ -2313,9 +2313,9 @@ A ref name the tool's ref enumeration skips is read by the tool's
 `prune --refs-only` as unreachable, so the tool deletes a commit the port keeps.
 That is the out-of-band ref name of "P1", and the pair is stated there.
 
-One repository config key in the `[ex-ostrya]` group is a port extension with
-no option and no counterpart in the tool. It parts `ostrya` from `ostree` on a
-repository that sets it, and the divergence is by intent
+Two repository config keys in the `[ex-ostrya]` group are port extensions
+with no option and no counterpart in the tool. Each parts `ostrya` from
+`ostree` on a repository that sets it, and the divergence is by intent
 (`format-reference.md`, "Configuration keys of the port"):
 
 - `detached-metadata-exclude` names detached-metadata keys the repository does
@@ -2326,8 +2326,16 @@ repository that sets it, and the divergence is by intent
   `.commitmeta` the destination already holds where it stands. `ostrya push`
   drops them from the detached metadata it sends, and `ostrya receive` drops
   them from the detached metadata it stores.
+- `keep-detached-related=false` drops `ostrya.related` from each detached
+  metadata dict that a transfer stores in the repository: `ostrya pull`,
+  `ostrya pull-local`, `ostrya receive`, and the receive endpoint of
+  `ostrya serve`. `ostrya push` to an `s3://` address reads the key from the
+  `config` of the bucket. The tool's pull writes what the source holds. The
+  commit checksum does not cover detached metadata, so the objects both
+  write stay identical. A local write, for example `ostrya commit`, keeps
+  the key (`format-reference.md`, "The switch of the destination").
 
-No harness repository sets the key (`harness.md`, "Constraints"), so every
+No harness repository sets either key (`harness.md`, "Constraints"), so every
 matrix cell reads the tool's own behavior.
 
 `fsck` accepts `--repo`, `--add-tombstones`, `-q/--quiet`, `-a/--all`,
@@ -4893,7 +4901,12 @@ allow-cleartext-credentials`.
   refusal. The ref lines and the exit status are those of a push over a
   session. The push uploads the stored `.filez` of an `archive` repository
   as it is, and builds the `.filez` of each other mode at the
-  `[archive] zlib-level` of the `config` of the bucket.
+  `[archive] zlib-level` of the `config` of the bucket. With
+  `[ex-ostrya] keep-detached-related=false` in the `config` of the bucket,
+  the push drops `ostrya.related` from each `.commitmeta` that it uploads.
+  A value that is not a boolean refuses the push before it uploads an
+  object or a ref file. The refusal changes nothing in the bucket but the
+  probe key of the writer lock.
 - `push-tree` to an `s3://` address, or to a remote whose push address is
   one, makes the commit on the client and writes it to the bucket
   repository (`push-tree`).

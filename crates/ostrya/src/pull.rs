@@ -589,6 +589,29 @@ impl DetachedMetadataFilter {
         })
     }
 
+    /// Returns this filter with the rule of `[ex-ostrya]
+    /// keep-detached-related` of the destination.
+    ///
+    /// If `keep_related` is `true`, the call gives this filter back
+    /// unchanged. If it is `false`, the result drops `ostrya.related` and
+    /// does not call this filter for that key. It calls this filter for each
+    /// other property, and an unset filter allows each other property.
+    pub(crate) fn dropping_related(self, keep_related: bool) -> DetachedMetadataFilter {
+        if keep_related {
+            return self;
+        }
+        let inner = self.0;
+        DetachedMetadataFilter::new(move |commit, key, value| {
+            if key == crate::related::RELATED_KEY {
+                return FilterResult::Skip;
+            }
+            match &inner {
+                Some(f) => f(commit, key, value),
+                None => FilterResult::Allow,
+            }
+        })
+    }
+
     /// Returns the serialized properties of `bytes` that this filter allows,
     /// or `None` if the caller writes nothing.
     ///
@@ -1088,6 +1111,14 @@ pub struct PullOptions {
     /// calls it when it fetches the commit, and discovery parses no
     /// `.commitmeta`. So a `.commitmeta` that does not parse fails the pull
     /// only for a commit that the pull fetches.
+    ///
+    /// The pull also applies `[ex-ostrya] keep-detached-related` of the
+    /// destination
+    /// ([`RepoConfig::keep_detached_related`](crate::RepoConfig::keep_detached_related)).
+    /// If it is `false`, the pull drops `ostrya.related` and does not call
+    /// the filter for that key. The pull then parses each `.commitmeta` as
+    /// it does for a set filter, so a `.commitmeta` that is not an `a{sv}`
+    /// dict fails the pull.
     pub detached_metadata_filter: DetachedMetadataFilter,
     /// The handle to which a pull from a remote adds its live counters.
     ///
@@ -1665,10 +1696,12 @@ impl Repo {
     ///
     /// The pull copies the `.commitmeta` of the first source that holds one,
     /// through [`detached_metadata_filter`](PullOptions::detached_metadata_filter).
-    /// A zero-length `.commitmeta` in a source is the "no metadata" marker, and
-    /// it replaces the copy of this repository. If no source holds a
-    /// `.commitmeta`, the signature verification reads the copy of this
-    /// repository.
+    /// If `[ex-ostrya] keep-detached-related` of this repository is `false`
+    /// ([`RepoConfig::keep_detached_related`](crate::RepoConfig::keep_detached_related)),
+    /// the pull also drops `ostrya.related`. A zero-length `.commitmeta` in a
+    /// source is the "no metadata" marker, and it replaces the copy of this
+    /// repository. If no source holds a `.commitmeta`, the signature
+    /// verification reads the copy of this repository.
     ///
     /// If the pull fails before the ref step of its commit, a
     /// [`LockTimeout`](Error::LockTimeout) at that step included, it leaves no
@@ -1760,6 +1793,8 @@ impl Repo {
     ///   one delta, or is set together with
     ///   [`disable_static_deltas`](PullOptions::disable_static_deltas), before
     ///   the pull reads `src`.
+    /// - [`Error::Core`] if `[ex-ostrya] keep-detached-related` of this
+    ///   repository is not a boolean, before the pull reads `src`.
     /// - [`Error::InvalidRefspec`] if the collection id or a name is invalid,
     ///   or if a name holds `:`, before the pull reads `src`.
     /// - [`Error::Pull`] if the options ask for a signature verification and
@@ -1838,6 +1873,7 @@ impl Repo {
         }
         check_depth(opts.depth)?;
         check_static_deltas(&opts)?;
+        keep_related(self, &mut opts)?;
         let collection_relpaths = check_local_collection(&opts)?;
         let edges = take_static_deltas(&mut opts).await?;
         // The pull builds the signature policy before it reads the source. So
@@ -3307,6 +3343,22 @@ fn check_static_deltas(opts: &PullOptions) -> Result<()> {
             "a pull with static_deltas takes no subpath".into(),
         ));
     }
+    Ok(())
+}
+
+/// Applies `[ex-ostrya] keep-detached-related` of `repo`, the destination of
+/// the pull, to the filter of `opts`.
+///
+/// Each entry point calls this function before its first request and before
+/// it reads a source.
+///
+/// # Errors
+///
+/// [`Error::Core`] if the value is not a boolean.
+fn keep_related(repo: &Repo, opts: &mut PullOptions) -> Result<()> {
+    let keep = repo.config().keep_detached_related()?;
+    opts.detached_metadata_filter =
+        std::mem::take(&mut opts.detached_metadata_filter).dropping_related(keep);
     Ok(())
 }
 

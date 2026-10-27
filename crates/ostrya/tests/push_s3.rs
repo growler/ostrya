@@ -887,6 +887,94 @@ fn a_commitmeta_that_the_filter_empties_is_not_uploaded() {
     });
 }
 
+/// The config of a bucket that turns the related switch off.
+fn drop_related_config() -> String {
+    format!("{PLAIN}[ex-ostrya]\nkeep-detached-related=false\n")
+}
+
+/// Returns the keys of the `.commitmeta` of `commit` in the bucket, in order.
+fn bucket_detached_keys(server: &StandIn, commit: &Checksum) -> Vec<String> {
+    let stored = server.state().objects[&key(ObjectType::CommitMeta, commit)]
+        .bytes
+        .clone();
+    let ty = ostrya::Type::parse("a{sv}").unwrap();
+    let Value::Array(entries) = ostrya::from_bytes(&ty, &stored).unwrap() else {
+        panic!("the .commitmeta is not a dict");
+    };
+    entries
+        .iter()
+        .map(|entry| entry.as_tuple().unwrap()[0].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// With `keep-detached-related=false` in the config of the bucket, the push
+/// drops `ostrya.related` from the `.commitmeta` that it uploads. A second
+/// push uploads no `.commitmeta`.
+#[test]
+fn the_switch_of_the_bucket_drops_the_related_key() {
+    let scratch = TmpDir::new("push-s3-keep-related");
+    block_on(async {
+        let server = StandIn::start();
+        server
+            .state()
+            .store(CONFIG, drop_related_config().as_bytes());
+        let repo = archive(&scratch.path().join("src")).await;
+        let base = commit(&repo, "main", None, "one", None).await;
+        let tip = commit(&repo, "main", Some(base), "two", None).await;
+        detached(&repo, &tip, &["keep"]).await;
+        repo.add_detached_related(&tip, "layer/base", &base)
+            .await
+            .unwrap();
+
+        push(&repo, &server.endpoint(), opts(&["main"]))
+            .await
+            .unwrap();
+        assert_eq!(bucket_detached_keys(&server, &tip), ["keep"]);
+        server.state().requests.clear();
+        push(&repo, &server.endpoint(), opts(&["main"]))
+            .await
+            .unwrap();
+        assert!(!puts(&server).iter().any(|t| t.ends_with(".commitmeta")));
+    });
+}
+
+/// With the default switch, the push uploads `ostrya.related`. Under
+/// `false`, the push uploads no `.commitmeta` for a dict that holds
+/// `ostrya.related` alone, and the bucket copy stays.
+#[test]
+fn a_commitmeta_that_the_switch_empties_is_not_uploaded() {
+    let scratch = TmpDir::new("push-s3-keep-related-empty");
+    block_on(async {
+        let server = StandIn::start();
+        init(&server.endpoint(), None).await;
+        let repo = archive(&scratch.path().join("src")).await;
+        let base = commit(&repo, "main", None, "one", None).await;
+        let tip = commit(&repo, "main", Some(base), "two", None).await;
+        repo.add_detached_related(&tip, "layer/base", &base)
+            .await
+            .unwrap();
+        push(&repo, &server.endpoint(), opts(&["main"]))
+            .await
+            .unwrap();
+        assert_eq!(bucket_detached_keys(&server, &tip), ["ostrya.related"]);
+        let meta = key(ObjectType::CommitMeta, &tip);
+        let first = server.state().objects[&meta].clone();
+
+        repo.add_detached_related(&tip, "layer/other", &tip)
+            .await
+            .unwrap();
+        server
+            .state()
+            .store(CONFIG, drop_related_config().as_bytes());
+        server.state().requests.clear();
+        push(&repo, &server.endpoint(), opts(&["main"]))
+            .await
+            .unwrap();
+        assert!(!puts(&server).iter().any(|t| t.ends_with(".commitmeta")));
+        assert_eq!(server.state().objects[&meta], first);
+    });
+}
+
 #[test]
 fn an_interrupted_push_leaves_whole_trees_and_a_run_again_completes() {
     let scratch = TmpDir::new("push-s3-interrupted");
@@ -1763,9 +1851,13 @@ fn a_bucket_config_with_a_bare_mode_refuses_the_push() {
 
 #[test]
 fn a_bucket_config_with_a_value_that_is_no_boolean_refuses_the_push() {
-    for key in ["tombstone-commits", "indexed-deltas"] {
-        let (server, result) =
-            push_onto_seed("push-s3-no-boolean", &format!("{PLAIN}{key}=maybe\n"), &[]);
+    for (key, group) in [
+        ("tombstone-commits", ""),
+        ("indexed-deltas", ""),
+        ("keep-detached-related", "[ex-ostrya]\n"),
+    ] {
+        let config = format!("{PLAIN}{group}{key}=maybe\n");
+        let (server, result) = push_onto_seed("push-s3-no-boolean", &config, &[]);
         let message = malformed(result);
         assert!(message.contains("its config"), "{message}");
         assert!(message.contains(key), "{message}");

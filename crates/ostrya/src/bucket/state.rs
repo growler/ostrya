@@ -56,8 +56,9 @@ impl BucketRepo {
     /// The config must state the mode `archive-z2` or `archive`, and a
     /// `[core] collection-id` must pass the collection id rule and be at most
     /// 255 bytes. `[core] tombstone-commits` and `[core] indexed-deltas`, which
-    /// the summary takes, must be booleans if they are set. `[archive]
-    /// zlib-level`, which a push takes, must be an integer if it is set.
+    /// the summary takes, and `[ex-ostrya] keep-detached-related`, which a
+    /// push takes, must be booleans if they are set. `[archive] zlib-level`,
+    /// which a push takes, must be an integer if it is set.
     ///
     /// # Errors
     ///
@@ -117,7 +118,11 @@ impl BucketRepo {
                 id.escape_debug()
             )));
         }
-        for checked in [config.tombstone_commits(), config.indexed_deltas()] {
+        for checked in [
+            config.tombstone_commits(),
+            config.indexed_deltas(),
+            config.keep_detached_related(),
+        ] {
             checked.map_err(|e| {
                 self.malformed(format!("its config has a key that is no boolean: {e}"))
             })?;

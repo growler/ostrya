@@ -46,7 +46,9 @@ pub struct StreamPolicy {
     pub update_summary: bool,
     /// The detached-metadata keys that the repository does not store.
     ///
-    /// `None` stores every key.
+    /// `None` stores every key. If `[ex-ostrya] keep-detached-related` of the
+    /// repository is `false`, the session also drops `ostrya.related` and
+    /// does not call the filter for that key.
     pub detached_metadata_filter: Option<DetachedMetadataFilter>,
 }
 

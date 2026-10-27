@@ -31,7 +31,7 @@ use ostrya::remote::{self, Encoding, ErrorCode, Expected, RefOutcome, RefUpdate}
 use ostrya::{
     Checksum, DictBuilder, Error, FsckOptions, MAX_METADATA_SIZE, ObjectName, ObjectType,
     ReceivePattern, ReceiveReport, ReceiveService, Repo, RepoMode, ServerSigner, StreamPolicy,
-    StreamRule, Type,
+    StreamRule, Type, Value,
 };
 use ostrya_rt::block_on;
 
@@ -716,6 +716,61 @@ fn merged_detached_metadata_over_the_limit_is_limit_exceeded() {
         ),
         "{result:?}"
     );
+    assert_nothing_published(&repo, &before);
+}
+
+/// With `keep-detached-related=false` in the repository, a one-way stream
+/// drops `ostrya.related` from the incoming dict and stores each other
+/// property. A value that is not a boolean fails the stream at `Hello`, and
+/// nothing is published.
+#[test]
+fn the_switch_applies_to_a_one_way_stream() {
+    let mut dict = DictBuilder::new();
+    dict.insert_str("k", "v");
+    dict.insert(
+        "ostrya.related",
+        Type::parse("a(say)").unwrap(),
+        Value::Array(vec![Value::Tuple(vec![
+            Value::Str("layer/base".to_owned()),
+            Value::Bytes(fixture_commit().as_bytes().to_vec()),
+        ])]),
+    );
+    let incoming = ostrya_core::to_bytes(&Type::parse("a{sv}").unwrap(), &dict.build()).unwrap();
+    let stream = || {
+        let mut s = Stream::new();
+        for o in fixture_objects(Encoding::Raw) {
+            s.object(&o);
+        }
+        s.object(&Obj {
+            ty: ObjectType::CommitMeta,
+            checksum: fixture_commit(),
+            encoding: Encoding::Raw,
+            bytes: incoming.clone(),
+        })
+        .message(&Message::ObjectsEnd)
+        .commit(updates());
+        s.bytes()
+    };
+
+    let tmp = TmpDir::new("one-way-keep-related");
+    let repo = new_repo(
+        &tmp,
+        RepoMode::BareUser,
+        "\n[ex-ostrya]\nkeep-detached-related=false\n",
+    );
+    receive(&repo, &policy(), &stream()).unwrap();
+    let stored = block_on(repo.read_commit_detached_metadata(&fixture_commit()))
+        .unwrap()
+        .unwrap();
+    assert!(stored.dict_get("k").is_some(), "{stored:?}");
+    assert!(stored.dict_get("ostrya.related").is_none(), "{stored:?}");
+
+    let tmp = TmpDir::new("one-way-keep-related-malformed");
+    let (repo, before) = empty_repo(&tmp, "\n[ex-ostrya]\nkeep-detached-related=maybe\n");
+    let result = receive(&repo, &policy(), &stream());
+    assert!(matches!(&result, Err(Error::Core(_))), "{result:?}");
+    let Err(e) = &result else { unreachable!() };
+    assert!(e.to_string().contains("keep-detached-related"), "{e}");
     assert_nothing_published(&repo, &before);
 }
 

@@ -693,6 +693,110 @@ fn the_filter_removes_its_keys_from_the_incoming_dict() {
     assert_eq!(keys, vec!["kept"]);
 }
 
+/// The `[ex-ostrya]` group that turns the related switch off.
+const DROP_RELATED: &str = "\n[ex-ostrya]\nkeep-detached-related=false\n";
+
+/// Returns the keys of the stored detached metadata of the fixture commit, in
+/// order.
+fn fixture_detached_keys(repo: &Repo) -> Vec<String> {
+    let stored = block_on(repo.read_commit_detached_metadata(&fixture_commit()))
+        .unwrap()
+        .unwrap();
+    stored
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e.as_tuple().unwrap()[0].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// Inserts an `ostrya.related` value with one entry that names `commit`.
+fn insert_related(dict: &mut DictBuilder, name: &str, commit: &Checksum) {
+    dict.insert(
+        "ostrya.related",
+        Type::parse("a(say)").unwrap(),
+        Value::Array(vec![Value::Tuple(vec![
+            Value::Str(name.to_owned()),
+            Value::Bytes(commit.as_bytes().to_vec()),
+        ])]),
+    );
+}
+
+/// With `keep-detached-related=false` in the repository, the session drops
+/// `ostrya.related` from the incoming dict, with and without a filter of the
+/// policy. The two rules apply together.
+#[test]
+fn the_switch_removes_the_related_key_from_the_incoming_dict() {
+    let filters = [
+        None,
+        Some(ostrya::DetachedMetadataFilter::excluding(["dropped"])),
+    ];
+    for filter in filters {
+        let tmp = TmpDir::new("recv-keep-related");
+        let repo = new_repo(&tmp, RepoMode::Archive, DROP_RELATED);
+        let mut dict = DictBuilder::new();
+        dict.insert_str("kept", "a");
+        dict.insert_str("dropped", "b");
+        insert_related(&mut dict, "layer/base", &fixture_commit());
+        let policy = ReceivePolicy {
+            detached_metadata_filter: filter.clone(),
+            ..policy()
+        };
+        committed(push(
+            &repo,
+            &policy,
+            &fixture_objects(Encoding::Raw),
+            &[(fixture_commit(), dict_bytes(&dict.build()))],
+            vec![update(
+                "test/main",
+                Expected::Absent,
+                Some(fixture_commit()),
+            )],
+            false,
+        ));
+        let expected: &[&str] = match filter {
+            Some(_) => &["kept"],
+            None => &["kept", "dropped"],
+        };
+        assert_eq!(fixture_detached_keys(&repo), expected);
+    }
+}
+
+/// Under the switch, a receive merges into the stored dict, so it keeps a
+/// value that the repository holds. A local write stores `ostrya.related` under the switch, and a later session keeps
+/// the stored value and drops the incoming one.
+#[test]
+fn the_switch_keeps_a_stored_related_value() {
+    let tmp = TmpDir::new("recv-keep-related-stored");
+    let repo = repo_with_fixture(&tmp, RepoMode::Archive, DROP_RELATED);
+    block_on(repo.add_detached_related(&fixture_commit(), "layer/base", &fixture_commit()))
+        .unwrap();
+    let held = block_on(repo.read_commit_detached_metadata(&fixture_commit()))
+        .unwrap()
+        .unwrap();
+
+    let mut dict = DictBuilder::new();
+    dict.insert_str("kept", "a");
+    insert_related(&mut dict, "layer/other", &checksum(ROOT_DIRTREE));
+    committed(push(
+        &repo,
+        &policy(),
+        &[],
+        &[(fixture_commit(), dict_bytes(&dict.build()))],
+        vec![update("test/main", Expected::Any, Some(fixture_commit()))],
+        false,
+    ));
+
+    assert_eq!(fixture_detached_keys(&repo), ["ostrya.related", "kept"]);
+    let stored = block_on(repo.read_commit_detached_metadata(&fixture_commit()))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        stored.dict_get("ostrya.related"),
+        held.dict_get("ostrya.related")
+    );
+}
+
 /// A push session writes no remote ref. A `Hello` that names a remote ref is
 /// `ref-denied`, also under an allow item that matches each ref, and the
 /// session opens no transaction.

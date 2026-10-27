@@ -132,8 +132,8 @@ pub(super) fn cut(message: &mut String) {
 /// - A host entry replaces an entry of the client dict with the same key,
 ///   with no duplicate-key error.
 /// - A commit with no client dict gets a new dict.
-/// - The `detached-metadata-exclude` filter of the policy does not apply to
-///   the host entries.
+/// - The `detached-metadata-exclude` filter of the policy and the rule of
+///   `[ex-ostrya] keep-detached-related` do not apply to the host entries.
 /// - If [`keep_existing`](HostEntry::keep_existing) is `false`, the host entry
 ///   replaces the value that the stored dict holds under its key.
 /// - If `keep_existing` is `true`, a value that the stored dict holds under

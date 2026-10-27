@@ -344,6 +344,10 @@ fn a_malformed_write_setting_is_internal_at_hello() {
         (RepoMode::Archive, "[archive]\nzlib-level=abc\n"),
         (RepoMode::BareUser, "[ex-integrity]\nfsverity=often\n"),
         (RepoMode::BareUser, "fsync=often\n"),
+        (
+            RepoMode::Archive,
+            "[ex-ostrya]\nkeep-detached-related=maybe\n",
+        ),
     ] {
         let tmp = TmpDir::new("recv-badcfg");
         let repo = new_repo(&tmp, mode, extra);
@@ -356,6 +360,13 @@ fn a_malformed_write_setting_is_internal_at_hello() {
             !matches!(result, Err(Error::Remote(_))),
             "{extra}: the caller gets the server error, {result:?}"
         );
+        if extra.contains("keep-detached-related") {
+            assert!(error.message.contains("keep-detached-related"), "{error:?}");
+            let Err(e) = &result else {
+                panic!("{extra}: expected an error, {result:?}");
+            };
+            assert!(e.to_string().contains("keep-detached-related"), "{e}");
+        }
         assert!(staging_entries(repo.path()).is_empty());
     }
 }

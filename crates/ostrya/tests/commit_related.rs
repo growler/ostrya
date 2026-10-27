@@ -901,6 +901,64 @@ fn transaction_adds_apply_after_the_queued_dict_and_before_the_signatures() {
     });
 }
 
+/// A local write ignores `[ex-ostrya] keep-detached-related`. Under `false`,
+/// each write API and a signature after it keep `ostrya.related`.
+#[test]
+fn a_local_write_keeps_the_related_key_under_the_switch() {
+    let tmp = TmpDir::new("related-local-write-switch");
+    block_on(async {
+        let repo = repo_with_trees(tmp.path(), &["src", "one", "two", "three", "four"]).await;
+        let config = repo.path().join("config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str("\n[ex-ostrya]\nkeep-detached-related=false\n");
+        std::fs::write(&config, text).unwrap();
+        let repo = Repo::open(repo.path()).await.unwrap();
+        assert!(!repo.config().keep_detached_related().unwrap());
+        let src = commit(&repo, tmp.path(), "src", &[]).await;
+        let [one, two, three, four] = [
+            commit(&repo, tmp.path(), "one", &[]).await,
+            commit(&repo, tmp.path(), "two", &[]).await,
+            commit(&repo, tmp.path(), "three", &[]).await,
+            commit(&repo, tmp.path(), "four", &[]).await,
+        ];
+        let meta = dict(vec![
+            ("test.note", string("n")),
+            (RELATED_KEY, sources(&[("source/src", src.as_bytes())])),
+        ]);
+
+        repo.write_commit_detached_metadata(&one, Some(&meta))
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        txn.set_commit_detached_metadata(&two, meta.clone());
+        txn.commit().await.unwrap();
+        repo.add_detached_related(&three, "source/src", &src)
+            .await
+            .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        txn.add_detached_related(&four, "source/src", &src).unwrap();
+        txn.commit().await.unwrap();
+
+        for head in [one, two, three, four] {
+            repo.sign_commit(&head, &DummySigner::new("key"))
+                .await
+                .unwrap();
+            assert!(
+                detached_keys(&repo, &head)
+                    .await
+                    .iter()
+                    .any(|k| k == RELATED_KEY),
+                "{head}"
+            );
+            assert_eq!(
+                repo.read_commit_related(&head).await.unwrap().build_sources,
+                owned(&[("source/src", src)]),
+                "{head}"
+            );
+        }
+    });
+}
+
 /// Returns the defective `ostrya.related` values of the write checks, each
 /// with the reason of its refusal.
 fn defective_values() -> Vec<((Type, Value), &'static str)> {

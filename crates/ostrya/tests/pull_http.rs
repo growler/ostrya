@@ -235,6 +235,131 @@ fn a_filter_shapes_the_detached_metadata_an_http_pull_stores() {
     });
 }
 
+/// The `[ex-ostrya]` group that turns the related switch off.
+const DROP_RELATED: &str = "\n[ex-ostrya]\nkeep-detached-related=false\n";
+
+/// Returns the keys of the stored detached metadata of a commit, in order.
+async fn detached_keys(repo: &Repo, commit: &Checksum) -> Vec<String> {
+    let Some(Value::Array(entries)) = repo.read_commit_detached_metadata(commit).await.unwrap()
+    else {
+        return Vec::new();
+    };
+    entries
+        .iter()
+        .map(|entry| entry.as_tuple().unwrap()[0].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// Builds a remote as [`build_remote_chain`] does. The second commit holds
+/// `test.detached` and names the first commit in `ostrya.related`.
+async fn build_related_remote(dir: &Path) -> (Repo, Checksum) {
+    let (remote, first, second) = build_remote_chain(dir).await;
+    remote
+        .write_commit_detached_metadata(&second, Some(&detached_dict()))
+        .await
+        .unwrap();
+    remote
+        .add_detached_related(&second, "layer/base", &first)
+        .await
+        .unwrap();
+    assert_eq!(
+        detached_keys(&remote, &second).await,
+        ["test.detached", "ostrya.related"]
+    );
+    (remote, second)
+}
+
+/// With `keep-detached-related=false` in the destination, an HTTP pull drops
+/// `ostrya.related` and stores each other property. With the default, it
+/// stores the `.commitmeta` of the remote byte for byte.
+#[test]
+fn the_switch_shapes_the_detached_metadata_an_http_pull_stores() {
+    for (extra, keys) in [
+        (DROP_RELATED, &["test.detached"][..]),
+        ("", &["test.detached", "ostrya.related"][..]),
+    ] {
+        block_on(async {
+            let dir = TmpDir::new("pull-http-keep-related");
+            let (_remote, commit) = build_related_remote(dir.path()).await;
+            let server = RepoServer::start(&dir.path().join("remote"), false).await;
+            let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), extra).await;
+
+            dest.pull(
+                "origin",
+                PullOptions {
+                    refs: vec!["test/main".to_owned()],
+                    ..PullOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(detached_keys(&dest, &commit).await, keys, "{extra:?}");
+            if extra.is_empty() {
+                let path = meta_path(&commit, "commitmeta");
+                assert_eq!(
+                    std::fs::read(dir.path().join("dest").join(&path)).unwrap(),
+                    std::fs::read(dir.path().join("remote").join(&path)).unwrap()
+                );
+            }
+        });
+    }
+}
+
+/// A pull through a session applies the switch of the destination.
+#[test]
+fn the_switch_applies_to_a_pull_through_a_session() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-session-keep-related");
+        let (_remote, commit) = build_related_remote(dir.path()).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), DROP_RELATED).await;
+
+        dest.pull_with_session(
+            http_session(&server).await,
+            PullTrust::unverified(),
+            PullOptions {
+                refs: vec!["test/main".to_owned()],
+                ..PullOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(detached_keys(&dest, &commit).await, ["test.detached"]);
+    });
+}
+
+/// A switch that is not a boolean fails the pull before its first request.
+/// The pull writes no object and no ref.
+#[test]
+fn a_switch_that_is_no_boolean_refuses_an_http_pull() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-keep-related-malformed");
+        let (_remote, _commit) = build_related_remote(dir.path()).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let extra = "\n[ex-ostrya]\nkeep-detached-related=maybe\n";
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), extra).await;
+
+        let opts = || PullOptions {
+            refs: vec!["test/main".to_owned()],
+            ..PullOptions::default()
+        };
+        let err = dest.pull("origin", opts()).await.unwrap_err();
+        assert!(matches!(&err, Error::Core(_)), "{err}");
+        assert!(err.to_string().contains("keep-detached-related"), "{err}");
+        let err = dest
+            .pull_with_session(http_session(&server).await, PullTrust::unverified(), opts())
+            .await
+            .unwrap_err();
+        assert!(matches!(&err, Error::Core(_)), "{err}");
+
+        assert!(server.seen().is_empty(), "{:?}", server.seen());
+        assert_no_refs(&dest).await;
+        assert!(dest.list_objects().await.unwrap().is_empty());
+    });
+}
+
 /// A guard holds the update lock, so an HTTP pull fails at the step that writes
 /// detached metadata and refs. The pull keeps the marker of the commit that it
 /// published. It writes no `.commitmeta` and no ref. The next pull completes
@@ -7692,6 +7817,52 @@ fn the_detached_filter_applies_to_an_intermediate_commit() {
         }
         assert_no_markers(&dest_dir);
     });
+}
+
+/// The switch of the destination applies to the `.commitmeta` of each commit
+/// of a chain of static deltas, with and without a signature policy. A
+/// verified pull filters it in discovery, and an unverified pull when it
+/// fetches the commit. The pull stores each commit without `ostrya.related`.
+#[test]
+fn the_switch_applies_to_each_commit_of_a_chain() {
+    for policy in [signed_policy(), String::new()] {
+        block_on(async {
+            let dir = TmpDir::new("pull-http-chain-keep-related");
+            let (remote, [a, b, c, d]) = build_chain_remote(dir.path()).await;
+            sign_commits(&remote, &[a, b, c, d]).await;
+            for commit in [b, c, d] {
+                remote
+                    .add_detached_related(&commit, "layer/base", &a)
+                    .await
+                    .unwrap();
+            }
+            let mut list = Vec::new();
+            for (from, to) in [(a, b), (b, c), (c, d)] {
+                list.push(listed(&remote, &from, &to, DeltaOptions::default()).await);
+            }
+            let server = RepoServer::start(remote.path(), false).await;
+            drop(dest_holding(dir.path(), &server.url(), &a).await);
+            let extra = format!("{policy}{DROP_RELATED}");
+            let dest = reconfigure_dest(dir.path(), &server.url(), &extra).await;
+            let dest_dir = dir.path().join("dest");
+
+            dest.pull("origin", chain_opts(list)).await.unwrap();
+
+            for commit in [b, c, d] {
+                assert_eq!(
+                    detached_keys(&remote, &commit).await,
+                    ["ostree.sign.ed25519", "ostrya.related"]
+                );
+                assert_eq!(
+                    detached_keys(&dest, &commit).await,
+                    ["ostree.sign.ed25519"],
+                    "{policy:?}"
+                );
+                assert_complete(&remote, &dest, &dest_dir, &commit).await;
+            }
+            assert_no_markers(&dest_dir);
+        });
+    }
 }
 
 /// A verified pull of a chain calls the detached-metadata filter one time for

@@ -8,7 +8,7 @@ ostrya push [OPTIONS] [REMOTE] [REFSPECS]...
 .SH DESCRIPTION
 Push commits to a remote over ssh or HTTP, or to a bucket repository.
 .PP
-The command resolves REMOTE and sends the objects that the server does not have. The server then updates all the refs of the refspecs in one transaction. Over ssh, the push runs the ssh client with the receive command on the remote side. Over HTTP, the push sends its requests to the receive endpoint of \fB\%ostrya serve\fR\&. The push drops the detached metadata keys that \fB\%[ex\-ostrya] detached\-metadata\-exclude\fR names.
+The command resolves REMOTE and sends the objects that the server does not have. The server then updates all the refs of the refspecs in one transaction. Over ssh, the push runs the ssh client with the receive command on the remote side. Over HTTP, the push sends its requests to the receive endpoint of \fB\%ostrya serve\fR\&. The push drops the detached metadata keys that \fB\%[ex\-ostrya] detached\-metadata\-exclude\fR names. To an \fB\%s3://\fR address, the push reads \fB\%[ex\-ostrya] keep\-detached\-related\fR from the \fB\%config\fR of the bucket, and with \fB\%false\fR drops \fB\%ostrya.related\fR\&.
 .PP
 The collection bindings of the source commits, or \%\-\-collection, give the namespace of the push on the server: the local refs or one collection. The server writes the refs of a collection other than its own collection id under \fB\%refs/mirrors/ID/\fR\&.
 .PP

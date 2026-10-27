@@ -32,8 +32,9 @@ const CONFIG_FILE: &str = "config";
 ///   [`fsverity`](RepoConfig::fsverity).
 /// - `[remote "<name>"]`: one section for each remote, read through
 ///   [`Remote`].
-/// - `[ex-ostrya]`: the key that is an ostrya extension,
-///   [`detached_metadata_exclude`](RepoConfig::detached_metadata_exclude).
+/// - `[ex-ostrya]`: the keys that are ostrya extensions,
+///   [`detached_metadata_exclude`](RepoConfig::detached_metadata_exclude) and
+///   [`keep_detached_related`](RepoConfig::keep_detached_related).
 /// - The groups whose names start with `ex-ostrya` and a space, for example
 ///   `[ex-ostrya client "NAME"]`: the access of the clients of a server, and
 ///   the keys that verify and sign the commits that it receives.
@@ -474,6 +475,40 @@ impl RepoConfig {
     /// [`Error::Core`] if the value holds a malformed escape sequence.
     pub fn detached_metadata_exclude(&self) -> Result<Vec<String>> {
         self.string_list(EX_OSTRYA, "detached-metadata-exclude")
+    }
+
+    /// Returns `true` if a transfer into this repository stores
+    /// `ostrya.related`.
+    ///
+    /// The key is `[ex-ostrya] keep-detached-related`, and the default is
+    /// `true`. The key is an ostrya extension. If it is `false`, each transfer
+    /// that writes into this repository drops `ostrya.related` from each
+    /// detached metadata dict that it stores: [`Repo::pull`], also through a
+    /// static delta, [`Repo::pull_with_session`], [`Repo::pull_collection`],
+    /// and [`Repo::pull_local`]. Under the `receive` feature, the receive
+    /// path also applies it: the push session and the one-way stream. A push
+    /// to a bucket repository reads the key from the `config` of the bucket.
+    /// The rule applies together with
+    /// [`detached_metadata_exclude`](RepoConfig::detached_metadata_exclude).
+    ///
+    /// A local write does not read the key: a commit write,
+    /// [`Repo::write_commit_detached_metadata`], and
+    /// [`Repo::add_detached_related`] store `ostrya.related`. The key controls
+    /// what a transfer stores. A pull, also a local pull and a pull through a
+    /// static delta, and a push to a bucket replace the whole stored
+    /// `.commitmeta` with the filtered dict. So a stored `ostrya.related`
+    /// stays only if the filtered dict is empty: the transfer then writes
+    /// nothing, and the destination keeps the copy that it holds. A receive
+    /// merges the incoming dict into the stored dict, so a stored value stays.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Core`] if the value is not a boolean.
+    pub fn keep_detached_related(&self) -> Result<bool> {
+        Ok(self
+            .keyfile
+            .get_bool(EX_OSTRYA, "keep-detached-related")?
+            .unwrap_or(true))
     }
 
     /// Returns `true` if a ref change regenerates the summary.
@@ -1384,6 +1419,30 @@ mod tests {
     fn ex_ostrya_lists_are_empty_when_absent() {
         let cfg = RepoConfig::parse(ARCHIVE_CONFIG).unwrap();
         assert!(cfg.detached_metadata_exclude().unwrap().is_empty());
+    }
+
+    #[test]
+    fn keep_detached_related_is_true_when_absent() {
+        let cfg = RepoConfig::parse(ARCHIVE_CONFIG).unwrap();
+        assert!(cfg.keep_detached_related().unwrap());
+    }
+
+    #[test]
+    fn keep_detached_related_reads_a_boolean() {
+        let read = |value: &str| {
+            RepoConfig::parse(&format!(
+                "[core]\nrepo_version=1\nmode=bare\n[ex-ostrya]\n\
+                 keep-detached-related={value}\n"
+            ))
+            .unwrap()
+            .keep_detached_related()
+        };
+        assert!(!read("false").unwrap());
+        assert!(!read("0").unwrap());
+        assert!(read("true").unwrap());
+        assert!(read("1").unwrap());
+        assert!(read("maybe").is_err());
+        assert!(read("yes").is_err());
     }
 
     #[test]

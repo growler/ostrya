@@ -44,7 +44,8 @@ use super::source::{Connection, RemoteSource};
 use super::subpath::Subpaths;
 use super::verify::Verification;
 use super::{
-    PullFlags, PullOptions, PullStats, PullVerify, RefPlace, check_depth, refuse_remote_collection,
+    PullFlags, PullOptions, PullStats, PullVerify, RefPlace, check_depth, keep_related,
+    refuse_remote_collection,
 };
 
 /// The path of the ref listing under the base URL of a remote.
@@ -435,6 +436,8 @@ impl Repo {
     ///   is longer than [`MAX_REF_ENTRY_LEN`] bytes or has more than
     ///   [`MAX_REF_ENTRY_PARTS`] parts, or if the request target of the name
     ///   alone over HTTP is longer than 16 KiB.
+    /// - [`Error::Core`] if `[ex-ostrya] keep-detached-related` of this
+    ///   repository is not a boolean.
     /// - The errors of [`resolve_pull`] and of [`PullTrust::from_remote`],
     ///   for each remote, and the errors of
     ///   [`trust_group`](PullOptions::trust_group).
@@ -491,10 +494,11 @@ impl Repo {
     ) -> Result<CollectionPullStats> {
         let started = Instant::now();
         let CollectionPullOptions {
-            pull: opts,
+            pull: mut opts,
             mut on_event,
         } = opts;
         let subpaths = check_collection_pull(collection_id, remotes, &opts)?;
+        keep_related(self, &mut opts)?;
         let names = first_of_each(opts.refs.iter().map(String::as_str));
 
         // The endpoint, the trust, and the transport of each remote come

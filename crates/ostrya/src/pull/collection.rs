@@ -24,6 +24,7 @@ use crate::endpoint::{EndpointOverrides, resolve_pull};
 use crate::error::{Error, Result};
 use crate::fetch::Fetcher;
 use crate::refs::{MAX_COLLECTION_ID_LEN, check_ref_path};
+use crate::related::RelatedRule;
 use crate::remote::proto::{MAX_REF_ENTRY_LEN, MAX_REF_ENTRY_PARTS, MAX_REF_PATTERNS};
 #[cfg(feature = "s3")]
 use crate::remote::s3::{Bucket, S3Endpoint};
@@ -44,8 +45,7 @@ use super::source::{Connection, RemoteSource};
 use super::subpath::Subpaths;
 use super::verify::Verification;
 use super::{
-    PullFlags, PullOptions, PullStats, PullVerify, RefPlace, check_depth, keep_related,
-    refuse_remote_collection,
+    PullFlags, PullOptions, PullStats, PullVerify, RefPlace, check_depth, refuse_remote_collection,
 };
 
 /// The path of the ref listing under the base URL of a remote.
@@ -494,11 +494,13 @@ impl Repo {
     ) -> Result<CollectionPullStats> {
         let started = Instant::now();
         let CollectionPullOptions {
-            pull: mut opts,
+            pull: opts,
             mut on_event,
         } = opts;
         let subpaths = check_collection_pull(collection_id, remotes, &opts)?;
-        keep_related(self, &mut opts)?;
+        // `drive` reads the rule again. This read refuses a value that is not
+        // a boolean before the first request.
+        RelatedRule::of(self.config())?;
         let names = first_of_each(opts.refs.iter().map(String::as_str));
 
         // The endpoint, the trust, and the transport of each remote come

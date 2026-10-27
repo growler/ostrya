@@ -1,6 +1,5 @@
 //! `ReceivePolicies::from_config`: the receive policy of each client group,
-//! the trust groups, the key groups, `[core] auto-update-summary`, and
-//! `detached-metadata-exclude`.
+//! the trust groups, the key groups, and `[core] auto-update-summary`.
 //!
 //! Each case writes one repository configuration and reads the policies. The
 //! read refuses a malformed group with the error kind that the policies
@@ -168,7 +167,6 @@ fn no_client_group_gives_the_implicit_policies() {
         assert!(!policy.allow_privileged);
         assert!(policy.summary_signers.is_empty());
         assert!(!policy.update_summary);
-        assert!(policy.detached_metadata_filter.is_none());
     }
     assert!(policies.get("c").is_none());
 }
@@ -294,22 +292,16 @@ fn update_summary_reads_the_core_keys() {
     assert!(matches!(err, Error::Core(_)), "{err}");
 }
 
-/// If `detached-metadata-exclude` names a key, the policy has a filter. If the
-/// value is empty, the policy has no filter.
+/// `from_config` reads no `detached-metadata-exclude`. A config that sets
+/// the key, also with a value that the key-file syntax cannot split as a
+/// list, gives the policies of a config with no such key.
 #[test]
-fn detached_metadata_exclude_gives_the_filter() {
-    let named = policy("[ex-ostrya]\ndetached-metadata-exclude=app.secret;app.other\n").unwrap();
-    assert!(
-        group(&named, "anonymous")
-            .detached_metadata_filter
-            .is_some()
-    );
-    let empty = policy("[ex-ostrya]\ndetached-metadata-exclude=\n").unwrap();
-    assert!(
-        group(&empty, "anonymous")
-            .detached_metadata_filter
-            .is_none()
-    );
+fn a_config_that_sets_detached_metadata_exclude_gives_the_same_policies() {
+    let plain = format!("{:?}", policy("").unwrap());
+    for value in ["app.gc-roots;", "app.gc-roots\\"] {
+        let set = policy(&format!("[ex-ostrya]\ndetached-metadata-exclude={value}\n")).unwrap();
+        assert_eq!(format!("{set:?}"), plain, "{value:?}");
+    }
 }
 
 /// `from_config` refuses an unknown key in a trust group and in a key group.

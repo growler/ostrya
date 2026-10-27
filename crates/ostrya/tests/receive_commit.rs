@@ -656,43 +656,6 @@ fn a_second_client_signature_joins_the_stored_one() {
     assert_eq!(signatures(&merged, ED25519_KEY), vec![first, second]);
 }
 
-/// The detached-metadata filter removes its keys from the incoming dict before
-/// the merge.
-#[test]
-fn the_filter_removes_its_keys_from_the_incoming_dict() {
-    let tmp = TmpDir::new("recv-filter");
-    let repo = new_repo(&tmp, RepoMode::Archive, "");
-    let mut dict = DictBuilder::new();
-    dict.insert_str("kept", "a");
-    dict.insert_str("dropped", "b");
-    let policy = ReceivePolicy {
-        detached_metadata_filter: Some(ostrya::DetachedMetadataFilter::excluding(["dropped"])),
-        ..policy()
-    };
-    committed(push(
-        &repo,
-        &policy,
-        &fixture_objects(Encoding::Raw),
-        &[(fixture_commit(), dict_bytes(&dict.build()))],
-        vec![update(
-            "test/main",
-            Expected::Absent,
-            Some(fixture_commit()),
-        )],
-        false,
-    ));
-    let stored = block_on(repo.read_commit_detached_metadata(&fixture_commit()))
-        .unwrap()
-        .unwrap();
-    let keys: Vec<&str> = stored
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|e| e.as_tuple().unwrap()[0].as_str().unwrap())
-        .collect();
-    assert_eq!(keys, vec!["kept"]);
-}
-
 /// The `[ex-ostrya]` group that turns the related switch off.
 const DROP_RELATED: &str = "\n[ex-ostrya]\nkeep-detached-related=false\n";
 
@@ -723,43 +686,28 @@ fn insert_related(dict: &mut DictBuilder, name: &str, commit: &Checksum) {
 }
 
 /// With `keep-detached-related=false` in the repository, the session drops
-/// `ostrya.related` from the incoming dict, with and without a filter of the
-/// policy. The two rules apply together.
+/// `ostrya.related` from the incoming dict and stores each other property.
 #[test]
 fn the_switch_removes_the_related_key_from_the_incoming_dict() {
-    let filters = [
-        None,
-        Some(ostrya::DetachedMetadataFilter::excluding(["dropped"])),
-    ];
-    for filter in filters {
-        let tmp = TmpDir::new("recv-keep-related");
-        let repo = new_repo(&tmp, RepoMode::Archive, DROP_RELATED);
-        let mut dict = DictBuilder::new();
-        dict.insert_str("kept", "a");
-        dict.insert_str("dropped", "b");
-        insert_related(&mut dict, "layer/base", &fixture_commit());
-        let policy = ReceivePolicy {
-            detached_metadata_filter: filter.clone(),
-            ..policy()
-        };
-        committed(push(
-            &repo,
-            &policy,
-            &fixture_objects(Encoding::Raw),
-            &[(fixture_commit(), dict_bytes(&dict.build()))],
-            vec![update(
-                "test/main",
-                Expected::Absent,
-                Some(fixture_commit()),
-            )],
-            false,
-        ));
-        let expected: &[&str] = match filter {
-            Some(_) => &["kept"],
-            None => &["kept", "dropped"],
-        };
-        assert_eq!(fixture_detached_keys(&repo), expected);
-    }
+    let tmp = TmpDir::new("recv-keep-related");
+    let repo = new_repo(&tmp, RepoMode::Archive, DROP_RELATED);
+    let mut dict = DictBuilder::new();
+    dict.insert_str("kept", "a");
+    dict.insert_str("other", "b");
+    insert_related(&mut dict, "layer/base", &fixture_commit());
+    committed(push(
+        &repo,
+        &policy(),
+        &fixture_objects(Encoding::Raw),
+        &[(fixture_commit(), dict_bytes(&dict.build()))],
+        vec![update(
+            "test/main",
+            Expected::Absent,
+            Some(fixture_commit()),
+        )],
+        false,
+    ));
+    assert_eq!(fixture_detached_keys(&repo), ["kept", "other"]);
 }
 
 /// Under the switch, a receive merges into the stored dict, so it keeps a

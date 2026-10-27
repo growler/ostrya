@@ -217,9 +217,9 @@ use sha2::{Digest, Sha256};
 use crate::composefs::recorded_digest;
 use crate::error::{Error, Result};
 use crate::file::FileKind;
-use crate::modifier::FilterResult;
 use crate::perm;
 use crate::refs::{CollectionRef, collection_ref_to_relpath, refspec_to_relpath};
+use crate::related::RelatedRule;
 use crate::repo::Repo;
 use crate::summary::AdvertisedDelta;
 use crate::transaction::Transaction;
@@ -494,262 +494,6 @@ pub struct PullVerify {
     pub sign_summary: Option<bool>,
 }
 
-/// A callback that decides if a pull stores one property of detached metadata.
-///
-/// The pull calls it before it stores the metadata of a commit. The arguments
-/// are the commit, the key of the property, and the value of the property. The
-/// value is the `v` member of the `a{sv}` entry, so it is a
-/// [`Value::Variant`]. [`Allow`](FilterResult::Allow) stores the property,
-/// and [`Skip`](FilterResult::Skip) leaves it out.
-pub type DetachedMetadataFilterFn =
-    Arc<dyn Fn(&Checksum, &str, &Value) -> FilterResult + Send + Sync>;
-
-/// The detached-metadata filter of a pull, unset by default.
-///
-/// The pull calls the filter once for each property of the `.commitmeta` of
-/// each commit, and stores the properties that it allows. If the filter
-/// allows no property, the pull stores nothing, and the destination keeps the
-/// detached metadata that it holds.
-///
-/// The filter runs after each signature verification of the pull, over the
-/// metadata as the source holds it. A filter that drops a signature does not
-/// change the result of that verification. The stored commit then has no
-/// signature for a later verification.
-///
-/// The pull calls the filter on the blocking pool. The callback is shared (an
-/// `Arc`), because a pull from a remote carries several commits at a time and
-/// calls the filter from each. So several threads can call the filter at the
-/// same time. A filter that keeps state supplies its own interior mutability.
-/// If a pull fails while a filter call runs, that call runs to its end, so the
-/// callback can run after the pull returns the error.
-/// The pull can call the filter for a commit that a later check of the pull
-/// refuses, so a call does not mean that the pull stores the commit.
-///
-/// A pull from a remote with a list of static deltas
-/// ([`PullOptions::static_deltas`]) checks the signatures of each commit of a
-/// chain in discovery, before the transaction opens. If the pull verifies the
-/// signatures of commits, discovery calls the filter for each such commit
-/// right after its signature check, over the parse of that check. Discovery
-/// keeps the result, and the pull stores it with no second call. So the pull
-/// can also call the filter for a commit that a later plan of discovery drops,
-/// and for a commit of a pull that fails later in discovery. If the pull does
-/// not verify the signatures of commits, it calls the filter for a commit of a
-/// chain when it fetches the commit, as for each other commit.
-#[derive(Clone, Default)]
-pub struct DetachedMetadataFilter(Option<DetachedMetadataFilterFn>);
-
-impl DetachedMetadataFilter {
-    /// Creates a filter that calls `f` for each property.
-    pub fn new<F>(f: F) -> DetachedMetadataFilter
-    where
-        F: Fn(&Checksum, &str, &Value) -> FilterResult + Send + Sync + 'static,
-    {
-        DetachedMetadataFilter(Some(Arc::new(f)))
-    }
-
-    /// Creates a filter from a callback that the caller already holds.
-    ///
-    /// A caller can share one callback between several [`PullOptions`] this
-    /// way.
-    pub fn from_fn(f: DetachedMetadataFilterFn) -> DetachedMetadataFilter {
-        DetachedMetadataFilter(Some(f))
-    }
-
-    /// Creates a filter that drops the named metadata keys and keeps the
-    /// other properties.
-    ///
-    /// Each name matches the whole key of a property. An empty list keeps each
-    /// property, so the pull stores the source bytes unchanged. A name that no
-    /// commit holds drops nothing, and a name can occur more than once in the
-    /// list.
-    ///
-    /// If the list names each property of a commit, the pull writes nothing
-    /// for that commit, and the detached metadata that the destination holds
-    /// stays. A copy that the destination stored before the list named its
-    /// keys stays too.
-    ///
-    /// The `ostrya` CLI builds the filter with this constructor from the
-    /// repository config key `[ex-ostrya] detached-metadata-exclude`
-    /// ([`RepoConfig::detached_metadata_exclude`](crate::RepoConfig::detached_metadata_exclude)).
-    /// A pull does not read
-    /// `[ex-ostrya] detached-metadata-exclude`: it filters what its options
-    /// state.
-    pub fn excluding<I, S>(names: I) -> DetachedMetadataFilter
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        let names: Vec<String> = names.into_iter().map(Into::into).collect();
-        DetachedMetadataFilter::new(move |_, key, _| {
-            if names.iter().any(|name| name == key) {
-                FilterResult::Skip
-            } else {
-                FilterResult::Allow
-            }
-        })
-    }
-
-    /// Returns this filter with the rule of `[ex-ostrya]
-    /// keep-detached-related` of the destination.
-    ///
-    /// If `keep_related` is `true`, the call gives this filter back
-    /// unchanged. If it is `false`, the result drops `ostrya.related` and
-    /// does not call this filter for that key. It calls this filter for each
-    /// other property, and an unset filter allows each other property.
-    pub(crate) fn dropping_related(self, keep_related: bool) -> DetachedMetadataFilter {
-        if keep_related {
-            return self;
-        }
-        let inner = self.0;
-        DetachedMetadataFilter::new(move |commit, key, value| {
-            if key == crate::related::RELATED_KEY {
-                return FilterResult::Skip;
-            }
-            match &inner {
-                Some(f) => f(commit, key, value),
-                None => FilterResult::Allow,
-            }
-        })
-    }
-
-    /// Returns the serialized properties of `bytes` that this filter allows,
-    /// or `None` if the caller writes nothing.
-    ///
-    /// An unset filter, a filter that allows each property, and the zero-length
-    /// "no metadata" marker each give the input bytes back unchanged. So a pull
-    /// that filters nothing out stores the bytes of the source unchanged. A
-    /// filter that allows no property gives `None`, and the destination keeps
-    /// the detached metadata that it holds.
-    pub(crate) fn apply(&self, commit: &Checksum, bytes: Vec<u8>) -> Result<Option<Vec<u8>>> {
-        if self.0.is_none() {
-            return Ok(Some(bytes));
-        }
-        let Some(dict) = crate::summary::parse_signature_dict(&bytes)? else {
-            return Ok(Some(bytes));
-        };
-        self.apply_parsed(commit, bytes, dict)
-    }
-
-    /// Runs [`apply`](DetachedMetadataFilter::apply) on the blocking pool.
-    ///
-    /// An unset filter and the zero-length marker parse nothing, so they give
-    /// the input bytes back on the calling task.
-    pub(crate) async fn apply_on_pool(
-        &self,
-        commit: &Checksum,
-        bytes: Vec<u8>,
-    ) -> Result<Option<Vec<u8>>> {
-        if self.0.is_none() || bytes.is_empty() {
-            return Ok(Some(bytes));
-        }
-        let filter = self.clone();
-        let commit = *commit;
-        ostrya_rt::unblock(move || filter.apply(&commit, bytes)).await
-    }
-
-    /// Runs [`apply`](DetachedMetadataFilter::apply) over the `.commitmeta`
-    /// bytes `bytes`, whose parse is `dict`.
-    ///
-    /// The call parses nothing. It serializes only a dict of which the filter
-    /// keeps some properties. The result is the result of `apply`.
-    pub(crate) fn apply_parsed(
-        &self,
-        commit: &Checksum,
-        bytes: Vec<u8>,
-        dict: Value,
-    ) -> Result<Option<Vec<u8>>> {
-        let Some(filter) = &self.0 else {
-            return Ok(Some(bytes));
-        };
-        match kept_entries(filter, commit, dict)? {
-            Kept::All(_) => Ok(Some(bytes)),
-            Kept::Nothing => Ok(None),
-            Kept::Part(kept) => {
-                // The source bytes are not part of the result, so they drop
-                // before the serialization.
-                drop(bytes);
-                crate::summary::serialize_signature_dict(&Value::Array(kept)).map(Some)
-            }
-        }
-    }
-
-    /// Returns the properties of the parsed detached metadata `dict` that this
-    /// filter allows, or `None` if the caller writes nothing.
-    ///
-    /// An unset filter and a filter that allows each property give `dict`
-    /// back unchanged. A filter that allows no property gives `None`.
-    #[cfg_attr(not(feature = "push"), allow(dead_code))]
-    pub(crate) fn apply_value(&self, commit: &Checksum, dict: Value) -> Result<Option<Value>> {
-        let Some(filter) = &self.0 else {
-            return Ok(Some(dict));
-        };
-        match kept_entries(filter, commit, dict)? {
-            Kept::All(dict) => Ok(Some(dict)),
-            Kept::Nothing => Ok(None),
-            Kept::Part(kept) => Ok(Some(Value::Array(kept))),
-        }
-    }
-}
-
-/// The properties of a detached metadata dict that a filter keeps.
-enum Kept {
-    /// Every property: the dict as it came in.
-    All(Value),
-    /// Some of the properties, in their order.
-    Part(Vec<Value>),
-    /// No property.
-    Nothing,
-}
-
-/// Runs `filter` over each property of the detached metadata `dict` of
-/// `commit`.
-///
-/// A value that is not a dict, and an entry that is not `{sv}`, are
-/// [`Error::InvalidFormat`].
-fn kept_entries(filter: &DetachedMetadataFilterFn, commit: &Checksum, dict: Value) -> Result<Kept> {
-    let Value::Array(entries) = dict else {
-        return Err(Error::InvalidFormat(format!(
-            "detached metadata of {commit} is not a dict"
-        )));
-    };
-    let mut allowed = Vec::with_capacity(entries.len());
-    for entry in &entries {
-        let (key, value) = entry
-            .as_tuple()
-            .and_then(|fields| match fields {
-                [key, value] => key.as_str().map(|key| (key, value)),
-                _ => None,
-            })
-            .ok_or_else(|| {
-                Error::InvalidFormat(format!(
-                    "detached metadata of {commit} holds an entry that is not `{{sv}}`"
-                ))
-            })?;
-        allowed.push(filter(commit, key, value) == FilterResult::Allow);
-    }
-    if allowed.iter().all(|allow| *allow) {
-        return Ok(Kept::All(Value::Array(entries)));
-    }
-    if !allowed.iter().any(|allow| *allow) {
-        return Ok(Kept::Nothing);
-    }
-    let kept = entries
-        .into_iter()
-        .zip(allowed)
-        .filter_map(|(entry, allow)| allow.then_some(entry))
-        .collect();
-    Ok(Kept::Part(kept))
-}
-
-impl std::fmt::Debug for DetachedMetadataFilter {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self.0 {
-            Some(_) => f.write_str("DetachedMetadataFilter(set)"),
-            None => f.write_str("DetachedMetadataFilter(unset)"),
-        }
-    }
-}
-
 /// The options of a pull.
 ///
 /// The defaults give the behavior of [`Repo::pull_local`]. Each field that
@@ -767,9 +511,8 @@ impl std::fmt::Debug for DetachedMetadataFilter {
 ///   [`disable_static_deltas`](PullOptions::disable_static_deltas),
 ///   [`require_static_deltas`](PullOptions::require_static_deltas),
 ///   [`static_deltas`](PullOptions::static_deltas),
-///   [`verify`](PullOptions::verify),
-///   [`trust_group`](PullOptions::trust_group), and
-///   [`detached_metadata_filter`](PullOptions::detached_metadata_filter).
+///   [`verify`](PullOptions::verify), and
+///   [`trust_group`](PullOptions::trust_group).
 /// - Only a local pull reads [`collection_id`](PullOptions::collection_id).
 ///   A pull from a remote refuses it. [`Repo::pull_collection`] takes the
 ///   collection id as an argument, and states the other fields that it
@@ -1092,34 +835,6 @@ pub struct PullOptions {
     /// - [`Error::InvalidFormat`] if the section of the remote turns on a
     ///   commit check or holds a key source that no summary check reads.
     pub trust_group: Option<String>,
-    /// The properties of the detached metadata of a commit that this pull
-    /// stores.
-    ///
-    /// The default keeps each property, so the pull stores the bytes of the
-    /// source unchanged. The pull calls the filter on the blocking pool, and
-    /// several threads can call it at the same time. If a pull fails while a
-    /// filter call runs, that call runs to its end, so the callback can run
-    /// after the pull returns the error. A call does not mean that the pull
-    /// stores the commit: a later check of the pull can refuse it.
-    ///
-    /// If the pull verifies the signatures of commits, a pull from a remote
-    /// calls the filter for each commit of a chain of
-    /// [`static_deltas`](PullOptions::static_deltas) in discovery, right after
-    /// the signature check of the commit, before the transaction opens. So the
-    /// pull can call it for a commit that a later plan of discovery drops, or
-    /// for a commit of a pull that fails later in discovery. Else the pull
-    /// calls it when it fetches the commit, and discovery parses no
-    /// `.commitmeta`. So a `.commitmeta` that does not parse fails the pull
-    /// only for a commit that the pull fetches.
-    ///
-    /// The pull also applies `[ex-ostrya] keep-detached-related` of the
-    /// destination
-    /// ([`RepoConfig::keep_detached_related`](crate::RepoConfig::keep_detached_related)).
-    /// If it is `false`, the pull drops `ostrya.related` and does not call
-    /// the filter for that key. The pull then parses each `.commitmeta` as
-    /// it does for a set filter, so a `.commitmeta` that is not an `a{sv}`
-    /// dict fails the pull.
-    pub detached_metadata_filter: DetachedMetadataFilter,
     /// The handle to which a pull from a remote adds its live counters.
     ///
     /// A caller can show the progress of the pull while it runs. `None` keeps
@@ -1694,12 +1409,11 @@ impl Repo {
     /// publish and before the ref that names the commit. A verifier that reads
     /// the signatures with the commit needs this order.
     ///
-    /// The pull copies the `.commitmeta` of the first source that holds one,
-    /// through [`detached_metadata_filter`](PullOptions::detached_metadata_filter).
+    /// The pull copies the `.commitmeta` of the first source that holds one.
     /// If `[ex-ostrya] keep-detached-related` of this repository is `false`
     /// ([`RepoConfig::keep_detached_related`](crate::RepoConfig::keep_detached_related)),
-    /// the pull also drops `ostrya.related`. A zero-length `.commitmeta` in a
-    /// source is the "no metadata" marker, and it replaces the copy of this
+    /// the pull drops `ostrya.related` from it. A zero-length `.commitmeta` in
+    /// a source is the "no metadata" marker, and it replaces the copy of this
     /// repository. If no source holds a `.commitmeta`, the signature
     /// verification reads the copy of this repository.
     ///
@@ -1859,8 +1573,7 @@ impl Repo {
     /// - [`Error::InvalidFormat`] if the `summary` or `summary.sig` of `src` is
     ///   larger than 64 MiB or is not a regular file. Also if a static delta of
     ///   `src` is malformed, or if `src` does not hold a superblock of a chain
-    ///   when the pull applies its step. Also if a filter gets detached
-    ///   metadata that is not a dict of `{sv}` entries.
+    ///   when the pull applies its step.
     /// - [`Error::Io`] for an I/O failure of the file system. Also for a held
     ///   dirtree that the pull cannot read, that is not a regular file, or that
     ///   is larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
@@ -1873,7 +1586,7 @@ impl Repo {
         }
         check_depth(opts.depth)?;
         check_static_deltas(&opts)?;
-        keep_related(self, &mut opts)?;
+        let related = RelatedRule::of(self.config())?;
         let collection_relpaths = check_local_collection(&opts)?;
         let edges = take_static_deltas(&mut opts).await?;
         // The pull builds the signature policy before it reads the source. So
@@ -2164,7 +1877,7 @@ impl Repo {
                         &txn,
                         &sources,
                         &chain_commit.checksum,
-                        &opts.detached_metadata_filter,
+                        related,
                         None,
                     )
                     .await?;
@@ -2221,14 +1934,8 @@ impl Repo {
                     count,
                 )
                 .await?;
-                self.import_detached_metadata(
-                    &txn,
-                    &sources,
-                    commit,
-                    &opts.detached_metadata_filter,
-                    count,
-                )
-                .await?;
+                self.import_detached_metadata(&txn, &sources, commit, related, count)
+                    .await?;
                 Box::pin(self.import_composefs_image(&txn, &sources, chain_commit, flags, count))
                     .await?;
             }
@@ -2431,36 +2138,35 @@ impl Repo {
     }
 
     /// Stages the detached metadata of a commit in `txn`, from the first
-    /// source that holds it, through `filter`.
+    /// source that holds it, through `rule`.
     ///
-    /// If the filter keeps each property, the stored bytes are the bytes of the
+    /// If the rule keeps each property, the stored bytes are the bytes of the
     /// source unchanged. They get to `objects/` when `txn` commits. A source
-    /// with no `.commitmeta`, and a filter that allows no property, each leave
-    /// the copy of the destination unchanged.
+    /// with no `.commitmeta`, and a dict of which the rule keeps no property,
+    /// each leave the copy of the destination unchanged.
     ///
     /// If `count` is set, the call counts the `.commitmeta` as a fetch counts
     /// it when the bytes come from the source, the first of `sources`. The
-    /// count is the length of the bytes that the call read, before the
-    /// filter. A filter that fails counts the bytes first.
+    /// count is the length of the bytes that the call read, before the rule.
+    /// A rule that fails counts the bytes first.
     ///
-    /// The read and the filter run in one call on the blocking pool.
+    /// The read and the rule run in one call on the blocking pool.
     async fn import_detached_metadata(
         &self,
         txn: &Transaction,
         sources: &[&Repo],
         commit: &Checksum,
-        filter: &DetachedMetadataFilter,
+        rule: RelatedRule,
         count: Option<&PullCounters>,
     ) -> Result<()> {
         let owned: Vec<Repo> = sources.iter().map(|src| (*src).clone()).collect();
-        let filter = filter.clone();
         let key = *commit;
         let read = ostrya_rt::unblock(move || -> Result<_> {
             let Some((at, bytes)) = detached_bytes_from_blocking(&owned, &key)? else {
                 return Ok(None);
             };
             let len = bytes.len() as u64;
-            Ok(Some((at, len, filter.apply(&key, bytes))))
+            Ok(Some((at, len, rule.apply(&key, bytes))))
         })
         .await?;
         let Some((at, len, kept)) = read else {
@@ -2859,9 +2565,9 @@ impl ChainCheck<'_> {
         }
         // The verification reads the detached metadata as the source holds
         // it. That is the `.commitmeta` of the first source that holds one,
-        // else that of this repository. A filter makes the stored metadata
-        // smaller, so a later verification of the stored commit reads what the
-        // filter kept.
+        // else that of this repository. The rule of `[ex-ostrya]
+        // keep-detached-related` can make the stored metadata smaller, so a
+        // later verification of the stored commit reads what the rule kept.
         let sources: Vec<Repo> = self.sources.iter().map(|src| (*src).clone()).collect();
         check_local_commit_signatures(self.repo, self.verification, sources, commit, bytes)
             .await
@@ -2950,9 +2656,9 @@ async fn check_local_commit_signatures(
 /// The `.commitmeta` that the pull puts in place for a commit, after the
 /// signature check of the commit.
 enum CheckedMeta {
-    /// The bytes as the source holds them. The filter did not run.
+    /// The bytes as the source holds them. The rule did not run.
     Source(Vec<u8>),
-    /// The result of the filter: the bytes to stage, or `None` if the pull
+    /// The result of the rule: the bytes to stage, or `None` if the pull
     /// stages nothing.
     Filtered(Option<Vec<u8>>),
 }
@@ -2961,37 +2667,33 @@ impl CheckedMeta {
     /// Gives the bytes that the pull stages, or `None` if it stages nothing.
     ///
     /// [`CheckedMeta::Source`] goes through
-    /// [`apply_on_pool`](DetachedMetadataFilter::apply_on_pool).
-    async fn filtered(
-        self,
-        filter: &DetachedMetadataFilter,
-        commit: &Checksum,
-    ) -> Result<Option<Vec<u8>>> {
+    /// [`apply_on_pool`](RelatedRule::apply_on_pool).
+    async fn filtered(self, rule: RelatedRule, commit: &Checksum) -> Result<Option<Vec<u8>>> {
         match self {
-            CheckedMeta::Source(bytes) => filter.apply_on_pool(commit, bytes).await,
+            CheckedMeta::Source(bytes) => rule.apply_on_pool(commit, bytes).await,
             CheckedMeta::Filtered(kept) => Ok(kept),
         }
     }
 }
 
 /// Checks the signatures of `commit` as [`check_commit_signatures`] does, and
-/// runs `filter` over `detached` if the check parses it.
+/// runs `rule` over `detached` if the check parses it.
 ///
-/// If the policy checks commits, `filter` is set, and `detached` is `Some`,
-/// the filter reads the dict that the check parsed. The filter runs on the
-/// blocking pool after the check, so the call parses `detached` one time and
-/// gives [`CheckedMeta::Filtered`]. Else the call gives the bytes that
+/// If the policy checks commits, `rule` drops `ostrya.related`, and `detached`
+/// is `Some`, the rule reads the dict that the check parsed. The rule runs on
+/// the blocking pool after the check, so the call parses `detached` one time
+/// and gives [`CheckedMeta::Filtered`]. Else the call gives the bytes that
 /// [`check_commit_signatures`] gives back, as [`CheckedMeta::Source`].
 async fn check_commit_signatures_filtered(
     repo: &Repo,
     verification: &verify::Verification,
-    filter: &DetachedMetadataFilter,
+    rule: RelatedRule,
     commit: &Checksum,
     bytes: &[u8],
     detached: Option<Vec<u8>>,
 ) -> Result<Option<CheckedMeta>> {
     match detached {
-        Some(detached) if verification.checks_commits() && filter.0.is_some() => {
+        Some(detached) if verification.checks_commits() && rule.drop_related => {
             let (dict, detached) = parse_detached(detached).await;
             let dict = dict?;
             verification
@@ -3002,10 +2704,9 @@ async fn check_commit_signatures_filtered(
             let Some(dict) = dict else {
                 return Ok(Some(CheckedMeta::Filtered(Some(detached))));
             };
-            let filter = filter.clone();
             let commit = *commit;
             let kept =
-                ostrya_rt::unblock(move || filter.apply_parsed(&commit, detached, dict)).await?;
+                ostrya_rt::unblock(move || rule.apply_parsed(&commit, detached, dict)).await?;
             Ok(Some(CheckedMeta::Filtered(kept)))
         }
         detached => Ok(
@@ -3343,22 +3044,6 @@ fn check_static_deltas(opts: &PullOptions) -> Result<()> {
             "a pull with static_deltas takes no subpath".into(),
         ));
     }
-    Ok(())
-}
-
-/// Applies `[ex-ostrya] keep-detached-related` of `repo`, the destination of
-/// the pull, to the filter of `opts`.
-///
-/// Each entry point calls this function before its first request and before
-/// it reads a source.
-///
-/// # Errors
-///
-/// [`Error::Core`] if the value is not a boolean.
-fn keep_related(repo: &Repo, opts: &mut PullOptions) -> Result<()> {
-    let keep = repo.config().keep_detached_related()?;
-    opts.detached_metadata_filter =
-        std::mem::take(&mut opts.detached_metadata_filter).dropping_related(keep);
     Ok(())
 }
 

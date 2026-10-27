@@ -1349,11 +1349,12 @@ that hold storage.
 
 The push uploads a `.commitmeta` when the listing does not hold it, when
 its size in the listing differs, or when a read of it gives other bytes.
-So a second push with no change uploads no object. A `.commitmeta` that the
-detached metadata filter empties uploads nothing, and the bucket keeps its
-copy, as a pull with such a filter keeps the copy of the destination. An
-upload of an empty file and a delete of the bucket copy were rejected:
-each one removes metadata that the filter of the push did not name. An
+So a second push with no change uploads no object. A `.commitmeta` that
+holds `ostrya.related` alone uploads nothing under
+`[ex-ostrya] keep-detached-related=false` of the bucket, and the bucket keeps
+its copy, as a pull under the same switch keeps the copy of the destination.
+An upload of an empty file and a delete of the bucket copy were rejected:
+each one removes metadata other than `ostrya.related`. An
 upload of each `.commitmeta` of each source commit at each run was
 rejected: a second push with no change then uploads the `.commitmeta` of
 each source commit.
@@ -2119,12 +2120,24 @@ the rules.
   write and the add API always store the key, because the owner of the
   repository writes the value. A pull, also a pull-local and a pull through
   a static delta, and a push to a bucket replace the whole stored
-  `.commitmeta` with the filtered dict, so a stored value stays only if the
-  filtered dict is empty. A receive merges the incoming dict into the stored
-  dict, so a stored value stays. An option of the sender was rejected: the
-  rule belongs to the repository that stores the dict, and a sender that
-  does not set the option stores the key against the rule of the
+  `.commitmeta` with the dict that the switch leaves, so a stored value
+  stays only if that dict is empty. A receive merges the incoming dict into
+  the stored dict, so a stored value stays. An option of the sender was
+  rejected: the rule belongs to the repository that stores the dict, and a
+  sender that does not set the option stores the key against the rule of the
   destination.
+- The switch is the one rule that drops a detached metadata key in a
+  transfer. `[ex-ostrya] detached-metadata-exclude`, a list of keys to
+  drop, was removed with no alias and no refusal. The config reader ignores
+  an unknown key, so a config that sets it gets no filter and no message.
+  `DetachedMetadataFilter` and each option field that took it were removed
+  too: `PullOptions`, `RepoPushOptions`, `ExportStreamOptions`,
+  `ReceivePolicy`, and `StreamPolicy` carry no filter. The one key that a
+  distribution repository must not keep is `ostrya.related`, and the
+  destination reads its own switch, so the sender needs no option. A list
+  of keys to drop lets a fault span two configs: if an upstream drops a key
+  and a downstream roots on that key, the downstream prune deletes the
+  commits that the key kept, and no call reports it.
 - A config key that names more metadata keys with commit checksums was
   rejected. A reader then needs the repository config to find the related
   commits, and one dict is valid in one repository and not valid in

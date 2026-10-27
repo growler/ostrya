@@ -57,12 +57,12 @@ use ostrya::{
     BootableMetadata, BootableRefusal, CheckoutFilterFn, CheckoutMode, CheckoutOptions, Checksum,
     CollectionPullOptions, CollectionRef, CollectionRefEntry, CommitModifier, CommitModifierFlags,
     CommitOptions, ComposefsImageState, ComposefsOptions, CreateOptions, DeltaEndianness,
-    DeltaOptions, DeltaSuperblock, DetachedMetadataFilter, DevInoCache, DictBuilder, DiffChange,
-    DiffOptions, DiffSide, Ed25519Signer, Ed25519Verifier, Error, FileKind, FileMeta, FileObject,
-    FilterResult, FsckBindingError, FsckBindingErrorKind, FsckError, FsckErrorKind, FsckFailure,
-    FsckOptions, FsckPhase, MutableTree, ObjectType, OverwriteMode, PruneOptions, PullFlags,
-    PullOptions, PullProgress, PullProgressSnapshot, PullStats, PullVerify, RefAlias, Repo,
-    RepoConfig, RepoMode, RepoTree, Result, Signer, Summary, SummaryOptions, TarExportOptions,
+    DeltaOptions, DeltaSuperblock, DevInoCache, DictBuilder, DiffChange, DiffOptions, DiffSide,
+    Ed25519Signer, Ed25519Verifier, Error, FileKind, FileMeta, FileObject, FilterResult,
+    FsckBindingError, FsckBindingErrorKind, FsckError, FsckErrorKind, FsckFailure, FsckOptions,
+    FsckPhase, MutableTree, ObjectType, OverwriteMode, PruneOptions, PullFlags, PullOptions,
+    PullProgress, PullProgressSnapshot, PullStats, PullVerify, RefAlias, Repo, RepoConfig,
+    RepoMode, RepoTree, Result, Signer, Summary, SummaryOptions, TarExportOptions,
     TarImportOptions, TimestampCheck, Transaction, TransactionStats, TreeEntry, Type, Value,
     Verifier, VerifyOutcome, VerityPolicy, Xattrs, base64, from_bytes, load_sign_keys,
     load_sign_keys_from, to_text, to_text_unannotated, validate_refspec,
@@ -375,10 +375,8 @@ enum Command {
     /// The pull stores the objects in one transaction, and then writes each
     /// ref under `refs/remotes/<remote>/`, or under `refs/heads/` with
     /// --mirror. It verifies the signatures that the config of the remote or
-    /// the verify options ask for. The pull does not store the detached
-    /// metadata keys that `[ex-ostrya] detached-metadata-exclude` names. With
-    /// `[ex-ostrya] keep-detached-related=false`, it also drops
-    /// `ostrya.related`.
+    /// the verify options ask for. With `[ex-ostrya]
+    /// keep-detached-related=false`, the pull drops `ostrya.related`.
     ///
     /// On success, the command prints one statistics line to standard output.
     /// If standard output is a terminal, a progress line shows while the pull
@@ -391,9 +389,7 @@ enum Command {
     /// link is possible, the pull hardlinks an object of the source into this
     /// repository. The pull writes local refs, or remote refs under --remote.
     /// With --remote, the verification keys of the remote apply to the pull.
-    /// It drops the detached metadata keys that
-    /// `[ex-ostrya] detached-metadata-exclude` names. With
-    /// `[ex-ostrya] keep-detached-related=false`, it also drops
+    /// With `[ex-ostrya] keep-detached-related=false`, it drops
     /// `ostrya.related`.
     ///
     /// On success, the command prints one statistics line to standard output:
@@ -445,10 +441,9 @@ enum Command {
     /// not have. The server then updates all the refs of the refspecs in one
     /// transaction. Over ssh, the push runs the ssh client with the receive
     /// command on the remote side. Over HTTP, the push sends its requests to
-    /// the receive endpoint of `ostrya serve`. The push drops the detached
-    /// metadata keys that `[ex-ostrya] detached-metadata-exclude` names. To an
-    /// `s3://` address, the push reads `[ex-ostrya] keep-detached-related` from
-    /// the `config` of the bucket, and with `false` drops `ostrya.related`.
+    /// the receive endpoint of `ostrya serve`. To an `s3://` address, the
+    /// push reads `[ex-ostrya] keep-detached-related` from the `config` of the
+    /// bucket, and with `false` drops `ostrya.related`.
     ///
     /// The collection bindings of the source commits, or --collection, give
     /// the namespace of the push on the server: the local refs or one
@@ -4994,7 +4989,6 @@ async fn push(repo: Repo, name: &str, verbose: bool, mut args: PushArgs) -> Resu
     if args.onto.is_some() {
         return push_onto(repo, verbose, args).await;
     }
-    let detached_metadata_filter = detached_metadata_filter(&repo)?;
     let overrides = push_overrides(&mut args);
     let endpoint = ostrya::endpoint::resolve_push(Some(repo.config()), remote, overrides).await?;
     let (progress, bar) = PushBar::start();
@@ -5005,7 +4999,6 @@ async fn push(repo: Repo, name: &str, verbose: bool, mut args: PushArgs) -> Resu
         tags: args.tags,
         compression: push_compression(args.compress),
         force: args.force,
-        detached_metadata_filter,
         progress,
         #[cfg(feature = "s3")]
         break_lock: args.break_lock,
@@ -5953,9 +5946,6 @@ async fn pull(
 
     let terminal = std::io::IsTerminal::is_terminal(&std::io::stdout());
     let progress = terminal.then(PullProgress::new);
-    // The filter is read before the progress line starts, so if the read
-    // fails, no thread draws the line.
-    let detached_metadata_filter = detached_metadata_filter(&repo)?;
     let overrides = ostrya::endpoint::EndpointOverrides {
         url: args.url,
         http_headers: args.http_header,
@@ -5994,7 +5984,6 @@ async fn pull(
             sign: args.sign_verify,
             sign_summary: args.sign_verify_summary,
         },
-        detached_metadata_filter,
         progress,
         ..PullOptions::default()
     };
@@ -6220,20 +6209,6 @@ fn parse_http_header(arg: &str) -> std::result::Result<(String, String), String>
     }
 }
 
-/// Returns the detached-metadata filter that a pull into `repo` applies.
-///
-/// The filter comes from the repository config key
-/// `[ex-ostrya] detached-metadata-exclude`. An absent or empty key gives the
-/// default filter, which keeps every property and stores the source bytes
-/// verbatim.
-fn detached_metadata_filter(repo: &Repo) -> Result<DetachedMetadataFilter> {
-    let excluded = repo.config().detached_metadata_exclude()?;
-    if excluded.is_empty() {
-        return Ok(DetachedMetadataFilter::default());
-    }
-    Ok(DetachedMetadataFilter::excluding(excluded))
-}
-
 /// The source of the objects of a pull, which selects the statistics line.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PullSource {
@@ -6378,7 +6353,6 @@ async fn pull_local(repo: Repo, name: &str, args: PullLocalArgs) -> Result<()> {
                         .then_some(args.sign_verify_summary),
                 },
                 trust_group: args.trust,
-                detached_metadata_filter: detached_metadata_filter(&repo)?,
                 ..PullOptions::default()
             },
         )

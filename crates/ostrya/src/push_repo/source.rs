@@ -7,7 +7,7 @@ use ostrya_rt::FileReader;
 use crate::error::{Error, Result};
 use crate::file::FileKind;
 use crate::object;
-use crate::pull::DetachedMetadataFilter;
+use crate::related::RelatedRule;
 use crate::remote::{BoxFuture, DetachedMetadata, Encoding, ObjectData, ObjectSource};
 use crate::repo::Repo;
 
@@ -28,22 +28,27 @@ use crate::repo::Repo;
 /// calls. [`content_size`](ObjectSource::content_size) reads the metadata of
 /// each file object in one pass on the blocking pool. It reads no payload byte.
 ///
-/// The source applies the filter to the detached metadata of a commit. It
-/// gives the detached metadata as [`DetachedMetadata::Encoded`]. If the filter
-/// is unset or keeps each property, these are the bytes of the stored
-/// `.commitmeta` unchanged, so the session sends them with no parse or
-/// serialization of its own. With an unset filter, the source does not parse
-/// the `.commitmeta`, and the server checks it.
+/// The source applies the [`RelatedRule`] of its caller to the detached
+/// metadata of a commit. It gives the detached metadata as
+/// [`DetachedMetadata::Encoded`]. The push to a bucket gives the rule of
+/// `[ex-ostrya] keep-detached-related` of the bucket. The push to a server,
+/// the export stream, and the push `--onto` give the default rule, which
+/// drops nothing, and the receiver applies its own rule. If the rule drops
+/// nothing, the source does not parse the `.commitmeta`, and it gives the
+/// stored bytes unchanged. If the rule drops `ostrya.related` and the dict
+/// holds no `ostrya.related` entry, the source also gives the stored bytes
+/// unchanged. The session sends these bytes with no parse or serialization
+/// of its own.
 pub(crate) struct RepoSource {
     repo: Repo,
-    filter: DetachedMetadataFilter,
+    rule: RelatedRule,
 }
 
 impl RepoSource {
     /// Creates the source over `repo`. The detached metadata passes through
-    /// `filter`.
-    pub(crate) fn new(repo: Repo, filter: DetachedMetadataFilter) -> RepoSource {
-        RepoSource { repo, filter }
+    /// `rule`.
+    pub(crate) fn new(repo: Repo, rule: RelatedRule) -> RepoSource {
+        RepoSource { repo, rule }
     }
 
     async fn load(&self, name: &ObjectName, encoding: Encoding) -> Result<ObjectData> {
@@ -141,41 +146,41 @@ impl RepoSource {
         })
     }
 
-    /// Returns the detached metadata of `commit` that the filter allows. If the
-    /// commit has none or the filter allows no property, returns `None`.
+    /// Returns the detached metadata of `commit` that the rule keeps. If the
+    /// commit has none or the rule keeps no property, returns `None`.
     ///
-    /// The read, the parse, and the filter run in one call on the blocking
+    /// The read, the parse, and the rule run in one call on the blocking
     /// pool.
     async fn detached(&self, commit: &Checksum) -> Result<Option<Value>> {
         let repo = self.repo.clone();
-        let filter = self.filter.clone();
+        let rule = self.rule;
         let commit = *commit;
         ostrya_rt::unblock(
             move || match repo.read_commit_detached_metadata_blocking(&commit)? {
-                Some(dict) => filter.apply_value(&commit, dict),
+                Some(dict) => rule.apply_value(&commit, dict),
                 None => Ok(None),
             },
         )
         .await
     }
 
-    /// Returns the bytes of the detached metadata of `commit` that the filter
-    /// allows. If the commit has none or the filter allows no property,
-    /// returns `None`.
+    /// Returns the bytes of the detached metadata of `commit` that the rule
+    /// keeps. If the commit has none or the rule keeps no property, returns
+    /// `None`.
     ///
-    /// An unset filter gives the bytes of the stored `.commitmeta` unchanged,
-    /// and the call does not parse them. So a `.commitmeta` that is not an
-    /// `a{sv}` dict goes to the server as it is, and the server refuses it
-    /// with the code `protocol`. A set filter parses the file: a filter that
-    /// keeps each property gives the bytes unchanged, and a filter that keeps
-    /// some of the properties gives their normal form. With a set filter, a
-    /// `.commitmeta` that is not an `a{sv}` dict gives [`Error::Core`], as
-    /// [`detached`](RepoSource::detached) does. The read, the parse, the
-    /// filter, and the serialization of a partial result run in one call on
-    /// the blocking pool.
+    /// A rule that drops nothing gives the bytes of the stored `.commitmeta`
+    /// unchanged, and the call does not parse them. So a `.commitmeta` that is
+    /// not an `a{sv}` dict goes to the server as it is, and the server refuses
+    /// it with the code `protocol`. A rule that drops `ostrya.related` parses
+    /// the file: a dict with no `ostrya.related` entry gives the bytes
+    /// unchanged, and a dict with other properties gives the normal form of
+    /// these properties. With that rule, a `.commitmeta` that is not an `a{sv}`
+    /// dict gives [`Error::Core`], as [`detached`](RepoSource::detached) does.
+    /// The read, the parse, the rule, and the serialization of a partial result
+    /// run in one call on the blocking pool.
     pub(super) async fn detached_bytes(&self, commit: &Checksum) -> Result<Option<Vec<u8>>> {
         let repo = self.repo.clone();
-        let filter = self.filter.clone();
+        let rule = self.rule;
         let commit = *commit;
         ostrya_rt::unblock(move || {
             let bytes = match repo.load_object_bytes_blocking(ObjectType::CommitMeta, &commit) {
@@ -188,7 +193,7 @@ impl RepoSource {
             if bytes.is_empty() {
                 return Ok(None);
             }
-            filter.apply(&commit, bytes)
+            rule.apply(&commit, bytes)
         })
         .await
     }
@@ -254,12 +259,11 @@ impl ObjectSource for RepoSource {
     }
 }
 
-/// Pins at compile time that the source and its filter are `Send` and `Sync`,
-/// so they can move across tasks and threads.
+/// Pins at compile time that the source is `Send` and `Sync`, so it can move
+/// across tasks and threads.
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<RepoSource>();
-    assert_send_sync::<DetachedMetadataFilter>();
 };
 
 #[cfg(test)]
@@ -309,7 +313,12 @@ mod tests {
     }
 
     fn source(repo: &Repo) -> RepoSource {
-        RepoSource::new(repo.clone(), DetachedMetadataFilter::default())
+        RepoSource::new(repo.clone(), RelatedRule::default())
+    }
+
+    /// Returns the source over `repo` that drops `ostrya.related`.
+    fn dropping(repo: &Repo) -> RepoSource {
+        RepoSource::new(repo.clone(), RelatedRule { drop_related: true })
     }
 
     fn keys(dict: &Value) -> Vec<&str> {
@@ -621,7 +630,7 @@ mod tests {
     }
 
     #[test]
-    fn detached_metadata_comes_with_the_filter_applied() {
+    fn detached_metadata_comes_with_the_rule_applied() {
         ostrya_rt::block_on(async {
             let (_scratch, repo, commit) = fixture("detached", RepoMode::Archive).await;
             // No detached metadata.
@@ -635,9 +644,11 @@ mod tests {
 
             let mut dict = DictBuilder::new();
             dict.insert_str("xa.keep", "kept");
-            dict.insert_str("xa.drop", "dropped");
             dict.insert_str("xa.other", "kept too");
             repo.write_commit_detached_metadata(&commit, Some(&dict.build()))
+                .await
+                .unwrap();
+            repo.add_detached_related(&commit, "build/source", &commit)
                 .await
                 .unwrap();
 
@@ -646,19 +657,30 @@ mod tests {
                 .await
                 .unwrap()
                 .unwrap();
-            assert_eq!(keys(&all), ["xa.keep", "xa.drop", "xa.other"]);
+            assert_eq!(keys(&all), ["xa.keep", "xa.other", "ostrya.related"]);
 
-            let filtered =
-                RepoSource::new(repo.clone(), DetachedMetadataFilter::excluding(["xa.drop"]));
-            let kept = filtered.detached_metadata(&commit).await.unwrap().unwrap();
+            let kept = dropping(&repo)
+                .detached_metadata(&commit)
+                .await
+                .unwrap()
+                .unwrap();
             assert_eq!(keys(&kept), ["xa.keep", "xa.other"]);
 
-            // A filter that allows no property sends no detached metadata.
-            let none = RepoSource::new(
-                repo.clone(),
-                DetachedMetadataFilter::excluding(["xa.keep", "xa.drop", "xa.other"]),
+            // A dict that holds `ostrya.related` alone sends no detached
+            // metadata under the rule.
+            repo.write_commit_detached_metadata(&commit, None)
+                .await
+                .unwrap();
+            repo.add_detached_related(&commit, "build/source", &commit)
+                .await
+                .unwrap();
+            assert!(
+                dropping(&repo)
+                    .detached_metadata(&commit)
+                    .await
+                    .unwrap()
+                    .is_none()
             );
-            assert!(none.detached_metadata(&commit).await.unwrap().is_none());
         });
     }
 
@@ -672,14 +694,16 @@ mod tests {
         }
     }
 
-    /// The source gives the bytes of the stored `.commitmeta` unchanged for an
-    /// unset filter and for a filter that keeps each property. A partial
-    /// filter gives the normal form of the kept properties. An absent file,
-    /// the zero-length marker, and a filter that allows no property give
-    /// `None`. An unset filter does not parse the file, so a file that is not
-    /// an `a{sv}` dict goes as it is. A set filter refuses that file.
+    /// The source gives the bytes of the stored `.commitmeta` unchanged for a
+    /// rule that drops nothing, and for a dict with no `ostrya.related`
+    /// entry. A dict with `ostrya.related` and other properties gives the
+    /// normal form of the other properties under the rule. An absent file,
+    /// the zero-length marker, and a dict that holds `ostrya.related` alone
+    /// under the rule give `None`. A rule that drops nothing does not parse
+    /// the file, so a file that is not an `a{sv}` dict goes as it is. A rule
+    /// that drops `ostrya.related` refuses that file.
     #[test]
-    fn encoded_detached_metadata_is_the_stored_file_if_the_filter_keeps_each_property() {
+    fn encoded_detached_metadata_is_the_stored_file_if_the_rule_keeps_each_property() {
         ostrya_rt::block_on(async {
             let (scratch, repo, commit) = fixture("detached-encoded", RepoMode::Archive).await;
             let name = ObjectName::new(commit, ObjectType::CommitMeta);
@@ -690,51 +714,47 @@ mod tests {
                 .unwrap();
             assert!(stored(&scratch, &repo, &name).is_empty());
             assert_eq!(encoded(&source(&repo), &commit).await, None);
+            assert_eq!(encoded(&dropping(&repo), &commit).await, None);
 
             let mut dict = DictBuilder::new();
             dict.insert_str("xa.keep", "kept");
-            dict.insert_str("xa.drop", "dropped");
             let dict = dict.build();
             repo.write_commit_detached_metadata(&commit, Some(&dict))
                 .await
                 .unwrap();
             let file = stored(&scratch, &repo, &name);
-
             assert_eq!(encoded(&source(&repo), &commit).await.as_ref(), Some(&file));
-            let keep_all = RepoSource::new(
-                repo.clone(),
-                DetachedMetadataFilter::excluding(["xa.absent"]),
-            );
-            assert_eq!(encoded(&keep_all, &commit).await.as_ref(), Some(&file));
-
-            let partial =
-                RepoSource::new(repo.clone(), DetachedMetadataFilter::excluding(["xa.drop"]));
-            let kept: Vec<Value> = dict
-                .as_array()
-                .unwrap()
-                .iter()
-                .filter(|entry| entry.as_tuple().unwrap()[0].as_str() != Some("xa.drop"))
-                .cloned()
-                .collect();
             assert_eq!(
-                encoded(&partial, &commit).await,
-                Some(crate::summary::serialize_signature_dict(&Value::Array(kept)).unwrap())
+                encoded(&dropping(&repo), &commit).await.as_ref(),
+                Some(&file)
             );
 
-            let none = RepoSource::new(
-                repo.clone(),
-                DetachedMetadataFilter::excluding(["xa.keep", "xa.drop"]),
+            repo.add_detached_related(&commit, "build/source", &commit)
+                .await
+                .unwrap();
+            let file = stored(&scratch, &repo, &name);
+            assert_eq!(encoded(&source(&repo), &commit).await.as_ref(), Some(&file));
+            assert_eq!(
+                encoded(&dropping(&repo), &commit).await,
+                Some(crate::summary::serialize_signature_dict(&dict).unwrap())
             );
-            assert_eq!(encoded(&none, &commit).await, None);
+
+            repo.write_commit_detached_metadata(&commit, None)
+                .await
+                .unwrap();
+            repo.add_detached_related(&commit, "build/source", &commit)
+                .await
+                .unwrap();
+            assert_eq!(encoded(&dropping(&repo), &commit).await, None);
 
             let corrupt = b"\x01\x02\x03\x04\x05".to_vec();
             let path = loose_path(&commit, ObjectType::CommitMeta, repo.mode());
             std::fs::write(scratch.path().join("repo/objects").join(path), &corrupt).unwrap();
             assert_eq!(encoded(&source(&repo), &commit).await, Some(corrupt));
             let Err(crate::remote::Error::Source(inner)) =
-                keep_all.detached_metadata_encoded(&commit).await
+                dropping(&repo).detached_metadata_encoded(&commit).await
             else {
-                panic!("a set filter passed a corrupt .commitmeta");
+                panic!("the rule passed a corrupt .commitmeta");
             };
             assert!(
                 matches!(inner.downcast_ref::<Error>(), Some(Error::Core(_))),

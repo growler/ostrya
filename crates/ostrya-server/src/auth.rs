@@ -484,7 +484,6 @@ impl GroupAuth {
                     allow_privileged,
                     summary_signers,
                     update_summary,
-                    detached_metadata_filter,
                     group,
                 } = &**policy;
                 Arc::new(ReceivePolicy {
@@ -496,7 +495,6 @@ impl GroupAuth {
                     allow_privileged: *allow_privileged,
                     summary_signers: summary_signers.clone(),
                     update_summary: *update_summary,
-                    detached_metadata_filter: detached_metadata_filter.clone(),
                     group: group.clone(),
                 })
             }

@@ -32,8 +32,7 @@ const CONFIG_FILE: &str = "config";
 ///   [`fsverity`](RepoConfig::fsverity).
 /// - `[remote "<name>"]`: one section for each remote, read through
 ///   [`Remote`].
-/// - `[ex-ostrya]`: the keys that are ostrya extensions,
-///   [`detached_metadata_exclude`](RepoConfig::detached_metadata_exclude) and
+/// - `[ex-ostrya]`: the key that is an ostrya extension,
 ///   [`keep_detached_related`](RepoConfig::keep_detached_related).
 /// - The groups whose names start with `ex-ostrya` and a space, for example
 ///   `[ex-ostrya client "NAME"]`: the access of the clients of a server, and
@@ -450,33 +449,6 @@ impl RepoConfig {
             .unwrap_or(6))
     }
 
-    /// Returns the `[ex-ostrya] detached-metadata-exclude` list.
-    ///
-    /// The list names the detached metadata keys that this repository does not
-    /// store when it receives a commit. The repository also does not send these
-    /// keys when it serves a commit. The key is an ostrya extension, and the
-    /// list is empty by default.
-    ///
-    /// The `ostrya pull` and `ostrya pull-local` commands put this list into
-    /// [`PullOptions::detached_metadata_filter`](crate::PullOptions::detached_metadata_filter)
-    /// through
-    /// [`DetachedMetadataFilter::excluding`](crate::DetachedMetadataFilter::excluding).
-    /// Under the `receive` feature, `ReceivePolicies::from_config` reads it
-    /// into the filter of the receive path.
-    ///
-    /// The list controls what a pull stores. It does not change what the
-    /// repository already holds. If the list names each detached metadata key
-    /// of a commit, a pull keeps the copy that the destination holds. A new
-    /// pull after a change of this key does not remove a copy from an earlier
-    /// pull.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Core`] if the value holds a malformed escape sequence.
-    pub fn detached_metadata_exclude(&self) -> Result<Vec<String>> {
-        self.string_list(EX_OSTRYA, "detached-metadata-exclude")
-    }
-
     /// Returns `true` if a transfer into this repository stores
     /// `ostrya.related`.
     ///
@@ -488,18 +460,17 @@ impl RepoConfig {
     /// and [`Repo::pull_local`]. Under the `receive` feature, the receive
     /// path also applies it: the push session and the one-way stream. A push
     /// to a bucket repository reads the key from the `config` of the bucket.
-    /// The rule applies together with
-    /// [`detached_metadata_exclude`](RepoConfig::detached_metadata_exclude).
     ///
     /// A local write does not read the key: a commit write,
     /// [`Repo::write_commit_detached_metadata`], and
     /// [`Repo::add_detached_related`] store `ostrya.related`. The key controls
     /// what a transfer stores. A pull, also a local pull and a pull through a
     /// static delta, and a push to a bucket replace the whole stored
-    /// `.commitmeta` with the filtered dict. So a stored `ostrya.related`
-    /// stays only if the filtered dict is empty: the transfer then writes
-    /// nothing, and the destination keeps the copy that it holds. A receive
-    /// merges the incoming dict into the stored dict, so a stored value stays.
+    /// `.commitmeta` with the dict that the key leaves. So a stored
+    /// `ostrya.related` stays only if that dict is empty: the transfer then
+    /// writes nothing, and the destination keeps the copy that it holds. A
+    /// receive merges the incoming dict into the stored dict, so a stored
+    /// value stays.
     ///
     /// # Errors
     ///
@@ -529,15 +500,6 @@ impl RepoConfig {
         let canonical = self.keyfile.get_bool(CORE, "auto-update-summary")?;
         let alias = self.keyfile.get_bool(CORE, "commit-update-summary")?;
         Ok(canonical.unwrap_or(false) || alias.unwrap_or(false))
-    }
-
-    /// Reads a `;`-separated list key. The list is empty if the key is absent.
-    /// A value that the key-file syntax cannot split is an error.
-    fn string_list(&self, group: &str, key: &str) -> Result<Vec<String>> {
-        Ok(self
-            .keyfile
-            .get_string_list(group, key)?
-            .unwrap_or_default())
     }
 
     /// Returns the `[ex-integrity] composefs` setting.
@@ -1416,12 +1378,6 @@ mod tests {
     }
 
     #[test]
-    fn ex_ostrya_lists_are_empty_when_absent() {
-        let cfg = RepoConfig::parse(ARCHIVE_CONFIG).unwrap();
-        assert!(cfg.detached_metadata_exclude().unwrap().is_empty());
-    }
-
-    #[test]
     fn keep_detached_related_is_true_when_absent() {
         let cfg = RepoConfig::parse(ARCHIVE_CONFIG).unwrap();
         assert!(cfg.keep_detached_related().unwrap());
@@ -1443,40 +1399,6 @@ mod tests {
         assert!(read("1").unwrap());
         assert!(read("maybe").is_err());
         assert!(read("yes").is_err());
-    }
-
-    #[test]
-    fn ex_ostrya_lists_parse_their_values() {
-        let text = "[core]\nrepo_version=1\nmode=bare\n[ex-ostrya]\n\
-                    detached-metadata-exclude=app.roots\n";
-        let cfg = RepoConfig::parse(text).unwrap();
-        assert_eq!(
-            cfg.detached_metadata_exclude().unwrap(),
-            vec!["app.roots".to_owned()]
-        );
-    }
-
-    #[test]
-    fn an_ex_ostrya_list_takes_a_trailing_separator() {
-        // The key-file list convention writes a trailing `;`, which adds no
-        // empty element.
-        let text = "[core]\nrepo_version=1\nmode=bare\n[ex-ostrya]\n\
-                    detached-metadata-exclude=app.roots;app.caches;\n";
-        let cfg = RepoConfig::parse(text).unwrap();
-        assert_eq!(
-            cfg.detached_metadata_exclude().unwrap(),
-            vec!["app.roots".to_owned(), "app.caches".to_owned()]
-        );
-    }
-
-    #[test]
-    fn a_malformed_ex_ostrya_list_is_an_error() {
-        // A value that ends in a lone backslash is not a list that the
-        // key-file syntax can split.
-        let text = "[core]\nrepo_version=1\nmode=bare\n[ex-ostrya]\n\
-                    detached-metadata-exclude=app.roots\\\n";
-        let cfg = RepoConfig::parse(text).unwrap();
-        assert!(cfg.detached_metadata_exclude().is_err());
     }
 
     /// Summary regeneration is off by default, each key alone turns it on, and

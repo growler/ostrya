@@ -219,9 +219,8 @@ pub use ostrya_remote::proto::{
 pub use prune::{PruneOptions, PruneStats, WeakRefFilter, WeakRefFilterFn};
 #[doc(hidden)]
 pub use pull::{
-    CollectionPullEvent, CollectionPullOptions, CollectionPullRef, CollectionPullStats,
-    DetachedMetadataFilter, DetachedMetadataFilterFn, PullFlags, PullOptions, PullProgress,
-    PullProgressSnapshot, PullStats, PullVerify, TimestampCheck,
+    CollectionPullEvent, CollectionPullOptions, CollectionPullRef, CollectionPullStats, PullFlags,
+    PullOptions, PullProgress, PullProgressSnapshot, PullStats, PullVerify, TimestampCheck,
 };
 #[cfg(feature = "push")]
 pub use push_repo::{ExportStreamOptions, PushOntoOptions, RepoPushOptions, is_push_address};

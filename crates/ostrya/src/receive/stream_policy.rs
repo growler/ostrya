@@ -2,8 +2,6 @@
 
 use std::sync::Arc;
 
-use crate::pull::DetachedMetadataFilter;
-
 use super::{ReceivePattern, ReceiveVerify, ServerSigner};
 
 /// The rules that decide what a one-way stream accepts.
@@ -19,8 +17,7 @@ use super::{ReceivePattern, ReceiveVerify, ServerSigner};
 ///   plain refs with no signature verification
 /// - no pattern rule, so every remote ref is refused
 /// - no privileged content
-/// - no summary signer and no summary regeneration
-/// - no detached-metadata filter.
+/// - no summary signer and no summary regeneration.
 ///
 /// A one-way stream adds no server signature and does not regenerate the
 /// summary. It ignores [`StreamRule::signers`],
@@ -44,12 +41,6 @@ pub struct StreamPolicy {
     pub summary_signers: Vec<Arc<ServerSigner>>,
     /// The switch of the summary regeneration. A one-way stream ignores it.
     pub update_summary: bool,
-    /// The detached-metadata keys that the repository does not store.
-    ///
-    /// `None` stores every key. If `[ex-ostrya] keep-detached-related` of the
-    /// repository is `false`, the session also drops `ostrya.related` and
-    /// does not call the filter for that key.
-    pub detached_metadata_filter: Option<DetachedMetadataFilter>,
 }
 
 /// The rule that applies to an update of a ref in a one-way stream.

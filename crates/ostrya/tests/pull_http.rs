@@ -26,7 +26,6 @@ mod pull;
 use std::collections::HashSet;
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use common::{
@@ -43,10 +42,9 @@ use ostrya::sign::Ed25519Verifier;
 use ostrya::verify::{PullTrust, TrustedKeys};
 use ostrya::{
     AdvertisedDelta, ArchiveAnswer, ArchiveView, Checksum, CommitModifierFlags, CommitState,
-    CreateOptions, DeltaEndianness, DeltaOptions, DeltaSuperblock, DetachedMetadataFilter,
-    Ed25519Signer, Error, FilterResult, FsckOptions, PullFlags, PullOptions, PullStats, PullVerify,
-    Repo, RepoMode, Signer, SummaryOptions, TimestampCheck, TreeEntry, Type, Value,
-    static_delta_relative_dir,
+    CreateOptions, DeltaEndianness, DeltaOptions, DeltaSuperblock, Ed25519Signer, Error,
+    FsckOptions, PullFlags, PullOptions, PullStats, PullVerify, Repo, RepoMode, Signer,
+    SummaryOptions, TimestampCheck, TreeEntry, Type, Value, static_delta_relative_dir,
 };
 use ostrya_rt::{TcpListener, block_on, spawn};
 use proxy::{TestProxy, Tunnel};
@@ -167,70 +165,6 @@ fn pulls_a_ref_and_its_tree_then_fetches_nothing_the_second_time() {
                 "config".to_owned(),
                 meta_path(&commit, "commitmeta"),
             ]
-        );
-    });
-}
-
-/// The detached-metadata filter controls what an HTTP pull stores, as it does
-/// for a local pull. The remote serves the whole `.commitmeta`, and the
-/// destination keeps the properties that the filter allows.
-#[test]
-fn a_filter_shapes_the_detached_metadata_an_http_pull_stores() {
-    block_on(async {
-        let dir = TmpDir::new("pull-http-detached-filter");
-        let (remote, commit) = build_remote(dir.path()).await;
-        let meta = Value::Array(vec![
-            Value::Tuple(vec![
-                Value::Str("test.detached".to_owned()),
-                Value::Variant(Box::new((
-                    Type::parse("s").unwrap(),
-                    Value::Str("present".to_owned()),
-                ))),
-            ]),
-            Value::Tuple(vec![
-                Value::Str("test.private".to_owned()),
-                Value::Variant(Box::new((
-                    Type::parse("s").unwrap(),
-                    Value::Str("repository-local".to_owned()),
-                ))),
-            ]),
-        ]);
-        remote
-            .write_commit_detached_metadata(&commit, Some(&meta))
-            .await
-            .unwrap();
-        let server = RepoServer::start(&dir.path().join("remote"), false).await;
-        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
-
-        dest.pull(
-            "origin",
-            PullOptions {
-                refs: vec!["test/main".to_owned()],
-                detached_metadata_filter: DetachedMetadataFilter::new(|_, key, _| {
-                    if key == "test.private" {
-                        FilterResult::Skip
-                    } else {
-                        FilterResult::Allow
-                    }
-                }),
-                ..PullOptions::default()
-            },
-        )
-        .await
-        .unwrap();
-
-        let stored = dest
-            .read_commit_detached_metadata(&commit)
-            .await
-            .unwrap()
-            .expect("the allowed property is stored");
-        assert!(
-            stored.dict_get("test.detached").is_some(),
-            "an allowed property is stored"
-        );
-        assert!(
-            stored.dict_get("test.private").is_none(),
-            "a skipped property is not"
         );
     });
 }
@@ -4522,15 +4456,15 @@ fn a_parent_reached_under_depth_is_checked_too() {
     });
 }
 
-/// A pull that verifies the commit signatures and filters the detached
-/// metadata calls the filter one time for each property of the `.commitmeta`.
-/// A filter that keeps each property stores the bytes of the remote unchanged.
-/// A filter that drops a property stores the other properties in normal form,
-/// and the verification reads the whole metadata.
+/// A pull that verifies the commit signatures applies the switch of the
+/// destination to the `.commitmeta` that the verification read. With the
+/// default switch, the pull stores the bytes of the remote unchanged. With
+/// `keep-detached-related=false`, it stores the other properties in normal
+/// form, and the verification reads the whole metadata.
 #[test]
-fn a_verified_pull_filters_the_detached_metadata_one_time() {
+fn a_verified_pull_applies_the_switch_to_the_detached_metadata() {
     block_on(async {
-        let dir = TmpDir::new("pull-http-verify-filter");
+        let dir = TmpDir::new("pull-http-verify-switch");
         let (remote, commit) = build_remote(dir.path()).await;
         remote
             .write_commit_detached_metadata(&commit, Some(&detached_dict()))
@@ -4538,62 +4472,57 @@ fn a_verified_pull_filters_the_detached_metadata_one_time() {
             .unwrap();
         let signer = Ed25519Signer::from_base64(SECRET_B64).unwrap();
         remote.sign_commit(&commit, &signer).await.unwrap();
+        remote
+            .add_detached_related(&commit, "layer/base", &commit)
+            .await
+            .unwrap();
         let Some(Value::Array(entries)) =
             remote.read_commit_detached_metadata(&commit).await.unwrap()
         else {
             panic!("the remote holds a dict");
         };
-        assert_eq!(entries.len(), 2, "the property and the signature");
+        assert_eq!(
+            entries.len(),
+            3,
+            "the property, the signature, and the related key"
+        );
         let server = RepoServer::start(remote.path(), false).await;
         let extra = format!("sign-verify=ed25519\nverification-ed25519-key={PUBLIC_B64}\n");
         let commitmeta = |root: &Path| std::fs::read(root.join(meta_path(&commit, "commitmeta")));
 
-        for dropped in [None, Some("test.detached")] {
+        for switch in ["", DROP_RELATED] {
             let _ = std::fs::remove_dir_all(dir.path().join("dest"));
-            let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), &extra).await;
-            let calls = Arc::new(AtomicUsize::new(0));
-            let counted = calls.clone();
-            let filter = DetachedMetadataFilter::new(move |_, key, _| {
-                counted.fetch_add(1, Ordering::Relaxed);
-                if Some(key) == dropped {
-                    FilterResult::Skip
-                } else {
-                    FilterResult::Allow
-                }
-            });
-
-            pull_main(
-                &dest,
-                PullOptions {
-                    detached_metadata_filter: filter,
-                    ..PullOptions::default()
-                },
+            let dest = build_dest(
+                dir.path(),
+                RepoMode::Archive,
+                &server.url(),
+                &format!("{extra}{switch}"),
             )
-            .await
-            .unwrap();
+            .await;
 
-            assert_eq!(calls.load(Ordering::Relaxed), entries.len(), "{dropped:?}");
-            match dropped {
-                None => assert_eq!(
+            pull_main(&dest, PullOptions::default()).await.unwrap();
+
+            if switch.is_empty() {
+                assert_eq!(
                     commitmeta(&dir.path().join("dest")).unwrap(),
                     commitmeta(remote.path()).unwrap()
-                ),
-                Some(key) => {
-                    // The read accepts normal form alone, so the stored bytes
-                    // are the normal form of the kept properties.
-                    let kept: Vec<Value> = entries
-                        .iter()
-                        .filter(|entry| {
-                            entry.as_tuple().and_then(|fields| fields[0].as_str()) != Some(key)
-                        })
-                        .cloned()
-                        .collect();
-                    assert_eq!(kept.len(), 1);
-                    assert_eq!(
-                        dest.read_commit_detached_metadata(&commit).await.unwrap(),
-                        Some(Value::Array(kept))
-                    );
-                }
+                );
+            } else {
+                // The read accepts normal form alone, so the stored bytes are
+                // the normal form of the kept properties.
+                let kept: Vec<Value> = entries
+                    .iter()
+                    .filter(|entry| {
+                        entry.as_tuple().and_then(|fields| fields[0].as_str())
+                            != Some("ostrya.related")
+                    })
+                    .cloned()
+                    .collect();
+                assert_eq!(kept.len(), 2);
+                assert_eq!(
+                    dest.read_commit_detached_metadata(&commit).await.unwrap(),
+                    Some(Value::Array(kept))
+                );
             }
         }
     });
@@ -7736,92 +7665,9 @@ fn a_pull_with_no_target_reads_no_timestamp_commit() {
     });
 }
 
-/// The detached-metadata filter applies to the `.commitmeta` that discovery
-/// keeps for an intermediate commit. The remote adds a private key to the
-/// signed `.commitmeta` of each commit. The pull passes under a signature
-/// policy, requests each intermediate `.commitmeta` once, and stores each
-/// with the signature and without the private key.
-#[test]
-fn the_detached_filter_applies_to_an_intermediate_commit() {
-    block_on(async {
-        let dir = TmpDir::new("pull-http-chain-detached-filter");
-        let (remote, [a, b, c, d]) = build_chain_remote(dir.path()).await;
-        sign_commits(&remote, &[a, b, c, d]).await;
-        for commit in [b, c, d] {
-            let Some(Value::Array(mut entries)) =
-                remote.read_commit_detached_metadata(&commit).await.unwrap()
-            else {
-                panic!("{commit} has no signed .commitmeta");
-            };
-            entries.push(Value::Tuple(vec![
-                Value::Str("test.private".to_owned()),
-                Value::Variant(Box::new((
-                    Type::parse("s").unwrap(),
-                    Value::Str("repository-local".to_owned()),
-                ))),
-            ]));
-            remote
-                .write_commit_detached_metadata(&commit, Some(&Value::Array(entries)))
-                .await
-                .unwrap();
-        }
-        let mut list = Vec::new();
-        for (from, to) in [(a, b), (b, c), (c, d)] {
-            list.push(listed(&remote, &from, &to, DeltaOptions::default()).await);
-        }
-        let server = RepoServer::start(remote.path(), false).await;
-        drop(dest_holding(dir.path(), &server.url(), &a).await);
-        let dest = reconfigure_dest(dir.path(), &server.url(), &signed_policy()).await;
-        let dest_dir = dir.path().join("dest");
-        server.forget();
-
-        let opts = PullOptions {
-            detached_metadata_filter: DetachedMetadataFilter::new(|_, key, _| {
-                if key == "test.private" {
-                    FilterResult::Skip
-                } else {
-                    FilterResult::Allow
-                }
-            }),
-            ..chain_opts(list)
-        };
-        dest.pull("origin", opts).await.unwrap();
-
-        let seen = server.seen();
-        for commit in [b, c, d] {
-            assert_eq!(
-                server.requests_for(&meta_path(&commit, "commitmeta")),
-                1,
-                "{seen:?}"
-            );
-            let held = remote
-                .read_commit_detached_metadata(&commit)
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(held.dict_get("test.private").is_some());
-            let stored = dest
-                .read_commit_detached_metadata(&commit)
-                .await
-                .unwrap()
-                .expect("the signature is stored");
-            assert!(
-                stored.dict_get("ostree.sign.ed25519").is_some(),
-                "{commit}: {stored:?}"
-            );
-            assert!(
-                stored.dict_get("test.private").is_none(),
-                "{commit}: {stored:?}"
-            );
-            assert_complete(&remote, &dest, &dest_dir, &commit).await;
-        }
-        assert_no_markers(&dest_dir);
-    });
-}
-
 /// The switch of the destination applies to the `.commitmeta` of each commit
 /// of a chain of static deltas, with and without a signature policy. A
-/// verified pull filters it in discovery, and an unverified pull when it
+/// verified pull applies it in discovery, and an unverified pull when it
 /// fetches the commit. The pull stores each commit without `ostrya.related`.
 #[test]
 fn the_switch_applies_to_each_commit_of_a_chain() {
@@ -7865,39 +7711,28 @@ fn the_switch_applies_to_each_commit_of_a_chain() {
     }
 }
 
-/// A verified pull of a chain calls the detached-metadata filter one time for
-/// each property of the `.commitmeta` of each commit of the chain. Discovery
-/// runs the filter, and the commit step stores its result with no second
-/// call. A filter that keeps each property stores the bytes of the remote
-/// unchanged. A filter that drops a property stores the other properties.
-/// The pull requests each `.commitmeta` once.
+/// A verified pull of a chain applies the switch of the destination to the
+/// `.commitmeta` of each commit of the chain. Discovery applies it, and the
+/// commit step stores its result. With the default switch, the pull stores
+/// the bytes of the remote unchanged. With `keep-detached-related=false`, it
+/// stores the signature and drops `ostrya.related`. The pull requests each
+/// `.commitmeta` once.
 #[test]
-fn a_verified_chain_pull_filters_each_commitmeta_one_time() {
+fn a_verified_chain_pull_applies_the_switch_to_each_commitmeta() {
     block_on(async {
-        let dir = TmpDir::new("pull-http-chain-filter-count");
+        let dir = TmpDir::new("pull-http-chain-switch-verified");
         let (remote, [a, b, c, d]) = build_chain_remote(dir.path()).await;
         sign_commits(&remote, &[a, b, c, d]).await;
-        let mut properties = 0;
         for commit in [b, c, d] {
-            let Some(Value::Array(mut entries)) =
-                remote.read_commit_detached_metadata(&commit).await.unwrap()
-            else {
-                panic!("{commit} has no signed .commitmeta");
-            };
-            entries.push(Value::Tuple(vec![
-                Value::Str("test.private".to_owned()),
-                Value::Variant(Box::new((
-                    Type::parse("s").unwrap(),
-                    Value::Str("repository-local".to_owned()),
-                ))),
-            ]));
-            properties += entries.len();
             remote
-                .write_commit_detached_metadata(&commit, Some(&Value::Array(entries)))
+                .add_detached_related(&commit, "layer/base", &a)
                 .await
                 .unwrap();
+            assert_eq!(
+                detached_keys(&remote, &commit).await,
+                ["ostree.sign.ed25519", "ostrya.related"]
+            );
         }
-        assert_eq!(properties, 6, "a signature and a private key for each");
         let mut list = Vec::new();
         for (from, to) in [(a, b), (b, c), (c, d)] {
             list.push(listed(&remote, &from, &to, DeltaOptions::default()).await);
@@ -7905,56 +7740,46 @@ fn a_verified_chain_pull_filters_each_commitmeta_one_time() {
         let server = RepoServer::start(remote.path(), false).await;
         let dest_dir = dir.path().join("dest");
 
-        for dropped in [None, Some("test.private")] {
+        for switch in ["", DROP_RELATED] {
             let _ = std::fs::remove_dir_all(&dest_dir);
             drop(dest_holding(dir.path(), &server.url(), &a).await);
-            let dest = reconfigure_dest(dir.path(), &server.url(), &signed_policy()).await;
+            let extra = format!("{}{switch}", signed_policy());
+            let dest = reconfigure_dest(dir.path(), &server.url(), &extra).await;
             server.forget();
-            let calls = Arc::new(AtomicUsize::new(0));
-            let counted = calls.clone();
-            let opts = PullOptions {
-                detached_metadata_filter: DetachedMetadataFilter::new(move |_, key, _| {
-                    counted.fetch_add(1, Ordering::Relaxed);
-                    if Some(key) == dropped {
-                        FilterResult::Skip
-                    } else {
-                        FilterResult::Allow
-                    }
-                }),
-                ..chain_opts(list.clone())
-            };
-            dest.pull("origin", opts).await.unwrap();
 
-            assert_eq!(calls.load(Ordering::Relaxed), properties, "{dropped:?}");
+            dest.pull("origin", chain_opts(list.clone())).await.unwrap();
+
             let seen = server.seen();
             for commit in [b, c, d] {
                 let path = meta_path(&commit, "commitmeta");
-                assert_eq!(server.requests_for(&path), 1, "{dropped:?}: {seen:?}");
-                match dropped {
-                    None => assert_eq!(
+                assert_eq!(server.requests_for(&path), 1, "{switch:?}: {seen:?}");
+                if switch.is_empty() {
+                    assert_eq!(
                         std::fs::read(dest_dir.join(&path)).unwrap(),
                         std::fs::read(remote.path().join(&path)).unwrap(),
                         "{commit}"
-                    ),
-                    Some(key) => {
-                        let Some(Value::Array(entries)) =
-                            remote.read_commit_detached_metadata(&commit).await.unwrap()
-                        else {
-                            panic!("{commit} has no .commitmeta");
-                        };
-                        let kept: Vec<Value> = entries
-                            .into_iter()
-                            .filter(|entry| {
-                                entry.as_tuple().and_then(|fields| fields[0].as_str()) != Some(key)
-                            })
-                            .collect();
-                        assert_eq!(kept.len(), 1, "{commit}");
-                        assert_eq!(
-                            dest.read_commit_detached_metadata(&commit).await.unwrap(),
-                            Some(Value::Array(kept)),
-                            "{commit}"
-                        );
-                    }
+                    );
+                } else {
+                    assert_eq!(
+                        detached_keys(&dest, &commit).await,
+                        ["ostree.sign.ed25519"],
+                        "{commit}"
+                    );
+                    let stored = dest
+                        .read_commit_detached_metadata(&commit)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    let held = remote
+                        .read_commit_detached_metadata(&commit)
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(
+                        stored.dict_get("ostree.sign.ed25519"),
+                        held.dict_get("ostree.sign.ed25519"),
+                        "{commit}"
+                    );
                 }
                 assert_complete(&remote, &dest, &dest_dir, &commit).await;
             }
@@ -7964,14 +7789,14 @@ fn a_verified_chain_pull_filters_each_commitmeta_one_time() {
 }
 
 /// With commit verification off, discovery does not parse the `.commitmeta`
-/// of a commit of a chain. A filter set on the pull, and a `.commitmeta` of an
-/// intermediate commit that does not parse, do not change the error of the
-/// pull: the timestamp check of the target in discovery refuses the pull
-/// first.
+/// of a commit of a chain. `keep-detached-related=false` in the destination,
+/// and a `.commitmeta` of an intermediate commit that does not parse, do not
+/// change the error of the pull: the timestamp check of the target in
+/// discovery refuses the pull first.
 #[test]
-fn an_unverified_chain_pull_does_not_filter_in_discovery() {
+fn an_unverified_chain_pull_does_not_apply_the_switch_in_discovery() {
     block_on(async {
-        let dir = TmpDir::new("pull-http-chain-filter-unverified-order");
+        let dir = TmpDir::new("pull-http-chain-switch-unverified-order");
         let (remote, [a, b, c, d]) = build_chain_remote(dir.path()).await;
         let mut list = Vec::new();
         for (from, to) in [(a, b), (b, c), (c, d)] {
@@ -7991,9 +7816,10 @@ fn an_unverified_chain_pull_does_not_filter_in_discovery() {
             FIXED_TS + 100,
         )
         .await;
+        drop(dest);
+        let dest = reconfigure_dest(dir.path(), &server.url(), DROP_RELATED).await;
         let opts = PullOptions {
             timestamp_check: TimestampCheck::Rev(newer),
-            detached_metadata_filter: DetachedMetadataFilter::excluding(["absent.key"]),
             ..chain_opts(list)
         };
         match dest.pull("origin", opts).await {
@@ -8005,14 +7831,15 @@ fn an_unverified_chain_pull_does_not_filter_in_discovery() {
     });
 }
 
-/// With commit verification off, a `.commitmeta` that does not parse fails no
-/// pull for a commit that discovery checks and a later plan drops. The list
-/// gives a->c and c->d, and the remote lacks the superblock c->d, so the pull
-/// fetches d loose and never fetches c.
+/// With commit verification off and `keep-detached-related=false` in the
+/// destination, a `.commitmeta` that does not parse fails no pull for a
+/// commit that discovery checks and a later plan drops. The list gives a->c
+/// and c->d, and the remote lacks the superblock c->d, so the pull fetches d
+/// loose and never fetches c.
 #[test]
 fn an_unverified_chain_pull_skips_the_commitmeta_of_a_dropped_commit() {
     block_on(async {
-        let dir = TmpDir::new("pull-http-chain-filter-unverified-dropped");
+        let dir = TmpDir::new("pull-http-chain-switch-unverified-dropped");
         let (remote, [a, _b, c, d]) = build_chain_remote(dir.path()).await;
         let mut list = Vec::new();
         for (from, to) in [(a, c), (c, d)] {
@@ -8023,13 +7850,10 @@ fn an_unverified_chain_pull_skips_the_commitmeta_of_a_dropped_commit() {
         std::fs::write(remote.path().join(&path), b"\x01\x02\x03\x04\x05").unwrap();
         let server = RepoServer::start(remote.path(), false).await;
         let dest_dir = dir.path().join("dest");
-        let dest = dest_holding(dir.path(), &server.url(), &a).await;
+        drop(dest_holding(dir.path(), &server.url(), &a).await);
+        let dest = reconfigure_dest(dir.path(), &server.url(), DROP_RELATED).await;
         server.forget();
-        let opts = PullOptions {
-            detached_metadata_filter: DetachedMetadataFilter::excluding(["absent.key"]),
-            ..chain_opts(list)
-        };
-        dest.pull("origin", opts).await.unwrap();
+        dest.pull("origin", chain_opts(list)).await.unwrap();
         assert_eq!(server.requests_for(&path), 1, "{:?}", server.seen());
         assert_complete(&remote, &dest, &dest_dir, &d).await;
         assert_no_markers(&dest_dir);

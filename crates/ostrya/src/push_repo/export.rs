@@ -10,9 +10,9 @@ use super::negotiate::check_ref_binding;
 use super::source::RepoSource;
 use crate::error::Result;
 use crate::lock::LockKind;
-use crate::pull::DetachedMetadataFilter;
 use crate::read::CommitState;
 use crate::refs::validate_refspec;
+use crate::related::RelatedRule;
 use crate::remote::{Compression, Expected, PushStats, RefUpdate, SessionOptions};
 use crate::repo::Repo;
 
@@ -30,14 +30,6 @@ pub struct ExportStreamOptions {
     pub updates: Vec<RefUpdate>,
     /// The encoding of the content objects.
     pub compression: Compression,
-    /// The filter for the detached metadata of each commit in the stream.
-    ///
-    /// If the filter is unset, the stream carries every key. The stream then
-    /// carries the stored `.commitmeta` bytes with no parse, so the receiver
-    /// refuses a `.commitmeta` that is not an `a{sv}` dict. A set filter
-    /// parses the file, and such a file gives
-    /// [`Source`](crate::remote::Error::Source).
-    pub detached_metadata_filter: DetachedMetadataFilter,
 }
 
 /// Methods that export commits as a one-way stream.
@@ -56,11 +48,10 @@ impl Repo {
     ///
     /// The stream carries each new commit once. With each commit, it carries
     /// each object that the tree of the commit reaches. It also carries the
-    /// detached metadata of the commit after
-    /// [`detached_metadata_filter`](ExportStreamOptions::detached_metadata_filter).
-    /// If the repository holds the composefs image of a new commit, the
-    /// stream carries the image after the trees. The stream carries no parent
-    /// commit.
+    /// stored `.commitmeta` bytes of the commit with no parse, so the receiver
+    /// refuses a `.commitmeta` that is not an `a{sv}` dict. If the repository
+    /// holds the composefs image of a new commit, the stream carries the image
+    /// after the trees. The stream carries no parent commit.
     ///
     /// The call does no negotiation, so it sends each object, also the
     /// objects that the receiver holds.
@@ -242,7 +233,7 @@ impl Repo {
         .await?;
         names.extend(images);
 
-        let source = RepoSource::new(self.clone(), opts.detached_metadata_filter);
+        let source = RepoSource::new(self.clone(), RelatedRule::default());
         Ok(crate::remote::session::export_stream(
             output,
             &source,

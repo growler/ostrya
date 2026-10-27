@@ -43,6 +43,7 @@ use crate::bucket::{
 use crate::error::{Error, Result};
 use crate::hashing::VerifyingReader;
 use crate::pull::drive::Slots;
+use crate::related::RelatedRule;
 use crate::remote::s3::{S3Endpoint, part_size};
 use crate::remote::tree::TreeModel;
 use crate::remote::{
@@ -275,14 +276,12 @@ impl Repo {
     ///    [`BucketRepo::fsck`] wrote.
     /// 5. It uploads each tree object and image that the listing lacks, and
     ///    the detached metadata of each commit that the bucket lacks and of
-    ///    each source commit, after
-    ///    [`detached_metadata_filter`](RepoPushOptions::detached_metadata_filter),
-    ///    at most `max_outstanding` uploads at a time. If `[ex-ostrya]
-    ///    keep-detached-related` of the `config` of the bucket is `false`, it
-    ///    also drops `ostrya.related` from each dict that it uploads. It skips
-    ///    a `.commitmeta` that the bucket holds with the same bytes, and a
-    ///    commit with no detached metadata after the filter, which leaves the
-    ///    bucket copy.
+    ///    each source commit, at most `max_outstanding` uploads at a time. If
+    ///    `[ex-ostrya] keep-detached-related` of the `config` of the bucket is
+    ///    `false`, it drops `ostrya.related` from each dict that it uploads.
+    ///    It skips a `.commitmeta` that the bucket holds with the same bytes,
+    ///    and a commit with no detached metadata after the rule, which leaves
+    ///    the bucket copy.
     /// 6. It uploads each commit object that the bucket lacks.
     /// 7. It checks the writer lock, deletes the marker of each walked commit
     ///    with a marker, then writes each ref file that changes, in the order
@@ -535,9 +534,9 @@ impl Repo {
         );
         let source = RepoSource::new(
             self.clone(),
-            opts.detached_metadata_filter
-                .clone()
-                .dropping_related(keep_related),
+            RelatedRule {
+                drop_related: !keep_related,
+            },
         );
         let uploads = Uploads {
             bucket,
@@ -869,7 +868,8 @@ pub(super) enum Origin<'a> {
         repo: &'a Repo,
         view: &'a ArchiveView,
         access: &'a ReadAccess,
-        /// The source of the detached metadata, with the filter of the push.
+        /// The source of the detached metadata, with the rule of `[ex-ostrya]
+        /// keep-detached-related` of the bucket.
         source: &'a RepoSource,
         /// The payload size of each file whose `.filez` the push builds, if
         /// the pass over the files read it.
@@ -1123,8 +1123,9 @@ impl Uploads<'_> {
     /// Uploads the detached metadata of `commit` if the bucket does not hold
     /// it with the same bytes.
     ///
-    /// The bytes are the stored `.commitmeta` after the filter of the push.
-    /// A commit with no detached metadata after the filter uploads nothing,
+    /// The bytes are the stored `.commitmeta` after the rule of `[ex-ostrya]
+    /// keep-detached-related` of the bucket. A commit with no detached
+    /// metadata after the rule uploads nothing,
     /// and the bucket keeps its copy. The bytes go up when the listing does
     /// not hold the key, when the size in the listing differs, or when a
     /// read of the key gives other bytes.

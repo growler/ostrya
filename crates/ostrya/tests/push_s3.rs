@@ -37,8 +37,8 @@ use ostrya::remote::{Compression, Endpoint, PullSession, StreamSessionOptions};
 use ostrya::verify::PullTrust;
 use ostrya::{
     Checksum, Commit, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions,
-    DetachedMetadataFilter, DictBuilder, DirTree, Ed25519Signer, Error, MutableTree, ObjectType,
-    PullOptions, PushOntoOptions, Repo, RepoMode, RepoPushOptions, Value,
+    DictBuilder, DirTree, Ed25519Signer, Error, MutableTree, ObjectType, PullOptions,
+    PushOntoOptions, Repo, RepoMode, RepoPushOptions, Value,
 };
 use ostrya_rt::block_on;
 
@@ -833,58 +833,6 @@ async fn detached(repo: &Repo, commit: &Checksum, keys: &[&str]) {
     repo.write_commit_detached_metadata(commit, Some(&dict.build()))
         .await
         .unwrap();
-}
-
-#[test]
-fn the_commitmeta_goes_without_the_excluded_keys() {
-    let scratch = TmpDir::new("push-s3-filter");
-    block_on(async {
-        let server = StandIn::start();
-        init(&server.endpoint(), None).await;
-        let repo = archive(&scratch.path().join("src")).await;
-        let tip = commit(&repo, "main", None, "one", None).await;
-        detached(&repo, &tip, &["keep", "secret"]).await;
-        let filtered = || RepoPushOptions {
-            detached_metadata_filter: DetachedMetadataFilter::excluding(["secret"]),
-            ..opts(&["main"])
-        };
-        push(&repo, &server.endpoint(), filtered()).await.unwrap();
-        let meta = key(ObjectType::CommitMeta, &tip);
-        let stored = server.state().objects[&meta].bytes.clone();
-        let ty = ostrya::Type::parse("a{sv}").unwrap();
-        let dict = ostrya::from_bytes(&ty, &stored).unwrap();
-        assert!(dict.dict_get("keep").is_some());
-        assert!(dict.dict_get("secret").is_none());
-        // The bucket holds the filtered bytes, so a second push skips them.
-        server.state().requests.clear();
-        push(&repo, &server.endpoint(), filtered()).await.unwrap();
-        assert!(!puts(&server).iter().any(|t| t.ends_with(".commitmeta")));
-    });
-}
-
-#[test]
-fn a_commitmeta_that_the_filter_empties_is_not_uploaded() {
-    let scratch = TmpDir::new("push-s3-empty-filter");
-    block_on(async {
-        let server = StandIn::start();
-        init(&server.endpoint(), None).await;
-        let repo = archive(&scratch.path().join("src")).await;
-        let tip = commit(&repo, "main", None, "one", None).await;
-        detached(&repo, &tip, &["secret"]).await;
-        push(&repo, &server.endpoint(), opts(&["main"]))
-            .await
-            .unwrap();
-        let meta = key(ObjectType::CommitMeta, &tip);
-        let first = server.state().objects[&meta].clone();
-        server.state().requests.clear();
-        let filtered = RepoPushOptions {
-            detached_metadata_filter: DetachedMetadataFilter::excluding(["secret"]),
-            ..opts(&["main"])
-        };
-        push(&repo, &server.endpoint(), filtered).await.unwrap();
-        assert!(!puts(&server).iter().any(|t| t.ends_with(".commitmeta")));
-        assert_eq!(server.state().objects[&meta], first);
-    });
 }
 
 /// The config of a bucket that turns the related switch off.

@@ -2313,19 +2313,11 @@ A ref name the tool's ref enumeration skips is read by the tool's
 `prune --refs-only` as unreachable, so the tool deletes a commit the port keeps.
 That is the out-of-band ref name of "P1", and the pair is stated there.
 
-Two repository config keys in the `[ex-ostrya]` group are port extensions
-with no option and no counterpart in the tool. Each parts `ostrya` from
+One repository config key in the `[ex-ostrya]` group is a port extension
+with no option and no counterpart in the tool. It parts `ostrya` from
 `ostree` on a repository that sets it, and the divergence is by intent
 (`format-reference.md`, "Configuration keys of the port"):
 
-- `detached-metadata-exclude` names detached-metadata keys the repository does
-  not store on receive. `ostrya pull` and `ostrya pull-local` drop them from the
-  `.commitmeta` they write; the tool's pull writes what the source holds. The
-  commit checksum does not cover detached metadata, so the objects both write
-  stay identical. A commit whose every key the list names leaves the
-  `.commitmeta` the destination already holds where it stands. `ostrya push`
-  drops them from the detached metadata it sends, and `ostrya receive` drops
-  them from the detached metadata it stores.
 - `keep-detached-related=false` drops `ostrya.related` from each detached
   metadata dict that a transfer stores in the repository: `ostrya pull`,
   `ostrya pull-local`, `ostrya receive`, and the receive endpoint of
@@ -2335,7 +2327,7 @@ with no option and no counterpart in the tool. Each parts `ostrya` from
   write stay identical. A local write, for example `ostrya commit`, keeps
   the key (`format-reference.md`, "The switch of the destination").
 
-No harness repository sets either key (`harness.md`, "Constraints"), so every
+No harness repository sets the key (`harness.md`, "Constraints"), so every
 matrix cell reads the tool's own behavior.
 
 `fsck` accepts `--repo`, `--add-tombstones`, `-q/--quiet`, `-a/--all`,
@@ -4665,8 +4657,6 @@ ostrya push [--repo=PATH] REMOTE REF --onto=BRANCH
   white space at its start or its end is refused at exit 1 before any
   request: `error: unsupported: remote 'NAME': the proxy key has white space
   at the start or the end of its value`.
-- The push drops the detached metadata keys that `[ex-ostrya]
-  detached-metadata-exclude` of the local repository names.
 - On success the command writes one line for each ref to standard output,
   in the order of the refspecs and then of the tags, and exits 0. A line
   holds the `DST` name, the old state, and the new state, separated by one

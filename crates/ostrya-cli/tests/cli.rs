@@ -27222,79 +27222,7 @@ fn fsck_no_mark_partial_survives_the_new_options() {
     );
 }
 
-/// `pull-local` reads `[ex-ostrya] detached-metadata-exclude` from the
-/// destination and stores no detached-metadata key that the list names.
-#[test]
-fn pull_local_honours_the_configured_detached_metadata_exclude() {
-    let tmp = TmpDir::new("pull-local-detached-exclude");
-    let base = tmp.path();
-    let src = base.join("src-repo");
-    block_on(async {
-        Repo::create(&src, CreateOptions::new(RepoMode::Archive))
-            .await
-            .unwrap();
-    });
-    let commit = ex_ostrya_commit(&src, base, "payload", Some("main"));
-    let detached = Value::Array(vec![
-        Value::Tuple(vec![
-            Value::Str("app.gc-roots".to_owned()),
-            Value::Variant(Box::new((
-                Type::parse("s").unwrap(),
-                Value::Str("repository-local".to_owned()),
-            ))),
-        ]),
-        Value::Tuple(vec![
-            Value::Str("app.keep".to_owned()),
-            Value::Variant(Box::new((
-                Type::parse("s").unwrap(),
-                Value::Str("carried".to_owned()),
-            ))),
-        ]),
-    ]);
-    block_on(async {
-        Repo::open(&src)
-            .await
-            .unwrap()
-            .write_commit_detached_metadata(&commit, Some(&detached))
-            .await
-            .unwrap();
-    });
-
-    let dst = create_repo(base, RepoMode::Archive);
-    let mut config = std::fs::read_to_string(dst.join("config")).unwrap();
-    config.push_str("\n[ex-ostrya]\ndetached-metadata-exclude=app.gc-roots;\n");
-    std::fs::write(dst.join("config"), config).unwrap();
-
-    let repo_arg = format!("--repo={}", dst.display());
-    ostrya(
-        &[&repo_arg, "pull-local", &src.display().to_string(), "main"],
-        None,
-        &[],
-    )
-    .ok();
-
-    let stored = block_on(async {
-        Repo::open(&dst)
-            .await
-            .unwrap()
-            .read_commit_detached_metadata(&commit)
-            .await
-            .unwrap()
-    })
-    .expect("the destination stores detached metadata");
-    assert_eq!(
-        stored.dict_get("app.gc-roots"),
-        None,
-        "a key the exclude list names is not stored"
-    );
-    assert!(
-        stored.dict_get("app.keep").is_some(),
-        "a key it does not name is stored"
-    );
-}
-
-/// Returns an `a{sv}` with two string properties. One of them is the key that
-/// the exclude list names.
+/// Returns an `a{sv}` with two string properties.
 fn ex_ostrya_two_key_detached() -> Value {
     let entry = |key: &str, text: &str| {
         Value::Tuple(vec![
@@ -27311,58 +27239,69 @@ fn ex_ostrya_two_key_detached() -> Value {
     ])
 }
 
-/// `pull` over HTTP also reads `[ex-ostrya] detached-metadata-exclude` from the
-/// destination. The key applies to the `.commitmeta` write of the fetcher, and
-/// also to the local-pull path.
+/// The port reads no `[ex-ostrya] detached-metadata-exclude`. A destination
+/// config that sets the key, also with a value that the key-file syntax
+/// cannot split as a list, filters nothing: `pull-local` and `pull` over HTTP
+/// succeed and store the `.commitmeta` of the source byte for byte.
 #[test]
-fn pull_over_http_honours_the_configured_detached_metadata_exclude() {
-    let tmp = TmpDir::new("pull-http-detached-exclude");
-    let base = tmp.path();
-    let remote = build_remote(base, "remote");
-    let commit = Checksum::from_hex(COMMIT).unwrap();
-    // The remote serves both keys, so the filter of the destination decides
-    // which key it keeps.
-    block_on(async {
-        Repo::open(&remote)
-            .await
+fn a_config_that_sets_detached_metadata_exclude_filters_nothing() {
+    for value in ["app.gc-roots;", "app.gc-roots\\"] {
+        let tmp = TmpDir::new("pull-detached-exclude-ignored");
+        let base = tmp.path();
+        let remote = build_remote(base, "remote");
+        let commit = Checksum::from_hex(COMMIT).unwrap();
+        block_on(async {
+            Repo::open(&remote)
+                .await
+                .unwrap()
+                .write_commit_detached_metadata(&commit, Some(&ex_ostrya_two_key_detached()))
+                .await
+                .unwrap();
+        });
+        let commitmeta = |repo: &Path| {
+            std::fs::read(repo.join("objects").join(ostrya::loose_path(
+                &commit,
+                ObjectType::CommitMeta,
+                RepoMode::Archive,
+            )))
             .unwrap()
-            .write_commit_detached_metadata(&commit, Some(&ex_ostrya_two_key_detached()))
-            .await
-            .unwrap();
-    });
-    let server = FileServer::start(&remote);
+        };
+        let set_key = |repo: &Path| {
+            let mut config = std::fs::read_to_string(repo.join("config")).unwrap();
+            config.push_str(&format!(
+                "\n[ex-ostrya]\ndetached-metadata-exclude={value}\n"
+            ));
+            std::fs::write(repo.join("config"), config).unwrap();
+        };
 
-    let dest = build_dest(base, "dest");
-    configure_remote(&dest, &server.url(), "gpg-verify=false\n");
-    let mut config = std::fs::read_to_string(dest.join("config")).unwrap();
-    config.push_str("\n[ex-ostrya]\ndetached-metadata-exclude=app.gc-roots;\n");
-    std::fs::write(dest.join("config"), config).unwrap();
+        let local = build_dest(base, "local");
+        set_key(&local);
+        ostrya(
+            &[
+                "pull-local",
+                "--repo",
+                local.to_str().unwrap(),
+                remote.to_str().unwrap(),
+                BRANCH,
+            ],
+            None,
+            &[],
+        )
+        .ok();
+        assert_eq!(commitmeta(&local), commitmeta(&remote), "{value:?}");
 
-    ostrya(
-        &["pull", "--repo", dest.to_str().unwrap(), "origin", BRANCH],
-        None,
-        &[],
-    )
-    .ok();
-
-    let stored = block_on(async {
-        Repo::open(&dest)
-            .await
-            .unwrap()
-            .read_commit_detached_metadata(&commit)
-            .await
-            .unwrap()
-    })
-    .expect("the destination stores detached metadata");
-    assert_eq!(
-        stored.dict_get("app.gc-roots"),
-        None,
-        "a key the exclude list names is not stored"
-    );
-    assert!(
-        stored.dict_get("app.keep").is_some(),
-        "a key it does not name is stored"
-    );
+        let server = FileServer::start(&remote);
+        let http = build_dest(base, "http");
+        configure_remote(&http, &server.url(), "gpg-verify=false\n");
+        set_key(&http);
+        ostrya(
+            &["pull", "--repo", http.to_str().unwrap(), "origin", BRANCH],
+            None,
+            &[],
+        )
+        .ok();
+        assert_eq!(commitmeta(&http), commitmeta(&remote), "{value:?}");
+    }
 }
 
 // --- checkout: the union family and --allow-noent -------------------------

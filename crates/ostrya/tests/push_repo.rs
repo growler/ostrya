@@ -21,9 +21,8 @@ use futures_lite::future::zip;
 use ostrya::access::CollectionScope;
 use ostrya::remote::{self, Compression, PushOutcome, PushProgress};
 use ostrya::{
-    Checksum, CommitModifier, CommitModifierFlags, CommitOptions, DetachedMetadataFilter,
-    DictBuilder, Error, MutableTree, ObjectType, PruneOptions, ReceivePolicy, ReceiveReport, Repo,
-    RepoMode, RepoPushOptions, Value,
+    Checksum, CommitModifier, CommitModifierFlags, CommitOptions, DictBuilder, Error, MutableTree,
+    ObjectType, PruneOptions, ReceivePolicy, ReceiveReport, Repo, RepoMode, RepoPushOptions, Value,
 };
 use ostrya_rt::block_on;
 
@@ -904,35 +903,6 @@ fn deleting_a_present_ref_is_delete_denied_by_default() {
     assert_eq!(tip(&pair.server, "main"), Some(c1));
 }
 
-#[test]
-fn the_filter_drops_the_excluded_keys_from_the_detached_metadata() {
-    let pair = Pair::new("filter", RepoMode::Archive, RepoMode::Archive, "");
-    let c1 = commit(&pair.client, "main", None, "c1", None);
-    let mut detached = DictBuilder::new();
-    detached
-        .insert_str("xa.keep", "kept")
-        .insert_str("xa.drop", "dropped");
-    block_on(
-        pair.client
-            .write_commit_detached_metadata(&c1, Some(&detached.build())),
-    )
-    .unwrap();
-    let (report, outcome) = push(
-        &pair,
-        RepoPushOptions {
-            detached_metadata_filter: DetachedMetadataFilter::excluding(["xa.drop"]),
-            ..opts(&["main"])
-        },
-    );
-    report.unwrap();
-    outcome.unwrap();
-    let stored = block_on(pair.server.read_commit_detached_metadata(&c1))
-        .unwrap()
-        .expect("the server stores the detached metadata");
-    assert!(stored.dict_get("xa.keep").is_some());
-    assert!(stored.dict_get("xa.drop").is_none());
-}
-
 /// With `keep-detached-related=false` in the config of the server, the
 /// session drops `ostrya.related` from the incoming dict and stores each other
 /// property. The client sends the key: the server reads its own switch.
@@ -972,37 +942,6 @@ fn the_switch_of_the_server_drops_the_related_key() {
         block_on(pair.server.read_commit_detached_metadata(&c2)).unwrap(),
         Some(detached)
     );
-}
-
-/// A push whose filter keeps each property stores the `.commitmeta` bytes of
-/// the client unchanged on the server.
-#[test]
-fn a_filter_that_keeps_each_property_sends_the_source_bytes() {
-    let pair = Pair::new("filter-keep", RepoMode::Archive, RepoMode::Archive, "");
-    let c1 = commit(&pair.client, "main", None, "c1", None);
-    let mut detached = DictBuilder::new();
-    detached
-        .insert_str("xa.keep", "kept")
-        .insert_str("xa.other", "kept too");
-    block_on(
-        pair.client
-            .write_commit_detached_metadata(&c1, Some(&detached.build())),
-    )
-    .unwrap();
-    let (report, outcome) = push(
-        &pair,
-        RepoPushOptions {
-            detached_metadata_filter: DetachedMetadataFilter::excluding(["absent.key"]),
-            ..opts(&["main"])
-        },
-    );
-    report.unwrap();
-    outcome.unwrap();
-    let path = ostrya::loose_path(&c1, ObjectType::CommitMeta, RepoMode::Archive);
-    let sent = std::fs::read(pair.client.path().join("objects").join(&path)).unwrap();
-    let stored = std::fs::read(pair.server.path().join("objects").join(&path)).unwrap();
-    assert!(!sent.is_empty());
-    assert_eq!(sent, stored);
 }
 
 #[test]

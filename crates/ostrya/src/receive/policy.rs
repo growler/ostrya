@@ -7,7 +7,6 @@ use crate::access::{
     AccessModes, AccessRules, AuthItem, ClientAccess, ClientGroup, CollectionScope, Namespace,
 };
 use crate::error::Result;
-use crate::pull::DetachedMetadataFilter;
 use crate::remote::{self, RefUpdate};
 use crate::repo::Repo;
 
@@ -20,7 +19,7 @@ use super::{ServerSigner, StreamPolicy, TrustedKeys};
 /// The policy states which refs a session can read and change, how the
 /// server verifies the commits of the client, and which keys sign them. It
 /// also states the steps after an accepted session: the server signatures of
-/// the summary, the summary regeneration, and the detached-metadata filter.
+/// the summary and the summary regeneration.
 ///
 /// [`ReceivePolicies::from_config`] builds one policy for each client group
 /// of a repository. A caller can also build a policy in code.
@@ -95,12 +94,6 @@ pub struct ReceivePolicy {
     /// [`Repo::regenerate_summaries`](crate::Repo::regenerate_summaries)
     /// writes them, after a session that writes a ref.
     pub update_summary: bool,
-    /// The detached-metadata keys that the repository does not store.
-    ///
-    /// `None` stores every key. If `[ex-ostrya] keep-detached-related` of the
-    /// repository is `false`, the session also drops `ostrya.related` and
-    /// does not call the filter for that key.
-    pub detached_metadata_filter: Option<DetachedMetadataFilter>,
     /// The name of the client group of the policy.
     ///
     /// [`ReceivePolicies::from_config`] sets the name of each group. A policy
@@ -188,8 +181,7 @@ impl ReceivePolicies {
     /// - [`update_summary`](ReceivePolicy::update_summary) from
     ///   `[core] auto-update-summary` and its alias, as
     ///   [`auto_update_summary`](crate::RepoConfig::auto_update_summary) reads
-    ///   them
-    /// - the filter from `[ex-ostrya] detached-metadata-exclude`.
+    ///   them.
     ///
     /// # Trust groups and key groups
     ///
@@ -333,9 +325,6 @@ pub(super) trait SessionPolicy: Send + Sync {
         tags: &[String],
     ) -> std::result::Result<ServerCommitRule<'_>, Failure>;
 
-    /// Returns the detached-metadata filter of the session.
-    fn metadata_filter(&self) -> Option<&DetachedMetadataFilter>;
-
     /// Returns `true` if the session regenerates the summary after it writes
     /// a ref.
     fn regenerates_summary(&self) -> bool;
@@ -461,10 +450,6 @@ impl SessionPolicy for ReceivePolicy {
         })
     }
 
-    fn metadata_filter(&self) -> Option<&DetachedMetadataFilter> {
-        self.detached_metadata_filter.as_ref()
-    }
-
     fn regenerates_summary(&self) -> bool {
         self.update_summary
     }
@@ -524,10 +509,6 @@ impl SessionPolicy for StreamPolicy {
         Err(Failure::Wire(remote::Error::Protocol(
             "a one-way stream carries no server commit".into(),
         )))
-    }
-
-    fn metadata_filter(&self) -> Option<&DetachedMetadataFilter> {
-        self.detached_metadata_filter.as_ref()
     }
 
     /// A one-way stream does not regenerate the summary.

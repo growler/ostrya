@@ -8,7 +8,7 @@ ostrya pull\-local [OPTIONS] [SRC_REPO] [REFS]...
 .SH DESCRIPTION
 Import refs and their objects from another local repository.
 .PP
-The command opens \%SRC_REPO and imports each ref, the commits that \%\-\-depth reaches, and the objects that these commits reach. When the link is possible, the pull hardlinks an object of the source into this repository. The pull writes local refs, or remote refs under \%\-\-remote. With \%\-\-remote, the verification keys of the remote apply to the pull. It drops the detached metadata keys that \fB\%[ex\-ostrya] detached\-metadata\-exclude\fR names. With \fB\%[ex\-ostrya] keep\-detached\-related=false\fR, it also drops \fB\%ostrya.related\fR\&.
+The command opens \%SRC_REPO and imports each ref, the commits that \%\-\-depth reaches, and the objects that these commits reach. When the link is possible, the pull hardlinks an object of the source into this repository. The pull writes local refs, or remote refs under \%\-\-remote. With \%\-\-remote, the verification keys of the remote apply to the pull. With \fB\%[ex\-ostrya] keep\-detached\-related=false\fR, it drops \fB\%ostrya.related\fR\&.
 .PP
 On success, the command prints one statistics line to standard output: \fB\%M metadata, C content objects imported; SIZE content written\fR\&. Under \%\-\-require\-static\-deltas, the line has the form of a pull from a remote. The command writes no progress line.
 .SH ARGUMENTS

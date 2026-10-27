@@ -17,7 +17,6 @@ use ostrya_core::KeyFile;
 
 use crate::access::{ClientAccess, Group, classify};
 use crate::error::{Error, Result};
-use crate::pull::DetachedMetadataFilter;
 use crate::repo::Repo;
 use crate::sign::{MAX_KEY_FILE, key_text, read_key_path};
 use crate::verify::trust::{check_trust, trust_group_policy, unknown_key};
@@ -101,9 +100,6 @@ pub(crate) async fn read(repo: &Repo) -> Result<(ClientAccess, Vec<Arc<ReceivePo
     };
     let summary_signers = named(access.server().sign_summary.as_deref().unwrap_or_default());
     let update_summary = config.auto_update_summary()?;
-    let exclude = config.detached_metadata_exclude()?;
-    let detached_metadata_filter =
-        (!exclude.is_empty()).then(|| DetachedMetadataFilter::excluding(exclude));
     let policies = access
         .groups()
         .iter()
@@ -120,7 +116,6 @@ pub(crate) async fn read(repo: &Repo) -> Result<(ClientAccess, Vec<Arc<ReceivePo
                 allow_privileged: group.allow_privileged(),
                 summary_signers: summary_signers.clone(),
                 update_summary,
-                detached_metadata_filter: detached_metadata_filter.clone(),
                 group: Some(group.name().to_owned()),
             })
         })

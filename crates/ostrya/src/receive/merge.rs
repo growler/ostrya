@@ -60,8 +60,8 @@ const HOST: &str = "a detached-metadata entry of the host";
 /// The merged dict can be larger than either input. If its serialized form is
 /// over [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE), the caller refuses it
 /// before the write. This function applies no filter. The caller applies the
-/// `detached-metadata-exclude` filter and the rule of `[ex-ostrya]
-/// keep-detached-related` to the incoming dict before the merge.
+/// rule of `[ex-ostrya] keep-detached-related` to the incoming dict before
+/// the merge.
 ///
 /// # Cost
 ///

@@ -30,6 +30,7 @@ use crate::error::{Error, Result};
 use crate::lock::UpdateLockHeld;
 use crate::object::read_meta_object;
 use crate::refs::{CollectionRef, RefFileState};
+use crate::related::RelatedRule;
 use crate::remote::proto::{CommitRequest, MAX_FRAME, Message};
 use crate::remote::{self, Expected, RefOutcome, RefUpdate};
 use crate::repo::Repo;
@@ -172,12 +173,11 @@ struct Edit<'a> {
 ///
 /// # Before the update lock
 ///
-/// After the checks, the incoming detached metadata goes through the filter.
-/// If `[ex-ostrya] keep-detached-related` of the repository is `false`, this
-/// step also drops `ostrya.related` from each incoming dict. Then the staged
-/// objects become durable. At the same time, each new commit gets a signature
-/// from each server key of its rules. A key makes no
-/// signature if it already signed the commit in one of these places:
+/// After the checks, if `[ex-ostrya] keep-detached-related` of the repository
+/// is `false`, this step drops `ostrya.related` from each incoming dict. Then
+/// the staged objects become durable. At the same time, each new commit gets a
+/// signature from each server key of its rules. A key makes no signature if it
+/// already signed the commit in one of these places:
 ///
 /// - The merge of the filtered incoming dict into the stored dict.
 /// - A signature that a key before it made.
@@ -315,7 +315,7 @@ pub(super) async fn finish(
         .collect();
     let mut stored = read_stored_for(repo, &rules, &targets, &commit_meta).await?;
     check_signatures(&rules, &commit_meta, &targets, &stored).await?;
-    let incoming = filter_detached(repo, policy, commit_meta).await?;
+    let incoming = filter_detached(repo, commit_meta).await?;
     let edits = plan(&rules, &targets, &mut stored, incoming);
     // The dicts that no edit took. The merge of the host entries takes them,
     // so they stay only where the session has hooks.
@@ -1117,8 +1117,9 @@ fn empty_dict() -> Value {
 /// updates, once for each set of trusted keys.
 ///
 /// The verification reads the union of the stored detached metadata of the
-/// commit and the incoming dict, before the detached-metadata filter. This
-/// function builds the union on the blocking pool.
+/// commit and the incoming dict, before the rule of `[ex-ostrya]
+/// keep-detached-related` applies. This function builds the union on the
+/// blocking pool.
 ///
 /// A set whose rules accept a commit with no signature skips the commit if
 /// the union holds no blob under a signature key. A commit with a blob must
@@ -1316,36 +1317,27 @@ async fn check_ref(
     }
 }
 
-/// Removes the keys that the filter excludes from each incoming detached
-/// metadata dict, on the blocking pool.
+/// Drops `ostrya.related` from each incoming detached metadata dict if
+/// `[ex-ostrya] keep-detached-related` of `repo` is `false`.
 ///
-/// If `[ex-ostrya] keep-detached-related` of `repo` is `false`, the filter
-/// also drops `ostrya.related`. The result leaves out a dict that the filter
-/// empties.
+/// The result leaves out a dict that holds `ostrya.related` alone under that
+/// rule, and the zero-length marker. Under `false`, the call parses the dicts
+/// on the blocking pool. Under `true`, the call parses nothing, and the result
+/// holds each other dict as it came in.
 async fn filter_detached(
     repo: &Repo,
-    policy: &dyn SessionPolicy,
-    commit_meta: HashMap<Checksum, Bytes>,
+    mut commit_meta: HashMap<Checksum, Bytes>,
 ) -> Checked<HashMap<Checksum, Bytes>> {
-    let keep_related = repo
-        .config()
-        .keep_detached_related()
-        .map_err(Failure::Internal)?;
-    let filter = policy.metadata_filter().cloned();
-    let filter = if keep_related {
-        filter
-    } else {
-        Some(filter.unwrap_or_default().dropping_related(false))
-    };
+    let rule = RelatedRule::of(repo.config()).map_err(Failure::Internal)?;
+    if !rule.drop_related {
+        commit_meta.retain(|_, bytes| !bytes.is_empty());
+        return Ok(commit_meta);
+    }
     ostrya_rt::unblock(move || -> Result<_> {
         let mut incoming = HashMap::with_capacity(commit_meta.len());
         for (commit, bytes) in commit_meta {
             let bytes = Arc::unwrap_or_clone(bytes);
-            let filtered = match &filter {
-                Some(filter) => filter.apply(&commit, bytes)?,
-                None => Some(bytes),
-            };
-            if let Some(bytes) = filtered
+            if let Some(bytes) = rule.apply(&commit, bytes)?
                 && !bytes.is_empty()
             {
                 incoming.insert(commit, Arc::new(bytes));

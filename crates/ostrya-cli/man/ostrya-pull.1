@@ -10,7 +10,7 @@ Fetch refs and their objects from a remote over HTTP or ssh.
 .PP
 The address is \%\-\-url, else the \fB\%pull\-url\fR key of the remote, else its \fB\%url\fR key. An address that starts with \fB\%ssh://\fR, or that holds no \fB\%://\fR, is an ssh address, and the pull runs the ssh client. The remote command is \fB\%ostrya send\fR, or the \fB\%send\-command\fR key of the remote. Each other address goes to the HTTP fetcher, which takes \fB\%http\fR and \fB\%https\fR alone. The \fB\%url\fR key cannot hold an ssh address.
 .PP
-The pull stores the objects in one transaction, and then writes each ref under \fB\%refs/remotes/<remote>/\fR, or under \fB\%refs/heads/\fR with \%\-\-mirror. It verifies the signatures that the config of the remote or the verify options ask for. The pull does not store the detached metadata keys that \fB\%[ex\-ostrya] detached\-metadata\-exclude\fR names. With \fB\%[ex\-ostrya] keep\-detached\-related=false\fR, it also drops \fB\%ostrya.related\fR\&.
+The pull stores the objects in one transaction, and then writes each ref under \fB\%refs/remotes/<remote>/\fR, or under \fB\%refs/heads/\fR with \%\-\-mirror. It verifies the signatures that the config of the remote or the verify options ask for. With \fB\%[ex\-ostrya] keep\-detached\-related=false\fR, the pull drops \fB\%ostrya.related\fR\&.
 .PP
 On success, the command prints one statistics line to standard output. If standard output is a terminal, a progress line shows while the pull runs, and the statistics line is drawn over it.
 .SH ARGUMENTS

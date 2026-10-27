@@ -34,11 +34,11 @@
 //! remote. From a local source it reads the `.commitmeta` only if the policy
 //! checks commits. Then it checks the signatures of the commit that the
 //! superblock carries. For a remote source, if the check parsed the
-//! `.commitmeta` and the pull has a filter, discovery then runs the detached
-//! metadata filter of the pull over that parse, and the record file keeps the
-//! result. For a target, it also makes the ref-binding check of
-//! each requested ref that names it. For a remote source it also makes the
-//! timestamp check of each of these refs, and for a local source it makes
+//! `.commitmeta` and `[ex-ostrya] keep-detached-related` of the destination is
+//! `false`, discovery then drops `ostrya.related` from that parse, and the
+//! record file keeps the result. For a target, it also makes the ref-binding
+//! check of each requested ref that names it. For a remote source it also makes
+//! the timestamp check of each of these refs, and for a local source it makes
 //! none, because a local pull has none. So a refused target costs no part.
 //!
 //! The pull checks no commit of the last plan a second time. A commit that
@@ -92,6 +92,7 @@ use crate::object::MAX_METADATA_SIZE;
 use crate::pull::verify::Verification;
 use crate::pull::{ModeChecks, PullCounters, PullFlags, PullOptions, RefPlace};
 use crate::read::CommitState;
+use crate::related::RelatedRule;
 use crate::repo::Repo;
 use crate::summary::{AdvertisedDelta, INDEXED_DELTAS_KEY, Summary, delta_digest};
 use crate::transaction::Transaction;
@@ -102,8 +103,8 @@ use super::chain::{
 use super::http::{cached_source, fetch_remote_detached};
 use super::source::{RemoteSource, Transfer, session_error};
 use super::{
-    CheckedMeta, DetachedMetadataFilter, TipChecks, check_commit_signatures_filtered,
-    check_local_commit_signatures, check_tip_refs, count_fetched, source_size,
+    CheckedMeta, TipChecks, check_commit_signatures_filtered, check_local_commit_signatures,
+    check_tip_refs, count_fetched, source_size,
 };
 
 /// The number of delta parts that one pull fetches at a time.
@@ -338,11 +339,12 @@ impl DeltaPlan {
     /// Returns the check that discovery made of `commit`.
     ///
     /// For a checked commit, the result holds the verified `.commitmeta` from
-    /// the record file, and states whether the filter of the pull ran over it.
-    /// It holds `None` if no repository holds a `.commitmeta`, or if the
-    /// filter allows no property. A record from a local source keeps no bytes,
-    /// so for a plan from a local source the result holds `None` and states
-    /// only whether discovery checked the commit. The call then reads nothing.
+    /// the record file, and states whether the rule of `[ex-ostrya]
+    /// keep-detached-related` ran over it. It holds `None` if no repository
+    /// holds a `.commitmeta`, or if the rule keeps no property. A record from a
+    /// local source keeps no bytes, so for a plan from a local source the
+    /// result holds `None` and states only whether discovery checked the
+    /// commit. The call then reads nothing.
     ///
     /// # Errors
     ///
@@ -398,11 +400,11 @@ pub(crate) enum CommitCheck {
     /// source, discovery also made the timestamp check of each of these refs.
     Checked {
         /// The verified `.commitmeta`. It is `None` if no repository holds a
-        /// `.commitmeta`, or if the filter allows no property.
+        /// `.commitmeta`, or if the rule keeps no property.
         detached: Option<Vec<u8>>,
-        /// `true` if `detached` is the result of the filter of the pull.
-        /// `false` if `detached` holds the bytes as the source holds them, and
-        /// the commit step runs the filter over them.
+        /// `true` if `detached` is the result of the rule of `[ex-ostrya]
+        /// keep-detached-related`. `false` if `detached` holds the bytes as
+        /// the source holds them, and the commit step runs the rule over them.
         filtered: bool,
     },
 }
@@ -430,10 +432,10 @@ enum Detached {
     Checked {
         /// The range of the verified `.commitmeta` in the record file. `None`
         /// if the remote and the localcache repositories hold none, if the
-        /// filter allows no property, and for a local source, which keeps no
+        /// rule keeps no property, and for a local source, which keeps no
         /// bytes.
         kept: Option<Range<u64>>,
-        /// `true` if `kept` holds the result of the filter of the pull, as
+        /// `true` if `kept` holds the result of the rule, as
         /// [`CommitCheck::Checked`] states.
         filtered: bool,
     },
@@ -444,7 +446,7 @@ struct Checked {
     /// The range of the verified `.commitmeta` in the record file, from a
     /// remote.
     kept: Option<Range<u64>>,
-    /// `true` if `kept` holds the result of the filter of the pull, as
+    /// `true` if `kept` holds the result of the rule, as
     /// [`CommitCheck::Checked`] states.
     filtered: bool,
     /// What the check read of the `.commitmeta` in a local source.
@@ -465,8 +467,9 @@ enum LocalRead {
 
 /// The file that keeps the raw superblocks and the verified `.commitmeta`
 /// files of a discovery from a remote. If the check of the signatures parsed a
-/// `.commitmeta` and the pull has a filter, the file keeps the result of the
-/// filter. Else it keeps the `.commitmeta` as the source holds it.
+/// `.commitmeta` and the rule of `[ex-ostrya] keep-detached-related` drops
+/// `ostrya.related`, the file keeps the result of the rule. Else it keeps the
+/// `.commitmeta` as the source holds it.
 ///
 /// The file is one unlinked temp file in `tmp/` of the repository, open for
 /// reads and writes and not mapped. It opens at the first write. Discovery
@@ -905,7 +908,7 @@ async fn discover_chain(
         source,
         localcache: &opts.localcache_repos,
         verification,
-        filter: &opts.detached_metadata_filter,
+        related: RelatedRule::of(repo.config())?,
         progress,
         tips,
     };
@@ -1110,10 +1113,11 @@ struct CheckCtx<'a> {
     /// The localcache repositories of the pull, in the order of the reads.
     localcache: &'a [Repo],
     verification: &'a Verification,
-    /// The detached metadata filter of the pull. Discovery runs it over the
-    /// `.commitmeta` of a commit that it checks from a remote, if the check of
-    /// the signatures parses the `.commitmeta`.
-    filter: &'a DetachedMetadataFilter,
+    /// The rule of `[ex-ostrya] keep-detached-related` of the destination.
+    /// Discovery applies it to the `.commitmeta` of a commit that it checks
+    /// from a remote, if the check of the signatures parses the
+    /// `.commitmeta`.
+    related: RelatedRule,
     progress: &'a PullCounters,
     /// The checks of each requested ref that names a commit.
     tips: TipChecks<'a>,
@@ -1219,12 +1223,12 @@ async fn fetch_step(
 ///   with the superblock. If it is `None`, the `.commitmeta` comes from the
 ///   first localcache repository that holds it, else from the remote. A file
 ///   that the remote serves adds one to the metadata count. If the policy
-///   checks commits and the pull has a filter, the check parses the bytes,
-///   and the detached metadata filter of the pull reads that parse right
-///   after the check, on the blocking pool. The record file keeps the result
-///   of the filter. A filter that allows no property keeps no range. Else
+///   checks commits and the rule of `[ex-ostrya] keep-detached-related` drops
+///   `ostrya.related`, the check parses the bytes, and the rule reads that
+///   parse right after the check, on the blocking pool. The record file keeps
+///   the result of the rule. A rule that keeps no property keeps no range. Else
 ///   the record file keeps the verified bytes, and the commit step runs the
-///   filter over them. The result holds the range in the record file.
+///   rule over them. The result holds the range in the record file.
 /// - From a local source, the `.commitmeta` comes from the source, else from
 ///   the first localcache repository that holds it. The reads and the parse
 ///   run in one call on the blocking pool. The record keeps no bytes. If the
@@ -1265,15 +1269,15 @@ async fn check_step_commit(
                     .await?
                 }
             };
-            // If the check parses the `.commitmeta`, the filter reads that
-            // parse right after the check, and the record file keeps its
-            // result. Else the record file keeps the bytes of the source, and
-            // the commit step filters them. A parse error of the filter then
-            // comes only for a commit that the pull fetches.
+            // If the check parses the `.commitmeta`, the rule reads that parse
+            // right after the check, and the record file keeps its result.
+            // Else the record file keeps the bytes of the source, and the
+            // commit step applies the rule to them. A parse error of the rule
+            // then comes only for a commit that the pull fetches.
             let checked = check_commit_signatures_filtered(
                 ctx.repo,
                 ctx.verification,
-                ctx.filter,
+                ctx.related,
                 commit,
                 &commit_bytes,
                 detached,

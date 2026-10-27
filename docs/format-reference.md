@@ -2813,8 +2813,8 @@ remote. "The push token file of a client" states the grammar of the file that
 
 The receive path of a server reads the client groups, the server group, the
 trust groups, and the key groups from `<repo>/config`. It also reads
-`[ex-ostrya] detached-metadata-exclude`, `[ex-ostrya] keep-detached-related`,
-and `[core] auto-update-summary` from `<repo>/config`. A pull from a remote with the key `trust` reads the one trust
+`[ex-ostrya] keep-detached-related` and `[core] auto-update-summary` from
+`<repo>/config`. A pull from a remote with the key `trust` reads the one trust
 group that the key names. A pull with `PullOptions::trust_group`, which
 `ostrya pull-local --trust=NAME` sets, reads the one trust group that the
 field names, and does not read the key `trust`.
@@ -2831,8 +2831,8 @@ SERVER GROUPS", states the refusals of a group name. "Ref patterns" states the
 grammar of a pattern of an allow item and of a deny item.
 
 No key changes the encoding or the checksum of an object.
-`detached-metadata-exclude`, `keep-detached-related`, and the key `sign` of a
-client group change the bytes of a `.commitmeta` file. The commit checksum does not cover detached
+`keep-detached-related` and the key `sign` of a client group change the bytes
+of a `.commitmeta` file. The commit checksum does not cover detached
 metadata, so these keys change no commit checksum.
 
 Observed behavior: the tool keeps the `[ex-ostrya]` group and the groups
@@ -2959,18 +2959,16 @@ The repository that stores the dict reads its own switch. A push to a bucket
 reads the key from the `config` of the bucket. The sender has no option for
 the key. A distribution repository sets `false`.
 
-The switch applies together with `detached-metadata-exclude`. Under `false`,
-the filter of that key gets no call for `ostrya.related`. The transfer then
-parses each `.commitmeta` that it stores, so a `.commitmeta` that is not an
-`a{sv}` dict fails the transfer.
+Under `false`, the transfer parses each `.commitmeta` that it stores, so a
+`.commitmeta` that is not an `a{sv}` dict fails the transfer.
 
-A pull, also a local pull and a pull through a static delta, and a push to
-a bucket replace the whole stored `.commitmeta` with the filtered dict. So a
-stored `ostrya.related` value stays only if the filtered dict is empty. If
-`ostrya.related` is the only key of a dict, the transfer writes nothing for
-the commit, and the destination keeps the `.commitmeta` that it holds. A
-receive merges the incoming dict into the stored dict, so a stored
-`ostrya.related` value stays.
+A pull, also a local pull and a pull through a static delta, and a push to a
+bucket replace the whole stored `.commitmeta` with the dict that the switch
+leaves. So a stored `ostrya.related` value stays only if that dict is empty. If
+`ostrya.related` is the only key of a dict, the transfer writes nothing for the
+commit, and the destination keeps the `.commitmeta` that it holds. A receive
+merges the incoming dict into the stored dict, so a stored `ostrya.related`
+value stays.
 
 A local write ignores the switch and stores `ostrya.related`: a commit write,
 `Repo::write_commit_detached_metadata`, the commit of a transaction,
@@ -3695,16 +3693,15 @@ Each failed check ends the session, and the session writes nothing:
      so a commit with no binding passes in each namespace.
 8. A new commit that the client built must pass the signature verification
    of the client group, else `signature-required`. The verification reads the stored detached
-   metadata of the commit and the incoming dict together, before the
-   `detached-metadata-exclude` filter and the switch of step 9. A group with no `verify`
+   metadata of the commit and the incoming dict together, before the switch
+   of step 9. A group with no `verify`
    checks no signature. A group with `verify=trust:NAME` checks each axis of
    the trust group. With `allow-unsigned=true`, a commit whose dict holds no
    blob under `ostree.gpgsigs`, `ostree.sign.ed25519`, `ostree.sign.spki`, and
    `ostree.sign.dummy` passes. A commit with a blob under one of these keys
    must pass the check, so a signature of an engine that the trust group does
    not read fails.
-9. The server applies the `detached-metadata-exclude` filter. If
-   `[ex-ostrya] keep-detached-related` is `false`, it also drops
+9. If `[ex-ostrya] keep-detached-related` is `false`, the server drops
    `ostrya.related` from each incoming dict ("The switch of the
    destination"). The server then makes the staged objects durable, and signs each new commit one time with each key
    of the key `sign` of the client group. It walks the history of each update
@@ -6251,13 +6248,12 @@ are:
 6. The upload of each tree object and image that the listing lacks, and of
    the `.commitmeta` of each commit that the bucket lacks and of each source
    commit, at most `max_outstanding` uploads at a time. The bytes of a
-   `.commitmeta` are the stored `.commitmeta` without the keys that the
-   detached metadata filter of the push removes, and without
-   `ostrya.related` if `[ex-ostrya] keep-detached-related` of the `config`
-   of the bucket is `false`. The push skips a
+   `.commitmeta` are the stored `.commitmeta`, without `ostrya.related` if
+   `[ex-ostrya] keep-detached-related` of the `config` of the bucket is
+   `false`. The push skips a
    `.commitmeta` that the bucket holds with the same bytes: the listing
    holds its key with the same size, and a read of the key gives the same
-   bytes. A commit with no detached metadata after the filter uploads
+   bytes. A commit with no detached metadata after the switch uploads
    nothing, and the bucket keeps its copy. After a failed upload, the push
    starts no new upload and waits for the uploads in flight.
 7. The upload of each commit object that the bucket lacks.

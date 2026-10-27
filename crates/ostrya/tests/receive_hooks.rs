@@ -26,9 +26,9 @@ use common::{COMMIT, ROOT_DIRMETA, ROOT_DIRTREE, TmpDir, foreign_holder, lock_ho
 use ostrya::remote::proto::{CommitRequest, Hello, ServerCommit};
 use ostrya::remote::{self, Encoding, Expected, RefOutcome, RefUpdate};
 use ostrya::{
-    Checksum, Commit, DetachedMetadataFilter, Error, HookFuture, HookRefusal, HostEntry, LockKind,
-    MAX_METADATA_SIZE, ObjectType, ReceiveHooks, ReceivePolicy, ReceiveReport, ReceiveService,
-    Repo, RepoMode, Type, UpdatePlan, Value,
+    Checksum, Commit, Error, HookFuture, HookRefusal, HostEntry, LockKind, MAX_METADATA_SIZE,
+    ObjectType, ReceiveHooks, ReceivePolicy, ReceiveReport, ReceiveService, Repo, RepoMode, Type,
+    UpdatePlan, Value,
 };
 use ostrya_rt::block_on;
 
@@ -1058,14 +1058,19 @@ fn keep_existing_keeps_a_stored_value() {
 }
 
 /// The host merge takes a stored dict that the edit plan of the session read
-/// and that no edit took. The exclude filter empties the client dict, so the
-/// edit plan reads the stored dict and adds no edit. `keep_existing` keeps the
+/// and that no edit took. The client dict holds `ostrya.related` alone, and
+/// `keep-detached-related=false` empties it, so the edit plan reads the stored
+/// dict and adds no edit. `keep_existing` keeps the
 /// stored value. An entry without `keep_existing` replaces the stored value,
 /// and the other stored entries stay.
 #[test]
 fn the_host_merge_takes_a_stored_dict_the_plan_read() {
     let tmp = TmpDir::new("hooks-leftover");
-    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    let repo = new_repo(
+        &tmp,
+        RepoMode::Archive,
+        "\n[ex-ostrya]\nkeep-detached-related=false\n",
+    );
     plant_stored(
         &repo,
         dict_bytes(vec![
@@ -1086,13 +1091,22 @@ fn the_host_merge_takes_a_stored_dict_the_plan_read() {
         )],
         &drops,
     );
-    let policy = ReceivePolicy {
-        detached_metadata_filter: Some(DetachedMetadataFilter::excluding(["dropped"])),
-        ..policy_allowing(&["w:**"])
-    };
+    let related = Value::variant(
+        Type::parse("a(say)").unwrap(),
+        Value::Array(vec![Value::Tuple(vec![
+            Value::Str("layer/base".into()),
+            Value::Bytes(fixture_commit().as_bytes().to_vec()),
+        ])]),
+    );
     let mut objects = fixture_objects(Encoding::Raw);
-    objects.push(client_dict(vec![("dropped", text("client"))]));
-    let (_, result) = run_with(&repo, policy, Some(hook), &objects, vec![main_update()]);
+    objects.push(client_dict(vec![("ostrya.related", related)]));
+    let (_, result) = run_with(
+        &repo,
+        policy_allowing(&["w:**"]),
+        Some(hook),
+        &objects,
+        vec![main_update()],
+    );
     result.unwrap();
     let dict = stored(&repo).unwrap();
     assert_eq!(

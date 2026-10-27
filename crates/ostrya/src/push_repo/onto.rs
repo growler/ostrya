@@ -11,8 +11,8 @@ use super::negotiate::{check_tag_names, collection_id_refusal};
 use super::source::RepoSource;
 use crate::error::{Error, Result};
 use crate::lock::{LockGuard, LockKind};
-use crate::pull::DetachedMetadataFilter;
 use crate::read::CommitState;
+use crate::related::RelatedRule;
 use crate::remote::proto::ServerCommit;
 use crate::remote::{
     Compression, Endpoint, PushOutcome, PushProgress, PushSession, SessionOptions,
@@ -388,7 +388,7 @@ impl Onto {
         drop(seen);
         let missing = session.missing(&names).await?;
         drop(names);
-        let source = RepoSource::new(self.repo.clone(), DetachedMetadataFilter::default());
+        let source = RepoSource::new(self.repo.clone(), RelatedRule::default());
         let no_commits: &[Checksum] = &[];
         session
             .send(&source, &missing, no_commits, compression)

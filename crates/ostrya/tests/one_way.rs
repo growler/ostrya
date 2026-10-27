@@ -1039,7 +1039,6 @@ mod export {
                 update("origin:main", Expected::Any, Some(commit)),
             ],
             compression,
-            ..ExportStreamOptions::default()
         }
     }
 

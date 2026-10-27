@@ -304,14 +304,12 @@ impl Repo {
     /// # Detached metadata merge
     ///
     /// The session merges each incoming detached metadata dict into the dict
-    /// that the repository holds for the same commit. The
-    /// `detached-metadata-exclude` filter applies to the incoming dict before
-    /// the merge. If `[ex-ostrya] keep-detached-related` of the repository is
-    /// `false`, the session also drops `ostrya.related` from the incoming
-    /// dict before the merge. A value that the stored dict holds under
-    /// `ostrya.related` stays. The merged dict holds the stored keys first, in
-    /// the stored order. Then it holds each key that only the incoming dict
-    /// holds, in the incoming order.
+    /// that the repository holds for the same commit. If `[ex-ostrya]
+    /// keep-detached-related` of the repository is `false`, the session drops
+    /// `ostrya.related` from the incoming dict before the merge. A value that
+    /// the stored dict holds under `ostrya.related` stays. The merged dict
+    /// holds the stored keys first, in the stored order. Then it holds each
+    /// key that only the incoming dict holds, in the incoming order.
     ///
     /// - Under `ostree.gpgsigs`, `ostree.sign.ed25519`, `ostree.sign.spki`, and
     ///   `ostree.sign.dummy`, the value is the union of the two lists. The

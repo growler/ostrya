@@ -43,6 +43,7 @@ use crate::fetch::{FetchRequest, Fetched, Fetcher, Priority};
 use crate::inflate::BufSource;
 use crate::object::{MAX_FILE_HEADER_SIZE, MAX_METADATA_SIZE};
 use crate::read::CommitState;
+use crate::related::RelatedRule;
 use crate::remote::{Endpoint, PullSession, StreamSessionOptions};
 use crate::repo::Repo;
 use crate::summary::{SUMMARY_FILE, SUMMARY_SIG_FILE, Summary, put_root_file_blocking};
@@ -59,10 +60,10 @@ use super::source::{Connection, RemoteSource, RootFiles, Transfer, http_error, s
 use super::subpath::{Scope, Subpaths};
 use super::verify::Verification;
 use super::{
-    CheckedMeta, DetachedMetadataFilter, ModeChecks, PullCounters, PullFlags, PullOptions,
-    PullStats, PullVerify, READ_CHUNK, RefPlace, TimestampBase, TipChecks, apply_durability,
+    CheckedMeta, ModeChecks, PullCounters, PullFlags, PullOptions, PullStats, PullVerify,
+    READ_CHUNK, RefPlace, TimestampBase, TipChecks, apply_durability,
     check_commit_signatures_filtered, check_depth, check_remote_option, check_static_deltas,
-    check_tip_refs, keep_related, refuse_remote_collection, take_static_deltas,
+    check_tip_refs, refuse_remote_collection, take_static_deltas,
 };
 
 /// The number of fetched content objects that stream into the object store at
@@ -230,12 +231,10 @@ impl Repo {
     /// answers 404 for. [`pull_local`](Repo::pull_local) states when the
     /// transaction writes it and what a failure leaves.
     ///
-    /// The pull stores the properties that
-    /// [`detached_metadata_filter`](PullOptions::detached_metadata_filter)
-    /// allows. If `[ex-ostrya] keep-detached-related` of this repository is
-    /// `false`
+    /// If `[ex-ostrya] keep-detached-related` of this repository is `false`
     /// ([`RepoConfig::keep_detached_related`](crate::RepoConfig::keep_detached_related)),
-    /// the pull also drops `ostrya.related`, also through a static delta.
+    /// the pull drops `ostrya.related` from each `.commitmeta` that it stores,
+    /// also through a static delta.
     ///
     /// # Composefs image
     ///
@@ -609,7 +608,9 @@ impl Repo {
         refuse_remote_collection(&opts)?;
         check_remote_option(&opts)?;
         check_static_deltas(&opts)?;
-        keep_related(self, &mut opts)?;
+        // `drive` reads the rule again. This read refuses a value that is not
+        // a boolean before the first request.
+        RelatedRule::of(self.config())?;
         let edges = take_static_deltas(&mut opts).await?;
         // The endpoint is resolved first, so a remote the config does not
         // describe reports that before a policy is resolved for it.
@@ -762,8 +763,8 @@ impl Repo {
         mut opts: PullOptions,
     ) -> Result<PullStats> {
         let started = Instant::now();
-        let checked = match keep_related(self, &mut opts) {
-            Ok(()) => check_session_pull(&mut opts).await,
+        let checked = match RelatedRule::of(self.config()) {
+            Ok(_) => check_session_pull(&mut opts).await,
             Err(e) => Err(e),
         };
         let (subpaths, edges) = match checked {
@@ -1322,7 +1323,7 @@ impl Repo {
             done: phase.done,
             delta_plan,
             verification,
-            detached_filter: &opts.detached_metadata_filter,
+            related: RelatedRule::of(self.config())?,
             images: !opts.flags.contains(PullFlags::COMMIT_ONLY) && opts.subpaths.is_empty(),
             progress,
         };
@@ -1433,7 +1434,7 @@ impl Repo {
             return self.done_commit(ctx, checksum).await;
         }
         // Discovery checked the signatures of each commit of a chain, and kept
-        // the verified `.commitmeta`: the result of the filter if the check
+        // the verified `.commitmeta`: the result of the rule if the check
         // parsed it, else the bytes of the source. The step stages these bytes
         // and does not request them again.
         let (prechecked, filtered, mut known) = match ctx.delta_plan.commit_check(&checksum).await?
@@ -1531,11 +1532,12 @@ impl Repo {
         // this pull puts in place. That is the copy of the remote if it served
         // one, else the copy of this repository. A later verification of the
         // stored commit reads the same metadata.
-        // If the verification parses the metadata, the filter reads that parse
-        // right after the verification, and the step keeps only its result.
-        // The bytes that discovery filtered pass as they are. The step filters
-        // the other bytes that discovery kept, and a `.commitmeta` that it
-        // fetched itself.
+        // If the verification parses the metadata, the rule of `[ex-ostrya]
+        // keep-detached-related` reads that parse right after the
+        // verification, and the step keeps only its result. The bytes that
+        // the rule of discovery read pass as they are. The step applies the
+        // rule to the other bytes that discovery kept, and to a `.commitmeta`
+        // that it fetched itself.
         let detached = if prechecked {
             match known {
                 None if filtered => Some(CheckedMeta::Filtered(detached)),
@@ -1545,7 +1547,7 @@ impl Repo {
             let detached = check_commit_signatures_filtered(
                 self,
                 ctx.verification,
-                ctx.detached_filter,
+                ctx.related,
                 &checksum,
                 &bytes,
                 detached,
@@ -1597,15 +1599,15 @@ impl Repo {
         // copy of the remote replaces the copy here. That is the purpose of a
         // new read of a mutable file on each pull.
         //
-        // The filter runs after the checks read the metadata as the remote
+        // The rule runs after the checks read the metadata as the remote
         // holds it: here, after the verification that parsed it, or in
         // discovery after the verification of a commit of a chain that parsed
-        // it. So a filter drops a property from
-        // what the pull stores, and the verified metadata stays whole. A
-        // filter that allows no property stages nothing, and the copy of this
-        // repository stays as it is.
+        // it. So the rule drops `ostrya.related` from what the pull stores,
+        // and the verified metadata stays whole. A dict of which the rule
+        // keeps no property stages nothing, and the copy of this repository
+        // stays as it is.
         if let Some(meta) = detached
-            && let Some(meta) = meta.filtered(ctx.detached_filter, &checksum).await?
+            && let Some(meta) = meta.filtered(ctx.related, &checksum).await?
         {
             ctx.txn.stage_commit_detached_bytes(&checksum, meta).await?;
         }
@@ -2237,9 +2239,10 @@ struct StepCtx<'a> {
     /// The signature policy of this pull. The pull verifies each commit of a
     /// step before it stages its bytes.
     verification: &'a Verification,
-    /// The filter of the properties of detached metadata that this pull
-    /// stores. It applies after the checks of the commit pass.
-    detached_filter: &'a DetachedMetadataFilter,
+    /// The rule of `[ex-ostrya] keep-detached-related` of this repository. It
+    /// applies to the detached metadata that this pull stores, after the
+    /// checks of the commit pass.
+    related: RelatedRule,
     /// `true` if the pull fetches the composefs image of each commit that
     /// carries the key: a pull that is not commit-only and has no subpath.
     images: bool,

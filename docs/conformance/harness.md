@@ -585,9 +585,9 @@ failure naming what is missing.
 - No shell interprets a `run:` line.
 - The upstream shell test suite is never read, run, or vendored. See
   CLAUDE.md, "Licensing and clean-room discipline".
-- No repository a setup builds carries an `[ex-ostrya]` group. The keys of
-  that group part `ostrya pull` from the tool (`cli-surface.md`, "P2"), so a
-  cell run against a repository holding them would read a port extension where
+- No repository a setup builds carries an `[ex-ostrya]` group. The key of
+  that group parts `ostrya pull` from the tool (`cli-surface.md`, "P2"), so a
+  cell run against a repository holding it would read a port extension where
   it states it reads the tool's behavior. The rule holds by construction: a setup
   creates its repository through `init`, which writes `[core]` alone, and no
   setup edits `config`.

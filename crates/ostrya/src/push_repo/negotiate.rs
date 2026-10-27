@@ -11,9 +11,9 @@ use super::refspec::PushTarget;
 use super::source::RepoSource;
 use crate::error::{Error, Result};
 use crate::lock::{LockGuard, LockKind};
-use crate::pull::DetachedMetadataFilter;
 use crate::read::CommitState;
 use crate::refs::MAX_COLLECTION_ID_LEN;
+use crate::related::RelatedRule;
 use crate::remote::{
     Compression, Endpoint, Expected, PushOutcome, PushProgress, PushSession, RefUpdate, ServerInfo,
     SessionOptions,
@@ -91,13 +91,6 @@ pub struct RepoPushOptions {
     /// If `true`, each ref update expects any state. The push also asks the
     /// server to allow an update that is not a fast-forward.
     pub force: bool,
-    /// The filter of the detached metadata of each commit that the push sends.
-    ///
-    /// If the filter is unset, the push sends every key. The push then sends
-    /// the stored `.commitmeta` bytes with no parse, so the server refuses a
-    /// `.commitmeta` that is not an `a{sv}` dict. A set filter parses the
-    /// file, and such a file gives [`Source`](crate::remote::Error::Source).
-    pub detached_metadata_filter: DetachedMetadataFilter,
     /// A progress handle that receives the counters of the session.
     pub progress: Option<PushProgress>,
     /// The switch that removes the writer lock of a bucket repository before
@@ -309,9 +302,9 @@ impl Repo {
     /// that the server lacks.
     ///
     /// The push also sends the detached metadata of each commit that it sends
-    /// and of each source commit. The metadata passes
-    /// [`detached_metadata_filter`](RepoPushOptions::detached_metadata_filter)
-    /// first.
+    /// and of each source commit. It sends the stored `.commitmeta` bytes with
+    /// no parse, so the server refuses a `.commitmeta` that is not an `a{sv}`
+    /// dict.
     ///
     /// # Ref updates
     ///
@@ -897,7 +890,7 @@ impl Plan {
                     .map(|(c, _)| *c)
                     .filter(|c| !lacking.contains(c)),
             );
-            let source = RepoSource::new(self.repo.clone(), opts.detached_metadata_filter.clone());
+            let source = RepoSource::new(self.repo.clone(), RelatedRule::default());
             session
                 .send(&source, &needed, &metadata, opts.compression)
                 .await?;

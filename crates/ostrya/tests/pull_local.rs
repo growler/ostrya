@@ -12,17 +12,14 @@ use std::os::fd::AsFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt, symlink};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use common::{TmpDir, file_inventory, ostree_available, wait_for_commit_under_guard, within};
 use futures_lite::future::poll_once;
 use ostrya::{
     AdvertisedDelta, Checksum, CollectionRef, CommitModifier, CommitModifierFlags, CommitOptions,
-    CommitState, CreateOptions, DeltaOptions, DeltaSuperblock, DetachedMetadataFilter,
-    DetachedMetadataFilterFn, Ed25519Signer, Error, FilterResult, FsckOptions, MutableTree,
-    ObjectName, ObjectType, PullFlags, PullOptions, PullStats, PullVerify, Repo, RepoMode, Signer,
-    SummaryOptions, TimestampCheck, Type, Value,
+    CommitState, CreateOptions, DeltaOptions, DeltaSuperblock, Ed25519Signer, Error, FsckOptions,
+    MutableTree, ObjectName, ObjectType, PullFlags, PullOptions, PullStats, PullVerify, Repo,
+    RepoMode, Signer, SummaryOptions, TimestampCheck, Type, Value,
 };
 use ostrya_rt::{block_on, spawn};
 
@@ -2111,104 +2108,26 @@ async fn detached_property(repo: &Repo, commit: &Checksum, key: &str) -> Option<
         .and_then(|dict| dict.dict_get(key).cloned())
 }
 
+/// A dict that holds `ostrya.related` alone gives nothing to store under
+/// `keep-detached-related=false`, so a destination with no `.commitmeta`
+/// gets none.
 #[test]
-fn a_filter_drops_the_properties_it_skips_and_keeps_the_rest() {
-    let tmp = TmpDir::new("pull-detached-filter");
+fn the_switch_stores_nothing_for_a_dict_that_holds_the_related_key_alone() {
+    let tmp = TmpDir::new("pull-keep-related-alone");
     block_on(async {
         let base = tmp.path();
-        let (_src_dir, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
-        src.write_commit_detached_metadata(&c2, Some(&two_property_metadata()))
+        let (_src_dir, src, c1, c2) = source_repo(base, RepoMode::Archive).await;
+        src.add_detached_related(&c2, "layer/base", &c1)
             .await
             .unwrap();
+        assert_eq!(detached_keys(&src, &c2).await, ["ostrya.related"]);
 
-        let (_dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+        let (dst_dir, _dst) = make_repo(base, "dst", RepoMode::Archive).await;
+        let dst = with_keep_related(&dst_dir, "false").await;
         dst.pull_local(
             &src,
             PullOptions {
                 refs: vec!["main".to_owned()],
-                detached_metadata_filter: DetachedMetadataFilter::new(|_, key, _| {
-                    if key == "build.gc-roots" {
-                        FilterResult::Skip
-                    } else {
-                        FilterResult::Allow
-                    }
-                }),
-                ..PullOptions::default()
-            },
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            detached_property(&dst, &c2, "ostree.gpgsigs").await,
-            Some(Value::Variant(Box::new((
-                Type::parse("s").unwrap(),
-                Value::Str("a signature".to_owned()),
-            )))),
-            "an allowed property is stored"
-        );
-        assert_eq!(
-            detached_property(&dst, &c2, "build.gc-roots").await,
-            None,
-            "a skipped property is not"
-        );
-        // The source stays unchanged. The filter changes only what the
-        // destination stores.
-        assert_eq!(
-            src.read_commit_detached_metadata(&c2).await.unwrap(),
-            Some(two_property_metadata())
-        );
-    });
-}
-
-#[test]
-fn a_filter_that_allows_everything_stores_the_source_bytes() {
-    let tmp = TmpDir::new("pull-detached-filter-allow");
-    block_on(async {
-        let base = tmp.path();
-        let (src_dir, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
-        src.write_commit_detached_metadata(&c2, Some(&two_property_metadata()))
-            .await
-            .unwrap();
-
-        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
-        dst.pull_local(
-            &src,
-            PullOptions {
-                refs: vec!["main".to_owned()],
-                detached_metadata_filter: DetachedMetadataFilter::new(|_, _, _| {
-                    FilterResult::Allow
-                }),
-                ..PullOptions::default()
-            },
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            std::fs::read(commitmeta_path(&dst_dir, &c2)).unwrap(),
-            std::fs::read(commitmeta_path(&src_dir, &c2)).unwrap(),
-            "the stored bytes are the source's, byte for byte"
-        );
-    });
-}
-
-#[test]
-fn a_filter_that_skips_everything_stores_nothing() {
-    let tmp = TmpDir::new("pull-detached-filter-skip");
-    block_on(async {
-        let base = tmp.path();
-        let (_src_dir, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
-        src.write_commit_detached_metadata(&c2, Some(&two_property_metadata()))
-            .await
-            .unwrap();
-
-        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
-        dst.pull_local(
-            &src,
-            PullOptions {
-                refs: vec!["main".to_owned()],
-                detached_metadata_filter: DetachedMetadataFilter::new(|_, _, _| FilterResult::Skip),
                 ..PullOptions::default()
             },
         )
@@ -2331,131 +2250,6 @@ fn a_pull_under_a_guard_publishes_its_objects_and_waits_at_the_ref_step() {
     });
 }
 
-/// `DetachedMetadataFilter::excluding` is the constructor that the `ostrya`
-/// CLI uses for `[ex-ostrya] detached-metadata-exclude`. The filter drops the
-/// properties that the list names and keeps each other property.
-#[test]
-fn an_exclude_list_drops_the_named_properties_and_keeps_the_rest() {
-    let tmp = TmpDir::new("pull-detached-exclude");
-    block_on(async {
-        let base = tmp.path();
-        let (_src_dir, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
-        src.write_commit_detached_metadata(&c2, Some(&two_property_metadata()))
-            .await
-            .unwrap();
-
-        let (_dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
-        dst.pull_local(
-            &src,
-            PullOptions {
-                refs: vec!["main".to_owned()],
-                detached_metadata_filter: DetachedMetadataFilter::excluding(["build.gc-roots"]),
-                ..PullOptions::default()
-            },
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            detached_property(&dst, &c2, "build.gc-roots").await,
-            None,
-            "a property the list names is not stored"
-        );
-        assert_eq!(
-            detached_property(&dst, &c2, "ostree.gpgsigs").await,
-            Some(Value::Variant(Box::new((
-                Type::parse("s").unwrap(),
-                Value::Str("a signature".to_owned()),
-            )))),
-            "a property it does not name is stored"
-        );
-    });
-}
-
-/// The CLI treats an empty exclude list as an absent key and uses the default
-/// filter. A filter built directly from an empty list also keeps each
-/// property.
-#[test]
-fn an_empty_exclude_list_keeps_every_property() {
-    let tmp = TmpDir::new("pull-detached-exclude-empty");
-    block_on(async {
-        let base = tmp.path();
-        let (src_dir, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
-        src.write_commit_detached_metadata(&c2, Some(&two_property_metadata()))
-            .await
-            .unwrap();
-
-        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
-        dst.pull_local(
-            &src,
-            PullOptions {
-                refs: vec!["main".to_owned()],
-                detached_metadata_filter: DetachedMetadataFilter::excluding(Vec::<String>::new()),
-                ..PullOptions::default()
-            },
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            std::fs::read(commitmeta_path(&dst_dir, &c2)).unwrap(),
-            std::fs::read(commitmeta_path(&src_dir, &c2)).unwrap(),
-            "the stored bytes are the source's, byte for byte"
-        );
-    });
-}
-
-/// A filter that allows no property keeps the `.commitmeta` of the
-/// destination. A source that holds no `.commitmeta` has the same result.
-#[test]
-fn a_filter_that_skips_everything_keeps_the_destinations_own_metadata() {
-    let tmp = TmpDir::new("pull-detached-filter-skip-keep");
-    block_on(async {
-        let base = tmp.path();
-        let (_src_dir, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
-        src.write_commit_detached_metadata(&c2, Some(&two_property_metadata()))
-            .await
-            .unwrap();
-
-        // The destination holds the commit and detached metadata of its own.
-        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
-        dst.pull_local(
-            &src,
-            PullOptions {
-                refs: vec!["main".to_owned()],
-                ..PullOptions::default()
-            },
-        )
-        .await
-        .unwrap();
-        let local = dict_of("local.signature", "the destination's own");
-        dst.write_commit_detached_metadata(&c2, Some(&local))
-            .await
-            .unwrap();
-        let before = std::fs::read(commitmeta_path(&dst_dir, &c2)).unwrap();
-
-        // `from_fn` takes a callback that the caller holds.
-        let skip: DetachedMetadataFilterFn =
-            std::sync::Arc::new(|_: &Checksum, _: &str, _: &Value| FilterResult::Skip);
-        dst.pull_local(
-            &src,
-            PullOptions {
-                refs: vec!["main".to_owned()],
-                detached_metadata_filter: DetachedMetadataFilter::from_fn(skip),
-                ..PullOptions::default()
-            },
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(
-            std::fs::read(commitmeta_path(&dst_dir, &c2)).unwrap(),
-            before,
-            "the destination's own detached metadata stands"
-        );
-    });
-}
-
 /// Appends `[ex-ostrya] keep-detached-related=VALUE` to the config of the
 /// repository at `dir`, and opens the repository again.
 async fn with_keep_related(dir: &Path, value: &str) -> Repo {
@@ -2513,49 +2307,6 @@ fn the_switch_drops_the_related_key_and_keeps_the_rest() {
             dst.read_commit_detached_metadata(&c2).await.unwrap(),
             Some(two_property_metadata())
         );
-    });
-}
-
-/// The switch and the filter of the options apply together. The pull does
-/// not call the filter for `ostrya.related`.
-#[test]
-fn the_switch_and_the_filter_apply_together() {
-    let tmp = TmpDir::new("pull-keep-related-filter");
-    block_on(async {
-        let base = tmp.path();
-        let (_src_dir, src, c1, c2) = source_repo(base, RepoMode::Archive).await;
-        src.write_commit_detached_metadata(&c2, Some(&two_property_metadata()))
-            .await
-            .unwrap();
-        src.add_detached_related(&c2, "layer/base", &c1)
-            .await
-            .unwrap();
-
-        let (dst_dir, _dst) = make_repo(base, "dst", RepoMode::Archive).await;
-        let dst = with_keep_related(&dst_dir, "false").await;
-        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let record = Arc::clone(&seen);
-        let filter = DetachedMetadataFilter::new(move |_, key, _| {
-            record.lock().unwrap().push(key.to_owned());
-            if key == "ostree.gpgsigs" {
-                FilterResult::Skip
-            } else {
-                FilterResult::Allow
-            }
-        });
-        dst.pull_local(
-            &src,
-            PullOptions {
-                refs: vec!["main".to_owned()],
-                detached_metadata_filter: filter,
-                ..PullOptions::default()
-            },
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(detached_keys(&dst, &c2).await, ["build.gc-roots"]);
-        assert_eq!(*seen.lock().unwrap(), ["ostree.gpgsigs", "build.gc-roots"]);
     });
 }
 
@@ -2684,50 +2435,6 @@ fn dict_of(key: &str, value: &str) -> Value {
             Value::Str(value.to_owned()),
         ))),
     ])])
-}
-
-#[test]
-fn the_filter_sees_the_commit_it_is_filtering_for() {
-    let tmp = TmpDir::new("pull-detached-filter-commit");
-    block_on(async {
-        let base = tmp.path();
-        let (_src_dir, src, c1, c2) = source_repo(base, RepoMode::Archive).await;
-        for commit in [&c1, &c2] {
-            src.write_commit_detached_metadata(commit, Some(&two_property_metadata()))
-                .await
-                .unwrap();
-        }
-
-        // The filter drops the private property of the tip only. The parent
-        // keeps its private property.
-        let tip = c2;
-        let (_dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
-        dst.pull_local(
-            &src,
-            PullOptions {
-                refs: vec!["main".to_owned()],
-                depth: -1,
-                detached_metadata_filter: DetachedMetadataFilter::new(move |commit, key, _| {
-                    if *commit == tip && key == "build.gc-roots" {
-                        FilterResult::Skip
-                    } else {
-                        FilterResult::Allow
-                    }
-                }),
-                ..PullOptions::default()
-            },
-        )
-        .await
-        .unwrap();
-
-        assert_eq!(detached_property(&dst, &c2, "build.gc-roots").await, None);
-        assert!(
-            detached_property(&dst, &c1, "build.gc-roots")
-                .await
-                .is_some(),
-            "the parent commit is filtered on its own terms"
-        );
-    });
 }
 
 #[test]
@@ -3325,20 +3032,29 @@ fn a_local_pull_checks_the_commits_when_asked() {
     });
 }
 
-/// The filter runs after the signature verification, on the metadata of the
-/// source. As a result, a filter that drops the signature cannot stop the
-/// verification. The stored commit then carries no signature.
+/// The switch applies after the signature verification, on the metadata of
+/// the source. The verified pull passes, and the stored commit keeps its
+/// signature and loses `ostrya.related`.
 #[test]
-fn the_filter_runs_after_the_signature_check() {
-    let tmp = TmpDir::new("pull-local-filter-after-verify");
+fn the_switch_applies_after_the_signature_check() {
+    let tmp = TmpDir::new("pull-local-switch-after-verify");
     let base = tmp.path();
     block_on(async {
         let (_src_path, src, c1, c2) = source_repo(base, RepoMode::Archive).await;
         let signer = Ed25519Signer::from_base64(SECRET_B64).unwrap();
         src.sign_commit(&c1, &signer).await.unwrap();
         src.sign_commit(&c2, &signer).await.unwrap();
+        src.add_detached_related(&c2, "layer/base", &c1)
+            .await
+            .unwrap();
+        assert_eq!(
+            detached_keys(&src, &c2).await,
+            ["ostree.sign.ed25519", "ostrya.related"]
+        );
 
         let dst = dest_trusting(base, PUBLIC_B64).await;
+        drop(dst);
+        let dst = with_keep_related(&base.join("dst"), "false").await;
         let opts = PullOptions {
             remote: Some("origin".to_owned()),
             verify: PullVerify {
@@ -3346,7 +3062,6 @@ fn the_filter_runs_after_the_signature_check() {
                 ..PullVerify::default()
             },
             depth: -1,
-            detached_metadata_filter: DetachedMetadataFilter::new(|_, _, _| FilterResult::Skip),
             ..PullOptions::default()
         };
         pull_main_with(&dst, &src, opts).await.unwrap();
@@ -3357,9 +3072,9 @@ fn the_filter_runs_after_the_signature_check() {
             "the pull verified the signature and published the ref"
         );
         assert_eq!(
-            dst.read_commit_detached_metadata(&c2).await.unwrap(),
-            None,
-            "and stored none of the metadata the filter skipped"
+            detached_keys(&dst, &c2).await,
+            ["ostree.sign.ed25519"],
+            "and stored the signature without the related key"
         );
     });
 }
@@ -6352,20 +6067,6 @@ fn assert_no_markers(dst_dir: &Path) {
     assert!(staging.is_empty(), "{staging:?}");
 }
 
-/// Returns a filter that allows each property, and the count of its calls for
-/// the detached metadata of `commit`.
-fn counting_filter(commit: Checksum) -> (DetachedMetadataFilter, Arc<AtomicUsize>) {
-    let calls = Arc::new(AtomicUsize::new(0));
-    let counted = Arc::clone(&calls);
-    let filter = DetachedMetadataFilter::new(move |seen, _, _| {
-        if *seen == commit {
-            counted.fetch_add(1, Ordering::Relaxed);
-        }
-        FilterResult::Allow
-    });
-    (filter, calls)
-}
-
 /// A local pull applies a chain of two static deltas from the commit that the
 /// destination holds, with no summary and with `require_static_deltas` off.
 /// The intermediate commit and the target end complete with no marker. The
@@ -6522,8 +6223,8 @@ fn an_unsigned_intermediate_commit_fails_a_local_pull() {
 
 /// A pull of depth 1 through a chain under a signature policy passes. The
 /// parent of the target is an intermediate commit. The pull counts the
-/// `.commitmeta` of that commit once, and imports it once: three superblocks
-/// and the `.commitmeta` of B, C, and D make six metadata reads.
+/// `.commitmeta` of that commit once: three superblocks and the
+/// `.commitmeta` of B, C, and D make six metadata reads.
 #[test]
 fn depth_one_through_a_local_chain_under_verification() {
     let tmp = TmpDir::new("pull-chain-depth-verify");
@@ -6536,18 +6237,15 @@ fn depth_one_through_a_local_chain_under_verification() {
         sign_commits(&src, &[a, b, c, d]).await;
         let (list, _dirs) = chain_list(&src, &[(a, b), (b, c), (c, d)]).await;
         let (dst_dir, dst) = signed_dst_holding(base, &src, &a).await;
-        let (filter, calls) = counting_filter(c);
 
         let opts = PullOptions {
             depth: 1,
-            detached_metadata_filter: filter,
             ..signed_chain_pull(list)
         };
         let stats = dst.pull_local(&src, opts).await.unwrap();
 
         assert_eq!(stats.metadata_fetched, 6);
         assert_eq!(stats.content_fetched, 0);
-        assert_eq!(calls.load(Ordering::Relaxed), 1);
         for commit in [b, c, d] {
             assert_complete(&src, &dst, &dst_dir, &commit).await;
         }
@@ -6563,8 +6261,8 @@ fn depth_one_through_a_local_chain_under_verification() {
 }
 
 /// A pull through a chain of static deltas under verification applies the
-/// switch of the destination. Discovery filters the `.commitmeta` of each
-/// commit of the chain, and the pull stores each signature without
+/// switch of the destination. Discovery applies it to the `.commitmeta` of
+/// each commit of the chain, and the pull stores each signature without
 /// `ostrya.related`.
 #[test]
 fn the_switch_applies_through_a_local_chain_under_verification() {
@@ -6604,10 +6302,9 @@ fn the_switch_applies_through_a_local_chain_under_verification() {
 }
 
 /// A requested target is also an intermediate commit of the chain of another
-/// target. The pull writes both refs and imports the detached metadata of
-/// that commit once. The binding check applies to the ref that names the
-/// intermediate commit: a ref that the binding of that commit does not list
-/// fails the pull.
+/// target. The pull writes both refs. The binding check applies to the ref that
+/// names the intermediate commit: a ref that the binding of that commit does
+/// not list fails the pull.
 #[test]
 fn a_local_target_that_is_an_intermediate_commit_of_another_target() {
     let tmp = TmpDir::new("pull-chain-target-in-level");
@@ -6642,16 +6339,13 @@ fn a_local_target_that_is_an_intermediate_commit_of_another_target() {
         assert_eq!(dst.list_objects().await.unwrap(), held);
         assert_no_markers(&dst_dir);
 
-        let (filter, calls) = counting_filter(c);
         let opts = PullOptions {
             refs: vec!["main".to_owned(), "mid".to_owned()],
-            detached_metadata_filter: filter,
             ..signed_chain_pull(list)
         };
         dst.pull_local(&src, opts).await.unwrap();
         assert_eq!(dst.resolve_rev("origin:main", true).await.unwrap(), Some(d));
         assert_eq!(dst.resolve_rev("origin:mid", true).await.unwrap(), Some(c));
-        assert_eq!(calls.load(Ordering::Relaxed), 1);
         for commit in [b, c, d] {
             assert_complete(&src, &dst, &dst_dir, &commit).await;
         }

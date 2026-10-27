@@ -1537,10 +1537,11 @@ mod cli {
         assert_eq!(server_tip(&dest, "main"), Some(c2));
     }
 
-    /// A key that `[ex-ostrya] detached-metadata-exclude` of the client names
-    /// does not reach the server, and the other keys do.
+    /// The port reads no `[ex-ostrya] detached-metadata-exclude`. With the key
+    /// in the config of the client and of the server, each detached metadata
+    /// key reaches the server.
     #[test]
-    fn an_excluded_detached_metadata_key_does_not_reach_the_server() {
+    fn a_config_that_sets_detached_metadata_exclude_filters_nothing() {
         let setup = Setup::new("cli-exclude", "archive");
         let c = setup.commit(
             "main",
@@ -1550,11 +1551,13 @@ mod cli {
                 "--add-detached-metadata-string=drop.me=2",
             ],
         );
-        let config = setup.client.join("config");
-        let mut text = std::fs::read_to_string(&config).unwrap();
-        text.push_str("\n[ex-ostrya]\ndetached-metadata-exclude=drop.me\n");
-        std::fs::write(&config, text).unwrap();
         let dest = receiver(&setup.base, RepoMode::Archive);
+        for repo in [&setup.client, &dest] {
+            let config = repo.join("config");
+            let mut text = std::fs::read_to_string(&config).unwrap();
+            text.push_str("\n[ex-ostrya]\ndetached-metadata-exclude=drop.me\n");
+            std::fs::write(&config, text).unwrap();
+        }
 
         let out = setup.push_to(&dest, &["main"]);
         assert!(out.status.success(), "{}", stderr(&out));
@@ -1565,7 +1568,7 @@ mod cli {
         .expect("the server stores the detached metadata");
         let text = format!("{meta:?}");
         assert!(text.contains("keep.me"), "{text}");
-        assert!(!text.contains("drop.me"), "{text}");
+        assert!(text.contains("drop.me"), "{text}");
     }
 
     /// `ostrya push-tree` over the stand-in, checked against `ostree commit

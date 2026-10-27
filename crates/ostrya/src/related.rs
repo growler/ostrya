@@ -24,6 +24,7 @@ use std::sync::LazyLock;
 
 use ostrya_core::{Checksum, ObjectType, Type, Value, tuple_field_from_bytes};
 
+use crate::config::RepoConfig;
 use crate::error::{Error, Result};
 use crate::read::CommitState;
 use crate::repo::Repo;
@@ -257,6 +258,168 @@ fn related_values(dict: &Value) -> impl Iterator<Item = &Value> {
             [key, value] if key.as_str() == Some(RELATED_KEY) => Some(value),
             _ => None,
         })
+}
+
+/// The rule of `[ex-ostrya] keep-detached-related` for the detached metadata
+/// that a transfer stores.
+///
+/// If `drop_related` is `true`, the transfer drops `ostrya.related` from each
+/// detached metadata dict that it stores, and keeps each other property. If it
+/// is `false`, the transfer stores the dict of the source unchanged. The rule
+/// applies after each signature verification of the transfer, over the dict
+/// as the source holds it.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct RelatedRule {
+    /// `true` if the transfer drops `ostrya.related`.
+    pub(crate) drop_related: bool,
+}
+
+impl RelatedRule {
+    /// Returns the rule of `[ex-ostrya] keep-detached-related` of `config`,
+    /// the config of the repository that stores the dicts.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Core`] if the value is not a boolean.
+    pub(crate) fn of(config: &RepoConfig) -> Result<RelatedRule> {
+        Ok(RelatedRule {
+            drop_related: !config.keep_detached_related()?,
+        })
+    }
+
+    /// Returns the serialized properties of `bytes` that this rule keeps, or
+    /// `None` if the caller writes nothing.
+    ///
+    /// A rule that drops nothing, a dict with no `ostrya.related` entry, and
+    /// the zero-length "no metadata" marker each give the input bytes back
+    /// unchanged. A dict that holds only `ostrya.related` entries gives `None`
+    /// if the rule drops them, and the destination keeps the detached metadata
+    /// that it holds.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Core`] if the rule drops `ostrya.related` and `bytes` is not
+    /// an `a{sv}` dict.
+    pub(crate) fn apply(&self, commit: &Checksum, bytes: Vec<u8>) -> Result<Option<Vec<u8>>> {
+        if !self.drop_related {
+            return Ok(Some(bytes));
+        }
+        let Some(dict) = crate::summary::parse_signature_dict(&bytes)? else {
+            return Ok(Some(bytes));
+        };
+        self.apply_parsed(commit, bytes, dict)
+    }
+
+    /// Runs [`apply`](RelatedRule::apply) on the blocking pool.
+    ///
+    /// A rule that drops nothing and the zero-length marker parse nothing, so
+    /// they give the input bytes back on the calling task.
+    pub(crate) async fn apply_on_pool(
+        &self,
+        commit: &Checksum,
+        bytes: Vec<u8>,
+    ) -> Result<Option<Vec<u8>>> {
+        if !self.drop_related || bytes.is_empty() {
+            return Ok(Some(bytes));
+        }
+        let rule = *self;
+        let commit = *commit;
+        ostrya_rt::unblock(move || rule.apply(&commit, bytes)).await
+    }
+
+    /// Runs [`apply`](RelatedRule::apply) over the `.commitmeta` bytes
+    /// `bytes`, whose parse is `dict`.
+    ///
+    /// The call parses nothing. It serializes only a dict of which the rule
+    /// keeps some properties. The result is the result of `apply`.
+    pub(crate) fn apply_parsed(
+        &self,
+        commit: &Checksum,
+        bytes: Vec<u8>,
+        dict: Value,
+    ) -> Result<Option<Vec<u8>>> {
+        if !self.drop_related {
+            return Ok(Some(bytes));
+        }
+        match kept_entries(commit, dict)? {
+            Kept::All(_) => Ok(Some(bytes)),
+            Kept::Nothing => Ok(None),
+            Kept::Part(kept) => {
+                // The source bytes are not part of the result, so they drop
+                // before the serialization.
+                drop(bytes);
+                crate::summary::serialize_signature_dict(&Value::Array(kept)).map(Some)
+            }
+        }
+    }
+
+    /// Returns the properties of the parsed detached metadata `dict` that this
+    /// rule keeps, or `None` if the caller writes nothing.
+    ///
+    /// A rule that drops nothing and a dict with no `ostrya.related` entry
+    /// give `dict` back unchanged. A dict that holds only `ostrya.related`
+    /// entries gives `None` if the rule drops them.
+    #[cfg_attr(not(feature = "push"), allow(dead_code))]
+    pub(crate) fn apply_value(&self, commit: &Checksum, dict: Value) -> Result<Option<Value>> {
+        if !self.drop_related {
+            return Ok(Some(dict));
+        }
+        match kept_entries(commit, dict)? {
+            Kept::All(dict) => Ok(Some(dict)),
+            Kept::Nothing => Ok(None),
+            Kept::Part(kept) => Ok(Some(Value::Array(kept))),
+        }
+    }
+}
+
+/// The properties of a detached metadata dict that a [`RelatedRule`] keeps.
+enum Kept {
+    /// Every property: the dict as it came in.
+    All(Value),
+    /// Some of the properties, in their order.
+    Part(Vec<Value>),
+    /// No property.
+    Nothing,
+}
+
+/// Drops each `ostrya.related` property of the detached metadata `dict` of
+/// `commit`.
+///
+/// A value that is not a dict, and an entry that is not `{sv}`, are
+/// [`Error::InvalidFormat`].
+fn kept_entries(commit: &Checksum, dict: Value) -> Result<Kept> {
+    let Value::Array(entries) = dict else {
+        return Err(Error::InvalidFormat(format!(
+            "detached metadata of {commit} is not a dict"
+        )));
+    };
+    let mut allowed = Vec::with_capacity(entries.len());
+    for entry in &entries {
+        let key = entry
+            .as_tuple()
+            .and_then(|fields| match fields {
+                [key, _] => key.as_str(),
+                _ => None,
+            })
+            .ok_or_else(|| {
+                Error::InvalidFormat(format!(
+                    "detached metadata of {commit} holds an entry that is not `{{sv}}`"
+                ))
+            })?;
+        allowed.push(key != RELATED_KEY);
+    }
+    if allowed.iter().all(|allow| *allow) {
+        return Ok(Kept::All(Value::Array(entries)));
+    }
+    if !allowed.iter().any(|allow| *allow) {
+        return Ok(Kept::Nothing);
+    }
+    let kept = entries
+        .into_iter()
+        .zip(allowed)
+        .filter_map(|(entry, allow)| allow.then_some(entry))
+        .collect();
+    Ok(Kept::Part(kept))
 }
 
 /// Adds the build source `name` with the checksum `source` to the detached

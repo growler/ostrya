@@ -150,7 +150,7 @@ A missing commit is a commit that this repository does not hold complete. The pu
 \fB\-\-gpg\-verify\fR[=\fIBOOL\fR]
 Require a GPG signature on every commit that the pull carries.
 .IP
-Without this option, the \fB\%gpg\-verify\fR key of the remote applies, and its default is true. \fB\%\-\-gpg\-verify\fR requires a signature, and \fB\%\-\-gpg\-verify=false\fR requires none. The trusted keys are \fB\%<remote>.trustedkeys.gpg\fR of the repository, the system trusted set, and the keyrings that the \fB\%gpgkeypath\fR key of the remote names. Possible values: true, false.
+Without this option, the \fB\%gpg\-verify\fR key of the remote applies, and its default is true. \fB\%\-\-gpg\-verify\fR requires a signature, and \fB\%\-\-gpg\-verify=false\fR requires none. The trusted keys are \fB\%<remote>.trustedkeys.gpg\fR of the repository, the system trusted set, and the keyrings that the \fB\%gpgkeypath\fR key of the remote names. If the remote has the key \fB\%trust\fR, the keys of the commits come from its trust group (see \%ostrya\-config(1)). The command then refuses \fB\%\-\-gpg\-verify\fR, and \fB\%\-\-gpg\-verify=false\fR turns off the GPG check of the group. Possible values: true, false.
 .TP
 \fB\-\-gpg\-verify\-summary\fR[=\fIBOOL\fR]
 Require a GPG signature on the summary of the remote.
@@ -160,7 +160,7 @@ Without this option, the \fB\%gpg\-verify\-summary\fR key of the remote applies,
 \fB\-\-sign\-verify\fR[=\fIBOOL\fR]
 Require an \%ed25519 or spki signature on every pulled commit.
 .IP
-Without this option, the \fB\%sign\-verify\fR key of the remote applies, and its default is off. \fB\%\-\-sign\-verify\fR requires a signature and selects every engine of this build. \fB\%\-\-sign\-verify=false\fR requires none. A valid signature of one engine is sufficient. The trusted keys come from the \fB\%verification\-<engine>\-key\fR and \fB\%verification\-<engine>\-file\fR keys of the remote, and from the system key store. Possible values: true, false.
+Without this option, the \fB\%sign\-verify\fR key of the remote applies, and its default is off. \fB\%\-\-sign\-verify\fR requires a signature and selects every engine of this build. \fB\%\-\-sign\-verify=false\fR requires none. A valid signature of one engine is sufficient. The trusted keys come from the \fB\%verification\-<engine>\-key\fR and \fB\%verification\-<engine>\-file\fR keys of the remote, and from the system key store. If the remote has the key \fB\%trust\fR, the keys of the commits come from its trust group (see \%ostrya\-config(1)). The command then refuses \fB\%\-\-sign\-verify\fR, and \fB\%\-\-sign\-verify=false\fR turns off the \%sign\-api check of the group. Possible values: true, false.
 .TP
 \fB\-\-sign\-verify\-summary\fR[=\fIBOOL\fR]
 Require an \%ed25519 or spki signature on the summary of the remote.

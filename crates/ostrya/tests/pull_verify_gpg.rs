@@ -416,6 +416,99 @@ fn the_repository_keyring_is_what_a_remote_trusts() {
     });
 }
 
+/// A remote with a GPG trust group takes the keys of the commits from the
+/// keyrings that the group names alone. The repository keyring
+/// `<repo>/origin.trustedkeys.gpg` does not verify a commit of the remote.
+/// The GPG check of the summary still reads the repository keyring.
+///
+/// - The repository keyring holds the key of the commit, and the group names
+///   a keyring of another key: the pull refuses the commit.
+/// - The group names the keyring of the key of the commit, and the
+///   repository holds no keyring: the pull takes the commit.
+/// - The remote sets `gpg-verify-summary=true`, and the summary has a
+///   signature of a key that the repository keyring alone holds: the pull
+///   takes the commit and the summary. If the repository keyring holds the
+///   key of the group in place of that key, the pull refuses the summary.
+#[test]
+fn a_gpg_trust_group_reads_no_repository_keyring() {
+    if !gpg_available() {
+        return;
+    }
+    let tmp = TmpDir::new("pull-verify-gpg-trust");
+    let base = tmp.path();
+    let signer_home = GpgHome::create(base, "gnupg", "Ostrya Pull <pull@example.invalid>");
+    let other_home = GpgHome::create(base, "gnupg-other", "Other <other@example.invalid>");
+    let signer_keyring = base.join("signer.gpg");
+    let other_keyring = base.join("other.gpg");
+    signer_home.export_to(&signer_keyring);
+    other_home.export_to(&other_keyring);
+    let trust = |keyring: &Path, extra: &str| {
+        format!(
+            "gpg-verify=false\ntrust=t\n{extra}[ex-ostrya trust \"t\"]\ngpg-verify=true\n\
+             gpgkeypath={}\n",
+            keyring.display()
+        )
+    };
+    // The default policy: the remote and its trust group set the checks.
+    let opts = PullOptions {
+        refs: vec!["main".to_owned()],
+        remote: Some("origin".to_owned()),
+        ..PullOptions::default()
+    };
+
+    block_on(async {
+        let (src, commit) = source_repo(base).await;
+        src.sign_commit(&commit, &signer_home.signer())
+            .await
+            .unwrap();
+
+        let (path, dst) = dest_with_remote(base, "dst-keyring", &trust(&other_keyring, "")).await;
+        signer_home.export_to(&path.join("origin.trustedkeys.gpg"));
+        let err = dst.pull_local(&src, opts.clone()).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m) if m.contains("is from a trusted key")),
+            "{err}"
+        );
+        assert!(dst.list_refs(None).await.unwrap().is_empty());
+
+        let (_path, dst) = dest_with_remote(base, "dst-group", &trust(&signer_keyring, "")).await;
+        dst.pull_local(&src, opts.clone()).await.unwrap();
+        assert_eq!(
+            dst.resolve_rev("origin:main", true).await.unwrap(),
+            Some(commit)
+        );
+
+        src.regenerate_summary(&ostrya::SummaryOptions {
+            last_modified: Some(FIXED_TS),
+            ..ostrya::SummaryOptions::default()
+        })
+        .await
+        .unwrap();
+        src.sign_summary(&other_home.signer()).await.unwrap();
+        let (path, dst) = dest_with_remote(
+            base,
+            "dst-summary",
+            &trust(&signer_keyring, "gpg-verify-summary=true\n"),
+        )
+        .await;
+        // The repository keyring holds the key of the group alone, and the
+        // summary check refuses the summary.
+        signer_home.export_to(&path.join("origin.trustedkeys.gpg"));
+        let err = dst.pull_local(&src, opts.clone()).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m) if m.contains("is from a trusted key")),
+            "{err}"
+        );
+        assert!(dst.list_refs(None).await.unwrap().is_empty());
+        other_home.export_to(&path.join("origin.trustedkeys.gpg"));
+        dst.pull_local(&src, opts.clone()).await.unwrap();
+        assert_eq!(
+            dst.resolve_rev("origin:main", true).await.unwrap(),
+            Some(commit)
+        );
+    });
+}
+
 /// The pull follows a symlink at `<remote>.trustedkeys.gpg`.
 ///
 /// The remote trusts the keyring that the symlink names. The `ostree` command

@@ -3458,7 +3458,10 @@ struct PullArgs {
     /// its default is true. `--gpg-verify` requires a signature, and
     /// `--gpg-verify=false` requires none. The trusted keys are
     /// `<remote>.trustedkeys.gpg` of the repository, the system trusted set,
-    /// and the keyrings that the `gpgkeypath` key of the remote names.
+    /// and the keyrings that the `gpgkeypath` key of the remote names. If the
+    /// remote has the key `trust`, the keys of the commits come from its trust
+    /// group (see ostrya-config(1)). The command then refuses `--gpg-verify`,
+    /// and `--gpg-verify=false` turns off the GPG check of the group.
     #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
     gpg_verify: Option<bool>,
     /// Require a GPG signature on the summary of the remote.
@@ -3477,7 +3480,10 @@ struct PullArgs {
     /// every engine of this build. `--sign-verify=false` requires none. A
     /// valid signature of one engine is sufficient. The trusted keys come from
     /// the `verification-<engine>-key` and `verification-<engine>-file` keys
-    /// of the remote, and from the system key store.
+    /// of the remote, and from the system key store. If the remote has the
+    /// key `trust`, the keys of the commits come from its trust group (see
+    /// ostrya-config(1)). The command then refuses `--sign-verify`, and
+    /// `--sign-verify=false` turns off the sign-api check of the group.
     #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
     sign_verify: Option<bool>,
     /// Require an ed25519 or spki signature on the summary of the remote.
@@ -4220,7 +4226,10 @@ struct PullLocalArgs {
     /// its key: --gpg-verify, --gpg-verify-summary, --sign-verify, and
     /// --sign-verify-summary turn a check on, and --no-gpg-verify,
     /// --no-gpg-verify-summary, --no-sign-verify, and --no-sign-verify-summary
-    /// turn a configured check off.
+    /// turn a configured check off. If the remote has the key `trust`, the
+    /// keys of the commits come from its trust group. The command then refuses
+    /// --gpg-verify and --sign-verify, and --no-gpg-verify and
+    /// --no-sign-verify turn off that check of the group.
     #[arg(long)]
     remote: Option<String>,
     /// The number of parents of each pulled commit to follow.
@@ -4311,7 +4320,9 @@ struct PullLocalArgs {
     /// Do not require a GPG signature on the commits.
     ///
     /// The switch turns off the `gpg-verify` key of the remote that --remote
-    /// names. It needs --remote and conflicts with --gpg-verify.
+    /// names. If the remote has the key `trust`, the switch turns off the GPG
+    /// check of its trust group. It needs --remote and conflicts with
+    /// --gpg-verify.
     #[arg(long, requires = "remote", conflicts_with = "gpg_verify")]
     no_gpg_verify: bool,
     /// Do not require a GPG signature on the summary of the source.
@@ -4324,7 +4335,9 @@ struct PullLocalArgs {
     /// Do not require an ed25519 or spki signature on the commits.
     ///
     /// The switch turns off the `sign-verify` key of the remote that --remote
-    /// names. It needs --remote and conflicts with --sign-verify.
+    /// names. If the remote has the key `trust`, the switch turns off the
+    /// sign-api check of its trust group. It needs --remote and conflicts with
+    /// --sign-verify.
     #[arg(long, requires = "remote", conflicts_with = "sign_verify")]
     no_sign_verify: bool,
     /// Do not require an ed25519 or spki signature on the summary of the

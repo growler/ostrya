@@ -247,10 +247,46 @@ impl PullTrust {
     /// The call reads each key source before it returns. The trust that it
     /// gives reads no key source again.
     ///
+    /// # Trust groups
+    ///
+    /// If the section holds the key [`trust`](crate::config::Remote::trust),
+    /// the trust group `[ex-ostrya trust "NAME"]` that the key names sets the
+    /// commit policy. The commit keys come from the group alone: no system
+    /// key store, no repository keyring `<repo>/NAME.trustedkeys.gpg`, no
+    /// system keyring, and no global GPG trusted directory. The keys
+    /// `gpg-verify-summary` and `sign-verify-summary` of the section and the
+    /// key sources that they read set the summary policy, as without a trust
+    /// group. The two policies share no verifier.
+    ///
+    /// The call checks the group as the receive side does, and builds only
+    /// the axes that stay on. `Some(false)` in `verify.gpg` or `verify.sign`
+    /// turns off that commit axis of the group. The summary fields of
+    /// `verify` override the summary keys of the section.
+    ///
+    /// The section must not turn on a commit check: the call refuses
+    /// `gpg-verify=true` and a `sign-verify` value other than false. It
+    /// accepts `gpg-verify=false` and an absent `gpg-verify`, and both give no
+    /// GPG check of the commits. The call also refuses a key source of the
+    /// section that no summary check reads: `gpgkeypath` when
+    /// `gpg-verify-summary` is not true, and a `verification-ENGINE-key` or a
+    /// `verification-ENGINE-file` of an engine that `sign-verify-summary` does
+    /// not select. `sign-verify-summary=true` selects `ed25519` and `spki`.
+    /// This rule reads the summary keys of the section, and not the fields of
+    /// `verify`.
+    ///
+    /// Each refusal of a trust group comes before the call reads a key
+    /// source.
+    ///
     /// # Errors
     ///
     /// - [`Error::InvalidInput`] if [`valid_remote_name`] refuses `remote`.
     ///   The call refuses the name before it reads a key source.
+    /// - [`Error::InvalidFormat`] if the `trust` value is empty or holds a `"`
+    ///   or a control character, if it names no trust group, if the group
+    ///   fails the check of a trust group, or if the section breaks a rule of
+    ///   a trust group above.
+    /// - [`Error::InvalidInput`] if the section holds `trust`, and
+    ///   `verify.gpg` or `verify.sign` is `Some(true)`.
     /// - [`Error::Core`] if `gpg-verify` or `gpg-verify-summary` is not a
     ///   boolean, if a value holds a malformed escape sequence, or if a
     ///   sign-api key is not valid base64.
@@ -262,7 +298,9 @@ impl PullTrust {
     /// - [`Error::Unsupported`] if `sign-verify` or `sign-verify-summary` names
     ///   an engine that this build does not verify with.
     /// - [`Error::Unsupported`] if the trust asks for GPG verification and the
-    ///   build has no `verify-gpg` feature.
+    ///   build has no `verify-gpg` feature. Also if a trust group sets
+    ///   `gpg-verify=true` in such a build, or names the spki engine in a
+    ///   build with no spki key feature, whatever the fields of `verify`.
     /// - [`Error::Io`] if a directory of keys cannot be listed.
     pub async fn from_remote(repo: &Repo, remote: &str, verify: &PullVerify) -> Result<PullTrust> {
         if !valid_remote_name(remote) {
@@ -288,6 +326,13 @@ impl PullTrust {
         defaults: Defaults,
     ) -> Result<PullTrust> {
         let section = remote.and_then(|name| repo.config().remote(name));
+        // A remote with the key `trust` takes its commit keys from the trust
+        // group that the key names.
+        if let (Some(name), Some(section)) = (remote, &section)
+            && let Some(value) = section.trust()?
+        {
+            return trust::pull_trust(repo, name, section, &value, verify).await;
+        }
 
         let gpg_commit = switch(verify.gpg, || match &section {
             Some(section) => section.gpg_verify(),
@@ -295,18 +340,11 @@ impl PullTrust {
             // describe, the remote takes the default of a described remote.
             None => Ok(defaults == Defaults::Config),
         })?;
-        let gpg_summary = switch(verify.gpg_summary, || match &section {
-            Some(section) => section.gpg_verify_summary(),
-            None => Ok(false),
-        })?;
         let sign_commit = engines(verify.sign, || match &section {
             Some(section) => section.sign_verify(),
             None => Ok(SignVerify::Off),
         })?;
-        let sign_summary = engines(verify.sign_summary, || match &section {
-            Some(section) => section.sign_verify_summary(),
-            None => Ok(SignVerify::Off),
-        })?;
+        let (gpg_summary, sign_summary) = summary_switches(section.as_ref(), verify)?;
 
         let asks_for_a_check = gpg_commit
             || gpg_summary
@@ -370,6 +408,23 @@ pub(crate) enum Defaults {
     /// remote with no section, or no remote, gives no check.
     /// [`Repo::pull_local`] uses this source.
     Section,
+}
+
+/// Resolves the summary switches of a pull: the overrides in `verify`, or else
+/// the summary keys of `section`. A remote with no section checks no summary.
+fn summary_switches(
+    section: Option<&Remote<'_>>,
+    verify: &PullVerify,
+) -> Result<(bool, SignVerify)> {
+    let gpg = switch(verify.gpg_summary, || match section {
+        Some(section) => section.gpg_verify_summary(),
+        None => Ok(false),
+    })?;
+    let sign = engines(verify.sign_summary, || match section {
+        Some(section) => section.sign_verify_summary(),
+        None => Ok(SignVerify::Off),
+    })?;
+    Ok((gpg, sign))
 }
 
 /// Resolves one boolean switch: the override of the pull, or else the config.
@@ -613,7 +668,6 @@ pub(crate) enum KeySource<'a> {
     },
     /// A trust group, `[ex-ostrya trust "NAME"]`. The accessors of a remote
     /// section read it.
-    #[cfg_attr(not(feature = "receive"), allow(dead_code))]
     Trust {
         /// The name of the group, which a refusal names.
         name: &'a str,
@@ -660,7 +714,8 @@ impl KeySource<'_> {
 ///
 /// Both targets of a pull take their keys from the same remote. If the commit
 /// policy and the summary policy ask for the same verifier, the build makes it
-/// once and both policies hold it.
+/// once and both policies hold it. A pull from a remote with a trust group
+/// takes its commit keys from the group, so each target gets its own set.
 #[derive(Default)]
 pub(crate) struct Verifiers {
     /// The GPG verifier, built for the first target that asks for it.
@@ -1314,6 +1369,62 @@ mod tests {
             assert!(Arc::ptr_eq(&first, &second));
             assert_eq!(cache.sign.len(), 1);
         });
+    }
+
+    /// A pull from a remote with a trust group builds the commit policy from
+    /// the group and the summary policy from the remote, and the two share no
+    /// verifier. The group trusts key A, and the remote trusts key B for the
+    /// summary: the commit policy refuses B, and the summary policy refuses A.
+    #[test]
+    fn a_trust_group_and_the_remote_share_no_verifier() {
+        use crate::{CreateOptions, RepoMode};
+
+        const OTHER_SECRET_B64: &str = "5ILWxT+l9G/u3h0BptRpmSi35C9uog7YDdD+Fp1Xk+Hz52p0NlYh6xBA73kJEJKhKbbnjcE0rsWA5XA/K5Sq5Q==";
+        const OTHER_PUBLIC_B64: &str = "8+dqdDZWIesQQO95CRCSoSm2543BNK7FgOVwPyuUquU=";
+        let dir = std::env::temp_dir().join(format!(
+            "ostrya-verify-trust-split-{}-{}",
+            std::process::id(),
+            crate::write::unique()
+        ));
+        let root = dir.join("repo");
+        std::fs::create_dir_all(&dir).unwrap();
+        let group_key = ed25519_signed(SECRET_B64);
+        let remote_key = ed25519_signed(OTHER_SECRET_B64);
+        let outcome = ostrya_rt::block_on(async {
+            drop(
+                Repo::create(&root, CreateOptions::new(RepoMode::Archive))
+                    .await
+                    .unwrap(),
+            );
+            let config = root.join("config");
+            let mut text = std::fs::read_to_string(&config).unwrap();
+            text.push_str(&format!(
+                "\n[remote \"origin\"]\nurl=http://localhost/\ngpg-verify=false\ntrust=t\n\
+                 sign-verify-summary=ed25519\nverification-ed25519-key={OTHER_PUBLIC_B64}\n\
+                 [ex-ostrya trust \"t\"]\nsign-verify=ed25519\n\
+                 verification-ed25519-key={PUBLIC_B64}\n"
+            ));
+            std::fs::write(&config, text).unwrap();
+            let repo = Repo::open(&root).await.unwrap();
+            let trust = PullTrust::from_remote(&repo, "origin", &PullVerify::default())
+                .await
+                .unwrap();
+            let (commit, summary) = trust.into_policies();
+            (
+                commit.check("commit", PAYLOAD, Some(&group_key)).await,
+                commit.check("commit", PAYLOAD, Some(&remote_key)).await,
+                summary.check("summary", PAYLOAD, Some(&remote_key)).await,
+                summary.check("summary", PAYLOAD, Some(&group_key)).await,
+            )
+        });
+        std::fs::remove_dir_all(&dir).unwrap();
+        let (commit_a, commit_b, summary_b, summary_a) = outcome;
+        commit_a.expect("the commit policy trusts the key of the group");
+        let err = commit_b.expect_err("the commit policy does not trust the remote key");
+        assert!(err.to_string().contains("is from a trusted key"), "{err}");
+        summary_b.expect("the summary policy trusts the key of the remote");
+        let err = summary_a.expect_err("the summary policy does not trust the group key");
+        assert!(err.to_string().contains("is from a trusted key"), "{err}");
     }
 
     /// `read_verification_file` refuses a key file over the ceiling by its own

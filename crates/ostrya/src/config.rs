@@ -731,9 +731,9 @@ pub(crate) fn remote_keyring_name(remote: &str) -> String {
 
 /// A typed accessor for one `[remote "<name>"]` section.
 ///
-/// A trust group of a receive policy takes the key names of a remote section.
-/// Under the `receive` feature, `ReceivePolicies::from_config` reads a trust
-/// group through this type.
+/// A trust group, `[ex-ostrya trust "NAME"]`, takes the key names of a remote
+/// section. A pull from a remote with the key [`trust`](Remote::trust) and the
+/// receive side read a trust group through this type.
 #[derive(Debug, Clone)]
 pub struct Remote<'a> {
     keyfile: &'a KeyFile,
@@ -753,7 +753,6 @@ impl<'a> Remote<'a> {
     /// Returns the accessors of a remote section over another group of
     /// `keyfile`. The group takes the key names and the value forms of a
     /// remote section.
-    #[cfg_attr(not(feature = "receive"), allow(dead_code))]
     pub(crate) fn view(keyfile: &'a KeyFile, group: String) -> Remote<'a> {
         Remote { keyfile, group }
     }
@@ -797,10 +796,13 @@ impl Remote<'_> {
     ///
     /// [`Error::Core`] if the value is not a boolean.
     pub fn gpg_verify(&self) -> Result<bool> {
-        Ok(self
-            .keyfile
-            .get_bool(&self.group, "gpg-verify")?
-            .unwrap_or(true))
+        Ok(self.gpg_verify_key()?.unwrap_or(true))
+    }
+
+    /// Returns the value of the `gpg-verify` key, or `None` if the key is
+    /// absent.
+    pub(crate) fn gpg_verify_key(&self) -> Result<Option<bool>> {
+        Ok(self.keyfile.get_bool(&self.group, "gpg-verify")?)
     }
 
     /// Returns `true` if a pull verifies the GPG signature of the summary.
@@ -889,6 +891,23 @@ impl Remote<'_> {
     /// [`Error::Core`] if the value holds a malformed escape sequence.
     pub fn verification_file(&self, engine: &str) -> Result<Option<String>> {
         self.string(&format!("verification-{engine}-file"))
+    }
+
+    /// Returns the `trust` key: the name of the trust group
+    /// `[ex-ostrya trust "NAME"]` whose keys check the commits of each pull
+    /// from this remote.
+    ///
+    /// With the key, the group sets the commit checks of the pull, and the
+    /// summary keys of this section set the summary check.
+    /// [`PullTrust::from_remote`](crate::verify::PullTrust::from_remote)
+    /// states the rules and the refusals. The key is an ostrya extension. The
+    /// `ostree` command keeps it and ignores it.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Core`] if the value holds a malformed escape sequence.
+    pub fn trust(&self) -> Result<Option<String>> {
+        self.string("trust")
     }
 
     /// Returns the `collection-id` of this remote, if it is set.
@@ -1134,6 +1153,11 @@ impl Remote<'_> {
     /// Returns the raw value of any key in this remote section.
     pub fn get(&self, key: &str) -> Option<&str> {
         self.keyfile.get_value(&self.group, key)
+    }
+
+    /// Returns the names of the keys of this section, in file order.
+    pub(crate) fn keys(&self) -> impl Iterator<Item = &str> {
+        self.keyfile.keys(&self.group)
     }
 
     fn string(&self, key: &str) -> Result<Option<String>> {

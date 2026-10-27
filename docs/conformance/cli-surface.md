@@ -3159,6 +3159,10 @@ with `error: Unknown option --gpg-verify` (or the option as written, value
 included) at exit 1. The port's fetcher serves `http` and `https` alone, so a
 `file://` remote, which the tool pulls from, reports `error: unsupported: fetch
 url scheme file: only http and https are fetched` at exit 1 and writes nothing.
+The port reads the remote key `trust=NAME`, and the trust group
+`[ex-ostrya trust "NAME"]` then checks the commits of the pull
+(`ostrya-config(1)`, "REMOTE KEYS"). The tool keeps the key and ignores it
+(`cli-behavior.md`, "Signature verification during a pull").
 
 `pull` and `pull-local` also take the composefs image of each commit that
 carries `ostree.composefs.digest.v0`, unless the pull is commit-only or has a
@@ -3589,12 +3593,13 @@ surface", "Static deltas over pull-local"). `--disable-static-deltas` changes
 nothing, since `pull-local` reads no delta by default. Eight differences stand:
 
 - the verification keys of the remote. The port reads `gpg-verify`,
-  `gpg-verify-summary`, `sign-verify`, and `sign-verify-summary` of the
-  `[remote "NAME"]` group that `--remote` names, as `pull` does. A name with
-  no group gives no check. The tool reads none of these keys, and makes only
-  the checks that its switches ask for. So over an unsigned commit, a group
-  with `sign-verify=ed25519` and a trusted key, or a group that leaves
-  `gpg-verify` at its default, makes the port refuse the commit that the tool
+  `gpg-verify-summary`, `sign-verify`, `sign-verify-summary`, and `trust` of
+  the `[remote "NAME"]` group that `--remote` names, as `pull` does. A name
+  with no group gives no check. The tool reads none of these keys, and makes
+  only the checks that its switches ask for. So over an unsigned commit, a
+  group with `sign-verify=ed25519` and a trusted key, a group that leaves
+  `gpg-verify` at its default, or a group with `trust=NAME` and a trust group
+  that checks the commits, makes the port refuse the commit that the tool
   imports. The port writes no object and no ref;
 - a value given to a GPG switch. The tool reads and discards the value, so
   `--gpg-verify=false` turns the check on. The port's `pull-local` takes both
@@ -4757,8 +4762,10 @@ allow-cleartext-credentials`.
   on a full device, gives `error: i/o error: ...` and exit status 1. With
   a remote name, the command verifies the signature of the summary with
   the summary keys of the remote, `gpg-verify-summary` and
-  `sign-verify-summary`. With an address, it verifies no signature, and no
-  option changes this.
+  `sign-verify-summary`. A remote with `trust=NAME` keeps this check. The
+  command checks the trust group and the keys beside `trust` as a pull does,
+  and reads no key of the group. With an address, it verifies no signature,
+  and no option changes this.
 - `remote fsck --delete` takes the writer lock, writes the marker
   `state/<checksum>.commitpartial` of each commit that reaches a missing or
   a bad object of a tree, deletes the marker of each commit whose tree is

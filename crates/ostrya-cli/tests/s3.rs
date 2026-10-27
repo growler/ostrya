@@ -1700,6 +1700,58 @@ fn remote_fsck_of_a_remote_takes_its_address_and_its_summary_keys() {
     assert!(message.starts_with("error: "), "{message}");
 }
 
+/// `remote fsck` of a remote with `trust=NAME` keeps the summary check of the
+/// remote: the trust group sets the commit keys of a pull alone, and the
+/// command checks no commit signature. The summary has a signature of
+/// [`PUBLIC_B64`].
+///
+/// - The remote trusts [`PUBLIC_B64`] for the summary, and its group trusts
+///   another key: the command accepts the bucket repository.
+/// - The remote trusts another key for the summary, and its group trusts
+///   [`PUBLIC_B64`]: the command refuses the `summary.sig` with the output
+///   of the same remote with no `trust` key.
+#[test]
+fn remote_fsck_of_a_remote_with_a_trust_group_keeps_its_summary_check() {
+    let scratch = Scratch::new("fsck-remote-trust");
+    let server = StandIn::start();
+    let (repo, _) = fsck_fixture(&scratch, &server, &[&format!("--sign={SECRET_B64}")]);
+    let remote = |name: &str, summary_key: &str, trust: &str| {
+        format!(
+            "\n[remote \"{name}\"]\npush-url={ADDRESS}\ns3-endpoint={}\n{trust}\
+             sign-verify-summary=ed25519\nverification-ed25519-key={summary_key}\n",
+            server.endpoint()
+        )
+    };
+    scratch.append_config(
+        &repo,
+        &format!(
+            "{}{}{}\n[ex-ostrya trust \"other\"]\nsign-verify=ed25519\n\
+             verification-ed25519-key={OTHER_PUBLIC_B64}\n\
+             \n[ex-ostrya trust \"signer\"]\nsign-verify=ed25519\n\
+             verification-ed25519-key={PUBLIC_B64}\n",
+            remote("good", PUBLIC_B64, "trust=other\n"),
+            remote("wrong", OTHER_PUBLIC_B64, "trust=signer\n"),
+            remote("plain", OTHER_PUBLIC_B64, ""),
+        ),
+    );
+    let out = scratch.ok(&[&repo, "remote", "fsck", "-q", "good", CLEARTEXT]);
+    assert_eq!(
+        out,
+        format!("fsck of the bucket repository {ADDRESS}: no errors found\n")
+    );
+    let wrong = scratch.run(&[&repo, "remote", "fsck", "-q", "wrong", CLEARTEXT]);
+    let plain = scratch.run(&[&repo, "remote", "fsck", "-q", "plain", CLEARTEXT]);
+    assert_eq!(wrong.status.code(), Some(1));
+    assert!(
+        stderr(&wrong).starts_with("summary summary.sig: "),
+        "{}",
+        stderr(&wrong)
+    );
+    assert_eq!(wrong.status.code(), plain.status.code());
+    assert_eq!(stderr(&wrong), stderr(&plain));
+    assert_eq!(wrong.stdout, plain.stdout);
+}
+
 // ---------------------------------------------------------------------------
 // remote prune
 // ---------------------------------------------------------------------------

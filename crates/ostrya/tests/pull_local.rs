@@ -21,7 +21,7 @@ use ostrya::{
     AdvertisedDelta, Checksum, CollectionRef, CommitModifier, CommitModifierFlags, CommitOptions,
     CommitState, CreateOptions, DeltaOptions, DeltaSuperblock, DetachedMetadataFilter,
     DetachedMetadataFilterFn, Ed25519Signer, Error, FilterResult, FsckOptions, MutableTree,
-    ObjectName, ObjectType, PullFlags, PullOptions, PullStats, PullVerify, Repo, RepoMode,
+    ObjectName, ObjectType, PullFlags, PullOptions, PullStats, PullVerify, Repo, RepoMode, Signer,
     SummaryOptions, TimestampCheck, Type, Value,
 };
 use ostrya_rt::{block_on, spawn};
@@ -3322,6 +3322,412 @@ fn a_check_without_a_remote_name_is_refused() {
             "{err}"
         );
         assert!(dst.list_refs(None).await.unwrap().is_empty());
+    });
+}
+
+// --- trust groups ----------------------------------------------------------
+
+/// The secret key of [`OTHER_PUBLIC_B64`].
+const OTHER_SECRET_B64: &str =
+    "5ILWxT+l9G/u3h0BptRpmSi35C9uog7YDdD+Fp1Xk+Hz52p0NlYh6xBA73kJEJKhKbbnjcE0rsWA5XA/K5Sq5Q==";
+/// Returns the keys of a trust group that trusts the ed25519 key
+/// [`PUBLIC_B64`].
+fn ed25519_group() -> String {
+    format!("sign-verify=ed25519\nverification-ed25519-key={PUBLIC_B64}\n")
+}
+
+/// Creates a destination as [`dest_with_remote`] does. The remote section
+/// holds `trust=t` and the keys of `extra`. The trust group
+/// `[ex-ostrya trust "t"]` holds the keys of `group`.
+async fn dest_with_trust(base: &Path, extra: &str, group: &str) -> Repo {
+    dest_with_remote(
+        base,
+        &format!("trust=t\n{extra}[ex-ostrya trust \"t\"]\n{group}"),
+    )
+    .await
+}
+
+/// Removes the destination under `base/dst`.
+fn remove_dst(dst: Repo, base: &Path) {
+    drop(dst);
+    std::fs::remove_dir_all(base.join("dst")).unwrap();
+}
+
+/// Pulls `main` of a source under `base` into a destination whose remote
+/// names the trust group `group`, with no other verification key. `own` is a
+/// key that the group trusts, and `other` is a key that it does not trust.
+///
+/// An unsigned commit and a commit of `other` are refused, and the pull
+/// imports nothing. A commit of `own` is pulled.
+async fn assert_the_group_checks_the_commits(
+    base: &Path,
+    group: &str,
+    own: &dyn Signer,
+    other: &dyn Signer,
+) {
+    let (_src_path, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
+    let pull = || origin_pull(PullVerify::default());
+
+    let dst = dest_with_trust(base, "", group).await;
+    let err = pull_main_with(&dst, &src, pull()).await.unwrap_err();
+    assert!(
+        matches!(&err, Error::Signature(m)
+            if m.contains("sign-api verification is enabled, but it carries no signature")),
+        "{err}"
+    );
+    assert_nothing_pulled(&dst, &c2).await;
+
+    src.sign_commit(&c2, other).await.unwrap();
+    let err = pull_main_with(&dst, &src, pull()).await.unwrap_err();
+    assert!(
+        matches!(&err, Error::Signature(m) if m.contains("no sign-api signature is from a trusted key")),
+        "{err}"
+    );
+    assert_nothing_pulled(&dst, &c2).await;
+
+    src.write_commit_detached_metadata(&c2, None).await.unwrap();
+    src.sign_commit(&c2, own).await.unwrap();
+    pull_main_with(&dst, &src, pull()).await.unwrap();
+    assert_eq!(
+        dst.resolve_rev("origin:main", true).await.unwrap(),
+        Some(c2)
+    );
+}
+
+/// A remote with `trust=t` takes the keys of the commits from the trust group
+/// `[ex-ostrya trust "t"]`, with an ed25519 group and with an spki group. The
+/// pull refuses an unsigned commit and a commit of another key, and pulls a
+/// commit of the key of the group. The remote leaves `gpg-verify` out, and
+/// the pull makes no GPG check.
+#[test]
+fn a_trust_group_checks_the_commits_of_a_local_pull() {
+    let tmp = TmpDir::new("pull-local-trust-commits");
+    let base = tmp.path();
+    block_on(async {
+        let own = Ed25519Signer::from_base64(SECRET_B64).unwrap();
+        let other = Ed25519Signer::from_base64(OTHER_SECRET_B64).unwrap();
+        assert_the_group_checks_the_commits(base, &ed25519_group(), &own, &other).await;
+    });
+    #[cfg(feature = "sign-spki-p256")]
+    {
+        use ostrya::SpkiSigner;
+        let base = base.join("spki");
+        std::fs::create_dir(&base).unwrap();
+        block_on(async {
+            let own = SpkiSigner::from_base64(SPKI_SECRET_B64).unwrap();
+            let other = SpkiSigner::from_base64(SPKI_OTHER_SECRET_B64).unwrap();
+            let group = format!(
+                "sign-verify=spki\nverification-spki-key={}\n",
+                ostrya::base64::encode(&own.public_key_der())
+            );
+            assert_the_group_checks_the_commits(&base, &group, &own, &other).await;
+        });
+    }
+}
+
+/// A P-256 secret key, base64 of the PKCS#8 DER.
+#[cfg(feature = "sign-spki-p256")]
+const SPKI_SECRET_B64: &str = concat!(
+    "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg2L708EsnnzHER0SYasMNIUcG",
+    "v63QapC/3kVsoPerzKGhRANCAATxfzfHKUPeJtyLTGMUoxHhvBS1NT9guWhUQPGiZRLZIcB8Wc3",
+    "csdVU1iOiTRmbZGKJTtekOdEAbVRrx5HxIpst",
+);
+/// A second P-256 secret key, base64 of the PKCS#8 DER.
+#[cfg(feature = "sign-spki-p256")]
+const SPKI_OTHER_SECRET_B64: &str = concat!(
+    "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgU5tYPz/hTTxfsSTPOxD/H9U+",
+    "IkBj5qWV4/H3D1NBfRChRANCAAQPyTr9rh2d6WiYOi3oxNiE3ppTP2g5JP2xX9D7rEKnzixp",
+    "MqVuqA9XnzQr5GlCYd71m/D7BnYIqS4MytNawYrR",
+);
+
+/// A `trust` value that names no trust group, the empty value, and a value
+/// with a `"` are refused before the pull reads the source.
+#[test]
+fn a_trust_value_that_names_no_group_is_refused() {
+    let tmp = TmpDir::new("pull-local-trust-value");
+    let base = tmp.path();
+    block_on(async {
+        let (src_path, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
+        // The source has no ref directory, so a pull that read the source
+        // before the refusal would fail on the ref.
+        std::fs::rename(src_path.join("refs"), base.join("refs-aside")).unwrap();
+        for (value, reason) in [
+            (
+                "nope",
+                "[remote \"origin\"] trust=nope names no [ex-ostrya trust \"nope\"] group"
+                    .to_owned(),
+            ),
+            (
+                "",
+                "malformed [remote \"origin\"] trust value '': the value names a trust \
+                 group, is not empty, and holds no '\"' and no control character"
+                    .to_owned(),
+            ),
+            (
+                "a\"b",
+                "malformed [remote \"origin\"] trust value 'a\"b': the value names a trust \
+                 group, is not empty, and holds no '\"' and no control character"
+                    .to_owned(),
+            ),
+        ] {
+            let dst = dest_with_remote(
+                base,
+                &format!(
+                    "trust={value}\n[ex-ostrya trust \"t\"]\n{}",
+                    ed25519_group()
+                ),
+            )
+            .await;
+            let err = pull_main_with(&dst, &src, origin_pull(PullVerify::default()))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, Error::InvalidFormat(m) if *m == reason),
+                "{value:?}: {err}"
+            );
+            assert_nothing_pulled(&dst, &c2).await;
+            remove_dst(dst, base);
+        }
+    });
+}
+
+/// With a trust group, `Some(true)` in `gpg` or `sign` is refused before the
+/// pull reads the source. `Some(false)` in `sign` turns the sign-api axis of
+/// the group off, so the pull takes an unsigned commit.
+#[test]
+fn a_trust_group_takes_no_switch_that_turns_on_a_commit_check() {
+    let tmp = TmpDir::new("pull-local-trust-switches");
+    let base = tmp.path();
+    block_on(async {
+        let (_src_path, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
+        let dst = dest_with_trust(base, "", &ed25519_group()).await;
+        let gpg = PullVerify {
+            gpg: Some(true),
+            ..PullVerify::default()
+        };
+        let sign = PullVerify {
+            sign: Some(true),
+            ..PullVerify::default()
+        };
+        for (verify, check) in [(gpg, "the GPG check"), (sign, "the sign-api check")] {
+            let err = pull_main_with(&dst, &src, origin_pull(verify))
+                .await
+                .unwrap_err();
+            let reason = format!(
+                "remote 'origin' takes its commit keys from [ex-ostrya trust \"t\"], so a \
+                 pull cannot turn on {check} of the commits"
+            );
+            assert!(
+                matches!(&err, Error::InvalidInput(m) if *m == reason),
+                "{err}"
+            );
+            assert_nothing_pulled(&dst, &c2).await;
+        }
+
+        let off = PullVerify {
+            sign: Some(false),
+            ..PullVerify::default()
+        };
+        pull_main_with(&dst, &src, origin_pull(off)).await.unwrap();
+        assert_eq!(
+            dst.resolve_rev("origin:main", true).await.unwrap(),
+            Some(c2)
+        );
+    });
+}
+
+/// Beside `trust=t`, the remote section must not turn on a commit check, and
+/// must hold no key source that no summary check reads. The pull refuses
+/// each such key before it reads the source. `gpg-verify=false`,
+/// `sign-verify=false`, and an empty `sign-verify` turn no check on, and the
+/// pull takes a commit of the key of the group.
+#[test]
+fn a_trust_group_refuses_the_commit_keys_of_the_remote() {
+    let tmp = TmpDir::new("pull-local-trust-remote-keys");
+    let base = tmp.path();
+    block_on(async {
+        let (_src_path, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
+        let head = "[remote \"origin\"] sets trust=t and";
+        let commit_check = "the trust group sets the commit checks";
+        for (extra, reason) in [
+            (
+                "gpg-verify=true\n".to_owned(),
+                format!(
+                    "{head} gpg-verify=true: {commit_check}, so set gpg-verify=false or remove the key"
+                ),
+            ),
+            (
+                "sign-verify=true\n".to_owned(),
+                format!("{head} sign-verify=true: {commit_check}, so remove sign-verify"),
+            ),
+            (
+                "sign-verify=ed25519\n".to_owned(),
+                format!("{head} sign-verify=ed25519: {commit_check}, so remove sign-verify"),
+            ),
+            (
+                "gpgkeypath=/nonexistent.gpg\n".to_owned(),
+                format!(
+                    "{head} gpgkeypath, and gpg-verify-summary is not true, so no check \
+                     reads it"
+                ),
+            ),
+            (
+                format!("verification-ed25519-key={OTHER_PUBLIC_B64}\n"),
+                format!(
+                    "{head} holds 'verification-ed25519-key', and sign-verify-summary does \
+                     not select ed25519, so no check reads it"
+                ),
+            ),
+            (
+                "sign-verify-summary=spki\nverification-ed25519-file=/nonexistent.keys\n"
+                    .to_owned(),
+                format!(
+                    "{head} holds 'verification-ed25519-file', and sign-verify-summary does \
+                     not select ed25519, so no check reads it"
+                ),
+            ),
+        ] {
+            let dst = dest_with_trust(base, &extra, &ed25519_group()).await;
+            let err = pull_main_with(&dst, &src, origin_pull(PullVerify::default()))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, Error::InvalidFormat(m) if *m == reason),
+                "{extra:?}: {err}"
+            );
+            assert_nothing_pulled(&dst, &c2).await;
+            remove_dst(dst, base);
+        }
+
+        src.sign_commit(&c2, &Ed25519Signer::from_base64(SECRET_B64).unwrap())
+            .await
+            .unwrap();
+        for extra in [
+            "gpg-verify=false\n",
+            "sign-verify=false\n",
+            "sign-verify=\n",
+        ] {
+            let dst = dest_with_trust(base, extra, &ed25519_group()).await;
+            pull_main_with(&dst, &src, origin_pull(PullVerify::default()))
+                .await
+                .unwrap();
+            assert_eq!(
+                dst.resolve_rev("origin:main", true).await.unwrap(),
+                Some(c2),
+                "{extra:?}"
+            );
+            remove_dst(dst, base);
+        }
+    });
+}
+
+/// Beside `trust=t`, the summary keys of the remote set the summary check.
+/// The group trusts key A, and the remote trusts key B for the summary. A
+/// summary of B is accepted, and a summary of A is refused, so the summary
+/// check does not take the key of the group.
+///
+/// The rule on the key sources of the remote reads the config, so
+/// `sign_summary: Some(false)` over `sign-verify-summary=true` and its key is
+/// accepted, and the pull checks no summary.
+#[test]
+fn a_trust_group_keeps_the_summary_check_of_the_remote() {
+    let tmp = TmpDir::new("pull-local-trust-summary");
+    let base = tmp.path();
+    block_on(async {
+        let (_src_path, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
+        let own = Ed25519Signer::from_base64(SECRET_B64).unwrap();
+        let other = Ed25519Signer::from_base64(OTHER_SECRET_B64).unwrap();
+        src.sign_commit(&c2, &own).await.unwrap();
+        let summarize = || async {
+            src.regenerate_summary(&SummaryOptions {
+                last_modified: Some(FIXED_TS),
+                ..SummaryOptions::default()
+            })
+            .await
+            .unwrap();
+        };
+        summarize().await;
+        src.sign_summary(&other).await.unwrap();
+
+        let summary_keys =
+            format!("sign-verify-summary=ed25519\nverification-ed25519-key={OTHER_PUBLIC_B64}\n");
+        let dst = dest_with_trust(base, &summary_keys, &ed25519_group()).await;
+        pull_main_with(&dst, &src, origin_pull(PullVerify::default()))
+            .await
+            .unwrap();
+        assert_eq!(
+            dst.resolve_rev("origin:main", true).await.unwrap(),
+            Some(c2)
+        );
+        remove_dst(dst, base);
+
+        summarize().await;
+        src.sign_summary(&own).await.unwrap();
+        let dst = dest_with_trust(base, &summary_keys, &ed25519_group()).await;
+        let err = pull_main_with(&dst, &src, origin_pull(PullVerify::default()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m) if m.contains("no sign-api signature is from a trusted key")),
+            "{err}"
+        );
+        assert_nothing_pulled(&dst, &c2).await;
+        remove_dst(dst, base);
+
+        // An unsigned summary: the check that the config turns on refuses it,
+        // and the override turns the check off.
+        summarize().await;
+        let dst = dest_with_trust(
+            base,
+            &format!("sign-verify-summary=true\nverification-ed25519-key={OTHER_PUBLIC_B64}\n"),
+            &ed25519_group(),
+        )
+        .await;
+        let err = pull_main_with(&dst, &src, origin_pull(PullVerify::default()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m) if m.contains("no summary.sig")),
+            "{err}"
+        );
+        let off = PullVerify {
+            sign_summary: Some(false),
+            ..PullVerify::default()
+        };
+        pull_main_with(&dst, &src, origin_pull(off)).await.unwrap();
+        assert_eq!(
+            dst.resolve_rev("origin:main", true).await.unwrap(),
+            Some(c2)
+        );
+    });
+}
+
+/// Beside `trust=t`, a summary key of the remote that is not valid is
+/// refused before the pull reads a key source of the group. The group names
+/// a key file that does not exist, so a read of it gives a different error.
+#[test]
+fn a_trust_group_refuses_a_malformed_summary_key_before_it_reads_keys() {
+    let tmp = TmpDir::new("pull-local-trust-summary-key");
+    let base = tmp.path();
+    block_on(async {
+        let (_src_path, src, _c1, c2) = source_repo(base, RepoMode::Archive).await;
+        let dst = dest_with_trust(
+            base,
+            "gpg-verify=false\ngpg-verify-summary=maybe\n",
+            "sign-verify=ed25519\nverification-ed25519-file=/nonexistent/keys\n",
+        )
+        .await;
+        let err = pull_main_with(&dst, &src, origin_pull(PullVerify::default()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Core(_))
+                && err.to_string().contains(
+                    "value 'maybe' for remote \"origin\".gpg-verify-summary is not a boolean"
+                ),
+            "{err}"
+        );
+        assert_nothing_pulled(&dst, &c2).await;
     });
 }
 

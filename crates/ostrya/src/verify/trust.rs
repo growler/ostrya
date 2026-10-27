@@ -1,44 +1,189 @@
-//! The trust groups, `[ex-ostrya trust "NAME"]`: the check of a group and the
-//! build of its trusted keys.
+//! The trust groups, `[ex-ostrya trust "NAME"]`: the check of a group, the
+//! build of its policy, and the trust of a pull from a remote with the key
+//! `trust`.
 //!
 //! `check_trust` checks the keys and the values of a group. It reads no file
-//! and runs no program. `TrustedKeys::for_trust_group` builds the trusted
-//! keys of a group that passed the check.
-#![cfg_attr(not(feature = "receive"), allow(dead_code))]
+//! and runs no program. `trust_group_policy` builds the policy of a group that
+//! passed the check. `pull_trust` resolves the trust of a pull from a remote
+//! whose section names a group in its key `trust`.
 
 use ostrya_core::KeyFile;
 
 use crate::config::{Remote, SignVerify};
 use crate::error::{Error, Result};
+use crate::pull::PullVerify;
 use crate::repo::Repo;
 
-use super::{KeySource, TrustedKeys, Verifiers, build_policy};
+use super::{KeySource, Policy, PullTrust, TrustedKeys, Verifiers, build_policy, summary_switches};
 
 /// The sign-api engines that a trust group can name.
 const TRUST_ENGINES: &[&str] = &["ed25519", "spki"];
 
-impl TrustedKeys {
-    /// Creates the keys of the trust group `name` from the key-file group
-    /// `group`.
-    ///
-    /// The policy reader checks the group first. As a result, the group turns
-    /// on at least one axis, and an axis reads each key that the group holds.
-    pub(crate) async fn for_trust_group(
-        repo: &Repo,
-        keyfile: &KeyFile,
-        name: &str,
-        group: &str,
-    ) -> Result<TrustedKeys> {
-        let section = Remote::view(keyfile, group.to_owned());
-        let gpg = keyfile.get_bool(group, "gpg-verify")?.unwrap_or(false);
-        let sign = section.sign_verify()?;
-        let source = KeySource::Trust {
-            name,
-            section: &section,
-        };
-        let policy = build_policy(repo, &source, &mut Verifiers::default(), gpg, &sign).await?;
-        Ok(TrustedKeys::from_policy(policy))
+/// Builds the policy of the trust group `name` from the key-file group
+/// `group`.
+///
+/// The policy holds the GPG axis of the group if `gpg_on` is `true`, and the
+/// sign-api axis of the group if `sign_on` is `true`. The build reads no key
+/// source of an axis that is off. Each call makes its own verifiers, so a
+/// policy of a group shares no verifier with a policy of a remote.
+///
+/// The caller checks the group with [`check_trust`] first. As a result, the
+/// group turns on at least one axis, and an axis reads each key that the group
+/// holds.
+pub(crate) async fn trust_group_policy(
+    repo: &Repo,
+    keyfile: &KeyFile,
+    name: &str,
+    group: &str,
+    gpg_on: bool,
+    sign_on: bool,
+) -> Result<Policy> {
+    let section = Remote::view(keyfile, group.to_owned());
+    let gpg = gpg_on && keyfile.get_bool(group, "gpg-verify")?.unwrap_or(false);
+    let sign = if sign_on {
+        section.sign_verify()?
+    } else {
+        SignVerify::Off
+    };
+    let source = KeySource::Trust {
+        name,
+        section: &section,
+    };
+    build_policy(repo, &source, &mut Verifiers::default(), gpg, &sign).await
+}
+
+/// Resolves the trust of a pull from `remote`, whose section `section` holds
+/// `trust=NAME`, with `NAME` in `value`.
+///
+/// The trust group sets the commit policy, and the summary keys of the
+/// section set the summary policy. A field `Some(false)` of `verify` turns
+/// off its commit axis of the group. The summary fields of `verify`
+/// override the summary keys of the section.
+///
+/// The checks come in this order, and each one comes before the call reads a
+/// key source:
+///
+/// 1. the value is a valid group name, and the group exists;
+/// 2. [`check_trust`] accepts the group;
+/// 3. `verify` does not turn on a commit check;
+/// 4. the section turns on no commit check, and holds no key source that no
+///    summary check reads;
+/// 5. the summary keys of the section that `verify` does not override
+///    parse.
+pub(crate) async fn pull_trust(
+    repo: &Repo,
+    remote: &str,
+    section: &Remote<'_>,
+    value: &str,
+    verify: &PullVerify,
+) -> Result<PullTrust> {
+    let head = || format!("[remote \"{remote}\"]");
+    if value.is_empty() || value.contains('"') || value.contains(char::is_control) {
+        return Err(Error::InvalidFormat(format!(
+            "malformed {} trust value '{value}': the value names a trust group, is \
+             not empty, and holds no '\"' and no control character",
+            head()
+        )));
     }
+    let keyfile = repo.config().keyfile();
+    let group = format!("ex-ostrya trust \"{value}\"");
+    if !keyfile.has_group(&group) {
+        return Err(Error::InvalidFormat(format!(
+            "{} trust={value} names no [{group}] group",
+            head()
+        )));
+    }
+    check_trust(keyfile, &group)?;
+    for (field, check) in [
+        (verify.gpg, "the GPG check"),
+        (verify.sign, "the sign-api check"),
+    ] {
+        if field == Some(true) {
+            return Err(Error::InvalidInput(format!(
+                "remote '{remote}' takes its commit keys from [{group}], so a pull cannot \
+                 turn on {check} of the commits"
+            )));
+        }
+    }
+    refuse_commit_keys(remote, section, value)?;
+    let (gpg_summary, sign_summary) = summary_switches(Some(section), verify)?;
+
+    let commit = trust_group_policy(
+        repo,
+        keyfile,
+        value,
+        &group,
+        verify.gpg != Some(false),
+        verify.sign != Some(false),
+    )
+    .await?;
+    let source = KeySource::Remote {
+        name: remote,
+        section: Some(section),
+        repo_keyring: true,
+    };
+    let summary = build_policy(
+        repo,
+        &source,
+        &mut Verifiers::default(),
+        gpg_summary,
+        &sign_summary,
+    )
+    .await?;
+    Ok(PullTrust {
+        commit: commit.applies().then(|| TrustedKeys::from_policy(commit)),
+        summary: summary.applies().then(|| TrustedKeys::from_policy(summary)),
+    })
+}
+
+/// Refuses a key of the remote section `section` that a trust group makes
+/// void: a key that turns on a commit check, and a key source that no summary
+/// check reads. `remote` names the section, and `value` is the `trust`
+/// value.
+///
+/// The rule reads the summary keys of the section, and no override of a pull.
+fn refuse_commit_keys(remote: &str, section: &Remote<'_>, value: &str) -> Result<()> {
+    let head = || format!("[remote \"{remote}\"] sets trust={value}");
+    if section.gpg_verify_key()? == Some(true) {
+        return Err(Error::InvalidFormat(format!(
+            "{} and gpg-verify=true: the trust group sets the commit checks, so set \
+             gpg-verify=false or remove the key",
+            head()
+        )));
+    }
+    if section.sign_verify()? != SignVerify::Off {
+        let raw = section.get("sign-verify").unwrap_or_default();
+        return Err(Error::InvalidFormat(format!(
+            "{} and sign-verify={raw}: the trust group sets the commit checks, so \
+             remove sign-verify",
+            head()
+        )));
+    }
+    if section.get("gpgkeypath").is_some() && !section.gpg_verify_summary()? {
+        return Err(Error::InvalidFormat(format!(
+            "{} and gpgkeypath, and gpg-verify-summary is not true, so no check \
+             reads it",
+            head()
+        )));
+    }
+    let summary = section.sign_verify_summary()?;
+    let engines: Vec<&str> = match &summary {
+        SignVerify::Off => Vec::new(),
+        SignVerify::All => TRUST_ENGINES.to_vec(),
+        SignVerify::Engines(names) => names.iter().map(String::as_str).collect(),
+    };
+    for key in section.keys() {
+        if let Some(engine) = verification_engine(key)
+            && !engines.contains(&engine)
+        {
+            return Err(Error::InvalidFormat(format!(
+                "{} and holds '{key}', and sign-verify-summary does not select \
+                 {engine}, so no check reads it",
+                head()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Checks the trust group `group`.
@@ -52,7 +197,7 @@ pub(crate) fn check_trust(keyfile: &KeyFile, group: &str) -> Result<()> {
             "gpg-verify" | "gpgkeypath" | "sign-verify" => {}
             "gpg-verify-summary" | "sign-verify-summary" => {
                 return Err(Error::InvalidFormat(format!(
-                    "[{group}] holds '{key}', and a push carries no summary"
+                    "[{group}] holds '{key}', and a trust group sets a commit policy alone"
                 )));
             }
             _ => match verification_engine(key) {
@@ -228,9 +373,9 @@ pub(crate) mod tests {
             "[{group}]\nsign-verify=ed25519\nverification-ed25519-key={PUBLIC_B64}\n"
         ))
         .unwrap();
-        let policy = ostrya_rt::block_on(TrustedKeys::for_trust_group(&repo, &keyfile, "t", group))
-            .unwrap()
-            .into_policy();
+        let policy =
+            ostrya_rt::block_on(trust_group_policy(&repo, &keyfile, "t", group, true, true))
+                .unwrap();
         let own = ed25519_signed(SECRET_B64);
         let other = ed25519_signed(OTHER_SECRET_B64);
         let (valid, unsigned, untrusted) = ostrya_rt::block_on(async {
@@ -262,7 +407,7 @@ pub(crate) mod tests {
         let group = "ex-ostrya trust \"t\"";
         let keyfile = KeyFile::parse(&format!("[{group}]\nsign-verify=ed25519\n")).unwrap();
         let Err(err) =
-            ostrya_rt::block_on(TrustedKeys::for_trust_group(&repo, &keyfile, "t", group))
+            ostrya_rt::block_on(trust_group_policy(&repo, &keyfile, "t", group, true, true))
         else {
             panic!("an engine with no key is refused");
         };
@@ -270,6 +415,49 @@ pub(crate) mod tests {
             matches!(&err, Error::Signature(m) if m.contains("no trusted key for signature engine 'ed25519'")),
             "{err}"
         );
+    }
+
+    /// The build of a trust group builds only the axes that stay on, and
+    /// reads no key source of an axis that is off. With both axes off, the
+    /// policy holds no axis.
+    #[test]
+    fn a_trust_group_builds_the_axes_that_stay_on() {
+        let scratch = Scratch::new("axes");
+        let repo = scratch.repo();
+        let group = "ex-ostrya trust \"t\"";
+        // The keyring path does not exist, so a build of the GPG axis fails.
+        let keyfile = KeyFile::parse(&format!(
+            "[{group}]\ngpg-verify=true\ngpgkeypath={}\n\
+             sign-verify=ed25519\nverification-ed25519-key={PUBLIC_B64}\n",
+            scratch.dir.join("absent.gpg").display()
+        ))
+        .unwrap();
+        let build = |gpg_on: bool, sign_on: bool| {
+            ostrya_rt::block_on(trust_group_policy(
+                &repo, &keyfile, "t", group, gpg_on, sign_on,
+            ))
+        };
+
+        let sign = build(false, true).expect("the GPG axis is off, so no keyring is read");
+        assert!(!sign.gpg_axis());
+        assert_eq!(sign.sign_axis().map(<[_]>::len), Some(1));
+        let own = ed25519_signed(SECRET_B64);
+        ostrya_rt::block_on(sign.check_unblocked("commit", PAYLOAD, Some(&own)))
+            .expect("the sign-api axis reads the key of the group");
+
+        let none = build(false, false).unwrap();
+        assert!(!none.applies());
+
+        let Err(err) = build(true, false) else {
+            panic!("the GPG axis reads the keyring that the group names");
+        };
+        #[cfg(feature = "verify-gpg")]
+        assert!(
+            matches!(&err, Error::Signature(m) if m.contains("absent.gpg")),
+            "{err}"
+        );
+        #[cfg(not(feature = "verify-gpg"))]
+        assert!(matches!(&err, Error::Unsupported(_)), "{err}");
     }
 
     /// Returns `true` if `gpg` answers.
@@ -364,10 +552,9 @@ pub(crate) mod tests {
             ))
             .unwrap();
             ostrya_rt::block_on(async {
-                TrustedKeys::for_trust_group(&repo, &keyfile, "t", group)
+                trust_group_policy(&repo, &keyfile, "t", group, true, true)
                     .await
                     .unwrap()
-                    .into_policy()
                     .check_unblocked("commit", PAYLOAD, Some(&signed))
                     .await
             })

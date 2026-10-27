@@ -389,6 +389,15 @@ pub enum TimestampCheck {
 /// remote and asks for a verification, it fails with [`Error::Pull`] before
 /// it fetches anything.
 ///
+/// A remote with the key `trust=NAME` takes its commit policy from the trust
+/// group `[ex-ostrya trust "NAME"]`, and each pull reads the key. With a trust
+/// group, the pull refuses `Some(true)` in [`gpg`](PullVerify::gpg) and in
+/// [`sign`](PullVerify::sign) with [`Error::InvalidInput`]. `Some(false)` in
+/// one of the two fields turns that commit axis of the group off. The two
+/// summary fields override the summary keys of the remote, as they do without
+/// a trust group. [`PullTrust::from_remote`](crate::verify::PullTrust::from_remote)
+/// states the rules of the remote keys beside `trust`.
+///
 /// # Keys
 ///
 /// - GPG: the trusted set of the remote. The set holds the
@@ -399,6 +408,13 @@ pub enum TimestampCheck {
 ///   names. The keys of an engine are its `verification-<engine>-key` and
 ///   `verification-<engine>-file` entries and the system key store, less the
 ///   revoked set of the store.
+/// - A trust group: the commit keys are the keys that the group names, and
+///   nothing else. The repository keyring `<repo>/<remote>.trustedkeys.gpg`,
+///   the system keyrings, the global trusted directory, and the system key
+///   store do not verify a commit of a remote with `trust`. So the keys that
+///   a GPG import for the remote writes to the repository keyring do not
+///   apply to its commits. The GPG check of the summary still reads these
+///   sources.
 ///
 /// The GPG axis and the sign-api axis are independent. If a policy asks for
 /// both, the pull verifies both. In the sign-api axis, one engine that
@@ -1698,6 +1714,15 @@ impl Repo {
     ///   or if a name holds `:`, before the pull reads `src`.
     /// - [`Error::Pull`] if the options ask for a signature verification and
     ///   name no [`remote`](PullOptions::remote).
+    /// - [`Error::InvalidFormat`] if the remote section holds a `trust` value
+    ///   that is malformed or names no trust group, if the group fails the
+    ///   check of a trust group, or if the section turns on a commit check or
+    ///   holds a key source that no summary check reads beside `trust`
+    ///   ([`PullTrust::from_remote`](crate::verify::PullTrust::from_remote)).
+    ///   The pull makes these checks before it reads `src`.
+    /// - [`Error::InvalidInput`] if the remote section holds `trust` and
+    ///   [`verify`](PullOptions::verify) sets `gpg` or `sign` to `Some(true)`,
+    ///   before the pull reads `src`.
     /// - [`Error::Unsupported`] if the policy asks for GPG verification and
     ///   the build has no `verify-gpg` feature, or if `sign-verify` or
     ///   `sign-verify-summary` names an engine that this build does not

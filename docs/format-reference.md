@@ -2788,10 +2788,11 @@ version. The pull over HTTP sends no version message.
 ## Configuration keys of the port
 
 The `[ex-ostrya]` group, the server group, the client groups, the trust
-groups, the key groups, and seven keys of a `[remote "NAME"]` group are
-extensions of the port. The seven keys are `push-url`, `ssh-command`,
-`receive-command`, `push-token-file`, `push-user`, `pull-url`, and
-`send-command`. The `ostree` tool defines none of them and reads none.
+groups, the key groups, and eight keys of a `[remote "NAME"]` group are
+extensions of the port. The eight keys are `push-url`, `ssh-command`,
+`receive-command`, `push-token-file`, `push-user`, `pull-url`,
+`send-command`, and `trust`. The `ostree` tool defines none of them and reads
+none.
 `ostrya-config(1)` states each key, its type, its default, its precedence,
 each refusal, and the operations that read it. "EXTENSION KEYS" and "CLIENT
 AND SERVER GROUPS" state the groups, and "REMOTE KEYS" states the keys of a
@@ -2801,7 +2802,8 @@ remote. "The push token file of a client" states the grammar of the file that
 The receive path of a server reads the client groups, the server group, the
 trust groups, and the key groups from `<repo>/config`. It also reads
 `[ex-ostrya] detached-metadata-exclude` and `[core] auto-update-summary` from
-`<repo>/config`.
+`<repo>/config`. A pull from a remote with the key `trust` reads the one trust
+group that the key names.
 
 The tool gives a quote no meaning in a group name, so the port splits the name
 of a group itself. The server group has the exact name `ex-ostrya server`. The
@@ -2862,6 +2864,12 @@ In each observation, the remote also has an HTTP `url`:
 - With the pull keys, no system call of `remote list -u`, `remote show-url`,
   or `pull` names the ssh address or the `send-command` value. The pull runs
   no other program.
+
+Observed behavior: the tool keeps the remote key `trust` and ignores it. A
+`pull` from a `file://` URL and a `pull-local --remote=NAME` import an
+unsigned commit with `trust=grp`, with and without the group
+`[ex-ostrya trust "grp"]`, and with `trust=` (`conformance/cli-behavior.md`,
+"Signature verification during a pull").
 
 `conformance/cli-surface.md`, "P2", `pull`, records how the tool and the port
 treat a remote with `pull-url` and no `url`, and an ssh address in `url`.

@@ -184,6 +184,7 @@ A candidate whose \fB\%pull\-url\fR is an \fB\%s3://\fR address serves the refs 
 These keys apply to \fB\%ostrya pull NAME\fR and to \fB\%ostrya pull\-local \-\-remote=NAME\fR.
 \fB\%ostrya remote fsck NAME\fR reads \fB\%gpg\-verify\-summary\fR, \fB\%sign\-verify\-summary\fR, and the trusted keys of these two checks.
 A switch of the command that turns a check on or off wins over its key.
+For a remote with the key \fB\%trust\fR, the switches of the checks of the commits follow the rule of that key.
 When the config has no group for \fB\%NAME\fR, \fB\%ostrya pull\-local\fR makes only the checks that its switches ask for.
 \fB\%ostree pull\-local\fR reads none of these keys.
 .TP
@@ -225,6 +226,22 @@ An \fB\%spki\fR file holds PEM \fB\%PUBLIC KEY\fR blocks, and ostrya ignores the
 ostrya refuses an \fB\%spki\fR file with a block of another label, a block that does not decode, or no block.
 An empty file, or a file of white space only, adds no keys.
 In an \fB\%spki\fR file, white space is space, horizontal tab, line feed, form feed, and carriage return.
+.TP
+\fB\%trust\fR (string)
+The name of a trust group \fB\%[ex\-ostrya trust "NAME"]\fR.
+The keys of the group check each commit of a pull from the remote: \fB\%ostrya pull\fR over each transport, \fB\%ostrya pull \-\-collection\fR, and \fB\%ostrya pull\-local \-\-remote=NAME\fR.
+The group alone supplies the keys of the commits: no system key store, no \fB\%<repo>/NAME.trustedkeys.gpg\fR, no \fB\%/etc/ostree/remotes.d/NAME.trustedkeys.gpg\fR, and no global trusted keyring.
+\fB\%gpg\-verify\-summary\fR, \fB\%sign\-verify\-summary\fR, and the keys that they read still set the check of the summary, and that check still reads these key sources.
+A pull refuses a value that is empty, holds \fB\%"\fR or a control character, or names no group.
+Beside this key, a pull refuses \fB\%gpg\-verify=true\fR and a \fB\%sign\-verify\fR value other than false, because the group sets the checks of the commits.
+\fB\%gpg\-verify=false\fR and an absent \fB\%gpg\-verify\fR give no GPG check of the commits.
+A pull also refuses \fB\%gpgkeypath\fR when \fB\%gpg\-verify\-summary\fR is not true, and a \fB\%verification\-ENGINE\-key\fR or a \fB\%verification\-ENGINE\-file\fR of an engine that \fB\%sign\-verify\-summary\fR does not select.
+\fB\%sign\-verify\-summary=true\fR selects \fB\%ed25519\fR and \fB\%spki\fR here.
+These refusals read the keys of the config, and a switch of the command does not change them.
+A switch that turns on a check of the commits is refused.
+A switch that turns off a check of the commits turns off that check of the group.
+\fB\%ostrya remote fsck NAME\fR checks the group and the keys beside this key, and reads no key of the group.
+The key is an extension of ostrya, and the \fB\%ostree\fR tool keeps it and ignores it.
 .SS "TLS and proxy"
 A relative path is relative to the current directory of the command.
 ostrya does not expand \fB\%~\fR.
@@ -410,6 +427,7 @@ A repeated key takes the last value, so each list key is one line in a group.
 \fB\%ostrya receive\fR and \fB\%ostrya serve\fR also build each trust group and each key group one time, also a group that no client group names.
 Thus a key source that ostrya cannot read stops the command.
 \fB\%ostrya send\fR reads no key of a trust group or a key group.
+A pull from a remote with the key \fB\%trust\fR checks and builds the one trust group that the key names, and no other group.
 A bad group stops the command with status 1.
 A push session names its namespace in \fB\%Hello\fR: the local refs, or one collection.
 The \fB\%collection\-id\fR of \fB\%[core]\fR names the local refs.
@@ -795,7 +813,10 @@ A trust group that turns on no check is refused.
 \fB\%gpgkeypath\fR without \fB\%gpg\-verify=true\fR is refused, and so is \fB\%gpg\-verify=true\fR with no \fB\%gpgkeypath\fR.
 An entry of \fB\%gpgkeypath\fR that names neither a file nor a directory is refused, and so are keyrings that hold no certificate.
 A \fB\%verification\-ENGINE\-key\fR or \fB\%verification\-ENGINE\-file\fR key of an engine that \fB\%sign\-verify\fR does not select is refused.
-\fB\%gpg\-verify\-summary\fR and \fB\%sign\-verify\-summary\fR are refused, because a push carries no summary.
+\fB\%gpg\-verify\-summary\fR and \fB\%sign\-verify\-summary\fR are refused, because a trust group sets a commit policy alone.
+A trust group checks the commits of a push that a client group with \fB\%verify=trust:NAME\fR accepts, and the commits of a pull from a remote with \fB\%trust=NAME\fR.
+Thus the keys that \fB\%ostrya remote gpg\-import NAME\fR writes to \fB\%<repo>/NAME.trustedkeys.gpg\fR do not check a commit of a remote with \fB\%trust\fR.
+The GPG check of the summary of that remote still reads them.
 .SS "Signing key keys"
 A key group refuses a key of another type, for example \fB\%gpg\-key\fR in an \fB\%ed25519\fR group.
 .TP

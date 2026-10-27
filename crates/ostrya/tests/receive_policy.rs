@@ -642,7 +642,7 @@ fn a_trust_group_turns_on_an_axis() {
     for key in ["gpg-verify-summary=true", "sign-verify-summary=ed25519"] {
         assert_malformed(
             &format!("{}{key}\n", trust_t()),
-            "a push carries no summary",
+            "a trust group sets a commit policy alone",
         );
     }
 }

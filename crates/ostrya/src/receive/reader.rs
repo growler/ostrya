@@ -20,7 +20,7 @@ use crate::error::{Error, Result};
 use crate::pull::DetachedMetadataFilter;
 use crate::repo::Repo;
 use crate::sign::{MAX_KEY_FILE, key_text, read_key_path};
-use crate::verify::trust::{check_trust, unknown_key};
+use crate::verify::trust::{check_trust, trust_group_policy, unknown_key};
 
 use super::{ReceivePolicy, ReceiveVerify, ServerSigner, TrustedKeys};
 
@@ -86,8 +86,8 @@ pub(crate) async fn read(repo: &Repo) -> Result<(ClientAccess, Vec<Arc<ReceivePo
                 signers.insert(name, built.into_iter().map(Arc::new).collect());
             }
             Group::Trust(name) => {
-                let keys = TrustedKeys::for_trust_group(repo, keyfile, name, group).await?;
-                trusts.insert(name, Arc::new(keys));
+                let policy = trust_group_policy(repo, keyfile, name, group, true, true).await?;
+                trusts.insert(name, Arc::new(TrustedKeys::from_policy(policy)));
             }
             _ => {}
         }

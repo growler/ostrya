@@ -1426,6 +1426,31 @@ Each refusal writes no object and no ref. The tool reads and discards a value
 given to either option, so `--gpg-verify=false` turns on the check.
 `cli-surface.md`, "P2", `pull-local`, records the port side.
 
+`pull` from a `file://` URL and `pull-local --remote=NAME` keep the remote
+key `trust` of the port and ignore it. The value of the key names a group
+`[ex-ostrya trust "NAME"]` of the config. In each observation, the source is
+an `archive` repository with a summary, the destination is a new `bare-user`
+repository, and `remote add --no-gpg-verify` adds the remote. Each command
+imports the commit at exit 0, prints `3 metadata, 1 content objects imported;
+6 bytes content written`, and writes the ref `origin:<ref>` in each of these
+cases:
+
+- `trust=grp` with no group `[ex-ostrya trust "grp"]`, and an unsigned
+  commit;
+- `trust=grp` with a group that sets `sign-verify=ed25519` and the key A, and
+  an unsigned commit or a commit of the key A;
+- `trust=` with an empty value, and an unsigned commit.
+
+With the group, and `sign-verify=ed25519` and the key A in the remote too,
+`pull` refuses the unsigned commit with `error: Can't verify commit
+<checksum>: ed25519: commit have no signatures of my type`, and writes no
+object and no ref. `pull-local` imports the unsigned commit. Both import the
+commit of the key A. With `trust=grp` and the group, `remote list -u`,
+`remote show-url`, `remote refs`, `remote summary`, and `fsck` exit 0 and
+write no diagnostic. `config get` prints `grp`, and `config set` keeps the key
+and the group. `cli-surface.md`, "P2", `pull` and `pull-local`, records the
+port side.
+
 #### Static deltas and signatures
 
 The tool checks a commit that a delta delivers against the copy of the detached

@@ -7028,6 +7028,92 @@ fn pull_sign_verify_switch_overrides_the_configuration() {
     );
 }
 
+/// The remote keys of a remote with `trust=t` and the trust group
+/// `[ex-ostrya trust "t"]`, which trusts the shared ed25519 key.
+fn trust_group_keys() -> String {
+    format!(
+        "trust=t\n[ex-ostrya trust \"t\"]\nsign-verify=ed25519\n\
+         verification-ed25519-key={ED25519_PUBLIC_B64}\n"
+    )
+}
+
+/// `pull` reads the key `trust` of the remote: the trust group that the key
+/// names checks each commit. The pull takes a commit of the key of the group,
+/// and refuses an unsigned commit at exit 1 with no ref. A `trust` value that
+/// names no group is refused at exit 1 before the first request.
+#[test]
+fn pull_reads_the_trust_group_of_the_remote() {
+    let tmp = TmpDir::new("pull-trust");
+    let base = tmp.path();
+    let unsigned = build_remote(base, "unsigned");
+    let signed = build_remote(base, "signed");
+    let signed_s = signed.to_str().unwrap().to_owned();
+    ostrya(
+        &["sign", "--repo", &signed_s, COMMIT, ED25519_SECRET_B64],
+        None,
+        &[],
+    )
+    .ok();
+    let unsigned_server = FileServer::start(&unsigned);
+    let signed_server = FileServer::start(&signed);
+    let pull = |dest: &Path| {
+        ostrya(
+            &["pull", "--repo", dest.to_str().unwrap(), "origin", BRANCH],
+            None,
+            &[],
+        )
+    };
+
+    let accepted = build_dest(base, "accepted");
+    configure_remote(
+        &accepted,
+        &signed_server.url(),
+        &format!("gpg-verify=false\n{}", trust_group_keys()),
+    );
+    pull(&accepted).ok();
+    assert_eq!(
+        resolve(&accepted, &format!("origin:{BRANCH}")).as_deref(),
+        Some(COMMIT)
+    );
+
+    let refused = build_dest(base, "refused");
+    configure_remote(
+        &refused,
+        &unsigned_server.url(),
+        &format!("gpg-verify=false\n{}", trust_group_keys()),
+    );
+    let run = pull(&refused);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert_eq!(run.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("sign-api verification is enabled, but it carries no signature"),
+        "{stderr}"
+    );
+    assert_eq!(resolve(&refused, &format!("origin:{BRANCH}")), None);
+    assert!(loose_objects(&refused).is_empty());
+
+    let seen = unsigned_server.seen().len();
+    let no_group = build_dest(base, "no-group");
+    configure_remote(
+        &no_group,
+        &unsigned_server.url(),
+        "gpg-verify=false\ntrust=nope\n",
+    );
+    let run = pull(&no_group);
+    assert_eq!(run.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&run.stderr),
+        "error: invalid format: [remote \"origin\"] trust=nope names no \
+         [ex-ostrya trust \"nope\"] group\n"
+    );
+    assert_eq!(
+        unsigned_server.seen().len(),
+        seen,
+        "the pull sent a request"
+    );
+    assert!(loose_objects(&no_group).is_empty());
+}
+
 // --- `pull` network tuning against `ostree` ----------------------------------
 //
 // ostrya and the `ostree` command each pull from a separate server. The server
@@ -41406,6 +41492,65 @@ fn pull_local_sign_verify_summary_checks_the_summary() {
             }
         }
     }
+}
+
+/// `pull-local --remote=origin` reads the key `trust` of the remote, as
+/// `pull` does: the trust group that the key names checks each commit. The
+/// port takes a commit of the key of the group, and refuses an unsigned
+/// commit at exit 1 with no object and no ref. The `ostree` command keeps
+/// the key and ignores it, so it imports the unsigned commit that the port
+/// refuses.
+#[test]
+fn pull_local_reads_the_trust_group_of_the_remote() {
+    let tmp = TmpDir::new("pull-local-trust");
+    let base = tmp.path();
+    let source = |name: &str| {
+        let dir = base.join(name);
+        std::fs::create_dir_all(&dir).unwrap();
+        commit_fixture(&dir)
+    };
+    let unsigned = source("unsigned");
+    let signed = source("signed");
+    let repo_arg = format!("--repo={}", signed.display());
+    ostrya(&["sign", &repo_arg, COMMIT, ED25519_SECRET_B64], None, &[]).ok();
+    let keys = trust_group_keys();
+
+    let (run, dest) = pull_local_into_origin(base, "accepted", &signed, Some(&keys), &[]);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert_eq!(run.status.code(), Some(0), "{stderr}");
+    assert_eq!(resolve(&dest, "origin:test/main").as_deref(), Some(COMMIT));
+
+    let (run, dest) = pull_local_into_origin(base, "refused", &unsigned, Some(&keys), &[]);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert_eq!(run.status.code(), Some(1), "{stderr}");
+    assert!(
+        stderr.contains("sign-api verification is enabled, but it carries no signature"),
+        "{stderr}"
+    );
+    assert_nothing_pulled(&dest, "refused");
+
+    if !ostree_supports_ed25519() {
+        return;
+    }
+    let dir = base.join("tool");
+    std::fs::create_dir_all(&dir).unwrap();
+    let dest = create_repo(&dir, RepoMode::Archive);
+    configure_remote(
+        &dest,
+        "file:///nonexistent",
+        &format!("gpg-verify=false\n{keys}"),
+    );
+    let dest_arg = format!("--repo={}", dest.display());
+    let run = ostree(&[
+        "pull-local",
+        &dest_arg,
+        "--remote=origin",
+        unsigned.to_str().unwrap(),
+        BRANCH,
+    ]);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert_eq!(run.status.code(), Some(0), "{stderr}");
+    assert_eq!(resolve(&dest, "origin:test/main").as_deref(), Some(COMMIT));
 }
 
 /// `clap` refuses each sign switch of `pull-local` with no `--remote`, with a

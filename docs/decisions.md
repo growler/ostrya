@@ -431,6 +431,67 @@ Two alternatives were rejected:
 - The config read with no off switch. A configured check would then apply
   to each local pull of the remote, and a command line could not turn it off.
 
+## The trust group of a remote
+
+The remote key `trust=NAME` names a trust group `[ex-ostrya trust "NAME"]`.
+The group supplies the commit keys of each pull from the remote. The key name
+has no prefix, as the other remote keys of the port (`ssh-command`,
+`push-user`, `s3-region`). The value is the quoted part of the group name.
+
+Each pull reads the key: `pull` over HTTP, over ssh, and from an `s3://`
+address, `pull --collection`, and `pull-local`. `PullTrust::resolve` reads
+it, and each pull calls that function.
+
+The group sets the commit policy alone. The remote keys `gpg-verify-summary`
+and `sign-verify-summary`, and the key sources that they read, set the
+summary policy. So `ostrya remote fsck NAME` keeps its summary check. A trust
+group refuses `gpg-verify-summary` and `sign-verify-summary` on the receive
+side and on the pull side, because a trust group sets a commit policy alone.
+The commit policy and the summary policy share no verifier. So the GPG check
+of the summary cannot take the verifier of the group, which reads no
+repository keyring.
+
+With a trust group, the pull refuses `Some(true)` in `PullVerify::gpg` or
+`PullVerify::sign` with `Error::InvalidInput`. `Some(false)` in one of the two
+fields turns that commit axis of the group off. The summary fields override
+the summary keys of the remote, as without a trust group. `ostrya remote
+fsck NAME` sets both commit fields to `Some(false)`, so it reads no key of
+the group.
+
+Beside `trust`, the pull refuses a remote key that turns on a commit check:
+`gpg-verify=true`, and a `sign-verify` value other than false. It accepts
+`gpg-verify=false`, which `remote add --no-gpg-verify` writes. An absent
+`gpg-verify` gives no GPG check of the commits, because the group sets the
+commit policy. The pull also refuses a key source of the remote that no
+summary check reads: `gpgkeypath` without a GPG summary check, and a
+`verification-ENGINE-key` or a `verification-ENGINE-file` of an engine that
+the summary check does not select. This rule reads the summary keys of the
+config, and not the overrides of `PullVerify`. So an override that turns the
+summary check off for one pull does not make the remote refused. A summary
+key of the remote that the pull reads and cannot parse is refused too. Each
+refusal comes before the pull reads a key source and before it fetches
+anything.
+
+A pull checks and builds the one trust group that it names, and no other
+group. `ostrya receive` and `ostrya serve` keep their check of each group.
+
+The commit policy of a group reads no repository keyring
+`<repo>/NAME.trustedkeys.gpg` and no system key store. So the keys that
+`ostrya remote gpg-import NAME` writes do not check the commits of a remote
+with `trust=NAME`. The GPG check of the summary still reads them. The pull
+does not refuse the keyring file, and `ostrya-config(1)` states the rule.
+
+Three alternatives were rejected:
+
+- A key that `pull-local` alone reads. A pull over HTTP of the same remote
+  would then use the keys of the remote, with no message.
+- A trust group with no summary check. The summary keys of the remote would
+  then apply to no check, and `ostrya remote fsck NAME` would verify no
+  summary of such a remote.
+- A refusal of each `Some` field of `PullVerify`. `Some(false)` makes the
+  policy of the group smaller and never larger, and `ostrya remote fsck
+  NAME` sets it. The summary fields do not touch the group.
+
 ## TLS stack
 
 The fetcher uses `rustls` 0.23 with `rustls-graviola` 0.4 as the crypto

@@ -102,6 +102,7 @@ async fn commit_tree(repo: &Repo, tree: &Path, parent: Option<Checksum>) -> Chec
                 body: None,
                 timestamp: Some(1_700_000_000),
                 metadata: None,
+                related: Vec::new(),
             },
             &root,
         )
@@ -132,6 +133,7 @@ async fn commit_tree_with_xattrs(repo: &Repo, tree: &Path, parent: Option<Checks
                 body: None,
                 timestamp: Some(1_700_000_000),
                 metadata: None,
+                related: Vec::new(),
             },
             &root,
         )
@@ -3062,6 +3064,7 @@ async fn commit_tree_keyed(
                 body: None,
                 timestamp: Some(1_700_000_000),
                 metadata,
+                related: Vec::new(),
             },
             &root,
         )

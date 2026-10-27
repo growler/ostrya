@@ -520,7 +520,7 @@ The command exists and the matrix exercises an option it does not accept.
 `--tar-autocreate-parents`, `--tar-pathname-filter=REGEX,REPLACEMENT`,
 `--gpg-sign=KEY-ID`, `--gpg-homedir=HOMEDIR`, `--sign=KEY_ID`,
 `--sign-from-file=PATH`, `--sign-type=NAME`, and the port extensions
-`--tag=NAME` and `--generate-composefs`.
+`--tag=NAME`, `--generate-composefs`, and `--related=NAME=CHECKSUM`.
 Missing:
 `--selinux-policy=PATH`, `-P/--selinux-policy-from-base`,
 `--selinux-labeling-epoch`.
@@ -556,6 +556,29 @@ A refusal writes no object and no ref. Without `-b`, the option needs
 `--orphan`, as each commit does. `--orphan --tag=NAME` creates `NAME` and
 moves no branch. `--tag` conflicts with `--no-bindings` and with
 `--skip-if-unchanged`, and `clap` refuses each pair at exit 1.
+
+`--related=NAME=CHECKSUM` of the port names one dependency of the commit in
+field 2 of the commit object (`../format-reference.md`, "Commit --
+`(a{sv}aya(say)sstayay)`"). The option can occur more than once. The port
+splits the value at its last `=`, so `NAME` can hold `=`. `CHECKSUM` is 64
+lowercase hex characters. The commit holds the entries sorted by name in byte
+order, so the order of the options does not change the commit checksum. The
+tool has no option that writes field 2. `ostree show --print-related` prints
+the entries that the port writes, and `ostree fsck` accepts the commit. The
+port refuses these values at exit 1:
+
+- a value with no `=`, with `error: Missing '=' in NAME=CHECKSUM argument
+  '<value>'`, before it takes the repository lock;
+- a `CHECKSUM` that is not 64 lowercase hex characters, with `error: Checksum
+  '<checksum>' in '<value>' is not 64 lowercase hexadecimal characters`,
+  before it takes the repository lock;
+- an empty `NAME`, and a `NAME` given two times, before it reads the tree;
+- a dependency that the repository does not hold, or holds partial, before it
+  reads the tree;
+- a dependency whose own field 2 is not empty, before it reads the tree.
+
+A refusal writes no object and no ref. `--related` conflicts with
+`--skip-if-unchanged`, and `clap` refuses the pair at exit 1.
 
 The five tree-source options carry seven divergences between them, and the
 walk of a filesystem source carries the divergences its own paragraph states

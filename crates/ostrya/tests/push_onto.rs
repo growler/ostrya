@@ -156,6 +156,7 @@ fn commit_with(
                     body: Some("body".into()),
                     timestamp: Some(TIMESTAMP),
                     metadata: Some(metadata),
+                    related: Vec::new(),
                 },
                 &root,
             )

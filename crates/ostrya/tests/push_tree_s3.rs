@@ -221,6 +221,7 @@ async fn local_commit(
         body: Some(BODY.into()),
         timestamp: Some(TIMESTAMP),
         metadata: Some(metadata),
+        related: Vec::new(),
     };
     let commit = txn.write_commit(opts, &root).await.unwrap();
     txn.set_ref(BRANCH, Some(&commit));

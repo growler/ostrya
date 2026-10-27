@@ -52,8 +52,10 @@ pub struct Commit {
     pub parent: Option<Checksum>,
     /// The related objects.
     ///
-    /// The `ostree` command writes an empty array. A parse keeps the entries
-    /// as read, so the commit serializes to the same bytes.
+    /// The `ostree` command writes an empty array. The port uses the field
+    /// for the dependencies of a commit: each entry is a name and the 32-byte
+    /// checksum of a commit. A parse keeps the entries as read, so the commit
+    /// serializes to the same bytes.
     pub related: Vec<(String, Vec<u8>)>,
     /// The commit subject, the first line of its message.
     pub subject: String,

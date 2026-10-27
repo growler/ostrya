@@ -5,6 +5,8 @@
 //! - [`Repo::read_commit_detached_metadata`] and
 //!   [`Repo::write_commit_detached_metadata`] read and write the detached
 //!   metadata of a commit.
+//! - [`Repo::read_commit_related`] reads the related commits of a commit:
+//!   the dependencies and the build sources.
 
 use std::collections::HashMap;
 use std::os::fd::{AsFd, BorrowedFd};
@@ -20,6 +22,7 @@ use crate::config::RepoConfig;
 use crate::error::{Error, Result};
 use crate::file::FileKind;
 use crate::perm;
+use crate::related::{self, CommitRelated, RelatedField};
 use crate::repo::Repo;
 use crate::staging::{META_TEMP_PREFIX, TempEntry, open_tmp_dir};
 use crate::transaction::Transaction;
@@ -59,6 +62,19 @@ pub struct CommitOptions {
     pub timestamp: Option<u64>,
     /// The `a{sv}` metadata dict, or `None` for an empty dict.
     pub metadata: Option<Value>,
+    /// The dependencies of the commit: the name and the checksum of each
+    /// commit that field 2 of the commit object names.
+    ///
+    /// The name has the form `<class>/<name>` by convention, for example
+    /// `container/fe`. The write sorts the entries by name in byte order, so
+    /// one set of entries gives one commit checksum. It refuses an empty name
+    /// and two entries with the same name. Each dependency must be complete
+    /// in the repository or in the writing transaction, and must have no
+    /// dependency of its own. [`Transaction::write_commit`] states the rule.
+    ///
+    /// A prune does not read field 2. A dependency stays only if a ref or
+    /// another root of the prune keeps it.
+    pub related: Vec<(String, Checksum)>,
 }
 
 /// Methods that write a commit object.
@@ -120,11 +136,35 @@ impl Transaction {
     /// a refusal. The transaction stays open, and the caller commits or aborts
     /// it. The call does not check the `ostree.sizes` entry that it adds.
     ///
+    /// # Dependencies
+    ///
+    /// Field 2 of the commit object holds the entries of `opts.related`,
+    /// sorted by name in byte order. The call refuses an entry with an empty
+    /// name and two entries with the same name. It checks nothing else in a
+    /// name.
+    ///
+    /// Each dependency must be complete: this transaction stages its commit
+    /// object or the repository holds it, and the repository holds no
+    /// `state/<checksum>.commitpartial` marker for it. A dependency that this
+    /// transaction writes must be staged before the call that names it. A
+    /// dependency must have no dependency of its own, so a dependency names
+    /// no dependency. It can have a parent and build sources.
+    ///
+    /// The call checks the dependencies as
+    /// [`check_related`](Transaction::check_related) does, after the GC anchor
+    /// keys and the timestamp and before it serializes the commit. On a
+    /// refusal, it writes nothing and the transaction stays open.
+    ///
     /// # Errors
     ///
     /// - [`Error::Unsupported`] if the repository mode is `bare-split-xattrs`.
     /// - [`Error::InvalidGcAnchor`] if an entry of `opts.metadata` gives a key
     ///   of `[ex-ostrya] gc-root-metadata-keys` a value that a prune refuses.
+    /// - [`Error::InvalidRelated`] if an entry of `opts.related` has an empty
+    ///   name, if two entries have the same name, or if a dependency is
+    ///   absent, partial, or has a dependency of its own.
+    /// - [`Error::Core`] if the commit tuple of a dependency does not frame,
+    ///   or if its field 2 does not decode.
     /// - [`Error::Core`] if `opts.metadata` holds at least one entry and
     ///   `[ex-ostrya] gc-root-metadata-keys` holds a malformed escape
     ///   sequence.
@@ -156,21 +196,58 @@ impl Transaction {
     ///   commit reaches is larger than
     ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
     /// - [`Error::Io`] if a file system operation fails.
-    pub async fn write_commit(&self, opts: CommitOptions, root: &RepoTree) -> Result<Checksum> {
+    pub async fn write_commit(&self, mut opts: CommitOptions, root: &RepoTree) -> Result<Checksum> {
         if self.repo().mode() == RepoMode::BareSplitXattrs {
             return Err(Error::Unsupported(
                 "bare-split-xattrs is read-only; the port does not write it".into(),
             ));
         }
         check_gc_anchors(self.repo().config(), opts.metadata.as_slice())?;
+        let timestamp = ostrya_core::commit_timestamp(opts.timestamp)
+            .map_err(|e| Error::InvalidFormat(e.to_string()))?;
+        opts.timestamp = Some(timestamp);
+        self.check_related(&opts.related).await?;
+        opts.related.sort_by(|(a, _), (b, _)| a.cmp(b));
         self.write_commit_unchecked(opts, root).await
     }
 
-    /// Writes a commit as [`write_commit`](Transaction::write_commit) does,
-    /// with no check of the GC anchor keys.
+    /// Checks the dependencies `related` of a new commit, as
+    /// [`write_commit`](Transaction::write_commit) checks
+    /// [`CommitOptions::related`].
     ///
-    /// The anchor commit of a summary uses this path, because the port builds
-    /// its binding keys. A `bare-split-xattrs` repository refuses the write in
+    /// The call refuses an entry with an empty name and two entries with the
+    /// same name. Then it checks each dependency in the byte order of the
+    /// names: the dependency must be complete in the repository or in this
+    /// transaction, and it must have no dependency of its own.
+    /// [`write_commit`](Transaction::write_commit) states the rules and runs
+    /// the same checks. The call does not change `related` and writes
+    /// nothing.
+    ///
+    /// The call reads no tree. A caller can call it before it builds a large
+    /// tree, so that a refused dependency stops the work before the build.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidRelated`] with no commit, if an entry of `related`
+    ///   has an empty name, if two entries have the same name, or if a
+    ///   dependency is absent, partial, or has a dependency of its own.
+    /// - [`Error::Core`] if the commit tuple of a dependency does not frame,
+    ///   or if its field 2 does not decode.
+    /// - [`Error::Io`] if the commit object of a dependency is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE), or if a file system
+    ///   operation fails.
+    pub async fn check_related(&self, related: &[(String, Checksum)]) -> Result<()> {
+        let sorted = related::sorted_new(related)?;
+        related::check_dependencies(self, None, sorted).await
+    }
+
+    /// Writes a commit as [`write_commit`](Transaction::write_commit) does,
+    /// with no check of the GC anchor keys or the dependencies.
+    ///
+    /// Field 2 holds the entries of `opts.related` in the given order. The
+    /// anchor commit of a summary uses this path, because the port builds its
+    /// binding keys, and it has no dependency. A `bare-split-xattrs`
+    /// repository refuses the write in
     /// [`write_metadata`](Transaction::write_metadata).
     pub(crate) async fn write_commit_unchecked(
         &self,
@@ -193,7 +270,11 @@ impl Transaction {
         let commit = Commit {
             metadata,
             parent: opts.parent,
-            related: Vec::new(),
+            related: opts
+                .related
+                .into_iter()
+                .map(|(name, checksum)| (name, checksum.as_bytes().to_vec()))
+                .collect(),
             subject: opts.subject.unwrap_or_default(),
             body: opts.body.unwrap_or_default(),
             timestamp,
@@ -357,6 +438,68 @@ impl Repo {
         let repo = self.clone();
         let key = *checksum;
         ostrya_rt::unblock(move || repo.read_commit_detached_metadata_blocking(&key)).await
+    }
+
+    /// Returns the related commits of the commit `commit`.
+    ///
+    /// The dependencies come from field 2 of the commit object. The build
+    /// sources come from the key `ostrya.related` of the detached metadata.
+    /// If the detached metadata is absent or has no such key, the list of
+    /// build sources is empty. If the key occurs more than one time, the
+    /// first entry gives the value. Each list keeps the stored order.
+    ///
+    /// The call checks the format alone: each entry has a name that is not
+    /// empty and a checksum of 32 bytes, and the value of `ostrya.related`
+    /// is a variant of type `a(say)`. It accepts entries that are not sorted
+    /// and two entries with the same name. It does not check that the
+    /// repository holds a related commit. The checks of the dependencies of
+    /// [`Transaction::write_commit`] apply when a commit is written.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::ObjectNotFound`] if the repository does not hold the commit
+    ///   object.
+    /// - [`Error::Core`] if the commit tuple does not frame, if field 2 does
+    ///   not decode, or if the detached metadata does not parse.
+    /// - [`Error::InvalidRelated`] with the field and the reason, if an entry
+    ///   of either field has an empty name or a checksum that is not 32
+    ///   bytes, or if the value of `ostrya.related` is not a variant of type
+    ///   `a(say)`.
+    /// - [`Error::Io`] if the commit object or the detached metadata is
+    ///   larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE), or if a
+    ///   file system operation fails.
+    pub async fn read_commit_related(&self, commit: &Checksum) -> Result<CommitRelated> {
+        let repo = self.clone();
+        let commit = *commit;
+        // A commit object can be as large as `MAX_METADATA_SIZE`, so the two
+        // reads and the parse run in one call on the blocking pool. The read
+        // of the commit comes first, then the read of the `.commitmeta`, then
+        // the parse.
+        ostrya_rt::unblock(move || {
+            let bytes = repo.load_object_bytes_blocking(ObjectType::Commit, &commit)?;
+            let detached = repo.read_commit_detached_metadata_blocking(&commit)?;
+            let dependencies = related::checked_entries(
+                RelatedField::Dependencies,
+                Some(commit),
+                related::parse_dependencies(&bytes)?,
+            )?;
+            let build_sources = related::build_sources(detached.as_ref())
+                .map_err(|reason| Error::InvalidRelated {
+                    commit: Some(commit),
+                    field: RelatedField::BuildSources,
+                    reason,
+                })?
+                .map(|entries| {
+                    related::checked_entries(RelatedField::BuildSources, Some(commit), entries)
+                })
+                .transpose()?
+                .unwrap_or_default();
+            Ok(CommitRelated {
+                dependencies,
+                build_sources,
+            })
+        })
+        .await
     }
 
     /// Runs

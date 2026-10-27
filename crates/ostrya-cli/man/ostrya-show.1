@@ -22,7 +22,7 @@ A full checksum can name a metadata object or a file object. The command looks f
 \fB\-\-print\-related\fR
 Show the \%"related" commits.
 .IP
-The command prints one \fB\%<ref> <checksum>\fR line for each entry of the \%related\-objects array of the commit. An empty array prints nothing.
+The command prints one \fB\%<name> <checksum>\fR line for each dependency of the commit, the entries of field \%2 of the commit object, in the stored order. An empty field prints nothing.
 .TP
 \fB\-\-print\-variant\-type\fR \fITYPE\fR
 Read OBJECT as a file that holds a value of this GVariant type.

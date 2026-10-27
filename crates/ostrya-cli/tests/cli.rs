@@ -13008,9 +13008,10 @@ fn show_forms_match_the_tool() {
 }
 
 /// `show --print-related` over a commit with a related array that is not empty.
-/// No `commit` option writes such an array. The test builds the commit through
-/// the library and writes it into the object store. ostrya reads it back, and
-/// if the `ostree` command is installed, both commands read it back.
+/// No `commit` option of the `ostree` command writes such an array. The test
+/// builds the commit through the library and writes it into the object store.
+/// ostrya reads it back, and if the `ostree` command is installed, both
+/// commands read it back.
 #[test]
 fn show_print_related_lists_each_pair() {
     let tmp = TmpDir::new("show-related");
@@ -13055,6 +13056,157 @@ fn show_print_related_lists_each_pair() {
             &["show", "--print-related", &crafted],
         );
     }
+}
+
+/// `commit --related` writes field 2 sorted by name in byte order, and
+/// `show --print-related` prints one `name checksum` line for each entry. A
+/// name can hold `=`, because the argument splits at its last `=`. If the
+/// `ostree` command is installed, it prints the same lines and its fsck
+/// accepts the repository.
+#[test]
+fn commit_related_writes_sorted_dependencies() {
+    let tmp = TmpDir::new("commit-related");
+    let base = tmp.path();
+    let repo = create_repo(base, RepoMode::Archive);
+    let fe = commit_gc_anchor_run(&repo, &ex_ostrya_tree(base, "fe"), &[])
+        .ok()
+        .stdout_trimmed();
+    let uki = commit_gc_anchor_run(&repo, &ex_ostrya_tree(base, "uki"), &[])
+        .ok()
+        .stdout_trimmed();
+    let tree = ex_ostrya_tree(base, "head");
+    let head = commit_gc_anchor_run(
+        &repo,
+        &tree,
+        &[
+            &format!("--related=container/fe={fe}"),
+            &format!("--related=boot/uki={uki}"),
+            &format!("--related=a=b={fe}"),
+        ],
+    )
+    .ok()
+    .stdout_trimmed();
+    let repo_arg = format!("--repo={}", repo.display());
+    let run = ostrya(&[&repo_arg, "show", "--print-related", &head], None, &[]);
+    assert_eq!(
+        String::from_utf8(run.ok().stdout.clone()).unwrap(),
+        format!("a=b {fe}\nboot/uki {uki}\ncontainer/fe {fe}\n"),
+        "the sorted entries"
+    );
+    if ostree_available() {
+        assert_agrees(&repo, &repo, &["show", "--print-related", &head]);
+        let fsck = ostree(&["fsck", &repo_arg]);
+        assert!(
+            fsck.status.success(),
+            "ostree fsck: {}",
+            String::from_utf8_lossy(&fsck.stderr)
+        );
+    }
+}
+
+/// `commit --related` refuses an argument with no `=` and a checksum that is
+/// not 64 lowercase hexadecimal characters. It also refuses an empty name and
+/// a dependency that the repository does not hold, before it reads the tree.
+/// The option conflicts with `--skip-if-unchanged`. Each refusal exits 1 and
+/// writes no object and no ref.
+#[test]
+fn commit_related_refuses_a_malformed_or_absent_dependency() {
+    let tmp = TmpDir::new("commit-related-refuse");
+    let base = tmp.path();
+    let repo = create_repo(base, RepoMode::Archive);
+    let dep = commit_gc_anchor_run(&repo, &ex_ostrya_tree(base, "dep"), &[])
+        .ok()
+        .stdout_trimmed();
+    let tree = ex_ostrya_tree(base, "head");
+    let absent = "ab".repeat(32);
+    let short = &dep[..63];
+    let upper = dep.to_uppercase();
+    let not_hex = format!("{}g", &dep[..63]);
+    let cases = [
+        (
+            format!("--related=a/x{dep}"),
+            format!("Missing '=' in NAME=CHECKSUM argument 'a/x{dep}'"),
+        ),
+        (
+            format!("--related=a/x={short}"),
+            format!(
+                "Checksum '{short}' in 'a/x={short}' is not 64 lowercase hexadecimal characters"
+            ),
+        ),
+        (
+            format!("--related=a/x={upper}"),
+            format!(
+                "Checksum '{upper}' in 'a/x={upper}' is not 64 lowercase hexadecimal characters"
+            ),
+        ),
+        (
+            format!("--related=a/x={not_hex}"),
+            format!(
+                "Checksum '{not_hex}' in 'a/x={not_hex}' is not 64 lowercase hexadecimal \
+                 characters"
+            ),
+        ),
+        (
+            format!("--related=={dep}"),
+            "related commits in field 2: entry 0 has an empty name".to_owned(),
+        ),
+        (
+            format!("--related=a/x={absent}"),
+            format!(
+                "related commits in field 2: dependency a/x names commit {absent}, which is in \
+                 neither the repository nor the transaction"
+            ),
+        ),
+    ];
+    for (option, message) in cases {
+        let before = commit_gc_anchor_state(&repo);
+        let run = commit_gc_anchor_run(&repo, &tree, &[&option]);
+        assert_eq!(run.status.code(), Some(1), "{option}: the command exits 1");
+        assert_eq!(
+            String::from_utf8_lossy(&run.stderr),
+            format!("error: {message}\n"),
+            "{option}: the error line"
+        );
+        assert!(run.stdout.is_empty(), "{option}: no checksum is printed");
+        assert_eq!(
+            commit_gc_anchor_state(&repo),
+            before,
+            "{option}: the store holds the same objects and refs"
+        );
+    }
+
+    // The dependencies are checked before the tree is read, so a tree that
+    // does not exist gives the error of the dependency.
+    let before = commit_gc_anchor_state(&repo);
+    let option = format!("--related=a/x={absent}");
+    let run = commit_gc_anchor_run(&repo, &base.join("missing"), &[&option]);
+    assert_eq!(
+        run.status.code(),
+        Some(1),
+        "missing tree: the command exits 1"
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stderr),
+        format!(
+            "error: related commits in field 2: dependency a/x names commit {absent}, which is \
+             in neither the repository nor the transaction\n"
+        ),
+        "missing tree: the error line"
+    );
+
+    let option = format!("--related=a/x={dep}");
+    let run = commit_gc_anchor_run(&repo, &tree, &[&option, "--skip-if-unchanged"]);
+    assert_eq!(
+        run.status.code(),
+        Some(1),
+        "--skip-if-unchanged: the command exits 1"
+    );
+    assert!(run.stdout.is_empty(), "--skip-if-unchanged: no checksum");
+    assert_eq!(
+        commit_gc_anchor_state(&repo),
+        before,
+        "the store holds the same objects and refs"
+    );
 }
 
 /// `log` over the repository that the `ostree` command built. The forms are

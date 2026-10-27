@@ -817,6 +817,27 @@ struct CommitArgs {
         conflicts_with_all = ["no_bindings", "skip_if_unchanged"]
     )]
     tags: Vec<String>,
+    /// Name a dependency of the commit in field 2 of the commit object.
+    ///
+    /// The argument splits at its last `=`, so NAME can hold `=`. CHECKSUM
+    /// is 64 lowercase hexadecimal characters. By convention, NAME has the
+    /// form `<class>/<name>`, for example `container/fe`. The option can
+    /// occur more than once. The commit holds the entries sorted by name in
+    /// byte order.
+    ///
+    /// The command refuses an argument with no `=` and a CHECKSUM of another
+    /// form before it takes the repository lock. It refuses an empty NAME, a
+    /// NAME that occurs two times, and a dependency that the repository does
+    /// not hold complete or that has a dependency of its own before it reads
+    /// the tree. A refusal gives no new object and no ref. The option
+    /// conflicts with --skip-if-unchanged. This option is an extension of
+    /// ostrya.
+    #[arg(
+        long = "related",
+        value_name = "NAME=CHECKSUM",
+        conflicts_with = "skip_if_unchanged"
+    )]
+    related: Vec<String>,
     /// Add a string-valued key to the commit metadata.
     ///
     /// The argument splits at its first `=`, so the value can hold `=`. The
@@ -1438,8 +1459,9 @@ struct CatArgs {
 struct ShowArgs {
     /// Show the "related" commits.
     ///
-    /// The command prints one `<ref> <checksum>` line for each entry of the
-    /// related-objects array of the commit. An empty array prints nothing.
+    /// The command prints one `<name> <checksum>` line for each dependency of
+    /// the commit, the entries of field 2 of the commit object, in the stored
+    /// order. An empty field prints nothing.
     #[arg(long)]
     print_related: bool,
     /// Read OBJECT as a file that holds a value of this GVariant type.
@@ -7275,6 +7297,7 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
     let added_strings = refuse_unlocked!(metadata_pairs(&args.add_metadata_string));
     let added_variants = refuse_unlocked!(parse_added_metadata(&args.add_metadata));
     let detached_pairs = refuse_unlocked!(metadata_pairs(&args.add_detached_metadata_string));
+    let related = refuse_unlocked!(related_pairs(&args.related));
     let kept = match parent.as_ref() {
         Some(parent) => refuse_unlocked!(kept_metadata(&repo, parent, &args.keep_metadata).await?),
         None => Vec::new(),
@@ -7322,6 +7345,12 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
     // skip list names the walk root, no source is read. Then no object is
     // counted, and the commit has no `ostree.sizes` key.
     txn.set_generate_sizes(args.generate_sizes && !walk.root_pruned);
+    // The dependencies are checked before the tree is read, so a refused
+    // dependency stops the command before the ingest and the composefs build.
+    if let Err(err) = txn.check_related(&related).await {
+        txn.abort().await?;
+        return Err(err);
+    }
 
     // From this point, a refusal first aborts the transaction. `exit_error`
     // runs no destructor, so the abort reaps the staging directory before the
@@ -7507,6 +7536,7 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
             body,
             timestamp,
             metadata: Some(metadata),
+            related,
         };
         let checksum = txn.write_commit(opts, &root).await?;
         if let Some(image) = image {
@@ -10810,10 +10840,11 @@ fn print_sorted_keys(dict: &Value) {
     }
 }
 
-/// Prints the related-objects array of the commit as `ref checksum` lines.
+/// Prints the related-objects array of the commit as `name checksum` lines.
 ///
-/// The array is empty on each commit that the `ostree` command writes. A
-/// commit with no related objects prints nothing and exits 0.
+/// The array is empty on each commit that the `ostree` command writes.
+/// `ostrya commit --related` writes entries into it. A commit with no related
+/// objects prints nothing and exits 0.
 async fn show_related(repo: &Repo, object: &str) -> Result<()> {
     let checksum = resolve(repo, object).await?;
     let (commit, _) = repo.load_commit(&checksum).await?;
@@ -14284,6 +14315,28 @@ fn metadata_pair(argument: &str) -> std::result::Result<(&str, &str), String> {
         .ok_or_else(|| format!("Missing '=' in KEY=VALUE metadata '{argument}'"))
 }
 
+/// Splits each `--related` argument at its last `=` into a name and a
+/// checksum.
+///
+/// The checksum is 64 lowercase hexadecimal characters. An empty name and a
+/// name that occurs two times pass here, and the commit write refuses them.
+fn related_pairs(arguments: &[String]) -> std::result::Result<Vec<(String, Checksum)>, String> {
+    arguments
+        .iter()
+        .map(|argument| {
+            let (name, hex) = argument
+                .rsplit_once('=')
+                .ok_or_else(|| format!("Missing '=' in NAME=CHECKSUM argument '{argument}'"))?;
+            let checksum = Checksum::from_hex_lower(hex).map_err(|_| {
+                format!(
+                    "Checksum '{hex}' in '{argument}' is not 64 lowercase hexadecimal characters"
+                )
+            })?;
+            Ok((name.to_owned(), checksum))
+        })
+        .collect()
+}
+
 /// Reads each `--add-metadata` argument into its key and the variant of its
 /// value.
 ///
@@ -15522,6 +15575,24 @@ mod tests {
             );
         }
         parse(&["--tag=u", "--bind-ref=t", "--orphan"]).unwrap();
+    }
+
+    /// `--related` of `commit` conflicts with `--skip-if-unchanged`.
+    #[test]
+    fn the_related_of_commit_conflicts_with_skip_if_unchanged() {
+        let parse = |extra: &[&str]| {
+            let mut all = vec!["ostrya", "commit", "-b", "main"];
+            all.extend_from_slice(extra);
+            Cli::try_parse_from(all).map(|_| ())
+        };
+        let related = format!("--related=a/x={}", "ab".repeat(32));
+        assert_eq!(
+            parse(&[&related, "--skip-if-unchanged"])
+                .unwrap_err()
+                .kind(),
+            clap::error::ErrorKind::ArgumentConflict
+        );
+        parse(&[&related, &related]).unwrap();
     }
 
     /// `tag_name_refusal` refuses a name with `:`, a name that the ref-name

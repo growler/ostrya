@@ -121,7 +121,16 @@ and `log` does not read them.
 
 0. `a{sv}` metadata dict.
 1. `ay` parent commit checksum: 32 raw bytes, empty array for a root commit.
-2. `a(say)` related objects: written as an empty array.
+2. `a(say)` related objects. The port uses this field for the dependencies
+   of a commit. Each entry is a name and the 32 raw bytes of the checksum of
+   a commit. The name is not empty. By convention, it has the form
+   `<class>/<name>`, for example `container/fe` or `boot/uki`. The `ostree`
+   command writes an empty array. The port writes the entries sorted by name
+   in byte order, with no name two times, so one set of entries gives one
+   commit checksum. A dependency names no dependency of its own. The commit
+   write of the port refuses a dependency whose field 2 is not empty, and a
+   dependency that the repository or the writing transaction does not hold
+   complete. A dependency can have a parent.
 3. `s` subject (empty string if none).
 4. `s` body (empty string if none).
 5. `t` timestamp, seconds since Unix epoch UTC, big-endian.

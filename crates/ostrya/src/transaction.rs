@@ -531,6 +531,18 @@ impl Transaction {
             .contains_key(&(*checksum, ty))
     }
 
+    /// Returns, for each checksum of `checksums`, `true` if an object of that
+    /// identity and of type `ty` is staged in this transaction.
+    ///
+    /// The call takes the lock of the staged set one time.
+    pub(crate) fn staged_flags(&self, ty: ObjectType, checksums: &[Checksum]) -> Vec<bool> {
+        let staged = self.staged.lock().unwrap();
+        checksums
+            .iter()
+            .map(|checksum| staged.objects.contains_key(&(*checksum, ty)))
+            .collect()
+    }
+
     /// Returns the checksums of the objects of type `ty` staged in this
     /// transaction.
     #[cfg(feature = "receive")]

@@ -4837,8 +4837,8 @@ oracle: exit-status stdout-text
 outcome: full
 severity: interop
 spec: cli-behavior.md#show
-note: no `commit` option writes a related entry, so the array is empty on every
- commit either implementation produces and the mode prints nothing at exit 0.
+note: no `commit` option of the tool writes a related entry, and the setup
+ commit names none, so the array is empty and the mode prints nothing at exit 0.
  The line shape a non-empty array draws is stated by
  `ostrya_cli::cli::show_print_related_lists_each_pair`, which assembles such a
  commit through the library and reads it back with both.

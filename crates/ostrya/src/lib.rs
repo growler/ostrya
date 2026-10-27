@@ -105,6 +105,7 @@ pub mod read;
 #[cfg(feature = "receive")]
 pub mod receive;
 pub mod refs;
+mod related;
 mod rollsum;
 mod send;
 #[cfg(any(feature = "receive", all(feature = "push", feature = "s3")))]
@@ -235,6 +236,7 @@ pub use receive::{
 };
 #[doc(hidden)]
 pub use refs::{CollectionRef, CollectionRefEntry, RefAlias, validate_refspec};
+pub use related::{CommitRelated, RelatedField};
 #[doc(hidden)]
 pub use repo::{CreateOptions, Repo};
 pub use send::{SendEvent, SendEventFn, SendOptions};

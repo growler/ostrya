@@ -1875,6 +1875,7 @@ impl Repo {
                     body: None,
                     timestamp,
                     metadata: Some(metadata),
+                    related: Vec::new(),
                 },
                 &root,
             )
@@ -3863,6 +3864,7 @@ mod tests {
             body: None,
             timestamp: Some(1_700_000_000),
             metadata: Some(metadata),
+            related: Vec::new(),
         };
         let commit = txn.write_commit(options, &root).await.unwrap();
         txn.commit().await.unwrap();
@@ -4064,6 +4066,7 @@ mod tests {
             body: None,
             timestamp: Some(timestamp),
             metadata: None,
+            related: Vec::new(),
         };
         let commit = txn.write_commit(options, &root).await.unwrap();
         txn.commit().await.unwrap();

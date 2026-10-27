@@ -3763,10 +3763,11 @@ with nothing on standard error. The order holds also where the names are not
 in sorted order. Over an array that holds `zz/last` and then `aa/first`, the
 tool prints `zz/last` first, at exit 0, with nothing on standard error. The
 mode prints each entry also where the repository does not hold the commit that
-the entry names. No `commit` option of the tool or the port writes such an
-entry (`../format-reference.md`, "Commit -- `(a{sv}aya(say)sstayay)`", field
-2). So the array is empty on each commit that the tool or the port writes. Over
-such a commit, the mode prints nothing at exit 0.
+the entry names. No `commit` option of the tool writes such an entry
+(`../format-reference.md`, "Commit -- `(a{sv}aya(say)sstayay)`", field 2). So
+the array is empty on each commit that the tool writes. Over such a commit,
+the mode prints nothing at exit 0. `ostrya commit --related` writes entries
+(`cli-surface.md`, "P2", `commit`).
 
 `--list-metadata-keys` and `--list-detached-metadata-keys` print one key on
 each line, in sorted order. A commit with no `.commitmeta` reports `error: No

@@ -492,6 +492,40 @@ pub enum Error {
         /// The text that names the defect of the value.
         reason: String,
     },
+    /// A defective list of related commits, or dependencies that are not
+    /// complete.
+    ///
+    /// These calls give this error:
+    ///
+    /// - [`Transaction::write_commit`](crate::Transaction::write_commit) and
+    ///   [`Transaction::check_related`](crate::Transaction::check_related),
+    ///   for an entry of
+    ///   [`CommitOptions::related`](crate::CommitOptions::related) with an
+    ///   empty name, for two entries with the same name, and for a dependency
+    ///   that is absent, partial, or nested. The calls check before the
+    ///   commit has a checksum, so `commit` is `None`.
+    /// - [`Repo::commit_add_composefs_metadata`](crate::Repo::commit_add_composefs_metadata),
+    ///   for a defective field 2 of the source commit: an entry with an empty
+    ///   name or with a checksum that is not 32 bytes, entries that are not
+    ///   sorted by name, two entries with the same name, and a dependency
+    ///   that is absent, partial, or nested. `commit` is the source commit.
+    /// - [`Repo::read_commit_related`](crate::Repo::read_commit_related), for
+    ///   an entry with an empty name or with a checksum that is not 32 bytes,
+    ///   and for an `ostrya.related` value that is not a variant of type
+    ///   `a(say)`. `commit` is the commit that the call reads.
+    #[error(
+        "related commits in {field}{}: {reason}",
+        .commit.map(|c| format!(" of commit {c}")).unwrap_or_default()
+    )]
+    InvalidRelated {
+        /// The commit that holds the entries, or `None` for a commit that is
+        /// not written yet.
+        commit: Option<Checksum>,
+        /// The field that holds the entries.
+        field: crate::RelatedField,
+        /// The text that names the defect.
+        reason: String,
+    },
     /// A failure of a session of the wire protocol of
     /// [`ostrya-remote`](crate::remote).
     ///

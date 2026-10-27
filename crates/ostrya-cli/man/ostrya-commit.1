@@ -71,6 +71,13 @@ The option can occur more than once. Each NAME goes into the \fB\%ostree.ref\-bi
 .IP
 NAME passes the \%ref\-name rule, has no \fB\%:\fR, and is not \%64 lowercase hexadecimal characters. NAME is not the \%\-\-branch name, and each NAME occurs one time. No name of \%\-\-branch and \%\-\-tag is a path below another of these names. The command refuses a NAME that has an entry under \fB\%refs/heads\fR: a ref, an alias, or a directory of refs. It also refuses a NAME below a ref. A refused NAME gives no new object and no ref. The command reads the path of each NAME again before it publishes the objects. If another writer creates a ref at the path after this read, the command replaces that ref. The option conflicts with \%\-\-no\-bindings and \%\-\-skip\-if\-unchanged.
 .TP
+\fB\-\-related\fR \fINAME=CHECKSUM\fR
+Name a dependency of the commit in field \%2 of the commit object.
+.IP
+The argument splits at its last \fB\%=\fR, so NAME can hold \fB\%=\fR\&. CHECKSUM is \%64 lowercase hexadecimal characters. By convention, NAME has the form \fB\%<class>/<name>\fR, for example \fB\%container/fe\fR\&. The option can occur more than once. The commit holds the entries sorted by name in byte order.
+.IP
+The command refuses an argument with no \fB\%=\fR and a CHECKSUM of another form before it takes the repository lock. It refuses an empty NAME, a NAME that occurs two times, and a dependency that the repository does not hold complete or that has a dependency of its own before it reads the tree. A refusal gives no new object and no ref. The option conflicts with \%\-\-skip\-if\-unchanged. This option is an extension of ostrya.
+.TP
 \fB\-\-add\-metadata\-string\fR \fIKEY=VALUE\fR
 Add a \%string\-valued key to the commit metadata.
 .IP

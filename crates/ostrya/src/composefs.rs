@@ -62,6 +62,7 @@ use ostrya_core::{
 use crate::commit::{append_dict_entry, check_gc_anchors};
 use crate::error::{Error, Result};
 use crate::file::{FileKind, FileObject};
+use crate::related::{self, RelatedField};
 use crate::repo::Repo;
 use crate::transaction::Transaction;
 use crate::tree::RepoTree;
@@ -1018,6 +1019,14 @@ impl Repo {
     /// includes the entries that the call copies from `commit`. On a refusal,
     /// the call stages nothing.
     ///
+    /// The new commit keeps field 2 of `commit`, the dependencies, with no
+    /// change. Before the call builds the image, it checks field 2 with the
+    /// rules of [`write_commit`](Transaction::write_commit): each entry has a
+    /// name that is not empty and a checksum of 32 bytes, the entries are
+    /// sorted by name in byte order with no name two times, and each
+    /// dependency is complete in the repository or in `txn` and has no
+    /// dependency of its own.
+    ///
     /// The image depends on the tree of the commit alone, so the metadata of
     /// the commit and the repository mode do not change the digest. The image
     /// goes to [`std::io::sink`], so the digest needs no image-sized buffer.
@@ -1031,6 +1040,12 @@ impl Repo {
     ///   refuses.
     /// - [`Error::Core`] if `[ex-ostrya] gc-root-metadata-keys` holds a
     ///   malformed escape sequence.
+    /// - [`Error::InvalidRelated`] with `commit` if field 2 of `commit` is
+    ///   defective, if its entries are not sorted or have a name two times,
+    ///   or if a dependency is absent, partial, or has a dependency of its
+    ///   own.
+    /// - [`Error::Core`] if the commit tuple of a dependency does not frame,
+    ///   or if its field 2 does not decode.
     /// - [`Error::ObjectNotFound`] if the commit object, or a dirtree,
     ///   dirmeta, or file object of its tree, is not in the object store.
     /// - [`Error::Core`] if the commit object, a dirtree object, a dirmeta
@@ -1062,6 +1077,13 @@ impl Repo {
                 "commit already carries {COMPOSEFS_DIGEST_KEY}"
             )));
         }
+        let deps = related::checked_entries(
+            RelatedField::Dependencies,
+            Some(*commit),
+            related::entries_of(&commit_obj.related),
+        )?;
+        related::check_order(Some(*commit), deps.iter().map(|(name, _)| name.as_str()))?;
+        related::check_dependencies(txn, Some(*commit), &deps).await?;
         let dir = self
             .composefs_commit_model(&commit_obj, ComposefsOptions::RECORDED.verity.into())
             .await?;

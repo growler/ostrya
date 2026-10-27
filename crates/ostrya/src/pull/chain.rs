@@ -1002,6 +1002,7 @@ mod tests {
             body: None,
             timestamp: Some(timestamp),
             metadata: None,
+            related: Vec::new(),
         };
         let commit = txn.write_commit(options, &root).await.unwrap();
         txn.commit().await.unwrap();

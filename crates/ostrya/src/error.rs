@@ -513,6 +513,26 @@ pub enum Error {
     ///   an entry with an empty name or with a checksum that is not 32 bytes,
     ///   and for an `ostrya.related` value that is not a variant of type
     ///   `a(say)`. `commit` is the commit that the call reads.
+    /// - [`Repo::write_commit_detached_metadata`](crate::Repo::write_commit_detached_metadata),
+    ///   and [`Transaction::commit`](crate::Transaction::commit) for a dict
+    ///   that
+    ///   [`Transaction::set_commit_detached_metadata`](crate::Transaction::set_commit_detached_metadata)
+    ///   queued, for an `ostrya.related` entry of the dict with one of these
+    ///   defects. `commit` is the commit of the dict.
+    /// - [`Repo::add_detached_related`](crate::Repo::add_detached_related) and
+    ///   [`Transaction::add_detached_related`](crate::Transaction::add_detached_related),
+    ///   for an empty name. `commit` is the commit that gets the build
+    ///   source.
+    /// - [`Repo::add_detached_related`](crate::Repo::add_detached_related),
+    ///   and [`Transaction::commit`](crate::Transaction::commit) for an add
+    ///   that
+    ///   [`Transaction::add_detached_related`](crate::Transaction::add_detached_related)
+    ///   queued, for a stored `ostrya.related` value with one of these
+    ///   defects. `commit` is the commit that gets the build source.
+    ///
+    /// [`Repo::prune`](crate::Repo::prune) gives a
+    /// [`RelatedWarning`](crate::RelatedWarning) with the same text in place
+    /// of this error, and continues.
     #[error(
         "related commits in {field}{}: {reason}",
         .commit.map(|c| format!(" of commit {c}")).unwrap_or_default()

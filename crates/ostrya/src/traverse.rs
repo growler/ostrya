@@ -19,6 +19,7 @@ use rustix::io::Errno;
 use crate::error::{Error, Result};
 use crate::pull::drive::Slots;
 use crate::refs::walk_ref_dir;
+use crate::related::{self, RelatedField, RelatedWarning};
 use crate::repo::Repo;
 
 /// The GVariant type of a value of a GC anchor key that is an array of
@@ -141,8 +142,8 @@ pub(crate) struct ListedRef {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Arrival {
     /// An arrival at a root: a seed of the caller, or a commit that a
-    /// metadata-key edge names. The bound of the arrival is the bound of the
-    /// commit itself.
+    /// metadata-key edge or a related edge names. The bound of the arrival is
+    /// the bound of the commit itself.
     Root,
     /// An arrival over a `parent` edge with a depth bound. The bound of the
     /// arrival is the bound that the child had left.
@@ -240,8 +241,16 @@ pub(crate) struct GcRoots {
     ///
     /// The walk reads each entry with one of these keys, in the metadata and
     /// in the detached metadata of each commit that it expands. If the list
-    /// is empty, the walk reads no metadata.
+    /// is empty, the walk reads no entry for these keys.
     pub metadata_keys: Vec<String>,
+    /// `true` if the walk follows field 2 of a commit: the dependencies.
+    pub dependencies: bool,
+    /// `true` if the walk follows the `ostrya.related` entry of the detached
+    /// metadata of a commit: the build sources.
+    ///
+    /// The walk reads the detached metadata of a commit if this is `true` or
+    /// if [`metadata_keys`](GcRoots::metadata_keys) is not empty.
+    pub build_sources: bool,
     /// `true` if the walk follows the `parent` edge of a commit.
     pub traverse_parent: bool,
     /// `true` if the objects of the tree of a commit are reachable.
@@ -262,10 +271,12 @@ pub(crate) struct GcRoots {
 
 impl GcRoots {
     /// Returns the edges of the walk of the `ostree` command: the `parent`
-    /// edge, the trees, and no metadata-key edges.
+    /// edge, the trees, no metadata-key edges, and no related edges.
     fn parents_only() -> GcRoots {
         GcRoots {
             metadata_keys: Vec::new(),
+            dependencies: false,
+            build_sources: false,
             traverse_parent: true,
             traverse_tree: true,
             weak_roots: HashMap::new(),
@@ -385,6 +396,8 @@ impl Repo {
         }
         let bound = ParentBound::depth(max_depth);
         let mut reachable = HashSet::new();
+        // The walk follows no related edge, so it gives no warning.
+        let mut warnings = Vec::new();
         collect_reachable(
             self,
             vec![(*commit, bound, Arrival::Root)],
@@ -393,6 +406,7 @@ impl Repo {
             &HashSet::new(),
             None,
             &mut reachable,
+            &mut warnings,
         )
         .await?;
         Ok(reachable)
@@ -439,15 +453,20 @@ impl Repo {
     }
 
     /// Returns the name of each object that one of `roots` reaches over the
-    /// edges of `gc`.
+    /// edges of `gc`, and the warnings of the defective related values that
+    /// the walk read.
     ///
     /// The walk is the walk of
     /// [`traverse_reachable`](Repo::traverse_reachable), with an optional
-    /// `parent` edge and with the metadata-key edges.
+    /// `parent` edge, with the metadata-key edges, and with the related
+    /// edges.
     ///
     /// Each root has its own bound. So one walk can cut one branch to a depth
     /// and keep another branch in full. The walk seeds each commit that a
-    /// metadata-key edge names at `root_bound`.
+    /// metadata-key edge or a related edge names at `root_bound`.
+    ///
+    /// The warnings are sorted by commit and then by field, dependencies
+    /// first. The warnings of one field keep the order of its entries.
     ///
     /// `bounded_roots` names the commits whose bound belongs to the commit,
     /// and not to the path that reached it. The walk drops each `parent`-edge
@@ -460,6 +479,11 @@ impl Repo {
     /// `pending_delete`, the result is the result of a walk of the store after
     /// the unlink. The name of the commit is reachable, and nothing below it
     /// is.
+    ///
+    /// `listing` is the listing of the loose objects that the caller took
+    /// under the exclusive repository lock, and the caller holds that lock
+    /// during the walk. The walk reads the `.commitmeta` of a commit only if
+    /// `listing` holds it.
     pub(crate) async fn traverse_reachable_gc(
         &self,
         roots: impl IntoIterator<Item = (Checksum, ParentBound)>,
@@ -467,8 +491,13 @@ impl Repo {
         gc: &GcRoots,
         bounded_roots: &HashSet<Checksum>,
         pending_delete: Option<Checksum>,
-    ) -> Result<HashSet<ObjectName>> {
-        walk_reachable_gc(self, roots, root_bound, gc, bounded_roots, pending_delete).await
+        listing: &HashSet<ObjectName>,
+    ) -> Result<(HashSet<ObjectName>, Vec<RelatedWarning>)> {
+        let store = ListedLoose {
+            repo: self,
+            listing,
+        };
+        walk_reachable_gc(&store, roots, root_bound, gc, bounded_roots, pending_delete).await
     }
 
     /// Adds the names of one tree to `seen` and `out`.
@@ -623,6 +652,48 @@ pub(crate) trait MetadataSource: Sync {
     fn max_reads(&self) -> usize {
         1
     }
+
+    /// Returns the detached metadata dict of the commit `commit`, or `None`
+    /// if the store holds no `.commitmeta` for it or holds the zero-length
+    /// marker.
+    ///
+    /// The default reads the object with
+    /// [`load_metadata`](MetadataSource::load_metadata) and parses it on the
+    /// blocking pool. [`Repo`] reads and parses the file in one trip to the
+    /// blocking pool.
+    fn load_detached(
+        &self,
+        commit: Checksum,
+    ) -> impl Future<Output = Result<Option<Value>>> + Send {
+        async move {
+            match self.load_metadata(ObjectType::CommitMeta, commit).await? {
+                Some(bytes) => {
+                    ostrya_rt::unblock(move || crate::commit::parse_detached_metadata(&bytes)).await
+                }
+                None => Ok(None),
+            }
+        }
+    }
+
+    /// Returns the bytes of the commit object `commit` and its detached
+    /// metadata dict, or `None` if the store does not hold the commit.
+    ///
+    /// The detached metadata is the value that
+    /// [`load_detached`](MetadataSource::load_detached) gives. The default
+    /// calls [`load_metadata`](MetadataSource::load_metadata) and then
+    /// `load_detached`. [`Repo`] reads the two files and parses the detached
+    /// metadata in one trip to the blocking pool.
+    fn load_commit_with_detached(
+        &self,
+        commit: Checksum,
+    ) -> impl Future<Output = Result<Option<(Vec<u8>, Option<Value>)>>> + Send {
+        async move {
+            let Some(bytes) = self.load_metadata(ObjectType::Commit, commit).await? else {
+                return Ok(None);
+            };
+            Ok(Some((bytes, self.load_detached(commit).await?)))
+        }
+    }
 }
 
 impl MetadataSource for Repo {
@@ -632,6 +703,73 @@ impl MetadataSource for Repo {
             Err(Error::ObjectNotFound { .. }) => Ok(None),
             Err(e) => Err(e),
         }
+    }
+
+    async fn load_detached(&self, commit: Checksum) -> Result<Option<Value>> {
+        self.read_commit_detached_metadata(&commit).await
+    }
+
+    async fn load_commit_with_detached(
+        &self,
+        commit: Checksum,
+    ) -> Result<Option<(Vec<u8>, Option<Value>)>> {
+        match self.load_commit_and_detached(&commit).await {
+            Ok(loaded) => Ok(Some(loaded)),
+            Err(Error::ObjectNotFound {
+                ty: ObjectType::Commit,
+                ..
+            }) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// The loose objects of a [`Repo`], with the listing of the objects that the
+/// caller of the walk took.
+///
+/// A prune takes the listing under the exclusive repository lock and holds
+/// that lock during the walk. Each writer of a `.commitmeta` file takes the
+/// shared repository lock. So a `.commitmeta` that the listing does not hold
+/// is absent, and the source opens no file for it. Each other read goes to
+/// the [`Repo`]. If `[core] locking` is false, no lock orders the walk and a
+/// writer, as for each other object of the prune.
+struct ListedLoose<'a> {
+    repo: &'a Repo,
+    listing: &'a HashSet<ObjectName>,
+}
+
+impl ListedLoose<'_> {
+    /// Returns `true` if the listing holds the `.commitmeta` of `commit`.
+    fn has_detached(&self, commit: Checksum) -> bool {
+        self.listing
+            .contains(&ObjectName::new(commit, ObjectType::CommitMeta))
+    }
+}
+
+impl MetadataSource for ListedLoose<'_> {
+    async fn load_metadata(&self, ty: ObjectType, checksum: Checksum) -> Result<Option<Vec<u8>>> {
+        if ty == ObjectType::CommitMeta && !self.has_detached(checksum) {
+            return Ok(None);
+        }
+        self.repo.load_metadata(ty, checksum).await
+    }
+
+    async fn load_detached(&self, commit: Checksum) -> Result<Option<Value>> {
+        if !self.has_detached(commit) {
+            return Ok(None);
+        }
+        self.repo.load_detached(commit).await
+    }
+
+    async fn load_commit_with_detached(
+        &self,
+        commit: Checksum,
+    ) -> Result<Option<(Vec<u8>, Option<Value>)>> {
+        if !self.has_detached(commit) {
+            let bytes = self.repo.load_metadata(ObjectType::Commit, commit).await?;
+            return Ok(bytes.map(|bytes| (bytes, None)));
+        }
+        self.repo.load_commit_with_detached(commit).await
     }
 }
 
@@ -646,7 +784,8 @@ pub(crate) async fn walk_reachable<S: MetadataSource>(
     max_depth: i32,
 ) -> Result<HashSet<ObjectName>> {
     let bound = ParentBound::depth(max_depth);
-    walk_reachable_gc(
+    // The walk follows no related edge, so it gives no warning.
+    let (reachable, _) = walk_reachable_gc(
         store,
         roots.into_iter().map(|c| (c, bound)),
         bound,
@@ -654,14 +793,16 @@ pub(crate) async fn walk_reachable<S: MetadataSource>(
         &HashSet::new(),
         None,
     )
-    .await
+    .await?;
+    Ok(reachable)
 }
 
 /// Returns the name of each object of `store` that one of `roots` reaches
-/// over the edges of `gc`.
+/// over the edges of `gc`, and the warnings of the defective related values
+/// that the walk read.
 ///
 /// The walk is the walk of [`Repo::traverse_reachable_gc`], and the
-/// arguments have the same meaning.
+/// arguments and the result have the same meaning.
 pub(crate) async fn walk_reachable_gc<S: MetadataSource>(
     store: &S,
     roots: impl IntoIterator<Item = (Checksum, ParentBound)>,
@@ -669,12 +810,13 @@ pub(crate) async fn walk_reachable_gc<S: MetadataSource>(
     gc: &GcRoots,
     bounded_roots: &HashSet<Checksum>,
     pending_delete: Option<Checksum>,
-) -> Result<HashSet<ObjectName>> {
+) -> Result<(HashSet<ObjectName>, Vec<RelatedWarning>)> {
     let seeds = roots
         .into_iter()
         .map(|(c, bound)| (c, bound, Arrival::Root))
         .collect();
     let mut reachable = HashSet::new();
+    let mut warnings = Vec::new();
     collect_reachable(
         store,
         seeds,
@@ -683,9 +825,14 @@ pub(crate) async fn walk_reachable_gc<S: MetadataSource>(
         bounded_roots,
         pending_delete,
         &mut reachable,
+        &mut warnings,
     )
     .await?;
-    Ok(reachable)
+    // The walk reads the commits in an order that depends on the order of
+    // the roots. The sort is stable, so the warnings of one field keep the
+    // order of its entries.
+    warnings.sort_by_key(|w| (w.commit, w.field == RelatedField::BuildSources));
+    Ok((reachable, warnings))
 }
 
 /// Adds to `reachable` the name of each object that `seeds` reach.
@@ -729,13 +876,35 @@ pub(crate) async fn walk_reachable_gc<S: MetadataSource>(
 /// same commit still keeps it. The walk memoizes the rejection, so a second
 /// child that arrives under the same bound reads no commit.
 ///
-/// The walk seeds each commit that a metadata-key edge names at
-/// `root_bound`. Each such seed is the same entry, so the walk pushes it
-/// at the first edge alone. The walk reads the commit `pending_delete`
-/// names as absent.
+/// The walk seeds each commit that a metadata-key edge or a related edge
+/// names at `root_bound`. Each such seed is the same entry, so the walk
+/// pushes it at the first edge alone. One set of seeded commits serves the
+/// metadata-key edges and the two related fields. The walk reads the commit
+/// `pending_delete` names as absent.
+///
+/// The walk reads the edges other than `parent` one time for each commit, at
+/// its first expansion. A later expansion follows more parents, and the
+/// seeds of the edges are the same. The related edges are:
+///
+/// - With `gc.dependencies`, the entries of field 2. The walk reads field 2
+///   of each commit that it reaches, a dependency included.
+/// - With `gc.build_sources`, the entries of the first `ostrya.related` entry
+///   of the detached metadata. The walk reads it for each commit that it
+///   reaches, a build source included.
+///
+/// A defective related value or entry adds one warning to `warnings` and
+/// seeds nothing. The other entries of the field seed as usual. A related
+/// entry that names a commit that the store does not hold seeds a commit
+/// that adds its own name alone. The walk reads the detached metadata one
+/// time for the build sources and the metadata-key edges together. Unless
+/// the arrival is over a `parent` edge under a timestamp bound, it reads the
+/// detached metadata with the commit in one call of
+/// [`load_commit_with_detached`](MetadataSource::load_commit_with_detached).
+/// A `.commitmeta` that does not parse stops the walk with an error.
 ///
 /// The walk reads the commits one at a time. It walks the tree of a commit
 /// with [`walk_tree`] before it reads the next commit.
+#[allow(clippy::too_many_arguments)]
 async fn collect_reachable<S: MetadataSource>(
     store: &S,
     seeds: Vec<(Checksum, ParentBound, Arrival)>,
@@ -744,6 +913,7 @@ async fn collect_reachable<S: MetadataSource>(
     bounded_roots: &HashSet<Checksum>,
     pending_delete: Option<Checksum>,
     reachable: &mut HashSet<ObjectName>,
+    warnings: &mut Vec<RelatedWarning>,
 ) -> Result<()> {
     let mut commit_stack = seeds;
     let mut seen_commits: HashMap<Checksum, Expanded> = HashMap::new();
@@ -752,9 +922,16 @@ async fn collect_reachable<S: MetadataSource>(
     // matches `weak_roots` again when the walk pops it. This set stops the
     // walk from a second push of the seed.
     let mut weak_seeded: HashSet<Checksum> = HashSet::new();
-    // The commits for which a metadata-key edge pushed a seed. A second
-    // edge to the same commit pushes the same entry, which adds nothing.
-    let mut anchor_seeded: HashSet<Checksum> = HashSet::new();
+    // The commits for which a metadata-key edge or a related edge pushed a
+    // seed. A second edge to the same commit pushes the same entry, which
+    // adds nothing.
+    let mut seeded: HashSet<Checksum> = HashSet::new();
+    // The commits whose edges other than `parent` the walk read. The walk
+    // adds a commit when it reads them, so an arrival that the timestamp
+    // bound rejects reads nothing and adds nothing.
+    let mut edges_read: HashSet<Checksum> = HashSet::new();
+    let reads_detached = gc.build_sources || !gc.metadata_keys.is_empty();
+    let reads_edges = gc.dependencies || reads_detached;
 
     while let Some((commit_checksum, bound, arrival)) = commit_stack.pop() {
         // When the walk reaches the commit of a weak ref over any edge,
@@ -800,8 +977,24 @@ async fn collect_reachable<S: MetadataSource>(
             continue;
         }
 
+        // At the first expansion of a commit, the walk reads the detached
+        // metadata with the commit, in one read of the store. A `TimedParent`
+        // arrival can be rejected, so it reads the commit alone, and the
+        // walk reads the detached metadata after the bound accepts it.
+        let mut prefetched: Option<Option<Value>> = None;
         let loaded = if pending_delete == Some(commit_checksum) {
             None
+        } else if reads_detached
+            && arrival != Arrival::TimedParent
+            && !edges_read.contains(&commit_checksum)
+        {
+            match store.load_commit_with_detached(commit_checksum).await? {
+                Some((bytes, detached)) => {
+                    prefetched = Some(detached);
+                    Some(Commit::parse(&bytes)?)
+                }
+                None => None,
+            }
         } else {
             try_load_commit(store, &commit_checksum).await?
         };
@@ -837,17 +1030,47 @@ async fn collect_reachable<S: MetadataSource>(
             walk_tree(store, commit.root_dirtree, &mut seen_dirtrees, reachable).await?;
         }
 
-        if !gc.metadata_keys.is_empty() {
-            push_metadata_key_edges(
-                store,
-                &commit_checksum,
-                &commit.metadata,
-                gc,
-                root_bound,
-                &mut anchor_seeded,
-                &mut commit_stack,
-            )
-            .await?;
+        if reads_edges && edges_read.insert(commit_checksum) {
+            let mut push = |target: Checksum| {
+                if seeded.insert(target) {
+                    commit_stack.push((target, root_bound, Arrival::Root));
+                }
+            };
+            if gc.dependencies {
+                let (targets, defects) =
+                    related::split_entries(related::entries_of(&commit.related));
+                warnings.extend(defects.into_iter().map(|reason| RelatedWarning {
+                    commit: commit_checksum,
+                    field: RelatedField::Dependencies,
+                    reason,
+                }));
+                targets.into_iter().for_each(&mut push);
+            }
+            if reads_detached {
+                let detached = match prefetched {
+                    Some(detached) => detached,
+                    None => store.load_detached(commit_checksum).await?,
+                };
+                if gc.build_sources {
+                    let (targets, defects) = match related::build_sources(detached.as_ref()) {
+                        Ok(entries) => related::split_entries(entries.unwrap_or_default()),
+                        Err(reason) => (Vec::new(), vec![reason]),
+                    };
+                    warnings.extend(defects.into_iter().map(|reason| RelatedWarning {
+                        commit: commit_checksum,
+                        field: RelatedField::BuildSources,
+                        reason,
+                    }));
+                    targets.into_iter().for_each(&mut push);
+                }
+                push_metadata_key_edges(
+                    &commit_checksum,
+                    &commit.metadata,
+                    detached.as_ref(),
+                    gc,
+                    &mut push,
+                )?;
+            }
         }
 
         if gc.traverse_parent
@@ -939,41 +1162,29 @@ async fn walk_tree<S: MetadataSource>(
 /// of the commit before its detached metadata, then the order of the
 /// entries in the dict, then the order of the elements in the value.
 ///
-/// The function pushes a commit only if `seeded` does not hold it, and
-/// adds the commit to `seeded`. It decodes each value also when it pushes
-/// no commit, so the errors stay the same.
+/// The function gives `push` each commit that a value names. `push` seeds
+/// a commit at its first edge alone. The function decodes each value also
+/// when `push` seeds no commit, so the errors stay the same.
 ///
-/// The function reads the detached metadata once for each expansion of a
-/// commit, and only if the walk has metadata keys. The walk can reach a
-/// commit again at a depth that follows more parents. It then expands the
-/// commit a second time and reads the detached metadata again.
-async fn push_metadata_key_edges<S: MetadataSource>(
-    store: &S,
+/// `detached` is the detached metadata of the commit, which the caller read
+/// one time for these edges and for the build sources. The walk calls the
+/// function at the first expansion of a commit alone.
+fn push_metadata_key_edges(
     commit: &Checksum,
     metadata: &Value,
+    detached: Option<&Value>,
     gc: &GcRoots,
-    root_bound: ParentBound,
-    seeded: &mut HashSet<Checksum>,
-    stack: &mut Vec<(Checksum, ParentBound, Arrival)>,
+    push: &mut impl FnMut(Checksum),
 ) -> Result<()> {
-    let detached = match store.load_metadata(ObjectType::CommitMeta, *commit).await? {
-        Some(bytes) => {
-            ostrya_rt::unblock(move || crate::commit::parse_detached_metadata(&bytes)).await?
-        }
-        None => None,
-    };
     for key in &gc.metadata_keys {
-        for source in [Some(metadata), detached.as_ref()].into_iter().flatten() {
+        for source in [Some(metadata), detached].into_iter().flatten() {
             for value in dict_values(source, key) {
-                for_each_metadata_key_target(value, |target| {
-                    if seeded.insert(target) {
-                        stack.push((target, root_bound, Arrival::Root));
+                for_each_metadata_key_target(value, &mut *push).map_err(|reason| {
+                    Error::InvalidGcRoot {
+                        commit: *commit,
+                        metadata_key: key.clone(),
+                        reason,
                     }
-                })
-                .map_err(|reason| Error::InvalidGcRoot {
-                    commit: *commit,
-                    metadata_key: key.clone(),
-                    reason,
                 })?;
             }
         }

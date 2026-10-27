@@ -167,7 +167,9 @@
 //!   names, and, unless the roots are on the refs alone, each commit of the
 //!   listing. The objects that the run keeps are the objects that a local
 //!   prune keeps with the same options, refs, and objects, and the objects
-//!   of the commits of the summary. Unless the roots are on the refs alone,
+//!   of the commits of the summary. The run reads neither related field of
+//!   a commit, so it deletes a related commit that no other root reaches,
+//!   which a local prune keeps. Unless the roots are on the refs alone,
 //!   the run also deletes the detached metadata and the composefs image of
 //!   a parent commit that the listing does not hold.
 //! - The walk reads each commit and dirtree that it reaches, and checks

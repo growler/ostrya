@@ -75,7 +75,8 @@ const KEY_CHECK_GROUP: &str = "remote";
 /// - [`Repo::regenerate_summary`], [`Repo::regenerate_summaries`],
 ///   [`Repo::sign_summary`], [`Repo::sign_summary_all`], and the `summary`
 ///   and `summary.sig` writes of a mirror pull.
-/// - [`Repo::write_commit_detached_metadata`], [`Repo::sign_commit`], and
+/// - [`Repo::write_commit_detached_metadata`],
+///   [`Repo::add_detached_related`], [`Repo::sign_commit`], and
 ///   [`Repo::delete_signatures`].
 ///
 /// If `[core] locking` is on, [`Repo::prune`] also waits for the guard,

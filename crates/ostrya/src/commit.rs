@@ -7,6 +7,7 @@
 //!   metadata of a commit.
 //! - [`Repo::read_commit_related`] reads the related commits of a commit:
 //!   the dependencies and the build sources.
+//! - [`Repo::add_detached_related`] adds a build source to a commit.
 
 use std::collections::HashMap;
 use std::os::fd::{AsFd, BorrowedFd};
@@ -72,8 +73,8 @@ pub struct CommitOptions {
     /// in the repository or in the writing transaction, and must have no
     /// dependency of its own. [`Transaction::write_commit`] states the rule.
     ///
-    /// A prune does not read field 2. A dependency stays only if a ref or
-    /// another root of the prune keeps it.
+    /// A local prune keeps the dependencies of each commit that it reaches.
+    /// [`Repo::prune`], "Related commits", states the rules.
     pub related: Vec<(String, Checksum)>,
 }
 
@@ -571,12 +572,27 @@ impl Repo {
     /// call checks before it takes a lock. On a refusal the `.commitmeta` file
     /// stays as it was.
     ///
+    /// # Build sources
+    ///
+    /// The key `ostrya.related` holds the build sources of the commit. The
+    /// call checks each entry with this key, also when the key occurs more
+    /// than one time. The value must be a variant of type `a(say)`, and each
+    /// element must have a name that is not empty and a checksum of 32 bytes.
+    /// The call accepts elements that are not sorted, two elements with the
+    /// same name, and a checksum of a commit that the repository does not
+    /// hold. It checks after the GC anchor keys and before it takes a lock.
+    /// On a refusal the `.commitmeta` file stays as it was.
+    ///
     /// # Errors
     ///
     /// - [`Error::InvalidGcAnchor`] if an entry of `meta` gives a key of
     ///   `[ex-ostrya] gc-root-metadata-keys` a value that a prune refuses.
     /// - [`Error::Core`] if `meta` holds at least one entry and `[ex-ostrya]
     ///   gc-root-metadata-keys` holds a malformed escape sequence.
+    /// - [`Error::InvalidRelated`] with `checksum` and
+    ///   [`RelatedField::BuildSources`] if an `ostrya.related` entry of `meta`
+    ///   is not a variant of type `a(say)`, or if one of its elements has an
+    ///   empty name or a checksum that is not 32 bytes.
     /// - [`Error::LockTimeout`] if the wait for a lock passes `[core]
     ///   lock-timeout-secs`. Each of the two waits gets the full timeout.
     /// - [`Error::Core`] if `meta` is not an `a{sv}` dict value.
@@ -593,6 +609,9 @@ impl Repo {
         meta: Option<&Value>,
     ) -> Result<()> {
         check_gc_anchors(self.config(), meta)?;
+        if let Some(meta) = meta {
+            related::check_detached(checksum, meta)?;
+        }
         let bytes = match meta {
             Some(value) => {
                 let ty = Type::parse(METADATA_SIGNATURE).map_err(ostrya_core::Error::from)?;
@@ -615,6 +634,113 @@ impl Repo {
             )
         })
         .await
+    }
+
+    /// Adds the build source `name` with the checksum `source` to the commit
+    /// `commit`.
+    ///
+    /// The build sources of a commit are the entries of the key
+    /// `ostrya.related` in its detached metadata, a variant of type `a(say)`.
+    /// Each entry is a name and the checksum of a commit. The name has the
+    /// form `<class>/<name>` by convention, for example `layer/base`. The
+    /// call checks nothing else in the name. It does not check that the
+    /// repository holds `source`. A build source can name build sources of
+    /// its own, and the add can make a cycle.
+    ///
+    /// The call edits the first `ostrya.related` entry of the detached
+    /// metadata. It replaces the element with the name `name`, or adds a new
+    /// one, and sorts the elements by name in byte order. If the detached
+    /// metadata has no such entry, the call appends one after the other
+    /// entries. If the commit has no detached metadata, the call writes a new
+    /// dict with the one entry. Each other entry stays as it is. The new
+    /// file replaces the old file atomically.
+    ///
+    /// A local prune keeps the build sources of each commit that it reaches.
+    /// [`Repo::prune`], "Related commits", states the rules.
+    ///
+    /// # Locks
+    ///
+    /// The call takes the repository lock as
+    /// [`Shared`](crate::LockKind::Shared) and the update lock, as
+    /// [`sign_commit`](Repo::sign_commit) does. Under both locks, it checks
+    /// that the repository holds the commit object, reads the dict, adds the
+    /// entry, and writes the file. A prune takes the repository lock as
+    /// [`Exclusive`](crate::LockKind::Exclusive), so it cannot delete the
+    /// commit between the check and the write. If the caller holds an
+    /// [`UpdateGuard`](crate::UpdateGuard) of this repository, the call waits
+    /// for that guard.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidRelated`] with `commit` and
+    ///   [`RelatedField::BuildSources`] if `name` is empty. The call refuses
+    ///   it before it reads anything.
+    /// - [`Error::ObjectNotFound`] if the repository does not hold the commit
+    ///   object. The call writes no file.
+    /// - [`Error::InvalidRelated`] with `commit` and
+    ///   [`RelatedField::BuildSources`] if the stored value of the first
+    ///   `ostrya.related` entry is not a variant of type `a(say)`, or if one
+    ///   of its elements has an empty name or a checksum that is not 32
+    ///   bytes. The `.commitmeta` file stays as it was.
+    /// - [`Error::LockTimeout`] if the wait for a lock passes `[core]
+    ///   lock-timeout-secs`. Each of the two waits gets the full timeout.
+    /// - [`Error::Core`] if `[core] fsync` or `[core] locking` is not a
+    ///   boolean, or if `[core] lock-timeout-secs` is not an integer.
+    /// - [`Error::Core`] if the `.commitmeta` file does not parse as an
+    ///   `a{sv}` dict.
+    /// - [`Error::InvalidFormat`] if `[core] lock-timeout-secs` is less than
+    ///   `-1`.
+    /// - [`Error::Io`] if the `.commitmeta` file is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
+    /// - [`Error::Io`] with `EXDEV` if `tmp/` and `objects/` are on different
+    ///   file systems.
+    /// - [`Error::Io`] if another file system operation fails.
+    pub async fn add_detached_related(
+        &self,
+        commit: &Checksum,
+        name: &str,
+        source: &Checksum,
+    ) -> Result<()> {
+        if name.is_empty() {
+            return Err(empty_build_source_name(commit));
+        }
+        let fsync = self.config().fsync()?;
+        let repo_mode = self.mode();
+        let checksum = *commit;
+        let related = vec![(name.to_owned(), *source)];
+        self.write_locked(move |repo| {
+            // A prune takes the exclusive lock, so the commit stays until the
+            // write ends.
+            if !repo.has_object_blocking(ObjectType::Commit, &checksum)? {
+                return Err(Error::ObjectNotFound {
+                    checksum,
+                    ty: ObjectType::Commit,
+                });
+            }
+            let tmp_fd = open_tmp_dir(repo.repo_fd(), repo_mode)?;
+            merge_detached_blocking(
+                tmp_fd.as_fd(),
+                repo.objects_fd(),
+                &checksum,
+                None,
+                None,
+                related,
+                Vec::new(),
+                fsync,
+                repo_mode,
+            )
+        })
+        .await
+    }
+}
+
+/// Returns the refusal of a build source with an empty name, for the commit
+/// `commit`.
+pub(crate) fn empty_build_source_name(commit: &Checksum) -> Error {
+    Error::InvalidRelated {
+        commit: Some(*commit),
+        field: RelatedField::BuildSources,
+        reason: "the new entry has an empty name".into(),
     }
 }
 
@@ -697,8 +823,11 @@ pub(crate) fn append_dict_entry(metadata: &mut Value, key: &str, value: Value) -
 /// If `merge` is given, it holds a serialized `a{sv}` dict and a list of
 /// keys. The call merges that dict into the base dict with a union of each
 /// signature list. The listed keys keep the value that the base dict holds.
+/// Next, each entry of `build_sources` adds one build source to the first
+/// `ostrya.related` entry, in order, as [`Repo::add_detached_related`] states.
 /// Then each entry of `appends` appends one signature to the `aay` array of
-/// its engine, in order. The result replaces the file atomically.
+/// its engine, in order. The result replaces the file atomically. If a step
+/// fails, the file stays as it was.
 ///
 /// The read, the merge, and the write run as one step under
 /// [`DETACHED_MERGE`], for this edit only. Because the guard covers one edit,
@@ -711,6 +840,7 @@ pub(crate) fn merge_detached_blocking(
     checksum: &Checksum,
     replace: Option<Value>,
     merge: Option<(Vec<u8>, Vec<String>)>,
+    build_sources: Vec<(String, Checksum)>,
     appends: Vec<(String, Vec<u8>)>,
     fsync: bool,
     repo_mode: RepoMode,
@@ -730,6 +860,9 @@ pub(crate) fn merge_detached_blocking(
             },
             _ => base.unwrap_or_else(|| Value::Array(Vec::new())),
         };
+        for (name, source) in build_sources {
+            related::add_build_source(&mut dict, checksum, &name, &source)?;
+        }
         for (key, signature) in appends {
             crate::sign::append_signature(&mut dict, &key, signature)?;
         }

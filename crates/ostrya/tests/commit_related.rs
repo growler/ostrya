@@ -5,8 +5,11 @@
 //! defective, not complete, or nested. `Transaction::check_related` runs the
 //! same checks before a tree is built. `Repo::commit_add_composefs_metadata`
 //! keeps field 2 and applies the same check. `Repo::read_commit_related`
-//! reads field 2 and the detached key `ostrya.related`. The `ostree` command
-//! has no counterpart, so the tests use ostrya alone.
+//! reads field 2 and the detached key `ostrya.related`.
+//! `Repo::add_detached_related` and `Transaction::add_detached_related` add
+//! a build source, and the detached metadata writes check the value of
+//! `ostrya.related`. The `ostree` command has no counterpart, so the tests
+//! use ostrya alone.
 
 mod common;
 
@@ -15,8 +18,8 @@ use std::path::Path;
 use common::{TmpDir, file_inventory};
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CommitRelated, CreateOptions,
-    DictBuilder, Error, MutableTree, ObjectType, RelatedField, Repo, RepoMode, RepoTree,
-    Transaction, Type, Value,
+    DictBuilder, DummySigner, Error, MutableTree, ObjectType, PullOptions, RelatedField, Repo,
+    RepoMode, RepoTree, Transaction, Type, Value,
 };
 use ostrya_rt::block_on;
 
@@ -165,6 +168,38 @@ fn related_error(err: Error) -> (Option<Checksum>, RelatedField, String) {
         } => (commit, field, reason),
         other => panic!("expected InvalidRelated, got {other:?}"),
     }
+}
+
+/// Writes `meta` as the `.commitmeta` of `commit` with no check, as a write
+/// out of band does.
+fn write_raw_detached(repo: &Repo, commit: &Checksum, meta: &Value) {
+    let bytes = ostrya_core::to_bytes(&Type::parse("a{sv}").unwrap(), meta).unwrap();
+    let path = repo.path().join("objects").join(ostrya::loose_path(
+        commit,
+        ObjectType::CommitMeta,
+        repo.mode(),
+    ));
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    std::fs::write(path, bytes).unwrap();
+}
+
+/// Returns the keys of the detached metadata of `commit`, in stored order.
+async fn detached_keys(repo: &Repo, commit: &Checksum) -> Vec<String> {
+    let dict = repo
+        .read_commit_detached_metadata(commit)
+        .await
+        .unwrap()
+        .expect("the commit has detached metadata");
+    dict.as_array()
+        .unwrap()
+        .iter()
+        .map(|entry| entry.as_tuple().unwrap()[0].as_str().unwrap().to_owned())
+        .collect()
+}
+
+/// Returns an `s` value.
+fn string(text: &str) -> (Type, Value) {
+    (Type::parse("s").unwrap(), Value::Str(text.to_owned()))
 }
 
 /// Returns the regular files and symlinks under `objects/` of `repo`.
@@ -575,10 +610,10 @@ fn read_commit_related_refuses_a_defective_build_source_value() {
             (sources(&[("", &[0x55; 32])]), "entry 0 has an empty name"),
         ];
         for (value, expected) in cases {
+            // The detached metadata writes refuse the value, so the test
+            // writes the file out of band.
             let meta = dict(vec![(RELATED_KEY, value)]);
-            repo.write_commit_detached_metadata(&head, Some(&meta))
-                .await
-                .unwrap();
+            write_raw_detached(&repo, &head, &meta);
             let err = repo.read_commit_related(&head).await.unwrap_err();
             assert_eq!(
                 err.to_string(),
@@ -647,5 +682,402 @@ fn read_commit_related_of_an_absent_commit() {
         let absent = Checksum::from_ay(&[0x77; 32]).unwrap();
         let err = repo.read_commit_related(&absent).await.unwrap_err();
         assert!(matches!(err, Error::ObjectNotFound { .. }), "got {err:?}");
+    });
+}
+
+#[test]
+fn add_detached_related_replaces_by_name_and_keeps_the_sort() {
+    let tmp = TmpDir::new("related-add-sort");
+    block_on(async {
+        let repo = repo_with_trees(tmp.path(), &["x", "y", "head"]).await;
+        let x = commit(&repo, tmp.path(), "x", &[]).await;
+        let y = commit(&repo, tmp.path(), "y", &[]).await;
+        let head = commit(&repo, tmp.path(), "head", &[]).await;
+        repo.write_commit_detached_metadata(&head, Some(&dict(vec![("test.note", string("n"))])))
+            .await
+            .unwrap();
+
+        repo.add_detached_related(&head, "z/x", &x).await.unwrap();
+        repo.add_detached_related(&head, "a/y", &y).await.unwrap();
+        assert_eq!(
+            repo.read_commit_related(&head).await.unwrap().build_sources,
+            owned(&[("a/y", y), ("z/x", x)])
+        );
+        // An add with a stored name replaces the entry.
+        repo.add_detached_related(&head, "z/x", &y).await.unwrap();
+        assert_eq!(
+            repo.read_commit_related(&head).await.unwrap().build_sources,
+            owned(&[("a/y", y), ("z/x", y)])
+        );
+        // The new key comes after the stored keys, and the other key stays.
+        assert_eq!(
+            detached_keys(&repo, &head).await,
+            ["test.note", RELATED_KEY]
+        );
+
+        // A commit with no detached metadata gets a dict with the one key. A
+        // checksum that the repository does not hold is accepted.
+        let absent = Checksum::from_ay(&[0x31; 32]).unwrap();
+        repo.add_detached_related(&x, "layer/gone", &absent)
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.read_commit_related(&x).await.unwrap().build_sources,
+            owned(&[("layer/gone", absent)])
+        );
+        assert_eq!(detached_keys(&repo, &x).await, [RELATED_KEY]);
+    });
+}
+
+#[test]
+fn add_detached_related_edits_the_first_key() {
+    let tmp = TmpDir::new("related-add-first-key");
+    block_on(async {
+        let repo = repo_with_trees(tmp.path(), &["src", "head"]).await;
+        let src = commit(&repo, tmp.path(), "src", &[]).await;
+        let head = commit(&repo, tmp.path(), "head", &[]).await;
+        let second = sources(&[("source/second", src.as_bytes())]);
+        let meta = dict(vec![
+            (RELATED_KEY, sources(&[("source/first", src.as_bytes())])),
+            (RELATED_KEY, second.clone()),
+        ]);
+        repo.write_commit_detached_metadata(&head, Some(&meta))
+            .await
+            .unwrap();
+        repo.add_detached_related(&head, "source/added", &src)
+            .await
+            .unwrap();
+        let expected = dict(vec![
+            (
+                RELATED_KEY,
+                sources(&[
+                    ("source/added", src.as_bytes()),
+                    ("source/first", src.as_bytes()),
+                ]),
+            ),
+            (RELATED_KEY, second),
+        ]);
+        assert_eq!(
+            repo.read_commit_detached_metadata(&head).await.unwrap(),
+            Some(expected)
+        );
+    });
+}
+
+#[test]
+fn add_detached_related_refuses_an_empty_name() {
+    let tmp = TmpDir::new("related-add-empty-name");
+    block_on(async {
+        let repo = repo_with_trees(tmp.path(), &["src", "head"]).await;
+        let src = commit(&repo, tmp.path(), "src", &[]).await;
+        let head = commit(&repo, tmp.path(), "head", &[]).await;
+        repo.add_detached_related(&head, "source/src", &src)
+            .await
+            .unwrap();
+        let before = objects(&repo);
+        let expected = (
+            Some(head),
+            RelatedField::BuildSources,
+            "the new entry has an empty name".to_owned(),
+        );
+        let err = repo
+            .add_detached_related(&head, "", &src)
+            .await
+            .unwrap_err();
+        assert_eq!(related_error(err), expected);
+        assert_eq!(objects(&repo), before, "the refused add writes nothing");
+
+        let txn = repo.transaction().await.unwrap();
+        let err = txn.add_detached_related(&head, "", &src).unwrap_err();
+        assert_eq!(related_error(err), expected);
+        txn.commit().await.unwrap();
+        assert_eq!(objects(&repo), before, "the refused add queues nothing");
+    });
+}
+
+#[test]
+fn add_detached_related_of_an_absent_commit() {
+    let tmp = TmpDir::new("related-add-absent");
+    block_on(async {
+        let repo = repo_with_trees(tmp.path(), &["src"]).await;
+        let src = commit(&repo, tmp.path(), "src", &[]).await;
+        let absent = Checksum::from_ay(&[0x77; 32]).unwrap();
+        let before = objects(&repo);
+        let err = repo
+            .add_detached_related(&absent, "source/src", &src)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::ObjectNotFound { checksum, ty: ObjectType::Commit } if checksum == absent),
+            "got {err:?}"
+        );
+        assert_eq!(objects(&repo), before);
+    });
+}
+
+#[test]
+fn add_detached_related_refuses_a_defective_stored_value() {
+    let tmp = TmpDir::new("related-add-defective");
+    block_on(async {
+        let repo = repo_with_trees(tmp.path(), &["src", "head"]).await;
+        let src = commit(&repo, tmp.path(), "src", &[]).await;
+        let head = commit(&repo, tmp.path(), "head", &[]).await;
+        let meta = dict(vec![(
+            RELATED_KEY,
+            sources(&[("source/short", &[0x55; 31])]),
+        )]);
+        write_raw_detached(&repo, &head, &meta);
+        let before = objects(&repo);
+        let expected = (
+            Some(head),
+            RelatedField::BuildSources,
+            "entry 0 (source/short) has a checksum of 31 bytes, not 32".to_owned(),
+        );
+
+        let err = repo
+            .add_detached_related(&head, "source/src", &src)
+            .await
+            .unwrap_err();
+        assert_eq!(related_error(err), expected);
+        assert_eq!(objects(&repo), before, "the refused add writes nothing");
+
+        // The queued add fails at the commit of the transaction. The commit
+        // writes no ref, and the file stays as it was.
+        let refs_before = refs(&repo);
+        let txn = repo.transaction().await.unwrap();
+        txn.add_detached_related(&head, "source/src", &src).unwrap();
+        txn.set_ref("main", Some(&head));
+        let err = txn.commit().await.unwrap_err();
+        assert_eq!(related_error(err), expected);
+        assert_eq!(objects(&repo), before);
+        assert_eq!(refs(&repo), refs_before, "the failed commit writes no ref");
+    });
+}
+
+#[test]
+fn transaction_add_detached_related_gives_the_result_of_the_repo_add() {
+    let tmp = TmpDir::new("related-add-txn");
+    block_on(async {
+        let repo = repo_with_trees(tmp.path(), &["x", "y", "one", "two"]).await;
+        let x = commit(&repo, tmp.path(), "x", &[]).await;
+        let y = commit(&repo, tmp.path(), "y", &[]).await;
+        let one = commit(&repo, tmp.path(), "one", &[]).await;
+        let two = commit(&repo, tmp.path(), "two", &[]).await;
+        let adds = [("z/x", x), ("a/y", y), ("z/x", y)];
+
+        for (name, source) in adds {
+            repo.add_detached_related(&one, name, &source)
+                .await
+                .unwrap();
+        }
+        let txn = repo.transaction().await.unwrap();
+        for (name, source) in adds {
+            txn.add_detached_related(&two, name, &source).unwrap();
+        }
+        txn.commit().await.unwrap();
+        assert_eq!(
+            repo.read_commit_detached_metadata(&two).await.unwrap(),
+            repo.read_commit_detached_metadata(&one).await.unwrap()
+        );
+        assert_eq!(
+            repo.read_commit_related(&two).await.unwrap().build_sources,
+            owned(&[("a/y", y), ("z/x", y)])
+        );
+    });
+}
+
+#[test]
+fn transaction_adds_apply_after_the_queued_dict_and_before_the_signatures() {
+    let tmp = TmpDir::new("related-add-txn-order");
+    block_on(async {
+        let repo = repo_with_trees(tmp.path(), &["src", "head"]).await;
+        let src = commit(&repo, tmp.path(), "src", &[]).await;
+        let head = commit(&repo, tmp.path(), "head", &[]).await;
+
+        let txn = repo.transaction().await.unwrap();
+        txn.set_commit_detached_metadata(&head, dict(vec![("test.note", string("n"))]));
+        txn.add_detached_related(&head, "source/src", &src).unwrap();
+        txn.sign_commit(&head, &DummySigner::new("key"))
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        let keys = detached_keys(&repo, &head).await;
+        assert_eq!(keys.len(), 3, "got {keys:?}");
+        assert_eq!(keys[..2], ["test.note", RELATED_KEY]);
+        assert_eq!(
+            repo.read_commit_related(&head).await.unwrap().build_sources,
+            owned(&[("source/src", src)])
+        );
+
+        // A queued dict after an add drops the add.
+        let txn = repo.transaction().await.unwrap();
+        txn.add_detached_related(&head, "source/other", &src)
+            .unwrap();
+        txn.set_commit_detached_metadata(&head, dict(vec![("test.note", string("m"))]));
+        txn.commit().await.unwrap();
+        assert_eq!(detached_keys(&repo, &head).await, ["test.note"]);
+        assert!(
+            repo.read_commit_related(&head)
+                .await
+                .unwrap()
+                .build_sources
+                .is_empty()
+        );
+    });
+}
+
+/// Returns the defective `ostrya.related` values of the write checks, each
+/// with the reason of its refusal.
+fn defective_values() -> Vec<((Type, Value), &'static str)> {
+    let strings = (
+        Type::parse("as").unwrap(),
+        Value::Array(vec![Value::Str("source/x".into())]),
+    );
+    vec![
+        (strings, "type is `as`, not `a(say)`"),
+        (
+            sources(&[("source/ok", &[0x55; 32]), ("source/x", &[0x55; 31])]),
+            "entry 1 (source/x) has a checksum of 31 bytes, not 32",
+        ),
+        (sources(&[("", &[0x55; 32])]), "entry 0 has an empty name"),
+    ]
+}
+
+#[test]
+fn write_commit_detached_metadata_checks_each_build_source_key() {
+    let tmp = TmpDir::new("related-write-check");
+    block_on(async {
+        let repo = repo_with_trees(tmp.path(), &["head"]).await;
+        let head = commit(&repo, tmp.path(), "head", &[]).await;
+        let stored = dict(vec![("test.note", string("n"))]);
+        repo.write_commit_detached_metadata(&head, Some(&stored))
+            .await
+            .unwrap();
+        let before = objects(&repo);
+        let valid = sources(&[("source/ok", &[0x55; 32])]);
+        for (value, reason) in defective_values() {
+            // The defect is in the first key, and then in a later key.
+            for meta in [
+                dict(vec![(RELATED_KEY, value.clone())]),
+                dict(vec![
+                    (RELATED_KEY, valid.clone()),
+                    (RELATED_KEY, value.clone()),
+                ]),
+            ] {
+                let err = repo
+                    .write_commit_detached_metadata(&head, Some(&meta))
+                    .await
+                    .unwrap_err();
+                assert_eq!(
+                    err.to_string(),
+                    format!("related commits in ostrya.related of commit {head}: {reason}")
+                );
+                assert_eq!(
+                    related_error(err),
+                    (Some(head), RelatedField::BuildSources, reason.to_owned())
+                );
+                assert_eq!(objects(&repo), before, "the refused write writes nothing");
+            }
+        }
+
+        // Entries that are not sorted, a name two times, and a checksum that
+        // the repository does not hold are accepted.
+        let accepted = dict(vec![(
+            RELATED_KEY,
+            sources(&[
+                ("source/b", &[0x55; 32]),
+                ("source/a", &[0x56; 32]),
+                ("source/b", &[0x57; 32]),
+            ]),
+        )]);
+        repo.write_commit_detached_metadata(&head, Some(&accepted))
+            .await
+            .unwrap();
+    });
+}
+
+#[test]
+fn a_queued_defective_dict_fails_the_commit() {
+    let tmp = TmpDir::new("related-queued-check");
+    block_on(async {
+        let repo = repo_with_trees(tmp.path(), &["head"]).await;
+        for (value, reason) in defective_values() {
+            let before = objects(&repo);
+            let refs_before = refs(&repo);
+            let txn = repo.transaction().await.unwrap();
+            let root = stage_tree(&txn, tmp.path(), "head").await;
+            let head = txn.write_commit(options("head", &[]), &root).await.unwrap();
+            txn.set_commit_detached_metadata(&head, dict(vec![(RELATED_KEY, value)]));
+            txn.set_ref("main", Some(&head));
+            let err = txn.commit().await.unwrap_err();
+            assert_eq!(
+                related_error(err),
+                (Some(head), RelatedField::BuildSources, reason.to_owned())
+            );
+            assert_eq!(
+                objects(&repo),
+                before,
+                "the refused commit publishes nothing"
+            );
+            assert_eq!(refs(&repo), refs_before, "the refused commit writes no ref");
+            assert!(staged(&repo).is_empty(), "the staging directory is removed");
+        }
+    });
+}
+
+#[test]
+fn a_signature_over_a_defective_value_takes_no_check() {
+    let tmp = TmpDir::new("related-sign-no-check");
+    block_on(async {
+        let repo = repo_with_trees(tmp.path(), &["head"]).await;
+        let head = commit(&repo, tmp.path(), "head", &[]).await;
+        let meta = dict(vec![(
+            RELATED_KEY,
+            sources(&[("source/short", &[0x55; 31])]),
+        )]);
+        write_raw_detached(&repo, &head, &meta);
+        repo.sign_commit(&head, &DummySigner::new("key"))
+            .await
+            .unwrap();
+        assert_eq!(detached_keys(&repo, &head).await.len(), 2);
+    });
+}
+
+#[test]
+fn a_local_pull_stores_a_defective_value() {
+    let tmp = TmpDir::new("related-pull-no-check");
+    block_on(async {
+        let src = repo_with_trees(tmp.path(), &["head"]).await;
+        let txn = src.transaction().await.unwrap();
+        let root = stage_tree(&txn, tmp.path(), "head").await;
+        let head = txn.write_commit(options("head", &[]), &root).await.unwrap();
+        txn.set_ref("main", Some(&head));
+        txn.commit().await.unwrap();
+        let meta = dict(vec![(
+            RELATED_KEY,
+            sources(&[("source/short", &[0x55; 31])]),
+        )]);
+        write_raw_detached(&src, &head, &meta);
+
+        let dst = Repo::create(
+            &tmp.path().join("dst"),
+            CreateOptions::new(RepoMode::Archive),
+        )
+        .await
+        .unwrap();
+        dst.pull_local(
+            &src,
+            PullOptions {
+                refs: vec!["main".to_owned()],
+                ..PullOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(dst.resolve_rev("main", false).await.unwrap(), Some(head));
+        assert_eq!(
+            dst.read_commit_detached_metadata(&head).await.unwrap(),
+            Some(meta)
+        );
     });
 }

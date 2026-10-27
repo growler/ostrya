@@ -1,13 +1,18 @@
 //! Removal of unreachable objects.
 //!
 //! [`Repo::prune`] walks from a set of roots and removes each loose object
-//! that the walk does not reach. If the three ostrya extensions of
-//! [`PruneOptions`] keep their defaults and the repository config does not set
-//! `[ex-ostrya] gc-root-metadata-keys`, a run does the same work as the
-//! `ostree prune` command, as observed.
+//! that the walk does not reach. The walk also keeps the related commits of
+//! each commit that it reaches: the dependencies and the build sources. If
+//! the three ostrya extensions of [`PruneOptions`] keep their defaults, the
+//! repository config does not set `[ex-ostrya] gc-root-metadata-keys`, and no
+//! reached commit names a related commit, a run deletes the same objects as
+//! the `ostree prune` command, as observed. The run also reads the
+//! `.commitmeta` of each commit that the walk reaches, and a `.commitmeta`
+//! that does not parse fails the run.
 //!
 //! - [`PruneOptions`] sets the roots, the bounds, and the dry run.
-//! - [`PruneStats`] holds the counts of a run and the refs that it deleted.
+//! - [`PruneStats`] holds the counts of a run, the refs that it deleted, and
+//!   the warnings of the defective related values that it read.
 //! - [`WeakRefFilter`] marks refs weak, so that a run can delete them.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
@@ -20,6 +25,7 @@ use rustix::io::Errno;
 
 use crate::error::{Error, Result};
 use crate::lock::LockKind;
+use crate::related::RelatedWarning;
 use crate::repo::Repo;
 use crate::tombstone::write_tombstone;
 use crate::traverse::{ListedRef, ParentBound, RefSpace, WeakBounds};
@@ -123,9 +129,16 @@ impl std::fmt::Debug for WeakRefFilter {
 ///   marks each ref strong or weak.
 ///
 /// The default of each one is the behavior without the option. A prune that
-/// keeps all three at their defaults does the same work as the `ostree`
-/// command, if the repository config does not set
-/// `[ex-ostrya] gc-root-metadata-keys`.
+/// keeps all three at their defaults deletes the same objects as the
+/// `ostree` command, if the repository config does not set
+/// `[ex-ostrya] gc-root-metadata-keys` and no commit that the run reaches
+/// names a related commit. The run also reads the `.commitmeta` of each
+/// commit that it reaches, and a `.commitmeta` that does not parse fails the
+/// run ([`Repo::prune`], "Related commits").
+///
+/// The roots on the related commits of a commit are also an ostrya
+/// extension, with no option. [`Repo::prune`], "Related commits", states
+/// them.
 #[derive(Debug, Clone)]
 pub struct PruneOptions {
     /// The switch that roots the walk on the refs alone.
@@ -153,6 +166,12 @@ pub struct PruneOptions {
     /// sweep removes each object that only this commit reached. The run unlinks
     /// the commit object after the walk succeeds. The counts cover only the
     /// swept objects, as the counts of the `ostree` command do.
+    ///
+    /// The run can delete a commit that the related field of another commit
+    /// names, as it can delete the parent of a commit. The entry then names a
+    /// commit that the repository does not hold, and a later run reads
+    /// nothing below it. The run also reads no related value of the deleted commit,
+    /// so the commits that only it named are swept.
     ///
     /// If [`no_prune`](PruneOptions::no_prune) is set, the commit stays, and
     /// the statistics report the sweep that its removal causes. The
@@ -247,8 +266,10 @@ pub struct PruneOptions {
     /// key from it.
     ///
     /// The list is empty by default. If this list and the config list are both
-    /// empty, the run reads no metadata. If no option roots the walk on the
-    /// refs alone (see [`Repo::prune`], "Roots"), the keys add no
+    /// empty, the run reads no entry for these keys. The run reads the
+    /// detached metadata of each reached commit for its build sources in each
+    /// case ([`Repo::prune`], "Related commits"). If no option roots the walk
+    /// on the refs alone (see [`Repo::prune`], "Roots"), the keys add no
     /// reachability, because each commit in the store is already a root. The
     /// run still reads the metadata and the detached metadata of each commit.
     /// A defective value fails the prune in both cases.
@@ -261,8 +282,13 @@ pub struct PruneOptions {
     /// [`depth`](PruneOptions::depth) bounds the edge. If it is `false`, the
     /// ancestry of a commit survives only where something else names it. An
     /// application that tracks its own roots through
-    /// [`gc_root_metadata_keys`](PruneOptions::gc_root_metadata_keys) uses this
-    /// setting.
+    /// [`gc_root_metadata_keys`](PruneOptions::gc_root_metadata_keys) or
+    /// through the related commits uses this setting.
+    ///
+    /// The switch acts on the `parent` edge alone. If it is `false`, the run
+    /// still keeps the related commits of each reached commit
+    /// ([`Repo::prune`], "Related commits"), and a related commit keeps no
+    /// parent.
     ///
     /// This field is an ostrya extension. The repository config has no key for
     /// it, so a prune that the `ostrya` CLI runs always follows the `parent`
@@ -360,7 +386,8 @@ impl PruneOptions {
     /// [`gc_root_metadata_keys`](PruneOptions::gc_root_metadata_keys) to
     /// `keys`, and [`traverse_parent`](PruneOptions::traverse_parent) to
     /// `false`. The other fields keep their defaults. [`Repo::prune`] also
-    /// reads the keys of `[ex-ostrya] gc-root-metadata-keys`.
+    /// reads the keys of `[ex-ostrya] gc-root-metadata-keys`, and keeps the
+    /// related commits of each reached commit.
     ///
     /// With these options, an application that records its own reachability in
     /// commit metadata decides what the run keeps. The ancestry of a commit
@@ -511,6 +538,17 @@ pub struct PruneStats {
     /// If the run fails part way through the deletions, the refs that it
     /// already removed stay removed. The caller gets the error and no list.
     pub deleted_refs: Vec<String>,
+    /// The defective related values that the walk read, as
+    /// [`Repo::prune`], "Related commits", states.
+    ///
+    /// The list holds one warning for each defective entry and one for each
+    /// defective `ostrya.related` value. It is sorted by commit and then by
+    /// field, dependencies first. The warnings of one field keep the order of
+    /// its entries. A [`no_prune`](PruneOptions::no_prune) run gives the same
+    /// list as a run without it. A
+    /// [`static_deltas_only`](PruneOptions::static_deltas_only) run walks
+    /// nothing, so its list is empty.
+    pub warnings: Vec<RelatedWarning>,
 }
 
 /// The settings that the blocking half of a prune applies to each object that
@@ -539,9 +577,12 @@ impl Repo {
     /// The run walks from the roots, keeps each object that the walk reaches,
     /// and removes each other loose object. A kept commit keeps its sidecars:
     /// its detached metadata (`.commitmeta`) and its composefs image (`.cfs`).
-    /// The run removes the sidecars of each commit that it removes, and each
-    /// sidecar whose commit is absent. [`PruneOptions`] sets the roots, the bounds, and
-    /// the dry run.
+    /// The run removes the sidecars of each commit that it removes. It also
+    /// removes each sidecar whose commit is absent, if the walk does not
+    /// reach the name of that commit. The walk reaches the name of an absent
+    /// commit that a reached commit names as its parent within the bound, as
+    /// a target of a GC anchor key, or as a related commit. [`PruneOptions`]
+    /// sets the roots, the bounds, and the dry run.
     ///
     /// The run reads five keys of the repository config, in this order:
     ///
@@ -570,6 +611,50 @@ impl Repo {
     /// - [`only_branch`](PruneOptions::only_branch) if it is not empty.
     /// - [`retain_branch_depth`](PruneOptions::retain_branch_depth) if it is
     ///   not empty.
+    ///
+    /// The related commits of each commit that the walk reaches are also
+    /// roots. "Related commits" states them.
+    ///
+    /// # Related commits
+    ///
+    /// A commit names its related commits in two fields:
+    ///
+    /// - Field 2 of the commit object holds the dependencies
+    ///   ([`CommitOptions::related`](crate::CommitOptions::related)).
+    /// - The key `ostrya.related` of the detached metadata holds the build
+    ///   sources ([`Repo::add_detached_related`]). If the key occurs more than
+    ///   one time, the run reads the first entry alone.
+    ///
+    /// The run reads both fields of each commit that the walk reaches, and
+    /// walks each commit that they name as a root of its own. Such a commit
+    /// gets the global bound of the run, [`depth`](PruneOptions::depth) or
+    /// [`keep_younger_than`](PruneOptions::keep_younger_than), because the
+    /// bound counts `parent` edges. The run reads the two fields of a related
+    /// commit too, so it keeps the dependencies of a dependency and the build
+    /// sources of a build source. A cycle of build sources ends the walk,
+    /// because the walk reads the fields of each commit one time.
+    ///
+    /// A related entry that names a commit that the repository does not hold
+    /// gives no error, and the walk reads nothing below it. The run keeps the
+    /// name of that commit, as it keeps the name of an absent parent. So the
+    /// run keeps the `.commitmeta` and the `.cfs` of that commit if the
+    /// store holds them. A weak ref
+    /// ([`weak_ref_filter`](PruneOptions::weak_ref_filter)) whose commit a
+    /// related field names survives.
+    ///
+    /// A defective related value gives a warning in
+    /// [`PruneStats::warnings`], and the run continues. A value is defective
+    /// if an entry of either field has an empty name or a checksum that is
+    /// not 32 bytes, or if the value of `ostrya.related` is not a variant of
+    /// type `a(say)`. The defective entry or value roots nothing, and the
+    /// other entries of the field root as usual. Entries that are not sorted,
+    /// two entries with the same name, and a dependency with dependencies of
+    /// its own are not defective.
+    ///
+    /// The run reads the related values also if each commit in the store is
+    /// a root, so it gives the same warnings. A `.commitmeta` that does not
+    /// parse, or that is larger than
+    /// [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE), fails the prune.
     ///
     /// # Bounds
     ///
@@ -673,7 +758,8 @@ impl Repo {
     ///   lock and deletes nothing.
     /// - [`Error::Core`] if a ref file holds no valid checksum.
     /// - [`Error::Core`] if a commit object or its detached metadata does not
-    ///   parse.
+    ///   parse. The run reads the detached metadata of each commit that the
+    ///   walk reaches.
     /// - [`Error::Core`] if a dirtree that the walk reads does not parse. A
     ///   run with [`commit_only`](PruneOptions::commit_only) reads no dirtree.
     /// - [`Error::LockTimeout`] if the wait for the lock passes `[core]
@@ -763,6 +849,8 @@ impl Repo {
                 freed_bytes: 0,
                 // A delta-only run reads no ref, so it deletes none.
                 deleted_refs: Vec::new(),
+                // A delta-only run walks nothing, so it reads no related value.
+                warnings: Vec::new(),
             });
         }
         self.prune_objects(opts, mode, metadata_keys).await
@@ -873,14 +961,23 @@ impl Repo {
 
         let gc = crate::traverse::GcRoots {
             metadata_keys,
+            dependencies: true,
+            build_sources: true,
             traverse_parent: opts.traverse_parent,
             // A `commit_only` run reads only the commit names of the reachable
             // set, so the walk neither reads nor collects the trees.
             traverse_tree: !opts.commit_only,
             weak_roots,
         };
-        let keep = self
-            .traverse_reachable_gc(roots, global_bound, &gc, &ref_targets, opts.delete_commit)
+        let (keep, warnings) = self
+            .traverse_reachable_gc(
+                roots,
+                global_bound,
+                &gc,
+                &ref_targets,
+                opts.delete_commit,
+                &all_objects,
+            )
             .await?;
         // A kept commit keeps its sidecars: the detached metadata and the
         // composefs image.
@@ -1010,6 +1107,7 @@ impl Repo {
             pruned_objects,
             freed_bytes,
             deleted_refs,
+            warnings,
         })
     }
 

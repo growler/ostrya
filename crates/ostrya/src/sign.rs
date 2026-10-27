@@ -121,6 +121,7 @@ impl Repo {
                 &checksum,
                 None,
                 None,
+                Vec::new(),
                 appends,
                 fsync,
                 repo_mode,

@@ -52,7 +52,8 @@ pub struct BucketPruneReport {
     /// The sizes come from the listing of the objects. A delete of a key
     /// that holds no object counts too.
     /// [`deleted_refs`](PruneStats::deleted_refs) is always empty, because
-    /// the run deletes no ref.
+    /// the run deletes no ref. [`warnings`](PruneStats::warnings) is always
+    /// empty, because the run reads no related value.
     pub stats: PruneStats,
     /// The name of each static delta whose keys the run deleted, sorted.
     ///
@@ -172,11 +173,21 @@ impl BucketRepo {
     /// The run keeps the objects that [`Repo::prune`](crate::Repo::prune)
     /// keeps with the same options in a local repository with the same
     /// objects and refs, and the commits that the summary names. A kept
-    /// commit keeps its detached metadata and its composefs image. Unless the
-    /// roots are on the refs alone, the run also deletes the detached
-    /// metadata and the composefs image of a parent commit that the listing
-    /// does not hold. `Repo::prune` keeps these when its bound reaches that
-    /// parent. The run deletes no ref, writes no summary, and leaves the `summary`, the
+    /// commit keeps its detached metadata and its composefs image. Two
+    /// differences apply:
+    ///
+    /// - The run reads neither related field of a commit
+    ///   ([`Repo::prune`](crate::Repo::prune), "Related commits"). So it
+    ///   deletes a related commit that no other root reaches, and the objects
+    ///   that only that commit reaches. It also deletes the detached metadata
+    ///   and the composefs image of a related commit that the listing does
+    ///   not hold. `Repo::prune` keeps these.
+    /// - Unless the roots are on the refs alone, the run also deletes the
+    ///   detached metadata and the composefs image of a parent commit that
+    ///   the listing does not hold. `Repo::prune` keeps these when its bound
+    ///   reaches that parent.
+    ///
+    /// The run deletes no ref, writes no summary, and leaves the `summary`, the
     /// `summary.sig`, the `delta-indexes/`, and each `.tombstone-commit` as
     /// they are. The bucket repository module states the run under "The
     /// prune".
@@ -449,6 +460,8 @@ impl BucketRepo {
         }
         let gc = GcRoots {
             metadata_keys: Vec::new(),
+            dependencies: false,
+            build_sources: false,
             traverse_parent: true,
             traverse_tree: true,
             weak_roots: Default::default(),
@@ -457,7 +470,9 @@ impl BucketRepo {
             repo: self,
             listing,
         };
-        walk_reachable_gc(&source, roots, global, &gc, &targets, None).await
+        // The walk follows no related edge, so it gives no warning.
+        let (reachable, _) = walk_reachable_gc(&source, roots, global, &gc, &targets, None).await?;
+        Ok(reachable)
     }
 
     /// Returns each commit that the `summary` of the repository names, in
@@ -648,6 +663,7 @@ fn plan(
             pruned_objects: 0,
             freed_bytes: 0,
             deleted_refs: Vec::new(),
+            warnings: Vec::new(),
         },
     };
     let mut candidates: Vec<ObjectName> = Vec::new();

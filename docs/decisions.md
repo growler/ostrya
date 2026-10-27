@@ -1708,6 +1708,11 @@ The walk is the walk of the local prune, `traverse::walk_reachable_gc`,
 over a source of metadata objects that the local repository and the bucket
 both give. So the bucket prune has the roots and the bounds of
 `Repo::prune` with no copy, and the tests of the local prune gate the walk.
+The bucket prune turns off the related edges of the walk, so it reads
+neither related field of a commit ("Related commits"). With `refs_only` or
+`keep_younger_than`, it deletes a related commit that the local prune
+keeps. In each case, it deletes the `.commitmeta` and the `.cfs` of a
+related commit that the listing does not hold, which the local prune keeps.
 A walk for the bucket alone, with a copy of the rules of the bounds, was
 rejected: a later change to one copy can miss the other.
 
@@ -1754,10 +1759,10 @@ root, so each root, the ref targets and the commits of the summary
 included, keeps no parent. The walk reads each commit one time. With the
 bound of the local prune, the walk reads a commit again at each greater
 depth, which is a `GET` for each read. The kept objects of the listing are
-the same, with one exception. The walk does not reach a parent commit that
-the listing does not hold, so the prune deletes the `.commitmeta` and the
-`.cfs` of that commit. The local prune keeps them when its bound reaches
-that parent. These objects have no commit object, and a push of the commit
+the same, with one exception, apart from the related commits. The walk does
+not reach a parent commit that the listing does not hold, so the prune
+deletes the `.commitmeta` and the `.cfs` of that commit. The local prune
+keeps them when its bound reaches that parent. These objects have no commit object, and a push of the commit
 uploads them again. A rule that keeps them too was rejected: it needs the
 parent of each commit that the walk reads, and the walk gives the names of
 the reached objects alone. With `refs_only` or `keep_younger_than`, the
@@ -2046,6 +2051,52 @@ commit, the collection selectors of the ref listing, and the object type
 100. No deployment ran version 1 when these changes came, so the version
 number did not change. Thus a receiver that does not take the type 100
 refuses a sender that sends an image.
+
+## Related commits
+
+A commit names its related commits in two fixed fields, both of type
+`a(say)`. `format-reference.md`, "Related commits", states the format and
+the rules.
+
+- Field 2 of the commit object holds the dependencies: the runtime needs of
+  the commit, for example the UKI, the kernel, the initrd, or a container.
+  The detached metadata key `ostrya.related` holds the build sources: for
+  example an intermediate layer, an artifact, or a package set. The two
+  fields are fixed: no config key and no option of a call selects them.
+  Thus a reader finds the related commits with no repository config, and
+  the check of a write is the same in each repository.
+- A dependency names no dependency. The commit write and the composefs
+  rewrite refuse a nested dependency with `Error::InvalidRelated`. A
+  dependency can have a parent and build sources. A UKI, a kernel, an
+  initrd, or a container needs no dependency of its own. With one level,
+  field 2 cannot make a cycle, and a check reads one commit and the commits
+  that it names.
+- A local prune roots on the commits that field 2 and `ostrya.related` of
+  each reached commit name. The walk treats each such commit as a root of
+  its own, at the global bound of the run.
+- The prune reads field 2 of each commit that it reaches, a dependency
+  included. So it keeps the commits that a nested dependency names, with no
+  warning. To keep too much is the safe direction.
+- Build sources are recursive in the local prune: the prune reads
+  `ostrya.related` of each commit that it reaches, a build source included.
+  `Repo::add_detached_related` can make a cycle. The walk reads the fields of
+  each commit one time, so a cycle ends the walk.
+- A related entry that names a commit that the repository does not hold
+  gives no error, and the walk reads nothing below it. The prune keeps the
+  name of that commit, as it keeps the name of an absent parent within the
+  bound and of an absent target of a GC anchor key. So it keeps the
+  `.commitmeta` and the `.cfs` of that commit if the store holds them.
+- A prune that reads a defective related value gives a warning and
+  continues. The warning names the commit, the field, and the reason. The
+  defective value or entry roots nothing, and the other entries of the field
+  root as usual. `PruneStats::warnings` carries the warnings, and
+  `ostrya prune` writes each one to standard error and exits 0. For the
+  prune, a nested dependency is not defective.
+- No transfer follows a build source. A pull, a push, and the one-way stream
+  move `ostrya.related` as any other detached metadata key, and fetch no
+  commit that it names. A build cache needs the refs of its sources, and not
+  only the commits. A distributed build cache mirrors the refs of its build
+  sources with the existing pull and push.
 
 ## GC anchor keys
 

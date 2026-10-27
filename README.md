@@ -76,6 +76,12 @@ Ostrya adds these functions, which the `ostree` command does not have:
   commit that such a key names in the metadata or the detached metadata of a
   kept commit. A library caller can add keys to a prune. A write of commit
   metadata refuses a value that a prune cannot read.
+- Related commits. Field 2 of a commit holds its dependencies, which
+  `ostrya commit --related` writes. The detached metadata key
+  `ostrya.related` holds its build sources, which the library adds. A prune
+  keeps the related commits of each kept commit, and gives a warning for a
+  defective value. `ostrya remote prune` of a bucket repository reads
+  neither field.
 - The `bare-user-shared` mode, for development. It is `bare-user` storage
   with the fixed file mode 0644, for a repository that one group shares.
 - composefs image objects. `ostrya commit --generate-composefs` and

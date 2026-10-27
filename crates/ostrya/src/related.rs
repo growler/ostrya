@@ -9,7 +9,12 @@
 //!
 //! Each entry is a name and the 32-byte checksum of a commit. The name has
 //! the form `<class>/<name>` by convention, for example `container/fe`.
-//! [`Repo::read_commit_related`] reads both fields.
+//!
+//! - [`Repo::read_commit_related`] reads both fields.
+//! - [`Repo::add_detached_related`] and [`Transaction::add_detached_related`]
+//!   add a build source to a commit.
+//! - [`Repo::prune`] keeps the commits that the two fields of each reached
+//!   commit name, and gives a [`RelatedWarning`] for each defective value.
 
 use std::os::fd::AsFd;
 use std::sync::LazyLock;
@@ -46,6 +51,32 @@ impl std::fmt::Display for RelatedField {
             RelatedField::Dependencies => "field 2",
             RelatedField::BuildSources => RELATED_KEY,
         })
+    }
+}
+
+/// A defective related value that [`Repo::prune`] read.
+///
+/// The prune gives this warning in place of [`Error::InvalidRelated`] and
+/// continues. The defective value or entry roots nothing. The other entries
+/// of the field root as usual. The text of the warning is the text of the
+/// error with the same commit, field, and reason.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelatedWarning {
+    /// The commit that holds the defective value.
+    pub commit: Checksum,
+    /// The field that holds the defective value.
+    pub field: RelatedField,
+    /// The text that names the defect.
+    pub reason: String,
+}
+
+impl std::fmt::Display for RelatedWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "related commits in {} of commit {}: {}",
+            self.field, self.commit, self.reason
+        )
     }
 }
 
@@ -143,9 +174,18 @@ pub(crate) fn entries_of(related: &[(String, Vec<u8>)]) -> Vec<RelatedEntry> {
 pub(crate) fn build_sources(
     detached: Option<&Value>,
 ) -> std::result::Result<Option<Vec<RelatedEntry>>, String> {
-    let Some(value) = detached.and_then(|dict| dict.dict_get(RELATED_KEY)) else {
-        return Ok(None);
-    };
+    match detached.and_then(|dict| dict.dict_get(RELATED_KEY)) {
+        Some(value) => entries_of_variant(value).map(Some),
+        None => Ok(None),
+    }
+}
+
+/// Reads the value of one `ostrya.related` entry as related entries.
+///
+/// # Errors
+///
+/// The reason of the defect, if the value is not a variant of type `a(say)`.
+fn entries_of_variant(value: &Value) -> std::result::Result<Vec<RelatedEntry>, String> {
     let Some((ty, child)) = value.as_variant() else {
         return Err("value is not a variant".into());
     };
@@ -153,7 +193,134 @@ pub(crate) fn build_sources(
     if signature != RELATED_SIGNATURE {
         return Err(format!("type is `{signature}`, not `{RELATED_SIGNATURE}`"));
     }
-    entries_of_value(child).map(Some)
+    entries_of_value(child)
+}
+
+/// Returns the checksum of each entry of `entries` that has a name that is
+/// not empty and a 32-byte checksum, and the defect of each other entry.
+///
+/// Both lists keep the order of `entries`.
+pub(crate) fn split_entries(entries: Vec<RelatedEntry>) -> (Vec<Checksum>, Vec<String>) {
+    let mut valid = Vec::with_capacity(entries.len());
+    let mut defects = Vec::new();
+    for (index, entry) in entries.into_iter().enumerate() {
+        match entry.defect(index) {
+            Some(reason) => defects.push(reason),
+            None => valid.push(entry.checksum.expect("the defect check passed")),
+        }
+    }
+    (valid, defects)
+}
+
+/// Checks each `ostrya.related` entry of the detached metadata dict `dict`
+/// of the commit `commit`.
+///
+/// The check reads each entry with the key, also when the key occurs more
+/// than one time. Each value must be a variant of type `a(say)`, and each
+/// element must have a name that is not empty and a 32-byte checksum. The
+/// check accepts elements that are not sorted and two elements with the same
+/// name. It does not check that the repository holds a named commit. A dict
+/// that is not an array has no entry, so it passes.
+///
+/// # Errors
+///
+/// [`Error::InvalidRelated`] with `commit` and
+/// [`RelatedField::BuildSources`] for the first defect, in the order of the
+/// entries and then of the elements.
+pub(crate) fn check_detached(commit: &Checksum, dict: &Value) -> Result<()> {
+    for value in related_values(dict) {
+        let entries = entries_of_variant(value).map_err(|reason| Error::InvalidRelated {
+            commit: Some(*commit),
+            field: RelatedField::BuildSources,
+            reason,
+        })?;
+        checked_entries(RelatedField::BuildSources, Some(*commit), entries)?;
+    }
+    Ok(())
+}
+
+/// Returns the value of each `ostrya.related` entry of the `a{sv}` dict
+/// `dict`, in the order of the dict.
+///
+/// The function skips each entry that does not have the `{s?}` shape. If
+/// `dict` is not an array, the result is empty.
+fn related_values(dict: &Value) -> impl Iterator<Item = &Value> {
+    dict.as_array()
+        .unwrap_or_default()
+        .iter()
+        .filter_map(|entry| match entry.as_tuple()? {
+            [key, value] if key.as_str() == Some(RELATED_KEY) => Some(value),
+            _ => None,
+        })
+}
+
+/// Adds the build source `name` with the checksum `source` to the detached
+/// metadata dict `dict` of the commit `commit`.
+///
+/// The add edits the first `ostrya.related` entry of `dict`. It removes each
+/// element with the name `name`, adds the new element, and sorts the elements
+/// by name in byte order. The sort is stable. If `dict` has no such entry,
+/// the add appends one after the other entries, with the new element alone.
+/// Each other entry of `dict` stays as it is.
+///
+/// # Errors
+///
+/// - [`Error::InvalidFormat`] if `dict` is not an array.
+/// - [`Error::InvalidRelated`] with `commit` and
+///   [`RelatedField::BuildSources`] if the value of the first entry is not a
+///   variant of type `a(say)`, or if one of its elements has an empty name or
+///   a checksum that is not 32 bytes. `dict` then stays as it is.
+pub(crate) fn add_build_source(
+    dict: &mut Value,
+    commit: &Checksum,
+    name: &str,
+    source: &Checksum,
+) -> Result<()> {
+    let Value::Array(entries) = dict else {
+        return Err(Error::InvalidFormat(
+            "detached metadata must be an a{sv} dict".into(),
+        ));
+    };
+    let slot = entries.iter_mut().find_map(|entry| match entry {
+        Value::Tuple(fields) => match fields.as_mut_slice() {
+            [key, value] if key.as_str() == Some(RELATED_KEY) => Some(value),
+            _ => None,
+        },
+        _ => None,
+    });
+    let mut sources = match &slot {
+        Some(value) => {
+            let entries = entries_of_variant(value).map_err(|reason| Error::InvalidRelated {
+                commit: Some(*commit),
+                field: RelatedField::BuildSources,
+                reason,
+            })?;
+            checked_entries(RelatedField::BuildSources, Some(*commit), entries)?
+        }
+        None => Vec::new(),
+    };
+    sources.retain(|(stored, _)| stored != name);
+    sources.push((name.to_owned(), *source));
+    sources.sort_by(|(a, _), (b, _)| a.cmp(b));
+    let elements = sources
+        .into_iter()
+        .map(|(name, checksum)| {
+            Value::Tuple(vec![
+                Value::Str(name),
+                Value::Bytes(checksum.as_bytes().to_vec()),
+            ])
+        })
+        .collect();
+    let ty = Type::parse(RELATED_SIGNATURE).map_err(ostrya_core::Error::from)?;
+    let value = Value::variant(ty, Value::Array(elements));
+    match slot {
+        Some(slot) => *slot = value,
+        None => entries.push(Value::Tuple(vec![
+            Value::Str(RELATED_KEY.to_owned()),
+            value,
+        ])),
+    }
+    Ok(())
 }
 
 /// Reads an `a(say)` value as related entries.

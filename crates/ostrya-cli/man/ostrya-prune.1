@@ -10,13 +10,15 @@ Delete the objects that no ref or commit of the repository reaches.
 .PP
 The walk starts from each ref and from each commit in the store. The command deletes each loose object that the walk does not reach. \%\-\-refs\-only, \%\-\-only\-branch, \%\-\-retain\-branch\-depth, and \%\-\-keep\-younger\-than start the walk from the refs alone. The depth and date options then limit the history of each ref. The commits that the metadata keys of the config key \fB\%[ex\-ostrya] gc\-root\-metadata\-keys\fR name are also roots.
 .PP
+The related commits of each commit that the walk reaches are also roots, under the bound of \%\-\-depth or \%\-\-keep\-younger\-than. A related commit gets this bound also if \%\-\-retain\-branch\-depth gives the commit that names it a different depth. Field \%2 of a commit holds its dependencies, which \fB\%commit \-\-related\fR writes. The detached metadata key \fB\%ostrya.related\fR holds its build sources. The walk reads the two fields of each related commit too. An entry that names a commit that is not in the store gives no error. The command then keeps the detached metadata and the composefs image of that commit if they are in the store. For each defective value, the command writes a warning on standard error, and the defective value roots nothing. A detached metadata file that does not parse fails the command.
+.PP
 The command also deletes each static delta whose target commit it deleted. A run with neither \%\-\-no\-prune nor \%\-\-static\-deltas\-only also deletes each static delta and each \fB\%state/<commit>.commitpartial\fR marker whose commit is not in the store. If \fB\%[core] tombstone\-commits\fR is true, the command writes a \fB\%\&.tombstone\-commit\fR for each deleted commit.
 .PP
 The command prints the total number of objects. It then prints the number of deleted objects and the freed size, or \fB\%No unreachable objects\fR\&. If \fB\%[core] locking\fR is false, the command takes no repository lock and prints a warning on standard error.
 .SH OPTIONS
 .TP
 \fB\-\-refs\-only\fR
-Delete each commit and object that no ref reaches.
+Delete each commit and object that no ref reaches, directly or through a related commit.
 .IP
 Without this option, each commit in the store is a root of the walk. A commit that no ref names then stays, with the objects that it reaches.
 .TP

@@ -580,6 +580,14 @@ port refuses these values at exit 1:
 A refusal writes no object and no ref. `--related` conflicts with
 `--skip-if-unchanged`, and `clap` refuses the pair at exit 1.
 
+`--add-detached-metadata-string=ostrya.related=VALUE` gives the detached
+metadata key `ostrya.related` a string value. The key is a port extension
+that holds the build sources of the commit, and its value must be an
+`a(say)` (`../format-reference.md`, "Related commits"). The port refuses the
+option at exit 1 with ``error: related commits in ostrya.related of commit
+<checksum>: type is `s`, not `a(say)` ``, and writes no object and no ref. The
+refusal comes at the end of the command, after the signatures.
+
 The five tree-source options carry seven divergences between them, and the
 walk of a filesystem source carries the divergences its own paragraph states
 below. The composition rule, the source list, the two type-change refusals,
@@ -2201,7 +2209,7 @@ makes one attempt in both. Every port command that takes `.lock` or
 own wording, `error: timed out acquiring repository lock after <N>s`, which is
 the diagnostic carve-out of "Scope of CLI compatibility" above.
 
-Seven divergences stand at `prune`:
+Eight divergences stand at `prune`:
 
 - the `--keep-younger-than` value dialect. The port takes `@SECONDS` and an
   absolute date and time carrying a UTC offset, and refuses the tool's
@@ -2262,7 +2270,21 @@ Seven divergences stand at `prune`:
   half: the two arms write one standard-output text and leave one object
   inventory). No matrix cell reaches the line, because no harness setup edits
   `config` (`harness.md`, "Constraints"), so every cell runs against a
-  repository whose `[core] locking` holds its default of true.
+  repository whose `[core] locking` holds its default of true;
+- the related commits. `ostree prune --refs-only` keeps no commit that field
+  2 of a kept commit names (`cli-behavior.md`, "Related commits in a prune").
+  The port keeps each commit that field 2 or the detached metadata key
+  `ostrya.related` of a reached commit names, and the related commits of
+  that commit in turn (`../format-reference.md`, "Related commits"). For each
+  defective related value, the port writes one line `warning: related
+  commits in <field> of commit <checksum>: <reason>` to standard error, and
+  exits 0. The port also reads the `.commitmeta` of each commit that the
+  walk reaches. A `.commitmeta` that does not parse as an `a{sv}` dict, or
+  that is larger than the size cap of a metadata object, fails the port's
+  run at exit 1, and the run deletes nothing. No observation records how the
+  tool treats such a file. On a repository where no commit names a related
+  commit and each `.commitmeta` parses, the two commands delete the same
+  objects.
 
 Two corners at `prune` are not settled by an observation this host can make:
 

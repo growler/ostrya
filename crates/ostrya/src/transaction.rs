@@ -148,6 +148,9 @@ struct Staged {
 ///   queued to replace the stored one.
 /// - `merge`: the dict that a receiving session merges in, with the keys whose
 ///   stored value stays.
+/// - `related`: the build sources that
+///   [`add_detached_related`](Transaction::add_detached_related) adds after
+///   it, in call order.
 /// - `appends`: the signatures that [`sign_commit`](Transaction::sign_commit)
 ///   made after it, in call order.
 #[derive(Default)]
@@ -166,6 +169,9 @@ struct DetachedEdit {
     /// the starting dict holds keeps its value. Each other key takes the value
     /// of this dict.
     merge: Option<(Vec<u8>, Vec<String>)>,
+    /// The build sources to add after the merge, each a name and the checksum
+    /// of a commit.
+    related: Vec<(String, Checksum)>,
     /// The signatures to append, each an engine metadata key and one signature.
     appends: Vec<(String, Vec<u8>)>,
 }
@@ -692,14 +698,20 @@ impl Transaction {
     ///
     /// If the call runs twice for one checksum, the last dict stays. The call
     /// also drops the signatures that [`sign_commit`](Transaction::sign_commit)
-    /// queued before it.
+    /// queued before it, and the build sources that
+    /// [`add_detached_related`](Transaction::add_detached_related) queued
+    /// before it.
     ///
     /// The call does not check `meta`, and it cannot fail. [`commit`] checks
     /// the values of the GC anchor keys in the queued dict, as
     /// [`write_commit`](Transaction::write_commit) checks the metadata of a
     /// commit. If an entry gives a key of `[ex-ostrya] gc-root-metadata-keys`
     /// a value that a prune refuses, `commit` fails with
-    /// [`Error::InvalidGcAnchor`] and publishes nothing.
+    /// [`Error::InvalidGcAnchor`] and publishes nothing. [`commit`] also
+    /// checks each `ostrya.related` entry of the queued dict, as
+    /// [`Repo::write_commit_detached_metadata`] does. If an entry is
+    /// defective, `commit` fails with [`Error::InvalidRelated`] and publishes
+    /// nothing.
     ///
     /// [`commit`]: Transaction::commit
     pub fn set_commit_detached_metadata(&self, checksum: &Checksum, meta: Value) {
@@ -708,7 +720,51 @@ impl Transaction {
         edit.staged = None;
         edit.replace = Some(meta);
         edit.merge = None;
+        edit.related.clear();
         edit.appends.clear();
+    }
+
+    /// Queues the build source `name` with the checksum `source` for the
+    /// detached metadata of the commit `commit`.
+    ///
+    /// The write at [`commit`](Transaction::commit) adds the entry to the
+    /// first `ostrya.related` entry of the detached metadata, as
+    /// [`Repo::add_detached_related`] does: it replaces the element with the
+    /// name `name` and keeps the elements sorted by name in byte order. The
+    /// adds apply in call order, after the dict that
+    /// [`set_commit_detached_metadata`](Transaction::set_commit_detached_metadata)
+    /// queued, or else after the stored dict. The signatures that
+    /// [`sign_commit`](Transaction::sign_commit) queues come after the adds.
+    ///
+    /// The call does not check that the transaction or the repository holds
+    /// `commit` or `source`, and it writes nothing to the file system.
+    ///
+    /// If the stored value of the first `ostrya.related` entry is defective,
+    /// the write at [`commit`](Transaction::commit) fails with
+    /// [`Error::InvalidRelated`]. The commit fails after it publishes the
+    /// staged objects. It then writes no ref, and the `.commitmeta` file of
+    /// `commit` stays as it was. The detached-metadata edits of other commits
+    /// that the queue holds before this one stay written.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidRelated`] with `commit` and
+    /// [`RelatedField::BuildSources`](crate::RelatedField::BuildSources) if
+    /// `name` is empty. The call then queues nothing.
+    pub fn add_detached_related(
+        &self,
+        commit: &Checksum,
+        name: &str,
+        source: &Checksum,
+    ) -> Result<()> {
+        if name.is_empty() {
+            return Err(crate::commit::empty_build_source_name(commit));
+        }
+        let mut queue = self.detached.lock().unwrap();
+        Self::edit_for(&mut queue, commit)
+            .related
+            .push((name.to_owned(), *source));
+        Ok(())
     }
 
     /// Stages `bytes`, the serialized detached metadata of `checksum`, to
@@ -745,6 +801,7 @@ impl Transaction {
         edit.staged = Some(name);
         edit.replace = None;
         edit.merge = None;
+        edit.related.clear();
         edit.appends.clear();
         Ok(())
     }
@@ -1335,8 +1392,10 @@ impl Transaction {
     ///    [`set_commit_detached_metadata`](Transaction::set_commit_detached_metadata)
     ///    queued, as [`write_commit`](Transaction::write_commit) checks the
     ///    metadata of a commit. If a dict holds at least one entry, the call
-    ///    reads `[ex-ostrya] gc-root-metadata-keys` for this check. On a
-    ///    refusal the call publishes no object and writes nothing.
+    ///    reads `[ex-ostrya] gc-root-metadata-keys` for this check. Next, it
+    ///    checks each `ostrya.related` entry of these dicts, as
+    ///    [`Repo::write_commit_detached_metadata`] does. On a refusal the call
+    ///    publishes no object and writes nothing.
     /// 2. The call renames each staged object into `objects/<xx>/`. The
     ///    composefs images go after all other objects. The rename of an image
     ///    replaces a stored image of the same commit.
@@ -1395,6 +1454,14 @@ impl Transaction {
     /// - [`Error::Core`] if a queued detached-metadata dict holds at least one
     ///   entry and `[ex-ostrya] gc-root-metadata-keys` holds a malformed
     ///   escape sequence. The call publishes no object and writes nothing.
+    /// - [`Error::InvalidRelated`] if an `ostrya.related` entry of a queued
+    ///   detached-metadata dict is not a variant of type `a(say)`, or if one
+    ///   of its elements has an empty name or a checksum that is not 32
+    ///   bytes. The call publishes no object and writes nothing.
+    /// - [`Error::InvalidRelated`] if a build source that
+    ///   [`add_detached_related`](Transaction::add_detached_related) queued
+    ///   meets a defective stored `ostrya.related` value. The published
+    ///   objects stay, and the call writes no ref.
     /// - [`Error::LockTimeout`] if the wait for the update lock passes
     ///   `[core] lock-timeout-secs`. The published objects stay, and the call
     ///   writes no detached metadata and no ref.
@@ -1410,6 +1477,7 @@ impl Transaction {
     pub async fn commit(mut self) -> Result<TransactionStats> {
         let refs = self.resolve_ref_queue()?;
         self.check_queued_gc_anchors()?;
+        self.check_queued_related()?;
         let synced = self.publish().await?;
         if refs.is_empty() && self.detached.lock().unwrap().edits.is_empty() {
             let stats = self.staged.lock().unwrap().stats;
@@ -1432,6 +1500,7 @@ impl Transaction {
         );
         let refs = self.resolve_ref_queue()?;
         self.check_queued_gc_anchors()?;
+        self.check_queued_related()?;
         let synced = self.publish().await?;
         self.write_tail(refs, synced, None).await
     }
@@ -1451,6 +1520,24 @@ impl Transaction {
                 .iter()
                 .filter_map(|(_, edit)| edit.replace.as_ref()),
         )
+    }
+
+    /// Checks each `ostrya.related` entry in each dict that
+    /// [`set_commit_detached_metadata`](Transaction::set_commit_detached_metadata)
+    /// queued, as
+    /// [`Repo::write_commit_detached_metadata`] checks the dict that it
+    /// writes.
+    ///
+    /// The check reads no file, so it holds the lock of the queue and no
+    /// await. The first defect in queue order gives the error.
+    fn check_queued_related(&self) -> Result<()> {
+        let queue = self.detached.lock().unwrap();
+        for (checksum, edit) in &queue.edits {
+            if let Some(dict) = &edit.replace {
+                crate::related::check_detached(checksum, dict)?;
+            }
+        }
+        Ok(())
     }
 
     /// Writes the queued detached metadata and then `refs`, removes the
@@ -1644,6 +1731,7 @@ impl DetachedJob {
             if edit.staged.is_some()
                 && edit.replace.is_none()
                 && edit.merge.is_none()
+                && edit.related.is_empty()
                 && edit.appends.is_empty()
             {
                 continue;
@@ -1654,6 +1742,7 @@ impl DetachedJob {
                 &checksum,
                 edit.replace,
                 edit.merge,
+                edit.related,
                 edit.appends,
                 self.fsync,
                 self.repo_mode,

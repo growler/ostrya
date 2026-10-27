@@ -71,7 +71,9 @@ objects/<first 2 hex>/<last 62 hex>.<suffix>
 The suffix gives the object type:
 .TP
 \fB\%.commit\fR
-A commit: the metadata, the parent, the subject, the body, the time, and the root dirtree and dirmeta checksums.
+A commit: the metadata, the parent, the related objects, the subject, the body, the time, and the root dirtree and dirmeta checksums.
+Ostrya uses the related objects for the dependencies of the commit, which \fB\%ostrya commit \-\-related\fR writes.
+\fB\%ostrya prune\fR keeps the dependencies of each commit that it keeps.
 .TP
 \fB\%.dirtree\fR
 A directory listing: the names and checksums of the files and of the subdirectories.
@@ -88,6 +90,8 @@ A file object in an archive repository.
 \fB\%.commitmeta\fR
 The detached metadata of a commit, for example its signatures.
 The checksum of a commit does not include it, so a signature can be added after the commit.
+The key \fB\%ostrya.related\fR, an extension of ostrya, holds the build sources of the commit.
+\fB\%ostrya prune\fR keeps the build sources of each commit that it keeps.
 .TP
 \fB\%.cfs\fR
 The composefs image of a commit, an extension of ostrya.

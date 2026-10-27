@@ -236,7 +236,7 @@ pub use receive::{
 };
 #[doc(hidden)]
 pub use refs::{CollectionRef, CollectionRefEntry, RefAlias, validate_refspec};
-pub use related::{CommitRelated, RelatedField};
+pub use related::{CommitRelated, RelatedField, RelatedWarning};
 #[doc(hidden)]
 pub use repo::{CreateOptions, Repo};
 pub use send::{SendEvent, SendEventFn, SendOptions};

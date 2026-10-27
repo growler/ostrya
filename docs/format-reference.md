@@ -313,7 +313,9 @@ mode. The layout is the dirmeta layout.
 A bare dict, with no tuple around it. It is not part of the commit checksum. It
 is a separate loose file, it is mutable, and it holds the signatures. A write
 with no metadata gives a zero-length file, which deletes the metadata.
-"Signing details" lists the signature keys and their values.
+"Signing details" lists the signature keys and their values. The key
+`ostrya.related` of the port holds the build sources of the commit ("Related
+commits").
 
 ## Summary and summary signature
 
@@ -2775,6 +2777,7 @@ the bytes on the wire or on disk can verify each fact.
 The part holds these items:
 
 - the config keys of the port;
+- the related commits of a commit and the rules of the local prune;
 - the ref patterns of the client groups and of the ref listing;
 - the push protocol and the pull protocol, over HTTP and over a byte stream;
 - the ref listing;
@@ -2886,6 +2889,101 @@ unsigned commit with `trust=grp`, with and without the group
 treat a remote with `pull-url` and no `url`, and an ssh address in `url`.
 `conformance/cli-behavior.md`, "`remote`", states how `remote list -u` stops
 at a remote with no `url`.
+
+## Related commits
+
+A commit names its related commits in two fields. Each field is an `a(say)`
+array. Each entry is a name and the 32 raw bytes of the checksum of a commit.
+
+- Field 2 of the commit object holds the dependencies ("Commit --
+  `(a{sv}aya(say)sstayay)`"). The commit checksum and each signature of the
+  commit cover the field.
+- The key `ostrya.related` of the detached metadata (`.commitmeta`) holds the
+  build sources. The value is a variant of type `a(say)`. The commit checksum
+  does not cover the key, so a build source can be added after the commit.
+
+The name of an entry has the form `<class>/<name>` by convention, for example
+`container/fe`, `boot/uki`, or `layer/base`. Each write of the port refuses an
+empty name and checks nothing else in the name.
+
+A defective related value is an `ostrya.related` value that is not a variant
+of type `a(say)`, or an entry of either field with an empty name or with a
+checksum that is not 32 bytes.
+
+### Dependencies
+
+A dependency names no dependency: the relation is one level deep. The commit
+write of the port sorts the entries by name in byte order. It refuses two
+entries with one name, a dependency that the repository or the writing
+transaction does not hold, a dependency that is partial, and a dependency
+whose own field 2 is not empty. A dependency can have a parent and build
+sources.
+
+### Build sources
+
+The add of a build source (`Repo::add_detached_related` and
+`Transaction::add_detached_related`) edits the first `ostrya.related` entry
+of the dict:
+
+- It replaces the element with the same name, or adds a new element.
+- It sorts the elements by name in byte order.
+- If the dict has no such entry, it appends one after the other entries. If
+  the commit has no detached metadata, it writes a dict with the one entry.
+- Each other entry of the dict stays as it is.
+
+The add checks the format of the new element alone: a name that is not empty
+and a checksum of 32 bytes. It does not check that the repository holds the
+named commit. If the stored value of the first entry is defective, the add
+refuses it, and the `.commitmeta` file stays as it was. A build source can
+name build sources of its own, so the add can make a cycle.
+
+`Repo::write_commit_detached_metadata`, and the commit of a transaction for a
+dict that `Transaction::set_commit_detached_metadata` queued, check each
+`ostrya.related` entry of the dict, also a second entry with the key. A
+defective value fails the write with `Error::InvalidRelated`, and the write
+changes no file. The check accepts elements that are not sorted, two
+elements with one name, and a checksum of a commit that the repository does
+not hold. A signature, a pull, and a receive store a dict with no check of
+the key.
+
+A reader of the build sources reads the first `ostrya.related` entry of the
+dict.
+
+### The local prune
+
+`ostrya prune` and `Repo::prune` keep the related commits of each commit
+that they reach:
+
+- The prune reads both fields of each commit that the walk reaches. It walks
+  each commit that they name as a root of its own, at the global bound of the
+  run: `--depth`, or `--keep-younger-than`.
+- The prune reads the two fields of each related commit too. So it keeps the
+  dependencies of a dependency and the build sources of a build source. The
+  walk reads the fields of each commit one time, so a cycle ends the walk.
+- A related entry that names a commit that the repository does not hold
+  gives no error, and the walk reads nothing below it. The prune keeps the
+  name of that commit, as it keeps the name of an absent parent within the
+  bound and of an absent target of a GC anchor key. So the prune keeps the
+  `.commitmeta` and the `.cfs` of that commit if the store holds them.
+- The prune accepts field 2 entries that are not sorted, two entries with one
+  name, and a dependency whose own field 2 is not empty. It roots on each
+  such entry.
+- A defective related value gives one warning for each defective entry, or
+  one warning for a defective `ostrya.related` value. The defective entry or
+  value roots nothing, and the other entries of the field root as usual. The
+  text of a warning is `related commits in <field> of commit <checksum>:
+  <reason>`, where `<field>` is `field 2` or `ostrya.related`. `ostrya prune`
+  writes each warning on standard error after `warning: `, and exits 0.
+- The prune reads the two fields also if each commit in the store is a root,
+  so a run without `--refs-only` gives the same warnings.
+- A `.commitmeta` that does not parse as an `a{sv}` dict, or that is larger
+  than the size cap of a metadata object, fails the prune. The prune then
+  deletes nothing.
+
+The prune of a bucket repository reads neither field.
+
+The `ostree` command keeps no commit for an entry of field 2
+(`conformance/cli-behavior.md`, "Related commits in a prune").
 
 ## Ref patterns
 
@@ -6516,10 +6614,19 @@ before a request. The prune also refuses `--break-lock` together with
 writer lock of another writer. The prune keeps the objects of the listing
 that a local prune with the same options keeps in a repository with the
 same refs and objects, and also the objects of the commits that the summary
-names. One difference applies: without `--refs-only` and
-`--keep-younger-than`, the prune also deletes the `.commitmeta` and the
-`.cfs` of a parent commit that the listing does not hold. The local prune
-keeps these when its bound reaches that parent.
+names. Two differences apply:
+
+- The prune reads neither related field of a commit ("Related commits"). So
+  it deletes a related commit that no other root reaches, and the objects
+  that only that commit reaches. It also deletes the `.commitmeta` and the
+  `.cfs` of a related commit that the listing does not hold. The local prune
+  keeps these. With `--refs-only` or `--keep-younger-than`, the local prune
+  keeps each related commit of a reached commit. Without these options,
+  each commit of the listing is a root, and the difference is the
+  `.commitmeta` and the `.cfs` of an absent related commit alone.
+- Without `--refs-only` and `--keep-younger-than`, the prune also deletes
+  the `.commitmeta` and the `.cfs` of a parent commit that the listing does
+  not hold. The local prune keeps these when its bound reaches that parent.
 
 The roots are:
 

@@ -13209,6 +13209,136 @@ fn commit_related_refuses_a_malformed_or_absent_dependency() {
     );
 }
 
+/// Returns an `a{sv}` with the key `key` and an `a(say)` of `entries`.
+fn related_dict(key: &str, entries: &[(&str, &[u8])]) -> Value {
+    let elements = entries
+        .iter()
+        .map(|(name, bytes)| {
+            Value::Tuple(vec![
+                Value::Str((*name).to_owned()),
+                Value::Bytes(bytes.to_vec()),
+            ])
+        })
+        .collect();
+    Value::Array(vec![Value::Tuple(vec![
+        Value::Str(key.to_owned()),
+        Value::Variant(Box::new((
+            Type::parse("a(say)").unwrap(),
+            Value::Array(elements),
+        ))),
+    ])])
+}
+
+/// `prune --refs-only` keeps the dependency that `commit --related` writes
+/// and a build source that the library adds. A defective `ostrya.related`
+/// value gives one `warning:` line on standard error for each defect, the
+/// valid entries still root, and the prune exits 0.
+#[test]
+fn prune_keeps_the_related_commits_and_warns_on_a_defective_value() {
+    let tmp = TmpDir::new("prune-related");
+    let base = tmp.path();
+    let repo = create_repo(base, RepoMode::Archive);
+    let repo_arg = format!("--repo={}", repo.display());
+    let dep = ex_ostrya_commit(&repo, base, "dep", None, None);
+    let src = ex_ostrya_commit(&repo, base, "src", None, None);
+    let orphan = ex_ostrya_commit(&repo, base, "orphan", None, None);
+    let head = commit_gc_anchor_run(
+        &repo,
+        &ex_ostrya_tree(base, "head"),
+        &[&format!("--related=boot/dep={dep}")],
+    )
+    .ok()
+    .stdout_trimmed();
+    let head = Checksum::from_hex(&head).unwrap();
+    block_on(async {
+        let repo = Repo::open(&repo).await.unwrap();
+        repo.add_detached_related(&head, "layer/src", &src)
+            .await
+            .unwrap();
+    });
+
+    let run = ostrya(&[&repo_arg, "prune", "--refs-only"], None, &[]);
+    run.ok();
+    assert!(
+        run.stderr.is_empty(),
+        "no warning: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(ex_ostrya_holds(&repo, &dep), "the dependency survives");
+    assert!(ex_ostrya_holds(&repo, &src), "the build source survives");
+    assert!(!ex_ostrya_holds(&repo, &orphan), "the orphan is pruned");
+
+    // Each write path of the library refuses a defective value. So the test
+    // writes it under another key of the same length and renames the key in
+    // the file.
+    let other = ex_ostrya_commit(&repo, base, "other", None, None);
+    let dict = related_dict(
+        "ostrya.relatex",
+        &[("layer/src", src.as_bytes()), ("layer/x", &[0x55; 31])],
+    );
+    let path = repo.join("objects").join(ostrya::loose_path(
+        &head,
+        ObjectType::CommitMeta,
+        RepoMode::Archive,
+    ));
+    block_on(async {
+        let repo = Repo::open(&repo).await.unwrap();
+        repo.write_commit_detached_metadata(&head, Some(&dict))
+            .await
+            .unwrap();
+    });
+    let bytes = std::fs::read(&path).unwrap();
+    let at = bytes
+        .windows(14)
+        .position(|window| window == b"ostrya.relatex")
+        .unwrap();
+    let mut patched = bytes;
+    patched[at + 13] = b'd';
+    std::fs::write(&path, patched).unwrap();
+
+    let run = ostrya(&[&repo_arg, "prune", "--refs-only"], None, &[]);
+    run.ok();
+    assert_eq!(
+        String::from_utf8_lossy(&run.stderr),
+        format!(
+            "warning: related commits in ostrya.related of commit {head}: entry 1 (layer/x) \
+             has a checksum of 31 bytes, not 32\n"
+        )
+    );
+    assert!(ex_ostrya_holds(&repo, &src), "the valid entry still roots");
+    assert!(!ex_ostrya_holds(&repo, &other), "the prune completes");
+}
+
+/// `commit --add-detached-metadata-string` with the key `ostrya.related`
+/// gives the key a string value, which is not an `a(say)`. The command exits
+/// 1 and writes no object and no ref.
+#[test]
+fn commit_refuses_a_string_build_source_value() {
+    let tmp = TmpDir::new("commit-related-detached-string");
+    let base = tmp.path();
+    let repo = create_repo(base, RepoMode::Archive);
+    let tree = ex_ostrya_tree(base, "head");
+    let before = commit_gc_anchor_state(&repo);
+    let run = commit_gc_anchor_run(
+        &repo,
+        &tree,
+        &["--add-detached-metadata-string=ostrya.related=layer/x"],
+    );
+    assert_eq!(run.status.code(), Some(1), "the command exits 1");
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        stderr.starts_with("error: related commits in ostrya.related of commit ")
+            && stderr.ends_with(": type is `s`, not `a(say)`\n"),
+        "the error line: {stderr}"
+    );
+    assert!(run.stdout.is_empty(), "no checksum is printed");
+    assert_eq!(
+        commit_gc_anchor_state(&repo),
+        before,
+        "the store holds the same objects and refs"
+    );
+}
+
 /// `log` over the repository that the `ostree` command built. The forms are
 /// the walk, the raw form, an ancestry suffix, and the note that `log` prints
 /// for a parent with no commit object.

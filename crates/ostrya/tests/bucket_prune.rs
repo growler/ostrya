@@ -30,7 +30,7 @@ use ostrya::verify::PullTrust;
 use ostrya::{
     Checksum, CollectionRef, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions,
     DeltaOptions, Error, MutableTree, ObjectType, PruneOptions, PruneStats, PullOptions, Repo,
-    RepoMode, Summary, SummaryOptions, WeakRefFilter,
+    RepoMode, Summary, SummaryOptions, Type, Value, WeakRefFilter,
 };
 use ostrya_rt::block_on;
 
@@ -146,7 +146,18 @@ impl Fixture {
         ] {
             let path = f.local.path().join(object_path(ty, &commit));
             std::fs::create_dir_all(path.parent().unwrap()).unwrap();
-            std::fs::write(path, format!("sidecar {ty:?}")).unwrap();
+            // The local prune reads the detached metadata of each commit that
+            // it reaches, so a `.commitmeta` holds a dict that parses.
+            let bytes = if ty == ObjectType::CommitMeta {
+                let note = Value::Array(vec![Value::Tuple(vec![
+                    Value::Str("test.note".into()),
+                    Value::variant(Type::parse("s").unwrap(), Value::Str("sidecar".into())),
+                ])]);
+                ostrya_core::to_bytes(&Type::parse("a{sv}").unwrap(), &note).unwrap()
+            } else {
+                format!("sidecar {ty:?}").into_bytes()
+            };
+            std::fs::write(path, bytes).unwrap();
         }
         for sub in ["objects", "deltas", "state"] {
             f.copy(sub);
@@ -1357,6 +1368,7 @@ fn a_time_bound_keeps_the_commit_of_each_ref_at_any_age() {
                 pruned_objects: objects.len() - kept.len(),
                 freed_bytes: freed as u64,
                 deleted_refs: Vec::new(),
+                warnings: Vec::new(),
             }
         );
         f.prune(&opts).await.unwrap();

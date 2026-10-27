@@ -271,6 +271,19 @@ enum Command {
     /// metadata keys of the config key `[ex-ostrya] gc-root-metadata-keys`
     /// name are also roots.
     ///
+    /// The related commits of each commit that the walk reaches are also
+    /// roots, under the bound of --depth or --keep-younger-than. A related
+    /// commit gets this bound also if --retain-branch-depth gives the commit
+    /// that names it a different depth. Field 2 of a commit holds its
+    /// dependencies, which `commit --related` writes. The detached metadata
+    /// key `ostrya.related` holds its build sources. The walk reads the two
+    /// fields of each related commit too. An entry that names a commit that
+    /// is not in the store gives no error. The command then keeps the
+    /// detached metadata and the composefs image of that commit if they are
+    /// in the store. For each defective value, the command writes a warning
+    /// on standard error, and the defective value roots nothing. A detached
+    /// metadata file that does not parse fails the command.
+    ///
     /// The command also deletes each static delta whose target commit it
     /// deleted. A run with neither --no-prune nor --static-deltas-only also
     /// deletes each static delta and each `state/<commit>.commitpartial`
@@ -1738,10 +1751,13 @@ enum RemoteCommand {
     /// ref is a root. Without --refs-only and --keep-younger-than, each
     /// commit of the bucket is a root too. The commits that the summary names
     /// are roots, and the command keeps them with no parent. A kept commit
-    /// keeps its detached metadata and its composefs image. Without
-    /// --refs-only and --keep-younger-than, the command also deletes the
-    /// detached metadata and the composefs image of a parent commit that the
-    /// bucket does not hold, which `ostrya prune` can keep.
+    /// keeps its detached metadata and its composefs image. The command reads
+    /// neither related field of a commit: field 2 and the detached metadata
+    /// key `ostrya.related`. So it deletes a related commit that no other
+    /// root reaches, which `ostrya prune` keeps. Without --refs-only and
+    /// --keep-younger-than, the command also deletes the detached metadata
+    /// and the composefs image of a parent commit that the bucket does not
+    /// hold, which `ostrya prune` can keep.
     ///
     /// The command deletes each object that no root reaches, then each
     /// static delta and each `state/<commit>.commitpartial` marker whose
@@ -2334,7 +2350,8 @@ struct RemotePruneArgs {
 
 #[derive(Args)]
 struct PruneArgs {
-    /// Delete each commit and object that no ref reaches.
+    /// Delete each commit and object that no ref reaches, directly or through
+    /// a related commit.
     ///
     /// Without this option, each commit in the store is a root of the walk. A
     /// commit that no ref names then stays, with the objects that it reaches.
@@ -12804,6 +12821,9 @@ async fn prune(repo: Repo, args: PruneArgs) -> Result<()> {
         );
     }
     let stats = repo.prune(&opts).await.map_err(report_resolution_failure)?;
+    for warning in &stats.warnings {
+        eprintln!("warning: {warning}");
+    }
     if args.commit_only {
         println!("Total (commit only) objects: {}", stats.total_objects);
     } else {

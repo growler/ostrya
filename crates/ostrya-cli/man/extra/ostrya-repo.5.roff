@@ -73,7 +73,7 @@ The suffix gives the object type:
 \fB\%.commit\fR
 A commit: the metadata, the parent, the related objects, the subject, the body, the time, and the root dirtree and dirmeta checksums.
 Ostrya uses the related objects for the dependencies of the commit, which \fB\%ostrya commit \-\-related\fR writes.
-\fB\%ostrya prune\fR keeps the dependencies of each commit that it keeps.
+\fB\%ostrya prune\fR and \fB\%ostrya remote prune\fR keep the dependencies of each commit that they keep.
 .TP
 \fB\%.dirtree\fR
 A directory listing: the names and checksums of the files and of the subdirectories.
@@ -317,6 +317,8 @@ The key of the object is the path of the file under \fB\%PREFIX/\fR.
 \fB\%ostrya remote init\fR creates a bucket repository, \fB\%ostrya push\fR writes commits to it, \fB\%ostrya push\-tree\fR writes a directory to it as a new commit, and \fB\%ostrya pull\fR, \fB\%ostrya remote refs\fR, and \fB\%ostrya remote summary\fR read it.
 \fB\%ostrya remote fsck\fR checks it, and with \fB\%\-\-delete\fR repairs it.
 \fB\%ostrya remote prune\fR deletes the objects that no root reaches.
+The prune roots on the dependencies in the related objects of each commit that it reaches, and reads them from the commit object alone.
+It reads no \fB\%.commitmeta\fR, so it keeps a build source only if a ref or another root keeps it.
 \fB\%ostrya remote summary \-u\fR writes its summary.
 The init, the two pushes, the repair, the prune, and the summary update take the writer lock of the bucket repository.
 The prune takes the lock also with \fB\%\-\-no\-prune\fR.
@@ -355,7 +357,7 @@ The init refuses a bucket that holds a \fB\%config\fR, so the collection id of a
 A push, a prune, and a summary update need the \fB\%config\fR, and refuse a mode other than \fB\%archive\-z2\fR and \fB\%archive\fR, a collection id that fails the collection\-id rule, a \fB\%tombstone\-commits\fR or \fB\%indexed\-deltas\fR that is not a boolean, and a \fB\%zlib\-level\fR that is not an integer.
 A push builds each \fB\%.filez\fR that it uploads at the \fB\%zlib\-level\fR of this \fB\%config\fR, 6 when the key is absent.
 A push of commits from an archive repository uploads each \fB\%.filez\fR as it is stored.
-A prune also refuses a \fB\%config\fR that sets \fB\%tombstone\-commits=true\fR in \fB\%[core]\fR or \fB\%gc\-root\-metadata\-keys\fR in \fB\%[ex\-ostrya]\fR.
+A prune also refuses a \fB\%config\fR that sets \fB\%tombstone\-commits=true\fR in \fB\%[core]\fR.
 .TP
 \fB\%summary\fR, \fB\%summary.sig\fR
 The summary of the repository and its signatures.
@@ -365,7 +367,7 @@ The update never deletes \fB\%summary.sig\fR, so a bucket repository that holds 
 Between the two writes, a pull that verifies the summary refuses it.
 If the write of \fB\%summary.sig\fR fails after the write of \fB\%summary\fR, the update fails with an error that states that the two keys can fail to match, and an update again with the same signing keys writes a matching pair.
 A push and a prune write no summary, and leave these two keys as they are.
-A prune keeps each commit that the summary names, with no parent.
+A prune keeps each commit that the summary names, with no parent, and the dependencies of that commit.
 A summary that names a static delta that a prune deleted stays as it is until an update of the summary.
 A pull of a named ref reads the ref file when the summary does not list the ref.
 A pull of a ref that the summary lists takes the commit of the summary, so after a push moves that ref, the pull takes the old commit until an update of the summary.

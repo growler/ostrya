@@ -1943,6 +1943,63 @@ fn remote_prune_with_break_lock_removes_a_lock_and_prints_its_holder() {
     assert!(object(&server, LOCK).is_none());
 }
 
+/// `remote prune` roots on the valid field 2 entries of a commit, writes one
+/// warning line on standard error for each defective entry, and exits 0.
+#[test]
+fn remote_prune_keeps_the_dependencies_and_warns_on_a_defective_entry() {
+    let scratch = Scratch::new("prune-related");
+    let server = StandIn::start();
+    let (_, one, two) = prune_fixture(&scratch, &server);
+    let key = |commit: &str| format!("repo/objects/{}/{}.commit", &commit[..2], &commit[2..]);
+    // A copy of `two` whose field 2 names `one` and holds a defective entry.
+    let mut head = ostrya::Commit::parse(&object(&server, &key(&two)).unwrap()).unwrap();
+    head.related = vec![
+        (
+            "a/ok".to_owned(),
+            ostrya::Checksum::from_hex(&one)
+                .unwrap()
+                .as_bytes()
+                .to_vec(),
+        ),
+        ("b/short".to_owned(), vec![0x55; 31]),
+    ];
+    let bytes = head.serialize().unwrap();
+    let head = ostrya::Checksum::sha256(&bytes).to_hex();
+    server.state().store(&key(&head), &bytes);
+    server
+        .state()
+        .store("repo/refs/heads/main", format!("{head}\n").as_bytes());
+    let endpoint = endpoint_of(&server);
+    let out = scratch.run(&[
+        "remote",
+        "prune",
+        "--refs-only",
+        "--depth=0",
+        ADDRESS,
+        &endpoint,
+        CLEARTEXT,
+    ]);
+    assert_eq!(out.status.code(), Some(0), "{}", stderr(&out));
+    assert_eq!(
+        stderr(&out),
+        format!(
+            "warning: related commits in field 2 of commit {head}: entry 1 (b/short) has a \
+             checksum of 31 bytes, not 32\n"
+        )
+    );
+    assert!(
+        stdout(&out).contains("\nDeleted 1 objects, "),
+        "{}",
+        stdout(&out)
+    );
+    assert!(
+        object(&server, &key(&one)).is_some(),
+        "the valid entry roots"
+    );
+    assert!(object(&server, &key(&two)).is_none());
+    assert!(object(&server, &key(&head)).is_some());
+}
+
 #[test]
 fn remote_prune_refuses_break_lock_with_no_prune_before_a_request() {
     let scratch = Scratch::new("prune-dry-break-lock");

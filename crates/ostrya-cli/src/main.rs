@@ -1731,13 +1731,29 @@ enum RemoteCommand {
     /// ref is a root. Without --refs-only and --keep-younger-than, each
     /// commit of the bucket is a root too. The commits that the summary names
     /// are roots, and the command keeps them with no parent. A kept commit
-    /// keeps its detached metadata and its composefs image. The command reads
-    /// neither related field of a commit: field 2 and the detached metadata
-    /// key `ostrya.related`. So it deletes a related commit that no other
-    /// root reaches, which `ostrya prune` keeps. Without --refs-only and
-    /// --keep-younger-than, the command also deletes the detached metadata
-    /// and the composefs image of a parent commit that the bucket does not
-    /// hold, which `ostrya prune` can keep.
+    /// keeps its detached metadata and its composefs image.
+    ///
+    /// The dependencies in field 2 of each commit that the walk reaches are
+    /// also roots, as in `ostrya prune`. With --refs-only or
+    /// --keep-younger-than, a dependency gets the bound of --depth or
+    /// --keep-younger-than, also a dependency of a commit that the summary
+    /// names. Without them, each commit of the bucket is a root
+    /// that keeps no parent, and a dependency keeps no parent too. The
+    /// command reads field 2 from the commit object, with no other request.
+    /// An entry that names a commit that is not in the bucket gives no error,
+    /// and the command keeps the detached metadata and the composefs image of
+    /// that commit if they are in the bucket. For each defective field 2
+    /// entry, the command writes one
+    /// `warning: related commits in field 2 of commit CHECKSUM: REASON` line
+    /// to standard error before the lines on standard output, and the
+    /// defective entry roots nothing.
+    ///
+    /// The command reads no detached metadata, so it reads no build source in
+    /// the detached metadata key `ostrya.related`. It deletes a build source
+    /// that no root reaches, which `ostrya prune` keeps. Without --refs-only
+    /// and --keep-younger-than, the command also deletes the detached
+    /// metadata and the composefs image of a parent commit that the bucket
+    /// does not hold, which `ostrya prune` can keep.
     ///
     /// The command deletes each object that no root reaches, then each
     /// static delta and each `state/<commit>.commitpartial` marker whose
@@ -1773,15 +1789,14 @@ enum RemoteCommand {
     /// a push, `s3:GetObject`, `s3:PutObject`, `s3:ListBucket`,
     /// `s3:DeleteObject`, and `s3:AbortMultipartUpload`, and also
     /// `s3:ListBucketMultipartUploads`. It refuses a bucket repository whose
-    /// `config` sets `[core] tombstone-commits` to true or sets
-    /// `[ex-ostrya] gc-root-metadata-keys`.
+    /// `config` sets `[core] tombstone-commits` to true.
     ///
     /// With an address, the command needs no repository and reads no
     /// `--repo`, current directory, or `OSTREE_REPO`. With a remote name, it
     /// reads the remote from the config of the repository. With
     /// --break-lock, a prune that removed the writer lock of another writer
     /// writes one `warning: removed the writer lock of HOLDER` line to
-    /// standard error.
+    /// standard error, after the other lines.
     #[cfg(feature = "s3")]
     Prune(RemotePruneArgs),
     /// Delete a remote repository and its trusted GPG keyring.
@@ -11931,9 +11946,11 @@ async fn remote_fsck(repo: Option<&Repo>, nested: &str, args: RemoteFsckArgs) ->
 /// remote prune`.
 ///
 /// `repo` is `None` for an address. The `--keep-younger-than` value is read
-/// before any request. The lines go to standard output as the help text
-/// states, and a writer lock that `--break-lock` removed gives one warning
-/// line on standard error.
+/// before any request. Each defective field 2 entry that the walk read gives
+/// one warning line on standard error before the lines on standard output.
+/// The lines go to standard output as the help text states, and a writer
+/// lock that `--break-lock` removed gives one warning line on standard error
+/// after them.
 #[cfg(feature = "s3")]
 async fn remote_prune(repo: Option<&Repo>, nested: &str, args: RemotePruneArgs) -> Result<()> {
     use std::io::Write;
@@ -11959,6 +11976,9 @@ async fn remote_prune(repo: Option<&Repo>, nested: &str, args: RemotePruneArgs) 
     bucket_opts.break_lock = args.break_lock;
     let bucket = ostrya::bucket::BucketRepo::open(&endpoint).await?;
     let report = bucket.prune(&opts, &bucket_opts).await?;
+    for warning in &report.stats.warnings {
+        eprintln!("warning: {warning}");
+    }
     let stats = &report.stats;
     let mut out = std::io::stdout().lock();
     writeln!(out, "Total objects: {}", stats.total_objects).map_err(Error::Io)?;

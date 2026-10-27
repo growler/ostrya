@@ -164,14 +164,18 @@
 //! refuses `break_lock` with `no_prune`.
 //!
 //! - The roots are the commits of the refs, the commits that the `summary`
-//!   names, and, unless the roots are on the refs alone, each commit of the
-//!   listing. The objects that the run keeps are the objects that a local
-//!   prune keeps with the same options, refs, and objects, and the objects
-//!   of the commits of the summary. The run reads neither related field of
-//!   a commit, so it deletes a related commit that no other root reaches,
-//!   which a local prune keeps. Unless the roots are on the refs alone,
-//!   the run also deletes the detached metadata and the composefs image of
-//!   a parent commit that the listing does not hold.
+//!   names, the dependencies in field 2 of each commit that the walk
+//!   reaches, and, unless the roots are on the refs alone, each commit of
+//!   the listing. The objects that the run keeps are the objects that a
+//!   local prune keeps with the same options, refs, and objects, and the
+//!   objects of the commits of the summary and of their dependencies, under
+//!   the bound of the run. The run reads field 2 of each commit
+//!   that it reaches, and keeps the dependencies as a local prune keeps
+//!   them. It reads no detached metadata, so it deletes a build source that
+//!   no other root reaches, which a local prune keeps. Each defective
+//!   field 2 entry gives a warning in the report. Unless the roots are on
+//!   the refs alone, the run also deletes the detached metadata and the
+//!   composefs image of a parent commit that the listing does not hold.
 //! - The walk reads each commit and dirtree that it reaches, and checks
 //!   each one against its name. It reads the commits one at a time, and at
 //!   most `max_outstanding` dirtrees of the tree of one commit at a time,

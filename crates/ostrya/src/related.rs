@@ -15,6 +15,9 @@
 //!   add a build source to a commit.
 //! - [`Repo::prune`] keeps the commits that the two fields of each reached
 //!   commit name, and gives a [`RelatedWarning`] for each defective value.
+//!   `BucketRepo::prune` keeps the commits that field 2 of each reached
+//!   commit names, and gives a [`RelatedWarning`] for each defective field 2
+//!   entry.
 
 use std::os::fd::AsFd;
 use std::sync::LazyLock;
@@ -54,12 +57,14 @@ impl std::fmt::Display for RelatedField {
     }
 }
 
-/// A defective related value that [`Repo::prune`] read.
+/// A defective related value that [`Repo::prune`] or `BucketRepo::prune`
+/// read.
 ///
 /// The prune gives this warning in place of [`Error::InvalidRelated`] and
 /// continues. The defective value or entry roots nothing. The other entries
 /// of the field root as usual. The text of the warning is the text of the
-/// error with the same commit, field, and reason.
+/// error with the same commit, field, and reason. `BucketRepo::prune` reads
+/// field 2 alone, so each of its warnings is about field 2.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelatedWarning {
     /// The commit that holds the defective value.

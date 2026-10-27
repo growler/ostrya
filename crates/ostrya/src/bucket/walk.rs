@@ -55,9 +55,8 @@ impl BucketRepo {
     /// bytes. Each read is one `GET`. The walk reads the commits one at a
     /// time. It reads the dirtrees of the tree of one commit at most
     /// `max_outstanding` at a time, as [`new`](BucketRepo::new) gives it,
-    /// before it reads the next commit. The walk reads each dirtree once. It
-    /// can read a commit again when it expands the commit again at a greater
-    /// depth. The call takes no writer lock.
+    /// before it reads the next commit. The walk reads each commit and each
+    /// dirtree once. The call takes no writer lock.
     ///
     /// Each read holds the bytes of its object in memory, so the reads in
     /// flight hold at most `max_outstanding` objects, each at most

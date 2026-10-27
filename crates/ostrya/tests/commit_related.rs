@@ -15,7 +15,7 @@ mod common;
 
 use std::path::Path;
 
-use common::{TmpDir, file_inventory};
+use common::{Field2Entry, TmpDir, file_inventory, store_with_field2};
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CommitRelated, CreateOptions,
     DictBuilder, DummySigner, Error, LockKind, MutableTree, ObjectType, PullOptions, RelatedField,
@@ -89,31 +89,6 @@ async fn commit(repo: &Repo, base: &Path, name: &str, related: &[(&str, Checksum
         .unwrap();
     txn.commit().await.unwrap();
     commit
-}
-
-/// One entry of field 2 as stored: a name and the bytes of a checksum.
-type Field2Entry<'a> = (&'a str, &'a [u8]);
-
-/// Stores a copy of the commit `source` with field 2 set to `related`, with
-/// no check of the entries, and returns its checksum.
-async fn store_with_field2(
-    repo: &Repo,
-    source: &Checksum,
-    related: &[Field2Entry<'_>],
-) -> Checksum {
-    let (mut commit, _) = repo.load_commit(source).await.unwrap();
-    commit.related = related
-        .iter()
-        .map(|(name, bytes)| ((*name).to_owned(), bytes.to_vec()))
-        .collect();
-    let bytes = commit.serialize().unwrap();
-    let txn = repo.transaction().await.unwrap();
-    let written = txn
-        .write_metadata(ObjectType::Commit, None, &bytes)
-        .await
-        .unwrap();
-    txn.commit().await.unwrap();
-    written
 }
 
 /// Returns the entries `entries` as field 2 stores them: names and checksum

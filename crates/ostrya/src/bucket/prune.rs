@@ -13,6 +13,7 @@ use crate::deltagen::delta_name;
 use crate::error::{Error, Result};
 use crate::object::MAX_METADATA_SIZE;
 use crate::prune::{PruneOptions, PruneStats, counted};
+use crate::related::RelatedWarning;
 use crate::remote::s3::{Bucket, Upload, is_repository_key};
 use crate::summary::{SUMMARY_READ_CAP, Summary};
 use crate::traverse::{GcRoots, MetadataSource, ParentBound, walk_reachable_gc};
@@ -52,8 +53,10 @@ pub struct BucketPruneReport {
     /// The sizes come from the listing of the objects. A delete of a key
     /// that holds no object counts too.
     /// [`deleted_refs`](PruneStats::deleted_refs) is always empty, because
-    /// the run deletes no ref. [`warnings`](PruneStats::warnings) is always
-    /// empty, because the run reads no related value.
+    /// the run deletes no ref. [`warnings`](PruneStats::warnings) holds one
+    /// warning for each defective field 2 entry that the walk read. It holds
+    /// no warning about `ostrya.related`, because the run reads no detached
+    /// metadata.
     pub stats: PruneStats,
     /// The name of each static delta whose keys the run deleted, sorted.
     ///
@@ -172,16 +175,17 @@ impl BucketRepo {
     ///
     /// The run keeps the objects that [`Repo::prune`](crate::Repo::prune)
     /// keeps with the same options in a local repository with the same
-    /// objects and refs, and the commits that the summary names. A kept
-    /// commit keeps its detached metadata and its composefs image. Two
-    /// differences apply:
+    /// objects and refs, and the commits that the summary names, with their
+    /// dependencies under the bound of the run. A kept commit keeps its
+    /// detached metadata and its composefs image. Two differences apply:
     ///
-    /// - The run reads neither related field of a commit
-    ///   ([`Repo::prune`](crate::Repo::prune), "Related commits"). So it
-    ///   deletes a related commit that no other root reaches, and the objects
-    ///   that only that commit reaches. It also deletes the detached metadata
-    ///   and the composefs image of a related commit that the listing does
-    ///   not hold. `Repo::prune` keeps these.
+    /// - The run reads field 2 of each commit that the walk reaches, and keeps
+    ///   the dependencies as [`Repo::prune`](crate::Repo::prune) keeps them
+    ///   ("Related commits"). It reads no detached metadata, so it reads no
+    ///   build source. Thus it deletes a build source that no other root
+    ///   reaches, and the objects that only that commit reaches. It also
+    ///   deletes the detached metadata and the composefs image of a build
+    ///   source that the listing does not hold. `Repo::prune` keeps these.
     /// - Unless the roots are on the refs alone, the run also deletes the
     ///   detached metadata and the composefs image of a parent commit that
     ///   the listing does not hold. `Repo::prune` keeps these when its bound
@@ -210,9 +214,29 @@ impl BucketRepo {
     /// Unless the roots are on the refs alone, each commit of the listing is
     /// a root too. In that case, each root keeps no parent, so the walk reads
     /// each commit of the listing once: each commit of the listing is a root
-    /// of its own. With `refs_only` or `keep_younger_than`, the walk can read
-    /// a commit again when it reaches the commit under a bound that goes
-    /// further.
+    /// of its own. With `keep_younger_than`, the walk reads a commit a second
+    /// time when the time bound rejected the commit as a parent and the walk
+    /// then reaches the commit as a root, for example as a dependency. The
+    /// walk reads each other commit once.
+    ///
+    /// The commit of each field 2 entry of a commit that the walk reaches is
+    /// a root too: the dependencies. With `refs_only` or `keep_younger_than`,
+    /// a dependency is a root under the bound of the run, also a dependency
+    /// of a commit of the summary. Otherwise a dependency keeps no parent, as
+    /// each other root, so the walk still reads each commit once. The walk
+    /// reads field 2 from the bytes of the commit object, and sends no other
+    /// request for it.
+    ///
+    /// - A defective field 2 entry, with an empty name or a checksum that is
+    ///   not 32 bytes, roots nothing and gives one warning in
+    ///   [`PruneStats::warnings`]. The other entries of the field root as
+    ///   usual.
+    /// - The walk roots on entries that are not sorted, on two entries with
+    ///   one name, and on the field 2 entries of a dependency. These are not
+    ///   defective.
+    /// - An entry that names a commit that the listing does not hold roots
+    ///   nothing and gives no warning. The walk keeps the name of that commit,
+    ///   so the run keeps its detached metadata and its composefs image.
     ///
     /// The walk reads each commit and dirtree that it reaches with one `GET`,
     /// and checks its SHA-256 against its name. It reads the commits one at
@@ -272,8 +296,7 @@ impl BucketRepo {
     /// - [`Error::Remote`] with
     ///   [`InvalidInput`](crate::remote::Error::InvalidInput) if the bucket
     ///   repository has no `config`, or if its `config` sets
-    ///   `[core] tombstone-commits` to `true` or sets
-    ///   `[ex-ostrya] gc-root-metadata-keys`. The run then takes no lock.
+    ///   `[core] tombstone-commits` to `true`. The run then takes no lock.
     /// - [`Error::InvalidFormat`] if the `config` breaks a rule of a bucket
     ///   repository, if a key under `refs/` is no ref key, if a ref file is
     ///   malformed or is gone at its read, if the summary does not parse or
@@ -307,6 +330,9 @@ impl BucketRepo {
     /// opts.refs_only = true;
     /// opts.depth = 0;
     /// let report = repo.prune(&opts, &BucketPruneOptions::default()).await?;
+    /// for warning in &report.stats.warnings {
+    ///     eprintln!("warning: {warning}");
+    /// }
     /// println!(
     ///     "deleted {} of {} objects",
     ///     report.stats.pruned_objects, report.stats.total_objects
@@ -336,17 +362,6 @@ impl BucketRepo {
             return Err(invalid(format!(
                 "the config of the bucket repository {} sets [core] tombstone-commits to true, \
                  and the prune of a bucket repository writes no tombstone",
-                self.address()
-            )));
-        }
-        if config
-            .keyfile()
-            .get_value("ex-ostrya", "gc-root-metadata-keys")
-            .is_some()
-        {
-            return Err(invalid(format!(
-                "the config of the bucket repository {} sets [ex-ostrya] gc-root-metadata-keys, \
-                 and the prune of a bucket repository reads no metadata key",
                 self.address()
             )));
         }
@@ -402,23 +417,26 @@ impl BucketRepo {
                 .cmp(&b.key)
                 .then_with(|| a.upload_id.cmp(&b.upload_id))
         });
-        let keep = self.prune_walk(opts, &refs, &summary, &listing).await?;
+        let (keep, warnings) = self.prune_walk(opts, &refs, &summary, &listing).await?;
         let deltas: Vec<&str> = deltas
             .objects
             .iter()
             .map(|listed| listed.key.as_str())
             .collect();
-        Ok((plan(&listing, &keep, &deltas, &partial), uploads))
+        let mut plan = plan(&listing, &keep, &deltas, &partial);
+        plan.stats.warnings = warnings;
+        Ok((plan, uploads))
     }
 
-    /// Returns the name of each object that the roots of the run reach.
+    /// Returns the name of each object that the roots of the run reach, and
+    /// a warning for each defective field 2 entry that the walk read.
     async fn prune_walk(
         &self,
         opts: &PruneOptions,
         refs: &BucketRefs,
         summary: &BTreeSet<Checksum>,
         listing: &ObjectListing,
-    ) -> Result<HashSet<ObjectName>> {
+    ) -> Result<(HashSet<ObjectName>, Vec<RelatedWarning>)> {
         let targets: HashSet<Checksum> = refs
             .heads
             .values()
@@ -427,16 +445,28 @@ impl BucketRepo {
             .collect();
         let global = opts.global_bound();
         let mut roots: Vec<(Checksum, ParentBound)> = Vec::new();
+        // A dependency takes the bound of the run when the roots are on the
+        // refs alone, as in a local prune. Otherwise each commit of the
+        // listing is a root that keeps no parent, so a dependency keeps no
+        // parent either: a parent bound adds no commit of the listing.
+        let related_bound = if opts.roots_on_refs_alone() {
+            global
+        } else {
+            ParentBound::Depth(0)
+        };
         if opts.roots_on_refs_alone() {
-            roots.extend(targets.iter().map(|commit| (*commit, global)));
             // The root of a ref target already keeps the commit and its
-            // tree, so a second root for it at no parent only reads it again.
+            // tree, so a second root for it at no parent adds nothing.
+            // The walk takes the roots from the end, so it expands the
+            // commits of the summary last. An earlier expansion of such a
+            // commit, as a dependency or as a parent, covers its root.
             roots.extend(
                 summary
                     .iter()
                     .filter(|commit| !targets.contains(commit))
                     .map(|commit| (*commit, ParentBound::Depth(0))),
             );
+            roots.extend(targets.iter().map(|commit| (*commit, global)));
         } else {
             // Each commit of the listing is a root, so a root that keeps no
             // parent keeps the same objects of the listing, and the walk
@@ -458,8 +488,10 @@ impl BucketRepo {
                     .map(|commit| (commit, ParentBound::Depth(0))),
             );
         }
+        // The walk reads field 2 from the bytes of each commit that it reads,
+        // and reads no detached metadata, so it follows no build source.
         let gc = GcRoots {
-            dependencies: false,
+            dependencies: true,
             build_sources: false,
             traverse_parent: true,
             traverse_tree: true,
@@ -469,9 +501,7 @@ impl BucketRepo {
             repo: self,
             listing,
         };
-        // The walk follows no related edge, so it gives no warning.
-        let (reachable, _) = walk_reachable_gc(&source, roots, global, &gc, &targets, None).await?;
-        Ok(reachable)
+        walk_reachable_gc(&source, roots, related_bound, &gc, &targets, None).await
     }
 
     /// Returns each commit that the `summary` of the repository names, in

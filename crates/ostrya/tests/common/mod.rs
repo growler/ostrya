@@ -753,6 +753,40 @@ pub fn mark_partial(repo: &ostrya::Repo, commit: &ostrya::Checksum) {
     .unwrap();
 }
 
+/// One entry of field 2 as stored: a name and the bytes of a checksum.
+pub type Field2Entry<'a> = (&'a str, &'a [u8]);
+
+/// Stores a copy of the commit `source` with field 2 set to `related`, with
+/// no check of the entries, and returns its checksum.
+pub async fn store_with_field2(
+    repo: &ostrya::Repo,
+    source: &ostrya::Checksum,
+    related: &[Field2Entry<'_>],
+) -> ostrya::Checksum {
+    let (mut commit, _) = repo.load_commit(source).await.unwrap();
+    commit.related = related
+        .iter()
+        .map(|(name, bytes)| ((*name).to_owned(), bytes.to_vec()))
+        .collect();
+    let bytes = commit.serialize().unwrap();
+    let txn = repo.transaction().await.unwrap();
+    let written = txn
+        .write_metadata(ostrya::ObjectType::Commit, None, &bytes)
+        .await
+        .unwrap();
+    txn.commit().await.unwrap();
+    written
+}
+
+/// Returns a warning of the dependencies of `commit`.
+pub fn dependency_warning(commit: ostrya::Checksum, reason: &str) -> ostrya::RelatedWarning {
+    ostrya::RelatedWarning {
+        commit,
+        field: ostrya::RelatedField::Dependencies,
+        reason: reason.to_owned(),
+    }
+}
+
 /// Returns `true` if fs-verity seals the regular file at `path`.
 ///
 /// A sealed file refuses an open for writing. The objects are writable by the

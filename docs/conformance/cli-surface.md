@@ -4812,20 +4812,24 @@ allow-cleartext-credentials`.
   of `prune`, and the command refuses a `--keep-younger-than` value that
   `prune` refuses, with the same message, before any request. The option
   parser refuses the other options of `prune`. The commits that the summary
-  names are roots with no parent. The command writes the lines of `prune`
-  to standard output: `Total objects: N`, then `Deleted N objects, SIZE
-  freed`, `Would delete: N objects, freeing SIZE` with `--no-prune`, or `No
-  unreachable objects`. Then, for each count that is not zero, it writes
-  `Deleted N static deltas`, `Deleted N partial-commit markers`, and
-  `Aborted N incomplete multipart uploads`, or with `--no-prune` `Would
-  delete N static deltas`, `Would delete N partial-commit markers`, and
-  `Would abort N incomplete multipart uploads`. It exits 0. The command
-  takes the writer lock, also with `--no-prune`, writes no summary, and
-  refuses a bucket repository whose `config` sets
-  `[core] tombstone-commits=true` or `[ex-ostrya] gc-root-metadata-keys`.
-  The option parser refuses `--break-lock` with `--no-prune`. A commit or a
-  dirtree whose bytes do not match its name fails the command before its
-  first delete.
+  names are roots with no parent. The dependencies in field 2 of each
+  reached commit, also of a commit of the summary, are roots, as in
+  `prune`, and the command reads no build source. For each defective
+  field 2 entry, the command writes one
+  `warning: related commits in field 2 of commit CHECKSUM: REASON` line to
+  standard error before the lines on standard output. The command writes
+  the lines of `prune` to standard output: `Total objects: N`, then
+  `Deleted N objects, SIZE freed`, `Would delete: N objects, freeing SIZE`
+  with `--no-prune`, or `No unreachable objects`. Then, for each count
+  that is not zero, it writes `Deleted N static deltas`, `Deleted N
+  partial-commit markers`, and `Aborted N incomplete multipart uploads`, or
+  with `--no-prune` `Would delete N static deltas`, `Would delete N
+  partial-commit markers`, and `Would abort N incomplete multipart
+  uploads`. It exits 0. The command takes the writer lock, also with
+  `--no-prune`, writes no summary, and refuses a bucket repository whose
+  `config` sets `[core] tombstone-commits=true`. The option parser refuses
+  `--break-lock` with `--no-prune`. A commit or a dirtree whose bytes do
+  not match its name fails the command before its first delete.
 - `remote summary -u` writes the summary of a bucket repository
   (`../format-reference.md`, "The summary of a bucket repository"). It
   takes the address of its operand as `remote init` does, with no

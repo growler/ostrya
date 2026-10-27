@@ -18,9 +18,9 @@ use std::os::fd::AsFd;
 use std::path::Path;
 use std::time::Duration;
 
-use common::TmpDir;
 use common::modes::object_path;
 use common::s3::{PROBE_BODY, PROBE_KEY, Rclone, StandIn, endpoint, rclone_available};
+use common::{TmpDir, dependency_warning, store_with_field2};
 use ostrya::bucket::{
     BucketFsckOptions, BucketPruneOptions, BucketPruneReport, BucketRepo, BucketSummaryOptions,
 };
@@ -289,17 +289,35 @@ async fn commit(
     std::fs::write(tree.join("file"), content).unwrap();
     std::fs::write(tree.join("sub/deep/nested"), "the same in each commit\n").unwrap();
     std::os::unix::fs::symlink("file", tree.join("link")).unwrap();
-    commit_tree(repo, &tree, branch, content, parent, timestamp).await
+    commit_tree(repo, &tree, branch, content, parent, &[], timestamp).await
 }
 
-/// Commits the directory `tree` with the subject `subject` at the time
-/// `timestamp`. Sets the ref `branch` to the commit if it is given.
+/// Commits a tree with the file `file`, which holds `content`, with the
+/// dependencies `related` at the time `timestamp`, and sets no ref.
+async fn commit_related(
+    repo: &Repo,
+    base: &Path,
+    content: &str,
+    parent: Option<Checksum>,
+    related: &[(&str, Checksum)],
+    timestamp: u64,
+) -> Checksum {
+    let tree = base.join(format!("tree-{content}"));
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(tree.join("file"), content).unwrap();
+    commit_tree(repo, &tree, None, content, parent, related, timestamp).await
+}
+
+/// Commits the directory `tree` with the subject `subject` and the
+/// dependencies `related` at the time `timestamp`. Sets the ref `branch` to
+/// the commit if it is given.
 async fn commit_tree(
     repo: &Repo,
     tree: &Path,
     branch: Option<&str>,
     subject: &str,
     parent: Option<Checksum>,
+    related: &[(&str, Checksum)],
     timestamp: u64,
 ) -> Checksum {
     let txn = repo.transaction().await.unwrap();
@@ -318,6 +336,10 @@ async fn commit_tree(
                 parent,
                 subject: Some(subject.to_owned()),
                 timestamp: Some(timestamp),
+                related: related
+                    .iter()
+                    .map(|(name, checksum)| ((*name).to_owned(), *checksum))
+                    .collect(),
                 ..CommitOptions::default()
             },
             &root,
@@ -362,6 +384,63 @@ fn copy_dir(from: &Path, to: &Path) {
         .status()
         .unwrap();
     assert!(status.success(), "cp -a {}", from.display());
+}
+
+/// Prunes a copy of the local repository of `f` and the bucket of `f` with
+/// `opts`, and asserts that the two runs give the same counts and warnings
+/// and keep the same objects, static deltas, and markers. Returns the report
+/// of the bucket.
+async fn prune_as_local(f: &Fixture, opts: &PruneOptions, case: &str) -> BucketPruneReport {
+    let copy = f.tmp.path().join("copy");
+    let _ = std::fs::remove_dir_all(&copy);
+    copy_dir(f.local.path(), &copy);
+    let local = Repo::open(&copy).await.unwrap();
+    let stats = local.prune(opts).await.unwrap();
+    let report = f.prune(opts).await.unwrap();
+    assert_eq!(report.stats, stats, "{case}");
+    for sub in ["objects", "deltas", "state"] {
+        let local: BTreeSet<String> = common::file_inventory(&copy, sub)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(f.keys(sub), local, "{case}: {sub}");
+    }
+    report
+}
+
+/// Returns the keys of the objects that the server got a `GET` of, whose
+/// keys end in `suffix`, sorted.
+fn gets(f: &Fixture, suffix: &str) -> Vec<String> {
+    let mut gets: Vec<String> = f
+        .requests()
+        .into_iter()
+        .filter(|(method, key)| method == "GET" && key.ends_with(suffix))
+        .map(|(_, key)| key)
+        .collect();
+    gets.sort();
+    gets
+}
+
+/// Returns the key of each commit object that the server got more than one
+/// `GET` of, and of each detached metadata object that it got a `GET` of,
+/// sorted.
+fn commits_read_again(f: &Fixture) -> Vec<String> {
+    let commits = gets(f, ".commit");
+    let mut again: Vec<String> = commits
+        .windows(2)
+        .filter(|pair| pair[0] == pair[1])
+        .map(|pair| pair[1].clone())
+        .collect();
+    again.dedup();
+    again.extend(gets(f, ".commitmeta"));
+    again
+}
+
+/// Asserts that the server got at most one `GET` of each commit object and
+/// no `GET` of a detached metadata object.
+fn assert_each_commit_read_once(f: &Fixture, case: &str) {
+    let again = commits_read_again(f);
+    assert!(again.is_empty(), "{case}: {again:?}");
 }
 
 /// Pulls `refs` from the bucket of `f` into a new `archive` repository, and
@@ -929,26 +1008,18 @@ fn a_bucket_with_no_config_or_a_refused_config_takes_no_lock() {
                 if m.ends_with("has no config; init it first")),
             "{err}"
         );
-        for (config, words) in [
-            (
-                format!("{PLAIN}tombstone-commits=true\n"),
-                "tombstone-commits",
-            ),
-            (
-                format!("{PLAIN}\n[ex-ostrya]\ngc-root-metadata-keys=\n"),
-                "gc-root-metadata-keys",
-            ),
-        ] {
-            f.put("config", config.as_bytes());
-            f.server.state().requests.clear();
-            let err = f.prune(&refs_only(0)).await.unwrap_err();
-            assert!(
-                matches!(&err, Error::Remote(ostrya::remote::Error::InvalidInput(m))
-                    if m.contains(words)),
-                "{err}"
-            );
-            assert_eq!(f.requests(), [("GET".to_owned(), "config".to_owned())]);
-        }
+        f.put(
+            "config",
+            format!("{PLAIN}tombstone-commits=true\n").as_bytes(),
+        );
+        f.server.state().requests.clear();
+        let err = f.prune(&refs_only(0)).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Remote(ostrya::remote::Error::InvalidInput(m))
+                if m.contains("tombstone-commits")),
+            "{err}"
+        );
+        assert_eq!(f.requests(), [("GET".to_owned(), "config".to_owned())]);
         f.remove("config");
         assert_eq!(f.snapshot(), before);
         // `tombstone-commits=false` is no refusal.
@@ -1094,7 +1165,16 @@ fn the_walk_of_a_run_reads_at_most_max_outstanding_dirtrees_at_a_time() {
             std::fs::create_dir_all(&dir).unwrap();
             std::fs::write(dir.join("file"), format!("file {n}\n")).unwrap();
         }
-        let wide = commit_tree(&f.local, &tree, Some("main"), "wide", Some(f.c3), T0 + 300).await;
+        let wide = commit_tree(
+            &f.local,
+            &tree,
+            Some("main"),
+            "wide",
+            Some(f.c3),
+            &[],
+            T0 + 300,
+        )
+        .await;
         f.copy("objects");
         f.put_ref("refs/heads/main", &wide);
         let opts = PruneOptions {
@@ -1366,6 +1446,394 @@ fn a_time_bound_keeps_the_commit_of_each_ref_at_any_age() {
         );
         f.prune(&opts).await.unwrap();
         assert_eq!(f.keys("objects"), kept);
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Related commits.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn a_dependency_survives_as_in_the_local_prune() {
+    // Each case gives `true` if the run keeps the parent of the dependency.
+    let cases: Vec<(&str, PruneOptions, bool)> = vec![
+        ("default", PruneOptions::default(), true),
+        ("depth 0", refs_only(0), false),
+        ("refs_only", refs_only(-1), true),
+        (
+            "keep_younger_than",
+            PruneOptions {
+                keep_younger_than: Some(T0 + 120),
+                ..PruneOptions::default()
+            },
+            true,
+        ),
+    ];
+    for (case, opts, keeps_base) in cases {
+        block_on(async {
+            let (f, _) = Fixture::rich().await;
+            let base = f.tmp.path();
+            // The two commits are younger than the time bound, so the bound
+            // of the run keeps the parent of the dependency.
+            let dep_base = commit_related(&f.local, base, "dep-base", None, &[], T0 + 130).await;
+            let dep = commit_related(&f.local, base, "dep", Some(dep_base), &[], T0 + 140).await;
+            // No store holds the parent of this dependency.
+            let gone = Checksum::sha256(b"gone parent");
+            let lone = commit_related(&f.local, base, "lone", Some(gone), &[], T0 + 150).await;
+            let head = commit_related(
+                &f.local,
+                base,
+                "head",
+                Some(f.c3),
+                &[("boot/fallback", lone), ("boot/uki", dep)],
+                T0 + 300,
+            )
+            .await;
+            f.set_local_ref("main", &head).await;
+            f.copy("objects");
+            f.put_ref("refs/heads/main", &head);
+            let commits: Vec<String> = f
+                .keys("objects")
+                .into_iter()
+                .filter(|key| key.ends_with(".commit"))
+                .collect();
+            let report = prune_as_local(&f, &opts, case).await;
+            assert!(report.stats.warnings.is_empty(), "{case}");
+            let dep_root = f.local.load_commit(&dep).await.unwrap().0.root_dirtree;
+            for kept in [
+                key(ObjectType::Commit, &head),
+                key(ObjectType::Commit, &dep),
+                key(ObjectType::DirTree, &dep_root),
+            ] {
+                assert!(f.get(&kept).is_some(), "{case}: {kept}");
+            }
+            assert_eq!(
+                f.get(&key(ObjectType::Commit, &dep_base)).is_some(),
+                keeps_base,
+                "{case}: the parent of the dependency"
+            );
+            assert_each_commit_read_once(&f, case);
+            if case == "default" {
+                // Each commit of the listing is a root that keeps no parent,
+                // and so is the dependency, so the walk reads each commit
+                // once.
+                assert_eq!(gets(&f, ".commit"), commits);
+                // The dependency keeps no parent, so the run deletes the
+                // detached metadata of a parent that the listing does not
+                // hold. A local prune keeps it.
+                let meta = key(ObjectType::CommitMeta, &gone);
+                f.put(&meta, b"sidecar");
+                f.prune(&opts).await.unwrap();
+                assert!(f.get(&meta).is_none(), "{case}: {meta}");
+            }
+        });
+    }
+}
+
+#[test]
+fn a_dependency_on_a_parent_chain_is_read_once_unless_the_time_bound_rejected_it() {
+    // The third value is `true` if the time bound rejects `d` as the parent
+    // of `e` before `d` arrives as a root.
+    let cases: Vec<(&str, PruneOptions, bool)> = vec![
+        ("default", PruneOptions::default(), false),
+        ("depth 0", refs_only(0), false),
+        ("depth 1", refs_only(1), false),
+        ("depth 3", refs_only(3), false),
+        ("refs_only", refs_only(-1), false),
+        (
+            "keep_younger_than",
+            PruneOptions {
+                keep_younger_than: Some(T0 + 5),
+                ..PruneOptions::default()
+            },
+            false,
+        ),
+        (
+            "keep_younger_than, older dependency",
+            PruneOptions {
+                keep_younger_than: Some(T0 + 25),
+                ..PruneOptions::default()
+            },
+            true,
+        ),
+    ];
+    let mut wrong = Vec::new();
+    for (case, opts, rejected) in cases {
+        block_on(async {
+            let f = Fixture::new(None).await;
+            let base = f.tmp.path();
+            // `e` is a child of `d`, and the head names the two in field 2.
+            let d0 = commit_related(&f.local, base, "d0", None, &[], T0 + 10).await;
+            let d = commit_related(&f.local, base, "d", Some(d0), &[], T0 + 20).await;
+            let e = commit_related(&f.local, base, "e", Some(d), &[], T0 + 30).await;
+            let head = commit_related(
+                &f.local,
+                base,
+                "head",
+                Some(f.c3),
+                &[("boot/fallback", d), ("boot/uki", e)],
+                T0 + 300,
+            )
+            .await;
+            f.set_local_ref("main", &head).await;
+            f.copy("objects");
+            f.put_ref("refs/heads/main", &head);
+            prune_as_local(&f, &opts, case).await;
+            // The keys of the objects that the server got more than one
+            // `GET` of, and of each detached metadata object that it got a
+            // `GET` of.
+            let mut objects = gets(&f, "");
+            objects.retain(|key| key.starts_with("objects/"));
+            let mut again: Vec<String> = objects
+                .windows(2)
+                .filter(|pair| pair[0] == pair[1])
+                .map(|pair| pair[1].clone())
+                .collect();
+            again.dedup();
+            again.extend(gets(&f, ".commitmeta"));
+            // A rejection reads `d` for its timestamp alone. The root of `d`
+            // reads it again for its tree, its parent, and its field 2.
+            let expected = if rejected {
+                vec![key(ObjectType::Commit, &d)]
+            } else {
+                Vec::new()
+            };
+            if again != expected {
+                wrong.push((case, again, expected));
+            }
+        });
+    }
+    assert!(wrong.is_empty(), "{wrong:#?}");
+}
+
+#[test]
+fn a_dependency_of_a_commit_of_the_summary_takes_the_bound_of_the_run() {
+    let cases: Vec<(&str, PruneOptions)> = vec![
+        ("depth 1", refs_only(1)),
+        ("depth 3", refs_only(3)),
+        ("refs_only", refs_only(-1)),
+        (
+            "keep_younger_than",
+            PruneOptions {
+                keep_younger_than: Some(T0 + 120),
+                ..PruneOptions::default()
+            },
+        ),
+    ];
+    let mut again = Vec::new();
+    for (case, opts) in cases {
+        block_on(async {
+            let f = Fixture::new(None).await;
+            let base = f.tmp.path();
+            let x0 = commit_related(&f.local, base, "x0", None, &[], T0 + 130).await;
+            let x = commit_related(&f.local, base, "x", Some(x0), &[], T0 + 140).await;
+            let old = commit_related(&f.local, base, "old", None, &[("x/x", x)], T0 + 150).await;
+            f.set_local_ref("old", &old).await;
+            f.local
+                .regenerate_summary(&SummaryOptions::default())
+                .await
+                .unwrap();
+            let summary = std::fs::read(f.local.path().join("summary")).unwrap();
+            // The summary names `c3`, `s1`, and `old`. No ref of the bucket
+            // names `old`, and `main` names a commit with no parent that
+            // names `c3` in field 2.
+            let head =
+                commit_related(&f.local, base, "head", None, &[("x/c3", f.c3)], T0 + 300).await;
+            f.copy("objects");
+            f.put("summary", &summary);
+            f.put_ref("refs/heads/main", &head);
+            f.prune(&opts).await.unwrap();
+            for kept in [f.c3, old, x, x0] {
+                let kept = key(ObjectType::Commit, &kept);
+                assert!(f.get(&kept).is_some(), "{case}: {kept}");
+            }
+            again.push((case, commits_read_again(&f)));
+        });
+    }
+    again.retain(|(_, keys)| !keys.is_empty());
+    assert!(again.is_empty(), "{again:#?}");
+}
+
+#[test]
+fn an_absent_dependency_roots_nothing() {
+    block_on(async {
+        let (f, _) = Fixture::rich().await;
+        // The fixture holds the detached metadata of this commit, and not
+        // the commit.
+        let absent = Checksum::sha256(b"absent");
+        let head = store_with_field2(&f.local, &f.c3, &[("boot/gone", absent.as_bytes())]).await;
+        f.set_local_ref("main", &head).await;
+        f.copy("objects");
+        f.put_ref("refs/heads/main", &head);
+        let report = prune_as_local(&f, &refs_only(0), "depth 0").await;
+        assert!(
+            report.stats.warnings.is_empty(),
+            "{:?}",
+            report.stats.warnings
+        );
+        assert_each_commit_read_once(&f, "depth 0");
+        let commit = key(ObjectType::Commit, &absent);
+        assert!(!f.requests().iter().any(|(_, key)| *key == commit));
+        let meta = key(ObjectType::CommitMeta, &absent);
+        assert!(f.get(&meta).is_some());
+        assert!(!f.deletes().contains(&meta));
+    });
+}
+
+#[test]
+fn a_build_source_that_no_ref_keeps_is_deleted() {
+    block_on(async {
+        let (f, _) = Fixture::rich().await;
+        let src = commit_related(&f.local, f.tmp.path(), "src", None, &[], T0 + 10).await;
+        let src_root = f.local.load_commit(&src).await.unwrap().0.root_dirtree;
+        f.local
+            .add_detached_related(&f.c3, "layer/src", &src)
+            .await
+            .unwrap();
+        f.copy("objects");
+        let opts = refs_only(-1);
+        let copy = f.tmp.path().join("copy");
+        copy_dir(f.local.path(), &copy);
+        let local = Repo::open(&copy).await.unwrap();
+        local.prune(&opts).await.unwrap();
+        assert!(
+            local.has_object(ObjectType::Commit, &src).await.unwrap(),
+            "the local prune keeps the build source"
+        );
+        let report = f.prune(&opts).await.unwrap();
+        assert!(report.stats.warnings.is_empty());
+        for gone in [
+            key(ObjectType::Commit, &src),
+            key(ObjectType::DirTree, &src_root),
+        ] {
+            assert!(f.get(&gone).is_none(), "{gone}");
+        }
+        assert!(f.get(&key(ObjectType::CommitMeta, &f.c3)).is_some());
+        assert_each_commit_read_once(&f, "refs_only");
+    });
+}
+
+#[test]
+fn a_defective_field_2_entry_gives_a_warning() {
+    block_on(async {
+        let (f, _) = Fixture::rich().await;
+        let base = f.tmp.path();
+        let dep = commit_related(&f.local, base, "dep", None, &[], T0 + 10).await;
+        let other = commit_related(&f.local, base, "other", None, &[], T0 + 20).await;
+        let head = store_with_field2(
+            &f.local,
+            &f.c3,
+            &[
+                ("a/ok", dep.as_bytes()),
+                ("", other.as_bytes()),
+                ("b/short", &dep.as_bytes()[..31]),
+            ],
+        )
+        .await;
+        f.set_local_ref("main", &head).await;
+        f.copy("objects");
+        f.put_ref("refs/heads/main", &head);
+        let expected = vec![
+            dependency_warning(head, "entry 1 has an empty name"),
+            dependency_warning(head, "entry 2 (b/short) has a checksum of 31 bytes, not 32"),
+        ];
+        let before = f.snapshot();
+        let dry = f
+            .prune(&PruneOptions {
+                no_prune: true,
+                ..refs_only(-1)
+            })
+            .await
+            .unwrap();
+        assert_eq!(dry.stats.warnings, expected);
+        assert_eq!(f.snapshot(), before);
+        assert_each_commit_read_once(&f, "refs_only");
+        let report = prune_as_local(&f, &refs_only(-1), "refs_only").await;
+        assert_eq!(report, dry);
+        assert_eq!(
+            report.stats.warnings[0].to_string(),
+            format!("related commits in field 2 of commit {head}: entry 1 has an empty name")
+        );
+        assert!(
+            f.get(&key(ObjectType::Commit, &dep)).is_some(),
+            "the valid entry roots"
+        );
+        assert!(
+            f.get(&key(ObjectType::Commit, &other)).is_none(),
+            "the defective entry roots nothing"
+        );
+        f.server.state().requests.clear();
+        let report = f.prune(&PruneOptions::default()).await.unwrap();
+        assert_eq!(report.stats.warnings, expected);
+        assert_each_commit_read_once(&f, "default");
+    });
+}
+
+#[test]
+fn a_config_key_that_names_metadata_keys_changes_no_prune() {
+    let variants = [
+        ("absent", ""),
+        ("empty", "\n[ex-ostrya]\ngc-root-metadata-keys=\n"),
+        (
+            "valid",
+            "\n[ex-ostrya]\ngc-root-metadata-keys=test.anchors;ostrya.related\n",
+        ),
+        (
+            "malformed",
+            "\n[ex-ostrya]\ngc-root-metadata-keys=app.roots\\\n",
+        ),
+    ];
+    let mut outcomes = Vec::new();
+    for (label, text) in variants {
+        let outcome = block_on(async {
+            let f = Fixture::new(None).await;
+            f.put("config", format!("{PLAIN}{text}").as_bytes());
+            let report = f.prune(&refs_only(0)).await.unwrap();
+            assert!(
+                f.requests()
+                    .iter()
+                    .any(|(method, key)| method == "PUT" && key == "extensions/ostrya/lock"),
+                "{label}: the run takes the lock"
+            );
+            (report, f.keys("objects"))
+        });
+        outcomes.push((label, outcome));
+    }
+    for (label, outcome) in &outcomes[1..] {
+        assert_eq!(*outcome, outcomes[0].1, "{label}");
+    }
+}
+
+#[test]
+fn a_nested_dependency_roots_its_dependencies_with_no_warning() {
+    block_on(async {
+        let f = Fixture::new(None).await;
+        let base = f.tmp.path();
+        let c = commit_related(&f.local, base, "c", None, &[], T0 + 10).await;
+        let plain_b = commit_related(&f.local, base, "b", None, &[], T0 + 20).await;
+        // The commit write refuses a nested dependency, so the commits are
+        // stored as metadata objects.
+        let b = store_with_field2(&f.local, &plain_b, &[("x/c", c.as_bytes())]).await;
+        let head = store_with_field2(&f.local, &f.c3, &[("x/b", b.as_bytes())]).await;
+        f.set_local_ref("main", &head).await;
+        f.copy("objects");
+        f.put_ref("refs/heads/main", &head);
+        let report = prune_as_local(&f, &refs_only(0), "depth 0").await;
+        assert!(
+            report.stats.warnings.is_empty(),
+            "{:?}",
+            report.stats.warnings
+        );
+        assert_each_commit_read_once(&f, "depth 0");
+        assert!(
+            f.get(&key(ObjectType::Commit, &b)).is_some(),
+            "the dependency survives"
+        );
+        assert!(
+            f.get(&key(ObjectType::Commit, &c)).is_some(),
+            "the dependency of the dependency survives"
+        );
+        assert!(f.get(&key(ObjectType::Commit, &plain_b)).is_none());
     });
 }
 

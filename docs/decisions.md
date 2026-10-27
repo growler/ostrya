@@ -1708,13 +1708,13 @@ The walk is the walk of the local prune, `traverse::walk_reachable_gc`,
 over a source of metadata objects that the local repository and the bucket
 both give. So the bucket prune has the roots and the bounds of
 `Repo::prune` with no copy, and the tests of the local prune gate the walk.
-The bucket prune turns off the related edges of the walk, so it reads
-neither related field of a commit ("Related commits"). With `refs_only` or
-`keep_younger_than`, it deletes a related commit that the local prune
-keeps. In each case, it deletes the `.commitmeta` and the `.cfs` of a
-related commit that the listing does not hold, which the local prune keeps.
-A walk for the bucket alone, with a copy of the rules of the bounds, was
-rejected: a later change to one copy can miss the other.
+The bucket prune follows the field 2 edge of the walk and does not follow
+the `ostrya.related` edge ("Related commits"). With `refs_only` or
+`keep_younger_than`, it deletes a build source that the local prune keeps.
+In each case, it deletes the `.commitmeta` and the `.cfs` of a build source
+that the listing does not hold, which the local prune keeps. A walk for the
+bucket alone, with a copy of the rules of the bounds, was rejected: a
+later change to one copy can miss the other.
 
 The walk reads the commits one at a time, and walks the tree of a commit
 before it reads the next commit. It reads the dirtrees of one tree with the
@@ -1748,7 +1748,8 @@ and `traverse_parent` reads the metadata of each commit. These stay for a
 later version.
 
 The result is `BucketPruneReport`: the `PruneStats` of the local prune,
-whose `deleted_refs` is always empty, and the deleted deltas, the deleted
+whose `deleted_refs` is always empty and whose `warnings` hold the
+defective field 2 entries, and the deleted deltas, the deleted
 markers, the aborted uploads, and the holder of a broken lock. With
 `no_prune`, the lists name what a run deletes. A `PruneStats` alone was
 rejected, because the command prints the deltas, the markers, and the
@@ -1756,19 +1757,26 @@ uploads, and the holder of a broken lock needs a place on success.
 
 When the roots are not on the refs alone, each commit of the listing is a
 root, so each root, the ref targets and the commits of the summary
-included, keeps no parent. The walk reads each commit one time. With the
-bound of the local prune, the walk reads a commit again at each greater
-depth, which is a `GET` for each read. The kept objects of the listing are
-the same, with one exception, apart from the related commits. The walk does
-not reach a parent commit that the listing does not hold, so the prune
-deletes the `.commitmeta` and the `.cfs` of that commit. The local prune
-keeps them when its bound reaches that parent. These objects have no commit object, and a push of the commit
-uploads them again. A rule that keeps them too was rejected: it needs the
-parent of each commit that the walk reads, and the walk gives the names of
-the reached objects alone. With `refs_only` or `keep_younger_than`, the
-walk keeps the bounds of the local prune and its reads again. A commit of
-the summary that a ref also names is a root under the bound of the ref
-alone, so the walk does not read it again.
+included, keeps no parent. A dependency is then a root that keeps no parent
+too. Each commit of the listing is already a root, so a parent bound adds
+no commit of the listing to the kept set. The kept objects of the listing
+are the same as in the local prune, with one exception, apart from the
+build sources. The walk does not reach a parent commit that the listing
+does not hold, so the prune deletes the `.commitmeta` and the `.cfs` of
+that commit. The local prune keeps them when its bound reaches that parent.
+These objects have no commit object in the bucket, and a push of that
+commit uploads them again. So the prune treats them as objects that no root
+reaches. The bound of the local prune for these roots was rejected: it
+keeps these objects, and it adds no object of the listing to the kept set.
+With `refs_only` or `keep_younger_than`, the walk takes the bounds of the
+local prune. A dependency, also a dependency of a commit of the summary, is
+a root under the bound of the run, as in the local prune. A commit of the
+summary that a ref also names is a root under the bound of the ref alone.
+The walk keeps the parent and the timestamp of each commit that it reads,
+so it reads each commit one time in each mode, with one exception. With
+`keep_younger_than`, the walk reads a commit a second time when the time
+bound rejected the commit as a parent and the walk then reaches the commit
+as a root, for example as a dependency.
 
 The walk reads an object that the listing does not hold as absent, with no
 request. The run holds the writer lock, so no writer adds an object during
@@ -1803,10 +1811,9 @@ dry run that takes no lock, as the fsck with no repair, was rejected: its
 counts then describe a state that a concurrent push can change.
 
 The prune refuses a `config` that sets `[core] tombstone-commits=true`,
-because it writes no tombstone, and a `config` that sets
-`[ex-ostrya] gc-root-metadata-keys`, because it reads no metadata key. A
-run that ignores the keys was rejected: it deletes commits that the
-repository policy keeps. The refusal comes before the lock.
+because it writes no tombstone. A run that ignores the key was rejected: it
+deletes commits with no tombstone, which the repository policy asks for.
+The refusal comes before the lock.
 
 The prune deletes a delta directory whose target commit is absent also when
 it has no superblock, and deletes the superblock first when it has one. A
@@ -2090,6 +2097,14 @@ the rules.
   root as usual. `PruneStats::warnings` carries the warnings, and
   `ostrya prune` writes each one to standard error and exits 0. For the
   prune, a nested dependency is not defective.
+- The bucket prune roots on field 2 alone. It reads field 2 from the bytes
+  of each commit object that it reads, so the field gives no extra request.
+  It reads no `.commitmeta`, so a build source in a bucket repository stays
+  only if a ref or another root keeps it. The bucket prune gives the warning
+  of a defective field 2 entry in `BucketPruneReport`, and
+  `ostrya remote prune` writes each one to standard error. A bucket prune
+  that also reads the `.commitmeta` of each commit that it reaches was
+  rejected: it sends one more `GET` for each such commit.
 - No transfer follows a build source. A pull, a push, and the one-way stream
   move `ostrya.related` as any other detached metadata key, and fetch no
   commit that it names. A build cache needs the refs of its sources, and not

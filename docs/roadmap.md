@@ -131,9 +131,7 @@ work on a local repository are not carried for it:
 
 - The deletion of a ref, and weak refs.
 - These options of `prune`: `--delete-commit`, `--only-branch`,
-  `--retain-branch-depth`, `--commit-only`, `--static-deltas-only`, and the
-  gc root metadata keys. `ostrya remote prune` refuses a bucket `config`
-  that sets `[ex-ostrya] gc-root-metadata-keys`.
+  `--retain-branch-depth`, `--commit-only`, and `--static-deltas-only`.
 - Tombstone commits. `ostrya remote prune` refuses a bucket `config` that
   sets `[core] tombstone-commits=true`.
 - These options of `fsck`: `--add-tombstones`, `--all`, `--verify-bindings`,

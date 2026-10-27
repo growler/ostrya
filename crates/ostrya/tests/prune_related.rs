@@ -12,7 +12,7 @@ mod common;
 
 use std::path::Path;
 
-use common::TmpDir;
+use common::{TmpDir, dependency_warning, store_with_field2};
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, DictBuilder,
     Error, MutableTree, ObjectType, PruneOptions, RelatedField, RelatedWarning, Repo, RepoMode,
@@ -91,31 +91,6 @@ async fn commit(
     }
     txn.commit().await.unwrap();
     commit
-}
-
-/// One entry of field 2 as stored: a name and the bytes of a checksum.
-type Field2Entry<'a> = (&'a str, &'a [u8]);
-
-/// Stores a copy of the commit `source` with field 2 set to `related`, with
-/// no check of the entries, and returns its checksum.
-async fn store_with_field2(
-    repo: &Repo,
-    source: &Checksum,
-    related: &[Field2Entry<'_>],
-) -> Checksum {
-    let (mut commit, _) = repo.load_commit(source).await.unwrap();
-    commit.related = related
-        .iter()
-        .map(|(name, bytes)| ((*name).to_owned(), bytes.to_vec()))
-        .collect();
-    let bytes = commit.serialize().unwrap();
-    let txn = repo.transaction().await.unwrap();
-    let written = txn
-        .write_metadata(ObjectType::Commit, None, &bytes)
-        .await
-        .unwrap();
-    txn.commit().await.unwrap();
-    written
 }
 
 /// Returns an `a(say)` variant of the build sources `entries`.
@@ -197,15 +172,6 @@ fn build_source_warning(commit: Checksum, reason: &str) -> RelatedWarning {
     RelatedWarning {
         commit,
         field: RelatedField::BuildSources,
-        reason: reason.to_owned(),
-    }
-}
-
-/// Returns a warning of the dependencies of `commit`.
-fn dependency_warning(commit: Checksum, reason: &str) -> RelatedWarning {
-    RelatedWarning {
-        commit,
-        field: RelatedField::Dependencies,
         reason: reason.to_owned(),
     }
 }

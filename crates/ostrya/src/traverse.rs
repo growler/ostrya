@@ -140,11 +140,28 @@ impl Arrival {
     }
 }
 
-/// The furthest bounds under which the walk expanded one commit.
+/// What the walk read of one commit.
+#[derive(Debug, Clone, Copy, Default)]
+enum Read {
+    /// The walk did not read the commit.
+    #[default]
+    Unread,
+    /// The store does not hold the commit.
+    Absent,
+    /// The store holds the commit, with this parent and this timestamp.
+    Present {
+        parent: Option<Checksum>,
+        timestamp: u64,
+    },
+}
+
+/// The furthest bounds under which the walk expanded one commit, and the
+/// parent and the timestamp of the commit.
 ///
 /// The walk expands a commit again only under a bound that reaches further
 /// than each earlier bound of that commit. So each expansion strictly extends
-/// `depth` or `since`, and the walk ends.
+/// `depth` or `since`, and the walk ends. A second expansion follows the
+/// parent that `read` holds, and reads the commit no second time.
 #[derive(Debug, Clone, Copy, Default)]
 struct Expanded {
     /// The depth bound of an expansion that reaches furthest.
@@ -158,9 +175,17 @@ struct Expanded {
     /// rejects each conditional arrival at or after this bound, and reads the
     /// commit no second time.
     rejected_since: Option<u64>,
+    /// What the walk read of the commit.
+    read: Read,
 }
 
 impl Expanded {
+    /// Returns `true` if the walk expanded the commit under one bound or
+    /// more.
+    fn expanded(&self) -> bool {
+        self.depth.is_some() || self.since.is_some()
+    }
+
     /// Returns `true` if an earlier expansion reaches at least as far as
     /// `bound`.
     fn covers(&self, bound: ParentBound) -> bool {
@@ -168,6 +193,10 @@ impl Expanded {
             return true;
         }
         match bound {
+            // Each expansion reads the commit, its tree, and its edges other
+            // than `parent`. An expansion under `Depth(0)` follows no parent,
+            // so each earlier expansion covers it.
+            ParentBound::Depth(0) => self.expanded(),
             ParentBound::Depth(depth) => {
                 self.depth.is_some_and(|prev| reaches_at_least(prev, depth))
             }
@@ -816,7 +845,11 @@ pub(crate) async fn walk_reachable_gc<S: MetadataSource>(
 /// under the bound that reaches furthest. So the reachable set does not
 /// depend on the order of the roots. If an earlier expansion of the commit
 /// reaches at least as far, the walk skips the arrival. Otherwise it
-/// expands the commit again, to follow its parents further.
+/// expands the commit again, to follow its parents further. Each expansion
+/// reaches the tree and the edges other than `parent`, so each earlier
+/// expansion covers an arrival under `Depth(0)`. The walk keeps the parent
+/// and the timestamp of each commit that it reads, so a second expansion
+/// reads no commit.
 ///
 /// A commit that `bounded_roots` names has its own bound. The walk drops
 /// each `parent`-edge arrival at such a commit. So the bound of the seed
@@ -841,8 +874,10 @@ pub(crate) async fn walk_reachable_gc<S: MetadataSource>(
 /// A conditional arrival is an arrival over a [`ParentBound::Since`]
 /// `parent` edge. If the timestamp of the commit is below the bound, the
 /// arrival adds nothing and records no expansion. So a root that names the
-/// same commit still keeps it. The walk memoizes the rejection, so a second
-/// child that arrives under the same bound reads no commit.
+/// same commit still keeps it. The walk memoizes the rejection and the
+/// timestamp, so a second conditional arrival reads no commit. An arrival
+/// that expands the commit after a rejection reads the commit again, for
+/// its tree and its edges other than `parent`.
 ///
 /// The walk seeds each commit that a related edge names at `root_bound`.
 /// Each such seed is the same entry, so the walk pushes it at the first edge
@@ -941,6 +976,38 @@ async fn collect_reachable<S: MetadataSource>(
             continue;
         }
 
+        // The timestamp that the entry holds decides a conditional arrival
+        // with no second read of the commit.
+        if arrival == Arrival::TimedParent
+            && let ParentBound::Since(since) = bound
+            && let Read::Present { timestamp, .. } = seen.read
+            && timestamp < since
+        {
+            seen_commits
+                .entry(commit_checksum)
+                .or_default()
+                .reject(since);
+            continue;
+        }
+        // An earlier expansion read the commit, walked its tree, and read
+        // its edges other than `parent`. So a further expansion follows the
+        // parent alone.
+        if seen.expanded() {
+            seen_commits
+                .entry(commit_checksum)
+                .or_default()
+                .record(bound);
+            if gc.traverse_parent
+                && let Read::Present {
+                    parent: Some(parent),
+                    ..
+                } = seen.read
+            {
+                push_parent(&mut commit_stack, parent, bound);
+            }
+            continue;
+        }
+
         // At the first expansion of a commit, the walk reads the detached
         // metadata with the commit, in one read of the store. A `TimedParent`
         // arrival can be rejected, so it reads the commit alone, and the
@@ -962,6 +1029,14 @@ async fn collect_reachable<S: MetadataSource>(
         } else {
             try_load_commit(store, &commit_checksum).await?
         };
+        let entry = seen_commits.entry(commit_checksum).or_default();
+        entry.read = match &loaded {
+            Some(commit) => Read::Present {
+                parent: commit.parent,
+                timestamp: commit.timestamp,
+            },
+            None => Read::Absent,
+        };
 
         // The walk does not keep a commit that the timestamp bound rejects,
         // and records no expansion for it. So a ref that names the commit
@@ -972,17 +1047,11 @@ async fn collect_reachable<S: MetadataSource>(
             && let Some(commit) = &loaded
             && commit.timestamp < since
         {
-            seen_commits
-                .entry(commit_checksum)
-                .or_default()
-                .reject(since);
+            entry.reject(since);
             continue;
         }
 
-        seen_commits
-            .entry(commit_checksum)
-            .or_default()
-            .record(bound);
+        entry.record(bound);
         reachable.insert(ObjectName::new(commit_checksum, ObjectType::Commit));
 
         let Some(commit) = loaded else {
@@ -1031,19 +1100,31 @@ async fn collect_reachable<S: MetadataSource>(
         if gc.traverse_parent
             && let Some(parent) = commit.parent
         {
-            match bound {
-                ParentBound::Depth(0) => {}
-                ParentBound::Depth(depth) => {
-                    let next = if depth < 0 { -1 } else { depth - 1 };
-                    commit_stack.push((parent, ParentBound::Depth(next), Arrival::Parent));
-                }
-                ParentBound::Since(since) => {
-                    commit_stack.push((parent, ParentBound::Since(since), Arrival::TimedParent));
-                }
-            }
+            push_parent(&mut commit_stack, parent, bound);
         }
     }
     Ok(())
+}
+
+/// Pushes the arrival at `parent` over the `parent` edge of a commit that
+/// the walk expands under `bound`.
+///
+/// Under `Depth(0)`, the walk follows no parent and pushes nothing.
+fn push_parent(
+    commit_stack: &mut Vec<(Checksum, ParentBound, Arrival)>,
+    parent: Checksum,
+    bound: ParentBound,
+) {
+    match bound {
+        ParentBound::Depth(0) => {}
+        ParentBound::Depth(depth) => {
+            let next = if depth < 0 { -1 } else { depth - 1 };
+            commit_stack.push((parent, ParentBound::Depth(next), Arrival::Parent));
+        }
+        ParentBound::Since(since) => {
+            commit_stack.push((parent, ParentBound::Since(since), Arrival::TimedParent));
+        }
+    }
 }
 
 /// Adds to `reachable` the name of each dirtree, dirmeta, and file object

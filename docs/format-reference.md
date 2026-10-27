@@ -2975,7 +2975,8 @@ that they reach:
   than the size cap of a metadata object, fails the prune. The prune then
   deletes nothing.
 
-The prune of a bucket repository reads neither field.
+The prune of a bucket repository reads field 2 alone ("The prune of a
+bucket repository").
 
 The `ostree` command keeps no commit for an entry of field 2
 (`conformance/cli-behavior.md`, "Related commits in a prune").
@@ -6609,16 +6610,19 @@ before a request. The prune also refuses `--break-lock` together with
 writer lock of another writer. The prune keeps the objects of the listing
 that a local prune with the same options keeps in a repository with the
 same refs and objects, and also the objects of the commits that the summary
-names. Two differences apply:
+names and of their dependencies, under the bound of the run. Two
+differences apply:
 
-- The prune reads neither related field of a commit ("Related commits"). So
-  it deletes a related commit that no other root reaches, and the objects
-  that only that commit reaches. It also deletes the `.commitmeta` and the
-  `.cfs` of a related commit that the listing does not hold. The local prune
-  keeps these. With `--refs-only` or `--keep-younger-than`, the local prune
-  keeps each related commit of a reached commit. Without these options,
-  each commit of the listing is a root, and the difference is the
-  `.commitmeta` and the `.cfs` of an absent related commit alone.
+- The prune reads field 2 of each commit that the walk reaches, and keeps
+  the dependencies as the local prune keeps them ("Related commits"). It
+  reads no `.commitmeta`, so it reads no build source. So it deletes a build
+  source that no other root reaches, and the objects that only that commit
+  reaches. It also deletes the `.commitmeta` and the `.cfs` of a build
+  source that the listing does not hold. The local prune keeps these. With
+  `--refs-only` or `--keep-younger-than`, the local prune keeps each build
+  source of a reached commit. Without these options, each commit of the
+  listing is a root, and the difference is the `.commitmeta` and the `.cfs`
+  of an absent build source alone.
 - Without `--refs-only` and `--keep-younger-than`, the prune also deletes
   the `.commitmeta` and the `.cfs` of a parent commit that the listing does
   not hold. The local prune keeps these when its bound reaches that parent.
@@ -6638,6 +6642,25 @@ The roots are:
   kept objects of the listing do not change, with one exception: the walk
   does not reach a parent commit that the listing does not hold, so the
   prune deletes the `.commitmeta` and the `.cfs` of that commit.
+- the commit of each field 2 entry of a commit that the walk reaches: the
+  dependencies. With `--refs-only` or `--keep-younger-than`, a dependency is
+  a root under the bound of `--depth` or `--keep-younger-than`, also a
+  dependency of a commit of the summary. Without these options, a
+  dependency keeps no parent, as each other root, so the walk still reads
+  each commit one time.
+
+The walk reads field 2 from the bytes of each commit object that it reads,
+and sends no other request for it. It roots on field 2 entries that are not
+sorted, on two entries with one name, and on the field 2 entries of a
+dependency. A defective field 2 entry, with an empty name or with a
+checksum that is not 32 bytes, roots nothing and gives one warning. The
+other entries of the field root as usual. The text of the warning is
+`related commits in field 2 of commit <checksum>: <reason>`, and
+`ostrya remote prune` writes each warning on standard error after
+`warning: `, before the lines on standard output, and exits 0. An entry
+that names a commit that the listing does not hold roots nothing and gives
+no warning. The walk keeps the name of that commit, so the prune keeps its
+`.commitmeta` and its `.cfs`.
 
 The walk reads each commit and each dirtree that it reaches with one `GET`.
 It reads the commits one at a time. It reads the dirtrees of the tree of
@@ -6653,8 +6676,10 @@ its first delete, and a run of the fsck with the repair deletes the bad
 object. The walk sends no request for an object that the listing does not
 hold, and reads it as absent: an absent commit or dirtree keeps its own name
 and no object below it. A listed object that is gone at its read fails the
-run. With `--refs-only` or `--keep-younger-than`, the walk can read a commit
-again when it reaches the commit under a bound that goes further.
+run. With `--keep-younger-than`, the walk reads a commit a second time
+when the time bound rejected the commit as a parent and the walk then
+reaches the commit as a root, for example as a dependency. The walk reads
+each other commit one time.
 
 A kept commit keeps its `.commitmeta` and its `.cfs`. A partial commit that
 the prune keeps keeps its marker. An object that only a dirtree that the
@@ -6665,10 +6690,8 @@ The steps of the prune are:
 
 1. The read of `config`, by the strict rule of an absent key. An absent
    `config`, a `config` that breaks a rule of "The config of a bucket
-   repository", a `config` that sets `[core] tombstone-commits=true`, and a
-   `config` that sets `[ex-ostrya] gc-root-metadata-keys` refuse the run
-   before it takes the lock. The prune writes no tombstone, and reads no
-   metadata key.
+   repository", and a `config` that sets `[core] tombstone-commits=true`
+   refuse the run before it takes the lock. The prune writes no tombstone.
 2. The take of the writer lock with `operation=prune`. A run with
    `--no-prune` takes the lock too.
 3. At the same time: the list of `refs/` and the read of each ref file, the

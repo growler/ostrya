@@ -2,6 +2,8 @@
 //!
 //! - the depth of each branch
 //! - the timestamp cut
+//! - the `parent` edge
+//! - the deletion of one commit
 //! - the commit-only sweep
 //! - the static-delta sweep
 //! - the tombstone markers
@@ -127,6 +129,27 @@ async fn shared_chain(repo: &Repo, base: &Path, branch: &str, mid: &str) -> [Che
 /// Returns `true` if the repository still holds `commit` as a commit object.
 async fn holds(repo: &Repo, commit: &Checksum) -> bool {
     repo.has_object(ObjectType::Commit, commit).await.unwrap()
+}
+
+/// Returns the checksum of the root dirtree of a stored commit.
+async fn commit_root(repo: &Repo, commit: &Checksum) -> Checksum {
+    repo.load_commit(commit).await.unwrap().0.root_dirtree
+}
+
+/// Writes the commit `first` and its child `second`, one day apart, and sets
+/// the ref `main` to `second`. Returns the two commits oldest first.
+async fn two_commits(repo: &Repo, base: &Path) -> [Checksum; 2] {
+    let first = commit(repo, base, "first", BASE_TS, None, None).await;
+    let second = commit(
+        repo,
+        base,
+        "second",
+        BASE_TS + DAY,
+        Some(first),
+        Some("main"),
+    )
+    .await;
+    [first, second]
 }
 
 /// Prunes `repo` with options that start from the refs-only default. The
@@ -514,6 +537,101 @@ fn depth_minus_two_keeps_the_head_alone() {
             "-1 is the one negative depth that keeps the whole ancestry"
         );
         assert!(!holds(&repo, &main[0]).await);
+    });
+}
+
+#[test]
+fn the_parent_edge_is_not_followed_when_it_is_off() {
+    let tmp = TmpDir::new("prune-parent-off");
+    block_on(async {
+        let repo = repo_at(tmp.path()).await;
+        let [first, second] = two_commits(&repo, tmp.path()).await;
+
+        let opts = PruneOptions {
+            refs_only: true,
+            traverse_parent: false,
+            ..PruneOptions::new()
+        };
+        repo.prune(&opts).await.unwrap();
+        assert!(holds(&repo, &second).await, "the ref's commit survives");
+        assert!(
+            !holds(&repo, &first).await,
+            "the parent is not reachable with the parent edge off"
+        );
+    });
+}
+
+#[test]
+fn the_parent_edge_is_followed_by_default() {
+    let tmp = TmpDir::new("prune-parent-on");
+    block_on(async {
+        let repo = repo_at(tmp.path()).await;
+        let [first, second] = two_commits(&repo, tmp.path()).await;
+
+        let opts = PruneOptions {
+            refs_only: true,
+            ..PruneOptions::new()
+        };
+        repo.prune(&opts).await.unwrap();
+        assert!(holds(&repo, &second).await, "the ref's commit survives");
+        assert!(holds(&repo, &first).await, "its parent survives with it");
+    });
+}
+
+#[test]
+fn a_deleted_commit_takes_the_objects_only_it_reached() {
+    let tmp = TmpDir::new("prune-delete-orphans");
+    block_on(async {
+        let repo = repo_at(tmp.path()).await;
+        let [first, _] = two_commits(&repo, tmp.path()).await;
+        let orphaned = commit_root(&repo, &first).await;
+
+        let opts = PruneOptions {
+            delete_commit: Some(first),
+            ..PruneOptions::new()
+        };
+        repo.prune(&opts).await.unwrap();
+
+        assert!(!holds(&repo, &first).await, "the named commit is removed");
+        assert!(
+            !repo
+                .has_object(ObjectType::DirTree, &orphaned)
+                .await
+                .unwrap(),
+            "the tree only it reached is swept with it"
+        );
+    });
+}
+
+#[test]
+fn a_dry_run_keeps_the_commit_it_was_told_to_delete() {
+    let tmp = TmpDir::new("prune-dry-run-delete");
+    block_on(async {
+        let repo = repo_at(tmp.path()).await;
+        let [first, _] = two_commits(&repo, tmp.path()).await;
+        let orphaned = commit_root(&repo, &first).await;
+
+        let opts = PruneOptions {
+            delete_commit: Some(first),
+            no_prune: true,
+            ..PruneOptions::new()
+        };
+        let stats = repo.prune(&opts).await.unwrap();
+
+        assert!(
+            stats.pruned_objects > 0,
+            "the dry run reports the sweep the deletion would cause"
+        );
+        assert!(
+            holds(&repo, &first).await,
+            "the commit named for deletion stays"
+        );
+        assert!(
+            repo.has_object(ObjectType::DirTree, &orphaned)
+                .await
+                .unwrap(),
+            "and so does the tree only it reached"
+        );
     });
 }
 

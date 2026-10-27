@@ -1744,8 +1744,8 @@ local prune, and a later option of the local prune that the bucket takes
 then needs no new field. `delete_commit` and `static_deltas_only` need a
 tombstone, `only_branch`, `retain_branch_depth`, and `weak_ref_filter` read
 names of the local ref space, `commit_only` leaves objects with no commit,
-and `gc_root_metadata_keys` and `traverse_parent` read the metadata of each
-commit. These stay for a later version.
+and `traverse_parent` reads the metadata of each commit. These stay for a
+later version.
 
 The result is `BucketPruneReport`: the `PruneStats` of the local prune,
 whose `deleted_refs` is always empty, and the deleted deltas, the deleted
@@ -1948,13 +1948,11 @@ builder lost its input of a local repository and of a listing: the push
 writes no summary, so no caller gave them.
 
 The update writes `ostree.summary.tombstone-commits` from the `config`, as
-the local summary does, and refuses no value of it. It ignores
-`[ex-ostrya] gc-root-metadata-keys`, which the summary does not read. A
-ref whose commit has a partial-commit marker is in the summary, and the
-update reads no key under `state/`: the marker tells a push to upload the
-missing objects, and the commit object is in the bucket. A bucket
-repository with no ref gets a summary with an empty field 0, as a local
-repository with no ref does.
+the local summary does, and refuses no value of it. A ref whose commit has
+a partial-commit marker is in the summary, and the update reads no key
+under `state/`: the marker tells a push to upload the missing objects, and
+the commit object is in the bucket. A bucket repository with no ref gets a
+summary with an empty field 0, as a local repository with no ref does.
 
 A ref name that is a directory of another ref name of the same directory,
 as `a` is of `a/b`, refuses the update with the check of the push. The
@@ -2084,7 +2082,7 @@ the rules.
 - A related entry that names a commit that the repository does not hold
   gives no error, and the walk reads nothing below it. The prune keeps the
   name of that commit, as it keeps the name of an absent parent within the
-  bound and of an absent target of a GC anchor key. So it keeps the
+  bound. So it keeps the
   `.commitmeta` and the `.cfs` of that commit if the store holds them.
 - A prune that reads a defective related value gives a warning and
   continues. The warning names the commit, the field, and the reason. The
@@ -2097,20 +2095,12 @@ the rules.
   commit that it names. A build cache needs the refs of its sources, and not
   only the commits. A distributed build cache mirrors the refs of its build
   sources with the existing pull and push.
-
-## GC anchor keys
-
-- `Repo::prune` reads `[ex-ostrya] gc-root-metadata-keys` and merges the
-  keys of the caller into the list. The config key is the policy of the
-  repository, and it only adds roots. Thus a library caller cannot remove a
-  config key from a run, and a run keeps at least what the same run with no
-  config key keeps.
-- A commit write refuses a value of an anchor key that a prune refuses.
-  Else the commit enters the store, and each later prune that reaches it
-  fails.
-- The library does not know where an entry of a metadata dict comes from.
-  Thus the check cannot exempt a value that `ostrya commit --keep-metadata`
-  copies from the parent commit.
+- A config key that names more metadata keys with commit checksums was
+  rejected. A reader then needs the repository config to find the related
+  commits, and one dict is valid in one repository and not valid in
+  another. If an upstream drops a key from the detached metadata and a
+  downstream roots on that key, the downstream prune deletes the commits
+  that the key kept, and no call reports it.
 
 ## The pull scheduler
 

@@ -2313,44 +2313,11 @@ A ref name the tool's ref enumeration skips is read by the tool's
 `prune --refs-only` as unreachable, so the tool deletes a commit the port keeps.
 That is the out-of-band ref name of "P1", and the pair is stated there.
 
-Two repository config keys in the `[ex-ostrya]` group are port extensions with
-no option and no counterpart in the tool. They part `ostrya` from `ostree` on a
-repository that sets one, and the divergence is by intent
+One repository config key in the `[ex-ostrya]` group is a port extension with
+no option and no counterpart in the tool. It parts `ostrya` from `ostree` on a
+repository that sets it, and the divergence is by intent
 (`format-reference.md`, "Configuration keys of the port"):
 
-- `gc-root-metadata-keys` names metadata keys a prune reads for further
-  reachable commits. `ostrya prune` roots on them; `ostree prune` does not, and
-  sweeps what only they reach. The key carries roots alone -- it holds no
-  counterpart for the parent edge and does not touch `--refs-only` -- so a
-  configured `ostrya prune` keeps at least what `ostree prune` keeps, and never
-  less. A value the key-file syntax cannot split fails the prune, which then
-  deletes nothing.
-
-  The library also reads the key when it writes a commit or the detached
-  metadata of a commit, and it refuses a value of a listed key that a prune
-  refuses. It does not check a commit that a caller gives as the bytes of a
-  metadata object. `ostrya commit` refuses an `--add-metadata-string` or
-  `--add-detached-metadata-string` entry of a listed key, and an
-  `--add-metadata` or `--keep-metadata` value of a listed key that is not an
-  `aay`, an `a(say)`, or an `a{s(say)}` with checksums of 32 bytes. It writes
-  `error: metadata key KEY is in [ex-ostrya] gc-root-metadata-keys: REASON`,
-  exits 1, and writes no object, no ref, and no `.commitmeta`. `ostree commit`
-  writes each such value. The refusal comes after the editor, the repository
-  lock, and the walk of the tree. The refusal of the commit metadata comes
-  before the refusal of a branch name that the revision syntax shadows or that
-  the refspec grammar refuses, and before the second check of the tags. The
-  checks of the tag names come before the repository lock. The refusal of the
-  detached metadata comes at the end of the command, after the signatures.
-  Each commit that writes metadata, the binding keys included, reads the key
-  when it writes the commit, so a value the key-file syntax cannot split fails
-  it. A commit with `--no-bindings` and `--add-detached-metadata-string` as its
-  only metadata option reads the key at the end of the command. A commit with
-  `--no-bindings` and no metadata option does not read the key. The port
-  builds the binding keys of the anchor commit of a collection, so the anchor
-  commit that `ostrya summary -u`, `ostrya receive`, and `ostrya serve` write
-  takes no check. A pull, `pull-local`, and the mirror push and the server
-  commit of `ostrya receive` and `ostrya serve` store the values with no check,
-  and a prune that reaches such a commit fails.
 - `detached-metadata-exclude` names detached-metadata keys the repository does
   not store on receive. `ostrya pull` and `ostrya pull-local` drop them from the
   `.commitmeta` they write; the tool's pull writes what the source holds. The
@@ -2360,9 +2327,8 @@ repository that sets one, and the divergence is by intent
   drops them from the detached metadata it sends, and `ostrya receive` drops
   them from the detached metadata it stores.
 
-Neither key is derived from the other, and no harness repository sets either
-(`harness.md`, "Constraints"), so every matrix cell reads the tool's own
-behavior.
+No harness repository sets the key (`harness.md`, "Constraints"), so every
+matrix cell reads the tool's own behavior.
 
 `fsck` accepts `--repo`, `--add-tombstones`, `-q/--quiet`, `-a/--all`,
 `--delete`, `--verify-bindings`, `--verify-back-refs`, and the port extension
@@ -5616,34 +5582,22 @@ Observed by running the tool (2026.1).
   refusal and the port's earlier check, so `commit --statoverride=no-such-file`
   against a repository holding `fsync=bogus` names the config from the tool and
   the file from the port. Both exit 1 with no object and no ref written.
-  `commit` also reads `[ex-ostrya] gc-root-metadata-keys` when it writes the
-  commit. A run whose only metadata option is `--add-detached-metadata-string`,
-  with `--no-bindings`, reads the key at the end of the command, after the
-  signatures. `ostree commit` ignores the `[ex-ostrya]` group and exits 0, so
-  a fault in that key parts the tool and the port ("P2", `prune`). Within
-  `checkout` the port reads `[core] fsync` alone, and it reads it after the
-  composefs export decision, which applies no durability policy, and ahead of
-  the first checkout. A record stream carrying no pair reaches the read and
+  Within `checkout` the port reads `[core] fsync` alone, and it reads it after
+  the composefs export decision, which applies no durability policy, and ahead
+  of the first checkout. A record stream carrying no pair reaches the read and
   refuses such a value too. A `--composefs` line reaches it nowhere, so the port
   exports the image at exit 0 where the tool refuses the repository, which
   "checkout" above records as a divergence. Within `prune` the port reads
   `[core] locking` first, in the `prune` handler, for the line it writes where
-  that key is false. The library then reads `[ex-ostrya]
-  gc-root-metadata-keys` before the repository lock. It reads `[core] locking`
-  a second time, together with `[core] lock-timeout-secs`, as it takes the
-  repository lock, and it reads `[core] tombstone-commits` and `[core] fsync`
-  inside the run. All of them come after every option refusal and after the
+  that key is false. The library reads `[core] locking` a second time, together
+  with `[core] lock-timeout-secs`, as it takes the repository lock, and it
+  reads `[core] tombstone-commits` and `[core] fsync` inside the run. All of
+  them come after every option refusal and after the
   revision `--delete-commit` names, so a line the port refuses on its options
-  refuses the same way whatever those values hold. A repository holding
-  `locking=bogus` and a `gc-root-metadata-keys` value that does not parse
-  refuses on `locking`
-  (`prune_refuses_a_bad_locking_value_before_a_malformed_key_list` in
-  `crates/ostrya-cli/tests/cli.rs`). The tool reads neither value as the port
-  does, so no conformance record covers the pair. The timeout is read even
+  refuses the same way whatever those values hold. The timeout is read even
   where `locking` is false, so a malformed `lock-timeout-secs` refuses a prune
   on a repository that takes no lock. A `--static-deltas-only` run returns
-  before the last two, so it refuses neither of them. It reads
-  `gc-root-metadata-keys`, so a value that does not parse refuses it.
+  before the last two, so it refuses neither of them.
 - The port reads at most 1048576 bytes of `config`. It refuses a larger file
   with `config exceeds the 1048576-byte size cap` when it opens a repository,
   and at each later read of the file. The tool reads a `config` of any size.

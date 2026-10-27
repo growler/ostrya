@@ -862,13 +862,6 @@ fn each_refused_option_fails_before_a_request() {
                 },
             ),
             (
-                "gc_root_metadata_keys",
-                PruneOptions {
-                    gc_root_metadata_keys: vec!["k".into()],
-                    ..PruneOptions::default()
-                },
-            ),
-            (
                 "traverse_parent",
                 PruneOptions {
                     traverse_parent: false,

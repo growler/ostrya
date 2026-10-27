@@ -59,7 +59,7 @@ use ostrya_core::{
     Checksum, Commit, DirMeta, DirTree, ObjectType, RepoMode, Type, Value, Xattrs, loose_path,
 };
 
-use crate::commit::{append_dict_entry, check_gc_anchors};
+use crate::commit::append_dict_entry;
 use crate::error::{Error, Result};
 use crate::file::{FileKind, FileObject};
 use crate::related::{self, RelatedField};
@@ -1014,11 +1014,6 @@ impl Repo {
     /// `txn` and returns its checksum. The new commit publishes when `txn`
     /// commits.
     ///
-    /// The call checks the values of the GC anchor keys in the new metadata
-    /// dict, as [`write_commit`](Transaction::write_commit) does. The check
-    /// includes the entries that the call copies from `commit`. On a refusal,
-    /// the call stages nothing.
-    ///
     /// The new commit keeps field 2 of `commit`, the dependencies, with no
     /// change. Before the call builds the image, it checks field 2 with the
     /// rules of [`write_commit`](Transaction::write_commit): each entry has a
@@ -1035,11 +1030,6 @@ impl Repo {
     ///
     /// - [`Error::InvalidFormat`] if `commit` already carries
     ///   `ostree.composefs.digest.v0`.
-    /// - [`Error::InvalidGcAnchor`] if an entry of the new metadata gives a
-    ///   key of `[ex-ostrya] gc-root-metadata-keys` a value that a prune
-    ///   refuses.
-    /// - [`Error::Core`] if `[ex-ostrya] gc-root-metadata-keys` holds a
-    ///   malformed escape sequence.
     /// - [`Error::InvalidRelated`] with `commit` if field 2 of `commit` is
     ///   defective, if its entries are not sorted or have a name two times,
     ///   or if a dependency is absent, partial, or has a dependency of its
@@ -1091,7 +1081,6 @@ impl Repo {
         let digest_type = Type::parse(DIGEST_SIGNATURE).map_err(ostrya_core::Error::from)?;
         let value = Value::variant(digest_type, Value::Bytes(fs_verity.to_vec()));
         append_dict_entry(&mut commit_obj.metadata, COMPOSEFS_DIGEST_KEY, value)?;
-        check_gc_anchors(self.config(), [&commit_obj.metadata])?;
         let bytes = commit_obj.serialize()?;
         txn.write_metadata(ObjectType::Commit, None, &bytes).await
     }

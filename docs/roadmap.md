@@ -95,11 +95,7 @@ for it.
   so the handoff to the blocking pool is a large part of a run over many
   small objects. The `Slots` driver of the pull has the necessary shape.
 - A config key that marks weak refs by a name pattern. `Repo::prune` takes
-  the classification as a function, and `[ex-ostrya] gc-root-metadata-keys`
-  marks roots by a metadata key.
-- An option that turns off the keys of `[ex-ostrya] gc-root-metadata-keys`
-  for one run of `Repo::prune`. It comes when a caller needs a run that
-  keeps less than the policy of the repository.
+  the classification as a function.
 - The detached metadata in an offline apply.
   `Repo::apply_static_delta_offline` and `Repo::apply_static_delta` write no
   `.commitmeta`. The `ostree` command writes the `.commitmeta` of the target
@@ -120,6 +116,12 @@ for it.
   ECDSA P-521 and ML-DSA. Each type can come later with its key feature, its
   tool fixtures, and the cross-check with the `ostree` command. A type that
   needs a new crate needs the authorization of the maintainer first.
+- A light commit parse in the prune walk. For each commit that the walk
+  expands, `Commit::parse` builds the `a{sv}` metadata tree and copies the
+  subject and the body. The walk also decodes the full detached dict,
+  signatures included. It reads the parent, the root dirtree and dirmeta, the
+  timestamp, field 2, and the `ostrya.related` key alone. A parse that checks
+  the normal form and decodes these fields alone refuses the same commits.
 
 ## Gaps of bucket repositories
 

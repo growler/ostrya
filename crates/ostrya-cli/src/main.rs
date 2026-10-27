@@ -267,9 +267,7 @@ enum Command {
     /// command deletes each loose object that the walk does not reach.
     /// --refs-only, --only-branch, --retain-branch-depth, and
     /// --keep-younger-than start the walk from the refs alone. The depth and
-    /// date options then limit the history of each ref. The commits that the
-    /// metadata keys of the config key `[ex-ostrya] gc-root-metadata-keys`
-    /// name are also roots.
+    /// date options then limit the history of each ref.
     ///
     /// The related commits of each commit that the walk reaches are also
     /// roots, under the bound of --depth or --keep-younger-than. A related
@@ -858,10 +856,6 @@ struct CommitArgs {
     /// separate entry. The command refuses an argument with no `=` and an
     /// empty key. The metadata holds these entries first, then the
     /// --add-metadata entries, then the --keep-metadata entries.
-    ///
-    /// A prune refuses a string value of a key of `[ex-ostrya]
-    /// gc-root-metadata-keys`. So the command refuses such a KEY when it
-    /// writes the commit, and it writes no object and no ref.
     #[arg(long, value_name = "KEY=VALUE")]
     add_metadata_string: Vec<String>,
     /// Add a key to the commit metadata, with a value in GVariant text form.
@@ -870,11 +864,6 @@ struct CommitArgs {
     /// the text. The command refuses an argument with no `=`, a value that
     /// does not parse, and an empty key. A repeated key stays as a separate
     /// entry.
-    ///
-    /// The value of a key of `[ex-ostrya] gc-root-metadata-keys` has the type
-    /// `aay`, `a(say)`, or `a{s(say)}`, and each checksum in it has 32 bytes.
-    /// The command refuses each other value of such a key when it writes the
-    /// commit, and it writes no object and no ref.
     #[arg(long, value_name = "KEY=VALUE")]
     add_metadata: Vec<String>,
     /// Carry this metadata key over from the parent commit.
@@ -882,10 +871,6 @@ struct CommitArgs {
     /// The value keeps its bytes. The option needs a parent, from --parent or
     /// from the tip of --branch. The command refuses a key that the parent
     /// does not hold.
-    ///
-    /// The command checks a carried value of a key of `[ex-ostrya]
-    /// gc-root-metadata-keys` as it checks an --add-metadata value. A parent
-    /// from a pull can hold a value that this check refuses.
     #[arg(long, value_name = "KEY")]
     keep_metadata: Vec<String>,
     /// Add a string-valued key to the detached commit metadata.
@@ -894,11 +879,6 @@ struct CommitArgs {
     /// detached metadata of the commit, so a signature that an earlier run
     /// left on the same commit checksum goes. The signatures of this run come
     /// after these entries.
-    ///
-    /// A prune refuses a string value of a key of `[ex-ostrya]
-    /// gc-root-metadata-keys`. So the command refuses such a KEY at the end of
-    /// the command, after any signatures, and it writes no object, no ref, and
-    /// no .commitmeta file.
     #[arg(long, value_name = "KEY=VALUE")]
     add_detached_metadata_string: Vec<String>,
     /// Record owner 0:0, modes of `perm & 0755`, and no extended attributes.
@@ -12799,13 +12779,10 @@ async fn prune(repo: Repo, args: PruneArgs) -> Result<()> {
     // The config reads of a prune come in this order:
     //
     // 1. `[core] locking`, here, for the warning line.
-    // 2. `[ex-ostrya] gc-root-metadata-keys`, in `Repo::prune`, before the
-    //    lock.
-    // 3. `[core] locking` and `[core] lock-timeout-secs`, at the lock.
-    // 4. `[core] tombstone-commits` and `[core] fsync`, in the run.
+    // 2. `[core] locking` and `[core] lock-timeout-secs`, at the lock.
+    // 3. `[core] tombstone-commits` and `[core] fsync`, in the run.
     //
-    // So a `locking=bogus` refusal comes before a refusal of a key list that
-    // does not parse. The read is here, after the options are assembled.
+    // The read is here, after the options are assembled.
     // `commit` reads the four `[core]` keys of its transaction at the top of
     // its function. If this read moves to the top of this function, a
     // `locking=bogus` refusal comes before the `--keep-younger-than`,

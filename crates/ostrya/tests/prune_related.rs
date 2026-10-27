@@ -844,3 +844,117 @@ fn a_commitmeta_that_does_not_parse_fails_the_prune() {
         );
     });
 }
+
+/// Appends `text` to the config of the repository under `base/repo` and
+/// returns a new handle, which reads the changed config.
+async fn reconfigure(base: &Path, text: &str) -> Repo {
+    let path = base.join("repo");
+    let config = path.join("config");
+    let mut current = std::fs::read_to_string(&config).unwrap();
+    current.push_str(text);
+    std::fs::write(&config, current).unwrap();
+    Repo::open(&path).await.unwrap()
+}
+
+#[test]
+fn a_config_key_that_names_metadata_keys_changes_no_write_and_no_prune() {
+    // The metadata key that the commits of this test give commit checksums
+    // and strings.
+    const ANCHORS: &str = "test.anchors";
+    // The config of each variant. The `[ex-ostrya]` group holds no key that
+    // names metadata keys, so the port reads none of these values.
+    let variants = [
+        ("absent", ""),
+        (
+            "valid",
+            "\n[ex-ostrya]\ngc-root-metadata-keys=test.anchors;ostrya.related\n",
+        ),
+        (
+            "malformed",
+            "\n[ex-ostrya]\ngc-root-metadata-keys=app.roots\\\n",
+        ),
+    ];
+    let mut outcomes = Vec::new();
+    for (label, text) in variants {
+        let tmp = TmpDir::new(&format!("prune-related-config-{label}"));
+        let outcome = block_on(async {
+            repo_with_trees(tmp.path(), &["orphan", "head", "cfs"]).await;
+            let repo = reconfigure(tmp.path(), text).await;
+            let orphan = commit(&repo, tmp.path(), "orphan", None, &[], None).await;
+            let string = dict(vec![(
+                ANCHORS,
+                (Type::parse("s").unwrap(), Value::Str("main".into())),
+            )]);
+
+            // The commit metadata of the head names the orphan in an `aay`.
+            let txn = repo.transaction().await.unwrap();
+            let root = stage_tree(&txn, tmp.path(), "head").await;
+            let checksums = dict(vec![(
+                ANCHORS,
+                (
+                    Type::parse("aay").unwrap(),
+                    Value::Array(vec![Value::Bytes(orphan.as_bytes().to_vec())]),
+                ),
+            )]);
+            let opts = CommitOptions {
+                subject: Some("head".into()),
+                timestamp: Some(FIXED_TS),
+                metadata: Some(checksums),
+                ..CommitOptions::default()
+            };
+            let head = txn.write_commit(opts, &root).await.unwrap();
+            txn.set_ref("main", Some(&head));
+            txn.commit().await.unwrap();
+
+            // Each write path takes a string value of the key.
+            repo.write_commit_detached_metadata(&head, Some(&string))
+                .await
+                .unwrap();
+            let txn = repo.transaction().await.unwrap();
+            txn.set_commit_detached_metadata(&head, string.clone());
+            txn.commit().await.unwrap();
+            let txn = repo.transaction().await.unwrap();
+            let root = stage_tree(&txn, tmp.path(), "cfs").await;
+            let opts = CommitOptions {
+                subject: Some("cfs".into()),
+                timestamp: Some(FIXED_TS),
+                metadata: Some(string.clone()),
+                ..CommitOptions::default()
+            };
+            let plain = txn.write_commit(opts, &root).await.unwrap();
+            txn.commit().await.unwrap();
+            let txn = repo.transaction().await.unwrap();
+            let cfs = repo
+                .commit_add_composefs_metadata(&txn, &plain)
+                .await
+                .unwrap();
+            txn.set_ref("cfs", Some(&cfs));
+            txn.commit().await.unwrap();
+
+            // A defective build-source value on a reached commit.
+            let strings = (
+                Type::parse("as").unwrap(),
+                Value::Array(vec![Value::Str(orphan.to_hex())]),
+            );
+            write_raw_detached(&repo, &cfs, &dict(vec![(RELATED_KEY, strings)]));
+
+            let stats = repo.prune(&refs_only()).await.unwrap();
+            assert!(
+                !holds(&repo, &orphan).await,
+                "{label}: the orphan is pruned"
+            );
+            assert_eq!(
+                stats.warnings,
+                [build_source_warning(cfs, "type is `as`, not `a(say)`")],
+                "{label}"
+            );
+            (stats.pruned_objects, stats.warnings)
+        });
+        outcomes.push(outcome);
+    }
+    assert_eq!(outcomes[0], outcomes[1], "the valid value changes nothing");
+    assert_eq!(
+        outcomes[0], outcomes[2],
+        "the malformed value changes nothing"
+    );
+}

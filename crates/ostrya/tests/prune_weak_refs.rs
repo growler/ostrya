@@ -23,15 +23,12 @@ use std::sync::{Arc, Mutex};
 use common::TmpDir;
 use ostrya::{
     Checksum, CollectionRef, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions,
-    Error, MutableTree, ObjectType, PruneOptions, Repo, RepoMode, Type, Value, WeakRefFilter,
+    Error, MutableTree, ObjectType, PruneOptions, Repo, RepoMode, WeakRefFilter,
 };
 use ostrya_rt::block_on;
 
 /// A fixed timestamp, so the commits are reproducible.
 const FIXED_TS: u64 = 1_700_000_000;
-
-/// The metadata key that these tests configure as a GC anchor key.
-const GC_ROOTS: &str = "test.gc-roots";
 
 /// Writes a tree of one file at `base/<name>`. The file content is the name.
 fn write_tree(base: &Path, name: &str) {
@@ -40,34 +37,13 @@ fn write_tree(base: &Path, name: &str) {
     std::fs::write(dir.join("payload.txt"), format!("{name}\n")).unwrap();
 }
 
-/// Returns an `a{sv}` with one key. The value of the key is an `aay` of commit
-/// checksums.
-fn checksum_list(key: &str, commits: &[Checksum]) -> Value {
-    let elements = commits
-        .iter()
-        .map(|c| Value::Bytes(c.as_bytes().to_vec()))
-        .collect();
-    dict(key, Type::parse("aay").unwrap(), Value::Array(elements))
-}
-
-/// Returns an `a{sv}` with one key, of the type and the value that the caller
-/// gives.
-fn dict(key: &str, ty: Type, value: Value) -> Value {
-    Value::Array(vec![Value::Tuple(vec![
-        Value::Str(key.to_owned()),
-        Value::Variant(Box::new((ty, value))),
-    ])])
-}
-
-/// Commits the tree `base/<name>` into `repo` with the given parent and
-/// metadata. If `branch` names a ref, the transaction also sets that ref to the
-/// new commit.
+/// Commits the tree `base/<name>` into `repo` with the given parent. If
+/// `branch` names a ref, the transaction also sets that ref to the new commit.
 async fn commit(
     repo: &Repo,
     base: &Path,
     name: &str,
     parent: Option<Checksum>,
-    metadata: Option<Value>,
     branch: Option<&str>,
 ) -> Checksum {
     use std::os::fd::AsFd;
@@ -90,7 +66,6 @@ async fn commit(
                 parent,
                 subject: Some(name.to_owned()),
                 timestamp: Some(FIXED_TS),
-                metadata,
                 ..CommitOptions::default()
             },
             &root,
@@ -133,12 +108,11 @@ async fn holds_tree(repo: &Repo, root: &Checksum) -> bool {
     repo.has_object(ObjectType::DirTree, root).await.unwrap()
 }
 
-/// Returns the prune options of these tests: refs only, the parent edge, the
-/// one configured metadata key, and the classifier of the caller.
+/// Returns the prune options of these tests: refs only, the parent edge, and
+/// the classifier of the caller.
 fn weak_options(filter: WeakRefFilter) -> PruneOptions {
     PruneOptions {
         refs_only: true,
-        gc_root_metadata_keys: vec![GC_ROOTS.to_owned()],
         weak_ref_filter: filter,
         ..PruneOptions::new()
     }
@@ -196,8 +170,8 @@ fn an_unreached_weak_ref_is_deleted_and_its_objects_swept() {
     let tmp = TmpDir::new("weak-refs-unreached");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["head", "orphan"]).await;
-        let head = commit(&repo, tmp.path(), "head", None, None, Some("main")).await;
-        let orphan = commit(&repo, tmp.path(), "orphan", None, None, Some("pool/a")).await;
+        let head = commit(&repo, tmp.path(), "head", None, Some("main")).await;
+        let orphan = commit(&repo, tmp.path(), "orphan", None, Some("pool/a")).await;
         let orphan_root = commit_root(&repo, &orphan).await;
         let head_root = commit_root(&repo, &head).await;
 
@@ -228,43 +202,6 @@ fn an_unreached_weak_ref_is_deleted_and_its_objects_swept() {
 }
 
 #[test]
-fn a_weak_ref_reached_over_a_metadata_edge_survives() {
-    let tmp = TmpDir::new("weak-refs-metadata-edge");
-    block_on(async {
-        let repo = repo_with_trees(tmp.path(), &["kept", "head"]).await;
-        let kept = commit(&repo, tmp.path(), "kept", None, None, Some("pool/a")).await;
-        let kept_root = commit_root(&repo, &kept).await;
-        commit(
-            &repo,
-            tmp.path(),
-            "head",
-            None,
-            Some(checksum_list(GC_ROOTS, &[kept])),
-            Some("main"),
-        )
-        .await;
-
-        let stats = repo.prune(&weak_options(pool_is_weak())).await.unwrap();
-
-        assert!(
-            stats.deleted_refs.is_empty(),
-            "the run deleted no ref: {:?}",
-            stats.deleted_refs
-        );
-        assert_eq!(
-            tip(&repo, "pool/a").await,
-            Some(kept),
-            "the weak ref still names its commit"
-        );
-        assert!(holds(&repo, &kept).await, "the commit survives");
-        assert!(
-            holds_tree(&repo, &kept_root).await,
-            "and so does the tree it reaches"
-        );
-    });
-}
-
-#[test]
 fn a_reached_weak_ref_reseeds_the_walk_at_its_own_bound() {
     let tmp = TmpDir::new("weak-refs-rule-b");
     block_on(async {
@@ -273,18 +210,18 @@ fn a_reached_weak_ref_reseeds_the_walk_at_its_own_bound() {
             &["c1", "c2", "c3", "c4", "c5", "d1", "d2", "d3"],
         )
         .await;
-        let c1 = commit(&repo, tmp.path(), "c1", None, None, None).await;
-        let c2 = commit(&repo, tmp.path(), "c2", Some(c1), None, None).await;
-        let c3 = commit(&repo, tmp.path(), "c3", Some(c2), None, None).await;
-        let c4 = commit(&repo, tmp.path(), "c4", Some(c3), None, Some("pool/a")).await;
-        let c5 = commit(&repo, tmp.path(), "c5", Some(c4), None, Some("main")).await;
+        let c1 = commit(&repo, tmp.path(), "c1", None, None).await;
+        let c2 = commit(&repo, tmp.path(), "c2", Some(c1), None).await;
+        let c3 = commit(&repo, tmp.path(), "c3", Some(c2), None).await;
+        let c4 = commit(&repo, tmp.path(), "c4", Some(c3), Some("pool/a")).await;
+        let c5 = commit(&repo, tmp.path(), "c5", Some(c4), Some("main")).await;
         // The control chain has a strong ref at the global depth of 1. The walk
         // keeps d3 and d2 and drops d1. This chain proves that the depth bound
         // applies, so the assertions on the weak ref's ancestry cannot pass
         // vacuously.
-        let d1 = commit(&repo, tmp.path(), "d1", None, None, None).await;
-        let d2 = commit(&repo, tmp.path(), "d2", Some(d1), None, None).await;
-        let d3 = commit(&repo, tmp.path(), "d3", Some(d2), None, Some("other")).await;
+        let d1 = commit(&repo, tmp.path(), "d1", None, None).await;
+        let d2 = commit(&repo, tmp.path(), "d2", Some(d1), None).await;
+        let d3 = commit(&repo, tmp.path(), "d3", Some(d2), Some("other")).await;
 
         let roots: Vec<Checksum> = vec![c1, c2, c3, c4, c5, d1, d2, d3];
         let mut trees = Vec::new();
@@ -335,22 +272,17 @@ fn the_ancestry_rule_b_reaches_roots_a_second_weak_ref() {
     let tmp = TmpDir::new("weak-refs-fixpoint");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["c1", "c2", "c3", "x", "y"]).await;
-        let x = commit(&repo, tmp.path(), "x", None, None, Some("pool/b")).await;
+        let x = commit(&repo, tmp.path(), "x", None, Some("pool/b")).await;
         let x_root = commit_root(&repo, &x).await;
-        // c1 holds the key that names x. The walk reads this key only if the
+        // c1 names x as a build source. The walk reads this entry only if the
         // weak ref pool/a re-seeds c2 at the bound of its own name.
-        let c1 = commit(
-            &repo,
-            tmp.path(),
-            "c1",
-            None,
-            Some(checksum_list(GC_ROOTS, &[x])),
-            None,
-        )
-        .await;
-        let c2 = commit(&repo, tmp.path(), "c2", Some(c1), None, Some("pool/a")).await;
-        let c3 = commit(&repo, tmp.path(), "c3", Some(c2), None, Some("main")).await;
-        let y = commit(&repo, tmp.path(), "y", None, None, Some("pool/c")).await;
+        let c1 = commit(&repo, tmp.path(), "c1", None, None).await;
+        repo.add_detached_related(&c1, "source/x", &x)
+            .await
+            .unwrap();
+        let c2 = commit(&repo, tmp.path(), "c2", Some(c1), Some("pool/a")).await;
+        let c3 = commit(&repo, tmp.path(), "c3", Some(c2), Some("main")).await;
+        let y = commit(&repo, tmp.path(), "y", None, Some("pool/c")).await;
         let y_root = commit_root(&repo, &y).await;
 
         let opts = PruneOptions {
@@ -392,8 +324,8 @@ fn a_dry_run_deletes_no_ref_and_still_reports_the_list() {
     let tmp = TmpDir::new("weak-refs-no-prune");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["head", "orphan"]).await;
-        commit(&repo, tmp.path(), "head", None, None, Some("main")).await;
-        let orphan = commit(&repo, tmp.path(), "orphan", None, None, Some("pool/a")).await;
+        commit(&repo, tmp.path(), "head", None, Some("main")).await;
+        let orphan = commit(&repo, tmp.path(), "orphan", None, Some("pool/a")).await;
         let orphan_root = commit_root(&repo, &orphan).await;
 
         let opts = PruneOptions {
@@ -425,8 +357,8 @@ fn a_classifier_without_refs_only_is_refused() {
     let tmp = TmpDir::new("weak-refs-refusal");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["head", "orphan"]).await;
-        commit(&repo, tmp.path(), "head", None, None, Some("main")).await;
-        let orphan = commit(&repo, tmp.path(), "orphan", None, None, Some("pool/a")).await;
+        commit(&repo, tmp.path(), "head", None, Some("main")).await;
+        let orphan = commit(&repo, tmp.path(), "orphan", None, Some("pool/a")).await;
 
         let calls = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&calls);
@@ -516,9 +448,9 @@ fn the_deleted_ref_list_is_sorted() {
         names.extend(owned.iter().map(String::as_str));
         let repo = repo_with_trees(tmp.path(), &names).await;
 
-        commit(&repo, tmp.path(), "head", None, None, Some("main")).await;
+        commit(&repo, tmp.path(), "head", None, Some("main")).await;
         for (branch, tree) in weak.iter().zip(owned.iter()) {
-            commit(&repo, tmp.path(), tree, None, None, Some(branch)).await;
+            commit(&repo, tmp.path(), tree, None, Some(branch)).await;
         }
 
         let filter = WeakRefFilter::new(|name: &str, _: &Checksum| name == "main");
@@ -557,8 +489,8 @@ fn a_ref_that_moved_under_the_classifier_is_not_unlinked() {
     let tmp = TmpDir::new("weak-refs-moved");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["head", "orphan"]).await;
-        let head = commit(&repo, tmp.path(), "head", None, None, Some("main")).await;
-        commit(&repo, tmp.path(), "orphan", None, None, Some("pool/a")).await;
+        let head = commit(&repo, tmp.path(), "head", None, Some("main")).await;
+        commit(&repo, tmp.path(), "orphan", None, Some("pool/a")).await;
 
         let repo_path = tmp.path().join("repo");
         let calls = Arc::new(AtomicUsize::new(0));
@@ -607,8 +539,8 @@ fn a_local_ref_name_holding_a_colon_is_never_classified() {
     let tmp = TmpDir::new("weak-refs-colon");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["head", "colon"]).await;
-        commit(&repo, tmp.path(), "head", None, None, Some("main")).await;
-        let odd = commit(&repo, tmp.path(), "colon", None, None, None).await;
+        commit(&repo, tmp.path(), "head", None, Some("main")).await;
+        let odd = commit(&repo, tmp.path(), "colon", None, None).await;
 
         // `set_ref_immediate` reads the `:` as a remote separator, so the test
         // writes the file with blocking `std::fs`.
@@ -648,11 +580,11 @@ fn a_weak_alias_over_a_weak_ref_leaves_no_ref_file() {
     let tmp = TmpDir::new("weak-refs-alias");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["head", "first", "second"]).await;
-        commit(&repo, tmp.path(), "head", None, None, Some("main")).await;
+        commit(&repo, tmp.path(), "head", None, Some("main")).await;
 
         // The test writes the target first, so a listing in creation order
         // reaches the target before the alias that names it.
-        let first = commit(&repo, tmp.path(), "first", None, None, Some("pool/b")).await;
+        let first = commit(&repo, tmp.path(), "first", None, Some("pool/b")).await;
         repo.set_ref_alias_immediate("pool/a", "pool/b")
             .await
             .unwrap();
@@ -662,7 +594,7 @@ fn a_weak_alias_over_a_weak_ref_leaves_no_ref_file() {
         repo.set_ref_alias_immediate("pool/x", "pool/y")
             .await
             .unwrap();
-        let second = commit(&repo, tmp.path(), "second", None, None, Some("pool/y")).await;
+        let second = commit(&repo, tmp.path(), "second", None, Some("pool/y")).await;
 
         let stats = repo.prune(&weak_options(pool_is_weak())).await.unwrap();
 
@@ -702,9 +634,9 @@ fn a_reached_weak_ref_narrows_the_arrival_bound() {
     let tmp = TmpDir::new("weak-refs-rule-b-narrow");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["c1", "c2", "c3"]).await;
-        let c1 = commit(&repo, tmp.path(), "c1", None, None, None).await;
-        let c2 = commit(&repo, tmp.path(), "c2", Some(c1), None, Some("pool/a")).await;
-        let c3 = commit(&repo, tmp.path(), "c3", Some(c2), None, Some("main")).await;
+        let c1 = commit(&repo, tmp.path(), "c1", None, None).await;
+        let c2 = commit(&repo, tmp.path(), "c2", Some(c1), Some("pool/a")).await;
+        let c3 = commit(&repo, tmp.path(), "c3", Some(c2), Some("main")).await;
 
         // `main` reaches c2 with the whole ancestry left. The weak ref's own
         // name carries a bound that keeps the head alone. A depth of -2 is one
@@ -745,35 +677,14 @@ fn a_weak_remote_ref_is_classified_and_deleted() {
     let tmp = TmpDir::new("weak-refs-remote");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["head", "keep", "drop"]).await;
-        let keep = commit(
-            &repo,
-            tmp.path(),
-            "keep",
-            None,
-            None,
-            Some("origin:pool/keep"),
-        )
-        .await;
+        let keep = commit(&repo, tmp.path(), "keep", None, Some("origin:pool/keep")).await;
         let keep_root = commit_root(&repo, &keep).await;
-        let dropped = commit(
-            &repo,
-            tmp.path(),
-            "drop",
-            None,
-            None,
-            Some("origin:pool/drop"),
-        )
-        .await;
+        let dropped = commit(&repo, tmp.path(), "drop", None, Some("origin:pool/drop")).await;
         let dropped_root = commit_root(&repo, &dropped).await;
-        commit(
-            &repo,
-            tmp.path(),
-            "head",
-            None,
-            Some(checksum_list(GC_ROOTS, &[keep])),
-            Some("main"),
-        )
-        .await;
+        let head = commit(&repo, tmp.path(), "head", None, Some("main")).await;
+        repo.add_detached_related(&head, "source/keep", &keep)
+            .await
+            .unwrap();
 
         let (filter, seen) = recording_pool_is_weak();
         let stats = repo.prune(&weak_options(filter)).await.unwrap();
@@ -824,9 +735,9 @@ fn a_mirror_ref_is_never_classified_and_never_deleted() {
     let tmp = TmpDir::new("weak-refs-mirror");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["head", "a", "m"]).await;
-        commit(&repo, tmp.path(), "head", None, None, Some("main")).await;
-        let orphan = commit(&repo, tmp.path(), "a", None, None, Some("pool/a")).await;
-        let mirrored = commit(&repo, tmp.path(), "m", None, None, None).await;
+        commit(&repo, tmp.path(), "head", None, Some("main")).await;
+        let orphan = commit(&repo, tmp.path(), "a", None, Some("pool/a")).await;
+        let mirrored = commit(&repo, tmp.path(), "m", None, None).await;
         let mirrored_root = commit_root(&repo, &mirrored).await;
         let cref = CollectionRef::new("org.example.Coll", "pool/m");
         repo.set_collection_ref_immediate(&cref, Some(&mirrored))
@@ -883,8 +794,8 @@ fn a_strong_alias_over_a_weak_ref_keeps_both_refs() {
     let tmp = TmpDir::new("weak-refs-strong-alias");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["head", "target"]).await;
-        commit(&repo, tmp.path(), "head", None, None, Some("main")).await;
-        let x = commit(&repo, tmp.path(), "target", None, None, Some("pool/target")).await;
+        commit(&repo, tmp.path(), "head", None, Some("main")).await;
+        let x = commit(&repo, tmp.path(), "target", None, Some("pool/target")).await;
         let x_root = commit_root(&repo, &x).await;
         repo.set_ref_alias_immediate("keepalive", "pool/target")
             .await
@@ -927,7 +838,7 @@ fn a_weak_alias_over_a_strong_ref_survives() {
     let tmp = TmpDir::new("weak-refs-weak-alias");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["head"]).await;
-        let x = commit(&repo, tmp.path(), "head", None, None, Some("main")).await;
+        let x = commit(&repo, tmp.path(), "head", None, Some("main")).await;
         repo.set_ref_alias_immediate("pool/alias", "main")
             .await
             .unwrap();
@@ -966,8 +877,8 @@ fn a_dangling_alias_is_never_classified_and_never_deleted() {
     let tmp = TmpDir::new("weak-refs-dangling-alias");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["head", "orphan"]).await;
-        commit(&repo, tmp.path(), "head", None, None, Some("main")).await;
-        let orphan = commit(&repo, tmp.path(), "orphan", None, None, Some("pool/a")).await;
+        commit(&repo, tmp.path(), "head", None, Some("main")).await;
+        let orphan = commit(&repo, tmp.path(), "orphan", None, Some("pool/a")).await;
         // The test never writes `pool/missing`, so the link dangles.
         repo.set_ref_alias_immediate("pool/dangle", "pool/missing")
             .await
@@ -1018,18 +929,18 @@ fn a_remote_ref_outside_the_name_rule_is_never_classified() {
             &["head", "shadowed", "second", "addressed", "stray"],
         )
         .await;
-        commit(&repo, tmp.path(), "head", None, None, Some("main")).await;
+        commit(&repo, tmp.path(), "head", None, Some("main")).await;
 
         // No write path of the library accepts these names, so the test writes
         // the files with blocking `std::fs`.
-        let shadowed = commit(&repo, tmp.path(), "shadowed", None, None, None).await;
+        let shadowed = commit(&repo, tmp.path(), "shadowed", None, None).await;
         let shadowed_root = commit_root(&repo, &shadowed).await;
         let shadowed_path = tmp.path().join("repo/refs/remotes/a:b/pool/x");
         let shadowed_body = format!("{}\n", shadowed.to_hex());
         std::fs::create_dir_all(shadowed_path.parent().unwrap()).unwrap();
         std::fs::write(&shadowed_path, &shadowed_body).unwrap();
 
-        let second = commit(&repo, tmp.path(), "second", None, None, None).await;
+        let second = commit(&repo, tmp.path(), "second", None, None).await;
         let second_root = commit_root(&repo, &second).await;
         let second_path = tmp.path().join("repo/refs/remotes/a/b:pool/x");
         let second_body = format!("{}\n", second.to_hex());
@@ -1037,7 +948,7 @@ fn a_remote_ref_outside_the_name_rule_is_never_classified() {
         std::fs::write(&second_path, &second_body).unwrap();
 
         // The refspec `a:pool/x` is valid and addresses its own file.
-        let addressed = commit(&repo, tmp.path(), "addressed", None, None, None).await;
+        let addressed = commit(&repo, tmp.path(), "addressed", None, None).await;
         let addressed_root = commit_root(&repo, &addressed).await;
         repo.set_ref_immediate("a:pool/x", Some(&addressed))
             .await
@@ -1050,7 +961,7 @@ fn a_remote_ref_outside_the_name_rule_is_never_classified() {
 
         // A file directly under `refs/remotes` lists under a name that maps
         // below `refs/heads`. A ref of that name also stands there.
-        let stray = commit(&repo, tmp.path(), "stray", None, None, None).await;
+        let stray = commit(&repo, tmp.path(), "stray", None, None).await;
         let stray_path = tmp.path().join("repo/refs/remotes/poolstray");
         std::fs::write(&stray_path, format!("{}\n", stray.to_hex())).unwrap();
         repo.set_ref_immediate("poolstray", Some(&stray))
@@ -1126,8 +1037,8 @@ fn a_ref_directory_gone_before_the_unlink_does_not_fail_the_run() {
     let tmp = TmpDir::new("weak-refs-vanished-parent");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["head", "doomed"]).await;
-        let head = commit(&repo, tmp.path(), "head", None, None, Some("main")).await;
-        let doomed = commit(&repo, tmp.path(), "doomed", None, None, Some("pool/doomed")).await;
+        let head = commit(&repo, tmp.path(), "head", None, Some("main")).await;
+        let doomed = commit(&repo, tmp.path(), "doomed", None, Some("pool/doomed")).await;
         let doomed_root = commit_root(&repo, &doomed).await;
 
         // The classifier clears the directory that holds the doomed ref. The
@@ -1174,34 +1085,21 @@ fn a_reached_weak_remote_ref_reseeds_the_walk_at_its_refspec_bound() {
     let tmp = TmpDir::new("weak-refs-remote-rule-b");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["g1", "g2", "g3", "head", "d1", "d2"]).await;
-        let g1 = commit(&repo, tmp.path(), "g1", None, None, None).await;
-        let g2 = commit(&repo, tmp.path(), "g2", Some(g1), None, None).await;
-        let g3 = commit(
-            &repo,
-            tmp.path(),
-            "g3",
-            Some(g2),
-            None,
-            Some("origin:pool/chain"),
-        )
-        .await;
-        // `main` reaches g3 over a metadata edge with the global bound of 0.
-        // g2 and g1 survive only under the weak ref's own bound.
-        commit(
-            &repo,
-            tmp.path(),
-            "head",
-            None,
-            Some(checksum_list(GC_ROOTS, &[g3])),
-            Some("main"),
-        )
-        .await;
+        let g1 = commit(&repo, tmp.path(), "g1", None, None).await;
+        let g2 = commit(&repo, tmp.path(), "g2", Some(g1), None).await;
+        let g3 = commit(&repo, tmp.path(), "g3", Some(g2), Some("origin:pool/chain")).await;
+        // `main` reaches g3 over a build-source edge with the global bound of
+        // 0. g2 and g1 survive only under the weak ref's own bound.
+        let head = commit(&repo, tmp.path(), "head", None, Some("main")).await;
+        repo.add_detached_related(&head, "source/chain", &g3)
+            .await
+            .unwrap();
         // The control chain has a strong ref at the global depth of 0. The walk
         // keeps d2 and drops d1. This chain proves that the depth bound
         // applies, so the assertions on the weak ref's ancestry cannot pass
         // vacuously.
-        let d1 = commit(&repo, tmp.path(), "d1", None, None, None).await;
-        let d2 = commit(&repo, tmp.path(), "d2", Some(d1), None, Some("other")).await;
+        let d1 = commit(&repo, tmp.path(), "d1", None, None).await;
+        let d2 = commit(&repo, tmp.path(), "d2", Some(d1), Some("other")).await;
 
         let mut trees = Vec::new();
         for c in [g1, g2, g3] {
@@ -1250,12 +1148,11 @@ fn a_cross_space_alias_is_classified_under_its_own_name() {
     let tmp = TmpDir::new("weak-refs-cross-space-alias");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["head", "target"]).await;
-        let head = commit(&repo, tmp.path(), "head", None, None, Some("main")).await;
+        let head = commit(&repo, tmp.path(), "head", None, Some("main")).await;
         let target = commit(
             &repo,
             tmp.path(),
             "target",
-            None,
             None,
             Some("origin:pool/target"),
         )
@@ -1330,12 +1227,11 @@ fn a_weak_remote_alias_over_a_weak_remote_ref_leaves_no_ref_file() {
     let tmp = TmpDir::new("weak-refs-remote-alias");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["head", "target"]).await;
-        commit(&repo, tmp.path(), "head", None, None, Some("main")).await;
+        commit(&repo, tmp.path(), "head", None, Some("main")).await;
         let target = commit(
             &repo,
             tmp.path(),
             "target",
-            None,
             None,
             Some("origin:pool/target"),
         )

@@ -459,7 +459,6 @@ impl BucketRepo {
             );
         }
         let gc = GcRoots {
-            metadata_keys: Vec::new(),
             dependencies: false,
             build_sources: false,
             traverse_parent: true,
@@ -611,10 +610,6 @@ fn refuse_options(opts: &PruneOptions) -> Result<()> {
         ("retain_branch_depth", !opts.retain_branch_depth.is_empty()),
         ("commit_only", opts.commit_only),
         ("static_deltas_only", opts.static_deltas_only),
-        (
-            "gc_root_metadata_keys",
-            !opts.gc_root_metadata_keys.is_empty(),
-        ),
         ("traverse_parent", !opts.traverse_parent),
         ("weak_ref_filter", opts.weak_ref_filter.is_set()),
     ];

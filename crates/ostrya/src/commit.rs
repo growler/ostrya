@@ -19,7 +19,6 @@ use ostrya_core::{
 use rustix::fs::{Mode, OFlags};
 use rustix::io::Errno;
 
-use crate::config::RepoConfig;
 use crate::error::{Error, Result};
 use crate::file::FileKind;
 use crate::perm;
@@ -123,20 +122,6 @@ impl Transaction {
     /// In each other mode the call writes no key. The bytes of the commit are
     /// the same with and without the request.
     ///
-    /// # GC anchor keys
-    ///
-    /// If `opts.metadata` holds at least one entry, the call reads the
-    /// repository config key `[ex-ostrya] gc-root-metadata-keys`
-    /// ([`RepoConfig::gc_root_metadata_keys`]). It checks each entry whose key
-    /// is in that list with the rules of a prune: the value is an `aay`, an
-    /// `a(say)`, or an `a{s(say)}`, and each checksum in it is 32 bytes. A
-    /// checksum that names no commit in the store passes. The call checks
-    /// each entry, also when a key occurs more than one time.
-    ///
-    /// The call checks before it serializes the commit and writes nothing on
-    /// a refusal. The transaction stays open, and the caller commits or aborts
-    /// it. The call does not check the `ostree.sizes` entry that it adds.
-    ///
     /// # Dependencies
     ///
     /// Field 2 of the commit object holds the entries of `opts.related`,
@@ -152,23 +137,18 @@ impl Transaction {
     /// no dependency. It can have a parent and build sources.
     ///
     /// The call checks the dependencies as
-    /// [`check_related`](Transaction::check_related) does, after the GC anchor
-    /// keys and the timestamp and before it serializes the commit. On a
-    /// refusal, it writes nothing and the transaction stays open.
+    /// [`check_related`](Transaction::check_related) does, after the timestamp
+    /// and before it serializes the commit. On a refusal, it writes nothing
+    /// and the transaction stays open.
     ///
     /// # Errors
     ///
     /// - [`Error::Unsupported`] if the repository mode is `bare-split-xattrs`.
-    /// - [`Error::InvalidGcAnchor`] if an entry of `opts.metadata` gives a key
-    ///   of `[ex-ostrya] gc-root-metadata-keys` a value that a prune refuses.
     /// - [`Error::InvalidRelated`] if an entry of `opts.related` has an empty
     ///   name, if two entries have the same name, or if a dependency is
     ///   absent, partial, or has a dependency of its own.
     /// - [`Error::Core`] if the commit tuple of a dependency does not frame,
     ///   or if its field 2 does not decode.
-    /// - [`Error::Core`] if `opts.metadata` holds at least one entry and
-    ///   `[ex-ostrya] gc-root-metadata-keys` holds a malformed escape
-    ///   sequence.
     /// - [`Error::Unsupported`] if `[ex-integrity] fsverity` is `yes` and the
     ///   fs-verity seal fails.
     /// - [`Error::InvalidFormat`] if `opts.timestamp` is `None` and
@@ -203,7 +183,6 @@ impl Transaction {
                 "bare-split-xattrs is read-only; the port does not write it".into(),
             ));
         }
-        check_gc_anchors(self.repo().config(), opts.metadata.as_slice())?;
         let timestamp = ostrya_core::commit_timestamp(opts.timestamp)
             .map_err(|e| Error::InvalidFormat(e.to_string()))?;
         opts.timestamp = Some(timestamp);
@@ -243,12 +222,11 @@ impl Transaction {
     }
 
     /// Writes a commit as [`write_commit`](Transaction::write_commit) does,
-    /// with no check of the GC anchor keys or the dependencies.
+    /// with no check of the dependencies.
     ///
     /// Field 2 holds the entries of `opts.related` in the given order. The
-    /// anchor commit of a summary uses this path, because the port builds its
-    /// binding keys, and it has no dependency. A `bare-split-xattrs`
-    /// repository refuses the write in
+    /// anchor commit of a summary uses this path, because it has no
+    /// dependency. A `bare-split-xattrs` repository refuses the write in
     /// [`write_metadata`](Transaction::write_metadata).
     pub(crate) async fn write_commit_unchecked(
         &self,
@@ -564,14 +542,6 @@ impl Repo {
     /// If the caller holds an [`UpdateGuard`](crate::UpdateGuard) of this
     /// repository, the call waits for that guard.
     ///
-    /// # GC anchor keys
-    ///
-    /// If `meta` holds at least one entry, the call reads the repository
-    /// config key `[ex-ostrya] gc-root-metadata-keys` and checks each entry
-    /// whose key is in that list, as [`Transaction::write_commit`] does. The
-    /// call checks before it takes a lock. On a refusal the `.commitmeta` file
-    /// stays as it was.
-    ///
     /// # Build sources
     ///
     /// The key `ostrya.related` holds the build sources of the commit. The
@@ -580,15 +550,11 @@ impl Repo {
     /// element must have a name that is not empty and a checksum of 32 bytes.
     /// The call accepts elements that are not sorted, two elements with the
     /// same name, and a checksum of a commit that the repository does not
-    /// hold. It checks after the GC anchor keys and before it takes a lock.
-    /// On a refusal the `.commitmeta` file stays as it was.
+    /// hold. It checks before it takes a lock. On a refusal the `.commitmeta`
+    /// file stays as it was.
     ///
     /// # Errors
     ///
-    /// - [`Error::InvalidGcAnchor`] if an entry of `meta` gives a key of
-    ///   `[ex-ostrya] gc-root-metadata-keys` a value that a prune refuses.
-    /// - [`Error::Core`] if `meta` holds at least one entry and `[ex-ostrya]
-    ///   gc-root-metadata-keys` holds a malformed escape sequence.
     /// - [`Error::InvalidRelated`] with `checksum` and
     ///   [`RelatedField::BuildSources`] if an `ostrya.related` entry of `meta`
     ///   is not a variant of type `a(say)`, or if one of its elements has an
@@ -608,7 +574,6 @@ impl Repo {
         checksum: &Checksum,
         meta: Option<&Value>,
     ) -> Result<()> {
-        check_gc_anchors(self.config(), meta)?;
         if let Some(meta) = meta {
             related::check_detached(checksum, meta)?;
         }
@@ -742,46 +707,6 @@ pub(crate) fn empty_build_source_name(commit: &Checksum) -> Error {
         field: RelatedField::BuildSources,
         reason: "the new entry has an empty name".into(),
     }
-}
-
-/// Checks the values of the GC anchor keys in each metadata dict of `dicts`.
-///
-/// The GC anchor keys are the list of `[ex-ostrya] gc-root-metadata-keys` in
-/// `config`. The function reads the list once, at the first dict that holds
-/// an entry. If no dict holds an entry, the function does not read the list.
-/// It checks each entry whose key is in the list with the decoder of the
-/// prune walk. The first defect in the order of the dicts, then of the keys
-/// in the list, then of the entries in the dict, gives the error.
-///
-/// # Errors
-///
-/// - [`Error::InvalidGcAnchor`] with the key and the reason of the decoder.
-/// - [`Error::Core`] if the list holds a malformed escape sequence.
-pub(crate) fn check_gc_anchors<'a>(
-    config: &RepoConfig,
-    dicts: impl IntoIterator<Item = &'a Value>,
-) -> Result<()> {
-    let mut keys: Option<Vec<String>> = None;
-    for dict in dicts {
-        if dict.as_array().is_none_or(<[Value]>::is_empty) {
-            continue;
-        }
-        let keys = match &mut keys {
-            Some(keys) => keys,
-            None => keys.insert(config.gc_root_metadata_keys()?),
-        };
-        for key in keys.iter() {
-            for value in crate::traverse::dict_values(dict, key) {
-                crate::traverse::for_each_metadata_key_target(value, |_| {}).map_err(|reason| {
-                    Error::InvalidGcAnchor {
-                        metadata_key: key.clone(),
-                        reason,
-                    }
-                })?;
-            }
-        }
-    }
-    Ok(())
 }
 
 /// Parses `bytes`, the contents of a `.commitmeta` file, as detached

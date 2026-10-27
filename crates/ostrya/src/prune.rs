@@ -3,8 +3,7 @@
 //! [`Repo::prune`] walks from a set of roots and removes each loose object
 //! that the walk does not reach. The walk also keeps the related commits of
 //! each commit that it reaches: the dependencies and the build sources. If
-//! the three ostrya extensions of [`PruneOptions`] keep their defaults, the
-//! repository config does not set `[ex-ostrya] gc-root-metadata-keys`, and no
+//! the two ostrya extensions of [`PruneOptions`] keep their defaults and no
 //! reached commit names a related commit, a run deletes the same objects as
 //! the `ostree prune` command, as observed. The run also reads the
 //! `.commitmeta` of each commit that the walk reaches, and a `.commitmeta`
@@ -118,23 +117,20 @@ impl std::fmt::Debug for WeakRefFilter {
 ///
 /// # Extensions
 ///
-/// Three options are ostrya extensions. The `ostree` command has no
+/// Two options are ostrya extensions. The `ostree` command has no
 /// counterpart for them:
 ///
-/// - [`gc_root_metadata_keys`](PruneOptions::gc_root_metadata_keys): metadata
-///   keys whose values name more commits to keep.
 /// - [`traverse_parent`](PruneOptions::traverse_parent): the switch that makes
 ///   the `parent` of a commit reachable from it.
 /// - [`weak_ref_filter`](PruneOptions::weak_ref_filter): the classifier that
 ///   marks each ref strong or weak.
 ///
 /// The default of each one is the behavior without the option. A prune that
-/// keeps all three at their defaults deletes the same objects as the
-/// `ostree` command, if the repository config does not set
-/// `[ex-ostrya] gc-root-metadata-keys` and no commit that the run reaches
-/// names a related commit. The run also reads the `.commitmeta` of each
-/// commit that it reaches, and a `.commitmeta` that does not parse fails the
-/// run ([`Repo::prune`], "Related commits").
+/// keeps both at their defaults deletes the same objects as the `ostree`
+/// command, if no commit that the run reaches names a related commit. The run
+/// also reads the `.commitmeta` of each commit that it reaches, and a
+/// `.commitmeta` that does not parse fails the run ([`Repo::prune`], "Related
+/// commits").
 ///
 /// The roots on the related commits of a commit are also an ostrya
 /// extension, with no option. [`Repo::prune`], "Related commits", states
@@ -236,54 +232,13 @@ pub struct PruneOptions {
     /// [`delete_commit`](PruneOptions::delete_commit). If `delete_commit` is
     /// `None`, the prune fails with [`Error::InvalidFormat`].
     pub static_deltas_only: bool,
-    /// Metadata keys whose values name more commits to keep.
-    ///
-    /// Each key of this list is a GC anchor key: a commit metadata key whose
-    /// value names commits that the run keeps. The run reads each entry with
-    /// one of these keys in the metadata of each reached commit and in its
-    /// detached metadata. A dict that holds a key more than one time gives the
-    /// commits of each entry. The value of an entry has one of these shapes:
-    ///
-    /// - `aay`: an array of commit checksums.
-    /// - `a(say)`: an array of pairs of a string and a commit checksum.
-    /// - `a{s(say)}`: a dict of names, each with a `(say)` pair.
-    ///
-    /// The run reads the checksums alone and ignores the strings. Each
-    /// checksum is 32 bytes. The run walks each of those commits as a root of
-    /// its own, so it also keeps what that commit reaches. Such a commit gets
-    /// the full depth of the walk, because the depth counts parent edges.
-    ///
-    /// If an entry holds a value without one of these shapes, or a checksum
-    /// that is not 32 bytes, the prune fails with [`Error::InvalidGcRoot`].
-    ///
-    /// [`Repo::prune`] also reads the keys of the repository config key
-    /// `[ex-ostrya] gc-root-metadata-keys`
-    /// ([`RepoConfig::gc_root_metadata_keys`](crate::RepoConfig::gc_root_metadata_keys)).
-    /// The run reads the config keys first, in config order, and
-    /// then the keys of this list, in list order. It reads each key one time.
-    /// This field holds the keys of the caller alone, and the run does not
-    /// change it. A caller can add keys to the run, but cannot remove a config
-    /// key from it.
-    ///
-    /// The list is empty by default. If this list and the config list are both
-    /// empty, the run reads no entry for these keys. The run reads the
-    /// detached metadata of each reached commit for its build sources in each
-    /// case ([`Repo::prune`], "Related commits"). If no option roots the walk
-    /// on the refs alone (see [`Repo::prune`], "Roots"), the keys add no
-    /// reachability, because each commit in the store is already a root. The
-    /// run still reads the metadata and the detached metadata of each commit.
-    /// A defective value fails the prune in both cases.
-    ///
-    /// This field is an ostrya extension.
-    pub gc_root_metadata_keys: Vec<String>,
     /// The switch that makes the `parent` of a commit reachable from it.
     ///
     /// The default is `true`, which is the behavior of the `ostree` command.
     /// [`depth`](PruneOptions::depth) bounds the edge. If it is `false`, the
     /// ancestry of a commit survives only where something else names it. An
-    /// application that tracks its own roots through
-    /// [`gc_root_metadata_keys`](PruneOptions::gc_root_metadata_keys) or
-    /// through the related commits uses this setting.
+    /// application that tracks its own roots through the related commits uses
+    /// this setting.
     ///
     /// The switch acts on the `parent` edge alone. If it is `false`, the run
     /// still keeps the related commits of each reached commit
@@ -292,9 +247,7 @@ pub struct PruneOptions {
     ///
     /// This field is an ostrya extension. The repository config has no key for
     /// it, so a prune that the `ostrya` CLI runs always follows the `parent`
-    /// edge. The metadata keys of the config add roots and remove none, so a
-    /// prune with configured keys keeps at least what the same prune without
-    /// them keeps.
+    /// edge.
     pub traverse_parent: bool,
     /// The classifier that marks each ref strong or weak.
     ///
@@ -363,7 +316,6 @@ impl Default for PruneOptions {
             retain_branch_depth: Vec::new(),
             commit_only: false,
             static_deltas_only: false,
-            gc_root_metadata_keys: Vec::new(),
             traverse_parent: true,
             weak_ref_filter: WeakRefFilter::default(),
         }
@@ -378,32 +330,6 @@ impl PruneOptions {
     /// nothing.
     pub fn new() -> PruneOptions {
         PruneOptions::default()
-    }
-
-    /// Creates options for a walk over refs and metadata keys with no `parent` edge.
-    ///
-    /// The options set [`refs_only`](PruneOptions::refs_only) to `true`,
-    /// [`gc_root_metadata_keys`](PruneOptions::gc_root_metadata_keys) to
-    /// `keys`, and [`traverse_parent`](PruneOptions::traverse_parent) to
-    /// `false`. The other fields keep their defaults. [`Repo::prune`] also
-    /// reads the keys of `[ex-ostrya] gc-root-metadata-keys`, and keeps the
-    /// related commits of each reached commit.
-    ///
-    /// With these options, an application that records its own reachability in
-    /// commit metadata decides what the run keeps. The ancestry of a commit
-    /// survives only where something else names it. A caller that wants both
-    /// edge kinds sets `traverse_parent` back to `true` on the result.
-    pub fn gc_roots<I, S>(keys: I) -> PruneOptions
-    where
-        I: IntoIterator<Item = S>,
-        S: Into<String>,
-    {
-        PruneOptions {
-            refs_only: true,
-            gc_root_metadata_keys: keys.into_iter().map(Into::into).collect(),
-            traverse_parent: false,
-            ..PruneOptions::default()
-        }
     }
 
     /// Returns the bound of a branch that no `retain_branch_depth` entry names
@@ -456,27 +382,6 @@ impl PruneOptions {
             }
         }
     }
-}
-
-/// Merges the metadata keys of the config with the keys of the caller.
-///
-/// The config keys come first, in config order, and then the caller keys, in
-/// caller order. The result holds each key one time, at its first position.
-/// Two keys are equal if their bytes are equal. The lists are short, so a
-/// linear search finds each repeat.
-fn merge_metadata_keys(config: Vec<String>, caller: &[String]) -> Vec<String> {
-    let mut merged: Vec<String> = Vec::with_capacity(config.len() + caller.len());
-    for key in config {
-        if !merged.contains(&key) {
-            merged.push(key);
-        }
-    }
-    for key in caller {
-        if !merged.contains(key) {
-            merged.push(key.clone());
-        }
-    }
-    merged
 }
 
 /// Returns `true` if an object of this type is in the counts of a run.
@@ -580,18 +485,15 @@ impl Repo {
     /// The run removes the sidecars of each commit that it removes. It also
     /// removes each sidecar whose commit is absent, if the walk does not
     /// reach the name of that commit. The walk reaches the name of an absent
-    /// commit that a reached commit names as its parent within the bound, as
-    /// a target of a GC anchor key, or as a related commit. [`PruneOptions`]
-    /// sets the roots, the bounds, and the dry run.
+    /// commit that a reached commit names as its parent within the bound, or
+    /// as a related commit. [`PruneOptions`] sets the roots, the bounds, and
+    /// the dry run.
     ///
-    /// The run reads five keys of the repository config, in this order:
+    /// The run reads four keys of the repository config, in this order:
     ///
-    /// 1. `[ex-ostrya] gc-root-metadata-keys`, before the repository lock. The
-    ///    run reads these keys before the keys of
-    ///    [`gc_root_metadata_keys`](PruneOptions::gc_root_metadata_keys).
-    /// 2. `[core] locking` and `[core] lock-timeout-secs`, when it takes the
+    /// 1. `[core] locking` and `[core] lock-timeout-secs`, when it takes the
     ///    repository lock.
-    /// 3. `[core] tombstone-commits` and `[core] fsync`, during the run. A
+    /// 2. `[core] tombstone-commits` and `[core] fsync`, during the run. A
     ///    [`static_deltas_only`](PruneOptions::static_deltas_only) run stops
     ///    before this step and reads neither key. Another run with
     ///    [`delete_commit`](PruneOptions::delete_commit) set writes tombstones
@@ -730,8 +632,7 @@ impl Repo {
     /// [`UpdateGuard`](crate::UpdateGuard) included. If the caller holds its
     /// own transaction open across the call, the run waits until `[core]
     /// lock-timeout-secs` passes and then fails. The refusals of the options
-    /// and the read of `[ex-ostrya] gc-root-metadata-keys` come before the
-    /// lock.
+    /// come before the lock.
     ///
     /// If the repository config sets `[core] locking` to `false`, no lock
     /// excludes a concurrent writer. Another writer can store a commit after
@@ -753,9 +654,6 @@ impl Repo {
     ///   or if a ref file holds bytes that are not UTF-8.
     /// - [`Error::Core`] if a `[core]` key that the run reads holds a value of
     ///   the wrong type.
-    /// - [`Error::Core`] if `[ex-ostrya] gc-root-metadata-keys` holds a
-    ///   malformed escape sequence. The run returns this error before the
-    ///   lock and deletes nothing.
     /// - [`Error::Core`] if a ref file holds no valid checksum.
     /// - [`Error::Core`] if a commit object or its detached metadata does not
     ///   parse. The run reads the detached metadata of each commit that the
@@ -767,11 +665,6 @@ impl Repo {
     /// - An error of [`resolve_rev`](Repo::resolve_rev), for example
     ///   [`Error::RefNotFound`], if a value of
     ///   [`only_branch`](PruneOptions::only_branch) does not resolve.
-    /// - [`Error::InvalidGcRoot`] if an entry with a key of
-    ///   [`gc_root_metadata_keys`](PruneOptions::gc_root_metadata_keys) or of
-    ///   `[ex-ostrya] gc-root-metadata-keys` holds a value that is not an
-    ///   `aay`, an `a(say)`, or an `a{s(say)}`, or a checksum that is not 32
-    ///   bytes.
     /// - [`Error::Io`] if a read, a write, or a removal on the file system
     ///   fails.
     /// - [`Error::Io`] if a metadata object is larger than
@@ -814,19 +707,10 @@ impl Repo {
             ));
         }
 
-        // The run reads the config keys before the lock, so a value that does
-        // not parse gives the same refusal on a contended repository as on a
-        // free one. A delta-only run walks nothing, so it does not use the
-        // list, but a value that does not parse also fails it.
-        let metadata_keys = merge_metadata_keys(
-            self.config().gc_root_metadata_keys()?,
-            &opts.gc_root_metadata_keys,
-        );
-
         let _lock = self.lock_repo(LockKind::Exclusive).await?;
 
         let Some(delta_target) = opts.delete_commit else {
-            return self.prune_objects(opts, mode, metadata_keys).await;
+            return self.prune_objects(opts, mode).await;
         };
         if opts.static_deltas_only {
             // The run removes the deltas of the named commit and nothing else.
@@ -853,20 +737,12 @@ impl Repo {
                 warnings: Vec::new(),
             });
         }
-        self.prune_objects(opts, mode, metadata_keys).await
+        self.prune_objects(opts, mode).await
     }
 
     /// Runs the object sweep: the walk, the deletions, and the removal of the
     /// static deltas that the deletions left with no target.
-    ///
-    /// `metadata_keys` is the merged key list of the run. The method does not
-    /// read [`PruneOptions::gc_root_metadata_keys`].
-    async fn prune_objects(
-        &self,
-        opts: &PruneOptions,
-        mode: RepoMode,
-        metadata_keys: Vec<String>,
-    ) -> Result<PruneStats> {
+    async fn prune_objects(&self, opts: &PruneOptions, mode: RepoMode) -> Result<PruneStats> {
         // The run cannot delete a commit that a ref names. Refuse it here, so a
         // prune that cannot succeed fails before the walk. The unlink checks
         // again, because a writer that takes no repository lock can publish a
@@ -960,7 +836,6 @@ impl Repo {
         }
 
         let gc = crate::traverse::GcRoots {
-            metadata_keys,
             dependencies: true,
             build_sources: true,
             traverse_parent: opts.traverse_parent,
@@ -1401,43 +1276,5 @@ fn unlink_optional(dir: BorrowedFd<'_>, path: &str) -> Result<bool> {
         Ok(()) => Ok(true),
         Err(Errno::NOENT) => Ok(false),
         Err(e) => Err(Error::Io(e.into())),
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    /// Returns the keys as owned strings.
-    fn keys(list: &[&str]) -> Vec<String> {
-        list.iter().map(|key| key.to_string()).collect()
-    }
-
-    /// Checks that the config keys come first, in config order, and that a
-    /// caller key that the config already names keeps its config position.
-    #[test]
-    fn merge_puts_the_config_keys_first() {
-        let merged = merge_metadata_keys(keys(&["b", "a"]), &keys(&["c", "a", "d"]));
-        assert_eq!(merged, keys(&["b", "a", "c", "d"]));
-    }
-
-    /// Checks that a repeat in the caller list is dropped.
-    #[test]
-    fn merge_drops_a_repeat_in_the_caller_list() {
-        let merged = merge_metadata_keys(Vec::new(), &keys(&["c", "c"]));
-        assert_eq!(merged, keys(&["c"]));
-    }
-
-    /// Checks that a repeat in the config list is dropped.
-    #[test]
-    fn merge_drops_a_repeat_in_the_config_list() {
-        let merged = merge_metadata_keys(keys(&["a", "b", "a"]), &keys(&["b"]));
-        assert_eq!(merged, keys(&["a", "b"]));
-    }
-
-    /// Checks that two empty lists give an empty list.
-    #[test]
-    fn merge_of_two_empty_lists_is_empty() {
-        assert!(merge_metadata_keys(Vec::new(), &[]).is_empty());
     }
 }

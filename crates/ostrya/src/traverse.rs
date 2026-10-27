@@ -22,25 +22,6 @@ use crate::refs::walk_ref_dir;
 use crate::related::{self, RelatedField, RelatedWarning};
 use crate::repo::Repo;
 
-/// The GVariant type of a value of a GC anchor key that is an array of
-/// checksums.
-///
-/// Each element is one commit checksum in its 32-byte binary form.
-const ANCHOR_CHECKSUMS: &str = "aay";
-
-/// The GVariant type of a value of a GC anchor key that is an array of pairs.
-///
-/// Each pair holds a string and one commit checksum in its 32-byte binary
-/// form. The walk ignores the string.
-const ANCHOR_PAIRS: &str = "a(say)";
-
-/// The GVariant type of a value of a GC anchor key that is a dict of named
-/// pairs.
-///
-/// Each entry holds a name and a pair of the [`ANCHOR_PAIRS`] shape. The walk
-/// ignores the name and the string of the pair.
-const ANCHOR_NAMED_PAIRS: &str = "a{s(say)}";
-
 /// The bound that a walk puts on the `parent` chain of one root.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ParentBound {
@@ -141,9 +122,8 @@ pub(crate) struct ListedRef {
 /// The kind of edge over which the walk arrived at a commit.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Arrival {
-    /// An arrival at a root: a seed of the caller, or a commit that a
-    /// metadata-key edge or a related edge names. The bound of the arrival is
-    /// the bound of the commit itself.
+    /// An arrival at a root: a seed of the caller, or a commit that a related
+    /// edge names. The bound of the arrival is the bound of the commit itself.
     Root,
     /// An arrival over a `parent` edge with a depth bound. The bound of the
     /// arrival is the bound that the child had left.
@@ -233,23 +213,13 @@ impl Expanded {
 /// of its tree.
 #[derive(Debug, Clone)]
 pub(crate) struct GcRoots {
-    /// The metadata keys whose values name more reachable commits.
-    ///
-    /// A prune puts the merged key list of the run here: the keys of the
-    /// repository config first, and then the keys of the caller. The list
-    /// holds each key one time.
-    ///
-    /// The walk reads each entry with one of these keys, in the metadata and
-    /// in the detached metadata of each commit that it expands. If the list
-    /// is empty, the walk reads no entry for these keys.
-    pub metadata_keys: Vec<String>,
     /// `true` if the walk follows field 2 of a commit: the dependencies.
     pub dependencies: bool,
     /// `true` if the walk follows the `ostrya.related` entry of the detached
     /// metadata of a commit: the build sources.
     ///
-    /// The walk reads the detached metadata of a commit if this is `true` or
-    /// if [`metadata_keys`](GcRoots::metadata_keys) is not empty.
+    /// The walk reads the detached metadata of a commit only if this is
+    /// `true`.
     pub build_sources: bool,
     /// `true` if the walk follows the `parent` edge of a commit.
     pub traverse_parent: bool,
@@ -271,10 +241,9 @@ pub(crate) struct GcRoots {
 
 impl GcRoots {
     /// Returns the edges of the walk of the `ostree` command: the `parent`
-    /// edge, the trees, no metadata-key edges, and no related edges.
+    /// edge, the trees, and no related edges.
     fn parents_only() -> GcRoots {
         GcRoots {
-            metadata_keys: Vec::new(),
             dependencies: false,
             build_sources: false,
             traverse_parent: true,
@@ -458,12 +427,11 @@ impl Repo {
     ///
     /// The walk is the walk of
     /// [`traverse_reachable`](Repo::traverse_reachable), with an optional
-    /// `parent` edge, with the metadata-key edges, and with the related
-    /// edges.
+    /// `parent` edge and with the related edges.
     ///
     /// Each root has its own bound. So one walk can cut one branch to a depth
     /// and keep another branch in full. The walk seeds each commit that a
-    /// metadata-key edge or a related edge names at `root_bound`.
+    /// related edge names at `root_bound`.
     ///
     /// The warnings are sorted by commit and then by field, dependencies
     /// first. The warnings of one field keep the order of its entries.
@@ -876,11 +844,10 @@ pub(crate) async fn walk_reachable_gc<S: MetadataSource>(
 /// same commit still keeps it. The walk memoizes the rejection, so a second
 /// child that arrives under the same bound reads no commit.
 ///
-/// The walk seeds each commit that a metadata-key edge or a related edge
-/// names at `root_bound`. Each such seed is the same entry, so the walk
-/// pushes it at the first edge alone. One set of seeded commits serves the
-/// metadata-key edges and the two related fields. The walk reads the commit
-/// `pending_delete` names as absent.
+/// The walk seeds each commit that a related edge names at `root_bound`.
+/// Each such seed is the same entry, so the walk pushes it at the first edge
+/// alone. One set of seeded commits serves the two related fields. The walk
+/// reads the commit `pending_delete` names as absent.
 ///
 /// The walk reads the edges other than `parent` one time for each commit, at
 /// its first expansion. A later expansion follows more parents, and the
@@ -895,10 +862,9 @@ pub(crate) async fn walk_reachable_gc<S: MetadataSource>(
 /// A defective related value or entry adds one warning to `warnings` and
 /// seeds nothing. The other entries of the field seed as usual. A related
 /// entry that names a commit that the store does not hold seeds a commit
-/// that adds its own name alone. The walk reads the detached metadata one
-/// time for the build sources and the metadata-key edges together. Unless
-/// the arrival is over a `parent` edge under a timestamp bound, it reads the
-/// detached metadata with the commit in one call of
+/// that adds its own name alone. Unless the arrival is over a `parent` edge
+/// under a timestamp bound, the walk reads the detached metadata with the
+/// commit in one call of
 /// [`load_commit_with_detached`](MetadataSource::load_commit_with_detached).
 /// A `.commitmeta` that does not parse stops the walk with an error.
 ///
@@ -922,16 +888,14 @@ async fn collect_reachable<S: MetadataSource>(
     // matches `weak_roots` again when the walk pops it. This set stops the
     // walk from a second push of the seed.
     let mut weak_seeded: HashSet<Checksum> = HashSet::new();
-    // The commits for which a metadata-key edge or a related edge pushed a
-    // seed. A second edge to the same commit pushes the same entry, which
-    // adds nothing.
+    // The commits for which a related edge pushed a seed. A second edge to
+    // the same commit pushes the same entry, which adds nothing.
     let mut seeded: HashSet<Checksum> = HashSet::new();
     // The commits whose edges other than `parent` the walk read. The walk
     // adds a commit when it reads them, so an arrival that the timestamp
     // bound rejects reads nothing and adds nothing.
     let mut edges_read: HashSet<Checksum> = HashSet::new();
-    let reads_detached = gc.build_sources || !gc.metadata_keys.is_empty();
-    let reads_edges = gc.dependencies || reads_detached;
+    let reads_edges = gc.dependencies || gc.build_sources;
 
     while let Some((commit_checksum, bound, arrival)) = commit_stack.pop() {
         // When the walk reaches the commit of a weak ref over any edge,
@@ -941,11 +905,11 @@ async fn collect_reachable<S: MetadataSource>(
         // as it keeps the target of a strong ref.
         //
         // This test comes before the `inherited` drop and applies to each
-        // kind of arrival. A metadata-key edge pushes a `Root` arrival at
-        // the global bound of the run. If the rule tested `inherited`
-        // alone, that arrival can expand the commit at the global bound
-        // while the bound of the weak ref reaches further. Then the sweep
-        // deletes the ancestry of a ref that stays.
+        // kind of arrival. A related edge pushes a `Root` arrival at the
+        // global bound of the run. If the rule tested `inherited` alone, that
+        // arrival can expand the commit at the global bound while the bound
+        // of the weak ref reaches further. Then the sweep deletes the
+        // ancestry of a ref that stays.
         if let Some(bounds) = gc.weak_roots.get(&commit_checksum)
             && weak_seeded.insert(commit_checksum)
         {
@@ -984,7 +948,7 @@ async fn collect_reachable<S: MetadataSource>(
         let mut prefetched: Option<Option<Value>> = None;
         let loaded = if pending_delete == Some(commit_checksum) {
             None
-        } else if reads_detached
+        } else if gc.build_sources
             && arrival != Arrival::TimedParent
             && !edges_read.contains(&commit_checksum)
         {
@@ -1046,30 +1010,21 @@ async fn collect_reachable<S: MetadataSource>(
                 }));
                 targets.into_iter().for_each(&mut push);
             }
-            if reads_detached {
+            if gc.build_sources {
                 let detached = match prefetched {
                     Some(detached) => detached,
                     None => store.load_detached(commit_checksum).await?,
                 };
-                if gc.build_sources {
-                    let (targets, defects) = match related::build_sources(detached.as_ref()) {
-                        Ok(entries) => related::split_entries(entries.unwrap_or_default()),
-                        Err(reason) => (Vec::new(), vec![reason]),
-                    };
-                    warnings.extend(defects.into_iter().map(|reason| RelatedWarning {
-                        commit: commit_checksum,
-                        field: RelatedField::BuildSources,
-                        reason,
-                    }));
-                    targets.into_iter().for_each(&mut push);
-                }
-                push_metadata_key_edges(
-                    &commit_checksum,
-                    &commit.metadata,
-                    detached.as_ref(),
-                    gc,
-                    &mut push,
-                )?;
+                let (targets, defects) = match related::build_sources(detached.as_ref()) {
+                    Ok(entries) => related::split_entries(entries.unwrap_or_default()),
+                    Err(reason) => (Vec::new(), vec![reason]),
+                };
+                warnings.extend(defects.into_iter().map(|reason| RelatedWarning {
+                    commit: commit_checksum,
+                    field: RelatedField::BuildSources,
+                    reason,
+                }));
+                targets.into_iter().for_each(&mut push);
             }
         }
 
@@ -1141,57 +1096,6 @@ async fn walk_tree<S: MetadataSource>(
     Ok(())
 }
 
-/// Pushes onto the walk each commit that the configured metadata keys
-/// name.
-///
-/// The function reads each entry with the key from `metadata`, the metadata
-/// of the commit, and then from its detached metadata. So one key name
-/// gives edges from both. A dict that holds the key more than one time
-/// gives the edges of each entry, and the entries can have different
-/// shapes. A key that no dict holds adds nothing.
-///
-/// The value of each entry is an `aay`, an `a(say)`, or an `a{s(say)}`.
-/// The walk reads the 32-byte checksums alone and ignores each string.
-/// If a value does not have one of these shapes, or holds a checksum that
-/// is not 32 bytes, the walk fails with [`Error::InvalidGcRoot`]. If the
-/// walk does not follow an edge, a sweep deletes the objects of that edge.
-/// So a value that the walk cannot read stops the walk.
-///
-/// With more than one defect, the error names the first in this order:
-/// the order of the keys in [`GcRoots::metadata_keys`], then the metadata
-/// of the commit before its detached metadata, then the order of the
-/// entries in the dict, then the order of the elements in the value.
-///
-/// The function gives `push` each commit that a value names. `push` seeds
-/// a commit at its first edge alone. The function decodes each value also
-/// when `push` seeds no commit, so the errors stay the same.
-///
-/// `detached` is the detached metadata of the commit, which the caller read
-/// one time for these edges and for the build sources. The walk calls the
-/// function at the first expansion of a commit alone.
-fn push_metadata_key_edges(
-    commit: &Checksum,
-    metadata: &Value,
-    detached: Option<&Value>,
-    gc: &GcRoots,
-    push: &mut impl FnMut(Checksum),
-) -> Result<()> {
-    for key in &gc.metadata_keys {
-        for source in [Some(metadata), detached].into_iter().flatten() {
-            for value in dict_values(source, key) {
-                for_each_metadata_key_target(value, &mut *push).map_err(|reason| {
-                    Error::InvalidGcRoot {
-                        commit: *commit,
-                        metadata_key: key.clone(),
-                        reason,
-                    }
-                })?;
-            }
-        }
-    }
-    Ok(())
-}
-
 /// Loads and parses a commit for the lenient walk.
 ///
 /// Returns `None` if the store does not hold the commit.
@@ -1254,94 +1158,6 @@ async fn join_all<F: Future>(futures: impl IntoIterator<Item = F>) -> Vec<F::Out
         .into_iter()
         .map(|output| output.expect("each future is ready"))
         .collect()
-}
-
-/// Returns the value of each entry of the `a{sv}` dict `dict` whose key is
-/// `key`, in the order of the dict.
-///
-/// The function skips each entry that does not have the `{s?}` shape. If
-/// `dict` is not an array, the result is empty.
-pub(crate) fn dict_values<'a>(dict: &'a Value, key: &'a str) -> impl Iterator<Item = &'a Value> {
-    dict.as_array()
-        .unwrap_or_default()
-        .iter()
-        .filter_map(move |entry| match entry.as_tuple()? {
-            [k, v] if k.as_str() == Some(key) => Some(v),
-            _ => None,
-        })
-}
-
-/// Gives `visit` each commit that the value of one metadata key names, in the
-/// order of the value.
-///
-/// The value is the variant that an `a{sv}` entry holds. The type of the
-/// variant selects the shape:
-///
-/// - `aay`: each element is a checksum.
-/// - `a(say)`: each element is a pair of a string and a checksum.
-/// - `a{s(say)}`: each element is an entry of a name and an `(say)` pair.
-///
-/// The function ignores each string. Each checksum is a 32-byte commit
-/// checksum. An empty array gives no commit.
-///
-/// Any other value gives an error with the reason, the first defect in the
-/// order of the elements. `visit` then has the checksums of the elements
-/// before the defect. The walk puts the reason into an
-/// [`Error::InvalidGcRoot`]. The check of a commit write gives a `visit` that
-/// does nothing, and puts the reason into an [`Error::InvalidGcAnchor`].
-pub(crate) fn for_each_metadata_key_target(
-    value: &Value,
-    mut visit: impl FnMut(Checksum),
-) -> std::result::Result<(), String> {
-    let Some((ty, child)) = value.as_variant() else {
-        return Err("value is not a variant".into());
-    };
-    let signature = ty.signature();
-    let (checksum_of, element): (ChecksumOf, &str) = match signature.as_str() {
-        ANCHOR_CHECKSUMS => (Value::as_bytes, "a byte array"),
-        ANCHOR_PAIRS => (pair_checksum, "a (say) pair"),
-        ANCHOR_NAMED_PAIRS => (entry_checksum, "a {s(say)} entry"),
-        _ => {
-            return Err(format!(
-                "type is `{signature}`, not `aay`, `a(say)`, or `a{{s(say)}}`"
-            ));
-        }
-    };
-    let Some(elements) = child.as_array() else {
-        return Err("value is not an array".into());
-    };
-    for (index, item) in elements.iter().enumerate() {
-        let Some(bytes) = checksum_of(item) else {
-            return Err(format!("element {index} is not {element}"));
-        };
-        let checksum = Checksum::from_ay(bytes)
-            .map_err(|_| format!("element {index} is {} bytes, not 32", bytes.len()))?;
-        visit(checksum);
-    }
-    Ok(())
-}
-
-/// A function that returns the checksum bytes of one element of a value of a
-/// GC anchor key, or `None` if the element does not have the shape of the
-/// value.
-type ChecksumOf = fn(&Value) -> Option<&[u8]>;
-
-/// Returns the checksum bytes of an `(say)` pair, or `None` if `pair` does not
-/// have that shape.
-fn pair_checksum(pair: &Value) -> Option<&[u8]> {
-    match pair.as_tuple()? {
-        [Value::Str(_), Value::Bytes(checksum)] => Some(checksum),
-        _ => None,
-    }
-}
-
-/// Returns the checksum bytes of an `{s(say)}` entry, or `None` if `entry`
-/// does not have that shape.
-fn entry_checksum(entry: &Value) -> Option<&[u8]> {
-    match entry.as_tuple()? {
-        [Value::Str(_), pair] => pair_checksum(pair),
-        _ => None,
-    }
 }
 
 /// Returns `true` if an expansion at remaining depth `prev` follows at least
@@ -1553,41 +1369,7 @@ fn read_ref_target(dir: BorrowedFd<'_>, name: &str) -> Result<Option<Checksum>> 
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use ostrya_core::Type;
-
     use super::*;
-
-    /// Returns a variant of the type `signature` that holds `child`.
-    fn variant(signature: &str, child: Value) -> Value {
-        Value::variant(Type::parse(signature).unwrap(), child)
-    }
-
-    /// Returns a `(say)` pair of `name` and `checksum`.
-    fn pair(name: &str, checksum: &[u8]) -> Value {
-        Value::Tuple(vec![
-            Value::Str(name.into()),
-            Value::Bytes(checksum.to_vec()),
-        ])
-    }
-
-    /// Returns an `{s(say)}` entry of `name` and a pair of `name` and
-    /// `checksum`.
-    fn entry(name: &str, checksum: &[u8]) -> Value {
-        Value::Tuple(vec![Value::Str(name.into()), pair(name, checksum)])
-    }
-
-    /// Returns the checksums that the decoder gives for `value`, or the
-    /// reason of its refusal.
-    fn metadata_key_targets(value: &Value) -> std::result::Result<Vec<Checksum>, String> {
-        let mut targets = Vec::new();
-        for_each_metadata_key_target(value, |target| targets.push(target))?;
-        Ok(targets)
-    }
-
-    /// Returns the reason that the decoder gives for `value`.
-    fn reason(value: &Value) -> String {
-        metadata_key_targets(value).unwrap_err()
-    }
 
     /// A `.cfs` entry parses as the composefs image of the commit that has
     /// the same checksum, and the `keep` filter applies to it.
@@ -1606,131 +1388,6 @@ mod tests {
         );
         let type_str = format!("{}.composefs-image", &hex[2..]);
         assert_eq!(parse_object_entry(&hex[..2], &type_str, &|_| true), None);
-    }
-
-    #[test]
-    fn each_shape_gives_its_checksums_in_order() {
-        let one = Checksum::from_bytes([1; 32]);
-        let two = Checksum::from_bytes([2; 32]);
-        let checksums = variant(
-            "aay",
-            Value::Array(vec![
-                Value::Bytes(one.as_bytes().to_vec()),
-                Value::Bytes(two.as_bytes().to_vec()),
-            ]),
-        );
-        let pairs = variant(
-            "a(say)",
-            Value::Array(vec![pair("a", one.as_bytes()), pair("", two.as_bytes())]),
-        );
-        let named = variant(
-            "a{s(say)}",
-            Value::Array(vec![entry("a", one.as_bytes()), entry("a", two.as_bytes())]),
-        );
-        for value in [checksums, pairs, named] {
-            assert_eq!(metadata_key_targets(&value).unwrap(), [one, two]);
-        }
-    }
-
-    #[test]
-    fn an_empty_array_of_each_shape_gives_no_checksum() {
-        for signature in ["aay", "a(say)", "a{s(say)}"] {
-            let value = variant(signature, Value::Array(Vec::new()));
-            assert!(
-                metadata_key_targets(&value).unwrap().is_empty(),
-                "{signature}"
-            );
-        }
-    }
-
-    #[test]
-    fn a_value_that_is_not_a_variant_is_refused() {
-        assert_eq!(reason(&Value::Str("x".into())), "value is not a variant");
-    }
-
-    #[test]
-    fn a_variant_that_holds_no_array_is_refused() {
-        assert_eq!(
-            reason(&variant("aay", Value::Str("x".into()))),
-            "value is not an array"
-        );
-    }
-
-    #[test]
-    fn another_type_is_refused_with_its_signature() {
-        let empty_strings = variant("as", Value::Array(Vec::new()));
-        assert_eq!(
-            reason(&empty_strings),
-            "type is `as`, not `aay`, `a(say)`, or `a{s(say)}`"
-        );
-        let nested = variant("v", variant("aay", Value::Array(Vec::new())));
-        assert_eq!(
-            reason(&nested),
-            "type is `v`, not `aay`, `a(say)`, or `a{s(say)}`"
-        );
-    }
-
-    #[test]
-    fn an_element_of_the_wrong_shape_is_refused() {
-        let checksum = [0; 32];
-        let cases = [
-            (
-                variant("aay", Value::Array(vec![Value::Str("x".into())])),
-                "element 0 is not a byte array",
-            ),
-            (
-                variant(
-                    "a(say)",
-                    Value::Array(vec![Value::Bytes(checksum.to_vec())]),
-                ),
-                "element 0 is not a (say) pair",
-            ),
-            (
-                variant(
-                    "a(say)",
-                    Value::Array(vec![
-                        pair("a", &checksum),
-                        Value::Tuple(vec![Value::U32(0), Value::Bytes(checksum.to_vec())]),
-                    ]),
-                ),
-                "element 1 is not a (say) pair",
-            ),
-            (
-                variant("a{s(say)}", Value::Array(vec![pair("a", &checksum)])),
-                "element 0 is not a {s(say)} entry",
-            ),
-        ];
-        for (value, expected) in cases {
-            assert_eq!(reason(&value), expected);
-        }
-    }
-
-    #[test]
-    fn the_first_defect_in_element_order_is_reported() {
-        let value = variant(
-            "a(say)",
-            Value::Array(vec![
-                pair("a", &[0; 32]),
-                pair("b", &[0; 20]),
-                Value::U32(0),
-            ]),
-        );
-        assert_eq!(reason(&value), "element 1 is 20 bytes, not 32");
-    }
-
-    #[test]
-    fn dict_values_yields_each_entry_with_the_key() {
-        let mut builder = ostrya_core::DictBuilder::new();
-        builder
-            .insert_str("k", "first")
-            .insert_str("other", "x")
-            .insert_str("k", "second");
-        let dict = builder.build();
-        let values: Vec<&str> = dict_values(&dict, "k")
-            .map(|v| v.as_variant().unwrap().1.as_str().unwrap())
-            .collect();
-        assert_eq!(values, ["first", "second"]);
-        assert_eq!(dict_values(&Value::Str("k".into()), "k").count(), 0);
     }
 
     /// A store in memory that records its reads in order and counts the

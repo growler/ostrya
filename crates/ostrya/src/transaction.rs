@@ -703,12 +703,7 @@ impl Transaction {
     /// before it.
     ///
     /// The call does not check `meta`, and it cannot fail. [`commit`] checks
-    /// the values of the GC anchor keys in the queued dict, as
-    /// [`write_commit`](Transaction::write_commit) checks the metadata of a
-    /// commit. If an entry gives a key of `[ex-ostrya] gc-root-metadata-keys`
-    /// a value that a prune refuses, `commit` fails with
-    /// [`Error::InvalidGcAnchor`] and publishes nothing. [`commit`] also
-    /// checks each `ostrya.related` entry of the queued dict, as
+    /// each `ostrya.related` entry of the queued dict, as
     /// [`Repo::write_commit_detached_metadata`] does. If an entry is
     /// defective, `commit` fails with [`Error::InvalidRelated`] and publishes
     /// nothing.
@@ -1387,15 +1382,10 @@ impl Transaction {
     ///
     /// 1. The call checks each queued refspec. If a refspec is malformed, the
     ///    call fails before it publishes an object, and it writes nothing.
-    ///    The call then checks the values of the GC anchor keys in each dict
-    ///    that
+    ///    The call then checks each `ostrya.related` entry of each dict that
     ///    [`set_commit_detached_metadata`](Transaction::set_commit_detached_metadata)
-    ///    queued, as [`write_commit`](Transaction::write_commit) checks the
-    ///    metadata of a commit. If a dict holds at least one entry, the call
-    ///    reads `[ex-ostrya] gc-root-metadata-keys` for this check. Next, it
-    ///    checks each `ostrya.related` entry of these dicts, as
-    ///    [`Repo::write_commit_detached_metadata`] does. On a refusal the call
-    ///    publishes no object and writes nothing.
+    ///    queued, as [`Repo::write_commit_detached_metadata`] does. On a
+    ///    refusal the call publishes no object and writes nothing.
     /// 2. The call renames each staged object into `objects/<xx>/`. The
     ///    composefs images go after all other objects. The rename of an image
     ///    replaces a stored image of the same commit.
@@ -1448,12 +1438,6 @@ impl Transaction {
     ///
     /// - [`Error::InvalidRefspec`] if a queued refspec is malformed. The call
     ///   publishes no object.
-    /// - [`Error::InvalidGcAnchor`] if a queued detached-metadata dict gives a
-    ///   key of `[ex-ostrya] gc-root-metadata-keys` a value that a prune
-    ///   refuses. The call publishes no object and writes nothing.
-    /// - [`Error::Core`] if a queued detached-metadata dict holds at least one
-    ///   entry and `[ex-ostrya] gc-root-metadata-keys` holds a malformed
-    ///   escape sequence. The call publishes no object and writes nothing.
     /// - [`Error::InvalidRelated`] if an `ostrya.related` entry of a queued
     ///   detached-metadata dict is not a variant of type `a(say)`, or if one
     ///   of its elements has an empty name or a checksum that is not 32
@@ -1476,7 +1460,6 @@ impl Transaction {
     ///   detached metadata fails.
     pub async fn commit(mut self) -> Result<TransactionStats> {
         let refs = self.resolve_ref_queue()?;
-        self.check_queued_gc_anchors()?;
         self.check_queued_related()?;
         let synced = self.publish().await?;
         if refs.is_empty() && self.detached.lock().unwrap().edits.is_empty() {
@@ -1499,27 +1482,9 @@ impl Transaction {
             "the hold is not the update lock of this repository"
         );
         let refs = self.resolve_ref_queue()?;
-        self.check_queued_gc_anchors()?;
         self.check_queued_related()?;
         let synced = self.publish().await?;
         self.write_tail(refs, synced, None).await
-    }
-
-    /// Checks the values of the GC anchor keys in each dict that
-    /// [`set_commit_detached_metadata`](Transaction::set_commit_detached_metadata)
-    /// queued.
-    ///
-    /// The check reads no file, so it holds the lock of the queue and no
-    /// await.
-    fn check_queued_gc_anchors(&self) -> Result<()> {
-        let queue = self.detached.lock().unwrap();
-        crate::commit::check_gc_anchors(
-            self.repo.config(),
-            queue
-                .edits
-                .iter()
-                .filter_map(|(_, edit)| edit.replace.as_ref()),
-        )
     }
 
     /// Checks each `ostrya.related` entry in each dict that

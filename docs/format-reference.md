@@ -2830,15 +2830,10 @@ message that names `[ex-ostrya client "NAME"]`. `ostrya-config(1)`, "CLIENT AND
 SERVER GROUPS", states the refusals of a group name. "Ref patterns" states the
 grammar of a pattern of an allow item and of a deny item.
 
-No key changes the encoding or the checksum of an object. Some keys change
-which bytes a repository holds:
-
-- `detached-metadata-exclude` and the key `sign` of a client group change
-  the bytes of a `.commitmeta` file.
-- `gc-root-metadata-keys` changes which objects a prune keeps.
-
-The commit checksum does not cover detached metadata, so these keys change no
-commit checksum.
+No key changes the encoding or the checksum of an object.
+`detached-metadata-exclude` and the key `sign` of a client group change the
+bytes of a `.commitmeta` file. The commit checksum does not cover detached
+metadata, so these keys change no commit checksum.
 
 Observed behavior: the tool keeps the `[ex-ostrya]` group and the groups
 whose names start with `ex-ostrya `, and ignores them.
@@ -2963,8 +2958,8 @@ that they reach:
 - A related entry that names a commit that the repository does not hold
   gives no error, and the walk reads nothing below it. The prune keeps the
   name of that commit, as it keeps the name of an absent parent within the
-  bound and of an absent target of a GC anchor key. So the prune keeps the
-  `.commitmeta` and the `.cfs` of that commit if the store holds them.
+  bound. So the prune keeps the `.commitmeta` and the `.cfs` of that commit
+  if the store holds them.
 - The prune accepts field 2 entries that are not sorted, two entries with one
   name, and a dependency whose own field 2 is not empty. It roots on each
   such entry.

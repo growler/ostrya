@@ -746,9 +746,8 @@ impl Transaction {
     /// The identity is the SHA-256 of `bytes`. The call returns the checksum
     /// of the object.
     ///
-    /// The call does not check the values of the GC anchor keys in a commit,
-    /// and it checks no entry of field 2 of a commit.
-    /// [`write_commit`](Transaction::write_commit) checks both.
+    /// The call checks no entry of field 2 of a commit.
+    /// [`write_commit`](Transaction::write_commit) checks them.
     ///
     /// # Errors
     ///

@@ -345,29 +345,6 @@ If ostrya cannot read a file that a TLS key or \fB\%push\-token\-file\fR names, 
 The keys of the group \fB\%[ex\-ostrya]\fR.
 The group is an extension of ostrya, and the \fB\%ostree\fR tool ignores it.
 .TP
-\fB\%gc\-root\-metadata\-keys\fR (list)
-Metadata keys that hold more roots for a prune.
-Each prune reads this key: a prune of \fB\%ostrya prune\fR, and a prune of a program that uses the ostrya library.
-\fB\%ostrya remote prune\fR reads no metadata key, so it refuses a bucket repository whose \fB\%config\fR sets this key.
-Such a program can add metadata keys to a prune, but it cannot remove a key of this list.
-A value that has a malformed escape sequence fails the prune before the repository lock, and the prune deletes nothing.
-A prune reads each entry with such a key, in the metadata and in the detached metadata of a commit.
-The value of an entry has one of the GVariant types \fB\%aay\fR, \fB\%a(say)\fR, or \fB\%a{s(say)}\fR.
-Each checksum in the value is a commit checksum of 32 bytes, and a prune ignores the strings.
-A prune keeps each commit that such a value names.
-A value of another type, or a checksum that is not 32 bytes, fails the prune, and the prune deletes nothing.
-A write of commit metadata or of detached metadata also reads this key and refuses such a value: \fB\%ostrya commit\fR and a write of a program that uses the ostrya library.
-The ostrya library also checks the metadata of a commit when it adds a composefs digest to the commit.
-A refused write writes no object, no ref, and no detached metadata.
-A write reads this key only if the metadata that it writes holds at least one entry, and a value that has a malformed escape sequence then fails the write.
-A pull, a push that \fB\%ostrya receive\fR or \fB\%ostrya serve\fR stores, a server commit, and a signature do not check the values.
-A program that writes the bytes of a metadata object through the ostrya library does not check the values.
-The port builds the binding keys of the anchor commit of a collection, so the anchor commit that \fB\%ostrya summary \-u\fR, \fB\%ostrya receive\fR, and \fB\%ostrya serve\fR write takes no check.
-A prune that reaches a commit with a defective value from one of these paths fails.
-Do not list a key here that the upstream of the repository lists in its \fB\%detached\-metadata\-exclude\fR.
-A pull from that upstream stores no detached metadata entry with such a key, so the entry keeps no commit, and a prune deletes the commits that it would keep.
-No command checks this rule, because each of the two configurations is correct alone.
-.TP
 \fB\%detached\-metadata\-exclude\fR (list)
 Detached metadata keys that are not stored.
 \fB\%ostrya pull\fR and \fB\%ostrya pull\-local\fR remove these keys from the \fB\%.commitmeta\fR that they write.

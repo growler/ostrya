@@ -18,8 +18,8 @@ use std::path::Path;
 use common::{TmpDir, file_inventory};
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CommitRelated, CreateOptions,
-    DictBuilder, DummySigner, Error, MutableTree, ObjectType, PullOptions, RelatedField, Repo,
-    RepoMode, RepoTree, Transaction, Type, Value,
+    DictBuilder, DummySigner, Error, LockKind, MutableTree, ObjectType, PullOptions, RelatedField,
+    Repo, RepoMode, RepoTree, Transaction, Type, Value,
 };
 use ostrya_rt::block_on;
 
@@ -993,6 +993,59 @@ fn write_commit_detached_metadata_checks_each_build_source_key() {
         repo.write_commit_detached_metadata(&head, Some(&accepted))
             .await
             .unwrap();
+    });
+}
+
+#[test]
+fn write_commit_detached_metadata_checks_before_the_lock() {
+    let tmp = TmpDir::new("related-write-before-lock");
+    block_on(async {
+        let repo = repo_with_trees(tmp.path(), &["head"]).await;
+        let head = commit(&repo, tmp.path(), "head", &[]).await;
+        // The config of a new repository ends in its `[core]` group, so the
+        // appended key goes into that group.
+        let config = repo.path().join("config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str("lock-timeout-secs=0\n");
+        std::fs::write(&config, text).unwrap();
+        let writing = Repo::open(repo.path()).await.unwrap();
+
+        let held = repo
+            .transaction_with_lock(LockKind::Exclusive)
+            .await
+            .expect("take the exclusive hold");
+        // The hold excludes the handle that writes.
+        let valid = dict(vec![(RELATED_KEY, sources(&[("source/ok", &[0x55; 32])]))]);
+        let err = writing
+            .write_commit_detached_metadata(&head, Some(&valid))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::LockTimeout { secs: 0 }),
+            "the hold is live: {err:?}"
+        );
+
+        let before = objects(&repo);
+        let defective = dict(vec![(RELATED_KEY, sources(&[("", &[0x55; 32])]))]);
+        let err = writing
+            .write_commit_detached_metadata(&head, Some(&defective))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            related_error(err),
+            (
+                Some(head),
+                RelatedField::BuildSources,
+                "entry 0 has an empty name".to_owned()
+            ),
+            "the check comes before the lock"
+        );
+        held.abort().await.unwrap();
+        assert_eq!(objects(&repo), before, "the refused write writes nothing");
+        assert_eq!(
+            writing.read_commit_detached_metadata(&head).await.unwrap(),
+            None
+        );
     });
 }
 

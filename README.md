@@ -71,11 +71,6 @@ Ostrya adds these functions, which the `ostree` command does not have:
 - Client access. Client groups in the `config` file give each client the
   access modes of each ref. The same groups apply to `serve`, `receive`, and
   `send`.
-- GC anchors. The key `[ex-ostrya] gc-root-metadata-keys` of the `config`
-  file names metadata keys that hold commit checksums. A prune keeps each
-  commit that such a key names in the metadata or the detached metadata of a
-  kept commit. A library caller can add keys to a prune. A write of commit
-  metadata refuses a value that a prune cannot read.
 - Related commits. Field 2 of a commit holds its dependencies, which
   `ostrya commit --related` writes. The detached metadata key
   `ostrya.related` holds its build sources, which the library adds. A prune

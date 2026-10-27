@@ -8,7 +8,7 @@ ostrya prune [OPTIONS]
 .SH DESCRIPTION
 Delete the objects that no ref or commit of the repository reaches.
 .PP
-The walk starts from each ref and from each commit in the store. The command deletes each loose object that the walk does not reach. \%\-\-refs\-only, \%\-\-only\-branch, \%\-\-retain\-branch\-depth, and \%\-\-keep\-younger\-than start the walk from the refs alone. The depth and date options then limit the history of each ref. The commits that the metadata keys of the config key \fB\%[ex\-ostrya] gc\-root\-metadata\-keys\fR name are also roots.
+The walk starts from each ref and from each commit in the store. The command deletes each loose object that the walk does not reach. \%\-\-refs\-only, \%\-\-only\-branch, \%\-\-retain\-branch\-depth, and \%\-\-keep\-younger\-than start the walk from the refs alone. The depth and date options then limit the history of each ref.
 .PP
 The related commits of each commit that the walk reaches are also roots, under the bound of \%\-\-depth or \%\-\-keep\-younger\-than. A related commit gets this bound also if \%\-\-retain\-branch\-depth gives the commit that names it a different depth. Field \%2 of a commit holds its dependencies, which \fB\%commit \-\-related\fR writes. The detached metadata key \fB\%ostrya.related\fR holds its build sources. The walk reads the two fields of each related commit too. An entry that names a commit that is not in the store gives no error. The command then keeps the detached metadata and the composefs image of that commit if they are in the store. For each defective value, the command writes a warning on standard error, and the defective value roots nothing. A detached metadata file that does not parse fails the command.
 .PP

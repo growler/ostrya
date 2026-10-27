@@ -32,8 +32,7 @@ const CONFIG_FILE: &str = "config";
 ///   [`fsverity`](RepoConfig::fsverity).
 /// - `[remote "<name>"]`: one section for each remote, read through
 ///   [`Remote`].
-/// - `[ex-ostrya]`: the keys that are ostrya extensions,
-///   [`gc_root_metadata_keys`](RepoConfig::gc_root_metadata_keys) and
+/// - `[ex-ostrya]`: the key that is an ostrya extension,
 ///   [`detached_metadata_exclude`](RepoConfig::detached_metadata_exclude).
 /// - The groups whose names start with `ex-ostrya` and a space, for example
 ///   `[ex-ostrya client "NAME"]`: the access of the clients of a server, and
@@ -450,62 +449,6 @@ impl RepoConfig {
             .unwrap_or(6))
     }
 
-    /// Returns the `[ex-ostrya] gc-root-metadata-keys` list.
-    ///
-    /// The list names the metadata keys from which a prune reads more
-    /// reachable commits. The key is an ostrya extension, and the list is empty
-    /// by default.
-    ///
-    /// [`Repo::prune`](crate::Repo::prune) reads this key and merges the list
-    /// with
-    /// [`PruneOptions::gc_root_metadata_keys`](crate::PruneOptions::gc_root_metadata_keys).
-    /// The config keys come first, and the merged list holds each key one
-    /// time. The list adds roots and removes none. It has no counterpart for
-    /// [`traverse_parent`](crate::PruneOptions::traverse_parent). As a result,
-    /// a prune with this list keeps at least what the same prune without it
-    /// keeps. With `traverse_parent` set, as `ostrya prune` runs, that is at
-    /// least what the `ostree` command keeps.
-    ///
-    /// A repository must not root on a key that its upstream strips with
-    /// [`detached_metadata_exclude`](RepoConfig::detached_metadata_exclude). No
-    /// call checks this rule, because the fault spans two configurations and
-    /// neither one shows it alone. A stripped key is in no detached metadata
-    /// that this repository receives, so it adds no root there, and a prune
-    /// deletes the commits that the key would keep, with no report.
-    ///
-    /// Four write methods also read this key, when a dict that they check
-    /// holds at least one entry:
-    /// [`Transaction::write_commit`](crate::Transaction::write_commit),
-    /// [`Transaction::commit`](crate::Transaction::commit),
-    /// [`Repo::write_commit_detached_metadata`], and
-    /// [`Repo::commit_add_composefs_metadata`]. Each one refuses a dict that
-    /// gives a key of this list a value that a prune refuses, with
-    /// [`Error::InvalidGcAnchor`].
-    ///
-    /// These paths store a commit or its detached metadata with no check:
-    ///
-    /// - a pull
-    /// - the mirror push and the server commit of `ostrya receive` and
-    ///   `ostrya serve`
-    /// - [`Transaction::sign_commit`](crate::Transaction::sign_commit) and
-    ///   [`Repo::sign_commit`]
-    /// - the tombstone of a pruned commit
-    /// - [`Transaction::write_metadata`](crate::Transaction::write_metadata),
-    ///   which takes the bytes of a metadata object
-    /// - the anchor commit of a repository with a collection id, which
-    ///   [`Repo::regenerate_summaries`], `ostrya receive`, and `ostrya serve`
-    ///   write. The port builds the binding keys of this commit.
-    ///
-    /// A prune that reaches a commit with a defective value from one of these
-    /// paths fails.
-    ///
-    /// # Errors
-    ///
-    /// [`Error::Core`] if the value holds a malformed escape sequence.
-    pub fn gc_root_metadata_keys(&self) -> Result<Vec<String>> {
-        self.string_list(EX_OSTRYA, "gc-root-metadata-keys")
-    }
-
     /// Returns the `[ex-ostrya] detached-metadata-exclude` list.
     ///
     /// The list names the detached metadata keys that this repository does not
@@ -519,11 +462,6 @@ impl RepoConfig {
     /// [`DetachedMetadataFilter::excluding`](crate::DetachedMetadataFilter::excluding).
     /// Under the `receive` feature, `ReceivePolicies::from_config` reads it
     /// into the filter of the receive path.
-    ///
-    /// This list never comes from
-    /// [`gc_root_metadata_keys`](RepoConfig::gc_root_metadata_keys), also when
-    /// the two lists are equal. If a repository roots on a key and does not
-    /// list it here, the repository continues to transfer the key.
     ///
     /// The list controls what a pull stores. It does not change what the
     /// repository already holds. If the list names each detached metadata key
@@ -1445,20 +1383,14 @@ mod tests {
     #[test]
     fn ex_ostrya_lists_are_empty_when_absent() {
         let cfg = RepoConfig::parse(ARCHIVE_CONFIG).unwrap();
-        assert!(cfg.gc_root_metadata_keys().unwrap().is_empty());
         assert!(cfg.detached_metadata_exclude().unwrap().is_empty());
     }
 
     #[test]
     fn ex_ostrya_lists_parse_their_values() {
         let text = "[core]\nrepo_version=1\nmode=bare\n[ex-ostrya]\n\
-                    gc-root-metadata-keys=app.roots;app.caches\n\
                     detached-metadata-exclude=app.roots\n";
         let cfg = RepoConfig::parse(text).unwrap();
-        assert_eq!(
-            cfg.gc_root_metadata_keys().unwrap(),
-            vec!["app.roots".to_owned(), "app.caches".to_owned()]
-        );
         assert_eq!(
             cfg.detached_metadata_exclude().unwrap(),
             vec!["app.roots".to_owned()]
@@ -1470,10 +1402,10 @@ mod tests {
         // The key-file list convention writes a trailing `;`, which adds no
         // empty element.
         let text = "[core]\nrepo_version=1\nmode=bare\n[ex-ostrya]\n\
-                    gc-root-metadata-keys=app.roots;app.caches;\n";
+                    detached-metadata-exclude=app.roots;app.caches;\n";
         let cfg = RepoConfig::parse(text).unwrap();
         assert_eq!(
-            cfg.gc_root_metadata_keys().unwrap(),
+            cfg.detached_metadata_exclude().unwrap(),
             vec!["app.roots".to_owned(), "app.caches".to_owned()]
         );
     }

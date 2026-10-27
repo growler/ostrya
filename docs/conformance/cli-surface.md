@@ -2659,7 +2659,7 @@ states for `commit --sign-type`. `reindex` takes `--to=REV`, which rewrites or
 removes the index file of one target and reads REV by the rule of one half of a
 delta name; the last `--to` wins. A `--keys-file` and each key-store file of
 the spki engine hold PEM `PUBLIC KEY` blocks (`format-reference.md`, "Signing
-details", "spki"). Forty-three differences stand on `show`,
+details", "spki"). Forty-four differences stand on `show`,
 `delete`, `list`, `indexes`, `verify`, `apply-offline`, and `reindex`.
 
 - a superblock file over 128 MiB (134217728 bytes). The port refuses it in
@@ -2817,6 +2817,13 @@ details", "spki"). Forty-three differences stand on `show`,
   superblock copied away from its parts. The tool reports `error: Opening
   deltapart '<i>': <reason>`. The port reports the library's `error: i/o
   error:` sentence. Both exit 1 and write no object;
+- the detached metadata of the target under `apply-offline`. Where the
+  superblock carries a copy of the detached metadata of the target
+  (`../format-reference.md`, "Superblock fields"), the tool writes the
+  `.commitmeta` of the target from that copy (`cli-behavior.md`, "CLI output
+  formats", `static-delta`, "`apply-offline`"). The port writes no
+  `.commitmeta`. Both exit 0 and write the same objects, and neither writes a
+  ref. `../roadmap.md`, "Gaps in the library", lists the work;
 - the deltas `apply-offline` takes. `ostree static-delta apply-offline`
   refuses a delta whose fallback array is not empty, with `Cannot execute
   delta offline: contains nonempty http fallback entries`. To the tool,

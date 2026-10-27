@@ -942,9 +942,9 @@ The tool selects a delta and requests the delta files by these rules:
 
 #### The remote config
 
-The tool requests `config` only after a summary arrives. Then the `[core] mode`
-of `config` decides whether the pull proceeds. The tool reads `[core] mode`
-alone from the remote `config`:
+In a pull of a ref, the tool requests `config` only after a summary arrives.
+Then the `[core] mode` of `config` decides whether the pull proceeds. The tool
+reads `[core] mode` alone from the remote `config`:
 
 - `mode=archive-z2` and `mode=archive` proceed. The tool refuses `mode=bare`,
   `bare-user`, `bare-user-only`, and `bare-split-xattrs` before the first object
@@ -959,7 +959,8 @@ alone from the remote `config`:
   or comment`.
 - The tool does not check `repo_version`. A `config` with `repo_version`
   absent, `0`, `2`, or `abc` proceeds.
-- No other key and no other group changes the requests or the result.
+- In a pull of a ref, no other key and no other group changes the requests or
+  the result.
 - After a summary, a `config` that answers 404 fails the pull, and no request
   follows: `error: While fetching <url>/config: Server returned HTTP 404`.
 
@@ -973,11 +974,15 @@ The rule for the other keys and groups holds for these values:
 - `collection-id` present, absent, and different from that of the summary
 - the groups `[remote "x"]`, `[ex-ostrya]`, and `[sysroot]`
 
-With no summary, the tool requests no `config`. So a `bare-user` remote with no
-summary fails the pull on a 404 for an `objects/<...>.filez` request. An
-archive remote with no summary pulls with no error when its `config` is absent,
-does not parse, or states `mode=bare-user`. `remote refs` and `remote summary`
-request no `config`.
+In a pull of a ref with no summary, the tool requests no `config`. So a
+`bare-user` remote with no summary fails the pull on a 404 for an
+`objects/<...>.filez` request. An archive remote with no summary pulls with no
+error when its `config` is absent, does not parse, or states `mode=bare-user`.
+`remote refs` and `remote summary` request no `config`.
+
+A pull by checksum requests `config` first. Where `config` states `[core]
+indexed-deltas=true`, the pull requests no summary ("Related commits in a
+pull").
 
 A collection id fails a pull only through the remote of the client. The tool
 checks that remote against the binding of the commit:
@@ -1249,6 +1254,74 @@ repository does not configure gives the same abort. These rules hold for
 
 `cli-surface.md`, "P2", `pull`, and `cli-surface.md`, "P2", `pull-local`,
 record the port side.
+
+#### Related commits in a pull
+
+The pulls in this subsection pull a commit C whose related-objects array names
+two commits, A and B (`../format-reference.md`, "Commit --
+`(a{sv}aya(say)sstayay)`", field 2). The entries are `boot/kernel` for A and
+`container/fe` for B. C has the root tree of B. The three commits share one
+dirmeta, and A has its own dirtree and file object. So the commit objects of A
+and B and the dirtree and the file object of A show whether a transfer follows
+the array. The remote is an archive repository that holds A, B, and C, a ref
+on each commit, a summary, and a `.commitmeta` on C. The port library wrote the
+objects of A, B, and C and the `.commitmeta`, because no `commit` option of the
+tool writes a related entry. `summary -u` of the tool wrote the summary. Each
+client is a new `bare-user` repository.
+
+A pull of the ref of C sends these requests, with these statuses:
+
+```
+summary.sig                                         404
+summary                                             200
+config                                              200
+delta-indexes/<to_b64[0:2]>/<to_b64[2:]>.index      404
+objects/<C>.commitmeta                              200
+objects/<C>.commit                                  200
+objects/<...>.dirtree, .dirmeta, .filez             200
+```
+
+- The tool accepts C and exits 0. The pull writes the ref of C alone.
+- The tool requests no commit object of A or B and neither the dirtree nor the
+  file object of A. It fetches the tree of C, which is also the tree of B. The
+  client holds the commit object of C, its `.commitmeta`, and the tree of C.
+  The `.commitmeta` is the same bytes as the file of the remote.
+- `show <A>` and `show <B>` give the error of an absent object at exit 1
+  (`show`, "The object argument").
+- `fsck` over the client exits 0 with no finding (`fsck`, "Related commits in
+  fsck").
+- A pull by the checksum of C requests `config` first. The `config` of the
+  remote states `indexed-deltas=true`, which `summary -u` writes, so the pull
+  requests no `summary.sig` and no `summary`. Where `config` does not state
+  the key, `summary.sig` and `summary` follow `config`. The other requests and
+  the objects that the client holds after the pull are the same. The pull
+  writes no ref.
+
+`pull-local` of the ref of C from the same source imports the commit object of
+C, its `.commitmeta`, and the tree of C, at exit 0. It imports no commit object
+of A or B and neither the dirtree nor the file object of A. The `.commitmeta`
+is the same bytes as the source file. `fsck` over the result exits 0 with no
+finding (`fsck`, "Related commits in fsck").
+
+A delta pull also fetches the target alone. The remote holds the from-scratch
+delta of C, which `static-delta generate` of the tool wrote, and its summary
+names the delta. A pull of the ref of C with `--require-static-deltas` sends
+these requests, with these statuses:
+
+```
+summary.sig                                         404
+summary                                             200
+config                                              200
+delta-indexes/<to_b64[0:2]>/<to_b64[2:]>.index      200
+deltas/<to_b64[0:2]>/<to_b64[2:]>/superblock        200
+deltas/<to_b64[0:2]>/<to_b64[2:]>/0                 200
+objects/<C>.commitmeta                              200
+```
+
+No `delta-indexes/` or `deltas/` request names A or B.
+`--require-static-deltas` does not refuse the pull. The client holds the same
+objects and the same `.commitmeta` as after the pull of loose objects. `fsck`
+over the result exits 0 with no finding (`fsck`, "Related commits in fsck").
 
 ### Signature verification during a pull
 
@@ -3683,12 +3756,17 @@ A file object reports its header, one field on each line:
 #### The metadata key modes
 
 `--print-related` prints one line for each entry of the related-objects array
-of the commit: `<ref> <checksum>`. Over a commit that holds two entries, the
-tool prints one line for each entry. No `commit` option of the tool or the
-port writes such an entry (`../format-reference.md`, "Commit --
-`(a{sv}aya(say)sstayay)`", field 2). So the array is empty on each commit that
-the tool or the port writes. Over such a commit, the mode prints nothing at
-exit 0.
+of the commit, in the order of the array: the name, one space, the checksum in
+lowercase hex, and a newline. Over a commit whose array holds `boot/kernel` and
+then `container/fe`, the tool prints the two lines in that order at exit 0,
+with nothing on standard error. The order holds also where the names are not
+in sorted order. Over an array that holds `zz/last` and then `aa/first`, the
+tool prints `zz/last` first, at exit 0, with nothing on standard error. The
+mode prints each entry also where the repository does not hold the commit that
+the entry names. No `commit` option of the tool or the port writes such an
+entry (`../format-reference.md`, "Commit -- `(a{sv}aya(say)sstayay)`", field
+2). So the array is empty on each commit that the tool or the port writes. Over
+such a commit, the mode prints nothing at exit 0.
 
 `--list-metadata-keys` and `--list-detached-metadata-keys` print one key on
 each line, in sorted order. A commit with no `.commitmeta` reports `error: No
@@ -4255,6 +4333,28 @@ Not observed: the separator of the tool under a locale with a different
 decimal separator. `cli-surface.md`, "P2", `prune`, and `cli-surface.md`,
 "P2", `static-delta`, record the port side.
 
+#### Related commits in a prune
+
+The repository is an archive repository that holds the same commits as the
+source of "Related commits in a pull": A, B, and C, a ref on each commit, and
+a `.commitmeta` on C. It holds no summary, no `deltas/` directory, and no
+`delta-indexes/` directory. The related-objects array of C names A and B, and
+C has the root tree of B.
+
+- Each run writes `Total objects: 8` on its first line.
+- With the three refs, `prune --refs-only --no-prune` writes `No unreachable
+  objects` on its second line.
+- After `refs --delete` of the refs of A and B, the ref of C alone stays.
+  `prune --refs-only --no-prune` then writes `Would delete: 4 objects, freeing
+  257 bytes`, and `prune --refs-only` writes `Deleted 4 objects, 257 bytes
+  freed`. Each run exits 0.
+- The four objects are the commit objects of A and B and the dirtree and the
+  file object of A. C, its `.commitmeta`, and its tree stay.
+
+So `prune --refs-only` keeps no commit for an entry of the array. After the
+prune, `show <A>` and `show <B>` give the error of an absent object at exit 1.
+`fsck` exits 0 with no finding (`fsck`, "Related commits in fsck").
+
 ### `fsck`
 
 `fsck` writes its phase lines and its summary lines to standard output. It
@@ -4483,6 +4583,26 @@ the absent parent does not stop the action.
 
 The branch ref stays over the deleted commit. So the next run ends in the
 phase that reads the ref.
+
+#### Related commits in fsck
+
+The run reports no finding for an entry of the related-objects array of a
+commit. The repositories are the repositories of "Related commits in a pull",
+"Related commits in a prune", and `static-delta`, "`apply-offline`":
+
+- The source holds C and the two commits that its array names. The run checks
+  3 commits and 8 objects and exits 0 with the success line.
+- A client of a pull, of `pull-local`, or of `static-delta apply-offline` of
+  the from-scratch delta of C holds C and neither commit that its array names.
+  The run checks 1 commit and 4 objects and exits 0 with the success line.
+- A repository that holds B and takes the delta from B to C through
+  `apply-offline` holds B and C and not A. The run checks 2 commits and 5
+  objects and exits 0 with the success line.
+- A repository from which a prune removed A and B gives the same result as a
+  client of a pull.
+
+So the object walk does not follow the array, and the absence of a commit that
+the array names is not a fault.
 
 #### Exit status
 
@@ -5676,8 +5796,29 @@ in both PATH forms (`../format-reference.md`, "Inline parts"). The options are
 the options of `verify`, under the same last-value rule.
 
 On success, both streams are empty and the exit status is 0. The objects of the
-target commit are in the repository, and no ref is written. The checks run in
-this order, and each refusal writes no object and no ref:
+target commit are in the repository, and no ref is written.
+
+Where the superblock carries a copy of the detached metadata of the target
+(`../format-reference.md`, "Superblock fields"), the apply writes the
+`.commitmeta` of the target from that copy. These runs show this, each with a
+target C that has a `.commitmeta` and a related-objects array that names the
+commits A and B:
+
+- the from-scratch delta of C, into a new `bare-user`, `bare-user-only`, or
+  `archive` repository;
+- the delta from B to C, into a `bare-user` repository that holds B.
+
+After each run, the `.commitmeta` of C is the same bytes as the file of the
+source repository, and `show --list-detached-metadata-keys` of C lists its key.
+Where the repository holds a different `.commitmeta` of C and not the commit
+object of C, the apply replaces that file with the copy. Where the repository
+holds the commit object of C, the apply exits 0 and keeps the `.commitmeta`
+that the repository holds. The apply writes no commit object of A and neither
+the dirtree nor the file object of A, and it does not refuse C where the
+repository does not hold A. `fsck` over each result exits 0 with no finding
+(`fsck`, "Related commits in fsck").
+
+The checks run in this order, and each refusal writes no object and no ref:
 
 1. No PATH reports `error: PATH must be specified`. The tool opens the
    repository before this check.
@@ -5784,6 +5925,16 @@ bsdiff=0 objects
 
 `cli-surface.md`, "P2", `static-delta generate`, records the port side of
 standard error.
+
+The tool accepts a target whose related-objects array is not empty, at exit 0.
+For a target C whose array names the commits A and B, and whose root tree is
+the root tree of B, the from-scratch delta and the delta from B are observed:
+
+- The superblock embeds the commit object of C with the two entries of the
+  array.
+- The parts carry neither the dirtree nor the file object of A. The part of
+  the from-scratch delta holds the dirtree, the dirmeta, and the file object of
+  C. The part of the delta from B holds no object.
 
 #### Byte order of a generated delta
 

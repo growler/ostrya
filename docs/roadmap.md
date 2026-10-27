@@ -100,6 +100,12 @@ for it.
 - An option that turns off the keys of `[ex-ostrya] gc-root-metadata-keys`
   for one run of `Repo::prune`. It comes when a caller needs a run that
   keeps less than the policy of the repository.
+- The detached metadata in an offline apply.
+  `Repo::apply_static_delta_offline` and `Repo::apply_static_delta` write no
+  `.commitmeta`. The `ostree` command writes the `.commitmeta` of the target
+  from the copy in the superblock (`conformance/cli-behavior.md`, "CLI output
+  formats", `static-delta`, "`apply-offline`"). `conformance/cli-surface.md`,
+  "P2", `static-delta`, records the difference.
 - The rules of the one-way stream come from code alone (`StreamPolicy`), and
   they can name remote refs. No client group applies to the stream. A later
   command, for example `ostrya repo import`, can replace the stream.

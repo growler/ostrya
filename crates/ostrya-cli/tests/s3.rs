@@ -1480,6 +1480,43 @@ fn remote_fsck_of_a_corrupt_bucket_prints_each_finding_and_exits_1() {
     );
 }
 
+/// A commit whose field 2 names a commit that the bucket does not hold gives
+/// a `dependency` error on the key of the commit, and the command exits 1.
+#[test]
+fn remote_fsck_reports_an_absent_dependency_and_exits_1() {
+    let scratch = Scratch::new("fsck-dependency");
+    let server = StandIn::start();
+    let (_, tip) = fsck_fixture(&scratch, &server, &[]);
+    let key = |commit: &str| format!("objects/{}/{}.commit", &commit[..2], &commit[2..]);
+    let absent = "ab".repeat(32);
+    let mut naming =
+        ostrya::Commit::parse(&object(&server, &format!("repo/{}", key(&tip))).unwrap()).unwrap();
+    naming.related = vec![(
+        "lib/x".to_owned(),
+        ostrya::Checksum::from_hex(&absent)
+            .unwrap()
+            .as_bytes()
+            .to_vec(),
+    )];
+    let bytes = naming.serialize().unwrap();
+    let naming = ostrya::Checksum::sha256(&bytes).to_hex();
+    server
+        .state()
+        .store(&format!("repo/{}", key(&naming)), &bytes);
+    let endpoint = endpoint_of(&server);
+    let out = scratch.run(&["remote", "fsck", "-q", ADDRESS, &endpoint, CLEARTEXT]);
+    assert_eq!(out.status.code(), Some(1));
+    assert_eq!(stdout(&out), "");
+    assert_eq!(
+        stderr(&out),
+        format!(
+            "dependency {}: dependency lib/x names commit {absent}, which the repository does \
+             not hold\nerror: Bucket repository corruption encountered\n",
+            key(&naming)
+        )
+    );
+}
+
 #[test]
 fn remote_fsck_reports_a_stale_summary_as_a_note() {
     let scratch = Scratch::new("fsck-stale");

@@ -2372,7 +2372,7 @@ one alike. `--delete` takes no such gate of its own: the objects it unlinks and
 the commits it marks are the same set with `-a` and without it in both
 implementations.
 
-Eight divergences stand at `fsck`:
+Nine divergences stand at `fsck`:
 
 - the progress line. The tool writes `fsck objects (n/total) pct%` to standard
   output: the first update, the last one, and about one more a second between
@@ -2437,7 +2437,16 @@ Eight divergences stand at `fsck`:
   `--add-tombstones`, `--verify-bindings`, or `--verify-back-refs`; the port
   refuses it with `error: the argument '<flag>' cannot be used multiple times`
   at exit 1. This is the repeated-boolean-flag class already recorded for
-  `export --no-xattrs` and the four `prune` flags.
+  `export --no-xattrs` and the four `prune` flags;
+- a dependency in field 2 that is absent, partial, or defective. The tool
+  reports no finding for an entry of field 2 and exits 0 (`cli-behavior.md`,
+  "CLI output formats", `fsck`, "Related commits in fsck"). The port writes
+  one line for each such entry on standard error, marks the commit that names
+  an absent or a partial dependency as partial unless `--no-mark-partial` is
+  given, and exits 1 with `error: Repository corruption encountered`. A
+  defective entry gets no marker. `../format-reference.md`, "Dependencies in
+  the fsck", states the rules. Over a repository whose dependencies are
+  complete, the two agree.
 
 `fsck --add-tombstones` deletes a commit object and leaves a branch ref
 standing over it, so repeated runs walk a broken branch backwards one commit
@@ -4832,10 +4841,13 @@ allow-cleartext-credentials`.
   when the count is not zero. It writes one line for each finding to
   standard error, sorted by key and then by kind: `KIND KEY: DETAIL`, then
   `; in commits C1, C2` when the finding names commits. A note starts with
-  `note: `. A report with an error ends with `error: Bucket repository
-  corruption encountered` and exit status 1. Else the command writes `fsck
-  of the bucket repository ADDRESS: no errors found` and exits 0. Notes
-  alone give exit status 0. A failed write to standard output, for example
+  `note: `. A dependency in field 2 of a commit that is absent, partial, or
+  defective gives a `dependency` error on the key of that commit, with the
+  reason of the finding of `fsck` as its detail (`../format-reference.md`,
+  "Dependencies in the fsck"). A report with an error ends with `error: Bucket
+  repository corruption encountered` and exit status 1. Else the command
+  writes `fsck of the bucket repository ADDRESS: no errors found` and exits 0.
+  Notes alone give exit status 0. A failed write to standard output, for example
   on a full device, gives `error: i/o error: ...` and exit status 1. With
   a remote name, the command verifies the signature of the summary with
   the summary keys of the remote, `gpg-verify-summary` and
@@ -4846,7 +4858,12 @@ allow-cleartext-credentials`.
 - `remote fsck --delete` takes the writer lock, writes the marker
   `state/<checksum>.commitpartial` of each commit that reaches a missing or
   a bad object of a tree, deletes the marker of each commit whose tree is
-  whole, and deletes each bad object. It writes `Marking commit as partial:
+  whole, and deletes each bad object. It checks the dependencies against
+  the state after the repair: a dependency whose marker the repair deletes
+  is not partial, a dependency that gets a marker is partial, a dependency
+  whose commit object the repair deletes is absent, and a commit whose own
+  object the repair deletes gets no check. It writes and deletes no key for
+  a `dependency` error. It writes `Marking commit as partial:
   COMMIT (REF, ...)`, `Deleted the partial-commit marker of commit COMMIT`,
   `Deleted KEY`, and `Deleted the commit object of a ref: COMMIT (REF,
   ...)` lines to standard output. A bucket repository with no valid

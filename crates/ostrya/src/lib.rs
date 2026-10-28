@@ -185,8 +185,9 @@ pub use fetch::{
 pub use file::{ContentReader, FileKind, FileObject};
 #[doc(hidden)]
 pub use fsck::{
-    FsckBindingError, FsckBindingErrorKind, FsckError, FsckErrorKind, FsckFailure, FsckImageError,
-    FsckImageErrorKind, FsckOptions, FsckPhase, FsckReport,
+    FsckBindingError, FsckBindingErrorKind, FsckDependencyError, FsckDependencyErrorKind,
+    FsckError, FsckErrorKind, FsckFailure, FsckImageError, FsckImageErrorKind, FsckOptions,
+    FsckPhase, FsckReport,
 };
 #[cfg(feature = "sign-gpg")]
 #[doc(hidden)]

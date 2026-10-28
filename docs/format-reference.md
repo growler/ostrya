@@ -3289,6 +3289,42 @@ at the server, a sender sends it as the new commit of an update, in that
 stream or in an earlier one. The server then checks the tree of the
 dependency and removes its marker.
 
+### Dependencies in the fsck
+
+`Repo::fsck` and `ostrya fsck` check field 2 of each commit that they verify:
+each commit with no partial-commit marker at the start of the run that the
+run does not delete. The run reads field 2 from the read of its object walk,
+so it reads no object again. It gives one finding for each entry, in the
+stored order, and the first rule that applies gives the kind:
+
+- `Defective`: the entry has an empty name, or a checksum that is not 32
+  bytes.
+- `Absent`: the repository does not hold the commit object at the start of
+  the run, or the run deletes it.
+- `Partial`: the commit has a partial-commit marker at the start of the run,
+  or its tree reaches an object that is absent or that the run deletes.
+- `Defective`: the field 2 of the commit is not empty.
+
+An entry that no rule applies to gives no finding. A checksum that field 2
+names under two names gives two findings. Two entries with one name, and
+names that are not sorted, give no finding. The text of a finding is the
+text of `Error::InvalidRelated` for field 2: `related commits in field 2 of
+commit C: dependency N names commit D, which the repository does not hold`,
+`..., which is partial`, `..., which has dependencies of its own`, or the
+defect of the entry.
+
+With the default `mark_partial`, the run writes the marker
+`state/<commit>.commitpartial` of each commit with an `Absent` or a
+`Partial` finding. A later pull of that commit fetches it again with its
+dependencies. A `Defective` finding gets no marker, because a pull cannot
+repair it. A marker of this check does not change the other findings of the
+run. `ostrya fsck` writes each finding on standard error and exits 1. A run
+that ends early does not reach this check. The check runs before the
+tombstone step of `--add-tombstones`.
+
+The fsck of a bucket repository makes the same findings as `dependency`
+findings ("The fsck of a bucket repository").
+
 ## Ref patterns
 
 The port selects refs by name with two grammars. A pattern of a client group
@@ -6854,7 +6890,11 @@ The steps of the fsck are:
    the listing and to the metadata size cap of 128 MiB. An object that is
    larger than its listed size is read again up to the cap. The SHA-256 of
    the bytes must be the checksum of the name, and the bytes must parse as
-   a commit.
+   a commit. Then, without the repair, the check of field 2 of each commit
+   that parses, the commits with a partial-commit marker included, as
+   "Dependencies in the fsck" states. The listing must hold the commit of
+   each dependency, and `state/` must hold no marker
+   `state/<checksum>.commitpartial` of it. This check reads no object.
 6. The walk of the tree of each commit that parses, also of a commit whose
    bytes do not match its name. The run reads each dirtree and each dirmeta
    once, and checks its checksum and its parse. A dirtree that does not
@@ -6874,11 +6914,18 @@ The steps of the fsck are:
    `.commitmeta` and a `.cfs` of a commit of the listing are reached. The
    run reads no such object.
 10. Without the repair, the read again of each object of a `missing`
-    finding that the listing does not hold, and then of the commits of each
-    such object that is still absent. Each read is a `GET` with
+    finding that the listing does not hold, and of the commit of each
+    `Absent` dependency of a `dependency` finding, one time for each
+    commit. Then the read again of the commits of each object of a
+    `missing` finding that is still absent. Each read is a `GET` with
     `Range: bytes=0-0`, by the strict rule of an absent key.
-11. With the repair, the repair below and the release of the lock. Without
-    the repair, the read of the lock again.
+11. With the repair, the check of field 2 of step 5 against the state
+    after the repair, then the repair below and the release of the lock.
+    The markers after the repair are the markers of the list of `state/`
+    that the repair does not delete, and the markers that the repair
+    writes. A commit object that the repair deletes is absent, and a commit
+    whose own object the repair deletes gets no check. Without the repair,
+    the read of the lock again.
 
 When a finding names a missing or a bad object of a tree, the run reads
 each dirtree of the trees one more time, and names the commits that reach
@@ -6930,6 +6977,14 @@ Each finding has one kind, and is an error or a note:
 - `corrupt`, an error: an object that does not parse, a `.filez` that does
   not inflate as its header declares, an object over the metadata size cap,
   or a `.cfs` whose commit records no digest that the run reads.
+- `dependency`, an error: an entry of field 2 of a commit that is
+  `Absent`, `Partial`, or `Defective`. The key is the object key of the
+  commit that holds the entry, and the detail is the reason of the finding
+  of the local fsck. With the repair, the run classifies the entry against
+  the state after the repair (step 11). The repair writes and deletes no
+  key for it.
+- `dependency`, a note: without the repair, an `Absent` dependency whose
+  commit the read again finds.
 - `marker`, a note: without the repair, the partial-commit marker of a
   commit that the run walked, whose tree has no `missing`, `mismatch`, or
   `corrupt` finding, and whose own object has none.

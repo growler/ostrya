@@ -129,6 +129,12 @@
 //!   its name, and parse. A `.filez` must inflate to its declared size with
 //!   no bytes after its payload. The fs-verity digest of an image must be the
 //!   digest that its commit records.
+//! - The dependencies in field 2 of each commit that parses, the commits
+//!   with a partial-commit marker included. Each entry must have a name that
+//!   is not empty and a checksum of 32 bytes. The listing must hold the
+//!   commit of each dependency, the bucket must hold no partial-commit marker
+//!   of it, and its field 2 must be empty. Each fault is a `Dependency`
+//!   finding. With `delete`, the check reads the state after the repair.
 //! - The partial-commit markers of the commits whose trees are whole, the
 //!   incomplete multipart uploads, and a writer lock at the start or at the
 //!   end of the run. These are notes.
@@ -138,7 +144,9 @@
 //! fan-out prefixes is no snapshot. Before the run reports an object that
 //! the listing does not hold, it reads the object again, and then the
 //! commits of the object. An object that is in the bucket now is a note, and
-//! an object whose commits are all gone is no finding.
+//! an object whose commits are all gone is no finding. The run also reads
+//! again the commit of each dependency that the listing does not hold, and
+//! a commit that is in the bucket now makes its finding a note.
 //!
 //! With `delete`, the run takes the writer lock with the operation `fsck`.
 //! It writes the marker `state/<checksum>.commitpartial`, with the one byte
@@ -148,8 +156,13 @@
 //! tree, so each ref keeps its commit, unless the object of the commit is
 //! bad. A commit object whose own bytes are bad goes, also when a ref names
 //! it, the report names the ref, and a push of the ref uploads the commit
-//! again. A push of a ref whose commit has a marker uploads the missing
-//! objects of its tree. A repair that fails after its first change gives
+//! again. The run checks the dependencies against the state after the
+//! repair: a dependency whose marker the run deletes is not partial, a
+//! dependency that gets a marker is partial, a dependency whose commit
+//! object the run deletes is absent, and a commit whose own object the run
+//! deletes gets no check. The run writes and deletes no key for a
+//! `Dependency` finding. A push of a ref whose commit has a marker uploads
+//! the missing objects of its tree. A repair that fails after its first change gives
 //! [`Error::BucketRepairIncomplete`](crate::Error::BucketRepairIncomplete),
 //! with the report of the changes that completed: run the fsck with
 //! `delete` again before a push.

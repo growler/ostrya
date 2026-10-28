@@ -12,13 +12,15 @@ The command loads the commit of each ref, lists each commit in the store, and re
 .PP
 The walk runs to its end and writes each finding on standard error. A ref to a missing commit, a missing dirtree, or a failed binding check ends the run early. If the command finds an error or skips a partial commit, it exits \%1.
 .PP
+After the walk, the command checks the dependencies in field \%2 of each commit that it verified. It writes one line on standard error for each dependency that is absent, partial, or defective, and exits \%1. It marks a commit with an absent or a partial dependency as partial, unless \%\-\-no\-mark\-partial is given, so a later pull fetches the dependency.
+.PP
 After the walk, the command checks each composefs image object against the key \fB\%ostree.composefs.digest.v0\fR of its commit. A faulty image is an error, and \%\-\-delete removes it: an image whose digest is not the key, an image that does not read, and an image whose commit has no key or a malformed key. If the commit of an image does not load, the command reports an error and keeps the image. An image whose commit is absent gets one line on standard output and is not an error.
 .SH OPTIONS
 .TP
 \fB\-\-no\-mark\-partial\fR
 If a referenced object is missing, do not mark the commit partial.
 .IP
-Without this option, the command writes the marker \fB\%state/<commit>.commitpartial\fR for each commit that reaches a missing object, or an object that \%\-\-delete removed.
+Without this option, the command writes the marker \fB\%state/<commit>.commitpartial\fR for each commit that reaches a missing object, or an object that \%\-\-delete removed, and for each commit with an absent or a partial dependency.
 .TP
 \fB\-\-add\-tombstones\fR
 Delete each commit whose parent commit is missing, and add a tombstone.

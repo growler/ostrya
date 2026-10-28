@@ -111,6 +111,13 @@ for it.
   target whose dependency has a `.commitpartial` marker, and do not remove the
   marker when they apply the delta of the dependency. So offline media cannot
   repair a dependency that the repository holds partial.
+- The tombstone step of `fsck --add-tombstones` and dependencies. The step
+  deletes each commit whose parent commit is absent, also a commit that
+  another commit names as a dependency. A pull takes a dependency at depth
+  0, with no parent, so a dependency with a parent is such a commit. The
+  next run then gives an `Absent` finding for the commit that names it. The
+  dependency check of the run runs before the tombstone step, so the run
+  that deletes the dependency does not report it.
 - The rules of the one-way stream come from code alone (`StreamPolicy`), and
   they can name remote refs. No client group applies to the stream. A later
   command, for example `ostrya repo import`, can replace the stream.

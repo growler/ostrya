@@ -307,6 +307,12 @@ enum Command {
     /// ends the run early. If the command finds an error or skips a partial
     /// commit, it exits 1.
     ///
+    /// After the walk, the command checks the dependencies in field 2 of each
+    /// commit that it verified. It writes one line on standard error for each
+    /// dependency that is absent, partial, or defective, and exits 1. It marks
+    /// a commit with an absent or a partial dependency as partial, unless
+    /// --no-mark-partial is given, so a later pull fetches the dependency.
+    ///
     /// After the walk, the command checks each composefs image object against
     /// the key `ostree.composefs.digest.v0` of its commit. A faulty image is
     /// an error, and --delete removes it: an image whose digest is not the
@@ -1707,6 +1713,12 @@ enum RemoteCommand {
     /// in the bucket now gives a note, and an object whose commits are all
     /// gone now gives no line.
     ///
+    /// The command checks the dependencies in field 2 of each commit. A
+    /// dependency that is absent, partial, or defective gives a `dependency`
+    /// error on the key of the commit that names it. With --delete, the
+    /// command checks the dependencies against the bucket after the repair,
+    /// and writes and deletes no key for such an error.
+    ///
     /// With --delete, the command takes the writer lock, writes the marker
     /// `state/<checksum>.commitpartial` for each commit that reaches a bad or
     /// a missing object of a tree, deletes the marker of each commit whose
@@ -2433,7 +2445,8 @@ struct FsckArgs {
     ///
     /// Without this option, the command writes the marker
     /// `state/<commit>.commitpartial` for each commit that reaches a missing
-    /// object, or an object that --delete removed.
+    /// object, or an object that --delete removed, and for each commit with
+    /// an absent or a partial dependency.
     #[arg(long)]
     no_mark_partial: bool,
     /// Delete each commit whose parent commit is missing, and add a tombstone.
@@ -12895,6 +12908,9 @@ async fn fsck(repo: Repo, args: FsckArgs) -> Result<()> {
     for error in &report.errors {
         eprintln!("{}", fsck_finding_line(error));
     }
+    for error in &report.dependency_errors {
+        eprintln!("{error}");
+    }
     for commit in &report.marked_partial {
         eprintln!("Marking commit as partial: {commit}");
     }
@@ -12921,7 +12937,10 @@ async fn fsck(repo: Repo, args: FsckArgs) -> Result<()> {
     }
 
     std::io::stdout().flush().ok();
-    if !report.errors.is_empty() || !report.image_errors.is_empty() {
+    if !report.errors.is_empty()
+        || !report.image_errors.is_empty()
+        || !report.dependency_errors.is_empty()
+    {
         eprintln!("error: Repository corruption encountered");
         exit_process(1);
     }

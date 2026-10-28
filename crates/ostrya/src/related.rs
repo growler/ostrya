@@ -29,6 +29,10 @@
 //!   each staged dependency.
 //! - [`Repo::apply_static_delta`] and [`Repo::apply_static_delta_offline`]
 //!   check the dependencies of the target commit before they write an object.
+//! - [`Repo::fsck`] reports each dependency of a checked commit that is
+//!   absent, partial, or defective, and marks the commit of an absent or a
+//!   partial dependency as partial. `BucketRepo::fsck` reports the same
+//!   dependencies and writes nothing for them.
 
 use std::collections::HashSet;
 use std::os::fd::AsFd;
@@ -49,10 +53,13 @@ pub(crate) const RELATED_KEY: &str = "ostrya.related";
 const RELATED_SIGNATURE: &str = "a(say)";
 
 /// The end of the reason of a dependency whose own field 2 is not empty.
-const NESTED_REASON: &str = "which has dependencies of its own";
+pub(crate) const NESTED_REASON: &str = "which has dependencies of its own";
 
 /// The end of the reason of a dependency that the repository marks partial.
-const PARTIAL_REASON: &str = "which is partial";
+pub(crate) const PARTIAL_REASON: &str = "which is partial";
+
+/// The end of the reason of a dependency that the repository does not hold.
+pub(crate) const ABSENT_REASON: &str = "which the repository does not hold";
 
 /// The type of a commit object. The parse of field 2 decodes member 2 alone.
 static COMMIT_TYPE: LazyLock<Type> =
@@ -182,6 +189,18 @@ pub(crate) fn entries_of(related: &[(String, Vec<u8>)]) -> Vec<RelatedEntry> {
         .map(|(name, bytes)| RelatedEntry {
             name: name.clone(),
             checksum: Checksum::from_ay(bytes).map_err(|_| bytes.len()),
+        })
+        .collect()
+}
+
+/// Returns the entries of field 2 of a parsed commit, in the stored order,
+/// as [`entries_of`] does, and takes the names of `related`.
+pub(crate) fn into_entries(related: Vec<(String, Vec<u8>)>) -> Vec<RelatedEntry> {
+    related
+        .into_iter()
+        .map(|(name, bytes)| RelatedEntry {
+            checksum: Checksum::from_ay(&bytes).map_err(|_| bytes.len()),
+            name,
         })
         .collect()
 }
@@ -666,7 +685,7 @@ pub(crate) fn nested_dependency(commit: Checksum, name: &str, dependency: &Check
     Error::InvalidRelated {
         commit: Some(commit),
         field: RelatedField::Dependencies,
-        reason: format!("dependency {name} names commit {dependency}, {NESTED_REASON}"),
+        reason: dependency_reason(name, dependency, NESTED_REASON),
     }
 }
 
@@ -677,8 +696,14 @@ pub(crate) fn partial_dependency(commit: Checksum, name: &str, dependency: &Chec
     Error::InvalidRelated {
         commit: Some(commit),
         field: RelatedField::Dependencies,
-        reason: format!("dependency {name} names commit {dependency}, {PARTIAL_REASON}"),
+        reason: dependency_reason(name, dependency, PARTIAL_REASON),
     }
+}
+
+/// Returns the reason for the dependency `name`, which names the commit
+/// `dependency`, with the end `end`.
+pub(crate) fn dependency_reason(name: &str, dependency: &Checksum, end: &str) -> String {
+    format!("dependency {name} names commit {dependency}, {end}")
 }
 
 /// Returns the dependencies `entries` of a new commit, sorted by name in byte
@@ -825,7 +850,7 @@ pub(crate) async fn check_dependencies<'a>(
             Err(Error::InvalidRelated {
                 commit,
                 field: RelatedField::Dependencies,
-                reason: format!("dependency {name} names commit {checksum}, {defect}"),
+                reason: dependency_reason(name, checksum, defect),
             })
         }
     }
@@ -907,6 +932,10 @@ mod tests {
         );
         assert_eq!(entries[2].defect(2).unwrap(), "entry 2 has an empty name");
         assert_eq!(entries_of(&Commit::parse(&bytes).unwrap().related), entries);
+        assert_eq!(
+            into_entries(Commit::parse(&bytes).unwrap().related),
+            entries
+        );
     }
 
     #[test]

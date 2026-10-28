@@ -74,6 +74,7 @@ The suffix gives the object type:
 A commit: the metadata, the parent, the related objects, the subject, the body, the time, and the root dirtree and dirmeta checksums.
 Ostrya uses the related objects for the dependencies of the commit, which \fB\%ostrya commit \-\-related\fR writes.
 \fB\%ostrya prune\fR and \fB\%ostrya remote prune\fR keep the dependencies of each commit that they keep.
+\fB\%ostrya fsck\fR and \fB\%ostrya remote fsck\fR report each dependency that is absent, partial, or defective.
 .TP
 \fB\%.dirtree\fR
 A directory listing: the names and checksums of the files and of the subdirectories.

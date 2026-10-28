@@ -6862,6 +6862,82 @@ fn pull_local_imports_a_dependency() {
     ostrya(&["fsck", "--repo", dest.to_str().unwrap()], None, &[]).ok();
 }
 
+/// `ostrya fsck` prints the finding of an absent dependency, marks the
+/// commit that names it as partial, and exits 1. A defective entry also exits
+/// 1, and marks no commit.
+#[test]
+fn fsck_reports_a_dependency_error() {
+    let tmp = TmpDir::new("fsck-dependency");
+    let base = tmp.path();
+    let repo = build_dest(base, "repo");
+    let repo_s = repo.to_str().unwrap().to_owned();
+    let dep = ex_ostrya_commit(&repo, base, "uki", None);
+    let related = format!("--related=boot/uki={dep}");
+    let tip = ostrya(
+        &[
+            "commit",
+            "--repo",
+            &repo_s,
+            "--canonical-permissions",
+            "-b",
+            BRANCH,
+            &related,
+            ex_ostrya_tree(base, "main").to_str().unwrap(),
+        ],
+        None,
+        &[("SOURCE_DATE_EPOCH", "1700000100")],
+    )
+    .ok()
+    .stdout_trimmed();
+    let dep_hex = dep.to_hex();
+    std::fs::remove_file(repo.join(format!(
+        "objects/{}/{}.commit",
+        &dep_hex[..2],
+        &dep_hex[2..]
+    )))
+    .unwrap();
+
+    let run = ostrya(&["fsck", "--repo", &repo_s], None, &[]);
+    assert_eq!(run.status.code(), Some(1));
+    let stderr = String::from_utf8(run.stderr).unwrap();
+    assert_eq!(
+        stderr,
+        format!(
+            "related commits in field 2 of commit {tip}: dependency boot/uki names commit \
+             {dep}, which the repository does not hold\nMarking commit as partial: {tip}\n\
+             error: Repository corruption encountered\n"
+        )
+    );
+    assert!(repo.join(format!("state/{tip}.commitpartial")).is_file());
+
+    let other = build_dest(base, "other");
+    let source = ex_ostrya_commit(&other, base, "plain", None);
+    let defective = block_on(async {
+        let repo = Repo::open(&other).await.unwrap();
+        let (mut commit, _) = repo.load_commit(&source).await.unwrap();
+        commit.related = vec![("lib/a".to_owned(), vec![7; 31])];
+        let bytes = commit.serialize().unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let written = txn
+            .write_metadata(ObjectType::Commit, None, &bytes)
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        written
+    });
+    let run = ostrya(&["fsck", "--repo", other.to_str().unwrap()], None, &[]);
+    assert_eq!(run.status.code(), Some(1));
+    let stderr = String::from_utf8(run.stderr).unwrap();
+    assert_eq!(
+        stderr,
+        format!(
+            "related commits in field 2 of commit {defective}: entry 0 (lib/a) has a checksum \
+             of 31 bytes, not 32\nerror: Repository corruption encountered\n"
+        )
+    );
+    assert!(!other.join("state").read_dir().unwrap().any(|_| true));
+}
+
 #[test]
 fn pull_timestamp_check_refuses_an_older_tip() {
     let tmp = TmpDir::new("pull-timestamp");

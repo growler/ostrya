@@ -14,7 +14,7 @@ use ostrya_core::{
 };
 
 use self::BucketFindingKind::{
-    Config, Corrupt, Lock, Marker, Mismatch, Missing, Ref, Stray, Upload,
+    Config, Corrupt, Dependency, Lock, Marker, Mismatch, Missing, Ref, Stray, Upload,
 };
 use super::listing::is_fanout_prefix;
 use super::lock::{LOCK_KEY, LockHolder, LockOperation, WriterLock};
@@ -23,11 +23,13 @@ use super::summary::SuperblockKey;
 use super::{BucketRepo, ObjectListing, each_slot, object_key, release_on_error};
 use crate::deltagen::delta_name;
 use crate::error::{Error, Result};
+use crate::fsck::{FsckDependencyError, FsckDependencyErrorKind, dependency_findings};
 use crate::object::MAX_METADATA_SIZE;
 use crate::pull::drive::Slots;
 use crate::pull::http::{
     BoundedInput, check_stream_end, compressed_bound, payload_refusal, read_archive_header,
 };
+use crate::related::{self, RelatedEntry};
 use crate::summary::{SUMMARY_READ_CAP, Summary};
 use crate::verify::TrustedKeys;
 use crate::write::{COPY_CHUNK, check_archive_payload};
@@ -157,16 +159,19 @@ pub struct BucketFinding {
     /// bucket does not hold. Each other `Summary` finding is a note. A
     /// `Missing` finding of a run without
     /// [`delete`](BucketFsckOptions::delete) is a note if the listing does
-    /// not hold the object and a read after the listing finds it. A `Marker`,
-    /// an `Upload`, and a `Lock` finding are notes. Each other finding is an
-    /// error.
+    /// not hold the object and a read after the listing finds it. A
+    /// `Dependency` finding of a run without `delete` is a note if the
+    /// listing does not hold the commit of the dependency and a read after
+    /// the listing finds it. A `Marker`, an `Upload`, and a `Lock` finding
+    /// are notes. Each other finding is an error.
     pub error: bool,
     /// The key of the finding, relative to the prefix of the repository:
     /// `config`, a ref key, `summary`, `summary.sig`, a stray key, the key of
     /// an object, the key of a partial-commit marker, the key of an upload,
     /// or the key of the writer lock.
     pub key: String,
-    /// The object of a `Missing`, a `Mismatch`, or a `Corrupt` finding.
+    /// The object of a `Missing`, a `Mismatch`, or a `Corrupt` finding, and
+    /// the commit whose field 2 holds the entry of a `Dependency` finding.
     pub object: Option<ObjectName>,
     /// The commits of the listing that reach the object of a `Missing`, a
     /// `Mismatch`, or a `Corrupt` finding, sorted.
@@ -176,6 +181,15 @@ pub struct BucketFinding {
     pub commits: Vec<Checksum>,
     /// The reason, in words.
     pub detail: String,
+    /// The dependency of a `Dependency` finding, and `None` for each other
+    /// kind.
+    ///
+    /// Its fields are the fields of the finding of the local fsck. A
+    /// dependency is [`Partial`](FsckDependencyErrorKind::Partial) if the
+    /// bucket holds its marker `state/<checksum>.commitpartial`. A run with
+    /// [`delete`](BucketFsckOptions::delete) reads the markers and the
+    /// commit objects after its repair.
+    pub dependency: Option<FsckDependencyError>,
 }
 
 impl std::fmt::Display for BucketFinding {
@@ -224,6 +238,11 @@ pub enum BucketFindingKind {
     /// its declared size, or a composefs image whose commit records no
     /// digest that the run can read.
     Corrupt,
+    /// A dependency in field 2 of a commit that is absent, partial, or
+    /// defective. [`BucketFinding::dependency`] holds it. A run with
+    /// [`delete`](BucketFsckOptions::delete) writes and deletes no key for
+    /// it.
+    Dependency,
     /// A partial-commit marker of a commit whose tree the run finds whole. A
     /// run with [`delete`](BucketFsckOptions::delete) deletes such a marker.
     Marker,
@@ -235,7 +254,8 @@ pub enum BucketFindingKind {
 
 impl BucketFindingKind {
     /// Returns the name of the kind: `config`, `ref`, `summary`, `stray`,
-    /// `missing`, `mismatch`, `corrupt`, `marker`, `upload`, or `lock`.
+    /// `missing`, `mismatch`, `corrupt`, `dependency`, `marker`, `upload`,
+    /// or `lock`.
     pub fn as_str(self) -> &'static str {
         match self {
             BucketFindingKind::Config => "config",
@@ -245,6 +265,7 @@ impl BucketFindingKind {
             BucketFindingKind::Missing => "missing",
             BucketFindingKind::Mismatch => "mismatch",
             BucketFindingKind::Corrupt => "corrupt",
+            BucketFindingKind::Dependency => "dependency",
             BucketFindingKind::Marker => "marker",
             BucketFindingKind::Upload => "upload",
             BucketFindingKind::Lock => "lock",
@@ -280,6 +301,7 @@ impl Run {
             object: None,
             commits: Vec::new(),
             detail,
+            dependency: None,
         });
     }
 
@@ -292,6 +314,7 @@ impl Run {
             object: Some(name),
             commits: Vec::new(),
             detail,
+            dependency: None,
         });
     }
 
@@ -332,6 +355,62 @@ impl Run {
         }
     }
 
+    /// Records a `Dependency` error for each entry of field 2 of the commits
+    /// of `dependencies` that is absent, partial, or defective.
+    ///
+    /// `dependencies` holds each commit that parses and whose field 2 is not
+    /// empty, sorted by commit. A dependency in that list has dependencies
+    /// of its own. `partial` holds the commits with a partial-commit marker.
+    /// `deleted` holds the commit objects that the repair deletes, sorted:
+    /// such a dependency is absent, and such a commit gets no check.
+    fn dependencies(
+        &mut self,
+        listing: &ObjectListing,
+        partial: &BTreeSet<Checksum>,
+        deleted: &[ObjectName],
+        dependencies: &[(Checksum, Vec<RelatedEntry>)],
+    ) {
+        let nested = |commit: &Checksum| {
+            dependencies
+                .binary_search_by_key(commit, |(naming, _)| *naming)
+                .is_ok()
+        };
+        let deleted = |commit: &Checksum| {
+            deleted
+                .binary_search_by_key(commit, |name| name.checksum)
+                .is_ok()
+        };
+        for (commit, entries) in dependencies {
+            if deleted(commit) {
+                continue;
+            }
+            let name = ObjectName::new(*commit, ObjectType::Commit);
+            let found = dependency_findings(
+                *commit,
+                entries,
+                |dependency| {
+                    !listing
+                        .objects
+                        .contains_key(&ObjectName::new(*dependency, ObjectType::Commit))
+                        || deleted(dependency)
+                },
+                |dependency| partial.contains(dependency),
+                nested,
+            );
+            for error in found {
+                self.findings.push(BucketFinding {
+                    kind: Dependency,
+                    error: true,
+                    key: object_key(&name),
+                    object: Some(name),
+                    commits: Vec::new(),
+                    detail: error.reason(),
+                    dependency: Some(error),
+                });
+            }
+        }
+    }
+
     /// Returns the report, with the findings sorted.
     fn finish(self) -> BucketFsckReport {
         let Run {
@@ -352,6 +431,18 @@ struct Root {
     commit: Checksum,
     dirtree: Checksum,
     dirmeta: Checksum,
+}
+
+/// The commits that the run read.
+struct Commits {
+    /// The root of each commit that parses, sorted by commit.
+    roots: Vec<Root>,
+    /// The digest that each commit with a composefs image in the listing
+    /// records, or the reason that the digest does not read.
+    digests: HashMap<Checksum, std::result::Result<Option<[u8; 32]>, String>>,
+    /// Each commit that parses and whose field 2 is not empty, with the
+    /// entries of its field 2, sorted by commit.
+    dependencies: Vec<(Checksum, Vec<RelatedEntry>)>,
 }
 
 /// The result of the read of one metadata object.
@@ -459,15 +550,25 @@ impl BucketRepo {
     ///    [`summary_keys`](BucketFsckOptions::summary_keys).
     /// 5. The commits, then the dirtrees and the dirmetas, then the
     ///    `.filez` objects, then the composefs images. A phase starts after
-    ///    the phase before it ends.
+    ///    the phase before it ends. Without `delete`, after the commits, the
+    ///    run checks the dependencies in field 2 of each commit that parses,
+    ///    the commits with a partial-commit marker included, against the
+    ///    listing and the markers. This check reads no object.
     /// 6. The count of the objects that no commit reaches.
     /// 7. Without `delete`, a read again of each object that the listing
     ///    does not hold and that a `Missing` finding names, because a writer
     ///    can change the bucket during the run. If the key holds an object,
     ///    the finding is a note. Else the run reads each commit of the
     ///    finding again, and drops the commits that are gone. If no commit
-    ///    stays, the run records no finding.
-    /// 8. With `delete`: a check of the lock, a marker
+    ///    stays, the run records no finding. The same read covers each
+    ///    absent dependency of a `Dependency` finding, one time for each
+    ///    commit. If the key holds an object, the finding is a note.
+    /// 8. With `delete`: the check of the dependencies of step 5, against
+    ///    the state after the repair. A dependency is partial if it holds a
+    ///    marker that the repair does not delete, or gets a marker from the
+    ///    repair. A dependency whose commit object the repair deletes is
+    ///    absent, and a commit whose own object the repair deletes gets no
+    ///    check. Then a check of the lock, a marker
     ///    `state/<checksum>.commitpartial` for each commit that reaches a
     ///    tree object of a `Missing`, a `Mismatch`, or a `Corrupt` finding,
     ///    the delete of the marker of each commit whose tree the run finds
@@ -476,7 +577,8 @@ impl BucketRepo {
     ///    tree objects, then the composefs images. A commit that holds a
     ///    marker gets no new one, and a commit whose own object the run
     ///    deletes gets none. The run deletes no commit because of a bad tree
-    ///    object. Then the release of the lock. Without `delete`, a marker of
+    ///    object, and writes and deletes no key for a `Dependency` finding.
+    ///    Then the release of the lock. Without `delete`, a marker of
     ///    a commit whose tree the run finds whole gives a `Marker` note, and
     ///    the run reads the lock again: a new lock gives a `Lock` note.
     ///
@@ -656,7 +758,16 @@ impl BucketRepo {
         }
         self.fsck_summary(run, opts.summary_keys.as_ref(), &refs, &listing)
             .await?;
-        let (roots, digests) = self.fsck_commits(run, &listing).await?;
+        let Commits {
+            roots,
+            digests,
+            mut dependencies,
+        } = self.fsck_commits(run, &listing).await?;
+        // With the lock, the check waits for the plan of the repair.
+        if lock.is_none() {
+            run.dependencies(&listing, &partial, &[], &dependencies);
+            dependencies = Vec::new();
+        }
         let (seen, files) = self.fsck_trees(run, &listing, &roots).await?;
         self.fsck_contents(run, &listing, &files).await?;
         self.fsck_images(run, &listing, &digests, lock.is_some())
@@ -674,7 +785,20 @@ impl BucketRepo {
         }
         let whole = whole_marked(&run.findings, &roots, &partial);
         match lock {
-            Some(lock) => self.fsck_repair(run, &refs, &partial, &whole, lock).await,
+            Some(lock) => {
+                // The dependencies, against the markers and the commit
+                // objects after the repair.
+                let plan = delete_plan(&run.findings, &partial);
+                let mut marked: BTreeSet<Checksum> = partial
+                    .iter()
+                    .filter(|commit| whole.binary_search(commit).is_err())
+                    .copied()
+                    .collect();
+                marked.extend(plan.markers.iter().copied());
+                run.dependencies(&listing, &marked, &plan.commits, &dependencies);
+                drop(dependencies);
+                self.fsck_repair(run, &refs, &plan, &whole, lock).await
+            }
             None => {
                 for commit in whole {
                     run.add(
@@ -1080,19 +1204,11 @@ impl BucketRepo {
 
     /// Reads and checks each commit object of the listing.
     ///
-    /// Returns the root of each commit that parses, also of a commit whose
-    /// bytes do not match its name, and the digest that each commit with a
-    /// composefs image in the listing records, or the reason that the digest
-    /// does not read.
-    #[allow(clippy::type_complexity)]
-    async fn fsck_commits(
-        &self,
-        run: &mut Run,
-        listing: &ObjectListing,
-    ) -> Result<(
-        Vec<Root>,
-        HashMap<Checksum, std::result::Result<Option<[u8; 32]>, String>>,
-    )> {
+    /// Returns the root and the field 2 of each commit that parses, also of
+    /// a commit whose bytes do not match its name, and the digest that each
+    /// commit with a composefs image in the listing records, or the reason
+    /// that the digest does not read.
+    async fn fsck_commits(&self, run: &mut Run, listing: &ObjectListing) -> Result<Commits> {
         let mut commits: Vec<(ObjectName, u64)> = listing
             .objects
             .iter()
@@ -1102,6 +1218,7 @@ impl BucketRepo {
         commits.sort_by_key(|(name, _)| name.checksum);
         let mut roots = Vec::new();
         let mut digests = HashMap::new();
+        let mut dependencies = Vec::new();
         let mut reads = Slots::new(self.max_outstanding);
         let mut pending = commits.into_iter();
         loop {
@@ -1142,12 +1259,16 @@ impl BucketRepo {
             run.report.bytes_read += len;
             run.check_metadata(name, actual, &parsed);
             match parsed {
-                Ok(commit) => {
+                Ok(mut commit) => {
                     roots.push(Root {
                         commit: name.checksum,
                         dirtree: commit.root_dirtree,
                         dirmeta: commit.root_dirmeta,
                     });
+                    if !commit.related.is_empty() {
+                        let related = std::mem::take(&mut commit.related);
+                        dependencies.push((name.checksum, related::into_entries(related)));
+                    }
                     if has_image {
                         digests.insert(
                             name.checksum,
@@ -1165,7 +1286,12 @@ impl BucketRepo {
             }
         }
         roots.sort_by_key(|root| root.commit);
-        Ok((roots, digests))
+        dependencies.sort_by_key(|(commit, _)| *commit);
+        Ok(Commits {
+            roots,
+            digests,
+            dependencies,
+        })
     }
 
     /// Reads the metadata object `name` whole, by the strict rule of an
@@ -1674,8 +1800,9 @@ impl BucketRepo {
     }
 
     /// Reads again each object that a `Missing` finding names and that the
-    /// listing does not hold, and then the commits of each such object that
-    /// is still absent.
+    /// listing does not hold, and each commit of an absent dependency of a
+    /// `Dependency` finding, and then the commits of each object of a
+    /// `Missing` finding that is still absent.
     ///
     /// A run with no lock does not stop a writer, and the listing of the 256
     /// fan-out prefixes is no snapshot. An object that a read finds now
@@ -1683,10 +1810,19 @@ impl BucketRepo {
     /// dropped. Each read asks for the first byte of the object alone, so
     /// its connection serves the next read.
     async fn fsck_recheck(&self, run: &mut Run) -> Result<()> {
-        if run.unlisted.is_empty() {
+        let absent: HashSet<ObjectName> = run
+            .findings
+            .iter()
+            .filter_map(|finding| finding.dependency.as_ref())
+            .filter(|error| error.kind == FsckDependencyErrorKind::Absent)
+            .filter_map(|error| error.dependency)
+            .map(|commit| ObjectName::new(commit, ObjectType::Commit))
+            .collect();
+        if run.unlisted.is_empty() && absent.is_empty() {
             return Ok(());
         }
         let mut names: Vec<ObjectName> = run.unlisted.iter().copied().collect();
+        names.extend(absent.iter().filter(|name| !run.unlisted.contains(name)));
         names.sort_by_cached_key(object_key);
         let present = self.held_objects(names).await?;
         let mut commits: BTreeSet<Checksum> = BTreeSet::new();
@@ -1709,6 +1845,20 @@ impl BucketRepo {
             .await?;
         let unlisted = &run.unlisted;
         run.findings.retain_mut(|finding| {
+            if let Some(error) = &finding.dependency
+                && error.kind == FsckDependencyErrorKind::Absent
+                && let Some(dependency) = error.dependency
+                && present.contains(&ObjectName::new(dependency, ObjectType::Commit))
+            {
+                finding.error = false;
+                finding.detail = related::dependency_reason(
+                    &error.name,
+                    &dependency,
+                    "which the listing does not hold, and a read after the listing finds it: a \
+                     writer changed the bucket during the run",
+                );
+                return true;
+            }
             let Some(name) = finding.object else {
                 return true;
             };
@@ -1760,18 +1910,18 @@ impl BucketRepo {
     }
 
     /// Writes and deletes the partial-commit markers, and deletes the bad
-    /// objects, under `lock`. `whole` holds the commits whose marker the run
+    /// objects, under `lock`. `plan` holds the markers to write and the
+    /// objects to delete, and `whole` holds the commits whose marker the run
     /// deletes.
     async fn fsck_repair(
         &self,
         run: &mut Run,
         refs: &BucketRefs,
-        partial: &BTreeSet<Checksum>,
+        plan: &DeletePlan,
         whole: &[Checksum],
         lock: &WriterLock<'_>,
     ) -> Result<()> {
-        let plan = delete_plan(&run.findings, partial);
-        if plan == DeletePlan::default() && whole.is_empty() {
+        if *plan == DeletePlan::default() && whole.is_empty() {
             return Ok(());
         }
         let mut named: HashMap<Checksum, Vec<String>> = HashMap::new();
@@ -2048,6 +2198,7 @@ fn image_finding(kind: BucketFindingKind, name: ObjectName, detail: String) -> B
         object: Some(name),
         commits: Vec::new(),
         detail,
+        dependency: None,
     }
 }
 
@@ -2166,6 +2317,7 @@ mod tests {
             object: Some(name),
             commits: commits.iter().map(|byte| csum(*byte)).collect(),
             detail: String::new(),
+            dependency: None,
         }
     }
 
@@ -2186,6 +2338,7 @@ mod tests {
                 object: None,
                 commits: Vec::new(),
                 detail: String::new(),
+                dependency: None,
             },
         ];
         let partial: BTreeSet<Checksum> = [csum(7)].into();
@@ -2260,6 +2413,7 @@ mod tests {
             object: None,
             commits: Vec::new(),
             detail: "an incomplete multipart upload".into(),
+            dependency: None,
         };
         assert_eq!(
             note.to_string(),
@@ -2277,6 +2431,7 @@ mod tests {
             (Missing, "missing"),
             (Mismatch, "mismatch"),
             (Corrupt, "corrupt"),
+            (Dependency, "dependency"),
             (Marker, "marker"),
             (Upload, "upload"),
             (Lock, "lock"),

@@ -2183,6 +2183,28 @@ the rules.
   dependencies of the push was rejected. The dependencies are in the signed
   commits, so a list in the message adds a second source that can disagree
   with them.
+- The fsck (`Repo::fsck` and `ostrya fsck`) reports each dependency of a
+  commit that it checks that is absent, partial, or defective, in
+  `FsckReport::dependency_errors`. A nested dependency is defective. The run
+  reads field 2 from the read of its object walk, and classifies each entry
+  against the state after its own findings: a dependency that the run
+  deletes is absent, and a dependency whose tree the run finds incomplete is
+  partial. Under `mark_partial`, the run marks the commit of an absent or a
+  partial dependency as partial, so a later pull fetches the commit again
+  with its dependencies. A pull cannot repair a defective entry, so it gets
+  no marker. The marks of this check do not change the other findings of
+  the run. The bucket fsck gives the same findings as `dependency` findings,
+  reads a dependency as partial if the bucket holds its partial-commit
+  marker, and writes no key for them in a repair. A run with the repair
+  classifies each entry against the markers and the commit objects after
+  the repair, as the local run does, so its findings describe the bucket
+  that the run leaves. A run with no lock reads
+  each absent dependency again, as it reads a missing object again. The
+  tool reports no finding for field 2 and exits 0, so the exit status of
+  `ostrya fsck` over such a repository is a divergence. To pass a commit
+  whose dependency is absent was rejected: the commit is not complete, and
+  each other operation of the port refuses it. To mark the commit of a
+  defective entry was rejected: a pull of the commit gives the same entry.
 - No transfer follows a build source. A pull, a push, and the one-way stream
   move `ostrya.related` as any other detached metadata key, under the switch
   of the destination, and fetch no commit that it names. A build cache needs the refs of its sources, and not

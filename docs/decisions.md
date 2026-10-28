@@ -2136,7 +2136,14 @@ the rules.
   dependencies of the whole local history with no depth was rejected: the
   push reads the commit objects of dependencies that it does not send, and
   a dependency of old history that the server holds, which the local
-  repository no longer holds, refuses the push.
+  repository no longer holds, refuses the push. The one-way export
+  (`Repo::export_stream`) sends the dependencies of each new commit by the
+  same rules. It does no negotiation, so it sends a dependency that the
+  receiver holds, and it finds each refusal before it writes the first byte.
+  A receiver that holds a dependency with a partial-commit marker refuses
+  the stream, also though the stream carries the whole tree of the
+  dependency. The sender completes such a dependency with an update that
+  takes it as a new commit.
 - The receiver of a push session and of a one-way stream checks the
   dependencies of each commit that it stages, the staged parents of a new
   commit included. It also checks a new commit that it holds with a
@@ -2150,7 +2157,16 @@ the rules.
   counts too. The server signs it one time with each distinct key of these
   rules. A
   dependency that the server already holds gets no check and no signature:
-  the server accepted it when it stored it. A `Commit` message that lists the
+  the server accepted it when it stored it. For the same reason, the server
+  drops a detached metadata dict for a commit that it holds, that the
+  session did not stage, and that no update names, if field 2 of a commit of
+  the session names that commit. The server writes and merges nothing from
+  the dict. The one-way export sends such a dict, because it does no
+  negotiation. A refusal of the dict was rejected: it refuses each second
+  export of a dependency with a `.commitmeta` to one receiver. A merge of
+  the dict was rejected: no rule of the session covers a held dependency. A
+  dict for each other commit that the session did not stage and that no
+  update names stays `protocol`. A `Commit` message that lists the
   dependencies of the push was rejected. The dependencies are in the signed
   commits, so a list in the message adds a second source that can disagree
   with them.

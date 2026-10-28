@@ -2172,6 +2172,74 @@ fn a_partial_held_dependency_is_missing_objects() {
     assert_unchanged(&repo, &before);
 }
 
+/// The repository holds a dependency with a signed dict. A session sends
+/// the commit object of the dependency again, a new commit whose field 2
+/// names it, and a dict for it with another signature. The server drops that
+/// dict, so the stored dict keeps its bytes. A dict for a held commit that no
+/// field 2 of a commit of the session names stays `protocol`.
+#[test]
+fn a_dict_for_a_held_dependency_is_dropped() {
+    let dep = build_commit(None, "dependency", no_metadata(), &[]);
+    let lone = build_commit(None, "lone", no_metadata(), &[]);
+    let target = build_commit(None, "target", no_metadata(), &[entry("lib/d", &dep)]);
+    let second = build_commit(None, "second", no_metadata(), &[entry("lib/d", &dep)]);
+    let tmp = TmpDir::new("recv-dep-held-dict");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    committed(push(
+        &repo,
+        &policy(),
+        &with_tree(&[&dep, &lone]),
+        &[client_signed(&dep)],
+        vec![
+            update("dep", Expected::Absent, Some(dep.checksum)),
+            update("lone", Expected::Absent, Some(lone.checksum)),
+        ],
+        false,
+    ));
+    let held = std::fs::read(commit_meta_path(&repo, &dep.checksum)).unwrap();
+
+    let other = (dep.checksum, signed_dict(&dep.bytes, &[OTHER_SECRET_B64]));
+    committed(push(
+        &repo,
+        &policy(),
+        &[dep.clone(), target.clone()],
+        std::slice::from_ref(&other),
+        vec![update("main", Expected::Absent, Some(target.checksum))],
+        false,
+    ));
+    assert_eq!(
+        std::fs::read(commit_meta_path(&repo, &dep.checksum)).unwrap(),
+        held
+    );
+    assert_eq!(
+        ed25519_signatures(&repo, &dep.checksum),
+        [ed25519_signature(SECRET_B64, &dep.bytes)]
+    );
+    assert_eq!(
+        ref_file(&repo, "refs/heads/main"),
+        Some(format!("{}\n", target.checksum))
+    );
+
+    let before = snapshot(&repo);
+    let error = refused(
+        push(
+            &repo,
+            &policy(),
+            std::slice::from_ref(&second),
+            &[other, client_signed(&lone)],
+            vec![update("second", Expected::Absent, Some(second.checksum))],
+            false,
+        ),
+        ErrorCode::Protocol,
+    );
+    assert!(
+        error.message.contains(&lone.checksum.to_string()),
+        "{}",
+        error.message
+    );
+    assert_unchanged(&repo, &before);
+}
+
 /// A staged dependency that two new commits name gets each server key of
 /// their rules once, also a key that the list holds two times. A second
 /// session with a new commit that names the dependency, which the repository

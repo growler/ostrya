@@ -185,8 +185,9 @@ struct Edit<'a> {
 ///   the longest outcome of each update (`limit-exceeded`). Because of this
 ///   check, the server can always send the reply of a commit that wrote its
 ///   refs.
-/// - Each detached metadata dict belongs to a commit of the session: a staged
-///   commit, or the new commit of an update (`protocol`).
+/// - Each detached metadata dict belongs to a commit of the session, a staged
+///   commit or the new commit of an update, or to a commit that the
+///   repository holds (`protocol`).
 /// - No update names the collection anchor ref of the local refs of a
 ///   repository with a collection id, and `policy` gives a rule for each
 ///   update (`ref-denied`).
@@ -195,6 +196,11 @@ struct Edit<'a> {
 ///   ref.
 /// - Each new commit is staged or present (`missing-objects`), and each
 ///   commit of the session parses.
+/// - A dict for a commit that the repository holds, that the session did not
+///   stage, and that no update names, belongs to a dependency: an entry of
+///   field 2 of a commit of the session names the commit (`protocol`). The
+///   session drops each such dict, with no merge and no write, because a held
+///   dependency gets no signature.
 /// - Each composefs image belongs to a commit that the session staged or
 ///   that the repository holds. That commit carries a valid
 ///   `ostree.composefs.digest.v0` (`protocol`), and the digest of each image
@@ -326,7 +332,7 @@ pub(super) async fn finish(
     hooks: Option<&dyn ReceiveHooks>,
     txn: Transaction,
     named: Named<'_>,
-    commit_meta: HashMap<Checksum, Vec<u8>>,
+    mut commit_meta: HashMap<Checksum, Vec<u8>>,
     images: HashMap<Checksum, Option<[u8; 32]>>,
     request: CommitRequest,
 ) -> Checked<ReceiveReport> {
@@ -348,16 +354,26 @@ pub(super) async fn finish(
     let CommitRequest { updates, force, .. } = request;
     let paths: Arc<[String]> = check_names(&named, &updates)?.into();
     check_reply_fits(&updates)?;
-    check_commit_meta_commits(&txn, &updates, &commit_meta)?;
-    let rules = select_rules(repo, policy, named.is_local(), &updates)?;
-    let Loaded {
-        mut targets,
-        session_commits,
-        roots,
-        parents,
-        staged,
-        fields,
-    } = load_commits(&txn, &updates).await?;
+    // The box keeps the futures of the dict check and of the commit reads out
+    // of the future of the session.
+    let (
+        rules,
+        Loaded {
+            mut targets,
+            session_commits,
+            roots,
+            parents,
+            staged,
+            fields,
+        },
+    ) = Box::pin(async {
+        check_commit_meta_commits(&txn, &updates, &commit_meta).await?;
+        let rules = select_rules(repo, policy, named.is_local(), &updates)?;
+        let loaded = load_commits(&txn, &updates).await?;
+        drop_dependency_meta(&txn, &updates, &loaded.fields, &mut commit_meta)?;
+        Ok::<_, Failure>((rules, loaded))
+    })
+    .await?;
     check_images(&txn, images).await?;
     let missing = walk::completeness(&txn, roots).await?;
     if missing.total > 0 {
@@ -669,25 +685,98 @@ fn check_reply_fits(updates: &[RefUpdate]) -> Checked<()> {
     Ok(())
 }
 
+/// Returns the commits of the dicts of `commit_meta` that the session did
+/// not stage and that no update names, in the order of their checksums.
+fn outside_commits(
+    txn: &Transaction,
+    updates: &[RefUpdate],
+    commit_meta: &HashMap<Checksum, Vec<u8>>,
+) -> Vec<Checksum> {
+    let new: HashSet<&Checksum> = updates.iter().filter_map(|u| u.new.as_ref()).collect();
+    let mut outside: Vec<Checksum> = commit_meta
+        .keys()
+        .filter(|commit| !(new.contains(commit) || txn.is_staged(commit, ObjectType::Commit)))
+        .copied()
+        .collect();
+    outside.sort_unstable();
+    outside
+}
+
 /// Checks that each detached metadata dict of the session belongs to a commit
-/// of the session.
+/// of the session or to a commit that the repository holds.
 ///
 /// A commit of the session is a commit that the session staged, or the new
-/// commit of an update. Without this check, a dict for any other commit can
-/// edit the detached metadata of a commit that no rule of the message covers.
-fn check_commit_meta_commits(
+/// commit of an update. A dict for a held commit outside the session goes to
+/// [`drop_dependency_meta`]. A dict for a commit that is neither is
+/// `protocol`. The reads of the held commits run in one trip to the blocking
+/// pool, and only if the session has a dict outside the session.
+async fn check_commit_meta_commits(
     txn: &Transaction,
     updates: &[RefUpdate],
     commit_meta: &HashMap<Checksum, Vec<u8>>,
 ) -> Checked<()> {
-    let new: HashSet<&Checksum> = updates.iter().filter_map(|u| u.new.as_ref()).collect();
-    for commit in commit_meta.keys() {
-        if !(new.contains(commit) || txn.is_staged(commit, ObjectType::Commit)) {
+    let outside = outside_commits(txn, updates, commit_meta);
+    if outside.is_empty() {
+        return Ok(());
+    }
+    let repo = txn.repo().clone();
+    let held: Vec<(Checksum, bool)> = ostrya_rt::unblock(move || {
+        outside
+            .into_iter()
+            .map(|commit| {
+                repo.has_object_blocking(ObjectType::Commit, &commit)
+                    .map(|held| (commit, held))
+            })
+            .collect::<Result<_>>()
+    })
+    .await
+    .map_err(Failure::Internal)?;
+    if let Some((commit, _)) = held.iter().find(|(_, held)| !held) {
+        return Err(protocol(format!(
+            "detached metadata for commit {commit}, which the session did not stage, no ref \
+             update names, and the repository does not hold"
+        )));
+    }
+    Ok(())
+}
+
+/// Drops the dict of each commit that the session did not stage and that no
+/// update names, if an entry of field 2 of a commit of the session names that
+/// commit.
+///
+/// [`check_commit_meta_commits`] found that the repository holds each such
+/// commit. A named commit is a dependency that the repository holds, and a
+/// held dependency gets no merge and no signature. `fields` holds field 2 of
+/// each commit of the session, as [`load_commits`] reads it. An entry with an
+/// empty name or a checksum that is not 32 bytes names no commit.
+///
+/// A dict for such a commit that no entry names is `protocol`. Without this
+/// check, a dict can edit the detached metadata of a commit that no rule of
+/// the message covers.
+fn drop_dependency_meta(
+    txn: &Transaction,
+    updates: &[RefUpdate],
+    fields: &HashMap<Checksum, Vec<(String, Vec<u8>)>>,
+    commit_meta: &mut HashMap<Checksum, Vec<u8>>,
+) -> Checked<()> {
+    let outside = outside_commits(txn, updates, commit_meta);
+    if outside.is_empty() {
+        return Ok(());
+    }
+    let named: HashSet<&[u8]> = fields
+        .values()
+        .flatten()
+        .filter(|(name, _)| !name.is_empty())
+        .map(|(_, bytes)| bytes.as_slice())
+        .collect();
+    for commit in outside {
+        if !named.contains(&commit.as_bytes()[..]) {
             return Err(protocol(format!(
-                "detached metadata for commit {commit}, which the session did not stage \
-                 and no ref update names"
+                "detached metadata for commit {commit}, which the session did not stage, no ref \
+                 update names, and no commit of the session names as a dependency"
             )));
         }
+        commit_meta.remove(&commit);
     }
     Ok(())
 }

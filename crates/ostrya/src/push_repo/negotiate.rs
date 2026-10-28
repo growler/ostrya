@@ -138,7 +138,7 @@ pub(super) enum Local {
     Absent,
 }
 
-/// Returns the parts of a parsed commit that the push reads.
+/// Returns the parts of a parsed commit that the push and the export read.
 pub(super) fn link_of(commit: &Commit) -> CommitLink {
     CommitLink {
         parent: commit.parent,
@@ -147,27 +147,27 @@ pub(super) fn link_of(commit: &Commit) -> CommitLink {
     }
 }
 
-/// The commits that the walk of a push read, and the dependencies that the
-/// push resolved.
+/// The commits that the walk of a push or the load of an export read, and
+/// the dependencies that the push or the export resolved.
 #[derive(Default)]
 pub(super) struct Commits {
-    /// The local state of each commit that the walk read, and of each
-    /// dependency that the push read.
+    /// The local state of each commit that the walk or the load read, and of
+    /// each dependency that the call read.
     pub(super) local: HashMap<Checksum, Local>,
     /// The entries of field 2 of each commit that `local` holds as
     /// [`Local::Held`], as names and checksums in the stored order, or the
-    /// [`Error::InvalidRelated`] of the first defective entry. The push takes
-    /// the result at its own point, so it sets the order of the errors. A
-    /// held commit with no entry here has an empty field 2.
+    /// [`Error::InvalidRelated`] of the first defective entry. The caller
+    /// takes the result at its own point, so it sets the order of the errors.
+    /// A held commit with no entry here has an empty field 2.
     fields: HashMap<Checksum, Result<Vec<(String, Checksum)>>>,
-    /// The dependencies that the push resolved.
+    /// The dependencies that the call resolved.
     known: HashSet<Checksum>,
 }
 
 impl Commits {
     /// Records the field 2 `field` of the held commit `commit`. An empty
     /// field 2 gets no entry in `fields`.
-    fn record(&mut self, commit: Checksum, field: Result<Vec<(String, Checksum)>>) {
+    pub(super) fn record(&mut self, commit: Checksum, field: Result<Vec<(String, Checksum)>>) {
         if !field.as_ref().is_ok_and(Vec::is_empty) {
             self.fields.insert(commit, field);
         }
@@ -176,10 +176,13 @@ impl Commits {
     /// Refuses a defective field 2 entry of each commit of `commits`, in
     /// order. A commit that the repository does not hold, or marks partial,
     /// has no field to check.
-    fn check_fields<'a>(&mut self, commits: impl IntoIterator<Item = &'a Checksum>) -> Result<()> {
+    pub(super) fn check_fields<'a>(
+        &mut self,
+        commits: impl IntoIterator<Item = &'a Checksum>,
+    ) -> Result<()> {
         for commit in commits {
             if self.fields.get(commit).is_some_and(Result::is_err) {
-                // The push stops at this error, so the result moves out.
+                // The caller stops at this error, so the result moves out.
                 return self
                     .fields
                     .remove(commit)
@@ -192,8 +195,9 @@ impl Commits {
 
     /// Returns the dependencies of the commit `commit`, in the stored order.
     ///
-    /// The push calls it for a commit whose dependencies it resolved. A
-    /// commit with no entry in `fields` has an empty field 2 and gives none.
+    /// The push and the export call it for a commit whose dependencies they
+    /// resolved. A commit with no entry in `fields` has an empty field 2 and
+    /// gives none.
     pub(super) fn dependencies_of(
         &self,
         commit: &Checksum,
@@ -206,7 +210,7 @@ impl Commits {
     }
 
     /// Resolves the dependencies of each commit of `commits`, in order, and
-    /// refuses a dependency that the push cannot send.
+    /// refuses a dependency that the push or the export cannot send.
     ///
     /// The repository holds each commit of `commits`, and its field 2 passed
     /// the format check. The call records each dependency with the commit and
@@ -228,7 +232,9 @@ impl Commits {
     ///   partial, or if the field 2 of the dependency is not empty. The error
     ///   names the commit that first named the dependency.
     /// - [`Error::Io`] or [`Error::Core`] if the read of the dependency
-    ///   fails, or if its commit object does not parse.
+    ///   fails, or if the tuple frame, the parent or root checksums, or field
+    ///   2 of its commit object does not decode. The call decodes no other
+    ///   part of the commit object.
     pub(super) async fn check_dependencies<'a>(
         &mut self,
         repo: &Repo,
@@ -608,8 +614,11 @@ impl Repo {
     /// - [`Error::InvalidFormat`] if `[core] lock-timeout-secs` is less than
     ///   `-1`.
     /// - [`Error::Core`] if `[core] locking` is not a boolean or
-    ///   `[core] lock-timeout-secs` is not an integer, or if a commit or a
-    ///   dirtree object does not parse.
+    ///   `[core] lock-timeout-secs` is not an integer, or if a source commit
+    ///   or a dirtree object does not parse. For the commit object of a
+    ///   parent or of a dependency, the push decodes the tuple frame, the
+    ///   parent and root checksums, and field 2 alone, and gives this error
+    ///   if one of them does not decode.
     /// - [`Error::Io`] if a read from the file system fails, or if a metadata
     ///   object is larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
     /// - [`Error::Remote`] with

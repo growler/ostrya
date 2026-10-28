@@ -6,13 +6,13 @@ use futures_io::AsyncWrite;
 use ostrya_core::{Checksum, Commit, ObjectName, ObjectType};
 
 use super::invalid;
-use super::negotiate::check_ref_binding;
+use super::negotiate::{Commits, Local, check_ref_binding, link_of};
 use super::source::RepoSource;
 use crate::error::Result;
 use crate::lock::LockKind;
 use crate::read::CommitState;
 use crate::refs::validate_refspec;
-use crate::related::RelatedRule;
+use crate::related::{self, RelatedRule};
 use crate::remote::{Compression, Expected, PushStats, RefUpdate, SessionOptions};
 use crate::repo::Repo;
 
@@ -26,7 +26,8 @@ pub struct ExportStreamOptions {
     ///
     /// Each update expects [`Absent`](Expected::Absent) or
     /// [`Any`](Expected::Any) and sets a new commit. A name is `NAME` or
-    /// `REMOTE:NAME`. The new commits are the commits of the stream.
+    /// `REMOTE:NAME`. The new commits are the commits of the stream. The
+    /// stream also carries the dependencies of the new commits, with no ref.
     pub updates: Vec<RefUpdate>,
     /// The encoding of the content objects.
     pub compression: Compression,
@@ -46,12 +47,13 @@ impl Repo {
     ///
     /// # Stream content
     ///
-    /// The stream carries each new commit once. With each commit, it carries
-    /// each object that the tree of the commit reaches. It also carries the
-    /// stored `.commitmeta` bytes of the commit with no parse, so the receiver
-    /// refuses a `.commitmeta` that is not an `a{sv}` dict. If the repository
-    /// holds the composefs image of a new commit, the stream carries the image
-    /// after the trees. The stream carries no parent commit.
+    /// The stream carries each new commit once, then each dependency of the
+    /// new commits once. With each commit, it carries each object that the
+    /// tree of the commit reaches. It also carries the stored `.commitmeta`
+    /// bytes of the commit with no parse, so the receiver refuses a
+    /// `.commitmeta` that is not an `a{sv}` dict. If the repository holds the
+    /// composefs image of a sent commit, the stream carries the image after
+    /// the trees. The stream carries no parent commit.
     ///
     /// The call does no negotiation, so it sends each object, also the
     /// objects that the receiver holds.
@@ -60,6 +62,48 @@ impl Repo {
     /// [`Deflate`](Compression::Deflate), the stream carries each file object
     /// in `deflate`. The stream copies the bytes of the stored `.filez` file
     /// of the object.
+    ///
+    /// # Dependencies
+    ///
+    /// Field 2 of a commit names the dependencies of the commit.
+    /// [`read_commit_related`](Repo::read_commit_related) reads them. The
+    /// stream carries the dependencies of each new commit.
+    ///
+    /// - The call sends each dependency at depth 0, so a dependency entry
+    ///   adds no parent to the stream. The stream carries a dependency one
+    ///   time, also if several commits name it, or if it is also a new
+    ///   commit.
+    /// - The `Commit` frame holds no ref update for a dependency.
+    /// - For each dependency, the stream carries the commit object, the
+    ///   objects of its tree, and its detached metadata. If the repository
+    ///   holds the composefs image of the dependency, the stream carries it.
+    ///   An object that a new commit and a dependency share goes in the stream
+    ///   one time.
+    /// - The call does no negotiation, so it sends a dependency that the
+    ///   receiver holds. The receiver accepts it, and drops its
+    ///   `.commitmeta`: a held dependency gets no merge of detached metadata
+    ///   and no signature.
+    /// - A receiver that holds a dependency and marks it partial refuses the
+    ///   stream with [`MissingObjects`](crate::remote::Error::MissingObjects)
+    ///   and no object listed, also though the stream carries the whole tree
+    ///   of the dependency. To complete the dependency at the receiver, send
+    ///   it as the new commit of an update, in this stream or in an earlier
+    ///   one. The receiver then removes its partial marker.
+    /// - The call makes no ref-binding check on a dependency.
+    /// - The call does not send a build source: a commit that the detached
+    ///   metadata key `ostrya.related` names. The key goes with the detached
+    ///   metadata of its commit.
+    ///
+    /// These cases refuse the export before the call writes the first byte:
+    ///
+    /// - An entry of field 2 of a new commit has an empty name or a checksum
+    ///   that is not 32 bytes.
+    /// - The repository does not hold a dependency, or marks it partial.
+    /// - A dependency names dependencies of its own: its own field 2 is not
+    ///   empty, also if that field 2 holds a defective entry. This is also
+    ///   true for a dependency that is also a new commit. If the field 2 of
+    ///   such a new commit holds a defective entry, the first case refuses
+    ///   the export first.
     ///
     /// # Lock
     ///
@@ -105,10 +149,16 @@ impl Repo {
     /// - [`Error::Core`](crate::Error::Core) if `[core] locking` is not a
     ///   boolean or `[core] lock-timeout-secs` is not an integer.
     /// - [`Error::ObjectNotFound`](crate::Error::ObjectNotFound) if the
-    ///   repository does not hold a new commit, or a dirtree or a dirmeta
-    ///   that the tree of a new commit reaches.
-    /// - [`Error::Core`](crate::Error::Core) if a commit object or a dirtree
-    ///   object does not parse.
+    ///   repository does not hold a new commit or a dependency, or a dirtree
+    ///   or a dirmeta that the tree of a sent commit reaches.
+    /// - [`Error::InvalidRelated`](crate::Error::InvalidRelated) if an entry
+    ///   of field 2 of a new commit has an empty name or a checksum that is
+    ///   not 32 bytes, or if the repository marks a dependency partial, or if
+    ///   a dependency names dependencies of its own.
+    /// - [`Error::Core`](crate::Error::Core) if a new commit or a dirtree
+    ///   object does not parse. For the commit object of a dependency, the
+    ///   call decodes the tuple frame, the parent and root checksums, and
+    ///   field 2 alone, and gives this error if one of them does not decode.
     /// - [`Error::Remote`](crate::Error::Remote) with
     ///   [`InvalidInput`](crate::remote::Error::InvalidInput) if the repository
     ///   marks a new commit partial.
@@ -125,11 +175,12 @@ impl Repo {
     ///   frame or the `Commit` frame is more than 1 MiB.
     /// - [`Error::Io`](crate::Error::Io) if the open or the lock of the lock
     ///   file fails.
-    /// - [`Error::Io`](crate::Error::Io) if a read of a commit, of its
-    ///   `.commitpartial` marker, or of a dirtree fails, or if a lookup of a
-    ///   dirmeta fails. A commit or a dirtree that is not a regular file, or
-    ///   that is larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE),
-    ///   also gives this error.
+    /// - [`Error::Io`](crate::Error::Io) if a read of a commit or of a
+    ///   dependency, of its `.commitpartial` marker, or of a dirtree fails, or
+    ///   if a lookup of a dirmeta fails. A commit or a dirtree that is not a
+    ///   regular file, or that is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE), also gives this
+    ///   error.
     ///
     /// After the first byte, the call returns:
     ///
@@ -179,13 +230,15 @@ impl Repo {
 
         let _lock = self.lock_repo(LockKind::Shared).await?;
         // Each new commit once, in the order of the updates.
-        let mut loaded: Vec<(Checksum, Commit)> = Vec::new();
+        let mut targets: Vec<Checksum> = Vec::new();
+        let mut loaded: Vec<Commit> = Vec::new();
+        let mut commits = Commits::default();
         for u in updates {
             let checksum = u.new.expect("a delete is refused");
-            let position = match loaded.iter().position(|(c, _)| *c == checksum) {
+            let position = match targets.iter().position(|c| *c == checksum) {
                 Some(position) => position,
                 None => {
-                    let (commit, state) = self.load_commit(&checksum).await?;
+                    let (mut commit, state) = self.load_commit(&checksum).await?;
                     if state == CommitState::Partial {
                         return Err(invalid(format!(
                             "commit {checksum} for '{}' is marked partial in the local \
@@ -193,34 +246,55 @@ impl Repo {
                             u.name
                         )));
                     }
-                    loaded.push((checksum, commit));
+                    commits
+                        .local
+                        .insert(checksum, Local::Held(link_of(&commit)));
+                    let related = std::mem::take(&mut commit.related);
+                    commits.record(checksum, related::checked_dependencies(&checksum, related));
+                    targets.push(checksum);
+                    loaded.push(commit);
                     loaded.len() - 1
                 }
             };
-            check_ref_binding(&checksum, &loaded[position].1, &u.name)?;
+            check_ref_binding(&checksum, &loaded[position], &u.name)?;
         }
+        drop(loaded);
 
-        let commits: Vec<Checksum> = loaded.iter().map(|(c, _)| *c).collect();
-        let mut names: Vec<ObjectName> = commits
+        // The format of field 2 of each new commit, then its dependencies,
+        // before the first byte.
+        commits.check_fields(&targets)?;
+        commits.check_dependencies(self, &targets).await?;
+
+        // The new commits, then each dependency once.
+        let mut sent = targets.clone();
+        let mut known: HashSet<Checksum> = targets.iter().copied().collect();
+        for target in &targets {
+            for dependency in commits.dependencies_of(target) {
+                if known.insert(dependency) {
+                    sent.push(dependency);
+                }
+            }
+        }
+        drop(known);
+
+        let mut names: Vec<ObjectName> = sent
             .iter()
             .map(|c| ObjectName::new(*c, ObjectType::Commit))
             .collect();
         let mut seen = HashSet::new();
-        for (_, commit) in &loaded {
-            self.collect_tree_strict(
-                commit.root_dirtree,
-                commit.root_dirmeta,
-                &mut seen,
-                &mut names,
-            )
-            .await?;
+        for commit in &sent {
+            let Local::Held(link) = commits.local[commit] else {
+                unreachable!("a sent commit is held");
+            };
+            self.collect_tree_strict(link.root_dirtree, link.root_dirmeta, &mut seen, &mut names)
+                .await?;
         }
         drop(seen);
-        drop(loaded);
-        // The composefs image of each new commit that this repository holds
+        drop(commits);
+        // The composefs image of each sent commit that this repository holds
         // goes after the trees.
         let repo = self.clone();
-        let wanted = commits.clone();
+        let wanted = sent.clone();
         let images = ostrya_rt::unblock(move || -> Result<Vec<ObjectName>> {
             let mut images = Vec::new();
             for commit in wanted {
@@ -238,7 +312,7 @@ impl Repo {
             output,
             &source,
             &names,
-            &commits,
+            &sent,
             updates,
             opts.compression,
             SessionOptions::default(),

@@ -434,7 +434,9 @@ impl ReceiveService {
     ///   the session holds a detached metadata dict or a composefs image, or
     ///   staged a commit object.
     /// - [`remote::Error::Protocol`] if a detached metadata dict belongs to a
-    ///   commit that is not a commit of the session.
+    ///   commit that is not a commit of the session, unless the repository
+    ///   holds the commit and field 2 of a commit of the session names it.
+    ///   The session drops the dict of such a held dependency.
     /// - [`remote::Error::Protocol`] if a composefs image belongs to a commit
     ///   that the session did not stage and the repository does not hold, or
     ///   to a commit with no valid `ostree.composefs.digest.v0`.

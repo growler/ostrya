@@ -3152,6 +3152,49 @@ a server commit is empty ("Server commit").
 The server checks the dependencies of the commits that it stages, and applies
 its signature rules to them ("Commit and CommitReply", checks 6, 8, and 9).
 
+### Dependencies in a one-way stream
+
+An ostrya sender of a one-way stream follows the dependencies of each new
+commit of the stream: each commit that an update of `Commit` sets.
+
+- The sender sends each dependency at depth 0, so a dependency entry adds no
+  parent to the stream. The stream carries a dependency one time, also if
+  several new commits name it, or if it is also a new commit.
+- `Commit` holds no update for a dependency.
+- The sender makes no ref-binding check on a dependency.
+- For each dependency, the stream carries the commit object, the objects of
+  its tree, and its `.commitmeta`. If the repository of the sender holds the
+  composefs image of the dependency, the stream carries it. An object that a
+  new commit and a dependency share goes in the stream one time.
+- The sender does no negotiation, so it sends a dependency that the server
+  holds. The server accepts that dependency and drops its `.commitmeta`
+  ("Commit and CommitReply", check 5).
+- The sender does not follow a build source. `ostrya.related` goes with the
+  `.commitmeta` of its commit.
+
+The sender checks the format of field 2 of each new commit. A defective
+related value in field 2 refuses the export: an entry with an empty name, an
+entry with a checksum that is not 32 bytes, and an entry that names a nested
+dependency. A dependency whose own field 2 is not empty is nested, also if
+that field 2 holds a defective entry, and also if the dependency is a new
+commit. The format check of field 2 of each new commit runs first, so a
+dependency that is a new commit with a defective entry in its field 2 gives
+the failure of that entry. A dependency that the repository of the sender
+does not hold, or marks partial, refuses the export too. The sender finds
+each of these failures before it writes the first byte of the stream.
+`Repo::export_stream` then gives `Error::ObjectNotFound` for a dependency
+that the repository does not hold, and `Error::InvalidRelated` for each other
+failure.
+
+The server checks the dependencies of the commits that it stages, as in a
+push session ("The one-way stream"). A server that holds a dependency with a
+partial-commit marker refuses the stream with `missing-objects` and no
+`missing` detail, also though the stream carries the whole tree of the
+dependency ("Commit and CommitReply", check 6). To complete the dependency
+at the server, a sender sends it as the new commit of an update, in that
+stream or in an earlier one. The server then checks the tree of the
+dependency and removes its marker.
+
 ## Ref patterns
 
 The port selects refs by name with two grammars. A pattern of a client group
@@ -3790,8 +3833,9 @@ Each failed check ends the session, and the session writes nothing:
    name, and two updates of one ref are `protocol`.
 2. A `CommitReply` with a commit in each `old`, and the `new` of each
    update, that needs a frame over 1 MiB is `limit-exceeded`.
-3. A detached metadata dict for a commit that the session did not stage and
-   that no update names as `new` is `protocol`.
+3. A detached metadata dict for a commit that the session did not stage,
+   that no update names as `new`, and that the repository does not hold is
+   `protocol`.
 4. The server reads the effective rights of the ref of each update in the
    client group. These updates are `ref-denied`:
    - an update of `ostree-metadata` in the local refs of a repository with a
@@ -3806,10 +3850,17 @@ Each failed check ends the session, and the session writes nothing:
    Such a commit fails the check at once. A `new` commit that the session did
    not stage and that the repository does not hold is `missing-objects`. The
    absent commits fail together, after the read of the other commits. Then
-   the server checks each composefs image of the session, in the order of
-   the checksums of their commits. An image for a commit that the session did
-   not stage and that the repository does not hold is `protocol`. For an
-   image that the session staged, a commit without
+   the server takes each detached metadata dict for a commit that the
+   repository holds, that the session did not stage, and that no update
+   names as `new`. If an entry of field 2 of a commit of the session names
+   that commit, the commit is a dependency that the repository holds, and
+   the server drops the dict with no merge and no write. An entry with an
+   empty name or with a checksum that is not 32 bytes names no commit. Each
+   other such dict is `protocol`. Then the server checks each composefs
+   image of the session, in the order of the checksums of their commits. An
+   image for a commit that the session did not stage and that the repository
+   does not hold is `protocol`. For an image that the session staged, a
+   commit without
    `ostree.composefs.digest.v0`, or with a value that is not a variant of
    type `ay` with 32 bytes, is `protocol`. An image whose fs-verity digest is
    not that value is `checksum-mismatch`.
@@ -4190,9 +4241,11 @@ If a client cannot complete an object, it sends the abandon marker and then
 `Abort` ("Abort, abandon, and end of input"). The server then ends the session
 with no change.
 
-An object stream can carry the composefs image of a new commit. An ostrya
-sender sends the image of each new commit that its repository holds, after
-the trees of the commits. The server reads and checks the image as in a push
+An ostrya sender also sends the dependencies of each new commit, with no
+ref update ("Dependencies in a one-way stream"). An object stream can carry
+the composefs image of a sent commit. An ostrya sender sends the image of
+each new commit and of each dependency that its repository holds, after the
+trees of the commits. The server reads and checks the image as in a push
 session ("Object streams").
 
 The server runs `Hello` checks 2, 3, and 5 of a push session ("Hello and

@@ -778,6 +778,19 @@ pub async fn store_with_field2(
     written
 }
 
+/// Returns the commit and the reason of an [`ostrya::Error::InvalidRelated`]
+/// for field 2.
+pub fn dependency_error(err: ostrya::Error) -> (Option<ostrya::Checksum>, String) {
+    match err {
+        ostrya::Error::InvalidRelated {
+            commit,
+            field: ostrya::RelatedField::Dependencies,
+            reason,
+        } => (commit, reason),
+        other => panic!("expected InvalidRelated in field 2, got {other:?}"),
+    }
+}
+
 /// Returns a warning of the dependencies of `commit`.
 pub fn dependency_warning(commit: ostrya::Checksum, reason: &str) -> ostrya::RelatedWarning {
     ostrya::RelatedWarning {

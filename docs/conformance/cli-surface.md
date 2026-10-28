@@ -3623,7 +3623,7 @@ port's own words. `--require-static-deltas` applies the delta the source's
 summary advertises, with the objects, the refs, and the statistics line of the
 tool, and refuses where the tool refuses (`cli-behavior.md`, "HTTP pull
 surface", "Static deltas over pull-local"). `--disable-static-deltas` changes
-nothing, since `pull-local` reads no delta by default. Eight differences stand:
+nothing, since `pull-local` reads no delta by default. Nine differences stand:
 
 - the verification keys of the remote. The port reads `gpg-verify`,
   `gpg-verify-summary`, `sign-verify`, `sign-verify-summary`, and `trust` of
@@ -3671,7 +3671,15 @@ nothing, since `pull-local` reads no delta by default. Eight differences stand:
   canonical form of `bare-user-only` -- a non-zero uid or gid, an xattr, or a
   regular-file mode with bits outside `0755` -- because the object would get a
   name that its stored form does not hash to. What the port imports passes its
-  own `fsck` and the `fsck` of the tool.
+  own `fsck` and the `fsck` of the tool;
+- the dependencies of a commit. The port imports the dependencies that field
+  2 of each pulled commit names, each at depth 0 and with no ref, unless the
+  pull is commit-only (`../format-reference.md`, "Dependencies in a local
+  pull"). A dependency that neither the source, a localcache repository, nor
+  the destination holds, a field 2 entry with an empty name or with a
+  checksum that is not 32 bytes, and a nested dependency fail the pull at
+  exit 1, and the pull writes no object and no ref. The tool imports no
+  dependency (`cli-behavior.md`, "Related commits in a pull").
 
 `sign` accepts the whole tool option set and adds `--gpg-homedir`,
 `--remote`, and the `gpg` engine. The `ostree` 2026.1 build with OpenSSL on

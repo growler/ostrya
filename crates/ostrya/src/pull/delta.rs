@@ -92,7 +92,7 @@ use crate::object::MAX_METADATA_SIZE;
 use crate::pull::verify::Verification;
 use crate::pull::{ModeChecks, PullCounters, PullFlags, PullOptions, RefPlace};
 use crate::read::CommitState;
-use crate::related::RelatedRule;
+use crate::related::{self, RelatedField, RelatedRule};
 use crate::repo::Repo;
 use crate::summary::{AdvertisedDelta, INDEXED_DELTAS_KEY, Summary, delta_digest};
 use crate::transaction::Transaction;
@@ -237,6 +237,9 @@ pub(crate) struct DeltaPlan {
     /// with a record and in no level is a target, which the pull applies
     /// last.
     levels: Vec<Vec<Checksum>>,
+    /// The entries of field 2 of each intermediate commit of the chains whose
+    /// field 2 is not empty, for a local source.
+    dependencies: HashMap<Checksum, Vec<(String, Checksum)>>,
     /// The file of the raw bytes of the records from a remote.
     store: Option<RecordStore>,
 }
@@ -389,6 +392,18 @@ impl DeltaPlan {
             .get(commit)
             .is_some_and(|record| matches!(record.detached, Detached::Checked { .. }))
     }
+
+    /// Takes the entries of field 2 of each intermediate commit of the
+    /// chains, as names and checksums in the stored order. Discovery read them
+    /// from the superblock of the step of a local source and checked their
+    /// format.
+    ///
+    /// The map holds no commit whose field 2 is empty. For a plan from a
+    /// remote source, the map is empty. The call reads nothing, and a second
+    /// call returns an empty map.
+    pub(crate) fn take_dependencies(&mut self) -> HashMap<Checksum, Vec<(String, Checksum)>> {
+        std::mem::take(&mut self.dependencies)
+    }
 }
 
 /// The check that discovery made of one commit.
@@ -451,6 +466,10 @@ struct Checked {
     filtered: bool,
     /// What the check read of the `.commitmeta` in a local source.
     local: LocalRead,
+    /// The entries of field 2 of the commit, in the stored order, after the
+    /// format check. The list is empty for a remote source: a pull from a
+    /// remote reads field 2 when it stages the commit.
+    dependencies: Vec<(String, Checksum)>,
 }
 
 /// What the check of a commit of a chain read of its `.commitmeta` in a local
@@ -844,6 +863,12 @@ pub(crate) async fn discover(
 /// plan makes it from another step. For a local source, discovery makes no
 /// timestamp check, because a local pull has none.
 ///
+/// For a local source, discovery also reads field 2 of the commit of each
+/// step and checks the format of its entries. It keeps the entries of each
+/// intermediate commit of the last plan.
+/// [`DeltaPlan::take_dependencies`] gives them to the pull, which follows the
+/// dependencies of each intermediate commit.
+///
 /// If the source does not hold the superblock of a step, discovery excludes
 /// that delta and plans again. It fetches only the steps that it did not
 /// fetch before. Each pass excludes one delta, so the loop ends. The planner
@@ -869,6 +894,10 @@ pub(crate) async fn discover(
 ///   The pull then does not fetch loose.
 /// - [`Error::InvalidFormat`] if a superblock or an inline part is
 ///   malformed.
+/// - [`Error::InvalidRelated`] if field 2 of the commit of a step of a local
+///   source has an entry with an empty name or with a checksum that is not 32
+///   bytes. Discovery reports it after the checks of the commit, as
+///   [`check_step_commit`] states.
 #[allow(clippy::too_many_arguments)]
 async fn discover_chain(
     repo: &Repo,
@@ -985,7 +1014,11 @@ async fn discover_chain(
         }
     }
 
+    // The pull follows the dependencies of the intermediate commits alone.
+    // The walk of the commit chains reads field 2 of each target again.
+    let intermediate: HashSet<&Checksum> = pass.plan.levels.iter().flatten().collect();
     let mut kept_records = HashMap::with_capacity(pass.plan.steps.len());
+    let mut dependencies = HashMap::new();
     for (commit, index) in &pass.plan.steps {
         let Some(mut record) = records.remove(index) else {
             continue;
@@ -995,6 +1028,9 @@ async fn discover_chain(
                 kept: check.kept,
                 filtered: check.filtered,
             };
+            if intermediate.contains(commit) && !check.dependencies.is_empty() {
+                dependencies.insert(*commit, check.dependencies);
+            }
         }
         kept_records.insert(*commit, record);
     }
@@ -1002,6 +1038,7 @@ async fn discover_chain(
         jobs: HashMap::new(),
         records: kept_records,
         levels: pass.plan.levels,
+        dependencies,
         store,
     })
 }
@@ -1240,6 +1277,11 @@ async fn fetch_step(
 /// If no repository holds a `.commitmeta`, the check reads the detached
 /// metadata of this repository.
 ///
+/// For a local source, the check also reads field 2 of the commit and checks
+/// the format of its entries. It reports a defective entry after the other
+/// checks, and the result holds the entries. One call on the blocking pool
+/// decodes field 2 and makes the parse for the checks of the refs.
+///
 /// # Errors
 ///
 /// - [`Error::Signature`] if the signatures fail the policy of the pull.
@@ -1247,6 +1289,8 @@ async fn fetch_step(
 ///   of `refs`, or if the commit is older than the timestamp check allows.
 /// - [`Error::Pull`] if the `.commitmeta` would pass the limit of the record
 ///   file.
+/// - [`Error::InvalidRelated`] if field 2 of the commit from a local source
+///   has an entry with an empty name or with a checksum that is not 32 bytes.
 async fn check_step_commit(
     ctx: &CheckCtx<'_>,
     commit: &Checksum,
@@ -1255,7 +1299,29 @@ async fn check_step_commit(
     detached: Option<Option<Vec<u8>>>,
     store: Option<&mut RecordStore>,
 ) -> Result<Checked> {
-    let checked = match ctx.source {
+    // A local pull follows the dependencies of each commit that a step makes,
+    // so for a local source the check reads field 2 of the commit and checks
+    // its format. The bytes can be as large as `MAX_METADATA_SIZE`, so one
+    // call on the blocking pool decodes field 2 alone, and parses the commit
+    // for the checks of the refs. The check takes each result at its own
+    // point.
+    let (commit_bytes, local_parse) = match ctx.source {
+        DeltaSource::Local(_) => {
+            let checksum = *commit;
+            let parse = !refs.is_empty();
+            ostrya_rt::unblock(move || {
+                let dependencies = related::parse_dependencies(&commit_bytes).and_then(|entries| {
+                    related::checked_entries(RelatedField::Dependencies, Some(checksum), entries)
+                });
+                let parsed = parse.then(|| Commit::parse(&commit_bytes));
+                (commit_bytes, Some((parsed, dependencies)))
+            })
+            .await
+        }
+        DeltaSource::Remote(_) => (commit_bytes, None),
+    };
+    let (parsed, dependencies) = local_parse.unzip();
+    let mut checked = match ctx.source {
         DeltaSource::Remote(remote) => {
             let detached = match detached {
                 Some(detached) => detached,
@@ -1300,12 +1366,14 @@ async fn check_step_commit(
                 kept,
                 filtered,
                 local: LocalRead::Nothing,
+                dependencies: Vec::new(),
             }
         }
         DeltaSource::Local(_) if !ctx.verification.checks_commits() => Checked {
             kept: None,
             filtered: false,
             local: LocalRead::Nothing,
+            dependencies: Vec::new(),
         },
         DeltaSource::Local(src) => {
             // The source comes first, then the localcache repositories, then
@@ -1329,14 +1397,23 @@ async fn check_step_commit(
                 kept: None,
                 filtered: false,
                 local,
+                dependencies: Vec::new(),
             }
         }
     };
     if !refs.is_empty() {
-        // The bytes can be as large as `MAX_METADATA_SIZE`, so the parse runs
-        // on the blocking pool. The bytes drop there.
-        let parsed = ostrya_rt::unblock(move || Commit::parse(&commit_bytes)).await?;
+        let parsed = match parsed.flatten() {
+            Some(parsed) => parsed?,
+            // The bytes can be as large as `MAX_METADATA_SIZE`, so the parse
+            // runs on the blocking pool. The bytes drop there.
+            None => ostrya_rt::unblock(move || Commit::parse(&commit_bytes)).await?,
+        };
         check_tip_refs(ctx.repo, ctx.tips, commit, &parsed, refs).await?;
+    }
+    // A defective entry of field 2 fails the pull after the other checks of
+    // the commit.
+    if let Some(dependencies) = dependencies {
+        checked.dependencies = dependencies?;
     }
     Ok(checked)
 }

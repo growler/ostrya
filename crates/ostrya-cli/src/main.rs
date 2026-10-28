@@ -396,6 +396,10 @@ enum Command {
     /// With `[ex-ostrya] keep-detached-related=false`, it drops
     /// `ostrya.related`.
     ///
+    /// The pull also imports the dependencies that field 2 of each pulled
+    /// commit names, each with no parent and no ref, unless it takes
+    /// --commit-metadata-only.
+    ///
     /// On success, the command prints one statistics line to standard output:
     /// `M metadata, C content objects imported; SIZE content written`. Under
     /// --require-static-deltas, the line has the form of a pull from a

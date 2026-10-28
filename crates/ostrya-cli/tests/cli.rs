@@ -6711,6 +6711,67 @@ fn pull_fetches_a_dependency() {
     ostrya(&["fsck", "--repo", dest.to_str().unwrap()], None, &[]).ok();
 }
 
+/// `pull-local` imports the dependency that field 2 of the pulled commit
+/// names, complete, and writes no ref for it. The fsck of the destination
+/// passes.
+#[test]
+fn pull_local_imports_a_dependency() {
+    let tmp = TmpDir::new("pull-local-dependency");
+    let base = tmp.path();
+    let src = build_remote(base, "src");
+    let src_s = src.to_str().unwrap().to_owned();
+    let commit = |args: &[&str]| {
+        let mut all = vec!["commit", "--repo", &src_s, "--canonical-permissions"];
+        all.extend_from_slice(args);
+        ostrya(&all, None, &[("SOURCE_DATE_EPOCH", "1700000100")])
+            .ok()
+            .stdout_trimmed()
+    };
+    let dep = commit(&[
+        "-b",
+        "dep/uki",
+        ex_ostrya_tree(base, "uki").to_str().unwrap(),
+    ]);
+    let related = format!("--related=boot/uki={dep}");
+    let tip = commit(&[
+        "-b",
+        BRANCH,
+        &related,
+        base.join("src/src").to_str().unwrap(),
+    ]);
+
+    let dest = build_dest(base, "dest");
+    ostrya(
+        &[
+            "pull-local",
+            "--repo",
+            dest.to_str().unwrap(),
+            &src_s,
+            BRANCH,
+        ],
+        None,
+        &[],
+    )
+    .ok();
+
+    let object = dest.join(format!("objects/{}/{}.commit", &dep[..2], &dep[2..]));
+    assert!(object.is_file(), "dependency {dep} was not imported");
+    let marker = dest.join(format!("state/{dep}.commitpartial"));
+    assert!(!marker.exists(), "dependency {dep} is marked partial");
+    block_on(async {
+        let repo = Repo::open(&dest).await.unwrap();
+        let refs: Vec<(String, String)> = repo
+            .list_refs(None)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(name, commit)| (name, commit.to_hex()))
+            .collect();
+        assert_eq!(refs, [(BRANCH.to_owned(), tip)]);
+    });
+    ostrya(&["fsck", "--repo", dest.to_str().unwrap()], None, &[]).ok();
+}
+
 #[test]
 fn pull_timestamp_check_refuses_an_older_tip() {
     let tmp = TmpDir::new("pull-timestamp");

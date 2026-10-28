@@ -20,6 +20,8 @@
 //!   entry.
 //! - [`Repo::pull`], [`Repo::pull_with_session`], and [`Repo::pull_collection`]
 //!   fetch the dependencies of each commit that they read.
+//!   [`Repo::pull_local`] imports the dependencies of each commit that it
+//!   walks.
 
 use std::os::fd::AsFd;
 use std::sync::LazyLock;

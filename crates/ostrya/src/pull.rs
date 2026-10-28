@@ -219,7 +219,7 @@ use crate::error::{Error, Result};
 use crate::file::FileKind;
 use crate::perm;
 use crate::refs::{CollectionRef, collection_ref_to_relpath, refspec_to_relpath};
-use crate::related::RelatedRule;
+use crate::related::{self, RelatedRule};
 use crate::repo::Repo;
 use crate::summary::AdvertisedDelta;
 use crate::transaction::Transaction;
@@ -269,8 +269,7 @@ impl PullFlags {
     /// The import of the commit objects alone.
     ///
     /// The pull does not walk the trees, and it keeps the `.commitpartial`
-    /// marker of each commit. A pull from a remote fetches no dependency
-    /// under this flag.
+    /// marker of each commit. A pull takes no dependency under this flag.
     pub const COMMIT_ONLY: PullFlags = PullFlags(1 << 1);
     /// The refusal of a regular file whose logical mode has bits outside
     /// `0775`.
@@ -622,10 +621,10 @@ pub struct PullOptions {
     /// commits. A value below `-1` is [`Error::InvalidInput`], and the pull
     /// writes no object and no ref.
     ///
-    /// A pull from a remote fetches each dependency at depth 0, whatever this
-    /// value is. It follows the dependencies of each commit that it takes,
-    /// the parents included. [`Repo::pull`] states the rules in
-    /// "Dependencies". [`Repo::pull_local`] does not follow dependencies.
+    /// A pull takes each dependency at depth 0, whatever this value is. It
+    /// follows the dependencies of each commit that it takes, the parents
+    /// included. [`Repo::pull`] and [`Repo::pull_local`] state the rules in
+    /// "Dependencies".
     pub depth: i32,
     /// More local repositories that supply an object that the source does not
     /// hold, in order.
@@ -866,8 +865,8 @@ fn apply_durability(txn: &mut Transaction, opts: &PullOptions) {
 /// pull staged. An object that the destination already held does not count.
 /// The plan of a [`COMMIT_ONLY`](PullFlags::COMMIT_ONLY) pull is the commit
 /// objects alone, so the pull reports those and no content. The objects of
-/// the dependencies that a pull from a remote fetches count as the other
-/// objects of the pull.
+/// the dependencies that a pull takes count as the other objects of the
+/// pull.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PullStats {
     /// The number of metadata objects that the pull imported.
@@ -1195,7 +1194,9 @@ impl Repo {
     /// the pull fails, it publishes no object and writes no ref.
     ///
     /// A parent commit that the source does not hold ends its chain without an
-    /// error. So a source with a truncated history pulls what it has.
+    /// error. So a source with a truncated history pulls what it has. A parent
+    /// that a commit of the pull names as a dependency is a dependency too, as
+    /// "Dependencies" states.
     ///
     /// The pull writes the refs last, after the objects are published. So no
     /// ref of this repository names a commit with objects that are not durable.
@@ -1208,6 +1209,57 @@ impl Repo {
     /// [`verify`](PullOptions::verify) selects the signature policy, as
     /// [`PullVerify`] states. The module [`pull`](self) states the rules of
     /// the `.commitpartial` markers.
+    ///
+    /// # Dependencies
+    ///
+    /// Field 2 of a commit names the dependencies of the commit.
+    /// [`read_commit_related`](Repo::read_commit_related) reads them. The pull
+    /// follows the dependencies of each commit that it walks: each target, and
+    /// each parent that [`depth`](PullOptions::depth) takes. It also follows
+    /// the dependencies of each intermediate commit of a chain of static
+    /// deltas. Discovery reads field 2 of such a commit from the superblock of
+    /// its step.
+    ///
+    /// - The pull takes each dependency at depth 0, so a dependency entry adds
+    ///   no parent to the pull. The pull takes a dependency one time, also if
+    ///   several commits name it.
+    /// - The pull writes no ref for a dependency.
+    /// - The signature policy of the pull applies to each dependency. The
+    ///   pull makes no ref-binding check on a dependency.
+    /// - The pull reads the commit object of a dependency from the source,
+    ///   then from each localcache repository, then from this repository. It
+    ///   reads no commit object of a dependency that a chain of static deltas
+    ///   makes, so the source can hold that commit in the delta alone.
+    /// - A dependency is a commit of the pull for each other rule: its
+    ///   `.commitpartial` marker, the walk of its tree, its detached metadata,
+    ///   and its composefs image. For a dependency that this repository holds
+    ///   complete, the pull checks the signatures and walks no tree. A
+    ///   dependency that this repository holds partial gets the walk of its
+    ///   whole tree.
+    /// - A dependency entry adds no static delta to the pull, also under
+    ///   [`require_static_deltas`](PullOptions::require_static_deltas). The
+    ///   pull imports the objects of a dependency loose, unless a chain of
+    ///   static deltas of the pull makes that commit.
+    /// - The pull does not follow a build source: a commit that the detached
+    ///   metadata key `ostrya.related` names.
+    ///
+    /// A [`COMMIT_ONLY`](PullFlags::COMMIT_ONLY) pull takes no dependency. It
+    /// also checks the format of the entries of field 2 of each commit that it
+    /// walks.
+    ///
+    /// These cases fail the pull before the transaction opens, and the pull
+    /// writes no object and no ref:
+    ///
+    /// - An entry of field 2 has an empty name or a checksum that is not 32
+    ///   bytes.
+    /// - A dependency names dependencies of its own: its own field 2 is not
+    ///   empty.
+    /// - Neither a source nor this repository holds a dependency. This is
+    ///   also true for a parent that the source does not hold, if a commit of
+    ///   the pull names that parent as a dependency.
+    ///
+    /// The pull reports these defects before a commit that the walk finds to
+    /// fail the signature policy, as for each other defect of the walk.
     ///
     /// # Remote config
     ///
@@ -1478,13 +1530,15 @@ impl Repo {
     /// the signatures of the superblock, by the rules of [`PullVerify`], and
     /// its inline parts. For each commit of a chain, the target included, it
     /// also checks the signatures of the commit, and the ref binding of each
-    /// requested ref that names the commit. The walk of the commit chains
-    /// does not check that commit again. A local pull makes no timestamp
-    /// check. So a target that the policy or its ref binding refuses costs the
-    /// reads of the superblocks, and the pull applies no part. The pull
-    /// reports this refusal before a defect that the walk of the commit chains
-    /// finds. A target with no chain gets its checks in the walk of the commit
-    /// chains, also before the transaction opens.
+    /// requested ref that names the commit. Then it checks the format of
+    /// field 2 of the commit, as "Dependencies" states. The walk of the commit
+    /// chains does not check the signatures or the ref binding of that commit
+    /// again. A local pull makes no timestamp check. So a target that the
+    /// policy or its ref binding refuses costs the reads of the superblocks,
+    /// and the pull applies no part. The pull reports this refusal before a
+    /// defect that the walk of the commit chains finds. A target with no chain
+    /// gets its checks in the walk of the commit chains, also before the
+    /// transaction opens.
     ///
     /// The pull applies a chain one level at a time, in its one transaction.
     /// The parts, the loose objects, and the tree walk of one level end before
@@ -1558,15 +1612,20 @@ impl Repo {
     /// - [`Error::Pull`] if an object fails the
     ///   [`BAREUSERONLY_FILES`](PullFlags::BAREUSERONLY_FILES) check or the
     ///   check of a `bare-user-only` destination.
-    /// - [`Error::Signature`] if a commit or the summary fails the signature
-    ///   policy, each commit of a chain included. Also if the signatures of
-    ///   a superblock fail the policy, or if the policy covers the summary and
-    ///   `src` has no `summary` or no `summary.sig`.
+    /// - [`Error::InvalidRelated`] if an entry of field 2 of a commit has an
+    ///   empty name or a checksum that is not 32 bytes, or if a dependency
+    ///   names dependencies of its own. The pull reports it before a failed
+    ///   signature check of the walk.
+    /// - [`Error::Signature`] if a commit, a dependency, or the summary fails
+    ///   the signature policy, each commit of a chain included. Also if the
+    ///   signatures of a superblock fail the policy, or if the policy covers
+    ///   the summary and `src` has no `summary` or no `summary.sig`.
     /// - [`Error::RefNotFound`] if `src` does not hold a requested ref or
     ///   collection ref.
     /// - [`Error::ObjectNotFound`] if neither this repository nor a source
-    ///   holds an object that a pulled commit reaches. Also if a dirtree that
-    ///   this repository holds is a symlink that points to no file.
+    ///   holds a dependency or an object that a pulled commit reaches. Also if
+    ///   a dirtree that this repository holds is a symlink that points to no
+    ///   file.
     /// - [`Error::ChecksumMismatch`] if an imported object does not hash to its
     ///   name, under [`UNTRUSTED`](PullFlags::UNTRUSTED) or on the re-ingest
     ///   path. Also if a delta superblock does not match its advertised digest
@@ -1719,6 +1778,8 @@ impl Repo {
         // The intermediate commits of the chains. The run of the levels
         // imports each of them, and the commit loop skips them.
         let done: HashSet<Checksum> = deltas.levels().iter().flatten().copied().collect();
+        // Discovery read field 2 of each intermediate commit of the chains.
+        let mut level_dependencies = deltas.take_dependencies();
 
         let sources: Vec<&Repo> = std::iter::once(src)
             .chain(opts.localcache_repos.iter())
@@ -1743,6 +1804,10 @@ impl Repo {
         //
         // Discovery checked each commit of a chain, so the walk does not check
         // it again.
+        //
+        // The dependencies of the commits are commits of the pull too. The
+        // walk appends each one after the chains, at depth 0, and checks it
+        // over the bytes that it read.
         let mut check = verification.checks_commits().then(|| ChainCheck {
             repo: self,
             sources: &sources,
@@ -1751,21 +1816,44 @@ impl Repo {
             failed: None,
         });
 
+        // A commit-only pull follows no dependency. It also checks the format
+        // of field 2 of each commit that it walks.
+        let mut deps = (!flags.contains(PullFlags::COMMIT_ONLY)).then(ChainDependencies::default);
         // The commit chains, in the order of the refs, each commit once.
         let mut commits: Vec<ChainCommit> = Vec::new();
         let mut seen: HashMap<Checksum, i32> = HashMap::new();
         for (ref_name, tip) in &targets {
-            let (bytes, commit) = load_commit(src, tip).await?;
+            let loaded = load_commit(src, tip).await?;
             // Discovery made the binding check of each ref that names a
             // commit of a chain.
             if verify_bindings && !deltas.checked(tip) {
-                check_ref_binding(tip, &commit, ref_name)?;
+                check_ref_binding(tip, &loaded.commit, ref_name)?;
             }
             collect_chain(
                 src,
                 *tip,
-                (bytes, commit),
+                loaded,
                 opts.depth,
+                &mut commits,
+                &mut seen,
+                check.as_mut(),
+                deps.as_mut(),
+            )
+            .await?;
+        }
+        if let Some(mut deps) = deps {
+            // The run of the levels imports the intermediate commits of the
+            // chains, so the walk reads none of them again.
+            for commit in deltas.levels().iter().flatten() {
+                if let Some(entries) = level_dependencies.remove(commit) {
+                    deps.record(*commit, entries);
+                }
+            }
+            collect_dependencies(
+                self,
+                &sources,
+                deps,
+                &done,
                 &mut commits,
                 &mut seen,
                 check.as_mut(),
@@ -1804,12 +1892,19 @@ impl Repo {
                     marked.push(commit);
                 }
             }
-            for commit in &mut commits {
-                if done.contains(&commit.checksum) {
-                    continue;
-                }
-                commit.held = delta::complete_here(self, &commit.checksum).await?;
-                if !commit.held {
+            // The other commits follow, with one batched check.
+            let walked: Vec<Checksum> = commits
+                .iter()
+                .map(|commit| commit.checksum)
+                .filter(|checksum| !done.contains(checksum))
+                .collect();
+            let states = chain::check_complete(self, &walked).await?;
+            let walked = commits
+                .iter_mut()
+                .filter(|commit| !done.contains(&commit.checksum));
+            for (commit, (_, held)) in walked.zip(states) {
+                commit.held = held;
+                if !held {
                     self.write_partial_marker(&commit.checksum).await?;
                     marked.push(commit.checksum);
                 }
@@ -2468,28 +2563,49 @@ async fn resolve_targets(
 /// of a pull do not depend on the order of the refs. The walk appends a commit
 /// the first time that it gets to it, and not again.
 ///
-/// `tip_commit` holds the bytes of the tip and the commit parsed from them. If
-/// `check` is present, it runs on each commit when the walk appends it, over
-/// the bytes that the walk read. The walk appends each commit with the root of
-/// its tree, so the plan of the tree does not read the commit object again.
+/// `tip_commit` holds the bytes of the tip, the commit parsed from them, and
+/// the format check of its field 2. If `check` is present, it runs on each
+/// commit when the walk appends it, over the bytes that the walk read. The
+/// walk appends each commit with the root of its tree, so the plan of the tree
+/// does not read the commit object again.
+///
+/// The walk takes the format check of field 2 of each commit when it appends
+/// the commit, also if `deps` is `None`. If `deps` is present, the walk
+/// records the dependencies of each commit that it appends there.
+///
+/// # Errors
+///
+/// [`Error::InvalidRelated`] if field 2 of a commit of the chain has an entry
+/// with an empty name or with a checksum that is not 32 bytes.
+#[allow(clippy::too_many_arguments)]
 async fn collect_chain(
     src: &Repo,
     tip: Checksum,
-    tip_commit: (Vec<u8>, Commit),
+    tip_commit: LoadedCommit,
     depth: i32,
     out: &mut Vec<ChainCommit>,
     seen: &mut HashMap<Checksum, i32>,
     mut check: Option<&mut ChainCheck<'_>>,
+    mut deps: Option<&mut ChainDependencies>,
 ) -> Result<()> {
     let mut current = Some((tip, tip_commit));
     let mut remaining = depth;
-    while let Some((checksum, (bytes, commit))) = current {
+    while let Some((
+        checksum,
+        LoadedCommit {
+            bytes,
+            commit,
+            dependencies,
+        },
+    )) = current
+    {
         if let Some(&prev) = seen.get(&checksum)
             && reaches_at_least(prev, remaining)
         {
             return Ok(());
         }
         if seen.insert(checksum, remaining).is_none() {
+            let dependencies = dependencies?;
             out.push(ChainCommit {
                 checksum,
                 root_dirtree: commit.root_dirtree,
@@ -2499,6 +2615,9 @@ async fn collect_chain(
             });
             if let Some(check) = check.as_deref_mut() {
                 check.check(&checksum, &bytes).await;
+            }
+            if let Some(deps) = deps.as_deref_mut() {
+                deps.record(checksum, dependencies);
             }
         }
         drop(bytes);
@@ -2533,6 +2652,102 @@ struct ChainCommit {
     /// The value of `ostree.composefs.digest.v0` of the commit, or `None` if
     /// the commit does not carry the key or carries a malformed value.
     image_key: Option<[u8; 32]>,
+}
+
+/// The dependencies that the walk of the chains of a local pull met, and the
+/// commits that it checks them against.
+#[derive(Default)]
+struct ChainDependencies {
+    /// Each dependency, the commit that first named it, and the name of that
+    /// entry, in the order in which the walk met the dependencies.
+    named: Vec<(Checksum, Checksum, String)>,
+    /// The dependencies in `named`.
+    known: HashSet<Checksum>,
+    /// The commits whose field 2 is not empty.
+    with_dependencies: HashSet<Checksum>,
+}
+
+impl ChainDependencies {
+    /// Records the dependencies `dependencies` of `commit`.
+    ///
+    /// A dependency that an earlier commit named keeps the first commit and
+    /// entry name. An empty list records nothing.
+    fn record(&mut self, commit: Checksum, dependencies: Vec<(String, Checksum)>) {
+        if dependencies.is_empty() {
+            return;
+        }
+        self.with_dependencies.insert(commit);
+        for (name, dependency) in dependencies {
+            if self.known.insert(dependency) {
+                self.named.push((dependency, commit, name));
+            }
+        }
+    }
+}
+
+/// Appends each dependency of `deps` that the walk did not collect to `out`,
+/// at depth 0, in the order of `deps`.
+///
+/// A dependency that `seen` holds, or that `made` holds, needs no read: the
+/// walk collected it, or a chain of static deltas makes it. `made` holds the
+/// intermediate commits of the chains, and `deps` holds their dependencies.
+/// The call reads each other dependency from the first repository of
+/// `sources` that holds it, else from `repo`. It follows no parent of a
+/// dependency. If `check` is present, it runs on each dependency that the
+/// call appends, as [`collect_chain`] runs it.
+///
+/// # Errors
+///
+/// - [`Error::InvalidRelated`] if a dependency names dependencies of its own.
+///   The error names the commit that first named the dependency.
+/// - [`Error::InvalidRelated`] if field 2 of a dependency that the call reads
+///   has an entry with an empty name or with a checksum that is not 32 bytes.
+///   The error names the dependency.
+/// - [`Error::ObjectNotFound`] if neither a source nor `repo` holds a
+///   dependency.
+async fn collect_dependencies(
+    repo: &Repo,
+    sources: &[&Repo],
+    deps: ChainDependencies,
+    made: &HashSet<Checksum>,
+    out: &mut Vec<ChainCommit>,
+    seen: &mut HashMap<Checksum, i32>,
+    mut check: Option<&mut ChainCheck<'_>>,
+) -> Result<()> {
+    for (dependency, naming, name) in deps.named {
+        if seen.contains_key(&dependency) || made.contains(&dependency) {
+            if deps.with_dependencies.contains(&dependency) {
+                return Err(related::nested_dependency(naming, &name, &dependency));
+            }
+            continue;
+        }
+        let Some(LoadedCommit {
+            bytes,
+            commit,
+            dependencies,
+        }) = load_dependency(sources, repo, &dependency).await?
+        else {
+            return Err(Error::ObjectNotFound {
+                checksum: dependency,
+                ty: ObjectType::Commit,
+            });
+        };
+        if !dependencies?.is_empty() {
+            return Err(related::nested_dependency(naming, &name, &dependency));
+        }
+        seen.insert(dependency, 0);
+        out.push(ChainCommit {
+            checksum: dependency,
+            root_dirtree: commit.root_dirtree,
+            root_dirmeta: commit.root_dirmeta,
+            held: false,
+            image_key: recorded_digest(&commit).ok().flatten(),
+        });
+        if let Some(check) = check.as_deref_mut() {
+            check.check(&dependency, &bytes).await;
+        }
+    }
+    Ok(())
 }
 
 /// The signature verification that a local pull runs on each commit of the
@@ -2899,28 +3114,87 @@ async fn source_size(repo: &Repo, ty: ObjectType, checksum: &Checksum) -> Result
     }
 }
 
-/// Loads a commit from a repository: its bytes and the commit parsed from them.
+/// A commit that a local pull read: its bytes, the commit parsed from them,
+/// and the result of the format check of field 2.
+struct LoadedCommit {
+    bytes: Vec<u8>,
+    /// The parsed commit. Its field 2 is empty: the entries are in
+    /// `dependencies`.
+    commit: Commit,
+    /// The entries of field 2 as names and checksums, in the stored order, or
+    /// the [`Error::InvalidRelated`] of the first defective entry. The caller
+    /// takes the result at its own point, so it sets the order of the errors.
+    dependencies: Result<Vec<(String, Checksum)>>,
+}
+
+/// Parses the bytes of the commit `checksum` and checks the format of its
+/// field 2. The entries of field 2 move out of the parse.
+///
+/// The call runs on the calling thread. A caller on the executor calls it on
+/// the blocking pool.
+fn parse_loaded(checksum: Checksum, bytes: Vec<u8>) -> Result<LoadedCommit> {
+    let mut commit = Commit::parse(&bytes)?;
+    let related = std::mem::take(&mut commit.related);
+    Ok(LoadedCommit {
+        bytes,
+        commit,
+        dependencies: related::checked_dependencies(&checksum, related),
+    })
+}
+
+/// Loads a commit from a repository: its bytes, the commit parsed from them,
+/// and the format check of its field 2.
 ///
 /// A commit object can be as large as [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE),
-/// so the read and the parse run in one call on the blocking pool.
-async fn load_commit(repo: &Repo, checksum: &Checksum) -> Result<(Vec<u8>, Commit)> {
+/// so the read, the parse, and the check run in one call on the blocking
+/// pool.
+async fn load_commit(repo: &Repo, checksum: &Checksum) -> Result<LoadedCommit> {
     let repo = repo.clone();
     let checksum = *checksum;
     ostrya_rt::unblock(move || {
         let bytes = repo.load_object_bytes_blocking(ObjectType::Commit, &checksum)?;
-        let commit = Commit::parse(&bytes)?;
-        Ok((bytes, commit))
+        parse_loaded(checksum, bytes)
     })
     .await
 }
 
 /// Loads a commit, or returns `None` for an absent object.
-async fn try_load_commit(repo: &Repo, checksum: &Checksum) -> Result<Option<(Vec<u8>, Commit)>> {
+async fn try_load_commit(repo: &Repo, checksum: &Checksum) -> Result<Option<LoadedCommit>> {
     match load_commit(repo, checksum).await {
         Ok(loaded) => Ok(Some(loaded)),
         Err(Error::ObjectNotFound { .. }) => Ok(None),
         Err(e) => Err(e),
     }
+}
+
+/// Loads the dependency `checksum` from the first repository of `sources`
+/// that holds it, else from `repo`, this repository. Returns `None` if none
+/// of them holds it.
+///
+/// The reads, the parse, and the format check of field 2 run in one call on
+/// the blocking pool, as [`load_commit`] states.
+async fn load_dependency(
+    sources: &[&Repo],
+    repo: &Repo,
+    checksum: &Checksum,
+) -> Result<Option<LoadedCommit>> {
+    let owned: Vec<Repo> = sources
+        .iter()
+        .map(|src| (*src).clone())
+        .chain(std::iter::once(repo.clone()))
+        .collect();
+    let checksum = *checksum;
+    ostrya_rt::unblock(move || {
+        for held in &owned {
+            match held.load_object_bytes_blocking(ObjectType::Commit, &checksum) {
+                Ok(bytes) => return parse_loaded(checksum, bytes).map(Some),
+                Err(Error::ObjectNotFound { .. }) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        Ok(None)
+    })
+    .await
 }
 
 /// Reads the `.commitmeta` bytes of a commit from the first source that holds
@@ -3618,5 +3892,33 @@ mod tests {
         assert!(flags.contains(PullFlags::COMMIT_ONLY));
         assert!(!flags.contains(PullFlags::FORCE_COPY));
         assert!(PullFlags::empty().contains(PullFlags::NONE));
+    }
+
+    /// Returns the checksum with each byte `byte`.
+    fn csum(byte: u8) -> Checksum {
+        Checksum::from_bytes([byte; 32])
+    }
+
+    /// A dependency that two commits name is recorded once, with the commit
+    /// and the entry name of the first. Each commit with a dependency is
+    /// recorded, and a commit with an empty field 2 is not.
+    #[test]
+    fn chain_dependencies_keep_the_first_naming_commit() {
+        let mut deps = ChainDependencies::default();
+        deps.record(csum(1), vec![("boot/uki".into(), csum(3))]);
+        deps.record(
+            csum(2),
+            vec![("lib/uki".into(), csum(3)), ("lib/c".into(), csum(4))],
+        );
+        deps.record(csum(5), Vec::new());
+        assert_eq!(
+            deps.named,
+            [
+                (csum(3), csum(1), "boot/uki".to_owned()),
+                (csum(4), csum(2), "lib/c".to_owned()),
+            ]
+        );
+        assert_eq!(deps.known, HashSet::from([csum(3), csum(4)]));
+        assert_eq!(deps.with_dependencies, HashSet::from([csum(1), csum(2)]));
     }
 }

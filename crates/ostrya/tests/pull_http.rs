@@ -29,8 +29,8 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use common::{
-    TmpDir, file_inventory, ostree_available, ostree_supports_ed25519, store_with_field2,
-    wait_for_commit_under_guard, within, writer_child_main, writer_child_with,
+    TmpDir, dependency_error, file_inventory, ostree_available, ostree_supports_ed25519,
+    store_with_field2, wait_for_commit_under_guard, within, writer_child_main, writer_child_with,
 };
 use futures_lite::future::poll_once;
 use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
@@ -43,9 +43,8 @@ use ostrya::verify::{PullTrust, TrustedKeys};
 use ostrya::{
     AdvertisedDelta, ArchiveAnswer, ArchiveView, Checksum, CommitModifierFlags, CommitState,
     CreateOptions, DeltaEndianness, DeltaOptions, DeltaSuperblock, Ed25519Signer, Error,
-    FsckOptions, ObjectType, PullFlags, PullOptions, PullStats, PullVerify, RelatedField, Repo,
-    RepoMode, Signer, SummaryOptions, TimestampCheck, TreeEntry, Type, Value,
-    static_delta_relative_dir,
+    FsckOptions, ObjectType, PullFlags, PullOptions, PullStats, PullVerify, Repo, RepoMode, Signer,
+    SummaryOptions, TimestampCheck, TreeEntry, Type, Value, static_delta_relative_dir,
 };
 use ostrya_rt::{TcpListener, block_on, spawn};
 use proxy::{TestProxy, Tunnel};
@@ -9207,19 +9206,6 @@ async fn assert_left_nothing(dest: &Repo) {
     assert!(dest.list_refs(None).await.unwrap().is_empty());
     assert!(dest.list_remote_refs().await.unwrap().is_empty());
     assert_eq!(file_inventory(dest.path(), "state"), Vec::new());
-}
-
-/// Returns the commit and the reason of an [`Error::InvalidRelated`] for
-/// field 2.
-fn dependency_error(err: Error) -> (Option<Checksum>, String) {
-    match err {
-        Error::InvalidRelated {
-            commit,
-            field: RelatedField::Dependencies,
-            reason,
-        } => (commit, reason),
-        other => panic!("expected InvalidRelated in field 2, got {other:?}"),
-    }
 }
 
 /// A pull fetches the dependency that field 2 of the pulled commit names,

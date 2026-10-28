@@ -3062,6 +3062,47 @@ the pull wrote.
 The pull of the `ostree` command fetches no dependency
 (`conformance/cli-behavior.md`, "Related commits in a pull").
 
+### Dependencies in a local pull
+
+A local pull follows the dependencies of each commit that it walks: each
+target and each parent that the depth of the pull takes, also a commit that
+the repository holds complete. It also follows the dependencies of each
+intermediate commit of a chain of static deltas. Discovery reads field 2 of
+such a commit from the superblock of its step. These rules apply to a pull of
+refs and to a pull of collection refs:
+
+- The pull imports each dependency at depth 0, so a dependency entry adds no
+  parent to the pull. The pull imports a dependency one time, also if
+  several commits name it.
+- The pull writes no ref for a dependency.
+- The signature policy of the pull applies to each dependency. The pull makes
+  no ref-binding check on a dependency.
+- The pull reads the commit object of a dependency from the source, then
+  from each localcache repository, then from the repository. It reads no
+  commit object of a dependency that a chain of static deltas makes.
+- For a dependency that the repository holds complete, the pull checks the
+  signatures and walks no tree. A dependency that the repository holds
+  partial gets the walk of its whole tree, and the pull removes its
+  `.commitpartial` marker.
+- A dependency entry adds no static delta to the pull, also if the pull
+  requires static deltas. The pull imports the objects of a dependency loose,
+  unless a chain of static deltas of the pull makes that commit.
+- The pull does not follow a build source.
+- A commit-only pull imports no dependency.
+
+The pull checks the format of field 2 of each commit that it walks, and of
+each commit of a chain of static deltas. A commit-only pull checks it too. A
+defective related value in field 2 fails the pull: an entry with an empty
+name, an entry with a checksum that is not 32 bytes, and an entry that names
+a nested dependency. A dependency that neither a source nor the repository
+holds fails the pull too. This is also true for a parent that the source does
+not hold, if a commit of the pull names it as a dependency. The pull finds
+each of these failures before its transaction opens, so it writes no object,
+no ref, and no `.commitpartial` marker.
+
+The `pull-local` command of `ostree` imports no dependency
+(`conformance/cli-behavior.md`, "Related commits in a pull").
+
 ## Ref patterns
 
 The port selects refs by name with two grammars. A pattern of a client group

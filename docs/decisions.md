@@ -2106,6 +2106,19 @@ the rules.
   `ostrya remote prune` writes each one to standard error. A bucket prune
   that also reads the `.commitmeta` of each commit that it reaches was
   rejected: it sends one more `GET` for each such commit.
+- A pull from a remote follows the dependencies of each commit that it
+  reads, the parents that its depth takes included. Field 2 is in the
+  signed commit, so the pull is complete with no option, and the signature
+  policy of the pull applies to each dependency. The pull fetches each
+  dependency at depth 0, with no parent: a dependency is a runtime need of
+  the commit, and its history is not. A prune of the destination accepts
+  the missing parents, as after a pull with a small depth. A dependency
+  gets no ref. A commit-only pull and a pull with subpaths fetch no
+  dependency. A dependency that neither the repository, a localcache
+  repository, nor the remote holds fails the pull, and the pull moves no
+  ref. A pull that follows each dependency at the depth of the pull was
+  rejected: it fetches the history of each dependency, which no commit
+  needs.
 - No transfer follows a build source. A pull, a push, and the one-way stream
   move `ostrya.related` as any other detached metadata key, under the switch
   of the destination, and fetch no commit that it names. A build cache needs the refs of its sources, and not

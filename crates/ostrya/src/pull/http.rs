@@ -43,7 +43,7 @@ use crate::fetch::{FetchRequest, Fetched, Fetcher, Priority};
 use crate::inflate::BufSource;
 use crate::object::{MAX_FILE_HEADER_SIZE, MAX_METADATA_SIZE};
 use crate::read::CommitState;
-use crate::related::RelatedRule;
+use crate::related::{self, RelatedRule};
 use crate::remote::{Endpoint, PullSession, StreamSessionOptions};
 use crate::repo::Repo;
 use crate::summary::{SUMMARY_FILE, SUMMARY_SIG_FILE, Summary, put_root_file_blocking};
@@ -222,6 +222,48 @@ impl Repo {
     /// The pull queues no object of the tree of a commit that this repository
     /// holds complete. It follows the parent of that commit all the same, so a
     /// pull extends the history that a shallower pull left.
+    ///
+    /// # Dependencies
+    ///
+    /// Field 2 of a commit names the dependencies of the commit.
+    /// [`read_commit_related`](Repo::read_commit_related) reads them. The pull
+    /// follows the dependencies of each commit that it reads: each target, and
+    /// each parent that [`depth`](PullOptions::depth) takes. It also follows
+    /// the dependencies of a commit that this repository holds complete.
+    ///
+    /// - The pull fetches each dependency at depth 0, so a dependency entry
+    ///   adds no parent to the pull. The pull fetches a dependency one time,
+    ///   also if several commits name it.
+    /// - The pull writes no ref for a dependency.
+    /// - The signature policy of the pull applies to each dependency. The
+    ///   pull makes no ref-binding check, no collection-binding check, and no
+    ///   timestamp check on a dependency.
+    /// - A dependency is a commit of the pull for each other rule. A
+    ///   localcache repository can supply it. For a dependency that this
+    ///   repository holds complete, the pull requests the `.commitmeta` and
+    ///   checks the signatures, and fetches no object of its tree. A
+    ///   dependency that this repository holds partial gets its whole tree.
+    /// - A dependency entry adds no static delta to the pull, also under
+    ///   [`require_static_deltas`](PullOptions::require_static_deltas). The
+    ///   pull fetches the objects of a dependency loose, unless a static delta
+    ///   of the pull delivers that commit.
+    /// - The pull does not follow a build source: a commit that the detached
+    ///   metadata key `ostrya.related` names.
+    ///
+    /// A [`COMMIT_ONLY`](PullFlags::COMMIT_ONLY) pull and a pull with
+    /// [`subpaths`](PullOptions::subpaths) fetch no dependency. They check the
+    /// format of the entries of field 2 of each commit that they read all the
+    /// same.
+    ///
+    /// These cases fail the pull, and the pull writes no object and no ref:
+    ///
+    /// - An entry of field 2 has an empty name or a checksum that is not 32
+    ///   bytes.
+    /// - A dependency names dependencies of its own: its own field 2 is not
+    ///   empty.
+    /// - Neither this repository, a localcache repository, nor the remote
+    ///   holds a dependency. This is also true for a parent that none of them
+    ///   holds, if a commit of the pull names that parent as a dependency.
     ///
     /// # Detached metadata
     ///
@@ -550,14 +592,18 @@ impl Repo {
     ///
     /// These errors stop the pull while it fetches:
     ///
-    /// - [`Error::Signature`] if the policy refuses a commit or a static delta.
+    /// - [`Error::Signature`] if the policy refuses a commit, a dependency, or
+    ///   a static delta.
+    /// - [`Error::InvalidRelated`] if an entry of field 2 of a commit has an
+    ///   empty name or a checksum that is not 32 bytes, or if a dependency
+    ///   names dependencies of its own.
     /// - [`Error::Pull`] if the `ostree.ref-binding` of a commit does not list
     ///   the ref.
     /// - [`Error::Pull`] if a tip is older than the
     ///   [`timestamp_check`](PullOptions::timestamp_check) allows, or if a
     ///   content object fails a mode check.
     /// - [`Error::ObjectNotFound`] if the remote does not hold a requested
-    ///   commit or an object of a tree.
+    ///   commit, a dependency, or an object of a tree.
     /// - [`Error::ChecksumMismatch`] if a fetched object does not hash to its
     ///   name, or a superblock does not hash to its advertised digest.
     /// - [`Error::Core`] if a fetched commit or the header of a content object
@@ -645,8 +691,8 @@ impl Repo {
     /// checks a signature against. The pull obeys the rules of
     /// [`pull`](Repo::pull) that do not come from the config of a remote: the
     /// transaction, the commit walk, [`depth`](PullOptions::depth), the
-    /// subpaths, the verification of signatures, the static deltas, and the
-    /// statistics.
+    /// dependencies, the subpaths, the verification of signatures, the static
+    /// deltas, and the statistics.
     ///
     /// The pull reads no remote section and no trust group of the config of
     /// this repository. It reads the `[core]` keys that each transaction
@@ -1101,7 +1147,10 @@ impl Repo {
             )
             .await?;
             drop(jobs);
+            // The run fetched each dependency that the commits of the level
+            // name, so the transaction holds them complete too.
             done.extend(level.iter().copied());
+            done.extend(carry.dependencies.named.keys().copied());
         }
         let jobs = deltas.target_jobs(self, &delta_source).await?;
         // The refs of each requested tip. The binding check and the timestamp
@@ -1310,6 +1359,9 @@ impl Repo {
         carry: &mut Carry,
         marked: &mut Vec<Checksum>,
     ) -> Result<()> {
+        // A commit-only pull and a pull with subpaths take part of each commit.
+        // They fetch no composefs image and follow no dependency.
+        let whole = !opts.flags.contains(PullFlags::COMMIT_ONLY) && opts.subpaths.is_empty();
         let ctx = StepCtx {
             txn,
             source,
@@ -1324,12 +1376,15 @@ impl Repo {
             delta_plan,
             verification,
             related: RelatedRule::of(self.config())?,
-            images: !opts.flags.contains(PullFlags::COMMIT_ONLY) && opts.subpaths.is_empty(),
+            images: whole,
+            dependencies: whole,
+            marking: Mutex::new(Vec::new()),
             progress,
         };
         let mut plan = Plan::new(phase.subpaths);
         plan.queued = std::mem::take(&mut carry.queued);
         plan.images = std::mem::take(&mut carry.images);
+        plan.dependencies = std::mem::take(&mut carry.dependencies);
         for root in phase.roots {
             plan.push_commit(CommitItem {
                 checksum: *root,
@@ -1351,29 +1406,47 @@ impl Repo {
         // The units of work given to a slot by this pull, for the progress
         // total.
         let mut started = carry.started;
-        loop {
-            // The composefs images wait for the last run, and in that run for
-            // the end of each other step.
-            while slots.has_room()
-                && let Some(item) = plan
-                    .next()
-                    .or_else(|| phase.last.then(|| plan.next_image(slots.len())).flatten())
-            {
-                let buffer = buffers.pop().unwrap_or_default();
-                slots.push(self.step(&ctx, item, buffer));
-                started += 1;
+        let earlier = marked.len();
+        let ran = async {
+            loop {
+                // The composefs images wait for the last run, and in that run
+                // for the end of each other step.
+                while slots.has_room()
+                    && let Some(item) = plan
+                        .next()
+                        .or_else(|| phase.last.then(|| plan.next_image(slots.len())).flatten())
+                {
+                    let buffer = buffers.pop().unwrap_or_default();
+                    slots.push(self.step(&ctx, item, buffer));
+                    started += 1;
+                }
+                plan.report(progress, started, !phase.last);
+                let Some(outcome) = slots.next_ready().await else {
+                    return Ok(());
+                };
+                let (step, buffer) = outcome?;
+                buffers.push(buffer);
+                progress.object_done();
+                plan.apply(step, marked)?;
             }
-            plan.report(progress, started, !phase.last);
-            let Some(outcome) = slots.next_ready().await else {
-                break;
-            };
-            let (step, buffer) = outcome?;
-            buffers.push(buffer);
-            progress.object_done();
-            plan.apply(step, marked);
+        }
+        .await;
+        if let Err(e) = ran {
+            // The steps that are still in flight end here. `marked` then
+            // takes each marker that this run wrote, whether or not its step
+            // reached the plan.
+            drop(slots);
+            let marking = ctx
+                .marking
+                .into_inner()
+                .unwrap_or_else(PoisonError::into_inner);
+            marked.truncate(earlier);
+            marked.extend(marking);
+            return Err(e);
         }
         carry.queued = plan.queued;
         carry.images = plan.images;
+        carry.dependencies = plan.dependencies;
         carry.started = started;
         Ok(())
     }
@@ -1508,8 +1581,9 @@ impl Repo {
                 // A parent that the remote does not hold ends that chain, as a
                 // source with truncated history does for a local pull. The pull
                 // drops its detached metadata: this repository holds no commit
-                // for it.
-                (_, None) if item.optional => return Ok(Step::Done),
+                // for it. The plan fails the pull if a commit names the parent
+                // as a dependency.
+                (_, None) if item.optional => return Ok(Step::Absent(checksum)),
                 (_, None) => {
                     return Err(Error::ObjectNotFound {
                         checksum,
@@ -1520,9 +1594,19 @@ impl Repo {
         };
 
         // A commit object can be as large as `MAX_METADATA_SIZE`, so the parse
-        // runs on the blocking pool.
+        // and the format check of field 2 run on the blocking pool. The check
+        // takes the entries out of the parse. The format of field 2 is checked
+        // for each commit that the pull reads, also for a pull that follows no
+        // dependency. A defective entry fails the pull after the checks of the
+        // signatures and of the refs, and before the marker and the staging of
+        // the commit.
         let shared = Arc::clone(&bytes);
-        let commit = ostrya_rt::unblock(move || Commit::parse(&shared)).await?;
+        let (commit, dependencies) = ostrya_rt::unblock(move || {
+            let mut commit = Commit::parse(&shared)?;
+            let related = std::mem::take(&mut commit.related);
+            Ok::<_, Error>((commit, related::checked_dependencies(&checksum, related)))
+        })
+        .await?;
         // The signature verification runs before the pull stages the commit
         // and requests its tree, so a commit that the policy refuses costs no
         // fetch of its own objects. Discovery checked each commit of a chain
@@ -1556,6 +1640,7 @@ impl Repo {
             self.check_tips(ctx, &checksum, &commit).await?;
             detached
         };
+        let dependencies = dependencies?;
         // The checks are the last readers of these bytes. A write keeps its
         // own reference in `staging`, so the other stagings drop the bytes
         // here.
@@ -1564,6 +1649,10 @@ impl Repo {
         // The pull writes no partial marker for a commit that this repository
         // holds complete: a pull that fails elsewhere must not demote it.
         if !complete {
+            ctx.marking
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .push(checksum);
             self.write_partial_marker(&checksum).await?;
         }
         // The pull stages the commit here, after its marker and before its
@@ -1649,6 +1738,11 @@ impl Repo {
             checksum,
             next,
             parent: commit.parent,
+            dependencies: if ctx.dependencies {
+                dependencies
+            } else {
+                Vec::new()
+            },
             marked: !complete,
             image,
         }))
@@ -1682,16 +1776,26 @@ impl Repo {
     /// on the blocking pool. It then makes the checks of each requested ref
     /// that names the commit, unless discovery made them. It checks no
     /// signature, requests nothing, and stages nothing. The plan follows the
-    /// parent of the commit under `depth`.
+    /// parent of the commit under `depth`, and its dependencies.
     async fn done_commit(&self, ctx: &StepCtx<'_>, checksum: Checksum) -> Result<Step> {
-        let commit = ctx.txn.load_commit_staged_first(&checksum).await?;
+        let mut commit = ctx.txn.load_commit_staged_first(&checksum).await?;
         if !ctx.delta_plan.checked(&checksum) {
             self.check_tips(ctx, &checksum, &commit).await?;
         }
+        // Field 2 can hold many entries, so the check runs on the blocking
+        // pool.
+        let related = std::mem::take(&mut commit.related);
+        let dependencies =
+            ostrya_rt::unblock(move || related::checked_dependencies(&checksum, related)).await?;
         Ok(Step::Commit(CommitOutcome {
             checksum,
             next: CommitNext::Nothing,
             parent: commit.parent,
+            dependencies: if ctx.dependencies {
+                dependencies
+            } else {
+                Vec::new()
+            },
             marked: false,
             image: CommitImage::None,
         }))
@@ -2246,6 +2350,14 @@ struct StepCtx<'a> {
     /// `true` if the pull fetches the composefs image of each commit that
     /// carries the key: a pull that is not commit-only and has no subpath.
     images: bool,
+    /// `true` if the pull follows the dependencies of each commit that it
+    /// reads: a pull that is not commit-only and has no subpath.
+    dependencies: bool,
+    /// The commits whose `.commitpartial` marker a step of this run writes. A
+    /// step adds the commit before it writes the marker. So a failed run
+    /// hands each marker that it wrote to the cleanup, also the marker of a
+    /// step that failed or that the run dropped in flight.
+    marking: Mutex<Vec<Checksum>>,
     /// The live counters of the pull.
     progress: &'a PullCounters,
 }
@@ -2279,6 +2391,9 @@ struct Carry {
     images: Images,
     /// The units of work that the runs gave to a slot, for the progress total.
     started: usize,
+    /// The dependencies that the runs followed, so that the checks of a
+    /// dependency span all runs.
+    dependencies: Dependencies,
 }
 
 /// One commit to fetch.
@@ -2287,7 +2402,10 @@ struct CommitItem {
     /// The number of parents to follow from here, `-1` for all of them.
     depth: i32,
     /// `true` if a remote that does not hold this commit ends the chain, and
-    /// the pull goes on. A parent under `depth` has this value.
+    /// the pull goes on. A parent under `depth` has this value. A dependency
+    /// has the value `false`. If the plan reached a commit as a parent first,
+    /// the item keeps the value `true`, and the plan fails the pull if the
+    /// remote does not hold a commit that a dependency entry names.
     optional: bool,
 }
 
@@ -2318,9 +2436,11 @@ enum Step {
     Part(Checksum),
     /// The step of a composefs image ended, with the answer of the remote.
     Image(ImageAnswer),
-    /// Nothing follows: a dirmeta or content object is stored, or a parent
-    /// that the remote does not hold ended its chain.
+    /// Nothing follows: a dirmeta or content object is stored.
     Done,
+    /// A parent that the remote does not hold ended its chain. The value is
+    /// the commit of the parent.
+    Absent(Checksum),
 }
 
 /// What a commit adds to the plan.
@@ -2330,6 +2450,9 @@ struct CommitOutcome {
     next: CommitNext,
     /// The parent to follow under `depth`.
     parent: Option<Checksum>,
+    /// The name and the checksum of each dependency to follow, in the order
+    /// of field 2. The list is empty if the pull follows no dependency.
+    dependencies: Vec<(String, Checksum)>,
     /// `true` if this pull wrote the `.commitpartial` marker of the commit.
     marked: bool,
     /// The composefs image of the commit that the pull fetches, after the
@@ -2438,6 +2561,26 @@ struct Plan {
     /// commit again, with more depth, resumes at the parent and does not fetch
     /// the commit again.
     parents: HashMap<Checksum, Option<Checksum>>,
+    /// The dependencies that the plan followed, and the commits that it
+    /// checks them against.
+    dependencies: Dependencies,
+}
+
+/// The state of the checks of the dependencies of one pull.
+///
+/// The checks do not depend on the order in which the steps end. A commit
+/// that is a dependency and names dependencies of its own fails the pull,
+/// whichever of the two facts the plan learns first. The same holds for a
+/// dependency that is also a parent that the remote does not hold.
+#[derive(Default)]
+struct Dependencies {
+    /// The commit that first named each dependency, and the name of its
+    /// entry.
+    named: HashMap<Checksum, (Checksum, String)>,
+    /// The commits whose field 2 is not empty.
+    with_dependencies: HashSet<Checksum>,
+    /// The parents that the remote does not hold.
+    absent: HashSet<Checksum>,
 }
 
 /// A dirtree walked under a scope smaller than the whole tree.
@@ -2692,14 +2835,21 @@ impl Plan {
     }
 
     /// Adds the outcome of one step to the plan.
-    fn apply(&mut self, step: Step, marked: &mut Vec<Checksum>) {
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`apply_commit`](Plan::apply_commit) and of
+    /// [`apply_absent`](Plan::apply_absent).
+    fn apply(&mut self, step: Step, marked: &mut Vec<Checksum>) -> Result<()> {
         match step {
-            Step::Commit(outcome) => self.apply_commit(outcome, marked),
+            Step::Commit(outcome) => return self.apply_commit(outcome, marked),
             Step::DirTree(checksum, dirtree) => self.apply_dirtree(checksum, &dirtree),
             Step::Part(commit) => self.apply_part(commit),
             Step::Image(answer) => self.images.apply(answer),
+            Step::Absent(commit) => return self.apply_absent(commit),
             Step::Done => {}
         }
+        Ok(())
     }
 
     /// Records an applied delta part. After the last part of the delta, queues
@@ -2722,8 +2872,19 @@ impl Plan {
         }
     }
 
-    /// Records a commit and queues what it needs.
-    fn apply_commit(&mut self, outcome: CommitOutcome, marked: &mut Vec<Checksum>) {
+    /// Records a commit and queues what it needs: its objects, its composefs
+    /// image, its parent under `depth`, and each of its dependencies.
+    ///
+    /// The plan queues a dependency at depth 0, so it follows no parent of
+    /// the dependency. The marker of the commit goes into `marked` first, so
+    /// the caller clears it if the call fails.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidRelated`] if a dependency names dependencies of its
+    ///   own. The error names the commit that names the dependency.
+    /// - [`Error::ObjectNotFound`] if the remote does not hold a dependency.
+    fn apply_commit(&mut self, outcome: CommitOutcome, marked: &mut Vec<Checksum>) -> Result<()> {
         if outcome.marked {
             marked.push(outcome.checksum);
         }
@@ -2775,6 +2936,64 @@ impl Plan {
                 optional: true,
             });
         }
+        self.apply_dependencies(outcome.checksum, outcome.dependencies)
+    }
+
+    /// Records the dependencies of `commit` and queues each one.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`apply_commit`](Plan::apply_commit).
+    fn apply_dependencies(
+        &mut self,
+        commit: Checksum,
+        dependencies: Vec<(String, Checksum)>,
+    ) -> Result<()> {
+        if dependencies.is_empty() {
+            return Ok(());
+        }
+        if let Some((naming, name)) = self.dependencies.named.get(&commit) {
+            return Err(related::nested_dependency(*naming, name, &commit));
+        }
+        self.dependencies.with_dependencies.insert(commit);
+        for (name, dependency) in dependencies {
+            if self.dependencies.with_dependencies.contains(&dependency) {
+                return Err(related::nested_dependency(commit, &name, &dependency));
+            }
+            if self.dependencies.absent.contains(&dependency) {
+                return Err(Error::ObjectNotFound {
+                    checksum: dependency,
+                    ty: ObjectType::Commit,
+                });
+            }
+            self.dependencies
+                .named
+                .entry(dependency)
+                .or_insert((commit, name));
+            self.push_commit(CommitItem {
+                checksum: dependency,
+                depth: 0,
+                optional: false,
+            });
+        }
+        Ok(())
+    }
+
+    /// Records a parent that the remote does not hold.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ObjectNotFound`] if a commit of this pull names the parent as
+    /// a dependency.
+    fn apply_absent(&mut self, commit: Checksum) -> Result<()> {
+        if self.dependencies.named.contains_key(&commit) {
+            return Err(Error::ObjectNotFound {
+                checksum: commit,
+                ty: ObjectType::Commit,
+            });
+        }
+        self.dependencies.absent.insert(commit);
+        Ok(())
     }
 }
 
@@ -3676,6 +3895,7 @@ mod tests {
             checksum,
             next: CommitNext::Scan(tree),
             parent,
+            dependencies: Vec::new(),
             marked: true,
             image: CommitImage::None,
         })
@@ -3696,6 +3916,7 @@ mod tests {
             checksum,
             next: CommitNext::Nothing,
             parent: None,
+            dependencies: Vec::new(),
             marked: false,
             image: CommitImage::Held,
         })
@@ -3730,6 +3951,7 @@ mod tests {
                 tree,
             },
             parent: None,
+            dependencies: Vec::new(),
             marked: true,
             image: CommitImage::None,
         })
@@ -3747,7 +3969,7 @@ mod tests {
                 Item::Part(part) => Step::Part(part.commit),
                 Item::Commit(_) => panic!("the test queues no further commits"),
             };
-            plan.apply(step, marked);
+            plan.apply(step, marked).unwrap();
         }
     }
 
@@ -3773,7 +3995,8 @@ mod tests {
                 None,
             ),
             &mut marked,
-        );
+        )
+        .unwrap();
         assert_eq!(plan.scan.len(), 2);
         drain(&mut plan, &mut marked);
         assert!(plan.next().is_none());
@@ -3788,11 +4011,13 @@ mod tests {
         let mut marked = Vec::new();
         let shared = object(9, ObjectType::DirMeta);
         for byte in [1u8, 2] {
-            plan.apply(fetched(csum(byte), vec![shared], None), &mut marked);
+            plan.apply(fetched(csum(byte), vec![shared], None), &mut marked)
+                .unwrap();
         }
         assert_eq!(plan.scan.len(), 1);
         drain(&mut plan, &mut marked);
-        plan.apply(fetched(csum(3), vec![shared], None), &mut marked);
+        plan.apply(fetched(csum(3), vec![shared], None), &mut marked)
+            .unwrap();
         assert!(plan.next().is_none());
     }
 
@@ -3810,7 +4035,8 @@ mod tests {
         plan.push_commit(tip);
         assert!(matches!(plan.next(), Some(Item::Commit(_))));
         // Its parent is recorded, but depth 0 followed none of it.
-        plan.apply(fetched(csum(1), Vec::new(), Some(csum(2))), &mut marked);
+        plan.apply(fetched(csum(1), Vec::new(), Some(csum(2))), &mut marked)
+            .unwrap();
         assert!(plan.next().is_none());
 
         // A second ref reaches the same commit with one parent to follow.
@@ -3845,7 +4071,8 @@ mod tests {
                 None,
             ),
             &mut marked,
-        );
+        )
+        .unwrap();
         plan.push_commit(CommitItem {
             checksum: csum(5),
             depth: 0,
@@ -3879,12 +4106,14 @@ mod tests {
                 CommitImage::New,
             ),
             &mut marked,
-        );
+        )
+        .unwrap();
         plan.apply(
             fetched(csum(5), vec![object(6, ObjectType::File)], None),
             &mut marked,
-        );
-        plan.apply(held(csum(7)), &mut marked);
+        )
+        .unwrap();
+        plan.apply(held(csum(7)), &mut marked).unwrap();
         let mut drained = Vec::new();
         while let Some(item) = take(&mut plan, 0) {
             let Item::Object(name) = item else {
@@ -3892,7 +4121,8 @@ mod tests {
             };
             drained.push(name);
             if name.ty == ObjectType::ComposefsImage {
-                plan.apply(Step::Image(ImageAnswer::Served), &mut marked);
+                plan.apply(Step::Image(ImageAnswer::Served), &mut marked)
+                    .unwrap();
             }
         }
         assert_eq!(
@@ -3920,7 +4150,8 @@ mod tests {
                 CommitImage::New,
             ),
             &mut marked,
-        );
+        )
+        .unwrap();
         let Some(Item::Object(tree)) = take(&mut plan, 0) else {
             panic!("the plan gave no dirtree");
         };
@@ -3932,14 +4163,15 @@ mod tests {
             files: vec![("f".to_owned(), csum(4))],
             dirs: Vec::new(),
         };
-        plan.apply(Step::DirTree(tree.checksum, dirtree), &mut marked);
+        plan.apply(Step::DirTree(tree.checksum, dirtree), &mut marked)
+            .unwrap();
         let Some(Item::Object(file)) = take(&mut plan, 0) else {
             panic!("the plan gave no content");
         };
         assert_eq!(file, object(4, ObjectType::File));
         assert!(take(&mut plan, 1).is_none());
 
-        plan.apply(Step::Done, &mut marked);
+        plan.apply(Step::Done, &mut marked).unwrap();
         assert_eq!(
             image_of(take(&mut plan, 0)),
             object(1, ObjectType::ComposefsImage)
@@ -3957,17 +4189,18 @@ mod tests {
         plan.apply(
             with_image(by_delta(csum(1), 1, Vec::new(), tree), CommitImage::New),
             &mut marked,
-        );
+        )
+        .unwrap();
         assert!(matches!(take(&mut plan, 0), Some(Item::Part(_))));
         assert!(take(&mut plan, 1).is_none());
 
-        plan.apply(Step::Part(csum(1)), &mut marked);
+        plan.apply(Step::Part(csum(1)), &mut marked).unwrap();
         let Some(Item::Object(name)) = take(&mut plan, 0) else {
             panic!("the plan gave no tree object");
         };
         assert_eq!(name, object(2, ObjectType::DirMeta));
         assert!(take(&mut plan, 1).is_none());
-        plan.apply(Step::Done, &mut marked);
+        plan.apply(Step::Done, &mut marked).unwrap();
         assert_eq!(
             image_of(take(&mut plan, 0)),
             object(1, ObjectType::ComposefsImage)
@@ -3982,30 +4215,35 @@ mod tests {
         let mut plan = Plan::default();
         let mut marked = Vec::new();
         for byte in [1, 2, 3] {
-            plan.apply(held(csum(byte)), &mut marked);
+            plan.apply(held(csum(byte)), &mut marked).unwrap();
         }
         plan.apply(
             with_image(fetched(csum(9), Vec::new(), None), CommitImage::New),
             &mut marked,
-        );
+        )
+        .unwrap();
         plan.apply(
             with_image(fetched(csum(8), Vec::new(), None), CommitImage::New),
             &mut marked,
-        );
+        )
+        .unwrap();
         // The images of the new commits go out together, and the held images
         // wait for their answers.
         let first = image_of(take(&mut plan, 0));
         let second = image_of(take(&mut plan, 1));
         assert_eq!([first.checksum, second.checksum], [csum(9), csum(8)]);
         assert!(take(&mut plan, 2).is_none());
-        plan.apply(Step::Image(ImageAnswer::NotAsked), &mut marked);
+        plan.apply(Step::Image(ImageAnswer::NotAsked), &mut marked)
+            .unwrap();
         assert!(take(&mut plan, 1).is_none());
-        plan.apply(Step::Image(ImageAnswer::NotAsked), &mut marked);
+        plan.apply(Step::Image(ImageAnswer::NotAsked), &mut marked)
+            .unwrap();
 
         // No answer yet: one held image probes the remote.
         assert_eq!(image_of(take(&mut plan, 0)).checksum, csum(1));
         assert!(take(&mut plan, 1).is_none());
-        plan.apply(Step::Image(ImageAnswer::Absent), &mut marked);
+        plan.apply(Step::Image(ImageAnswer::Absent), &mut marked)
+            .unwrap();
         assert!(take(&mut plan, 0).is_none());
         assert_eq!(plan.images.len(), 0);
 
@@ -4013,7 +4251,8 @@ mod tests {
         plan.apply(
             with_image(fetched(csum(7), Vec::new(), None), CommitImage::New),
             &mut marked,
-        );
+        )
+        .unwrap();
         assert_eq!(image_of(take(&mut plan, 0)).checksum, csum(7));
     }
 
@@ -4023,11 +4262,12 @@ mod tests {
         let mut plan = Plan::default();
         let mut marked = Vec::new();
         for byte in [1, 2, 3] {
-            plan.apply(held(csum(byte)), &mut marked);
+            plan.apply(held(csum(byte)), &mut marked).unwrap();
         }
         assert_eq!(image_of(take(&mut plan, 0)).checksum, csum(1));
         assert!(take(&mut plan, 1).is_none());
-        plan.apply(Step::Image(ImageAnswer::Served), &mut marked);
+        plan.apply(Step::Image(ImageAnswer::Served), &mut marked)
+            .unwrap();
         assert_eq!(image_of(take(&mut plan, 0)).checksum, csum(2));
         assert_eq!(image_of(take(&mut plan, 1)).checksum, csum(3));
     }
@@ -4043,7 +4283,8 @@ mod tests {
             object(2, ObjectType::DirMeta),
             object(3, ObjectType::DirTree),
         ];
-        plan.apply(by_delta(csum(1), 2, vec![fallback], tree), &mut marked);
+        plan.apply(by_delta(csum(1), 2, vec![fallback], tree), &mut marked)
+            .unwrap();
 
         // The parts come before the fallback, which is content.
         assert!(matches!(plan.next(), Some(Item::Part(_))));
@@ -4055,9 +4296,9 @@ mod tests {
         // The tree is not queued while a part is outstanding.
         assert!(plan.next().is_none());
 
-        plan.apply(Step::Part(csum(1)), &mut marked);
+        plan.apply(Step::Part(csum(1)), &mut marked).unwrap();
         assert!(plan.next().is_none());
-        plan.apply(Step::Part(csum(1)), &mut marked);
+        plan.apply(Step::Part(csum(1)), &mut marked).unwrap();
         let Some(Item::Object(name)) = plan.next() else {
             panic!("the tree was not queued after the last part");
         };
@@ -4070,7 +4311,8 @@ mod tests {
     fn the_part_cap_holds_however_many_parts_a_delta_has() {
         let mut plan = Plan::default();
         let mut marked = Vec::new();
-        plan.apply(by_delta(csum(1), 5, Vec::new(), Vec::new()), &mut marked);
+        plan.apply(by_delta(csum(1), 5, Vec::new(), Vec::new()), &mut marked)
+            .unwrap();
 
         let mut in_flight = 0;
         let mut high_water = 0;
@@ -4084,7 +4326,7 @@ mod tests {
             if in_flight == 0 {
                 break;
             }
-            plan.apply(Step::Part(csum(1)), &mut marked);
+            plan.apply(Step::Part(csum(1)), &mut marked).unwrap();
             in_flight -= 1;
             applied += 1;
         }
@@ -4252,20 +4494,26 @@ mod tests {
                 None,
             ),
             &mut marked,
-        );
+        )
+        .unwrap();
         pop_dirtree(&mut plan, 1);
-        plan.apply(Step::DirTree(csum(1), root), &mut marked);
+        plan.apply(Step::DirTree(csum(1), root), &mut marked)
+            .unwrap();
         pop_dirtree(&mut plan, 10);
         pop_dirtree(&mut plan, 11);
-        plan.apply(Step::DirTree(csum(10), parent.clone()), &mut marked);
+        plan.apply(Step::DirTree(csum(10), parent.clone()), &mut marked)
+            .unwrap();
         // The walk of `x` is under `/p/x/` alone, which fetches nothing in it.
         pop_dirtree(&mut plan, 20);
-        plan.apply(Step::DirTree(csum(20), x.clone()), &mut marked);
+        plan.apply(Step::DirTree(csum(20), x.clone()), &mut marked)
+            .unwrap();
         assert!(plan.content.is_empty());
         // `/q/x` reaches it again and names it whole.
-        plan.apply(Step::DirTree(csum(11), parent), &mut marked);
+        plan.apply(Step::DirTree(csum(11), parent), &mut marked)
+            .unwrap();
         pop_dirtree(&mut plan, 20);
-        plan.apply(Step::DirTree(csum(20), x.clone()), &mut marked);
+        plan.apply(Step::DirTree(csum(20), x.clone()), &mut marked)
+            .unwrap();
         assert_eq!(
             plan.content.iter().copied().collect::<Vec<_>>(),
             [object(30, ObjectType::File)]
@@ -4289,9 +4537,160 @@ mod tests {
                 vec![object(2, ObjectType::DirMeta)],
             ),
             &mut marked,
-        );
+        )
+        .unwrap();
         assert_eq!(plan.scan.len(), 1);
         assert_eq!(plan.content.len(), 1);
         assert!(plan.parts.is_empty());
+    }
+
+    /// Returns the outcome of a fetched commit with no tree to fetch, which
+    /// names the commit `dep` of each `(name, dep)` as a dependency.
+    fn naming(checksum: Checksum, parent: Option<Checksum>, deps: &[(&str, u8)]) -> Step {
+        Step::Commit(CommitOutcome {
+            checksum,
+            next: CommitNext::Nothing,
+            parent,
+            dependencies: deps
+                .iter()
+                .map(|(name, byte)| ((*name).to_owned(), csum(*byte)))
+                .collect(),
+            marked: true,
+            image: CommitImage::None,
+        })
+    }
+
+    /// Returns the next queued commit item.
+    fn next_commit(plan: &mut Plan) -> CommitItem {
+        match plan.next() {
+            Some(Item::Commit(item)) => item,
+            _ => panic!("the plan gave no commit"),
+        }
+    }
+
+    /// Returns the commit, the field, and the reason of an
+    /// [`Error::InvalidRelated`].
+    fn invalid_related(err: Error) -> (Option<Checksum>, String) {
+        match err {
+            Error::InvalidRelated {
+                commit,
+                field: crate::related::RelatedField::Dependencies,
+                reason,
+            } => (commit, reason),
+            other => panic!("expected InvalidRelated in field 2, got {other:?}"),
+        }
+    }
+
+    /// A dependency is queued at depth 0 and is not optional, also under a
+    /// commit that the plan follows to its full depth.
+    #[test]
+    fn a_dependency_is_queued_at_depth_zero_and_not_optional() {
+        let mut plan = Plan::default();
+        let mut marked = Vec::new();
+        plan.push_commit(CommitItem {
+            checksum: csum(1),
+            depth: -1,
+            optional: false,
+        });
+        next_commit(&mut plan);
+        plan.apply(
+            naming(csum(1), Some(csum(2)), &[("boot/uki", 3)]),
+            &mut marked,
+        )
+        .unwrap();
+        let parent = next_commit(&mut plan);
+        assert_eq!((parent.checksum, parent.depth), (csum(2), -1));
+        assert!(parent.optional);
+        let dependency = next_commit(&mut plan);
+        assert_eq!((dependency.checksum, dependency.depth), (csum(3), 0));
+        assert!(!dependency.optional);
+        assert!(plan.next().is_none());
+        assert_eq!(marked, [csum(1)]);
+    }
+
+    /// A dependency that two commits name is queued once.
+    #[test]
+    fn a_dependency_two_commits_name_is_queued_once() {
+        let mut plan = Plan::default();
+        let mut marked = Vec::new();
+        plan.apply(naming(csum(1), None, &[("a/x", 3)]), &mut marked)
+            .unwrap();
+        plan.apply(naming(csum(2), None, &[("b/x", 3)]), &mut marked)
+            .unwrap();
+        assert_eq!(next_commit(&mut plan).checksum, csum(3));
+        assert!(plan.next().is_none());
+        plan.apply(naming(csum(3), None, &[]), &mut marked).unwrap();
+        plan.apply(naming(csum(4), None, &[("c/x", 3)]), &mut marked)
+            .unwrap();
+        assert!(plan.next().is_none());
+    }
+
+    /// A dependency that names dependencies of its own fails the pull, in
+    /// either order of the two steps. The error names the commit that names
+    /// the nested dependency.
+    #[test]
+    fn a_nested_dependency_fails_in_either_order() {
+        let nested = format!(
+            "dependency lib/b names commit {}, which has dependencies of its own",
+            csum(2)
+        );
+        // The commit that names the dependency comes first.
+        let mut plan = Plan::default();
+        let mut marked = Vec::new();
+        plan.apply(naming(csum(1), None, &[("lib/b", 2)]), &mut marked)
+            .unwrap();
+        let err = plan
+            .apply(naming(csum(2), None, &[("lib/c", 3)]), &mut marked)
+            .unwrap_err();
+        assert_eq!(invalid_related(err), (Some(csum(1)), nested.clone()));
+        assert_eq!(marked, [csum(1), csum(2)], "the marker is recorded first");
+
+        // The dependency comes first.
+        let mut plan = Plan::default();
+        plan.apply(naming(csum(2), None, &[("lib/c", 3)]), &mut marked)
+            .unwrap();
+        let err = plan
+            .apply(naming(csum(1), None, &[("lib/b", 2)]), &mut marked)
+            .unwrap_err();
+        assert_eq!(invalid_related(err), (Some(csum(1)), nested));
+    }
+
+    /// A parent that the remote does not hold fails the pull if a commit
+    /// names it as a dependency, in either order of the two steps.
+    #[test]
+    fn an_absent_parent_that_is_a_dependency_fails_in_either_order() {
+        let missing = |err: Error| {
+            assert!(
+                matches!(
+                    err,
+                    Error::ObjectNotFound {
+                        checksum,
+                        ty: ObjectType::Commit,
+                    } if checksum == csum(2)
+                ),
+                "{err:?}"
+            );
+        };
+        let mut marked = Vec::new();
+        // The plan learns of the dependency first.
+        let mut plan = Plan::default();
+        plan.apply(naming(csum(1), None, &[("lib/b", 2)]), &mut marked)
+            .unwrap();
+        missing(plan.apply(Step::Absent(csum(2)), &mut marked).unwrap_err());
+
+        // The plan learns of the absent parent first.
+        let mut plan = Plan::default();
+        plan.apply(Step::Absent(csum(2)), &mut marked).unwrap();
+        missing(
+            plan.apply(naming(csum(1), None, &[("lib/b", 2)]), &mut marked)
+                .unwrap_err(),
+        );
+
+        // An absent parent that no commit names ends its chain.
+        let mut plan = Plan::default();
+        plan.apply(Step::Absent(csum(2)), &mut marked).unwrap();
+        plan.apply(naming(csum(1), None, &[("lib/b", 3)]), &mut marked)
+            .unwrap();
+        assert_eq!(next_commit(&mut plan).checksum, csum(3));
     }
 }

@@ -489,6 +489,13 @@ pub enum Error {
     ///   [`Transaction::add_detached_related`](crate::Transaction::add_detached_related)
     ///   queued, for a stored `ostrya.related` value with one of these
     ///   defects. `commit` is the commit that gets the build source.
+    /// - [`Repo::pull`](crate::Repo::pull),
+    ///   [`Repo::pull_with_session`](crate::Repo::pull_with_session), and
+    ///   [`Repo::pull_collection`](crate::Repo::pull_collection), for an
+    ///   entry of field 2 with an empty name or with a checksum that is not 32
+    ///   bytes, and for a nested dependency. `commit` is the commit that holds
+    ///   the entry. For a nested dependency, it is the commit that names the
+    ///   dependency.
     ///
     /// [`Repo::prune`](crate::Repo::prune) gives a
     /// [`RelatedWarning`](crate::RelatedWarning) with the same text in place

@@ -2,9 +2,11 @@
 
 //! Tests of a pull from an `s3://` address.
 //!
-//! Each test serves a copy of the `archive` fixture of the `ostree` command
-//! with `rclone serve s3` on a scratch directory. The `ostree` command signs
-//! the summary of the copy with a new GPG key, before the server starts.
+//! Each test serves a repository with `rclone serve s3` on a scratch
+//! directory. The test of a dependency serves a repository that ostrya
+//! builds. Each other test serves a copy of the `archive` fixture of the
+//! `ostree` command. The `ostree` command signs the summary of the copy with
+//! a new GPG key, before the server starts.
 //!
 //! A pull through `Repo::pull` reads the key pair from the environment of the
 //! process. The test sets the variables only in a child process, so it needs
@@ -19,6 +21,8 @@
 #![cfg(all(feature = "s3", feature = "verify-gpg"))]
 
 mod common;
+#[path = "common/pull.rs"]
+mod pull;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -29,8 +33,11 @@ use ostrya::endpoint::EndpointOverrides;
 use ostrya::remote::s3::{Address, Credentials, Location, S3Endpoint};
 use ostrya::remote::{Endpoint, PullSession, StreamSessionOptions};
 use ostrya::verify::PullTrust;
-use ostrya::{Checksum, CreateOptions, Error, Proxy, PullOptions, Repo, RepoMode};
+use ostrya::{
+    Checksum, CommitState, CreateOptions, Error, Proxy, PullOptions, Repo, RepoMode, SummaryOptions,
+};
 use ostrya_rt::block_on;
+use pull::{FIXED_TS, build_tree, commit_tree, commit_tree_related};
 
 /// The variable that names the case of the child process.
 const CASE: &str = "OSTRYA_TEST_S3_CASE";
@@ -371,6 +378,66 @@ fn a_session_to_an_s3_endpoint_pulls_with_the_session() {
             repo.resolve_rev(REF, false).await.unwrap(),
             Some(fixture_commit())
         );
+        assert_eq!(object_names(&path), object_names(&bucket));
+    });
+}
+
+/// A pull through a session to an `Endpoint::S3` fetches the dependency that
+/// field 2 of the pulled commit names, complete, and writes no ref for it.
+#[test]
+fn a_session_to_an_s3_endpoint_fetches_a_dependency() {
+    if !rclone_available("a_session_to_an_s3_endpoint_fetches_a_dependency") {
+        return;
+    }
+    let scratch = TmpDir::new("pull-s3-dependency");
+    let root = scratch.path().join("root");
+    let bucket = root.join("bkt").join("repo");
+    std::fs::create_dir_all(bucket.parent().unwrap()).unwrap();
+    let (tip, dep) = block_on(async {
+        build_tree(&scratch.path().join("uki"), b"uki\n");
+        build_tree(&scratch.path().join("main"), b"main\n");
+        let remote = Repo::create(&bucket, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        let dep = commit_tree(&remote, scratch.path(), "uki", "dep/uki", None, FIXED_TS).await;
+        let tip = commit_tree_related(
+            &remote,
+            scratch.path(),
+            "main",
+            REF,
+            None,
+            &[("boot/uki", dep)],
+        )
+        .await;
+        remote
+            .regenerate_summary(&SummaryOptions {
+                last_modified: Some(FIXED_TS),
+                ..SummaryOptions::default()
+            })
+            .await
+            .unwrap();
+        (tip, dep)
+    });
+    let server = Rclone::start(scratch.path(), &root);
+    block_on(async {
+        let endpoint = common::s3::endpoint(&server.endpoint(), "s3://bkt/repo");
+        let session = PullSession::connect(Endpoint::S3(endpoint), StreamSessionOptions::default())
+            .await
+            .unwrap();
+        let path = scratch.path().join("dest");
+        let repo = Repo::create(&path, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        let opts = PullOptions {
+            refs: vec![REF.to_owned()],
+            ..PullOptions::default()
+        };
+        repo.pull_with_session(session, PullTrust::unverified(), opts)
+            .await
+            .unwrap();
+        assert_eq!(repo.list_refs(None).await.unwrap(), [(REF.to_owned(), tip)]);
+        assert!(repo.list_remote_refs().await.unwrap().is_empty());
+        assert_eq!(repo.commit_state(&dep).await.unwrap(), CommitState::Normal);
         assert_eq!(object_names(&path), object_names(&bucket));
     });
 }

@@ -370,7 +370,9 @@ impl Repo {
     /// no ref of the remote again. If the probe read the refs from the
     /// summary, the pull uses those bytes and does not read the summary
     /// again. The remotes pull in the order of `remotes`, each with its own
-    /// transaction. A remote with no selected ref is not asked again.
+    /// transaction. A remote with no selected ref is not asked again. The
+    /// pull fetches the dependencies of each commit from the remote of the
+    /// commit, as [`Repo::pull`] states in "Dependencies".
     ///
     /// So a failure of a later remote leaves the objects and the refs of the
     /// earlier remotes in place. A failure of a selected remote stops the
@@ -385,6 +387,8 @@ impl Repo {
     ///   with no ref binding passes, as in each other pull.
     /// - The timestamp of the commit must be the timestamp that the remote
     ///   listed for the ref.
+    ///
+    /// The pull makes none of these checks on a dependency.
     ///
     /// # Refs
     ///

@@ -3196,6 +3196,15 @@ The pull then stores the image from the part and requests no `.cfs`, a pull
 with a subpath included (`format-reference.md`, "The composefs image in a
 static delta").
 
+`pull` also fetches the dependencies that field 2 of each pulled commit
+names, each at depth 0 and with no ref, unless the pull is commit-only or has a
+subpath (`../format-reference.md`, "Dependencies in a pull from a remote"). A
+dependency that neither the repository, a localcache repository, nor the
+remote holds, a field 2 entry with an empty name or with a checksum that is
+not 32 bytes, and a nested dependency fail the pull at exit 1, and the pull
+writes no object and no ref. The tool fetches no dependency
+(`cli-behavior.md`, "Related commits in a pull").
+
 The port adds `--collection=ID`, the pull of the refs of the collection ID
 from each remote whose `collection-id` is ID (`format-reference.md`, "The
 pull of collection refs"). With it, each operand is a ref of the collection,

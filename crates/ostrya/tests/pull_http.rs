@@ -29,8 +29,8 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use common::{
-    TmpDir, file_inventory, ostree_available, ostree_supports_ed25519, wait_for_commit_under_guard,
-    within, writer_child_main, writer_child_with,
+    TmpDir, file_inventory, ostree_available, ostree_supports_ed25519, store_with_field2,
+    wait_for_commit_under_guard, within, writer_child_main, writer_child_with,
 };
 use futures_lite::future::poll_once;
 use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
@@ -43,8 +43,9 @@ use ostrya::verify::{PullTrust, TrustedKeys};
 use ostrya::{
     AdvertisedDelta, ArchiveAnswer, ArchiveView, Checksum, CommitModifierFlags, CommitState,
     CreateOptions, DeltaEndianness, DeltaOptions, DeltaSuperblock, Ed25519Signer, Error,
-    FsckOptions, PullFlags, PullOptions, PullStats, PullVerify, Repo, RepoMode, Signer,
-    SummaryOptions, TimestampCheck, TreeEntry, Type, Value, static_delta_relative_dir,
+    FsckOptions, ObjectType, PullFlags, PullOptions, PullStats, PullVerify, RelatedField, Repo,
+    RepoMode, Signer, SummaryOptions, TimestampCheck, TreeEntry, Type, Value,
+    static_delta_relative_dir,
 };
 use ostrya_rt::{TcpListener, block_on, spawn};
 use proxy::{TestProxy, Tunnel};
@@ -1889,7 +1890,8 @@ fn a_compressed_payload_passing_its_bound_fails_the_pull() {
 
 /// The remote serves a substituted commit object: the bytes of another commit,
 /// on the same ref, under the wrong name. The pull fails when it stores the
-/// commit object, before it requests the tree.
+/// commit object, before it requests the tree. The step of the commit wrote
+/// the marker before it failed, and the pull removes that marker.
 #[test]
 fn a_substituted_commit_object_fails_before_its_tree_is_fetched() {
     block_on(async {
@@ -1942,6 +1944,7 @@ fn a_substituted_commit_object_fails_before_its_tree_is_fetched() {
             .unwrap_err();
         assert!(matches!(err, Error::ChecksumMismatch { .. }), "{err}");
         assert_nothing_published(&dest).await;
+        assert_no_markers(&dir.path().join("dest"));
         let seen = server.seen();
         assert!(
             !seen.iter().any(|path| path.ends_with(".filez")),
@@ -9141,5 +9144,641 @@ fn a_session_pull_takes_its_request_limit_from_the_session() {
                 );
             }
         }
+    });
+}
+
+// --- dependencies ------------------------------------------------------------
+
+/// Regenerates the summary of `repo` with a fixed timestamp.
+async fn summarize(repo: &Repo) {
+    repo.regenerate_summary(&SummaryOptions {
+        last_modified: Some(FIXED_TS),
+        ..SummaryOptions::default()
+    })
+    .await
+    .unwrap();
+}
+
+/// Builds an archive remote under `dir/remote`, with a summary. `dep/uki`
+/// names the dependency, and `test/main` names the tip, whose field 2 names
+/// the dependency as `boot/uki`. Returns the remote, the tip, and the
+/// dependency.
+async fn build_dependency_remote(dir: &Path) -> (Repo, Checksum, Checksum) {
+    build_tree(&dir.join("uki"), b"uki\n");
+    build_tree(&dir.join("main"), b"main\n");
+    let remote = Repo::create(&dir.join("remote"), CreateOptions::new(RepoMode::Archive))
+        .await
+        .unwrap();
+    let dep = commit_tree(&remote, dir, "uki", "dep/uki", None, FIXED_TS).await;
+    let tip = commit_tree_related(
+        &remote,
+        dir,
+        "main",
+        "test/main",
+        None,
+        &[("boot/uki", dep)],
+    )
+    .await;
+    summarize(&remote).await;
+    (remote, tip, dep)
+}
+
+/// Sets the ref `name` of `repo` to `commit` and regenerates the summary.
+async fn move_ref(repo: &Repo, name: &str, commit: &Checksum) {
+    let txn = repo.transaction().await.unwrap();
+    txn.set_ref(name, Some(commit));
+    txn.commit().await.unwrap();
+    summarize(repo).await;
+}
+
+/// Returns the number of distinct content objects of `commits` in `remote`.
+async fn distinct_content(remote: &Repo, commits: &[Checksum]) -> usize {
+    let mut all = HashSet::new();
+    for commit in commits {
+        all.extend(content_checksums(remote, commit).await);
+    }
+    all.len()
+}
+
+/// Asserts that a failed pull left nothing in `dest`: no object, no local
+/// ref, no remote ref, and no file under `state/`.
+async fn assert_left_nothing(dest: &Repo) {
+    assert!(dest.list_objects().await.unwrap().is_empty());
+    assert!(dest.list_refs(None).await.unwrap().is_empty());
+    assert!(dest.list_remote_refs().await.unwrap().is_empty());
+    assert_eq!(file_inventory(dest.path(), "state"), Vec::new());
+}
+
+/// Returns the commit and the reason of an [`Error::InvalidRelated`] for
+/// field 2.
+fn dependency_error(err: Error) -> (Option<Checksum>, String) {
+    match err {
+        Error::InvalidRelated {
+            commit,
+            field: RelatedField::Dependencies,
+            reason,
+        } => (commit, reason),
+        other => panic!("expected InvalidRelated in field 2, got {other:?}"),
+    }
+}
+
+/// A pull fetches the dependency that field 2 of the pulled commit names,
+/// complete, and writes no ref for it. The content count of the pull holds
+/// the content of the dependency. A repeat pull reads the detached metadata
+/// of the tip and of the dependency again, and fetches no object.
+#[test]
+fn a_pull_fetches_the_dependency_of_the_commit() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-dependency");
+        let (remote, tip, dep) = build_dependency_remote(dir.path()).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
+
+        let stats = pull_main(&dest, PullOptions::default()).await.unwrap();
+
+        assert_complete(&remote, &dest, dest.path(), &dep).await;
+        assert_complete(&remote, &dest, dest.path(), &tip).await;
+        assert!(dest.fsck(&FsckOptions::default()).await.unwrap().is_ok());
+        assert_eq!(
+            stats.content_fetched as usize,
+            distinct_content(&remote, &[tip, dep]).await
+        );
+        assert!(dest.list_refs(None).await.unwrap().is_empty());
+        assert_eq!(
+            dest.list_remote_refs().await.unwrap(),
+            [("origin:test/main".to_owned(), tip)]
+        );
+
+        server.forget();
+        let repeated = pull_main(&dest, PullOptions::default()).await.unwrap();
+        assert_eq!(
+            (repeated.metadata_fetched, repeated.content_fetched),
+            (0, 0)
+        );
+        assert_eq!(
+            server.seen(),
+            [
+                "summary.sig".to_owned(),
+                "summary".to_owned(),
+                "config".to_owned(),
+                meta_path(&tip, "commitmeta"),
+                meta_path(&dep, "commitmeta"),
+            ]
+        );
+    });
+}
+
+/// A pull with depth follows the dependencies of each parent that it
+/// moves. At depth 0 it moves no parent, so it fetches the dependency of the
+/// tip alone.
+#[test]
+fn a_pull_with_depth_fetches_the_dependencies_of_the_parents() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-dependency-parent");
+        let base = dir.path();
+        for sub in ["d1", "d2", "p", "t"] {
+            build_tree(&base.join(sub), sub.as_bytes());
+        }
+        let remote = Repo::create(&base.join("remote"), CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        let d1 = commit_tree(&remote, base, "d1", "dep/d1", None, FIXED_TS).await;
+        let d2 = commit_tree(&remote, base, "d2", "dep/d2", None, FIXED_TS).await;
+        let parent =
+            commit_tree_related(&remote, base, "p", "test/main", None, &[("boot/d1", d1)]).await;
+        let tip = commit_tree_related(
+            &remote,
+            base,
+            "t",
+            "test/main",
+            Some(parent),
+            &[("boot/d2", d2)],
+        )
+        .await;
+        summarize(&remote).await;
+        let server = RepoServer::start(&base.join("remote"), false).await;
+
+        for depth in [0, 1] {
+            let path = base.join(format!("depth-{depth}"));
+            std::fs::create_dir(&path).unwrap();
+            let dest = build_dest(&path, RepoMode::Archive, &server.url(), "").await;
+            pull_main(
+                &dest,
+                PullOptions {
+                    depth,
+                    ..PullOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert_complete(&remote, &dest, dest.path(), &tip).await;
+            assert_complete(&remote, &dest, dest.path(), &d2).await;
+            for commit in [parent, d1] {
+                assert_eq!(
+                    dest.has_object(ObjectType::Commit, &commit).await.unwrap(),
+                    depth == 1,
+                    "depth {depth}: {commit}"
+                );
+            }
+            if depth == 1 {
+                assert_complete(&remote, &dest, dest.path(), &d1).await;
+            }
+            assert_eq!(
+                dest.list_remote_refs().await.unwrap(),
+                [("origin:test/main".to_owned(), tip)]
+            );
+        }
+    });
+}
+
+/// A dependency that two pulled commits name is fetched one time.
+#[test]
+fn a_dependency_that_two_commits_name_is_fetched_once() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-dependency-once");
+        let base = dir.path();
+        for sub in ["uki", "p", "t"] {
+            build_tree(&base.join(sub), sub.as_bytes());
+        }
+        let remote = Repo::create(&base.join("remote"), CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        let dep = commit_tree(&remote, base, "uki", "dep/uki", None, FIXED_TS).await;
+        let parent =
+            commit_tree_related(&remote, base, "p", "test/main", None, &[("boot/uki", dep)]).await;
+        commit_tree_related(
+            &remote,
+            base,
+            "t",
+            "test/main",
+            Some(parent),
+            &[("boot/uki", dep)],
+        )
+        .await;
+        summarize(&remote).await;
+        let server = RepoServer::start(&base.join("remote"), false).await;
+        let dest = build_dest(base, RepoMode::Archive, &server.url(), "").await;
+
+        pull_main(
+            &dest,
+            PullOptions {
+                depth: 1,
+                ..PullOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_complete(&remote, &dest, dest.path(), &dep).await;
+        assert_eq!(server.requests_for(&meta_path(&dep, "commit")), 1);
+        assert_eq!(server.requests_for(&meta_path(&dep, "commitmeta")), 1);
+    });
+}
+
+/// A pull fetches a dependency at depth 0, also under a pull of the whole
+/// history. The parent of the dependency stays on the remote.
+#[test]
+fn a_dependency_is_fetched_at_depth_zero() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-dependency-depth");
+        let base = dir.path();
+        for sub in ["old", "uki", "main"] {
+            build_tree(&base.join(sub), sub.as_bytes());
+        }
+        let remote = Repo::create(&base.join("remote"), CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        let old = commit_tree(&remote, base, "old", "dep/uki", None, FIXED_TS).await;
+        let dep = commit_tree(&remote, base, "uki", "dep/uki", Some(old), FIXED_TS + 1).await;
+        let tip = commit_tree_related(
+            &remote,
+            base,
+            "main",
+            "test/main",
+            None,
+            &[("boot/uki", dep)],
+        )
+        .await;
+        summarize(&remote).await;
+        let server = RepoServer::start(&base.join("remote"), false).await;
+        let dest = build_dest(base, RepoMode::Archive, &server.url(), "").await;
+
+        pull_main(
+            &dest,
+            PullOptions {
+                depth: -1,
+                ..PullOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_complete(&remote, &dest, dest.path(), &tip).await;
+        assert_complete(&remote, &dest, dest.path(), &dep).await;
+        assert!(!dest.has_object(ObjectType::Commit, &old).await.unwrap());
+        assert_eq!(server.requests_for(&meta_path(&old, "commit")), 0);
+    });
+}
+
+/// A pull does not fetch a build source: the commit that `ostrya.related`
+/// names.
+#[test]
+fn a_pull_does_not_fetch_a_build_source() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-build-source");
+        let (remote, tip, _dep) = build_dependency_remote(dir.path()).await;
+        build_tree(&dir.path().join("base"), b"base\n");
+        let source = commit_tree(&remote, dir.path(), "base", "other/base", None, FIXED_TS).await;
+        remote
+            .add_detached_related(&tip, "layer/base", &source)
+            .await
+            .unwrap();
+        summarize(&remote).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
+
+        pull_main(&dest, PullOptions::default()).await.unwrap();
+
+        assert_eq!(
+            dest.read_commit_related(&tip).await.unwrap().build_sources,
+            [("layer/base".to_owned(), source)]
+        );
+        assert!(!dest.has_object(ObjectType::Commit, &source).await.unwrap());
+        for ext in ["commit", "commitmeta"] {
+            assert_eq!(server.requests_for(&meta_path(&source, ext)), 0, "{ext}");
+        }
+    });
+}
+
+/// A commit-only pull and a pull with subpaths fetch no dependency. A later
+/// full pull fetches it.
+#[test]
+fn a_partial_pull_fetches_no_dependency() {
+    for (tag, opts) in [
+        (
+            "commit-only",
+            PullOptions {
+                flags: PullFlags::COMMIT_ONLY,
+                ..PullOptions::default()
+            },
+        ),
+        (
+            "subpaths",
+            PullOptions {
+                subpaths: vec!["/".to_owned()],
+                ..PullOptions::default()
+            },
+        ),
+    ] {
+        block_on(async {
+            let dir = TmpDir::new(&format!("pull-http-dependency-{tag}"));
+            let (remote, tip, dep) = build_dependency_remote(dir.path()).await;
+            let server = RepoServer::start(&dir.path().join("remote"), false).await;
+            let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
+
+            pull_main(&dest, opts).await.unwrap();
+            assert!(dest.has_object(ObjectType::Commit, &tip).await.unwrap());
+            assert!(!dest.has_object(ObjectType::Commit, &dep).await.unwrap());
+            for ext in ["commit", "commitmeta"] {
+                assert_eq!(server.requests_for(&meta_path(&dep, ext)), 0, "{tag} {ext}");
+            }
+
+            pull_main(&dest, PullOptions::default()).await.unwrap();
+            assert_complete(&remote, &dest, dest.path(), &tip).await;
+            assert_complete(&remote, &dest, dest.path(), &dep).await;
+        });
+    }
+}
+
+/// The signature policy of the pull applies to a dependency. A dependency
+/// with no signature from a trusted key fails the pull, and the pull leaves
+/// nothing. With a signature of the trusted key, the pull takes it.
+#[test]
+fn a_dependency_with_no_trusted_signature_fails_the_pull() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-dependency-signature");
+        let (remote, tip, dep) = build_dependency_remote(dir.path()).await;
+        let signer = Ed25519Signer::from_base64(SECRET_B64).unwrap();
+        remote.sign_commit(&tip, &signer).await.unwrap();
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = build_dest(
+            dir.path(),
+            RepoMode::Archive,
+            &server.url(),
+            &format!("sign-verify=ed25519\nverification-ed25519-key={PUBLIC_B64}\n"),
+        )
+        .await;
+
+        let err = pull_main(&dest, PullOptions::default()).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m) if m.contains(&format!("commit {dep}"))),
+            "{err}"
+        );
+        assert_left_nothing(&dest).await;
+
+        remote.sign_commit(&dep, &signer).await.unwrap();
+        pull_main(&dest, PullOptions::default()).await.unwrap();
+        assert_complete(&remote, &dest, dest.path(), &dep).await;
+    });
+}
+
+/// A dependency that the remote does not hold fails the pull with
+/// `Error::ObjectNotFound`, and the pull leaves nothing.
+#[test]
+fn a_missing_dependency_fails_the_pull() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-dependency-missing");
+        let (_remote, _tip, dep) = build_dependency_remote(dir.path()).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        server.hide(&meta_path(&dep, "commit"));
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
+
+        let err = pull_main(&dest, PullOptions::default()).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::ObjectNotFound {
+                    checksum,
+                    ty: ObjectType::Commit,
+                } if checksum == dep
+            ),
+            "{err:?}"
+        );
+        assert_left_nothing(&dest).await;
+    });
+}
+
+/// A field 2 entry with an empty name or with a checksum that is not 32
+/// bytes fails the pull with `Error::InvalidRelated`, and the pull leaves
+/// nothing.
+#[test]
+fn a_defective_dependency_entry_fails_the_pull() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-dependency-defective");
+        let (remote, tip, dep) = build_dependency_remote(dir.path()).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
+
+        let short: &[u8] = &dep.as_bytes()[..31];
+        for (entry, reason) in [
+            (
+                ("boot/uki", short),
+                "entry 0 (boot/uki) has a checksum of 31 bytes, not 32",
+            ),
+            (("", dep.as_bytes()), "entry 0 has an empty name"),
+        ] {
+            let defective = store_with_field2(&remote, &tip, &[entry]).await;
+            move_ref(&remote, "test/main", &defective).await;
+            let err = pull_main(&dest, PullOptions::default()).await.unwrap_err();
+            assert_eq!(dependency_error(err), (Some(defective), reason.to_owned()));
+            assert_left_nothing(&dest).await;
+        }
+    });
+}
+
+/// A dependency that names dependencies of its own fails the pull with
+/// `Error::InvalidRelated`, whichever of the two commits the pull reads
+/// first. The error names the commit that names the nested dependency. The
+/// pull leaves nothing.
+#[test]
+fn a_nested_dependency_fails_the_pull() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-dependency-nested");
+        let base = dir.path();
+        let (remote, tip, dep) = build_dependency_remote(base).await;
+        build_tree(&base.join("other"), b"other\n");
+        let other = commit_tree(&remote, base, "other", "test/other", None, FIXED_TS).await;
+        // `test/other` names a commit with a dependency, and `test/main` names
+        // a commit whose dependency is that commit.
+        let nested = store_with_field2(&remote, &other, &[("lib/c", dep.as_bytes())]).await;
+        let head = store_with_field2(&remote, &tip, &[("lib/b", nested.as_bytes())]).await;
+        move_ref(&remote, "test/other", &nested).await;
+        move_ref(&remote, "test/main", &head).await;
+        let server = RepoServer::start(&base.join("remote"), false).await;
+        let dest = build_dest(base, RepoMode::Archive, &server.url(), "").await;
+
+        let reason =
+            format!("dependency lib/b names commit {nested}, which has dependencies of its own");
+        for refs in [&["test/main"][..], &["test/main", "test/other"]] {
+            let err = dest
+                .pull(
+                    "origin",
+                    PullOptions {
+                        refs: refs.iter().map(|r| (*r).to_owned()).collect(),
+                        ..PullOptions::default()
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert_eq!(
+                dependency_error(err),
+                (Some(head), reason.clone()),
+                "{refs:?}"
+            );
+            assert_left_nothing(&dest).await;
+        }
+    });
+}
+
+/// A parent that the remote does not hold ends its chain. If a pulled commit
+/// names the parent as a dependency, the pull fails with
+/// `Error::ObjectNotFound`. The tip names its own parent, so the plan queues
+/// the parent first as an optional commit, and the dependency adds no item.
+#[test]
+fn an_absent_parent_that_is_a_dependency_fails_the_pull() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-dependency-absent-parent");
+        let base = dir.path();
+        for sub in ["p", "t"] {
+            build_tree(&base.join(sub), sub.as_bytes());
+        }
+        let remote = Repo::create(&base.join("remote"), CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        let parent = commit_tree(&remote, base, "p", "test/main", None, FIXED_TS).await;
+        let plain = commit_tree(&remote, base, "t", "test/main", Some(parent), FIXED_TS + 1).await;
+        let tip = store_with_field2(&remote, &plain, &[("boot/p", parent.as_bytes())]).await;
+        move_ref(&remote, "test/main", &tip).await;
+        let server = RepoServer::start(&base.join("remote"), false).await;
+        server.hide(&meta_path(&parent, "commit"));
+        let dest = build_dest(base, RepoMode::Archive, &server.url(), "").await;
+        let opts = || PullOptions {
+            depth: 1,
+            ..PullOptions::default()
+        };
+
+        let err = pull_main(&dest, opts()).await.unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::ObjectNotFound {
+                    checksum,
+                    ty: ObjectType::Commit,
+                } if checksum == parent
+            ),
+            "{err:?}"
+        );
+        assert_left_nothing(&dest).await;
+
+        // With no commit that names it, the absent parent ends its chain.
+        move_ref(&remote, "test/main", &plain).await;
+        pull_main(&dest, opts()).await.unwrap();
+        assert!(!dest.has_object(ObjectType::Commit, &parent).await.unwrap());
+    });
+}
+
+/// A pull that takes a static delta of the target fetches the dependency as
+/// loose objects. The remote serves no summary, so the pull asks for the
+/// from-scratch delta of the target by name.
+#[test]
+fn a_pull_through_a_delta_fetches_the_dependency_loose() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-dependency-delta");
+        let (remote, tip, dep) = build_dependency_remote(dir.path()).await;
+        remote
+            .generate_static_delta(
+                None,
+                &tip,
+                &DeltaOptions {
+                    timestamp: Some(FIXED_TS),
+                    ..DeltaOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+        std::fs::remove_file(dir.path().join("remote/summary")).unwrap();
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
+
+        pull_main(&dest, PullOptions::default()).await.unwrap();
+
+        let seen = server.seen();
+        assert!(
+            seen.iter().any(|path| path.ends_with("/superblock")),
+            "{seen:?}"
+        );
+        assert!(!seen.contains(&meta_path(&tip, "commit")), "{seen:?}");
+        assert!(seen.contains(&meta_path(&dep, "commit")), "{seen:?}");
+        assert_complete(&remote, &dest, dest.path(), &tip).await;
+        assert_complete(&remote, &dest, dest.path(), &dep).await;
+    });
+}
+
+/// A pull through a chain of static deltas fetches a dependency one time, if
+/// an intermediate commit and the target both name it.
+#[test]
+fn a_dependency_of_a_chain_is_fetched_once() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-dependency-chain");
+        let base = dir.path();
+        for sub in ["uki", "b", "c"] {
+            build_tree(&base.join(sub), sub.as_bytes());
+        }
+        let remote = create_remote(base).await;
+        let a = chain_commit(&remote, base, "a", "test/main", None, 0).await;
+        let dep = commit_tree(&remote, base, "uki", "dep/uki", None, FIXED_TS).await;
+        let b = commit_tree_related(
+            &remote,
+            base,
+            "b",
+            "test/main",
+            Some(a),
+            &[("boot/uki", dep)],
+        )
+        .await;
+        let c = commit_tree_related(
+            &remote,
+            base,
+            "c",
+            "test/main",
+            Some(b),
+            &[("boot/uki", dep)],
+        )
+        .await;
+        let list = vec![
+            listed(&remote, &a, &b, DeltaOptions::default()).await,
+            listed(&remote, &b, &c, DeltaOptions::default()).await,
+        ];
+        let server = RepoServer::start(remote.path(), false).await;
+        let dest = dest_holding(base, &server.url(), &a).await;
+        server.forget();
+
+        dest.pull("origin", chain_opts(list)).await.unwrap();
+
+        for (from, to) in [(a, b), (b, c)] {
+            assert_eq!(server.requests_for(&superblock_path(&from, &to)), 1);
+        }
+        assert_eq!(server.requests_for(&meta_path(&dep, "commit")), 1);
+        assert_eq!(server.requests_for(&meta_path(&dep, "commitmeta")), 1);
+        for commit in [b, c, dep] {
+            assert_complete(&remote, &dest, dest.path(), &commit).await;
+        }
+    });
+}
+
+/// A dependency that this repository holds partial is fetched whole, and the
+/// pull removes its marker.
+#[test]
+fn a_dependency_held_partial_is_completed() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-dependency-partial");
+        let (remote, _tip, dep) = build_dependency_remote(dir.path()).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
+        dest.pull(
+            "origin",
+            PullOptions {
+                refs: vec!["dep/uki".to_owned()],
+                flags: PullFlags::COMMIT_ONLY,
+                ..PullOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(dest.commit_state(&dep).await.unwrap(), CommitState::Partial);
+
+        pull_main(&dest, PullOptions::default()).await.unwrap();
+
+        assert_complete(&remote, &dest, dest.path(), &dep).await;
     });
 }

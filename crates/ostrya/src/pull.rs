@@ -269,7 +269,8 @@ impl PullFlags {
     /// The import of the commit objects alone.
     ///
     /// The pull does not walk the trees, and it keeps the `.commitpartial`
-    /// marker of each commit.
+    /// marker of each commit. A pull from a remote fetches no dependency
+    /// under this flag.
     pub const COMMIT_ONLY: PullFlags = PullFlags(1 << 1);
     /// The refusal of a regular file whose logical mode has bits outside
     /// `0775`.
@@ -620,6 +621,11 @@ pub struct PullOptions {
     /// depth separately, so the order of the refs does not change the
     /// commits. A value below `-1` is [`Error::InvalidInput`], and the pull
     /// writes no object and no ref.
+    ///
+    /// A pull from a remote fetches each dependency at depth 0, whatever this
+    /// value is. It follows the dependencies of each commit that it takes,
+    /// the parents included. [`Repo::pull`] states the rules in
+    /// "Dependencies". [`Repo::pull_local`] does not follow dependencies.
     pub depth: i32,
     /// More local repositories that supply an object that the source does not
     /// hold, in order.
@@ -663,7 +669,8 @@ pub struct PullOptions {
     /// dirtree and dirmeta, and `/` fetches nothing more.
     ///
     /// A pull with subpaths leaves each commit that it marks partial, and a
-    /// later pull without subpaths completes it. A value that does not start
+    /// later pull without subpaths completes it. A pull with subpaths fetches
+    /// no dependency. A value that does not start
     /// with `/`, the empty value included, fails the pull with
     /// [`Error::Pull`]. [`Repo::pull_local`] refuses the option with
     /// [`Error::Unsupported`].
@@ -858,7 +865,9 @@ fn apply_durability(txn: &mut Transaction, opts: &PullOptions) {
 /// The import counters and the written counters cover the objects that the
 /// pull staged. An object that the destination already held does not count.
 /// The plan of a [`COMMIT_ONLY`](PullFlags::COMMIT_ONLY) pull is the commit
-/// objects alone, so the pull reports those and no content.
+/// objects alone, so the pull reports those and no content. The objects of
+/// the dependencies that a pull from a remote fetches count as the other
+/// objects of the pull.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PullStats {
     /// The number of metadata objects that the pull imported.

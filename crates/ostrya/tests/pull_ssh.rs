@@ -37,8 +37,8 @@ use ostrya::{
 use ostrya_rt::block_on;
 use pull::{
     FIXED_TS, RepoServer, assert_list_refusal, build_remote, build_tree, commit_tree,
-    commit_tree_with, content_checksums, detached_dict, filez_path, incompressible,
-    static_delta_list_cases,
+    commit_tree_related, commit_tree_with, content_checksums, detached_dict, filez_path,
+    incompressible, static_delta_list_cases,
 };
 
 /// The capacity of each pipe.
@@ -259,6 +259,55 @@ fn the_stream_source_pulls_what_the_http_pull_pulls() {
         )
         .await;
         assert_eq!(stats.content_fetched, 1);
+    });
+}
+
+/// The stream source fetches the dependency that field 2 of the pulled commit
+/// names, as the HTTP pull does, and writes no ref for it.
+#[test]
+fn the_stream_source_fetches_a_dependency() {
+    block_on(async {
+        let dir = TmpDir::new("pull-ssh-dependency");
+        build_tree(&dir.path().join("uki"), b"uki\n");
+        build_tree(&dir.path().join("main"), b"main\n");
+        let remote_path = dir.path().join("remote");
+        let remote = Repo::create(&remote_path, CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        let dep = commit_tree(&remote, dir.path(), "uki", "dep/uki", None, FIXED_TS).await;
+        let tip = commit_tree_related(
+            &remote,
+            dir.path(),
+            "main",
+            "test/main",
+            None,
+            &[("boot/uki", dep)],
+        )
+        .await;
+        summarize(&remote).await;
+
+        pull_both(
+            dir.path(),
+            "dependency",
+            &remote_path,
+            RepoMode::Archive,
+            || main_ref(0),
+        )
+        .await;
+
+        let dest = Repo::open(&dir.path().join("dependency-ssh"))
+            .await
+            .unwrap();
+        assert!(dest.has_object(ObjectType::Commit, &dep).await.unwrap());
+        assert_eq!(
+            dest.commit_state(&dep).await.unwrap(),
+            ostrya::CommitState::Normal
+        );
+        assert!(dest.list_refs(None).await.unwrap().is_empty());
+        assert_eq!(
+            dest.list_remote_refs().await.unwrap(),
+            [("origin:test/main".to_owned(), tip)]
+        );
     });
 }
 

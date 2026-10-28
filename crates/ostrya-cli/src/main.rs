@@ -378,6 +378,10 @@ enum Command {
     /// the verify options ask for. With `[ex-ostrya]
     /// keep-detached-related=false`, the pull drops `ostrya.related`.
     ///
+    /// The pull also fetches the dependencies that field 2 of each pulled
+    /// commit names, each with no parent and no ref, unless it takes
+    /// --commit-metadata-only or --subpath.
+    ///
     /// On success, the command prints one statistics line to standard output.
     /// If standard output is a terminal, a progress line shows while the pull
     /// runs, and the statistics line is drawn over it.

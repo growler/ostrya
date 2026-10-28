@@ -12,6 +12,8 @@ The address is \%\-\-url, else the \fB\%pull\-url\fR key of the remote, else its
 .PP
 The pull stores the objects in one transaction, and then writes each ref under \fB\%refs/remotes/<remote>/\fR, or under \fB\%refs/heads/\fR with \%\-\-mirror. It verifies the signatures that the config of the remote or the verify options ask for. With \fB\%[ex\-ostrya] keep\-detached\-related=false\fR, the pull drops \fB\%ostrya.related\fR\&.
 .PP
+The pull also fetches the dependencies that field \%2 of each pulled commit names, each with no parent and no ref, unless it takes \%\-\-commit\-metadata\-only or \%\-\-subpath.
+.PP
 On success, the command prints one statistics line to standard output. If standard output is a terminal, a progress line shows while the pull runs, and the statistics line is drawn over it.
 .SH ARGUMENTS
 .TP

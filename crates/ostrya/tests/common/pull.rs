@@ -733,6 +733,47 @@ pub async fn commit_tree_with(
     timestamp: u64,
     flags: CommitModifierFlags,
 ) -> Checksum {
+    commit_tree_full(repo, base, sub, branch, parent, timestamp, flags, &[]).await
+}
+
+/// Commits the subtree `sub` as [`commit_tree`] does, with the dependencies
+/// `related` in field 2.
+///
+/// The repository must hold each dependency complete.
+pub async fn commit_tree_related(
+    repo: &Repo,
+    base: &Path,
+    sub: &str,
+    branch: &str,
+    parent: Option<Checksum>,
+    related: &[(&str, Checksum)],
+) -> Checksum {
+    commit_tree_full(
+        repo,
+        base,
+        sub,
+        branch,
+        parent,
+        FIXED_TS,
+        CommitModifierFlags::SKIP_XATTRS | CommitModifierFlags::CANONICAL_PERMISSIONS,
+        related,
+    )
+    .await
+}
+
+/// Commits the subtree `sub` as [`commit_tree_with`] does, with the
+/// dependencies `related` in field 2.
+#[allow(clippy::too_many_arguments)]
+async fn commit_tree_full(
+    repo: &Repo,
+    base: &Path,
+    sub: &str,
+    branch: &str,
+    parent: Option<Checksum>,
+    timestamp: u64,
+    flags: CommitModifierFlags,
+    related: &[(&str, Checksum)],
+) -> Checksum {
     let txn = repo.transaction().await.unwrap();
     let mut mtree = MutableTree::new();
     let mut modifier = CommitModifier::new(flags);
@@ -748,6 +789,10 @@ pub async fn commit_tree_with(
                 subject: Some(format!("{branch} {sub}")),
                 timestamp: Some(timestamp),
                 metadata: Some(ref_binding(branch)),
+                related: related
+                    .iter()
+                    .map(|(name, checksum)| ((*name).to_owned(), *checksum))
+                    .collect(),
                 ..CommitOptions::default()
             },
             &root,

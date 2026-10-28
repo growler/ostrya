@@ -18,6 +18,8 @@
 //!   `BucketRepo::prune` keeps the commits that field 2 of each reached
 //!   commit names, and gives a [`RelatedWarning`] for each defective field 2
 //!   entry.
+//! - [`Repo::pull`], [`Repo::pull_with_session`], and [`Repo::pull_collection`]
+//!   fetch the dependencies of each commit that they read.
 
 use std::os::fd::AsFd;
 use std::sync::LazyLock;
@@ -35,6 +37,9 @@ pub(crate) const RELATED_KEY: &str = "ostrya.related";
 
 /// The type string of a field of related entries.
 const RELATED_SIGNATURE: &str = "a(say)";
+
+/// The end of the reason of a dependency whose own field 2 is not empty.
+const NESTED_REASON: &str = "which has dependencies of its own";
 
 /// The type of a commit object. The parse of field 2 decodes member 2 alone.
 static COMMIT_TYPE: LazyLock<Type> =
@@ -523,7 +528,7 @@ fn entries_of_value(value: &Value) -> std::result::Result<Vec<RelatedEntry>, Str
 pub(crate) fn checked_entries(
     field: RelatedField,
     commit: Option<Checksum>,
-    entries: Vec<RelatedEntry>,
+    entries: impl IntoIterator<Item = RelatedEntry>,
 ) -> Result<Vec<(String, Checksum)>> {
     entries
         .into_iter()
@@ -537,6 +542,38 @@ pub(crate) fn checked_entries(
             None => Ok((entry.name, entry.checksum.expect("the defect check passed"))),
         })
         .collect()
+}
+
+/// Checks the format of each entry of field 2 of the parsed commit `commit`
+/// and returns the entries as names and checksums, in the stored order.
+///
+/// The check accepts entries that are not sorted and two entries with the
+/// same name.
+///
+/// # Errors
+///
+/// [`Error::InvalidRelated`] with `commit` and [`RelatedField::Dependencies`]
+/// for the first entry with an empty name or with a checksum that is not 32
+/// bytes.
+pub(crate) fn checked_dependencies(
+    commit: &Checksum,
+    related: Vec<(String, Vec<u8>)>,
+) -> Result<Vec<(String, Checksum)>> {
+    let entries = related.into_iter().map(|(name, bytes)| RelatedEntry {
+        checksum: Checksum::from_ay(&bytes).map_err(|_| bytes.len()),
+        name,
+    });
+    checked_entries(RelatedField::Dependencies, Some(*commit), entries)
+}
+
+/// Returns the error for the dependency `name` of `commit`, which names the
+/// commit `dependency` whose own field 2 is not empty.
+pub(crate) fn nested_dependency(commit: Checksum, name: &str, dependency: &Checksum) -> Error {
+    Error::InvalidRelated {
+        commit: Some(commit),
+        field: RelatedField::Dependencies,
+        reason: format!("dependency {name} names commit {dependency}, {NESTED_REASON}"),
+    }
 }
 
 /// Returns the dependencies `entries` of a new commit, sorted by name in byte
@@ -663,7 +700,7 @@ pub(crate) async fn check_dependencies<'a>(
                 return Ok(Some((index, "which is partial")));
             }
             if has_dependencies(&bytes)? {
-                return Ok(Some((index, "which has dependencies of its own")));
+                return Ok(Some((index, NESTED_REASON)));
             }
         }
         Ok(None)
@@ -786,6 +823,32 @@ mod tests {
         assert_eq!(commit, Some(checksum(9)));
         assert_eq!(field, RelatedField::BuildSources);
         assert_eq!(reason, "entry 1 (b/x) has a checksum of 0 bytes, not 32");
+    }
+
+    #[test]
+    fn checked_dependencies_keeps_order_and_names_the_commit() {
+        let related = vec![("b/x".into(), vec![3; 32]), ("a/y".into(), vec![4; 32])];
+        assert_eq!(
+            checked_dependencies(&checksum(9), related).unwrap(),
+            vec![("b/x".into(), checksum(3)), ("a/y".into(), checksum(4))]
+        );
+        let (commit, field, text) = reason(
+            checked_dependencies(&checksum(9), vec![(String::new(), vec![3; 32])]).unwrap_err(),
+        );
+        assert_eq!(commit, Some(checksum(9)));
+        assert_eq!(field, RelatedField::Dependencies);
+        assert_eq!(text, "entry 0 has an empty name");
+
+        let (commit, field, text) = reason(nested_dependency(checksum(9), "lib/b", &checksum(3)));
+        assert_eq!(commit, Some(checksum(9)));
+        assert_eq!(field, RelatedField::Dependencies);
+        assert_eq!(
+            text,
+            format!(
+                "dependency lib/b names commit {}, which has dependencies of its own",
+                checksum(3)
+            )
+        );
     }
 
     #[test]

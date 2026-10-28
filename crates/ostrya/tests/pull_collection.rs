@@ -18,13 +18,13 @@ use std::os::fd::AsFd;
 use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-use common::{TmpDir, anyone};
+use common::{TmpDir, anyone, store_with_field2};
 use ostrya::endpoint::EndpointOverrides;
 use ostrya::{
     Checksum, CollectionPullEvent, CollectionPullOptions, CollectionPullStats, CollectionRef,
     CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, Ed25519Signer, Error,
-    FsckOptions, MutableTree, PullFlags, PullOptions, RefSelector, Repo, RepoMode, SummaryOptions,
-    TimestampCheck, Type, Value,
+    FsckOptions, MutableTree, ObjectType, PullFlags, PullOptions, RefSelector, Repo, RepoMode,
+    SummaryOptions, TimestampCheck, Type, Value,
 };
 use ostrya_rt::block_on;
 use pull::*;
@@ -938,6 +938,52 @@ fn the_switch_drops_the_related_key_of_a_collection_pull() {
             .unwrap();
         assert!(stored.dict_get("test.kept").is_some(), "{stored:?}");
         assert!(stored.dict_get("ostrya.related").is_none(), "{stored:?}");
+    });
+}
+
+// --- dependencies ------------------------------------------------------------
+
+/// A collection pull fetches the dependency that field 2 of the pulled commit
+/// names, complete, and writes no ref for it. The dependency gets no binding
+/// check.
+#[test]
+fn a_collection_pull_fetches_the_dependency() {
+    block_on(async {
+        let dir = TmpDir::new("pull-collection-dependency");
+        let a = create(dir.path(), "a", Some(ID)).await;
+        let unbound = Bind {
+            collection: None,
+            refs: None,
+        };
+        let dep = commit(&a, dir.path(), "dep", None, "os/dep", FIXED_TS, unbound).await;
+        let plain = commit(&a, dir.path(), "a", None, REF, FIXED_TS, BOUND).await;
+        let tip = store_with_field2(&a, &plain, &[("boot/uki", dep.as_bytes())]).await;
+        let txn = a.transaction().await.unwrap();
+        txn.set_ref(REF, Some(&tip));
+        txn.commit().await.unwrap();
+        summarize(&a).await;
+        let server_a = RepoServer::start(&dir.path().join("a"), false).await;
+        let dest = dest(dir.path(), None, &[("a", &server_a.url(), "")]).await;
+
+        let (opts, _) = options(&[REF]);
+        dest.pull_collection(ID, &["a"], opts).await.unwrap();
+
+        assert_eq!(mirror(&dest, REF).await, Some(tip));
+        assert_eq!(dest.list_mirror_refs().await.unwrap().len(), 1);
+        assert!(dest.list_refs(None).await.unwrap().is_empty());
+        assert!(dest.list_remote_refs().await.unwrap().is_empty());
+        assert!(dest.has_object(ObjectType::Commit, &dep).await.unwrap());
+        assert_eq!(
+            dest.commit_state(&dep).await.unwrap(),
+            ostrya::CommitState::Normal
+        );
+        for name in &a.traverse_commit(&dep, 0).await.unwrap() {
+            assert!(
+                dest.has_object(name.ty, &name.checksum).await.unwrap(),
+                "{name} missing from the destination"
+            );
+        }
+        assert!(dest.fsck(&FsckOptions::default()).await.unwrap().is_ok());
     });
 }
 

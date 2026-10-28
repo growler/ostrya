@@ -2903,7 +2903,9 @@ empty name and checks nothing else in the name.
 
 A defective related value is an `ostrya.related` value that is not a variant
 of type `a(say)`, or an entry of either field with an empty name or with a
-checksum that is not 32 bytes.
+checksum that is not 32 bytes. For a transfer, a field 2 entry that names a
+nested dependency is defective too. A nested dependency is a dependency whose
+own field 2 is not empty.
 
 ### Dependencies
 
@@ -3019,6 +3021,46 @@ bucket repository").
 
 The `ostree` command keeps no commit for an entry of field 2
 (`conformance/cli-behavior.md`, "Related commits in a prune").
+
+### Dependencies in a pull from a remote
+
+A pull from a remote follows the dependencies of each commit that it reads:
+each target and each parent that the depth of the pull takes, also a commit
+that the repository holds complete. These rules apply to a pull over HTTP,
+over ssh, and from an `s3://` address, to a pull through a session of the
+caller, and to a pull of collection refs:
+
+- The pull fetches each dependency at depth 0, so a dependency entry adds no
+  parent to the pull. The pull fetches a dependency one time, also if several
+  commits name it. A prune of the destination accepts the parents that the
+  pull did not fetch, as after a pull with a small depth.
+- The pull writes no ref for a dependency.
+- The signature policy of the pull applies to each dependency. The pull makes
+  no ref-binding check, no collection-binding check, and no timestamp check
+  on a dependency.
+- For a dependency that the repository holds complete, the pull requests the
+  `.commitmeta` and checks the signatures. It requests no object of the tree.
+  A dependency that the repository holds partial gets its whole tree, and the
+  pull removes its `.commitpartial` marker.
+- A localcache repository can supply a dependency.
+- A dependency entry adds no static delta to the pull, also if the pull
+  requires static deltas. The pull fetches the objects of a dependency loose,
+  unless a static delta of the pull delivers that commit.
+- The pull does not follow a build source.
+- A commit-only pull and a pull with subpaths fetch no dependency.
+
+The pull checks the format of field 2 of each commit that it reads. A
+commit-only pull and a pull with subpaths check it too. A defective related
+value in field 2 fails the pull: an entry with an empty name, an entry with a
+checksum that is not 32 bytes, and an entry that names a nested dependency. A
+dependency that neither the repository, a localcache repository, nor the
+remote holds fails the pull too. This is also true for a parent that none of
+them holds, if a commit of the pull names it as a dependency. A failure of the
+pull writes no object and no ref, and leaves no `.commitpartial` marker that
+the pull wrote.
+
+The pull of the `ostree` command fetches no dependency
+(`conformance/cli-behavior.md`, "Related commits in a pull").
 
 ## Ref patterns
 
@@ -4142,6 +4184,10 @@ Over HTTP, the server keeps one copy of an entry that the query repeats ("GET
 
 A pull of collection refs reads the ref listing or the summary of a remote,
 over both transports ("The pull of collection refs").
+
+A pull of the port requests the dependencies of a commit over both
+transports, as `.commitmeta` and `.commit` requests of their own ("Dependencies
+in a pull from a remote").
 
 A pull of the port requests the composefs image of a commit,
 `objects/<first 2 hex>/<remaining 62 hex>.cfs`, over both transports when

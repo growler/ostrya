@@ -6653,6 +6653,64 @@ fn pull_depth_and_commit_metadata_only() {
     );
 }
 
+/// `pull` fetches the dependency that field 2 of the pulled commit names,
+/// complete, and writes no ref for it. The fsck of the destination passes.
+#[test]
+fn pull_fetches_a_dependency() {
+    let tmp = TmpDir::new("pull-dependency");
+    let base = tmp.path();
+    let remote = build_remote(base, "remote");
+    let remote_s = remote.to_str().unwrap().to_owned();
+    let commit = |args: &[&str]| {
+        let mut all = vec!["commit", "--repo", &remote_s, "--canonical-permissions"];
+        all.extend_from_slice(args);
+        ostrya(&all, None, &[("SOURCE_DATE_EPOCH", "1700000100")])
+            .ok()
+            .stdout_trimmed()
+    };
+    let dep = commit(&[
+        "-b",
+        "dep/uki",
+        ex_ostrya_tree(base, "uki").to_str().unwrap(),
+    ]);
+    let related = format!("--related=boot/uki={dep}");
+    let tip = commit(&[
+        "-b",
+        BRANCH,
+        &related,
+        base.join("remote/src").to_str().unwrap(),
+    ]);
+    ostrya(&["summary", "--repo", &remote_s, "-u"], None, &[]).ok();
+
+    let server = FileServer::start(&remote);
+    let dest = build_dest(base, "dest");
+    configure_remote(&dest, &server.url(), "gpg-verify=false\n");
+    ostrya(
+        &["pull", "--repo", dest.to_str().unwrap(), "origin", BRANCH],
+        None,
+        &[],
+    )
+    .ok();
+
+    let object = dest.join(format!("objects/{}/{}.commit", &dep[..2], &dep[2..]));
+    assert!(object.is_file(), "dependency {dep} was not fetched");
+    let marker = dest.join(format!("state/{dep}.commitpartial"));
+    assert!(!marker.exists(), "dependency {dep} is marked partial");
+    block_on(async {
+        let repo = Repo::open(&dest).await.unwrap();
+        assert!(repo.list_refs(None).await.unwrap().is_empty());
+        let refs: Vec<(String, String)> = repo
+            .list_remote_refs()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(name, commit)| (name, commit.to_hex()))
+            .collect();
+        assert_eq!(refs, [(format!("origin:{BRANCH}"), tip)]);
+    });
+    ostrya(&["fsck", "--repo", dest.to_str().unwrap()], None, &[]).ok();
+}
+
 #[test]
 fn pull_timestamp_check_refuses_an_older_tip() {
     let tmp = TmpDir::new("pull-timestamp");

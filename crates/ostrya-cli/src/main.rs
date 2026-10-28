@@ -478,6 +478,9 @@ enum Command {
     /// server makes a new commit over it on the branch BRANCH. The server
     /// picks the parent, writes the bindings, and signs the commit.
     ///
+    /// The push also sends the dependencies that field 2 of each pushed commit
+    /// names, each with no parent and no ref, unless it takes --onto.
+    ///
     /// On success, standard output carries one line for each ref, in the order
     /// of the refspecs and then of the tags. A line holds the DST name, the
     /// old state, and the new state. The old state is a full commit checksum,

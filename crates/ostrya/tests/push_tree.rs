@@ -886,6 +886,36 @@ fn a_second_tree_push_sends_no_object() {
     assert_eq!(named_ref(&repo, REF), Some(format!("{second}\n")));
 }
 
+/// The server commit of a tree push has an empty field 2, also onto a tip
+/// whose field 2 names a dependency.
+#[test]
+fn the_server_commit_of_a_tree_push_names_no_dependency() {
+    let tmp = TmpDir::new("push-tree-no-dependency");
+    let src = build_rich_source(tmp.path());
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    let (first, _) = pushed(&repo, &src, tree_options(REF), "first");
+    let named = block_on(async {
+        let named =
+            common::store_with_field2(&repo, &first, &[("boot/first", first.as_bytes())]).await;
+        let txn = repo.transaction().await.unwrap();
+        txn.set_ref(REF, Some(&named));
+        txn.commit().await.unwrap();
+        named
+    });
+    assert_eq!(
+        block_on(repo.read_commit_related(&named))
+            .unwrap()
+            .dependencies,
+        [("boot/first".to_owned(), first)]
+    );
+
+    let (second, _) = pushed(&repo, &src, tree_options(REF), "second");
+
+    let (commit, _) = block_on(repo.load_commit(&second)).unwrap();
+    assert_eq!(commit.parent, Some(named));
+    assert!(commit.related.is_empty(), "{:?}", commit.related);
+}
+
 /// With no timestamp, the server takes its clock.
 #[test]
 fn a_tree_push_with_no_timestamp_takes_the_clock_of_the_server() {

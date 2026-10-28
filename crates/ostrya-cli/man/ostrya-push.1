@@ -16,6 +16,8 @@ To an \fB\%s3://\fR address, the push writes a bucket repository in an \%S3 buck
 .PP
 With \%\-\-onto, the push sends the tree of one local commit, and the server makes a new commit over it on the branch BRANCH. The server picks the parent, writes the bindings, and signs the commit.
 .PP
+The push also sends the dependencies that field \%2 of each pushed commit names, each with no parent and no ref, unless it takes \%\-\-onto.
+.PP
 On success, standard output carries one line for each ref, in the order of the refspecs and then of the tags. A line holds the DST name, the old state, and the new state. The old state is a full commit checksum, \fB\%(new)\fR, or \fB\%(absent)\fR\&. The new state is a full commit checksum, \fB\%(unchanged)\fR, or \fB\%(deleted)\fR\&. With \%\-\-onto, standard output carries the checksum of the new commit alone.
 .PP
 Under \%\-\-verbose, one statistics line goes to standard error. If standard error is a terminal and \fB\%TERM\fR is set and is not \fB\%dumb\fR, standard error shows a progress bar while the push runs. A push to a bucket repository shows no bar while it lists the bucket and walks the commits. With \%\-\-break\-lock, a push that removed the writer lock of another writer writes one \fB\%warning: removed the writer lock of HOLDER\fR line to standard error. On failure, the command writes \fB\%error: MESSAGE\fR to standard error and nothing to standard output, and exits \%1.

@@ -497,6 +497,15 @@ pub enum Error {
     ///   bytes, and for a nested dependency. `commit` is the commit that holds
     ///   the entry. For a nested dependency, it is the commit that names the
     ///   dependency.
+    /// - `Repo::push`, `Repo::push_over_stream`, and `Repo::push_to_bucket`,
+    ///   for an entry of field 2 with an empty name or with a checksum that is
+    ///   not 32 bytes, in a commit of the walk of the push: a source commit or
+    ///   a commit of the parent chain that the push walks. Also for a
+    ///   dependency that the local repository marks partial or that is
+    ///   nested. A dependency whose own field 2 holds a defective entry is
+    ///   nested. `commit` is the commit that holds the entry. For a partial or
+    ///   a nested dependency, it is the commit that first names the
+    ///   dependency.
     ///
     /// [`Repo::prune`](crate::Repo::prune) gives a
     /// [`RelatedWarning`](crate::RelatedWarning) with the same text in place

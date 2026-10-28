@@ -28,9 +28,9 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use common::TmpDir;
 use common::modes::{build_tree, object_path, repo_of};
 use common::s3::{Rclone, Seaweed, StandIn, endpoint, rclone_available, seaweed_available};
+use common::{TmpDir, dependency_error, mark_partial, store_with_field2};
 use ostrya::bucket::{BucketPushOutcome, BucketRepo};
 use ostrya::remote::s3::S3Endpoint;
 use ostrya::remote::{Compression, Endpoint, PullSession, StreamSessionOptions};
@@ -116,6 +116,19 @@ async fn commit(
     content: &str,
     metadata: Option<Value>,
 ) -> Checksum {
+    commit_related(repo, branch, parent, content, metadata, &[]).await
+}
+
+/// Commits a tree as [`commit`] does, with the dependencies `related` in
+/// field 2.
+async fn commit_related(
+    repo: &Repo,
+    branch: &str,
+    parent: Option<Checksum>,
+    content: &str,
+    metadata: Option<Value>,
+    related: &[(&str, Checksum)],
+) -> Checksum {
     let tree = repo
         .path()
         .parent()
@@ -141,6 +154,10 @@ async fn commit(
                 subject: Some(content.to_owned()),
                 timestamp: Some(1_700_000_000),
                 metadata,
+                related: related
+                    .iter()
+                    .map(|(name, dependency)| ((*name).to_owned(), *dependency))
+                    .collect(),
                 ..CommitOptions::default()
             },
             &root,
@@ -920,6 +937,385 @@ fn a_commitmeta_that_the_switch_empties_is_not_uploaded() {
             .unwrap();
         assert!(!puts(&server).iter().any(|t| t.ends_with(".commitmeta")));
         assert_eq!(server.state().objects[&meta], first);
+    });
+}
+
+// --- dependencies --------------------------------------------------------
+
+/// Commits a dependency on `dep/uki` of `repo`, and a tip on `main` whose
+/// field 2 names it as `boot/uki`. Returns the tip and the dependency.
+async fn dependency_chain(repo: &Repo) -> (Checksum, Checksum) {
+    let dep = commit(repo, "dep/uki", None, "uki", None).await;
+    let tip = commit_related(repo, "main", None, "main", None, &[("boot/uki", dep)]).await;
+    (tip, dep)
+}
+
+/// Returns `true` if `server` holds the commit object of `commit`.
+fn holds_commit(server: &StandIn, commit: &Checksum) -> bool {
+    server
+        .state()
+        .objects
+        .contains_key(&key(ObjectType::Commit, commit))
+}
+
+/// Points the ref `name` of `repo` at `commit`.
+async fn move_ref(repo: &Repo, name: &str, commit: &Checksum) {
+    let txn = repo.transaction().await.unwrap();
+    txn.set_ref(name, Some(commit));
+    txn.commit().await.unwrap();
+}
+
+/// Removes the loose commit object of `commit` from the archive repository
+/// `repo`.
+fn remove_commit_object(repo: &Repo, commit: &Checksum) {
+    std::fs::remove_file(repo.path().join(object_path(ObjectType::Commit, commit))).unwrap();
+}
+
+/// A push uploads the dependency that field 2 of the source commit names,
+/// with its whole tree and its `.commitmeta`, and writes no ref file for it.
+#[test]
+fn a_push_uploads_the_dependency_of_the_commit() {
+    let scratch = TmpDir::new("push-s3-dependency");
+    block_on(async {
+        let server = StandIn::start();
+        init(&server.endpoint(), None).await;
+        let repo = archive(&scratch.path().join("src")).await;
+        let (tip, dep) = dependency_chain(&repo).await;
+        detached(&repo, &dep, &["keep"]).await;
+
+        push(&repo, &server.endpoint(), opts(&["main"]))
+            .await
+            .unwrap();
+
+        assert!(holds_commit(&server, &tip));
+        assert!(holds_commit(&server, &dep));
+        assert_trees_whole(&server);
+        assert_eq!(bucket_detached_keys(&server, &dep), ["keep"]);
+        assert_eq!(keys(&server, "repo/refs/"), ["repo/refs/heads/main"]);
+    });
+}
+
+/// A push with a depth uploads the dependencies of each parent that it
+/// uploads. At depth 0 it uploads no parent, so it uploads the dependency of
+/// the source commit alone.
+#[test]
+fn a_push_with_depth_uploads_the_dependencies_of_the_parents() {
+    for depth in [0, 1] {
+        let scratch = TmpDir::new(&format!("push-s3-dependency-parent-{depth}"));
+        block_on(async {
+            let server = StandIn::start();
+            init(&server.endpoint(), None).await;
+            let repo = archive(&scratch.path().join("src")).await;
+            let d1 = commit(&repo, "dep/d1", None, "d1", None).await;
+            let d2 = commit(&repo, "dep/d2", None, "d2", None).await;
+            let parent = commit_related(&repo, "main", None, "p", None, &[("boot/d1", d1)]).await;
+            let tip =
+                commit_related(&repo, "main", Some(parent), "t", None, &[("boot/d2", d2)]).await;
+
+            push(
+                &repo,
+                &server.endpoint(),
+                RepoPushOptions {
+                    depth: Some(depth),
+                    ..opts(&["main"])
+                },
+            )
+            .await
+            .unwrap();
+
+            assert!(holds_commit(&server, &tip));
+            assert!(holds_commit(&server, &d2));
+            for commit in [parent, d1] {
+                assert_eq!(
+                    holds_commit(&server, &commit),
+                    depth == 1,
+                    "depth {depth}: {commit}"
+                );
+            }
+            assert_trees_whole(&server);
+        });
+    }
+}
+
+/// A push uploads a dependency at depth 0, also under a push of the whole
+/// history. The parent of the dependency stays in the local repository.
+#[test]
+fn a_dependency_is_uploaded_at_depth_zero() {
+    let scratch = TmpDir::new("push-s3-dependency-depth");
+    block_on(async {
+        let server = StandIn::start();
+        init(&server.endpoint(), None).await;
+        let repo = archive(&scratch.path().join("src")).await;
+        let old = commit(&repo, "dep/uki", None, "old", None).await;
+        let dep = commit(&repo, "dep/uki", Some(old), "uki", None).await;
+        commit_related(&repo, "main", None, "main", None, &[("boot/uki", dep)]).await;
+
+        push(
+            &repo,
+            &server.endpoint(),
+            RepoPushOptions {
+                depth: Some(-1),
+                ..opts(&["main"])
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(holds_commit(&server, &dep));
+        assert!(!holds_commit(&server, &old));
+        assert_trees_whole(&server);
+    });
+}
+
+/// A dependency that the bucket holds with a partial-commit marker gets the
+/// walk of its whole tree. The push uploads the missing objects and deletes
+/// the marker.
+#[test]
+fn a_dependency_with_a_marker_in_the_bucket_gets_its_tree() {
+    let scratch = TmpDir::new("push-s3-dependency-marker");
+    block_on(async {
+        let server = StandIn::start();
+        init(&server.endpoint(), None).await;
+        let repo = archive(&scratch.path().join("src")).await;
+        let (_tip, dep) = dependency_chain(&repo).await;
+        push(&repo, &server.endpoint(), opts(&["dep/uki"]))
+            .await
+            .unwrap();
+        let stored =
+            std::fs::read(repo.path().join(object_path(ObjectType::Commit, &dep))).unwrap();
+        let root = key(
+            ObjectType::DirTree,
+            &Commit::parse(&stored).unwrap().root_dirtree,
+        );
+        let marker = format!("repo/state/{dep}.commitpartial");
+        {
+            let mut state = server.state();
+            state.objects.remove(&root).unwrap();
+            state.store(&marker, b"");
+        }
+
+        push(&repo, &server.endpoint(), opts(&["main"]))
+            .await
+            .unwrap();
+
+        assert!(server.state().objects.contains_key(&root));
+        assert!(!server.state().objects.contains_key(&marker));
+        assert_trees_whole(&server);
+    });
+}
+
+/// An absent dependency, a dependency that the local repository marks
+/// partial, a defective field 2 entry, and a nested dependency are each
+/// refused before the push sends a request.
+#[test]
+fn a_dependency_the_push_cannot_upload_is_refused_before_a_request() {
+    let scratch = TmpDir::new("push-s3-dependency-refused");
+    block_on(async {
+        let server = StandIn::start();
+        let repo = archive(&scratch.path().join("src")).await;
+        let (tip, dep) = dependency_chain(&repo).await;
+
+        // A defective entry.
+        let short: &[u8] = &dep.as_bytes()[..31];
+        let defective = store_with_field2(&repo, &tip, &[("boot/uki", short)]).await;
+        move_ref(&repo, "main", &defective).await;
+        let err = push(&repo, &server.endpoint(), opts(&["main"]))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            dependency_error(err),
+            (
+                Some(defective),
+                "entry 0 (boot/uki) has a checksum of 31 bytes, not 32".to_owned()
+            )
+        );
+
+        // A nested dependency.
+        let other = commit(&repo, "other", None, "other", None).await;
+        let nested = store_with_field2(&repo, &other, &[("lib/c", dep.as_bytes())]).await;
+        let head = store_with_field2(&repo, &tip, &[("lib/b", nested.as_bytes())]).await;
+        move_ref(&repo, "main", &head).await;
+        let err = push(&repo, &server.endpoint(), opts(&["main"]))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            dependency_error(err),
+            (
+                Some(head),
+                format!(
+                    "dependency lib/b names commit {nested}, which has dependencies of its own"
+                )
+            )
+        );
+
+        // A partial dependency, then an absent one.
+        move_ref(&repo, "main", &tip).await;
+        mark_partial(&repo, &dep);
+        let err = push(&repo, &server.endpoint(), opts(&["main"]))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            dependency_error(err),
+            (
+                Some(tip),
+                format!("dependency boot/uki names commit {dep}, which is partial")
+            )
+        );
+        remove_commit_object(&repo, &dep);
+        let err = push(&repo, &server.endpoint(), opts(&["main"]))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::ObjectNotFound { checksum, ty: ObjectType::Commit } if checksum == dep
+            ),
+            "{err:?}"
+        );
+
+        assert!(server.state().requests.is_empty());
+    });
+}
+
+/// With a depth, the push resolves the dependencies of each history commit
+/// before it sends a request. A nested, a partial, and an absent dependency
+/// that the parent of the source commit alone names are each refused.
+#[test]
+fn with_a_depth_a_dependency_of_a_history_commit_is_refused_before_a_request() {
+    let scratch = TmpDir::new("push-s3-dependency-history");
+    block_on(async {
+        let server = StandIn::start();
+        let repo = archive(&scratch.path().join("src")).await;
+        let depth_one = || RepoPushOptions {
+            depth: Some(1),
+            ..opts(&["main"])
+        };
+
+        // The parent names a commit that names a dependency of its own.
+        let dep = commit(&repo, "dep/uki", None, "uki", None).await;
+        let other = commit(&repo, "other", None, "other", None).await;
+        let nested = store_with_field2(&repo, &other, &[("lib/c", dep.as_bytes())]).await;
+        let plain = commit(&repo, "main", None, "p", None).await;
+        let parent = store_with_field2(&repo, &plain, &[("lib/b", nested.as_bytes())]).await;
+        commit(&repo, "main", Some(parent), "t", None).await;
+        let err = push(&repo, &server.endpoint(), depth_one())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            dependency_error(err),
+            (
+                Some(parent),
+                format!(
+                    "dependency lib/b names commit {nested}, which has dependencies of its own"
+                )
+            )
+        );
+
+        // The parent names a partial dependency, then an absent one.
+        let parent = commit_related(&repo, "main", None, "p", None, &[("boot/uki", dep)]).await;
+        commit(&repo, "main", Some(parent), "t", None).await;
+        mark_partial(&repo, &dep);
+        let err = push(&repo, &server.endpoint(), depth_one())
+            .await
+            .unwrap_err();
+        assert_eq!(
+            dependency_error(err),
+            (
+                Some(parent),
+                format!("dependency boot/uki names commit {dep}, which is partial")
+            )
+        );
+        remove_commit_object(&repo, &dep);
+        let err = push(&repo, &server.endpoint(), depth_one())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                Error::ObjectNotFound { checksum, ty: ObjectType::Commit } if checksum == dep
+            ),
+            "{err:?}"
+        );
+
+        assert!(server.state().requests.is_empty());
+    });
+}
+
+/// With no depth, the push resolves the dependencies of the history after the
+/// cut at the tip of the ref in the bucket, under the lock. A refused
+/// dependency of such a commit ends the push before its first upload, and
+/// the push releases the lock.
+#[test]
+fn with_no_depth_a_dependency_of_the_offered_history_is_refused_before_an_upload() {
+    let scratch = TmpDir::new("push-s3-dependency-cut");
+    block_on(async {
+        let server = StandIn::start();
+        init(&server.endpoint(), None).await;
+        let repo = archive(&scratch.path().join("src")).await;
+        let c1 = commit(&repo, "main", None, "c1", None).await;
+        push(&repo, &server.endpoint(), opts(&["main"]))
+            .await
+            .unwrap();
+        let objects = keys(&server, "repo/objects/");
+        let dep = commit(&repo, "dep/uki", None, "uki", None).await;
+        let c2 = commit_related(&repo, "main", Some(c1), "c2", None, &[("boot/uki", dep)]).await;
+        commit(&repo, "main", Some(c2), "c3", None).await;
+        remove_commit_object(&repo, &dep);
+        server.state().requests.clear();
+
+        let err = push(&repo, &server.endpoint(), opts(&["main"]))
+            .await
+            .unwrap_err();
+
+        assert!(
+            matches!(
+                err,
+                Error::ObjectNotFound { checksum, ty: ObjectType::Commit } if checksum == dep
+            ),
+            "{err:?}"
+        );
+        assert_eq!(keys(&server, "repo/objects/"), objects);
+        assert_eq!(ref_of(&server, "repo/refs/heads/main"), Some(c1));
+        assert!(!server.state().objects.contains_key(LOCK));
+        // The push took the lock, and uploaded nothing.
+        assert_eq!(puts(&server), [PROBE, LOCK]);
+    });
+}
+
+/// A push does not upload a build source: the commit that `ostrya.related`
+/// names. Under `keep-detached-related=false` in the config of the bucket,
+/// the push drops the key from the `.commitmeta` of a dependency too.
+#[test]
+fn a_push_uploads_no_build_source_and_the_switch_applies_to_a_dependency() {
+    let scratch = TmpDir::new("push-s3-dependency-build-source");
+    block_on(async {
+        let server = StandIn::start();
+        init(&server.endpoint(), None).await;
+        let repo = archive(&scratch.path().join("src")).await;
+        let (tip, dep) = dependency_chain(&repo).await;
+        let source = commit(&repo, "other/base", None, "base", None).await;
+        repo.add_detached_related(&tip, "layer/base", &source)
+            .await
+            .unwrap();
+        push(&repo, &server.endpoint(), opts(&["main"]))
+            .await
+            .unwrap();
+        assert!(!holds_commit(&server, &source));
+        assert_eq!(bucket_detached_keys(&server, &tip), ["ostrya.related"]);
+
+        let server = StandIn::start();
+        server
+            .state()
+            .store(CONFIG, drop_related_config().as_bytes());
+        detached(&repo, &dep, &["keep"]).await;
+        repo.add_detached_related(&dep, "layer/base", &source)
+            .await
+            .unwrap();
+        push(&repo, &server.endpoint(), opts(&["main"]))
+            .await
+            .unwrap();
+        assert_eq!(bucket_detached_keys(&server, &dep), ["keep"]);
+        assert!(!holds_commit(&server, &source));
     });
 }
 

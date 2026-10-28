@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
 use common::receive::{PIPE_CAP, PipeReader, PipeWriter, is_root, new_repo, pipe, policy_allowing};
-use common::{Counting, TmpDir, mark_partial};
+use common::{Counting, TmpDir, dependency_error, mark_partial, store_with_field2};
 use futures_io::AsyncWrite;
 use futures_lite::future::zip;
 use ostrya::access::CollectionScope;
@@ -74,6 +74,19 @@ fn commit(
     content: &str,
     metadata: Option<Value>,
 ) -> Checksum {
+    commit_related(repo, branch, parent, content, metadata, &[])
+}
+
+/// Commits a tree as [`commit`] does, with the dependencies `related` in
+/// field 2.
+fn commit_related(
+    repo: &Repo,
+    branch: &str,
+    parent: Option<Checksum>,
+    content: &str,
+    metadata: Option<Value>,
+    related: &[(&str, Checksum)],
+) -> Checksum {
     let tree = repo
         .path()
         .parent()
@@ -102,6 +115,10 @@ fn commit(
                     subject: Some(content.to_owned()),
                     timestamp: Some(1_700_000_000),
                     metadata,
+                    related: related
+                        .iter()
+                        .map(|(name, dependency)| ((*name).to_owned(), *dependency))
+                        .collect(),
                     ..CommitOptions::default()
                 },
                 &root,
@@ -1410,6 +1427,583 @@ fn a_session_push_refuses_the_bucket_fields() {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Dependencies.
+// ---------------------------------------------------------------------------
+
+/// Commits a dependency on `dep/uki` of `repo`, and a tip on `main` whose
+/// field 2 names it as `boot/uki`. Returns the tip and the dependency.
+fn dependency_chain(repo: &Repo) -> (Checksum, Checksum) {
+    let dep = commit(repo, "dep/uki", None, "uki", None);
+    let main = commit_related(repo, "main", None, "main", None, &[("boot/uki", dep)]);
+    (main, dep)
+}
+
+/// Asserts that `server` holds `commit` with no marker and each object of
+/// its tree.
+fn assert_complete(client: &Repo, server: &Repo, commit: &Checksum) {
+    assert_eq!(
+        block_on(server.commit_state(commit)).unwrap(),
+        ostrya::CommitState::Normal,
+        "{commit}"
+    );
+    for name in block_on(client.traverse_commit(commit, 0)).unwrap() {
+        assert!(
+            block_on(server.has_object(name.ty, &name.checksum)).unwrap(),
+            "{commit}: {name:?}"
+        );
+    }
+}
+
+/// Removes the loose commit object of `commit` from the archive repository
+/// `repo`.
+fn remove_commit_object(repo: &Repo, commit: &Checksum) {
+    let path = ostrya::loose_path(commit, ObjectType::Commit, RepoMode::Archive);
+    std::fs::remove_file(repo.path().join("objects").join(path)).unwrap();
+}
+
+/// Points the ref `name` of `repo` at `commit`.
+fn move_ref(repo: &Repo, name: &str, commit: &Checksum) {
+    block_on(async {
+        let txn = repo.transaction().await.unwrap();
+        txn.set_ref(name, Some(commit));
+        txn.commit().await.unwrap();
+    });
+}
+
+/// A detached metadata dict with one property.
+fn detached_dict() -> Value {
+    let mut builder = DictBuilder::new();
+    builder.insert_str("xa.note", "dependency");
+    builder.build()
+}
+
+/// A push sends the dependency that field 2 of the source commit names,
+/// complete and with its `.commitmeta`, and the server writes no ref for it.
+/// A second push sends no object.
+#[test]
+fn a_push_sends_the_dependency_of_the_commit() {
+    let pair = Pair::new("dependency", RepoMode::Archive, RepoMode::Archive, "");
+    let (main, dep) = dependency_chain(&pair.client);
+    block_on(
+        pair.client
+            .write_commit_detached_metadata(&dep, Some(&detached_dict())),
+    )
+    .unwrap();
+
+    let (report, outcome) = push(&pair, opts(&["main"]));
+    report.unwrap();
+    outcome.unwrap();
+
+    assert_complete(&pair.client, &pair.server, &main);
+    assert_complete(&pair.client, &pair.server, &dep);
+    assert_eq!(
+        block_on(pair.server.read_commit_detached_metadata(&dep)).unwrap(),
+        Some(detached_dict())
+    );
+    assert_eq!(
+        block_on(pair.server.list_refs(None)).unwrap(),
+        [("main".to_owned(), main)]
+    );
+
+    let (report, outcome) = push(&pair, opts(&["main"]));
+    report.unwrap();
+    assert_eq!(outcome.unwrap().stats.objects_sent, 0);
+}
+
+/// A push with a depth sends the dependencies of each parent that it sends.
+/// At depth 0 it sends no parent, so it sends the dependency of the source
+/// commit alone.
+#[test]
+fn a_push_with_depth_sends_the_dependencies_of_the_parents() {
+    for depth in [0, 1, -1] {
+        let pair = Pair::new(
+            &format!("dependency-parent-{depth}"),
+            RepoMode::Archive,
+            RepoMode::Archive,
+            "",
+        );
+        let d1 = commit(&pair.client, "dep/d1", None, "d1", None);
+        let d2 = commit(&pair.client, "dep/d2", None, "d2", None);
+        let parent = commit_related(&pair.client, "main", None, "p", None, &[("boot/d1", d1)]);
+        let main = commit_related(
+            &pair.client,
+            "main",
+            Some(parent),
+            "t",
+            None,
+            &[("boot/d2", d2)],
+        );
+
+        let (report, outcome) = push(
+            &pair,
+            RepoPushOptions {
+                depth: Some(depth),
+                ..opts(&["main"])
+            },
+        );
+        report.unwrap();
+        outcome.unwrap();
+
+        assert_complete(&pair.client, &pair.server, &main);
+        assert_complete(&pair.client, &pair.server, &d2);
+        for commit in [parent, d1] {
+            assert_eq!(
+                has_commit(&pair.server, &commit),
+                depth != 0,
+                "depth {depth}: {commit}"
+            );
+        }
+        if depth != 0 {
+            assert_complete(&pair.client, &pair.server, &d1);
+        }
+        assert_eq!(tip(&pair.server, "main"), Some(main));
+    }
+}
+
+/// A push sends a dependency at depth 0, also under a push of the whole
+/// history and with no depth. The parent of the dependency stays in the
+/// local repository.
+#[test]
+fn a_dependency_is_sent_at_depth_zero() {
+    for depth in [Some(-1), None] {
+        let pair = Pair::new(
+            &format!("dependency-depth-{depth:?}"),
+            RepoMode::Archive,
+            RepoMode::Archive,
+            "",
+        );
+        let old = commit(&pair.client, "dep/uki", None, "old", None);
+        let dep = commit(&pair.client, "dep/uki", Some(old), "uki", None);
+        let main = commit_related(
+            &pair.client,
+            "main",
+            None,
+            "main",
+            None,
+            &[("boot/uki", dep)],
+        );
+
+        let (report, outcome) = push(
+            &pair,
+            RepoPushOptions {
+                depth,
+                ..opts(&["main"])
+            },
+        );
+        report.unwrap();
+        outcome.unwrap();
+
+        assert_complete(&pair.client, &pair.server, &main);
+        assert_complete(&pair.client, &pair.server, &dep);
+        assert!(!has_commit(&pair.server, &old), "{depth:?}");
+    }
+}
+
+/// A dependency that two sent commits name is sent one time. The server
+/// refuses a second dict for one commit, so the push passes only if it sends
+/// the `.commitmeta` of the dependency one time.
+#[test]
+fn a_dependency_that_two_commits_name_is_sent_once() {
+    let pair = Pair::new("dependency-once", RepoMode::Archive, RepoMode::Archive, "");
+    let dep = commit(&pair.client, "dep/uki", None, "uki", None);
+    block_on(
+        pair.client
+            .write_commit_detached_metadata(&dep, Some(&detached_dict())),
+    )
+    .unwrap();
+    let parent = commit_related(&pair.client, "main", None, "p", None, &[("boot/uki", dep)]);
+    commit_related(
+        &pair.client,
+        "main",
+        Some(parent),
+        "t",
+        None,
+        &[("boot/uki", dep)],
+    );
+
+    let (report, outcome) = push(
+        &pair,
+        RepoPushOptions {
+            depth: Some(1),
+            ..opts(&["main"])
+        },
+    );
+    report.unwrap();
+    outcome.unwrap();
+
+    assert_complete(&pair.client, &pair.server, &dep);
+    assert_eq!(
+        block_on(pair.server.read_commit_detached_metadata(&dep)).unwrap(),
+        Some(detached_dict())
+    );
+}
+
+/// The source commit names its own parent as a dependency. At depth 0 the
+/// dependency brings the parent in, and at depth 1 the walk does. In both,
+/// the push sends the parent and its `.commitmeta` one time, with no parent
+/// of its own.
+#[test]
+fn a_parent_that_is_a_dependency_is_sent_once() {
+    for depth in [0, 1] {
+        let pair = Pair::new(
+            &format!("dependency-parent-once-{depth}"),
+            RepoMode::Archive,
+            RepoMode::Archive,
+            "",
+        );
+        let grand = commit(&pair.client, "main", None, "g", None);
+        let parent = commit(&pair.client, "main", Some(grand), "p", None);
+        block_on(
+            pair.client
+                .write_commit_detached_metadata(&parent, Some(&detached_dict())),
+        )
+        .unwrap();
+        commit_related(
+            &pair.client,
+            "main",
+            Some(parent),
+            "t",
+            None,
+            &[("boot/p", parent)],
+        );
+
+        let (report, outcome) = push(
+            &pair,
+            RepoPushOptions {
+                depth: Some(depth),
+                ..opts(&["main"])
+            },
+        );
+        report.unwrap();
+        outcome.unwrap();
+
+        assert_complete(&pair.client, &pair.server, &parent);
+        assert!(!has_commit(&pair.server, &grand), "depth {depth}");
+        assert_eq!(
+            block_on(pair.server.read_commit_detached_metadata(&parent)).unwrap(),
+            Some(detached_dict()),
+            "depth {depth}"
+        );
+    }
+}
+
+/// The push walks no tree of a dependency that the server holds: the local
+/// repository lacks the root dirtree of the dependency, and the push passes.
+#[test]
+fn a_dependency_the_server_holds_gets_no_tree_walk() {
+    let pair = Pair::new("dependency-held", RepoMode::Archive, RepoMode::Archive, "");
+    let (main, dep) = dependency_chain(&pair.client);
+    let (report, outcome) = push(&pair, opts(&["dep/uki"]));
+    report.unwrap();
+    outcome.unwrap();
+    let (root, _) = block_on(pair.client.load_commit(&dep)).unwrap();
+    let path = ostrya::loose_path(&root.root_dirtree, ObjectType::DirTree, RepoMode::Archive);
+    std::fs::remove_file(pair.client.path().join("objects").join(path)).unwrap();
+
+    let (report, outcome) = push(&pair, opts(&["main"]));
+    report.unwrap();
+    outcome.unwrap();
+
+    assert_eq!(tip(&pair.server, "main"), Some(main));
+    assert_complete(&pair.server, &pair.server, &dep);
+}
+
+/// A dependency that the local repository does not hold, or marks partial,
+/// is refused before the push writes a byte.
+#[test]
+fn an_absent_or_partial_dependency_is_refused_before_any_byte() {
+    let dir = TmpDir::new("push-repo-dependency-absent");
+    let repo = new_repo(&dir, RepoMode::Archive, "");
+    let (main, dep) = dependency_chain(&repo);
+
+    mark_partial(&repo, &dep);
+    let (error, written) = refused(&repo, opts(&["main"]));
+    assert_eq!(
+        dependency_error(error),
+        (
+            Some(main),
+            format!("dependency boot/uki names commit {dep}, which is partial")
+        )
+    );
+    assert_eq!(written, 0);
+
+    remove_commit_object(&repo, &dep);
+    let (error, written) = refused(&repo, opts(&["main"]));
+    match error {
+        Error::ObjectNotFound { checksum, ty } => {
+            assert_eq!((checksum, ty), (dep, ObjectType::Commit));
+        }
+        other => panic!("expected ObjectNotFound, got {other:?}"),
+    }
+    assert_eq!(written, 0);
+}
+
+/// A field 2 entry with an empty name or with a checksum that is not 32
+/// bytes is refused before the push writes a byte, also in a history commit
+/// that a push with no depth does not send.
+#[test]
+fn a_defective_dependency_entry_is_refused_before_any_byte() {
+    let dir = TmpDir::new("push-repo-dependency-defective");
+    let repo = new_repo(&dir, RepoMode::Archive, "");
+    let (main, dep) = dependency_chain(&repo);
+    let short: &[u8] = &dep.as_bytes()[..31];
+    for (entry, reason) in [
+        (
+            ("boot/uki", short),
+            "entry 0 (boot/uki) has a checksum of 31 bytes, not 32",
+        ),
+        (("", dep.as_bytes()), "entry 0 has an empty name"),
+    ] {
+        let defective = block_on(store_with_field2(&repo, &main, &[entry]));
+        move_ref(&repo, "main", &defective);
+        let (error, written) = refused(&repo, opts(&["main"]));
+        assert_eq!(
+            dependency_error(error),
+            (Some(defective), reason.to_owned())
+        );
+        assert_eq!(written, 0);
+
+        // The defective commit is the parent of the source commit.
+        let child = commit(&repo, "main", Some(defective), "child", None);
+        let (error, written) = refused(&repo, opts(&["main"]));
+        assert_eq!(
+            dependency_error(error),
+            (Some(defective), reason.to_owned())
+        );
+        assert_eq!(written, 0);
+        assert_eq!(tip(&repo, "main"), Some(child));
+    }
+}
+
+/// A dependency that names dependencies of its own is refused before the
+/// push writes a byte, also if the push takes that commit as a source
+/// commit. The error names the commit that names the nested dependency.
+#[test]
+fn a_nested_dependency_is_refused_before_any_byte() {
+    let dir = TmpDir::new("push-repo-dependency-nested");
+    let repo = new_repo(&dir, RepoMode::Archive, "");
+    let (main, dep) = dependency_chain(&repo);
+    let other = commit(&repo, "other", None, "other", None);
+    // `other` names a commit with a dependency, and `main` names a commit
+    // whose dependency is that commit.
+    let nested = block_on(store_with_field2(
+        &repo,
+        &other,
+        &[("lib/c", dep.as_bytes())],
+    ));
+    let head = block_on(store_with_field2(
+        &repo,
+        &main,
+        &[("lib/b", nested.as_bytes())],
+    ));
+    move_ref(&repo, "other", &nested);
+    move_ref(&repo, "main", &head);
+
+    let reason =
+        format!("dependency lib/b names commit {nested}, which has dependencies of its own");
+    for specs in [&["main"][..], &["main", "other"], &["other", "main"]] {
+        let (error, written) = refused(&repo, opts(specs));
+        assert_eq!(
+            dependency_error(error),
+            (Some(head), reason.clone()),
+            "{specs:?}"
+        );
+        assert_eq!(written, 0, "{specs:?}");
+    }
+}
+
+/// A parent that the local repository does not hold ends its chain. If the
+/// source commit names the parent as a dependency, the push is refused
+/// before it writes a byte.
+#[test]
+fn an_absent_parent_that_is_a_dependency_is_refused_before_any_byte() {
+    let dir = TmpDir::new("push-repo-dependency-absent-parent");
+    let repo = new_repo(&dir, RepoMode::Archive, "");
+    let parent = commit(&repo, "main", None, "p", None);
+    let plain = commit(&repo, "main", Some(parent), "t", None);
+    let source = block_on(store_with_field2(
+        &repo,
+        &plain,
+        &[("boot/p", parent.as_bytes())],
+    ));
+    move_ref(&repo, "main", &source);
+    remove_commit_object(&repo, &parent);
+
+    for depth in [Some(1), None] {
+        let (error, written) = refused(
+            &repo,
+            RepoPushOptions {
+                depth,
+                ..opts(&["main"])
+            },
+        );
+        match error {
+            Error::ObjectNotFound { checksum, ty } => {
+                assert_eq!((checksum, ty), (parent, ObjectType::Commit), "{depth:?}");
+            }
+            other => panic!("{depth:?}: expected ObjectNotFound, got {other:?}"),
+        }
+        assert_eq!(written, 0, "{depth:?}");
+    }
+}
+
+/// With a depth, the push resolves the dependencies of each history commit
+/// before it writes a byte. A nested, a partial, and an absent dependency
+/// that the parent of the source commit alone names are each refused.
+#[test]
+fn with_a_depth_a_dependency_of_a_history_commit_is_refused_before_any_byte() {
+    let dir = TmpDir::new("push-repo-dependency-history");
+    let repo = new_repo(&dir, RepoMode::Archive, "");
+    let depth_one = || RepoPushOptions {
+        depth: Some(1),
+        ..opts(&["main"])
+    };
+
+    // The parent names a commit that names a dependency of its own.
+    let dep = commit(&repo, "dep/uki", None, "uki", None);
+    let other = commit(&repo, "other", None, "other", None);
+    let nested = block_on(store_with_field2(
+        &repo,
+        &other,
+        &[("lib/c", dep.as_bytes())],
+    ));
+    let plain = commit(&repo, "main", None, "p", None);
+    let parent = block_on(store_with_field2(
+        &repo,
+        &plain,
+        &[("lib/b", nested.as_bytes())],
+    ));
+    commit(&repo, "main", Some(parent), "t", None);
+    let (error, written) = refused(&repo, depth_one());
+    assert_eq!(
+        dependency_error(error),
+        (
+            Some(parent),
+            format!("dependency lib/b names commit {nested}, which has dependencies of its own")
+        )
+    );
+    assert_eq!(written, 0);
+
+    // The parent names a partial dependency, then an absent one.
+    let parent = commit_related(&repo, "main", None, "p", None, &[("boot/uki", dep)]);
+    commit(&repo, "main", Some(parent), "t", None);
+    mark_partial(&repo, &dep);
+    let (error, written) = refused(&repo, depth_one());
+    assert_eq!(
+        dependency_error(error),
+        (
+            Some(parent),
+            format!("dependency boot/uki names commit {dep}, which is partial")
+        )
+    );
+    assert_eq!(written, 0);
+
+    remove_commit_object(&repo, &dep);
+    let (error, written) = refused(&repo, depth_one());
+    match error {
+        Error::ObjectNotFound { checksum, ty } => {
+            assert_eq!((checksum, ty), (dep, ObjectType::Commit));
+        }
+        other => panic!("expected ObjectNotFound, got {other:?}"),
+    }
+    assert_eq!(written, 0);
+}
+
+/// A push does not send a build source: the commit that `ostrya.related`
+/// names. The key travels with the detached metadata of the commit.
+#[test]
+fn a_push_does_not_send_a_build_source() {
+    let pair = Pair::new("build-source", RepoMode::Archive, RepoMode::Archive, "");
+    let (main, _dep) = dependency_chain(&pair.client);
+    let source = commit(&pair.client, "other/base", None, "base", None);
+    block_on(
+        pair.client
+            .add_detached_related(&main, "layer/base", &source),
+    )
+    .unwrap();
+
+    let (report, outcome) = push(&pair, opts(&["main"]));
+    report.unwrap();
+    outcome.unwrap();
+
+    assert_eq!(
+        block_on(pair.server.read_commit_related(&main))
+            .unwrap()
+            .build_sources,
+        [("layer/base".to_owned(), source)]
+    );
+    assert!(!has_commit(&pair.server, &source));
+}
+
+/// With no depth, the push resolves the dependencies of the history after
+/// the cut at the server tip. A refused dependency of such a commit ends the
+/// session with `Abort` before the first upload. A dependency of the server
+/// tip, which the push does not send, is not resolved.
+#[test]
+fn with_no_depth_a_dependency_of_the_offered_history_is_resolved_after_the_cut() {
+    let pair = Pair::new("dependency-cut", RepoMode::Archive, RepoMode::Archive, "");
+    let held = commit(&pair.client, "dep/held", None, "held", None);
+    let c1 = commit_related(
+        &pair.client,
+        "main",
+        None,
+        "c1",
+        None,
+        &[("boot/held", held)],
+    );
+    let (report, outcome) = push(&pair, opts(&["main"]));
+    report.unwrap();
+    outcome.unwrap();
+    assert!(has_commit(&pair.server, &held));
+    // The client loses the dependency of the server tip.
+    remove_commit_object(&pair.client, &held);
+
+    let dep = commit(&pair.client, "dep/uki", None, "uki", None);
+    let c2 = commit_related(
+        &pair.client,
+        "main",
+        Some(c1),
+        "c2",
+        None,
+        &[("boot/uki", dep)],
+    );
+    let c3 = commit(&pair.client, "main", Some(c2), "c3", None);
+    remove_commit_object(&pair.client, &dep);
+    let progress = PushProgress::new();
+    let (kinds, hook) = frame_kinds();
+    let (report, outcome) = push_through(
+        &pair,
+        RepoPushOptions {
+            progress: Some(progress.clone()),
+            ..opts(&["main"])
+        },
+        hook,
+    );
+    assert_aborted(&report);
+    match outcome {
+        Err(Error::ObjectNotFound { checksum, ty }) => {
+            assert_eq!((checksum, ty), (dep, ObjectType::Commit));
+        }
+        other => panic!("expected ObjectNotFound, got {other:?}"),
+    }
+    let kinds = kinds.lock().unwrap().clone();
+    assert!(!kinds.contains(&HAVE_FRAME), "{kinds:?}");
+    assert_eq!(progress.snapshot().payload_bytes, 0);
+    assert!(!has_commit(&pair.server, &c2));
+    assert!(!has_commit(&pair.server, &c3));
+    assert_eq!(tip(&pair.server, "main"), Some(c1));
+
+    // With the commit that names the absent dependency out of the push, the
+    // push passes.
+    move_ref(&pair.client, "main", &c1);
+    let c4 = commit(&pair.client, "main", Some(c1), "c4", None);
+    let (report, outcome) = push(&pair, opts(&["main"]));
+    report.unwrap();
+    outcome.unwrap();
+    assert_eq!(tip(&pair.server, "main"), Some(c4));
 }
 
 // ---------------------------------------------------------------------------

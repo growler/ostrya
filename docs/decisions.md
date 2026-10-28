@@ -2120,6 +2120,23 @@ the rules.
   transaction opens. A pull that follows each dependency at the depth of the
   pull was rejected: it takes the history of each dependency, which no
   commit needs.
+- A push (`Repo::push`, `Repo::push_over_stream`, and `Repo::push_to_bucket`)
+  sends the dependencies of each commit that it offers, at depth 0 and with
+  no ref. It refuses an absent or a partial dependency, a defective field 2
+  entry, and a nested dependency before the first upload. With a depth, the
+  push resolves each dependency before it writes a byte. With no depth, the
+  history of the offer ends at the server tip, which the push knows only
+  after `HelloReply`, or under the writer lock of a bucket. So the push
+  resolves the dependencies of the source commits first, and the
+  dependencies of the offered history commits after the cut. It checks the
+  format of field 2 of each commit of its walk, from the bytes that it
+  already read. Two alternatives were rejected. To leave each check to the
+  receiver was rejected: a push to a bucket repository has no receiver, and
+  the client can refuse before it sends an object. To resolve the
+  dependencies of the whole local history with no depth was rejected: the
+  push reads the commit objects of dependencies that it does not send, and
+  a dependency of old history that the server holds, which the local
+  repository no longer holds, refuses the push.
 - No transfer follows a build source. A pull, a push, and the one-way stream
   move `ostrya.related` as any other detached metadata key, under the switch
   of the destination, and fetch no commit that it names. A build cache needs the refs of its sources, and not

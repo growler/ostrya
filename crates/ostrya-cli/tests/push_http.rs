@@ -1464,6 +1464,42 @@ mod cli {
         assert_eq!(image(&server), image(&client));
     }
 
+    /// `ostrya push` to `ostrya serve` sends the dependency that field 2 of
+    /// the pushed commit names. The server holds the dependency complete,
+    /// and writes no ref for it.
+    #[test]
+    fn push_sends_a_dependency() {
+        let setup = Setup::new("cli-dependency");
+        let src = tree(setup.tmp.path(), "tree", 3, 1000);
+        let uki = tree(setup.tmp.path(), "uki", 2, 500);
+        let client = setup.init("client", "archive");
+        let commit = |args: &[&str]| {
+            let repo = format!("--repo={}", client.display());
+            let mut all = vec![repo.as_str(), "commit", "-s", "subject", "--no-bindings"];
+            all.extend_from_slice(args);
+            ok("ostrya", &all).trim().to_owned()
+        };
+        let dep = commit(&["-b", "dep/uki", uki.to_str().unwrap()]);
+        let related = format!("--related=boot/uki={dep}");
+        let tip = commit(&["-b", "main", &related, src.to_str().unwrap()]);
+        let server = setup.init("server", "archive");
+        add_config(
+            &server,
+            "[ex-ostrya client \"anyone\"]\nauth=anonymous\nallow=w:**\n",
+        );
+        let serving = Serving::start(&server, &[]);
+
+        let out = push_from(&client, &[&serving.url, "main"]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(stdout(&out), format!("main (new) {tip}\n"));
+
+        let object = server.join(format!("objects/{}/{}.commit", &dep[..2], &dep[2..]));
+        assert!(object.is_file(), "dependency {dep} was not sent");
+        let refs = ok("ostrya", &[&format!("--repo={}", server.display()), "refs"]);
+        assert_eq!(refs, "main\n");
+        ok("ostrya", &[&format!("--repo={}", server.display()), "fsck"]);
+    }
+
     /// `ostrya push-tree` over HTTPS with a client certificate that the
     /// client CA of the server signed sets the ref. The client group names
     /// the certificate by its subject CN. With no credential, the server

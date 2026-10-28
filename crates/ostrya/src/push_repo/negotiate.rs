@@ -13,7 +13,7 @@ use crate::error::{Error, Result};
 use crate::lock::{LockGuard, LockKind};
 use crate::read::CommitState;
 use crate::refs::MAX_COLLECTION_ID_LEN;
-use crate::related::RelatedRule;
+use crate::related::{self, RelatedField, RelatedRule};
 use crate::remote::{
     Compression, Endpoint, Expected, PushOutcome, PushProgress, PushSession, RefUpdate, ServerInfo,
     SessionOptions,
@@ -56,6 +56,11 @@ pub struct RepoPushOptions {
     ///   holds.
     ///
     /// The push refuses a value less than `-1`.
+    ///
+    /// A push sends each dependency at depth 0, whatever this value is. It
+    /// sends the dependencies of each commit that it offers, the history
+    /// commits included. [`Repo::push_over_stream`] states the rules in
+    /// "Dependencies".
     pub depth: Option<i32>,
     /// The collection id of the namespace of the server that the push
     /// writes.
@@ -142,6 +147,178 @@ pub(super) fn link_of(commit: &Commit) -> CommitLink {
     }
 }
 
+/// The commits that the walk of a push read, and the dependencies that the
+/// push resolved.
+#[derive(Default)]
+pub(super) struct Commits {
+    /// The local state of each commit that the walk read, and of each
+    /// dependency that the push read.
+    pub(super) local: HashMap<Checksum, Local>,
+    /// The entries of field 2 of each commit that `local` holds as
+    /// [`Local::Held`], as names and checksums in the stored order, or the
+    /// [`Error::InvalidRelated`] of the first defective entry. The push takes
+    /// the result at its own point, so it sets the order of the errors. A
+    /// held commit with no entry here has an empty field 2.
+    fields: HashMap<Checksum, Result<Vec<(String, Checksum)>>>,
+    /// The dependencies that the push resolved.
+    known: HashSet<Checksum>,
+}
+
+impl Commits {
+    /// Records the field 2 `field` of the held commit `commit`. An empty
+    /// field 2 gets no entry in `fields`.
+    fn record(&mut self, commit: Checksum, field: Result<Vec<(String, Checksum)>>) {
+        if !field.as_ref().is_ok_and(Vec::is_empty) {
+            self.fields.insert(commit, field);
+        }
+    }
+
+    /// Refuses a defective field 2 entry of each commit of `commits`, in
+    /// order. A commit that the repository does not hold, or marks partial,
+    /// has no field to check.
+    fn check_fields<'a>(&mut self, commits: impl IntoIterator<Item = &'a Checksum>) -> Result<()> {
+        for commit in commits {
+            if self.fields.get(commit).is_some_and(Result::is_err) {
+                // The push stops at this error, so the result moves out.
+                return self
+                    .fields
+                    .remove(commit)
+                    .expect("the field is recorded")
+                    .map(drop);
+            }
+        }
+        Ok(())
+    }
+
+    /// Returns the dependencies of the commit `commit`, in the stored order.
+    ///
+    /// The push calls it for a commit whose dependencies it resolved. A
+    /// commit with no entry in `fields` has an empty field 2 and gives none.
+    pub(super) fn dependencies_of(
+        &self,
+        commit: &Checksum,
+    ) -> impl Iterator<Item = Checksum> + use<'_> {
+        self.fields
+            .get(commit)
+            .into_iter()
+            .flat_map(|field| field.iter().flatten())
+            .map(|(_, dependency)| *dependency)
+    }
+
+    /// Resolves the dependencies of each commit of `commits`, in order, and
+    /// refuses a dependency that the push cannot send.
+    ///
+    /// The repository holds each commit of `commits`, and its field 2 passed
+    /// the format check. The call records each dependency with the commit and
+    /// the entry name that first named it, and skips a dependency that it
+    /// resolved before. A dependency that `local` holds needs no read. One
+    /// trip to the blocking pool reads each other dependency: its commit
+    /// object, its partial marker, the link of the commit, and if its field 2
+    /// is empty. No object bytes leave the pool. The call reads no parent of
+    /// a dependency. Each dependency that passes is [`Local::Held`] in
+    /// `local`, so the walk of the trees finds it.
+    ///
+    /// # Errors
+    ///
+    /// For the first refused dependency, in the order of naming:
+    ///
+    /// - [`Error::ObjectNotFound`] if the repository does not hold the
+    ///   dependency.
+    /// - [`Error::InvalidRelated`] if the repository marks the dependency
+    ///   partial, or if the field 2 of the dependency is not empty. The error
+    ///   names the commit that first named the dependency.
+    /// - [`Error::Io`] or [`Error::Core`] if the read of the dependency
+    ///   fails, or if its commit object does not parse.
+    pub(super) async fn check_dependencies<'a>(
+        &mut self,
+        repo: &Repo,
+        commits: impl IntoIterator<Item = &'a Checksum>,
+    ) -> Result<()> {
+        // Each new dependency, the commit that first named it, and the name of
+        // that entry.
+        let mut named: Vec<(Checksum, Checksum, &str)> = Vec::new();
+        for commit in commits {
+            let entries = match self.fields.get(commit) {
+                Some(Ok(entries)) => entries,
+                Some(Err(_)) => {
+                    unreachable!("the field 2 of a resolved commit passed the check")
+                }
+                None => continue,
+            };
+            for (name, dependency) in entries {
+                if self.known.insert(*dependency) {
+                    named.push((*dependency, *commit, name));
+                }
+            }
+        }
+        let unread: Vec<Checksum> = named
+            .iter()
+            .map(|(dependency, _, _)| *dependency)
+            .filter(|dependency| !self.local.contains_key(dependency))
+            .collect();
+        let mut loaded: HashMap<Checksum, Result<(Local, bool)>> = if unread.is_empty() {
+            HashMap::new()
+        } else {
+            let repo = repo.clone();
+            ostrya_rt::unblock(move || {
+                unread
+                    .into_iter()
+                    .map(|key| (key, read_dependency(&repo, &key)))
+                    .collect()
+            })
+            .await
+        };
+        for (dependency, naming, name) in named {
+            let nested = match loaded.remove(&dependency) {
+                Some(result) => {
+                    let (local, nested) = result?;
+                    self.local.insert(dependency, local);
+                    nested
+                }
+                // A commit that `local` holds: `fields` holds its field 2 if
+                // that field is not empty, valid or not.
+                None => self.fields.contains_key(&dependency),
+            };
+            match self.local[&dependency] {
+                Local::Absent => {
+                    return Err(Error::ObjectNotFound {
+                        checksum: dependency,
+                        ty: ObjectType::Commit,
+                    });
+                }
+                Local::Partial => {
+                    return Err(related::partial_dependency(naming, name, &dependency));
+                }
+                Local::Held(_) if nested => {
+                    return Err(related::nested_dependency(naming, name, &dependency));
+                }
+                Local::Held(_) => {}
+            }
+        }
+        Ok(())
+    }
+}
+
+/// Returns the local state of the dependency `checksum`, and `true` if its
+/// field 2 is not empty.
+///
+/// The call reads the commit object and the partial marker on the calling
+/// thread. A caller on the executor calls it on the blocking pool.
+fn read_dependency(repo: &Repo, checksum: &Checksum) -> Result<(Local, bool)> {
+    let bytes = match repo.load_object_bytes_blocking(ObjectType::Commit, checksum) {
+        Ok(bytes) => bytes,
+        Err(Error::ObjectNotFound { .. }) => return Ok((Local::Absent, false)),
+        Err(e) => return Err(e),
+    };
+    Ok(match repo.commit_state_blocking(checksum)? {
+        CommitState::Normal => (
+            Local::Held(Commit::parse_link(&bytes)?),
+            related::has_dependencies(&bytes)?,
+        ),
+        CommitState::Partial => (Local::Partial, false),
+    })
+}
+
 /// The local work of a push before the session opens.
 pub(super) struct Plan {
     pub(super) repo: Repo,
@@ -160,9 +337,9 @@ pub(super) struct Plan {
     /// commit on, as the walk read them. A delete has none. The negotiation
     /// drops the chains when it has the commits to offer.
     pub(super) chains: Vec<Vec<Checksum>>,
-    /// Each commit the walk read. The negotiation drops the map after the
-    /// tree walk.
-    pub(super) commits: HashMap<Checksum, Local>,
+    /// Each commit that the walk read, with its field 2, and each dependency
+    /// that the push read. The negotiation drops them after the tree walk.
+    pub(super) commits: Commits,
 }
 
 /// Methods that push commits to a remote.
@@ -186,7 +363,9 @@ impl Repo {
     /// refuses the endpoint, the push takes no lock and reads no refspec.
     /// After this step, the push runs the checks and the walk. It opens the
     /// session with [`PreparedSession::open`](crate::remote::PreparedSession::open)
-    /// and does the rest of the work of `push_over_stream`.
+    /// and does the rest of the work of `push_over_stream`. The push sends
+    /// the dependencies of each commit that it offers, as "Dependencies" of
+    /// [`push_over_stream`](Repo::push_over_stream) states.
     ///
     /// # Tokio runtime
     ///
@@ -261,6 +440,9 @@ impl Repo {
     /// commit. If `depth` is `None`, that commit is the last commit of the
     /// chain, and the push does not walk its tree.
     ///
+    /// The push checks the format of field 2 of each commit that the walk
+    /// reads, also of a history commit that it does not offer.
+    ///
     /// # Namespace
     ///
     /// Before the session opens, the push reads the `ostree.collection-binding`
@@ -288,11 +470,13 @@ impl Repo {
     /// alone if the server does not hold the `DST`. The server then decides
     /// if the update is a fast-forward.
     ///
-    /// The negotiation offers the commits first, in the first `Have` round.
-    /// Then the push walks the tree of each source commit, also when the
-    /// server holds that commit. It also walks the tree of each history
-    /// commit that the server lacks. It does not walk the tree of a history
-    /// commit that the server holds.
+    /// The negotiation offers the commits first, in the first `Have` round:
+    /// each source commit and its history, then the dependencies of each
+    /// offered commit. Then the push walks the tree of each source commit,
+    /// also when the server holds that commit. It also walks the tree of
+    /// each history commit and each dependency that the server lacks. It
+    /// does not walk the tree of a history commit or a dependency that the
+    /// server holds.
     ///
     /// If the local repository lacks a dirtree or a dirmeta, the push ends
     /// the session with `Abort`. The second `Have` round offers the tree
@@ -305,6 +489,45 @@ impl Repo {
     /// and of each source commit. It sends the stored `.commitmeta` bytes with
     /// no parse, so the server refuses a `.commitmeta` that is not an `a{sv}`
     /// dict.
+    ///
+    /// # Dependencies
+    ///
+    /// Field 2 of a commit names the dependencies of the commit.
+    /// [`read_commit_related`](Repo::read_commit_related) reads them. The push
+    /// sends the dependencies of each commit that it offers: each source
+    /// commit, and each history commit of the offer.
+    ///
+    /// - The push sends each dependency at depth 0, so a dependency entry
+    ///   adds no parent to the push. The push offers a dependency one time,
+    ///   also if several commits name it.
+    /// - The push sets no ref for a dependency.
+    /// - A dependency is a commit of the offer for each other rule. For a
+    ///   dependency that the server lacks, the push sends the commit object,
+    ///   the objects of its tree, its composefs image, and its detached
+    ///   metadata.
+    /// - The push makes no ref-binding check and no collection-binding check
+    ///   on a dependency.
+    /// - The push does not send a build source: a commit that the detached
+    ///   metadata key `ostrya.related` names. The key goes with the detached
+    ///   metadata of its commit.
+    ///
+    /// These cases refuse the push:
+    ///
+    /// - An entry of field 2 of a commit of the walk has an empty name or a
+    ///   checksum that is not 32 bytes.
+    /// - The local repository does not hold a dependency, or marks it
+    ///   partial. This is also true for a parent that ends a chain, if a
+    ///   commit of the push names that parent as a dependency.
+    /// - A dependency names dependencies of its own: its own field 2 is not
+    ///   empty, also if that field 2 holds a defective entry.
+    ///
+    /// If `depth` is `Some`, the push finds each case before it writes a
+    /// byte. If `depth` is `None`, the push finds a defective entry and each
+    /// defect of a dependency of a source commit before it writes a byte. It
+    /// finds a defect of a dependency of a history commit after the cut at
+    /// the server tip, which comes after `HelloReply`. It then ends the
+    /// session with `Abort` and sends no object. The push reads no dependency
+    /// of a history commit that it does not offer.
     ///
     /// # Ref updates
     ///
@@ -374,6 +597,12 @@ impl Repo {
     ///   a source commit, as "Namespace" states.
     /// - [`Error::ObjectNotFound`] if the local repository lacks a source
     ///   commit, or a dirtree or a dirmeta of a tree that the push walks.
+    /// - [`Error::InvalidRelated`] if an entry of field 2 of a commit of the
+    ///   walk has an empty name or a checksum that is not 32 bytes, or if a
+    ///   dependency of an offered commit is partial in the local repository
+    ///   or names dependencies of its own. [`Error::ObjectNotFound`] if the
+    ///   local repository lacks such a dependency. "Dependencies" states when
+    ///   the push finds each case.
     /// - [`Error::LockTimeout`] if the wait for the lock passes
     ///   `[core] lock-timeout-secs`.
     /// - [`Error::InvalidFormat`] if `[core] lock-timeout-secs` is less than
@@ -427,7 +656,7 @@ impl Repo {
         let targets = self.push_targets(&opts.refspecs).await?;
 
         let mut sources: Vec<(Checksum, Commit)> = Vec::new();
-        let mut commits: HashMap<Checksum, Local> = HashMap::new();
+        let mut commits = Commits::default();
         for target in &targets {
             let Some(checksum) = target.commit else {
                 continue;
@@ -435,7 +664,7 @@ impl Repo {
             let position = match sources.iter().position(|(c, _)| *c == checksum) {
                 Some(position) => position,
                 None => {
-                    let (commit, state) = self.load_commit(&checksum).await?;
+                    let (mut commit, state) = self.load_commit(&checksum).await?;
                     if state == CommitState::Partial {
                         return Err(invalid(format!(
                             "commit {checksum} for '{}' is marked partial in the local \
@@ -443,7 +672,11 @@ impl Repo {
                             target.dst
                         )));
                     }
-                    commits.insert(checksum, Local::Held(link_of(&commit)));
+                    commits
+                        .local
+                        .insert(checksum, Local::Held(link_of(&commit)));
+                    let related = std::mem::take(&mut commit.related);
+                    commits.record(checksum, related::checked_dependencies(&checksum, related));
                     sources.push((checksum, commit));
                     sources.len() - 1
                 }
@@ -464,7 +697,7 @@ impl Repo {
         for target in &targets {
             let mut chain = Vec::new();
             if let Some(source) = target.commit {
-                let mut next = match commits[&source] {
+                let mut next = match commits.local[&source] {
                     Local::Held(link) => link.parent,
                     Local::Partial | Local::Absent => unreachable!("a source commit is held"),
                 };
@@ -495,6 +728,23 @@ impl Repo {
             chains.push(chain);
         }
 
+        // The format of field 2 of each commit that the walk read, then the
+        // dependencies. With no depth, the cut at the server tip comes after
+        // `HelloReply`, so the negotiation resolves the dependencies of the
+        // history that it offers.
+        let walked = sources
+            .iter()
+            .map(|(checksum, _)| checksum)
+            .chain(chains.iter().flatten());
+        commits.check_fields(walked.clone())?;
+        match opts.depth {
+            Some(_) => commits.check_dependencies(self, walked).await?,
+            None => {
+                let sources = sources.iter().map(|(checksum, _)| checksum);
+                commits.check_dependencies(self, sources).await?;
+            }
+        }
+
         Ok(Plan {
             repo: self.clone(),
             _lock: lock,
@@ -513,31 +763,40 @@ impl Repo {
 
     /// Returns the local state of the history commit `checksum`, read once.
     ///
-    /// One blocking call reads the object and the partial marker, and parses
-    /// the link of the commit.
+    /// One blocking call reads the object and the partial marker, parses the
+    /// link of the commit, and checks the format of its field 2. The result
+    /// of the check goes into `commits` for a later point of the push.
     pub(super) async fn history_commit(
         &self,
         checksum: &Checksum,
-        commits: &mut HashMap<Checksum, Local>,
+        commits: &mut Commits,
     ) -> Result<Local> {
-        if let Some(local) = commits.get(checksum) {
+        if let Some(local) = commits.local.get(checksum) {
             return Ok(*local);
         }
         let repo = self.clone();
         let key = *checksum;
-        let local = ostrya_rt::unblock(move || {
+        let (local, field) = ostrya_rt::unblock(move || {
             let bytes = match repo.load_object_bytes_blocking(ObjectType::Commit, &key) {
                 Ok(bytes) => bytes,
-                Err(Error::ObjectNotFound { .. }) => return Ok(Local::Absent),
+                Err(Error::ObjectNotFound { .. }) => return Ok((Local::Absent, None)),
                 Err(e) => return Err(e),
             };
             Ok(match repo.commit_state_blocking(&key)? {
-                CommitState::Normal => Local::Held(Commit::parse_link(&bytes)?),
-                CommitState::Partial => Local::Partial,
+                CommitState::Normal => {
+                    let field = related::parse_dependencies(&bytes).and_then(|entries| {
+                        related::checked_entries(RelatedField::Dependencies, Some(key), entries)
+                    });
+                    (Local::Held(Commit::parse_link(&bytes)?), Some(field))
+                }
+                CommitState::Partial => (Local::Partial, None),
             })
         })
         .await?;
-        commits.insert(*checksum, local);
+        commits.local.insert(*checksum, local);
+        if let Some(field) = field {
+            commits.record(*checksum, field);
+        }
         Ok(local)
     }
 }
@@ -815,8 +1074,25 @@ impl Plan {
                 }
             }
         }
-
         drop(chains);
+
+        // Then the dependencies of each offered commit, each once. With no
+        // depth, the push resolves the dependencies of the offered history
+        // here, before the first upload.
+        if opts.depth.is_none() {
+            let offer = names.iter().map(|name| &name.checksum);
+            self.commits.check_dependencies(&self.repo, offer).await?;
+        }
+        let resolved = names.len();
+        for at in 0..resolved {
+            let commit = names[at].checksum;
+            for dependency in self.commits.dependencies_of(&commit) {
+                if offered.insert(dependency) {
+                    names.push(ObjectName::new(dependency, ObjectType::Commit));
+                }
+            }
+        }
+
         drop(offered);
         let commits = std::mem::take(&mut self.commits);
 
@@ -842,7 +1118,7 @@ impl Plan {
             let mut seen = HashSet::new();
             let mut tree_names = Vec::new();
             for commit in &walked {
-                let Local::Held(link) = commits[commit] else {
+                let Local::Held(link) = commits.local[commit] else {
                     unreachable!("an offered commit is held");
                 };
                 self.repo

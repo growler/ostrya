@@ -22,6 +22,8 @@
 //!   fetch the dependencies of each commit that they read.
 //!   [`Repo::pull_local`] imports the dependencies of each commit that it
 //!   walks.
+//! - `Repo::push`, `Repo::push_over_stream`, and `Repo::push_to_bucket` send
+//!   the dependencies of each commit that they offer.
 
 use std::os::fd::AsFd;
 use std::sync::LazyLock;
@@ -42,6 +44,9 @@ const RELATED_SIGNATURE: &str = "a(say)";
 
 /// The end of the reason of a dependency whose own field 2 is not empty.
 const NESTED_REASON: &str = "which has dependencies of its own";
+
+/// The end of the reason of a dependency that the repository marks partial.
+const PARTIAL_REASON: &str = "which is partial";
 
 /// The type of a commit object. The parse of field 2 decodes member 2 alone.
 static COMMIT_TYPE: LazyLock<Type> =
@@ -578,6 +583,17 @@ pub(crate) fn nested_dependency(commit: Checksum, name: &str, dependency: &Check
     }
 }
 
+/// Returns the error for the dependency `name` of `commit`, which names the
+/// commit `dependency` that the repository marks partial.
+#[cfg_attr(not(feature = "push"), allow(dead_code))]
+pub(crate) fn partial_dependency(commit: Checksum, name: &str, dependency: &Checksum) -> Error {
+    Error::InvalidRelated {
+        commit: Some(commit),
+        field: RelatedField::Dependencies,
+        reason: format!("dependency {name} names commit {dependency}, {PARTIAL_REASON}"),
+    }
+}
+
 /// Returns the dependencies `entries` of a new commit, sorted by name in byte
 /// order.
 ///
@@ -699,7 +715,7 @@ pub(crate) async fn check_dependencies<'a>(
                 },
             };
             if repo.commit_state_blocking(checksum)? == CommitState::Partial {
-                return Ok(Some((index, "which is partial")));
+                return Ok(Some((index, PARTIAL_REASON)));
             }
             if has_dependencies(&bytes)? {
                 return Ok(Some((index, NESTED_REASON)));

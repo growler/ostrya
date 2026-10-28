@@ -3103,6 +3103,52 @@ no ref, and no `.commitpartial` marker.
 The `pull-local` command of `ostree` imports no dependency
 (`conformance/cli-behavior.md`, "Related commits in a pull").
 
+### Dependencies in a push
+
+A push follows the dependencies of each commit that it offers: each source
+commit and each history commit of the offer. These rules apply to a push over
+ssh and over HTTP, to a push over the streams of the caller, and to a push to
+a bucket repository:
+
+- The push sends each dependency at depth 0, so a dependency entry adds no
+  parent to the push. The push offers a dependency one time, also if several
+  commits name it. A prune of the server accepts the parents that the push
+  did not send, as after a push with a small depth.
+- The push writes no ref for a dependency.
+- The push makes no ref-binding check and no collection-binding check on a
+  dependency.
+- A dependency is an offered commit for each other rule. For a dependency
+  that the server lacks, the push sends the commit object, the objects of
+  its tree, its composefs image, and its `.commitmeta`. The push walks no
+  tree of a dependency that the server holds. A dependency that a bucket
+  repository holds with a partial-commit marker gets the walk of its whole
+  tree, and the push deletes the marker.
+- The push does not follow a build source. `ostrya.related` goes with the
+  `.commitmeta` of its commit.
+
+The push checks the format of field 2 of each commit of its walk: each source
+commit, and each parent that the depth takes, or each parent of the local
+chain with no depth. This is also true for a history commit that the push
+does not offer. A defective related value in field 2 refuses the push: an
+entry with an empty name, an entry with a checksum that is not 32 bytes, and
+an entry that names a nested dependency. A dependency whose own field 2 is
+not empty is nested, also if that field 2 holds a defective entry. A
+dependency that the local repository does not hold, or marks partial,
+refuses the push too. This is also true for a parent that ends a chain, if a
+commit of the push names it as a dependency.
+
+With a depth, the push finds each of these failures before it writes a byte
+or sends a request. With no depth, the push finds the failures of the
+dependencies of the history commits after the cut at the tip of the
+destination ref: after `HelloReply` in a session, and under the writer lock
+of a bucket repository. The push then sends no object. A session ends with
+`Abort`, and a push to a bucket repository uploads nothing and releases the
+lock. The push reads no dependency of a history commit that it does not
+offer.
+
+`ostrya push --onto` and `ostrya push-tree` send no dependency. The field 2 of
+a server commit is empty ("Server commit").
+
 ## Ref patterns
 
 The port selects refs by name with two grammars. A pattern of a client group
@@ -3533,6 +3579,15 @@ them:
 - To cancel an object, a client sends the abandon marker and then `Abort`.
 - On a stream, a client sends one request and reads its reply before it sends
   the next one.
+
+A push of a repository (`ostrya push`, `Repo::push`, and
+`Repo::push_over_stream`) offers its commits in the first `Have`: each source
+commit, its history, and then the dependencies of each offered commit
+("Dependencies in a push"). With no depth, the history ends before the
+current commit of the ref in `HelloReply`. If the server does not hold the
+ref, or the local chain does not hold the commit of the ref, the push offers
+no history commit. The client then offers the objects of the trees of the
+commits that the server lacks, and of each source commit.
 
 ### Hello and HelloReply
 
@@ -6321,8 +6376,9 @@ are:
    forced. A tip that the local repository does not hold, or marks partial,
    is no ancestor. The fast-forward rule and the force apply to each ref in
    its own namespace.
-5. The walk: each source commit and its history, cut at the tip of the ref
-   in the bucket, as a push over a session offers them. The trees of the
+5. The walk: each source commit, its history, cut at the tip of the ref in
+   the bucket, and the dependencies of each offered commit, as a push over a
+   session offers them ("Dependencies in a push"). The trees of the
    commits that the bucket lacks and of the offered commits with a
    partial-commit marker under `state/`, and the composefs image of each
    source commit and of each walked commit, if the local repository holds

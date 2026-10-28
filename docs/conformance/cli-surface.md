@@ -4626,6 +4626,20 @@ ostrya push [--repo=PATH] REMOTE REF --onto=BRANCH
   source commit alone. `--depth=-1` sends the whole local chain. A value
   below `-1` is refused before the ssh client starts and before the first
   HTTP request.
+- The push also sends the dependencies that field 2 of each offered commit
+  names, each at depth 0 and with no ref (`../format-reference.md`,
+  "Dependencies in a push"). It sends no build source. It refuses at exit 1
+  a field 2 entry with an empty name or with a checksum that is not 32
+  bytes, in a source commit and in each parent that the push walks: `N`
+  parents with `--depth=N`, and the whole local chain with `--depth=-1` or
+  without `--depth`. It also refuses a dependency that the local repository
+  does not hold or marks partial, and a dependency whose own field 2 is not
+  empty, also if that field 2 holds a defective entry. Each of these
+  refusals comes before the ssh client starts, before the first HTTP
+  request, and before the first request to a bucket. Without `--depth`, the
+  push checks the dependencies of the history commits after the server
+  reports its refs, or under the writer lock of a bucket. A refusal there
+  comes before the push sends an object.
 - `--force` sends each update with any expected state, and asks the server
   to allow an update that is not a fast-forward. The server refuses such an
   update unless the client group of the push has `w` and `d` on the ref

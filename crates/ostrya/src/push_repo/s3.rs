@@ -32,7 +32,7 @@ use ostrya_core::{Checksum, DeflateReader, ObjectName, ObjectType, is_ref_name};
 use sha2::{Digest, Sha256};
 
 use super::invalid;
-use super::negotiate::{Local, Plan, RepoPushOptions, check_bindings, offered_history};
+use super::negotiate::{Commits, Local, Plan, RepoPushOptions, check_bindings, offered_history};
 use super::source::RepoSource;
 use crate::access::{AuthItem, ClientAccess, ReadAccess};
 use crate::archive::{ArchiveAnswer, ArchiveView};
@@ -250,8 +250,8 @@ impl Repo {
     /// 1. The push refuses the options that it cannot carry, and runs the
     ///    checks and the commit walk of [`Repo::push_over_stream`] with no
     ///    request: the depth, the collection, the refspecs, the source
-    ///    commits, and the bindings. It holds the repository lock shared
-    ///    until it returns.
+    ///    commits, the bindings, and the dependencies. It holds the repository
+    ///    lock shared until it returns.
     /// 2. It takes the writer lock of the bucket repository for
     ///    [`LockOperation::Push`], with
     ///    [`break_lock`](RepoPushOptions::break_lock).
@@ -263,9 +263,12 @@ impl Repo {
     ///    be an ancestor of the new commit in the local repository, unless
     ///    [`force`](RepoPushOptions::force) is set. A tip that the local
     ///    repository does not hold, or marks partial, is no ancestor.
-    /// 4. It walks the commits to offer: each source commit and its history,
-    ///    as [`Repo::push_over_stream`] offers them, with the tip of the ref
-    ///    in the bucket in the role of the server tip. It walks the tree of
+    /// 4. It walks the commits to offer: each source commit, its history, and
+    ///    the dependencies of each offered commit, as
+    ///    [`Repo::push_over_stream`] offers them, with the tip of the ref in
+    ///    the bucket in the role of the server tip. With no depth, it checks
+    ///    the dependencies of the offered history here, as "Dependencies" of
+    ///    [`Repo::push_over_stream`] states. It walks the tree of
     ///    each offered commit that the listing lacks, and of each offered
     ///    commit with a partial-commit marker `state/<checksum>.commitpartial`,
     ///    and adds the composefs image of each source commit and of each
@@ -352,6 +355,10 @@ impl Repo {
     ///   name. The push then sends no request.
     /// - The errors of the checks and of the commit walk of
     ///   [`Repo::push_over_stream`], before a request.
+    /// - With no depth, [`Error::InvalidRelated`] or [`Error::ObjectNotFound`]
+    ///   for a dependency of a history commit after the cut at the tip of the
+    ///   ref in the bucket, as "Dependencies" of [`Repo::push_over_stream`]
+    ///   states. The push then uploads nothing and releases the lock.
     /// - The errors of [`BucketRepo::lock`].
     /// - [`Error::Remote`] with
     ///   [`InvalidInput`](crate::remote::Error::InvalidInput) if the bucket
@@ -668,6 +675,21 @@ impl Repo {
             }
         }
         drop(chains);
+        // Then the dependencies of each offered commit, each once. With no
+        // depth, the push resolves the dependencies of the offered history
+        // here, before the first upload.
+        if opts.depth.is_none() {
+            plan.commits.check_dependencies(self, &offered).await?;
+        }
+        let resolved = offered.len();
+        for at in 0..resolved {
+            let commit = offered[at];
+            for dependency in plan.commits.dependencies_of(&commit) {
+                if seen.insert(dependency) {
+                    offered.push(dependency);
+                }
+            }
+        }
         let missing_commits: Vec<Checksum> = offered
             .iter()
             .filter(|commit| !holds(commit, ObjectType::Commit))
@@ -689,7 +711,7 @@ impl Repo {
         let mut seen = HashSet::new();
         let mut tree_names = Vec::new();
         for commit in missing_commits.iter().chain(&marked) {
-            let Local::Held(link) = plan.commits[commit] else {
+            let Local::Held(link) = plan.commits.local[commit] else {
                 unreachable!("an offered commit is held");
             };
             self.collect_tree_strict(
@@ -762,7 +784,7 @@ impl Repo {
         &self,
         new: Checksum,
         tip: Checksum,
-        commits: &mut HashMap<Checksum, Local>,
+        commits: &mut Commits,
     ) -> Result<bool> {
         let mut next = new;
         loop {
@@ -1361,7 +1383,7 @@ mod tests {
             let c2 = commit_tree(&repo, &scratch, "main", Some(c1), b"2").await;
             let c3 = commit_tree(&repo, &scratch, "main", Some(c2), b"3").await;
             let other = commit_tree(&repo, &scratch, "other", None, b"x").await;
-            let mut commits = HashMap::new();
+            let mut commits = Commits::default();
             assert!(repo.fast_forward(c3, c1, &mut commits).await.unwrap());
             assert!(repo.fast_forward(c3, c2, &mut commits).await.unwrap());
             assert!(!repo.fast_forward(c3, other, &mut commits).await.unwrap());
@@ -1374,10 +1396,10 @@ mod tests {
                 b"",
             )
             .unwrap();
-            let mut commits = HashMap::new();
+            let mut commits = Commits::default();
             assert!(!repo.fast_forward(c3, c1, &mut commits).await.unwrap());
             // A tip that the repository does not hold is no ancestor.
-            let mut commits = HashMap::new();
+            let mut commits = Commits::default();
             let absent = Checksum::from_bytes([9; 32]);
             assert!(!repo.fast_forward(c3, absent, &mut commits).await.unwrap());
         });

@@ -27,7 +27,10 @@
 //! - `Repo::receive` and `Repo::receive_stream` check the dependencies of each
 //!   commit that the session stages, and apply the rules of the ref updates to
 //!   each staged dependency.
+//! - [`Repo::apply_static_delta`] and [`Repo::apply_static_delta_offline`]
+//!   check the dependencies of the target commit before they write an object.
 
+use std::collections::HashSet;
 use std::os::fd::AsFd;
 use std::sync::LazyLock;
 
@@ -743,7 +746,8 @@ pub(crate) fn check_order<'a>(
 /// repository holds it, and the repository holds no
 /// `state/<checksum>.commitpartial` marker for it. A dependency is nested if
 /// its own field 2 is not empty. The checks of all dependencies run in one
-/// trip to the blocking pool, in the order of `deps`.
+/// trip to the blocking pool, in the order of `deps`. A checksum that `deps`
+/// names more than once is checked once, at its first entry.
 ///
 /// # Errors
 ///
@@ -774,7 +778,13 @@ pub(crate) async fn check_dependencies<'a>(
     // The closure gives the index of the first refused dependency and the end
     // of the reason. The names stay here.
     let refused = ostrya_rt::unblock(move || -> Result<Option<(usize, &'static str)>> {
+        // A repeated checksum has the result of its first entry, so the check
+        // reads it once.
+        let mut checked = HashSet::new();
         for (index, (checksum, staged)) in checksums.iter().zip(staged).enumerate() {
+            if !checked.insert(*checksum) {
+                continue;
+            }
             let bytes = match staging.as_ref().filter(|_| staged) {
                 Some(staging) => {
                     let flat = crate::write::flat_name(checksum, ObjectType::Commit, repo.mode());

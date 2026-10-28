@@ -2874,6 +2874,8 @@ enum StaticDeltaCommand {
     /// --keys-file, or --keys-dir. With a key source, the command verifies a
     /// signed delta before it writes an object, and applies an unsigned delta
     /// with no check. Without a key source, the command verifies no signature.
+    /// Each dependency of the target commit must be complete in the
+    /// repository, so apply the delta of each dependency first.
     ApplyOffline(DeltaApplyArgs),
     /// Generate a static delta and print what it is generated from and to.
     ///
@@ -6774,7 +6776,10 @@ fn verify_sign_type(name: &str, report_unsupported: bool) -> SignType {
 /// 4. [`lexical_path`] applies the `..` components of the path. Then the path
 ///    resolves, and the superblock reads.
 /// 5. The signatures of a signed delta verify.
-/// 6. The delta applies.
+/// 6. The delta applies. First the fallback objects of the delta are present.
+///    Then the entries of field 2 of the target are valid, and the
+///    dependencies of the target are complete. The `ostree` command has no
+///    check of field 2. Then the parts apply.
 ///
 /// The superblock is read once, so the verified bytes are the applied bytes.
 /// Nothing is printed on success.

@@ -1723,6 +1723,14 @@ A delta carries its target commit alone, and no field of the superblock names
 a dependency. A pull of the port looks for one delta for each dependency of
 the commits that it moves, as for a target ("Static deltas of dependencies").
 
+An offline application of the port reads field 2 of the target commit before
+it writes an object. It refuses the delta if an entry of the field is
+defective, or if a dependency is not complete in the repository or is nested.
+The refusal writes no object. The check also runs if the repository holds the
+target. It accepts entries that are not sorted by name and two entries with
+one name. Offline media thus carry one delta for each dependency, and the
+deltas of the dependencies apply first.
+
 ### Fallback selection
 
 The generator makes an object a fallback when its compared size is at least the

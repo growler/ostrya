@@ -31,8 +31,8 @@ use futures_lite::AsyncReadExt;
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, DeltaEndianness,
     DeltaOptions, DeltaSuperblock, DummyVerifier, Ed25519Signer, Ed25519Verifier, Error,
-    MutableTree, Repo, RepoMode, SignFuture, Signer, SummaryOptions, TreeEntry, Type, Value,
-    base64, from_bytes, static_delta_relative_dir,
+    MutableTree, ObjectType, Repo, RepoMode, SignFuture, Signer, SummaryOptions, TreeEntry, Type,
+    Value, base64, from_bytes, static_delta_relative_dir,
 };
 use ostrya_rt::block_on;
 
@@ -84,6 +84,19 @@ fn noise(len: usize, seed: u64) -> Vec<u8> {
 /// objects then do not depend on the owner or the umask of the test
 /// environment.
 async fn commit_tree(repo: &Repo, tree: &Path, parent: Option<Checksum>) -> Checksum {
+    commit_tree_related(repo, tree, parent, &[]).await
+}
+
+/// Commits `tree` as [`commit_tree`] does, with the dependencies `related` in
+/// field 2.
+///
+/// The repository must hold each dependency complete.
+async fn commit_tree_related(
+    repo: &Repo,
+    tree: &Path,
+    parent: Option<Checksum>,
+    related: &[(&str, Checksum)],
+) -> Checksum {
     let txn = repo.transaction().await.unwrap();
     let dfd = std::fs::File::open(tree).unwrap();
     let mut modifier = Some(CommitModifier::new(
@@ -102,7 +115,10 @@ async fn commit_tree(repo: &Repo, tree: &Path, parent: Option<Checksum>) -> Chec
                 body: None,
                 timestamp: Some(1_700_000_000),
                 metadata: None,
-                related: Vec::new(),
+                related: related
+                    .iter()
+                    .map(|(name, checksum)| ((*name).to_owned(), *checksum))
+                    .collect(),
             },
             &root,
         )
@@ -1570,6 +1586,319 @@ fn apply_static_delta_writes_no_ref() {
         let offline = fresh_archive(tmp.path(), "offline").await;
         offline.apply_static_delta_offline(&delta).await.unwrap();
         assert_eq!(offline.list_refs(None).await.unwrap(), []);
+    });
+}
+
+// --- the dependencies of the target ------------------------------------------
+
+/// A source repository with a dependency `dep`, a base commit `base`, and a
+/// target commit `target`. The target has the parent `base` and names `dep`
+/// as `boot/dep` in field 2.
+struct DependencyFixture {
+    src: Repo,
+    dep: Checksum,
+    base: Checksum,
+    target: Checksum,
+}
+
+impl DependencyFixture {
+    async fn new(base_dir: &Path) -> DependencyFixture {
+        let src = fresh_archive(base_dir, "src").await;
+        let mut commits = Vec::new();
+        for name in ["dep", "base", "target"] {
+            let tree = base_dir.join(format!("tree-{name}"));
+            std::fs::create_dir_all(&tree).unwrap();
+            std::fs::write(tree.join(format!("{name}.txt")), format!("{name}\n")).unwrap();
+            commits.push(tree);
+        }
+        let dep = commit_tree(&src, &commits[0], None).await;
+        let base = commit_tree(&src, &commits[1], None).await;
+        let target = commit_tree_related(&src, &commits[2], Some(base), &[("boot/dep", dep)]).await;
+        DependencyFixture {
+            src,
+            dep,
+            base,
+            target,
+        }
+    }
+
+    /// Generates the delta from `from` to `to` in the source repository and
+    /// returns its directory.
+    async fn delta(&self, from: Option<&Checksum>, to: &Checksum) -> PathBuf {
+        let relative = self
+            .src
+            .generate_static_delta(from, to, &DeltaOptions::default())
+            .await
+            .unwrap();
+        self.src.path().join(relative)
+    }
+
+    /// Stores a copy of the target with field 2 set to `related` and returns
+    /// the directory of its delta from scratch.
+    async fn variant(&self, related: &[common::Field2Entry<'_>]) -> (Checksum, PathBuf) {
+        let commit = common::store_with_field2(&self.src, &self.target, related).await;
+        (commit, self.delta(None, &commit).await)
+    }
+}
+
+/// Applies the delta in `dir` to `dst` through `Repo::apply_static_delta_offline`,
+/// asserts that the call fails with `Error::InvalidRelated` for field 2 and
+/// writes no object and no ref, and returns the commit and the reason.
+async fn refused_apply(dst: &Repo, dir: &Path) -> (Option<Checksum>, String) {
+    let objects = dst.list_objects().await.unwrap();
+    let files = common::file_inventory(dst.path(), "objects");
+    let err = dst.apply_static_delta_offline(dir).await.unwrap_err();
+    assert_eq!(dst.list_objects().await.unwrap(), objects);
+    assert_eq!(common::file_inventory(dst.path(), "objects"), files);
+    assert_eq!(dst.list_refs(None).await.unwrap(), []);
+    common::dependency_error(err)
+}
+
+/// The reason of a dependency `boot/dep` on `dep` that ends in `defect`.
+fn dep_reason(dep: &Checksum, defect: &str) -> String {
+    format!("dependency boot/dep names commit {dep}, {defect}")
+}
+
+/// A target applies after the delta of its dependency, and is refused before.
+#[test]
+fn a_target_applies_after_the_deltas_of_its_dependencies() {
+    let tmp = TmpDir::new("apply-deps-order");
+    block_on(async {
+        let fx = DependencyFixture::new(tmp.path()).await;
+        let dep_delta = fx.delta(None, &fx.dep).await;
+        let target_delta = fx.delta(None, &fx.target).await;
+        let dst = fresh_archive(tmp.path(), "dst").await;
+        refused_apply(&dst, &target_delta).await;
+        assert_eq!(
+            dst.apply_static_delta_offline(&dep_delta).await.unwrap(),
+            fx.dep
+        );
+        assert_eq!(
+            dst.apply_static_delta_offline(&target_delta).await.unwrap(),
+            fx.target
+        );
+        for commit in [fx.dep, fx.target] {
+            assert!(dst.has_object(ObjectType::Commit, &commit).await.unwrap());
+        }
+    });
+}
+
+/// A dependency that the repository does not hold is refused through both
+/// apply calls, and neither writes an object.
+#[test]
+fn a_target_with_a_missing_dependency_writes_no_object() {
+    let tmp = TmpDir::new("apply-deps-missing");
+    block_on(async {
+        let fx = DependencyFixture::new(tmp.path()).await;
+        let target_delta = fx.delta(None, &fx.target).await;
+        let dst = fresh_archive(tmp.path(), "dst").await;
+        let expected = (
+            Some(fx.target),
+            dep_reason(
+                &fx.dep,
+                "which is in neither the repository nor the transaction",
+            ),
+        );
+        assert_eq!(refused_apply(&dst, &target_delta).await, expected);
+
+        let objects = dst.list_objects().await.unwrap();
+        let sb = DeltaSuperblock::read(&target_delta.join("superblock"))
+            .await
+            .unwrap();
+        let err = dst.apply_static_delta(sb, &target_delta).await.unwrap_err();
+        assert_eq!(common::dependency_error(err), expected);
+        assert_eq!(dst.list_objects().await.unwrap(), objects);
+    });
+}
+
+/// The check of the dependencies runs before the parts apply. The delta has
+/// no part file, and the apply gives the error of the absent dependency.
+#[test]
+fn the_dependencies_are_checked_before_the_parts_apply() {
+    let tmp = TmpDir::new("apply-deps-before-parts");
+    block_on(async {
+        let fx = DependencyFixture::new(tmp.path()).await;
+        let target_delta = fx.delta(None, &fx.target).await;
+        std::fs::remove_file(target_delta.join("0")).unwrap();
+        let dst = fresh_archive(tmp.path(), "dst").await;
+        assert_eq!(
+            refused_apply(&dst, &target_delta).await,
+            (
+                Some(fx.target),
+                dep_reason(
+                    &fx.dep,
+                    "which is in neither the repository nor the transaction"
+                )
+            )
+        );
+    });
+}
+
+/// A dependency with dependencies of its own is refused, and the apply writes
+/// no object.
+#[test]
+fn a_target_with_a_nested_dependency_writes_no_object() {
+    let tmp = TmpDir::new("apply-deps-nested");
+    block_on(async {
+        let fx = DependencyFixture::new(tmp.path()).await;
+        // `nested` is a copy of the base commit that names `dep`.
+        let nested =
+            common::store_with_field2(&fx.src, &fx.base, &[("boot/dep", fx.dep.as_bytes())]).await;
+        let (target, target_delta) = fx.variant(&[("boot/dep", nested.as_bytes())]).await;
+        let dst = fresh_archive(tmp.path(), "dst").await;
+        dst.apply_static_delta_offline(&fx.delta(None, &fx.dep).await)
+            .await
+            .unwrap();
+        dst.apply_static_delta_offline(&fx.delta(None, &nested).await)
+            .await
+            .unwrap();
+        assert_eq!(
+            refused_apply(&dst, &target_delta).await,
+            (
+                Some(target),
+                dep_reason(&nested, "which has dependencies of its own")
+            )
+        );
+    });
+}
+
+/// A dependency that the repository marks partial is refused, and the apply
+/// writes no object. The marker stays.
+#[test]
+fn a_target_with_a_partial_dependency_writes_no_object() {
+    let tmp = TmpDir::new("apply-deps-partial");
+    block_on(async {
+        let fx = DependencyFixture::new(tmp.path()).await;
+        let target_delta = fx.delta(None, &fx.target).await;
+        let dst = fresh_archive(tmp.path(), "dst").await;
+        dst.apply_static_delta_offline(&fx.delta(None, &fx.dep).await)
+            .await
+            .unwrap();
+        common::mark_partial(&dst, &fx.dep);
+        assert_eq!(
+            refused_apply(&dst, &target_delta).await,
+            (Some(fx.target), dep_reason(&fx.dep, "which is partial"))
+        );
+        assert!(
+            dst.path()
+                .join(format!("state/{}.commitpartial", fx.dep))
+                .exists()
+        );
+    });
+}
+
+/// A field 2 entry of the target with a checksum that is not 32 bytes or with
+/// an empty name is refused, and the apply writes no object.
+#[test]
+fn a_defective_dependency_entry_writes_no_object() {
+    let tmp = TmpDir::new("apply-deps-defective");
+    block_on(async {
+        let fx = DependencyFixture::new(tmp.path()).await;
+        let dst = fresh_archive(tmp.path(), "dst").await;
+        dst.apply_static_delta_offline(&fx.delta(None, &fx.dep).await)
+            .await
+            .unwrap();
+        let short: &[u8] = &fx.dep.as_bytes()[..31];
+        for (entry, reason) in [
+            (
+                ("boot/dep", short),
+                "entry 0 (boot/dep) has a checksum of 31 bytes, not 32",
+            ),
+            (("", fx.dep.as_bytes()), "entry 0 has an empty name"),
+        ] {
+            let (target, target_delta) = fx.variant(&[entry]).await;
+            assert_eq!(
+                refused_apply(&dst, &target_delta).await,
+                (Some(target), reason.to_owned())
+            );
+        }
+    });
+}
+
+/// A delta from a source commit checks the dependencies of its target as a
+/// delta from scratch does.
+#[test]
+fn a_from_delta_checks_the_dependencies_of_its_target() {
+    let tmp = TmpDir::new("apply-deps-from");
+    block_on(async {
+        let fx = DependencyFixture::new(tmp.path()).await;
+        let target_delta = fx.delta(Some(&fx.base), &fx.target).await;
+        let dst = fresh_archive(tmp.path(), "dst").await;
+        dst.apply_static_delta_offline(&fx.delta(None, &fx.base).await)
+            .await
+            .unwrap();
+        assert_eq!(
+            refused_apply(&dst, &target_delta).await,
+            (
+                Some(fx.target),
+                dep_reason(
+                    &fx.dep,
+                    "which is in neither the repository nor the transaction"
+                )
+            )
+        );
+        dst.apply_static_delta_offline(&fx.delta(None, &fx.dep).await)
+            .await
+            .unwrap();
+        assert_eq!(
+            dst.apply_static_delta_offline(&target_delta).await.unwrap(),
+            fx.target
+        );
+    });
+}
+
+/// The check runs also if the repository holds the target. The test removes
+/// the commit object of the dependency after both apply.
+#[test]
+fn a_held_target_checks_its_dependencies() {
+    let tmp = TmpDir::new("apply-deps-held");
+    block_on(async {
+        let fx = DependencyFixture::new(tmp.path()).await;
+        let target_delta = fx.delta(None, &fx.target).await;
+        let dst = fresh_archive(tmp.path(), "dst").await;
+        dst.apply_static_delta_offline(&fx.delta(None, &fx.dep).await)
+            .await
+            .unwrap();
+        dst.apply_static_delta_offline(&target_delta).await.unwrap();
+        let path = ostrya::loose_path(&fx.dep, ObjectType::Commit, RepoMode::Archive);
+        std::fs::remove_file(dst.path().join("objects").join(path)).unwrap();
+        assert_eq!(
+            refused_apply(&dst, &target_delta).await,
+            (
+                Some(fx.target),
+                dep_reason(
+                    &fx.dep,
+                    "which is in neither the repository nor the transaction"
+                )
+            )
+        );
+    });
+}
+
+/// Field 2 entries that are not sorted by name, or two entries with the same
+/// name, apply if each dependency is complete.
+#[test]
+fn unsorted_dependency_names_apply() {
+    let tmp = TmpDir::new("apply-deps-unsorted");
+    block_on(async {
+        let fx = DependencyFixture::new(tmp.path()).await;
+        let dst = fresh_archive(tmp.path(), "dst").await;
+        for dep in [fx.dep, fx.base] {
+            dst.apply_static_delta_offline(&fx.delta(None, &dep).await)
+                .await
+                .unwrap();
+        }
+        let (dep, base): (&[u8], &[u8]) = (fx.dep.as_bytes(), fx.base.as_bytes());
+        for related in [
+            [("z/dep", dep), ("a/base", base)],
+            [("boot/dep", dep), ("boot/dep", dep)],
+        ] {
+            let (target, target_delta) = fx.variant(&related).await;
+            assert_eq!(
+                dst.apply_static_delta_offline(&target_delta).await.unwrap(),
+                target
+            );
+        }
     });
 }
 

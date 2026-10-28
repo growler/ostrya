@@ -2670,7 +2670,7 @@ states for `commit --sign-type`. `reindex` takes `--to=REV`, which rewrites or
 removes the index file of one target and reads REV by the rule of one half of a
 delta name; the last `--to` wins. A `--keys-file` and each key-store file of
 the spki engine hold PEM `PUBLIC KEY` blocks (`format-reference.md`, "Signing
-details", "spki"). Forty-four differences stand on `show`,
+details", "spki"). Forty-five differences stand on `show`,
 `delete`, `list`, `indexes`, `verify`, `apply-offline`, and `reindex`.
 
 - a superblock file over 128 MiB (134217728 bytes). The port refuses it in
@@ -2848,6 +2848,15 @@ details", "spki"). Forty-four differences stand on `show`,
   that they name are already in the repository. A fallback entry of the
   composefs image need not be present (`../format-reference.md`, "The
   composefs image in a static delta");
+- the dependencies of the target under `apply-offline`. The port reads field
+  2 of the target commit before it writes an object
+  (`../format-reference.md`, "Object delivery"). It refuses a defective
+  entry, and a dependency that the repository does not hold complete or that
+  is nested, at exit 1 with `error: related commits in field 2 of commit
+  <target>: <reason>` and nothing on standard output. It writes no object.
+  The check also runs if the repository holds the target. The tool applies
+  the delta with no check of field 2, also if the repository holds the
+  target;
 - a 32-byte `apply-offline` key that decodes to no curve point. The port
   refuses every run that carries such a key at exit 1 with the error it gives
   for `verify` and writes no object. The tool applies an unsigned delta at

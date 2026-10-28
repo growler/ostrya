@@ -5730,6 +5730,96 @@ fn assert_applied_without_ref(run: &Run, dst: &Path, commit: &str, label: &str) 
     );
 }
 
+/// `static-delta apply-offline` refuses a delta whose target names a
+/// dependency that the repository does not hold. It exits 1 and writes no
+/// object and no ref. After the delta of the dependency, the target applies.
+#[test]
+fn static_delta_apply_offline_refuses_a_missing_dependency() {
+    let tmp = TmpDir::new("static-delta-dependency");
+    let base = tmp.path();
+    let src = build_remote(base, "src");
+    let src_s = src.to_str().unwrap().to_owned();
+    let commit = |args: &[&str]| {
+        let mut all = vec!["commit", "--repo", &src_s, "--canonical-permissions"];
+        all.extend_from_slice(args);
+        ostrya(&all, None, &[("SOURCE_DATE_EPOCH", "1700000100")])
+            .ok()
+            .stdout_trimmed()
+    };
+    let dep = commit(&[
+        "-b",
+        "dep/uki",
+        ex_ostrya_tree(base, "uki").to_str().unwrap(),
+    ]);
+    let related = format!("--related=boot/uki={dep}");
+    let tip = commit(&[
+        "-b",
+        BRANCH,
+        &related,
+        base.join("src/src").to_str().unwrap(),
+    ]);
+    let generate = |rev: &str, name: &str| {
+        let out = base.join(name);
+        let out_arg = format!("--output-dir={}", out.display());
+        ostrya(
+            &[
+                "static-delta",
+                "--repo",
+                &src_s,
+                "generate",
+                "--empty",
+                "--to",
+                rev,
+                &out_arg,
+            ],
+            None,
+            &[],
+        )
+        .ok();
+        out
+    };
+    let dep_delta = generate(&dep, "dep-delta");
+    let tip_delta = generate(&tip, "tip-delta");
+
+    let dest = build_dest(base, "dest");
+    let apply = |delta: &Path| {
+        ostrya(
+            &[
+                "static-delta",
+                "--repo",
+                dest.to_str().unwrap(),
+                "apply-offline",
+                delta.to_str().unwrap(),
+            ],
+            None,
+            &[],
+        )
+    };
+    let before = commit_store_state(&dest);
+    let refused = apply(&tip_delta);
+    assert_eq!(refused.status.code(), Some(1), "the command exits 1");
+    assert!(refused.stdout.is_empty(), "the command prints nothing");
+    assert_eq!(
+        String::from_utf8_lossy(&refused.stderr),
+        format!(
+            "error: related commits in field 2 of commit {tip}: dependency boot/uki names \
+             commit {dep}, which is in neither the repository nor the transaction\n"
+        )
+    );
+    assert_eq!(
+        commit_store_state(&dest),
+        before,
+        "the store holds the same objects and refs"
+    );
+
+    apply(&dep_delta).ok();
+    apply(&tip_delta).ok();
+    for commit in [&dep, &tip] {
+        let object = dest.join(format!("objects/{}/{}.commit", &commit[..2], &commit[2..]));
+        assert!(object.is_file(), "commit {commit} was not applied");
+    }
+}
+
 #[test]
 fn static_delta_list_and_apply_offline() {
     if !ostree_available() {

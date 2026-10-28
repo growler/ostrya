@@ -34,6 +34,7 @@ use crate::composefs::recorded_digest;
 use crate::error::{Error, Result};
 use crate::hashing::HashingReader;
 use crate::pull::{ModeChecks, PullFlags};
+use crate::related::{self, RelatedField};
 use crate::repo::Repo;
 use crate::sign::{Verifier, VerifyOutcome, signatures_for};
 use crate::transaction::Transaction;
@@ -372,6 +373,17 @@ impl Repo {
     /// fetch them. The composefs image is optional, so a fallback image need
     /// not be present.
     ///
+    /// # Dependencies
+    ///
+    /// Each dependency of the target, which field 2 of the target commit
+    /// names, must be complete in the repository, and must have no
+    /// dependencies of its own. The call checks this before it writes an
+    /// object. The check runs also if the repository holds the target. A delta
+    /// carries its target alone, so offline media carry one delta for each
+    /// dependency. Apply the deltas of the dependencies first. The check
+    /// accepts entries that are not sorted by name and two entries with the
+    /// same name.
+    ///
     /// # Composefs image
     ///
     /// A part can carry the composefs image of the target commit. The image
@@ -430,12 +442,17 @@ impl Repo {
     /// superblock, and each other part from the file `parts_dir/<index>`. The
     /// other rules of [`apply_static_delta_offline`](Repo::apply_static_delta_offline)
     /// apply: the call verifies no signature, the fallback objects must be in
-    /// the repository, and the call sets no ref.
+    /// the repository, the dependencies of the target must be complete, and
+    /// the call sets no ref.
     ///
     /// # Errors
     ///
     /// - [`Error::ObjectNotFound`] if a fallback object of the delta, or a
     ///   source object that a part reads, is not in the repository.
+    /// - [`Error::InvalidRelated`] if an entry of field 2 of the target commit
+    ///   has an empty name or a checksum that is not 32 bytes, or if a
+    ///   dependency is absent, partial, or has dependencies of its own. The
+    ///   call writes no object.
     /// - [`Error::InvalidFormat`] if a part breaks the format:
     ///   - an inline part that is not a `(yay)` variant
     ///   - a part that passes its declared size or fails its checksum
@@ -453,7 +470,8 @@ impl Repo {
     ///     key, a composefs image larger than 128 MiB, or an open of a
     ///     composefs image
     /// - [`Error::Core`] if a part payload, an operand, a checksum, or an xattr
-    ///   set does not decode.
+    ///   set does not decode, or if field 2 of the target commit or of a
+    ///   dependency does not decode.
     /// - [`Error::ChecksumMismatch`] if an object that a part produces does not
     ///   hash to the checksum that the part names for it.
     /// - [`Error::ComposefsDigestMismatch`] if the fs-verity digest of a
@@ -499,23 +517,31 @@ impl Repo {
             }
         }
 
-        // A part that carries the composefs image needs the key of the target
-        // commit. The commit parses on the blocking pool, and only if a part
-        // carries the image.
-        let image_key = if carries_image(&sb.meta_entries) {
-            let bytes = std::mem::take(&mut sb.commit_bytes);
-            let (bytes, key) = ostrya_rt::unblock(move || {
-                let key = image_key(&bytes);
-                (bytes, key)
-            })
-            .await;
-            sb.commit_bytes = bytes;
-            key
-        } else {
-            None
-        };
+        // The dependencies of the target are in field 2 of the commit, and a
+        // part that carries the composefs image needs the key of the target
+        // commit. One call on the blocking pool decodes field 2 and checks
+        // its format, and parses the commit for the key only if a part carries
+        // the image.
+        let bytes = std::mem::take(&mut sb.commit_bytes);
+        let to = sb.to;
+        let with_image = carries_image(&sb.meta_entries);
+        let (bytes, dependencies, image_key) = ostrya_rt::unblock(move || {
+            let dependencies = related::parse_dependencies(&bytes).and_then(|entries| {
+                related::checked_entries(RelatedField::Dependencies, Some(to), entries)
+            });
+            let key = if with_image { image_key(&bytes) } else { None };
+            (bytes, dependencies, key)
+        })
+        .await;
+        sb.commit_bytes = bytes;
+        let dependencies = dependencies?;
 
         let txn = self.transaction().await?;
+        // Each dependency must be complete and must have no dependencies of
+        // its own. The check runs before the first write, so a refusal writes
+        // no object.
+        related::check_dependencies(&txn, Some(sb.to), &dependencies).await?;
+        drop(dependencies);
         let staging = txn.staging_fd().try_clone_to_owned()?;
 
         // The target commit object is embedded in the superblock, not a part.

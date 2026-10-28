@@ -506,6 +506,11 @@ pub enum Error {
     ///   nested. `commit` is the commit that holds the entry. For a partial or
     ///   a nested dependency, it is the commit that first names the
     ///   dependency.
+    /// - [`Repo::apply_static_delta`](crate::Repo::apply_static_delta) and
+    ///   [`Repo::apply_static_delta_offline`](crate::Repo::apply_static_delta_offline),
+    ///   for an entry of field 2 of the target commit with an empty name or
+    ///   with a checksum that is not 32 bytes, and for a dependency that is
+    ///   absent, partial, or nested. `commit` is the target commit.
     ///
     /// [`Repo::prune`](crate::Repo::prune) gives a
     /// [`RelatedWarning`](crate::RelatedWarning) with the same text in place

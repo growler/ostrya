@@ -409,10 +409,11 @@ impl Transaction {
         )
         .await?;
         let staging = self.staging_fd().try_clone_to_owned()?;
-        let image = ostrya_rt::unblock(move || {
-            write_image_temp_blocking(staging.as_fd(), &dir, fsync && per_object_fsync, verity)
-        })
-        .await?;
+        let image = self
+            .unblock(move || {
+                write_image_temp_blocking(staging.as_fd(), &dir, fsync && per_object_fsync, verity)
+            })
+            .await?;
         Ok(StagedComposefsImage {
             txn: self,
             digest: image.digest,
@@ -575,9 +576,9 @@ impl Transaction {
             .expect("a staged composefs image holds its file until attached");
         let mode = self.repo().mode();
         let key = *commit;
-        let outcome =
-            ostrya_rt::unblock(move || link_image_blocking(staging.as_fd(), temp, &key, mode))
-                .await?;
+        let outcome = self
+            .unblock(move || link_image_blocking(staging.as_fd(), temp, &key, mode))
+            .await?;
         self.record_image(*commit, outcome)?;
         Ok(result)
     }
@@ -642,17 +643,18 @@ impl Transaction {
         let staging = self.staging_fd().try_clone_to_owned()?;
         let src = src.clone();
         let key = *commit;
-        let image = ostrya_rt::unblock(move || {
-            clone_image_temp_blocking(
-                staging.as_fd(),
-                src.objects_fd(),
-                src.mode(),
-                &key,
-                fsync && per_object_fsync,
-                verity,
-            )
-        })
-        .await?;
+        let image = self
+            .unblock(move || {
+                clone_image_temp_blocking(
+                    staging.as_fd(),
+                    src.objects_fd(),
+                    src.mode(),
+                    &key,
+                    fsync && per_object_fsync,
+                    verity,
+                )
+            })
+            .await?;
         let Some(image) = image else {
             return Ok(None);
         };
@@ -755,9 +757,9 @@ impl Transaction {
         let staging = self.staging_fd().try_clone_to_owned()?;
         let mode = self.repo().mode();
         let key = *commit;
-        let outcome =
-            ostrya_rt::unblock(move || link_image_blocking(staging.as_fd(), image, &key, mode))
-                .await?;
+        let outcome = self
+            .unblock(move || link_image_blocking(staging.as_fd(), image, &key, mode))
+            .await?;
         self.record_image(*commit, outcome)?;
         Ok(digest)
     }

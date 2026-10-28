@@ -18,6 +18,7 @@ API documentation: <https://docs.rs/ostrya-rt>
 
 - `spawn` starts a task and returns a `JoinHandle`.
 - `unblock` and `unblock_detached` run a closure on the blocking pool.
+  `unblock_task` runs one there and returns a `JoinHandle`.
 - `File` and `FileReader` stream over an open file descriptor.
 - `TcpStream` and `TcpListener` carry async TCP.
 - `Command` runs a helper process.

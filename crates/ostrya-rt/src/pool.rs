@@ -3,9 +3,10 @@
 //! [`unblock`] runs a closure on the blocking pool of the backend
 //! (`smol::unblock` or `tokio::task::spawn_blocking`) and awaits its result.
 //! [`unblock_detached`] runs a closure on the same pool and does not wait.
-//! Each synchronous system call that the library moves off its async tasks
-//! goes through one of the two. [`blocking_threads`] gives the size of the
-//! pool.
+//! [`unblock_task`](crate::unblock_task) runs a closure on the same pool and
+//! returns a handle. Each synchronous system call that the library moves off
+//! its async tasks goes through one of the three. [`blocking_threads`] gives
+//! the size of the pool.
 //!
 //! [`block_on`] exists for tests and doctests. The entry points of the library
 //! are `async fn` items that the runtime of the caller drives.

@@ -15,6 +15,10 @@
 //! drops `Slots` and each future that is still in flight. A dropped future
 //! closes its connections and releases its permits. No future lives after the
 //! call.
+//!
+//! The drop does not stop a blocking job that a future started: the job runs
+//! to its end on the blocking pool. The caller settles the tracked jobs of the
+//! transaction before its cleanup.
 
 use std::future::Future;
 use std::pin::Pin;

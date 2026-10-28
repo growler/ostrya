@@ -12,6 +12,7 @@
 //!
 //! - [`spawn`] starts a task and returns a [`JoinHandle`].
 //! - [`unblock`] and [`unblock_detached`] run a closure on the blocking pool.
+//!   [`unblock_task`] runs one there and returns a [`JoinHandle`].
 //! - [`File`] and [`FileReader`] stream over an open file descriptor.
 //! - [`TcpStream`] and [`TcpListener`] carry async TCP.
 //! - [`Command`] runs a helper process.
@@ -57,7 +58,7 @@ pub use file::{File, FileReader};
 pub use net::{TcpListener, TcpStream};
 pub use pool::{block_on, blocking_threads, unblock, unblock_detached};
 pub use process::{Child, ChildStdin, ChildStdout, Command};
-pub use task::{JoinHandle, spawn};
+pub use task::{JoinHandle, spawn, unblock_task};
 pub use timer::{Deadline, Timer};
 
 /// The tokio I/O traits, for a crate with no direct `tokio` dependency.

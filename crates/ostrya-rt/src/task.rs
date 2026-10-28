@@ -4,6 +4,9 @@
 //! `tokio::spawn`). The task continues when its [`JoinHandle`] drops. The
 //! connection drivers of the fetcher need this, because a connection lives
 //! longer than the request that opened it.
+//!
+//! [`unblock_task`] gives a closure to the blocking pool and returns a
+//! [`JoinHandle`] of the same kind.
 
 use std::future::Future;
 use std::pin::Pin;
@@ -32,7 +35,37 @@ where
     }
 }
 
-/// A handle that resolves to the output of a spawned task.
+/// Starts a closure on the blocking pool and returns a handle to its result.
+///
+/// The pool is the pool of [`unblock`](crate::unblock). The closure starts
+/// without a poll of the handle. If the handle drops, the closure continues
+/// and runs to completion, also if it has not started yet. So a caller can
+/// keep the handle after it drops the future that started the closure, and
+/// await the end of the closure later.
+///
+/// The [`JoinHandle`] states the panics of an await of the handle. With the
+/// `tokio` feature, the call must run inside a tokio runtime context.
+pub fn unblock_task<T, F>(f: F) -> JoinHandle<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    #[cfg(feature = "tokio")]
+    {
+        JoinHandle {
+            inner: tokio::task::spawn_blocking(f),
+        }
+    }
+    #[cfg(all(feature = "smol", not(feature = "tokio")))]
+    {
+        JoinHandle {
+            inner: Some(smol::unblock(f)),
+        }
+    }
+}
+
+/// A handle that resolves to the output of a spawned task, or of a closure
+/// that [`unblock_task`] started.
 ///
 /// If the handle drops, the task continues and runs to completion.
 ///
@@ -134,6 +167,42 @@ mod tests {
         .unwrap_err();
         let message = caught.downcast_ref::<String>().cloned().unwrap_or_default();
         assert!(message.contains("cancelled"), "{message}");
+    }
+
+    #[test]
+    fn unblock_task_returns_the_result_of_the_closure() {
+        block_on(async { assert_eq!(unblock_task(|| 6 * 7).await, 42) });
+    }
+
+    /// The awaiting side sees the panic payload of the closure.
+    #[test]
+    fn an_unblock_task_propagates_the_panic_of_its_closure() {
+        let caught = std::panic::catch_unwind(|| {
+            block_on(async { unblock_task(|| panic!("job boom")).await });
+        })
+        .unwrap_err();
+        let message = caught
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| caught.downcast_ref::<String>().cloned())
+            .unwrap_or_default();
+        assert_eq!(message, "job boom");
+    }
+
+    /// The closure runs to its end after its handle drops.
+    #[test]
+    fn a_dropped_unblock_task_runs_its_closure() {
+        let (go_tx, go_rx) = std::sync::mpsc::channel::<()>();
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<u32>();
+        block_on(async move {
+            drop(unblock_task(move || {
+                go_rx.recv().unwrap();
+                done_tx.send(7).unwrap();
+            }));
+            go_tx.send(()).unwrap();
+            let done = crate::unblock(move || done_rx.recv().unwrap()).await;
+            assert_eq!(done, 7);
+        });
     }
 
     #[test]

@@ -1566,10 +1566,13 @@ impl Repo {
         }
         .await;
         if let Err(e) = ran {
-            // The steps that are still in flight end here. `marked` then
-            // takes each marker that this run wrote, whether or not its step
-            // reached the plan.
+            // The steps that are still in flight end here. A blocking job of a
+            // dropped step continues, so the run waits for each tracked job
+            // that a dropped step left. The cleanup then sees each marker that
+            // the run wrote. `marked` takes each such marker, whether or not
+            // its step reached the plan.
             drop(slots);
+            ctx.txn.settle().await;
             let marking = ctx
                 .marking
                 .into_inner()
@@ -1796,7 +1799,7 @@ impl Repo {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .push(checksum);
-            self.write_partial_marker(&checksum).await?;
+            ctx.txn.track(self.partial_marker_job(&checksum)).await?;
         }
         // The pull stages the commit here, after its marker and before its
         // tree. Each path hashes the bytes and compares the result with the
@@ -2497,7 +2500,9 @@ struct StepCtx<'a> {
     /// reads: a pull that is not commit-only and has no subpath.
     dependencies: bool,
     /// The commits whose `.commitpartial` marker a step of this run writes. A
-    /// step adds the commit before it writes the marker. So a failed run
+    /// step adds the commit before it starts the write of the marker, and the
+    /// write is a tracked job of the transaction. A failed run waits for the
+    /// tracked jobs of its dropped steps before it reads the list. So it
     /// hands each marker that it wrote to the cleanup, also the marker of a
     /// step that failed or that the run dropped in flight.
     marking: Mutex<Vec<Checksum>>,
@@ -3687,6 +3692,12 @@ const _: fn() = || {
     let _ = |repo: &Repo, src: &Repo| assert_send(&repo.pull_local(src, PullOptions::default()));
 };
 
+/// The in-process byte pipe of the integration tests, for the unit tests of a
+/// pull through a stream session.
+#[cfg(test)]
+#[path = "../../tests/common/pipe.rs"]
+mod test_pipe;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4853,5 +4864,190 @@ mod tests {
             .unwrap();
         assert!(plan.dependencies.named.contains_key(&csum(3)));
         assert!(!plan.parents.contains_key(&csum(2)));
+    }
+
+    /// A scratch directory, removed on drop.
+    struct ScratchDir(std::path::PathBuf);
+
+    impl ScratchDir {
+        fn new(tag: &str) -> ScratchDir {
+            use std::sync::atomic::{AtomicU64, Ordering};
+            static COUNTER: AtomicU64 = AtomicU64::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let dir = std::env::temp_dir()
+                .join(format!("ostrya-pull-jobs-{}-{tag}-{n}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).unwrap();
+            ScratchDir(dir)
+        }
+    }
+
+    impl Drop for ScratchDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// The time that a test waits for the end of a held job.
+    const JOB_END: std::time::Duration = std::time::Duration::from_secs(120);
+
+    /// Writes a commit whose tree holds the file `f` with `content` under the
+    /// ref `name`, and returns it.
+    async fn commit_under(repo: &Repo, name: &str, content: &[u8]) -> Checksum {
+        let txn = repo.transaction().await.unwrap();
+        let dirmeta = ostrya_core::DirMeta {
+            uid: 0,
+            gid: 0,
+            mode: 0o40755,
+            xattrs: Default::default(),
+        };
+        let dirmeta = txn
+            .write_metadata(ObjectType::DirMeta, None, &dirmeta.serialize().unwrap())
+            .await
+            .unwrap();
+        let file = txn
+            .write_regfile_inline(None, &FileMeta::regular(0, 0, 0o644), content)
+            .await
+            .unwrap();
+        let mut mtree = crate::mtree::MutableTree::new();
+        mtree.set_metadata_checksum(dirmeta);
+        mtree.replace_file("f", file).unwrap();
+        let root = txn.write_mtree(&mut mtree).await.unwrap();
+        let options = crate::commit::CommitOptions {
+            parent: None,
+            subject: None,
+            body: None,
+            timestamp: Some(1_700_000_000),
+            metadata: None,
+            related: Vec::new(),
+        };
+        let commit = txn.write_commit(options, &root).await.unwrap();
+        txn.set_ref(name, Some(&commit));
+        txn.commit().await.unwrap();
+        commit
+    }
+
+    /// A source repository with the ref `left` at the commit `left` and the
+    /// ref `right` at the commit `right`, and an empty destination.
+    struct TwoRefs {
+        dir: ScratchDir,
+        src: Repo,
+        dest: Repo,
+        left: Checksum,
+        right: Checksum,
+    }
+
+    async fn two_refs(tag: &str) -> TwoRefs {
+        let dir = ScratchDir::new(tag);
+        let archive = || crate::CreateOptions::new(RepoMode::Archive);
+        let src = Repo::create(&dir.0.join("src"), archive()).await.unwrap();
+        let dest = Repo::create(&dir.0.join("dest"), archive()).await.unwrap();
+        let left = commit_under(&src, "left", b"left content").await;
+        let right = commit_under(&src, "right", b"right content").await;
+        TwoRefs {
+            dir,
+            src,
+            dest,
+            left,
+            right,
+        }
+    }
+
+    /// Pulls the refs `left` and `right` from `src` into `dest` through a
+    /// stream session, with `Repo::send` as the server of `src`.
+    async fn pull_both_refs(src: &Repo, dest: &Repo) -> Result<PullStats> {
+        let (to_server, server_in) = test_pipe::pipe(64 * 1024);
+        let (server_out, from_server) = test_pipe::pipe(64 * 1024);
+        let access = crate::access::ReadAccess::new(
+            Arc::new(crate::access::ClientAccess::implicit(None)),
+            crate::access::AuthItem::Anonymous,
+            None,
+        );
+        let opts = PullOptions {
+            refs: vec!["left".to_owned(), "right".to_owned()],
+            ..PullOptions::default()
+        };
+        let (pulled, _) = futures_lite::future::zip(
+            async {
+                let session = PullSession::over_stream(
+                    from_server,
+                    to_server,
+                    StreamSessionOptions::default(),
+                )
+                .await?;
+                dest.pull_with_session(session, PullTrust::unverified(), opts)
+                    .await
+            },
+            async move { src.send(server_in, server_out, &access).await },
+        )
+        .await;
+        pulled
+    }
+
+    fn marker(repo: &Repo, commit: &Checksum) -> std::path::PathBuf {
+        repo.path().join(super::super::partial_path(commit))
+    }
+
+    /// A failed pull removes the marker that the blocking job of a dropped
+    /// step writes after the failure. The marker job of `left` waits until
+    /// the run has failed, and the marker job of `right` fails once the job of
+    /// `left` has started. Neither marker stays.
+    #[test]
+    fn a_failed_pull_clears_the_marker_of_a_dropped_step() {
+        let fixture = block_on(two_refs("marker"));
+        let dest_root = fixture.dest.path().to_path_buf();
+        let held = format!("marker {}", fixture.left.to_hex());
+        let finished = crate::jobs::job_gate::hold(&dest_root, held.clone());
+        crate::jobs::job_gate::fail(
+            &dest_root,
+            format!("marker {}", fixture.right.to_hex()),
+            held,
+        );
+        let pulled = block_on(pull_both_refs(&fixture.src, &fixture.dest));
+        let err = pulled.unwrap_err();
+        assert!(err.to_string().contains("injected job failure"), "{err}");
+        finished.recv_timeout(JOB_END).unwrap();
+        for commit in [&fixture.left, &fixture.right] {
+            let path = marker(&fixture.dest, commit);
+            assert!(!path.exists(), "{} stays", path.display());
+        }
+        drop(fixture.dir);
+    }
+
+    /// A failed pull removes its staging directory after the staging job of a
+    /// dropped step ends. The job that stages the root dirtree of `left` waits
+    /// until the run has failed, and it finds the staging directory in place.
+    /// The marker job of `right` fails once that job has started.
+    #[test]
+    fn a_failed_pull_removes_the_staging_directory_after_a_dropped_step() {
+        let fixture = block_on(two_refs("staging"));
+        let dest_root = fixture.dest.path().to_path_buf();
+        let (commit, _) = block_on(fixture.src.load_commit(&fixture.left)).unwrap();
+        let held = format!("stage {}", commit.root_dirtree.to_hex());
+        let finished = crate::jobs::job_gate::hold(&dest_root, held.clone());
+        crate::jobs::job_gate::fail(
+            &dest_root,
+            format!("marker {}", fixture.right.to_hex()),
+            held,
+        );
+        let pulled = block_on(pull_both_refs(&fixture.src, &fixture.dest));
+        let err = pulled.unwrap_err();
+        assert!(err.to_string().contains("injected job failure"), "{err}");
+        let linked = finished.recv_timeout(JOB_END).unwrap();
+        assert!(
+            linked,
+            "the job ran after the removal of the staging directory"
+        );
+        let staging: Vec<_> = std::fs::read_dir(dest_root.join("tmp"))
+            .unwrap()
+            .map(|entry| entry.unwrap())
+            .filter(|entry| {
+                entry.file_name().to_string_lossy().starts_with("staging-")
+                    && entry.file_type().unwrap().is_dir()
+            })
+            .map(|entry| entry.file_name())
+            .collect();
+        assert!(staging.is_empty(), "{staging:?}");
+        drop(fixture.dir);
     }
 }

@@ -880,9 +880,9 @@ fn the_service_is_send_and_sync() {
 }
 
 /// The futures of `commit`, `Repo::receive`, and `Repo::receive_stream` stay
-/// small. The checks and the commit of a session sit inline in these
-/// futures, and the publication step and the commit of a server commit are
-/// boxed, so neither sits inline.
+/// small. The future of the checks and of the commit of a session is boxed,
+/// and so are the publication step and the commit of a server commit. So the
+/// guard measures the rest of each future.
 #[test]
 fn the_receive_futures_are_small() {
     let tmp = TmpDir::new("future-sizes");

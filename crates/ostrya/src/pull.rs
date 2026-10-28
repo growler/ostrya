@@ -1966,15 +1966,17 @@ impl Repo {
             // failure must not demote a complete commit. The plan of the tree
             // reads the same answer and plans nothing for a complete commit.
             // The intermediate commits of the chains come first, with one
-            // batched check.
+            // batched check. `marked` takes each commit before the write of
+            // its marker, so the cleanup also sees a marker that a failed
+            // write created.
             let level_commits: Vec<Checksum> = deltas.levels().iter().flatten().copied().collect();
             let mut held_levels: HashSet<Checksum> = HashSet::new();
             for (commit, held) in chain::check_complete(self, &level_commits).await? {
                 if held {
                     held_levels.insert(commit);
                 } else {
-                    self.write_partial_marker(&commit).await?;
                     marked.push(commit);
+                    self.write_partial_marker(&commit).await?;
                 }
             }
             // The other commits follow, with one batched check.
@@ -1990,8 +1992,8 @@ impl Repo {
             for (commit, (_, held)) in walked.zip(states) {
                 commit.held = held;
                 if !held {
-                    self.write_partial_marker(&commit.checksum).await?;
                     marked.push(commit.checksum);
+                    self.write_partial_marker(&commit.checksum).await?;
                 }
             }
 
@@ -2460,9 +2462,25 @@ impl Repo {
     /// In a `bare-user-shared` repository, a marker that this call creates gets
     /// [`perm::SHARED_FILE_MODE`]. A marker that is present keeps its mode.
     async fn write_partial_marker(&self, commit: &Checksum) -> Result<()> {
+        self.partial_marker_job(commit).await
+    }
+
+    /// Starts the write of the marker of `commit` on the blocking pool, as
+    /// [`write_partial_marker`](Repo::write_partial_marker) states it, and
+    /// returns the handle of the job.
+    ///
+    /// The job continues if the handle drops. A pull from a remote gives the
+    /// handle to its transaction, so that a failed run waits for the job
+    /// before its cleanup.
+    fn partial_marker_job(&self, commit: &Checksum) -> ostrya_rt::JoinHandle<Result<()>> {
         let path = partial_path(commit);
         let repo = self.clone();
-        ostrya_rt::unblock(move || {
+        #[cfg(test)]
+        let gate =
+            crate::jobs::job_gate::key(self.repo_fd(), format!("marker {}", commit.to_hex()));
+        ostrya_rt::unblock_task(move || {
+            #[cfg(test)]
+            let _gate = crate::jobs::job_gate::pass(&gate, repo.repo_fd())?;
             match rustix::fs::openat(
                 repo.repo_fd(),
                 path.as_str(),
@@ -2477,7 +2495,6 @@ impl Repo {
                 Err(e) => Err(Error::from(e)),
             }
         })
-        .await
     }
 
     /// Removes the `.commitpartial` marker of a commit.
@@ -2542,6 +2559,8 @@ impl Repo {
                 let _ = self.remove_partial_marker(commit).await;
             }
         }
+        #[cfg(test)]
+        crate::jobs::job_gate::release(self.repo_fd());
     }
 }
 

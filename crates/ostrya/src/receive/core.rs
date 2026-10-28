@@ -528,7 +528,12 @@ impl<P: Deref<Target: SessionPolicy + Sized>> SessionCore<P> {
             names: &named,
             paths: &paths,
         };
-        super::finish::finish(&repo, &*policy, hooks, txn, session, dicts, images, request).await
+        // The future of the checks and of the commit is large, and it owns the
+        // transaction. The box keeps it out of the future of each caller.
+        Box::pin(super::finish::finish(
+            &repo, &*policy, hooks, txn, session, dicts, images, request,
+        ))
+        .await
     }
 }
 

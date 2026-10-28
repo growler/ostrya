@@ -457,7 +457,7 @@ impl Transaction {
         hasher.update(&framed);
 
         let staging = self.staging_fd().try_clone_to_owned()?;
-        let (fd, temp) = ostrya_rt::unblock(move || open_temp(staging.as_fd())).await?;
+        let (fd, temp) = self.unblock(move || open_temp(staging.as_fd())).await?;
         let temp = PendingTemp::new(self.staging_fd(), temp);
         let mut file = RtFile::from(fd);
 
@@ -600,7 +600,7 @@ impl Transaction {
         }
 
         let staging = self.staging_fd().try_clone_to_owned()?;
-        let (fd, temp) = ostrya_rt::unblock(move || open_temp(staging.as_fd())).await?;
+        let (fd, temp) = self.unblock(move || open_temp(staging.as_fd())).await?;
         let temp = PendingTemp::new(self.staging_fd(), temp);
         let mut file = RtFile::from(fd);
         write_all(&mut file, framed_header).await?;
@@ -1346,7 +1346,7 @@ pub(crate) async fn write_image_stream_temp<R: AsyncRead + Unpin>(
     let verity = txn.repo().config().fsverity()?;
     let staging = txn.staging_fd().try_clone_to_owned()?;
     let opened = staging.try_clone()?;
-    let (fd, temp) = ostrya_rt::unblock(move || open_temp(opened.as_fd())).await?;
+    let (fd, temp) = txn.unblock(move || open_temp(opened.as_fd())).await?;
     let pending = PendingTemp::new(txn.staging_fd(), temp);
     let mut file = RtFile::from(fd);
     if buf.len() < COPY_CHUNK {
@@ -1365,7 +1365,7 @@ pub(crate) async fn write_image_stream_temp<R: AsyncRead + Unpin>(
     let file = file.into_std().await;
     let digest = hasher.finalize();
     let temp = pending.into_inner();
-    ostrya_rt::unblock(move || {
+    txn.unblock(move || {
         let pending = PendingTemp::new(staging.as_fd(), temp);
         finish_image_temp_blocking(
             file,

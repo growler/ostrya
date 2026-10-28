@@ -963,9 +963,11 @@ marker is local state and does not enter any checksum.
 `conformance/cli-surface.md`, "P2", `pull`, records the markers that a failed
 pull leaves.
 
-No writer syncs a marker or the `state/` directory. A pull creates every marker
-before its transaction stages an object. So the `syncfs` at the start of
-publication makes the marker durable before the first object rename. The removal
+No writer syncs a marker or the `state/` directory. A local pull creates every
+marker before its first stage. A pull from a remote creates the marker of a
+commit in the step that fetches that commit. Each marker exists before the
+transaction commits. So the `syncfs` at the start of publication makes the
+marker durable before the first object rename. The removal
 is the last operation of the pull, and no barrier follows it. So a crash
 immediately after a successful pull can restore the marker of a complete commit.
 `fsck` writes its marker with no barrier, and a new `fsck` run writes it again.

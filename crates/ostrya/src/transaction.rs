@@ -18,6 +18,7 @@ use ostrya_core::{Checksum, Commit, ObjectType, RepoMode, Value};
 
 use crate::config::Tristate;
 use crate::error::{Error, Result};
+use crate::jobs::{Jobs, Tracked};
 use crate::lock::{LockGuard, UpdateLockHeld};
 use crate::repo::Repo;
 use crate::staging::StagingDir;
@@ -316,6 +317,9 @@ pub struct Transaction {
     /// [`fresh_owner`](Transaction::fresh_owner) measures them once, on first
     /// use.
     fresh_owner: OnceLock<(u32, u32)>,
+    /// The blocking jobs of this transaction that a dropped future left
+    /// before they ended.
+    jobs: Jobs,
     staging: Option<StagingDir>,
     /// The repository lock hold, kept for the life of the transaction.
     ///
@@ -353,6 +357,7 @@ impl Transaction {
             refs: Mutex::new(Vec::new()),
             detached: Mutex::new(DetachedQueue::default()),
             fresh_owner: OnceLock::new(),
+            jobs: Jobs::default(),
             staging: Some(staging),
             lock,
         }
@@ -411,6 +416,44 @@ impl Transaction {
             .dir_fd()
     }
 
+    /// Runs `f` on the blocking pool as a job of this transaction, and
+    /// returns a future of its result.
+    ///
+    /// The jobs that stage an object, detached metadata, or a composefs
+    /// image, that open the temp file of an object to stage, or that probe
+    /// the owner of a fresh object run through this call. The marker write
+    /// of a step of a pull from a remote runs through
+    /// [`track`](Transaction::track). If the future drops before the job
+    /// ends, the job continues, and [`settle`](Transaction::settle) waits for
+    /// it. So a failed pull from a remote can wait for these jobs before its
+    /// cleanup. Other jobs run through `ostrya_rt::unblock`, and `settle`
+    /// does not wait for them. Some of them create a name, for example the
+    /// publish of [`commit`](Transaction::commit).
+    pub(crate) fn unblock<T, F>(&self, f: F) -> Tracked<'_, T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        self.jobs.track(ostrya_rt::unblock_task(f))
+    }
+
+    /// Makes `handle` a job of this transaction, as
+    /// [`unblock`](Transaction::unblock) does for the job that it starts.
+    pub(crate) fn track<T: Send + 'static>(
+        &self,
+        handle: ostrya_rt::JoinHandle<T>,
+    ) -> Tracked<'_, T> {
+        self.jobs.track(handle)
+    }
+
+    /// Waits for each job of this transaction that a dropped future left
+    /// before the job ended.
+    pub(crate) async fn settle(&self) {
+        #[cfg(test)]
+        crate::jobs::job_gate::release(self.repo.repo_fd());
+        self.jobs.settle().await;
+    }
+
     /// Returns the uid and gid of an object freshly staged in this transaction.
     ///
     /// The call measures the pair on first use and keeps it for the life of the
@@ -422,7 +465,9 @@ impl Transaction {
             return Ok(*owner);
         }
         let staging = self.staging_fd().try_clone_to_owned()?;
-        let owner = ostrya_rt::unblock(move || probe_fresh_owner(staging.as_fd())).await?;
+        let owner = self
+            .unblock(move || probe_fresh_owner(staging.as_fd()))
+            .await?;
         Ok(*self.fresh_owner.get_or_init(|| owner))
     }
 
@@ -787,7 +832,7 @@ impl Transaction {
         let name = crate::write::flat_name(checksum, ObjectType::CommitMeta, self.repo.mode());
         let staging = self.staging_fd().try_clone_to_owned()?;
         let staged = name.clone();
-        ostrya_rt::unblock(move || {
+        self.unblock(move || {
             crate::commit::stage_detached_blocking(staging.as_fd(), &staged, &bytes)
         })
         .await?;
@@ -997,19 +1042,20 @@ impl Transaction {
         let objects = self.repo.objects_fd().try_clone_to_owned()?;
         let staging = self.staging_fd().try_clone_to_owned()?;
         let key = checksum;
-        let outcome = ostrya_rt::unblock(move || {
-            let ctx = StageCtx {
-                objects_fd: objects.as_fd(),
-                staging_fd: staging.as_fd(),
-                mode,
-                fsync,
-                per_object_fsync,
-                sync_metadata: false,
-                verity,
-            };
-            stage_content_blocking(&ctx, &key, &header, file, temp, unpacked)
-        })
-        .await?;
+        let outcome = self
+            .unblock(move || {
+                let ctx = StageCtx {
+                    objects_fd: objects.as_fd(),
+                    staging_fd: staging.as_fd(),
+                    mode,
+                    fsync,
+                    per_object_fsync,
+                    sync_metadata: false,
+                    verity,
+                };
+                stage_content_blocking(&ctx, &key, &header, file, temp, unpacked)
+            })
+            .await?;
         self.record(checksum, ObjectType::File, mode, outcome, counted)
     }
 
@@ -1027,19 +1073,20 @@ impl Transaction {
         let objects = self.repo.objects_fd().try_clone_to_owned()?;
         let staging = self.staging_fd().try_clone_to_owned()?;
         let key = checksum;
-        let outcome = ostrya_rt::unblock(move || {
-            let ctx = StageCtx {
-                objects_fd: objects.as_fd(),
-                staging_fd: staging.as_fd(),
-                mode,
-                fsync,
-                per_object_fsync,
-                sync_metadata: false,
-                verity,
-            };
-            stage_symlink_blocking(&ctx, &key, &header)
-        })
-        .await?;
+        let outcome = self
+            .unblock(move || {
+                let ctx = StageCtx {
+                    objects_fd: objects.as_fd(),
+                    staging_fd: staging.as_fd(),
+                    mode,
+                    fsync,
+                    per_object_fsync,
+                    sync_metadata: false,
+                    verity,
+                };
+                stage_symlink_blocking(&ctx, &key, &header)
+            })
+            .await?;
         self.record(checksum, ObjectType::File, mode, outcome, false)
     }
 
@@ -1077,19 +1124,25 @@ impl Transaction {
         let objects = self.repo.objects_fd().try_clone_to_owned()?;
         let staging = self.staging_fd().try_clone_to_owned()?;
         let key = checksum;
-        let outcome = ostrya_rt::unblock(move || {
-            let ctx = StageCtx {
-                objects_fd: objects.as_fd(),
-                staging_fd: staging.as_fd(),
-                mode,
-                fsync,
-                per_object_fsync,
-                sync_metadata,
-                verity,
-            };
-            stage_metadata_blocking(&ctx, &key, ty, &bytes)
-        })
-        .await?;
+        #[cfg(test)]
+        let gate =
+            crate::jobs::job_gate::key(self.repo.repo_fd(), format!("stage {}", checksum.to_hex()));
+        let outcome = self
+            .unblock(move || {
+                #[cfg(test)]
+                let _gate = crate::jobs::job_gate::pass(&gate, staging.as_fd())?;
+                let ctx = StageCtx {
+                    objects_fd: objects.as_fd(),
+                    staging_fd: staging.as_fd(),
+                    mode,
+                    fsync,
+                    per_object_fsync,
+                    sync_metadata,
+                    verity,
+                };
+                stage_metadata_blocking(&ctx, &key, ty, &bytes)
+            })
+            .await?;
         let written = !outcome.deduped;
         self.record_object(checksum, ty, mode, outcome, true, false, sync_metadata)?;
         Ok(written)
@@ -1129,19 +1182,20 @@ impl Transaction {
         } else {
             Some(self.fresh_owner().await?)
         };
-        let outcome = ostrya_rt::unblock(move || {
-            let ctx = StageCtx {
-                objects_fd: objects.as_fd(),
-                staging_fd: staging.as_fd(),
-                mode,
-                fsync,
-                per_object_fsync,
-                sync_metadata: false,
-                verity,
-            };
-            stage_import_blocking(&ctx, source.as_fd(), &checksum, ty, src_mode, link_owner)
-        })
-        .await?;
+        let outcome = self
+            .unblock(move || {
+                let ctx = StageCtx {
+                    objects_fd: objects.as_fd(),
+                    staging_fd: staging.as_fd(),
+                    mode,
+                    fsync,
+                    per_object_fsync,
+                    sync_metadata: false,
+                    verity,
+                };
+                stage_import_blocking(&ctx, source.as_fd(), &checksum, ty, src_mode, link_owner)
+            })
+            .await?;
         let Some(outcome) = outcome else {
             return Ok(false);
         };
@@ -1173,26 +1227,27 @@ impl Transaction {
         let objects = self.repo.objects_fd().try_clone_to_owned()?;
         let staging = self.staging_fd().try_clone_to_owned()?;
         let source = src_objects_fd.try_clone_to_owned()?;
-        let outcome = ostrya_rt::unblock(move || {
-            let ctx = StageCtx {
-                objects_fd: objects.as_fd(),
-                staging_fd: staging.as_fd(),
-                mode,
-                fsync,
-                per_object_fsync,
-                sync_metadata: false,
-                verity,
-            };
-            stage_clone_content_blocking(
-                &ctx,
-                source.as_fd(),
-                &checksum,
-                src_mode,
-                &header,
-                unpacked,
-            )
-        })
-        .await?;
+        let outcome = self
+            .unblock(move || {
+                let ctx = StageCtx {
+                    objects_fd: objects.as_fd(),
+                    staging_fd: staging.as_fd(),
+                    mode,
+                    fsync,
+                    per_object_fsync,
+                    sync_metadata: false,
+                    verity,
+                };
+                stage_clone_content_blocking(
+                    &ctx,
+                    source.as_fd(),
+                    &checksum,
+                    src_mode,
+                    &header,
+                    unpacked,
+                )
+            })
+            .await?;
         // An imported object has no size record. A pull writes no commit, so
         // this transaction never writes `ostree.sizes`.
         self.record_object(
@@ -1588,10 +1643,14 @@ impl Transaction {
 
     /// Discards the transaction and its staged objects, and releases the lock.
     ///
+    /// The call first waits for each blocking job of the transaction that a
+    /// dropped future left before the job ended.
+    ///
     /// # Errors
     ///
     /// The call does not fail. It always returns `Ok(())`.
     pub async fn abort(mut self) -> Result<()> {
+        self.settle().await;
         self.reap_staging().await;
         Ok(())
     }

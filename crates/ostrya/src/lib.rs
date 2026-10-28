@@ -91,6 +91,7 @@ pub mod gpg;
 mod hashing;
 mod inflate;
 mod ingest;
+mod jobs;
 mod lock;
 pub mod modifier;
 pub mod mtree;

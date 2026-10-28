@@ -14,15 +14,19 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 
-use common::receive::{PIPE_CAP, PipeReader, PipeWriter, is_root, new_repo, pipe, policy_allowing};
+use common::receive::{
+    PIPE_CAP, PipeReader, PipeWriter, SECRET_B64, SERVER_SECRET_B64, ed25519_signature,
+    ed25519_signatures, is_root, new_repo, pipe, policy_allowing, secret, server_signer, trust,
+};
 use common::{Counting, TmpDir, dependency_error, mark_partial, store_with_field2};
 use futures_io::AsyncWrite;
 use futures_lite::future::zip;
 use ostrya::access::CollectionScope;
 use ostrya::remote::{self, Compression, PushOutcome, PushProgress};
 use ostrya::{
-    Checksum, CommitModifier, CommitModifierFlags, CommitOptions, DictBuilder, Error, MutableTree,
-    ObjectType, PruneOptions, ReceivePolicy, ReceiveReport, Repo, RepoMode, RepoPushOptions, Value,
+    Checksum, CommitModifier, CommitModifierFlags, CommitOptions, DictBuilder, Ed25519Signer,
+    Error, MutableTree, ObjectType, PruneOptions, ReceivePolicy, ReceiveReport, ReceiveVerify,
+    Repo, RepoMode, RepoPushOptions, Value,
 };
 use ostrya_rt::block_on;
 
@@ -2004,6 +2008,178 @@ fn with_no_depth_a_dependency_of_the_offered_history_is_resolved_after_the_cut()
     report.unwrap();
     outcome.unwrap();
     assert_eq!(tip(&pair.server, "main"), Some(c4));
+}
+
+// ---------------------------------------------------------------------------
+// The checks of the server on the dependencies.
+// ---------------------------------------------------------------------------
+
+/// Signs `commit` of `repo` with the key [`SECRET_B64`].
+fn client_sign(repo: &Repo, commit: &Checksum) {
+    let signer = Ed25519Signer::from_secret_key(&secret(SECRET_B64)).unwrap();
+    block_on(repo.sign_commit(commit, &signer)).unwrap();
+}
+
+/// A server policy that needs a signature of the key [`SECRET_B64`].
+fn verify_policy() -> ReceivePolicy {
+    ReceivePolicy {
+        verify: ReceiveVerify::Keys(trust(SECRET_B64)),
+        ..policy_allowing(&["w:**"])
+    }
+}
+
+/// A server policy that signs each new commit with the key
+/// [`SERVER_SECRET_B64`].
+fn sign_policy() -> ReceivePolicy {
+    ReceivePolicy {
+        signers: vec![server_signer(SERVER_SECRET_B64)],
+        ..policy_allowing(&["w:**"])
+    }
+}
+
+/// Asserts that the server refused a push with `code`.
+fn assert_refused(pushed: Pushed, code: remote::ErrorCode) {
+    let (report, outcome) = pushed;
+    match report {
+        Err(Error::Remote(e)) => assert_eq!(e.code(), Some(code), "{e}"),
+        other => panic!("expected a refusal, got {other:?}"),
+    }
+    assert!(outcome.is_err(), "{outcome:?}");
+}
+
+/// Under a server policy with `verify`, a dependency with no signature is
+/// refused, and the server keeps no ref and no dependency. After the client
+/// signs the dependency, the push passes.
+#[test]
+fn an_unsigned_dependency_is_refused_under_verify() {
+    let pair = Pair::new(
+        "dependency-verify",
+        RepoMode::Archive,
+        RepoMode::Archive,
+        "",
+    );
+    let (main, dep) = dependency_chain(&pair.client);
+    client_sign(&pair.client, &main);
+
+    let pushed = push_under(&pair, opts(&["main"]), &verify_policy(), |_| {});
+    assert_refused(pushed, remote::ErrorCode::SignatureRequired);
+    assert_eq!(tip(&pair.server, "main"), None);
+    assert!(!has_commit(&pair.server, &dep));
+    assert!(!has_commit(&pair.server, &main));
+
+    client_sign(&pair.client, &dep);
+    let (report, outcome) = push_under(&pair, opts(&["main"]), &verify_policy(), |_| {});
+    report.unwrap();
+    outcome.unwrap();
+    assert_eq!(tip(&pair.server, "main"), Some(main));
+    assert_complete(&pair.client, &pair.server, &dep);
+}
+
+/// With depth 1, a dependency of the parent is checked under the rule of the
+/// source commit.
+#[test]
+fn with_a_depth_a_dependency_of_the_parent_is_checked_under_the_rule_of_the_source() {
+    let pair = Pair::new(
+        "dependency-verify-parent",
+        RepoMode::Archive,
+        RepoMode::Archive,
+        "",
+    );
+    let dep = commit(&pair.client, "dep/d", None, "d", None);
+    let parent = commit_related(&pair.client, "main", None, "p", None, &[("boot/d", dep)]);
+    let main = commit(&pair.client, "main", Some(parent), "t", None);
+    client_sign(&pair.client, &main);
+    let options = || RepoPushOptions {
+        depth: Some(1),
+        ..opts(&["main"])
+    };
+
+    let pushed = push_under(&pair, options(), &verify_policy(), |_| {});
+    assert_refused(pushed, remote::ErrorCode::SignatureRequired);
+    assert!(!has_commit(&pair.server, &dep));
+
+    client_sign(&pair.client, &dep);
+    let (report, outcome) = push_under(&pair, options(), &verify_policy(), |_| {});
+    report.unwrap();
+    outcome.unwrap();
+    assert_eq!(tip(&pair.server, "main"), Some(main));
+    assert!(has_commit(&pair.server, &parent));
+    assert_complete(&pair.client, &pair.server, &dep);
+}
+
+/// Under a server policy with `sign`, a staged dependency carries the server
+/// signature once. A later push of a commit that names the held dependency
+/// adds no signature.
+#[test]
+fn a_staged_dependency_carries_the_server_signature_once() {
+    let pair = Pair::new("dependency-sign", RepoMode::Archive, RepoMode::Archive, "");
+    let (main, dep) = dependency_chain(&pair.client);
+    let (report, outcome) = push_under(&pair, opts(&["main"]), &sign_policy(), |_| {});
+    report.unwrap();
+    outcome.unwrap();
+    let bytes = block_on(pair.server.load_object_bytes(ObjectType::Commit, &dep)).unwrap();
+    let expected = [ed25519_signature(SERVER_SECRET_B64, &bytes)];
+    assert_eq!(ed25519_signatures(&pair.server, &dep), expected);
+
+    let next = commit_related(
+        &pair.client,
+        "main",
+        Some(main),
+        "next",
+        None,
+        &[("boot/uki", dep)],
+    );
+    let (report, outcome) = push_under(&pair, opts(&["main"]), &sign_policy(), |_| {});
+    report.unwrap();
+    outcome.unwrap();
+    assert_eq!(tip(&pair.server, "main"), Some(next));
+    assert_eq!(ed25519_signatures(&pair.server, &dep), expected);
+}
+
+/// A dependency that the server already holds gets no server signature.
+#[test]
+fn a_dependency_the_server_holds_gets_no_server_signature() {
+    let pair = Pair::new(
+        "dependency-held-sign",
+        RepoMode::Archive,
+        RepoMode::Archive,
+        "",
+    );
+    let (main, dep) = dependency_chain(&pair.client);
+    let (report, outcome) = push(&pair, opts(&["dep/uki"]));
+    report.unwrap();
+    outcome.unwrap();
+
+    let (report, outcome) = push_under(&pair, opts(&["main"]), &sign_policy(), |_| {});
+    report.unwrap();
+    outcome.unwrap();
+    assert_eq!(tip(&pair.server, "main"), Some(main));
+    assert!(ed25519_signatures(&pair.server, &dep).is_empty());
+    assert_eq!(ed25519_signatures(&pair.server, &main).len(), 1);
+}
+
+/// A dependency that the server holds and marks partial refuses the push
+/// with `missing-objects`. The server moves no ref.
+#[test]
+fn a_dependency_the_server_holds_partial_refuses_the_push() {
+    let pair = Pair::new(
+        "dependency-held-partial",
+        RepoMode::Archive,
+        RepoMode::Archive,
+        "",
+    );
+    let (main, dep) = dependency_chain(&pair.client);
+    let (report, outcome) = push(&pair, opts(&["dep/uki"]));
+    report.unwrap();
+    outcome.unwrap();
+    mark_partial(&pair.server, &dep);
+
+    assert_refused(
+        push(&pair, opts(&["main"])),
+        remote::ErrorCode::MissingObjects,
+    );
+    assert_eq!(tip(&pair.server, "main"), None);
+    assert!(!has_commit(&pair.server, &main));
 }
 
 // ---------------------------------------------------------------------------

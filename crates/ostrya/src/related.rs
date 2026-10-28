@@ -24,6 +24,9 @@
 //!   walks.
 //! - `Repo::push`, `Repo::push_over_stream`, and `Repo::push_to_bucket` send
 //!   the dependencies of each commit that they offer.
+//! - `Repo::receive` and `Repo::receive_stream` check the dependencies of each
+//!   commit that the session stages, and apply the rules of the ref updates to
+//!   each staged dependency.
 
 use std::os::fd::AsFd;
 use std::sync::LazyLock;
@@ -573,6 +576,87 @@ pub(crate) fn checked_dependencies(
     checked_entries(RelatedField::Dependencies, Some(*commit), entries)
 }
 
+/// Checks the format of each entry of field 2 of the parsed commit `commit`
+/// and returns the name and the checksum of each entry, in the stored order.
+///
+/// The call is [`checked_dependencies`] over a borrowed field: the result
+/// borrows the names, and the call copies a name only for its error.
+///
+/// # Errors
+///
+/// [`Error::InvalidRelated`] with `commit` and [`RelatedField::Dependencies`]
+/// for the first entry with an empty name or with a checksum that is not 32
+/// bytes.
+#[cfg_attr(not(feature = "receive"), allow(dead_code))]
+pub(crate) fn borrowed_dependencies<'a>(
+    commit: &Checksum,
+    related: &'a [(String, Vec<u8>)],
+) -> Result<Vec<(&'a str, Checksum)>> {
+    related
+        .iter()
+        .enumerate()
+        .map(|(index, (name, bytes))| match Checksum::from_ay(bytes) {
+            Ok(checksum) if !name.is_empty() => Ok((name.as_str(), checksum)),
+            checksum => {
+                let entry = RelatedEntry {
+                    name: name.clone(),
+                    checksum: checksum.map_err(|_| bytes.len()),
+                };
+                Err(Error::InvalidRelated {
+                    commit: Some(*commit),
+                    field: RelatedField::Dependencies,
+                    reason: entry.defect(index).expect("the entry is defective"),
+                })
+            }
+        })
+        .collect()
+}
+
+/// The state of a commit that the repository holds, as a dependency.
+#[cfg_attr(not(feature = "receive"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeldDependency {
+    /// The repository does not hold the commit object.
+    Absent,
+    /// The repository holds the commit object and marks it partial.
+    Partial,
+    /// The repository holds the commit object and does not mark it partial.
+    /// `nested` is `true` if the field 2 of the commit is not empty.
+    Complete { nested: bool },
+}
+
+/// Returns the state of the dependency `checksum` in `repo`.
+///
+/// The call reads the partial marker, then the commit object, on the calling
+/// thread. A caller on the executor calls it on the blocking pool. For a
+/// commit with a partial marker, the call reads no object: it only finds if
+/// the object is present. For a commit with no marker, it reads the object
+/// and decodes field 2 alone.
+///
+/// # Errors
+///
+/// - [`Error::Core`] if the commit tuple does not frame, or if its field 2
+///   does not decode.
+/// - [`Error::Io`] if a file system operation fails, or if the commit object
+///   is larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
+#[cfg_attr(not(feature = "receive"), allow(dead_code))]
+pub(crate) fn held_dependency_blocking(repo: &Repo, checksum: &Checksum) -> Result<HeldDependency> {
+    if repo.commit_state_blocking(checksum)? == CommitState::Partial {
+        return Ok(if repo.has_object_blocking(ObjectType::Commit, checksum)? {
+            HeldDependency::Partial
+        } else {
+            HeldDependency::Absent
+        });
+    }
+    match repo.load_object_bytes_blocking(ObjectType::Commit, checksum) {
+        Ok(bytes) => Ok(HeldDependency::Complete {
+            nested: has_dependencies(&bytes)?,
+        }),
+        Err(Error::ObjectNotFound { .. }) => Ok(HeldDependency::Absent),
+        Err(e) => Err(e),
+    }
+}
+
 /// Returns the error for the dependency `name` of `commit`, which names the
 /// commit `dependency` whose own field 2 is not empty.
 pub(crate) fn nested_dependency(commit: Checksum, name: &str, dependency: &Checksum) -> Error {
@@ -585,7 +669,7 @@ pub(crate) fn nested_dependency(commit: Checksum, name: &str, dependency: &Check
 
 /// Returns the error for the dependency `name` of `commit`, which names the
 /// commit `dependency` that the repository marks partial.
-#[cfg_attr(not(feature = "push"), allow(dead_code))]
+#[cfg_attr(not(any(feature = "push", feature = "receive")), allow(dead_code))]
 pub(crate) fn partial_dependency(commit: Checksum, name: &str, dependency: &Checksum) -> Error {
     Error::InvalidRelated {
         commit: Some(commit),

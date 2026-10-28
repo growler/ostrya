@@ -18,8 +18,9 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use common::receive::{
-    Obj, PIPE_CAP, assert_nothing_published, fixture_objects, new_repo, pipe, policy_allowing,
-    returned_code, session, staging_entries,
+    ED25519_KEY, OTHER_SECRET_B64, Obj, PIPE_CAP, SECRET_B64, SERVER_SECRET_B64,
+    assert_nothing_published, build_commit, ed25519_signatures, fixture_objects, new_repo, pipe,
+    policy_allowing, returned_code, server_signer, session, signed_dict, staging_entries, trust,
 };
 use common::{COMMIT, TmpDir, file_inventory, foreign_holder, lock_holder_main, tool_fsck};
 use futures_io::AsyncWrite;
@@ -30,16 +31,10 @@ use ostrya::remote::proto::{
 use ostrya::remote::{self, Encoding, ErrorCode, Expected, RefOutcome, RefUpdate};
 use ostrya::{
     Checksum, DictBuilder, Error, FsckOptions, MAX_METADATA_SIZE, ObjectName, ObjectType,
-    ReceivePattern, ReceiveReport, ReceiveService, Repo, RepoMode, ServerSigner, StreamPolicy,
-    StreamRule, Type, Value,
+    ReceivePattern, ReceiveReport, ReceiveService, ReceiveVerify, Repo, RepoMode, ServerSigner,
+    StreamPolicy, StreamRule, Type, Value,
 };
 use ostrya_rt::block_on;
-
-/// The ed25519 secret key of a server signer.
-const SERVER_SECRET_B64: &str =
-    "Rdkqts/v6AXV6N+XOTlBGoGiItwTHGWaip72oFWzQDDMGsL2Sdl/Bcj+xg4EA2iJqHUuBsmdnNCFKNZMBqTiFw==";
-
-const ED25519_KEY: &str = "ostree.sign.ed25519";
 
 #[test]
 #[ignore = "helper process for the lock tests"]
@@ -192,6 +187,23 @@ impl Stream {
             encoding: Encoding::Raw,
             bytes: detached_meta(),
         });
+        self.message(&Message::ObjectsEnd)
+    }
+
+    /// One object stream: each of `objects`, each detached metadata dict of
+    /// `meta`, and `ObjectsEnd`.
+    fn objects_with(&mut self, objects: &[Obj], meta: &[(Checksum, Vec<u8>)]) -> &mut Stream {
+        for o in objects {
+            self.object(o);
+        }
+        for (commit, dict) in meta {
+            self.object(&Obj {
+                ty: ObjectType::CommitMeta,
+                checksum: *commit,
+                encoding: Encoding::Raw,
+                bytes: dict.clone(),
+            });
+        }
         self.message(&Message::ObjectsEnd)
     }
 
@@ -850,6 +862,181 @@ fn a_write_to_a_checksum_shaped_name_is_invalid_ref_at_commit() {
         other => panic!("{other:?}"),
     }
     assert_nothing_published(&repo, &before);
+}
+
+// ---------------------------------------------------------------------------
+// Dependencies.
+// ---------------------------------------------------------------------------
+
+/// The objects of the fixture tree, then `commits`.
+fn with_tree(commits: &[&Obj]) -> Vec<Obj> {
+    let mut objects: Vec<Obj> = fixture_objects(Encoding::Raw)
+        .into_iter()
+        .filter(|o| o.ty != ObjectType::Commit)
+        .collect();
+    objects.extend(commits.iter().map(|commit| (*commit).clone()));
+    objects
+}
+
+/// A commit over the fixture tree with the subject `subject` and one field 2
+/// entry for each of `deps`.
+fn commit_naming(subject: &str, deps: &[(&str, &[u8])]) -> Obj {
+    build_commit(None, subject, Value::Array(Vec::new()), deps)
+}
+
+/// The detached metadata of `commit` with a signature of each key of
+/// `secrets`.
+fn signed(commit: &Obj, secrets: &[&str]) -> (Checksum, Vec<u8>) {
+    (commit.checksum, signed_dict(&commit.bytes, secrets))
+}
+
+/// A stream with `Hello` for `refs`, one object stream of `objects` and
+/// `meta`, and `Commit` with an update from absent to each commit of
+/// `updates`.
+fn dependency_stream(
+    objects: &[Obj],
+    meta: &[(Checksum, Vec<u8>)],
+    updates: &[(&str, Checksum)],
+) -> Vec<u8> {
+    let names: Vec<&str> = updates.iter().map(|(name, _)| *name).collect();
+    let mut stream = Stream::hello(&names, true);
+    stream.objects_with(objects, meta).commit(
+        updates
+            .iter()
+            .map(|(name, commit)| update(name, Expected::Absent, Some(*commit)))
+            .collect(),
+    );
+    stream.bytes()
+}
+
+/// A policy whose rule of each of `refs` verifies with the key of its
+/// secret.
+fn verify_policy(refs: &[(&str, &str)]) -> StreamPolicy {
+    StreamPolicy {
+        rules: refs
+            .iter()
+            .map(|(name, secret)| {
+                (
+                    ReceivePattern::parse(name).unwrap(),
+                    StreamRule {
+                        verify: ReceiveVerify::Keys(trust(secret)),
+                        ..StreamRule::default()
+                    },
+                )
+            })
+            .collect(),
+        ..StreamPolicy::default()
+    }
+}
+
+/// A staged dependency that two new commits name must pass the rule of each
+/// of their refs. A dependency with no signature, or with the signature of
+/// one rule alone, is `signature-required`.
+#[test]
+fn a_dependency_passes_the_rule_of_each_target_that_names_it() {
+    let dep = commit_naming("dependency", &[]);
+    let a = commit_naming("a", &[("lib/d", &dep.checksum.as_bytes()[..])]);
+    let b = commit_naming("b", &[("lib/d", &dep.checksum.as_bytes()[..])]);
+    let policy = verify_policy(&[("a", SECRET_B64), ("b", OTHER_SECRET_B64)]);
+    let objects = with_tree(&[&dep, &a, &b]);
+    let updates = [("a", a.checksum), ("b", b.checksum)];
+    let targets = [signed(&a, &[SECRET_B64]), signed(&b, &[OTHER_SECRET_B64])];
+    let tmp = TmpDir::new("one-way-dep-two-rules");
+    let (repo, before) = empty_repo(&tmp, "");
+
+    for dict in [None, Some(signed(&dep, &[SECRET_B64]))] {
+        let mut meta = targets.to_vec();
+        meta.extend(dict);
+        let result = receive(
+            &repo,
+            &policy,
+            &dependency_stream(&objects, &meta, &updates),
+        );
+        match result {
+            Err(Error::Remote(remote::Error::SignatureRequired(m))) => assert!(
+                m.contains(&format!("commit {}, a dependency of commit", dep.checksum)),
+                "{m}"
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert_nothing_published(&repo, &before);
+    }
+
+    let mut meta = targets.to_vec();
+    meta.push(signed(&dep, &[SECRET_B64, OTHER_SECRET_B64]));
+    let bytes = dependency_stream(&objects, &meta, &updates);
+    receive_piped(&repo, &policy, bytes).unwrap();
+    assert!(block_on(repo.has_object(ObjectType::Commit, &dep.checksum)).unwrap());
+}
+
+/// A dependency that the stream neither stages nor finds in the repository
+/// is `missing-objects`, and the error lists it.
+#[test]
+fn an_absent_dependency_is_missing_objects() {
+    let dep = commit_naming("dependency", &[]);
+    let target = commit_naming("target", &[("lib/d", &dep.checksum.as_bytes()[..])]);
+    let tmp = TmpDir::new("one-way-dep-absent");
+    let (repo, before) = empty_repo(&tmp, "");
+    let bytes = dependency_stream(&with_tree(&[&target]), &[], &[("main", target.checksum)]);
+    match receive(&repo, &StreamPolicy::default(), &bytes) {
+        Err(Error::Remote(remote::Error::MissingObjects { missing, .. })) => {
+            assert_eq!(missing, [ObjectName::new(dep.checksum, ObjectType::Commit)])
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_nothing_published(&repo, &before);
+}
+
+/// A nested dependency and a defective field 2 entry are `protocol`.
+#[test]
+fn a_nested_or_defective_dependency_is_protocol() {
+    let inner = commit_naming("inner", &[]);
+    let nested = commit_naming("nested", &[("lib/i", &inner.checksum.as_bytes()[..])]);
+    let over_nested = commit_naming("target", &[("lib/n", &nested.checksum.as_bytes()[..])]);
+    let defective = commit_naming("defective", &[("lib/s", &[7; 31])]);
+    let cases = [
+        (vec![&inner, &nested, &over_nested], over_nested.checksum),
+        (vec![&defective], defective.checksum),
+    ];
+    for (commits, target) in cases {
+        let tmp = TmpDir::new("one-way-dep-protocol");
+        let (repo, before) = empty_repo(&tmp, "");
+        let bytes = dependency_stream(&with_tree(&commits), &[], &[("main", target)]);
+        match receive(&repo, &StreamPolicy::default(), &bytes) {
+            Err(Error::Remote(remote::Error::Protocol(m))) => assert!(
+                m.starts_with(&format!("related commits in field 2 of commit {target}: ")),
+                "{m}"
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert_nothing_published(&repo, &before);
+    }
+}
+
+/// A one-way stream ignores the server keys of its rules, so a staged
+/// dependency gets no server signature.
+#[test]
+fn a_dependency_gets_no_server_signature() {
+    let dep = commit_naming("dependency", &[]);
+    let target = commit_naming("target", &[("lib/d", &dep.checksum.as_bytes()[..])]);
+    let rule = StreamRule {
+        signers: vec![server_signer(SERVER_SECRET_B64)],
+        ..StreamRule::default()
+    };
+    let policy = StreamPolicy {
+        default_rule: rule,
+        ..StreamPolicy::default()
+    };
+    let tmp = TmpDir::new("one-way-dep-no-signer");
+    let (repo, _) = empty_repo(&tmp, "");
+    let bytes = dependency_stream(
+        &with_tree(&[&dep, &target]),
+        &[],
+        &[("main", target.checksum)],
+    );
+    receive_piped(&repo, &policy, bytes).unwrap();
+    assert!(ed25519_signatures(&repo, &dep.checksum).is_empty());
+    assert!(ed25519_signatures(&repo, &target.checksum).is_empty());
 }
 
 // ---------------------------------------------------------------------------

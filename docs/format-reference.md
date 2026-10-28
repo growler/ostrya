@@ -3149,6 +3149,9 @@ offer.
 `ostrya push --onto` and `ostrya push-tree` send no dependency. The field 2 of
 a server commit is empty ("Server commit").
 
+The server checks the dependencies of the commits that it stages, and applies
+its signature rules to them ("Commit and CommitReply", checks 6, 8, and 9).
+
 ## Ref patterns
 
 The port selects refs by name with two grammars. A pattern of a client group
@@ -3815,6 +3818,26 @@ Each failed check ends the session, and the session writes nothing:
    required. The `missing` detail names at most 16384 objects. A staged
    dirtree that does not parse is `protocol`, and a stored one is
    `internal`.
+
+   Then the server checks the dependencies of each staged commit: the field
+   2 entries of each commit that the session staged, the staged parents of a
+   new commit included ("Related commits"). A new commit that the repository
+   holds with a partial-commit marker gets the same check, because the walk
+   above completes its tree and the session removes its marker. The server
+   takes the new commits that it checks in the order of the updates, then
+   the other staged commits in the order of their checksums. An entry with an empty
+   name or with a checksum that is not 32 bytes is `protocol`. A dependency
+   that the session did not stage and that the repository does not hold is
+   `missing-objects`. The absent dependencies fail together, and the
+   `missing` detail names each one. Then, in the order of the commits that
+   name them, a dependency that the repository holds with a partial-commit
+   marker is `missing-objects` with no `missing` detail, and a dependency
+   whose own field 2 is not empty is `protocol`. The message names the
+   commit that holds the entry, field 2, and the defect. A dependency that
+   the session staged, and a dependency that is a new commit, are complete
+   through the walk above, also with a partial-commit marker. The server
+   does not check field 2 of a new commit that the repository holds with no
+   partial-commit marker.
 7. The bindings of each new commit must agree with the session, else
    `binding-mismatch`:
    - A non-empty `ostree.ref-binding` must hold the name of each ref that the
@@ -3839,10 +3862,24 @@ Each failed check ends the session, and the session writes nothing:
    `ostree.sign.dummy` passes. A commit with a blob under one of these keys
    must pass the check, so a signature of an engine that the trust group does
    not read fails.
+
+   Each staged dependency must pass the verification of the rule of each
+   update whose new commit names it in its staged chain, else
+   `signature-required`. The staged chain of a new commit is the commit and
+   its parents as far as the session staged them. Field 2 of a new commit
+   that the repository holds also counts. The message names the dependency
+   and the first new commit, in the order of the updates, whose staged chain
+   names it. A staged dependency that is also a new commit gets one
+   verification under the rules of both roles. A dependency that the
+   repository holds, and a staged dependency that only commits outside each
+   staged chain name, get no verification.
 9. If `[ex-ostrya] keep-detached-related` is `false`, the server drops
    `ostrya.related` from each incoming dict ("The switch of the
    destination"). The server then makes the staged objects durable, and signs each new commit one time with each key
-   of the key `sign` of the client group. It walks the history of each update
+   of the key `sign` of the client group. It signs each staged dependency
+   that the staged chain of a new commit names, as check 8 states, one time
+   with each distinct key of the rules of these new commits. A dependency
+   that the repository holds gets no signature. It walks the history of each update
    that needs the fast-forward check. The walk starts at the new commit and
    follows the parents until it reaches the commit of the ref, an absent
    commit, or a root commit. An update of an absent ref needs no walk, so the
@@ -4171,8 +4208,9 @@ repository lock, and `Commit` still takes the update lock ("The update lock").
 
 The size check of `CommitReply` (check 2 of "Commit and CommitReply")
 applies. The server runs the other `Commit` checks after the end of the
-input. A one-way stream adds no server signature, writes no anchor commit,
-and does not regenerate the summary. It calls no hook of a host application.
+input. Check 6 checks the dependencies of the staged commits as in a push
+session. A one-way stream adds no server signature, also to a dependency,
+writes no anchor commit, and does not regenerate the summary. It calls no hook of a host application.
 
 A one-way stream keeps rules of its own, and a client group does not apply to
 it. A host application gives the rules in code. Each rule has a pattern with
@@ -4181,7 +4219,10 @@ an optional remote part, so a one-way stream can write a remote ref
 check 8, if it allows a delete, and if it allows an update that is not a
 fast-forward under `force`. Check 4 refuses an update that no rule covers
 and an update whose rule does not accept it, with `ref-denied`. Check 8 with
-trusted keys refuses a commit with no signature. Check 11 refuses a delete
+trusted keys refuses a commit with no signature. The trusted keys of the rule
+of an update also apply to each staged dependency that the staged chain of
+its new commit names, so a dependency that two new commits name must pass the
+rules of both. Check 11 refuses a delete
 that the rule does not allow with `delete-denied`.
 
 ## The pull session over a stream

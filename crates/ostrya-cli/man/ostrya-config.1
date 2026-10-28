@@ -545,11 +545,14 @@ A group with no \fB\%tls:\fR or \fB\%tls\-sha256:\fR item refuses the key, with 
 .TP
 \fB\%verify\fR (string)
 \fB\%trust:NAME\fR, the trust group that verifies each commit that a client builds and pushes.
+The trust group also verifies each staged dependency: a commit that the session stages and that field 2 of a new commit, or of a staged parent of it, names.
+A dependency that the repository holds gets no verification.
 Each other value is refused, \fB\%off\fR and \fB\%remote:NAME\fR included.
 Without the key, the group verifies no signature.
 .TP
 \fB\%allow\-unsigned\fR (boolean)
 Accept a commit that a client builds and pushes, when it has no signature.
+The key applies to each staged dependency that \fB\%verify\fR verifies too.
 A commit has no signature if its detached metadata holds no blob under \fB\%ostree.gpgsigs\fR, \fB\%ostree.sign.ed25519\fR, \fB\%ostree.sign.spki\fR, and \fB\%ostree.sign.dummy\fR.
 A commit with a signature must verify on each axis of the trust group, also when the key is true, so a signature of an engine that the trust group does not read is refused.
 The default is true without \fB\%verify\fR, and false with \fB\%verify\fR.
@@ -557,6 +560,8 @@ The default is true without \fB\%verify\fR, and false with \fB\%verify\fR.
 .TP
 \fB\%sign\fR (list)
 The key groups whose keys sign each new commit of a ref update of the group, and each server commit of the group.
+The keys also sign each staged dependency that field 2 of a new commit, or of a staged parent of it, names, one time with each key.
+A dependency that the repository holds gets no signature.
 A key that already signed a commit adds no signature.
 A name that occurs two times counts one time.
 An empty value is refused.

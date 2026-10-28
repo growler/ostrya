@@ -61,12 +61,16 @@ pub struct ReceivePolicy {
     /// The signatures that a new commit must carry.
     ///
     /// The verification applies to a commit that the client built. A server
-    /// commit gets no verification.
+    /// commit gets no verification. It also applies to each staged dependency
+    /// that the staged chain of a new commit names: a commit that the session
+    /// stages and that field 2 of the new commit or of a staged parent of it
+    /// names. A dependency that the repository holds gets no verification.
     pub verify: ReceiveVerify,
     /// The switch that accepts a new commit with no signature.
     ///
     /// The switch applies only with [`ReceiveVerify::Keys`], and only to a
-    /// commit that the client built. A commit has no
+    /// commit that the client built: a new commit or a staged dependency that
+    /// [`verify`](ReceivePolicy::verify) applies to. A commit has no
     /// signature if its detached metadata holds no blob under
     /// `ostree.gpgsigs`, `ostree.sign.ed25519`, `ostree.sign.spki`, and
     /// `ostree.sign.dummy`. A commit with a blob under one of these keys must
@@ -79,7 +83,10 @@ pub struct ReceivePolicy {
     /// so the list can hold more keys than the client group names groups.
     ///
     /// A new commit is a commit that becomes the new value of a ref. A server
-    /// commit is a new commit too.
+    /// commit is a new commit too. The server also signs each staged
+    /// dependency that field 2 of a new commit, or of a staged parent of it,
+    /// names, with each key once. A dependency that the repository holds gets
+    /// no signature.
     pub signers: Vec<Arc<ServerSigner>>,
     /// The switch that accepts privileged content in a `bare` repository.
     ///

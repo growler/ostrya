@@ -6,6 +6,7 @@
 
 use std::future::Future;
 use std::path::Path;
+use std::sync::Arc;
 
 use futures_lite::io::AsyncReadExt;
 use ostrya::remote::proto::{
@@ -13,8 +14,11 @@ use ostrya::remote::proto::{
     ObjectHeader, ObjectsReply, ServerCommit,
 };
 use ostrya::remote::{self, Encoding, ErrorCode, RefOutcome, RefUpdate};
+use ostrya::sign::append_signature;
 use ostrya::{
-    Checksum, CreateOptions, Error, ObjectName, ObjectType, ReceivePolicy, Repo, RepoMode, Xattrs,
+    Checksum, Commit, CreateOptions, Ed25519Signer, Ed25519Verifier, Error, ObjectName, ObjectType,
+    ReceivePolicy, Repo, RepoMode, ServerSigner, Signer, TrustedKeys, Type, Value, Verifier,
+    Xattrs,
 };
 use ostrya_core::DeflateSink;
 use ostrya_core::FileHeader;
@@ -23,7 +27,9 @@ use ostrya_rt::block_on;
 use sha2::{Digest, Sha256};
 
 pub use super::pipe::{PipeReader, PipeWriter, pipe};
-use super::{COMMIT, TmpDir, file_inventory, fixture_repo};
+use super::{
+    COMMIT, Field2Entry, ROOT_DIRMETA, ROOT_DIRTREE, TmpDir, file_inventory, fixture_repo,
+};
 
 // ---------------------------------------------------------------------------
 // The test client.
@@ -362,6 +368,106 @@ pub fn commit_objects(root: &Path, commit: &Checksum, encoding: Encoding) -> Vec
                 bytes,
             }
         })
+        .collect()
+}
+
+/// A commit over the tree of the fixture commit with `metadata`, `parent`,
+/// `subject`, and the field 2 entries `related`, with no check of the
+/// entries.
+pub fn build_commit(
+    parent: Option<Checksum>,
+    subject: &str,
+    metadata: Value,
+    related: &[Field2Entry<'_>],
+) -> Obj {
+    let bytes = Commit {
+        metadata,
+        parent,
+        related: related
+            .iter()
+            .map(|(name, bytes)| ((*name).to_owned(), bytes.to_vec()))
+            .collect(),
+        subject: subject.into(),
+        body: String::new(),
+        timestamp: 1_700_000_100,
+        root_dirtree: Checksum::from_hex(ROOT_DIRTREE).unwrap(),
+        root_dirmeta: Checksum::from_hex(ROOT_DIRMETA).unwrap(),
+    }
+    .serialize()
+    .unwrap();
+    Obj {
+        ty: ObjectType::Commit,
+        checksum: sha(&bytes),
+        encoding: Encoding::Raw,
+        bytes,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Signatures.
+// ---------------------------------------------------------------------------
+
+/// The base64 of a 64-byte ed25519 secret key (seed, then public key).
+pub const SECRET_B64: &str =
+    "o74ME/dmhvDeYf64dDJQY8kX2piK0M/nyIRWVi30i6DCOzRsHVcvgYToz6zOb5OvK/v8nH6KfLR3dfdsn6ZSyQ==";
+/// Another ed25519 secret key.
+pub const OTHER_SECRET_B64: &str =
+    "5ILWxT+l9G/u3h0BptRpmSi35C9uog7YDdD+Fp1Xk+Hz52p0NlYh6xBA73kJEJKhKbbnjcE0rsWA5XA/K5Sq5Q==";
+/// The ed25519 secret key of a server signer.
+pub const SERVER_SECRET_B64: &str =
+    "Rdkqts/v6AXV6N+XOTlBGoGiItwTHGWaip72oFWzQDDMGsL2Sdl/Bcj+xg4EA2iJqHUuBsmdnNCFKNZMBqTiFw==";
+/// The ed25519 secret key of a second server signer.
+pub const SECOND_SERVER_SECRET_B64: &str =
+    "l/anh/DXkHapldUSa0GdgaH5ISN03SHhYNSK+Ru3aAtpU8w6rtwuSrlO1kD+T1+eddwLhqHxd9ui+B+v52iDOw==";
+
+pub const ED25519_KEY: &str = "ostree.sign.ed25519";
+
+pub fn secret(b64: &str) -> Vec<u8> {
+    ostrya::base64::decode(b64).unwrap()
+}
+
+/// An ed25519 signature of `payload` with the key `secret_b64`.
+pub fn ed25519_signature(secret_b64: &str, payload: &[u8]) -> Vec<u8> {
+    let signer = Ed25519Signer::from_secret_key(&secret(secret_b64)).unwrap();
+    block_on(signer.sign(payload)).unwrap()
+}
+
+/// A detached metadata dict with one ed25519 signature for each key.
+pub fn signed_dict(payload: &[u8], secrets: &[&str]) -> Vec<u8> {
+    let mut dict = Value::Array(Vec::new());
+    for key in secrets {
+        append_signature(&mut dict, ED25519_KEY, ed25519_signature(key, payload)).unwrap();
+    }
+    ostrya_core::to_bytes(&Type::parse("a{sv}").unwrap(), &dict).unwrap()
+}
+
+/// A server signer with the ed25519 key `secret_b64`.
+pub fn server_signer(secret_b64: &str) -> Arc<ServerSigner> {
+    Arc::new(ServerSigner::ed25519(&secret(secret_b64)).unwrap())
+}
+
+/// Trusted keys that trust the ed25519 key `secret_b64`.
+pub fn trust(secret_b64: &str) -> Arc<TrustedKeys> {
+    let public = secret(secret_b64)[32..].to_vec();
+    let verifier: Arc<dyn Verifier> =
+        Arc::new(Ed25519Verifier::new([public], Vec::<Vec<u8>>::new()).unwrap());
+    Arc::new(TrustedKeys::new(vec![verifier]).unwrap())
+}
+
+/// The blobs under [`ED25519_KEY`] in the detached metadata of `commit` in
+/// `repo`, and none if the repository holds no such dict or key.
+pub fn ed25519_signatures(repo: &Repo, commit: &Checksum) -> Vec<Vec<u8>> {
+    let Some(dict) = block_on(repo.read_commit_detached_metadata(commit)).unwrap() else {
+        return Vec::new();
+    };
+    let Some(value) = dict.dict_get(ED25519_KEY) else {
+        return Vec::new();
+    };
+    let (_, list) = value.as_variant().unwrap();
+    list.as_array()
+        .unwrap()
+        .iter()
+        .map(|blob| blob.as_bytes().unwrap().to_vec())
         .collect()
 }
 

@@ -442,6 +442,12 @@ impl ReceiveService {
     ///   composefs image is not the key of its commit.
     /// - [`remote::Error::Protocol`] if a staged commit or a staged dirtree does
     ///   not parse.
+    /// - [`remote::Error::Protocol`] if an entry of field 2 of a staged commit
+    ///   has an empty name or a checksum that is not 32 bytes, or if a
+    ///   dependency of a staged commit has dependencies of its own. The
+    ///   message is the text of [`Error::InvalidRelated`]. A new commit that
+    ///   the repository holds with a partial marker gets the checks of a
+    ///   staged commit, here and for `missing-objects`.
     /// - [`remote::Error::InvalidRef`] if a ref name is not valid, or if an
     ///   update writes a commit to a ref name of 64 lowercase hex characters.
     ///   This applies to the branch and each tag of a server commit too. A
@@ -469,13 +475,21 @@ impl ReceiveService {
     ///   with `ref-denied`.
     /// - [`remote::Error::MissingObjects`] if a new commit, or an object of the
     ///   tree of a commit of the session, is neither staged nor present.
+    /// - [`remote::Error::MissingObjects`] if a dependency of a staged commit
+    ///   is neither staged nor present. The error lists each such dependency.
+    ///   A dependency that the repository holds and marks partial also gives
+    ///   this error, with no object listed and the text of
+    ///   [`Error::InvalidRelated`], unless it is a new commit of an update.
     /// - [`remote::Error::BindingMismatch`] if the ref binding of a new commit
     ///   does not name its ref, or if its collection binding does not name the
     ///   collection of the namespace. For the local refs, that collection is
     ///   the collection id of the repository, and in a repository with no
     ///   collection id each collection binding fails.
     /// - [`remote::Error::SignatureRequired`] if a new commit that the client
-    ///   built fails the signature verification of the policy. With
+    ///   built fails the signature verification of the policy. A staged
+    ///   dependency that the staged chain of a new commit names, the new
+    ///   commit and its staged parents, also gives this error if it fails the
+    ///   verification. With
     ///   [`allow_unsigned`](super::ReceivePolicy::allow_unsigned), a commit
     ///   with no signature passes, and a commit with a signature that does not
     ///   verify fails.
@@ -495,6 +509,8 @@ impl ReceiveService {
     ///   that [`ReceiveHooks`] states. The host sends it as `internal`.
     /// - [`Error::InvalidFormat`] if a commit or a dirtree that the repository
     ///   holds does not parse.
+    /// - [`Error::Core`] if the field 2 of a dependency that the repository
+    ///   holds does not decode.
     /// - [`Error::Core`] or [`Error::InvalidFormat`] if a stored detached
     ///   metadata dict is not an `a{sv}` in normal form.
     /// - [`Error::InvalidFormat`] if a stored dict holds a value that is not an

@@ -17,8 +17,8 @@ mod common;
 use std::sync::Arc;
 
 use common::receive::{
-    Obj, collections_policy, commit_objects, connect, fixture_objects, new_repo, policy_allowing,
-    returned_code, session, staging_entries,
+    Obj, build_commit, collections_policy, commit_objects, connect, fixture_objects, new_repo,
+    policy_allowing, returned_code, session, staging_entries,
 };
 use common::{
     ROOT_DIRMETA, ROOT_DIRTREE, TmpDir, file_inventory, tool_fsck, writer_child_main,
@@ -809,6 +809,57 @@ fn server_keys_sign_the_commit() {
     let verifier = Ed25519Verifier::new([public], Vec::<Vec<u8>>::new()).unwrap();
     let outcome = block_on(repo.verify_commit(&commit, &[&verifier])).unwrap();
     assert!(outcome.valid, "the server signature verifies");
+}
+
+/// A server commit onto a tip that names a dependency signs the new commit
+/// alone. The dependency gets no server signature.
+#[test]
+fn a_dependency_of_the_tip_gets_no_server_signature() {
+    let tmp = TmpDir::new("sc-sign-dependency");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    let dep = build_commit(None, "dependency", Value::Array(Vec::new()), &[]);
+    let tip = build_commit(
+        None,
+        "tip",
+        Value::Array(Vec::new()),
+        &[("lib/d", &dep.checksum.as_bytes()[..])],
+    );
+    let mut objects = tree_objects();
+    objects.extend([dep.clone(), tip.clone()]);
+    let updates = vec![RefUpdate {
+        name: "main".into(),
+        expected: Expected::Absent,
+        new: Some(tip.checksum),
+    }];
+    committed(push_request(
+        &repo,
+        &policy_allowing(&["w:**"]),
+        &["main"],
+        None,
+        &objects,
+        &[],
+        CommitRequest {
+            updates,
+            force: false,
+            server_commit: None,
+        },
+    ));
+
+    let policy = ReceivePolicy {
+        signers: vec![server_signer(SERVER_SECRET_B64)],
+        ..policy_allowing(&["c:**"])
+    };
+    let report = committed(push_sc(&repo, &policy, &[], server_commit("main")));
+    let commit = new_commit(&report);
+    let (bytes, parsed) = load(&repo, &commit);
+    assert_eq!(parsed.parent, Some(tip.checksum));
+    assert!(parsed.related.is_empty());
+    assert_eq!(
+        stored_signatures(&repo, &commit, ED25519_KEY),
+        vec![ed25519_signature(SERVER_SECRET_B64, &bytes)]
+    );
+    assert!(stored_signatures(&repo, &dep.checksum, ED25519_KEY).is_empty());
+    assert!(stored_signatures(&repo, &tip.checksum, ED25519_KEY).is_empty());
 }
 
 /// A policy with `verify` and no `allow_unsigned` accepts a server commit,

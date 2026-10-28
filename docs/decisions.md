@@ -2137,6 +2137,23 @@ the rules.
   push reads the commit objects of dependencies that it does not send, and
   a dependency of old history that the server holds, which the local
   repository no longer holds, refuses the push.
+- The receiver of a push session and of a one-way stream checks the
+  dependencies of each commit that it stages, the staged parents of a new
+  commit included. It also checks a new commit that it holds with a
+  partial-commit marker, because the session completes the tree of that
+  commit and removes its marker. For the same reason, a dependency that is a
+  new commit counts as complete. Each other dependency must be staged or
+  held complete, and no dependency can have dependencies of its own. A
+  staged dependency passes the signature rules of each update whose new
+  commit names it in its staged chain: the new commit and its parents as far
+  as the session staged them. Field 2 of a new commit that the server holds
+  counts too. The server signs it one time with each distinct key of these
+  rules. A
+  dependency that the server already holds gets no check and no signature:
+  the server accepted it when it stored it. A `Commit` message that lists the
+  dependencies of the push was rejected. The dependencies are in the signed
+  commits, so a list in the message adds a second source that can disagree
+  with them.
 - No transfer follows a build source. A pull, a push, and the one-way stream
   move `ostrya.related` as any other detached metadata key, under the switch
   of the destination, and fetch no commit that it names. A build cache needs the refs of its sources, and not

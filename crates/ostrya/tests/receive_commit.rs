@@ -11,41 +11,27 @@
 mod common;
 
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use common::receive::{
-    Obj, collections_policy, connect, fixture_objects, new_repo, policy_allowing, returned_code,
-    session, sha, staging_entries,
+    ED25519_KEY, OTHER_SECRET_B64, Obj, SECOND_SERVER_SECRET_B64, SECRET_B64, SERVER_SECRET_B64,
+    build_commit, collections_policy, connect, ed25519_signature, ed25519_signatures,
+    fixture_objects, new_repo, policy_allowing, returned_code, secret, server_signer, session, sha,
+    signed_dict, staging_entries, trust,
 };
 use common::{
-    COMMIT, GUARD_RELEASING_MARKER, ROOT_DIRMETA, ROOT_DIRTREE, TmpDir, file_inventory,
-    foreign_holder, guard_holder, guard_holder_main, is_sealed, lock_holder_main, regular_objects,
-    tool_fsck,
+    COMMIT, Field2Entry, GUARD_RELEASING_MARKER, ROOT_DIRMETA, ROOT_DIRTREE, TmpDir,
+    file_inventory, foreign_holder, guard_holder, guard_holder_main, is_sealed, lock_holder_main,
+    mark_partial, regular_objects, store_with_field2, tool_fsck,
 };
 use ostrya::remote::proto::ErrorMessage;
 use ostrya::remote::{Encoding, ErrorCode, Expected, RefOutcome, RefUpdate};
 use ostrya::sign::append_signature;
 use ostrya::{
-    Checksum, Commit, DictBuilder, Ed25519Signer, Ed25519Verifier, Error, FsckOptions, ObjectName,
-    ObjectType, ReceivePolicies, ReceivePolicy, ReceiveReport, ReceiveStep, ReceiveVerify, Repo,
-    RepoMode, ServerSigner, Signer, Summary, SummaryOptions, TrustedKeys, Type, Value, Verifier,
+    Checksum, Commit, DictBuilder, Ed25519Verifier, Error, FsckOptions, ObjectName, ObjectType,
+    ReceivePolicies, ReceivePolicy, ReceiveReport, ReceiveStep, ReceiveVerify, Repo, RepoMode,
+    Summary, SummaryOptions, Type, Value,
 };
 use ostrya_rt::block_on;
-
-/// The base64 of a 64-byte ed25519 secret key (seed, then public key).
-const SECRET_B64: &str =
-    "o74ME/dmhvDeYf64dDJQY8kX2piK0M/nyIRWVi30i6DCOzRsHVcvgYToz6zOb5OvK/v8nH6KfLR3dfdsn6ZSyQ==";
-/// Another ed25519 secret key.
-const OTHER_SECRET_B64: &str =
-    "5ILWxT+l9G/u3h0BptRpmSi35C9uog7YDdD+Fp1Xk+Hz52p0NlYh6xBA73kJEJKhKbbnjcE0rsWA5XA/K5Sq5Q==";
-/// The ed25519 secret key of a server signer.
-const SERVER_SECRET_B64: &str =
-    "Rdkqts/v6AXV6N+XOTlBGoGiItwTHGWaip72oFWzQDDMGsL2Sdl/Bcj+xg4EA2iJqHUuBsmdnNCFKNZMBqTiFw==";
-/// The ed25519 secret key of a second server signer.
-const SECOND_SERVER_SECRET_B64: &str =
-    "l/anh/DXkHapldUSa0GdgaH5ISN03SHhYNSK+Ru3aAtpU8w6rtwuSrlO1kD+T1+eddwLhqHxd9ui+B+v52iDOw==";
-
-const ED25519_KEY: &str = "ostree.sign.ed25519";
 
 #[test]
 #[ignore = "helper process for the receive lock tests"]
@@ -79,28 +65,6 @@ fn tree_objects() -> Vec<Obj> {
         .collect()
 }
 
-/// A commit over the fixture tree with `metadata`, `parent`, and `subject`.
-fn build_commit(parent: Option<Checksum>, subject: &str, metadata: Value) -> Obj {
-    let bytes = Commit {
-        metadata,
-        parent,
-        related: Vec::new(),
-        subject: subject.into(),
-        body: String::new(),
-        timestamp: 1_700_000_100,
-        root_dirtree: checksum(ROOT_DIRTREE),
-        root_dirmeta: checksum(ROOT_DIRMETA),
-    }
-    .serialize()
-    .unwrap();
-    Obj {
-        ty: ObjectType::Commit,
-        checksum: sha(&bytes),
-        encoding: Encoding::Raw,
-        bytes,
-    }
-}
-
 fn no_metadata() -> Value {
     Value::Array(Vec::new())
 }
@@ -119,41 +83,9 @@ fn signatures(dict: &Value, key: &str) -> Vec<Vec<u8>> {
         .collect()
 }
 
-fn secret(b64: &str) -> Vec<u8> {
-    ostrya::base64::decode(b64).unwrap()
-}
-
-/// An ed25519 signature of `payload` with the key `secret_b64`.
-fn ed25519_signature(secret_b64: &str, payload: &[u8]) -> Vec<u8> {
-    let signer = Ed25519Signer::from_secret_key(&secret(secret_b64)).unwrap();
-    block_on(signer.sign(payload)).unwrap()
-}
-
-/// A detached metadata dict with one ed25519 signature for each key.
-fn signed_dict(payload: &[u8], secrets: &[&str]) -> Vec<u8> {
-    let mut dict = no_metadata();
-    for key in secrets {
-        append_signature(&mut dict, ED25519_KEY, ed25519_signature(key, payload)).unwrap();
-    }
-    dict_bytes(&dict)
-}
-
-/// A server signer with the ed25519 key `secret_b64`.
-fn server_signer(secret_b64: &str) -> Arc<ServerSigner> {
-    Arc::new(ServerSigner::ed25519(&secret(secret_b64)).unwrap())
-}
-
 /// A verifier that trusts the ed25519 key `secret_b64`.
 fn ed25519_verifier(secret_b64: &str) -> Ed25519Verifier {
     Ed25519Verifier::new([secret(secret_b64)[32..].to_vec()], Vec::<Vec<u8>>::new()).unwrap()
-}
-
-/// Trusted keys that trust the ed25519 key `secret_b64`.
-fn trust(secret_b64: &str) -> Arc<TrustedKeys> {
-    let public = secret(secret_b64)[32..].to_vec();
-    let verifier: Arc<dyn Verifier> =
-        Arc::new(Ed25519Verifier::new([public], Vec::<Vec<u8>>::new()).unwrap());
-    Arc::new(TrustedKeys::new(vec![verifier]).unwrap())
 }
 
 // ---------------------------------------------------------------------------
@@ -801,7 +733,7 @@ fn hello_needs_a_push_mode_and_read_on_each_ref() {
         assert_unchanged(&repo, &before);
     }
     // `r` on a ref that the session does not write is enough for `Hello`.
-    let commit = build_commit(None, "unbound", no_metadata());
+    let commit = build_commit(None, "unbound", no_metadata(), &[]);
     let mut objects = tree_objects();
     objects.push(commit.clone());
     committed(push_named(
@@ -1031,8 +963,8 @@ fn detached_metadata_the_merge_refuses_is_protocol_at_ingest() {
 fn detached_metadata_for_a_commit_outside_the_session_is_protocol() {
     let tmp = TmpDir::new("recv-meta-outside");
     let repo = new_repo(&tmp, RepoMode::Archive, "");
-    let protected = build_commit(None, "protected", no_metadata());
-    let free = build_commit(None, "free", no_metadata());
+    let protected = build_commit(None, "protected", no_metadata(), &[]);
+    let free = build_commit(None, "free", no_metadata(), &[]);
     let mut objects = tree_objects();
     objects.push(protected.clone());
     committed(push(
@@ -1166,7 +1098,7 @@ fn an_object_that_does_not_parse_is_protocol_when_staged_and_internal_when_store
 #[test]
 fn ref_denied_covers_each_refused_ref() {
     // An unbound commit, so the binding check passes each name.
-    let commit = build_commit(None, "unbound", no_metadata());
+    let commit = build_commit(None, "unbound", no_metadata(), &[]);
     let mut objects = tree_objects();
     objects.push(commit.clone());
     let new = Some(commit.checksum);
@@ -1292,7 +1224,7 @@ fn a_foreign_ref_binding_is_binding_mismatch() {
 fn a_foreign_collection_binding_is_binding_mismatch() {
     let mut metadata = DictBuilder::new();
     metadata.insert_str("ostree.collection-binding", "org.example.Other");
-    let commit = build_commit(None, "bound", metadata.build());
+    let commit = build_commit(None, "bound", metadata.build(), &[]);
     let mut objects = tree_objects();
     objects.push(commit.clone());
 
@@ -1332,8 +1264,8 @@ fn a_foreign_collection_binding_is_binding_mismatch() {
 fn a_collection_binding_needs_a_namespace_of_that_id() {
     let mut metadata = DictBuilder::new();
     metadata.insert_str("ostree.collection-binding", "org.example.Os");
-    let bound = build_commit(None, "bound", metadata.build());
-    let unbound = build_commit(None, "unbound", no_metadata());
+    let bound = build_commit(None, "bound", metadata.build(), &[]);
+    let unbound = build_commit(None, "unbound", no_metadata(), &[]);
     let mut objects = tree_objects();
     objects.extend([bound.clone(), unbound.clone()]);
 
@@ -1396,10 +1328,10 @@ fn a_collection_namespace_writes_the_mirror_refs() {
     let repo = new_repo(&tmp, RepoMode::Archive, "collection-id=org.example.C\n");
     let mut metadata = DictBuilder::new();
     metadata.insert_str("ostree.collection-binding", "org.example.Os");
-    let first = build_commit(None, "first", metadata.build());
+    let first = build_commit(None, "first", metadata.build(), &[]);
     let mut metadata = DictBuilder::new();
     metadata.insert_str("ostree.collection-binding", "org.example.Os");
-    let second = build_commit(Some(first.checksum), "second", metadata.build());
+    let second = build_commit(Some(first.checksum), "second", metadata.build(), &[]);
     let mut objects = tree_objects();
     objects.extend([first.clone(), second.clone()]);
     let local = sha(b"local");
@@ -1494,7 +1426,7 @@ fn a_collection_namespace_writes_the_mirror_refs() {
 fn ostree_metadata_is_a_normal_ref_in_a_collection() {
     let tmp = TmpDir::new("recv-mirror-anchor");
     let repo = new_repo(&tmp, RepoMode::Archive, "collection-id=org.example.C\n");
-    let commit = build_commit(None, "unbound", no_metadata());
+    let commit = build_commit(None, "unbound", no_metadata(), &[]);
     let mut objects = tree_objects();
     objects.push(commit.clone());
     let before = snapshot(&repo);
@@ -1631,7 +1563,7 @@ fn an_unsigned_commit_is_signature_required() {
 /// verification, a signature that does not verify passes.
 #[test]
 fn allow_unsigned_accepts_only_a_commit_with_no_signature() {
-    let commit = build_commit(None, "unbound", no_metadata());
+    let commit = build_commit(None, "unbound", no_metadata(), &[]);
     let mut objects = tree_objects();
     objects.push(commit.clone());
     let dict = |key: &str, blobs: Vec<Vec<u8>>| {
@@ -1707,7 +1639,7 @@ fn allow_unsigned_accepts_only_a_commit_with_no_signature() {
 /// holds two times. A second push adds no signature.
 #[test]
 fn a_commit_of_two_refs_gets_each_key_once() {
-    let commit = build_commit(None, "unbound", no_metadata());
+    let commit = build_commit(None, "unbound", no_metadata(), &[]);
     let mut objects = tree_objects();
     objects.push(commit.clone());
     let shared = server_signer(SECOND_SERVER_SECRET_B64);
@@ -1811,7 +1743,7 @@ fn two_key_groups_with_one_key_file_sign_once() {
     let policies = block_on(ReceivePolicies::from_config(&repo)).unwrap();
     let policy = policies.get("c").unwrap();
     assert_eq!(policy.signers.len(), 2);
-    let commit = build_commit(None, "signed once", no_metadata());
+    let commit = build_commit(None, "signed once", no_metadata(), &[]);
     let mut objects = tree_objects();
     objects.push(commit.clone());
     committed(push(
@@ -1829,6 +1761,757 @@ fn two_key_groups_with_one_key_file_sign_once() {
         signatures(&dict, ED25519_KEY),
         vec![ed25519_signature(SERVER_SECRET_B64, &commit.bytes)]
     );
+}
+
+// ---------------------------------------------------------------------------
+// Dependencies.
+// ---------------------------------------------------------------------------
+
+/// The field 2 entry `name` that names `commit`.
+fn entry<'a>(name: &'a str, commit: &'a Obj) -> Field2Entry<'a> {
+    (name, &commit.checksum.as_bytes()[..])
+}
+
+/// The objects of the fixture tree, then `commits`.
+fn with_tree(commits: &[&Obj]) -> Vec<Obj> {
+    let mut objects = tree_objects();
+    objects.extend(commits.iter().map(|commit| (*commit).clone()));
+    objects
+}
+
+/// The detached metadata of `commit` with a signature of the key
+/// [`SECRET_B64`].
+fn client_signed(commit: &Obj) -> (Checksum, Vec<u8>) {
+    (commit.checksum, signed_dict(&commit.bytes, &[SECRET_B64]))
+}
+
+/// A policy that needs a signature of the key [`SECRET_B64`] on each commit
+/// that it verifies.
+fn verify_policy() -> ReceivePolicy {
+    ReceivePolicy {
+        verify: ReceiveVerify::Keys(trust(SECRET_B64)),
+        ..policy()
+    }
+}
+
+fn refs(repo: &Repo) -> Vec<(String, Checksum)> {
+    block_on(repo.list_refs(None)).unwrap()
+}
+
+/// A staged dependency of a new commit must pass the verification of the
+/// rule of the update. A dependency with no signature, or with a signature of
+/// a key that the rule does not trust, is `signature-required`. The message
+/// names the dependency and the new commit. A signed dependency passes and
+/// gets no ref.
+#[test]
+fn an_unsigned_dependency_is_signature_required() {
+    let dep = build_commit(None, "dependency", no_metadata(), &[]);
+    let target = build_commit(None, "target", no_metadata(), &[entry("lib/d", &dep)]);
+    let objects = with_tree(&[&dep, &target]);
+    let updates = || vec![update("main", Expected::Absent, Some(target.checksum))];
+    let tmp = TmpDir::new("recv-dep-unsigned");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    let before = snapshot(&repo);
+
+    let error = refused(
+        push(
+            &repo,
+            &verify_policy(),
+            &objects,
+            &[client_signed(&target)],
+            updates(),
+            false,
+        ),
+        ErrorCode::SignatureRequired,
+    );
+    let subject = format!(
+        "commit {}, a dependency of commit {}",
+        dep.checksum, target.checksum
+    );
+    assert!(error.message.contains(&subject), "{}", error.message);
+    assert_unchanged(&repo, &before);
+
+    let untrusted = (dep.checksum, signed_dict(&dep.bytes, &[OTHER_SECRET_B64]));
+    refused(
+        push(
+            &repo,
+            &verify_policy(),
+            &objects,
+            &[client_signed(&target), untrusted],
+            updates(),
+            false,
+        ),
+        ErrorCode::SignatureRequired,
+    );
+    assert_unchanged(&repo, &before);
+
+    committed(push(
+        &repo,
+        &verify_policy(),
+        &objects,
+        &[client_signed(&target), client_signed(&dep)],
+        updates(),
+        false,
+    ));
+    assert!(commit_meta_path(&repo, &dep.checksum).exists());
+    assert_eq!(refs(&repo), [("main".to_owned(), target.checksum)]);
+}
+
+/// A dependency that only a staged parent of a new commit names is checked
+/// under the rule of the update of the new commit. The parent itself needs
+/// no signature.
+#[test]
+fn a_dependency_of_a_staged_parent_is_checked_under_the_rule_of_its_target() {
+    let dep = build_commit(None, "dependency", no_metadata(), &[]);
+    let parent = build_commit(None, "parent", no_metadata(), &[entry("lib/d", &dep)]);
+    let target = build_commit(Some(parent.checksum), "target", no_metadata(), &[]);
+    let objects = with_tree(&[&dep, &parent, &target]);
+    let updates = || vec![update("main", Expected::Absent, Some(target.checksum))];
+    let tmp = TmpDir::new("recv-dep-parent");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    let before = snapshot(&repo);
+
+    let error = refused(
+        push(
+            &repo,
+            &verify_policy(),
+            &objects,
+            &[client_signed(&target)],
+            updates(),
+            false,
+        ),
+        ErrorCode::SignatureRequired,
+    );
+    let subject = format!(
+        "commit {}, a dependency of commit {}",
+        dep.checksum, target.checksum
+    );
+    assert!(error.message.contains(&subject), "{}", error.message);
+    assert_unchanged(&repo, &before);
+
+    committed(push(
+        &repo,
+        &verify_policy(),
+        &objects,
+        &[client_signed(&target), client_signed(&dep)],
+        updates(),
+        false,
+    ));
+}
+
+/// A staged dependency that only a staged commit outside the staged chain of
+/// each new commit names gets the completeness check alone: no
+/// verification and no server signature.
+#[test]
+fn a_dependency_outside_each_staged_chain_gets_no_rule() {
+    let dep = build_commit(None, "dependency", no_metadata(), &[]);
+    let other = build_commit(None, "other", no_metadata(), &[entry("lib/d", &dep)]);
+    let target = build_commit(None, "target", no_metadata(), &[]);
+    let policy = ReceivePolicy {
+        signers: vec![server_signer(SERVER_SECRET_B64)],
+        ..verify_policy()
+    };
+    let tmp = TmpDir::new("recv-dep-outside");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    committed(push(
+        &repo,
+        &policy,
+        &with_tree(&[&dep, &other, &target]),
+        &[client_signed(&target)],
+        vec![update("main", Expected::Absent, Some(target.checksum))],
+        false,
+    ));
+    assert!(!commit_meta_path(&repo, &dep.checksum).exists());
+    assert!(!commit_meta_path(&repo, &other.checksum).exists());
+    assert_eq!(
+        ed25519_signatures(&repo, &target.checksum),
+        [
+            ed25519_signature(SECRET_B64, &target.bytes),
+            ed25519_signature(SERVER_SECRET_B64, &target.bytes),
+        ]
+    );
+}
+
+/// A dependency of a new commit or of a staged parent that is neither staged
+/// nor held is `missing-objects`. The error lists each such dependency, in
+/// the order of the commits that name them.
+#[test]
+fn absent_dependencies_are_missing_objects_together() {
+    let first = build_commit(None, "first dependency", no_metadata(), &[]);
+    let second = build_commit(None, "second dependency", no_metadata(), &[]);
+    let parent = build_commit(None, "parent", no_metadata(), &[entry("lib/b", &second)]);
+    let target = build_commit(
+        Some(parent.checksum),
+        "target",
+        no_metadata(),
+        &[entry("lib/a", &first)],
+    );
+    let tmp = TmpDir::new("recv-dep-absent");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    let before = snapshot(&repo);
+    let error = refused(
+        push(
+            &repo,
+            &policy(),
+            &with_tree(&[&parent, &target]),
+            &[],
+            vec![update("main", Expected::Absent, Some(target.checksum))],
+            false,
+        ),
+        ErrorCode::MissingObjects,
+    );
+    assert_eq!(
+        error.missing,
+        [
+            ObjectName::new(first.checksum, ObjectType::Commit),
+            ObjectName::new(second.checksum, ObjectType::Commit),
+        ]
+    );
+    assert!(
+        error
+            .message
+            .contains("2 objects that the staged commits name as dependencies"),
+        "{}",
+        error.message
+    );
+    assert_unchanged(&repo, &before);
+}
+
+/// An entry of field 2 with an empty name, in a new commit, or with a
+/// checksum that is not 32 bytes, in a staged parent, is `protocol`. The
+/// message names the commit that holds the entry.
+#[test]
+fn a_defective_field_2_entry_is_protocol() {
+    let dep = build_commit(None, "dependency", no_metadata(), &[]);
+    let empty = build_commit(None, "empty name", no_metadata(), &[entry("", &dep)]);
+    let short = build_commit(None, "short", no_metadata(), &[("lib/s", &[7; 31])]);
+    let over_short = build_commit(Some(short.checksum), "over short", no_metadata(), &[]);
+    let cases = [
+        (
+            vec![&dep, &empty],
+            empty.checksum,
+            format!(
+                "related commits in field 2 of commit {}: entry 0 has an empty name",
+                empty.checksum
+            ),
+        ),
+        (
+            vec![&short, &over_short],
+            over_short.checksum,
+            format!(
+                "related commits in field 2 of commit {}: entry 0 (lib/s) has a checksum of 31 \
+                 bytes, not 32",
+                short.checksum
+            ),
+        ),
+    ];
+    for (commits, target, text) in cases {
+        let tmp = TmpDir::new("recv-dep-defect");
+        let repo = new_repo(&tmp, RepoMode::Archive, "");
+        let before = snapshot(&repo);
+        let error = refused(
+            push(
+                &repo,
+                &policy(),
+                &with_tree(&commits),
+                &[],
+                vec![update("main", Expected::Absent, Some(target))],
+                false,
+            ),
+            ErrorCode::Protocol,
+        );
+        assert_eq!(error.message, text);
+        assert_unchanged(&repo, &before);
+    }
+}
+
+/// A dependency whose own field 2 is not empty is `protocol`, for a staged
+/// dependency and for a dependency that the repository holds.
+#[test]
+fn a_nested_dependency_is_protocol() {
+    let inner = build_commit(None, "inner", no_metadata(), &[]);
+    let dep = build_commit(None, "dependency", no_metadata(), &[entry("lib/i", &inner)]);
+    let target = build_commit(None, "target", no_metadata(), &[entry("lib/d", &dep)]);
+    let tmp = TmpDir::new("recv-dep-nested");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    let before = snapshot(&repo);
+    let error = refused(
+        push(
+            &repo,
+            &policy(),
+            &with_tree(&[&inner, &dep, &target]),
+            &[],
+            vec![update("main", Expected::Absent, Some(target.checksum))],
+            false,
+        ),
+        ErrorCode::Protocol,
+    );
+    assert_eq!(
+        error.message,
+        format!(
+            "related commits in field 2 of commit {}: dependency lib/d names commit {}, which \
+             has dependencies of its own",
+            target.checksum, dep.checksum
+        )
+    );
+    assert_unchanged(&repo, &before);
+
+    let tmp = TmpDir::new("recv-dep-nested-held");
+    let repo = repo_with_fixture(&tmp, RepoMode::Archive, "");
+    let held = block_on(store_with_field2(
+        &repo,
+        &fixture_commit(),
+        &[("lib/x", &[7; 32])],
+    ));
+    let target = build_commit(
+        None,
+        "target",
+        no_metadata(),
+        &[("lib/h", &held.as_bytes()[..])],
+    );
+    let before = snapshot(&repo);
+    let error = refused(
+        push(
+            &repo,
+            &policy(),
+            std::slice::from_ref(&target),
+            &[],
+            vec![update("main", Expected::Absent, Some(target.checksum))],
+            false,
+        ),
+        ErrorCode::Protocol,
+    );
+    assert!(
+        error.message.contains(&format!(
+            "dependency lib/h names commit {held}, which has dependencies of its own"
+        )),
+        "{}",
+        error.message
+    );
+    assert_unchanged(&repo, &before);
+}
+
+/// A dependency that the repository holds complete passes with no
+/// verification, and the server does not sign it: its detached metadata
+/// stays as it was.
+#[test]
+fn a_held_dependency_gets_no_check_and_no_signature() {
+    let dep = build_commit(None, "dependency", no_metadata(), &[]);
+    let target = build_commit(None, "target", no_metadata(), &[entry("lib/d", &dep)]);
+    let tmp = TmpDir::new("recv-dep-held");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    committed(push(
+        &repo,
+        &policy(),
+        &with_tree(&[&dep]),
+        &[],
+        vec![update("dep", Expected::Absent, Some(dep.checksum))],
+        false,
+    ));
+    assert!(!commit_meta_path(&repo, &dep.checksum).exists());
+    let policy = ReceivePolicy {
+        signers: vec![server_signer(SERVER_SECRET_B64)],
+        ..verify_policy()
+    };
+    committed(push(
+        &repo,
+        &policy,
+        std::slice::from_ref(&target),
+        &[client_signed(&target)],
+        vec![update("main", Expected::Absent, Some(target.checksum))],
+        false,
+    ));
+    assert!(!commit_meta_path(&repo, &dep.checksum).exists());
+    assert_eq!(
+        ed25519_signatures(&repo, &target.checksum),
+        [
+            ed25519_signature(SECRET_B64, &target.bytes),
+            ed25519_signature(SERVER_SECRET_B64, &target.bytes),
+        ]
+    );
+}
+
+/// A dependency that the repository holds and marks partial is
+/// `missing-objects`, with no object listed.
+#[test]
+fn a_partial_held_dependency_is_missing_objects() {
+    let dep = build_commit(None, "dependency", no_metadata(), &[]);
+    let target = build_commit(None, "target", no_metadata(), &[entry("lib/d", &dep)]);
+    let tmp = TmpDir::new("recv-dep-partial");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    committed(push(
+        &repo,
+        &policy(),
+        &with_tree(&[&dep]),
+        &[],
+        vec![update("dep", Expected::Absent, Some(dep.checksum))],
+        false,
+    ));
+    mark_partial(&repo, &dep.checksum);
+    let before = snapshot(&repo);
+    let error = refused(
+        push(
+            &repo,
+            &policy(),
+            std::slice::from_ref(&target),
+            &[],
+            vec![update("main", Expected::Absent, Some(target.checksum))],
+            false,
+        ),
+        ErrorCode::MissingObjects,
+    );
+    assert!(error.missing.is_empty(), "{:?}", error.missing);
+    assert_eq!(
+        error.message,
+        format!(
+            "related commits in field 2 of commit {}: dependency lib/d names commit {}, which \
+             is partial",
+            target.checksum, dep.checksum
+        )
+    );
+    assert_unchanged(&repo, &before);
+}
+
+/// A staged dependency that two new commits name gets each server key of
+/// their rules once, also a key that the list holds two times. A second
+/// session with a new commit that names the dependency, which the repository
+/// now holds, adds no signature to it, also with a new key.
+#[test]
+fn a_dependency_of_two_targets_gets_each_server_key_once() {
+    let dep = build_commit(None, "dependency", no_metadata(), &[]);
+    let a = build_commit(None, "a", no_metadata(), &[entry("lib/d", &dep)]);
+    let b = build_commit(None, "b", no_metadata(), &[entry("lib/d", &dep)]);
+    let c = build_commit(None, "c", no_metadata(), &[entry("lib/d", &dep)]);
+    let shared = server_signer(SECOND_SERVER_SECRET_B64);
+    let policy = ReceivePolicy {
+        signers: vec![server_signer(SERVER_SECRET_B64), shared.clone(), shared],
+        ..policy()
+    };
+    let tmp = TmpDir::new("recv-dep-two-targets");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    committed(push(
+        &repo,
+        &policy,
+        &with_tree(&[&dep, &a, &b]),
+        &[],
+        vec![
+            update("a", Expected::Absent, Some(a.checksum)),
+            update("b", Expected::Absent, Some(b.checksum)),
+        ],
+        false,
+    ));
+    let expected = [
+        ed25519_signature(SERVER_SECRET_B64, &dep.bytes),
+        ed25519_signature(SECOND_SERVER_SECRET_B64, &dep.bytes),
+    ];
+    assert_eq!(ed25519_signatures(&repo, &dep.checksum), expected);
+
+    let policy = ReceivePolicy {
+        signers: vec![
+            server_signer(SERVER_SECRET_B64),
+            server_signer(OTHER_SECRET_B64),
+        ],
+        ..policy
+    };
+    committed(push(
+        &repo,
+        &policy,
+        &with_tree(&[&dep, &c]),
+        &[],
+        vec![update("c", Expected::Absent, Some(c.checksum))],
+        false,
+    ));
+    assert_eq!(ed25519_signatures(&repo, &dep.checksum), expected);
+    assert_eq!(
+        ed25519_signatures(&repo, &c.checksum),
+        [
+            ed25519_signature(SERVER_SECRET_B64, &c.bytes),
+            ed25519_signature(OTHER_SECRET_B64, &c.bytes),
+        ]
+    );
+}
+
+/// A staged dependency that is also a new commit passes one verification
+/// and gets each server key once.
+#[test]
+fn a_dependency_that_is_also_a_target_is_signed_once() {
+    let dep = build_commit(None, "dependency", no_metadata(), &[]);
+    let target = build_commit(None, "target", no_metadata(), &[entry("lib/d", &dep)]);
+    let policy = ReceivePolicy {
+        signers: vec![server_signer(SERVER_SECRET_B64)],
+        ..verify_policy()
+    };
+    let updates = || {
+        vec![
+            update("main", Expected::Absent, Some(target.checksum)),
+            update("dep", Expected::Absent, Some(dep.checksum)),
+        ]
+    };
+    let tmp = TmpDir::new("recv-dep-target");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    let before = snapshot(&repo);
+    let error = refused(
+        push(
+            &repo,
+            &policy,
+            &with_tree(&[&dep, &target]),
+            &[client_signed(&target)],
+            updates(),
+            false,
+        ),
+        ErrorCode::SignatureRequired,
+    );
+    let subject = format!(
+        "commit {}, a dependency of commit {}",
+        dep.checksum, target.checksum
+    );
+    assert!(error.message.contains(&subject), "{}", error.message);
+    assert_unchanged(&repo, &before);
+
+    committed(push(
+        &repo,
+        &policy,
+        &with_tree(&[&dep, &target]),
+        &[client_signed(&target), client_signed(&dep)],
+        updates(),
+        false,
+    ));
+    assert_eq!(
+        ed25519_signatures(&repo, &dep.checksum),
+        [
+            ed25519_signature(SECRET_B64, &dep.bytes),
+            ed25519_signature(SERVER_SECRET_B64, &dep.bytes),
+        ]
+    );
+}
+
+/// Stores the commit object `commit` in `repo`, with no check of its field 2
+/// and no object of its tree.
+fn hold_commit(repo: &Repo, commit: &Obj) {
+    block_on(async {
+        let txn = repo.transaction().await.unwrap();
+        txn.write_metadata(ObjectType::Commit, Some(&commit.checksum), &commit.bytes)
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+    });
+}
+
+fn marker(repo: &Repo, commit: &Checksum) -> PathBuf {
+    repo.path().join(format!("state/{commit}.commitpartial"))
+}
+
+/// The repository holds a new commit with a partial marker, and the session
+/// sends its tree. Field 2 of the commit gets the checks of a staged commit:
+/// an absent dependency is `missing-objects`, and a defective entry and a
+/// nested dependency are `protocol`. The session publishes nothing, and the
+/// marker stays.
+#[test]
+fn a_partial_held_target_gets_the_dependency_checks() {
+    let dep = build_commit(None, "dependency", no_metadata(), &[]);
+    let nested = build_commit(None, "nested", no_metadata(), &[("lib/x", &[7; 32])]);
+    let absent = build_commit(None, "absent", no_metadata(), &[entry("lib/d", &dep)]);
+    let short = build_commit(None, "short", no_metadata(), &[("lib/s", &[7; 31])]);
+    let over_nested = build_commit(
+        None,
+        "over nested",
+        no_metadata(),
+        &[entry("lib/n", &nested)],
+    );
+    let cases = [
+        (&absent, ErrorCode::MissingObjects, None),
+        (
+            &short,
+            ErrorCode::Protocol,
+            Some(format!(
+                "related commits in field 2 of commit {}: entry 0 (lib/s) has a checksum of 31 \
+                 bytes, not 32",
+                short.checksum
+            )),
+        ),
+        (
+            &over_nested,
+            ErrorCode::Protocol,
+            Some(format!(
+                "related commits in field 2 of commit {}: dependency lib/n names commit {}, \
+                 which has dependencies of its own",
+                over_nested.checksum, nested.checksum
+            )),
+        ),
+    ];
+    for (target, code, text) in cases {
+        let tmp = TmpDir::new("recv-dep-partial-target");
+        let repo = new_repo(&tmp, RepoMode::Archive, "");
+        hold_commit(&repo, &nested);
+        hold_commit(&repo, target);
+        mark_partial(&repo, &target.checksum);
+        let before = snapshot(&repo);
+        let error = refused(
+            push(
+                &repo,
+                &policy(),
+                &tree_objects(),
+                &[],
+                vec![update("main", Expected::Absent, Some(target.checksum))],
+                false,
+            ),
+            code,
+        );
+        match text {
+            None => assert_eq!(
+                error.missing,
+                [ObjectName::new(dep.checksum, ObjectType::Commit)]
+            ),
+            Some(text) => assert_eq!(error.message, text),
+        }
+        assert!(marker(&repo, &target.checksum).exists(), "the marker stays");
+        assert_unchanged(&repo, &before);
+    }
+}
+
+/// The repository holds a dependency with a partial marker. A session that
+/// sends its tree and names it as a new commit counts it as complete: the
+/// session commits, and the marker goes.
+#[test]
+fn a_partial_held_dependency_that_is_a_new_commit_counts_as_complete() {
+    let dep = build_commit(None, "dependency", no_metadata(), &[]);
+    let target = build_commit(None, "target", no_metadata(), &[entry("lib/d", &dep)]);
+    let tmp = TmpDir::new("recv-dep-partial-new");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    hold_commit(&repo, &dep);
+    mark_partial(&repo, &dep.checksum);
+    committed(push(
+        &repo,
+        &policy(),
+        &with_tree(&[&target]),
+        &[],
+        vec![
+            update("dep", Expected::Absent, Some(dep.checksum)),
+            update("main", Expected::Absent, Some(target.checksum)),
+        ],
+        false,
+    ));
+    assert!(!marker(&repo, &dep.checksum).exists(), "the marker goes");
+    assert_eq!(
+        refs(&repo),
+        [
+            ("dep".to_owned(), dep.checksum),
+            ("main".to_owned(), target.checksum),
+        ]
+    );
+}
+
+/// Field 2 of a new commit that the repository holds gives the rule of its
+/// update to a staged dependency: the dependency must pass the verification,
+/// and the server signs it.
+#[test]
+fn a_held_target_gives_its_rule_to_a_staged_dependency() {
+    let dep = build_commit(None, "dependency", no_metadata(), &[]);
+    let target = build_commit(None, "target", no_metadata(), &[entry("lib/d", &dep)]);
+    let policy = ReceivePolicy {
+        signers: vec![server_signer(SERVER_SECRET_B64)],
+        ..verify_policy()
+    };
+    let updates = || vec![update("main", Expected::Absent, Some(target.checksum))];
+    let tmp = TmpDir::new("recv-dep-held-target");
+    let repo = repo_with_fixture(&tmp, RepoMode::Archive, "");
+    hold_commit(&repo, &target);
+    let before = snapshot(&repo);
+    let error = refused(
+        push(
+            &repo,
+            &policy,
+            std::slice::from_ref(&dep),
+            &[client_signed(&target)],
+            updates(),
+            false,
+        ),
+        ErrorCode::SignatureRequired,
+    );
+    let subject = format!(
+        "commit {}, a dependency of commit {}",
+        dep.checksum, target.checksum
+    );
+    assert!(error.message.contains(&subject), "{}", error.message);
+    assert_unchanged(&repo, &before);
+
+    committed(push(
+        &repo,
+        &policy,
+        std::slice::from_ref(&dep),
+        &[client_signed(&target), client_signed(&dep)],
+        updates(),
+        false,
+    ));
+    assert_eq!(
+        ed25519_signatures(&repo, &dep.checksum),
+        [
+            ed25519_signature(SECRET_B64, &dep.bytes),
+            ed25519_signature(SERVER_SECRET_B64, &dep.bytes),
+        ]
+    );
+}
+
+/// A staged dependency with a partial marker that no object backs counts as
+/// complete, and the session removes the marker.
+#[test]
+fn a_staged_dependency_with_a_stale_marker_counts_as_complete() {
+    let dep = build_commit(None, "dependency", no_metadata(), &[]);
+    let target = build_commit(None, "target", no_metadata(), &[entry("lib/d", &dep)]);
+    let tmp = TmpDir::new("recv-dep-stale-marker");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    mark_partial(&repo, &dep.checksum);
+    committed(push(
+        &repo,
+        &policy(),
+        &with_tree(&[&dep, &target]),
+        &[],
+        vec![update("main", Expected::Absent, Some(target.checksum))],
+        false,
+    ));
+    assert!(!marker(&repo, &dep.checksum).exists(), "the marker goes");
+}
+
+/// The refusal of a dependency that two new commits name names the new
+/// commit of the first update, also when its checksum sorts last.
+#[test]
+fn a_dependency_refusal_names_the_first_new_commit_in_update_order() {
+    let dep = build_commit(None, "dependency", no_metadata(), &[]);
+    let a = build_commit(None, "a", no_metadata(), &[entry("lib/d", &dep)]);
+    let b = build_commit(None, "b", no_metadata(), &[entry("lib/d", &dep)]);
+    let (first, last) = if a.checksum > b.checksum {
+        (a, b)
+    } else {
+        (b, a)
+    };
+    let tmp = TmpDir::new("recv-dep-first-target");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    let before = snapshot(&repo);
+    let error = refused(
+        push(
+            &repo,
+            &verify_policy(),
+            &with_tree(&[&dep, &first, &last]),
+            &[client_signed(&first), client_signed(&last)],
+            vec![
+                update("x", Expected::Absent, Some(first.checksum)),
+                update("y", Expected::Absent, Some(last.checksum)),
+            ],
+            false,
+        ),
+        ErrorCode::SignatureRequired,
+    );
+    let subject = format!(
+        "commit {}, a dependency of commit {}",
+        dep.checksum, first.checksum
+    );
+    assert!(error.message.contains(&subject), "{}", error.message);
+    assert!(
+        !error.message.contains(&last.checksum.to_string()),
+        "{}",
+        error.message
+    );
+    assert_unchanged(&repo, &before);
 }
 
 // ---------------------------------------------------------------------------
@@ -1889,9 +2572,9 @@ fn an_expected_state_that_differs_is_ref_mismatch() {
 /// proves no fast-forward. A child of the current commit is a fast-forward.
 #[test]
 fn a_non_ancestor_is_non_fast_forward() {
-    let unrelated = build_commit(None, "unrelated", no_metadata());
-    let orphan = build_commit(Some(sha(b"an absent parent")), "orphan", no_metadata());
-    let child = build_commit(Some(fixture_commit()), "child", no_metadata());
+    let unrelated = build_commit(None, "unrelated", no_metadata(), &[]);
+    let orphan = build_commit(Some(sha(b"an absent parent")), "orphan", no_metadata(), &[]);
+    let child = build_commit(Some(fixture_commit()), "child", no_metadata(), &[]);
     let forced = || policy_allowing(&["wd:**"]);
     let current = Expected::Commit(fixture_commit());
     for commit in [&unrelated, &orphan] {
@@ -1965,7 +2648,7 @@ fn a_partial_history_is_a_fast_forward_when_it_reaches_the_tip() {
     let tmp = TmpDir::new("recv-partial");
     let repo = new_repo(&tmp, RepoMode::Archive, "");
     // A commit whose parent the repository never holds.
-    let base = build_commit(Some(sha(b"an absent parent")), "base", no_metadata());
+    let base = build_commit(Some(sha(b"an absent parent")), "base", no_metadata(), &[]);
     let mut objects = tree_objects();
     objects.push(base.clone());
     committed(push(
@@ -1977,8 +2660,8 @@ fn a_partial_history_is_a_fast_forward_when_it_reaches_the_tip() {
         false,
     ));
     // A chain of two commits on top of it. The session sends both.
-    let middle = build_commit(Some(base.checksum), "middle", no_metadata());
-    let top = build_commit(Some(middle.checksum), "top", no_metadata());
+    let middle = build_commit(Some(base.checksum), "middle", no_metadata(), &[]);
+    let top = build_commit(Some(middle.checksum), "top", no_metadata(), &[]);
     committed(push(
         &repo,
         &policy(),
@@ -1996,7 +2679,12 @@ fn a_partial_history_is_a_fast_forward_when_it_reaches_the_tip() {
         Some(format!("{}\n", top.checksum))
     );
     // A chain that stops at an absent commit before the tip is refused.
-    let stray = build_commit(Some(sha(b"another absent parent")), "stray", no_metadata());
+    let stray = build_commit(
+        Some(sha(b"another absent parent")),
+        "stray",
+        no_metadata(),
+        &[],
+    );
     let before = snapshot(&repo);
     refused(
         push(
@@ -2021,8 +2709,8 @@ fn t_creates_a_ref_and_never_moves_it() {
     let tmp = TmpDir::new("recv-tag");
     let repo = new_repo(&tmp, RepoMode::Archive, "");
     let tag = policy_allowing(&["t:tags/**"]);
-    let first = build_commit(None, "first", no_metadata());
-    let second = build_commit(Some(first.checksum), "second", no_metadata());
+    let first = build_commit(None, "first", no_metadata(), &[]);
+    let second = build_commit(Some(first.checksum), "second", no_metadata(), &[]);
     let mut objects = tree_objects();
     objects.push(first.clone());
     committed(push(
@@ -2093,7 +2781,7 @@ fn t_creates_a_ref_and_never_moves_it() {
 fn t_refuses_a_present_ref_with_no_walk_of_the_parent_chain() {
     let tmp = TmpDir::new("recv-tag-walk");
     let repo = new_repo(&tmp, RepoMode::Archive, "");
-    let first = build_commit(None, "first", no_metadata());
+    let first = build_commit(None, "first", no_metadata(), &[]);
     let mut objects = tree_objects();
     objects.push(first.clone());
     committed(push(
@@ -2107,7 +2795,7 @@ fn t_refuses_a_present_ref_with_no_walk_of_the_parent_chain() {
     let garbage = b"not a gvariant commit".to_vec();
     let bad = sha(&garbage);
     plant_object(&repo, ObjectType::Commit, &bad, &garbage);
-    let top = build_commit(Some(bad), "top", no_metadata());
+    let top = build_commit(Some(bad), "top", no_metadata(), &[]);
     let before = snapshot(&repo);
     let error = refused(
         push(
@@ -2208,7 +2896,7 @@ fn a_delete_the_rule_refuses_is_delete_denied() {
 /// The other updates of the message write nothing either.
 #[test]
 fn a_ref_path_that_a_write_cannot_replace_is_ref_denied() {
-    let commit = build_commit(None, "unbound", no_metadata());
+    let commit = build_commit(None, "unbound", no_metadata(), &[]);
     let mut objects = tree_objects();
     objects.push(commit.clone());
     let new = Some(commit.checksum);
@@ -2500,7 +3188,9 @@ fn two_pushes_with_a_gpg_server_key_leave_one_server_signature() {
     );
     let signer = ostrya::GpgSigner::new("server@example.org").with_homedir(&home.dir);
     let policy = ReceivePolicy {
-        signers: vec![Arc::new(block_on(ServerSigner::gpg(signer)).unwrap())],
+        signers: vec![std::sync::Arc::new(
+            block_on(ostrya::ServerSigner::gpg(signer)).unwrap(),
+        )],
         ..policy()
     };
     let repo = new_repo(&tmp, RepoMode::Archive, "");
@@ -2597,7 +3287,7 @@ fn summary_is_regenerated_and_signed_from_the_built_bytes() {
         update_summary: true,
         ..policy()
     };
-    let other = build_commit(None, "other", no_metadata());
+    let other = build_commit(None, "other", no_metadata(), &[]);
     committed(push(
         &repo,
         &unsigned,
@@ -2754,7 +3444,7 @@ fn a_collection_repo_writes_the_anchor_in_the_session() {
     assert_eq!(summary.lookup("test/main"), Some(fixture_commit()));
     assert!(staging_entries(repo.path()).is_empty());
 
-    let other = build_commit(None, "other", no_metadata());
+    let other = build_commit(None, "other", no_metadata(), &[]);
     committed(push(
         &repo,
         &policy,

@@ -673,7 +673,12 @@ impl Repo {
     /// - [`Error::ChecksumMismatch`] if a fetched object does not hash to its
     ///   name, or a superblock does not hash to its advertised digest.
     /// - [`Error::Core`] if a fetched commit or the header of a content object
-    ///   does not parse.
+    ///   does not parse. Also if a `.commitmeta` does not parse. If the
+    ///   signature policy verifies commits, the pull parses the `.commitmeta`
+    ///   that it reads from the remote or a localcache repository, or the copy
+    ///   in this repository if no source holds one. If
+    ///   `[ex-ostrya] keep-detached-related` of this repository is `false`, the
+    ///   pull parses each `.commitmeta` that it stores.
     /// - [`Error::InvalidFormat`] if a content object breaks its framing, or
     ///   passes its declared size or its compressed limit.
     /// - [`Error::InvalidFormat`] if a content object inflates to fewer bytes

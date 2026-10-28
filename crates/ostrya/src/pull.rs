@@ -1653,7 +1653,8 @@ impl Repo {
     /// - [`Error::InvalidRelated`] if an entry of field 2 of a commit has an
     ///   empty name or a checksum that is not 32 bytes, or if a dependency
     ///   names dependencies of its own. The pull reports it before a failed
-    ///   signature check of the walk.
+    ///   signature check of the walk, and before a `.commitmeta` of the walk
+    ///   that does not parse.
     /// - [`Error::Signature`] if a commit, a dependency, or the summary fails
     ///   the signature policy, each commit of a chain included. Also if the
     ///   signatures of a superblock fail the policy, or if the policy covers
@@ -1675,7 +1676,11 @@ impl Repo {
     /// - [`Error::LockTimeout`] if the wait for the repository lock or the
     ///   update lock passes `[core] lock-timeout-secs`.
     /// - [`Error::Core`] if a commit, a dirtree, or detached metadata does not
-    ///   parse.
+    ///   parse. If the signature policy verifies commits, the pull parses the
+    ///   `.commitmeta` that it reads from `src` or a localcache repository, or
+    ///   the copy in this repository if no source holds one. If
+    ///   `[ex-ostrya] keep-detached-related` of this repository is `false`, the
+    ///   pull parses each `.commitmeta` that it stores.
     /// - [`Error::InvalidFormat`] if the `summary` or `summary.sig` of `src` is
     ///   larger than 64 MiB or is not a regular file. Also if a static delta of
     ///   `src` is malformed, or if `src` does not hold a superblock of a chain

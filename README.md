@@ -78,7 +78,8 @@ Ostrya adds these functions, which the `ostree` command does not have:
   defective value. `ostrya remote prune` of a bucket repository keeps the
   dependencies and reads no build source. A pull from a remote, a local
   pull, a push, and a one-way stream copy the dependencies of each commit
-  that they move, with no ref. With
+  that they move, with no ref. A pull looks for a static delta of each
+  dependency. With
   `[ex-ostrya] keep-detached-related=false`, a transfer into the repository
   does not store `ostrya.related`.
 - The `bare-user-shared` mode, for development. It is `bare-user` storage

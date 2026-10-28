@@ -2120,6 +2120,19 @@ the rules.
   transaction opens. A pull that follows each dependency at the depth of the
   pull was rejected: it takes the history of each dependency, which no
   commit needs.
+- A pull looks for a static delta of each dependency of its own. After the
+  pull reads the commits that name the dependencies, it looks for a delta of
+  each dependency that it does not hold complete. The `from` is the entry of
+  the same name in field 2 of the commit that the local ref of a target names
+  before the pull, the paired entry, so an update of a dependency goes from
+  the dependency that the client runs. The pull takes the first paired entry
+  that it holds complete, in the order of the targets, and takes the
+  from-scratch delta only if it holds no paired entry complete. The
+  requirement of static deltas applies to each dependency. With a list of
+  static deltas, the pull takes one entry of the list to the dependency. A
+  change to the delta format, so that the delta of a target also carries its
+  dependencies, was rejected: the tool writes and reads the format, and a
+  delta of each dependency keeps it.
 - A push (`Repo::push`, `Repo::push_over_stream`, and `Repo::push_to_bucket`)
   sends the dependencies of each commit that it offers, at depth 0 and with
   no ref. It refuses an absent or a partial dependency, a defective field 2

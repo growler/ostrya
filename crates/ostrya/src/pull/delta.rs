@@ -17,6 +17,11 @@
 //! turn, and then the targets. It parses, applies, and drops the job of one
 //! step of a list at a time, so the heap holds one job of the list.
 //!
+//! [`discover_dependencies`] finds one delta for each dependency of a pull,
+//! after the pull read the commits that name the dependencies. The sibling
+//! module `dependency` gives the source commit of each search. With a list,
+//! the search takes one entry of the list, and plans no chain.
+//!
 //! The discovery of a chain keeps one record for each step of the plan, and
 //! drops each parsed superblock after its checks. So the heap holds one
 //! parsed superblock at a time. A record from a remote keeps the raw
@@ -66,6 +71,7 @@
 //! The digest check, the parse, and the check of the inline parts of a
 //! superblock run on the blocking pool.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -100,6 +106,7 @@ use crate::transaction::Transaction;
 use super::chain::{
     ChainPlan, ChainSearch, Edges, Planned, check_complete, complete_sources, scratch_allowed,
 };
+use super::drive::Slots;
 use super::http::{cached_source, fetch_remote_detached};
 use super::source::{RemoteSource, Transfer, session_error};
 use super::{
@@ -242,6 +249,9 @@ pub(crate) struct DeltaPlan {
     dependencies: HashMap<Checksum, Vec<(String, Checksum)>>,
     /// The file of the raw bytes of the records from a remote.
     store: Option<RecordStore>,
+    /// The list of static deltas, after the discovery of the chains. The
+    /// pull looks up the delta of each dependency in it.
+    edges: Option<Edges>,
 }
 
 impl DeltaPlan {
@@ -403,6 +413,12 @@ impl DeltaPlan {
     /// call returns an empty map.
     pub(crate) fn take_dependencies(&mut self) -> HashMap<Checksum, Vec<(String, Checksum)>> {
         std::mem::take(&mut self.dependencies)
+    }
+
+    /// Takes the list of static deltas, or `None` for a pull with no list or
+    /// a commit-only pull. A second call returns `None`.
+    pub(crate) fn take_edges(&mut self) -> Option<Edges> {
+        self.edges.take()
     }
 }
 
@@ -745,8 +761,10 @@ impl ParsedDelta {
 ///
 /// If `disable_static_deltas` is set, discovery returns before all other
 /// checks. A pull that requires static deltas from a source with no summary
-/// fails before the other skips. A pull that requires static deltas and finds
-/// no delta for a commit fails as [`discover_one`] states.
+/// fails before the other skips. `advert` holds what the summary of the
+/// source states about its deltas, and is `None` for a source with no
+/// summary. A pull that requires static deltas and finds no delta for a
+/// commit fails as [`discover_one`] states.
 ///
 /// Two refs that name one commit share one delta, because the plan fetches
 /// that commit once. Discovery reads the source commit from the ref in this
@@ -767,12 +785,14 @@ impl ParsedDelta {
 /// ref. A local pull passes
 /// [`TimestampBase::Off`](super::TimestampBase::Off). A
 /// [`COMMIT_ONLY`](PullFlags::COMMIT_ONLY) pull ignores the list. A pull that
-/// requires static deltas needs no summary for the list.
+/// requires static deltas needs no summary for the list. The plan keeps the
+/// list for the deltas of the dependencies, as
+/// [`DeltaPlan::take_edges`] gives it.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn discover(
     repo: &Repo,
     source: &DeltaSource<'_>,
-    summary: Option<&Summary>,
+    advert: Option<&DeltaAdvert>,
     targets: &[(String, Checksum)],
     opts: &PullOptions,
     tips: TipChecks<'_>,
@@ -802,7 +822,7 @@ pub(crate) async fn discover(
     let mut jobs = HashMap::new();
     // If there is no summary, nothing advertises a delta, so a pull that
     // requires a delta fails whatever it looks for.
-    if opts.require_static_deltas && summary.is_none() {
+    if opts.require_static_deltas && advert.is_none() {
         return Err(no_summary_error());
     }
     if opts.flags.contains(PullFlags::COMMIT_ONLY)
@@ -821,27 +841,240 @@ pub(crate) async fn discover(
             .await?;
         let from = source_commit(repo, tip, to).await?;
         let scratch = scratch_allowed(tip, from, to);
-        if let Some(job) = discover_one(
+        if let Some(found) = discover_one(
             repo,
             source,
-            summary,
+            advert,
+            None,
             ref_name,
             from,
             scratch,
             *to,
+            &HashMap::new(),
             opts,
             verification,
             progress,
         )
         .await?
         {
-            jobs.insert(*to, job);
+            jobs.insert(*to, found.fetched.into_job(repo).await?);
         }
     }
     Ok(DeltaPlan {
         jobs,
         ..DeltaPlan::default()
     })
+}
+
+/// The search for the delta of one dependency of a pull.
+///
+/// The module `dependency` builds it from the paired entries of the
+/// dependency.
+pub(crate) struct DependencyLookup {
+    /// The dependency.
+    pub(crate) checksum: Checksum,
+    /// The dependency in an error: `<name> of <ref>`. `<ref>` is the first
+    /// target whose chain names the dependency, and `<name>` is the name of
+    /// the entry nearest to its tip. If no chain of a target names the
+    /// dependency, `<ref>` is the first target of the pull, and `<name>` comes
+    /// from the commit of the pull with the lowest checksum that names it.
+    pub(crate) subject: String,
+    /// The first paired entry that this repository holds complete.
+    pub(crate) from: Option<Checksum>,
+    /// `true` if this repository holds no paired entry complete, so the pull
+    /// can take the from-scratch delta.
+    pub(crate) scratch: bool,
+}
+
+/// The deltas that [`discover_dependencies`] found, keyed by dependency.
+///
+/// A delta from a remote is a job, which the run of the dependencies applies.
+/// A delta from a local source keeps no bytes: [`take_job`] reads its
+/// superblock from the source again, checks it against its digest, and parses
+/// it, just before the pull applies it.
+///
+/// [`take_job`]: DependencyDeltas::take_job
+#[derive(Default)]
+pub(crate) struct DependencyDeltas {
+    /// The job of each dependency, from a remote.
+    jobs: HashMap<Checksum, DeltaJob>,
+    /// The source commit and the superblock digest of the delta of each
+    /// dependency, from a local source.
+    local: HashMap<Checksum, (Option<Checksum>, Option<Checksum>)>,
+}
+
+impl DependencyDeltas {
+    /// Returns `true` if no dependency has a delta.
+    pub(crate) fn is_empty(&self) -> bool {
+        self.jobs.is_empty() && self.local.is_empty()
+    }
+
+    /// Returns the jobs of the deltas from a remote.
+    pub(crate) fn into_jobs(self) -> HashMap<Checksum, DeltaJob> {
+        self.jobs
+    }
+
+    /// Takes the job of the delta of `dependency`, or returns `None` if it
+    /// has no delta. For a delta from a local source, the call reads the
+    /// superblock from `source` again and checks it against its digest.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::ChecksumMismatch`] if the superblock does not have its
+    ///   digest.
+    /// - [`Error::InvalidFormat`] if the source no longer holds the
+    ///   superblock.
+    pub(crate) async fn take_job(
+        &mut self,
+        repo: &Repo,
+        source: &DeltaSource<'_>,
+        dependency: &Checksum,
+    ) -> Result<Option<DeltaJob>> {
+        if let Some(job) = self.jobs.remove(dependency) {
+            return Ok(Some(job));
+        }
+        let Some((from, digest)) = self.local.remove(dependency) else {
+            return Ok(None);
+        };
+        let DeltaSource::Local(src) = source else {
+            return Err(Error::InvalidFormat(format!(
+                "static delta {}: discovery kept no superblock",
+                delta_name(from.as_ref(), dependency)
+            )));
+        };
+        let fetched = read_local_superblock(src, from, *dependency, digest).await?;
+        fetched.into_job(repo).await.map(Some)
+    }
+}
+
+/// Finds the delta of each dependency of `lookups`, keyed by the dependency.
+///
+/// The search of each dependency is the search of [`discover_one`] for a
+/// target, with the `from` and the scratch rule of its lookup. With `edges`,
+/// the search takes one delta of the list to the dependency, and plans no
+/// chain. Else it reads the delta index of the dependency and the map of
+/// `advert`, as for a target, or requests the delta by name if `advert` is
+/// `None`. The call adds the part files of each delta and their declared
+/// sizes to the planned counts in `progress`.
+///
+/// For a remote, the searches run together, up to the number of requests
+/// that the session admits. For a local source, they run one at a time. The
+/// call takes the results in the order of `lookups`, so the first error in
+/// that order is the error of the call. A delta from a local source keeps no
+/// bytes, as [`DependencyDeltas`] states.
+///
+/// `known` holds the completeness of commits that the caller checked. The
+/// searches check no such commit again. The caller passes no lookup for a
+/// dependency that this repository holds complete, and makes no call for a
+/// pull with [`disable_static_deltas`](PullOptions::disable_static_deltas)
+/// set.
+///
+/// # Errors
+///
+/// The errors of [`discover_one`]. Under
+/// [`require_static_deltas`](PullOptions::require_static_deltas), a
+/// dependency with no delta gives [`Error::Pull`] with the subject of its
+/// lookup.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn discover_dependencies(
+    repo: &Repo,
+    source: &DeltaSource<'_>,
+    advert: Option<&DeltaAdvert>,
+    edges: Option<&Edges>,
+    lookups: Vec<DependencyLookup>,
+    known: &HashMap<Checksum, bool>,
+    opts: &PullOptions,
+    verification: &Verification,
+    progress: &PullCounters,
+) -> Result<DependencyDeltas> {
+    let limit = match source {
+        DeltaSource::Remote(remote) => remote.max_outstanding(),
+        DeltaSource::Local(_) => 1,
+    };
+    let mut found = DependencyDeltas::default();
+    let mut ready: Vec<Option<Result<Option<Kept>>>> = Vec::new();
+    ready.resize_with(lookups.len(), || None);
+    let mut next = 0;
+    let mut pending = lookups.into_iter().enumerate();
+    let mut slots = Slots::new(limit);
+    loop {
+        while slots.has_room()
+            && let Some((at, lookup)) = pending.next()
+        {
+            slots.push(async move {
+                let kept = async {
+                    let Some(delta) = discover_one(
+                        repo,
+                        source,
+                        advert,
+                        edges,
+                        &lookup.subject,
+                        lookup.from,
+                        lookup.scratch,
+                        lookup.checksum,
+                        known,
+                        opts,
+                        verification,
+                        progress,
+                    )
+                    .await?
+                    else {
+                        return Ok(None);
+                    };
+                    let parts = delta.fetched.parts();
+                    let delta = match source {
+                        DeltaSource::Remote(_) => Found::Job(delta.fetched.into_job(repo).await?),
+                        DeltaSource::Local(_) => Found::Local(delta.from, delta.digest),
+                    };
+                    Ok(Some(Kept {
+                        dependency: lookup.checksum,
+                        parts,
+                        delta,
+                    }))
+                };
+                (at, kept.await)
+            });
+        }
+        let Some((at, result)) = slots.next_ready().await else {
+            return Ok(found);
+        };
+        ready[at] = Some(result);
+        while let Some(result) = ready.get_mut(next).and_then(Option::take) {
+            next += 1;
+            let Some(kept) = result? else {
+                continue;
+            };
+            progress.parts_planned(kept.parts.0, kept.parts.1);
+            match kept.delta {
+                Found::Job(job) => {
+                    found.jobs.insert(kept.dependency, job);
+                }
+                Found::Local(from, digest) => {
+                    found.local.insert(kept.dependency, (from, digest));
+                }
+            }
+        }
+    }
+}
+
+/// The delta of one dependency that a search of [`discover_dependencies`]
+/// found, with the number of its part files and their declared sizes.
+struct Kept {
+    /// The dependency.
+    dependency: Checksum,
+    /// The number of part files of the delta and the sum of their declared
+    /// sizes.
+    parts: (u32, u64),
+    /// What the pull keeps of the delta.
+    delta: Found,
+}
+
+/// What [`DependencyDeltas`] keeps of the delta of one dependency.
+enum Found {
+    /// The job, from a remote.
+    Job(DeltaJob),
+    /// The source commit and the superblock digest, from a local source.
+    Local(Option<Checksum>, Option<Checksum>),
 }
 
 /// Plans the chains of static deltas to the targets over `edges`, and fetches
@@ -911,7 +1144,10 @@ async fn discover_chain(
 ) -> Result<DeltaPlan> {
     let (wanted, names) = chain_targets(repo, targets, tips.place).await?;
     if wanted.is_empty() {
-        return Ok(DeltaPlan::default());
+        return Ok(DeltaPlan {
+            edges: Some(edges),
+            ..DeltaPlan::default()
+        });
     }
     let target_commits: Vec<Checksum> = wanted.iter().map(|(target, _)| *target).collect();
     let (edges, complete) = complete_sources(repo, edges, &target_commits).await?;
@@ -1040,6 +1276,7 @@ async fn discover_chain(
         levels: pass.plan.levels,
         dependencies,
         store,
+        edges: Some(search.into_edges()),
     })
 }
 
@@ -1436,22 +1673,10 @@ async fn read_record(
         to,
         superblock: digest,
     } = record.delta;
-    let (bytes, digest) = match (&record.superblock, store, source) {
-        (Some(range), Some(store), _) => (store.read(range.clone()).await?, None),
+    let bytes = match (&record.superblock, store, source) {
+        (Some(range), Some(store), _) => store.read(range.clone()).await?,
         (None, _, DeltaSource::Local(src)) => {
-            let path = format!(
-                "{}/{SUPERBLOCK_FILE}",
-                delta_relative_dir(from.as_ref(), &to)
-            );
-            let bytes = read_local(src, &path, MAX_SUPERBLOCK)
-                .await?
-                .ok_or_else(|| {
-                    Error::InvalidFormat(format!(
-                        "static delta {}: the source repository holds no superblock",
-                        delta_name(from.as_ref(), &to)
-                    ))
-                })?;
-            (bytes, Some(digest))
+            return read_local_superblock(src, from, to, Some(digest)).await;
         }
         _ => {
             return Err(Error::InvalidFormat(format!(
@@ -1460,6 +1685,35 @@ async fn read_record(
             )));
         }
     };
+    let (parsed, _) =
+        ostrya_rt::unblock(move || parse_superblock(bytes, None, None, from, to, false)).await?;
+    parsed.verify(None).await
+}
+
+/// Reads the superblock of the delta from `from` to `to` from the local source
+/// `src` again, checks it against `digest` if it is set, and parses it on the
+/// blocking pool.
+///
+/// Discovery verified the superblock with the same digest, so the parse checks
+/// no signature and no inline part again.
+async fn read_local_superblock(
+    src: &Repo,
+    from: Option<Checksum>,
+    to: Checksum,
+    digest: Option<Checksum>,
+) -> Result<FetchedDelta> {
+    let path = format!(
+        "{}/{SUPERBLOCK_FILE}",
+        delta_relative_dir(from.as_ref(), &to)
+    );
+    let bytes = read_local(src, &path, MAX_SUPERBLOCK)
+        .await?
+        .ok_or_else(|| {
+            Error::InvalidFormat(format!(
+                "static delta {}: the source repository holds no superblock",
+                delta_name(from.as_ref(), &to)
+            ))
+        })?;
     let (parsed, _) =
         ostrya_rt::unblock(move || parse_superblock(bytes, digest, None, from, to, false)).await?;
     parsed.verify(None).await
@@ -1638,11 +1892,13 @@ pub(crate) fn no_summary_error() -> Error {
 
 /// Returns the error of a pull that requires a static delta and finds none.
 ///
-/// The error names the ref `ref_name` and the target commit `to`. The message
-/// is the message of the `ostree` command.
-fn none_found_error(ref_name: &str, to: &Checksum) -> Error {
+/// The error names `subject` and the commit `to`. For a target, `subject` is
+/// the ref, and the message is the message of the `ostree` command. For a
+/// dependency, it is `<name> of <ref>`, as [`DependencyLookup::subject`]
+/// states.
+fn none_found_error(subject: &str, to: &Checksum) -> Error {
     Error::Pull(format!(
-        "Static deltas required, but none found for {ref_name} to {to}"
+        "Static deltas required, but none found for {subject} to {to}"
     ))
 }
 
@@ -1666,13 +1922,16 @@ enum Choice {
 ///
 /// `from` is the commit that the ref names here, if this repository holds it
 /// complete. `scratch` is `true` if the pull can take the from-scratch delta.
-/// [`discover_one`] states the order of the choice.
+/// [`discover_one`] states the order of the choice. `known` holds the
+/// completeness of commits that the caller checked, as [`first_complete`]
+/// reads it.
 async fn choose_delta(
     repo: &Repo,
     map: &Value,
     from: Option<Checksum>,
     scratch: bool,
     to: &Checksum,
+    known: &HashMap<Checksum, bool>,
 ) -> Result<Choice> {
     if let Some(from) = from
         && let Some(digest) = map_digest(map, &delta_name(Some(&from), to))?
@@ -1682,19 +1941,105 @@ async fn choose_delta(
             digest,
         });
     }
-    for (candidate, name, value) in source_candidates(map, to) {
-        if Some(candidate) != from && complete_here(repo, &candidate).await? {
-            return Ok(Choice::Take {
-                from: Some(candidate),
-                digest: delta_digest(name, value)?,
-            });
-        }
+    let candidates: Vec<(Checksum, &str, &Value)> = source_candidates(map, to)
+        .filter(|(candidate, _, _)| Some(*candidate) != from)
+        .collect();
+    let commits: Vec<Checksum> = candidates.iter().map(|(commit, _, _)| *commit).collect();
+    if let Some(at) = first_complete(repo, &commits, known).await? {
+        let (candidate, name, value) = candidates[at];
+        return Ok(Choice::Take {
+            from: Some(candidate),
+            digest: delta_digest(name, value)?,
+        });
     }
     Ok(match map_digest(map, &delta_name(None, to))? {
         Some(digest) if scratch => Choice::Take { from: None, digest },
         Some(_) => Choice::Declined,
         None => Choice::None,
     })
+}
+
+/// Chooses the delta to `to` that the list `edges` holds, in the order of
+/// [`choose_delta`]. Step 2 goes in list order.
+async fn choose_listed(
+    repo: &Repo,
+    edges: &Edges,
+    from: Option<Checksum>,
+    scratch: bool,
+    to: &Checksum,
+    known: &HashMap<Checksum, bool>,
+) -> Result<Choice> {
+    let mut steps = edges.steps_to(to).to_vec();
+    steps.sort_unstable();
+    let listed = |index: &usize| edges.delta(*index);
+    if let Some(from) = from
+        && let Some(delta) = steps.iter().map(listed).find(|d| d.from == Some(from))
+    {
+        return Ok(Choice::Take {
+            from: Some(from),
+            digest: delta.superblock,
+        });
+    }
+    let candidates: Vec<&AdvertisedDelta> = steps
+        .iter()
+        .map(listed)
+        .filter(|delta| delta.from.is_some() && delta.from != from)
+        .collect();
+    let commits: Vec<Checksum> = candidates.iter().filter_map(|delta| delta.from).collect();
+    if let Some(at) = first_complete(repo, &commits, known).await? {
+        let delta = candidates[at];
+        return Ok(Choice::Take {
+            from: delta.from,
+            digest: delta.superblock,
+        });
+    }
+    Ok(match steps.iter().map(listed).find(|d| d.from.is_none()) {
+        Some(delta) if scratch => Choice::Take {
+            from: None,
+            digest: delta.superblock,
+        },
+        Some(_) => Choice::Declined,
+        None => Choice::None,
+    })
+}
+
+/// Returns the position of the first commit of `commits` that this repository
+/// holds complete, or `None` if it holds none of them complete.
+///
+/// `known` holds the completeness of commits that the caller checked. The
+/// call checks each other commit in order, in one call on the blocking pool,
+/// and stops at the first commit held complete.
+async fn first_complete(
+    repo: &Repo,
+    commits: &[Checksum],
+    known: &HashMap<Checksum, bool>,
+) -> Result<Option<usize>> {
+    let mut unknown = Vec::new();
+    let mut held = None;
+    for (at, commit) in commits.iter().enumerate() {
+        match known.get(commit) {
+            Some(true) => {
+                held = Some(at);
+                break;
+            }
+            Some(false) => {}
+            None => unknown.push((at, *commit)),
+        }
+    }
+    if unknown.is_empty() {
+        return Ok(held);
+    }
+    let repo = repo.clone();
+    let first = ostrya_rt::unblock(move || -> Result<Option<usize>> {
+        for (at, commit) in unknown {
+            if complete_here_blocking(&repo, &commit)? {
+                return Ok(Some(at));
+            }
+        }
+        Ok(None)
+    })
+    .await?;
+    Ok(first.or(held))
 }
 
 /// Returns the source commit, the name, and the value of each `<from>-<to>`
@@ -1728,10 +2073,13 @@ fn source_candidates<'a>(
 }
 
 /// What a remote states about the deltas that it holds.
-enum Advertisement {
+enum Advertisement<'a> {
     /// A map from delta name to superblock digest: the index file of the
-    /// target commit, or the map of the summary.
-    Map(Value),
+    /// target commit, or the map of the summary. The map of the summary is
+    /// borrowed, with no copy.
+    Map(Cow<'a, Value>),
+    /// The list of static deltas that the caller gives.
+    List(&'a Edges),
     /// The remote serves no summary. It advertises nothing, and the pull
     /// requests a delta by name.
     Unlisted,
@@ -1744,7 +2092,13 @@ enum Advertisement {
 ///
 /// `from` is the commit that the pulled ref names here, if this repository
 /// holds it complete. `scratch` is `true` if the ref names no commit held
-/// complete and does not name `to`.
+/// complete and does not name `to`. For a dependency, [`DependencyLookup`]
+/// gives the two values. `subject` names `to` in an error, as
+/// [`none_found_error`] states.
+///
+/// With `edges`, the list of static deltas, the pull reads no summary map and
+/// no delta index. It takes the first delta of the list in the order below.
+/// Step 2 then goes in list order.
 ///
 /// If the remote advertises a map, the pull takes the first of these deltas
 /// that the map names:
@@ -1767,48 +2121,60 @@ enum Advertisement {
 /// finds none fails with [`Error::Pull`]. If the ref names a commit held here
 /// complete, or names `to`, the pull does not take a from-scratch delta in
 /// the map. That delta counts as found, and the pull fetches loose. A
-/// superblock that the map names and the remote does not hold counts as none.
+/// superblock that the map or the list names and the remote does not hold
+/// counts as none.
+///
+/// `known` holds the completeness of commits that the caller checked. Step 2
+/// checks no such commit again.
 #[allow(clippy::too_many_arguments)]
 async fn discover_one(
     repo: &Repo,
     source: &DeltaSource<'_>,
-    summary: Option<&Summary>,
-    ref_name: &str,
+    advert: Option<&DeltaAdvert>,
+    edges: Option<&Edges>,
+    subject: &str,
     from: Option<Checksum>,
     scratch: bool,
     to: Checksum,
+    known: &HashMap<Checksum, bool>,
     opts: &PullOptions,
     verification: &Verification,
     progress: &PullCounters,
-) -> Result<Option<DeltaJob>> {
-    let advertised = match summary {
-        None => Advertisement::Unlisted,
-        Some(summary) => match advertised_map(source, summary, &to, progress).await? {
+) -> Result<Option<FoundDelta>> {
+    let advertised = match (edges, advert) {
+        (Some(edges), _) => Advertisement::List(edges),
+        (None, None) => Advertisement::Unlisted,
+        (None, Some(advert)) => match advertised_map(source, advert, &to, progress).await? {
             Some(map) => Advertisement::Map(map),
             None => Advertisement::Nothing,
         },
     };
-    let none_found = || -> Result<Option<DeltaJob>> {
+    let none_found = || -> Result<Option<FoundDelta>> {
         if opts.require_static_deltas {
-            return Err(none_found_error(ref_name, &to));
+            return Err(none_found_error(subject, &to));
         }
         Ok(None)
     };
 
-    let (from, digest) = match &advertised {
-        Advertisement::Map(map) => match choose_delta(repo, map, from, scratch, &to).await? {
-            Choice::Take { from, digest } => (from, Some(digest)),
-            // A from-scratch delta for this commit on the remote satisfies the
-            // requirement, and the pull does not take it. The pull fetches
-            // loose each object of the commit that this repository lacks.
-            Choice::Declined => return Ok(None),
-            Choice::None => return none_found(),
-        },
+    let choice = match &advertised {
+        Advertisement::Map(map) => Some(choose_delta(repo, map, from, scratch, &to, known).await?),
+        Advertisement::List(edges) => {
+            Some(choose_listed(repo, edges, from, scratch, &to, known).await?)
+        }
+        Advertisement::Unlisted => None,
+        Advertisement::Nothing => return none_found(),
+    };
+    let (from, digest) = match choice {
+        Some(Choice::Take { from, digest }) => (from, Some(digest)),
+        // A from-scratch delta for this commit on the remote satisfies the
+        // requirement, and the pull does not take it. The pull fetches loose
+        // each object of the commit that this repository lacks.
+        Some(Choice::Declined) => return Ok(None),
+        Some(Choice::None) => return none_found(),
         // Nothing states a digest, so the pull requests the delta by name, and
         // no advertised digest verifies the superblock. The application of the
         // parts still verifies each object that the delta produces.
-        Advertisement::Unlisted => (from, None),
-        Advertisement::Nothing => return none_found(),
+        None => (from, None),
     };
     // If the remote does not hold an advertised superblock, the advertisement
     // is stale. The pull then fetches the objects loose. If the pull requires
@@ -1818,7 +2184,22 @@ async fn discover_one(
     else {
         return none_found();
     };
-    fetched.into_job(repo).await.map(Some)
+    Ok(Some(FoundDelta {
+        from,
+        digest,
+        fetched,
+    }))
+}
+
+/// A delta that [`discover_one`] found, fetched, and verified.
+struct FoundDelta {
+    /// The source commit of the delta, or `None` for a from-scratch delta.
+    from: Option<Checksum>,
+    /// The digest of the superblock that the map or the list states, or
+    /// `None` if nothing states one.
+    digest: Option<Checksum>,
+    /// The parsed superblock.
+    fetched: FetchedDelta,
 }
 
 /// Fetches the superblock of the delta from `from` to `to`, and verifies it.
@@ -2032,6 +2413,47 @@ async fn verify_fetched_delta(
         .await
 }
 
+/// What the summary of a source states about its deltas: the
+/// `ostree.summary.indexed-deltas` key and the `ostree.static-deltas` map.
+///
+/// The pull keeps these two values and drops the rest of the summary. It
+/// reads them for the targets, and for the dependencies after the run of the
+/// commits that name them.
+pub(crate) struct DeltaAdvert {
+    /// `true` if the summary states `indexed-deltas`, or omits the key.
+    indexed: bool,
+    /// The `ostree.static-deltas` map, or `None` if the summary has none.
+    map: Option<Value>,
+}
+
+impl DeltaAdvert {
+    /// Takes the two values out of `summary`, and drops the rest. The map
+    /// moves out of the metadata dict with no copy.
+    pub(crate) fn from_summary(mut summary: Summary) -> DeltaAdvert {
+        let indexed = indexed_deltas(&summary);
+        let map = take_metadata_value(&mut summary.metadata, STATIC_DELTAS_KEY);
+        DeltaAdvert { indexed, map }
+    }
+}
+
+/// Takes the value of `key` out of the metadata dict `metadata`, as
+/// [`Summary::metadata_value`] reads it, and leaves a placeholder there.
+fn take_metadata_value(metadata: &mut Value, key: &str) -> Option<Value> {
+    let Value::Array(entries) = metadata else {
+        return None;
+    };
+    let fields = entries.iter_mut().find_map(|entry| match entry {
+        Value::Tuple(fields) if matches!(fields.as_slice(), [name, _] if name.as_str() == Some(key)) => {
+            Some(fields)
+        }
+        _ => None,
+    })?;
+    match &mut fields[1] {
+        Value::Variant(inner) => Some(std::mem::replace(&mut inner.1, Value::Bool(false))),
+        _ => None,
+    }
+}
+
 /// Returns the delta map that the remote advertises for `to`, or `None` if it
 /// advertises no map.
 ///
@@ -2042,13 +2464,13 @@ async fn verify_fetched_delta(
 /// A summary that omits the key counts as `true`, because that is the
 /// repository default. A remote that holds deltas and no index (no reindex
 /// ran) answers 404 for the index. The pull then reads the summary map.
-async fn advertised_map(
+async fn advertised_map<'a>(
     source: &DeltaSource<'_>,
-    summary: &Summary,
+    advert: &'a DeltaAdvert,
     to: &Checksum,
     progress: &PullCounters,
-) -> Result<Option<Value>> {
-    if indexed_deltas(summary) {
+) -> Result<Option<Cow<'a, Value>>> {
+    if advert.indexed {
         let path = delta_index_relative_path(to);
         let fetched = source.read(&path, MAX_METADATA_SIZE, progress).await?;
         progress.metadata_fetched();
@@ -2058,10 +2480,10 @@ async fn advertised_map(
                     "the remote's delta index for {to} holds no {STATIC_DELTAS_KEY} map"
                 ))
             })?;
-            return Ok(Some(map));
+            return Ok(Some(Cow::Owned(map)));
         }
     }
-    Ok(summary.metadata_value(STATIC_DELTAS_KEY).cloned())
+    Ok(advert.map.as_ref().map(Cow::Borrowed))
 }
 
 /// Returns `true` if the summary states that the remote indexes its deltas.

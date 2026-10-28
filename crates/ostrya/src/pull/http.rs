@@ -54,7 +54,8 @@ use crate::verify::trust::FieldGroup;
 use crate::write::FileMeta;
 
 use super::chain::Edges;
-use super::delta::{self, CommitCheck, DeltaJob, DeltaPlan, DeltaSource, PART_CAP};
+use super::delta::{self, CommitCheck, DeltaAdvert, DeltaJob, DeltaPlan, DeltaSource, PART_CAP};
+use super::dependency;
 use super::drive::Slots;
 use super::source::{Connection, RemoteSource, RootFiles, Transfer, http_error, session_error};
 use super::subpath::{Scope, Subpaths};
@@ -243,10 +244,9 @@ impl Repo {
     ///   repository holds complete, the pull requests the `.commitmeta` and
     ///   checks the signatures, and fetches no object of its tree. A
     ///   dependency that this repository holds partial gets its whole tree.
-    /// - A dependency entry adds no static delta to the pull, also under
-    ///   [`require_static_deltas`](PullOptions::require_static_deltas). The
-    ///   pull fetches the objects of a dependency loose, unless a static delta
-    ///   of the pull delivers that commit.
+    /// - The pull fetches the dependencies after the commits that name them.
+    ///   It looks for a static delta of each dependency, as `# Static deltas`
+    ///   states. A dependency with no delta comes as loose objects.
     /// - The pull does not follow a build source: a commit that the detached
     ///   metadata key `ostrya.related` names.
     ///
@@ -292,15 +292,16 @@ impl Repo {
     /// The requests of the images come after the requests of all other
     /// objects of the pull: the first image request goes out when no request
     /// of another object is queued or in flight. In a pull through a chain of
-    /// static deltas, the images wait for the last step of the chain. A
-    /// remote that serves no image of a commit leaves the commit with no
-    /// image, and the pull goes on. After the first image that the remote
-    /// does not serve, the pull requests no image of a commit that this
-    /// repository holds complete. The image of each commit whose objects the
-    /// pull takes is requested all the same. The images of the held commits
-    /// come after the other images, one request at a time until the remote
-    /// serves one, so a remote that serves no image gets at most one request
-    /// for them.
+    /// static deltas, the images wait for the last step of the chain. In a
+    /// pull that follows dependencies, the images wait for the run of the
+    /// dependencies. A remote that serves no image of a commit leaves the
+    /// commit with no image, and the pull goes on. After the first image that
+    /// the remote does not serve, the pull requests no image of a commit that
+    /// this repository holds complete. The image of each commit whose objects
+    /// the pull takes is requested all the same. The images of the held
+    /// commits come after the other images, one request at a time until the
+    /// remote serves one, so a remote that serves no image gets at most one
+    /// request for them.
     ///
     /// The pull streams the image to the staging directory, computes its
     /// fs-verity digest, and stages it only when the digest is the key. No
@@ -490,9 +491,48 @@ impl Repo {
     /// counts as found: the pull does not fail, and fetches that target loose.
     /// A [`COMMIT_ONLY`](PullFlags::COMMIT_ONLY) pull ignores the list.
     ///
+    /// A static delta carries its target commit alone, so each dependency
+    /// gets a delta of its own. After the runs of the commits that name the
+    /// dependencies, the pull looks for a delta of each dependency that no run
+    /// reached and that this repository does not hold complete. Then it
+    /// fetches these dependencies in one more run, at depth 0. The search for
+    /// the delta of a dependency is the search for the delta of a target,
+    /// with these changes:
+    ///
+    /// - The `from` comes from the paired entries of the dependency. Each
+    ///   target whose chain names the dependency gives at most one paired
+    ///   entry: the entry with the same name in field 2 of the commit that the
+    ///   ref of the target names in this repository before the pull. The chain
+    ///   of a target is the target and the parents that
+    ///   [`depth`](PullOptions::depth) takes. If the chain names the
+    ///   dependency under two names, the name nearest to the tip applies.
+    /// - The `from` is the first paired entry, in the order of the targets,
+    ///   that this repository holds complete. The step `<c>-<to>` finds a
+    ///   delta from each other commit held complete, the other paired entries
+    ///   included.
+    /// - The pull takes the from-scratch delta only if this repository holds
+    ///   no paired entry complete.
+    /// - A target with no local ref gives no paired entry. A ref gives none if
+    ///   this repository does not hold its commit, or if field 2 of that
+    ///   commit does not decode or has a defective entry. If field 2 holds two
+    ///   entries with one name, the first entry applies. An intermediate
+    ///   commit of a chain of static deltas that the depth does not take is
+    ///   not in the chain of a target, so it gives no paired entry.
+    /// - With [`static_deltas`](PullOptions::static_deltas), the pull takes
+    ///   one entry of the list whose target is the dependency, in the same
+    ///   order. It plans no chain for a dependency, and reads no delta index
+    ///   and no summary map.
+    /// - With no summary, the pull requests the delta from the `from` by
+    ///   name, or the from-scratch delta if it has no `from`.
+    ///
+    /// A dependency with no delta comes as loose objects, or fails the pull
+    /// under `require_static_deltas`. A dependency that a run of the targets
+    /// or of a level reaches, for example as a parent, gets no delta of its
+    /// own.
+    ///
     /// [`disable_static_deltas`](PullOptions::disable_static_deltas) and
     /// [`require_static_deltas`](PullOptions::require_static_deltas) control
-    /// the search.
+    /// the search, also for the dependencies.
     ///
     /// # Failure
     ///
@@ -594,9 +634,19 @@ impl Repo {
     ///
     /// - [`Error::Signature`] if the policy refuses a commit, a dependency, or
     ///   a static delta.
+    /// - [`Error::Pull`] if
+    ///   [`require_static_deltas`](PullOptions::require_static_deltas) is set
+    ///   and the pull finds no delta for a dependency. The pull looks for it
+    ///   after it fetched the objects of the targets, and publishes nothing.
+    ///   The search comes before the fetch of the dependency. So a dependency
+    ///   with no delta that the remote does not hold, or that names
+    ///   dependencies of its own, gives this error, and not
+    ///   [`Error::ObjectNotFound`] or [`Error::InvalidRelated`].
     /// - [`Error::InvalidRelated`] if an entry of field 2 of a commit has an
     ///   empty name or a checksum that is not 32 bytes, or if a dependency
-    ///   names dependencies of its own.
+    ///   names dependencies of its own. If such a dependency has a delta, the
+    ///   pull fetches and verifies the superblock first, and the error comes
+    ///   when the pull reads the commit from the superblock.
     /// - [`Error::Pull`] if the `ostree.ref-binding` of a commit does not list
     ///   the ref.
     /// - [`Error::Pull`] if a tip is older than the
@@ -1000,8 +1050,11 @@ impl Repo {
     /// Fetches what a pull from `source` reaches into a new transaction: the
     /// summary and its checks, the refs, the deltas, and then the plan, to
     /// its end. With a list of static deltas, the plan runs one time for each
-    /// level of intermediate commits, and then one time for the targets. The
-    /// commits whose `.commitpartial` marker the pull wrote go into `marked`.
+    /// level of intermediate commits, and then one time for the targets. A
+    /// pull that follows dependencies then looks for the deltas of the
+    /// dependencies that no run reached, and runs the plan one more time for
+    /// them. The commits whose `.commitpartial` marker the pull wrote go into
+    /// `marked`.
     #[allow(clippy::too_many_arguments)]
     async fn fetch_from(
         &self,
@@ -1067,6 +1120,10 @@ impl Repo {
         let targets = self
             .remote_targets(wanted, opts, summary.as_ref(), source)
             .await?;
+        // Discovery reads two values of the summary alone. The pull keeps
+        // them for the deltas of the dependencies, and drops the rest of the
+        // summary here.
+        let advert = summary.map(DeltaAdvert::from_summary);
         // The transferred count starts after the summary, the config, and the
         // ref files that a pull reads from a remote with no summary. The
         // `ostree` command reports the same count.
@@ -1100,7 +1157,7 @@ impl Repo {
         let mut deltas = delta::discover(
             self,
             &delta_source,
-            summary.as_ref(),
+            advert.as_ref(),
             &targets,
             opts,
             tip_checks,
@@ -1109,9 +1166,15 @@ impl Repo {
             counters,
         )
         .await?;
-        // Discovery is the last reader of the parsed summary.
-        drop(summary);
         deltas.plan_parts(counters);
+        // A commit-only pull and a pull with subpaths follow no dependency.
+        // The search for the deltas of the dependencies reads the list of
+        // static deltas, else the summary values, after the run of the
+        // targets. The pull keeps neither if it does not read it.
+        let follows = !opts.flags.contains(PullFlags::COMMIT_ONLY) && opts.subpaths.is_empty();
+        let looks = follows && !opts.disable_static_deltas;
+        let edges = deltas.take_edges().filter(|_| looks);
+        let advert = advert.filter(|_| looks && edges.is_none());
 
         let mut txn = self.transaction().await?;
         apply_durability(&mut txn, opts);
@@ -1122,6 +1185,9 @@ impl Repo {
         let none = HashMap::new();
         let mut done = HashSet::new();
         let mut carry = Carry::default();
+        // A pull that looks for no delta of a dependency pairs no dependency
+        // with a target, so it keeps no entry of field 2.
+        carry.dependencies.keys_only = !looks;
         for level in deltas.levels() {
             let jobs = deltas.parse_level(self, &delta_source, level).await?;
             let phase = Phase {
@@ -1147,10 +1213,7 @@ impl Repo {
             )
             .await?;
             drop(jobs);
-            // The run fetched each dependency that the commits of the level
-            // name, so the transaction holds them complete too.
             done.extend(level.iter().copied());
-            done.extend(carry.dependencies.named.keys().copied());
         }
         let jobs = deltas.target_jobs(self, &delta_source).await?;
         // The refs of each requested tip. The binding check and the timestamp
@@ -1169,7 +1232,7 @@ impl Repo {
             subpaths,
             deltas: &jobs,
             done: &done,
-            last: true,
+            last: !follows,
         };
         self.drive(
             &txn,
@@ -1184,6 +1247,77 @@ impl Repo {
             marked,
         )
         .await?;
+        drop(jobs);
+        // The run of the dependencies reads no record of a chain: each commit
+        // with a record is a commit that a run reached.
+        drop(deltas);
+        if follows {
+            // The dependencies that no run reached. The search for their
+            // deltas runs after the runs of the commits that name them, and
+            // the last run fetches them at depth 0. A dependency with no delta
+            // is fetched object by object. The run also fetches the composefs
+            // images of the pull, after each other object.
+            let mut pending: Vec<Checksum> = carry
+                .dependencies
+                .named
+                .keys()
+                .filter(|dependency| !carry.parents.contains_key(*dependency))
+                .copied()
+                .collect();
+            pending.sort_unstable();
+            let (roots, jobs) = if looks {
+                let named = dependency::pair_targets(
+                    &targets,
+                    opts.depth,
+                    &carry.parents,
+                    &carry.dependencies.naming,
+                    pending,
+                );
+                let roots: Vec<Checksum> = named.iter().map(|named| named.checksum).collect();
+                let (lookups, known) = dependency::lookups(self, &targets, place, named).await?;
+                let found = delta::discover_dependencies(
+                    self,
+                    &delta_source,
+                    advert.as_ref(),
+                    edges.as_ref(),
+                    lookups,
+                    &known,
+                    opts,
+                    verification,
+                    counters,
+                )
+                .await?;
+                (roots, found.into_jobs())
+            } else {
+                (pending, HashMap::new())
+            };
+            drop(advert);
+            drop(edges);
+            // The run of the dependencies reads no parent of the earlier runs.
+            carry.parents = HashMap::new();
+            let phase = Phase {
+                roots: &roots,
+                tips: &none,
+                depth: 0,
+                subpaths: None,
+                deltas: &jobs,
+                done: &done,
+                last: true,
+            };
+            self.drive(
+                &txn,
+                source,
+                opts,
+                tip_checks,
+                phase,
+                &DeltaPlan::default(),
+                verification,
+                counters,
+                &mut carry,
+                marked,
+            )
+            .await?;
+        }
         Ok(FetchedPull {
             txn,
             targets,
@@ -1447,6 +1581,15 @@ impl Repo {
         carry.queued = plan.queued;
         carry.images = plan.images;
         carry.dependencies = plan.dependencies;
+        // The parents tell which commits a run reached, and give the chains
+        // of the targets. A pull that follows no dependency reads neither.
+        if whole {
+            if carry.parents.is_empty() {
+                carry.parents = plan.parents;
+            } else {
+                carry.parents.extend(plan.parents);
+            }
+        }
         carry.started = started;
         Ok(())
     }
@@ -2391,9 +2534,12 @@ struct Carry {
     images: Images,
     /// The units of work that the runs gave to a slot, for the progress total.
     started: usize,
-    /// The dependencies that the runs followed, so that the checks of a
+    /// The dependencies that the runs met, so that the checks of a
     /// dependency span all runs.
     dependencies: Dependencies,
+    /// The parent that each commit of the runs named. A commit is here if a
+    /// run reached it. A pull that follows no dependency keeps no parent.
+    parents: HashMap<Checksum, Option<Checksum>>,
 }
 
 /// One commit to fetch.
@@ -2403,9 +2549,9 @@ struct CommitItem {
     depth: i32,
     /// `true` if a remote that does not hold this commit ends the chain, and
     /// the pull goes on. A parent under `depth` has this value. A dependency
-    /// has the value `false`. If the plan reached a commit as a parent first,
-    /// the item keeps the value `true`, and the plan fails the pull if the
-    /// remote does not hold a commit that a dependency entry names.
+    /// has the value `false`. If the plan reached a commit as a parent, the
+    /// item keeps the value `true`, and the plan fails the pull if the remote
+    /// does not hold a commit that a dependency entry names.
     optional: bool,
 }
 
@@ -2561,8 +2707,8 @@ struct Plan {
     /// commit again, with more depth, resumes at the parent and does not fetch
     /// the commit again.
     parents: HashMap<Checksum, Option<Checksum>>,
-    /// The dependencies that the plan followed, and the commits that it
-    /// checks them against.
+    /// The dependencies that the plan met, and the commits that it checks
+    /// them against.
     dependencies: Dependencies,
 }
 
@@ -2577,10 +2723,14 @@ struct Dependencies {
     /// The commit that first named each dependency, and the name of its
     /// entry.
     named: HashMap<Checksum, (Checksum, String)>,
-    /// The commits whose field 2 is not empty.
-    with_dependencies: HashSet<Checksum>,
+    /// The entries of field 2 of each commit whose field 2 is not empty, in
+    /// the stored order. Under `keys_only`, each commit has no entry here.
+    naming: HashMap<Checksum, Vec<(String, Checksum)>>,
     /// The parents that the remote does not hold.
     absent: HashSet<Checksum>,
+    /// `true` if `naming` keeps the commits alone, for the checks. A pull
+    /// that looks for no delta of a dependency reads no entry.
+    keys_only: bool,
 }
 
 /// A dirtree walked under a scope smaller than the whole tree.
@@ -2873,11 +3023,11 @@ impl Plan {
     }
 
     /// Records a commit and queues what it needs: its objects, its composefs
-    /// image, its parent under `depth`, and each of its dependencies.
-    ///
-    /// The plan queues a dependency at depth 0, so it follows no parent of
-    /// the dependency. The marker of the commit goes into `marked` first, so
-    /// the caller clears it if the call fails.
+    /// image, and its parent under `depth`. The call records the dependencies
+    /// of the commit and does not queue them. The pull fetches them in a
+    /// later run, at depth 0, so it follows no parent of a dependency. The
+    /// marker of the commit goes into `marked` first, so the caller clears it
+    /// if the call fails.
     ///
     /// # Errors
     ///
@@ -2939,7 +3089,8 @@ impl Plan {
         self.apply_dependencies(outcome.checksum, outcome.dependencies)
     }
 
-    /// Records the dependencies of `commit` and queues each one.
+    /// Records the dependencies of `commit`, for the checks and for the run
+    /// that fetches them.
     ///
     /// # Errors
     ///
@@ -2955,27 +3106,27 @@ impl Plan {
         if let Some((naming, name)) = self.dependencies.named.get(&commit) {
             return Err(related::nested_dependency(*naming, name, &commit));
         }
-        self.dependencies.with_dependencies.insert(commit);
-        for (name, dependency) in dependencies {
-            if self.dependencies.with_dependencies.contains(&dependency) {
-                return Err(related::nested_dependency(commit, &name, &dependency));
+        for (name, dependency) in &dependencies {
+            if *dependency == commit || self.dependencies.naming.contains_key(dependency) {
+                return Err(related::nested_dependency(commit, name, dependency));
             }
-            if self.dependencies.absent.contains(&dependency) {
+            if self.dependencies.absent.contains(dependency) {
                 return Err(Error::ObjectNotFound {
-                    checksum: dependency,
+                    checksum: *dependency,
                     ty: ObjectType::Commit,
                 });
             }
             self.dependencies
                 .named
-                .entry(dependency)
-                .or_insert((commit, name));
-            self.push_commit(CommitItem {
-                checksum: dependency,
-                depth: 0,
-                optional: false,
-            });
+                .entry(*dependency)
+                .or_insert_with(|| (commit, name.clone()));
         }
+        let entries = if self.dependencies.keys_only {
+            Vec::new()
+        } else {
+            dependencies
+        };
+        self.dependencies.naming.insert(commit, entries);
         Ok(())
     }
 
@@ -4581,10 +4732,10 @@ mod tests {
         }
     }
 
-    /// A dependency is queued at depth 0 and is not optional, also under a
-    /// commit that the plan follows to its full depth.
+    /// A dependency is recorded and not queued, also under a commit that the
+    /// plan follows to its full depth. The parent is queued.
     #[test]
-    fn a_dependency_is_queued_at_depth_zero_and_not_optional() {
+    fn a_dependency_is_recorded_and_not_queued() {
         let mut plan = Plan::default();
         let mut marked = Vec::new();
         plan.push_commit(CommitItem {
@@ -4601,28 +4752,37 @@ mod tests {
         let parent = next_commit(&mut plan);
         assert_eq!((parent.checksum, parent.depth), (csum(2), -1));
         assert!(parent.optional);
-        let dependency = next_commit(&mut plan);
-        assert_eq!((dependency.checksum, dependency.depth), (csum(3), 0));
-        assert!(!dependency.optional);
         assert!(plan.next().is_none());
         assert_eq!(marked, [csum(1)]);
+        assert_eq!(
+            plan.dependencies.named.get(&csum(3)),
+            Some(&(csum(1), "boot/uki".to_owned()))
+        );
+        assert_eq!(
+            plan.dependencies.naming.get(&csum(1)),
+            Some(&vec![("boot/uki".to_owned(), csum(3))])
+        );
     }
 
-    /// A dependency that two commits name is queued once.
+    /// A dependency that two commits name keeps the first commit and entry
+    /// name. The plan records the entries of each commit.
     #[test]
-    fn a_dependency_two_commits_name_is_queued_once() {
+    fn a_dependency_two_commits_name_keeps_the_first_entry() {
         let mut plan = Plan::default();
         let mut marked = Vec::new();
         plan.apply(naming(csum(1), None, &[("a/x", 3)]), &mut marked)
             .unwrap();
         plan.apply(naming(csum(2), None, &[("b/x", 3)]), &mut marked)
             .unwrap();
-        assert_eq!(next_commit(&mut plan).checksum, csum(3));
         assert!(plan.next().is_none());
+        assert_eq!(
+            plan.dependencies.named.get(&csum(3)),
+            Some(&(csum(1), "a/x".to_owned()))
+        );
+        assert_eq!(plan.dependencies.named.len(), 1);
+        assert_eq!(plan.dependencies.naming.len(), 2);
         plan.apply(naming(csum(3), None, &[]), &mut marked).unwrap();
-        plan.apply(naming(csum(4), None, &[("c/x", 3)]), &mut marked)
-            .unwrap();
-        assert!(plan.next().is_none());
+        assert_eq!(plan.parents.get(&csum(3)), Some(&None));
     }
 
     /// A dependency that names dependencies of its own fails the pull, in
@@ -4691,6 +4851,7 @@ mod tests {
         plan.apply(Step::Absent(csum(2)), &mut marked).unwrap();
         plan.apply(naming(csum(1), None, &[("lib/b", 3)]), &mut marked)
             .unwrap();
-        assert_eq!(next_commit(&mut plan).checksum, csum(3));
+        assert!(plan.dependencies.named.contains_key(&csum(3)));
+        assert!(!plan.parents.contains_key(&csum(2)));
     }
 }

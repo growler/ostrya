@@ -3202,8 +3202,11 @@ subpath (`../format-reference.md`, "Dependencies in a pull from a remote"). A
 dependency that neither the repository, a localcache repository, nor the
 remote holds, a field 2 entry with an empty name or with a checksum that is
 not 32 bytes, and a nested dependency fail the pull at exit 1, and the pull
-writes no object and no ref. The tool fetches no dependency
-(`cli-behavior.md`, "Related commits in a pull").
+writes no object and no ref. The pull looks for a static delta of each
+dependency, from the entry of the same name in the commit that the local ref
+names before the pull (`../format-reference.md`, "Static deltas of
+dependencies"). The tool fetches no dependency (`cli-behavior.md`, "Related
+commits in a pull").
 
 The port adds `--collection=ID`, the pull of the refs of the collection ID
 from each remote whose `collection-id` is ID (`format-reference.md`, "The
@@ -3503,6 +3506,14 @@ not. Two differences stand:
   from-scratch delta alone and fetches loose, and the port takes the delta.
   Both land the same objects, and neither refuses.
 
+The requirement also applies to each dependency that the port fetches and
+that the destination does not hold complete. A dependency with no delta fails
+the pull at exit 1 with `error: pull: Static deltas required, but none found
+for <name> of <ref> to <checksum>`, where `<name>` is the name of the field 2
+entry, and the pull writes no ref (`../format-reference.md`, "Static deltas
+of dependencies", which also gives the rule of `<name>` and `<ref>`). The
+tool fetches no dependency, so it has no such refusal.
+
 A pull that returns an error removes the `state/<commit>.commitpartial` marker
 of each commit it marked whose commit object the destination does not hold, a
 marker it found in place included, and keeps the marker of a commit the
@@ -3678,8 +3689,12 @@ nothing, since `pull-local` reads no delta by default. Nine differences stand:
   pull"). A dependency that neither the source, a localcache repository, nor
   the destination holds, a field 2 entry with an empty name or with a
   checksum that is not 32 bytes, and a nested dependency fail the pull at
-  exit 1, and the pull writes no object and no ref. The tool imports no
-  dependency (`cli-behavior.md`, "Related commits in a pull").
+  exit 1, and the pull writes no object and no ref. Under
+  `--require-static-deltas`, the port also looks for a delta of each
+  dependency, and a dependency with no delta fails the pull at exit 1 before
+  it writes an object (`../format-reference.md`, "Static deltas of
+  dependencies"). The tool imports no dependency (`cli-behavior.md`,
+  "Related commits in a pull").
 
 `sign` accepts the whole tool option set and adds `--gpg-homedir`,
 `--remote`, and the `gpg` engine. The `ostree` 2026.1 build with OpenSSL on

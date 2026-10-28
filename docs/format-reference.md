@@ -1719,6 +1719,10 @@ the object type 100, in the object array of a part or in the fallback array.
 The tool writes no such entry. "The composefs image in a static delta" states
 the rules.
 
+A delta carries its target commit alone, and no field of the superblock names
+a dependency. A pull of the port looks for one delta for each dependency of
+the commits that it moves, as for a target ("Static deltas of dependencies").
+
 ### Fallback selection
 
 The generator makes an object a fallback when its compared size is at least the
@@ -3043,9 +3047,10 @@ caller, and to a pull of collection refs:
   A dependency that the repository holds partial gets its whole tree, and the
   pull removes its `.commitpartial` marker.
 - A localcache repository can supply a dependency.
-- A dependency entry adds no static delta to the pull, also if the pull
-  requires static deltas. The pull fetches the objects of a dependency loose,
-  unless a static delta of the pull delivers that commit.
+- The pull fetches the dependencies after the commits that name them, in one
+  more run. It looks for a static delta of each dependency ("Static deltas of
+  dependencies"). A dependency with no delta comes as loose objects. The
+  composefs images of the pull wait for the run of the dependencies.
 - The pull does not follow a build source.
 - A commit-only pull and a pull with subpaths fetch no dependency.
 
@@ -3084,9 +3089,11 @@ refs and to a pull of collection refs:
   signatures and walks no tree. A dependency that the repository holds
   partial gets the walk of its whole tree, and the pull removes its
   `.commitpartial` marker.
-- A dependency entry adds no static delta to the pull, also if the pull
-  requires static deltas. The pull imports the objects of a dependency loose,
-  unless a chain of static deltas of the pull makes that commit.
+- A pull that reads static deltas looks for a delta of each dependency that
+  it appends, before its transaction opens ("Static deltas of dependencies").
+  The pull applies these deltas after the deltas of the targets. It imports a
+  dependency with no delta loose, unless a chain of static deltas of the pull
+  makes that commit.
 - The pull does not follow a build source.
 - A commit-only pull imports no dependency.
 
@@ -3098,10 +3105,89 @@ a nested dependency. A dependency that neither a source nor the repository
 holds fails the pull too. This is also true for a parent that the source does
 not hold, if a commit of the pull names it as a dependency. The pull finds
 each of these failures before its transaction opens, so it writes no object,
-no ref, and no `.commitpartial` marker.
+no ref, and no `.commitpartial` marker. The same is true for a dependency with
+no delta under the requirement of static deltas.
 
 The `pull-local` command of `ostree` imports no dependency
 (`conformance/cli-behavior.md`, "Related commits in a pull").
+
+### Static deltas of dependencies
+
+A static delta carries its target alone, so each dependency gets a delta of
+its own. A pull looks for the delta of each dependency that it fetches and
+that the repository does not hold complete. A pull from a remote looks after
+the runs of the commits that name the dependencies, and fetches the
+dependencies in one more run. A local pull looks after the walk of the commit
+chains, before its transaction opens, and only if it reads static deltas:
+under the option that requires them, or with a list. A dependency that the pull reaches as a
+target, as a parent, or as an intermediate commit of a chain of static deltas
+gets no search of its own.
+
+The search for the delta of a dependency is the search for the delta of a
+target (the rustdoc of `Repo::pull`, "Static deltas"), with this `from`:
+
+paired entry
+: For a dependency with the name N, the entry with the name N in field 2 of
+  the commit that the local ref of a target names before the pull. The target
+  is a target whose chain names the dependency. The chain of a target is the
+  target and the parents that the depth of the pull takes.
+
+- Each target gives at most one paired entry. If its chain names the
+  dependency under two names, the name nearest to the tip applies. If field 2
+  holds two entries with that name, the first entry applies.
+- A target gives no paired entry if the repository has no local ref for it,
+  does not hold the commit of the ref, or reads a field 2 of that commit that
+  does not decode or has a defective entry. A local pull of a target whose
+  name is the full hex form of its commit is a pull by checksum, and gives no
+  paired entry. An intermediate commit of a chain of static deltas that the
+  depth does not take is not in the chain of a target, so it gives no paired
+  entry.
+- The `from` is the first paired entry, in the order of the targets of the
+  pull, that the repository holds complete.
+
+The pull takes the first delta that it finds, in this order:
+
+1. `<from>-<to>`
+2. `<c>-<to>`, for each commit `c` that the repository holds complete, other
+   paired entries included
+3. the from-scratch `<to>`, only if the repository holds no paired entry
+   complete
+
+With a summary, the pull reads the delta index of the dependency ("Static
+delta index files"), and else the `ostree.static-deltas` map of the summary,
+as for a target. With no summary, a pull from a remote requests `<from>-<to>`
+by name, or the from-scratch `<to>` if it has no `from`. With a list of static
+deltas, the pull takes one entry of the list whose target is the dependency,
+in the order above, and plans no chain for it. Step 2 then goes in list
+order.
+
+The option that disables static deltas applies to each dependency. Under the
+option that requires static deltas, a dependency with no delta fails the pull
+with this message, and the pull moves no ref:
+
+```text
+Static deltas required, but none found for <name> of <ref> to <checksum>
+```
+
+`<ref>` is the first target whose chain names the dependency, as the pull
+names it. `<name>` is the name of the entry nearest to the tip of that chain.
+If no chain of a target names the dependency, `<ref>` is the first target of
+the pull. `<name>` then comes from the commit of the pull with the lowest
+checksum that names the dependency, and is the lowest name if that commit has
+two entries for it. `<checksum>` is the dependency. A from-scratch delta that
+step 3 leaves alone counts as found, and the pull fetches the dependency
+loose. A delta that the advertisement or the list names and the source does
+not hold counts as none.
+
+A pull from a remote looks for the delta of a dependency before it fetches
+the dependency. Under the option that requires static deltas, a dependency
+with no delta fails the pull with the message above, also if the remote does
+not hold it or if it names dependencies of its own. A dependency that names
+dependencies of its own and has a delta fails the pull as a nested
+dependency, after the pull fetched and verified the superblock. A local pull
+reads the commit of each dependency before the search. So a dependency that
+no source holds, and a nested dependency, fail the pull before the search for
+its delta.
 
 ### Dependencies in a push
 

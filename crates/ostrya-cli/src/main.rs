@@ -3494,8 +3494,9 @@ struct PullArgs {
     /// Refuse the pull if a missing commit has no static delta on the remote.
     ///
     /// A missing commit is a commit that this repository does not hold
-    /// complete. The pull also fails if the remote serves no summary. The
-    /// option conflicts with --disable-static-deltas.
+    /// complete, a dependency of a pulled commit included. The pull also fails
+    /// if the remote serves no summary. The option conflicts with
+    /// --disable-static-deltas.
     #[arg(long, conflicts_with = "disable_static_deltas")]
     require_static_deltas: bool,
     /// Require a GPG signature on every commit that the pull carries.
@@ -4415,7 +4416,9 @@ struct PullLocalArgs {
     /// Apply the static delta that the summary of the source advertises.
     ///
     /// If the source advertises no delta for a commit, the command refuses the
-    /// pull. The source must be an archive repository with a summary. The
+    /// pull. This includes each dependency that the pull imports and that this
+    /// repository does not hold complete. The source must be an archive
+    /// repository with a summary. The
     /// statistics line then has the form of a pull from a remote. This switch
     /// conflicts with --disable-static-deltas.
     #[arg(long, conflicts_with = "disable_static_deltas")]

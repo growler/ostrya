@@ -120,7 +120,7 @@ The switch turns off the \fB\%sign\-verify\-summary\fR key of the remote that \%
 \fB\-\-require\-static\-deltas\fR
 Apply the static delta that the summary of the source advertises.
 .IP
-If the source advertises no delta for a commit, the command refuses the pull. The source must be an archive repository with a summary. The statistics line then has the form of a pull from a remote. This switch conflicts with \%\-\-disable\-static\-deltas.
+If the source advertises no delta for a commit, the command refuses the pull. This includes each dependency that the pull imports and that this repository does not hold complete. The source must be an archive repository with a summary. The statistics line then has the form of a pull from a remote. This switch conflicts with \%\-\-disable\-static\-deltas.
 .TP
 \fB\-\-disable\-static\-deltas\fR
 Read no static delta.

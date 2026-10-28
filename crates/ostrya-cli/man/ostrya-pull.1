@@ -147,7 +147,7 @@ Fetch every object loose, and ignore all static deltas of the remote.
 \fB\-\-require\-static\-deltas\fR
 Refuse the pull if a missing commit has no static delta on the remote.
 .IP
-A missing commit is a commit that this repository does not hold complete. The pull also fails if the remote serves no summary. The option conflicts with \%\-\-disable\-static\-deltas.
+A missing commit is a commit that this repository does not hold complete, a dependency of a pulled commit included. The pull also fails if the remote serves no summary. The option conflicts with \%\-\-disable\-static\-deltas.
 .TP
 \fB\-\-gpg\-verify\fR[=\fIBOOL\fR]
 Require a GPG signature on every commit that the pull carries.

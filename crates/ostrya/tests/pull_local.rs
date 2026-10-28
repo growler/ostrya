@@ -7679,10 +7679,11 @@ fn a_defective_entry_of_an_intermediate_commit_fails_the_pull() {
 }
 
 /// A pull that requires static deltas applies the from-scratch delta of the
-/// tip. The tip names a dependency that has no delta. The pull imports the
-/// dependency loose and does not refuse it.
+/// tip. The tip names a dependency that has no delta, so the pull fails
+/// before its transaction opens. The message names the entry, the ref, and
+/// the dependency.
 #[test]
-fn a_required_delta_pull_imports_a_dependency_loose() {
+fn a_required_delta_pull_refuses_a_dependency_with_no_delta() {
     let tmp = TmpDir::new("pull-local-dependency-required");
     block_on(async {
         let base = tmp.path();
@@ -7690,31 +7691,21 @@ fn a_required_delta_pull_imports_a_dependency_loose() {
         delta_with(&src, None, &tip, DeltaOptions::default()).await;
         src.reindex_static_deltas().await.unwrap();
         summarize(&src).await;
-        let own = src.traverse_commit(&tip, 0).await.unwrap();
-        let only_dep = src
-            .traverse_commit(&dep, 0)
-            .await
-            .unwrap()
-            .into_iter()
-            .filter(|name| name.ty == ObjectType::File && !own.contains(name))
-            .count();
-        assert!(only_dep > 0);
-        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+        let (_dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
 
-        let stats = dst
+        let err = dst
             .pull_local(&src, required(PullFlags::empty()))
             .await
-            .unwrap();
+            .unwrap_err();
 
-        assert_eq!(stats.delta_parts, 1);
-        assert_eq!(stats.content_fetched as usize, only_dep);
-        assert_complete(&src, &dst, &dst_dir, &tip).await;
-        assert_complete(&src, &dst, &dst_dir, &dep).await;
-        assert!(dst.fsck(&FsckOptions::default()).await.unwrap().is_ok());
-        assert_eq!(
-            dst.list_refs(None).await.unwrap(),
-            [("main".to_owned(), tip)]
-        );
+        match err {
+            Error::Pull(message) => assert_eq!(
+                message,
+                format!("Static deltas required, but none found for boot/uki of main to {dep}")
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert_left_nothing(&dst).await;
     });
 }
 
@@ -7763,6 +7754,372 @@ fn a_dependency_of_an_intermediate_commit_that_the_depth_reaches_is_imported_onc
         assert_eq!(
             (stats.metadata_imported + stats.content_imported) as usize,
             after.len() - before.len()
+        );
+    });
+}
+
+// --- static deltas of dependencies ---------------------------------------
+
+/// Creates an archive source under `base/src` with two commits of a
+/// dependency, D1 and D2, and two commits on `main`, T1 and T2. T1 names D1
+/// as `boot/uki`, and T2, a child of T1, names D2 as `boot/uki`. The ref
+/// `main` names T1. Returns the source and `[T1, D1, T2, D2]`.
+async fn build_dependency_generations(base: &Path) -> (Repo, [Checksum; 4]) {
+    for sub in ["uki1", "uki2", "main1", "main2"] {
+        build_tree(&base.join(sub), format!("{sub}\n").as_bytes());
+    }
+    let (_path, src) = make_repo(base, "src", RepoMode::Archive).await;
+    let d1 = commit_tree(&src, base, "uki1", "dep/uki", None).await;
+    let d2 = commit_tree(&src, base, "uki2", "dep/uki", Some(d1)).await;
+    let t1 = commit_tree_related(&src, base, "main1", "main", None, &[("boot/uki", d1)]).await;
+    let t2 = commit_tree_related(&src, base, "main2", "main", Some(t1), &[("boot/uki", d2)]).await;
+    move_ref(&src, "main", &t1).await;
+    (src, [t1, d1, t2, d2])
+}
+
+/// Generates the delta from each `(from, to)` of `steps` in `src`, then the
+/// delta index and the summary. Returns the directory of each delta, in
+/// order.
+async fn publish_deltas(src: &Repo, steps: &[(Option<Checksum>, Checksum)]) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    for (from, to) in steps {
+        dirs.push(delta_with(src, from.as_ref(), to, DeltaOptions::default()).await);
+    }
+    src.reindex_static_deltas().await.unwrap();
+    summarize(src).await;
+    dirs
+}
+
+/// Replaces the superblock of the delta in `dir` with bytes that do not have
+/// the digest of the index. A pull that takes the delta fails with
+/// `Error::ChecksumMismatch`.
+fn spoil_superblock(dir: &Path) {
+    std::fs::write(dir.join("superblock"), b"not a superblock").unwrap();
+}
+
+/// Returns the options of a pull of `refs`.
+fn pull_refs(refs: &[&str]) -> PullOptions {
+    PullOptions {
+        refs: refs.iter().map(|name| (*name).to_owned()).collect(),
+        ..PullOptions::default()
+    }
+}
+
+/// Returns the options of a pull of `refs` that requires static deltas.
+fn required_refs(refs: &[&str]) -> PullOptions {
+    PullOptions {
+        require_static_deltas: true,
+        ..pull_refs(refs)
+    }
+}
+
+/// The pull of T2 takes the delta of its dependency D2 from the paired entry
+/// D1: the entry `boot/uki` of T1, which the ref `main` names before the
+/// pull. The from-scratch delta of D2 has a spoiled superblock, so a pull
+/// that took it would fail. No content object of D2 is imported loose.
+#[test]
+fn a_local_dependency_delta_from_its_paired_entry_is_taken() {
+    let tmp = TmpDir::new("pull-local-dependency-delta-paired");
+    block_on(async {
+        let base = tmp.path();
+        let (src, [t1, d1, t2, d2]) = build_dependency_generations(base).await;
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+        dst.pull_local(&src, pull_refs(&["main"])).await.unwrap();
+        move_ref(&src, "main", &t2).await;
+        let dirs = publish_deltas(&src, &[(Some(t1), t2), (Some(d1), d2), (None, d2)]).await;
+        spoil_superblock(&dirs[2]);
+
+        let stats = dst
+            .pull_local(&src, required(PullFlags::empty()))
+            .await
+            .unwrap();
+
+        assert_eq!(stats.content_fetched, 0);
+        assert_eq!(stats.delta_parts, 2);
+        for commit in [t2, d2] {
+            assert_complete(&src, &dst, &dst_dir, &commit).await;
+        }
+        assert_no_markers(&dst_dir);
+        assert!(dst.fsck(&FsckOptions::default()).await.unwrap().is_ok());
+        assert_eq!(
+            dst.list_refs(None).await.unwrap(),
+            [("main".to_owned(), t2)]
+        );
+    });
+}
+
+/// The destination holds D1 complete under no ref, so no paired entry
+/// exists. The pull takes the delta `<D1>-<D2>` from the commit that it holds
+/// complete, before the from-scratch delta of D2, whose superblock is
+/// spoiled.
+#[test]
+fn a_local_dependency_delta_from_another_held_commit_is_taken() {
+    let tmp = TmpDir::new("pull-local-dependency-delta-held");
+    block_on(async {
+        let base = tmp.path();
+        let (src, [_, d1, t2, d2]) = build_dependency_generations(base).await;
+        move_ref(&src, "main", &t2).await;
+        let dirs = publish_deltas(&src, &[(None, t2), (Some(d1), d2), (None, d2)]).await;
+        spoil_superblock(&dirs[2]);
+        let (dst_dir, dst) = dst_holding(base, "dst", &src, &d1).await;
+
+        let stats = dst
+            .pull_local(&src, required(PullFlags::empty()))
+            .await
+            .unwrap();
+
+        assert_eq!(stats.content_fetched, 0);
+        assert_complete(&src, &dst, &dst_dir, &d2).await;
+        assert_no_markers(&dst_dir);
+    });
+}
+
+/// The pull takes the from-scratch delta of a dependency if it holds no
+/// paired entry complete: here the destination is empty. If the paired entry
+/// is held complete, the pull does not take the from-scratch delta and
+/// imports the dependency loose. That delta counts as found, so the pull
+/// passes.
+#[test]
+fn the_from_scratch_delta_of_a_local_dependency_needs_no_paired_entry_held() {
+    let tmp = TmpDir::new("pull-local-dependency-delta-scratch");
+    block_on(async {
+        let base = tmp.path();
+        let (src, [t1, _, t2, d2]) = build_dependency_generations(base).await;
+        let (paired_dir, paired) = make_repo(base, "paired", RepoMode::Archive).await;
+        paired.pull_local(&src, pull_refs(&["main"])).await.unwrap();
+        move_ref(&src, "main", &t2).await;
+        publish_deltas(&src, &[(None, t2), (Some(t1), t2), (None, d2)]).await;
+        let own = src.traverse_commit(&t2, 0).await.unwrap();
+        let only_dep = src
+            .traverse_commit(&d2, 0)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|name| name.ty == ObjectType::File && !own.contains(name))
+            .count();
+        assert!(only_dep > 0);
+
+        let (fresh_dir, fresh) = make_repo(base, "fresh", RepoMode::Archive).await;
+        let stats = fresh
+            .pull_local(&src, required(PullFlags::empty()))
+            .await
+            .unwrap();
+        assert_eq!(stats.content_fetched, 0);
+        assert_eq!(stats.delta_parts, 2);
+        assert_complete(&src, &fresh, &fresh_dir, &d2).await;
+
+        let stats = paired
+            .pull_local(&src, required(PullFlags::empty()))
+            .await
+            .unwrap();
+        assert_eq!(stats.delta_parts, 1);
+        assert_eq!(stats.content_fetched as usize, only_dep);
+        assert_complete(&src, &paired, &paired_dir, &d2).await;
+        assert_no_markers(&paired_dir);
+    });
+}
+
+/// Two targets name one dependency D, with the paired entries DA and DB.
+/// With the delta `<DB>-<D>` alone, the pull of `[left, right]` finds it in
+/// the step `<c>-<to>`. With both deltas and a spoiled `<DB>-<D>`, the pull of
+/// `[left, right]` takes `<DA>-<D>` and passes, and the pull of
+/// `[right, left]` takes `<DB>-<D>` and fails.
+#[test]
+fn the_first_local_target_gives_the_from_of_a_dependency() {
+    let tmp = TmpDir::new("pull-local-dependency-delta-targets");
+    block_on(async {
+        let base = tmp.path();
+        for sub in ["da", "db", "d", "a1", "b1", "a2", "b2"] {
+            build_tree(&base.join(sub), format!("{sub}\n").as_bytes());
+        }
+        let (_src_dir, src) = make_repo(base, "src", RepoMode::Archive).await;
+        let da = commit_tree(&src, base, "da", "dep/a", None).await;
+        let db = commit_tree(&src, base, "db", "dep/b", None).await;
+        let d = commit_tree(&src, base, "d", "dep/d", None).await;
+        let a1 = commit_tree_related(&src, base, "a1", "left", None, &[("boot/uki", da)]).await;
+        let b1 = commit_tree_related(&src, base, "b1", "right", None, &[("boot/uki", db)]).await;
+        let mut dsts = Vec::new();
+        for name in ["one", "two", "three"] {
+            let (dir, dst) = make_repo(base, name, RepoMode::Archive).await;
+            dst.pull_local(&src, pull_refs(&["left", "right"]))
+                .await
+                .unwrap();
+            dsts.push((dir, dst));
+        }
+        let a2 = commit_tree_related(&src, base, "a2", "left", Some(a1), &[("boot/uki", d)]).await;
+        let b2 = commit_tree_related(&src, base, "b2", "right", Some(b1), &[("boot/uki", d)]).await;
+        let dirs = publish_deltas(&src, &[(Some(a1), a2), (Some(b1), b2), (Some(db), d)]).await;
+
+        let stats = dsts[0]
+            .1
+            .pull_local(&src, required_refs(&["left", "right"]))
+            .await
+            .unwrap();
+        assert_eq!(stats.content_fetched, 0);
+        assert_eq!(stats.delta_parts, 3);
+
+        publish_deltas(&src, &[(Some(da), d)]).await;
+        spoil_superblock(&dirs[2]);
+        let stats = dsts[1]
+            .1
+            .pull_local(&src, required_refs(&["left", "right"]))
+            .await
+            .unwrap();
+        assert_eq!(stats.content_fetched, 0);
+        let err = dsts[2]
+            .1
+            .pull_local(&src, required_refs(&["right", "left"]))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::ChecksumMismatch { .. }), "{err:?}");
+
+        for (dir, dst) in &dsts[..2] {
+            for commit in [a2, b2, d] {
+                assert_complete(&src, dst, dir, &commit).await;
+            }
+        }
+    });
+}
+
+/// A pull by checksum names no local ref, so a dependency gets no paired
+/// entry, and the pull takes its from-scratch delta. A pull of `main` holds
+/// the paired entry D1 complete and imports the dependency loose.
+#[test]
+fn a_local_pull_by_checksum_takes_the_from_scratch_delta_of_a_dependency() {
+    let tmp = TmpDir::new("pull-local-dependency-delta-checksum");
+    block_on(async {
+        let base = tmp.path();
+        let (src, [_, _, t2, d2]) = build_dependency_generations(base).await;
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+        dst.pull_local(&src, pull_refs(&["main"])).await.unwrap();
+        move_ref(&src, "main", &t2).await;
+        publish_deltas(&src, &[(None, t2), (None, d2)]).await;
+
+        let stats = dst
+            .pull_local(
+                &src,
+                PullOptions {
+                    flags: PullFlags::DISABLE_VERIFY_BINDINGS,
+                    ..required_refs(&[&t2.to_hex()])
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(stats.content_fetched, 0);
+        assert_eq!(stats.delta_parts, 2);
+        assert_complete(&src, &dst, &dst_dir, &d2).await;
+    });
+}
+
+/// Under `disable_static_deltas`, a pull that requires static deltas reads
+/// no delta, also for a dependency that has one, and imports it loose.
+#[test]
+fn a_local_pull_with_disabled_deltas_reads_no_dependency_delta() {
+    let tmp = TmpDir::new("pull-local-dependency-delta-disabled");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, tip, dep) = build_dependency_source(base).await;
+        publish_deltas(&src, &[(None, tip), (None, dep)]).await;
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+
+        let stats = dst
+            .pull_local(
+                &src,
+                PullOptions {
+                    disable_static_deltas: true,
+                    ..required(PullFlags::empty())
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(stats.delta_parts, 0);
+        assert_complete(&src, &dst, &dst_dir, &dep).await;
+    });
+}
+
+/// With a list of static deltas, the pull takes the list entry to a
+/// dependency from its paired entry, in one step, and imports no content of
+/// the dependency loose. Under `require_static_deltas`, a list with no entry
+/// to the dependency fails the pull before its transaction opens.
+#[test]
+fn a_local_list_pull_takes_the_listed_delta_of_a_dependency() {
+    let tmp = TmpDir::new("pull-local-dependency-delta-list");
+    block_on(async {
+        let base = tmp.path();
+        let (src, [t1, d1, t2, d2]) = build_dependency_generations(base).await;
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+        dst.pull_local(&src, pull_refs(&["main"])).await.unwrap();
+        let (refused_dir, refused) = make_repo(base, "refused", RepoMode::Archive).await;
+        refused
+            .pull_local(&src, pull_refs(&["main"]))
+            .await
+            .unwrap();
+        move_ref(&src, "main", &t2).await;
+        let (list, _dirs) = chain_list(&src, &[(t1, t2), (d1, d2)]).await;
+
+        let stats = dst
+            .pull_local(&src, chain_pull(list.clone()))
+            .await
+            .unwrap();
+
+        assert_eq!(stats.content_fetched, 0);
+        assert_eq!(stats.delta_parts, 2);
+        assert_complete(&src, &dst, &dst_dir, &d2).await;
+        assert_no_markers(&dst_dir);
+
+        let held = refused.list_objects().await.unwrap();
+        let err = refused
+            .pull_local(
+                &src,
+                PullOptions {
+                    require_static_deltas: true,
+                    ..chain_pull(list[..1].to_vec())
+                },
+            )
+            .await
+            .unwrap_err();
+        match err {
+            Error::Pull(message) => assert_eq!(
+                message,
+                format!("Static deltas required, but none found for boot/uki of main to {d2}")
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(refused.list_objects().await.unwrap(), held);
+        assert_eq!(
+            refused.list_refs(None).await.unwrap(),
+            [("main".to_owned(), t1)]
+        );
+        assert_no_markers(&refused_dir);
+    });
+}
+
+/// With a list of static deltas and no requirement, a dependency with no
+/// entry in the list comes as loose objects, and the pull passes. The pull
+/// applies the listed delta of the target.
+#[test]
+fn a_local_list_pull_imports_a_dependency_with_no_listed_delta_loose() {
+    let tmp = TmpDir::new("pull-local-dependency-delta-list-loose");
+    block_on(async {
+        let base = tmp.path();
+        let (src, [t1, _, t2, d2]) = build_dependency_generations(base).await;
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+        dst.pull_local(&src, pull_refs(&["main"])).await.unwrap();
+        move_ref(&src, "main", &t2).await;
+        let (list, _dirs) = chain_list(&src, &[(t1, t2)]).await;
+
+        let stats = dst.pull_local(&src, chain_pull(list)).await.unwrap();
+
+        assert_eq!(stats.delta_parts, 1);
+        assert!(stats.content_fetched > 0, "{stats:?}");
+        assert_complete(&src, &dst, &dst_dir, &t2).await;
+        assert_complete(&src, &dst, &dst_dir, &d2).await;
+        assert_no_markers(&dst_dir);
+        assert_eq!(
+            dst.list_refs(None).await.unwrap(),
+            [("main".to_owned(), t2)]
         );
     });
 }

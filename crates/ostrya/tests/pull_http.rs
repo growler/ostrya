@@ -9655,7 +9655,8 @@ fn an_absent_parent_that_is_a_dependency_fails_the_pull() {
 
 /// A pull that takes a static delta of the target fetches the dependency as
 /// loose objects. The remote serves no summary, so the pull asks for the
-/// from-scratch delta of the target by name.
+/// from-scratch delta of the target by name, and then for the from-scratch
+/// delta of the dependency, which the remote does not hold.
 #[test]
 fn a_pull_through_a_delta_fetches_the_dependency_loose() {
     block_on(async {
@@ -9685,6 +9686,7 @@ fn a_pull_through_a_delta_fetches_the_dependency_loose() {
         );
         assert!(!seen.contains(&meta_path(&tip, "commit")), "{seen:?}");
         assert!(seen.contains(&meta_path(&dep, "commit")), "{seen:?}");
+        assert_eq!(server.statuses_for(&scratch_superblock(&dep)), [404]);
         assert_complete(&remote, &dest, dest.path(), &tip).await;
         assert_complete(&remote, &dest, dest.path(), &dep).await;
     });
@@ -9766,5 +9768,558 @@ fn a_dependency_held_partial_is_completed() {
         pull_main(&dest, PullOptions::default()).await.unwrap();
 
         assert_complete(&remote, &dest, dest.path(), &dep).await;
+    });
+}
+
+// --- static deltas of dependencies ---------------------------------------
+
+/// Builds an archive remote under `dir/remote` with two commits of a
+/// dependency, D1 and D2, and two commits on `test/main`, T1 and T2. T1 names
+/// D1 as `boot/uki`, and T2, a child of T1, names D2 as `boot/uki`. The ref
+/// `test/main` names T1, and the remote holds a summary. Returns the remote
+/// and `[T1, D1, T2, D2]`.
+async fn build_dependency_generations(dir: &Path) -> (Repo, [Checksum; 4]) {
+    for sub in ["uki1", "uki2", "main1", "main2"] {
+        build_tree(&dir.join(sub), format!("{sub}\n").as_bytes());
+    }
+    let remote = create_remote(dir).await;
+    let d1 = commit_tree(&remote, dir, "uki1", "dep/uki", None, FIXED_TS).await;
+    let d2 = commit_tree(&remote, dir, "uki2", "dep/uki", Some(d1), FIXED_TS + 1).await;
+    let t1 = commit_tree_related(
+        &remote,
+        dir,
+        "main1",
+        "test/main",
+        None,
+        &[("boot/uki", d1)],
+    )
+    .await;
+    let t2 = commit_tree_related(
+        &remote,
+        dir,
+        "main2",
+        "test/main",
+        Some(t1),
+        &[("boot/uki", d2)],
+    )
+    .await;
+    move_ref(&remote, "test/main", &t1).await;
+    (remote, [t1, d1, t2, d2])
+}
+
+/// Returns the request path of the superblock of the from-scratch delta to
+/// `to`.
+fn scratch_superblock(to: &Checksum) -> String {
+    format!("{}/superblock", static_delta_relative_dir(None, to))
+}
+
+/// The pull of T2 takes the delta of its dependency D2 from the paired entry
+/// D1: the entry `boot/uki` of T1, which the local ref names before the pull.
+/// The remote also publishes the from-scratch delta of D2, and the pull does
+/// not request it. The commit of D2 comes from the superblock.
+#[test]
+fn the_delta_of_a_dependency_from_its_paired_entry_is_taken() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-dependency-delta-paired");
+        let (remote, [_, d1, t2, d2]) = build_dependency_generations(dir.path()).await;
+        let server = RepoServer::start(remote.path(), false).await;
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
+        pull_main(&dest, PullOptions::default()).await.unwrap();
+        publish_delta(&remote, Some(&d1), &d2).await;
+        publish_delta(&remote, None, &d2).await;
+        move_ref(&remote, "test/main", &t2).await;
+        server.forget();
+
+        pull_main(&dest, PullOptions::default()).await.unwrap();
+
+        let seen = server.seen();
+        assert_eq!(
+            server.requests_for(&superblock_path(&d1, &d2)),
+            1,
+            "{seen:?}"
+        );
+        assert_eq!(server.requests_for(&scratch_superblock(&d2)), 0, "{seen:?}");
+        assert_eq!(
+            server.requests_for(&meta_path(&d2, "commit")),
+            0,
+            "{seen:?}"
+        );
+        assert_complete(&remote, &dest, dest.path(), &t2).await;
+        assert_complete(&remote, &dest, dest.path(), &d2).await;
+        assert!(dest.fsck(&FsckOptions::default()).await.unwrap().is_ok());
+        assert_eq!(
+            dest.list_remote_refs().await.unwrap(),
+            [("origin:test/main".to_owned(), t2)]
+        );
+    });
+}
+
+/// The destination holds D1 complete under no ref, so no paired entry
+/// exists. The pull takes the delta `<D1>-<D2>` from the commit that it
+/// holds complete, before the from-scratch delta of D2.
+#[test]
+fn a_dependency_delta_from_another_held_commit_is_taken() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-dependency-delta-held");
+        let (remote, [_, d1, t2, d2]) = build_dependency_generations(dir.path()).await;
+        publish_delta(&remote, Some(&d1), &d2).await;
+        publish_delta(&remote, None, &d2).await;
+        move_ref(&remote, "test/main", &t2).await;
+        let server = RepoServer::start(remote.path(), false).await;
+        let dest = dest_holding(dir.path(), &server.url(), &d1).await;
+        server.forget();
+
+        pull_main(&dest, PullOptions::default()).await.unwrap();
+
+        let seen = server.seen();
+        assert_eq!(
+            server.requests_for(&superblock_path(&d1, &d2)),
+            1,
+            "{seen:?}"
+        );
+        assert_eq!(server.requests_for(&scratch_superblock(&d2)), 0, "{seen:?}");
+        assert_eq!(
+            server.requests_for(&meta_path(&d2, "commit")),
+            0,
+            "{seen:?}"
+        );
+        assert_complete(&remote, &dest, dest.path(), &d2).await;
+    });
+}
+
+/// The pull takes the from-scratch delta of a dependency if it holds no
+/// paired entry complete: here the destination has no local ref. If the
+/// paired entry is held complete, the pull does not take the from-scratch
+/// delta and fetches the dependency loose. That delta counts as found, so a
+/// pull that requires static deltas passes.
+#[test]
+fn the_from_scratch_delta_of_a_dependency_needs_no_paired_entry_held() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-dependency-delta-scratch");
+        let base = dir.path();
+        let (remote, [t1, _, t2, d2]) = build_dependency_generations(base).await;
+        let server = RepoServer::start(remote.path(), false).await;
+        let mut paired = Vec::new();
+        for (name, opts) in [
+            ("loose", PullOptions::default()),
+            ("required", required_delta_opts()),
+        ] {
+            let path = base.join(name);
+            std::fs::create_dir(&path).unwrap();
+            let dest = build_dest(&path, RepoMode::Archive, &server.url(), "").await;
+            pull_main(&dest, PullOptions::default()).await.unwrap();
+            paired.push((dest, opts));
+        }
+        publish_delta(&remote, None, &d2).await;
+        publish_delta(&remote, Some(&t1), &t2).await;
+        move_ref(&remote, "test/main", &t2).await;
+
+        let fresh = build_dest(base, RepoMode::Archive, &server.url(), "").await;
+        server.forget();
+        pull_main(&fresh, PullOptions::default()).await.unwrap();
+        let seen = server.seen();
+        assert_eq!(
+            server.statuses_for(&scratch_superblock(&d2)),
+            [200],
+            "{seen:?}"
+        );
+        assert_eq!(
+            server.requests_for(&meta_path(&d2, "commit")),
+            0,
+            "{seen:?}"
+        );
+        assert_complete(&remote, &fresh, fresh.path(), &d2).await;
+
+        for (dest, opts) in paired {
+            server.forget();
+            pull_main(&dest, opts).await.unwrap();
+            let seen = server.seen();
+            assert_eq!(server.requests_for(&scratch_superblock(&d2)), 0, "{seen:?}");
+            assert_eq!(
+                server.requests_for(&meta_path(&d2, "commit")),
+                1,
+                "{seen:?}"
+            );
+            assert_complete(&remote, &dest, dest.path(), &d2).await;
+        }
+    });
+}
+
+/// Two targets name one dependency D, with the paired entries DA and DB.
+/// With the delta `<DB>-<D>` alone, the pull of `[a, b]` finds it in the step
+/// `<c>-<to>`. With both deltas, the paired entry of the first target is the
+/// `from`: the pull of `[a, b]` takes `<DA>-<D>`, and the pull of `[b, a]`
+/// takes `<DB>-<D>`.
+#[test]
+fn the_first_target_gives_the_from_of_a_dependency() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-dependency-delta-targets");
+        let base = dir.path();
+        for sub in ["da", "db", "d", "a1", "b1", "a2", "b2"] {
+            build_tree(&base.join(sub), format!("{sub}\n").as_bytes());
+        }
+        let remote = create_remote(base).await;
+        let da = commit_tree(&remote, base, "da", "dep/a", None, FIXED_TS).await;
+        let db = commit_tree(&remote, base, "db", "dep/b", None, FIXED_TS).await;
+        let d = commit_tree(&remote, base, "d", "dep/d", None, FIXED_TS).await;
+        let a1 =
+            commit_tree_related(&remote, base, "a1", "test/a", None, &[("boot/uki", da)]).await;
+        let b1 =
+            commit_tree_related(&remote, base, "b1", "test/b", None, &[("boot/uki", db)]).await;
+        summarize(&remote).await;
+        let server = RepoServer::start(remote.path(), false).await;
+        let ab = || vec!["test/a".to_owned(), "test/b".to_owned()];
+        let ba = || vec!["test/b".to_owned(), "test/a".to_owned()];
+        let mut dests = Vec::new();
+        for name in ["one", "two", "three"] {
+            let path = base.join(name);
+            std::fs::create_dir(&path).unwrap();
+            let dest = build_dest(&path, RepoMode::Archive, &server.url(), "").await;
+            dest.pull(
+                "origin",
+                PullOptions {
+                    refs: ab(),
+                    ..PullOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+            dests.push(dest);
+        }
+        let a2 =
+            commit_tree_related(&remote, base, "a2", "test/a", Some(a1), &[("boot/uki", d)]).await;
+        let b2 =
+            commit_tree_related(&remote, base, "b2", "test/b", Some(b1), &[("boot/uki", d)]).await;
+        publish_delta(&remote, Some(&db), &d).await;
+        let pull = |dest: &Repo, refs: Vec<String>| {
+            let dest = dest.clone();
+            async move {
+                dest.pull(
+                    "origin",
+                    PullOptions {
+                        refs,
+                        ..PullOptions::default()
+                    },
+                )
+                .await
+                .unwrap();
+            }
+        };
+
+        server.forget();
+        pull(&dests[0], ab()).await;
+        assert_eq!(server.requests_for(&superblock_path(&db, &d)), 1);
+        assert_eq!(server.requests_for(&meta_path(&d, "commit")), 0);
+
+        publish_delta(&remote, Some(&da), &d).await;
+        for (dest, refs, taken, other) in [(&dests[1], ab(), da, db), (&dests[2], ba(), db, da)] {
+            server.forget();
+            pull(dest, refs).await;
+            let seen = server.seen();
+            assert_eq!(
+                server.requests_for(&superblock_path(&taken, &d)),
+                1,
+                "{seen:?}"
+            );
+            assert_eq!(
+                server.requests_for(&superblock_path(&other, &d)),
+                0,
+                "{seen:?}"
+            );
+            assert_eq!(server.requests_for(&meta_path(&d, "commit")), 0, "{seen:?}");
+        }
+        for dest in &dests {
+            for commit in [a2, b2, d] {
+                assert_complete(&remote, dest, dest.path(), &commit).await;
+            }
+        }
+    });
+}
+
+/// A pull that requires static deltas fails if a dependency has no delta.
+/// The message names the entry, the ref of the target, and the dependency.
+/// The pull moves no ref and leaves nothing.
+#[test]
+fn a_required_delta_pull_refuses_a_dependency_with_no_delta() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-dependency-delta-required");
+        let (remote, tip, dep) = build_dependency_remote(dir.path()).await;
+        publish_delta(&remote, None, &tip).await;
+        let server = RepoServer::start(remote.path(), false).await;
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
+
+        let err = dest
+            .pull("origin", required_delta_opts())
+            .await
+            .unwrap_err();
+
+        match err {
+            Error::Pull(message) => assert_eq!(
+                message,
+                format!(
+                    "Static deltas required, but none found for boot/uki of test/main to {dep}"
+                )
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert_left_nothing(&dest).await;
+    });
+}
+
+/// Under `disable_static_deltas`, the pull requests no delta and no delta
+/// index for a dependency, and fetches it loose.
+#[test]
+fn a_pull_with_disabled_deltas_requests_no_dependency_delta() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-dependency-delta-disabled");
+        let (remote, _tip, dep) = build_dependency_remote(dir.path()).await;
+        publish_delta(&remote, None, &dep).await;
+        let server = RepoServer::start(remote.path(), false).await;
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
+
+        pull_main(
+            &dest,
+            PullOptions {
+                disable_static_deltas: true,
+                ..PullOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let seen = server.seen();
+        assert!(
+            !seen
+                .iter()
+                .any(|path| path.starts_with("deltas/") || path.starts_with("delta-indexes/")),
+            "{seen:?}"
+        );
+        assert_eq!(server.requests_for(&meta_path(&dep, "commit")), 1);
+        assert_complete(&remote, &dest, dest.path(), &dep).await;
+    });
+}
+
+/// A remote with no summary advertises no delta. The pull requests the delta
+/// of the dependency from its paired entry by name, and not the from-scratch
+/// delta.
+#[test]
+fn a_pull_with_no_summary_requests_the_dependency_delta_by_name() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-dependency-delta-unlisted");
+        let (remote, [_, d1, t2, d2]) = build_dependency_generations(dir.path()).await;
+        let server = RepoServer::start(remote.path(), false).await;
+        let dest = build_dest(dir.path(), RepoMode::Archive, &server.url(), "").await;
+        pull_main(&dest, PullOptions::default()).await.unwrap();
+        publish_delta(&remote, Some(&d1), &d2).await;
+        publish_delta(&remote, None, &d2).await;
+        move_ref(&remote, "test/main", &t2).await;
+        std::fs::remove_file(remote.path().join("summary")).unwrap();
+        server.forget();
+
+        pull_main(&dest, PullOptions::default()).await.unwrap();
+
+        let seen = server.seen();
+        assert_eq!(
+            server.statuses_for(&superblock_path(&d1, &d2)),
+            [200],
+            "{seen:?}"
+        );
+        assert_eq!(server.requests_for(&scratch_superblock(&d2)), 0, "{seen:?}");
+        assert_eq!(
+            server.requests_for(&meta_path(&d2, "commit")),
+            0,
+            "{seen:?}"
+        );
+        assert_complete(&remote, &dest, dest.path(), &d2).await;
+    });
+}
+
+/// With a list of static deltas, the pull takes the list entry to a
+/// dependency from its paired entry, in one step. Under
+/// `require_static_deltas`, a list with no entry to the dependency fails the
+/// pull with the message of a dependency, and the pull moves no ref.
+#[test]
+fn a_list_pull_takes_the_listed_delta_of_a_dependency() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-dependency-delta-list");
+        let base = dir.path();
+        let (remote, [t1, d1, t2, d2]) = build_dependency_generations(base).await;
+        let server = RepoServer::start(remote.path(), false).await;
+        let listed_dest = build_dest(base, RepoMode::Archive, &server.url(), "").await;
+        pull_main(&listed_dest, PullOptions::default())
+            .await
+            .unwrap();
+        let other = base.join("other");
+        std::fs::create_dir(&other).unwrap();
+        let refused = build_dest(&other, RepoMode::Archive, &server.url(), "").await;
+        pull_main(&refused, PullOptions::default()).await.unwrap();
+        move_ref(&remote, "test/main", &t2).await;
+        let target = listed(&remote, &t1, &t2, DeltaOptions::default()).await;
+        let dependency = listed(&remote, &d1, &d2, DeltaOptions::default()).await;
+        server.forget();
+
+        listed_dest
+            .pull("origin", chain_opts(vec![target, dependency]))
+            .await
+            .unwrap();
+
+        let seen = server.seen();
+        assert_eq!(
+            server.requests_for(&superblock_path(&d1, &d2)),
+            1,
+            "{seen:?}"
+        );
+        assert_eq!(
+            server.requests_for(&meta_path(&d2, "commit")),
+            0,
+            "{seen:?}"
+        );
+        assert!(
+            !seen.iter().any(|path| path.starts_with("delta-indexes/")),
+            "{seen:?}"
+        );
+        assert_complete(&remote, &listed_dest, listed_dest.path(), &d2).await;
+
+        let held = refused.list_objects().await.unwrap();
+        let err = refused
+            .pull(
+                "origin",
+                PullOptions {
+                    require_static_deltas: true,
+                    ..chain_opts(vec![target])
+                },
+            )
+            .await
+            .unwrap_err();
+        match err {
+            Error::Pull(message) => assert_eq!(
+                message,
+                format!("Static deltas required, but none found for boot/uki of test/main to {d2}")
+            ),
+            other => panic!("{other:?}"),
+        }
+        assert_eq!(refused.list_objects().await.unwrap(), held);
+        assert_eq!(
+            refused.list_remote_refs().await.unwrap(),
+            [("origin:test/main".to_owned(), t1)]
+        );
+        assert_eq!(file_inventory(refused.path(), "state"), Vec::new());
+    });
+}
+
+/// The signature policy also checks a dependency whose commit comes from the
+/// superblock of its delta. A dependency with no trusted signature fails the
+/// pull after the pull fetched the superblock, and the pull leaves nothing.
+/// After the remote signs the dependency, the pull takes the delta.
+#[test]
+fn a_dependency_delta_with_no_trusted_signature_fails_the_pull() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-dependency-delta-signature");
+        let (remote, tip, dep) = build_dependency_remote(dir.path()).await;
+        publish_delta(&remote, None, &dep).await;
+        let signer = Ed25519Signer::from_base64(SECRET_B64).unwrap();
+        remote.sign_commit(&tip, &signer).await.unwrap();
+        let server = RepoServer::start(remote.path(), false).await;
+        let dest = build_dest(
+            dir.path(),
+            RepoMode::Archive,
+            &server.url(),
+            &format!("sign-verify=ed25519\nverification-ed25519-key={PUBLIC_B64}\n"),
+        )
+        .await;
+
+        let err = pull_main(&dest, PullOptions::default()).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m) if m.contains(&format!("commit {dep}"))),
+            "{err}"
+        );
+        let seen = server.seen();
+        assert_eq!(
+            server.statuses_for(&scratch_superblock(&dep)),
+            [200],
+            "{seen:?}"
+        );
+        assert_eq!(
+            server.requests_for(&meta_path(&dep, "commit")),
+            0,
+            "{seen:?}"
+        );
+        assert_left_nothing(&dest).await;
+
+        remote.sign_commit(&dep, &signer).await.unwrap();
+        server.forget();
+        pull_main(&dest, PullOptions::default()).await.unwrap();
+        let seen = server.seen();
+        assert_eq!(
+            server.statuses_for(&scratch_superblock(&dep)),
+            [200],
+            "{seen:?}"
+        );
+        assert_eq!(
+            server.requests_for(&meta_path(&dep, "commit")),
+            0,
+            "{seen:?}"
+        );
+        assert_complete(&remote, &dest, dest.path(), &dep).await;
+    });
+}
+
+/// Returns the request path of the delta index of `to`.
+fn index_path(to: &Checksum) -> String {
+    let dir = static_delta_relative_dir(None, to);
+    format!("{}.index", dir.replacen("deltas/", "delta-indexes/", 1))
+}
+
+/// A dependency that the run of the targets reaches gets no search for a
+/// delta of its own. Here one dependency is the parent of the target, and the
+/// other is the second target of the pull. The pull requests no delta index
+/// for the parent, and one delta index for each target, the search of the
+/// target. It requests no superblock.
+#[test]
+fn a_dependency_that_the_run_reaches_gets_no_delta_search() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-dependency-delta-reached");
+        let base = dir.path();
+        for sub in ["uki", "parent", "main"] {
+            build_tree(&base.join(sub), format!("{sub}\n").as_bytes());
+        }
+        let remote = create_remote(base).await;
+        let dep = commit_tree(&remote, base, "uki", "dep/uki", None, FIXED_TS).await;
+        let parent = commit_tree(&remote, base, "parent", "test/main", None, FIXED_TS).await;
+        let tip = commit_tree_related(
+            &remote,
+            base,
+            "main",
+            "test/main",
+            Some(parent),
+            &[("boot/uki", dep), ("boot/base", parent)],
+        )
+        .await;
+        summarize(&remote).await;
+        let server = RepoServer::start(remote.path(), false).await;
+        let dest = build_dest(base, RepoMode::Archive, &server.url(), "").await;
+
+        dest.pull(
+            "origin",
+            PullOptions {
+                refs: vec!["test/main".to_owned(), "dep/uki".to_owned()],
+                depth: 1,
+                ..PullOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        let seen = server.seen();
+        assert_eq!(server.requests_for(&index_path(&tip)), 1, "{seen:?}");
+        assert_eq!(server.requests_for(&index_path(&dep)), 1, "{seen:?}");
+        assert_eq!(server.requests_for(&index_path(&parent)), 0, "{seen:?}");
+        assert!(
+            !seen.iter().any(|path| path.starts_with("deltas/")),
+            "{seen:?}"
+        );
+        for commit in [tip, parent, dep] {
+            assert_complete(&remote, &dest, dest.path(), &commit).await;
+        }
     });
 }

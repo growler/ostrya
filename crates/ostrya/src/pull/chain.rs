@@ -117,7 +117,7 @@ impl Edges {
 
     /// Returns the list indices of the steps to `to`, sorted by source commit.
     /// A step from scratch comes first.
-    fn steps_to(&self, to: &Checksum) -> &[usize] {
+    pub(super) fn steps_to(&self, to: &Checksum) -> &[usize] {
         let start = self
             .by_target
             .partition_point(|&index| self.list[index].to < *to);
@@ -429,6 +429,11 @@ impl ChainSearch {
     /// Returns the deltas of the search.
     pub(super) fn edges(&self) -> &Edges {
         &self.edges
+    }
+
+    /// Ends the search and returns its deltas.
+    pub(super) fn into_edges(self) -> Edges {
+        self.edges
     }
 }
 

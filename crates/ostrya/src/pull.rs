@@ -229,6 +229,7 @@ use crate::write::FileMeta;
 mod chain;
 mod collection;
 mod delta;
+mod dependency;
 pub(crate) mod drive;
 #[doc(hidden)]
 pub mod http;
@@ -723,8 +724,9 @@ pub struct PullOptions {
     /// that asks for no delta looks for none, so it finds nothing to require. A
     /// local pull reads a delta only if it requires one or applies a list of
     /// [`static_deltas`](PullOptions::static_deltas). So with this option, a
-    /// local pull reads no delta. [`Repo::pull`] states the static delta rules
-    /// of a pull.
+    /// local pull reads no delta. The option also applies to the delta of
+    /// each dependency. [`Repo::pull`] states the static delta rules of a
+    /// pull.
     ///
     /// A pull refuses this option together with
     /// [`static_deltas`](PullOptions::static_deltas).
@@ -750,6 +752,21 @@ pub struct PullOptions {
     /// that no chain of the list reaches. A listed delta from scratch to the
     /// target that the rule above leaves alone counts as found: the pull does
     /// not fail, and fetches that target loose.
+    ///
+    /// The requirement also applies to each dependency that the pull fetches
+    /// and that this repository does not hold complete. A dependency with no
+    /// delta fails the pull with [`Error::Pull`], and the pull moves no ref.
+    /// The message is `Static deltas required, but none found for <name> of
+    /// <ref> to <checksum>`. `<ref>` is the first target whose chain names
+    /// the dependency, as the pull names it, and `<name>` is the name of the
+    /// entry nearest to the tip of that chain. If no chain of a target names
+    /// the dependency, `<ref>` is the first target of the pull. `<name>` then
+    /// comes from the commit of the pull with the lowest checksum that names
+    /// the dependency, and is the lowest name if that commit has two entries
+    /// for it. `<checksum>` is the dependency. A from-scratch delta that the
+    /// rules of a dependency leave alone counts as found. With a list, the
+    /// pull takes one entry of the list to the dependency, and plans no chain
+    /// for it. [`Repo::pull`] states the search, under `# Static deltas`.
     ///
     /// A local pull reads a delta from the source directory only under this
     /// option or with a list. [`Repo::pull_local`] states the static delta
@@ -1236,10 +1253,11 @@ impl Repo {
     ///   complete, the pull checks the signatures and walks no tree. A
     ///   dependency that this repository holds partial gets the walk of its
     ///   whole tree.
-    /// - A dependency entry adds no static delta to the pull, also under
-    ///   [`require_static_deltas`](PullOptions::require_static_deltas). The
-    ///   pull imports the objects of a dependency loose, unless a chain of
-    ///   static deltas of the pull makes that commit.
+    /// - A pull that reads static deltas looks for a delta of each dependency
+    ///   that it appends and that this repository does not hold complete, as
+    ///   "Static deltas" states. The pull imports the objects of a dependency
+    ///   with no delta loose, unless a chain of static deltas of the pull
+    ///   makes that commit.
     /// - The pull does not follow a build source: a commit that the detached
     ///   metadata key `ostrya.related` names.
     ///
@@ -1554,6 +1572,21 @@ impl Repo {
     /// no chain reaches a target, the pull imports its objects loose, or fails
     /// under `require_static_deltas`.
     ///
+    /// After the walk of the commit chains, and before the transaction opens,
+    /// the pull looks for a delta of each dependency that the walk appends and
+    /// that this repository does not hold complete. The search and its `from`
+    /// are those of [`Repo::pull`] under `# Static deltas`: the summary and
+    /// the delta index of the source, or one entry of the list. A target whose
+    /// name is the full hex form of its commit is a pull by checksum, and
+    /// gives no paired entry. Under `require_static_deltas`, a dependency with
+    /// no delta fails the pull, and the pull writes nothing. The pull applies
+    /// the deltas of the dependencies after the deltas of the targets, one
+    /// part at a time, in the order of the walk. The search keeps no
+    /// superblock of a dependency. Before the pull applies the delta of a
+    /// dependency, it reads the superblock again from the source and compares
+    /// it with the digest that the summary, the delta index, or the list
+    /// states.
+    ///
     /// # Errors
     ///
     /// - [`Error::Unsupported`] if [`subpaths`](PullOptions::subpaths) is not
@@ -1600,12 +1633,17 @@ impl Repo {
     ///   no trusted key, or if a keyring or a key file of the remote cannot
     ///   be read.
     /// - [`Error::Pull`] if the pull requires static deltas and `src` has no
-    ///   summary, or no delta for a commit. With a `static_deltas` list, the
+    ///   summary, or no delta for a commit or for a dependency that this
+    ///   repository does not hold complete. With a `static_deltas` list, the
     ///   pull needs no summary, and fails if no chain of the list reaches a
     ///   target commit. A listed delta from scratch to the target that the
     ///   rule of [`require_static_deltas`](PullOptions::require_static_deltas)
     ///   leaves alone counts as found: the pull does not fail, and imports
-    ///   that target loose.
+    ///   that target loose. The walk reads the commit of each dependency
+    ///   before the search for its delta. So a dependency that no source
+    ///   holds gives [`Error::ObjectNotFound`], and a dependency that names
+    ///   dependencies of its own gives [`Error::InvalidRelated`], before this
+    ///   error.
     /// - [`Error::Pull`] if a superblock of the list produces another commit,
     ///   or from another commit, than its entry of the list.
     /// - [`Error::Pull`] if the ref binding of a commit does not name its ref.
@@ -1641,7 +1679,7 @@ impl Repo {
     /// - [`Error::InvalidFormat`] if the `summary` or `summary.sig` of `src` is
     ///   larger than 64 MiB or is not a regular file. Also if a static delta of
     ///   `src` is malformed, or if `src` does not hold a superblock of a chain
-    ///   when the pull applies its step.
+    ///   or of a dependency when the pull applies its delta.
     /// - [`Error::Io`] for an I/O failure of the file system. Also for a held
     ///   dirtree that the pull cannot read, that is not a regular file, or that
     ///   is larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
@@ -1733,13 +1771,17 @@ impl Repo {
                 src.mode().as_mode_str()
             )));
         }
-        // The pull drops the bytes here: discovery reads the parsed summary
-        // alone. A summary can be as large as `SUMMARY_READ_CAP`, so the parse
-        // runs on the blocking pool, and the bytes drop there.
-        let summary = match summary {
-            Some(bytes) if needs_summary => {
-                Some(ostrya_rt::unblock(move || crate::summary::Summary::parse(&bytes)).await?)
-            }
+        // The pull drops the bytes here: discovery reads two values of the
+        // parsed summary alone. A summary can be as large as
+        // `SUMMARY_READ_CAP`, so the parse runs on the blocking pool, and the
+        // bytes and the rest of the parse drop there.
+        let advert = match summary {
+            Some(bytes) if needs_summary => Some(
+                ostrya_rt::unblock(move || {
+                    crate::summary::Summary::parse(&bytes).map(delta::DeltaAdvert::from_summary)
+                })
+                .await?,
+            ),
             _ => None,
         };
 
@@ -1752,11 +1794,11 @@ impl Repo {
         // checks each commit of a chain: the signatures, and the ref binding of
         // each requested ref that names it.
         let counters = PullCounters::new(None);
-        let deltas = if summary.is_some() || edges.is_some() {
+        let deltas = if advert.is_some() || edges.is_some() {
             delta::discover(
                 self,
                 &delta::DeltaSource::Local(src),
-                summary.as_ref(),
+                advert.as_ref(),
                 &targets,
                 &opts,
                 // A local pull makes no timestamp check.
@@ -1773,8 +1815,10 @@ impl Repo {
         } else {
             delta::DeltaPlan::default()
         };
-        drop(summary);
         let mut deltas = deltas;
+        // The search for the deltas of the dependencies reads the summary
+        // values or the list of static deltas, after the walk of the chains.
+        let edges = deltas.take_edges();
         // The intermediate commits of the chains. The run of the levels
         // imports each of them, and the commit loop skips them.
         let done: HashSet<Checksum> = deltas.levels().iter().flatten().copied().collect();
@@ -1807,7 +1851,9 @@ impl Repo {
         //
         // The dependencies of the commits are commits of the pull too. The
         // walk appends each one after the chains, at depth 0, and checks it
-        // over the bytes that it read.
+        // over the bytes that it read. A pull that reads static deltas then
+        // looks for the delta of each dependency that it appended, before the
+        // transaction opens.
         let mut check = verification.checks_commits().then(|| ChainCheck {
             repo: self,
             sources: &sources,
@@ -1818,7 +1864,13 @@ impl Repo {
 
         // A commit-only pull follows no dependency. It also checks the format
         // of field 2 of each commit that it walks.
-        let mut deps = (!flags.contains(PullFlags::COMMIT_ONLY)).then(ChainDependencies::default);
+        // A pull that reads no static delta pairs no dependency with a target,
+        // so it keeps no entry of field 2 and no parent.
+        let mut deps = (!flags.contains(PullFlags::COMMIT_ONLY)).then(|| ChainDependencies {
+            keys_only: !reads_deltas,
+            ..ChainDependencies::default()
+        });
+        let mut appended: Vec<Checksum> = Vec::new();
         // The commit chains, in the order of the refs, each commit once.
         let mut commits: Vec<ChainCommit> = Vec::new();
         let mut seen: HashMap<Checksum, i32> = HashMap::new();
@@ -1841,7 +1893,7 @@ impl Repo {
             )
             .await?;
         }
-        if let Some(mut deps) = deps {
+        if let Some(deps) = deps.as_mut() {
             // The run of the levels imports the intermediate commits of the
             // chains, so the walk reads none of them again.
             for commit in deltas.levels().iter().flatten() {
@@ -1849,7 +1901,7 @@ impl Repo {
                     deps.record(*commit, entries);
                 }
             }
-            collect_dependencies(
+            appended = collect_dependencies(
                 self,
                 &sources,
                 deps,
@@ -1867,6 +1919,39 @@ impl Repo {
         {
             return Err(err);
         }
+        // The search keeps the source commit and the digest of each delta of a
+        // dependency alone. The pull reads each superblock again just before
+        // it applies the delta. The maps of the walk drop here, before the
+        // transaction opens.
+        let mut dependency_deltas = match deps.take() {
+            Some(deps) if reads_deltas && !appended.is_empty() => {
+                let named = dependency::pair_targets(
+                    &targets,
+                    opts.depth,
+                    &deps.parents,
+                    &deps.naming,
+                    appended,
+                );
+                drop(deps);
+                let place = RefPlace::of_remote(opts.remote.as_deref());
+                let (lookups, known) = dependency::lookups(self, &targets, place, named).await?;
+                delta::discover_dependencies(
+                    self,
+                    &delta::DeltaSource::Local(src),
+                    advert.as_ref(),
+                    edges.as_ref(),
+                    lookups,
+                    &known,
+                    &opts,
+                    &verification,
+                    &counters,
+                )
+                .await?
+            }
+            _ => delta::DependencyDeltas::default(),
+        };
+        drop(advert);
+        drop(edges);
 
         let mut txn = self.transaction().await?;
         apply_durability(&mut txn, &opts);
@@ -2017,6 +2102,27 @@ impl Repo {
                         .await?;
                 }
                 txn.write_metadata(ObjectType::Commit, Some(tip), &job.commit_bytes)
+                    .await?;
+            }
+            // The deltas of the dependencies follow, in the order of the walk,
+            // as the deltas of the targets. The pull parses the job of one
+            // dependency at a time, and drops it after its parts.
+            for chain_commit in &commits {
+                if dependency_deltas.is_empty() {
+                    break;
+                }
+                let dependency = &chain_commit.checksum;
+                let Some(job) = dependency_deltas
+                    .take_job(self, &delta_source, dependency)
+                    .await?
+                else {
+                    continue;
+                };
+                for index in 0..job.parts() {
+                    delta::apply_job_part(&txn, &delta_source, &job, index, checks, &counters)
+                        .await?;
+                }
+                txn.write_metadata(ObjectType::Commit, Some(dependency), &job.commit_bytes)
                     .await?;
             }
             // The pull is done with the deltas, the inline part bodies of the
@@ -2571,7 +2677,9 @@ async fn resolve_targets(
 ///
 /// The walk takes the format check of field 2 of each commit when it appends
 /// the commit, also if `deps` is `None`. If `deps` is present, the walk
-/// records the dependencies of each commit that it appends there.
+/// records the dependencies of each commit that it appends there. Unless
+/// `deps` keeps the commits alone, the walk also records the parent of each
+/// commit that it gets to.
 ///
 /// # Errors
 ///
@@ -2599,6 +2707,11 @@ async fn collect_chain(
         },
     )) = current
     {
+        if let Some(deps) = deps.as_deref_mut()
+            && !deps.keys_only
+        {
+            deps.parents.insert(checksum, commit.parent);
+        }
         if let Some(&prev) = seen.get(&checksum)
             && reaches_at_least(prev, remaining)
         {
@@ -2663,8 +2776,16 @@ struct ChainDependencies {
     named: Vec<(Checksum, Checksum, String)>,
     /// The dependencies in `named`.
     known: HashSet<Checksum>,
-    /// The commits whose field 2 is not empty.
-    with_dependencies: HashSet<Checksum>,
+    /// The entries of field 2 of each commit whose field 2 is not empty, in
+    /// the stored order. Under `keys_only`, each commit has no entry here.
+    naming: HashMap<Checksum, Vec<(String, Checksum)>>,
+    /// The parent that each commit of the chains named. Under `keys_only`,
+    /// the map stays empty.
+    parents: HashMap<Checksum, Option<Checksum>>,
+    /// `true` if `naming` keeps the commits alone, for the checks, and
+    /// `parents` stays empty. A pull that reads no static delta pairs no
+    /// dependency with a target, so it reads neither.
+    keys_only: bool,
 }
 
 impl ChainDependencies {
@@ -2676,17 +2797,23 @@ impl ChainDependencies {
         if dependencies.is_empty() {
             return;
         }
-        self.with_dependencies.insert(commit);
-        for (name, dependency) in dependencies {
-            if self.known.insert(dependency) {
-                self.named.push((dependency, commit, name));
+        for (name, dependency) in &dependencies {
+            if self.known.insert(*dependency) {
+                self.named.push((*dependency, commit, name.clone()));
             }
         }
+        let entries = if self.keys_only {
+            Vec::new()
+        } else {
+            dependencies
+        };
+        self.naming.insert(commit, entries);
     }
 }
 
 /// Appends each dependency of `deps` that the walk did not collect to `out`,
-/// at depth 0, in the order of `deps`.
+/// at depth 0, in the order of `deps`. Returns each appended dependency, in
+/// the same order.
 ///
 /// A dependency that `seen` holds, or that `made` holds, needs no read: the
 /// walk collected it, or a chain of static deltas makes it. `made` holds the
@@ -2708,16 +2835,18 @@ impl ChainDependencies {
 async fn collect_dependencies(
     repo: &Repo,
     sources: &[&Repo],
-    deps: ChainDependencies,
+    deps: &ChainDependencies,
     made: &HashSet<Checksum>,
     out: &mut Vec<ChainCommit>,
     seen: &mut HashMap<Checksum, i32>,
     mut check: Option<&mut ChainCheck<'_>>,
-) -> Result<()> {
-    for (dependency, naming, name) in deps.named {
+) -> Result<Vec<Checksum>> {
+    let mut appended = Vec::new();
+    for (dependency, naming, name) in &deps.named {
+        let (dependency, naming) = (*dependency, *naming);
         if seen.contains_key(&dependency) || made.contains(&dependency) {
-            if deps.with_dependencies.contains(&dependency) {
-                return Err(related::nested_dependency(naming, &name, &dependency));
+            if deps.naming.contains_key(&dependency) {
+                return Err(related::nested_dependency(naming, name, &dependency));
             }
             continue;
         }
@@ -2733,9 +2862,10 @@ async fn collect_dependencies(
             });
         };
         if !dependencies?.is_empty() {
-            return Err(related::nested_dependency(naming, &name, &dependency));
+            return Err(related::nested_dependency(naming, name, &dependency));
         }
         seen.insert(dependency, 0);
+        appended.push(dependency);
         out.push(ChainCommit {
             checksum: dependency,
             root_dirtree: commit.root_dirtree,
@@ -2747,7 +2877,7 @@ async fn collect_dependencies(
             check.check(&dependency, &bytes).await;
         }
     }
-    Ok(())
+    Ok(appended)
 }
 
 /// The signature verification that a local pull runs on each commit of the
@@ -3919,6 +4049,9 @@ mod tests {
             ]
         );
         assert_eq!(deps.known, HashSet::from([csum(3), csum(4)]));
-        assert_eq!(deps.with_dependencies, HashSet::from([csum(1), csum(2)]));
+        let mut naming: Vec<&Checksum> = deps.naming.keys().collect();
+        naming.sort_unstable();
+        assert_eq!(naming, [&csum(1), &csum(2)]);
+        assert_eq!(deps.naming[&csum(2)][1], ("lib/c".to_owned(), csum(4)));
     }
 }

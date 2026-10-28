@@ -20,7 +20,11 @@
 //! [`discover_dependencies`] finds one delta for each dependency of a pull,
 //! after the pull read the commits that name the dependencies. The sibling
 //! module `dependency` gives the source commit of each search. With a list,
-//! the search takes one entry of the list, and plans no chain.
+//! the search takes one entry of the list, and plans no chain. From a remote,
+//! the searches keep each verified superblock and the commit that it carries
+//! in a record file, as the discovery of a chain below does. The pull parses
+//! the superblock of a dependency again just before its parts, as
+//! [`DependencyDeltas`] states.
 //!
 //! The discovery of a chain keeps one record for each step of the plan, and
 //! drops each parsed superblock after its checks. So the heap holds one
@@ -76,7 +80,7 @@ use std::collections::{HashMap, HashSet};
 use std::ops::Range;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::os::unix::fs::FileExt;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, PoisonError};
 
 use ostrya_core::{Checksum, Commit, ObjectName, ObjectType, RepoMode, Value};
 use ostrya_rt::FileReader;
@@ -123,6 +127,12 @@ pub(crate) const PART_CAP: usize = 2;
 /// [`MAX_METADATA_SIZE`] bytes of `.commitmeta`, 256 MiB in total. So the file
 /// holds four steps of the maximum size. The limit applies to the length of
 /// the file, the bytes of the records that discovery drops included.
+///
+/// The search for the deltas of the dependencies has a record file of its
+/// own, with the same limit. It keeps the superblocks and the commits that
+/// they carry. A superblock carries its commit, so the commit is smaller than
+/// the superblock, and the file holds four superblocks of the maximum size
+/// with their commits.
 const MAX_RECORD_FILE: u64 = 8 * MAX_METADATA_SIZE;
 
 /// A static delta that a pull applies for one commit.
@@ -136,6 +146,8 @@ const MAX_RECORD_FILE: u64 = 8 * MAX_METADATA_SIZE;
 /// alone. [`DeltaPlan::target_jobs`] builds the jobs of the target commits
 /// after the run of the last level. A local pull builds the job of one step
 /// at a time with [`DeltaPlan::parse_record`], and drops it after its parts.
+/// The run of the dependencies builds the job of a dependency just before its
+/// parts, and drops it after its last part, as [`DependencyDeltas`] states.
 /// A job holds only what the application of the parts reads.
 ///
 /// The parse of a superblock reads the raw superblock bytes, the signature
@@ -198,11 +210,7 @@ impl DeltaJob {
     /// image: the pull requests the image of the commit by its own rules,
     /// after the other objects of the pull.
     pub(crate) fn fallbacks(&self) -> Vec<ObjectName> {
-        self.fallbacks
-            .iter()
-            .filter(|fallback| fallback.objtype != ObjectType::ComposefsImage)
-            .map(|fallback| ObjectName::new(fallback.checksum, fallback.objtype))
-            .collect()
+        loose_fallbacks(&self.fallbacks)
     }
 
     /// Returns the number of parts of the delta, inline parts and part files.
@@ -223,6 +231,16 @@ impl DeltaJob {
                 (parts + 1, bytes.saturating_add(entry.size))
             })
     }
+}
+
+/// Returns the objects of `fallbacks` that the pull fetches loose, as
+/// [`DeltaJob::fallbacks`] states.
+fn loose_fallbacks(fallbacks: &[DeltaFallback]) -> Vec<ObjectName> {
+    fallbacks
+        .iter()
+        .filter(|fallback| fallback.objtype != ObjectType::ComposefsImage)
+        .map(|fallback| ObjectName::new(fallback.checksum, fallback.objtype))
+        .collect()
 }
 
 /// The deltas that discovery found for one pull.
@@ -512,6 +530,10 @@ enum LocalRead {
 /// record that discovery drops stay in the file. The file goes away when the
 /// pull drops it.
 ///
+/// The search for the deltas of the dependencies has a file of its own,
+/// which its concurrent searches share. It keeps the superblocks and the
+/// commits that they carry, as [`discover_dependencies`] states.
+///
 /// The length of the file has a limit. Discovery checks the limit before each
 /// write, so the file never passes it. A write that would pass the limit
 /// fails the pull with [`Error::Pull`].
@@ -524,17 +546,41 @@ struct RecordStore {
     len: u64,
     /// The limit of the length of the file.
     limit: u64,
+    /// What the file keeps. The error of the limit names it.
+    records: Records,
+}
+
+/// What a [`RecordStore`] keeps.
+#[derive(Clone, Copy)]
+enum Records {
+    /// The superblocks and the `.commitmeta` files of the discovery of a
+    /// chain.
+    Chain,
+    /// The superblocks and the commits of the search for the deltas of the
+    /// dependencies.
+    Dependencies,
 }
 
 impl RecordStore {
-    /// Returns a record store in `tmp/` of `repo`, with no file yet, and with
-    /// the limit [`MAX_RECORD_FILE`].
+    /// Returns a record store in `tmp/` of `repo` for the discovery of a
+    /// chain, with no file yet, and with the limit [`MAX_RECORD_FILE`].
     fn new(repo: &Repo) -> RecordStore {
         RecordStore {
             repo: repo.clone(),
             file: None,
             len: 0,
             limit: MAX_RECORD_FILE,
+            records: Records::Chain,
+        }
+    }
+
+    /// Returns a record store in `tmp/` of `repo` for the search for the
+    /// deltas of the dependencies, with no file yet, and with the limit
+    /// [`MAX_RECORD_FILE`].
+    fn for_dependencies(repo: &Repo) -> RecordStore {
+        RecordStore {
+            records: Records::Dependencies,
+            ..RecordStore::new(repo)
         }
     }
 
@@ -548,12 +594,20 @@ impl RecordStore {
     fn check_room(&self, len: u64, what: impl FnOnce() -> String) -> Result<()> {
         match self.len.checked_add(len) {
             Some(end) if end <= self.limit => Ok(()),
-            _ => Err(Error::Pull(format!(
-                "static delta list: {} passes the limit of {} bytes for the superblocks \
-                 and the detached metadata that discovery keeps",
-                what(),
-                self.limit
-            ))),
+            _ => Err(Error::Pull(match self.records {
+                Records::Chain => format!(
+                    "static delta list: {} passes the limit of {} bytes for the superblocks \
+                     and the detached metadata that discovery keeps",
+                    what(),
+                    self.limit
+                ),
+                Records::Dependencies => format!(
+                    "static deltas of the dependencies: {} passes the limit of {} bytes for \
+                     the superblocks and the commits that the search keeps",
+                    what(),
+                    self.limit
+                ),
+            })),
         }
     }
 
@@ -567,6 +621,34 @@ impl RecordStore {
         let file = Arc::new(std::fs::File::from(fd));
         self.file = Some(Arc::clone(&file));
         Ok(file)
+    }
+
+    /// Returns the file, and opens it on the calling thread if it is not
+    /// open. The caller is on the blocking pool.
+    fn file_blocking(&mut self) -> Result<Arc<std::fs::File>> {
+        if let Some(file) = &self.file {
+            return Ok(Arc::clone(file));
+        }
+        let tmp = crate::staging::open_tmp_dir(self.repo.repo_fd(), self.repo.mode())?;
+        let file = Arc::new(std::fs::File::from(open_rw_temp(tmp.as_fd())?));
+        self.file = Some(Arc::clone(&file));
+        Ok(file)
+    }
+
+    /// Reserves `len` bytes at the end of the file, and returns the start of
+    /// the reserved range. The caller writes the bytes. The call opens no
+    /// file.
+    ///
+    /// `what` names the bytes in the error.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Pull`] if the bytes would pass the limit of the file.
+    fn reserve(&mut self, len: u64, what: impl FnOnce() -> String) -> Result<u64> {
+        self.check_room(len, what)?;
+        let start = self.len;
+        self.len += len;
+        Ok(start)
     }
 
     /// Appends `bytes` on the blocking pool, and returns their range.
@@ -674,6 +756,24 @@ impl FetchedDelta {
     /// parsed superblock.
     fn into_commit_bytes(self) -> Vec<u8> {
         self.commit_bytes
+    }
+
+    /// Returns the head of a delta from `from` whose superblock and commit
+    /// the record file keeps at `superblock` and `commit`, and drops the
+    /// parsed superblock.
+    fn into_head(
+        self,
+        from: Option<Checksum>,
+        superblock: Range<u64>,
+        commit: Range<u64>,
+    ) -> DependencyHead {
+        DependencyHead {
+            from,
+            superblock,
+            parts: self.meta_entries.len(),
+            fallbacks: loose_fallbacks(&self.fallbacks),
+            commit: Some(commit),
+        }
     }
 
     /// Returns the number of part files and the sum of their declared sizes.
@@ -854,6 +954,7 @@ pub(crate) async fn discover(
             opts,
             verification,
             progress,
+            None,
         )
         .await?
         {
@@ -888,35 +989,240 @@ pub(crate) struct DependencyLookup {
 
 /// The deltas that [`discover_dependencies`] found, keyed by dependency.
 ///
-/// A delta from a remote is a job, which the run of the dependencies applies.
+/// A delta from a remote keeps a [`DependencyHead`] on the heap, and its
+/// verified superblock and the commit that it carries in the record file of
+/// the search. The step of the commit reads the commit from the record file,
+/// and takes the fallbacks of the head. The head then keeps the number of
+/// parts and the range of the superblock alone. Just before the parts of the
+/// delta, [`load_job`] parses the superblock again from the record file, and
+/// the job lives until [`release_job`] after the last part. The run loads at
+/// most [`PART_CAP`] jobs at a time, so the heap holds at most that number of
+/// jobs, whatever the number of dependencies. A head whose delta has no part,
+/// or whose commit needs no delta, goes in the step of the commit.
+///
 /// A delta from a local source keeps no bytes: [`take_job`] reads its
 /// superblock from the source again, checks it against its digest, and parses
 /// it, just before the pull applies it.
 ///
+/// [`load_job`]: DependencyDeltas::load_job
+/// [`release_job`]: DependencyDeltas::release_job
 /// [`take_job`]: DependencyDeltas::take_job
 #[derive(Default)]
 pub(crate) struct DependencyDeltas {
-    /// The job of each dependency, from a remote.
-    jobs: HashMap<Checksum, DeltaJob>,
+    /// The head of the delta of each dependency, from a remote. The steps of
+    /// the run share the map.
+    heads: Mutex<HashMap<Checksum, DependencyHead>>,
+    /// The file of the verified superblocks and commits from a remote.
+    store: Option<RecordStore>,
+    /// The jobs that the run loaded and did not release yet.
+    live: Mutex<HashMap<Checksum, Arc<DeltaJob>>>,
     /// The source commit and the superblock digest of the delta of each
     /// dependency, from a local source.
     local: HashMap<Checksum, (Option<Checksum>, Option<Checksum>)>,
 }
 
+/// What [`DependencyDeltas`] keeps on the heap of the delta of one dependency
+/// from a remote, until the run releases its job.
+struct DependencyHead {
+    /// The source commit of the delta, or `None` for a from-scratch delta.
+    from: Option<Checksum>,
+    /// The range of the verified superblock in the record file.
+    superblock: Range<u64>,
+    /// The number of parts of the delta, inline parts and part files.
+    parts: usize,
+    /// The range in the record file of the normal-form bytes of the
+    /// dependency, which the superblock carries. `None` after the step of the
+    /// commit.
+    commit: Option<Range<u64>>,
+    /// The objects that the delta names and does not carry, as
+    /// [`DeltaJob::fallbacks`] gives them. Empty after the step of the commit.
+    fallbacks: Vec<ObjectName>,
+}
+
 impl DependencyDeltas {
     /// Returns `true` if no dependency has a delta.
     pub(crate) fn is_empty(&self) -> bool {
-        self.jobs.is_empty() && self.local.is_empty()
+        self.heads
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .is_empty()
+            && self.local.is_empty()
     }
 
-    /// Returns the jobs of the deltas from a remote.
-    pub(crate) fn into_jobs(self) -> HashMap<Checksum, DeltaJob> {
-        self.jobs
+    /// Reads the commit bytes of the delta of `dependency` from a remote
+    /// from the record file, on the blocking pool. Returns `None` if the
+    /// dependency has no delta or the step of the commit took the delta.
+    ///
+    /// Discovery wrote the bytes after the parse of the superblock verified
+    /// that they hash to `dependency`.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] if the record file cannot be read.
+    pub(crate) async fn commit_bytes(&self, dependency: &Checksum) -> Result<Option<Vec<u8>>> {
+        let range = self
+            .heads
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(dependency)
+            .and_then(|head| head.commit.clone());
+        match (range, &self.store) {
+            (Some(range), Some(store)) => store.read(range).await.map(Some),
+            _ => Ok(None),
+        }
     }
 
-    /// Takes the job of the delta of `dependency`, or returns `None` if it
-    /// has no delta. For a delta from a local source, the call reads the
-    /// superblock from `source` again and checks it against its digest.
+    /// Returns the number of parts and the fallbacks of the delta of
+    /// `dependency` from a remote, or `None` if it has no delta.
+    ///
+    /// The step of the commit calls it one time. The head then drops the
+    /// range of the commit and its fallbacks, and keeps the number of parts
+    /// and the range of the superblock alone. A delta with no part has no
+    /// load step, so its head goes here.
+    pub(crate) fn take_commit_delta(
+        &self,
+        dependency: &Checksum,
+    ) -> Option<(usize, Vec<ObjectName>)> {
+        let mut heads = self.heads.lock().unwrap_or_else(PoisonError::into_inner);
+        let head = heads.get_mut(dependency)?;
+        let taken = (head.parts, std::mem::take(&mut head.fallbacks));
+        head.commit = None;
+        if head.parts == 0 {
+            heads.remove(dependency);
+        }
+        Some(taken)
+    }
+
+    /// Parses the job of the delta of `dependency` from the record file, and
+    /// keeps it until [`release_job`](DependencyDeltas::release_job).
+    ///
+    /// These are the bytes that discovery verified, so the parse checks no
+    /// digest, no signature, and no inline part again. A delta that no
+    /// summary advertised has no digest, and the bytes are still the bytes
+    /// that discovery checked. The call sends no request.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Io`] if the record file cannot be read.
+    /// - [`Error::InvalidFormat`] if discovery kept no superblock of
+    ///   `dependency`.
+    pub(crate) async fn load_job(&self, repo: &Repo, dependency: &Checksum) -> Result<()> {
+        let kept = self
+            .heads
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(dependency)
+            .map(|head| (head.from, head.superblock.clone()));
+        let (Some((from, range)), Some(store)) = (kept, &self.store) else {
+            return Err(Error::InvalidFormat(format!(
+                "the static delta to {dependency}: discovery kept no superblock"
+            )));
+        };
+        let fetched = parse_kept(store, range, from, *dependency).await?;
+        let mut job = fetched.into_job(repo).await?;
+        // The step of the commit read the commit bytes and the fallbacks. The
+        // parts read neither, so the job keeps neither.
+        job.commit_bytes = Arc::default();
+        job.fallbacks = Vec::new();
+        self.live
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(*dependency, Arc::new(job));
+        Ok(())
+    }
+
+    /// Returns the job of the delta of `dependency` that
+    /// [`load_job`](DependencyDeltas::load_job) parsed, or `None` if the job
+    /// is not loaded.
+    pub(crate) fn live_job(&self, dependency: &Checksum) -> Option<Arc<DeltaJob>> {
+        self.live
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(dependency)
+            .cloned()
+    }
+
+    /// Drops the job and the head of the delta of `dependency`: after its
+    /// last part, or in the step of a commit that needs no delta.
+    pub(crate) fn release_job(&self, dependency: &Checksum) {
+        self.live
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(dependency);
+        self.heads
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(dependency);
+    }
+
+    /// Returns the number of loaded jobs.
+    #[cfg(test)]
+    pub(crate) fn live_jobs(&self) -> usize {
+        self.live
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .len()
+    }
+
+    /// Returns `true` if the head of the delta of `dependency` still keeps
+    /// the range of its commit or a fallback.
+    #[cfg(test)]
+    pub(crate) fn holds_commit_data(&self, dependency: &Checksum) -> bool {
+        self.heads
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(dependency)
+            .is_some_and(|head| head.commit.is_some() || !head.fallbacks.is_empty())
+    }
+
+    /// Returns `true` if the delta of `dependency` from a remote has a head.
+    #[cfg(test)]
+    pub(crate) fn has_head(&self, dependency: &Checksum) -> bool {
+        self.heads
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .contains_key(dependency)
+    }
+
+    /// Returns the deltas `deltas` of the local source `src`, kept as the
+    /// search of [`discover_dependencies`] keeps the deltas from a remote: in
+    /// one shared record file in `tmp/` of `repo`, with a head of each.
+    #[cfg(test)]
+    pub(crate) async fn kept_from(
+        repo: &Repo,
+        src: &Repo,
+        deltas: &[(Option<Checksum>, Checksum)],
+    ) -> DependencyDeltas {
+        let shared = Arc::new(Mutex::new(RecordStore::for_dependencies(repo)));
+        let verification = Verification::from_trust(crate::verify::PullTrust::unverified());
+        let progress = PullCounters::new(None);
+        let mut found = DependencyDeltas::default();
+        for (from, to) in deltas {
+            let (fetched, kept) = fetch_job(
+                &DeltaSource::Local(src),
+                *from,
+                *to,
+                None,
+                &verification,
+                &progress,
+                Some(Keep::Shared(&shared)),
+            )
+            .await
+            .unwrap()
+            .unwrap();
+            let kept = kept.unwrap();
+            found.heads.get_mut().unwrap().insert(
+                *to,
+                fetched.into_head(*from, kept.superblock, kept.commit.unwrap()),
+            );
+        }
+        found.store = Arc::into_inner(shared).map(|store| store.into_inner().unwrap());
+        found
+    }
+
+    /// Takes the job of the delta of `dependency` from a local source, or
+    /// returns `None` if it has no such delta. The call reads the superblock
+    /// from `source` again and checks it against its digest.
     ///
     /// # Errors
     ///
@@ -930,9 +1236,6 @@ impl DependencyDeltas {
         source: &DeltaSource<'_>,
         dependency: &Checksum,
     ) -> Result<Option<DeltaJob>> {
-        if let Some(job) = self.jobs.remove(dependency) {
-            return Ok(Some(job));
-        }
         let Some((from, digest)) = self.local.remove(dependency) else {
             return Ok(None);
         };
@@ -960,8 +1263,22 @@ impl DependencyDeltas {
 /// For a remote, the searches run together, up to the number of requests
 /// that the session admits. For a local source, they run one at a time. The
 /// call takes the results in the order of `lookups`, so the first error in
-/// that order is the error of the call. A delta from a local source keeps no
-/// bytes, as [`DependencyDeltas`] states.
+/// that order is the error of the call.
+///
+/// For a remote, the searches share one record file, which opens at the
+/// first write. Each search writes the superblock that it fetched to the file
+/// after the digest check, and the commit that the superblock carries after
+/// the parse, as [`fetch_job`] states. The file has the limit
+/// [`MAX_RECORD_FILE`]. A failed check fails the pull, so the file holds
+/// verified bytes. The result keeps a [`DependencyHead`] of each delta, and
+/// the parsed superblock drops. A search holds the superblock that it fetched
+/// and the parse of it until its checks end, so the heap holds at most one
+/// superblock and its parse for each search in flight. A delta from a local
+/// source keeps no bytes, as [`DependencyDeltas`] states.
+///
+/// After a search fails, the call starts no further search. The searches in
+/// flight end, so the first error in the order of `lookups` is still the
+/// error of the call.
 ///
 /// `known` holds the completeness of commits that the caller checked. The
 /// searches check no such commit again. The caller passes no lookup for a
@@ -971,10 +1288,13 @@ impl DependencyDeltas {
 ///
 /// # Errors
 ///
-/// The errors of [`discover_one`]. Under
-/// [`require_static_deltas`](PullOptions::require_static_deltas), a
-/// dependency with no delta gives [`Error::Pull`] with the subject of its
-/// lookup.
+/// - The errors of [`discover_one`]. Under
+///   [`require_static_deltas`](PullOptions::require_static_deltas), a
+///   dependency with no delta gives [`Error::Pull`] with the subject of its
+///   lookup.
+/// - [`Error::Pull`] if the superblocks and the commits from a remote would
+///   pass the limit of the record file. The pull then does not fetch loose.
+/// - [`Error::Io`] if the record file cannot be opened or written.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn discover_dependencies(
     repo: &Repo,
@@ -991,14 +1311,25 @@ pub(crate) async fn discover_dependencies(
         DeltaSource::Remote(remote) => remote.max_outstanding(),
         DeltaSource::Local(_) => 1,
     };
+    // The searches share the record file. Each search reserves its ranges
+    // under the lock, and writes them on the blocking pool. The file opens at
+    // the first write.
+    let shared = match source {
+        DeltaSource::Remote(_) => Some(Arc::new(Mutex::new(RecordStore::for_dependencies(repo)))),
+        DeltaSource::Local(_) => None,
+    };
+    let store = shared.as_ref();
     let mut found = DependencyDeltas::default();
     let mut ready: Vec<Option<Result<Option<Kept>>>> = Vec::new();
     ready.resize_with(lookups.len(), || None);
     let mut next = 0;
     let mut pending = lookups.into_iter().enumerate();
     let mut slots = Slots::new(limit);
+    // A failed search fails the call, so the call starts no search after it.
+    let mut failed = false;
     loop {
-        while slots.has_room()
+        while !failed
+            && slots.has_room()
             && let Some((at, lookup)) = pending.next()
         {
             slots.push(async move {
@@ -1016,15 +1347,19 @@ pub(crate) async fn discover_dependencies(
                         opts,
                         verification,
                         progress,
+                        store,
                     )
                     .await?
                     else {
                         return Ok(None);
                     };
                     let parts = delta.fetched.parts();
-                    let delta = match source {
-                        DeltaSource::Remote(_) => Found::Job(delta.fetched.into_job(repo).await?),
-                        DeltaSource::Local(_) => Found::Local(delta.from, delta.digest),
+                    let delta = match delta.kept {
+                        Some(KeptRanges {
+                            superblock,
+                            commit: Some(commit),
+                        }) => Found::Head(delta.fetched.into_head(delta.from, superblock, commit)),
+                        _ => Found::Local(delta.from, delta.digest),
                     };
                     Ok(Some(Kept {
                         dependency: lookup.checksum,
@@ -1036,8 +1371,15 @@ pub(crate) async fn discover_dependencies(
             });
         }
         let Some((at, result)) = slots.next_ready().await else {
+            drop(slots);
+            // Each search ended, and with it each blocking call that held the
+            // store.
+            found.store = shared
+                .and_then(Arc::into_inner)
+                .map(|store| store.into_inner().unwrap_or_else(PoisonError::into_inner));
             return Ok(found);
         };
+        failed |= result.is_err();
         ready[at] = Some(result);
         while let Some(result) = ready.get_mut(next).and_then(Option::take) {
             next += 1;
@@ -1046,8 +1388,12 @@ pub(crate) async fn discover_dependencies(
             };
             progress.parts_planned(kept.parts.0, kept.parts.1);
             match kept.delta {
-                Found::Job(job) => {
-                    found.jobs.insert(kept.dependency, job);
+                Found::Head(head) => {
+                    found
+                        .heads
+                        .get_mut()
+                        .unwrap_or_else(PoisonError::into_inner)
+                        .insert(kept.dependency, head);
                 }
                 Found::Local(from, digest) => {
                     found.local.insert(kept.dependency, (from, digest));
@@ -1071,8 +1417,8 @@ struct Kept {
 
 /// What [`DependencyDeltas`] keeps of the delta of one dependency.
 enum Found {
-    /// The job, from a remote.
-    Job(DeltaJob),
+    /// The head, from a remote.
+    Head(DependencyHead),
     /// The source commit and the superblock digest, from a local source.
     Local(Option<Checksum>, Option<Checksum>),
 }
@@ -1449,7 +1795,7 @@ async fn fetch_step(
         Some(delta.superblock),
         ctx.verification,
         ctx.progress,
-        store,
+        store.map(Keep::Own),
     );
     let (job, detached) = match ctx.source {
         DeltaSource::Remote(remote) if pair && matches!(remote.transfer(), Transfer::Stream(_)) => {
@@ -1472,7 +1818,7 @@ async fn fetch_step(
     let detached = detached.transpose()?;
     Ok(job.map(|(fetched, kept)| FetchedStep {
         fetched,
-        kept,
+        kept: kept.map(|kept| kept.superblock),
         detached,
     }))
 }
@@ -1673,18 +2019,30 @@ async fn read_record(
         to,
         superblock: digest,
     } = record.delta;
-    let bytes = match (&record.superblock, store, source) {
-        (Some(range), Some(store), _) => store.read(range.clone()).await?,
+    match (&record.superblock, store, source) {
+        (Some(range), Some(store), _) => parse_kept(store, range.clone(), from, to).await,
         (None, _, DeltaSource::Local(src)) => {
-            return read_local_superblock(src, from, to, Some(digest)).await;
+            read_local_superblock(src, from, to, Some(digest)).await
         }
-        _ => {
-            return Err(Error::InvalidFormat(format!(
-                "static delta {}: discovery kept no superblock",
-                delta_name(from.as_ref(), &to)
-            )));
-        }
-    };
+        _ => Err(Error::InvalidFormat(format!(
+            "static delta {}: discovery kept no superblock",
+            delta_name(from.as_ref(), &to)
+        ))),
+    }
+}
+
+/// Reads the superblock of the delta from `from` to `to` at `range` of
+/// `store`, and parses it on the blocking pool.
+///
+/// These are the bytes that discovery verified, so the parse checks no
+/// digest, no signature, and no inline part again.
+async fn parse_kept(
+    store: &RecordStore,
+    range: Range<u64>,
+    from: Option<Checksum>,
+    to: Checksum,
+) -> Result<FetchedDelta> {
+    let bytes = store.read(range).await?;
     let (parsed, _) =
         ostrya_rt::unblock(move || parse_superblock(bytes, None, None, from, to, false)).await?;
     parsed.verify(None).await
@@ -2126,6 +2484,9 @@ enum Advertisement<'a> {
 ///
 /// `known` holds the completeness of commits that the caller checked. Step 2
 /// checks no such commit again.
+///
+/// If `keep` is set, the search writes the superblock to that record file, as
+/// [`fetch_job`] states, and the result holds its range.
 #[allow(clippy::too_many_arguments)]
 async fn discover_one(
     repo: &Repo,
@@ -2140,6 +2501,7 @@ async fn discover_one(
     opts: &PullOptions,
     verification: &Verification,
     progress: &PullCounters,
+    keep: Option<&Arc<Mutex<RecordStore>>>,
 ) -> Result<Option<FoundDelta>> {
     let advertised = match (edges, advert) {
         (Some(edges), _) => Advertisement::List(edges),
@@ -2179,8 +2541,9 @@ async fn discover_one(
     // If the remote does not hold an advertised superblock, the advertisement
     // is stale. The pull then fetches the objects loose. If the pull requires
     // static deltas, it fails.
-    let Some((fetched, _)) =
-        fetch_job(source, from, to, digest, verification, progress, None).await?
+    let keep = keep.map(Keep::Shared);
+    let Some((fetched, kept)) =
+        fetch_job(source, from, to, digest, verification, progress, keep).await?
     else {
         return none_found();
     };
@@ -2188,6 +2551,7 @@ async fn discover_one(
         from,
         digest,
         fetched,
+        kept,
     }))
 }
 
@@ -2200,6 +2564,28 @@ struct FoundDelta {
     digest: Option<Checksum>,
     /// The parsed superblock.
     fetched: FetchedDelta,
+    /// The ranges of the delta in the record file, if the search kept it.
+    kept: Option<KeptRanges>,
+}
+
+/// The record file where [`fetch_job`] keeps a raw superblock.
+enum Keep<'a> {
+    /// The record file of the discovery of a chain, which fetches one
+    /// superblock at a time.
+    Own(&'a mut RecordStore),
+    /// The record file that the concurrent searches of
+    /// [`discover_dependencies`] share. The file also keeps the commit that
+    /// each superblock carries.
+    Shared(&'a Arc<Mutex<RecordStore>>),
+}
+
+/// The ranges of one delta in the record file of [`fetch_job`].
+struct KeptRanges {
+    /// The range of the raw superblock.
+    superblock: Range<u64>,
+    /// The range of the normal-form bytes of the commit that the superblock
+    /// carries, or `None` if the record file keeps no commit.
+    commit: Option<Range<u64>>,
 }
 
 /// Fetches the superblock of the delta from `from` to `to`, and verifies it.
@@ -2214,18 +2600,22 @@ struct FoundDelta {
 /// If `keep` is set, the function appends the raw bytes to that record file
 /// after the digest check, and returns their range with the parsed delta.
 /// Before the digest check, it checks that the bytes keep the record file in
-/// its limit. A superblock that would pass the limit fails before the
-/// function opens the file or writes to it.
+/// its limit, and reserves their range. A superblock that would pass the
+/// limit fails before the function opens the file or writes to it. A record
+/// file that concurrent searches share gives each search its own range. To
+/// such a file, the function also appends the normal-form bytes of the
+/// commit that the superblock carries, after the parse verified that they
+/// hash to `to`, and returns their range too.
 ///
-/// The digest check, the write to the record file, the parse, and the check
+/// The digest check, the writes to the record file, the parse, and the check
 /// of the inline parts run in one call on the blocking pool. The check of the
 /// signatures comes after it, and a failed inline part fails after the check
 /// of the signatures.
 ///
 /// # Errors
 ///
-/// - [`Error::Pull`] if the superblock would pass the limit of the record
-///   file of `keep`.
+/// - [`Error::Pull`] if the superblock or the commit would pass the limit of
+///   the record file of `keep`.
 /// - [`Error::ChecksumMismatch`] if the superblock does not have `digest`.
 /// - [`Error::Pull`] if the superblock produces another commit, or from
 ///   another commit.
@@ -2239,8 +2629,8 @@ async fn fetch_job(
     digest: Option<Checksum>,
     verification: &Verification,
     progress: &PullCounters,
-    mut keep: Option<&mut RecordStore>,
-) -> Result<Option<(FetchedDelta, Option<Range<u64>>)>> {
+    keep: Option<Keep<'_>>,
+) -> Result<Option<(FetchedDelta, Option<KeptRanges>)>> {
     let path = format!(
         "{}/{SUPERBLOCK_FILE}",
         delta_relative_dir(from.as_ref(), &to)
@@ -2250,23 +2640,70 @@ async fn fetch_job(
     let Some(bytes) = fetched else {
         return Ok(None);
     };
-    let sink = match keep.as_mut() {
-        Some(store) => {
-            store.check_room(bytes.len() as u64, || {
+    let len = bytes.len() as u64;
+    let what = || {
+        format!(
+            "the superblock of static delta {}",
+            delta_name(from.as_ref(), &to)
+        )
+    };
+    // A shared record file opens at the first write, on the blocking pool
+    // and under the lock. No search holds the lock across an await.
+    let (own, shared) = match keep {
+        Some(Keep::Own(store)) => {
+            store.check_room(len, what)?;
+            let file = store.file().await?;
+            (Some((file, store.reserve(len, what)?)), None)
+        }
+        Some(Keep::Shared(store)) => {
+            let start = store
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .reserve(len, what)?;
+            (None, Some((Arc::clone(store), start)))
+        }
+        None => (None, None),
+    };
+    let (parsed, kept) = ostrya_rt::unblock(move || {
+        let Some((store, start)) = shared else {
+            let (parsed, kept) = parse_superblock(bytes, digest, own, from, to, true)?;
+            let kept = kept.map(|superblock| KeptRanges {
+                superblock,
+                commit: None,
+            });
+            return Ok((parsed, kept));
+        };
+        let file = store
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .file_blocking()?;
+        let (parsed, superblock) = parse_superblock(
+            bytes,
+            digest,
+            Some((Arc::clone(&file), start)),
+            from,
+            to,
+            true,
+        )?;
+        let commit = &parsed.delta.commit_bytes;
+        let len = commit.len() as u64;
+        let start = store
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .reserve(len, || {
                 format!(
-                    "the superblock of static delta {}",
+                    "the commit of static delta {}",
                     delta_name(from.as_ref(), &to)
                 )
             })?;
-            Some((store.file().await?, store.len))
-        }
-        None => None,
-    };
-    let (parsed, kept) =
-        ostrya_rt::unblock(move || parse_superblock(bytes, digest, sink, from, to, true)).await?;
-    if let (Some(store), Some(range)) = (keep, &kept) {
-        store.len = range.end;
-    }
+        file.write_all_at(commit, start)?;
+        let kept = superblock.map(|superblock| KeptRanges {
+            superblock,
+            commit: Some(start..start + len),
+        });
+        Ok::<_, Error>((parsed, kept))
+    })
+    .await?;
     let fetched = parsed.verify(Some(verification)).await?;
     Ok(Some((fetched, kept)))
 }
@@ -4121,7 +4558,7 @@ mod tests {
                 Some(delta.superblock),
                 &unverified(),
                 &PullCounters::new(None),
-                Some(&mut store),
+                Some(Keep::Own(&mut store)),
             )
             .await
             .unwrap()
@@ -4129,6 +4566,7 @@ mod tests {
             let len = std::fs::metadata(f.superblock(delta.from, delta.to))
                 .unwrap()
                 .len();
+            let kept = kept.map(|kept| kept.superblock);
             assert_eq!(kept, Some(7..7 + len));
             let record = StepRecord {
                 delta,
@@ -4198,7 +4636,7 @@ mod tests {
                 Some(delta.superblock),
                 &unverified(),
                 &counters,
-                Some(&mut store),
+                Some(Keep::Own(&mut store)),
             )
             .await
             .err()
@@ -4214,5 +4652,115 @@ mod tests {
             assert_eq!(store.len, 0);
             assert_eq!(counters.metadata(), 1);
         });
+    }
+
+    /// The record file of the search for the deltas of the dependencies
+    /// keeps the superblock and then the commit that it carries, and opens
+    /// at the first write. A superblock past the limit fails before the file
+    /// opens, and a commit past the limit fails after the superblock. Each
+    /// error names the limit and the dependency search.
+    #[test]
+    fn the_dependency_record_file_keeps_the_commit_and_stops_at_its_limit() {
+        ostrya_rt::block_on(async {
+            let f = Fixture::new().await;
+            let delta = f.delta(Some(f.a), f.b).await;
+            let len = std::fs::metadata(f.superblock(delta.from, delta.to))
+                .unwrap()
+                .len();
+            let source = &DeltaSource::Local(&f.src);
+            let fetch = |store: Arc<Mutex<RecordStore>>| async move {
+                let result = fetch_job(
+                    source,
+                    delta.from,
+                    delta.to,
+                    Some(delta.superblock),
+                    &unverified(),
+                    &PullCounters::new(None),
+                    Some(Keep::Shared(&store)),
+                )
+                .await;
+                let store = Arc::into_inner(store).unwrap().into_inner().unwrap();
+                (result, store)
+            };
+            let name = delta_name(delta.from.as_ref(), &delta.to);
+
+            let store = RecordStore::for_dependencies(&f.dst);
+            assert!(store.file.is_none());
+            let (result, store) = fetch(Arc::new(Mutex::new(store))).await;
+            let (fetched, kept) = result.unwrap().unwrap();
+            let kept = kept.unwrap();
+            assert_eq!(kept.superblock, 0..len);
+            let commit = kept.commit.unwrap();
+            assert_eq!(commit.start, len);
+            assert_eq!(store.len, commit.end);
+            let bytes = store.read(commit).await.unwrap();
+            assert_eq!(bytes, fetched.commit_bytes);
+            assert_eq!(Checksum::sha256(&bytes), f.b);
+
+            for (limit, what, opened) in [
+                (
+                    len - 1,
+                    format!("the superblock of static delta {name}"),
+                    false,
+                ),
+                (len, format!("the commit of static delta {name}"), true),
+            ] {
+                let store = RecordStore {
+                    limit,
+                    ..RecordStore::for_dependencies(&f.dst)
+                };
+                let (result, store) = fetch(Arc::new(Mutex::new(store))).await;
+                let Some(Error::Pull(message)) = result.err() else {
+                    panic!("no limit error at {limit}");
+                };
+                assert!(
+                    message.starts_with("static deltas of the dependencies: "),
+                    "{message}"
+                );
+                assert!(message.contains(&what), "{message}");
+                assert!(message.contains(&format!("{limit} bytes")), "{message}");
+                assert_eq!(store.file.is_some(), opened);
+                assert_eq!(store.len, if opened { len } else { 0 });
+            }
+        });
+    }
+
+    /// The step of the commit takes the fallbacks of the head of a
+    /// dependency delta, and drops the range of its commit. A head with
+    /// parts stays for the load step. A head with no part has no load step,
+    /// so it goes there.
+    #[test]
+    fn the_step_of_the_commit_takes_the_commit_data_of_a_head() {
+        let found = DependencyDeltas::default();
+        let fallback = ObjectName::new(checksum(9), ObjectType::File);
+        for (commit, parts) in [(checksum(1), 0), (checksum(2), 2)] {
+            found.heads.lock().unwrap().insert(
+                commit,
+                DependencyHead {
+                    from: None,
+                    superblock: 0..10,
+                    parts,
+                    commit: Some(10..20),
+                    fallbacks: vec![fallback],
+                },
+            );
+            assert!(found.holds_commit_data(&commit));
+        }
+
+        assert_eq!(
+            found.take_commit_delta(&checksum(1)),
+            Some((0, vec![fallback]))
+        );
+        assert!(!found.has_head(&checksum(1)));
+
+        assert_eq!(
+            found.take_commit_delta(&checksum(2)),
+            Some((2, vec![fallback]))
+        );
+        assert!(found.has_head(&checksum(2)));
+        assert!(!found.holds_commit_data(&checksum(2)));
+
+        found.release_job(&checksum(2));
+        assert!(found.is_empty());
     }
 }

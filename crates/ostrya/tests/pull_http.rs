@@ -10134,6 +10134,59 @@ fn a_pull_with_no_summary_requests_the_dependency_delta_by_name() {
     });
 }
 
+/// A remote with no summary states no digest of a superblock. The target
+/// names three dependencies, and the remote holds the from-scratch delta of
+/// each. The pull requests each superblock one time: it parses the job of a
+/// dependency from the bytes that discovery verified and kept, and sends no
+/// second request.
+#[test]
+fn each_dependency_superblock_is_fetched_once_with_no_summary() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-dependency-delta-kept");
+        let base = dir.path();
+        for sub in ["uki", "initrd", "modules", "main"] {
+            build_tree(&base.join(sub), format!("{sub}\n").as_bytes());
+        }
+        let remote = create_remote(base).await;
+        let mut deps = Vec::new();
+        for sub in ["uki", "initrd", "modules"] {
+            let ref_name = format!("dep/{sub}");
+            deps.push(commit_tree(&remote, base, sub, &ref_name, None, FIXED_TS).await);
+        }
+        let entries = [
+            ("boot/uki", deps[0]),
+            ("boot/initrd", deps[1]),
+            ("lib/modules", deps[2]),
+        ];
+        let tip = commit_tree_related(&remote, base, "main", "test/main", None, &entries).await;
+        for dep in &deps {
+            publish_delta(&remote, None, dep).await;
+        }
+        std::fs::remove_file(remote.path().join("summary")).unwrap();
+        let server = RepoServer::start(remote.path(), false).await;
+        let dest = build_dest(base, RepoMode::Archive, &server.url(), "").await;
+
+        pull_main(&dest, PullOptions::default()).await.unwrap();
+
+        let seen = server.seen();
+        for dep in &deps {
+            assert_eq!(
+                server.statuses_for(&scratch_superblock(dep)),
+                [200],
+                "{seen:?}"
+            );
+            assert_eq!(
+                server.requests_for(&meta_path(dep, "commit")),
+                0,
+                "{seen:?}"
+            );
+            assert_complete(&remote, &dest, dest.path(), dep).await;
+        }
+        assert_complete(&remote, &dest, dest.path(), &tip).await;
+        assert!(dest.fsck(&FsckOptions::default()).await.unwrap().is_ok());
+    });
+}
+
 /// With a list of static deltas, the pull takes the list entry to a
 /// dependency from its paired entry, in one step. Under
 /// `require_static_deltas`, a list with no entry to the dependency fails the

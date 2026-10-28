@@ -3199,6 +3199,20 @@ reads the commit of each dependency before the search. So a dependency that
 no source holds, and a nested dependency, fail the pull before the search for
 its delta.
 
+A pull from a remote requests the superblock of the delta of each dependency
+one time. It writes each superblock to one temp file in `tmp/` of the
+repository after the digest check, and the commit that the superblock carries
+after the parse of the superblock. The file opens at the first write, and the
+pull keeps it until the pull ends. A failed check fails the pull, so the file
+holds verified bytes. The step of the commit reads the commit from the file.
+Just before the parts of a delta, the pull parses its superblock again from
+the file, and it drops the parse after the last part. This is also true for a
+remote with no summary, which states no digest of a superblock. The file holds
+at most 1 GiB, four superblocks of 128 MiB with their commits. If the
+superblocks and the commits of the dependencies pass this limit, the pull
+fails with an error that names the limit, and does not fetch the dependencies
+loose.
+
 ### Dependencies in a push
 
 A push follows the dependencies of each commit that it offers: each source

@@ -54,7 +54,9 @@ use crate::verify::trust::FieldGroup;
 use crate::write::FileMeta;
 
 use super::chain::Edges;
-use super::delta::{self, CommitCheck, DeltaAdvert, DeltaJob, DeltaPlan, DeltaSource, PART_CAP};
+use super::delta::{
+    self, CommitCheck, DeltaAdvert, DeltaJob, DeltaPlan, DeltaSource, DependencyDeltas, PART_CAP,
+};
 use super::dependency;
 use super::drive::Slots;
 use super::source::{Connection, RemoteSource, RootFiles, Transfer, http_error, session_error};
@@ -529,6 +531,20 @@ impl Repo {
     /// under `require_static_deltas`. A dependency that a run of the targets
     /// or of a level reaches, for example as a parent, gets no delta of its
     /// own.
+    ///
+    /// The pull keeps the verified superblock of the delta of each dependency,
+    /// and the commit that it carries, in one temp file in `tmp/` of this
+    /// repository until it ends. A search holds the superblock that it fetched
+    /// and the parse of it until its checks end, so during the search the heap
+    /// holds at most one superblock and its parse for each search in flight.
+    /// The pull reads the commit from the file in the step of the commit. It
+    /// parses the superblock again from the file just before the parts of the
+    /// delta, and drops the parse after the last part. So the pull requests
+    /// each superblock one time, also from a remote with no summary, and the
+    /// application of the parts holds the parsed deltas of at most two
+    /// dependencies at a time. The file holds at most 1 GiB. If the
+    /// superblocks and the commits of the dependencies pass this limit, the
+    /// pull fails with [`Error::Pull`], and does not fetch loose.
     ///
     /// [`disable_static_deltas`](PullOptions::disable_static_deltas) and
     /// [`require_static_deltas`](PullOptions::require_static_deltas) control
@@ -1195,7 +1211,7 @@ impl Repo {
                 tips: &none,
                 depth: 0,
                 subpaths: None,
-                deltas: &jobs,
+                deltas: RunDeltas::Ready(&jobs),
                 done: &done,
                 last: false,
             };
@@ -1230,7 +1246,7 @@ impl Repo {
             tips: &tips,
             depth: opts.depth,
             subpaths,
-            deltas: &jobs,
+            deltas: RunDeltas::Ready(&jobs),
             done: &done,
             last: !follows,
         };
@@ -1265,7 +1281,7 @@ impl Repo {
                 .copied()
                 .collect();
             pending.sort_unstable();
-            let (roots, jobs) = if looks {
+            let (roots, found) = if looks {
                 let named = dependency::pair_targets(
                     &targets,
                     opts.depth,
@@ -1287,9 +1303,9 @@ impl Repo {
                     counters,
                 )
                 .await?;
-                (roots, found.into_jobs())
+                (roots, found)
             } else {
-                (pending, HashMap::new())
+                (pending, DependencyDeltas::default())
             };
             drop(advert);
             drop(edges);
@@ -1300,7 +1316,7 @@ impl Repo {
                 tips: &none,
                 depth: 0,
                 subpaths: None,
-                deltas: &jobs,
+                deltas: RunDeltas::Lazy(&found),
                 done: &done,
                 last: true,
             };
@@ -1550,9 +1566,11 @@ impl Repo {
                         .next()
                         .or_else(|| phase.last.then(|| plan.next_image(slots.len())).flatten())
                 {
+                    // The load of a job is no unit of work of the progress.
+                    let counted = !matches!(item, Item::Load(_));
                     let buffer = buffers.pop().unwrap_or_default();
                     slots.push(self.step(&ctx, item, buffer));
-                    started += 1;
+                    started += usize::from(counted);
                 }
                 plan.report(progress, started, !phase.last);
                 let Some(outcome) = slots.next_ready().await else {
@@ -1560,8 +1578,21 @@ impl Repo {
                 };
                 let (step, buffer) = outcome?;
                 buffers.push(buffer);
-                progress.object_done();
+                if !matches!(step, Step::Loaded(_)) {
+                    progress.object_done();
+                }
+                let part = match step {
+                    Step::Part(commit) => Some(commit),
+                    _ => None,
+                };
                 plan.apply(step, marked)?;
+                // After the last part of a delta, the plan counts no part of
+                // it, and the run releases the job of a dependency.
+                if let Some(commit) = part
+                    && !plan.delta_parts.contains_key(&commit)
+                {
+                    ctx.deltas.release(&commit);
+                }
             }
         }
         .await;
@@ -1618,11 +1649,24 @@ impl Repo {
                 Box::pin(self.fetch_image(ctx, name.checksum, &mut read_buf)).await?
             }
             Item::Object(name) => self.fetch_metadata(ctx, name, &mut read_buf).await?,
+            Item::Load(commit) => {
+                if let RunDeltas::Lazy(found) = ctx.deltas {
+                    found.load_job(self, &commit).await?;
+                }
+                Step::Loaded(commit)
+            }
             Item::Part(part) => {
-                let job = ctx
-                    .deltas
-                    .get(&part.commit)
-                    .expect("a queued part belongs to a delta this pull found");
+                // A load step loaded the job of a dependency before the plan
+                // queued its parts. The step holds the job until it ends.
+                let loaded;
+                let job = match ctx.deltas {
+                    RunDeltas::Ready(jobs) => jobs.get(&part.commit),
+                    RunDeltas::Lazy(found) => {
+                        loaded = found.live_job(&part.commit);
+                        loaded.as_deref()
+                    }
+                }
+                .expect("a queued part belongs to a delta this pull found");
                 delta::apply_job_part(
                     ctx.txn,
                     &DeltaSource::Remote(ctx.source),
@@ -1650,6 +1694,9 @@ impl Repo {
         let checksum = item.checksum;
         let name = ObjectName::new(checksum, ObjectType::Commit);
         if ctx.done.contains(&checksum) {
+            // The commit needs no delta. The head of the delta of a
+            // dependency goes here.
+            ctx.deltas.release(&checksum);
             return self.done_commit(ctx, checksum).await;
         }
         // Discovery checked the signatures of each commit of a chain, and kept
@@ -1702,12 +1749,13 @@ impl Repo {
                 detached,
                 Arc::new(src.load_object_bytes(ObjectType::Commit, &checksum).await?),
             )
-        } else if let Some(job) = ctx.deltas.get(&checksum) {
+        } else if let Some(commit_bytes) = ctx.deltas.commit_bytes(&checksum).await? {
             // A delta carries the target commit in its superblock, and these
             // bytes come from there. The parse of the superblock verified that
-            // they hash to this checksum. The write at staging verifies it
-            // again.
-            staging = CommitStaging::Write(Arc::clone(&job.commit_bytes));
+            // they hash to this checksum. For a dependency, discovery wrote
+            // them to its record file after that parse, and the step reads
+            // them back. The write at staging verifies the checksum again.
+            staging = CommitStaging::Write(Arc::clone(&commit_bytes));
             let detached = match known.take() {
                 Some(detached) => detached,
                 None => {
@@ -1715,7 +1763,7 @@ impl Repo {
                         .await?
                 }
             };
-            (detached, Arc::clone(&job.commit_bytes))
+            (detached, commit_bytes)
         } else {
             match self.fetch_remote_commit(ctx, &checksum).await? {
                 (detached, Some(bytes)) => {
@@ -1856,19 +1904,16 @@ impl Repo {
             ObjectName::new(commit.root_dirtree, ObjectType::DirTree),
         ];
         let next = if complete || ctx.flags.contains(PullFlags::COMMIT_ONLY) {
+            // The head of the delta of a dependency goes here.
+            ctx.deltas.release(&checksum);
             CommitNext::Nothing
-        } else if let Some(job) = ctx.deltas.get(&checksum) {
+        } else {
             // A delta delivers the tree: its parts, and the objects that it
             // names and hands over loose. The tree walk comes after the last
             // part. It finds each object that no part delivered and fetches it
-            // loose.
-            CommitNext::Delta {
-                parts: job.parts(),
-                fallbacks: job.fallbacks(),
-                tree,
-            }
-        } else {
-            CommitNext::Scan(tree)
+            // loose. The head of the delta of a dependency drops the range of
+            // its commit and its fallbacks here.
+            ctx.deltas.commit_next(&checksum, tree)
         };
         // The composefs image of the commit follows the other objects of the
         // pull. A commit that is complete here gets its image too, if this
@@ -2479,7 +2524,7 @@ struct StepCtx<'a> {
     /// The static delta that delivers each commit of this run, if the remote
     /// publishes one. The pull fetches a commit with no entry object by
     /// object.
-    deltas: &'a HashMap<Checksum, DeltaJob>,
+    deltas: RunDeltas<'a>,
     /// The commits that an earlier run of this pull made complete in the
     /// transaction. The step stages nothing for them and checks no signature
     /// again.
@@ -2521,11 +2566,73 @@ struct Phase<'a> {
     /// The subpaths of the walk. `None` walks every tree whole.
     subpaths: Option<Subpaths>,
     /// The static delta of each commit of this run.
-    deltas: &'a HashMap<Checksum, DeltaJob>,
+    deltas: RunDeltas<'a>,
     /// The commits that an earlier run made complete in the transaction.
     done: &'a HashSet<Checksum>,
     /// `true` for the last run of the pull.
     last: bool,
+}
+
+/// The static deltas of one run of the plan.
+#[derive(Clone, Copy)]
+enum RunDeltas<'a> {
+    /// The jobs that the pull parsed before the run: the jobs of a level of
+    /// intermediate commits, or of the targets. They live for the run.
+    Ready(&'a HashMap<Checksum, DeltaJob>),
+    /// The deltas of the dependencies. The step of a commit reads the head of
+    /// its delta. A load step parses the job just before the parts, and the
+    /// run releases the job after the last part. The plan loads at most
+    /// [`PART_CAP`] jobs at a time.
+    Lazy(&'a DependencyDeltas),
+}
+
+impl RunDeltas<'_> {
+    /// Returns the commit bytes that the delta of `commit` carries, or `None`
+    /// if the commit has no delta. For a dependency, the call reads them from
+    /// the record file of the search.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] if the record file cannot be read.
+    async fn commit_bytes(self, commit: &Checksum) -> Result<Option<Arc<Vec<u8>>>> {
+        match self {
+            RunDeltas::Ready(jobs) => Ok(jobs.get(commit).map(|job| Arc::clone(&job.commit_bytes))),
+            RunDeltas::Lazy(found) => Ok(found.commit_bytes(commit).await?.map(Arc::new)),
+        }
+    }
+
+    /// Returns how the objects of `commit` reach this repository: by its
+    /// delta, or by the walk from `tree` if the commit has no delta. For a
+    /// dependency, the head of the delta then drops the range of its commit
+    /// and its fallbacks, and a delta with no part drops its head.
+    fn commit_next(self, commit: &Checksum, tree: Vec<ObjectName>) -> CommitNext {
+        let delta = match self {
+            RunDeltas::Ready(jobs) => jobs
+                .get(commit)
+                .map(|job| (job.parts(), job.fallbacks(), false)),
+            RunDeltas::Lazy(found) => found
+                .take_commit_delta(commit)
+                .map(|(parts, fallbacks)| (parts, fallbacks, true)),
+        };
+        match delta {
+            Some((parts, fallbacks, lazy)) => CommitNext::Delta {
+                parts,
+                fallbacks,
+                tree,
+                lazy,
+            },
+            None => CommitNext::Scan(tree),
+        }
+    }
+
+    /// Releases the job and the head of the delta of `commit`: after its last
+    /// part, or in the step of a commit that needs no delta. The call does
+    /// nothing for a job that the pull parsed before the run.
+    fn release(self, commit: &Checksum) {
+        if let RunDeltas::Lazy(found) = self {
+            found.release_job(commit);
+        }
+    }
 }
 
 /// What one run of the plan leaves for the next run.
@@ -2573,6 +2680,9 @@ struct PartItem {
 enum Item {
     Commit(CommitItem),
     Object(ObjectName),
+    /// The load of the job of the delta of a dependency, before its parts.
+    /// The value is the commit of the delta.
+    Load(Checksum),
     Part(PartItem),
 }
 
@@ -2583,6 +2693,9 @@ enum Step {
     /// A dirtree is stored: its checksum and its entries, which the plan walks
     /// on from.
     DirTree(Checksum, DirTree),
+    /// The job of the delta of a dependency is loaded. The value is the
+    /// commit of the delta.
+    Loaded(Checksum),
     /// A delta part is applied. The value is the commit of the part.
     Part(Checksum),
     /// The step of a composefs image ended, with the answer of the remote.
@@ -2658,6 +2771,9 @@ enum CommitNext {
         parts: usize,
         fallbacks: Vec<ObjectName>,
         tree: Vec<ObjectName>,
+        /// `true` if a load step loads the job of the delta before the parts,
+        /// as [`RunDeltas::Lazy`] states.
+        lazy: bool,
     },
     /// Nothing: the commit is complete here, or the pull is commit-only.
     Nothing,
@@ -2675,6 +2791,17 @@ struct Plan {
     parts: VecDeque<PartItem>,
     /// The number of part fetches in flight.
     parts_in_flight: usize,
+    /// The commits whose job of a delta waits for its load step, drained
+    /// after the parts and fetched at high priority.
+    loads: VecDeque<Checksum>,
+    /// The commits whose job a load step loads, or loaded, until the last
+    /// part of the delta. The plan gives out no load step while
+    /// [`PART_CAP`] commits are here, so at most [`PART_CAP`] jobs are loaded
+    /// at once.
+    loaded: HashSet<Checksum>,
+    /// The number of parts of the deltas whose load step did not queue them
+    /// yet. The progress total counts them, as it counts queued parts.
+    waiting_parts: usize,
     /// The number of parts of the delta of each commit that are not applied
     /// yet. When that count is zero, the plan queues the tree walk that
     /// `delta_trees` holds.
@@ -2928,14 +3055,19 @@ impl Plan {
     }
 
     /// Returns the next unit of work: the commits, then the delta parts, then
-    /// the scan, then the content. [`next_image`](Plan::next_image) gives the
-    /// composefs images.
+    /// the loads of the jobs, then the scan, then the content.
+    /// [`next_image`](Plan::next_image) gives the composefs images.
     ///
     /// The plan holds back a queued part while [`PART_CAP`] parts are in
     /// flight. A pull with more slots spends the other slots on the scan and
     /// the content. The loop can run out of work while parts are queued. This
     /// is safe: the plan holds back a part only while a part is in flight, in a
     /// slot that the loop waits on.
+    ///
+    /// The plan also holds back a load while [`PART_CAP`] jobs are loaded and
+    /// have parts to apply. This is safe for the same reason: each of these
+    /// jobs has a load step or a part in flight, or a queued part that the
+    /// plan gives out.
     fn next(&mut self) -> Option<Item> {
         if let Some(commit) = self.commits.pop_front() {
             return Some(Item::Commit(commit));
@@ -2945,6 +3077,12 @@ impl Plan {
         {
             self.parts_in_flight += 1;
             return Some(Item::Part(part));
+        }
+        if self.loaded.len() < PART_CAP
+            && let Some(commit) = self.loads.pop_front()
+        {
+            self.loaded.insert(commit);
+            return Some(Item::Load(commit));
         }
         if let Some(name) = self.scan.pop_front() {
             return Some(Item::Object(name));
@@ -2964,6 +3102,7 @@ impl Plan {
     fn next_image(&mut self, in_flight: usize) -> Option<Item> {
         if !self.commits.is_empty()
             || !self.parts.is_empty()
+            || !self.loads.is_empty()
             || !self.scan.is_empty()
             || !self.content.is_empty()
             || in_flight > self.images.in_flight
@@ -2979,6 +3118,7 @@ impl Plan {
     fn report(&self, progress: &PullCounters, started: usize, more: bool) {
         let queued = self.commits.len()
             + self.parts.len()
+            + self.waiting_parts
             + self.scan.len()
             + self.content.len()
             + self.images.len();
@@ -2999,6 +3139,7 @@ impl Plan {
         match step {
             Step::Commit(outcome) => return self.apply_commit(outcome, marked),
             Step::DirTree(checksum, dirtree) => self.apply_dirtree(checksum, &dirtree),
+            Step::Loaded(commit) => self.apply_load(commit),
             Step::Part(commit) => self.apply_part(commit),
             Step::Image(answer) => self.images.apply(answer),
             Step::Absent(commit) => return self.apply_absent(commit),
@@ -3007,8 +3148,21 @@ impl Plan {
         Ok(())
     }
 
+    /// Records a loaded job of a delta, and queues its parts.
+    fn apply_load(&mut self, commit: Checksum) {
+        let parts = *self
+            .delta_parts
+            .get(&commit)
+            .expect("a loaded job belongs to a commit whose delta is counted");
+        self.waiting_parts -= parts;
+        for index in 0..parts {
+            self.parts.push_back(PartItem { commit, index });
+        }
+    }
+
     /// Records an applied delta part. After the last part of the delta, queues
-    /// the tree walk of its commit.
+    /// the tree walk of its commit, and the plan no longer counts its job as
+    /// loaded. The caller then releases the job.
     fn apply_part(&mut self, commit: Checksum) {
         self.parts_in_flight -= 1;
         let left = self
@@ -3020,6 +3174,7 @@ impl Plan {
             return;
         }
         self.delta_parts.remove(&commit);
+        self.loaded.remove(&commit);
         // Each object of the delta is staged now. The walk reads what is here,
         // and requests from the network only what the delta left out.
         for name in self.delta_trees.remove(&commit).unwrap_or_default() {
@@ -3056,6 +3211,7 @@ impl Plan {
                 parts,
                 fallbacks,
                 tree,
+                lazy,
             } => {
                 // The plan queues the objects that the delta hands over loose at
                 // once, so they travel together with the parts.
@@ -3067,6 +3223,13 @@ impl Plan {
                     for name in tree {
                         self.push_root(name);
                     }
+                } else if lazy {
+                    // The job of the delta is not loaded yet. The load step
+                    // queues the parts.
+                    self.delta_parts.insert(outcome.checksum, parts);
+                    self.delta_trees.insert(outcome.checksum, tree);
+                    self.loads.push_back(outcome.checksum);
+                    self.waiting_parts += parts;
                 } else {
                     self.delta_parts.insert(outcome.checksum, parts);
                     self.delta_trees.insert(outcome.checksum, tree);
@@ -4105,12 +4268,31 @@ mod tests {
         fallbacks: Vec<ObjectName>,
         tree: Vec<ObjectName>,
     ) -> Step {
+        delta_outcome(checksum, parts, fallbacks, tree, false)
+    }
+
+    /// Returns the outcome of a commit that the delta of a dependency
+    /// delivers. A load step loads the job of the delta.
+    fn by_dependency_delta(checksum: Checksum, parts: usize, tree: Vec<ObjectName>) -> Step {
+        delta_outcome(checksum, parts, Vec::new(), tree, true)
+    }
+
+    /// Returns the outcome of a commit that a delta delivers, with `lazy` as
+    /// the load rule of its job.
+    fn delta_outcome(
+        checksum: Checksum,
+        parts: usize,
+        fallbacks: Vec<ObjectName>,
+        tree: Vec<ObjectName>,
+        lazy: bool,
+    ) -> Step {
         Step::Commit(CommitOutcome {
             checksum,
             next: CommitNext::Delta {
                 parts,
                 fallbacks,
                 tree,
+                lazy,
             },
             parent: None,
             dependencies: Vec::new(),
@@ -4128,6 +4310,7 @@ mod tests {
                     Step::DirTree(name.checksum, DirTree::default())
                 }
                 Item::Object(_) => Step::Done,
+                Item::Load(commit) => Step::Loaded(commit),
                 Item::Part(part) => Step::Part(part.commit),
                 Item::Commit(_) => panic!("the test queues no further commits"),
             };
@@ -4245,6 +4428,7 @@ mod tests {
             drained.push(match item {
                 Item::Commit(commit) => commit.checksum,
                 Item::Object(name) => name.checksum,
+                Item::Load(commit) => commit,
                 Item::Part(part) => part.commit,
             });
         }
@@ -4494,6 +4678,195 @@ mod tests {
         }
         assert_eq!(high_water, PART_CAP);
         assert_eq!(applied, 5);
+    }
+
+    /// The delta of a dependency queues a load step and no part. The parts
+    /// follow the load. After the last part the plan counts the job as
+    /// loaded no longer, and queues the tree.
+    #[test]
+    fn the_load_of_a_dependency_job_comes_before_its_parts() {
+        let mut plan = Plan::default();
+        let mut marked = Vec::new();
+        let tree = vec![object(2, ObjectType::DirMeta)];
+        plan.apply(by_dependency_delta(csum(1), 2, tree), &mut marked)
+            .unwrap();
+
+        assert!(matches!(plan.next(), Some(Item::Load(commit)) if commit == csum(1)));
+        assert!(plan.loaded.contains(&csum(1)));
+        // No part and no tree before the job is loaded.
+        assert!(plan.next().is_none());
+
+        plan.apply(Step::Loaded(csum(1)), &mut marked).unwrap();
+        assert!(matches!(plan.next(), Some(Item::Part(_))));
+        assert!(matches!(plan.next(), Some(Item::Part(_))));
+        assert!(plan.next().is_none());
+
+        plan.apply(Step::Part(csum(1)), &mut marked).unwrap();
+        assert!(plan.loaded.contains(&csum(1)));
+        assert!(plan.delta_parts.contains_key(&csum(1)));
+        assert!(plan.next().is_none());
+        plan.apply(Step::Part(csum(1)), &mut marked).unwrap();
+        assert!(plan.loaded.is_empty());
+        assert!(!plan.delta_parts.contains_key(&csum(1)));
+        let Some(Item::Object(name)) = plan.next() else {
+            panic!("the tree was not queued after the last part");
+        };
+        assert_eq!(name, object(2, ObjectType::DirMeta));
+    }
+
+    /// A run of more dependencies than [`PART_CAP`] holds at most
+    /// [`PART_CAP`] parsed jobs at once. The test runs the plan as the drive
+    /// loop does, with the steps in flight applied in order, and reads the
+    /// jobs of the deltas from the record file. Each job goes after its last
+    /// part.
+    #[test]
+    fn a_dependency_run_holds_at_most_part_cap_jobs() {
+        block_on(async {
+            let dir = ScratchDir::new("dependency-jobs");
+            let archive = || crate::CreateOptions::new(RepoMode::Archive);
+            let src = Repo::create(&dir.0.join("src"), archive()).await.unwrap();
+            let dest = Repo::create(&dir.0.join("dest"), archive()).await.unwrap();
+            let mut deltas = Vec::new();
+            for name in ["d1", "d2", "d3", "d4", "d5"] {
+                let commit = commit_under(&src, name, name.as_bytes()).await;
+                src.generate_static_delta(None, &commit, &crate::DeltaOptions::default())
+                    .await
+                    .unwrap();
+                deltas.push((None, commit));
+            }
+            assert!(deltas.len() > PART_CAP);
+            let found = DependencyDeltas::kept_from(&dest, &src, &deltas).await;
+            let run = RunDeltas::Lazy(&found);
+
+            let mut plan = Plan::default();
+            let mut marked = Vec::new();
+            for (_, commit) in &deltas {
+                let bytes = run.commit_bytes(commit).await.unwrap().unwrap();
+                assert_eq!(Checksum::sha256(&bytes), *commit);
+                assert!(found.holds_commit_data(commit));
+                let next = run.commit_next(commit, Vec::new());
+                let CommitNext::Delta {
+                    parts, lazy: true, ..
+                } = next
+                else {
+                    panic!("the dependency has no delta");
+                };
+                assert!(parts > 0);
+                // The head keeps the number of parts and the range of the
+                // superblock for the load step, and no commit data.
+                assert!(run.commit_bytes(commit).await.unwrap().is_none());
+                assert!(!found.holds_commit_data(commit));
+                assert!(found.has_head(commit));
+                plan.apply(by_dependency_delta(*commit, parts, Vec::new()), &mut marked)
+                    .unwrap();
+            }
+
+            let mut in_flight = VecDeque::new();
+            let mut high_water = 0;
+            let mut loads = 0;
+            loop {
+                while let Some(item) = plan.next() {
+                    in_flight.push_back(match item {
+                        Item::Load(commit) => {
+                            found.load_job(&dest, &commit).await.unwrap();
+                            loads += 1;
+                            Step::Loaded(commit)
+                        }
+                        Item::Part(part) => {
+                            assert!(found.live_job(&part.commit).is_some());
+                            Step::Part(part.commit)
+                        }
+                        Item::Object(_) => Step::Done,
+                        Item::Commit(_) => panic!("the test queues no further commits"),
+                    });
+                    high_water = high_water.max(found.live_jobs());
+                    assert!(found.live_jobs() <= PART_CAP);
+                }
+                let Some(step) = in_flight.pop_front() else {
+                    break;
+                };
+                let part = match step {
+                    Step::Part(commit) => Some(commit),
+                    _ => None,
+                };
+                plan.apply(step, &mut marked).unwrap();
+                if let Some(commit) = part
+                    && !plan.delta_parts.contains_key(&commit)
+                {
+                    run.release(&commit);
+                    assert!(found.live_job(&commit).is_none());
+                }
+            }
+            assert_eq!(loads, deltas.len());
+            assert_eq!(high_water, PART_CAP);
+            assert_eq!(found.live_jobs(), 0);
+            assert!(found.is_empty());
+        });
+    }
+
+    /// The head of the delta of a dependency goes in the step of a commit
+    /// that needs no delta: a commit that is complete here, a commit-only
+    /// pull, or a commit that an earlier run made complete. No load follows,
+    /// so the head goes with no job.
+    #[test]
+    fn a_commit_that_needs_no_delta_releases_the_dependency_head() {
+        block_on(async {
+            let dir = ScratchDir::new("dependency-head-release");
+            let archive = || crate::CreateOptions::new(RepoMode::Archive);
+            let src = Repo::create(&dir.0.join("src"), archive()).await.unwrap();
+            let dest = Repo::create(&dir.0.join("dest"), archive()).await.unwrap();
+            let commit = commit_under(&src, "d1", b"d1").await;
+            src.generate_static_delta(None, &commit, &crate::DeltaOptions::default())
+                .await
+                .unwrap();
+            let found = DependencyDeltas::kept_from(&dest, &src, &[(None, commit)]).await;
+            assert!(found.holds_commit_data(&commit));
+
+            RunDeltas::Lazy(&found).release(&commit);
+            assert!(!found.has_head(&commit));
+            assert_eq!(found.live_jobs(), 0);
+            assert!(found.is_empty());
+        });
+    }
+
+    /// The progress total counts the parts of the delta of a dependency at
+    /// the step of its commit, before the load step queues them. The total
+    /// is the total of a delta whose parts the plan queues at once, and it
+    /// does not change at the load.
+    #[test]
+    fn the_progress_total_counts_the_parts_of_a_job_before_its_load() {
+        let total = |progress: &PullCounters| {
+            progress
+                .own
+                .objects_total
+                .load(std::sync::atomic::Ordering::Relaxed)
+        };
+        let tree = || vec![object(2, ObjectType::DirMeta)];
+        let mut marked = Vec::new();
+
+        let eager_progress = PullCounters::new(None);
+        let mut eager = Plan::default();
+        eager
+            .apply(by_delta(csum(1), 3, Vec::new(), tree()), &mut marked)
+            .unwrap();
+        eager.report(&eager_progress, 1, false);
+
+        let lazy_progress = PullCounters::new(None);
+        let mut lazy = Plan::default();
+        lazy.apply(by_dependency_delta(csum(1), 3, tree()), &mut marked)
+            .unwrap();
+        lazy.report(&lazy_progress, 1, false);
+        assert_eq!(total(&lazy_progress), total(&eager_progress));
+        assert_eq!(total(&lazy_progress), 1 + 3);
+
+        // The load step is in flight, and is no unit of work.
+        assert!(matches!(lazy.next(), Some(Item::Load(_))));
+        lazy.report(&lazy_progress, 1, false);
+        assert_eq!(total(&lazy_progress), 1 + 3);
+        lazy.apply(Step::Loaded(csum(1)), &mut marked).unwrap();
+        lazy.report(&lazy_progress, 1, false);
+        assert_eq!(total(&lazy_progress), 1 + 3);
+        assert_eq!(lazy.waiting_parts, 0);
     }
 
     /// A stream that checks, at its end, that the transaction did not stage the

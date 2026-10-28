@@ -2133,6 +2133,29 @@ the rules.
   change to the delta format, so that the delta of a target also carries its
   dependencies, was rejected: the tool writes and reads the format, and a
   delta of each dependency keeps it.
+- A pull from a remote requests the superblock of the delta of each
+  dependency one time. The search writes each superblock to one temp file
+  after the digest check, and the commit that it carries after the parse. A
+  failed check fails the pull, so the file holds verified bytes. The pull
+  keeps on the heap the fallbacks, the number of parts, and the ranges in the
+  file of each delta. The step of the commit reads the commit from the file
+  and takes the fallbacks. Just before the parts of a delta, a load step
+  parses the superblock again from the file, and the run drops the parse
+  after the last part. The application of the parts loads the jobs of at most
+  two dependencies at a time, the cap of the part fetches. The file has the
+  limit of the record file of a chain, 1 GiB, and a pull whose superblocks
+  and commits of dependencies pass it fails. After a search fails, the pull
+  starts no further search. Three alternatives were rejected. To request the
+  superblock again at the start of its parts was rejected: it doubles the
+  transfer of each superblock, and with no summary no digest checks that the
+  second copy is the verified copy. A failure then also comes late in the
+  transaction. To keep each parsed delta until the run ends was rejected:
+  field 2 of the commits that the remote serves sets the number of
+  dependencies, which has no cap, so the heap cost of the parsed deltas then
+  has no limit. To keep the commit of each delta on the heap until the step
+  of the commit was rejected for the same reason: the steps of the commits
+  come after the search, so the heap then holds the commits of all the
+  dependencies.
 - A push (`Repo::push`, `Repo::push_over_stream`, and `Repo::push_to_bucket`)
   sends the dependencies of each commit that it offers, at depth 0 and with
   no ref. It refuses an absent or a partial dependency, a defective field 2

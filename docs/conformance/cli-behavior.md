@@ -4815,7 +4815,8 @@ nothing on standard output. The refusals are:
 
 The tool tries the positional keys first. It reads the last `--keys-file` only
 where no positional key verifies. The tool skips a KEY-ID that does not decode
-to 32 bytes, with no message. It ignores a `--keys-file` line of that kind where
+to 32 bytes, with no message. A 64-byte secret key is skipped in the same way,
+so a run with a secret key alone reports `No valid signatures found`. The tool ignores a `--keys-file` line of that kind where
 another line verifies. It decodes a line of the bytes `\xff\xfe` and a valid key
 as that key. `cli-surface.md`, "P2", `sign`, records the port side.
 
@@ -4855,6 +4856,33 @@ Under the gpg engine, the port writes the report that `cli-surface.md`, "P2",
 <fingerprint>` where the signature names its key. It has ` (<name> <email>)`
 where the key has a user id. A user id with no address gives ` (<name>)`. A
 user id with an address alone gives ` (<<email>>)`.
+
+#### Delete mode
+
+`ostree sign --help` describes `-d`/`--delete` as `Delete signatures having
+any of the KEY-IDs`. The man page `ostree-sign(1)` has no text for the
+option. On 2026-10-28, the `ostree` 2026.1 build with OpenSSL on the NixOS
+development host removed no signature in this mode under `ed25519` or
+`spki`. The tool reads each KEY-ID and each `--keys-file` line as a secret
+key, and signs with it as a signing run does:
+
+- A secret key adds one signature at exit 0, with nothing on standard output
+  or standard error. This occurs over a signed commit and over an unsigned
+  commit. Each run adds one more signature. An ed25519 signature is
+  deterministic, so a second run with the same key writes a second copy of
+  the same signature.
+- A public key is refused at exit 1, and the detached metadata does not
+  change. Under `ed25519` the error is `error: Invalid ed25519 secret key:
+  Ill-formed input: expected 64 bytes, got 32 bytes`, for a KEY-ID and for a
+  `--keys-file` line. Under `spki` a positional SubjectPublicKeyInfo gives
+  `error: Not able to sign the cobject: openssl: Failed to initialize spki
+  key`. A `PUBLIC KEY` block in an spki `--keys-file` gives `error:
+  Unexpected label "PUBLIC KEY"` (`static-delta`, "spki secret key files").
+- With no KEY-ID and no `--keys-file`, the tool writes its usage text to
+  standard error, then `error: Need at least one KEY-ID to sign with`, at
+  exit 1.
+
+`cli-surface.md`, "P2", `sign`, records the port side.
 
 ### `summary`
 

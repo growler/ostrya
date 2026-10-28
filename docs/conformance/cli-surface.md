@@ -3736,7 +3736,7 @@ reads. The key-file entries under `static-delta` above, the spki entries
 included, also hold for `sign --verify`. Under `spki`, a signing
 `--keys-file` holds PEM `PRIVATE KEY` blocks, each a PKCS#8 DER, and each
 block adds one signature. A `-d` `--keys-file` holds PEM `PUBLIC KEY` blocks,
-read as a `--keys-file` of `--verify`. Twenty differences stand.
+read as a `--keys-file` of `--verify`. Twenty-one differences stand.
 
 - the verdict report. The exit status agrees. The two reports part as
   follows:
@@ -3766,7 +3766,10 @@ read as a `--keys-file` of `--verify`. Twenty differences stand.
   included, where another line verifies. The port refuses the run at exit 1
   before verification with `error: Invalid ed25519 public key: Ill-formed
   input: expected 32 bytes, got <n> bytes` and nothing on standard output.
-  Where no key verifies, both exit 1;
+  Where no key verifies, both exit 1. A 64-byte secret key is a key of this
+  kind: `--verify COMMIT <secret key>` alone gives `error: No valid
+  signatures found` from the tool and the error above with `got 64 bytes`
+  from the port;
 - a keys-file line that is not UTF-8. The tool decodes a line of the bytes
   `\xff\xfe` followed by a valid key as that key and verifies at exit 0. The
   port decodes a line that is not UTF-8 to no byte and refuses the run with
@@ -3800,7 +3803,17 @@ read as a `--keys-file` of `--verify`. Twenty differences stand.
   signature that key verifies. It refuses a secret key with `error:
   signature: ed25519 public key must be 32 bytes, got 64` at exit 1 and
   writes nothing. The tool writes a signature where the port refuses, and the
-  port removes a signature where the tool refuses. Under `spki` the tool
+  port removes a signature where the tool refuses. Each `-d` run of the tool
+  with a secret key adds one more signature, so a second run with the same
+  ed25519 key writes a second copy of the same signature
+  (`cli-behavior.md`, "CLI output formats", `sign`, "Delete mode"). Under
+  `-s spki` the tool signs with a positional secret key and refuses a
+  positional SubjectPublicKeyInfo with `error: Not able to sign the cobject:
+  openssl: Failed to initialize spki key` at exit 1. The port removes each
+  signature that a positional SubjectPublicKeyInfo verifies and writes
+  `Deleted <n> signature(s)`. It refuses a positional secret key with
+  `error: signature: spki public key: expected SubjectPublicKeyInfo DER` at
+  exit 1 and writes nothing. Under `spki` the tool
   takes a `PRIVATE KEY` block in a `-d` `--keys-file` and writes one more
   signature at exit 0, and refuses a `PUBLIC KEY` block with `error:
   Unexpected label "PUBLIC KEY"` at exit 1 (`cli-behavior.md`, "CLI output
@@ -3808,6 +3821,10 @@ read as a `--keys-file` of `--verify`. Twenty differences stand.
   KEY` blocks and removes each signature that a key of the file verifies. It
   refuses a `PRIVATE KEY` block with `error: signature: the key file
   '<path>', line <n>: unexpected label "PRIVATE KEY"` at exit 1;
+- `-d/--delete` with no KEY-ID and no `--keys-file`. Both refuse at exit 1
+  and write nothing. The tool writes its usage text to standard error, then
+  `error: Need at least one KEY-ID to sign with`. The port writes `error:
+  signature: delete requires at least one KEY-ID`;
 - a signing or delete `--keys-file` that is not a regular file, an empty
   `--keys-file=` included. With no positional KEY-ID both refuse at exit 1
   and write nothing. The tool writes the GLib warning `Can't open file

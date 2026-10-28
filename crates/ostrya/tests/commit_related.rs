@@ -381,6 +381,72 @@ fn check_related_runs_the_checks_of_write_commit() {
     });
 }
 
+/// The check reads no commit object of a dependency with a partial marker: a
+/// directory at the path of the object gives the partial refusal.
+#[test]
+fn check_related_reads_no_object_of_a_partial_dependency() {
+    let tmp = TmpDir::new("related-partial-unreadable");
+    block_on(async {
+        let repo = repo_with_trees(tmp.path(), &["partial"]).await;
+        let partial = commit(&repo, tmp.path(), "partial", &[]).await;
+        let state = repo.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(state.join(format!("{partial}.commitpartial")), b"").unwrap();
+        let path = repo.path().join("objects").join(ostrya::loose_path(
+            &partial,
+            ObjectType::Commit,
+            RepoMode::Archive,
+        ));
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+
+        let txn = repo.transaction().await.unwrap();
+        let err = txn
+            .check_related(&owned(&[("a/x", partial)]))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            related_error(err),
+            (
+                None,
+                RelatedField::Dependencies,
+                format!("dependency a/x names commit {partial}, which is partial")
+            )
+        );
+        txn.abort().await.unwrap();
+    });
+}
+
+/// A dependency that the transaction stages is partial if the repository has
+/// a partial marker for it.
+#[test]
+fn check_related_refuses_a_staged_dependency_with_a_partial_marker() {
+    let tmp = TmpDir::new("related-staged-partial");
+    block_on(async {
+        let repo = repo_with_trees(tmp.path(), &["dep"]).await;
+        let txn = repo.transaction().await.unwrap();
+        let root = stage_tree(&txn, tmp.path(), "dep").await;
+        let dep = txn.write_commit(options("dep", &[]), &root).await.unwrap();
+        let state = repo.path().join("state");
+        std::fs::create_dir_all(&state).unwrap();
+        std::fs::write(state.join(format!("{dep}.commitpartial")), b"").unwrap();
+
+        let err = txn
+            .check_related(&owned(&[("a/x", dep)]))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            related_error(err),
+            (
+                None,
+                RelatedField::Dependencies,
+                format!("dependency a/x names commit {dep}, which is partial")
+            )
+        );
+        txn.abort().await.unwrap();
+    });
+}
+
 #[test]
 fn write_commit_refuses_a_nested_dependency() {
     let tmp = TmpDir::new("related-nested");

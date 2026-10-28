@@ -1745,6 +1745,29 @@ fn an_absent_or_partial_dependency_is_refused_before_any_byte() {
     assert_eq!(written, 0);
 }
 
+/// The push reads no commit object of a dependency with a partial marker: a
+/// directory at the path of the object gives the partial refusal.
+#[test]
+fn a_partial_dependency_with_an_unreadable_object_is_refused_as_partial() {
+    let dir = TmpDir::new("push-repo-dependency-partial-unreadable");
+    let repo = new_repo(&dir, RepoMode::Archive, "");
+    let (main, dep) = dependency_chain(&repo);
+    mark_partial(&repo, &dep);
+    remove_commit_object(&repo, &dep);
+    let path = ostrya::loose_path(&dep, ObjectType::Commit, RepoMode::Archive);
+    std::fs::create_dir(repo.path().join("objects").join(path)).unwrap();
+
+    let (error, written) = refused(&repo, opts(&["main"]));
+    assert_eq!(
+        dependency_error(error),
+        (
+            Some(main),
+            format!("dependency boot/uki names commit {dep}, which is partial")
+        )
+    );
+    assert_eq!(written, 0);
+}
+
 /// A field 2 entry with an empty name or with a checksum that is not 32
 /// bytes is refused before the push writes a byte, also in a history commit
 /// that a push with no depth does not send.

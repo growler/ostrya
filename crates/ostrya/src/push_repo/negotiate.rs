@@ -13,7 +13,7 @@ use crate::error::{Error, Result};
 use crate::lock::{LockGuard, LockKind};
 use crate::read::CommitState;
 use crate::refs::MAX_COLLECTION_ID_LEN;
-use crate::related::{self, RelatedField, RelatedRule};
+use crate::related::{self, HeldDependency, RelatedField, RelatedRule};
 use crate::remote::{
     Compression, Endpoint, Expected, PushOutcome, PushProgress, PushSession, RefUpdate, ServerInfo,
     SessionOptions,
@@ -216,11 +216,12 @@ impl Commits {
     /// the format check. The call records each dependency with the commit and
     /// the entry name that first named it, and skips a dependency that it
     /// resolved before. A dependency that `local` holds needs no read. One
-    /// trip to the blocking pool reads each other dependency: its commit
-    /// object, its partial marker, the link of the commit, and if its field 2
-    /// is empty. No object bytes leave the pool. The call reads no parent of
-    /// a dependency. Each dependency that passes is [`Local::Held`] in
-    /// `local`, so the walk of the trees finds it.
+    /// trip to the blocking pool reads each other dependency: its partial
+    /// marker, then its commit object, if its field 2 is empty, and the link
+    /// of the commit. The call reads no commit object of a dependency with a
+    /// partial marker. No object bytes leave the pool. The call reads no
+    /// parent of a dependency. Each dependency that passes is [`Local::Held`]
+    /// in `local`, so the walk of the trees finds it.
     ///
     /// # Errors
     ///
@@ -231,10 +232,13 @@ impl Commits {
     /// - [`Error::InvalidRelated`] if the repository marks the dependency
     ///   partial, or if the field 2 of the dependency is not empty. The error
     ///   names the commit that first named the dependency.
-    /// - [`Error::Io`] or [`Error::Core`] if the read of the dependency
-    ///   fails, or if the tuple frame, the parent or root checksums, or field
-    ///   2 of its commit object does not decode. The call decodes no other
-    ///   part of the commit object.
+    /// - [`Error::Io`] or [`Error::Core`] if the read of a dependency with no
+    ///   partial marker fails, or if the tuple frame, field 2, or the parent
+    ///   or root checksums of its commit object do not decode. The call
+    ///   decodes no other part of the commit object.
+    /// - [`Error::Io`] if the lstat of the partial marker of a dependency
+    ///   fails, or if the lstat of the commit object of a dependency with a
+    ///   partial marker fails.
     pub(super) async fn check_dependencies<'a>(
         &mut self,
         repo: &Repo,
@@ -262,14 +266,19 @@ impl Commits {
             .map(|(dependency, _, _)| *dependency)
             .filter(|dependency| !self.local.contains_key(dependency))
             .collect();
-        let mut loaded: HashMap<Checksum, Result<(Local, bool)>> = if unread.is_empty() {
+        let mut loaded: HashMap<_, Result<HeldDependency<CommitLink>>> = if unread.is_empty() {
             HashMap::new()
         } else {
             let repo = repo.clone();
             ostrya_rt::unblock(move || {
                 unread
                     .into_iter()
-                    .map(|key| (key, read_dependency(&repo, &key)))
+                    .map(|key| {
+                        let state = related::held_dependency_blocking(&repo, None, &key, |b| {
+                            Ok(Commit::parse_link(b)?)
+                        });
+                        (key, state)
+                    })
                     .collect()
             })
             .await
@@ -277,7 +286,11 @@ impl Commits {
         for (dependency, naming, name) in named {
             let nested = match loaded.remove(&dependency) {
                 Some(result) => {
-                    let (local, nested) = result?;
+                    let (local, nested) = match result? {
+                        HeldDependency::Absent => (Local::Absent, false),
+                        HeldDependency::Partial => (Local::Partial, false),
+                        HeldDependency::Complete { nested, value } => (Local::Held(value), nested),
+                    };
                     self.local.insert(dependency, local);
                     nested
                 }
@@ -303,26 +316,6 @@ impl Commits {
         }
         Ok(())
     }
-}
-
-/// Returns the local state of the dependency `checksum`, and `true` if its
-/// field 2 is not empty.
-///
-/// The call reads the commit object and the partial marker on the calling
-/// thread. A caller on the executor calls it on the blocking pool.
-fn read_dependency(repo: &Repo, checksum: &Checksum) -> Result<(Local, bool)> {
-    let bytes = match repo.load_object_bytes_blocking(ObjectType::Commit, checksum) {
-        Ok(bytes) => bytes,
-        Err(Error::ObjectNotFound { .. }) => return Ok((Local::Absent, false)),
-        Err(e) => return Err(e),
-    };
-    Ok(match repo.commit_state_blocking(checksum)? {
-        CommitState::Normal => (
-            Local::Held(Commit::parse_link(&bytes)?),
-            related::has_dependencies(&bytes)?,
-        ),
-        CommitState::Partial => (Local::Partial, false),
-    })
 }
 
 /// The local work of a push before the session opens.

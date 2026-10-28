@@ -213,9 +213,9 @@ impl Transaction {
     ///   dependency is absent, partial, or has a dependency of its own.
     /// - [`Error::Core`] if the commit tuple of a dependency does not frame,
     ///   or if its field 2 does not decode.
-    /// - [`Error::Io`] if the commit object of a dependency is larger than
-    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE), or if a file system
-    ///   operation fails.
+    /// - [`Error::Io`] if the commit object of a dependency with no partial
+    ///   marker is larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE),
+    ///   or if a file system operation fails.
     pub async fn check_related(&self, related: &[(String, Checksum)]) -> Result<()> {
         let sorted = related::sorted_new(related)?;
         related::check_dependencies(self, None, sorted).await

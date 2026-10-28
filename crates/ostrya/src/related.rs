@@ -35,7 +35,7 @@
 //!   dependencies and writes nothing for them.
 
 use std::collections::HashSet;
-use std::os::fd::AsFd;
+use std::os::fd::{AsFd, BorrowedFd};
 use std::sync::LazyLock;
 
 use ostrya_core::{Checksum, ObjectType, Type, Value, tuple_field_from_bytes};
@@ -634,26 +634,41 @@ pub(crate) fn borrowed_dependencies<'a>(
         .collect()
 }
 
-/// The state of a commit that the repository holds, as a dependency.
-#[cfg_attr(not(feature = "receive"), allow(dead_code))]
+/// The state of a commit that the repository or the transaction holds, as a
+/// dependency.
+///
+/// `T` is the value that the caller reads from the commit object of a
+/// complete dependency.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum HeldDependency {
-    /// The repository does not hold the commit object.
+pub(crate) enum HeldDependency<T = ()> {
+    /// The repository does not hold the commit object, and the transaction
+    /// does not stage it.
     Absent,
-    /// The repository holds the commit object and marks it partial.
+    /// The repository or the transaction holds the commit object, and the
+    /// repository marks it partial.
     Partial,
-    /// The repository holds the commit object and does not mark it partial.
-    /// `nested` is `true` if the field 2 of the commit is not empty.
-    Complete { nested: bool },
+    /// The repository or the transaction holds the commit object, and the
+    /// repository does not mark it partial.
+    /// `nested` is `true` if the field 2 of the commit is not empty. `value`
+    /// is the value that the caller reads from the commit object.
+    Complete { nested: bool, value: T },
 }
 
-/// Returns the state of the dependency `checksum` in `repo`.
+/// Returns the state of the dependency `checksum` in `repo` or in the
+/// transaction that stages it.
+///
+/// If `staging` is set, the transaction stages the commit object of
+/// `checksum` in the staging directory `staging`, and the call reads the
+/// object from that directory. Otherwise the call reads the object from the
+/// object store of `repo`.
 ///
 /// The call reads the partial marker, then the commit object, on the calling
 /// thread. A caller on the executor calls it on the blocking pool. For a
-/// commit with a partial marker, the call reads no object: it only finds if
-/// the object is present. For a commit with no marker, it reads the object
-/// and decodes field 2 alone.
+/// commit with a partial marker, the call reads no object. A staged commit is
+/// then [`HeldDependency::Partial`]. For a commit that is not staged, the call
+/// only finds if the object store holds the object. For a commit with no
+/// marker, the call reads the object, decodes field 2 alone, and then calls
+/// `read` with the bytes of the object.
 ///
 /// # Errors
 ///
@@ -661,22 +676,37 @@ pub(crate) enum HeldDependency {
 ///   does not decode.
 /// - [`Error::Io`] if a file system operation fails, or if the commit object
 ///   is larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
-#[cfg_attr(not(feature = "receive"), allow(dead_code))]
-pub(crate) fn held_dependency_blocking(repo: &Repo, checksum: &Checksum) -> Result<HeldDependency> {
+/// - Each error of `read`.
+pub(crate) fn held_dependency_blocking<T>(
+    repo: &Repo,
+    staging: Option<BorrowedFd<'_>>,
+    checksum: &Checksum,
+    read: impl FnOnce(&[u8]) -> Result<T>,
+) -> Result<HeldDependency<T>> {
     if repo.commit_state_blocking(checksum)? == CommitState::Partial {
-        return Ok(if repo.has_object_blocking(ObjectType::Commit, checksum)? {
+        let held = staging.is_some() || repo.has_object_blocking(ObjectType::Commit, checksum)?;
+        return Ok(if held {
             HeldDependency::Partial
         } else {
             HeldDependency::Absent
         });
     }
-    match repo.load_object_bytes_blocking(ObjectType::Commit, checksum) {
-        Ok(bytes) => Ok(HeldDependency::Complete {
-            nested: has_dependencies(&bytes)?,
-        }),
-        Err(Error::ObjectNotFound { .. }) => Ok(HeldDependency::Absent),
-        Err(e) => Err(e),
-    }
+    let bytes = match staging {
+        Some(staging) => {
+            let flat = crate::write::flat_name(checksum, ObjectType::Commit, repo.mode());
+            crate::object::read_meta_object(staging, &flat, crate::object::MAX_METADATA_SIZE)?
+        }
+        None => match repo.load_object_bytes_blocking(ObjectType::Commit, checksum) {
+            Ok(bytes) => bytes,
+            Err(Error::ObjectNotFound { .. }) => return Ok(HeldDependency::Absent),
+            Err(e) => return Err(e),
+        },
+    };
+    let nested = has_dependencies(&bytes)?;
+    Ok(HeldDependency::Complete {
+        nested,
+        value: read(&bytes)?,
+    })
 }
 
 /// Returns the error for the dependency `name` of `commit`, which names the
@@ -772,16 +802,18 @@ pub(crate) fn check_order<'a>(
 /// `state/<checksum>.commitpartial` marker for it. A dependency is nested if
 /// its own field 2 is not empty. The checks of all dependencies run in one
 /// trip to the blocking pool, in the order of `deps`. A checksum that `deps`
-/// names more than once is checked once, at its first entry.
+/// names more than once is checked once, at its first entry. For each
+/// dependency, the check reads the partial marker first, and reads no commit
+/// object of a dependency with a marker.
 ///
 /// # Errors
 ///
 /// - [`Error::InvalidRelated`] with `commit` for the first dependency that is
 ///   absent, partial, or nested.
-/// - [`Error::Core`] if the commit tuple of a dependency does not frame, or if
-///   its field 2 does not decode.
+/// - [`Error::Core`] if the commit tuple of a dependency with no partial
+///   marker does not frame, or if its field 2 does not decode.
 /// - [`Error::Io`] if a file system operation fails, or if the commit object
-///   of a dependency is larger than
+///   of a dependency with no partial marker is larger than
 ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
 pub(crate) async fn check_dependencies<'a>(
     txn: &Transaction,
@@ -810,35 +842,14 @@ pub(crate) async fn check_dependencies<'a>(
             if !checked.insert(*checksum) {
                 continue;
             }
-            let bytes = match staging.as_ref().filter(|_| staged) {
-                Some(staging) => {
-                    let flat = crate::write::flat_name(checksum, ObjectType::Commit, repo.mode());
-                    crate::object::read_meta_object(
-                        staging.as_fd(),
-                        &flat,
-                        crate::object::MAX_METADATA_SIZE,
-                    )?
-                }
-                None => match repo.load_object_bytes_blocking(ObjectType::Commit, checksum) {
-                    Ok(bytes) => bytes,
-                    Err(Error::ObjectNotFound {
-                        checksum: missing,
-                        ty: ObjectType::Commit,
-                    }) if missing == *checksum => {
-                        return Ok(Some((
-                            index,
-                            "which is in neither the repository nor the transaction",
-                        )));
-                    }
-                    Err(e) => return Err(e),
-                },
+            let staging = staging.as_ref().filter(|_| staged).map(|fd| fd.as_fd());
+            let defect = match held_dependency_blocking(&repo, staging, checksum, |_| Ok(()))? {
+                HeldDependency::Absent => "which is in neither the repository nor the transaction",
+                HeldDependency::Partial => PARTIAL_REASON,
+                HeldDependency::Complete { nested: true, .. } => NESTED_REASON,
+                HeldDependency::Complete { nested: false, .. } => continue,
             };
-            if repo.commit_state_blocking(checksum)? == CommitState::Partial {
-                return Ok(Some((index, PARTIAL_REASON)));
-            }
-            if has_dependencies(&bytes)? {
-                return Ok(Some((index, NESTED_REASON)));
-            }
+            return Ok(Some((index, defect)));
         }
         Ok(None)
     })

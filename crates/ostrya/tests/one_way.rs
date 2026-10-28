@@ -1919,6 +1919,30 @@ mod export {
         assert_eq!(calls, 0);
     }
 
+    /// The export reads no commit object of a dependency with a partial
+    /// marker: a directory at the path of the object gives the partial
+    /// refusal.
+    #[test]
+    fn a_partial_dependency_with_an_unreadable_object_is_refused_as_partial() {
+        let tmp = TmpDir::new("one-way-export-dependency-partial-unreadable");
+        let repo = new_repo(&tmp, RepoMode::Archive, "");
+        let (main, dep) = dependency_chain(&repo);
+        mark_partial(&repo, &dep);
+        remove_commit_object(&repo, &dep);
+        let path = ostrya::loose_path(&dep, ObjectType::Commit, RepoMode::Archive);
+        std::fs::create_dir(repo.path().join("objects").join(path)).unwrap();
+
+        let (error, calls) = refused(&repo, exporting(&[("main", main)]));
+        assert_eq!(
+            dependency_error(error),
+            (
+                Some(main),
+                format!("dependency boot/uki names commit {dep}, which is partial")
+            )
+        );
+        assert_eq!(calls, 0);
+    }
+
     /// A field 2 entry of a new commit with an empty name or with a checksum
     /// that is not 32 bytes refuses the export before it writes a byte.
     #[test]

@@ -1173,7 +1173,7 @@ async fn check_dependencies(
         ostrya_rt::unblock(move || {
             held.into_iter()
                 .map(|dependency| {
-                    related::held_dependency_blocking(&repo, &dependency)
+                    related::held_dependency_blocking(&repo, None, &dependency, |_| Ok(()))
                         .map(|state| (dependency, state))
                 })
                 .collect::<Result<_>>()
@@ -1196,7 +1196,7 @@ async fn check_dependencies(
     for (dependency, naming, name) in named {
         let nested = match states.get(&dependency) {
             None => fields.contains_key(&dependency),
-            Some(HeldDependency::Complete { nested }) => *nested,
+            Some(HeldDependency::Complete { nested, .. }) => *nested,
             Some(HeldDependency::Partial) => {
                 return Err(Failure::Wire(remote::Error::MissingObjects {
                     message: related::partial_dependency(naming, name, &dependency).to_string(),

@@ -35,7 +35,7 @@
 //!   partial dependency as partial. `BucketRepo::fsck` reports the same
 //!   dependencies and writes nothing for them.
 
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::os::fd::{AsFd, BorrowedFd};
 use std::sync::LazyLock;
 
@@ -479,28 +479,45 @@ fn kept_entries(commit: &Checksum, dict: Value) -> Result<Kept> {
     Ok(Kept::Part(kept))
 }
 
-/// Adds the build source `name` with the checksum `source` to the detached
-/// metadata dict `dict` of the commit `commit`.
+/// Adds the build sources `sources` to the detached metadata dict `dict` of
+/// the commit `commit`.
 ///
-/// The add edits the first `ostrya.related` entry of `dict`. It removes each
-/// element with the name `name`, adds the new element, and sorts the elements
-/// by name in byte order. The sort is stable. If `dict` has no such entry,
-/// the add appends one after the other entries, with the new element alone.
-/// Each other entry of `dict` stays as it is.
+/// An empty `sources` changes nothing, and the call then does not examine
+/// `dict`. Else the call edits the first `ostrya.related` entry of `dict`:
+///
+/// - It removes each stored element whose name is the name of an entry of
+///   `sources`.
+/// - It adds one element for each name of `sources`. If `sources` holds a
+///   name more than one time, the last checksum for that name is the value.
+/// - Each other stored element stays, also two stored elements with one
+///   name.
+/// - It sorts the elements one time by name in byte order. The sort is
+///   stable.
+///
+/// If `dict` has no such entry, the call appends one after the other entries,
+/// with the new elements alone. Each other entry of `dict` stays as it is.
+/// The result is the same as one add of each entry of `sources`, in the order
+/// of `sources`.
+///
+/// Each name of `sources` must not be empty. The callers make this check.
 ///
 /// # Errors
 ///
-/// - [`Error::InvalidFormat`] if `dict` is not an array.
+/// - [`Error::InvalidFormat`] if `sources` is not empty and `dict` is not an
+///   array.
 /// - [`Error::InvalidRelated`] with `commit` and
-///   [`RelatedField::BuildSources`] if the value of the first entry is not a
-///   variant of type `a(say)`, or if one of its elements has an empty name or
-///   a checksum that is not 32 bytes. `dict` then stays as it is.
-pub(crate) fn add_build_source(
+///   [`RelatedField::BuildSources`] if `sources` is not empty and the value of
+///   the first entry is not a variant of type `a(say)`, or if one of its
+///   elements has an empty name or a checksum that is not 32 bytes. `dict`
+///   then stays as it is.
+pub(crate) fn add_build_sources(
     dict: &mut Value,
     commit: &Checksum,
-    name: &str,
-    source: &Checksum,
+    sources: Vec<(String, Checksum)>,
 ) -> Result<()> {
+    if sources.is_empty() {
+        return Ok(());
+    }
     let Value::Array(entries) = dict else {
         return Err(Error::InvalidFormat(
             "detached metadata must be an a{sv} dict".into(),
@@ -513,7 +530,7 @@ pub(crate) fn add_build_source(
         },
         _ => None,
     });
-    let mut sources = match &slot {
+    let stored = match &slot {
         Some(value) => {
             let entries = entries_of_variant(value).map_err(|reason| Error::InvalidRelated {
                 commit: Some(*commit),
@@ -524,10 +541,18 @@ pub(crate) fn add_build_source(
         }
         None => Vec::new(),
     };
-    sources.retain(|(stored, _)| stored != name);
-    sources.push((name.to_owned(), *source));
-    sources.sort_by(|(a, _), (b, _)| a.cmp(b));
-    let elements = sources
+    let mut queued = BTreeMap::new();
+    for (name, source) in sources {
+        debug_assert!(!name.is_empty(), "a build source name is empty");
+        queued.insert(name, source);
+    }
+    let mut kept: Vec<(String, Checksum)> = stored
+        .into_iter()
+        .filter(|(name, _)| !queued.contains_key(name))
+        .collect();
+    kept.extend(queued);
+    kept.sort_by(|(a, _), (b, _)| a.cmp(b));
+    let elements = kept
         .into_iter()
         .map(|(name, checksum)| {
             Value::Tuple(vec![
@@ -1150,5 +1175,386 @@ mod tests {
             build_sources(Some(&detached(shape))),
             Err("element 0 is not a (say) pair".into())
         );
+    }
+
+    /// Adds the build source `name` with the checksum `source` to the detached
+    /// metadata dict `dict` of the commit `commit`.
+    ///
+    /// The add edits the first `ostrya.related` entry of `dict`. It removes each
+    /// element with the name `name`, adds the new element, and sorts the elements
+    /// by name in byte order. The sort is stable. If `dict` has no such entry,
+    /// the add appends one after the other entries, with the new element alone.
+    /// Each other entry of `dict` stays as it is.
+    ///
+    /// The tests compare [`add_build_sources`] with one call of this function
+    /// for each entry, in order.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidFormat`] if `dict` is not an array.
+    /// - [`Error::InvalidRelated`] with `commit` and
+    ///   [`RelatedField::BuildSources`] if the value of the first entry is not a
+    ///   variant of type `a(say)`, or if one of its elements has an empty name or
+    ///   a checksum that is not 32 bytes. `dict` then stays as it is.
+    fn add_one_build_source(
+        dict: &mut Value,
+        commit: &Checksum,
+        name: &str,
+        source: &Checksum,
+    ) -> Result<()> {
+        let Value::Array(entries) = dict else {
+            return Err(Error::InvalidFormat(
+                "detached metadata must be an a{sv} dict".into(),
+            ));
+        };
+        let slot = entries.iter_mut().find_map(|entry| match entry {
+            Value::Tuple(fields) => match fields.as_mut_slice() {
+                [key, value] if key.as_str() == Some(RELATED_KEY) => Some(value),
+                _ => None,
+            },
+            _ => None,
+        });
+        let mut sources = match &slot {
+            Some(value) => {
+                let entries =
+                    entries_of_variant(value).map_err(|reason| Error::InvalidRelated {
+                        commit: Some(*commit),
+                        field: RelatedField::BuildSources,
+                        reason,
+                    })?;
+                checked_entries(RelatedField::BuildSources, Some(*commit), entries)?
+            }
+            None => Vec::new(),
+        };
+        sources.retain(|(stored, _)| stored != name);
+        sources.push((name.to_owned(), *source));
+        sources.sort_by(|(a, _), (b, _)| a.cmp(b));
+        let elements = sources
+            .into_iter()
+            .map(|(name, checksum)| {
+                Value::Tuple(vec![
+                    Value::Str(name),
+                    Value::Bytes(checksum.as_bytes().to_vec()),
+                ])
+            })
+            .collect();
+        let ty = Type::parse(RELATED_SIGNATURE).map_err(ostrya_core::Error::from)?;
+        let value = Value::variant(ty, Value::Array(elements));
+        match slot {
+            Some(slot) => *slot = value,
+            None => entries.push(Value::Tuple(vec![
+                Value::Str(RELATED_KEY.to_owned()),
+                value,
+            ])),
+        }
+        Ok(())
+    }
+
+    /// Returns the value of an `ostrya.related` entry with the elements
+    /// `elements`, each a name and the bytes of a checksum.
+    fn related_value(elements: &[(&str, &[u8])]) -> Value {
+        Value::variant(
+            Type::parse(RELATED_SIGNATURE).unwrap(),
+            Value::Array(
+                elements
+                    .iter()
+                    .map(|(name, bytes)| {
+                        Value::Tuple(vec![
+                            Value::Str((*name).into()),
+                            Value::Bytes(bytes.to_vec()),
+                        ])
+                    })
+                    .collect(),
+            ),
+        )
+    }
+
+    fn queued(entries: &[(&str, u8)]) -> Vec<(String, Checksum)> {
+        entries
+            .iter()
+            .map(|(name, byte)| ((*name).to_owned(), checksum(*byte)))
+            .collect()
+    }
+
+    /// Runs one call of [`add_one_build_source`] for each entry of
+    /// `sources`, in order, on a copy of `dict`.
+    fn by_one_add(
+        dict: &Value,
+        commit: &Checksum,
+        sources: &[(String, Checksum)],
+    ) -> Result<Value> {
+        let mut dict = dict.clone();
+        for (name, source) in sources {
+            add_one_build_source(&mut dict, commit, name, source)?;
+        }
+        Ok(dict)
+    }
+
+    /// Asserts that [`add_build_sources`] gives the result of one add for
+    /// each entry, and returns that result.
+    fn assert_same_as_one_add(dict: &Value, sources: Vec<(String, Checksum)>) -> Value {
+        let expected = by_one_add(dict, &checksum(9), &sources).unwrap();
+        let mut actual = dict.clone();
+        add_build_sources(&mut actual, &checksum(9), sources).unwrap();
+        assert_eq!(actual, expected);
+        actual
+    }
+
+    fn elements_of(dict: &Value) -> Vec<(String, Checksum)> {
+        let entries = build_sources(Some(dict)).unwrap().unwrap();
+        checked_entries(RelatedField::BuildSources, None, entries).unwrap()
+    }
+
+    #[test]
+    fn add_build_sources_appends_an_absent_entry_last() {
+        let other = Value::Tuple(vec![
+            Value::Str("ostree.other".into()),
+            Value::variant(Type::parse("s").unwrap(), Value::Str("x".into())),
+        ]);
+        let dict = Value::Array(vec![other.clone()]);
+        let result = assert_same_as_one_add(&dict, queued(&[("b/x", 1), ("a/x", 2)]));
+        let entries = result.as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0], other);
+        assert_eq!(
+            elements_of(&result),
+            vec![("a/x".into(), checksum(2)), ("b/x".into(), checksum(1))]
+        );
+    }
+
+    #[test]
+    fn add_build_sources_fills_an_empty_stored_array() {
+        let dict = detached(related_value(&[]));
+        let result = assert_same_as_one_add(&dict, queued(&[("b/x", 1), ("a/x", 2)]));
+        assert_eq!(
+            elements_of(&result),
+            vec![("a/x".into(), checksum(2)), ("b/x".into(), checksum(1))]
+        );
+    }
+
+    #[test]
+    fn add_build_sources_keeps_stored_duplicates_of_other_names() {
+        let dict = detached(related_value(&[
+            ("c/x", &[1; 32]),
+            ("a/d", &[2; 32]),
+            ("c/x", &[3; 32]),
+            ("a/d", &[4; 32]),
+        ]));
+        let result = assert_same_as_one_add(&dict, queued(&[("b/x", 5)]));
+        assert_eq!(
+            elements_of(&result),
+            vec![
+                ("a/d".into(), checksum(2)),
+                ("a/d".into(), checksum(4)),
+                ("b/x".into(), checksum(5)),
+                ("c/x".into(), checksum(1)),
+                ("c/x".into(), checksum(3)),
+            ]
+        );
+    }
+
+    #[test]
+    fn add_build_sources_keeps_the_stored_order_of_many_duplicates() {
+        // 64 stored elements under 8 names, 8 elements for each name. The
+        // names interleave and are not sorted. Each element has its own
+        // checksum, so the order of the elements of one name is observable.
+        let stored: Vec<(String, [u8; 32])> = (0u8..64)
+            .map(|index| (format!("d/{}", ((index % 8) * 5) % 8), [index + 1; 32]))
+            .collect();
+        let elements: Vec<(&str, &[u8])> = stored
+            .iter()
+            .map(|(name, bytes)| (name.as_str(), &bytes[..]))
+            .collect();
+        let dict = detached(related_value(&elements));
+        let result =
+            assert_same_as_one_add(&dict, queued(&[("z/x", 200), ("d/3a", 201), ("a/x", 202)]));
+
+        let actual = elements_of(&result);
+        assert_eq!(actual.len(), 67);
+        assert!(
+            actual
+                .windows(2)
+                .all(|pair| pair[0].0.as_bytes() <= pair[1].0.as_bytes())
+        );
+        for name in 0..8 {
+            let name = format!("d/{name}");
+            let expected: Vec<Checksum> = stored
+                .iter()
+                .filter(|(stored, _)| *stored == name)
+                .map(|(_, bytes)| checksum(bytes[0]))
+                .collect();
+            let got: Vec<Checksum> = actual
+                .iter()
+                .filter(|(stored, _)| *stored == name)
+                .map(|(_, value)| *value)
+                .collect();
+            assert_eq!(got, expected, "the elements of {name}");
+        }
+    }
+
+    #[test]
+    fn add_build_sources_collapses_stored_duplicates_of_a_queued_name() {
+        let dict = detached(related_value(&[
+            ("a/x", &[1; 32]),
+            ("b/x", &[3; 32]),
+            ("a/x", &[2; 32]),
+        ]));
+        let result = assert_same_as_one_add(&dict, queued(&[("a/x", 4)]));
+        assert_eq!(
+            elements_of(&result),
+            vec![("a/x".into(), checksum(4)), ("b/x".into(), checksum(3))]
+        );
+    }
+
+    #[test]
+    fn add_build_sources_takes_the_last_checksum_of_a_name() {
+        let dict = detached(related_value(&[("a/x", &[7; 32])]));
+        let result = assert_same_as_one_add(&dict, queued(&[("a/x", 1), ("b/x", 2), ("a/x", 3)]));
+        assert_eq!(
+            elements_of(&result),
+            vec![("a/x".into(), checksum(3)), ("b/x".into(), checksum(2))]
+        );
+    }
+
+    #[test]
+    fn add_build_sources_edits_the_first_of_two_entries() {
+        let second = Value::Tuple(vec![
+            Value::Str(RELATED_KEY.into()),
+            related_value(&[("z/x", &[8; 32])]),
+        ]);
+        let dict = Value::Array(vec![
+            Value::Tuple(vec![
+                Value::Str(RELATED_KEY.into()),
+                related_value(&[("b/x", &[7; 32])]),
+            ]),
+            second.clone(),
+        ]);
+        let result = assert_same_as_one_add(&dict, queued(&[("a/x", 1)]));
+        let entries = result.as_array().unwrap();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[1], second);
+        assert_eq!(
+            elements_of(&result),
+            vec![("a/x".into(), checksum(1)), ("b/x".into(), checksum(7))]
+        );
+    }
+
+    #[test]
+    fn add_build_sources_sorts_by_bytes() {
+        let dict = detached(related_value(&[("boot/uki", &[7; 32])]));
+        let result = assert_same_as_one_add(
+            &dict,
+            queued(&[
+                ("\u{e9}/x", 1),
+                ("a/x", 2),
+                ("boot/uki-2", 3),
+                ("z/x", 4),
+                ("Z/x", 5),
+            ]),
+        );
+        let names: Vec<String> = elements_of(&result)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(
+            names,
+            ["Z/x", "a/x", "boot/uki", "boot/uki-2", "z/x", "\u{e9}/x"]
+        );
+    }
+
+    #[test]
+    fn add_build_sources_of_an_empty_list_changes_nothing() {
+        let unsorted = detached(related_value(&[("b/x", &[1; 32]), ("a/x", &[2; 32])]));
+        let mut dict = unsorted.clone();
+        add_build_sources(&mut dict, &checksum(9), Vec::new()).unwrap();
+        assert_eq!(dict, unsorted);
+
+        let mut not_a_dict = Value::Str("x".into());
+        add_build_sources(&mut not_a_dict, &checksum(9), Vec::new()).unwrap();
+        assert_eq!(not_a_dict, Value::Str("x".into()));
+    }
+
+    #[test]
+    fn add_build_sources_refuses_a_value_that_is_not_a_dict() {
+        let dict = Value::Str("x".into());
+        let sources = queued(&[("a/x", 1)]);
+        let expected = match by_one_add(&dict, &checksum(9), &sources).unwrap_err() {
+            Error::InvalidFormat(text) => text,
+            other => panic!("expected InvalidFormat, got {other:?}"),
+        };
+        let mut actual = dict.clone();
+        match add_build_sources(&mut actual, &checksum(9), sources).unwrap_err() {
+            Error::InvalidFormat(text) => assert_eq!(text, expected),
+            other => panic!("expected InvalidFormat, got {other:?}"),
+        }
+        assert_eq!(actual, dict);
+    }
+
+    #[test]
+    fn add_build_sources_refuses_a_defective_stored_value() {
+        let shape = Value::variant(
+            Type::parse(RELATED_SIGNATURE).unwrap(),
+            Value::Array(vec![Value::Str("x".into())]),
+        );
+        let defective = [
+            Value::Str("x".into()),
+            Value::variant(
+                Type::parse("as").unwrap(),
+                Value::Array(vec![Value::Str("x".into())]),
+            ),
+            shape,
+            related_value(&[("a/x", &[1; 32]), ("b/x", &[2; 31])]),
+            related_value(&[("a/x", &[1; 32]), ("", &[2; 32])]),
+        ];
+        for value in defective {
+            let dict = detached(value);
+            let sources = queued(&[("c/x", 3), ("a/x", 4)]);
+            let expected = reason(by_one_add(&dict, &checksum(9), &sources).unwrap_err());
+            let mut actual = dict.clone();
+            let got = reason(add_build_sources(&mut actual, &checksum(9), sources).unwrap_err());
+            assert_eq!(got, expected);
+            assert_eq!(got.0, Some(checksum(9)));
+            assert_eq!(got.1, RelatedField::BuildSources);
+            assert_eq!(actual, dict);
+        }
+    }
+
+    #[test]
+    fn add_build_sources_sorts_a_long_list() {
+        fn numbered(number: u64) -> Checksum {
+            let mut bytes = [0u8; 32];
+            bytes[..8].copy_from_slice(&number.to_le_bytes());
+            Checksum::from_ay(&bytes).unwrap()
+        }
+        const COUNT: u64 = 3000;
+        // 7 and 3000 have no common factor, so the names are a permutation.
+        let mut sources: Vec<(String, Checksum)> = (0..COUNT)
+            .map(|index| (format!("pkg/{:04}", (index * 7) % COUNT), numbered(index)))
+            .collect();
+        let repeated = ["pkg/0005", "pkg/1234", "pkg/2999"];
+        for (offset, name) in (0u64..).zip(repeated) {
+            sources.push((name.to_owned(), numbered(COUNT + offset)));
+        }
+        let mut dict = detached(related_value(&[("pkg/stored", &[0xff; 32])]));
+        add_build_sources(&mut dict, &checksum(9), sources).unwrap();
+
+        let elements = elements_of(&dict);
+        assert_eq!(elements.len(), 3001);
+        assert!(
+            elements
+                .windows(2)
+                .all(|pair| pair[0].0.as_bytes() < pair[1].0.as_bytes())
+        );
+        for (offset, name) in (0u64..).zip(repeated) {
+            let (_, value) = elements.iter().find(|(stored, _)| stored == name).unwrap();
+            assert_eq!(*value, numbered(COUNT + offset));
+        }
+        // Index 1 gives the name pkg/0007.
+        let (_, value) = elements
+            .iter()
+            .find(|(stored, _)| stored == "pkg/0007")
+            .unwrap();
+        assert_eq!(*value, numbered(1));
+        assert_eq!(elements[3000], ("pkg/stored".into(), checksum(0xff)));
     }
 }

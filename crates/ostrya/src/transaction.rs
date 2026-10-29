@@ -769,9 +769,11 @@ impl Transaction {
     ///
     /// The write at [`commit`](Transaction::commit) adds the entry to the
     /// first `ostrya.related` entry of the detached metadata, as
-    /// [`Repo::add_detached_related`] does: it replaces the element with the
-    /// name `name` and keeps the elements sorted by name in byte order. The
-    /// adds apply in call order, after the dict that
+    /// [`Repo::add_detached_related`] does: it removes each element with the
+    /// name `name`, adds the new element, and keeps the elements sorted by
+    /// name in byte order. The write adds the entries of all calls for one
+    /// commit in one step. The result is the same as one add for each call,
+    /// in call order, after the dict that
     /// [`set_commit_detached_metadata`](Transaction::set_commit_detached_metadata)
     /// queued, or else after the stored dict. The signatures that
     /// [`sign_commit`](Transaction::sign_commit) queues come after the adds.

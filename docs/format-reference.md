@@ -2936,7 +2936,8 @@ The add of a build source (`Repo::add_detached_related` and
 `Transaction::add_detached_related`) edits the first `ostrya.related` entry
 of the dict:
 
-- It replaces the element with the same name, or adds a new element.
+- It removes each element with the name of the new element, also when two
+  or more elements have that name. Then it adds the new element.
 - It sorts the elements by name in byte order.
 - If the dict has no such entry, it appends one after the other entries. If
   the commit has no detached metadata, it writes a dict with the one entry.

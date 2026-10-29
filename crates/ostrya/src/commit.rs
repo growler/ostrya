@@ -814,12 +814,13 @@ impl Repo {
     /// its own, and the add can make a cycle.
     ///
     /// The call edits the first `ostrya.related` entry of the detached
-    /// metadata. It replaces the element with the name `name`, or adds a new
-    /// one, and sorts the elements by name in byte order. If the detached
-    /// metadata has no such entry, the call appends one after the other
-    /// entries. If the commit has no detached metadata, the call writes a new
-    /// dict with the one entry. Each other entry stays as it is. The new
-    /// file replaces the old file atomically.
+    /// metadata. It removes each element with the name `name`, also when two
+    /// or more elements have that name. Then it adds the new element and
+    /// sorts the elements by name in byte order. If the detached metadata has
+    /// no such entry, the call appends one after the other entries. If the
+    /// commit has no detached metadata, the call writes a new dict with the
+    /// one entry. Each other entry stays as it is. The new file replaces the
+    /// old file atomically.
     ///
     /// A local prune keeps the build sources of each commit that it reaches.
     /// [`Repo::prune`], "Related commits", states the rules.
@@ -969,8 +970,9 @@ pub(crate) fn append_dict_entry(metadata: &mut Value, key: &str, value: Value) -
 /// If `merge` is given, it holds a serialized `a{sv}` dict and a list of
 /// keys. The call merges that dict into the base dict with a union of each
 /// signature list. The listed keys keep the value that the base dict holds.
-/// Next, each entry of `build_sources` adds one build source to the first
-/// `ostrya.related` entry, in order, as [`Repo::add_detached_related`] states.
+/// Next, the call adds the entries of `build_sources` to the first
+/// `ostrya.related` entry in one step. The result is the same as one add of
+/// each entry, in order, as [`Repo::add_detached_related`] states.
 /// Then each entry of `appends` appends one signature to the `aay` array of
 /// its engine, in order. The result replaces the file atomically. If a step
 /// fails, the file stays as it was.
@@ -1006,9 +1008,7 @@ pub(crate) fn merge_detached_blocking(
             },
             _ => base.unwrap_or_else(|| Value::Array(Vec::new())),
         };
-        for (name, source) in build_sources {
-            related::add_build_source(&mut dict, checksum, &name, &source)?;
-        }
+        related::add_build_sources(&mut dict, checksum, build_sources)?;
         for (key, signature) in appends {
             crate::sign::append_signature(&mut dict, &key, signature)?;
         }

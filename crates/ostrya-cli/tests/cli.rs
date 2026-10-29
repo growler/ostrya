@@ -13535,6 +13535,56 @@ fn commit_related_refuses_a_malformed_or_absent_dependency() {
     );
 }
 
+/// `commit --related` checks each dependency one time: the run opens the
+/// commit object of the dependency one time and looks up its partial marker
+/// one time. The dependency is on another branch, so no other step of the
+/// command reads it.
+#[test]
+fn commit_related_checks_each_dependency_once() {
+    if !strace_available() {
+        return;
+    }
+    let tmp = TmpDir::new("commit-related-once");
+    let base = &tmp.path().canonicalize().expect("the temp dir resolves");
+    let repo = create_repo(base, RepoMode::Archive);
+    let repo_arg = format!("--repo={}", repo.display());
+    let dep = ex_ostrya_commit(&repo, base, "dep", Some("dep")).to_string();
+    let tree = ex_ostrya_tree(base, "head");
+    let trace = base.join("trace");
+    let out = Command::new("strace")
+        .args(["-y", "-f", "-e", "trace=openat,newfstatat,statx", "-o"])
+        .arg(&trace)
+        .arg(env!("CARGO_BIN_EXE_ostrya"))
+        .args([
+            "commit",
+            &repo_arg,
+            "-b",
+            "main",
+            "--timestamp=@1700000000",
+            &format!("--related=a/x={dep}"),
+            tree.to_str().unwrap(),
+        ])
+        .output()
+        .expect("strace runs");
+    assert!(
+        out.status.success(),
+        "commit failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // A path argument ends with a quote. The `strace -y` form of a descriptor
+    // ends with `>`, so a descriptor of the object is not counted.
+    let text = std::fs::read_to_string(&trace).expect("the trace is written");
+    let object = format!("{}/{}.commit\"", &dep[..2], &dep[2..]);
+    let marker = format!("{dep}.commitpartial\"");
+    let opens = text
+        .lines()
+        .filter(|line| line.contains("openat(") && line.contains(&object))
+        .count();
+    let stats = text.lines().filter(|line| line.contains(&marker)).count();
+    assert_eq!(opens, 1, "the opens of the dependency commit object");
+    assert_eq!(stats, 1, "the lookups of the partial marker");
+}
+
 /// Returns an `a{sv}` with the key `key` and an `a(say)` of `entries`.
 fn related_dict(key: &str, entries: &[(&str, &[u8])]) -> Value {
     let elements = entries

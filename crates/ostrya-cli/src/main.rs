@@ -7383,10 +7383,14 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
     txn.set_generate_sizes(args.generate_sizes && !walk.root_pruned);
     // The dependencies are checked before the tree is read, so a refused
     // dependency stops the command before the ingest and the composefs build.
-    if let Err(err) = txn.check_related(&related).await {
-        txn.abort().await?;
-        return Err(err);
-    }
+    // The commit write takes the checked list and does not check it again.
+    let checked = match txn.check_related(&related).await {
+        Ok(checked) => checked,
+        Err(err) => {
+            txn.abort().await?;
+            return Err(err);
+        }
+    };
 
     // From this point, a refusal first aborts the transaction. `exit_error`
     // runs no destructor, so the abort reaps the staging directory before the
@@ -7572,9 +7576,9 @@ async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>)
             body,
             timestamp,
             metadata: Some(metadata),
-            related,
+            related: Vec::new(),
         };
-        let checksum = txn.write_commit(opts, &root).await?;
+        let checksum = txn.write_commit_checked(opts, checked, &root).await?;
         if let Some(image) = image {
             txn.attach_composefs_image(&checksum, image).await?;
         }

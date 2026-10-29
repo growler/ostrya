@@ -2,6 +2,10 @@
 //!
 //! - [`Transaction::write_commit`] stages a commit object over a root tree,
 //!   with the options in [`CommitOptions`].
+//! - [`Transaction::check_related`] checks the dependencies of a new commit
+//!   before the tree is built, and gives a [`CheckedRelated`].
+//!   [`Transaction::write_commit_checked`] stages the commit with these
+//!   dependencies and does not check them again.
 //! - [`Repo::read_commit_detached_metadata`] and
 //!   [`Repo::write_commit_detached_metadata`] read and write the detached
 //!   metadata of a commit.
@@ -41,7 +45,8 @@ const SIZES_KEY: &str = "ostree.sizes";
 /// object.
 const COMMITMETA_MODE: u32 = 0o644;
 
-/// The options of [`Transaction::write_commit`].
+/// The options of [`Transaction::write_commit`] and
+/// [`Transaction::write_commit_checked`].
 ///
 /// Each field is optional. If `metadata` is set, it must be an `a{sv}` dict
 /// value. Its entries appear in the commit in insertion order. A caller that
@@ -72,9 +77,41 @@ pub struct CommitOptions {
     /// in the repository or in the writing transaction, and must have no
     /// dependency of its own. [`Transaction::write_commit`] states the rule.
     ///
+    /// [`Transaction::write_commit_checked`] refuses a list that is not
+    /// empty. The [`CheckedRelated`] that it takes gives the dependencies.
+    ///
     /// A local prune keeps the dependencies of each commit that it reaches.
     /// [`Repo::prune`], "Related commits", states the rules.
     pub related: Vec<(String, Checksum)>,
+}
+
+/// The dependencies of a new commit, after the checks of
+/// [`Transaction::check_related`].
+///
+/// [`Transaction::check_related`] gives it, and
+/// [`Transaction::write_commit_checked`] takes it. It holds the entries sorted
+/// by name in byte order, and it borrows the transaction that checked them.
+/// A drop writes and removes nothing.
+///
+/// While the value lives, the calls that take the transaction as `&mut self`
+/// or by value do not compile: [`set_fsync`](Transaction::set_fsync),
+/// [`set_per_object_fsync`](Transaction::set_per_object_fsync),
+/// [`set_generate_sizes`](Transaction::set_generate_sizes),
+/// [`commit`](Transaction::commit), and [`abort`](Transaction::abort). Call
+/// the setters before [`check_related`](Transaction::check_related).
+#[must_use = "write_commit_checked takes the checked dependencies"]
+pub struct CheckedRelated<'txn> {
+    txn: &'txn Transaction,
+    /// The entries, sorted by name in byte order.
+    entries: Vec<(String, Checksum)>,
+}
+
+impl std::fmt::Debug for CheckedRelated<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CheckedRelated")
+            .field("entries", &self.entries)
+            .finish_non_exhaustive()
+    }
 }
 
 /// Methods that write a commit object.
@@ -141,6 +178,11 @@ impl Transaction {
     /// and before it serializes the commit. On a refusal, it writes nothing
     /// and the transaction stays open.
     ///
+    /// A caller that checks the dependencies before it builds the tree calls
+    /// [`check_related`](Transaction::check_related) and then
+    /// [`write_commit_checked`](Transaction::write_commit_checked). Then each
+    /// dependency is checked one time.
+    ///
     /// # Errors
     ///
     /// - [`Error::Unsupported`] if the repository mode is `bare-split-xattrs`.
@@ -178,6 +220,94 @@ impl Transaction {
     ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
     /// - [`Error::Io`] if a file system operation fails.
     pub async fn write_commit(&self, mut opts: CommitOptions, root: &RepoTree) -> Result<Checksum> {
+        self.resolve_commit_options(&mut opts)?;
+        let checked = self
+            .check_owned_related(std::mem::take(&mut opts.related))
+            .await?;
+        opts.related = checked.entries;
+        self.write_commit_unchecked(opts, root).await
+    }
+
+    /// Stages a commit object over the tree `root` with the dependencies
+    /// `related`, and returns its checksum.
+    ///
+    /// The call writes the commit as [`write_commit`](Transaction::write_commit)
+    /// does. Field 2 of the commit object holds the entries of `related`,
+    /// sorted by name in byte order. `opts.related` must be empty. For the
+    /// same inputs, the call and `write_commit` give the same commit.
+    ///
+    /// The call does not check the dependencies again.
+    /// [`check_related`](Transaction::check_related) checked them. A process
+    /// outside the transaction can make a dependency partial or absent after
+    /// that check: for example, an fsck, which takes no repository lock, or a
+    /// prune in a repository with `[core] locking=false`. The call does not
+    /// refuse such a dependency, and an fsck reports it.
+    ///
+    /// # Errors
+    ///
+    /// The call checks the origin of `related`, then `opts.related`, then the
+    /// repository mode, then the timestamp. On these refusals, it writes
+    /// nothing and the transaction stays open.
+    ///
+    /// - [`Error::InvalidInput`] if `related` comes from another transaction.
+    /// - [`Error::InvalidInput`] if `opts.related` is not empty.
+    /// - [`Error::Unsupported`] if the repository mode is `bare-split-xattrs`.
+    /// - [`Error::Unsupported`] if `[ex-integrity] fsverity` is `yes` and the
+    ///   fs-verity seal fails.
+    /// - [`Error::InvalidFormat`] if `opts.timestamp` is `None` and
+    ///   `SOURCE_DATE_EPOCH` is not a count of seconds.
+    /// - [`Error::InvalidFormat`] if the call reads the system clock and the
+    ///   clock is before the Unix epoch.
+    /// - [`Error::InvalidFormat`] if the call adds `ostree.sizes` and
+    ///   `opts.metadata` is not an array value.
+    /// - [`Error::InvalidFormat`] if `[ex-integrity] fsverity` or
+    ///   `[ex-integrity] composefs` in the repository config is malformed.
+    /// - [`Error::Core`] if the commit does not serialize: `opts.metadata` is
+    ///   not an `a{sv}` dict, a string holds an interior NUL byte, or the
+    ///   metadata nests too deep.
+    /// - [`Error::Core`] if `[core] fsync` or `[core] per-object-fsync` in the
+    ///   repository config is malformed.
+    /// - [`Error::Core`] if the call adds `ostree.sizes` and a dirtree that
+    ///   the commit reaches does not parse.
+    /// - [`Error::ObjectNotFound`] if the call adds `ostree.sizes` and an
+    ///   object that the commit reaches is in neither the staging directory
+    ///   nor `objects/`.
+    /// - The errors of [`load_file`](Repo::load_file) if the call adds
+    ///   `ostree.sizes` and a file object from `objects/` does not load.
+    /// - [`Error::InsufficientFreeSpace`] if the commit object needs more
+    ///   space than the free-space budget of the transaction holds.
+    /// - [`Error::Io`] if the call adds `ostree.sizes` and a dirtree that the
+    ///   commit reaches is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
+    /// - [`Error::Io`] if a file system operation fails.
+    pub async fn write_commit_checked(
+        &self,
+        mut opts: CommitOptions,
+        related: CheckedRelated<'_>,
+        root: &RepoTree,
+    ) -> Result<Checksum> {
+        if !std::ptr::eq(related.txn, self) {
+            return Err(Error::InvalidInput(
+                "the checked dependencies come from another transaction".into(),
+            ));
+        }
+        if !opts.related.is_empty() {
+            return Err(Error::InvalidInput(
+                "the commit options name dependencies; the checked dependencies give them".into(),
+            ));
+        }
+        self.resolve_commit_options(&mut opts)?;
+        opts.related = related.entries;
+        self.write_commit_unchecked(opts, root).await
+    }
+
+    /// Refuses a `bare-split-xattrs` repository and sets `opts.timestamp` to
+    /// the commit time.
+    ///
+    /// [`write_commit`](Transaction::write_commit) and
+    /// [`write_commit_checked`](Transaction::write_commit_checked) make these
+    /// steps before they write.
+    fn resolve_commit_options(&self, opts: &mut CommitOptions) -> Result<()> {
         if self.repo().mode() == RepoMode::BareSplitXattrs {
             return Err(Error::Unsupported(
                 "bare-split-xattrs is read-only; the port does not write it".into(),
@@ -186,9 +316,7 @@ impl Transaction {
         let timestamp = ostrya_core::commit_timestamp(opts.timestamp)
             .map_err(|e| Error::InvalidFormat(e.to_string()))?;
         opts.timestamp = Some(timestamp);
-        self.check_related(&opts.related).await?;
-        opts.related.sort_by(|(a, _), (b, _)| a.cmp(b));
-        self.write_commit_unchecked(opts, root).await
+        Ok(())
     }
 
     /// Checks the dependencies `related` of a new commit, as
@@ -206,6 +334,10 @@ impl Transaction {
     /// The call reads no tree. A caller can call it before it builds a large
     /// tree, so that a refused dependency stops the work before the build.
     ///
+    /// Returns the checked entries, sorted by name in byte order.
+    /// [`write_commit_checked`](Transaction::write_commit_checked) takes them
+    /// and writes the commit with no second check.
+    ///
     /// # Errors
     ///
     /// - [`Error::InvalidRelated`] with no commit, if an entry of `related`
@@ -216,17 +348,34 @@ impl Transaction {
     /// - [`Error::Io`] if the commit object of a dependency with no partial
     ///   marker is larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE),
     ///   or if a file system operation fails.
-    pub async fn check_related(&self, related: &[(String, Checksum)]) -> Result<()> {
-        let sorted = related::sorted_new(related)?;
-        related::check_dependencies(self, None, sorted).await
+    pub async fn check_related(
+        &self,
+        related: &[(String, Checksum)],
+    ) -> Result<CheckedRelated<'_>> {
+        self.check_owned_related(related.to_vec()).await
+    }
+
+    /// Checks the dependencies `related` as
+    /// [`check_related`](Transaction::check_related) does, and keeps the
+    /// entries in the result with no copy.
+    async fn check_owned_related(
+        &self,
+        related: Vec<(String, Checksum)>,
+    ) -> Result<CheckedRelated<'_>> {
+        let entries = related::sorted_new(related)?;
+        related::check_dependencies(self, None, &entries).await?;
+        Ok(CheckedRelated { txn: self, entries })
     }
 
     /// Writes a commit as [`write_commit`](Transaction::write_commit) does,
     /// with no check of the dependencies.
     ///
-    /// Field 2 holds the entries of `opts.related` in the given order. The
-    /// anchor commit of a summary uses this path, because it has no
-    /// dependency. A `bare-split-xattrs` repository refuses the write in
+    /// Field 2 holds the entries of `opts.related` in the given order.
+    /// [`write_commit`](Transaction::write_commit) and
+    /// [`write_commit_checked`](Transaction::write_commit_checked) call it
+    /// with the sorted entries after the check. The anchor commit of a
+    /// summary uses this path, because it has no dependency. A
+    /// `bare-split-xattrs` repository refuses the write in
     /// [`write_metadata`](Transaction::write_metadata).
     pub(crate) async fn write_commit_unchecked(
         &self,

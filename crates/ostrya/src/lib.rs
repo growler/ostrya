@@ -159,7 +159,7 @@ pub use bucket::{
 #[doc(hidden)]
 pub use checkout::{CheckoutFilterFn, CheckoutMode, CheckoutOptions, OverwriteMode};
 #[doc(hidden)]
-pub use commit::CommitOptions;
+pub use commit::{CheckedRelated, CommitOptions};
 #[doc(hidden)]
 pub use composefs::{
     ComposefsImageAdd, ComposefsImageState, ComposefsOptions, StagedComposefsImage, VerityPolicy,

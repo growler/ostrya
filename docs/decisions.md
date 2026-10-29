@@ -2077,6 +2077,20 @@ the rules.
   initrd, or a container needs no dependency of its own. With one level,
   field 2 cannot make a cycle, and a check reads one commit and the commits
   that it names.
+- The commit write of `ostrya commit` checks each dependency one time.
+  `Transaction::check_related` checks the dependencies before the command
+  reads the tree, and gives a `CheckedRelated` that borrows the transaction.
+  `Transaction::write_commit_checked` takes it and writes the sorted entries
+  with no second check. It refuses a `CheckedRelated` of another
+  transaction. A process outside the transaction can make a dependency
+  partial or absent after the check: an fsck, which takes no repository
+  lock, or a prune in a repository with `[core] locking=false`. The write
+  does not refuse such a dependency, and an fsck reports it. The same
+  window is open after the write until the transaction publishes. Two
+  alternatives were rejected. A public write with no check was rejected:
+  each user of the library can then write a field 2 that is not sorted or
+  not checked. A record of the checked lists in the transaction was
+  rejected: it is state that the caller does not see.
 - A local prune roots on the commits that field 2 and `ostrya.related` of
   each reached commit name. The walk treats each such commit as a root of
   its own, at the global bound of the run.

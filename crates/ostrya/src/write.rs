@@ -747,7 +747,9 @@ impl Transaction {
     /// of the object.
     ///
     /// The call checks no entry of field 2 of a commit.
-    /// [`write_commit`](Transaction::write_commit) checks them.
+    /// [`write_commit`](Transaction::write_commit) checks them, and
+    /// [`write_commit_checked`](Transaction::write_commit_checked) writes the
+    /// entries that [`check_related`](Transaction::check_related) checked.
     ///
     /// # Errors
     ///

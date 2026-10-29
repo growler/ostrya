@@ -740,13 +740,14 @@ pub(crate) fn dependency_reason(name: &str, dependency: &Checksum, end: &str) ->
 /// Returns the dependencies `entries` of a new commit, sorted by name in byte
 /// order.
 ///
-/// The call does no I/O and does not change `entries`. The sort is stable.
+/// The call does no I/O. The sort is stable. The index in the error for an
+/// empty name is the position of the entry in `entries` before the sort.
 ///
 /// # Errors
 ///
 /// [`Error::InvalidRelated`] with no commit, if an entry has an empty name or
 /// if two entries have the same name.
-pub(crate) fn sorted_new(entries: &[(String, Checksum)]) -> Result<Vec<&(String, Checksum)>> {
+pub(crate) fn sorted_new(mut entries: Vec<(String, Checksum)>) -> Result<Vec<(String, Checksum)>> {
     if let Some(index) = entries.iter().position(|(name, _)| name.is_empty()) {
         return Err(Error::InvalidRelated {
             commit: None,
@@ -754,10 +755,9 @@ pub(crate) fn sorted_new(entries: &[(String, Checksum)]) -> Result<Vec<&(String,
             reason: format!("entry {index} has an empty name"),
         });
     }
-    let mut sorted: Vec<&(String, Checksum)> = entries.iter().collect();
-    sorted.sort_by(|(a, _), (b, _)| a.cmp(b));
-    check_order(None, sorted.iter().map(|(name, _)| name.as_str()))?;
-    Ok(sorted)
+    entries.sort_by(|(a, _), (b, _)| a.cmp(b));
+    check_order(None, entries.iter().map(|(name, _)| name.as_str()))?;
+    Ok(entries)
 }
 
 /// Checks that the names of the dependencies are sorted in byte order, with
@@ -1012,23 +1012,26 @@ mod tests {
             ("Z/upper".into(), checksum(3)),
             ("boot/uki-2".into(), checksum(4)),
         ];
-        let sorted = sorted_new(&entries).unwrap();
+        let sorted = sorted_new(entries).unwrap();
         let names: Vec<&str> = sorted.iter().map(|(name, _)| name.as_str()).collect();
         assert_eq!(names, ["Z/upper", "boot/uki", "boot/uki-2", "container/fe"]);
-        assert_eq!(entries[0].0, "container/fe", "the input keeps its order");
     }
 
     #[test]
     fn sorted_new_refuses_empty_and_duplicate_names() {
         let (commit, field, text) = reason(
-            sorted_new(&[("a".into(), checksum(1)), (String::new(), checksum(2))]).unwrap_err(),
+            sorted_new(vec![
+                ("a".into(), checksum(1)),
+                (String::new(), checksum(2)),
+            ])
+            .unwrap_err(),
         );
         assert_eq!(commit, None);
         assert_eq!(field, RelatedField::Dependencies);
         assert_eq!(text, "entry 1 has an empty name");
 
         let (_, _, text) = reason(
-            sorted_new(&[
+            sorted_new(vec![
                 ("b".into(), checksum(1)),
                 ("a".into(), checksum(2)),
                 ("b".into(), checksum(3)),

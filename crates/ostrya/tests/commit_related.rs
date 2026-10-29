@@ -3,7 +3,9 @@
 //! `Transaction::write_commit` writes `CommitOptions::related` into field 2
 //! of the commit object, sorted by name, and refuses dependencies that are
 //! defective, not complete, or nested. `Transaction::check_related` runs the
-//! same checks before a tree is built. `Repo::commit_add_composefs_metadata`
+//! same checks before a tree is built, and `Transaction::write_commit_checked`
+//! writes the checked list with no second check.
+//! `Repo::commit_add_composefs_metadata`
 //! keeps field 2 and applies the same check. `Repo::read_commit_related`
 //! reads field 2 and the detached key `ostrya.related`.
 //! `Repo::add_detached_related` and `Transaction::add_detached_related` add
@@ -374,9 +376,9 @@ fn check_related_runs_the_checks_of_write_commit() {
         );
         // An accepted list stays in the order of the caller.
         let accepted = owned(&[("b/x", dep), ("a/x", c)]);
-        txn.check_related(&accepted).await.unwrap();
+        let _ = txn.check_related(&accepted).await.unwrap();
         assert_eq!(accepted, owned(&[("b/x", dep), ("a/x", c)]));
-        txn.check_related(&[]).await.unwrap();
+        let _ = txn.check_related(&[]).await.unwrap();
         txn.abort().await.unwrap();
     });
 }
@@ -444,6 +446,166 @@ fn check_related_refuses_a_staged_dependency_with_a_partial_marker() {
             )
         );
         txn.abort().await.unwrap();
+    });
+}
+
+/// Writes the partial marker of `commit` in `repo`.
+fn mark_partial(repo: &Repo, commit: &Checksum) {
+    let state = repo.path().join("state");
+    std::fs::create_dir_all(&state).unwrap();
+    std::fs::write(state.join(format!("{commit}.commitpartial")), b"").unwrap();
+}
+
+/// Returns the text of an [`Error::InvalidInput`].
+fn invalid_input(err: Error) -> String {
+    match err {
+        Error::InvalidInput(text) => text,
+        other => panic!("expected InvalidInput, got {other:?}"),
+    }
+}
+
+/// The write through the checked list does not check the dependencies again:
+/// a partial marker that comes after the check does not stop the write.
+/// `write_commit` refuses the same dependency.
+#[test]
+fn write_commit_checked_does_not_check_again() {
+    let tmp = TmpDir::new("related-checked-once");
+    block_on(async {
+        let repo = repo_with_trees(tmp.path(), &["fe", "uki", "head"]).await;
+        let fe = commit(&repo, tmp.path(), "fe", &[]).await;
+        let uki = commit(&repo, tmp.path(), "uki", &[]).await;
+        let unsorted = owned(&[("container/fe", fe), ("boot/uki", uki)]);
+
+        let txn = repo.transaction().await.unwrap();
+        let checked = txn.check_related(&unsorted).await.unwrap();
+        mark_partial(&repo, &fe);
+        let root = stage_tree(&txn, tmp.path(), "head").await;
+        let head = txn
+            .write_commit_checked(options("head", &[]), checked, &root)
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        let (stored, _) = repo.load_commit(&head).await.unwrap();
+        assert_eq!(
+            stored.related,
+            field2(&[("boot/uki", uki), ("container/fe", fe)])
+        );
+
+        let txn = repo.transaction().await.unwrap();
+        let root = stage_tree(&txn, tmp.path(), "head").await;
+        let mut opts = options("head", &[]);
+        opts.related = unsorted;
+        let err = txn.write_commit(opts, &root).await.unwrap_err();
+        assert_eq!(
+            related_error(err),
+            (
+                None,
+                RelatedField::Dependencies,
+                format!("dependency container/fe names commit {fe}, which is partial")
+            )
+        );
+        txn.abort().await.unwrap();
+    });
+}
+
+/// A checked list from another transaction is refused before the write. The
+/// call stages nothing, and the transaction stays usable.
+#[test]
+fn write_commit_checked_refuses_a_list_of_another_transaction() {
+    let tmp = TmpDir::new("related-checked-other");
+    block_on(async {
+        let repo = repo_with_trees(tmp.path(), &["dep", "head"]).await;
+        let dep = commit(&repo, tmp.path(), "dep", &[]).await;
+        let other = repo.transaction().await.unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let root = stage_tree(&txn, tmp.path(), "head").await;
+        let checked = other.check_related(&owned(&[("a/x", dep)])).await.unwrap();
+
+        let staged_before = staged(&repo);
+        let err = txn
+            .write_commit_checked(options("head", &[]), checked, &root)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            invalid_input(err),
+            "the checked dependencies come from another transaction"
+        );
+        assert_eq!(staged(&repo), staged_before, "the call stages nothing");
+        other.abort().await.unwrap();
+
+        let checked = txn.check_related(&owned(&[("a/x", dep)])).await.unwrap();
+        let head = txn
+            .write_commit_checked(options("head", &[]), checked, &root)
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        assert_eq!(
+            repo.read_commit_related(&head).await.unwrap().dependencies,
+            owned(&[("a/x", dep)])
+        );
+    });
+}
+
+/// The checked list gives the dependencies alone, so `opts.related` must be
+/// empty. The call stages nothing, and the transaction stays usable.
+#[test]
+fn write_commit_checked_refuses_dependencies_in_the_options() {
+    let tmp = TmpDir::new("related-checked-options");
+    block_on(async {
+        let repo = repo_with_trees(tmp.path(), &["dep", "head"]).await;
+        let dep = commit(&repo, tmp.path(), "dep", &[]).await;
+        let txn = repo.transaction().await.unwrap();
+        let root = stage_tree(&txn, tmp.path(), "head").await;
+        let checked = txn.check_related(&owned(&[("a/x", dep)])).await.unwrap();
+
+        let staged_before = staged(&repo);
+        let err = txn
+            .write_commit_checked(options("head", &[("a/x", dep)]), checked, &root)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            invalid_input(err),
+            "the commit options name dependencies; the checked dependencies give them"
+        );
+        assert_eq!(staged(&repo), staged_before, "the call stages nothing");
+
+        let checked = txn.check_related(&owned(&[("a/x", dep)])).await.unwrap();
+        let head = txn
+            .write_commit_checked(options("head", &[]), checked, &root)
+            .await
+            .unwrap();
+        txn.commit().await.unwrap();
+        assert_eq!(
+            repo.read_commit_related(&head).await.unwrap().dependencies,
+            owned(&[("a/x", dep)])
+        );
+    });
+}
+
+/// For the same inputs, the write through the checked list and `write_commit`
+/// give the same commit.
+#[test]
+fn write_commit_checked_gives_the_commit_of_write_commit() {
+    let tmp = TmpDir::new("related-checked-same");
+    block_on(async {
+        let repo = repo_with_trees(tmp.path(), &["fe", "uki", "head"]).await;
+        let fe = commit(&repo, tmp.path(), "fe", &[]).await;
+        let uki = commit(&repo, tmp.path(), "uki", &[]).await;
+        let unsorted = [("container/fe", fe), ("boot/uki", uki)];
+
+        let txn = repo.transaction().await.unwrap();
+        let root = stage_tree(&txn, tmp.path(), "head").await;
+        let checked = txn.check_related(&owned(&unsorted)).await.unwrap();
+        let through_list = txn
+            .write_commit_checked(options("head", &[]), checked, &root)
+            .await
+            .unwrap();
+        let direct = txn
+            .write_commit(options("head", &unsorted), &root)
+            .await
+            .unwrap();
+        assert_eq!(through_list, direct);
+        txn.commit().await.unwrap();
     });
 }
 

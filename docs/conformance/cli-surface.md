@@ -451,12 +451,8 @@ deliberately not reproduced:
   2026.1 removes such a signature under four selectors -- the key id and the
   whole fingerprint of the signing key, and the key id and the whole
   fingerprint of the certificate -- measured over a signature a signing subkey
-  made. The port holds both keys in its own record, so `ostrya sign --delete`
-  reaches the same signature under the key id of either key
-  (`crates/ostrya-cli/tests/cli.rs`,
-  `sign_delete_reaches_a_signature_that_does_not_verify`). It matches a KEY-ID
-  against the tail of either fingerprint, so the whole fingerprint of either
-  key reaches it as well;
+  made. The port holds both keys in its own record. No command of the port
+  removes a signature (`sign`, "`-d/--delete`");
 - the verdict the report states rests on the port's own trust and validity
   policy, which "GPG verification differences" compares with GnuPG 2.4.9.
   Seven differences stand there, and each one can make a `show` verdict part
@@ -1431,8 +1427,34 @@ ref in both: a key that cannot sign leaves the ref where it stood and publishes
 nothing, and a ref write that cannot happen leaves the commit and its
 `.commitmeta` durable in `objects/` with no ref. Both write the same
 `.commitmeta` bytes for a given ed25519 key set, and each one's GPG signature
-verifies through the other's `show --gpg-verify-remote`. Twelve divergences
+verifies through the other's `show --gpg-verify-remote`. Fourteen divergences
 stand.
+
+- The engine of each key. This difference is in the bytes of the repository.
+  The tool applies the last `--sign-type` to each `--sign` and
+  `--sign-from-file` key. The port gives each key the engine of the nearest
+  `--sign-type` before it on the command line, and gives `ed25519` to a key
+  before the first `--sign-type`. For `--sign-type=spki --sign=A
+  --sign-type=ed25519 --sign=B`, the tool signs A and B with ed25519, and the
+  port signs A with spki and B with ed25519. For `--sign=K --sign-type=spki`,
+  the tool signs K with spki, and the port refuses the run (the next item).
+  The order of the signatures is the same in both: the `--sign` keys, then the
+  `--sign-from-file` keys, then the `--gpg-sign` keys.
+- A `--sign-type` with no key of its own. The port refuses a `--sign-type`
+  that has no key after it and before the next `--sign-type`, at exit 1, with
+  `error: --sign-type=NAME has no key of its own; give a key after it and
+  before the next --sign-type`. It writes no object and moves no ref.
+  Examples are `--sign-type=spki` with no key, `--sign=K --sign-type=spki`,
+  and `--sign-type=spki --sign-type=ed25519 --sign=A`. `--gpg-sign` is not a
+  key of a `--sign-type`, so the port also refuses `--sign-type=gpg
+  --gpg-sign=K` with no other key, where the tool signs with K. The tool
+  reads `--sign-type` only where a key needs an engine, so a `--sign-type`
+  with no key commits (`commit/sign-type-unread-without-a-key`). The port
+  reads each name in command-line order before this check. So it refuses a
+  name that no engine carries also with no key, and also before a name of an
+  engine. The tool reads the last name alone, so `--sign-type=nosuch
+  --sign-type=ed25519 --sign=K` commits in the tool and is refused by the port
+  (`commit/sign-type-last-occurrence-decides`).
 
 - `--sign-type=gpg` names an engine the port carries and the tool build does
   not. The tool's build reports `error: Requested signature type is not
@@ -2536,14 +2558,22 @@ of the spki engine holds PEM `PRIVATE KEY` blocks, the form of a `sign
 that names a directory ends `summary -u` with exit 1 in both implementations,
 in different words ("P1", `refs`). The port's `summary
 --verify` reads the key sources of its `sign --verify` (`cli-behavior.md`, "CLI
-output formats", `sign`, "The key sources of `sign`"). On this command the tool
+output formats", `sign`, "The key sources of `sign`"), with one verifier for
+each engine, and refuses `--sign` and `--gpg-sign`. With `--remote`, it reads
+the keys of the remote alone, for the engines that `gpg-verify-summary` and
+`sign-verify-summary` of the remote turn on. A `-s` with no key selects its
+engine, and the port then reads the keys of the selected engines alone. The
+multi-engine report reads `summary` and `summary.sig` one time, so each
+engine checks the same bytes. The port refuses `--remote` in each mode other
+than `--verify`, `-u` and the read options included, with `error: signature:
+--remote applies to --verify alone`. On this command the tool
 binds `-v` to `--view`, and `--verbose` has no short form. The port carries the
 same shape: `summary` declares `-v/--view` and a long-only `--verbose`, and
 every other subcommand, together with the top level, keeps `-v/--verbose`. `-m`,
 `--sign`, and `--gpg-sign` are read with `-u` alone, and both implementations
 check every one of them before the regeneration, so a refusal leaves `summary`
 and `summary.sig` as they stood (`cli-behavior.md`, "CLI output formats",
-`summary`, "The `-u` checks"). Fourteen differences stand.
+`summary`, "The `-u` checks"). Sixteen differences stand.
 
 - `-v` does not turn on the debug stream. The tool binds `-v` to `--view` and
   `--verbose` together and writes `OT: using fuse: 0` for a read-only view; the
@@ -2603,11 +2633,26 @@ and `summary.sig` as they stood (`cli-behavior.md`, "CLI output formats",
   `static-delta` entry below records for the index files. The entries and each
   digest agree. For some sets the tool's order is name order by chance, and
   the two maps then agree;
+- the engine of each key, the rule `commit --sign-type` records. The tool
+  applies the last `--sign-type` to each `--sign`, positional, and
+  `--keys-file` key. The port gives each key the engine of the nearest
+  `--sign-type` before it, and `ed25519` to a key before the first
+  `--sign-type`. `--gpg-sign` is not a key of a `--sign-type`;
+- a `--sign-type` with no key of its own, the rule `commit --sign-type`
+  records. The port refuses it at exit 1 in each mode of `summary` other than
+  `--verify`, the read options included, and keeps `summary` and
+  `summary.sig`. It reads each name first, so a name that no engine carries
+  gets the refusal of the name. The tool reads `--sign-type` only where a key
+  needs an engine: `-u --sign-type=ed25519` with no key signs nothing and
+  removes `summary.sig` (`summary/update-without-sign-drops-sig`), and `-u
+  --sign-type=bogus` with no key runs (`summary/sign-type-unread-without-a-key`).
+  A `--verify` run with no key takes each `--sign-type` as a selection of its
+  engine;
 - `--sign-type=gpg` names an engine the port carries and the tool build does
   not, the rule `commit --sign-type` already records. The tool's build reports
   `error: Requested signature type is not implemented` for `gpg` beside
-  `--sign`, where the port reads the key under `gpg` when it is built with the
-  `gpg` feature. The port looks up a `gpg` selector given to `--sign` or as a
+  `--sign`, where the port reads a key after `--sign-type=gpg` under `gpg` when
+  it is built with the `gpg` feature. The port looks up a `gpg` selector given to `--sign` or as a
   positional key before the regeneration, the way it looks up a `--gpg-sign`
   selector. Under `spki` both read the key before the regeneration: the
   `ostree` 2026.1 build with OpenSSL on the NixOS development host, and the
@@ -2682,7 +2727,7 @@ states for `commit --sign-type`. `reindex` takes `--to=REV`, which rewrites or
 removes the index file of one target and reads REV by the rule of one half of a
 delta name; the last `--to` wins. A `--keys-file` and each key-store file of
 the spki engine hold PEM `PUBLIC KEY` blocks (`format-reference.md`, "Signing
-details", "spki"). Forty-five differences stand on `show`,
+details", "spki"). Fifty differences stand on `show`,
 `delete`, `list`, `indexes`, `verify`, `apply-offline`, and `reindex`.
 
 - a superblock file over 128 MiB (134217728 bytes). The port refuses it in
@@ -2979,7 +3024,8 @@ details", "spki"). Forty-five differences stand on `show`,
   signature: ed25519: no keys loaded`, and a later `--keys-dir` replaces the
   file. The port reports `error: signature: the
   key file '<path>/trusted.ed25519' cannot be opened: Not a directory (os
-  error 20)`. Both
+  error 20)`, and a later `--keys-dir` does not change the refusal, because
+  the port reads each `--keys-dir`. Both
   exit 1 with nothing on standard output;
 - a 32-byte `verify` key that decodes to no curve point. The port refuses
   every run that carries such a key before standard output with `error:
@@ -3117,9 +3163,10 @@ order, as in the tool. Only a little-endian host is observed.
   before the repository reads, and nothing is written. `clap` reads every
   option value before the port checks `--set-endianness`, so
   `--set-endianness=q --max-chunk-size=abc` gets the `clap` refusal where the
-  tool writes `error: Invalid endianness 'q'`. An unknown `--sign-type` beside
-  an invalid endianness value takes the same order. Both exit 1 and write
-  nothing;
+  tool writes `error: Invalid endianness 'q'`. The port reads each
+  `--sign-type` value before `--set-endianness`, so an unknown `--sign-type`
+  beside an invalid endianness value gets the refusal of the name. Both exit 1
+  and write nothing;
 - `--max-chunk-size=0`. The tool writes one object in each part and exits 0.
   The port refuses at exit 1 after the block with `error: invalid format:
   static delta max chunk size must be positive`, and writes nothing;
@@ -3182,8 +3229,45 @@ order, as in the tool. Only a little-endian host is observed.
   block. Both exit 1 and write no superblock;
 - an unknown `--sign-type`. The tool ignores it where no key is given, and
   refuses it with `error: Requested signature type is not implemented` after
-  the parts are written where a key is given. `clap` refuses it at exit 1
-  before the repository reads.
+  the parts are written where a key is given. The port reads each
+  `--sign-type` value as the first step of the command, after the repository
+  resolves and before the block, also where no key is given. It refuses the
+  name with the same line at exit 1, and writes nothing;
+- the engine of each key of `generate`, the rule `commit --sign-type` records
+  ("P2", `commit`). This difference is in the bytes of the repository. The
+  tool applies the last `--sign-type` to each `--sign` and `--keys-file` key.
+  The port gives each key the engine of the nearest `--sign-type` before it,
+  and `ed25519` to a key before the first `--sign-type`. The superblock of
+  the port then holds the signatures of each engine, the `--sign` keys first;
+- a `--sign-type` of `generate` with no key of its own, the rule `commit
+  --sign-type` records. The port refuses it at exit 1 before the block, and
+  writes nothing. The tool reads `--sign-type` only where a key is given;
+- the engine of each key of `verify` and `apply-offline`. The tool applies the
+  last `--sign-type` to each KEY-ID and `--keys-file` key. The port gives each
+  key the engine of the nearest `--sign-type` before it, and `ed25519` to a
+  key before the first `--sign-type`. It reads the last `--keys-file` of each
+  engine, and verifies with one verifier for each engine. Each engine must
+  have a valid signature. `verify` prints `Verification OK` one time, or the
+  failure line of the first engine that fails. The tool reads one engine;
+- a `--sign-type` of `verify` and `apply-offline` with no key of its own. With
+  a key on the command line, the port refuses it at exit 1 before standard
+  output. `verify` with no key takes each `--sign-type` as a selection of its
+  engine, and verifies with the selected engines alone. `apply-offline`
+  refuses it also with no key and with a `--keys-dir`, where the tool applies
+  an unsigned delta and, with no key source, a signed delta with no check. The
+  refusal of a name comes first, so `apply-offline --sign-type=nosuch` keeps
+  the line of the tool (`static-delta/apply-offline-sign-type-unknown`);
+- the key directories of `verify` and `apply-offline`. The tool reads the last
+  `--keys-dir` alone, and the system key directories `/etc/ostree` and
+  `/usr/share/ostree` where no `--keys-dir` is given. The port reads the
+  system key directories and then each `--keys-dir`, and a revoked key of one
+  directory applies to the keys of each directory. With no key, it verifies
+  with each engine that has a trusted key in them. A run that finds no engine
+  is refused at exit 1 with `error: signature: no keys loaded: the key
+  directories hold no ed25519 or spki key`, where the tool writes `error:
+  signature: ed25519: no keys loaded` (`static-delta/verify-no-keys`).
+  `apply-offline` with a `--keys-dir` and no key reads the system key
+  directories as well.
 
 The port adds `--output-dir=DIR`, which writes the superblock and the parts to
 DIR, `--timestamp`, `--reindex`, `--gpg-homedir`, and `-s` for
@@ -3722,29 +3806,29 @@ nothing, since `pull-local` reads no delta by default. Nine differences stand:
   dependencies"). The tool imports no dependency (`cli-behavior.md`,
   "Related commits in a pull").
 
-`sign` accepts the whole tool option set and adds `--gpg-homedir`,
-`--remote`, and the `gpg` engine. The `ostree` 2026.1 build with OpenSSL on
-the NixOS development host carries `-s spki` in signing, `--verify`, and
-`-d`. A tool build without the features `openssl` and `sign-spki` refuses
-`-s spki` in each with `error: Requested signature type is not implemented`
-at exit 1. Under `-s gpg` each `--keys-file` of a verify or a
-`-d` is a keyring, and every keyring given is read; a gpg signing run refuses
-`--keys-file`. Under `ed25519` and `spki`,
-`--verify` reads the key sources of `static-delta verify`: the positionals and
-the last `--keys-file`, either one leaving `--keys-dir` unread, the last
-`--keys-dir`, an empty one naming the working directory, and `no keys loaded`
+`sign` accepts the tool option set except `-d/--delete`, and adds
+`--gpg-homedir`, `--remote`, and the `gpg` engine. The `ostree` 2026.1 build
+with OpenSSL on the NixOS development host carries `-s spki` in signing and
+`--verify`. A tool build without the features `openssl` and `sign-spki`
+refuses `-s spki` in each with `error: Requested signature type is not
+implemented` at exit 1. Each key takes the engine of the nearest `-s` before
+it ("the engine of each key" below). Under `-s gpg` each `--keys-file` of a
+verify is a keyring, and every keyring given is read; a gpg signing run
+refuses `--keys-file`. Under `ed25519` and `spki`, `--verify` reads the key
+sources of `static-delta verify`: the positionals and the last `--keys-file`
+of the engine, either one leaving `--keys-dir` unread, the key directories,
+an empty `--keys-dir` naming the working directory, and the trusted keys
 judged before revocation (`cli-behavior.md`, "CLI output formats",
 `static-delta`, "Key sources"). Over a commit either implementation signed,
-the verdict and the exit status agree for these rules, and so do the refusals
-`no keys loaded`, `File object '<path>' is not a regular file`, and `no valid
-keys in file '<path>'` of `ed25519`, byte for byte. Under `spki`, a
-`--keys-file` and each key-store file hold PEM `PUBLIC KEY` blocks, the form
-that the `ostree` 2026.1 build with OpenSSL on the NixOS development host
-reads. The key-file entries under `static-delta` above, the spki entries
-included, also hold for `sign --verify`. Under `spki`, a signing
+the verdict and the exit status agree for these rules where one `--keys-dir`
+is given, and so do the refusals `File object '<path>' is not a regular
+file` and `no valid keys in file '<path>'` of `ed25519`, byte for byte.
+Under `spki`, a `--keys-file` and each key-store file hold PEM `PUBLIC KEY`
+blocks, the form that the `ostree` 2026.1 build with OpenSSL on the NixOS
+development host reads. The key-file entries under `static-delta` above, the
+spki entries included, also hold for `sign --verify`. Under `spki`, a signing
 `--keys-file` holds PEM `PRIVATE KEY` blocks, each a PKCS#8 DER, and each
-block adds one signature. A `-d` `--keys-file` holds PEM `PUBLIC KEY` blocks,
-read as a `--keys-file` of `--verify`. Twenty-one differences stand.
+block adds one signature. Twenty-five differences stand.
 
 - the verdict report. The exit status agrees. The two reports part as
   follows:
@@ -3791,60 +3875,106 @@ read as a `--keys-file` of `--verify`. Twenty-one differences stand.
 - a key-store line of whitespace of two or more bytes. The tool skips it with
   a GLib warning on standard error. The port skips it with no message. Both
   verify with the other keys;
-- a repeated `-s/--sign-type`. The tool keeps the last. `clap` refuses the
-  second with `error: the argument '--sign-type <SIGN_TYPE>' cannot be used
-  multiple times` at exit 1;
+- the engine of each key, the rule `commit --sign-type` records ("P2",
+  `commit`). This difference is in the bytes of the repository. The tool
+  applies the last `-s` to each KEY-ID and `--keys-file` key, in signing and
+  in `--verify`. The port gives each key the engine of the nearest `-s` before
+  it, and `ed25519` to a key before the first `-s`. So `sign COMMIT K -s spki`
+  signs K with spki in the tool, and the port refuses the run (the next
+  item). A signing run of the port signs in the order of the KEY-IDs and then
+  of the keys of each `--keys-file`. It builds each signer before the first
+  signature, and looks up each gpg key in the GnuPG home directory, so a
+  refused key writes no signature. A gpg key that names no secret key gives
+  `error: signature: No gpg key found with ID <key> (homedir: <dir>)`;
+- a `-s/--sign-type` with no key of its own, the rule `commit --sign-type`
+  records. The port refuses it at exit 1 before it reads the commit, in
+  signing and in a `--verify` run with a key on the command line, and writes
+  nothing. Examples are `sign COMMIT -s gpg` and `sign --verify COMMIT K -s
+  spki`, which the tool reads as an spki verify of K. A `--verify` run with no
+  key on the command line takes each `-s` as a selection of its engine (the
+  item on the engines of a verify below);
+- the engines of a `--verify` run. The tool verifies with one engine, the
+  engine of the last `-s`. The port verifies with one verifier for each engine
+  of the run, and each engine must have a valid signature. It prints the
+  report of each engine, after a line with the engine name and a colon where
+  the run has more than one engine. With a key on the command line, the
+  engines are the engines of the keys. With no key and no `--remote`, the
+  engines are the engines that have a trusted key in the key directories, and
+  the gpg engine if the GPG system trust holds a certificate. On a host with
+  keys of two engines, `sign --verify COMMIT` then also needs a valid
+  signature of each engine, and `-s ENGINE` selects one. A run that finds no
+  engine is refused at exit 1 with `error: signature: no keys loaded: the key
+  directories hold no ed25519 or spki key, and the system trust holds no gpg
+  key` (`sign/verify-no-keys`), where the tool writes `error: signature:
+  ed25519: no keys loaded`. A selected engine with no trusted key is refused
+  with `error: signature: <engine>: no keys loaded`. A run that looks for the
+  gpg engine reads each keyring of the GPG system trust, and a keyring that
+  cannot be read refuses the run at exit 1. A `-s` that selects the other
+  engines does not read the GPG system trust;
+- the key directories of `--verify`. The tool reads the last `--keys-dir`
+  alone, and the system key directories `/etc/ostree` and `/usr/share/ostree`
+  where no `--keys-dir` is given (`sign/verify-keys-dir-last-wins`). The port
+  reads the system key directories and then each `--keys-dir`, and a revoked
+  key of one directory applies to the keys of each directory. The port reads
+  `--keys-dir` under each engine of a verify, and the gpg engine reads no key
+  directory;
+- `--remote` of `--verify`. The tool reads `--remote` only in a verify of its
+  gpg engine and adds the keyrings of the remote to its global trusted set.
+  The port verifies with the engines that the config of the remote turns on
+  for its commits: `gpg-verify` and `sign-verify`, or the trust group that
+  the key `trust` names, as a pull reads them. The keys are the keys of the
+  remote alone: `<remote>.trustedkeys.gpg` in the repository and in
+  `/etc/ostree/remotes.d/`, each `gpgkeypath` entry, and the
+  `verification-<engine>-key` and `verification-<engine>-file` keys, or the
+  keys of the trust group. The port reads no global GPG trusted directory and
+  no system key directory for `--remote`. It refuses a remote with no section,
+  a remote whose config turns on no check, and a remote whose config turns on
+  the GPG check with no certificate in its keyrings. A `-s` with no key
+  selects its engine. The port then reads the keys of the selected engines
+  alone, and refuses an engine that the config does not turn on with `error:
+  signature: remote '<remote>' turns on no <engine> check of its commits`.
+  The port refuses `--remote` at exit 1 in these cases:
+  - with a KEY-ID or a `--keys-file`: `error: signature: --remote verifies
+    with the keys of the remote; it takes no KEY-ID and no --keys-file`;
+  - with a `--keys-dir`: `error: signature: --remote verifies with the keys
+    of the remote; it reads no --keys-dir`;
+  - without `--verify`: `error: signature: --remote applies to --verify
+    alone`;
+- a gpg KEY-ID in a `--verify` run. The tool reads no KEY-ID in a gpg verify.
+  The port refuses it at exit 1 with `error: signature: a gpg verify takes its
+  keyrings from --keys-file, --remote, or the system trust; it takes no
+  KEY-ID`. `--gpg-homedir` is refused where no key and no `-s` names the gpg
+  engine;
 - signing with a repeated `--keys-file`. This difference is in the bytes of
   the repository, and the port keeps it. The tool reads the last
   `--keys-file` when it signs, so `sign COMMIT --keys-file=s1 --keys-file=s2` writes one signature,
   by the key of `s2`. The port reads every file and writes one signature for
   each key, so the `.commitmeta` bytes differ. A positional secret key beside
   one `--keys-file` signs with both keys in both implementations;
-- the key kind `-d/--delete` takes. This difference is in the bytes of the
-  repository and is open. The tool reads a `-d` KEY-ID and each line of its
-  keys file as an ed25519 secret key and signs with it: `sign -d COMMIT <secret
-  key>` exits 0 and writes the `.commitmeta` bytes `sign COMMIT <secret key>`
+- `-d/--delete`. The tool reads a `-d` KEY-ID and each line of its keys file
+  as an ed25519 secret key and signs with it: `sign -d COMMIT <secret key>`
+  exits 0 and writes the `.commitmeta` bytes `sign COMMIT <secret key>`
   writes, one more signature, over a signed commit and over an unsigned one.
   It refuses a public key with `error: Invalid ed25519 secret key: Ill-formed
-  input: expected 64 bytes, got 32 bytes` at exit 1. The port reads a `-d`
-  KEY-ID and each `--keys-file` line as a public key and removes each
-  signature that key verifies. It refuses a secret key with `error:
-  signature: ed25519 public key must be 32 bytes, got 64` at exit 1 and
-  writes nothing. The tool writes a signature where the port refuses, and the
-  port removes a signature where the tool refuses. Each `-d` run of the tool
-  with a secret key adds one more signature, so a second run with the same
-  ed25519 key writes a second copy of the same signature
-  (`cli-behavior.md`, "CLI output formats", `sign`, "Delete mode"). Under
-  `-s spki` the tool signs with a positional secret key and refuses a
-  positional SubjectPublicKeyInfo with `error: Not able to sign the cobject:
-  openssl: Failed to initialize spki key` at exit 1. The port removes each
-  signature that a positional SubjectPublicKeyInfo verifies and writes
-  `Deleted <n> signature(s)`. It refuses a positional secret key with
-  `error: signature: spki public key: expected SubjectPublicKeyInfo DER` at
-  exit 1 and writes nothing. Under `spki` the tool
-  takes a `PRIVATE KEY` block in a `-d` `--keys-file` and writes one more
-  signature at exit 0, and refuses a `PUBLIC KEY` block with `error:
-  Unexpected label "PUBLIC KEY"` at exit 1 (`cli-behavior.md`, "CLI output
-  formats", `static-delta`, "spki secret key files"). The port reads `PUBLIC
-  KEY` blocks and removes each signature that a key of the file verifies. It
-  refuses a `PRIVATE KEY` block with `error: signature: the key file
-  '<path>', line <n>: unexpected label "PRIVATE KEY"` at exit 1;
-- `-d/--delete` with no KEY-ID and no `--keys-file`. Both refuse at exit 1
-  and write nothing. The tool writes its usage text to standard error, then
-  `error: Need at least one KEY-ID to sign with`. The port writes `error:
-  signature: delete requires at least one KEY-ID`;
-- a signing or delete `--keys-file` that is not a regular file, an empty
+  input: expected 64 bytes, got 32 bytes` at exit 1, and with no KEY-ID and
+  no `--keys-file` it writes its usage text and `error: Need at least one
+  KEY-ID to sign with` (`cli-behavior.md`, "CLI output formats", `sign`,
+  "Delete mode"). Under `spki` it signs with a positional secret key and
+  with a `PRIVATE KEY` block of a `-d` `--keys-file`. The port has no
+  `-d/--delete`: `clap` refuses `-d` and `--delete` with `error: unexpected
+  argument '<arg>' found` at exit 1, and the port writes nothing. No command
+  of the port removes a signature (`gpg-sign` in "P3");
+- a signing `--keys-file` that is not a regular file, an empty
   `--keys-file=` included. With no positional KEY-ID both refuse at exit 1
   and write nothing. The tool writes the GLib warning `Can't open file
   '<path>' with keys` and `error: File object '<path>' is not a regular
-  file`. The port reads a signing file and a `-d` file as a key source of
+  file`. The port reads a signing file as a key source of
   the library: a regular file of at most 1 MiB, with no wait on a
   fifo. It writes `error: i/o error: No such file or directory (os error 2)`
   for a missing file, `error: signature: the key file '<path>' is not a
   regular file` for a directory or a fifo, and `error: signature: the key
-  file '<path>' is over the 1048576-byte ceiling` for a larger file. `-d`
-  with no positional KEY-ID writes `error: signature: delete
-  requires at least one KEY-ID`. Beside a positional secret key, the tool
+  file '<path>' is over the 1048576-byte ceiling` for a larger file. Beside a
+  positional secret key, the tool
   writes the warning, signs with the positional key, and exits 0. The port
   refuses at exit 1 and writes nothing;
 - an spki signing `--keys-file`. Observed with the `ostree` 2026.1 build with
@@ -3999,7 +4129,9 @@ No matrix cell needs these. The shell suite invokes them.
   `--commit=COMMIT`.
 - `gpg-sign` -- `-d/--delete`, `--gpg-homedir=HOMEDIR`. The port folds GPG
   signing into `sign --sign-type=gpg`, so this is an alias with its own option
-  names.
+  names. `ostree gpg-sign --delete` in 2026.1 removes a GPG signature. No
+  command of the port removes a signature, so `--delete` has no counterpart
+  in the port. The library keeps `Repo::delete_signatures`.
 
 `remote` landed in Phase 17e: `add`, `delete`, `list`, `show-url`, `refs`,
 `summary`, `gpg-import`, and `gpg-list-keys`, with the option set the tool
@@ -4934,9 +5066,11 @@ allow-cleartext-credentials`.
   takes the writer lock, writes `summary` and then, with a key,
   `summary.sig`, writes nothing to standard output, and exits 0. The
   signing options are those of `ostrya summary -u`: each `--gpg-sign` key,
-  each `--sign` key, and each `--keys-file` key signs, in this order, with
-  the engine of `-s`/`--sign-type`, `ed25519` by default, and with the
-  refusals of `ostrya summary -u`. Two of these refusals name the options
+  each `--sign` key, and each `--keys-file` key signs, in this order. Each
+  `--sign` and `--keys-file` key takes the engine of the nearest
+  `-s`/`--sign-type` before it, and `ed25519` if no `-s` comes before it. The
+  command refuses a `-s` with no key of its own, and gives the other refusals
+  of `ostrya summary -u`. Two of these refusals name the options
   of `remote summary -u`: `--keys-file` under the gpg engine gives
   `error: signature: gpg signing takes --gpg-sign and --sign KEY-ID
   arguments; --keys-file serves the other engines`, and an ed25519 key file

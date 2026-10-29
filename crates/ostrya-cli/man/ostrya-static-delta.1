@@ -24,7 +24,7 @@ ostrya static\-delta list [OPTIONS]
 .SS "apply\-offline"
 Apply a static delta offline and write the objects of its target commit.
 .PP
-The source is a superblock file or a directory that holds \fB\%superblock\fR\&. The command prints nothing and writes no ref. A key source is a \%KEY\-ID, \%\-\-keys\-file, or \%\-\-keys\-dir. With a key source, the command verifies a signed delta before it writes an object, and applies an unsigned delta with no check. Without a key source, the command verifies no signature. Each dependency of the target commit must be complete in the repository, so apply the delta of each dependency first.
+The source is a superblock file or a directory that holds \fB\%superblock\fR\&. The command prints nothing and writes no ref. A key source is a \%KEY\-ID, \%\-\-keys\-file, or \%\-\-keys\-dir. With a key source, the command verifies a signed delta with each engine before it writes an object, and applies an unsigned delta with no check. Without a key source, the command verifies no signature. Each dependency of the target commit must be complete in the repository, so apply the delta of each dependency first.
 .PP
 .nf
 ostrya static\-delta apply\-offline [OPTIONS] [PATH] [KEY_ID]...
@@ -40,24 +40,24 @@ The superblock file can have any name. For a file, the command reads the parts f
 \fIKEY_ID...\fR
 Trusted public keys in \%base64.
 .IP
-An \%ed25519 key must decode to \%32 bytes. An spki key is a SubjectPublicKeyInfo DER, and its \%base64 can hold line breaks.
+The \%\-\-sign\-type before a key selects its engine. An \%ed25519 key must decode to \%32 bytes. An spki key is a SubjectPublicKeyInfo DER, and its \%base64 can hold line breaks.
 .PP
 Options:
 .TP
 \fB\-\-sign\-type\fR \fINAME\fR
-The signature engine: \fB\%ed25519\fR or \fB\%spki\fR\&.
+The signature engine of the \%KEY\-ID and \%\-\-keys\-file keys after it: \fB\%ed25519\fR or \fB\%spki\fR\&.
 .IP
-The default is \fB\%ed25519\fR\&. The command reads this option also with no key source, and refuses any other name, \fB\%gpg\fR included. If the option occurs more than once, the last value wins.
+The command reads this option also with no key source, and refuses any other name, \fB\%gpg\fR included. Each key takes the engine of the nearest \%\-\-sign\-type before it on the command line. A key before the first \%\-\-sign\-type takes \fB\%ed25519\fR\&. The option can occur more than once, and each occurrence needs a key of its own: a key after it and before the next \%\-\-sign\-type.
 .TP
 \fB\-\-keys\-file\fR \fIPATH\fR
 Read public keys from a file.
 .IP
-For \%ed25519, the file has one \%base64 key per line. For spki, it has PEM \fB\%PUBLIC KEY\fR blocks. If the option occurs more than once, the last value wins. With this option or a \%KEY\-ID, the command does not read \%\-\-keys\-dir. The path must name a regular file of \%1 MiB or less.
+The \%\-\-sign\-type before the file selects its engine. For \%ed25519, the file has one \%base64 key per line. For spki, it has PEM \fB\%PUBLIC KEY\fR blocks. The command reads the last file of each engine. With this option or a \%KEY\-ID, the command does not read \%\-\-keys\-dir or the key directories. The path must name a regular file of \%1 MiB or less.
 .TP
 \fB\-\-keys\-dir\fR \fIPATH\fR
-Read \fB\%trusted.<type>\fR and \fB\%revoked.<type>\fR from this directory.
+Add a directory to the key directories.
 .IP
-The command also reads the files in \fB\%trusted.<type>.d/\fR and \fB\%revoked.<type>.d/\fR\&. An \%ed25519 file has one \%base64 key per line, and an spki file has PEM \fB\%PUBLIC KEY\fR blocks. If the option occurs more than once, the last value wins. An empty value names the working directory.
+The key directories are \fB\%/etc/ostree\fR, \fB\%/usr/share/ostree\fR, and each \%\-\-keys\-dir, in this order. With no key, a \%\-\-keys\-dir makes the command read \fB\%trusted.<type>\fR, \fB\%revoked.<type>\fR, and the files in \fB\%trusted.<type>.d/\fR and \fB\%revoked.<type>.d/\fR of each directory, and check a signed delta with each engine that has a trusted key. A revoked key of one directory applies to the keys of each directory. An \%ed25519 file has one \%base64 key per line, and an spki file has PEM \fB\%PUBLIC KEY\fR blocks. The option can occur more than once. An empty value names the working directory.
 .SS "generate"
 Generate a static delta and print what it is generated from and to.
 .PP
@@ -132,15 +132,17 @@ Without this option, the files go to \fB\%deltas/\fR of the repository. The comm
 \fB\-\-sign\fR \fISIGN\fR
 Sign the generated delta with this key.
 .IP
-The option can occur more than once. The key is a \%base64 secret key for \%ed25519 and spki, and a \%KEY\-ID for gpg, as for \fB\%ostrya sign\fR\&. An spki secret key is a \%PKCS#8 DER, a \%SEC1 DER that names the \%P\-256 or the \%P\-384 curve, or a \%PKCS#1 DER of an RSA key, and its \%base64 can hold line breaks.
+The option can occur more than once. The \%\-\-sign\-type before the key selects its engine. The key is a \%base64 secret key for \%ed25519 and spki, and a \%KEY\-ID for gpg, as for \fB\%ostrya sign\fR\&. An spki secret key is a \%PKCS#8 DER, a \%SEC1 DER that names the \%P\-256 or the \%P\-384 curve, or a \%PKCS#1 DER of an RSA key, and its \%base64 can hold line breaks.
 .TP
-\fB\-s\fR, \fB\-\-sign\-type\fR \fISIGN_TYPE\fR
-The signature engine for \%\-\-sign and \%\-\-keys\-file. Default: \%ed25519. Possible values: \%ed25519, spki, gpg.
+\fB\-s\fR, \fB\-\-sign\-type\fR \fINAME\fR
+The signature engine of the \%\-\-sign and \%\-\-keys\-file keys after it.
+.IP
+The names are \fB\%ed25519\fR, \fB\%spki\fR, and \fB\%gpg\fR, and the command refuses any other name. Each key takes the engine of the nearest \%\-\-sign\-type before it on the command line. A key before the first \%\-\-sign\-type takes \fB\%ed25519\fR\&. The option can occur more than once, and each occurrence needs a key of its own: a key after it and before the next \%\-\-sign\-type.
 .TP
 \fB\-\-keys\-file\fR \fIKEYS_FILE\fR
 Read signing keys from a file.
 .IP
-For \%ed25519, the file has \%base64 secret keys, one per line, as for \fB\%ostrya sign\fR\&. For spki, each line is the \%base64 of one secret key: a \%PKCS#8 DER, a \%SEC1 DER that names the \%P\-256 or the \%P\-384 curve, or a \%PKCS#1 DER of an RSA key. A line ends at LF or CRLF, and the last line can have no line end. The command refuses an empty spki file, an empty line, and a line with white space. Each key adds one signature. The option can occur more than once, and the command reads every file. The gpg engine refuses this option.
+For \%ed25519, the file has \%base64 secret keys, one per line, as for \fB\%ostrya sign\fR\&. For spki, each line is the \%base64 of one secret key: a \%PKCS#8 DER, a \%SEC1 DER that names the \%P\-256 or the \%P\-384 curve, or a \%PKCS#1 DER of an RSA key. A line ends at LF or CRLF, and the last line can have no line end. The command refuses an empty spki file, an empty line, and a line with white space. Each key adds one signature. The \%\-\-sign\-type before the file selects its engine. The option can occur more than once, and the command reads every file. The gpg engine refuses this option.
 .TP
 \fB\-\-gpg\-homedir\fR \fIGPG_HOMEDIR\fR
 The GnuPG home directory where gpg resolves signing keys.
@@ -220,7 +222,7 @@ ostrya static\-delta indexes [OPTIONS]
 .SS "verify"
 Verify the superblock signatures of a static delta.
 .PP
-On success, the command prints \fB\%Verification OK\fR\&. After the keys load, each failure prints \fB\%Verification fails\fR on standard output and an error on standard error, and the command exits \%1. An unsigned delta is a failure. Without \%\-\-keys\-file, \%\-\-keys\-dir, or a \%KEY\-ID, the command reads the system key directories \fB\%/etc/ostree\fR and \fB\%/usr/share/ostree\fR\&.
+The command verifies with one verifier for each engine. If each engine has a valid signature, the command prints \fB\%Verification OK\fR one time. After the keys load, each failure prints \fB\%Verification fails\fR on standard output and an error on standard error, and the command exits with status \%1. The first engine that fails gives the error. An unsigned delta is a failure. Without \%\-\-keys\-file or a \%KEY\-ID, the command reads the key directories \fB\%/etc/ostree\fR, \fB\%/usr/share/ostree\fR, and each \%\-\-keys\-dir, and verifies with each engine that has a trusted key in them.
 .PP
 .nf
 ostrya static\-delta verify [OPTIONS] [DELTA] [KEY_ID]...
@@ -236,23 +238,23 @@ A delta name is \fB\%TO\fR or \fB\%FROM\-TO\fR in full lowercase hex. An argumen
 \fIKEY_ID...\fR
 Trusted public keys in \%base64.
 .IP
-An \%ed25519 key must decode to \%32 bytes. An spki key is a SubjectPublicKeyInfo DER, and its \%base64 can hold line breaks.
+The \%\-\-sign\-type before a key selects its engine. An \%ed25519 key must decode to \%32 bytes. An spki key is a SubjectPublicKeyInfo DER, and its \%base64 can hold line breaks.
 .PP
 Options:
 .TP
 \fB\-\-sign\-type\fR \fINAME\fR
-The signature engine: \fB\%ed25519\fR or \fB\%spki\fR\&.
+The signature engine of the \%KEY\-ID and \%\-\-keys\-file keys after it: \fB\%ed25519\fR or \fB\%spki\fR\&.
 .IP
-The default is \fB\%ed25519\fR\&. The command refuses any other name, \fB\%gpg\fR included. If the option occurs more than once, the last value wins.
+The command refuses any other name, \fB\%gpg\fR included. Each key takes the engine of the nearest \%\-\-sign\-type before it on the command line. A key before the first \%\-\-sign\-type takes \fB\%ed25519\fR\&. The option can occur more than once. With a key on the command line, each occurrence needs a key of its own: a key after it and before the next \%\-\-sign\-type. With no key, each \%\-\-sign\-type selects its engine, and the command verifies with the selected engines alone.
 .TP
 \fB\-\-keys\-file\fR \fIPATH\fR
 Read public keys from a file.
 .IP
-For \%ed25519, the file has one \%base64 key per line. For spki, it has PEM \fB\%PUBLIC KEY\fR blocks. If the option occurs more than once, the last value wins. With this option or a \%KEY\-ID, the command does not read \%\-\-keys\-dir or the system key directories. The path must name a regular file of \%1 MiB or less. The command takes an empty value as given, and refuses it because it is not a regular file.
+The \%\-\-sign\-type before the file selects its engine. For \%ed25519, the file has one \%base64 key per line. For spki, it has PEM \fB\%PUBLIC KEY\fR blocks. The command reads the last file of each engine. With this option or a \%KEY\-ID, the command does not read \%\-\-keys\-dir or the key directories. The path must name a regular file of \%1 MiB or less. The command takes an empty value as given, and refuses it because it is not a regular file.
 .TP
 \fB\-\-keys\-dir\fR \fIPATH\fR
-Read \fB\%trusted.<type>\fR and \fB\%revoked.<type>\fR from this directory.
+Add a directory to the key directories.
 .IP
-The command also reads the files in \fB\%trusted.<type>.d/\fR and \fB\%revoked.<type>.d/\fR\&. It then does not read the system key directories. An \%ed25519 file has one \%base64 key per line, and an spki file has PEM \fB\%PUBLIC KEY\fR blocks. If the option occurs more than once, the last value wins. An empty value names the working directory.
+The key directories are \fB\%/etc/ostree\fR, \fB\%/usr/share/ostree\fR, and each \%\-\-keys\-dir, in this order. With no key, the command reads \fB\%trusted.<type>\fR, \fB\%revoked.<type>\fR, and the files in \fB\%trusted.<type>.d/\fR and \fB\%revoked.<type>.d/\fR of each directory, and verifies with each engine that has a trusted key. A revoked key of one directory applies to the keys of each directory. An \%ed25519 file has one \%base64 key per line, and an spki file has PEM \fB\%PUBLIC KEY\fR blocks. The option can occur more than once. An empty value names the working directory.
 .SH SEE ALSO
 \fBostrya\fR(1)

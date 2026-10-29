@@ -2272,13 +2272,33 @@ fn remote_summary_update_signs_with_ed25519_and_a_pull_verifies_it() {
         CLEARTEXT,
     ]);
     let by_file = object(&server, "repo/summary.sig").unwrap();
-    scratch.ok(&[
+    let requests = server.state().requests.len();
+    // A `--sign-type` after the last key has no key of its own.
+    let message = scratch.fails(&[
         "remote",
         "summary",
         "-u",
         &format!("--sign={SECRET_B64}"),
         "-s",
         "ed25519",
+        &last_modified,
+        ADDRESS,
+        &endpoint,
+        CLEARTEXT,
+    ]);
+    assert_eq!(
+        message,
+        "error: --sign-type=ed25519 has no key of its own; give a key after it and before \
+         the next --sign-type\n"
+    );
+    assert_eq!(server.state().requests.len(), requests);
+    scratch.ok(&[
+        "remote",
+        "summary",
+        "-u",
+        "-s",
+        "ed25519",
+        &format!("--sign={SECRET_B64}"),
         &last_modified,
         ADDRESS,
         &endpoint,

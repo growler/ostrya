@@ -40,18 +40,39 @@ pub(crate) async fn trust_group_policy(
     gpg_on: bool,
     sign_on: bool,
 ) -> Result<Policy> {
-    let section = Remote::view(keyfile, group.to_owned());
     let gpg = gpg_on && keyfile.get_bool(group, "gpg-verify")?.unwrap_or(false);
     let sign = if sign_on {
-        section.sign_verify()?
+        Remote::view(keyfile, group.to_owned()).sign_verify()?
     } else {
         SignVerify::Off
     };
+    trust_group_build(repo, keyfile, name, group, gpg, &sign).await
+}
+
+/// Returns the GPG switch and the sign-api switch of the key-file group
+/// `group`. The call reads no key source.
+pub(crate) fn trust_group_switches(keyfile: &KeyFile, group: &str) -> Result<(bool, SignVerify)> {
+    let gpg = keyfile.get_bool(group, "gpg-verify")?.unwrap_or(false);
+    let sign = Remote::view(keyfile, group.to_owned()).sign_verify()?;
+    Ok((gpg, sign))
+}
+
+/// Builds the policy of the trust group `name` from the key-file group
+/// `group`, with the axes that `gpg` and `sign` turn on.
+pub(crate) async fn trust_group_build(
+    repo: &Repo,
+    keyfile: &KeyFile,
+    name: &str,
+    group: &str,
+    gpg: bool,
+    sign: &SignVerify,
+) -> Result<Policy> {
+    let section = Remote::view(keyfile, group.to_owned());
     let source = KeySource::Trust {
         name,
         section: &section,
     };
-    build_policy(repo, &source, &mut Verifiers::default(), gpg, &sign).await
+    build_policy(repo, &source, &mut Verifiers::default(), gpg, sign).await
 }
 
 /// The source of the name of the trust group of a pull.
@@ -137,32 +158,8 @@ pub(crate) async fn pull_trust(
     commit: &mut Option<Policy>,
 ) -> Result<PullTrust> {
     let value = name.value();
-    let group = format!("ex-ostrya trust \"{value}\"");
-    if !valid_group_name(value) {
-        return Err(match name {
-            GroupName::Key { remote, .. } => Error::InvalidFormat(format!(
-                "malformed [remote \"{remote}\"] trust value '{value}': the value names a \
-                 trust group, is not empty, and holds no '\"' and no control character"
-            )),
-            GroupName::Field(_) => Error::InvalidInput(format!(
-                "malformed trust group name '{value}': the name is not empty, and holds \
-                 no '\"' and no control character"
-            )),
-        });
-    }
     let keyfile = repo.config().keyfile();
-    if !keyfile.has_group(&group) {
-        return Err(match name {
-            GroupName::Key { remote, .. } => Error::InvalidFormat(format!(
-                "[remote \"{remote}\"] trust={value} names no [{group}] group"
-            )),
-            GroupName::Field(_) => Error::InvalidInput(format!(
-                "the pull names the trust group '{value}', and the config has no \
-                 [{group}] group"
-            )),
-        });
-    }
-    check_trust(keyfile, &group)?;
+    let group = named_group(keyfile, name)?;
     for (field, check) in [
         (verify.gpg, "the GPG check"),
         (verify.sign, "the sign-api check"),
@@ -184,23 +181,8 @@ pub(crate) async fn pull_trust(
     if remote.is_none() && (verify.gpg_summary == Some(true) || verify.sign_summary == Some(true)) {
         return Err(no_remote());
     }
-    if let (Some(remote), Some(section)) = (remote, section)
-        && let Some(void) = void_commit_key(section)?
-    {
-        let VoidKey { holds, key, reason } = void;
-        return Err(Error::InvalidFormat(match name {
-            GroupName::Key { .. } => {
-                let verb = if holds { "holds " } else { "" };
-                format!("[remote \"{remote}\"] sets trust={value} and {verb}{key}{reason}")
-            }
-            GroupName::Field(_) => {
-                let verb = if holds { "holds" } else { "sets" };
-                format!(
-                    "the pull takes its commit keys from [{group}], and [remote \"{remote}\"] \
-                     {verb} {key}{reason}"
-                )
-            }
-        }));
+    if let (Some(remote), Some(section)) = (remote, section) {
+        refuse_void_key(remote, section, name, &group)?;
     }
     let (gpg_summary, sign_summary) = summary_switches(section, verify)?;
 
@@ -226,6 +208,7 @@ pub(crate) async fn pull_trust(
                 name: remote,
                 section,
                 repo_keyring: true,
+                system_keys: true,
             };
             build_policy(
                 repo,
@@ -242,6 +225,86 @@ pub(crate) async fn pull_trust(
         commit: commit.applies().then(|| TrustedKeys::from_policy(commit)),
         summary: summary.applies().then(|| TrustedKeys::from_policy(summary)),
     })
+}
+
+/// Checks the trust group that `name` names, and returns the name of its
+/// key-file group, `ex-ostrya trust "NAME"`.
+///
+/// The checks are the first two checks of [`pull_trust`]: the name is a valid
+/// group name, the group exists, and [`check_trust`] accepts the group.
+fn named_group(keyfile: &KeyFile, name: GroupName<'_>) -> Result<String> {
+    let value = name.value();
+    let group = format!("ex-ostrya trust \"{value}\"");
+    if !valid_group_name(value) {
+        return Err(match name {
+            GroupName::Key { remote, .. } => Error::InvalidFormat(format!(
+                "malformed [remote \"{remote}\"] trust value '{value}': the value names a \
+                 trust group, is not empty, and holds no '\"' and no control character"
+            )),
+            GroupName::Field(_) => Error::InvalidInput(format!(
+                "malformed trust group name '{value}': the name is not empty, and holds \
+                 no '\"' and no control character"
+            )),
+        });
+    }
+    if !keyfile.has_group(&group) {
+        return Err(match name {
+            GroupName::Key { remote, .. } => Error::InvalidFormat(format!(
+                "[remote \"{remote}\"] trust={value} names no [{group}] group"
+            )),
+            GroupName::Field(_) => Error::InvalidInput(format!(
+                "the pull names the trust group '{value}', and the config has no \
+                 [{group}] group"
+            )),
+        });
+    }
+    check_trust(keyfile, &group)?;
+    Ok(group)
+}
+
+/// Refuses the section `section` of `remote` if it holds a key that the trust
+/// group `group`, which `name` names, makes void.
+fn refuse_void_key(
+    remote: &str,
+    section: &Remote<'_>,
+    name: GroupName<'_>,
+    group: &str,
+) -> Result<()> {
+    let Some(VoidKey { holds, key, reason }) = void_commit_key(section)? else {
+        return Ok(());
+    };
+    let value = name.value();
+    Err(Error::InvalidFormat(match name {
+        GroupName::Key { .. } => {
+            let verb = if holds { "holds " } else { "" };
+            format!("[remote \"{remote}\"] sets trust={value} and {verb}{key}{reason}")
+        }
+        GroupName::Field(_) => {
+            let verb = if holds { "holds" } else { "sets" };
+            format!(
+                "the pull takes its commit keys from [{group}], and [remote \"{remote}\"] \
+                 {verb} {key}{reason}"
+            )
+        }
+    }))
+}
+
+/// Checks the trust group that the key `trust` of the section `section` of
+/// `remote` names, as a pull of `remote` checks it, and returns the name of
+/// its key-file group.
+///
+/// `value` is the value of the key. The call refuses the section if it holds
+/// a key that the group makes void. It reads no key source.
+pub(crate) fn check_remote_group(
+    repo: &Repo,
+    remote: &str,
+    section: &Remote<'_>,
+    value: &str,
+) -> Result<String> {
+    let name = GroupName::Key { remote, value };
+    let group = named_group(repo.config().keyfile(), name)?;
+    refuse_void_key(remote, section, name, &group)?;
+    Ok(group)
 }
 
 /// Returns `true` if `name` is a valid name of a trust group: it is not
@@ -774,6 +837,251 @@ pub(crate) mod tests {
         check("own.gpg").expect("the keyring of the group holds the key");
         let err = check("stranger.gpg").expect_err("a trust group reads no global directory");
         assert!(matches!(err, Error::Signature(_)), "{err}");
+    }
+
+    /// Opens the repository of `scratch` with `remotes` added to its config.
+    fn repo_with_remotes(scratch: &Scratch, remotes: &str) -> Repo {
+        drop(scratch.repo());
+        let config = scratch.dir.join("repo/config");
+        let mut text = std::fs::read_to_string(&config).unwrap();
+        text.push_str(remotes);
+        std::fs::write(&config, text).unwrap();
+        ostrya_rt::block_on(Repo::open(&scratch.dir.join("repo"))).unwrap()
+    }
+
+    /// `RemoteKeys` reads the commit switches for the commits and the summary
+    /// switches for the summary. It refuses a target that the switches do not
+    /// check, a remote with no section, and a name that is not valid.
+    #[test]
+    fn remote_keys_follow_the_switches_of_each_target() {
+        use crate::verify::RemoteKeys;
+
+        let scratch = Scratch::new("remote-keys");
+        let repo = repo_with_remotes(
+            &scratch,
+            &format!(
+                "[remote \"origin\"]\nurl=http://localhost/\ngpg-verify=false\n\
+                 sign-verify=ed25519\nverification-ed25519-key={PUBLIC_B64}\n\
+                 [remote \"plain\"]\nurl=http://localhost/\ngpg-verify=false\n"
+            ),
+        );
+        let keys = ostrya_rt::block_on(RemoteKeys::commits(&repo, "origin", None)).unwrap();
+        assert!(
+            keys.gpg().is_none(),
+            "gpg-verify=false gives no GPG verifier"
+        );
+        let engines: Vec<&str> = keys.sign().iter().map(|v| v.metadata_key()).collect();
+        assert_eq!(engines, ["ostree.sign.ed25519"]);
+
+        let signer = Ed25519Signer::from_base64(SECRET_B64).unwrap();
+        let blob = ostrya_rt::block_on(signer.sign(PAYLOAD)).unwrap();
+        assert!(keys.sign()[0].verify(PAYLOAD, &[blob]).unwrap().valid);
+
+        for err in [
+            ostrya_rt::block_on(RemoteKeys::summary(&repo, "origin", None)).unwrap_err(),
+            ostrya_rt::block_on(RemoteKeys::commits(&repo, "plain", None)).unwrap_err(),
+        ] {
+            assert!(
+                matches!(&err, Error::Signature(m) if m.contains("turns on no signature check")),
+                "{err}"
+            );
+        }
+        let err = ostrya_rt::block_on(RemoteKeys::commits(&repo, "nosuch", None)).unwrap_err();
+        assert!(matches!(err, Error::RemoteNotFound(_)), "{err}");
+        let err = ostrya_rt::block_on(RemoteKeys::commits(&repo, "a/b", None)).unwrap_err();
+        assert!(matches!(err, Error::InvalidInput(_)), "{err}");
+    }
+
+    /// A selection of engines builds the selected engines alone. The call
+    /// reads no key source of an engine that it does not select, and refuses
+    /// an engine that the switches do not turn on before it reads a key.
+    #[test]
+    fn remote_keys_build_the_selected_engines_alone() {
+        use crate::verify::RemoteKeys;
+
+        let scratch = Scratch::new("remote-keys-select");
+        let missing = scratch.dir.join("missing");
+        let repo = repo_with_remotes(
+            &scratch,
+            &format!(
+                "[remote \"both\"]\nurl=http://localhost/\ngpgkeypath={}\n\
+                 sign-verify=ed25519\nverification-ed25519-key={PUBLIC_B64}\n\
+                 [remote \"all\"]\nurl=http://localhost/\ngpg-verify=false\n\
+                 sign-verify=true\nverification-ed25519-file={}\n",
+                missing.join("keyring.gpg").display(),
+                missing.join("ed25519.keys").display(),
+            ),
+        );
+        let keys =
+            ostrya_rt::block_on(RemoteKeys::commits(&repo, "both", Some(&["ed25519"]))).unwrap();
+        assert!(keys.gpg().is_none(), "gpg is not selected");
+        let engines: Vec<&str> = keys.sign().iter().map(|v| v.metadata_key()).collect();
+        assert_eq!(engines, ["ostree.sign.ed25519"]);
+
+        for (remote, names, text) in [
+            (
+                "both",
+                &["spki"][..],
+                "turns on no spki check of its commits",
+            ),
+            ("all", &["gpg"][..], "turns on no gpg check of its commits"),
+            (
+                "both",
+                &["ed25519"][..],
+                "turns on no ed25519 check of its summary",
+            ),
+        ] {
+            let summary = text.ends_with("summary");
+            let err = ostrya_rt::block_on(async {
+                if summary {
+                    RemoteKeys::summary(&repo, remote, Some(names)).await
+                } else {
+                    RemoteKeys::commits(&repo, remote, Some(names)).await
+                }
+            })
+            .unwrap_err();
+            assert!(
+                matches!(&err, Error::Signature(m) if m.contains(text)),
+                "{remote} {names:?}: {err}"
+            );
+        }
+        let err =
+            ostrya_rt::block_on(RemoteKeys::commits(&repo, "both", Some(&["gpg"]))).unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m) if m.contains("gpgkeypath")),
+            "the selected GPG engine reads gpgkeypath: {err}"
+        );
+        let err =
+            ostrya_rt::block_on(RemoteKeys::commits(&repo, "all", Some(&["ed25519"]))).unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m) if m.contains("ed25519.keys")),
+            "the selected engine reads its key file: {err}"
+        );
+    }
+
+    /// With the key `trust`, the commit keys of `RemoteKeys` come from the
+    /// trust group. The summary keys come from the section, and a section
+    /// that a trust group makes void is refused for both targets.
+    #[test]
+    fn remote_keys_read_the_trust_group_for_the_commits() {
+        use crate::verify::RemoteKeys;
+
+        let scratch = Scratch::new("remote-keys-trust");
+        let repo = repo_with_remotes(
+            &scratch,
+            &format!(
+                "[remote \"t\"]\nurl=http://localhost/\ntrust=g\ngpg-verify=false\n\
+                 [remote \"void\"]\nurl=http://localhost/\ntrust=g\ngpg-verify=true\n\
+                 [ex-ostrya trust \"g\"]\nsign-verify=ed25519\n\
+                 verification-ed25519-key={PUBLIC_B64}\n"
+            ),
+        );
+        let keys = ostrya_rt::block_on(RemoteKeys::commits(&repo, "t", None)).unwrap();
+        assert!(keys.gpg().is_none());
+        assert_eq!(keys.sign().len(), 1);
+        let err = ostrya_rt::block_on(RemoteKeys::summary(&repo, "t", None)).unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m) if m.contains("of its summary")),
+            "{err}"
+        );
+        for err in [
+            ostrya_rt::block_on(RemoteKeys::commits(&repo, "void", None)).unwrap_err(),
+            ostrya_rt::block_on(RemoteKeys::summary(&repo, "void", None)).unwrap_err(),
+        ] {
+            assert!(
+                matches!(&err, Error::InvalidFormat(m) if m.contains("gpg-verify=true")),
+                "{err}"
+            );
+        }
+    }
+
+    /// `RemoteKeys` reads no global GPG trusted directory. A remote with the
+    /// GPG check on and no keyring of its own is refused, where the trust of
+    /// a pull reads the key from the global directory. The test sets the
+    /// environment for a child process, so no test of this process reads the
+    /// directory.
+    #[cfg(feature = "verify-gpg")]
+    #[test]
+    fn remote_keys_read_no_global_gpg_directory() {
+        use crate::gpg::tests::KeyFixture;
+
+        if !gpg_or_skip() {
+            return;
+        }
+        let key = KeyFixture::new("Global <global@example.org>");
+        let scratch = Scratch::new("remote-keys-global");
+        let global = scratch.dir.join("global");
+        std::fs::create_dir(&global).unwrap();
+        std::fs::write(global.join("global.gpg"), key.export(false)).unwrap();
+        std::fs::write(scratch.dir.join("own.gpg"), key.export(false)).unwrap();
+        std::fs::write(scratch.dir.join("signature"), key.sign(PAYLOAD)).unwrap();
+
+        let child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "verify::trust::tests::remote_keys_global_gpg_subprocess",
+                "--exact",
+                "--ignored",
+                "--nocapture",
+            ])
+            .env("OSTREE_GPG_HOME", &global)
+            .env(FIXTURE_ENV, &scratch.dir)
+            .output()
+            .expect("re-execute this test binary");
+        let stdout = String::from_utf8_lossy(&child.stdout);
+        assert!(
+            child.status.success() && stdout.contains("1 passed"),
+            "the child reported {}:\n{stdout}{}",
+            child.status,
+            String::from_utf8_lossy(&child.stderr),
+        );
+    }
+
+    /// The half of [`remote_keys_read_no_global_gpg_directory`] that reads
+    /// the keys. It runs only if this test binary runs again with the
+    /// environment set.
+    #[cfg(feature = "verify-gpg")]
+    #[test]
+    #[ignore = "helper process for remote_keys_read_no_global_gpg_directory"]
+    fn remote_keys_global_gpg_subprocess() {
+        use crate::pull::PullVerify;
+        use crate::verify::RemoteKeys;
+
+        let Some(fixtures) = std::env::var_os(FIXTURE_ENV).map(std::path::PathBuf::from) else {
+            return;
+        };
+        let signature = std::fs::read(fixtures.join("signature")).unwrap();
+        let scratch = Scratch::new("remote-keys-global-child");
+        let repo = repo_with_remotes(
+            &scratch,
+            &format!(
+                "[remote \"bare\"]\nurl=http://localhost/\n\
+                 [remote \"own\"]\nurl=http://localhost/\ngpgkeypath={}\n",
+                fixtures.join("own.gpg").display()
+            ),
+        );
+        let err = ostrya_rt::block_on(RemoteKeys::commits(&repo, "bare", None)).unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m) if m.contains("hold no certificate")),
+            "{err}"
+        );
+        let signed = dict_with("ostree.gpgsigs", signature.clone());
+        let pull = ostrya_rt::block_on(PullTrust::from_remote(
+            &repo,
+            "bare",
+            &PullVerify::default(),
+        ))
+        .unwrap();
+        ostrya_rt::block_on(
+            pull.into_policies()
+                .0
+                .check("commit", PAYLOAD, Some(&signed)),
+        )
+        .expect("the trust of a pull reads the global directory");
+
+        let keys = ostrya_rt::block_on(RemoteKeys::commits(&repo, "own", None)).unwrap();
+        let gpg = keys.gpg().expect("gpg-verify defaults to true");
+        assert!(gpg.verify(PAYLOAD, &[signature]).unwrap().valid);
+        assert!(keys.sign().is_empty());
     }
 
     /// `verification_engine` returns the engine that a verification key

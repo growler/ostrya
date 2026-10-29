@@ -545,6 +545,69 @@ Two alternatives were rejected:
 - A field that `Repo::pull_local` alone reads. A pull over HTTP with the same
   options would then use the keys of the remote, with no message.
 
+## The engine of each signing key
+
+Each command that takes `--sign-type` gives each key the engine of the
+nearest `--sign-type` before it on the command line. A key before the first
+`--sign-type` takes `ed25519`. A key is a value of `--sign`,
+`--sign-from-file`, `--keys-file`, or a positional key. `--gpg-sign` keeps
+the gpg engine, and it is not a key of a `--sign-type`. The `ostree` command
+applies the last `--sign-type` to each key, so the two can write different
+signatures for one command line. `conformance/cli-surface.md`, "P2", records
+the difference in each command.
+
+Each `--sign-type` needs a key of its own: a key after it and before the
+next `--sign-type`. A command refuses a `--sign-type` with no key of its own
+before the first signature and before the verification. The refusal of a
+name that no engine carries comes first. In a verify mode other than
+`apply-offline`, a run with no key on the command line takes each
+`--sign-type` as a selection of its engine.
+
+A verify mode makes one verifier for each engine of the run, and each engine
+must have a valid signature. A user who names a key of an engine expects a
+valid signature of that engine. The verify modes are `sign --verify`,
+`summary --verify`, `static-delta verify`, and `static-delta apply-offline`
+with a key source. A run with no engine is refused. The key sources are:
+
+- A key on the command line: the engines of the keys alone, and no key
+  directory.
+- No key and no `--remote`: each engine with a trusted key in the system key
+  directories and each `--keys-dir`, and the gpg engine if the GPG system
+  trust holds a certificate. Each `--keys-dir` adds one directory. The two
+  `static-delta` verify modes have no gpg engine. A keyring of the GPG system
+  trust that cannot be read refuses a run that looks for the gpg engine. A
+  broken trust store is an error of the host, and the command does not hide
+  it. A `--sign-type` that selects the other engines does not read the GPG
+  system trust.
+- `--remote`: the engines that the config of the remote turns on, as a pull
+  reads them, with the keys of the remote alone. `RemoteKeys` of the `ostrya`
+  crate reads them. The command reads no global GPG trusted directory and no
+  system key directory for `--remote`. A `--sign-type` with no key selects
+  its engine, and `RemoteKeys` then reads the keys of the selected engines
+  alone. An engine that the run does not check cannot refuse the run.
+
+`ostrya sign` has no `-d/--delete`. The `-d` of the `ostree` command signs,
+and the port has no `gpg-sign` command, so no command of the port removes a
+signature. The library keeps `Repo::delete_signatures`.
+
+These alternatives were rejected:
+
+- The last `--sign-type` for each key, as the `ostree` command does. A
+  command line with keys of two engines could not sign or verify with both.
+- The first or the last `--sign-type` for the keys before the first one. The
+  rule of the nearest `--sign-type` before a key has no exception.
+- A `--sign-type` after the last key that applies to that key. The tool signs
+  `--sign=K --sign-type=spki` with spki, so the port refuses the form rather
+  than sign K with ed25519.
+- One valid signature of any engine in a verify mode, as the sign-api axis of
+  a pull accepts. `--remote` keeps the rule of each engine too.
+- A `--keys-dir` that replaces the default key directories, as the `ostree`
+  command does. The key directories of the port are one set, and a revoked
+  key of one directory applies to each directory.
+- The global GPG trusted set and the system key store for `--remote`. These
+  sets do not belong to the remote.
+- A `sign -d` that removes a signature. The tool has no such mode on `sign`.
+
 ## TLS stack
 
 The fetcher uses `rustls` 0.23 with `rustls-graviola` 0.4 as the crypto

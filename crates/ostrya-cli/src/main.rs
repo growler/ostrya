@@ -52,7 +52,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use clap::{Args, CommandFactory, Parser, Subcommand, ValueEnum};
+use clap::{Args, CommandFactory, Parser, Subcommand};
 use ostrya::{
     BootableMetadata, BootableRefusal, CheckoutFilterFn, CheckoutMode, CheckoutOptions, Checksum,
     CollectionPullOptions, CollectionRef, CollectionRefEntry, CommitModifier, CommitModifierFlags,
@@ -64,8 +64,8 @@ use ostrya::{
     PullProgress, PullProgressSnapshot, PullStats, PullVerify, RefAlias, Repo, RepoConfig,
     RepoMode, RepoTree, Result, Signer, Summary, SummaryOptions, TarExportOptions,
     TarImportOptions, TimestampCheck, Transaction, TransactionStats, TreeEntry, Type, Value,
-    Verifier, VerifyOutcome, VerityPolicy, Xattrs, base64, from_bytes, load_sign_keys,
-    load_sign_keys_from, to_text, to_text_unannotated, validate_refspec,
+    Verifier, VerifyOutcome, VerityPolicy, Xattrs, from_bytes, load_sign_keys, load_sign_keys_from,
+    to_text, to_text_unannotated, validate_refspec,
 };
 #[cfg(feature = "gpg")]
 use ostrya::{FromOstreeKeyrings, GpgSigner, GpgVerifier, SignatureInfo};
@@ -338,15 +338,17 @@ enum Command {
     /// in place of the path lines. With --stats and --fs-diff, it prints the
     /// path lines and then the statistics.
     Diff(DiffArgs),
-    /// Add, verify, or delete signatures on a commit.
+    /// Add or verify signatures on a commit.
     ///
     /// The signatures are in the detached metadata of the commit. Without
-    /// --verify or --delete, the command signs the commit once for each key and
-    /// prints nothing. With --verify, it prints one line for each signature and
-    /// a final verdict, and exits 1 if no signature is valid. With --delete, it
-    /// removes the signatures that match the KEY-IDs and prints their count.
-    /// An ed25519 or spki verify with no key source reads the system key
-    /// directories `/etc/ostree` and `/usr/share/ostree`.
+    /// --verify, the command signs the commit once for each key and prints
+    /// nothing. Each key takes the engine of the --sign-type before it. With
+    /// --verify, it verifies with one verifier for each engine, prints one
+    /// line for each signature and a verdict for each engine, and exits 1 if
+    /// an engine has no valid signature. A verify with no key and no --remote
+    /// reads the key directories `/etc/ostree`, `/usr/share/ostree`, and each
+    /// --keys-dir, and the GPG system trust. The command has no option that
+    /// removes a signature.
     Sign(SignArgs),
     /// Regenerate, sign, or verify the repository summary.
     ///
@@ -1125,10 +1127,10 @@ struct CommitArgs {
     /// public key. An `spki` secret key is a PKCS#8 DER, a SEC1 DER that names
     /// the P-256 or the P-384 curve, or a PKCS#1 DER of an RSA key, and its
     /// base64 can hold line breaks. For `gpg`, the key is a key ID. Each
-    /// occurrence adds one signature. --sign-type selects the engine. The
-    /// command reads every key before it makes the first signature, so a bad
-    /// key gives no signature. The order is the --sign keys, then the
-    /// --sign-from-file keys, then the --gpg-sign keys.
+    /// occurrence adds one signature. The --sign-type before the key selects
+    /// its engine. The command reads every key before it makes the first
+    /// signature, so a bad key gives no signature. The order is the --sign
+    /// keys, then the --sign-from-file keys, then the --gpg-sign keys.
     #[arg(long, value_name = "KEY_ID")]
     sign: Vec<String>,
     /// Sign the commit with the key of this file.
@@ -1140,18 +1142,24 @@ struct CommitArgs {
     /// block, a PKCS#8 DER, and the command ignores the text outside the
     /// block. The command refuses an spki file of more than one block. The
     /// spki file is a regular file of at most 1 MiB. The command refuses an
-    /// empty path with a message of its own.
+    /// empty path with a message of its own. The --sign-type before the path
+    /// selects the engine.
     #[arg(long, value_name = "PATH")]
     sign_from_file: Vec<std::ffi::OsString>,
-    /// The signature engine of --sign and --sign-from-file.
+    /// The signature engine of the --sign and --sign-from-file keys after it.
     ///
-    /// The names are `ed25519`, `spki`, and `gpg`, and the default is
-    /// `ed25519`. The match is case sensitive, and the command refuses any
-    /// other name. The command reads this option only if --sign or
-    /// --sign-from-file names a key. If the option occurs more than once, the
-    /// last value wins.
-    #[arg(long, value_name = "NAME", overrides_with = "sign_type")]
-    sign_type: Option<String>,
+    /// The names are `ed25519`, `spki`, and `gpg`. The match is case
+    /// sensitive, and the command refuses any other name. Each key takes the
+    /// engine of the nearest --sign-type before it on the command line. A key
+    /// before the first --sign-type takes `ed25519`. The option can occur more
+    /// than once, and each occurrence needs a key of its own: a key after it
+    /// and before the next --sign-type. --gpg-sign is not a key of this
+    /// option.
+    #[arg(long, value_name = "NAME")]
+    sign_type: Vec<String>,
+    /// The engine of each key, from the --sign-type values.
+    #[arg(skip)]
+    key_types: KeyTypes,
     /// The directory to commit.
     ///
     /// If a --tree option is present, the command ignores this argument. It
@@ -2209,8 +2217,8 @@ struct RemoteSummaryArgs {
     update: bool,
     /// With -u, sign the summary with the GPG key that this selector names.
     ///
-    /// The option uses the gpg engine for each --sign-type. Each occurrence
-    /// adds one signature. The option needs -u.
+    /// The option uses the gpg engine, and it is not a key of a --sign-type.
+    /// Each occurrence adds one signature. The option needs -u.
     #[cfg(feature = "s3")]
     #[arg(long, value_name = "KEY-ID", requires = "update")]
     gpg_sign: Vec<String>,
@@ -2223,40 +2231,49 @@ struct RemoteSummaryArgs {
     gpg_homedir: Option<PathBuf>,
     /// With -u, sign the summary with this key.
     ///
-    /// The --sign-type option selects the engine. For ed25519 and spki, the key
-    /// is the base64 of the secret key. An spki secret key is a PKCS#8 DER, a
-    /// SEC1 DER that names the P-256 or the P-384 curve, or a PKCS#1 DER of an
-    /// RSA key, and its base64 can hold line breaks. For gpg, the key is a
-    /// selector, as for --gpg-sign. Each
-    /// occurrence adds one signature. The option needs -u.
+    /// The --sign-type before the key selects its engine. For ed25519 and
+    /// spki, the key is the base64 of the secret key. An spki secret key is a
+    /// PKCS#8 DER, a SEC1 DER that names the P-256 or the P-384 curve, or a
+    /// PKCS#1 DER of an RSA key, and its base64 can hold line breaks. For gpg,
+    /// the key is a selector, as for --gpg-sign. Each occurrence adds one
+    /// signature. The option needs -u.
     #[cfg(feature = "s3")]
     #[arg(long, value_name = "KEY-ID", requires = "update")]
     sign: Vec<String>,
-    /// With -u, the signature engine for --sign and --keys-file.
+    /// With -u, the signature engine of the --sign and --keys-file keys after
+    /// it.
     ///
     /// The names are `ed25519`, `spki`, and `gpg`, and the command refuses any
-    /// other name. The default is `ed25519`. If the option occurs more than
-    /// once, the last value wins. The option needs -u.
+    /// other name. Each key takes the engine of the nearest --sign-type before
+    /// it on the command line. A key before the first --sign-type takes
+    /// `ed25519`. The option can occur more than once, and each occurrence
+    /// needs a key of its own: a key after it and before the next
+    /// --sign-type. --gpg-sign is not a key of this option. The option needs
+    /// -u.
     #[cfg(feature = "s3")]
     #[arg(
         short = 's',
         long = "sign-type",
         value_name = "NAME",
-        overrides_with = "sign_type",
         requires = "update"
     )]
-    sign_type: Option<String>,
+    sign_type: Vec<String>,
     /// With -u, sign the summary with the keys of this file, in the format of
     /// `ostrya sign`.
     ///
     /// For ed25519, the file has base64 secret keys, one per line. For spki,
     /// the file holds PEM `PRIVATE KEY` blocks, each a PKCS#8 DER of a P-256, a
-    /// P-384, an Ed25519, or an RSA key. The command
-    /// reads every file, and each key adds one signature after each --sign
-    /// key. The gpg engine refuses this option. The option needs -u.
+    /// P-384, an Ed25519, or an RSA key. The --sign-type before the file
+    /// selects its engine. The command reads every file, and each key adds
+    /// one signature after each --sign key. The gpg engine refuses this
+    /// option. The option needs -u.
     #[cfg(feature = "s3")]
     #[arg(long, value_name = "PATH", requires = "update")]
     keys_file: Vec<std::ffi::OsString>,
+    /// The engine of each key, from the --sign-type values.
+    #[cfg(feature = "s3")]
+    #[arg(skip)]
+    key_types: KeyTypes,
     /// With -u, remove the writer lock of another writer of the bucket
     /// repository.
     ///
@@ -2563,90 +2580,352 @@ struct DiffArgs {
 }
 
 /// The signature engine that `--sign-type` selects.
-#[derive(Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum SignType {
     /// ed25519 detached signatures (the sign-api default).
-    #[value(name = "ed25519")]
     Ed25519,
     /// SubjectPublicKeyInfo keys: ECDSA over NIST P-256 or P-384 with SHA-256,
     /// Ed25519, or RSA PKCS#1 v1.5 with SHA-256.
-    #[value(name = "spki")]
     Spki,
     /// GPG (OpenPGP) detached signatures.
-    #[value(name = "gpg")]
     Gpg,
+}
+
+/// The `--sign-type` values of one command line, and the place of each key
+/// among them.
+///
+/// `clap` gives each value of the command line an index. A key takes the
+/// `--sign-type` with the highest index below its own. The capture keeps
+/// these places, so a handler can give each key its engine after the parse.
+#[derive(Clone, Debug, Default)]
+struct KeyTypes {
+    /// Each `--sign-type` value, in command-line order.
+    names: Vec<String>,
+    /// Each key option of the command, in the order of [`KeyTypes::capture`].
+    options: Vec<KeyOption>,
+}
+
+/// The keys of one key option of a command line.
+#[derive(Clone, Debug)]
+struct KeyOption {
+    /// The `clap` id of the option.
+    id: &'static str,
+    /// For each value of the option, in value order: the command-line index
+    /// of the value, and the index in [`KeyTypes::names`] of the nearest
+    /// `--sign-type` before it. `None` means that no `--sign-type` comes
+    /// before the value.
+    values: Vec<(usize, Option<usize>)>,
+}
+
+/// The `clap` id of the `--sign-type` option of each command.
+const SIGN_TYPE_ID: &str = "sign_type";
+
+impl KeyTypes {
+    /// Reads the `--sign-type` values and the places of the keys of the
+    /// options `ids` from the matches of one subcommand.
+    fn capture(matches: &clap::ArgMatches, ids: &[&'static str]) -> KeyTypes {
+        let names: Vec<String> = matches
+            .get_many::<String>(SIGN_TYPE_ID)
+            .map(|values| values.cloned().collect())
+            .unwrap_or_default();
+        let places: Vec<usize> = matches
+            .indices_of(SIGN_TYPE_ID)
+            .map(Iterator::collect)
+            .unwrap_or_default();
+        let options = ids
+            .iter()
+            .map(|&id| KeyOption {
+                id,
+                values: matches
+                    .indices_of(id)
+                    .map(|indices| {
+                        indices
+                            .map(|index| {
+                                let before = places.partition_point(|&place| place < index);
+                                (index, before.checked_sub(1))
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            })
+            .collect();
+        KeyTypes { names, options }
+    }
+
+    /// Returns `true` if the command line names a key.
+    fn has_key(&self) -> bool {
+        self.options.iter().any(|option| !option.values.is_empty())
+    }
+
+    /// Gives each key its engine.
+    ///
+    /// `read` reads one `--sign-type` value into its engine, or gives the
+    /// refusal of the value. The steps come in this order:
+    ///
+    /// 1. `read` reads each value in command-line order, also a value with no
+    ///    key. The first refusal ends the call.
+    /// 2. Each value needs a key of its own: a key after it and before the
+    ///    next value. If `filter` is `true` and the command line names no
+    ///    key, this step does not apply, and the values select the engines of
+    ///    the run.
+    ///
+    /// A key before the first `--sign-type` takes the ed25519 engine.
+    fn engines(
+        &self,
+        mut read: impl FnMut(&str) -> std::result::Result<SignType, String>,
+        filter: bool,
+    ) -> std::result::Result<KeyEngines, String> {
+        let types = self
+            .names
+            .iter()
+            .map(|name| read(name))
+            .collect::<std::result::Result<Vec<SignType>, String>>()?;
+        let has_key = self.has_key();
+        if has_key || !filter {
+            let mut owned = vec![false; self.names.len()];
+            for option in &self.options {
+                for &(_, owner) in &option.values {
+                    if let Some(owner) = owner {
+                        owned[owner] = true;
+                    }
+                }
+            }
+            if let Some(name) = owned
+                .iter()
+                .position(|owns| !owns)
+                .map(|place| &self.names[place])
+            {
+                return Err(format!(
+                    "--sign-type={name} has no key of its own; give a key after it and \
+                     before the next --sign-type"
+                ));
+            }
+        }
+        let mut keys: Vec<(&'static str, Vec<(usize, SignType)>)> =
+            Vec::with_capacity(self.options.len());
+        for option in &self.options {
+            let engines = option
+                .values
+                .iter()
+                .map(|&(index, owner)| (index, owner.map_or(SignType::Ed25519, |t| types[t])))
+                .collect();
+            keys.push((option.id, engines));
+        }
+        let filter = if has_key {
+            Vec::new()
+        } else {
+            let mut selected: Vec<SignType> = Vec::with_capacity(types.len());
+            for engine in &types {
+                if !selected.contains(engine) {
+                    selected.push(*engine);
+                }
+            }
+            selected
+        };
+        Ok(KeyEngines {
+            types,
+            keys,
+            filter,
+        })
+    }
+}
+
+/// The engine of each key of a command line.
+#[derive(Debug)]
+struct KeyEngines {
+    /// The engine of each `--sign-type` value, in command-line order.
+    types: Vec<SignType>,
+    /// For each key option: its `clap` id, and for each value in value order,
+    /// the command-line index of the value and its engine.
+    keys: Vec<(&'static str, Vec<(usize, SignType)>)>,
+    /// With no key on the command line, the engines that the `--sign-type`
+    /// values select, each once, in command-line order.
+    filter: Vec<SignType>,
+}
+
+impl KeyEngines {
+    /// Returns the engine of each value of the key option `id`, in value
+    /// order. An option that the capture did not read has no value.
+    fn of(&self, id: &str) -> Vec<SignType> {
+        self.keys
+            .iter()
+            .find(|(option, _)| *option == id)
+            .map(|(_, values)| values.iter().map(|&(_, engine)| engine).collect())
+            .unwrap_or_default()
+    }
+
+    /// Returns `true` if the command line names a key.
+    fn has_key(&self) -> bool {
+        self.keys.iter().any(|(_, values)| !values.is_empty())
+    }
+
+    /// Returns `true` if a key or a `--sign-type` names `engine`.
+    fn names(&self, engine: SignType) -> bool {
+        self.types.contains(&engine)
+    }
+
+    /// Returns the engines of the keys, each once, in the command-line order
+    /// of the first key of each engine.
+    fn order(&self) -> Vec<SignType> {
+        let mut first: Vec<(usize, SignType)> = Vec::new();
+        for (_, values) in &self.keys {
+            for &(index, engine) in values {
+                match first.iter_mut().find(|(_, held)| *held == engine) {
+                    Some(entry) => entry.0 = entry.0.min(index),
+                    None => first.push((index, engine)),
+                }
+            }
+        }
+        first.sort_by_key(|&(index, _)| index);
+        first.into_iter().map(|(_, engine)| engine).collect()
+    }
+}
+
+/// Parses the command line with `clap`, and gives each command that takes
+/// `--sign-type` the places of its keys.
+fn parse_cli<I, T>(args: I) -> std::result::Result<Cli, clap::Error>
+where
+    I: IntoIterator<Item = T>,
+    T: Into<std::ffi::OsString> + Clone,
+{
+    let mut command = Cli::command();
+    let matches = command.try_get_matches_from_mut(args)?;
+    let mut cli = <Cli as clap::FromArgMatches>::from_arg_matches(&matches)
+        .map_err(|err| err.format(&mut command))?;
+    if let (Some(command), Some((_, sub))) = (cli.command.as_mut(), matches.subcommand()) {
+        attach_key_types(command, sub);
+    }
+    Ok(cli)
+}
+
+/// Captures the [`KeyTypes`] of `command` from `matches`, the matches of its
+/// subcommand.
+fn attach_key_types(command: &mut Command, matches: &clap::ArgMatches) {
+    match command {
+        Command::Commit(args) => {
+            args.key_types = KeyTypes::capture(matches, &["sign", "sign_from_file"]);
+        }
+        Command::Sign(args) => {
+            args.key_types = KeyTypes::capture(matches, &["key_id", "keys_file"]);
+        }
+        Command::Summary(args) => {
+            args.key_types = KeyTypes::capture(matches, &["sign", "key_id", "keys_file"]);
+        }
+        Command::StaticDelta(args) => {
+            let (Some(command), Some((_, sub))) = (args.command.as_mut(), matches.subcommand())
+            else {
+                return;
+            };
+            match command {
+                StaticDeltaCommand::Generate(args) => {
+                    args.key_types = KeyTypes::capture(sub, &["sign", "keys_file"]);
+                }
+                StaticDeltaCommand::Verify(args) => {
+                    args.key_types = KeyTypes::capture(sub, &["key_id", "keys_file"]);
+                }
+                StaticDeltaCommand::ApplyOffline(args) => {
+                    args.key_types = KeyTypes::capture(sub, &["key_id", "keys_file"]);
+                }
+                _ => {}
+            }
+        }
+        #[cfg(feature = "s3")]
+        Command::Remote(args) => {
+            if let (Some(RemoteCommand::Summary(args)), Some((_, sub))) =
+                (args.command.as_mut(), matches.subcommand())
+            {
+                args.key_types = KeyTypes::capture(sub, &["sign", "keys_file"]);
+            }
+        }
+        _ => {}
+    }
 }
 
 #[derive(Args)]
 struct SignArgs {
-    /// Delete the stored signatures that match the given KEY-IDs.
-    ///
-    /// The command needs at least one KEY-ID, and prints `Deleted <n>
-    /// signature(s)`. For ed25519 and spki, a signature matches if it verifies
-    /// under a public key from a KEY-ID or from a --keys-file. For gpg, a
-    /// KEY-ID matches the end of the issuer fingerprint or of the primary-key
-    /// fingerprint of a signature. This option conflicts with --verify.
-    #[arg(short, long, conflicts_with = "verify")]
-    delete: bool,
     /// Verify the signatures of the commit, and add no signature.
     ///
-    /// The command prints one line for each signature, with `good`, `BAD`, or
-    /// `no public key`. Then it prints `verification OK` or `verification
+    /// The command verifies with one verifier for each engine of the run. For
+    /// each engine, it prints one line for each signature, with `good`, `BAD`,
+    /// or `no public key`. Then it prints `verification OK` or `verification
     /// FAILED`. If the commit has no signature for the engine, the command
-    /// prints `no signatures found`. If no signature is valid, the command
-    /// exits 1.
+    /// prints `no signatures found`. With more than one engine, a line with
+    /// the engine name and a colon comes before the lines of each engine. If
+    /// an engine has no valid signature, the command exits 1.
+    ///
+    /// With a KEY-ID or a --keys-file, the engines are the engines of these
+    /// keys. With --remote, the engines are the engines that the config of the
+    /// remote turns on. With no key and no --remote, the engines are the
+    /// engines that have a key in the key directories or in the GPG system
+    /// trust. A --sign-type with no key then selects its engine, and the
+    /// command verifies with the selected engines alone. The command refuses
+    /// a run with no engine. If the gpg engine is not excluded by a
+    /// --sign-type, a keyring of the GPG system trust that cannot be read
+    /// refuses the run.
     #[arg(long)]
     verify: bool,
-    /// The signature engine to use.
+    /// The signature engine of the KEY-ID and --keys-file keys after it.
     ///
-    /// The engine selects the key format and the detached-metadata key that
-    /// holds the signatures: `ostree.sign.ed25519`, `ostree.sign.spki`, or
-    /// `ostree.gpgsigs`.
-    #[arg(short = 's', long = "sign-type", default_value = "ed25519")]
-    sign_type: SignType,
+    /// The names are `ed25519`, `spki`, and `gpg`. The engine selects the key
+    /// format and the detached-metadata key that holds the signatures:
+    /// `ostree.sign.ed25519`, `ostree.sign.spki`, or `ostree.gpgsigs`. Each
+    /// key takes the engine of the nearest --sign-type before it on the
+    /// command line. A key before the first --sign-type takes `ed25519`. The
+    /// option can occur more than once, and each occurrence needs a key of
+    /// its own: a key after it and before the next --sign-type. A --verify run
+    /// with no key on the command line takes each --sign-type as a selection
+    /// of its engine.
+    #[arg(short = 's', long = "sign-type", value_name = "NAME")]
+    sign_type: Vec<String>,
     /// Read keys from a file.
     ///
-    /// For ed25519, the file has base64 keys, one per line: secret keys to
-    /// sign, public keys to verify and delete. For spki, the file holds PEM
-    /// `PRIVATE KEY` blocks, each a PKCS#8 DER of a P-256, a P-384, an
-    /// Ed25519, or an RSA key, to sign, and PEM `PUBLIC KEY`
-    /// blocks to verify and delete. Each `PRIVATE KEY` block adds one
-    /// signature. Signing and delete read every file. A signing or delete file
-    /// is a regular file of at most 1 MiB. For an ed25519 or spki verify, the
-    /// last value wins. With
-    /// this option or a KEY-ID, that verify does not read --keys-dir or the
-    /// system key directories.
+    /// The --sign-type before the file selects its engine. For ed25519, the
+    /// file has base64 keys, one per line: secret keys to sign, public keys
+    /// to verify. For spki, the file holds PEM `PRIVATE KEY` blocks, each a
+    /// PKCS#8 DER of a P-256, a P-384, an Ed25519, or an RSA key, to sign, and
+    /// PEM `PUBLIC KEY` blocks to verify. Each `PRIVATE KEY` block adds one
+    /// signature. Signing reads every file. A signing file is a regular file
+    /// of at most 1 MiB. An ed25519 or spki verify reads the last file of its
+    /// engine. With this option or a KEY-ID, a verify does not read --keys-dir
+    /// or the key directories.
     ///
-    /// For gpg, the file is a binary or armored keyring for verify and delete,
-    /// and every file is read. These keyrings then replace the global trusted
-    /// set and the keyrings of --remote. A gpg signing run refuses this option.
+    /// For gpg, the file is a binary or armored keyring for verify, and every
+    /// file is read. A gpg signing run refuses this option.
     #[arg(long, value_name = "PATH")]
     keys_file: Vec<std::ffi::OsString>,
-    /// Read the keys of an ed25519 or spki verify from this directory.
+    /// Add a directory to the key directories of a verify.
     ///
-    /// The verify reads `trusted.<type>`, `revoked.<type>`, and the files in
-    /// `trusted.<type>.d/` and `revoked.<type>.d/`. It then does not read the
-    /// system key directories `/etc/ostree` and `/usr/share/ostree`. An
-    /// ed25519 file has one base64 key per line, and an spki file has PEM
-    /// `PUBLIC KEY` blocks. If the option occurs more than once, the last
-    /// value wins. An empty value names the working directory. The gpg engine
-    /// refuses this option.
-    #[arg(long, value_name = "PATH", overrides_with = "keys_dir")]
-    keys_dir: Option<std::ffi::OsString>,
+    /// The key directories are `/etc/ostree`, `/usr/share/ostree`, and each
+    /// --keys-dir, in this order. A verify with no key and no --remote reads
+    /// `trusted.<type>`, `revoked.<type>`, and the files in
+    /// `trusted.<type>.d/` and `revoked.<type>.d/` of each directory, for the
+    /// ed25519 and spki engines. A revoked key of one directory applies to the
+    /// keys of each directory. An ed25519 file has one base64 key per line,
+    /// and an spki file has PEM `PUBLIC KEY` blocks. The option can occur more
+    /// than once. An empty value names the working directory. The command
+    /// refuses this option with --remote.
+    #[arg(long, value_name = "PATH")]
+    keys_dir: Vec<std::ffi::OsString>,
     /// The GnuPG home directory where gpg resolves signing keys.
     ///
-    /// Without this option, gpg uses its own resolution. Only the gpg engine
-    /// reads it, and the ed25519 and spki engines refuse it.
+    /// Without this option, gpg uses its own resolution. The command refuses
+    /// it if no key and no --sign-type names the gpg engine.
     #[arg(long)]
     gpg_homedir: Option<PathBuf>,
-    /// Add the trusted keyrings of this remote to a gpg verify and delete.
+    /// Verify with the keys of this remote.
     ///
-    /// The keyrings are `<remote>.trustedkeys.gpg` in the repository and in
-    /// `/etc/ostree/remotes.d/`. The command adds them to the global trusted
-    /// set: the `*.gpg` keyrings in `OSTREE_GPG_HOME`, or in
-    /// `/usr/share/ostree/trusted.gpg.d/` if that variable is unset or empty.
-    /// With --keys-file, the command does not read these keyrings. Only the gpg
-    /// engine reads this option, and the ed25519 and spki engines refuse it.
+    /// The engines are the engines that the config of the remote turns on for
+    /// its commits: `gpg-verify` and `sign-verify`, or the trust group that
+    /// the key `trust` names. The keys are the keys of the remote alone:
+    /// `<remote>.trustedkeys.gpg` in the repository and in
+    /// `/etc/ostree/remotes.d/`, each `gpgkeypath` entry, and the
+    /// `verification-<type>-key` and `verification-<type>-file` keys, or the
+    /// keys of the trust group. The command reads no global GPG trusted
+    /// directory and no key directory. A --sign-type selects its engine. The
+    /// command then reads the keys of the selected engines alone, and refuses
+    /// an engine that the config does not turn on. The command refuses this
+    /// option with a KEY-ID, a --keys-file, or a --keys-dir, and without
+    /// --verify.
     #[arg(long)]
     remote: Option<String>,
     // ostrya checks this operand after the repository resolves, in the order
@@ -2655,15 +2934,19 @@ struct SignArgs {
     commit: Option<String>,
     /// Key identifiers: base64 keys, or gpg key selectors.
     ///
-    /// For ed25519 and spki, each KEY-ID is a base64 key: a secret key to
-    /// sign, or a public key to verify and delete. An spki secret key is a
-    /// PKCS#8 DER, a SEC1 DER that names the P-256 or the P-384 curve, or a
-    /// PKCS#1 DER of an RSA key. An spki public key is a SubjectPublicKeyInfo
-    /// DER. The base64 of an spki key can hold line breaks. For gpg, each
-    /// KEY-ID is a signing key that gpg resolves (a fingerprint, key id, or
-    /// user id). A gpg signing run needs at least one KEY-ID. With --delete,
-    /// the gpg KEY-IDs are the fingerprints to remove.
+    /// The --sign-type before a KEY-ID selects its engine. For ed25519 and
+    /// spki, each KEY-ID is a base64 key: a secret key to sign, or a public
+    /// key to verify. An spki secret key is a PKCS#8 DER, a SEC1 DER that
+    /// names the P-256 or the P-384 curve, or a PKCS#1 DER of an RSA key. An
+    /// spki public key is a SubjectPublicKeyInfo DER. The base64 of an spki
+    /// key can hold line breaks. For gpg, each KEY-ID is a signing key that
+    /// gpg resolves (a fingerprint, key id, or user id). A verify refuses a
+    /// gpg KEY-ID: a gpg verify reads --keys-file, --remote, or the system
+    /// trust.
     key_id: Vec<String>,
+    /// The engine of each key, from the --sign-type values.
+    #[arg(skip)]
+    key_types: KeyTypes,
 }
 
 #[derive(Args)]
@@ -2747,42 +3030,45 @@ struct SummaryArgs {
     add_metadata: Vec<String>,
     /// Sign the summary with this key.
     ///
-    /// The --sign-type option selects the engine. For ed25519 and spki, the key
-    /// is the base64 of the secret key. An spki secret key is a PKCS#8 DER, a
-    /// SEC1 DER that names the P-256 or the P-384 curve, or a PKCS#1 DER of an
-    /// RSA key, and its base64 can hold line breaks. For gpg, the key is a
-    /// selector, as for --gpg-sign. Each
-    /// occurrence adds one signature. Only -u reads it.
+    /// The --sign-type before the key selects its engine. For ed25519 and
+    /// spki, the key is the base64 of the secret key. An spki secret key is a
+    /// PKCS#8 DER, a SEC1 DER that names the P-256 or the P-384 curve, or a
+    /// PKCS#1 DER of an RSA key, and its base64 can hold line breaks. For gpg,
+    /// the key is a selector, as for --gpg-sign. Each occurrence adds one
+    /// signature. Only -u reads it. --verify refuses it.
     #[arg(long, value_name = "KEY-ID")]
     sign: Vec<String>,
     /// Sign the summary with the GPG key that this selector names.
     ///
-    /// The option uses the gpg engine for each --sign-type. Each occurrence
-    /// adds one signature. Only -u reads it.
+    /// The option uses the gpg engine, and it is not a key of a --sign-type.
+    /// Each occurrence adds one signature. Only -u reads it. --verify refuses
+    /// it.
     #[arg(long, value_name = "KEY-ID")]
     gpg_sign: Vec<String>,
     /// Verify the signatures of the summary.
     ///
     /// The command then does not regenerate or sign the summary, also with -u.
-    /// It prints one line for each signature and then `verification OK` or
-    /// `verification FAILED`. If no signature is valid, the command exits 1.
-    /// The ed25519 and spki engines read the key sources of `ostrya sign
-    /// --verify`. The gpg engine reads each --keys-file keyring, or else the
-    /// keyrings of --remote, or else the global trusted set.
+    /// It verifies with one verifier for each engine of the run, and reads
+    /// the key sources of `ostrya sign --verify`. For each engine, it prints
+    /// one line for each signature and then `verification OK` or
+    /// `verification FAILED`. With more than one engine, a line with the
+    /// engine name and a colon comes before the lines of each engine. If an
+    /// engine has no valid signature, the command exits 1.
     #[arg(long)]
     verify: bool,
-    /// The signature engine for --verify, --sign, and the positional keys.
+    /// The signature engine of the --sign, KEY-ID, and --keys-file keys after
+    /// it.
     ///
-    /// The engine also applies to --keys-file. The names are `ed25519`,
-    /// `spki`, and `gpg`, and the command refuses any other name. The default
-    /// is `ed25519`. If the option occurs more than once, the last value wins.
-    #[arg(
-        short = 's',
-        long = "sign-type",
-        value_name = "NAME",
-        overrides_with = "sign_type"
-    )]
-    sign_type: Option<String>,
+    /// The names are `ed25519`, `spki`, and `gpg`, and the command refuses any
+    /// other name. Each key takes the engine of the nearest --sign-type before
+    /// it on the command line. A key before the first --sign-type takes
+    /// `ed25519`. The option can occur more than once, and each occurrence
+    /// needs a key of its own: a key after it and before the next
+    /// --sign-type. --gpg-sign is not a key of this option. A --verify run
+    /// with no key on the command line takes each --sign-type as a selection
+    /// of its engine.
+    #[arg(short = 's', long = "sign-type", value_name = "NAME")]
+    sign_type: Vec<String>,
     /// Set `ostree.summary.last-modified`, in seconds since the Unix epoch.
     ///
     /// A fixed value makes the output reproducible. Without this option, the
@@ -2800,38 +3086,47 @@ struct SummaryArgs {
     metadata_commit_timestamp: Option<u64>,
     /// Read keys from a file, in the format of `ostrya sign`.
     ///
-    /// For spki, a signing file holds PEM `PRIVATE KEY` blocks, and a verify
-    /// file holds PEM `PUBLIC KEY` blocks. For an ed25519 or spki verify, the
-    /// last value wins. With this option or a KEY-ID, that verify does not read
-    /// --keys-dir or the system key directories. A signing run reads every
-    /// file. A gpg verify reads every
-    /// file as a keyring, and a gpg signing run refuses this option. Without -u
-    /// and --verify, the keys sign the existing summary.
+    /// The --sign-type before the file selects its engine. For spki, a
+    /// signing file holds PEM `PRIVATE KEY` blocks, and a verify file holds
+    /// PEM `PUBLIC KEY` blocks. An ed25519 or spki verify reads the last file
+    /// of its engine. With this option or a KEY-ID, a verify does not read
+    /// --keys-dir or the key directories. A signing run reads every file. A
+    /// gpg verify reads every file as a keyring, and a gpg signing run refuses
+    /// this option. Without -u and --verify, the keys sign the existing
+    /// summary.
     #[arg(long, value_name = "PATH")]
     keys_file: Vec<std::ffi::OsString>,
-    /// Read the keys of an ed25519 or spki verify from this directory.
+    /// Add a directory to the key directories of a verify.
     ///
-    /// The verify reads `trusted.<type>`, `revoked.<type>`, and the files in
-    /// `trusted.<type>.d/` and `revoked.<type>.d/`. It then does not read the
-    /// system key directories `/etc/ostree` and `/usr/share/ostree`. An
-    /// ed25519 file has one base64 key per line, and an spki file has PEM
-    /// `PUBLIC KEY` blocks. If the option occurs more than once, the last
-    /// value wins. An empty value names the working directory. A gpg verify
-    /// refuses this option.
-    #[arg(long, value_name = "PATH", overrides_with = "keys_dir")]
-    keys_dir: Option<std::ffi::OsString>,
+    /// The key directories are `/etc/ostree`, `/usr/share/ostree`, and each
+    /// --keys-dir, in this order. A verify with no key and no --remote reads
+    /// `trusted.<type>`, `revoked.<type>`, and the files in
+    /// `trusted.<type>.d/` and `revoked.<type>.d/` of each directory, for the
+    /// ed25519 and spki engines. A revoked key of one directory applies to the
+    /// keys of each directory. An ed25519 file has one base64 key per line,
+    /// and an spki file has PEM `PUBLIC KEY` blocks. The option can occur more
+    /// than once. An empty value names the working directory. The command
+    /// refuses this option with --remote.
+    #[arg(long, value_name = "PATH")]
+    keys_dir: Vec<std::ffi::OsString>,
     /// The GnuPG home directory where gpg resolves signing keys.
     ///
     /// Only the gpg engine reads it: for --gpg-sign, and for --sign and the
     /// positional keys under the gpg engine.
     #[arg(long)]
     gpg_homedir: Option<PathBuf>,
-    /// Add the trusted gpg keyrings of this remote to a gpg verify.
+    /// Verify with the keys of this remote.
     ///
-    /// The keyrings are `<remote>.trustedkeys.gpg` in the repository and in
-    /// `/etc/ostree/remotes.d/`, in addition to the global trusted set. With
-    /// --keys-file, the command does not read them. Only the gpg engine reads
-    /// this option.
+    /// The engines are the engines that the config of the remote turns on for
+    /// its summary: `gpg-verify-summary` and `sign-verify-summary`. The keys
+    /// are the keys of the remote alone: `<remote>.trustedkeys.gpg` in the
+    /// repository and in `/etc/ostree/remotes.d/`, each `gpgkeypath` entry,
+    /// and the `verification-<type>-key` and `verification-<type>-file` keys.
+    /// The command reads no global GPG trusted directory and no key directory.
+    /// A --sign-type selects its engine. The command then reads the keys of
+    /// the selected engines alone, and refuses an engine that the config does
+    /// not turn on. The command refuses this option without --verify, and
+    /// with a KEY-ID, a --keys-file, or a --keys-dir.
     #[arg(long)]
     remote: Option<String>,
     /// Read the summary of the auth item of the client group NAME.
@@ -2849,11 +3144,15 @@ struct SummaryArgs {
     auth_group: Option<String>,
     /// Signing or verification keys, in the format of `ostrya sign`.
     ///
-    /// This is an ostrya extension. With -u, the keys sign each summary after
-    /// every --sign key. Without -u, they sign each existing summary, and the
-    /// command then ignores every read option. With --verify, they are the
-    /// trusted keys.
+    /// This is an ostrya extension. The --sign-type before a key selects its
+    /// engine. With -u, the keys sign each summary after every --sign key.
+    /// Without -u, they sign each existing summary, and the command then
+    /// ignores every read option. With --verify, they are the trusted keys,
+    /// and the command refuses a gpg key.
     key_id: Vec<String>,
+    /// The engine of each key, from the --sign-type values.
+    #[arg(skip)]
+    key_types: KeyTypes,
 }
 
 #[derive(Args)]
@@ -2890,8 +3189,9 @@ enum StaticDeltaCommand {
     /// The source is a superblock file or a directory that holds `superblock`.
     /// The command prints nothing and writes no ref. A key source is a KEY-ID,
     /// --keys-file, or --keys-dir. With a key source, the command verifies a
-    /// signed delta before it writes an object, and applies an unsigned delta
-    /// with no check. Without a key source, the command verifies no signature.
+    /// signed delta with each engine before it writes an object, and applies
+    /// an unsigned delta with no check. Without a key source, the command
+    /// verifies no signature.
     /// Each dependency of the target commit must be complete in the
     /// repository, so apply the delta of each dependency first.
     ApplyOffline(DeltaApplyArgs),
@@ -2942,41 +3242,56 @@ enum StaticDeltaCommand {
     Indexes,
     /// Verify the superblock signatures of a static delta.
     ///
-    /// On success, the command prints `Verification OK`. After the keys load,
-    /// each failure prints `Verification fails` on standard output and an
-    /// error on standard error, and the command exits 1. An unsigned delta is
-    /// a failure. Without --keys-file, --keys-dir, or a KEY-ID, the command
-    /// reads the system key directories `/etc/ostree` and `/usr/share/ostree`.
+    /// The command verifies with one verifier for each engine. If each engine
+    /// has a valid signature, the command prints `Verification OK` one time.
+    /// After the keys load, each failure prints `Verification fails` on
+    /// standard output and an error on standard error, and the command exits
+    /// with status 1. The first engine that fails gives the error. An unsigned
+    /// delta is a failure. Without --keys-file or a KEY-ID, the command reads
+    /// the key directories `/etc/ostree`, `/usr/share/ostree`, and each
+    /// --keys-dir, and verifies with each engine that has a trusted key in
+    /// them.
     Verify(DeltaVerifyArgs),
 }
 
 #[derive(Args)]
 struct DeltaVerifyArgs {
-    /// The signature engine: `ed25519` or `spki`.
+    /// The signature engine of the KEY-ID and --keys-file keys after it:
+    /// `ed25519` or `spki`.
     ///
-    /// The default is `ed25519`. The command refuses any other name, `gpg`
-    /// included. If the option occurs more than once, the last value wins.
-    #[arg(long = "sign-type", value_name = "NAME", overrides_with = "sign_type")]
-    sign_type: Option<String>,
+    /// The command refuses any other name, `gpg` included. Each key takes the
+    /// engine of the nearest --sign-type before it on the command line. A key
+    /// before the first --sign-type takes `ed25519`. The option can occur
+    /// more than once. With a key on the command line, each occurrence needs a
+    /// key of its own: a key after it and before the next --sign-type. With
+    /// no key, each --sign-type selects its engine, and the command verifies
+    /// with the selected engines alone.
+    #[arg(long = "sign-type", value_name = "NAME")]
+    sign_type: Vec<String>,
     /// Read public keys from a file.
     ///
-    /// For ed25519, the file has one base64 key per line. For spki, it has PEM
-    /// `PUBLIC KEY` blocks. If the option occurs more than once, the last value
-    /// wins. With this option or a KEY-ID, the command does not read --keys-dir
-    /// or the system key directories. The path must name a regular file of 1 MiB or less.
-    /// The command takes an empty value as given, and refuses it because it is
+    /// The --sign-type before the file selects its engine. For ed25519, the
+    /// file has one base64 key per line. For spki, it has PEM `PUBLIC KEY`
+    /// blocks. The command reads the last file of each engine. With this
+    /// option or a KEY-ID, the command does not read --keys-dir or the key
+    /// directories. The path must name a regular file of 1 MiB or less. The
+    /// command takes an empty value as given, and refuses it because it is
     /// not a regular file.
-    #[arg(long, value_name = "PATH", overrides_with = "keys_file")]
-    keys_file: Option<std::ffi::OsString>,
-    /// Read `trusted.<type>` and `revoked.<type>` from this directory.
+    #[arg(long, value_name = "PATH")]
+    keys_file: Vec<std::ffi::OsString>,
+    /// Add a directory to the key directories.
     ///
-    /// The command also reads the files in `trusted.<type>.d/` and
-    /// `revoked.<type>.d/`. It then does not read the system key directories.
-    /// An ed25519 file has one base64 key per line, and an spki file has PEM
-    /// `PUBLIC KEY` blocks. If the option occurs more than once, the last value
-    /// wins. An empty value names the working directory.
-    #[arg(long, value_name = "PATH", overrides_with = "keys_dir")]
-    keys_dir: Option<std::ffi::OsString>,
+    /// The key directories are `/etc/ostree`, `/usr/share/ostree`, and each
+    /// --keys-dir, in this order. With no key, the command reads
+    /// `trusted.<type>`, `revoked.<type>`, and the files in
+    /// `trusted.<type>.d/` and `revoked.<type>.d/` of each directory, and
+    /// verifies with each engine that has a trusted key. A revoked key of one
+    /// directory applies to the keys of each directory. An ed25519 file has
+    /// one base64 key per line, and an spki file has PEM `PUBLIC KEY` blocks.
+    /// The option can occur more than once. An empty value names the working
+    /// directory.
+    #[arg(long, value_name = "PATH")]
+    keys_dir: Vec<std::ffi::OsString>,
     // ostrya checks this operand after the repository resolves.
     /// A delta name, or the path of a superblock file. Required.
     ///
@@ -2985,37 +3300,50 @@ struct DeltaVerifyArgs {
     delta: Option<String>,
     /// Trusted public keys in base64.
     ///
-    /// An ed25519 key must decode to 32 bytes. An spki key is a
-    /// SubjectPublicKeyInfo DER, and its base64 can hold line breaks.
+    /// The --sign-type before a key selects its engine. An ed25519 key must
+    /// decode to 32 bytes. An spki key is a SubjectPublicKeyInfo DER, and its
+    /// base64 can hold line breaks.
     key_id: Vec<String>,
+    /// The engine of each key, from the --sign-type values.
+    #[arg(skip)]
+    key_types: KeyTypes,
 }
 
 #[derive(Args)]
 struct DeltaApplyArgs {
-    /// The signature engine: `ed25519` or `spki`.
+    /// The signature engine of the KEY-ID and --keys-file keys after it:
+    /// `ed25519` or `spki`.
     ///
-    /// The default is `ed25519`. The command reads this option also with no
-    /// key source, and refuses any other name, `gpg` included. If the option
-    /// occurs more than once, the last value wins.
-    #[arg(long = "sign-type", value_name = "NAME", overrides_with = "sign_type")]
-    sign_type: Option<String>,
+    /// The command reads this option also with no key source, and refuses
+    /// any other name, `gpg` included. Each key takes the engine of the
+    /// nearest --sign-type before it on the command line. A key before the
+    /// first --sign-type takes `ed25519`. The option can occur more than once,
+    /// and each occurrence needs a key of its own: a key after it and before
+    /// the next --sign-type.
+    #[arg(long = "sign-type", value_name = "NAME")]
+    sign_type: Vec<String>,
     /// Read public keys from a file.
     ///
-    /// For ed25519, the file has one base64 key per line. For spki, it has PEM
-    /// `PUBLIC KEY` blocks. If the option occurs more than once, the last value
-    /// wins. With this option or a KEY-ID, the command does not read
-    /// --keys-dir. The path must
-    /// name a regular file of 1 MiB or less.
-    #[arg(long, value_name = "PATH", overrides_with = "keys_file")]
-    keys_file: Option<std::ffi::OsString>,
-    /// Read `trusted.<type>` and `revoked.<type>` from this directory.
+    /// The --sign-type before the file selects its engine. For ed25519, the
+    /// file has one base64 key per line. For spki, it has PEM `PUBLIC KEY`
+    /// blocks. The command reads the last file of each engine. With this
+    /// option or a KEY-ID, the command does not read --keys-dir or the key
+    /// directories. The path must name a regular file of 1 MiB or less.
+    #[arg(long, value_name = "PATH")]
+    keys_file: Vec<std::ffi::OsString>,
+    /// Add a directory to the key directories.
     ///
-    /// The command also reads the files in `trusted.<type>.d/` and
-    /// `revoked.<type>.d/`. An ed25519 file has one base64 key per line, and an
-    /// spki file has PEM `PUBLIC KEY` blocks. If the option occurs more than
-    /// once, the last value wins. An empty value names the working directory.
-    #[arg(long, value_name = "PATH", overrides_with = "keys_dir")]
-    keys_dir: Option<std::ffi::OsString>,
+    /// The key directories are `/etc/ostree`, `/usr/share/ostree`, and each
+    /// --keys-dir, in this order. With no key, a --keys-dir makes the command
+    /// read `trusted.<type>`, `revoked.<type>`, and the files in
+    /// `trusted.<type>.d/` and `revoked.<type>.d/` of each directory, and
+    /// check a signed delta with each engine that has a trusted key. A revoked
+    /// key of one directory applies to the keys of each directory. An ed25519
+    /// file has one base64 key per line, and an spki file has PEM `PUBLIC KEY`
+    /// blocks. The option can occur more than once. An empty value names the
+    /// working directory.
+    #[arg(long, value_name = "PATH")]
+    keys_dir: Vec<std::ffi::OsString>,
     // ostrya checks this operand after the repository resolves.
     /// A superblock file, or a directory with `superblock` and the parts.
     ///
@@ -3025,9 +3353,13 @@ struct DeltaApplyArgs {
     path: Option<PathBuf>,
     /// Trusted public keys in base64.
     ///
-    /// An ed25519 key must decode to 32 bytes. An spki key is a
-    /// SubjectPublicKeyInfo DER, and its base64 can hold line breaks.
+    /// The --sign-type before a key selects its engine. An ed25519 key must
+    /// decode to 32 bytes. An spki key is a SubjectPublicKeyInfo DER, and its
+    /// base64 can hold line breaks.
     key_id: Vec<String>,
+    /// The engine of each key, from the --sign-type values.
+    #[arg(skip)]
+    key_types: KeyTypes,
 }
 
 #[derive(Args)]
@@ -3112,16 +3444,23 @@ struct DeltaGenerateArgs {
     output_dir: Option<PathBuf>,
     /// Sign the generated delta with this key.
     ///
-    /// The option can occur more than once. The key is a base64 secret key for
-    /// ed25519 and spki, and a KEY-ID for gpg, as for `ostrya sign`. An spki
-    /// secret key is a PKCS#8 DER, a SEC1 DER that names the P-256 or the P-384
-    /// curve, or a PKCS#1 DER of an RSA key, and its base64 can hold line
-    /// breaks.
+    /// The option can occur more than once. The --sign-type before the key
+    /// selects its engine. The key is a base64 secret key for ed25519 and
+    /// spki, and a KEY-ID for gpg, as for `ostrya sign`. An spki secret key is
+    /// a PKCS#8 DER, a SEC1 DER that names the P-256 or the P-384 curve, or a
+    /// PKCS#1 DER of an RSA key, and its base64 can hold line breaks.
     #[arg(long = "sign")]
     sign: Vec<String>,
-    /// The signature engine for --sign and --keys-file.
-    #[arg(short = 's', long = "sign-type", default_value = "ed25519")]
-    sign_type: SignType,
+    /// The signature engine of the --sign and --keys-file keys after it.
+    ///
+    /// The names are `ed25519`, `spki`, and `gpg`, and the command refuses any
+    /// other name. Each key takes the engine of the nearest --sign-type before
+    /// it on the command line. A key before the first --sign-type takes
+    /// `ed25519`. The option can occur more than once, and each occurrence
+    /// needs a key of its own: a key after it and before the next
+    /// --sign-type.
+    #[arg(short = 's', long = "sign-type", value_name = "NAME")]
+    sign_type: Vec<String>,
     /// Read signing keys from a file.
     ///
     /// For ed25519, the file has base64 secret keys, one per line, as for
@@ -3130,8 +3469,9 @@ struct DeltaGenerateArgs {
     /// PKCS#1 DER of an RSA key. A line ends at LF
     /// or CRLF, and the last line can have no line end. The command refuses an
     /// empty spki file, an empty line, and a line with white space. Each key
-    /// adds one signature. The option can occur more than once, and the
-    /// command reads every file. The gpg engine refuses this option.
+    /// adds one signature. The --sign-type before the file selects its
+    /// engine. The option can occur more than once, and the command reads
+    /// every file. The gpg engine refuses this option.
     #[arg(long)]
     keys_file: Vec<PathBuf>,
     /// The GnuPG home directory where gpg resolves signing keys.
@@ -3168,6 +3508,9 @@ struct DeltaGenerateArgs {
     /// Swap the byte order from the host order, or from --set-endianness.
     #[arg(long, overrides_with = "swap_endianness")]
     swap_endianness: bool,
+    /// The engine of each key, from the --sign-type values.
+    #[arg(skip)]
+    key_types: KeyTypes,
 }
 
 /// The options of a command that reads or writes a bucket repository at an
@@ -4478,7 +4821,7 @@ struct PullLocalArgs {
 /// [`exit_no_command`] ends the process. A library error prints the line of
 /// [`error_line`] and exits 1.
 fn main() -> std::process::ExitCode {
-    let cli = match Cli::try_parse() {
+    let cli = match parse_cli(std::env::args_os()) {
         Ok(cli) => cli,
         Err(err) => {
             err.print().ok();
@@ -4661,12 +5004,12 @@ async fn run(repo: Option<&Path>, verbose: bool, command: Command) -> Result<()>
             diff(repo, name, args, owner).await
         }
         Command::Sign(args) => {
-            let (repo, path) = resolve_repo(repo, verbose, name).await;
-            sign(repo, path, name, args).await
+            let (repo, _) = resolve_repo(repo, verbose, name).await;
+            sign(repo, name, args).await
         }
         Command::Summary(args) => {
-            let (repo, path) = resolve_repo(repo, verbose, name).await;
-            summary(repo, path, args).await
+            let (repo, _) = resolve_repo(repo, verbose, name).await;
+            summary(repo, args).await
         }
         Command::StaticDelta(args) => {
             // The `ostree` command reports a missing nested subcommand before
@@ -6658,14 +7001,27 @@ async fn delta_show(repo_path: &Path, delta: Option<String>) -> Result<()> {
 /// library applies to each of its files.
 const VERIFY_KEYS_FILE_LIMIT: u64 = 1024 * 1024;
 
-/// The keys of an ed25519 or spki verify.
+/// The keys of one engine of a verify.
 ///
-/// The keys are the verifier, and the trusted and revoked keys in load order.
-/// The failure line of `static-delta verify` names the keys from these lists.
+/// The keys are the verifier, and the trusted and revoked keys of an ed25519
+/// or spki verifier in load order. The failure line of `static-delta verify`
+/// names the keys from these lists. A gpg verifier has empty lists.
 struct VerifyKeys {
-    verifier: Box<dyn Verifier>,
+    verifier: Arc<dyn Verifier>,
     trusted: Vec<Vec<u8>>,
     revoked: Vec<Vec<u8>>,
+}
+
+impl VerifyKeys {
+    /// Returns the keys of a verifier whose key lists the command does not
+    /// hold.
+    fn of(verifier: Arc<dyn Verifier>) -> VerifyKeys {
+        VerifyKeys {
+            verifier,
+            trusted: Vec::new(),
+            revoked: Vec::new(),
+        }
+    }
 }
 
 /// Prints `Verification fails` and `error: {text}`, then exits 1.
@@ -6683,23 +7039,35 @@ fn verification_fails(text: &str) -> ! {
 /// The checks come in the order of the `ostree` command:
 ///
 /// 1. The argument is present.
-/// 2. ostrya supports the sign type.
-/// 3. The keys load.
+/// 2. ostrya supports each sign type, and each `--sign-type` with a key on
+///    the command line has a key of its own.
+/// 3. The keys of each engine load.
 /// 4. The argument resolves, and the superblock reads.
-/// 5. The signatures verify.
+/// 5. The signatures verify with each engine, in the order of the engines.
 ///
-/// Every failure from step 4 on prints `Verification fails` first.
+/// Every failure from step 4 on prints `Verification fails` first. The first
+/// engine that fails gives the failure line. If each engine passes, the
+/// command prints `Verification OK` one time.
 async fn delta_verify(repo_path: &Path, args: DeltaVerifyArgs) -> Result<()> {
     let Some(arg) = args.delta else {
         exit_error("DELTA must be specified");
     };
-    let engine = verify_sign_type(args.sign_type.as_deref().unwrap_or("ed25519"), true);
-    let keys = load_verify_keys(
-        engine,
-        &args.key_id,
-        args.keys_file.as_deref().map(Path::new),
-        args.keys_dir.as_deref().map(Path::new),
-    )?;
+    let engines = match args
+        .key_types
+        .engines(|name| Ok(verify_sign_type(name, true)), true)
+    {
+        Ok(engines) => engines,
+        Err(message) => exit_error(&message),
+    };
+    let keys = local_verify_keys(&VerifySources {
+        engines: &engines,
+        key_id: &args.key_id,
+        keys_file: &args.keys_file,
+        keys_dir: &args.keys_dir,
+        remote: None,
+        summary: false,
+        gpg: false,
+    })?;
     let files = resolve_delta_arg(repo_path, &arg).unwrap_or_else(|text| verification_fails(&text));
     let sb = match DeltaSuperblock::read(&files.superblock).await {
         Ok(sb) => sb,
@@ -6714,20 +7082,20 @@ async fn delta_verify(repo_path: &Path, args: DeltaVerifyArgs) -> Result<()> {
     if !sb.is_signed() {
         verification_fails("no signatures in static-delta");
     }
-    let outcome = match sb.verify(&[keys.verifier.as_ref()]) {
-        Ok(outcome) => outcome,
-        Err(err) => {
-            println!("Verification fails");
-            return Err(err);
+    for (engine, keys) in &keys {
+        let outcome = match sb.verify(&[keys.verifier.as_ref()]) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                println!("Verification fails");
+                return Err(err);
+            }
+        };
+        if let Some(text) = delta_verify_failure(*engine, keys, &outcome) {
+            verification_fails(&text);
         }
-    };
-    match delta_verify_failure(engine, &keys, &outcome) {
-        None => {
-            println!("Verification OK");
-            Ok(())
-        }
-        Some(text) => verification_fails(&text),
     }
+    println!("Verification OK");
+    Ok(())
 }
 
 /// Returns the failure text of a verify of static-delta signatures.
@@ -6800,11 +7168,15 @@ fn verify_sign_type(name: &str, report_unsupported: bool) -> SignType {
 /// The steps come in the order of the `ostree` command:
 ///
 /// 1. The path is present.
-/// 2. ostrya supports the sign type.
-/// 3. The keys load, if a key source is given.
+/// 2. ostrya supports each sign type, and each `--sign-type` has a key of its
+///    own.
+/// 3. The keys load, if a key source is given. A key source is a KEY-ID, a
+///    `--keys-file`, or a `--keys-dir`. With a `--keys-dir` and no key, the
+///    keys come from the key directories, and a run that finds no engine is
+///    refused.
 /// 4. [`lexical_path`] applies the `..` components of the path. Then the path
 ///    resolves, and the superblock reads.
-/// 5. The signatures of a signed delta verify.
+/// 5. The signatures of a signed delta verify with each engine.
 /// 6. The delta applies. First the fallback objects of the delta are present.
 ///    Then the entries of field 2 of the target are valid, and the
 ///    dependencies of the target are complete. The `ostree` command has no
@@ -6816,16 +7188,25 @@ async fn delta_apply_offline(repo: &Repo, args: DeltaApplyArgs) -> Result<()> {
     let Some(path) = args.path else {
         exit_error("PATH must be specified");
     };
-    let engine = verify_sign_type(args.sign_type.as_deref().unwrap_or("ed25519"), false);
-    let keys = if !args.key_id.is_empty() || args.keys_file.is_some() || args.keys_dir.is_some() {
-        Some(load_verify_keys(
-            engine,
-            &args.key_id,
-            args.keys_file.as_deref().map(Path::new),
-            args.keys_dir.as_deref().map(Path::new),
-        )?)
+    let engines = match args
+        .key_types
+        .engines(|name| Ok(verify_sign_type(name, false)), false)
+    {
+        Ok(engines) => engines,
+        Err(message) => exit_error(&message),
+    };
+    let keys = if engines.has_key() || !args.keys_dir.is_empty() {
+        local_verify_keys(&VerifySources {
+            engines: &engines,
+            key_id: &args.key_id,
+            keys_file: &args.keys_file,
+            keys_dir: &args.keys_dir,
+            remote: None,
+            summary: false,
+            gpg: false,
+        })?
     } else {
-        None
+        Vec::new()
     };
     let path = lexical_path(&path);
     let meta = std::fs::metadata(&path)
@@ -6852,10 +7233,12 @@ async fn delta_apply_offline(repo: &Repo, args: DeltaApplyArgs) -> Result<()> {
     let sb = DeltaSuperblock::read(&superblock)
         .await
         .map_err(|err| delta_read_error(err, &shown))?;
-    if let Some(keys) = keys.filter(|_| sb.is_signed()) {
-        let outcome = sb.verify(&[keys.verifier.as_ref()])?;
-        if let Some(text) = delta_verify_failure(engine, &keys, &outcome) {
-            exit_error(&text);
+    if sb.is_signed() {
+        for (engine, keys) in &keys {
+            let outcome = sb.verify(&[keys.verifier.as_ref()])?;
+            if let Some(text) = delta_verify_failure(*engine, keys, &outcome) {
+                exit_error(&text);
+            }
         }
     }
     repo.apply_static_delta(sb, &parts).await?;
@@ -6895,52 +7278,280 @@ fn lexical_path(path: &Path) -> PathBuf {
     }
 }
 
-/// Loads the keys of an ed25519 or spki verify.
+/// The key sources of a verify run: `sign --verify`, `summary --verify`,
+/// `static-delta verify`, or `static-delta apply-offline`.
+struct VerifySources<'a> {
+    /// The engine of each key of the command line.
+    engines: &'a KeyEngines,
+    /// The positional keys.
+    key_id: &'a [String],
+    /// The `--keys-file` paths.
+    keys_file: &'a [std::ffi::OsString],
+    /// The `--keys-dir` paths.
+    keys_dir: &'a [std::ffi::OsString],
+    /// The `--remote` value.
+    remote: Option<&'a str>,
+    /// `true` if `--remote` gives the keys of the summary, and `false` if it
+    /// gives the keys of the commits.
+    summary: bool,
+    /// `true` if the command has the gpg engine.
+    gpg: bool,
+}
+
+/// Loads the keys of each engine of a verify run, in the order of the
+/// reports.
 ///
-/// The verify is `sign --verify`, `summary --verify`, `static-delta verify`,
-/// or `static-delta apply-offline`. The trusted keys are each `key_ids` entry,
-/// then each key of `keys_file`. If neither is given, the trusted and revoked
-/// keys come from `keys_dir`, or from the system key directories if `keys_dir`
-/// is absent.
-///
-/// If no trusted key is present before revocation, the error is
-/// `{type}: no keys loaded`. A key that is not valid refuses the run. A build
-/// without the `spki` feature refuses the spki engine before it reads a key.
-fn load_verify_keys(
-    engine: SignType,
-    key_ids: &[String],
-    keys_file: Option<&Path>,
-    keys_dir: Option<&Path>,
-) -> Result<VerifyKeys> {
-    #[cfg(not(feature = "spki"))]
-    if engine == SignType::Spki {
-        return Err(unsupported_type("spki"));
+/// With `--remote`, the keys come from the remote, as
+/// [`remote_verify_keys`] reads them. The command refuses `--remote` with a
+/// key on the command line and with a `--keys-dir`. Without `--remote`,
+/// [`local_verify_keys`] reads the keys.
+async fn verify_keys(
+    repo: &Repo,
+    sources: &VerifySources<'_>,
+) -> Result<Vec<(SignType, VerifyKeys)>> {
+    let Some(remote) = sources.remote else {
+        return local_verify_keys(sources);
+    };
+    if sources.engines.has_key() {
+        return Err(Error::Signature(
+            "--remote verifies with the keys of the remote; it takes no KEY-ID and no \
+             --keys-file"
+                .into(),
+        ));
     }
-    let name = sign_type_name(engine);
-    let mut trusted: Vec<Vec<u8>> = key_ids
+    if !sources.keys_dir.is_empty() {
+        return Err(Error::Signature(
+            "--remote verifies with the keys of the remote; it reads no --keys-dir".into(),
+        ));
+    }
+    remote_verify_keys(repo, remote, sources.summary, &sources.engines.filter).await
+}
+
+/// Loads the keys of each engine that the config of `remote` turns on, from
+/// the keys of the remote alone.
+///
+/// The engines are the GPG engine, then the sign-api engines in the order of
+/// the config. With a `filter`, the engines are the engines of the filter, in
+/// the order of the filter. The call then reads the keys of these engines
+/// alone, and refuses an engine that the config does not turn on.
+async fn remote_verify_keys(
+    repo: &Repo,
+    remote: &str,
+    summary: bool,
+    filter: &[SignType],
+) -> Result<Vec<(SignType, VerifyKeys)>> {
+    let names: Vec<&str> = filter
         .iter()
-        .map(|key| verify_key_bytes(engine, key.as_bytes()))
+        .map(|engine| sign_type_name(*engine))
         .collect();
-    let mut revoked = Vec::new();
-    if let Some(path) = keys_file {
-        trusted.extend(read_verify_keys_file(engine, path)?);
-    } else if key_ids.is_empty() {
-        let keys = match keys_dir {
-            Some(root) => load_sign_keys_from(&[root], name)?,
-            None => load_sign_keys(name)?,
+    let selection = (!names.is_empty()).then_some(names.as_slice());
+    let keys = if summary {
+        ostrya::verify::RemoteKeys::summary(repo, remote, selection).await?
+    } else {
+        ostrya::verify::RemoteKeys::commits(repo, remote, selection).await?
+    };
+    let mut found: Vec<(SignType, Arc<dyn Verifier>)> = Vec::new();
+    if let Some(gpg) = keys.gpg() {
+        found.push((SignType::Gpg, Arc::clone(gpg)));
+    }
+    for verifier in keys.sign() {
+        let key = verifier.metadata_key();
+        let Some(engine) = [SignType::Ed25519, SignType::Spki]
+            .into_iter()
+            .find(|engine| sign_metadata_key(*engine) == key)
+        else {
+            return Err(Error::Signature(format!(
+                "remote '{remote}' turns on the signature key '{key}', which this command \
+                 does not verify"
+            )));
         };
-        trusted = keys.trusted;
-        revoked = keys.revoked;
+        found.push((engine, Arc::clone(verifier)));
     }
-    if trusted.is_empty() {
-        return Err(Error::Signature(format!("{name}: no keys loaded")));
+    if filter.is_empty() {
+        return Ok(found
+            .into_iter()
+            .map(|(engine, verifier)| (engine, VerifyKeys::of(verifier)))
+            .collect());
     }
-    let verifier = build_sign_api_verifier(engine, &trusted, &revoked)?;
-    Ok(VerifyKeys {
-        verifier,
-        trusted,
-        revoked,
-    })
+    let target = if summary { "summary" } else { "commits" };
+    filter
+        .iter()
+        .map(
+            |engine| match found.iter().find(|(held, _)| held == engine) {
+                Some((_, verifier)) => Ok((*engine, VerifyKeys::of(Arc::clone(verifier)))),
+                None => Err(Error::Signature(format!(
+                    "remote '{remote}' turns on no {} check of its {target}",
+                    sign_type_name(*engine)
+                ))),
+            },
+        )
+        .collect()
+}
+
+/// Loads the keys of each engine of a verify run with no `--remote`.
+///
+/// With a key on the command line, the engines are the engines of the keys,
+/// in the order of the first key of each engine:
+///
+/// - An ed25519 or spki engine trusts its KEY-IDs, then the keys of its last
+///   `--keys-file`.
+/// - The gpg engine trusts the keyrings of each of its `--keys-file` values.
+///   A gpg KEY-ID is refused.
+///
+/// The run then reads no key directory.
+///
+/// With no key, the engines are the engines of the `--sign-type` values, or
+/// else ed25519, spki, and gpg. An ed25519 or spki engine reads the system
+/// key directories and then each `--keys-dir`, and the revoked keys of each
+/// directory apply to the trusted keys of each directory. The gpg engine
+/// reads the system trust. An engine is found if it has a trusted key before
+/// revocation. The call skips an engine that it does not find, and refuses an
+/// engine of a `--sign-type` that it does not find. A run that finds no
+/// engine is refused.
+///
+/// An ed25519 or spki key that is not valid refuses the run. A build without
+/// an engine does not read keys for it.
+fn local_verify_keys(sources: &VerifySources<'_>) -> Result<Vec<(SignType, VerifyKeys)>> {
+    let engines = sources.engines;
+    if engines.has_key() {
+        let key_engines = engines.of("key_id");
+        let file_engines = engines.of("keys_file");
+        if key_engines.contains(&SignType::Gpg) {
+            return Err(Error::Signature(
+                "a gpg verify takes its keyrings from --keys-file, --remote, or the system \
+                 trust; it takes no KEY-ID"
+                    .into(),
+            ));
+        }
+        let mut loaded = Vec::new();
+        for engine in engines.order() {
+            let mut files = sources
+                .keys_file
+                .iter()
+                .zip(&file_engines)
+                .filter(|(_, held)| **held == engine)
+                .map(|(path, _)| Path::new(path));
+            if engine == SignType::Gpg {
+                loaded.push((engine, gpg_keyring_keys(files)?));
+                continue;
+            }
+            let last_file = files.next_back();
+            let mut trusted: Vec<Vec<u8>> = sources
+                .key_id
+                .iter()
+                .zip(&key_engines)
+                .filter(|(_, held)| **held == engine)
+                .map(|(key, _)| verify_key_bytes(engine, key.as_bytes()))
+                .collect();
+            if let Some(path) = last_file {
+                trusted.extend(read_verify_keys_file(engine, path)?);
+            }
+            if trusted.is_empty() {
+                return Err(no_keys_loaded(engine));
+            }
+            let verifier = build_sign_api_verifier(engine, &trusted, &[])?;
+            loaded.push((
+                engine,
+                VerifyKeys {
+                    verifier,
+                    trusted,
+                    revoked: Vec::new(),
+                },
+            ));
+        }
+        return Ok(loaded);
+    }
+
+    let mut candidates = vec![
+        SignType::Ed25519,
+        #[cfg(feature = "spki")]
+        SignType::Spki,
+    ];
+    let sign_api = candidates.len();
+    if cfg!(feature = "gpg") && sources.gpg {
+        candidates.push(SignType::Gpg);
+    }
+    let filtered = !engines.filter.is_empty();
+    if filtered {
+        candidates = engines.filter.clone();
+    }
+    let dirs: Vec<&Path> = sources.keys_dir.iter().map(Path::new).collect();
+    let mut loaded = Vec::new();
+    for engine in candidates {
+        let keys = if engine == SignType::Gpg {
+            gpg_system_keys()?
+        } else {
+            let name = sign_type_name(engine);
+            let mut keys = load_sign_keys(name)?;
+            if !dirs.is_empty() {
+                let more = load_sign_keys_from(&dirs, name)?;
+                keys.trusted.extend(more.trusted);
+                keys.revoked.extend(more.revoked);
+            }
+            if keys.trusted.is_empty() {
+                None
+            } else {
+                Some(VerifyKeys {
+                    verifier: build_sign_api_verifier(engine, &keys.trusted, &keys.revoked)?,
+                    trusted: keys.trusted,
+                    revoked: keys.revoked,
+                })
+            }
+        };
+        match keys {
+            Some(keys) => loaded.push((engine, keys)),
+            None if filtered => return Err(no_keys_loaded(engine)),
+            None => {}
+        }
+    }
+    if loaded.is_empty() {
+        let probed = if sign_api > 1 {
+            "ed25519 or spki"
+        } else {
+            "ed25519"
+        };
+        let gpg = if cfg!(feature = "gpg") && sources.gpg {
+            ", and the system trust holds no gpg key"
+        } else {
+            ""
+        };
+        return Err(Error::Signature(format!(
+            "no keys loaded: the key directories hold no {probed} key{gpg}"
+        )));
+    }
+    Ok(loaded)
+}
+
+/// Returns the refusal of an engine of a verify run that has no trusted key.
+fn no_keys_loaded(engine: SignType) -> Error {
+    Error::Signature(format!("{}: no keys loaded", sign_type_name(engine)))
+}
+
+/// Returns the keys of a gpg verify over the keyrings `files`.
+#[cfg(feature = "gpg")]
+fn gpg_keyring_keys<'a>(files: impl Iterator<Item = &'a Path>) -> Result<VerifyKeys> {
+    let verifier = GpgVerifier::from_keyring_files(files)?;
+    Ok(VerifyKeys::of(Arc::new(verifier)))
+}
+
+/// Returns an error, because this build has no gpg engine.
+#[cfg(not(feature = "gpg"))]
+fn gpg_keyring_keys<'a>(_: impl Iterator<Item = &'a Path>) -> Result<VerifyKeys> {
+    Err(unsupported_type("gpg"))
+}
+
+/// Returns the keys of a gpg verify over the system trust, or `None` if the
+/// system trust holds no certificate.
+#[cfg(feature = "gpg")]
+fn gpg_system_keys() -> Result<Option<VerifyKeys>> {
+    let verifier = GpgVerifier::from_system_trust()?;
+    Ok((!verifier.is_empty()).then(|| VerifyKeys::of(Arc::new(verifier))))
+}
+
+/// Returns an error, because this build has no gpg engine.
+#[cfg(not(feature = "gpg"))]
+fn gpg_system_keys() -> Result<Option<VerifyKeys>> {
+    Err(unsupported_type("gpg"))
 }
 
 /// Decodes one public key of an ed25519 or spki verify.
@@ -7054,8 +7665,13 @@ fn format_delta_size(n: u64) -> String {
 
 /// Generates a static delta and prints the commits that it goes from and to.
 ///
-/// If signing keys are given, the delta is signed.
+/// If signing keys are given, the delta is signed. The `--sign-type` values
+/// are read first.
 async fn delta_generate(repo: &Repo, repo_path: &Path, args: DeltaGenerateArgs) -> Result<()> {
+    let engines = match args.key_types.engines(sign_type_from_name, false) {
+        Ok(engines) => engines,
+        Err(message) => exit_error(&message),
+    };
     // The reindex rebuilds the cache from the deltas under the `deltas/` tree
     // of the repository. A delta written to another location is not in this
     // tree, so the combination indexes nothing and gives no message.
@@ -7130,7 +7746,7 @@ async fn delta_generate(repo: &Repo, repo_path: &Path, args: DeltaGenerateArgs) 
         timestamp: args.timestamp,
         output_dir: args.output_dir.clone(),
         superblock_file: args.filename.clone(),
-        signers: delta_signers(&args)?,
+        signers: delta_signers(&args, &engines).await?,
         inline: args.inline,
         endianness,
     };
@@ -7144,66 +7760,87 @@ async fn delta_generate(repo: &Repo, repo_path: &Path, args: DeltaGenerateArgs) 
 
 /// Returns the signers of a `static-delta generate` run.
 ///
-/// There is one signer for each `--sign` value and for each line of each
-/// `--keys-file`, under `--sign-type`. If neither option is given, the list is
-/// empty.
-fn delta_signers(args: &DeltaGenerateArgs) -> Result<Vec<Arc<dyn Signer>>> {
-    if args.sign.is_empty() && args.keys_file.is_empty() {
-        return Ok(Vec::new());
-    }
-    if args.sign_type == SignType::Gpg && !args.keys_file.is_empty() {
+/// There is one signer for each `--sign` value, then one for each key of each
+/// `--keys-file`, in command-line order. Each key takes its engine from
+/// `engines`. The gpg engine refuses `--keys-file`. The command reads every
+/// file before it decodes a `--sign` value. An ed25519 file holds one base64
+/// key on each line, and [`delta_spki_key_lines`] reads an spki file. If no
+/// key is given, the list is empty. Each gpg key is looked up in the GnuPG
+/// home directory before the delta is written, so a refused key writes no
+/// part of the delta.
+async fn delta_signers(
+    args: &DeltaGenerateArgs,
+    engines: &KeyEngines,
+) -> Result<Vec<Arc<dyn Signer>>> {
+    let file_engines = engines.of("keys_file");
+    if file_engines.contains(&SignType::Gpg) {
         return Err(Error::Signature(
             "gpg signing takes --sign KEY-ID arguments; --keys-file serves the other engines"
                 .into(),
         ));
     }
-    #[cfg(feature = "spki")]
-    if args.sign_type == SignType::Spki {
-        return delta_spki_signers(args);
+    /// The keys of one `--keys-file`, read before a `--sign` value decodes.
+    enum FileKeys {
+        /// The base64 lines of an ed25519 file.
+        Ed25519(Vec<String>),
+        /// The signers of an spki file.
+        Spki(Vec<Arc<dyn Signer>>),
     }
-    let mut keys = args.sign.clone();
-    for path in &args.keys_file {
-        keys.extend(read_key_lines(path)?);
+    let mut files = Vec::with_capacity(args.keys_file.len());
+    for (path, engine) in args.keys_file.iter().zip(file_engines) {
+        files.push(match engine {
+            SignType::Spki => FileKeys::Spki(delta_spki_signers(path)?),
+            _ => FileKeys::Ed25519(read_key_lines(path)?),
+        });
     }
-    if keys.is_empty() {
+    let homedir = args.gpg_homedir.as_deref();
+    let decode =
+        |engine: SignType, key: &str| match sign_api_signer(engine, key.as_bytes(), homedir) {
+            Ok(signer) => Arc::from(signer),
+            Err(message) => exit_error(&message),
+        };
+    let mut signers: Vec<Arc<dyn Signer>> = Vec::with_capacity(args.sign.len());
+    for (key, engine) in args.sign.iter().zip(engines.of("sign")) {
+        if engine == SignType::Gpg {
+            let key = std::slice::from_ref(key);
+            match resolve_gpg_selectors(key, homedir).await? {
+                Ok(found) => signers.extend(found.into_iter().map(Arc::from)),
+                Err(message) => exit_error(&message),
+            }
+        } else {
+            signers.push(decode(engine, key));
+        }
+    }
+    for keys in files {
+        match keys {
+            FileKeys::Ed25519(lines) => {
+                signers.extend(lines.iter().map(|key| decode(SignType::Ed25519, key)))
+            }
+            FileKeys::Spki(file_signers) => signers.extend(file_signers),
+        }
+    }
+    if signers.is_empty() && !args.keys_file.is_empty() {
         return Err(Error::Signature(
             "no signing key given; pass --sign or --keys-file".into(),
         ));
     }
-    keys.iter()
-        .map(|key| {
-            match sign_api_signer(args.sign_type, key.as_bytes(), args.gpg_homedir.as_deref()) {
-                Ok(signer) => Ok(Arc::from(signer)),
-                Err(message) => exit_error(&message),
-            }
-        })
-        .collect()
+    Ok(signers)
 }
 
-/// Returns the signers of a `static-delta generate` run under spki.
-///
-/// There is one signer for each `--sign` value, then one for each line of
-/// each `--keys-file`, as [`delta_spki_key_lines`] reads the file. The
-/// command reads every file before it decodes a `--sign` value.
+/// Returns one spki signer for each line of the `static-delta generate`
+/// `--keys-file` at `path`, as [`delta_spki_key_lines`] reads the file.
 #[cfg(feature = "spki")]
-fn delta_spki_signers(args: &DeltaGenerateArgs) -> Result<Vec<Arc<dyn Signer>>> {
-    let mut from_files = Vec::new();
-    for path in &args.keys_file {
-        from_files.extend(delta_spki_key_lines(path)?);
-    }
-    let mut signers: Vec<Arc<dyn Signer>> = Vec::with_capacity(args.sign.len() + from_files.len());
-    for key in &args.sign {
-        match sign_api_signer(SignType::Spki, key.as_bytes(), None) {
-            Ok(signer) => signers.push(Arc::from(signer)),
-            Err(message) => exit_error(&message),
-        }
-    }
-    signers.extend(
-        from_files
-            .into_iter()
-            .map(|signer| Arc::new(signer) as Arc<dyn Signer>),
-    );
-    Ok(signers)
+fn delta_spki_signers(path: &Path) -> Result<Vec<Arc<dyn Signer>>> {
+    Ok(delta_spki_key_lines(path)?
+        .into_iter()
+        .map(|signer| Arc::new(signer) as Arc<dyn Signer>)
+        .collect())
+}
+
+/// Returns an error, because this build has no spki engine.
+#[cfg(not(feature = "spki"))]
+fn delta_spki_signers(_: &Path) -> Result<Vec<Arc<dyn Signer>>> {
+    Err(unsupported_type("spki"))
 }
 
 /// Returns one spki signer for each line of a `static-delta generate`
@@ -7741,11 +8378,6 @@ fn canonical_owner_conflict(canonical: bool, owner: Owner) -> Option<String> {
         .map(|(_, flag)| format!("Cannot specify both --canonical-permissions and non-zero {flag}"))
 }
 
-/// The `--sign-type` name that applies if the option is absent.
-///
-/// It is also the one name that the build of the `ostree` command supports.
-const DEFAULT_SIGN_TYPE: &str = "ed25519";
-
 /// The length in bytes of an ed25519 secret key.
 ///
 /// The key is the 32-byte seed, then the 32-byte public key.
@@ -7769,15 +8401,7 @@ async fn sign_staged_commit(
     checksum: &Checksum,
     args: &CommitArgs,
 ) -> Result<std::result::Result<(), String>> {
-    let signers = match collect_signers(
-        &args.sign,
-        &args.sign_from_file,
-        args.sign_type.as_deref(),
-        &args.gpg_sign,
-        args.gpg_homedir.as_deref(),
-    )
-    .await?
-    {
+    let signers = match collect_signers(args).await? {
         Ok(signers) => signers,
         Err(message) => return Ok(Err(message)),
     };
@@ -7799,28 +8423,26 @@ async fn sign_staged_commit(
 /// 2. every `--sign-from-file` key
 /// 3. every `--gpg-sign` key
 ///
-/// `sign_type` selects the engine of the first two groups alone. It is read
-/// only if one of these groups names a key. A run that signs nothing then
-/// accepts an engine name that no engine has, with no message.
+/// Each key of the first two groups takes the engine of the nearest
+/// `--sign-type` before it, and the ed25519 engine if no `--sign-type` comes
+/// before it.
 ///
 /// # Refusals
 ///
 /// The function refuses these inputs, so each refusal comes before the first
 /// signature:
 ///
+/// - a `--sign-type` value that names no engine, in command-line order
+/// - a `--sign-type` with no key of its own
 /// - a key that does not decode
 /// - a key file that does not read
 /// - an spki key file of more than one `PRIVATE KEY` block
 /// - a gpg selector that does not name exactly one secret key
 ///
 /// A gpg selector is a `--gpg-sign` key, or a `--sign` or `--sign-from-file`
-/// key under `--sign-type=gpg`.
+/// key under the gpg engine.
 async fn collect_signers(
-    sign: &[String],
-    sign_from_file: &[std::ffi::OsString],
-    sign_type: Option<&str>,
-    gpg_sign: &[String],
-    gpg_homedir: Option<&Path>,
+    args: &CommitArgs,
 ) -> Result<std::result::Result<Vec<Box<dyn Signer>>, String>> {
     macro_rules! refuse {
         ($result:expr) => {
@@ -7830,35 +8452,36 @@ async fn collect_signers(
             }
         };
     }
-    let mut signers = Vec::with_capacity(sign.len() + sign_from_file.len() + gpg_sign.len());
-    if !sign.is_empty() || !sign_from_file.is_empty() {
-        let engine = refuse!(sign_type_from_name(sign_type.unwrap_or(DEFAULT_SIGN_TYPE)));
+    let homedir = args.gpg_homedir.as_deref();
+    let engines = refuse!(args.key_types.engines(sign_type_from_name, false));
+    let mut signers =
+        Vec::with_capacity(args.sign.len() + args.sign_from_file.len() + args.gpg_sign.len());
+    for (key, engine) in args.sign.iter().zip(engines.of("sign")) {
         if engine == SignType::Gpg {
-            signers.extend(refuse!(resolve_gpg_selectors(sign, gpg_homedir).await?));
-            for path in sign_from_file {
-                let key = refuse!(read_sign_key_file(Path::new(path)));
-                let key = [String::from_utf8_lossy(&key).into_owned()];
-                signers.extend(refuse!(resolve_gpg_selectors(&key, gpg_homedir).await?));
-            }
+            let key = std::slice::from_ref(key);
+            signers.extend(refuse!(resolve_gpg_selectors(key, homedir).await?));
         } else {
-            for key in sign {
-                signers.push(refuse!(sign_api_signer(
-                    engine,
-                    key.as_bytes(),
-                    gpg_homedir
-                )));
+            signers.push(refuse!(sign_api_signer(engine, key.as_bytes(), homedir)));
+        }
+    }
+    for (path, engine) in args.sign_from_file.iter().zip(engines.of("sign_from_file")) {
+        let path = Path::new(path);
+        match engine {
+            SignType::Spki => signers.push(refuse!(sign_from_file_spki(path))),
+            SignType::Gpg => {
+                let key = refuse!(read_sign_key_file(path));
+                let key = [String::from_utf8_lossy(&key).into_owned()];
+                signers.extend(refuse!(resolve_gpg_selectors(&key, homedir).await?));
             }
-            for path in sign_from_file {
-                if engine == SignType::Spki {
-                    signers.push(refuse!(sign_from_file_spki(Path::new(path))));
-                    continue;
-                }
-                let key = refuse!(read_sign_key_file(Path::new(path)));
-                signers.push(refuse!(sign_api_signer(engine, &key, gpg_homedir)));
+            SignType::Ed25519 => {
+                let key = refuse!(read_sign_key_file(path));
+                signers.push(refuse!(sign_api_signer(engine, &key, homedir)));
             }
         }
     }
-    signers.extend(refuse!(resolve_gpg_selectors(gpg_sign, gpg_homedir).await?));
+    signers.extend(refuse!(
+        resolve_gpg_selectors(&args.gpg_sign, homedir).await?
+    ));
     Ok(Ok(signers))
 }
 
@@ -12273,7 +12896,7 @@ async fn remote_summary_update(
     let signers = summary_signers(&SummarySigning {
         gpg_sign: &args.gpg_sign,
         sign: &args.sign,
-        sign_type: args.sign_type.as_deref(),
+        key_types: &args.key_types,
         keys_file: &args.keys_file,
         key_id: &[],
         gpg_homedir: args.gpg_homedir.as_deref(),
@@ -13223,58 +13846,52 @@ async fn diff(repo: Repo, name: &str, args: DiffArgs, owner: Owner) -> Result<()
     Ok(())
 }
 
-/// Returns the refusal of `--keys-dir` under the gpg engine.
+/// Signs a commit, or verifies its signatures.
 ///
-/// The gpg engine reads keyrings only from `--keys-file`.
-fn gpg_keys_dir_refusal() -> Error {
-    Error::Signature(
-        "--keys-dir is not used by the gpg engine; supply keyrings with --keys-file".into(),
-    )
-}
-
-/// Signs a commit, or verifies or deletes its signatures.
-async fn sign(repo: Repo, repo_path: PathBuf, name: &str, args: SignArgs) -> Result<()> {
+/// The `--sign-type` values are read first, then the COMMIT. Each key takes
+/// the engine of the nearest `--sign-type` before it.
+async fn sign(repo: Repo, name: &str, args: SignArgs) -> Result<()> {
+    let engines = match args.key_types.engines(sign_type_from_name, args.verify) {
+        Ok(engines) => engines,
+        Err(message) => exit_error(&message),
+    };
     let Some(commit_rev) = args.commit.as_deref() else {
         exit_with_error(name, "Need a COMMIT to sign or verify");
     };
     let commit = resolve(&repo, commit_rev).await?;
-    if args.sign_type == SignType::Gpg && args.keys_dir.is_some() {
-        return Err(gpg_keys_dir_refusal());
-    }
-    if args.sign_type != SignType::Gpg && args.gpg_homedir.is_some() {
+    if args.gpg_homedir.is_some() && !engines.names(SignType::Gpg) {
         return Err(Error::Signature(
             "--gpg-homedir applies only to the gpg engine".into(),
         ));
     }
-    if args.sign_type != SignType::Gpg && args.remote.is_some() {
-        return Err(Error::Signature(
-            "--remote applies only to the gpg engine".into(),
-        ));
-    }
     if args.verify {
-        verify_signatures(&repo, &commit, &repo_path, &args).await
-    } else if args.delete {
-        delete_signatures(&repo, &commit, &repo_path, &args).await
+        verify_signatures(&repo, &commit, &args, &engines).await
+    } else if args.remote.is_some() {
+        Err(remote_without_verify())
     } else {
-        add_signatures(&repo, &commit, &args).await
+        add_signatures(&repo, &commit, &args, &engines).await
     }
 }
 
+/// Returns the refusal of `--remote` in a run that does not verify.
+fn remote_without_verify() -> Error {
+    Error::Signature("--remote applies to --verify alone".into())
+}
+
 /// Updates, verifies, signs, or reads the summary of the repository.
-async fn summary(repo: Repo, repo_path: PathBuf, args: SummaryArgs) -> Result<()> {
+///
+/// Each mode reads the `--sign-type` values. A mode other than `--verify`
+/// refuses a `--sign-type` with no key of its own.
+async fn summary(repo: Repo, args: SummaryArgs) -> Result<()> {
     let item = match &args.auth_group {
         Some(name) => Some(summary_auth_item(&repo, name, &args)?),
         None => None,
     };
     if args.verify {
-        let engine = summary_sign_type(&args.signing());
-        let verifier: Arc<dyn Verifier> = Arc::from(summary_verifier(&repo_path, engine, &args)?);
-        let outcome = repo.verify_summary(&[verifier]).await?;
-        report_verify(&outcome, engine);
-        if !outcome.valid {
-            exit_process(1);
-        }
-        return Ok(());
+        return summary_verify(&repo, &args).await;
+    }
+    if args.remote.is_some() {
+        return Err(remote_without_verify());
     }
 
     if args.update {
@@ -13283,6 +13900,10 @@ async fn summary(repo: Repo, repo_path: PathBuf, args: SummaryArgs) -> Result<()
         return summary_update(&repo, &args).await;
     }
 
+    let engines = match args.key_types.engines(sign_type_from_name, false) {
+        Ok(engines) => engines,
+        Err(message) => exit_error(&message),
+    };
     // Without `-u`, nothing reads the write options. With a read option, they
     // have no effect. Alone, they cause the no-option refusal, before a
     // positional key is read.
@@ -13297,14 +13918,68 @@ async fn summary(repo: Repo, repo_path: PathBuf, args: SummaryArgs) -> Result<()
     // an ostrya extension. Signing comes before each read option. Each signer
     // is built before the first signature is written.
     if !args.key_id.is_empty() || !args.keys_file.is_empty() {
-        let signing = args.signing();
-        let signers = summary_extension_signers(&signing, summary_sign_type(&signing)).await?;
+        let signers = summary_extension_signers(&args.signing(), &engines).await?;
         return repo.sign_summary_all(&signer_refs(&signers)).await;
     }
     if !reading {
         return Err(summary_nothing_to_do());
     }
     summary_read(&repo, &args, item.as_ref()).await
+}
+
+/// Verifies the signatures of the summary with one verifier for each engine
+/// of the run, and prints the report of each engine.
+///
+/// The command refuses `--sign` and `--gpg-sign`, which sign a summary. If an
+/// engine has no valid signature, the process exits 1.
+async fn summary_verify(repo: &Repo, args: &SummaryArgs) -> Result<()> {
+    if !args.sign.is_empty() || !args.gpg_sign.is_empty() {
+        return Err(Error::Signature(
+            "--verify takes no --sign or --gpg-sign key; give the trusted keys as KEY-ID \
+             arguments or with --keys-file"
+                .into(),
+        ));
+    }
+    let engines = match args.key_types.engines(sign_type_from_name, true) {
+        Ok(engines) => engines,
+        Err(message) => exit_error(&message),
+    };
+    let keys = verify_keys(
+        repo,
+        &VerifySources {
+            engines: &engines,
+            key_id: &args.key_id,
+            keys_file: &args.keys_file,
+            keys_dir: &args.keys_dir,
+            remote: args.remote.as_deref(),
+            summary: true,
+            gpg: true,
+        },
+    )
+    .await?;
+    // The summary and its signatures are read one time. Each engine then
+    // verifies the same bytes, and the verifiers run in one call on the
+    // blocking pool.
+    let data = repo
+        .read_summary()
+        .await?
+        .ok_or_else(|| Error::InvalidFormat("no summary to verify".into()))?;
+    let dict = repo.read_summary_signature().await?;
+    let outcomes = ostrya_rt::unblock(move || {
+        keys.into_iter()
+            .map(|(engine, keys)| {
+                let verifier = keys.verifier;
+                let signatures = match &dict {
+                    Some(dict) => signature_blobs(dict, verifier.metadata_key()),
+                    None => Vec::new(),
+                };
+                Ok((engine, verifier.verify(&data, &signatures)?))
+            })
+            .collect::<Result<Vec<_>>>()
+    })
+    .await?;
+    report_engines(&outcomes);
+    Ok(())
 }
 
 /// Returns the auth item of the client group `name` for `--auth-group`.
@@ -13379,8 +14054,8 @@ struct SummarySigning<'a> {
     gpg_sign: &'a [String],
     /// The `--sign` keys.
     sign: &'a [String],
-    /// The `--sign-type` value.
-    sign_type: Option<&'a str>,
+    /// The `--sign-type` values and the places of the keys among them.
+    key_types: &'a KeyTypes,
     /// The `--keys-file` paths.
     keys_file: &'a [std::ffi::OsString],
     /// The positional KEY-IDs.
@@ -13398,23 +14073,12 @@ impl SummaryArgs {
         SummarySigning {
             gpg_sign: &self.gpg_sign,
             sign: &self.sign,
-            sign_type: self.sign_type.as_deref(),
+            key_types: &self.key_types,
             keys_file: &self.keys_file,
             key_id: &self.key_id,
             gpg_homedir: self.gpg_homedir.as_deref(),
             remote: false,
         }
-    }
-}
-
-/// Returns the engine that `--sign-type` names.
-///
-/// If no engine has the name, the process exits with the refusal of the
-/// `ostree` command.
-fn summary_sign_type(args: &SummarySigning<'_>) -> SignType {
-    match sign_type_from_name(args.sign_type.unwrap_or(DEFAULT_SIGN_TYPE)) {
-        Ok(engine) => engine,
-        Err(message) => exit_error(&message),
     }
 }
 
@@ -13428,12 +14092,13 @@ fn summary_sign_type(args: &SummarySigning<'_>) -> SignType {
 ///
 /// 1. each `-m` argument, in command-line order
 /// 2. each `--gpg-sign` lookup
-/// 3. `--sign-type`, if a key needs an engine
+/// 3. each `--sign-type` value, and the key of each `--sign-type`
 /// 4. each `--sign` key
 /// 5. the positional and `--keys-file` keys
 ///
-/// Under the gpg engine, a `--sign` key and a positional key are looked up as
-/// a `--gpg-sign` selector is. The GPG signatures are written first, and the
+/// Each key takes the engine of the nearest `--sign-type` before it. Under
+/// the gpg engine, a `--sign` key and a positional key are looked up as a
+/// `--gpg-sign` selector is. The GPG signatures are written first, and the
 /// `--sign` signatures after them, in one write of each signature file. Each
 /// directory under `refs/mirrors/` whose name is not a collection id gets one
 /// `warning:` line on standard error.
@@ -13485,25 +14150,25 @@ async fn summary_signers(args: &SummarySigning<'_>) -> Result<Vec<Box<dyn Signer
         Ok(signers) => signers,
         Err(message) => exit_error(&message),
     };
-    let extension = !args.key_id.is_empty() || !args.keys_file.is_empty();
-    if !args.sign.is_empty() || extension {
-        let engine = summary_sign_type(args);
+    let engines = match args.key_types.engines(sign_type_from_name, false) {
+        Ok(engines) => engines,
+        Err(message) => exit_error(&message),
+    };
+    for (key, engine) in args.sign.iter().zip(engines.of("sign")) {
         if engine == SignType::Gpg {
-            match resolve_gpg_selectors(args.sign, homedir).await? {
+            match resolve_gpg_selectors(std::slice::from_ref(key), homedir).await? {
                 Ok(resolved) => signers.extend(resolved),
                 Err(message) => exit_error(&message),
             }
         } else {
-            for key in args.sign {
-                match sign_api_signer(engine, key.as_bytes(), homedir) {
-                    Ok(signer) => signers.push(signer),
-                    Err(message) => exit_error(&message),
-                }
+            match sign_api_signer(engine, key.as_bytes(), homedir) {
+                Ok(signer) => signers.push(signer),
+                Err(message) => exit_error(&message),
             }
         }
-        if extension {
-            signers.extend(summary_extension_signers(args, engine).await?);
-        }
+    }
+    if !args.key_id.is_empty() || !args.keys_file.is_empty() {
+        signers.extend(summary_extension_signers(args, &engines).await?);
     }
     Ok(signers)
 }
@@ -13550,49 +14215,19 @@ async fn summary_read(
     )
 }
 
-/// Returns the signers of the positional keys and `--keys-file` under `engine`.
+/// Returns the signers of the positional keys and of each `--keys-file`, in
+/// this order.
 ///
-/// This is an ostrya extension. The keys are read strictly, as `ostrya sign`
-/// reads them. A gpg selector is looked up before the signer is returned.
+/// This is an ostrya extension. Each key takes its engine from `engines`. The
+/// keys are read strictly, as `ostrya sign` reads them. A gpg selector is
+/// looked up before the signer is returned. The gpg engine refuses
+/// `--keys-file`, and a run that gives no key is refused.
 async fn summary_extension_signers(
     args: &SummarySigning<'_>,
-    engine: SignType,
+    engines: &KeyEngines,
 ) -> Result<Vec<Box<dyn Signer>>> {
-    match engine {
-        SignType::Ed25519 => summary_secret_keys(args)?
-            .iter()
-            .map(|key| {
-                Ed25519Signer::from_base64(key)
-                    .map(|signer| Box::new(signer) as Box<dyn Signer>)
-                    .map_err(Error::from)
-            })
-            .collect(),
-        SignType::Spki => summary_signers_spki(args),
-        SignType::Gpg => summary_signers_gpg(args).await,
-    }
-}
-
-/// Returns an spki signer for each positional summary secret key, then for
-/// each `PRIVATE KEY` block of each `--keys-file`, in order.
-#[cfg(feature = "spki")]
-fn summary_signers_spki(args: &SummarySigning<'_>) -> Result<Vec<Box<dyn Signer>>> {
-    let signers = spki_signers(args.key_id, args.keys_file, no_summary_key(args.remote))?;
-    Ok(signers
-        .into_iter()
-        .map(|signer| Box::new(signer) as Box<dyn Signer>)
-        .collect())
-}
-
-/// Returns an error, because this build has no spki engine.
-#[cfg(not(feature = "spki"))]
-fn summary_signers_spki(_: &SummarySigning<'_>) -> Result<Vec<Box<dyn Signer>>> {
-    Err(unsupported_type("spki"))
-}
-
-/// Returns a gpg signer for each positional KEY-ID of `summary`.
-#[cfg(feature = "gpg")]
-async fn summary_signers_gpg(args: &SummarySigning<'_>) -> Result<Vec<Box<dyn Signer>>> {
-    if !args.keys_file.is_empty() {
+    let file_engines = engines.of("keys_file");
+    if file_engines.contains(&SignType::Gpg) {
         let message = if args.remote {
             "gpg signing takes --gpg-sign and --sign KEY-ID arguments; --keys-file serves the \
              other engines"
@@ -13601,31 +14236,26 @@ async fn summary_signers_gpg(args: &SummarySigning<'_>) -> Result<Vec<Box<dyn Si
         };
         return Err(Error::Signature(message.into()));
     }
-    match resolve_gpg_selectors(args.key_id, args.gpg_homedir).await? {
-        Ok(signers) => Ok(signers),
-        Err(message) => exit_error(&message),
+    let mut signers: Vec<Box<dyn Signer>> = Vec::with_capacity(args.key_id.len());
+    for (key, engine) in args.key_id.iter().zip(engines.of("key_id")) {
+        match engine {
+            SignType::Ed25519 => signers.push(Box::new(Ed25519Signer::from_base64(key)?)),
+            SignType::Spki => signers.push(spki_signer(key)?),
+            SignType::Gpg => {
+                match resolve_gpg_selectors(std::slice::from_ref(key), args.gpg_homedir).await? {
+                    Ok(resolved) => signers.extend(resolved),
+                    Err(message) => exit_error(&message),
+                }
+            }
+        }
     }
-}
-
-/// Returns an error, because this build has no gpg engine.
-#[cfg(not(feature = "gpg"))]
-async fn summary_signers_gpg(_: &SummarySigning<'_>) -> Result<Vec<Box<dyn Signer>>> {
-    Err(unsupported_type("gpg"))
-}
-
-/// Returns the base64 secret keys for a summary signing run.
-///
-/// These are the KEY-IDs and the non-blank lines of each `--keys-file`. At
-/// least one key is required.
-fn summary_secret_keys(args: &SummarySigning<'_>) -> Result<Vec<String>> {
-    let mut keys = args.key_id.to_vec();
-    for path in args.keys_file {
-        keys.extend(read_key_lines(Path::new(path))?);
+    for (path, engine) in args.keys_file.iter().zip(file_engines) {
+        signers.extend(file_signers(Path::new(path), engine)?);
     }
-    if keys.is_empty() {
+    if signers.is_empty() {
         return Err(Error::Signature(no_summary_key(args.remote).into()));
     }
-    Ok(keys)
+    Ok(signers)
 }
 
 /// Returns the refusal of a summary signing run with no key.
@@ -13640,105 +14270,103 @@ fn no_summary_key(remote: bool) -> &'static str {
     }
 }
 
-/// Returns the verifier for `ostrya summary --verify`.
+/// Returns the spki signer of one base64 secret key.
+#[cfg(feature = "spki")]
+fn spki_signer(key: &str) -> Result<Box<dyn Signer>> {
+    Ok(Box::new(SpkiSigner::from_base64(key)?))
+}
+
+/// Returns an error, because this build has no spki engine.
+#[cfg(not(feature = "spki"))]
+fn spki_signer(_: &str) -> Result<Box<dyn Signer>> {
+    Err(unsupported_type("spki"))
+}
+
+/// Returns one signer for each secret key of the key file at `path`, in the
+/// order of the file, under `engine`.
 ///
-/// The ed25519 and spki engines read the key sources of `ostrya sign
-/// --verify`. The gpg engine reads each `--keys-file` keyring and refuses
-/// `--keys-dir`.
-fn summary_verifier(
-    repo_path: &Path,
-    engine: SignType,
-    args: &SummaryArgs,
-) -> Result<Box<dyn Verifier>> {
+/// An ed25519 file holds one base64 key on each line. An spki file holds PEM
+/// `PRIVATE KEY` blocks. The caller refuses a gpg file before this call, and
+/// a gpg file gives no signer.
+fn file_signers(path: &Path, engine: SignType) -> Result<Vec<Box<dyn Signer>>> {
     match engine {
-        SignType::Gpg if args.keys_dir.is_some() => Err(gpg_keys_dir_refusal()),
-        SignType::Gpg => summary_gpg_verifier(repo_path, args),
-        engine => Ok(load_verify_keys(
-            engine,
-            &args.key_id,
-            args.keys_file.last().map(Path::new),
-            args.keys_dir.as_deref().map(Path::new),
-        )?
-        .verifier),
+        SignType::Ed25519 => read_key_lines(path)?
+            .iter()
+            .map(|key| {
+                Ed25519Signer::from_base64(key)
+                    .map(|signer| Box::new(signer) as Box<dyn Signer>)
+                    .map_err(Error::from)
+            })
+            .collect(),
+        SignType::Spki => spki_file_signers(path),
+        SignType::Gpg => Ok(Vec::new()),
     }
 }
 
-/// Returns the gpg verifier for `summary --verify`.
+/// Returns one spki signer for each `PRIVATE KEY` block of the key file at
+/// `path`, in the order of the file.
+#[cfg(feature = "spki")]
+fn spki_file_signers(path: &Path) -> Result<Vec<Box<dyn Signer>>> {
+    Ok(spki_key_file_signers(path)?
+        .into_iter()
+        .map(|signer| Box::new(signer) as Box<dyn Signer>)
+        .collect())
+}
+
+/// Returns an error, because this build has no spki engine.
+#[cfg(not(feature = "spki"))]
+fn spki_file_signers(_: &Path) -> Result<Vec<Box<dyn Signer>>> {
+    Err(unsupported_type("spki"))
+}
+
+/// Signs the commit once for each key: each KEY-ID, then each key of each
+/// `--keys-file`, in command-line order.
 ///
-/// The keyrings are each `--keys-file`, or else the trusted keys of
-/// `--remote`, or else the system trust.
-#[cfg(feature = "gpg")]
-fn summary_gpg_verifier(repo_path: &Path, args: &SummaryArgs) -> Result<Box<dyn Verifier>> {
-    let verifier = if !args.keys_file.is_empty() {
-        GpgVerifier::from_keyring_files(&args.keys_file)?
-    } else if let Some(remote) = &args.remote {
-        GpgVerifier::for_remote(repo_path, remote)?
-    } else {
-        GpgVerifier::from_system_trust()?
-    };
-    Ok(Box::new(verifier))
-}
-
-/// Returns an error, because this build has no gpg engine.
-#[cfg(not(feature = "gpg"))]
-fn summary_gpg_verifier(_: &Path, _: &SummaryArgs) -> Result<Box<dyn Verifier>> {
-    Err(unsupported_type("gpg"))
-}
-
-/// Signs the commit once for each given key.
-async fn add_signatures(repo: &Repo, commit: &Checksum, args: &SignArgs) -> Result<()> {
-    match args.sign_type {
-        SignType::Ed25519 => {
-            for key in secret_key_lines(args)? {
-                repo.sign_commit(commit, &Ed25519Signer::from_base64(&key)?)
-                    .await?;
+/// Each key takes its engine from `engines`. The command builds every signer
+/// before the first signature, and looks up each gpg key in the GnuPG home
+/// directory, so a refused key writes no signature. The gpg engine refuses
+/// `--keys-file`.
+async fn add_signatures(
+    repo: &Repo,
+    commit: &Checksum,
+    args: &SignArgs,
+    engines: &KeyEngines,
+) -> Result<()> {
+    let file_engines = engines.of("keys_file");
+    if file_engines.contains(&SignType::Gpg) {
+        return Err(Error::Signature(
+            "gpg signing takes KEY-ID arguments; --keys-file keyrings serve verify".into(),
+        ));
+    }
+    let homedir = args.gpg_homedir.as_deref();
+    let mut signers: Vec<Box<dyn Signer>> = Vec::with_capacity(args.key_id.len());
+    for (key, engine) in args.key_id.iter().zip(engines.of("key_id")) {
+        signers.push(match engine {
+            SignType::Ed25519 => Box::new(Ed25519Signer::from_base64(key)?),
+            SignType::Spki => spki_signer(key)?,
+            SignType::Gpg => {
+                let key = std::slice::from_ref(key);
+                signers.extend(
+                    resolve_gpg_selectors(key, homedir)
+                        .await?
+                        .map_err(Error::Signature)?,
+                );
+                continue;
             }
-            Ok(())
-        }
-        SignType::Spki => sign_spki(repo, commit, args).await,
-        SignType::Gpg => sign_gpg(repo, commit, args).await,
+        });
     }
-}
-
-/// Signs the commit with each spki secret key.
-///
-/// The signers are the positional keys, then the `PRIVATE KEY` blocks of each
-/// `--keys-file`. The command reads every key before the first signature, so
-/// a refused key writes no signature.
-#[cfg(feature = "spki")]
-async fn sign_spki(repo: &Repo, commit: &Checksum, args: &SignArgs) -> Result<()> {
-    let signers = spki_signers(
-        &args.key_id,
-        &args.keys_file,
-        "no signing key given; pass a key argument or --keys-file",
-    )?;
-    for signer in &signers {
-        repo.sign_commit(commit, signer).await?;
-    }
-    Ok(())
-}
-
-/// Returns the spki signers of a signing run: one for each positional secret
-/// key, then one for each `PRIVATE KEY` block of each key file, in order.
-///
-/// `none` is the refusal if no key is given.
-#[cfg(feature = "spki")]
-fn spki_signers(
-    key_id: &[String],
-    keys_file: &[std::ffi::OsString],
-    none: &str,
-) -> Result<Vec<SpkiSigner>> {
-    let mut signers = Vec::new();
-    for key in key_id {
-        signers.push(SpkiSigner::from_base64(key)?);
-    }
-    for path in keys_file {
-        signers.extend(spki_key_file_signers(Path::new(path))?);
+    for (path, engine) in args.keys_file.iter().zip(file_engines) {
+        signers.extend(file_signers(Path::new(path), engine)?);
     }
     if signers.is_empty() {
-        return Err(Error::Signature(none.into()));
+        return Err(Error::Signature(
+            "no signing key given; pass a key argument or --keys-file".into(),
+        ));
     }
-    Ok(signers)
+    for signer in &signers {
+        repo.sign_commit(commit, signer.as_ref()).await?;
+    }
+    Ok(())
 }
 
 /// Returns one spki signer for each `PRIVATE KEY` block of the secret key
@@ -13752,123 +14380,62 @@ fn spki_key_file_signers(path: &Path) -> Result<Vec<SpkiSigner>> {
     Ok(spki_secret_keys(bytes, &key_file_subject(path))?)
 }
 
-/// Returns an error, because this build has no spki engine.
-#[cfg(not(feature = "spki"))]
-async fn sign_spki(_: &Repo, _: &Checksum, _: &SignArgs) -> Result<()> {
-    Err(unsupported_type("spki"))
-}
-
-/// Signs the commit with keys that the `gpg` binary resolves.
+/// Verifies the commit with one verifier for each engine of the run, and
+/// prints the report of each engine.
 ///
-/// Each KEY-ID is a fingerprint, a key id, or a user id. The lookup uses the
-/// default GnuPG home directory or the `--gpg-homedir` override. The private
-/// key stays with gpg and its agent, also a key on a hardware token.
-#[cfg(feature = "gpg")]
-async fn sign_gpg(repo: &Repo, commit: &Checksum, args: &SignArgs) -> Result<()> {
-    if !args.keys_file.is_empty() {
-        return Err(Error::Signature(
-            "gpg signing takes KEY-ID arguments; --keys-file keyrings serve verify and delete"
-                .into(),
-        ));
-    }
-    if args.key_id.is_empty() {
-        return Err(Error::Signature(
-            "gpg signing requires at least one KEY-ID (a fingerprint, key id, or user id)".into(),
-        ));
-    }
-    for key in &args.key_id {
-        let mut signer = GpgSigner::new(key);
-        if let Some(dir) = &args.gpg_homedir {
-            signer = signer.with_homedir(dir);
-        }
-        repo.sign_commit(commit, &signer).await?;
-    }
-    Ok(())
-}
-
-/// Returns an error, because this build has no gpg engine.
-#[cfg(not(feature = "gpg"))]
-async fn sign_gpg(_: &Repo, _: &Checksum, _: &SignArgs) -> Result<()> {
-    Err(unsupported_type("gpg"))
-}
-
-/// Verifies the commit under the selected engine and prints each signature.
-///
-/// If no signature is valid, the process exits 1.
+/// If an engine has no valid signature, the process exits 1.
 async fn verify_signatures(
     repo: &Repo,
     commit: &Checksum,
-    repo_path: &Path,
     args: &SignArgs,
+    engines: &KeyEngines,
 ) -> Result<()> {
-    let verifier: Arc<dyn Verifier> = Arc::from(match args.sign_type {
-        SignType::Gpg => gpg_verifier(repo_path, args)?,
-        engine => sign_api_verifier(engine, args)?,
-    });
-    let outcome = repo.verify_commit(commit, &[verifier]).await?;
-    report_verify(&outcome, args.sign_type);
-    if !outcome.valid {
-        exit_process(1);
+    let keys = verify_keys(
+        repo,
+        &VerifySources {
+            engines,
+            key_id: &args.key_id,
+            keys_file: &args.keys_file,
+            keys_dir: &args.keys_dir,
+            remote: args.remote.as_deref(),
+            summary: false,
+            gpg: true,
+        },
+    )
+    .await?;
+    let mut outcomes = Vec::with_capacity(keys.len());
+    for (engine, keys) in keys {
+        outcomes.push((engine, repo.verify_commit(commit, &[keys.verifier]).await?));
     }
-    Ok(())
-}
-
-/// Deletes the signatures that the KEY-IDs match, and prints the count.
-async fn delete_signatures(
-    repo: &Repo,
-    commit: &Checksum,
-    repo_path: &Path,
-    args: &SignArgs,
-) -> Result<()> {
-    if args.key_id.is_empty() {
-        return Err(Error::Signature(
-            "delete requires at least one KEY-ID".into(),
-        ));
-    }
-    let removed = match args.sign_type {
-        SignType::Gpg => gpg_delete(repo, commit, repo_path, args).await?,
-        engine => {
-            // An ed25519 or spki blob belongs to a KEY-ID if it verifies under
-            // that public key. The code selects the blobs to remove first, and
-            // the predicate matches them by bytes.
-            let verifier = build_sign_api_verifier(engine, &public_key_bytes(args)?, &[])?;
-            let key = sign_metadata_key(engine);
-            let payload = repo.load_object_bytes(ObjectType::Commit, commit).await?;
-            let mut doomed: Vec<Vec<u8>> = Vec::new();
-            for blob in stored_signatures(repo, commit, key).await? {
-                let valid = verifier
-                    .verify(&payload, std::slice::from_ref(&blob))
-                    .map(|o| o.valid)
-                    .unwrap_or(false);
-                if valid {
-                    doomed.push(blob);
-                }
-            }
-            repo.delete_signatures(commit, key, move |_, blob| doomed.iter().any(|d| d == blob))
-                .await?
-        }
-    };
-    println!("Deleted {removed} signature(s)");
+    report_engines(&outcomes);
     Ok(())
 }
 
 /// Returns the signature blobs stored under `key` in the detached metadata.
 ///
-/// The blobs come in stored order. If the metadata or the key is missing, or
-/// the value is not an array, the result is empty. Elements that are not
-/// bytes are skipped.
+/// The blobs come in stored order, as [`signature_blobs`] reads them.
+#[cfg(feature = "gpg")]
 async fn stored_signatures(repo: &Repo, commit: &Checksum, key: &str) -> Result<Vec<Vec<u8>>> {
-    let Some(dict) = repo.read_commit_detached_metadata(commit).await? else {
-        return Ok(Vec::new());
-    };
+    Ok(match repo.read_commit_detached_metadata(commit).await? {
+        Some(dict) => signature_blobs(&dict, key),
+        None => Vec::new(),
+    })
+}
+
+/// Returns the signature blobs under `key` in the `a{sv}` signature dict
+/// `dict`, in stored order.
+///
+/// If the key is missing, or the value is not an array, the result is empty.
+/// Elements that are not bytes are skipped.
+fn signature_blobs(dict: &Value, key: &str) -> Vec<Vec<u8>> {
     let Some(value) = dict.dict_get(key) else {
-        return Ok(Vec::new());
+        return Vec::new();
     };
     let array = match value.as_variant() {
         Some((_, inner)) => inner,
         None => value,
     };
-    Ok(array
+    array
         .as_array()
         .map(|blobs| {
             blobs
@@ -13876,69 +14443,7 @@ async fn stored_signatures(repo: &Repo, commit: &Checksum, key: &str) -> Result<
                 .filter_map(|blob| blob.as_bytes().map(<[u8]>::to_vec))
                 .collect()
         })
-        .unwrap_or_default())
-}
-
-/// Deletes the GPG signatures that match a KEY-ID by fingerprint.
-///
-/// A signature matches by its issuer fingerprint or by its primary-key
-/// fingerprint. The issuer fingerprint is reported also for a key that is not
-/// in the keyrings. If a keyring of the trusted set (`--keys-file`,
-/// `--remote`, or the default `trusted.gpg.d`) holds the key, a match can
-/// also use the primary-key fingerprint of a verified signature.
-#[cfg(feature = "gpg")]
-async fn gpg_delete(
-    repo: &Repo,
-    commit: &Checksum,
-    repo_path: &Path,
-    args: &SignArgs,
-) -> Result<usize> {
-    let wanted: Vec<String> = args
-        .key_id
-        .iter()
-        .map(|k| normalize_fingerprint(k))
-        .collect();
-    let verifier = gpg_trust(repo_path, args)?;
-    let payload = repo.load_object_bytes(ObjectType::Commit, commit).await?;
-    let mut doomed: Vec<Vec<u8>> = Vec::new();
-    for blob in stored_signatures(repo, commit, "ostree.gpgsigs").await? {
-        let matches = match verifier.verify(&payload, std::slice::from_ref(&blob)) {
-            Ok(outcome) => outcome.signatures.iter().any(|s| {
-                fingerprint_matches(s.fingerprint.as_deref(), &wanted)
-                    || fingerprint_matches(s.primary_fingerprint.as_deref(), &wanted)
-            }),
-            Err(_) => false,
-        };
-        if matches {
-            doomed.push(blob);
-        }
-    }
-    repo.delete_signatures(commit, "ostree.gpgsigs", move |_, blob| {
-        doomed.iter().any(|d| d == blob)
-    })
-    .await
-}
-
-/// Returns an error, because this build has no gpg engine.
-#[cfg(not(feature = "gpg"))]
-async fn gpg_delete(_: &Repo, _: &Checksum, _: &Path, _: &SignArgs) -> Result<usize> {
-    Err(unsupported_type("gpg"))
-}
-
-/// Returns the ed25519 or spki verifier of `sign --verify`.
-///
-/// [`load_verify_keys`] reads the KEY-IDs and the last `--keys-file`. With
-/// neither, it reads the last `--keys-dir`, or the system key directories if
-/// `--keys-dir` is absent. If no trusted key is loaded before revocation, the
-/// error is `{type}: no keys loaded`.
-fn sign_api_verifier(engine: SignType, args: &SignArgs) -> Result<Box<dyn Verifier>> {
-    let keys = load_verify_keys(
-        engine,
-        &args.key_id,
-        args.keys_file.last().map(Path::new),
-        args.keys_dir.as_deref().map(Path::new),
-    )?;
-    Ok(keys.verifier)
+        .unwrap_or_default()
 }
 
 /// Returns an ed25519 or spki verifier for the trusted and revoked public
@@ -13947,106 +14452,15 @@ fn build_sign_api_verifier(
     engine: SignType,
     trusted: &[Vec<u8>],
     revoked: &[Vec<u8>],
-) -> Result<Box<dyn Verifier>> {
+) -> Result<Arc<dyn Verifier>> {
     match engine {
-        SignType::Ed25519 => Ok(Box::new(Ed25519Verifier::new(trusted, revoked)?)),
+        SignType::Ed25519 => Ok(Arc::new(Ed25519Verifier::new(trusted, revoked)?)),
         #[cfg(feature = "spki")]
-        SignType::Spki => Ok(Box::new(SpkiVerifier::new(trusted, revoked)?)),
+        SignType::Spki => Ok(Arc::new(SpkiVerifier::new(trusted, revoked)?)),
         #[cfg(not(feature = "spki"))]
         SignType::Spki => Err(unsupported_type("spki")),
         SignType::Gpg => Err(Error::Signature("gpg is not a sign-api engine".into())),
     }
-}
-
-/// Returns the gpg verifier of `sign --verify`, with the keyrings of
-/// [`gpg_trust`].
-#[cfg(feature = "gpg")]
-fn gpg_verifier(repo_path: &Path, args: &SignArgs) -> Result<Box<dyn Verifier>> {
-    Ok(Box::new(gpg_trust(repo_path, args)?))
-}
-
-/// Returns an error, because this build has no gpg engine.
-#[cfg(not(feature = "gpg"))]
-fn gpg_verifier(_: &Path, _: &SignArgs) -> Result<Box<dyn Verifier>> {
-    Err(unsupported_type("gpg"))
-}
-
-/// Returns the trusted gpg keyring set for verify and delete.
-///
-/// If `--keys-file` gives keyrings, the set is these keyrings. Otherwise, the
-/// set is the default ostree trust: the global `trusted.gpg.d` directory (or
-/// `$OSTREE_GPG_HOME`). If `--remote` names a remote, the set also holds the
-/// `trustedkeys.gpg` of that remote.
-#[cfg(feature = "gpg")]
-fn gpg_trust(repo_path: &Path, args: &SignArgs) -> Result<GpgVerifier> {
-    if !args.keys_file.is_empty() {
-        return Ok(GpgVerifier::from_keyring_files(&args.keys_file)?);
-    }
-    match &args.remote {
-        Some(remote) => GpgVerifier::for_remote(repo_path, remote),
-        None => GpgVerifier::from_system_trust(),
-    }
-}
-
-/// Returns the base64 secret keys for an ed25519 signing run.
-///
-/// These are the KEY-IDs and the non-blank lines of each `--keys-file`. At
-/// least one key is required.
-fn secret_key_lines(args: &SignArgs) -> Result<Vec<String>> {
-    let mut keys = args.key_id.clone();
-    for path in &args.keys_file {
-        keys.extend(read_key_lines(Path::new(path))?);
-    }
-    if keys.is_empty() {
-        return Err(Error::Signature(
-            "no signing key given; pass a key argument or --keys-file".into(),
-        ));
-    }
-    Ok(keys)
-}
-
-/// Returns the decoded public keys for an ed25519 or spki verify or delete.
-///
-/// These are the KEY-IDs and the keys of each `--keys-file`. An spki KEY-ID
-/// decodes as [`verify_key_bytes`] decodes it, so it can hold the line breaks
-/// of a PEM body. An spki `--keys-file` holds PEM `PUBLIC KEY` blocks, and
-/// [`spki_delete_keys`] reads it. The other KEY-IDs and the lines of an
-/// ed25519 `--keys-file` decode strictly.
-fn public_key_bytes(args: &SignArgs) -> Result<Vec<Vec<u8>>> {
-    let mut keys = Vec::new();
-    for key in &args.key_id {
-        keys.push(match args.sign_type {
-            SignType::Spki => verify_key_bytes(SignType::Spki, key.as_bytes()),
-            _ => base64::decode(key.trim())?,
-        });
-    }
-    for path in &args.keys_file {
-        if args.sign_type == SignType::Spki {
-            keys.extend(spki_delete_keys(Path::new(path))?);
-            continue;
-        }
-        for line in read_key_lines(Path::new(path))? {
-            keys.push(base64::decode(&line)?);
-        }
-    }
-    Ok(keys)
-}
-
-/// Returns the public keys of an spki `-d` `--keys-file`.
-///
-/// The file is read as [`read_signing_key_file`] reads it. `spki_public_keys`
-/// of the `ostrya` crate reads its PEM `PUBLIC KEY` blocks, by the rules of a
-/// verify `--keys-file`.
-#[cfg(feature = "spki")]
-fn spki_delete_keys(path: &Path) -> Result<Vec<Vec<u8>>> {
-    let bytes = read_signing_key_file(path)?;
-    Ok(spki_public_keys(&bytes, &key_file_subject(path))?)
-}
-
-/// Returns an error, because this build has no spki engine.
-#[cfg(not(feature = "spki"))]
-fn spki_delete_keys(_: &Path) -> Result<Vec<Vec<u8>>> {
-    Err(unsupported_type("spki"))
 }
 
 /// Returns the non-blank lines of a key file, trimmed.
@@ -14114,35 +14528,6 @@ fn sign_metadata_key(engine: SignType) -> &'static str {
     }
 }
 
-/// Normalizes a GPG fingerprint or key id for a suffix match.
-///
-/// The function drops a `0x` prefix and all spaces, and changes the hex to
-/// uppercase.
-#[cfg(feature = "gpg")]
-fn normalize_fingerprint(id: &str) -> String {
-    id.trim()
-        .trim_start_matches("0x")
-        .trim_start_matches("0X")
-        .replace(' ', "")
-        .to_uppercase()
-}
-
-/// Returns `true` if a stored fingerprint ends with one of the wanted key ids.
-///
-/// A short key id matches the tail of a full fingerprint.
-#[cfg(feature = "gpg")]
-fn fingerprint_matches(stored: Option<&str>, wanted: &[String]) -> bool {
-    match stored {
-        Some(fpr) => {
-            let fpr = fpr.to_uppercase();
-            wanted
-                .iter()
-                .any(|w| !w.is_empty() && fpr.ends_with(w.as_str()))
-        }
-        None => false,
-    }
-}
-
 /// Returns the error for a sign type whose engine this binary does not have.
 #[cfg_attr(all(feature = "spki", feature = "gpg"), allow(dead_code))]
 fn unsupported_type(name: &str) -> Error {
@@ -14187,6 +14572,24 @@ fn report_verify(outcome: &VerifyOutcome, engine: SignType) {
             "verification FAILED"
         }
     );
+}
+
+/// Prints the report of each engine of a verify run, in order, and exits 1 if
+/// an engine has no valid signature.
+///
+/// With more than one engine, a line with the engine name and a colon comes
+/// before the report of each engine.
+fn report_engines(outcomes: &[(SignType, VerifyOutcome)]) {
+    let named = outcomes.len() > 1;
+    for (engine, outcome) in outcomes {
+        if named {
+            println!("{}:", sign_type_name(*engine));
+        }
+        report_verify(outcome, *engine);
+    }
+    if outcomes.iter().any(|(_, outcome)| !outcome.valid) {
+        exit_process(1);
+    }
 }
 
 /// Resolves a revision to a commit checksum.
@@ -15569,7 +15972,7 @@ mod tests {
     #[cfg(feature = "push")]
     #[test]
     fn the_tree_push_metadata_puts_the_strings_before_the_variants() {
-        let cli = Cli::try_parse_from([
+        let cli = parse_cli([
             "ostrya",
             "push-tree",
             "--add-metadata=n=uint32 1",
@@ -15616,7 +16019,7 @@ mod tests {
         let parse = |extra: &[&str]| {
             let mut all = vec!["ostrya", "commit", "-b", "main", "--tag=t"];
             all.extend_from_slice(extra);
-            Cli::try_parse_from(all).map(|_| ())
+            parse_cli(all).map(|_| ())
         };
         use clap::error::ErrorKind;
         for extra in ["--no-bindings", "--skip-if-unchanged"] {
@@ -15635,7 +16038,7 @@ mod tests {
         let parse = |extra: &[&str]| {
             let mut all = vec!["ostrya", "commit", "-b", "main"];
             all.extend_from_slice(extra);
-            Cli::try_parse_from(all).map(|_| ())
+            parse_cli(all).map(|_| ())
         };
         let related = format!("--related=a/x={}", "ab".repeat(32));
         assert_eq!(
@@ -15731,7 +16134,7 @@ mod tests {
         let parse = |args: &[&str]| {
             let mut all = vec!["ostrya", "push"];
             all.extend_from_slice(args);
-            Cli::try_parse_from(all).map(|_| ())
+            parse_cli(all).map(|_| ())
         };
         let kind = |args: &[&str]| parse(args).unwrap_err().kind();
         use clap::error::ErrorKind;
@@ -15781,7 +16184,7 @@ mod tests {
                 "host:repo",
                 "dir",
             ];
-            assert!(Cli::try_parse_from(args).is_err(), "{removed}");
+            assert!(parse_cli(args).is_err(), "{removed}");
         }
     }
 
@@ -15793,15 +16196,173 @@ mod tests {
             &["ostrya", "summary", "-c"][..],
             &["ostrya", "summary", "--client-groups", "-v"],
         ] {
-            let err = Cli::try_parse_from(args).map(|_| ()).unwrap_err();
+            let err = parse_cli(args).map(|_| ()).unwrap_err();
             assert_eq!(err.kind(), ErrorKind::MissingRequiredArgument, "{args:?}");
         }
         for args in [
             &["ostrya", "summary", "-u", "-c"][..],
             &["ostrya", "summary", "--update", "--client-groups"],
         ] {
-            Cli::try_parse_from(args).map(|_| ()).unwrap();
+            parse_cli(args).map(|_| ()).unwrap();
         }
+    }
+
+    /// Returns the key types of the command line `args`, which names one of
+    /// the commands that take `--sign-type`.
+    fn key_types_of(args: &[&str]) -> KeyTypes {
+        match parse_cli(args).unwrap().command.unwrap() {
+            Command::Commit(args) => args.key_types,
+            Command::Sign(args) => args.key_types,
+            Command::Summary(args) => args.key_types,
+            Command::StaticDelta(args) => match args.command.unwrap() {
+                StaticDeltaCommand::Generate(args) => args.key_types,
+                StaticDeltaCommand::Verify(args) => args.key_types,
+                StaticDeltaCommand::ApplyOffline(args) => args.key_types,
+                _ => panic!("no key types"),
+            },
+            #[cfg(feature = "s3")]
+            Command::Remote(args) => match args.command.unwrap() {
+                RemoteCommand::Summary(args) => args.key_types,
+                _ => panic!("no key types"),
+            },
+            _ => panic!("no key types"),
+        }
+    }
+
+    /// Reads a `--sign-type` name for the tests: `ed25519`, `spki`, and `gpg`
+    /// name engines in every build.
+    fn any_engine(name: &str) -> std::result::Result<SignType, String> {
+        match name {
+            "ed25519" => Ok(SignType::Ed25519),
+            "spki" => Ok(SignType::Spki),
+            "gpg" => Ok(SignType::Gpg),
+            _ => Err(format!("unknown {name}")),
+        }
+    }
+
+    /// Each key takes the engine of the nearest `--sign-type` before it, and
+    /// a key before the first `--sign-type` takes ed25519. `--gpg-sign` is
+    /// not a key of a `--sign-type`. The order of the engines is the order of
+    /// the first key of each engine.
+    #[test]
+    fn each_key_takes_the_sign_type_before_it() {
+        let types = key_types_of(&[
+            "ostrya",
+            "commit",
+            "--sign=A",
+            "--sign-type=spki",
+            "--sign=B",
+            "--sign-from-file=F",
+            "--sign-type=gpg",
+            "--gpg-sign=G",
+            "--sign=C",
+        ]);
+        let engines = types.engines(any_engine, false).unwrap();
+        assert_eq!(
+            engines.of("sign"),
+            [SignType::Ed25519, SignType::Spki, SignType::Gpg]
+        );
+        assert_eq!(engines.of("sign_from_file"), [SignType::Spki]);
+        assert_eq!(
+            engines.order(),
+            [SignType::Ed25519, SignType::Spki, SignType::Gpg]
+        );
+
+        let types = key_types_of(&[
+            "ostrya",
+            "sign",
+            "C",
+            "K1",
+            "-sgpg",
+            "--keys-file=R",
+            "-s",
+            "spki",
+            "K2",
+        ]);
+        let engines = types.engines(any_engine, true).unwrap();
+        assert_eq!(engines.of("key_id"), [SignType::Ed25519, SignType::Spki]);
+        assert_eq!(engines.of("keys_file"), [SignType::Gpg]);
+        assert_eq!(
+            engines.order(),
+            [SignType::Ed25519, SignType::Gpg, SignType::Spki]
+        );
+    }
+
+    /// A `--sign-type` with no key of its own is refused: one with no key at
+    /// all, one after the last key, and one before another `--sign-type`. The
+    /// refusal of a name comes first.
+    #[test]
+    fn a_sign_type_needs_a_key_of_its_own() {
+        for args in [
+            &["ostrya", "commit", "--sign-type=spki"][..],
+            &["ostrya", "commit", "--sign=K", "--sign-type=spki"],
+            &[
+                "ostrya",
+                "commit",
+                "--sign-type=spki",
+                "--sign-type=ed25519",
+                "--sign=A",
+            ],
+            &["ostrya", "commit", "--sign-type=gpg", "--gpg-sign=K"],
+            &[
+                "ostrya",
+                "static-delta",
+                "apply-offline",
+                "--sign-type=spki",
+                "P",
+            ],
+            &["ostrya", "sign", "--verify", "C", "K", "--sign-type=spki"],
+        ] {
+            let filter = args.contains(&"--verify");
+            let err = key_types_of(args).engines(any_engine, filter).unwrap_err();
+            assert!(err.contains("has no key of its own"), "{args:?}: {err}");
+        }
+        let err = key_types_of(&["ostrya", "commit", "--sign=K", "--sign-type=nosuch"])
+            .engines(any_engine, false)
+            .unwrap_err();
+        assert_eq!(err, "unknown nosuch");
+    }
+
+    /// A verify with no key on the command line takes the `--sign-type`
+    /// values as a selection of engines, each engine once.
+    #[test]
+    fn a_keyless_verify_selects_the_engines() {
+        let types = key_types_of(&[
+            "ostrya",
+            "static-delta",
+            "verify",
+            "--sign-type=spki",
+            "--sign-type=ed25519",
+            "--sign-type=spki",
+            "D",
+        ]);
+        let engines = types.engines(any_engine, true).unwrap();
+        assert!(!engines.has_key());
+        assert_eq!(engines.filter, [SignType::Spki, SignType::Ed25519]);
+        let engines = key_types_of(&["ostrya", "summary", "--verify"])
+            .engines(any_engine, true)
+            .unwrap();
+        assert!(engines.filter.is_empty());
+    }
+
+    /// `remote summary` captures the keys of `--sign` and `--keys-file`.
+    #[cfg(feature = "s3")]
+    #[test]
+    fn the_remote_summary_keys_take_their_engines() {
+        let types = key_types_of(&[
+            "ostrya",
+            "remote",
+            "summary",
+            "-u",
+            "--sign=A",
+            "-s",
+            "spki",
+            "--keys-file=F",
+            "origin",
+        ]);
+        let engines = types.engines(any_engine, false).unwrap();
+        assert_eq!(engines.of("sign"), [SignType::Ed25519]);
+        assert_eq!(engines.of("keys_file"), [SignType::Spki]);
     }
 
     /// Each template of the push progress bar parses. The bar shows no stage

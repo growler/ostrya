@@ -1,4 +1,4 @@
-//! The trusted keys and the trust of one pull.
+//! The trusted keys, the trust of one pull, and the verifiers of one remote.
 //!
 //! [`TrustedKeys`] holds a set of verifiers and the signature axes that the set
 //! requires. The axes are GPG and the sign api. The axes are ANDed: each axis
@@ -10,6 +10,10 @@
 //! the trust from the configuration of a remote, as [`Repo::pull`] does.
 //! [`PullTrust::commits`] and [`PullTrust::with_summary`] take keys that the
 //! caller holds.
+//!
+//! [`RemoteKeys`] holds the verifiers of one remote for its commits or for its
+//! summary, from the keys of the remote alone, with one verifier for each
+//! engine.
 
 // The module also builds the policy of a target from a key source: the
 // configuration section of a remote, or a trust group.
@@ -27,7 +31,7 @@ use rustix::io::Errno;
 use crate::config::{Remote, SignVerify, valid_remote_name};
 use crate::error::{Error, Result};
 #[cfg(feature = "verify-gpg")]
-use crate::gpg::{FromOstreeKeyrings, read_keyring_fd};
+use crate::gpg::read_keyring_fd;
 use crate::pull::PullVerify;
 use crate::repo::Repo;
 use crate::sign::{
@@ -412,6 +416,7 @@ impl PullTrust {
             name,
             section: section.as_ref(),
             repo_keyring: true,
+            system_keys: true,
         };
         let mut cache = Verifiers::default();
         let commit = build_policy(repo, &source, &mut cache, gpg_commit, &sign_commit).await?;
@@ -436,12 +441,244 @@ impl PullTrust {
     }
 }
 
+/// The verifiers of a remote, built from the configuration of the remote and
+/// from the keys of the remote alone.
+///
+/// [`RemoteKeys::commits`] reads the keys that check the commits of a remote.
+/// [`RemoteKeys::summary`] reads the keys that check its summary. Each call
+/// reads the switches that a pull reads, and builds one verifier for each
+/// engine that the switches turn on:
+///
+/// - For the commits: `gpg-verify` and `sign-verify`, or the trust group that
+///   the key [`trust`](crate::config::Remote::trust) names.
+/// - For the summary: `gpg-verify-summary` and `sign-verify-summary`.
+///
+/// The keys are the keys of the remote alone:
+///
+/// - the repository keyring `<repo>/NAME.trustedkeys.gpg`
+/// - the system keyring `/etc/ostree/remotes.d/NAME.trustedkeys.gpg`
+/// - each `gpgkeypath` entry
+/// - the `verification-ENGINE-key` and `verification-ENGINE-file` keys
+///
+/// With a trust group, the commit keys come from the group alone, as in a
+/// pull. The calls read no global GPG trusted directory and no system sign-api
+/// key store. [`PullTrust::from_remote`] also reads these two sources.
+///
+/// A caller can select engines. The call then builds the selected engines
+/// alone, and reads no key source of an engine that it does not select.
+///
+/// A pull accepts a valid signature of any one sign-api engine. Each verifier
+/// of a `RemoteKeys` is available on its own, so a caller can require a valid
+/// signature of each engine.
+#[derive(Clone)]
+pub struct RemoteKeys {
+    /// The GPG verifier, if the switches turn on the GPG check.
+    gpg: Option<Arc<dyn Verifier>>,
+    /// One verifier for each sign-api engine that the switches turn on, in the
+    /// order of the switch value or of the selection.
+    sign: Vec<Arc<dyn Verifier>>,
+}
+
+impl RemoteKeys {
+    /// Reads the verifiers that check the commits of `remote`.
+    ///
+    /// If the section of `remote` holds the key `trust`, the trust group that
+    /// the key names gives the commit verifiers. The call checks the group as
+    /// [`PullTrust::from_remote`] does.
+    ///
+    /// `engines` selects the engines to build. With `None`, the call builds
+    /// each engine that the switches turn on. With `Some(names)`, it builds
+    /// the engines of `names` alone: `gpg` names the GPG engine, and each
+    /// other name names a sign-api engine, as in the value of `sign-verify`.
+    /// A selected sign-api engine must have a trusted key, also under
+    /// `sign-verify=true`.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidInput`] if [`valid_remote_name`] refuses `remote`.
+    /// - [`Error::RemoteNotFound`] if the config has no section for `remote`.
+    /// - [`Error::InvalidFormat`] if the trust group fails a check of
+    ///   [`PullTrust::from_remote`].
+    /// - [`Error::Signature`] if the switches turn on no check, if they do not
+    ///   turn on an engine of `engines`, if a GPG check finds no certificate
+    ///   in the keyrings of the remote, or if a sign-api check finds no
+    ///   trusted key, as [`PullTrust::from_remote`] states.
+    /// - The other errors of [`PullTrust::from_remote`], for a value that
+    ///   does not parse, a key source that cannot be read, or an engine that
+    ///   this build does not have.
+    ///
+    /// Each refusal of the name, of the section, of the trust group, and of the
+    /// switches comes before the call reads a key source.
+    pub async fn commits(
+        repo: &Repo,
+        remote: &str,
+        engines: Option<&[&str]>,
+    ) -> Result<RemoteKeys> {
+        RemoteKeys::read(repo, remote, true, engines).await
+    }
+
+    /// Reads the verifiers that check the summary of `remote`.
+    ///
+    /// If the section of `remote` holds the key `trust`, the call checks the
+    /// trust group as [`PullTrust::from_remote`] does, and reads no key of the
+    /// group. `engines` selects the engines as in
+    /// [`commits`](RemoteKeys::commits).
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`commits`](RemoteKeys::commits).
+    pub async fn summary(
+        repo: &Repo,
+        remote: &str,
+        engines: Option<&[&str]>,
+    ) -> Result<RemoteKeys> {
+        RemoteKeys::read(repo, remote, false, engines).await
+    }
+
+    /// Returns the GPG verifier, or `None` if the switches do not turn on the
+    /// GPG check or the selection does not name it.
+    pub fn gpg(&self) -> Option<&Arc<dyn Verifier>> {
+        self.gpg.as_ref()
+    }
+
+    /// Returns one verifier for each sign-api engine that the call builds.
+    /// With a selection, the engines are in the order of the selection. With
+    /// no selection, a switch that names engines gives them in the order of
+    /// its value, and `true` gives each engine of this build that has a
+    /// trusted key.
+    pub fn sign(&self) -> &[Arc<dyn Verifier>] {
+        &self.sign
+    }
+
+    /// Reads the verifiers of the commits of `remote` if `commits` is `true`,
+    /// or of its summary, for the engines of `engines`.
+    async fn read(
+        repo: &Repo,
+        remote: &str,
+        commits: bool,
+        engines: Option<&[&str]>,
+    ) -> Result<RemoteKeys> {
+        if !valid_remote_name(remote) {
+            return Err(Error::InvalidInput(format!(
+                "invalid remote name: {remote}"
+            )));
+        }
+        let Some(section) = repo.config().remote(remote) else {
+            return Err(Error::RemoteNotFound(remote.to_owned()));
+        };
+        let group = match section.trust()? {
+            Some(value) => {
+                let group = trust::check_remote_group(repo, remote, &section, &value)?;
+                Some((value, group))
+            }
+            None => None,
+        };
+        let target = if commits { "commits" } else { "summary" };
+        let keyfile = repo.config().keyfile();
+        let (gpg, sign) = match &group {
+            Some((_, group)) if commits => trust::trust_group_switches(keyfile, group)?,
+            _ if commits => (section.gpg_verify()?, section.sign_verify()?),
+            _ => (
+                section.gpg_verify_summary()?,
+                section.sign_verify_summary()?,
+            ),
+        };
+        let (gpg, sign) = match engines {
+            Some(names) => select_engines(remote, target, gpg, &sign, names)?,
+            None => (gpg, sign),
+        };
+        if !gpg && sign == SignVerify::Off {
+            return Err(no_check(remote, target));
+        }
+        let policy = match &group {
+            Some((value, group)) if commits => {
+                trust::trust_group_build(repo, keyfile, value, group, gpg, &sign).await?
+            }
+            _ => {
+                let source = KeySource::Remote {
+                    name: remote,
+                    section: Some(&section),
+                    repo_keyring: true,
+                    system_keys: false,
+                };
+                build_policy(repo, &source, &mut Verifiers::default(), gpg, &sign).await?
+            }
+        };
+        if !policy.applies() {
+            return Err(no_check(remote, target));
+        }
+        Ok(RemoteKeys {
+            gpg: policy.gpg,
+            sign: policy.sign.unwrap_or_default(),
+        })
+    }
+}
+
+/// Returns the switches of the engines `names` of a remote whose switches are
+/// `gpg` and `sign`. `gpg` names the GPG engine, and each other name names a
+/// sign-api engine. A name that the switches do not turn on is refused. The
+/// sign-api engines are in the order of `names`, each one once, and each one
+/// must have a trusted key.
+fn select_engines(
+    remote: &str,
+    target: &str,
+    gpg: bool,
+    sign: &SignVerify,
+    names: &[&str],
+) -> Result<(bool, SignVerify)> {
+    let mut gpg_selected = false;
+    let mut selected: Vec<String> = Vec::with_capacity(names.len());
+    for name in names {
+        let on = match (*name, sign) {
+            ("gpg", _) => gpg,
+            (_, SignVerify::Off) => false,
+            (_, SignVerify::All) => ALL_ENGINES.contains(name),
+            (_, SignVerify::Engines(held)) => held.iter().any(|held| held == name),
+        };
+        if !on {
+            return Err(Error::Signature(format!(
+                "remote '{remote}' turns on no {name} check of its {target}"
+            )));
+        }
+        if *name == "gpg" {
+            gpg_selected = true;
+        } else if !selected.iter().any(|held| held == name) {
+            selected.push((*name).to_owned());
+        }
+    }
+    let sign = if selected.is_empty() {
+        SignVerify::Off
+    } else {
+        SignVerify::Engines(selected)
+    };
+    Ok((gpg_selected, sign))
+}
+
+/// Returns the refusal of a remote whose switches turn on no check of
+/// `target`.
+fn no_check(remote: &str, target: &str) -> Error {
+    Error::Signature(format!(
+        "remote '{remote}' turns on no signature check of its {target}"
+    ))
+}
+
+impl std::fmt::Debug for RemoteKeys {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let sign: Vec<&str> = self.sign.iter().map(|v| v.metadata_key()).collect();
+        f.debug_struct("RemoteKeys")
+            .field("gpg", &self.gpg.is_some())
+            .field("sign", &sign)
+            .finish()
+    }
+}
+
 /// The trust types move freely across tasks and threads, so one trust can
 /// serve pulls on many tasks.
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<TrustedKeys>();
     assert_send_sync::<PullTrust>();
+    assert_send_sync::<RemoteKeys>();
 };
 
 /// Returns the refusal of a check that takes its keys from the section of a
@@ -764,6 +1001,11 @@ pub(crate) enum KeySource<'a> {
         /// adds to the GPG trusted set.
         #[cfg_attr(not(feature = "verify-gpg"), allow(dead_code))]
         repo_keyring: bool,
+        /// If `true`, the global GPG trusted directory and the system sign-api
+        /// key store add to the keys of the remote, as in a pull. If `false`,
+        /// the keys are the keys of the remote alone, and a GPG axis whose
+        /// keyrings hold no certificate is refused.
+        system_keys: bool,
     },
     /// A trust group, `[ex-ostrya trust "NAME"]`. The accessors of a remote
     /// section read it.
@@ -802,7 +1044,7 @@ impl KeySource<'_> {
     /// keys that this source names.
     fn system_store(&self) -> bool {
         match self {
-            KeySource::Remote { .. } => true,
+            KeySource::Remote { system_keys, .. } => *system_keys,
             KeySource::Trust { .. } => false,
         }
     }
@@ -928,12 +1170,16 @@ fn each_engine_once(names: &[String]) -> Vec<String> {
 
 /// Builds the GPG verifier for a key source.
 ///
-/// For a remote, the trusted set has three parts:
+/// For a remote, the trusted set has these parts:
 ///
 /// - the keyring of the repository for the remote, read through the repository
 ///   descriptor, if the source asks for it
-/// - the system trusted set
+/// - the system keyring of the remote
+/// - the global trusted set, if the source asks for the system keys
 /// - the keyrings that `gpgkeypath` names
+///
+/// A remote source without the system keys refuses a trusted set that holds
+/// no certificate.
 ///
 /// For a trust group, the trusted set is the keyrings that its `gpgkeypath`
 /// names, and nothing else.
@@ -944,6 +1190,7 @@ async fn gpg_verifier(repo: &Repo, source: &KeySource<'_>) -> Result<Arc<dyn Ver
             name,
             section,
             repo_keyring,
+            system_keys,
         } => {
             let keyring = if *repo_keyring {
                 read_repo_keyring(repo, name).await?
@@ -955,10 +1202,18 @@ async fn gpg_verifier(repo: &Repo, source: &KeySource<'_>) -> Result<Arc<dyn Ver
                 None => Vec::new(),
             };
             let remote = (*name).to_owned();
-            ostrya_rt::unblock(move || {
-                crate::gpg::GpgVerifier::for_remote_keyrings(keyring, &remote, &keypath)
+            let global = *system_keys;
+            let verifier = ostrya_rt::unblock(move || {
+                crate::gpg::remote_keyrings(keyring, &remote, &keypath, global)
             })
-            .await?
+            .await?;
+            if !global && verifier.is_empty() {
+                return Err(Error::Signature(format!(
+                    "remote '{name}' asks for GPG verification, and its keyrings hold no \
+                     certificate"
+                )));
+            }
+            verifier
         }
         KeySource::Trust { name, section } => {
             let keypath = section.gpgkeypath()?;
@@ -1193,6 +1448,7 @@ mod tests {
         name: "origin",
         section: None,
         repo_keyring: true,
+        system_keys: true,
     };
 
     /// The base64 of a 64-byte ed25519 secret key (seed, then public key).
@@ -1458,6 +1714,7 @@ mod tests {
                 name: "origin",
                 section: section.as_ref(),
                 repo_keyring: true,
+                system_keys: true,
             };
             build_policy(&repo, &source, &mut cache, false, &sign).await
         });
@@ -1485,6 +1742,7 @@ mod tests {
                 name: "origin",
                 section: section.as_ref(),
                 repo_keyring: true,
+                system_keys: true,
             };
             let mut cache = Verifiers::default();
             let first = cache.sign("ed25519", &source).await.unwrap();
@@ -1889,6 +2147,7 @@ mod tests {
                 name: "origin",
                 section: None,
                 repo_keyring: false,
+                system_keys: true,
             };
             (
                 gpg_verifier(&repo, &without).await.map(|_| ()),

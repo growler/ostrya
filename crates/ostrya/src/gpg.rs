@@ -139,16 +139,7 @@ impl FromOstreeKeyrings for GpgVerifier {
         remote: &str,
         keypath: &[String],
     ) -> Result<GpgVerifier> {
-        let mut paths: Vec<PathBuf> = Vec::new();
-        paths.push(Path::new(SYSTEM_REMOTES_D).join(format!("{remote}.trustedkeys.gpg")));
-        paths.extend(keyring_files_in(&global_trusted_dir())?);
-        paths.extend(keypath_files("gpgkeypath", keypath)?);
-        let mut verifier = GpgVerifier::default();
-        if let Some(bytes) = repo_keyring {
-            verifier.add_keyring(&bytes, &format!("the keyring '{remote}.trustedkeys.gpg'"))?;
-        }
-        verifier.add_keyring_files(paths)?;
-        Ok(verifier)
+        remote_keyrings(repo_keyring, remote, keypath, true)
     }
 
     fn from_system_trust() -> Result<GpgVerifier> {
@@ -156,6 +147,32 @@ impl FromOstreeKeyrings for GpgVerifier {
             &global_trusted_dir(),
         )?)?)
     }
+}
+
+/// Creates a verifier from the keyrings of a remote, as
+/// [`for_remote_keyrings`](FromOstreeKeyrings::for_remote_keyrings) does.
+///
+/// If `global` is `false`, the global trusted set takes no part, and the
+/// trusted set is `repo_keyring`, the system keyring of the remote, and the
+/// entries of `keypath` alone.
+pub(crate) fn remote_keyrings(
+    repo_keyring: Option<Vec<u8>>,
+    remote: &str,
+    keypath: &[String],
+    global: bool,
+) -> Result<GpgVerifier> {
+    let mut paths: Vec<PathBuf> = Vec::new();
+    paths.push(Path::new(SYSTEM_REMOTES_D).join(format!("{remote}.trustedkeys.gpg")));
+    if global {
+        paths.extend(keyring_files_in(&global_trusted_dir())?);
+    }
+    paths.extend(keypath_files("gpgkeypath", keypath)?);
+    let mut verifier = GpgVerifier::default();
+    if let Some(bytes) = repo_keyring {
+        verifier.add_keyring(&bytes, &format!("the keyring '{remote}.trustedkeys.gpg'"))?;
+    }
+    verifier.add_keyring_files(paths)?;
+    Ok(verifier)
 }
 
 /// Creates a verifier from the keyrings that `keypath` names, and from no

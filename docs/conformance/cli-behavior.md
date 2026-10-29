@@ -4821,19 +4821,31 @@ another line verifies. It decodes a line of the bytes `\xff\xfe` and a valid key
 as that key. `cli-surface.md`, "P2", `sign`, records the port side.
 
 Under `ed25519` and `spki`, the port reads each `--keys-file` given when it
-signs and under `-d`/`--delete` (`cli-surface.md`, "P2", `sign`).
+signs (`cli-surface.md`, "P2", `sign`).
+
+In the port, each key takes the engine of the nearest `-s`/`--sign-type`
+before it on the command line, and a key before the first `-s` takes
+`ed25519`. Each `-s` needs a key of its own, except in a `--verify` run with
+no key on the command line, where each `-s` selects its engine. A `--verify`
+run verifies with one verifier for each engine, and prints the report of each
+engine after a line with the engine name and a colon where the run has more
+than one engine. Each engine must have a valid signature. With no key and no
+`--remote`, the port reads the system key directories and each `--keys-dir`,
+and the GPG system trust. `cli-surface.md`, "P2", `sign`, records these
+differences.
 
 #### The gpg engine
 
 The port has a `gpg` engine on `sign`. Under this engine, each `--keys-file` of
-a verify or of a `-d`/`--delete` is a keyring, and the port reads each keyring
-given. The port refuses `--keys-file` in a gpg signing run with this line:
+a verify is a keyring, and the port reads each keyring given. The port refuses
+`--keys-file` in a gpg signing run with this line:
 
 ```
-error: signature: gpg signing takes KEY-ID arguments; --keys-file keyrings serve verify and delete
+error: signature: gpg signing takes KEY-ID arguments; --keys-file keyrings serve verify
 ```
 
-The port refuses `--keys-dir` under this engine.
+The gpg engine reads no key directory, and the port refuses a gpg KEY-ID in a
+verify.
 
 #### The verify report
 
@@ -4890,8 +4902,10 @@ key, and signs with it as a signing run does:
 
 The writing options are `-m`/`--add-metadata=KEY=VALUE`, `--sign=KEY-ID`, and
 `--gpg-sign=KEY-ID`. Only `-u` reads them. `-u` also reads `--sign-type`. In
-the port, `--sign-type` also names the engine of `--verify`, and of a
-positional key or a `--keys-file` key.
+the port, each key takes the engine of the nearest `--sign-type` before it: a
+`--sign` key, a positional key, and a `--keys-file` key. The port reads
+`--sign-type` in each mode, and a `--verify` run with no key takes each
+`--sign-type` as a selection of its engine.
 
 The four reading options are `-v`/`--view`, `--raw`, `--list-metadata-keys`,
 and `--print-metadata-key=KEY`. Each reading option reads `<repo>/summary` and

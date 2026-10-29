@@ -449,7 +449,7 @@ This is an ostrya extension. The option conflicts with \%\-\-raw, \%\-\-list\-me
 \fB\-\-gpg\-sign\fR \fIKEY\-ID\fR
 With \%\-u, sign the summary with the GPG key that this selector names.
 .IP
-The option uses the gpg engine for each \%\-\-sign\-type. Each occurrence adds one signature. The option needs \%\-u.
+The option uses the gpg engine, and it is not a key of a \%\-\-sign\-type. Each occurrence adds one signature. The option needs \%\-u.
 .TP
 \fB\-\-gpg\-homedir\fR \fIDIR\fR
 With \%\-u, the GnuPG home directory where gpg resolves signing keys.
@@ -459,17 +459,17 @@ Only the gpg engine reads it: for \%\-\-gpg\-sign, and for \%\-\-sign under the 
 \fB\-\-sign\fR \fIKEY\-ID\fR
 With \%\-u, sign the summary with this key.
 .IP
-The \%\-\-sign\-type option selects the engine. For \%ed25519 and spki, the key is the \%base64 of the secret key. An spki secret key is a \%PKCS#8 DER, a \%SEC1 DER that names the \%P\-256 or the \%P\-384 curve, or a \%PKCS#1 DER of an RSA key, and its \%base64 can hold line breaks. For gpg, the key is a selector, as for \%\-\-gpg\-sign. Each occurrence adds one signature. The option needs \%\-u.
+The \%\-\-sign\-type before the key selects its engine. For \%ed25519 and spki, the key is the \%base64 of the secret key. An spki secret key is a \%PKCS#8 DER, a \%SEC1 DER that names the \%P\-256 or the \%P\-384 curve, or a \%PKCS#1 DER of an RSA key, and its \%base64 can hold line breaks. For gpg, the key is a selector, as for \%\-\-gpg\-sign. Each occurrence adds one signature. The option needs \%\-u.
 .TP
 \fB\-s\fR, \fB\-\-sign\-type\fR \fINAME\fR
-With \%\-u, the signature engine for \%\-\-sign and \%\-\-keys\-file.
+With \%\-u, the signature engine of the \%\-\-sign and \%\-\-keys\-file keys after it.
 .IP
-The names are \fB\%ed25519\fR, \fB\%spki\fR, and \fB\%gpg\fR, and the command refuses any other name. The default is \fB\%ed25519\fR\&. If the option occurs more than once, the last value wins. The option needs \%\-u.
+The names are \fB\%ed25519\fR, \fB\%spki\fR, and \fB\%gpg\fR, and the command refuses any other name. Each key takes the engine of the nearest \%\-\-sign\-type before it on the command line. A key before the first \%\-\-sign\-type takes \fB\%ed25519\fR\&. The option can occur more than once, and each occurrence needs a key of its own: a key after it and before the next \%\-\-sign\-type. \%\-\-gpg\-sign is not a key of this option. The option needs \%\-u.
 .TP
 \fB\-\-keys\-file\fR \fIPATH\fR
 With \%\-u, sign the summary with the keys of this file, in the format of \fB\%ostrya sign\fR\&.
 .IP
-For \%ed25519, the file has \%base64 secret keys, one per line. For spki, the file holds PEM \fB\%PRIVATE KEY\fR blocks, each a \%PKCS#8 DER of a \%P\-256, a \%P\-384, an \%Ed25519, or an RSA key. The command reads every file, and each key adds one signature after each \%\-\-sign key. The gpg engine refuses this option. The option needs \%\-u.
+For \%ed25519, the file has \%base64 secret keys, one per line. For spki, the file holds PEM \fB\%PRIVATE KEY\fR blocks, each a \%PKCS#8 DER of a \%P\-256, a \%P\-384, an \%Ed25519, or an RSA key. The \%\-\-sign\-type before the file selects its engine. The command reads every file, and each key adds one signature after each \%\-\-sign key. The gpg engine refuses this option. The option needs \%\-u.
 .TP
 \fB\-\-break\-lock\fR
 With \%\-u, remove the writer lock of another writer of the bucket repository.

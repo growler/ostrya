@@ -126,8 +126,9 @@ These `ostree` commands have no counterpart in `ostrya`:
 - `find-remotes`: `ostrya pull --collection=ID` does the work of
   `find-remotes --pull`, with the configured remotes as the only candidates.
   `ostrya` has no command that finds remotes and pulls nothing;
-- `gpg-sign`: `ostrya sign --sign-type=gpg` does the same work, with
-  different option names;
+- `gpg-sign`: `ostrya sign --sign-type=gpg` does the same signing work, with
+  different option names. `gpg-sign --delete` has no counterpart: no `ostrya`
+  command removes a signature;
 - `remote add-cookie`, `remote delete-cookie`, and `remote list-cookies`.
 
 `ostrya init` does not create a `bare-split-xattrs` repository, because Ostrya

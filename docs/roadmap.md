@@ -26,6 +26,8 @@ The `ostrya` command does not carry these commands of the `ostree` command.
   carry. A delta carries its target alone, and an offline apply refuses a
   target whose dependencies are not complete.
 - `gpg-sign`, the alias of `sign --sign-type=gpg` with its own option names.
+  `ostree gpg-sign --delete` removes a GPG signature, and no command of the
+  port removes a signature, so the alias needs a delete mode of its own.
 
 The cookie commands of `remote` (`add-cookie`, `delete-cookie` and
 `list-cookies`) are out of scope. `conformance/cli-surface.md`, "P3", states
@@ -231,10 +233,9 @@ until each one is made.
   keys there. The alternative carries the keys into the
   `ostree-metadata` anchor commit in the order of the port, and records the
   anchor checksum as a difference.
-- Five differences in the bytes of the repository, which
+- Four differences in the bytes of the repository, which
   `conformance/cli-surface.md`, "P2", records as open:
   - `sign` with a repeated `--keys-file`;
-  - the key kind of `sign -d`;
   - `static-delta generate` with a repeated `--keys-file`;
   - the `usize` of the meta-entry of a delta part;
   - the part boundaries of `static-delta generate`.

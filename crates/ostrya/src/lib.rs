@@ -36,7 +36,7 @@
 //! - Remote resolution: [`endpoint`], which reads the keys and files of a remote for a pull or a push.
 //! - Bucket repositories: `bucket`, a repository in an S3 bucket, with the init, the writer lock, the listing of the objects, the fsck, the prune, and the summary update.
 //! - Signing: [`sign`], `gpg`, and `spki`.
-//! - Signature trust: [`verify`], the trusted keys and the trust of one pull.
+//! - Signature trust: [`verify`], the trusted keys, the trust of one pull, and the verifiers of one remote.
 //! - Maintenance: [`prune`], [`fsck`], [`diff`], [`update`], and [`config`].
 //! - Static deltas: [`DeltaSuperblock`], [`DeltaOptions`], [`AdvertisedDelta`], and [`Repo::generate_static_delta`].
 //!

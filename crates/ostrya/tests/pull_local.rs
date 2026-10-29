@@ -8324,3 +8324,152 @@ fn a_local_list_pull_imports_a_dependency_with_no_listed_delta_loose() {
         );
     });
 }
+
+/// The superblock type string, for a test that rewrites a superblock.
+const SUPERBLOCK_SIG: &str = "(a{sv}tayay(a{sv}aya(say)sstayay)aya(uayttay)a(yaytt))";
+
+/// The superblock of a dependency delta must give the commit that field 2
+/// names. The source holds two changed superblocks in turn in the directory of
+/// the delta of the dependency:
+///
+/// - the superblock of the dependency, with the commit of another tree in
+///   place of the dependency commit. The parse of the superblock finds that
+///   the commit does not hash to the `to` of the superblock, and the pull
+///   fails with [`Error::InvalidFormat`].
+/// - the superblock of the delta of another commit. The `to` of the
+///   superblock is not the dependency, and the pull fails with
+///   [`Error::Pull`].
+///
+/// A list names the delta with the digest of the changed bytes, so no digest
+/// check catches the superblock first. Each pull fails with or without a
+/// remote that checks the commits against a key that signed the tip, and
+/// leaves nothing.
+#[test]
+fn a_local_dependency_delta_that_gives_another_commit_fails_the_pull() {
+    let tmp = TmpDir::new("pull-local-dependency-delta-other-commit");
+    block_on(async {
+        let base = tmp.path();
+        let (src_dir, src, tip, dep) = build_dependency_source(base).await;
+        sign_commits(&src, &[tip]).await;
+        build_tree(&base.join("other"), b"other\n");
+        let donor = commit_tree(&src, base, "other", "other/x", None).await;
+        let dir = delta_with(&src, None, &dep, DeltaOptions::default()).await;
+        let donor_dir = delta_with(&src, None, &donor, DeltaOptions::default()).await;
+
+        let ty = Type::parse(SUPERBLOCK_SIG).unwrap();
+        let Value::Tuple(mut fields) =
+            ostrya::from_bytes(&ty, &std::fs::read(dir.join("superblock")).unwrap()).unwrap()
+        else {
+            panic!("a superblock is a tuple");
+        };
+        fields[4] = ostrya::from_bytes(
+            &Type::parse("(a{sv}aya(say)sstayay)").unwrap(),
+            &std::fs::read(object_path(
+                &src_dir,
+                &ObjectName::new(donor, ObjectType::Commit),
+                RepoMode::Archive,
+            ))
+            .unwrap(),
+        )
+        .unwrap();
+        let embedded = ostrya_core::to_bytes(&ty, &Value::Tuple(fields)).unwrap();
+        let other = std::fs::read(donor_dir.join("superblock")).unwrap();
+
+        for (case, bytes) in [("embedded", embedded), ("other", other)] {
+            std::fs::write(dir.join("superblock"), &bytes).unwrap();
+            let list = vec![AdvertisedDelta {
+                from: None,
+                to: dep,
+                superblock: Checksum::sha256(&bytes),
+            }];
+            for (tag, extra) in [("unverified", None), ("verified", Some(signed_remote()))] {
+                let case_base = base.join(format!("{case}-{tag}"));
+                std::fs::create_dir(&case_base).unwrap();
+                let (dst, opts) = match &extra {
+                    None => (
+                        make_repo(&case_base, "dst", RepoMode::Archive).await.1,
+                        chain_pull(list.clone()),
+                    ),
+                    Some(extra) => (
+                        dest_with_remote(&case_base, extra).await,
+                        PullOptions {
+                            static_deltas: Some(list.clone()),
+                            ..origin_pull(PullVerify::default())
+                        },
+                    ),
+                };
+                let err = dst.pull_local(&src, opts).await.unwrap_err();
+                match (case, &err) {
+                    ("embedded", Error::InvalidFormat(m)) => {
+                        assert!(m.contains("embedded commit"), "{case} {tag}: {err}");
+                    }
+                    ("other", Error::Pull(m)) => {
+                        assert!(m.contains(&donor.to_hex()), "{case} {tag}: {err}");
+                    }
+                    _ => panic!("{case} {tag}: {err:?}"),
+                }
+                assert_left_nothing(&dst).await;
+            }
+        }
+    });
+}
+
+/// The pull checks no signature of the superblock of a dependency delta. A
+/// key that the destination does not trust signs the delta of the
+/// dependency, and the pull under a remote that checks the commits against
+/// the key that signed the tip takes the delta. A pull that takes the
+/// dependency as a target too checks the superblock, and fails with
+/// [`Error::Signature`].
+#[test]
+fn a_local_dependency_delta_signed_by_an_untrusted_key_passes_the_pull() {
+    let tmp = TmpDir::new("pull-local-dependency-delta-untrusted");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, tip, dep) = build_dependency_source(base).await;
+        sign_commits(&src, &[tip]).await;
+        let dir = delta_with(&src, None, &dep, DeltaOptions::default()).await;
+        src.sign_static_delta(&dir, &Ed25519Signer::from_base64(OTHER_SECRET_B64).unwrap())
+            .await
+            .unwrap();
+        delta_with(&src, None, &tip, DeltaOptions::default()).await;
+        src.reindex_static_deltas().await.unwrap();
+        summarize(&src).await;
+
+        let dependency = base.join("dependency");
+        std::fs::create_dir(&dependency).unwrap();
+        let dst = dest_with_remote(&dependency, &signed_remote()).await;
+        let stats = dst
+            .pull_local(
+                &src,
+                PullOptions {
+                    require_static_deltas: true,
+                    ..origin_pull(PullVerify::default())
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(stats.delta_parts, 2);
+        assert_complete(&src, &dst, &dependency.join("dst"), &dep).await;
+        assert_no_markers(&dependency.join("dst"));
+
+        let target = base.join("target");
+        std::fs::create_dir(&target).unwrap();
+        let dst = dest_with_remote(&target, &signed_remote()).await;
+        let err = dst
+            .pull_local(
+                &src,
+                PullOptions {
+                    refs: vec!["main".to_owned(), "dep/uki".to_owned()],
+                    require_static_deltas: true,
+                    ..origin_pull(PullVerify::default())
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m) if m.contains("static delta")),
+            "{err}"
+        );
+        assert_left_nothing(&dst).await;
+    });
+}

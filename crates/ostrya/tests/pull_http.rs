@@ -10307,7 +10307,7 @@ fn a_pull_with_no_summary_requests_the_dependency_delta_by_name() {
 /// A remote with no summary states no digest of a superblock. The target
 /// names three dependencies, and the remote holds the from-scratch delta of
 /// each. The pull requests each superblock one time: it parses the job of a
-/// dependency from the bytes that discovery verified and kept, and sends no
+/// dependency from the bytes that discovery checked and kept, and sends no
 /// second request.
 #[test]
 fn each_dependency_superblock_is_fetched_once_with_no_summary() {
@@ -10469,6 +10469,140 @@ fn an_unsigned_dependency_from_its_delta_passes_the_pull() {
             "{seen:?}"
         );
         assert_complete(&remote, &dest, dest.path(), &dep).await;
+    });
+}
+
+/// The superblock of a dependency delta must give the commit that field 2
+/// names. The remote serves two changed superblocks under the path of the
+/// delta of the dependency:
+///
+/// - the superblock of the dependency, with the commit of another tree in
+///   place of the dependency commit. The parse of the superblock finds that
+///   the commit does not hash to the `to` of the superblock, and the pull
+///   fails with [`Error::InvalidFormat`].
+/// - the superblock of the delta of another commit. The `to` of the
+///   superblock is not the dependency, and the pull fails with
+///   [`Error::Pull`].
+///
+/// The remote serves no summary, so no advertised digest catches a changed
+/// superblock first. Each pull fails with or without `sign-verify` and a
+/// signed tip, requests no part, and leaves nothing.
+#[test]
+fn a_dependency_delta_that_gives_another_commit_fails_the_pull() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-dependency-delta-other-commit");
+        let (remote, tip, dep) = build_dependency_remote(dir.path()).await;
+        sign_commits(&remote, &[tip]).await;
+        build_tree(&dir.path().join("other"), b"other\n");
+        let donor = commit_tree(&remote, dir.path(), "other", "other/x", None, FIXED_TS).await;
+        publish_delta(&remote, None, &dep).await;
+        publish_delta(&remote, None, &donor).await;
+        std::fs::remove_file(remote.path().join("summary")).unwrap();
+
+        let ty = Type::parse(SUPERBLOCK_SIG).unwrap();
+        let Value::Tuple(mut fields) = ostrya::from_bytes(
+            &ty,
+            &std::fs::read(remote.path().join(scratch_superblock(&dep))).unwrap(),
+        )
+        .unwrap() else {
+            panic!("a superblock is a tuple");
+        };
+        fields[4] = ostrya::from_bytes(
+            &Type::parse("(a{sv}aya(say)sstayay)").unwrap(),
+            &std::fs::read(remote.path().join(meta_path(&donor, "commit"))).unwrap(),
+        )
+        .unwrap();
+        let embedded = ostrya_core::to_bytes(&ty, &Value::Tuple(fields)).unwrap();
+        let other = std::fs::read(remote.path().join(scratch_superblock(&donor))).unwrap();
+
+        let server = RepoServer::start(remote.path(), false).await;
+        for (case, bytes) in [("embedded", embedded), ("other", other)] {
+            server.tamper(&scratch_superblock(&dep), bytes);
+            for (tag, extra) in [("unverified", String::new()), ("verified", signed_policy())] {
+                let base = dir.path().join(format!("{case}-{tag}"));
+                std::fs::create_dir(&base).unwrap();
+                let dest = build_dest(&base, RepoMode::Archive, &server.url(), &extra).await;
+                server.forget();
+                let err = pull_main(&dest, PullOptions::default()).await.unwrap_err();
+                match (case, &err) {
+                    ("embedded", Error::InvalidFormat(m)) => {
+                        assert!(m.contains("embedded commit"), "{case} {tag}: {err}");
+                    }
+                    ("other", Error::Pull(m)) => {
+                        assert!(m.contains(&donor.to_hex()), "{case} {tag}: {err}");
+                    }
+                    _ => panic!("{case} {tag}: {err:?}"),
+                }
+                let seen = server.seen();
+                assert_eq!(
+                    server.statuses_for(&scratch_superblock(&dep)),
+                    [200],
+                    "{case} {tag}: {seen:?}"
+                );
+                assert_eq!(part_requests(&seen), Vec::<String>::new());
+                assert_left_nothing(&dest).await;
+            }
+        }
+    });
+}
+
+/// The pull checks no signature of the superblock of a dependency delta. A
+/// key that the destination does not trust signs the delta of the
+/// dependency, and the pull under `sign-verify` with a signed tip takes the
+/// delta. A pull that takes the dependency as a target too checks the
+/// superblock, and fails with [`Error::Signature`].
+#[test]
+fn a_dependency_delta_signed_by_an_untrusted_key_passes_the_pull() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-dependency-delta-untrusted");
+        let (remote, tip, dep) = build_dependency_remote(dir.path()).await;
+        sign_commits(&remote, &[tip]).await;
+        publish_delta(&remote, None, &dep).await;
+        remote
+            .sign_static_delta(
+                &remote.path().join(static_delta_relative_dir(None, &dep)),
+                &Ed25519Signer::from_base64(OTHER_SECRET_B64).unwrap(),
+            )
+            .await
+            .unwrap();
+        summarize(&remote).await;
+        let server = RepoServer::start(remote.path(), false).await;
+
+        let base = dir.path().join("dependency");
+        std::fs::create_dir(&base).unwrap();
+        let dest = build_dest(&base, RepoMode::Archive, &server.url(), &signed_policy()).await;
+        pull_main(&dest, PullOptions::default()).await.unwrap();
+        let seen = server.seen();
+        assert_eq!(
+            server.statuses_for(&scratch_superblock(&dep)),
+            [200],
+            "{seen:?}"
+        );
+        assert_eq!(
+            server.requests_for(&meta_path(&dep, "commit")),
+            0,
+            "{seen:?}"
+        );
+        assert_complete(&remote, &dest, dest.path(), &dep).await;
+
+        let base = dir.path().join("target");
+        std::fs::create_dir(&base).unwrap();
+        let dest = build_dest(&base, RepoMode::Archive, &server.url(), &signed_policy()).await;
+        let err = dest
+            .pull(
+                "origin",
+                PullOptions {
+                    refs: vec!["test/main".to_owned(), "dep/uki".to_owned()],
+                    ..PullOptions::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m) if m.contains("static delta")),
+            "{err}"
+        );
+        assert_left_nothing(&dest).await;
     });
 }
 

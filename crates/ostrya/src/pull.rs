@@ -467,18 +467,24 @@ pub enum TimestampCheck {
 /// plan of discovery drops a commit, the commit gets its checks when the pull
 /// fetches it.
 ///
-/// The pull verifies the superblock of a static delta before it fetches a
-/// part of the delta. For a chain, discovery verifies the superblock of each
-/// step before it verifies the commit of the step. Only the sign-api axis
+/// The pull verifies the superblock of the static delta of a target before it
+/// fetches a part of the delta. For a chain, discovery verifies the superblock
+/// of each step before it verifies the commit of the step. Only the sign-api axis
 /// applies to a superblock, because a static delta carries sign-api
 /// signatures alone. A superblock with no signature of an engine of the
 /// policy passes, and the commit that the delta gives still gets its checks.
 /// The removal of a signature from a delta thus gives no gain: the delta map
 /// of the summary or of the delta index names the superblock by its digest,
 /// the superblock names each object that the delta gives, and the commit gets
-/// the checks of any other commit.
+/// the checks of its role.
 /// If each such signature of a superblock is from a key that is not trusted,
 /// the pull fails with [`Error::Signature`].
+///
+/// The pull verifies no superblock of the static delta of a dependency. The
+/// superblock gives the dependency commit, and field 2 names that commit by
+/// its checksum. The pull compares the checksum of the commit that the
+/// superblock gives with that checksum. A dependency that is also a target,
+/// or that a chain of static deltas makes, keeps the checks of that role.
 ///
 /// A local pull verifies the commits and the summary before the transaction
 /// opens, so a source that the policy refuses imports nothing.
@@ -1604,7 +1610,8 @@ impl Repo {
     /// superblock of a dependency. Before the pull applies the delta of a
     /// dependency, it reads the superblock again from the source and compares
     /// it with the digest that the summary, the delta index, or the list
-    /// states.
+    /// states. The pull checks no signature of the superblock of a
+    /// dependency, as [`Repo::pull`] states.
     ///
     /// # Errors
     ///
@@ -1675,9 +1682,9 @@ impl Repo {
     ///   signature check of the walk, and before a `.commitmeta` of the walk
     ///   that does not parse.
     /// - [`Error::Signature`] if a commit or the summary fails the signature
-    ///   policy, each commit of a chain included. Also if the signatures of a
-    ///   superblock fail the policy, or if the policy covers the summary and
-    ///   `src` has no `summary` or no `summary.sig`.
+    ///   policy, each commit of a chain included. Also if the signatures of the
+    ///   superblock of a target or of a step fail the policy, or if the policy
+    ///   covers the summary and `src` has no `summary` or no `summary.sig`.
     /// - [`Error::RefNotFound`] if `src` does not hold a requested ref or
     ///   collection ref.
     /// - [`Error::ObjectNotFound`] if neither this repository nor a source
@@ -1880,7 +1887,8 @@ impl Repo {
         // names it holds its checksum, and the signatures of that commit
         // cover field 2. A pull that reads static deltas then looks for the
         // delta of each dependency that it appended, before the transaction
-        // opens.
+        // opens. The search checks no signature of the superblock of such a
+        // delta.
         let mut check = verification.checks_commits().then(|| ChainCheck {
             repo: self,
             sources: &sources,
@@ -1962,7 +1970,6 @@ impl Repo {
                     lookups,
                     &known,
                     &opts,
-                    &verification,
                     &counters,
                 )
                 .await?

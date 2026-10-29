@@ -408,11 +408,12 @@ impl Repo {
     /// delta name states.
     ///
     /// Before any part request, the pull verifies the signatures of the delta
-    /// over the raw superblock bytes, under the policy of
-    /// [`PullVerify`]. Also before any part request, it
-    /// verifies each inline part against the size and the checksum of its
-    /// meta-entry. A superblock that the remote does not hold (a stale
-    /// advertisement) is a 404, and the pull fetches the objects loose.
+    /// over the raw superblock bytes, under the policy of [`PullVerify`]. The
+    /// delta of a dependency is the exception, as the list below for the delta
+    /// of a dependency states. Also before any part request, it verifies each
+    /// inline part against the size and the checksum of its meta-entry. A
+    /// superblock that the remote does not hold (a stale advertisement) is a
+    /// 404, and the pull fetches the objects loose.
     ///
     /// The superblock holds the target commit, so the pull requests no
     /// `.commit`. A part that the superblock carries inline needs no request.
@@ -539,25 +540,30 @@ impl Repo {
     ///   and no summary map.
     /// - With no summary, the pull requests the delta from the `from` by
     ///   name, or the from-scratch delta if it has no `from`.
+    /// - The pull checks no signature of the superblock. Field 2 names the
+    ///   dependency by its checksum, and the parse of the superblock compares
+    ///   the checksum of the commit that the superblock carries with that
+    ///   checksum. The checks of the digest, of the `from` and the `to`, and
+    ///   of the inline parts stay.
     ///
     /// A dependency with no delta comes as loose objects, or fails the pull
     /// under `require_static_deltas`. A dependency that a run of the targets
     /// or of a level reaches, for example as a parent, gets no delta of its
     /// own.
     ///
-    /// The pull keeps the verified superblock of the delta of each dependency,
-    /// and the commit that it carries, in one temp file in `tmp/` of this
-    /// repository until it ends. A search holds the superblock that it fetched
-    /// and the parse of it until its checks end, so during the search the heap
-    /// holds at most one superblock and its parse for each search in flight.
-    /// The pull reads the commit from the file in the step of the commit. It
-    /// parses the superblock again from the file just before the parts of the
-    /// delta, and drops the parse after the last part. So the pull requests
-    /// each superblock one time, also from a remote with no summary, and the
-    /// application of the parts holds the parsed deltas of at most two
-    /// dependencies at a time. The file holds at most 1 GiB. If the
-    /// superblocks and the commits of the dependencies pass this limit, the
-    /// pull fails with [`Error::Pull`], and does not fetch loose.
+    /// After its checks, the pull keeps the superblock of the delta of each
+    /// dependency, and the commit that it carries, in one temp file in `tmp/`
+    /// of this repository until it ends. A search holds the superblock that it
+    /// fetched and the parse of it until its checks end, so during the search
+    /// the heap holds at most one superblock and its parse for each search in
+    /// flight. The pull reads the commit from the file in the step of the
+    /// commit. It parses the superblock again from the file just before the
+    /// parts of the delta, and drops the parse after the last part. So the pull
+    /// requests each superblock one time, also from a remote with no summary,
+    /// and the application of the parts holds the parsed deltas of at most two
+    /// dependencies at a time. The file holds at most 1 GiB. If the superblocks
+    /// and the commits of the dependencies pass this limit, the pull fails with
+    /// [`Error::Pull`], and does not fetch loose.
     ///
     /// [`disable_static_deltas`](PullOptions::disable_static_deltas) and
     /// [`require_static_deltas`](PullOptions::require_static_deltas) control
@@ -661,8 +667,8 @@ impl Repo {
     ///
     /// These errors stop the pull while it fetches:
     ///
-    /// - [`Error::Signature`] if the policy refuses a commit or a static
-    ///   delta.
+    /// - [`Error::Signature`] if the policy refuses a commit, or the static
+    ///   delta of a target.
     /// - [`Error::Pull`] if
     ///   [`require_static_deltas`](PullOptions::require_static_deltas) is set
     ///   and the pull finds no delta for a dependency. The pull looks for it
@@ -674,7 +680,7 @@ impl Repo {
     /// - [`Error::InvalidRelated`] if an entry of field 2 of a commit has an
     ///   empty name or a checksum that is not 32 bytes, or if a dependency
     ///   names dependencies of its own. If such a dependency has a delta, the
-    ///   pull fetches and verifies the superblock first, and the error comes
+    ///   pull fetches and checks the superblock first, and the error comes
     ///   when the pull reads the commit from the superblock.
     /// - [`Error::Pull`] if the `ostree.ref-binding` of a commit does not list
     ///   the ref.
@@ -1294,7 +1300,8 @@ impl Repo {
             // the last run fetches them at depth 0. A dependency with no delta
             // is fetched object by object. The run also fetches the composefs
             // images of the pull, after each other object. Each commit of the
-            // run is a dependency alone, so the run checks no signature.
+            // run is a dependency alone, so the run checks no signature. The
+            // search for their deltas checks no signature of a superblock.
             let mut pending: Vec<Checksum> = carry
                 .dependencies
                 .named
@@ -1321,7 +1328,6 @@ impl Repo {
                     lookups,
                     &known,
                     opts,
-                    verification,
                     counters,
                 )
                 .await?;

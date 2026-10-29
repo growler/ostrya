@@ -20,11 +20,12 @@
 //! [`discover_dependencies`] finds one delta for each dependency of a pull,
 //! after the pull read the commits that name the dependencies. The sibling
 //! module `dependency` gives the source commit of each search. With a list,
-//! the search takes one entry of the list, and plans no chain. From a remote,
-//! the searches keep each verified superblock and the commit that it carries
-//! in a record file, as the discovery of a chain below does. The pull parses
-//! the superblock of a dependency again just before its parts, as
-//! [`DependencyDeltas`] states.
+//! the search takes one entry of the list, and plans no chain. The searches
+//! check no signature of a superblock, as [`discover_dependencies`] states.
+//! From a remote, the searches keep each superblock after its checks and the
+//! commit that it carries in a record file, as the discovery of a chain below
+//! does. The pull parses the superblock of a dependency again just before its
+//! parts, as [`DependencyDeltas`] states.
 //!
 //! The discovery of a chain keeps one record for each step of the plan, and
 //! drops each parsed superblock after its checks. So the heap holds one
@@ -692,8 +693,8 @@ impl RecordStore {
 }
 
 /// A superblock that discovery fetched and parsed, with its source and
-/// target checked against the request, its signatures checked, and its
-/// inline parts verified.
+/// target checked against the request, its signatures checked if the search
+/// checks them, and its inline parts verified.
 struct FetchedDelta {
     /// The request path prefix of the delta, `deltas/<fanout>/<rest>`.
     dir: String,
@@ -952,7 +953,7 @@ pub(crate) async fn discover(
             *to,
             &HashMap::new(),
             opts,
-            verification,
+            Some(verification),
             progress,
             None,
         )
@@ -990,7 +991,7 @@ pub(crate) struct DependencyLookup {
 /// The deltas that [`discover_dependencies`] found, keyed by dependency.
 ///
 /// A delta from a remote keeps a [`DependencyHead`] on the heap, and its
-/// verified superblock and the commit that it carries in the record file of
+/// checked superblock and the commit that it carries in the record file of
 /// the search. The step of the commit reads the commit from the record file,
 /// and takes the fallbacks of the head. The head then keeps the number of
 /// parts and the range of the superblock alone. Just before the parts of the
@@ -1012,7 +1013,7 @@ pub(crate) struct DependencyDeltas {
     /// The head of the delta of each dependency, from a remote. The steps of
     /// the run share the map.
     heads: Mutex<HashMap<Checksum, DependencyHead>>,
-    /// The file of the verified superblocks and commits from a remote.
+    /// The file of the checked superblocks and commits from a remote.
     store: Option<RecordStore>,
     /// The jobs that the run loaded and did not release yet.
     live: Mutex<HashMap<Checksum, Arc<DeltaJob>>>,
@@ -1026,7 +1027,7 @@ pub(crate) struct DependencyDeltas {
 struct DependencyHead {
     /// The source commit of the delta, or `None` for a from-scratch delta.
     from: Option<Checksum>,
-    /// The range of the verified superblock in the record file.
+    /// The range of the checked superblock in the record file.
     superblock: Range<u64>,
     /// The number of parts of the delta, inline parts and part files.
     parts: usize,
@@ -1096,8 +1097,9 @@ impl DependencyDeltas {
     /// Parses the job of the delta of `dependency` from the record file, and
     /// keeps it until [`release_job`](DependencyDeltas::release_job).
     ///
-    /// These are the bytes that discovery verified, so the parse checks no
-    /// digest, no signature, and no inline part again. A delta that no
+    /// These are the bytes that discovery checked, so the parse checks no
+    /// digest and no inline part again. Discovery checked no signature of the
+    /// superblock, and the parse checks none. A delta that no
     /// summary advertised has no digest, and the bytes are still the bytes
     /// that discovery checked. The call sends no request.
     ///
@@ -1194,7 +1196,6 @@ impl DependencyDeltas {
         deltas: &[(Option<Checksum>, Checksum)],
     ) -> DependencyDeltas {
         let shared = Arc::new(Mutex::new(RecordStore::for_dependencies(repo)));
-        let verification = Verification::from_trust(crate::verify::PullTrust::unverified());
         let progress = PullCounters::new(None);
         let mut found = DependencyDeltas::default();
         for (from, to) in deltas {
@@ -1203,7 +1204,7 @@ impl DependencyDeltas {
                 *from,
                 *to,
                 None,
-                &verification,
+                None,
                 &progress,
                 Some(Keep::Shared(&shared)),
             )
@@ -1260,6 +1261,13 @@ impl DependencyDeltas {
 /// `None`. The call adds the part files of each delta and their declared
 /// sizes to the planned counts in `progress`.
 ///
+/// The searches check no signature of a superblock. Field 2 of the commit
+/// that names a dependency holds its checksum, the `to` of the search. The
+/// parse of a superblock checks that the commit that it carries hashes to
+/// its `to`, and [`fetch_job`] checks that `to` against the search. The
+/// digest, the `from`, and the inline parts get their checks, as for a
+/// target.
+///
 /// For a remote, the searches run together, up to the number of requests
 /// that the session admits. For a local source, they run one at a time. The
 /// call takes the results in the order of `lookups`, so the first error in
@@ -1270,7 +1278,7 @@ impl DependencyDeltas {
 /// after the digest check, and the commit that the superblock carries after
 /// the parse, as [`fetch_job`] states. The file has the limit
 /// [`MAX_RECORD_FILE`]. A failed check fails the pull, so the file holds
-/// verified bytes. The result keeps a [`DependencyHead`] of each delta, and
+/// checked bytes. The result keeps a [`DependencyHead`] of each delta, and
 /// the parsed superblock drops. A search holds the superblock that it fetched
 /// and the parse of it until its checks end, so the heap holds at most one
 /// superblock and its parse for each search in flight. A delta from a local
@@ -1288,7 +1296,7 @@ impl DependencyDeltas {
 ///
 /// # Errors
 ///
-/// - The errors of [`discover_one`]. Under
+/// - The errors of [`discover_one`], except [`Error::Signature`]. Under
 ///   [`require_static_deltas`](PullOptions::require_static_deltas), a
 ///   dependency with no delta gives [`Error::Pull`] with the subject of its
 ///   lookup.
@@ -1304,7 +1312,6 @@ pub(crate) async fn discover_dependencies(
     lookups: Vec<DependencyLookup>,
     known: &HashMap<Checksum, bool>,
     opts: &PullOptions,
-    verification: &Verification,
     progress: &PullCounters,
 ) -> Result<DependencyDeltas> {
     let limit = match source {
@@ -1345,7 +1352,7 @@ pub(crate) async fn discover_dependencies(
                         lookup.checksum,
                         known,
                         opts,
-                        verification,
+                        None,
                         progress,
                         store,
                     )
@@ -1793,7 +1800,7 @@ async fn fetch_step(
         delta.from,
         delta.to,
         Some(delta.superblock),
-        ctx.verification,
+        Some(ctx.verification),
         ctx.progress,
         store.map(Keep::Own),
     );
@@ -2034,7 +2041,7 @@ async fn read_record(
 /// Reads the superblock of the delta from `from` to `to` at `range` of
 /// `store`, and parses it on the blocking pool.
 ///
-/// These are the bytes that discovery verified, so the parse checks no
+/// These are the bytes that discovery checked, so the parse checks no
 /// digest, no signature, and no inline part again.
 async fn parse_kept(
     store: &RecordStore,
@@ -2052,7 +2059,7 @@ async fn parse_kept(
 /// `src` again, checks it against `digest` if it is set, and parses it on the
 /// blocking pool.
 ///
-/// Discovery verified the superblock with the same digest, so the parse checks
+/// Discovery checked the superblock with the same digest, so the parse checks
 /// no signature and no inline part again.
 async fn read_local_superblock(
     src: &Repo,
@@ -2485,6 +2492,10 @@ enum Advertisement<'a> {
 /// `known` holds the completeness of commits that the caller checked. Step 2
 /// checks no such commit again.
 ///
+/// `verification` is the policy for the signatures of the superblock, as
+/// [`fetch_job`] states. The search for the delta of a dependency passes
+/// `None`.
+///
 /// If `keep` is set, the search writes the superblock to that record file, as
 /// [`fetch_job`] states, and the result holds its range.
 #[allow(clippy::too_many_arguments)]
@@ -2499,7 +2510,7 @@ async fn discover_one(
     to: Checksum,
     known: &HashMap<Checksum, bool>,
     opts: &PullOptions,
-    verification: &Verification,
+    verification: Option<&Verification>,
     progress: &PullCounters,
     keep: Option<&Arc<Mutex<RecordStore>>>,
 ) -> Result<Option<FoundDelta>> {
@@ -2555,7 +2566,8 @@ async fn discover_one(
     }))
 }
 
-/// A delta that [`discover_one`] found, fetched, and verified.
+/// A delta that [`discover_one`] found, fetched, and checked, as
+/// [`fetch_job`] states.
 struct FoundDelta {
     /// The source commit of the delta, or `None` for a from-scratch delta.
     from: Option<Checksum>,
@@ -2588,14 +2600,15 @@ struct KeptRanges {
     commit: Option<Range<u64>>,
 }
 
-/// Fetches the superblock of the delta from `from` to `to`, and verifies it.
+/// Fetches the superblock of the delta from `from` to `to`, and checks it.
 ///
 /// Returns `None` if the source does not hold the superblock. The request
 /// adds one to the metadata count in `progress`, whatever the source answers.
 /// If `digest` is set, the SHA-256 of the superblock must be `digest`. The
-/// superblock must produce `to` from `from`. Its signatures must pass the
-/// policy of the pull, as [`verify_fetched_delta`] states. Each inline part
-/// must pass its meta-entry.
+/// superblock must produce `to` from `from`. If `verification` is set, its
+/// signatures must pass that policy, as [`verify_fetched_delta`] states. The
+/// search for the delta of a dependency passes `None`, and the function then
+/// checks no signature. Each inline part must pass its meta-entry.
 ///
 /// If `keep` is set, the function appends the raw bytes to that record file
 /// after the digest check, and returns their range with the parsed delta.
@@ -2619,7 +2632,8 @@ struct KeptRanges {
 /// - [`Error::ChecksumMismatch`] if the superblock does not have `digest`.
 /// - [`Error::Pull`] if the superblock produces another commit, or from
 ///   another commit.
-/// - [`Error::Signature`] if the signatures fail the policy.
+/// - [`Error::Signature`] if `verification` is set and the signatures fail
+///   it.
 /// - [`Error::InvalidFormat`] or [`Error::Core`] if the superblock or an
 ///   inline part is malformed.
 async fn fetch_job(
@@ -2627,7 +2641,7 @@ async fn fetch_job(
     from: Option<Checksum>,
     to: Checksum,
     digest: Option<Checksum>,
-    verification: &Verification,
+    verification: Option<&Verification>,
     progress: &PullCounters,
     keep: Option<Keep<'_>>,
 ) -> Result<Option<(FetchedDelta, Option<KeptRanges>)>> {
@@ -2704,7 +2718,7 @@ async fn fetch_job(
         Ok::<_, Error>((parsed, kept))
     })
     .await?;
-    let fetched = parsed.verify(Some(verification)).await?;
+    let fetched = parsed.verify(verification).await?;
     Ok(Some((fetched, kept)))
 }
 
@@ -2834,7 +2848,9 @@ async fn take_inline_parts(
 /// The policy of the pull decides. The sign-api engines that verify a commit
 /// also verify the delta, because a delta carries sign-api signatures alone.
 /// A delta with none of those signatures passes, and the pull holds the
-/// commit that it delivers to the commit policy, as any other commit.
+/// commit that it delivers to the commit policy, as any other target or
+/// commit of a chain. The search for the delta of a dependency does not call
+/// the function.
 ///
 /// The call is in discovery, where the raw superblock bytes and the signature
 /// array are available. The pull drops them after the call and does not keep
@@ -4556,7 +4572,7 @@ mod tests {
                 delta.from,
                 delta.to,
                 Some(delta.superblock),
-                &unverified(),
+                Some(&unverified()),
                 &PullCounters::new(None),
                 Some(Keep::Own(&mut store)),
             )
@@ -4634,7 +4650,7 @@ mod tests {
                 delta.from,
                 delta.to,
                 Some(delta.superblock),
-                &unverified(),
+                Some(&unverified()),
                 &counters,
                 Some(Keep::Own(&mut store)),
             )
@@ -4674,7 +4690,7 @@ mod tests {
                     delta.from,
                     delta.to,
                     Some(delta.superblock),
-                    &unverified(),
+                    None,
                     &PullCounters::new(None),
                     Some(Keep::Shared(&store)),
                 )

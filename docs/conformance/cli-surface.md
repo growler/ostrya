@@ -3487,13 +3487,18 @@ that `static-delta generate --sign` signed both fail a pull of the tool with
 verification configured and with verification off (`cli-behavior.md`,
 "Signature verification during a pull", "Static deltas and signatures").
 
-The port verifies a fetched delta with the sign-api engines that the commit
-policy names, before it requests a part. It applies a delta that a trusted
-key signed, and refuses a delta that another key signed. It accepts a delta
-with no signature under those engines. The summary advertisement names the
-superblock, the superblock names what the delta writes, and the pull checks
-the commit that the delta delivers as it checks each other commit. So a delta
-with its signature removed gets nothing past the checks.
+The port verifies the fetched delta of a target or of a step of a chain
+with the sign-api engines that the commit policy names, before it requests a
+part. It applies such a delta that a trusted key signed, and refuses such a
+delta that another key signed. It accepts such a delta with no signature
+under those engines. The summary advertisement names the superblock, the
+superblock names what the delta writes, and the pull checks the commit that
+the delta delivers as it checks the target or the commit of the chain. So a
+delta with its signature removed gets nothing past the checks.
+
+The port verifies no superblock of the delta of a dependency. Field 2 of the
+signed commit names the dependency by its checksum, and the superblock gives
+that commit.
 
 The port checks a commit that a delta delivers against the `.commitmeta` that
 the pull fetches and stores, which is the metadata that a later verify of the

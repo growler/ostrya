@@ -2136,14 +2136,20 @@ the rules.
   that it holds complete, in the order of the targets, and takes the
   from-scratch delta only if it holds no paired entry complete. The
   requirement of static deltas applies to each dependency. With a list of
-  static deltas, the pull takes one entry of the list to the dependency. A
-  change to the delta format, so that the delta of a target also carries its
-  dependencies, was rejected: the tool writes and reads the format, and a
-  delta of each dependency keeps it.
+  static deltas, the pull takes one entry of the list to the dependency. The
+  search checks no signature of the superblock: the parse compares the
+  checksum of the commit that the superblock carries with the checksum in
+  field 2. Two alternatives were rejected. A change to the delta format, so
+  that the delta of a target also carries its dependencies, was rejected: the
+  tool writes and reads the format, and a delta of each dependency keeps it.
+  A search that verifies the superblock of the delta of a dependency under
+  the policy of the pull was rejected: the superblock gives the dependency
+  commit, and field 2 of the signed commit names that commit by its
+  checksum, so a signature on the superblock adds no trust.
 - A pull from a remote requests the superblock of the delta of each
   dependency one time. The search writes each superblock to one temp file
   after the digest check, and the commit that it carries after the parse. A
-  failed check fails the pull, so the file holds verified bytes. The pull
+  failed check fails the pull, so the file holds checked bytes. The pull
   keeps on the heap the fallbacks, the number of parts, and the ranges in the
   file of each delta. The step of the commit reads the commit from the file
   and takes the fallbacks. Just before the parts of a delta, a load step
@@ -2155,7 +2161,7 @@ the rules.
   starts no further search. Three alternatives were rejected. To request the
   superblock again at the start of its parts was rejected: it doubles the
   transfer of each superblock, and with no summary no digest checks that the
-  second copy is the verified copy. A failure then also comes late in the
+  second copy is the checked copy. A failure then also comes late in the
   transaction. To keep each parsed delta until the run ends was rejected:
   field 2 of the commits that the remote serves sets the number of
   dependencies, which has no cap, so the heap cost of the parsed deltas then

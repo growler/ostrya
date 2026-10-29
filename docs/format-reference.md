@@ -3223,17 +3223,24 @@ the dependency. Under the option that requires static deltas, a dependency
 with no delta fails the pull with the message above, also if the remote does
 not hold it or if it names dependencies of its own. A dependency that names
 dependencies of its own and has a delta fails the pull as a nested
-dependency, after the pull fetched and verified the superblock. A local pull
+dependency, after the pull fetched and checked the superblock. A local pull
 reads the commit of each dependency before the search. So a dependency that
 no source holds, and a nested dependency, fail the pull before the search for
 its delta.
+
+The pull checks no signature of the superblock of the delta of a dependency.
+It checks the digest that the advertisement or the list states, the `from`
+and the `to` of the superblock, and each inline part. The parse of the
+superblock compares the checksum of the commit that the superblock carries
+with the `to`, and the `to` is the checksum in field 2. A failed check fails
+the pull.
 
 A pull from a remote requests the superblock of the delta of each dependency
 one time. It writes each superblock to one temp file in `tmp/` of the
 repository after the digest check, and the commit that the superblock carries
 after the parse of the superblock. The file opens at the first write, and the
 pull keeps it until the pull ends. A failed check fails the pull, so the file
-holds verified bytes. The step of the commit reads the commit from the file.
+holds checked bytes. The step of the commit reads the commit from the file.
 Just before the parts of a delta, the pull parses its superblock again from
 the file, and it drops the parse after the last part. This is also true for a
 remote with no summary, which states no digest of a superblock. The file holds

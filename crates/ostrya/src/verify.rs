@@ -152,9 +152,10 @@ impl std::fmt::Debug for TrustedKeys {
 /// commit of a chain of static deltas against the commit set, and the summary
 /// against the summary set. A dependency in no other role gets no check. The
 /// pull does not check a target that has no set. If the commit set has a
-/// sign-api axis and a static delta carries signatures that this axis reads,
-/// one of them must be valid. The pull does not check the signatures of other
-/// static deltas.
+/// sign-api axis and the static delta of a target or of a step of a chain
+/// carries signatures that this axis reads, one of them must be valid. The
+/// pull checks no other signature of a static delta, and no signature of the
+/// static delta of a dependency.
 ///
 /// [`PullTrust::from_remote`] reads the trust that [`Repo::pull`] uses.
 /// [`PullTrust::commits`] and [`PullTrust::with_summary`] take keys that the

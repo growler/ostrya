@@ -125,8 +125,9 @@ impl Verification {
     ///
     /// - The superblock names what the delta produces.
     /// - The advertisement names the superblock.
-    /// - The commit policy applies to the delivered commit, as to each other
-    ///   commit.
+    /// - The commit policy applies to the delivered commit: a target or a
+    ///   commit of a chain. The pull does not call this function for the
+    ///   delta of a dependency.
     ///
     /// If a delta carries signatures and no signature is from a trusted key,
     /// this function fails with [`Error::Signature`].

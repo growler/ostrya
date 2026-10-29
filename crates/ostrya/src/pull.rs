@@ -2877,6 +2877,14 @@ impl ChainDependencies {
 /// `sources` that holds it, else from `repo`. It follows no parent of a
 /// dependency.
 ///
+/// The function reads the dependencies that neither `seen` nor `made` holds in
+/// one call on the blocking pool, in the order of `deps`. The call stops at
+/// the first failure. If no dependency needs a read, the function makes no
+/// call. The call reads no dependency after the first dependency that `seen`
+/// or `made` holds and that names dependencies of its own. If the caller drops
+/// the future, the blocking call continues to the end of its list or to the
+/// first failure.
+///
 /// The call checks no signature of a dependency. Field 2 of the commit that
 /// names the dependency holds its checksum, and the checksum and the
 /// signatures of that commit cover field 2. A dependency that the walk
@@ -2891,6 +2899,10 @@ impl ChainDependencies {
 ///   The error names the dependency.
 /// - [`Error::ObjectNotFound`] if neither a source nor `repo` holds a
 ///   dependency.
+/// - [`Error::Core`] if the commit object of a dependency does not parse.
+/// - [`Error::Io`] if a file system operation fails, or if the commit object
+///   of a dependency is larger than
+///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
 async fn collect_dependencies(
     repo: &Repo,
     sources: &[&Repo],
@@ -2899,38 +2911,58 @@ async fn collect_dependencies(
     out: &mut Vec<ChainCommit>,
     seen: &mut HashMap<Checksum, i32>,
 ) -> Result<Vec<Checksum>> {
-    let mut appended = Vec::new();
-    for (dependency, naming, name) in &deps.named {
-        let (dependency, naming) = (*dependency, *naming);
-        if seen.contains_key(&dependency) || made.contains(&dependency) {
-            if deps.naming.contains_key(&dependency) {
-                return Err(related::nested_dependency(naming, name, &dependency));
+    // The position in `deps.named` of each dependency to read, and its
+    // checksum. A held dependency that names dependencies of its own stops
+    // the list: the call reads no dependency after it.
+    let mut positions = Vec::new();
+    let mut wanted = Vec::new();
+    let mut stop = None;
+    for (at, (dependency, _, _)) in deps.named.iter().enumerate() {
+        if seen.contains_key(dependency) || made.contains(dependency) {
+            if deps.naming.contains_key(dependency) {
+                stop = Some(at);
+                break;
             }
             continue;
         }
-        let Some(LoadedCommit {
-            commit,
-            dependencies,
-            ..
-        }) = load_dependency(sources, repo, &dependency).await?
-        else {
-            return Err(Error::ObjectNotFound {
-                checksum: dependency,
-                ty: ObjectType::Commit,
-            });
+        positions.push(at);
+        wanted.push(*dependency);
+    }
+    let mut loaded = Vec::new();
+    if !wanted.is_empty() {
+        let holders: Vec<Repo> = sources
+            .iter()
+            .map(|src| (*src).clone())
+            .chain(std::iter::once(repo.clone()))
+            .collect();
+        // The closure gives the position in `wanted` of a nested dependency.
+        // The names stay here.
+        loaded = match ostrya_rt::unblock(move || load_dependencies_blocking(&holders, &wanted))
+            .await?
+        {
+            Ok(loaded) => loaded,
+            Err(nested) => {
+                let (dependency, naming, name) = &deps.named[positions[nested]];
+                return Err(related::nested_dependency(*naming, name, dependency));
+            }
         };
-        if !dependencies?.is_empty() {
-            return Err(related::nested_dependency(naming, name, &dependency));
-        }
-        seen.insert(dependency, 0);
-        appended.push(dependency);
+    }
+    if let Some(at) = stop {
+        let (dependency, naming, name) = &deps.named[at];
+        return Err(related::nested_dependency(*naming, name, dependency));
+    }
+    let mut appended = Vec::with_capacity(loaded.len());
+    for (at, dependency) in positions.into_iter().zip(loaded) {
+        let checksum = deps.named[at].0;
+        seen.insert(checksum, 0);
+        appended.push(checksum);
         out.push(ChainCommit {
-            checksum: dependency,
-            root_dirtree: commit.root_dirtree,
-            root_dirmeta: commit.root_dirmeta,
+            checksum,
+            root_dirtree: dependency.root_dirtree,
+            root_dirmeta: dependency.root_dirmeta,
             held: false,
             dependency: true,
-            image_key: recorded_digest(&commit).ok().flatten(),
+            image_key: dependency.image_key,
         });
     }
     Ok(appended)
@@ -3313,6 +3345,15 @@ struct LoadedCommit {
     dependencies: Result<Vec<(String, Checksum)>>,
 }
 
+/// What a local pull keeps of a dependency that it read: the root of its
+/// tree, and the value of `ostree.composefs.digest.v0` of the commit, or
+/// `None` if the commit does not carry the key or carries a malformed value.
+struct LoadedDependency {
+    root_dirtree: Checksum,
+    root_dirmeta: Checksum,
+    image_key: Option<[u8; 32]>,
+}
+
 /// Parses the bytes of the commit `checksum` and checks the format of its
 /// field 2. The entries of field 2 move out of the parse.
 ///
@@ -3353,34 +3394,65 @@ async fn try_load_commit(repo: &Repo, checksum: &Checksum) -> Result<Option<Load
     }
 }
 
-/// Loads the dependency `checksum` from the first repository of `sources`
-/// that holds it, else from `repo`, this repository. Returns `None` if none
-/// of them holds it.
+/// Loads the dependencies `wanted`, in order, each from the first repository
+/// of `holders` that holds it.
 ///
-/// The reads, the parse, and the format check of field 2 run in one call on
-/// the blocking pool, as [`load_commit`] states.
-async fn load_dependency(
-    sources: &[&Repo],
-    repo: &Repo,
-    checksum: &Checksum,
-) -> Result<Option<LoadedCommit>> {
-    let owned: Vec<Repo> = sources
-        .iter()
-        .map(|src| (*src).clone())
-        .chain(std::iter::once(repo.clone()))
-        .collect();
-    let checksum = *checksum;
-    ostrya_rt::unblock(move || {
-        for held in &owned {
-            match held.load_object_bytes_blocking(ObjectType::Commit, &checksum) {
-                Ok(bytes) => return parse_loaded(checksum, bytes).map(Some),
+/// For each dependency, the call parses the commit and checks the format of
+/// its field 2. It keeps the root of the tree and the composefs digest of the
+/// commit alone, and drops the bytes before it reads the next dependency. It
+/// stops at the first failure. The inner `Err` holds the position in `wanted`
+/// of a dependency that names dependencies of its own.
+///
+/// The function reads on the calling thread. A caller on the executor calls
+/// it in one call on the blocking pool for all dependencies.
+///
+/// # Errors
+///
+/// - [`Error::ObjectNotFound`] if no repository of `holders` holds a
+///   dependency.
+/// - [`Error::InvalidRelated`] if field 2 of a dependency has an entry with
+///   an empty name or with a checksum that is not 32 bytes. The error names
+///   the dependency.
+/// - The errors of [`parse_loaded`], and the errors of the read of a commit
+///   object other than an absent object.
+fn load_dependencies_blocking(
+    holders: &[Repo],
+    wanted: &[Checksum],
+) -> Result<std::result::Result<Vec<LoadedDependency>, usize>> {
+    let mut loaded = Vec::with_capacity(wanted.len());
+    for (at, checksum) in wanted.iter().enumerate() {
+        let mut bytes = None;
+        for held in holders {
+            match held.load_object_bytes_blocking(ObjectType::Commit, checksum) {
+                Ok(read) => {
+                    bytes = Some(read);
+                    break;
+                }
                 Err(Error::ObjectNotFound { .. }) => continue,
                 Err(e) => return Err(e),
             }
         }
-        Ok(None)
-    })
-    .await
+        let Some(bytes) = bytes else {
+            return Err(Error::ObjectNotFound {
+                checksum: *checksum,
+                ty: ObjectType::Commit,
+            });
+        };
+        let LoadedCommit {
+            commit,
+            dependencies,
+            ..
+        } = parse_loaded(*checksum, bytes)?;
+        if !dependencies?.is_empty() {
+            return Ok(Err(at));
+        }
+        loaded.push(LoadedDependency {
+            root_dirtree: commit.root_dirtree,
+            root_dirmeta: commit.root_dirmeta,
+            image_key: recorded_digest(&commit).ok().flatten(),
+        });
+    }
+    Ok(Ok(loaded))
 }
 
 /// Reads the `.commitmeta` bytes of a commit from the first source that holds

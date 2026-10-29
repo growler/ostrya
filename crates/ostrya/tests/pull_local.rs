@@ -6885,6 +6885,15 @@ fn remove_commit_object(repo_dir: &Path, commit: &Checksum) {
     std::fs::remove_file(object_path(repo_dir, &name, RepoMode::Archive)).unwrap();
 }
 
+/// Puts an empty directory in place of the loose commit object of `commit`
+/// in the archive repository at `repo_dir`. A read of the object then fails
+/// with an error that is not `Error::ObjectNotFound`.
+fn spoil_commit_object(repo_dir: &Path, commit: &Checksum) {
+    remove_commit_object(repo_dir, commit);
+    let name = ObjectName::new(*commit, ObjectType::Commit);
+    std::fs::create_dir(object_path(repo_dir, &name, RepoMode::Archive)).unwrap();
+}
+
 /// Asserts that a failed pull left nothing in `dst`: no object, no local
 /// ref, no remote ref, and no file under `state/`.
 async fn assert_left_nothing(dst: &Repo) {
@@ -7532,6 +7541,110 @@ fn a_nested_local_dependency_fails_the_pull() {
     });
 }
 
+/// One tip names an absent commit and a commit that names dependencies of its
+/// own. The pull reads the dependencies in the order of field 2 and fails at
+/// the first defect. A first entry that names the parent of the tip needs no
+/// read. The pull leaves nothing.
+#[test]
+fn the_first_failing_local_dependency_gives_the_error() {
+    let tmp = TmpDir::new("pull-local-dependency-first-failure");
+    block_on(async {
+        let base = tmp.path();
+        for sub in ["p", "t", "x", "n", "d"] {
+            build_tree(&base.join(sub), sub.as_bytes());
+        }
+        let (src_dir, src) = make_repo(base, "src", RepoMode::Archive).await;
+        let parent = commit_tree(&src, base, "p", "main", None).await;
+        let plain = commit_tree(&src, base, "t", "main", Some(parent)).await;
+        let absent = commit_tree(&src, base, "x", "dep/x", None).await;
+        remove_commit_object(&src_dir, &absent);
+        let inner = commit_tree(&src, base, "d", "dep/d", None).await;
+        let nested = commit_tree_related(&src, base, "n", "dep/n", None, &[("lib/d", inner)]).await;
+        let (_dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+        let opts = || PullOptions {
+            depth: 1,
+            ..PullOptions::default()
+        };
+
+        for (first, second) in [(absent, nested), (nested, absent)] {
+            let tip = store_with_field2(
+                &src,
+                &plain,
+                &[
+                    ("a/p", parent.as_bytes()),
+                    ("b/x", first.as_bytes()),
+                    ("c/y", second.as_bytes()),
+                ],
+            )
+            .await;
+            move_ref(&src, "main", &tip).await;
+
+            let err = pull_main_with(&dst, &src, opts()).await.unwrap_err();
+            if first == absent {
+                assert_commit_not_found(&err, &absent);
+            } else {
+                let reason = format!(
+                    "dependency b/x names commit {nested}, which has dependencies of its own"
+                );
+                assert_eq!(dependency_error(err), (Some(tip), reason));
+            }
+            assert_left_nothing(&dst).await;
+        }
+    });
+}
+
+/// The tip of `main` names the tip of `other`, which the walk takes and which
+/// names dependencies of its own, and an absent commit. The pull reads no
+/// dependency after the nested one, so the order of field 2 selects the
+/// error. The pull leaves nothing.
+#[test]
+fn a_held_nested_dependency_before_a_missing_one_gives_the_nested_error() {
+    let tmp = TmpDir::new("pull-local-dependency-held-nested");
+    block_on(async {
+        let base = tmp.path();
+        for sub in ["t", "o", "x", "d"] {
+            build_tree(&base.join(sub), sub.as_bytes());
+        }
+        let (src_dir, src) = make_repo(base, "src", RepoMode::Archive).await;
+        let plain = commit_tree(&src, base, "t", "main", None).await;
+        let inner = commit_tree(&src, base, "d", "dep/d", None).await;
+        let other = commit_tree_related(&src, base, "o", "other", None, &[("lib/d", inner)]).await;
+        let absent = commit_tree(&src, base, "x", "dep/x", None).await;
+        remove_commit_object(&src_dir, &absent);
+        let (_dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+
+        for (first, second) in [(other, absent), (absent, other)] {
+            let tip = store_with_field2(
+                &src,
+                &plain,
+                &[("a/x", first.as_bytes()), ("b/y", second.as_bytes())],
+            )
+            .await;
+            move_ref(&src, "main", &tip).await;
+
+            let err = dst
+                .pull_local(
+                    &src,
+                    PullOptions {
+                        refs: vec!["main".to_owned(), "other".to_owned()],
+                        ..PullOptions::default()
+                    },
+                )
+                .await
+                .unwrap_err();
+            if first == other {
+                let reason = format!(
+                    "dependency a/x names commit {other}, which has dependencies of its own"
+                );
+                assert_eq!(dependency_error(err), (Some(tip), reason));
+            } else {
+                assert_commit_not_found(&err, &absent);
+            }
+            assert_left_nothing(&dst).await;
+        }
+    });
+}
+
 /// A parent that the source does not hold ends its chain. If a pulled commit
 /// names the parent as a dependency, the pull fails with
 /// `Error::ObjectNotFound`.
@@ -7702,6 +7815,124 @@ fn a_dependency_comes_from_a_localcache_or_the_destination() {
         assert_complete(&src, &held, &held_dir, &tip).await;
         assert_eq!(held.commit_state(&dep).await.unwrap(), CommitState::Normal);
         assert!(held.fsck(&FsckOptions::default()).await.unwrap().is_ok());
+    });
+}
+
+/// One tip names three dependencies. The source alone holds the first, a
+/// localcache repository alone holds the second, and the destination alone
+/// holds the third, complete. The pull reads each one from the repository
+/// that holds it, and each one ends complete in the destination.
+#[test]
+fn a_local_pull_reads_each_dependency_from_the_repository_that_holds_it() {
+    let tmp = TmpDir::new("pull-local-dependency-holders");
+    block_on(async {
+        let base = tmp.path();
+        for sub in ["s", "c", "d", "main"] {
+            build_tree(&base.join(sub), sub.as_bytes());
+        }
+        let (src_dir, src) = make_repo(base, "src", RepoMode::Archive).await;
+        let in_src = commit_tree(&src, base, "s", "dep/s", None).await;
+        let in_cache = commit_tree(&src, base, "c", "dep/c", None).await;
+        let in_dst = commit_tree(&src, base, "d", "dep/d", None).await;
+        let tip = commit_tree_related(
+            &src,
+            base,
+            "main",
+            "main",
+            None,
+            &[("a/s", in_src), ("b/c", in_cache), ("c/d", in_dst)],
+        )
+        .await;
+        let (_cache_dir, cache) = make_repo(base, "cache", RepoMode::Archive).await;
+        hold_commit(&cache, &src, &in_cache).await;
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+        hold_commit(&dst, &src, &in_dst).await;
+        remove_commit_object(&src_dir, &in_cache);
+        remove_commit_object(&src_dir, &in_dst);
+
+        pull_main_with(
+            &dst,
+            &src,
+            PullOptions {
+                localcache_repos: vec![cache],
+                ..PullOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_complete(&src, &dst, &dst_dir, &tip).await;
+        assert_complete(&src, &dst, &dst_dir, &in_src).await;
+        for dep in [in_cache, in_dst] {
+            assert_eq!(dst.commit_state(&dep).await.unwrap(), CommitState::Normal);
+            assert!(!has_partial_marker(&dst_dir, &dep));
+        }
+        assert!(dst.fsck(&FsckOptions::default()).await.unwrap().is_ok());
+        assert_eq!(
+            dst.list_refs(None).await.unwrap(),
+            [("main".to_owned(), tip)]
+        );
+    });
+}
+
+/// A tip names two dependencies. The destination alone holds the first. Two
+/// repositories hold the second: the earlier one in the order source,
+/// localcache, destination holds a copy that does not read, and the later one
+/// holds a good copy. The pull fails on the defective copy. Thus the pull
+/// reads the source before a localcache and a localcache before the
+/// destination, and it starts the search of each dependency at the source.
+#[test]
+fn a_local_pull_reads_a_dependency_from_its_first_holder() {
+    let tmp = TmpDir::new("pull-local-dependency-holder-order");
+    block_on(async {
+        let base = tmp.path();
+        for sub in ["t", "d", "c", "e"] {
+            build_tree(&base.join(sub), sub.as_bytes());
+        }
+        let (src_dir, src) = make_repo(base, "src", RepoMode::Archive).await;
+        let plain = commit_tree(&src, base, "t", "main", None).await;
+        let in_dst = commit_tree(&src, base, "d", "dep/d", None).await;
+        // Defective in the source, good in the localcache.
+        let in_cache = commit_tree(&src, base, "c", "dep/c", None).await;
+        // Defective in the localcache, good in the destination.
+        let past_cache = commit_tree(&src, base, "e", "dep/e", None).await;
+        let (cache_dir, cache) = make_repo(base, "cache", RepoMode::Archive).await;
+        hold_commit(&cache, &src, &in_cache).await;
+        hold_commit(&cache, &src, &past_cache).await;
+        spoil_commit_object(&cache_dir, &past_cache);
+        let (_dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+        hold_commit(&dst, &src, &in_dst).await;
+        hold_commit(&dst, &src, &past_cache).await;
+        remove_commit_object(&src_dir, &in_dst);
+        remove_commit_object(&src_dir, &past_cache);
+        spoil_commit_object(&src_dir, &in_cache);
+
+        for second in [in_cache, past_cache] {
+            let tip = store_with_field2(
+                &src,
+                &plain,
+                &[("a/d", in_dst.as_bytes()), ("b/x", second.as_bytes())],
+            )
+            .await;
+            move_ref(&src, "main", &tip).await;
+
+            let err = pull_main_with(
+                &dst,
+                &src,
+                PullOptions {
+                    localcache_repos: vec![cache.clone()],
+                    ..PullOptions::default()
+                },
+            )
+            .await
+            .unwrap_err();
+            assert!(
+                matches!(&err, Error::Io(e) if e.kind() == std::io::ErrorKind::InvalidData)
+                    && err.to_string().contains("not a regular file"),
+                "{second}: {err:?}"
+            );
+            assert!(dst.list_refs(None).await.unwrap().is_empty());
+        }
     });
 }
 

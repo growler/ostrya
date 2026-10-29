@@ -228,11 +228,11 @@ jobs:
       - name: ostrya send without the push features compiles
         run: cargo check -p ostrya-cli --no-default-features --features smol,send
 
-      # `ostrya-sign` holds a runtime only under `sign-gpg`. This compiles the
+      # `ostrya-sign` holds a runtime only under `gpg-sign`. This compiles the
       # crate with the spki engine and the GPG verifier and with no runtime
       # backend, so a runtime item placed outside that feature fails here.
       - name: ostrya-sign without a runtime compiles
-        run: cargo check -p ostrya-sign --no-default-features --features sign-spki,gpg
+        run: cargo check -p ostrya-sign --no-default-features --features spki,gpg
 
       # The feature `gpg` holds the GPG verifier and no runtime. These steps
       # build the crate with `gpg` alone, with no warning, and run its unit
@@ -242,52 +242,29 @@ jobs:
       - name: The ostrya-sign unit tests pass with the GPG verifier feature alone
         run: cargo test -p ostrya-sign --no-default-features --features gpg --lib
 
-      # Each key feature of the spki engine turns on the code that the key
-      # types share. These steps build the engine with one key feature alone,
-      # with no warning, run the unit tests of `ostrya-sign` in that build,
-      # and run the spki tests of `ostrya` in that build. A build with one key
-      # feature refuses a key of each other type, and the tests of each build
-      # check the refusal.
-      - name: ostrya-sign with the P-256 key feature alone compiles
-        run: cargo clippy -p ostrya-sign --no-default-features --features sign-spki-p256 --all-targets -- -D warnings
-      - name: The ostrya-sign unit tests pass with the P-256 key feature alone
-        run: cargo test -p ostrya-sign --no-default-features --features sign-spki-p256 --lib
-      - name: The spki tests pass with the P-256 key feature alone
-        run: cargo test -p ostrya --no-default-features --features smol,sign-spki-p256 --test sign_spki --test sign_spki_fixtures
-      - name: ostrya-sign with the P-384 key feature alone compiles
-        run: cargo clippy -p ostrya-sign --no-default-features --features sign-spki-p384 --all-targets -- -D warnings
-      - name: The ostrya-sign unit tests pass with the P-384 key feature alone
-        run: cargo test -p ostrya-sign --no-default-features --features sign-spki-p384 --lib
-      - name: The spki tests pass with the P-384 key feature alone
-        run: cargo test -p ostrya --no-default-features --features smol,sign-spki-p384 --test sign_spki_p384 --test sign_spki_fixtures
-      - name: ostrya-sign with the Ed25519 key feature alone compiles
-        run: cargo clippy -p ostrya-sign --no-default-features --features sign-spki-ed25519 --all-targets -- -D warnings
-      - name: The ostrya-sign unit tests pass with the Ed25519 key feature alone
-        run: cargo test -p ostrya-sign --no-default-features --features sign-spki-ed25519 --lib
-      - name: The spki tests pass with the Ed25519 key feature alone
-        run: cargo test -p ostrya --no-default-features --features smol,sign-spki-ed25519 --test sign_spki_ed25519 --test sign_spki_fixtures
-      - name: ostrya-sign with the RSA key feature alone compiles
-        run: cargo clippy -p ostrya-sign --no-default-features --features sign-spki-rsa --all-targets -- -D warnings
-      - name: The ostrya-sign unit tests pass with the RSA key feature alone
-        run: cargo test -p ostrya-sign --no-default-features --features sign-spki-rsa --lib
-      - name: The spki tests pass with the RSA key feature alone
-        run: cargo test -p ostrya --no-default-features --features smol,sign-spki-rsa --test sign_spki_rsa --test sign_spki_fixtures
+      # The feature `spki` turns on the spki engine with each key type. These
+      # steps build the engine with no other feature, with no warning, run
+      # the unit tests of `ostrya-sign` in that build, and run the spki tests
+      # of `ostrya` with `sign-spki` and no other signing feature.
+      - name: ostrya-sign with the spki feature alone compiles
+        run: cargo clippy -p ostrya-sign --no-default-features --features spki --all-targets -- -D warnings
+      - name: The ostrya-sign unit tests pass with the spki feature alone
+        run: cargo test -p ostrya-sign --no-default-features --features spki --lib
+      - name: The spki tests pass with the sign-spki feature alone
+        run: cargo test -p ostrya --no-default-features --features smol,sign-spki --test sign_spki --test sign_spki_p384 --test sign_spki_ed25519 --test sign_spki_rsa --test sign_spki_fixtures
 
-      # `sign-x509` alone holds the trait `X509Signer` and no key type. With
-      # the RSA key feature, it holds the X.509 signer of the spki engine.
-      # With the Ed25519 key feature alone, it holds the X.509 verifier and
-      # no X.509 signer. These steps build the three forms with no warning,
-      # and run the unit tests of `ostrya-sign` in the first two.
+      # `x509` alone holds the trait `X509Signer` and no key type. With `spki`,
+      # it holds the X.509 signer and the X.509 verifier of the spki engine.
+      # These steps build the two forms with no warning, and run the unit
+      # tests of `ostrya-sign` in each.
       - name: ostrya-sign with the X.509 feature alone compiles
-        run: cargo clippy -p ostrya-sign --no-default-features --features sign-x509 --all-targets -- -D warnings
+        run: cargo clippy -p ostrya-sign --no-default-features --features x509 --all-targets -- -D warnings
       - name: The ostrya-sign unit tests pass with the X.509 feature alone
-        run: cargo test -p ostrya-sign --no-default-features --features sign-x509 --lib
-      - name: ostrya-sign with the X.509 feature and the RSA key feature compiles
-        run: cargo clippy -p ostrya-sign --no-default-features --features sign-x509,sign-spki-rsa --all-targets -- -D warnings
-      - name: The ostrya-sign unit tests pass with the X.509 feature and the RSA key feature
-        run: cargo test -p ostrya-sign --no-default-features --features sign-x509,sign-spki-rsa --lib
-      - name: ostrya-sign with the X.509 feature and the Ed25519 key feature compiles
-        run: cargo clippy -p ostrya-sign --no-default-features --features sign-x509,sign-spki-ed25519 --all-targets -- -D warnings
+        run: cargo test -p ostrya-sign --no-default-features --features x509 --lib
+      - name: ostrya-sign with the X.509 feature and the spki feature compiles
+        run: cargo clippy -p ostrya-sign --no-default-features --features x509,spki --all-targets -- -D warnings
+      - name: The ostrya-sign unit tests pass with the X.509 feature and the spki feature
+        run: cargo test -p ostrya-sign --no-default-features --features x509,spki --lib
 
       # The portable crates compile for macOS and Windows as well as Linux.
       # `cargo check` needs the standard library of each target and no linker,
@@ -306,8 +283,8 @@ jobs:
             cargo check --target "$target" -p ostrya-remote --no-default-features --features tokio
             cargo check --target "$target" -p ostrya-remote --features s3
             cargo check --target "$target" -p ostrya-remote --no-default-features --features tokio,s3
-            cargo check --target "$target" -p ostrya-sign --features sign-spki,gpg,sign-gpg,sign-x509
-            cargo check --target "$target" -p ostrya-sign --no-default-features --features tokio,sign-spki,gpg,sign-gpg,sign-x509
+            cargo check --target "$target" -p ostrya-sign --features spki,gpg,gpg-sign,x509
+            cargo check --target "$target" -p ostrya-sign --no-default-features --features tokio,spki,gpg,gpg-sign,x509
           done
 
       # `cargo check` does no code generation, so it does not assemble the

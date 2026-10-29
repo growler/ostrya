@@ -129,8 +129,8 @@ for it.
   with the fix comes with a review of the advisory exception in `CLAUDE.md`.
 - More key types in the spki engine. The engine takes ECDSA P-256, ECDSA
   P-384, Ed25519, and RSA. The `ostree` command also signs and verifies with
-  ECDSA P-521 and ML-DSA. Each type can come later with its key feature, its
-  tool fixtures, and the cross-check with the `ostree` command. A type that
+  ECDSA P-521 and ML-DSA. Each type can come later in the feature `spki`,
+  with its tool fixtures, and the cross-check with the `ostree` command. A type that
   needs a new crate needs the authorization of the maintainer first.
 - A light commit parse in the prune walk. For each commit that the walk
   expands, `Commit::parse` builds the `a{sv}` metadata tree and copies the

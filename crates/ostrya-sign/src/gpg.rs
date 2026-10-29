@@ -1,15 +1,15 @@
-//! The GPG engine: the signer behind `sign-gpg`, the verifier behind `gpg`.
+//! The GPG engine: the signer behind `gpg-sign`, the verifier behind `gpg`.
 //!
 //! The doc of `GpgSigner` holds the key selection, the signing process, and
 //! the signature format. The doc of `GpgVerifier` holds the verdict and the
 //! limits of a keyring.
 
-#[cfg(feature = "sign-gpg")]
+#[cfg(feature = "gpg-sign")]
 mod signer;
 #[cfg(feature = "gpg")]
 mod verifier;
 
-#[cfg(feature = "sign-gpg")]
+#[cfg(feature = "gpg-sign")]
 pub use signer::GpgSigner;
 #[cfg(feature = "gpg")]
 pub use verifier::{
@@ -23,5 +23,5 @@ pub use verifier::{
 /// them from it.
 const GPG_METADATA_KEY: &str = "ostree.gpgsigs";
 /// The prefix of a machine-readable status line on the status fd.
-#[cfg(any(test, feature = "sign-gpg"))]
+#[cfg(any(test, feature = "gpg-sign"))]
 const STATUS_PREFIX: &str = "[GNUPG:] ";

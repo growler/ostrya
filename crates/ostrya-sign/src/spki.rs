@@ -4,13 +4,10 @@
 //! The algorithm OID of a key selects its key type. The docs of `SpkiSigner`
 //! and `SpkiVerifier` hold the signature and key formats.
 
-#[cfg(feature = "sign-spki-ed25519")]
 mod ed25519;
-#[cfg(feature = "sign-spki-p384")]
 mod p384;
-#[cfg(feature = "sign-spki-rsa")]
 mod rsa;
-#[cfg(feature = "sign-x509")]
+#[cfg(feature = "x509")]
 mod x509;
 
 use std::borrow::Cow;
@@ -24,19 +21,10 @@ use ostrya_core::{Checksum, base64};
 use pkcs8::PrivateKeyInfo;
 use spki::{AlgorithmIdentifierRef, SubjectPublicKeyInfoRef};
 
-#[cfg(feature = "sign-spki-p256")]
 use p256::ecdsa::signature::{Signer as _, hazmat::PrehashVerifier as _};
-#[cfg(feature = "sign-spki-p256")]
 use p256::pkcs8::EncodePublicKey;
 
-#[cfg(all(
-    feature = "sign-x509",
-    any(
-        feature = "sign-spki-p256",
-        feature = "sign-spki-p384",
-        feature = "sign-spki-rsa"
-    )
-))]
+#[cfg(feature = "x509")]
 pub use self::x509::X509SpkiSigner;
 use crate::pem;
 use crate::{Error, Result, SignFuture, SignKeys, SignatureInfo, Signer, Verifier, VerifyOutcome};
@@ -131,21 +119,17 @@ const EXPLICIT_PARAMETERS: &str = "the EC key has explicit curve parameters";
 /// types:
 ///
 /// - `id-ecPublicKey` (1.2.840.10045.2.1) on the curve `prime256v1`
-///   (1.2.840.10045.3.1.7), with the feature `sign-spki-p256`.
-/// - `id-ecPublicKey` on the curve `secp384r1` (1.3.132.0.34), with the
-///   feature `sign-spki-p384`.
-/// - `id-Ed25519` (1.3.101.112) with no parameters, with the feature
-///   `sign-spki-ed25519`. The `privateKey` field holds an `OCTET STRING` of
-///   the 32-byte seed. A PKCS#8 version 2 key also holds the public key of
-///   the seed.
-/// - `rsaEncryption` (1.2.840.113549.1.1.1) with `NULL` parameters, with the
-///   feature `sign-spki-rsa`. The modulus has 2048 to 16384 bits, and the
-///   key has two primes.
+///   (1.2.840.10045.3.1.7).
+/// - `id-ecPublicKey` on the curve `secp384r1` (1.3.132.0.34).
+/// - `id-Ed25519` (1.3.101.112) with no parameters. The `privateKey` field
+///   holds an `OCTET STRING` of the 32-byte seed. A PKCS#8 version 2 key also
+///   holds the public key of the seed.
+/// - `rsaEncryption` (1.2.840.113549.1.1.1) with `NULL` parameters. The
+///   modulus has 2048 to 16384 bits, and the key has two primes.
 ///
-/// The signer refuses each other key type and curve, an EC key with
-/// explicit curve parameters, and a key of a type that the build has no code
-/// for. An `id-RSASSA-PSS` key (1.2.840.113549.1.1.10) is of another key
-/// type.
+/// The signer refuses each other key type and curve, and an EC key with
+/// explicit curve parameters. An `id-RSASSA-PSS` key (1.2.840.113549.1.1.10)
+/// is of another key type.
 ///
 /// A secret key file holds PEM `PRIVATE KEY` blocks, and
 /// [`spki_secret_keys`] reads it. Each block gives one signer.
@@ -210,12 +194,6 @@ impl SpkiSigner {
     ///   or `rsaEncryption`. The message is
     ///   `spki secret key: the key type <name> is not supported`. `<name>` is
     ///   a name such as `RSASSA-PSS` or `Ed448`, or the dotted OID.
-    /// - The build has no code for the key type or the curve of the key. The
-    ///   message is `spki secret key: this build has no code for <the key
-    ///   type RSA | the key type Ed25519 | the curve P-256 | the curve
-    ///   P-384>; build with the <feature> feature`. `<feature>` is
-    ///   `sign-spki-rsa`, `sign-spki-ed25519`, `sign-spki-p256`, or
-    ///   `sign-spki-p384`.
     /// - The parameters of the `rsaEncryption` `AlgorithmIdentifier` of a
     ///   PKCS#8 key are not `NULL`. The message is
     ///   `spki secret key: the rsaEncryption parameters are not NULL`.
@@ -347,25 +325,23 @@ impl Signer for SpkiSigner {
 /// and the curve OID selects the curve. The verifier takes these key types:
 ///
 /// - `id-ecPublicKey` on the curve `prime256v1`, with a compressed or an
-///   uncompressed point, with the feature `sign-spki-p256`.
+///   uncompressed point.
 /// - `id-ecPublicKey` on the curve `secp384r1`, with a compressed or an
-///   uncompressed point, with the feature `sign-spki-p384`.
-/// - `id-Ed25519` with no parameters and a 32-byte public key, with the
-///   feature `sign-spki-ed25519`. The 32 bytes must decode to a point on the
-///   curve. The verifier also accepts the encodings that RFC 8032 refuses: a
-///   y coordinate that is not below p, and x = 0 with the sign bit set. It
-///   keeps the 32 bytes as they are given. A key of small order is a valid
-///   key.
+///   uncompressed point.
+/// - `id-Ed25519` with no parameters and a 32-byte public key. The 32 bytes
+///   must decode to a point on the curve. The verifier also accepts the
+///   encodings that RFC 8032 refuses: a y coordinate that is not below p, and
+///   x = 0 with the sign bit set. It keeps the 32 bytes as they are given. A
+///   key of small order is a valid key.
 /// - `rsaEncryption` with `NULL` parameters and a modulus of 2048 to 16384
-///   bits, with the feature `sign-spki-rsa`. The public key of a multi-prime
-///   key is a modulus and an exponent, and the verifier takes it.
+///   bits. The public key of a multi-prime key is a modulus and an exponent,
+///   and the verifier takes it.
 ///
-/// The verifier refuses each other key type and curve, an EC key with
-/// explicit curve parameters, and a key of a type that the build has no code
-/// for. A bare SEC1 point is not a public key of the verifier. A public key
-/// file holds PEM `PUBLIC KEY` blocks, and [`spki_public_keys`] reads it. The
-/// `trusted.spki` and `revoked.spki` files of the system key store are public
-/// key files.
+/// The verifier refuses each other key type and curve, and an EC key with
+/// explicit curve parameters. A bare SEC1 point is not a public key of the
+/// verifier. A public key file holds PEM `PUBLIC KEY` blocks, and
+/// [`spki_public_keys`] reads it. The `trusted.spki` and `revoked.spki` files
+/// of the system key store are public key files.
 ///
 /// # Verification
 ///
@@ -407,8 +383,6 @@ impl Signer for SpkiSigner {
 /// # Examples
 ///
 /// ```
-/// # #[cfg(feature = "sign-spki-p256")]
-/// # {
 /// use futures_lite::future::block_on;
 /// use ostrya_sign::{Signer, SpkiSigner, SpkiVerifier, Verifier};
 ///
@@ -426,7 +400,6 @@ impl Signer for SpkiSigner {
 /// let outcome = verifier.verify(b"commit bytes", &[signature])?;
 /// assert!(outcome.valid);
 /// assert_eq!(outcome.signatures[0].pubkey_algorithm.as_deref(), Some("p256"));
-/// # }
 /// # Ok::<(), ostrya_sign::Error>(())
 /// ```
 #[derive(Clone)]
@@ -457,10 +430,6 @@ impl SpkiVerifier {
     ///   `rsaEncryption`. The message is
     ///   `spki public key: the key type <name> is not supported`. `<name>` is
     ///   a name such as `RSASSA-PSS` or `Ed448`, or the dotted OID.
-    /// - The build has no code for the key type or the curve of the key. The
-    ///   message is `spki public key: this build has no code for <the key
-    ///   type RSA | the key type Ed25519 | the curve P-256 | the curve
-    ///   P-384>; build with the <feature> feature`.
     /// - The parameters of an `rsaEncryption` key are not `NULL`. The message
     ///   is `spki public key: the rsaEncryption parameters are not NULL`.
     /// - An `id-Ed25519` key has a `parameters` field, for example a `NULL`.
@@ -842,16 +811,12 @@ fn without_white_space(text: &str) -> Cow<'_, str> {
 #[derive(Clone)]
 enum Secret {
     /// An ECDSA P-256 key.
-    #[cfg(feature = "sign-spki-p256")]
     P256(p256::ecdsa::SigningKey),
     /// An ECDSA P-384 key that signs the SHA-256 of the data.
-    #[cfg(feature = "sign-spki-p384")]
     P384(::p384::ecdsa::SigningKey),
     /// An Ed25519 key that signs the data.
-    #[cfg(feature = "sign-spki-ed25519")]
     Ed25519(Box<ed25519_dalek::SigningKey>),
     /// An RSA key that signs with PKCS#1 v1.5 and SHA-256.
-    #[cfg(feature = "sign-spki-rsa")]
     Rsa(Box<::rsa::pkcs1v15::SigningKey<::rsa::sha2::Sha256>>),
 }
 
@@ -859,13 +824,9 @@ impl Secret {
     /// Returns the public key of this secret key.
     fn public_key(&self) -> Public {
         match self {
-            #[cfg(feature = "sign-spki-p256")]
             Secret::P256(key) => Public::P256(*key.verifying_key()),
-            #[cfg(feature = "sign-spki-p384")]
             Secret::P384(key) => Public::P384(*key.verifying_key()),
-            #[cfg(feature = "sign-spki-ed25519")]
             Secret::Ed25519(key) => Public::Ed25519(key.verifying_key()),
-            #[cfg(feature = "sign-spki-rsa")]
             Secret::Rsa(key) => Public::Rsa(rsa::public_of(key)),
         }
     }
@@ -873,16 +834,12 @@ impl Secret {
     /// Signs `data` and returns the signature in the form of the key type.
     fn sign(&self, data: &[u8]) -> Result<Vec<u8>> {
         match self {
-            #[cfg(feature = "sign-spki-p256")]
             Secret::P256(key) => {
                 let signature: p256::ecdsa::Signature = key.sign(data);
                 Ok(signature.to_der().to_bytes().into_vec())
             }
-            #[cfg(feature = "sign-spki-p384")]
             Secret::P384(key) => Ok(p384::sign(key, data)),
-            #[cfg(feature = "sign-spki-ed25519")]
             Secret::Ed25519(key) => Ok(ed25519::sign(key, data)),
-            #[cfg(feature = "sign-spki-rsa")]
             Secret::Rsa(key) => rsa::sign(key, data),
         }
     }
@@ -892,17 +849,13 @@ impl Secret {
 #[derive(Clone)]
 enum Public {
     /// An ECDSA P-256 key.
-    #[cfg(feature = "sign-spki-p256")]
     P256(p256::ecdsa::VerifyingKey),
     /// An ECDSA P-384 key that verifies a signature of the SHA-256 of the
     /// data.
-    #[cfg(feature = "sign-spki-p384")]
     P384(::p384::ecdsa::VerifyingKey),
     /// An Ed25519 key that verifies a signature of the data.
-    #[cfg(feature = "sign-spki-ed25519")]
     Ed25519(ed25519_dalek::VerifyingKey),
     /// An RSA key that verifies PKCS#1 v1.5 with SHA-256.
-    #[cfg(feature = "sign-spki-rsa")]
     Rsa(::rsa::pkcs1v15::VerifyingKey<::rsa::sha2::Sha256>),
 }
 
@@ -911,13 +864,9 @@ impl Public {
     /// [`SignatureInfo::pubkey_algorithm`].
     fn algorithm(&self) -> &'static str {
         match self {
-            #[cfg(feature = "sign-spki-p256")]
             Public::P256(_) => "p256",
-            #[cfg(feature = "sign-spki-p384")]
             Public::P384(_) => "p384",
-            #[cfg(feature = "sign-spki-ed25519")]
             Public::Ed25519(_) => "ed25519",
-            #[cfg(feature = "sign-spki-rsa")]
             Public::Rsa(_) => "rsa",
         }
     }
@@ -929,16 +878,12 @@ impl Public {
     /// exponent.
     fn canonical_der(&self) -> Vec<u8> {
         match self {
-            #[cfg(feature = "sign-spki-p256")]
             Public::P256(key) => p256::PublicKey::from(key)
                 .to_public_key_der()
                 .expect("P-256 public key always encodes to SPKI DER")
                 .into_vec(),
-            #[cfg(feature = "sign-spki-p384")]
             Public::P384(key) => p384::canonical_der(key),
-            #[cfg(feature = "sign-spki-ed25519")]
             Public::Ed25519(key) => ed25519::canonical_der(key),
-            #[cfg(feature = "sign-spki-rsa")]
             Public::Rsa(key) => ::rsa::pkcs8::EncodePublicKey::to_public_key_der(key)
                 .expect("RSA public key always encodes to SPKI DER")
                 .into_vec(),
@@ -949,16 +894,12 @@ impl Public {
     /// data of `prehash`. The key tries only the form of its key type.
     fn verifies(&self, prehash: &Prehash<'_>, forms: &SignatureForms<'_>) -> bool {
         match self {
-            #[cfg(feature = "sign-spki-p256")]
             Public::P256(key) => forms
                 .p256
                 .as_ref()
                 .is_some_and(|signature| key.verify_prehash(prehash.get(), signature).is_ok()),
-            #[cfg(feature = "sign-spki-p384")]
             Public::P384(key) => p384::verifies(key, prehash, forms.p384.as_ref()),
-            #[cfg(feature = "sign-spki-ed25519")]
             Public::Ed25519(key) => ed25519::verifies(key, prehash, forms.ed25519.as_ref()),
-            #[cfg(feature = "sign-spki-rsa")]
             Public::Rsa(key) => rsa::verifies(key, prehash, forms.blob),
         }
     }
@@ -973,16 +914,7 @@ impl Public {
 struct Prehash<'a> {
     /// The data.
     data: &'a [u8],
-    /// The SHA-256 of `data`, after the first call to [`Prehash::get`]. A
-    /// build with the Ed25519 key type alone does not read it.
-    #[cfg_attr(
-        not(any(
-            feature = "sign-spki-p256",
-            feature = "sign-spki-p384",
-            feature = "sign-spki-rsa"
-        )),
-        allow(dead_code)
-    )]
+    /// The SHA-256 of `data`, after the first call to [`Prehash::get`].
     digest: OnceCell<Checksum>,
 }
 
@@ -996,14 +928,6 @@ impl Prehash<'_> {
     }
 
     /// Returns the SHA-256 of the data. The first call computes it.
-    #[cfg_attr(
-        not(any(
-            feature = "sign-spki-p256",
-            feature = "sign-spki-p384",
-            feature = "sign-spki-rsa"
-        )),
-        allow(dead_code)
-    )]
     fn get(&self) -> &[u8] {
         self.digest
             .get_or_init(|| Checksum::sha256(self.data))
@@ -1034,16 +958,12 @@ impl TrustedKey {
 struct SignatureForms<'a> {
     /// The blob. An RSA key reads it as it is, because the form of an RSA
     /// signature depends on the size of the key.
-    #[cfg_attr(not(feature = "sign-spki-rsa"), allow(dead_code))]
     blob: &'a [u8],
     /// The blob as a DER ECDSA P-256 signature, if it parses as one.
-    #[cfg(feature = "sign-spki-p256")]
     p256: Option<p256::ecdsa::Signature>,
     /// The blob as a DER ECDSA P-384 signature, if it parses as one.
-    #[cfg(feature = "sign-spki-p384")]
     p384: Option<::p384::ecdsa::Signature>,
     /// The blob as an Ed25519 signature, if it is 64 bytes.
-    #[cfg(feature = "sign-spki-ed25519")]
     ed25519: Option<ed25519_dalek::Signature>,
 }
 
@@ -1052,11 +972,8 @@ impl SignatureForms<'_> {
     fn parse(blob: &[u8]) -> SignatureForms<'_> {
         SignatureForms {
             blob,
-            #[cfg(feature = "sign-spki-p256")]
             p256: p256::ecdsa::Signature::from_der(blob).ok(),
-            #[cfg(feature = "sign-spki-p384")]
             p384: ::p384::ecdsa::Signature::from_der(blob).ok(),
-            #[cfg(feature = "sign-spki-ed25519")]
             ed25519: ed25519_dalek::Signature::from_slice(blob).ok(),
         }
     }
@@ -1065,16 +982,12 @@ impl SignatureForms<'_> {
 /// The key types of the engine.
 enum KeyType {
     /// ECDSA on the P-256 curve.
-    #[cfg(feature = "sign-spki-p256")]
     P256,
     /// ECDSA on the P-384 curve.
-    #[cfg(feature = "sign-spki-p384")]
     P384,
     /// Ed25519, key type `id-Ed25519`.
-    #[cfg(feature = "sign-spki-ed25519")]
     Ed25519,
     /// RSA, key type `rsaEncryption`.
-    #[cfg(feature = "sign-spki-rsa")]
     Rsa,
 }
 
@@ -1106,49 +1019,16 @@ fn oid_name(oid: ObjectIdentifier) -> String {
         .map_or_else(|| oid.to_string(), |(_, name)| (*name).to_owned())
 }
 
-/// Returns the refusal of a key of a type or on a curve that the build has no
-/// code for. `what` names the key type or the curve, and `feature` names the
-/// feature that adds the code.
-#[cfg(not(all(
-    feature = "sign-spki-p256",
-    feature = "sign-spki-p384",
-    feature = "sign-spki-ed25519",
-    feature = "sign-spki-rsa"
-)))]
-fn missing_feature(what: &str, feature: &str) -> Refusal {
-    Refusal::Key(format!(
-        "this build has no code for {what}; build with the {feature} feature"
-    ))
-}
-
 /// Selects the key type from the `AlgorithmIdentifier` of a key.
 fn key_type(algorithm: &AlgorithmIdentifierRef<'_>) -> std::result::Result<KeyType, Refusal> {
     match algorithm.oid {
         oid if oid == ID_EC_PUBLIC_KEY => match ec_curve(algorithm.parameters)? {
-            #[cfg(feature = "sign-spki-p256")]
             curve if curve == SECP256R1 => Ok(KeyType::P256),
-            #[cfg(not(feature = "sign-spki-p256"))]
-            curve if curve == SECP256R1 => {
-                Err(missing_feature("the curve P-256", "sign-spki-p256"))
-            }
-            #[cfg(feature = "sign-spki-p384")]
             curve if curve == SECP384R1 => Ok(KeyType::P384),
-            #[cfg(not(feature = "sign-spki-p384"))]
-            curve if curve == SECP384R1 => {
-                Err(missing_feature("the curve P-384", "sign-spki-p384"))
-            }
             curve => Err(unsupported_curve(curve)),
         },
-        #[cfg(feature = "sign-spki-rsa")]
         oid if oid == RSA_ENCRYPTION => rsa_parameters(algorithm).map(|()| KeyType::Rsa),
-        #[cfg(not(feature = "sign-spki-rsa"))]
-        oid if oid == RSA_ENCRYPTION => rsa_parameters(algorithm)
-            .and_then(|()| Err(missing_feature("the key type RSA", "sign-spki-rsa"))),
-        #[cfg(feature = "sign-spki-ed25519")]
         oid if oid == ID_ED25519 => ed25519_parameters(algorithm).map(|()| KeyType::Ed25519),
-        #[cfg(not(feature = "sign-spki-ed25519"))]
-        oid if oid == ID_ED25519 => ed25519_parameters(algorithm)
-            .and_then(|()| Err(missing_feature("the key type Ed25519", "sign-spki-ed25519"))),
         oid => Err(Refusal::Key(format!(
             "the key type {} is not supported",
             oid_name(oid)
@@ -1215,18 +1095,14 @@ fn decode_public_key_info(
     info: SubjectPublicKeyInfoRef<'_>,
 ) -> std::result::Result<Public, Refusal> {
     match key_type(&info.algorithm)? {
-        #[cfg(feature = "sign-spki-p256")]
         KeyType::P256 => {
             ec_point_form(&info)?;
             p256::ecdsa::VerifyingKey::try_from(info)
                 .map(Public::P256)
                 .map_err(|_| Refusal::Form)
         }
-        #[cfg(feature = "sign-spki-p384")]
         KeyType::P384 => p384::public_key(info).map(Public::P384),
-        #[cfg(feature = "sign-spki-ed25519")]
         KeyType::Ed25519 => ed25519::public_key(info).map(Public::Ed25519),
-        #[cfg(feature = "sign-spki-rsa")]
         KeyType::Rsa => rsa::public_key(&info).map(Public::Rsa),
     }
 }
@@ -1234,7 +1110,6 @@ fn decode_public_key_info(
 /// Checks that the point of an EC SubjectPublicKeyInfo is compressed (0x02,
 /// 0x03) or uncompressed (0x04). The compact form (0x05) leaves the choice of
 /// y to the decoder, so the engine refuses it.
-#[cfg(any(feature = "sign-spki-p256", feature = "sign-spki-p384"))]
 fn ec_point_form(info: &SubjectPublicKeyInfoRef<'_>) -> std::result::Result<(), Refusal> {
     match info.subject_public_key.as_bytes().and_then(<[u8]>::first) {
         Some(0x02..=0x04) => Ok(()),
@@ -1263,28 +1138,15 @@ fn decode_secret_key(bytes: &[u8]) -> std::result::Result<Secret, Refusal> {
         return decode_pkcs8(info);
     }
     if is_pkcs1_private_key(bytes) {
-        #[cfg(feature = "sign-spki-rsa")]
         return rsa::secret_key(bytes).map(|key| Secret::Rsa(Box::new(key)));
-        #[cfg(not(feature = "sign-spki-rsa"))]
-        return Err(missing_feature("the key type RSA", "sign-spki-rsa"));
     }
     let parameters = sec1_parameters(bytes).map_err(|_| Refusal::Form)?;
     match parameters.map(named_curve).transpose()?.flatten() {
         None => Err(Refusal::Key("the SEC1 key does not name its curve".into())),
-        #[cfg(feature = "sign-spki-p256")]
         Some(curve) if curve == SECP256R1 => p256::SecretKey::from_sec1_der(bytes)
             .map(|secret| Secret::P256((&secret).into()))
             .map_err(|_| Refusal::Form),
-        #[cfg(not(feature = "sign-spki-p256"))]
-        Some(curve) if curve == SECP256R1 => {
-            Err(missing_feature("the curve P-256", "sign-spki-p256"))
-        }
-        #[cfg(feature = "sign-spki-p384")]
         Some(curve) if curve == SECP384R1 => p384::sec1_secret_key(bytes).map(Secret::P384),
-        #[cfg(not(feature = "sign-spki-p384"))]
-        Some(curve) if curve == SECP384R1 => {
-            Err(missing_feature("the curve P-384", "sign-spki-p384"))
-        }
         Some(curve) => Err(unsupported_curve(curve)),
     }
 }
@@ -1335,20 +1197,16 @@ fn decode_pkcs8_key(der: &[u8]) -> std::result::Result<Secret, Refusal> {
 /// Decodes the secret key of a PKCS#8 `PrivateKeyInfo`.
 fn decode_pkcs8(info: PrivateKeyInfo<'_>) -> std::result::Result<Secret, Refusal> {
     match key_type(&info.algorithm)? {
-        #[cfg(feature = "sign-spki-p256")]
         KeyType::P256 => {
             inner_curve_is(info.private_key, SECP256R1)?;
             p256::SecretKey::try_from(info)
                 .map(|secret| Secret::P256((&secret).into()))
                 .map_err(|_| Refusal::Form)
         }
-        #[cfg(feature = "sign-spki-p384")]
         KeyType::P384 => p384::pkcs8_secret_key(info).map(Secret::P384),
-        #[cfg(feature = "sign-spki-ed25519")]
         KeyType::Ed25519 => {
             ed25519::pkcs8_secret_key(info).map(|key| Secret::Ed25519(Box::new(key)))
         }
-        #[cfg(feature = "sign-spki-rsa")]
         KeyType::Rsa => rsa::secret_key(info.private_key).map(|key| Secret::Rsa(Box::new(key))),
     }
 }
@@ -1358,7 +1216,6 @@ fn decode_pkcs8(info: PrivateKeyInfo<'_>) -> std::result::Result<Secret, Refusal
 ///
 /// The field can be absent. If it is present, it names `curve`. A field that
 /// names no curve, such as a `NULL`, is refused as another curve.
-#[cfg(any(feature = "sign-spki-p256", feature = "sign-spki-p384"))]
 fn inner_curve_is(der: &[u8], curve: ObjectIdentifier) -> std::result::Result<(), Refusal> {
     let Some(parameters) = sec1_parameters(der).map_err(|_| Refusal::Form)? else {
         return Ok(());
@@ -1392,7 +1249,7 @@ fn sec1_parameters(bytes: &[u8]) -> der::Result<Option<AnyRef<'_>>> {
     reader.finish(parameters)
 }
 
-#[cfg(all(test, feature = "sign-spki-p256"))]
+#[cfg(test)]
 mod tests {
     use std::task::{Context, Poll, Waker};
 
@@ -1416,11 +1273,8 @@ mod tests {
     fn signing_key(signer: &SpkiSigner) -> &SigningKey {
         match &signer.key {
             Secret::P256(key) => key,
-            #[cfg(feature = "sign-spki-p384")]
             Secret::P384(_) => panic!("the signer holds a P-384 key"),
-            #[cfg(feature = "sign-spki-ed25519")]
             Secret::Ed25519(_) => panic!("the signer holds an Ed25519 key"),
-            #[cfg(feature = "sign-spki-rsa")]
             Secret::Rsa(_) => panic!("the signer holds an RSA key"),
         }
     }
@@ -2437,266 +2291,6 @@ mod tests {
                     "{data:?}"
                 );
             }
-        }
-    }
-}
-
-#[cfg(all(
-    test,
-    any(
-        feature = "sign-spki-p256",
-        feature = "sign-spki-p384",
-        feature = "sign-spki-ed25519"
-    ),
-    not(feature = "sign-spki-rsa")
-))]
-mod without_rsa_tests {
-    use super::*;
-
-    /// Returns the DER of the one PEM block of the key fixture file `$name`.
-    macro_rules! key_der {
-        ($name:literal) => {
-            pem_rfc7468::decode_vec(
-                include_bytes!(concat!("../../../tests/fixtures/spki/keys/", $name)).as_slice(),
-            )
-            .unwrap()
-            .1
-        };
-    }
-
-    #[test]
-    fn an_rsa_key_names_the_feature_of_the_key_type() {
-        let reason = "this build has no code for the key type RSA; build with the sign-spki-rsa \
-                      feature";
-        let public = key_der!("rsa-2048.pub.pem");
-        match SpkiVerifier::new([public], Vec::<&[u8]>::new()) {
-            Err(Error::Signature(m)) => assert_eq!(m, format!("spki public key: {reason}")),
-            _ => panic!("the RSA public key has to be refused"),
-        }
-        for secret in [
-            key_der!("rsa-2048.pem"),
-            key_der!("rsa-2048.pkcs1.pem"),
-            key_der!("rsa-3prime.pkcs1.pem"),
-        ] {
-            match SpkiSigner::from_secret_key(&secret) {
-                Err(Error::Signature(m)) => assert_eq!(m, format!("spki secret key: {reason}")),
-                _ => panic!("the RSA secret key has to be refused"),
-            }
-        }
-    }
-
-    /// Returns the DER of a TLV with the tag `tag` and the content `content`.
-    fn tlv(tag: u8, content: &[u8]) -> Vec<u8> {
-        let mut out = vec![tag];
-        match content.len() {
-            len @ 0..=0x7f => out.push(len as u8),
-            len => out.extend([0x81, len as u8]),
-        }
-        out.extend_from_slice(content);
-        out
-    }
-
-    /// Returns the DER of one `INTEGER` for each value of `values`.
-    fn integers(values: &[u8]) -> Vec<u8> {
-        values.iter().flat_map(|&v| tlv(0x02, &[v])).collect()
-    }
-
-    #[test]
-    fn a_sequence_of_integers_that_is_no_rsa_key_is_in_no_form() {
-        let form = "spki secret key: expected PKCS#8 DER, SEC1 DER, or PKCS#1 DER";
-        let two_prime = integers(&[0, 5, 5, 5, 5, 5, 5, 5, 5]);
-        let multi_prime = integers(&[1, 5, 5, 5, 5, 5, 5, 5, 5]);
-        // An `otherPrimeInfos` field of one `OtherPrimeInfo`.
-        let other_primes = tlv(0x30, &tlv(0x30, &integers(&[5, 5, 5])));
-        let null = [0x05, 0x00];
-        for fields in [
-            // A traditional DSA key: version 0, then p, q, g, y, and x.
-            integers(&[0, 23, 11, 4, 9, 7]),
-            // The version and one integer.
-            integers(&[0, 5]),
-            // One integer too many.
-            integers(&[0, 5, 5, 5, 5, 5, 5, 5, 5, 5]),
-            // A field after the integers of a two-prime key.
-            [&two_prime[..], &null].concat(),
-            [&two_prime[..], &other_primes].concat(),
-            // Version 1 with no `otherPrimeInfos` field, or with a field that
-            // is not one.
-            multi_prime.clone(),
-            [&multi_prime[..], &null].concat(),
-            // A field after the `otherPrimeInfos` field.
-            [&multi_prime[..], &other_primes, &null].concat(),
-        ] {
-            let der = tlv(0x30, &fields);
-            match SpkiSigner::from_secret_key(&der) {
-                Err(Error::Signature(m)) => assert_eq!(m, form, "{der:02x?}"),
-                _ => panic!("the sequence has to be refused: {der:02x?}"),
-            }
-        }
-
-        // The fields of an `RSAPrivateKey`, with integers that make no valid
-        // key, name the feature of the key type.
-        let reason = "spki secret key: this build has no code for the key type RSA; build with \
-                      the sign-spki-rsa feature";
-        for fields in [two_prime, [&multi_prime[..], &other_primes].concat()] {
-            let der = tlv(0x30, &fields);
-            match SpkiSigner::from_secret_key(&der) {
-                Err(Error::Signature(m)) => assert_eq!(m, reason, "{der:02x?}"),
-                _ => panic!("the sequence has to be refused: {der:02x?}"),
-            }
-        }
-    }
-}
-
-#[cfg(all(
-    test,
-    any(
-        feature = "sign-spki-p384",
-        feature = "sign-spki-ed25519",
-        feature = "sign-spki-rsa"
-    ),
-    not(feature = "sign-spki-p256")
-))]
-mod without_p256_tests {
-    use ostrya_core::base64;
-
-    use super::*;
-
-    #[test]
-    fn a_p256_key_names_the_feature_of_the_curve() {
-        let reason = "this build has no code for the curve P-256; build with the sign-spki-p256 \
-                      feature";
-        // A P-256 key: the SubjectPublicKeyInfo DER, the PKCS#8 DER, and the
-        // SEC1 DER with the curve in its `parameters` field, in base64.
-        let public = base64::decode(concat!(
-            "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE8X83xylD3ibci0xjFKMR4bwUtTU/",
-            "YLloVEDxomUS2SHAfFnN3LHVVNYjok0Zm2RiiU7XpDnRAG1Ua8eR8SKbLQ==",
-        ))
-        .unwrap();
-        let pkcs8 = base64::decode(concat!(
-            "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg2L708EsnnzHER0SYasMNIUcG",
-            "v63QapC/3kVsoPerzKGhRANCAATxfzfHKUPeJtyLTGMUoxHhvBS1NT9guWhUQPGiZRLZIcB8Wc3",
-            "csdVU1iOiTRmbZGKJTtekOdEAbVRrx5HxIpst",
-        ))
-        .unwrap();
-        let sec1 = base64::decode(concat!(
-            "MHcCAQEEINi+9PBLJ58xxEdEmGrDDSFHBr+t0GqQv95FbKD3q8yhoAoGCCqGSM49AwEHoUQD",
-            "QgAE8X83xylD3ibci0xjFKMR4bwUtTU/YLloVEDxomUS2SHAfFnN3LHVVNYjok0Zm2RiiU7XpDn",
-            "RAG1Ua8eR8SKbLQ==",
-        ))
-        .unwrap();
-        match SpkiVerifier::new([public], Vec::<&[u8]>::new()) {
-            Err(Error::Signature(m)) => assert_eq!(m, format!("spki public key: {reason}")),
-            _ => panic!("the P-256 public key has to be refused"),
-        }
-        for secret in [pkcs8, sec1] {
-            match SpkiSigner::from_secret_key(&secret) {
-                Err(Error::Signature(m)) => assert_eq!(m, format!("spki secret key: {reason}")),
-                _ => panic!("the P-256 secret key has to be refused"),
-            }
-        }
-    }
-}
-
-#[cfg(all(
-    test,
-    any(
-        feature = "sign-spki-p256",
-        feature = "sign-spki-ed25519",
-        feature = "sign-spki-rsa"
-    ),
-    not(feature = "sign-spki-p384")
-))]
-mod without_p384_tests {
-    use ostrya_core::base64;
-
-    use super::*;
-
-    #[test]
-    fn a_p384_key_names_the_feature_of_the_curve() {
-        let reason = "this build has no code for the curve P-384; build with the sign-spki-p384 \
-                      feature";
-        // The P-384 key of RFC 6979, appendix A.2.6: the SubjectPublicKeyInfo
-        // DER, the PKCS#8 DER, and the SEC1 DER with the curve in its
-        // `parameters` field, in base64.
-        let public = base64::decode(concat!(
-            "MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAE7DpOQVtOGaRWhhgCn0J/pdqai8SukuAuBqrlKGswDGTe",
-            "+PDqkFWGYGSiVFFUgLwTgBXZty19VyROqO+awMYhiWcIpZNn+d+59UyoSz8cnbEoiyMcOuDU/nNE",
-            "/SUzJkcg",
-        ))
-        .unwrap();
-        let pkcs8 = base64::decode(concat!(
-            "MIG2AgEAMBAGByqGSM49AgEGBSuBBAAiBIGeMIGbAgEBBDBrnT2tLhuMHAWxmHW2ZZ9N4jw7Znvy",
-            "l7qapHdAeHE32JbVck5McKgl+HLJ6mDS7fWhZANiAATsOk5BW04ZpFaGGAKfQn+l2pqLxK6S4C4G",
-            "quUoazAMZN748OqQVYZgZKJUUVSAvBOAFdm3LX1XJE6o75rAxiGJZwilk2f537n1TKhLPxydsSiL",
-            "Ixw64NT+c0T9JTMmRyA=",
-        ))
-        .unwrap();
-        let sec1 = base64::decode(concat!(
-            "MIGkAgEBBDBrnT2tLhuMHAWxmHW2ZZ9N4jw7Znvyl7qapHdAeHE32JbVck5McKgl+HLJ6mDS7fWg",
-            "BwYFK4EEACKhZANiAATsOk5BW04ZpFaGGAKfQn+l2pqLxK6S4C4GquUoazAMZN748OqQVYZgZKJU",
-            "UVSAvBOAFdm3LX1XJE6o75rAxiGJZwilk2f537n1TKhLPxydsSiLIxw64NT+c0T9JTMmRyA=",
-        ))
-        .unwrap();
-        match SpkiVerifier::new([public], Vec::<&[u8]>::new()) {
-            Err(Error::Signature(m)) => assert_eq!(m, format!("spki public key: {reason}")),
-            _ => panic!("the P-384 public key has to be refused"),
-        }
-        for secret in [pkcs8, sec1] {
-            match SpkiSigner::from_secret_key(&secret) {
-                Err(Error::Signature(m)) => assert_eq!(m, format!("spki secret key: {reason}")),
-                _ => panic!("the P-384 secret key has to be refused"),
-            }
-        }
-    }
-}
-
-#[cfg(all(
-    test,
-    any(
-        feature = "sign-spki-p256",
-        feature = "sign-spki-p384",
-        feature = "sign-spki-rsa"
-    ),
-    not(feature = "sign-spki-ed25519")
-))]
-mod without_ed25519_tests {
-    use ostrya_core::base64;
-
-    use super::*;
-
-    #[test]
-    fn an_ed25519_key_names_the_feature_of_the_key_type() {
-        let reason = "this build has no code for the key type Ed25519; build with the \
-                      sign-spki-ed25519 feature";
-        // The key of test 1 in RFC 8032: the SubjectPublicKeyInfo DER and the
-        // PKCS#8 DER, in base64.
-        let public =
-            base64::decode("MCowBQYDK2VwAyEA11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=").unwrap();
-        let pkcs8 =
-            base64::decode("MC4CAQAwBQYDK2VwBCIEIJ1hsZ3v/VpguoRK9JLsLMREScVpezJpGXA7rAMcrn9g")
-                .unwrap();
-        match SpkiVerifier::new([public], Vec::<&[u8]>::new()) {
-            Err(Error::Signature(m)) => assert_eq!(m, format!("spki public key: {reason}")),
-            _ => panic!("the Ed25519 public key has to be refused"),
-        }
-        match SpkiSigner::from_secret_key(&pkcs8) {
-            Err(Error::Signature(m)) => assert_eq!(m, format!("spki secret key: {reason}")),
-            _ => panic!("the Ed25519 secret key has to be refused"),
-        }
-    }
-
-    #[test]
-    fn ed25519_parameters_are_refused_before_the_feature() {
-        // The SubjectPublicKeyInfo DER of the key of test 1 in RFC 8032, with
-        // NULL parameters.
-        let public =
-            base64::decode("MCwwBwYDK2VwBQADIQDXWpgBgrEKt9VL/tPJZAc6DuFy89qmIyWvAhpo9wdRGg==")
-                .unwrap();
-        match SpkiVerifier::new([public], Vec::<&[u8]>::new()) {
-            Err(Error::Signature(m)) => {
-                assert_eq!(m, "spki public key: the Ed25519 parameters are not absent")
-            }
-            _ => panic!("the Ed25519 public key has to be refused"),
         }
     }
 }

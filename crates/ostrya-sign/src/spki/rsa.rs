@@ -400,14 +400,52 @@ mod tests {
         let form = "spki secret key: expected PKCS#8 DER, SEC1 DER, or PKCS#1 DER";
         let integers =
             |values: &[u8]| -> Vec<u8> { values.iter().flat_map(|&v| integer(&[v])).collect() };
-        // A traditional DSA key, and version 1 with no `otherPrimeInfos` field.
+        let two_prime = integers(&[0, 5, 5, 5, 5, 5, 5, 5, 5]);
+        let multi_prime = integers(&[1, 5, 5, 5, 5, 5, 5, 5, 5]);
+        // An `otherPrimeInfos` field of one `OtherPrimeInfo`.
+        let other_primes = tlv(0x30, &tlv(0x30, &integers(&[5, 5, 5])));
+        let null = [0x05, 0x00];
         for fields in [
+            // A traditional DSA key: version 0, then p, q, g, y, and x.
             integers(&[0, 23, 11, 4, 9, 7]),
-            integers(&[1, 5, 5, 5, 5, 5, 5, 5, 5]),
+            // The version and one integer.
+            integers(&[0, 5]),
+            // One integer too many.
+            integers(&[0, 5, 5, 5, 5, 5, 5, 5, 5, 5]),
+            // A field after the integers of a two-prime key.
+            [&two_prime[..], &null].concat(),
+            [&two_prime[..], &other_primes].concat(),
+            // Version 1 with no `otherPrimeInfos` field, or with a field that
+            // is not one.
+            multi_prime.clone(),
+            [&multi_prime[..], &null].concat(),
+            // A field after the `otherPrimeInfos` field.
+            [&multi_prime[..], &other_primes, &null].concat(),
         ] {
+            let der = tlv(0x30, &fields);
+            assert!(!crate::spki::is_pkcs1_private_key(&der), "{der:02x?}");
+            assert!(crate::spki::sec1_parameters(&der).is_err(), "{der:02x?}");
+            assert_eq!(message(SpkiSigner::from_secret_key(&der)), form);
+        }
+
+        // The fields of an `RSAPrivateKey`, with integers that make no valid
+        // key, are in the PKCS#1 form, and the RSA decoder refuses the key.
+        for (fields, reason) in [
+            (
+                two_prime,
+                "the RSA modulus has 3 bits; the engine takes 2048 to 16384 bits",
+            ),
+            (
+                [&multi_prime[..], &other_primes].concat(),
+                "the RSA key has more than two primes",
+            ),
+        ] {
+            let der = tlv(0x30, &fields);
+            assert!(crate::spki::is_pkcs1_private_key(&der), "{der:02x?}");
+            assert!(crate::spki::sec1_parameters(&der).is_err(), "{der:02x?}");
             assert_eq!(
-                message(SpkiSigner::from_secret_key(&tlv(0x30, &fields))),
-                form
+                message(SpkiSigner::from_secret_key(&der)),
+                format!("spki secret key: {reason}")
             );
         }
     }
@@ -487,10 +525,8 @@ mod tests {
             .collect();
         let other_key = sign(&three_prime_signer(), b"data").unwrap();
         assert_eq!(other_key.len(), 256);
-        #[cfg_attr(not(feature = "sign-spki-p256"), allow(unused_mut))]
         let mut blobs = vec![longer, shorter, leading_zero, fixed, other_key];
         // A DER ECDSA signature over the same data.
-        #[cfg(feature = "sign-spki-p256")]
         blobs.push(block_on(p256_signer().sign(b"data")).unwrap());
         for blob in blobs {
             let outcome = outcome(&verifier, b"data", &blob);
@@ -570,7 +606,6 @@ mod tests {
     }
 
     /// Returns a signer of a P-256 key, from the base64 of its PKCS#8 DER.
-    #[cfg(feature = "sign-spki-p256")]
     fn p256_signer() -> SpkiSigner {
         SpkiSigner::from_base64(concat!(
             "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg2L708EsnnzHER0SYasMNIUcG",
@@ -580,7 +615,6 @@ mod tests {
         .unwrap()
     }
 
-    #[cfg(feature = "sign-spki-p256")]
     #[test]
     fn a_store_of_a_p256_key_and_an_rsa_key_verifies_a_signature_of_each() {
         let p256 = p256_signer();

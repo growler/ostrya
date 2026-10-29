@@ -3,7 +3,7 @@
 //!
 //! The key is the P-384 key of RFC 6979, appendix A.2.6. No test makes a key.
 
-#![cfg(feature = "sign-spki-p384")]
+#![cfg(feature = "sign-spki")]
 
 mod common;
 
@@ -47,18 +47,7 @@ BqrlKGswDGTe+PDqkFWGYGSiVFFUgLwT\n\
 /// an uncompressed point.
 const FINGERPRINT: &str = "2f95601fa82060b909bfc6b979dbd303d34d34e0afb27ea496beac362f242a4b";
 
-/// A P-256 public key in a PEM `PUBLIC KEY` block.
-#[cfg(not(any(feature = "sign-spki-p256", feature = "sign-spki-rsa")))]
-const P256_PUBLIC_PEM: &str = "-----BEGIN PUBLIC KEY-----\n\
-MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE8X83xylD3ibci0xjFKMR4bwUtTU/\n\
-YLloVEDxomUS2SHAfFnN3LHVVNYjok0Zm2RiiU7XpDnRAG1Ua8eR8SKbLQ==\n\
------END PUBLIC KEY-----\n";
-
 /// Returns the path of the key fixture file `name`.
-#[cfg(any(
-    all(feature = "sign-spki-p256", feature = "sign-spki-rsa"),
-    not(any(feature = "sign-spki-p256", feature = "sign-spki-rsa"))
-))]
 fn key_path(name: &str) -> PathBuf {
     common::fixture_root().join("../spki/keys").join(name)
 }
@@ -172,7 +161,6 @@ fn a_key_store_with_a_p384_key_verifies_and_its_revocation_removes_the_key() {
     });
 }
 
-#[cfg(all(feature = "sign-spki-p256", feature = "sign-spki-rsa"))]
 #[test]
 fn a_key_store_of_p256_p384_and_rsa_keys_verifies_a_commit_of_each() {
     let tmp = TmpDir::new("spki-p384-mixed");
@@ -213,59 +201,5 @@ YLloVEDxomUS2SHAfFnN3LHVVNYjok0Zm2RiiU7XpDnRAG1Ua8eR8SKbLQ==\n\
                 Some(algorithm)
             );
         }
-    });
-}
-
-#[cfg(not(any(feature = "sign-spki-p256", feature = "sign-spki-rsa")))]
-#[test]
-fn a_build_with_p384_alone_refuses_p256_and_rsa_keys_and_verifies_a_p384_key() {
-    let tmp = TmpDir::new("spki-p384-alone");
-    let base = tmp.path();
-    let rsa_public = std::fs::read_to_string(key_path("rsa-2048.pub.pem")).unwrap();
-    for (name, text, reason) in [
-        (
-            "p256",
-            P256_PUBLIC_PEM,
-            "this build has no code for the curve P-256; build with the sign-spki-p256 feature",
-        ),
-        (
-            "rsa",
-            rsa_public.as_str(),
-            "this build has no code for the key type RSA; build with the sign-spki-rsa feature",
-        ),
-    ] {
-        // The key in `trusted.spki`, and the key in `revoked.spki`, which
-        // fails the store closed.
-        for (dir, file) in [
-            (store(base, name, text, None), "trusted.spki"),
-            (
-                store(base, &format!("revoked-{name}"), PUBLIC_PEM, Some(text)),
-                "revoked.spki",
-            ),
-        ] {
-            match load_sign_keys_from(&[dir.as_path()], "spki").unwrap_err() {
-                ostrya::Error::Signature(m) => assert_eq!(
-                    m,
-                    format!(
-                        "the key file '{}', line 1: {reason}",
-                        dir.join(file).display()
-                    )
-                ),
-                other => panic!("not a signature error: {other}"),
-            }
-        }
-    }
-
-    let dir = store(base, "p384", PUBLIC_PEM, None);
-    block_on(async {
-        let (repo, commit) = build_committed_repo(base).await;
-        let signer = SpkiSigner::from_base64(SECRET_PKCS8_B64).unwrap();
-        repo.sign_commit(&commit, &signer).await.unwrap();
-        assert!(
-            repo.verify_commit(&commit, &[Arc::new(store_verifier(&dir))])
-                .await
-                .unwrap()
-                .valid
-        );
     });
 }

@@ -76,7 +76,7 @@ feature set and its graph.
 - `url` and `pkcs8` -- in `ostrya-fetch`.
 - `getrandom` -- in `ostrya-server`.
 - `x509-cert` -- in `ostrya-server`, and in `ostrya-sign` under the feature
-  `sign-x509`.
+  `x509`.
 - `thiserror` -- the error types.
 - `libc` -- in `ostrya-sys`, `ostrya-remote` and `ostrya-sign`.
 - `clap` -- command-line parsing, in `ostrya-cli` and `ostrya-mountd`.
@@ -248,28 +248,17 @@ a PKCS#1 `RSAPrivateKey` holds an `INTEGER`, and a SEC1 `ECPrivateKey` holds
 an `OCTET STRING`. A PKCS#1 key is RSA. The version of a PKCS#1 key is 0 or
 1, so a multi-prime PKCS#1 key gets the refusal of its primes.
 
-The engine has one feature for each key type. `sign-spki-p256` gates the
-P-256 key type, and `sign-spki` turns on each key type. The code that the key
-types share -- the PEM splitter, the OID dispatch, and the key file readers --
-compiles when one key feature is on. This code takes `der`, `spki`, `pkcs8`,
-and `pem-rfc7468` as direct dependencies, and not through the re-exports of
-`p256`, so a key type that does not use `p256` builds the engine with no
-`p256`. `sign-spki-p384` gates the P-384 key type, `sign-spki-ed25519`
-gates the Ed25519 key type, and `sign-spki-rsa` gates the RSA key type. A
-build with one of the three alone has no `p256`. A build with no key feature has no ECDSA crate tree. The gates of the
-shared code take the form `any(feature = ...)` over the key features, so each
-key feature adds one item to each gate. `ostrya` and `ostrya-sign` allow the
-clippy lint `non_minimal_cfg`, which refuses a gate of this form with one
-item. Two other forms were rejected. A hidden feature that each key feature
-turns on is a public feature of a published crate. A build script that sets a
-private cfg adds a build script to two crates.
-
-A build without a key type refuses a key of that type, with the
-`Error::Signature` message `this build has no code for <the key type RSA |
-the key type Ed25519 | the curve P-256 | the curve P-384>; build with the
-<feature> feature`. A signature of that type
-is a blob that no trusted key verifies. A revoked key that the build cannot
-read refuses the key store, so the revocation fails closed.
+The engine has one feature, `spki` of `ostrya-sign`, with each key type:
+P-256, P-384, Ed25519, and RSA. `ostrya` forwards it as `sign-spki`. The
+code of the engine names `der`, `spki`, `pkcs8`, and `pem-rfc7468`, so it
+takes them as direct dependencies. A build of `ostrya-sign` with neither
+`spki` nor `gpg` has no ECDSA crate tree. One feature for each key type was
+rejected: each gate of the shared code named each key feature, and a build
+without a key type needed code, tests, and CI builds of its own that refused
+a key of that type. Each build with `spki` holds `rsa`, so RUSTSEC-2023-0071
+is in the graph of a consumer that only verifies. The advisory covers RSA
+private-key operations, and `CLAUDE.md`, "Advisory exceptions", states the
+terms.
 
 The algorithm OID of a key selects its key type, and the curve OID selects the
 curve of an EC key. The engine refuses each key type and each curve outside
@@ -344,7 +333,7 @@ blob with this hash. A store of many keys then hashes a commit one time, and
 a blob that no key tries computes no hash. An Ed25519 key verifies with the
 data and computes no SHA-256.
 
-With the feature `sign-x509`, `ostrya-sign` has the trait `X509Signer`, with
+With the feature `x509`, `ostrya-sign` has the trait `X509Signer`, with
 the supertrait `Signer`. The trait gives the values of a CMS `SignerInfo` for
 a signature with an X.509 certificate chain, for example an Authenticode
 signature of a UEFI image. `certificates()` gives the DER of each
@@ -393,10 +382,8 @@ rejected: a strict decode of the full structure refuses each malformed
 certificate, and a walk to one field does not. `x509-cert` 0.2.5 was in the
 graph through `ostrya-server`, so no package enters `Cargo.lock`.
 
-The feature `sign-spki` does not turn on `sign-x509`. `X509SpkiSigner`
-needs `sign-x509` and one of the key features `sign-spki-p256`,
-`sign-spki-p384`, and `sign-spki-rsa`. `SpkiVerifier::from_certificates`
-needs `sign-x509` and one of the four key features. `sign-x509` alone gives
+The feature `spki` does not turn on `x509`. `X509SpkiSigner` and
+`SpkiVerifier::from_certificates` need `x509` and `spki`. `x509` alone gives
 the trait `X509Signer` alone.
 
 ## GPG

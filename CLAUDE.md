@@ -390,15 +390,14 @@ term below is measured on the resolved dependency graph.
 - The highest minimum supported Rust version in the graph is 1.85. The
   workspace pins 1.92, so the requirement holds.
 
-`pkcs8` 0.10.2 is also authorized for `crates/ostrya-sign`, behind each key
-feature of the spki engine, now `sign-spki-p256`, `sign-spki-p384`,
-`sign-spki-rsa`, and `sign-spki-ed25519`. It reads the `PrivateKeyInfo` of a PKCS#8 secret key, so the
-spki engine selects the key type from the algorithm OID before it decodes the
-key.
+`pkcs8` 0.10.2 is also authorized for `crates/ostrya-sign`, behind the
+feature `spki`, which turns on the spki engine with each key type. It reads
+the `PrivateKeyInfo` of a PKCS#8 secret key, so the spki engine selects the
+key type from the algorithm OID before it decodes the key.
 
 - `default-features = false` is mandatory, and no feature is turned on.
 - `der` 0.7.10 and `spki` 0.7.3 enter the same manifest behind the same
-  features, with `default-features = false`. `der` takes the features
+  feature, with `default-features = false`. `der` takes the features
   `alloc`, `oid`, and `zeroize`, and `spki` takes no feature. No record is
   kept for these two crates.
 - No package enters `Cargo.lock`. `p256` already reached `pkcs8`, `der`, and
@@ -408,7 +407,7 @@ key.
 ### Authorized: the `rsa` crate
 
 `rsa` 0.9.10 is authorized for `crates/ostrya-sign` alone, as an optional
-dependency behind the feature `sign-spki-rsa`. It supplies RSA PKCS#1 v1.5
+dependency behind the feature `spki`. It supplies RSA PKCS#1 v1.5
 signatures with SHA-256 to the spki engine in
 `crates/ostrya-sign/src/spki/rsa.rs`: the private key from its components,
 the signer, and the verifier. Each term below is measured on the resolved
@@ -441,11 +440,14 @@ dependency graph.
   and `zerocopy-derive` 0.8.56. `cargo metadata --format-version 1
   --all-features` counts the same 59 packages under 58 distinct names for
   the closure, with `syn` at 2.0.118 and 3.0.3.
-- A build of `ostrya-sign` with `sign-spki-rsa` alone holds 54 packages
-  under 54 distinct names on the host target, measured with
-  `cargo tree -p ostrya-sign --no-default-features --features sign-spki-rsa
+- A build of `ostrya-sign` with `spki` alone holds 66 packages under 66
+  distinct names on the host target, measured with
+  `cargo tree -p ostrya-sign --no-default-features --features spki
   -e normal,build`. The count includes `ostrya-sign` and its other
-  dependencies. With `--target all` it holds 57. The graph holds no `p256`.
+  dependencies. With `--target all` it holds 69. The feature `spki` turns on
+  each key type of the spki engine, so the graph also holds `p256`, `p384`,
+  and the feature `pkcs8` of `ed25519-dalek`. Against a build with the other
+  three key types, `rsa` adds 15 packages.
 - No package in the graph declares a `links` key, and no package name in it
   ends in `-sys`.
 - Ten packages carry a build script: `generic-array`, `libc`, `libm`,
@@ -481,7 +483,7 @@ dependency graph.
 ### Authorized: the `p384` crate
 
 `p384` 0.13.1 is authorized for `crates/ostrya-sign` alone, as an optional
-dependency behind the feature `sign-spki-p384`. It supplies ECDSA P-384 to
+dependency behind the feature `spki`. It supplies ECDSA P-384 to
 the spki engine: the secret key from a PKCS#8 or a SEC1 key, the signer, and
 the verifier. The engine hashes the data with SHA-256 and calls
 `sign_prehash` and `verify_prehash`. Each term below is measured on the
@@ -529,8 +531,8 @@ resolved dependency graph.
 ### Authorized: the `pkcs8` feature of `ed25519-dalek`
 
 The feature `pkcs8` of `ed25519-dalek` 2.2.0, a foundation crate, is
-authorized for `crates/ostrya-sign` alone, behind the feature
-`sign-spki-ed25519`. It supplies the decode of an Ed25519
+authorized for `crates/ostrya-sign` alone, behind the feature `spki`. It
+supplies the decode of an Ed25519
 SubjectPublicKeyInfo and the encode of the canonical SubjectPublicKeyInfo to
 the spki engine in `crates/ostrya-sign/src/spki/ed25519.rs`. The engine
 reads the seed of a PKCS#8 secret key itself, into a buffer that it wipes.
@@ -539,7 +541,7 @@ Each term below is measured on the resolved dependency graph.
 - License: `ed25519-dalek` states `BSD-3-Clause`. The feature turns on
   `ed25519/pkcs8`, and `ed25519` 2.2.3 states `Apache-2.0 OR MIT`.
 - The manifest keeps `default-features = false` with the features `std` and
-  `zeroize`, and `sign-spki-ed25519` adds `pkcs8`. The feature `pem` stays
+  `zeroize`, and `spki` adds `pkcs8`. The feature `pem` stays
   off: it turns on `ed25519/pem` and `pkcs8/pem`, and the engine reads PEM
   with `pem-rfc7468`. The feature `legacy_compatibility` stays off: it
   accepts an `S` that is not reduced, which the `ostree` command refuses.
@@ -548,29 +550,35 @@ Each term below is measured on the resolved dependency graph.
   and `std`. The feature `zeroize` of `ed25519` is off, so
   `ed25519::KeypairBytes` does not wipe its seed, and the engine does not use
   it.
-- A build of `ostrya-sign` with `sign-spki-ed25519` alone holds 37 packages
-  under 37 distinct names on the host target, measured with
-  `cargo tree -p ostrya-sign --no-default-features --features
-  sign-spki-ed25519 -e normal,build`. The count includes `ostrya-sign`,
-  `ostrya-core`, and `ostrya-gvariant`. With `--target all` it holds 38,
-  adding `fiat-crypto` 0.2.9. Against a build of `ostrya-sign` with no
-  feature, the build adds `base64ct` 1.8.3, `const-oid` 0.9.6, `der` 0.7.10,
-  `pem-rfc7468` 0.7.0, `pkcs8` 0.10.2, and `spki` 0.7.3.
+- A build of `ostrya-sign` with `spki` alone holds 66 packages under 66
+  distinct names on the host target, measured with
+  `cargo tree -p ostrya-sign --no-default-features --features spki
+  -e normal,build`. The count includes `ostrya-sign`, `ostrya-core`, and
+  `ostrya-gvariant`. With `--target all` it holds 69, adding `fiat-crypto`
+  0.2.9, `wasi` 0.11.1+wasi-snapshot-preview1, and `zerocopy-derive` 0.8.56.
+  Against a build of `ostrya-sign` with no feature, the build adds 35
+  packages. The feature `pkcs8` of `ed25519-dalek` adds no package to the
+  build: `p256`, `p384`, and `rsa` already reach `pkcs8`, `der`, `spki`, and
+  `pem-rfc7468`.
 - No package in the graph declares a `links` key, and no package name in it
   ends in `-sys`.
-- Six packages carry a build script: `curve25519-dalek`, `generic-array`,
-  `libc`, `proc-macro2`, `quote`, and `thiserror`. All six were already in
-  the graph.
+- Ten packages carry a build script: `curve25519-dalek`, `generic-array`,
+  `libc`, `libm`, `num-bigint-dig`, `num-traits`, `proc-macro2`, `quote`,
+  `thiserror`, and `zerocopy`. All ten were already in the graph.
 - Every license in the graph is permissive by the rule in "Requirement:
-  permissive licenses only". With `--target all`, 16 packages state
-  `MIT OR Apache-2.0`, 9 state `Apache-2.0 OR MIT`, `generic-array` and the
-  three workspace crates state `MIT`, `curve25519-dalek`, `ed25519-dalek`,
-  and `subtle` state `BSD-3-Clause`, `curve25519-dalek-derive` and
+  permissive licenses only". With `--target all`, 28 packages state
+  `MIT OR Apache-2.0`, 20 state `Apache-2.0 OR MIT`, `generic-array`,
+  `libm`, `spin`, and the three workspace crates state `MIT`,
+  `curve25519-dalek`, `ed25519-dalek`, and `subtle` state `BSD-3-Clause`,
+  `curve25519-dalek-derive`, `ff`, `group`, `num-bigint-dig`, and
   `version_check` state the legacy `MIT/Apache-2.0` form the CI license
-  guard normalizes, `adler2` states `0BSD OR MIT OR Apache-2.0`,
-  `miniz_oxide` states `MIT OR Zlib OR Apache-2.0`, `fiat-crypto` states
-  `MIT OR Apache-2.0 OR BSD-1-Clause`, and `unicode-ident` states
-  `(MIT OR Apache-2.0) AND Unicode-3.0`.
+  guard normalizes, `zerocopy` and `zerocopy-derive` state
+  `BSD-2-Clause OR Apache-2.0 OR MIT`, `adler2` states
+  `0BSD OR MIT OR Apache-2.0`, `miniz_oxide` states
+  `MIT OR Zlib OR Apache-2.0`, `fiat-crypto` states
+  `MIT OR Apache-2.0 OR BSD-1-Clause`, `wasi` states
+  `Apache-2.0 WITH LLVM-exception OR Apache-2.0 OR MIT`, and
+  `unicode-ident` states `(MIT OR Apache-2.0) AND Unicode-3.0`.
 - The highest minimum supported Rust version in the graph is 1.85, stated
   by `base64ct` and `zeroize`. `ed25519-dalek` states 1.81 and `ed25519`
   states 1.60. The workspace pins 1.92, so the requirement holds.
@@ -749,7 +757,7 @@ dependency graph.
   A rebuild of the first tree gives the same byte count.
 
 `x509-cert` 0.2.5 is also authorized for `crates/ostrya-sign`, as an
-optional dependency behind the feature `sign-x509`. It decodes the
+optional dependency behind the feature `x509`. It decodes the
 certificates of `SpkiSigner::with_certificates` and
 `SpkiVerifier::from_certificates`, which read the SubjectPublicKeyInfo of a
 certificate. The unit tests build test certificates with its types.
@@ -757,14 +765,12 @@ certificate. The unit tests build test certificates with its types.
 - `default-features = false` is mandatory, and no feature is turned on.
 - In a build of `ostrya-sign`, the crate turns on the features `derive` and
   `flagset` of `der` and the feature `db` of `const-oid`.
-- A build of `ostrya-sign` with `sign-x509` and `sign-spki-rsa` holds 57
-  packages under 57 distinct names on the host target, measured with
-  `cargo tree -p ostrya-sign --no-default-features --features
-  sign-x509,sign-spki-rsa -e normal,build`. With `--target all` it holds 60.
-  Against a build with `sign-spki-rsa` alone, the build adds `x509-cert`
-  0.2.5, `der_derive` 0.7.3, and `flagset` 0.4.7. A build with one other key
-  feature adds the same three packages. A build with `sign-x509` alone also
-  adds `der`, `spki`, and `const-oid`.
+- A build of `ostrya-sign` with `x509` and `spki` holds 69 packages under 69
+  distinct names on the host target, measured with `cargo tree -p
+  ostrya-sign --no-default-features --features x509,spki -e normal,build`.
+  With `--target all` it holds 72. Against a build with `spki` alone, the
+  build adds `x509-cert` 0.2.5, `der_derive` 0.7.3, and `flagset` 0.4.7. A
+  build with `x509` alone also adds `der`, `spki`, and `const-oid`.
 - No package in the graph declares a `links` key, and no package name in it
   ends in `-sys`. The three packages carry no build script.
 - `x509-cert` and `der_derive` state `Apache-2.0 OR MIT`, and `flagset`

@@ -578,11 +578,6 @@ mod tests {
         assert!(outcome.signatures[0].key_missing);
     }
 
-    #[cfg(all(
-        feature = "sign-spki-p256",
-        feature = "sign-spki-p384",
-        feature = "sign-spki-rsa"
-    ))]
     #[test]
     fn a_store_of_the_four_key_types_verifies_a_signature_of_each() {
         // A P-256 key and a P-384 key, base64 of the PKCS#8 DER.

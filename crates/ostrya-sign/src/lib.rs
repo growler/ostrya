@@ -19,7 +19,7 @@
 //! - [`DummySigner`] and [`DummyVerifier`] are the dummy engine for tests.
 //! - [`append_signature`] adds a signature to a detached-metadata dict.
 //! - [`read_key_file`] reads a key file, and [`SignKeys`] holds the keys.
-//! - `X509Signer`, with the feature `sign-x509`, is the trait of a signer
+//! - `X509Signer`, with the feature `x509`, is the trait of a signer
 //!   with an X.509 certificate chain, for a CMS signature.
 //! - `GpgVerifier`, with the feature `gpg`, is the GPG verifier.
 //!   `gpg_keyring_keys` lists the keys of a keyring, and `gpg_offered_keys`
@@ -27,37 +27,26 @@
 //!
 //! # Features
 //!
-//! - `smol` (default): with `sign-gpg`, `GpgSigner` runs `gpg` on `smol`.
-//! - `tokio`: with `sign-gpg`, `GpgSigner` runs `gpg` on `tokio`.
-//! - `sign-spki`: the spki engine with each of its key types. It turns on
-//!   `sign-spki-p256`, `sign-spki-p384`, `sign-spki-ed25519`, and
-//!   `sign-spki-rsa`.
-//! - `sign-spki-p256`: the spki engine with the ECDSA P-256 key type. The
-//!   engine is `SpkiSigner` and `SpkiVerifier`, `spki_public_keys`, which
-//!   reads the keys of a public key file, `spki_secret_keys`, which reads the
-//!   signers of a PEM secret key file, and `spki_secret_key_lines`, which
-//!   reads the signers of a file of base64 key lines.
-//! - `sign-spki-p384`: the spki engine with the ECDSA P-384 key type, ECDSA
-//!   signatures with SHA-256. The engine has the items of `sign-spki-p256`.
-//! - `sign-spki-ed25519`: the spki engine with the Ed25519 key type, pure
-//!   Ed25519 signatures of RFC 8032. The engine has the items of
-//!   `sign-spki-p256`. The ed25519 engine needs no feature.
-//! - `sign-spki-rsa`: the spki engine with the RSA key type, PKCS#1 v1.5
-//!   signatures with SHA-256. The engine has the items of `sign-spki-p256`.
-//!   A build without one of the four key features refuses a key of that
-//!   type, with a message that names its feature.
+//! - `smol` (default): with `gpg-sign`, `GpgSigner` runs `gpg` on `smol`.
+//! - `tokio`: with `gpg-sign`, `GpgSigner` runs `gpg` on `tokio`.
+//! - `spki`: the spki engine with each of its key types: ECDSA P-256, ECDSA
+//!   P-384 with SHA-256, pure Ed25519 of RFC 8032, and RSA PKCS#1 v1.5 with
+//!   SHA-256. The engine is `SpkiSigner` and `SpkiVerifier`,
+//!   `spki_public_keys`, which reads the keys of a public key file,
+//!   `spki_secret_keys`, which reads the signers of a PEM secret key file,
+//!   and `spki_secret_key_lines`, which reads the signers of a file of base64
+//!   key lines. The ed25519 engine needs no feature.
 //! - `gpg`: `GpgVerifier`, which verifies GPG signatures in the process
 //!   with rPGP, and the keyring functions `gpg_keyring_keys`,
 //!   `gpg_offered_keys`, and `gpg_merge_keyring`, with `GpgKey`,
 //!   `GpgOfferedKeys`, and `MAX_KEYRING`. The feature holds no runtime.
-//! - `sign-gpg`: `GpgSigner`, which signs with the `gpg` command. It does
+//! - `gpg-sign`: `GpgSigner`, which signs with the `gpg` command. It does
 //!   not turn on `gpg`.
-//! - `sign-x509`: the trait `X509Signer`. With `sign-spki-p256`,
-//!   `sign-spki-p384`, or `sign-spki-rsa`, also `X509SpkiSigner`, the spki
-//!   signer with an X.509 certificate chain, which
-//!   `SpkiSigner::with_certificates` makes. With one of the four key
-//!   features, also `SpkiVerifier::from_certificates`, which trusts the keys
-//!   of X.509 certificates. The feature validates no certificate chain.
+//! - `x509`: the trait `X509Signer`. With `spki`, also `X509SpkiSigner`, the
+//!   spki signer with an X.509 certificate chain, which
+//!   `SpkiSigner::with_certificates` makes, and
+//!   `SpkiVerifier::from_certificates`, which trusts the keys of X.509
+//!   certificates. The feature validates no certificate chain.
 //!
 //! # Examples
 //!
@@ -82,42 +71,20 @@ mod dummy;
 mod ed25519;
 mod engine;
 mod error;
-#[cfg(any(feature = "gpg", feature = "sign-gpg"))]
+#[cfg(any(feature = "gpg", feature = "gpg-sign"))]
 mod gpg;
 mod keys;
 mod metadata;
-#[cfg(any(
-    feature = "sign-spki-p256",
-    feature = "sign-spki-p384",
-    feature = "sign-spki-ed25519",
-    feature = "sign-spki-rsa"
-))]
+#[cfg(feature = "spki")]
 mod pem;
-#[cfg(any(
-    feature = "sign-spki-p256",
-    feature = "sign-spki-p384",
-    feature = "sign-spki-ed25519",
-    feature = "sign-spki-rsa"
-))]
+#[cfg(feature = "spki")]
 mod spki;
-#[cfg(feature = "sign-x509")]
+#[cfg(feature = "x509")]
 mod x509;
 
-#[cfg(all(
-    feature = "sign-x509",
-    any(
-        feature = "sign-spki-p256",
-        feature = "sign-spki-p384",
-        feature = "sign-spki-rsa"
-    )
-))]
+#[cfg(all(feature = "x509", feature = "spki"))]
 pub use self::spki::X509SpkiSigner;
-#[cfg(any(
-    feature = "sign-spki-p256",
-    feature = "sign-spki-p384",
-    feature = "sign-spki-ed25519",
-    feature = "sign-spki-rsa"
-))]
+#[cfg(feature = "spki")]
 pub use self::spki::{
     SpkiSigner, SpkiVerifier, spki_public_keys, spki_secret_key_lines, spki_secret_keys,
 };
@@ -125,7 +92,7 @@ pub use dummy::{DummySigner, DummyVerifier};
 pub use ed25519::{Ed25519Signer, Ed25519Verifier};
 pub use engine::{SignFuture, SignatureInfo, Signer, Verifier, VerifyOutcome};
 pub use error::{Error, Result};
-#[cfg(feature = "sign-gpg")]
+#[cfg(feature = "gpg-sign")]
 pub use gpg::GpgSigner;
 #[cfg(feature = "gpg")]
 pub use gpg::{
@@ -134,7 +101,7 @@ pub use gpg::{
 };
 pub use keys::{MAX_KEY_FILE, SignKeys, key_text, read_key_file, read_key_source};
 pub use metadata::append_signature;
-#[cfg(feature = "sign-x509")]
+#[cfg(feature = "x509")]
 pub use x509::X509Signer;
 
 // The public types of this crate are `Send + Sync`, so they can move across
@@ -154,30 +121,13 @@ const _: fn() = || {
     assert_send_sync::<SignatureInfo>();
     assert_send_sync::<SignKeys>();
     assert_send_sync::<Error>();
-    #[cfg(any(
-        feature = "sign-spki-p256",
-        feature = "sign-spki-p384",
-        feature = "sign-spki-ed25519",
-        feature = "sign-spki-rsa"
-    ))]
+    #[cfg(feature = "spki")]
     assert_send_sync::<SpkiSigner>();
-    #[cfg(any(
-        feature = "sign-spki-p256",
-        feature = "sign-spki-p384",
-        feature = "sign-spki-ed25519",
-        feature = "sign-spki-rsa"
-    ))]
+    #[cfg(feature = "spki")]
     assert_send_sync::<SpkiVerifier>();
-    #[cfg(all(
-        feature = "sign-x509",
-        any(
-            feature = "sign-spki-p256",
-            feature = "sign-spki-p384",
-            feature = "sign-spki-rsa"
-        )
-    ))]
+    #[cfg(all(feature = "x509", feature = "spki"))]
     assert_send_sync::<X509SpkiSigner>();
-    #[cfg(feature = "sign-gpg")]
+    #[cfg(feature = "gpg-sign")]
     assert_send_sync::<GpgSigner>();
     #[cfg(feature = "gpg")]
     assert_send_sync::<GpgVerifier>();
@@ -185,6 +135,6 @@ const _: fn() = || {
     assert_send_sync::<GpgKey>();
     #[cfg(feature = "gpg")]
     assert_send_sync::<GpgOfferedKeys>();
-    #[cfg(feature = "sign-x509")]
+    #[cfg(feature = "x509")]
     let _: Option<&dyn X509Signer> = None;
 };

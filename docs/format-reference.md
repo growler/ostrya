@@ -2073,10 +2073,6 @@ The port refuses these keys:
 
 - a key of another type, for example RSASSA-PSS (1.2.840.113549.1.1.10) or
   Ed448 (1.3.101.113);
-- a key of a type that the build has no code for. A build has the code for
-  P-256 with the feature `sign-spki-p256`, for P-384 with the feature
-  `sign-spki-p384`, for Ed25519 with the feature `sign-spki-ed25519`, and for
-  RSA with the feature `sign-spki-rsa`;
 - an `id-Ed25519` key with a `parameters` field, for example a `NULL`, in a
   SubjectPublicKeyInfo and in a PKCS#8 key;
 - an `rsaEncryption` key with no `parameters` field, or with a value other
@@ -2099,9 +2095,7 @@ The port refuses these keys:
   `ECPrivateKey` in a PKCS#8 key can have no `parameters` field.
 
 A key file, an inline key, or a file of the key store that holds one such key
-is refused whole, also when other keys in it are valid. A file of revoked keys
-that holds a key of a type that the build has no code for is refused, so the
-revocation fails closed.
+is refused whole, also when other keys in it are valid.
 
 The key store has the layout of the ed25519 store: `trusted.spki`,
 `revoked.spki`, and their `.d` directories under `/etc/ostree` and

@@ -4954,7 +4954,7 @@ fn a_trust_group_checks_the_commits_of_a_pull_over_http() {
         let other = Ed25519Signer::from_base64(OTHER_SECRET_B64).unwrap();
         assert_the_group_checks_the_commits(dir.path(), &ed25519_group(), &own, &other).await;
     });
-    #[cfg(feature = "sign-spki-p256")]
+    #[cfg(feature = "sign-spki")]
     block_on(async {
         use ostrya::SpkiSigner;
 
@@ -5348,7 +5348,7 @@ fn the_trust_group_option_checks_the_commits_of_a_pull_over_http() {
         let other = Ed25519Signer::from_base64(OTHER_SECRET_B64).unwrap();
         assert_the_option_checks_the_commits(dir.path(), &ed25519_group(), &own, &other).await;
     });
-    #[cfg(feature = "sign-spki-p256")]
+    #[cfg(feature = "sign-spki")]
     block_on(async {
         use ostrya::SpkiSigner;
 

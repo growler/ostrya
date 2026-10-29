@@ -22,24 +22,13 @@ tokio = [
     "ostrya-fetch/tokio",
     "ostrya-remote/tokio",
 ]
-# One feature for each key type of the spki engine.
-sign-spki-p256 = ["ostrya-sign/sign-spki-p256"]
-sign-spki-p384 = ["ostrya-sign/sign-spki-p384"]
-sign-spki-ed25519 = ["ostrya-sign/sign-spki-ed25519"]
-sign-spki-rsa = ["ostrya-sign/sign-spki-rsa"]
 # The spki engine with each of its key types.
-sign-spki = [
-    "sign-spki-p256",
-    "sign-spki-p384",
-    "sign-spki-ed25519",
-    "sign-spki-rsa",
-    "ostrya-sign/sign-spki",
-]
+sign-spki = ["ostrya-sign/spki"]
 verify-gpg = ["ostrya-sign/gpg"]
-sign-gpg = ["verify-gpg", "ostrya-sign/sign-gpg"]
-# The trait `X509Signer`, and with the spki key features, the X.509 signer
-# and the X.509 verifier of the spki engine.
-sign-x509 = ["ostrya-sign/sign-x509"]
+sign-gpg = ["verify-gpg", "ostrya-sign/gpg-sign"]
+# The trait `X509Signer`, and with `sign-spki`, the X.509 signer and the
+# X.509 verifier of the spki engine.
+sign-x509 = ["ostrya-sign/x509"]
 # The server side of a push: the receive policy, the checks it makes, and the
 # session over the push wire protocol of ostrya-remote.
 receive = []
@@ -68,12 +57,6 @@ lzma-static = ["liblzma/static"]
 [package.metadata.docs.rs]
 features = ["sign-spki", "verify-gpg", "sign-gpg", "sign-x509", "receive", "push", "s3"]
 rustdoc-args = ["--cfg", "docsrs"]
-
-# The gates of the spki engine take the form `any(feature = ...)` over the key
-# features of the engine, so that each key feature adds one item to each gate.
-# A gate that names one feature is in this form too.
-[lints.clippy]
-non_minimal_cfg = "allow"
 
 [dependencies]
 ostrya-core = { workspace = true }

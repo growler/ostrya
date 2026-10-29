@@ -4770,7 +4770,7 @@ fn spki_signs_and_verifies_with_an_rsa_key() {
         .filter(|line| !line.starts_with("-----"))
         .collect();
 
-    let tmp = TmpDir::new("sign-spki-rsa");
+    let tmp = TmpDir::new("spki-rsa");
     let repo = commit_fixture(tmp.path());
     let repo_arg = format!("--repo={}", repo.to_str().unwrap());
     let keys_file = format!("--keys-file={secret}");
@@ -4934,7 +4934,7 @@ BqrlKGswDGTe+PDqkFWGYGSiVFFUgLwT
 #[cfg(all(feature = "spki", unix))]
 #[test]
 fn spki_signs_and_verifies_with_a_p384_key() {
-    let tmp = TmpDir::new("sign-spki-p384");
+    let tmp = TmpDir::new("spki-p384");
     let base = tmp.path();
     let repo = commit_fixture(base);
     let repo_arg = format!("--repo={}", repo.to_str().unwrap());
@@ -5098,7 +5098,7 @@ MCowBQYDK2VwAyEA11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=
 #[cfg(all(feature = "spki", unix))]
 #[test]
 fn spki_signs_and_verifies_with_an_ed25519_key() {
-    let tmp = TmpDir::new("sign-spki-ed25519");
+    let tmp = TmpDir::new("spki-ed25519");
     let base = tmp.path();
     let repo = commit_fixture(base);
     let repo_arg = format!("--repo={}", repo.to_str().unwrap());
@@ -5183,7 +5183,7 @@ fn spki_refuses_ed25519_keys_that_the_engine_does_not_take() {
 MCwwBwYDK2VwBQADIQDXWpgBgrEKt9VL/tPJZAc6DuFy89qmIyWvAhpo9wdRGg==
 -----END PUBLIC KEY-----
 ";
-    let tmp = TmpDir::new("sign-spki-ed25519-refused");
+    let tmp = TmpDir::new("spki-ed25519-refused");
     let base = tmp.path();
     let repo = commit_fixture(base);
     let repo_arg = format!("--repo={}", repo.to_str().unwrap());

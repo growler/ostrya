@@ -3390,7 +3390,7 @@ fn a_trust_group_checks_the_commits_of_a_local_pull() {
         let other = Ed25519Signer::from_base64(OTHER_SECRET_B64).unwrap();
         assert_the_group_checks_the_commits(base, &ed25519_group(), &own, &other).await;
     });
-    #[cfg(feature = "sign-spki-p256")]
+    #[cfg(feature = "sign-spki")]
     {
         use ostrya::SpkiSigner;
         let base = base.join("spki");
@@ -3408,14 +3408,14 @@ fn a_trust_group_checks_the_commits_of_a_local_pull() {
 }
 
 /// A P-256 secret key, base64 of the PKCS#8 DER.
-#[cfg(feature = "sign-spki-p256")]
+#[cfg(feature = "sign-spki")]
 const SPKI_SECRET_B64: &str = concat!(
     "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg2L708EsnnzHER0SYasMNIUcG",
     "v63QapC/3kVsoPerzKGhRANCAATxfzfHKUPeJtyLTGMUoxHhvBS1NT9guWhUQPGiZRLZIcB8Wc3",
     "csdVU1iOiTRmbZGKJTtekOdEAbVRrx5HxIpst",
 );
 /// A second P-256 secret key, base64 of the PKCS#8 DER.
-#[cfg(feature = "sign-spki-p256")]
+#[cfg(feature = "sign-spki")]
 const SPKI_OTHER_SECRET_B64: &str = concat!(
     "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQgU5tYPz/hTTxfsSTPOxD/H9U+",
     "IkBj5qWV4/H3D1NBfRChRANCAAQPyTr9rh2d6WiYOi3oxNiE3ppTP2g5JP2xX9D7rEKnzixp",
@@ -3810,7 +3810,7 @@ fn the_trust_group_option_checks_the_commits_of_a_local_pull() {
         let other = Ed25519Signer::from_base64(OTHER_SECRET_B64).unwrap();
         assert_the_option_checks_the_commits(base, &ed25519_group(), &own, &other).await;
     });
-    #[cfg(feature = "sign-spki-p256")]
+    #[cfg(feature = "sign-spki")]
     {
         use ostrya::SpkiSigner;
         let base = base.join("spki");

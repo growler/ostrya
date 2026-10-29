@@ -344,25 +344,16 @@ A later ECDSA curve adds these items:
 - a case in the script, with `kind=ecdsa`, its `genpkey` options, and its
   group order in `param`;
 - a `spki/<type>/` directory;
-- a test module under a `cfg` of its key feature, with n/2 of the curve for
-  the s class, and the key feature in the `any()` list of the `cfg` of the
-  test file and of `has_high_s`;
+- a test module, with n/2 of the curve for the s class;
 - a bullet in the fixture layout.
 
-The tests are in `crates/ostrya/tests/sign_spki_fixtures.rs`. The `cfg` of
-the file is an `any()` list of the key features. The tests of each key type
-are in one module, `p256`, `p384`, `ed25519`, or `rsa`, under the `cfg` of
-its key feature. The items that the modules share are at the top level of
-the file. Run the tests of each key type with its key feature:
+The tests are in `crates/ostrya/tests/sign_spki_fixtures.rs`, under the
+`cfg` of the feature `sign-spki`. The tests of each key type are in one
+module, `p256`, `p384`, `ed25519`, or `rsa`. The items that the modules
+share are at the top level of the file. Run the tests:
 
 ```sh
-cargo test -p ostrya --no-default-features --features smol,sign-spki-p256 \
-    --test sign_spki_fixtures
-cargo test -p ostrya --no-default-features --features smol,sign-spki-p384 \
-    --test sign_spki_fixtures
-cargo test -p ostrya --no-default-features --features smol,sign-spki-ed25519 \
-    --test sign_spki_fixtures
-cargo test -p ostrya --no-default-features --features smol,sign-spki-rsa \
+cargo test -p ostrya --no-default-features --features smol,sign-spki \
     --test sign_spki_fixtures
 ```
 

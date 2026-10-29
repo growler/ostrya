@@ -594,7 +594,6 @@ mod tests {
         );
     }
 
-    #[cfg(all(feature = "sign-spki-p256", feature = "sign-spki-rsa"))]
     #[test]
     fn a_store_of_p256_p384_and_rsa_keys_verifies_a_signature_of_each() {
         // A P-256 key, base64 of the PKCS#8 DER.

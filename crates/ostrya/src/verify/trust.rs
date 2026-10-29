@@ -375,13 +375,7 @@ pub(crate) fn check_trust(keyfile: &KeyFile, group: &str) -> Result<()> {
     // only in a build that has it.
     let names_spki = matches!(&sign, SignVerify::Engines(names) if names.iter().any(|n| n == "spki"))
         || engine_keys.iter().any(|(_, engine)| *engine == "spki");
-    if cfg!(not(any(
-        feature = "sign-spki-p256",
-        feature = "sign-spki-p384",
-        feature = "sign-spki-ed25519",
-        feature = "sign-spki-rsa"
-    ))) && names_spki
-    {
+    if cfg!(not(feature = "sign-spki")) && names_spki {
         return Err(Error::Unsupported(format!(
             "[{group}] names the spki engine, which this build has no engine for; \
              build with the sign-spki feature"

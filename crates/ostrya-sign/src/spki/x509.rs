@@ -9,43 +9,27 @@ use der::Decode;
 use der::referenced::OwnedToRef;
 use x509_cert::Certificate;
 
-use super::{Public, SpkiVerifier, TrustedKey, decode_public_key_info, labeled_blocks, refuse};
-#[cfg(any(
-    feature = "sign-spki-p256",
-    feature = "sign-spki-p384",
-    feature = "sign-spki-rsa"
-))]
-use super::{Secret, SpkiSigner};
-use crate::{Error, Result};
-#[cfg(any(
-    feature = "sign-spki-p256",
-    feature = "sign-spki-p384",
-    feature = "sign-spki-rsa"
-))]
-use crate::{SignFuture, Signer, X509Signer};
+use super::{
+    Public, Secret, SpkiSigner, SpkiVerifier, TrustedKey, decode_public_key_info, labeled_blocks,
+    refuse,
+};
+use crate::{Error, Result, SignFuture, Signer, X509Signer};
 
 /// The label of the PEM blocks of a certificate.
 const CERTIFICATE_LABEL: &[u8] = b"CERTIFICATE";
 
 /// The `AlgorithmIdentifier` DER of an RSA signature: `rsaEncryption`
 /// (1.2.840.113549.1.1.1) with `NULL` parameters.
-#[cfg(feature = "sign-spki-rsa")]
 const RSA_SIGNATURE: &[u8] = &[
     0x30, 0x0d, 0x06, 0x09, 0x2a, 0x86, 0x48, 0x86, 0xf7, 0x0d, 0x01, 0x01, 0x01, 0x05, 0x00,
 ];
 /// The `AlgorithmIdentifier` DER of an ECDSA signature: `ecdsa-with-SHA256`
 /// (1.2.840.10045.4.3.2) with no parameters.
-#[cfg(any(feature = "sign-spki-p256", feature = "sign-spki-p384"))]
 const ECDSA_SIGNATURE: &[u8] = &[
     0x30, 0x0a, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x04, 0x03, 0x02,
 ];
 /// The `AlgorithmIdentifier` DER of the digest: SHA-256
 /// (2.16.840.1.101.3.4.2.1) with `NULL` parameters.
-#[cfg(any(
-    feature = "sign-spki-p256",
-    feature = "sign-spki-p384",
-    feature = "sign-spki-rsa"
-))]
 const SHA256_DIGEST: &[u8] = &[
     0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01, 0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00,
 ];
@@ -74,11 +58,6 @@ const SHA256_DIGEST: &[u8] = &[
 ///
 /// The signature of an RSA key is the raw PKCS#1 v1.5 signature, and the
 /// signature of an ECDSA key is a DER `SEQUENCE` of `r` and `s`.
-#[cfg(any(
-    feature = "sign-spki-p256",
-    feature = "sign-spki-p384",
-    feature = "sign-spki-rsa"
-))]
 #[derive(Clone)]
 pub struct X509SpkiSigner {
     signer: SpkiSigner,
@@ -86,11 +65,6 @@ pub struct X509SpkiSigner {
     signature_algorithm: &'static [u8],
 }
 
-#[cfg(any(
-    feature = "sign-spki-p256",
-    feature = "sign-spki-p384",
-    feature = "sign-spki-rsa"
-))]
 impl X509SpkiSigner {
     /// Returns the SubjectPublicKeyInfo DER of the public key of this signer.
     ///
@@ -100,11 +74,6 @@ impl X509SpkiSigner {
     }
 }
 
-#[cfg(any(
-    feature = "sign-spki-p256",
-    feature = "sign-spki-p384",
-    feature = "sign-spki-rsa"
-))]
 impl Signer for X509SpkiSigner {
     fn name(&self) -> &str {
         self.signer.name()
@@ -119,11 +88,6 @@ impl Signer for X509SpkiSigner {
     }
 }
 
-#[cfg(any(
-    feature = "sign-spki-p256",
-    feature = "sign-spki-p384",
-    feature = "sign-spki-rsa"
-))]
 impl X509Signer for X509SpkiSigner {
     fn certificates(&self) -> &[Vec<u8>] {
         &self.certificates
@@ -138,11 +102,6 @@ impl X509Signer for X509SpkiSigner {
     }
 }
 
-#[cfg(any(
-    feature = "sign-spki-p256",
-    feature = "sign-spki-p384",
-    feature = "sign-spki-rsa"
-))]
 impl SpkiSigner {
     /// Gives this signer an X.509 certificate chain.
     ///
@@ -180,13 +139,9 @@ impl SpkiSigner {
         I::Item: AsRef<[u8]>,
     {
         let signature_algorithm = match self.key {
-            #[cfg(feature = "sign-spki-p256")]
             Secret::P256(_) => ECDSA_SIGNATURE,
-            #[cfg(feature = "sign-spki-p384")]
             Secret::P384(_) => ECDSA_SIGNATURE,
-            #[cfg(feature = "sign-spki-rsa")]
             Secret::Rsa(_) => RSA_SIGNATURE,
-            #[cfg(feature = "sign-spki-ed25519")]
             Secret::Ed25519(_) => {
                 return Err(Error::Signature(
                     "spki certificate: an Ed25519 key takes no X.509 signer".into(),
@@ -461,36 +416,46 @@ mod tests {
         );
     }
 
-    #[cfg(not(feature = "sign-spki-p256"))]
     #[test]
-    fn a_key_type_outside_the_build_refuses_the_input() {
+    fn a_certificate_of_a_refused_key_refuses_the_input() {
+        // Returns `server.pem` with the SubjectPublicKeyInfo of the algorithm
+        // `oid`, with no parameters, and the public key `key`.
+        let with_key = |oid: &str, key: &[u8]| -> Vec<u8> {
+            let mut certificate = Certificate::from_der(&der_of(tls!("server.pem"))).unwrap();
+            certificate.tbs_certificate.subject_public_key_info = SubjectPublicKeyInfoOwned {
+                algorithm: AlgorithmIdentifierOwned {
+                    oid: ObjectIdentifier::new_unwrap(oid),
+                    parameters: None,
+                },
+                subject_public_key: BitString::from_bytes(key).unwrap(),
+            };
+            certificate.to_der().unwrap()
+        };
+        let ed448 = with_key("1.3.101.113", &[7; 57]);
         assert_eq!(
-            message(SpkiVerifier::from_certificates([tls!("server.pem")])),
-            "spki certificate 1: this build has no code for the curve P-256; build with the \
-             sign-spki-p256 feature"
+            message(SpkiVerifier::from_certificates([
+                der_of(tls!("server.pem")),
+                ed448.clone()
+            ])),
+            "spki certificate 2: the key type Ed448 is not supported"
         );
-        // A certificate of a key type in the build does not make the input
-        // valid.
-        #[cfg(feature = "sign-spki-rsa")]
-        {
-            let pem = include_str!("../../../../tests/fixtures/spki/keys/rsa-2048.pem");
-            let signer = crate::spki_secret_keys(pem.as_bytes().to_vec(), "k")
-                .unwrap()
-                .remove(0);
-            let rsa = certificate(&signer, "1.2.840.113549.1.1.11");
-            assert!(SpkiVerifier::from_certificates([&rsa]).is_ok());
-            assert_eq!(
-                message(SpkiVerifier::from_certificates([
-                    rsa.as_slice(),
-                    tls!("server.pem").as_bytes()
-                ])),
-                "spki certificate 2: this build has no code for the curve P-256; build with the \
-                 sign-spki-p256 feature"
-            );
-        }
+        assert_eq!(
+            message(SpkiVerifier::from_certificates([
+                ed448,
+                der_of(tls!("server.pem"))
+            ])),
+            "spki certificate 1: the key type Ed448 is not supported"
+        );
+        // An Ed25519 key of 31 bytes is not in the form of the key type.
+        assert_eq!(
+            message(SpkiVerifier::from_certificates([
+                der_of(tls!("ca.pem")),
+                with_key("1.3.101.112", &[7; 31])
+            ])),
+            "spki certificate 2: the certificate holds no valid public key"
+        );
     }
 
-    #[cfg(feature = "sign-spki-p256")]
     #[test]
     fn a_signer_takes_its_certificate_chain_in_order() {
         let signer = crate::spki_secret_keys(tls!("server.key.pem").as_bytes().to_vec(), "k")
@@ -517,7 +482,6 @@ mod tests {
         assert_eq!(x509.certificates().len(), 2);
     }
 
-    #[cfg(feature = "sign-spki-p256")]
     #[test]
     fn a_signer_compares_the_decoded_key_of_its_certificate() {
         let signer = crate::spki_secret_keys(tls!("server.key.pem").as_bytes().to_vec(), "k")
@@ -538,7 +502,6 @@ mod tests {
         assert_eq!(x509.certificates(), [compressed]);
     }
 
-    #[cfg(feature = "sign-spki-p256")]
     #[test]
     fn a_signer_refuses_a_certificate_of_another_key() {
         let signer = crate::spki_secret_keys(tls!("server.key.pem").as_bytes().to_vec(), "k")
@@ -567,7 +530,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "sign-spki-p256")]
     #[test]
     fn the_key_of_a_certificate_is_the_trusted_key() {
         let signer = crate::spki_secret_keys(tls!("server.key.pem").as_bytes().to_vec(), "k")
@@ -598,11 +560,6 @@ mod tests {
         assert!(!outcome(&ca, b"data", &signature).valid);
     }
 
-    #[cfg(any(
-        feature = "sign-spki-p256",
-        feature = "sign-spki-p384",
-        feature = "sign-spki-rsa"
-    ))]
     #[test]
     fn the_digest_algorithm_is_sha256_with_null_parameters() {
         let algorithm = x509_cert::spki::AlgorithmIdentifierRef::from_der(SHA256_DIGEST).unwrap();
@@ -613,7 +570,6 @@ mod tests {
         assert_eq!(algorithm.parameters, Some(der::asn1::AnyRef::NULL));
     }
 
-    #[cfg(feature = "sign-spki-p384")]
     #[test]
     fn a_p384_signer_gives_the_ecdsa_with_sha256_identifier() {
         let signer = SpkiSigner {
@@ -650,7 +606,6 @@ mod tests {
         assert_eq!(info.pubkey_algorithm.as_deref(), Some("p384"));
     }
 
-    #[cfg(feature = "sign-spki-rsa")]
     #[test]
     fn an_rsa_signer_signs_the_test_vector() {
         let data = include_bytes!("../../../../tests/fixtures/spki/keys/vector.data");
@@ -684,7 +639,6 @@ mod tests {
         assert_eq!(info.pubkey_algorithm.as_deref(), Some("rsa"));
     }
 
-    #[cfg(feature = "sign-spki-ed25519")]
     #[test]
     fn an_ed25519_certificate_is_trusted() {
         let signer = SpkiSigner {
@@ -707,11 +661,6 @@ mod tests {
         assert!(info.valid);
         assert_eq!(info.pubkey_algorithm.as_deref(), Some("ed25519"));
         assert_eq!(info.fingerprint, want.fingerprint);
-        #[cfg(any(
-            feature = "sign-spki-p256",
-            feature = "sign-spki-p384",
-            feature = "sign-spki-rsa"
-        ))]
         assert_eq!(
             message(signer.with_certificates([&certificate])),
             "spki certificate: an Ed25519 key takes no X.509 signer"

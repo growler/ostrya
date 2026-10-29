@@ -3,7 +3,7 @@
 //!
 //! The key is the key of test 1 in RFC 8032. No test makes a key.
 
-#![cfg(feature = "sign-spki-ed25519")]
+#![cfg(feature = "sign-spki")]
 
 mod common;
 
@@ -41,30 +41,7 @@ MCowBQYDK2VwAyEA11qYAYKxCrfVS/7TyWQHOg7hcvPapiMlrwIaaPcHURo=\n\
 /// The lowercase hex SHA-256 of the SubjectPublicKeyInfo DER of the key.
 const FINGERPRINT: &str = "06e3fd8fda29bb60ab59557de61edb0aecdb231134be30e75b455f8e1b792fa9";
 
-/// A P-256 public key in a PEM `PUBLIC KEY` block.
-#[cfg(not(any(
-    feature = "sign-spki-p256",
-    feature = "sign-spki-p384",
-    feature = "sign-spki-rsa"
-)))]
-const P256_PUBLIC_PEM: &str = "-----BEGIN PUBLIC KEY-----\n\
-MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE8X83xylD3ibci0xjFKMR4bwUtTU/\n\
-YLloVEDxomUS2SHAfFnN3LHVVNYjok0Zm2RiiU7XpDnRAG1Ua8eR8SKbLQ==\n\
------END PUBLIC KEY-----\n";
-
 /// The P-384 key of RFC 6979, appendix A.2.6, in a PEM `PUBLIC KEY` block.
-#[cfg(any(
-    all(
-        feature = "sign-spki-p256",
-        feature = "sign-spki-p384",
-        feature = "sign-spki-rsa"
-    ),
-    not(any(
-        feature = "sign-spki-p256",
-        feature = "sign-spki-p384",
-        feature = "sign-spki-rsa"
-    ))
-))]
 const P384_PUBLIC_PEM: &str = "-----BEGIN PUBLIC KEY-----\n\
 MHYwEAYHKoZIzj0CAQYFK4EEACIDYgAE7DpOQVtOGaRWhhgCn0J/pdqai8SukuAu\n\
 BqrlKGswDGTe+PDqkFWGYGSiVFFUgLwTgBXZty19VyROqO+awMYhiWcIpZNn+d+5\n\
@@ -72,18 +49,6 @@ BqrlKGswDGTe+PDqkFWGYGSiVFFUgLwTgBXZty19VyROqO+awMYhiWcIpZNn+d+5\n\
 -----END PUBLIC KEY-----\n";
 
 /// Returns the path of the key fixture file `name`.
-#[cfg(any(
-    all(
-        feature = "sign-spki-p256",
-        feature = "sign-spki-p384",
-        feature = "sign-spki-rsa"
-    ),
-    not(any(
-        feature = "sign-spki-p256",
-        feature = "sign-spki-p384",
-        feature = "sign-spki-rsa"
-    ))
-))]
 fn key_path(name: &str) -> PathBuf {
     common::fixture_root().join("../spki/keys").join(name)
 }
@@ -279,11 +244,6 @@ fn the_ed25519_engine_and_the_spki_engine_sign_with_the_same_bytes() {
     });
 }
 
-#[cfg(all(
-    feature = "sign-spki-p256",
-    feature = "sign-spki-p384",
-    feature = "sign-spki-rsa"
-))]
 #[test]
 fn a_key_store_of_the_four_key_types_verifies_a_commit_of_each() {
     let tmp = TmpDir::new("spki-ed25519-mixed");
@@ -336,68 +296,5 @@ YLloVEDxomUS2SHAfFnN3LHVVNYjok0Zm2RiiU7XpDnRAG1Ua8eR8SKbLQ==\n\
                 Some(algorithm)
             );
         }
-    });
-}
-
-#[cfg(not(any(
-    feature = "sign-spki-p256",
-    feature = "sign-spki-p384",
-    feature = "sign-spki-rsa"
-)))]
-#[test]
-fn a_build_with_ed25519_alone_refuses_the_other_key_types_and_verifies_an_ed25519_key() {
-    let tmp = TmpDir::new("spki-ed25519-alone");
-    let base = tmp.path();
-    let rsa_public = std::fs::read_to_string(key_path("rsa-2048.pub.pem")).unwrap();
-    for (name, text, reason) in [
-        (
-            "p256",
-            P256_PUBLIC_PEM,
-            "this build has no code for the curve P-256; build with the sign-spki-p256 feature",
-        ),
-        (
-            "p384",
-            P384_PUBLIC_PEM,
-            "this build has no code for the curve P-384; build with the sign-spki-p384 feature",
-        ),
-        (
-            "rsa",
-            rsa_public.as_str(),
-            "this build has no code for the key type RSA; build with the sign-spki-rsa feature",
-        ),
-    ] {
-        // The key in `trusted.spki`, and the key in `revoked.spki`, which
-        // fails the store closed.
-        for (dir, file) in [
-            (store(base, name, text, None), "trusted.spki"),
-            (
-                store(base, &format!("revoked-{name}"), PUBLIC_PEM, Some(text)),
-                "revoked.spki",
-            ),
-        ] {
-            match load_sign_keys_from(&[dir.as_path()], "spki").unwrap_err() {
-                ostrya::Error::Signature(m) => assert_eq!(
-                    m,
-                    format!(
-                        "the key file '{}', line 1: {reason}",
-                        dir.join(file).display()
-                    )
-                ),
-                other => panic!("not a signature error: {other}"),
-            }
-        }
-    }
-
-    let dir = store(base, "ed25519", PUBLIC_PEM, None);
-    block_on(async {
-        let (repo, commit) = build_committed_repo(base).await;
-        let signer = SpkiSigner::from_base64(SECRET_PKCS8_V1_B64).unwrap();
-        repo.sign_commit(&commit, &signer).await.unwrap();
-        assert!(
-            repo.verify_commit(&commit, &[Arc::new(store_verifier(&dir))])
-                .await
-                .unwrap()
-                .valid
-        );
     });
 }

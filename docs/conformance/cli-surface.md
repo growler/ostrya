@@ -3926,14 +3926,9 @@ read as a `--keys-file` of `--verify`. Twenty-one differences stand.
   signature: spki public key: the key type <name> is not supported` or
   `error: signature: spki public key: the curve <name> is not supported`,
   and with `spki secret key` for a secret key. `<name>` is a name such as
-  `RSASSA-PSS`, `Ed448`, or `P-521`, or the dotted OID. A build of the port
-  without the code of a key type refuses a key of that type the same way,
-  with the reason `this build has no code for the key type RSA; build with
-  the sign-spki-rsa feature`, `this build has no code for the key type
-  Ed25519; build with the sign-spki-ed25519 feature`, `this build has no code
-  for the curve P-256; build with the sign-spki-p256 feature`, or `this build
-  has no code for the curve P-384; build with the sign-spki-p384 feature`.
-  The `ostrya` command carries the four key types. A key file and a key-store file give the reason after `error:
+  `RSASSA-PSS`, `Ed448`, or `P-521`, or the dotted OID. The `ostrya`
+  command carries the four key types. A key file and a key-store file give
+  the reason after `error:
   signature: the key file '<path>', line <n>: `, also when the other blocks
   of the file are valid. A line of the `--keys-file` of `static-delta
   generate` gives the reason after `error: signature: the key file '<path>',

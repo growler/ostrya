@@ -669,12 +669,7 @@ fn signing_items_resolve_at_their_public_paths() {
 
     fn from_system_keys<T: FromSystemKeys + ostrya::FromSystemKeys>() {}
     from_system_keys::<Ed25519Verifier>();
-    #[cfg(any(
-        feature = "sign-spki-p256",
-        feature = "sign-spki-p384",
-        feature = "sign-spki-ed25519",
-        feature = "sign-spki-rsa"
-    ))]
+    #[cfg(feature = "sign-spki")]
     from_system_keys::<ostrya::spki::SpkiVerifier>();
 
     let signer: Box<dyn ostrya::Signer> = Box::new(DummySigner::new("key"));
@@ -705,7 +700,7 @@ fn signing_items_resolve_at_their_public_paths() {
         "{err}"
     );
 
-    #[cfg(feature = "sign-spki-p256")]
+    #[cfg(feature = "sign-spki")]
     {
         // A P-256 secret key, base64 of the PKCS#8 DER.
         let signer = ostrya::spki::SpkiSigner::from_base64(concat!(

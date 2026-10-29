@@ -43,14 +43,10 @@
 //! # Features
 //! - `smol` (default): the `smol` backend of `ostrya-rt`.
 //! - `tokio`: the `tokio` backend of `ostrya-rt`.
-//! - `sign-spki`: the `spki` module, the spki signing engine with each of its key types. It turns on `sign-spki-p256`, `sign-spki-p384`, `sign-spki-ed25519`, and `sign-spki-rsa`.
-//! - `sign-spki-p256`: the `spki` module with the ECDSA P-256 key type.
-//! - `sign-spki-p384`: the `spki` module with the ECDSA P-384 key type.
-//! - `sign-spki-ed25519`: the `spki` module with the Ed25519 key type.
-//! - `sign-spki-rsa`: the `spki` module with the RSA key type. A build without one of the four key features refuses a key of that type.
+//! - `sign-spki`: the `spki` module, the spki signing engine with each of its key types: ECDSA P-256, ECDSA P-384, Ed25519, and RSA. It turns on the feature `spki` of `ostrya-sign`.
 //! - `verify-gpg`: the `gpg` module: the GPG verifier of `ostrya-sign` with the trait `FromOstreeKeyrings`, which reads the ostree keyring paths, and the keyring management of a remote. It turns on the feature `gpg` of `ostrya-sign`.
 //! - `sign-gpg`: `GpgSigner`, which signs with the `gpg` command. It turns on `verify-gpg`.
-//! - `sign-x509`: `X509Signer`, the trait of a signer with an X.509 certificate chain for a CMS signature. With `sign-spki-p256`, `sign-spki-p384`, or `sign-spki-rsa`, also `X509SpkiSigner` and `SpkiSigner::with_certificates`. With one of the four key features, also `SpkiVerifier::from_certificates`.
+//! - `sign-x509`: `X509Signer`, the trait of a signer with an X.509 certificate chain for a CMS signature. With `sign-spki`, also `X509SpkiSigner`, `SpkiSigner::with_certificates`, and `SpkiVerifier::from_certificates`.
 //! - `receive`: the `receive` module, the receive side of a push.
 //! - `push`: `Repo::push`, `Repo::push_onto`, and `Repo::export_stream`, the push from a repository.
 //! - `s3`: the pull from a bucket repository at an `s3://` address and the pull of collection refs from one, the `bucket` module with the fsck, the prune, and the summary update of a bucket repository, the `s3` module of `ostrya-remote`, and with `push`, the push of commits and of a local directory to a bucket repository.
@@ -112,23 +108,11 @@ mod send;
 #[cfg(any(feature = "receive", all(feature = "push", feature = "s3")))]
 mod server_commit;
 pub mod sign;
-#[cfg(any(
-    feature = "sign-spki-p256",
-    feature = "sign-spki-p384",
-    feature = "sign-spki-ed25519",
-    feature = "sign-spki-rsa"
-))]
+#[cfg(feature = "sign-spki")]
 pub mod spki {
     //! The spki signing engine: ECDSA P-256 and P-384, Ed25519, and RSA
     //! PKCS#1 v1.5 signatures, with SPKI public keys.
-    #[cfg(all(
-        feature = "sign-x509",
-        any(
-            feature = "sign-spki-p256",
-            feature = "sign-spki-p384",
-            feature = "sign-spki-rsa"
-        )
-    ))]
+    #[cfg(feature = "sign-x509")]
     pub use ostrya_sign::X509SpkiSigner;
     pub use ostrya_sign::{
         SpkiSigner, SpkiVerifier, spki_public_keys, spki_secret_key_lines, spki_secret_keys,
@@ -249,22 +233,10 @@ pub use sign::{
     DummySigner, DummyVerifier, Ed25519Signer, Ed25519Verifier, FromSystemKeys, SignFuture,
     SignKeys, SignatureInfo, Signer, Verifier, VerifyOutcome, load_sign_keys, load_sign_keys_from,
 };
-#[cfg(all(
-    feature = "sign-x509",
-    any(
-        feature = "sign-spki-p256",
-        feature = "sign-spki-p384",
-        feature = "sign-spki-rsa"
-    )
-))]
+#[cfg(all(feature = "sign-x509", feature = "sign-spki"))]
 #[doc(hidden)]
 pub use spki::X509SpkiSigner;
-#[cfg(any(
-    feature = "sign-spki-p256",
-    feature = "sign-spki-p384",
-    feature = "sign-spki-ed25519",
-    feature = "sign-spki-rsa"
-))]
+#[cfg(feature = "sign-spki")]
 #[doc(hidden)]
 pub use spki::{
     SpkiSigner, SpkiVerifier, spki_public_keys, spki_secret_key_lines, spki_secret_keys,

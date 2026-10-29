@@ -15,7 +15,7 @@ use std::sync::Arc;
 use common::TmpDir;
 #[cfg(feature = "verify-gpg")]
 use common::receive::GnupgHome;
-#[cfg(feature = "sign-spki-p256")]
+#[cfg(feature = "sign-spki")]
 use common::wrap_pem;
 use ostrya::access::{AccessModes, AuthItem, Namespace};
 use ostrya::{
@@ -398,19 +398,19 @@ fn an_ed25519_key_group_is_read() {
 }
 
 /// The secret key of the first spki fixture, base64 of a PKCS#8 DER.
-#[cfg(feature = "sign-spki-p256")]
+#[cfg(feature = "sign-spki")]
 const SPKI_SECRET_A: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg2L708EsnnzHER0SYasMNIUcG\
 v63QapC/3kVsoPerzKGhRANCAATxfzfHKUPeJtyLTGMUoxHhvBS1NT9guWhUQPGiZRLZIcB8Wc3\
 csdVU1iOiTRmbZGKJTtekOdEAbVRrx5HxIpst";
 /// The secret key of the second spki fixture, base64 of a PKCS#8 DER.
-#[cfg(feature = "sign-spki-p256")]
+#[cfg(feature = "sign-spki")]
 const SPKI_SECRET_B: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQga/Vn02DKuHPztB29\
 97ybXVngf9XlVRkpxQl0PMHYB2GhRANCAARapiXxcZO+MwxDicFtiWeYWfMDNYF8\
 zlrMtaYLMVD5RNnxfTNPW/JLR8DreWpEAJCsrmwMcsVoL66GqkOOOx1R";
 
 /// Returns the refusal of an spki key group whose secret key file holds
 /// `contents`.
-#[cfg(feature = "sign-spki-p256")]
+#[cfg(feature = "sign-spki")]
 fn spki_key_group_refusal(contents: &str) -> Error {
     let dir = TmpDir::new("receive-signer-spki-bad");
     let file = dir.path().join("secret.spki");
@@ -428,7 +428,7 @@ fn spki_key_group_refusal(contents: &str) -> Error {
 
 /// `from_config` reads an spki key group from PEM `PRIVATE KEY` blocks. Each
 /// block gives one signer, in the order of the file.
-#[cfg(feature = "sign-spki-p256")]
+#[cfg(feature = "sign-spki")]
 #[test]
 fn an_spki_key_group_is_read() {
     use ostrya::Signer as _;
@@ -469,7 +469,7 @@ fn an_spki_key_group_is_read() {
 
 /// `from_config` reads an spki key group of an RSA key from a PEM `PRIVATE
 /// KEY` block. The key signs as the signer of the fixture file.
-#[cfg(feature = "sign-spki-rsa")]
+#[cfg(feature = "sign-spki")]
 #[test]
 fn an_spki_key_group_reads_an_rsa_key() {
     use ostrya::Signer as _;
@@ -499,7 +499,7 @@ fn an_spki_key_group_reads_an_rsa_key() {
 
 /// The `secret-key-file` of an spki key group refuses each file that is not
 /// PEM `PRIVATE KEY` blocks of PKCS#8 keys. Each refusal names the group.
-#[cfg(feature = "sign-spki-p256")]
+#[cfg(feature = "sign-spki")]
 #[test]
 fn an_spki_key_group_file_holds_pem_blocks() {
     let key = wrap_pem("PRIVATE KEY", SPKI_SECRET_A);
@@ -671,22 +671,12 @@ fn a_trust_group_key_no_axis_reads_is_refused() {
     }
     // This case puts an spki key under an axis that selects ed25519 alone.
     let err = refusal(&format!("{}verification-spki-key=AAAA\n", trust_t()));
-    #[cfg(any(
-        feature = "sign-spki-p256",
-        feature = "sign-spki-p384",
-        feature = "sign-spki-ed25519",
-        feature = "sign-spki-rsa"
-    ))]
+    #[cfg(feature = "sign-spki")]
     assert!(
         matches!(&err, Error::InvalidFormat(m) if m.contains("no check reads it")),
         "{err}"
     );
-    #[cfg(not(any(
-        feature = "sign-spki-p256",
-        feature = "sign-spki-p384",
-        feature = "sign-spki-ed25519",
-        feature = "sign-spki-rsa"
-    )))]
+    #[cfg(not(feature = "sign-spki"))]
     assert!(matches!(err, Error::Unsupported(_)), "{err}");
 }
 
@@ -723,7 +713,7 @@ fn a_trust_group_needs_readable_keys() {
 /// The `verification-spki-file` of a trust group holds PEM `PUBLIC KEY`
 /// blocks. A file of base64 lines, and a file with a block of another label,
 /// are refused by their names. An empty file adds no keys.
-#[cfg(feature = "sign-spki-p256")]
+#[cfg(feature = "sign-spki")]
 #[test]
 fn a_trust_group_spki_file_holds_pem_blocks() {
     const SPKI_B64: &str = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE8X83xylD3ibci0xjFKMR4bwUtTU/\
@@ -788,7 +778,7 @@ fn a_trust_group_spki_file_holds_pem_blocks() {
 /// The `verification-spki-key` of a trust group is the base64 of a
 /// SubjectPublicKeyInfo DER. It can hold line breaks as `\n` escapes of the
 /// key file. A SEC1 point and the base64 of the PEM text are refused.
-#[cfg(feature = "sign-spki-p256")]
+#[cfg(feature = "sign-spki")]
 #[test]
 fn a_trust_group_spki_key_is_a_subject_public_key_info() {
     const SPKI_B64: &str = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE8X83xylD3ibci0xjFKMR4bwUtTU/\
@@ -819,7 +809,7 @@ fn a_trust_group_spki_key_is_a_subject_public_key_info() {
 
 /// The `secret-key-file` of an spki key group refuses a raw 32-byte P-256
 /// scalar in a `PRIVATE KEY` block.
-#[cfg(feature = "sign-spki-p256")]
+#[cfg(feature = "sign-spki")]
 #[test]
 fn an_spki_key_group_refuses_a_raw_scalar() {
     let err = spki_key_group_refusal(&wrap_pem(
@@ -890,12 +880,7 @@ fn a_trust_group_gpg_axis_needs_a_certificate() {
 }
 
 /// The spki engine of a trust group needs the spki engine of the build.
-#[cfg(not(any(
-    feature = "sign-spki-p256",
-    feature = "sign-spki-p384",
-    feature = "sign-spki-ed25519",
-    feature = "sign-spki-rsa"
-)))]
+#[cfg(not(feature = "sign-spki"))]
 #[test]
 fn a_trust_group_spki_axis_needs_the_engine() {
     let err = refusal("[ex-ostrya trust \"t\"]\nsign-verify=spki\nverification-spki-key=AAAA\n");
@@ -962,12 +947,7 @@ fn a_key_group_file_holds_one_key() {
 }
 
 /// An spki key group needs the spki engine.
-#[cfg(not(any(
-    feature = "sign-spki-p256",
-    feature = "sign-spki-p384",
-    feature = "sign-spki-ed25519",
-    feature = "sign-spki-rsa"
-)))]
+#[cfg(not(feature = "sign-spki"))]
 #[test]
 fn an_spki_key_group_needs_the_engine() {
     let err = refusal("[ex-ostrya key \"k\"]\ntype=spki\nsecret-key-file=/nonexistent/ostrya/k\n");

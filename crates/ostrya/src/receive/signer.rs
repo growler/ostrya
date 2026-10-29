@@ -117,12 +117,7 @@ impl ServerSigner {
     /// - [`Error::Signature`] if the verifier does not accept the DER public
     ///   key of `signer`. The message is
     ///   `spki public key: expected SubjectPublicKeyInfo DER`.
-    #[cfg(any(
-        feature = "sign-spki-p256",
-        feature = "sign-spki-p384",
-        feature = "sign-spki-ed25519",
-        feature = "sign-spki-rsa"
-    ))]
+    #[cfg(feature = "sign-spki")]
     pub fn spki(signer: crate::spki::SpkiSigner) -> Result<ServerSigner> {
         let verifier =
             crate::spki::SpkiVerifier::new([signer.public_key_der()], Vec::<Vec<u8>>::new())?;
@@ -226,23 +221,13 @@ impl ServerSigner {
 ///
 /// The signer copies the data of each call and gives the copy to the pool.
 /// The data is a commit object or a summary, whose size the format caps.
-#[cfg(any(
-    feature = "sign-spki-p256",
-    feature = "sign-spki-p384",
-    feature = "sign-spki-ed25519",
-    feature = "sign-spki-rsa"
-))]
+#[cfg(feature = "sign-spki")]
 struct Unblocked {
     /// The signer that does the work.
     inner: Arc<crate::spki::SpkiSigner>,
 }
 
-#[cfg(any(
-    feature = "sign-spki-p256",
-    feature = "sign-spki-p384",
-    feature = "sign-spki-ed25519",
-    feature = "sign-spki-rsa"
-))]
+#[cfg(feature = "sign-spki")]
 impl Signer for Unblocked {
     fn name(&self) -> &str {
         self.inner.name()
@@ -481,7 +466,7 @@ mod tests {
     /// The spki search recognizes the DER signature of the key, the form
     /// that the verifier reads. It does not recognize the fixed-width
     /// `r || s` form of the same signature, or the signature of another key.
-    #[cfg(feature = "sign-spki-p256")]
+    #[cfg(feature = "sign-spki")]
     #[test]
     fn an_spki_key_recognizes_its_own_der_signature_alone() {
         use crate::spki::SpkiSigner;
@@ -522,7 +507,7 @@ mod tests {
     /// An spki server key of the RSA key type signs on the blocking pool, and
     /// the search recognizes its own signature alone. It does not recognize
     /// the signature of another key, or a blob of another length.
-    #[cfg(feature = "sign-spki-rsa")]
+    #[cfg(feature = "sign-spki")]
     #[test]
     fn an_rsa_spki_key_recognizes_its_own_signature_alone() {
         use crate::spki::{SpkiSigner, spki_secret_keys};
@@ -565,7 +550,7 @@ mod tests {
 
     /// Returns the fixed-width `r || s` form of a DER ECDSA signature over
     /// P-256.
-    #[cfg(feature = "sign-spki-p256")]
+    #[cfg(feature = "sign-spki")]
     fn fixed_width(der: &[u8]) -> Vec<u8> {
         // SEQUENCE { INTEGER r, INTEGER s }, each short-form length.
         assert_eq!(der[0], 0x30);

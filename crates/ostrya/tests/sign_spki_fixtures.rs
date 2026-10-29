@@ -31,12 +31,7 @@
 //! `sign-spki` in `ostree --version`. Without such a build the part skips, and
 //! `OSTRYA_REQUIRE_OSTREE_SPKI` turns the skip into a failure.
 
-#![cfg(any(
-    feature = "sign-spki-p256",
-    feature = "sign-spki-p384",
-    feature = "sign-spki-ed25519",
-    feature = "sign-spki-rsa"
-))]
+#![cfg(feature = "sign-spki")]
 
 mod common;
 
@@ -117,7 +112,6 @@ fn spki_blobs(dict: &Value) -> Vec<Vec<u8>> {
 
 /// Returns the path of the `.commitmeta` of the fixture commit, relative to
 /// the repository.
-#[cfg(any(feature = "sign-spki-ed25519", feature = "sign-spki-rsa"))]
 fn commitmeta_path() -> String {
     format!("objects/{}/{}.commitmeta", &COMMIT[..2], &COMMIT[2..])
 }
@@ -125,7 +119,6 @@ fn commitmeta_path() -> String {
 /// Reads the signed superblock of the delta in the repository `root`.
 /// Returns the superblock bytes that the signatures sign, and the spki
 /// blobs.
-#[cfg(any(feature = "sign-spki-ed25519", feature = "sign-spki-rsa"))]
 fn read_signed_superblock(root: &std::path::Path) -> (Vec<u8>, Vec<Vec<u8>>) {
     let path = root
         .join(static_delta_relative_dir(None, &commit()))
@@ -162,7 +155,6 @@ fn copy_tree(from: &std::path::Path, to: &std::path::Path) {
 /// negative INTEGER and an INTEGER that is not minimal. The strict DER parse
 /// is the verify of the port. The test that calls this function also verifies
 /// each blob with the port.
-#[cfg(any(feature = "sign-spki-p256", feature = "sign-spki-p384"))]
 fn has_high_s(der: &[u8], half_order: &[u8]) -> bool {
     assert!(
         der.first() == Some(&0x30)
@@ -346,7 +338,6 @@ fn assert_tool_verifies_port_signatures(ty: &str, stranger_pem: &str) {
     }
 }
 
-#[cfg(feature = "sign-spki-p256")]
 mod p256 {
     use super::*;
     use common::wrap_pem;
@@ -497,7 +488,6 @@ mod p256 {
     }
 }
 
-#[cfg(feature = "sign-spki-p384")]
 mod p384 {
     use super::*;
     use common::wrap_pem;
@@ -652,7 +642,6 @@ mod p384 {
     }
 }
 
-#[cfg(feature = "sign-spki-ed25519")]
 mod ed25519 {
     use super::*;
     use common::wrap_pem;
@@ -854,7 +843,6 @@ mod ed25519 {
     }
 }
 
-#[cfg(feature = "sign-spki-rsa")]
 mod rsa {
     use super::*;
     use ostrya::{Signer, Type, from_bytes};

@@ -18,8 +18,7 @@ use crate::Signer;
 /// the trait. The trait is dyn-compatible.
 ///
 /// `X509SpkiSigner` implements the trait for the spki engine, with the
-/// features `sign-x509` and `sign-spki-p256`, `sign-spki-p384`, or
-/// `sign-spki-rsa`.
+/// features `x509` and `spki`.
 pub trait X509Signer: Signer {
     /// Returns the DER of each certificate of the chain.
     ///

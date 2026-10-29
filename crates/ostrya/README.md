@@ -64,13 +64,8 @@ API documentation: <https://docs.rs/ostrya>
 - `smol` (default): the `smol` backend of `ostrya-rt`.
 - `tokio`: the `tokio` backend of `ostrya-rt`.
 - `sign-spki`: the `spki` module, the spki signing engine with each of its
-  key types. It turns on `sign-spki-p256`, `sign-spki-p384`,
-  `sign-spki-ed25519`, and `sign-spki-rsa`.
-- `sign-spki-p256`: the `spki` module with the ECDSA P-256 key type.
-- `sign-spki-p384`: the `spki` module with the ECDSA P-384 key type.
-- `sign-spki-ed25519`: the `spki` module with the Ed25519 key type.
-- `sign-spki-rsa`: the `spki` module with the RSA key type. A build without
-  one of the four key features refuses a key of that type.
+  key types: ECDSA P-256, ECDSA P-384, Ed25519, and RSA. It turns on the
+  feature `spki` of `ostrya-sign`.
 - `verify-gpg`: the `gpg` module: the GPG verifier of `ostrya-sign` with
   the trait `FromOstreeKeyrings`, which reads the ostree keyring paths, and
   the keyring management of a remote. It turns on the feature `gpg` of
@@ -78,9 +73,8 @@ API documentation: <https://docs.rs/ostrya>
 - `sign-gpg`: `GpgSigner`, which signs with the `gpg` command. It turns on
   `verify-gpg`.
 - `sign-x509`: `X509Signer`, the trait of a signer with an X.509 certificate
-  chain for a CMS signature. With `sign-spki-p256`, `sign-spki-p384`, or
-  `sign-spki-rsa`, also `X509SpkiSigner` and `SpkiSigner::with_certificates`.
-  With one of the four key features, also `SpkiVerifier::from_certificates`.
+  chain for a CMS signature. With `sign-spki`, also `X509SpkiSigner`,
+  `SpkiSigner::with_certificates`, and `SpkiVerifier::from_certificates`.
 - `receive`: the `receive` module, the receive side of a push.
 - `push`: `Repo::push`, `Repo::push_onto`, and `Repo::export_stream`, the push
   from a repository.

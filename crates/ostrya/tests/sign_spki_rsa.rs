@@ -5,7 +5,7 @@
 //! `tests/fixtures/spki/keys/generate.sh` writes with OpenSSL 3. No test makes
 //! a key.
 
-#![cfg(feature = "sign-spki-rsa")]
+#![cfg(feature = "sign-spki")]
 
 mod common;
 
@@ -158,7 +158,6 @@ fn a_key_store_with_an_rsa_key_verifies_and_its_revocation_removes_the_key() {
     });
 }
 
-#[cfg(feature = "sign-spki-p256")]
 #[test]
 fn a_key_store_of_a_p256_key_and_an_rsa_key_verifies_a_commit_of_each() {
     let tmp = TmpDir::new("spki-rsa-mixed");
@@ -189,56 +188,5 @@ fn a_key_store_of_a_p256_key_and_an_rsa_key_verifies_a_commit_of_each() {
                 Some(algorithm)
             );
         }
-    });
-}
-
-#[cfg(not(feature = "sign-spki-p256"))]
-#[test]
-fn a_build_with_rsa_alone_refuses_a_p256_key_and_verifies_an_rsa_key() {
-    let tmp = TmpDir::new("spki-rsa-alone");
-    let base = tmp.path();
-    let dir = store(base, "p256", P256_PUBLIC_PEM, None);
-    let file = dir.join("trusted.spki");
-    match load_sign_keys_from(&[dir.as_path()], "spki").unwrap_err() {
-        ostrya::Error::Signature(m) => assert_eq!(
-            m,
-            format!(
-                "the key file '{}', line 1: this build has no code for the curve P-256; build \
-                 with the sign-spki-p256 feature",
-                file.display()
-            )
-        ),
-        other => panic!("not a signature error: {other}"),
-    }
-
-    // A P-256 key in `revoked.spki` refuses the store, so a revocation that
-    // the build cannot read fails closed.
-    let public = key_text("rsa-2048.pub.pem");
-    let dir = store(base, "revoked-p256", &public, Some(P256_PUBLIC_PEM));
-    let file = dir.join("revoked.spki");
-    match load_sign_keys_from(&[dir.as_path()], "spki").unwrap_err() {
-        ostrya::Error::Signature(m) => assert_eq!(
-            m,
-            format!(
-                "the key file '{}', line 1: this build has no code for the curve P-256; build \
-                 with the sign-spki-p256 feature",
-                file.display()
-            )
-        ),
-        other => panic!("not a signature error: {other}"),
-    }
-
-    let dir = store(base, "rsa", &public, None);
-    block_on(async {
-        let (repo, commit) = build_committed_repo(base).await;
-        repo.sign_commit(&commit, &signer("rsa-2048.pem"))
-            .await
-            .unwrap();
-        assert!(
-            repo.verify_commit(&commit, &[Arc::new(store_verifier(&dir))])
-                .await
-                .unwrap()
-                .valid
-        );
     });
 }

@@ -182,6 +182,8 @@ A candidate whose \fB\%pull\-url\fR is an \fB\%s3://\fR address serves the refs 
 \fB\%ostrya remote summary \-u\fR writes the summary of a bucket repository.
 .SS "Verification"
 These keys apply to \fB\%ostrya pull NAME\fR and to \fB\%ostrya pull\-local \-\-remote=NAME\fR.
+The checks of the commits apply to each target, each parent that the depth takes, and each commit of a chain of static deltas.
+A pull checks no signature of a dependency in field 2 of a commit, unless the dependency also has one of these roles.
 \fB\%ostrya remote fsck NAME\fR reads \fB\%gpg\-verify\-summary\fR, \fB\%sign\-verify\-summary\fR, and the trusted keys of these two checks.
 A switch of the command that turns a check on or off wins over its key.
 For a remote with the key \fB\%trust\fR, the switches of the checks of the commits follow the rule of that key.
@@ -190,7 +192,7 @@ When the config has no group for \fB\%NAME\fR, \fB\%ostrya pull\-local\fR makes 
 \fB\%ostree pull\-local\fR reads none of these keys.
 .TP
 \fB\%gpg\-verify\fR (boolean, default true)
-A pull checks the GPG signature of each commit that it fetches.
+A pull checks the GPG signatures of its commits.
 The trusted keys are in \fB\%gpgkeypath\fR, \fB\%<repo>/NAME.trustedkeys.gpg\fR, \fB\%/etc/ostree/remotes.d/NAME.trustedkeys.gpg\fR, and the global trusted keyrings.
 A build without GPG support refuses \fB\%true\fR.
 .TP
@@ -203,7 +205,7 @@ More keyring files, or directories of \fB\%*.gpg\fR keyrings, that \fB\%gpg\-ver
 An entry that does not exist fails the pull.
 .TP
 \fB\%sign\-verify\fR (boolean or list, default false)
-A pull checks the signature of each commit with the signature engines.
+A pull checks the signatures of its commits with the signature engines.
 \fB\%true\fR uses each engine that has a key.
 A list names the engines, split on \fB\%,\fR or \fB\%;\fR, and each engine must have a key.
 The engines are \fB\%ed25519\fR, and \fB\%spki\fR in a build with SPKI support.
@@ -230,7 +232,7 @@ In an \fB\%spki\fR file, white space is space, horizontal tab, line feed, form f
 .TP
 \fB\%trust\fR (string)
 The name of a trust group \fB\%[ex\-ostrya trust "NAME"]\fR.
-The keys of the group check each commit of a pull from the remote: \fB\%ostrya pull\fR over each transport, \fB\%ostrya pull \-\-collection\fR, and \fB\%ostrya pull\-local \-\-remote=NAME\fR.
+The keys of the group check the commits of a pull from the remote: \fB\%ostrya pull\fR over each transport, \fB\%ostrya pull \-\-collection\fR, and \fB\%ostrya pull\-local \-\-remote=NAME\fR.
 The group alone supplies the keys of the commits: no system key store, no \fB\%<repo>/NAME.trustedkeys.gpg\fR, no \fB\%/etc/ostree/remotes.d/NAME.trustedkeys.gpg\fR, and no global trusted keyring.
 \fB\%gpg\-verify\-summary\fR, \fB\%sign\-verify\-summary\fR, and the keys that they read still set the check of the summary, and that check still reads these key sources.
 A pull refuses a value that is empty, holds \fB\%"\fR or a control character, or names no group.

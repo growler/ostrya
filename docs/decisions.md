@@ -2106,20 +2106,27 @@ the rules.
   `ostrya remote prune` writes each one to standard error. A bucket prune
   that also reads the `.commitmeta` of each commit that it reaches was
   rejected: it sends one more `GET` for each such commit.
-- A pull from a remote and a local pull follow the dependencies of each
-  commit that they read, the parents that their depth takes included. Field
-  2 is in the signed commit, so the pull is complete with no option, and the
-  signature policy of the pull applies to each dependency. The pull takes
-  each dependency at depth 0, with no parent: a dependency is a runtime need
-  of the commit, and its history is not. A prune of the destination accepts
-  the missing parents, as after a pull with a small depth. A dependency
-  gets no ref. A commit-only pull and a pull with subpaths take no
+- A pull from a remote and a local pull follow the dependencies of each commit
+  that they read, the parents that their depth takes included. Field 2 is in
+  the signed commit, so the pull is complete with no option. Field 2 also
+  binds each dependency to its checksum in a commit that the signature policy
+  covers, so the pull checks no signature of a dependency. A dependency that
+  is also a target, a parent that the depth takes, or a commit of a chain of
+  static deltas gets the check of that role. The pull requests and copies no
+  `.commitmeta` of a dependency that the repository holds complete. The pull
+  takes each dependency at depth 0, with no parent: a dependency is a runtime
+  need of the commit, and its history is not. A prune of the destination
+  accepts the missing parents, as after a pull with a small depth. A
+  dependency gets no ref. A commit-only pull and a pull with subpaths take no
   dependency. A dependency that neither the repository, a localcache
   repository, nor the remote (the source of a local pull) holds fails the
-  pull, and the pull moves no ref. A local pull finds each such failure before its
-  transaction opens. A pull that follows each dependency at the depth of the
-  pull was rejected: it takes the history of each dependency, which no
-  commit needs.
+  pull, and the pull moves no ref. A local pull finds each such failure before
+  its transaction opens. Two alternatives were rejected. A pull that follows
+  each dependency at the depth of the pull was rejected: it takes the history
+  of each dependency, which no commit needs. A pull that checks the signatures
+  of each dependency was rejected: field 2 is in the signed commit, so the
+  dependency is bound by its checksum, and a signature on the dependency adds
+  no trust.
 - A pull looks for a static delta of each dependency of its own. After the
   pull reads the commits that name the dependencies, it looks for a delta of
   each dependency that it does not hold complete. The `from` is the entry of

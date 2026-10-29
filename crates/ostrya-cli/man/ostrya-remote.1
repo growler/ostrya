@@ -51,7 +51,7 @@ The option can occur more than once. The command writes the pairs in the order o
 \fB\-\-no\-gpg\-verify\fR
 Do not require a GPG signature on the commits pulled from this remote.
 .IP
-The command writes \fB\%gpg\-verify=false\fR\&. Without this option, a pull from the remote verifies the GPG signature of each commit.
+The command writes \fB\%gpg\-verify=false\fR\&. Without this option, a pull from the remote verifies the GPG signatures of its commits (see the key \fB\%gpg\-verify\fR in \%ostrya\-config(1)).
 .TP
 \fB\-\-no\-sign\-verify\fR
 Do not require an \%ed25519, spki, or GPG signature on pulled commits.

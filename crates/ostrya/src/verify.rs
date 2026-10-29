@@ -148,11 +148,13 @@ impl std::fmt::Debug for TrustedKeys {
 /// The trusted keys of one pull: a set for the commits, and a set for the
 /// summary of the remote.
 ///
-/// A pull checks each commit that it carries against the commit set, and the
-/// summary against the summary set. The pull does not check a target that has
-/// no set. If the commit set has a sign-api axis and a static delta carries
-/// signatures that this axis reads, one of them must be valid. The pull does
-/// not check the signatures of other static deltas.
+/// A pull checks each target, each parent that its depth takes, and each
+/// commit of a chain of static deltas against the commit set, and the summary
+/// against the summary set. A dependency in no other role gets no check. The
+/// pull does not check a target that has no set. If the commit set has a
+/// sign-api axis and a static delta carries signatures that this axis reads,
+/// one of them must be valid. The pull does not check the signatures of other
+/// static deltas.
 ///
 /// [`PullTrust::from_remote`] reads the trust that [`Repo::pull`] uses.
 /// [`PullTrust::commits`] and [`PullTrust::with_summary`] take keys that the
@@ -160,7 +162,7 @@ impl std::fmt::Debug for TrustedKeys {
 ///
 /// # Examples
 ///
-/// The trust of a pull that checks each commit against one ed25519 key:
+/// The trust of a pull that checks its commits against one ed25519 key:
 ///
 /// ```
 /// use std::sync::Arc;
@@ -193,7 +195,7 @@ impl PullTrust {
         }
     }
 
-    /// Creates the trust of a pull that checks each commit against `keys`.
+    /// Creates the trust of a pull that checks its commits against `keys`.
     ///
     /// The pull does not check the summary. `keys` is the whole trusted set of
     /// the commits: the pull reads no system key store and no keyring of the

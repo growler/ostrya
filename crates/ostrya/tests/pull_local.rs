@@ -6894,6 +6894,12 @@ async fn assert_left_nothing(dst: &Repo) {
     assert_eq!(file_inventory(dst.path(), "state"), Vec::new());
 }
 
+/// Returns the keys of a remote section that turns the GPG check off and
+/// checks each commit against the ed25519 key of `PUBLIC_B64`.
+fn signed_remote() -> String {
+    format!("gpg-verify=false\nsign-verify=ed25519\nverification-ed25519-key={PUBLIC_B64}\n")
+}
+
 /// Asserts that `err` is `Error::ObjectNotFound` for the commit object of
 /// `commit`.
 fn assert_commit_not_found(err: &Error, commit: &Checksum) {
@@ -7203,26 +7209,181 @@ fn a_commit_only_local_pull_checks_the_format_of_field_2() {
     });
 }
 
-/// The signature policy of the pull applies to a dependency. Under a remote
-/// with `sign-verify`, a dependency with no signature from a trusted key
-/// fails the pull, and the pull leaves nothing. With a signature of the
-/// trusted key, the pull takes it.
+/// Under `PullFlags::UNTRUSTED`, a dependency whose bytes do not hash to the
+/// checksum in field 2 of the tip fails the pull with
+/// `Error::ChecksumMismatch` for that checksum, and the pull leaves nothing.
+/// The source holds the bytes of a different commit with an empty field 2 at
+/// the path of the dependency, so the format check of field 2 passes and the
+/// hash of the import finds the defect. The pull checks no signature of the
+/// dependency, so under a remote with `sign-verify` and a signed tip the pull
+/// fails with the same error.
 #[test]
-fn a_local_dependency_with_no_trusted_signature_fails_the_pull() {
+fn a_local_dependency_with_wrong_bytes_fails_an_untrusted_pull() {
+    let tmp = TmpDir::new("pull-local-dependency-wrong-bytes");
+    block_on(async {
+        let base = tmp.path();
+        let (src_dir, src, tip, dep) = build_dependency_source(base).await;
+        sign_commits(&src, &[tip]).await;
+        build_tree(&base.join("other"), b"other\n");
+        let donor = commit_tree(&src, base, "other", "other/x", None).await;
+        let donor_bytes = std::fs::read(object_path(
+            &src_dir,
+            &ObjectName::new(donor, ObjectType::Commit),
+            RepoMode::Archive,
+        ))
+        .unwrap();
+        std::fs::write(
+            object_path(
+                &src_dir,
+                &ObjectName::new(dep, ObjectType::Commit),
+                RepoMode::Archive,
+            ),
+            donor_bytes,
+        )
+        .unwrap();
+
+        let (_dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+        let err = pull_main_with(
+            &dst,
+            &src,
+            PullOptions {
+                flags: PullFlags::UNTRUSTED,
+                ..PullOptions::default()
+            },
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(err, Error::ChecksumMismatch { expected, .. } if expected == dep),
+            "{err}"
+        );
+        assert_left_nothing(&dst).await;
+        drop(dst);
+        std::fs::remove_dir_all(base.join("dst")).unwrap();
+
+        let dst = dest_with_remote(base, &signed_remote()).await;
+        let err = dst
+            .pull_local(
+                &src,
+                PullOptions {
+                    flags: PullFlags::UNTRUSTED,
+                    ..origin_pull(PullVerify::default())
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::ChecksumMismatch { expected, .. } if expected == dep),
+            "verified: {err}"
+        );
+        assert_left_nothing(&dst).await;
+    });
+}
+
+/// The pull checks no signature of a dependency. Under a remote with
+/// `sign-verify` and a signed tip, an unsigned dependency passes the pull, and
+/// the destination holds no detached metadata for it. A dependency that a key
+/// signed that the destination does not trust passes too, and the destination
+/// holds the `.commitmeta` of the source.
+#[test]
+fn a_local_dependency_with_no_trusted_signature_passes_the_pull() {
     let tmp = TmpDir::new("pull-local-dependency-signature");
+    block_on(async {
+        let base = tmp.path();
+        let (src_dir, src, tip, dep) = build_dependency_source(base).await;
+        sign_commits(&src, &[tip]).await;
+        let meta = |dir: &Path| {
+            dir.join("objects")
+                .join(ObjectName::new(dep, ObjectType::Commit).loose_path(RepoMode::Archive))
+                .with_extension("commitmeta")
+        };
+
+        let dst = dest_with_remote(base, &signed_remote()).await;
+        pull_main_with(&dst, &src, origin_pull(PullVerify::default()))
+            .await
+            .unwrap();
+        assert_complete(&src, &dst, &base.join("dst"), &dep).await;
+        assert!(!meta(&base.join("dst")).exists());
+        drop(dst);
+        std::fs::remove_dir_all(base.join("dst")).unwrap();
+
+        src.sign_commit(&dep, &Ed25519Signer::from_base64(OTHER_SECRET_B64).unwrap())
+            .await
+            .unwrap();
+        let dst = dest_with_remote(base, &signed_remote()).await;
+        pull_main_with(&dst, &src, origin_pull(PullVerify::default()))
+            .await
+            .unwrap();
+        assert_complete(&src, &dst, &base.join("dst"), &dep).await;
+        assert_eq!(
+            std::fs::read(meta(&base.join("dst"))).unwrap(),
+            std::fs::read(meta(&src_dir)).unwrap()
+        );
+    });
+}
+
+/// A dependency that this repository holds complete keeps the detached
+/// metadata of this repository: the pull copies no `.commitmeta` for it. A
+/// pull that takes the dependency as a target copies the `.commitmeta` of the
+/// source.
+#[test]
+fn a_local_dependency_held_complete_keeps_its_detached_metadata() {
+    let tmp = TmpDir::new("pull-local-dependency-held-meta");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, _tip, dep) = build_dependency_source(base).await;
+        let (_dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+        pull_main_with(&dst, &src, PullOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(dst.commit_state(&dep).await.unwrap(), CommitState::Normal);
+        assert_eq!(dst.read_commit_detached_metadata(&dep).await.unwrap(), None);
+
+        src.write_commit_detached_metadata(&dep, Some(&two_property_metadata()))
+            .await
+            .unwrap();
+        pull_main_with(&dst, &src, PullOptions::default())
+            .await
+            .unwrap();
+        assert_eq!(dst.read_commit_detached_metadata(&dep).await.unwrap(), None);
+
+        dst.pull_local(
+            &src,
+            PullOptions {
+                refs: vec!["dep/uki".to_owned()],
+                ..PullOptions::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            dst.read_commit_detached_metadata(&dep).await.unwrap(),
+            Some(two_property_metadata())
+        );
+    });
+}
+
+/// A dependency that the pull also takes as a target gets the check of a
+/// target. Under a remote with `sign-verify` and a signed tip, an unsigned
+/// dependency that a requested ref names fails the pull, and the pull leaves
+/// nothing.
+#[test]
+fn a_local_dependency_that_is_also_a_target_is_checked() {
+    let tmp = TmpDir::new("pull-local-dependency-target-signature");
     block_on(async {
         let base = tmp.path();
         let (_src_dir, src, tip, dep) = build_dependency_source(base).await;
         sign_commits(&src, &[tip]).await;
-        let dst = dest_with_remote(
-            base,
-            &format!(
-                "gpg-verify=false\nsign-verify=ed25519\nverification-ed25519-key={PUBLIC_B64}\n"
-            ),
-        )
-        .await;
+        let dst = dest_with_remote(base, &signed_remote()).await;
 
-        let err = pull_main_with(&dst, &src, origin_pull(PullVerify::default()))
+        let err = dst
+            .pull_local(
+                &src,
+                PullOptions {
+                    refs: vec!["main".to_owned(), "dep/uki".to_owned()],
+                    ..origin_pull(PullVerify::default())
+                },
+            )
             .await
             .unwrap_err();
         assert!(
@@ -7230,12 +7391,52 @@ fn a_local_dependency_with_no_trusted_signature_fails_the_pull() {
             "{err}"
         );
         assert_left_nothing(&dst).await;
+    });
+}
 
-        sign_commits(&src, &[dep]).await;
-        pull_main_with(&dst, &src, origin_pull(PullVerify::default()))
-            .await
-            .unwrap();
-        assert_complete(&src, &dst, &base.join("dst"), &dep).await;
+/// A parent that the depth of the pull takes gets the check of a parent, also
+/// if field 2 of the tip names it. Under a remote with `sign-verify`, a signed
+/// tip, and an unsigned parent, a pull at depth 0 takes the parent as a
+/// dependency alone and passes. A pull at depth 1 refuses the parent.
+#[test]
+fn a_local_dependency_that_is_also_a_parent_is_checked() {
+    let tmp = TmpDir::new("pull-local-dependency-parent-signature");
+    block_on(async {
+        let base = tmp.path();
+        for sub in ["p", "t"] {
+            build_tree(&base.join(sub), sub.as_bytes());
+        }
+        let (_src_dir, src) = make_repo(base, "src", RepoMode::Archive).await;
+        let parent = commit_tree(&src, base, "p", "main", None).await;
+        let tip =
+            commit_tree_related(&src, base, "t", "main", Some(parent), &[("boot/p", parent)]).await;
+        sign_commits(&src, &[tip]).await;
+
+        for depth in [0, 1] {
+            let dst = dest_with_remote(base, &signed_remote()).await;
+            let pulled = pull_main_with(
+                &dst,
+                &src,
+                PullOptions {
+                    depth,
+                    ..origin_pull(PullVerify::default())
+                },
+            )
+            .await;
+            if depth == 0 {
+                pulled.unwrap();
+                assert_complete(&src, &dst, &base.join("dst"), &parent).await;
+            } else {
+                let err = pulled.unwrap_err();
+                assert!(
+                    matches!(&err, Error::Signature(m) if m.contains(&format!("commit {parent}"))),
+                    "depth {depth}: {err}"
+                );
+                assert_left_nothing(&dst).await;
+            }
+            drop(dst);
+            std::fs::remove_dir_all(base.join("dst")).unwrap();
+        }
     });
 }
 

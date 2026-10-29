@@ -238,14 +238,25 @@ impl Repo {
     ///   adds no parent to the pull. The pull fetches a dependency one time,
     ///   also if several commits name it.
     /// - The pull writes no ref for a dependency.
-    /// - The signature policy of the pull applies to each dependency. The
-    ///   pull makes no ref-binding check, no collection-binding check, and no
-    ///   timestamp check on a dependency.
+    /// - The pull checks no signature of a dependency commit. Field 2 holds the
+    ///   checksum of the dependency, and the checksum and the signatures of
+    ///   the commit that names it cover field 2. The pull hashes the
+    ///   dependency commit that it stores and compares the result with that
+    ///   checksum. The pull makes no ref-binding check, no
+    ///   collection-binding check, and no timestamp check on a dependency.
+    /// - A target, a parent that [`depth`](PullOptions::depth) takes, and a
+    ///   commit of a chain of static deltas keep the checks of that role,
+    ///   also if a field 2 names them.
     /// - A dependency is a commit of the pull for each other rule. A
-    ///   localcache repository can supply it. For a dependency that this
-    ///   repository holds complete, the pull requests the `.commitmeta` and
-    ///   checks the signatures, and fetches no object of its tree. A
-    ///   dependency that this repository holds partial gets its whole tree.
+    ///   localcache repository can supply it. The pull stores the
+    ///   `.commitmeta` of a dependency that it fetches, under the rule of
+    ///   `[ex-ostrya] keep-detached-related`.
+    /// - For a dependency that this repository holds complete, the pull
+    ///   requests no `.commitmeta` and no object of its tree. So the
+    ///   dependency does not get the signatures that the remote added after
+    ///   this repository stored it. A pull that takes the dependency as a
+    ///   target requests its `.commitmeta`. A dependency that this repository
+    ///   holds partial gets its whole tree and its `.commitmeta`.
     /// - The pull fetches the dependencies after the commits that name them.
     ///   It looks for a static delta of each dependency, as `# Static deltas`
     ///   states. A dependency with no delta comes as loose objects.
@@ -270,10 +281,12 @@ impl Repo {
     /// # Detached metadata
     ///
     /// The pull requests the `.commitmeta` of a commit before the commit
-    /// object. It stages the `.commitmeta` in the transaction when the commit
-    /// object arrives, so no `.commitmeta` stays for a parent that the remote
-    /// answers 404 for. [`pull_local`](Repo::pull_local) states when the
-    /// transaction writes it and what a failure leaves.
+    /// object. It requests no `.commitmeta` of a dependency that this
+    /// repository holds complete, as `# Dependencies` states. It stages the
+    /// `.commitmeta` in the transaction when the commit object arrives, so no
+    /// `.commitmeta` stays for a parent that the remote answers 404 for.
+    /// [`pull_local`](Repo::pull_local) states when the transaction writes it
+    /// and what a failure leaves.
     ///
     /// If `[ex-ostrya] keep-detached-related` of this repository is `false`
     /// ([`RepoConfig::keep_detached_related`](crate::RepoConfig::keep_detached_related)),
@@ -648,8 +661,8 @@ impl Repo {
     ///
     /// These errors stop the pull while it fetches:
     ///
-    /// - [`Error::Signature`] if the policy refuses a commit, a dependency, or
-    ///   a static delta.
+    /// - [`Error::Signature`] if the policy refuses a commit or a static
+    ///   delta.
     /// - [`Error::Pull`] if
     ///   [`require_static_deltas`](PullOptions::require_static_deltas) is set
     ///   and the pull finds no delta for a dependency. The pull looks for it
@@ -675,8 +688,9 @@ impl Repo {
     /// - [`Error::Core`] if a fetched commit or the header of a content object
     ///   does not parse. Also if a `.commitmeta` does not parse. If the
     ///   signature policy verifies commits, the pull parses the `.commitmeta`
-    ///   that it reads from the remote or a localcache repository, or the copy
-    ///   in this repository if no source holds one. If
+    ///   of each commit that it verifies: the copy that it reads from the
+    ///   remote or a localcache repository, or the copy in this repository if
+    ///   no source holds one. It verifies no dependency. If
     ///   `[ex-ostrya] keep-detached-related` of this repository is `false`, the
     ///   pull parses each `.commitmeta` that it stores.
     /// - [`Error::InvalidFormat`] if a content object breaks its framing, or
@@ -1219,6 +1233,7 @@ impl Repo {
                 deltas: RunDeltas::Ready(&jobs),
                 done: &done,
                 last: false,
+                dependency_run: false,
             };
             self.drive(
                 &txn,
@@ -1254,6 +1269,7 @@ impl Repo {
             deltas: RunDeltas::Ready(&jobs),
             done: &done,
             last: !follows,
+            dependency_run: false,
         };
         self.drive(
             &txn,
@@ -1277,7 +1293,8 @@ impl Repo {
             // deltas runs after the runs of the commits that name them, and
             // the last run fetches them at depth 0. A dependency with no delta
             // is fetched object by object. The run also fetches the composefs
-            // images of the pull, after each other object.
+            // images of the pull, after each other object. Each commit of the
+            // run is a dependency alone, so the run checks no signature.
             let mut pending: Vec<Checksum> = carry
                 .dependencies
                 .named
@@ -1324,6 +1341,7 @@ impl Repo {
                 deltas: RunDeltas::Lazy(&found),
                 done: &done,
                 last: true,
+                dependency_run: true,
             };
             self.drive(
                 &txn,
@@ -1533,6 +1551,7 @@ impl Repo {
             related: RelatedRule::of(self.config())?,
             images: whole,
             dependencies: whole,
+            dependency_run: phase.dependency_run,
             marking: Mutex::new(Vec::new()),
             progress,
         };
@@ -1690,6 +1709,10 @@ impl Repo {
     /// Fetches one commit: its detached metadata, then the object, then the
     /// checks of each requested ref that names it. The step stages the
     /// detached metadata when the commit object is here.
+    ///
+    /// In the run of the dependencies, the step checks no signature. For a
+    /// dependency that this repository holds complete, it requests no
+    /// detached metadata.
     async fn fetch_commit(
         &self,
         ctx: &StepCtx<'_>,
@@ -1729,6 +1752,9 @@ impl Repo {
         let (detached, bytes) = if present {
             let detached = match known.take() {
                 Some(detached) => detached,
+                // The pull checks no signature of a dependency, and the
+                // dependency keeps the detached metadata of this repository.
+                None if ctx.dependency_run && complete => None,
                 None => {
                     fetch_detached_metadata(ctx.source, ctx.sources, ctx.progress, &checksum)
                         .await?
@@ -1826,6 +1852,17 @@ impl Repo {
                 None if filtered => Some(CheckedMeta::Filtered(detached)),
                 _ => detached.map(CheckedMeta::Source),
             }
+        } else if ctx.dependency_run {
+            // The pull checks no signature of a dependency. Field 2 of the
+            // commit that names the dependency holds its checksum, and the
+            // checksum and the signatures of that commit cover field 2. A
+            // commit that this repository does not hold is hashed against that
+            // checksum when the step below stages it. A commit that this
+            // repository holds was hashed when the repository stored it. A
+            // target, a parent, and a commit of a chain are not in this run,
+            // so each keeps the check of its role. This run has no requested
+            // ref.
+            detached.map(CheckedMeta::Source)
         } else {
             let detached = check_commit_signatures_filtered(
                 self,
@@ -1885,7 +1922,9 @@ impl Repo {
         // commit. A verifier that reads the signatures with the commit needs
         // this order. For a commit that this repository already holds, the
         // copy of the remote replaces the copy here. That is the purpose of a
-        // new read of a mutable file on each pull.
+        // new read of a mutable file on each pull. A dependency that this
+        // repository holds complete is the exception: the step requests no
+        // copy, and the copy here stays as it is.
         //
         // The rule runs after the checks read the metadata as the remote
         // holds it: here, after the verification that parsed it, or in
@@ -2537,7 +2576,8 @@ struct StepCtx<'a> {
     /// The checks that discovery made on the commit of each step of a chain.
     delta_plan: &'a DeltaPlan,
     /// The signature policy of this pull. The pull verifies each commit of a
-    /// step before it stages its bytes.
+    /// step before it stages its bytes, except in the run of the
+    /// dependencies.
     verification: &'a Verification,
     /// The rule of `[ex-ostrya] keep-detached-related` of this repository. It
     /// applies to the detached metadata that this pull stores, after the
@@ -2549,6 +2589,9 @@ struct StepCtx<'a> {
     /// `true` if the pull follows the dependencies of each commit that it
     /// reads: a pull that is not commit-only and has no subpath.
     dependencies: bool,
+    /// `true` for the run of the dependencies. Each commit of that run is a
+    /// dependency alone, and the step checks no signature of it.
+    dependency_run: bool,
     /// The commits whose `.commitpartial` marker a step of this run writes. A
     /// step adds the commit before it starts the write of the marker, and the
     /// write is a tracked job of the transaction. A failed run waits for the
@@ -2576,6 +2619,8 @@ struct Phase<'a> {
     done: &'a HashSet<Checksum>,
     /// `true` for the last run of the pull.
     last: bool,
+    /// `true` for the run of the dependencies, as [`StepCtx`] holds it.
+    dependency_run: bool,
 }
 
 /// The static deltas of one run of the plan.

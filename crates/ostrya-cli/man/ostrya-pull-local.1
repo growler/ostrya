@@ -78,9 +78,9 @@ Sync the file of each content object when the pull stages it.
 The pull does not sync metadata objects or hardlinked objects one by one. Without this switch, \fB\%[core] per\-object\-fsync\fR applies. \%\-\-disable\-fsync and \fB\%[core] fsync=false\fR win over this switch.
 .TP
 \fB\-\-gpg\-verify\fR
-Require a GPG signature on every commit that the pull carries.
+Require a GPG signature on the commits that the pull carries.
 .IP
-The pull uses the keys of the remote that \%\-\-remote names. Without \%\-\-remote, the command refuses this switch. The switch takes no value.
+The pull uses the keys of the remote that \%\-\-remote names. Without \%\-\-remote, the command refuses this switch. The switch takes no value. The pull checks no signature of a dependency, unless the dependency is also a target, a parent that \%\-\-depth takes, or a commit of a chain of static deltas.
 .TP
 \fB\-\-gpg\-verify\-summary\fR
 Require a GPG signature on the summary of the source.
@@ -88,9 +88,9 @@ Require a GPG signature on the summary of the source.
 The pull uses the keys of the remote that \%\-\-remote names. Without \%\-\-remote, the command refuses this switch. The switch takes no value.
 .TP
 \fB\-\-sign\-verify\fR
-Require an \%ed25519 or spki signature on every commit that the pull carries.
+Require an \%ed25519 or spki signature on the commits that the pull carries.
 .IP
-The switch selects every engine of this build, and a valid signature of one engine is sufficient. The trusted keys come from the \fB\%verification\-<engine>\-key\fR and \fB\%verification\-<engine>\-file\fR keys of the remote that \%\-\-remote names, and from the system key store. The switch needs \%\-\-remote and takes no value.
+The switch selects every engine of this build, and a valid signature of one engine is sufficient. The trusted keys come from the \fB\%verification\-<engine>\-key\fR and \fB\%verification\-<engine>\-file\fR keys of the remote that \%\-\-remote names, and from the system key store. The switch needs \%\-\-remote and takes no value. The pull checks no signature of a dependency, unless the dependency is also a target, a parent that \%\-\-depth takes, or a commit of a chain of static deltas.
 .TP
 \fB\-\-sign\-verify\-summary\fR
 Require an \%ed25519 or spki signature on the summary of the source.

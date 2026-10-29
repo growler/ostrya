@@ -4391,9 +4391,8 @@ fn the_summary_signature_is_checked_when_the_remote_asks_for_it() {
     });
 }
 
-/// A pull verifies each commit that it carries, also the parents that a depth
-/// pull follows. If the tip is signed and its parent is not, the pull refuses
-/// the parent.
+/// A pull verifies the tip and each parent that a depth pull follows. If the
+/// tip is signed and its parent is not, the pull refuses the parent.
 #[test]
 fn a_parent_reached_under_depth_is_checked_too() {
     block_on(async {
@@ -9211,7 +9210,7 @@ async fn assert_left_nothing(dest: &Repo) {
 /// A pull fetches the dependency that field 2 of the pulled commit names,
 /// complete, and writes no ref for it. The content count of the pull holds
 /// the content of the dependency. A repeat pull reads the detached metadata
-/// of the tip and of the dependency again, and fetches no object.
+/// of the tip alone again, and fetches no object.
 #[test]
 fn a_pull_fetches_the_dependency_of_the_commit() {
     block_on(async {
@@ -9248,7 +9247,6 @@ fn a_pull_fetches_the_dependency_of_the_commit() {
                 "summary".to_owned(),
                 "config".to_owned(),
                 meta_path(&tip, "commitmeta"),
-                meta_path(&dep, "commitmeta"),
             ]
         );
     });
@@ -9476,35 +9474,205 @@ fn a_partial_pull_fetches_no_dependency() {
     }
 }
 
-/// The signature policy of the pull applies to a dependency. A dependency
-/// with no signature from a trusted key fails the pull, and the pull leaves
-/// nothing. With a signature of the trusted key, the pull takes it.
+/// A dependency whose bytes do not hash to the checksum in field 2 of the tip
+/// fails the pull with `Error::ChecksumMismatch` for that checksum, and the
+/// pull leaves nothing. The served bytes are those of a different commit with
+/// an empty field 2, so the format check of field 2 passes and the hash of the
+/// stage finds the defect. The pull checks no signature of the dependency, so
+/// under `sign-verify` with a signed tip the pull fails with the same error.
 #[test]
-fn a_dependency_with_no_trusted_signature_fails_the_pull() {
+fn a_dependency_with_wrong_bytes_fails_the_pull() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-dependency-wrong-bytes");
+        let (remote, tip, dep) = build_dependency_remote(dir.path()).await;
+        sign_commits(&remote, &[tip]).await;
+        build_tree(&dir.path().join("other"), b"other\n");
+        let donor = commit_tree(&remote, dir.path(), "other", "other/x", None, FIXED_TS).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let donor_bytes =
+            std::fs::read(dir.path().join("remote").join(meta_path(&donor, "commit"))).unwrap();
+        server.tamper(&meta_path(&dep, "commit"), donor_bytes);
+
+        for (tag, extra) in [("unverified", String::new()), ("verified", signed_policy())] {
+            let base = dir.path().join(tag);
+            std::fs::create_dir(&base).unwrap();
+            let dest = build_dest(&base, RepoMode::Archive, &server.url(), &extra).await;
+            let err = pull_main(&dest, PullOptions::default()).await.unwrap_err();
+            assert!(
+                matches!(err, Error::ChecksumMismatch { expected, .. } if expected == dep),
+                "{tag}: {err}"
+            );
+            assert_left_nothing(&dest).await;
+        }
+    });
+}
+
+/// The pull checks no signature of a dependency. Under `sign-verify` with a
+/// signed tip, an unsigned dependency passes the pull, and the destination
+/// holds no detached metadata for it. A dependency that a key signed that the
+/// destination does not trust passes too, and the destination holds the
+/// `.commitmeta` of the remote.
+#[test]
+fn a_dependency_with_no_trusted_signature_passes_the_pull() {
     block_on(async {
         let dir = TmpDir::new("pull-http-dependency-signature");
         let (remote, tip, dep) = build_dependency_remote(dir.path()).await;
-        let signer = Ed25519Signer::from_base64(SECRET_B64).unwrap();
-        remote.sign_commit(&tip, &signer).await.unwrap();
+        sign_commits(&remote, &[tip]).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let path = meta_path(&dep, "commitmeta");
+
+        let unsigned = dir.path().join("unsigned");
+        std::fs::create_dir(&unsigned).unwrap();
+        let dest = build_dest(
+            &unsigned,
+            RepoMode::Archive,
+            &server.url(),
+            &signed_policy(),
+        )
+        .await;
+        pull_main(&dest, PullOptions::default()).await.unwrap();
+        assert_complete(&remote, &dest, dest.path(), &dep).await;
+        assert!(!dest.path().join(&path).exists());
+
+        remote
+            .sign_commit(&dep, &Ed25519Signer::from_base64(OTHER_SECRET_B64).unwrap())
+            .await
+            .unwrap();
+        let other = dir.path().join("other");
+        std::fs::create_dir(&other).unwrap();
+        let dest = build_dest(&other, RepoMode::Archive, &server.url(), &signed_policy()).await;
+        pull_main(&dest, PullOptions::default()).await.unwrap();
+        assert_complete(&remote, &dest, dest.path(), &dep).await;
+        assert_eq!(
+            std::fs::read(dest.path().join(&path)).unwrap(),
+            std::fs::read(remote.path().join(&path)).unwrap()
+        );
+    });
+}
+
+/// A dependency that the pull also takes as a target gets the check of a
+/// target. Under `sign-verify` with a signed tip, an unsigned dependency that a
+/// requested ref names fails the pull, and the pull leaves nothing.
+#[test]
+fn a_dependency_that_is_also_a_target_is_checked() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-dependency-target-signature");
+        let (remote, tip, dep) = build_dependency_remote(dir.path()).await;
+        sign_commits(&remote, &[tip]).await;
         let server = RepoServer::start(&dir.path().join("remote"), false).await;
         let dest = build_dest(
             dir.path(),
             RepoMode::Archive,
             &server.url(),
-            &format!("sign-verify=ed25519\nverification-ed25519-key={PUBLIC_B64}\n"),
+            &signed_policy(),
         )
         .await;
 
-        let err = pull_main(&dest, PullOptions::default()).await.unwrap_err();
+        let err = dest
+            .pull(
+                "origin",
+                PullOptions {
+                    refs: vec!["test/main".to_owned(), "dep/uki".to_owned()],
+                    ..PullOptions::default()
+                },
+            )
+            .await
+            .unwrap_err();
         assert!(
             matches!(&err, Error::Signature(m) if m.contains(&format!("commit {dep}"))),
             "{err}"
         );
         assert_left_nothing(&dest).await;
+    });
+}
 
-        remote.sign_commit(&dep, &signer).await.unwrap();
+/// A parent that the depth of the pull takes gets the check of a parent, also
+/// if field 2 of the tip names it. Under `sign-verify` with a signed tip and
+/// an unsigned parent, a pull at depth 0 takes the parent as a dependency
+/// alone and passes. A pull at depth 1 refuses the parent.
+#[test]
+fn a_dependency_that_is_also_a_parent_is_checked() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-dependency-parent-signature");
+        let base = dir.path();
+        for sub in ["p", "t"] {
+            build_tree(&base.join(sub), sub.as_bytes());
+        }
+        let remote = Repo::create(&base.join("remote"), CreateOptions::new(RepoMode::Archive))
+            .await
+            .unwrap();
+        let parent = commit_tree(&remote, base, "p", "test/main", None, FIXED_TS).await;
+        let tip = commit_tree_related(
+            &remote,
+            base,
+            "t",
+            "test/main",
+            Some(parent),
+            &[("boot/base", parent)],
+        )
+        .await;
+        summarize(&remote).await;
+        sign_commits(&remote, &[tip]).await;
+        let server = RepoServer::start(&base.join("remote"), false).await;
+
+        for depth in [0, 1] {
+            let path = base.join(format!("depth-{depth}"));
+            std::fs::create_dir(&path).unwrap();
+            let dest = build_dest(&path, RepoMode::Archive, &server.url(), &signed_policy()).await;
+            let pulled = pull_main(
+                &dest,
+                PullOptions {
+                    depth,
+                    ..PullOptions::default()
+                },
+            )
+            .await;
+            if depth == 0 {
+                pulled.unwrap();
+                assert_complete(&remote, &dest, dest.path(), &parent).await;
+            } else {
+                let err = pulled.unwrap_err();
+                assert!(
+                    matches!(&err, Error::Signature(m) if m.contains(&format!("commit {parent}"))),
+                    "depth {depth}: {err}"
+                );
+                assert_left_nothing(&dest).await;
+            }
+        }
+    });
+}
+
+/// The pull checks no signature of a dependency, so under `sign-verify` and
+/// the default `keep-detached-related` it does not parse the `.commitmeta` of
+/// a dependency. A `.commitmeta` that does not parse passes the pull, and the
+/// destination holds its bytes. With `keep-detached-related=false`, the rule
+/// parses the `.commitmeta`, and the pull fails with `Error::Core` and leaves
+/// nothing.
+#[test]
+fn a_dependency_commitmeta_that_does_not_parse_is_stored() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-dependency-commitmeta-garbage");
+        let (remote, tip, dep) = build_dependency_remote(dir.path()).await;
+        sign_commits(&remote, &[tip]).await;
+        let path = meta_path(&dep, "commitmeta");
+        let garbage = b"\x01\x02\x03\x04\x05";
+        std::fs::write(remote.path().join(&path), garbage).unwrap();
+        let server = RepoServer::start(remote.path(), false).await;
+
+        let kept = dir.path().join("kept");
+        std::fs::create_dir(&kept).unwrap();
+        let dest = build_dest(&kept, RepoMode::Archive, &server.url(), &signed_policy()).await;
         pull_main(&dest, PullOptions::default()).await.unwrap();
         assert_complete(&remote, &dest, dest.path(), &dep).await;
+        assert_eq!(std::fs::read(dest.path().join(&path)).unwrap(), garbage);
+
+        let dropped = dir.path().join("dropped");
+        std::fs::create_dir(&dropped).unwrap();
+        let extra = format!("{}{DROP_RELATED}", signed_policy());
+        let dest = build_dest(&dropped, RepoMode::Archive, &server.url(), &extra).await;
+        let err = pull_main(&dest, PullOptions::default()).await.unwrap_err();
+        assert!(matches!(err, Error::Core(_)), "{err}");
+        assert_left_nothing(&dest).await;
     });
 }
 
@@ -9744,8 +9912,8 @@ fn a_dependency_of_a_chain_is_fetched_once() {
     });
 }
 
-/// A dependency that this repository holds partial is fetched whole, and the
-/// pull removes its marker.
+/// A dependency that this repository holds partial is fetched whole, with a
+/// request of its `.commitmeta`, and the pull removes its marker.
 #[test]
 fn a_dependency_held_partial_is_completed() {
     block_on(async {
@@ -9765,9 +9933,11 @@ fn a_dependency_held_partial_is_completed() {
         .unwrap();
         assert_eq!(dest.commit_state(&dep).await.unwrap(), CommitState::Partial);
 
+        server.forget();
         pull_main(&dest, PullOptions::default()).await.unwrap();
 
         assert_complete(&remote, &dest, dest.path(), &dep).await;
+        assert_eq!(server.requests_for(&meta_path(&dep, "commitmeta")), 1);
     });
 }
 
@@ -10260,47 +10430,27 @@ fn a_list_pull_takes_the_listed_delta_of_a_dependency() {
     });
 }
 
-/// The signature policy also checks a dependency whose commit comes from the
-/// superblock of its delta. A dependency with no trusted signature fails the
-/// pull after the pull fetched the superblock, and the pull leaves nothing.
-/// After the remote signs the dependency, the pull takes the delta.
+/// The pull checks no signature of a dependency whose commit comes from the
+/// superblock of its delta. Under `sign-verify` with a signed tip, an unsigned
+/// dependency and its unsigned delta pass the pull. The pull requests the
+/// superblock and the `.commitmeta` of the dependency one time each, and no
+/// `.commit` of the dependency.
 #[test]
-fn a_dependency_delta_with_no_trusted_signature_fails_the_pull() {
+fn an_unsigned_dependency_from_its_delta_passes_the_pull() {
     block_on(async {
         let dir = TmpDir::new("pull-http-dependency-delta-signature");
         let (remote, tip, dep) = build_dependency_remote(dir.path()).await;
         publish_delta(&remote, None, &dep).await;
-        let signer = Ed25519Signer::from_base64(SECRET_B64).unwrap();
-        remote.sign_commit(&tip, &signer).await.unwrap();
+        sign_commits(&remote, &[tip]).await;
         let server = RepoServer::start(remote.path(), false).await;
         let dest = build_dest(
             dir.path(),
             RepoMode::Archive,
             &server.url(),
-            &format!("sign-verify=ed25519\nverification-ed25519-key={PUBLIC_B64}\n"),
+            &signed_policy(),
         )
         .await;
 
-        let err = pull_main(&dest, PullOptions::default()).await.unwrap_err();
-        assert!(
-            matches!(&err, Error::Signature(m) if m.contains(&format!("commit {dep}"))),
-            "{err}"
-        );
-        let seen = server.seen();
-        assert_eq!(
-            server.statuses_for(&scratch_superblock(&dep)),
-            [200],
-            "{seen:?}"
-        );
-        assert_eq!(
-            server.requests_for(&meta_path(&dep, "commit")),
-            0,
-            "{seen:?}"
-        );
-        assert_left_nothing(&dest).await;
-
-        remote.sign_commit(&dep, &signer).await.unwrap();
-        server.forget();
         pull_main(&dest, PullOptions::default()).await.unwrap();
         let seen = server.seen();
         assert_eq!(
@@ -10311,6 +10461,11 @@ fn a_dependency_delta_with_no_trusted_signature_fails_the_pull() {
         assert_eq!(
             server.requests_for(&meta_path(&dep, "commit")),
             0,
+            "{seen:?}"
+        );
+        assert_eq!(
+            server.requests_for(&meta_path(&dep, "commitmeta")),
+            1,
             "{seen:?}"
         );
         assert_complete(&remote, &dest, dest.path(), &dep).await;

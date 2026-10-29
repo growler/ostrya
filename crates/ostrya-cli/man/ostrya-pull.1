@@ -31,7 +31,7 @@ With none, the pull takes the configured \fB\%branches\fR of the remote, or with
 \fB\-\-url\fR \fIURL\fR
 Fetch from this address, an HTTP URL, an ssh address, or an \fB\%s3://\fR address.
 .IP
-The address replaces the configured \fB\%pull\-url\fR or \fB\%url\fR of the remote. An address that starts with \fB\%ssh://\fR, or that holds no \fB\%://\fR, is an ssh address. \fB\%s3://BUCKET[/PREFIX]\fR is the address of a bucket repository in an \%S3 bucket, which the pull reads with signed requests. A build without the feature \fB\%s3\fR refuses it. With this option, a pull can use a remote that the config does not describe. The config gives no keys for such a remote, and \fB\%gpg\-verify\fR keeps its default of true. So the pull requires a GPG signature on each commit, unless the command line states its own signature policy, for example \%\-\-gpg\-verify=false.
+The address replaces the configured \fB\%pull\-url\fR or \fB\%url\fR of the remote. An address that starts with \fB\%ssh://\fR, or that holds no \fB\%://\fR, is an ssh address. \fB\%s3://BUCKET[/PREFIX]\fR is the address of a bucket repository in an \%S3 bucket, which the pull reads with signed requests. A build without the feature \fB\%s3\fR refuses it. With this option, a pull can use a remote that the config does not describe. The config gives no keys for such a remote, and \fB\%gpg\-verify\fR keeps its default of true. So the pull requires a GPG signature on the commits, as \%\-\-gpg\-verify states, unless the command line states its own signature policy, for example \%\-\-gpg\-verify=false.
 .TP
 \fB\-\-collection\fR \fIID\fR
 Pull refs of the collection ID from each remote that serves it.
@@ -150,9 +150,9 @@ Refuse the pull if a missing commit has no static delta on the remote.
 A missing commit is a commit that this repository does not hold complete, a dependency of a pulled commit included. The pull also fails if the remote serves no summary. The option conflicts with \%\-\-disable\-static\-deltas.
 .TP
 \fB\-\-gpg\-verify\fR[=\fIBOOL\fR]
-Require a GPG signature on every commit that the pull carries.
+Require a GPG signature on the commits that the pull carries.
 .IP
-Without this option, the \fB\%gpg\-verify\fR key of the remote applies, and its default is true. \fB\%\-\-gpg\-verify\fR requires a signature, and \fB\%\-\-gpg\-verify=false\fR requires none. The trusted keys are \fB\%<remote>.trustedkeys.gpg\fR of the repository, the system trusted set, and the keyrings that the \fB\%gpgkeypath\fR key of the remote names. If the remote has the key \fB\%trust\fR, the keys of the commits come from its trust group (see \%ostrya\-config(1)). The command then refuses \fB\%\-\-gpg\-verify\fR, and \fB\%\-\-gpg\-verify=false\fR turns off the GPG check of the group. Possible values: true, false.
+Without this option, the \fB\%gpg\-verify\fR key of the remote applies, and its default is true. \fB\%\-\-gpg\-verify\fR requires a signature, and \fB\%\-\-gpg\-verify=false\fR requires none. The pull checks no signature of a dependency, unless the dependency is also a target, a parent that \%\-\-depth takes, or a commit of a chain of static deltas. The trusted keys are \fB\%<remote>.trustedkeys.gpg\fR of the repository, the system trusted set, and the keyrings that the \fB\%gpgkeypath\fR key of the remote names. If the remote has the key \fB\%trust\fR, the keys of the commits come from its trust group (see \%ostrya\-config(1)). The command then refuses \fB\%\-\-gpg\-verify\fR, and \fB\%\-\-gpg\-verify=false\fR turns off the GPG check of the group. Possible values: true, false.
 .TP
 \fB\-\-gpg\-verify\-summary\fR[=\fIBOOL\fR]
 Require a GPG signature on the summary of the remote.
@@ -160,9 +160,9 @@ Require a GPG signature on the summary of the remote.
 Without this option, the \fB\%gpg\-verify\-summary\fR key of the remote applies, and its default is false. \fB\%\-\-gpg\-verify\-summary\fR requires a signature, and \fB\%\-\-gpg\-verify\-summary=false\fR requires none. If a signature is required and the remote has no \fB\%summary\fR or no \fB\%summary.sig\fR, the pull fails. Possible values: true, false.
 .TP
 \fB\-\-sign\-verify\fR[=\fIBOOL\fR]
-Require an \%ed25519 or spki signature on every pulled commit.
+Require an \%ed25519 or spki signature on the pulled commits.
 .IP
-Without this option, the \fB\%sign\-verify\fR key of the remote applies, and its default is off. \fB\%\-\-sign\-verify\fR requires a signature and selects every engine of this build. \fB\%\-\-sign\-verify=false\fR requires none. A valid signature of one engine is sufficient. The trusted keys come from the \fB\%verification\-<engine>\-key\fR and \fB\%verification\-<engine>\-file\fR keys of the remote, and from the system key store. If the remote has the key \fB\%trust\fR, the keys of the commits come from its trust group (see \%ostrya\-config(1)). The command then refuses \fB\%\-\-sign\-verify\fR, and \fB\%\-\-sign\-verify=false\fR turns off the \%sign\-api check of the group. Possible values: true, false.
+Without this option, the \fB\%sign\-verify\fR key of the remote applies, and its default is off. \fB\%\-\-sign\-verify\fR requires a signature and selects every engine of this build. \fB\%\-\-sign\-verify=false\fR requires none. A valid signature of one engine is sufficient. The pull checks no signature of a dependency, unless the dependency is also a target, a parent that \%\-\-depth takes, or a commit of a chain of static deltas. The trusted keys come from the \fB\%verification\-<engine>\-key\fR and \fB\%verification\-<engine>\-file\fR keys of the remote, and from the system key store. If the remote has the key \fB\%trust\fR, the keys of the commits come from its trust group (see \%ostrya\-config(1)). The command then refuses \fB\%\-\-sign\-verify\fR, and \fB\%\-\-sign\-verify=false\fR turns off the \%sign\-api check of the group. Possible values: true, false.
 .TP
 \fB\-\-sign\-verify\-summary\fR[=\fIBOOL\fR]
 Require an \%ed25519 or spki signature on the summary of the remote.

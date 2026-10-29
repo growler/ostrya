@@ -1959,7 +1959,8 @@ struct RemoteAddArgs {
     /// Do not require a GPG signature on the commits pulled from this remote.
     ///
     /// The command writes `gpg-verify=false`. Without this option, a pull from
-    /// the remote verifies the GPG signature of each commit.
+    /// the remote verifies the GPG signatures of its commits (see the key
+    /// `gpg-verify` in ostrya-config(1)).
     #[arg(long)]
     no_gpg_verify: bool,
     // The `ostree` command writes both keys for this switch.
@@ -3313,8 +3314,8 @@ struct PullArgs {
     /// can use a remote that the config
     /// does not describe. The config gives no keys for such a remote, and
     /// `gpg-verify` keeps its default of true. So the pull requires a GPG
-    /// signature on each commit, unless the command line states its own
-    /// signature policy, for example --gpg-verify=false.
+    /// signature on the commits, as --gpg-verify states, unless the command
+    /// line states its own signature policy, for example --gpg-verify=false.
     #[arg(long)]
     url: Option<String>,
     /// Pull refs of the collection ID from each remote that serves it.
@@ -3514,16 +3515,19 @@ struct PullArgs {
     /// --disable-static-deltas.
     #[arg(long, conflicts_with = "disable_static_deltas")]
     require_static_deltas: bool,
-    /// Require a GPG signature on every commit that the pull carries.
+    /// Require a GPG signature on the commits that the pull carries.
     ///
     /// Without this option, the `gpg-verify` key of the remote applies, and
     /// its default is true. `--gpg-verify` requires a signature, and
-    /// `--gpg-verify=false` requires none. The trusted keys are
-    /// `<remote>.trustedkeys.gpg` of the repository, the system trusted set,
-    /// and the keyrings that the `gpgkeypath` key of the remote names. If the
-    /// remote has the key `trust`, the keys of the commits come from its trust
-    /// group (see ostrya-config(1)). The command then refuses `--gpg-verify`,
-    /// and `--gpg-verify=false` turns off the GPG check of the group.
+    /// `--gpg-verify=false` requires none. The pull checks no signature of a
+    /// dependency, unless the dependency is also a target, a parent that
+    /// --depth takes, or a commit of a chain of static deltas. The trusted keys
+    /// are `<remote>.trustedkeys.gpg` of the repository, the system trusted
+    /// set, and the keyrings that the `gpgkeypath` key of the remote names. If
+    /// the remote has the key `trust`, the keys of the commits come from its
+    /// trust group (see ostrya-config(1)). The command then refuses
+    /// `--gpg-verify`, and `--gpg-verify=false` turns off the GPG check of the
+    /// group.
     #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
     gpg_verify: Option<bool>,
     /// Require a GPG signature on the summary of the remote.
@@ -3535,17 +3539,20 @@ struct PullArgs {
     /// `summary.sig`, the pull fails.
     #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
     gpg_verify_summary: Option<bool>,
-    /// Require an ed25519 or spki signature on every pulled commit.
+    /// Require an ed25519 or spki signature on the pulled commits.
     ///
     /// Without this option, the `sign-verify` key of the remote applies, and
     /// its default is off. `--sign-verify` requires a signature and selects
     /// every engine of this build. `--sign-verify=false` requires none. A
-    /// valid signature of one engine is sufficient. The trusted keys come from
-    /// the `verification-<engine>-key` and `verification-<engine>-file` keys
-    /// of the remote, and from the system key store. If the remote has the
-    /// key `trust`, the keys of the commits come from its trust group (see
-    /// ostrya-config(1)). The command then refuses `--sign-verify`, and
-    /// `--sign-verify=false` turns off the sign-api check of the group.
+    /// valid signature of one engine is sufficient. The pull checks no
+    /// signature of a dependency, unless the dependency is also a target, a
+    /// parent that --depth takes, or a commit of a chain of static deltas. The
+    /// trusted keys come from the `verification-<engine>-key` and
+    /// `verification-<engine>-file` keys of the remote, and from the system
+    /// key store. If the remote has the key `trust`, the keys of the commits
+    /// come from its trust group (see ostrya-config(1)). The command then
+    /// refuses `--sign-verify`, and `--sign-verify=false` turns off the
+    /// sign-api check of the group.
     #[arg(long, require_equals = true, num_args = 0..=1, default_missing_value = "true", value_name = "BOOL")]
     sign_verify: Option<bool>,
     /// Require an ed25519 or spki signature on the summary of the remote.
@@ -4367,10 +4374,13 @@ struct PullLocalArgs {
     /// --disable-fsync and `[core] fsync=false` win over this switch.
     #[arg(long)]
     per_object_fsync: bool,
-    /// Require a GPG signature on every commit that the pull carries.
+    /// Require a GPG signature on the commits that the pull carries.
     ///
     /// The pull uses the keys of the remote that --remote names. Without
     /// --remote, the command refuses this switch. The switch takes no value.
+    /// The pull checks no signature of a dependency, unless the dependency is
+    /// also a target, a parent that --depth takes, or a commit of a chain of
+    /// static deltas.
     #[arg(long)]
     gpg_verify: bool,
     /// Require a GPG signature on the summary of the source.
@@ -4379,14 +4389,16 @@ struct PullLocalArgs {
     /// --remote, the command refuses this switch. The switch takes no value.
     #[arg(long)]
     gpg_verify_summary: bool,
-    /// Require an ed25519 or spki signature on every commit that the pull
+    /// Require an ed25519 or spki signature on the commits that the pull
     /// carries.
     ///
     /// The switch selects every engine of this build, and a valid signature of
     /// one engine is sufficient. The trusted keys come from the
     /// `verification-<engine>-key` and `verification-<engine>-file` keys of
     /// the remote that --remote names, and from the system key store. The
-    /// switch needs --remote and takes no value.
+    /// switch needs --remote and takes no value. The pull checks no signature
+    /// of a dependency, unless the dependency is also a target, a parent that
+    /// --depth takes, or a commit of a chain of static deltas.
     #[arg(long, requires = "remote")]
     sign_verify: bool,
     /// Require an ed25519 or spki signature on the summary of the source.

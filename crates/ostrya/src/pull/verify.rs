@@ -1,6 +1,6 @@
 //! The signature verification of a pull.
 //!
-//! A pull holds two independent policies: one for the commits that it fetches
+//! A pull holds two independent policies: one for the commits that it verifies
 //! and one for the summary of the remote. The pull builds them once, from the
 //! [`PullTrust`] of the pull.
 //!
@@ -16,7 +16,8 @@ use crate::verify::{Found, Policy, PullTrust, examine};
 
 /// The signature verification of one pull.
 pub(crate) struct Verification {
-    /// The policy for each commit that the pull carries.
+    /// The policy for each commit that the pull carries, except a dependency
+    /// in no other role.
     commit: Policy,
     /// The policy for the summary of the remote.
     summary: Policy,
@@ -31,7 +32,8 @@ impl Verification {
         Verification { commit, summary }
     }
 
-    /// Returns `true` if this pull verifies the commits that it carries.
+    /// Returns `true` if this pull verifies its commits. A dependency in no
+    /// other role gets no check.
     pub(crate) fn checks_commits(&self) -> bool {
         self.commit.applies()
     }

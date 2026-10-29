@@ -3049,13 +3049,26 @@ caller, and to a pull of collection refs:
   commits name it. A prune of the destination accepts the parents that the
   pull did not fetch, as after a pull with a small depth.
 - The pull writes no ref for a dependency.
-- The signature policy of the pull applies to each dependency. The pull makes
+- The pull checks no signature of a dependency commit. Field 2 holds the
+  checksum of the dependency, and the checksum and the signatures of the
+  commit that names it cover field 2. The pull hashes the dependency commit
+  that it stores and compares the result with that checksum. The pull makes
   no ref-binding check, no collection-binding check, and no timestamp check
   on a dependency.
-- For a dependency that the repository holds complete, the pull requests the
-  `.commitmeta` and checks the signatures. It requests no object of the tree.
-  A dependency that the repository holds partial gets its whole tree, and the
-  pull removes its `.commitpartial` marker.
+- A target, a parent that the depth of the pull takes, and a commit of a
+  chain of static deltas keep the checks of that role, also if a field 2
+  names them.
+- The pull stores the `.commitmeta` of a dependency that it fetches, under
+  the rule of `[ex-ostrya] keep-detached-related`. It parses that
+  `.commitmeta` only if the rule drops `ostrya.related`. A `.commitmeta` that
+  does not parse then fails the pull. Under the default rule, the pull stores
+  the bytes as the remote serves them.
+- For a dependency that the repository holds complete, the pull requests no
+  `.commitmeta` and no object of the tree. So the dependency does not get the
+  signatures that the remote added after the repository stored it. A pull
+  that takes the dependency as a target requests its `.commitmeta`. A
+  dependency that the repository holds partial gets its whole tree and its
+  `.commitmeta`, and the pull removes its `.commitpartial` marker.
 - A localcache repository can supply a dependency.
 - The pull fetches the dependencies after the commits that name them, in one
   more run. It looks for a static delta of each dependency ("Static deltas of
@@ -3090,15 +3103,31 @@ refs and to a pull of collection refs:
   parent to the pull. The pull imports a dependency one time, also if
   several commits name it.
 - The pull writes no ref for a dependency.
-- The signature policy of the pull applies to each dependency. The pull makes
-  no ref-binding check on a dependency.
+- The pull checks no signature of a dependency commit. Field 2 holds the
+  checksum of the dependency, and the checksum and the signatures of the
+  commit that names it cover field 2. An untrusted pull (`--untrusted`,
+  `PullFlags::UNTRUSTED`) hashes the dependency commit that it imports and
+  compares the result with that checksum. A pull without the flag trusts the
+  source for a dependency as for each other object. The pull makes no
+  ref-binding check on a dependency.
+- A target, a parent that the depth of the pull takes, and a commit of a
+  chain of static deltas keep the checks of that role, also if a field 2
+  names them.
+- The pull copies the `.commitmeta` of a dependency that it imports, under
+  the rule of `[ex-ostrya] keep-detached-related`. It parses that
+  `.commitmeta` only if the rule drops `ostrya.related`. A `.commitmeta` that
+  does not parse then fails the pull. Under the default rule, the pull copies
+  the bytes as it reads them.
 - The pull reads the commit object of a dependency from the source, then
   from each localcache repository, then from the repository. It reads no
   commit object of a dependency that a chain of static deltas makes.
-- For a dependency that the repository holds complete, the pull checks the
-  signatures and walks no tree. A dependency that the repository holds
-  partial gets the walk of its whole tree, and the pull removes its
-  `.commitpartial` marker.
+- For a dependency that the repository holds complete, the pull walks no
+  tree and copies no `.commitmeta`. So the dependency does not get the
+  signatures that the source added after the repository stored it. A pull
+  that takes the dependency as a target copies its `.commitmeta`. A
+  dependency that the repository holds partial gets the walk of its whole
+  tree and its `.commitmeta`, and the pull removes its `.commitpartial`
+  marker.
 - A pull that reads static deltas looks for a delta of each dependency that
   it appends, before its transaction opens ("Static deltas of dependencies").
   The pull applies these deltas after the deltas of the targets. It imports a
@@ -4523,7 +4552,8 @@ over both transports ("The pull of collection refs").
 
 A pull of the port requests the dependencies of a commit over both
 transports, as `.commitmeta` and `.commit` requests of their own ("Dependencies
-in a pull from a remote").
+in a pull from a remote"). For a dependency that the repository holds
+complete, it requests neither file.
 
 A pull of the port requests the composefs image of a commit,
 `objects/<first 2 hex>/<remaining 62 hex>.cfs`, over both transports when

@@ -434,10 +434,12 @@ pub enum TimestampCheck {
 /// the summary. If the policy covers the summary and the source has no
 /// `summary` or no `summary.sig`, the pull fails with [`Error::Signature`].
 ///
-/// The policy belongs to the pull, so the pull verifies each commit that it
-/// carries. This includes the parents that a depth pull follows and a commit
-/// that this repository already holds. A commit that fails the policy fails
-/// the pull with [`Error::Signature`].
+/// The policy belongs to the pull. The pull verifies each target, each
+/// parent that a depth pull follows, and each commit of a chain of static
+/// deltas, also a commit that this repository already holds. It verifies no
+/// dependency, unless the dependency also has one of these roles. The section
+/// `# Dependencies` of [`Repo::pull`] states the reason. A commit that fails
+/// the policy fails the pull with [`Error::Signature`].
 ///
 /// A pull from a remote verifies a commit outside a chain of static deltas in
 /// the step that fetched it. The verification comes before the pull stages
@@ -482,14 +484,18 @@ pub enum TimestampCheck {
 /// opens, so a source that the policy refuses imports nothing.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct PullVerify {
-    /// A GPG signature on each commit, from a trusted keyring of the remote.
+    /// A GPG signature on each commit that the pull verifies, from a trusted
+    /// keyring of the remote.
+    ///
+    /// `# When the pull verifies` names these commits.
     pub gpg: Option<bool>,
     /// A GPG signature on the summary of the remote, from the same keyrings.
     pub gpg_summary: Option<bool>,
-    /// A sign-api signature on each commit, from a trusted key.
+    /// A sign-api signature on each commit that the pull verifies, from a
+    /// trusted key.
     ///
-    /// A trusted key comes from the config of the remote or from the system
-    /// key store.
+    /// `# When the pull verifies` names these commits. A trusted key comes
+    /// from the config of the remote or from the system key store.
     pub sign: Option<bool>,
     /// A sign-api signature on the summary of the remote, from a trusted key.
     pub sign_summary: Option<bool>,
@@ -1241,8 +1247,16 @@ impl Repo {
     ///   no parent to the pull. The pull takes a dependency one time, also if
     ///   several commits name it.
     /// - The pull writes no ref for a dependency.
-    /// - The signature policy of the pull applies to each dependency. The
-    ///   pull makes no ref-binding check on a dependency.
+    /// - The pull checks no signature of a dependency commit. Field 2 holds
+    ///   the checksum of the dependency, and the checksum and the signatures
+    ///   of the commit that names it cover field 2. Under
+    ///   [`UNTRUSTED`](PullFlags::UNTRUSTED), the import hashes the dependency
+    ///   commit and compares the result with that checksum. Without the flag,
+    ///   the pull trusts the source for a dependency as for each other
+    ///   object. The pull makes no ref-binding check on a dependency.
+    /// - A target, a parent that [`depth`](PullOptions::depth) takes, and a
+    ///   commit of a chain of static deltas keep the checks of that role,
+    ///   also if a field 2 names them.
     /// - The pull reads the commit object of a dependency from the source,
     ///   then from each localcache repository, then from this repository. It
     ///   reads no commit object of a dependency that a chain of static deltas
@@ -1250,9 +1264,11 @@ impl Repo {
     /// - A dependency is a commit of the pull for each other rule: its
     ///   `.commitpartial` marker, the walk of its tree, its detached metadata,
     ///   and its composefs image. For a dependency that this repository holds
-    ///   complete, the pull checks the signatures and walks no tree. A
-    ///   dependency that this repository holds partial gets the walk of its
-    ///   whole tree.
+    ///   complete, the pull walks no tree and copies no `.commitmeta`. So the
+    ///   dependency does not get the signatures that the source added after
+    ///   this repository stored it. A pull that takes the dependency as a
+    ///   target copies its `.commitmeta`. A dependency that this repository
+    ///   holds partial gets the walk of its whole tree and its `.commitmeta`.
     /// - A pull that reads static deltas looks for a delta of each dependency
     ///   that it appends and that this repository does not hold complete, as
     ///   "Static deltas" states. The pull imports the objects of a dependency
@@ -1276,8 +1292,8 @@ impl Repo {
     ///   also true for a parent that the source does not hold, if a commit of
     ///   the pull names that parent as a dependency.
     ///
-    /// The pull reports these defects before a commit that the walk finds to
-    /// fail the signature policy, as for each other defect of the walk.
+    /// The pull reports these defects before a target or a parent that fails
+    /// the signature policy, as for each other defect of the walk.
     ///
     /// # Remote config
     ///
@@ -1344,7 +1360,8 @@ impl Repo {
     /// A commit is complete in this repository if the commit object is present
     /// and no `.commitpartial` marker names it. The pull does not walk such a
     /// commit: it reads no object of its tree, and imports its detached
-    /// metadata alone.
+    /// metadata alone. For a dependency that is complete here, the pull also
+    /// imports no detached metadata, as `# Dependencies` states.
     ///
     /// A gap in a complete commit stays until [`fsck`](Repo::fsck) marks the
     /// commit partial. Then a pull walks its tree and fills the gap. `fsck`
@@ -1489,7 +1506,9 @@ impl Repo {
     /// the signatures with the commit needs this order.
     ///
     /// The pull copies the `.commitmeta` of the first source that holds one.
-    /// If `[ex-ostrya] keep-detached-related` of this repository is `false`
+    /// It copies no `.commitmeta` of a dependency that this repository holds
+    /// complete, as `# Dependencies` states. If
+    /// `[ex-ostrya] keep-detached-related` of this repository is `false`
     /// ([`RepoConfig::keep_detached_related`](crate::RepoConfig::keep_detached_related)),
     /// the pull drops `ostrya.related` from it. A zero-length `.commitmeta` in
     /// a source is the "no metadata" marker, and it replaces the copy of this
@@ -1655,10 +1674,10 @@ impl Repo {
     ///   names dependencies of its own. The pull reports it before a failed
     ///   signature check of the walk, and before a `.commitmeta` of the walk
     ///   that does not parse.
-    /// - [`Error::Signature`] if a commit, a dependency, or the summary fails
-    ///   the signature policy, each commit of a chain included. Also if the
-    ///   signatures of a superblock fail the policy, or if the policy covers
-    ///   the summary and `src` has no `summary` or no `summary.sig`.
+    /// - [`Error::Signature`] if a commit or the summary fails the signature
+    ///   policy, each commit of a chain included. Also if the signatures of a
+    ///   superblock fail the policy, or if the policy covers the summary and
+    ///   `src` has no `summary` or no `summary.sig`.
     /// - [`Error::RefNotFound`] if `src` does not hold a requested ref or
     ///   collection ref.
     /// - [`Error::ObjectNotFound`] if neither this repository nor a source
@@ -1677,8 +1696,9 @@ impl Repo {
     ///   update lock passes `[core] lock-timeout-secs`.
     /// - [`Error::Core`] if a commit, a dirtree, or detached metadata does not
     ///   parse. If the signature policy verifies commits, the pull parses the
-    ///   `.commitmeta` that it reads from `src` or a localcache repository, or
-    ///   the copy in this repository if no source holds one. If
+    ///   `.commitmeta` of each commit that it verifies: the copy that it reads
+    ///   from `src` or a localcache repository, or the copy in this repository
+    ///   if no source holds one. It verifies no dependency. If
     ///   `[ex-ostrya] keep-detached-related` of this repository is `false`, the
     ///   pull parses each `.commitmeta` that it stores.
     /// - [`Error::InvalidFormat`] if the `summary` or `summary.sig` of `src` is
@@ -1855,10 +1875,12 @@ impl Repo {
         // it again.
         //
         // The dependencies of the commits are commits of the pull too. The
-        // walk appends each one after the chains, at depth 0, and checks it
-        // over the bytes that it read. A pull that reads static deltas then
-        // looks for the delta of each dependency that it appended, before the
-        // transaction opens.
+        // walk appends each one after the chains, at depth 0. It checks no
+        // signature of an appended dependency: field 2 of the commit that
+        // names it holds its checksum, and the signatures of that commit
+        // cover field 2. A pull that reads static deltas then looks for the
+        // delta of each dependency that it appended, before the transaction
+        // opens.
         let mut check = verification.checks_commits().then(|| ChainCheck {
             repo: self,
             sources: &sources,
@@ -1906,16 +1928,8 @@ impl Repo {
                     deps.record(*commit, entries);
                 }
             }
-            appended = collect_dependencies(
-                self,
-                &sources,
-                deps,
-                &done,
-                &mut commits,
-                &mut seen,
-                check.as_mut(),
-            )
-            .await?;
+            appended =
+                collect_dependencies(self, &sources, deps, &done, &mut commits, &mut seen).await?;
         }
         // The pull reports a defect that the walk finds before a failed check.
         if let Some(ChainCheck {
@@ -2053,6 +2067,7 @@ impl Repo {
                         root_dirtree: parsed.root_dirtree,
                         root_dirmeta: parsed.root_dirmeta,
                         held,
+                        dependency: false,
                         image_key: recorded_digest(&parsed).ok().flatten(),
                     });
                 }
@@ -2151,8 +2166,12 @@ impl Repo {
                     count,
                 )
                 .await?;
-                self.import_detached_metadata(&txn, &sources, commit, related, count)
-                    .await?;
+                // A dependency that this repository holds complete keeps the
+                // detached metadata of this repository.
+                if !(chain_commit.dependency && chain_commit.held) {
+                    self.import_detached_metadata(&txn, &sources, commit, related, count)
+                        .await?;
+                }
                 Box::pin(self.import_composefs_image(&txn, &sources, chain_commit, flags, count))
                     .await?;
             }
@@ -2748,6 +2767,7 @@ async fn collect_chain(
                 root_dirtree: commit.root_dirtree,
                 root_dirmeta: commit.root_dirmeta,
                 held: false,
+                dependency: false,
                 image_key: recorded_digest(&commit).ok().flatten(),
             });
             if let Some(check) = check.as_deref_mut() {
@@ -2786,6 +2806,10 @@ struct ChainCommit {
     /// The pull sets it when the transaction is open, where it writes the
     /// markers.
     held: bool,
+    /// `true` for a dependency that the walk appended after the chains. Such
+    /// a commit is a dependency alone: a target, a parent, and a commit of a
+    /// chain are not appended.
+    dependency: bool,
     /// The value of `ostree.composefs.digest.v0` of the commit, or `None` if
     /// the commit does not carry the key or carries a malformed value.
     image_key: Option<[u8; 32]>,
@@ -2844,8 +2868,12 @@ impl ChainDependencies {
 /// intermediate commits of the chains, and `deps` holds their dependencies.
 /// The call reads each other dependency from the first repository of
 /// `sources` that holds it, else from `repo`. It follows no parent of a
-/// dependency. If `check` is present, it runs on each dependency that the
-/// call appends, as [`collect_chain`] runs it.
+/// dependency.
+///
+/// The call checks no signature of a dependency. Field 2 of the commit that
+/// names the dependency holds its checksum, and the checksum and the
+/// signatures of that commit cover field 2. A dependency that the walk
+/// collected, or that a chain makes, keeps the check of that role.
 ///
 /// # Errors
 ///
@@ -2863,7 +2891,6 @@ async fn collect_dependencies(
     made: &HashSet<Checksum>,
     out: &mut Vec<ChainCommit>,
     seen: &mut HashMap<Checksum, i32>,
-    mut check: Option<&mut ChainCheck<'_>>,
 ) -> Result<Vec<Checksum>> {
     let mut appended = Vec::new();
     for (dependency, naming, name) in &deps.named {
@@ -2875,9 +2902,9 @@ async fn collect_dependencies(
             continue;
         }
         let Some(LoadedCommit {
-            bytes,
             commit,
             dependencies,
+            ..
         }) = load_dependency(sources, repo, &dependency).await?
         else {
             return Err(Error::ObjectNotFound {
@@ -2895,11 +2922,9 @@ async fn collect_dependencies(
             root_dirtree: commit.root_dirtree,
             root_dirmeta: commit.root_dirmeta,
             held: false,
+            dependency: true,
             image_key: recorded_digest(&commit).ok().flatten(),
         });
-        if let Some(check) = check.as_deref_mut() {
-            check.check(&dependency, &bytes).await;
-        }
     }
     Ok(appended)
 }

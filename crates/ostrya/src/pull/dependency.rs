@@ -13,7 +13,12 @@
 //! `from` of the delta is the first paired entry, in target order, that this
 //! repository holds complete. The pull takes the from-scratch delta only if
 //! it holds no paired entry complete.
+//!
+//! [`Dependencies`] holds the dependencies that a pull met, the commits that
+//! name them, and the error for a dependency that names dependencies of its
+//! own, for the local pull and for the pull over HTTP.
 
+use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 
 use ostrya_core::{Checksum, ObjectType};
@@ -24,6 +29,96 @@ use crate::repo::Repo;
 
 use super::RefPlace;
 use super::delta::{DependencyLookup, complete_here_blocking};
+
+/// The dependencies that one pull met, and the commits that name them.
+///
+/// The type records the state alone. Each engine chooses when it calls
+/// [`nested_error`](Dependencies::nested_error): the local pull checks each
+/// dependency after the walk of the chains, and the pull over HTTP checks
+/// each commit when its step ends.
+#[derive(Default)]
+pub(super) struct Dependencies {
+    /// Each dependency, in the order in which the pull first recorded it.
+    order: Vec<Checksum>,
+    /// The commit that first named each dependency, and the name of its
+    /// entry.
+    named: HashMap<Checksum, (Checksum, String)>,
+    /// The entries of field 2 of each commit whose field 2 is not empty, in
+    /// the stored order. Under `keys_only`, each commit has an empty list
+    /// here.
+    naming: HashMap<Checksum, Vec<(String, Checksum)>>,
+    /// `true` if `naming` keeps the commits alone, for the checks. A pull
+    /// that reads no static delta of a dependency pairs no dependency with a
+    /// target, so it keeps no entry.
+    keys_only: bool,
+}
+
+impl Dependencies {
+    /// Returns an empty record. `keys_only` is `true` if the record keeps no
+    /// entry of field 2.
+    pub(super) fn new(keys_only: bool) -> Self {
+        Self {
+            keys_only,
+            ..Self::default()
+        }
+    }
+
+    /// Returns `true` if the record keeps no entry of field 2.
+    pub(super) fn keys_only(&self) -> bool {
+        self.keys_only
+    }
+
+    /// Records the dependencies `dependencies` of `commit`.
+    ///
+    /// A dependency that an earlier commit named keeps the first commit and
+    /// entry name. An empty list records nothing.
+    pub(super) fn record(&mut self, commit: Checksum, dependencies: Vec<(String, Checksum)>) {
+        if dependencies.is_empty() {
+            return;
+        }
+        for (name, dependency) in &dependencies {
+            if let Entry::Vacant(slot) = self.named.entry(*dependency) {
+                slot.insert((commit, name.clone()));
+                self.order.push(*dependency);
+            }
+        }
+        let entries = if self.keys_only {
+            Vec::new()
+        } else {
+            dependencies
+        };
+        self.naming.insert(commit, entries);
+    }
+
+    /// Returns each dependency, in the order in which the pull first
+    /// recorded it.
+    pub(super) fn order(&self) -> &[Checksum] {
+        &self.order
+    }
+
+    /// Returns the commit that first named `dependency`, and the name of its
+    /// entry, or `None` if no commit named it.
+    pub(super) fn named(&self, dependency: &Checksum) -> Option<(Checksum, &str)> {
+        self.named
+            .get(dependency)
+            .map(|(commit, name)| (*commit, name.as_str()))
+    }
+
+    /// Returns the entries of field 2 of each commit whose field 2 is not
+    /// empty. Under `keys_only`, each list is empty.
+    pub(super) fn naming(&self) -> &HashMap<Checksum, Vec<(String, Checksum)>> {
+        &self.naming
+    }
+
+    /// Returns the nested-dependency error for `dependency`, or `None` if no
+    /// commit named it. The error names the commit that first named the
+    /// dependency. The caller calls this method when it finds that
+    /// `dependency` has dependencies of its own.
+    pub(super) fn nested_error(&self, dependency: &Checksum) -> Option<Error> {
+        self.named(dependency)
+            .map(|(commit, name)| related::nested_dependency(commit, name, dependency))
+    }
+}
 
 /// A dependency that a pull fetches, with the targets whose chains name it.
 pub(super) struct Named {
@@ -273,6 +368,72 @@ mod tests {
 
     fn pending(list: &[u8]) -> Vec<Checksum> {
         list.iter().map(|byte| cs(*byte)).collect()
+    }
+
+    /// A dependency that two commits name is recorded once, with the commit
+    /// and the entry name of the first. Each commit with a dependency is
+    /// recorded, and a commit with an empty field 2 is not.
+    #[test]
+    fn dependencies_keep_the_first_naming_commit() {
+        let mut deps = Dependencies::new(false);
+        deps.record(cs(1), entries(&[("boot/uki", 3)]));
+        deps.record(cs(2), entries(&[("lib/uki", 3), ("lib/c", 4)]));
+        deps.record(cs(5), Vec::new());
+        assert!(!deps.keys_only());
+        assert_eq!(deps.order(), [cs(3), cs(4)]);
+        assert_eq!(deps.named(&cs(3)), Some((cs(1), "boot/uki")));
+        assert_eq!(deps.named(&cs(4)), Some((cs(2), "lib/c")));
+        assert_eq!(deps.named(&cs(5)), None);
+        let mut naming: Vec<&Checksum> = deps.naming().keys().collect();
+        naming.sort_unstable();
+        assert_eq!(naming, [&cs(1), &cs(2)]);
+        assert_eq!(deps.naming()[&cs(2)][1], ("lib/c".to_owned(), cs(4)));
+    }
+
+    /// Under `keys_only`, the record keeps each commit that names a
+    /// dependency, with an empty list, and keeps the order and the first
+    /// naming commit of each dependency.
+    #[test]
+    fn dependencies_keep_the_commits_alone_under_keys_only() {
+        let mut deps = Dependencies::new(true);
+        deps.record(cs(1), entries(&[("boot/uki", 3)]));
+        deps.record(cs(2), entries(&[("lib/c", 4), ("lib/uki", 3)]));
+        deps.record(cs(5), Vec::new());
+        assert!(deps.keys_only());
+        assert_eq!(deps.order(), [cs(3), cs(4)]);
+        assert_eq!(deps.named(&cs(3)), Some((cs(1), "boot/uki")));
+        let mut naming: Vec<&Checksum> = deps.naming().keys().collect();
+        naming.sort_unstable();
+        assert_eq!(naming, [&cs(1), &cs(2)]);
+        assert!(deps.naming().values().all(Vec::is_empty));
+    }
+
+    /// The error for a nested dependency names the commit and the entry that
+    /// first named the dependency. A dependency that no commit named gives no
+    /// error.
+    #[test]
+    fn a_nested_dependency_error_names_the_first_naming_commit() {
+        let mut deps = Dependencies::new(false);
+        deps.record(cs(1), entries(&[("lib/b", 2)]));
+        deps.record(cs(3), entries(&[("lib/x", 2)]));
+        match deps.nested_error(&cs(2)) {
+            Some(Error::InvalidRelated {
+                commit,
+                field: RelatedField::Dependencies,
+                reason,
+            }) => {
+                assert_eq!(commit, Some(cs(1)));
+                assert_eq!(
+                    reason,
+                    format!(
+                        "dependency lib/b names commit {}, which has dependencies of its own",
+                        cs(2)
+                    )
+                );
+            }
+            other => panic!("expected InvalidRelated in field 2, got {other:?}"),
+        }
+        assert!(deps.nested_error(&cs(4)).is_none());
     }
 
     /// One result of [`pair_targets`]: the first byte of the checksum, the

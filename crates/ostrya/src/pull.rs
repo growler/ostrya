@@ -1903,8 +1903,8 @@ impl Repo {
         // A pull that reads no static delta pairs no dependency with a target,
         // so it keeps no entry of field 2 and no parent.
         let mut deps = (!flags.contains(PullFlags::COMMIT_ONLY)).then(|| ChainDependencies {
-            keys_only: !reads_deltas,
-            ..ChainDependencies::default()
+            inner: dependency::Dependencies::new(!reads_deltas),
+            parents: HashMap::new(),
         });
         let mut appended: Vec<Checksum> = Vec::new();
         // The commit chains, in the order of the refs, each commit once.
@@ -1934,7 +1934,7 @@ impl Repo {
             // chains, so the walk reads none of them again.
             for commit in deltas.levels().iter().flatten() {
                 if let Some(entries) = level_dependencies.remove(commit) {
-                    deps.record(*commit, entries);
+                    deps.inner.record(*commit, entries);
                 }
             }
             appended =
@@ -1957,7 +1957,7 @@ impl Repo {
                     &targets,
                     opts.depth,
                     &deps.parents,
-                    &deps.naming,
+                    deps.inner.naming(),
                     appended,
                 );
                 drop(deps);
@@ -2759,7 +2759,7 @@ async fn collect_chain(
     )) = current
     {
         if let Some(deps) = deps.as_deref_mut()
-            && !deps.keys_only
+            && !deps.inner.keys_only()
         {
             deps.parents.insert(checksum, commit.parent);
         }
@@ -2782,7 +2782,7 @@ async fn collect_chain(
                 check.check(&checksum, &bytes).await;
             }
             if let Some(deps) = deps.as_deref_mut() {
-                deps.record(checksum, dependencies);
+                deps.inner.record(checksum, dependencies);
             }
         }
         drop(bytes);
@@ -2825,46 +2825,17 @@ struct ChainCommit {
 
 /// The dependencies that the walk of the chains of a local pull met, and the
 /// commits that it checks them against.
-#[derive(Default)]
 struct ChainDependencies {
-    /// Each dependency, the commit that first named it, and the name of that
-    /// entry, in the order in which the walk met the dependencies.
-    named: Vec<(Checksum, Checksum, String)>,
-    /// The dependencies in `named`.
-    known: HashSet<Checksum>,
-    /// The entries of field 2 of each commit whose field 2 is not empty, in
-    /// the stored order. Under `keys_only`, each commit has no entry here.
-    naming: HashMap<Checksum, Vec<(String, Checksum)>>,
-    /// The parent that each commit of the chains named. Under `keys_only`,
-    /// the map stays empty.
+    /// The dependencies, in the order in which the pull first recorded them,
+    /// and the commits that name them. The pull records the dependencies of
+    /// the commits of the walk first, then the dependencies of the
+    /// intermediate commits of the delta levels.
+    inner: dependency::Dependencies,
+    /// The parent that each commit of the chains named. Under
+    /// [`keys_only`](dependency::Dependencies::keys_only), the map stays
+    /// empty: a pull that reads no static delta pairs no dependency with a
+    /// target, so it reads no parent.
     parents: HashMap<Checksum, Option<Checksum>>,
-    /// `true` if `naming` keeps the commits alone, for the checks, and
-    /// `parents` stays empty. A pull that reads no static delta pairs no
-    /// dependency with a target, so it reads neither.
-    keys_only: bool,
-}
-
-impl ChainDependencies {
-    /// Records the dependencies `dependencies` of `commit`.
-    ///
-    /// A dependency that an earlier commit named keeps the first commit and
-    /// entry name. An empty list records nothing.
-    fn record(&mut self, commit: Checksum, dependencies: Vec<(String, Checksum)>) {
-        if dependencies.is_empty() {
-            return;
-        }
-        for (name, dependency) in &dependencies {
-            if self.known.insert(*dependency) {
-                self.named.push((*dependency, commit, name.clone()));
-            }
-        }
-        let entries = if self.keys_only {
-            Vec::new()
-        } else {
-            dependencies
-        };
-        self.naming.insert(commit, entries);
-    }
 }
 
 /// Appends each dependency of `deps` that the walk did not collect to `out`,
@@ -2912,15 +2883,21 @@ async fn collect_dependencies(
     out: &mut Vec<ChainCommit>,
     seen: &mut HashMap<Checksum, i32>,
 ) -> Result<Vec<Checksum>> {
-    // The position in `deps.named` of each dependency to read, and its
-    // checksum. A held dependency that names dependencies of its own stops
-    // the list: the call reads no dependency after it.
+    // The position in `deps.inner.order()` of each dependency to read, and
+    // its checksum. A held dependency that names dependencies of its own
+    // stops the list: the call reads no dependency after it.
+    let order = deps.inner.order();
+    let nested_error = |dependency: &Checksum| {
+        deps.inner
+            .nested_error(dependency)
+            .expect("a commit names each dependency of the order")
+    };
     let mut positions = Vec::new();
     let mut wanted = Vec::new();
     let mut stop = None;
-    for (at, (dependency, _, _)) in deps.named.iter().enumerate() {
+    for (at, dependency) in order.iter().enumerate() {
         if seen.contains_key(dependency) || made.contains(dependency) {
-            if deps.naming.contains_key(dependency) {
+            if deps.inner.naming().contains_key(dependency) {
                 stop = Some(at);
                 break;
             }
@@ -2942,19 +2919,15 @@ async fn collect_dependencies(
             .await?
         {
             Ok(loaded) => loaded,
-            Err(nested) => {
-                let (dependency, naming, name) = &deps.named[positions[nested]];
-                return Err(related::nested_dependency(*naming, name, dependency));
-            }
+            Err(nested) => return Err(nested_error(&order[positions[nested]])),
         };
     }
     if let Some(at) = stop {
-        let (dependency, naming, name) = &deps.named[at];
-        return Err(related::nested_dependency(*naming, name, dependency));
+        return Err(nested_error(&order[at]));
     }
     let mut appended = Vec::with_capacity(loaded.len());
     for (at, dependency) in positions.into_iter().zip(loaded) {
-        let checksum = deps.named[at].0;
+        let checksum = order[at];
         seen.insert(checksum, 0);
         appended.push(checksum);
         out.push(ChainCommit {
@@ -4151,36 +4124,5 @@ mod tests {
         assert!(flags.contains(PullFlags::COMMIT_ONLY));
         assert!(!flags.contains(PullFlags::FORCE_COPY));
         assert!(PullFlags::empty().contains(PullFlags::NONE));
-    }
-
-    /// Returns the checksum with each byte `byte`.
-    fn csum(byte: u8) -> Checksum {
-        Checksum::from_bytes([byte; 32])
-    }
-
-    /// A dependency that two commits name is recorded once, with the commit
-    /// and the entry name of the first. Each commit with a dependency is
-    /// recorded, and a commit with an empty field 2 is not.
-    #[test]
-    fn chain_dependencies_keep_the_first_naming_commit() {
-        let mut deps = ChainDependencies::default();
-        deps.record(csum(1), vec![("boot/uki".into(), csum(3))]);
-        deps.record(
-            csum(2),
-            vec![("lib/uki".into(), csum(3)), ("lib/c".into(), csum(4))],
-        );
-        deps.record(csum(5), Vec::new());
-        assert_eq!(
-            deps.named,
-            [
-                (csum(3), csum(1), "boot/uki".to_owned()),
-                (csum(4), csum(2), "lib/c".to_owned()),
-            ]
-        );
-        assert_eq!(deps.known, HashSet::from([csum(3), csum(4)]));
-        let mut naming: Vec<&Checksum> = deps.naming.keys().collect();
-        naming.sort_unstable();
-        assert_eq!(naming, [&csum(1), &csum(2)]);
-        assert_eq!(deps.naming[&csum(2)][1], ("lib/c".to_owned(), csum(4)));
     }
 }

@@ -1238,7 +1238,7 @@ impl Repo {
         let mut carry = Carry::default();
         // A pull that looks for no delta of a dependency pairs no dependency
         // with a target, so it keeps no entry of field 2.
-        carry.dependencies.keys_only = !looks;
+        carry.dependencies.inner = dependency::Dependencies::new(!looks);
         for level in deltas.levels() {
             let jobs = deltas.parse_level(self, &delta_source, level).await?;
             let phase = Phase {
@@ -1316,8 +1316,9 @@ impl Repo {
             // search for their deltas checks no signature of a superblock.
             let mut pending: Vec<Checksum> = carry
                 .dependencies
-                .named
-                .keys()
+                .inner
+                .order()
+                .iter()
                 .filter(|dependency| !carry.parents.contains_key(*dependency))
                 .copied()
                 .collect();
@@ -1327,7 +1328,7 @@ impl Repo {
                     &targets,
                     opts.depth,
                     &carry.parents,
-                    &carry.dependencies.naming,
+                    carry.dependencies.inner.naming(),
                     pending,
                 );
                 let roots: Vec<Checksum> = named.iter().map(|named| named.checksum).collect();
@@ -2718,7 +2719,7 @@ struct Carry {
     started: usize,
     /// The dependencies that the runs met, so that the checks of a
     /// dependency span all runs.
-    dependencies: Dependencies,
+    dependencies: PlanDependencies,
     /// The parent that each commit of the runs named. A commit is here if a
     /// run reached it. A pull that follows no dependency keeps no parent.
     parents: HashMap<Checksum, Option<Checksum>>,
@@ -2911,7 +2912,7 @@ struct Plan {
     parents: HashMap<Checksum, Option<Checksum>>,
     /// The dependencies that the plan met, and the commits that it checks
     /// them against.
-    dependencies: Dependencies,
+    dependencies: PlanDependencies,
 }
 
 /// The state of the checks of the dependencies of one pull.
@@ -2921,18 +2922,12 @@ struct Plan {
 /// whichever of the two facts the plan learns first. The same holds for a
 /// dependency that is also a parent that the remote does not hold.
 #[derive(Default)]
-struct Dependencies {
-    /// The commit that first named each dependency, and the name of its
-    /// entry.
-    named: HashMap<Checksum, (Checksum, String)>,
-    /// The entries of field 2 of each commit whose field 2 is not empty, in
-    /// the stored order. Under `keys_only`, each commit has no entry here.
-    naming: HashMap<Checksum, Vec<(String, Checksum)>>,
+struct PlanDependencies {
+    /// The dependencies, and the commits that name them. A pull that looks
+    /// for no delta of a dependency keeps no entry of field 2.
+    inner: dependency::Dependencies,
     /// The parents that the remote does not hold.
     absent: HashSet<Checksum>,
-    /// `true` if `naming` keeps the commits alone, for the checks. A pull
-    /// that looks for no delta of a dependency reads no entry.
-    keys_only: bool,
 }
 
 /// A dirtree walked under a scope smaller than the whole tree.
@@ -3341,11 +3336,11 @@ impl Plan {
         if dependencies.is_empty() {
             return Ok(());
         }
-        if let Some((naming, name)) = self.dependencies.named.get(&commit) {
-            return Err(related::nested_dependency(*naming, name, &commit));
+        if let Some(err) = self.dependencies.inner.nested_error(&commit) {
+            return Err(err);
         }
         for (name, dependency) in &dependencies {
-            if *dependency == commit || self.dependencies.naming.contains_key(dependency) {
+            if *dependency == commit || self.dependencies.inner.naming().contains_key(dependency) {
                 return Err(related::nested_dependency(commit, name, dependency));
             }
             if self.dependencies.absent.contains(dependency) {
@@ -3354,17 +3349,8 @@ impl Plan {
                     ty: ObjectType::Commit,
                 });
             }
-            self.dependencies
-                .named
-                .entry(*dependency)
-                .or_insert_with(|| (commit, name.clone()));
         }
-        let entries = if self.dependencies.keys_only {
-            Vec::new()
-        } else {
-            dependencies
-        };
-        self.dependencies.naming.insert(commit, entries);
+        self.dependencies.inner.record(commit, dependencies);
         Ok(())
     }
 
@@ -3375,7 +3361,7 @@ impl Plan {
     /// [`Error::ObjectNotFound`] if a commit of this pull names the parent as
     /// a dependency.
     fn apply_absent(&mut self, commit: Checksum) -> Result<()> {
-        if self.dependencies.named.contains_key(&commit) {
+        if self.dependencies.inner.named(&commit).is_some() {
             return Err(Error::ObjectNotFound {
                 checksum: commit,
                 ty: ObjectType::Commit,
@@ -5209,11 +5195,11 @@ mod tests {
         assert!(plan.next().is_none());
         assert_eq!(marked, [csum(1)]);
         assert_eq!(
-            plan.dependencies.named.get(&csum(3)),
-            Some(&(csum(1), "boot/uki".to_owned()))
+            plan.dependencies.inner.named(&csum(3)),
+            Some((csum(1), "boot/uki"))
         );
         assert_eq!(
-            plan.dependencies.naming.get(&csum(1)),
+            plan.dependencies.inner.naming().get(&csum(1)),
             Some(&vec![("boot/uki".to_owned(), csum(3))])
         );
     }
@@ -5230,11 +5216,11 @@ mod tests {
             .unwrap();
         assert!(plan.next().is_none());
         assert_eq!(
-            plan.dependencies.named.get(&csum(3)),
-            Some(&(csum(1), "a/x".to_owned()))
+            plan.dependencies.inner.named(&csum(3)),
+            Some((csum(1), "a/x"))
         );
-        assert_eq!(plan.dependencies.named.len(), 1);
-        assert_eq!(plan.dependencies.naming.len(), 2);
+        assert_eq!(plan.dependencies.inner.order(), [csum(3)]);
+        assert_eq!(plan.dependencies.inner.naming().len(), 2);
         plan.apply(naming(csum(3), None, &[]), &mut marked).unwrap();
         assert_eq!(plan.parents.get(&csum(3)), Some(&None));
     }
@@ -5305,7 +5291,7 @@ mod tests {
         plan.apply(Step::Absent(csum(2)), &mut marked).unwrap();
         plan.apply(naming(csum(1), None, &[("lib/b", 3)]), &mut marked)
             .unwrap();
-        assert!(plan.dependencies.named.contains_key(&csum(3)));
+        assert!(plan.dependencies.inner.named(&csum(3)).is_some());
         assert!(!plan.parents.contains_key(&csum(2)));
     }
 

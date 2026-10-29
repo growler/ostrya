@@ -2279,12 +2279,15 @@ Eight divergences stand at `prune`:
   defective related value, the port writes one line `warning: related
   commits in <field> of commit <checksum>: <reason>` to standard error, and
   exits 0. The port also reads the `.commitmeta` of each commit that the
-  walk reaches. A `.commitmeta` that does not parse as an `a{sv}` dict, or
-  that is larger than the size cap of a metadata object, fails the port's
-  run at exit 1, and the run deletes nothing. No observation records how the
-  tool treats such a file. On a repository where no commit names a related
-  commit and each `.commitmeta` parses, the two commands delete the same
-  objects.
+  walk reaches. It parses the file only if its bytes hold the key
+  `ostrya.related` and its terminating NUL. So a file that does not hold the
+  key and does not parse gives no error. A `.commitmeta` that holds the key
+  and does not parse as an `a{sv}` dict fails the port's run at exit 1. A
+  `.commitmeta` that is larger than the size cap of a metadata object fails
+  the run in the same way, with or without the key. A failed run deletes
+  nothing. No observation records how the tool treats such a file. On a
+  repository where no commit names a related commit and each `.commitmeta`
+  that holds the key parses, the two commands delete the same objects.
 
 Two corners at `prune` are not settled by an observation this host can make:
 

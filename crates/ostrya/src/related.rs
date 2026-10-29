@@ -50,6 +50,10 @@ use crate::transaction::Transaction;
 /// The detached metadata key of the build sources.
 pub(crate) const RELATED_KEY: &str = "ostrya.related";
 
+/// The bytes of the key [`RELATED_KEY`] in a serialized `a{sv}` dict: the
+/// key and its terminating NUL.
+const RELATED_KEY_BYTES: &[u8] = b"ostrya.related\0";
+
 /// The type string of a field of related entries.
 const RELATED_SIGNATURE: &str = "a(say)";
 
@@ -222,6 +226,21 @@ pub(crate) fn build_sources(
         Some(value) => entries_of_variant(value).map(Some),
         None => Ok(None),
     }
+}
+
+/// Returns `true` if `bytes`, the contents of a `.commitmeta` file, can hold
+/// an `ostrya.related` entry.
+///
+/// The test searches `bytes` for the key and its terminating NUL. In a
+/// serialized `a{sv}` dict, the key of each entry is a NUL-terminated string
+/// at contiguous bytes. So a parse of `bytes` finds an `ostrya.related` entry
+/// only if `bytes` holds these bytes. These bytes can also be in a value, for
+/// example in a string. Then the test gives `true`, and the parse finds no
+/// entry.
+pub(crate) fn may_hold_build_sources(bytes: &[u8]) -> bool {
+    bytes
+        .windows(RELATED_KEY_BYTES.len())
+        .any(|window| window == RELATED_KEY_BYTES)
 }
 
 /// Reads the value of one `ostrya.related` entry as related entries.
@@ -1053,6 +1072,34 @@ mod tests {
             Value::Str(RELATED_KEY.into()),
             value,
         ])])
+    }
+
+    #[test]
+    fn the_key_bytes_are_the_key_and_a_nul() {
+        let mut expected = RELATED_KEY.as_bytes().to_vec();
+        expected.push(0);
+        assert_eq!(RELATED_KEY_BYTES, expected);
+    }
+
+    #[test]
+    fn may_hold_build_sources_needs_the_key_and_its_nul() {
+        assert!(!may_hold_build_sources(b""));
+        assert!(!may_hold_build_sources(b"ostree.gpgsigs\0"));
+        assert!(may_hold_build_sources(b"ostrya.related\0"));
+        assert!(may_hold_build_sources(b"\x01\x02ostrya.related\0\0\0v"));
+        assert!(!may_hold_build_sources(b"\x01\x02ostrya.related"));
+        assert!(!may_hold_build_sources(b"ostrya.relatedX\0"));
+        assert!(!may_hold_build_sources(b"ostrya.relate\0"));
+    }
+
+    #[test]
+    fn may_hold_build_sources_finds_the_key_of_a_serialized_dict() {
+        let dict = detached(Value::variant(
+            Type::parse(RELATED_SIGNATURE).unwrap(),
+            Value::Array(Vec::new()),
+        ));
+        let bytes = crate::summary::serialize_signature_dict(&dict).unwrap();
+        assert!(may_hold_build_sources(&bytes));
     }
 
     #[test]

@@ -791,17 +791,219 @@ fn a_prune_of_each_commit_gives_the_same_warnings() {
     });
 }
 
+/// Returns the bytes of the `a{sv}` dict `meta` with a broken framing: the
+/// last byte, which is the end offset of the last entry, points past the end
+/// of the dict. The other bytes stay, so the keys stay readable.
+fn broken_dict_bytes(meta: &Value) -> Vec<u8> {
+    let mut bytes = ostrya_core::to_bytes(&Type::parse("a{sv}").unwrap(), meta).unwrap();
+    *bytes.last_mut().unwrap() = 0xff;
+    bytes
+}
+
+/// Returns `true` if `bytes` hold the key `ostrya.related` and its
+/// terminating NUL.
+fn holds_key(bytes: &[u8]) -> bool {
+    let key = format!("{RELATED_KEY}\0");
+    bytes
+        .windows(key.len())
+        .any(|window| window == key.as_bytes())
+}
+
+/// Returns a signature entry of type `aay`, as `ostree.gpgsigs` holds.
+fn signatures() -> (Type, Value) {
+    (
+        Type::parse("aay").unwrap(),
+        Value::Array(vec![
+            Value::Bytes(vec![0x99; 40]),
+            Value::Bytes(vec![0x98; 7]),
+        ]),
+    )
+}
+
 #[test]
-fn a_commitmeta_that_does_not_parse_fails_the_prune() {
+fn a_commitmeta_without_the_key_is_not_parsed() {
+    let tmp = TmpDir::new("prune-related-unread-commitmeta");
+    block_on(async {
+        let repo = repo_with_trees(tmp.path(), &["head", "orphan"]).await;
+        let head = commit(&repo, tmp.path(), "head", None, &[], Some("main")).await;
+        let cases = [
+            // An `a{sv}` whose one entry claims an offset past the end.
+            vec![b'k', 0, 0, b's', 0xff],
+            broken_dict_bytes(&dict(vec![("ostree.gpgsigs", signatures())])),
+        ];
+        for bytes in cases {
+            assert!(!holds_key(&bytes));
+            let orphan = commit(&repo, tmp.path(), "orphan", None, &[], None).await;
+            write_raw_bytes(&repo, &head, &bytes);
+            assert!(
+                matches!(
+                    repo.read_commit_detached_metadata(&head).await,
+                    Err(Error::Core(_))
+                ),
+                "the file does not parse"
+            );
+            let stats = repo.prune(&refs_only()).await.unwrap();
+            assert!(stats.warnings.is_empty(), "got {:?}", stats.warnings);
+            assert!(holds(&repo, &head).await);
+            assert_eq!(
+                std::fs::read(detached_path(&repo, &head)).unwrap(),
+                bytes,
+                "the kept commit keeps its .commitmeta"
+            );
+            assert!(!holds(&repo, &orphan).await, "the orphan is pruned");
+        }
+    });
+}
+
+#[test]
+fn a_commitmeta_that_holds_the_key_and_does_not_parse_fails_the_prune() {
     let tmp = TmpDir::new("prune-related-bad-commitmeta");
+    block_on(async {
+        let repo = repo_with_trees(tmp.path(), &["src", "head", "orphan"]).await;
+        let src = commit(&repo, tmp.path(), "src", None, &[], None).await;
+        let head = commit(&repo, tmp.path(), "head", None, &[], Some("main")).await;
+        commit(&repo, tmp.path(), "orphan", None, &[], None).await;
+        let bytes = broken_dict_bytes(&dict(vec![
+            ("ostree.gpgsigs", signatures()),
+            (RELATED_KEY, sources(&[("layer/src", src.as_bytes())])),
+        ]));
+        assert!(holds_key(&bytes));
+        write_raw_bytes(&repo, &head, &bytes);
+        let before = repo.list_objects().await.unwrap();
+        let err = repo.prune(&refs_only()).await.unwrap_err();
+        assert!(matches!(err, Error::Core(_)), "got {err:?}");
+        assert_eq!(
+            repo.list_objects().await.unwrap(),
+            before,
+            "the failed prune deletes nothing"
+        );
+    });
+}
+
+#[test]
+fn a_build_source_after_a_signature_entry_survives() {
+    let tmp = TmpDir::new("prune-related-signed");
+    block_on(async {
+        let repo = repo_with_trees(tmp.path(), &["src", "head", "orphan"]).await;
+        let src = commit(&repo, tmp.path(), "src", None, &[], None).await;
+        let head = commit(&repo, tmp.path(), "head", None, &[], Some("main")).await;
+        let orphan = commit(&repo, tmp.path(), "orphan", None, &[], None).await;
+        write_raw_detached(
+            &repo,
+            &head,
+            &dict(vec![
+                ("ostree.gpgsigs", signatures()),
+                (RELATED_KEY, sources(&[("layer/src", src.as_bytes())])),
+            ]),
+        );
+        let stats = repo.prune(&refs_only()).await.unwrap();
+        assert!(stats.warnings.is_empty(), "got {:?}", stats.warnings);
+        assert!(holds(&repo, &src).await, "the build source survives");
+        assert!(!holds(&repo, &orphan).await, "the orphan is pruned");
+    });
+}
+
+#[test]
+fn the_key_in_a_value_causes_the_full_parse() {
+    let tmp = TmpDir::new("prune-related-key-in-value");
+    block_on(async {
+        let repo = repo_with_trees(tmp.path(), &["head", "orphan"]).await;
+        let head = commit(&repo, tmp.path(), "head", None, &[], Some("main")).await;
+        let orphan = commit(&repo, tmp.path(), "orphan", None, &[], None).await;
+        let note = dict(vec![(
+            "test.note",
+            (Type::parse("s").unwrap(), Value::Str(RELATED_KEY.into())),
+        )]);
+
+        // A valid file has no `ostrya.related` entry, so it roots nothing.
+        write_raw_detached(&repo, &head, &note);
+        let stats = repo.prune(&refs_only()).await.unwrap();
+        assert!(stats.warnings.is_empty(), "got {:?}", stats.warnings);
+        assert!(holds(&repo, &head).await);
+        assert!(!holds(&repo, &orphan).await, "the orphan is pruned");
+
+        // The same file with a broken framing gets the full parse.
+        commit(&repo, tmp.path(), "orphan", None, &[], None).await;
+        let bytes = broken_dict_bytes(&note);
+        assert!(holds_key(&bytes));
+        write_raw_bytes(&repo, &head, &bytes);
+        let before = repo.list_objects().await.unwrap();
+        let err = repo.prune(&refs_only()).await.unwrap_err();
+        assert!(matches!(err, Error::Core(_)), "got {err:?}");
+        assert_eq!(
+            repo.list_objects().await.unwrap(),
+            before,
+            "the failed prune deletes nothing"
+        );
+    });
+}
+
+#[test]
+fn an_oversize_commitmeta_without_the_key_fails_the_prune() {
+    let tmp = TmpDir::new("prune-related-oversize-commitmeta");
     block_on(async {
         let repo = repo_with_trees(tmp.path(), &["head", "orphan"]).await;
         let head = commit(&repo, tmp.path(), "head", None, &[], Some("main")).await;
         commit(&repo, tmp.path(), "orphan", None, &[], None).await;
-        // An `a{sv}` whose one entry claims an offset past the end.
-        write_raw_bytes(&repo, &head, &[b'k', 0, 0, b's', 0xff]);
+        // A sparse file of zero bytes, one byte over the cap. It does not
+        // hold the key, so the size check comes before the byte test.
+        let path = detached_path(&repo, &head);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::File::create(&path)
+            .unwrap()
+            .set_len(ostrya::MAX_METADATA_SIZE + 1)
+            .unwrap();
         let before = repo.list_objects().await.unwrap();
         let err = repo.prune(&refs_only()).await.unwrap_err();
+        assert!(matches!(err, Error::Io(_)), "got {err:?}");
+        assert_eq!(
+            repo.list_objects().await.unwrap(),
+            before,
+            "the failed prune deletes nothing"
+        );
+    });
+}
+
+/// A commit that the walk reaches over a `parent` edge under a timestamp
+/// bound gets the same test of its `.commitmeta` as each other commit.
+#[test]
+fn a_timed_parent_gets_the_same_test_of_its_commitmeta() {
+    let tmp = TmpDir::new("prune-related-timed-parent");
+    block_on(async {
+        let repo = repo_with_trees(tmp.path(), &["base", "head", "orphan"]).await;
+        let base = commit(&repo, tmp.path(), "base", None, &[], None).await;
+        let head = commit(&repo, tmp.path(), "head", Some(base), &[], Some("main")).await;
+        // Each commit has the timestamp `FIXED_TS`, so the bound keeps `base`.
+        let opts = PruneOptions {
+            keep_younger_than: Some(FIXED_TS),
+            ..PruneOptions::new()
+        };
+
+        // An `a{sv}` whose one entry claims an offset past the end.
+        let bytes = [b'k', 0, 0, b's', 0xff];
+        let orphan = commit(&repo, tmp.path(), "orphan", None, &[], None).await;
+        write_raw_bytes(&repo, &base, &bytes);
+        let stats = repo.prune(&opts).await.unwrap();
+        assert!(stats.warnings.is_empty(), "got {:?}", stats.warnings);
+        assert!(holds(&repo, &head).await);
+        assert!(holds(&repo, &base).await, "the bound keeps the parent");
+        assert_eq!(
+            std::fs::read(detached_path(&repo, &base)).unwrap(),
+            bytes,
+            "the parent keeps its .commitmeta"
+        );
+        assert!(!holds(&repo, &orphan).await, "the orphan is pruned");
+
+        // The same framing under the key `ostrya.related`.
+        commit(&repo, tmp.path(), "orphan", None, &[], None).await;
+        let bytes = broken_dict_bytes(&dict(vec![(
+            RELATED_KEY,
+            sources(&[("layer/head", head.as_bytes())]),
+        )]));
+        assert!(holds_key(&bytes));
+        write_raw_bytes(&repo, &base, &bytes);
+        let before = repo.list_objects().await.unwrap();
+        let err = repo.prune(&opts).await.unwrap_err();
         assert!(matches!(err, Error::Core(_)), "got {err:?}");
         assert_eq!(
             repo.list_objects().await.unwrap(),

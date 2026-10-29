@@ -19,7 +19,7 @@ use rustix::io::Errno;
 use crate::error::{Error, Result};
 use crate::pull::drive::Slots;
 use crate::refs::walk_ref_dir;
-use crate::related::{self, RelatedField, RelatedWarning};
+use crate::related::{self, RelatedEntry, RelatedField, RelatedWarning};
 use crate::repo::Repo;
 
 /// The bound that a walk puts on the `parent` chain of one root.
@@ -248,7 +248,9 @@ pub(crate) struct GcRoots {
     /// metadata of a commit: the build sources.
     ///
     /// The walk reads the detached metadata of a commit only if this is
-    /// `true`.
+    /// `true`. It parses the `.commitmeta` of a commit only if the bytes of
+    /// the file hold the key `ostrya.related` and its terminating NUL
+    /// ([`MetadataSource::load_build_source_dict`]).
     pub build_sources: bool,
     /// `true` if the walk follows the `parent` edge of a commit.
     pub traverse_parent: bool,
@@ -480,7 +482,8 @@ impl Repo {
     /// `listing` is the listing of the loose objects that the caller took
     /// under the exclusive repository lock, and the caller holds that lock
     /// during the walk. The walk reads the `.commitmeta` of a commit only if
-    /// `listing` holds it.
+    /// `listing` holds it, and parses it only if its bytes hold the key
+    /// `ostrya.related`.
     pub(crate) async fn traverse_reachable_gc(
         &self,
         roots: impl IntoIterator<Item = (Checksum, ParentBound)>,
@@ -650,22 +653,28 @@ pub(crate) trait MetadataSource: Sync {
         1
     }
 
-    /// Returns the detached metadata dict of the commit `commit`, or `None`
-    /// if the store holds no `.commitmeta` for it or holds the zero-length
-    /// marker.
+    /// Returns the detached metadata dict of the commit `commit` if its
+    /// `.commitmeta` can hold build sources, or `None`.
+    ///
+    /// The result is `None` if the store holds no `.commitmeta` for the
+    /// commit, if it holds the zero-length marker, or if the bytes of the
+    /// file do not hold the key `ostrya.related` and its terminating NUL.
+    /// The call parses no such file, so a file that does not parse and does
+    /// not hold the key gives `None` and no error. Each other file gets the
+    /// full parse of an `a{sv}` dict.
     ///
     /// The default reads the object with
-    /// [`load_metadata`](MetadataSource::load_metadata) and parses it on the
-    /// blocking pool. [`Repo`] reads and parses the file in one trip to the
-    /// blocking pool.
-    fn load_detached(
+    /// [`load_metadata`](MetadataSource::load_metadata) and tests and parses
+    /// it on the blocking pool. [`Repo`] reads, tests, and parses the file in
+    /// one trip to the blocking pool.
+    fn load_build_source_dict(
         &self,
         commit: Checksum,
     ) -> impl Future<Output = Result<Option<Value>>> + Send {
         async move {
             match self.load_metadata(ObjectType::CommitMeta, commit).await? {
                 Some(bytes) => {
-                    ostrya_rt::unblock(move || crate::commit::parse_detached_metadata(&bytes)).await
+                    ostrya_rt::unblock(move || crate::commit::parse_build_source_dict(&bytes)).await
                 }
                 None => Ok(None),
             }
@@ -676,11 +685,12 @@ pub(crate) trait MetadataSource: Sync {
     /// metadata dict, or `None` if the store does not hold the commit.
     ///
     /// The detached metadata is the value that
-    /// [`load_detached`](MetadataSource::load_detached) gives. The default
-    /// calls [`load_metadata`](MetadataSource::load_metadata) and then
-    /// `load_detached`. [`Repo`] reads the two files and parses the detached
-    /// metadata in one trip to the blocking pool.
-    fn load_commit_with_detached(
+    /// [`load_build_source_dict`](MetadataSource::load_build_source_dict)
+    /// gives. The default calls
+    /// [`load_metadata`](MetadataSource::load_metadata) and then
+    /// `load_build_source_dict`. [`Repo`] reads the two files and tests and
+    /// parses the detached metadata in one trip to the blocking pool.
+    fn load_commit_with_build_source_dict(
         &self,
         commit: Checksum,
     ) -> impl Future<Output = Result<Option<(Vec<u8>, Option<Value>)>>> + Send {
@@ -688,7 +698,7 @@ pub(crate) trait MetadataSource: Sync {
             let Some(bytes) = self.load_metadata(ObjectType::Commit, commit).await? else {
                 return Ok(None);
             };
-            Ok(Some((bytes, self.load_detached(commit).await?)))
+            Ok(Some((bytes, self.load_build_source_dict(commit).await?)))
         }
     }
 }
@@ -702,15 +712,16 @@ impl MetadataSource for Repo {
         }
     }
 
-    async fn load_detached(&self, commit: Checksum) -> Result<Option<Value>> {
-        self.read_commit_detached_metadata(&commit).await
+    async fn load_build_source_dict(&self, commit: Checksum) -> Result<Option<Value>> {
+        let repo = self.clone();
+        ostrya_rt::unblock(move || repo.read_build_source_dict_blocking(&commit)).await
     }
 
-    async fn load_commit_with_detached(
+    async fn load_commit_with_build_source_dict(
         &self,
         commit: Checksum,
     ) -> Result<Option<(Vec<u8>, Option<Value>)>> {
-        match self.load_commit_and_detached(&commit).await {
+        match self.load_commit_and_build_source_dict(&commit).await {
             Ok(loaded) => Ok(Some(loaded)),
             Err(Error::ObjectNotFound {
                 ty: ObjectType::Commit,
@@ -730,6 +741,9 @@ impl MetadataSource for Repo {
 /// is absent, and the source opens no file for it. Each other read goes to
 /// the [`Repo`]. If `[core] locking` is false, no lock orders the walk and a
 /// writer, as for each other object of the prune.
+///
+/// The source parses a `.commitmeta` that the listing holds as [`Repo`]
+/// does: only if its bytes hold the key `ostrya.related`.
 struct ListedLoose<'a> {
     repo: &'a Repo,
     listing: &'a HashSet<ObjectName>,
@@ -751,14 +765,14 @@ impl MetadataSource for ListedLoose<'_> {
         self.repo.load_metadata(ty, checksum).await
     }
 
-    async fn load_detached(&self, commit: Checksum) -> Result<Option<Value>> {
+    async fn load_build_source_dict(&self, commit: Checksum) -> Result<Option<Value>> {
         if !self.has_detached(commit) {
             return Ok(None);
         }
-        self.repo.load_detached(commit).await
+        self.repo.load_build_source_dict(commit).await
     }
 
-    async fn load_commit_with_detached(
+    async fn load_commit_with_build_source_dict(
         &self,
         commit: Checksum,
     ) -> Result<Option<(Vec<u8>, Option<Value>)>> {
@@ -766,7 +780,7 @@ impl MetadataSource for ListedLoose<'_> {
             let bytes = self.repo.load_metadata(ObjectType::Commit, commit).await?;
             return Ok(bytes.map(|bytes| (bytes, None)));
         }
-        self.repo.load_commit_with_detached(commit).await
+        self.repo.load_commit_with_build_source_dict(commit).await
     }
 }
 
@@ -900,8 +914,11 @@ pub(crate) async fn walk_reachable_gc<S: MetadataSource>(
 /// that adds its own name alone. Unless the arrival is over a `parent` edge
 /// under a timestamp bound, the walk reads the detached metadata with the
 /// commit in one call of
-/// [`load_commit_with_detached`](MetadataSource::load_commit_with_detached).
-/// A `.commitmeta` that does not parse stops the walk with an error.
+/// [`load_commit_with_build_source_dict`](MetadataSource::load_commit_with_build_source_dict).
+/// The walk parses a `.commitmeta` only if its bytes hold the key
+/// `ostrya.related`. A `.commitmeta` that holds the key and does not parse
+/// stops the walk with an error. The walk parses no `.commitmeta` that does
+/// not hold the key, so such a file that does not parse gives no error.
 ///
 /// The walk reads the commits one at a time. It walks the tree of a commit
 /// with [`walk_tree`] before it reads the next commit.
@@ -1009,19 +1026,24 @@ async fn collect_reachable<S: MetadataSource>(
         }
 
         // At the first expansion of a commit, the walk reads the detached
-        // metadata with the commit, in one read of the store. A `TimedParent`
-        // arrival can be rejected, so it reads the commit alone, and the
-        // walk reads the detached metadata after the bound accepts it.
-        let mut prefetched: Option<Option<Value>> = None;
+        // metadata with the commit, in one read of the store. It keeps the
+        // build sources of the dict alone, so the dict drops before the walk
+        // of the tree. A `TimedParent` arrival can be rejected, so it reads
+        // the commit alone, and the walk reads the detached metadata after
+        // the bound accepts it.
+        let mut prefetched: Option<std::result::Result<Option<Vec<RelatedEntry>>, String>> = None;
         let loaded = if pending_delete == Some(commit_checksum) {
             None
         } else if gc.build_sources
             && arrival != Arrival::TimedParent
             && !edges_read.contains(&commit_checksum)
         {
-            match store.load_commit_with_detached(commit_checksum).await? {
+            match store
+                .load_commit_with_build_source_dict(commit_checksum)
+                .await?
+            {
                 Some((bytes, detached)) => {
-                    prefetched = Some(detached);
+                    prefetched = Some(related::build_sources(detached.as_ref()));
                     Some(Commit::parse(&bytes)?)
                 }
                 None => None,
@@ -1080,11 +1102,16 @@ async fn collect_reachable<S: MetadataSource>(
                 targets.into_iter().for_each(&mut push);
             }
             if gc.build_sources {
-                let detached = match prefetched {
-                    Some(detached) => detached,
-                    None => store.load_detached(commit_checksum).await?,
+                let sources = match prefetched {
+                    Some(sources) => sources,
+                    None => related::build_sources(
+                        store
+                            .load_build_source_dict(commit_checksum)
+                            .await?
+                            .as_ref(),
+                    ),
                 };
-                let (targets, defects) = match related::build_sources(detached.as_ref()) {
+                let (targets, defects) = match sources {
                     Ok(entries) => related::split_entries(entries.unwrap_or_default()),
                     Err(reason) => (Vec::new(), vec![reason]),
                 };

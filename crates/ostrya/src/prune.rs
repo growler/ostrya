@@ -6,8 +6,8 @@
 //! the two ostrya extensions of [`PruneOptions`] keep their defaults and no
 //! reached commit names a related commit, a run deletes the same objects as
 //! the `ostree prune` command, as observed. The run also reads the
-//! `.commitmeta` of each commit that the walk reaches, and a `.commitmeta`
-//! that does not parse fails the run.
+//! `.commitmeta` of each commit that the walk reaches. A `.commitmeta` that
+//! holds the key `ostrya.related` and does not parse fails the run.
 //!
 //! - [`PruneOptions`] sets the roots, the bounds, and the dry run.
 //! - [`PruneStats`] holds the counts of a run, the refs that it deleted, and
@@ -128,9 +128,9 @@ impl std::fmt::Debug for WeakRefFilter {
 /// The default of each one is the behavior without the option. A prune that
 /// keeps both at their defaults deletes the same objects as the `ostree`
 /// command, if no commit that the run reaches names a related commit. The run
-/// also reads the `.commitmeta` of each commit that it reaches, and a
-/// `.commitmeta` that does not parse fails the run ([`Repo::prune`], "Related
-/// commits").
+/// also reads the `.commitmeta` of each commit that it reaches. A
+/// `.commitmeta` that holds the key `ostrya.related` and does not parse fails
+/// the run ([`Repo::prune`], "Related commits").
 ///
 /// The roots on the related commits of a commit are also an ostrya
 /// extension, with no option. [`Repo::prune`], "Related commits", states
@@ -554,9 +554,27 @@ impl Repo {
     /// its own are not defective.
     ///
     /// The run reads the related values also if each commit in the store is
-    /// a root, so it gives the same warnings. A `.commitmeta` that does not
-    /// parse, or that is larger than
-    /// [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE), fails the prune.
+    /// a root, so it gives the same warnings.
+    ///
+    /// The run parses a `.commitmeta` only if its bytes hold the key
+    /// `ostrya.related` and its terminating NUL. In a serialized `a{sv}`
+    /// dict, the key of each entry is a NUL-terminated string at contiguous
+    /// bytes, so a file that does not hold these bytes has no
+    /// `ostrya.related` entry. The run parses no such file. So such a file
+    /// that does not parse gives no error and no warning, and the run does
+    /// not parse the signatures of a commit whose `.commitmeta` does not hold
+    /// these bytes. A `.commitmeta` that holds the key and does not parse
+    /// fails the prune before it deletes an object. The key can also be in a
+    /// value of another entry, for example in a string. Then the run parses
+    /// the file, and a file that does not parse fails the prune.
+    ///
+    /// A `.commitmeta` that is larger than
+    /// [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE) fails the prune, also
+    /// if it does not hold the key. The open of a `.commitmeta` follows a
+    /// symlink. An open file that is not a regular file, for example a
+    /// directory, fails the prune. In the strict open mode of
+    /// `Repo::open_at_strict`, the open follows no symlink, and each
+    /// `.commitmeta` that is not a regular file fails the prune.
     ///
     /// # Bounds
     ///
@@ -655,9 +673,9 @@ impl Repo {
     /// - [`Error::Core`] if a `[core]` key that the run reads holds a value of
     ///   the wrong type.
     /// - [`Error::Core`] if a ref file holds no valid checksum.
-    /// - [`Error::Core`] if a commit object or its detached metadata does not
-    ///   parse. The run reads the detached metadata of each commit that the
-    ///   walk reaches.
+    /// - [`Error::Core`] if a commit object does not parse, or if its detached
+    ///   metadata holds the key `ostrya.related` and does not parse. The run
+    ///   reads the detached metadata of each commit that the walk reaches.
     /// - [`Error::Core`] if a dirtree that the walk reads does not parse. A
     ///   run with [`commit_only`](PruneOptions::commit_only) reads no dirtree.
     /// - [`Error::LockTimeout`] if the wait for the lock passes `[core]

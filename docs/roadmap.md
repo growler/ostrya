@@ -134,10 +134,9 @@ for it.
   needs a new crate needs the authorization of the maintainer first.
 - A light commit parse in the prune walk. For each commit that the walk
   expands, `Commit::parse` builds the `a{sv}` metadata tree and copies the
-  subject and the body. The walk also decodes the full detached dict,
-  signatures included. It reads the parent, the root dirtree and dirmeta, the
-  timestamp, field 2, and the `ostrya.related` key alone. A parse that checks
-  the normal form and decodes these fields alone refuses the same commits.
+  subject and the body. The walk reads the parent, the root dirtree and
+  dirmeta, the timestamp, and field 2 alone. A parse that checks the normal
+  form and decodes these fields alone refuses the same commits.
 
 ## Gaps of bucket repositories
 

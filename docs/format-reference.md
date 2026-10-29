@@ -3026,9 +3026,21 @@ that they reach:
   writes each warning on standard error after `warning: `, and exits 0.
 - The prune reads the two fields also if each commit in the store is a root,
   so a run without `--refs-only` gives the same warnings.
-- A `.commitmeta` that does not parse as an `a{sv}` dict, or that is larger
-  than the size cap of a metadata object, fails the prune. The prune then
-  deletes nothing.
+- The prune parses a `.commitmeta` only if its bytes hold the key
+  `ostrya.related` and its terminating NUL, the 15 bytes
+  `6f 73 74 72 79 61 2e 72 65 6c 61 74 65 64 00`. In a serialized `a{sv}`
+  dict, the key of each entry is a NUL-terminated string at contiguous
+  bytes. So a file that does not hold these bytes has no `ostrya.related`
+  entry. The prune parses no such file. So such a file that does not parse
+  gives no error and no warning. A `.commitmeta` that holds these bytes and
+  does not parse as an `a{sv}` dict fails the prune. These bytes can also be
+  in a value of another entry, for example in a string. Then the prune
+  parses the file, and a file that does not parse fails the prune.
+- A `.commitmeta` that is larger than the size cap of a metadata object
+  fails the prune, also if it does not hold these bytes.
+- The open of a `.commitmeta` follows a symlink. An open file that is not a
+  regular file, for example a directory, fails the prune.
+- A prune that fails on a `.commitmeta` deletes nothing.
 
 The prune of a bucket repository reads field 2 alone ("The prune of a
 bucket repository").

@@ -280,7 +280,11 @@ enum Command {
     /// detached metadata and the composefs image of that commit if they are
     /// in the store. For each defective value, the command writes a warning
     /// on standard error, and the defective value roots nothing. A detached
-    /// metadata file that does not parse fails the command.
+    /// metadata file that holds the key `ostrya.related` and does not parse
+    /// fails the command. The command parses no detached metadata file that
+    /// does not hold the key, so such a file that does not parse gives no
+    /// error. A detached metadata file that is larger than the size cap of a
+    /// metadata object fails the command, also if it does not hold the key.
     ///
     /// The command also deletes each static delta whose target commit it
     /// deleted. A run with neither --no-prune nor --static-deltas-only also

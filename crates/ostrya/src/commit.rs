@@ -648,6 +648,58 @@ impl Repo {
         parse_detached_metadata(&bytes)
     }
 
+    /// Returns the detached metadata dict of the commit `checksum` if its
+    /// `.commitmeta` can hold build sources, or `None`.
+    ///
+    /// The call reads the file as
+    /// [`read_commit_detached_metadata_blocking`](Repo::read_commit_detached_metadata_blocking)
+    /// does, and parses it with [`parse_build_source_dict`]. So a
+    /// `.commitmeta` that does not hold the key `ostrya.related` gives
+    /// `None`, also if it does not parse. The read and the parse block the
+    /// thread, so an async caller runs this call on the blocking pool.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Core`] if the file holds the bytes of the key
+    ///   `ostrya.related` and does not parse as an `a{sv}` dict.
+    /// - [`Error::Io`] if the file is larger than
+    ///   [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE), or if a file system
+    ///   operation fails.
+    pub(crate) fn read_build_source_dict_blocking(
+        &self,
+        checksum: &Checksum,
+    ) -> Result<Option<Value>> {
+        let bytes = match self.load_object_bytes_blocking(ObjectType::CommitMeta, checksum) {
+            Ok(bytes) => bytes,
+            Err(Error::ObjectNotFound { .. }) => return Ok(None),
+            Err(e) => return Err(e),
+        };
+        parse_build_source_dict(&bytes)
+    }
+
+    /// Loads the bytes of the commit object `checksum` and its detached
+    /// metadata dict, as
+    /// [`read_build_source_dict_blocking`](Repo::read_build_source_dict_blocking)
+    /// reads it.
+    ///
+    /// The two reads and the parse run in one call on the blocking pool. The
+    /// read of the commit comes first, so a commit that this repository does
+    /// not hold gives [`Error::ObjectNotFound`] before an error of the
+    /// `.commitmeta`.
+    pub(crate) async fn load_commit_and_build_source_dict(
+        &self,
+        checksum: &Checksum,
+    ) -> Result<(Vec<u8>, Option<Value>)> {
+        let repo = self.clone();
+        let key = *checksum;
+        ostrya_rt::unblock(move || {
+            let bytes = repo.load_object_bytes_blocking(ObjectType::Commit, &key)?;
+            let detached = repo.read_build_source_dict_blocking(&key)?;
+            Ok((bytes, detached))
+        })
+        .await
+    }
+
     /// Loads the bytes of the commit object `checksum` and its detached
     /// metadata, as
     /// [`read_commit_detached_metadata`](Repo::read_commit_detached_metadata)
@@ -870,6 +922,26 @@ pub(crate) fn empty_build_source_name(commit: &Checksum) -> Error {
 /// [`Error::Core`] if `bytes` does not parse as an `a{sv}` dict.
 pub(crate) fn parse_detached_metadata(bytes: &[u8]) -> Result<Option<Value>> {
     crate::summary::parse_signature_dict(bytes)
+}
+
+/// Parses `bytes`, the contents of a `.commitmeta` file, as detached
+/// metadata only if they can hold build sources.
+///
+/// Returns `None` with no parse if
+/// [`may_hold_build_sources`](related::may_hold_build_sources) does not
+/// accept `bytes`. Else the result is the result of
+/// [`parse_detached_metadata`]. The parse blocks the thread, so an async
+/// caller runs it on the blocking pool.
+///
+/// # Errors
+///
+/// [`Error::Core`] if `bytes` hold the bytes of the key `ostrya.related` and
+/// do not parse as an `a{sv}` dict.
+pub(crate) fn parse_build_source_dict(bytes: &[u8]) -> Result<Option<Value>> {
+    if !related::may_hold_build_sources(bytes) {
+        return Ok(None);
+    }
+    parse_detached_metadata(bytes)
 }
 
 /// Appends one entry to an `a{sv}` dict value, after its existing entries.

@@ -2112,6 +2112,22 @@ the rules.
   root as usual. `PruneStats::warnings` carries the warnings, and
   `ostrya prune` writes each one to standard error and exits 0. For the
   prune, a nested dependency is not defective.
+- The local prune parses a `.commitmeta` only if its bytes hold the key
+  `ostrya.related` and its terminating NUL. In a serialized `a{sv}` dict, the
+  key of each entry is a NUL-terminated string at contiguous bytes. So a file
+  without these bytes has no build sources. The prune parses no such file, so
+  such a file that does not parse gives no error. A file that holds these
+  bytes gets the full parse. If it does not parse, it fails the prune before
+  the prune deletes an object. These bytes in a value of another entry only
+  cause the full parse. Three alternatives were rejected. A full parse of
+  each `.commitmeta` was rejected. With it, the prune decodes the signature
+  dict of each signed commit, and one defective file with no build sources
+  stops each prune. A lookup of the one key with no parse of the other
+  values was rejected. It accepts a file whose other values do not parse.
+  Its errors also differ from the errors of the other readers of detached
+  metadata. A warning for a file that holds the key and does not parse was
+  rejected. With the warning, the prune continues and deletes build sources
+  that nobody can read.
 - The bucket prune roots on field 2 alone. It reads field 2 from the bytes
   of each commit object that it reads, so the field gives no extra request.
   It reads no `.commitmeta`, so a build source in a bucket repository stays

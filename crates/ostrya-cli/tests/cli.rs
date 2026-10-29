@@ -13685,6 +13685,66 @@ fn prune_keeps_the_related_commits_and_warns_on_a_defective_value() {
     assert!(!ex_ostrya_holds(&repo, &other), "the prune completes");
 }
 
+/// `prune --refs-only` parses no detached metadata file that does not hold
+/// the key `ostrya.related`, so such a file that does not parse gives no
+/// error, and the command exits 0. A file that holds the key and does not
+/// parse fails the command at exit 1 with the parse error, and the command
+/// deletes nothing.
+#[test]
+fn prune_parses_a_commitmeta_only_if_it_holds_the_key() {
+    let tmp = TmpDir::new("prune-related-unread");
+    let base = tmp.path();
+    let repo = create_repo(base, RepoMode::Archive);
+    let repo_arg = format!("--repo={}", repo.display());
+    let orphan = ex_ostrya_commit(&repo, base, "orphan", None);
+    let head = commit_main_run(&repo, &ex_ostrya_tree(base, "head"), &[])
+        .ok()
+        .stdout_trimmed();
+    let head = Checksum::from_hex(&head).unwrap();
+    let path = repo.join("objects").join(ostrya::loose_path(
+        &head,
+        ObjectType::CommitMeta,
+        RepoMode::Archive,
+    ));
+    std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+    // An `a{sv}` whose one entry claims an offset past the end.
+    std::fs::write(&path, [b'k', 0, 0, b's', 0xff]).unwrap();
+
+    let run = ostrya(&[&repo_arg, "prune", "--refs-only"], None, &[]);
+    run.ok();
+    assert!(
+        run.stderr.is_empty(),
+        "no warning: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    assert!(ex_ostrya_holds(&repo, &head), "the head survives");
+    assert!(path.exists(), "the head keeps its detached metadata");
+    assert!(!ex_ostrya_holds(&repo, &orphan), "the orphan is pruned");
+
+    // The same framing under the key `ostrya.related`.
+    let orphan = ex_ostrya_commit(&repo, base, "orphan", None);
+    let mut bytes = b"ostrya.related\0".to_vec();
+    bytes.extend_from_slice(&[0, b's', 0xff]);
+    std::fs::write(&path, bytes).unwrap();
+    let before = prune_inventory(&repo);
+    let run = ostrya(&[&repo_arg, "prune", "--refs-only"], None, &[]);
+    assert_eq!(run.status.code(), Some(1), "the command exits 1");
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        stderr.contains(
+            "error: gvariant: data is not normal-form GVariant: array framing \
+             offset is out of bounds"
+        ),
+        "the parse error: {stderr}"
+    );
+    assert!(ex_ostrya_holds(&repo, &orphan), "the orphan survives");
+    assert_eq!(
+        prune_inventory(&repo),
+        before,
+        "the failed prune deletes nothing"
+    );
+}
+
 /// `commit --add-detached-metadata-string` with the key `ostrya.related`
 /// gives the key a string value, which is not an `a(say)`. The command exits
 /// 1 and writes no object and no ref.

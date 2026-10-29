@@ -6714,7 +6714,7 @@ async fn delta_verify(repo_path: &Path, args: DeltaVerifyArgs) -> Result<()> {
     if !sb.is_signed() {
         verification_fails("no signatures in static-delta");
     }
-    let outcome = match sb.verify(&[keys.verifier.as_ref()]).await {
+    let outcome = match sb.verify(&[keys.verifier.as_ref()]) {
         Ok(outcome) => outcome,
         Err(err) => {
             println!("Verification fails");
@@ -6853,7 +6853,7 @@ async fn delta_apply_offline(repo: &Repo, args: DeltaApplyArgs) -> Result<()> {
         .await
         .map_err(|err| delta_read_error(err, &shown))?;
     if let Some(keys) = keys.filter(|_| sb.is_signed()) {
-        let outcome = sb.verify(&[keys.verifier.as_ref()]).await?;
+        let outcome = sb.verify(&[keys.verifier.as_ref()])?;
         if let Some(text) = delta_verify_failure(engine, &keys, &outcome) {
             exit_error(&text);
         }
@@ -11113,10 +11113,8 @@ async fn report_commit_signatures(
     {
         return Ok(());
     }
-    let verifier = show_gpg_verifier(repo_path, args)?;
-    let outcome = repo
-        .verify_commit(checksum, &[&verifier as &dyn Verifier])
-        .await?;
+    let verifier: Arc<dyn Verifier> = Arc::new(show_gpg_verifier(repo_path, args)?);
+    let outcome = repo.verify_commit(checksum, &[verifier]).await?;
     println!();
     let plural = if outcome.signatures.len() == 1 {
         ""
@@ -13270,8 +13268,8 @@ async fn summary(repo: Repo, repo_path: PathBuf, args: SummaryArgs) -> Result<()
     };
     if args.verify {
         let engine = summary_sign_type(&args.signing());
-        let verifier = summary_verifier(&repo_path, engine, &args)?;
-        let outcome = repo.verify_summary(&[verifier.as_ref()]).await?;
+        let verifier: Arc<dyn Verifier> = Arc::from(summary_verifier(&repo_path, engine, &args)?);
+        let outcome = repo.verify_summary(&[verifier]).await?;
         report_verify(&outcome, engine);
         if !outcome.valid {
             exit_process(1);
@@ -13803,11 +13801,11 @@ async fn verify_signatures(
     repo_path: &Path,
     args: &SignArgs,
 ) -> Result<()> {
-    let verifier = match args.sign_type {
+    let verifier: Arc<dyn Verifier> = Arc::from(match args.sign_type {
         SignType::Gpg => gpg_verifier(repo_path, args)?,
         engine => sign_api_verifier(engine, args)?,
-    };
-    let outcome = repo.verify_commit(commit, &[verifier.as_ref()]).await?;
+    });
+    let outcome = repo.verify_commit(commit, &[verifier]).await?;
     report_verify(&outcome, args.sign_type);
     if !outcome.valid {
         exit_process(1);
@@ -13831,8 +13829,8 @@ async fn delete_signatures(
         SignType::Gpg => gpg_delete(repo, commit, repo_path, args).await?,
         engine => {
             // An ed25519 or spki blob belongs to a KEY-ID if it verifies under
-            // that public key. Verification is async, so the code selects the
-            // blobs to remove first, and the predicate matches them by bytes.
+            // that public key. The code selects the blobs to remove first, and
+            // the predicate matches them by bytes.
             let verifier = build_sign_api_verifier(engine, &public_key_bytes(args)?, &[])?;
             let key = sign_metadata_key(engine);
             let payload = repo.load_object_bytes(ObjectType::Commit, commit).await?;
@@ -13840,7 +13838,6 @@ async fn delete_signatures(
             for blob in stored_signatures(repo, commit, key).await? {
                 let valid = verifier
                     .verify(&payload, std::slice::from_ref(&blob))
-                    .await
                     .map(|o| o.valid)
                     .unwrap_or(false);
                 if valid {
@@ -13905,7 +13902,7 @@ async fn gpg_delete(
     let payload = repo.load_object_bytes(ObjectType::Commit, commit).await?;
     let mut doomed: Vec<Vec<u8>> = Vec::new();
     for blob in stored_signatures(repo, commit, "ostree.gpgsigs").await? {
-        let matches = match verifier.verify(&payload, std::slice::from_ref(&blob)).await {
+        let matches = match verifier.verify(&payload, std::slice::from_ref(&blob)) {
             Ok(outcome) => outcome.signatures.iter().any(|s| {
                 fingerprint_matches(s.fingerprint.as_deref(), &wanted)
                     || fingerprint_matches(s.primary_fingerprint.as_deref(), &wanted)

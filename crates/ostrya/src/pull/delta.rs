@@ -829,6 +829,9 @@ impl ParsedDelta {
             signatures,
             inline,
         } = self;
+        // The check gives the bytes to the blocking pool in an `Arc`, with no
+        // copy.
+        let superblock_bytes = Arc::new(superblock_bytes);
         if let Some(verification) = verification {
             verify_fetched_delta(
                 verification,
@@ -1914,6 +1917,9 @@ async fn check_step_commit(
         }
         DeltaSource::Remote(_) => (commit_bytes, None),
     };
+    // The signature check gives the bytes to the blocking pool in an `Arc`,
+    // with no copy.
+    let commit_bytes = Arc::new(commit_bytes);
     let (parsed, dependencies) = local_parse.unzip();
     let mut checked = match ctx.source {
         DeltaSource::Remote(remote) => {
@@ -1939,7 +1945,7 @@ async fn check_step_commit(
                 ctx.verification,
                 ctx.related,
                 commit,
-                &commit_bytes,
+                (&commit_bytes).into(),
                 detached,
             )
             .await?;
@@ -1980,7 +1986,7 @@ async fn check_step_commit(
                 ctx.verification,
                 sources,
                 commit,
-                &commit_bytes,
+                (&commit_bytes).into(),
             )
             .await?;
             let local = match read {
@@ -2862,7 +2868,7 @@ async fn take_inline_parts(
 async fn verify_fetched_delta(
     verification: &Verification,
     name: &str,
-    superblock_bytes: &[u8],
+    superblock_bytes: &Arc<Vec<u8>>,
     signatures: Option<&Value>,
 ) -> Result<()> {
     verification

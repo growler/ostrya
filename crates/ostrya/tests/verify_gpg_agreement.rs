@@ -13,9 +13,9 @@
 //! failure.
 //!
 //! The unit tests of the engine check each policy rule against `gpgv` through
-//! the internal entry point. These cases run the public path: the keyring load,
-//! the async `Verifier::verify`, and the move to the blocking pool. They also
-//! cover the axes that those rules do not reach:
+//! the internal entry point. These cases run the public path: the keyring load
+//! and the `Verifier::verify` call. They also cover the axes that those rules
+//! do not reach:
 //!
 //! - the key algorithm
 //! - the user id set of the certificate
@@ -520,12 +520,13 @@ fn split_uid(uid: &str) -> (Option<String>, Option<String>) {
 
 /// Returns the records that the engine reports over the public path.
 ///
-/// The keyring blobs load into a verifier, and the async `Verifier::verify`
+/// The keyring blobs load into a verifier, and the `Verifier::verify` call
 /// gives the answer.
 fn port_records(keyrings: &[&[u8]], blobs: &[&[u8]], payload: &[u8]) -> Vec<SignatureInfo> {
     let verifier = GpgVerifier::from_keyring_bytes(keyrings).expect("the keyrings load");
     let blobs: Vec<Vec<u8>> = blobs.iter().map(|blob| blob.to_vec()).collect();
-    block_on(verifier.verify(payload, &blobs))
+    verifier
+        .verify(payload, &blobs)
         .expect("the blobs are within the input caps")
         .signatures
 }
@@ -1591,7 +1592,7 @@ fn assert_bounded(label: &str, keyrings: &[&[u8]], blobs: &[&[u8]], primary: &st
     let owned: Vec<Vec<u8>> = blobs.iter().map(|blob| blob.to_vec()).collect();
     // Over a payload that nothing signed, no record is ever valid.
     if let Ok(verifier) = GpgVerifier::from_keyring_bytes(keyrings) {
-        if let Ok(outcome) = block_on(verifier.verify(OTHER_PAYLOAD, &owned)) {
+        if let Ok(outcome) = verifier.verify(OTHER_PAYLOAD, &owned) {
             assert!(
                 !outcome.valid,
                 "{label}: verified over a payload nothing signed",
@@ -1605,7 +1606,7 @@ fn assert_bounded(label: &str, keyrings: &[&[u8]], blobs: &[&[u8]], primary: &st
         }
         // Over the payload that the fixture signed, a valid record names the
         // key of the fixture and its certificate.
-        if let Ok(outcome) = block_on(verifier.verify(PAYLOAD, &owned)) {
+        if let Ok(outcome) = verifier.verify(PAYLOAD, &owned) {
             for record in &outcome.signatures {
                 if record.valid {
                     assert_eq!(

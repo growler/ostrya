@@ -39,10 +39,7 @@ use p256::pkcs8::EncodePublicKey;
 ))]
 pub use self::x509::X509SpkiSigner;
 use crate::pem;
-use crate::{
-    Error, Result, SignFuture, SignKeys, SignatureInfo, Signer, Verifier, VerifyFuture,
-    VerifyOutcome,
-};
+use crate::{Error, Result, SignFuture, SignKeys, SignatureInfo, Signer, Verifier, VerifyOutcome};
 
 /// The name of the spki sign type. It is the engine name and the base name of
 /// the key-store files (`trusted.spki`, `revoked.spki`).
@@ -395,10 +392,11 @@ impl Signer for SpkiSigner {
 ///   encode a point again, so a non-canonical encoding of a point gives a
 ///   fingerprint of its own.
 ///
-/// The verifier verifies in the call to [`Verifier::verify`], so the future
-/// that this call returns is ready at once. An ECDSA key and an RSA key
-/// verify a signature of the SHA-256 of the data. The verifier computes this
-/// hash one time for each call, when the first ECDSA or RSA key tries a blob.
+/// The verifier verifies in the call to [`Verifier::verify`], and the call
+/// holds its thread for the time of the verification. An ECDSA key and an RSA
+/// key verify a signature of the SHA-256 of the data. The verifier computes
+/// this hash one time for each call, when the first ECDSA or RSA key tries a
+/// blob.
 /// An Ed25519 key verifies a signature of the data itself. It checks the
 /// equation `[S]B = R + [k]A` with no cofactor, which RFC 8032 permits, and
 /// it refuses an `S` that is not below the group order. Each Ed25519 key
@@ -425,7 +423,7 @@ impl Signer for SpkiSigner {
 /// let signature = block_on(signer.sign(b"commit bytes"))?;
 /// // A DER signature starts with the tag of an ASN.1 `SEQUENCE`.
 /// assert_eq!(signature[0], 0x30);
-/// let outcome = block_on(verifier.verify(b"commit bytes", &[signature]))?;
+/// let outcome = verifier.verify(b"commit bytes", &[signature])?;
 /// assert!(outcome.valid);
 /// assert_eq!(outcome.signatures[0].pubkey_algorithm.as_deref(), Some("p256"));
 /// # }
@@ -560,7 +558,7 @@ impl Verifier for SpkiVerifier {
         SPKI_METADATA_KEY
     }
 
-    fn verify<'a>(&'a self, data: &'a [u8], signatures: &'a [Vec<u8>]) -> VerifyFuture<'a> {
+    fn verify(&self, data: &[u8], signatures: &[Vec<u8>]) -> Result<VerifyOutcome> {
         let mut outcome = VerifyOutcome::default();
         let prehash = Prehash::new(data);
         for blob in signatures {
@@ -584,7 +582,7 @@ impl Verifier for SpkiVerifier {
             outcome.valid |= info.valid;
             outcome.signatures.push(info);
         }
-        Box::pin(async move { Ok(outcome) })
+        Ok(outcome)
     }
 }
 
@@ -1548,11 +1546,7 @@ mod tests {
         );
         let verifier = SpkiVerifier::from_pem(&text).unwrap();
         let signature = block_on(b.sign(b"data")).unwrap();
-        assert!(
-            block_on(verifier.verify(b"data", &[signature]))
-                .unwrap()
-                .valid
-        );
+        assert!(verifier.verify(b"data", &[signature]).unwrap().valid);
         assert!(SpkiVerifier::from_pem("").unwrap().is_empty());
         assert!(SpkiVerifier::from_pem(base64::encode(&a.public_key_der())).is_err());
     }
@@ -1922,10 +1916,10 @@ mod tests {
         let der = block_on(signer.sign(b"data")).unwrap();
         let fixed = Signature::from_der(&der).unwrap().to_bytes().to_vec();
         assert_eq!(fixed.len(), 64);
-        let outcome = block_on(verifier.verify(b"data", &[fixed])).unwrap();
+        let outcome = verifier.verify(b"data", &[fixed]).unwrap();
         assert!(!outcome.valid);
         assert!(outcome.signatures[0].key_missing);
-        assert!(block_on(verifier.verify(b"data", &[der])).unwrap().valid);
+        assert!(verifier.verify(b"data", &[der]).unwrap().valid);
     }
 
     // A P-256 key with explicit curve parameters, in three forms. The command
@@ -2302,7 +2296,9 @@ mod tests {
             .map(|i| i.wrapping_mul(37).wrapping_add(11))
             .collect();
         for blob in [random, vec![0x5a], trailing, malformed, fixed, ed25519] {
-            let outcome = block_on(verifier.verify(b"data", std::slice::from_ref(&blob))).unwrap();
+            let outcome = verifier
+                .verify(b"data", std::slice::from_ref(&blob))
+                .unwrap();
             assert!(!outcome.valid, "{blob:02x?}");
             let info = &outcome.signatures[0];
             assert!(!info.valid && info.key_missing, "{blob:02x?}");
@@ -2319,7 +2315,7 @@ mod tests {
             ed25519_signature(b"data"),
             block_on(signer.sign(b"data")).unwrap(),
         ];
-        let outcome = block_on(verifier.verify(b"data", &blobs)).unwrap();
+        let outcome = verifier.verify(b"data", &blobs).unwrap();
         assert!(outcome.valid);
         assert!(!outcome.signatures[0].valid && outcome.signatures[0].key_missing);
         assert!(outcome.signatures[1].valid && !outcome.signatures[1].key_missing);
@@ -2353,8 +2349,9 @@ mod tests {
             SpkiVerifier::new([compressed_fixture_spki()], Vec::<&[u8]>::new()).unwrap(),
             SpkiVerifier::from_pem(&pem_text).unwrap(),
         ] {
-            let outcome =
-                block_on(verifier.verify(b"data", std::slice::from_ref(&signature))).unwrap();
+            let outcome = verifier
+                .verify(b"data", std::slice::from_ref(&signature))
+                .unwrap();
             let info = &outcome.signatures[0];
             assert!(info.valid);
             assert_eq!(info.pubkey_algorithm.as_deref(), Some("p256"));
@@ -2396,7 +2393,7 @@ mod tests {
     }
 
     #[test]
-    fn the_sign_and_verify_futures_are_ready_at_once() {
+    fn the_sign_future_is_ready_at_once() {
         let signer = signer(7);
         let verifier = SpkiVerifier::new([signer.public_key_der()], Vec::<&[u8]>::new()).unwrap();
         let mut context = Context::from_waker(Waker::noop());
@@ -2404,15 +2401,7 @@ mod tests {
             Poll::Ready(signature) => signature.unwrap(),
             Poll::Pending => panic!("the sign future is pending"),
         };
-        let signatures = [signature];
-        match verifier
-            .verify(b"data", &signatures)
-            .as_mut()
-            .poll(&mut context)
-        {
-            Poll::Ready(outcome) => assert!(outcome.unwrap().valid),
-            Poll::Pending => panic!("the verify future is pending"),
-        }
+        assert!(verifier.verify(b"data", &[signature]).unwrap().valid);
     }
 
     #[test]

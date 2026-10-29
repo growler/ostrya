@@ -19,8 +19,9 @@ mod common;
 use std::os::fd::AsFd;
 use std::path::Path;
 use std::process::Command;
+use std::sync::Arc;
 
-use common::{TmpDir, ostree_available};
+use common::{ThreadRecorder, TmpDir, ostree_available};
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, DummySigner,
     DummyVerifier, MutableTree, Repo, RepoMode, Type, Value,
@@ -164,7 +165,7 @@ fn port_verifies_a_dummy_signature_the_tool_wrote() {
         // A verifier that trusts the key verifies the signature. With a
         // verifier that does not trust the key, the signature is not valid.
         let outcome = repo
-            .verify_commit(&commit, &[&DummyVerifier::new(["toolkey"])])
+            .verify_commit(&commit, &[Arc::new(DummyVerifier::new(["toolkey"]))])
             .await
             .unwrap();
         assert!(outcome.valid, "port rejected the tool's dummy signature");
@@ -172,7 +173,7 @@ fn port_verifies_a_dummy_signature_the_tool_wrote() {
         assert!(outcome.signatures[0].valid);
 
         let rejected = repo
-            .verify_commit(&commit, &[&DummyVerifier::new(["othertoolkey"])])
+            .verify_commit(&commit, &[Arc::new(DummyVerifier::new(["othertoolkey"]))])
             .await
             .unwrap();
         assert!(!rejected.valid, "port accepted an untrusted key");
@@ -291,7 +292,7 @@ fn appending_dummy_signature_leaves_a_foreign_engine_array_intact() {
         // The verification sees both dummy blobs. A verifier that trusts one
         // of the keys gives a valid result.
         let outcome = repo
-            .verify_commit(&commit, &[&DummyVerifier::new(["keytwo"])])
+            .verify_commit(&commit, &[Arc::new(DummyVerifier::new(["keytwo"]))])
             .await
             .unwrap();
         assert!(outcome.valid);
@@ -337,14 +338,14 @@ fn delete_signatures_removes_matching_and_empties() {
         assert_eq!(blobs.len(), 1);
         assert_eq!(blobs[0].as_bytes(), Some(b"key-b".as_slice()));
         assert!(
-            repo.verify_commit(&commit, &[&DummyVerifier::new(["key-b"])])
+            repo.verify_commit(&commit, &[Arc::new(DummyVerifier::new(["key-b"]))])
                 .await
                 .unwrap()
                 .valid
         );
         assert!(
             !repo
-                .verify_commit(&commit, &[&DummyVerifier::new(["key-a"])])
+                .verify_commit(&commit, &[Arc::new(DummyVerifier::new(["key-a"]))])
                 .await
                 .unwrap()
                 .valid
@@ -437,7 +438,7 @@ fn delete_signatures_without_a_match_is_a_noop() {
             0
         );
         assert!(
-            repo.verify_commit(&commit, &[&DummyVerifier::new(["key-a"])])
+            repo.verify_commit(&commit, &[Arc::new(DummyVerifier::new(["key-a"]))])
                 .await
                 .unwrap()
                 .valid
@@ -473,7 +474,7 @@ fn verifying_an_unsigned_commit_is_not_valid() {
     block_on(async {
         let (repo, commit) = build_committed_repo(base).await;
         let outcome = repo
-            .verify_commit(&commit, &[&DummyVerifier::new(["anykey"])])
+            .verify_commit(&commit, &[Arc::new(DummyVerifier::new(["anykey"]))])
             .await
             .unwrap();
         assert!(!outcome.valid, "an unsigned commit is not valid");
@@ -492,17 +493,38 @@ fn dummy_round_trip_within_the_port() {
             .unwrap();
 
         let good = repo
-            .verify_commit(&commit, &[&DummyVerifier::new(["thekey"])])
+            .verify_commit(&commit, &[Arc::new(DummyVerifier::new(["thekey"]))])
             .await
             .unwrap();
         assert!(good.valid);
 
         let bad = repo
-            .verify_commit(&commit, &[&DummyVerifier::new(["nope"])])
+            .verify_commit(&commit, &[Arc::new(DummyVerifier::new(["nope"]))])
             .await
             .unwrap();
         assert!(!bad.valid);
     });
+}
+
+/// `Repo::verify_commit` runs the verifiers on the blocking pool, so a
+/// verifier that works in the call does not hold the async executor.
+#[test]
+fn verify_commit_runs_the_verifiers_on_the_blocking_pool() {
+    let tmp = TmpDir::new("sign-pool");
+    let base = tmp.path();
+    let recorder = ThreadRecorder::new("ostree.sign.dummy");
+    block_on(async {
+        let (repo, commit) = build_committed_repo(base).await;
+        repo.sign_commit(&commit, &DummySigner::new("thekey"))
+            .await
+            .unwrap();
+        let outcome = repo
+            .verify_commit(&commit, &[Arc::new(recorder.clone())])
+            .await
+            .unwrap();
+        assert!(outcome.valid);
+    });
+    recorder.assert_one_foreign_call();
 }
 
 /// Returns the stored signature blobs of the dummy engine for `commit`, sorted,
@@ -641,8 +663,7 @@ fn concurrent_signatures_are_not_lost() {
 #[test]
 fn signing_items_resolve_at_their_public_paths() {
     use ostrya::sign::{
-        Error, FromSystemKeys, MAX_KEY_FILE, Result, SignFuture, SignKeys, Signer, VerifyFuture,
-        append_signature,
+        Error, FromSystemKeys, MAX_KEY_FILE, Result, SignFuture, SignKeys, Signer, append_signature,
     };
     use ostrya::{DummySigner, Ed25519Signer, Ed25519Verifier};
 
@@ -665,8 +686,9 @@ fn signing_items_resolve_at_their_public_paths() {
 
     let verifier = DummyVerifier::new([b"key".to_vec()]);
     let signatures = [signature.clone()];
-    let verified: VerifyFuture<'_> = ostrya::Verifier::verify(&verifier, b"payload", &signatures);
-    assert!(block_on(verified).unwrap().valid);
+    let verified: Result<ostrya::VerifyOutcome> =
+        ostrya::Verifier::verify(&verifier, b"payload", &signatures);
+    assert!(verified.unwrap().valid);
 
     let mut dict = Value::Array(Vec::new());
     append_signature(&mut dict, signer.metadata_key(), signature).unwrap();

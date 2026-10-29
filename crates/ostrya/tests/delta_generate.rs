@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
-use common::{TmpDir, ostree_available, ostree_supports_ed25519};
+use common::{ThreadRecorder, TmpDir, ostree_available, ostree_supports_ed25519};
 use futures_lite::AsyncReadExt;
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, DeltaEndianness,
@@ -1403,12 +1403,15 @@ fn a_signed_delta_verifies_and_indexes() {
         let trusted =
             Ed25519Verifier::new([base64::decode(PUBLIC_B64).unwrap()], Vec::<Vec<u8>>::new())
                 .unwrap();
-        let outcome = repo.verify_static_delta(&delta, &[&trusted]).await.unwrap();
+        let outcome = repo
+            .verify_static_delta(&delta, &[Arc::new(trusted)])
+            .await
+            .unwrap();
         assert!(outcome.valid, "the signed delta verifies");
         let other = Ed25519Verifier::new([vec![0u8; 32]], Vec::<Vec<u8>>::new()).unwrap();
         assert!(
             !repo
-                .verify_static_delta(&delta, &[&other])
+                .verify_static_delta(&delta, &[Arc::new(other)])
                 .await
                 .unwrap()
                 .valid
@@ -1509,16 +1512,47 @@ fn superblock_verify_reads_a_superblock_under_any_name() {
         let trusted =
             Ed25519Verifier::new([base64::decode(PUBLIC_B64).unwrap()], Vec::<Vec<u8>>::new())
                 .unwrap();
-        let outcome = sb.verify(&[&trusted]).await.unwrap();
+        let outcome = sb.verify(&[&trusted]).unwrap();
         assert!(
             outcome.valid,
             "the trusted key verifies the copied superblock"
         );
         let other = Ed25519Verifier::new([vec![0u8; 32]], Vec::<Vec<u8>>::new()).unwrap();
-        let rejected = sb.verify(&[&other]).await.unwrap();
+        let rejected = sb.verify(&[&other]).unwrap();
         assert!(!rejected.valid, "an untrusted key verifies the superblock");
         assert_eq!(rejected.signatures.len(), 1);
     });
+}
+
+/// `Repo::verify_static_delta` runs the verifiers on the blocking pool, so a
+/// verifier that works in the call does not hold the async executor.
+#[test]
+fn verify_static_delta_runs_the_verifiers_on_the_blocking_pool() {
+    let tmp = TmpDir::new("sb-verify-pool");
+    let delta = verify_fixture_delta(tmp.path(), true);
+    let recorder = ThreadRecorder::new("ostree.sign.ed25519");
+    block_on(async {
+        let repo = Repo::open(&tmp.path().join("src")).await.unwrap();
+        let outcome = repo
+            .verify_static_delta(&delta, &[Arc::new(recorder.clone())])
+            .await
+            .unwrap();
+        assert!(outcome.valid);
+    });
+    recorder.assert_one_foreign_call();
+}
+
+/// `DeltaSuperblock::verify` verifies in the calling thread, and it needs no
+/// async runtime.
+#[test]
+fn superblock_verify_runs_in_the_calling_thread_with_no_runtime() {
+    let tmp = TmpDir::new("sb-verify-no-runtime");
+    let delta = verify_fixture_delta(tmp.path(), true);
+    let sb = DeltaSuperblock::parse(std::fs::read(delta.join("superblock")).unwrap()).unwrap();
+    let recorder = ThreadRecorder::new("ostree.sign.ed25519");
+    let outcome = sb.verify(&[&recorder]).unwrap();
+    assert!(outcome.valid);
+    assert_eq!(recorder.threads(), [std::thread::current().id()]);
 }
 
 /// Creates a new archive repository at `base/<name>`.
@@ -1564,7 +1598,7 @@ fn a_verified_superblock_applies_from_the_same_read() {
         let trusted =
             Ed25519Verifier::new([base64::decode(PUBLIC_B64).unwrap()], Vec::<Vec<u8>>::new())
                 .unwrap();
-        assert!(sb.verify(&[&trusted]).await.unwrap().valid);
+        assert!(sb.verify(&[&trusted]).unwrap().valid);
         let to = *sb.to_commit();
         assert_eq!(dst.apply_static_delta(sb, &delta).await.unwrap(), to);
         dst.load_commit(&to).await.unwrap();
@@ -1914,7 +1948,7 @@ fn superblock_verify_refuses_an_unsigned_superblock() {
         let trusted =
             Ed25519Verifier::new([base64::decode(PUBLIC_B64).unwrap()], Vec::<Vec<u8>>::new())
                 .unwrap();
-        let err = sb.verify(&[&trusted]).await.unwrap_err();
+        let err = sb.verify(&[&trusted]).unwrap_err();
         assert!(matches!(err, Error::Signature(_)), "{err}");
     });
 }
@@ -1930,7 +1964,7 @@ fn superblock_verify_reports_no_blob_for_an_absent_engine() {
             .await
             .unwrap();
         let dummy = DummyVerifier::new([b"key".to_vec()]);
-        let outcome = sb.verify(&[&dummy]).await.unwrap();
+        let outcome = sb.verify(&[&dummy]).unwrap();
         assert!(!outcome.valid);
         assert!(outcome.signatures.is_empty());
     });
@@ -2643,7 +2677,7 @@ fn a_superblock_file_takes_the_superblock_and_its_directory_the_parts() {
         let trusted =
             Ed25519Verifier::new([base64::decode(PUBLIC_B64).unwrap()], Vec::<Vec<u8>>::new())
                 .unwrap();
-        assert!(read.verify(&[&trusted]).await.unwrap().valid);
+        assert!(read.verify(&[&trusted]).unwrap().valid);
     });
 }
 
@@ -3351,7 +3385,7 @@ fn a_signed_inline_delta_verifies_in_both() {
         let trusted =
             Ed25519Verifier::new([base64::decode(PUBLIC_B64).unwrap()], Vec::<Vec<u8>>::new())
                 .unwrap();
-        assert!(sb.verify(&[&trusted]).await.unwrap().valid);
+        assert!(sb.verify(&[&trusted]).unwrap().valid);
         let stats = sb.part_stats(0, &delta).await.unwrap();
         assert!(stats.ops.open_splice_close > 0);
     });

@@ -1,6 +1,6 @@
 //! The test-only dummy engine.
 
-use crate::{SignFuture, SignatureInfo, Signer, Verifier, VerifyFuture, VerifyOutcome};
+use crate::{Result, SignFuture, SignatureInfo, Signer, Verifier, VerifyOutcome};
 
 /// A signer of the dummy engine, for tests.
 ///
@@ -66,7 +66,7 @@ impl Verifier for DummyVerifier {
         "ostree.sign.dummy"
     }
 
-    fn verify<'a>(&'a self, _data: &'a [u8], signatures: &'a [Vec<u8>]) -> VerifyFuture<'a> {
+    fn verify(&self, _data: &[u8], signatures: &[Vec<u8>]) -> Result<VerifyOutcome> {
         let mut outcome = VerifyOutcome::default();
         for signature in signatures {
             let valid = self.trusted.iter().any(|key| key == signature);
@@ -77,6 +77,6 @@ impl Verifier for DummyVerifier {
                 ..SignatureInfo::default()
             });
         }
-        Box::pin(async move { Ok(outcome) })
+        Ok(outcome)
     }
 }

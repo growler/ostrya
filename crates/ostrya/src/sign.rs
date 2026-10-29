@@ -25,6 +25,7 @@
 
 use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use ostrya_core::{Checksum, ObjectType, Value, base64};
 use rustix::fs::{Mode, OFlags};
@@ -36,8 +37,8 @@ use crate::repo::Repo;
 pub use ostrya_sign::X509Signer;
 pub use ostrya_sign::{
     DummySigner, DummyVerifier, Ed25519Signer, Ed25519Verifier, MAX_KEY_FILE, SignFuture, SignKeys,
-    SignatureInfo, Signer, Verifier, VerifyFuture, VerifyOutcome, append_signature, key_text,
-    read_key_file, read_key_source,
+    SignatureInfo, Signer, Verifier, VerifyOutcome, append_signature, key_text, read_key_file,
+    read_key_source,
 };
 #[doc(hidden)]
 pub use ostrya_sign::{Error, Result};
@@ -145,7 +146,9 @@ impl Repo {
     ///
     /// The read of the commit object, the read of the `.commitmeta` file, and
     /// the parse of the file run in one call on the blocking pool. The read of
-    /// the commit object comes first.
+    /// the commit object comes first. After the read, the verifiers run in one
+    /// more call on the blocking pool, because a verifier does its work in the
+    /// call.
     ///
     /// # Errors
     ///
@@ -174,20 +177,24 @@ impl Repo {
     pub async fn verify_commit(
         &self,
         checksum: &Checksum,
-        verifiers: &[&dyn Verifier],
+        verifiers: &[Arc<dyn Verifier>],
     ) -> crate::Result<VerifyOutcome> {
         let (data, dict) = self.load_commit_and_detached(checksum).await?;
-        let mut outcome = VerifyOutcome::default();
-        for verifier in verifiers {
-            let signatures = match &dict {
-                Some(dict) => signatures_for(dict, verifier.metadata_key()),
-                None => Vec::new(),
-            };
-            let result = verifier.verify(&data, &signatures).await?;
-            outcome.valid |= result.valid;
-            outcome.signatures.extend(result.signatures);
-        }
-        Ok(outcome)
+        let verifiers = verifiers.to_vec();
+        ostrya_rt::unblock(move || {
+            let mut outcome = VerifyOutcome::default();
+            for verifier in &verifiers {
+                let signatures = match &dict {
+                    Some(dict) => signatures_for(dict, verifier.metadata_key()),
+                    None => Vec::new(),
+                };
+                let result = verifier.verify(&data, &signatures)?;
+                outcome.valid |= result.valid;
+                outcome.signatures.extend(result.signatures);
+            }
+            Ok(outcome)
+        })
+        .await
     }
 
     /// Removes the signatures of a commit that `remove` selects.

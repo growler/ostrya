@@ -11,6 +11,9 @@ a `Verifier`. Each engine stores its signatures under its own key in the
 detached metadata. The `ostrya` crate reads and writes this metadata and
 loads the system key store. The crate compiles on Linux, macOS, and Windows.
 
+A `Verifier` verifies in the call to `Verifier::verify`, so a program
+with no async runtime can verify. A `Signer` returns a future.
+
 API documentation: <https://docs.rs/ostrya-sign>
 
 ## Entry points
@@ -66,6 +69,6 @@ let secret = ostrya_core::base64::decode(concat!(
 let signer = Ed25519Signer::from_secret_key(&secret)?;
 let signature = block_on(signer.sign(b"commit bytes"))?;
 let verifier = Ed25519Verifier::new([&secret[32..]], Vec::<&[u8]>::new())?;
-let outcome = block_on(verifier.verify(b"commit bytes", &[signature]))?;
+let outcome = verifier.verify(b"commit bytes", &[signature])?;
 assert!(outcome.valid);
 ```

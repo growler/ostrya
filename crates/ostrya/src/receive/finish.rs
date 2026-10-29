@@ -41,6 +41,7 @@ use crate::summary::{
     serialize_signature_dict,
 };
 use crate::transaction::{Transaction, TransactionStats};
+use crate::verify::Payload;
 use crate::write::flat_name;
 
 /// The detached-metadata key of GPG signatures. The `ostree` command writes
@@ -83,8 +84,10 @@ impl Named<'_> {
 /// A commit that a ref update names as its new value.
 struct Target {
     checksum: Checksum,
-    /// The serialized commit, the payload of its signatures.
-    bytes: Vec<u8>,
+    /// The serialized commit, the payload of its signatures. The trust check
+    /// and the search for a signature of a server key give it to the blocking
+    /// pool with no copy.
+    bytes: Arc<Vec<u8>>,
     commit: Commit,
     /// The index of each ref update whose new value the commit is, in order.
     /// The rules of these updates verify and sign the commit.
@@ -104,7 +107,7 @@ struct Edit<'a> {
     commit: Checksum,
     /// The commit bytes, the payload of its signatures. A commit that no
     /// update names gets no signature, and its payload is empty.
-    payload: &'a [u8],
+    payload: Payload<'a>,
     /// The dict that the repository held at the time of the plan, `None` for
     /// no dict.
     stored: Option<Bytes>,
@@ -944,7 +947,7 @@ async fn load_commits(txn: &Transaction, updates: &[RefUpdate]) -> Checked<Loade
                 }
                 loaded.targets.push(Target {
                     checksum: *checksum,
-                    bytes,
+                    bytes: Arc::new(bytes),
                     commit,
                     updates,
                 });
@@ -1335,7 +1338,7 @@ pub(super) async fn sign_server_commit(
     let stored = read_stored(repo, vec![commit]).await?.pop().flatten();
     let edit = Edit {
         commit,
-        payload,
+        payload: payload.into(),
         stored,
         incoming: None,
         keep: Arc::default(),
@@ -1665,11 +1668,11 @@ fn plan<'a>(
         let signers = target_signers(rules, &target.updates);
         let dict = incoming.remove(&target.checksum);
         if dict.is_some() || !signers.is_empty() {
-            edits.push(edit(target.checksum, &target.bytes[..], dict, signers));
+            edits.push(edit(target.checksum, (&target.bytes).into(), dict, signers));
         }
     }
     for (commit, dict) in incoming {
-        edits.push(edit(commit, &[][..], Some(dict), Vec::new()));
+        edits.push(edit(commit, Payload::Borrowed(&[]), Some(dict), Vec::new()));
     }
     edits
 }
@@ -1863,7 +1866,7 @@ async fn prepare_signatures(mut edits: Vec<Edit<'_>>, size: bool) -> Checked<Vec
                 let key = signer.signer().metadata_key();
                 let signature = signer
                     .signer()
-                    .sign(edit.payload)
+                    .sign(edit.payload.bytes())
                     .await
                     .map_err(|e| Failure::Internal(e.into()))?;
                 append_signature(dict, key, signature.clone())
@@ -2120,7 +2123,7 @@ async fn add_host_entries<'a>(
                 host.push(true);
                 edits.push(Edit {
                     commit: target.checksum,
-                    payload: &target.bytes,
+                    payload: (&target.bytes).into(),
                     stored,
                     incoming,
                     keep,

@@ -381,7 +381,7 @@ mod tests {
 
     /// Returns the result of `verifier` for the one blob `blob` over `data`.
     fn outcome(verifier: &SpkiVerifier, data: &[u8], blob: &[u8]) -> SignatureInfo {
-        let mut outcome = block_on(verifier.verify(data, &[blob.to_vec()])).unwrap();
+        let mut outcome = verifier.verify(data, &[blob.to_vec()]).unwrap();
         outcome.signatures.remove(0)
     }
 

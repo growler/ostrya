@@ -12,13 +12,6 @@ use crate::Result;
 /// engine decides internally if it moves heavy work to the blocking pool.
 pub type SignFuture<'a> = Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send + 'a>>;
 
-/// The boxed future that [`Verifier::verify`] returns.
-///
-/// The future is boxed so that `Verifier` stays dyn-compatible. As a result,
-/// `Repo::verify_commit` of the `ostrya` crate can take `&dyn Verifier`. The
-/// verifiers of this crate return a future that is ready at once.
-pub type VerifyFuture<'a> = Pin<Box<dyn Future<Output = Result<VerifyOutcome>> + Send + 'a>>;
-
 /// An engine that produces a detached signature over an opaque payload.
 pub trait Signer: Send + Sync {
     /// Returns the short name of the engine.
@@ -65,6 +58,12 @@ pub trait Verifier: Send + Sync {
     /// The outcome is valid if at least one blob verifies. The outcome holds
     /// one [`SignatureInfo`] for each blob in [`VerifyOutcome::signatures`].
     ///
+    /// The verifier does its work in the call, and the call holds its thread
+    /// for the time of the verification. The number of blobs and the length of
+    /// `data` set this time. A caller on an async executor that verifies
+    /// untrusted input runs the call on the blocking pool of its runtime. A
+    /// program with no async runtime calls this method directly.
+    ///
     /// # Errors
     ///
     /// - [`Error::Signature`] if the engine cannot do the verification.
@@ -73,7 +72,7 @@ pub trait Verifier: Send + Sync {
     /// does not verify is an entry with `valid` set to `false` in the outcome.
     ///
     /// [`Error::Signature`]: crate::Error::Signature
-    fn verify<'a>(&'a self, data: &'a [u8], signatures: &'a [Vec<u8>]) -> VerifyFuture<'a>;
+    fn verify(&self, data: &[u8], signatures: &[Vec<u8>]) -> Result<VerifyOutcome>;
 }
 
 /// The result of the verification of a payload.

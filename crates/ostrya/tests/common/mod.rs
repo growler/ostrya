@@ -877,3 +877,60 @@ impl<W: AsyncWrite + Unpin> AsyncWrite for Counting<W> {
         Pin::new(&mut self.get_mut().inner).poll_close(cx)
     }
 }
+
+/// A verifier that accepts each blob under its key and records the thread of
+/// each call.
+///
+/// A clone shares the record, so a test keeps a handle on the record after it
+/// gives the verifier to a method.
+#[derive(Clone)]
+pub struct ThreadRecorder {
+    /// The detached-metadata key that the verifier reads.
+    key: &'static str,
+    /// The thread of each call to `verify`, in order.
+    threads: Arc<Mutex<Vec<std::thread::ThreadId>>>,
+}
+
+impl ThreadRecorder {
+    /// Creates a recorder that reads the blobs under `key`.
+    pub fn new(key: &'static str) -> ThreadRecorder {
+        ThreadRecorder {
+            key,
+            threads: Arc::default(),
+        }
+    }
+
+    /// Returns the thread of each call to `verify`, in order.
+    pub fn threads(&self) -> Vec<std::thread::ThreadId> {
+        self.threads.lock().unwrap().clone()
+    }
+
+    /// Asserts that one call to `verify` ran, on a thread other than the
+    /// thread of the test.
+    pub fn assert_one_foreign_call(&self) {
+        let threads = self.threads();
+        assert_eq!(threads.len(), 1, "{threads:?}");
+        assert_ne!(threads[0], std::thread::current().id());
+    }
+}
+
+impl ostrya::Verifier for ThreadRecorder {
+    fn metadata_key(&self) -> &str {
+        self.key
+    }
+
+    fn verify(
+        &self,
+        _data: &[u8],
+        signatures: &[Vec<u8>],
+    ) -> ostrya::sign::Result<ostrya::VerifyOutcome> {
+        self.threads
+            .lock()
+            .unwrap()
+            .push(std::thread::current().id());
+        Ok(ostrya::VerifyOutcome {
+            valid: !signatures.is_empty(),
+            ..Default::default()
+        })
+    }
+}

@@ -16,10 +16,12 @@ mod common;
 
 use std::path::Path;
 use std::process::Command;
+use std::sync::Arc;
 
 use common::modes::{WRITABLE, build_tree, repo_of};
 use common::{
-    TmpDir, anyone, fixture_root, ostree_available, ostree_supports_ed25519, read_access,
+    ThreadRecorder, TmpDir, anyone, fixture_root, ostree_available, ostree_supports_ed25519,
+    read_access,
 };
 use ostrya::base64;
 use ostrya::{
@@ -186,13 +188,41 @@ fn sign_and_verify_round_trip() {
 
         let public = base64::decode(PUBLIC_B64).unwrap();
         let trusted = Ed25519Verifier::new([public], Vec::<Vec<u8>>::new()).unwrap();
-        let outcome = repo.verify_summary(&[&trusted]).await.unwrap();
+        let outcome = repo.verify_summary(&[Arc::new(trusted)]).await.unwrap();
         assert!(outcome.valid, "a signed summary must verify with the key");
 
         let wrong = Ed25519Verifier::new([vec![0u8; 32]], Vec::<Vec<u8>>::new()).unwrap();
-        let outcome = repo.verify_summary(&[&wrong]).await.unwrap();
+        let outcome = repo.verify_summary(&[Arc::new(wrong)]).await.unwrap();
         assert!(!outcome.valid, "a foreign key must not verify the summary");
     });
+}
+
+/// `Repo::verify_summary` runs the verifiers on the blocking pool, so a
+/// verifier that works in the call does not hold the async executor.
+#[test]
+fn verify_summary_runs_the_verifiers_on_the_blocking_pool() {
+    let (_tmp, repo_dir) = writable_fixture("summary", "summary-pool");
+    let recorder = ThreadRecorder::new("ostree.sign.ed25519");
+    block_on(async {
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        repo.regenerate_summary(&SummaryOptions {
+            last_modified: Some(FIXED_EPOCH),
+            metadata_commit_timestamp: None,
+            additional_metadata: Vec::new(),
+            auth_items_only: false,
+        })
+        .await
+        .unwrap();
+        repo.sign_summary(&Ed25519Signer::from_base64(SECRET_B64).unwrap())
+            .await
+            .unwrap();
+        let outcome = repo
+            .verify_summary(&[Arc::new(recorder.clone())])
+            .await
+            .unwrap();
+        assert!(outcome.valid);
+    });
+    recorder.assert_one_foreign_call();
 }
 
 /// The gate in the reverse direction: the `ostree` command verifies a summary

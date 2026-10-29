@@ -1754,6 +1754,9 @@ impl Repo {
     /// The outcome is valid if a verifier reports a valid signature. The
     /// outcome holds the signatures that each verifier reports.
     ///
+    /// After the reads, the verifiers run in one call on the blocking pool,
+    /// because a verifier does its work in the call.
+    ///
     /// # Errors
     ///
     /// - [`Error::InvalidFormat`] if the repository has no `summary`.
@@ -1761,23 +1764,27 @@ impl Repo {
     /// - [`Error::Signature`], or the variant that the engine error converts
     ///   to, if a verifier fails.
     /// - [`Error::Io`] if a read fails.
-    pub async fn verify_summary(&self, verifiers: &[&dyn Verifier]) -> Result<VerifyOutcome> {
+    pub async fn verify_summary(&self, verifiers: &[Arc<dyn Verifier>]) -> Result<VerifyOutcome> {
         let data = self
             .read_summary()
             .await?
             .ok_or_else(|| Error::InvalidFormat("no summary to verify".into()))?;
         let dict = self.read_summary_signature().await?;
-        let mut outcome = VerifyOutcome::default();
-        for verifier in verifiers {
-            let signatures = match &dict {
-                Some(dict) => signatures_for(dict, verifier.metadata_key()),
-                None => Vec::new(),
-            };
-            let result = verifier.verify(&data, &signatures).await?;
-            outcome.valid |= result.valid;
-            outcome.signatures.extend(result.signatures);
-        }
-        Ok(outcome)
+        let verifiers = verifiers.to_vec();
+        ostrya_rt::unblock(move || {
+            let mut outcome = VerifyOutcome::default();
+            for verifier in &verifiers {
+                let signatures = match &dict {
+                    Some(dict) => signatures_for(dict, verifier.metadata_key()),
+                    None => Vec::new(),
+                };
+                let result = verifier.verify(&data, &signatures)?;
+                outcome.valid |= result.valid;
+                outcome.signatures.extend(result.signatures);
+            }
+            Ok(outcome)
+        })
+        .await
     }
 
     /// Returns the size, the version, and the timestamp of each commit of

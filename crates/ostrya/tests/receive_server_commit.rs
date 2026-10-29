@@ -807,7 +807,7 @@ fn server_keys_sign_the_commit() {
     );
     let public = secret(SERVER_SECRET_B64)[32..].to_vec();
     let verifier = Ed25519Verifier::new([public], Vec::<Vec<u8>>::new()).unwrap();
-    let outcome = block_on(repo.verify_commit(&commit, &[&verifier])).unwrap();
+    let outcome = block_on(repo.verify_commit(&commit, &[Arc::new(verifier)])).unwrap();
     assert!(outcome.valid, "the server signature verifies");
 }
 
@@ -1001,7 +1001,7 @@ fn a_gpg_server_key_signs_the_commit() {
     let commit = new_commit(&report);
     assert_eq!(stored_signatures(&repo, &commit, "ostree.gpgsigs").len(), 1);
     let verifier = ostrya::GpgVerifier::from_keyring_bytes([home.export()]).unwrap();
-    let outcome = block_on(repo.verify_commit(&commit, &[&verifier])).unwrap();
+    let outcome = block_on(repo.verify_commit(&commit, &[Arc::new(verifier)])).unwrap();
     assert!(outcome.valid, "the server signature verifies");
 }
 

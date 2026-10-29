@@ -16,6 +16,7 @@ use std::io::{self, SeekFrom};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 
 use async_compression::futures::bufread::XzDecoder;
@@ -592,7 +593,8 @@ impl Repo {
     /// Verifies the signatures of the static delta in `dir` against `verifiers`.
     ///
     /// The call reads `dir/superblock` and verifies it as
-    /// [`DeltaSuperblock::verify`] does.
+    /// [`DeltaSuperblock::verify`] does. The verifiers run in one call on the
+    /// blocking pool, because a verifier does its work in the call.
     ///
     /// # Errors
     ///
@@ -606,12 +608,15 @@ impl Repo {
     pub async fn verify_static_delta(
         &self,
         dir: &Path,
-        verifiers: &[&dyn Verifier],
+        verifiers: &[Arc<dyn Verifier>],
     ) -> Result<VerifyOutcome> {
-        DeltaSuperblock::read(&dir.join("superblock"))
-            .await?
-            .verify(verifiers)
-            .await
+        let sb = DeltaSuperblock::read(&dir.join("superblock")).await?;
+        let verifiers = verifiers.to_vec();
+        ostrya_rt::unblock(move || {
+            let verifiers: Vec<&dyn Verifier> = verifiers.iter().map(|v| v.as_ref()).collect();
+            sb.verify(&verifiers)
+        })
+        .await
     }
 
     /// Returns the names of the static deltas in `deltas/`, sorted.
@@ -1240,6 +1245,11 @@ impl DeltaSuperblock {
     /// examines no signature. The outcome is valid if any verifier reports a
     /// valid signature. The superblock file can have any name.
     ///
+    /// The call verifies in the calling thread, and it holds the thread for
+    /// the time of the verification. It needs no async runtime. A caller on an
+    /// async executor that verifies untrusted input runs the call on the
+    /// blocking pool.
+    ///
     /// # Signed envelope
     ///
     /// A signed superblock file is a GVariant of type `(taya{sv})`. Its fields
@@ -1251,7 +1261,7 @@ impl DeltaSuperblock {
     /// - [`Error::Signature`] if the superblock has no signed envelope.
     /// - An error that a verifier returns, as [`Error::Signature`],
     ///   [`Error::InvalidFormat`], or [`Error::Core`].
-    pub async fn verify(&self, verifiers: &[&dyn Verifier]) -> Result<VerifyOutcome> {
+    pub fn verify(&self, verifiers: &[&dyn Verifier]) -> Result<VerifyOutcome> {
         let signatures = self
             .signatures
             .as_ref()
@@ -1259,7 +1269,7 @@ impl DeltaSuperblock {
         let mut outcome = VerifyOutcome::default();
         for verifier in verifiers {
             let blobs = signatures_for(signatures, verifier.metadata_key());
-            let result = verifier.verify(&self.superblock_bytes, &blobs).await?;
+            let result = verifier.verify(&self.superblock_bytes, &blobs)?;
             outcome.valid |= result.valid;
             outcome.signatures.extend(result.signatures);
         }

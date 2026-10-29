@@ -12,6 +12,7 @@
 mod common;
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use common::{
@@ -208,7 +209,7 @@ async fn ed25519_signatures(repo: &Repo, commit: &Checksum) -> usize {
 async fn signed_by(repo: &Repo, commit: &Checksum, secret_b64: &str) -> bool {
     let public = ostrya::base64::decode(secret_b64).unwrap()[32..].to_vec();
     let verifier = Ed25519Verifier::new([public], Vec::<Vec<u8>>::new()).unwrap();
-    repo.verify_commit(commit, &[&verifier])
+    repo.verify_commit(commit, &[Arc::new(verifier)])
         .await
         .unwrap()
         .valid

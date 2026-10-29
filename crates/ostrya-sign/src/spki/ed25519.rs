@@ -204,7 +204,7 @@ mod tests {
 
     /// Returns the outcome of `verifier` for the one blob `blob` over `data`.
     fn outcome(verifier: &SpkiVerifier, data: &[u8], blob: &[u8]) -> crate::VerifyOutcome {
-        block_on(verifier.verify(data, &[blob.to_vec()])).unwrap()
+        verifier.verify(data, &[blob.to_vec()]).unwrap()
     }
 
     #[test]
@@ -488,7 +488,7 @@ mod tests {
     }
 
     #[test]
-    fn the_sign_and_verify_futures_are_ready_at_once() {
+    fn the_sign_future_is_ready_at_once() {
         let signer = signer();
         let verifier = verifier();
         let mut context = Context::from_waker(Waker::noop());
@@ -496,15 +496,7 @@ mod tests {
             Poll::Ready(signature) => signature.unwrap(),
             Poll::Pending => panic!("the sign future is pending"),
         };
-        let signatures = [signature];
-        match verifier
-            .verify(b"data", &signatures)
-            .as_mut()
-            .poll(&mut context)
-        {
-            Poll::Ready(outcome) => assert!(outcome.unwrap().valid),
-            Poll::Pending => panic!("the verify future is pending"),
-        }
+        assert!(verifier.verify(b"data", &[signature]).unwrap().valid);
     }
 
     // The three tests below hold the agreement of the verify with the

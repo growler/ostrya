@@ -533,7 +533,8 @@ pub(crate) const ALL_ENGINES: &[&str] = &[
 /// valid signature.
 ///
 /// The policy holds each verifier in an [`Arc`], so the two targets of one pull
-/// share the verifiers that both ask for. The default policy holds no axis.
+/// share the verifiers that both ask for, and a check can run each verifier on
+/// the blocking pool. The default policy holds no axis.
 #[derive(Clone, Default)]
 pub(crate) struct Policy {
     /// The GPG axis, if it applies.
@@ -573,55 +574,107 @@ impl Policy {
     /// `signatures` is the detached-metadata dict that holds the signatures. It
     /// is `None` if the payload carries no signatures. `subject` names the
     /// payload in an error message.
-    pub(crate) async fn check(
-        &self,
-        subject: &str,
-        payload: &[u8],
-        signatures: Option<&Value>,
-    ) -> Result<()> {
-        self.check_on(subject, payload, signatures, false).await
-    }
-
-    /// Verifies as [`check`](Self::check) does, and runs the verifiers of the
-    /// sign-api axis on the blocking pool.
     ///
-    /// The ed25519 and spki verifiers do their work in the call. The pool
-    /// gets a copy of `payload`, and the signature blobs that the check reads
-    /// for each verifier. The GPG verifier moves its own work to the
-    /// blocking pool, so the GPG axis runs in the calling task.
-    pub(crate) async fn check_unblocked(
+    /// Each verifier of each axis runs on the blocking pool, because a
+    /// verifier does its work in the call. The verifiers share one copy of
+    /// `payload` on the pool. [`Payload`] states when the check makes this
+    /// copy.
+    pub(crate) async fn check<'p>(
         &self,
         subject: &str,
-        payload: &[u8],
+        payload: impl Into<Payload<'p>>,
         signatures: Option<&Value>,
     ) -> Result<()> {
-        self.check_on(subject, payload, signatures, true).await
-    }
-
-    /// Verifies as [`check`](Self::check) does. If `unblock` is `true`, the
-    /// verifiers of the sign-api axis run on the blocking pool.
-    async fn check_on(
-        &self,
-        subject: &str,
-        payload: &[u8],
-        signatures: Option<&Value>,
-        unblock: bool,
-    ) -> Result<()> {
+        let mut payload = PoolCopy::new(payload.into());
         if let Some(gpg) = &self.gpg {
             check_axis(
                 subject,
                 "GPG",
                 std::slice::from_ref(gpg),
-                payload,
+                &mut payload,
                 signatures,
-                false,
             )
             .await?;
         }
         if let Some(engines) = &self.sign {
-            check_axis(subject, "sign-api", engines, payload, signatures, unblock).await?;
+            check_axis(subject, "sign-api", engines, &mut payload, signatures).await?;
         }
         Ok(())
+    }
+}
+
+/// The payload of a signature check, as the caller holds it.
+///
+/// The verifiers of a check run on the blocking pool, and the pool gets the
+/// payload in an [`Arc`]. If the caller holds the payload in an `Arc`, it
+/// gives [`Payload::Shared`], and the pool gets no copy. The check copies a
+/// [`Payload::Borrowed`] payload one time, when the first verifier runs.
+#[derive(Clone, Copy)]
+pub(crate) enum Payload<'a> {
+    /// A payload that the caller borrows.
+    Borrowed(&'a [u8]),
+    /// A payload that the caller holds in an [`Arc`].
+    Shared(&'a Arc<Vec<u8>>),
+}
+
+impl<'a> Payload<'a> {
+    /// Returns the bytes of the payload.
+    #[cfg_attr(not(feature = "receive"), allow(dead_code))]
+    pub(crate) fn bytes(self) -> &'a [u8] {
+        match self {
+            Payload::Borrowed(bytes) => bytes,
+            Payload::Shared(bytes) => bytes,
+        }
+    }
+
+    /// Returns the payload in an [`Arc`] for the blocking pool. A shared
+    /// payload gives a clone of its `Arc`, and a borrowed payload gives a
+    /// copy.
+    pub(crate) fn to_shared(self) -> Arc<Vec<u8>> {
+        match self {
+            Payload::Borrowed(bytes) => Arc::new(bytes.to_vec()),
+            Payload::Shared(bytes) => Arc::clone(bytes),
+        }
+    }
+}
+
+impl<'a> From<&'a [u8]> for Payload<'a> {
+    fn from(bytes: &'a [u8]) -> Payload<'a> {
+        Payload::Borrowed(bytes)
+    }
+}
+
+impl<'a> From<&'a Arc<Vec<u8>>> for Payload<'a> {
+    fn from(bytes: &'a Arc<Vec<u8>>) -> Payload<'a> {
+        Payload::Shared(bytes)
+    }
+}
+
+/// The payload of one check, with the copy that its verifiers share on the
+/// blocking pool.
+struct PoolCopy<'a> {
+    payload: Payload<'a>,
+    /// The copy of a borrowed payload, made when the first verifier runs.
+    copy: Option<Arc<Vec<u8>>>,
+}
+
+impl<'a> PoolCopy<'a> {
+    fn new(payload: Payload<'a>) -> PoolCopy<'a> {
+        PoolCopy {
+            payload,
+            copy: None,
+        }
+    }
+
+    /// Returns the payload for one verifier on the pool. The first call for a
+    /// borrowed payload copies it.
+    fn shared(&mut self) -> Arc<Vec<u8>> {
+        match self.payload {
+            Payload::Shared(bytes) => Arc::clone(bytes),
+            Payload::Borrowed(_) => {
+                Arc::clone(self.copy.get_or_insert_with(|| self.payload.to_shared()))
+            }
+        }
     }
 }
 
@@ -644,25 +697,26 @@ pub(crate) enum Found {
 /// two cases apart, as the `ostree` command does. For a commit or a summary,
 /// [`Found::Nothing`] is a refusal. An unsigned static delta gives
 /// [`Found::Nothing`], and the delta check accepts it.
-pub(crate) async fn examine(
+///
+/// Each verifier runs on the blocking pool, with the payload that the
+/// verifiers share, and the blobs that the search reads for the verifier.
+/// [`Payload`] states when the check copies the payload.
+pub(crate) async fn examine<'p>(
     verifiers: &[Arc<dyn Verifier>],
-    payload: &[u8],
+    payload: impl Into<Payload<'p>>,
     signatures: Option<&Value>,
 ) -> Result<Found> {
-    examine_on(verifiers, payload, signatures, false).await
+    examine_pooled(verifiers, &mut PoolCopy::new(payload.into()), signatures).await
 }
 
-/// Verifies `payload` on one axis as [`examine`] does. If `unblock` is
-/// `true`, each verifier runs on the blocking pool, with a copy of `payload`
-/// and the blobs that the search reads for the verifier.
-async fn examine_on(
+/// Verifies `payload` on one axis as [`examine`] does. The verifiers get the
+/// shared copy of `payload`.
+async fn examine_pooled(
     verifiers: &[Arc<dyn Verifier>],
-    payload: &[u8],
+    payload: &mut PoolCopy<'_>,
     signatures: Option<&Value>,
-    unblock: bool,
 ) -> Result<Found> {
     let mut found = Found::Nothing;
-    let mut copy: Option<Arc<[u8]>> = None;
     for verifier in verifiers {
         let blobs = match signatures {
             Some(dict) => signatures_for(dict, verifier.metadata_key()),
@@ -672,16 +726,9 @@ async fn examine_on(
             continue;
         }
         found = Found::Untrusted;
-        let outcome = if unblock {
-            let payload = Arc::clone(copy.get_or_insert_with(|| Arc::from(payload)));
-            let verifier = Arc::clone(verifier);
-            ostrya_rt::unblock(move || {
-                futures_lite::future::block_on(verifier.verify(&payload, &blobs))
-            })
-            .await?
-        } else {
-            verifier.verify(payload, &blobs).await?
-        };
+        let payload = payload.shared();
+        let verifier = Arc::clone(verifier);
+        let outcome = ostrya_rt::unblock(move || verifier.verify(&payload, &blobs)).await?;
         if outcome.valid {
             return Ok(Found::Valid);
         }
@@ -690,17 +737,15 @@ async fn examine_on(
 }
 
 /// Verifies `payload` on one axis, and refuses it if no key of the axis signed
-/// it or if it carries no signature. If `unblock` is `true`, the verifiers
-/// run on the blocking pool.
+/// it or if it carries no signature. The verifiers run on the blocking pool.
 async fn check_axis(
     subject: &str,
     axis: &str,
     verifiers: &[Arc<dyn Verifier>],
-    payload: &[u8],
+    payload: &mut PoolCopy<'_>,
     signatures: Option<&Value>,
-    unblock: bool,
 ) -> Result<()> {
-    match examine_on(verifiers, payload, signatures, unblock).await? {
+    match examine_pooled(verifiers, payload, signatures).await? {
         Found::Valid => Ok(()),
         Found::Untrusted => Err(Error::Signature(format!(
             "{subject}: no {axis} signature is from a trusted key"
@@ -1250,6 +1295,54 @@ mod tests {
         .unwrap();
     }
 
+    /// A policy check runs the verifier of each axis on the blocking pool, so
+    /// a verifier that works in the call does not hold the async executor.
+    #[test]
+    fn each_axis_verifies_on_the_blocking_pool() {
+        use crate::sign::append_signature;
+        use crate::verify::trust::tests::ThreadRecorder;
+
+        let gpg = ThreadRecorder::new("ostree.gpgsigs");
+        let sign = ThreadRecorder::new("ostree.sign.ed25519");
+        let policy = Policy::from_axes(
+            Some(Arc::new(gpg.clone())),
+            Some(vec![Arc::new(sign.clone())]),
+        );
+        let mut dict = Value::Array(Vec::new());
+        append_signature(&mut dict, "ostree.gpgsigs", vec![1; 8]).unwrap();
+        append_signature(&mut dict, "ostree.sign.ed25519", vec![7; 64]).unwrap();
+        ostrya_rt::block_on(policy.check("commit", PAYLOAD, Some(&dict))).unwrap();
+        gpg.assert_one_foreign_call();
+        sign.assert_one_foreign_call();
+        // The two axes share one copy of a borrowed payload.
+        let (gpg, sign) = (gpg.payloads(), sign.payloads());
+        assert_eq!(gpg, sign);
+        assert_eq!(gpg[0].1, PAYLOAD);
+        assert_ne!(gpg[0].0, PAYLOAD.as_ptr() as usize);
+    }
+
+    /// A policy check gives a payload in an [`Arc`] to the verifier of each
+    /// axis with no copy.
+    #[test]
+    fn a_shared_payload_reaches_each_axis_with_no_copy() {
+        use crate::sign::append_signature;
+        use crate::verify::trust::tests::ThreadRecorder;
+
+        let gpg = ThreadRecorder::new("ostree.gpgsigs");
+        let sign = ThreadRecorder::new("ostree.sign.ed25519");
+        let policy = Policy::from_axes(
+            Some(Arc::new(gpg.clone())),
+            Some(vec![Arc::new(sign.clone())]),
+        );
+        let mut dict = Value::Array(Vec::new());
+        append_signature(&mut dict, "ostree.gpgsigs", vec![1; 8]).unwrap();
+        append_signature(&mut dict, "ostree.sign.ed25519", vec![7; 64]).unwrap();
+        let payload = Arc::new(PAYLOAD.to_vec());
+        ostrya_rt::block_on(policy.check("commit", &payload, Some(&dict))).unwrap();
+        gpg.assert_no_copy_of(&payload);
+        sign.assert_no_copy_of(&payload);
+    }
+
     /// `TrustedKeys::new` refuses a dummy verifier, alone and next to a real
     /// engine.
     #[test]
@@ -1711,7 +1804,7 @@ mod tests {
         let verifier = build_verifier(Engine::Spki, keys).unwrap().unwrap();
         for signer in [&inline, &in_file] {
             let signature = ostrya_rt::block_on(signer.sign(PAYLOAD)).unwrap();
-            let outcome = ostrya_rt::block_on(verifier.verify(PAYLOAD, &[signature])).unwrap();
+            let outcome = verifier.verify(PAYLOAD, &[signature]).unwrap();
             assert!(outcome.valid);
         }
     }

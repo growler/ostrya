@@ -11,6 +11,7 @@
 mod common;
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use common::receive::{
     ED25519_KEY, OTHER_SECRET_B64, Obj, SECOND_SERVER_SECRET_B64, SECRET_B64, SERVER_SECRET_B64,
@@ -3246,7 +3247,7 @@ fn two_pushes_with_a_gpg_server_key_leave_one_server_signature() {
         .unwrap();
     assert_eq!(signatures(&dict, "ostree.gpgsigs").len(), 1);
     let verifier = ostrya::GpgVerifier::from_keyring_bytes([home.export()]).unwrap();
-    let outcome = block_on(repo.verify_commit(&fixture_commit(), &[&verifier])).unwrap();
+    let outcome = block_on(repo.verify_commit(&fixture_commit(), &[Arc::new(verifier)])).unwrap();
     assert!(outcome.valid, "the server signature verifies");
 }
 
@@ -3293,7 +3294,11 @@ fn summary_is_regenerated_and_signed_from_the_built_bytes() {
     );
     for key in [SERVER_SECRET_B64, SECOND_SERVER_SECRET_B64] {
         let verifier = ed25519_verifier(key);
-        assert!(block_on(repo.verify_summary(&[&verifier])).unwrap().valid);
+        assert!(
+            block_on(repo.verify_summary(&[Arc::new(verifier)]))
+                .unwrap()
+                .valid
+        );
     }
 
     // An update to the current commit changes no ref and writes no summary.

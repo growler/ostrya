@@ -5,10 +5,7 @@ use std::collections::HashSet;
 use ed25519_dalek::{Signature, Signer as _, SigningKey, Verifier as _, VerifyingKey};
 use ostrya_core::base64;
 
-use crate::{
-    Error, Result, SignFuture, SignKeys, SignatureInfo, Signer, Verifier, VerifyFuture,
-    VerifyOutcome,
-};
+use crate::{Error, Result, SignFuture, SignKeys, SignatureInfo, Signer, Verifier, VerifyOutcome};
 
 /// The ed25519 sign type. It is the engine name and the base name of the
 /// key-store files (`trusted.ed25519`, `revoked.ed25519`).
@@ -171,7 +168,7 @@ impl Verifier for Ed25519Verifier {
         ED25519_METADATA_KEY
     }
 
-    fn verify<'a>(&'a self, data: &'a [u8], signatures: &'a [Vec<u8>]) -> VerifyFuture<'a> {
+    fn verify(&self, data: &[u8], signatures: &[Vec<u8>]) -> Result<VerifyOutcome> {
         let mut outcome = VerifyOutcome::default();
         for blob in signatures {
             let valid = match <[u8; 64]>::try_from(blob.as_slice()) {
@@ -189,7 +186,7 @@ impl Verifier for Ed25519Verifier {
                 ..SignatureInfo::default()
             });
         }
-        Box::pin(async move { Ok(outcome) })
+        Ok(outcome)
     }
 }
 
@@ -227,8 +224,7 @@ mod tests {
         let signer = Ed25519Signer::from_secret_key(&secret).unwrap();
         let signature = futures_lite::future::block_on(signer.sign(b"payload")).unwrap();
         let verifier = Ed25519Verifier::new([public], Vec::<Vec<u8>>::new()).unwrap();
-        let outcome =
-            futures_lite::future::block_on(verifier.verify(b"payload", &[signature])).unwrap();
+        let outcome = verifier.verify(b"payload", &[signature]).unwrap();
         assert!(outcome.valid);
     }
 }

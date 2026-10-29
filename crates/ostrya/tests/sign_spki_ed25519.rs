@@ -9,6 +9,7 @@ mod common;
 
 use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use common::TmpDir;
 use ostrya::{
@@ -165,7 +166,10 @@ fn ed25519_keys_in_pkcs8_v1_and_v2_sign_and_verify_a_commit() {
             let signer = SpkiSigner::from_base64(secret).unwrap();
             repo.sign_commit(&commit, &signer).await.unwrap();
             let verifier = SpkiVerifier::from_pem(PUBLIC_PEM).unwrap();
-            let outcome = repo.verify_commit(&commit, &[&verifier]).await.unwrap();
+            let outcome = repo
+                .verify_commit(&commit, &[Arc::new(verifier)])
+                .await
+                .unwrap();
             assert!(outcome.valid, "{secret}");
             let dict = repo
                 .read_commit_detached_metadata(&commit)
@@ -192,7 +196,7 @@ fn a_key_store_with_an_ed25519_key_verifies_and_its_revocation_removes_the_key()
 
         let dir = store(base, "trusted", PUBLIC_PEM, None);
         let outcome = repo
-            .verify_commit(&commit, &[&store_verifier(&dir)])
+            .verify_commit(&commit, &[Arc::new(store_verifier(&dir))])
             .await
             .unwrap();
         assert!(outcome.valid);
@@ -205,7 +209,7 @@ fn a_key_store_with_an_ed25519_key_verifies_and_its_revocation_removes_the_key()
         assert!(verifier.is_empty());
         assert!(
             !repo
-                .verify_commit(&commit, &[&verifier])
+                .verify_commit(&commit, &[Arc::new(verifier)])
                 .await
                 .unwrap()
                 .valid
@@ -224,9 +228,10 @@ fn the_ed25519_engine_and_the_spki_engine_sign_with_the_same_bytes() {
     let engine_secret = base64::decode(ENGINE_SECRET_B64).unwrap();
     let engine = Ed25519Signer::from_secret_key(&engine_secret).unwrap();
     let spki = SpkiSigner::from_base64(SECRET_PKCS8_V1_B64).unwrap();
-    let engine_verifier =
-        Ed25519Verifier::new([&engine_secret[32..]], Vec::<&[u8]>::new()).unwrap();
-    let spki_verifier = SpkiVerifier::from_pem(PUBLIC_PEM).unwrap();
+    let engine_verifier: Arc<dyn ostrya::Verifier> =
+        Arc::new(Ed25519Verifier::new([&engine_secret[32..]], Vec::<&[u8]>::new()).unwrap());
+    let spki_verifier: Arc<dyn ostrya::Verifier> =
+        Arc::new(SpkiVerifier::from_pem(PUBLIC_PEM).unwrap());
     block_on(async {
         assert_eq!(
             engine.sign(b"data").await.unwrap(),
@@ -237,7 +242,7 @@ fn the_ed25519_engine_and_the_spki_engine_sign_with_the_same_bytes() {
         repo.sign_commit(&commit, &spki).await.unwrap();
         assert!(
             !repo
-                .verify_commit(&commit, &[&engine_verifier])
+                .verify_commit(&commit, std::slice::from_ref(&engine_verifier))
                 .await
                 .unwrap()
                 .valid
@@ -248,7 +253,7 @@ fn the_ed25519_engine_and_the_spki_engine_sign_with_the_same_bytes() {
         repo.sign_commit(&commit, &engine).await.unwrap();
         assert!(
             !repo
-                .verify_commit(&commit, &[&spki_verifier])
+                .verify_commit(&commit, std::slice::from_ref(&spki_verifier))
                 .await
                 .unwrap()
                 .valid
@@ -263,7 +268,7 @@ fn the_ed25519_engine_and_the_spki_engine_sign_with_the_same_bytes() {
         let engine_blobs = blobs(&dict, "ostree.sign.ed25519");
         assert_eq!(engine_blobs.len(), 1);
         assert_eq!(engine_blobs, blobs(&dict, "ostree.sign.spki"));
-        for verifier in [&engine_verifier as &dyn ostrya::Verifier, &spki_verifier] {
+        for verifier in [engine_verifier, spki_verifier] {
             assert!(
                 repo.verify_commit(&commit, &[verifier])
                     .await
@@ -322,7 +327,7 @@ YLloVEDxomUS2SHAfFnN3LHVVNYjok0Zm2RiiU7XpDnRAG1Ua8eR8SKbLQ==\n\
                 .unwrap();
             repo.sign_commit(&commit, &signer).await.unwrap();
             let outcome = repo
-                .verify_commit(&commit, &[&store_verifier(&dir)])
+                .verify_commit(&commit, &[Arc::new(store_verifier(&dir))])
                 .await
                 .unwrap();
             assert!(outcome.valid, "{algorithm}");
@@ -389,7 +394,7 @@ fn a_build_with_ed25519_alone_refuses_the_other_key_types_and_verifies_an_ed2551
         let signer = SpkiSigner::from_base64(SECRET_PKCS8_V1_B64).unwrap();
         repo.sign_commit(&commit, &signer).await.unwrap();
         assert!(
-            repo.verify_commit(&commit, &[&store_verifier(&dir)])
+            repo.verify_commit(&commit, &[Arc::new(store_verifier(&dir))])
                 .await
                 .unwrap()
                 .valid

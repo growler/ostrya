@@ -6,6 +6,7 @@ use ostrya_core::Value;
 
 use crate::error::{Error, Result};
 use crate::sign::{Ed25519Signer, Ed25519Verifier, Signer, Verifier, signatures_for};
+use crate::verify::Payload;
 
 /// The length of an ed25519 secret key: the 32-byte seed, then the 32-byte
 /// public key.
@@ -44,13 +45,6 @@ pub struct ServerSigner {
     /// A verifier that trusts the public half of the key of `signer` and no
     /// other key.
     verifier: Arc<dyn Verifier>,
-    /// `true` if `verifier` does its work in the call to
-    /// [`Verifier::verify`], on the thread that calls it.
-    ///
-    /// The value is `true` for the keys that [`ed25519`](Self::ed25519) and
-    /// `spki` give. [`has_signed`](Self::has_signed) then verifies on the
-    /// blocking pool, so the verification does not hold the async executor.
-    verifies_in_call: bool,
 }
 
 impl ServerSigner {
@@ -66,7 +60,7 @@ impl ServerSigner {
     ///   that another key signed.
     ///
     /// The server verifies the [existing signatures](ServerSigner#existing-signatures)
-    /// with this pair in the calling task.
+    /// with this pair on the blocking pool.
     ///
     /// # Errors
     ///
@@ -84,7 +78,6 @@ impl ServerSigner {
         Ok(ServerSigner {
             signer,
             verifier: Arc::from(verifier),
-            verifies_in_call: false,
         })
     }
 
@@ -106,7 +99,6 @@ impl ServerSigner {
         Ok(ServerSigner {
             signer: Box::new(signer),
             verifier: Arc::new(verifier),
-            verifies_in_call: true,
         })
     }
 
@@ -139,7 +131,6 @@ impl ServerSigner {
                 inner: Arc::new(signer),
             }),
             verifier: Arc::new(verifier),
-            verifies_in_call: true,
         })
     }
 
@@ -195,7 +186,6 @@ impl ServerSigner {
         Ok(ServerSigner {
             signer: Box::new(bound),
             verifier: Arc::new(verifier),
-            verifies_in_call: false,
         })
     }
 
@@ -211,11 +201,14 @@ impl ServerSigner {
     /// with no detached metadata. [`ServerSigner`](ServerSigner#existing-signatures)
     /// states the rules of the search.
     ///
-    /// For a key from [`ed25519`](Self::ed25519) or `spki`, the search runs on
-    /// the blocking pool, because those verifiers do their work in the calling
-    /// thread. The GPG verifier moves its own work to the blocking pool. The
-    /// search of a pair from [`new`](Self::new) runs in the calling task.
-    pub(crate) async fn has_signed(&self, payload: &[u8], dict: Option<&Value>) -> bool {
+    /// The search runs on the blocking pool, because a verifier does its work
+    /// in the call. The pool gets a [`Payload::Shared`] payload with no copy,
+    /// and a copy of a [`Payload::Borrowed`] payload.
+    pub(crate) async fn has_signed<'p>(
+        &self,
+        payload: impl Into<Payload<'p>>,
+        dict: Option<&Value>,
+    ) -> bool {
         let Some(dict) = dict else {
             return false;
         };
@@ -223,15 +216,9 @@ impl ServerSigner {
         if blobs.is_empty() {
             return false;
         }
-        if self.verifies_in_call {
-            let verifier = Arc::clone(&self.verifier);
-            let payload = payload.to_vec();
-            return ostrya_rt::unblock(move || {
-                futures_lite::future::block_on(any_verifies(verifier.as_ref(), &payload, &blobs))
-            })
-            .await;
-        }
-        any_verifies(self.verifier.as_ref(), payload, &blobs).await
+        let verifier = Arc::clone(&self.verifier);
+        let payload = payload.into().to_shared();
+        ostrya_rt::unblock(move || any_verifies(verifier.as_ref(), &payload, &blobs)).await
     }
 }
 
@@ -278,9 +265,9 @@ impl Signer for Unblocked {
 ///
 /// The function verifies each blob on its own and stops at the first blob that
 /// verifies. A blob that the verifier refuses counts as not valid.
-async fn any_verifies(verifier: &dyn Verifier, payload: &[u8], blobs: &[Vec<u8>]) -> bool {
+fn any_verifies(verifier: &dyn Verifier, payload: &[u8], blobs: &[Vec<u8>]) -> bool {
     for blob in blobs {
-        if let Ok(outcome) = verifier.verify(payload, std::slice::from_ref(blob)).await
+        if let Ok(outcome) = verifier.verify(payload, std::slice::from_ref(blob))
             && outcome.valid
         {
             return true;
@@ -403,19 +390,17 @@ mod tests {
             "ostree.sign.dummy"
         }
 
-        fn verify<'a>(
-            &'a self,
-            _data: &'a [u8],
-            signatures: &'a [Vec<u8>],
-        ) -> ostrya_sign::VerifyFuture<'a> {
-            Box::pin(async move {
-                if signatures.iter().any(|blob| *blob != self.good) {
-                    return Err(ostrya_sign::Error::Signature("refused".into()));
-                }
-                Ok(ostrya_sign::VerifyOutcome {
-                    valid: true,
-                    ..Default::default()
-                })
+        fn verify(
+            &self,
+            _data: &[u8],
+            signatures: &[Vec<u8>],
+        ) -> ostrya_sign::Result<ostrya_sign::VerifyOutcome> {
+            if signatures.iter().any(|blob| *blob != self.good) {
+                return Err(ostrya_sign::Error::Signature("refused".into()));
+            }
+            Ok(ostrya_sign::VerifyOutcome {
+                valid: true,
+                ..Default::default()
             })
         }
     }
@@ -435,6 +420,28 @@ mod tests {
         let mixed = dict_of(key, vec![b"bad".to_vec(), b"good".to_vec()]);
         assert!(has_signed(&server, Some(&mixed)));
         assert!(!has_signed(&server, Some(&dict_with(key, b"bad".to_vec()))));
+    }
+
+    /// The search runs the verifier of a pair from `new` on the blocking pool,
+    /// so a verifier that works in the call does not hold the async executor.
+    /// The search gives a payload in an [`Arc`] to the verifier with no copy.
+    #[test]
+    fn the_search_verifies_on_the_blocking_pool() {
+        use crate::verify::trust::tests::ThreadRecorder;
+
+        let recorder = ThreadRecorder::new("ostree.sign.dummy");
+        let server = ServerSigner::new(
+            Box::new(DummySigner::new(b"k".to_vec())),
+            Box::new(recorder.clone()),
+        )
+        .unwrap();
+        let payload = Arc::new(PAYLOAD.to_vec());
+        let dict = dict_with("ostree.sign.dummy", b"k".to_vec());
+        assert!(ostrya_rt::block_on(
+            server.has_signed(&payload, Some(&dict))
+        ));
+        recorder.assert_one_foreign_call();
+        recorder.assert_no_copy_of(&payload);
     }
 
     /// `ServerSigner::ed25519` refuses a secret of another length and a secret

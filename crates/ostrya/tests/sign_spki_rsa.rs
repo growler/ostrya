@@ -11,6 +11,7 @@ mod common;
 
 use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use common::TmpDir;
 use ostrya::{
@@ -114,7 +115,10 @@ fn rsa_keys_of_2048_and_8192_bits_sign_and_verify_a_commit() {
                 .unwrap();
             repo.sign_commit(&commit, &signer(secret)).await.unwrap();
             let verifier = SpkiVerifier::from_pem(key_text(public)).unwrap();
-            let outcome = repo.verify_commit(&commit, &[&verifier]).await.unwrap();
+            let outcome = repo
+                .verify_commit(&commit, &[Arc::new(verifier)])
+                .await
+                .unwrap();
             assert!(outcome.valid, "{secret}");
         }
     });
@@ -133,7 +137,7 @@ fn a_key_store_with_an_rsa_key_verifies_and_its_revocation_removes_the_key() {
 
         let dir = store(base, "trusted", &public, None);
         let outcome = repo
-            .verify_commit(&commit, &[&store_verifier(&dir)])
+            .verify_commit(&commit, &[Arc::new(store_verifier(&dir))])
             .await
             .unwrap();
         assert!(outcome.valid);
@@ -146,7 +150,7 @@ fn a_key_store_with_an_rsa_key_verifies_and_its_revocation_removes_the_key() {
         assert!(verifier.is_empty());
         assert!(
             !repo
-                .verify_commit(&commit, &[&verifier])
+                .verify_commit(&commit, &[Arc::new(verifier)])
                 .await
                 .unwrap()
                 .valid
@@ -176,7 +180,7 @@ fn a_key_store_of_a_p256_key_and_an_rsa_key_verifies_a_commit_of_each() {
                 .unwrap();
             repo.sign_commit(&commit, &signer).await.unwrap();
             let outcome = repo
-                .verify_commit(&commit, &[&store_verifier(&dir)])
+                .verify_commit(&commit, &[Arc::new(store_verifier(&dir))])
                 .await
                 .unwrap();
             assert!(outcome.valid, "{algorithm}");
@@ -231,7 +235,7 @@ fn a_build_with_rsa_alone_refuses_a_p256_key_and_verifies_an_rsa_key() {
             .await
             .unwrap();
         assert!(
-            repo.verify_commit(&commit, &[&store_verifier(&dir)])
+            repo.verify_commit(&commit, &[Arc::new(store_verifier(&dir))])
                 .await
                 .unwrap()
                 .valid

@@ -8,6 +8,9 @@
 //! detached metadata. The `ostrya` crate reads and writes this metadata and
 //! loads the system key store. The crate compiles on Linux, macOS, and Windows.
 //!
+//! A [`Verifier`] verifies in the call to [`Verifier::verify`], so a program
+//! with no async runtime can verify. A [`Signer`] returns a future.
+//!
 //! # Entry points
 //!
 //! - [`Signer`] and [`Verifier`] are the traits of an engine.
@@ -61,7 +64,7 @@
 //! let signer = Ed25519Signer::from_secret_key(&secret)?;
 //! let signature = block_on(signer.sign(b"commit bytes"))?;
 //! let verifier = Ed25519Verifier::new([&secret[32..]], Vec::<&[u8]>::new())?;
-//! let outcome = block_on(verifier.verify(b"commit bytes", &[signature]))?;
+//! let outcome = verifier.verify(b"commit bytes", &[signature])?;
 //! assert!(outcome.valid);
 //! # Ok::<(), ostrya_sign::Error>(())
 //! ```
@@ -111,7 +114,7 @@ pub use self::spki::{
 };
 pub use dummy::{DummySigner, DummyVerifier};
 pub use ed25519::{Ed25519Signer, Ed25519Verifier};
-pub use engine::{SignFuture, SignatureInfo, Signer, Verifier, VerifyFuture, VerifyOutcome};
+pub use engine::{SignFuture, SignatureInfo, Signer, Verifier, VerifyOutcome};
 pub use error::{Error, Result};
 #[cfg(feature = "sign-gpg")]
 pub use gpg::GpgSigner;
@@ -123,9 +126,10 @@ pub use x509::X509Signer;
 // The public types of this crate are `Send + Sync`, so they can move across
 // tasks and threads. The trait objects that `Repo::sign_commit` and
 // `Repo::verify_commit` take are `Send + Sync` through the supertrait bounds.
-// The `&dyn Signer` and `&dyn Verifier` arguments of these two methods make
-// sure that the traits stay dyn-compatible. The `&dyn X509Signer` below does
-// the same for `X509Signer`.
+// The `&dyn Signer` argument of `Repo::sign_commit` and the
+// `Arc<dyn Verifier>` arguments of `Repo::verify_commit` make sure that the
+// traits stay dyn-compatible. The `&dyn X509Signer` below does the same for
+// `X509Signer`.
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<DummySigner>();

@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll, ready};
 
 use futures_io::AsyncRead;
@@ -967,6 +968,9 @@ impl BucketRepo {
                 return Ok(());
             }
         };
+        // The signature check gives the bytes to the blocking pool in an
+        // `Arc`, with no copy.
+        let summary = Arc::new(summary);
         if let (Some(keys), Some(signature)) = (keys, signature) {
             self.fsck_signature(run, keys, &summary, signature).await?;
         }
@@ -1133,7 +1137,7 @@ impl BucketRepo {
         &self,
         run: &mut Run,
         keys: &TrustedKeys,
-        summary: &[u8],
+        summary: &Arc<Vec<u8>>,
         signature: Whole,
     ) -> Result<()> {
         let signature = match signature {

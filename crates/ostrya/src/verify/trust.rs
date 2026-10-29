@@ -429,6 +429,9 @@ pub(crate) fn unknown_key(group: &str, key: &str) -> Error {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::sync::{Arc, Mutex};
+    use std::thread::ThreadId;
+
     use ostrya_core::Value;
 
     use super::*;
@@ -485,6 +488,92 @@ pub(crate) mod tests {
         dict
     }
 
+    /// The address of the data and a copy of the data of one call to
+    /// `verify`.
+    pub(crate) type SeenPayload = (usize, Vec<u8>);
+
+    /// A verifier that accepts each blob and records the thread and the data
+    /// of each call.
+    ///
+    /// A clone shares the record, so a test keeps a handle on the record after
+    /// it gives the verifier away.
+    #[derive(Clone)]
+    pub(crate) struct ThreadRecorder {
+        /// The detached-metadata key that the verifier reads.
+        key: &'static str,
+        /// The thread of each call to `verify`, in order.
+        threads: Arc<Mutex<Vec<ThreadId>>>,
+        /// The address of the data and a copy of the data of each call to
+        /// `verify`, in order.
+        payloads: Arc<Mutex<Vec<SeenPayload>>>,
+    }
+
+    impl ThreadRecorder {
+        /// Creates a recorder that reads the blobs under `key`.
+        pub(crate) fn new(key: &'static str) -> ThreadRecorder {
+            ThreadRecorder {
+                key,
+                threads: Arc::default(),
+                payloads: Arc::default(),
+            }
+        }
+
+        /// Returns the thread of each call to `verify`, in order.
+        pub(crate) fn threads(&self) -> Vec<ThreadId> {
+            self.threads.lock().unwrap().clone()
+        }
+
+        /// Returns the address of the data and a copy of the data of each
+        /// call to `verify`, in order.
+        pub(crate) fn payloads(&self) -> Vec<SeenPayload> {
+            self.payloads.lock().unwrap().clone()
+        }
+
+        /// Asserts that one call to `verify` ran, on a thread other than the
+        /// thread of the test.
+        pub(crate) fn assert_one_foreign_call(&self) {
+            let threads = self.threads();
+            assert_eq!(threads.len(), 1, "{threads:?}");
+            assert_ne!(threads[0], std::thread::current().id());
+        }
+
+        /// Asserts that each call to `verify` got `data` at its address, with
+        /// no copy.
+        pub(crate) fn assert_no_copy_of(&self, data: &[u8]) {
+            let payloads = self.payloads();
+            assert!(!payloads.is_empty());
+            for (address, bytes) in payloads {
+                assert_eq!(address, data.as_ptr() as usize);
+                assert_eq!(bytes, data);
+            }
+        }
+    }
+
+    impl crate::sign::Verifier for ThreadRecorder {
+        fn metadata_key(&self) -> &str {
+            self.key
+        }
+
+        fn verify(
+            &self,
+            data: &[u8],
+            signatures: &[Vec<u8>],
+        ) -> ostrya_sign::Result<crate::sign::VerifyOutcome> {
+            self.threads
+                .lock()
+                .unwrap()
+                .push(std::thread::current().id());
+            self.payloads
+                .lock()
+                .unwrap()
+                .push((data.as_ptr() as usize, data.to_vec()));
+            Ok(crate::sign::VerifyOutcome {
+                valid: !signatures.is_empty(),
+                ..Default::default()
+            })
+        }
+    }
+
     /// The ed25519 signature of `secret` over [`PAYLOAD`], in its dict.
     fn ed25519_signed(secret: &str) -> Value {
         let signer = Ed25519Signer::from_base64(secret).unwrap();
@@ -511,11 +600,9 @@ pub(crate) mod tests {
         let other = ed25519_signed(OTHER_SECRET_B64);
         let (valid, unsigned, untrusted) = ostrya_rt::block_on(async {
             (
-                policy.check_unblocked("commit", PAYLOAD, Some(&own)).await,
-                policy.check_unblocked("commit", PAYLOAD, None).await,
-                policy
-                    .check_unblocked("commit", PAYLOAD, Some(&other))
-                    .await,
+                policy.check("commit", PAYLOAD, Some(&own)).await,
+                policy.check("commit", PAYLOAD, None).await,
+                policy.check("commit", PAYLOAD, Some(&other)).await,
             )
         });
         valid.expect("a signature from the named key passes");
@@ -573,7 +660,7 @@ pub(crate) mod tests {
         assert!(!sign.gpg_axis());
         assert_eq!(sign.sign_axis().map(<[_]>::len), Some(1));
         let own = ed25519_signed(SECRET_B64);
-        ostrya_rt::block_on(sign.check_unblocked("commit", PAYLOAD, Some(&own)))
+        ostrya_rt::block_on(sign.check("commit", PAYLOAD, Some(&own)))
             .expect("the sign-api axis reads the key of the group");
 
         let none = build(false, false).unwrap();
@@ -686,7 +773,7 @@ pub(crate) mod tests {
                 trust_group_policy(&repo, &keyfile, "t", group, true, true)
                     .await
                     .unwrap()
-                    .check_unblocked("commit", PAYLOAD, Some(&signed))
+                    .check("commit", PAYLOAD, Some(&signed))
                     .await
             })
         };

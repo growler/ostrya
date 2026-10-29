@@ -1890,7 +1890,7 @@ impl Repo {
                 ctx.verification,
                 ctx.related,
                 &checksum,
-                &bytes,
+                (&bytes).into(),
                 detached,
             )
             .await?;

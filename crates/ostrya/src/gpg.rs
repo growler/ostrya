@@ -35,7 +35,7 @@ use pgp::types::{KeyDetails, PacketLength, Tag};
 use crate::config::remote_keyring_name;
 use crate::error::{Error, Result};
 use crate::repo::Repo;
-use crate::sign::{Verifier, VerifyFuture, VerifyOutcome, read_key_path, read_key_source};
+use crate::sign::{Verifier, VerifyOutcome, read_key_path, read_key_source};
 use crate::summary::{read_root_file_blocking, write_root_file_blocking};
 
 mod verify;
@@ -79,8 +79,8 @@ const KEYBOX_MAGIC_OFFSET: usize = 8;
 ///
 /// `GpgVerifier` implements [`Verifier`]. Trust is membership in the keyrings
 /// of the verifier. The ownertrust model of GnuPG has no effect. The verifier
-/// reads the stored blobs and the loaded certificates on the blocking pool. It
-/// starts no process and writes no scratch directory.
+/// does its work in the call to [`Verifier::verify`]. It starts no process and
+/// writes no scratch directory.
 ///
 /// # Format
 ///
@@ -204,9 +204,8 @@ pub struct GpgVerifier {
     /// issuer of a signature. So a revocation in any of them refuses the
     /// signature, and the load order has no effect on this result.
     ///
-    /// One reference count holds the set. A verification gives the set to the
-    /// blocking pool through a count of its own. The parse runs once, and every
-    /// commit that a pull verifies uses the same certificates.
+    /// One reference count holds the set. The parse runs once, and every commit
+    /// that a pull verifies uses the same certificates.
     certs: Arc<Vec<SignedPublicKey>>,
 }
 
@@ -585,20 +584,8 @@ impl Verifier for GpgVerifier {
         GPG_METADATA_KEY
     }
 
-    fn verify<'a>(&'a self, data: &'a [u8], signatures: &'a [Vec<u8>]) -> VerifyFuture<'a> {
-        Box::pin(async move {
-            if signatures.is_empty() {
-                return Ok(VerifyOutcome::default());
-            }
-            // Public-key cryptography over untrusted input runs on the
-            // blocking pool. The pool gets copies of the payload and the
-            // signature blobs. It also gets a reference count over the one
-            // parse of the trusted set.
-            let certs = Arc::clone(&self.certs);
-            let payload = data.to_vec();
-            let blobs = signatures.to_vec();
-            ostrya_rt::unblock(move || verify::verify_signatures(&certs, &payload, &blobs)).await
-        })
+    fn verify(&self, data: &[u8], signatures: &[Vec<u8>]) -> ostrya_sign::Result<VerifyOutcome> {
+        verify::verify_signatures(&self.certs, data, signatures)
     }
 }
 

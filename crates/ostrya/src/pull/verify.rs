@@ -12,7 +12,7 @@
 use ostrya_core::{Checksum, Value};
 
 use crate::error::{Error, Result};
-use crate::verify::{Found, Policy, PullTrust, examine};
+use crate::verify::{Found, Payload, Policy, PullTrust, examine};
 
 /// The signature verification of one pull.
 pub(crate) struct Verification {
@@ -46,11 +46,12 @@ impl Verification {
     /// Verifies one commit against the commit policy.
     ///
     /// `detached` is the detached metadata of the commit, which holds its
-    /// signatures.
-    pub(crate) async fn check_commit(
+    /// signatures. `bytes` is the serialized commit. Each verifier runs on the
+    /// blocking pool, as [`Policy::check`] states.
+    pub(crate) async fn check_commit<'p>(
         &self,
         checksum: &Checksum,
-        bytes: &[u8],
+        bytes: impl Into<Payload<'p>>,
         detached: Option<&Value>,
     ) -> Result<()> {
         if !self.commit.applies() {
@@ -70,9 +71,8 @@ impl Verification {
     /// command reports the same two cases. A policy that does not apply reads
     /// nothing.
     ///
-    /// The parse of `summary.sig` and the ed25519 and spki verifiers run on
-    /// the blocking pool, because each file can be as large as the read cap
-    /// of a summary.
+    /// The parse of `summary.sig` and each verifier run on the blocking pool,
+    /// because each file can be as large as the read cap of a summary.
     pub(crate) async fn check_summary(
         &self,
         summary: Option<&[u8]>,
@@ -89,7 +89,7 @@ impl Verification {
         };
         let (dict, signature) = super::parse_detached(signature).await;
         self.summary
-            .check_unblocked("the summary", summary, dict?.as_ref())
+            .check("the summary", summary, dict?.as_ref())
             .await?;
         Ok(Some(signature))
     }
@@ -131,10 +131,12 @@ impl Verification {
     ///
     /// If a delta carries signatures and no signature is from a trusted key,
     /// this function fails with [`Error::Signature`].
-    pub(crate) async fn check_delta(
+    ///
+    /// Each verifier runs on the blocking pool, as [`examine`] states.
+    pub(crate) async fn check_delta<'p>(
         &self,
         name: &str,
-        superblock: &[u8],
+        superblock: impl Into<Payload<'p>>,
         signatures: Option<&Value>,
     ) -> Result<()> {
         let Some(engines) = self.commit.sign_axis() else {
@@ -254,6 +256,23 @@ mod tests {
             "{err}"
         );
         summary.expect("the summary is not checked");
+    }
+
+    /// The delta check runs each verifier on the blocking pool, so a verifier
+    /// that works in the call does not hold the async executor. The check
+    /// gives a superblock in an [`Arc`] to the verifier with no copy.
+    #[test]
+    fn the_delta_check_verifies_on_the_blocking_pool() {
+        use crate::verify::trust::tests::{ThreadRecorder, dict_with};
+
+        let recorder = ThreadRecorder::new("ostree.sign.ed25519");
+        let keys = TrustedKeys::new(vec![Arc::new(recorder.clone()) as Arc<dyn Verifier>]).unwrap();
+        let verification = Verification::from_trust(PullTrust::commits(keys));
+        let dict = dict_with("ostree.sign.ed25519", vec![7; 64]);
+        let superblock = Arc::new(PAYLOAD.to_vec());
+        ostrya_rt::block_on(verification.check_delta("delta", &superblock, Some(&dict))).unwrap();
+        recorder.assert_one_foreign_call();
+        recorder.assert_no_copy_of(&superblock);
     }
 
     /// A trust with summary keys alone checks the summary, and no commit and

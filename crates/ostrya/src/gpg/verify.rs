@@ -47,9 +47,10 @@ const MAX_SIGNATURE_PACKETS: usize = 64;
 /// [`VerifyOutcome::valid`] is the OR of the flags of all signatures. One valid
 /// signature among several makes the outcome valid.
 ///
-/// The work is public-key cryptography over untrusted input, so it runs on the
-/// blocking pool. [`Verifier::verify`](crate::sign::Verifier::verify) for
-/// [`GpgVerifier`](super::GpgVerifier) calls this function there.
+/// The work is public-key cryptography over untrusted input.
+/// [`Verifier::verify`](crate::sign::Verifier::verify) for
+/// [`GpgVerifier`](super::GpgVerifier) calls this function, and its caller
+/// selects the thread.
 pub(super) fn verify_signatures(
     certs: &[SignedPublicKey],
     payload: &[u8],

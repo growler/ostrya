@@ -231,14 +231,17 @@ fn assert_tool_verifies_port_signatures(ty: &str, stranger_pem: &str) {
             .unwrap();
         repo.sign_summary(&*signer).await.unwrap();
 
-        let verifier = fixture_verifier(ty);
+        let verifier: Arc<dyn ostrya::Verifier> = Arc::new(fixture_verifier(ty));
         let dir = root.join(static_delta_relative_dir(None, &commit()));
-        let outcome = repo.verify_static_delta(&dir, &[&verifier]).await.unwrap();
+        let outcome = repo
+            .verify_static_delta(&dir, std::slice::from_ref(&verifier))
+            .await
+            .unwrap();
         assert!(
             outcome.valid,
             "the port does not verify its delta signature"
         );
-        let outcome = repo.verify_summary(&[&verifier]).await.unwrap();
+        let outcome = repo.verify_summary(&[verifier]).await.unwrap();
         assert!(
             outcome.valid,
             "the port does not verify its summary signature"
@@ -414,7 +417,7 @@ mod p256 {
             );
 
             let outcome = repo
-                .verify_commit(&commit(), &[&fixture_verifier(TYPE)])
+                .verify_commit(&commit(), &[Arc::new(fixture_verifier(TYPE))])
                 .await
                 .unwrap();
             assert!(outcome.valid);
@@ -426,7 +429,7 @@ mod p256 {
             }
 
             let outcome = repo
-                .verify_commit(&commit(), &[&stranger_verifier()])
+                .verify_commit(&commit(), &[Arc::new(stranger_verifier())])
                 .await
                 .unwrap();
             assert!(
@@ -448,13 +451,16 @@ mod p256 {
         block_on(async {
             let repo = Repo::open(&fixture_dir(TYPE).join("repo")).await.unwrap();
             let outcome = repo
-                .verify_summary(&[&fixture_verifier(TYPE)])
+                .verify_summary(&[Arc::new(fixture_verifier(TYPE))])
                 .await
                 .unwrap();
             assert!(outcome.valid);
             assert!(outcome.signatures.iter().all(|info| info.valid));
 
-            let outcome = repo.verify_summary(&[&stranger_verifier()]).await.unwrap();
+            let outcome = repo
+                .verify_summary(&[Arc::new(stranger_verifier())])
+                .await
+                .unwrap();
             assert!(
                 !outcome.valid,
                 "a key that signed no fixture must not verify"
@@ -471,14 +477,14 @@ mod p256 {
             let repo = Repo::open(&root).await.unwrap();
             let dir = root.join(static_delta_relative_dir(None, &commit()));
             let outcome = repo
-                .verify_static_delta(&dir, &[&fixture_verifier(TYPE)])
+                .verify_static_delta(&dir, &[Arc::new(fixture_verifier(TYPE))])
                 .await
                 .unwrap();
             assert!(outcome.valid);
             assert!(outcome.signatures.iter().all(|info| info.valid));
 
             let outcome = repo
-                .verify_static_delta(&dir, &[&stranger_verifier()])
+                .verify_static_delta(&dir, &[Arc::new(stranger_verifier())])
                 .await
                 .unwrap();
             assert!(
@@ -563,7 +569,7 @@ mod p384 {
 
             let fingerprint = Checksum::sha256(&fixture_signer(TYPE).public_key_der()).to_hex();
             let outcome = repo
-                .verify_commit(&commit(), &[&fixture_verifier(TYPE)])
+                .verify_commit(&commit(), &[Arc::new(fixture_verifier(TYPE))])
                 .await
                 .unwrap();
             assert!(outcome.valid);
@@ -576,7 +582,7 @@ mod p384 {
             }
 
             let outcome = repo
-                .verify_commit(&commit(), &[&stranger_verifier()])
+                .verify_commit(&commit(), &[Arc::new(stranger_verifier())])
                 .await
                 .unwrap();
             assert!(
@@ -598,14 +604,17 @@ mod p384 {
         block_on(async {
             let repo = Repo::open(&fixture_dir(TYPE).join("repo")).await.unwrap();
             let outcome = repo
-                .verify_summary(&[&fixture_verifier(TYPE)])
+                .verify_summary(&[Arc::new(fixture_verifier(TYPE))])
                 .await
                 .unwrap();
             assert!(outcome.valid);
             assert_eq!(outcome.signatures.len(), 1, "{}", regenerate(TYPE));
             assert!(outcome.signatures[0].valid);
 
-            let outcome = repo.verify_summary(&[&stranger_verifier()]).await.unwrap();
+            let outcome = repo
+                .verify_summary(&[Arc::new(stranger_verifier())])
+                .await
+                .unwrap();
             assert!(
                 !outcome.valid,
                 "a key that signed no fixture must not verify"
@@ -622,7 +631,7 @@ mod p384 {
             let repo = Repo::open(&root).await.unwrap();
             let dir = root.join(static_delta_relative_dir(None, &commit()));
             let outcome = repo
-                .verify_static_delta(&dir, &[&fixture_verifier(TYPE)])
+                .verify_static_delta(&dir, &[Arc::new(fixture_verifier(TYPE))])
                 .await
                 .unwrap();
             assert!(outcome.valid);
@@ -630,7 +639,7 @@ mod p384 {
             assert!(outcome.signatures[0].valid);
 
             let outcome = repo
-                .verify_static_delta(&dir, &[&stranger_verifier()])
+                .verify_static_delta(&dir, &[Arc::new(stranger_verifier())])
                 .await
                 .unwrap();
             assert!(
@@ -704,7 +713,7 @@ mod ed25519 {
 
             let fingerprint = Checksum::sha256(&fixture_signer(TYPE).public_key_der()).to_hex();
             let outcome = repo
-                .verify_commit(&commit(), &[&fixture_verifier(TYPE)])
+                .verify_commit(&commit(), &[Arc::new(fixture_verifier(TYPE))])
                 .await
                 .unwrap();
             assert!(outcome.valid);
@@ -715,7 +724,7 @@ mod ed25519 {
             assert_eq!(info.fingerprint.as_deref(), Some(fingerprint.as_str()));
 
             let outcome = repo
-                .verify_commit(&commit(), &[&stranger_verifier()])
+                .verify_commit(&commit(), &[Arc::new(stranger_verifier())])
                 .await
                 .unwrap();
             assert!(
@@ -733,14 +742,17 @@ mod ed25519 {
         block_on(async {
             let repo = Repo::open(&fixture_dir(TYPE).join("repo")).await.unwrap();
             let outcome = repo
-                .verify_summary(&[&fixture_verifier(TYPE)])
+                .verify_summary(&[Arc::new(fixture_verifier(TYPE))])
                 .await
                 .unwrap();
             assert!(outcome.valid);
             assert_eq!(outcome.signatures.len(), 1, "{}", regenerate(TYPE));
             assert!(outcome.signatures[0].valid);
 
-            let outcome = repo.verify_summary(&[&stranger_verifier()]).await.unwrap();
+            let outcome = repo
+                .verify_summary(&[Arc::new(stranger_verifier())])
+                .await
+                .unwrap();
             assert!(
                 !outcome.valid,
                 "a key that signed no fixture must not verify"
@@ -757,7 +769,7 @@ mod ed25519 {
             let repo = Repo::open(&root).await.unwrap();
             let dir = root.join(static_delta_relative_dir(None, &commit()));
             let outcome = repo
-                .verify_static_delta(&dir, &[&fixture_verifier(TYPE)])
+                .verify_static_delta(&dir, &[Arc::new(fixture_verifier(TYPE))])
                 .await
                 .unwrap();
             assert!(outcome.valid);
@@ -765,7 +777,7 @@ mod ed25519 {
             assert!(outcome.signatures[0].valid);
 
             let outcome = repo
-                .verify_static_delta(&dir, &[&stranger_verifier()])
+                .verify_static_delta(&dir, &[Arc::new(stranger_verifier())])
                 .await
                 .unwrap();
             assert!(
@@ -891,7 +903,7 @@ mod rsa {
 
             let fingerprint = Checksum::sha256(&fixture_signer(TYPE).public_key_der()).to_hex();
             let outcome = repo
-                .verify_commit(&commit(), &[&fixture_verifier(TYPE)])
+                .verify_commit(&commit(), &[Arc::new(fixture_verifier(TYPE))])
                 .await
                 .unwrap();
             assert!(outcome.valid);
@@ -902,7 +914,7 @@ mod rsa {
             assert_eq!(info.fingerprint.as_deref(), Some(fingerprint.as_str()));
 
             let outcome = repo
-                .verify_commit(&commit(), &[&stranger_verifier()])
+                .verify_commit(&commit(), &[Arc::new(stranger_verifier())])
                 .await
                 .unwrap();
             assert!(
@@ -920,14 +932,17 @@ mod rsa {
         block_on(async {
             let repo = Repo::open(&fixture_dir(TYPE).join("repo")).await.unwrap();
             let outcome = repo
-                .verify_summary(&[&fixture_verifier(TYPE)])
+                .verify_summary(&[Arc::new(fixture_verifier(TYPE))])
                 .await
                 .unwrap();
             assert!(outcome.valid);
             assert_eq!(outcome.signatures.len(), 1, "{}", regenerate(TYPE));
             assert!(outcome.signatures[0].valid);
 
-            let outcome = repo.verify_summary(&[&stranger_verifier()]).await.unwrap();
+            let outcome = repo
+                .verify_summary(&[Arc::new(stranger_verifier())])
+                .await
+                .unwrap();
             assert!(
                 !outcome.valid,
                 "a key that signed no fixture must not verify"
@@ -944,7 +959,7 @@ mod rsa {
             let repo = Repo::open(&root).await.unwrap();
             let dir = root.join(static_delta_relative_dir(None, &commit()));
             let outcome = repo
-                .verify_static_delta(&dir, &[&fixture_verifier(TYPE)])
+                .verify_static_delta(&dir, &[Arc::new(fixture_verifier(TYPE))])
                 .await
                 .unwrap();
             assert!(outcome.valid);
@@ -952,7 +967,7 @@ mod rsa {
             assert!(outcome.signatures[0].valid);
 
             let outcome = repo
-                .verify_static_delta(&dir, &[&stranger_verifier()])
+                .verify_static_delta(&dir, &[Arc::new(stranger_verifier())])
                 .await
                 .unwrap();
             assert!(

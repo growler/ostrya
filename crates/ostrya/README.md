@@ -113,6 +113,9 @@ project.
   adapts its stream with `tokio_util::compat`.
 - Each I/O entry point is an `async fn`. A filter callback and an xattr callback
   are synchronous.
+- `Verifier::verify` is synchronous. Each verification of the crate runs it on
+  the blocking pool of `ostrya-rt`. `DeltaSuperblock::verify` runs it in the
+  calling thread.
 - `rustix` makes the namespace and metadata syscalls: the opens relative to a
   descriptor, stat, link, rename, the xattrs, reflink, `O_TMPFILE` with `linkat`,
   the record locks, and the syncs. These calls are synchronous. They run on the

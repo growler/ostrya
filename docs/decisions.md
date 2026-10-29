@@ -306,18 +306,36 @@ this build, the second direction skips. The test `spki_openssl_interop`
 compares the engine with the `openssl` command in both directions.
 
 The spki signer signs in the call to `Signer::sign`, and its future is ready
-at once, so a program with no async runtime can sign and verify. An RSA
-signature with a 16384-bit key takes about 0.5 seconds of CPU time. The
-receive endpoint of `ostrya` signs with the spki key of an `[ex-ostrya key]`
-group on the blocking pool, through `ostrya_rt::unblock`, so the signature
-does not hold the async executor. The trust check of the receive endpoint
-runs the verifiers of the sign-api axis on the blocking pool too, with a copy
-of the commit, because a client sets the number of signature blobs that the
-check verifies. The summary check of a pull runs these verifiers on the
-blocking pool, with a copy of the summary, because a summary can be as large
-as 64 MiB. The GPG verifier moves its own work to the blocking pool. A
-sign future in `ostrya-sign` that moves the work to the blocking pool was
-rejected, because the engine then needs a runtime.
+at once, so a program with no async runtime can sign. `Verifier::verify` is
+synchronous: each verifier does its work in the call, so a program with no
+async runtime can verify. The call holds its thread for the time of the
+verification, and the caller selects the thread. An RSA signature with a
+16384-bit key takes about 0.5 seconds of CPU time. The receive endpoint of
+`ostrya` signs with the spki key of an `[ex-ostrya key]` group on the
+blocking pool, through `ostrya_rt::unblock`, so the signature does not hold
+the async executor.
+
+Each path of `ostrya` that verifies runs each verifier, on both axes, on the
+blocking pool, with one copy of the payload for each check. A caller that
+holds the payload in an `Arc` gives the `Arc`, and the pool gets no copy.
+These paths are the commit check, the summary check, and the delta check of
+a pull, the trust check of the receive endpoint, the search of the receive
+endpoint for a signature of its own key, and the summary check of `remote
+fsck` of a bucket. A client sets the number of signature blobs that the
+receive endpoint verifies, and a summary can be as large as 64 MiB.
+`Repo::verify_commit`, `Repo::verify_summary`, and
+`Repo::verify_static_delta` take `Arc<dyn Verifier>` and run the verifiers on
+the blocking pool too. `DeltaSuperblock::verify` verifies in the calling
+thread, because it needs no repository and no runtime. The `ostrya` command
+calls `Verifier::verify` and `DeltaSuperblock::verify` in the calling task,
+because it runs one command in each process.
+
+These alternatives were rejected:
+
+- A sign future in `ostrya-sign` that moves the work to the blocking pool,
+  because the engine then needs a runtime.
+- A verify future whose engine moves the work to the blocking pool, because
+  the engine then needs a runtime.
 
 The spki verifier computes the SHA-256 of the data one time for each call,
 when the first ECDSA or RSA key tries a blob. Each of these keys verifies the
@@ -391,6 +409,9 @@ rejected for its LGPL license. The port owns the trust policy: issuer
 resolution, subkey bindings, expiry, revocation, the signature class and the
 digest policy. No fallback to the `gpgv` binary exists, so one engine and one
 policy give each verdict.
+
+The GPG verifier verifies in the call to `Verifier::verify`, as the other
+verifiers do, and the caller selects the thread.
 
 ## The signature policy of a local pull
 

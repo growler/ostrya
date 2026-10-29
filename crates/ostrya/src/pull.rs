@@ -224,6 +224,7 @@ use crate::repo::Repo;
 use crate::summary::AdvertisedDelta;
 use crate::transaction::Transaction;
 use crate::traverse::reaches_at_least;
+use crate::verify::Payload;
 use crate::write::FileMeta;
 
 mod chain;
@@ -2768,6 +2769,9 @@ async fn collect_chain(
         {
             return Ok(());
         }
+        // The check gives the bytes to the blocking pool in an `Arc`, with no
+        // copy.
+        let bytes = Arc::new(bytes);
         if seen.insert(checksum, remaining).is_none() {
             let dependencies = dependencies?;
             out.push(ChainCommit {
@@ -2964,7 +2968,7 @@ struct ChainCheck<'a> {
 impl ChainCheck<'_> {
     /// Checks `commit`, whose object holds `bytes`, unless a check failed
     /// before, and records a failure.
-    async fn check(&mut self, commit: &Checksum, bytes: &[u8]) {
+    async fn check(&mut self, commit: &Checksum, bytes: &Arc<Vec<u8>>) {
         if self.failed.is_none()
             && let Err(err) = self.check_one(commit, bytes).await
         {
@@ -2975,7 +2979,7 @@ impl ChainCheck<'_> {
     /// Checks `commit`, whose object holds `bytes`, against the commit policy.
     ///
     /// A commit that discovery checked passes with no read.
-    async fn check_one(&self, commit: &Checksum, bytes: &[u8]) -> Result<()> {
+    async fn check_one(&self, commit: &Checksum, bytes: &Arc<Vec<u8>>) -> Result<()> {
         if self.plan.checked(commit) {
             return Ok(());
         }
@@ -2985,7 +2989,7 @@ impl ChainCheck<'_> {
         // keep-detached-related` can make the stored metadata smaller, so a
         // later verification of the stored commit reads what the rule kept.
         let sources: Vec<Repo> = self.sources.iter().map(|src| (*src).clone()).collect();
-        check_local_commit_signatures(self.repo, self.verification, sources, commit, bytes)
+        check_local_commit_signatures(self.repo, self.verification, sources, commit, bytes.into())
             .await
             .map(drop)
     }
@@ -3005,7 +3009,7 @@ async fn check_commit_signatures(
     repo: &Repo,
     verification: &verify::Verification,
     commit: &Checksum,
-    bytes: &[u8],
+    bytes: Payload<'_>,
     detached: Option<Vec<u8>>,
 ) -> Result<Option<Vec<u8>>> {
     if !verification.checks_commits() {
@@ -3047,7 +3051,7 @@ async fn check_local_commit_signatures(
     verification: &verify::Verification,
     sources: Vec<Repo>,
     commit: &Checksum,
-    bytes: &[u8],
+    bytes: Payload<'_>,
 ) -> Result<Option<(usize, u64)>> {
     let repo = repo.clone();
     let key = *commit;
@@ -3105,7 +3109,7 @@ async fn check_commit_signatures_filtered(
     verification: &verify::Verification,
     rule: RelatedRule,
     commit: &Checksum,
-    bytes: &[u8],
+    bytes: Payload<'_>,
     detached: Option<Vec<u8>>,
 ) -> Result<Option<CheckedMeta>> {
     match detached {

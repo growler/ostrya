@@ -9,6 +9,7 @@ mod common;
 
 use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use common::TmpDir;
 use ostrya::{
@@ -128,7 +129,10 @@ fn p384_keys_in_pkcs8_and_sec1_sign_and_verify_a_commit() {
             repo.sign_commit(&commit, &signer).await.unwrap();
             for public in [PUBLIC_PEM, PUBLIC_COMPRESSED_PEM] {
                 let verifier = SpkiVerifier::from_pem(public).unwrap();
-                let outcome = repo.verify_commit(&commit, &[&verifier]).await.unwrap();
+                let outcome = repo
+                    .verify_commit(&commit, &[Arc::new(verifier)])
+                    .await
+                    .unwrap();
                 assert!(outcome.valid, "{secret}");
             }
         }
@@ -146,7 +150,7 @@ fn a_key_store_with_a_p384_key_verifies_and_its_revocation_removes_the_key() {
 
         let dir = store(base, "trusted", PUBLIC_COMPRESSED_PEM, None);
         let outcome = repo
-            .verify_commit(&commit, &[&store_verifier(&dir)])
+            .verify_commit(&commit, &[Arc::new(store_verifier(&dir))])
             .await
             .unwrap();
         assert!(outcome.valid);
@@ -160,7 +164,7 @@ fn a_key_store_with_a_p384_key_verifies_and_its_revocation_removes_the_key() {
         assert!(verifier.is_empty());
         assert!(
             !repo
-                .verify_commit(&commit, &[&verifier])
+                .verify_commit(&commit, &[Arc::new(verifier)])
                 .await
                 .unwrap()
                 .valid
@@ -200,7 +204,7 @@ YLloVEDxomUS2SHAfFnN3LHVVNYjok0Zm2RiiU7XpDnRAG1Ua8eR8SKbLQ==\n\
                 .unwrap();
             repo.sign_commit(&commit, &signer).await.unwrap();
             let outcome = repo
-                .verify_commit(&commit, &[&store_verifier(&dir)])
+                .verify_commit(&commit, &[Arc::new(store_verifier(&dir))])
                 .await
                 .unwrap();
             assert!(outcome.valid, "{algorithm}");
@@ -258,7 +262,7 @@ fn a_build_with_p384_alone_refuses_p256_and_rsa_keys_and_verifies_a_p384_key() {
         let signer = SpkiSigner::from_base64(SECRET_PKCS8_B64).unwrap();
         repo.sign_commit(&commit, &signer).await.unwrap();
         assert!(
-            repo.verify_commit(&commit, &[&store_verifier(&dir)])
+            repo.verify_commit(&commit, &[Arc::new(store_verifier(&dir))])
                 .await
                 .unwrap()
                 .valid

@@ -25,6 +25,7 @@ mod common;
 use std::os::fd::AsFd;
 use std::path::Path;
 use std::process::Command;
+use std::sync::Arc;
 
 use common::{TmpDir, openssl_available, wrap_pem};
 use ostrya::{
@@ -141,13 +142,26 @@ fn spki_round_trip_within_the_port() {
         // The signature verifies with the key in SubjectPublicKeyInfo DER
         // form and in PEM form.
         let by_der = SpkiVerifier::new([public_spki_der()], Vec::<Vec<u8>>::new()).unwrap();
-        assert!(repo.verify_commit(&commit, &[&by_der]).await.unwrap().valid);
+        assert!(
+            repo.verify_commit(&commit, &[Arc::new(by_der)])
+                .await
+                .unwrap()
+                .valid
+        );
         let by_pem = SpkiVerifier::from_pem(PUBLIC_PEM).unwrap();
-        assert!(repo.verify_commit(&commit, &[&by_pem]).await.unwrap().valid);
+        assert!(
+            repo.verify_commit(&commit, &[Arc::new(by_pem)])
+                .await
+                .unwrap()
+                .valid
+        );
 
         // The signature does not verify with an unrelated well-formed key.
         let stranger = spki_stranger_verifier();
-        let outcome = repo.verify_commit(&commit, &[&stranger]).await.unwrap();
+        let outcome = repo
+            .verify_commit(&commit, &[Arc::new(stranger)])
+            .await
+            .unwrap();
         assert!(!outcome.valid, "an untrusted key must not verify");
         assert!(outcome.signatures[0].key_missing);
     });
@@ -297,7 +311,8 @@ fn spki_fixed_width_signature_does_not_verify() {
         let (repo, commit) = build_committed_repo(base).await;
         let signer = SpkiSigner::from_base64(SECRET_PKCS8_B64).unwrap();
         let der = signer.sign(&commit_bytes(base, &commit)).await.unwrap();
-        let verifier = SpkiVerifier::new([public_spki_der()], Vec::<Vec<u8>>::new()).unwrap();
+        let verifier: Arc<dyn Verifier> =
+            Arc::new(SpkiVerifier::new([public_spki_der()], Vec::<Vec<u8>>::new()).unwrap());
 
         for (blob, valid) in [(fixed_width(&der), false), (der, true)] {
             let mut dict = ostrya::Value::Array(Vec::new());
@@ -305,7 +320,10 @@ fn spki_fixed_width_signature_does_not_verify() {
             repo.write_commit_detached_metadata(&commit, Some(&dict))
                 .await
                 .unwrap();
-            let outcome = repo.verify_commit(&commit, &[&verifier]).await.unwrap();
+            let outcome = repo
+                .verify_commit(&commit, std::slice::from_ref(&verifier))
+                .await
+                .unwrap();
             assert_eq!(outcome.valid, valid);
             assert_eq!(outcome.signatures.len(), 1);
         }
@@ -324,7 +342,8 @@ fn spki_blobs_that_no_trusted_key_verifies() {
         let data = commit_bytes(base, &commit);
         let signer = SpkiSigner::from_base64(SECRET_PKCS8_B64).unwrap();
         let der = signer.sign(&data).await.unwrap();
-        let verifier = SpkiVerifier::new([public_spki_der()], Vec::<Vec<u8>>::new()).unwrap();
+        let verifier: Arc<dyn Verifier> =
+            Arc::new(SpkiVerifier::new([public_spki_der()], Vec::<Vec<u8>>::new()).unwrap());
         // The ed25519 key of test 1 in RFC 8032: the seed, then the public key.
         let ed25519 = Ed25519Signer::from_secret_key(
             &base64::decode(concat!(
@@ -364,7 +383,10 @@ fn spki_blobs_that_no_trusted_key_verifies() {
             repo.write_commit_detached_metadata(&commit, Some(&dict))
                 .await
                 .unwrap();
-            let outcome = repo.verify_commit(&commit, &[&verifier]).await.unwrap();
+            let outcome = repo
+                .verify_commit(&commit, std::slice::from_ref(&verifier))
+                .await
+                .unwrap();
             assert_eq!(outcome.valid, valid, "{blobs:02x?}");
             assert_eq!(outcome.signatures.len(), blobs.len());
             assert!(!outcome.signatures[0].valid && outcome.signatures[0].key_missing);
@@ -393,7 +415,7 @@ fn spki_trusted_revoked_directory_convention() {
         assert!(keys.revoked.is_empty());
         let verifier = SpkiVerifier::from_sign_keys(keys).unwrap();
         assert!(
-            repo.verify_commit(&commit, &[&verifier])
+            repo.verify_commit(&commit, &[Arc::new(verifier)])
                 .await
                 .unwrap()
                 .valid,
@@ -409,7 +431,7 @@ fn spki_trusted_revoked_directory_convention() {
         let verifier = SpkiVerifier::from_sign_keys(keys).unwrap();
         assert!(
             !repo
-                .verify_commit(&commit, &[&verifier])
+                .verify_commit(&commit, &[Arc::new(verifier)])
                 .await
                 .unwrap()
                 .valid,
@@ -423,7 +445,7 @@ fn spki_trusted_revoked_directory_convention() {
 async fn store_verifies(repo: &Repo, commit: &Checksum, keys_dir: &Path) -> bool {
     let keys = load_sign_keys_from(&[keys_dir], "spki").unwrap();
     let verifier = SpkiVerifier::from_sign_keys(keys).unwrap();
-    repo.verify_commit(commit, &[&verifier])
+    repo.verify_commit(commit, &[Arc::new(verifier)])
         .await
         .unwrap()
         .valid
@@ -623,7 +645,7 @@ fn spki_openssl_interop() {
         );
         let sig_bytes = std::fs::read(&os_sig).unwrap();
         let verifier = SpkiVerifier::from_pem(&pub_pem_text).unwrap();
-        let outcome = verifier.verify(&payload, &[sig_bytes]).await.unwrap();
+        let outcome = verifier.verify(&payload, &[sig_bytes]).unwrap();
         assert!(
             outcome.valid,
             "port rejected an openssl-written spki signature"

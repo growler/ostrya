@@ -26,6 +26,7 @@ mod common;
 use std::os::fd::AsFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 use common::TmpDir;
 use ostrya::{
@@ -200,7 +201,10 @@ fn gpg_round_trip_within_the_port() {
 
         // The trusted keyring accepts the signature and reports its details.
         let verifier = GpgVerifier::from_keyring_bytes([home.export()]).unwrap();
-        let outcome = repo.verify_commit(&commit, &[&verifier]).await.unwrap();
+        let outcome = repo
+            .verify_commit(&commit, &[Arc::new(verifier)])
+            .await
+            .unwrap();
         assert!(outcome.valid);
         assert_eq!(outcome.signatures.len(), 1);
         let info = &outcome.signatures[0];
@@ -214,7 +218,10 @@ fn gpg_round_trip_within_the_port() {
 
         // With an empty trusted set, the verifier reports the key as missing.
         let untrusted = GpgVerifier::from_keyring_bytes(Vec::<Vec<u8>>::new()).unwrap();
-        let outcome = repo.verify_commit(&commit, &[&untrusted]).await.unwrap();
+        let outcome = repo
+            .verify_commit(&commit, &[Arc::new(untrusted)])
+            .await
+            .unwrap();
         assert!(!outcome.valid);
         assert_eq!(outcome.signatures.len(), 1);
         assert!(outcome.signatures[0].key_missing);
@@ -238,7 +245,10 @@ fn armored_and_file_keyrings_load() {
         // The verifier decodes the armored export when it loads it. The
         // signature verifies.
         let armored = GpgVerifier::from_keyring_bytes([home.export_armored()]).unwrap();
-        let outcome = repo.verify_commit(&commit, &[&armored]).await.unwrap();
+        let outcome = repo
+            .verify_commit(&commit, &[Arc::new(armored)])
+            .await
+            .unwrap();
         assert!(outcome.valid);
 
         // The verifier loads keyring files from disk. It skips a path that
@@ -247,7 +257,10 @@ fn armored_and_file_keyrings_load() {
         std::fs::write(&ring_path, home.export()).unwrap();
         let files =
             GpgVerifier::from_keyring_files([&ring_path, &base.join("absent.gpg")]).unwrap();
-        let outcome = repo.verify_commit(&commit, &[&files]).await.unwrap();
+        let outcome = repo
+            .verify_commit(&commit, &[Arc::new(files)])
+            .await
+            .unwrap();
         assert!(outcome.valid);
     });
 }
@@ -269,13 +282,11 @@ fn wrong_payload_is_rejected() {
         let verifier = GpgVerifier::from_keyring_bytes([home.export()]).unwrap();
         let good = verifier
             .verify(&payload, std::slice::from_ref(&signature))
-            .await
             .unwrap();
         assert!(good.valid);
 
         let bad = verifier
             .verify(b"a different payload", &[signature])
-            .await
             .unwrap();
         assert!(!bad.valid);
         assert_eq!(bad.signatures.len(), 1);
@@ -371,7 +382,13 @@ fn gpg_coexists_with_the_dummy_engine() {
         let gpg_verifier = GpgVerifier::from_keyring_bytes([home.export()]).unwrap();
         let dummy_verifier = DummyVerifier::new([b"dummy-key".to_vec()]);
         let outcome = repo
-            .verify_commit(&commit, &[&dummy_verifier, &gpg_verifier])
+            .verify_commit(
+                &commit,
+                &[
+                    Arc::new(dummy_verifier) as Arc<dyn ostrya::Verifier>,
+                    Arc::new(gpg_verifier),
+                ],
+            )
             .await
             .unwrap();
         assert!(outcome.valid);
@@ -418,7 +435,10 @@ fn a_revoked_re_export_revokes_the_held_key() {
             .unwrap();
         assert_eq!(count, 1);
         let verifier = GpgVerifier::for_remote(&root, "origin").unwrap();
-        let outcome = repo.verify_commit(&commit, &[&verifier]).await.unwrap();
+        let outcome = repo
+            .verify_commit(&commit, &[Arc::new(verifier)])
+            .await
+            .unwrap();
         assert!(outcome.valid);
         assert!(!outcome.signatures[0].revoked);
 
@@ -431,7 +451,10 @@ fn a_revoked_re_export_revokes_the_held_key() {
             .unwrap();
         assert_eq!(count, 0);
         let verifier = GpgVerifier::for_remote(&root, "origin").unwrap();
-        let outcome = repo.verify_commit(&commit, &[&verifier]).await.unwrap();
+        let outcome = repo
+            .verify_commit(&commit, &[Arc::new(verifier)])
+            .await
+            .unwrap();
         assert_eq!(outcome.signatures.len(), 1);
         assert!(
             outcome.signatures[0].revoked,

@@ -26,6 +26,7 @@ mod common;
 use std::os::fd::AsFd;
 use std::path::Path;
 use std::process::Command;
+use std::sync::Arc;
 
 use common::{TmpDir, ostree_supports_ed25519};
 use ostrya::{
@@ -195,13 +196,19 @@ fn port_verifies_an_ed25519_signature_the_tool_wrote() {
         // ostrya verifies the signature with the matching trusted key. With a
         // verifier that does not trust the key, the verification fails.
         let verifier = Ed25519Verifier::new([public_key()], Vec::<Vec<u8>>::new()).unwrap();
-        let outcome = repo.verify_commit(&commit, &[&verifier]).await.unwrap();
+        let outcome = repo
+            .verify_commit(&commit, &[Arc::new(verifier)])
+            .await
+            .unwrap();
         assert!(outcome.valid, "port rejected the tool's ed25519 signature");
         assert_eq!(outcome.signatures.len(), 1);
         assert!(outcome.signatures[0].valid);
 
         let other = Ed25519Verifier::new([vec![0u8; 32]], Vec::<Vec<u8>>::new()).unwrap();
-        let rejected = repo.verify_commit(&commit, &[&other]).await.unwrap();
+        let rejected = repo
+            .verify_commit(&commit, &[Arc::new(other)])
+            .await
+            .unwrap();
         assert!(!rejected.valid, "port accepted an untrusted key");
         assert_eq!(rejected.signatures.len(), 1);
         assert!(!rejected.signatures[0].valid);
@@ -223,9 +230,10 @@ fn delete_by_key_removes_the_ed25519_signature() {
         // ostrya deletes a signature that the matching key made. ed25519 is
         // deterministic, so the test signs the same payload with the same key
         // again. The delete matches the signature blob by its bytes.
-        let verifier = Ed25519Verifier::new([public_key()], Vec::<Vec<u8>>::new()).unwrap();
+        let verifier: Arc<dyn ostrya::Verifier> =
+            Arc::new(Ed25519Verifier::new([public_key()], Vec::<Vec<u8>>::new()).unwrap());
         assert!(
-            repo.verify_commit(&commit, &[&verifier])
+            repo.verify_commit(&commit, std::slice::from_ref(&verifier))
                 .await
                 .unwrap()
                 .valid
@@ -255,7 +263,7 @@ fn delete_by_key_removes_the_ed25519_signature() {
         );
         assert!(
             !repo
-                .verify_commit(&commit, &[&verifier])
+                .verify_commit(&commit, &[verifier])
                 .await
                 .unwrap()
                 .valid
@@ -357,7 +365,7 @@ fn ed25519_trusted_revoked_directory_convention() {
         assert!(keys.revoked.is_empty());
         let verifier = Ed25519Verifier::from_sign_keys(keys).unwrap();
         assert!(
-            repo.verify_commit(&commit, &[&verifier])
+            repo.verify_commit(&commit, &[Arc::new(verifier)])
                 .await
                 .unwrap()
                 .valid,
@@ -401,7 +409,7 @@ fn ed25519_trusted_revoked_directory_convention() {
         let verifier = Ed25519Verifier::from_sign_keys(keys).unwrap();
         assert!(
             !repo
-                .verify_commit(&commit, &[&verifier])
+                .verify_commit(&commit, &[Arc::new(verifier)])
                 .await
                 .unwrap()
                 .valid,
@@ -437,10 +445,21 @@ fn ed25519_round_trip_within_the_port() {
             .unwrap();
 
         let good = Ed25519Verifier::new([public_key()], Vec::<Vec<u8>>::new()).unwrap();
-        assert!(repo.verify_commit(&commit, &[&good]).await.unwrap().valid);
+        assert!(
+            repo.verify_commit(&commit, &[Arc::new(good)])
+                .await
+                .unwrap()
+                .valid
+        );
 
         let bad = Ed25519Verifier::new([vec![0u8; 32]], Vec::<Vec<u8>>::new()).unwrap();
-        assert!(!repo.verify_commit(&commit, &[&bad]).await.unwrap().valid);
+        assert!(
+            !repo
+                .verify_commit(&commit, &[Arc::new(bad)])
+                .await
+                .unwrap()
+                .valid
+        );
     });
 }
 
@@ -459,7 +478,13 @@ fn ed25519_verifier_drops_revoked_from_trusted() {
         repo.sign_commit(&commit, &Ed25519Signer::from_base64(SECRET_B64).unwrap())
             .await
             .unwrap();
-        assert!(!repo.verify_commit(&commit, &[&both]).await.unwrap().valid);
+        assert!(
+            !repo
+                .verify_commit(&commit, &[Arc::new(both)])
+                .await
+                .unwrap()
+                .valid
+        );
     });
 }
 

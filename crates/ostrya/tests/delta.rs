@@ -26,6 +26,7 @@ mod common;
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 use common::{TmpDir, ostree_available, ostree_supports_ed25519};
 use futures_lite::AsyncReadExt;
@@ -357,7 +358,7 @@ fn verifies_signed_delta() {
             Ed25519Verifier::new([base64::decode(PUBLIC_B64).unwrap()], Vec::<Vec<u8>>::new())
                 .unwrap();
         let outcome = repo
-            .verify_static_delta(&signed, &[&trusted])
+            .verify_static_delta(&signed, &[Arc::new(trusted)])
             .await
             .unwrap();
         assert!(outcome.valid, "trusted key verifies the signed delta");
@@ -365,7 +366,10 @@ fn verifies_signed_delta() {
 
         // A verifier that trusts a different key rejects the delta.
         let other = Ed25519Verifier::new([vec![0u8; 32]], Vec::<Vec<u8>>::new()).unwrap();
-        let rejected = repo.verify_static_delta(&signed, &[&other]).await.unwrap();
+        let rejected = repo
+            .verify_static_delta(&signed, &[Arc::new(other)])
+            .await
+            .unwrap();
         assert!(!rejected.valid, "untrusted key does not verify the delta");
     });
 }

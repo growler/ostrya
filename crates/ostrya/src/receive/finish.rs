@@ -335,10 +335,10 @@ pub(super) async fn finish(
             fields,
         },
     ) = Box::pin(async {
-        check_commit_meta_commits(&txn, &updates, &commit_meta).await?;
+        let outside = check_commit_meta_commits(&txn, &updates, &commit_meta).await?;
         let rules = select_rules(repo, policy, named.is_local(), &updates)?;
         let loaded = load_commits(&txn, &updates).await?;
-        drop_dependency_meta(&txn, &updates, &loaded.fields, &mut commit_meta)?;
+        drop_dependency_meta(outside, &loaded.fields, &mut commit_meta)?;
         Ok::<_, Failure>((rules, loaded))
     })
     .await?;
@@ -674,14 +674,17 @@ fn outside_commits(
 /// [`drop_dependency_meta`]. A dict for a commit that is neither is
 /// `protocol`. The reads of the held commits run in one trip to the blocking
 /// pool, and only if the session has a dict outside the session.
+///
+/// Returns the commits of the dicts outside the session, in the order of
+/// their checksums. The repository holds each of them.
 async fn check_commit_meta_commits(
     txn: &Transaction,
     updates: &[RefUpdate],
     commit_meta: &HashMap<Checksum, Vec<u8>>,
-) -> Checked<()> {
+) -> Checked<Vec<Checksum>> {
     let outside = outside_commits(txn, updates, commit_meta);
     if outside.is_empty() {
-        return Ok(());
+        return Ok(outside);
     }
     let repo = txn.repo().clone();
     let held: Vec<(Checksum, bool)> = ostrya_rt::unblock(move || {
@@ -701,32 +704,32 @@ async fn check_commit_meta_commits(
              update names, and the repository does not hold"
         )));
     }
-    Ok(())
+    Ok(held.into_iter().map(|(commit, _)| commit).collect())
 }
 
 /// Drops the dict of each commit that the session did not stage and that no
 /// update names, if an entry of field 2 of a commit of the session names that
 /// commit.
 ///
-/// [`check_commit_meta_commits`] found that the repository holds each such
-/// commit. A named commit is a dependency that the repository holds. The
-/// repository held that commit and its dict before the session, and no rule
-/// of the session covers a change to them. A staged dependency is a commit
-/// that the repository did not hold before the session, and its dict merges
-/// as the dict of each other staged commit. `fields` holds field 2 of
-/// each commit of the session, as [`load_commits`] reads it. An entry with an
-/// empty name or a checksum that is not 32 bytes names no commit.
+/// `outside` is the list that [`check_commit_meta_commits`] returns: the
+/// commits of `commit_meta` that the session did not stage and that no update
+/// names. The repository holds each of them. A named commit is a dependency
+/// that the repository holds. The repository held that commit and its dict
+/// before the session, and no rule of the session covers a change to them. A
+/// staged dependency is a commit that the repository did not hold before the
+/// session, and its dict merges as the dict of each other staged commit.
+/// `fields` holds field 2 of each commit of the session, as [`load_commits`]
+/// reads it. An entry with an empty name or a checksum that is not 32 bytes
+/// names no commit.
 ///
 /// A dict for such a commit that no entry names is `protocol`. Without this
 /// check, a dict can edit the detached metadata of a commit that no rule of
 /// the message covers.
 fn drop_dependency_meta(
-    txn: &Transaction,
-    updates: &[RefUpdate],
+    outside: Vec<Checksum>,
     fields: &HashMap<Checksum, Vec<(String, Vec<u8>)>>,
     commit_meta: &mut HashMap<Checksum, Vec<u8>>,
 ) -> Checked<()> {
-    let outside = outside_commits(txn, updates, commit_meta);
     if outside.is_empty() {
         return Ok(());
     }

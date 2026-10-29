@@ -4275,6 +4275,100 @@ fn keys_of_two_engines_sign_and_verify_in_one_run() {
     assert_eq!(loose_objects(&dst), []);
 }
 
+/// `sign --verify` with keys of two engines reads the commit object one time
+/// and the `.commitmeta` one time. Each engine verifies the same bytes.
+#[cfg(feature = "spki")]
+#[test]
+fn sign_verify_with_two_engines_reads_the_commit_once() {
+    const SPKI_SECRET: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg2L708EsnnzHER0SYasMNIUcGv63QapC/3kVsoPerzKGhRANCAATxfzfHKUPeJtyLTGMUoxHhvBS1NT9guWhUQPGiZRLZIcB8Wc3csdVU1iOiTRmbZGKJTtekOdEAbVRrx5HxIpst";
+    const SPKI_PUBLIC: &str = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE8X83xylD3ibci0xjFKMR4bwUtTU/YLloVEDxomUS2SHAfFnN3LHVVNYjok0Zm2RiiU7XpDnRAG1Ua8eR8SKbLQ==";
+    if !strace_available() {
+        return;
+    }
+    let tmp = TmpDir::new("sign-verify-once");
+    let base = &tmp.path().canonicalize().expect("the temp dir resolves");
+    build_fixture_source(base);
+    let repo = create_repo(base, RepoMode::Archive);
+    let repo_arg = format!("--repo={}", repo.display());
+    let src = base.join("src");
+    let ed = format!("--sign={ED25519_SECRET_B64}");
+    let spki = format!("--sign={SPKI_SECRET}");
+    let commit = ostrya(
+        &[
+            "commit",
+            &repo_arg,
+            "-b",
+            "main",
+            &ed,
+            "--sign-type=spki",
+            &spki,
+            src.to_str().unwrap(),
+        ],
+        None,
+        &[],
+    )
+    .ok()
+    .stdout_trimmed();
+    let trace = base.join("trace");
+    let out = Command::new("strace")
+        .args(["-y", "-f", "-e", "trace=openat", "-o"])
+        .arg(&trace)
+        .arg(env!("CARGO_BIN_EXE_ostrya"))
+        .args([
+            "sign",
+            &repo_arg,
+            "--verify",
+            &commit,
+            ED25519_PUBLIC_B64,
+            "--sign-type=spki",
+            SPKI_PUBLIC,
+        ])
+        .output()
+        .expect("strace runs");
+    assert!(
+        out.status.success(),
+        "verify failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        "ed25519:\nsignature 1: good\nverification OK\nspki:\nsignature 1: good\n\
+         verification OK\n"
+    );
+    // A path argument ends with a quote. The `strace -y` form of a descriptor
+    // ends with `>`, so a descriptor of the file is not counted.
+    let text = std::fs::read_to_string(&trace).expect("the trace is written");
+    let opens = |suffix: &str| {
+        let path = format!("{}/{}.{suffix}\"", &commit[..2], &commit[2..]);
+        text.lines()
+            .filter(|line| line.contains("openat(") && line.contains(&path))
+            .count()
+    };
+    assert_eq!(opens("commit"), 1, "the opens of the commit object");
+    assert_eq!(opens("commitmeta"), 1, "the opens of the .commitmeta");
+}
+
+/// `sign --verify` of a commit that the repository does not hold exits 1 and
+/// names the commit.
+#[test]
+fn sign_verify_of_a_missing_commit_fails() {
+    let tmp = TmpDir::new("sign-verify-missing");
+    let repo = create_repo(tmp.path(), RepoMode::Archive);
+    let repo_arg = format!("--repo={}", repo.display());
+    let missing = "0".repeat(64);
+    let run = ostrya(
+        &["sign", &repo_arg, "--verify", &missing, ED25519_PUBLIC_B64],
+        None,
+        &[],
+    );
+    assert_eq!(run.status.code(), Some(1));
+    assert!(run.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&run.stderr),
+        format!("error: object not found: Commit {missing}\n")
+    );
+}
+
 /// `sign --verify --remote` and `summary --verify --remote` verify with the
 /// engines that the config of the remote turns on, and with the keys of the
 /// remote alone:
@@ -14468,6 +14562,116 @@ fn log_verifies_signatures_against_the_repo_not_the_cwd() {
         stdout.contains("Good signature from"),
         "log did not verify against the repository's own keyring:\n{stdout}"
     );
+}
+
+/// `show` and `log` open each file of a GPG-signed commit one time: the
+/// commit object and the `.commitmeta`. `log` over two signed commits opens
+/// the keyring one time.
+#[cfg(feature = "gpg")]
+#[test]
+fn show_and_log_open_each_file_once() {
+    if !gpg_available() {
+        assert!(
+            std::env::var_os("OSTRYA_REQUIRE_GNUPG").is_none(),
+            "OSTRYA_REQUIRE_GNUPG is set and `gpg` is not available"
+        );
+        eprintln!("skipping: gpg not available");
+        return;
+    }
+    if !strace_available() {
+        return;
+    }
+    let tmp = TmpDir::new("show-gpg-open-once");
+    let base = &tmp.path().canonicalize().expect("the temp dir resolves");
+    let repo = commit_fixture(base);
+    let repo_s = repo.to_str().unwrap();
+    let src = base.join("src");
+    let tip = ostrya(
+        &[
+            "commit",
+            "--repo",
+            repo_s,
+            "-b",
+            BRANCH,
+            "-s",
+            "Second",
+            src.to_str().unwrap(),
+        ],
+        None,
+        &[],
+    )
+    .ok()
+    .stdout_trimmed();
+    let home = GpgHome::create(base, "Ostrya Show Test <show-gpg@ostrya.example>");
+    let fpr = home.fingerprint();
+    let home_s = home.dir.to_str().unwrap().to_owned();
+    for commit in [COMMIT, tip.as_str()] {
+        ostrya(
+            &[
+                "sign",
+                "--repo",
+                repo_s,
+                "-s",
+                "gpg",
+                "--gpg-homedir",
+                &home_s,
+                commit,
+                &fpr,
+            ],
+            None,
+            &[],
+        )
+        .ok();
+    }
+    home.export_to(&repo.join("gpgkeys.gpg"));
+
+    let object = |commit: &str, suffix: &str| format!("{}/{}.{suffix}", &commit[..2], &commit[2..]);
+    for (command, rev, signed) in [
+        ("show", COMMIT, vec![COMMIT]),
+        ("log", tip.as_str(), vec![tip.as_str(), COMMIT]),
+    ] {
+        let trace = base.join(format!("trace-{command}"));
+        let out = Command::new("strace")
+            .args(["-y", "-f", "-e", "trace=openat", "-o"])
+            .arg(&trace)
+            .arg(env!("CARGO_BIN_EXE_ostrya"))
+            .args([command, "--repo", repo_s, rev])
+            .output()
+            .expect("strace runs");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            out.status.success() && stdout.matches("Good signature from").count() == signed.len(),
+            "{command} did not verify each commit:\n{stdout}\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // A path argument ends with a quote. The `strace -y` form of a
+        // descriptor ends with `>`, so a descriptor of the file is not
+        // counted.
+        let text = std::fs::read_to_string(&trace).expect("the trace is written");
+        let opens = |path: &str| {
+            let path = format!("{path}\"");
+            text.lines()
+                .filter(|line| line.contains("openat(") && line.contains(&path))
+                .count()
+        };
+        for commit in signed {
+            assert_eq!(
+                opens(&object(commit, "commit")),
+                1,
+                "{command}: the opens of {commit}.commit"
+            );
+            assert_eq!(
+                opens(&object(commit, "commitmeta")),
+                1,
+                "{command}: the opens of {commit}.commitmeta"
+            );
+        }
+        assert_eq!(
+            opens("/gpgkeys.gpg"),
+            1,
+            "{command}: the opens of the keyring"
+        );
+    }
 }
 
 /// `ls` over the repository that the `ostree` command built, in every option

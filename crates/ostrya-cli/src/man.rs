@@ -10,7 +10,8 @@
 //! ```
 //!
 //! The module is compiled for tests alone, so the `ostrya` binary carries no
-//! generator.
+//! generator. The pages describe the default feature set, so the module is
+//! compiled only when each subcommand feature is on.
 //!
 //! # Pages
 //!
@@ -250,13 +251,6 @@ fn push_nested(out: &mut String, title: &str, cmd: &Command, globals: &HashSet<S
 /// the test fails. Only then does
 /// it read `OSTRYA_BLESS_MAN`. If the variable is set, the test writes the
 /// pages again and removes each page that has no subcommand.
-#[cfg(all(
-    feature = "receive",
-    feature = "push",
-    feature = "serve",
-    feature = "send",
-    feature = "s3"
-))]
 #[test]
 fn man_pages_match_the_committed_files() {
     let dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("man");
@@ -319,13 +313,6 @@ fn man_pages_match_the_committed_files() {
 
 /// Returns true if `name` is the file name of a man page, such as
 /// `ostrya.1` or `ostrya-repo.5`.
-#[cfg(all(
-    feature = "receive",
-    feature = "push",
-    feature = "serve",
-    feature = "send",
-    feature = "s3"
-))]
 fn is_page_file(name: &str) -> bool {
     name.rsplit_once('.').is_some_and(|(stem, section)| {
         !stem.is_empty() && section.len() == 1 && section.as_bytes()[0].is_ascii_digit()

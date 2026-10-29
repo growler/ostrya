@@ -55,14 +55,14 @@ use std::sync::{Arc, Mutex};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use ostrya::{
     BootableMetadata, BootableRefusal, CheckoutFilterFn, CheckoutMode, CheckoutOptions, Checksum,
-    CollectionPullOptions, CollectionRef, CollectionRefEntry, CommitModifier, CommitModifierFlags,
-    CommitOptions, ComposefsImageState, ComposefsOptions, CreateOptions, DeltaEndianness,
-    DeltaOptions, DeltaSuperblock, DevInoCache, DictBuilder, DiffChange, DiffOptions, DiffSide,
-    Ed25519Signer, Ed25519Verifier, Error, FileKind, FileMeta, FileObject, FilterResult,
-    FsckBindingError, FsckBindingErrorKind, FsckError, FsckErrorKind, FsckFailure, FsckOptions,
-    FsckPhase, MutableTree, ObjectType, OverwriteMode, PruneOptions, PullFlags, PullOptions,
-    PullProgress, PullProgressSnapshot, PullStats, PullVerify, RefAlias, Repo, RepoConfig,
-    RepoMode, RepoTree, Result, Signer, Summary, SummaryOptions, TarExportOptions,
+    CollectionPullOptions, CollectionRef, CollectionRefEntry, Commit, CommitModifier,
+    CommitModifierFlags, CommitOptions, ComposefsImageState, ComposefsOptions, CreateOptions,
+    DeltaEndianness, DeltaOptions, DeltaSuperblock, DevInoCache, DictBuilder, DiffChange,
+    DiffOptions, DiffSide, Ed25519Signer, Ed25519Verifier, Error, FileKind, FileMeta, FileObject,
+    FilterResult, FsckBindingError, FsckBindingErrorKind, FsckError, FsckErrorKind, FsckFailure,
+    FsckOptions, FsckPhase, MutableTree, ObjectType, OverwriteMode, PruneOptions, PullFlags,
+    PullOptions, PullProgress, PullProgressSnapshot, PullStats, PullVerify, RefAlias, Repo,
+    RepoConfig, RepoMode, RepoTree, Result, Signer, Summary, SummaryOptions, TarExportOptions,
     TarImportOptions, TimestampCheck, Transaction, TransactionStats, TreeEntry, Type, Value,
     Verifier, VerifyOutcome, VerityPolicy, Xattrs, from_bytes, load_sign_keys, load_sign_keys_from,
     to_text, to_text_unannotated, validate_refspec,
@@ -74,7 +74,14 @@ use ostrya::{SpkiSigner, SpkiVerifier, spki_public_keys, spki_secret_key_lines, 
 
 use pcre2::bytes::{CaptureLocations, RegexBuilder};
 
-#[cfg(test)]
+#[cfg(all(
+    test,
+    feature = "receive",
+    feature = "push",
+    feature = "serve",
+    feature = "send",
+    feature = "s3"
+))]
 mod man;
 
 /// The command line of the `ostrya` binary: the global options and the
@@ -11620,7 +11627,7 @@ async fn show_object(repo: &Repo, repo_path: &Path, object: &str, args: &ShowArg
         // `--raw` alone reports the variant and stops. `-B` reports the variant
         // and then gives the report of the commit itself.
         if ty == ObjectType::Commit && (!args.raw || args.no_byteswap) {
-            report_commit(repo, repo_path, &checksum, args).await?;
+            report_commit(repo, repo_path, &checksum, args, &mut None).await?;
         }
         return Ok(());
     }
@@ -11669,18 +11676,34 @@ fn metadata_signature(ty: ObjectType) -> &'static str {
     }
 }
 
-/// Prints the report of a commit.
+/// The GPG verifier of the commit reports, which the first report of a
+/// signed commit builds.
+///
+/// `log` keeps one value over the walk, so the keyrings are read one time.
+/// A build without the gpg engine has no verifier.
+#[cfg(feature = "gpg")]
+type ReportVerifier = Option<GpgVerifier>;
+#[cfg(not(feature = "gpg"))]
+type ReportVerifier = Option<std::convert::Infallible>;
+
+/// Prints the report of a commit, and returns the parent of the commit.
 ///
 /// The report holds the parent, the content checksum, and the date. Then come
 /// the `version` metadata key if the commit has one, the subject, and the
 /// body. If the commit has GPG signatures, the signature report follows.
+///
+/// The commit object is read one time. The signature report verifies the same
+/// bytes with `verifier`. If `verifier` is `None` at the first signed commit,
+/// the report builds it from the keyrings of `args`.
 async fn report_commit(
     repo: &Repo,
     repo_path: &Path,
     checksum: &Checksum,
     args: &ShowArgs,
-) -> Result<()> {
-    let (commit, _) = repo.load_commit(checksum).await?;
+    verifier: &mut ReportVerifier,
+) -> Result<Option<Checksum>> {
+    let data = repo.load_object_bytes(ObjectType::Commit, checksum).await?;
+    let commit = parse_commit(repo, checksum, &data).await?;
     if let Some(parent) = &commit.parent {
         println!("Parent:  {}", parent.to_hex());
     }
@@ -11708,7 +11731,20 @@ async fn report_commit(
         print_indented(&commit.body);
     }
     println!();
-    report_commit_signatures(repo, repo_path, checksum, args).await
+    report_commit_signatures(repo, repo_path, checksum, &data, args, verifier).await?;
+    Ok(commit.parent)
+}
+
+/// Parses the bytes of a commit object, with the checks of
+/// [`Repo::load_commit`].
+///
+/// [`Repo::load_commit`] also checks the `.commitpartial` marker of the
+/// commit. The check stays, so a failure of it stops the command at the same
+/// point.
+async fn parse_commit(repo: &Repo, checksum: &Checksum, data: &[u8]) -> Result<Commit> {
+    let commit = Commit::parse(data)?;
+    repo.commit_state(checksum).await?;
+    Ok(commit)
 }
 
 /// Prints each line of `text` indented by four spaces.
@@ -11728,16 +11764,19 @@ async fn report_commit_signatures(
     repo: &Repo,
     repo_path: &Path,
     checksum: &Checksum,
+    data: &[u8],
     args: &ShowArgs,
+    verifier: &mut ReportVerifier,
 ) -> Result<()> {
-    if stored_signatures(repo, checksum, "ostree.gpgsigs")
-        .await?
-        .is_empty()
-    {
+    let signatures = stored_signatures(repo, checksum, "ostree.gpgsigs").await?;
+    if signatures.is_empty() {
         return Ok(());
     }
-    let verifier: Arc<dyn Verifier> = Arc::new(show_gpg_verifier(repo_path, args)?);
-    let outcome = repo.verify_commit(checksum, &[verifier]).await?;
+    let verifier = match verifier {
+        Some(verifier) => verifier,
+        None => verifier.insert(show_gpg_verifier(repo_path, args)?),
+    };
+    let outcome = verifier.verify(data, &signatures)?;
     println!();
     let plural = if outcome.signatures.len() == 1 {
         ""
@@ -11770,7 +11809,14 @@ async fn report_commit_signatures(
 ///
 /// The two GPG options are accepted and have no effect.
 #[cfg(not(feature = "gpg"))]
-async fn report_commit_signatures(_: &Repo, _: &Path, _: &Checksum, _: &ShowArgs) -> Result<()> {
+async fn report_commit_signatures(
+    _: &Repo,
+    _: &Path,
+    _: &Checksum,
+    _: &[u8],
+    _: &ShowArgs,
+    _: &mut ReportVerifier,
+) -> Result<()> {
     Ok(())
 }
 
@@ -11886,6 +11932,9 @@ async fn log(repo: Repo, repo_path: PathBuf, name: &str, args: LogArgs) -> Resul
             ty: ObjectType::Commit,
         });
     }
+    // The verifier is built at the first signed commit of the walk, and each
+    // later commit reuses it.
+    let mut verifier = None;
     let mut current = Some(start);
     while let Some(checksum) = current {
         if !repo.has_object(ObjectType::Commit, &checksum).await? {
@@ -11893,15 +11942,17 @@ async fn log(repo: Repo, repo_path: PathBuf, name: &str, args: LogArgs) -> Resul
             return Ok(());
         }
         println!("commit {}", checksum.to_hex());
-        if args.raw {
-            let value = repo.load_variant(ObjectType::Commit, &checksum).await?;
+        current = if args.raw {
+            let data = repo
+                .load_object_bytes(ObjectType::Commit, &checksum)
+                .await?;
             let ty = parse_type(COMMIT_SIGNATURE)?;
+            let value = from_bytes(&ty, &data).map_err(|err| Error::Core(err.into()))?;
             println!("{}", variant_text(&ty, &value.byteswapped())?);
+            parse_commit(&repo, &checksum, &data).await?.parent
         } else {
-            report_commit(&repo, &repo_path, &checksum, &show).await?;
-        }
-        let (commit, _) = repo.load_commit(&checksum).await?;
-        current = commit.parent;
+            report_commit(&repo, &repo_path, &checksum, &show, &mut verifier).await?
+        };
     }
     Ok(())
 }
@@ -13958,27 +14009,13 @@ async fn summary_verify(repo: &Repo, args: &SummaryArgs) -> Result<()> {
     )
     .await?;
     // The summary and its signatures are read one time. Each engine then
-    // verifies the same bytes, and the verifiers run in one call on the
-    // blocking pool.
+    // verifies the same bytes.
     let data = repo
         .read_summary()
         .await?
         .ok_or_else(|| Error::InvalidFormat("no summary to verify".into()))?;
     let dict = repo.read_summary_signature().await?;
-    let outcomes = ostrya_rt::unblock(move || {
-        keys.into_iter()
-            .map(|(engine, keys)| {
-                let verifier = keys.verifier;
-                let signatures = match &dict {
-                    Some(dict) => signature_blobs(dict, verifier.metadata_key()),
-                    None => Vec::new(),
-                };
-                Ok((engine, verifier.verify(&data, &signatures)?))
-            })
-            .collect::<Result<Vec<_>>>()
-    })
-    .await?;
-    report_engines(&outcomes);
+    report_engines(&verify_engines(keys, &data, dict.as_ref())?);
     Ok(())
 }
 
@@ -14403,12 +14440,35 @@ async fn verify_signatures(
         },
     )
     .await?;
-    let mut outcomes = Vec::with_capacity(keys.len());
-    for (engine, keys) in keys {
-        outcomes.push((engine, repo.verify_commit(commit, &[keys.verifier]).await?));
-    }
-    report_engines(&outcomes);
+    // The commit and its detached metadata are read one time. Each engine
+    // then verifies the same bytes.
+    let data = repo.load_object_bytes(ObjectType::Commit, commit).await?;
+    let dict = repo.read_commit_detached_metadata(commit).await?;
+    report_engines(&verify_engines(keys, &data, dict.as_ref())?);
     Ok(())
+}
+
+/// Verifies `data` with the keys of each engine, and returns the outcome of
+/// each engine in the order of `keys`.
+///
+/// Each verifier gets the blobs under its metadata key in the signature dict
+/// `dict`, as [`signature_blobs`] reads them. If `dict` is `None`, each
+/// verifier gets no blob. The verifiers run in the calling task.
+fn verify_engines(
+    keys: Vec<(SignType, VerifyKeys)>,
+    data: &[u8],
+    dict: Option<&Value>,
+) -> Result<Vec<(SignType, VerifyOutcome)>> {
+    keys.into_iter()
+        .map(|(engine, keys)| {
+            let verifier = keys.verifier;
+            let signatures = match dict {
+                Some(dict) => signature_blobs(dict, verifier.metadata_key()),
+                None => Vec::new(),
+            };
+            Ok((engine, verifier.verify(data, &signatures)?))
+        })
+        .collect()
 }
 
 /// Returns the signature blobs stored under `key` in the detached metadata.

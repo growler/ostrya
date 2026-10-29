@@ -266,6 +266,14 @@ jobs:
       - name: The ostrya-sign unit tests pass with the X.509 feature and the spki feature
         run: cargo test -p ostrya-sign --no-default-features --features x509,spki --lib
 
+      # `ostrya-cli` builds with the spki engine or the gpg engine and no
+      # subcommand feature, with no warning. `--all-targets` also checks the
+      # test code.
+      - name: ostrya-cli with the spki feature alone compiles
+        run: cargo clippy -p ostrya-cli --no-default-features --features smol,spki --all-targets -- -D warnings
+      - name: ostrya-cli with the gpg feature alone compiles
+        run: cargo clippy -p ostrya-cli --no-default-features --features smol,gpg --all-targets -- -D warnings
+
       # The portable crates compile for macOS and Windows as well as Linux.
       # `cargo check` needs the standard library of each target and no linker,
       # so the Linux runner checks all three targets. Each portable crate that

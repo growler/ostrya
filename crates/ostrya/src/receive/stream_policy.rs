@@ -60,10 +60,10 @@ pub struct StreamRule {
     ///
     /// With [`ReceiveVerify::Keys`], each new commit must pass the
     /// verification on each axis of the keys. A commit with no signature
-    /// fails. Each staged dependency that the staged chain of the new commit
-    /// names must pass the same verification. The staged chain is the new
-    /// commit and its parents as far as the stream stages them. A dependency
-    /// that the repository holds gets no verification.
+    /// fails. The rule applies to the new commit of an update of a matching
+    /// ref alone. A dependency that field 2 of that commit names gets no
+    /// verification, unless an update also takes it as its new commit. Then
+    /// the rule of that update applies.
     pub verify: ReceiveVerify,
     /// The switch that accepts an update whose new commit does not descend
     /// from the current one.

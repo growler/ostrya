@@ -2199,26 +2199,37 @@ the rules.
   partial-commit marker, because the session completes the tree of that
   commit and removes its marker. For the same reason, a dependency that is a
   new commit counts as complete. Each other dependency must be staged or
-  held complete, and no dependency can have dependencies of its own. A
-  staged dependency passes the signature rules of each update whose new
-  commit names it in its staged chain: the new commit and its parents as far
-  as the session staged them. Field 2 of a new commit that the server holds
-  counts too. The server signs it one time with each distinct key of these
-  rules. A
-  dependency that the server already holds gets no check and no signature:
-  the server accepted it when it stored it. For the same reason, the server
-  drops a detached metadata dict for a commit that it holds, that the
-  session did not stage, and that no update names, if field 2 of a commit of
-  the session names that commit. The server writes and merges nothing from
-  the dict. The one-way export sends such a dict, because it does no
-  negotiation. A refusal of the dict was rejected: it refuses each second
-  export of a dependency with a `.commitmeta` to one receiver. A merge of
-  the dict was rejected: no rule of the session covers a held dependency. A
-  dict for each other commit that the session did not stage and that no
-  update names stays `protocol`. A `Commit` message that lists the
-  dependencies of the push was rejected. The dependencies are in the signed
-  commits, so a list in the message adds a second source that can disagree
-  with them.
+  held complete, and no dependency can have dependencies of its own. The
+  receiver checks no signature of a dependency and adds no server signature
+  to it. A dependency that is also a new commit gets the check and the
+  signatures of its own updates alone. The checksum of a dependency is in
+  field 2 of a commit of the session. A new commit is that commit, or binds
+  it through the parent checksums of its history, and the signature rules
+  cover the new commit. The receiver checks that the bytes of each object
+  hash to the checksum that names it. A dependency that only a staged commit
+  outside each history names is bound to no new commit, and no ref update of
+  the session reaches it. A staged parent gets no check and no signature,
+  also when a field 2 names it. The receiver merges the incoming dict of a staged dependency into the
+  stored dict, as for each other staged commit. A later pull can take the
+  dependency as a target, and that pull needs the signatures. So under
+  `verify`, a client can store a dict with signatures that no key trusts on
+  a staged dependency. The server drops a detached metadata dict for a
+  commit that it holds, that the session did not stage, and that no update
+  names, if field 2 of a commit of the session names that commit. The
+  server writes and merges nothing from the dict. The one-way export sends
+  such a dict, because it does no negotiation. A refusal of the dict was
+  rejected: it refuses each second export of a dependency with a
+  `.commitmeta` to one receiver. A merge of the dict was rejected: the
+  server held the dependency and its dict before the session, and no rule
+  of the session covers a change to them. A dict for each other commit that
+  the session did not stage and that no update names stays `protocol`. A
+  `Commit` message that lists the dependencies of the push was rejected.
+  The dependencies are in the signed commits, so a list in the message adds
+  a second source that can disagree with them. A receiver that checks the
+  signatures of a staged dependency and signs it, under the rules of the
+  updates that name it, was rejected: a new commit binds each dependency of
+  its history by its checksum, so a signature on the dependency adds no
+  trust.
 - The fsck (`Repo::fsck` and `ostrya fsck`) reports each dependency of a
   commit that it checks that is absent, partial, or defective, in
   `FsckReport::dependency_errors`. A nested dependency is defective. The run

@@ -211,9 +211,8 @@ impl Repo {
     ///    of the namespace, or the collection id of the repository for the
     ///    local refs. A commit with no collection binding passes.
     /// 7. The signature verification of the policy (`signature-required`).
-    ///    The verification applies to each new commit, and to each staged
-    ///    dependency that the staged chain of a new commit names. The staged
-    ///    chain of a new commit is the commit and its staged parents.
+    ///    The verification applies to each new commit alone. A staged parent
+    ///    and a dependency get no verification, unless an update names them.
     ///
     /// [`ReceiveService::commit`](super::ReceiveService::commit) runs the same
     /// checks. The errors section of its doc states the condition of each code.
@@ -230,10 +229,10 @@ impl Repo {
     /// is a commit of the session only if an update names it.
     ///
     /// After the checks, the session makes the staged objects durable. At the
-    /// same time, it signs each new commit, and each staged dependency that
-    /// the staged chain of a new commit names, with each server key of the
+    /// same time, it signs each new commit with each server key of the
     /// policy, each key once. A key that already signed the commit makes no
-    /// signature. A dependency that the repository holds gets no signature.
+    /// signature. The session signs no other commit, a staged parent and a
+    /// dependency included.
     ///
     /// # Under the update lock
     ///

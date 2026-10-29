@@ -86,43 +86,9 @@ struct Target {
     /// The serialized commit, the payload of its signatures.
     bytes: Vec<u8>,
     commit: Commit,
-    /// The index of each ref update whose new value the commit is.
+    /// The index of each ref update whose new value the commit is, in order.
+    /// The rules of these updates verify and sign the commit.
     updates: Vec<usize>,
-    /// The index of each ref update whose rule verifies and signs the commit,
-    /// if the staged chain of a target names the commit as a dependency: the
-    /// updates of the commit and of each such target, in order. Else it is
-    /// empty, and the rules are `updates`. [`Target::rules`] reads it.
-    extended: Vec<usize>,
-    /// The first target, in the order of the updates, whose staged chain
-    /// names the commit as a dependency.
-    named_by: Option<Checksum>,
-}
-
-impl Target {
-    /// Returns the index of each ref update whose rule verifies and signs the
-    /// commit, in order.
-    fn rules(&self) -> &[usize] {
-        if self.extended.is_empty() {
-            &self.updates
-        } else {
-            &self.extended
-        }
-    }
-}
-
-/// A staged dependency that is no target, and that a rule of the targets
-/// whose staged chain names it verifies or signs.
-///
-/// The staged chain of a target is the target, then its parents as far as
-/// the session stages them.
-struct Dependency {
-    checksum: Checksum,
-    /// The serialized commit, the payload of its signatures.
-    bytes: Vec<u8>,
-    /// The index of each ref update of these targets, in order.
-    rules: Vec<usize>,
-    /// The first of these targets, in the order of the updates.
-    named_by: Checksum,
 }
 
 /// A server signature over the bytes of a new commit, made before the
@@ -199,8 +165,9 @@ struct Edit<'a> {
 /// - A dict for a commit that the repository holds, that the session did not
 ///   stage, and that no update names, belongs to a dependency: an entry of
 ///   field 2 of a commit of the session names the commit (`protocol`). The
-///   session drops each such dict, with no merge and no write, because a held
-///   dependency gets no signature.
+///   session drops each such dict, with no merge and no write. The repository
+///   held the dependency and its dict before the session, and no rule of the
+///   session covers a change to them.
 /// - Each composefs image belongs to a commit that the session staged or
 ///   that the repository holds. That commit carries a valid
 ///   `ostree.composefs.digest.v0` (`protocol`), and the digest of each image
@@ -218,25 +185,26 @@ struct Edit<'a> {
 /// - The ref binding and the collection binding of each new commit name its
 ///   refs and the namespace (`binding-mismatch`).
 /// - Each new commit passes the signature verification of each of its rules
-///   (`signature-required`). Each staged dependency passes the verification
-///   of the rules of each new commit whose staged chain names it. The staged
-///   chain of a new commit is the commit and its staged parents. The refusal
-///   of a dependency names it and the first new commit, in the order of the
-///   updates, whose staged chain names it. A held
-///   dependency gets no verification. The verification reads the union of
-///   the stored and the incoming detached metadata. A rule that accepts a
-///   commit with no signature skips a commit whose union holds no signature
-///   blob.
+///   (`signature-required`). The verification reads the union of the stored
+///   and the incoming detached metadata. A rule that accepts a commit with no
+///   signature skips a commit whose union holds no signature blob. A commit
+///   that no update names gets no verification, a staged parent and a
+///   dependency included. The checksum of a dependency is in field 2 of a
+///   commit of the session. A new commit is that commit, or binds it through
+///   the parent checksums of its history, and the signatures of the new
+///   commit cover these checksums. A dependency that only a staged commit
+///   outside each history names is bound to no new commit. The session staged
+///   each object under the checksum of its bytes.
 ///
 /// # Before the update lock
 ///
 /// After the checks, if `[ex-ostrya] keep-detached-related` of the repository
 /// is `false`, this step drops `ostrya.related` from each incoming dict. Then
 /// the staged objects become durable. At the same time, each new commit gets a
-/// signature from each server key of its rules. Each staged dependency that the
-/// staged chain of a new commit names gets a signature from each server key of
-/// the rules of these new commits. A held dependency gets no signature. A key
-/// makes no signature if it already signed the commit in one of these places:
+/// signature from each server key of its rules. No other commit gets a server
+/// signature. Each other commit with a filtered incoming dict, a staged
+/// dependency included, gets the merge of that dict alone. A key makes no
+/// signature if it already signed the commit in one of these places:
 ///
 /// - The merge of the filtered incoming dict into the stored dict.
 /// - A signature that a key before it made.
@@ -359,7 +327,7 @@ pub(super) async fn finish(
     let (
         rules,
         Loaded {
-            mut targets,
+            targets,
             session_commits,
             roots,
             parents,
@@ -381,17 +349,15 @@ pub(super) async fn finish(
     }
     check_dependencies(&txn, &targets, &staged, &fields).await?;
     check_bindings(repo, named.namespace, &updates, &targets)?;
-    let dependencies =
-        dependency_rules(&txn, &rules, &mut targets, &staged, &fields, &parents).await?;
     drop((staged, fields));
     let commit_meta: HashMap<Checksum, Bytes> = commit_meta
         .into_iter()
         .map(|(commit, bytes)| (commit, Arc::new(bytes)))
         .collect();
-    let mut stored = read_stored_for(repo, &rules, &targets, &dependencies, &commit_meta).await?;
-    check_signatures(&rules, &commit_meta, &targets, &dependencies, &stored).await?;
+    let mut stored = read_stored_for(repo, &rules, &targets, &commit_meta).await?;
+    check_signatures(&rules, &commit_meta, &targets, &stored).await?;
     let incoming = filter_detached(repo, commit_meta).await?;
-    let edits = plan(&rules, &targets, &dependencies, &mut stored, incoming);
+    let edits = plan(&rules, &targets, &mut stored, incoming);
     // The dicts that no edit took. The merge of the host entries takes them,
     // so they stay only where the session has hooks.
     let leftover = match hooks {
@@ -467,8 +433,6 @@ pub(super) async fn finish(
         changes.push(changed);
     }
     queue_detached(repo, &txn, edits).await?;
-    // The bytes of the dependencies are not held through the publication.
-    drop(dependencies);
     for (update, changed) in updates.iter().zip(&changes) {
         if !*changed {
             continue;
@@ -745,8 +709,11 @@ async fn check_commit_meta_commits(
 /// commit.
 ///
 /// [`check_commit_meta_commits`] found that the repository holds each such
-/// commit. A named commit is a dependency that the repository holds, and a
-/// held dependency gets no merge and no signature. `fields` holds field 2 of
+/// commit. A named commit is a dependency that the repository holds. The
+/// repository held that commit and its dict before the session, and no rule
+/// of the session covers a change to them. A staged dependency is a commit
+/// that the repository did not hold before the session, and its dict merges
+/// as the dict of each other staged commit. `fields` holds field 2 of
 /// each commit of the session, as [`load_commits`] reads it. An entry with an
 /// empty name or a checksum that is not 32 bytes names no commit.
 ///
@@ -977,8 +944,6 @@ async fn load_commits(txn: &Transaction, updates: &[RefUpdate]) -> Checked<Loade
                     bytes,
                     commit,
                     updates,
-                    extended: Vec::new(),
-                    named_by: None,
                 });
             }
             ReadCommit::Other(..) => unreachable!("a new commit is read with its bytes"),
@@ -1214,210 +1179,6 @@ async fn check_dependencies(
     Ok(())
 }
 
-/// Gives each staged dependency the rules of the targets whose staged chain
-/// names it, and returns the dependencies that are no target and that these
-/// rules verify or sign.
-///
-/// The staged chain of a target is the target, then its parent as long as the
-/// session staged the parent. A target that the repository holds starts a
-/// chain too. The chain names each staged commit that field 2 of a commit of
-/// the chain names. An entry with a defect names nothing. A dependency that
-/// the repository holds gets no rule, and neither does a staged dependency
-/// that only commits outside each staged chain name.
-///
-/// A dependency that is a target adds the updates of these targets to its
-/// rules, and the first of these targets, in the order of the updates, is its
-/// `named_by`. Each other dependency gets the updates of these targets, and a
-/// [`Dependency`] if a rule of them has trusted keys or server keys. If no
-/// rule of the session has trusted keys or server keys, the function changes
-/// no target and returns no dependency.
-///
-/// The walk reads each commit of the staged chains once: the walk of a
-/// target stops at a commit that the walk of a target before it read. The
-/// chains then make a forest, in which the child of a commit is a commit
-/// whose parent it is. The targets whose chain holds a commit are the targets
-/// in the subtree of that commit. A preorder numbers the commits, so each
-/// subtree is a range of numbers. The reads of the bytes of the dependencies
-/// run in one trip to the blocking pool.
-async fn dependency_rules(
-    txn: &Transaction,
-    rules: &[UpdateRule<'_>],
-    targets: &mut [Target],
-    staged: &HashSet<Checksum>,
-    fields: &HashMap<Checksum, Vec<(String, Vec<u8>)>>,
-    parents: &Parents,
-) -> Checked<Vec<Dependency>> {
-    let applies = rules
-        .iter()
-        .any(|rule| matches!(rule.verify, ReceiveVerify::Keys(_)) || !rule.signers.is_empty());
-    if fields.is_empty() || !applies {
-        return Ok(Vec::new());
-    }
-    // The commits of the staged chains, each once, in the order of the walks,
-    // and the parent of each commit that is on a chain.
-    let mut index: HashMap<Checksum, usize> = HashMap::new();
-    let mut commits: Vec<(Checksum, Option<Checksum>)> = Vec::new();
-    for target in targets.iter() {
-        let mut commit = target.checksum;
-        while let Entry::Vacant(at) = index.entry(commit) {
-            at.insert(commits.len());
-            let parent = match parents.get(&commit) {
-                Some(&Some(parent)) if staged.contains(&parent) => Some(parent),
-                _ => None,
-            };
-            commits.push((commit, parent));
-            match parent {
-                Some(parent) => commit = parent,
-                None => break,
-            }
-        }
-    }
-    // The preorder range of the subtree of each commit, as a start and an
-    // end that is not in the range.
-    let mut children: Vec<Vec<usize>> = vec![Vec::new(); commits.len()];
-    let mut stack: Vec<(usize, bool)> = Vec::new();
-    for (i, (_, parent)) in commits.iter().enumerate() {
-        match parent {
-            Some(parent) => children[index[parent]].push(i),
-            None => stack.push((i, false)),
-        }
-    }
-    let mut spans = vec![(0, 0); commits.len()];
-    let mut number = 0;
-    while let Some((i, done)) = stack.pop() {
-        if done {
-            spans[i].1 = number;
-        } else {
-            spans[i].0 = number;
-            number += 1;
-            stack.push((i, true));
-            stack.extend(children[i].iter().map(|&child| (child, false)));
-        }
-    }
-    drop(children);
-    // The preorder number of each target and its index, in the order of the
-    // numbers.
-    let mut numbered: Vec<(usize, usize)> = targets
-        .iter()
-        .enumerate()
-        .map(|(t, target)| (spans[index[&target.checksum]].0, t))
-        .collect();
-    numbered.sort_unstable();
-    // The commits that name each staged dependency, and the dependencies in
-    // the order of the first commit that names them.
-    let mut naming: HashMap<Checksum, Vec<usize>> = HashMap::new();
-    let mut order: Vec<Checksum> = Vec::new();
-    for (i, (commit, _)) in commits.iter().enumerate() {
-        for (name, bytes) in fields.get(commit).into_iter().flatten() {
-            let Ok(dependency) = Checksum::from_ay(bytes) else {
-                continue;
-            };
-            if name.is_empty() || !staged.contains(&dependency) {
-                continue;
-            }
-            let at = naming.entry(dependency).or_insert_with(|| {
-                order.push(dependency);
-                Vec::new()
-            });
-            if at.last() != Some(&i) {
-                at.push(i);
-            }
-        }
-    }
-    drop((commits, index));
-    let targets_at: HashMap<Checksum, usize> = targets
-        .iter()
-        .enumerate()
-        .map(|(t, target)| (target.checksum, t))
-        .collect();
-    let mut found: Vec<(Checksum, Vec<usize>, Checksum)> = Vec::new();
-    for dependency in order {
-        // The targets in the subtree of each commit that names the
-        // dependency. Two subtrees are nested or apart, so a range that starts
-        // in the range before it adds no target.
-        let mut ranges: Vec<(usize, usize)> =
-            naming[&dependency].iter().map(|&i| spans[i]).collect();
-        ranges.sort_unstable();
-        let mut holders: Vec<usize> = Vec::new();
-        let mut end = 0;
-        for (start, stop) in ranges {
-            if start < end {
-                continue;
-            }
-            end = stop;
-            let from = numbered.partition_point(|&(n, _)| n < start);
-            holders.extend(
-                numbered[from..]
-                    .iter()
-                    .take_while(|&&(n, _)| n < stop)
-                    .map(|&(_, t)| t),
-            );
-        }
-        let first = *holders
-            .iter()
-            .min()
-            .expect("the walk of a target reads each commit of a chain");
-        let named_by = targets[first].checksum;
-        let mut updates: Vec<usize> = holders
-            .iter()
-            .flat_map(|&t| targets[t].updates.iter().copied())
-            .collect();
-        match targets_at.get(&dependency) {
-            Some(&at) => {
-                let target = &mut targets[at];
-                updates.extend_from_slice(&target.updates);
-                updates.sort_unstable();
-                updates.dedup();
-                target.extended = updates;
-                target.named_by = Some(named_by);
-            }
-            None => {
-                updates.sort_unstable();
-                updates.dedup();
-                if !target_keys(rules, &updates).is_empty()
-                    || !target_signers(rules, &updates).is_empty()
-                {
-                    found.push((dependency, updates, named_by));
-                }
-            }
-        }
-    }
-    if found.is_empty() {
-        return Ok(Vec::new());
-    }
-    let commits = found.iter().map(|(checksum, ..)| *checksum).collect();
-    let read = read_staged_commits(txn, commits)
-        .await
-        .map_err(Failure::Internal)?;
-    Ok(found
-        .into_iter()
-        .zip(read)
-        .map(|((checksum, rules, named_by), bytes)| Dependency {
-            checksum,
-            bytes,
-            rules,
-            named_by,
-        })
-        .collect())
-}
-
-/// Reads the bytes of the staged commits `commits` in one trip to the
-/// blocking pool, with no parse.
-async fn read_staged_commits(txn: &Transaction, commits: Vec<Checksum>) -> Result<Vec<Vec<u8>>> {
-    let mode = txn.repo().mode();
-    let staging = txn.staging_fd().try_clone_to_owned()?;
-    ostrya_rt::unblock(move || {
-        commits
-            .iter()
-            .map(|commit| {
-                let name = flat_name(commit, ObjectType::Commit, mode);
-                Ok(read_meta_object(staging.as_fd(), &name, MAX_METADATA_SIZE)?)
-            })
-            .collect()
-    })
-    .await
-}
-
 /// Checks the ref binding and the collection binding of each new commit.
 ///
 /// The `ostree.ref-binding` of each new commit lists each ref that the commit
@@ -1522,24 +1283,21 @@ fn target_signers<'a>(rules: &[UpdateRule<'a>], indices: &[usize]) -> Vec<&'a Ar
 /// reads.
 ///
 /// These commits are each new commit with a signature verification or a
-/// server key, each staged dependency of `dependencies`, and each commit with
-/// an incoming dict.
+/// server key, and each commit with an incoming dict.
 async fn read_stored_for(
     repo: &Repo,
     rules: &[UpdateRule<'_>],
     targets: &[Target],
-    dependencies: &[Dependency],
     commit_meta: &HashMap<Checksum, Bytes>,
 ) -> Checked<HashMap<Checksum, Option<Bytes>>> {
     let mut commits: Vec<Checksum> = targets
         .iter()
         .filter(|t| {
-            !target_keys(rules, t.rules()).is_empty()
-                || !target_signers(rules, t.rules()).is_empty()
+            !target_keys(rules, &t.updates).is_empty()
+                || !target_signers(rules, &t.updates).is_empty()
                 || commit_meta.contains_key(&t.checksum)
         })
         .map(|t| t.checksum)
-        .chain(dependencies.iter().map(|d| d.checksum))
         .collect();
     let listed: HashSet<Checksum> = commits.iter().copied().collect();
     commits.extend(commit_meta.keys().filter(|c| !listed.contains(c)).copied());
@@ -1639,9 +1397,8 @@ fn empty_dict() -> Value {
     Value::Array(Vec::new())
 }
 
-/// Verifies the signatures of each new commit, then of each staged
-/// dependency of `dependencies`, against each rule of its `rules`, once for
-/// each set of trusted keys.
+/// Verifies the signatures of each new commit against the rule of each of its
+/// updates, once for each set of trusted keys.
 ///
 /// The verification reads the union of the stored detached metadata of the
 /// commit and the incoming dict, before the rule of `[ex-ostrya]
@@ -1651,24 +1408,16 @@ fn empty_dict() -> Value {
 /// A set whose rules accept a commit with no signature skips the commit if
 /// the union holds no blob under a signature key. A commit with a blob must
 /// pass the verification on each axis of the set. The message of a failure
-/// of a commit with a `named_by` target names the commit and that target.
+/// names the commit. No other commit gets a verification.
 async fn check_signatures(
     rules: &[UpdateRule<'_>],
     commit_meta: &HashMap<Checksum, Bytes>,
     targets: &[Target],
-    dependencies: &[Dependency],
     stored: &HashMap<Checksum, Option<Bytes>>,
 ) -> Checked<()> {
-    let commits = targets
-        .iter()
-        .map(|t| (t.checksum, &t.bytes, t.rules(), t.named_by))
-        .chain(
-            dependencies
-                .iter()
-                .map(|d| (d.checksum, &d.bytes, &d.rules[..], Some(d.named_by))),
-        );
-    for (checksum, bytes, indices, named_by) in commits {
-        let keys = target_keys(rules, indices);
+    for target in targets {
+        let checksum = target.checksum;
+        let keys = target_keys(rules, &target.updates);
         if keys.is_empty() {
             continue;
         }
@@ -1683,17 +1432,14 @@ async fn check_signatures(
         })
         .await
         .map_err(Failure::Internal)?;
-        let subject = match named_by {
-            None => format!("commit {checksum}"),
-            Some(target) => format!("commit {checksum}, a dependency of commit {target}"),
-        };
+        let subject = format!("commit {checksum}");
         let signed = keys.iter().any(|(_, allow_unsigned)| *allow_unsigned)
             && dict.as_ref().is_some_and(has_signature);
         for (held, allow_unsigned) in keys {
             if allow_unsigned && !signed {
                 continue;
             }
-            held.check(&subject, bytes, dict.as_ref())
+            held.check(&subject, &target.bytes, dict.as_ref())
                 .await
                 .map_err(|e| match e {
                     Error::Signature(message) => {
@@ -1891,14 +1637,13 @@ async fn filter_detached(
 
 /// Returns the detached-metadata edits of the session.
 ///
-/// A new commit, and a staged dependency of `dependencies`, gets an edit if it
-/// has a server key or a filtered incoming dict. Each other commit with a
-/// filtered incoming dict also gets an edit. Each commit gets one edit at
-/// most. Each edit takes its stored dict out of `stored`.
+/// A new commit gets an edit if it has a server key or a filtered incoming
+/// dict. Each other commit with a filtered incoming dict, a staged dependency
+/// included, also gets an edit, with no server key. Each commit gets one edit
+/// at most. Each edit takes its stored dict out of `stored`.
 fn plan<'a>(
     rules: &[UpdateRule<'a>],
     targets: &'a [Target],
-    dependencies: &'a [Dependency],
     stored: &mut HashMap<Checksum, Option<Bytes>>,
     mut incoming: HashMap<Checksum, Bytes>,
 ) -> Vec<Edit<'a>> {
@@ -1913,19 +1658,11 @@ fn plan<'a>(
         oversize: None,
     };
     let mut edits = Vec::new();
-    let commits = targets
-        .iter()
-        .map(|t| (t.checksum, &t.bytes, t.rules()))
-        .chain(
-            dependencies
-                .iter()
-                .map(|d| (d.checksum, &d.bytes, &d.rules[..])),
-        );
-    for (checksum, bytes, indices) in commits {
-        let signers = target_signers(rules, indices);
-        let dict = incoming.remove(&checksum);
+    for target in targets {
+        let signers = target_signers(rules, &target.updates);
+        let dict = incoming.remove(&target.checksum);
         if dict.is_some() || !signers.is_empty() {
-            edits.push(edit(checksum, &bytes[..], dict, signers));
+            edits.push(edit(target.checksum, &target.bytes[..], dict, signers));
         }
     }
     for (commit, dict) in incoming {

@@ -1798,112 +1798,74 @@ fn refs(repo: &Repo) -> Vec<(String, Checksum)> {
     block_on(repo.list_refs(None)).unwrap()
 }
 
-/// A staged dependency of a new commit must pass the verification of the
-/// rule of the update. A dependency with no signature, or with a signature of
-/// a key that the rule does not trust, is `signature-required`. The message
-/// names the dependency and the new commit. A signed dependency passes and
-/// gets no ref.
+/// A staged dependency of a new commit gets no verification. A dependency
+/// with no dict passes and gets no dict. A dependency with a signature of a
+/// key that the rule does not trust passes, and keeps that signature. The
+/// dependency gets no ref.
 #[test]
-fn an_unsigned_dependency_is_signature_required() {
+fn an_unsigned_dependency_is_accepted() {
     let dep = build_commit(None, "dependency", no_metadata(), &[]);
     let target = build_commit(None, "target", no_metadata(), &[entry("lib/d", &dep)]);
     let objects = with_tree(&[&dep, &target]);
     let updates = || vec![update("main", Expected::Absent, Some(target.checksum))];
+
     let tmp = TmpDir::new("recv-dep-unsigned");
     let repo = new_repo(&tmp, RepoMode::Archive, "");
-    let before = snapshot(&repo);
-
-    let error = refused(
-        push(
-            &repo,
-            &verify_policy(),
-            &objects,
-            &[client_signed(&target)],
-            updates(),
-            false,
-        ),
-        ErrorCode::SignatureRequired,
-    );
-    let subject = format!(
-        "commit {}, a dependency of commit {}",
-        dep.checksum, target.checksum
-    );
-    assert!(error.message.contains(&subject), "{}", error.message);
-    assert_unchanged(&repo, &before);
-
-    let untrusted = (dep.checksum, signed_dict(&dep.bytes, &[OTHER_SECRET_B64]));
-    refused(
-        push(
-            &repo,
-            &verify_policy(),
-            &objects,
-            &[client_signed(&target), untrusted],
-            updates(),
-            false,
-        ),
-        ErrorCode::SignatureRequired,
-    );
-    assert_unchanged(&repo, &before);
-
     committed(push(
         &repo,
         &verify_policy(),
         &objects,
-        &[client_signed(&target), client_signed(&dep)],
+        &[client_signed(&target)],
         updates(),
         false,
     ));
-    assert!(commit_meta_path(&repo, &dep.checksum).exists());
+    assert!(!commit_meta_path(&repo, &dep.checksum).exists());
+    assert_eq!(refs(&repo), [("main".to_owned(), target.checksum)]);
+
+    let tmp = TmpDir::new("recv-dep-untrusted");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    let untrusted = (dep.checksum, signed_dict(&dep.bytes, &[OTHER_SECRET_B64]));
+    committed(push(
+        &repo,
+        &verify_policy(),
+        &objects,
+        &[client_signed(&target), untrusted],
+        updates(),
+        false,
+    ));
+    assert_eq!(
+        ed25519_signatures(&repo, &dep.checksum),
+        [ed25519_signature(OTHER_SECRET_B64, &dep.bytes)]
+    );
     assert_eq!(refs(&repo), [("main".to_owned(), target.checksum)]);
 }
 
-/// A dependency that only a staged parent of a new commit names is checked
-/// under the rule of the update of the new commit. The parent itself needs
-/// no signature.
+/// A dependency that only a staged parent of a new commit names gets no
+/// verification. The parent itself needs no signature either.
 #[test]
-fn a_dependency_of_a_staged_parent_is_checked_under_the_rule_of_its_target() {
+fn a_dependency_of_a_staged_parent_gets_no_rule() {
     let dep = build_commit(None, "dependency", no_metadata(), &[]);
     let parent = build_commit(None, "parent", no_metadata(), &[entry("lib/d", &dep)]);
     let target = build_commit(Some(parent.checksum), "target", no_metadata(), &[]);
-    let objects = with_tree(&[&dep, &parent, &target]);
-    let updates = || vec![update("main", Expected::Absent, Some(target.checksum))];
     let tmp = TmpDir::new("recv-dep-parent");
     let repo = new_repo(&tmp, RepoMode::Archive, "");
-    let before = snapshot(&repo);
-
-    let error = refused(
-        push(
-            &repo,
-            &verify_policy(),
-            &objects,
-            &[client_signed(&target)],
-            updates(),
-            false,
-        ),
-        ErrorCode::SignatureRequired,
-    );
-    let subject = format!(
-        "commit {}, a dependency of commit {}",
-        dep.checksum, target.checksum
-    );
-    assert!(error.message.contains(&subject), "{}", error.message);
-    assert_unchanged(&repo, &before);
-
     committed(push(
         &repo,
         &verify_policy(),
-        &objects,
-        &[client_signed(&target), client_signed(&dep)],
-        updates(),
+        &with_tree(&[&dep, &parent, &target]),
+        &[client_signed(&target)],
+        vec![update("main", Expected::Absent, Some(target.checksum))],
         false,
     ));
+    assert!(!commit_meta_path(&repo, &dep.checksum).exists());
+    assert!(!commit_meta_path(&repo, &parent.checksum).exists());
 }
 
-/// A staged dependency that only a staged commit outside the staged chain of
-/// each new commit names gets the completeness check alone: no
-/// verification and no server signature.
+/// A staged commit that no update names and that no parent chain reaches,
+/// and the staged dependency that its field 2 names, get the completeness
+/// check alone: no verification and no server signature.
 #[test]
-fn a_dependency_outside_each_staged_chain_gets_no_rule() {
+fn a_staged_commit_outside_each_history_gets_no_rule() {
     let dep = build_commit(None, "dependency", no_metadata(), &[]);
     let other = build_commit(None, "other", no_metadata(), &[entry("lib/d", &dep)]);
     let target = build_commit(None, "target", no_metadata(), &[]);
@@ -2240,16 +2202,14 @@ fn a_dict_for_a_held_dependency_is_dropped() {
     assert_unchanged(&repo, &before);
 }
 
-/// A staged dependency that two new commits name gets each server key of
-/// their rules once, also a key that the list holds two times. A second
-/// session with a new commit that names the dependency, which the repository
-/// now holds, adds no signature to it, also with a new key.
+/// A staged dependency that two new commits name gets no server signature.
+/// Each new commit gets each server key of its rule once, also a key that the
+/// list holds two times.
 #[test]
-fn a_dependency_of_two_targets_gets_each_server_key_once() {
+fn a_dependency_of_two_targets_gets_no_server_signature() {
     let dep = build_commit(None, "dependency", no_metadata(), &[]);
     let a = build_commit(None, "a", no_metadata(), &[entry("lib/d", &dep)]);
     let b = build_commit(None, "b", no_metadata(), &[entry("lib/d", &dep)]);
-    let c = build_commit(None, "c", no_metadata(), &[entry("lib/d", &dep)]);
     let shared = server_signer(SECOND_SERVER_SECRET_B64);
     let policy = ReceivePolicy {
         signers: vec![server_signer(SERVER_SECRET_B64), shared.clone(), shared],
@@ -2268,39 +2228,21 @@ fn a_dependency_of_two_targets_gets_each_server_key_once() {
         ],
         false,
     ));
-    let expected = [
-        ed25519_signature(SERVER_SECRET_B64, &dep.bytes),
-        ed25519_signature(SECOND_SERVER_SECRET_B64, &dep.bytes),
-    ];
-    assert_eq!(ed25519_signatures(&repo, &dep.checksum), expected);
-
-    let policy = ReceivePolicy {
-        signers: vec![
-            server_signer(SERVER_SECRET_B64),
-            server_signer(OTHER_SECRET_B64),
-        ],
-        ..policy
-    };
-    committed(push(
-        &repo,
-        &policy,
-        &with_tree(&[&dep, &c]),
-        &[],
-        vec![update("c", Expected::Absent, Some(c.checksum))],
-        false,
-    ));
-    assert_eq!(ed25519_signatures(&repo, &dep.checksum), expected);
-    assert_eq!(
-        ed25519_signatures(&repo, &c.checksum),
-        [
-            ed25519_signature(SERVER_SECRET_B64, &c.bytes),
-            ed25519_signature(OTHER_SECRET_B64, &c.bytes),
-        ]
-    );
+    assert!(!commit_meta_path(&repo, &dep.checksum).exists());
+    for commit in [&a, &b] {
+        assert_eq!(
+            ed25519_signatures(&repo, &commit.checksum),
+            [
+                ed25519_signature(SERVER_SECRET_B64, &commit.bytes),
+                ed25519_signature(SECOND_SERVER_SECRET_B64, &commit.bytes),
+            ]
+        );
+    }
 }
 
-/// A staged dependency that is also a new commit passes one verification
-/// and gets each server key once.
+/// A staged dependency that is also a new commit passes the verification of
+/// its update, and the refusal names it as a new commit. It gets each server
+/// key of its update once.
 #[test]
 fn a_dependency_that_is_also_a_target_is_signed_once() {
     let dep = build_commit(None, "dependency", no_metadata(), &[]);
@@ -2329,11 +2271,8 @@ fn a_dependency_that_is_also_a_target_is_signed_once() {
         ),
         ErrorCode::SignatureRequired,
     );
-    let subject = format!(
-        "commit {}, a dependency of commit {}",
-        dep.checksum, target.checksum
-    );
-    assert!(error.message.contains(&subject), "{}", error.message);
+    let subject = format!("commit {}: ", dep.checksum);
+    assert!(error.message.starts_with(&subject), "{}", error.message);
     assert_unchanged(&repo, &before);
 
     committed(push(
@@ -2469,53 +2408,34 @@ fn a_partial_held_dependency_that_is_a_new_commit_counts_as_complete() {
     );
 }
 
-/// Field 2 of a new commit that the repository holds gives the rule of its
-/// update to a staged dependency: the dependency must pass the verification,
-/// and the server signs it.
+/// Field 2 of a new commit that the repository holds gives no rule to a
+/// staged dependency: the dependency gets no verification and no server
+/// signature.
 #[test]
-fn a_held_target_gives_its_rule_to_a_staged_dependency() {
+fn a_held_target_gives_no_rule_to_a_staged_dependency() {
     let dep = build_commit(None, "dependency", no_metadata(), &[]);
     let target = build_commit(None, "target", no_metadata(), &[entry("lib/d", &dep)]);
     let policy = ReceivePolicy {
         signers: vec![server_signer(SERVER_SECRET_B64)],
         ..verify_policy()
     };
-    let updates = || vec![update("main", Expected::Absent, Some(target.checksum))];
     let tmp = TmpDir::new("recv-dep-held-target");
     let repo = repo_with_fixture(&tmp, RepoMode::Archive, "");
     hold_commit(&repo, &target);
-    let before = snapshot(&repo);
-    let error = refused(
-        push(
-            &repo,
-            &policy,
-            std::slice::from_ref(&dep),
-            &[client_signed(&target)],
-            updates(),
-            false,
-        ),
-        ErrorCode::SignatureRequired,
-    );
-    let subject = format!(
-        "commit {}, a dependency of commit {}",
-        dep.checksum, target.checksum
-    );
-    assert!(error.message.contains(&subject), "{}", error.message);
-    assert_unchanged(&repo, &before);
-
     committed(push(
         &repo,
         &policy,
         std::slice::from_ref(&dep),
-        &[client_signed(&target), client_signed(&dep)],
-        updates(),
+        &[client_signed(&target)],
+        vec![update("main", Expected::Absent, Some(target.checksum))],
         false,
     ));
+    assert!(!commit_meta_path(&repo, &dep.checksum).exists());
     assert_eq!(
-        ed25519_signatures(&repo, &dep.checksum),
+        ed25519_signatures(&repo, &target.checksum),
         [
-            ed25519_signature(SECRET_B64, &dep.bytes),
-            ed25519_signature(SERVER_SECRET_B64, &dep.bytes),
+            ed25519_signature(SECRET_B64, &target.bytes),
+            ed25519_signature(SERVER_SECRET_B64, &target.bytes),
         ]
     );
 }
@@ -2540,11 +2460,12 @@ fn a_staged_dependency_with_a_stale_marker_counts_as_complete() {
     assert!(!marker(&repo, &dep.checksum).exists(), "the marker goes");
 }
 
-/// The refusal of a dependency that two new commits name names the new
-/// commit of the first update, also when its checksum sorts last.
+/// The refusal of a nested dependency that two new commits name names the
+/// new commit of the first update, also when its checksum sorts last.
 #[test]
-fn a_dependency_refusal_names_the_first_new_commit_in_update_order() {
-    let dep = build_commit(None, "dependency", no_metadata(), &[]);
+fn a_nested_dependency_refusal_names_the_first_new_commit_in_update_order() {
+    let inner = build_commit(None, "inner", no_metadata(), &[]);
+    let dep = build_commit(None, "dependency", no_metadata(), &[entry("lib/i", &inner)]);
     let a = build_commit(None, "a", no_metadata(), &[entry("lib/d", &dep)]);
     let b = build_commit(None, "b", no_metadata(), &[entry("lib/d", &dep)]);
     let (first, last) = if a.checksum > b.checksum {
@@ -2558,28 +2479,66 @@ fn a_dependency_refusal_names_the_first_new_commit_in_update_order() {
     let error = refused(
         push(
             &repo,
-            &verify_policy(),
-            &with_tree(&[&dep, &first, &last]),
-            &[client_signed(&first), client_signed(&last)],
+            &policy(),
+            &with_tree(&[&inner, &dep, &first, &last]),
+            &[],
             vec![
                 update("x", Expected::Absent, Some(first.checksum)),
                 update("y", Expected::Absent, Some(last.checksum)),
             ],
             false,
         ),
-        ErrorCode::SignatureRequired,
+        ErrorCode::Protocol,
     );
-    let subject = format!(
-        "commit {}, a dependency of commit {}",
-        dep.checksum, first.checksum
+    assert_eq!(
+        error.message,
+        format!(
+            "related commits in field 2 of commit {}: dependency lib/d names commit {}, which \
+             has dependencies of its own",
+            first.checksum, dep.checksum
+        )
     );
-    assert!(error.message.contains(&subject), "{}", error.message);
     assert!(
         !error.message.contains(&last.checksum.to_string()),
         "{}",
         error.message
     );
     assert_unchanged(&repo, &before);
+}
+
+/// A staged parent that field 2 of its new commit names gets no
+/// verification and no server signature.
+#[test]
+fn a_staged_parent_that_field_2_names_gets_no_rule() {
+    let parent = build_commit(None, "parent", no_metadata(), &[]);
+    let target = build_commit(
+        Some(parent.checksum),
+        "target",
+        no_metadata(),
+        &[entry("lib/p", &parent)],
+    );
+    let policy = ReceivePolicy {
+        signers: vec![server_signer(SERVER_SECRET_B64)],
+        ..verify_policy()
+    };
+    let tmp = TmpDir::new("recv-dep-parent-named");
+    let repo = new_repo(&tmp, RepoMode::Archive, "");
+    committed(push(
+        &repo,
+        &policy,
+        &with_tree(&[&parent, &target]),
+        &[client_signed(&target)],
+        vec![update("main", Expected::Absent, Some(target.checksum))],
+        false,
+    ));
+    assert!(!commit_meta_path(&repo, &parent.checksum).exists());
+    assert_eq!(
+        ed25519_signatures(&repo, &target.checksum),
+        [
+            ed25519_signature(SECRET_B64, &target.bytes),
+            ed25519_signature(SERVER_SECRET_B64, &target.bytes),
+        ]
+    );
 }
 
 // ---------------------------------------------------------------------------

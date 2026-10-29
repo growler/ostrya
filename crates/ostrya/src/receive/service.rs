@@ -488,10 +488,9 @@ impl ReceiveService {
     ///   the collection id of the repository, and in a repository with no
     ///   collection id each collection binding fails.
     /// - [`remote::Error::SignatureRequired`] if a new commit that the client
-    ///   built fails the signature verification of the policy. A staged
-    ///   dependency that the staged chain of a new commit names, the new
-    ///   commit and its staged parents, also gives this error if it fails the
-    ///   verification. With
+    ///   built fails the signature verification of the policy. A commit that
+    ///   no update names gets no verification, a staged parent and a
+    ///   dependency included. With
     ///   [`allow_unsigned`](super::ReceivePolicy::allow_unsigned), a commit
     ///   with no signature passes, and a commit with a signature that does not
     ///   verify fails.

@@ -19,8 +19,9 @@ use std::time::{Duration, Instant};
 
 use common::receive::{
     ED25519_KEY, OTHER_SECRET_B64, Obj, PIPE_CAP, SECRET_B64, SERVER_SECRET_B64,
-    assert_nothing_published, build_commit, ed25519_signatures, fixture_objects, new_repo, pipe,
-    policy_allowing, returned_code, server_signer, session, signed_dict, staging_entries, trust,
+    assert_nothing_published, build_commit, ed25519_signature, ed25519_signatures, fixture_objects,
+    new_repo, pipe, policy_allowing, returned_code, server_signer, session, signed_dict,
+    staging_entries, trust,
 };
 use common::{COMMIT, TmpDir, file_inventory, foreign_holder, lock_holder_main, tool_fsck};
 use futures_io::AsyncWrite;
@@ -929,11 +930,12 @@ fn verify_policy(refs: &[(&str, &str)]) -> StreamPolicy {
     }
 }
 
-/// A staged dependency that two new commits name must pass the rule of each
-/// of their refs. A dependency with no signature, or with the signature of
-/// one rule alone, is `signature-required`.
+/// A staged dependency that two new commits name gets no verification under
+/// the rules of their refs. A dependency with no dict passes and gets no
+/// signature. A dependency with a signature of a key that no rule trusts
+/// passes and keeps that signature.
 #[test]
-fn a_dependency_passes_the_rule_of_each_target_that_names_it() {
+fn a_dependency_gets_no_rule_of_the_targets_that_name_it() {
     let dep = commit_naming("dependency", &[]);
     let a = commit_naming("a", &[("lib/d", &dep.checksum.as_bytes()[..])]);
     let b = commit_naming("b", &[("lib/d", &dep.checksum.as_bytes()[..])]);
@@ -941,32 +943,93 @@ fn a_dependency_passes_the_rule_of_each_target_that_names_it() {
     let objects = with_tree(&[&dep, &a, &b]);
     let updates = [("a", a.checksum), ("b", b.checksum)];
     let targets = [signed(&a, &[SECRET_B64]), signed(&b, &[OTHER_SECRET_B64])];
+
     let tmp = TmpDir::new("one-way-dep-two-rules");
-    let (repo, before) = empty_repo(&tmp, "");
-
-    for dict in [None, Some(signed(&dep, &[SECRET_B64]))] {
-        let mut meta = targets.to_vec();
-        meta.extend(dict);
-        let result = receive(
-            &repo,
-            &policy,
-            &dependency_stream(&objects, &meta, &updates),
-        );
-        match result {
-            Err(Error::Remote(remote::Error::SignatureRequired(m))) => assert!(
-                m.contains(&format!("commit {}, a dependency of commit", dep.checksum)),
-                "{m}"
-            ),
-            other => panic!("{other:?}"),
-        }
-        assert_nothing_published(&repo, &before);
-    }
-
-    let mut meta = targets.to_vec();
-    meta.push(signed(&dep, &[SECRET_B64, OTHER_SECRET_B64]));
-    let bytes = dependency_stream(&objects, &meta, &updates);
+    let (repo, _) = empty_repo(&tmp, "");
+    let bytes = dependency_stream(&objects, &targets, &updates);
     receive_piped(&repo, &policy, bytes).unwrap();
     assert!(block_on(repo.has_object(ObjectType::Commit, &dep.checksum)).unwrap());
+    assert!(ed25519_signatures(&repo, &dep.checksum).is_empty());
+
+    let tmp = TmpDir::new("one-way-dep-untrusted");
+    let (repo, _) = empty_repo(&tmp, "");
+    let mut meta = targets.to_vec();
+    meta.push(signed(&dep, &[SERVER_SECRET_B64]));
+    let bytes = dependency_stream(&objects, &meta, &updates);
+    receive_piped(&repo, &policy, bytes).unwrap();
+    assert_eq!(
+        ed25519_signatures(&repo, &dep.checksum),
+        [ed25519_signature(SERVER_SECRET_B64, &dep.bytes)]
+    );
+}
+
+/// A dependency of the new commit of ref `a` that is also the new commit of
+/// ref `b` gets the verification of the rule of `b` alone. A signature of the
+/// key of `a` alone is `signature-required`, and the refusal names the
+/// dependency as a new commit. A signature of the key of `b` passes.
+#[test]
+fn a_dependency_that_is_also_a_new_commit_gets_the_rule_of_its_ref() {
+    let dep = commit_naming("dependency", &[]);
+    let a = commit_naming("a", &[("lib/d", &dep.checksum.as_bytes()[..])]);
+    let policy = verify_policy(&[("a", SECRET_B64), ("b", OTHER_SECRET_B64)]);
+    let objects = with_tree(&[&dep, &a]);
+    let updates = [("a", a.checksum), ("b", dep.checksum)];
+
+    let tmp = TmpDir::new("one-way-dep-new-commit");
+    let (repo, before) = empty_repo(&tmp, "");
+    let meta = [signed(&a, &[SECRET_B64]), signed(&dep, &[SECRET_B64])];
+    let result = receive(
+        &repo,
+        &policy,
+        &dependency_stream(&objects, &meta, &updates),
+    );
+    match result {
+        Err(Error::Remote(remote::Error::SignatureRequired(m))) => {
+            assert!(m.starts_with(&format!("commit {}: ", dep.checksum)), "{m}")
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_nothing_published(&repo, &before);
+
+    let meta = [signed(&a, &[SECRET_B64]), signed(&dep, &[OTHER_SECRET_B64])];
+    let bytes = dependency_stream(&objects, &meta, &updates);
+    receive_piped(&repo, &policy, bytes).unwrap();
+    assert_eq!(
+        block_on(repo.list_refs(None)).unwrap(),
+        [("a".to_owned(), a.checksum), ("b".to_owned(), dep.checksum)]
+    );
+}
+
+/// A dependency whose bytes do not hash to the checksum that field 2 names
+/// is `checksum-mismatch`. The stream sends the bytes of another commit
+/// under the checksum of the dependency, and nothing is published.
+#[test]
+fn a_dependency_with_the_bytes_of_another_commit_is_checksum_mismatch() {
+    let dep = commit_naming("dependency", &[]);
+    let other = commit_naming("other", &[]);
+    let target = commit_naming("target", &[("lib/d", &dep.checksum.as_bytes()[..])]);
+    let forged = Obj {
+        bytes: other.bytes.clone(),
+        ..dep.clone()
+    };
+    let tmp = TmpDir::new("one-way-dep-forged");
+    let (repo, before) = empty_repo(&tmp, "");
+    let bytes = dependency_stream(
+        &with_tree(&[&forged, &target]),
+        &[],
+        &[("main", target.checksum)],
+    );
+    match receive(&repo, &StreamPolicy::default(), &bytes) {
+        Err(Error::Remote(remote::Error::ChecksumMismatch(m))) => assert_eq!(
+            m,
+            format!(
+                "commit object {}: the bytes hash to {}",
+                dep.checksum, other.checksum
+            )
+        ),
+        other => panic!("{other:?}"),
+    }
+    assert_nothing_published(&repo, &before);
 }
 
 /// A dependency that the stream neither stages nor finds in the repository
@@ -1840,12 +1903,11 @@ mod export {
         }
     }
 
-    /// The receiver applies the rule of the ref of a new commit to its
-    /// dependency. A signature of the new commit alone is
-    /// `signature-required`, and nothing is published. With a signature of
-    /// the dependency too, the stream commits.
+    /// The receiver applies the rule of the ref of a new commit to that
+    /// commit alone. The source signs the new commit and not its dependency,
+    /// and the stream commits with the whole dependency.
     #[test]
-    fn the_receiver_verifies_the_exported_dependencies() {
+    fn the_receiver_verifies_no_exported_dependency() {
         let tmp = TmpDir::new("one-way-export-dependency-verify-source");
         let source = new_repo(&tmp, RepoMode::Archive, "");
         let (main, dep) = dependency_chain(&source);
@@ -1857,20 +1919,7 @@ mod export {
         };
 
         let target_tmp = TmpDir::new("one-way-export-dependency-verify");
-        let (target, before) = empty_repo(&target_tmp, "");
-        let (received, exported) =
-            export_piped(&source, &target, &policy, exporting(&[("main", main)]));
-        exported.unwrap();
-        match received {
-            Err(Error::Remote(remote::Error::SignatureRequired(m))) => assert!(
-                m.contains(&format!("commit {dep}, a dependency of commit {main}")),
-                "{m}"
-            ),
-            other => panic!("{other:?}"),
-        }
-        assert_nothing_published(&target, &before);
-
-        block_on(source.sign_commit(&dep, &signer)).unwrap();
+        let (target, _) = empty_repo(&target_tmp, "");
         let (received, exported) =
             export_piped(&source, &target, &policy, exporting(&[("main", main)]));
         exported.unwrap();

@@ -3295,8 +3295,10 @@ offer.
 `ostrya push --onto` and `ostrya push-tree` send no dependency. The field 2 of
 a server commit is empty ("Server commit").
 
-The server checks the dependencies of the commits that it stages, and applies
-its signature rules to them ("Commit and CommitReply", checks 6, 8, and 9).
+The server checks the dependencies of the commits that it stages ("Commit and
+CommitReply", check 6). It checks no signature of a dependency and adds no
+server signature to it, unless the dependency is also a new commit (checks 8
+and 9).
 
 ### Dependencies in a one-way stream
 
@@ -4096,23 +4098,23 @@ Each failed check ends the session, and the session writes nothing:
    must pass the check, so a signature of an engine that the trust group does
    not read fails.
 
-   Each staged dependency must pass the verification of the rule of each
-   update whose new commit names it in its staged chain, else
-   `signature-required`. The staged chain of a new commit is the commit and
-   its parents as far as the session staged them. Field 2 of a new commit
-   that the repository holds also counts. The message names the dependency
-   and the first new commit, in the order of the updates, whose staged chain
-   names it. A staged dependency that is also a new commit gets one
-   verification under the rules of both roles. A dependency that the
-   repository holds, and a staged dependency that only commits outside each
-   staged chain name, get no verification.
+   A commit that no update names gets no verification, a staged parent and
+   a dependency included. The checksum of a dependency is in field 2 of a
+   commit of the session. A new commit is that commit, or binds it through
+   the parent checksums of its history, and the signatures of the new
+   commit cover these checksums. The server checks that the bytes of each
+   object hash to the checksum that names it ("Object streams"), so a
+   signature on a dependency adds no trust. A dependency that only a staged
+   commit outside each history names is bound to no new commit. A
+   dependency that is also a new commit gets the verification of its own
+   updates alone, and the message names it as a new commit.
 9. If `[ex-ostrya] keep-detached-related` is `false`, the server drops
    `ostrya.related` from each incoming dict ("The switch of the
    destination"). The server then makes the staged objects durable, and signs each new commit one time with each key
-   of the key `sign` of the client group. It signs each staged dependency
-   that the staged chain of a new commit names, as check 8 states, one time
-   with each distinct key of the rules of these new commits. A dependency
-   that the repository holds gets no signature. It walks the history of each update
+   of the key `sign` of the client group. The server signs no other commit,
+   a staged parent and a dependency included. The incoming dict of each
+   other commit of the session, a staged dependency included, merges into
+   its stored dict with no signature. The server then walks the history of each update
    that needs the fast-forward check. The walk starts at the new commit and
    follows the parents until it reaches the commit of the ref, an absent
    commit, or a root commit. An update of an absent ref needs no walk, so the
@@ -4444,8 +4446,8 @@ repository lock, and `Commit` still takes the update lock ("The update lock").
 The size check of `CommitReply` (check 2 of "Commit and CommitReply")
 applies. The server runs the other `Commit` checks after the end of the
 input. Check 6 checks the dependencies of the staged commits as in a push
-session. A one-way stream adds no server signature, also to a dependency,
-writes no anchor commit, and does not regenerate the summary. It calls no hook of a host application.
+session. A one-way stream adds no server signature, writes no anchor commit,
+and does not regenerate the summary. It calls no hook of a host application.
 
 A one-way stream keeps rules of its own, and a client group does not apply to
 it. A host application gives the rules in code. Each rule has a pattern with
@@ -4455,9 +4457,9 @@ check 8, if it allows a delete, and if it allows an update that is not a
 fast-forward under `force`. Check 4 refuses an update that no rule covers
 and an update whose rule does not accept it, with `ref-denied`. Check 8 with
 trusted keys refuses a commit with no signature. The trusted keys of the rule
-of an update also apply to each staged dependency that the staged chain of
-its new commit names, so a dependency that two new commits name must pass the
-rules of both. Check 11 refuses a delete
+of an update apply to the new commit of that update alone. A dependency gets
+no verification, unless it is also a new commit. Then the rules of its own
+updates apply. Check 11 refuses a delete
 that the rule does not allow with `delete-denied`.
 
 ## The pull session over a stream

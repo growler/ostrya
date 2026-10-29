@@ -60,14 +60,13 @@ impl Repo {
     ///   `allow_delete`. An update that is not a fast-forward needs `force`
     ///   and `allow_non_fast_forward`. With
     ///   [`ReceiveVerify::Keys`](super::ReceiveVerify::Keys), each new commit
-    ///   must pass the verification, and a commit with no signature fails.
-    ///   Each staged dependency that the staged chain of a new commit names
-    ///   must pass the verification of the rule of each such new commit. The
-    ///   staged chain of a new commit is the commit and its staged parents.
+    ///   must pass the verification of the rule of each of its updates, and a
+    ///   commit with no signature fails. A commit that no update names gets
+    ///   no verification, a dependency included.
     /// - The call ignores the `signers` of each rule, `summary_signers`, and
     ///   `update_summary` of `policy`. As a result, the commit adds no server
-    ///   signature, also to a staged dependency, writes no anchor commit, and
-    ///   does not regenerate the summary.
+    ///   signature, writes no anchor commit, and does not regenerate the
+    ///   summary.
     /// - A ref update whose expected state is [`Expected::Commit`] is
     ///   `protocol`. A ref update with no new commit, and a server commit,
     ///   are also `protocol`.

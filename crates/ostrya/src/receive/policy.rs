@@ -60,16 +60,18 @@ pub struct ReceivePolicy {
     pub rules: AccessRules,
     /// The signatures that a new commit must carry.
     ///
-    /// The verification applies to a commit that the client built. A server
-    /// commit gets no verification. It also applies to each staged dependency
-    /// that the staged chain of a new commit names: a commit that the session
-    /// stages and that field 2 of the new commit or of a staged parent of it
-    /// names. A dependency that the repository holds gets no verification.
+    /// The verification applies to each new commit of a ref update that a
+    /// client builds and pushes. A server commit gets no verification. A
+    /// commit that no update names gets no verification, a staged parent and
+    /// a dependency included. The checksum of a dependency is in field 2 of
+    /// a commit. A new commit is that commit, or binds it through the parent
+    /// checksums of its history, and the signatures of the new commit cover
+    /// these checksums.
     pub verify: ReceiveVerify,
     /// The switch that accepts a new commit with no signature.
     ///
     /// The switch applies only with [`ReceiveVerify::Keys`], and only to a
-    /// commit that the client built: a new commit or a staged dependency that
+    /// new commit that the client built, which
     /// [`verify`](ReceivePolicy::verify) applies to. A commit has no
     /// signature if its detached metadata holds no blob under
     /// `ostree.gpgsigs`, `ostree.sign.ed25519`, `ostree.sign.spki`, and
@@ -83,10 +85,9 @@ pub struct ReceivePolicy {
     /// so the list can hold more keys than the client group names groups.
     ///
     /// A new commit is a commit that becomes the new value of a ref. A server
-    /// commit is a new commit too. The server also signs each staged
-    /// dependency that field 2 of a new commit, or of a staged parent of it,
-    /// names, with each key once. A dependency that the repository holds gets
-    /// no signature.
+    /// commit is a new commit too. The server signs no other commit, a staged
+    /// parent and a dependency included. The server signature on a new
+    /// commit covers its field 2 and its parent checksum.
     pub signers: Vec<Arc<ServerSigner>>,
     /// The switch that accepts privileged content in a `bare` repository.
     ///

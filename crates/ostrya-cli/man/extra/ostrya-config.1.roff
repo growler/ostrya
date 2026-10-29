@@ -516,15 +516,15 @@ The claims of the namespace replace \fB\%allow\fR and \fB\%deny\fR of the group.
 A group with no \fB\%tls:\fR or \fB\%tls\-sha256:\fR item refuses the key, with any value.
 .TP
 \fB\%verify\fR (string)
-\fB\%trust:NAME\fR, the trust group that verifies each commit that a client builds and pushes.
-The trust group also verifies each staged dependency: a commit that the session stages and that field 2 of a new commit, or of a staged parent of it, names.
-A dependency that the repository holds gets no verification.
+\fB\%trust:NAME\fR, the trust group that verifies each new commit of a ref update that a client builds and pushes.
+The trust group verifies no other commit: no staged parent and no dependency in field 2 of a commit, unless a ref update also takes that commit as its new commit.
+The checksum of a dependency is in field 2 of a commit.
+A new commit is that commit, or binds it through the parent checksums of its history, and the signatures of the new commit cover these checksums.
 Each other value is refused, \fB\%off\fR and \fB\%remote:NAME\fR included.
 Without the key, the group verifies no signature.
 .TP
 \fB\%allow\-unsigned\fR (boolean)
-Accept a commit that a client builds and pushes, when it has no signature.
-The key applies to each staged dependency that \fB\%verify\fR verifies too.
+Accept a new commit of a ref update that a client builds and pushes, when it has no signature.
 A commit has no signature if its detached metadata holds no blob under \fB\%ostree.gpgsigs\fR, \fB\%ostree.sign.ed25519\fR, \fB\%ostree.sign.spki\fR, and \fB\%ostree.sign.dummy\fR.
 A commit with a signature must verify on each axis of the trust group, also when the key is true, so a signature of an engine that the trust group does not read is refused.
 The default is true without \fB\%verify\fR, and false with \fB\%verify\fR.
@@ -532,8 +532,7 @@ The default is true without \fB\%verify\fR, and false with \fB\%verify\fR.
 .TP
 \fB\%sign\fR (list)
 The key groups whose keys sign each new commit of a ref update of the group, and each server commit of the group.
-The keys also sign each staged dependency that field 2 of a new commit, or of a staged parent of it, names, one time with each key.
-A dependency that the repository holds gets no signature.
+The keys sign no other commit: no staged parent and no dependency in field 2 of a commit, unless a ref update also takes that commit as its new commit.
 A key that already signed a commit adds no signature.
 A name that occurs two times counts one time.
 An empty value is refused.
@@ -776,7 +775,7 @@ A trust group that turns on no check is refused.
 An entry of \fB\%gpgkeypath\fR that names neither a file nor a directory is refused, and so are keyrings that hold no certificate.
 A \fB\%verification\-ENGINE\-key\fR or \fB\%verification\-ENGINE\-file\fR key of an engine that \fB\%sign\-verify\fR does not select is refused.
 \fB\%gpg\-verify\-summary\fR and \fB\%sign\-verify\-summary\fR are refused, because a trust group sets a commit policy alone.
-A trust group checks the commits of a push that a client group with \fB\%verify=trust:NAME\fR accepts, the commits of a pull from a remote with \fB\%trust=NAME\fR, and the commits of \fB\%ostrya pull\-local \-\-trust=NAME\fR.
+A trust group checks the new commits of a push that a client group with \fB\%verify=trust:NAME\fR accepts, the commits of a pull from a remote with \fB\%trust=NAME\fR, and the commits of \fB\%ostrya pull\-local \-\-trust=NAME\fR.
 Thus the keys that \fB\%ostrya remote gpg\-import NAME\fR writes to \fB\%<repo>/NAME.trustedkeys.gpg\fR check no commit of a pull with a trust group, from the key \fB\%trust\fR or from \fB\%\-\-trust\fR.
 The GPG check of the summary of the remote \fB\%NAME\fR still reads them.
 The option \fB\%\-\-trust\fR wins over the key \fB\%trust\fR of the remote that \fB\%\-\-remote\fR names, and needs no \fB\%\-\-remote\fR.

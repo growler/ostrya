@@ -25,8 +25,9 @@
 //! - `Repo::push`, `Repo::push_over_stream`, and `Repo::push_to_bucket` send
 //!   the dependencies of each commit that they offer.
 //! - `Repo::receive` and `Repo::receive_stream` check the dependencies of each
-//!   commit that the session stages, and apply the rules of the ref updates to
-//!   each staged dependency.
+//!   commit that the session stages. They check no signature of a dependency
+//!   and add no server signature to it, unless the dependency is also the new
+//!   commit of a ref update.
 //! - [`Repo::apply_static_delta`] and [`Repo::apply_static_delta_offline`]
 //!   check the dependencies of the target commit before they write an object.
 //! - [`Repo::fsck`] reports each dependency of a checked commit that is

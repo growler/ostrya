@@ -2070,11 +2070,10 @@ fn assert_refused(pushed: Pushed, code: remote::ErrorCode) {
     assert!(outcome.is_err(), "{outcome:?}");
 }
 
-/// Under a server policy with `verify`, a dependency with no signature is
-/// refused, and the server keeps no ref and no dependency. After the client
-/// signs the dependency, the push passes.
+/// Under a server policy with `verify`, a dependency with no signature
+/// passes. The server verifies the source commit alone.
 #[test]
-fn an_unsigned_dependency_is_refused_under_verify() {
+fn an_unsigned_dependency_passes_under_verify() {
     let pair = Pair::new(
         "dependency-verify",
         RepoMode::Archive,
@@ -2084,24 +2083,18 @@ fn an_unsigned_dependency_is_refused_under_verify() {
     let (main, dep) = dependency_chain(&pair.client);
     client_sign(&pair.client, &main);
 
-    let pushed = push_under(&pair, opts(&["main"]), &verify_policy(), |_| {});
-    assert_refused(pushed, remote::ErrorCode::SignatureRequired);
-    assert_eq!(tip(&pair.server, "main"), None);
-    assert!(!has_commit(&pair.server, &dep));
-    assert!(!has_commit(&pair.server, &main));
-
-    client_sign(&pair.client, &dep);
     let (report, outcome) = push_under(&pair, opts(&["main"]), &verify_policy(), |_| {});
     report.unwrap();
     outcome.unwrap();
     assert_eq!(tip(&pair.server, "main"), Some(main));
     assert_complete(&pair.client, &pair.server, &dep);
+    assert!(ed25519_signatures(&pair.server, &dep).is_empty());
 }
 
-/// With depth 1, a dependency of the parent is checked under the rule of the
-/// source commit.
+/// With depth 1, a dependency of the parent gets no verification. The push
+/// passes with a signature on the source commit alone.
 #[test]
-fn with_a_depth_a_dependency_of_the_parent_is_checked_under_the_rule_of_the_source() {
+fn with_a_depth_a_dependency_of_the_parent_gets_no_rule() {
     let pair = Pair::new(
         "dependency-verify-parent",
         RepoMode::Archive,
@@ -2112,17 +2105,12 @@ fn with_a_depth_a_dependency_of_the_parent_is_checked_under_the_rule_of_the_sour
     let parent = commit_related(&pair.client, "main", None, "p", None, &[("boot/d", dep)]);
     let main = commit(&pair.client, "main", Some(parent), "t", None);
     client_sign(&pair.client, &main);
-    let options = || RepoPushOptions {
+    let options = RepoPushOptions {
         depth: Some(1),
         ..opts(&["main"])
     };
 
-    let pushed = push_under(&pair, options(), &verify_policy(), |_| {});
-    assert_refused(pushed, remote::ErrorCode::SignatureRequired);
-    assert!(!has_commit(&pair.server, &dep));
-
-    client_sign(&pair.client, &dep);
-    let (report, outcome) = push_under(&pair, options(), &verify_policy(), |_| {});
+    let (report, outcome) = push_under(&pair, options, &verify_policy(), |_| {});
     report.unwrap();
     outcome.unwrap();
     assert_eq!(tip(&pair.server, "main"), Some(main));
@@ -2130,33 +2118,21 @@ fn with_a_depth_a_dependency_of_the_parent_is_checked_under_the_rule_of_the_sour
     assert_complete(&pair.client, &pair.server, &dep);
 }
 
-/// Under a server policy with `sign`, a staged dependency carries the server
-/// signature once. A later push of a commit that names the held dependency
-/// adds no signature.
+/// Under a server policy with `sign`, a staged dependency gets no server
+/// signature, and the source commit gets the signature of the server key.
 #[test]
-fn a_staged_dependency_carries_the_server_signature_once() {
+fn a_staged_dependency_gets_no_server_signature() {
     let pair = Pair::new("dependency-sign", RepoMode::Archive, RepoMode::Archive, "");
     let (main, dep) = dependency_chain(&pair.client);
     let (report, outcome) = push_under(&pair, opts(&["main"]), &sign_policy(), |_| {});
     report.unwrap();
     outcome.unwrap();
-    let bytes = block_on(pair.server.load_object_bytes(ObjectType::Commit, &dep)).unwrap();
-    let expected = [ed25519_signature(SERVER_SECRET_B64, &bytes)];
-    assert_eq!(ed25519_signatures(&pair.server, &dep), expected);
-
-    let next = commit_related(
-        &pair.client,
-        "main",
-        Some(main),
-        "next",
-        None,
-        &[("boot/uki", dep)],
+    assert!(ed25519_signatures(&pair.server, &dep).is_empty());
+    let bytes = block_on(pair.server.load_object_bytes(ObjectType::Commit, &main)).unwrap();
+    assert_eq!(
+        ed25519_signatures(&pair.server, &main),
+        vec![ed25519_signature(SERVER_SECRET_B64, &bytes)]
     );
-    let (report, outcome) = push_under(&pair, opts(&["main"]), &sign_policy(), |_| {});
-    report.unwrap();
-    outcome.unwrap();
-    assert_eq!(tip(&pair.server, "main"), Some(next));
-    assert_eq!(ed25519_signatures(&pair.server, &dep), expected);
 }
 
 /// A dependency that the server already holds gets no server signature.

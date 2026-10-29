@@ -1,6 +1,6 @@
 [package]
 name = "ostrya-sign"
-description = "Signing and verifying engines for ostrya: dummy, ed25519, spki, and GPG through gpg"
+description = "Signing and verifying engines for ostrya: dummy, ed25519, spki, and GPG, which signs through gpg and verifies in the process"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -22,16 +22,19 @@ sign-spki-ed25519 = ["ed25519-dalek/pkcs8", "dep:der", "dep:spki", "dep:pkcs8", 
 sign-spki-rsa = ["dep:rsa", "dep:der", "dep:spki", "dep:pkcs8", "dep:pem-rfc7468"]
 # The spki engine with each of its key types.
 sign-spki = ["sign-spki-p256", "sign-spki-p384", "sign-spki-ed25519", "sign-spki-rsa"]
+# The GPG verifier and the keyring functions, over rPGP. The feature holds
+# no runtime.
+gpg = ["dep:pgp"]
 sign-gpg = ["dep:ostrya-rt"]
 # The trait `X509Signer`. With a key feature other than `sign-spki-ed25519`,
 # also the X.509 signer of the spki engine. With a key feature, also the
 # verifier that trusts the keys of X.509 certificates.
 sign-x509 = ["dep:x509-cert"]
 
-# docs.rs adds these three features to the default set, so the pages show the
+# docs.rs adds these four features to the default set, so the pages show the
 # items that a feature gates, with a feature badge on each.
 [package.metadata.docs.rs]
-features = ["sign-spki", "sign-gpg", "sign-x509"]
+features = ["sign-spki", "gpg", "sign-gpg", "sign-x509"]
 rustdoc-args = ["--cfg", "docsrs"]
 
 # The gates of the spki engine take the form `any(feature = ...)` over the key
@@ -74,6 +77,12 @@ rsa = { version = "0.9.10", default-features = false, features = [
     "getrandom",
 ], optional = true }
 x509-cert = { version = "0.2.5", default-features = false, optional = true }
+# rPGP reads OpenPGP keyrings and signatures in the process. `default-features
+# = false` is mandatory: the `default` feature reaches `bzip2` and the C
+# library behind it, and the `asm` feature turns on assembly paths. A detached
+# signature carries no compressed packet, so the verification path needs
+# neither.
+pgp = { version = "0.20.0", default-features = false, optional = true }
 
 # The key file reader opens with `O_NONBLOCK` on Unix, so a fifo answers the
 # open rather than waiting for a writer. `std` does not supply the value of

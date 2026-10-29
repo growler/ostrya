@@ -650,7 +650,8 @@ fn a_fifo_gpgkeypath_entry_is_refused_by_name() {
 /// operator did not put there, and no message reports it.
 #[test]
 fn an_oversized_gpgkeypath_entry_is_refused_by_name() {
-    /// The keyring ceiling that `src/gpg.rs` applies to each keyring source.
+    /// The keyring ceiling, `MAX_KEYRING` of `ostrya-sign`, that applies to
+    /// each keyring source.
     const MAX_KEYRING: u64 = 4 * 1024 * 1024;
 
     let tmp = TmpDir::new("pull-verify-gpg-keypath-size");

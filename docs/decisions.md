@@ -65,7 +65,8 @@ feature set and its graph.
 - `ed25519-dalek` -- the ed25519 sign engine and the Ed25519 key type of the
   spki sign engine, in `ostrya-sign`.
 - `p256` -- the spki sign engine, in `ostrya-sign`.
-- `pgp` -- OpenPGP keyring parsing and signature verification.
+- `pgp` -- OpenPGP keyring parsing and signature verification, in
+  `ostrya-sign` under the feature `gpg`.
 - `hyper` -- the HTTP/1.1 and HTTP/2 engine of `ostrya-fetch` and
   `ostrya-server`. Both crates take version 1.11.1 or later. Version 1.11.0
   can keep the last chunk of a response body in its write buffer when the
@@ -412,6 +413,14 @@ policy give each verdict.
 
 The GPG verifier verifies in the call to `Verifier::verify`, as the other
 verifiers do, and the caller selects the thread.
+
+The GPG verifier, the parse of a keyring, the key listing, and the keyring
+merge of an import are in `ostrya-sign`, next to the GPG signer, under the
+feature `gpg`. So one crate parses OpenPGP, and a build with `gpg` holds no
+runtime. `ostrya` reads and writes the keyring files, takes the locks, and
+holds the constructors that read the ostree keyring paths, as the trait
+`FromOstreeKeyrings`. A second parse in `ostrya` for the import and the
+listing was rejected, because two crates would then parse OpenPGP.
 
 ## The signature policy of a local pull
 

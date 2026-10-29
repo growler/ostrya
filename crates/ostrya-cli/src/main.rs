@@ -68,7 +68,7 @@ use ostrya::{
     load_sign_keys_from, to_text, to_text_unannotated, validate_refspec,
 };
 #[cfg(feature = "gpg")]
-use ostrya::{GpgSigner, GpgVerifier, SignatureInfo};
+use ostrya::{FromOstreeKeyrings, GpgSigner, GpgVerifier, SignatureInfo};
 #[cfg(feature = "spki")]
 use ostrya::{SpkiSigner, SpkiVerifier, spki_public_keys, spki_secret_key_lines, spki_secret_keys};
 
@@ -11173,7 +11173,7 @@ fn show_gpg_verifier(repo_path: &Path, args: &ShowArgs) -> Result<GpgVerifier> {
         found.sort();
         paths.extend(found);
     }
-    GpgVerifier::from_keyring_files(paths)
+    Ok(GpgVerifier::from_keyring_files(paths)?)
 }
 
 /// Returns the last 16 hex digits of a fingerprint.
@@ -13980,7 +13980,7 @@ fn gpg_verifier(_: &Path, _: &SignArgs) -> Result<Box<dyn Verifier>> {
 #[cfg(feature = "gpg")]
 fn gpg_trust(repo_path: &Path, args: &SignArgs) -> Result<GpgVerifier> {
     if !args.keys_file.is_empty() {
-        return GpgVerifier::from_keyring_files(&args.keys_file);
+        return Ok(GpgVerifier::from_keyring_files(&args.keys_file)?);
     }
     match &args.remote {
         Some(remote) => GpgVerifier::for_remote(repo_path, remote),

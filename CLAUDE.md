@@ -157,8 +157,8 @@ operating system:
   `windows-link`, which emits them in the `raw-dylib` form. These crates link
   `ws2_32`, `crypt32`, and other system libraries. `getrandom` links
   `bcryptprimitives` in the `raw-dylib` form itself. `ostrya-sign` reaches
-  `getrandom` 0.2.17 through `p256`, `p384`, and `rsa`, and that version
-  links `bcrypt` and `advapi32` with `#[link]` attributes.
+  `getrandom` 0.2.17 through `p256`, `p384`, `rsa`, and `pgp`, and that
+  version links `bcrypt` and `advapi32` with `#[link]` attributes.
 
 These libraries are part of the operating system. The build compiles no C
 source for them, and the port ships no copy of them. No crate in the list
@@ -270,14 +270,18 @@ begins only once its dependency set is agreed.
 
 ### Authorized: the `pgp` crate
 
-`pgp` 0.20.0 (rPGP) is authorized for `crates/ostrya` alone. It supplies
-in-process GPG signature verification and key management. Each term below is
-measured on the resolved dependency graph.
+`pgp` 0.20.0 (rPGP) is authorized for `crates/ostrya-sign` alone, as an
+optional dependency behind the feature `gpg`. It supplies in-process GPG
+signature verification and key management: `GpgVerifier`, the parse of a
+keyring, the key listing, and the keyring merge of an import. `ostrya`
+reaches it through its feature `verify-gpg`, which turns on `gpg` of
+`ostrya-sign`, and names no item of the crate. Each term below is measured
+on the resolved dependency graph.
 
 - License `MIT OR Apache-2.0`.
 - Minimum supported Rust version 1.88. The workspace pins 1.92, so the
   requirement holds.
-- `default-features = false` is mandatory.
+- `default-features = false` is mandatory, and no feature is turned on.
 - The `default` feature stays off. It pulls `bzip2` 0.6, whose own default
   feature pulls `libbz2-rs-sys` 0.2.5 under license `bzip2-1.0.6`, which the
   list in "Requirement: permissive licenses only" does not carry, and whose
@@ -285,16 +289,33 @@ measured on the resolved dependency graph.
   compressed packet, so the verification path has no use for the feature.
 - The `asm` feature stays off. It pulls `sha1-asm` and turns on the assembly
   paths in `sha2`.
-- With `default-features = false` the graph holds 156 packages under 155
-  distinct names, measured with `cargo tree -p pgp -e normal,build`, of which
-  91 were new to `Cargo.lock` when the crate was authorized. One name appears
-  at two versions, `serdect` 0.2.0 and 0.3.0. No package in the graph declares
-  a `links` key, and no package name in it ends in `-sys`.
+- With `default-features = false` the graph holds 158 packages under 157
+  distinct names, measured with `cargo tree -p pgp -e normal,build`, which
+  reads the features the workspace resolves. 91 of these packages were new
+  to `Cargo.lock` when the crate was authorized. One name appears at two
+  versions, `serdect` 0.2.0 and 0.3.0. `der_derive` and `flagset` are in it
+  because `x509-cert` turns on the features `derive` and `flagset` of `der`.
+  With `--target all` it holds 163 packages under 161 distinct names, adding
+  `fiat-crypto` 0.2.9, `serde_derive` 1.0.229, `syn` 3.0.3, `wasi`
+  0.11.1+wasi-snapshot-preview1, and `zerocopy-derive` 0.8.56.
+  `cargo metadata --format-version 1 --all-features` counts the same 163
+  packages under 161 distinct names for the closure.
+- A build of `ostrya-sign` with `gpg` alone holds 153 packages under 152
+  distinct names on the host target, measured with
+  `cargo tree -p ostrya-sign --no-default-features --features gpg
+  -e normal,build`. The count includes `ostrya-sign`, `ostrya-core`, and
+  `ostrya-gvariant`. With `--target all` it holds 159 packages under 157
+  distinct names. Against a build of `ostrya-sign` with no feature, the
+  build adds 122 packages. The graph holds no `ostrya-rt`.
+- No package in the graph declares a `links` key, and no package name in it
+  ends in `-sys`.
 - Every license in the graph is permissive by the rule in "Requirement:
-  permissive licenses only". Nine packages state a permissive choice in the
+  permissive licenses only". Eight packages state a permissive choice in the
   legacy slash form, `A/B` or `A / B`. The CI license guard must normalize
-  both forms to `A OR B` before it matches, so these nine pass and a copyleft
-  license still fails.
+  both forms to `A OR B` before it matches, so these eight pass and a
+  copyleft license still fails.
+- The entry `pgp` is in the dependency list of `ostrya-sign`, and in no
+  other dependency list of `Cargo.lock`.
 
 ### Authorized: the `url` crate
 
@@ -401,7 +422,8 @@ dependency graph.
   default features `std` and `pem` stay off: the engine reads PEM with
   `pem-rfc7468` and gives each error its own message. The features `hazmat`,
   `nightly`, `pkcs5`, and `serde` stay off. `pgp` takes the default features
-  of `rsa`, so a build with `verify-gpg` also turns on `std` and `pem`.
+  of `rsa`, so a build with the feature `gpg` of `crates/ostrya-sign` also
+  turns on `std` and `pem`.
 - The engine does not use the key decoders of the crate.
   `RsaPublicKey::new` caps the modulus at `RsaPublicKey::MAX_SIZE`, 4096
   bits, and the SubjectPublicKeyInfo decoder calls it. The private-key
@@ -468,8 +490,8 @@ resolved dependency graph.
 - License `Apache-2.0 OR MIT`.
 - `default-features = false` is mandatory, with the features `ecdsa`,
   `pkcs8`, and `std`, as `p256` takes. The features `pem` and `ecdh` stay
-  off. `pgp` takes the default features of `p384`, so a build with
-  `verify-gpg` also turns on `pem` and `ecdh`.
+  off. `pgp` takes the default features of `p384`, so a build with the
+  feature `gpg` of `crates/ostrya-sign` also turns on `pem` and `ecdh`.
 - The feature `ecdsa` turns on `sha384`, so the default `Signer` and
   `Verifier` of the crate hash with SHA-384. The engine does not call them. `sign_prehash` makes the
   RFC 6979 nonce with HMAC-SHA-384 for each prehash, so a signature of the

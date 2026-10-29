@@ -31,7 +31,8 @@ use std::sync::Arc;
 use common::TmpDir;
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, DummySigner,
-    DummyVerifier, GpgSigner, GpgVerifier, MutableTree, Repo, RepoMode, Signer, Verifier,
+    DummyVerifier, FromOstreeKeyrings, GpgSigner, GpgVerifier, MutableTree, Repo, RepoMode, Signer,
+    Verifier,
 };
 use ostrya_rt::block_on;
 

@@ -28,9 +28,7 @@ use pgp::crypto::public_key::PublicKeyAlgorithm;
 use pgp::packet::{PublicKey, Signature, SignatureType, SubpacketData};
 use pgp::types::{Fingerprint, KeyDetails, SignedUser, Tag, Timestamp};
 
-use ostrya_sign::{Error, Result};
-
-use crate::sign::{SignatureInfo, VerifyOutcome};
+use crate::{Error, Result, SignatureInfo, VerifyOutcome};
 
 /// The maximum size of one stored signature blob. The parser reads the whole
 /// blob in memory. One detached signature is a few hundred bytes, so one
@@ -48,7 +46,7 @@ const MAX_SIGNATURE_PACKETS: usize = 64;
 /// signature among several makes the outcome valid.
 ///
 /// The work is public-key cryptography over untrusted input.
-/// [`Verifier::verify`](crate::sign::Verifier::verify) for
+/// [`Verifier::verify`](crate::Verifier::verify) for
 /// [`GpgVerifier`](super::GpgVerifier) calls this function, and its caller
 /// selects the thread.
 pub(super) fn verify_signatures(
@@ -1229,7 +1227,8 @@ mod tests {
     use std::process::Command;
 
     use super::*;
-    use crate::gpg::{GpgVerifier, STATUS_PREFIX, parse_epoch, remove_home_sockets, scratch_dir};
+    use crate::gpg::STATUS_PREFIX;
+    use crate::gpg::verifier::{GpgVerifier, parse_epoch, remove_home_sockets, scratch_dir};
 
     /// The payload every fixture signs.
     const PAYLOAD: &[u8] = b"ostrya commit payload";
@@ -1455,7 +1454,9 @@ mod tests {
                 .arg("--desig-revoke")
                 .arg(key);
             answer(cmd, b"y\n0\n\ny\n", "gpg --desig-revoke");
-            crate::gpg::dearmor(&std::fs::read(&path).unwrap()).unwrap()
+            crate::gpg::verifier::dearmor(&std::fs::read(&path).unwrap())
+                .unwrap()
+                .into_owned()
         }
 
         /// Returns the exported secret key. `gpg` writes it unprotected because
@@ -1475,7 +1476,9 @@ mod tests {
         fn revocation_packet(&self) -> Vec<u8> {
             let text = std::fs::read_to_string(self.revocation_path()).unwrap();
             let at = text.find("-----BEGIN PGP").unwrap();
-            let packet = crate::gpg::dearmor(&text.as_bytes()[at..]).unwrap();
+            let packet = crate::gpg::verifier::dearmor(&text.as_bytes()[at..])
+                .unwrap()
+                .into_owned();
             assert_eq!(split_packets(&packet).len(), 1);
             packet
         }

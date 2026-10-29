@@ -48,7 +48,7 @@
 //! - `sign-spki-p384`: the `spki` module with the ECDSA P-384 key type.
 //! - `sign-spki-ed25519`: the `spki` module with the Ed25519 key type.
 //! - `sign-spki-rsa`: the `spki` module with the RSA key type. A build without one of the four key features refuses a key of that type.
-//! - `verify-gpg`: the `gpg` module, GPG verification and keyring management.
+//! - `verify-gpg`: the `gpg` module: the GPG verifier of `ostrya-sign` with the trait `FromOstreeKeyrings`, which reads the ostree keyring paths, and the keyring management of a remote. It turns on the feature `gpg` of `ostrya-sign`.
 //! - `sign-gpg`: `GpgSigner`, which signs with the `gpg` command. It turns on `verify-gpg`.
 //! - `sign-x509`: `X509Signer`, the trait of a signer with an X.509 certificate chain for a CMS signature. With `sign-spki-p256`, `sign-spki-p384`, or `sign-spki-rsa`, also `X509SpkiSigner` and `SpkiSigner::with_certificates`. With one of the four key features, also `SpkiVerifier::from_certificates`.
 //! - `receive`: the `receive` module, the receive side of a push.
@@ -195,7 +195,7 @@ pub use fsck::{
 pub use gpg::GpgSigner;
 #[cfg(feature = "verify-gpg")]
 #[doc(hidden)]
-pub use gpg::{GpgKey, GpgVerifier};
+pub use gpg::{FromOstreeKeyrings, GpgKey, GpgVerifier};
 pub use hashing::{HashingReader, HashingWriter, VerifyingReader};
 pub use lock::LockKind;
 #[doc(hidden)]

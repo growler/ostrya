@@ -28,7 +28,8 @@ jobs:
       # breaks in a build of that crate with its default features. This step
       # builds the workspace with every feature, then each published crate
       # alone with its default features, then `ostrya` with `verify-gpg`
-      # without `sign-gpg`, which holds the `gpg` module without `GpgSigner`.
+      # without `sign-gpg`, which holds the GPG verifier of `ostrya-sign`
+      # without `GpgSigner`, then `ostrya-sign` with `gpg` alone.
       - name: Rustdoc
         env:
           RUSTDOCFLAGS: -D warnings
@@ -41,6 +42,7 @@ jobs:
             cargo doc -p "$crate" --no-deps
           done
           cargo doc -p ostrya --no-deps --no-default-features --features smol,verify-gpg
+          cargo doc -p ostrya-sign --no-deps --no-default-features --features gpg
 
       # PCRE2 is the second C library in the tree, and it belongs to the
       # unpublished binary alone: `ostrya-cli` compiles the `commit
@@ -227,10 +229,18 @@ jobs:
         run: cargo check -p ostrya-cli --no-default-features --features smol,send
 
       # `ostrya-sign` holds a runtime only under `sign-gpg`. This compiles the
-      # crate with no runtime backend, so a runtime item placed outside that
-      # feature fails here.
+      # crate with the spki engine and the GPG verifier and with no runtime
+      # backend, so a runtime item placed outside that feature fails here.
       - name: ostrya-sign without a runtime compiles
-        run: cargo check -p ostrya-sign --no-default-features --features sign-spki
+        run: cargo check -p ostrya-sign --no-default-features --features sign-spki,gpg
+
+      # The feature `gpg` holds the GPG verifier and no runtime. These steps
+      # build the crate with `gpg` alone, with no warning, and run its unit
+      # tests in that build.
+      - name: ostrya-sign with the GPG verifier feature alone compiles
+        run: cargo clippy -p ostrya-sign --no-default-features --features gpg --all-targets -- -D warnings
+      - name: The ostrya-sign unit tests pass with the GPG verifier feature alone
+        run: cargo test -p ostrya-sign --no-default-features --features gpg --lib
 
       # Each key feature of the spki engine turns on the code that the key
       # types share. These steps build the engine with one key feature alone,
@@ -296,8 +306,8 @@ jobs:
             cargo check --target "$target" -p ostrya-remote --no-default-features --features tokio
             cargo check --target "$target" -p ostrya-remote --features s3
             cargo check --target "$target" -p ostrya-remote --no-default-features --features tokio,s3
-            cargo check --target "$target" -p ostrya-sign --features sign-spki,sign-gpg,sign-x509
-            cargo check --target "$target" -p ostrya-sign --no-default-features --features tokio,sign-spki,sign-gpg,sign-x509
+            cargo check --target "$target" -p ostrya-sign --features sign-spki,gpg,sign-gpg,sign-x509
+            cargo check --target "$target" -p ostrya-sign --no-default-features --features tokio,sign-spki,gpg,sign-gpg,sign-x509
           done
 
       # `cargo check` does no code generation, so it does not assemble the

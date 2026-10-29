@@ -4060,7 +4060,8 @@ records. Twelve divergences stand:
   trust value and carries no part of a transferable public key: with those
   packets dropped, the tool's keyring holds the packets the port's holds, in the
   same order, measured byte for byte over a key carrying a signing subkey
-  (`crates/ostrya/src/gpg.rs`, `the_trust_packets_are_the_whole_difference`).
+  (`crates/ostrya-sign/src/gpg/verifier.rs`,
+  `the_trust_packets_are_the_whole_difference`).
   The tool's file is the longer one by those packets alone, whose size varies
   from one to the next. Each implementation reads the keyring the other
   wrote: `ostree remote gpg-list-keys` and
@@ -4095,7 +4096,7 @@ records. Twelve divergences stand:
     holding no character other than whitespace. Both read a hex selector as a
     key alone: over a certificate whose user id opens `DEADBEEF`, neither takes
     the key for `DEADBEEF`
-    (`crates/ostrya/src/gpg.rs`,
+    (`crates/ostrya-sign/src/gpg/verifier.rs`,
     `a_selector_the_key_reader_does_not_carry_names_nothing` and
     `a_user_id_selector_folds_ascii_case_alone`, hold the port against
     `gpg --export` over each of those forms);
@@ -4150,7 +4151,7 @@ records. Twelve divergences stand:
   implementation reads the keyring the other wrote: `ostree remote gpg-list-keys`
   over the port's file reports the key and marks it `(revoked)`, and
   `ostrya remote gpg-list-keys` over the tool's file reports the key
-  (`crates/ostrya/src/gpg.rs`,
+  (`crates/ostrya-sign/src/gpg/verifier.rs`,
   `a_revoked_re_export_replaces_the_held_certificate`, states the same
   comparison against the keyring GnuPG writes for the same two imports).
 
@@ -4189,7 +4190,7 @@ records. Twelve divergences stand:
   expiry no later than the held one leaves the port's keyring at the bytes it
   held, so a shortened expiry does not reach a remote's trusted set, and a held
   certificate that revokes its key takes no expiry replacement
-  (`crates/ostrya/src/gpg.rs`,
+  (`crates/ostrya-sign/src/gpg/verifier.rs`,
   `an_expiry_extension_replaces_the_held_certificate`,
   `an_earlier_expiry_leaves_the_held_certificate`, and
   `a_revoked_key_takes_no_expiry_replacement`).
@@ -4272,7 +4273,7 @@ records. Twelve divergences stand:
   anyone stapled onto an offered certificate leaves the keyring at the bytes it
   held: one no self-signature designates, and one a designation names whose
   signature does not verify over the certificate it stands on
-  (`crates/ostrya/src/gpg.rs`,
+  (`crates/ostrya-sign/src/gpg/verifier.rs`,
   `a_stapled_revocation_does_not_replace_the_held_certificate`,
   `a_designated_revokers_revocation_replaces_the_held_certificate`,
   `an_offered_revoker_certificate_resolves_the_revocation`, and
@@ -4296,7 +4297,8 @@ records. Twelve divergences stand:
   readable as an OpenPGP keyring` at exit 1 and leaves the file byte for byte
   as it stood -- a revoked re-export of a key it holds, a re-export stating a
   later expiry, and a certificate for a key it does not hold alike
-  (`crates/ostrya/src/gpg.rs`, `an_unframeable_keyring_takes_no_import`).
+  (`crates/ostrya-sign/src/gpg/verifier.rs`,
+  `an_unframeable_keyring_takes_no_import`).
   Measured over a keyring the tool's own import wrote with one `0xff` byte
   appended, the tool reports `Imported 0 GPG keys` at exit 0 and writes
   nothing, `ostree remote gpg-list-keys` prints nothing at exit 0, and
@@ -4390,11 +4392,11 @@ Cookie-jar support needs its own design pass against that refusal.
 ## GPG verification differences
 
 The port verifies a GPG signature in the process, under its own trust and
-validity policy. The rustdoc of `GpgVerifier` and of the module `gpg::verify`
-in `crates/ostrya` states each rule of the policy, and the `gpgv` 2.4.9
-behavior that the rule reproduces. `crates/ostrya/tests/verify_gpg_agreement.rs`
-compares the port with `gpgv` over a fixture matrix, and declares each
-difference that its fixtures reach.
+validity policy. The rustdoc of `GpgVerifier` and of the module
+`gpg::verifier::verify` in `crates/ostrya-sign` states each rule of the
+policy, and the `gpgv` 2.4.9 behavior that the rule reproduces.
+`crates/ostrya/tests/verify_gpg_agreement.rs` compares the port with `gpgv`
+over a fixture matrix, and declares each difference that its fixtures reach.
 
 Seven differences from GnuPG 2.4.9 stand. None of them is a fact of the
 repository. Each one can make a verdict of the port part from the verdict of

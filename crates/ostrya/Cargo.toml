@@ -35,7 +35,7 @@ sign-spki = [
     "sign-spki-rsa",
     "ostrya-sign/sign-spki",
 ]
-verify-gpg = ["dep:pgp"]
+verify-gpg = ["ostrya-sign/gpg"]
 sign-gpg = ["verify-gpg", "ostrya-sign/sign-gpg"]
 # The trait `X509Signer`, and with the spki key features, the X.509 signer
 # and the X.509 verifier of the spki engine.
@@ -112,12 +112,6 @@ pin-project-lite = "0.2"
 futures-io = "0.3"
 futures-lite = "2"
 smol-tar = { version = "0.1.7", default-features = false, features = ["smol"] }
-# rPGP reads OpenPGP keyrings and signatures in the process. `default-features
-# = false` is mandatory: the `default` feature reaches `bzip2` and the C
-# library behind it, and the `asm` feature turns on assembly paths. A detached
-# signature carries no compressed packet, so the verification path needs
-# neither.
-pgp = { version = "0.20.0", default-features = false, optional = true }
 
 [dev-dependencies]
 ostrya-rt = { workspace = true }

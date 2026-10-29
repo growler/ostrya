@@ -27,7 +27,7 @@ use rustix::io::Errno;
 use crate::config::{Remote, SignVerify, valid_remote_name};
 use crate::error::{Error, Result};
 #[cfg(feature = "verify-gpg")]
-use crate::gpg::read_keyring_fd;
+use crate::gpg::{FromOstreeKeyrings, read_keyring_fd};
 use crate::pull::PullVerify;
 use crate::repo::Repo;
 use crate::sign::{
@@ -968,8 +968,7 @@ async fn gpg_verifier(repo: &Repo, source: &KeySource<'_>) -> Result<Arc<dyn Ver
         KeySource::Trust { name, section } => {
             let keypath = section.gpgkeypath()?;
             let key = format!("[ex-ostrya trust \"{name}\"] gpgkeypath");
-            ostrya_rt::unblock(move || crate::gpg::GpgVerifier::from_keypath(&key, &keypath))
-                .await?
+            ostrya_rt::unblock(move || crate::gpg::from_keypath(&key, &keypath)).await?
         }
     };
     Ok(Arc::new(verifier))
@@ -1125,7 +1124,7 @@ fn read_sign_keys(
 }
 
 /// Reads the `<remote>.trustedkeys.gpg` file of the repository, up to
-/// [`MAX_KEYRING`](crate::gpg::MAX_KEYRING) bytes.
+/// [`MAX_KEYRING`](ostrya_sign::MAX_KEYRING) bytes.
 ///
 /// Returns `None` if the repository holds no such file. The name resolves
 /// through the repository descriptor on the blocking pool. A keyring on a slow
@@ -1609,8 +1608,8 @@ mod tests {
     #[cfg(feature = "verify-gpg")]
     #[test]
     fn an_oversized_repository_keyring_is_refused_by_name() {
-        use crate::gpg::MAX_KEYRING;
         use crate::{CreateOptions, RepoMode};
+        use ostrya_sign::MAX_KEYRING;
 
         let dir = std::env::temp_dir().join(format!(
             "ostrya-verify-keyring-{}-{}",
@@ -1893,8 +1892,8 @@ mod tests {
     #[cfg(feature = "verify-gpg")]
     #[test]
     fn a_source_without_the_repository_keyring_does_not_read_it() {
-        use crate::gpg::MAX_KEYRING;
         use crate::{CreateOptions, RepoMode};
+        use ostrya_sign::MAX_KEYRING;
 
         let dir = std::env::temp_dir().join(format!(
             "ostrya-verify-nokeyring-{}-{}",

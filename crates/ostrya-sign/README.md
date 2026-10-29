@@ -8,8 +8,9 @@ The engines that sign and verify ostree commits and summaries.
 
 A caller signs a commit or a summary with a `Signer` and verifies it with
 a `Verifier`. Each engine stores its signatures under its own key in the
-detached metadata. The `ostrya` crate reads and writes this metadata and
-loads the system key store. The crate compiles on Linux, macOS, and Windows.
+detached metadata. The `ostrya` crate reads and writes this metadata, loads
+the system key store, and reads the GPG keyrings of the ostree paths. The
+crate compiles on Linux, macOS, and Windows.
 
 A `Verifier` verifies in the call to `Verifier::verify`, so a program
 with no async runtime can verify. A `Signer` returns a future.
@@ -25,6 +26,9 @@ API documentation: <https://docs.rs/ostrya-sign>
 - `read_key_file` reads a key file, and `SignKeys` holds the keys.
 - `X509Signer`, with the feature `sign-x509`, is the trait of a signer
   with an X.509 certificate chain, for a CMS signature.
+- `GpgVerifier`, with the feature `gpg`, is the GPG verifier.
+  `gpg_keyring_keys` lists the keys of a keyring, and `gpg_offered_keys`
+  and `gpg_merge_keyring` merge a keyring into another.
 
 ## Features
 
@@ -47,7 +51,12 @@ API documentation: <https://docs.rs/ostrya-sign>
   signatures with SHA-256. The engine has the items of `sign-spki-p256`.
   A build without one of the four key features refuses a key of that
   type, with a message that names its feature.
-- `sign-gpg`: `GpgSigner`, which signs with the `gpg` command.
+- `gpg`: `GpgVerifier`, which verifies GPG signatures in the process
+  with rPGP, and the keyring functions `gpg_keyring_keys`,
+  `gpg_offered_keys`, and `gpg_merge_keyring`, with `GpgKey`,
+  `GpgOfferedKeys`, and `MAX_KEYRING`. The feature holds no runtime.
+- `sign-gpg`: `GpgSigner`, which signs with the `gpg` command. It does
+  not turn on `gpg`.
 - `sign-x509`: the trait `X509Signer`. With `sign-spki-p256`,
   `sign-spki-p384`, or `sign-spki-rsa`, also `X509SpkiSigner`, the spki
   signer with an X.509 certificate chain, which

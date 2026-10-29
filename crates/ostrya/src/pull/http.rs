@@ -745,9 +745,9 @@ impl Repo {
         refuse_remote_collection(&opts)?;
         check_remote_option(&opts)?;
         check_static_deltas(&opts)?;
-        // `drive` reads the rule again. This read refuses a value that is not
-        // a boolean before the first request.
-        RelatedRule::of(self.config())?;
+        // The pull reads the rule one time, here. A value that is not a
+        // boolean stops the pull before its first request.
+        let related = RelatedRule::of(self.config())?;
         let edges = take_static_deltas(&mut opts).await?;
         // The endpoint is resolved first, so a remote the config does not
         // describe reports that before a policy is resolved for it.
@@ -767,6 +767,7 @@ impl Repo {
         self.run_session(
             connection,
             trust,
+            related,
             opts,
             Wanted::Config(remote),
             subpaths,
@@ -901,10 +902,12 @@ impl Repo {
     ) -> Result<PullStats> {
         let started = Instant::now();
         let checked = match RelatedRule::of(self.config()) {
-            Ok(_) => check_session_pull(&mut opts).await,
+            Ok(related) => check_session_pull(&mut opts)
+                .await
+                .map(|checked| (related, checked)),
             Err(e) => Err(e),
         };
-        let (subpaths, edges) = match checked {
+        let (related, (subpaths, edges)) = match checked {
             Ok(checked) => checked,
             Err(e) => {
                 // The refusal comes before the first request. The result of
@@ -916,6 +919,7 @@ impl Repo {
         self.run_session(
             session.into(),
             trust,
+            related,
             opts,
             Wanted::Named,
             subpaths,
@@ -938,6 +942,7 @@ impl Repo {
         &self,
         connection: Connection,
         trust: PullTrust,
+        related: RelatedRule,
         opts: PullOptions,
         wanted: Wanted<'_>,
         subpaths: Option<Subpaths>,
@@ -954,6 +959,7 @@ impl Repo {
             source,
             &opts,
             &verification,
+            related,
             subpaths,
             edges,
             &counters,
@@ -972,6 +978,7 @@ impl Repo {
         source: RemoteSource,
         opts: &PullOptions,
         verification: &Verification,
+        related: RelatedRule,
         subpaths: Option<Subpaths>,
         edges: Option<Edges>,
         counters: &PullCounters,
@@ -994,6 +1001,7 @@ impl Repo {
                 opts,
                 place,
                 verification,
+                related,
                 subpaths,
                 edges,
                 counters,
@@ -1104,6 +1112,7 @@ impl Repo {
         opts: &PullOptions,
         place: RefPlace<'_>,
         verification: &Verification,
+        related: RelatedRule,
         subpaths: Option<Subpaths>,
         edges: Option<Edges>,
         counters: &PullCounters,
@@ -1204,6 +1213,7 @@ impl Repo {
             tip_checks,
             edges,
             verification,
+            related,
             counters,
         )
         .await?;
@@ -1249,6 +1259,7 @@ impl Repo {
                 phase,
                 &deltas,
                 verification,
+                related,
                 counters,
                 &mut carry,
                 marked,
@@ -1285,6 +1296,7 @@ impl Repo {
             phase,
             &deltas,
             verification,
+            related,
             counters,
             &mut carry,
             marked,
@@ -1357,6 +1369,7 @@ impl Repo {
                 phase,
                 &DeltaPlan::default(),
                 verification,
+                related,
                 counters,
                 &mut carry,
                 marked,
@@ -1534,6 +1547,7 @@ impl Repo {
         phase: Phase<'_>,
         delta_plan: &DeltaPlan,
         verification: &Verification,
+        related: RelatedRule,
         progress: &PullCounters,
         carry: &mut Carry,
         marked: &mut Vec<Checksum>,
@@ -1554,7 +1568,7 @@ impl Repo {
             done: phase.done,
             delta_plan,
             verification,
-            related: RelatedRule::of(self.config())?,
+            related,
             images: whole,
             dependencies: whole,
             dependency_run: phase.dependency_run,

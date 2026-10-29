@@ -502,9 +502,10 @@ impl Repo {
             mut on_event,
         } = opts;
         let subpaths = check_collection_pull(collection_id, remotes, &opts)?;
-        // `drive` reads the rule again. This read refuses a value that is not
-        // a boolean before the first request.
-        RelatedRule::of(self.config())?;
+        // The pull reads the rule one time, here. A value that is not a
+        // boolean stops the pull before its first request. Each run of each
+        // remote takes this value.
+        let related = RelatedRule::of(self.config())?;
         let names = first_of_each(opts.refs.iter().map(String::as_str));
 
         // The endpoint, the trust, and the transport of each remote come
@@ -605,6 +606,7 @@ impl Repo {
                 .run_session(
                     session,
                     candidate.trust,
+                    related,
                     run,
                     Wanted::Pinned(&pinned),
                     subpaths.clone(),

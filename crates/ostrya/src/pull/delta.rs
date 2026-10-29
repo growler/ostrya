@@ -888,7 +888,8 @@ impl ParsedDelta {
 /// [`COMMIT_ONLY`](PullFlags::COMMIT_ONLY) pull ignores the list. A pull that
 /// requires static deltas needs no summary for the list. The plan keeps the
 /// list for the deltas of the dependencies, as
-/// [`DeltaPlan::take_edges`] gives it.
+/// [`DeltaPlan::take_edges`] gives it. `related` is the rule of
+/// `[ex-ostrya] keep-detached-related` that the entry of the pull read.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn discover(
     repo: &Repo,
@@ -899,6 +900,7 @@ pub(crate) async fn discover(
     tips: TipChecks<'_>,
     edges: Option<Edges>,
     verification: &Verification,
+    related: RelatedRule,
     progress: &PullCounters,
 ) -> Result<DeltaPlan> {
     if opts.disable_static_deltas {
@@ -916,6 +918,7 @@ pub(crate) async fn discover(
             tips,
             edges,
             verification,
+            related,
             progress,
         )
         .await;
@@ -1493,6 +1496,7 @@ async fn discover_chain(
     tips: TipChecks<'_>,
     edges: Edges,
     verification: &Verification,
+    related: RelatedRule,
     progress: &PullCounters,
 ) -> Result<DeltaPlan> {
     let (wanted, names) = chain_targets(repo, targets, tips.place).await?;
@@ -1526,7 +1530,7 @@ async fn discover_chain(
         source,
         localcache: &opts.localcache_repos,
         verification,
-        related: RelatedRule::of(repo.config())?,
+        related,
         progress,
         tips,
     };
@@ -3360,6 +3364,7 @@ mod tests {
                 TipChecks::new(opts.flags, TimestampBase::Off, RefPlace::Heads),
                 Some(Edges::new(list)?),
                 verification,
+                RelatedRule::default(),
                 counters,
             )
             .await
@@ -4145,6 +4150,7 @@ mod tests {
                     TipChecks::new(opts.flags, TimestampBase::Off, RefPlace::Heads),
                     Some(Edges::new(list.clone()).unwrap()),
                     &ed25519_verification(),
+                    RelatedRule::default(),
                     &counters,
                 )
                 .await
@@ -4400,6 +4406,7 @@ mod tests {
                     TipChecks::new(opts.flags, TimestampBase::Off, RefPlace::Heads),
                     Some(Edges::new(list.clone()).unwrap()),
                     &verification,
+                    RelatedRule::default(),
                     &counters,
                 );
                 let plan = futures_lite::future::or(discovery, async {
@@ -4518,6 +4525,7 @@ mod tests {
                 TipChecks::new(opts.flags, TimestampBase::Off, RefPlace::Heads),
                 Some(Edges::new(list).unwrap()),
                 &verification,
+                RelatedRule::default(),
                 &counters,
             );
             let plan = futures_lite::future::or(discovery, async {

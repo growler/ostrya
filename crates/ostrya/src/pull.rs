@@ -1841,6 +1841,7 @@ impl Repo {
                 ),
                 edges,
                 &verification,
+                related,
                 &counters,
             )
             .await?

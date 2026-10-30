@@ -17161,6 +17161,343 @@ fn show_reports_a_bad_signature_like_the_tool() {
     );
 }
 
+/// `show --gpg-verify-remote` refuses a remote name that is not valid, and
+/// reads no keyring of that name. A directory is at the path that the join
+/// of the name to the repository reaches, so a read of that path gives a
+/// different error.
+#[cfg(feature = "gpg")]
+#[test]
+fn show_refuses_an_invalid_gpg_verify_remote_name() {
+    if !gpg_available() {
+        assert!(
+            std::env::var_os("OSTRYA_REQUIRE_GNUPG").is_none(),
+            "OSTRYA_REQUIRE_GNUPG is set and `gpg` is not available"
+        );
+        eprintln!("skipping: gpg not available");
+        return;
+    }
+    let tmp = TmpDir::new("show-invalid-remote");
+    let base = tmp.path();
+    let (repo, _home, commit) =
+        signed_show_repo(base, "Invalid Remote <invalid-remote@ostrya.example>");
+    let repo_arg = format!("--repo={}", repo.display());
+    std::fs::create_dir(base.join("x.trustedkeys.gpg")).unwrap();
+
+    let out = ostrya(
+        &[&repo_arg, "show", "--gpg-verify-remote=../x", &commit],
+        None,
+        &[],
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert_eq!(out.status.code(), Some(1), "{stdout}");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stderr),
+        "error: invalid input: invalid remote name: ../x\n"
+    );
+}
+
+/// A signed commit in an archive repository under `base`, and the GnuPG home
+/// of the key that signed it. The function returns the repository path, the
+/// home, and the commit checksum.
+#[cfg(feature = "gpg")]
+fn signed_show_repo(base: &Path, uid: &str) -> (PathBuf, GpgHome, String) {
+    build_fixture_source(base);
+    let repo = create_repo(base, RepoMode::Archive);
+    let repo_arg = format!("--repo={}", repo.display());
+    let home = GpgHome::create(base, uid);
+    let gpg_sign = format!("--gpg-sign={}", home.fingerprint());
+    let homedir = format!("--gpg-homedir={}", home.dir.display());
+    let src = base.join("src");
+    let commit = ostrya(
+        &[
+            "commit",
+            &repo_arg,
+            "-b",
+            "main",
+            "-s",
+            "signed",
+            &gpg_sign,
+            &homedir,
+            src.to_str().unwrap(),
+        ],
+        None,
+        &[],
+    )
+    .ok()
+    .stdout_trimmed();
+    (repo, home, commit)
+}
+
+/// Run `args` with the port and, if `tool` is `true`, with the `ostree`
+/// command. Each run has the empty global trusted directory of
+/// [`empty_gpg_home`]. The label of each run names its command.
+#[cfg(feature = "gpg")]
+fn show_port_and_tool(args: &[&str], tool: bool) -> Vec<(&'static str, Run)> {
+    let mut runs = vec![("the port", ostrya(args, None, &[]))];
+    if tool {
+        let home = empty_gpg_home().to_str().unwrap();
+        runs.push(("the tool", ostree_env(args, &[("OSTREE_GPG_HOME", home)])));
+    }
+    runs
+}
+
+/// `show --gpg-verify-remote` trusts the `gpgkeypath` entries of the remote,
+/// in the port and in the `ostree` command. The port writes the repository,
+/// and each command reads it. The repository holds no `origin.trustedkeys.gpg`,
+/// and the global trusted directory is empty.
+///
+/// - An entry that names a keyring file, or a directory that holds the
+///   keyring as `k.gpg`, verifies the signature in both commands.
+/// - A directory that holds the keyring as `k.keyring` parts the two. The
+///   tool reads each file of the directory, and the port reads the `*.gpg`
+///   files alone.
+/// - An entry that does not exist gives the commit report and then a refusal
+///   at exit 1 in both commands. The wording of the refusal parts the two.
+#[cfg(feature = "gpg")]
+#[test]
+fn show_gpg_verify_remote_reads_gpgkeypath() {
+    if !gpg_available() {
+        assert!(
+            std::env::var_os("OSTRYA_REQUIRE_GNUPG").is_none(),
+            "OSTRYA_REQUIRE_GNUPG is set and `gpg` is not available"
+        );
+        eprintln!("skipping: gpg not available");
+        return;
+    }
+    let tool = ostree_available();
+    let tmp = TmpDir::new("show-gpgkeypath");
+    let base = tmp.path();
+    let uid = "Keypath <keypath@ostrya.example>";
+    let (repo, home, commit) = signed_show_repo(base, uid);
+    let repo_arg = format!("--repo={}", repo.display());
+    let keyring = base.join("k.gpg");
+    home.export_to(&keyring);
+    let entry = base.join("keypath");
+    configure_remote(
+        &repo,
+        "https://example.invalid/r",
+        &format!("gpgkeypath={}\n", entry.display()),
+    );
+    let args = [
+        repo_arg.as_str(),
+        "show",
+        "--gpg-verify-remote=origin",
+        &commit,
+    ];
+    let good = format!("Good signature from \"{uid}\"");
+    let absent = "Can't check signature: public key not found";
+
+    std::fs::copy(&keyring, &entry).unwrap();
+    for (label, run) in show_port_and_tool(&args, tool) {
+        let report = run.ok().stdout_trimmed();
+        assert!(report.contains(&good), "{label}, a keyring file:\n{report}");
+    }
+
+    std::fs::remove_file(&entry).unwrap();
+    std::fs::create_dir(&entry).unwrap();
+    std::fs::copy(&keyring, entry.join("k.gpg")).unwrap();
+    for (label, run) in show_port_and_tool(&args, tool) {
+        let report = run.ok().stdout_trimmed();
+        assert!(report.contains(&good), "{label}, a `*.gpg` file:\n{report}");
+    }
+
+    std::fs::rename(entry.join("k.gpg"), entry.join("k.keyring")).unwrap();
+    for (label, run) in show_port_and_tool(&args, tool) {
+        let report = run.ok().stdout_trimmed();
+        let verdict = if label == "the port" { absent } else { &good };
+        assert!(
+            report.contains(verdict),
+            "{label}, a `*.keyring` file:\n{report}"
+        );
+    }
+
+    std::fs::remove_dir_all(&entry).unwrap();
+    for (label, run) in show_port_and_tool(&args, tool) {
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        assert_eq!(run.status.code(), Some(1), "{label}:\n{stdout}");
+        assert!(
+            stdout.starts_with(&format!("commit {commit}\n")) && !stdout.contains("Found"),
+            "{label}:\n{stdout}"
+        );
+        let refusal = if label == "the port" {
+            format!(
+                "error: signature: gpgkeypath entry '{}' cannot be read: \
+                 No such file or directory (os error 2)\n",
+                entry.display()
+            )
+        } else {
+            format!(
+                "error: opendir({}): No such file or directory\n",
+                entry.display()
+            )
+        };
+        assert_eq!(String::from_utf8_lossy(&run.stderr), refusal, "{label}");
+    }
+}
+
+/// `show --gpg-verify-remote` refuses a remote with no section in the config,
+/// in the port and in the `ostree` command, with the same line. The port
+/// writes the repository, and each command reads it. The refusal comes after
+/// the commit report, and only for a commit that carries a GPG signature.
+#[cfg(feature = "gpg")]
+#[test]
+fn show_refuses_a_gpg_verify_remote_with_no_section() {
+    if !gpg_available() {
+        assert!(
+            std::env::var_os("OSTRYA_REQUIRE_GNUPG").is_none(),
+            "OSTRYA_REQUIRE_GNUPG is set and `gpg` is not available"
+        );
+        eprintln!("skipping: gpg not available");
+        return;
+    }
+    let tool = ostree_available();
+    let tmp = TmpDir::new("show-no-section");
+    let base = tmp.path();
+    let (repo, _home, commit) = signed_show_repo(base, "No Section <nosection@ostrya.example>");
+    let repo_arg = format!("--repo={}", repo.display());
+
+    let args = [&repo_arg, "show", "--gpg-verify-remote=nope", &commit];
+    for (label, run) in show_port_and_tool(&args, tool) {
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        assert_eq!(run.status.code(), Some(1), "{label}:\n{stdout}");
+        assert!(
+            stdout.starts_with(&format!("commit {commit}\n")) && !stdout.contains("Found"),
+            "{label}:\n{stdout}"
+        );
+        assert_eq!(
+            String::from_utf8_lossy(&run.stderr),
+            "error: Remote \"nope\" not found\n",
+            "{label}"
+        );
+    }
+
+    // A commit with no signature.
+    let src = base.join("src");
+    let unsigned = ostrya(
+        &[
+            "commit",
+            &repo_arg,
+            "-b",
+            "unsigned",
+            "-s",
+            "unsigned",
+            src.to_str().unwrap(),
+        ],
+        None,
+        &[],
+    )
+    .ok()
+    .stdout_trimmed();
+    let args = [&repo_arg, "show", "--gpg-verify-remote=nope", &unsigned];
+    for (label, run) in show_port_and_tool(&args, tool) {
+        let stderr = String::from_utf8_lossy(&run.stderr);
+        assert_eq!(run.status.code(), Some(0), "{label}: {stderr}");
+        assert!(stderr.is_empty(), "{label}: {stderr}");
+    }
+}
+
+/// `show --gpg-verify-remote` loads `<repo>/origin.trustedkeys.gpg` before
+/// the `gpgkeypath` entries of the remote. The report names the user id of the
+/// first certificate that the port loads for the signing key.
+///
+/// Two exports of the signing key make the keyrings. The `gpgkeypath` entry
+/// holds the export with the user id `Probe` alone. The repository keyring
+/// holds the export after the key got the user id `Second` as its primary user
+/// id. The port and the `ostree` command both report
+/// `Good signature from "Second <second@ostrya.example>"`.
+#[cfg(feature = "gpg")]
+#[test]
+fn show_gpg_verify_remote_loads_the_repository_keyring_first() {
+    if !gpg_available() {
+        assert!(
+            std::env::var_os("OSTRYA_REQUIRE_GNUPG").is_none(),
+            "OSTRYA_REQUIRE_GNUPG is set and `gpg` is not available"
+        );
+        eprintln!("skipping: gpg not available");
+        return;
+    }
+    let tool = ostree_available();
+    let tmp = TmpDir::new("show-keyring-order");
+    let base = tmp.path();
+    let (repo, home, commit) = signed_show_repo(base, "Probe <probe@ostrya.example>");
+    let repo_arg = format!("--repo={}", repo.display());
+    let first = base.join("probe.gpg");
+    home.export_to(&first);
+    let second = "Second <second@ostrya.example>";
+    let fingerprint = home.fingerprint();
+    for action in ["--quick-add-uid", "--quick-set-primary-uid"] {
+        let status = home
+            .gpg()
+            .args(["--pinentry-mode", "loopback", "--passphrase", ""])
+            .args([action, &fingerprint, second])
+            .status()
+            .unwrap();
+        assert!(status.success(), "gpg {action} failed");
+    }
+    home.export_to(&repo.join("origin.trustedkeys.gpg"));
+    configure_remote(
+        &repo,
+        "https://example.invalid/r",
+        &format!("gpgkeypath={}\n", first.display()),
+    );
+
+    let args = [&repo_arg, "show", "--gpg-verify-remote=origin", &commit];
+    let good = format!("Good signature from \"{second}\"");
+    for (label, run) in show_port_and_tool(&args, tool) {
+        let report = run.ok().stdout_trimmed();
+        assert!(report.contains(&good), "{label}:\n{report}");
+    }
+}
+
+/// `show --gpg-verify-remote` reads `<repo>/origin.trustedkeys.gpg` before the
+/// `gpgkeypath` entries of the remote. So when both sources fail, the refusal
+/// names the repository keyring. A directory is at the path of the repository
+/// keyring, and the `gpgkeypath` entry does not exist. Both commands print the
+/// commit report and then exit 1. The wording of the refusal parts the two.
+#[cfg(feature = "gpg")]
+#[test]
+fn show_gpg_verify_remote_refuses_the_repository_keyring_first() {
+    if !gpg_available() {
+        assert!(
+            std::env::var_os("OSTRYA_REQUIRE_GNUPG").is_none(),
+            "OSTRYA_REQUIRE_GNUPG is set and `gpg` is not available"
+        );
+        eprintln!("skipping: gpg not available");
+        return;
+    }
+    let tool = ostree_available();
+    let tmp = TmpDir::new("show-keyring-refusal-order");
+    let base = tmp.path();
+    let (repo, _home, commit) = signed_show_repo(base, "Order <order@ostrya.example>");
+    let repo_arg = format!("--repo={}", repo.display());
+    let keyring = repo.join("origin.trustedkeys.gpg");
+    std::fs::create_dir(&keyring).unwrap();
+    configure_remote(
+        &repo,
+        "https://example.invalid/r",
+        &format!("gpgkeypath={}\n", base.join("absent.gpg").display()),
+    );
+
+    let args = [&repo_arg, "show", "--gpg-verify-remote=origin", &commit];
+    for (label, run) in show_port_and_tool(&args, tool) {
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        assert_eq!(run.status.code(), Some(1), "{label}:\n{stdout}");
+        assert!(
+            stdout.starts_with(&format!("commit {commit}\n")) && !stdout.contains("Found"),
+            "{label}:\n{stdout}"
+        );
+        let refusal = if label == "the port" {
+            format!(
+                "error: signature: the keyring '{}' is not a regular file\n",
+                keyring.display()
+            )
+        } else {
+            "error: Is a directory\n".to_owned()
+        };
+        assert_eq!(String::from_utf8_lossy(&run.stderr), refusal, "{label}");
+    }
+}
+
 /// `show --print-variant-type` reads a file as a value of a named type. This
 /// makes the `ostree` command a byte-exact oracle for the GVariant text form.
 /// Each case is a hand-written serialized value for one rule of the form.

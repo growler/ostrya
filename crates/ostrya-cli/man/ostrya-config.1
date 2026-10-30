@@ -203,6 +203,7 @@ A pull checks the GPG signature of the summary in \fB\%summary.sig\fR.
 \fB\%gpgkeypath\fR (list)
 More keyring files, or directories of \fB\%*.gpg\fR keyrings, that \fB\%gpg\-verify\fR trusts.
 An entry that does not exist fails the pull.
+\fB\%ostrya show \-\-gpg\-verify\-remote=NAME\fR also trusts these entries, and an entry that does not exist fails its signature report.
 .TP
 \fB\%sign\-verify\fR (boolean or list, default false)
 A pull checks the signatures of its commits with the signature engines.

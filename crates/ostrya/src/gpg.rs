@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 
 use ostrya_sign::{MAX_KEYRING, gpg_keyring_keys, gpg_merge_keyring, gpg_offered_keys};
 
-use crate::config::remote_keyring_name;
+use crate::config::{remote_keyring_name, valid_remote_name};
 use crate::error::{Error, Result};
 use crate::repo::Repo;
 use crate::sign::{read_key_path, read_key_source};
@@ -64,11 +64,59 @@ pub trait FromOstreeKeyrings: Sized {
     ///
     /// # Errors
     ///
+    /// - [`Error::InvalidInput`] if [`valid_remote_name`] refuses `remote`.
+    ///   The call refuses the name before it reads a keyring.
     /// - The errors of [`from_keyring_files`](GpgVerifier::from_keyring_files)
     ///   for each keyring file.
     /// - [`Error::Io`] if the global trusted directory cannot be listed for a
     ///   reason other than its absence.
     fn for_remote(repo_path: &Path, remote: &str) -> Result<Self>;
+
+    /// Creates a verifier from the keyrings that `remote` trusts, together
+    /// with the `gpgkeypath` entries of the remote.
+    ///
+    /// The trusted set is the union of these keyrings, in load order:
+    ///
+    /// - `<remote>.trustedkeys.gpg` in the repository at `repo_path`.
+    /// - `<remote>.trustedkeys.gpg` in `/etc/ostree/remotes.d/`.
+    /// - The global trusted set of
+    ///   [`from_system_trust`](FromOstreeKeyrings::from_system_trust).
+    /// - Each entry of `keypath`, which holds the values of the `gpgkeypath`
+    ///   key of the remote.
+    ///
+    /// Where two keyrings hold one key, the first certificate in load order
+    /// supplies the user id of a signature report.
+    ///
+    /// A `keypath` entry is a keyring file or a directory of `*.gpg` keyrings.
+    /// The keyrings of a directory load in name order. The load takes only the
+    /// regular files of a directory, and skips a symlink. If an entry names
+    /// neither, the build fails. The other sources are optional, and the load
+    /// skips a missing one.
+    ///
+    /// The provided method reads the repository keyring and gives its bytes
+    /// to [`for_remote_keyrings`](FromOstreeKeyrings::for_remote_keyrings).
+    /// [`for_remote`](FromOstreeKeyrings::for_remote) of [`GpgVerifier`] is
+    /// this call with an empty `keypath`.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidInput`] if [`valid_remote_name`] refuses `remote`.
+    ///   The call refuses the name before it reads a keyring.
+    /// - [`Error::Signature`] if the repository keyring cannot be read, for
+    ///   example because it is a directory. The call reads this keyring
+    ///   before the other sources, so this error comes first.
+    /// - The errors of
+    ///   [`for_remote_keyrings`](FromOstreeKeyrings::for_remote_keyrings).
+    fn for_remote_keypath(repo_path: &Path, remote: &str, keypath: &[String]) -> Result<Self> {
+        if !valid_remote_name(remote) {
+            return Err(Error::InvalidInput(format!(
+                "invalid remote name: {remote}"
+            )));
+        }
+        let keyring = repo_path.join(format!("{remote}.trustedkeys.gpg"));
+        let repo_keyring = read_keyring_path(&keyring)?;
+        Self::for_remote_keyrings(repo_keyring, remote, keypath)
+    }
 
     /// Creates a verifier from the whole trusted set of a remote.
     ///
@@ -93,6 +141,8 @@ pub trait FromOstreeKeyrings: Sized {
     ///
     /// # Errors
     ///
+    /// - [`Error::InvalidInput`] if [`valid_remote_name`] refuses `remote`.
+    ///   The call refuses the name before it reads a keyring.
     /// - [`Error::Signature`] if the metadata of a `keypath` entry cannot be
     ///   read. The message names `gpgkeypath` and the entry.
     /// - [`Error::Io`] if a directory that an entry names, or the global
@@ -129,9 +179,7 @@ pub trait FromOstreeKeyrings: Sized {
 
 impl FromOstreeKeyrings for GpgVerifier {
     fn for_remote(repo_path: &Path, remote: &str) -> Result<GpgVerifier> {
-        let keyring = repo_path.join(format!("{remote}.trustedkeys.gpg"));
-        let repo_keyring = read_keyring_path(&keyring)?;
-        GpgVerifier::for_remote_keyrings(repo_keyring, remote, &[])
+        GpgVerifier::for_remote_keypath(repo_path, remote, &[])
     }
 
     fn for_remote_keyrings(
@@ -155,12 +203,20 @@ impl FromOstreeKeyrings for GpgVerifier {
 /// If `global` is `false`, the global trusted set takes no part, and the
 /// trusted set is `repo_keyring`, the system keyring of the remote, and the
 /// entries of `keypath` alone.
+///
+/// The call refuses a name that [`valid_remote_name`] refuses with
+/// [`Error::InvalidInput`], before it reads a keyring.
 pub(crate) fn remote_keyrings(
     repo_keyring: Option<Vec<u8>>,
     remote: &str,
     keypath: &[String],
     global: bool,
 ) -> Result<GpgVerifier> {
+    if !valid_remote_name(remote) {
+        return Err(Error::InvalidInput(format!(
+            "invalid remote name: {remote}"
+        )));
+    }
     let mut paths: Vec<PathBuf> = Vec::new();
     paths.push(Path::new(SYSTEM_REMOTES_D).join(format!("{remote}.trustedkeys.gpg")));
     if global {
@@ -554,6 +610,89 @@ pub(crate) mod tests {
     #[test]
     fn keyring_files_in_missing_dir_is_empty() {
         assert!(keyring_files_in(&scratch_dir()).unwrap().is_empty());
+    }
+
+    /// A keyring load refuses a remote name that [`valid_remote_name`]
+    /// refuses, before it reads a keyring. A directory is at the path that
+    /// the join of the name to the repository reaches, so a read of that
+    /// path before the check gives [`Error::Signature`] with `is not a
+    /// regular file`.
+    #[test]
+    fn a_remote_keyring_load_refuses_an_invalid_remote_name() {
+        let dir = scratch_dir();
+        let root = dir.join("repo");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir(dir.join("x.trustedkeys.gpg")).unwrap();
+        let repo = GpgVerifier::for_remote(&root, "../x");
+        let keypath = GpgVerifier::for_remote_keypath(&root, "../x", &[]);
+        let keyrings = GpgVerifier::for_remote_keyrings(None, "../x", &[]);
+        std::fs::remove_dir_all(&dir).unwrap();
+        for result in [repo, keypath, keyrings] {
+            assert!(
+                matches!(
+                    &result,
+                    Err(Error::InvalidInput(m)) if m == "invalid remote name: ../x"
+                ),
+                "{:?}",
+                result.err()
+            );
+        }
+    }
+
+    /// A remote keyring load reads the repository keyring before the
+    /// `gpgkeypath` entries. A directory is at the path of the repository
+    /// keyring, and the entry does not exist, so the refusal names the
+    /// repository keyring.
+    #[test]
+    fn a_keypath_load_refuses_the_repository_keyring_first() {
+        let dir = scratch_dir();
+        let keyring = dir.join("keypath-order.trustedkeys.gpg");
+        std::fs::create_dir_all(&keyring).unwrap();
+        let entry = dir.join("absent.gpg").to_string_lossy().into_owned();
+        let result = GpgVerifier::for_remote_keypath(&dir, "keypath-order", &[entry]);
+        std::fs::remove_dir_all(&dir).unwrap();
+        let expected = format!("the keyring '{}' is not a regular file", keyring.display());
+        assert!(
+            matches!(&result, Err(Error::Signature(m)) if *m == expected),
+            "{:?}",
+            result.err()
+        );
+    }
+
+    /// A remote keyring load trusts the keys of a `gpgkeypath` entry. The
+    /// repository holds no keyring of the remote, so the same load with no
+    /// entry does not trust the key.
+    #[test]
+    fn a_keypath_load_trusts_the_keypath_entries() {
+        use ostrya_sign::Verifier as _;
+
+        if !gpg_available() {
+            assert!(
+                std::env::var_os("OSTRYA_REQUIRE_GNUPG").is_none(),
+                "OSTRYA_REQUIRE_GNUPG is set and `gpg` is not available"
+            );
+            eprintln!("skipping: gpg not available");
+            return;
+        }
+        let key = KeyFixture::new("Keypath <keypath@ostrya.example>");
+        let payload = b"keypath payload";
+        let signature = key.sign(payload);
+        let dir = scratch_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let keyring = dir.join("k.gpg");
+        std::fs::write(&keyring, key.export(false)).unwrap();
+        let entry = keyring.to_string_lossy().into_owned();
+        let trusted = GpgVerifier::for_remote_keypath(&dir, "keypath-trust", &[entry])
+            .unwrap()
+            .verify(payload, std::slice::from_ref(&signature))
+            .unwrap();
+        let untrusted = GpgVerifier::for_remote_keypath(&dir, "keypath-trust", &[])
+            .unwrap()
+            .verify(payload, std::slice::from_ref(&signature))
+            .unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(trusted.valid, "{:?}", trusted.signatures);
+        assert!(!untrusted.valid, "{:?}", untrusted.signatures);
     }
 
     /// An import refuses an offered stream over [`MAX_KEYRING`] by its size,

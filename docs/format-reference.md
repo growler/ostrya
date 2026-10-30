@@ -2253,7 +2253,8 @@ under `/etc/ostree/remotes.d/`. Each `*.gpg` keyring in the global
 trusted-keyring directory is trusted for all remotes. That directory is
 `<datadir>/ostree/trusted.gpg.d/` (`/usr/share/ostree/trusted.gpg.d/`). The
 `OSTREE_GPG_HOME` environment variable replaces it with the directory that it
-names.
+names. The remote also trusts each keyring that the `gpgkeypath` key of its
+config section names.
 
 Observed behavior: the `--gpg-sign` signature of each implementation verifies
 through `show --gpg-verify-remote` of the other, with the exported public

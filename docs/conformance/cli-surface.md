@@ -395,7 +395,7 @@ are listed in the rustdoc of `ostrya_gvariant::Type` and `Value`.
 The indefinite characters part the two. The tool takes `r`, `*` and `?` and
 prints `**` for each, where the port refuses the type string with `error:
 invalid format: invalid type signature "<type>" at offset <n>: unsupported type
-character` at exit 1. Six tool behaviors around these commands are observed and
+character` at exit 1. Nine tool behaviors around these commands are observed and
 deliberately not reproduced:
 
 - a `--print-variant-type` signature that is not a type at all kills the tool
@@ -443,6 +443,12 @@ deliberately not reproduced:
   name, the short key id, and the user id are the same in both, measured
   against `ostree` 2026.1 over a commit each implementation signed with the
   same key, read back through the other's `show --gpg-verify-remote=<remote>`.
+  In that measurement, the trusted set holds one export of the key. Two
+  exports of one key with different primary user ids can part the user id,
+  when a `gpgkeypath` keyring holds one export and another keyring of the
+  trusted set holds the other. The port reports the user id of the export
+  that it loads first. In each load order measured, the tool reported the
+  primary user id of the export that `gpg` made later.
   The short key id and the user id are the same in both over a signature that
   does not verify as well: both name the signing key by its trailing sixteen
   hex digits, and the tool names the certificate that holds that key on its
@@ -453,6 +459,29 @@ deliberately not reproduced:
   fingerprint of the certificate -- measured over a signature a signing subkey
   made. The port holds both keys in its own record. No command of the port
   removes a signature (`sign`, "`-d/--delete`");
+- a `--gpg-verify-remote=REMOTE` that is not a valid remote name parts the
+  two. A build of the port with the `gpg` feature refuses it at exit 1 with
+  `error: invalid input: invalid remote name: REMOTE`, after the commit
+  report and before it reads a keyring. A build without the `gpg` feature
+  verifies no GPG signature, and it prints the commit report at exit 0 for
+  each `--gpg-verify-remote` value: a name that is not valid, a remote with
+  no config section, and a `gpgkeypath` entry that does not exist. The
+  tool reads `<repo>/REMOTE.trustedkeys.gpg` when the config holds a section
+  of that name, so a name such as `../x` reads a keyring outside the
+  repository. Both commands check the remote only for a commit that carries
+  a GPG signature;
+- a `gpgkeypath` entry of the `--gpg-verify-remote` remote that does not
+  exist parts the wording. Both commands print the commit report and then
+  exit 1. The tool writes `error: opendir(ENTRY): No such file or
+  directory`. The port writes `error: signature: gpgkeypath entry 'ENTRY'
+  cannot be read: No such file or directory (os error 2)`;
+- a `gpgkeypath` entry that names a directory parts the two. The tool reads
+  each file of the directory as a keyring, whatever its name. The port reads
+  only the regular `*.gpg` files of the directory, as a pull of the port
+  does. So a
+  directory that holds only `a.keyring` gives `Good signature from "<user
+  id>"` in the tool and `Can't check signature: public key not found` in the
+  port;
 - the verdict the report states rests on the port's own trust and validity
   policy, which "GPG verification differences" compares with GnuPG 2.4.9.
   Seven differences stand there, and each one can make a `show` verdict part
@@ -462,6 +491,21 @@ deliberately not reproduced:
   read over every certificate the trusted set holds for the key rather than over
   the first alone, and the key expiry read as the newest statement two exports
   of one certificate carry rather than as the statement the first export makes.
+
+`show --gpg-verify-remote=REMOTE` reads `REMOTE.trustedkeys.gpg` in the
+repository and in `/etc/ostree/remotes.d/`, the global trusted set, and each
+`gpgkeypath` entry. The tool reads keyrings from the same kinds of source.
+Both commands load `REMOTE.trustedkeys.gpg` of the repository before the
+global trusted set. So when these two sources hold two exports of one key,
+the export in the repository keyring supplies the user id in both. Both
+commands also read the repository keyring before the `gpgkeypath` entries.
+When a directory is at the path of the repository keyring and a `gpgkeypath`
+entry does not exist, the refusal names the repository keyring in the port,
+and the tool writes `error: Is a directory`. The read of
+`/etc/ostree/remotes.d/` by the tool is not observed (`cli-behavior.md`,
+"`show`"). `sign --verify --remote` reads no global trusted set (`sign`,
+"`--remote` of `--verify`"), so a key of the global trusted set verifies a
+commit in `show` and not in `sign`.
 
 Not observed: the answer of the tool to a repeated `show
 --print-metadata-key` or `--print-detached-metadata-key`. No test runs the

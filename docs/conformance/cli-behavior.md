@@ -3848,6 +3848,86 @@ trusted keyrings of that remote in place of `gpgkeys.gpg`
 `--gpg-homedir=HOMEDIR` adds the `*.gpg` files of the named directory as
 keyrings.
 
+The command reads the value of `--gpg-verify-remote=REMOTE` only for a commit
+that carries a GPG signature. Over a commit with no signature,
+`--gpg-verify-remote=../x` prints the report at exit 0, and standard error
+stays empty. Over a signed commit, the command prints the commit report, and
+then it reads the config for a section of that remote:
+
+- If the config holds no section of that name, as for `nope` or `../x`, the
+  command writes `error: Remote "REMOTE" not found` at exit 1.
+- If the config holds the section and the keyring of that name does not
+  exist, the verdict line is `Can't check signature: public key not found`,
+  at exit 0.
+- If the config holds the section, the command reads
+  `<repo>/REMOTE.trustedkeys.gpg` and does not check the name. A section
+  `[remote "../x"]`, written by hand, and the public keyring at
+  `<repo>/../x.trustedkeys.gpg` give `Good signature from "<user id>"` at
+  exit 0. The section `[remote "../evil/k"]` and the keyring
+  `<repo>/../evil/k.trustedkeys.gpg` give the same result.
+
+With the section, the command trusts the keys of these keyrings:
+
+- `<repo>/REMOTE.trustedkeys.gpg`.
+- Each entry of the `gpgkeypath` key of the remote. A `;` separates two
+  entries.
+- Each `*.gpg` file of the global trusted directory. `OSTREE_GPG_HOME` names
+  this directory.
+
+These results come from a commit that the key of `a.gpg` signed. The
+repository holds no `REMOTE.trustedkeys.gpg`, and the global directory is
+empty, unless a case states otherwise:
+
+- `gpgkeypath=<dir>/a.gpg` gives `Good signature from "<user id>"` at exit 0.
+  `gpgkeypath=<dir>/b.gpg;<dir>/a.gpg` gives the same result.
+- A `gpgkeypath` that names the keyring of an unrelated key, and a section
+  with no `gpgkeypath`, give `Can't check signature: public key not found` at
+  exit 0.
+- A `gpgkeypath` entry that names a directory makes the command read each
+  file of the directory as a keyring, whatever its name. A directory that
+  holds `a.gpg`, a directory that holds only `a.keyring`, and a directory that
+  holds `a.gpg` and a text file `README` give `Good signature from "<user
+  id>"` at exit 0. An empty directory gives `Can't check signature: public key
+  not found` at exit 0.
+- A `gpgkeypath` entry that does not exist gives the commit report on
+  standard output with no `Found` line. Then the command writes `error:
+  opendir(ENTRY): No such file or directory` at exit 1.
+- `OSTREE_GPG_HOME` that names a directory that holds `a.gpg`, and a section
+  with no `gpgkeypath`, give `Good signature from "<user id>"` at exit 0.
+  The same directory that holds only `a.keyring` gives `Can't check
+  signature: public key not found`. The global directory gives only its
+  `*.gpg` files.
+- A directory at `<repo>/REMOTE.trustedkeys.gpg` and a `gpgkeypath` entry
+  that does not exist give the commit report on standard output with no
+  `Found` line. Then the command writes `error: Is a directory` at exit 1.
+  The command reads the repository keyring before the `gpgkeypath` entries.
+
+Two exports of one key give these results. `k1` holds the key with the user
+id `Probe` alone. `gpg` made `k2` after it added the user id `Second` to the
+key and made `Second` the primary user id. The verdict line is `Good
+signature from "<user id>"` at exit 0, with this user id:
+
+- `REMOTE.trustedkeys.gpg` is `k1` and the global directory holds `k2`:
+  `Probe`.
+- `REMOTE.trustedkeys.gpg` is `k2` and the global directory holds `k1`:
+  `Second`.
+- `REMOTE.trustedkeys.gpg` is `k1` and `gpgkeypath` names `k2`, or the
+  opposite: `Second`.
+- `gpgkeypath` names `k1` and the global directory holds `k2`, or the
+  opposite: `Second`.
+- `gpgkeypath=k1;k2`: `Second`.
+
+So the repository keyring loads before the global directory. When a
+`gpgkeypath` keyring holds one of the two exports, the load order does not
+change the user id.
+
+With no `--gpg-verify-remote`, the command reads no `gpgkeypath`. Over the
+same commit, `ostree show COMMIT` and `gpgkeypath=<dir>/a.gpg` give `Can't
+check signature: public key not found`.
+
+The keyrings of `/etc/ostree/remotes.d/` are not observed, because the probe
+had no root access.
+
 ### `log`
 
 The command walks the parent chain from the given revision, newest first. It

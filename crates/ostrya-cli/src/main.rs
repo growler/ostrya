@@ -68,7 +68,7 @@ use ostrya::{
     to_text, to_text_unannotated, validate_refspec,
 };
 #[cfg(feature = "gpg")]
-use ostrya::{FromOstreeKeyrings, GpgSigner, GpgVerifier, SignatureInfo};
+use ostrya::{FromOstreeKeyrings, GpgSigner, GpgVerifier, SignatureInfo, valid_remote_name};
 #[cfg(feature = "spki")]
 use ostrya::{SpkiSigner, SpkiVerifier, spki_public_keys, spki_secret_key_lines, spki_secret_keys};
 
@@ -1561,9 +1561,11 @@ struct ShowArgs {
     /// Use the GPG configuration of this remote to verify signatures.
     ///
     /// The keyrings are `<remote>.trustedkeys.gpg` in the repository and in
-    /// `/etc/ostree/remotes.d/`, and the global trusted keyrings. The global
-    /// keyrings are the `*.gpg` files in the directory that `OSTREE_GPG_HOME`
-    /// names, or in `/usr/share/ostree/trusted.gpg.d/`.
+    /// `/etc/ostree/remotes.d/`, the global trusted keyrings, and each
+    /// `gpgkeypath` entry of the remote. The global keyrings are the `*.gpg`
+    /// files in the directory that `OSTREE_GPG_HOME` names, or in
+    /// `/usr/share/ostree/trusted.gpg.d/`. The command refuses a remote that
+    /// has no section in the config.
     #[arg(long, value_name = "REMOTE")]
     gpg_verify_remote: Option<String>,
     // ostrya checks this operand after the repository resolves, in the order
@@ -11828,7 +11830,7 @@ async fn report_commit_signatures(
     }
     let verifier = match verifier {
         Some(verifier) => verifier,
-        None => verifier.insert(show_gpg_verifier(repo_path, args)?),
+        None => verifier.insert(show_gpg_verifier(repo, repo_path, args)?),
     };
     let outcome = verifier.verify(data, &signatures)?;
     println!();
@@ -11877,12 +11879,31 @@ async fn report_commit_signatures(
 /// Returns the GPG verifier with the keyrings that `show` uses.
 ///
 /// Under `--gpg-verify-remote`, the keyrings are the full trusted set of that
-/// remote. Otherwise, the keyrings are the `gpgkeys.gpg` of the repository and
-/// each `*.gpg` file in a `--gpg-homedir`.
+/// remote, in this load order:
+///
+/// - `<remote>.trustedkeys.gpg` in the repository and in
+///   `/etc/ostree/remotes.d/`.
+/// - The global trusted set.
+/// - Each `gpgkeypath` entry of the remote.
+///
+/// Otherwise, the keyrings are the `gpgkeys.gpg` of the repository and each
+/// `*.gpg` file in a `--gpg-homedir`.
+///
+/// Under `--gpg-verify-remote`, the call refuses a name that
+/// [`valid_remote_name`] refuses with [`Error::InvalidInput`]. If the config
+/// holds no section of the remote, the process exits with the refusal of the
+/// `ostree` command. A `gpgkeypath` entry that cannot be read gives
+/// [`Error::Signature`].
 #[cfg(feature = "gpg")]
-fn show_gpg_verifier(repo_path: &Path, args: &ShowArgs) -> Result<GpgVerifier> {
+fn show_gpg_verifier(repo: &Repo, repo_path: &Path, args: &ShowArgs) -> Result<GpgVerifier> {
     if let Some(remote) = args.gpg_verify_remote.as_deref() {
-        return GpgVerifier::for_remote(repo_path, remote);
+        if !valid_remote_name(remote) {
+            return Err(Error::InvalidInput(format!(
+                "invalid remote name: {remote}"
+            )));
+        }
+        let keypath = remote_section(repo, remote).gpgkeypath()?;
+        return GpgVerifier::for_remote_keypath(repo_path, remote, &keypath);
     }
     let mut paths = vec![repo_path.join("gpgkeys.gpg")];
     if let Some(homedir) = args.gpg_homedir.as_deref() {

@@ -5011,6 +5011,49 @@ note: a signature the cryptography refuses needs a generated key, a remote
  words `BAD signature from "<user id>"`. The same test states the three
  differences the outcome names, so a move in either implementation is reported.
 
+family: M10
+subcommand: show
+cell: show/gpg-verify-remote-gpgkeypath
+modes: archive
+setup: repo-with-commit
+outcome: lossy
+severity: interop
+loss: a keyring in a `gpgkeypath` directory whose name does not end in `.gpg`.
+ The tool reads each file of the directory as a keyring, and the port reads
+ the `*.gpg` files alone, so such a keyring gives `Good signature from "<user
+ id>"` in the tool and `Can't check signature: public key not found` in the
+ port. The refusal of an entry that does not exist parts the wording: the tool
+ writes `error: opendir(ENTRY): No such file or directory`, and the port
+ writes `error: signature: gpgkeypath entry 'ENTRY' cannot be read: No such
+ file or directory (os error 2)`. Both exit 1 after the commit report
+ (`cli-surface.md`, "P1", states them).
+evidence: ostrya_cli::cli::show_gpg_verify_remote_reads_gpgkeypath
+spec: cli-behavior.md#show format-reference.md#gpg
+note: a signed commit needs a generated key, which no setup binds. The port
+ signs the commit, and each implementation reads the repository through
+ `show --gpg-verify-remote=origin`. The remote holds a `gpgkeypath` entry, the
+ repository holds no `origin.trustedkeys.gpg`, and the global trusted
+ directory is empty. An entry that names the keyring file, and an entry that
+ names a directory that holds the keyring as `k.gpg`, give `Good signature
+ from "<user id>"` at exit 0 in both. The cited test also states the two
+ differences the outcome names.
+
+family: M10
+subcommand: show
+cell: show/gpg-verify-remote-no-section
+modes: archive
+setup: repo-with-commit
+outcome: refused-both
+severity: interop
+evidence: ostrya_cli::cli::show_refuses_a_gpg_verify_remote_with_no_section
+spec: cli-behavior.md#show
+note: a signed commit needs a generated key, which no setup binds. The port
+ signs the commit, and each implementation reads the repository through
+ `show --gpg-verify-remote=nope`, where the config holds no section `nope`.
+ Both print the commit report with no `Found` line, then write `error: Remote
+ "nope" not found` at exit 1. Over a commit with no signature, both print the
+ report at exit 0 and write nothing to standard error.
+
 # ---------------------------------------------------------------------------
 # log -- the parent-chain walk (Phase 17d).
 # ---------------------------------------------------------------------------

@@ -75,7 +75,7 @@ The command reads each \fB\%*.gpg\fR file in HOMEDIR as a keyring, together with
 \fB\-\-gpg\-verify\-remote\fR \fIREMOTE\fR
 Use the GPG configuration of this remote to verify signatures.
 .IP
-The keyrings are \fB\%<remote>.trustedkeys.gpg\fR in the repository and in \fB\%/etc/ostree/remotes.d/\fR, and the global trusted keyrings. The global keyrings are the \fB\%*.gpg\fR files in the directory that \fB\%OSTREE_GPG_HOME\fR names, or in \fB\%/usr/share/ostree/trusted.gpg.d/\fR\&.
+The keyrings are \fB\%<remote>.trustedkeys.gpg\fR in the repository and in \fB\%/etc/ostree/remotes.d/\fR, the global trusted keyrings, and each \fB\%gpgkeypath\fR entry of the remote. The global keyrings are the \fB\%*.gpg\fR files in the directory that \fB\%OSTREE_GPG_HOME\fR names, or in \fB\%/usr/share/ostree/trusted.gpg.d/\fR\&. The command refuses a remote that has no section in the config.
 .PP
 The global options are listed in \fBostrya\fR(1).
 .SH SEE ALSO

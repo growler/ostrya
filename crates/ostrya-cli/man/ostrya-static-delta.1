@@ -52,12 +52,12 @@ The command reads this option also with no key source, and refuses any other nam
 \fB\-\-keys\-file\fR \fIPATH\fR
 Read public keys from a file.
 .IP
-The \%\-\-sign\-type before the file selects its engine. For \%ed25519, the file has one \%base64 key per line. For spki, it has PEM \fB\%PUBLIC KEY\fR blocks. The command reads the last file of each engine. With this option or a \%KEY\-ID, the command does not read \%\-\-keys\-dir or the key directories. The path must name a regular file of \%1 MiB or less.
+The \%\-\-sign\-type before the file selects its engine. For \%ed25519, the file has one \%base64 key per line. For spki, it has PEM \fB\%PUBLIC KEY\fR blocks. The command reads the last file of each engine. With this option or a \%KEY\-ID, the command reads no key directory, and refuses \%\-\-keys\-dir. The path must name a regular file of \%1 MiB or less.
 .TP
 \fB\-\-keys\-dir\fR \fIPATH\fR
 Add a directory to the key directories.
 .IP
-The key directories are \fB\%/etc/ostree\fR, \fB\%/usr/share/ostree\fR, and each \%\-\-keys\-dir, in this order. With no key, a \%\-\-keys\-dir makes the command read \fB\%trusted.<type>\fR, \fB\%revoked.<type>\fR, and the files in \fB\%trusted.<type>.d/\fR and \fB\%revoked.<type>.d/\fR of each directory, and check a signed delta with each engine that has a trusted key. If one engine finds a signature, the command skips each engine that finds none. A revoked key of one directory applies to the keys of each directory. An \%ed25519 file has one \%base64 key per line, and an spki file has PEM \fB\%PUBLIC KEY\fR blocks. The option can occur more than once. An empty value names the working directory.
+The key directories are \fB\%/etc/ostree\fR, \fB\%/usr/share/ostree\fR, and each \%\-\-keys\-dir, in this order. With no key, a \%\-\-keys\-dir makes the command read \fB\%trusted.<type>\fR, \fB\%revoked.<type>\fR, and the files in \fB\%trusted.<type>.d/\fR and \fB\%revoked.<type>.d/\fR of each directory, and check a signed delta with each engine that has a trusted key. If one engine finds a signature, the command skips each engine that finds none. A revoked key of one directory applies to the keys of each directory. An \%ed25519 file has one \%base64 key per line, and an spki file has PEM \fB\%PUBLIC KEY\fR blocks. The option can occur more than once. An empty value names the working directory. The command refuses this option with a \%KEY\-ID or a \%\-\-keys\-file.
 .SS "generate"
 Generate a static delta and print what it is generated from and to.
 .PP
@@ -250,11 +250,11 @@ The command refuses any other name, \fB\%gpg\fR included. Each key takes the eng
 \fB\-\-keys\-file\fR \fIPATH\fR
 Read public keys from a file.
 .IP
-The \%\-\-sign\-type before the file selects its engine. For \%ed25519, the file has one \%base64 key per line. For spki, it has PEM \fB\%PUBLIC KEY\fR blocks. The command reads the last file of each engine. With this option or a \%KEY\-ID, the command does not read \%\-\-keys\-dir or the key directories. The path must name a regular file of \%1 MiB or less. The command takes an empty value as given, and refuses it because it is not a regular file.
+The \%\-\-sign\-type before the file selects its engine. For \%ed25519, the file has one \%base64 key per line. For spki, it has PEM \fB\%PUBLIC KEY\fR blocks. The command reads the last file of each engine. With this option or a \%KEY\-ID, the command reads no key directory, and refuses \%\-\-keys\-dir. The path must name a regular file of \%1 MiB or less. The command takes an empty value as given, and refuses it because it is not a regular file.
 .TP
 \fB\-\-keys\-dir\fR \fIPATH\fR
 Add a directory to the key directories.
 .IP
-The key directories are \fB\%/etc/ostree\fR, \fB\%/usr/share/ostree\fR, and each \%\-\-keys\-dir, in this order. With no key, the command reads \fB\%trusted.<type>\fR, \fB\%revoked.<type>\fR, and the files in \fB\%trusted.<type>.d/\fR and \fB\%revoked.<type>.d/\fR of each directory, and verifies with each engine that has a trusted key. Without a \%\-\-sign\-type, if one engine finds a signature, the command skips each engine that finds none. A revoked key of one directory applies to the keys of each directory. An \%ed25519 file has one \%base64 key per line, and an spki file has PEM \fB\%PUBLIC KEY\fR blocks. The option can occur more than once. An empty value names the working directory.
+The key directories are \fB\%/etc/ostree\fR, \fB\%/usr/share/ostree\fR, and each \%\-\-keys\-dir, in this order. With no key, the command reads \fB\%trusted.<type>\fR, \fB\%revoked.<type>\fR, and the files in \fB\%trusted.<type>.d/\fR and \fB\%revoked.<type>.d/\fR of each directory, and verifies with each engine that has a trusted key. Without a \%\-\-sign\-type, if one engine finds a signature, the command skips each engine that finds none. A revoked key of one directory applies to the keys of each directory. An \%ed25519 file has one \%base64 key per line, and an spki file has PEM \fB\%PUBLIC KEY\fR blocks. The option can occur more than once. An empty value names the working directory. The command refuses this option with a \%KEY\-ID or a \%\-\-keys\-file.
 .SH SEE ALSO
 \fBostrya\fR(1)

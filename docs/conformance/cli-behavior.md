@@ -4830,7 +4830,9 @@ no key on the command line, where each `-s` selects its engine. A `--verify`
 run verifies with one verifier for each engine, and prints the report of each
 engine after a line with the engine name and a colon where the report has
 more than one engine. With no key and no `--remote`, the port reads the
-system key directories and each `--keys-dir`, and the GPG system trust. Each
+system key directories and each `--keys-dir`, and the GPG system trust. The
+port refuses `--keys-dir` in a signing run and in a `--verify` run with a key
+on the command line, because these runs read no key directory. Each
 engine that finds a signature must have a valid one. An engine that finds no
 signature fails the run, except in a run with no key, no `--remote`, and no
 `-s`: if another engine finds a signature, that run skips the engine and

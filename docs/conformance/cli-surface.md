@@ -2568,6 +2568,10 @@ signature, as its `sign --verify` does. The multi-engine report reads `summary`
 and `summary.sig` one time, so each engine checks the same bytes. The port
 refuses `--remote` in each mode other than `--verify`, `-u` and the read
 options included, with `error: signature: --remote applies to --verify alone`.
+It refuses `--keys-dir` in the same modes with `error: signature: --keys-dir
+applies to --verify alone`. In a `--verify` run with a KEY-ID or a
+`--keys-file`, it refuses `--keys-dir` with `error: signature: a KEY-ID or a
+--keys-file gives the keys of the verify; it reads no --keys-dir`.
 On this command the tool binds `-v` to `--view`, and `--verbose` has no short
 form. The port carries the same shape: `summary` declares `-v/--view` and a
 long-only `--verbose`, and every other subcommand, together with the top level,
@@ -2729,7 +2733,7 @@ states for `commit --sign-type`. `reindex` takes `--to=REV`, which rewrites or
 removes the index file of one target and reads REV by the rule of one half of a
 delta name; the last `--to` wins. A `--keys-file` and each key-store file of
 the spki engine hold PEM `PUBLIC KEY` blocks (`format-reference.md`, "Signing
-details", "spki"). Fifty differences stand on `show`,
+details", "spki"). Forty-nine differences stand on `show`,
 `delete`, `list`, `indexes`, `verify`, `apply-offline`, and `reindex`.
 
 - a superblock file over 128 MiB (134217728 bytes). The port refuses it in
@@ -3044,7 +3048,48 @@ details", "spki"). Fifty differences stand on `show`,
   `Verification OK` at exit 0. The port parses the whole superblock and refuses
   each after `Verification fails` with its own `error: invalid format:` or
   `error: gvariant:` sentence at exit 1. Only a publisher's own bytes reach the last
-  case.
+  case;
+- the engine of each key of `verify` and `apply-offline`. The tool applies the
+  last `--sign-type` to each KEY-ID and `--keys-file` key. The port gives each
+  key the engine of the nearest `--sign-type` before it, and `ed25519` to a
+  key before the first `--sign-type`. It reads the last `--keys-file` of each
+  engine, and verifies with one verifier for each engine. Each engine that
+  finds a signature must have a valid one. An engine that finds no signature
+  fails the run, except in a run with no key and no `--sign-type`, which
+  skips it if another engine finds a signature (the item on the key
+  directories below). `verify` prints `Verification OK` one time, or the
+  failure line of the first engine that fails. The tool reads one engine;
+- a `--sign-type` of `verify` and `apply-offline` with no key of its own. With
+  a key on the command line, the port refuses it at exit 1 before standard
+  output. `verify` with no key takes each `--sign-type` as a selection of its
+  engine, and verifies with the selected engines alone. Each selected engine
+  must have a valid signature. `apply-offline` refuses it also with no key and
+  with a `--keys-dir`, where the tool applies an unsigned delta and, with no
+  key source, a signed delta with no check. The refusal of a name comes first,
+  so `apply-offline --sign-type=nosuch` keeps the line of the tool
+  (`static-delta/apply-offline-sign-type-unknown`);
+- the key directories of `verify` and `apply-offline`. The tool reads the last
+  `--keys-dir` alone, and the system key directories `/etc/ostree` and
+  `/usr/share/ostree` where no `--keys-dir` is given. The port reads the
+  system key directories and then each `--keys-dir`, and a revoked key of one
+  directory applies to the keys of each directory. With no key, it verifies
+  with each engine that has a trusted key in them. Without a `--sign-type`, if
+  one of these engines finds a signature, the port skips each engine that finds
+  none. Each engine that finds a signature must have a valid one, and a run
+  where no engine finds a signature fails. A delta with an spki signature alone
+  then verifies and applies with a key directory that also holds an ed25519
+  key. A run that finds no engine is refused at exit 1 with `error: signature:
+  no keys loaded: the key directories hold no ed25519 or spki key`, where the
+  tool writes `error: signature: ed25519: no keys loaded`
+  (`static-delta/verify-no-keys`). `apply-offline` with a `--keys-dir` and no
+  key reads the system key directories as well;
+- a `--keys-dir` beside a KEY-ID or a `--keys-file`, under `verify` and
+  `apply-offline`. The tool reads no key directory in such a run, and
+  verifies with the other keys
+  (`static-delta/verify-keys-file-overrides-keys-dir`). The port refuses the
+  run at exit 1 before standard output with `error: signature: a KEY-ID or a
+  --keys-file gives the keys of the verify; it reads no --keys-dir`, and
+  `apply-offline` writes no object.
 
 The key-file entries under `verify` also hold for `apply-offline`, and each
 refusal writes no object.
@@ -3054,7 +3099,7 @@ refusal writes no object.
 "CLI output formats", `static-delta`). The byte order starts from the host
 order, as in the tool. Only a little-endian host is observed.
 
-`static-delta generate` carries twenty-two differences. Two of them are open.
+`static-delta generate` carries twenty-four differences. Two of them are open.
 
 - the composefs image of the target commit. The port puts the stored image
   of a commit that carries `ostree.composefs.digest.v0` in the delta, in a
@@ -3243,41 +3288,7 @@ order, as in the tool. Only a little-endian host is observed.
   the port then holds the signatures of each engine, the `--sign` keys first;
 - a `--sign-type` of `generate` with no key of its own, the rule `commit
   --sign-type` records. The port refuses it at exit 1 before the block, and
-  writes nothing. The tool reads `--sign-type` only where a key is given;
-- the engine of each key of `verify` and `apply-offline`. The tool applies the
-  last `--sign-type` to each KEY-ID and `--keys-file` key. The port gives each
-  key the engine of the nearest `--sign-type` before it, and `ed25519` to a
-  key before the first `--sign-type`. It reads the last `--keys-file` of each
-  engine, and verifies with one verifier for each engine. Each engine that
-  finds a signature must have a valid one. An engine that finds no signature
-  fails the run, except in a run with no key and no `--sign-type`, which
-  skips it if another engine finds a signature (the item on the key
-  directories below). `verify` prints `Verification OK` one time, or the
-  failure line of the first engine that fails. The tool reads one engine;
-- a `--sign-type` of `verify` and `apply-offline` with no key of its own. With
-  a key on the command line, the port refuses it at exit 1 before standard
-  output. `verify` with no key takes each `--sign-type` as a selection of its
-  engine, and verifies with the selected engines alone. Each selected engine
-  must have a valid signature. `apply-offline` refuses it also with no key and
-  with a `--keys-dir`, where the tool applies an unsigned delta and, with no
-  key source, a signed delta with no check. The refusal of a name comes first,
-  so `apply-offline --sign-type=nosuch` keeps the line of the tool
-  (`static-delta/apply-offline-sign-type-unknown`);
-- the key directories of `verify` and `apply-offline`. The tool reads the last
-  `--keys-dir` alone, and the system key directories `/etc/ostree` and
-  `/usr/share/ostree` where no `--keys-dir` is given. The port reads the
-  system key directories and then each `--keys-dir`, and a revoked key of one
-  directory applies to the keys of each directory. With no key, it verifies
-  with each engine that has a trusted key in them. Without a `--sign-type`, if
-  one of these engines finds a signature, the port skips each engine that finds
-  none. Each engine that finds a signature must have a valid one, and a run
-  where no engine finds a signature fails. A delta with an spki signature alone
-  then verifies and applies with a key directory that also holds an ed25519
-  key. A run that finds no engine is refused at exit 1 with `error: signature:
-  no keys loaded: the key directories hold no ed25519 or spki key`, where the
-  tool writes `error: signature: ed25519: no keys loaded`
-  (`static-delta/verify-no-keys`). `apply-offline` with a `--keys-dir` and no
-  key reads the system key directories as well.
+  writes nothing. The tool reads `--sign-type` only where a key is given.
 
 The port adds `--output-dir=DIR`, which writes the superblock and the parts to
 DIR, `--timestamp`, `--reindex`, `--gpg-homedir`, and `-s` for
@@ -3828,19 +3839,20 @@ refuses `--keys-file`. A gpg verify refuses a `--keys-file` that names no
 regular file at exit 1 with `File object '<path>' is not a regular file`, the
 refusal that the ed25519 and spki engines give for their last `--keys-file`.
 Under `ed25519` and `spki`, `--verify` reads the key sources of `static-delta
-verify`: the positionals and the last `--keys-file` of the engine, either one
-leaving `--keys-dir` unread, the key directories, an empty `--keys-dir` naming
-the working directory, and the trusted keys judged before revocation
-(`cli-behavior.md`, "CLI output formats", `static-delta`, "Key sources"). Over
-a commit either implementation signed, the verdict and the exit status agree
-for these rules where one `--keys-dir` is given, and so do the refusals `File
+verify`: the positionals and the last `--keys-file` of the engine, the key
+directories, an empty `--keys-dir` naming the working directory, and the
+trusted keys judged before revocation (`cli-behavior.md`, "CLI output
+formats", `static-delta`, "Key sources"). The port refuses a `--keys-dir`
+beside a positional or a `--keys-file` (an item below). Over a commit either
+implementation signed, the verdict and the exit status agree for the other
+rules where one `--keys-dir` is given, and so do the refusals `File
 object '<path>' is not a regular file` and `no valid keys in file '<path>'` of
 `ed25519`, byte for byte. Under `spki`, a `--keys-file` and each key-store file
 hold PEM `PUBLIC KEY` blocks, the form that the `ostree` 2026.1 build with
 OpenSSL on the NixOS development host reads. The key-file entries under
 `static-delta` above, the spki entries included, also hold for `sign --verify`.
 Under `spki`, a signing `--keys-file` holds PEM `PRIVATE KEY` blocks, each a
-PKCS#8 DER, and each block adds one signature. Twenty-five differences stand.
+PKCS#8 DER, and each block adds one signature. Twenty-six differences stand.
 
 - the verdict report. The exit status agrees. The two reports part as
   follows:
@@ -3958,6 +3970,17 @@ PKCS#8 DER, and each block adds one signature. Twenty-five differences stand.
     of the remote; it reads no --keys-dir`;
   - without `--verify`: `error: signature: --remote applies to --verify
     alone`;
+- `--keys-dir` in a signing run, and in a `--verify` run with a KEY-ID or a
+  `--keys-file`. The tool ignores `--keys-dir` in these runs
+  (`sign/verify-keys-file-overrides-keys-dir`). The port refuses `--keys-dir`
+  in these runs at exit 1, after the refusals of `--remote`, and writes
+  nothing:
+  - without `--verify`: `error: signature: --keys-dir applies to --verify
+    alone`;
+  - with a KEY-ID or a `--keys-file`: `error: signature: a KEY-ID or a
+    --keys-file gives the keys of the verify; it reads no --keys-dir`. This
+    refusal comes before the refusal of a gpg KEY-ID and before the port reads
+    a `--keys-file`;
 - a gpg KEY-ID in a `--verify` run. The tool reads no KEY-ID in a gpg verify.
   The port refuses it at exit 1 with `error: signature: a gpg verify takes its
   keyrings from --keys-file, --remote, or the system trust; it takes no

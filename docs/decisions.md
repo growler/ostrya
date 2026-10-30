@@ -572,10 +572,12 @@ if another engine finds one. The verify modes are `sign --verify`,
 with a key source. A run with no engine is refused. The key sources are:
 
 - A key on the command line: the engines of the keys alone, and no key
-  directory. Each gpg `--keys-file` must name a regular file, as the last
-  ed25519 or spki `--keys-file` must. `GpgVerifier::from_keyring_files`
-  skips a keyring path that names no file, so the command checks each path
-  before the load.
+  directory. The command refuses a `--keys-dir` in this run. `sign` also
+  refuses `--keys-dir` in a signing run, and `summary` refuses it in each
+  mode other than `--verify`. Each gpg `--keys-file` must name a regular
+  file, as the last ed25519 or spki `--keys-file` must.
+  `GpgVerifier::from_keyring_files` skips a keyring path that names no file,
+  so the command checks each path before the load.
 - No key and no `--remote`: each engine with a trusted key in the system key
   directories and each `--keys-dir`, and the gpg engine if the GPG system
   trust holds a certificate. Each `--keys-dir` adds one directory. The two
@@ -588,7 +590,8 @@ with a key source. A run with no engine is refused. The key sources are:
   trust that cannot be read refuses a run that looks for the gpg engine. A
   broken trust store is an error of the host, and the command does not hide
   it. A `--sign-type` that selects the other engines does not read the GPG
-  system trust.
+  system trust. A `--sign-type` that selects the gpg engine alone reads no
+  `--keys-dir`.
 - `--remote`: the engines that the config of the remote turns on, as a pull
   reads them, with the keys of the remote alone. `RemoteKeys` of the `ostrya`
   crate reads them. The command reads no global GPG trusted directory and no
@@ -619,6 +622,9 @@ These alternatives were rejected:
 - A `--keys-dir` that replaces the default key directories, as the `ostree`
   command does. The key directories of the port are one set, and a revoked
   key of one directory applies to each directory.
+- A `--keys-dir` that a verify with a key on the command line or a signing
+  run of `sign` ignores, as the `ostree` command does. A user who gives a key
+  directory then gets no message when the run reads no key from it.
 - A gpg `--keys-file` that names no file and that the command skips, as the
   library skips an optional keyring. A typo then verifies with an empty
   trusted set, and no message names the path.

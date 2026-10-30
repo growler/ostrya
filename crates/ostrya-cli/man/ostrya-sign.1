@@ -35,14 +35,14 @@ The names are \fB\%ed25519\fR, \fB\%spki\fR, and \fB\%gpg\fR\&. The engine selec
 \fB\-\-keys\-file\fR \fIPATH\fR
 Read keys from a file.
 .IP
-The \%\-\-sign\-type before the file selects its engine. For \%ed25519, the file has \%base64 keys, one per line: secret keys to sign, public keys to verify. For spki, the file holds PEM \fB\%PRIVATE KEY\fR blocks, each a \%PKCS#8 DER of a \%P\-256, a \%P\-384, an \%Ed25519, or an RSA key, to sign, and PEM \fB\%PUBLIC KEY\fR blocks to verify. Each \fB\%PRIVATE KEY\fR block adds one signature. Signing reads every file. A signing file is a regular file of at most \%1 MiB. An \%ed25519 or spki verify reads the last file of its engine. With this option or a \%KEY\-ID, a verify does not read \%\-\-keys\-dir or the key directories.
+The \%\-\-sign\-type before the file selects its engine. For \%ed25519, the file has \%base64 keys, one per line: secret keys to sign, public keys to verify. For spki, the file holds PEM \fB\%PRIVATE KEY\fR blocks, each a \%PKCS#8 DER of a \%P\-256, a \%P\-384, an \%Ed25519, or an RSA key, to sign, and PEM \fB\%PUBLIC KEY\fR blocks to verify. Each \fB\%PRIVATE KEY\fR block adds one signature. Signing reads every file. A signing file is a regular file of at most \%1 MiB. An \%ed25519 or spki verify reads the last file of its engine. With this option or a \%KEY\-ID, a verify reads no key directory, and the command refuses \%\-\-keys\-dir.
 .IP
 For gpg, the file is a binary or armored keyring for verify, and every file is read. A gpg verify refuses a path that names no regular file. A gpg signing run refuses this option.
 .TP
 \fB\-\-keys\-dir\fR \fIPATH\fR
 Add a directory to the key directories of a verify.
 .IP
-The key directories are \fB\%/etc/ostree\fR, \fB\%/usr/share/ostree\fR, and each \%\-\-keys\-dir, in this order. A verify with no key and no \%\-\-remote reads \fB\%trusted.<type>\fR, \fB\%revoked.<type>\fR, and the files in \fB\%trusted.<type>.d/\fR and \fB\%revoked.<type>.d/\fR of each directory, for the \%ed25519 and spki engines. Without a \%\-\-sign\-type, if one engine finds a signature, the verify skips each engine that finds none. A revoked key of one directory applies to the keys of each directory. An \%ed25519 file has one \%base64 key per line, and an spki file has PEM \fB\%PUBLIC KEY\fR blocks. The option can occur more than once. An empty value names the working directory. The command refuses this option with \%\-\-remote.
+The key directories are \fB\%/etc/ostree\fR, \fB\%/usr/share/ostree\fR, and each \%\-\-keys\-dir, in this order. A verify with no key and no \%\-\-remote reads \fB\%trusted.<type>\fR, \fB\%revoked.<type>\fR, and the files in \fB\%trusted.<type>.d/\fR and \fB\%revoked.<type>.d/\fR of each directory, for the \%ed25519 and spki engines. Without a \%\-\-sign\-type, if one engine finds a signature, the verify skips each engine that finds none. A revoked key of one directory applies to the keys of each directory. An \%ed25519 file has one \%base64 key per line, and an spki file has PEM \fB\%PUBLIC KEY\fR blocks. The option can occur more than once. An empty value names the working directory. The command refuses this option without \%\-\-verify, with a \%KEY\-ID or a \%\-\-keys\-file, and with \%\-\-remote.
 .TP
 \fB\-\-gpg\-homedir\fR \fIGPG_HOMEDIR\fR
 The GnuPG home directory where gpg resolves signing keys.

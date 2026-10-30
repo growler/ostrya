@@ -4104,6 +4104,148 @@ fn a_sign_type_needs_a_key_of_its_own() {
     }
 }
 
+/// The refusal of a `--keys-dir` in a verify with a KEY-ID or a
+/// `--keys-file`.
+const KEYS_DIR_WITH_KEYS: &str = "error: signature: a KEY-ID or a --keys-file gives the keys of \
+                                  the verify; it reads no --keys-dir\n";
+
+/// These runs read no key directory and refuse `--keys-dir`:
+///
+/// - each mode of `sign` and `summary` other than `--verify`
+/// - a verify of `sign`, `summary`, `static-delta verify`, and `static-delta
+///   apply-offline` with a KEY-ID or a `--keys-file`
+///
+/// The refusal comes before the refusal of a gpg KEY-ID and before the gpg
+/// checks of a `--keys-file`. A refusal
+/// writes nothing on standard output and writes no signature, summary, or
+/// object.
+#[test]
+fn a_run_that_reads_no_key_directory_refuses_keys_dir() {
+    let tmp = TmpDir::new("keys-dir-unread");
+    let base = tmp.path();
+    let repo = verify_fixture(base);
+    let repo_arg = format!("--repo={}", repo.display());
+    let dir = verify_key_store(base, "store", &[ED25519_PUBLIC_B64], &[]);
+    let dir_arg = format!("--keys-dir={}", dir.display());
+    std::fs::write(base.join("k"), format!("{ED25519_PUBLIC_B64}\n")).unwrap();
+    std::fs::write(base.join("s"), format!("{ED25519_SECRET_B64}\n")).unwrap();
+    let public_arg = format!("--keys-file={}", base.join("k").display());
+    let secret_arg = format!("--keys-file={}", base.join("s").display());
+    let missing_arg = format!("--keys-file={}", base.join("missing").display());
+    let sign = format!("--sign={ED25519_SECRET_B64}");
+    let meta = repo.join(format!(
+        "objects/{}/{}.commitmeta",
+        &COMMIT[..2],
+        &COMMIT[2..]
+    ));
+    let summary = repo.join("summary");
+    let summary_sig = repo.join("summary.sig");
+    let assert_refused = |case: &[&str], stderr: &str| {
+        let mut args = vec![case[0], repo_arg.as_str()];
+        args.extend_from_slice(&case[1..]);
+        let run = ostrya(&args, None, &[]);
+        let label = case.join(" ");
+        assert_eq!(run.status.code(), Some(1), "{label}");
+        assert!(run.stdout.is_empty(), "{label}");
+        assert_eq!(String::from_utf8_lossy(&run.stderr), stderr, "{label}");
+        assert!(!meta.exists(), "{label} wrote a signature");
+        assert!(!summary_sig.exists(), "{label} signed the summary");
+    };
+
+    let unread = "error: signature: --keys-dir applies to --verify alone\n";
+    let mut signing: Vec<Vec<&str>> = vec![
+        vec!["sign", COMMIT, ED25519_SECRET_B64, &dir_arg],
+        vec!["sign", &secret_arg, &dir_arg, COMMIT],
+        vec!["summary", "-u", &sign, &dir_arg],
+        vec!["summary", "-u", ED25519_SECRET_B64, &dir_arg],
+        vec!["summary", "-u", &dir_arg],
+        vec!["summary", "--view", &dir_arg],
+        vec!["summary", &dir_arg],
+    ];
+    if cfg!(feature = "gpg") {
+        signing.push(vec![
+            "sign",
+            COMMIT,
+            "-s",
+            "gpg",
+            "0123456789ABCDEF",
+            &dir_arg,
+        ]);
+        signing.push(vec![
+            "summary",
+            "-u",
+            "--gpg-sign=0123456789ABCDEF",
+            &dir_arg,
+        ]);
+    }
+    for case in &signing {
+        assert_refused(case, unread);
+        assert!(!summary.exists(), "{} wrote a summary", case.join(" "));
+        assert!(
+            !repo.join("extensions/ostrya/summary").exists(),
+            "{} wrote a summary extension",
+            case.join(" ")
+        );
+    }
+    // A positional key signs the current summary. With `--keys-dir`, the
+    // summary keeps its bytes and gets no signature.
+    ostrya(&["summary", &repo_arg, "-u"], None, &[]).ok();
+    let before = std::fs::read(&summary).unwrap();
+    assert_refused(&["summary", ED25519_SECRET_B64, &dir_arg], unread);
+    assert_eq!(std::fs::read(&summary).unwrap(), before);
+
+    let keyed = KEYS_DIR_WITH_KEYS;
+    let mut verifying: Vec<Vec<&str>> = vec![
+        vec!["sign", "--verify", COMMIT, ED25519_PUBLIC_B64, &dir_arg],
+        vec!["sign", "--verify", &public_arg, &dir_arg, COMMIT],
+        vec!["summary", "--verify", ED25519_PUBLIC_B64, &dir_arg],
+        vec!["summary", "--verify", &public_arg, &dir_arg],
+        vec![
+            "static-delta",
+            "verify",
+            &dir_arg,
+            COMMIT,
+            ED25519_PUBLIC_B64,
+        ],
+        vec!["static-delta", "verify", &public_arg, &dir_arg, COMMIT],
+    ];
+    if cfg!(feature = "gpg") {
+        verifying.push(vec![
+            "sign",
+            "--verify",
+            COMMIT,
+            "-s",
+            "gpg",
+            "0123456789ABCDEF",
+            &dir_arg,
+        ]);
+        verifying.push(vec![
+            "sign",
+            "--verify",
+            COMMIT,
+            "-s",
+            "gpg",
+            &missing_arg,
+            &dir_arg,
+        ]);
+    }
+    for case in &verifying {
+        assert_refused(case, keyed);
+    }
+    let signed = only_delta_dir(&repo);
+    let signed = signed.to_str().unwrap();
+    let refused = || ApplyOutcome::Refused(keyed.to_owned());
+    assert_apply_cases(
+        base,
+        COMMIT,
+        &[
+            (&[&dir_arg, signed, ED25519_PUBLIC_B64], refused()),
+            (&[&public_arg, &dir_arg, signed], refused()),
+            (&[&dir_arg, "unsigned", ED25519_PUBLIC_B64], refused()),
+        ],
+    );
+}
+
 /// One `commit` signs with an ed25519 key and an spki key, and each key takes
 /// the engine of the `--sign-type` before it. `sign --verify` with a key of
 /// each engine verifies with each engine, in the order of the first key of
@@ -38165,7 +38307,7 @@ fn static_delta_verify_reports_ok_and_fails() {
 /// The key sources:
 ///
 /// - The positionals and the last `--keys-file` combine.
-/// - If either one is given, the command does not read `--keys-dir`.
+/// - The command refuses `--keys-dir` with either one.
 /// - The command reads each `--keys-dir`, with its `.d` directory and its
 ///   revoked set. A revoked key of one directory applies to each directory.
 /// - The command checks for a trusted key before it applies revocation. A
@@ -38226,15 +38368,15 @@ fn static_delta_verify_key_sources() {
         &verify_key_list_error(&[&"0".repeat(64), ED25519_PUBLIC2_HEX]),
         "positional before file lines, listed reversed",
     );
-    fails(
+    refused(
         &["--keys-dir=store1", "--keys-file=k2", COMMIT],
-        &verify_key_list_error(&[ED25519_PUBLIC2_HEX]),
-        "a keys file makes keys-dir unread",
+        KEYS_DIR_WITH_KEYS,
+        "a keys file refuses keys-dir",
     );
-    fails(
+    refused(
         &["--keys-dir=store1", COMMIT, ED25519_PUBLIC2_B64],
-        &verify_key_list_error(&[ED25519_PUBLIC2_HEX]),
-        "a positional makes keys-dir unread",
+        KEYS_DIR_WITH_KEYS,
+        "a positional refuses keys-dir",
     );
     ok(&["--keys-dir=store1", COMMIT], "keys dir");
     ok(
@@ -38769,8 +38911,6 @@ fn assert_verify_cases_agree(base: &Path, repo: &Path, c1: &str, c2: &str) {
         vec![c1, ED25519_PUBLIC_B64],
         vec!["--keys-file=k2", "--keys-file=k1", c2],
         vec!["--keys-file=k1", "--keys-file=k2", c2],
-        vec!["--keys-dir=store1", "--keys-file=k2", c2],
-        vec!["--keys-dir=store1", c2, ED25519_PUBLIC2_B64],
         vec!["--keys-dir=store1", c2],
         vec!["--keys-dir=revoked", c2],
         vec!["--keys-dir=store2", "--keys-dir=store1", c2],
@@ -38797,8 +38937,9 @@ fn assert_verify_cases_agree(base: &Path, repo: &Path, c1: &str, c2: &str) {
 
 /// `verify` of ostrya and of the `ostree` command agree byte for byte over
 /// the deltas of `ostree`. The test carries
-/// `static-delta/verify-{ok,wrong-key,unsigned,keys-file-last-wins,keys-file-overrides-keys-dir,path-arg}`
-/// with `ostree` as the producer.
+/// `static-delta/verify-{ok,wrong-key,unsigned,keys-file-last-wins,path-arg}`,
+/// and the runs of `static-delta/verify-keys-file-overrides-keys-dir` with a
+/// `--keys-dir` and no key, with `ostree` as the producer.
 #[test]
 fn static_delta_verify_matches_the_tool_over_the_tools_deltas() {
     if !ostree_supports_ed25519() {
@@ -38838,7 +38979,7 @@ fn static_delta_verify_matches_the_tool_over_the_tools_deltas() {
 
 /// `verify` of ostrya and of the `ostree` command agree byte for byte over
 /// the deltas of ostrya. `verify` of `ostree` reads a delta that ostrya signs.
-/// The test carries the same cells as
+/// The test carries the same cells and runs as
 /// `static_delta_verify_matches_the_tool_over_the_tools_deltas`, with ostrya as
 /// the producer.
 #[test]
@@ -40037,7 +40178,8 @@ fn static_delta_apply_offline_prints_nothing_and_writes_no_ref() {
 /// The key sources: a positional KEY-ID, `--keys-file`, and `--keys-dir`. Each
 /// of them turns on the verification of a signed delta. The verification runs
 /// before the command writes an object. An unsigned delta applies with each
-/// key source whose keys load.
+/// key source whose keys load. A KEY-ID or a `--keys-file` refuses a
+/// `--keys-dir`.
 #[test]
 fn static_delta_apply_offline_key_sources() {
     let tmp = TmpDir::new("delta-apply-keys");
@@ -40078,7 +40220,7 @@ fn static_delta_apply_offline_key_sources() {
             ),
             (
                 &["--keys-dir=store2", "--keys-file=k1", signed],
-                ApplyOutcome::Applied,
+                ApplyOutcome::Refused(KEYS_DIR_WITH_KEYS.to_owned()),
             ),
             (&["--sign-type=ed25519", signed], refused(own_key)),
             (
@@ -40458,7 +40600,6 @@ fn assert_apply_cases_agree(base: &Path, c1: &str, c2: &str) {
         vec![&unsigned, ED25519_PUBLIC2_B64],
         vec!["--keys-file=k2", "--keys-file=k1", &signed],
         vec!["--keys-file=k1", "--keys-file=k2", &signed],
-        vec!["--keys-dir=store1", "--keys-file=k2", &signed],
         vec!["--keys-dir=store1", &signed],
         vec!["--keys-dir=store2", &signed],
         vec!["--keys-dir=revoked", &signed],
@@ -41544,11 +41685,14 @@ enum KeySourceOutcome {
 /// - the KEY-ID positionals after it
 /// - the outcome
 /// - `true` if `sign --verify` of the `ostree` command gives the same outcome
+/// - the exit status of `sign --verify` of the `ostree` command for a
+///   `--keys-dir` beside a KEY-ID or a `--keys-file`, which ostrya refuses
 struct KeySourceRow {
     options: Vec<&'static str>,
     keys: Vec<&'static str>,
     outcome: KeySourceOutcome,
     tool_agrees: bool,
+    tool_exit: Option<i32>,
 }
 
 /// Writes the key files and the key stores that the key-source rows name into
@@ -41599,6 +41743,7 @@ fn key_source_rows() -> Vec<KeySourceRow> {
             keys: keys.to_vec(),
             outcome,
             tool_agrees,
+            tool_exit: None,
         };
     let no_keys = || Refused(no_engine_error(true));
     let not_regular = |path: &str| {
@@ -41612,36 +41757,19 @@ fn key_source_rows() -> Vec<KeySourceRow> {
              bytes\n"
         ))
     };
+    let keyed = |options: &[&'static str], keys: &[&'static str], tool_exit| KeySourceRow {
+        options: options.to_vec(),
+        keys: keys.to_vec(),
+        outcome: Refused(KEYS_DIR_WITH_KEYS.to_owned()),
+        tool_agrees: false,
+        tool_exit: Some(tool_exit),
+    };
     vec![
         row(&["--keys-file=k2", "--keys-file=k1"], &[], Verdict(0), true),
         row(&["--keys-file=k1", "--keys-file=k2"], &[], Verdict(1), true),
         row(
             &["--keys-file=k1"],
             &[ED25519_PUBLIC2_B64],
-            Verdict(0),
-            true,
-        ),
-        row(
-            &["--keys-dir=store1", "--keys-file=k2"],
-            &[],
-            Verdict(1),
-            true,
-        ),
-        row(
-            &["--keys-dir=store1"],
-            &[ED25519_PUBLIC2_B64],
-            Verdict(1),
-            true,
-        ),
-        row(
-            &["--keys-dir=revoked"],
-            &[ED25519_PUBLIC_B64],
-            Verdict(0),
-            true,
-        ),
-        row(
-            &["--keys-dir=revoked", "--keys-file=k1"],
-            &[],
             Verdict(0),
             true,
         ),
@@ -41667,14 +41795,13 @@ fn key_source_rows() -> Vec<KeySourceRow> {
         row(&["--keys-dir="], &[], Verdict(0), true),
         row(&["--keys-dir=dotd"], &[], Verdict(0), true),
         row(&["--keys-dir=revoked"], &[], Verdict(1), true),
-        row(
-            &["--keys-dir=nodir"],
-            &[ED25519_PUBLIC_B64],
-            Verdict(0),
-            true,
-        ),
         row(&["--keys-file=lenient2"], &[], Verdict(0), true),
         row(&["--keys-file=blank-first"], &[], Verdict(0), false),
+        keyed(&["--keys-dir=store1", "--keys-file=k2"], &[], 1),
+        keyed(&["--keys-dir=store1"], &[ED25519_PUBLIC2_B64], 1),
+        keyed(&["--keys-dir=revoked"], &[ED25519_PUBLIC_B64], 0),
+        keyed(&["--keys-dir=revoked", "--keys-file=k1"], &[], 0),
+        keyed(&["--keys-dir=nodir"], &[ED25519_PUBLIC_B64], 0),
         row(&["--keys-dir=only-revoked"], &[], no_keys(), false),
         row(&["--keys-dir=nodir"], &[], no_keys(), false),
         row(
@@ -41783,8 +41910,8 @@ fn run_summary_verify(cwd: &Path, repo: &Path, options: &[&str], keys: &[&str]) 
 /// `sign --verify` reads the same key sources as `static-delta verify`:
 ///
 /// - the positionals and the last `--keys-file`
-/// - each `--keys-dir`, which the command does not read if a positional or a
-///   `--keys-file` is given
+/// - each `--keys-dir`, which the command refuses with a positional or a
+///   `--keys-file`
 /// - an empty `--keys-dir`, which names the working directory
 ///
 /// The command checks for a trusted key before it applies revocation. If a
@@ -41821,7 +41948,9 @@ fn summary_verify_key_sources() {
 /// ostrya signed. Over each commit, `sign --verify` of ostrya gives the verdict
 /// of `ostree` on each key-source row with `tool_agrees` set. Each refusal
 /// before verification agrees byte for byte. The verdict reports of the two
-/// commands differ. The test carries
+/// commands differ. ostrya refuses a `--keys-dir` with a KEY-ID or a
+/// `--keys-file`, and `ostree` verifies with the other keys and exits with the
+/// `tool_exit` of the row. The test carries
 /// `sign/verify-{keys-file-last-wins,keys-file-overrides-keys-dir,keys-dir-last-wins,no-keys,keys-file-not-regular,report}`.
 #[test]
 fn sign_verify_key_sources_match_the_tool() {
@@ -41844,6 +41973,19 @@ fn sign_verify_key_sources_match_the_tool() {
                 }
                 KeySourceOutcome::Refused(_) => assert_runs_agree(&port, &tool, &label),
             }
+        }
+        // A KEY-ID or a `--keys-file` with a `--keys-dir`: `ostree` reads no
+        // key directory and gives the verdict of the other keys. ostrya
+        // refuses the run.
+        for row in key_source_rows() {
+            let Some(code) = row.tool_exit else {
+                continue;
+            };
+            let label = format!("{who}-signed: {}", key_source_label(&row));
+            let port = run_sign_verify(base, &repo, &row.options, &row.keys, false);
+            let tool = run_sign_verify(base, &repo, &row.options, &row.keys, true);
+            assert_verify_run(&port, 1, "", KEYS_DIR_WITH_KEYS, &format!("port, {label}"));
+            assert_eq!(tool.status.code(), Some(code), "tool, {label}");
         }
         // The report: `ostree` prints one line with the key that verified.
         // ostrya prints one line for each signature, and the verdict.

@@ -2896,8 +2896,8 @@ struct SignArgs {
     /// PEM `PUBLIC KEY` blocks to verify. Each `PRIVATE KEY` block adds one
     /// signature. Signing reads every file. A signing file is a regular file
     /// of at most 1 MiB. An ed25519 or spki verify reads the last file of its
-    /// engine. With this option or a KEY-ID, a verify does not read --keys-dir
-    /// or the key directories.
+    /// engine. With this option or a KEY-ID, a verify reads no key directory,
+    /// and the command refuses --keys-dir.
     ///
     /// For gpg, the file is a binary or armored keyring for verify, and every
     /// file is read. A gpg verify refuses a path that names no regular file.
@@ -2915,7 +2915,8 @@ struct SignArgs {
     /// of one directory applies to the keys of each directory. An ed25519 file
     /// has one base64 key per line, and an spki file has PEM `PUBLIC KEY`
     /// blocks. The option can occur more than once. An empty value names the
-    /// working directory. The command refuses this option with --remote.
+    /// working directory. The command refuses this option without --verify,
+    /// with a KEY-ID or a --keys-file, and with --remote.
     #[arg(long, value_name = "PATH")]
     keys_dir: Vec<std::ffi::OsString>,
     /// The GnuPG home directory where gpg resolves signing keys.
@@ -3103,11 +3104,11 @@ struct SummaryArgs {
     /// The --sign-type before the file selects its engine. For spki, a
     /// signing file holds PEM `PRIVATE KEY` blocks, and a verify file holds
     /// PEM `PUBLIC KEY` blocks. An ed25519 or spki verify reads the last file
-    /// of its engine. With this option or a KEY-ID, a verify does not read
-    /// --keys-dir or the key directories. A signing run reads every file. A
-    /// gpg verify reads every file as a keyring, and refuses a path that names
-    /// no regular file. A gpg signing run refuses this option. Without -u and
-    /// --verify, the keys sign the existing summary.
+    /// of its engine. With this option or a KEY-ID, a verify reads no key
+    /// directory, and the command refuses --keys-dir. A signing run reads
+    /// every file. A gpg verify reads every file as a keyring, and refuses a
+    /// path that names no regular file. A gpg signing run refuses this option.
+    /// Without -u and --verify, the keys sign the existing summary.
     #[arg(long, value_name = "PATH")]
     keys_file: Vec<std::ffi::OsString>,
     /// Add a directory to the key directories of a verify.
@@ -3121,7 +3122,8 @@ struct SummaryArgs {
     /// of one directory applies to the keys of each directory. An ed25519 file
     /// has one base64 key per line, and an spki file has PEM `PUBLIC KEY`
     /// blocks. The option can occur more than once. An empty value names the
-    /// working directory. The command refuses this option with --remote.
+    /// working directory. The command refuses this option without --verify,
+    /// with a KEY-ID or a --keys-file, and with --remote.
     #[arg(long, value_name = "PATH")]
     keys_dir: Vec<std::ffi::OsString>,
     /// The GnuPG home directory where gpg resolves signing keys.
@@ -3291,8 +3293,8 @@ struct DeltaVerifyArgs {
     /// The --sign-type before the file selects its engine. For ed25519, the
     /// file has one base64 key per line. For spki, it has PEM `PUBLIC KEY`
     /// blocks. The command reads the last file of each engine. With this
-    /// option or a KEY-ID, the command does not read --keys-dir or the key
-    /// directories. The path must name a regular file of 1 MiB or less. The
+    /// option or a KEY-ID, the command reads no key directory, and refuses
+    /// --keys-dir. The path must name a regular file of 1 MiB or less. The
     /// command takes an empty value as given, and refuses it because it is
     /// not a regular file.
     #[arg(long, value_name = "PATH")]
@@ -3308,7 +3310,8 @@ struct DeltaVerifyArgs {
     /// engine that finds none. A revoked key of one directory applies to the
     /// keys of each directory. An ed25519 file has one base64 key per line, and
     /// an spki file has PEM `PUBLIC KEY` blocks. The option can occur more than
-    /// once. An empty value names the working directory.
+    /// once. An empty value names the working directory. The command refuses
+    /// this option with a KEY-ID or a --keys-file.
     #[arg(long, value_name = "PATH")]
     keys_dir: Vec<std::ffi::OsString>,
     // ostrya checks this operand after the repository resolves.
@@ -3346,8 +3349,8 @@ struct DeltaApplyArgs {
     /// The --sign-type before the file selects its engine. For ed25519, the
     /// file has one base64 key per line. For spki, it has PEM `PUBLIC KEY`
     /// blocks. The command reads the last file of each engine. With this
-    /// option or a KEY-ID, the command does not read --keys-dir or the key
-    /// directories. The path must name a regular file of 1 MiB or less.
+    /// option or a KEY-ID, the command reads no key directory, and refuses
+    /// --keys-dir. The path must name a regular file of 1 MiB or less.
     #[arg(long, value_name = "PATH")]
     keys_file: Vec<std::ffi::OsString>,
     /// Add a directory to the key directories.
@@ -3361,7 +3364,8 @@ struct DeltaApplyArgs {
     /// none. A revoked key of one directory applies to the keys of each
     /// directory. An ed25519 file has one base64 key per line, and an spki file
     /// has PEM `PUBLIC KEY` blocks. The option can occur more than once. An
-    /// empty value names the working directory.
+    /// empty value names the working directory. The command refuses this
+    /// option with a KEY-ID or a --keys-file.
     #[arg(long, value_name = "PATH")]
     keys_dir: Vec<std::ffi::OsString>,
     // ostrya checks this operand after the repository resolves.
@@ -7066,7 +7070,8 @@ fn verification_fails(text: &str) -> ! {
 /// 1. The argument is present.
 /// 2. ostrya supports each sign type, and each `--sign-type` with a key on
 ///    the command line has a key of its own.
-/// 3. The keys of each engine load.
+/// 3. The keys of each engine load. A KEY-ID or a `--keys-file` refuses a
+///    `--keys-dir`.
 /// 4. The argument resolves, and the superblock reads.
 /// 5. The signatures verify with each engine, in the order of the engines.
 ///    [`skip_unsigned_engines`] then skips each engine of the key directories
@@ -7198,9 +7203,9 @@ fn verify_sign_type(name: &str, report_unsupported: bool) -> SignType {
 /// 2. ostrya supports each sign type, and each `--sign-type` has a key of its
 ///    own.
 /// 3. The keys load, if a key source is given. A key source is a KEY-ID, a
-///    `--keys-file`, or a `--keys-dir`. With a `--keys-dir` and no key, the
-///    keys come from the key directories, and a run that finds no engine is
-///    refused.
+///    `--keys-file`, or a `--keys-dir`. A KEY-ID or a `--keys-file` refuses a
+///    `--keys-dir`. With a `--keys-dir` and no key, the keys come from the key
+///    directories, and a run that finds no engine is refused.
 /// 4. [`lexical_path`] applies the `..` components of the path. Then the path
 ///    resolves, and the superblock reads.
 /// 5. The signatures of a signed delta verify with each engine. With no key,
@@ -7332,7 +7337,8 @@ struct VerifySources<'a> {
 /// With `--remote`, the keys come from the remote, as
 /// [`remote_verify_keys`] reads them. The command refuses `--remote` with a
 /// key on the command line and with a `--keys-dir`. Without `--remote`,
-/// [`local_verify_keys`] reads the keys.
+/// [`local_verify_keys`] reads the keys, and refuses a `--keys-dir` with a key
+/// on the command line.
 async fn verify_keys(
     repo: &Repo,
     sources: &VerifySources<'_>,
@@ -7426,7 +7432,7 @@ async fn remote_verify_keys(
 /// - The gpg engine trusts the keyrings of each of its `--keys-file` values.
 ///   Each value must name a regular file. A gpg KEY-ID is refused.
 ///
-/// The run then reads no key directory.
+/// The call refuses a `--keys-dir`, because the run reads no key directory.
 ///
 /// With no key, the engines are the engines of the `--sign-type` values, or
 /// else ed25519, spki, and gpg. An ed25519 or spki engine reads the system
@@ -7443,6 +7449,12 @@ async fn remote_verify_keys(
 fn local_verify_keys(sources: &VerifySources<'_>) -> Result<Vec<(SignType, VerifyKeys)>> {
     let engines = sources.engines;
     if engines.has_key() {
+        if !sources.keys_dir.is_empty() {
+            return Err(Error::Signature(
+                "a KEY-ID or a --keys-file gives the keys of the verify; it reads no --keys-dir"
+                    .into(),
+            ));
+        }
         let key_engines = engines.of("key_id");
         let file_engines = engines.of("keys_file");
         if key_engines.contains(&SignType::Gpg) {
@@ -13949,7 +13961,8 @@ async fn diff(repo: Repo, name: &str, args: DiffArgs, owner: Owner) -> Result<()
 /// Signs a commit, or verifies its signatures.
 ///
 /// The `--sign-type` values are read first, then the COMMIT. Each key takes
-/// the engine of the nearest `--sign-type` before it.
+/// the engine of the nearest `--sign-type` before it. A signing run refuses
+/// `--remote` and `--keys-dir`.
 async fn sign(repo: Repo, name: &str, args: SignArgs) -> Result<()> {
     let engines = match args.key_types.engines(sign_type_from_name, args.verify) {
         Ok(engines) => engines,
@@ -13968,6 +13981,8 @@ async fn sign(repo: Repo, name: &str, args: SignArgs) -> Result<()> {
         verify_signatures(&repo, &commit, &args, &engines).await
     } else if args.remote.is_some() {
         Err(remote_without_verify())
+    } else if !args.keys_dir.is_empty() {
+        Err(keys_dir_without_verify())
     } else {
         add_signatures(&repo, &commit, &args, &engines).await
     }
@@ -13978,10 +13993,16 @@ fn remote_without_verify() -> Error {
     Error::Signature("--remote applies to --verify alone".into())
 }
 
+/// Returns the refusal of `--keys-dir` in a run that does not verify.
+fn keys_dir_without_verify() -> Error {
+    Error::Signature("--keys-dir applies to --verify alone".into())
+}
+
 /// Updates, verifies, signs, or reads the summary of the repository.
 ///
 /// Each mode reads the `--sign-type` values. A mode other than `--verify`
-/// refuses a `--sign-type` with no key of its own.
+/// refuses a `--sign-type` with no key of its own, `--remote`, and
+/// `--keys-dir`.
 async fn summary(repo: Repo, args: SummaryArgs) -> Result<()> {
     let item = match &args.auth_group {
         Some(name) => Some(summary_auth_item(&repo, name, &args)?),
@@ -13992,6 +14013,9 @@ async fn summary(repo: Repo, args: SummaryArgs) -> Result<()> {
     }
     if args.remote.is_some() {
         return Err(remote_without_verify());
+    }
+    if !args.keys_dir.is_empty() {
+        return Err(keys_dir_without_verify());
     }
 
     if args.update {

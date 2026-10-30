@@ -807,10 +807,10 @@ impl Policy {
     /// is `None` if the payload carries no signatures. `subject` names the
     /// payload in an error message.
     ///
-    /// Each verifier of each axis runs on the blocking pool, because a
-    /// verifier does its work in the call. The verifiers share one copy of
-    /// `payload` on the pool. [`Payload`] states when the check makes this
-    /// copy.
+    /// The verifiers run on the blocking pool, because a verifier does its
+    /// work in the call. The verifiers of one axis run in one call. The axes
+    /// share one copy of `payload` on the pool. [`Payload`] states when the
+    /// check makes this copy.
     pub(crate) async fn check<'p>(
         &self,
         subject: &str,
@@ -840,7 +840,8 @@ impl Policy {
 /// The verifiers of a check run on the blocking pool, and the pool gets the
 /// payload in an [`Arc`]. If the caller holds the payload in an `Arc`, it
 /// gives [`Payload::Shared`], and the pool gets no copy. The check copies a
-/// [`Payload::Borrowed`] payload one time, when the first verifier runs.
+/// [`Payload::Borrowed`] payload one time, when the first axis with a
+/// signature goes to the pool.
 #[derive(Clone, Copy)]
 pub(crate) enum Payload<'a> {
     /// A payload that the caller borrows.
@@ -886,7 +887,8 @@ impl<'a> From<&'a Arc<Vec<u8>>> for Payload<'a> {
 /// blocking pool.
 struct PoolCopy<'a> {
     payload: Payload<'a>,
-    /// The copy of a borrowed payload, made when the first verifier runs.
+    /// The copy of a borrowed payload, made when the first axis goes to the
+    /// pool.
     copy: Option<Arc<Vec<u8>>>,
 }
 
@@ -898,8 +900,8 @@ impl<'a> PoolCopy<'a> {
         }
     }
 
-    /// Returns the payload for one verifier on the pool. The first call for a
-    /// borrowed payload copies it.
+    /// Returns the payload for the verifiers of one axis on the pool. The first
+    /// call for a borrowed payload copies it.
     fn shared(&mut self) -> Arc<Vec<u8>> {
         match self.payload {
             Payload::Shared(bytes) => Arc::clone(bytes),
@@ -930,9 +932,10 @@ pub(crate) enum Found {
 /// [`Found::Nothing`] is a refusal. An unsigned static delta gives
 /// [`Found::Nothing`], and the delta check accepts it.
 ///
-/// Each verifier runs on the blocking pool, with the payload that the
-/// verifiers share, and the blobs that the search reads for the verifier.
-/// [`Payload`] states when the check copies the payload.
+/// The search reads the blobs of each verifier before the verifiers run. The
+/// verifiers that have a blob then run in one call on the blocking pool, in
+/// order, with the payload that they share. The call stops at the first valid
+/// signature. [`Payload`] states when the check copies the payload.
 pub(crate) async fn examine<'p>(
     verifiers: &[Arc<dyn Verifier>],
     payload: impl Into<Payload<'p>>,
@@ -942,30 +945,47 @@ pub(crate) async fn examine<'p>(
 }
 
 /// Verifies `payload` on one axis as [`examine`] does. The verifiers get the
-/// shared copy of `payload`.
+/// shared copy of `payload` in one call on the blocking pool. An axis with no
+/// blob gets no copy.
 async fn examine_pooled(
     verifiers: &[Arc<dyn Verifier>],
     payload: &mut PoolCopy<'_>,
     signatures: Option<&Value>,
 ) -> Result<Found> {
-    let mut found = Found::Nothing;
-    for verifier in verifiers {
-        let blobs = match signatures {
-            Some(dict) => signatures_for(dict, verifier.metadata_key()),
-            None => Vec::new(),
-        };
-        if blobs.is_empty() {
-            continue;
-        }
-        found = Found::Untrusted;
-        let payload = payload.shared();
-        let verifier = Arc::clone(verifier);
-        let outcome = ostrya_rt::unblock(move || verifier.verify(&payload, &blobs)).await?;
-        if outcome.valid {
-            return Ok(Found::Valid);
+    let Some(dict) = signatures else {
+        return Ok(Found::Nothing);
+    };
+    let jobs: Vec<Job> = verifiers
+        .iter()
+        .filter_map(|verifier| {
+            let blobs = signatures_for(dict, verifier.metadata_key());
+            (!blobs.is_empty()).then(|| (Arc::clone(verifier), blobs))
+        })
+        .collect();
+    if jobs.is_empty() {
+        return Ok(Found::Nothing);
+    }
+    let payload = payload.shared();
+    if ostrya_rt::unblock(move || first_valid(&jobs, &payload)).await? {
+        Ok(Found::Valid)
+    } else {
+        Ok(Found::Untrusted)
+    }
+}
+
+/// A verifier of an axis and the blobs that the search reads for it.
+type Job = (Arc<dyn Verifier>, Vec<Vec<u8>>);
+
+/// Runs each verifier of `jobs` over `payload` with its blobs, in order.
+/// Returns `true` at the first valid signature, and the verifiers after it do
+/// not run. Returns the first error of a verifier.
+fn first_valid(jobs: &[Job], payload: &[u8]) -> ostrya_sign::Result<bool> {
+    for (verifier, blobs) in jobs {
+        if verifier.verify(payload, blobs)?.valid {
+            return Ok(true);
         }
     }
-    Ok(found)
+    Ok(false)
 }
 
 /// Verifies `payload` on one axis, and refuses it if no key of the axis signed
@@ -1571,6 +1591,92 @@ mod tests {
         ostrya_rt::block_on(policy.check("commit", &payload, Some(&dict))).unwrap();
         gpg.assert_no_copy_of(&payload);
         sign.assert_no_copy_of(&payload);
+    }
+
+    /// The verifiers of an axis stop at the first valid signature. A verifier
+    /// after it does not run, though the payload carries its blobs.
+    #[test]
+    fn an_axis_stops_at_the_first_valid_signature() {
+        use crate::sign::append_signature;
+        use crate::verify::trust::tests::ThreadRecorder;
+
+        let first = ThreadRecorder::new("ostree.sign.ed25519");
+        let second = ThreadRecorder::new("ostree.sign.spki");
+        let policy = Policy::from_axes(
+            None,
+            Some(vec![Arc::new(first.clone()), Arc::new(second.clone())]),
+        );
+        let mut dict = Value::Array(Vec::new());
+        append_signature(&mut dict, "ostree.sign.ed25519", vec![7; 64]).unwrap();
+        append_signature(&mut dict, "ostree.sign.spki", vec![9; 64]).unwrap();
+        ostrya_rt::block_on(policy.check("commit", PAYLOAD, Some(&dict))).unwrap();
+        first.assert_one_foreign_call();
+        assert!(second.threads().is_empty());
+    }
+
+    /// An axis whose verifiers find no blob calls no verifier, and the check
+    /// refuses the payload as unsigned.
+    #[test]
+    fn an_axis_with_no_blob_calls_no_verifier() {
+        use crate::verify::trust::tests::{ThreadRecorder, dict_with};
+
+        let first = ThreadRecorder::new("ostree.sign.ed25519");
+        let second = ThreadRecorder::new("ostree.sign.spki");
+        let policy = Policy::from_axes(
+            None,
+            Some(vec![Arc::new(first.clone()), Arc::new(second.clone())]),
+        );
+        let dict = dict_with("ostree.sign.other", vec![7; 64]);
+        let err = ostrya_rt::block_on(policy.check("commit", PAYLOAD, Some(&dict))).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("sign-api verification is enabled, but it carries no signature"),
+            "{err}"
+        );
+        assert!(first.threads().is_empty());
+        assert!(second.threads().is_empty());
+    }
+
+    /// The verifiers of an axis run in one call on the blocking pool. One poll
+    /// of the check gives a verifier that rejects its blobs and the verifier
+    /// after it to the pool.
+    #[test]
+    fn the_verifiers_of_an_axis_run_in_one_call() {
+        use std::task::Poll;
+        use std::time::{Duration, Instant};
+
+        use crate::sign::append_signature;
+        use crate::verify::trust::tests::ThreadRecorder;
+
+        let rejecting = ThreadRecorder::rejecting("ostree.sign.ed25519");
+        let accepting = ThreadRecorder::new("ostree.sign.spki");
+        let policy = Policy::from_axes(
+            None,
+            Some(vec![
+                Arc::new(rejecting.clone()),
+                Arc::new(accepting.clone()),
+            ]),
+        );
+        let mut dict = Value::Array(Vec::new());
+        append_signature(&mut dict, "ostree.sign.ed25519", vec![7; 64]).unwrap();
+        append_signature(&mut dict, "ostree.sign.spki", vec![9; 64]).unwrap();
+        ostrya_rt::block_on(async {
+            let mut check = std::pin::pin!(policy.check("commit", PAYLOAD, Some(&dict)));
+            // The test does not poll the check again before the accepting
+            // verifier runs. Thus the one poll gives each verifier of the
+            // axis to the pool.
+            let first = std::future::poll_fn(|cx| Poll::Ready(check.as_mut().poll(cx))).await;
+            if first.is_pending() {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while accepting.threads().is_empty() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+            }
+            assert_eq!(accepting.threads().len(), 1);
+            check.await.unwrap();
+        });
+        rejecting.assert_one_foreign_call();
+        accepting.assert_one_foreign_call();
     }
 
     /// `TrustedKeys::new` refuses a dummy verifier, alone and next to a real

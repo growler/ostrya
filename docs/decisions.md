@@ -311,7 +311,10 @@ holds the payload in an `Arc` gives the `Arc`, and the pool gets no copy.
 These paths are the commit check, the summary check, and the delta check of
 a pull, the trust check of the receive endpoint, the search of the receive
 endpoint for a signature of its own key, and the summary check of `remote
-fsck` of a bucket. A client sets the number of signature blobs that the
+fsck` of a bucket. Each of these paths, other than the search for a
+signature of the own key, runs the verifiers of one axis in one call on the
+blocking pool. The call runs them in order and stops at the first valid
+signature. A client sets the number of signature blobs that the
 receive endpoint verifies, and a summary can be as large as 64 MiB.
 `Repo::verify_commit`, `Repo::verify_summary`, and
 `Repo::verify_static_delta` take `Arc<dyn Verifier>` and run the verifiers on

@@ -549,8 +549,8 @@ pub(crate) mod tests {
     /// `verify`.
     pub(crate) type SeenPayload = (usize, Vec<u8>);
 
-    /// A verifier that accepts each blob and records the thread and the data
-    /// of each call.
+    /// A verifier that accepts or rejects each blob and records the thread and
+    /// the data of each call.
     ///
     /// A clone shares the record, so a test keeps a handle on the record after
     /// it gives the verifier away.
@@ -558,6 +558,9 @@ pub(crate) mod tests {
     pub(crate) struct ThreadRecorder {
         /// The detached-metadata key that the verifier reads.
         key: &'static str,
+        /// If `true`, the verifier accepts a blob. If `false`, it rejects each
+        /// blob.
+        valid: bool,
         /// The thread of each call to `verify`, in order.
         threads: Arc<Mutex<Vec<ThreadId>>>,
         /// The address of the data and a copy of the data of each call to
@@ -566,12 +569,23 @@ pub(crate) mod tests {
     }
 
     impl ThreadRecorder {
-        /// Creates a recorder that reads the blobs under `key`.
+        /// Creates a recorder that reads the blobs under `key` and accepts
+        /// them.
         pub(crate) fn new(key: &'static str) -> ThreadRecorder {
             ThreadRecorder {
                 key,
+                valid: true,
                 threads: Arc::default(),
                 payloads: Arc::default(),
+            }
+        }
+
+        /// Creates a recorder that reads the blobs under `key` and rejects
+        /// them.
+        pub(crate) fn rejecting(key: &'static str) -> ThreadRecorder {
+            ThreadRecorder {
+                valid: false,
+                ..ThreadRecorder::new(key)
             }
         }
 
@@ -625,7 +639,7 @@ pub(crate) mod tests {
                 .unwrap()
                 .push((data.as_ptr() as usize, data.to_vec()));
             Ok(crate::sign::VerifyOutcome {
-                valid: !signatures.is_empty(),
+                valid: self.valid && !signatures.is_empty(),
                 ..Default::default()
             })
         }

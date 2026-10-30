@@ -2766,7 +2766,7 @@ impl KeyEngines {
         self.keys.iter().any(|(_, values)| !values.is_empty())
     }
 
-    /// Returns `true` if a key or a `--sign-type` names `engine`.
+    /// Returns `true` if a `--sign-type` value names `engine`.
     fn names(&self, engine: SignType) -> bool {
         self.types.contains(&engine)
     }

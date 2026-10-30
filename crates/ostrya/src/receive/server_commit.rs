@@ -201,8 +201,10 @@ pub(super) async fn finish(
         Some(timestamp) => timestamp,
         None => clock().map_err(Failure::Internal)?,
     };
-    let bytes = commit_bytes(&sc, tip, timestamp, collection_id)
-        .map_err(|e| Failure::Internal(e.into()))?;
+    let bytes = Arc::new(
+        commit_bytes(&sc, tip, timestamp, collection_id)
+            .map_err(|e| Failure::Internal(e.into()))?,
+    );
     // The commit bytes hold the other fields of the server commit. They are
     // freed here, so they are not held while the hook of the host runs.
     let ServerCommit {

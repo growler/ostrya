@@ -1318,12 +1318,13 @@ async fn read_stored_for(
 /// The call reads the dict that the repository holds for the commit. A key
 /// that signed the commit in that dict, or in a signature that a key before
 /// it made, makes no signature. A merged dict over the size limit is
-/// `limit-exceeded`.
+/// `limit-exceeded`. The search for a signature gives `payload` to each
+/// verifier with no copy.
 pub(super) async fn sign_server_commit(
     repo: &Repo,
     txn: &Transaction,
     commit: Checksum,
-    payload: &[u8],
+    payload: &Arc<Vec<u8>>,
     signers: &[Arc<ServerSigner>],
 ) -> Checked<()> {
     let mut unique: Vec<&Arc<ServerSigner>> = Vec::with_capacity(signers.len());
@@ -2304,6 +2305,27 @@ mod tests {
 
     const KEY: &str = "ostree.sign.ed25519";
 
+    /// A temporary directory that is removed on drop.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Scratch {
+            let dir = std::env::temp_dir().join(format!(
+                "ostrya-finish-{tag}-{}-{}",
+                std::process::id(),
+                crate::write::unique()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            Scratch(dir)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     /// Returns `count` updates that expect their refs absent. The request does
     /// not state an old commit, and the reply can.
     fn absent_updates(count: usize) -> Vec<RefUpdate> {
@@ -2546,5 +2568,47 @@ mod tests {
             .unwrap(),
             Some(written)
         );
+    }
+
+    /// The signature of a server commit gives the commit bytes to the
+    /// verifier of each key with no copy. The second key reads the signature
+    /// of the first key, so its verifier runs.
+    #[test]
+    fn the_server_commit_search_gets_the_bytes_with_no_copy() {
+        use crate::sign::DummySigner;
+        use crate::verify::trust::tests::ThreadRecorder;
+
+        let scratch = Scratch::new("server-commit");
+        let recorder = ThreadRecorder::new("ostree.sign.dummy");
+        let server = || {
+            Arc::new(
+                ServerSigner::new(
+                    Box::new(DummySigner::new(b"k".to_vec())),
+                    Box::new(recorder.clone()),
+                )
+                .unwrap(),
+            )
+        };
+        let signers = [server(), server()];
+        let payload = Arc::new(b"commit".to_vec());
+        ostrya_rt::block_on(async {
+            let repo = Repo::create(
+                &scratch.0.join("repo"),
+                crate::CreateOptions::new(crate::RepoMode::Archive),
+            )
+            .await
+            .unwrap();
+            let txn = repo.transaction().await.unwrap();
+            let commit = Checksum::from_bytes([1; 32]);
+            assert!(
+                sign_server_commit(&repo, &txn, commit, &payload, &signers)
+                    .await
+                    .is_ok()
+            );
+            txn.abort().await.unwrap();
+        });
+        drop(scratch);
+        recorder.assert_one_foreign_call();
+        recorder.assert_no_copy_of(&payload);
     }
 }

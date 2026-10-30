@@ -2787,7 +2787,10 @@ port differs.
    before the repository opens. The tool reads these options in command-line
    order. So a command line with a refusable id and a refusable policy reports
    the leftmost of the two (`cli-surface.md`, "P2", `commit`).
-2. The repository opens.
+2. The repository opens. The port reads the `--sign-type` values after this
+   step and before step 3. At that point, it refuses a name that no engine
+   carries and a `--sign-type` with no key of its own (`cli-surface.md`, "P2",
+   `commit`).
 3. The control files: first the `--statoverride` file, then the `--skip-list`
    file. Their open, read, UTF-8, and syntax faults come here.
 4. The branch check of `-b` and `--orphan`.
@@ -2826,7 +2829,9 @@ Then the tool writes the tree and the commit object, and these steps follow:
     in `objects/`. Not observed: the objects that the tool leaves for `a^b`.
     A branch name that ends in `^` has an earlier position in the tool
     (`cli-surface.md`, "P2", `commit`).
-17. The signing step, in the order of `commit`, "Signing".
+17. The signing step, in the order of `commit`, "Signing". In the port, this
+    step reads the keys, and the `--sign-type` values come after step 2
+    (`cli-surface.md`, "P2", `commit`).
 18. The publication and the ref write (`../format-reference.md`, "Signing
     sequence").
 

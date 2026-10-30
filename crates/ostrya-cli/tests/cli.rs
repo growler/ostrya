@@ -468,13 +468,13 @@ fn ostrya_in(cwd: Option<&Path>, args: &[&str], stdin: Option<&[u8]>, env: &[(&s
         cmd.env(k, v);
     }
     let mut child = cmd.spawn().expect("spawn ostrya");
-    if let Some(bytes) = stdin {
-        child
-            .stdin
-            .take()
-            .unwrap()
-            .write_all(bytes)
-            .expect("write stdin");
+    // A command that exits before it reads its input closes the pipe, and the
+    // write then fails with `BrokenPipe`. The run gives the result.
+    if let Some(bytes) = stdin
+        && let Err(e) = child.stdin.take().unwrap().write_all(bytes)
+        && e.kind() != std::io::ErrorKind::BrokenPipe
+    {
+        panic!("write stdin: {e}");
     }
     let out = child.wait_with_output().expect("wait ostrya");
     Run {
@@ -4101,6 +4101,77 @@ fn a_sign_type_needs_a_key_of_its_own() {
              keys as KEY-ID arguments or with --keys-file\n",
             "{key}"
         );
+    }
+}
+
+/// `commit` reads each `--sign-type` value as its first step. A refused value
+/// beside an earlier fault gets the refusal of the value: a tree source that
+/// does not open, a `--base` or a `--parent` that does not resolve, a refused
+/// timestamp over a tree that opens, a standard input that is not a tar
+/// stream, a control file that does not open, and a missing branch. A refusal
+/// writes nothing on standard output, moves no ref, and writes no object.
+#[test]
+fn commit_checks_the_sign_type_before_the_tree() {
+    let tmp = TmpDir::new("commit-sign-type-first");
+    let base = tmp.path();
+    let repo = create_repo(base, RepoMode::Archive);
+    build_fixture_source(base);
+    let repo_arg = format!("--repo={}", repo.display());
+    let src = base.join("src");
+    let src = src.to_str().unwrap();
+    let absent = base.join("absent");
+    let absent = absent.to_str().unwrap();
+    let sign = format!("--sign={ED25519_SECRET_B64}");
+    let tree_dir = format!("--tree=dir={absent}");
+    let tree_tar = format!("--tree=tar={absent}");
+    let statoverride = format!("--statoverride={absent}");
+    let skip_list = format!("--skip-list={absent}");
+    let not_implemented = "error: Requested signature type is not implemented\n".to_owned();
+    let spki = if cfg!(feature = "spki") {
+        no_own_key("spki")
+    } else {
+        not_implemented.clone()
+    };
+    let ed25519 = no_own_key("ed25519");
+    let before = loose_objects(&repo);
+    let mut cases: Vec<(Vec<&str>, &[u8], &str)> = vec![
+        (vec!["-b", "x", "--sign-type=spki", absent], b"", &spki),
+        (
+            vec!["-b", "x", "--sign-type=nosuch", &sign, absent],
+            b"",
+            &not_implemented,
+        ),
+        (
+            vec!["-b", "x", "--sign-type=ed25519"],
+            b"not a tar stream",
+            &ed25519,
+        ),
+        (vec!["--sign-type=ed25519", absent], b"", &ed25519),
+    ];
+    for rest in [
+        vec![absent],
+        vec![&tree_dir],
+        vec![&tree_tar],
+        vec!["--tree=ref=no-such-ref"],
+        vec!["--base=no-such-ref", absent],
+        vec!["--parent=no-such-ref", absent],
+        vec!["--timestamp=bogus", src],
+        vec![&statoverride, absent],
+        vec![&skip_list, absent],
+    ] {
+        let case = [vec!["-b", "x", "--sign-type=ed25519"], rest].concat();
+        cases.push((case, b"", &ed25519));
+    }
+    for (case, stdin, expected) in &cases {
+        let mut args = vec!["commit", repo_arg.as_str()];
+        args.extend_from_slice(case);
+        let run = ostrya(&args, Some(stdin), &[]);
+        let label = case.join(" ");
+        assert_eq!(run.status.code(), Some(1), "{label}");
+        assert!(run.stdout.is_empty(), "{label}");
+        assert_eq!(String::from_utf8_lossy(&run.stderr), *expected, "{label}");
+        assert!(!repo.join("refs/heads/x").exists(), "{label} moved a ref");
+        assert_eq!(loose_objects(&repo), before, "{label} wrote an object");
     }
 }
 

@@ -1427,7 +1427,7 @@ ref in both: a key that cannot sign leaves the ref where it stood and publishes
 nothing, and a ref write that cannot happen leaves the commit and its
 `.commitmeta` durable in `objects/` with no ref. Both write the same
 `.commitmeta` bytes for a given ed25519 key set, and each one's GPG signature
-verifies through the other's `show --gpg-verify-remote`. Fourteen divergences
+verifies through the other's `show --gpg-verify-remote`. Fifteen divergences
 stand.
 
 - The engine of each key. This difference is in the bytes of the repository.
@@ -1455,6 +1455,24 @@ stand.
   engine. The tool reads the last name alone, so `--sign-type=nosuch
   --sign-type=ed25519 --sign=K` commits in the tool and is refused by the port
   (`commit/sign-type-last-occurrence-decides`).
+- The step that reads the `--sign-type` values. The port reads each
+  `--sign-type` value as the first step of the command, after the repository
+  resolves. This step comes before the control files, the branch check, the
+  editor, the tree, and the repository lock. The refusal of a name that no
+  engine carries and the refusal of a `--sign-type` with no key of its own
+  come at this step. The tool reads the name in its signing step, after it
+  writes the tree (`cli-behavior.md`, "CLI output formats", `commit`, "Fault
+  order"). So, for a refused name beside an earlier fault, the port gives the
+  refusal of the name. An example of an earlier fault is a tree path that does
+  not open. A run with a `--sign-type` value that the port refuses at this
+  step, and with a `--skip-if-unchanged` that matches, exits 0 in the tool.
+  The port refuses that run at exit 1. In a run with a refused name and a key,
+  the tool runs the editor of `-e`, and `--consume` empties each filesystem
+  source. The tool then refuses the name in its signing step. The port refuses
+  that run before these steps, so it runs no editor and deletes no source
+  file. The port reads and decodes the keys in the signing step, as the tool
+  does. A refusal at the first step writes no object and moves no ref
+  (`ostrya_cli::cli::commit_checks_the_sign_type_before_the_tree`).
 
 - `--sign-type=gpg` names an engine the port carries and the tool build does
   not. The tool's build reports `error: Requested signature type is not

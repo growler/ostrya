@@ -7932,9 +7932,16 @@ const NO_PARENT: &str = "none";
 /// Writes one commit from the tree sources of a `commit` command line.
 ///
 /// On success, the command prints the commit checksum, or the
-/// `--table-output` block.
+/// `--table-output` block. The `--sign-type` values are read first.
 async fn commit(repo: Repo, args: CommitArgs, owner: Owner, fsync: Option<bool>) -> Result<()> {
-    // The two walk-control files are read first. The `ostree` command reports a
+    // Each `--sign-type` value is read first, so a refused name, or a name with
+    // no key of its own, stops the command before the tree is read. The keys
+    // are read in the signing step.
+    if let Err(message) = args.key_types.engines(sign_type_from_name, false) {
+        exit_error(&message);
+    }
+
+    // The two walk-control files are read next. The `ostree` command reports a
     // file that it cannot open or read at this step. The step comes before the
     // missing-branch check, `--parent`, the metadata options, the tree, and the
     // timestamp.
@@ -8509,6 +8516,9 @@ async fn sign_staged_commit(
 ///
 /// A gpg selector is a `--gpg-sign` key, or a `--sign` or `--sign-from-file`
 /// key under the gpg engine.
+///
+/// [`commit`] reads the `--sign-type` values as its first step, so in a
+/// `commit` run the first two refusals come before the tree is read.
 async fn collect_signers(
     args: &CommitArgs,
 ) -> Result<std::result::Result<Vec<Box<dyn Signer>>, String>> {

@@ -7364,10 +7364,12 @@ async fn verify_keys(
 /// Loads the keys of each engine that the config of `remote` turns on, from
 /// the keys of the remote alone.
 ///
-/// The engines are the GPG engine, then the sign-api engines in the order of
-/// the config. With a `filter`, the engines are the engines of the filter, in
-/// the order of the filter. The call then reads the keys of these engines
-/// alone, and refuses an engine that the config does not turn on.
+/// The engines are the GPG engine, then the sign-api engines in the order that
+/// [`RemoteKeys::sign`](ostrya::verify::RemoteKeys::sign) gives. With a
+/// `filter`, the engines are the engines of the filter, in the order of the
+/// filter. [`RemoteKeys`](ostrya::verify::RemoteKeys) then reads the keys of
+/// these engines alone, and refuses an engine that the config does not turn
+/// on.
 async fn remote_verify_keys(
     repo: &Repo,
     remote: &str,
@@ -7384,9 +7386,9 @@ async fn remote_verify_keys(
     } else {
         ostrya::verify::RemoteKeys::commits(repo, remote, selection).await?
     };
-    let mut found: Vec<(SignType, Arc<dyn Verifier>)> = Vec::new();
+    let mut found: Vec<(SignType, VerifyKeys)> = Vec::new();
     if let Some(gpg) = keys.gpg() {
-        found.push((SignType::Gpg, Arc::clone(gpg)));
+        found.push((SignType::Gpg, VerifyKeys::of(Arc::clone(gpg))));
     }
     for verifier in keys.sign() {
         let key = verifier.metadata_key();
@@ -7399,27 +7401,15 @@ async fn remote_verify_keys(
                  does not verify"
             )));
         };
-        found.push((engine, Arc::clone(verifier)));
+        found.push((engine, VerifyKeys::of(Arc::clone(verifier))));
     }
-    if filter.is_empty() {
-        return Ok(found
-            .into_iter()
-            .map(|(engine, verifier)| (engine, VerifyKeys::of(verifier)))
-            .collect());
-    }
-    let target = if summary { "summary" } else { "commits" };
-    filter
-        .iter()
-        .map(
-            |engine| match found.iter().find(|(held, _)| held == engine) {
-                Some((_, verifier)) => Ok((*engine, VerifyKeys::of(Arc::clone(verifier)))),
-                None => Err(Error::Signature(format!(
-                    "remote '{remote}' turns on no {} check of its {target}",
-                    sign_type_name(*engine)
-                ))),
-            },
-        )
-        .collect()
+    // With a filter, the keys hold each engine of the filter and no other
+    // engine. Each engine has a different position in the filter, so the sort
+    // gives the order of the filter. With no filter, each position is `None`,
+    // and the stable sort keeps the order of `found`, with the GPG engine
+    // first.
+    found.sort_by_key(|(engine, _)| filter.iter().position(|held| held == engine));
+    Ok(found)
 }
 
 /// Loads the keys of each engine of a verify run with no `--remote`.

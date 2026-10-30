@@ -4593,6 +4593,8 @@ fn sign_verify_of_a_missing_commit_fails() {
 ///   gpg` is refused for it.
 /// - A remote that turns on no check is refused.
 /// - `-s gpg` selects the gpg engine of a remote with two engines.
+/// - `-s ed25519 -s gpg` verifies with the two engines in the order of the
+///   `-s` values.
 /// - `--remote` is refused with a KEY-ID, a `--keys-file`, a `--keys-dir`,
 ///   and without `--verify`.
 /// - A gpg KEY-ID is refused in a verify, and `--gpg-homedir` is refused if
@@ -4699,6 +4701,24 @@ fn verify_with_the_keys_of_a_remote() {
     let report = gpg_only.ok().stdout_trimmed();
     assert!(report.starts_with("signature 1: good key"), "{report}");
     assert!(report.ends_with("verification OK"), "{report}");
+    for args in [
+        &[
+            "sign", "--verify", "-s", "ed25519", "-s", "gpg", "--remote", "both", &commit,
+        ][..],
+        &[
+            "summary", "--verify", "-s", "ed25519", "-s", "gpg", "--remote", "both",
+        ],
+    ] {
+        let out = run(args);
+        let report = out.ok().stdout_trimmed();
+        assert!(
+            report.starts_with(&format!(
+                "ed25519:\nsignature 1: good\nverification OK\ngpg:\nsignature 1: good key {fpr}"
+            )),
+            "{report}"
+        );
+        assert!(report.ends_with("verification OK"), "{report}");
+    }
 
     // A selection reads the keys of the selected engines alone. The keyring
     // of `nogpg` and the ed25519 key file of `noed` do not exist, and the

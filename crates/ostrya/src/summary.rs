@@ -48,7 +48,7 @@ use crate::perm;
 use crate::refs::RefSelection;
 use crate::remote::proto::MAX_REF_LISTING;
 use crate::repo::Repo;
-use crate::sign::{Signer, Verifier, VerifyOutcome, append_signature, signatures_for};
+use crate::sign::{Signer, Verifier, VerifyOutcome, append_signature, verify_all};
 
 /// The GVariant type of the summary: `(refs, global_metadata)`.
 const SUMMARY_SIGNATURE: &str = "(a(s(taya{sv}))a{sv})";
@@ -1772,17 +1772,8 @@ impl Repo {
         let dict = self.read_summary_signature().await?;
         let verifiers = verifiers.to_vec();
         ostrya_rt::unblock(move || {
-            let mut outcome = VerifyOutcome::default();
-            for verifier in &verifiers {
-                let signatures = match &dict {
-                    Some(dict) => signatures_for(dict, verifier.metadata_key()),
-                    None => Vec::new(),
-                };
-                let result = verifier.verify(&data, &signatures)?;
-                outcome.valid |= result.valid;
-                outcome.signatures.extend(result.signatures);
-            }
-            Ok(outcome)
+            let verifiers: Vec<&dyn Verifier> = verifiers.iter().map(|v| v.as_ref()).collect();
+            verify_all(&verifiers, &data, dict.as_ref())
         })
         .await
     }

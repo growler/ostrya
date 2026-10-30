@@ -14537,9 +14537,9 @@ async fn verify_signatures(
 /// each engine in the order of `keys`.
 ///
 /// Each verifier gets the blobs under its metadata key in the signature dict
-/// `dict`, as [`signature_blobs`] reads them. If `dict` is `None`, each
-/// verifier gets no blob. The verifiers run in the calling task. The result
-/// does not hold the engines that [`skip_unsigned_engines`] skips.
+/// `dict`, as [`ostrya::sign::verify_all`] gives them. If `dict` is `None`,
+/// each verifier gets no blob. The verifiers run in the calling task. The
+/// result does not hold the engines that [`skip_unsigned_engines`] skips.
 fn verify_engines(
     keys: &[(SignType, VerifyKeys)],
     data: &[u8],
@@ -14548,12 +14548,8 @@ fn verify_engines(
     let mut outcomes = keys
         .iter()
         .map(|(engine, keys)| {
-            let verifier = &keys.verifier;
-            let signatures = match dict {
-                Some(dict) => signature_blobs(dict, verifier.metadata_key()),
-                None => Vec::new(),
-            };
-            Ok((*engine, keys, verifier.verify(data, &signatures)?))
+            let outcome = ostrya::sign::verify_all(&[keys.verifier.as_ref()], data, dict)?;
+            Ok((*engine, keys, outcome))
         })
         .collect::<Result<Vec<_>>>()?;
     skip_unsigned_engines(&mut outcomes);
@@ -14598,37 +14594,14 @@ fn delta_outcomes<'k>(
 
 /// Returns the signature blobs stored under `key` in the detached metadata.
 ///
-/// The blobs come in stored order, as [`signature_blobs`] reads them.
+/// The blobs come in stored order, as [`ostrya::sign::signatures_for`] reads
+/// them.
 #[cfg(feature = "gpg")]
 async fn stored_signatures(repo: &Repo, commit: &Checksum, key: &str) -> Result<Vec<Vec<u8>>> {
     Ok(match repo.read_commit_detached_metadata(commit).await? {
-        Some(dict) => signature_blobs(&dict, key),
+        Some(dict) => ostrya::sign::signatures_for(&dict, key),
         None => Vec::new(),
     })
-}
-
-/// Returns the signature blobs under `key` in the `a{sv}` signature dict
-/// `dict`, in stored order.
-///
-/// If the key is missing, or the value is not an array, the result is empty.
-/// Elements that are not bytes are skipped.
-fn signature_blobs(dict: &Value, key: &str) -> Vec<Vec<u8>> {
-    let Some(value) = dict.dict_get(key) else {
-        return Vec::new();
-    };
-    let array = match value.as_variant() {
-        Some((_, inner)) => inner,
-        None => value,
-    };
-    array
-        .as_array()
-        .map(|blobs| {
-            blobs
-                .iter()
-                .filter_map(|blob| blob.as_bytes().map(<[u8]>::to_vec))
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 /// Returns an ed25519 or spki verifier for the trusted and revoked public

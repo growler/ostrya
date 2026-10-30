@@ -9,6 +9,8 @@
 //!
 //! - the signatures of a commit: [`Repo::sign_commit`],
 //!   [`Repo::verify_commit`], and [`Repo::delete_signatures`]
+//! - the signature blobs of a signature dict and their verification:
+//!   [`signatures_for`] and [`verify_all`]
 //! - the key store of the ed25519 and spki engines: [`load_sign_keys`] and
 //!   [`load_sign_keys_from`]
 //! - a verifier that trusts the system key store: [`FromSystemKeys`]
@@ -182,17 +184,8 @@ impl Repo {
         let (data, dict) = self.load_commit_and_detached(checksum).await?;
         let verifiers = verifiers.to_vec();
         ostrya_rt::unblock(move || {
-            let mut outcome = VerifyOutcome::default();
-            for verifier in &verifiers {
-                let signatures = match &dict {
-                    Some(dict) => signatures_for(dict, verifier.metadata_key()),
-                    None => Vec::new(),
-                };
-                let result = verifier.verify(&data, &signatures)?;
-                outcome.valid |= result.valid;
-                outcome.signatures.extend(result.signatures);
-            }
-            Ok(outcome)
+            let verifiers: Vec<&dyn Verifier> = verifiers.iter().map(|v| v.as_ref()).collect();
+            verify_all(&verifiers, &data, dict.as_ref())
         })
         .await
     }
@@ -286,11 +279,34 @@ impl Repo {
 
 /// Returns the signature blobs under `metadata_key` in the `a{sv}` dict `dict`.
 ///
+/// `dict` is a signature dict: the detached metadata of a commit, the
+/// `summary.sig` file, or the signatures of a signed static delta. Each engine
+/// owns one key of the dict, the [`metadata_key`](Verifier::metadata_key) of
+/// its verifier. The value of the key is an `aay`, with one `ay` element for
+/// each signature blob. If a variant holds the value, the call reads the value
+/// in the variant. The result holds the blobs in stored order.
+///
 /// If the key is absent or its value is not an array, the result is empty.
-/// The result skips each element that is not a byte string. A malformed entry
-/// of another writer does not cause an error, so it cannot fail a
-/// verification.
-pub(crate) fn signatures_for(dict: &Value, metadata_key: &str) -> Vec<Vec<u8>> {
+/// If `dict` is not an array, the result is also empty. The result skips each
+/// element that is not a byte string. A malformed entry of another writer does
+/// not cause an error, so it cannot fail a verification.
+///
+/// # Examples
+///
+/// ```
+/// use ostrya::Value;
+/// use ostrya::sign::{append_signature, signatures_for};
+///
+/// let mut dict = Value::Array(Vec::new());
+/// append_signature(&mut dict, "ostree.sign.dummy", b"one".to_vec())?;
+/// append_signature(&mut dict, "ostree.sign.dummy", b"two".to_vec())?;
+///
+/// let blobs = signatures_for(&dict, "ostree.sign.dummy");
+/// assert_eq!(blobs, [b"one".to_vec(), b"two".to_vec()]);
+/// assert!(signatures_for(&dict, "ostree.sign.ed25519").is_empty());
+/// # Ok::<(), ostrya::Error>(())
+/// ```
+pub fn signatures_for(dict: &Value, metadata_key: &str) -> Vec<Vec<u8>> {
     let Some(value) = dict.dict_get(metadata_key) else {
         return Vec::new();
     };
@@ -305,6 +321,83 @@ pub(crate) fn signatures_for(dict: &Value, metadata_key: &str) -> Vec<Vec<u8>> {
             .collect(),
         None => Vec::new(),
     }
+}
+
+/// Verifies `data` with each verifier of `verifiers` against the signature
+/// dict `dict`.
+///
+/// Each verifier gets `data` and the blobs under its
+/// [`metadata_key`](Verifier::metadata_key) in `dict`, as [`signatures_for`]
+/// reads them. If `dict` is `None`, each verifier gets no blob. The call also
+/// calls a verifier that gets no blob.
+///
+/// If at least one verifier reports a valid signature, the outcome is valid.
+/// The outcome holds the [`SignatureInfo`] records of all verifiers, in the
+/// order of `verifiers`.
+///
+/// The verifiers run in the calling thread, one after the other. The call
+/// holds the thread for the time of the verification, as
+/// [`Verifier::verify`] states. A caller on an async executor that verifies
+/// untrusted input runs the call on the blocking pool.
+///
+/// # Errors
+///
+/// The first verifier that fails stops the call. The verifiers after it do not
+/// run. The call returns the error of that verifier, converted to
+/// [`Error`](crate::Error):
+///
+/// - [`Error::Signature`] if the verifier fails with the `Signature` variant
+///   of [`ostrya_sign::Error`], or with a variant that the conversion does
+///   not name. Of the verifiers that this crate exports, only `GpgVerifier`
+///   fails: if a blob is larger than 1 MiB, holds more than 64 signature
+///   packets, or makes the OpenPGP parser panic.
+/// - [`Error::InvalidFormat`] or [`Error::Core`] if a verifier of another
+///   crate fails with the variant of the same name of
+///   [`ostrya_sign::Error`].
+///
+/// [`Error::Signature`]: crate::Error::Signature
+/// [`Error::InvalidFormat`]: crate::Error::InvalidFormat
+/// [`Error::Core`]: crate::Error::Core
+///
+/// # Examples
+///
+/// ```
+/// use ostrya::Value;
+/// use ostrya::sign::{DummyVerifier, append_signature, verify_all};
+///
+/// let mut dict = Value::Array(Vec::new());
+/// append_signature(&mut dict, "ostree.sign.dummy", b"trusted".to_vec())?;
+///
+/// let verifier = DummyVerifier::new([b"trusted".to_vec()]);
+/// let outcome = verify_all(&[&verifier], b"payload", Some(&dict))?;
+/// assert!(outcome.valid);
+/// assert_eq!(outcome.signatures.len(), 1);
+///
+/// let outcome = verify_all(&[&verifier], b"payload", None)?;
+/// assert!(!outcome.valid);
+/// assert!(outcome.signatures.is_empty());
+/// # Ok::<(), ostrya::Error>(())
+/// ```
+pub fn verify_all(
+    verifiers: &[&dyn Verifier],
+    data: &[u8],
+    dict: Option<&Value>,
+) -> crate::Result<VerifyOutcome> {
+    let mut outcome = VerifyOutcome::default();
+    for verifier in verifiers {
+        let signatures = match dict {
+            Some(dict) => signatures_for(dict, verifier.metadata_key()),
+            None => Vec::new(),
+        };
+        let result = verifier.verify(data, &signatures)?;
+        outcome.valid |= result.valid;
+        if outcome.signatures.is_empty() {
+            outcome.signatures = result.signatures;
+        } else {
+            outcome.signatures.extend(result.signatures);
+        }
+    }
+    Ok(outcome)
 }
 
 /// Removes each blob under `metadata_key` in the `a{sv}` dict `dict` for which
@@ -617,4 +710,166 @@ pub(crate) fn read_key_path(
         subject,
         ceiling,
     )?))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use super::*;
+
+    /// A verifier that records the payload and the number of blobs of each
+    /// call.
+    ///
+    /// Each blob gives one [`SignatureInfo`] whose fingerprint is
+    /// `<metadata key>:<blob>`. The outcome is `valid`, or the error
+    /// `refused` if `fails` is set.
+    struct Recorder {
+        key: &'static str,
+        valid: bool,
+        fails: bool,
+        calls: Mutex<Vec<(Vec<u8>, usize)>>,
+    }
+
+    impl Recorder {
+        fn new(key: &'static str, valid: bool) -> Recorder {
+            Recorder {
+                key,
+                valid,
+                fails: false,
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn failing(key: &'static str) -> Recorder {
+            Recorder {
+                fails: true,
+                ..Recorder::new(key, false)
+            }
+        }
+
+        fn calls(&self) -> Vec<usize> {
+            self.calls.lock().unwrap().iter().map(|(_, n)| *n).collect()
+        }
+
+        fn payloads(&self) -> Vec<Vec<u8>> {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(d, _)| d.clone())
+                .collect()
+        }
+    }
+
+    impl Verifier for Recorder {
+        fn metadata_key(&self) -> &str {
+            self.key
+        }
+
+        fn verify(&self, data: &[u8], signatures: &[Vec<u8>]) -> Result<VerifyOutcome> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((data.to_vec(), signatures.len()));
+            if self.fails {
+                return Err(Error::Signature("refused".into()));
+            }
+            let signatures = signatures
+                .iter()
+                .map(|blob| SignatureInfo {
+                    valid: self.valid,
+                    fingerprint: Some(format!("{}:{}", self.key, String::from_utf8_lossy(blob))),
+                    ..SignatureInfo::default()
+                })
+                .collect();
+            Ok(VerifyOutcome {
+                valid: self.valid,
+                signatures,
+            })
+        }
+    }
+
+    fn fingerprints(outcome: &VerifyOutcome) -> Vec<&str> {
+        outcome
+            .signatures
+            .iter()
+            .map(|info| info.fingerprint.as_deref().unwrap())
+            .collect()
+    }
+
+    /// The outcome is valid if one verifier is valid, in each order. The
+    /// signatures of the first verifier come before the signatures of the
+    /// second. Each verifier gets the payload of the call.
+    #[test]
+    fn the_outcome_joins_the_verifiers_in_order() {
+        let mut dict = Value::Array(Vec::new());
+        append_signature(&mut dict, "test.b", b"b1".to_vec()).unwrap();
+        append_signature(&mut dict, "test.a", b"a1".to_vec()).unwrap();
+        append_signature(&mut dict, "test.a", b"a2".to_vec()).unwrap();
+        let first = Recorder::new("test.a", false);
+        let second = Recorder::new("test.b", true);
+
+        let outcome = verify_all(&[&first, &second], b"data", Some(&dict)).unwrap();
+
+        assert!(outcome.valid);
+        assert_eq!(
+            fingerprints(&outcome),
+            ["test.a:a1", "test.a:a2", "test.b:b1"]
+        );
+        assert_eq!(first.calls(), [2]);
+        assert_eq!(second.calls(), [1]);
+        assert_eq!(first.payloads(), [b"data"]);
+        assert_eq!(second.payloads(), [b"data"]);
+
+        let outcome = verify_all(&[&second, &first], b"data", Some(&dict)).unwrap();
+
+        assert!(outcome.valid);
+        assert_eq!(
+            fingerprints(&outcome),
+            ["test.b:b1", "test.a:a1", "test.a:a2"]
+        );
+
+        let outcome = verify_all(&[&first], b"data", Some(&dict)).unwrap();
+        assert!(!outcome.valid);
+    }
+
+    /// A verifier whose key has no entry in the dict is called with no blob.
+    /// With no dict, each verifier is called with no blob.
+    #[test]
+    fn a_verifier_with_no_blob_is_called() {
+        let mut dict = Value::Array(Vec::new());
+        append_signature(&mut dict, "test.a", b"a1".to_vec()).unwrap();
+        let signed = Recorder::new("test.a", true);
+        let unsigned = Recorder::new("test.b", true);
+
+        let outcome = verify_all(&[&signed, &unsigned], b"data", Some(&dict)).unwrap();
+        assert_eq!(fingerprints(&outcome), ["test.a:a1"]);
+        assert_eq!(signed.calls(), [1]);
+        assert_eq!(unsigned.calls(), [0]);
+
+        let outcome = verify_all(&[&signed, &unsigned], b"data", None).unwrap();
+        assert!(outcome.signatures.is_empty());
+        assert_eq!(signed.calls(), [1, 0]);
+        assert_eq!(unsigned.calls(), [0, 0]);
+    }
+
+    /// The error of the first verifier that fails is the result, and the
+    /// verifiers after it do not run.
+    #[test]
+    fn the_first_error_stops_the_call() {
+        let mut dict = Value::Array(Vec::new());
+        append_signature(&mut dict, "test.a", b"a1".to_vec()).unwrap();
+        let failing = Recorder::failing("test.a");
+        let second = Recorder::new("test.b", true);
+
+        let err = verify_all(&[&failing, &second], b"data", Some(&dict)).unwrap_err();
+
+        assert!(
+            matches!(&err, crate::Error::Signature(m) if m == "refused"),
+            "{err}"
+        );
+        assert_eq!(failing.calls(), [1]);
+        assert!(second.calls().is_empty());
+    }
 }

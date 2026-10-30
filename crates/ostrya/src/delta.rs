@@ -37,7 +37,7 @@ use crate::hashing::HashingReader;
 use crate::pull::{ModeChecks, PullFlags};
 use crate::related::{self, RelatedField};
 use crate::repo::Repo;
-use crate::sign::{Verifier, VerifyOutcome, signatures_for};
+use crate::sign::{Verifier, VerifyOutcome, verify_all};
 use crate::transaction::Transaction;
 use crate::write::{ContentWriter, FileMeta};
 
@@ -1266,14 +1266,7 @@ impl DeltaSuperblock {
             .signatures
             .as_ref()
             .ok_or_else(|| Error::Signature("static delta carries no signatures".to_owned()))?;
-        let mut outcome = VerifyOutcome::default();
-        for verifier in verifiers {
-            let blobs = signatures_for(signatures, verifier.metadata_key());
-            let result = verifier.verify(&self.superblock_bytes, &blobs)?;
-            outcome.valid |= result.valid;
-            outcome.signatures.extend(result.signatures);
-        }
-        Ok(outcome)
+        verify_all(verifiers, &self.superblock_bytes, Some(signatures))
     }
 
     /// Returns the byte order that the `ostree.endianness` byte declares.

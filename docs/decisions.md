@@ -315,10 +315,11 @@ fsck` of a bucket. A client sets the number of signature blobs that the
 receive endpoint verifies, and a summary can be as large as 64 MiB.
 `Repo::verify_commit`, `Repo::verify_summary`, and
 `Repo::verify_static_delta` take `Arc<dyn Verifier>` and run the verifiers on
-the blocking pool too. `DeltaSuperblock::verify` verifies in the calling
-thread, because it needs no repository and no runtime. The `ostrya` command
-calls `Verifier::verify` and `DeltaSuperblock::verify` in the calling task,
-because it runs one command in each process.
+the blocking pool too. `DeltaSuperblock::verify` and `sign::verify_all`
+verify in the calling thread, because they need no repository and no
+runtime. The `ostrya` command calls `Verifier::verify`, `sign::verify_all`,
+and `DeltaSuperblock::verify` in the calling task, because it runs one
+command in each process.
 
 These alternatives were rejected:
 

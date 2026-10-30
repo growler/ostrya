@@ -56,7 +56,9 @@ pub trait Verifier: Send + Sync {
     /// Verifies the blobs in `signatures` against `data`.
     ///
     /// The outcome is valid if at least one blob verifies. The outcome holds
-    /// one [`SignatureInfo`] for each blob in [`VerifyOutcome::signatures`].
+    /// at least one [`SignatureInfo`] for each blob in
+    /// [`VerifyOutcome::signatures`]. [`VerifyOutcome::signatures`] is empty
+    /// only if `signatures` is empty.
     ///
     /// The verifier does its work in the call, and the call holds its thread
     /// for the time of the verification. The number of blobs and the length of
@@ -82,7 +84,9 @@ pub struct VerifyOutcome {
     ///
     /// [`Verifier::verify`] states the rule.
     pub valid: bool,
-    /// One entry for each signature blob, in the order of the blobs.
+    /// At least one entry for each signature blob, in the order of the blobs.
+    ///
+    /// [`Verifier::verify`] states the rule.
     pub signatures: Vec<SignatureInfo>,
 }
 

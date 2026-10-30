@@ -565,7 +565,9 @@ name that no engine carries comes first. In a verify mode other than
 
 A verify mode makes one verifier for each engine of the run, and each engine
 must have a valid signature. A user who names a key of an engine expects a
-valid signature of that engine. The verify modes are `sign --verify`,
+valid signature of that engine. A run with no key, no `--remote`, and no
+`--sign-type` is an exception: it skips each engine that finds no signature,
+if another engine finds one. The verify modes are `sign --verify`,
 `summary --verify`, `static-delta verify`, and `static-delta apply-offline`
 with a key source. A run with no engine is refused. The key sources are:
 
@@ -574,7 +576,12 @@ with a key source. A run with no engine is refused. The key sources are:
 - No key and no `--remote`: each engine with a trusted key in the system key
   directories and each `--keys-dir`, and the gpg engine if the GPG system
   trust holds a certificate. Each `--keys-dir` adds one directory. The two
-  `static-delta` verify modes have no gpg engine. A keyring of the GPG system
+  `static-delta` verify modes have no gpg engine. With no `--sign-type`, the
+  user names no engine, so the host decides which engines the run finds. An
+  engine that finds no signature prints nothing, and does not fail the run, if
+  another engine finds a signature. Each engine that finds a signature must
+  have a valid one, and a run where no engine finds a signature fails. An
+  engine that does not load still refuses the run. A keyring of the GPG system
   trust that cannot be read refuses a run that looks for the gpg engine. A
   broken trust store is an error of the host, and the command does not hide
   it. A `--sign-type` that selects the other engines does not read the GPG
@@ -601,6 +608,11 @@ These alternatives were rejected:
   than sign K with ed25519.
 - One valid signature of any engine in a verify mode, as the sign-api axis of
   a pull accepts. `--remote` keeps the rule of each engine too.
+- A valid signature of each engine that a run with no key finds. A key in
+  `/etc/ostree` or a keyring of the GPG system trust then fails each verify
+  of an object that has no signature of that engine. `static-delta
+  apply-offline` takes no `--sign-type` with no key, so the user cannot
+  select one engine there.
 - A `--keys-dir` that replaces the default key directories, as the `ostree`
   command does. The key directories of the port are one set, and a revoked
   key of one directory applies to each directory.

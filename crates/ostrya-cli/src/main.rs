@@ -2856,19 +2856,22 @@ struct SignArgs {
     /// each engine, it prints one line for each signature, with `good`, `BAD`,
     /// or `no public key`. Then it prints `verification OK` or `verification
     /// FAILED`. If the commit has no signature for the engine, the command
-    /// prints `no signatures found`. With more than one engine, a line with
-    /// the engine name and a colon comes before the lines of each engine. If
-    /// an engine has no valid signature, the command exits 1.
+    /// prints `no signatures found`. With more than one engine in the report,
+    /// a line with the engine name and a colon comes before the lines of each
+    /// engine. If an engine in the report has no valid signature, the command
+    /// exits 1.
     ///
     /// With a KEY-ID or a --keys-file, the engines are the engines of these
     /// keys. With --remote, the engines are the engines that the config of the
     /// remote turns on. With no key and no --remote, the engines are the
     /// engines that have a key in the key directories or in the GPG system
-    /// trust. A --sign-type with no key then selects its engine, and the
-    /// command verifies with the selected engines alone. The command refuses
-    /// a run with no engine. If the gpg engine is not excluded by a
-    /// --sign-type, a keyring of the GPG system trust that cannot be read
-    /// refuses the run.
+    /// trust. If one of these engines finds a signature, the command skips
+    /// each engine that finds none, and prints nothing for it. A --sign-type
+    /// with no key selects its engine, and the command verifies with the
+    /// selected engines alone. Each selected engine must then have a valid
+    /// signature. The command refuses a run with no engine. If the gpg engine
+    /// is not excluded by a --sign-type, a keyring of the GPG system trust
+    /// that cannot be read refuses the run.
     #[arg(long)]
     verify: bool,
     /// The signature engine of the KEY-ID and --keys-file keys after it.
@@ -2881,7 +2884,7 @@ struct SignArgs {
     /// option can occur more than once, and each occurrence needs a key of
     /// its own: a key after it and before the next --sign-type. A --verify run
     /// with no key on the command line takes each --sign-type as a selection
-    /// of its engine.
+    /// of its engine, and each selected engine must have a valid signature.
     #[arg(short = 's', long = "sign-type", value_name = "NAME")]
     sign_type: Vec<String>,
     /// Read keys from a file.
@@ -2906,11 +2909,12 @@ struct SignArgs {
     /// --keys-dir, in this order. A verify with no key and no --remote reads
     /// `trusted.<type>`, `revoked.<type>`, and the files in
     /// `trusted.<type>.d/` and `revoked.<type>.d/` of each directory, for the
-    /// ed25519 and spki engines. A revoked key of one directory applies to the
-    /// keys of each directory. An ed25519 file has one base64 key per line,
-    /// and an spki file has PEM `PUBLIC KEY` blocks. The option can occur more
-    /// than once. An empty value names the working directory. The command
-    /// refuses this option with --remote.
+    /// ed25519 and spki engines. Without a --sign-type, if one engine finds a
+    /// signature, the verify skips each engine that finds none. A revoked key
+    /// of one directory applies to the keys of each directory. An ed25519 file
+    /// has one base64 key per line, and an spki file has PEM `PUBLIC KEY`
+    /// blocks. The option can occur more than once. An empty value names the
+    /// working directory. The command refuses this option with --remote.
     #[arg(long, value_name = "PATH")]
     keys_dir: Vec<std::ffi::OsString>,
     /// The GnuPG home directory where gpg resolves signing keys.
@@ -3056,11 +3060,13 @@ struct SummaryArgs {
     ///
     /// The command then does not regenerate or sign the summary, also with -u.
     /// It verifies with one verifier for each engine of the run, and reads
-    /// the key sources of `ostrya sign --verify`. For each engine, it prints
+    /// the key sources of `ostrya sign --verify`. With no key, no --remote,
+    /// and no --sign-type, if one engine finds a signature, the command skips
+    /// each engine that finds none. For each engine in the report, it prints
     /// one line for each signature and then `verification OK` or
-    /// `verification FAILED`. With more than one engine, a line with the
-    /// engine name and a colon comes before the lines of each engine. If an
-    /// engine has no valid signature, the command exits 1.
+    /// `verification FAILED`. With more than one engine in the report, a line
+    /// with the engine name and a colon comes before the lines of each engine.
+    /// If an engine in the report has no valid signature, the command exits 1.
     #[arg(long)]
     verify: bool,
     /// The signature engine of the --sign, KEY-ID, and --keys-file keys after
@@ -3073,7 +3079,7 @@ struct SummaryArgs {
     /// needs a key of its own: a key after it and before the next
     /// --sign-type. --gpg-sign is not a key of this option. A --verify run
     /// with no key on the command line takes each --sign-type as a selection
-    /// of its engine.
+    /// of its engine, and each selected engine must have a valid signature.
     #[arg(short = 's', long = "sign-type", value_name = "NAME")]
     sign_type: Vec<String>,
     /// Set `ostree.summary.last-modified`, in seconds since the Unix epoch.
@@ -3109,11 +3115,12 @@ struct SummaryArgs {
     /// --keys-dir, in this order. A verify with no key and no --remote reads
     /// `trusted.<type>`, `revoked.<type>`, and the files in
     /// `trusted.<type>.d/` and `revoked.<type>.d/` of each directory, for the
-    /// ed25519 and spki engines. A revoked key of one directory applies to the
-    /// keys of each directory. An ed25519 file has one base64 key per line,
-    /// and an spki file has PEM `PUBLIC KEY` blocks. The option can occur more
-    /// than once. An empty value names the working directory. The command
-    /// refuses this option with --remote.
+    /// ed25519 and spki engines. Without a --sign-type, if one engine finds a
+    /// signature, the verify skips each engine that finds none. A revoked key
+    /// of one directory applies to the keys of each directory. An ed25519 file
+    /// has one base64 key per line, and an spki file has PEM `PUBLIC KEY`
+    /// blocks. The option can occur more than once. An empty value names the
+    /// working directory. The command refuses this option with --remote.
     #[arg(long, value_name = "PATH")]
     keys_dir: Vec<std::ffi::OsString>,
     /// The GnuPG home directory where gpg resolves signing keys.
@@ -3197,8 +3204,9 @@ enum StaticDeltaCommand {
     /// The command prints nothing and writes no ref. A key source is a KEY-ID,
     /// --keys-file, or --keys-dir. With a key source, the command verifies a
     /// signed delta with each engine before it writes an object, and applies
-    /// an unsigned delta with no check. Without a key source, the command
-    /// verifies no signature.
+    /// an unsigned delta with no check. With a --keys-dir and no key, if one
+    /// engine finds a signature, the command skips each engine that finds
+    /// none. Without a key source, the command verifies no signature.
     /// Each dependency of the target commit must be complete in the
     /// repository, so apply the delta of each dependency first.
     ApplyOffline(DeltaApplyArgs),
@@ -3257,7 +3265,8 @@ enum StaticDeltaCommand {
     /// delta is a failure. Without --keys-file or a KEY-ID, the command reads
     /// the key directories `/etc/ostree`, `/usr/share/ostree`, and each
     /// --keys-dir, and verifies with each engine that has a trusted key in
-    /// them.
+    /// them. Without a --sign-type, if one of these engines finds a signature,
+    /// the command skips each engine that finds none.
     Verify(DeltaVerifyArgs),
 }
 
@@ -3272,7 +3281,8 @@ struct DeltaVerifyArgs {
     /// more than once. With a key on the command line, each occurrence needs a
     /// key of its own: a key after it and before the next --sign-type. With
     /// no key, each --sign-type selects its engine, and the command verifies
-    /// with the selected engines alone.
+    /// with the selected engines alone. Each selected engine must then have a
+    /// valid signature.
     #[arg(long = "sign-type", value_name = "NAME")]
     sign_type: Vec<String>,
     /// Read public keys from a file.
@@ -3292,11 +3302,12 @@ struct DeltaVerifyArgs {
     /// --keys-dir, in this order. With no key, the command reads
     /// `trusted.<type>`, `revoked.<type>`, and the files in
     /// `trusted.<type>.d/` and `revoked.<type>.d/` of each directory, and
-    /// verifies with each engine that has a trusted key. A revoked key of one
-    /// directory applies to the keys of each directory. An ed25519 file has
-    /// one base64 key per line, and an spki file has PEM `PUBLIC KEY` blocks.
-    /// The option can occur more than once. An empty value names the working
-    /// directory.
+    /// verifies with each engine that has a trusted key. Without a
+    /// --sign-type, if one engine finds a signature, the command skips each
+    /// engine that finds none. A revoked key of one directory applies to the
+    /// keys of each directory. An ed25519 file has one base64 key per line, and
+    /// an spki file has PEM `PUBLIC KEY` blocks. The option can occur more than
+    /// once. An empty value names the working directory.
     #[arg(long, value_name = "PATH")]
     keys_dir: Vec<std::ffi::OsString>,
     // ostrya checks this operand after the repository resolves.
@@ -3344,11 +3355,12 @@ struct DeltaApplyArgs {
     /// --keys-dir, in this order. With no key, a --keys-dir makes the command
     /// read `trusted.<type>`, `revoked.<type>`, and the files in
     /// `trusted.<type>.d/` and `revoked.<type>.d/` of each directory, and
-    /// check a signed delta with each engine that has a trusted key. A revoked
-    /// key of one directory applies to the keys of each directory. An ed25519
-    /// file has one base64 key per line, and an spki file has PEM `PUBLIC KEY`
-    /// blocks. The option can occur more than once. An empty value names the
-    /// working directory.
+    /// check a signed delta with each engine that has a trusted key. If one
+    /// engine finds a signature, the command skips each engine that finds
+    /// none. A revoked key of one directory applies to the keys of each
+    /// directory. An ed25519 file has one base64 key per line, and an spki file
+    /// has PEM `PUBLIC KEY` blocks. The option can occur more than once. An
+    /// empty value names the working directory.
     #[arg(long, value_name = "PATH")]
     keys_dir: Vec<std::ffi::OsString>,
     // ostrya checks this operand after the repository resolves.
@@ -7017,6 +7029,10 @@ struct VerifyKeys {
     verifier: Arc<dyn Verifier>,
     trusted: Vec<Vec<u8>>,
     revoked: Vec<Vec<u8>>,
+    /// `true` if the run found the engine with no key on the command line,
+    /// no `--sign-type`, and no `--remote`. [`skip_unsigned_engines`] can
+    /// skip such an engine.
+    discovered: bool,
 }
 
 impl VerifyKeys {
@@ -7027,6 +7043,7 @@ impl VerifyKeys {
             verifier,
             trusted: Vec::new(),
             revoked: Vec::new(),
+            discovered: false,
         }
     }
 }
@@ -7051,6 +7068,8 @@ fn verification_fails(text: &str) -> ! {
 /// 3. The keys of each engine load.
 /// 4. The argument resolves, and the superblock reads.
 /// 5. The signatures verify with each engine, in the order of the engines.
+///    [`skip_unsigned_engines`] then skips each engine of the key directories
+///    that finds no signature, if another engine finds one.
 ///
 /// Every failure from step 4 on prints `Verification fails` first. The first
 /// engine that fails gives the failure line. If each engine passes, the
@@ -7089,15 +7108,15 @@ async fn delta_verify(repo_path: &Path, args: DeltaVerifyArgs) -> Result<()> {
     if !sb.is_signed() {
         verification_fails("no signatures in static-delta");
     }
-    for (engine, keys) in &keys {
-        let outcome = match sb.verify(&[keys.verifier.as_ref()]) {
-            Ok(outcome) => outcome,
-            Err(err) => {
-                println!("Verification fails");
-                return Err(err);
-            }
-        };
-        if let Some(text) = delta_verify_failure(*engine, keys, &outcome) {
+    let outcomes = match delta_outcomes(&sb, &keys) {
+        Ok(outcomes) => outcomes,
+        Err(err) => {
+            println!("Verification fails");
+            return Err(err);
+        }
+    };
+    for (engine, keys, outcome) in &outcomes {
+        if let Some(text) = delta_verify_failure(*engine, keys, outcome) {
             verification_fails(&text);
         }
     }
@@ -7183,7 +7202,9 @@ fn verify_sign_type(name: &str, report_unsupported: bool) -> SignType {
 ///    refused.
 /// 4. [`lexical_path`] applies the `..` components of the path. Then the path
 ///    resolves, and the superblock reads.
-/// 5. The signatures of a signed delta verify with each engine.
+/// 5. The signatures of a signed delta verify with each engine. With no key,
+///    [`skip_unsigned_engines`] skips each engine that finds no signature, if
+///    another engine finds one.
 /// 6. The delta applies. First the fallback objects of the delta are present.
 ///    Then the entries of field 2 of the target are valid, and the
 ///    dependencies of the target are complete. The `ostree` command has no
@@ -7241,9 +7262,8 @@ async fn delta_apply_offline(repo: &Repo, args: DeltaApplyArgs) -> Result<()> {
         .await
         .map_err(|err| delta_read_error(err, &shown))?;
     if sb.is_signed() {
-        for (engine, keys) in &keys {
-            let outcome = sb.verify(&[keys.verifier.as_ref()])?;
-            if let Some(text) = delta_verify_failure(*engine, keys, &outcome) {
+        for (engine, keys, outcome) in &delta_outcomes(&sb, &keys)? {
+            if let Some(text) = delta_verify_failure(*engine, keys, outcome) {
                 exit_error(&text);
             }
         }
@@ -7414,7 +7434,8 @@ async fn remote_verify_keys(
 /// reads the system trust. An engine is found if it has a trusted key before
 /// revocation. The call skips an engine that it does not find, and refuses an
 /// engine of a `--sign-type` that it does not find. A run that finds no
-/// engine is refused.
+/// engine is refused. With no `--sign-type`, each engine that the call finds
+/// is marked as discovered, and [`skip_unsigned_engines`] can skip it.
 ///
 /// An ed25519 or spki key that is not valid refuses the run. A build without
 /// an engine does not read keys for it.
@@ -7463,6 +7484,7 @@ fn local_verify_keys(sources: &VerifySources<'_>) -> Result<Vec<(SignType, Verif
                     verifier,
                     trusted,
                     revoked: Vec::new(),
+                    discovered: false,
                 },
             ));
         }
@@ -7502,11 +7524,15 @@ fn local_verify_keys(sources: &VerifySources<'_>) -> Result<Vec<(SignType, Verif
                     verifier: build_sign_api_verifier(engine, &keys.trusted, &keys.revoked)?,
                     trusted: keys.trusted,
                     revoked: keys.revoked,
+                    discovered: false,
                 })
             }
         };
         match keys {
-            Some(keys) => loaded.push((engine, keys)),
+            Some(mut keys) => {
+                keys.discovered = !filtered;
+                loaded.push((engine, keys));
+            }
             None if filtered => return Err(no_keys_loaded(engine)),
             None => {}
         }
@@ -13981,8 +14007,9 @@ async fn summary(repo: Repo, args: SummaryArgs) -> Result<()> {
 /// Verifies the signatures of the summary with one verifier for each engine
 /// of the run, and prints the report of each engine.
 ///
-/// The command refuses `--sign` and `--gpg-sign`, which sign a summary. If an
-/// engine has no valid signature, the process exits 1.
+/// The command refuses `--sign` and `--gpg-sign`, which sign a summary.
+/// [`verify_engines`] skips a discovered engine that finds no signature. If
+/// an engine that it reports has no valid signature, the process exits 1.
 async fn summary_verify(repo: &Repo, args: &SummaryArgs) -> Result<()> {
     if !args.sign.is_empty() || !args.gpg_sign.is_empty() {
         return Err(Error::Signature(
@@ -14015,7 +14042,7 @@ async fn summary_verify(repo: &Repo, args: &SummaryArgs) -> Result<()> {
         .await?
         .ok_or_else(|| Error::InvalidFormat("no summary to verify".into()))?;
     let dict = repo.read_summary_signature().await?;
-    report_engines(&verify_engines(keys, &data, dict.as_ref())?);
+    report_engines(&verify_engines(&keys, &data, dict.as_ref())?);
     Ok(())
 }
 
@@ -14420,7 +14447,8 @@ fn spki_key_file_signers(path: &Path) -> Result<Vec<SpkiSigner>> {
 /// Verifies the commit with one verifier for each engine of the run, and
 /// prints the report of each engine.
 ///
-/// If an engine has no valid signature, the process exits 1.
+/// [`verify_engines`] skips a discovered engine that finds no signature. If
+/// an engine that it reports has no valid signature, the process exits 1.
 async fn verify_signatures(
     repo: &Repo,
     commit: &Checksum,
@@ -14444,7 +14472,7 @@ async fn verify_signatures(
     // then verifies the same bytes.
     let data = repo.load_object_bytes(ObjectType::Commit, commit).await?;
     let dict = repo.read_commit_detached_metadata(commit).await?;
-    report_engines(&verify_engines(keys, &data, dict.as_ref())?);
+    report_engines(&verify_engines(&keys, &data, dict.as_ref())?);
     Ok(())
 }
 
@@ -14453,22 +14481,62 @@ async fn verify_signatures(
 ///
 /// Each verifier gets the blobs under its metadata key in the signature dict
 /// `dict`, as [`signature_blobs`] reads them. If `dict` is `None`, each
-/// verifier gets no blob. The verifiers run in the calling task.
+/// verifier gets no blob. The verifiers run in the calling task. The result
+/// does not hold the engines that [`skip_unsigned_engines`] skips.
 fn verify_engines(
-    keys: Vec<(SignType, VerifyKeys)>,
+    keys: &[(SignType, VerifyKeys)],
     data: &[u8],
     dict: Option<&Value>,
 ) -> Result<Vec<(SignType, VerifyOutcome)>> {
-    keys.into_iter()
+    let mut outcomes = keys
+        .iter()
         .map(|(engine, keys)| {
-            let verifier = keys.verifier;
+            let verifier = &keys.verifier;
             let signatures = match dict {
                 Some(dict) => signature_blobs(dict, verifier.metadata_key()),
                 None => Vec::new(),
             };
-            Ok((engine, verifier.verify(data, &signatures)?))
+            Ok((*engine, keys, verifier.verify(data, &signatures)?))
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    skip_unsigned_engines(&mut outcomes);
+    Ok(outcomes
+        .into_iter()
+        .map(|(engine, _, outcome)| (engine, outcome))
+        .collect())
+}
+
+/// Removes each discovered engine that has no signature from `outcomes`, if
+/// at least one engine has a signature.
+///
+/// A discovered engine is an engine of a verify with no key on the command
+/// line, no `--sign-type`, and no `--remote`. Each other engine stays, so it
+/// must pass. If no engine has a signature, each engine stays, and the run
+/// fails.
+fn skip_unsigned_engines(outcomes: &mut Vec<(SignType, &VerifyKeys, VerifyOutcome)>) {
+    if outcomes
+        .iter()
+        .any(|(_, _, outcome)| !outcome.signatures.is_empty())
+    {
+        outcomes.retain(|(_, keys, outcome)| !keys.discovered || !outcome.signatures.is_empty());
+    }
+}
+
+/// Verifies the signatures of the static delta `sb` with the keys of each
+/// engine, and returns the outcome of each engine in the order of `keys`.
+///
+/// The result does not hold the engines that [`skip_unsigned_engines`]
+/// skips.
+fn delta_outcomes<'k>(
+    sb: &DeltaSuperblock,
+    keys: &'k [(SignType, VerifyKeys)],
+) -> Result<Vec<(SignType, &'k VerifyKeys, VerifyOutcome)>> {
+    let mut outcomes = keys
+        .iter()
+        .map(|(engine, keys)| Ok((*engine, keys, sb.verify(&[keys.verifier.as_ref()])?)))
+        .collect::<Result<Vec<_>>>()?;
+    skip_unsigned_engines(&mut outcomes);
+    Ok(outcomes)
 }
 
 /// Returns the signature blobs stored under `key` in the detached metadata.
@@ -14637,8 +14705,9 @@ fn report_verify(outcome: &VerifyOutcome, engine: SignType) {
 /// Prints the report of each engine of a verify run, in order, and exits 1 if
 /// an engine has no valid signature.
 ///
-/// With more than one engine, a line with the engine name and a colon comes
-/// before the report of each engine.
+/// The outcomes are the outcomes that [`verify_engines`] returns, with no
+/// skipped engine. With more than one outcome, a line with the engine name
+/// and a colon comes before the report of each engine.
 fn report_engines(outcomes: &[(SignType, VerifyOutcome)]) {
     let named = outcomes.len() > 1;
     for (engine, outcome) in outcomes {

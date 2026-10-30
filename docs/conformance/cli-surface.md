@@ -2562,18 +2562,20 @@ output formats", `sign`, "The key sources of `sign`"), with one verifier for
 each engine, and refuses `--sign` and `--gpg-sign`. With `--remote`, it reads
 the keys of the remote alone, for the engines that `gpg-verify-summary` and
 `sign-verify-summary` of the remote turn on. A `-s` with no key selects its
-engine, and the port then reads the keys of the selected engines alone. The
-multi-engine report reads `summary` and `summary.sig` one time, so each
-engine checks the same bytes. The port refuses `--remote` in each mode other
-than `--verify`, `-u` and the read options included, with `error: signature:
---remote applies to --verify alone`. On this command the tool
-binds `-v` to `--view`, and `--verbose` has no short form. The port carries the
-same shape: `summary` declares `-v/--view` and a long-only `--verbose`, and
-every other subcommand, together with the top level, keeps `-v/--verbose`. `-m`,
-`--sign`, and `--gpg-sign` are read with `-u` alone, and both implementations
-check every one of them before the regeneration, so a refusal leaves `summary`
-and `summary.sig` as they stood (`cli-behavior.md`, "CLI output formats",
-`summary`, "The `-u` checks"). Sixteen differences stand.
+engine, and the port then reads the keys of the selected engines alone. With no
+key, no `--remote`, and no `-s`, the port skips an engine that finds no
+signature, as its `sign --verify` does. The multi-engine report reads `summary`
+and `summary.sig` one time, so each engine checks the same bytes. The port
+refuses `--remote` in each mode other than `--verify`, `-u` and the read
+options included, with `error: signature: --remote applies to --verify alone`.
+On this command the tool binds `-v` to `--view`, and `--verbose` has no short
+form. The port carries the same shape: `summary` declares `-v/--view` and a
+long-only `--verbose`, and every other subcommand, together with the top level,
+keeps `-v/--verbose`. `-m`, `--sign`, and `--gpg-sign` are read with `-u`
+alone, and both implementations check every one of them before the
+regeneration, so a refusal leaves `summary` and `summary.sig` as they stood
+(`cli-behavior.md`, "CLI output formats", `summary`, "The `-u` checks").
+Sixteen differences stand.
 
 - `-v` does not turn on the debug stream. The tool binds `-v` to `--view` and
   `--verbose` together and writes `OT: using fuse: 0` for a read-only view; the
@@ -3246,28 +3248,36 @@ order, as in the tool. Only a little-endian host is observed.
   last `--sign-type` to each KEY-ID and `--keys-file` key. The port gives each
   key the engine of the nearest `--sign-type` before it, and `ed25519` to a
   key before the first `--sign-type`. It reads the last `--keys-file` of each
-  engine, and verifies with one verifier for each engine. Each engine must
-  have a valid signature. `verify` prints `Verification OK` one time, or the
+  engine, and verifies with one verifier for each engine. Each engine that
+  finds a signature must have a valid one. An engine that finds no signature
+  fails the run, except in a run with no key and no `--sign-type`, which
+  skips it if another engine finds a signature (the item on the key
+  directories below). `verify` prints `Verification OK` one time, or the
   failure line of the first engine that fails. The tool reads one engine;
 - a `--sign-type` of `verify` and `apply-offline` with no key of its own. With
   a key on the command line, the port refuses it at exit 1 before standard
   output. `verify` with no key takes each `--sign-type` as a selection of its
-  engine, and verifies with the selected engines alone. `apply-offline`
-  refuses it also with no key and with a `--keys-dir`, where the tool applies
-  an unsigned delta and, with no key source, a signed delta with no check. The
-  refusal of a name comes first, so `apply-offline --sign-type=nosuch` keeps
-  the line of the tool (`static-delta/apply-offline-sign-type-unknown`);
+  engine, and verifies with the selected engines alone. Each selected engine
+  must have a valid signature. `apply-offline` refuses it also with no key and
+  with a `--keys-dir`, where the tool applies an unsigned delta and, with no
+  key source, a signed delta with no check. The refusal of a name comes first,
+  so `apply-offline --sign-type=nosuch` keeps the line of the tool
+  (`static-delta/apply-offline-sign-type-unknown`);
 - the key directories of `verify` and `apply-offline`. The tool reads the last
   `--keys-dir` alone, and the system key directories `/etc/ostree` and
   `/usr/share/ostree` where no `--keys-dir` is given. The port reads the
   system key directories and then each `--keys-dir`, and a revoked key of one
   directory applies to the keys of each directory. With no key, it verifies
-  with each engine that has a trusted key in them. A run that finds no engine
-  is refused at exit 1 with `error: signature: no keys loaded: the key
-  directories hold no ed25519 or spki key`, where the tool writes `error:
-  signature: ed25519: no keys loaded` (`static-delta/verify-no-keys`).
-  `apply-offline` with a `--keys-dir` and no key reads the system key
-  directories as well.
+  with each engine that has a trusted key in them. Without a `--sign-type`, if
+  one of these engines finds a signature, the port skips each engine that finds
+  none. Each engine that finds a signature must have a valid one, and a run
+  where no engine finds a signature fails. A delta with an spki signature alone
+  then verifies and applies with a key directory that also holds an ed25519
+  key. A run that finds no engine is refused at exit 1 with `error: signature:
+  no keys loaded: the key directories hold no ed25519 or spki key`, where the
+  tool writes `error: signature: ed25519: no keys loaded`
+  (`static-delta/verify-no-keys`). `apply-offline` with a `--keys-dir` and no
+  key reads the system key directories as well.
 
 The port adds `--output-dir=DIR`, which writes the superblock and the parts to
 DIR, `--timestamp`, `--reindex`, `--gpg-homedir`, and `-s` for
@@ -3895,22 +3905,28 @@ block adds one signature. Twenty-five differences stand.
   item on the engines of a verify below);
 - the engines of a `--verify` run. The tool verifies with one engine, the
   engine of the last `-s`. The port verifies with one verifier for each engine
-  of the run, and each engine must have a valid signature. It prints the
-  report of each engine, after a line with the engine name and a colon where
-  the run has more than one engine. With a key on the command line, the
-  engines are the engines of the keys. With no key and no `--remote`, the
+  of the run. It prints the report of each engine, after a line with the
+  engine name and a colon where the report has more than one engine. With a
+  key on the command line, the engines are the engines of the keys, and each
+  engine must have a valid signature. With `--remote`, each engine of the
+  remote must have a valid signature. With no key and no `--remote`, the
   engines are the engines that have a trusted key in the key directories, and
-  the gpg engine if the GPG system trust holds a certificate. On a host with
-  keys of two engines, `sign --verify COMMIT` then also needs a valid
-  signature of each engine, and `-s ENGINE` selects one. A run that finds no
-  engine is refused at exit 1 with `error: signature: no keys loaded: the key
-  directories hold no ed25519 or spki key, and the system trust holds no gpg
-  key` (`sign/verify-no-keys`), where the tool writes `error: signature:
-  ed25519: no keys loaded`. A selected engine with no trusted key is refused
-  with `error: signature: <engine>: no keys loaded`. A run that looks for the
-  gpg engine reads each keyring of the GPG system trust, and a keyring that
-  cannot be read refuses the run at exit 1. A `-s` that selects the other
-  engines does not read the GPG system trust;
+  the gpg engine if the GPG system trust holds a certificate. With no `-s`, if
+  one of these engines finds a signature, the port skips each engine that finds
+  none, and prints nothing for it. Each engine that finds a signature must have
+  a valid one. If no engine finds a signature, the port reports each engine and
+  exits 1. On a host with keys of two engines, `sign --verify COMMIT` over a
+  commit with an ed25519 signature alone then prints the ed25519 report alone
+  and exits 0. A `-s ENGINE` with no key selects its engine, and each selected
+  engine must have a valid signature. A run that finds no engine is refused at
+  exit 1 with `error: signature: no keys loaded: the key directories hold no
+  ed25519 or spki key, and the system trust holds no gpg key`
+  (`sign/verify-no-keys`), where the tool writes `error: signature: ed25519: no
+  keys loaded`. A selected engine with no trusted key is refused with `error:
+  signature: <engine>: no keys loaded`. A run that looks for the gpg engine
+  reads each keyring of the GPG system trust, and a keyring that cannot be read
+  refuses the run at exit 1. A `-s` that selects the other engines does not
+  read the GPG system trust;
 - the key directories of `--verify`. The tool reads the last `--keys-dir`
   alone, and the system key directories `/etc/ostree` and `/usr/share/ostree`
   where no `--keys-dir` is given (`sign/verify-keys-dir-last-wins`). The port

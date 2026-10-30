@@ -11447,8 +11447,10 @@ note: with no positional KEY-ID and no `--keys-file`, a `--keys-dir` supplies
  `--keys-dir=` names the working directory, in both. The tool reads the last
  `--keys-dir` alone. The port reads the system key directories and each
  `--keys-dir`, and a revoked key of one directory applies to each directory
- (`cli-surface.md`, "P2", `sign`). Where the last `--keys-dir` holds the key
- that verifies, the two agree, and the cited test compares these rows alone.
+ (`cli-surface.md`, "P2", `sign`). With no `-s`, the port skips an engine of
+ the key directories that finds no signature, if another engine finds one.
+ Where the last `--keys-dir` holds the key that verifies, the two agree, and
+ the cited test compares these rows alone.
 
 family: M10
 subcommand: sign
@@ -11508,12 +11510,15 @@ loss: the verdict report (`cli-surface.md`, "P2", `sign`). The tool prints one
  prints `signature <n>: good`, `no public key`, or `BAD` for each signature and
  then `verification OK` or `verification FAILED`, all on standard output. The
  exit status agrees.
-evidence: ostrya_cli::cli::sign_verify_key_sources_match_the_tool
+evidence: ostrya_cli::cli::sign_verify_key_sources_match_the_tool,
+ ostrya_cli::cli::sign_verify_key_discovery_skips_an_engine_with_no_signature
 spec: cli-surface.md#p2----options-missing-from-commands-that-exist
-note: the cited test compares the exit status of every key-source row and
- states both reports over a commit each implementation signed. A port run with
- keys of more than one engine prints the report of each engine after a line
- with the engine name and a colon. The tool reads one engine.
+note: the first cited test compares the exit status of every key-source row
+ and states both reports over a commit each implementation signed. A port run
+ that reports more than one engine prints the report of each engine after a
+ line with the engine name and a colon. A port run with no key, no
+ `--remote`, and no `-s` skips an engine that finds no signature, if another
+ engine finds one, as the second cited test states. The tool reads one engine.
 
 # ---------------------------------------------------------------------------
 # summary -- the four reading options, the report format, and the precedence
@@ -12349,12 +12354,15 @@ outcome: lossy
 severity: interop
 loss: the tool carries no `summary --verify`; it refuses the option with
  `error: Unknown option --verify`. The port's `--verify` is an extension.
-evidence: ostrya_cli::cli::summary_verify_key_sources_over_both_signers
+evidence: ostrya_cli::cli::summary_verify_key_sources_over_both_signers,
+ ostrya_cli::cli::sign_verify_key_discovery_skips_an_engine_with_no_signature
 spec: cli-surface.md#p2----options-missing-from-commands-that-exist
 note: in the port, a `--keys-file` or a positional KEY-ID leaves `--keys-dir`
  unread, and with neither the system key directories and each `--keys-dir`
  supply the keys, as for `sign --verify`, over a summary each implementation
- signed.
+ signed. With no `-s`, an engine that finds no signature is skipped, if
+ another engine finds one, as for `sign --verify` and as the second cited test
+ states.
 
 # ---------------------------------------------------------------------------
 # static-delta -- `show`, the superblock and part report, `list`, the listing
@@ -12782,14 +12790,17 @@ setup: repo
 outcome: full
 severity: interop
 evidence: ostrya_cli::cli::static_delta_verify_matches_the_tool_over_the_tools_deltas,
- ostrya_cli::cli::static_delta_verify_matches_the_tool_over_the_ports_deltas
+ ostrya_cli::cli::static_delta_verify_matches_the_tool_over_the_ports_deltas,
+ ostrya_cli::cli::static_delta_verify_key_discovery_skips_an_engine_with_no_signature
 spec: cli-behavior.md#static-delta
 note: a `--keys-file` makes both implementations leave `--keys-dir` unread, and
  a positional KEY-ID does the same. With neither, the system key directories
  and each `--keys-dir` supply the trusted keys less the revoked ones in the
  port, and the last `--keys-dir` in the tool; a store whose every trusted key
  is revoked reports `Verification fails` and `error: ed25519: no signatures
- found`.
+ found`. With no `--sign-type`, the port skips an engine of the key
+ directories that finds no signature, if another engine finds one, as the
+ third cited test states.
 
 family: M10
 subcommand: static-delta
@@ -13197,12 +13208,15 @@ setup: repo
 outcome: full
 severity: interop
 evidence: ostrya_cli::cli::static_delta_apply_offline_matches_the_tool_over_the_tools_deltas,
- ostrya_cli::cli::static_delta_apply_offline_matches_the_tool_over_the_ports_deltas
+ ostrya_cli::cli::static_delta_apply_offline_matches_the_tool_over_the_ports_deltas,
+ ostrya_cli::cli::static_delta_verify_key_discovery_skips_an_engine_with_no_signature
 spec: cli-behavior.md#static-delta
 note: a signed delta applies under the signing key given as a positional
  KEY-ID, also after a wrong key. The last --keys-file wins, a --keys-file
  leaves --keys-dir unread, and --keys-dir alone turns the check on. With
- --keys-dir alone, the port also reads the system key directories.
+ --keys-dir alone, the port also reads the system key directories, and skips
+ an engine that finds no signature, if another engine finds one, as the third
+ cited test states.
 
 family: M10
 subcommand: static-delta

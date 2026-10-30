@@ -383,9 +383,13 @@ mod tests {
             if signatures.iter().any(|blob| *blob != self.good) {
                 return Err(ostrya_sign::Error::Signature("refused".into()));
             }
-            Ok(ostrya_sign::VerifyOutcome {
+            let valid = ostrya_sign::SignatureInfo {
                 valid: true,
                 ..Default::default()
+            };
+            Ok(ostrya_sign::VerifyOutcome {
+                valid: true,
+                signatures: vec![valid; signatures.len()],
             })
         }
     }

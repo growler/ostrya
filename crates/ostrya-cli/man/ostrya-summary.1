@@ -67,12 +67,12 @@ The option uses the gpg engine, and it is not a key of a \%\-\-sign\-type. Each 
 \fB\-\-verify\fR
 Verify the signatures of the summary.
 .IP
-The command then does not regenerate or sign the summary, also with \%\-u. It verifies with one verifier for each engine of the run, and reads the key sources of \fB\%ostrya sign \-\-verify\fR\&. For each engine, it prints one line for each signature and then \fB\%verification OK\fR or \fB\%verification FAILED\fR\&. With more than one engine, a line with the engine name and a colon comes before the lines of each engine. If an engine has no valid signature, the command exits \%1.
+The command then does not regenerate or sign the summary, also with \%\-u. It verifies with one verifier for each engine of the run, and reads the key sources of \fB\%ostrya sign \-\-verify\fR\&. With no key, no \%\-\-remote, and no \%\-\-sign\-type, if one engine finds a signature, the command skips each engine that finds none. For each engine in the report, it prints one line for each signature and then \fB\%verification OK\fR or \fB\%verification FAILED\fR\&. With more than one engine in the report, a line with the engine name and a colon comes before the lines of each engine. If an engine in the report has no valid signature, the command exits \%1.
 .TP
 \fB\-s\fR, \fB\-\-sign\-type\fR \fINAME\fR
 The signature engine of the \%\-\-sign, \%KEY\-ID, and \%\-\-keys\-file keys after it.
 .IP
-The names are \fB\%ed25519\fR, \fB\%spki\fR, and \fB\%gpg\fR, and the command refuses any other name. Each key takes the engine of the nearest \%\-\-sign\-type before it on the command line. A key before the first \%\-\-sign\-type takes \fB\%ed25519\fR\&. The option can occur more than once, and each occurrence needs a key of its own: a key after it and before the next \%\-\-sign\-type. \%\-\-gpg\-sign is not a key of this option. A \%\-\-verify run with no key on the command line takes each \%\-\-sign\-type as a selection of its engine.
+The names are \fB\%ed25519\fR, \fB\%spki\fR, and \fB\%gpg\fR, and the command refuses any other name. Each key takes the engine of the nearest \%\-\-sign\-type before it on the command line. A key before the first \%\-\-sign\-type takes \fB\%ed25519\fR\&. The option can occur more than once, and each occurrence needs a key of its own: a key after it and before the next \%\-\-sign\-type. \%\-\-gpg\-sign is not a key of this option. A \%\-\-verify run with no key on the command line takes each \%\-\-sign\-type as a selection of its engine, and each selected engine must have a valid signature.
 .TP
 \fB\-\-last\-modified\fR \fILAST_MODIFIED\fR
 Set \fB\%ostree.summary.last\-modified\fR, in seconds since the Unix epoch.
@@ -92,7 +92,7 @@ The \%\-\-sign\-type before the file selects its engine. For spki, a signing fil
 \fB\-\-keys\-dir\fR \fIPATH\fR
 Add a directory to the key directories of a verify.
 .IP
-The key directories are \fB\%/etc/ostree\fR, \fB\%/usr/share/ostree\fR, and each \%\-\-keys\-dir, in this order. A verify with no key and no \%\-\-remote reads \fB\%trusted.<type>\fR, \fB\%revoked.<type>\fR, and the files in \fB\%trusted.<type>.d/\fR and \fB\%revoked.<type>.d/\fR of each directory, for the \%ed25519 and spki engines. A revoked key of one directory applies to the keys of each directory. An \%ed25519 file has one \%base64 key per line, and an spki file has PEM \fB\%PUBLIC KEY\fR blocks. The option can occur more than once. An empty value names the working directory. The command refuses this option with \%\-\-remote.
+The key directories are \fB\%/etc/ostree\fR, \fB\%/usr/share/ostree\fR, and each \%\-\-keys\-dir, in this order. A verify with no key and no \%\-\-remote reads \fB\%trusted.<type>\fR, \fB\%revoked.<type>\fR, and the files in \fB\%trusted.<type>.d/\fR and \fB\%revoked.<type>.d/\fR of each directory, for the \%ed25519 and spki engines. Without a \%\-\-sign\-type, if one engine finds a signature, the verify skips each engine that finds none. A revoked key of one directory applies to the keys of each directory. An \%ed25519 file has one \%base64 key per line, and an spki file has PEM \fB\%PUBLIC KEY\fR blocks. The option can occur more than once. An empty value names the working directory. The command refuses this option with \%\-\-remote.
 .TP
 \fB\-\-gpg\-homedir\fR \fIGPG_HOMEDIR\fR
 The GnuPG home directory where gpg resolves signing keys.

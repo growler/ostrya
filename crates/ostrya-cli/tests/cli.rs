@@ -6257,9 +6257,9 @@ fn a_refused_gpg_key_writes_nothing() {
 /// keyrings in the directory that `OSTREE_GPG_HOME` names.
 ///
 /// With keys of two engines on the host, `-s gpg` verifies with the gpg
-/// engine alone, and prints one report. With no `-s`, the run verifies with
-/// each engine that it finds, and prints a report for each engine under its
-/// name. The commit has no ed25519 signature, so that run exits 1. A
+/// engine alone, and prints one report. With no `-s`, the run finds each
+/// engine. The commit has no ed25519 signature, so the run skips the ed25519
+/// engine, prints the gpg report with no engine name, and exits 0. A
 /// selected engine with no key is refused before verification.
 #[cfg(feature = "gpg")]
 #[test]
@@ -6323,19 +6323,18 @@ fn sign_verify_gpg_default_trust() {
     assert!(report.ends_with("verification OK"), "{report}");
     assert!(!report.contains("gpg:"), "{report}");
 
-    // With no `-s`, each engine is found and reported under its name.
+    // With no `-s`, each engine is found. The ed25519 engine finds no
+    // signature, so the run reports the gpg engine alone.
     let both = ostrya(
         &["sign", "--verify", "--repo", repo_s, &keys_dir, COMMIT],
         None,
         &[("OSTREE_GPG_HOME", trusted_s)],
     );
-    assert_eq!(both.status.code(), Some(1));
+    both.ok();
     let report = both.stdout_trimmed();
-    assert!(
-        report.starts_with("ed25519:\nno signatures found\ngpg:\nsignature 1: good"),
-        "{report}"
-    );
+    assert!(report.starts_with("signature 1: good"), "{report}");
     assert!(report.ends_with("verification OK"), "{report}");
+    assert!(!report.contains("gpg:"), "{report}");
 
     // An `OSTREE_GPG_HOME` with no keyrings trusts no key, so `-s gpg` is
     // refused before verification.
@@ -6381,6 +6380,129 @@ fn sign_verify_gpg_default_trust() {
     );
     assert_eq!(ed_only.status.code(), Some(1));
     assert_eq!(ed_only.stdout_trimmed(), "no signatures found");
+}
+
+/// A verify with no key on the command line skips each engine that it finds
+/// with no signature, if another engine has a signature. Each engine that has
+/// a signature must pass.
+///
+/// The host has an ed25519 key directory and a gpg trust:
+///
+/// - Over a commit with no signature, no engine finds a signature, so the run
+///   reports the two engines and exits 1.
+/// - Over a commit with an ed25519 signature alone, `sign --verify` exits 0
+///   and prints one report with no engine name. `summary --verify` over a
+///   summary with an ed25519 signature alone does the same.
+/// - `-s ed25519 -s gpg` selects the two engines, so each engine must pass,
+///   and the run exits 1.
+/// - Over a commit that also has a gpg signature of a key that is not
+///   trusted, the gpg engine has a signature, so the run reports the two
+///   engines and exits 1.
+#[cfg(feature = "gpg")]
+#[test]
+fn sign_verify_key_discovery_skips_an_engine_with_no_signature() {
+    if !gpg_available() {
+        assert!(
+            std::env::var_os("OSTRYA_REQUIRE_GNUPG").is_none(),
+            "OSTRYA_REQUIRE_GNUPG is set and `gpg` is not available"
+        );
+        eprintln!("skipping: gpg not available");
+        return;
+    }
+    let tmp = TmpDir::new("sign-verify-discovery");
+    let base = tmp.path();
+    let repo = commit_fixture(base);
+    let repo_s = repo.to_str().unwrap();
+    let repo_arg = format!("--repo={repo_s}");
+    verify_key_store(base, "store", &[ED25519_PUBLIC_B64], &[]);
+    let keys_dir = format!("--keys-dir={}", base.join("store").display());
+
+    // The gpg trust holds one of the two keys of the home.
+    let home = GpgHome::create(base, "Ostrya Trusted <trusted@ostrya.example>");
+    home.add_key("Ostrya Untrusted <untrusted@ostrya.example>");
+    let trusted_fpr = home.fingerprint_of("trusted@ostrya.example");
+    let untrusted_fpr = home.fingerprint_of("untrusted@ostrya.example");
+    let trusted = base.join("trusted.gpg.d");
+    std::fs::create_dir(&trusted).unwrap();
+    home.export_one_to(&trusted_fpr, &trusted.join("key.gpg"));
+    let env = [("OSTREE_GPG_HOME", trusted.to_str().unwrap())];
+
+    let verify = |extra: &[&str]| {
+        ostrya(
+            &[
+                &["sign", "--verify", repo_arg.as_str()][..],
+                extra,
+                &[&keys_dir, COMMIT],
+            ]
+            .concat(),
+            None,
+            &env,
+        )
+    };
+    assert_verify_run(
+        &verify(&[]),
+        1,
+        "ed25519:\nno signatures found\ngpg:\nno signatures found\n",
+        "",
+        "commit with no signature",
+    );
+
+    ostrya(
+        &["sign", "--repo", repo_s, COMMIT, ED25519_SECRET_B64],
+        None,
+        &[],
+    )
+    .ok();
+    let sign = format!("--sign={ED25519_SECRET_B64}");
+    ostrya(&["summary", &repo_arg, "-u", &sign], None, &[]).ok();
+    assert_verify_run(
+        &verify(&[]),
+        0,
+        "signature 1: good\nverification OK\n",
+        "",
+        "commit with an ed25519 signature alone",
+    );
+    assert_verify_run(
+        &ostrya(&["summary", &repo_arg, "--verify", &keys_dir], None, &env),
+        0,
+        "signature 1: good\nverification OK\n",
+        "",
+        "summary with an ed25519 signature alone",
+    );
+    assert_verify_run(
+        &verify(&["-s", "ed25519", "-s", "gpg"]),
+        1,
+        "ed25519:\nsignature 1: good\nverification OK\ngpg:\nno signatures found\n",
+        "",
+        "the two engines selected",
+    );
+
+    ostrya(
+        &[
+            "sign",
+            "--repo",
+            repo_s,
+            "-s",
+            "gpg",
+            "--gpg-homedir",
+            home.dir.to_str().unwrap(),
+            COMMIT,
+            &untrusted_fpr,
+        ],
+        None,
+        &[],
+    )
+    .ok();
+    let both = verify(&[]);
+    assert_eq!(both.status.code(), Some(1));
+    let report = both.stdout_trimmed();
+    assert!(
+        report.starts_with(
+            "ed25519:\nsignature 1: good\nverification OK\ngpg:\nsignature 1: no public key"
+        ),
+        "{report}"
+    );
+    assert!(report.ends_with("verification FAILED"), "{report}");
 }
 
 /// Find the single delta directory under `repo/deltas`.
@@ -39891,6 +40013,114 @@ fn static_delta_apply_offline_key_sources() {
             ),
         ],
     );
+}
+
+/// `static-delta verify` and `apply-offline` with a `--keys-dir` and no key
+/// skip each engine that they find with no signature, if another engine has
+/// a signature. The key directory holds an ed25519 key and an spki key, and
+/// the delta has an spki signature alone:
+///
+/// - With the signing key in the directory, `verify` prints `Verification
+///   OK`, and `apply-offline` applies the delta.
+/// - `--sign-type=ed25519 --sign-type=spki` selects the two engines, so each
+///   engine must pass, and `verify` gives the ed25519 failure line.
+/// - With another spki key in the directory, the spki engine has a signature
+///   that does not verify, so each command gives the spki failure line.
+#[cfg(feature = "spki")]
+#[test]
+fn static_delta_verify_key_discovery_skips_an_engine_with_no_signature() {
+    const SECRET_PKCS8_B64: &str = "MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg2L708EsnnzHER0SYasMNIUcGv63QapC/3kVsoPerzKGhRANCAATxfzfHKUPeJtyLTGMUoxHhvBS1NT9guWhUQPGiZRLZIcB8Wc3csdVU1iOiTRmbZGKJTtekOdEAbVRrx5HxIpst";
+    const PUBLIC_SPKI_B64: &str = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAE8X83xylD3ibci0xjFKMR4bwUtTU/YLloVEDxomUS2SHAfFnN3LHVVNYjok0Zm2RiiU7XpDnRAG1Ua8eR8SKbLQ==";
+    const OTHER_SPKI_B64: &str = "MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAECmz6W9QPu0HuggzW4vGvsnvQIl4Jyl/b9kVl8fm/qw/xJSQfCEzhnGMQzmyj2quUo96zvuxlCllcTkzsOhwEAg==";
+    let pem = |b64: &str| {
+        let lines: Vec<&str> = b64
+            .as_bytes()
+            .chunks(64)
+            .map(|c| std::str::from_utf8(c).unwrap())
+            .collect();
+        format!(
+            "-----BEGIN PUBLIC KEY-----\n{}\n-----END PUBLIC KEY-----\n",
+            lines.join("\n")
+        )
+    };
+    let tmp = TmpDir::new("delta-verify-discovery");
+    let base = tmp.path();
+    let repo = commit_fixture(base);
+    let sign = format!("--sign={SECRET_PKCS8_B64}");
+    ostrya(
+        &[
+            "static-delta",
+            "--repo",
+            repo.to_str().unwrap(),
+            "generate",
+            "--empty",
+            "--to",
+            COMMIT,
+            "--sign-type=spki",
+            &sign,
+        ],
+        None,
+        &[],
+    )
+    .ok();
+    let delta = only_delta_dir(&repo);
+    let delta = delta.to_str().unwrap();
+    for (name, spki) in [("good", PUBLIC_SPKI_B64), ("other", OTHER_SPKI_B64)] {
+        let dir = verify_key_store(base, name, &[ED25519_PUBLIC_B64], &[]);
+        std::fs::write(dir.join("trusted.spki"), pem(spki)).unwrap();
+    }
+
+    assert_apply_cases(
+        base,
+        COMMIT,
+        &[(&["--keys-dir=good", delta], ApplyOutcome::Applied)],
+    );
+    assert_verify_run(
+        &run_delta_verify(base, &repo, &["--keys-dir=good", COMMIT]),
+        0,
+        "Verification OK\n",
+        "",
+        "verify with the signing key",
+    );
+    assert_verify_run(
+        &run_delta_verify(
+            base,
+            &repo,
+            &[
+                "--sign-type=ed25519",
+                "--sign-type=spki",
+                "--keys-dir=good",
+                COMMIT,
+            ],
+        ),
+        1,
+        "Verification fails\n",
+        "error: no signature for 'ostree.sign.ed25519' in static-delta superblock\n",
+        "verify with the two engines selected",
+    );
+
+    let failed = run_delta_verify(base, &repo, &["--keys-dir=other", COMMIT]);
+    assert_eq!(failed.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8_lossy(&failed.stdout),
+        "Verification fails\n"
+    );
+    let failure = "error: spki: Signature couldn't be verified with: key '";
+    assert!(
+        String::from_utf8_lossy(&failed.stderr).starts_with(failure),
+        "{}",
+        String::from_utf8_lossy(&failed.stderr)
+    );
+    let dst = fresh_archive(base, "dst-other");
+    let refused = run_apply_offline(base, &dst, &["--keys-dir=other", delta]);
+    assert_eq!(refused.status.code(), Some(1));
+    assert!(refused.stdout.is_empty());
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).starts_with(failure),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+    assert_eq!(loose_objects(&dst), []);
 }
 
 /// The command reads the sign type with or without a key source:

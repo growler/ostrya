@@ -4828,10 +4828,13 @@ before it on the command line, and a key before the first `-s` takes
 `ed25519`. Each `-s` needs a key of its own, except in a `--verify` run with
 no key on the command line, where each `-s` selects its engine. A `--verify`
 run verifies with one verifier for each engine, and prints the report of each
-engine after a line with the engine name and a colon where the run has more
-than one engine. Each engine must have a valid signature. With no key and no
-`--remote`, the port reads the system key directories and each `--keys-dir`,
-and the GPG system trust. `cli-surface.md`, "P2", `sign`, records these
+engine after a line with the engine name and a colon where the report has
+more than one engine. With no key and no `--remote`, the port reads the
+system key directories and each `--keys-dir`, and the GPG system trust. Each
+engine that finds a signature must have a valid one. An engine that finds no
+signature fails the run, except in a run with no key, no `--remote`, and no
+`-s`: if another engine finds a signature, that run skips the engine and
+prints nothing for it. `cli-surface.md`, "P2", `sign`, records these
 differences.
 
 #### The gpg engine

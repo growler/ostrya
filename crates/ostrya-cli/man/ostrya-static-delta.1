@@ -24,7 +24,7 @@ ostrya static\-delta list [OPTIONS]
 .SS "apply\-offline"
 Apply a static delta offline and write the objects of its target commit.
 .PP
-The source is a superblock file or a directory that holds \fB\%superblock\fR\&. The command prints nothing and writes no ref. A key source is a \%KEY\-ID, \%\-\-keys\-file, or \%\-\-keys\-dir. With a key source, the command verifies a signed delta with each engine before it writes an object, and applies an unsigned delta with no check. Without a key source, the command verifies no signature. Each dependency of the target commit must be complete in the repository, so apply the delta of each dependency first.
+The source is a superblock file or a directory that holds \fB\%superblock\fR\&. The command prints nothing and writes no ref. A key source is a \%KEY\-ID, \%\-\-keys\-file, or \%\-\-keys\-dir. With a key source, the command verifies a signed delta with each engine before it writes an object, and applies an unsigned delta with no check. With a \%\-\-keys\-dir and no key, if one engine finds a signature, the command skips each engine that finds none. Without a key source, the command verifies no signature. Each dependency of the target commit must be complete in the repository, so apply the delta of each dependency first.
 .PP
 .nf
 ostrya static\-delta apply\-offline [OPTIONS] [PATH] [KEY_ID]...
@@ -57,7 +57,7 @@ The \%\-\-sign\-type before the file selects its engine. For \%ed25519, the file
 \fB\-\-keys\-dir\fR \fIPATH\fR
 Add a directory to the key directories.
 .IP
-The key directories are \fB\%/etc/ostree\fR, \fB\%/usr/share/ostree\fR, and each \%\-\-keys\-dir, in this order. With no key, a \%\-\-keys\-dir makes the command read \fB\%trusted.<type>\fR, \fB\%revoked.<type>\fR, and the files in \fB\%trusted.<type>.d/\fR and \fB\%revoked.<type>.d/\fR of each directory, and check a signed delta with each engine that has a trusted key. A revoked key of one directory applies to the keys of each directory. An \%ed25519 file has one \%base64 key per line, and an spki file has PEM \fB\%PUBLIC KEY\fR blocks. The option can occur more than once. An empty value names the working directory.
+The key directories are \fB\%/etc/ostree\fR, \fB\%/usr/share/ostree\fR, and each \%\-\-keys\-dir, in this order. With no key, a \%\-\-keys\-dir makes the command read \fB\%trusted.<type>\fR, \fB\%revoked.<type>\fR, and the files in \fB\%trusted.<type>.d/\fR and \fB\%revoked.<type>.d/\fR of each directory, and check a signed delta with each engine that has a trusted key. If one engine finds a signature, the command skips each engine that finds none. A revoked key of one directory applies to the keys of each directory. An \%ed25519 file has one \%base64 key per line, and an spki file has PEM \fB\%PUBLIC KEY\fR blocks. The option can occur more than once. An empty value names the working directory.
 .SS "generate"
 Generate a static delta and print what it is generated from and to.
 .PP
@@ -222,7 +222,7 @@ ostrya static\-delta indexes [OPTIONS]
 .SS "verify"
 Verify the superblock signatures of a static delta.
 .PP
-The command verifies with one verifier for each engine. If each engine has a valid signature, the command prints \fB\%Verification OK\fR one time. After the keys load, each failure prints \fB\%Verification fails\fR on standard output and an error on standard error, and the command exits with status \%1. The first engine that fails gives the error. An unsigned delta is a failure. Without \%\-\-keys\-file or a \%KEY\-ID, the command reads the key directories \fB\%/etc/ostree\fR, \fB\%/usr/share/ostree\fR, and each \%\-\-keys\-dir, and verifies with each engine that has a trusted key in them.
+The command verifies with one verifier for each engine. If each engine has a valid signature, the command prints \fB\%Verification OK\fR one time. After the keys load, each failure prints \fB\%Verification fails\fR on standard output and an error on standard error, and the command exits with status \%1. The first engine that fails gives the error. An unsigned delta is a failure. Without \%\-\-keys\-file or a \%KEY\-ID, the command reads the key directories \fB\%/etc/ostree\fR, \fB\%/usr/share/ostree\fR, and each \%\-\-keys\-dir, and verifies with each engine that has a trusted key in them. Without a \%\-\-sign\-type, if one of these engines finds a signature, the command skips each engine that finds none.
 .PP
 .nf
 ostrya static\-delta verify [OPTIONS] [DELTA] [KEY_ID]...
@@ -245,7 +245,7 @@ Options:
 \fB\-\-sign\-type\fR \fINAME\fR
 The signature engine of the \%KEY\-ID and \%\-\-keys\-file keys after it: \fB\%ed25519\fR or \fB\%spki\fR\&.
 .IP
-The command refuses any other name, \fB\%gpg\fR included. Each key takes the engine of the nearest \%\-\-sign\-type before it on the command line. A key before the first \%\-\-sign\-type takes \fB\%ed25519\fR\&. The option can occur more than once. With a key on the command line, each occurrence needs a key of its own: a key after it and before the next \%\-\-sign\-type. With no key, each \%\-\-sign\-type selects its engine, and the command verifies with the selected engines alone.
+The command refuses any other name, \fB\%gpg\fR included. Each key takes the engine of the nearest \%\-\-sign\-type before it on the command line. A key before the first \%\-\-sign\-type takes \fB\%ed25519\fR\&. The option can occur more than once. With a key on the command line, each occurrence needs a key of its own: a key after it and before the next \%\-\-sign\-type. With no key, each \%\-\-sign\-type selects its engine, and the command verifies with the selected engines alone. Each selected engine must then have a valid signature.
 .TP
 \fB\-\-keys\-file\fR \fIPATH\fR
 Read public keys from a file.
@@ -255,6 +255,6 @@ The \%\-\-sign\-type before the file selects its engine. For \%ed25519, the file
 \fB\-\-keys\-dir\fR \fIPATH\fR
 Add a directory to the key directories.
 .IP
-The key directories are \fB\%/etc/ostree\fR, \fB\%/usr/share/ostree\fR, and each \%\-\-keys\-dir, in this order. With no key, the command reads \fB\%trusted.<type>\fR, \fB\%revoked.<type>\fR, and the files in \fB\%trusted.<type>.d/\fR and \fB\%revoked.<type>.d/\fR of each directory, and verifies with each engine that has a trusted key. A revoked key of one directory applies to the keys of each directory. An \%ed25519 file has one \%base64 key per line, and an spki file has PEM \fB\%PUBLIC KEY\fR blocks. The option can occur more than once. An empty value names the working directory.
+The key directories are \fB\%/etc/ostree\fR, \fB\%/usr/share/ostree\fR, and each \%\-\-keys\-dir, in this order. With no key, the command reads \fB\%trusted.<type>\fR, \fB\%revoked.<type>\fR, and the files in \fB\%trusted.<type>.d/\fR and \fB\%revoked.<type>.d/\fR of each directory, and verifies with each engine that has a trusted key. Without a \%\-\-sign\-type, if one engine finds a signature, the command skips each engine that finds none. A revoked key of one directory applies to the keys of each directory. An \%ed25519 file has one \%base64 key per line, and an spki file has PEM \fB\%PUBLIC KEY\fR blocks. The option can occur more than once. An empty value names the working directory.
 .SH SEE ALSO
 \fBostrya\fR(1)

@@ -2589,7 +2589,9 @@ options included, with `error: signature: --remote applies to --verify alone`.
 It refuses `--keys-dir` in the same modes with `error: signature: --keys-dir
 applies to --verify alone`. In a `--verify` run with a KEY-ID or a
 `--keys-file`, it refuses `--keys-dir` with `error: signature: a KEY-ID or a
---keys-file gives the keys of the verify; it reads no --keys-dir`.
+--keys-file gives the keys of the verify; it reads no --keys-dir`. A
+`--verify` run refuses `--gpg-homedir` with `error: signature: --gpg-homedir
+applies to signing alone`.
 On this command the tool binds `-v` to `--view`, and `--verbose` has no short
 form. The port carries the same shape: `summary` declares `-v/--view` and a
 long-only `--verbose`, and every other subcommand, together with the top level,
@@ -4002,8 +4004,12 @@ PKCS#8 DER, and each block adds one signature. Twenty-six differences stand.
 - a gpg KEY-ID in a `--verify` run. The tool reads no KEY-ID in a gpg verify.
   The port refuses it at exit 1 with `error: signature: a gpg verify takes its
   keyrings from --keys-file, --remote, or the system trust; it takes no
-  KEY-ID`. `--gpg-homedir` is refused where no key and no `-s` names the gpg
-  engine;
+  KEY-ID`. The port refuses `--gpg-homedir` in a `--verify` run at exit 1
+  with `error: signature: --gpg-homedir applies to signing alone`, before the
+  refusals of `--remote` and `--keys-dir`. In a signing run, the port refuses
+  `--gpg-homedir` where no key and no `-s` names the gpg engine. The tool has
+  no `--gpg-homedir` on `sign`, and refuses it in each run with `error:
+  Unknown option --gpg-homedir` at exit 1;
 - signing with a repeated `--keys-file`. This difference is in the bytes of
   the repository, and the port keeps it. The tool reads the last
   `--keys-file` when it signs, so `sign COMMIT --keys-file=s1 --keys-file=s2` writes one signature,

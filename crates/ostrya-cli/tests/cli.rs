@@ -4317,6 +4317,93 @@ fn a_run_that_reads_no_key_directory_refuses_keys_dir() {
     );
 }
 
+/// A verify refuses `--gpg-homedir`: `sign` and `summary` with no key, and
+/// `sign` with a key on the command line. In a build with gpg, the cases add
+/// `sign` and `summary` with `-s gpg` and a missing `--keys-file`, `sign`
+/// with `-s gpg` alone, and `sign` with `-s gpg`, `--remote`, and
+/// `--keys-dir`. A refusal writes nothing on standard output and writes no
+/// signature.
+#[test]
+fn a_verify_refuses_gpg_homedir() {
+    let tmp = TmpDir::new("verify-gpg-homedir");
+    let base = tmp.path();
+    let repo = verify_fixture(base);
+    let repo_arg = format!("--repo={}", repo.display());
+    let homedir = format!("--gpg-homedir={}", base.join("nohome").display());
+    let missing_arg = format!("--keys-file={}", base.join("missing").display());
+    let dir_arg = format!("--keys-dir={}", base.join("x").display());
+    let meta = repo.join(format!(
+        "objects/{}/{}.commitmeta",
+        &COMMIT[..2],
+        &COMMIT[2..]
+    ));
+    let summary_sig = repo.join("summary.sig");
+    let refused = "error: signature: --gpg-homedir applies to signing alone\n";
+    let mut cases: Vec<Vec<&str>> = vec![
+        vec!["sign", "--verify", &homedir, COMMIT],
+        vec!["sign", "--verify", &homedir, COMMIT, ED25519_PUBLIC_B64],
+        vec!["summary", "--verify", &homedir],
+    ];
+    if cfg!(feature = "gpg") {
+        cases.extend([
+            vec![
+                "sign",
+                "--verify",
+                "-s",
+                "gpg",
+                &missing_arg,
+                &homedir,
+                COMMIT,
+            ],
+            vec!["sign", "--verify", "-s", "gpg", &homedir, COMMIT],
+            vec![
+                "sign", "--verify", "-s", "gpg", "--remote", "none", &dir_arg, &homedir, COMMIT,
+            ],
+            vec!["summary", "--verify", "-s", "gpg", &missing_arg, &homedir],
+        ]);
+    }
+    for case in &cases {
+        let mut args = vec![case[0], repo_arg.as_str()];
+        args.extend_from_slice(&case[1..]);
+        let run = ostrya(&args, None, &[]);
+        let label = case.join(" ");
+        assert_eq!(run.status.code(), Some(1), "{label}");
+        assert!(run.stdout.is_empty(), "{label}");
+        assert_eq!(String::from_utf8_lossy(&run.stderr), refused, "{label}");
+        assert!(!meta.exists(), "{label} wrote a signature");
+        assert!(!summary_sig.exists(), "{label} signed the summary");
+    }
+}
+
+/// A signing run of `sign` refuses `--gpg-homedir` if no key and no
+/// `--sign-type` names gpg. The refusal writes nothing on standard output and
+/// writes no signature.
+#[test]
+fn a_signing_run_refuses_gpg_homedir_with_no_gpg_key() {
+    let tmp = TmpDir::new("sign-gpg-homedir");
+    let base = tmp.path();
+    let repo = commit_fixture(base);
+    let repo_arg = format!("--repo={}", repo.display());
+    let homedir = format!("--gpg-homedir={}", base.join("nohome").display());
+    let meta = repo.join(format!(
+        "objects/{}/{}.commitmeta",
+        &COMMIT[..2],
+        &COMMIT[2..]
+    ));
+    let run = ostrya(
+        &["sign", &repo_arg, COMMIT, ED25519_SECRET_B64, &homedir],
+        None,
+        &[],
+    );
+    assert_eq!(run.status.code(), Some(1));
+    assert!(run.stdout.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&run.stderr),
+        "error: signature: --gpg-homedir applies only to the gpg engine\n"
+    );
+    assert!(!meta.exists(), "the run wrote a signature");
+}
+
 /// One `commit` signs with an ed25519 key and an spki key, and each key takes
 /// the engine of the `--sign-type` before it. `sign --verify` with a key of
 /// each engine verifies with each engine, in the order of the first key of
@@ -4597,8 +4684,7 @@ fn sign_verify_of_a_missing_commit_fails() {
 ///   `-s` values.
 /// - `--remote` is refused with a KEY-ID, a `--keys-file`, a `--keys-dir`,
 ///   and without `--verify`.
-/// - A gpg KEY-ID is refused in a verify, and `--gpg-homedir` is refused if
-///   no key and no `--sign-type` names gpg.
+/// - A gpg KEY-ID and `--gpg-homedir` are refused in a verify.
 #[cfg(feature = "gpg")]
 #[test]
 fn verify_with_the_keys_of_a_remote() {
@@ -4840,14 +4926,18 @@ fn verify_with_the_keys_of_a_remote() {
         "error: signature: a gpg verify takes its keyrings from --keys-file, --remote, or \
          the system trust; it takes no KEY-ID\n",
     );
+    let homedir_refused = "error: signature: --gpg-homedir applies to signing alone\n";
     refused(
         &["sign", "--verify", &homedir, &commit, ED25519_PUBLIC_B64],
-        "error: signature: --gpg-homedir applies only to the gpg engine\n",
+        homedir_refused,
     );
-    let keyring_verify = run(&[
-        "sign", "--verify", &homedir, "-s", "gpg", &keys_file, &commit,
-    ]);
-    keyring_verify.ok();
+    refused(
+        &[
+            "sign", "--verify", &homedir, "-s", "gpg", &keys_file, &commit,
+        ],
+        homedir_refused,
+    );
+    run(&["sign", "--verify", "-s", "gpg", &keys_file, &commit]).ok();
 }
 
 /// Each command that writes refs, `config`, a remote keyring, `summary`, or

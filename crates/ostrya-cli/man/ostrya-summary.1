@@ -97,7 +97,7 @@ The key directories are \fB\%/etc/ostree\fR, \fB\%/usr/share/ostree\fR, and each
 \fB\-\-gpg\-homedir\fR \fIGPG_HOMEDIR\fR
 The GnuPG home directory where gpg resolves signing keys.
 .IP
-Only the gpg engine reads it: for \%\-\-gpg\-sign, and for \%\-\-sign and the positional keys under the gpg engine.
+Only the gpg engine reads it: for \%\-\-gpg\-sign, and for \%\-\-sign and the positional keys under the gpg engine. \%\-\-verify refuses it.
 .TP
 \fB\-\-remote\fR \fIREMOTE\fR
 Verify with the keys of this remote.

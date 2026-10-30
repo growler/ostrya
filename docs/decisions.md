@@ -573,7 +573,9 @@ valid signature of that engine. A run with no key, no `--remote`, and no
 `--sign-type` is an exception: it skips each engine that finds no signature,
 if another engine finds one. The verify modes are `sign --verify`,
 `summary --verify`, `static-delta verify`, and `static-delta apply-offline`
-with a key source. A run with no engine is refused. The key sources are:
+with a key source. A run with no engine is refused. A verify mode of `sign`
+and `summary` refuses `--gpg-homedir`, which names the home directory of a
+gpg signing key. The key sources are:
 
 - A key on the command line: the engines of the keys alone, and no key
   directory. The command refuses a `--keys-dir` in this run. `sign` also
@@ -629,6 +631,10 @@ These alternatives were rejected:
 - A `--keys-dir` that a verify with a key on the command line or a signing
   run of `sign` ignores, as the `ostree` command does. A user who gives a key
   directory then gets no message when the run reads no key from it.
+- A verify that reads the `*.gpg` files of `--gpg-homedir` as keyrings, as
+  `show --gpg-homedir` does. The GnuPG home directory of a signer is then a
+  trust source of the verify, and the verify trusts each key in it with no
+  statement of trust from the user.
 - A gpg `--keys-file` that names no file and that the command skips, as the
   library skips an optional keyring. A typo then verifies with an empty
   trusted set, and no message names the path.

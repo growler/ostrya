@@ -2914,7 +2914,8 @@ struct SignArgs {
     /// The GnuPG home directory where gpg resolves signing keys.
     ///
     /// Without this option, gpg uses its own resolution. The command refuses
-    /// it if no key and no --sign-type names the gpg engine.
+    /// it with --verify, and in a signing run where no key and no --sign-type
+    /// names the gpg engine.
     #[arg(long)]
     gpg_homedir: Option<PathBuf>,
     /// Verify with the keys of this remote.
@@ -3121,7 +3122,7 @@ struct SummaryArgs {
     /// The GnuPG home directory where gpg resolves signing keys.
     ///
     /// Only the gpg engine reads it: for --gpg-sign, and for --sign and the
-    /// positional keys under the gpg engine.
+    /// positional keys under the gpg engine. --verify refuses it.
     #[arg(long)]
     gpg_homedir: Option<PathBuf>,
     /// Verify with the keys of this remote.
@@ -13953,8 +13954,8 @@ async fn diff(repo: Repo, name: &str, args: DiffArgs, owner: Owner) -> Result<()
 /// Signs a commit, or verifies its signatures.
 ///
 /// The `--sign-type` values are read first, then the COMMIT. Each key takes
-/// the engine of the nearest `--sign-type` before it. A signing run refuses
-/// `--remote` and `--keys-dir`.
+/// the engine of the nearest `--sign-type` before it. A verify refuses
+/// `--gpg-homedir`. A signing run refuses `--remote` and `--keys-dir`.
 async fn sign(repo: Repo, name: &str, args: SignArgs) -> Result<()> {
     let engines = match args.key_types.engines(sign_type_from_name, args.verify) {
         Ok(engines) => engines,
@@ -13964,6 +13965,9 @@ async fn sign(repo: Repo, name: &str, args: SignArgs) -> Result<()> {
         exit_with_error(name, "Need a COMMIT to sign or verify");
     };
     let commit = resolve(&repo, commit_rev).await?;
+    if args.verify && args.gpg_homedir.is_some() {
+        return Err(gpg_homedir_with_verify());
+    }
     if args.gpg_homedir.is_some() && !engines.names(SignType::Gpg) {
         return Err(Error::Signature(
             "--gpg-homedir applies only to the gpg engine".into(),
@@ -13988,6 +13992,11 @@ fn remote_without_verify() -> Error {
 /// Returns the refusal of `--keys-dir` in a run that does not verify.
 fn keys_dir_without_verify() -> Error {
     Error::Signature("--keys-dir applies to --verify alone".into())
+}
+
+/// Returns the refusal of `--gpg-homedir` in a run that verifies.
+fn gpg_homedir_with_verify() -> Error {
+    Error::Signature("--gpg-homedir applies to signing alone".into())
 }
 
 /// Updates, verifies, signs, or reads the summary of the repository.
@@ -14046,9 +14055,10 @@ async fn summary(repo: Repo, args: SummaryArgs) -> Result<()> {
 /// Verifies the signatures of the summary with one verifier for each engine
 /// of the run, and prints the report of each engine.
 ///
-/// The command refuses `--sign` and `--gpg-sign`, which sign a summary.
-/// [`verify_engines`] skips a discovered engine that finds no signature. If
-/// an engine that it reports has no valid signature, the process exits 1.
+/// The command refuses `--sign` and `--gpg-sign`, which sign a summary, and
+/// `--gpg-homedir`. [`verify_engines`] skips a discovered engine that finds
+/// no signature. If an engine that it reports has no valid signature, the
+/// process exits 1.
 async fn summary_verify(repo: &Repo, args: &SummaryArgs) -> Result<()> {
     if !args.sign.is_empty() || !args.gpg_sign.is_empty() {
         return Err(Error::Signature(
@@ -14056,6 +14066,9 @@ async fn summary_verify(repo: &Repo, args: &SummaryArgs) -> Result<()> {
              arguments or with --keys-file"
                 .into(),
         ));
+    }
+    if args.gpg_homedir.is_some() {
+        return Err(gpg_homedir_with_verify());
     }
     let engines = match args.key_types.engines(sign_type_from_name, true) {
         Ok(engines) => engines,

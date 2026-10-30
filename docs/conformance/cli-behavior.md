@@ -4801,6 +4801,15 @@ block prints after the per-path lines, whatever the order of the two options.
 options are `-s`/`--sign-type=NAME`, `--keys-file=PATH`, and
 `--keys-dir=PATH`.
 
+The tool has no `--gpg-homedir` on `sign`. It refuses the option at exit 1
+before it opens the repository, also with `-s gpg`, in a signing run, and with
+a repository or a ref that does not exist. `ostree sign --repo=R --verify
+--gpg-homedir=/x main` writes this line:
+
+```
+error: Unknown option --gpg-homedir=/x
+```
+
 #### The key sources of `sign`
 
 Under the `ed25519` engine, `sign --verify` takes the key sources that
@@ -4855,7 +4864,8 @@ error: signature: gpg signing takes KEY-ID arguments; --keys-file keyrings serve
 ```
 
 The gpg engine reads no key directory, and the port refuses a gpg KEY-ID in a
-verify.
+verify. The port also refuses `--gpg-homedir` in a verify, because a gpg
+verify takes its keyrings from `--keys-file`, `--remote`, or the system trust.
 
 The port refuses a `--keys-file` of a gpg verify that names no regular file.
 The refusal comes before verification. The port writes nothing to standard

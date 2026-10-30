@@ -2659,11 +2659,6 @@ impl KeyTypes {
         KeyTypes { names, options }
     }
 
-    /// Returns `true` if the command line names a key.
-    fn has_key(&self) -> bool {
-        self.options.iter().any(|option| !option.values.is_empty())
-    }
-
     /// Gives each key its engine.
     ///
     /// `read` reads one `--sign-type` value into its engine, or gives the
@@ -2687,7 +2682,22 @@ impl KeyTypes {
             .iter()
             .map(|name| read(name))
             .collect::<std::result::Result<Vec<SignType>, String>>()?;
-        let has_key = self.has_key();
+        let mut keys: Vec<(&'static str, Vec<(usize, SignType)>)> =
+            Vec::with_capacity(self.options.len());
+        for option in &self.options {
+            let engines = option
+                .values
+                .iter()
+                .map(|&(index, owner)| (index, owner.map_or(SignType::Ed25519, |t| types[t])))
+                .collect();
+            keys.push((option.id, engines));
+        }
+        let mut engines = KeyEngines {
+            types,
+            keys,
+            filter: Vec::new(),
+        };
+        let has_key = engines.has_key();
         if has_key || !filter {
             let mut owned = vec![false; self.names.len()];
             for option in &self.options {
@@ -2708,32 +2718,14 @@ impl KeyTypes {
                 ));
             }
         }
-        let mut keys: Vec<(&'static str, Vec<(usize, SignType)>)> =
-            Vec::with_capacity(self.options.len());
-        for option in &self.options {
-            let engines = option
-                .values
-                .iter()
-                .map(|&(index, owner)| (index, owner.map_or(SignType::Ed25519, |t| types[t])))
-                .collect();
-            keys.push((option.id, engines));
-        }
-        let filter = if has_key {
-            Vec::new()
-        } else {
-            let mut selected: Vec<SignType> = Vec::with_capacity(types.len());
-            for engine in &types {
-                if !selected.contains(engine) {
-                    selected.push(*engine);
+        if !has_key {
+            for engine in &engines.types {
+                if !engines.filter.contains(engine) {
+                    engines.filter.push(*engine);
                 }
             }
-            selected
-        };
-        Ok(KeyEngines {
-            types,
-            keys,
-            filter,
-        })
+        }
+        Ok(engines)
     }
 }
 

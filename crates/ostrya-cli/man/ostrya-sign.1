@@ -37,7 +37,7 @@ Read keys from a file.
 .IP
 The \%\-\-sign\-type before the file selects its engine. For \%ed25519, the file has \%base64 keys, one per line: secret keys to sign, public keys to verify. For spki, the file holds PEM \fB\%PRIVATE KEY\fR blocks, each a \%PKCS#8 DER of a \%P\-256, a \%P\-384, an \%Ed25519, or an RSA key, to sign, and PEM \fB\%PUBLIC KEY\fR blocks to verify. Each \fB\%PRIVATE KEY\fR block adds one signature. Signing reads every file. A signing file is a regular file of at most \%1 MiB. An \%ed25519 or spki verify reads the last file of its engine. With this option or a \%KEY\-ID, a verify does not read \%\-\-keys\-dir or the key directories.
 .IP
-For gpg, the file is a binary or armored keyring for verify, and every file is read. A gpg signing run refuses this option.
+For gpg, the file is a binary or armored keyring for verify, and every file is read. A gpg verify refuses a path that names no regular file. A gpg signing run refuses this option.
 .TP
 \fB\-\-keys\-dir\fR \fIPATH\fR
 Add a directory to the key directories of a verify.

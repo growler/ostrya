@@ -6111,6 +6111,10 @@ fn static_delta_generate_spki_keys_file_lines() {
 #[test]
 fn sign_verify_gpg() {
     if !gpg_available() {
+        assert!(
+            std::env::var_os("OSTRYA_REQUIRE_GNUPG").is_none(),
+            "OSTRYA_REQUIRE_GNUPG is set and `gpg` is not available"
+        );
         eprintln!("skipping: gpg not available");
         return;
     }
@@ -6171,6 +6175,99 @@ fn sign_verify_gpg() {
     );
     verified.ok();
     assert!(verified.stdout_trimmed().contains("verification OK"));
+
+    // A `--keys-file` that names no file refuses the verify, also beside a
+    // keyring that verifies the signature, in each order.
+    let typo = base.join("typo.gpg");
+    let typo_s = typo.to_str().unwrap();
+    for files in [[public_s, typo_s], [typo_s, public_s]] {
+        let refused = ostrya(
+            &[
+                "sign",
+                "--verify",
+                "--repo",
+                repo_s,
+                "-s",
+                "gpg",
+                "--keys-file",
+                files[0],
+                "--keys-file",
+                files[1],
+                COMMIT,
+            ],
+            None,
+            &[],
+        );
+        assert_eq!(refused.status.code(), Some(1), "{files:?}");
+        assert!(refused.stdout.is_empty(), "{files:?}");
+        assert_eq!(
+            String::from_utf8_lossy(&refused.stderr),
+            format!("error: File object '{typo_s}' is not a regular file\n"),
+            "{files:?}"
+        );
+    }
+}
+
+/// A gpg verify refuses a `--keys-file` that names no regular file: a
+/// missing path, a directory, and an empty value, also next to a regular
+/// file. `sign --verify` and `summary --verify` give the refusal of the
+/// ed25519 and spki engines before verification. The run needs no `gpg`
+/// binary.
+#[cfg(feature = "gpg")]
+#[test]
+fn a_gpg_verify_refuses_a_keys_file_that_names_no_file() {
+    let tmp = TmpDir::new("gpg-keys-file-no-file");
+    let base = tmp.path();
+    let repo = commit_fixture(base);
+    let repo_arg = format!("--repo={}", repo.display());
+    ostrya(&["summary", &repo_arg, "-u"], None, &[]).ok();
+    let dir = base.join("dir");
+    std::fs::create_dir_all(&dir).unwrap();
+    let typo = base.join("typo.gpg");
+    for path in [typo.to_str().unwrap(), dir.to_str().unwrap(), ""] {
+        let keys_file = format!("--keys-file={path}");
+        for args in [
+            vec![
+                "sign", &repo_arg, "--verify", "-s", "gpg", &keys_file, COMMIT,
+            ],
+            vec!["summary", &repo_arg, "--verify", "-s", "gpg", &keys_file],
+        ] {
+            let refused = ostrya(&args, None, &[]);
+            assert_eq!(refused.status.code(), Some(1), "{args:?}");
+            assert!(refused.stdout.is_empty(), "{args:?}");
+            assert_eq!(
+                String::from_utf8_lossy(&refused.stderr),
+                format!("error: File object '{path}' is not a regular file\n"),
+                "{args:?}"
+            );
+        }
+    }
+    // A missing path refuses the run in either position next to a
+    // regular file.
+    let empty = base.join("empty.gpg");
+    std::fs::write(&empty, b"").unwrap();
+    let empty_arg = format!("--keys-file={}", empty.display());
+    let typo_s = typo.to_str().unwrap();
+    let typo_arg = format!("--keys-file={typo_s}");
+    for files in [[&empty_arg, &typo_arg], [&typo_arg, &empty_arg]] {
+        for args in [
+            vec![
+                "sign", &repo_arg, "--verify", "-s", "gpg", files[0], files[1], COMMIT,
+            ],
+            vec![
+                "summary", &repo_arg, "--verify", "-s", "gpg", files[0], files[1],
+            ],
+        ] {
+            let refused = ostrya(&args, None, &[]);
+            assert_eq!(refused.status.code(), Some(1), "{args:?}");
+            assert!(refused.stdout.is_empty(), "{args:?}");
+            assert_eq!(
+                String::from_utf8_lossy(&refused.stderr),
+                format!("error: File object '{typo_s}' is not a regular file\n"),
+                "{args:?}"
+            );
+        }
+    }
 }
 
 /// A gpg key that names no secret key is refused before the first write.

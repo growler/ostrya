@@ -572,7 +572,10 @@ if another engine finds one. The verify modes are `sign --verify`,
 with a key source. A run with no engine is refused. The key sources are:
 
 - A key on the command line: the engines of the keys alone, and no key
-  directory.
+  directory. Each gpg `--keys-file` must name a regular file, as the last
+  ed25519 or spki `--keys-file` must. `GpgVerifier::from_keyring_files`
+  skips a keyring path that names no file, so the command checks each path
+  before the load.
 - No key and no `--remote`: each engine with a trusted key in the system key
   directories and each `--keys-dir`, and the gpg engine if the GPG system
   trust holds a certificate. Each `--keys-dir` adds one directory. The two
@@ -616,6 +619,11 @@ These alternatives were rejected:
 - A `--keys-dir` that replaces the default key directories, as the `ostree`
   command does. The key directories of the port are one set, and a revoked
   key of one directory applies to each directory.
+- A gpg `--keys-file` that names no file and that the command skips, as the
+  library skips an optional keyring. A typo then verifies with an empty
+  trusted set, and no message names the path.
+- The refusal in `GpgVerifier::from_keyring_files`. The keyring paths of a
+  remote and of the system trust name files that can be absent.
 - The global GPG trusted set and the system key store for `--remote`. These
   sets do not belong to the remote.
 - A `sign -d` that removes a signature. The tool has no such mode on `sign`.

@@ -4850,6 +4850,15 @@ error: signature: gpg signing takes KEY-ID arguments; --keys-file keyrings serve
 The gpg engine reads no key directory, and the port refuses a gpg KEY-ID in a
 verify.
 
+The port refuses a `--keys-file` of a gpg verify that names no regular file.
+The refusal comes before verification. The port writes nothing to standard
+output, writes this line, and exits 1. The line is the refusal of the
+ed25519 and spki engines:
+
+```
+error: File object '<path>' is not a regular file
+```
+
 #### The verify report
 
 On success, the tool writes one line, `ed25519: Signature verified

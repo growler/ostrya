@@ -3824,21 +3824,23 @@ refuses `-s spki` in each with `error: Requested signature type is not
 implemented` at exit 1. Each key takes the engine of the nearest `-s` before
 it ("the engine of each key" below). Under `-s gpg` each `--keys-file` of a
 verify is a keyring, and every keyring given is read; a gpg signing run
-refuses `--keys-file`. Under `ed25519` and `spki`, `--verify` reads the key
-sources of `static-delta verify`: the positionals and the last `--keys-file`
-of the engine, either one leaving `--keys-dir` unread, the key directories,
-an empty `--keys-dir` naming the working directory, and the trusted keys
-judged before revocation (`cli-behavior.md`, "CLI output formats",
-`static-delta`, "Key sources"). Over a commit either implementation signed,
-the verdict and the exit status agree for these rules where one `--keys-dir`
-is given, and so do the refusals `File object '<path>' is not a regular
-file` and `no valid keys in file '<path>'` of `ed25519`, byte for byte.
-Under `spki`, a `--keys-file` and each key-store file hold PEM `PUBLIC KEY`
-blocks, the form that the `ostree` 2026.1 build with OpenSSL on the NixOS
-development host reads. The key-file entries under `static-delta` above, the
-spki entries included, also hold for `sign --verify`. Under `spki`, a signing
-`--keys-file` holds PEM `PRIVATE KEY` blocks, each a PKCS#8 DER, and each
-block adds one signature. Twenty-five differences stand.
+refuses `--keys-file`. A gpg verify refuses a `--keys-file` that names no
+regular file at exit 1 with `File object '<path>' is not a regular file`, the
+refusal that the ed25519 and spki engines give for their last `--keys-file`.
+Under `ed25519` and `spki`, `--verify` reads the key sources of `static-delta
+verify`: the positionals and the last `--keys-file` of the engine, either one
+leaving `--keys-dir` unread, the key directories, an empty `--keys-dir` naming
+the working directory, and the trusted keys judged before revocation
+(`cli-behavior.md`, "CLI output formats", `static-delta`, "Key sources"). Over
+a commit either implementation signed, the verdict and the exit status agree
+for these rules where one `--keys-dir` is given, and so do the refusals `File
+object '<path>' is not a regular file` and `no valid keys in file '<path>'` of
+`ed25519`, byte for byte. Under `spki`, a `--keys-file` and each key-store file
+hold PEM `PUBLIC KEY` blocks, the form that the `ostree` 2026.1 build with
+OpenSSL on the NixOS development host reads. The key-file entries under
+`static-delta` above, the spki entries included, also hold for `sign --verify`.
+Under `spki`, a signing `--keys-file` holds PEM `PRIVATE KEY` blocks, each a
+PKCS#8 DER, and each block adds one signature. Twenty-five differences stand.
 
 - the verdict report. The exit status agrees. The two reports part as
   follows:

@@ -2900,7 +2900,8 @@ struct SignArgs {
     /// or the key directories.
     ///
     /// For gpg, the file is a binary or armored keyring for verify, and every
-    /// file is read. A gpg signing run refuses this option.
+    /// file is read. A gpg verify refuses a path that names no regular file.
+    /// A gpg signing run refuses this option.
     #[arg(long, value_name = "PATH")]
     keys_file: Vec<std::ffi::OsString>,
     /// Add a directory to the key directories of a verify.
@@ -3104,9 +3105,9 @@ struct SummaryArgs {
     /// PEM `PUBLIC KEY` blocks. An ed25519 or spki verify reads the last file
     /// of its engine. With this option or a KEY-ID, a verify does not read
     /// --keys-dir or the key directories. A signing run reads every file. A
-    /// gpg verify reads every file as a keyring, and a gpg signing run refuses
-    /// this option. Without -u and --verify, the keys sign the existing
-    /// summary.
+    /// gpg verify reads every file as a keyring, and refuses a path that names
+    /// no regular file. A gpg signing run refuses this option. Without -u and
+    /// --verify, the keys sign the existing summary.
     #[arg(long, value_name = "PATH")]
     keys_file: Vec<std::ffi::OsString>,
     /// Add a directory to the key directories of a verify.
@@ -7423,7 +7424,7 @@ async fn remote_verify_keys(
 /// - An ed25519 or spki engine trusts its KEY-IDs, then the keys of its last
 ///   `--keys-file`.
 /// - The gpg engine trusts the keyrings of each of its `--keys-file` values.
-///   A gpg KEY-ID is refused.
+///   Each value must name a regular file. A gpg KEY-ID is refused.
 ///
 /// The run then reads no key directory.
 ///
@@ -7561,8 +7562,17 @@ fn no_keys_loaded(engine: SignType) -> Error {
 }
 
 /// Returns the keys of a gpg verify over the keyrings `files`.
+///
+/// Each path must name a regular file. [`require_verify_keys_file`] checks
+/// every path before the first keyring loads. The library loader skips a
+/// path that names no file, because the keyrings of a remote and of the
+/// system trust are optional. A path on the command line is not optional.
 #[cfg(feature = "gpg")]
 fn gpg_keyring_keys<'a>(files: impl Iterator<Item = &'a Path>) -> Result<VerifyKeys> {
+    let files: Vec<&Path> = files.collect();
+    for path in &files {
+        require_verify_keys_file(path);
+    }
     let verifier = GpgVerifier::from_keyring_files(files)?;
     Ok(VerifyKeys::of(Arc::new(verifier)))
 }
@@ -7610,6 +7620,21 @@ fn verify_key_bytes(engine: SignType, text: &[u8]) -> Vec<u8> {
     key
 }
 
+/// Refuses a `--keys-file` of a verify that does not name a regular file.
+///
+/// The path must stat as a regular file, with symlinks followed. A missing
+/// path, a dangling symlink, an empty value, a directory, and a FIFO are
+/// refused. The check reads no byte, so it does not wait on a FIFO. A refusal
+/// prints `error: File object '<path>' is not a regular file` and exits 1.
+fn require_verify_keys_file(path: &Path) {
+    if !std::fs::metadata(path).is_ok_and(|meta| meta.is_file()) {
+        exit_error(&format!(
+            "File object '{}' is not a regular file",
+            path.display()
+        ));
+    }
+}
+
 /// Reads the public keys of a `--keys-file` for an ed25519 or spki verify.
 ///
 /// The rules for each engine:
@@ -7632,10 +7657,8 @@ fn verify_key_bytes(engine: SignType, text: &[u8]) -> Vec<u8> {
 /// - A file with no key line is refused.
 fn read_verify_keys_file(engine: SignType, path: &Path) -> Result<Vec<Vec<u8>>> {
     use std::io::Read;
+    require_verify_keys_file(path);
     let shown = path.display();
-    if !std::fs::metadata(path).is_ok_and(|meta| meta.is_file()) {
-        exit_error(&format!("File object '{shown}' is not a regular file"));
-    }
     let mut bytes = Vec::new();
     std::fs::File::open(path)?
         .take(VERIFY_KEYS_FILE_LIMIT + 1)

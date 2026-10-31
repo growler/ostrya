@@ -5041,6 +5041,52 @@ note: a signed commit needs a generated key, which no setup binds. The port
 
 family: M10
 subcommand: show
+cell: show/gpg-verify-remote-global-fallback
+modes: archive
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::show_gpg_verify_remote_reads_the_global_directory_as_a_fallback
+spec: cli-behavior.md#show cli-behavior.md#the-verification-keys format-reference.md#gpg
+note: a signed commit needs a generated key, which no setup binds. The port
+ signs the commit, and each implementation reads the repository through
+ `show --gpg-verify-remote=origin`, with `OSTREE_GPG_HOME` naming a global
+ trusted directory and no `gpgkeypath`. With no `origin.trustedkeys.gpg`, a
+ global `k.gpg` that holds the key gives `Good signature from "<user id>"` at
+ exit 0 in both, and so do the key in a file named `.gpg` and a repository
+ keyring that is a symlink to no file. A repository keyring that holds
+ another key, and an empty repository keyring, give `Can't check signature:
+ public key not found` at exit 0 in both, with the key in the global
+ directory; `pull-local --remote=origin --gpg-verify` then exits 1 in both
+ and writes no object and no ref. With the key in the repository keyring, a
+ global directory that holds a text file `junk.gpg` and a file with mode 000,
+ and a global directory with mode 000, give `Good signature from "<user id>"`
+ at exit 0 in both: neither lists the global directory.
+
+family: M10
+subcommand: show
+cell: show/gpg-verify-remote-global-armored
+modes: archive
+setup: repo-with-commit
+outcome: refused-clean
+severity: interop
+evidence: ostrya_cli::cli::show_gpg_verify_remote_refuses_an_armored_global_keyring
+spec: cli-surface.md#gpg-verification-differences format-reference.md#gpg
+note: a signed commit needs a generated key, which no setup binds. The port
+ signs the commit. With no `origin.trustedkeys.gpg`, the global trusted
+ directory holds the key in `a.gpg` and its armored export in `m.gpg`. The
+ port refuses `m.gpg` by its path at exit 1 after the commit report, and the
+ tool gives `Can't check signature: public key not found` at exit 0: an
+ armored file stops the read of the global stream of the tool, and the key
+ of `a.gpg` is lost before it in either `readdir` order.
+ `pull-local --remote=origin --gpg-verify` exits 1 in both and writes no
+ object and no ref, and the refusal of the port names `m.gpg`. An armored
+ `origin.trustedkeys.gpg` takes the same outcome: the port refuses the
+ keyring by its name, and the tool trusts no key of it. The cited test
+ states the port and the tool side by side.
+
+family: M10
+subcommand: show
 cell: show/gpg-verify-remote-no-section
 modes: archive
 setup: repo-with-commit

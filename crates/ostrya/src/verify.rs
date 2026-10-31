@@ -1021,10 +1021,12 @@ pub(crate) enum KeySource<'a> {
         /// adds to the GPG trusted set.
         #[cfg_attr(not(feature = "verify-gpg"), allow(dead_code))]
         repo_keyring: bool,
-        /// If `true`, the global GPG trusted directory and the system sign-api
-        /// key store add to the keys of the remote, as in a pull. If `false`,
-        /// the keys are the keys of the remote alone, and a GPG axis whose
-        /// keyrings hold no certificate is refused.
+        /// If `true`, the system sign-api key store adds to the keys of the
+        /// remote, as in a pull. The global GPG trusted directory also adds
+        /// its keys, but only when no keyring of the remote exists in the
+        /// repository or in `/etc/ostree/remotes.d`. If `false`, the keys are
+        /// the keys of the remote alone, and a GPG axis whose keyrings hold no
+        /// certificate is refused.
         system_keys: bool,
     },
     /// A trust group, `[ex-ostrya trust "NAME"]`. The accessors of a remote
@@ -1195,8 +1197,13 @@ fn each_engine_once(names: &[String]) -> Vec<String> {
 /// - the keyring of the repository for the remote, read through the repository
 ///   descriptor, if the source asks for it
 /// - the system keyring of the remote
-/// - the global trusted set, if the source asks for the system keys
+/// - the global trusted set, if the source asks for the system keys and
+///   neither keyring of the remote exists
 /// - the keyrings that `gpgkeypath` names
+///
+/// The keyrings of the remote and the global keyring files must be binary
+/// OpenPGP packet streams. The rules are those of
+/// [`for_remote_keyrings`](crate::gpg::FromOstreeKeyrings::for_remote_keyrings).
 ///
 /// A remote source without the system keys refuses a trusted set that holds
 /// no certificate.

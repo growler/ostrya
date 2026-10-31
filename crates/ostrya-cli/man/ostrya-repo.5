@@ -221,6 +221,7 @@ A regeneration of the summary with no key removes it.
 \fB\%<repo>/<remote>.trustedkeys.gpg\fR
 The trusted GPG keyring of the remote \fB\%<remote>\fR.
 \fB\%ostrya remote gpg\-import\fR writes it, and \fB\%ostrya remote delete\fR removes it.
+A signature check takes it only as a binary OpenPGP keyring, and refuses an armored keyring by its name.
 .TP
 \fB\%<repo>/gpgkeys.gpg\fR
 A keyring that \fB\%ostrya show\fR reads to check a GPG signature, when \fB\%\-\-gpg\-verify\-remote\fR is not given.
@@ -457,10 +458,15 @@ ostrya also reads these files outside the repository:
 .TP
 \fB\%/etc/ostree/remotes.d/<remote>.trustedkeys.gpg\fR
 The system keyring of the remote \fB\%<remote>\fR.
+A signature check takes it only as a binary OpenPGP keyring, as it takes \fB\%<remote>.trustedkeys.gpg\fR in the repository, and refuses an armored keyring by its path.
 .TP
 \fB\%/usr/share/ostree/trusted.gpg.d/*.gpg\fR
 The global trusted GPG keyrings.
 If \fB\%OSTREE_GPG_HOME\fR is set and is not empty, ostrya reads the keyrings in that directory in place of this one.
+ostrya reads each regular file whose name ends in \fB\%.gpg\fR, in name order, and skips a symlink and a subdirectory.
+Each file must be a binary OpenPGP keyring, and ostrya refuses an armored file by its path.
+A remote reads these keyrings only when neither \fB\%<remote>.trustedkeys.gpg\fR exists, in the repository or in \fB\%/etc/ostree/remotes.d\fR.
+An empty \fB\%<remote>.trustedkeys.gpg\fR exists, and stops the read of this directory.
 .TP
 \fB\%/etc/ostree/trusted.<engine>\fR, \fB\%/etc/ostree/trusted.<engine>.d/\fR
 .TQ

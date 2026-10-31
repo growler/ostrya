@@ -2252,16 +2252,32 @@ binds no subkey, and ranks no user id. The first certificate that answers
 supplies the reported fingerprints and user id.
 
 The keyring trusted for a remote is `<remote>.trustedkeys.gpg` in the repo or
-under `/etc/ostree/remotes.d/`. Each `*.gpg` keyring in the global
-trusted-keyring directory is trusted for all remotes. That directory is
+under `/etc/ostree/remotes.d/`. The global trusted-keyring directory is
 `<datadir>/ostree/trusted.gpg.d/` (`/usr/share/ostree/trusted.gpg.d/`). The
 `OSTREE_GPG_HOME` environment variable replaces it with the directory that it
-names. The remote also trusts each keyring that the `gpgkeypath` key of its
-config section names. The reader takes the raw value of the key and decodes
-no escape sequence, so `k\sspace.gpg` names the file with that name. A `;`
-separates the entries. The reader removes one empty entry at the end of the
-value and keeps each other empty entry. An empty entry names no file, so it
-fails the read: `gpgkeypath=`, `gpgkeypath=;`, `gpgkeypath=;<k>`, and
+names. The global directory is a fallback: a remote trusts its keyrings only
+when neither `<remote>.trustedkeys.gpg` exists. A keyring exists if its open
+does not give "No such file or directory". So an empty file is a keyring with
+no key and stops the read of the global directory, and a symlink to no file
+is no keyring. The read of the global directory takes each regular file whose
+name ends in `.gpg`, a hidden name and the name `.gpg` included, in name
+order. It skips a name that ends in `.GPG`, a symlink, a fifo, and a
+subdirectory. The port refuses a global directory that it cannot list, other
+than an absent one, and the refusal names the directory.
+
+The two `<remote>.trustedkeys.gpg` keyrings and each file of the global
+directory must be a binary OpenPGP packet stream. If such a keyring holds
+other bytes, the port refuses it by its name. Armor, a GnuPG keybox, text, a
+keyring with bytes after its last packet, and a keyring over a limit are
+examples. An empty keyring gives no key.
+
+The remote also trusts each keyring that the `gpgkeypath` key of its config
+section names, whether or not it has a keyring of its own. The reader takes
+the raw value of the key and decodes no escape sequence, so `k\sspace.gpg`
+names the file with that name. A `;` separates the entries. The reader
+removes one empty entry at the end of the value and keeps each other empty
+entry. An empty entry names no file, so it fails the read: `gpgkeypath=`,
+`gpgkeypath=;`, `gpgkeypath=;<k>`, and
 `gpgkeypath=<k>;;<k>` fail, and `gpgkeypath=<k>;` reads `<k>`. A
 `gpgkeypath` entry is a keyring file or a directory.
 The remote trusts each regular file of the directory, with any name. The read

@@ -388,8 +388,7 @@ impl Issuer<'_> {
 /// One key can reach the trusted set through more than one certificate on
 /// usual paths:
 ///
-/// - the `<remote>.trustedkeys.gpg` of a repository and the global trusted
-///   directory
+/// - the `<remote>.trustedkeys.gpg` of a repository and a `gpgkeypath` entry
 /// - two `gpgkeypath` entries
 /// - one keyring file with two exports of one key.
 ///
@@ -409,12 +408,9 @@ struct Issuers<'a> {
     ///
     /// A revoker speaks for a certificate that does not hold it. So the whole
     /// trusted set applies here. Its certificates come from the keyring of a
-    /// remote, the global trusted directory, or a `gpgkeypath` entry.
-    ///
-    /// The `ostree` command resolves a revoker only in the keyring source that
-    /// carries the revocation. So if the revoker and the revocation come from
-    /// different sources, the two implementations give different answers.
-    /// ostrya is the stricter one (divergence P3).
+    /// remote, the global trusted directory, or a `gpgkeypath` entry. The
+    /// `ostree` command also resolves a revoker in a `gpgkeypath` entry for a
+    /// revocation in the keyring of the remote.
     trusted: &'a [SignedPublicKey],
 }
 
@@ -3555,8 +3551,8 @@ mod tests {
     /// so the verdict reads each certificate for the issuer. If one of them
     /// carries a revocation, the signature is refused. The ordinary paths:
     ///
-    /// - the `<remote>.trustedkeys.gpg` of a repository and the global trusted
-    ///   directory
+    /// - the `<remote>.trustedkeys.gpg` of a repository and a `gpgkeypath`
+    ///   entry
     /// - two `gpgkeypath` entries
     /// - one keyring file that holds two exports of one key.
     ///

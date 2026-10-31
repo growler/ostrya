@@ -395,8 +395,8 @@ are listed in the rustdoc of `ostrya_gvariant::Type` and `Value`.
 The indefinite characters part the two. The tool takes `r`, `*` and `?` and
 prints `**` for each, where the port refuses the type string with `error:
 invalid format: invalid type signature "<type>" at offset <n>: unsupported type
-character` at exit 1. Nine tool behaviors around these commands are observed and
-deliberately not reproduced:
+character` at exit 1. Thirteen tool behaviors around these commands are
+observed and deliberately not reproduced:
 
 - a `--print-variant-type` signature that is not a type at all kills the tool
   with a signal (`--print-variant-type=zz` exits 139 after two GLib assertions),
@@ -501,6 +501,29 @@ deliberately not reproduced:
   packet that holds only a version byte, gives `Good signature from "<user
   id>"` at exit 0 in `ostree` 2026.1 ("GPG verification differences", item
   3);
+- the global trusted directory of a `--gpg-verify-remote` remote with no
+  keyring of its own parts the two where the port cannot list it or open a
+  file of it. Both commands print the commit report with no `Found` line and
+  exit 1. For a directory that cannot be listed, the tool writes `error:
+  Reading keyring directory '<dir>': opendir(<dir>): Permission denied`, and
+  the port writes `error: signature: the global trusted directory '<dir>'
+  cannot be listed: Permission denied (os error 13)`. For a file that cannot
+  be opened, the tool writes `error: Reading keyring directory '<dir>':
+  openat(z.gpg): Permission denied`, and the port writes `error: signature:
+  the keyring '<dir>/z.gpg' cannot be opened: Permission denied (os error
+  13)`. An `OSTREE_GPG_HOME` that names a regular file gives no key and no
+  message in `ostree` 2026.1, and the signature report at exit 0. The port
+  refuses it with `error: signature: the global trusted directory '<path>'
+  cannot be listed: Not a directory (os error 20)` at exit 1 after the
+  commit report;
+- a file of that global trusted directory, or a `REMOTE.trustedkeys.gpg`
+  keyring, that is not a binary OpenPGP packet stream parts the two. The
+  port refuses such a keyring by its name, and the report exits 1 after the
+  commit report. Text, a keyring followed by text, a GnuPG keybox, and
+  armor are examples. `ostree` 2026.1 reads the global files as one stream in
+  `readdir` order, and stops at bytes that do not frame with no message. It
+  reads a keybox that is first in the stream, or that is the repository
+  keyring ("GPG verification differences", items 2, 3, and 8);
 - the verdict the report states rests on the port's own trust and validity
   policy, which "GPG verification differences" compares with GnuPG 2.4.9.
   Eight differences stand there, and each one can make a `show` verdict part
@@ -515,17 +538,33 @@ deliberately not reproduced:
 `show --gpg-verify-remote=REMOTE` reads `REMOTE.trustedkeys.gpg` in the
 repository and in `/etc/ostree/remotes.d/`, the global trusted set, and each
 `gpgkeypath` entry. The tool reads keyrings from the same kinds of source.
-Both commands load `REMOTE.trustedkeys.gpg` of the repository before the
-global trusted set. So when these two sources hold two exports of one key,
-the export in the repository keyring supplies the user id in both. Both
-commands also read the repository keyring before the `gpgkeypath` entries.
-When a directory is at the path of the repository keyring and a `gpgkeypath`
-entry does not exist, the refusal names the repository keyring in the port,
-and the tool writes `error: Is a directory`. The read of
+Both commands read the global trusted set only when the repository holds no
+`REMOTE.trustedkeys.gpg` (`show/gpg-verify-remote-global-fallback`). An
+empty file at that path stops the read, and a symlink to no file does not.
+With the repository keyring, neither command lists the global trusted
+directory, so a file there that cannot be read or that is not a keyring
+gives no error. So when the repository keyring and the global trusted set
+hold two exports of one key, the export in the repository keyring supplies
+the user id in both. The port also reads the global trusted set only when
+`/etc/ostree/remotes.d/REMOTE.trustedkeys.gpg` does not exist. The read of
 `/etc/ostree/remotes.d/` by the tool is not observed (`cli-behavior.md`,
-"`show`"). `sign --verify --remote` reads no global trusted set (`sign`,
+"`show`"). Both commands also read the repository keyring before the
+`gpgkeypath` entries. When a directory is at the path of the repository
+keyring and a `gpgkeypath` entry does not exist, the refusal names the
+repository keyring in the port, and the tool writes `error: Is a
+directory`. `sign --verify --remote` reads no global trusted set (`sign`,
 "`--remote` of `--verify`"), so a key of the global trusted set verifies a
-commit in `show` and not in `sign`.
+commit of a remote with no keyring in `show` and not in `sign`.
+
+In `show`, the port reads the global trusted directory under
+`--gpg-verify-remote` alone. `ostree show COMMIT` with no
+`--gpg-verify-remote` also reads it, and trusts its keys. The port reads
+`gpgkeys.gpg` of the repository and the files of `--gpg-homedir` alone
+there, so a commit that a key of the global trusted directory signed gives
+`Can't check signature: public key not found` in the port and `Good
+signature from "<user id>"` in the tool. The port reads each file of
+`--gpg-homedir` whose extension is `gpg`, binary or armored. The read of
+`--gpg-homedir` by the tool is not compared.
 
 Not observed: the answer of the tool to a repeated `show
 --print-metadata-key` or `--print-detached-metadata-key`. No test runs the
@@ -2643,19 +2682,20 @@ in different words ("P1", `refs`). The port's `summary
 output formats", `sign`, "The key sources of `sign`"), with one verifier for
 each engine, and refuses `--sign` and `--gpg-sign`. With `--remote`, it reads
 the keys of the remote alone, for the engines that `gpg-verify-summary` and
-`sign-verify-summary` of the remote turn on. A `-s` with no key selects its
-engine, and the port then reads the keys of the selected engines alone. With no
-key, no `--remote`, and no `-s`, the port skips an engine that finds no
-signature, as its `sign --verify` does. The multi-engine report reads `summary`
-and `summary.sig` one time, so each engine checks the same bytes. The port
-refuses `--remote` in each mode other than `--verify`, `-u` and the read
-options included, with `error: signature: --remote applies to --verify alone`.
-It refuses `--keys-dir` in the same modes with `error: signature: --keys-dir
-applies to --verify alone`. In a `--verify` run with a KEY-ID or a
-`--keys-file`, it refuses `--keys-dir` with `error: signature: a KEY-ID or a
---keys-file gives the keys of the verify; it reads no --keys-dir`. A
-`--verify` run refuses `--gpg-homedir` with `error: signature: --gpg-homedir
-applies to signing alone`.
+`sign-verify-summary` of the remote turn on. It refuses an armored
+`<remote>.trustedkeys.gpg`, as `sign --verify --remote` does. A `-s` with no
+key selects its engine, and the port then reads the keys of the selected
+engines alone. With no key, no `--remote`, and no `-s`, the port skips an
+engine that finds no signature, as its `sign --verify` does. The multi-engine
+report reads `summary` and `summary.sig` one time, so each engine checks the
+same bytes. The port refuses `--remote` in each mode other than `--verify`,
+`-u` and the read options included, with `error: signature: --remote applies
+to --verify alone`. It refuses `--keys-dir` in the same modes with `error:
+signature: --keys-dir applies to --verify alone`. In a `--verify` run with a
+KEY-ID or a `--keys-file`, it refuses `--keys-dir` with `error: signature: a
+KEY-ID or a --keys-file gives the keys of the verify; it reads no --keys-dir`.
+A `--verify` run refuses `--gpg-homedir` with `error: signature:
+--gpg-homedir applies to signing alone`.
 On this command the tool binds `-v` to `--view`, and `--verbose` has no short
 form. The port carries the same shape: `summary` declares `-v/--view` and a
 long-only `--verbose`, and every other subcommand, together with the top level,
@@ -4037,8 +4077,10 @@ PKCS#8 DER, and each block adds one signature. Twenty-six differences stand.
   keys loaded`. A selected engine with no trusted key is refused with `error:
   signature: <engine>: no keys loaded`. A run that looks for the gpg engine
   reads each keyring of the GPG system trust, and a keyring that cannot be read
-  refuses the run at exit 1. A `-s` that selects the other engines does not
-  read the GPG system trust;
+  refuses the run at exit 1. The GPG system trust is the global trusted
+  directory, and it takes binary keyrings alone, so an armored keyring there
+  also refuses the run by its path. A `-s` that selects the other engines does
+  not read the GPG system trust;
 - the key directories of `--verify`. The tool reads the last `--keys-dir`
   alone, and the system key directories `/etc/ostree` and `/usr/share/ostree`
   where no `--keys-dir` is given (`sign/verify-keys-dir-last-wins`). The port
@@ -4054,10 +4096,14 @@ PKCS#8 DER, and each block adds one signature. Twenty-six differences stand.
   remote alone: `<remote>.trustedkeys.gpg` in the repository and in
   `/etc/ostree/remotes.d/`, each `gpgkeypath` entry, and the
   `verification-<engine>-key` and `verification-<engine>-file` keys, or the
-  keys of the trust group. The port reads no global GPG trusted directory and
-  no system key directory for `--remote`. It refuses a remote with no section,
-  a remote whose config turns on no check, and a remote whose config turns on
-  the GPG check with no certificate in its keyrings. A `-s` with no key
+  keys of the trust group. Each `<remote>.trustedkeys.gpg` must be a binary
+  OpenPGP packet stream, and the port refuses an armored one at exit 1. The
+  refusal names the repository keyring as `the keyring
+  '<remote>.trustedkeys.gpg'`, and the keyring of `/etc/ostree/remotes.d/` by
+  its path. The port reads no global GPG trusted directory and no system key
+  directory for `--remote`. It refuses a remote with no section, a remote
+  whose config turns on no check, and a remote whose config turns on the GPG
+  check with no certificate in its keyrings. A `-s` with no key
   selects its engine. The port then reads the keys of the selected engines
   alone, and refuses an engine that the config does not turn on with `error:
   signature: remote '<remote>' turns on no <engine> check of its commits`.
@@ -4481,14 +4527,18 @@ records. Thirteen divergences stand:
   - the revoker's certificate stands in the global trusted directory or in a
     `gpgkeypath` entry rather than in either stream. The port writes nothing,
     since the import reads the two streams alone, and the tool merges the
-    revocation. Both then report a good signature, for reasons that part: the
-    port's keyring states no revocation, and the tool holds one and passes it
-    over. Over the keyring the tool's own import wrote, with the revoker's
-    certificate in the global trusted directory, the port reports `BAD
-    signature from` and the tool `Good signature from`: the port's verify path
-    resolves a revoker among every certificate it loads, whichever source
-    carried it, and the tool resolves none standing in another keyring source.
-    The port is the stricter of the two here;
+    revocation. With the revoker's certificate in the global trusted
+    directory, both then report a good signature, for reasons that part: the
+    port's keyring states no revocation, and the tool holds one that no key
+    it loads resolves. The remote holds a keyring in the repository, so
+    neither implementation reads the global trusted directory. Over the
+    keyring the tool's own import wrote, both report `Good signature from`
+    for the same reason. With the revoker's certificate in a `gpgkeypath`
+    entry of the remote, each implementation resolves the revoker across the
+    two sources: over the keyring the tool's import wrote, the port reports
+    `BAD signature from` and the tool `Key revoked`. Over the keyring each
+    implementation's own import wrote, the port reports `Good signature from`
+    and the tool `Key revoked`;
   - the revoker is absent everywhere when the re-export is offered and is
     imported after. The tool's merged packet then speaks and the port has
     written none, so the port reports `Good signature from` where the tool
@@ -4524,8 +4574,13 @@ records. Thirteen divergences stand:
       # one it held while the tool's grew by the revocation packet
       cp tool/origin.trustedkeys.gpg port/origin.trustedkeys.gpg
       OSTREE_GPG_HOME=global ostrya show --gpg-verify-remote=origin main
-      # BAD signature from "...", where the tool over that same keyring and
-      # the same global directory reports Good signature from "..."
+      # Good signature from "...", as the tool over that same keyring and
+      # the same global directory reports
+      # with gpgkeypath=r.gpg added to [remote "origin"] of both
+      ostrya show --gpg-verify-remote=origin main   # BAD signature from "..."
+      ostree show --gpg-verify-remote=origin main   # Key revoked
+      # the port's keyring back at the bytes its own import wrote
+      ostrya show --gpg-verify-remote=origin main   # Good signature from "..."
       # $R absent everywhere, offered, then imported after
       ostrya remote gpg-import origin --keyring revoked.gpg # Imported 0 GPG keys
       ostrya remote gpg-import origin --keyring r.gpg       # Imported 1 GPG key
@@ -4581,6 +4636,12 @@ records. Thirteen divergences stand:
   and the tool reads the certificates standing ahead of that point and trusts
   them ("GPG verification differences", item 3).
 
+  An armored keyring of the remote takes an import and a listing in the port:
+  `remote gpg-import` and `remote gpg-list-keys` read the armor, and an import
+  writes the keyring in the binary form. A verification refuses an armored
+  keyring of the remote ("GPG verification differences", item 8). The answer
+  of the tool to an armored keyring in these two commands is not observed.
+
   Both rules hold inside one offered stream as well: where a stream carries two
   states of one key the port keeps the first, unless a later one revokes the key
   or states a later expiry. The revoked export alone and the two exports
@@ -4590,9 +4651,10 @@ records. Thirteen divergences stand:
   it reported `Imported 1 GPG key`, wrote three byte-identical keyrings, and
   reported the signature `Key revoked`.
 
-  A trusted set holding both certificates parts a second way -- `cert1.gpg` in
-  the remote's keyring and `cert2.gpg` in the `OSTREE_GPG_HOME` directory. The
-  tool answers on which certificate it reads first. The port reads the
+  A trusted set holding both certificates parts a second way -- `cert1.gpg`
+  and `cert2.gpg` concatenated in one keyring, or in two files of the
+  `OSTREE_GPG_HOME` directory of a remote with no keyring. The tool answers
+  on which certificate it reads first. The port reads the
   revocation whichever one stands first, and reads the newest expiry statement
   of the two whichever one stands first. Those are items 6 and 7 of
   "GPG verification differences";
@@ -4701,7 +4763,11 @@ the tool, in `show`, in a `pull` that verifies, and in the keyring reads of
    and trusts no key of it. `ostree` 2026.1 also trusts no key of a keybox that a
    `gpgkeypath` entry names: `show --gpg-verify-remote=<remote>` reports
    `Can't check signature: public key not found`, and a pull refuses the
-   commit.
+   commit. The port refuses a keybox by its path in the global trusted
+   directory and as a `<remote>.trustedkeys.gpg` keyring. `ostree` 2026.1
+   reads a keybox that is the repository keyring, and a keybox that is
+   first in `readdir` order in the global trusted directory. A keybox after
+   another global file stops the read of the tool, as text does (item 3).
 3. A keyring that the parser refuses. The port refuses the whole file if the
    parser refuses the keyring, or if the packet stream of the keyring does not
    frame to its end. A command that reads the file exits non-zero, and the
@@ -4735,6 +4801,21 @@ the tool, in `show`, in a `pull` that verifies, and in the keyring reads of
      `ostree show --gpg-verify-remote=<remote> <ref>` reports
      `Good signature from "..."` for the first certificate and
      `Can't check signature: public key not found` for the second.
+
+   The global trusted directory and the `<remote>.trustedkeys.gpg` keyrings
+   have no skip. The port refuses by its path each file there that is not a
+   whole binary packet stream: text, a keyring followed by text, and text
+   followed by a keyring are examples. A remote with such a file refuses
+   each commit in the port, and a pull exits 1. `ostree` 2026.1 reads the
+   files of the global trusted directory as one stream in `readdir` order,
+   and stops at the first bytes that do not frame, with no message. It then
+   trusts no key of the keyblock just before those bytes, of a later global
+   file, or of a `gpgkeypath` entry. A repository keyring that does not frame
+   loses its keys after the same rule, and the `gpgkeypath` keys too. Where
+   the tool still trusts the key of a signature, a pull of the tool imports
+   the commit and a pull of the port refuses it. `cli-behavior.md`,
+   "Signature verification during a pull", "The verification keys", states
+   the observed cases.
 4. The digest of an Ed25519 key. An Ed25519 key or an EdDSA-legacy key with a
    digest of less than 256 bits verifies nothing in the port. So a SHA-1 or a
    SHA-224 data signature of such a key gives the fields of a signature that
@@ -4761,14 +4842,18 @@ the tool, in `show`, in a `pull` that verifies, and in the keyring reads of
      With the two exports in the opposite order, each tool reports the
      revocation.
    - Two keyring files of the `OSTREE_GPG_HOME` directory hold the two
-     exports. The tool answers on the sort order of the two file names.
-   - The `<remote>.trustedkeys.gpg` of the remote holds the export with no
-     revocation, and the `OSTREE_GPG_HOME` directory holds the revoked export.
-     `ostree show --gpg-verify-remote=<remote> <ref>` reports
-     `Good signature from "..."`, and `ostrya show` reports that the signature
-     is not good.
+     exports, and the remote has no keyring of its own. The tool answers on
+     the file that `readdir` gives first, and the names have no effect.
+     `a.gpg` with no revocation created before `z.gpg` with the revoked
+     export, and `z.gpg` with no revocation created before `a.gpg` with the
+     revoked export, give `Good signature from "..."` in
+     `ostree show --gpg-verify-remote=<remote> <ref>`. The two opposite
+     creation orders give `Key revoked`. The probe host lists the files of
+     a btrfs directory in the order of their creation.
 
-   The port refuses the signature in each of these orders.
+   The port refuses the signature in each of these orders. A remote with a
+   keyring of its own reads no file of the `OSTREE_GPG_HOME` directory, in
+   the port and in the tool.
 7. The key expiry of two exports of one certificate. The two exports can
    state two key expiries, and the port takes the newest statement of the two.
    `gpgv --keyring` over a file that holds both exports answers on their load
@@ -4816,6 +4901,19 @@ the tool, in `show`, in a `pull` that verifies, and in the keyring reads of
    tool trusts the key: `show --gpg-verify-remote=<remote>` reports `Good
    signature from "..."`, and a pull imports the commit. The port refuses the
    file by its path, and a pull of the port refuses the commit.
+
+   The global trusted directory and the `<remote>.trustedkeys.gpg` keyrings
+   take binary keyrings alone in the port. The port refuses an armored file
+   there by its path (`show/gpg-verify-remote-global-armored`). `ostree`
+   2026.1 trusts no key of an armored file there. An armored repository
+   keyring also loses the `gpgkeypath` keys, and an armored global file
+   stops the read of the global stream as text does (item 3). So a remote
+   whose key is armored in one of these sources refuses the commit in both,
+   with different texts: `show --gpg-verify-remote=<remote>` of the tool
+   reports `Can't check signature: public key not found` at exit 0, and the
+   port exits 1 after the commit report. `sign --verify -s gpg` with no key
+   reads the global trusted directory, and the port refuses an armored file
+   there by its path too. The tool has no gpg engine in `sign`.
 
 ## Port extensions with no counterpart in the tool
 

@@ -163,7 +163,10 @@ When the config has no group for \fB\%NAME\fR, \fB\%ostrya pull\-local\fR makes 
 .TP
 \fB\%gpg\-verify\fR (boolean, default true)
 A pull checks the GPG signatures of its commits.
-The trusted keys are in \fB\%gpgkeypath\fR, \fB\%<repo>/NAME.trustedkeys.gpg\fR, \fB\%/etc/ostree/remotes.d/NAME.trustedkeys.gpg\fR, and the global trusted keyrings.
+The trusted keys are in \fB\%gpgkeypath\fR, \fB\%<repo>/NAME.trustedkeys.gpg\fR, and \fB\%/etc/ostree/remotes.d/NAME.trustedkeys.gpg\fR.
+When neither \fB\%NAME.trustedkeys.gpg\fR exists, the global trusted keyrings take part too.
+The two \fB\%NAME.trustedkeys.gpg\fR keyrings and the global keyrings must be binary OpenPGP keyrings.
+A pull refuses an armored one: the repository keyring by its name, and each other keyring by its path.
 A build without GPG support refuses \fB\%true\fR.
 .TP
 \fB\%gpg\-verify\-summary\fR (boolean, default false)
@@ -863,6 +866,7 @@ ostrya does not read \fB\%HTTP_PROXY\fR.
 .TP
 \fB\%OSTREE_GPG_HOME\fR
 The directory of the global trusted GPG keyrings, in place of \fB\%/usr/share/ostree/trusted.gpg.d\fR.
+A value that names a file that is not a directory is refused when ostrya reads the global keyrings.
 .SH EXAMPLES
 Show the mode of the repository:
 .PP

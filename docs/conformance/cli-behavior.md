@@ -1469,6 +1469,84 @@ Each configuration key selects one check:
   pull over HTTP, and `pull-local --remote=<remote> --gpg-verify` give the
   same results.
 
+The GPG keyrings of a remote come from these sources:
+
+- `<repo>/<remote>.trustedkeys.gpg`, which `remote add --gpg-import` and
+  `remote gpg-import` write.
+- The global trusted directory, `/usr/share/ostree/trusted.gpg.d`, or the
+  directory that `OSTREE_GPG_HOME` names. The tool reads this directory only
+  when the open of `<repo>/<remote>.trustedkeys.gpg` gives "No such file or
+  directory".
+- Each `gpgkeypath` entry, with or without the repository keyring.
+
+These results come from `ostree` 2026.1, with five keys `A`, `Z`, `P`, `R`,
+and `Q`, and with one commit that each key signed. `show
+--gpg-verify-remote=<remote>`, a pull over HTTP, and `pull-local
+--remote=<remote> --gpg-verify` give the same result in each case that was
+run in more than one command. Unless a case states otherwise, the global
+directory holds `a.gpg` with `A` and `z.gpg` with `Z`, `gpgkeypath` names a
+file with `P` and a directory with `Q`, and the repository keyring holds `R`.
+The global files are listed in the order that `readdir` gives, which is the
+order of creation on the btrfs file system of the probe host.
+
+- With the repository keyring, the tool trusts `P`, `R`, and `Q`, and the
+  commits of `A` and `Z` give `Can't check signature: public key not found`.
+  Without `gpgkeypath`, `R` alone is trusted.
+- With no repository keyring, the tool trusts `A`, `Z`, `P`, and `Q`. A
+  repository keyring that is a symlink to no file gives the same result. A
+  repository keyring that is a symlink to the keyring of `R` gives the result
+  of the repository keyring.
+- An empty repository keyring: the tool trusts `P` and `Q` alone.
+- With the repository keyring, the global directory is not listed. A text
+  file `m.gpg`, a file `z.gpg` with mode 000, and a global directory with
+  mode 000 give no message, and `P`, `R`, and `Q` stay trusted. With `Q` in
+  the repository keyring and the armored export of `R` in `m.gpg`, `P` and
+  `Q` are trusted, and `R` is not.
+- With no repository keyring, the tool reads the global files as one stream
+  in `readdir` order. Text or armor in the stream stops the read. The tool
+  then trusts no key of the keyblock just before the text or the armor, no
+  key of a later global file, and no `gpgkeypath` key. No case writes a
+  message.
+  - `a.gpg`, `z.gpg`, and then a text file `m.gpg`: `A` alone is trusted.
+    The same three files created in the order `z.gpg`, `m.gpg`, `a.gpg`: no
+    key is trusted. A text file alone, a text file first, and `a.gpg` with a
+    text file after it: no key is trusted.
+  - `a.gpg`, `z.gpg`, and then the armored export of `R` in `m.gpg`: `A`
+    alone is trusted. The armored export alone: no key is trusted.
+  - A GnuPG keybox of the five keys first in `readdir` order, or alone, gives
+    each key. A keybox of `R` first, before `a.gpg` and `z.gpg`, gives `R`
+    alone. A keybox of `R` alone gives `P`, `R`, and `Q`. A keybox of the
+    five keys after `a.gpg` and `z.gpg` gives `A` alone.
+  - An empty `e.gpg`, first or last, gives no key and stops nothing.
+  - The tool reads a file named `.gpg` and a file named `.a.gpg`. It skips
+    `a.GPG`, `z.gpg.bak`, a subdirectory `d.gpg`, a symlink `a.gpg` to a
+    keyring, and a fifo `f.gpg`.
+  - A global file with mode 000: `error: Reading keyring directory '<dir>':
+    openat(z.gpg): Permission denied` at exit 1.
+  - A global directory with mode 000: `error: Reading keyring directory
+    '<dir>': opendir(<dir>): Permission denied` at exit 1.
+  - An `OSTREE_GPG_HOME` that does not exist, and an `OSTREE_GPG_HOME` that
+    names a regular file: `P` and `Q` are trusted, with no message.
+- Two exports of one key, one with no revocation and one revoked, in two
+  global files: the export that is first in `readdir` order decides, and the
+  names do not. Created as `a.gpg` with no revocation and then `z.gpg`
+  revoked, or as `z.gpg` with no revocation and then `a.gpg` revoked: `Good
+  signature`. Created in the opposite orders: `Key revoked`. A text file
+  `m.gpg` created between the two exports gives `Can't check signature:
+  public key not found` in both orders.
+- A repository keyring that is not a binary keyring:
+  - Text, a keyring followed by text, and text followed by a keyring: no key
+    is trusted, the `gpgkeypath` keys included. The keyring of `R`, then the
+    keyring of `A`, and then text: `R` alone is trusted.
+  - The armored export of `R`: no key is trusted, the `gpgkeypath` keys
+    included.
+  - A GnuPG keybox of `R`: `P`, `R`, and `Q` are trusted.
+  - A directory: `error: Is a directory` at exit 1. A file with mode 000:
+    `error: openat(<remote>.trustedkeys.gpg): Permission denied` at exit 1.
+
+`/etc/ostree/remotes.d/<remote>.trustedkeys.gpg` is not observed, because the
+probe had no root access.
+
 #### Rules common to the verification axes
 
 - The GPG axis and the sign axis are independent, and the tool applies both. A
@@ -3932,8 +4010,10 @@ With the section, the command trusts the keys of these keyrings:
 - Each entry of the `gpgkeypath` key of the remote. A `;` separates two
   entries. The command reads the raw value, as a pull does ("Signature
   verification during a pull", "The verification keys").
-- Each `*.gpg` file of the global trusted directory. `OSTREE_GPG_HOME` names
-  this directory.
+- The global trusted directory, only when `<repo>/REMOTE.trustedkeys.gpg`
+  does not exist. `OSTREE_GPG_HOME` names this directory. The command reads
+  it as a pull does ("Signature verification during a pull", "The
+  verification keys").
 
 These results come from a commit that the key of `a.gpg` signed. The
 repository holds no `REMOTE.trustedkeys.gpg`, and the global directory is
@@ -3977,8 +4057,8 @@ empty, unless a case states otherwise:
 - `OSTREE_GPG_HOME` that names a directory that holds `a.gpg`, and a section
   with no `gpgkeypath`, give `Good signature from "<user id>"` at exit 0.
   The same directory that holds only `a.keyring` gives `Can't check
-  signature: public key not found`. The global directory gives only its
-  `*.gpg` files.
+  signature: public key not found`. The global directory gives only the
+  files whose names end in `.gpg`.
 - A directory at `<repo>/REMOTE.trustedkeys.gpg` and a `gpgkeypath` entry
   that does not exist give the commit report on standard output with no
   `Found` line. Then the command writes `error: Is a directory` at exit 1.
@@ -3999,13 +4079,18 @@ signature from "<user id>"` at exit 0, with this user id:
   opposite: `Second`.
 - `gpgkeypath=k1;k2`: `Second`.
 
-So the repository keyring loads before the global directory. When a
-`gpgkeypath` keyring holds one of the two exports, the load order does not
-change the user id.
+With the repository keyring, the command does not read the global directory,
+so the export in the global directory takes no part. When a `gpgkeypath`
+keyring holds one of the two exports, the load order does not change the
+user id.
 
 With no `--gpg-verify-remote`, the command reads no `gpgkeypath`. Over the
 same commit, `ostree show COMMIT` and `gpgkeypath=<dir>/a.gpg` give `Can't
-check signature: public key not found`.
+check signature: public key not found`. With no `--gpg-verify-remote`, the
+command reads the global trusted directory: `OSTREE_GPG_HOME` that names a
+directory that holds `a.gpg` gives `Good signature from "<user id>"`, and a
+text file created after `a.gpg` and `z.gpg` keeps the key of `a.gpg` and
+loses the key of `z.gpg`.
 
 The keyrings of `/etc/ostree/remotes.d/` are not observed, because the probe
 had no root access.

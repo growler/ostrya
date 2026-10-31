@@ -50,6 +50,10 @@ for it.
   summary`. The decision is to carry the summary cache or to refuse the
   option at each site.
 - The pull does not write the summary cache `tmp/cache/summaries/`.
+- `/etc/ostree/remotes.d/<remote>.trustedkeys.gpg` acts as the repository
+  keyring of the remote: it takes binary keyrings alone, and it stops the
+  read of the global trusted directory. The answer of the `ostree` command
+  to this file is not observed, because the probe needs root.
 - The pull does not read the remote keys `contenturl` and `metalink`, and
   refuses a `metalink=` or `mirrorlist=` URL.
 - `Repo::pull` over HTTP refuses `collection_id`. `Repo::pull_collection`
@@ -81,6 +85,16 @@ for it.
   lock and again before the commit. The library has no API for this check. A
   ref that another writer makes during the publish step is replaced.
   `conformance/cli-surface.md` states this.
+- The armored repository keyring in `remote gpg-import` and `remote
+  gpg-list-keys`. These commands read an armored `<remote>.trustedkeys.gpg`,
+  and a verification refuses it. The answer of the `ostree` command to such a
+  keyring in these two commands is not observed.
+- The keyrings of `show` with no `--gpg-verify-remote`. The `ostree` command
+  reads the global trusted directory there, and the port reads `gpgkeys.gpg`
+  and `--gpg-homedir` alone. The port reads each file of `--gpg-homedir`
+  whose extension is `gpg`, binary or armored, and the read of the `ostree`
+  command is not compared. `conformance/cli-surface.md`, "P1", `show`,
+  records both.
 - `ostrya pull --trust=NAME`, also with `--collection`. The library field
   `PullOptions::trust_group` applies to each pull, and the command takes
   `--trust` on `pull-local` alone (`decisions.md`, "The trust group of one

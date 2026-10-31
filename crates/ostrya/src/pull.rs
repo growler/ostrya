@@ -408,8 +408,9 @@ pub enum TimestampCheck {
 ///
 /// - GPG: the trusted set of the remote. The set holds the
 ///   `<remote>.trustedkeys.gpg` of the repository,
-///   `/etc/ostree/remotes.d/<remote>.trustedkeys.gpg`, the global trusted
-///   directory, and the keyrings that `gpgkeypath` names.
+///   `/etc/ostree/remotes.d/<remote>.trustedkeys.gpg`, and the keyrings that
+///   `gpgkeypath` names. The global trusted directory takes part only when
+///   neither `<remote>.trustedkeys.gpg` exists.
 /// - The sign api: a value of `sign-verify` is a boolean or a list of engine
 ///   names. The keys of an engine are its `verification-<engine>-key` and
 ///   `verification-<engine>-file` entries and the system key store, less the

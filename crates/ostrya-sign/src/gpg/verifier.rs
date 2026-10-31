@@ -52,6 +52,9 @@ const KEYBOX_MAGIC_OFFSET: usize = 8;
 /// adds the files of a source that can hold files of other kinds, as a
 /// `gpgkeypath` entry can. It skips a file with no armor that is a GnuPG
 /// keybox or that is not a whole OpenPGP packet stream.
+/// [`add_binary_keyring`](GpgVerifier::add_binary_keyring) and
+/// [`add_binary_keyring_files`](GpgVerifier::add_binary_keyring_files) add
+/// a source that must be a binary packet stream. They refuse armor.
 ///
 /// # Format
 ///
@@ -369,6 +372,78 @@ impl GpgVerifier {
         Ok(())
     }
 
+    /// Adds one binary keyring to the trusted set.
+    ///
+    /// The keyring must be a binary OpenPGP packet stream, as `gpg --export`
+    /// writes it with no `--armor`. The call does not decode armor. It drops
+    /// the Trust packets, as [`add_keyring`](GpgVerifier::add_keyring) does.
+    /// An empty keyring gives no certificate. `subject` names the source, so
+    /// a refusal states which keyring the call refused.
+    ///
+    /// The call refuses the whole keyring if one of these conditions applies:
+    ///
+    /// - The keyring holds the bytes `-----BEGIN PGP` and does not frame as a
+    ///   packet stream. The refusal states that the keyring holds armor.
+    /// - The keyring does not frame as a whole packet stream. Text, random
+    ///   bytes, a truncated keyring, and a keyring with bytes after its last
+    ///   packet are examples.
+    /// - The keyring is a GnuPG keybox.
+    /// - The keyring is over 4 MiB, or holds more than 256 certificates.
+    /// - The parser refuses a certificate, or panics.
+    ///
+    /// The extend has the rules of [`add_keyring`](GpgVerifier::add_keyring).
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Signature`] for each condition of the list. The message
+    ///   holds `subject`.
+    ///
+    /// On an error, the verifier is unchanged.
+    pub fn add_binary_keyring(&mut self, bytes: &[u8], subject: &str) -> Result<()> {
+        let certs = binary_keyring_certs(bytes, subject)?;
+        self.trust(certs);
+        Ok(())
+    }
+
+    /// Adds each binary keyring that `paths` names to the trusted set, in the
+    /// given order. If a path names no file, the load skips it.
+    ///
+    /// Each file must be a binary OpenPGP packet stream, and the refusals of
+    /// [`add_binary_keyring`](GpgVerifier::add_binary_keyring) apply to its
+    /// content. So an armored file is refused. The read rules of
+    /// [`from_keyring_files`](GpgVerifier::from_keyring_files) apply to the
+    /// file. A refusal names the path, as `the keyring '<path>'`.
+    ///
+    /// The call reads and parses each keyring before it adds a certificate.
+    /// So the trusted set gets either all keyrings or none of them.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Signature`] if a path cannot be opened for a reason other
+    ///   than a missing file, or a read of the file fails.
+    /// - [`Error::Signature`] if a path names a file that is not a regular
+    ///   file, for example a directory or a fifo.
+    /// - The errors of [`add_binary_keyring`](GpgVerifier::add_binary_keyring)
+    ///   for the content of each file.
+    ///
+    /// On an error, the verifier is unchanged.
+    pub fn add_binary_keyring_files<I, P>(&mut self, paths: I) -> Result<()>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        let mut certs = Vec::new();
+        for path in paths {
+            let path = path.as_ref();
+            let subject = format!("the keyring '{}'", path.display());
+            if let Some(bytes) = read_key_file(path, &subject, MAX_KEYRING)? {
+                certs.extend(binary_keyring_certs(&bytes, &subject)?);
+            }
+        }
+        self.trust(certs);
+        Ok(())
+    }
+
     /// Adds `certs` to the trusted set.
     ///
     /// An empty `certs` leaves the set as it is. So a verifier that a clone
@@ -495,12 +570,51 @@ fn keyring_stream<'a>(
     bytes: &'a [u8],
     subject: &str,
 ) -> std::result::Result<Cow<'a, [u8]>, KeyringRefusal> {
+    keyring_size(bytes, subject)?;
+    let binary = dearmor(bytes).map_err(KeyringRefusal::Armor)?;
+    refuse_keybox(&binary, subject)?;
+    Ok(binary)
+}
+
+/// Returns the certificates of one binary keyring blob, as
+/// [`GpgVerifier::add_binary_keyring`] reads it.
+///
+/// The call applies [`MAX_KEYRING`], refuses a GnuPG keybox, and applies
+/// [`parse_keyring`] to `bytes` with no armor decode. If the blob does not
+/// frame and holds [`ARMOR_BEGIN`], the refusal states that it holds armor.
+/// `subject` names the source in a refusal.
+fn binary_keyring_certs(bytes: &[u8], subject: &str) -> Result<Vec<SignedPublicKey>> {
+    keyring_size(bytes, subject)?;
+    refuse_keybox(bytes, subject)?;
+    match parse_keyring(bytes, subject) {
+        Ok(certs) => Ok(certs.into_iter().map(|(cert, _)| cert).collect()),
+        Err(KeyringRefusal::NotPacketStream(_))
+            if bytes.windows(ARMOR_BEGIN.len()).any(|w| w == ARMOR_BEGIN) =>
+        {
+            Err(Error::Signature(format!(
+                "{subject} holds armor, and this keyring must be a binary OpenPGP \
+                 packet stream"
+            )))
+        }
+        Err(refusal) => Err(refusal.into()),
+    }
+}
+
+/// Refuses a blob over [`MAX_KEYRING`] with [`KeyringRefusal::OverLimit`].
+/// `subject` names the source in the refusal.
+fn keyring_size(bytes: &[u8], subject: &str) -> std::result::Result<(), KeyringRefusal> {
     if bytes.len() as u64 > MAX_KEYRING {
         return Err(KeyringRefusal::OverLimit(Error::Signature(format!(
             "{subject} is over the {MAX_KEYRING}-byte ceiling"
         ))));
     }
-    let binary = dearmor(bytes).map_err(KeyringRefusal::Armor)?;
+    Ok(())
+}
+
+/// Refuses a binary blob that is a GnuPG keybox with
+/// [`KeyringRefusal::NotPacketStream`]. `subject` names the source in the
+/// refusal.
+fn refuse_keybox(binary: &[u8], subject: &str) -> std::result::Result<(), KeyringRefusal> {
     if binary.len() >= KEYBOX_MAGIC_OFFSET + KEYBOX_MAGIC.len()
         && &binary[KEYBOX_MAGIC_OFFSET..KEYBOX_MAGIC_OFFSET + KEYBOX_MAGIC.len()] == KEYBOX_MAGIC
     {
@@ -509,7 +623,7 @@ fn keyring_stream<'a>(
              packet stream"
         ))));
     }
-    Ok(binary)
+    Ok(())
 }
 
 /// Frames the first packet of `rest`, and returns its tag and its length in
@@ -957,9 +1071,8 @@ struct KeyState {
     /// trust in a key, and the keyring of the `ostree` command stops the trust
     /// in it. This is a divergence:
     ///
-    /// - The certificate of the revoker is in the global trusted directory or
-    ///   in a `gpgkeypath` entry, and not in the keyring that the import
-    ///   changes.
+    /// - The certificate of the revoker is in a `gpgkeypath` entry, and not
+    ///   in the keyring that the import changes.
     /// - The revoker is imported after the revocation was offered.
     ///
     /// The import is a function of its two byte streams only. So one import
@@ -2017,6 +2130,93 @@ IHdvcmxk\n\
         );
         assert!(verifier.is_empty());
         verifier.add_keyring_files([&good]).unwrap();
+        assert_eq!(verifier.certs.len(), 1);
+    }
+
+    /// The binary load adds the certificates of a binary keyring, and gives
+    /// no certificate for an empty keyring. It refuses an armored keyring, a
+    /// keyring that is not a packet stream, a keyring with bytes after its
+    /// last packet, and a keybox by the subject, and leaves the verifier
+    /// unchanged.
+    #[test]
+    fn the_binary_load_refuses_armor_and_each_keyring_it_cannot_read_whole() {
+        if !gpg_or_skip() {
+            return;
+        }
+        let home = KeyFixture::new("Binary only <binary-only@ostrya.example>");
+        let binary = home.export(false);
+        let mut verifier = GpgVerifier::default();
+        verifier
+            .add_binary_keyring(b"", "the keyring 'empty'")
+            .unwrap();
+        assert!(verifier.is_empty());
+        verifier
+            .add_binary_keyring(&binary, "the keyring 'binary'")
+            .unwrap();
+        assert_eq!(verifier.certs.len(), 1);
+        let mut trailing = binary.clone();
+        trailing.extend_from_slice(b"This file holds the trusted keys.\n");
+        let mut armor_after = binary.clone();
+        armor_after.extend_from_slice(&home.export(true));
+        let refused = [
+            (home.export(true), "armor"),
+            (armor_after, "armor"),
+            (
+                b"This file holds the trusted keys.\n".to_vec(),
+                "OpenPGP keyring",
+            ),
+            (trailing, "OpenPGP keyring"),
+            (binary[..binary.len() / 2].to_vec(), "OpenPGP keyring"),
+            (home.keybox(), "keybox"),
+            (vec![0u8; MAX_KEYRING as usize + 1], "ceiling"),
+            (binary.repeat(MAX_KEYRING_CERTS + 1), "256 certificates"),
+        ];
+        for (index, (bytes, reason)) in refused.iter().enumerate() {
+            let subject = format!("the keyring 'case {index}'");
+            let err = verifier.add_binary_keyring(bytes, &subject).unwrap_err();
+            assert!(
+                matches!(&err, Error::Signature(m) if m.contains(&subject) && m.contains(reason)),
+                "case {index}: {err}"
+            );
+            assert_eq!(verifier.certs.len(), 1);
+        }
+    }
+
+    /// The binary load of files reads each file whole, skips a path that
+    /// names no file, and refuses an armored file by its path. On a refusal,
+    /// the verifier gets no certificate of the files before the refused path.
+    #[test]
+    fn the_binary_file_load_is_atomic_and_refuses_armor_by_path() {
+        if !gpg_or_skip() {
+            return;
+        }
+        let home = KeyFixture::new("Binary files <binary-files@ostrya.example>");
+        let dir = home.dir.join("keys");
+        std::fs::create_dir(&dir).unwrap();
+        let good = write_file(dir.join("good.gpg"), &home.export(false));
+        let empty = write_file(dir.join("empty.gpg"), b"");
+        let armored = write_file(dir.join("armored.gpg"), &home.export(true));
+        let mut verifier = GpgVerifier::default();
+        let err = verifier
+            .add_binary_keyring_files([good.as_path(), armored.as_path()])
+            .unwrap_err();
+        let named = format!("the keyring '{}'", armored.display());
+        assert!(
+            matches!(&err, Error::Signature(m) if m.contains(&named) && m.contains("armor")),
+            "{err}"
+        );
+        assert!(verifier.is_empty());
+        let err = verifier
+            .add_binary_keyring_files([good.as_path(), dir.as_path()])
+            .unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m) if m.contains("is not a regular file")),
+            "{err}"
+        );
+        assert!(verifier.is_empty());
+        verifier
+            .add_binary_keyring_files([good, empty, dir.join("absent.gpg")])
+            .unwrap();
         assert_eq!(verifier.certs.len(), 1);
     }
 

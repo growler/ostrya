@@ -139,6 +139,10 @@ for it.
   subject and the body. The walk reads the parent, the root dirtree and
   dirmeta, the timestamp, and field 2 alone. A parse that checks the normal
   form and decodes these fields alone refuses the same commits.
+- One pool job for a commit load. `Repo::load_commit` and
+  `Repo::load_commit_with_bytes` run two jobs on the blocking pool: one for
+  the read of the object and one for the check of the `.commitpartial`
+  marker. One job can do the read, the parse, and the check.
 
 ## Gaps of bucket repositories
 

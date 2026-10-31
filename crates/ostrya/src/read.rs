@@ -10,6 +10,7 @@
 //! The entry points are methods of [`Repo`]:
 //!
 //! - [`load_commit`](Repo::load_commit),
+//!   [`load_commit_with_bytes`](Repo::load_commit_with_bytes),
 //!   [`load_dirtree`](Repo::load_dirtree),
 //!   [`load_dirmeta`](Repo::load_dirmeta),
 //!   [`load_variant`](Repo::load_variant), and
@@ -213,7 +214,12 @@ impl Repo {
         Ok(from_bytes(&ty, &bytes).map_err(ostrya_core::Error::from)?)
     }
 
-    /// Loads and parses a commit object, and returns its completeness state.
+    /// Loads and parses a commit object, and returns its completeness state
+    /// and the bytes of the object.
+    ///
+    /// The bytes are the bytes that
+    /// [`load_object_bytes`](Repo::load_object_bytes) returns, so a caller
+    /// that also verifies a signature over them reads the object one time.
     ///
     /// # Errors
     ///
@@ -225,10 +231,23 @@ impl Repo {
     /// - [`Error::Io`] for other failures of the file system, also in the
     ///   check of the `.commitpartial` marker.
     /// - [`Error::Core`] if the bytes do not parse as a commit object.
-    pub async fn load_commit(&self, checksum: &Checksum) -> Result<(Commit, CommitState)> {
+    pub async fn load_commit_with_bytes(
+        &self,
+        checksum: &Checksum,
+    ) -> Result<(Commit, CommitState, Vec<u8>)> {
         let bytes = self.load_object_bytes(ObjectType::Commit, checksum).await?;
         let commit = Commit::parse(&bytes)?;
         let state = self.commit_state(checksum).await?;
+        Ok((commit, state, bytes))
+    }
+
+    /// Loads and parses a commit object, and returns its completeness state.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`load_commit_with_bytes`](Repo::load_commit_with_bytes).
+    pub async fn load_commit(&self, checksum: &Checksum) -> Result<(Commit, CommitState)> {
+        let (commit, state, _) = self.load_commit_with_bytes(checksum).await?;
         Ok((commit, state))
     }
 

@@ -19,8 +19,8 @@ use std::path::{Path, PathBuf};
 use common::*;
 use futures_lite::AsyncReadExt;
 use ostrya::{
-    Checksum, CommitState, CreateOptions, FileKind, MAX_METADATA_SIZE, ObjectType, Repo, RepoMode,
-    TreeEntry, loose_path,
+    Checksum, Commit, CommitState, CreateOptions, FileKind, MAX_METADATA_SIZE, ObjectType, Repo,
+    RepoMode, TreeEntry, loose_path,
 };
 use ostrya_core::{ContentHasher, FileHeader};
 use ostrya_rt::block_on;
@@ -116,6 +116,18 @@ fn loads_commit_dirtree_and_dirmeta() {
             assert_eq!(commit.timestamp, 1_700_000_000);
             assert_eq!(commit.content_checksum(), csum(CONTENT));
 
+            // `load_commit_with_bytes` gives the same commit and state, and the
+            // bytes that `load_object_bytes` gives.
+            let (with_bytes, with_state, bytes) =
+                repo.load_commit_with_bytes(&csum(COMMIT)).await.unwrap();
+            assert_eq!((&with_bytes, with_state), (&commit, state));
+            let raw = repo
+                .load_object_bytes(ObjectType::Commit, &csum(COMMIT))
+                .await
+                .unwrap();
+            assert_eq!(bytes, raw);
+            assert_eq!(Commit::parse(&bytes).unwrap(), commit);
+
             let root = repo.load_dirtree(&csum(ROOT_DIRTREE)).await.unwrap();
             let files: Vec<&str> = root.files.iter().map(|(n, _)| n.as_str()).collect();
             assert_eq!(files, ["empty.txt", "hello.txt", "link"]);
@@ -154,6 +166,87 @@ fn loads_commit_dirtree_and_dirmeta() {
             assert!(value.as_tuple().is_some());
         });
     }
+}
+
+/// Both commit loads give the `Partial` state of a commit with a
+/// `.commitpartial` marker, and the bytes stay the bytes of the object.
+#[test]
+fn loads_a_partial_commit_with_its_bytes() {
+    let tmp = TmpDir::new("read-partial-commit");
+    block_on(async {
+        let fixture = Repo::open(&repo_path("archive"))
+            .await
+            .expect("open fixture");
+        let key = csum(COMMIT);
+        let raw = fixture
+            .load_object_bytes(ObjectType::Commit, &key)
+            .await
+            .unwrap();
+
+        let repo_dir = tmp.path().join("repo");
+        let repo = Repo::create(&repo_dir, CreateOptions::new(RepoMode::Archive))
+            .await
+            .expect("create repo");
+        let path = place_sparse_object(&repo_dir, repo.mode(), &key, 0);
+        std::fs::write(&path, &raw).expect("copy the commit object");
+        mark_partial(&repo, &key);
+
+        let (commit, state) = repo.load_commit(&key).await.unwrap();
+        assert_eq!(state, CommitState::Partial);
+        let (with_bytes, with_state, bytes) = repo.load_commit_with_bytes(&key).await.unwrap();
+        assert_eq!(with_state, CommitState::Partial);
+        assert_eq!(with_bytes, commit);
+        assert_eq!(bytes, raw);
+    });
+}
+
+/// Both commit loads refuse an absent commit, bytes that do not parse, and an
+/// object larger than the cap, with the same error.
+#[test]
+fn commit_loads_refuse_with_the_same_error() {
+    let tmp = TmpDir::new("read-commit-refusals");
+    block_on(async {
+        let repo_dir = tmp.path().join("repo");
+        let repo = Repo::create(&repo_dir, CreateOptions::new(RepoMode::Archive))
+            .await
+            .expect("create repo");
+
+        let absent = csum(&"55".repeat(32));
+        let garbage = csum(&"66".repeat(32));
+        let path = place_sparse_object(&repo_dir, repo.mode(), &garbage, 0);
+        std::fs::write(&path, b"not a commit").expect("write the garbage object");
+        let oversized = csum(&"77".repeat(32));
+        place_sparse_object(&repo_dir, repo.mode(), &oversized, MAX_METADATA_SIZE + 1);
+
+        for key in [absent, garbage, oversized] {
+            let err = repo
+                .load_commit(&key)
+                .await
+                .expect_err("load_commit refuses the object");
+            let with_bytes = repo
+                .load_commit_with_bytes(&key)
+                .await
+                .expect_err("load_commit_with_bytes refuses the object");
+            assert_eq!(with_bytes.to_string(), err.to_string());
+            let expected = |e: &ostrya::Error| {
+                if key == absent {
+                    matches!(e, ostrya::Error::ObjectNotFound { .. })
+                } else if key == garbage {
+                    matches!(e, ostrya::Error::Core(_))
+                } else {
+                    matches!(e, ostrya::Error::Io(_))
+                }
+            };
+            assert!(
+                expected(&err),
+                "load_commit {key}: unexpected error {err:?}"
+            );
+            assert!(
+                expected(&with_bytes),
+                "load_commit_with_bytes {key}: unexpected error {with_bytes:?}"
+            );
+        }
+    });
 }
 
 #[test]

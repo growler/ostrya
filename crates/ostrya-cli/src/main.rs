@@ -55,14 +55,14 @@ use std::sync::{Arc, Mutex};
 use clap::{Args, CommandFactory, Parser, Subcommand};
 use ostrya::{
     BootableMetadata, BootableRefusal, CheckoutFilterFn, CheckoutMode, CheckoutOptions, Checksum,
-    CollectionPullOptions, CollectionRef, CollectionRefEntry, Commit, CommitModifier,
-    CommitModifierFlags, CommitOptions, ComposefsImageState, ComposefsOptions, CreateOptions,
-    DeltaEndianness, DeltaOptions, DeltaSuperblock, DevInoCache, DictBuilder, DiffChange,
-    DiffOptions, DiffSide, Ed25519Signer, Ed25519Verifier, Error, FileKind, FileMeta, FileObject,
-    FilterResult, FsckBindingError, FsckBindingErrorKind, FsckError, FsckErrorKind, FsckFailure,
-    FsckOptions, FsckPhase, MutableTree, ObjectType, OverwriteMode, PruneOptions, PullFlags,
-    PullOptions, PullProgress, PullProgressSnapshot, PullStats, PullVerify, RefAlias, Repo,
-    RepoConfig, RepoMode, RepoTree, Result, Signer, Summary, SummaryOptions, TarExportOptions,
+    CollectionPullOptions, CollectionRef, CollectionRefEntry, CommitModifier, CommitModifierFlags,
+    CommitOptions, ComposefsImageState, ComposefsOptions, CreateOptions, DeltaEndianness,
+    DeltaOptions, DeltaSuperblock, DevInoCache, DictBuilder, DiffChange, DiffOptions, DiffSide,
+    Ed25519Signer, Ed25519Verifier, Error, FileKind, FileMeta, FileObject, FilterResult,
+    FsckBindingError, FsckBindingErrorKind, FsckError, FsckErrorKind, FsckFailure, FsckOptions,
+    FsckPhase, MutableTree, ObjectType, OverwriteMode, PruneOptions, PullFlags, PullOptions,
+    PullProgress, PullProgressSnapshot, PullStats, PullVerify, RefAlias, Repo, RepoConfig,
+    RepoMode, RepoTree, Result, Signer, Summary, SummaryOptions, TarExportOptions,
     TarImportOptions, TimestampCheck, Transaction, TransactionStats, TreeEntry, Type, Value,
     Verifier, VerifyOutcome, VerityPolicy, Xattrs, from_bytes, load_sign_keys, load_sign_keys_from,
     to_text, to_text_unannotated, validate_refspec,
@@ -11758,8 +11758,7 @@ async fn report_commit(
     args: &ShowArgs,
     verifier: &mut ReportVerifier,
 ) -> Result<Option<Checksum>> {
-    let data = repo.load_object_bytes(ObjectType::Commit, checksum).await?;
-    let commit = parse_commit(repo, checksum, &data).await?;
+    let (commit, _, data) = repo.load_commit_with_bytes(checksum).await?;
     if let Some(parent) = &commit.parent {
         println!("Parent:  {}", parent.to_hex());
     }
@@ -11789,18 +11788,6 @@ async fn report_commit(
     println!();
     report_commit_signatures(repo, repo_path, checksum, &data, args, verifier).await?;
     Ok(commit.parent)
-}
-
-/// Parses the bytes of a commit object, with the checks of
-/// [`Repo::load_commit`].
-///
-/// [`Repo::load_commit`] also checks the `.commitpartial` marker of the
-/// commit. The check stays, so a failure of it stops the command at the same
-/// point.
-async fn parse_commit(repo: &Repo, checksum: &Checksum, data: &[u8]) -> Result<Commit> {
-    let commit = Commit::parse(data)?;
-    repo.commit_state(checksum).await?;
-    Ok(commit)
 }
 
 /// Prints each line of `text` indented by four spaces.
@@ -12018,13 +12005,11 @@ async fn log(repo: Repo, repo_path: PathBuf, name: &str, args: LogArgs) -> Resul
         }
         println!("commit {}", checksum.to_hex());
         current = if args.raw {
-            let data = repo
-                .load_object_bytes(ObjectType::Commit, &checksum)
-                .await?;
+            let (commit, _, data) = repo.load_commit_with_bytes(&checksum).await?;
             let ty = parse_type(COMMIT_SIGNATURE)?;
             let value = from_bytes(&ty, &data).map_err(|err| Error::Core(err.into()))?;
             println!("{}", variant_text(&ty, &value.byteswapped())?);
-            parse_commit(&repo, &checksum, &data).await?.parent
+            commit.parent
         } else {
             report_commit(&repo, &repo_path, &checksum, &show, &mut verifier).await?
         };

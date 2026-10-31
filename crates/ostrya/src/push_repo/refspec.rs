@@ -10,6 +10,7 @@ use ostrya_core::Checksum;
 use super::invalid;
 use crate::error::{Error, Result};
 use crate::refs::{RevKind, validate_refspec};
+use crate::remote::{Expected, RefUpdate};
 use crate::repo::Repo;
 
 /// One ref update of a push.
@@ -146,6 +147,109 @@ impl Repo {
             });
         }
         Ok(targets)
+    }
+
+    /// Returns the ref updates of a one-way stream for `refspecs`, in the
+    /// order of the refspecs.
+    ///
+    /// A refspec is `SRC[:DST]`, and the rules of
+    /// [`RepoPushOptions::refspecs`](crate::RepoPushOptions::refspecs) apply.
+    /// The split is at the last `:`. Each `SRC` resolves in this repository.
+    /// If `SRC` is a ref with no `^` suffix, `DST` defaults to `SRC`. A `SRC`
+    /// that is a checksum, or that has a `^` suffix, needs a `DST`.
+    ///
+    /// A one-way stream deletes no ref, so the call refuses a delete, `:DST`.
+    /// The call refuses a `DST` of 64 lowercase hex characters after a `SRC`.
+    /// Without `remote`, the reason is that a revision reads such a name as
+    /// a commit checksum. With `remote`, the call refuses it by the refspec
+    /// rule of [`push`](Repo::push).
+    ///
+    /// Without `remote`, the name of each update is `DST`. With `remote`, it is
+    /// `REMOTE:DST`, and the receiver writes a remote ref. The call checks
+    /// each name with [`validate_refspec`], so each name that it returns
+    /// passes the ref-name checks of [`export_stream`](Repo::export_stream).
+    ///
+    /// The call does not check the ref binding of a commit. If the commit of
+    /// a `SRC` has a non-empty `ostree.ref-binding` list that does not hold
+    /// `DST`, `export_stream` refuses the update with [`Error::Remote`] and
+    /// [`BindingMismatch`](crate::remote::Error::BindingMismatch) before it
+    /// writes a byte. A commit of `ostrya commit -b BRANCH` is bound to
+    /// `BRANCH`.
+    ///
+    /// Each update expects [`Any`](Expected::Any) and sets the commit of its
+    /// `SRC`. So the receiver applies its own rules to the state of the ref.
+    /// The updates go in
+    /// [`ExportStreamOptions::updates`](crate::ExportStreamOptions::updates).
+    ///
+    /// The call takes no lock. `export_stream` takes the repository lock.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Remote`] with
+    ///   [`InvalidInput`](crate::remote::Error::InvalidInput) if a refspec is
+    ///   a delete. This check comes before each other check.
+    /// - [`Error::Remote`] with
+    ///   [`InvalidInput`](crate::remote::Error::InvalidInput) for an empty
+    ///   list, an empty refspec, a refspec with an empty `DST`, a `SRC` with
+    ///   a `^` suffix and no `DST`, a checksum `SRC` with no `DST`, and a
+    ///   `DST` that two refspecs name.
+    /// - [`Error::InvalidRefspec`] with the `DST` if the ref-name rule
+    ///   refuses the `DST`, or if the `DST` after a `SRC` is 64 lowercase
+    ///   hex characters.
+    /// - [`Error::RefNotFound`] with the `SRC` if `SRC` resolves to no commit.
+    /// - The errors of [`resolve_rev`](Repo::resolve_rev) for a `SRC`.
+    /// - [`Error::InvalidRefspec`] with `REMOTE:DST` if [`validate_refspec`]
+    ///   refuses the name of an update.
+    ///
+    /// # Examples
+    ///
+    /// Write a one-way stream of the refs `main` and `stable` to a file. The
+    /// receiver writes the refs `origin:main` and `origin:stable`. Each `DST`
+    /// is its `SRC`, so a commit bound to its branch passes the binding
+    /// check:
+    ///
+    /// ```no_run
+    /// use ostrya::{ExportStreamOptions, Repo};
+    ///
+    /// # async fn run() -> ostrya::Result<()> {
+    /// let repo = Repo::open("/srv/repo".as_ref()).await?;
+    /// let refspecs = ["main".to_owned(), "stable".to_owned()];
+    /// let updates = repo.export_updates(&refspecs, Some("origin")).await?;
+    /// let output = ostrya_rt::File::from(std::fs::File::create("stream")?);
+    /// let opts = ExportStreamOptions {
+    ///     updates,
+    ///     ..ExportStreamOptions::default()
+    /// };
+    /// repo.export_stream(output, opts).await?;
+    /// # Ok(()) }
+    /// ```
+    pub async fn export_updates(
+        &self,
+        refspecs: &[String],
+        remote: Option<&str>,
+    ) -> Result<Vec<RefUpdate>> {
+        if let Some(spec) = refspecs.iter().find(|spec| {
+            spec.rsplit_once(':')
+                .is_some_and(|(src, dst)| src.is_empty() && !dst.is_empty())
+        }) {
+            return Err(invalid(format!(
+                "a one-way stream deletes no ref, and the refspec '{spec}' is a delete"
+            )));
+        }
+        let mut updates = Vec::with_capacity(refspecs.len());
+        for target in self.push_targets(refspecs).await? {
+            let name = match remote {
+                Some(remote) => format!("{remote}:{}", target.dst),
+                None => target.dst,
+            };
+            validate_refspec(&name)?;
+            updates.push(RefUpdate {
+                name,
+                expected: Expected::Any,
+                new: Some(target.commit.expect("a delete is refused")),
+            });
+        }
+        Ok(updates)
     }
 }
 
@@ -478,6 +582,112 @@ mod tests {
                 repo.push_targets(&refspecs(&[&format!("{shared}:x")])).await,
                 Err(Error::AmbiguousRefspec(rev)) if rev == shared
             ));
+        });
+    }
+
+    fn any(name: &str, commit: Checksum) -> RefUpdate {
+        RefUpdate {
+            name: name.to_owned(),
+            expected: Expected::Any,
+            new: Some(commit),
+        }
+    }
+
+    #[test]
+    fn the_updates_of_a_one_way_stream_expect_any_state() {
+        ostrya_rt::block_on(async {
+            let scratch = Scratch::new("export-updates");
+            let repo = scratch.create(RepoMode::BareUser).await;
+            let first = commit_tree(&repo, &scratch, "main", None, b"one").await;
+            let second = commit_tree(&repo, &scratch, "main", Some(first), b"two").await;
+            let other = commit_tree(&repo, &scratch, "origin:main", None, b"three").await;
+            let full = format!("{second}:full");
+
+            let got = repo
+                .export_updates(
+                    &refspecs(&["main", "main^:old", "origin:main:mirror", &full]),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                got,
+                vec![
+                    any("main", second),
+                    any("old", first),
+                    any("mirror", other),
+                    any("full", second),
+                ]
+            );
+
+            let got = repo
+                .export_updates(&refspecs(&["main", "main^:old"]), Some("os"))
+                .await
+                .unwrap();
+            assert_eq!(got, vec![any("os:main", second), any("os:old", first)]);
+        });
+    }
+
+    #[test]
+    fn a_one_way_stream_refuses_a_delete() {
+        ostrya_rt::block_on(async {
+            let scratch = Scratch::new("export-delete");
+            let repo = scratch.create(RepoMode::BareUser).await;
+            commit_tree(&repo, &scratch, "main", None, b"one").await;
+            let hex = "ab".repeat(32);
+
+            for specs in [
+                refspecs(&[":gone"]),
+                refspecs(&[&format!(":{hex}")]),
+                refspecs(&["main", ":gone"]),
+                // The refusal comes before any resolution.
+                refspecs(&["absent", ":gone"]),
+            ] {
+                assert_invalid(
+                    repo.export_updates(&specs, None).await,
+                    "a one-way stream deletes no ref, and the refspec ':",
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn the_updates_of_a_one_way_stream_keep_the_push_rules() {
+        ostrya_rt::block_on(async {
+            let scratch = Scratch::new("export-rules");
+            let repo = scratch.create(RepoMode::BareUser).await;
+            commit_tree(&repo, &scratch, "main", None, b"one").await;
+            let hex = "ab".repeat(32);
+
+            assert_invalid(repo.export_updates(&[], None).await, "at least one refspec");
+            assert!(matches!(
+                repo.export_updates(&refspecs(&["absent"]), None).await,
+                Err(Error::RefNotFound(name)) if name == "absent"
+            ));
+            // A checksum-shaped `DST` is refused, also with a remote.
+            assert_invalid_refspec(
+                repo.export_updates(&refspecs(&[&format!("main:{hex}")]), Some("os"))
+                    .await,
+                &hex,
+            );
+        });
+    }
+
+    #[test]
+    fn a_remote_that_makes_no_ref_name_is_an_invalid_refspec() {
+        // The remote name rule accepts the character, and the ref-name rule
+        // refuses it.
+        let remote = "\u{1f130}";
+        assert!(crate::valid_remote_name(remote));
+        ostrya_rt::block_on(async {
+            let scratch = Scratch::new("export-remote");
+            let repo = scratch.create(RepoMode::BareUser).await;
+            commit_tree(&repo, &scratch, "main", None, b"one").await;
+            assert_invalid_refspec(
+                repo.export_updates(&refspecs(&["main"]), Some(remote))
+                    .await,
+                &format!("{remote}:main"),
+            );
         });
     }
 }

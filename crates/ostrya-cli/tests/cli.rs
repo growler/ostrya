@@ -44751,3 +44751,240 @@ fn pull_local_checksum_shaped_ref() {
         }
     }
 }
+
+// --- send --one-way ----------------------------------------------------------
+
+/// Runs `ostrya` with `args`, with no `LOGNAME`, and with standard output to
+/// a file in `dir`. The run holds the bytes of the file as its standard
+/// output.
+#[cfg(all(feature = "send", feature = "push"))]
+fn ostrya_to_file(dir: &Path, args: &[&str]) -> Run {
+    let path = dir.join("stream");
+    let file = std::fs::File::create(&path).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_ostrya"))
+        .args(args)
+        .env_remove("LOGNAME")
+        .stdin(Stdio::null())
+        .stdout(file)
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run ostrya");
+    Run {
+        status: out.status,
+        stdout: std::fs::read(&path).unwrap(),
+        stderr: out.stderr,
+    }
+}
+
+/// Asserts that `run` exits 1 and writes nothing to standard output, and
+/// returns its standard error.
+#[cfg(all(feature = "send", feature = "push"))]
+fn refused(run: &Run, case: &str) -> String {
+    let stderr = String::from_utf8_lossy(&run.stderr).into_owned();
+    assert_eq!(run.status.code(), Some(1), "{case}: {stderr}");
+    assert!(run.stdout.is_empty(), "{case}");
+    stderr
+}
+
+/// `send --one-way` writes the stream to standard output and nothing to
+/// standard error, also under `--verbose`. The stream starts with a one-way
+/// `Hello` that names the remote ref of the refspec.
+#[cfg(all(feature = "send", feature = "push"))]
+#[test]
+fn send_one_way_writes_the_stream_to_a_file() {
+    use ostrya::remote::proto::{FrameReader, Message};
+
+    let tmp = TmpDir::new("send-one-way");
+    let repo = commit_fixture(tmp.path());
+    let repo = repo.to_str().unwrap();
+    for verbose in [false, true] {
+        let mut args = vec!["send", "--repo", repo, "--one-way", "--remote=os", BRANCH];
+        if verbose {
+            args.insert(0, "--verbose");
+        }
+        let run = ostrya_to_file(tmp.path(), &args);
+        run.ok();
+        assert!(run.stderr.is_empty(), "{verbose}: {:?}", run.stderr);
+        assert!(!run.stdout.is_empty(), "{verbose}");
+        let mut reader = FrameReader::new(&run.stdout[..]);
+        match block_on(reader.read_message()).unwrap() {
+            Some(Message::Hello(hello)) => {
+                assert!(hello.one_way, "{verbose}");
+                assert_eq!(hello.refs, vec![format!("os:{BRANCH}")], "{verbose}");
+            }
+            other => panic!("{verbose}: expected Hello, got {other:?}"),
+        }
+    }
+}
+
+/// `send --one-way` takes no client name, so it runs with no `LOGNAME` and
+/// no `--client`. `--compress=LEVEL` passes.
+#[cfg(all(feature = "send", feature = "push"))]
+#[test]
+fn send_one_way_needs_no_client_name() {
+    let tmp = TmpDir::new("send-one-way-no-client");
+    let repo = commit_fixture(tmp.path());
+    let run = ostrya_to_file(
+        tmp.path(),
+        &[
+            "send",
+            "--repo",
+            repo.to_str().unwrap(),
+            "--one-way",
+            "--compress=3",
+            BRANCH,
+        ],
+    );
+    run.ok();
+    assert!(run.stderr.is_empty(), "{:?}", run.stderr);
+    assert!(!run.stdout.is_empty());
+}
+
+/// `send --one-way` refuses a delete refspec.
+#[cfg(all(feature = "send", feature = "push"))]
+#[test]
+fn send_one_way_refuses_a_delete_refspec() {
+    let tmp = TmpDir::new("send-one-way-delete");
+    let repo = commit_fixture(tmp.path());
+    let spec = format!(":{BRANCH}");
+    let run = ostrya(
+        &["send", "--repo", repo.to_str().unwrap(), "--one-way", &spec],
+        None,
+        &[],
+    );
+    assert_eq!(
+        refused(&run, "delete"),
+        format!(
+            "error: invalid input: a one-way stream deletes no ref, and the refspec '{spec}' \
+             is a delete\n"
+        )
+    );
+}
+
+/// `send --one-way` refuses a DST that the ref binding of the commit does
+/// not hold, also with `--remote`. The fixture commit is bound to its
+/// branch.
+#[cfg(all(feature = "send", feature = "push"))]
+#[test]
+fn send_one_way_refuses_a_destination_outside_the_ref_binding() {
+    let tmp = TmpDir::new("send-one-way-binding");
+    let repo = commit_fixture(tmp.path());
+    let repo = repo.to_str().unwrap();
+    let spec = format!("{BRANCH}:other");
+    for remote in [None, Some("--remote=os")] {
+        let mut args = vec!["send", "--repo", repo, "--one-way", &spec];
+        if let Some(remote) = remote {
+            args.push(remote);
+        }
+        let run = ostrya(&args, None, &[]);
+        assert_eq!(
+            refused(&run, &spec),
+            format!(
+                "error: binding-mismatch: commit {COMMIT} is bound to the refs \
+                 [\"{BRANCH}\"], which do not hold 'other'\n"
+            ),
+            "{remote:?}"
+        );
+    }
+}
+
+/// `--remote`, `--compress`, and a refspec each need `--one-way`.
+#[cfg(all(feature = "send", feature = "push"))]
+#[test]
+fn send_one_way_options_need_one_way() {
+    let tmp = TmpDir::new("send-one-way-requires");
+    let missing = tmp.path().join("missing");
+    let missing = missing.to_str().unwrap();
+    for option in ["--remote=os", "--compress", "--compress=3", BRANCH] {
+        let run = ostrya(
+            &["send", "--repo", missing, option],
+            None,
+            &[("LOGNAME", "u")],
+        );
+        let stderr = refused(&run, option);
+        assert!(stderr.contains("--one-way"), "{option}: {stderr}");
+    }
+}
+
+/// `--one-way` conflicts with `--client`.
+#[cfg(all(feature = "send", feature = "push"))]
+#[test]
+fn send_one_way_conflicts_with_client() {
+    let tmp = TmpDir::new("send-one-way-client");
+    let missing = tmp.path().join("missing");
+    let run = ostrya(
+        &[
+            "send",
+            "--repo",
+            missing.to_str().unwrap(),
+            "--one-way",
+            "--client=u",
+            BRANCH,
+        ],
+        None,
+        &[],
+    );
+    let stderr = refused(&run, "client");
+    assert!(stderr.contains("cannot be used with"), "{stderr}");
+}
+
+/// `send --one-way` refuses a SRC that the repository does not hold.
+#[cfg(all(feature = "send", feature = "push"))]
+#[test]
+fn send_one_way_refuses_a_source_the_repository_does_not_hold() {
+    let tmp = TmpDir::new("send-one-way-absent");
+    let repo = commit_fixture(tmp.path());
+    let run = ostrya(
+        &[
+            "send",
+            "--repo",
+            repo.to_str().unwrap(),
+            "--one-way",
+            "nosuchref",
+        ],
+        None,
+        &[],
+    );
+    assert_eq!(refused(&run, "absent"), "error: ref not found: nosuchref\n");
+}
+
+/// The option parser refuses a value of `--remote` that is no remote name,
+/// before the repository opens.
+#[cfg(all(feature = "send", feature = "push"))]
+#[test]
+fn send_one_way_refuses_an_invalid_remote_name() {
+    let tmp = TmpDir::new("send-one-way-remote");
+    let missing = tmp.path().join("missing");
+    let missing = missing.to_str().unwrap();
+    for remote in ["a/b", "-x", ".", "", "a:b", "a b"] {
+        let option = format!("--remote={remote}");
+        let run = ostrya(
+            &["send", "--repo", missing, "--one-way", &option, BRANCH],
+            None,
+            &[],
+        );
+        let stderr = refused(&run, remote);
+        assert!(
+            stderr.starts_with(&format!("error: invalid value '{remote}' for '--remote ")),
+            "{remote:?}: {stderr}"
+        );
+    }
+}
+
+/// `send --one-way` with no refspec writes the usage text and an error line.
+#[cfg(all(feature = "send", feature = "push"))]
+#[test]
+fn send_one_way_needs_a_refspec() {
+    let tmp = TmpDir::new("send-one-way-no-refspec");
+    let missing = tmp.path().join("missing");
+    let run = ostrya(
+        &["send", "--repo", missing.to_str().unwrap(), "--one-way"],
+        None,
+        &[],
+    );
+    let stderr = refused(&run, "no refspec");
+    assert!(
+        stderr.ends_with("error: REFSPEC must be specified\n"),
+        "{stderr}"
+    );
+}

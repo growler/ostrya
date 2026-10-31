@@ -1623,6 +1623,50 @@ mod export {
         }
     }
 
+    /// The updates that `Repo::export_updates` returns for a set of refspecs
+    /// and a remote go into an export, and the receiver writes each remote
+    /// ref.
+    #[test]
+    fn the_updates_of_a_set_of_refspecs_commit_into_a_repository() {
+        let source = Source::new("one-way-export-updates-source");
+        block_on(source.repo.set_ref_immediate("main", Some(&source.commit))).unwrap();
+        let refspecs = ["main".to_owned(), "main:copy".to_owned()];
+        let updates = block_on(source.repo.export_updates(&refspecs, Some("origin"))).unwrap();
+        assert_eq!(
+            updates,
+            vec![
+                update("origin:main", Expected::Any, Some(source.commit)),
+                update("origin:copy", Expected::Any, Some(source.commit)),
+            ]
+        );
+        let tmp = TmpDir::new("one-way-export-updates");
+        let target = new_repo(&tmp, RepoMode::BareUser, "");
+        let opts = ExportStreamOptions {
+            updates,
+            compression: Compression::None,
+        };
+        let (received, exported) = export_piped(&source.repo, &target, &export_policy(), opts);
+        let report = received.unwrap();
+        exported.unwrap();
+        let outcome = |name: &str| RefOutcome {
+            name: name.into(),
+            old: None,
+            new: Some(source.commit),
+        };
+        assert_eq!(
+            report.refs,
+            vec![outcome("origin:main"), outcome("origin:copy")]
+        );
+        let line = format!("{}\n", source.commit).into_bytes();
+        assert_eq!(
+            file_inventory(target.path(), "refs"),
+            vec![
+                ("refs/remotes/origin/copy".to_owned(), line.clone()),
+                ("refs/remotes/origin/main".to_owned(), line),
+            ]
+        );
+    }
+
     /// One part of a captured stream: a frame with its kind, a chunk length,
     /// or the bytes of a chunk.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]

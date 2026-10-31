@@ -26,6 +26,7 @@ push = ["ostrya/push"]
 serve = ["dep:ostrya-server"]
 # `ostrya send`, the server side of a pull over ssh. `Repo::send` takes no
 # feature of `ostrya`, so the feature gates the subcommand alone.
+# `send --one-way` also needs `push`.
 send = []
 # The pull from and the push to a bucket repository at an `s3://` address,
 # `remote init`, and the S3 options of `push`, `push-tree`, `pull`,

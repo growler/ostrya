@@ -28,6 +28,7 @@ pub struct ExportStreamOptions {
     /// [`Any`](Expected::Any) and sets a new commit. A name is `NAME` or
     /// `REMOTE:NAME`. The new commits are the commits of the stream. The
     /// stream also carries the dependencies of the new commits, with no ref.
+    /// [`Repo::export_updates`] returns these updates for a set of refspecs.
     pub updates: Vec<RefUpdate>,
     /// The encoding of the content objects.
     pub compression: Compression,
@@ -41,7 +42,8 @@ impl Repo {
     /// direction. On the other side, `Repo::receive_stream` or
     /// `Repo::receive_stream_to_commit` of the `receive` feature reads it.
     /// The stream ends with the `Commit` frame, which carries the updates of
-    /// `opts.updates`.
+    /// `opts.updates`. [`export_updates`](Repo::export_updates) returns the
+    /// updates for a set of refspecs.
     ///
     /// The call returns the [`PushStats`] of the stream. The statistics count
     /// each object of the stream as offered and as needed.
@@ -323,7 +325,7 @@ impl Repo {
 }
 
 /// Checks at compile time that the options are `Send + Sync` and that the
-/// future of an export is `Send`.
+/// futures of an export and of its updates are `Send`.
 const _: fn() = || {
     fn assert_send<T: Send>(_: T) {}
     fn assert_send_sync<T: Send + Sync>() {}
@@ -331,4 +333,5 @@ const _: fn() = || {
     let _ = |repo: &Repo| {
         assert_send(repo.export_stream(futures_lite::io::sink(), ExportStreamOptions::default()))
     };
+    let _ = |repo: &Repo, refspecs: &[String]| assert_send(repo.export_updates(refspecs, None));
 };

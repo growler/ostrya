@@ -618,9 +618,10 @@ enum Command {
     Serve(ServeArgs),
     /// Serve one pull session over standard input and standard output.
     ///
-    /// An ssh pull runs this command on the remote side. The command answers
-    /// each `Get` path as the archive view of `ostrya serve` answers a `GET` of
-    /// that path. It takes no lock and writes no file in the repository.
+    /// Without --one-way, an ssh pull runs this command on the remote side.
+    /// The command answers each `Get` path as the archive view of
+    /// `ostrya serve` answers a `GET` of that path. It takes no lock and
+    /// writes no file in the repository.
     ///
     /// The client name is --client, else the value of `LOGNAME`, which sshd
     /// sets from the password entry of the user. With neither, and with a
@@ -653,6 +654,17 @@ enum Command {
     ///
     /// An `authorized_keys` entry with `command="ostrya send --repo=PATH"`
     /// limits an ssh key to a pull from one repository.
+    ///
+    /// With --one-way, the command serves no session. It writes the commits
+    /// of the refspecs to standard output as one one-way stream, and it does
+    /// not read standard input. It reads no client group and no `LOGNAME`. It
+    /// holds the repository lock as shared while it writes the stream.
+    /// Standard output carries the stream alone. When the command refuses
+    /// the options, it writes the usage error of `send` to standard error
+    /// and exits 1. A failure after the command reads the options writes one
+    /// `error: MESSAGE` line to standard error and exits 1. On success, the
+    /// command exits 0 and writes nothing to standard error, also under
+    /// --verbose. A build without the feature `push` has no --one-way.
     #[cfg(feature = "send")]
     Send(SendArgs),
 }
@@ -3985,6 +3997,92 @@ struct SendArgs {
     /// can give any name.
     #[arg(long, value_name = "NAME")]
     client: Option<String>,
+    /// Write the commits of the refspecs to standard output as one one-way
+    /// stream.
+    ///
+    /// The stream carries each commit, the objects of its tree, and its
+    /// detached metadata. It also carries each dependency that field 2 of a
+    /// commit names, with no ref update, and each stored composefs image of
+    /// a sent commit. It ends with a `Commit` frame that holds one ref update
+    /// for each refspec. The stream carries no parent commit. The command
+    /// does no negotiation, so it sends each object.
+    ///
+    /// Each update expects any state of the ref, so the receiver applies its
+    /// own rules. A failure before the first byte writes nothing to standard
+    /// output. A failure after the first byte ends the stream with `Abort`,
+    /// and a receiver changes nothing. The option conflicts with --client.
+    #[cfg(all(feature = "send", feature = "push"))]
+    #[arg(long, conflicts_with = "client")]
+    one_way: bool,
+    /// Prefix each DST with REMOTE, so the receiver writes the remote ref
+    /// REMOTE:DST.
+    ///
+    /// REMOTE is a remote name: one or more alphanumeric characters, `-`,
+    /// `_`, and `.`, that starts with an alphanumeric character or `_`. The
+    /// option needs --one-way.
+    #[cfg(all(feature = "send", feature = "push"))]
+    #[arg(
+        long,
+        value_name = "REMOTE",
+        requires = "one_way",
+        value_parser = parse_remote_name
+    )]
+    remote: Option<String>,
+    /// Send the content objects deflated at LEVEL, 1 to 9.
+    ///
+    /// The value needs the `=` form, and --compress alone gives level 6.
+    /// Without this option, the stream carries the content objects raw. With
+    /// it, if this repository is an archive repository, the stream carries
+    /// each stored content object as it is, whatever LEVEL is. The object
+    /// keeps the zlib level that the repository wrote it with. The option
+    /// needs --one-way.
+    #[cfg(all(feature = "send", feature = "push"))]
+    #[arg(
+        long,
+        value_name = "LEVEL",
+        require_equals = true,
+        num_args = 0..=1,
+        default_missing_value = "6",
+        value_parser = clap::value_parser!(u8).range(1..=9),
+        requires = "one_way"
+    )]
+    compress: Option<u8>,
+    /// The refspecs of --one-way, each `SRC[:DST]`. At least one refspec is
+    /// required.
+    ///
+    /// SRC is a revision of this repository, and DST is the ref that the
+    /// receiver sets to its commit. The command splits each refspec at its
+    /// last `:`. If SRC is a ref, DST defaults to SRC. A SRC that is a
+    /// checksum, or that has a `^` suffix, needs a DST. A one-way stream
+    /// deletes no ref, so the command refuses `:DST`.
+    ///
+    /// The command refuses a DST that the ref-name rule refuses, which
+    /// includes a DST with `^`. It also refuses a DST of 64 lowercase hex
+    /// characters. Without --remote, the reason is that a revision reads
+    /// such a name as a commit checksum. With --remote, the command refuses
+    /// it by the refspec rule of `push`.
+    ///
+    /// If the commit of a SRC has a ref binding, the binding must hold DST.
+    /// Otherwise the command writes `error: binding-mismatch: MESSAGE` before
+    /// it writes a byte, and exits 1. `ostrya commit -b BRANCH` binds the
+    /// commit to BRANCH. The refspecs need --one-way.
+    #[cfg(all(feature = "send", feature = "push"))]
+    #[arg(requires = "one_way")]
+    refspecs: Vec<String>,
+}
+
+/// Reads a value of `send --remote`.
+#[cfg(all(feature = "send", feature = "push"))]
+fn parse_remote_name(text: &str) -> std::result::Result<String, String> {
+    if ostrya::valid_remote_name(text) {
+        Ok(text.to_owned())
+    } else {
+        Err(
+            "a remote name is one or more alphanumeric characters, '-', '_', and '.', \
+             that starts with an alphanumeric character or '_'"
+                .to_owned(),
+        )
+    }
 }
 
 #[cfg(feature = "serve")]
@@ -5106,6 +5204,14 @@ async fn run(repo: Option<&Path>, verbose: bool, command: Command) -> Result<()>
         }
         #[cfg(feature = "send")]
         Command::Send(args) => {
+            #[cfg(feature = "push")]
+            if args.one_way {
+                if args.refspecs.is_empty() {
+                    exit_with_error(name, "REFSPEC must be specified");
+                }
+                let (repo, _) = resolve_repo(repo, false, name).await;
+                return send_one_way(repo, args).await;
+            }
             let client = ssh_client(args.client, name);
             // `send` writes nothing on success, also under `--verbose`, so
             // `resolve_repo` does not write the repository line of `--verbose`.
@@ -5354,6 +5460,27 @@ async fn send(repo: Repo, client: ostrya::access::AuthItem) -> Result<()> {
     }));
     repo.send_with(stdin_file()?, stdout_file()?, &access, &opts)
         .await
+}
+
+/// Writes the commits of the refspecs of `args` to standard output as one
+/// one-way stream.
+///
+/// The refspecs resolve through `Repo::export_updates`, and
+/// `Repo::export_stream` writes the stream under the shared repository lock.
+/// Standard output carries the stream alone. A failure goes to standard error
+/// as the error line of [`main`]. The command writes nothing to standard error
+/// on success, also under `--verbose`.
+#[cfg(all(feature = "send", feature = "push"))]
+async fn send_one_way(repo: Repo, args: SendArgs) -> Result<()> {
+    let updates = repo
+        .export_updates(&args.refspecs, args.remote.as_deref())
+        .await?;
+    let opts = ostrya::ExportStreamOptions {
+        updates,
+        compression: push_compression(args.compress),
+    };
+    repo.export_stream(stdout_file()?, opts).await?;
+    Ok(())
 }
 
 /// Pushes the commits that the refspecs name to a remote over ssh or HTTP, or

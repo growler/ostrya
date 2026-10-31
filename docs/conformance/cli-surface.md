@@ -5848,11 +5848,16 @@ ostrya serve [--repo=PATH] [--listen=ADDR:PORT]...
 
 ```text
 ostrya send [--repo=PATH] [--client=NAME]
+ostrya send [--repo=PATH] --one-way [--remote=REMOTE] [--compress[=LEVEL]]
+            SRC[:DST]...
 ```
 
 - The `send` feature of `ostrya-cli` builds the command. It is in the
   default set. `Repo::send` takes no feature of `ostrya`, so the command
-  builds without `receive`, `push`, and `serve`.
+  builds without `receive`, `push`, and `serve`. `--one-way` also needs the
+  `push` feature, which is in the default set. A build without `push`
+  refuses `--one-way`, `--remote`, `--compress`, and a refspec as unknown
+  arguments.
 - The session serves the `.cfs` composefs image of a commit as stored, as
   `serve` does.
 - The client name is `--client`, else the value of `LOGNAME`, as for
@@ -5876,12 +5881,12 @@ ostrya send [--repo=PATH] [--client=NAME]
   `Get` path as the archive view of `serve` answers a `GET` of that path. A
   path that the view refuses, and a path that the client cannot read, get
   the reply of a path that is not found.
-- The command takes no lock and writes no file in the repository. An
-  account with read access to the repository serves an `archive`,
-  `bare-user`, `bare-user-only`, or `bare-user-shared` repository. A `bare`
-  or `bare-split-xattrs` repository needs an account that can read every
-  object and its extended attributes. A file that the account cannot read
-  ends the session with `internal`.
+- Without `--one-way`, the command takes no lock and writes no file in the
+  repository. An account with read access to the repository serves an
+  `archive`, `bare-user`, `bare-user-only`, or `bare-user-shared`
+  repository. A `bare` or `bare-split-xattrs` repository needs an account
+  that can read every object and its extended attributes. A file that the
+  account cannot read ends the session with `internal`.
 - Standard output carries the frames of the session alone. The command
   writes `error: MESSAGE` to standard error on failure. For each directory
   under `refs/mirrors/` whose name is not a collection id, a `ListRefs` with
@@ -5916,7 +5921,66 @@ ostrya send [--repo=PATH] [--client=NAME]
   `ostrya receive` pushes and cannot pull. A user that pulls and pushes
   holds two keys.
 - `crates/ostrya/tests/send.rs` and `crates/ostrya-cli/tests/send.rs` hold
-  the tests.
+  the tests of the pull session.
+- `--one-way` writes the commits of the refspecs to standard output as one
+  one-way stream (`../format-reference.md`, "The one-way stream"), through
+  `Repo::export_updates` and `Repo::export_stream`. The command serves no
+  session and does not read standard input. It reads no client group and
+  no `LOGNAME`, so it runs with neither `--client` nor `LOGNAME`.
+  `--one-way` conflicts with `--client`. `--remote`, `--compress`, and a
+  refspec each need `--one-way`. The option parser refuses each of these
+  cases at exit 1.
+- With `--one-way` and no refspec, the command writes the usage text and
+  `error: REFSPEC must be specified`, and exits 1 before it opens the
+  repository.
+- A refspec is `SRC[:DST]` with the rules of `push`: the split at the last
+  `:`, a `DST` that defaults to a `SRC` that is a ref, a checksum `SRC` or
+  a `SRC` with a `^` suffix that needs a `DST`, the ref-name rule on `DST`,
+  and a `DST` that two refspecs name. The command refuses a delete with
+  `error: invalid input: a one-way stream deletes no ref, and the refspec
+  ':DST' is a delete` before it resolves a `SRC`. A `SRC` that resolves to
+  no commit gets `error: ref not found: SRC`. A `DST` of 64 lowercase hex
+  characters after a `SRC` gets `error: Invalid refspec DST`. Without
+  `--remote`, the reason is that a revision reads such a name as a commit
+  checksum. With `--remote`, the command refuses it by the refspec rule of
+  `push`. If the commit of a `SRC` has a non-empty `ostree.ref-binding`
+  list that does not hold `DST`, the command writes `error:
+  binding-mismatch: commit CHECKSUM is bound to the refs [...], which do
+  not hold 'DST'`. `ostrya commit -b BRANCH` binds the commit to `BRANCH`,
+  so `main^:old` gets this refusal for such a commit. Each refusal comes
+  before the command writes a byte, and the command exits 1.
+- `--remote=REMOTE` prefixes each `DST` with `REMOTE:`, so the receiver
+  writes the remote ref `REMOTE:DST`. The option parser checks `REMOTE`
+  with the remote-name rule of `remote add` before the repository opens. A
+  name that the rule refuses gets the usage error `error: invalid value
+  'REMOTE' for '--remote <REMOTE>'` with the rule, and exit 1. A name that
+  passes the remote-name rule and that the ref-name rule refuses as a
+  remote of a ref, such as a symbol that `char::is_alphanumeric` accepts,
+  gets `error: Invalid refspec REMOTE:DST` and exit 1.
+- `--compress` sends content objects deflated at level 6, and
+  `--compress=LEVEL` at `LEVEL`, 1 to 9, as for `push`. Without the option,
+  the stream carries them raw. An `archive` repository sends each stored
+  content object as it is.
+- Each update of the `Commit` frame expects any state of its ref, so the
+  receiver applies its own rules to the state of the ref. The stream
+  carries each commit of a refspec, the objects of its tree, its detached
+  metadata, each dependency that field 2 names with no ref update, and
+  each stored composefs image of a sent commit. It carries no parent
+  commit. The command does no negotiation, so it sends each object.
+- The command holds the repository lock as shared while it writes the
+  stream. Standard output carries the stream alone. A failure before the
+  first byte writes nothing to standard output. A failure after the first
+  byte ends the stream with `Abort`, and a receiver changes nothing. When
+  the command refuses the options, it writes the usage error of `send` to
+  standard error and exits 1. A refusal of the option parser starts with
+  the `error:` line and ends with `For more information, try '--help'.`.
+  With no refspec, the command writes the usage text before the `error:`
+  line. A failure after the command reads the options writes one
+  `error: MESSAGE` line to standard error and exits 1. On success, the
+  command exits 0 and writes nothing to standard error, also under `-v`.
+- `crates/ostrya/src/push_repo/refspec.rs` and
+  `crates/ostrya/tests/one_way.rs` hold the tests of the library calls, and
+  `crates/ostrya-cli/tests/cli.rs` holds the tests of `--one-way`.
 
 ### `composefs-image`
 

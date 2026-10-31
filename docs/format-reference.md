@@ -794,6 +794,8 @@ target ref:
   or a `--tag` of that shape with the same error.
 - `push-tree` refuses a branch of `--onto` or a `--tag` of that shape with
   `error: Rev name '<name>' looks like a checksum`.
+- `send --one-way` refuses a `DST` of that shape after a `SRC` with `error:
+  Invalid refspec <name>`, also with `--remote`, before it writes a byte.
 - `commit --tag` refuses a tag of that shape with `error: Rev name '<name>'
   looks like a checksum` before it takes the repository lock.
 - In the library, `Repo::push`, `Repo::push_onto`, `Repo::export_stream`, and

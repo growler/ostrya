@@ -645,6 +645,9 @@ impl Repo {
     ///
     /// # Errors
     ///
+    /// - [`Error::InvalidInput`] if [`valid_remote_name`] refuses `remote`.
+    ///   The call refuses the name before it takes a lock, and removes no
+    ///   file.
     /// - [`Error::LockTimeout`] if the wait for a lock passes `[core]
     ///   lock-timeout-secs`.
     /// - [`Error::InvalidFormat`] if `[core] lock-timeout-secs` of this handle
@@ -653,6 +656,11 @@ impl Repo {
     ///   or if `[core] lock-timeout-secs` is not an integer.
     /// - [`Error::Io`] if a lock file or the removal fails on the file system.
     pub async fn remove_remote_keyring(&self, remote: &str) -> Result<()> {
+        if !valid_remote_name(remote) {
+            return Err(Error::InvalidInput(format!(
+                "invalid remote name: {remote}"
+            )));
+        }
         let name = remote_keyring_name(remote);
         self.write_locked(move |repo| remove_root_file_blocking(repo.repo_fd(), &name).map(drop))
             .await

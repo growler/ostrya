@@ -4135,8 +4135,15 @@ Not observed: the answer of the tool to a non-ASCII letter. The port takes a
 non-ASCII letter as alphanumeric, so such a letter is a name in the port.
 
 `add` and `delete` refuse a name that breaks these rules. The reading
-subcommands take a name of each shape, and a name that breaks the rules names
-no section.
+subcommands take a name of each shape. A section that `add` writes holds a
+name that keeps the rules. A section that is written by hand in the config can
+hold a name that breaks them, and the tool then uses that section. With a
+section `[remote "../x"]`, `remote gpg-import ../x` writes
+`<repo>/../x.trustedkeys.gpg` and `remote gpg-list-keys ../x` reads it, each
+at exit 0. `show --gpg-verify-remote=../x` and `pull-local --remote=../x
+--gpg-verify` also read that file when they check the GPG signature of a
+commit. The port refuses such a name in these commands (`cli-surface.md`,
+"P1", `show`; "P2", `pull-local`; "P3", `remote`).
 
 #### Existing sections and option refusals
 

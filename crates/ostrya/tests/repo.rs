@@ -17,7 +17,8 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use common::{fixture_repo, ostree_available};
-use ostrya::{CreateOptions, Repo, RepoMode};
+use futures_lite::future::poll_once;
+use ostrya::{CreateOptions, Error, Repo, RepoMode};
 use ostrya_rt::block_on;
 
 /// A temporary directory. `Drop` removes it.
@@ -369,6 +370,36 @@ fn write_config_replaces_the_document_and_keeps_the_mode() {
     assert!(!keyring.exists());
     // If the keyring is already absent, the removal succeeds.
     block_on(reopened.remove_remote_keyring("origin")).expect("remove keyring again");
+}
+
+/// `Repo::remove_remote_keyring` refuses a remote name that
+/// `valid_remote_name` refuses, with `Error::InvalidInput`. The file that the
+/// join of the name to the repository reaches stays. The call refuses the name
+/// at its first poll, before it takes a lock.
+#[test]
+fn remove_remote_keyring_refuses_an_invalid_remote_name() {
+    let tmp = TmpDir::new("remove-keyring-invalid");
+    let outside = tmp.path().join("x.trustedkeys.gpg");
+    std::fs::write(&outside, b"outside").unwrap();
+    let repo = block_on(Repo::create(
+        &tmp.path().join("repo"),
+        CreateOptions::new(RepoMode::Archive),
+    ))
+    .expect("create");
+
+    let err = block_on(repo.remove_remote_keyring("../x")).unwrap_err();
+    assert!(
+        matches!(&err, Error::InvalidInput(m) if m == "invalid remote name: ../x"),
+        "{err:?}"
+    );
+    assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
+
+    let first = block_on(poll_once(repo.remove_remote_keyring("../x")));
+    assert!(
+        matches!(&first, Some(Err(Error::InvalidInput(m))) if m == "invalid remote name: ../x"),
+        "{first:?}"
+    );
+    assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
 }
 
 /// Creates a `bare-user` repository `repo` under `tmp` and returns a

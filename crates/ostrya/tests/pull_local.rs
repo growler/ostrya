@@ -619,6 +619,57 @@ fn a_local_pull_ignores_the_mirror_flag() {
     });
 }
 
+/// A local pull refuses a remote name that `valid_remote_name` refuses, with
+/// `Error::InvalidInput`. The pull refuses the name with the default checks,
+/// with a GPG check, and with no ref writes. A directory is at the path that
+/// the join of the name to the destination reaches, so a read of that keyring
+/// before the check gives a different error. The destination gets no object.
+#[test]
+fn a_local_pull_refuses_an_invalid_remote_name() {
+    let tmp = TmpDir::new("pull-invalid-remote");
+    block_on(async {
+        let base = tmp.path();
+        let (_src_dir, src, _c1, _c2) = source_repo(base, RepoMode::Archive).await;
+        let (dst_dir, dst) = make_repo(base, "dst", RepoMode::Archive).await;
+        let decoy = base.join("x.trustedkeys.gpg");
+        std::fs::create_dir(&decoy).unwrap();
+
+        let cases = [
+            PullOptions::default(),
+            PullOptions {
+                verify: PullVerify {
+                    gpg: Some(true),
+                    ..Default::default()
+                },
+                ..PullOptions::default()
+            },
+            PullOptions {
+                no_ref_writes: true,
+                ..PullOptions::default()
+            },
+        ];
+        for (i, opts) in cases.into_iter().enumerate() {
+            let err = dst
+                .pull_local(
+                    &src,
+                    PullOptions {
+                        refs: vec!["main".into()],
+                        remote: Some("../x".into()),
+                        ..opts
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, Error::InvalidInput(m) if m == "invalid remote name: ../x"),
+                "case {i}: {err:?}"
+            );
+        }
+        assert!(object_names(&dst_dir).is_empty());
+        assert!(decoy.is_dir());
+    });
+}
+
 #[test]
 fn depth_follows_parent_commits() {
     let tmp = TmpDir::new("pull-depth");

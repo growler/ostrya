@@ -321,6 +321,9 @@ impl Repo {
     /// failed sync of the repository directory, which comes after the rename
     /// of the new keyring.
     ///
+    /// - [`Error::InvalidInput`] if [`valid_remote_name`] refuses `remote`.
+    ///   The call refuses the name before it parses `keys` and before it
+    ///   takes a lock.
     /// - [`Error::Signature`] if `keys` or the keyring is over 4 MiB, holds
     ///   more than 256 certificates, or is a GnuPG keybox.
     /// - [`Error::InvalidFormat`] if the keyring is larger than 64 MiB, the
@@ -346,6 +349,11 @@ impl Repo {
         keys: &[u8],
         key_ids: &[String],
     ) -> Result<usize> {
+        if !valid_remote_name(remote) {
+            return Err(Error::InvalidInput(format!(
+                "invalid remote name: {remote}"
+            )));
+        }
         let name = remote_keyring_name(remote);
         let fsync = self.config().fsync()?;
         let subject = format!("the keyring '{name}'");
@@ -380,6 +388,8 @@ impl Repo {
     ///
     /// # Errors
     ///
+    /// - [`Error::InvalidInput`] if [`valid_remote_name`] refuses `remote`.
+    ///   The call refuses the name before it reads a keyring.
     /// - [`Error::Signature`] if the keyring is over 4 MiB, is a GnuPG keybox,
     ///   holds more than 256 certificates, or does not parse as an OpenPGP
     ///   keyring.
@@ -390,6 +400,11 @@ impl Repo {
     ///   valid base64.
     /// - [`Error::Io`] if the read of the keyring fails.
     pub async fn gpg_list_keys(&self, remote: &str) -> Result<Vec<GpgKey>> {
+        if !valid_remote_name(remote) {
+            return Err(Error::InvalidInput(format!(
+                "invalid remote name: {remote}"
+            )));
+        }
         let name = remote_keyring_name(remote);
         let Some(keyring) = self.read_root_file(&name).await? else {
             return Ok(Vec::new());
@@ -728,6 +743,64 @@ pub(crate) mod tests {
             empty_after.is_empty(),
             "the refused import changed the keyring"
         );
+    }
+
+    /// An import refuses a remote name that [`valid_remote_name`] refuses,
+    /// before it reads a keyring. A directory is at the path that the join of
+    /// the name to the repository reaches, so a read of that path before the
+    /// check gives a different error. The directory stays.
+    #[test]
+    fn an_import_refuses_an_invalid_remote_name() {
+        use crate::{CreateOptions, RepoMode};
+
+        let dir = scratch_dir();
+        let root = dir.join("repo");
+        std::fs::create_dir_all(&dir).unwrap();
+        let decoy = dir.join("x.trustedkeys.gpg");
+        std::fs::create_dir(&decoy).unwrap();
+        let result = ostrya_rt::block_on(async {
+            let repo = Repo::create(&root, CreateOptions::new(RepoMode::Archive))
+                .await
+                .unwrap();
+            repo.gpg_import_keys("../x", b"", &[]).await
+        });
+        let decoy_stays = decoy.is_dir();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(
+            matches!(&result, Err(Error::InvalidInput(m)) if m == "invalid remote name: ../x"),
+            "{:?}",
+            result.err()
+        );
+        assert!(decoy_stays, "the refused import changed the decoy");
+    }
+
+    /// A key listing refuses a remote name that [`valid_remote_name`]
+    /// refuses, before it reads a keyring. A directory is at the path that
+    /// the join of the name to the repository reaches, so a read of that
+    /// path before the check gives a different error.
+    #[test]
+    fn a_key_listing_refuses_an_invalid_remote_name() {
+        use crate::{CreateOptions, RepoMode};
+
+        let dir = scratch_dir();
+        let root = dir.join("repo");
+        std::fs::create_dir_all(&dir).unwrap();
+        let decoy = dir.join("x.trustedkeys.gpg");
+        std::fs::create_dir(&decoy).unwrap();
+        let result = ostrya_rt::block_on(async {
+            let repo = Repo::create(&root, CreateOptions::new(RepoMode::Archive))
+                .await
+                .unwrap();
+            repo.gpg_list_keys("../x").await
+        });
+        let decoy_stays = decoy.is_dir();
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(
+            matches!(&result, Err(Error::InvalidInput(m)) if m == "invalid remote name: ../x"),
+            "{:?}",
+            result.err()
+        );
+        assert!(decoy_stays, "the refused listing changed the decoy");
     }
 
     /// Returns `true` if the `gpg` binary runs.

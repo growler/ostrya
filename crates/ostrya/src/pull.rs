@@ -565,7 +565,9 @@ pub struct PullOptions {
     /// [`Repo::pull`] and [`Repo::pull_with_session`] refuse a name that
     /// [`valid_remote_name`](crate::config::valid_remote_name) refuses, with
     /// [`Error::InvalidInput`], before the first request. They refuse it also
-    /// under `MIRROR`.
+    /// under `MIRROR`. [`Repo::pull_local`] refuses such a name with the same
+    /// error, before it reads the source repository or a keyring. It refuses
+    /// it also under `no_ref_writes`.
     pub remote: Option<String>,
     /// The option to write no ref.
     ///
@@ -1626,6 +1628,10 @@ impl Repo {
     /// - [`Error::InvalidInput`] if [`depth`](PullOptions::depth) is below
     ///   `-1`, before the pull reads `src`.
     /// - [`Error::InvalidInput`] if
+    ///   [`valid_remote_name`](crate::config::valid_remote_name) refuses
+    ///   [`remote`](PullOptions::remote), before the pull reads `src` or a
+    ///   keyring of the remote.
+    /// - [`Error::InvalidInput`] if
     ///   [`static_deltas`](PullOptions::static_deltas) holds two digests for
     ///   one delta, or is set together with
     ///   [`disable_static_deltas`](PullOptions::disable_static_deltas), before
@@ -1724,6 +1730,7 @@ impl Repo {
             return Err(Error::Unsupported("a local pull takes no subpath".into()));
         }
         check_depth(opts.depth)?;
+        check_remote_option(&opts)?;
         check_static_deltas(&opts)?;
         let related = RelatedRule::of(self.config())?;
         let collection_relpaths = check_local_collection(&opts)?;
@@ -3527,7 +3534,8 @@ fn refuse_remote_collection(opts: &PullOptions) -> Result<()> {
 /// [`valid_remote_name`](crate::config::valid_remote_name) refuses.
 ///
 /// The name is the prefix of the written refs. A pull from a remote makes this
-/// check before its first request, also under [`MIRROR`](PullFlags::MIRROR).
+/// check before its first request, also under [`MIRROR`](PullFlags::MIRROR). A
+/// local pull makes this check before it reads the source or a keyring.
 fn check_remote_option(opts: &PullOptions) -> Result<()> {
     match opts.remote.as_deref() {
         Some(name) if !crate::config::valid_remote_name(name) => {

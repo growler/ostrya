@@ -3829,7 +3829,7 @@ port's own words. `--require-static-deltas` applies the delta the source's
 summary advertises, with the objects, the refs, and the statistics line of the
 tool, and refuses where the tool refuses (`cli-behavior.md`, "HTTP pull
 surface", "Static deltas over pull-local"). `--disable-static-deltas` changes
-nothing, since `pull-local` reads no delta by default. Nine differences stand:
+nothing, since `pull-local` reads no delta by default. Ten differences stand:
 
 - the verification keys of the remote. The port reads `gpg-verify`,
   `gpg-verify-summary`, `sign-verify`, `sign-verify-summary`, and `trust` of
@@ -3889,7 +3889,21 @@ nothing, since `pull-local` reads no delta by default. Nine differences stand:
   dependency, and a dependency with no delta fails the pull at exit 1 before
   it writes an object (`../format-reference.md`, "Static deltas of
   dependencies"). The tool imports no dependency (`cli-behavior.md`,
-  "Related commits in a pull").
+  "Related commits in a pull");
+- a `--remote=REMOTE` that is not a valid remote name, such as `../x`. The
+  port refuses it at exit 1 with `error: invalid input: invalid remote name:
+  REMOTE`, before it reads a ref or an object of the source. It reads no
+  keyring, and writes no object and no ref. The `ostree` 2026.1 tool copies
+  the objects of the commit into a staging directory under `tmp/` and writes
+  a `.commitpartial` marker under `state/`. It then refuses with `error:
+  Invalid refspec REMOTE:REF` at exit 1. It writes no object under
+  `objects/` and no ref, and leaves the staging directory and the marker.
+  With `--gpg-verify` over a signed commit, the tool refuses with `error:
+  Commit CHECKSUM: Remote "REMOTE" not found` at exit 1 when the config holds
+  no section of that name. When the config holds a section of that name, the
+  tool verifies the commit with `<repo>/REMOTE.trustedkeys.gpg`, so a name
+  such as `../x` reads a keyring outside the repository. The tool then
+  refuses the refspec.
 
 `sign` accepts the tool option set except `-d/--delete`, and adds
 `--gpg-homedir`, `--remote`, and the `gpg` engine. The `ostree` 2026.1 build
@@ -4245,7 +4259,7 @@ No matrix cell needs these. The shell suite invokes them.
 `remote` landed in Phase 17e: `add`, `delete`, `list`, `show-url`, `refs`,
 `summary`, `gpg-import`, and `gpg-list-keys`, with the option set the tool
 carries on each and the output formats `cli-behavior.md`, "`remote`",
-records. Twelve divergences stand:
+records. Thirteen divergences stand:
 
 - the tool's `remote` accepts no `--repo` of its own -- `ostree remote --repo=R
   list` reports `error: Unknown option --repo=R`, where the leading position
@@ -4577,6 +4591,19 @@ records. Twelve divergences stand:
   the key. The tool reports `error: GPG: Unable to export keys: GPGME: No data`
   at exit 1 and writes no keyring, which is also what it answers over a
   certificate whose self-signature does not verify;
+- a NAME of `remote gpg-import` or `remote gpg-list-keys` that is not a valid
+  remote name, such as `../x`, when the config holds a section of that name
+  that was written by hand. The tool writes the keyring of the import to
+  `<repo>/../x.trustedkeys.gpg`, outside the repository: it writes a
+  temporary file beside the repository and renames it. It reports `Imported
+  1 GPG key to remote "../x"` at exit 0. `remote gpg-list-keys` reads that
+  file and lists its keys at exit 0. A build of the port with the `gpg`
+  feature refuses both commands at exit 1 with `error: invalid input:
+  invalid remote name: ../x`, before it reads or writes the keyring of the
+  remote. `remote gpg-import` first reads and checks the offered keys. A
+  build without the `gpg` feature refuses both commands for each name.
+  `remote delete ../x` refuses the name in both, with `error: Invalid remote
+  name ../x` at exit 1, and removes no file;
 - `remote add` with `--sign-verify` and `--no-sign-verify` together. Not
   observed: the answer of the tool to the pair. The port refuses the pair with
   `error: Cannot specify both --sign-verify and --no-sign-verify` at exit 1,

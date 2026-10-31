@@ -43389,6 +43389,52 @@ fn pull_local_off_switches_need_a_remote() {
     );
 }
 
+/// `pull-local --remote=../x` refuses the remote name at exit 1, before it
+/// reads a ref or an object of the source. The destination gets no object
+/// and no ref. The ref of the name would be `refs/remotes/../x/<ref>`, which
+/// is `refs/x/<ref>`, so the destination also gets no `refs/x`.
+#[test]
+fn pull_local_refuses_an_invalid_remote_name() {
+    let tmp = TmpDir::new("pull-local-invalid-remote");
+    let base = tmp.path();
+    let src = trust_source(base, "src", false);
+    let dest_dir = base.join("dest");
+    std::fs::create_dir_all(&dest_dir).unwrap();
+    let dest = create_repo(&dest_dir, RepoMode::Archive);
+    let repo_arg = format!("--repo={}", dest.display());
+
+    let run = ostrya(
+        &[
+            "pull-local",
+            &repo_arg,
+            "--remote=../x",
+            src.to_str().unwrap(),
+            BRANCH,
+        ],
+        None,
+        &[],
+    );
+    assert_eq!(
+        run.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&run.stdout)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&run.stderr),
+        "error: invalid input: invalid remote name: ../x\n"
+    );
+    assert!(loose_objects(&dest).is_empty());
+    assert!(!dest.join("refs/x").exists());
+    for dir in ["refs/heads", "refs/remotes"] {
+        assert_eq!(
+            std::fs::read_dir(dest.join(dir)).unwrap().count(),
+            0,
+            "{dir}"
+        );
+    }
+}
+
 /// Asserts that a refused local pull left `dest` with no loose object, no local
 /// ref, and no ref of the remote `origin`.
 fn assert_nothing_pulled(dest: &Path, what: &str) {

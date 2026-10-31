@@ -1408,6 +1408,13 @@ Each configuration key selects one check:
   still accepts a commit of the imported key.
   - An entry that does not exist: `error: Commit <hex>: opendir(<entry>): No
     such file or directory`.
+  - The tool reads the raw value and decodes no escape sequence.
+    `gpgkeypath=<dir>/k\sspace.gpg` reads the file `k\sspace.gpg`, and
+    `gpgkeypath=\q` names the entry `\q`, which does not exist.
+  - An empty entry fails the pull at exit 1 with `opendir(): No such file or
+    directory`: `gpgkeypath=`, `gpgkeypath=;`, `gpgkeypath=;<k>`, and
+    `gpgkeypath=<k>;;<k>` are examples. One `;` at the end gives no entry:
+    `gpgkeypath=<k>;` accepts a commit of the key of `<k>`.
   - An entry that names a directory gives each regular file of the
     directory, with any name. `a.keyring`, the hidden `.a.gpg`, a file
     named `.gpg`, and an armored `a.asc` each give the key. The tool does
@@ -3923,7 +3930,8 @@ With the section, the command trusts the keys of these keyrings:
 
 - `<repo>/REMOTE.trustedkeys.gpg`.
 - Each entry of the `gpgkeypath` key of the remote. A `;` separates two
-  entries.
+  entries. The command reads the raw value, as a pull does ("Signature
+  verification during a pull", "The verification keys").
 - Each `*.gpg` file of the global trusted directory. `OSTREE_GPG_HOME` names
   this directory.
 
@@ -3957,6 +3965,15 @@ empty, unless a case states otherwise:
 - A `gpgkeypath` entry that does not exist gives the commit report on
   standard output with no `Found` line. Then the command writes `error:
   opendir(ENTRY): No such file or directory` at exit 1.
+- `gpgkeypath=<dir>/k\sspace.gpg`, with the keyring at the file
+  `k\sspace.gpg`, gives `Good signature from "<user id>"` at exit 0. The
+  command decodes no escape sequence. `gpgkeypath=\q` gives `error:
+  opendir(\q)` at exit 1.
+- An empty entry gives `error: opendir(): No such file or directory` at
+  exit 1: `gpgkeypath=`, `gpgkeypath=;`, `gpgkeypath=;<dir>/a.gpg`, and
+  `gpgkeypath=<dir>/a.gpg;;<dir>/a.gpg` are examples. One `;` at the end
+  gives no entry: `gpgkeypath=<dir>/a.gpg;` gives `Good signature from
+  "<user id>"` at exit 0.
 - `OSTREE_GPG_HOME` that names a directory that holds `a.gpg`, and a section
   with no `gpgkeypath`, give `Good signature from "<user id>"` at exit 0.
   The same directory that holds only `a.keyring` gives `Can't check

@@ -214,7 +214,8 @@ impl ReceivePolicies {
     ///   - a key has no effect
     ///   - a trust group turns on no signature verification
     ///   - a trust group names an engine other than `ed25519` or `spki`, or
-    ///     sets `gpg-verify=true` and its `gpgkeypath` names no keyring
+    ///     sets `gpg-verify=true` and its `gpgkeypath` names no keyring or
+    ///     holds an empty entry
     ///   - a key group has no `type`, an unknown `type`, the type `dummy`, or
     ///     no value for a required key.
     /// - [`Error::Unsupported`](crate::Error::Unsupported) if a group names a

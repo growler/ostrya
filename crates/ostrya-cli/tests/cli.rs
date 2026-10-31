@@ -17255,6 +17255,11 @@ fn show_port_and_tool(args: &[&str], tool: bool) -> Vec<(&'static str, Run)> {
 ///   message.
 /// - An entry that does not exist gives the commit report and then a refusal
 ///   at exit 1 in both commands. The wording of the refusal parts the two.
+/// - Each command reads the value with no escape decoding: the entry
+///   `k\sspace.gpg` names the file with that name, and the signature
+///   verifies.
+/// - An empty entry, as in `;<keyring>`, gives a refusal at exit 1 in both
+///   commands.
 #[cfg(feature = "gpg")]
 #[test]
 fn show_gpg_verify_remote_reads_gpgkeypath() {
@@ -17354,6 +17359,50 @@ fn show_gpg_verify_remote_reads_gpgkeypath() {
                 "error: opendir({}): No such file or directory\n",
                 entry.display()
             )
+        };
+        assert_eq!(String::from_utf8_lossy(&run.stderr), refusal, "{label}");
+    }
+
+    let config = repo.join("config");
+    let set_keypath = |value: &str| {
+        let text = std::fs::read_to_string(&config).unwrap();
+        let text: String = text
+            .lines()
+            .map(|line| {
+                if line.starts_with("gpgkeypath=") {
+                    format!("gpgkeypath={value}\n")
+                } else {
+                    format!("{line}\n")
+                }
+            })
+            .collect();
+        std::fs::write(&config, text).unwrap();
+    };
+
+    let backslash = base.join(r"k\sspace.gpg");
+    std::fs::copy(&keyring, &backslash).unwrap();
+    set_keypath(&backslash.display().to_string());
+    for (label, run) in show_port_and_tool(&args, tool) {
+        let report = run.ok().stdout_trimmed();
+        assert!(
+            report.contains(&good),
+            "{label}, a file name with a `\\s`:\n{report}"
+        );
+    }
+
+    set_keypath(&format!(";{}", keyring.display()));
+    for (label, run) in show_port_and_tool(&args, tool) {
+        let stdout = String::from_utf8_lossy(&run.stdout);
+        assert_eq!(run.status.code(), Some(1), "{label}:\n{stdout}");
+        assert!(
+            stdout.starts_with(&format!("commit {commit}\n")) && !stdout.contains("Found"),
+            "{label}:\n{stdout}"
+        );
+        let refusal = if label == "the port" {
+            "error: signature: gpgkeypath entry '' cannot be read: \
+             No such file or directory (os error 2)\n"
+        } else {
+            "error: opendir(): No such file or directory\n"
         };
         assert_eq!(String::from_utf8_lossy(&run.stderr), refusal, "{label}");
     }

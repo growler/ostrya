@@ -836,7 +836,7 @@ fn a_remote_key_is_not_a_trust_group_key() {
 /// engine refuses the axis.
 #[test]
 fn a_trust_group_gpg_axis_needs_a_keypath() {
-    let err = refusal("[ex-ostrya trust \"t\"]\ngpg-verify=true\ngpgkeypath=;\n");
+    let err = refusal("[ex-ostrya trust \"t\"]\ngpg-verify=true\n");
     #[cfg(feature = "verify-gpg")]
     assert!(
         matches!(&err, Error::InvalidFormat(m) if m.contains("gpgkeypath names no keyring")),
@@ -844,6 +844,23 @@ fn a_trust_group_gpg_axis_needs_a_keypath() {
     );
     #[cfg(not(feature = "verify-gpg"))]
     assert!(matches!(err, Error::Unsupported(_)), "{err}");
+}
+
+/// The load of a trust group refuses a `gpgkeypath` value that holds an empty
+/// entry. One `;` at the end of the value gives no entry.
+#[cfg(feature = "verify-gpg")]
+#[test]
+fn a_trust_group_gpgkeypath_refuses_an_empty_entry() {
+    for value in ["", ";", ";/k.gpg", "/k.gpg;;/k.gpg", "/k.gpg;;"] {
+        let err = refusal(&format!(
+            "[ex-ostrya trust \"t\"]\ngpg-verify=true\ngpgkeypath={value}\n"
+        ));
+        assert!(
+            matches!(&err, Error::InvalidFormat(m)
+                if m == "[ex-ostrya trust \"t\"] gpgkeypath holds an empty entry"),
+            "gpgkeypath={value}: {err}"
+        );
+    }
 }
 
 /// `from_config` refuses a `gpgkeypath` entry that names nothing, and the

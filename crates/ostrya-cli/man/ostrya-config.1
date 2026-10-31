@@ -202,13 +202,17 @@ A pull checks the GPG signature of the summary in \fB\%summary.sig\fR.
 .TP
 \fB\%gpgkeypath\fR (list)
 More keyring files, or directories of keyring files, that \fB\%gpg\-verify\fR trusts.
+A \fB\%;\fR separates the entries.
+ostrya reads the raw value and decodes no escape sequence, so \fB\%k\esspace.gpg\fR names the file with that name.
+One \fB\%;\fR at the end of the value gives no entry.
+Each other empty entry fails the pull, and so does an empty value.
 ostrya reads each regular file of a directory as a keyring, with any name.
 It does not read a subdirectory or a symlink of the directory.
 ostrya skips a file that does not hold the bytes \fB\%\-\-\-\-\-BEGIN PGP\fR and that is a GnuPG keybox or is not a whole OpenPGP packet stream, and the file adds no key.
 An entry that does not exist fails the pull.
 Each other file that ostrya cannot read whole as a keyring also fails the pull.
 Examples are a file that ostrya cannot open, a file larger than 4 MiB, a keyring with more than 256 certificates, armor that does not decode to a keyring, and a packet stream that the parser refuses.
-\fB\%ostrya show \-\-gpg\-verify\-remote=NAME\fR also trusts these entries, and an entry that does not exist fails its signature report.
+\fB\%ostrya show \-\-gpg\-verify\-remote=NAME\fR also trusts these entries, and an entry that does not exist or is empty fails its signature report.
 .TP
 \fB\%sign\-verify\fR (boolean or list, default false)
 A pull checks the signatures of its commits with the signature engines.
@@ -808,6 +812,9 @@ A \fB\%verification\-ENGINE\-file\fR holds base64 lines for \fB\%ed25519\fR, and
 It trusts the keys that it names, and no system key store or keyring.
 A trust group that turns on no check is refused.
 \fB\%gpgkeypath\fR without \fB\%gpg\-verify=true\fR is refused, and so is \fB\%gpg\-verify=true\fR with no \fB\%gpgkeypath\fR.
+ostrya reads \fB\%gpgkeypath\fR as it reads the remote key: it reads the raw value, decodes no escape sequence, and splits the value at each \fB\%;\fR.
+One \fB\%;\fR at the end of the value gives no entry.
+Each other empty entry of \fB\%gpgkeypath\fR is refused when the config is read, and so is an empty value.
 An entry of \fB\%gpgkeypath\fR that names neither a file nor a directory is refused, and so are keyrings that hold no certificate.
 A \fB\%verification\-ENGINE\-key\fR or \fB\%verification\-ENGINE\-file\fR key of an engine that \fB\%sign\-verify\fR does not select is refused.
 \fB\%gpg\-verify\-summary\fR and \fB\%sign\-verify\-summary\fR are refused, because a trust group sets a commit policy alone.

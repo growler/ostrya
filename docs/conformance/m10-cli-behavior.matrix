@@ -5022,7 +5022,8 @@ loss: the refusal of a `gpgkeypath` entry that does not exist parts the
  wording: the tool writes `error: opendir(ENTRY): No such file or directory`,
  and the port writes `error: signature: gpgkeypath entry 'ENTRY' cannot be
  read: No such file or directory (os error 2)`. Both exit 1 after the commit
- report (`cli-surface.md`, "P1", states it).
+ report (`cli-surface.md`, "P1", states it). An empty entry, as in
+ `;<keyring>`, takes the same outcome, and the tool writes `opendir()`.
 evidence: ostrya_cli::cli::show_gpg_verify_remote_reads_gpgkeypath
 spec: cli-behavior.md#show format-reference.md#gpg
 note: a signed commit needs a generated key, which no setup binds. The port
@@ -5033,8 +5034,10 @@ note: a signed commit needs a generated key, which no setup binds. The port
  names a directory that holds the keyring as `k.gpg`, as `k.keyring`, or
  armored as `k.asc`, give `Good signature from "<user id>"` at exit 0 in
  both. A directory that holds a text file `README` alone gives `Can't check
- signature: public key not found` at exit 0 in both. The cited test also
- states the difference the outcome names.
+ signature: public key not found` at exit 0 in both. Both read the value
+ with no escape decoding: an entry that names the keyring file
+ `k\sspace.gpg` gives `Good signature from "<user id>"` at exit 0 in both.
+ The cited test also states the difference the outcome names.
 
 family: M10
 subcommand: show

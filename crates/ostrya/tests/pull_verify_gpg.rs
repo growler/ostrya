@@ -544,9 +544,11 @@ fn a_symlinked_repository_keyring_is_followed() {
 }
 
 /// `gpgkeypath` adds keyrings to the trusted set, as a file or as a directory.
+/// The value is read with no escape decoding, so `k\sspace.gpg` names the file
+/// with that name. One `;` at the end of the value gives no entry.
 ///
-/// If an entry names no file and no directory, the pull fails. The trusted
-/// set does not silently become smaller.
+/// If an entry names no file and no directory, the pull fails. An empty entry
+/// names no file. The trusted set does not silently become smaller.
 #[test]
 fn gpgkeypath_adds_keyrings_and_a_missing_entry_fails() {
     if !gpg_available() {
@@ -570,10 +572,14 @@ fn gpgkeypath_adds_keyrings_and_a_missing_entry_fails() {
         // The directory scan reads this file too. It is not an OpenPGP
         // keyring, so the load skips it and the pull does not fail.
         std::fs::write(keydir.join("notes.txt"), b"not a keyring\n").unwrap();
+        let backslash = base.join(r"k\sspace.gpg");
+        signer_home.export_to(&backslash);
 
         for (name, entry) in [
             ("dst-file", keyring.display().to_string()),
             ("dst-dir", keydir.display().to_string()),
+            ("dst-backslash", backslash.display().to_string()),
+            ("dst-trailing", format!("{};", keyring.display())),
         ] {
             let (_path, dst) = dest_with_remote(base, name, &format!("gpgkeypath={entry}\n")).await;
             gpg_pull(&dst, &src).await.unwrap();
@@ -597,6 +603,20 @@ fn gpgkeypath_adds_keyrings_and_a_missing_entry_fails() {
         let err = gpg_pull(&dst, &src).await.unwrap_err();
         assert!(
             matches!(&err, Error::Signature(m) if m.contains("cannot be read")),
+            "{err}"
+        );
+        assert!(dst.list_refs(None).await.unwrap().is_empty());
+
+        let (_path, dst) = dest_with_remote(
+            base,
+            "dst-empty-entry",
+            &format!("gpgkeypath=;{}\n", keyring.display()),
+        )
+        .await;
+        let err = gpg_pull(&dst, &src).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m)
+                if m.starts_with("gpgkeypath entry '' cannot be read: ")),
             "{err}"
         );
         assert!(dst.list_refs(None).await.unwrap().is_empty());

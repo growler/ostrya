@@ -759,6 +759,21 @@ pub(crate) mod tests {
         );
     }
 
+    /// An empty `gpgkeypath` entry names no file, so the read refuses it.
+    /// The refusal names the configuration key and the empty entry.
+    #[test]
+    fn an_empty_keypath_entry_is_refused() {
+        let result = keypath_files("gpgkeypath", &[String::new()]);
+        assert!(
+            matches!(
+                &result,
+                Err(Error::Signature(m)) if m.starts_with("gpgkeypath entry '' cannot be read: ")
+            ),
+            "{:?}",
+            result.err()
+        );
+    }
+
     /// A keyring load refuses a remote name that [`valid_remote_name`]
     /// refuses, before it reads a keyring. A directory is at the path that
     /// the join of the name to the repository reaches, so a read of that

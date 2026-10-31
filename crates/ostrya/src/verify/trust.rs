@@ -459,12 +459,15 @@ pub(crate) fn check_trust(keyfile: &KeyFile, group: &str) -> Result<()> {
                  for; build with the verify-gpg feature"
             )));
         }
-        if Remote::view(keyfile, group.to_owned())
-            .gpgkeypath()?
-            .is_empty()
-        {
+        let keypath = Remote::view(keyfile, group.to_owned()).gpgkeypath()?;
+        if keypath.is_empty() {
             return Err(Error::InvalidFormat(format!(
                 "[{group}] sets gpg-verify=true, and gpgkeypath names no keyring"
+            )));
+        }
+        if keypath.iter().any(String::is_empty) {
+            return Err(Error::InvalidFormat(format!(
+                "[{group}] gpgkeypath holds an empty entry"
             )));
         }
     }

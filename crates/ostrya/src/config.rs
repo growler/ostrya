@@ -766,27 +766,32 @@ impl Remote<'_> {
     /// Returns the `gpgkeypath` entries: more trusted GPG keyrings.
     ///
     /// The remote also trusts the keyring `<remote>.trustedkeys.gpg` of the
-    /// repository and the system trusted set. A `;` separates the entries, and
-    /// the list skips an empty entry. Each entry is a keyring file or a
-    /// directory of keyring files. The GPG verifier reads each regular file of
-    /// a directory. It skips a file that does not hold the bytes
-    /// `-----BEGIN PGP` and that is a GnuPG keybox or is not a whole OpenPGP
-    /// packet stream. It refuses each other file that it cannot read whole as
-    /// a keyring.
+    /// repository and the system trusted set. The call reads the raw value of
+    /// the key and does not decode the escape sequences of the key file, so
+    /// `\s` is two characters of a path. A `;` separates the entries. The call
+    /// removes one empty entry at the end of the list and keeps each other
+    /// empty entry, so an empty value gives one empty entry. If the key is
+    /// absent, the list is empty.
+    ///
+    /// Each entry is a keyring file or a directory of keyring files. The GPG
+    /// verifier refuses an empty entry, because it cannot read it. It reads
+    /// each regular file of a directory. It skips a file that does not hold
+    /// the bytes `-----BEGIN PGP` and that is a GnuPG keybox or is not a whole
+    /// OpenPGP packet stream. It refuses each other file that it cannot read
+    /// whole as a keyring.
     ///
     /// # Errors
     ///
-    /// [`Error::Core`] if the value holds a malformed escape sequence.
+    /// The call gives no error.
     pub fn gpgkeypath(&self) -> Result<Vec<String>> {
-        Ok(self
-            .string("gpgkeypath")?
-            .map(|raw| {
-                raw.split(';')
-                    .filter(|entry| !entry.is_empty())
-                    .map(str::to_owned)
-                    .collect()
-            })
-            .unwrap_or_default())
+        let Some(raw) = self.get("gpgkeypath") else {
+            return Ok(Vec::new());
+        };
+        let mut entries: Vec<String> = raw.split(';').map(str::to_owned).collect();
+        if entries.len() > 1 && entries.last().is_some_and(String::is_empty) {
+            entries.pop();
+        }
+        Ok(entries)
     }
 
     /// Returns the sign-api engines that verify the commits of this remote.
@@ -1524,6 +1529,35 @@ mod tests {
         assert_eq!(bare.sign_verify().unwrap(), SignVerify::Off);
         assert_eq!(bare.sign_verify_summary().unwrap(), SignVerify::Off);
         assert!(bare.gpgkeypath().unwrap().is_empty());
+    }
+
+    /// `gpgkeypath` is the raw value split on `;`: no escape is decoded, one
+    /// empty entry at the end is removed, and each other empty entry stays.
+    #[test]
+    fn gpgkeypath_splits_the_raw_value() {
+        let cases: &[(&str, &[&str])] = &[
+            (r"k\sspace.gpg", &[r"k\sspace.gpg"]),
+            (r"\q", &[r"\q"]),
+            ("", &[""]),
+            (";", &[""]),
+            (";a", &["", "a"]),
+            ("a;;b", &["a", "", "b"]),
+            ("a;", &["a"]),
+            ("a;;", &["a", ""]),
+            ("a;b", &["a", "b"]),
+        ];
+        for (value, want) in cases {
+            let text = format!(
+                "[core]\nrepo_version=1\nmode=bare\n\n\
+                 [remote \"r\"]\nurl=http://ex/r\ngpgkeypath={value}\n"
+            );
+            let cfg = RepoConfig::parse(&text).unwrap();
+            assert_eq!(
+                cfg.remote("r").unwrap().gpgkeypath().unwrap(),
+                *want,
+                "gpgkeypath={value}"
+            );
+        }
     }
 
     /// `sign-verify` is a boolean or a list of engine names, split on `,` and

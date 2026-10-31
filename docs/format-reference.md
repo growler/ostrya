@@ -1216,6 +1216,9 @@ Observed behavior: the tool reads and writes `config` by these rules.
   min-free-space-size '1MB '`. The port refuses the same value.
 - The reader unescapes a string value. `\s` becomes a space, `\n` a newline,
   `\t` a tab, `\r` a carriage return, `\\` a backslash, and `\;` a `;`.
+  The `gpgkeypath` key of a remote is an exception: the reader takes its raw
+  value and decodes no escape sequence (see "GPG"). The port reads the
+  `gpgkeypath` key of an `[ex-ostrya trust "NAME"]` group by the same rule.
 - The writer escapes a backslash as `\\`, a newline as `\n`, and a carriage
   return as `\r` anywhere in a string value. In the leading run of white space,
   it writes each space as `\s` and each tab as `\t`. It writes a space or tab
@@ -2254,7 +2257,13 @@ trusted-keyring directory is trusted for all remotes. That directory is
 `<datadir>/ostree/trusted.gpg.d/` (`/usr/share/ostree/trusted.gpg.d/`). The
 `OSTREE_GPG_HOME` environment variable replaces it with the directory that it
 names. The remote also trusts each keyring that the `gpgkeypath` key of its
-config section names. A `gpgkeypath` entry is a keyring file or a directory.
+config section names. The reader takes the raw value of the key and decodes
+no escape sequence, so `k\sspace.gpg` names the file with that name. A `;`
+separates the entries. The reader removes one empty entry at the end of the
+value and keeps each other empty entry. An empty entry names no file, so it
+fails the read: `gpgkeypath=`, `gpgkeypath=;`, `gpgkeypath=;<k>`, and
+`gpgkeypath=<k>;;<k>` fail, and `gpgkeypath=<k>;` reads `<k>`. A
+`gpgkeypath` entry is a keyring file or a directory.
 The remote trusts each regular file of the directory, with any name. The read
 skips a file that does not hold the bytes `-----BEGIN PGP` and that is a GnuPG
 keybox or is not a whole OpenPGP packet stream. Each other file that the read

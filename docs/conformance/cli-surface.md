@@ -471,10 +471,13 @@ deliberately not reproduced:
   repository. Both commands check the remote only for a commit that carries
   a GPG signature;
 - a `gpgkeypath` entry of the `--gpg-verify-remote` remote that does not
-  exist parts the wording. Both commands print the commit report and then
-  exit 1. The tool writes `error: opendir(ENTRY): No such file or
-  directory`. The port writes `error: signature: gpgkeypath entry 'ENTRY'
-  cannot be read: No such file or directory (os error 2)`;
+  exist parts the wording. An empty entry, as in `gpgkeypath=;<k>`, is such
+  an entry. So is `\q`: both commands read the value with no escape
+  decoding. Both commands print the commit report and then exit 1. The
+  tool writes `error: opendir(ENTRY): No such file or directory`, and
+  `error: opendir(): No such file or directory` for an empty entry. The
+  port writes `error: signature: gpgkeypath entry 'ENTRY' cannot be read: No
+  such file or directory (os error 2)`;
 - a `gpgkeypath` file over 4 MiB, or with more than 256 certificates, parts
   the two. The port refuses the file by its path, and the report exits 1
   after the commit report. Two `gpgkeypath` directories give `Good signature

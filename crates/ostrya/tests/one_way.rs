@@ -1,5 +1,6 @@
-//! Tests of `Repo::receive_stream`: one one-way stream into one transaction,
-//! and the refusal of a one-way `Hello` by the two-way receiver.
+//! Tests of `Repo::receive_stream` and `Repo::receive_stream_to_commit`: one
+//! one-way stream into one transaction, and the refusal of a one-way `Hello`
+//! by the two-way receiver.
 //!
 //! The tests write each stream by hand with the frame codec of
 //! `ostrya::remote::proto`. A stream carries the objects of the golden fixture
@@ -257,6 +258,14 @@ fn receive(repo: &Repo, policy: &StreamPolicy, bytes: &[u8]) -> ostrya::Result<R
     block_on(repo.receive_stream(bytes, policy))
 }
 
+fn receive_to_commit(
+    repo: &Repo,
+    policy: &StreamPolicy,
+    bytes: &[u8],
+) -> ostrya::Result<ReceiveReport> {
+    block_on(repo.receive_stream_to_commit(bytes, policy))
+}
+
 fn assert_protocol(result: ostrya::Result<ReceiveReport>) {
     assert!(
         matches!(result, Err(Error::Remote(remote::Error::Protocol(_)))),
@@ -334,6 +343,51 @@ fn a_stream_commits_the_fixture_commit() {
             tool_fsck(repo.path());
         }
     }
+}
+
+/// The longest time that `receive_stream_to_commit` can take for the stream
+/// of the fixture commit on an open pipe.
+const LIMIT: Duration = Duration::from_secs(30);
+
+/// `receive_stream_to_commit` commits the stream of the fixture commit on a
+/// pipe that stays open after `Commit`. The call returns before the writer
+/// closes the pipe, in less than [`LIMIT`].
+#[test]
+fn a_stream_to_commit_commits_on_an_open_pipe() {
+    let tmp = TmpDir::new("one-way-to-commit");
+    let repo = new_repo(&tmp, RepoMode::BareUser, "");
+    let policy = policy();
+    let bytes = fixture_stream(Encoding::Raw).bytes();
+    let (mut writer, reader) = pipe(PIPE_CAP);
+    let (result, ()) = block_on(futures_lite::future::or(
+        futures_lite::future::zip(repo.receive_stream_to_commit(reader, &policy), async {
+            // The block borrows the writer, so the pipe stays open.
+            writer.write_all(&bytes).await.unwrap();
+        }),
+        async {
+            ostrya_rt::Timer::after(LIMIT).await;
+            panic!("the stream to Commit took longer than {LIMIT:?}");
+        },
+    ));
+    drop(writer);
+    let report = result.unwrap();
+    let outcome = |name: &str| RefOutcome {
+        name: name.into(),
+        old: None,
+        new: Some(fixture_commit()),
+    };
+    assert_eq!(
+        report.refs,
+        vec![outcome("test/main"), outcome("origin:test/main")]
+    );
+    let line = format!("{COMMIT}\n").into_bytes();
+    assert_eq!(
+        file_inventory(repo.path(), "refs"),
+        vec![
+            ("refs/heads/test/main".to_owned(), line.clone()),
+            ("refs/remotes/origin/test/main".to_owned(), line),
+        ]
+    );
 }
 
 /// The one-way receiver accepts a repository with `[core] locking=false`,
@@ -543,6 +597,48 @@ fn bytes_after_commit_are_protocol() {
     }
 }
 
+/// The size of the read buffer of the receiver of a one-way stream.
+const READ_BUFFER: usize = 64 * 1024;
+
+/// `receive_stream_to_commit` ignores the bytes after `Commit`, and the
+/// stream commits. The tails are one byte, a whole frame, a part of a frame
+/// length, and a frame length over the limit. The input is shorter than
+/// [`READ_BUFFER`], so the tail comes in the same read as `Commit`.
+#[test]
+fn bytes_after_commit_are_ignored_by_a_stream_to_commit() {
+    let policy = policy();
+    let stream = fixture_stream(Encoding::Raw).bytes();
+    let objects_end = [0, 0, 0, 1, 6];
+    let outcome = |name: &str| RefOutcome {
+        name: name.into(),
+        old: None,
+        new: Some(fixture_commit()),
+    };
+    for tail in [
+        &[0][..],
+        &objects_end[..],
+        &[0, 0][..],
+        &[0xff, 0xff, 0xff, 0xff][..],
+    ] {
+        let tmp = TmpDir::new("one-way-to-commit-trailing");
+        let repo = new_repo(&tmp, RepoMode::BareUser, "");
+        let mut bytes = stream.clone();
+        bytes.extend_from_slice(tail);
+        assert!(bytes.len() < READ_BUFFER, "{} bytes", bytes.len());
+        let report = receive_to_commit(&repo, &policy, &bytes)
+            .unwrap_or_else(|e| panic!("{tail:?}: the stream failed: {e}"));
+        assert_eq!(
+            report.refs,
+            vec![outcome("test/main"), outcome("origin:test/main")],
+            "{tail:?}"
+        );
+        assert!(
+            repo.path().join("refs/heads/test/main").exists(),
+            "{tail:?}"
+        );
+    }
+}
+
 /// If the sender abandons an object with the abandon marker and `Abort`, the
 /// stream ends with `Aborted`. If another frame follows the marker, the
 /// stream is `protocol`. Nothing is published.
@@ -622,12 +718,15 @@ fn a_server_commit_is_protocol() {
 
 /// If a stream ends before `Commit` is complete, the result is an end of
 /// file, and nothing is published. The test cuts the stream of each encoding
-/// at these positions:
+/// at these positions, and gives each cut to `receive_stream`:
 ///
 /// - at each frame or chunk boundary
 /// - one byte after a boundary
 /// - one byte before a boundary
 /// - at offset 0, which gives the empty stream
+///
+/// The test also gives `receive_stream_to_commit` the stream of each encoding
+/// with no last byte, which cuts the `Commit` frame.
 #[test]
 fn a_cut_stream_is_an_end_of_file() {
     let tmp = TmpDir::new("one-way-cut");
@@ -651,6 +750,15 @@ fn a_cut_stream_is_an_end_of_file() {
             }
             assert_nothing_published(&repo, &before);
         }
+        let cut = bytes.len() - 1;
+        match receive_to_commit(&repo, &policy, &bytes[..cut]) {
+            Err(Error::Io(e)) if e.kind() == io::ErrorKind::UnexpectedEof => {}
+            other => panic!(
+                "receive_stream_to_commit: {encoding:?}: a cut at {cut} of {}: {other:?}",
+                bytes.len()
+            ),
+        }
+        assert_nothing_published(&repo, &before);
     }
 }
 

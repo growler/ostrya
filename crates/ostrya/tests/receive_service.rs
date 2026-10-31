@@ -879,10 +879,11 @@ fn the_service_is_send_and_sync() {
     assert_send_sync::<ReceiveService>();
 }
 
-/// The futures of `commit`, `Repo::receive`, and `Repo::receive_stream` stay
-/// small. The future of the checks and of the commit of a session is boxed,
-/// and so are the publication step and the commit of a server commit. So the
-/// guard measures the rest of each future.
+/// The futures of `commit`, `Repo::receive`, `Repo::receive_stream`, and
+/// `Repo::receive_stream_to_commit` stay small. The future of the checks and
+/// of the commit of a session is boxed, and so are the publication step and
+/// the commit of a server commit. So the guard measures the rest of each
+/// future.
 #[test]
 fn the_receive_futures_are_small() {
     let tmp = TmpDir::new("future-sizes");
@@ -897,11 +898,21 @@ fn the_receive_futures_are_small() {
     let stream_policy = ostrya::StreamPolicy::default();
     let stream =
         std::mem::size_of_val(&repo.receive_stream(futures_lite::io::empty(), &stream_policy));
-    eprintln!("commit {commit}, receive {receive}, receive_stream {stream} bytes");
+    let to_commit = std::mem::size_of_val(
+        &repo.receive_stream_to_commit(futures_lite::io::empty(), &stream_policy),
+    );
+    eprintln!(
+        "commit {commit}, receive {receive}, receive_stream {stream}, \
+         receive_stream_to_commit {to_commit} bytes"
+    );
     assert!(commit <= 4096, "the commit future is {commit} bytes");
     assert!(receive <= 6144, "the receive future is {receive} bytes");
     assert!(
         stream <= 5120,
         "the receive_stream future is {stream} bytes"
+    );
+    assert!(
+        to_commit <= 5120,
+        "the receive_stream_to_commit future is {to_commit} bytes"
     );
 }

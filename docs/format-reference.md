@@ -4456,9 +4456,17 @@ The server sends no message. The stream holds these parts, in this order:
 - a first message other than a `Hello` with `one-way` true;
 - a `Have`, and each other message out of this order;
 - an `Abort` frame between two objects;
-- a byte after `Commit`;
+- a byte after `Commit`, unless the server stops at `Commit`;
 - an update whose state is 1, an update with no `new`, and a `Commit` with
   `server-commit`. The server refuses them when it reads `Commit`.
+
+A server can stop at `Commit`. This mode is for a channel that gives no end
+of the input, for example a virtio-serial port. In this mode, the server
+starts no read after the `Commit` frame. A read that completes the `Commit`
+frame can also get bytes after the frame. The server discards these bytes
+with no check. The bytes of the stream do not change. In ostrya,
+`Repo::receive_stream_to_commit` stops at `Commit`, and
+`Repo::receive_stream` reads to the end of the input.
 
 If a client cannot complete an object, it sends the abandon marker and then
 `Abort` ("Abort, abandon, and end of input"). The server then ends the session
@@ -4484,9 +4492,10 @@ repository lock, and `Commit` still takes the update lock ("The update lock").
 
 The size check of `CommitReply` (check 2 of "Commit and CommitReply")
 applies. The server runs the other `Commit` checks after the end of the
-input. Check 6 checks the dependencies of the staged commits as in a push
-session. A one-way stream adds no server signature, writes no anchor commit,
-and does not regenerate the summary. It calls no hook of a host application.
+input, or at `Commit` if it stops at `Commit`. Check 6 checks the
+dependencies of the staged commits as in a push session. A one-way stream
+adds no server signature, writes no anchor commit, and does not regenerate
+the summary. It calls no hook of a host application.
 
 A one-way stream keeps rules of its own, and a client group does not apply to
 it. A host application gives the rules in code. Each rule has a pattern with

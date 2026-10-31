@@ -250,10 +250,11 @@ impl ReceiveService {
     ///
     /// The call is sync, does no I/O, and reads no policy.
     /// [`hello`](Self::hello),
-    /// [`Repo::receive`](crate::Repo::receive), and
-    /// [`Repo::receive_stream`](crate::Repo::receive_stream) run the same
-    /// checks. The call does not refuse a `Hello` with `one-way` true, which
-    /// [`hello`](Self::hello) refuses.
+    /// [`Repo::receive`](crate::Repo::receive),
+    /// [`Repo::receive_stream`](crate::Repo::receive_stream), and
+    /// [`Repo::receive_stream_to_commit`](crate::Repo::receive_stream_to_commit)
+    /// run the same checks. The call does not refuse a `Hello` with `one-way`
+    /// true, which [`hello`](Self::hello) refuses.
     ///
     /// A `Hello` that passes can still fail to open. These steps of the open
     /// come after the checks:

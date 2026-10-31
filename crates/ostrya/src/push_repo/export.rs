@@ -38,9 +38,10 @@ impl Repo {
     /// Writes the commits that `opts.updates` name to `output` as a one-way stream.
     ///
     /// A one-way stream goes over a channel that carries data in one
-    /// direction. On the other side, `Repo::receive_stream` of the `receive`
-    /// feature reads it. The stream ends with the `Commit` frame, which
-    /// carries the updates of `opts.updates`.
+    /// direction. On the other side, `Repo::receive_stream` or
+    /// `Repo::receive_stream_to_commit` of the `receive` feature reads it.
+    /// The stream ends with the `Commit` frame, which carries the updates of
+    /// `opts.updates`.
     ///
     /// The call returns the [`PushStats`] of the stream. The statistics count
     /// each object of the stream as offered and as needed.

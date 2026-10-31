@@ -6,8 +6,9 @@ use super::{ReceivePattern, ReceiveVerify, ServerSigner};
 
 /// The rules that decide what a one-way stream accepts.
 ///
-/// [`Repo::receive_stream`](crate::Repo::receive_stream) takes this policy.
-/// A caller builds it in code. The rules select a ref by a
+/// [`Repo::receive_stream`](crate::Repo::receive_stream) and
+/// [`Repo::receive_stream_to_commit`](crate::Repo::receive_stream_to_commit)
+/// take this policy. A caller builds it in code. The rules select a ref by a
 /// [`ReceivePattern`], and they can accept a remote ref. A client group of
 /// the config does not apply to a one-way stream.
 ///

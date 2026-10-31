@@ -1,5 +1,6 @@
 //! The one-way stream of a push: the messages of a session in one direction,
-//! with no reply. [`Repo::receive_stream`] reads it.
+//! with no reply. [`Repo::receive_stream`] and
+//! [`Repo::receive_stream_to_commit`] read it.
 
 use futures_io::AsyncRead;
 use futures_lite::io::{AsyncBufReadExt, BufReader};
@@ -24,6 +25,9 @@ impl Repo {
     /// 2. Zero or more object streams, each one closed by `ObjectsEnd`.
     /// 3. One `Commit`.
     /// 4. The end of `input`.
+    ///
+    /// [`Repo::receive_stream_to_commit`] reads the same stream, and stops at
+    /// `Commit`.
     ///
     /// # Hello
     ///
@@ -71,7 +75,8 @@ impl Repo {
     ///   `protocol`. A ref update with no new commit, and a server commit,
     ///   are also `protocol`.
     /// - The commit checks run only after `input` reaches its end. A byte
-    ///   after `Commit` is `protocol`.
+    ///   after `Commit` is `protocol`. [`Repo::receive_stream_to_commit`]
+    ///   runs them at `Commit`, and starts no read of `input` after it.
     ///
     /// The reply limit of the two-way session also applies to the ref updates
     /// of `Commit`.
@@ -126,12 +131,62 @@ impl Repo {
         let reader = FrameReader::new(BufReader::with_capacity(STREAM_BUFFER, input));
         // A failure drops the transaction here, which removes its staging
         // directory and releases the repository lock.
-        run(self, policy, reader)
+        run(self, policy, reader, AfterCommit::CheckEnd)
             .await
-            .map_err(|failure| match failure {
-                Failure::Wire(e) => Error::Remote(e),
-                Failure::Internal(e) | Failure::Silent(e) => e,
-            })
+            .map_err(stream_error)
+    }
+
+    /// Reads one one-way stream from `input` into one transaction, and stops
+    /// at `Commit`.
+    ///
+    /// The call reads the stream as [`Repo::receive_stream`] does, with one
+    /// difference. It runs the commit checks when it has read the `Commit`
+    /// frame, and starts no read of `input` after that frame. A byte after
+    /// `Commit` is not `protocol`.
+    ///
+    /// The call reads `input` through a buffer, and a read of `input` returns
+    /// the bytes that are ready. A read that completes the `Commit` frame can
+    /// also get bytes after the frame. The call discards these bytes with no
+    /// check, and a later reader of `input` does not get them.
+    ///
+    /// Use this call on a channel that gives no end of input, for example a
+    /// virtio-serial port. On such a channel, [`Repo::receive_stream`] waits
+    /// until the writer closes the channel or writes one more byte.
+    ///
+    /// # Errors
+    ///
+    /// The errors of [`Repo::receive_stream`], with one difference: a byte
+    /// after `Commit` is not an error. These include [`Error::Io`] of kind
+    /// `UnexpectedEof` if `input` ends before `Commit` is complete.
+    pub async fn receive_stream_to_commit<R>(
+        &self,
+        input: R,
+        policy: &StreamPolicy,
+    ) -> Result<ReceiveReport>
+    where
+        R: AsyncRead + Unpin + Send,
+    {
+        let reader = FrameReader::new(BufReader::with_capacity(STREAM_BUFFER, input));
+        run(self, policy, reader, AfterCommit::Stop)
+            .await
+            .map_err(stream_error)
+    }
+}
+
+/// What the receive does with `input` after the `Commit` frame.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AfterCommit {
+    /// Read to the end of `input`. A byte there is `protocol`.
+    CheckEnd,
+    /// Start no read, and discard the bytes in the buffer with no check.
+    Stop,
+}
+
+/// Returns the error of the call for `failure`.
+fn stream_error(failure: Failure) -> Error {
+    match failure {
+        Failure::Wire(e) => Error::Remote(e),
+        Failure::Internal(e) | Failure::Silent(e) => e,
     }
 }
 
@@ -139,6 +194,7 @@ async fn run<R>(
     repo: &Repo,
     policy: &StreamPolicy,
     mut reader: FrameReader<BufReader<R>>,
+    after: AfterCommit,
 ) -> std::result::Result<ReceiveReport, Failure>
 where
     R: AsyncRead + Unpin + Send,
@@ -161,18 +217,22 @@ where
         }
     };
     check_updates(&request)?;
-    // Any byte after `Commit` is `protocol`, also bytes that do not make a
-    // whole frame.
     let mut rest = reader.into_inner();
-    match rest.fill_buf().await {
-        Ok([]) => {}
-        Ok(_) => {
-            return Err(Failure::Wire(remote::Error::Protocol(
-                "bytes follow Commit in a one-way stream".into(),
-            )));
+    if after == AfterCommit::CheckEnd {
+        // Any byte after `Commit` is `protocol`, also bytes that do not make
+        // a whole frame.
+        match rest.fill_buf().await {
+            Ok([]) => {}
+            Ok(_) => {
+                return Err(Failure::Wire(remote::Error::Protocol(
+                    "bytes follow Commit in a one-way stream".into(),
+                )));
+            }
+            Err(e) => return Err(Failure::Silent(Error::Io(e))),
         }
-        Err(e) => return Err(Failure::Silent(Error::Io(e))),
     }
+    // Under `AfterCommit::Stop`, the drop discards the bytes after `Commit`
+    // that the buffer holds, with no check.
     drop(rest);
     drop(buf);
     core.finish(request).await
@@ -212,6 +272,7 @@ fn check_updates(request: &CommitRequest) -> std::result::Result<(), Failure> {
 const _: fn() = || {
     fn assert_send<T: Send>(_: T) {}
     let _ = |repo: &Repo, policy: &StreamPolicy| {
-        assert_send(repo.receive_stream(futures_lite::io::empty(), policy))
+        assert_send(repo.receive_stream(futures_lite::io::empty(), policy));
+        assert_send(repo.receive_stream_to_commit(futures_lite::io::empty(), policy))
     };
 };

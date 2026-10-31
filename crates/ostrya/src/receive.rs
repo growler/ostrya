@@ -15,7 +15,9 @@
 //! - [`ReceiveHooks`] are the calls of the host that run before and after the
 //!   ref update of a session.
 //! - [`Repo::receive_stream`](crate::Repo::receive_stream) reads one one-way
-//!   stream: the messages of a session in one direction, with no reply. A
+//!   stream: the messages of a session in one direction, with no reply.
+//!   [`Repo::receive_stream_to_commit`](crate::Repo::receive_stream_to_commit)
+//!   reads it and stops at `Commit`, for a channel with no end of input. A
 //!   [`StreamPolicy`] states what the stream accepts.
 //! - [`ClientAccess`] reads the client groups and the server settings. The
 //!   module re-exports it and the other types of [`access`](crate::access).

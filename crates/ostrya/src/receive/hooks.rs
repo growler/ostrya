@@ -39,10 +39,11 @@ pub(super) fn cut(message: &mut String) {
 /// A host gives the hooks to one session through
 /// [`ReceiveService::hello_with_hooks`](super::ReceiveService::hello_with_hooks).
 /// [`ReceiveService::hello`](super::ReceiveService::hello),
-/// [`Repo::receive`](crate::Repo::receive), and
-/// [`Repo::receive_stream`](crate::Repo::receive_stream) take no hooks. The
-/// receive endpoint of `ostrya-server` gives the hooks that its
-/// `SessionSetup` holds.
+/// [`Repo::receive`](crate::Repo::receive),
+/// [`Repo::receive_stream`](crate::Repo::receive_stream), and
+/// [`Repo::receive_stream_to_commit`](crate::Repo::receive_stream_to_commit)
+/// take no hooks. The receive endpoint of `ostrya-server` gives the hooks
+/// that its `SessionSetup` holds.
 ///
 /// # When `before_update` runs
 ///

@@ -53,6 +53,11 @@ Ostrya adds these functions, which the `ostree` command does not have:
   sign it. `ostrya receive` is the server side of a push over ssh.
 - Pull over ssh. `ostrya pull` reads from an ssh address, and `ostrya send` is
   the server side.
+- One-way stream. `ostrya send --one-way` writes commits and their refs to
+  standard output as one stream, and `ostrya receive --one-way` reads the
+  stream into a repository. The stream goes through a file, a pipe, or a
+  channel with no end of input, for example a virtio-serial port. The
+  receiving side sends no reply.
 - S3 bucket repositories. A bucket repository is a repository in `archive`
   form in an S3 bucket, at an `s3://BUCKET[/PREFIX]` address, with no server
   program. `ostrya remote init` creates one, `ostrya push` writes commits to
@@ -69,8 +74,8 @@ Ostrya adds these functions, which the `ostree` command does not have:
   bearer token, a Basic credential, a TLS client certificate, or a network
   address, also behind a trusted proxy.
 - Client access. Client groups in the `config` file give each client the
-  access modes of each ref. The same groups apply to `serve`, `receive`, and
-  `send`.
+  access modes of each ref. The same groups apply to `serve`, and to
+  `receive` and `send` without `--one-way`.
 - Related commits. Field 2 of a commit holds its dependencies, which
   `ostrya commit --related` writes. The detached metadata key
   `ostrya.related` holds its build sources, which the library adds. A prune

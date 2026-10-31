@@ -177,6 +177,21 @@ address with a message that names the feature:
 cargo test -p ostrya-cli --no-default-features --features smol,push --test s3_absent
 ```
 
+The tests of `ostrya receive --one-way` are in
+`crates/ostrya-cli/tests/cli.rs`. Two of them keep standard input of the
+command open after the stream. The smol backend reads standard input ahead
+on a pool thread, and the tokio backend does not. A build with
+`--all-features` selects tokio. The default set of `ostrya-cli` selects smol,
+so CI also runs these two tests with the default set:
+
+```sh
+cargo test -p ostrya-cli --test cli receive_one_way_open_input
+```
+
+The test of `--allow-privileged` runs only as root, because only root can
+receive into a `bare` repository. As another user, the test writes a skip
+line to standard error and passes.
+
 ## Golden fixtures
 
 The golden fixtures are in `tests/fixtures/`. The `ostree` tool wrote them,

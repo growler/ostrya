@@ -1,20 +1,58 @@
 .TH "OSTRYA\-RECEIVE" "1" "" "ostrya" "User Commands"
 .SH NAME
-ostrya\-receive \- Receive one push session over standard input and standard output
+ostrya\-receive \- Receive one push session, or one \%one\-way stream with \%\-\-one\-way
 .SH SYNOPSIS
 .nf
 ostrya receive [OPTIONS]
 .fi
 .SH DESCRIPTION
-Receive one push session over standard input and standard output.
+Receive one push session, or one \%one\-way stream with \%\-\-one\-way.
 .PP
-By default, \fB\%ostrya push\fR runs this command on the server over ssh. The client name is \%\-\-client, else the value of \fB\%LOGNAME\fR, which sshd sets from the password entry of the user. With neither, the command writes an error line and exits \%1 before it opens the repository. At start, the command reads and checks the client groups, the server group, the trust groups, and the key groups of the repository config, and a bad group ends it with status \%1. \fB\%Hello\fR names the namespace of the session: the local refs, or one collection. The session takes the policy of the client group of that namespace that carries the item \fB\%ssh:NAME\fR\&. For a collection, a group that names the collection wins over a group with \fB\%collection=*\fR\&. With no such group, \fB\%Hello\fR gets \fB\%ref\-denied\fR\&. A session of a collection writes the refs under \fB\%refs/mirrors/ID/\fR\&. The session uses no \fB\%anonymous\fR and no \fB\%net:\fR item. With \fB\%[core] auto\-update\-summary=true\fR, a session that changes a ref writes each summary again, as \fB\%ostrya summary \-u\fR does, signed with the key groups of \fB\%sign\-summary\fR\&. Standard output carries the frames of the session alone. For each warning of the session, the command writes one \fB\%warning: STEP: MESSAGE\fR line to standard error. It writes nothing else, also under \%\-\-verbose. The exit status is \%0 after a committed session, also with warnings, and \%1 otherwise.
+Without \%\-\-one\-way, \fB\%ostrya push\fR runs this command on the server over ssh. The client name is \%\-\-client, else the value of \fB\%LOGNAME\fR, which sshd sets from the password entry of the user. With neither, the command writes an error line and exits \%1 before it opens the repository. At start, the command reads and checks the client groups, the server group, the trust groups, and the key groups of the repository config, and a bad group ends it with status \%1. \fB\%Hello\fR names the namespace of the session: the local refs, or one collection. The session takes the policy of the client group of that namespace that carries the item \fB\%ssh:NAME\fR\&. For a collection, a group that names the collection wins over a group with \fB\%collection=*\fR\&. With no such group, \fB\%Hello\fR gets \fB\%ref\-denied\fR\&. A session of a collection writes the refs under \fB\%refs/mirrors/ID/\fR\&. The session uses no \fB\%anonymous\fR and no \fB\%net:\fR item. With \fB\%[core] auto\-update\-summary=true\fR, a session that changes a ref writes each summary again, as \fB\%ostrya summary \-u\fR does, signed with the key groups of \fB\%sign\-summary\fR\&. Standard output carries the frames of the session alone. For each warning of the session, the command writes one \fB\%warning: STEP: MESSAGE\fR line to standard error. It writes nothing else, also under \%\-\-verbose. The exit status is \%0 after a committed session, also with warnings, and \%1 otherwise.
+.PP
+With \%\-\-one\-way, the command runs no session. It reads one \%one\-way stream from standard input, or from the file of \%\-\-input, and writes the objects and the refs of the stream in one transaction. \fB\%ostrya send \-\-one\-way\fR writes the stream. The repository must exist, so run \fB\%ostrya init\fR first. A \fB\%bare\fR repository refuses the stream with \fB\%mode\-refused\fR unless the process runs as root, and a \fB\%bare\-split\-xattrs\fR repository refuses it with \fB\%mode\-refused\fR\&. The command reads no client group, no server group, no key group, and no \fB\%LOGNAME\fR\&. It reads the trust group of \%\-\-trust alone. Unless the config sets \fB\%[core] locking=false\fR, it holds the repository lock as shared from \fB\%Hello\fR to the end. It adds no server signature and does not write the summary again.
+.PP
+A plain ref takes a \%fast\-forward update. A remote ref needs \%\-\-allow\-remote, and gets \fB\%ref\-denied\fR without it. The stream deletes no ref. A stream of the commit that a ref holds changes nothing. The stream carries no parent commit, so the history check of an update stops at the first commit that neither the stream nor the repository holds. For example, the repository holds commit A on a ref, and the stream sets the ref to commit C, a child of commit B, a child of A. The update gets \fB\%non\-fast\-forward\fR, because the repository does not hold B, and the ref does not change.
+.PP
+The input must end after the stream, or \%\-\-stop\-at\-commit must be given. Without \%\-\-stop\-at\-commit, the command commits only at the end of the input, and a byte after the \fB\%Commit\fR frame gets \fB\%protocol\fR\&. The command has no time limit. On a channel that gives no end of input, it waits for the writer and keeps the repository lock, if it holds the lock. Where a time limit is necessary, run the command under \%timeout(1). On a \%virtio\-serial port, a receive that starts before the host side of the port connects can get an end of input at once. The command then writes \fB\%error: i/o error: unexpected end of file\fR, exits \%1, and changes nothing.
+.PP
+Standard output stays empty. For each warning of the report, the command writes one \fB\%warning: STEP: MESSAGE\fR line to standard error. When the command refuses the options, it writes the usage error of \fB\%receive\fR to standard error and exits \%1. If no source gives a repository, the command writes its usage text and the line \fB\%error: Command requires a \-\-repo argument\fR to standard error, and it exits \%1. Each other failure writes one \fB\%error: MESSAGE\fR line to standard error and exits \%1. A failure before the transaction commit changes nothing. The exit status is \%0 after a committed stream, also with warnings. The command writes nothing else, also under \%\-\-verbose.
 .SH OPTIONS
 .TP
 \fB\-\-client\fR \fINAME\fR
 The client name of the session, in place of \fB\%LOGNAME\fR\&.
 .IP
 The session selects the client group that carries the item \fB\%ssh:NAME\fR\&. NAME is not empty, holds no control character, and does not start or end with white space. The option is safe only under a forced \fB\%command=\fR in \fB\%authorized_keys\fR, because a user with a shell can give any name.
+.TP
+\fB\-\-one\-way\fR
+Read one \%one\-way stream from standard input, or from the file of \%\-\-input, into the repository.
+.IP
+\fB\%ostrya send \-\-one\-way\fR writes the stream. The option conflicts with \%\-\-client.
+.TP
+\fB\-\-allow\-remote\fR \fIREMOTE\fR
+Accept the remote refs of REMOTE, each \fB\%REMOTE:NAME\fR\&. The option is repeatable, and \fB\%*\fR accepts the remote refs of each remote.
+.IP
+REMOTE is \fB\%*\fR, or a remote name: one or more alphanumeric characters, \fB\%\-\fR, \fB\%_\fR, and \fB\%\&.\fR, that starts with an alphanumeric character or \fB\%_\fR\&. A remote ref takes the rules of a plain ref: a \%fast\-forward update, and the keys of \%\-\-trust. Without a value that covers its remote, an update of a remote ref gets \fB\%ref\-denied\fR\&. The option needs \%\-\-one\-way.
+.TP
+\fB\-\-trust\fR \fINAME\fR
+Verify each new commit with the keys of the trust group \fB\%[ex\-ostrya trust "NAME"]\fR (see \%ostrya\-config(1)).
+.IP
+The keys apply to each plain ref and to each remote ref of \%\-\-allow\-remote. A commit that is the new value of a ref must pass the verification, and a commit with no signature gets \fB\%signature\-required\fR\&. A dependency of a commit gets no verification of its own. Field \%2 of the signed commit holds the checksum of each dependency, so the signature of the commit covers each dependency. A NAME that the config has no group for, and a bad group, end the command with one \fB\%error:\fR line and exit \%1 before it reads its input. The option needs \%\-\-one\-way.
+.TP
+\fB\-\-allow\-privileged\fR
+Accept privileged content in a \fB\%bare\fR repository.
+.IP
+Privileged content is a setuid or setgid mode bit, or the \fB\%security.capability\fR or \fB\%security.selinux\fR extended attribute. Without this option, a \fB\%bare\fR repository refuses it with \fB\%mode\-refused\fR\&. In the other modes, the option changes nothing. The option needs \%\-\-one\-way.
+.TP
+\fB\-\-stop\-at\-commit\fR
+Commit at the \fB\%Commit\fR frame of the stream.
+.IP
+The command runs the commit checks when it has read the \fB\%Commit\fR frame, and it checks no byte after the frame. It can read bytes after the frame, and a later reader of the channel does not get them. Use this option on a channel that gives no end of input, for example a \%virtio\-serial port. The option needs \%\-\-one\-way.
+.TP
+\fB\-\-input\fR \fIFILE\fR
+Read the stream from FILE in place of standard input.
+.IP
+FILE is a regular file, a character device, for example \fB\%/dev/virtio\-ports/NAME\fR, or a FIFO. The open of a FIFO waits until a writer opens it. A FILE that does not open ends the command with \fB\%error: FILE: REASON\fR and exit \%1, before the command opens a transaction. The option needs \%\-\-one\-way.
 .PP
 The global options are listed in \fBostrya\fR(1).
 .SH SEE ALSO

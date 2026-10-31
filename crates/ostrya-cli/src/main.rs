@@ -437,21 +437,21 @@ enum Command {
     /// standard error and exits 1. This command is an extension of ostrya.
     #[command(name = "composefs-image")]
     ComposefsImage(ComposefsImageArgs),
-    /// Receive one push session over standard input and standard output.
+    /// Receive one push session, or one one-way stream with --one-way.
     ///
-    /// By default, `ostrya push` runs this command on the server over ssh. The
-    /// client name is --client, else the value of `LOGNAME`, which sshd sets
-    /// from the password entry of the user. With neither, the command writes
-    /// an error line and exits 1 before it opens the repository. At start,
-    /// the command reads and checks the client groups, the server group, the
-    /// trust groups, and the key groups of the repository config, and a bad
-    /// group ends it with status 1. `Hello` names the namespace of the
-    /// session: the local refs, or one collection. The session takes the
-    /// policy of the client group of that namespace that carries the item
-    /// `ssh:NAME`. For a collection, a group that names the collection wins
-    /// over a group with `collection=*`. With no such group, `Hello` gets
-    /// `ref-denied`. A session of a collection writes the refs under
-    /// `refs/mirrors/ID/`. The session uses no `anonymous` and no `net:`
+    /// Without --one-way, `ostrya push` runs this command on the server over
+    /// ssh. The client name is --client, else the value of `LOGNAME`, which
+    /// sshd sets from the password entry of the user. With neither, the
+    /// command writes an error line and exits 1 before it opens the
+    /// repository. At start, the command reads and checks the client groups,
+    /// the server group, the trust groups, and the key groups of the
+    /// repository config, and a bad group ends it with status 1. `Hello` names
+    /// the namespace of the session: the local refs, or one collection. The
+    /// session takes the policy of the client group of that namespace that
+    /// carries the item `ssh:NAME`. For a collection, a group that names the
+    /// collection wins over a group with `collection=*`. With no such group,
+    /// `Hello` gets `ref-denied`. A session of a collection writes the refs
+    /// under `refs/mirrors/ID/`. The session uses no `anonymous` and no `net:`
     /// item. With `[core] auto-update-summary=true`, a session that changes a
     /// ref writes each summary again, as `ostrya summary -u` does, signed
     /// with the key groups of `sign-summary`.
@@ -460,6 +460,51 @@ enum Command {
     /// line to standard error. It writes nothing else, also under --verbose.
     /// The exit status is 0 after a committed session, also with warnings, and
     /// 1 otherwise.
+    ///
+    /// With --one-way, the command runs no session. It reads one one-way
+    /// stream from standard input, or from the file of --input, and writes
+    /// the objects and the refs of the stream in one transaction. `ostrya send
+    /// --one-way` writes the stream. The repository must exist, so run
+    /// `ostrya init` first. A `bare` repository refuses the stream with
+    /// `mode-refused` unless the process runs as root, and a
+    /// `bare-split-xattrs` repository refuses it with `mode-refused`. The
+    /// command reads no client group, no server group, no key group, and no
+    /// `LOGNAME`. It reads the trust group of --trust alone. Unless the
+    /// config sets `[core] locking=false`, it holds the repository lock as
+    /// shared from `Hello` to the end. It adds no server signature and does
+    /// not write the summary again.
+    ///
+    /// A plain ref takes a fast-forward update. A remote ref needs
+    /// --allow-remote, and gets `ref-denied` without it. The stream deletes no
+    /// ref. A stream of the commit that a ref holds changes nothing. The
+    /// stream carries no parent commit, so the history check of an update
+    /// stops at the first commit that neither the stream nor the repository
+    /// holds. For example, the repository holds commit A on a ref, and the
+    /// stream sets the ref to commit C, a child of commit B, a child of A.
+    /// The update gets `non-fast-forward`, because the repository does not
+    /// hold B, and the ref does not change.
+    ///
+    /// The input must end after the stream, or --stop-at-commit must be
+    /// given. Without --stop-at-commit, the command commits only at the end
+    /// of the input, and a byte after the `Commit` frame gets `protocol`. The
+    /// command has no time limit. On a channel that gives no end of input, it
+    /// waits for the writer and keeps the repository lock, if it holds the
+    /// lock. Where a time limit is necessary, run the command under
+    /// timeout(1). On a virtio-serial port, a receive that starts before the
+    /// host side of the port connects can get an end of input at once. The
+    /// command then writes `error: i/o error: unexpected end of file`, exits
+    /// 1, and changes nothing.
+    ///
+    /// Standard output stays empty. For each warning of the report, the
+    /// command writes one `warning: STEP: MESSAGE` line to standard error.
+    /// When the command refuses the options, it writes the usage error of
+    /// `receive` to standard error and exits 1. If no source gives a
+    /// repository, the command writes its usage text and the line
+    /// `error: Command requires a --repo argument` to standard error, and it
+    /// exits 1. Each other failure writes one `error: MESSAGE` line to
+    /// standard error and exits 1. A failure before the transaction commit
+    /// changes nothing. The exit status is 0 after a committed stream, also
+    /// with warnings. The command writes nothing else, also under --verbose.
     #[cfg(feature = "receive")]
     Receive(ReceiveArgs),
     /// Push commits to a remote over ssh or HTTP, or to a bucket repository.
@@ -3983,6 +4028,87 @@ struct ReceiveArgs {
     /// can give any name.
     #[arg(long, value_name = "NAME")]
     client: Option<String>,
+    /// Read one one-way stream from standard input, or from the file of
+    /// --input, into the repository.
+    ///
+    /// `ostrya send --one-way` writes the stream. The option conflicts with
+    /// --client.
+    #[arg(long, conflicts_with = "client")]
+    one_way: bool,
+    /// Accept the remote refs of REMOTE, each `REMOTE:NAME`. The option is
+    /// repeatable, and `*` accepts the remote refs of each remote.
+    ///
+    /// REMOTE is `*`, or a remote name: one or more alphanumeric characters,
+    /// `-`, `_`, and `.`, that starts with an alphanumeric character or `_`.
+    /// A remote ref takes the rules of a plain ref: a fast-forward update,
+    /// and the keys of --trust. Without a value that covers its remote, an
+    /// update of a remote ref gets `ref-denied`. The option needs --one-way.
+    #[arg(
+        long = "allow-remote",
+        value_name = "REMOTE",
+        requires = "one_way",
+        value_parser = parse_allow_remote
+    )]
+    allow_remote: Vec<ostrya::ReceivePattern>,
+    /// Verify each new commit with the keys of the trust group
+    /// `[ex-ostrya trust "NAME"]` (see ostrya-config(1)).
+    ///
+    /// The keys apply to each plain ref and to each remote ref of
+    /// --allow-remote. A commit that is the new value of a ref must pass the
+    /// verification, and a commit with no signature gets
+    /// `signature-required`. A dependency of a commit gets no verification of
+    /// its own. Field 2 of the signed commit holds the checksum of each
+    /// dependency, so the signature of the commit covers each dependency. A
+    /// NAME that the config has no group for, and a bad group, end the
+    /// command with one `error:` line and exit 1 before it reads its input.
+    /// The option needs --one-way.
+    #[arg(long, value_name = "NAME", requires = "one_way")]
+    trust: Option<String>,
+    /// Accept privileged content in a `bare` repository.
+    ///
+    /// Privileged content is a setuid or setgid mode bit, or the
+    /// `security.capability` or `security.selinux` extended attribute.
+    /// Without this option, a `bare` repository refuses it with
+    /// `mode-refused`. In the other modes, the option changes nothing. The
+    /// option needs --one-way.
+    #[arg(long, requires = "one_way")]
+    allow_privileged: bool,
+    /// Commit at the `Commit` frame of the stream.
+    ///
+    /// The command runs the commit checks when it has read the `Commit`
+    /// frame, and it checks no byte after the frame. It can read bytes after
+    /// the frame, and a later reader of the channel does not get them. Use
+    /// this option on a channel that gives no end of input, for example a
+    /// virtio-serial port. The option needs --one-way.
+    #[arg(long, requires = "one_way")]
+    stop_at_commit: bool,
+    /// Read the stream from FILE in place of standard input.
+    ///
+    /// FILE is a regular file, a character device, for example
+    /// `/dev/virtio-ports/NAME`, or a FIFO. The open of a FIFO waits until a
+    /// writer opens it. A FILE that does not open ends the command with
+    /// `error: FILE: REASON` and exit 1, before the command opens a
+    /// transaction. The option needs --one-way.
+    #[arg(long, value_name = "FILE", requires = "one_way")]
+    input: Option<PathBuf>,
+}
+
+/// The words of the remote-name rule in a usage error.
+#[cfg(any(all(feature = "send", feature = "push"), feature = "receive"))]
+const REMOTE_NAME_RULE: &str = "a remote name is one or more alphanumeric characters, '-', '_', \
+                                and '.', that starts with an alphanumeric character or '_'";
+
+/// Reads a value of `receive --allow-remote` into the pattern `REMOTE:**`.
+///
+/// The value is `*` or a remote name that `valid_remote_name` accepts. A
+/// remote name that the pattern refuses as a remote part gives the error of
+/// the pattern.
+#[cfg(feature = "receive")]
+fn parse_allow_remote(text: &str) -> std::result::Result<ostrya::ReceivePattern, String> {
+    if text != "*" && !ostrya::valid_remote_name(text) {
+        return Err(format!("{REMOTE_NAME_RULE}, or '*'"));
+    }
+    ostrya::ReceivePattern::parse(&format!("{text}:**")).map_err(|err| err.to_string())
 }
 
 #[cfg(feature = "send")]
@@ -4077,11 +4203,7 @@ fn parse_remote_name(text: &str) -> std::result::Result<String, String> {
     if ostrya::valid_remote_name(text) {
         Ok(text.to_owned())
     } else {
-        Err(
-            "a remote name is one or more alphanumeric characters, '-', '_', and '.', \
-             that starts with an alphanumeric character or '_'"
-                .to_owned(),
-        )
+        Err(REMOTE_NAME_RULE.to_owned())
     }
 }
 
@@ -5176,6 +5298,12 @@ async fn run(repo: Option<&Path>, verbose: bool, command: Command) -> Result<()>
         }
         #[cfg(feature = "receive")]
         Command::Receive(args) => {
+            if args.one_way {
+                // `receive --one-way` writes nothing on success, also under
+                // `--verbose`, and it reads no client name.
+                let (repo, _) = resolve_repo(repo, false, name).await;
+                return receive_one_way(repo, args).await;
+            }
             let client = ssh_client(args.client, name);
             // `receive` writes nothing on success, also under `--verbose`, so
             // `resolve_repo` does not write the repository line of `--verbose`.
@@ -5369,14 +5497,77 @@ async fn receive(repo: Repo, client: ostrya::access::AuthItem) -> Result<()> {
     let report = repo
         .receive_selected(stdin_file()?, stdout_file()?, select)
         .await?;
-    for warning in &report.warnings {
+    write_receive_warnings(&report.warnings);
+    Ok(())
+}
+
+/// Reads one one-way stream from standard input, or from the file of
+/// `--input`, into `repo`.
+///
+/// The policy comes from the options: the default rule for the plain refs,
+/// one rule `REMOTE:**` for each `--allow-remote`, the keys of the trust group
+/// of `--trust` on each rule, and `--allow-privileged`. The command reads no
+/// client group, no server group, and no `LOGNAME`. With `--stop-at-commit`,
+/// the receive commits at the `Commit` frame. Each warning of the report goes
+/// to standard error as one line. A failure goes there as the error line of
+/// [`main`].
+///
+/// The input is the reader of `ostrya_rt` with no other buffer. Under
+/// `--stop-at-commit`, the receive starts no read of the input after the
+/// `Commit` frame. Under the smol backend, the reader reads ahead on a pool
+/// thread, up to 256 KiB, so it can read bytes after the frame, and a later
+/// reader of the channel does not get them.
+#[cfg(feature = "receive")]
+async fn receive_one_way(repo: Repo, args: ReceiveArgs) -> Result<()> {
+    let verify = match &args.trust {
+        Some(name) => ostrya::ReceiveVerify::Keys(Arc::new(
+            ostrya::TrustedKeys::from_trust_group(&repo, name).await?,
+        )),
+        None => ostrya::ReceiveVerify::Off,
+    };
+    // The rules share one `Arc` of the keys. So the commit verifies a commit
+    // that the updates of two rules name one time.
+    let rule = ostrya::StreamRule {
+        verify,
+        ..ostrya::StreamRule::default()
+    };
+    let policy = ostrya::StreamPolicy {
+        rules: args
+            .allow_remote
+            .into_iter()
+            .map(|pattern| (pattern, rule.clone()))
+            .collect(),
+        default_rule: rule,
+        allow_privileged: args.allow_privileged,
+        ..ostrya::StreamPolicy::default()
+    };
+    let input = match &args.input {
+        Some(path) => match std::fs::File::open(path) {
+            Ok(file) => ostrya_rt::FileReader::from(file),
+            Err(err) => exit_error(&format!("{}: {err}", path.display())),
+        },
+        None => stdin_file()?,
+    };
+    let report = if args.stop_at_commit {
+        repo.receive_stream_to_commit(input, &policy).await?
+    } else {
+        repo.receive_stream(input, &policy).await?
+    };
+    write_receive_warnings(&report.warnings);
+    Ok(())
+}
+
+/// Writes each warning of a receive report to standard error as one
+/// `warning: STEP: MESSAGE` line.
+#[cfg(feature = "receive")]
+fn write_receive_warnings(warnings: &[ostrya::ReceiveWarning]) {
+    for warning in warnings {
         eprintln!(
             "warning: {}: {}",
             receive_step(warning.step),
             warning.message
         );
     }
-    Ok(())
 }
 
 /// Returns the client name of an ssh session of the command `name`.

@@ -4934,6 +4934,8 @@ pull`.
 
 ```text
 ostrya receive [--repo=PATH] [--client=NAME]
+ostrya receive [--repo=PATH] --one-way [--allow-remote=REMOTE]... [--trust=NAME]
+               [--allow-privileged] [--stop-at-commit] [--input=FILE]
 ```
 
 - The `receive` feature of `ostrya-cli` builds the command. It is in the
@@ -4972,6 +4974,83 @@ ostrya receive [--repo=PATH] [--client=NAME]
   nothing else, also under `-v`.
 - It exits 0 after a committed session, also with warnings, and 1
   otherwise.
+- `--one-way` reads one one-way stream (`../format-reference.md`, "The
+  one-way stream") from standard input, or from the file of `--input`,
+  through `Repo::receive_stream`, or `Repo::receive_stream_to_commit` with
+  `--stop-at-commit`. `ostrya send --one-way` writes the stream. The command
+  runs no session and writes nothing to standard output. It reads no client
+  group, no server group, no key group, and no `LOGNAME`, so it runs with
+  neither `--client` nor `LOGNAME`. It reads the trust group of `--trust`
+  alone. `--one-way` conflicts with `--client`. `--allow-remote`, `--trust`,
+  `--allow-privileged`, `--stop-at-commit`, and `--input` each need
+  `--one-way`. The option parser refuses each of these cases at exit 1.
+- The repository must exist: `ostrya init` makes it. A `bare` repository
+  refuses the stream with `mode-refused` unless the process runs as root,
+  and a `bare-split-xattrs` repository refuses it with `mode-refused`. The
+  command accepts a repository whose config sets `[core] locking=false`.
+  Unless the config sets `locking=false`, the command holds the repository
+  lock as shared from `Hello` to the end. With `locking=false`, it holds no
+  repository lock. The commit takes the update lock, which ignores
+  `[core] locking`. The command adds no server signature and does not write
+  the summary again.
+- The command builds one `StreamPolicy`. The default rule of the policy
+  takes a fast-forward update of a plain ref. Each `--allow-remote=REMOTE`
+  adds the pattern rule `REMOTE:**` with the same rule, and
+  `--allow-remote='*'` adds `*:**`. A remote ref that no value covers gets
+  `ref-denied`. The option parser checks `REMOTE` with the remote-name rule
+  of `remote add`, and `*` also passes, before the repository opens. A value
+  that the rule refuses gets the usage error `error: invalid value 'REMOTE'
+  for '--allow-remote <REMOTE>'` with the rule, and exit 1.
+- `--trust=NAME` puts the keys of `[ex-ostrya trust "NAME"]`, from
+  `TrustedKeys::from_trust_group`, on the default rule and on each rule of
+  `--allow-remote`. Each commit that is the new value of a ref must pass the
+  keys, and a commit with no signature gets `signature-required`. A
+  dependency that field 2 of the commit names gets no verification of its
+  own, because the signature of the commit covers field 2. A name with no
+  group gets `error: invalid input: the config has no [ex-ostrya trust
+  "NAME"] group`, and a bad group gets `error: MESSAGE`. Each refusal comes
+  before the command opens its input, and the command exits 1.
+- `--allow-privileged` sets `StreamPolicy::allow_privileged`. Without it, a
+  `bare` repository refuses a setuid or setgid mode bit and the
+  `security.capability` and `security.selinux` extended attributes with
+  `mode-refused`. In the other modes, the option changes nothing.
+- The stream carries no parent commit, so the history check of an update
+  stops at the first commit that neither the stream nor the repository
+  holds. If the repository holds commit A on a ref, and the stream sets the
+  ref to C, a child of B, a child of A, the update gets `non-fast-forward`,
+  and the ref does not change. A stream of the commit that the ref holds
+  passes and changes nothing. The stream deletes no ref.
+- Without `--stop-at-commit`, the command commits at the end of its input,
+  and a byte after the `Commit` frame gets `protocol`. With it, the command
+  runs the commit checks at the `Commit` frame and checks no byte after the
+  frame. The reader of standard input can read bytes after the frame, and a
+  later reader of the channel does not get them. The command has no time
+  limit. On a channel that gives no end of input, it waits and keeps the
+  shared lock, if it holds the lock. An input that ends before `Commit` gets
+  `error: i/o error: unexpected end of file`. On a virtio-serial port, a
+  receive that starts before the host side of the port connects can get
+  this end of input at once.
+- `--input=FILE` opens FILE with `std::fs::File::open`, after the trust
+  group and before the transaction. FILE is a regular file, a character
+  device, or a FIFO, and the open of a FIFO waits for a writer. The option
+  opens no socket. A FILE that does not open gets `error: FILE: REASON` and
+  exit 1, and the repository does not change. The command reads FILE
+  through the reader of the runtime with no other buffer.
+- For each warning of the report, the command writes one
+  `warning: STEP: MESSAGE` line to standard error. When the command refuses
+  the options, it writes the usage error of `receive` to standard error and
+  exits 1. If no source gives a repository, the command writes its usage
+  text and `error: Command requires a --repo argument` to standard error and
+  exits 1. Each other failure writes one `error: MESSAGE` line to standard
+  error and exits 1, with the wire code first for a refusal of the stream,
+  for example `error: ref-denied: MESSAGE`. A failure before the transaction
+  commit changes nothing. The command exits 0 after a committed stream, also
+  with warnings, and writes nothing else, also under `-v`.
+- `crates/ostrya/tests/one_way.rs` holds the tests of the library calls,
+  and `crates/ostrya-cli/tests/cli.rs` holds the tests of `--one-way`. The
+  test of `--allow-privileged` runs only as root. A CI step runs the tests
+  of an input that stays open under the smol backend, because the step
+  "Test" selects the tokio backend.
 
 ### `push`
 

@@ -44988,3 +44988,616 @@ fn send_one_way_needs_a_refspec() {
         "{stderr}"
     );
 }
+
+// --- receive --one-way -------------------------------------------------------
+
+/// Runs `ostrya send --repo=<repo> --one-way <args>` with standard output to
+/// the file `name` in `dir`, and returns the path of the file.
+#[cfg(all(feature = "send", feature = "push", feature = "receive"))]
+fn send_stream(dir: &Path, name: &str, repo: &Path, args: &[&str]) -> PathBuf {
+    let path = dir.join(name);
+    let repo_arg = format!("--repo={}", repo.display());
+    let mut all = vec!["send", repo_arg.as_str(), "--one-way"];
+    all.extend_from_slice(args);
+    let out = Command::new(env!("CARGO_BIN_EXE_ostrya"))
+        .args(&all)
+        .env_remove("LOGNAME")
+        .stdin(Stdio::null())
+        .stdout(std::fs::File::create(&path).unwrap())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run ostrya");
+    assert!(
+        out.status.success(),
+        "{all:?}: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    path
+}
+
+/// Makes the empty repository `base/<name>/repo` of `mode` with
+/// `ostrya init`, and returns its path.
+#[cfg(all(feature = "send", feature = "push", feature = "receive"))]
+fn guest(base: &Path, name: &str, mode: &str) -> PathBuf {
+    let repo = base.join(name).join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    let mode = format!("--mode={mode}");
+    ostrya(
+        &["init", "--repo", repo.to_str().unwrap(), &mode],
+        None,
+        &[],
+    )
+    .ok();
+    repo
+}
+
+/// Runs `ostrya receive --repo=<guest> --one-way <args>` with no `LOGNAME`.
+/// Standard input is the file `stdin`, or empty if `stdin` is `None`.
+#[cfg(all(feature = "send", feature = "push", feature = "receive"))]
+fn receive_from(guest: &Path, stdin: Option<&Path>, args: &[&str]) -> Run {
+    let repo_arg = format!("--repo={}", guest.display());
+    let mut all = vec!["receive", repo_arg.as_str(), "--one-way"];
+    all.extend_from_slice(args);
+    let input = match stdin {
+        Some(path) => Stdio::from(std::fs::File::open(path).unwrap()),
+        None => Stdio::null(),
+    };
+    let out = Command::new(env!("CARGO_BIN_EXE_ostrya"))
+        .args(&all)
+        .env_remove("LOGNAME")
+        .stdin(input)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("run ostrya");
+    Run {
+        status: out.status,
+        stdout: out.stdout,
+        stderr: out.stderr,
+    }
+}
+
+/// Asserts that `run` exits 0 and writes nothing to standard output and to
+/// standard error.
+#[cfg(all(feature = "send", feature = "push", feature = "receive"))]
+fn received(run: &Run, case: &str) {
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert_eq!(run.status.code(), Some(0), "{case}: {stderr}");
+    assert!(run.stdout.is_empty(), "{case}");
+    assert!(run.stderr.is_empty(), "{case}: {stderr}");
+}
+
+/// Returns the names of the `staging-` entries in `tmp/` of `repo`.
+#[cfg(all(feature = "send", feature = "push", feature = "receive"))]
+fn staging_entries(repo: &Path) -> Vec<String> {
+    std::fs::read_dir(repo.join("tmp"))
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+        .filter(|name| name.starts_with("staging-"))
+        .collect()
+}
+
+/// Asserts that `tmp/` of `repo` holds no `staging-` entry.
+#[cfg(all(feature = "send", feature = "push", feature = "receive"))]
+fn assert_no_staging(repo: &Path, case: &str) {
+    let staged = staging_entries(repo);
+    assert!(
+        staged.is_empty(),
+        "{case}: a staging entry stays: {staged:?}"
+    );
+}
+
+/// Asserts that `run` exits 1 with one `error: <code>: ` line, that `guest`
+/// keeps the objects and the refs of `before`, and that `tmp/` of `guest`
+/// holds no `staging-` entry.
+#[cfg(all(feature = "send", feature = "push", feature = "receive"))]
+fn refused_with(
+    run: &Run,
+    code: &str,
+    guest: &Path,
+    before: &(Vec<(String, Vec<u8>)>, Vec<String>),
+    case: &str,
+) {
+    let stderr = refused(run, case);
+    assert!(
+        stderr.starts_with(&format!("error: {code}: ")),
+        "{case}: {stderr}"
+    );
+    assert_eq!(stderr.lines().count(), 1, "{case}: {stderr}");
+    assert!(
+        commit_store_state(guest) == *before,
+        "{case}: the guest changed"
+    );
+    assert_no_staging(guest, case);
+}
+
+/// Makes the directory `base/<name>` with one file `<name>.txt`, and returns
+/// its path.
+#[cfg(all(feature = "send", feature = "push", feature = "receive"))]
+fn one_file_tree(base: &Path, name: &str) -> PathBuf {
+    let tree = base.join(name);
+    std::fs::create_dir_all(&tree).unwrap();
+    std::fs::write(tree.join(format!("{name}.txt")), name).unwrap();
+    tree
+}
+
+/// Returns `true` if the test process runs with the effective user id 0. The
+/// value is the second field of the `Uid:` line of `/proc/self/status`.
+#[cfg(all(feature = "send", feature = "push", feature = "receive"))]
+fn is_root() -> bool {
+    let status = std::fs::read_to_string("/proc/self/status").unwrap();
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Uid:"))
+        .and_then(|ids| ids.split_whitespace().nth(1))
+        .is_some_and(|euid| euid == "0")
+}
+
+/// A stream of `send --one-way` goes through a file into an empty
+/// `bare-user` repository. The ref points at the sent commit, `fsck` finds
+/// no error, and the command writes nothing, also under `--verbose`.
+#[cfg(all(feature = "send", feature = "push", feature = "receive"))]
+#[test]
+fn receive_one_way_round_trips_through_a_file() {
+    let tmp = TmpDir::new("receive-one-way-round-trip");
+    let source = commit_fixture(&tmp.path().join("source"));
+    let stream = send_stream(tmp.path(), "stream", &source, &[BRANCH]);
+    for (name, args) in [("plain", &[][..]), ("verbose", &["--verbose"][..])] {
+        let guest = guest(tmp.path(), name, "bare-user");
+        let run = receive_from(&guest, Some(&stream), args);
+        received(&run, name);
+        assert_eq!(resolve(&guest, BRANCH).as_deref(), Some(COMMIT), "{name}");
+        ostrya(&["fsck", "--repo", guest.to_str().unwrap()], None, &[]).ok();
+    }
+}
+
+/// `--input=FILE` reads the stream from FILE, and gives the refs of a
+/// receive from standard input.
+#[cfg(all(feature = "send", feature = "push", feature = "receive"))]
+#[test]
+fn receive_one_way_reads_the_file_of_input() {
+    let tmp = TmpDir::new("receive-one-way-input");
+    let source = commit_fixture(&tmp.path().join("source"));
+    let stream = send_stream(tmp.path(), "stream", &source, &[BRANCH]);
+    let guest = guest(tmp.path(), "guest", "bare-user");
+    let input = format!("--input={}", stream.display());
+    received(&receive_from(&guest, None, &[&input]), "input");
+    assert_eq!(resolve(&guest, BRANCH).as_deref(), Some(COMMIT));
+    ostrya(&["fsck", "--repo", guest.to_str().unwrap()], None, &[]).ok();
+}
+
+/// A FILE of `--input` that does not open ends the command with one
+/// `error:` line that names FILE, and exit 1. The repository does not
+/// change.
+#[cfg(all(feature = "send", feature = "push", feature = "receive"))]
+#[test]
+fn receive_one_way_refuses_an_input_that_does_not_open() {
+    let tmp = TmpDir::new("receive-one-way-input-absent");
+    let guest = guest(tmp.path(), "guest", "archive");
+    let before = commit_store_state(&guest);
+    let missing = tmp.path().join("missing");
+    let input = format!("--input={}", missing.display());
+    let run = receive_from(&guest, None, &[&input]);
+    assert_eq!(
+        refused(&run, "missing"),
+        format!(
+            "error: {}: No such file or directory (os error 2)\n",
+            missing.display()
+        )
+    );
+    assert!(commit_store_state(&guest) == before);
+    assert_no_staging(&guest, "missing");
+}
+
+/// `--allow-remote`, `--trust`, `--allow-privileged`, `--stop-at-commit`,
+/// and `--input` each need `--one-way`.
+#[cfg(all(feature = "send", feature = "push", feature = "receive"))]
+#[test]
+fn receive_one_way_options_need_one_way() {
+    let tmp = TmpDir::new("receive-one-way-requires");
+    let missing = tmp.path().join("missing");
+    let missing = missing.to_str().unwrap();
+    for option in [
+        "--allow-remote=os",
+        "--trust=t",
+        "--allow-privileged",
+        "--stop-at-commit",
+        "--input=x",
+    ] {
+        let run = ostrya(
+            &["receive", "--repo", missing, option],
+            None,
+            &[("LOGNAME", "u")],
+        );
+        let stderr = refused(&run, option);
+        assert!(stderr.contains("--one-way"), "{option}: {stderr}");
+    }
+}
+
+/// `--one-way` conflicts with `--client`.
+#[cfg(all(feature = "send", feature = "push", feature = "receive"))]
+#[test]
+fn receive_one_way_conflicts_with_client() {
+    let tmp = TmpDir::new("receive-one-way-client");
+    let missing = tmp.path().join("missing");
+    let run = ostrya(
+        &[
+            "receive",
+            "--repo",
+            missing.to_str().unwrap(),
+            "--one-way",
+            "--client=u",
+        ],
+        None,
+        &[],
+    );
+    let stderr = refused(&run, "client");
+    assert!(stderr.contains("cannot be used with"), "{stderr}");
+}
+
+/// `receive --one-way` reads no client group, so a malformed client group
+/// that stops `receive` without `--one-way` does not stop it.
+#[cfg(all(feature = "send", feature = "push", feature = "receive"))]
+#[test]
+fn receive_one_way_reads_no_client_group() {
+    let tmp = TmpDir::new("receive-one-way-client-group");
+    let source = commit_fixture(&tmp.path().join("source"));
+    let stream = send_stream(tmp.path(), "stream", &source, &[BRANCH]);
+    let guest = guest(tmp.path(), "guest", "archive");
+    append_config(&guest, "\n[ex-ostrya client \"x\"]\nno-such-key=1\n");
+    let session = ostrya(
+        &["receive", "--repo", guest.to_str().unwrap(), "--client=u"],
+        Some(&[]),
+        &[],
+    );
+    let stderr = String::from_utf8_lossy(&session.stderr);
+    assert_eq!(session.status.code(), Some(1), "{stderr}");
+    assert!(stderr.contains("no-such-key"), "{stderr}");
+    received(&receive_from(&guest, Some(&stream), &[]), "one-way");
+    assert_eq!(resolve(&guest, BRANCH).as_deref(), Some(COMMIT));
+}
+
+/// A remote ref needs `--allow-remote` with its remote or `*`. Without it,
+/// the update gets `ref-denied`, and the repository does not change.
+#[cfg(all(feature = "send", feature = "push", feature = "receive"))]
+#[test]
+fn receive_one_way_writes_a_remote_ref_only_with_allow_remote() {
+    let tmp = TmpDir::new("receive-one-way-remote");
+    let source = commit_fixture(&tmp.path().join("source"));
+    let stream = send_stream(tmp.path(), "stream", &source, &["--remote=os", BRANCH]);
+    let remote_ref = format!("os:{BRANCH}");
+    let denied = guest(tmp.path(), "denied", "archive");
+    let before = commit_store_state(&denied);
+    for args in [&[][..], &["--allow-remote=other"][..]] {
+        let run = receive_from(&denied, Some(&stream), args);
+        refused_with(&run, "ref-denied", &denied, &before, &format!("{args:?}"));
+    }
+    for (name, option) in [("named", "--allow-remote=os"), ("any", "--allow-remote=*")] {
+        let guest = guest(tmp.path(), name, "archive");
+        let run = receive_from(&guest, Some(&stream), &["--allow-remote=other", option]);
+        received(&run, name);
+        assert_eq!(
+            resolve(&guest, &remote_ref).as_deref(),
+            Some(COMMIT),
+            "{name}"
+        );
+        assert_eq!(resolve(&guest, BRANCH), None, "{name}");
+    }
+}
+
+/// The option parser refuses a value of `--allow-remote` that is no remote
+/// name and not `*`, before the repository opens.
+#[cfg(all(feature = "send", feature = "push", feature = "receive"))]
+#[test]
+fn receive_one_way_refuses_an_invalid_allow_remote() {
+    let tmp = TmpDir::new("receive-one-way-allow-remote");
+    let missing = tmp.path().join("missing");
+    let missing = missing.to_str().unwrap();
+    for remote in ["a/b", "-x", ".", "", "a:b", "a b", "**", "*x"] {
+        let option = format!("--allow-remote={remote}");
+        let run = ostrya(
+            &["receive", "--repo", missing, "--one-way", &option],
+            None,
+            &[],
+        );
+        let stderr = refused(&run, remote);
+        assert!(
+            stderr.starts_with(&format!(
+                "error: invalid value '{remote}' for '--allow-remote "
+            )),
+            "{remote:?}: {stderr}"
+        );
+    }
+    assert!(!Path::new(missing).exists());
+}
+
+/// `--trust=NAME` verifies each new commit with the keys of the trust
+/// group. A signed commit passes. An unsigned commit gets
+/// `signature-required` on a plain ref and on a remote ref of
+/// `--allow-remote`, and the repository does not change. A name with no
+/// group ends the command before it reads its input.
+#[cfg(all(feature = "send", feature = "push", feature = "receive"))]
+#[test]
+fn receive_one_way_trust_verifies_each_new_commit() {
+    let tmp = TmpDir::new("receive-one-way-trust");
+    let base = tmp.path();
+    let signed = trust_source(base, "signed", true);
+    let unsigned = trust_source(base, "unsigned", false);
+    let signed_stream = send_stream(base, "signed-stream", &signed, &[BRANCH]);
+    let unsigned_stream = send_stream(base, "unsigned-stream", &unsigned, &[BRANCH]);
+    let unsigned_remote = send_stream(base, "unsigned-remote", &unsigned, &["--remote=os", BRANCH]);
+
+    let accepted = guest(base, "accepted", "archive");
+    append_config(&accepted, &trust_group_alone());
+    received(
+        &receive_from(&accepted, Some(&signed_stream), &["--trust=t"]),
+        "signed",
+    );
+    assert_eq!(resolve(&accepted, BRANCH).as_deref(), Some(COMMIT));
+
+    let refusing = guest(base, "refusing", "archive");
+    append_config(&refusing, &trust_group_alone());
+    let before = commit_store_state(&refusing);
+    let run = receive_from(&refusing, Some(&unsigned_stream), &["--trust=t"]);
+    refused_with(&run, "signature-required", &refusing, &before, "plain");
+    let run = receive_from(
+        &refusing,
+        Some(&unsigned_remote),
+        &["--allow-remote=os", "--trust=t"],
+    );
+    refused_with(&run, "signature-required", &refusing, &before, "remote");
+
+    let run = receive_from(&refusing, Some(&signed_stream), &["--trust=nope"]);
+    assert_eq!(
+        refused(&run, "nope"),
+        "error: invalid input: the config has no [ex-ostrya trust \"nope\"] group\n"
+    );
+    assert!(commit_store_state(&refusing) == before);
+    assert_no_staging(&refusing, "nope");
+}
+
+/// A second stream of the commit that the ref holds passes and changes
+/// nothing.
+#[cfg(all(feature = "send", feature = "push", feature = "receive"))]
+#[test]
+fn receive_one_way_a_second_send_of_the_same_commit_changes_nothing() {
+    let tmp = TmpDir::new("receive-one-way-again");
+    let source = commit_fixture(&tmp.path().join("source"));
+    let stream = send_stream(tmp.path(), "stream", &source, &[BRANCH]);
+    let guest = guest(tmp.path(), "guest", "archive");
+    received(&receive_from(&guest, Some(&stream), &[]), "first");
+    let before = commit_store_state(&guest);
+    received(&receive_from(&guest, Some(&stream), &[]), "second");
+    assert!(commit_store_state(&guest) == before);
+    assert_eq!(resolve(&guest, BRANCH).as_deref(), Some(COMMIT));
+}
+
+/// A stream of a child of the commit that the ref holds is a fast-forward
+/// and passes. A stream of an unrelated commit gets `non-fast-forward`. A
+/// stream of a grandchild also gets `non-fast-forward`, because the stream
+/// carries no parent commit and the repository does not hold the child.
+#[cfg(all(feature = "send", feature = "push", feature = "receive"))]
+#[test]
+fn receive_one_way_takes_a_fast_forward_and_refuses_other_updates() {
+    let tmp = TmpDir::new("receive-one-way-fast-forward");
+    let base = tmp.path();
+    let source = commit_fixture(&base.join("source"));
+    let first = send_stream(base, "first", &source, &[BRANCH]);
+    let child = commit_tree(&source, BRANCH, &one_file_tree(base, "child"), Some(COMMIT));
+    let child_stream = send_stream(base, "child-stream", &source, &[BRANCH]);
+    let grandchild = commit_tree(
+        &source,
+        BRANCH,
+        &one_file_tree(base, "grandchild"),
+        Some(&child),
+    );
+    let grandchild_stream = send_stream(base, "grandchild-stream", &source, &[BRANCH]);
+    let other = commit_fixture(&base.join("other"));
+    commit_tree(&other, BRANCH, &one_file_tree(base, "unrelated"), None);
+    let unrelated_stream = send_stream(base, "unrelated-stream", &other, &[BRANCH]);
+
+    let skipped = guest(base, "skipped", "archive");
+    received(&receive_from(&skipped, Some(&first), &[]), "first");
+    let before = commit_store_state(&skipped);
+    let run = receive_from(&skipped, Some(&grandchild_stream), &[]);
+    refused_with(&run, "non-fast-forward", &skipped, &before, "grandchild");
+    assert_eq!(resolve(&skipped, BRANCH).as_deref(), Some(COMMIT));
+
+    let guest = guest(base, "guest", "archive");
+    received(&receive_from(&guest, Some(&first), &[]), "first");
+    received(&receive_from(&guest, Some(&child_stream), &[]), "child");
+    assert_eq!(resolve(&guest, BRANCH), Some(child.clone()));
+    let before = commit_store_state(&guest);
+    let run = receive_from(&guest, Some(&unrelated_stream), &[]);
+    refused_with(&run, "non-fast-forward", &guest, &before, "unrelated");
+    received(
+        &receive_from(&guest, Some(&grandchild_stream), &[]),
+        "grandchild",
+    );
+    assert_eq!(resolve(&guest, BRANCH), Some(grandchild));
+}
+
+/// An empty input is an end of input before `Hello`. The command writes one
+/// `error:` line, exits 1, and changes nothing, also with
+/// `--stop-at-commit`.
+#[cfg(all(feature = "send", feature = "push", feature = "receive"))]
+#[test]
+fn receive_one_way_refuses_an_empty_input() {
+    let tmp = TmpDir::new("receive-one-way-empty");
+    let guest = guest(tmp.path(), "guest", "archive");
+    let before = commit_store_state(&guest);
+    for args in [&[][..], &["--stop-at-commit"][..]] {
+        let run = receive_from(&guest, None, args);
+        assert_eq!(
+            refused(&run, &format!("{args:?}")),
+            "error: i/o error: unexpected end of file\n",
+            "{args:?}"
+        );
+        assert!(commit_store_state(&guest) == before, "{args:?}");
+        assert_no_staging(&guest, &format!("{args:?}"));
+    }
+}
+
+/// Starts `ostrya receive --repo=<guest> --one-way <args>` with a pipe on
+/// standard input, writes the bytes of `stream` into the pipe, and returns
+/// the child and the write end of the pipe, which stays open.
+#[cfg(all(feature = "send", feature = "push", feature = "receive"))]
+fn receive_open_input(
+    guest: &Path,
+    stream: &Path,
+    args: &[&str],
+) -> (KillOnDrop, std::process::ChildStdin) {
+    let repo_arg = format!("--repo={}", guest.display());
+    let mut all = vec!["receive", repo_arg.as_str(), "--one-way"];
+    all.extend_from_slice(args);
+    let mut child = KillOnDrop {
+        inner: Some(
+            Command::new(env!("CARGO_BIN_EXE_ostrya"))
+                .args(&all)
+                .env_remove("LOGNAME")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("spawn ostrya"),
+        ),
+    };
+    let mut input = child.child().stdin.take().unwrap();
+    let bytes = std::fs::read(stream).unwrap();
+    // The stream fits in the buffer of the pipe, so the write does not wait
+    // for the child.
+    assert!(bytes.len() < 64 * 1024, "{}", bytes.len());
+    input.write_all(&bytes).unwrap();
+    (child, input)
+}
+
+/// Waits until `child` ends, and returns its run. Panics if `GUARD_WAIT`
+/// passes.
+#[cfg(all(feature = "send", feature = "push", feature = "receive"))]
+fn wait_for_end(child: KillOnDrop, shown: &str) -> Run {
+    use std::time::Instant;
+
+    let mut child = child;
+    let deadline = Instant::now() + GUARD_WAIT;
+    while child.child().try_wait().unwrap().is_none() {
+        assert!(
+            Instant::now() < deadline,
+            "`{shown}` did not end in {GUARD_WAIT:?}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+    let out = child.take().wait_with_output().unwrap();
+    Run {
+        status: out.status,
+        stdout: out.stdout,
+        stderr: out.stderr,
+    }
+}
+
+/// With `--stop-at-commit`, the command commits at the `Commit` frame and
+/// exits 0 while its standard input stays open.
+#[cfg(all(feature = "send", feature = "push", feature = "receive"))]
+#[test]
+fn receive_one_way_open_input_stops_at_commit() {
+    let tmp = TmpDir::new("receive-one-way-open-stop");
+    let source = commit_fixture(&tmp.path().join("source"));
+    let stream = send_stream(tmp.path(), "stream", &source, &[BRANCH]);
+    let guest = guest(tmp.path(), "guest", "archive");
+    let (child, input) = receive_open_input(&guest, &stream, &["--stop-at-commit"]);
+    let run = wait_for_end(child, "receive --one-way --stop-at-commit");
+    received(&run, "stop-at-commit");
+    assert_eq!(resolve(&guest, BRANCH).as_deref(), Some(COMMIT));
+    drop(input);
+}
+
+/// Without `--stop-at-commit`, the command waits for the end of its input
+/// after the `Commit` frame, and commits only when the writer closes the
+/// pipe.
+///
+/// The command opens its staging directory after it reads `Hello`. The
+/// test waits for that directory, then gives the command a short time to
+/// read the rest of the stream from the pipe.
+#[cfg(all(feature = "send", feature = "push", feature = "receive"))]
+#[test]
+fn receive_one_way_open_input_waits_for_the_close() {
+    use std::time::{Duration, Instant};
+
+    let tmp = TmpDir::new("receive-one-way-open-wait");
+    let source = commit_fixture(&tmp.path().join("source"));
+    let stream = send_stream(tmp.path(), "stream", &source, &[BRANCH]);
+    let guest = guest(tmp.path(), "guest", "archive");
+    let (mut child, input) = receive_open_input(&guest, &stream, &[]);
+    let deadline = Instant::now() + GUARD_WAIT;
+    while staging_entries(&guest).is_empty() {
+        assert!(
+            child.child().try_wait().unwrap().is_none(),
+            "the child ended before it opened a staging directory"
+        );
+        assert!(
+            Instant::now() < deadline,
+            "no staging directory in {GUARD_WAIT:?}"
+        );
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        child.child().try_wait().unwrap().is_none(),
+        "the child ended"
+    );
+    assert_eq!(resolve(&guest, BRANCH), None);
+    drop(input);
+    let run = wait_for_end(child, "receive --one-way");
+    received(&run, "close");
+    assert_eq!(resolve(&guest, BRANCH).as_deref(), Some(COMMIT));
+}
+
+/// A `bare` repository refuses a setuid file with `mode-refused`, and takes
+/// it with `--allow-privileged`. The test runs only as root.
+#[cfg(all(feature = "send", feature = "push", feature = "receive"))]
+#[test]
+fn receive_one_way_allow_privileged_as_root() {
+    if !is_root() {
+        eprintln!("skipping the privileged receive: not running as root");
+        return;
+    }
+    let tmp = TmpDir::new("receive-one-way-privileged");
+    let base = tmp.path();
+    let tree = base.join("tree");
+    std::fs::create_dir_all(&tree).unwrap();
+    let file = tree.join("tool");
+    std::fs::write(&file, b"setuid\n").unwrap();
+    std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o4755)).unwrap();
+    let source = create_repo(&base.join("source"), RepoMode::Archive);
+    ostrya(
+        &[
+            "commit",
+            "--repo",
+            source.to_str().unwrap(),
+            "-b",
+            BRANCH,
+            "-s",
+            SUBJECT,
+            tree.to_str().unwrap(),
+        ],
+        None,
+        &[],
+    )
+    .ok();
+    let stream = send_stream(base, "stream", &source, &[BRANCH]);
+    let guest = guest(base, "guest", "bare");
+    let before = commit_store_state(&guest);
+    let run = receive_from(&guest, Some(&stream), &[]);
+    refused_with(&run, "mode-refused", &guest, &before, "refused");
+    received(
+        &receive_from(&guest, Some(&stream), &["--allow-privileged"]),
+        "allowed",
+    );
+    assert!(resolve(&guest, BRANCH).is_some());
+    ostrya(&["fsck", "--repo", guest.to_str().unwrap()], None, &[]).ok();
+    let setuid = commit_store_state(&guest)
+        .0
+        .iter()
+        .filter(|(name, _)| name.ends_with(".file"))
+        .any(|(name, _)| std::fs::metadata(guest.join(name)).unwrap().mode() & 0o4000 != 0);
+    assert!(setuid, "no object carries the setuid bit");
+}

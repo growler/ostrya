@@ -134,9 +134,10 @@ for it.
   next run then gives an `Absent` finding for the commit that names it. The
   dependency check of the run runs before the tombstone step, so the run
   that deletes the dependency does not report it.
-- The rules of the one-way stream come from code alone (`StreamPolicy`), and
-  they can name remote refs. No client group applies to the stream. A later
-  command, for example `ostrya repo import`, can replace the stream.
+- The rules of the one-way stream come from code (`StreamPolicy`) or from
+  the options of `ostrya receive --one-way`, and they can name remote refs.
+  No client group applies to the stream. A later command, for example
+  `ostrya repo import`, can replace the stream.
 - The archive view serves `deltas/` in the `archive` mode alone. Outside
   that mode, the summary of an auth item and the ref listing name no static
   delta.
@@ -303,6 +304,10 @@ until each one is made.
   `BucketRepo::update_summary` wrote, and no library test runs a summary
   update against `rclone serve s3`. The test of `ostrya remote summary -u`
   on rclone covers the refusal.
+- No test runs `ostrya receive --one-way` on a virtio-serial port. The end
+  of input at once on a port whose host side is not connected is not
+  probed. CI does not run as root, so the test of `--allow-privileged`
+  skips in CI.
 - `cargo clippy -p ostrya-cli --all-targets` with a feature set other than
   the default set fails in `crates/ostrya-cli/src/man.rs` on items with no
   use. CI does not run it.

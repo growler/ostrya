@@ -2,8 +2,10 @@
 //! with no reply. [`Repo::receive_stream`] and
 //! [`Repo::receive_stream_to_commit`] read it.
 
-use futures_io::AsyncRead;
-use futures_lite::io::{AsyncBufReadExt, BufReader};
+use std::pin::Pin;
+
+use futures_io::{AsyncBufRead, AsyncRead};
+use futures_lite::io::BufReader;
 
 use super::StreamPolicy;
 use super::core::SessionCore;
@@ -220,10 +222,20 @@ where
     let mut rest = reader.into_inner();
     if after == AfterCommit::CheckEnd {
         // Any byte after `Commit` is `protocol`, also bytes that do not make
-        // a whole frame.
-        match rest.fill_buf().await {
-            Ok([]) => {}
-            Ok(_) => {
+        // a whole frame. The `fill_buf` future of `futures-lite` polls the
+        // reader a second time after a ready poll, and panics if that poll is
+        // `Pending`. A reader that reads on a blocking pool returns `Pending`
+        // when a read follows the end of input, so the check polls the reader
+        // once for each wake.
+        let end = std::future::poll_fn(|cx| {
+            Pin::new(&mut rest)
+                .poll_fill_buf(cx)
+                .map_ok(|bytes| bytes.is_empty())
+        })
+        .await;
+        match end {
+            Ok(true) => {}
+            Ok(false) => {
                 return Err(Failure::Wire(remote::Error::Protocol(
                     "bytes follow Commit in a one-way stream".into(),
                 )));

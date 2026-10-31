@@ -598,6 +598,49 @@ fn bytes_after_commit_are_protocol() {
     }
 }
 
+/// A reader of a byte buffer that returns `Pending` before each read, as a
+/// reader that reads on a blocking pool does. A read at the end of the
+/// buffer also returns `Pending` first.
+struct Yielding<'a> {
+    bytes: &'a [u8],
+    ready: bool,
+}
+
+impl futures_io::AsyncRead for Yielding<'_> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        let me = self.get_mut();
+        if !me.ready {
+            me.ready = true;
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+        me.ready = false;
+        let n = buf.len().min(me.bytes.len());
+        buf[..n].copy_from_slice(&me.bytes[..n]);
+        me.bytes = &me.bytes[n..];
+        Poll::Ready(Ok(n))
+    }
+}
+
+/// `receive_stream` commits from a reader that returns `Pending` before each
+/// read, also before the read of the end of input after `Commit`.
+#[test]
+fn a_stream_commits_from_a_reader_that_yields_before_each_read() {
+    let tmp = TmpDir::new("one-way-yielding");
+    let repo = new_repo(&tmp, RepoMode::BareUser, "");
+    let bytes = fixture_stream(Encoding::Raw).bytes();
+    let reader = Yielding {
+        bytes: &bytes,
+        ready: false,
+    };
+    block_on(repo.receive_stream(reader, &policy())).unwrap();
+    assert!(repo.path().join("refs/heads/test/main").exists());
+}
+
 /// The size of the read buffer of the receiver of a one-way stream.
 const READ_BUFFER: usize = 64 * 1024;
 

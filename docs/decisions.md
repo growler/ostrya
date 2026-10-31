@@ -2174,6 +2174,113 @@ commit, the collection selectors of the ref listing, and the object type
 number did not change. Thus a receiver that does not take the type 100
 refuses a sender that sends an image.
 
+## The one-way stream in the command
+
+`ostrya send --one-way` writes a one-way stream to standard output, and
+`ostrya receive --one-way` reads it into a repository. A host script
+deploys commits into the repository of a new VM with these two commands,
+and the host and the guest do not talk in two directions. The stream
+travels in a file, in a pipe, or on a channel that gives no end of input,
+for example virtio-serial or vsock.
+
+The rules of the two commands:
+
+- The receive needs a repository that exists. The guest script runs
+  `ostrya init --mode=MODE` first. No rule applies to an empty repository.
+- The receive reads standard input, or the file of `--input`. The CLI opens
+  FILE with `std::fs::File::open` and reads it through
+  `ostrya_rt::FileReader`, as it reads a tar file. FILE can be a regular
+  file, a character device, or a FIFO, and the open of a FIFO waits for a
+  writer. `-` is a file with that name. The option opens no socket: a
+  vsock socket reaches standard input through a relay, for example a
+  systemd socket unit with `Accept=yes`. A FILE that does not open gives
+  `error: FILE: REASON` and exit 1. A directory gets no check of its own:
+  the first read fails before the transaction opens.
+- The receive opens the repository, then builds the keys of the trust
+  group, then opens its input. A bad trust group thus ends the command
+  before the open of a FIFO waits for a writer.
+- The ref rules are the default rules of `StreamPolicy` and the options. A
+  plain ref takes a fast-forward update. `--allow-remote=REMOTE`, which
+  repeats, adds the rule `REMOTE:**`, and `--allow-remote='*'` adds `*:**`.
+  The command line has no pattern syntax. The stream cannot carry a delete,
+  so the receive has no `--allow-delete`.
+- The commands make no update that is not a fast-forward. The send has no
+  `--force`, and the receive has no `--allow-non-fast-forward`.
+- Each update of the send expects any state of the ref. With an update that
+  expects the ref absent, a second send of a ref fails with
+  `ref-mismatch`, also for a fast-forward. With any state, the receiver
+  applies the fast-forward check, and a send of the commit that the ref
+  holds passes and changes nothing. The send has no option that expects the
+  ref absent.
+- The stream carries no parent commit. The history check of the receive
+  stops at the first commit that neither side holds, so a send of a commit
+  whose parent the guest does not hold gets `non-fast-forward`. Such a send
+  is not a supported use, and the receive has no path of its own for it.
+- `--trust=NAME` names a trust group of the receiving repository, through
+  `TrustedKeys::from_trust_group`. Each new commit must pass its keys. A
+  dependency gets no verification of its own, because field 2 of the signed
+  commit holds the checksum of each dependency.
+- Privileged content is refused by default, as in the library.
+  `--allow-privileged` sets `StreamPolicy::allow_privileged`.
+- The send takes `SRC[:DST]` refspecs with the parse and the rules of
+  `ostrya push`, through `Repo::export_updates`. `--remote=REMOTE` writes
+  each DST as `REMOTE:DST`. The delete form `:DST` is refused.
+- `send --remote=REMOTE` and `receive --allow-remote=REMOTE` check REMOTE
+  with `ostrya::valid_remote_name`, the rule of `remote add`.
+  `--allow-remote` also takes `*`. The option parser checks each value
+  before the repository opens.
+- `--one-way` conflicts with `--client` on both commands. The one-way
+  commands read no client group, no server group, no key group, and no
+  `LOGNAME`. The receive reads the trust group of `--trust` alone.
+- `send --one-way` and each option of `send` that needs `--one-way` exist
+  only in a build with the features `send` and `push` of `ostrya-cli`. The
+  feature `send` does not turn on `ostrya/push`. Each of these options
+  carries the same `cfg`, because a `requires` or a `conflicts_with` cannot
+  name an argument that the build leaves out.
+- The output follows `ostrya receive` and `ostrya send`. The send writes the
+  stream alone to standard output. The receive writes nothing to standard
+  output and one `warning: STEP: MESSAGE` line for each warning of the
+  report. A failure writes one `error:` line and exits 1. Neither command
+  writes more under `--verbose`.
+- The receive has no time limit. On a channel with no end of input, it
+  waits for the host and holds the shared repository lock, unless the config
+  sets `[core] locking=false`. The man page tells the user to run the
+  command under `timeout(1)`.
+- On virtio-serial, a receive that starts before the host side of the port
+  connects can see an end of input at once and fail. The man page states
+  this. It is not probed.
+
+The stop at `Commit`:
+
+- A channel with no end of input needs `--stop-at-commit`. With it, the
+  receive commits at the `Commit` frame and checks no byte after it. The
+  wire format is the same with and without the option. Bytes that the buffer
+  holds after the frame are discarded with no check, so the result does not
+  depend on the timing of the channel.
+- The reader of the CLI can read ahead of the library call. Under the smol
+  backend, a pool thread of `FileReader` reads the channel after the
+  `Commit` frame, and the bytes that it reads are lost to a later reader.
+  The process exits when the receive ends, under each backend. So the docs
+  state that the receive checks no byte after `Commit`, and do not state
+  that the process reads no byte after it. The CLI puts no other buffer
+  around the input: under the tokio backend, the drop of the runtime waits
+  for a read in flight.
+- The library gives the stop as the method
+  `Repo::receive_stream_to_commit(input, policy)`, which shares the body of
+  `Repo::receive_stream`. The signature of `Repo::receive_stream` and the
+  fields of `StreamPolicy` do not hold the stop.
+
+Two alternatives for the stop were rejected:
+
+- A field of `StreamPolicy`. A public field breaks each struct literal
+  of a caller with no `..Default::default()`. The fields of the policy state
+  what the receiver accepts, and the stop states how the input of the
+  channel ends, which the caller knows at the call. With a field, a caller
+  that reads a file and a port with the same rules needs two policy values,
+  and `StreamPolicy` is not `Clone`.
+- A parameter of `receive_stream`. It breaks each call, and gives
+  nothing that the method does not give.
+
 ## Related commits
 
 A commit names its related commits in two fixed fields, both of type

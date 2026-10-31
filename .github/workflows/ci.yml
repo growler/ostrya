@@ -207,6 +207,15 @@ jobs:
       - name: ostrya-cli without the s3 feature refuses an s3 address
         run: cargo test -p ostrya-cli --no-default-features --features smol,push --test s3_absent
 
+      # `receive --one-way` with an input that stays open after the stream.
+      # The smol backend reads standard input ahead on a pool thread, and the
+      # tokio backend does not. The step "Test" runs with `--all-features`,
+      # which selects tokio. The default set of `ostrya-cli` selects smol and
+      # holds `send`, `push`, and `receive`, so this step runs the tests under
+      # smol and uses the build of the step "PCRE2 is linked statically".
+      - name: receive --one-way with an open input under the smol backend
+        run: cargo test -p ostrya-cli --test cli receive_one_way_open_input
+
       # The HTTP server compiles on the smol backend with its own feature set,
       # and `ostrya serve` compiles without `ostrya receive`.
       - name: ostrya-server on the smol backend compiles

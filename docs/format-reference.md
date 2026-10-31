@@ -4502,9 +4502,10 @@ adds no server signature, writes no anchor commit, and does not regenerate
 the summary. It calls no hook of a host application.
 
 A one-way stream keeps rules of its own, and a client group does not apply to
-it. A host application gives the rules in code. Each rule has a pattern with
-an optional remote part, so a one-way stream can write a remote ref
-`REMOTE:NAME`. A rule states if it accepts an update, the trusted keys of
+it. A host application gives the rules in code, or `ostrya receive --one-way`
+builds them from its options. Each rule has a pattern with an optional remote
+part, so a one-way stream can write a remote ref `REMOTE:NAME`. A rule
+states if it accepts an update, the trusted keys of
 check 8, if it allows a delete, and if it allows an update that is not a
 fast-forward under `force`. Check 4 refuses an update that no rule covers
 and an update whose rule does not accept it, with `ref-denied`. Check 8 with

@@ -393,11 +393,12 @@ It refuses \fB\%[ex\-ostrya receive]\fR and \fB\%[ex\-ostrya receive "PATTERN"]\
 The quoted part of a group name is not empty and holds no \fB\%"\fR and no control character.
 A repeated key takes the last value, so each list key is one line in a group.
 .PP
-\fB\%ostrya receive\fR, \fB\%ostrya serve\fR, and \fB\%ostrya send\fR read and check the client groups and the server group at start.
-\fB\%ostrya receive\fR and \fB\%ostrya serve\fR also build each trust group and each key group one time, also a group that no client group names.
+\fB\%ostrya receive\fR and \fB\%ostrya send\fR without \fB\%\-\-one\-way\fR, and \fB\%ostrya serve\fR, read and check the client groups and the server group at start.
+\fB\%ostrya receive\fR without \fB\%\-\-one\-way\fR and \fB\%ostrya serve\fR also build each trust group and each key group one time, also a group that no client group names.
 Thus a key source that ostrya cannot read stops the command.
 \fB\%ostrya send\fR reads no key of a trust group or a key group.
-A pull from a remote with the key \fB\%trust\fR, and \fB\%ostrya pull\-local \-\-trust=NAME\fR, check and build the one trust group that they name, and no other group.
+\fB\%ostrya receive \-\-one\-way\fR and \fB\%ostrya send \-\-one\-way\fR read no client group, no server group, and no key group.
+A pull from a remote with the key \fB\%trust\fR, \fB\%ostrya pull\-local \-\-trust=NAME\fR, and \fB\%ostrya receive \-\-one\-way \-\-trust=NAME\fR check and build the one trust group that they name, and no other group.
 A bad group stops the command with status 1.
 A push session names its namespace in \fB\%Hello\fR: the local refs, or one collection.
 The \fB\%collection\-id\fR of \fB\%[core]\fR names the local refs.

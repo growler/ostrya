@@ -1666,14 +1666,20 @@ mod tests {
             // verifier runs. Thus the one poll gives each verifier of the
             // axis to the pool.
             let first = std::future::poll_fn(|cx| Poll::Ready(check.as_mut().poll(cx))).await;
-            if first.is_pending() {
-                let deadline = Instant::now() + Duration::from_secs(5);
-                while accepting.threads().is_empty() && Instant::now() < deadline {
-                    std::thread::sleep(Duration::from_millis(1));
+            match first {
+                Poll::Ready(result) => {
+                    result.unwrap();
+                    assert_eq!(accepting.threads().len(), 1);
+                }
+                Poll::Pending => {
+                    let deadline = Instant::now() + Duration::from_secs(5);
+                    while accepting.threads().is_empty() && Instant::now() < deadline {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
+                    assert_eq!(accepting.threads().len(), 1);
+                    check.await.unwrap();
                 }
             }
-            assert_eq!(accepting.threads().len(), 1);
-            check.await.unwrap();
         });
         rejecting.assert_one_foreign_call();
         accepting.assert_one_foreign_call();

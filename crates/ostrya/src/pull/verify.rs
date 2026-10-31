@@ -9,6 +9,8 @@
 //! path shares that module. [`PullVerify`](crate::PullVerify) states the rules
 //! that a caller sees.
 
+use std::sync::Arc;
+
 use ostrya_core::{Checksum, Value};
 
 use crate::error::{Error, Result};
@@ -72,10 +74,12 @@ impl Verification {
     /// nothing.
     ///
     /// The parse of `summary.sig` and each verifier run on the blocking pool,
-    /// because each file can be as large as the read cap of a summary.
+    /// because each file can be as large as the read cap of a summary. The
+    /// verifiers share the `Arc` of `summary`, so the check makes no copy of
+    /// the summary.
     pub(crate) async fn check_summary(
         &self,
-        summary: Option<&[u8]>,
+        summary: Option<&Arc<Vec<u8>>>,
         signature: Option<Vec<u8>>,
     ) -> Result<Option<Vec<u8>>> {
         if !self.summary.applies() {
@@ -275,6 +279,23 @@ mod tests {
         recorder.assert_no_copy_of(&superblock);
     }
 
+    /// The summary check gives a summary in an [`Arc`] to the verifier with
+    /// no copy.
+    #[test]
+    fn the_summary_check_gives_the_summary_with_no_copy() {
+        use crate::verify::trust::tests::{ThreadRecorder, dict_with};
+
+        let recorder = ThreadRecorder::new("ostree.sign.ed25519");
+        let keys = TrustedKeys::new(vec![Arc::new(recorder.clone()) as Arc<dyn Verifier>]).unwrap();
+        let verification = Verification::from_trust(PullTrust::unverified().with_summary(keys));
+        let dict = dict_with("ostree.sign.ed25519", vec![7; 64]);
+        let signature = crate::summary::serialize_signature_dict(&dict).unwrap();
+        let summary = Arc::new(PAYLOAD.to_vec());
+        ostrya_rt::block_on(verification.check_summary(Some(&summary), Some(signature))).unwrap();
+        recorder.assert_one_foreign_call();
+        recorder.assert_no_copy_of(&summary);
+    }
+
     /// A trust with summary keys alone checks the summary, and no commit and
     /// no static delta. `with_summary` replaces the summary keys of the trust.
     #[test]
@@ -304,13 +325,16 @@ mod tests {
 
         let own_sig = summary_sig(SECRET_B64);
         let other = summary_sig(OTHER_SECRET_B64);
+        let summary = Arc::new(PAYLOAD.to_vec());
         let (own, other, missing) = ostrya_rt::block_on(async {
             (
                 verification
-                    .check_summary(Some(PAYLOAD), Some(own_sig.clone()))
+                    .check_summary(Some(&summary), Some(own_sig.clone()))
                     .await,
-                verification.check_summary(Some(PAYLOAD), Some(other)).await,
-                verification.check_summary(Some(PAYLOAD), None).await,
+                verification
+                    .check_summary(Some(&summary), Some(other))
+                    .await,
+                verification.check_summary(Some(&summary), None).await,
             )
         });
         assert_eq!(
@@ -398,7 +422,8 @@ mod tests {
         assert!(verification.checks_commits());
         assert!(verification.checks_summary());
         let own = summary_sig(SECRET_B64);
-        ostrya_rt::block_on(verification.check_summary(Some(PAYLOAD), Some(own)))
+        let summary = Arc::new(PAYLOAD.to_vec());
+        ostrya_rt::block_on(verification.check_summary(Some(&summary), Some(own)))
             .expect("a summary signed with the key of the section passes");
     }
 

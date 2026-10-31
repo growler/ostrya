@@ -1146,18 +1146,20 @@ impl Repo {
             // the refs that the summary resolves and the deltas that it
             // advertises. As a result, a summary that the policy refuses stops
             // the pull before its first object request.
+            let summary = root.summary.take().map(Arc::new);
             root.signature = verification
-                .check_summary(root.summary.as_deref(), root.signature.take())
+                .check_summary(summary.as_ref(), root.signature.take())
                 .await?
                 .filter(|_| copies_summary);
             // A summary can be as large as its read cap, so the parse runs on
             // the blocking pool. The bytes come back only for the write of a
-            // mirror pull, and else drop there.
-            match root.summary.take() {
+            // mirror pull, and else drop there. The check is done, so the job
+            // holds the one `Arc` of the bytes, and the unwrap makes no copy.
+            match summary {
                 Some(bytes) => {
                     let (parsed, bytes) = ostrya_rt::unblock(move || {
                         let parsed = Summary::parse(&bytes);
-                        (parsed, copies_summary.then_some(bytes))
+                        (parsed, copies_summary.then(|| Arc::unwrap_or_clone(bytes)))
                     })
                     .await;
                     root.summary = bytes;

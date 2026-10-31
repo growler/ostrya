@@ -916,12 +916,13 @@ async fn summary_refs(
 ) -> Result<Refs> {
     let summary = if verification.checks_summary() {
         let (summary, signature) = source.summary_files().await?;
+        let summary = summary.map(Arc::new);
         verification
-            .check_summary(summary.as_deref(), signature)
+            .check_summary(summary.as_ref(), signature)
             .await?;
         summary
     } else {
-        source.read_root(SUMMARY_FILE).await?
+        source.read_root(SUMMARY_FILE).await?.map(Arc::new)
     };
     let Some(bytes) = summary else {
         if source.has_bucket() {
@@ -933,7 +934,6 @@ async fn summary_refs(
         }
         return Ok((Vec::new(), None));
     };
-    let bytes = Arc::new(bytes);
     let (_, listed) = parse_refs(Arc::clone(&bytes), id, names).await?;
     Ok((listed, Some(bytes)))
 }

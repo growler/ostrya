@@ -1782,7 +1782,8 @@ impl Repo {
             crate::summary::SUMMARY_FILE,
             crate::summary::SUMMARY_READ_CAP,
         )
-        .await?;
+        .await?
+        .map(Arc::new);
         if checks_summary {
             let signature = delta::read_opened(
                 signature_file,
@@ -1791,7 +1792,7 @@ impl Repo {
             )
             .await?;
             verification
-                .check_summary(summary.as_deref(), signature)
+                .check_summary(summary.as_ref(), signature)
                 .await?;
         }
         if needs_summary && summary.is_none() {

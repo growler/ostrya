@@ -2254,7 +2254,13 @@ trusted-keyring directory is trusted for all remotes. That directory is
 `<datadir>/ostree/trusted.gpg.d/` (`/usr/share/ostree/trusted.gpg.d/`). The
 `OSTREE_GPG_HOME` environment variable replaces it with the directory that it
 names. The remote also trusts each keyring that the `gpgkeypath` key of its
-config section names.
+config section names. A `gpgkeypath` entry is a keyring file or a directory.
+The remote trusts each regular file of the directory, with any name. The read
+skips a file that does not hold the bytes `-----BEGIN PGP` and that is a GnuPG
+keybox or is not a whole OpenPGP packet stream. Each other file that the read
+cannot read whole as a keyring fails the read, and the refusal names the path
+of the file. Armor that does not decode to a keyring and a packet stream that
+the parser refuses are examples.
 
 Observed behavior: the `--gpg-sign` signature of each implementation verifies
 through `show --gpg-verify-remote` of the other, with the exported public

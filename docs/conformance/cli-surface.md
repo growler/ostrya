@@ -475,22 +475,39 @@ deliberately not reproduced:
   exit 1. The tool writes `error: opendir(ENTRY): No such file or
   directory`. The port writes `error: signature: gpgkeypath entry 'ENTRY'
   cannot be read: No such file or directory (os error 2)`;
-- a `gpgkeypath` entry that names a directory parts the two. The tool reads
-  each file of the directory as a keyring, whatever its name. The port reads
-  only the regular `*.gpg` files of the directory, as a pull of the port
-  does. So a
-  directory that holds only `a.keyring` gives `Good signature from "<user
-  id>"` in the tool and `Can't check signature: public key not found` in the
-  port;
+- a `gpgkeypath` file over 4 MiB, or with more than 256 certificates, parts
+  the two. The port refuses the file by its path, and the report exits 1
+  after the commit report. Two `gpgkeypath` directories give `Good signature
+  from "<user id>"` in `ostree` 2026.1: a directory that holds the keyring and
+  a file of 4 MiB and one byte of zero bytes, and a directory that holds a
+  file of 5 MiB of blank lines and then the armored keyring. The answer of
+  the tool to a keyring with more than 256 certificates is not observed ("GPG
+  verification differences", item 5);
+- a `gpgkeypath` file that holds the bytes `-----BEGIN PGP` and whose armor
+  the port cannot decode to a keyring parts the two. Examples are a line of
+  text before the armor, an armor header that is not valid UTF-8, and a
+  block that is not valid base64 after a valid block. The tool reads the
+  armor of such a file. With the armored export of the key after a line of
+  text, it gives `Good signature from "<user id>"`. With a revoked export, it
+  reports `Key revoked`. The port refuses the file by its path, and the report
+  exits 1 after the commit report ("GPG verification differences", item 8);
+- a `gpgkeypath` file that frames as a whole OpenPGP packet stream and that
+  the parser of the port refuses parts the two. The port refuses the file by
+  its path, and the report exits 1 after the commit report. A directory that
+  holds the keyring and a file of the three bytes `c6 01 04`, a Public-Key
+  packet that holds only a version byte, gives `Good signature from "<user
+  id>"` at exit 0 in `ostree` 2026.1 ("GPG verification differences", item
+  3);
 - the verdict the report states rests on the port's own trust and validity
   policy, which "GPG verification differences" compares with GnuPG 2.4.9.
-  Seven differences stand there, and each one can make a `show` verdict part
+  Eight differences stand there, and each one can make a `show` verdict part
   from the tool's: the fixed digest policy, the GnuPG keybox refusal, the
   refusal a keyring the parser rejects draws, the 256-bit minimum digest an
   Ed25519 key carries, the keyring and signature-blob input caps, a revocation
   read over every certificate the trusted set holds for the key rather than over
-  the first alone, and the key expiry read as the newest statement two exports
-  of one certificate carry rather than as the statement the first export makes.
+  the first alone, the key expiry read as the newest statement two exports
+  of one certificate carry rather than as the statement the first export makes,
+  and the armor that the port does not decode.
 
 `show --gpg-verify-remote=REMOTE` reads `REMOTE.trustedkeys.gpg` in the
 repository and in `/etc/ostree/remotes.d/`, the global trusted set, and each
@@ -4661,7 +4678,7 @@ policy, and the `gpgv` 2.4.9 behavior that the rule reproduces.
 `crates/ostrya/tests/verify_gpg_agreement.rs` compares the port with `gpgv`
 over a fixture matrix, and declares each difference that its fixtures reach.
 
-Seven differences from GnuPG 2.4.9 stand. None of them is a fact of the
+Eight differences from GnuPG 2.4.9 stand. None of them is a fact of the
 repository. Each one can make a verdict of the port part from the verdict of
 the tool, in `show`, in a `pull` that verifies, and in the keyring reads of
 `remote gpg-import` and `remote gpg-list-keys`.
@@ -4676,11 +4693,26 @@ the tool, in `show`, in a `pull` that verifies, and in the keyring reads of
 2. The GnuPG keybox. The port refuses a keyring file or a keyring blob that
    carries the `KBXf` magic at byte offset 8, and the message names the path
    or the blob. `gpgv --keyring <homedir>/pubring.kbx <sig> <data>` reads the
-   keybox and reports `GOODSIG`.
+   keybox and reports `GOODSIG`. A file of a `gpgkeypath` entry is the
+   exception: the port skips a keybox with no armor there, with no message,
+   and trusts no key of it. `ostree` 2026.1 also trusts no key of a keybox that a
+   `gpgkeypath` entry names: `show --gpg-verify-remote=<remote>` reports
+   `Can't check signature: public key not found`, and a pull refuses the
+   commit.
 3. A keyring that the parser refuses. The port refuses the whole file if the
    parser refuses the keyring, or if the packet stream of the keyring does not
    frame to its end. A command that reads the file exits non-zero, and the
    message names the keyring. No key of the file gets into the trusted set.
+   A file of a `gpgkeypath` entry is the exception: if the file holds no
+   bytes `-----BEGIN PGP` and its packet stream does not frame to its end, the
+   port skips the whole file with no message, and no key of the file gets
+   into the trusted set. The port refuses by its path a file of a
+   `gpgkeypath` entry whose packet stream frames to its end and that the
+   parser refuses. In a `gpgkeypath` directory that also holds the keyring of
+   the key, `ostree` 2026.1 reads a file of the three bytes `c6 01 04` with no
+   message: `show --gpg-verify-remote=<remote>` reports `Good signature from
+   "..."`, and `pull-local --remote=<remote> --gpg-verify` imports the
+   commit. The port refuses the file by its path in both commands.
    The tools read such a keyring up to the packet at which they stop, and what
    they trust then depends on the position of that packet:
    - A keyring holds one intact certificate and then 40 bytes of a second
@@ -4711,7 +4743,10 @@ the tool, in `show`, in a `pull` that verifies, and in the keyring reads of
 5. The input limits. The port refuses, by name, a stored signature blob over
    1 MiB or with more than 64 signature packets, and a keyring over 4 MiB or
    with more than 256 certificates. `gpgv` reads an input of each of these
-   four shapes and reports on it.
+   four shapes and reports on it. The port also refuses a file of a
+   `gpgkeypath` entry over these two keyring limits. In a `gpgkeypath`
+   directory, `ostree` 2026.1 reads a file of 5 MiB that holds blank lines
+   and then the armored keyring, and trusts the key.
 6. A revocation in a second certificate of a key. The trusted set can hold
    several certificates for one key. The port reads each of them for a
    revocation, so a revocation in any one of them refuses the signature.
@@ -4748,6 +4783,36 @@ the tool, in `show`, in a `pull` that verifies, and in the keyring reads of
    past given to a key that stated no expiry. The merged keyring and the port
    agree on all three pairs. `gpgv` over the two exports concatenated answers
    on the export that is first.
+8. Armor that the port does not decode. The port reads a keyring as armored
+   only if its first character that is not white space starts the line
+   `-----BEGIN PGP`. The port reads a keyring with other text before the
+   armor as a binary packet stream, which does not frame to its end. So the
+   port refuses such a keyring (item 3). The port refuses by its path a file
+   of a `gpgkeypath` entry that holds the bytes `-----BEGIN PGP`, if one of
+   these conditions applies:
+   - Bytes other than white space come before the first armor line, or bytes
+     come before `-----BEGIN PGP` on its line. A line of text and a UTF-8
+     byte order mark are examples.
+   - The armor does not decode: the file is not valid UTF-8, or a block holds
+     text that is not valid base64, also after a valid block.
+   - The decoded bytes are not a keyring that the parser reads whole.
+
+   `ostree` 2026.1 reads the armor of such a file, and a revocation in it
+   refuses the commit. A `gpgkeypath` directory holds the export of the key
+   in `a.gpg` and the armored export of the revoked key in `b.asc`. With a
+   line of text before the armor, an armor header line `Comment:` that holds
+   a byte that is not valid UTF-8, or a block that is not valid base64 after
+   the armor, `pull-local --remote=<remote> --gpg-verify` of the tool reports
+   `Key revoked` at exit 1. With a line of text before the armor,
+   `show --gpg-verify-remote=<remote>` of the tool reports `Key revoked`. A
+   skip of `b.asc` would make the port trust the revoked key, so the port
+   refuses the file by its path. With a UTF-8 byte order mark before the
+   armor, or with two blank lines and two spaces before the armor line, the
+   tool imports the commit at exit 0, and the port refuses the file by its
+   path. With the export of the key after a line of text and no `a.gpg`, the
+   tool trusts the key: `show --gpg-verify-remote=<remote>` reports `Good
+   signature from "..."`, and a pull imports the commit. The port refuses the
+   file by its path, and a pull of the port refuses the commit.
 
 ## Port extensions with no counterpart in the tool
 

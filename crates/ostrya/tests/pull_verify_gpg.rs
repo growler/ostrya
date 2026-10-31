@@ -567,8 +567,8 @@ fn gpgkeypath_adds_keyrings_and_a_missing_entry_fails() {
         let keydir = base.join("keydir");
         std::fs::create_dir(&keydir).unwrap();
         signer_home.export_to(&keydir.join("pull.gpg"));
-        // The directory scan reads only regular files that end in `.gpg`, so
-        // it skips this file. This shows that the scan selects the keyrings.
+        // The directory scan reads this file too. It is not an OpenPGP
+        // keyring, so the load skips it and the pull does not fail.
         std::fs::write(keydir.join("notes.txt"), b"not a keyring\n").unwrap();
 
         for (name, entry) in [
@@ -600,6 +600,193 @@ fn gpgkeypath_adds_keyrings_and_a_missing_entry_fails() {
             "{err}"
         );
         assert!(dst.list_refs(None).await.unwrap().is_empty());
+    });
+}
+
+/// A `gpgkeypath` directory gives each regular file in it, with any name. A
+/// file that is not an OpenPGP keyring adds no key, and the pull does not
+/// fail on it. The same rule applies to a file entry. A file that cannot be
+/// read fails the pull by its name.
+#[test]
+fn a_gpgkeypath_directory_reads_each_regular_file() {
+    use std::os::unix::fs::PermissionsExt;
+
+    if !gpg_available() {
+        return;
+    }
+    let tmp = TmpDir::new("pull-verify-gpg-keypath-files");
+    let base = tmp.path();
+    let signer_home = GpgHome::create(base, "gnupg", "Ostrya Pull <pull@example.invalid>");
+    let text = b"This directory holds the trusted keys of the remote.\n";
+
+    block_on(async {
+        let (src, commit) = source_repo(base).await;
+        src.sign_commit(&commit, &signer_home.signer())
+            .await
+            .unwrap();
+
+        let keyring_alone = base.join("keyring-alone");
+        std::fs::create_dir(&keyring_alone).unwrap();
+        signer_home.export_to(&keyring_alone.join("a.keyring"));
+        let junk_first = base.join("junk-first");
+        std::fs::create_dir(&junk_first).unwrap();
+        std::fs::write(junk_first.join("junk.gpg"), text).unwrap();
+        signer_home.export_to(&junk_first.join("b.keyring"));
+        let junk_file = base.join("junk.txt");
+        std::fs::write(&junk_file, text).unwrap();
+        let keyring = base.join("trusted.gpg");
+        signer_home.export_to(&keyring);
+        for (name, keypath) in [
+            ("dst-keyring-alone", keyring_alone.display().to_string()),
+            ("dst-junk-first", junk_first.display().to_string()),
+            (
+                "dst-junk-file",
+                format!("{};{}", junk_file.display(), keyring.display()),
+            ),
+        ] {
+            let (_path, dst) =
+                dest_with_remote(base, name, &format!("gpgkeypath={keypath}\n")).await;
+            gpg_pull(&dst, &src).await.unwrap();
+            assert_eq!(
+                dst.resolve_rev("origin:main", true).await.unwrap(),
+                Some(commit),
+                "gpgkeypath={keypath}"
+            );
+        }
+
+        // A directory of text alone gives no key. The pull reads the
+        // directory with no error, and then trusts no signature.
+        let text_alone = base.join("text-alone");
+        std::fs::create_dir(&text_alone).unwrap();
+        std::fs::write(text_alone.join("README"), text).unwrap();
+        let (_path, dst) = dest_with_remote(
+            base,
+            "dst-text-alone",
+            &format!("gpgkeypath={}\n", text_alone.display()),
+        )
+        .await;
+        let err = gpg_pull(&dst, &src).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m)
+                if m.contains("no GPG signature is from a trusted key")),
+            "{err}"
+        );
+        assert!(dst.list_refs(None).await.unwrap().is_empty());
+
+        // A file that cannot be opened fails the pull by its name, though the
+        // directory holds the key in a second file.
+        let unreadable = base.join("unreadable");
+        std::fs::create_dir(&unreadable).unwrap();
+        signer_home.export_to(&unreadable.join("a.gpg"));
+        let locked = unreadable.join("z.gpg");
+        signer_home.export_to(&locked);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // A process that holds the override of file permissions, as root
+        // does, opens the file. The arm then has no refusal to observe.
+        if std::fs::File::open(&locked).is_ok() {
+            eprintln!("skipping the unreadable arm: the file opens with mode 000");
+            return;
+        }
+        let (_path, dst) = dest_with_remote(
+            base,
+            "dst-unreadable",
+            &format!("gpgkeypath={}\n", unreadable.display()),
+        )
+        .await;
+        let err = gpg_pull(&dst, &src).await.unwrap_err();
+        assert!(
+            matches!(&err, Error::Signature(m) if m.contains("z.gpg")
+                && m.contains("cannot be opened")),
+            "{err}"
+        );
+        assert!(dst.list_refs(None).await.unwrap().is_empty());
+    });
+}
+
+/// A revocation in an armored file of a `gpgkeypath` directory refuses the
+/// commit, also when a second file trusts the key. A pull with
+/// `remote=origin` reads the directory.
+///
+/// The directory holds the key in `a.gpg` and the revoked key in `b.asc`.
+/// With the armor alone in `b.asc`, the pull reads the revocation and trusts
+/// no signature. With a line of text before the armor, the pull cannot read
+/// `b.asc` whole, and refuses it by its path. A skip of `b.asc` would trust
+/// the revoked key, and the `ostree` command reads the revocation from both
+/// forms of the file.
+#[test]
+fn a_revocation_in_armor_of_a_gpgkeypath_file_refuses_the_commit() {
+    if !gpg_available() {
+        return;
+    }
+    let tmp = TmpDir::new("pull-verify-gpg-keypath-revocation");
+    let base = tmp.path();
+    let signer_home = GpgHome::create(base, "gnupg", "Ostrya Pull <pull@example.invalid>");
+
+    block_on(async {
+        let (src, commit) = source_repo(base).await;
+        src.sign_commit(&commit, &signer_home.signer())
+            .await
+            .unwrap();
+        let keyring = base.join("a.gpg");
+        signer_home.export_to(&keyring);
+
+        // `gpg` stores a revocation certificate when it generates a key. Its
+        // armor lines start with `:`, so that an import needs an edit.
+        let stored = signer_home
+            .dir
+            .join("openpgp-revocs.d")
+            .join(format!("{}.rev", signer_home.fingerprint()));
+        let certificate = std::fs::read_to_string(stored)
+            .unwrap()
+            .replace(":-----BEGIN", "-----BEGIN");
+        let revocation = base.join("revocation.asc");
+        std::fs::write(&revocation, certificate).unwrap();
+        let status = signer_home
+            .gpg()
+            .arg("--import")
+            .arg(&revocation)
+            .status()
+            .unwrap();
+        assert!(status.success(), "gpg --import of the revocation failed");
+        let out = signer_home
+            .gpg()
+            .args(["--armor", "--export"])
+            .output()
+            .unwrap();
+        assert!(out.status.success() && !out.stdout.is_empty());
+        let revoked = out.stdout;
+
+        for (name, text) in [("plain", &b""[..]), ("after-text", &b"Trusted keys\n"[..])] {
+            let keys = base.join(format!("keys-{name}"));
+            std::fs::create_dir(&keys).unwrap();
+            std::fs::copy(&keyring, keys.join("a.gpg")).unwrap();
+            let armored = keys.join("b.asc");
+            std::fs::write(&armored, [text, &revoked].concat()).unwrap();
+            let (_path, dst) = dest_with_remote(
+                base,
+                &format!("dst-{name}"),
+                &format!("gpgkeypath={}\n", keys.display()),
+            )
+            .await;
+            let err = gpg_pull(&dst, &src).await.unwrap_err();
+            let message = match &err {
+                Error::Signature(m) => m.clone(),
+                other => panic!("{name}: {other}"),
+            };
+            if text.is_empty() {
+                assert!(
+                    message.contains("no GPG signature is from a trusted key"),
+                    "{name}: {message}"
+                );
+            } else {
+                let named = format!("the keyring '{}'", armored.display());
+                assert!(
+                    message.contains(&named) && message.contains("armor"),
+                    "{name}: {message}"
+                );
+            }
+            assert!(dst.list_refs(None).await.unwrap().is_empty(), "{name}");
+        }
     });
 }
 

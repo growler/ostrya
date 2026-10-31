@@ -4,7 +4,6 @@
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::io::Cursor;
-use std::ops::Range;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -49,6 +48,10 @@ const KEYBOX_MAGIC_OFFSET: usize = 8;
 /// [`GpgVerifier::default`], which trusts no certificate.
 /// [`add_keyring`](GpgVerifier::add_keyring) and
 /// [`add_keyring_files`](GpgVerifier::add_keyring_files) then add each source.
+/// [`add_keyring_files_skipping`](GpgVerifier::add_keyring_files_skipping)
+/// adds the files of a source that can hold files of other kinds, as a
+/// `gpgkeypath` entry can. It skips a file with no armor that is a GnuPG
+/// keybox or that is not a whole OpenPGP packet stream.
 ///
 /// # Format
 ///
@@ -146,6 +149,10 @@ const KEYBOX_MAGIC_OFFSET: usize = 8;
 /// the parser refuses a keyring, the load fails. If the packet stream of a
 /// keyring does not frame to its end, the load also fails. So each
 /// verification uses a trusted set that was read whole.
+/// [`add_keyring_files_skipping`](GpgVerifier::add_keyring_files_skipping)
+/// skips a file with no armor that is a keybox or that does not frame to its
+/// end, and adds no certificate from it. It refuses each other file that it
+/// cannot read whole.
 ///
 /// The parse runs under `catch_unwind`, so a panic in the parser gives
 /// [`Error::Signature`]. If the binary is built with `panic = "abort"`, a panic
@@ -270,6 +277,74 @@ impl GpgVerifier {
         Ok(())
     }
 
+    /// Adds each keyring that `paths` names to the trusted set, in the given
+    /// order, and skips each file that is not an OpenPGP packet stream. If a
+    /// path names no file, the load skips it.
+    ///
+    /// The call skips a file only if the file does not hold the bytes
+    /// `-----BEGIN PGP`, and one of these conditions applies:
+    ///
+    /// - The file is a GnuPG keybox.
+    /// - The file does not frame as a whole OpenPGP packet stream. Text,
+    ///   random bytes, a truncated keyring, and a keyring with bytes after its
+    ///   last packet are examples.
+    ///
+    /// A skipped file adds no certificate and gives no message. The call reads
+    /// a file whole, so a file that holds a keyring and then other bytes adds
+    /// no certificate. An empty file gives no certificate.
+    ///
+    /// The call refuses each other file that it cannot read whole as a
+    /// keyring. A file that holds the bytes `-----BEGIN PGP` is armored, and
+    /// the call refuses it if its armor does not decode to a keyring. Armor
+    /// after other bytes, an armor line that does not start a line, an armor
+    /// header that is not valid UTF-8, a block that is not valid base64 after
+    /// a valid block, and armor of bytes that are not a whole packet stream
+    /// are examples. Another tool can read a key or a revocation from such a
+    /// file, so a skip could trust a key that the file revokes. The call also
+    /// refuses a whole packet stream if the parser refuses or panics on a
+    /// certificate of it.
+    ///
+    /// The other read rules of
+    /// [`from_keyring_files`](GpgVerifier::from_keyring_files) apply. So a
+    /// file that cannot be opened or read, a path that names a file that is
+    /// not a regular file, a file over 4 MiB, and a keyring with more than 256
+    /// certificates are refused. Each refusal names the path, as
+    /// `the keyring '<path>'`.
+    ///
+    /// The call reads and parses each keyring before it adds a certificate.
+    /// So the trusted set gets either all keyrings or none of them.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Signature`] if a path cannot be opened for a reason other
+    ///   than a missing file, or a read of the file fails.
+    /// - [`Error::Signature`] if a path names a file that is not a regular
+    ///   file, for example a directory or a fifo.
+    /// - [`Error::Signature`] if a file is over 4 MiB, or holds more than 256
+    ///   certificates.
+    /// - [`Error::Signature`] if a file holds the bytes `-----BEGIN PGP` and
+    ///   its armor does not decode to a keyring that the parser reads.
+    /// - [`Error::Signature`] if the parser refuses a certificate of a whole
+    ///   packet stream, or panics.
+    ///
+    /// On an error, the verifier is unchanged.
+    pub fn add_keyring_files_skipping<I, P>(&mut self, paths: I) -> Result<()>
+    where
+        I: IntoIterator<Item = P>,
+        P: AsRef<Path>,
+    {
+        let mut certs = Vec::new();
+        for path in paths {
+            let path = path.as_ref();
+            let subject = format!("the keyring '{}'", path.display());
+            if let Some(bytes) = read_key_file(path, &subject, MAX_KEYRING)? {
+                certs.extend(skippable_keyring_certs(&bytes, &subject)?);
+            }
+        }
+        self.trust(certs);
+        Ok(())
+    }
+
     /// Adds one keyring to the trusted set.
     ///
     /// The call decodes the armor, applies
@@ -312,11 +387,95 @@ impl GpgVerifier {
     }
 }
 
+/// The refusal of the read of one keyring, with the cause of the refusal.
+///
+/// Each variant holds the error that the refusal gives. A caller that refuses
+/// each keyring it cannot read changes the value to that error, with
+/// [`From`]. [`skippable_keyring_certs`] reads the variant.
+#[derive(Debug)]
+enum KeyringRefusal {
+    /// The bytes are not a whole OpenPGP packet stream: the blob is a GnuPG
+    /// keybox, or the packet stream does not frame to its end. The error
+    /// names the source.
+    NotPacketStream(Error),
+    /// The armor does not decode: an armored blob is not valid UTF-8, or its
+    /// armor holds text that is not valid base64. The error does not name the
+    /// source.
+    Armor(Error),
+    /// The packet stream frames to its end, and the parser refuses a
+    /// certificate or panics. The error names the source.
+    Unreadable(Error),
+    /// The blob is over [`MAX_KEYRING`], or holds more than
+    /// [`MAX_KEYRING_CERTS`] certificates. The error names the source.
+    OverLimit(Error),
+}
+
+impl From<KeyringRefusal> for Error {
+    fn from(refusal: KeyringRefusal) -> Error {
+        match refusal {
+            KeyringRefusal::NotPacketStream(err)
+            | KeyringRefusal::Armor(err)
+            | KeyringRefusal::Unreadable(err)
+            | KeyringRefusal::OverLimit(err) => err,
+        }
+    }
+}
+
+/// The bytes that start an armor header line.
+const ARMOR_BEGIN: &[u8] = b"-----BEGIN PGP";
+
+/// Returns the certificates of one file of a `gpgkeypath` entry, as
+/// [`GpgVerifier::add_keyring_files_skipping`] reads it.
+///
+/// Returns no certificate for a file to skip: a file that does not hold
+/// [`ARMOR_BEGIN`] and that is a GnuPG keybox or does not frame to its end.
+/// Each other refusal of the read is an error that names `subject`. A file
+/// that holds [`ARMOR_BEGIN`] must start with its armor, after white space
+/// alone, and each [`ARMOR_BEGIN`] must start a line. [`dearmor`] reads no
+/// other armor.
+fn skippable_keyring_certs(bytes: &[u8], subject: &str) -> Result<Vec<SignedPublicKey>> {
+    let mut begins = bytes
+        .windows(ARMOR_BEGIN.len())
+        .enumerate()
+        .filter(|(_, window)| *window == ARMOR_BEGIN)
+        .map(|(at, _)| at)
+        .peekable();
+    let armored = begins.peek().is_some();
+    if armored {
+        let first = bytes.iter().position(|b| !b.is_ascii_whitespace());
+        let starts_lines = begins.all(|at| at == 0 || bytes[at - 1] == b'\n');
+        if !starts_lines || !first.is_some_and(|at| bytes[at..].starts_with(ARMOR_BEGIN)) {
+            return Err(Error::Signature(format!(
+                "{subject} is not readable as an OpenPGP keyring: it holds armor \
+                 after other bytes, or armor that does not start a line"
+            )));
+        }
+    }
+    match keyring_certs(bytes, subject) {
+        Ok(certs) => Ok(certs),
+        Err(KeyringRefusal::NotPacketStream(_)) if !armored => Ok(Vec::new()),
+        Err(KeyringRefusal::Armor(err)) => {
+            let detail = match err {
+                Error::Signature(message) => message,
+                other => other.to_string(),
+            };
+            Err(Error::Signature(format!(
+                "{subject} is not readable as an OpenPGP keyring: its armor does \
+                 not decode: {detail}"
+            )))
+        }
+        Err(refusal) => Err(refusal.into()),
+    }
+}
+
 /// Returns the certificates of one keyring blob, binary or armored.
 ///
 /// The call applies [`keyring_stream`] and [`parse_keyring`]. `subject` names
 /// the source in a refusal.
-fn keyring_certs(bytes: &[u8], subject: &str) -> Result<Vec<SignedPublicKey>> {
+fn keyring_certs(
+    bytes: &[u8],
+    subject: &str,
+) -> std::result::Result<Vec<SignedPublicKey>, KeyringRefusal> {
     let binary = keyring_stream(bytes, subject)?;
     let certs = parse_keyring(&binary, subject)?;
     Ok(certs.into_iter().map(|(cert, _)| cert).collect())
@@ -328,57 +487,67 @@ fn keyring_certs(bytes: &[u8], subject: &str) -> Result<Vec<SignedPublicKey>> {
 /// keybox. `subject` names the source, so a refusal states which keyring
 /// reached which limit. A binary blob comes back as a borrow of `bytes`, with
 /// no copy.
-fn keyring_stream<'a>(bytes: &'a [u8], subject: &str) -> Result<Cow<'a, [u8]>> {
+///
+/// A blob over [`MAX_KEYRING`] gives [`KeyringRefusal::OverLimit`]. Armor
+/// that does not decode gives [`KeyringRefusal::Armor`], and a keybox gives
+/// [`KeyringRefusal::NotPacketStream`].
+fn keyring_stream<'a>(
+    bytes: &'a [u8],
+    subject: &str,
+) -> std::result::Result<Cow<'a, [u8]>, KeyringRefusal> {
     if bytes.len() as u64 > MAX_KEYRING {
-        return Err(Error::Signature(format!(
+        return Err(KeyringRefusal::OverLimit(Error::Signature(format!(
             "{subject} is over the {MAX_KEYRING}-byte ceiling"
-        )));
+        ))));
     }
-    let binary = dearmor(bytes)?;
+    let binary = dearmor(bytes).map_err(KeyringRefusal::Armor)?;
     if binary.len() >= KEYBOX_MAGIC_OFFSET + KEYBOX_MAGIC.len()
         && &binary[KEYBOX_MAGIC_OFFSET..KEYBOX_MAGIC_OFFSET + KEYBOX_MAGIC.len()] == KEYBOX_MAGIC
     {
-        return Err(Error::Signature(format!(
+        return Err(KeyringRefusal::NotPacketStream(Error::Signature(format!(
             "{subject} is a GnuPG keybox, and a keyring is read as an OpenPGP \
              packet stream"
-        )));
+        ))));
     }
     Ok(binary)
 }
 
-/// Returns the packets of a binary OpenPGP stream and the length of the
-/// framed prefix.
+/// Frames the first packet of `rest`, and returns its tag and its length in
+/// bytes, with the header.
 ///
-/// Each packet comes as its tag and its byte range. The walk frames each
-/// packet with the header parser of rPGP. The same parser reads the packet
-/// stream, so the packet boundaries are the same in both reads.
+/// The call frames the packet with the header parser of rPGP. The same parser
+/// reads the packet stream, so the packet boundaries are the same in both
+/// reads.
 ///
-/// These conditions stop the walk, and the prefix length is then shorter than
-/// the input:
+/// Returns `None` if one of these conditions applies:
 ///
-/// - The parser refuses a header.
-/// - A length form is not a fixed length.
-/// - A length goes past the end of the input.
-fn packet_spans(binary: &[u8]) -> (Vec<(Tag, Range<usize>)>, usize) {
-    let mut spans: Vec<(Tag, Range<usize>)> = Vec::new();
-    let mut at = 0usize;
-    while at < binary.len() {
-        let rest = &binary[at..];
-        let mut reader = rest;
-        let Ok(header) = PacketHeader::try_from_reader(&mut reader) else {
-            break;
-        };
-        let PacketLength::Fixed(body) = header.packet_length() else {
-            break;
-        };
-        let total = (rest.len() - reader.len()).saturating_add(body as usize);
-        if total == 0 || total > rest.len() {
-            break;
-        }
-        spans.push((header.tag(), at..at + total));
-        at += total;
-    }
-    (spans, at)
+/// - The parser refuses the header.
+/// - The length form is not a fixed length.
+/// - The length goes past the end of `rest`.
+fn next_packet(rest: &[u8]) -> Option<(Tag, usize)> {
+    let mut reader = rest;
+    let header = PacketHeader::try_from_reader(&mut reader).ok()?;
+    let PacketLength::Fixed(body) = header.packet_length() else {
+        return None;
+    };
+    let total = (rest.len() - reader.len()).saturating_add(body as usize);
+    (total != 0 && total <= rest.len()).then_some((header.tag(), total))
+}
+
+/// The certificates of a binary keyring stream, as [`certificate_chunks`]
+/// splits it.
+#[derive(Debug)]
+enum Chunks {
+    /// The stream frames to its end. Each value holds the packets of one
+    /// certificate, with no Trust packets.
+    Framed(Vec<Vec<u8>>),
+    /// The stream does not frame to its end, and holds at most
+    /// [`MAX_KEYRING_CERTS`] Public-Key packets before the first byte that
+    /// does not frame.
+    Unframed,
+    /// The framed part of the stream holds more than [`MAX_KEYRING_CERTS`]
+    /// Public-Key packets.
+    OverLimit,
 }
 
 /// Returns the certificates of a binary keyring stream, with no Trust packets.
@@ -398,28 +567,40 @@ fn packet_spans(binary: &[u8]) -> (Vec<(Tag, Range<usize>)>, usize) {
 /// keyring parses to the same certificates as the `gpg --export` form of the
 /// same keys.
 ///
-/// Returns `None` if the packet stream does not frame to its end. A truncated
-/// keyring gives this result, and the `ostree` command also refuses such a
-/// keyring. The result is not longer than the input, and [`keyring_stream`]
-/// already applied [`MAX_KEYRING`] to the input.
-fn certificate_chunks(binary: &[u8]) -> Option<Vec<Vec<u8>>> {
-    let (spans, framed) = packet_spans(binary);
-    if framed != binary.len() {
-        return None;
-    }
+/// The call walks the stream once, and counts the Public-Key packets as it
+/// frames them (see [`next_packet`]). At the Public-Key packet after
+/// [`MAX_KEYRING_CERTS`], the walk stops with [`Chunks::OverLimit`]. So the
+/// call keeps at most that number of certificates, and no list with one item
+/// for each packet. If the walk then reaches a byte that does not frame, the
+/// result is [`Chunks::Unframed`]. A truncated keyring gives this result, and
+/// the `ostree` command also refuses such a keyring. The certificates are not
+/// longer than the input, and [`keyring_stream`] already applied
+/// [`MAX_KEYRING`] to the input.
+fn certificate_chunks(binary: &[u8]) -> Chunks {
     let mut chunks: Vec<Vec<u8>> = Vec::new();
-    for (tag, span) in spans {
+    let mut at = 0usize;
+    while at < binary.len() {
+        let Some((tag, len)) = next_packet(&binary[at..]) else {
+            return Chunks::Unframed;
+        };
+        let packet = &binary[at..at + len];
         match tag {
             Tag::Trust => {}
-            Tag::PublicKey => chunks.push(binary[span].to_vec()),
+            Tag::PublicKey => {
+                if chunks.len() == MAX_KEYRING_CERTS {
+                    return Chunks::OverLimit;
+                }
+                chunks.push(packet.to_vec());
+            }
             _ => {
                 if let Some(chunk) = chunks.last_mut() {
-                    chunk.extend_from_slice(&binary[span]);
+                    chunk.extend_from_slice(packet);
                 }
             }
         }
+        at += len;
     }
-    Some(chunks)
+    Chunks::Framed(chunks)
 }
 
 /// Parses a binary OpenPGP keyring into its certificates, each with its
@@ -435,35 +616,51 @@ fn certificate_chunks(binary: &[u8]) -> Option<Vec<Vec<u8>>> {
 /// If the stream does not frame to its end, or the parser refuses a
 /// certificate, the read fails by the name of the source. So a caller gets
 /// only a keyring that was read whole. `subject` names the source, so a
-/// refusal states which keyring was read.
+/// refusal states which keyring was read. A stream that does not frame gives
+/// [`KeyringRefusal::NotPacketStream`]. A parser refusal and a caught panic
+/// give [`KeyringRefusal::Unreadable`]. A stream over [`MAX_KEYRING_CERTS`]
+/// gives [`KeyringRefusal::OverLimit`].
 ///
 /// Each read of a keyring goes through this function: a verification load, a
 /// key listing, and both streams of an import. The parse runs inside
 /// [`contained`], because a keyring is untrusted input.
-fn parse_keyring(binary: &[u8], subject: &str) -> Result<Vec<(SignedPublicKey, Vec<u8>)>> {
+fn parse_keyring(
+    binary: &[u8],
+    subject: &str,
+) -> std::result::Result<Vec<(SignedPublicKey, Vec<u8>)>, KeyringRefusal> {
     let refusal = format!("{subject} is not readable as an OpenPGP keyring: the parser panicked");
+    let unreadable =
+        |detail: String| format!("{subject} is not readable as an OpenPGP keyring{detail}");
+    // The outer `Err` is a caught panic. The inner result is the result of
+    // the read.
     contained(&refusal, || {
-        let Some(chunks) = certificate_chunks(binary) else {
-            return Err(Error::Signature(format!(
-                "{subject} is not readable as an OpenPGP keyring"
-            )));
+        let chunks = match certificate_chunks(binary) {
+            Chunks::Framed(chunks) => chunks,
+            Chunks::Unframed => {
+                return Ok(Err(KeyringRefusal::NotPacketStream(Error::Signature(
+                    unreadable(String::new()),
+                ))));
+            }
+            Chunks::OverLimit => {
+                return Ok(Err(KeyringRefusal::OverLimit(Error::Signature(format!(
+                    "{subject} holds more than {MAX_KEYRING_CERTS} certificates"
+                )))));
+            }
         };
-        if chunks.len() > MAX_KEYRING_CERTS {
-            return Err(Error::Signature(format!(
-                "{subject} holds more than {MAX_KEYRING_CERTS} certificates"
-            )));
-        }
         let mut certs = Vec::with_capacity(chunks.len());
         for chunk in chunks {
-            let cert = SignedPublicKey::from_bytes(Cursor::new(&chunk)).map_err(|e| {
-                Error::Signature(format!(
-                    "{subject} is not readable as an OpenPGP keyring: {e}"
-                ))
-            })?;
-            certs.push((cert, chunk));
+            match SignedPublicKey::from_bytes(Cursor::new(&chunk)) {
+                Ok(cert) => certs.push((cert, chunk)),
+                Err(e) => {
+                    return Ok(Err(KeyringRefusal::Unreadable(Error::Signature(
+                        unreadable(format!(": {e}")),
+                    ))));
+                }
+            }
         }
-        Ok(certs)
+        Ok(Ok(certs))
     })
+    .unwrap_or_else(|panicked| Err(KeyringRefusal::Unreadable(panicked)))
 }
 
 /// Runs `work`, which reads OpenPGP packets, and changes a panic in it to the
@@ -583,7 +780,7 @@ pub fn gpg_offered_keys(offered: &[u8], key_ids: &[String], subject: &str) -> Gp
         Ok(stream) => stream,
         Err(err) => {
             return GpgOfferedKeys {
-                inner: OfferedKeys::Refused(err),
+                inner: OfferedKeys::Refused(err.into()),
             };
         }
     };
@@ -1158,9 +1355,23 @@ fn parse_epoch(field: &str) -> Option<u64> {
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Range;
     use std::path::PathBuf;
 
     use super::*;
+
+    /// Returns the packets of a binary OpenPGP stream and the length of the
+    /// framed prefix. Each packet comes as its tag and its byte range. The
+    /// walk stops where [`next_packet`] frames no packet.
+    fn packet_spans(binary: &[u8]) -> (Vec<(Tag, Range<usize>)>, usize) {
+        let mut spans = Vec::new();
+        let mut at = 0usize;
+        while let Some((tag, len)) = next_packet(&binary[at..]) {
+            spans.push((tag, at..at + len));
+            at += len;
+        }
+        (spans, at)
+    }
 
     #[test]
     fn dearmor_passes_binary_through() {
@@ -1808,6 +2019,301 @@ IHdvcmxk\n\
         verifier.add_keyring_files([&good]).unwrap();
         assert_eq!(verifier.certs.len(), 1);
     }
+
+    /// The skipping load skips each file with no armor that is a GnuPG
+    /// keybox or that does not frame as a whole OpenPGP packet stream, and
+    /// gives no error. It adds the certificates of each keyring file, binary
+    /// or armored. A path that names no file is also skipped. An empty file
+    /// gives no certificate.
+    #[test]
+    fn the_skipping_load_skips_a_file_that_is_not_a_keyring() {
+        if !gpg_or_skip() {
+            return;
+        }
+        let home = KeyFixture::new("Skip <skip@ostrya.example>");
+        let dir = home.dir.join("keys");
+        std::fs::create_dir(&dir).unwrap();
+        let binary = home.export(false);
+        let text = b"This directory holds the trusted keys.\n".to_vec();
+        let mut trailing = binary.clone();
+        trailing.extend_from_slice(&text);
+        let noise: Vec<u8> = (0..512u32).map(|i| (i * 7919 % 251) as u8).collect();
+        let keyrings = [
+            ("binary.gpg", binary.clone()),
+            ("armored.asc", home.export(true)),
+        ];
+        let others = [
+            ("README", text),
+            ("pubring.kbx", home.keybox()),
+            ("truncated.gpg", binary[..binary.len() / 2].to_vec()),
+            ("trailing.gpg", trailing),
+            ("noise.bin", noise),
+        ];
+        let mut paths = Vec::new();
+        for (name, bytes) in keyrings.iter().chain(&others) {
+            let path = dir.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            paths.push(path);
+        }
+        // The load that refuses each file that is not a keyring refuses each
+        // of these files.
+        for (name, _) in &others {
+            let err = GpgVerifier::from_keyring_files([dir.join(name)]).unwrap_err();
+            assert!(
+                matches!(&err, Error::Signature(_) | Error::Core(_)),
+                "{name}: {err}"
+            );
+        }
+        let empty = dir.join("empty.gpg");
+        std::fs::write(&empty, b"").unwrap();
+        let mut verifier = GpgVerifier::default();
+        verifier.add_keyring_files_skipping([&empty]).unwrap();
+        assert!(verifier.is_empty());
+        paths.push(empty);
+        paths.push(dir.join("absent.gpg"));
+        verifier.add_keyring_files_skipping(&paths).unwrap();
+        assert_eq!(verifier.certs.len(), 2);
+        let alone = GpgVerifier::from_keyring_files([dir.join("binary.gpg")]).unwrap();
+        assert_eq!(verifier.certs[0], alone.certs[0]);
+        assert_eq!(verifier.certs[1], alone.certs[0]);
+    }
+
+    /// The skipping load refuses a file over a limit of the port, a file that
+    /// is not a regular file, and a file that cannot be opened, by the path of
+    /// the file. On each refusal, the verifier is unchanged.
+    #[cfg(unix)]
+    #[test]
+    fn the_skipping_load_refuses_a_limit_and_a_file_it_cannot_read() {
+        use std::os::unix::fs::PermissionsExt;
+
+        if !gpg_or_skip() {
+            return;
+        }
+        let home = KeyFixture::new("Limit <limit@ostrya.example>");
+        let dir = home.dir.join("keys");
+        std::fs::create_dir(&dir).unwrap();
+        let one = home.export(false);
+        let good = dir.join("good.gpg");
+        std::fs::write(&good, &one).unwrap();
+        let oversized = dir.join("oversized.gpg");
+        std::fs::write(&oversized, vec![0u8; MAX_KEYRING as usize + 1]).unwrap();
+        let many = dir.join("many.gpg");
+        std::fs::write(&many, one.repeat(MAX_KEYRING_CERTS + 1)).unwrap();
+        // The certificates come before bytes that do not frame. The count
+        // reaches the limit before the walk reaches these bytes.
+        let many_tailed = dir.join("many-tailed.gpg");
+        let mut tailed = one.repeat(MAX_KEYRING_CERTS + 1);
+        tailed.extend_from_slice(b"This file holds the trusted keys.\n");
+        std::fs::write(&many_tailed, tailed).unwrap();
+        let mut refused = vec![
+            (oversized, "ceiling"),
+            (many, "256 certificates"),
+            (many_tailed, "256 certificates"),
+            (dir.clone(), "is not a regular file"),
+        ];
+        let fifo = dir.join("fifo.gpg");
+        match std::process::Command::new("mkfifo").arg(&fifo).status() {
+            Ok(status) if status.success() => refused.push((fifo, "is not a regular file")),
+            other => eprintln!("skipping the fifo arm: mkfifo did not create a fifo: {other:?}"),
+        }
+        let unreadable = dir.join("unreadable.gpg");
+        std::fs::write(&unreadable, &one).unwrap();
+        std::fs::set_permissions(&unreadable, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // A process that holds the override of file permissions, as root
+        // does, opens the file. The arm then has no refusal to observe.
+        if std::fs::File::open(&unreadable).is_ok() {
+            eprintln!("skipping the unreadable arm: the file opens with mode 000");
+        } else {
+            refused.push((unreadable, "cannot be opened"));
+        }
+        let mut verifier = GpgVerifier::default();
+        verifier.add_keyring_files_skipping([&good]).unwrap();
+        for (path, reason) in &refused {
+            let err = verifier
+                .add_keyring_files_skipping([good.as_path(), path.as_path()])
+                .unwrap_err();
+            let named = format!("the keyring '{}'", path.display());
+            assert!(
+                matches!(&err, Error::Signature(m) if m.contains(&named) && m.contains(reason)),
+                "{err}"
+            );
+            assert_eq!(verifier.certs.len(), 1);
+        }
+    }
+
+    /// Returns `path` with `bytes` written to it.
+    fn write_file(path: PathBuf, bytes: &[u8]) -> PathBuf {
+        std::fs::write(&path, bytes).unwrap();
+        path
+    }
+
+    /// Asserts that the skipping load refuses each of `paths` by its path,
+    /// after a load of `good`, and leaves the verifier unchanged.
+    fn skipping_load_refuses(good: &Path, paths: &[PathBuf]) {
+        let mut verifier = GpgVerifier::default();
+        verifier.add_keyring_files_skipping([good]).unwrap();
+        let before = verifier.certs.len();
+        for path in paths {
+            let err = verifier
+                .add_keyring_files_skipping([good, path.as_path()])
+                .unwrap_err();
+            let named = format!("the keyring '{}'", path.display());
+            assert!(
+                matches!(&err, Error::Signature(m) if m.contains(&named)),
+                "{}: {err}",
+                path.display()
+            );
+            assert_eq!(verifier.certs.len(), before);
+        }
+    }
+
+    /// The skipping load refuses, by its path, each file that holds the
+    /// line `-----BEGIN PGP` and that the load cannot read whole as an
+    /// armored keyring. Armor after other bytes, an armor line that does not
+    /// start a line, an armor header that is not UTF-8, a good block before a
+    /// block that is not base64, and armor that does not decode to a whole
+    /// packet stream are examples. The `ostree` command reads the armor of
+    /// most of these files and can find a revocation in it, so a skip can
+    /// trust a revoked key.
+    #[test]
+    fn the_skipping_load_refuses_armor_it_cannot_read_whole() {
+        if !gpg_or_skip() {
+            return;
+        }
+        let home = KeyFixture::new("Armor <armor@ostrya.example>");
+        let dir = home.dir.join("keys");
+        std::fs::create_dir(&dir).unwrap();
+        let binary = home.export(false);
+        let armored = home.export(true);
+        let good = write_file(dir.join("good.gpg"), &binary);
+        let first_line = armored.iter().position(|b| *b == b'\n').unwrap() + 1;
+        let block = |payload: &[u8]| {
+            format!(
+                "-----BEGIN PGP PUBLIC KEY BLOCK-----\n\n{}\n\
+                 -----END PGP PUBLIC KEY BLOCK-----\n",
+                base64::encode(payload)
+            )
+            .into_bytes()
+        };
+        let bad_block = b"-----BEGIN PGP PUBLIC KEY BLOCK-----\n\n!!!!\n\
+                          -----END PGP PUBLIC KEY BLOCK-----\n";
+        let refused = [
+            write_file(
+                dir.join("after-text.asc"),
+                &[&b"The trusted keys of the remote.\n"[..], &armored].concat(),
+            ),
+            write_file(
+                dir.join("after-bom.asc"),
+                &[&b"\xef\xbb\xbf"[..], &armored].concat(),
+            ),
+            write_file(
+                dir.join("indented.asc"),
+                &[&b"\n\n  "[..], &armored].concat(),
+            ),
+            write_file(
+                dir.join("latin1-header.asc"),
+                &[
+                    &armored[..first_line],
+                    &b"Comment: caf\xe9\n"[..],
+                    &armored[first_line..],
+                ]
+                .concat(),
+            ),
+            write_file(
+                dir.join("bad-later-block.asc"),
+                &[&armored[..], &bad_block[..]].concat(),
+            ),
+            write_file(dir.join("bad-block.asc"), bad_block),
+            write_file(dir.join("not-a-keyring.asc"), &block(b"hello")),
+            write_file(
+                dir.join("truncated.asc"),
+                &block(&binary[..binary.len() / 2]),
+            ),
+            write_file(dir.join("keybox.asc"), &block(&home.keybox())),
+            write_file(
+                dir.join("in-binary.gpg"),
+                &[
+                    &binary[..],
+                    &b"\n-----BEGIN PGP PUBLIC KEY BLOCK-----\n"[..],
+                ]
+                .concat(),
+            ),
+        ];
+        skipping_load_refuses(&good, &refused);
+        // The same armor with no text before it adds the key.
+        let mut verifier = GpgVerifier::default();
+        verifier
+            .add_keyring_files_skipping([write_file(dir.join("plain.asc"), &armored)])
+            .unwrap();
+        assert_eq!(verifier.certs.len(), 1);
+    }
+
+    /// The skipping load refuses, by its path, a file that frames as a whole
+    /// OpenPGP packet stream and that the parser refuses. Each stream here is
+    /// one Public-Key packet whose body the parser refuses.
+    #[test]
+    fn the_skipping_load_refuses_a_framed_stream_the_parser_refuses() {
+        let dir = scratch_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let streams: [&[u8]; 3] = [
+            // A version 4 key with no creation time.
+            b"\xc6\x01\x04",
+            // A version 4 key of algorithm 1 (RSA) with no key material.
+            b"\xc6\x06\x04\x00\x00\x00\x00\x01",
+            // A key of version 9.
+            b"\xc6\x06\x09\x00\x00\x00\x00\x01",
+        ];
+        let mut results = Vec::new();
+        for (index, stream) in streams.iter().enumerate() {
+            let path = write_file(dir.join(format!("{index}.gpg")), stream);
+            assert!(matches!(certificate_chunks(stream), Chunks::Framed(_)));
+            let mut verifier = GpgVerifier::default();
+            results.push((path.clone(), verifier.add_keyring_files_skipping([&path])));
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+        for (path, result) in results {
+            let named = format!("the keyring '{}'", path.display());
+            assert!(
+                matches!(&result, Err(Error::Signature(m)) if m.contains(&named)
+                    && m.contains("is not readable as an OpenPGP keyring: ")),
+                "{}: {result:?}",
+                path.display()
+            );
+        }
+    }
+
+    /// A stream of empty Public-Key packets reaches the certificate limit.
+    /// The walk counts the Public-Key packets and stops at the first packet
+    /// over the limit, so the split keeps at most the limit in memory. Bytes
+    /// that do not frame after the limit do not change the refusal.
+    #[test]
+    fn a_stream_of_empty_key_packets_reaches_the_certificate_limit() {
+        let full = [0xc6u8, 0x00].repeat(MAX_KEYRING as usize / 2);
+        assert_eq!(full.len() as u64, MAX_KEYRING);
+        let mut tailed = [0xc6u8, 0x00].repeat(MAX_KEYRING_CERTS + 1);
+        tailed.extend_from_slice(b"trailing text");
+        for stream in [&full, &tailed] {
+            assert!(matches!(certificate_chunks(stream), Chunks::OverLimit));
+            let err = GpgVerifier::from_keyring_bytes([stream]).unwrap_err();
+            assert!(
+                matches!(&err, Error::Signature(m) if m.contains("keyring blob 0")
+                    && m.contains("holds more than 256 certificates")),
+                "{err}"
+            );
+        }
+        let dir = scratch_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = write_file(dir.join("empty-keys.gpg"), &full);
+        let result = GpgVerifier::default().add_keyring_files_skipping([&path]);
+        std::fs::remove_dir_all(&dir).unwrap();
+        let named = format!("the keyring '{}'", path.display());
+        assert!(
+            matches!(&result, Err(Error::Signature(m)) if m.contains(&named)
+                && m.contains("holds more than 256 certificates")),
+            "{result:?}"
+        );
+    }
+
     /// Returns the user ids of each certificate, one list for each
     /// certificate. The certificates and the ids are sorted. So two trusted
     /// sets compare as one value, and the order in their keyrings has no
@@ -1930,7 +2436,7 @@ IHdvcmxk\n\
         // The fixture has the shape under test: the walk stops inside the
         // second certificate, and the run split returns nothing.
         assert!(packet_spans(&keyring).1 < keyring.len());
-        assert!(certificate_chunks(&keyring).is_none());
+        assert!(matches!(certificate_chunks(&keyring), Chunks::Unframed));
 
         let err = GpgVerifier::from_keyring_bytes([&keyring]).unwrap_err();
         assert!(
@@ -2001,14 +2507,14 @@ IHdvcmxk\n\
     }
 
     /// Asserts that [`parse_keyring`] refuses `stream` by the name of the
-    /// source. A keyring that the certificate reader does not read whole gets
-    /// this refusal.
+    /// source, as a stream that does not frame to its end. A keyring that the
+    /// certificate reader does not read whole gets this refusal.
     fn refuses_the_stream(stream: &[u8]) {
         let err = parse_keyring(stream, SUBJECT).unwrap_err();
         assert!(
-            matches!(&err, Error::Signature(m) if m.contains(SUBJECT)
+            matches!(&err, KeyringRefusal::NotPacketStream(Error::Signature(m)) if m.contains(SUBJECT)
                 && m.contains("OpenPGP keyring")),
-            "{err}"
+            "{err:?}"
         );
     }
 
@@ -2727,7 +3233,7 @@ IHdvcmxk\n\
         // The fixture has the shape under test: the walk frames the export and
         // stops at the trailing byte, so the run split returns nothing.
         assert_eq!(packet_spans(&held).1, unrevoked.len());
-        assert!(certificate_chunks(&held).is_none());
+        assert!(matches!(certificate_chunks(&held), Chunks::Unframed));
 
         for offered in [&revoked, &added.export(false)] {
             let refusal = merge_keyring(&held, offered, &[], SUBJECT).unwrap_err();

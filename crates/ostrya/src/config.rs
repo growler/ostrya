@@ -768,7 +768,11 @@ impl Remote<'_> {
     /// The remote also trusts the keyring `<remote>.trustedkeys.gpg` of the
     /// repository and the system trusted set. A `;` separates the entries, and
     /// the list skips an empty entry. Each entry is a keyring file or a
-    /// directory of keyring files.
+    /// directory of keyring files. The GPG verifier reads each regular file of
+    /// a directory. It skips a file that does not hold the bytes
+    /// `-----BEGIN PGP` and that is a GnuPG keybox or is not a whole OpenPGP
+    /// packet stream. It refuses each other file that it cannot read whole as
+    /// a keyring.
     ///
     /// # Errors
     ///

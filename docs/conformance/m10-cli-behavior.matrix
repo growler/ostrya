@@ -5018,15 +5018,11 @@ modes: archive
 setup: repo-with-commit
 outcome: lossy
 severity: interop
-loss: a keyring in a `gpgkeypath` directory whose name does not end in `.gpg`.
- The tool reads each file of the directory as a keyring, and the port reads
- the `*.gpg` files alone, so such a keyring gives `Good signature from "<user
- id>"` in the tool and `Can't check signature: public key not found` in the
- port. The refusal of an entry that does not exist parts the wording: the tool
- writes `error: opendir(ENTRY): No such file or directory`, and the port
- writes `error: signature: gpgkeypath entry 'ENTRY' cannot be read: No such
- file or directory (os error 2)`. Both exit 1 after the commit report
- (`cli-surface.md`, "P1", states them).
+loss: the refusal of a `gpgkeypath` entry that does not exist parts the
+ wording: the tool writes `error: opendir(ENTRY): No such file or directory`,
+ and the port writes `error: signature: gpgkeypath entry 'ENTRY' cannot be
+ read: No such file or directory (os error 2)`. Both exit 1 after the commit
+ report (`cli-surface.md`, "P1", states it).
 evidence: ostrya_cli::cli::show_gpg_verify_remote_reads_gpgkeypath
 spec: cli-behavior.md#show format-reference.md#gpg
 note: a signed commit needs a generated key, which no setup binds. The port
@@ -5034,9 +5030,11 @@ note: a signed commit needs a generated key, which no setup binds. The port
  `show --gpg-verify-remote=origin`. The remote holds a `gpgkeypath` entry, the
  repository holds no `origin.trustedkeys.gpg`, and the global trusted
  directory is empty. An entry that names the keyring file, and an entry that
- names a directory that holds the keyring as `k.gpg`, give `Good signature
- from "<user id>"` at exit 0 in both. The cited test also states the two
- differences the outcome names.
+ names a directory that holds the keyring as `k.gpg`, as `k.keyring`, or
+ armored as `k.asc`, give `Good signature from "<user id>"` at exit 0 in
+ both. A directory that holds a text file `README` alone gives `Can't check
+ signature: public key not found` at exit 0 in both. The cited test also
+ states the difference the outcome names.
 
 family: M10
 subcommand: show

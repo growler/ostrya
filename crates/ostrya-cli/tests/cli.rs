@@ -17247,10 +17247,12 @@ fn show_port_and_tool(args: &[&str], tool: bool) -> Vec<(&'static str, Run)> {
 /// and the global trusted directory is empty.
 ///
 /// - An entry that names a keyring file, or a directory that holds the
-///   keyring as `k.gpg`, verifies the signature in both commands.
-/// - A directory that holds the keyring as `k.keyring` parts the two. The
-///   tool reads each file of the directory, and the port reads the `*.gpg`
-///   files alone.
+///   keyring as `k.gpg`, as `k.keyring`, or armored as `k.asc`, verifies the
+///   signature in both commands. Each command reads each regular file of the
+///   directory, with any name.
+/// - A directory that holds a text file `README` alone gives no key in both
+///   commands. The file is not a keyring, so each command skips it with no
+///   message.
 /// - An entry that does not exist gives the commit report and then a refusal
 ///   at exit 1 in both commands. The wording of the refusal parts the two.
 #[cfg(feature = "gpg")]
@@ -17304,11 +17306,33 @@ fn show_gpg_verify_remote_reads_gpgkeypath() {
     std::fs::rename(entry.join("k.gpg"), entry.join("k.keyring")).unwrap();
     for (label, run) in show_port_and_tool(&args, tool) {
         let report = run.ok().stdout_trimmed();
-        let verdict = if label == "the port" { absent } else { &good };
         assert!(
-            report.contains(verdict),
+            report.contains(&good),
             "{label}, a `*.keyring` file:\n{report}"
         );
+    }
+
+    std::fs::remove_file(entry.join("k.keyring")).unwrap();
+    std::fs::write(
+        entry.join("README"),
+        b"This directory holds the trusted keys of the remote.\n",
+    )
+    .unwrap();
+    for (label, run) in show_port_and_tool(&args, tool) {
+        let report = run.ok().stdout_trimmed();
+        assert!(
+            report.contains(absent),
+            "{label}, a `README` file:\n{report}"
+        );
+    }
+
+    std::fs::remove_file(entry.join("README")).unwrap();
+    let armored = home.gpg().args(["--export", "--armor"]).output().unwrap();
+    assert!(armored.status.success() && !armored.stdout.is_empty());
+    std::fs::write(entry.join("k.asc"), armored.stdout).unwrap();
+    for (label, run) in show_port_and_tool(&args, tool) {
+        let report = run.ok().stdout_trimmed();
+        assert!(report.contains(&good), "{label}, a `*.asc` file:\n{report}");
     }
 
     std::fs::remove_dir_all(&entry).unwrap();
@@ -43145,6 +43169,205 @@ fn pull_local_gpg_switches_refuse_where_the_tool_refuses() {
             assert_eq!(run.status.code(), Some(1), "{name} {who}");
             assert!(refs.is_empty(), "{name} {who}");
             assert!(objects.is_empty(), "{name} {who}");
+        }
+    }
+}
+
+/// `pull-local --remote=origin --gpg-verify` reads each regular file of a
+/// `gpgkeypath` directory, in ostrya and in the `ostree` command, with any
+/// name. Each command skips a file that is not an OpenPGP keyring, with no
+/// message. The global trusted directory is empty.
+///
+/// - A directory that holds the keyring as `a.keyring` alone: both commands
+///   import the commit.
+/// - A directory that holds the text file `junk.gpg` and the keyring as
+///   `b.keyring`: both commands import the commit.
+/// - A directory that holds the text file `README` alone: both commands exit
+///   1, and write no object and no ref. The messages differ.
+#[cfg(feature = "gpg")]
+#[test]
+fn pull_local_gpgkeypath_reads_each_regular_file_as_the_tool_does() {
+    if !gpg_available() {
+        assert!(
+            std::env::var_os("OSTRYA_REQUIRE_GNUPG").is_none(),
+            "OSTRYA_REQUIRE_GNUPG is set and `gpg` is not available"
+        );
+        eprintln!("skipping: gpg not available");
+        return;
+    }
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("pull-local-gpgkeypath-files");
+    let base = tmp.path();
+    let source = base.join("source");
+    std::fs::create_dir_all(&source).unwrap();
+    let (src, home, commit) =
+        signed_show_repo(&source, "Pull Keypath <pullkeypath@ostrya.example>");
+    let s = src.to_str().unwrap();
+    let text = b"This directory holds the trusted keys of the remote.\n";
+    let global = empty_gpg_home().to_str().unwrap();
+    for (name, files, imports) in [
+        ("keyring-alone", &[("a.keyring", true)][..], true),
+        (
+            "junk-first",
+            &[("junk.gpg", false), ("b.keyring", true)][..],
+            true,
+        ),
+        ("text-alone", &[("README", false)][..], false),
+    ] {
+        let keydir = base.join(format!("{name}-keys"));
+        std::fs::create_dir(&keydir).unwrap();
+        for (file, key) in files {
+            if *key {
+                home.export_to(&keydir.join(file));
+            } else {
+                std::fs::write(keydir.join(file), text).unwrap();
+            }
+        }
+        for who in ["port", "tool"] {
+            let label = format!("{name} {who}");
+            let dir = base.join(format!("{name}-{who}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let dest = create_repo(&dir, RepoMode::BareUser);
+            configure_remote(
+                &dest,
+                "file:///nonexistent",
+                &format!("gpgkeypath={}\n", keydir.display()),
+            );
+            let repo_arg = format!("--repo={}", dest.display());
+            let args = [
+                "pull-local",
+                &repo_arg,
+                "--remote=origin",
+                "--gpg-verify",
+                s,
+                "main",
+            ];
+            let run = if who == "port" {
+                ostrya(&args, None, &[])
+            } else {
+                ostree_env(&args, &[("OSTREE_GPG_HOME", global)])
+            };
+            let stderr = String::from_utf8_lossy(&run.stderr);
+            if imports {
+                assert!(run.status.success(), "{label}:\n{stderr}");
+                assert_eq!(
+                    resolve(&dest, "origin:main").as_deref(),
+                    Some(commit.as_str()),
+                    "{label}"
+                );
+            } else {
+                assert_eq!(run.status.code(), Some(1), "{label}:\n{stderr}");
+                assert_eq!(resolve(&dest, "origin:main"), None, "{label}");
+                assert!(loose_objects(&dest).is_empty(), "{label}");
+            }
+        }
+    }
+}
+
+/// A revocation in an armored file of a `gpgkeypath` directory refuses the
+/// commit in `pull-local --remote=origin --gpg-verify` of ostrya and of the
+/// `ostree` command. The directory holds the key in `a.gpg` and the revoked
+/// key, armored, in `b.asc`. The global trusted directory is empty.
+///
+/// - `b.asc` holds the armor alone: both commands exit 1. The tool reports
+///   `Key revoked`, and ostrya trusts no signature.
+/// - `b.asc` holds a line of text and then the armor: both commands exit 1.
+///   The tool reports `Key revoked`. ostrya cannot read the file whole, and
+///   refuses it by its path.
+///
+/// Each run writes no object and no ref.
+#[cfg(feature = "gpg")]
+#[test]
+fn pull_local_gpgkeypath_revocation_in_armor_refuses_as_the_tool_does() {
+    if !gpg_available() {
+        assert!(
+            std::env::var_os("OSTRYA_REQUIRE_GNUPG").is_none(),
+            "OSTRYA_REQUIRE_GNUPG is set and `gpg` is not available"
+        );
+        eprintln!("skipping: gpg not available");
+        return;
+    }
+    if !ostree_available() {
+        return;
+    }
+    let tmp = TmpDir::new("pull-local-gpgkeypath-revocation");
+    let base = tmp.path();
+    let source = base.join("source");
+    std::fs::create_dir_all(&source).unwrap();
+    let (src, home, _commit) =
+        signed_show_repo(&source, "Pull Revoked <pullrevoked@ostrya.example>");
+    let s = src.to_str().unwrap();
+    let keyring = base.join("a.gpg");
+    home.export_to(&keyring);
+    // `gpg` stores a revocation certificate when it generates a key. Its
+    // armor lines start with `:`, so that an import needs an edit.
+    let stored = home
+        .dir
+        .join("openpgp-revocs.d")
+        .join(format!("{}.rev", home.fingerprint()));
+    let certificate = std::fs::read_to_string(stored)
+        .unwrap()
+        .replace(":-----BEGIN", "-----BEGIN");
+    let revocation = base.join("revocation.asc");
+    std::fs::write(&revocation, certificate).unwrap();
+    let status = home
+        .gpg()
+        .arg("--import")
+        .arg(&revocation)
+        .status()
+        .unwrap();
+    assert!(status.success(), "gpg --import of the revocation failed");
+    let out = home.gpg().args(["--armor", "--export"]).output().unwrap();
+    assert!(out.status.success() && !out.stdout.is_empty());
+    let revoked = out.stdout;
+    let global = empty_gpg_home().to_str().unwrap();
+    for (name, text) in [("plain", &b""[..]), ("after-text", &b"Trusted keys\n"[..])] {
+        let keydir = base.join(format!("{name}-keys"));
+        std::fs::create_dir(&keydir).unwrap();
+        std::fs::copy(&keyring, keydir.join("a.gpg")).unwrap();
+        let armored = keydir.join("b.asc");
+        std::fs::write(&armored, [text, &revoked].concat()).unwrap();
+        for who in ["port", "tool"] {
+            let label = format!("{name} {who}");
+            let dir = base.join(format!("{name}-{who}"));
+            std::fs::create_dir_all(&dir).unwrap();
+            let dest = create_repo(&dir, RepoMode::BareUser);
+            configure_remote(
+                &dest,
+                "file:///nonexistent",
+                &format!("gpgkeypath={}\n", keydir.display()),
+            );
+            let repo_arg = format!("--repo={}", dest.display());
+            let args = [
+                "pull-local",
+                &repo_arg,
+                "--remote=origin",
+                "--gpg-verify",
+                s,
+                "main",
+            ];
+            let run = if who == "port" {
+                ostrya(&args, None, &[])
+            } else {
+                ostree_env(&args, &[("OSTREE_GPG_HOME", global)])
+            };
+            let stderr = String::from_utf8_lossy(&run.stderr);
+            assert_eq!(run.status.code(), Some(1), "{label}:\n{stderr}");
+            assert_eq!(resolve(&dest, "origin:main"), None, "{label}");
+            assert!(loose_objects(&dest).is_empty(), "{label}");
+            if who == "tool" {
+                assert!(stderr.contains("Key revoked"), "{label}:\n{stderr}");
+            } else if text.is_empty() {
+                assert!(
+                    stderr.contains("no GPG signature is from a trusted key"),
+                    "{label}:\n{stderr}"
+                );
+            } else {
+                let named = format!("the keyring '{}'", armored.display());
+                assert!(stderr.contains(&named), "{label}:\n{stderr}");
+            }
         }
     }
 }

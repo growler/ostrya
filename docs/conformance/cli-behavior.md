@@ -1408,6 +1408,59 @@ Each configuration key selects one check:
   still accepts a commit of the imported key.
   - An entry that does not exist: `error: Commit <hex>: opendir(<entry>): No
     such file or directory`.
+  - An entry that names a directory gives each regular file of the
+    directory, with any name. `a.keyring`, the hidden `.a.gpg`, a file
+    named `.gpg`, and an armored `a.asc` each give the key. The tool does
+    not read a subdirectory. It skips a symlink to a file, a symlink to a
+    directory, a dangling symlink, and a fifo.
+  - A file that is not an OpenPGP keyring gives no key and no message. Next
+    to the keyring of the key, a text file `README` or `junk.gpg`, random
+    bytes, an empty file, a truncated keyring, and a GnuPG keybox each
+    leave the pull at exit 0. Alone in the directory, a text file, random
+    bytes, an empty file, a keyring followed by text, and text followed by a
+    binary keyring each fail the pull as for a key that is not trusted:
+    `error: Commit <hex>: Signature made <date> using EdDSA key ID <key id>`,
+    and then the line `Can't check signature: public key not found`. A
+    file entry gets the same result for a text file, an empty file, a
+    keyring followed by text, and a keybox.
+  - Text followed by an armored keyring gives the key. A file of 4 MiB and
+    one byte of zero bytes next to the keyring leaves the pull at exit 0. A
+    file of 5 MiB of blank lines followed by the armored keyring gives the
+    key.
+  - A revocation in a file of the directory refuses the commit, also when
+    another file of the directory holds the key. The directory holds the
+    export of the key in `a.gpg` and the export of the revoked key in a
+    second file. `pull-local --remote=<remote> --gpg-verify` writes `error:
+    Commit <hex>: Signature made <date> using EdDSA key ID <key id>`, and
+    then the line `Key revoked`, at exit 1, for each of these forms of the
+    second file:
+    - the armored export alone;
+    - a line of text, and then the armored export;
+    - the armored export with the header line `Comment: caf` and the byte
+      `e9`, which is not valid UTF-8, after its first line;
+    - the armored export, and then a block with the body `!!!!`, which is
+      not valid base64;
+    - the armored export with CRLF line ends;
+    - the armored export, and then a line of text;
+    - the binary export, and then the packet `fc 01 00` of tag 60;
+    - the Marker packet `ca 03 50 47 50`, and then the binary export.
+  - A UTF-8 byte order mark before the armored export of the revoked key,
+    or two blank lines and two spaces before its armor line, gives no
+    revocation, and the pull imports the commit at exit 0. A binary export
+    of the revoked key followed by 40 bytes of the key export, or by a line
+    of text, also leaves the pull at exit 0.
+  - A file of the three bytes `c6 01 04`, a Public-Key packet that holds
+    only a version byte, next to the keyring of the key leaves the pull at
+    exit 0.
+  - A file of the directory that cannot be opened: `error: Commit <hex>:
+    GPG: GPG: openat(<path>): Permission denied`, also when another file of
+    the directory holds the key.
+  - A directory that cannot be listed: `error: Commit <hex>:
+    opendir(<entry>): Permission denied`.
+
+  These results come from `ostree` 2026.1. A pull from a `file://` URL, a
+  pull over HTTP, and `pull-local --remote=<remote> --gpg-verify` give the
+  same results.
 
 #### Rules common to the verification axes
 
@@ -3888,7 +3941,19 @@ empty, unless a case states otherwise:
   holds `a.gpg`, a directory that holds only `a.keyring`, and a directory that
   holds `a.gpg` and a text file `README` give `Good signature from "<user
   id>"` at exit 0. An empty directory gives `Can't check signature: public key
-  not found` at exit 0.
+  not found` at exit 0. The command reads the directory as a pull does
+  ("Signature verification during a pull", "The verification keys"): a
+  directory that holds only a text file
+  `README`, and a file entry that names a text file, give `Can't check
+  signature: public key not found` at exit 0. A file of the directory that
+  cannot be opened gives `error: GPG: GPG: openat(<path>): Permission
+  denied` at exit 1, and a directory that cannot be listed gives `error:
+  opendir(<entry>): Permission denied` at exit 1. A directory that holds the
+  export of the key in `a.gpg` and the armored export of the revoked key in
+  `b.asc` gives `Key revoked` in the signature report at exit 0. A line of
+  text before the armor of `b.asc` gives the same report. A directory that
+  holds `a.gpg` and a file of the three bytes `c6 01 04` gives `Good
+  signature from "<user id>"` at exit 0.
 - A `gpgkeypath` entry that does not exist gives the commit report on
   standard output with no `Found` line. Then the command writes `error:
   opendir(ENTRY): No such file or directory` at exit 1.

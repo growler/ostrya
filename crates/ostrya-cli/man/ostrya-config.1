@@ -201,8 +201,13 @@ A pull checks the GPG signature of the summary in \fB\%summary.sig\fR.
 \fB\%ostrya remote fsck NAME\fR checks the signature of the summary of a bucket repository with these keys too.
 .TP
 \fB\%gpgkeypath\fR (list)
-More keyring files, or directories of \fB\%*.gpg\fR keyrings, that \fB\%gpg\-verify\fR trusts.
+More keyring files, or directories of keyring files, that \fB\%gpg\-verify\fR trusts.
+ostrya reads each regular file of a directory as a keyring, with any name.
+It does not read a subdirectory or a symlink of the directory.
+ostrya skips a file that does not hold the bytes \fB\%\-\-\-\-\-BEGIN PGP\fR and that is a GnuPG keybox or is not a whole OpenPGP packet stream, and the file adds no key.
 An entry that does not exist fails the pull.
+Each other file that ostrya cannot read whole as a keyring also fails the pull.
+Examples are a file that ostrya cannot open, a file larger than 4 MiB, a keyring with more than 256 certificates, armor that does not decode to a keyring, and a packet stream that the parser refuses.
 \fB\%ostrya show \-\-gpg\-verify\-remote=NAME\fR also trusts these entries, and an entry that does not exist fails its signature report.
 .TP
 \fB\%sign\-verify\fR (boolean or list, default false)

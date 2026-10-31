@@ -51,6 +51,11 @@ const DUMMY_METADATA_KEY: &str = "ostree.sign.dummy";
 /// The set holds its verifiers, so the verification of a commit reads no key
 /// source.
 ///
+/// [`TrustedKeys::new`] takes verifiers that the caller holds, and so does
+/// `TrustedKeys::with_gpg` with the `verify-gpg` feature.
+/// [`TrustedKeys::from_trust_group`] reads the keys of a trust group of the
+/// repository config.
+///
 /// [`PullTrust`] holds a set for the commits and a set for the summary of one
 /// pull. With the `receive` feature, the policy of a client group and a rule
 /// of a one-way stream can each hold a set, in `ReceiveVerify::Keys`, for the

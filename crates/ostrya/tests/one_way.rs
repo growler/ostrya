@@ -31,6 +31,7 @@ use ostrya::remote::proto::{
     CommitRequest, FrameWriter, Hello, Message, ObjectHeader, ServerCommit,
 };
 use ostrya::remote::{self, Encoding, ErrorCode, Expected, RefOutcome, RefUpdate};
+use ostrya::verify::TrustedKeys;
 use ostrya::{
     Checksum, DictBuilder, Error, FsckOptions, MAX_METADATA_SIZE, ObjectName, ObjectType,
     ReceivePattern, ReceiveReport, ReceiveService, ReceiveVerify, Repo, RepoMode, ServerSigner,
@@ -1208,6 +1209,56 @@ fn a_dependency_gets_no_server_signature() {
     receive_piped(&repo, &policy, bytes).unwrap();
     assert!(ed25519_signatures(&repo, &dep.checksum).is_empty());
     assert!(ed25519_signatures(&repo, &target.checksum).is_empty());
+}
+
+// ---------------------------------------------------------------------------
+// The keys of a trust group.
+// ---------------------------------------------------------------------------
+
+/// The keys that `TrustedKeys::from_trust_group` reads from the config of the
+/// receiving repository verify a one-way stream. A commit with no signature
+/// is `signature-required`, and nothing is published. A commit with a
+/// signature of the key of the group lands, and the ref names it.
+#[test]
+fn trust_group_keys_verify_a_stream() {
+    let public = ostrya::base64::encode(&common::receive::secret(SECRET_B64)[32..]);
+    let core = format!(
+        "[ex-ostrya trust \"release\"]\nsign-verify=ed25519\n\
+         verification-ed25519-key={public}\n"
+    );
+    let tmp = TmpDir::new("one-way-trust-group");
+    let (repo, before) = empty_repo(&tmp, &core);
+    let keys = block_on(TrustedKeys::from_trust_group(&repo, "release")).unwrap();
+    let policy = StreamPolicy {
+        default_rule: StreamRule {
+            verify: ReceiveVerify::Keys(Arc::new(keys)),
+            ..StreamRule::default()
+        },
+        ..StreamPolicy::default()
+    };
+    let target = commit_naming("target", &[]);
+    let objects = with_tree(&[&target]);
+    let updates = [("main", target.checksum)];
+
+    let unsigned = dependency_stream(&objects, &[], &updates);
+    match receive(&repo, &policy, &unsigned) {
+        Err(Error::Remote(remote::Error::SignatureRequired(m))) => {
+            assert!(
+                m.starts_with(&format!("commit {}: ", target.checksum)),
+                "{m}"
+            )
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_nothing_published(&repo, &before);
+
+    let meta = [signed(&target, &[SECRET_B64])];
+    let bytes = dependency_stream(&objects, &meta, &updates);
+    receive_piped(&repo, &policy, bytes).unwrap();
+    assert_eq!(
+        block_on(repo.list_refs(None)).unwrap(),
+        [("main".to_owned(), target.checksum)]
+    );
 }
 
 // ---------------------------------------------------------------------------

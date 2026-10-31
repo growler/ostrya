@@ -1,11 +1,13 @@
 //! The trust groups, `[ex-ostrya trust "NAME"]`: the check of a group, the
-//! build of its policy, and the trust of a pull that names a group.
+//! build of its policy, the trust of a pull that names a group, and the
+//! trusted keys of a group.
 //!
 //! `check_trust` checks the keys and the values of a group. It reads no file
 //! and runs no program. `trust_group_policy` builds the policy of a group that
 //! passed the check. `pull_trust` resolves the trust of a pull that names a
 //! group: in the key `trust` of the section of its remote, or in
-//! `PullOptions::trust_group`.
+//! `PullOptions::trust_group`. `TrustedKeys::from_trust_group` resolves the
+//! name of a group that its caller gives, and builds the keys of the group.
 
 use ostrya_core::KeyFile;
 
@@ -75,7 +77,100 @@ pub(crate) async fn trust_group_build(
     build_policy(repo, &source, &mut Verifiers::default(), gpg, sign).await
 }
 
-/// The source of the name of the trust group of a pull.
+impl TrustedKeys {
+    /// Reads the trusted keys of the trust group `[ex-ostrya trust "NAME"]`
+    /// whose name is `name`.
+    ///
+    /// The group uses the key names of a remote section:
+    ///
+    /// - `gpg-verify` turns on the GPG axis. In a trust group, its default is
+    ///   `false`.
+    /// - `gpgkeypath` names the keyrings of the GPG axis.
+    /// - `sign-verify` turns on the sign-api axis and selects its engines.
+    /// - `verification-ENGINE-key` and `verification-ENGINE-file` hold the
+    ///   keys of the sign-api axis.
+    ///
+    /// The keys are the keys that the group names, and no other key. The call
+    /// reads no system key store, no revoked set, no per-remote keyring, and
+    /// no global GPG trusted directory. The axes are ANDed: a commit needs a
+    /// valid signature on each axis that the group turns on.
+    ///
+    /// The call reads the group from [`Repo::config`], the config that the
+    /// open of `repo` read. Each [`Error::InvalidInput`],
+    /// [`Error::InvalidFormat`], and [`Error::Unsupported`] refusal comes
+    /// before the call reads a key source. An [`Error::Core`] refusal of a
+    /// value that does not parse, and an [`Error::Signature`] refusal, can
+    /// come after the call reads a key source. The call reads each key source
+    /// before it returns, and the keys that it gives read no key source
+    /// again.
+    ///
+    /// With the `receive` feature, `ReceiveVerify::Keys` takes the keys, in
+    /// the policy of a client group or in a `StreamRule` of a one-way stream.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidInput`] if `name` is empty or holds a `"` or a
+    ///   control character, or if the config has no group
+    ///   `[ex-ostrya trust "NAME"]`.
+    /// - [`Error::InvalidFormat`] if the group holds a key that it does not
+    ///   take, holds a key that no check reads, turns on no signature check,
+    ///   names an engine other than `ed25519` or `spki`, or sets
+    ///   `gpg-verify=true` and its `gpgkeypath` names no keyring or holds an
+    ///   empty entry.
+    /// - [`Error::Unsupported`] if the group sets `gpg-verify=true` in a
+    ///   build with no `verify-gpg` feature, or names the spki engine in a
+    ///   build with no `sign-spki` feature.
+    /// - [`Error::Core`] if `gpg-verify` is not a boolean, if a value holds a
+    ///   malformed escape sequence, or if a key is not valid base64.
+    /// - [`Error::Signature`] if:
+    ///   - a key source cannot be read
+    ///   - an engine refuses a key
+    ///   - an engine that `sign-verify` names has no trusted key, or no
+    ///     engine has a trusted key
+    ///   - the keyrings that `gpgkeypath` names hold no certificate.
+    ///
+    /// # Examples
+    ///
+    /// A rule of a one-way stream that verifies each new commit against the
+    /// keys of the trust group `release`:
+    ///
+    /// ```no_run
+    /// # #[cfg(feature = "receive")]
+    /// use std::sync::Arc;
+    ///
+    /// use ostrya::Repo;
+    /// # #[cfg(feature = "receive")]
+    /// use ostrya::receive::{ReceiveVerify, StreamPolicy, StreamRule};
+    /// use ostrya::verify::TrustedKeys;
+    ///
+    /// # async fn run() -> ostrya::Result<()> {
+    /// let repo = Repo::open("/srv/repo".as_ref()).await?;
+    /// let keys = TrustedKeys::from_trust_group(&repo, "release").await?;
+    /// # #[cfg(feature = "receive")]
+    /// # {
+    /// let policy = StreamPolicy {
+    ///     default_rule: StreamRule {
+    ///         verify: ReceiveVerify::Keys(Arc::new(keys)),
+    ///         ..StreamRule::default()
+    ///     },
+    ///     ..StreamPolicy::default()
+    /// };
+    /// # let _ = policy;
+    /// # }
+    /// # #[cfg(not(feature = "receive"))]
+    /// # let _ = keys;
+    /// # Ok(()) }
+    /// ```
+    pub async fn from_trust_group(repo: &Repo, name: &str) -> Result<TrustedKeys> {
+        let keyfile = repo.config().keyfile();
+        let group = named_group(keyfile, GroupName::Group(name))?;
+        let policy = trust_group_policy(repo, keyfile, name, &group, true, true).await?;
+        Ok(TrustedKeys::from_policy(policy))
+    }
+}
+
+/// The source of the name of a trust group: a pull, or a caller of
+/// [`TrustedKeys::from_trust_group`].
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum GroupName<'a> {
     /// The value of the key `trust` of the section of `remote`.
@@ -87,13 +182,17 @@ pub(crate) enum GroupName<'a> {
     },
     /// The value of [`PullOptions::trust_group`](crate::PullOptions::trust_group).
     Field(&'a str),
+    /// The argument of [`TrustedKeys::from_trust_group`].
+    Group(&'a str),
 }
 
 impl GroupName<'_> {
     /// Returns the name of the trust group.
     fn value(&self) -> &str {
         match self {
-            GroupName::Key { value, .. } | GroupName::Field(value) => value,
+            GroupName::Key { value, .. } | GroupName::Field(value) | GroupName::Group(value) => {
+                value
+            }
         }
     }
 }
@@ -170,7 +269,7 @@ pub(crate) async fn pull_trust(
                     "remote '{remote}' takes its commit keys from [{group}], so a pull \
                      cannot turn on {check} of the commits"
                 ),
-                GroupName::Field(_) => format!(
+                GroupName::Field(_) | GroupName::Group(_) => format!(
                     "the pull takes its commit keys from [{group}], so it cannot turn on \
                      {check} of the commits"
                 ),
@@ -230,8 +329,10 @@ pub(crate) async fn pull_trust(
 /// Checks the trust group that `name` names, and returns the name of its
 /// key-file group, `ex-ostrya trust "NAME"`.
 ///
-/// The checks are the first two checks of [`pull_trust`]: the name is a valid
-/// group name, the group exists, and [`check_trust`] accepts the group.
+/// The checks are the first two checks of [`pull_trust`], and the checks of
+/// [`TrustedKeys::from_trust_group`] before it reads a key source: the name
+/// is a valid group name, the group exists, and [`check_trust`] accepts the
+/// group.
 fn named_group(keyfile: &KeyFile, name: GroupName<'_>) -> Result<String> {
     let value = name.value();
     let group = format!("ex-ostrya trust \"{value}\"");
@@ -241,7 +342,7 @@ fn named_group(keyfile: &KeyFile, name: GroupName<'_>) -> Result<String> {
                 "malformed [remote \"{remote}\"] trust value '{value}': the value names a \
                  trust group, is not empty, and holds no '\"' and no control character"
             )),
-            GroupName::Field(_) => Error::InvalidInput(format!(
+            GroupName::Field(_) | GroupName::Group(_) => Error::InvalidInput(format!(
                 "malformed trust group name '{value}': the name is not empty, and holds \
                  no '\"' and no control character"
             )),
@@ -256,6 +357,9 @@ fn named_group(keyfile: &KeyFile, name: GroupName<'_>) -> Result<String> {
                 "the pull names the trust group '{value}', and the config has no \
                  [{group}] group"
             )),
+            GroupName::Group(_) => {
+                Error::InvalidInput(format!("the config has no [{group}] group"))
+            }
         });
     }
     check_trust(keyfile, &group)?;
@@ -279,7 +383,7 @@ fn refuse_void_key(
             let verb = if holds { "holds " } else { "" };
             format!("[remote \"{remote}\"] sets trust={value} and {verb}{key}{reason}")
         }
-        GroupName::Field(_) => {
+        GroupName::Field(_) | GroupName::Group(_) => {
             let verb = if holds { "holds" } else { "sets" };
             format!(
                 "the pull takes its commit keys from [{group}], and [remote \"{remote}\"] \
@@ -1099,6 +1203,122 @@ pub(crate) mod tests {
         let gpg = keys.gpg().expect("gpg-verify defaults to true");
         assert!(gpg.verify(PAYLOAD, &[signature]).unwrap().valid);
         assert!(keys.sign().is_empty());
+    }
+
+    /// `TrustedKeys::from_trust_group` reads the keys of the group that it
+    /// names. A signature from the key of the group passes. A commit with no
+    /// signature fails, and a signature from another key fails.
+    #[test]
+    fn from_trust_group_verifies_a_commit() {
+        let scratch = Scratch::new("from-group");
+        let repo = repo_with_remotes(
+            &scratch,
+            &format!(
+                "[ex-ostrya trust \"t\"]\nsign-verify=ed25519\n\
+                 verification-ed25519-key={PUBLIC_B64}\n"
+            ),
+        );
+        let policy = ostrya_rt::block_on(TrustedKeys::from_trust_group(&repo, "t"))
+            .unwrap()
+            .into_policy();
+        let own = ed25519_signed(SECRET_B64);
+        let other = ed25519_signed(OTHER_SECRET_B64);
+        let (valid, unsigned, untrusted) = ostrya_rt::block_on(async {
+            (
+                policy.check("commit", PAYLOAD, Some(&own)).await,
+                policy.check("commit", PAYLOAD, None).await,
+                policy.check("commit", PAYLOAD, Some(&other)).await,
+            )
+        });
+        valid.expect("a signature from the key of the group passes");
+        let err = unsigned.unwrap_err();
+        assert!(err.to_string().contains("carries no signature"), "{err}");
+        let err = untrusted.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("no sign-api signature is from a trusted key"),
+            "{err}"
+        );
+    }
+
+    /// `TrustedKeys::from_trust_group` refuses a name that is empty or holds
+    /// a `"` or a control character with `Error::InvalidInput`.
+    #[test]
+    fn from_trust_group_refuses_a_malformed_name() {
+        let scratch = Scratch::new("from-group-name");
+        let repo = scratch.repo();
+        for name in ["", "a\"b", "a\nb"] {
+            let err = ostrya_rt::block_on(TrustedKeys::from_trust_group(&repo, name)).unwrap_err();
+            let Error::InvalidInput(m) = &err else {
+                panic!("{name:?}: {err}");
+            };
+            assert_eq!(
+                m,
+                &format!(
+                    "malformed trust group name '{name}': the name is not empty, and holds \
+                     no '\"' and no control character"
+                )
+            );
+        }
+    }
+
+    /// `TrustedKeys::from_trust_group` refuses a name of a group that the
+    /// config does not hold with `Error::InvalidInput`. The words name the
+    /// group and do not name a pull.
+    #[test]
+    fn from_trust_group_refuses_an_absent_group() {
+        let scratch = Scratch::new("from-group-absent");
+        let repo = repo_with_remotes(
+            &scratch,
+            &format!(
+                "[ex-ostrya trust \"t\"]\nsign-verify=ed25519\n\
+                 verification-ed25519-key={PUBLIC_B64}\n"
+            ),
+        );
+        let err = ostrya_rt::block_on(TrustedKeys::from_trust_group(&repo, "u")).unwrap_err();
+        let Error::InvalidInput(m) = &err else {
+            panic!("{err}");
+        };
+        assert_eq!(m, "the config has no [ex-ostrya trust \"u\"] group");
+        assert!(!m.contains("pull"), "{m}");
+    }
+
+    /// `TrustedKeys::from_trust_group` refuses a group that fails the check
+    /// of a trust group. The refusal comes before the call reads a key
+    /// source: the group names a keyring and a key file that do not exist,
+    /// and the error is the error of the check.
+    #[test]
+    fn from_trust_group_refuses_a_malformed_group() {
+        let scratch = Scratch::new("from-group-malformed");
+        let repo = repo_with_remotes(
+            &scratch,
+            &format!(
+                "[ex-ostrya trust \"empty\"]\n\
+                 [ex-ostrya trust \"summary\"]\ngpg-verify=true\ngpgkeypath={}\n\
+                 sign-verify=ed25519\nverification-ed25519-file={}\n\
+                 gpg-verify-summary=true\n",
+                scratch.dir.join("absent.gpg").display(),
+                scratch.dir.join("absent.keys").display(),
+            ),
+        );
+        for (name, text) in [
+            (
+                "empty",
+                "[ex-ostrya trust \"empty\"] turns on no signature check: set \
+                 gpg-verify=true or sign-verify",
+            ),
+            (
+                "summary",
+                "[ex-ostrya trust \"summary\"] holds 'gpg-verify-summary', and a trust \
+                 group sets a commit policy alone",
+            ),
+        ] {
+            let err = ostrya_rt::block_on(TrustedKeys::from_trust_group(&repo, name)).unwrap_err();
+            assert!(
+                matches!(&err, Error::InvalidFormat(m) if m == text),
+                "{name}: {err}"
+            );
+        }
     }
 
     /// `verification_engine` returns the engine that a verification key

@@ -2858,6 +2858,8 @@ trust groups, and the key groups from `<repo>/config`. It also reads
 group that the key names. A pull with `PullOptions::trust_group`, which
 `ostrya pull-local --trust=NAME` sets, reads the one trust group that the
 field names, and does not read the key `trust`.
+`TrustedKeys::from_trust_group` reads the one trust group that its argument
+names.
 
 The tool gives a quote no meaning in a group name, so the port splits the name
 of a group itself. The server group has the exact name `ex-ostrya server`. The

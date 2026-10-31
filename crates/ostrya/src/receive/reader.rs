@@ -19,7 +19,7 @@ use crate::access::{ClientAccess, Group, classify};
 use crate::error::{Error, Result};
 use crate::repo::Repo;
 use crate::sign::{MAX_KEY_FILE, key_text, read_key_path};
-use crate::verify::trust::{check_trust, trust_group_policy, unknown_key};
+use crate::verify::trust::{check_trust, unknown_key};
 
 use super::{ReceivePolicy, ReceiveVerify, ServerSigner, TrustedKeys};
 
@@ -73,15 +73,15 @@ pub(crate) async fn read(repo: &Repo) -> Result<(ClientAccess, Vec<Arc<ReceivePo
     // file order.
     let mut signers: HashMap<&str, Vec<Arc<ServerSigner>>> = HashMap::new();
     let mut trusts: HashMap<&str, Arc<TrustedKeys>> = HashMap::new();
-    for (build, group) in builds {
+    for (build, _) in builds {
         match build {
             Group::Key(name) => {
                 let built = build_signers(name, &keys[name]).await?;
                 signers.insert(name, built.into_iter().map(Arc::new).collect());
             }
             Group::Trust(name) => {
-                let policy = trust_group_policy(repo, keyfile, name, group, true, true).await?;
-                trusts.insert(name, Arc::new(TrustedKeys::from_policy(policy)));
+                let built = TrustedKeys::from_trust_group(repo, name).await?;
+                trusts.insert(name, Arc::new(built));
             }
             _ => {}
         }

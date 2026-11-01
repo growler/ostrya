@@ -670,6 +670,70 @@ The request body is a `Body` type of the fetcher, so `http-body-util` is not
 a dependency. The `basic` authorization header is encoded by
 `ostrya-core::base64`, so no base64 crate is a dependency.
 
+## SOCKS5 proxies
+
+The fetcher reaches an origin through a `socks5://` or a `socks5h://`
+proxy. With `socks5://`, the fetcher resolves the host name of the origin
+and sends an address. With `socks5h://`, it sends the host name of the
+origin, and the proxy resolves it. An origin host that is an IP literal goes
+as an address under both schemes. The default port is 1080, and a message
+names the proxy by its URL without the userinfo and without the port 1080.
+The connection to the origin carries origin-form requests, as a direct
+connection does. So its pool key is the origin, and no proxy flag is set.
+
+The client offers "no authentication" alone if the URL has no userinfo. With
+userinfo, it also offers the user name and password method of RFC 1929.
+GSSAPI is not offered. The userinfo takes the percent-decode of an `http://`
+proxy, and each field must be UTF-8 and 1 to 255 bytes after the decode.
+`Fetcher::new` refuses other userinfo with `Error::Unsupported`. A host name
+longer than 255 bytes, or with a `%`, fails the hop as definitive before the
+client connects to the proxy. These checks apply under both schemes, before
+the resolve. The client ignores the value of the `RSV` byte.
+
+Under `socks5://`, the fetcher asks the proxy to connect to each resolved
+address in turn, in the order that `ostrya_rt::TcpStream::connect` tries
+them. `ostrya_rt::resolve` gives this order. Each address gets a new
+connection to the proxy, because a refused `CONNECT` ends the connection.
+The first address that the proxy connects wins. A definitive failure ends
+the loop, because each later address gets the same answer. A failed connect
+to the proxy also ends the loop, with the retryable message of a proxy
+connect failure and no count of addresses. If the proxy refuses each
+address, the message is "connect to HOST:PORT through the proxy P failed at
+ADDR, the last of N addresses: REASON". A failed resolve, or a resolve that
+gives no address, is retryable and names the origin host.
+
+One `connect_timeout` covers the resolve, the whole address loop, the TLS
+handshake, and the HTTP handshake, as it covers a `CONNECT` tunnel. An
+attempt that stalls can use the full timeout, and then no later address is
+tried. The `Proxy` rustdoc states this limit.
+
+The failure classes follow the rule of an HTTP proxy, where 407 is
+definitive and each other refusal is retryable. A proxy that accepts no
+offered method, or that refuses the user name and the password, is
+definitive. Each reply code other than `00` is retryable. This includes
+`02` (not allowed by ruleset), `07` (command not supported), and `08`
+(address type not supported), which a retry can get again. The length
+check of a host name is different: the client makes it itself, before it
+sends the request, so no proxy answer is involved.
+
+`socks4://` and `socks4a://` stay refused, which is a divergence from the
+tool that `cli-surface.md` records with its source.
+
+Four alternatives were rejected:
+
+- A SOCKS crate. The client side of RFC 1928 and RFC 1929 is
+  `crates/ostrya-fetch/src/socks.rs`: 418 lines without its tests, of which
+  303 are code lines that are not blank and not comments. `tunnel()`, the
+  `CONNECT` exchange of an HTTP proxy, is 106 lines with its doc comment,
+  of which 89 are code lines. A crate adds packages to `Cargo.lock`.
+- `socks4` and `socks4a`. They have no IPv6 and no password, and each is a
+  second protocol to test.
+- "No authentication" alone. A proxy URL with userinfo then needs a
+  refusal, and a proxy that needs a password cannot serve the port.
+- The first resolved address alone. A name with IPv6 and IPv4 addresses then
+  fails through a proxy that cannot reach the first family, while a direct
+  connection reaches the origin.
+
 ## Request signing in the fetcher
 
 `ostrya_fetch::RequestSigner` is a hook that adds headers to each attempt.

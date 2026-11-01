@@ -2,8 +2,9 @@
 //!
 //! [`TcpStream`] and [`TcpListener`] wrap `smol::net` or `tokio::net`. The
 //! fetcher and the TLS layer use them through the `futures-io` traits, so
-//! these layers do not name the backend. The doc of [`TcpStream::connect`]
-//! holds the rules of the connect race.
+//! these layers do not name the backend. The doc of [`resolve`] holds the
+//! order of the addresses, and the doc of [`TcpStream::connect`] holds the
+//! rules of the connect race.
 
 use std::fmt;
 use std::future::Future;
@@ -43,18 +44,10 @@ pub struct TcpStream {
 impl TcpStream {
     /// Resolves `host` and returns the first connection that completes.
     ///
-    /// If `host` parses as an [`IpAddr`], that address is the one address to
-    /// reach. Every other host goes to the resolver on the blocking pool. An
-    /// IPv6 address in brackets, for example `[::1]`, does not parse as an
-    /// [`IpAddr`]. A caller gives an IPv6 address with no brackets.
+    /// [`resolve`] gives the addresses and their order. The connect race
+    /// tries them in that order.
     ///
     /// # Connect race
-    ///
-    /// The attempts keep the order of the resolver. If the answer holds IPv4
-    /// and IPv6 addresses, the first address of the other family moves to the
-    /// second place. The addresses that this address moves past keep their
-    /// order behind it. As a result, the first two attempts reach different
-    /// families.
     ///
     /// The first attempt starts at once. Each later attempt starts 250 ms
     /// after the start of the attempt before it. If an attempt fails, the next
@@ -70,9 +63,8 @@ impl TcpStream {
     ///
     /// # Errors
     ///
-    /// - The I/O error of the resolver, unchanged, if the resolution fails.
-    /// - An error of kind [`io::ErrorKind::NotFound`] if the answer holds no
-    ///   address.
+    /// - An error of [`resolve`], unchanged, if the resolution fails or the
+    ///   answer holds no address.
     /// - The error of the attempt to the first address in the attempt order,
     ///   if all attempts fail. Its kind is the kind of that failure, and its
     ///   message names the address. Its [`source`](std::error::Error::source)
@@ -111,24 +103,7 @@ impl TcpStream {
     /// # std::io::Result::Ok(())
     /// ```
     pub async fn connect(host: &str, port: u16) -> io::Result<TcpStream> {
-        let mut addrs = if let Ok(ip) = host.parse::<IpAddr>() {
-            vec![SocketAddr::new(ip, port)]
-        } else {
-            let name = host.to_owned();
-            crate::unblock(move || {
-                (name.as_str(), port)
-                    .to_socket_addrs()
-                    .map(|addrs| addrs.collect::<Vec<SocketAddr>>())
-            })
-            .await?
-        };
-        if addrs.is_empty() {
-            return Err(io::Error::new(
-                io::ErrorKind::NotFound,
-                format!("no address for {host}:{port}"),
-            ));
-        }
-        order_families(&mut addrs);
+        let addrs = resolve(host, port).await?;
         connect_addrs(addrs, ATTEMPT_STAGGER).await
     }
 
@@ -173,6 +148,60 @@ impl TcpStream {
             true
         }
     }
+}
+
+/// Resolves `host` and returns its addresses with `port`, in the order that
+/// [`TcpStream::connect`] tries them.
+///
+/// If `host` parses as an [`IpAddr`], that address is the one address in the
+/// list. Every other host goes to the resolver on the blocking pool. An IPv6
+/// address in brackets, for example `[::1]`, does not parse as an
+/// [`IpAddr`]. A caller gives an IPv6 address with no brackets.
+///
+/// The list keeps the order of the resolver. If the answer holds IPv4 and
+/// IPv6 addresses, the first address of the other family moves to the second
+/// place. The addresses that this address moves past keep their order behind
+/// it. As a result, the first two addresses hold different families.
+///
+/// The function has no time limit of its own. A caller that needs a time
+/// limit puts it around the whole call.
+///
+/// # Errors
+///
+/// - The I/O error of the resolver, unchanged, if the resolution fails.
+/// - An error of kind [`io::ErrorKind::NotFound`] if the answer holds no
+///   address. A list that the function returns is never empty.
+///
+/// # Examples
+///
+/// ```
+/// ostrya_rt::block_on(async {
+///     let addrs = ostrya_rt::resolve("2001:db8::1", 443).await?;
+///     assert_eq!(addrs, ["[2001:db8::1]:443".parse().unwrap()]);
+///     std::io::Result::Ok(())
+/// })?;
+/// # std::io::Result::Ok(())
+/// ```
+pub async fn resolve(host: &str, port: u16) -> io::Result<Vec<SocketAddr>> {
+    let mut addrs = if let Ok(ip) = host.parse::<IpAddr>() {
+        vec![SocketAddr::new(ip, port)]
+    } else {
+        let name = host.to_owned();
+        crate::unblock(move || {
+            (name.as_str(), port)
+                .to_socket_addrs()
+                .map(|addrs| addrs.collect::<Vec<SocketAddr>>())
+        })
+        .await?
+    };
+    if addrs.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("no address for {host}:{port}"),
+        ));
+    }
+    order_families(&mut addrs);
+    Ok(addrs)
 }
 
 /// A connect failure together with the address the attempt reached for.
@@ -873,6 +902,35 @@ mod tests {
             let client = connect_addrs(vec![live], TEST_STAGGER).await.unwrap();
             assert_eq!(client.peer_addr().unwrap(), live);
             assert_eq!(server.await, client.local_addr().unwrap());
+        });
+    }
+
+    /// An IP literal resolves to the one address, with the port.
+    #[test]
+    fn an_ip_literal_resolves_to_itself() {
+        block_on(async {
+            assert_eq!(
+                resolve("192.0.2.1", 443).await.unwrap(),
+                vec![at("192.0.2.1:443")]
+            );
+            assert_eq!(
+                resolve("2001:db8::1", 8443).await.unwrap(),
+                vec![at("[2001:db8::1]:8443")]
+            );
+        });
+    }
+
+    /// The name `localhost` resolves to loopback addresses alone, each with
+    /// the port.
+    #[test]
+    fn localhost_resolves_to_loopback_addresses() {
+        block_on(async {
+            let addrs = resolve("localhost", 80).await.unwrap();
+            assert!(!addrs.is_empty());
+            for addr in &addrs {
+                assert!(addr.ip().is_loopback(), "{addr}");
+                assert_eq!(addr.port(), 80, "{addr}");
+            }
         });
     }
 

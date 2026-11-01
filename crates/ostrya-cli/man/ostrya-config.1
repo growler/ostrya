@@ -278,7 +278,11 @@ A pull accepts each certificate chain, and still checks the host name.
 A push to an \fB\%https://\fR address or to an \fB\%s3://\fR address refuses \fB\%true\fR.
 .TP
 \fB\%proxy\fR (string)
-The \fB\%http://\fR proxy URL of each request to the remote.
+The proxy URL of each request to the remote: \fB\%http://HOST[:PORT]\fR, \fB\%socks5://HOST[:PORT]\fR, or \fB\%socks5h://HOST[:PORT]\fR.
+The default port of a SOCKS5 proxy is 1080.
+With \fB\%socks5://\fR, ostrya resolves the host name of the remote and sends each address to the proxy in turn.
+With \fB\%socks5h://\fR, the proxy resolves the host name of the remote.
+A value with another scheme, for example \fB\%socks4://\fR, is refused.
 The \fB\%no_proxy\fR variables do not apply to it.
 When the key is empty or absent, the proxy variables of the environment apply.
 A value with white space at its start or end is refused.

@@ -17,6 +17,9 @@
 
 #![cfg(all(feature = "serve", feature = "push"))]
 
+#[path = "../../ostrya/tests/common/socks.rs"]
+mod socks;
+
 use std::future::Future;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
@@ -1745,6 +1748,44 @@ mod cli {
         assert!(out.status.success(), "{}", stderr(&out));
         assert_eq!(stdout(&out), format!("main (new) {commit}\n"));
         assert_eq!(rev_parse(&server, "main"), commit);
+    }
+
+    /// An HTTP push reaches `ostrya serve` through the `socks5h://` proxy of
+    /// the `proxy` key. The remote names the server by `localhost`, so the
+    /// proxy gets the host name.
+    #[test]
+    fn a_push_goes_through_a_socks5h_proxy_key() {
+        let setup = Setup::new("cli-proxy-socks");
+        let src = tree(setup.tmp.path(), "tree", 2, 100);
+        let (client, commit) = setup.client(&src);
+        let server = setup.init("server", "archive");
+        add_config(&server, ANONYMOUS_PUSH);
+        let serving = Serving::start(&server, &[]);
+        let url = serving.url.replace("127.0.0.1", "localhost");
+        assert!(url.starts_with("http://localhost:"), "{url}");
+        let port: u16 = url
+            .trim_end_matches('/')
+            .rsplit(':')
+            .next()
+            .unwrap()
+            .parse()
+            .unwrap();
+        let peer = socks::TestSocks::start(socks::Socks::OPEN);
+        add_config(
+            &client,
+            &format!("[remote \"socks\"]\nurl={url}\nproxy={}\n", peer.url()),
+        );
+        let out = push_from(&client, &["socks", "main"]);
+        assert!(out.status.success(), "{}", stderr(&out));
+        assert_eq!(stdout(&out), format!("main (new) {commit}\n"));
+        assert_eq!(rev_parse(&server, "main"), commit);
+        let seen = peer.seen();
+        assert!(!seen.is_empty());
+        for record in &seen {
+            assert_eq!(record.atyp, Some(0x03), "{record:?}");
+            assert_eq!(record.host, "localhost", "{record:?}");
+            assert_eq!(record.port, port, "{record:?}");
+        }
     }
 
     /// With no client group, the implicit group `anonymous` reads each ref

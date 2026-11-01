@@ -145,8 +145,9 @@ impl Repo {
     ///
     /// An HTTP pull connects through the proxy of the endpoint.
     /// [`resolve_pull`] reads it from the
-    /// remote key `proxy`. With the `http://` proxy URL of that key, the pull
-    /// connects through the proxy for every origin, and ignores `no_proxy`. If
+    /// remote key `proxy`. With the `http://`, `socks5://`, or `socks5h://`
+    /// proxy URL of that key, the pull connects through the proxy for every origin, and
+    /// ignores `no_proxy`. If
     /// the key is absent or empty, the pull reads the proxy environment
     /// variables.
     ///

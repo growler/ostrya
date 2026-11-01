@@ -22,6 +22,8 @@ mod common;
 mod proxy;
 #[path = "common/pull.rs"]
 mod pull;
+#[path = "common/socks.rs"]
+mod socks;
 
 use std::collections::HashSet;
 use std::net::SocketAddr;
@@ -49,6 +51,7 @@ use ostrya::{
 use ostrya_rt::{TcpListener, block_on, spawn};
 use proxy::{TestProxy, Tunnel};
 use pull::*;
+use socks::{Socks, TestSocks};
 
 /// The overrides that set the retry count alone.
 fn retries(max_retries: u32) -> EndpointOverrides {
@@ -8207,6 +8210,59 @@ fn a_tls_pull_tunnels_through_the_proxy_key() {
     });
 }
 
+/// A pull from a remote whose `proxy` key names a `socks5h://` proxy reaches
+/// the remote through that proxy, over cleartext and over TLS. The proxy gets
+/// the host name of the remote. Each connection of the server comes through
+/// the proxy. Each TLS connection negotiates HTTP/2.
+#[test]
+fn a_pull_goes_through_a_socks5h_proxy_key() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-proxy-key-socks");
+        let (_remote, commit) = build_remote(dir.path()).await;
+        let root = dir.path().join("remote");
+        let ca = dir.path().join("ca.pem");
+        std::fs::write(&ca, CA_PEM).unwrap();
+        for tls in [false, true] {
+            let server = RepoServer::start(&root, tls).await;
+            let peer = TestSocks::start(Socks::OPEN);
+            let mut keys = format!("proxy={}\n", peer.url());
+            if tls {
+                keys.push_str(&format!("tls-ca-path={}\n", ca.display()));
+            }
+            let base = dir.path().join(if tls { "tls" } else { "cleartext" });
+            std::fs::create_dir(&base).unwrap();
+            let dest = build_dest(&base, RepoMode::Archive, &server.url(), &keys).await;
+
+            dest.pull(
+                "origin",
+                PullOptions {
+                    refs: vec!["test/main".to_owned()],
+                    ..PullOptions::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert_eq!(
+                dest.resolve_rev("origin:test/main", true).await.unwrap(),
+                Some(commit),
+                "tls {tls}"
+            );
+            let seen = peer.seen();
+            assert!(!seen.is_empty(), "tls {tls}");
+            for record in &seen {
+                assert_eq!(record.methods, [0x00], "tls {tls}: {record:?}");
+                assert_eq!(record.atyp, Some(0x03), "tls {tls}: {record:?}");
+                assert_eq!(record.host, "localhost", "tls {tls}: {record:?}");
+                assert_eq!(record.port, server.port(), "tls {tls}: {record:?}");
+            }
+            assert_eq!(server.connections(), seen.len(), "tls {tls}");
+            if tls {
+                assert_eq!(server.h2_connections(), server.connections());
+            }
+        }
+    });
+}
+
 /// `remote_fetch_summary` reaches the remote through its `proxy` key.
 #[test]
 fn remote_fetch_summary_goes_through_the_proxy_key() {
@@ -8508,6 +8564,42 @@ fn a_session_with_a_bearer_token_pulls_over_https() {
             dest.resolve_rev("origin:test/main", true).await.unwrap(),
             Some(commit)
         );
+    });
+}
+
+/// A session pull with `all_proxy` set to a `socks5://` proxy in
+/// `Proxy::Variables` reaches the remote through that proxy. The client
+/// resolves the host name and sends each address to the proxy, which never
+/// gets the name. The proxy refuses an address that it cannot connect to, so
+/// the server sees one connection for each record of `127.0.0.1`.
+#[test]
+fn a_session_pull_goes_through_a_socks5_all_proxy_variable() {
+    block_on(async {
+        let dir = TmpDir::new("pull-http-session-socks");
+        let (_remote, commit) = build_remote(dir.path()).await;
+        let server = RepoServer::start(&dir.path().join("remote"), false).await;
+        let peer = TestSocks::start(Socks::OPEN);
+        let dest = build_dest(dir.path(), RepoMode::Archive, DEAD_URL, "").await;
+
+        let mut http = FetcherOptions::new(server.url());
+        http.proxy = Proxy::Variables(vec![("all_proxy".into(), peer.client_resolve_url())]);
+        pull_main_over(&dest, http).await.unwrap();
+        assert_eq!(
+            dest.resolve_rev("origin:test/main", true).await.unwrap(),
+            Some(commit)
+        );
+        let seen = peer.seen();
+        for record in &seen {
+            assert!(matches!(record.atyp, Some(0x01 | 0x04)), "{record:?}");
+            assert_eq!(record.port, server.port(), "{record:?}");
+        }
+        let ipv4 = seen
+            .iter()
+            .filter(|record| record.atyp == Some(0x01) && record.host == "127.0.0.1")
+            .count();
+        assert!(ipv4 > 0, "{seen:?}");
+        assert_eq!(peer.connections(), seen.len());
+        assert_eq!(server.connections(), ipv4);
     });
 }
 

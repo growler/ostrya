@@ -59,6 +59,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::future::Future;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -75,6 +76,7 @@ use std::task::{Context, Poll, Waker, ready};
 mod error;
 pub mod gate;
 mod io;
+mod socks;
 mod tls;
 
 pub use self::error::{Error, Result};
@@ -120,8 +122,15 @@ const PROXY_VARIABLES: [&str; 7] = [
     "NO_PROXY",
 ];
 
-/// The scheme of a proxy URL. A proxy connection opens with this scheme alone.
+/// The scheme of an HTTP proxy URL. An HTTP proxy connection opens with this
+/// scheme alone.
 const PROXY_SCHEME: &str = "http://";
+
+/// The scheme of a SOCKS5 proxy URL whose client resolves the origin host.
+const SOCKS5_SCHEME: &str = "socks5://";
+
+/// The scheme of a SOCKS5 proxy URL whose proxy resolves the origin host.
+const SOCKS5H_SCHEME: &str = "socks5h://";
 
 /// The statuses at which a fetch follows a redirect. A fetch is a GET, so none
 /// of the five changes the method of the next hop. The statuses that differ in
@@ -553,13 +562,15 @@ const RATE_SPAN: usize = 5;
 ///
 /// # Proxy URL
 ///
-/// A proxy URL has the form `http://host[:port]`, and the port is 80 by
-/// default. The URL has no path other than `/`, no query, and no fragment. The
-/// fetcher percent-decodes the userinfo and sends it to the proxy as
-/// `Proxy-Authorization: Basic`.
+/// A proxy URL has the form `http://host[:port]`, `socks5://host[:port]`, or
+/// `socks5h://host[:port]`. The port is 80 by default for `http://` and 1080
+/// for `socks5://` and `socks5h://`. The URL has no path other than `/`, no
+/// query, and no fragment. For an `http://` proxy, the fetcher percent-decodes
+/// the userinfo and sends it to the proxy as `Proxy-Authorization: Basic`.
+/// [SOCKS proxies](Proxy#socks-proxies) states the rules of a SOCKS5 proxy.
 ///
 /// Any other form fails [`Fetcher::new`] with [`Error::Unsupported`], for
-/// example an `https://` or a `socks5://` proxy. This applies to a URL from the
+/// example an `https://` or a `socks4://` proxy. This applies to a URL from the
 /// options and to a URL from the environment. The message names the value
 /// without its userinfo.
 ///
@@ -596,8 +607,8 @@ const RATE_SPAN: usize = 5;
 ///
 /// # Cleartext origins
 ///
-/// The fetcher reaches a cleartext origin behind a proxy over a connection to
-/// the proxy. The request carries the absolute-form target, the whole
+/// The fetcher reaches a cleartext origin behind an `http://` proxy over a
+/// connection to the proxy. The request carries the absolute-form target, the whole
 /// `http://host/path` URL, and the `Host` header of the origin. Such a
 /// connection uses HTTP/1.1, because cleartext HTTP/2 needs prior knowledge or
 /// an upgrade.
@@ -611,7 +622,8 @@ const RATE_SPAN: usize = 5;
 ///
 /// # TLS origins
 ///
-/// The fetcher reaches a TLS origin behind a proxy over a `CONNECT` tunnel. The
+/// The fetcher reaches a TLS origin behind an `http://` proxy over a `CONNECT`
+/// tunnel. The
 /// request names the target as `host:port`. The port is always written, and an
 /// IPv6 literal keeps its brackets. If the proxy URL holds userinfo, the
 /// `CONNECT` carries the same `Proxy-Authorization`.
@@ -627,12 +639,78 @@ const RATE_SPAN: usize = 5;
 /// these steps together: the connect to the proxy, the `CONNECT` exchange, the
 /// TLS handshake, and the HTTP handshake.
 ///
+/// # SOCKS proxies
+///
+/// A `socks5://` or a `socks5h://` URL names a SOCKS5 proxy (RFC 1928). With
+/// `socks5://`, the fetcher resolves the host name of the origin and sends an
+/// address to the proxy. With `socks5h://`, the fetcher sends the host name
+/// of the origin to the proxy, and the proxy resolves the name. If the origin
+/// host is an IP address, the fetcher sends the address under both schemes.
+/// `socks4://` and `socks4a://` fail [`Fetcher::new`] with
+/// [`Error::Unsupported`].
+///
+/// The fetcher opens a connection to the proxy and asks the proxy to connect
+/// to the origin. Then the connection carries the bytes of the origin. A
+/// cleartext origin and a TLS origin use this one way. The TLS handshake, the
+/// ALPN selection, the request, and the pool entry are the same as for a
+/// direct connection to the origin. So the request has the origin form, and
+/// the proxy reads no HTTP. A `Proxy-Authorization` header of the caller goes
+/// to the origin.
+///
+/// If the URL has no userinfo, the fetcher offers the method "no
+/// authentication" alone. If the URL has userinfo, the fetcher also offers the
+/// user name and password method of RFC 1929. It sends the user name and the
+/// password only if the proxy selects that method. The fetcher does not offer
+/// GSSAPI.
+///
+/// The userinfo is `user:password`. The fetcher percent-decodes each field as
+/// for an `http://` proxy, and each field must be UTF-8 after the decode. Each
+/// field must be 1 to 255 bytes after the decode. [`Fetcher::new`] refuses
+/// other userinfo with [`Error::Unsupported`], for example `user@` or
+/// `user:@`. The message names the URL without its userinfo.
+///
+/// A message names the proxy with its URL without the userinfo. The message
+/// leaves out the port if it is 1080.
+///
+/// SOCKS5 sends a host name of 1 to 255 bytes. A longer origin host fails the
+/// hop as a definitive failure. A host name with a `%` also fails as a
+/// definitive failure, because a SOCKS5 request has no field for the zone id
+/// of an IPv6 address. The fetcher applies these two checks under both
+/// schemes, before it resolves the name. In these two cases, the fetcher
+/// resolves no name and opens no connection to the proxy.
+///
+/// Under `socks5://`, the fetcher asks the proxy to connect to each resolved
+/// address in turn, in the order that a direct connection tries them. Each
+/// address gets a new connection to the proxy, because a refused request ends
+/// the connection. The first address that the proxy connects wins. A
+/// definitive failure stops the loop, and a failed connect to the proxy also
+/// stops it. If the proxy refuses each address, the retryable failure states
+/// the last failure and the number of addresses. A failed resolve, or a
+/// resolve that gives no address, is a retryable failure and names the origin
+/// host.
+///
+/// Two answers of the proxy are definitive failures: the proxy accepts none of
+/// the offered methods, or it refuses the user name and the password. A retry
+/// gets the same answer. Each other failure is retryable. This includes each
+/// reply code other than success, a reply that breaks the protocol, and an I/O
+/// failure. The fetcher ignores the value of the reserved byte of the reply.
+/// Each failure is [`Error::Fetch`]. A failure of the SOCKS5 exchange names
+/// the proxy and the origin.
+///
+/// [`connect_timeout`](FetcherOptions::connect_timeout) is the limit for all
+/// these steps together: the resolve, the connect to the proxy, the SOCKS5
+/// exchange, the TLS handshake, and the HTTP handshake. Under `socks5://`,
+/// the limit covers the whole address loop. An attempt that stalls can use
+/// the full limit, and then the fetcher tries no later address. A timeout
+/// names the proxy.
+///
 /// # Proxy credential
 ///
 /// The proxy credential belongs to the connection layer. It goes to the proxy
 /// on a proxied cleartext request and on a `CONNECT`, and to no origin. It is
 /// not in the merged header list, so the cleartext credential check and the
-/// redirect scoping do not read it. A tunnel carries no part of it.
+/// redirect scoping do not read it. A tunnel carries no part of it. A SOCKS
+/// proxy gets its credential in the RFC 1929 exchange alone.
 ///
 /// A `Proxy-Authorization` header that a caller sets keeps the meaning that it
 /// has without a proxy. It is a credential in the merged list. A fetch refuses
@@ -684,10 +762,11 @@ pub enum Proxy {
     /// first entry with a value counts. [White space](Proxy#white-space) states
     /// the check of each value.
     Variables(Vec<(String, String)>),
-    /// One `http://` proxy URL for all origins.
+    /// One `http://`, `socks5://`, or `socks5h://` proxy URL for all origins.
     ///
-    /// The fetcher sends the userinfo of the URL as
-    /// `Proxy-Authorization: Basic`. No origin is exempt, because the fetcher
+    /// The fetcher sends the userinfo of an `http://` URL as
+    /// `Proxy-Authorization: Basic`, and the userinfo of a SOCKS5 URL in the
+    /// RFC 1929 exchange. No origin is exempt, because the fetcher
     /// reads the environment for neither the proxy nor the exemptions. The
     /// fetcher trims white space around the URL.
     Url(String),
@@ -970,8 +1049,10 @@ pub struct FetcherOptions {
     /// The proxy through which the fetcher reaches an origin.
     ///
     /// [`Fetcher::new`] resolves the value once, and a request does not read it
-    /// again. It refuses a proxy URL that is not `http://host[:port]`, and a
-    /// proxy variable with [white space](Proxy#white-space) around its value.
+    /// again. It refuses a proxy URL that is not `http://host[:port]`,
+    /// `socks5://host[:port]`, or `socks5h://host[:port]`, a SOCKS5 URL with a
+    /// userinfo that [SOCKS proxies](Proxy#socks-proxies) refuses, and a proxy variable with
+    /// [white space](Proxy#white-space) around its value.
     /// The default is [`Proxy::Environment`], the proxy that the process
     /// environment names.
     pub proxy: Proxy,
@@ -2059,12 +2140,45 @@ struct ProxyEndpoint {
     /// The endpoint of the connection. The fetcher reaches a proxy over
     /// cleartext, so this origin is never TLS.
     endpoint: Origin,
-    /// The `Proxy-Authorization` value from the userinfo of the proxy URL, if
-    /// the URL holds userinfo.
-    credential: Option<HeaderValue>,
+    /// The protocol of the proxy and its credential.
+    kind: ProxyKind,
     /// The name of this proxy in a message, which is its URL without the
     /// userinfo.
     named: String,
+}
+
+/// The protocol that the fetcher speaks to a proxy.
+#[derive(Debug)]
+enum ProxyKind {
+    /// An `http://` proxy.
+    Http {
+        /// The `Proxy-Authorization` value from the userinfo of the proxy URL,
+        /// if the URL holds userinfo.
+        credential: Option<HeaderValue>,
+    },
+    /// A `socks5://` or a `socks5h://` proxy.
+    Socks(SocksProxy),
+}
+
+/// The settings of a SOCKS5 proxy.
+#[derive(Debug)]
+struct SocksProxy {
+    /// The side that resolves the host name of an origin.
+    resolve: ResolveSide,
+    /// The user name and the password from the userinfo of the proxy URL, if
+    /// the URL holds userinfo.
+    credential: Option<socks::Credential>,
+}
+
+/// The side of a SOCKS5 connection that resolves the host name of an origin.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ResolveSide {
+    /// The fetcher resolves the name and sends each address to the proxy in
+    /// turn. A `socks5://` proxy uses this side.
+    Client,
+    /// The fetcher sends the name, and the proxy resolves it. A `socks5h://`
+    /// proxy uses this side.
+    Proxy,
 }
 
 /// One `no_proxy` entry: a host text, and the port of the entry if it names
@@ -2128,10 +2242,10 @@ impl Proxies {
         if self.exempt_all || self.exempt.iter().any(|entry| entry.matches(origin)) {
             return Via::Direct;
         }
-        if origin.tls {
-            Via::Tunnel(proxy)
-        } else {
-            Via::Absolute(proxy)
+        match &proxy.kind {
+            ProxyKind::Socks(socks) => Via::Socks(proxy, socks),
+            ProxyKind::Http { .. } if origin.tls => Via::Tunnel(proxy),
+            ProxyKind::Http { .. } => Via::Absolute(proxy),
         }
     }
 }
@@ -2142,11 +2256,15 @@ enum Via<'a> {
     /// A direct connection to the origin.
     Direct,
     /// A connection to the proxy that carries absolute-form requests. A
-    /// cleartext origin behind a proxy uses this way.
+    /// cleartext origin behind an HTTP proxy uses this way.
     Absolute(&'a ProxyEndpoint),
-    /// A `CONNECT` tunnel through the proxy. A TLS origin behind a proxy uses
-    /// this way.
+    /// A `CONNECT` tunnel through the proxy. A TLS origin behind an HTTP
+    /// proxy uses this way.
     Tunnel(&'a ProxyEndpoint),
+    /// A connection to the origin through a SOCKS5 proxy. It carries
+    /// origin-form requests, as a direct connection does. Each origin behind
+    /// a SOCKS5 proxy uses this way.
+    Socks(&'a ProxyEndpoint, &'a SocksProxy),
 }
 
 /// The body of a request: no body for a fetch and for a `CONNECT`, or the
@@ -2864,7 +2982,10 @@ impl Fetcher {
     ///   [`bearer_token`](FetcherOptions::bearer_token) does not have the
     ///   token68 syntax.
     /// - [`Error::Unsupported`] if a proxy URL is not `http://host[:port]`,
-    ///   from the options or from the environment.
+    ///   `socks5://host[:port]`, or `socks5h://host[:port]`, from the options
+    ///   or from the environment.
+    /// - [`Error::Unsupported`] if a SOCKS5 URL has a userinfo that
+    ///   [SOCKS proxies](Proxy#socks-proxies) refuses.
     /// - [`Error::Unsupported`] if a proxy variable has
     ///   [white space](Proxy#white-space) around its value.
     /// - [`Error::Fetch`] if the TLS material does not parse or the TLS setup
@@ -3580,7 +3701,7 @@ impl Fetcher {
             let key = PoolKey {
                 origin: match via {
                     Via::Absolute(proxy) => proxy.endpoint.clone(),
-                    Via::Direct | Via::Tunnel(_) => hop.origin.clone(),
+                    Via::Direct | Via::Tunnel(_) | Via::Socks(..) => hop.origin.clone(),
                 },
                 identity: self.presents_identity(&hop.origin, named),
                 proxied: matches!(via, Via::Absolute(_)),
@@ -4374,7 +4495,7 @@ impl Fetcher {
             let key = PoolKey {
                 origin: match via {
                     Via::Absolute(proxy) => proxy.endpoint.clone(),
-                    Via::Direct | Via::Tunnel(_) => hop.origin.clone(),
+                    Via::Direct | Via::Tunnel(_) | Via::Socks(..) => hop.origin.clone(),
                 },
                 identity: self.presents_identity(&hop.origin, named),
                 proxied: matches!(via, Via::Absolute(_)),
@@ -4773,7 +4894,9 @@ impl Fetcher {
             builder = builder.header(name, value);
         }
         if let Via::Absolute(proxy) = via
-            && let Some(credential) = &proxy.credential
+            && let ProxyKind::Http {
+                credential: Some(credential),
+            } = &proxy.kind
             && !headers
                 .iter()
                 .any(|(name, _)| *name == hyper::header::PROXY_AUTHORIZATION)
@@ -4798,27 +4921,34 @@ impl Fetcher {
     /// The key of a tunneled TLS origin is the origin. So the socket goes to
     /// the proxy, and the handshake runs over the `CONNECT` exchange.
     ///
+    /// The key of an origin behind a SOCKS5 proxy is the origin. The socket
+    /// goes to the proxy, and the SOCKS5 exchange runs first. Under
+    /// `socks5://`, the fetcher resolves a host name first and tries each
+    /// address over a connection of its own, as [`socks_each`] states. Then
+    /// the connection goes on as a direct connection does, for a cleartext
+    /// origin and for a TLS origin.
+    ///
     /// A failure states if another attempt can get a different result. A proxy
     /// that refuses the tunnel with 407 refuses the credential of the fetcher,
-    /// and no round of retries changes it. Each other failure is retryable.
+    /// and no round of retries changes it. A SOCKS5 proxy that accepts no
+    /// offered method or refuses the user name and the password does the
+    /// same. A host name that SOCKS5 cannot send is definitive too. Each other
+    /// failure is retryable.
     async fn connect(&self, key: &PoolKey, via: Via<'_>) -> std::result::Result<Sender, Failure> {
         let origin = &key.origin;
-        let endpoint = match via {
-            Via::Tunnel(proxy) => &proxy.endpoint,
-            Via::Direct | Via::Absolute(_) => origin,
+        let tcp = match via {
+            Via::Direct => rt::TcpStream::connect(&origin.host, origin.port)
+                .await
+                .map_err(|e| {
+                    Failure::Retry(Error::Fetch(format!(
+                        "connect to {}:{} failed: {e}",
+                        origin.host, origin.port
+                    )))
+                })?,
+            // The key of a proxied cleartext origin is the proxy endpoint.
+            Via::Absolute(proxy) | Via::Tunnel(proxy) => connect_proxy(proxy).await?,
+            Via::Socks(proxy, socks) => socks_connect(proxy, socks, origin).await?,
         };
-        let tcp = rt::TcpStream::connect(&endpoint.host, endpoint.port)
-            .await
-            .map_err(|e| {
-                Failure::Retry(Error::Fetch(match via {
-                    Via::Direct => {
-                        format!("connect to {}:{} failed: {e}", endpoint.host, endpoint.port)
-                    }
-                    Via::Absolute(proxy) | Via::Tunnel(proxy) => {
-                        format!("connect to the proxy {} failed: {e}", proxy.named)
-                    }
-                }))
-            })?;
         if !origin.tls {
             // Cleartext HTTP/2 needs prior knowledge or an upgrade. The
             // fetcher uses neither. So a cleartext origin speaks HTTP/1.1,
@@ -4830,7 +4960,7 @@ impl Fetcher {
         }
         let tcp = match via {
             Via::Tunnel(proxy) => self.tunnel(proxy, origin, tcp).await?,
-            Via::Direct | Via::Absolute(_) => tcp,
+            Via::Direct | Via::Absolute(_) | Via::Socks(..) => tcp,
         };
         let server_name =
             rustls::pki_types::ServerName::try_from(origin.host.clone()).map_err(|e| {
@@ -4893,7 +5023,10 @@ impl Fetcher {
             .method(Method::CONNECT)
             .uri(&authority)
             .header(hyper::header::HOST, host);
-        if let Some(credential) = &proxy.credential {
+        if let ProxyKind::Http {
+            credential: Some(credential),
+        } = &proxy.kind
+        {
             builder = builder.header(hyper::header::PROXY_AUTHORIZATION, credential);
         }
         let request = builder.body(RequestBody::Empty).map_err(|e| {
@@ -6257,12 +6390,15 @@ fn parse_exemption(entry: &str) -> Option<Exemption> {
 /// The request to a proxy names the origin. So the URL names an endpoint and
 /// nothing else. A path other than `/`, a query, or a fragment states a value
 /// that the request has no place for, and the function refuses it. The
-/// scheme is `http`, the one scheme of a proxy connection in this crate.
+/// scheme is `http`, with the default port 80, or `socks5` or `socks5h`, with
+/// the default port 1080. Under `socks5` the client resolves the origin host,
+/// and under `socks5h` the proxy resolves it.
 ///
-/// Userinfo is the credential of the proxy. The function percent-decodes it
-/// and sends it as `Proxy-Authorization: Basic`, as a proxy that works with
-/// other clients expects. A userinfo holds a password, so each refusal names
-/// the URL with the userinfo left out.
+/// Userinfo is the credential of the proxy. For an `http` proxy, the function
+/// percent-decodes it and sends it as `Proxy-Authorization: Basic`, as a proxy
+/// that works with other clients expects. For a SOCKS5 proxy, it becomes the
+/// user name and the password of RFC 1929. A userinfo holds a password, so
+/// each refusal names the URL with the userinfo left out.
 fn parse_proxy(url: &str) -> Result<ProxyEndpoint> {
     let refused = |what: &str| {
         Error::Unsupported(format!(
@@ -6271,12 +6407,22 @@ fn parse_proxy(url: &str) -> Result<ProxyEndpoint> {
         ))
     };
     let url = url.trim();
-    if !url
-        .get(..PROXY_SCHEME.len())
-        .is_some_and(|scheme| scheme.eq_ignore_ascii_case(PROXY_SCHEME))
-    {
-        return Err(refused("a proxy is reached over http://host[:port] alone"));
-    }
+    let has_scheme = |scheme: &str| {
+        url.get(..scheme.len())
+            .is_some_and(|text| text.eq_ignore_ascii_case(scheme))
+    };
+    let (scheme, default_port, socks) = if has_scheme(PROXY_SCHEME) {
+        (PROXY_SCHEME, 80, None)
+    } else if has_scheme(SOCKS5_SCHEME) {
+        (SOCKS5_SCHEME, 1080, Some(ResolveSide::Client))
+    } else if has_scheme(SOCKS5H_SCHEME) {
+        (SOCKS5H_SCHEME, 1080, Some(ResolveSide::Proxy))
+    } else {
+        return Err(refused(
+            "a proxy is reached over http://host[:port], socks5://host[:port], or \
+             socks5h://host[:port] alone",
+        ));
+    };
     if url.contains('#') {
         return Err(refused("a proxy url carries no fragment"));
     }
@@ -6296,14 +6442,28 @@ fn parse_proxy(url: &str) -> Result<ProxyEndpoint> {
         .authority()
         .expect("a url holding a host holds an authority")
         .as_str();
-    let credential = match authority.rsplit_once('@') {
-        Some((userinfo, _)) => Some(proxy_credential(userinfo).ok_or_else(|| {
-            refused(
-                "the userinfo is not a percent-encoded user name and password the proxy can be \
-                 sent",
-            )
-        })?),
-        None => None,
+    let userinfo = authority.rsplit_once('@').map(|(userinfo, _)| userinfo);
+    let kind = if let Some(resolve) = socks {
+        let credential = userinfo
+            .map(socks::Credential::from_userinfo)
+            .transpose()
+            .map_err(|e| refused(&e.to_string()))?;
+        ProxyKind::Socks(SocksProxy {
+            resolve,
+            credential,
+        })
+    } else {
+        let credential = userinfo
+            .map(|userinfo| {
+                proxy_credential(userinfo).ok_or_else(|| {
+                    refused(
+                        "the userinfo is not a percent-encoded user name and password the proxy \
+                         can be sent",
+                    )
+                })
+            })
+            .transpose()?;
+        ProxyKind::Http { credential }
     };
     let host = literal
         .strip_prefix('[')
@@ -6320,17 +6480,17 @@ fn parse_proxy(url: &str) -> Result<ProxyEndpoint> {
         .and_then(|rest| rest.strip_prefix(':'));
     let port = match (uri.port_u16(), port_text) {
         (Some(port), _) => port,
-        (None, None) => 80,
+        (None, None) => default_port,
         (None, Some(text)) => {
             return Err(refused(&format!(
                 "the port {text:?} is not a number from 0 to 65535"
             )));
         }
     };
-    let named = if port == 80 {
-        format!("{PROXY_SCHEME}{literal}")
+    let named = if port == default_port {
+        format!("{scheme}{literal}")
     } else {
-        format!("{PROXY_SCHEME}{literal}:{port}")
+        format!("{scheme}{literal}:{port}")
     };
     Ok(ProxyEndpoint {
         endpoint: Origin {
@@ -6338,7 +6498,7 @@ fn parse_proxy(url: &str) -> Result<ProxyEndpoint> {
             host,
             port,
         },
-        credential,
+        kind,
         named,
     })
 }
@@ -6386,7 +6546,8 @@ fn percent_decode(field: &str) -> Option<Vec<u8>> {
     Some(decoded)
 }
 
-/// Returns the `host:port` that names the target of a `CONNECT`.
+/// Returns the `host:port` that names the target of a `CONNECT`, and the
+/// origin in a message of a SOCKS5 hop.
 ///
 /// The port is always written, whatever the default of the scheme. The proxy
 /// opens a TCP connection, which names a port and reads no scheme. An IPv6
@@ -6397,6 +6558,120 @@ fn connect_authority(origin: &Origin) -> String {
     } else {
         format!("{}:{}", origin.host, origin.port)
     }
+}
+
+/// Returns the failure of a SOCKS5 exchange that asks `proxy` to connect to
+/// `origin`.
+///
+/// The error names the proxy and the origin, and keeps the class of the
+/// SOCKS5 failure.
+fn socks_failure(proxy: &ProxyEndpoint, origin: &Origin, e: socks::SocksError) -> Failure {
+    let error = Error::Fetch(format!(
+        "connect to {} through the proxy {} failed: {}",
+        connect_authority(origin),
+        proxy.named,
+        e.reason
+    ));
+    match e.class {
+        socks::Class::Definitive => Failure::Fatal(error),
+        socks::Class::Retryable => Failure::Retry(error),
+    }
+}
+
+/// Opens a TCP connection to `proxy`.
+///
+/// A failure is retryable and names the proxy.
+async fn connect_proxy(proxy: &ProxyEndpoint) -> std::result::Result<rt::TcpStream, Failure> {
+    rt::TcpStream::connect(&proxy.endpoint.host, proxy.endpoint.port)
+        .await
+        .map_err(|e| {
+            Failure::Retry(Error::Fetch(format!(
+                "connect to the proxy {} failed: {e}",
+                proxy.named
+            )))
+        })
+}
+
+/// Opens a connection through the SOCKS5 `proxy` to `origin`, and returns
+/// the stream after the handshake.
+///
+/// The function checks the host name before the resolve and before the
+/// connect to the proxy, under each resolve side. So a name that SOCKS5
+/// cannot send fails as definitive with no resolver and no reachable proxy.
+///
+/// If the client resolves the name, the function gives the addresses of
+/// [`rt::resolve`] to [`socks_each`]. A failed resolve is retryable and names
+/// the origin host. Each other case uses one connection to the proxy and one
+/// handshake: the proxy resolves the name, or the origin host is an IP
+/// address.
+async fn socks_connect(
+    proxy: &ProxyEndpoint,
+    socks: &SocksProxy,
+    origin: &Origin,
+) -> std::result::Result<rt::TcpStream, Failure> {
+    let target = socks::Target::new(&origin.host, origin.port);
+    target
+        .check()
+        .map_err(|e| socks_failure(proxy, origin, e))?;
+    if let (socks::Host::Name(name), ResolveSide::Client) = (&target.host, socks.resolve) {
+        let addrs = rt::resolve(name, origin.port).await.map_err(|e| {
+            Failure::Retry(Error::Fetch(format!(
+                "connect to {} through the proxy {} failed: cannot resolve {name}: {e}",
+                connect_authority(origin),
+                proxy.named
+            )))
+        })?;
+        return socks_each(proxy, socks, origin, &addrs).await;
+    }
+    let mut tcp = connect_proxy(proxy).await?;
+    socks::handshake(&mut tcp, &target, socks.credential.as_ref())
+        .await
+        .map_err(|e| socks_failure(proxy, origin, e))?;
+    Ok(tcp)
+}
+
+/// Asks the SOCKS5 `proxy` to connect to each address of `addrs` in turn, and
+/// returns the stream of the first address that the proxy connects.
+///
+/// A refused `CONNECT` ends the connection to the proxy, so each address gets
+/// a new connection. A definitive failure ends the loop, because each later
+/// address gets the same answer. A failed connect to the proxy also ends the
+/// loop. If the proxy refuses each address, the retryable failure names the
+/// last address, the number of addresses, and the last reason.
+///
+/// `addrs` is not empty. The one caller gives the output of [`rt::resolve`],
+/// which gives an error in place of an empty list.
+async fn socks_each(
+    proxy: &ProxyEndpoint,
+    socks: &SocksProxy,
+    origin: &Origin,
+    addrs: &[SocketAddr],
+) -> std::result::Result<rt::TcpStream, Failure> {
+    let mut last = None;
+    for addr in addrs {
+        let mut tcp = connect_proxy(proxy).await?;
+        let target = socks::Target {
+            host: socks::Host::Ip(addr.ip()),
+            port: addr.port(),
+        };
+        match socks::handshake(&mut tcp, &target, socks.credential.as_ref()).await {
+            Ok(()) => return Ok(tcp),
+            Err(e) if e.class == socks::Class::Definitive => {
+                return Err(socks_failure(proxy, origin, e));
+            }
+            Err(e) => last = Some((addr, e)),
+        }
+    }
+    let authority = connect_authority(origin);
+    let (addr, e) = last.expect("the address list is never empty");
+    let count = match addrs.len() {
+        1 => "1 address".to_owned(),
+        n => format!("{n} addresses"),
+    };
+    Err(Failure::Retry(Error::Fetch(format!(
+        "connect to {authority} through the proxy {} failed at {addr}, the last of {count}: {}",
+        proxy.named, e.reason
+    ))))
 }
 
 /// Returns the `Authorization` value of basic credentials, marked sensitive.
@@ -6923,13 +7198,15 @@ fn stalled(url: &str, limit: Duration) -> Error {
 /// The window covers the connect to the endpoint of the hop. So the error of
 /// a proxied hop names the proxy. The fetcher reaches the origin over that
 /// connection, and nothing contacts the origin before the connection is open.
+/// Under `socks5://`, the window also covers the resolve of the origin host
+/// name, and the error still names the proxy.
 fn connect_timed_out(origin: &Origin, via: Via<'_>, limit: Duration) -> Error {
     Error::Fetch(match via {
         Via::Direct => format!(
             "connect to {}:{} timed out after {limit:?}",
             origin.host, origin.port
         ),
-        Via::Absolute(proxy) | Via::Tunnel(proxy) => format!(
+        Via::Absolute(proxy) | Via::Tunnel(proxy) | Via::Socks(proxy, _) => format!(
             "connect to the proxy {} timed out after {limit:?}",
             proxy.named
         ),
@@ -7976,13 +8253,14 @@ mod tests {
         parse_url(url).unwrap().origin
     }
 
-    /// How a hop at `url` is reached: the proxy that it names, and the request
-    /// form, which is the absolute form or a tunnel.
-    fn via_of(proxies: &Proxies, url: &str) -> Option<(String, bool)> {
+    /// How a hop at `url` is reached: the proxy that it names, and the way,
+    /// which is the absolute form, a tunnel, or a SOCKS5 connection.
+    fn via_of(proxies: &Proxies, url: &str) -> Option<(String, &'static str)> {
         match proxies.via(&origin_of(url)) {
             Via::Direct => None,
-            Via::Absolute(proxy) => Some((proxy.named.clone(), false)),
-            Via::Tunnel(proxy) => Some((proxy.named.clone(), true)),
+            Via::Absolute(proxy) => Some((proxy.named.clone(), "absolute")),
+            Via::Tunnel(proxy) => Some((proxy.named.clone(), "tunnel")),
+            Via::Socks(proxy, _) => Some((proxy.named.clone(), "socks")),
         }
     }
 
@@ -8055,10 +8333,10 @@ mod tests {
         // Userinfo is the credential of the proxy, after the percent-decode:
         // base64("alice:s3cret") and base64("al:ce:p@ss").
         let credential = |url: &str| {
-            parse_proxy(url)
-                .unwrap()
-                .credential
-                .map(|value| value.to_str().unwrap().to_owned())
+            let ProxyKind::Http { credential } = parse_proxy(url).unwrap().kind else {
+                panic!("{url} names an http proxy");
+            };
+            credential.map(|value| value.to_str().unwrap().to_owned())
         };
         assert_eq!(credential("http://proxy.example"), None);
         assert_eq!(
@@ -8079,9 +8357,13 @@ mod tests {
         // Every row states a URL the fetcher cannot connect through and a word
         // its refusal carries.
         for (url, says) in [
-            ("socks5://proxy.example:1080", "http://host[:port] alone"),
-            ("https://proxy.example:3128", "http://host[:port] alone"),
-            ("proxy.example:3128", "http://host[:port] alone"),
+            ("socks4://proxy.example:1080", "socks5h://host[:port] alone"),
+            (
+                "socks4a://proxy.example:1080",
+                "socks5h://host[:port] alone",
+            ),
+            ("https://proxy.example:3128", "socks5h://host[:port] alone"),
+            ("proxy.example:3128", "socks5h://host[:port] alone"),
             ("http://proxy.example/squid", "carries no path"),
             ("http://proxy.example/?upstream=1", "carries no query"),
             ("http://proxy.example/#frag", "carries no fragment"),
@@ -8098,6 +8380,506 @@ mod tests {
         }
     }
 
+    /// A `socks5h` URL names a SOCKS5 endpoint, with the port 1080 by default.
+    /// It takes the checks of an `http` URL, and its userinfo is the user name
+    /// and the password of RFC 1929, each 1 to 255 bytes after the decode.
+    #[test]
+    fn a_socks5h_proxy_url_names_its_endpoint() {
+        for (url, host, port, named) in [
+            (
+                "socks5h://proxy.example",
+                "proxy.example",
+                1080,
+                "socks5h://proxy.example",
+            ),
+            (
+                "socks5h://proxy.example:1080",
+                "proxy.example",
+                1080,
+                "socks5h://proxy.example",
+            ),
+            (
+                "SOCKS5H://Proxy.Example:9050",
+                "proxy.example",
+                9050,
+                "socks5h://Proxy.Example:9050",
+            ),
+            ("socks5h://[::1]", "::1", 1080, "socks5h://[::1]"),
+            (
+                "socks5h://proxy.example/",
+                "proxy.example",
+                1080,
+                "socks5h://proxy.example",
+            ),
+            (
+                "socks5h://alice:s3cret@proxy.example",
+                "proxy.example",
+                1080,
+                "socks5h://proxy.example",
+            ),
+        ] {
+            let proxy = parse_proxy(url).unwrap_or_else(|e| panic!("{url}: {e}"));
+            assert_eq!(proxy.endpoint.host, host, "{url}");
+            assert_eq!(proxy.endpoint.port, port, "{url}");
+            assert!(!proxy.endpoint.tls, "{url}");
+            assert_eq!(proxy.named, named, "{url}");
+            assert!(matches!(proxy.kind, ProxyKind::Socks(_)), "{url}");
+        }
+        let credential = |url: &str| match parse_proxy(url).unwrap().kind {
+            ProxyKind::Socks(socks) => socks.credential.is_some(),
+            ProxyKind::Http { .. } => panic!("{url} names a SOCKS5 proxy"),
+        };
+        assert!(!credential("socks5h://proxy.example"));
+        assert!(credential("socks5h://alice:s3cret@proxy.example"));
+
+        // Every row states a URL that the fetcher refuses and a word of the
+        // refusal. The message names the URL without its userinfo.
+        let long = "a".repeat(256);
+        for (url, says) in [
+            ("socks5h://proxy.example/x".to_owned(), "carries no path"),
+            (
+                "socks5h://proxy.example/?a=1".to_owned(),
+                "carries no query",
+            ),
+            (
+                "socks5h://proxy.example/#f".to_owned(),
+                "carries no fragment",
+            ),
+            ("socks5h://proxy.example:99999".to_owned(), "not a number"),
+            (
+                "socks5h://s3cret@proxy.example".to_owned(),
+                "password is empty",
+            ),
+            (
+                "socks5h://s3cret:@proxy.example".to_owned(),
+                "password is empty",
+            ),
+            (
+                "socks5h://:s3cret@proxy.example".to_owned(),
+                "user name is empty",
+            ),
+            ("socks5h://@proxy.example".to_owned(), "user name is empty"),
+            (
+                format!("socks5h://{long}:s3cret@proxy.example"),
+                "user name is longer",
+            ),
+            (
+                format!("socks5h://alice:{long}s3cret@proxy.example"),
+                "password is longer",
+            ),
+            (
+                "socks5h://alice:s3cret%zz@proxy.example".to_owned(),
+                "percent-encoded",
+            ),
+            (
+                "socks5h://alice:s3cret%ff@proxy.example".to_owned(),
+                "percent-encoded",
+            ),
+        ] {
+            let err = parse_proxy(&url).unwrap_err();
+            assert!(matches!(err, Error::Unsupported(_)), "{url}: {err}");
+            let message = err.to_string();
+            assert!(message.contains(says), "{url}: {message}");
+            assert!(
+                message.contains("socks5h://proxy.example"),
+                "{url}: {message}"
+            );
+            assert!(!message.contains("s3cret"), "{url}: {message}");
+        }
+    }
+
+    /// A `socks5` URL names a SOCKS5 endpoint whose client resolves the origin
+    /// host, with the port 1080 by default. A `socks5h` URL names one whose
+    /// proxy resolves it. The URL rules and the userinfo rules are the rules
+    /// of a `socks5h` URL.
+    #[test]
+    fn a_socks5_proxy_url_names_its_endpoint() {
+        let resolve = |url: &str| match parse_proxy(url).unwrap().kind {
+            ProxyKind::Socks(socks) => (socks.resolve, socks.credential.is_some()),
+            ProxyKind::Http { .. } => panic!("{url} names a SOCKS5 proxy"),
+        };
+        for (url, host, port, named) in [
+            (
+                "socks5://proxy.example",
+                "proxy.example",
+                1080,
+                "socks5://proxy.example",
+            ),
+            (
+                "socks5://proxy.example:1080",
+                "proxy.example",
+                1080,
+                "socks5://proxy.example",
+            ),
+            (
+                "SOCKS5://Proxy.Example:9050",
+                "proxy.example",
+                9050,
+                "socks5://Proxy.Example:9050",
+            ),
+            ("socks5://[::1]", "::1", 1080, "socks5://[::1]"),
+            (
+                "socks5://alice:s3cret@proxy.example",
+                "proxy.example",
+                1080,
+                "socks5://proxy.example",
+            ),
+        ] {
+            let proxy = parse_proxy(url).unwrap_or_else(|e| panic!("{url}: {e}"));
+            assert_eq!(proxy.endpoint.host, host, "{url}");
+            assert_eq!(proxy.endpoint.port, port, "{url}");
+            assert!(!proxy.endpoint.tls, "{url}");
+            assert_eq!(proxy.named, named, "{url}");
+            assert_eq!(resolve(url).0, ResolveSide::Client, "{url}");
+        }
+        assert_eq!(
+            resolve("socks5h://proxy.example"),
+            (ResolveSide::Proxy, false)
+        );
+        assert_eq!(
+            resolve("socks5://alice:s3cret@proxy.example"),
+            (ResolveSide::Client, true)
+        );
+        assert_eq!(
+            resolve("socks5://proxy.example"),
+            (ResolveSide::Client, false)
+        );
+
+        let err = parse_proxy("socks5://s3cret@proxy.example").unwrap_err();
+        assert!(matches!(err, Error::Unsupported(_)), "{err}");
+        let message = err.to_string();
+        assert!(message.contains("password is empty"), "{message}");
+        assert!(message.contains("socks5://proxy.example"), "{message}");
+        assert!(!message.contains("s3cret"), "{message}");
+    }
+
+    /// The marker that [`socks_peer`] writes after a reply of success. It
+    /// stands for the first bytes of the origin.
+    const SOCKS_MARKER: &[u8] = b"origin bytes";
+
+    /// The answers of a [`socks_peer`].
+    struct SocksScript {
+        /// The method that the peer selects.
+        method: u8,
+        /// The status of the RFC 1929 reply, if the peer selects `02`.
+        auth_status: u8,
+        /// The `REP` of each connection in turn. A connection after the end of
+        /// the list gets `00`.
+        replies: Vec<u8>,
+    }
+
+    /// What a [`socks_peer`] saw.
+    #[derive(Debug, Default)]
+    struct SocksSeen {
+        /// The number of connections that the peer accepted.
+        connections: usize,
+        /// The `ATYP`, the address bytes, and the port of each request.
+        requests: Vec<(u8, Vec<u8>, u16)>,
+    }
+
+    /// Starts a scripted SOCKS5 peer on a loopback port, and gives the port
+    /// and what the peer sees.
+    ///
+    /// The peer serves one connection at a time. It answers the greeting with
+    /// the method of `script`, the RFC 1929 exchange with its status, and the
+    /// request of each connection with the next `REP`. After a `REP` of `00`,
+    /// it writes [`SOCKS_MARKER`].
+    async fn socks_peer(script: SocksScript) -> (u16, Arc<Mutex<SocksSeen>>) {
+        use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
+
+        let peer = rt::TcpListener::bind("127.0.0.1:0".parse().unwrap())
+            .await
+            .unwrap();
+        let port = peer.local_addr().unwrap().port();
+        let seen = Arc::new(Mutex::new(SocksSeen::default()));
+        let record = seen.clone();
+        drop(rt::spawn(async move {
+            while let Ok((mut stream, _peer)) = peer.accept().await {
+                let index = {
+                    let mut seen = record.lock().unwrap();
+                    seen.connections += 1;
+                    seen.connections - 1
+                };
+                let reply = script.replies.get(index).copied().unwrap_or(0);
+                let record = record.clone();
+                let script = &script;
+                let served = async move {
+                    let mut head = [0u8; 2];
+                    stream.read_exact(&mut head).await?;
+                    let mut methods = vec![0u8; usize::from(head[1])];
+                    stream.read_exact(&mut methods).await?;
+                    stream.write_all(&[0x05, script.method]).await?;
+                    stream.flush().await?;
+                    if script.method == 0x02 {
+                        let mut len = [0u8; 2];
+                        stream.read_exact(&mut len).await?;
+                        let mut user = vec![0u8; usize::from(len[1])];
+                        stream.read_exact(&mut user).await?;
+                        stream.read_exact(&mut len[..1]).await?;
+                        let mut password = vec![0u8; usize::from(len[0])];
+                        stream.read_exact(&mut password).await?;
+                        stream.write_all(&[0x01, script.auth_status]).await?;
+                        stream.flush().await?;
+                        if script.auth_status != 0x00 {
+                            return std::io::Result::Ok(());
+                        }
+                    } else if script.method != 0x00 {
+                        return Ok(());
+                    }
+                    let mut request = [0u8; 4];
+                    stream.read_exact(&mut request).await?;
+                    let mut addr = match request[3] {
+                        0x01 => vec![0u8; 4],
+                        0x04 => vec![0u8; 16],
+                        _ => {
+                            let mut len = [0u8; 1];
+                            stream.read_exact(&mut len).await?;
+                            vec![0u8; usize::from(len[0])]
+                        }
+                    };
+                    stream.read_exact(&mut addr).await?;
+                    let mut port = [0u8; 2];
+                    stream.read_exact(&mut port).await?;
+                    record.lock().unwrap().requests.push((
+                        request[3],
+                        addr,
+                        u16::from_be_bytes(port),
+                    ));
+                    stream
+                        .write_all(&[0x05, reply, 0x00, 0x01, 0, 0, 0, 0, 0, 0])
+                        .await?;
+                    if reply == 0x00 {
+                        stream.write_all(SOCKS_MARKER).await?;
+                    }
+                    stream.flush().await
+                };
+                let _ = served.await;
+            }
+        }));
+        (port, seen)
+    }
+
+    /// The endpoint of a SOCKS5 proxy URL.
+    fn socks_endpoint(url: &str) -> ProxyEndpoint {
+        let proxy = parse_proxy(url).unwrap();
+        assert!(matches!(proxy.kind, ProxyKind::Socks(_)), "{url}");
+        proxy
+    }
+
+    /// The SOCKS5 settings of an endpoint that [`socks_endpoint`] gives.
+    fn socks_of(proxy: &ProxyEndpoint) -> &SocksProxy {
+        let ProxyKind::Socks(socks) = &proxy.kind else {
+            panic!("{} names a SOCKS5 proxy", proxy.named);
+        };
+        socks
+    }
+
+    /// The TLS origin of the address loop tests.
+    fn loop_origin() -> Origin {
+        Origin {
+            tls: true,
+            host: "origin.example".to_owned(),
+            port: 443,
+        }
+    }
+
+    /// The address list of the address loop tests: an IPv4 address, then an
+    /// IPv6 address.
+    fn two_addresses() -> [SocketAddr; 2] {
+        [
+            "192.0.2.1:443".parse().unwrap(),
+            "[2001:db8::1]:443".parse().unwrap(),
+        ]
+    }
+
+    /// A refusal of the first address moves the loop to the second address
+    /// over a new connection to the proxy. Each request names the address,
+    /// and the stream of the second connection carries the bytes after the
+    /// reply.
+    #[test]
+    fn the_address_loop_moves_past_a_refused_address() {
+        use futures_lite::io::AsyncReadExt;
+
+        rt::block_on(async {
+            let (port, seen) = socks_peer(SocksScript {
+                method: 0x00,
+                auth_status: 0x00,
+                replies: vec![0x05, 0x00],
+            })
+            .await;
+            let proxy = socks_endpoint(&format!("socks5://127.0.0.1:{port}"));
+            let addrs = two_addresses();
+            let connected = within(
+                Duration::from_secs(5),
+                socks_each(&proxy, socks_of(&proxy), &loop_origin(), &addrs),
+            )
+            .await
+            .expect("the loop ends within the limit");
+            let Ok(mut stream) = connected else {
+                panic!("the second address connects");
+            };
+            let mut marker = vec![0u8; SOCKS_MARKER.len()];
+            stream.read_exact(&mut marker).await.unwrap();
+            assert_eq!(marker, SOCKS_MARKER);
+
+            let seen = seen.lock().unwrap();
+            assert_eq!(seen.connections, 2);
+            let v6 = "2001:db8::1".parse::<std::net::Ipv6Addr>().unwrap();
+            assert_eq!(
+                seen.requests,
+                vec![
+                    (0x01, vec![192, 0, 2, 1], 443),
+                    (0x04, v6.octets().to_vec(), 443),
+                ]
+            );
+        });
+    }
+
+    /// A refused user name and password is definitive, so the loop stops at
+    /// the first address. The message names the proxy and the origin, and
+    /// holds no part of the credential.
+    #[test]
+    fn an_auth_refusal_stops_the_address_loop() {
+        rt::block_on(async {
+            let (port, seen) = socks_peer(SocksScript {
+                method: 0x02,
+                auth_status: 0x01,
+                replies: Vec::new(),
+            })
+            .await;
+            let proxy = socks_endpoint(&format!("socks5://alice:s3cret@127.0.0.1:{port}"));
+            let addrs = two_addresses();
+            let failure = within(
+                Duration::from_secs(5),
+                socks_each(&proxy, socks_of(&proxy), &loop_origin(), &addrs),
+            )
+            .await
+            .expect("the loop ends within the limit");
+            let Err(Failure::Fatal(err)) = failure else {
+                panic!("an auth refusal is definitive");
+            };
+            let message = err.to_string();
+            assert!(
+                message.contains(&format!("socks5://127.0.0.1:{port}")),
+                "{message}"
+            );
+            assert!(message.contains("origin.example:443"), "{message}");
+            assert!(!message.contains("s3cret"), "{message}");
+            assert!(!message.contains("alice"), "{message}");
+            assert_eq!(seen.lock().unwrap().connections, 1);
+        });
+    }
+
+    /// With each address refused, the retryable failure names the last
+    /// address, the number of addresses, and the last reason.
+    #[test]
+    fn every_refused_address_gives_the_last_failure() {
+        rt::block_on(async {
+            let (port, seen) = socks_peer(SocksScript {
+                method: 0x00,
+                auth_status: 0x00,
+                replies: vec![0x05, 0x04],
+            })
+            .await;
+            let proxy = socks_endpoint(&format!("socks5://127.0.0.1:{port}"));
+            let addrs = two_addresses();
+            let failure = within(
+                Duration::from_secs(5),
+                socks_each(&proxy, socks_of(&proxy), &loop_origin(), &addrs),
+            )
+            .await
+            .expect("the loop ends within the limit");
+            let Err(Failure::Retry(err)) = failure else {
+                panic!("a refused connect is retryable");
+            };
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "fetch: connect to origin.example:443 through the proxy \
+                     socks5://127.0.0.1:{port} failed at [2001:db8::1]:443, the last of 2 addresses: the proxy refused \
+                     the connect with the code 04 (host unreachable)"
+                )
+            );
+            assert_eq!(seen.lock().unwrap().connections, 2);
+        });
+    }
+
+    /// Under `socks5://`, a host name that the resolver refuses is retryable.
+    /// The message names the origin host, and the fetcher opens no connection
+    /// to the proxy. A name with a NUL byte passes the SOCKS5 checks of the
+    /// name, and `std` refuses it before it calls the resolver of the system.
+    /// So the test sends no DNS query.
+    #[test]
+    fn a_failed_resolve_names_the_origin_host() {
+        rt::block_on(async {
+            let (port, seen) = socks_peer(SocksScript {
+                method: 0x00,
+                auth_status: 0x00,
+                replies: Vec::new(),
+            })
+            .await;
+            let proxy = socks_endpoint(&format!("socks5://127.0.0.1:{port}"));
+            let origin = Origin {
+                tls: true,
+                host: "origin\0example".to_owned(),
+                port: 443,
+            };
+            let failure = within(
+                Duration::from_secs(5),
+                socks_connect(&proxy, socks_of(&proxy), &origin),
+            )
+            .await
+            .expect("the resolve ends within the limit");
+            let Err(Failure::Retry(err)) = failure else {
+                panic!("a failed resolve is retryable");
+            };
+            let message = err.to_string();
+            assert!(
+                message.starts_with(&format!(
+                    "fetch: connect to origin\0example:443 through the proxy \
+                     socks5://127.0.0.1:{port} failed: cannot resolve origin\0example: "
+                )),
+                "{message}"
+            );
+            assert_eq!(seen.lock().unwrap().connections, 0);
+        });
+    }
+
+    /// A failed connect to the proxy ends the loop at the first address. The
+    /// failure is the retryable failure of a proxy connect, with no count of
+    /// addresses.
+    #[test]
+    fn an_unreachable_proxy_ends_the_address_loop() {
+        rt::block_on(async {
+            // An open connection holds its local port, and nothing listens on
+            // that port. So a connect to the port is refused, and no other
+            // test can bind the port before the end of this test.
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let held = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+            let port = held.local_addr().unwrap().port();
+            let proxy = socks_endpoint(&format!("socks5://127.0.0.1:{port}"));
+            let addrs = two_addresses();
+            let failure = within(
+                Duration::from_secs(5),
+                socks_each(&proxy, socks_of(&proxy), &loop_origin(), &addrs),
+            )
+            .await
+            .expect("the loop ends within the limit");
+            let Err(Failure::Retry(err)) = failure else {
+                panic!("a failed proxy connect is retryable");
+            };
+            let message = err.to_string();
+            assert!(
+                message.starts_with(&format!(
+                    "fetch: connect to the proxy socks5://127.0.0.1:{port} failed: "
+                )),
+                "{message}"
+            );
+            assert!(!message.contains("the last of"), "{message}");
+            drop((held, listener));
+        });
+    }
+
     /// `http_proxy` serves cleartext origins, and `https_proxy` serves TLS
     /// origins. `all_proxy` serves both schemes if the scheme-specific variable
     /// is unset. Lower case wins over upper case, and an empty value counts as
@@ -8106,8 +8888,9 @@ mod tests {
     fn the_proxy_variables_are_read_per_scheme() {
         let cleartext = "http://origin.example/summary";
         let tls = "https://origin.example/summary";
-        let absolute = |named: &str| Some((named.to_owned(), false));
-        let tunnel = |named: &str| Some((named.to_owned(), true));
+        let absolute = |named: &str| Some((named.to_owned(), "absolute"));
+        let tunnel = |named: &str| Some((named.to_owned(), "tunnel"));
+        let socks = |named: &str| Some((named.to_owned(), "socks"));
 
         // Each scheme is served by its own variable, and the request form
         // follows the origin. Cleartext uses the absolute form over a proxy
@@ -8194,7 +8977,7 @@ mod tests {
         // A value the fetcher cannot connect through fails the resolution
         // whichever variable held it.
         for name in ["http_proxy", "https_proxy", "all_proxy"] {
-            let err = resolve_variables(&variables(&[(name, "socks5://proxy.example:1080")]))
+            let err = resolve_variables(&variables(&[(name, "socks4://proxy.example:1080")]))
                 .unwrap_err();
             assert!(matches!(err, Error::Unsupported(_)), "{name}: {err}");
         }
@@ -8203,7 +8986,7 @@ mod tests {
         // fetch. If it holds a value that the fetcher cannot connect through,
         // the resolution fails.
         let err = resolve_variables(&variables(&[
-            ("all_proxy", "socks5://proxy.example:1080"),
+            ("all_proxy", "socks4://proxy.example:1080"),
             ("http_proxy", "http://plain.example:3128"),
             ("https_proxy", "http://secure.example:3128"),
         ]))
@@ -8223,6 +9006,22 @@ mod tests {
             absolute("http://any.example:3128")
         );
         assert_eq!(via_of(&proxies, tls), tunnel("http://any.example:3128"));
+
+        // A SOCKS5 proxy in `https_proxy` serves TLS origins alone, and the
+        // way is the same for each scheme that a SOCKS5 proxy serves.
+        let proxies = resolve_variables(&variables(&[(
+            "https_proxy",
+            "socks5h://socks.example:9050",
+        )]))
+        .unwrap();
+        assert_eq!(via_of(&proxies, tls), socks("socks5h://socks.example:9050"));
+        assert_eq!(via_of(&proxies, cleartext), None);
+        let proxies = resolve_proxy(&Proxy::Url("socks5h://socks.example".into())).unwrap();
+        assert_eq!(via_of(&proxies, tls), socks("socks5h://socks.example"));
+        assert_eq!(
+            via_of(&proxies, cleartext),
+            socks("socks5h://socks.example")
+        );
     }
 
     /// A proxy variable with white space at the start or the end of its value
@@ -8269,7 +9068,7 @@ mod tests {
         // The check comes before the parse, so a value the parse refuses as
         // well gets the white-space refusal.
         refused(
-            &[("all_proxy", "socks5://alice:s3cret@proxy.example:1080 ")],
+            &[("all_proxy", "socks4://alice:s3cret@proxy.example:1080 ")],
             "all_proxy",
         );
         // The refusal occurs when the fetcher is built. So an exemption of
@@ -8413,7 +9212,9 @@ mod tests {
             let message = err.to_string();
             assert!(!message.contains("sup3rs3cret"), "{tail}: {message}");
         }
-        let err = parse_proxy("socks5://alice:sup3rs3cret@proxy.example:1080").unwrap_err();
+        let err = parse_proxy("socks4://alice:sup3rs3cret@proxy.example:1080").unwrap_err();
+        assert!(!err.to_string().contains("sup3rs3cret"), "{err}");
+        let err = parse_proxy("socks5h://alice:sup3rs3cret@proxy.example/x").unwrap_err();
         assert!(!err.to_string().contains("sup3rs3cret"), "{err}");
 
         // A password with a `/`, a `?`, or a `#` ends the authority before the
@@ -8571,9 +9372,17 @@ mod tests {
             );
             assert_eq!(proxy_credential(&caller).as_deref(), Some("Basic Y2FsbGVy"));
 
-            // A direct hop and the request over a tunnel carry the origin form
-            // and nothing of the proxy.
-            for via in [Via::Direct, Via::Tunnel(proxy)] {
+            // A direct hop, the request over a tunnel, and the request over a
+            // SOCKS5 connection carry the origin form and nothing of the proxy.
+            let socks_proxy = parse_proxy("socks5h://bob:pw@socks.example").unwrap();
+            let ProxyKind::Socks(socks) = &socks_proxy.kind else {
+                panic!("a socks5h url names a SOCKS5 proxy");
+            };
+            for via in [
+                Via::Direct,
+                Via::Tunnel(proxy),
+                Via::Socks(&socks_proxy, socks),
+            ] {
                 let direct = built(via, &fetcher.inner.headers);
                 assert_eq!(direct.uri(), "/r/refs/heads/a");
                 assert_eq!(proxy_credential(&direct), None);

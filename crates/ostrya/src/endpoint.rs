@@ -2197,6 +2197,18 @@ mod tests {
         }
     }
 
+    /// The pull passes a `socks5h://` proxy value with its userinfo to the
+    /// fetcher unchanged.
+    #[test]
+    fn the_pull_passes_a_socks5h_proxy_unchanged() {
+        let config = config(
+            "[remote \"socks\"]\nurl=https://ex.com/repo\n\
+             proxy=socks5h://u:p@proxy.ex.com:1080\n",
+        );
+        let http = http_of(pull(Some(&config), "socks", EndpointOverrides::default()));
+        assert!(matches!(&http.proxy, Proxy::Url(url) if url == "socks5h://u:p@proxy.ex.com:1080"));
+    }
+
     /// A TLS file over 1 MiB and an absent TLS file fail the pull, and the
     /// error names the key and the path.
     #[test]
@@ -2717,6 +2729,20 @@ mod tests {
                 Err(Error::Unsupported(msg)) => assert!(msg.contains("white space"), "{msg}"),
                 other => panic!("{other:?}"),
             }
+        }
+
+        /// The push passes a `socks5h://` proxy value with its userinfo to the
+        /// fetcher unchanged.
+        #[test]
+        fn the_push_passes_a_socks5h_proxy_unchanged() {
+            let cfg = config(
+                "[remote \"socks\"]\nurl=https://ex.com/repo\n\
+                 proxy=socks5h://u:p@proxy.ex.com:1080\n",
+            );
+            let http = http_of(push(Some(&cfg), "socks", EndpointOverrides::default()));
+            assert!(
+                matches!(&http.proxy, Proxy::Url(url) if url == "socks5h://u:p@proxy.ex.com:1080")
+            );
         }
 
         /// A token with `push-user` gives `basic_auth`. A token alone gives

@@ -13,6 +13,8 @@
 
 #[path = "common/proxy.rs"]
 mod proxy;
+#[path = "common/socks.rs"]
+mod socks;
 
 use std::collections::VecDeque;
 use std::convert::Infallible;
@@ -43,6 +45,7 @@ use ostrya_rt::{TcpListener, TcpStream, Timer, block_on, spawn};
 use proxy::{TestProxy, Tunnel};
 use rustix::net;
 use sha2::{Digest, Sha256};
+use socks::{Reply, Socks, TestSocks};
 
 const CA_PEM: &[u8] = include_bytes!("../../../tests/fixtures/tls/ca.pem");
 const SERVER_CERT_PEM: &[u8] = include_bytes!("../../../tests/fixtures/tls/server.pem");
@@ -3942,7 +3945,11 @@ fn a_refused_connect_is_definitive_at_407_and_retried_at_502() {
 #[test]
 fn a_proxy_the_fetcher_cannot_reach_is_refused_at_construction() {
     block_on(async {
-        for url in ["socks5://127.0.0.1:1080", "https://127.0.0.1:3128"] {
+        for url in [
+            "socks4://127.0.0.1:1080",
+            "socks4a://127.0.0.1:1080",
+            "https://127.0.0.1:3128",
+        ] {
             let err = Fetcher::new(FetcherOptions {
                 proxy: Proxy::Url(url.to_owned()),
                 ..direct_options("http://origin.example/repo")
@@ -4138,6 +4145,427 @@ fn a_connect_timeout_on_a_proxied_hop_names_the_proxy() {
         assert!(message.contains(&proxy), "{message}");
         assert!(message.contains("timed out"), "{message}");
         assert!(!message.contains("localhost:1"), "{message}");
+    });
+}
+
+/// The fetcher reaches an origin behind a `socks5h://` proxy over a connection
+/// that the proxy opens to the origin. The proxy gets the host name and
+/// resolves it. The request has the origin form, as on a direct connection,
+/// and a TLS origin selects its protocol over ALPN in the tunnel.
+#[test]
+fn a_fetch_reaches_the_origin_through_a_socks5h_proxy() {
+    block_on(async {
+        for (transport, tls, protocol) in [
+            (Transport::Cleartext, false, Protocol::Http11),
+            (tls_transport("http/1.1"), true, Protocol::Http11),
+            (tls_transport("h2"), true, Protocol::Http2),
+        ] {
+            let origin = TestServer::start(transport, always(b"through socks")).await;
+            let peer = TestSocks::start(Socks::OPEN);
+            let fetcher = Fetcher::new(FetcherOptions {
+                tls: tls_options(None),
+                proxy: Proxy::Url(peer.url()),
+                ..direct_options(origin.url(tls))
+            })
+            .await
+            .unwrap();
+
+            let (bytes, carried) = fetch_bytes(&fetcher, "summary").await;
+            assert_eq!(bytes, b"through socks");
+            assert_eq!(carried, protocol);
+            let seen = peer.seen();
+            assert_eq!(seen.len(), 1);
+            assert_eq!(seen[0].methods, [0x00]);
+            assert_eq!(seen[0].atyp, Some(0x03));
+            assert_eq!(seen[0].host, "localhost");
+            assert_eq!(seen[0].port, origin.addr.port());
+            assert_eq!(origin.seen()[0].path, "/summary");
+            // An HTTP/2 server builds an absolute URI from the pseudo-headers,
+            // so the target of an HTTP/1.1 request alone shows the form.
+            if protocol == Protocol::Http11 {
+                assert_eq!(origin.seen()[0].target, "/summary");
+            }
+        }
+    });
+}
+
+/// An origin host that is an IP address goes to the proxy as an address,
+/// under `socks5h://` and under `socks5://`.
+#[test]
+fn an_ip_origin_goes_to_the_socks_proxy_as_an_ipv4_address() {
+    block_on(async {
+        let origin = TestServer::start(Transport::Cleartext, always(b"by address")).await;
+        for client_resolves in [false, true] {
+            let peer = TestSocks::start(Socks::OPEN);
+            let url = if client_resolves {
+                peer.client_resolve_url()
+            } else {
+                peer.url()
+            };
+            let fetcher = Fetcher::new(FetcherOptions {
+                tls: tls_options(None),
+                proxy: Proxy::Url(url.clone()),
+                ..direct_options(format!("http://127.0.0.1:{}", origin.addr.port()))
+            })
+            .await
+            .unwrap();
+
+            let (bytes, _) = fetch_bytes(&fetcher, "summary").await;
+            assert_eq!(bytes, b"by address", "{url}");
+            let seen = peer.seen();
+            assert_eq!(seen.len(), 1, "{url}");
+            assert_eq!(seen[0].atyp, Some(0x01), "{url}");
+            assert_eq!(seen[0].host, "127.0.0.1", "{url}");
+            assert_eq!(seen[0].port, origin.addr.port(), "{url}");
+        }
+    });
+}
+
+/// Under `socks5://`, the fetcher resolves the origin name and sends each
+/// address to the proxy, which never gets the name. The proxy refuses an
+/// address that it cannot connect, and the fetcher then tries the next one
+/// over a new connection. So the proxy sees one connection for each request.
+#[test]
+fn a_socks5_proxy_resolves_the_origin_name_on_the_client() {
+    block_on(async {
+        for (transport, tls, protocol) in [
+            (Transport::Cleartext, false, Protocol::Http11),
+            (tls_transport("h2"), true, Protocol::Http2),
+        ] {
+            let origin = TestServer::start(transport, always(b"resolved here")).await;
+            let peer = TestSocks::start(Socks::OPEN);
+            let url = origin.url(tls);
+            assert!(url.contains("://localhost:"), "{url}");
+            let fetcher = Fetcher::new(FetcherOptions {
+                tls: tls_options(None),
+                proxy: Proxy::Url(peer.client_resolve_url()),
+                ..direct_options(url.clone())
+            })
+            .await
+            .unwrap();
+
+            let (bytes, carried) = fetch_bytes(&fetcher, "summary").await;
+            assert_eq!(bytes, b"resolved here", "{url}");
+            assert_eq!(carried, protocol, "{url}");
+            let seen = peer.seen();
+            assert!(!seen.is_empty(), "{url}");
+            for record in &seen {
+                assert!(
+                    matches!(record.atyp, Some(0x01 | 0x04)),
+                    "{url}: {record:?}"
+                );
+                assert_eq!(record.port, origin.addr.port(), "{url}: {record:?}");
+            }
+            assert!(
+                seen.iter()
+                    .any(|record| record.atyp == Some(0x01) && record.host == "127.0.0.1"),
+                "{url}: {seen:?}"
+            );
+            assert_eq!(peer.connections(), seen.len(), "{url}");
+        }
+    });
+}
+
+/// The userinfo of a `socks5h://` URL goes to the proxy in the RFC 1929
+/// exchange, and no header of the origin carries it.
+#[test]
+fn the_socks_credential_reaches_the_proxy_and_no_origin() {
+    block_on(async {
+        let origin = TestServer::start(Transport::Cleartext, always(b"authorized")).await;
+        let peer = TestSocks::start(Socks {
+            method: 0x02,
+            ..Socks::OPEN
+        });
+        let fetcher = Fetcher::new(FetcherOptions {
+            tls: tls_options(None),
+            proxy: Proxy::Url(peer.url_with("alice:s3cret")),
+            ..direct_options(origin.url(false))
+        })
+        .await
+        .unwrap();
+
+        let (bytes, _) = fetch_bytes(&fetcher, "summary").await;
+        assert_eq!(bytes, b"authorized");
+        let seen = peer.seen();
+        assert_eq!(seen[0].methods, [0x00, 0x02]);
+        assert_eq!(
+            seen[0].credential,
+            Some((b"alice".to_vec(), b"s3cret".to_vec()))
+        );
+        assert_eq!(origin.seen()[0].header("proxy-authorization"), None);
+        assert_eq!(origin.seen()[0].header("authorization"), None);
+    });
+}
+
+/// A proxy that accepts no offered method, or that refuses the user name and
+/// the password, gives the same answer to a retry. So the fetcher asks the
+/// proxy once.
+#[test]
+fn a_socks_authentication_refusal_is_definitive() {
+    block_on(async {
+        for (config, userinfo) in [
+            (
+                Socks {
+                    method: 0x02,
+                    auth_status: 0x01,
+                    ..Socks::OPEN
+                },
+                Some("alice:s3cret"),
+            ),
+            (
+                Socks {
+                    method: 0xff,
+                    ..Socks::OPEN
+                },
+                None,
+            ),
+        ] {
+            let peer = TestSocks::start(config);
+            let url = match userinfo {
+                Some(userinfo) => peer.url_with(userinfo),
+                None => peer.url(),
+            };
+            let fetcher = Fetcher::new(FetcherOptions {
+                tls: tls_options(None),
+                proxy: Proxy::Url(url),
+                max_retries: 3,
+                ..direct_options("http://localhost:1/repo")
+            })
+            .await
+            .unwrap();
+
+            let message = fetch_error(&fetcher, "summary").await.to_string();
+            assert_eq!(peer.connections(), 1, "{config:?}: {message}");
+            assert!(message.contains(&peer.url()), "{message}");
+            assert!(message.contains("localhost:1"), "{message}");
+            assert!(!message.contains("s3cret"), "{message}");
+        }
+    });
+}
+
+/// A host name that SOCKS5 cannot send is definitive, under `socks5h://` and
+/// under `socks5://`. The fetcher checks the name before it resolves it. So it
+/// resolves no name, opens no connection to the proxy, and runs no round of
+/// retries.
+#[test]
+fn an_origin_name_that_socks5_cannot_send_opens_no_proxy_connection() {
+    block_on(async {
+        // Five labels of 50 bytes and the dots between them are 254 bytes, and
+        // ".abc" makes the name 258 bytes.
+        let label = "a".repeat(50);
+        let long = format!("{label}.{label}.{label}.{label}.{label}.abc");
+        assert_eq!(long.len(), 258);
+        // The URL parse keeps the zone id of an IPv6 literal as `%25eth0`, so
+        // the host that reaches the proxy step holds a `%`.
+        for (host, reason) in [
+            (long.as_str(), "1 to 255 bytes"),
+            ("[fe80::1%25eth0]", "zone id"),
+        ] {
+            for client_resolves in [false, true] {
+                let peer = TestSocks::start(Socks::OPEN);
+                let url = if client_resolves {
+                    peer.client_resolve_url()
+                } else {
+                    peer.url()
+                };
+                let fetcher = Fetcher::new(FetcherOptions {
+                    tls: tls_options(None),
+                    proxy: Proxy::Url(url.clone()),
+                    max_retries: 3,
+                    ..direct_options(format!("http://{host}:1/repo"))
+                })
+                .await
+                .unwrap();
+                let started = Instant::now();
+                let message = fetch_error(&fetcher, "summary").await.to_string();
+                // Three retries wait 250 ms, 500 ms, and 1 s first.
+                assert!(
+                    started.elapsed() < Duration::from_millis(1750),
+                    "{url}: {message}"
+                );
+                assert_eq!(peer.connections(), 0, "{url}: {message}");
+                assert!(message.contains(reason), "{url}: {message}");
+                assert!(message.contains(&url), "{url}: {message}");
+                assert!(!message.contains("cannot resolve"), "{url}: {message}");
+            }
+        }
+    });
+}
+
+/// A reply code other than success is retryable. The next round opens a new
+/// connection to the proxy and asks again.
+#[test]
+fn a_socks_reply_code_is_retried() {
+    block_on(async {
+        let origin = TestServer::start(Transport::Cleartext, always(b"second try")).await;
+        let peer = TestSocks::start(Socks {
+            reply: Reply::RefuseFirst(0x05),
+            ..Socks::OPEN
+        });
+        let fetcher = Fetcher::new(FetcherOptions {
+            tls: tls_options(None),
+            proxy: Proxy::Url(peer.url()),
+            max_retries: 1,
+            ..direct_options(origin.url(false))
+        })
+        .await
+        .unwrap();
+        let (bytes, _) = fetch_bytes(&fetcher, "summary").await;
+        assert_eq!(bytes, b"second try");
+        assert_eq!(peer.connections(), 2);
+        assert_eq!(origin.requests(), 1);
+
+        let peer = TestSocks::start(Socks {
+            reply: Reply::Refuse(0x02),
+            ..Socks::OPEN
+        });
+        let fetcher = Fetcher::new(FetcherOptions {
+            tls: tls_options(None),
+            proxy: Proxy::Url(peer.url()),
+            max_retries: 0,
+            ..direct_options("https://localhost:1/repo")
+        })
+        .await
+        .unwrap();
+        let message = fetch_error(&fetcher, "summary").await.to_string();
+        assert_eq!(peer.connections(), 1, "{message}");
+        assert!(
+            message.contains("code 02 (not allowed by ruleset)"),
+            "{message}"
+        );
+        assert!(message.contains(&peer.url()), "{message}");
+        assert!(message.contains("localhost:1"), "{message}");
+    });
+}
+
+/// `no_proxy` exempts an origin from a SOCKS5 proxy, as from an HTTP proxy.
+#[test]
+fn no_proxy_exempts_an_origin_from_a_socks_proxy() {
+    block_on(async {
+        let origin = TestServer::start(Transport::Cleartext, always(b"direct")).await;
+        let peer = TestSocks::start(Socks::OPEN);
+        let variables = vec![
+            ("all_proxy".to_owned(), peer.url()),
+            ("no_proxy".to_owned(), "localhost".to_owned()),
+        ];
+        let fetcher = Fetcher::new(FetcherOptions {
+            tls: tls_options(None),
+            proxy: Proxy::Variables(variables),
+            ..direct_options(origin.url(false))
+        })
+        .await
+        .unwrap();
+
+        let (bytes, _) = fetch_bytes(&fetcher, "summary").await;
+        assert_eq!(bytes, b"direct");
+        assert_eq!(peer.connections(), 0);
+    });
+}
+
+/// A redirect to another origin goes through the SOCKS5 proxy. Each origin
+/// gets its own connection through the proxy, because the proxy connects each
+/// connection to one origin.
+#[test]
+fn a_redirect_to_another_origin_goes_through_the_socks_proxy() {
+    block_on(async {
+        let second = TestServer::start(Transport::Cleartext, always(b"second hop")).await;
+        let first = TestServer::start(
+            Transport::Cleartext,
+            redirect_once(format!("{}/moved", second.url(false)), b"first hop"),
+        )
+        .await;
+        let peer = TestSocks::start(Socks::OPEN);
+        let fetcher = Fetcher::new(FetcherOptions {
+            tls: tls_options(None),
+            proxy: Proxy::Url(peer.url()),
+            ..direct_options(first.url(false))
+        })
+        .await
+        .unwrap();
+
+        let (bytes, _) = fetch_bytes(&fetcher, "summary").await;
+        assert_eq!(bytes, b"second hop");
+        let ports: Vec<u16> = peer.seen().iter().map(|seen| seen.port).collect();
+        assert_eq!(ports, [first.addr.port(), second.addr.port()]);
+        assert_eq!(peer.connections(), 2);
+        assert_eq!(second.seen()[0].target, "/moved");
+    });
+}
+
+/// If the connect window ends on a SOCKS5 hop, the error names the proxy.
+#[test]
+fn a_connect_timeout_on_a_socks_hop_names_the_proxy() {
+    block_on(async {
+        // A peer that accepts the connection, reads the greeting, and sends no
+        // answer.
+        let addr = stalling_server(b"").await;
+        let proxy = format!("socks5h://127.0.0.1:{}", addr.port());
+        let fetcher = Fetcher::new(FetcherOptions {
+            tls: tls_options(None),
+            proxy: Proxy::Url(proxy.clone()),
+            connect_timeout: Duration::from_millis(300),
+            max_retries: 0,
+            ..direct_options("https://localhost:1/repo")
+        })
+        .await
+        .unwrap();
+
+        let message = fetch_error(&fetcher, "summary").await.to_string();
+        assert!(message.contains(&proxy), "{message}");
+        assert!(message.contains("timed out"), "{message}");
+        assert!(!message.contains("localhost:1"), "{message}");
+    });
+}
+
+/// A SOCKS5 proxy in `https_proxy` serves TLS origins, and a cleartext origin
+/// goes direct.
+#[test]
+fn https_proxy_names_a_socks_proxy_for_tls_origins_alone() {
+    block_on(async {
+        let tls_origin = TestServer::start(tls_transport("h2"), always(b"tls")).await;
+        let cleartext = TestServer::start(Transport::Cleartext, always(b"cleartext")).await;
+        let peer = TestSocks::start(Socks::OPEN);
+        let fetcher = Fetcher::new(FetcherOptions {
+            proxy: Proxy::Variables(vec![("https_proxy".to_owned(), peer.url())]),
+            ..mirrorless_options()
+        })
+        .await
+        .unwrap();
+
+        let tls_url = format!("{}/summary", tls_origin.url(true));
+        let (bytes, _) = fetch_url_bytes(&fetcher, &tls_url).await;
+        assert_eq!(bytes, b"tls");
+        let cleartext_url = format!("{}/summary", cleartext.url(false));
+        let (bytes, _) = fetch_url_bytes(&fetcher, &cleartext_url).await;
+        assert_eq!(bytes, b"cleartext");
+        assert_eq!(peer.connections(), 1);
+        assert_eq!(peer.seen()[0].port, tls_origin.addr.port());
+        assert_eq!(cleartext.seen()[0].target, "/summary");
+    });
+}
+
+/// The pool keeps a connection through a SOCKS5 proxy under the origin, so two
+/// fetches to one origin share one connection.
+#[test]
+fn two_fetches_to_one_origin_share_one_socks_connection() {
+    block_on(async {
+        let origin = TestServer::start(Transport::Cleartext, always(b"pooled")).await;
+        let peer = TestSocks::start(Socks::OPEN);
+        let fetcher = Fetcher::new(FetcherOptions {
+            tls: tls_options(None),
+            proxy: Proxy::Url(peer.url()),
+            ..direct_options(origin.url(false))
+        })
+        .await
+        .unwrap();
+
+        for _ in 0..2 {
+            let (bytes, _) = fetch_bytes(&fetcher, "summary").await;
+            assert_eq!(bytes, b"pooled");
+        }
+        assert_eq!(origin.requests(), 2);
+        assert_eq!(peer.connections(), 1);
+        assert_eq!(origin.connections(), 1);
     });
 }
 
@@ -5131,6 +5559,38 @@ fn a_streamed_post_tunnels_through_the_proxy_over_http1_and_http2() {
             let seen = proxy.seen();
             assert_eq!(seen.len(), 1);
             assert_eq!(seen[0].method, "CONNECT");
+            assert_eq!(origin.seen()[0].method, "POST");
+            assert_body(&origin.seen()[0], &data);
+        }
+    }));
+}
+
+/// A streamed `POST` reaches a cleartext origin and a TLS origin through a
+/// `socks5h://` proxy, with the complete body.
+#[test]
+fn an_upload_reaches_the_origin_through_a_socks_proxy() {
+    block_on(bounded(async {
+        let data = upload_data(1024 * 1024 + 7);
+        for (transport, tls, protocol) in [
+            (Transport::Cleartext, false, Protocol::Http11),
+            (tls_transport("h2"), true, Protocol::Http2),
+        ] {
+            let origin = TestServer::start(transport, always(b"accepted")).await;
+            let peer = TestSocks::start(Socks::OPEN);
+            let fetcher = Fetcher::new(FetcherOptions {
+                proxy: Proxy::Url(peer.url()),
+                ..upload_options(origin.url(tls))
+            })
+            .await
+            .unwrap();
+
+            let (status, carried, answer) = post_streamed(&fetcher, "objects", &data).await;
+            assert_eq!((status, carried), (200, protocol));
+            assert_eq!(answer, b"accepted");
+            let seen = peer.seen();
+            assert_eq!(seen.len(), 1);
+            assert_eq!(seen[0].atyp, Some(0x03));
+            assert_eq!(seen[0].host, "localhost");
             assert_eq!(origin.seen()[0].method, "POST");
             assert_body(&origin.seen()[0], &data);
         }

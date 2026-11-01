@@ -3491,7 +3491,7 @@ does not name the host of the request.
 
 The port reads the proxy of a pull by the rules of the tool (`cli-behavior.md`,
 "HTTP pull surface", "Proxy"). `remote refs` and `remote summary` read it by
-the same rules. Two differences stand:
+the same rules. Three differences stand:
 
 - A `no_proxy` entry that matches the origin host does not exempt the origin
   from the remote `proxy` key. In the port, a pull through the key reaches each
@@ -3505,6 +3505,11 @@ the same rules. Two differences stand:
   `all_proxy` and a padded `HTTP_PROXY` fail the pull in neither. The message
   of the port names the variable and holds no part of the value. The tool
   writes `[5] Could not resolve proxy name`.
+- The port accepts a `socks5://` and a `socks5h://` proxy URL in the remote
+  `proxy` key and in each proxy variable. It refuses `socks4://` and `socks4a://` before any
+  request, and the message names the URL without its userinfo.
+  The tool fetches with libcurl, and libcurl accepts these SOCKS schemes. This
+  fact is stated by the maintainer, not probed.
 
 The port also pulls over ssh, which the tool does not do. The address of a
 pull is `--url`, then the `pull-url` key of the remote, then its `url` key. A

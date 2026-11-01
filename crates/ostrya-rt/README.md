@@ -20,7 +20,8 @@ API documentation: <https://docs.rs/ostrya-rt>
 - `unblock` and `unblock_detached` run a closure on the blocking pool.
   `unblock_task` runs one there and returns a `JoinHandle`.
 - `File` and `FileReader` stream over an open file descriptor.
-- `TcpStream` and `TcpListener` carry async TCP.
+- `TcpStream` and `TcpListener` carry async TCP. `resolve` gives
+  the addresses of a host name in the order that `TcpStream` tries them.
 - `Command` runs a helper process.
 - `Timer` and `Deadline` measure a time window.
 - `block_on` runs a future to completion on the current thread.

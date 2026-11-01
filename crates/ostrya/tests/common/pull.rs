@@ -8,6 +8,7 @@
 //! - the status of the answer to each request
 //! - the largest number of requests in flight at the same time
 //! - the number of connections that it accepts
+//! - the number of TLS connections that negotiate `h2` through ALPN
 //!
 //! A TLS server can demand a client certificate that the fixture authority
 //! signed, and any server can demand a bearer token. Any server can answer a
@@ -231,6 +232,8 @@ pub struct RepoServer {
     peak: Arc<AtomicUsize>,
     /// The number of connections that the server accepted.
     connections: Arc<AtomicUsize>,
+    /// The number of TLS connections that negotiated `h2` through ALPN.
+    h2_connections: Arc<AtomicUsize>,
 }
 
 impl RepoServer {
@@ -267,6 +270,7 @@ impl RepoServer {
         let peak = Arc::new(AtomicUsize::new(0));
         let inflight = Arc::new(AtomicUsize::new(0));
         let connections = Arc::new(AtomicUsize::new(0));
+        let h2_connections = Arc::new(AtomicUsize::new(0));
         let acceptor = tls.then(|| {
             futures_rustls::TlsAcceptor::from(Arc::new(server_config(
                 &["h2", "http/1.1"],
@@ -283,9 +287,10 @@ impl RepoServer {
             peak.clone(),
             inflight,
             connections.clone(),
+            h2_connections.clone(),
         );
         drop(spawn(async move {
-            let (root, seen, answered, policy, peak, inflight, connections) = task;
+            let (root, seen, answered, policy, peak, inflight, connections, h2_connections) = task;
             loop {
                 let Ok((stream, _peer)) = listener.accept().await else {
                     return;
@@ -300,6 +305,7 @@ impl RepoServer {
                     inflight.clone(),
                 );
                 let acceptor = acceptor.clone();
+                let h2_connections = h2_connections.clone();
                 drop(spawn(async move {
                     match acceptor {
                         Some(acceptor) => {
@@ -307,6 +313,9 @@ impl RepoServer {
                                 return;
                             };
                             let h2 = tls.get_ref().1.alpn_protocol() == Some(b"h2");
+                            if h2 {
+                                h2_connections.fetch_add(1, Ordering::SeqCst);
+                            }
                             serve(tls, h2, state).await;
                         }
                         None => serve(stream, false, state).await,
@@ -322,6 +331,7 @@ impl RepoServer {
             policy,
             peak,
             connections,
+            h2_connections,
         }
     }
 
@@ -329,6 +339,10 @@ impl RepoServer {
         let scheme = if self.tls { "https" } else { "http" };
         // The fixture server certificate covers `localhost` and `127.0.0.1`.
         format!("{scheme}://localhost:{}", self.addr.port())
+    }
+
+    pub fn port(&self) -> u16 {
+        self.addr.port()
     }
 
     /// Returns the request paths that the server received, in order, without
@@ -348,6 +362,12 @@ impl RepoServer {
 
     pub fn connections(&self) -> usize {
         self.connections.load(Ordering::SeqCst)
+    }
+
+    /// Returns the number of TLS connections that negotiated `h2` through
+    /// ALPN.
+    pub fn h2_connections(&self) -> usize {
+        self.h2_connections.load(Ordering::SeqCst)
     }
 
     /// Demands `Authorization: Bearer <token>` on each request. A request

@@ -1085,8 +1085,8 @@ impl Remote<'_> {
         self.string("send-command")
     }
 
-    /// Returns the `proxy` key: the `http://` proxy URL of an HTTP pull and of
-    /// an HTTP push.
+    /// Returns the `proxy` key: the `http://`, `socks5://`, or `socks5h://`
+    /// proxy URL of an HTTP pull and of an HTTP push.
     ///
     /// An HTTP pull from this remote and an HTTP push to it connect through
     /// this proxy. If the value is empty, the key counts as absent, and the

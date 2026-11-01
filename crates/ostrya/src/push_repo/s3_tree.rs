@@ -108,11 +108,14 @@ impl BucketRepo {
     ///
     /// # Progress
     ///
-    /// The scan sets the phases `Scanning` and `Hashing`. The push sets the
-    /// phase `Uploading` for the uploads of the objects, and `Committing`
-    /// for the write of the ref. Each object that it uploads, the commit
-    /// object included, counts as needed and as sent. The payload size of a
-    /// file counts as content after the upload of its `.filez`.
+    /// The scan sets the phases `Scanning` and `Hashing`. It sets `Scanning`
+    /// at its start with
+    /// [`start_phase`](crate::remote::PushProgress::start_phase), so the hook
+    /// of a new handle gets a call with `Scanning` before the walk. The push
+    /// sets the phase `Uploading` for the uploads of the objects, and
+    /// `Committing` for the write of the ref. Each object that it uploads,
+    /// the commit object included, counts as needed and as sent. The payload
+    /// size of a file counts as content after the upload of its `.filez`.
     ///
     /// # Failure states
     ///

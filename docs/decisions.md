@@ -1523,11 +1523,29 @@ A holder in the error was rejected: it changes the error type of each
 writer for one case, and a caller can read the holder with
 `BucketRepo::lock_holder` before it breaks the lock.
 
-`PushProgress` gets the public methods `set_phase`, `add_upload`,
-`object_uploaded`, and `add_content`, so a client that uploads with no
-session counts into the handle of the caller. The progress bar of the
-`ostrya` command reads the same handle with no change. A progress type of
-its own for the bucket push was rejected for this reason.
+`PushProgress` gets the public methods `set_phase`, `start_phase`,
+`add_upload`, `object_uploaded`, and `add_content`, so a client that
+uploads with no session counts into the handle of the caller. The progress
+bar of the `ostrya` command reads the same handle with no change. A
+progress type of its own for the bucket push was rejected for this reason.
+
+`PushProgress::start_phase` sets a phase and calls the hook, also when the
+handle holds that phase before the call. A tree scan calls it with
+`Scanning` before its walk, and `Repo::push_to_bucket` calls it with
+`Scanning` after its local checks. A tree push to a bucket repository gets
+its call from its tree scan. A `set_phase` call at the start of the scan
+and of the bucket push was rejected: a new handle holds `Scanning`, so the
+call gives the hook no call. The first hook call then comes after the
+walk, with `Hashing` or `Uploading`, and a client that writes one line at
+each hook call writes nothing during a long scan. `set_phase` and the
+phase changes of a session share one rule: a repeated phase gives the hook
+no call. A rule that calls the hook at each call that sets a phase was
+rejected: `PushSession::send` sets `Uploading` before it sends its
+objects, and a session can make more than one `send` call, so the hook
+gets calls with no change. A handle that starts in no phase was rejected.
+It needs a new `PushPhase` variant, and it changes `PushPhase::default()`
+and `PushProgressSnapshot::default()`. Each `match` of a client over
+`PushPhase` then gets a phase that is new to it.
 
 A push builds each `.filez` at the `[archive] zlib-level` of the `config`
 of the bucket. The level of the local repository was rejected: two pushes

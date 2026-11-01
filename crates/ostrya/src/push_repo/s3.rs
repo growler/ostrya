@@ -306,16 +306,21 @@ impl Repo {
     ///
     /// # Progress
     ///
-    /// The push sets the phase `Scanning` for the checks and the walk,
-    /// `Uploading` for the uploads of the objects, and `Committing` for the
-    /// writes of the refs. The objects that it
-    /// uploads, other than the composefs images, count as needed and as
-    /// sent. The content of an `archive` repository counts with the stored
-    /// bytes of each `.filez` as the push reads them. In each other mode,
-    /// the payload size of a file counts after the upload of its `.filez`.
-    /// With a progress handle, a pass over the files to upload gives the
-    /// total of the content before the uploads. A failure of that pass
-    /// gives no total, and the push goes on.
+    /// After step 1, the push sets the phase `Scanning` with
+    /// [`start_phase`](crate::remote::PushProgress::start_phase), so the hook
+    /// gets one call with `Scanning`, also on a new handle. The phase stays
+    /// for the lock, the reads, the checks, and the walk of steps 2 to 4. It
+    /// also stays for the check after the walk: each ref of the new ref set
+    /// of the namespace must name a commit that the bucket holds or that the
+    /// push uploads. With a progress handle, a pass over the files to upload
+    /// then gives the total of the content, also in `Scanning`. A failure of
+    /// that pass gives no total, and the push goes on. The push sets
+    /// `Uploading` before the uploads of steps 5 and 6, and `Committing`
+    /// before step 7, which writes the refs. The objects that it uploads,
+    /// other than the composefs images, count as needed and as sent. The
+    /// content of an `archive` repository counts with the stored bytes of
+    /// each `.filez` as the push reads them. In each other mode, the payload
+    /// size of a file counts after the upload of its `.filez`.
     ///
     /// # Failure states
     ///
@@ -404,7 +409,7 @@ impl Repo {
         }
         let progress = opts.progress.as_ref();
         if let Some(progress) = progress {
-            progress.set_phase(PushPhase::Scanning);
+            progress.start_phase(PushPhase::Scanning);
         }
         let start = Instant::now();
         let lock = bucket.lock(LockOperation::Push, opts.break_lock).await?;

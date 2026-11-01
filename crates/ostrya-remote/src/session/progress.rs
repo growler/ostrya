@@ -16,6 +16,14 @@ pub enum PushPhase {
     /// A tree push shows this phase from the start of its scan to the end of
     /// the walk, which lists and filters each directory. Hash jobs can run in
     /// this phase. A new [`PushProgress`] starts in this phase.
+    ///
+    /// A tree scan sets this phase with [`PushProgress::start_phase`] before
+    /// its walk, and `Repo::push_to_bucket` sets it after its local checks.
+    /// Thus the hook of a tree scan and of `Repo::push_to_bucket` gets one
+    /// call with this phase, also on a new handle. A push that does not scan
+    /// a tree, such as `Repo::push` of the `ostrya` crate, does not set this
+    /// phase. Its first hook call has the phase
+    /// [`Connecting`](PushPhase::Connecting).
     #[default]
     Scanning,
     /// The client hashes the files and the directories of a tree.
@@ -61,16 +69,26 @@ impl PushPhase {
     }
 }
 
-/// A hook that receives the counters of a [`PushProgress`] when they change.
+/// A hook that receives the counters of a [`PushProgress`] at the start of a
+/// scan and when they change.
 ///
-/// The hook gets a call only at a change that a progress display shows.
-/// [Hook calls](PushProgress#hook-calls) lists these changes.
+/// The hook gets a call at each call of
+/// [`start_phase`](PushProgress::start_phase), also when the phase does not
+/// change. A tree scan and `Repo::push_to_bucket` make this call. The hook
+/// also gets a call at a change that a progress display shows.
+/// [Hook calls](PushProgress#hook-calls) lists these calls.
 ///
-/// The hook runs on the task that changed the counters: the task of the
-/// session, or the task of the scan of a tree push. Over HTTP, each parallel
-/// object stream of a session calls the hook, so more than one thread can call
-/// it at the same time. The session waits for the hook, so the hook must
-/// return soon.
+/// The hook runs on the task that causes the hook call: the task of a
+/// session or of a one-way export with [`export_stream`](super::export_stream),
+/// the task of the scan of a tree push, the task of a push to a bucket
+/// repository, or the task of a client that calls
+/// [`set_phase`](PushProgress::set_phase),
+/// [`start_phase`](PushProgress::start_phase),
+/// [`object_uploaded`](PushProgress::object_uploaded), or
+/// [`add_content`](PushProgress::add_content). Over HTTP, each parallel
+/// object stream of a session calls the hook, so more than one thread can
+/// call it at the same time. The session waits for the hook, so the hook
+/// must return soon.
 ///
 /// A hook that keeps state between calls holds that state behind interior
 /// mutability of its own, for example an atomic or a mutex.
@@ -97,13 +115,25 @@ const HOOK_BYTE_STEP: u64 = 102_400;
 /// # Hook calls
 ///
 /// A handle made with [`with_hook`](PushProgress::with_hook) calls its hook
-/// with a snapshot at these changes:
+/// with a snapshot at these times:
 ///
+/// - at each call of [`start_phase`](PushProgress::start_phase), also when
+///   the phase does not change
 /// - each time the phase changes to another phase
-/// - after each object of the object stream, when
+/// - after each object of the object stream, and at each call of
+///   [`object_uploaded`](PushProgress::object_uploaded), when
 ///   [`objects_sent`](PushProgressSnapshot::objects_sent) grows
 /// - each time [`content_bytes`](PushProgressSnapshot::content_bytes)
 ///   reaches the next multiple of 102,400 bytes (100 KiB)
+///
+/// A `start_phase` call gives one hook call, also when it changes the phase.
+/// A tree scan calls `start_phase` with [`Scanning`](PushPhase::Scanning)
+/// before its walk. `Repo::push_to_bucket` of the `ostrya` crate pushes the
+/// commits of a local repository to a bucket repository. It calls
+/// `start_phase` with `Scanning` after its local checks and before it takes
+/// the writer lock. A tree push to a bucket repository gets its one call
+/// from its tree scan. Thus in these pushes the hook of a new handle, which
+/// holds `Scanning`, gets a call with `Scanning`.
 #[derive(Debug, Clone, Default)]
 pub struct PushProgress {
     inner: Arc<ProgressCounters>,
@@ -144,6 +174,21 @@ impl PushProgress {
     /// calls this method.
     pub fn set_phase(&self, phase: PushPhase) {
         self.inner.set_phase(phase);
+    }
+
+    /// Sets the phase of the handle, and calls the hook.
+    ///
+    /// This method calls the hook also when the phase does not change.
+    /// [`set_phase`](PushProgress::set_phase) calls the hook only when the
+    /// phase changes. A tree scan calls this method before its walk, and
+    /// `Repo::push_to_bucket` of the `ostrya` crate calls it after its local
+    /// checks. A tree push to a bucket repository gets its one call from its
+    /// tree scan. Thus in these pushes the hook of a new handle, which holds
+    /// [`PushPhase::Scanning`], gets a call with `Scanning`.
+    ///
+    /// [Hook calls](PushProgress#hook-calls) lists the calls.
+    pub fn start_phase(&self, phase: PushPhase) {
+        self.inner.start_phase(phase);
     }
 
     /// Adds `objects` to [`objects_needed`](PushProgressSnapshot::objects_needed)
@@ -315,6 +360,12 @@ impl ProgressCounters {
         }
     }
 
+    /// Sets the phase, and calls the hook also if the phase did not change.
+    fn start_phase(&self, phase: PushPhase) {
+        self.phase.store(phase.as_u8(), Ordering::Relaxed);
+        self.call_hook();
+    }
+
     /// Counts one object sent, and calls the hook.
     fn object_sent(&self) {
         self.objects_sent.fetch_add(1, Ordering::Relaxed);
@@ -475,5 +526,21 @@ mod tests {
         assert_eq!(calls.lock().unwrap().len(), 3);
         assert_eq!((last.objects_sent, last.content_bytes), (1, 102_400));
         assert_eq!(progress.snapshot(), last);
+    }
+
+    /// On a new handle, `start_phase` with `Scanning` calls the hook one
+    /// time. A `set_phase` with `Scanning` after it calls no hook.
+    #[test]
+    fn start_phase_calls_the_hook_when_the_phase_does_not_change() {
+        let calls: Arc<Mutex<Vec<PushProgressSnapshot>>> = Arc::default();
+        let seen = Arc::clone(&calls);
+        let progress = PushProgress::with_hook(Arc::new(move |snapshot| {
+            seen.lock().unwrap().push(*snapshot);
+        }));
+        progress.start_phase(PushPhase::Scanning);
+        let phases: Vec<PushPhase> = calls.lock().unwrap().iter().map(|c| c.phase).collect();
+        assert_eq!(phases, [PushPhase::Scanning]);
+        progress.set_phase(PushPhase::Scanning);
+        assert_eq!(calls.lock().unwrap().len(), 1, "the phase did not change");
     }
 }

@@ -36,9 +36,12 @@ struct Walker {
 
 /// Walks and hashes the tree at `root`.
 ///
-/// If `progress` is `Some`, it shows [`PushPhase::Scanning`] until the walk
-/// lists and filters each directory. Then it shows [`PushPhase::Hashing`]
-/// while the hash jobs in flight end and the bottom-up pass runs.
+/// If `progress` is `Some`, the scan sets [`PushPhase::Scanning`] with
+/// [`PushProgress::start_phase`] before the walk, so the hook gets one call
+/// also when the handle holds `Scanning`. The handle shows `Scanning` until
+/// the walk lists and filters each directory. Then it shows
+/// [`PushPhase::Hashing`] while the hash jobs in flight end and the
+/// bottom-up pass runs.
 pub(super) async fn scan(
     root: &Path,
     options: ScanOptions,
@@ -54,7 +57,7 @@ pub(super) async fn scan(
         ));
     }
     if let Some(progress) = progress {
-        progress.set_phase(PushPhase::Scanning);
+        progress.start_phase(PushPhase::Scanning);
     }
     let mut jobs = Jobs::new();
     let mut walker = Walker {

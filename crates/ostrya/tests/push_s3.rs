@@ -25,7 +25,7 @@ mod common;
 use std::collections::BTreeSet;
 use std::os::fd::AsFd;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use common::modes::{build_tree, object_path, repo_of};
@@ -33,7 +33,10 @@ use common::s3::{Rclone, Seaweed, StandIn, endpoint, rclone_available, seaweed_a
 use common::{TmpDir, dependency_error, mark_partial, store_with_field2};
 use ostrya::bucket::{BucketPushOutcome, BucketRepo};
 use ostrya::remote::s3::S3Endpoint;
-use ostrya::remote::{Compression, Endpoint, PullSession, StreamSessionOptions};
+use ostrya::remote::{
+    Compression, Endpoint, PullSession, PushPhase, PushProgress, PushProgressSnapshot,
+    StreamSessionOptions,
+};
 use ostrya::verify::PullTrust;
 use ostrya::{
     Checksum, Commit, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions,
@@ -1783,6 +1786,42 @@ fn repo_push_with_an_s3_endpoint_writes_the_bucket() {
         let outcome = repo.push(Endpoint::S3(s3), opts(&["main"])).await.unwrap();
         assert_eq!(outcome.refs[0].new, Some(tip));
         assert_eq!(ref_of(&server, "repo/refs/heads/main"), Some(tip));
+    });
+}
+
+/// A push with a new progress handle calls the hook with `Scanning` at its
+/// start. Then it calls the hook with `Uploading` at the phase change and
+/// one time for each object that it uploads. It calls the hook with
+/// `Committing` before it writes the refs.
+#[test]
+fn a_push_with_a_new_handle_calls_the_hook_with_scanning_before_uploading() {
+    let scratch = TmpDir::new("push-s3-scan-hook");
+    block_on(async {
+        let server = StandIn::start();
+        init(&server.endpoint(), None).await;
+        let repo = archive(&scratch.path().join("src")).await;
+        commit(&repo, "main", None, "one", None).await;
+        let calls: Arc<Mutex<Vec<PushPhase>>> = Arc::default();
+        let hook_calls = Arc::clone(&calls);
+        // A new handle holds the phase `Scanning`.
+        let progress = PushProgress::with_hook(Arc::new(move |snapshot: &PushProgressSnapshot| {
+            hook_calls.lock().unwrap().push(snapshot.phase);
+        }));
+        let o = RepoPushOptions {
+            progress: Some(progress),
+            ..opts(&["main"])
+        };
+        let outcome = push(&repo, &server.endpoint(), o).await.unwrap();
+        let sent = usize::try_from(outcome.outcome.stats.objects_sent).unwrap();
+        assert!(sent > 0);
+        // The content of the tree is less than 100 KiB, so no content step
+        // calls the hook.
+        let expected: Vec<PushPhase> = [PushPhase::Scanning]
+            .into_iter()
+            .chain(std::iter::repeat_n(PushPhase::Uploading, 1 + sent))
+            .chain([PushPhase::Committing])
+            .collect();
+        assert_eq!(*calls.lock().unwrap(), expected);
     });
 }
 

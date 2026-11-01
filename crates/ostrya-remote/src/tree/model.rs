@@ -218,6 +218,10 @@ impl TreeModel {
     /// Runs [`scan`](TreeModel::scan) and sets the phases of the scan in
     /// `progress`: [`Scanning`](crate::PushPhase::Scanning) during the walk,
     /// and [`Hashing`](crate::PushPhase::Hashing) after it.
+    ///
+    /// The scan sets `Scanning` with
+    /// [`start_phase`](crate::PushProgress::start_phase), so the hook of
+    /// `progress` gets one call before the walk, also on a new handle.
     pub(crate) async fn scan_with(
         root: &Path,
         options: ScanOptions,

@@ -854,6 +854,9 @@ mod tests {
         assert_eq!(scanned.model.object_names().len(), 4);
     }
 
+    /// On a reused handle, the filter sees `Scanning` for each entry. The
+    /// hook gets one call with `Scanning` before the walk, and one call with
+    /// `Hashing` after it.
     #[test]
     fn the_scan_shows_scanning_during_the_walk_and_hashing_after_it() {
         use std::sync::{Arc, Mutex};
@@ -861,18 +864,32 @@ mod tests {
         use crate::PushPhase;
         use crate::tree::EntryAction;
 
+        /// One call to the hook or to the entry filter, in the order of the
+        /// calls.
+        #[derive(Debug, PartialEq, Eq)]
+        enum Call {
+            Hook(PushPhase),
+            Filter,
+        }
+
         let root =
             std::env::temp_dir().join(format!("ostrya-remote-scan-phases-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(root.join("dir")).unwrap();
         std::fs::write(root.join("dir/file"), b"file").unwrap();
+        let calls: Arc<Mutex<Vec<Call>>> = Arc::default();
+        let hook_calls = Arc::clone(&calls);
         // A reused handle holds the phase of an earlier push.
-        let progress = PushProgress::new();
+        let progress = PushProgress::with_hook(Arc::new(move |snapshot| {
+            hook_calls.lock().unwrap().push(Call::Hook(snapshot.phase));
+        }));
         progress.set_phase(PushPhase::Committing);
+        calls.lock().unwrap().clear();
         let seen = Arc::new(Mutex::new(Vec::new()));
-        let record = (seen.clone(), progress.clone());
+        let record = (seen.clone(), progress.clone(), Arc::clone(&calls));
         let filter: EntryFilter = Box::new(move |_path, _meta| {
             record.0.lock().unwrap().push(record.1.snapshot().phase);
+            record.2.lock().unwrap().push(Call::Filter);
             EntryAction::Keep
         });
         let scan = ScanOptions {
@@ -886,5 +903,69 @@ mod tests {
         assert_eq!(seen.len(), 3, "{seen:?}");
         assert!(seen.iter().all(|p| *p == PushPhase::Scanning), "{seen:?}");
         assert_eq!(progress.snapshot().phase, PushPhase::Hashing);
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [
+                Call::Hook(PushPhase::Scanning),
+                Call::Filter,
+                Call::Filter,
+                Call::Filter,
+                Call::Hook(PushPhase::Hashing),
+            ]
+        );
+    }
+
+    /// The hook of a new handle gets one call with `Scanning` before the
+    /// filter sees the first entry, and one call with `Hashing` after the
+    /// filter sees the last entry.
+    #[test]
+    fn a_new_handle_gets_a_scanning_call_before_the_walk_and_a_hashing_call_after_it() {
+        use std::sync::{Arc, Mutex};
+
+        use crate::PushPhase;
+        use crate::tree::EntryAction;
+
+        /// One call to the hook or to the entry filter, in the order of the
+        /// calls.
+        #[derive(Debug, PartialEq, Eq)]
+        enum Call {
+            Hook(PushPhase),
+            Filter,
+        }
+
+        let root =
+            std::env::temp_dir().join(format!("ostrya-remote-scan-hook-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("dir")).unwrap();
+        std::fs::write(root.join("dir/file"), b"file").unwrap();
+        let calls: Arc<Mutex<Vec<Call>>> = Arc::default();
+        let hook_calls = Arc::clone(&calls);
+        // A new handle holds the phase `Scanning`.
+        let progress = PushProgress::with_hook(Arc::new(move |snapshot| {
+            hook_calls.lock().unwrap().push(Call::Hook(snapshot.phase));
+        }));
+        let filter_calls = Arc::clone(&calls);
+        let filter: EntryFilter = Box::new(move |_path, _meta| {
+            filter_calls.lock().unwrap().push(Call::Filter);
+            EntryAction::Keep
+        });
+        let scan = ScanOptions {
+            entry_filter: Some(filter),
+            hash_jobs: None,
+        };
+        let model = ostrya_rt::block_on(TreeModel::scan_with(&root, scan, Some(&progress)));
+        let _ = std::fs::remove_dir_all(&root);
+        model.unwrap();
+        // The filter sees the root, `dir`, and `dir/file`.
+        assert_eq!(
+            *calls.lock().unwrap(),
+            [
+                Call::Hook(PushPhase::Scanning),
+                Call::Filter,
+                Call::Filter,
+                Call::Filter,
+                Call::Hook(PushPhase::Hashing),
+            ]
+        );
     }
 }

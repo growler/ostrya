@@ -1,3 +1,31 @@
+ostrya (0.6.0) unstable; urgency=medium
+
+  * Push, push-tree, and pull with a bucket repository in an S3 bucket.
+    Add remote init, remote fsck, remote prune, remote summary -u, push
+    --break-lock, and the --s3-* options.
+  * Sign and verify RSA, ECDSA P-384, and Ed25519 keys under spki. Read
+    the spki key files as PEM blocks. Refuse the raw spki key forms and
+    the r || s signature.
+  * Apply --sign-type to the keys after it.
+  * Refuse --gpg-homedir in a verify of sign and summary.
+  * Write the dependencies of a commit with commit --related. Pull,
+    push, receive, and static deltas carry the dependencies. Prune keeps
+    the related commits, and fsck reports dependency errors.
+  * Remove the config keys gc-root-metadata-keys and
+    detached-metadata-exclude. Add the config key keep-detached-related.
+  * Read the verification keys of the remote in pull-local. Add the
+    pull-local options --sign-verify, --sign-verify-summary,
+    --no-gpg-verify, --no-gpg-verify-summary, --no-sign-verify,
+    --no-sign-verify-summary, and --trust.
+  * Take the commit keys of a pull from the trust group that the remote
+    key trust names.
+  * Read each regular file of a gpgkeypath directory. Read the global
+    trusted directory when the remote has no keyring.
+  * Add send --one-way and receive --one-way.
+  * Reach an origin through a socks5 or a socks5h proxy.
+
+ -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Sun, 01 Nov 2026 17:00:09 +0100
+
 ostrya (0.5.0) unstable; urgency=medium
 
   * Store the composefs image of a commit as a .cfs object. commit

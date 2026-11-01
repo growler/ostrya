@@ -19,6 +19,7 @@ use std::collections::BTreeSet;
 use std::os::fd::AsFd;
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use common::TmpDir;
 use common::modes::object_path;
@@ -1277,8 +1278,6 @@ fn the_repair_marks_the_commits_and_deletes_the_bad_objects_in_order() {
         f.remove(ObjectType::File, &nested);
         let other = f.object(ObjectType::Commit, &f.side);
         f.replace(ObjectType::Commit, &f.first, &other);
-        f.server.state().requests.clear();
-        let report = f.repair().await.unwrap();
         // The commits of the bad tree objects get a marker, except `first`,
         // whose own object is bad and goes.
         let mut wanted = vec![
@@ -1286,6 +1285,17 @@ fn the_repair_marks_the_commits_and_deletes_the_bad_objects_in_order() {
             (f.side, vec!["refs/heads/side".to_owned()]),
         ];
         wanted.sort();
+        // The markers go up at the same time, so the first one can arrive
+        // last.
+        f.server.state().delay = Some((
+            "PUT",
+            format!("repo/state/{}.commitpartial", wanted[0].0.to_hex()),
+            Duration::from_millis(200),
+        ));
+        f.server.state().requests.clear();
+        let report = f.repair().await.unwrap();
+        f.server.state().delay = None;
+        assert_eq!(f.server.state().max_delayed, 1);
         assert_eq!(report.marked_partial, wanted);
         assert_eq!(
             report.deleted,
@@ -1312,12 +1322,16 @@ fn the_repair_marks_the_commits_and_deletes_the_bad_objects_in_order() {
             "{:#?}",
             report.findings
         );
-        // The writes: the lock, the markers, the deletes, then the release.
-        let writes: Vec<(String, String)> = f
+        // The writes: the lock, the markers in any order, the deletes, then
+        // the release.
+        let mut writes: Vec<(String, String)> = f
             .requests()
             .into_iter()
             .filter(|(method, _)| method != "GET")
             .collect();
+        if let Some(markers) = writes.get_mut(2..2 + wanted.len()) {
+            markers.sort();
+        }
         let mut expected = vec![
             ("PUT".to_owned(), PROBE_KEY.to_owned()),
             ("PUT".to_owned(), "extensions/ostrya/lock".to_owned()),

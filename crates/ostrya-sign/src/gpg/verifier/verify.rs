@@ -1302,50 +1302,14 @@ mod tests {
         fn build(uid: &str, algorithm: &str, faked: bool, expiry: &str) -> Fixture {
             let mut fixture = Fixture::bare();
             fixture.faked = faked;
-            for _ in 0..16 {
-                let status = fixture
-                    .gpg()
-                    .args(["--quick-gen-key", uid, algorithm, "sign", expiry])
-                    .status()
-                    .unwrap();
-                assert!(status.success(), "gpg --quick-gen-key failed");
-                fixture.primary = fixture.fingerprints().remove(0);
-                if fixture.secret_key_is_read() {
-                    return fixture;
-                }
-                fixture.delete_key();
-            }
-            panic!("no generated key exported a secret key the pgp crate reads");
-        }
-
-        /// Returns `true` if the `pgp` crate reads the exported secret key of
-        /// the home.
-        ///
-        /// `gpg` writes the ed25519 secret scalar as an MPI that declares 256
-        /// bits, also when its leading octet is zero. The two-octet checksum
-        /// that `gpg` writes covers the octets that it wrote. The `pgp` crate
-        /// reads the MPI, drops the leading zero, and sums the shorter form, so
-        /// it refuses such a key with "Invalid checksum".
-        ///
-        /// One scalar in 256 has a zero leading octet. If the crate refuses the
-        /// secret export of a key, the fixture generates a new key. As a
-        /// result, the cases that sign with the key work on each run.
-        fn secret_key_is_read(&self) -> bool {
-            pgp::composed::SignedSecretKey::from_bytes(Cursor::new(self.secret_key())).is_ok()
-        }
-
-        /// Removes the key of the home, both its secret part and its public
-        /// part.
-        fn delete_key(&self) {
-            let status = self
+            let status = fixture
                 .gpg()
-                .args(["--yes", "--delete-secret-and-public-key", &self.primary])
+                .args(["--quick-gen-key", uid, algorithm, "sign", expiry])
                 .status()
                 .unwrap();
-            assert!(
-                status.success(),
-                "gpg --delete-secret-and-public-key failed"
-            );
+            assert!(status.success(), "gpg --quick-gen-key failed");
+            fixture.primary = fixture.fingerprints().remove(0);
+            fixture
         }
 
         /// Returns a `gpg` command bound to this home, in batch mode, that
@@ -1455,12 +1419,13 @@ mod tests {
                 .into_owned()
         }
 
-        /// Returns the exported secret key. `gpg` writes it unprotected because
-        /// the passphrase is empty.
+        /// Returns the exported secret key, in a form that the `pgp` crate
+        /// reads. `gpg` writes it unprotected because the passphrase is empty.
+        /// [`readable_secret_export`] states the change to the export.
         fn secret_key(&self) -> Vec<u8> {
             let out = self.gpg().arg("--export-secret-keys").output().unwrap();
             assert!(out.status.success() && !out.stdout.is_empty());
-            out.stdout
+            readable_secret_export(&out.stdout)
         }
 
         /// Returns the stored revocation certificate of the key as one binary
@@ -2240,6 +2205,118 @@ mod tests {
             out.extend_from_slice(body);
         }
         out
+    }
+
+    /// Returns the secret export `export` with each ed25519 secret scalar in
+    /// the MPI form of RFC 9580.
+    ///
+    /// `gpg` writes the scalar of an EdDSALegacy key (algorithm 22) as an MPI
+    /// that declares 256 bits, also when its leading octet is zero. RFC 9580,
+    /// section 3.2, counts the length from the most significant non-zero bit.
+    /// The two-octet checksum that `gpg` writes covers the octets that it
+    /// wrote. The `pgp` crate reads the MPI, drops the zero leading octets,
+    /// and sums the shorter form, so it refuses such a key with "Invalid
+    /// checksum". One scalar in 256 has a zero leading octet.
+    ///
+    /// The function changes a v4 secret key packet or secret subkey packet of
+    /// algorithm 22 with no string-to-key protection, and only if the stored
+    /// checksum covers the octets that `gpg` wrote. It drops the zero leading
+    /// octets of the scalar, writes the true bit count, and writes the
+    /// checksum of the new octets. Each other packet stays as it is.
+    fn readable_secret_export(export: &[u8]) -> Vec<u8> {
+        let packets: Vec<_> = split_packets(export)
+            .into_iter()
+            .map(|(tag, body)| match tag {
+                5 | 7 => (tag, canonical_secret_scalar(body)),
+                _ => (tag, body),
+            })
+            .collect();
+        join_packets(&packets)
+    }
+
+    /// Returns the body of a secret key packet with its ed25519 secret scalar
+    /// in the MPI form of RFC 9580. [`readable_secret_export`] states the
+    /// conditions.
+    fn canonical_secret_scalar(body: Vec<u8>) -> Vec<u8> {
+        // Version, creation time, algorithm, then the curve OID.
+        if body[0] != 4 || body[5] != 22 {
+            return body;
+        }
+        let public_at = 7 + usize::from(body[6]);
+        let public_bits = u16::from_be_bytes([body[public_at], body[public_at + 1]]);
+        let usage_at = public_at + 2 + usize::from(public_bits).div_ceil(8);
+        if body[usage_at] != 0 {
+            return body;
+        }
+        let secret_at = usage_at + 1;
+        let bits = u16::from_be_bytes([body[secret_at], body[secret_at + 1]]);
+        let checksum_at = secret_at + 2 + usize::from(bits).div_ceil(8);
+        let stored = u16::from_be_bytes([body[checksum_at], body[checksum_at + 1]]);
+        if octet_sum(&body[secret_at..checksum_at]) != stored {
+            return body;
+        }
+        let scalar = &body[secret_at + 2..checksum_at];
+        let scalar = &scalar[scalar.iter().take_while(|&&octet| octet == 0).count()..];
+        let true_bits = scalar.first().map_or(0, |&first| {
+            scalar.len() * 8 - usize::try_from(first.leading_zeros()).unwrap()
+        });
+        let mut mpi = u16::try_from(true_bits).unwrap().to_be_bytes().to_vec();
+        mpi.extend_from_slice(scalar);
+        let mut out = body[..secret_at].to_vec();
+        out.extend_from_slice(&mpi);
+        out.extend_from_slice(&octet_sum(&mpi).to_be_bytes());
+        out
+    }
+
+    /// Returns the sum of `octets` modulo 65536, the checksum of an
+    /// unprotected v4 secret key.
+    fn octet_sum(octets: &[u8]) -> u16 {
+        octets
+            .iter()
+            .fold(0u16, |sum, &octet| sum.wrapping_add(u16::from(octet)))
+    }
+
+    /// Returns the body of an unprotected v4 ed25519 secret key packet whose
+    /// secret MPI declares `bits` bits and holds the octets `scalar`. The
+    /// public point is the point of `seed`.
+    fn ed25519_secret_key_body(seed: &[u8; 32], bits: u16, scalar: &[u8]) -> Vec<u8> {
+        // The OID of the curve Ed25519, 1.3.6.1.4.1.11591.15.1.
+        const ED25519_OID: [u8; 9] = [0x2b, 0x06, 0x01, 0x04, 0x01, 0xda, 0x47, 0x0f, 0x01];
+        let point = ed25519_dalek::SigningKey::from_bytes(seed)
+            .verifying_key()
+            .to_bytes();
+        let mut body = vec![4, 0x67, 0x74, 0x84, 0x80, 22, 9];
+        body.extend_from_slice(&ED25519_OID);
+        // The public MPI: 263 bits, the prefix 0x40, then the point.
+        body.extend_from_slice(&[0x01, 0x07, 0x40]);
+        body.extend_from_slice(&point);
+        // No string-to-key protection.
+        body.push(0);
+        let mut mpi = bits.to_be_bytes().to_vec();
+        mpi.extend_from_slice(scalar);
+        body.extend_from_slice(&mpi);
+        body.extend_from_slice(&octet_sum(&mpi).to_be_bytes());
+        body
+    }
+
+    /// The `pgp` crate refuses the secret key that `gpg` writes for an
+    /// ed25519 scalar with a zero leading octet, and reads the form that
+    /// [`readable_secret_export`] makes of it.
+    #[test]
+    fn a_gpg_secret_scalar_with_a_zero_leading_octet_is_read() {
+        use pgp::composed::SignedSecretKey;
+
+        let mut seed = [0x5a; 32];
+        seed[0] = 0;
+        seed[1] = 0x80;
+        let gpg_form = join_packets(&[(5, ed25519_secret_key_body(&seed, 256, &seed))]);
+        let err = SignedSecretKey::from_bytes(Cursor::new(&gpg_form)).unwrap_err();
+        assert!(format!("{err:?}").contains("Invalid checksum"), "{err:?}");
+
+        let readable = readable_secret_export(&gpg_form);
+        let expected = join_packets(&[(5, ed25519_secret_key_body(&seed, 248, &seed[1..]))]);
+        assert_eq!(readable, expected);
+        SignedSecretKey::from_bytes(Cursor::new(&readable)).unwrap();
     }
 
     /// Removes the embedded primary-key binding signature (unhashed subpacket

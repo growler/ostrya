@@ -16,7 +16,7 @@ use std::path::Path;
 use common::TmpDir;
 use ostrya::{
     Checksum, CollectionRef, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions,
-    Error, MutableTree, ObjectType, Repo, RepoMode,
+    Error, MutableTree, ObjectType, RefSelector, Repo, RepoMode,
 };
 use ostrya_rt::block_on;
 
@@ -316,6 +316,18 @@ fn a_collection_ref_resolution_refuses_an_id_outside_the_rule() {
 }
 
 #[test]
+fn a_collection_listing_refuses_an_id_outside_the_rule() {
+    block_on(async {
+        let tmp = TmpDir::new("rule-collection-id-list");
+        let (repo, _) = repo_with_commit(tmp.path()).await;
+        let all = RefSelector::parse([]).unwrap();
+        for id in refused_ids() {
+            assert_refused(repo.list_collection_refs_in(&id, &all).await, &id);
+        }
+    });
+}
+
+#[test]
 fn a_collection_ref_write_takes_an_id_inside_the_rule() {
     block_on(async {
         let tmp = TmpDir::new("rule-collection-id-valid");
@@ -372,6 +384,11 @@ fn a_ref_under_an_invalid_collection_directory_stays() {
             repo.resolve_collection_ref(&CollectionRef::new("fresh", "x"), true)
                 .await,
             "fresh:x",
+        );
+        assert_refused(
+            repo.list_collection_refs_in("fresh", &RefSelector::parse([]).unwrap())
+                .await,
+            "fresh",
         );
         assert!(path.is_file(), "the ref store removed the ref");
     });

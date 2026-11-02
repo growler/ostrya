@@ -1324,12 +1324,14 @@ impl Repo {
     /// directories at its level. It skips a directory that a negative
     /// pattern covers, and it applies the negative patterns to a name before
     /// it reads the ref file, so it reads no ref that the selector does not
-    /// select. It reads each commit one time, also when more than one ref
-    /// names it. An empty selector, and a selector of negative patterns
-    /// alone, read only the directories that an allow item that gives `r`
-    /// in the group of the namespace can match, and no directory that a deny
-    /// item of that group covers. A name that the ref-name rule refuses is in
-    /// the walk, and a wildcard selects it.
+    /// select. With the negative pattern `**` in `refs`, the call opens
+    /// neither `refs/heads/` nor the directory of `[core] collection-id`
+    /// under `refs/mirrors/`. It reads each commit one time, also when more
+    /// than one ref names it. An empty selector, and a selector of negative
+    /// patterns alone, read only the directories that an allow item that
+    /// gives `r` in the group of the namespace can match, and no directory
+    /// that a deny item of that group covers. A name that the ref-name rule
+    /// refuses is in the walk, and a wildcard selects it.
     ///
     /// # Global metadata
     ///

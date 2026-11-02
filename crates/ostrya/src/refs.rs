@@ -9,8 +9,9 @@
 //! - [`Repo::resolve_collection_ref`] reads one collection ref from the ref
 //!   store.
 //! - [`Repo::list_refs`], [`Repo::list_remote_refs`],
-//!   [`Repo::list_mirror_refs`], [`Repo::list_collection_refs`], and
-//!   [`Repo::list_ref_aliases`] list refs.
+//!   [`Repo::list_mirror_refs`], [`Repo::list_collection_refs`],
+//!   [`Repo::list_collection_refs_in`], and [`Repo::list_ref_aliases`] list
+//!   refs.
 //! - [`Repo::set_ref_immediate`] writes one ref outside a transaction. Its doc
 //!   gives the ref file format and the durability rules.
 //! - [`Transaction::set_ref`] queues a ref write for the transaction commit.
@@ -18,14 +19,13 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::io::{Read, Write};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
-#[cfg(feature = "receive")]
 use std::sync::Arc;
 
 use ostrya_core::{Checksum, RefPattern, RefSelector, RepoMode};
 use rustix::fs::{AtFlags, FileType, Mode, OFlags};
 use rustix::io::Errno;
 
-use crate::access::{AccessRules, Namespace, ReadAccess};
+use crate::access::{AccessRules, AuthItem, ClientAccess, Namespace, ReadAccess};
 use crate::archive::{Walked, resolve_alias, walk};
 use crate::error::{Error, Result};
 use crate::perm;
@@ -611,8 +611,9 @@ impl Repo {
     /// The result holds a ref only when `access` reads its name. The call
     /// checks the name before it reads the ref file, so a ref file that
     /// `access` does not read is never read. When `access` reads no local
-    /// ref, the call opens neither directory. The call opens `refs/heads/`
-    /// and `refs/mirrors/` by their paths from the repository. Below these
+    /// ref, or when a negative pattern of `refs` is `**`, the call opens
+    /// neither directory. The call opens `refs/heads/` and `refs/mirrors/`
+    /// by their paths from the repository. Below these
     /// two directories, it opens each ref file and each directory with no
     /// symlink followed. An alias resolves by the rule of
     /// the archive view: its body is relative, it names a regular file under
@@ -633,8 +634,9 @@ impl Repo {
     /// `invalid_dirs`, and the call reads no entry in it. The call skips the
     /// directory of an id that no positive pattern can reach, or that a
     /// negative pattern covers, before it reads the rights of the id. With
-    /// `None`, the call reads `refs/mirrors/` only for the collection id of
-    /// the config. The call opens `refs/mirrors/` at most one time.
+    /// `None`, the call opens `refs/mirrors/` only for the local refs of the
+    /// collection id of the config. The call opens `refs/mirrors/` at most
+    /// one time.
     ///
     /// # Size
     ///
@@ -669,7 +671,8 @@ impl Repo {
             let own = repo.config().collection_id();
             // The one open of `refs/mirrors`, for the refs of the own
             // collection and for the collection refs.
-            let mirrors = if collections.is_some() || (own.is_some() && access.reads_local_refs()) {
+            let local = !selects_no_name(&refs) && access.reads_local_refs();
+            let mirrors = if collections.is_some() || (own.is_some() && local) {
                 open_refs_dir(&repo, MIRRORS_DIR)?
             } else {
                 None
@@ -745,6 +748,9 @@ impl Repo {
     /// A mirror ref under the collection id of the repository is in the result
     /// as a mirror ref.
     ///
+    /// [`list_collection_refs_in`](Repo::list_collection_refs_in) lists the
+    /// refs of one collection that a selector selects.
+    ///
     /// # Errors
     ///
     /// - [`Error::InvalidFormat`] if a ref file is not UTF-8.
@@ -756,6 +762,147 @@ impl Repo {
             None => Vec::new(),
         };
         self.collection_refs_over(&heads).await
+    }
+
+    /// Returns the refs of the collection `collection_id` that `refs`
+    /// selects, as `(name, commit)` pairs, sorted byte-wise by name, each
+    /// name one time.
+    ///
+    /// `refs` selects a ref by its name in the collection, with the rules of
+    /// [`RefSelector`]. An empty selector selects each ref of the collection.
+    ///
+    /// The collection id selects the directories that the call lists:
+    ///
+    /// - The `[core] collection-id` of the repository lists the refs of
+    ///   `refs/mirrors/ID/` and of `refs/heads/`. When a name is in the two
+    ///   directories, the result holds the commit of the mirror ref, and the
+    ///   call does not read the ref file of `refs/heads/`. With no directory
+    ///   `refs/mirrors/ID/`, the result holds the refs of `refs/heads/`. The
+    ///   summary and the ref listing apply the same rule.
+    /// - Each other collection id lists the refs of `refs/mirrors/ID/` alone.
+    ///   With no directory `refs/mirrors/ID/`, the result is an empty vector.
+    ///
+    /// The call opens `refs/mirrors/ID` with no symlink followed. An entry
+    /// `ID` that is absent, a regular file, or a symlink is no directory
+    /// `refs/mirrors/ID/`, and so is each entry `ID` when `refs/mirrors` is
+    /// absent. When the call opens `refs/mirrors`, a `refs/mirrors` that is a
+    /// regular file gives an error. The call reads `[core] collection-id`
+    /// from the config that the handle read at the open.
+    ///
+    /// An alias resolves by the rule of the ref listing: its body is a
+    /// relative path, and it names a regular file under `refs/heads/` or
+    /// under `refs/mirrors/ID/` of a valid collection id with one link. The
+    /// result holds the alias by its own name, with the commit of the target.
+    /// An alias whose target is absent, is outside these directories, or is
+    /// an alias is not in the result. Under the collection id of the
+    /// repository, such an alias in `refs/mirrors/ID/` does not hide the ref
+    /// of `refs/heads/` with the same name.
+    ///
+    /// The call does not check a name that it finds against the ref-name
+    /// rule. A wildcard of `refs` selects a name that the rule refuses.
+    ///
+    /// # Reads
+    ///
+    /// The call reads only the directories that the literal leading parts of
+    /// a positive pattern name, and below them only the directories that the
+    /// pattern can match. It does not read a directory that a negative
+    /// pattern covers: a negative pattern of literal or `*` parts and a
+    /// final `**` matches each name below a directory whose path starts with
+    /// these parts. It applies the negative patterns to a name before it
+    /// reads the ref file. A negative pattern `**` selects no ref, and the
+    /// call then opens no directory.
+    ///
+    /// For each other collection id, the call opens `refs/mirrors/` and
+    /// `refs/mirrors/ID/`, and below `refs/mirrors/ID/` the directories that
+    /// the rules above give. It does not read the names at the top level of
+    /// `refs/mirrors/`. Except to read the target of an alias, it does not
+    /// open the directory of another collection, and it does not open
+    /// `refs/heads/`.
+    ///
+    /// The call takes no lock. It does not wait for an
+    /// [`UpdateGuard`](crate::UpdateGuard) or for a transaction. A ref write
+    /// renames a complete file over the ref, so each ref in the result has
+    /// the old commit or the new commit. Writes during the call can give a
+    /// result that the store did not hold at one time.
+    ///
+    /// No client group applies: the `[ex-ostrya client]` groups of the
+    /// config do not limit the result. The result has no size limit.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::InvalidRefspec`] if the collection id does not pass
+    ///   [`is_collection_id`](crate::is_collection_id) or is longer than 255
+    ///   bytes. The error holds the collection id. The call reads no file.
+    /// - [`Error::InvalidFormat`] if a selected ref file is not UTF-8.
+    /// - [`Error::Core`] if a selected ref file holds no checksum.
+    /// - [`Error::Io`] if a read fails, for example if `refs/mirrors` that
+    ///   the call opens is a regular file, or if a directory that the call
+    ///   reads gives no read permission.
+    pub async fn list_collection_refs_in(
+        &self,
+        collection_id: &str,
+        refs: &RefSelector,
+    ) -> Result<Vec<(String, Checksum)>> {
+        if collection_id.len() > MAX_COLLECTION_ID_LEN
+            || !ostrya_core::is_collection_id(collection_id)
+        {
+            return Err(Error::InvalidRefspec(collection_id.to_owned()));
+        }
+        if selects_no_name(refs) {
+            return Ok(Vec::new());
+        }
+        let own = self.config().collection_id();
+        let everyone = ReadAccess::new(
+            Arc::new(ClientAccess::implicit(own)),
+            AuthItem::Anonymous,
+            None,
+        );
+        if own == Some(collection_id) {
+            let selection = self.select_refs(refs, None, &everyone, None).await?;
+            return Ok(selection.local);
+        }
+        // The selector of `ID/NAME` paths. With no positive pattern, `ID/**`
+        // keeps the walk inside the directory of the collection.
+        let mut entries: Vec<String> = refs
+            .positive()
+            .iter()
+            .map(|pattern| format!("{collection_id}/{}", pattern.as_str()))
+            .collect();
+        if entries.is_empty() {
+            entries.push(format!("{collection_id}/**"));
+        }
+        entries.extend(
+            refs.negative()
+                .iter()
+                .map(|pattern| format!("!{collection_id}/{}", pattern.as_str())),
+        );
+        let collections = RefSelector::parse(entries.iter().map(String::as_str))?;
+        let repo = self.clone();
+        let id = collection_id.to_owned();
+        ostrya_rt::unblock(move || {
+            let Some(rules) = everyone.collection_rules(&id) else {
+                return Ok(Vec::new());
+            };
+            // The walk opens `refs/mirrors/ID` by its name, so the call does
+            // not read the names of `refs/mirrors`.
+            let Some(mirrors) = open_refs_dir(&repo, MIRRORS_DIR)? else {
+                return Ok(Vec::new());
+            };
+            let mut floor = SelectionFloor::new(None);
+            let mut selection = RefSelection::default();
+            collect_collection_selected(
+                &repo,
+                mirrors.as_fd(),
+                &CollectionWalk::new(&collections),
+                &id,
+                &rules,
+                &everyone,
+                &mut floor,
+                &mut selection,
+            )?;
+            Ok(selection.collections.remove(&id).unwrap_or_default())
+        })
+        .await
     }
 
     /// Returns the listing of
@@ -1240,9 +1387,9 @@ impl RefSelection {
 /// `refs/mirrors/ID/` of `[core] collection-id` under `mirrors`, the open
 /// `refs/mirrors`. A mirror ref takes the place of the ref of `refs/heads` of
 /// the same name, and the call does not read that ref of `refs/heads`. When
-/// `access` reads no local ref, the call opens neither directory. The call
-/// adds each ref to `floor`, and the refs, their alias targets, and the
-/// hidden names to `selection`.
+/// `access` reads no local ref, or when `selector` selects no name, the call
+/// opens neither directory. The call adds each ref to `floor`, and the refs,
+/// their alias targets, and the hidden names to `selection`.
 fn collect_local_selected(
     repo: &Repo,
     mirrors: Option<BorrowedFd<'_>>,
@@ -1251,7 +1398,7 @@ fn collect_local_selected(
     floor: &mut SelectionFloor,
     selection: &mut RefSelection,
 ) -> Result<()> {
-    if !access.reads_local_refs() {
+    if selects_no_name(selector) || !access.reads_local_refs() {
         return Ok(());
     }
     // Each ref by name, and `true` for a ref of `refs/mirrors/ID/`.
@@ -1386,56 +1533,84 @@ fn collect_collections_selected(
             }
             continue;
         }
-        // The selector and the rights come before the type of the entry, so
-        // the call reads no type of a collection that it does not walk.
+        // The walk opens the directory of each id of `readable` with no
+        // symlink followed, and skips an entry that is no directory, so the
+        // loop reads no type of the entry.
         if !walk.reaches(&name) {
             continue;
         }
         if let Some(rules) = access.collection_rules(&name)
             && rules.gives_read()
-            && ref_entry_type(mirrors, &name)? == Some(FileType::Directory)
         {
             readable.insert(name, rules);
         }
     }
     selection.invalid_dirs.sort();
     selection.invalid_dirs.dedup();
-    for (id, rules) in readable {
-        let mut names: BTreeMap<String, Checksum> = BTreeMap::new();
-        let mut aliases = HashMap::new();
-        let mut take = |entry: RefEntry<'_>| -> Result<()> {
-            // The walk gives each entry of the directory of `id` as `id/NAME`.
-            let Some((_, name)) = entry.path.split_once('/') else {
-                return Ok(());
-            };
-            if names.contains_key(name)
-                || selector.negative().iter().any(|p| p.matches(entry.path))
-                || !crate::access::reads(&rules, name)
-            {
-                return Ok(());
-            }
-            if let Some((bytes, target)) = read_listed_ref(repo, MIRRORS_DIR, &entry, access)? {
-                let commit = parse_ref_content(&bytes)?;
-                if names.is_empty() {
-                    floor.add_collection(&id)?;
-                }
-                floor.add_ref(name)?;
-                names.insert(name.to_owned(), commit);
-                if let Some(target) = target {
-                    aliases.insert(name.to_owned(), target);
-                }
-            }
-            Ok(())
+    for (id, rules) in &readable {
+        collect_collection_selected(repo, mirrors, &walk, id, rules, access, floor, selection)?;
+    }
+    Ok(())
+}
+
+/// Adds to `selection` the refs of the collection `id` that `walk` selects by
+/// `ID/NAME` and that `rules`, the rules of the collection, read, with the
+/// target paths of their aliases. The call walks the directory `id` of
+/// `mirrors`, the open `refs/mirrors`, with [`CollectionWalk::walk`]. Except
+/// to read the target of an alias, it opens no other directory of `mirrors`.
+/// It applies the negative patterns of the walk and `rules` to a name before
+/// it reads the ref file. An alias resolves only when `access` reads its
+/// target path. The call adds each ref to `floor`, and the collection when it
+/// gives its first ref. A collection with no ref is not in `selection`.
+#[allow(clippy::too_many_arguments)]
+fn collect_collection_selected(
+    repo: &Repo,
+    mirrors: BorrowedFd<'_>,
+    walk: &CollectionWalk<'_>,
+    id: &str,
+    rules: &AccessRules,
+    access: &ReadAccess,
+    floor: &mut SelectionFloor,
+    selection: &mut RefSelection,
+) -> Result<()> {
+    let mut names: BTreeMap<String, Checksum> = BTreeMap::new();
+    let mut aliases = HashMap::new();
+    let mut take = |entry: RefEntry<'_>| -> Result<()> {
+        // The walk gives each entry of the directory of `id` as `id/NAME`.
+        let Some((_, name)) = entry.path.split_once('/') else {
+            return Ok(());
         };
-        walk.walk(mirrors, &id, &rules, &mut take)?;
-        if !aliases.is_empty() {
-            selection.collection_aliases.insert(id.clone(), aliases);
+        if names.contains_key(name)
+            || walk
+                .selector
+                .negative()
+                .iter()
+                .any(|p| p.matches(entry.path))
+            || !crate::access::reads(rules, name)
+        {
+            return Ok(());
         }
-        if !names.is_empty() {
-            selection
-                .collections
-                .insert(id, names.into_iter().collect());
+        if let Some((bytes, target)) = read_listed_ref(repo, MIRRORS_DIR, &entry, access)? {
+            let commit = parse_ref_content(&bytes)?;
+            if names.is_empty() {
+                floor.add_collection(id)?;
+            }
+            floor.add_ref(name)?;
+            names.insert(name.to_owned(), commit);
+            if let Some(target) = target {
+                aliases.insert(name.to_owned(), target);
+            }
         }
+        Ok(())
+    };
+    walk.walk(mirrors, id, rules, &mut take)?;
+    if !aliases.is_empty() {
+        selection.collection_aliases.insert(id.to_owned(), aliases);
+    }
+    if !names.is_empty() {
+        selection
+            .collections
+            .insert(id.to_owned(), names.into_iter().collect());
     }
     Ok(())
 }
@@ -1613,6 +1788,12 @@ fn first_part_reaches(parts: &[&str], id: &str) -> bool {
         Some((first, rest)) => !rest.is_empty() && (*first == "*" || *first == id),
         None => false,
     }
+}
+
+/// Returns `true` if a negative pattern of `selector` is `**`. That pattern
+/// matches each name, so `selector` selects no name.
+fn selects_no_name(selector: &RefSelector) -> bool {
+    selector.negative().iter().any(|p| p.as_str() == "**")
 }
 
 /// Returns the leading parts of each negative pattern of `selector` that

@@ -1502,6 +1502,62 @@ fn a_ref_listing_skips_a_directory_that_a_negative_entry_covers() {
     });
 }
 
+/// A selector of the local refs with the negative entry `**` reads neither
+/// `refs/heads` nor the mirror directory of the collection id of the
+/// repository. A listing with it and an unreadable directory of each
+/// succeeds, with or without collection refs. A listing that reads these
+/// directories fails. The test returns at once for a user that ignores the
+/// mode.
+#[test]
+fn a_listing_with_no_local_ref_reads_no_local_directory() {
+    use std::os::unix::fs::PermissionsExt;
+    let (_tmp, repo_dir) = writable_fixture("summary-collection", "listing-no-local-dir");
+    block_on(async {
+        let repo = Repo::open(&repo_dir).await.unwrap();
+        let main = repo.list_refs(None).await.unwrap()[0].1;
+        set_mirror(&repo, COLLECTION_ID, "own", &main).await;
+        set_mirror(&repo, "org.a", "main", &main).await;
+        let access = collection_access("", "anonymous");
+        let locked = [
+            repo_dir.join("refs/heads"),
+            repo_dir.join("refs/mirrors").join(COLLECTION_ID),
+        ];
+        for dir in &locked {
+            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o000)).unwrap();
+        }
+        let restore = || {
+            for dir in &locked {
+                std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+        };
+        if locked.iter().any(|dir| std::fs::read_dir(dir).is_ok()) {
+            restore();
+            return;
+        }
+        for collections in [None, Some(selector(&[]))] {
+            let all = repo
+                .build_ref_listing(&selector(&[]), collections.as_ref(), &access)
+                .await;
+            assert!(all.is_err(), "{collections:?}");
+        }
+        let none = list_with(&repo, &["!**"], None, &access).await;
+        assert!(listed_names(&none.bytes).is_empty());
+        let some = list_with(&repo, &["!**"], Some(&[]), &access).await;
+        assert!(listed_names(&some.bytes).is_empty());
+        assert_eq!(
+            collection_names(&some.bytes),
+            names_of(&[("org.a", &["main"])])
+        );
+        let some = list_with(&repo, &["a/**", "!**"], Some(&["org.a/**"]), &access).await;
+        assert!(listed_names(&some.bytes).is_empty());
+        assert_eq!(
+            collection_names(&some.bytes),
+            names_of(&[("org.a", &["main"])])
+        );
+        restore();
+    });
+}
+
 /// With no positive entry, the walk of a namespace reads only the
 /// directories that an allow item that gives `r` can match, and it skips a
 /// directory that a deny item of the group covers. A directory with mode 0
@@ -2015,8 +2071,9 @@ fn the_collection_map_follows_the_group_of_each_namespace() {
 /// is left out of the listing, and its ref files are not read, so their
 /// content fails no listing. The listing names each such directory one time,
 /// sorted byte-wise, whatever its selector selects. A file or a symlink at
-/// the top level, and a name that is not UTF-8, are left out with no report.
-/// A listing with no selector of the collection refs reads none of them.
+/// the top level, and a name that is not UTF-8, are left out with no report,
+/// also when the name passes the collection-id rule. A listing with no
+/// selector of the collection refs reads none of them.
 /// The archive view does not serve a ref of such a directory.
 #[test]
 fn a_listing_leaves_out_an_invalid_collection_directory() {
@@ -2026,11 +2083,20 @@ fn a_listing_leaves_out_an_invalid_collection_directory() {
         let repo = Repo::open(&repo_dir).await.unwrap();
         let (_, main) = repo.list_refs(None).await.unwrap()[0].clone();
         set_mirror(&repo, "org.a", "main", &main).await;
-        for path in ["bad/x", "bad/y/z", "a..b/x", "1a.b/main", "file"] {
+        for path in [
+            "bad/x",
+            "bad/y/z",
+            "a..b/x",
+            "1a.b/main",
+            "file",
+            "org.file",
+        ] {
             write_mirror_file(&repo_dir, path, "no checksum\n");
         }
         let mirrors = repo_dir.join("refs/mirrors");
         std::os::unix::fs::symlink("bad", mirrors.join("link")).unwrap();
+        std::os::unix::fs::symlink("org.a", mirrors.join("org.link")).unwrap();
+        std::os::unix::fs::symlink("org.absent", mirrors.join("org.gone")).unwrap();
         let raw = mirrors.join(std::ffi::OsStr::from_bytes(b"\xff.b"));
         std::fs::create_dir(&raw).unwrap();
         std::fs::write(raw.join("main"), "no checksum\n").unwrap();

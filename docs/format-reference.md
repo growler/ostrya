@@ -352,6 +352,9 @@ same rule for the ref files and the aliases that the port writes. It reads
 is absent, is a directory, has a parent that is a file, or is longer than
 the system accepts. For each other collection id, it reads
 `refs/mirrors/ID/NAME` alone. The read takes no lock.
+`Repo::list_collection_refs_in` lists the refs of the collection `ID` by the
+same rule: the mirror ref wins, and the listing does not read the
+`refs/heads/NAME` that it hides.
 
 A symlink that the port does not write can make the resolve and the ref
 listing give different results. Examples are a symlink to a directory in

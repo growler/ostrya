@@ -24216,9 +24216,9 @@ fn commit_tar_source_matches_the_tool() {
 }
 
 /// If the pathname of an archive member has a byte that is not valid UTF-8,
-/// ostrya and the `ostree` command refuse it. Both exit 1 with the same words.
-/// The `run:` grammar writes no archive, so the cell
-/// `commit/tree-tar-pathname-not-utf8` cites this test.
+/// ostrya and the `ostree` command refuse it. Both exit 1, with standard
+/// output empty and no ref written. The `run:` grammar writes no archive, so
+/// the cell `commit/tree-tar-pathname-not-utf8` cites this test.
 #[test]
 fn commit_tar_pathname_not_utf8_is_refused() {
     if !ostree_available() {
@@ -24229,17 +24229,30 @@ fn commit_tar_pathname_not_utf8_is_refused() {
     let (port_repo, tool_repo) = create_repo_pair(base, RepoMode::Archive);
     let archive = base.join("invalid-pathname.tar");
     pack_invalid_pathname(&archive);
-    assert_agrees_on_error(
-        &port_repo,
-        &tool_repo,
-        &[
-            "commit",
-            "-b",
-            "conformance",
-            FIXED_TIMESTAMP,
-            &format!("--tree=tar={}", archive.display()),
-        ],
-        "error: Archive entry pathname is not valid UTF-8",
+    let tree = format!("--tree=tar={}", archive.display());
+    let args = ["commit", "-b", "conformance", FIXED_TIMESTAMP, &tree];
+    let (port, tool) = run_both(&port_repo, &tool_repo, &args);
+    let label = args.join(" ");
+    // The two commands use different words for the refusal. This is a
+    // recorded divergence. The requirement is the exit status, the empty
+    // standard output, and no written ref.
+    for (who, run) in [("port", &port), ("tool", &tool)] {
+        assert_eq!(run.status.code(), Some(1), "the {who} accepted `{label}`");
+        assert!(
+            run.stdout.is_empty(),
+            "the {who} printed a checksum for `{label}`",
+        );
+    }
+    assert_eq!(
+        describe_refs(&port_repo),
+        describe_refs(&tool_repo),
+        "`{label}` left different refs",
+    );
+    assert!(
+        !describe_refs(&port_repo)
+            .iter()
+            .any(|row| row.contains("conformance")),
+        "`{label}` wrote a ref",
     );
 }
 

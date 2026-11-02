@@ -7923,13 +7923,14 @@ setup: repo
 outcome: refused-both
 severity: interop
 evidence: ostrya_cli::cli::commit_tar_pathname_not_utf8_is_refused
-spec: cli-behavior.md#commit
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
 note: a member whose pathname holds a byte that is not valid UTF-8 is refused by
- both at exit 1, in the same words, `error: Archive entry pathname is not valid
- UTF-8`, and neither writes a commit. The `run:` grammar writes no archive and
- no setup binds one holding such a byte, so the cited test packs the header
- blocks itself: a `./` root member and one regular file whose name holds the
- byte `0xFF`.
+ both at exit 1, with standard output empty, and neither writes a commit or a
+ ref. The two word the refusal differently, which `cli-surface.md`, "P2"
+ records, so `stderr-text` is not an oracle here. The `run:` grammar writes no
+ archive and no setup binds one holding such a byte, so the cited test packs the
+ header blocks itself: a `./` root member and one regular file whose name holds
+ the byte `0xFF`.
 
 family: M10
 subcommand: commit

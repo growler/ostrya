@@ -13,12 +13,16 @@
 
 use std::collections::HashMap;
 use std::future::Future;
+use std::io;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll, ready};
 use std::time::{Duration, UNIX_EPOCH};
 
-use futures_io::{AsyncRead, AsyncWrite};
+use futures_io::{AsyncBufRead, AsyncRead, AsyncWrite};
 use futures_lite::StreamExt;
+use futures_lite::io::BufReader;
 use ostrya_core::{Checksum, Commit, DirMeta, Xattrs};
 use smol_tar::{
     AttrList, TarDirectory, TarEntry, TarLink, TarReader, TarRegularFile, TarSymlink, TarWriter,
@@ -26,13 +30,14 @@ use smol_tar::{
 
 use crate::checkout::is_root_path;
 use crate::error::{Error, Result};
-use crate::file::{FileKind, FileObject};
+use crate::file::{ContentReader, FileKind, FileObject};
 use crate::ingest::{adjust_meta, finalize_meta, to_dirmeta};
 use crate::modifier::{CommitModifier, CommitModifierFlags, FilterResult, Owner};
 use crate::mtree::{ChildKind, MutableTree};
 use crate::repo::Repo;
 use crate::transaction::{FileMeta, Transaction};
 use crate::tree::{RepoTree, TreeEntry};
+use crate::write::COPY_CHUNK;
 
 /// The `S_IFDIR` file-type bits in the `st_mode` of a directory.
 const S_IFDIR: u32 = 0o040000;
@@ -43,9 +48,83 @@ const PERM_MASK: u32 = 0o7777;
 
 /// A boxed payload reader that does not depend on the runtime. One type
 /// serves all entry kinds, so one [`TarWriter`] instance serves the whole
-/// stream. `Pin<Box<..>>` is `Unpin`, which the writer requires of the body
-/// reader.
-type BodyReader = Pin<Box<dyn AsyncRead + Send>>;
+/// stream. The writer requires a body reader that implements `AsyncBufRead`
+/// and `Unpin`. `Pin<Box<..>>` is `Unpin`.
+type BodyReader = Pin<Box<dyn AsyncBufRead + Send>>;
+
+/// The body of a regular file member of the export.
+///
+/// The body gives `AsyncBufRead` over the [`ContentReader`] of the file. Its
+/// buffer comes from `spare` and goes back to `spare` when the writer drops
+/// the body at the end of the member. So the export uses one buffer of at
+/// most [`COPY_CHUNK`] bytes for all its files.
+struct Body {
+    reader: ContentReader,
+    buf: Vec<u8>,
+    pos: usize,
+    cap: usize,
+    spare: Arc<Mutex<Vec<u8>>>,
+}
+
+impl Body {
+    /// Takes the buffer from `spare`, and grows it to the size of the file,
+    /// at least 1 byte and at most [`COPY_CHUNK`] bytes.
+    fn new(reader: ContentReader, size: u64, spare: &Arc<Mutex<Vec<u8>>>) -> Body {
+        let mut buf = spare
+            .lock()
+            .map(|mut s| std::mem::take(&mut *s))
+            .unwrap_or_default();
+        let want = size.clamp(1, COPY_CHUNK as u64) as usize;
+        if buf.len() < want {
+            buf.resize(want, 0);
+        }
+        Body {
+            reader,
+            buf,
+            pos: 0,
+            cap: 0,
+            spare: Arc::clone(spare),
+        }
+    }
+}
+
+impl Drop for Body {
+    fn drop(&mut self) {
+        if let Ok(mut spare) = self.spare.lock() {
+            *spare = std::mem::take(&mut self.buf);
+        }
+    }
+}
+
+impl AsyncRead for Body {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        out: &mut [u8],
+    ) -> Poll<io::Result<usize>> {
+        let available = ready!(self.as_mut().poll_fill_buf(cx))?;
+        let n = available.len().min(out.len());
+        out[..n].copy_from_slice(&available[..n]);
+        self.consume(n);
+        Poll::Ready(Ok(n))
+    }
+}
+
+impl AsyncBufRead for Body {
+    fn poll_fill_buf(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<&[u8]>> {
+        let me = self.get_mut();
+        if me.pos >= me.cap {
+            me.cap = ready!(Pin::new(&mut me.reader).poll_read(cx, &mut me.buf))?;
+            me.pos = 0;
+        }
+        Poll::Ready(Ok(&me.buf[me.pos..me.cap]))
+    }
+
+    fn consume(self: Pin<&mut Self>, amt: usize) {
+        let me = self.get_mut();
+        me.pos = (me.pos + amt).min(me.cap);
+    }
+}
 
 /// The options of [`Repo::export_tar`].
 #[derive(Debug, Default, Clone)]
@@ -235,6 +314,8 @@ impl Repo {
     ///   the repository mode.
     /// - [`Error::Io`] if an xattr name holds a byte that is not graphic
     ///   ASCII, or holds `=`.
+    /// - [`Error::Io`] if the header blocks of a member, its PAX records
+    ///   included, are larger than 128 KiB. Large xattr values can cause this.
     /// - [`Error::Io`] if a write to `out` fails, or if a read of the object
     ///   store fails.
     pub async fn export_tar(
@@ -258,6 +339,7 @@ impl Repo {
         collect(self, root, member_prefix, &mut items, &mut seen).await?;
 
         let mut writer = TarWriter::<'_, '_, _, BodyReader>::new(out);
+        let spare = Arc::new(Mutex::new(Vec::new()));
         for item in items {
             match item {
                 Item::Dir { path, meta } => {
@@ -271,7 +353,7 @@ impl Repo {
                 }
                 Item::Regular { path, file, size } => {
                     let attrs = export_attrs(&file.xattrs, &opts)?;
-                    let body: BodyReader = Box::pin(file.reader().await?);
+                    let body: BodyReader = Box::pin(Body::new(file.reader().await?, size, &spare));
                     let entry = TarRegularFile::new(path, size, body)
                         .with_uid(file.uid)
                         .with_gid(file.gid)
@@ -377,6 +459,22 @@ impl Repo {
     /// target of a hardlink member goes through the same normalization and the
     /// same hook.
     ///
+    /// # Extended attributes
+    ///
+    /// Each `SCHILY.xattr.<name>` record of a member gives one extended
+    /// attribute. If two records of a member have the same name, the import
+    /// keeps the value of the last record. The `ostree` command keeps both
+    /// values, so it writes a different file object for such a member.
+    ///
+    /// # Global headers
+    ///
+    /// A pax global header (typeflag `g`) gives its `uid`, `gid`, and
+    /// `SCHILY.xattr.<name>` records to each member that follows it. A record
+    /// of the member replaces the global record of the same name. A global
+    /// `path`, `linkpath`, or `size` record has no effect. The `ostree`
+    /// command ignores a global header, so it writes different objects for
+    /// such an archive.
+    ///
     /// # Modifier
     ///
     /// `modifier` shapes each member as it shapes a walk of a file system,
@@ -389,8 +487,6 @@ impl Repo {
     ///
     /// # Errors
     ///
-    /// - [`Error::TarPathname`] if the pathname of a member is not valid
-    ///   UTF-8.
     /// - [`Error::Tar`] if the archive holds a device node or a FIFO member.
     /// - [`Error::Tar`] if a pathname has a `..` component.
     /// - [`Error::Tar`] if a regular file, symlink, or hardlink member has an
@@ -406,8 +502,8 @@ impl Repo {
     ///   where the tree holds a file.
     /// - [`Error::ReplaceDirWithFile`] if a regular file, symlink, or hardlink
     ///   member names a path where the tree holds a directory.
-    /// - [`Error::Core`] if two `SCHILY.xattr.*` records of a member have the
-    ///   same name, or if a record name is empty or holds a NUL byte.
+    /// - [`Error::Core`] if the name of a `SCHILY.xattr.*` record is empty or
+    ///   holds a NUL byte.
     /// - An error from a callback of the modifier. For example,
     ///   [`Error::InvalidFormat`] if the modifier sets
     ///   [`ERROR_ON_UNLABELED`](crate::CommitModifierFlags::ERROR_ON_UNLABELED)
@@ -420,6 +516,11 @@ impl Repo {
     ///   object store.
     /// - [`Error::Io`] if a read from `input` fails, or if a member header is
     ///   malformed.
+    /// - [`Error::Io`] with the kind `InvalidData` if a text field of a member
+    ///   header is not valid UTF-8: the pathname, the link target, the user
+    ///   name, the group name, or the value of a pax `atime`, `ctime`,
+    ///   `mtime`, `size`, `uid`, or `gid` record. The `ostree` command accepts
+    ///   a user name and a group name that are not valid UTF-8.
     /// - The error that the [`rename`](TarImportOptions::rename) hook returns.
     pub async fn import_tar_into(
         &self,
@@ -429,7 +530,7 @@ impl Repo {
         mtree: &mut MutableTree,
         mut modifier: Option<&mut CommitModifier>,
     ) -> Result<()> {
-        let mut reader = TarReader::new(input);
+        let mut reader = TarReader::new(BufReader::with_capacity(COPY_CHUNK, input));
         let flags = modifier
             .as_deref()
             .map_or(CommitModifierFlags::empty(), |m| m.flags);
@@ -444,7 +545,7 @@ impl Repo {
         let mut synthesized: Option<(u32, u32)> = None;
 
         while let Some(entry) = reader.next().await {
-            let entry = entry.map_err(read_error)?;
+            let entry = entry.map_err(Error::Io)?;
             match entry {
                 TarEntry::Directory(dir) => {
                     let comps = member_path(dir.path(), true, &mut opts)?;
@@ -830,28 +931,6 @@ fn collect<'a>(
         }
         Ok(())
     })
-}
-
-/// Converts a read error of a tar member header to an [`Error`]. The reader
-/// reports a pathname that is not valid UTF-8 as an `InvalidData` I/O error.
-/// ostrya stores pathnames as text, so it reports this case as the `ostree`
-/// command does.
-fn read_error(err: std::io::Error) -> Error {
-    // The match uses the message text of the dependency. smol-tar 0.1.7, the
-    // registry version that the workspace resolves, spells it `utf8 in file
-    // path`, and `Cargo.lock` records that version. If that text changes
-    // upstream, the failure stays an `Error::Io`.
-    // `import_rejects_a_pathname_that_is_not_utf8` in
-    // `crates/ostrya/tests/tar.rs` asserts `Error::TarPathname` and fails
-    // when the text moves. `commit_tar_pathname_not_utf8_is_refused` in the
-    // CLI tests holds the same case against the `ostree` command, if it is
-    // installed.
-    if err.kind() == std::io::ErrorKind::InvalidData
-        && err.to_string().contains("utf8 in file path")
-    {
-        return Error::TarPathname;
-    }
-    Error::Io(err)
 }
 
 /// Returns the name of a directory entry of either kind.

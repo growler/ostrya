@@ -94,12 +94,11 @@ bsdiff = "0.2.1"
 pin-project-lite = "0.2"
 futures-io = "0.3"
 futures-lite = "2"
-smol-tar = { version = "0.1.7", default-features = false, features = ["smol"] }
+smol-tar = { version = "0.2.0", default-features = false, features = ["smol"] }
 
 [dev-dependencies]
 ostrya-rt = { workspace = true }
 futures-lite = "2"
-smol-tar = { version = "0.1.7", default-features = false, features = ["smol"] }
 # The fetcher tests and the HTTP pull tests serve requests from an in-process
 # HTTP/1.1 and HTTP/2 server, over cleartext and over TLS, and one fetcher
 # test sends a request through a hyper client. The fetcher and its TLS stack

@@ -279,12 +279,6 @@ pub enum Error {
     /// - an export subpath that is absent or is not a directory
     #[error("tar: {0}")]
     Tar(String),
-    /// A tar member whose pathname is not valid UTF-8.
-    ///
-    /// This crate stores pathnames as text, so such a member has no name to
-    /// import it under.
-    #[error("Archive entry pathname is not valid UTF-8")]
-    TarPathname,
     /// A failure to remove an entry of the source under
     /// [`CONSUME`](crate::CommitModifierFlags::CONSUME).
     ///

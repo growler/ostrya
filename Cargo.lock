@@ -2639,11 +2639,10 @@ dependencies = [
 
 [[package]]
 name = "smol-tar"
-version = "0.1.7"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9f52667e55e7c7e8c0cd550b11c797ce2adf1df5c2f2a6089b2925c62b07259b"
+checksum = "bc9872e718e16c2a3963501f3261e2c98b7ad49ce654a8d77f7dfe6b0362d11b"
 dependencies = [
- "async-lock",
  "futures-core",
  "futures-io",
  "futures-sink",

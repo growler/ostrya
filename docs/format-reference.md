@@ -2707,7 +2707,10 @@ uses the member naming of `ostree export` (`./` root, bare relative names, a
 trailing slash on a directory), numeric ownership, and the commit timestamp as
 the mtime. It writes a regular file as a hardlink when an earlier member has
 the same content checksum. It never writes a symlink as a hardlink. A hardlink
-member header carries mtime 0, mode 0, and owner 0:0.
+member header carries mtime 0, mode 0, and owner 0:0. The header blocks of one
+member, its pax records included, are at most 128 KiB. A member with more
+header bytes, for example from large xattr values, stops the export with an
+error.
 
 The export writes each extended attribute of an entry as a `SCHILY.xattr.<name>`
 PAX record with the exact value bytes. Thus an xattr-bearing tree survives an
@@ -2757,7 +2760,31 @@ commits to one tree checksum. `--canonical-permissions` leaves the mode of a
 symlink as the member set it, as the filesystem walk does, so each of these
 values stays unchanged.
 
-`Repo::import_tar_into` follows each rule of this section. It reads into a
+Observed behavior: the tool reads the member headers by these rules.
+
+- A pathname and a link target must be valid UTF-8. The ustar name and prefix
+  fields, a GNU long name, and a pax `path` or `linkpath` record follow the
+  same rule. The tool refuses a member that breaks it, and writes no commit.
+- The header of a symlink member holds no data. A symlink member whose size
+  field is not 0 is refused: the tool reads the data block that follows as the
+  next header, and reports a bad header checksum.
+- A pax global header (typeflag `g`) changes no member. A `path` or a `size`
+  record in it does not apply to the members that follow.
+- An old-format member (no magic field) with typeflag `0` or NUL whose name
+  ends in `/` is a directory.
+- The user name and the group name of a header have no effect on the tree. A
+  name that is not valid UTF-8 does not stop the import.
+- Two `SCHILY.xattr.<name>` records of one member with the same name give two
+  xattrs of that name in the file header. Both values are kept.
+
+`conformance/cli-surface.md`, "P2", `commit`, records where the port parts
+from the rule of the pax global header and from the last two rules. The port
+gives the `uid`, `gid`, and `SCHILY.xattr.<name>` records of a global header
+to each member that follows it. It refuses a user name or a group name that is
+not valid UTF-8. It keeps the last value of two xattr records with the same
+name.
+
+`Repo::import_tar_into` follows each other rule of this section. It reads into a
 tree that an earlier source filled. So one archive composes with a filesystem
 source and with a committed tree under one modifier.
 `TarImportOptions::owner_uid` and `owner_gid` also set the owner of a parent

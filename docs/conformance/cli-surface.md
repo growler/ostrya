@@ -894,10 +894,18 @@ expression that leaves it empty is a match on nothing and is not this case.
 The fifth is the wording of an entry the tar reader refuses. Both refuse a
 device node and a FIFO; the tool reports `error: Unsupported file type for path
 "<name>"` and the port reports its own line under `error: tar:`. A member whose
-pathname is not valid UTF-8 is refused by both with the same line,
-`error: Archive entry pathname is not valid UTF-8`, at exit 1, and a member whose
 parent no member names is refused by both with `error: No such file or directory:
-<name>`.
+<name>`. A member whose pathname or link target is not valid UTF-8 is refused
+by both at exit 1, with standard output empty and no ref written. The tool
+reports `error: Archive entry pathname is not valid UTF-8` for a pathname and
+`error: Archive entry symlink target is not valid UTF-8` for a link target. The
+port reports the error text of its tar reader under `error: i/o error:`:
+`invalid utf8 in file path` for the ustar name, prefix, and link name fields,
+and `invalid UTF-8` for a GNU long name and a pax `path` or `linkpath` record.
+A symlink member whose size
+field is not 0 is refused by both at exit 1. The tool reports `error: Damaged
+tar archive (bad header checksum)`, and the port reports `error: i/o error:
+symlink entry has a non-zero size`.
 
 A file member that lands where an earlier member made a directory is refused by
 both at exit 1, with no commit written and with the same message body,
@@ -963,10 +971,34 @@ above (`cli-behavior.md`, "The tar import options").
 
 Not observed: the xattrs that the tool records under `--canonical-permissions`
 over a `tar=` source. No observation of the tool covers an archive that
-carries xattrs, so this case is not counted among the seven above. The port
-keeps the xattrs that the archive carries under the option (`shape` in
-`crates/ostrya/src/tar.rs`). Over a filesystem walk, both record no xattrs
-under the option (`../format-reference.md`, "Canonical permissions").
+carries xattrs under the option, so this case is not counted among the seven
+above. The port keeps the xattrs that the archive carries under the option
+(`shape` in `crates/ostrya/src/tar.rs`). Over a filesystem walk, both record no
+xattrs under the option (`../format-reference.md`, "Canonical permissions").
+
+Three outcomes of a `tar=` source part, and none is counted among the seven
+above (`../format-reference.md`, "The tar import"):
+
+- a member whose user name or group name is not valid UTF-8. The tool imports
+  it at exit 0, and the name has no effect on the tree. The port refuses the
+  commit with `error: i/o error: invalid UTF-8` at exit 1 and writes no object
+  and no ref. The tar reader of the port decodes each name as text, and the
+  import gets no member from it. Not observed: a pax `atime`, `ctime`,
+  `mtime`, `size`, `uid`, or `gid` record that is not valid UTF-8. The port
+  refuses it with the same line;
+- a member with two `SCHILY.xattr.<name>` records of the same name. The tool
+  stores both values. The port stores the value of the last record alone, so
+  the two write different file objects and different commit checksums. The tar
+  reader of the port keeps one value for each name, so the import does not get
+  the first record. No matrix cell states the case;
+- an archive with a pax global header (typeflag `g`). The tool ignores the
+  global header. The port gives its `uid`, `gid`, and `SCHILY.xattr.<name>`
+  records to each member that follows it, and a record of the member replaces
+  the global record of the same name. So the two write different file objects,
+  dirmeta objects, and commit checksums when the global header holds one of
+  these records. A global `path`, `linkpath`, or `size` record has no effect in
+  either. A global `mtime`, `atime`, `ctime`, `uname`, or `gname` record has no
+  effect on the tree of the port. No matrix cell states the case.
 
 The walk of a filesystem source carries divergences apart from the seven
 above: the wording of each refusal of an entry, and two outcomes. The walk

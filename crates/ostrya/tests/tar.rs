@@ -195,6 +195,76 @@ fn identical_files_dedup_to_hardlink() {
     });
 }
 
+/// The export writes the body of each regular file with the same bytes. The
+/// files are smaller and larger than the 64 KiB body buffer, and a small file
+/// follows a large file, so the export uses one buffer for files of different
+/// sizes. The repositories are in the `archive` mode, which inflates each
+/// payload, and in the `bare-user` mode, which reads each payload raw.
+#[test]
+fn export_writes_file_bodies_of_each_size() {
+    use futures_lite::AsyncReadExt;
+
+    let files: Vec<(&str, Vec<u8>)> = [("a", 1), ("b", 200_000), ("c", 3), ("d", 70_000)]
+        .into_iter()
+        .map(|(name, len)| {
+            let body = (0..len).map(|i| (i * 7 + name.len()) as u8 ^ name.as_bytes()[0]);
+            (name, body.collect())
+        })
+        .collect();
+    let mut sink = Cursor::new(Vec::new());
+    block_on(async {
+        let mut writer = TarWriter::<'_, '_, _, TestBody>::new(&mut sink);
+        writer.write(TarDirectory::new("./").into()).await.unwrap();
+        for (name, body) in &files {
+            let entry = TarRegularFile::new(*name, body.len() as u64, Cursor::new(body.clone()));
+            writer.write(entry.into()).await.unwrap();
+        }
+        writer.finish().await.unwrap();
+    });
+    let built = sink.into_inner();
+
+    for mode in [RepoMode::Archive, RepoMode::BareUser] {
+        let tmp = TmpDir::new("tar-export-sizes");
+        block_on(async {
+            let repo = Repo::create(&tmp.path().join("repo"), CreateOptions::new(mode))
+                .await
+                .unwrap();
+            let txn = repo.transaction().await.unwrap();
+            let mut mtree = repo
+                .import_tar(&txn, TarImportOptions::new(), Cursor::new(built.clone()))
+                .await
+                .unwrap();
+            let root = txn.write_mtree(&mut mtree).await.unwrap();
+            let commit = txn
+                .write_commit(CommitOptions::default(), &root)
+                .await
+                .unwrap();
+            txn.commit().await.unwrap();
+
+            let mut out = Cursor::new(Vec::new());
+            repo.export_tar(&commit, TarExportOptions::new(), &mut out)
+                .await
+                .unwrap();
+            let exported = out.into_inner();
+            let mut reader = TarReader::new(Cursor::new(exported));
+            let mut seen = Vec::new();
+            while let Some(entry) = reader.next().await {
+                if let TarEntry::File(mut file) = entry.unwrap() {
+                    let name = file.path().to_owned();
+                    let mut body = Vec::new();
+                    file.read_to_end(&mut body).await.unwrap();
+                    seen.push((name, body));
+                }
+            }
+            let want: Vec<(String, Vec<u8>)> = files
+                .iter()
+                .map(|(name, body)| (name.to_string(), body.clone()))
+                .collect();
+            assert_eq!(seen, want, "{mode:?}: file bodies");
+        });
+    }
+}
+
 /// `etc_to_usr_etc` rewrites a top-level `etc` component to `usr/etc`.
 #[test]
 fn etc_migration_remaps_top_level_etc() {
@@ -436,13 +506,112 @@ fn import_rejects_unsupported_nodes() {
     });
 }
 
-/// The import refuses a member with a pathname that is not valid UTF-8. This
-/// crate stores pathnames as text. The decode failure of the reader returns as
-/// [`ostrya::Error::TarPathname`]. The message of this error is the line that
-/// the CLI prints.
+/// The import refuses each text field of a member that is not valid UTF-8.
+/// The archives put the byte `0xFF` in the pathname, the GNU long name, the
+/// PAX `path` record, the link target, the PAX `linkpath` record, and the
+/// user name. Each decode failure of the reader returns as
+/// [`ostrya::Error::Io`] with the kind `InvalidData`.
 #[test]
-fn import_rejects_a_pathname_that_is_not_utf8() {
-    let tmp = TmpDir::new("tar-pathname");
+fn import_rejects_text_fields_that_are_not_utf8() {
+    let mut long_name = vec![b'd'; 120];
+    long_name.extend_from_slice(b"\xFF\0");
+    let pax_path = pax_body(&[(b"path", b"b\xFF")]);
+    let pax_linkpath = pax_body(&[(b"linkpath", b"t\xFF")]);
+    let cases: [(&str, Vec<u8>); 6] = [
+        ("ustar name", invalid_pathname_tar()),
+        (
+            "GNU long name",
+            raw_tar(&[
+                (
+                    header_block(GNU, b"././@LongLink", 0o644, b'L', long_name.len(), &[]),
+                    &long_name,
+                ),
+                (
+                    header_block(GNU, &long_name[..99], 0o644, b'0', 0, &[]),
+                    b"",
+                ),
+            ]),
+        ),
+        (
+            "PAX path",
+            raw_tar(&[
+                (
+                    header_block(USTAR, b"./PaxHeaders/b", 0o644, b'x', pax_path.len(), &[]),
+                    &pax_path,
+                ),
+                (header_block(USTAR, b"b", 0o644, b'0', 0, &[]), b""),
+            ]),
+        ),
+        (
+            "ustar linkname",
+            raw_tar(&[(
+                header_block(USTAR, b"l", 0o777, b'2', 0, &[(LINKNAME, b"t\xFF")]),
+                b"",
+            )]),
+        ),
+        (
+            "PAX linkpath",
+            raw_tar(&[
+                (
+                    header_block(
+                        USTAR,
+                        b"./PaxHeaders/l",
+                        0o644,
+                        b'x',
+                        pax_linkpath.len(),
+                        &[],
+                    ),
+                    &pax_linkpath,
+                ),
+                (
+                    header_block(USTAR, b"l", 0o777, b'2', 0, &[(LINKNAME, b"t")]),
+                    b"",
+                ),
+            ]),
+        ),
+        (
+            "ustar uname",
+            raw_tar(&[(
+                header_block(USTAR, b"u", 0o644, b'0', 0, &[(UNAME, b"r\xFF")]),
+                b"",
+            )]),
+        ),
+    ];
+    block_on(async {
+        for (case, built) in cases {
+            let tmp = TmpDir::new("tar-text-field");
+            let repo = Repo::create(
+                &tmp.path().join("repo"),
+                CreateOptions::new(RepoMode::Archive),
+            )
+            .await
+            .unwrap();
+            let txn = repo.transaction().await.unwrap();
+            let err = repo
+                .import_tar(&txn, TarImportOptions::new(), Cursor::new(built))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(&err, ostrya::Error::Io(e) if e.kind() == std::io::ErrorKind::InvalidData),
+                "{case}: got {err:?}"
+            );
+            txn.abort().await.unwrap();
+        }
+    });
+}
+
+/// The import refuses a symlink member with a size that is not 0. The member
+/// has the size 6 and one data block that holds the target. The reader refuses
+/// the member, and the error returns as [`ostrya::Error::Io`]. The `ostree`
+/// command also refuses this archive, because it reads the data block as the
+/// next header.
+#[test]
+fn import_rejects_a_symlink_with_a_data_block() {
+    let built = raw_tar(&[(
+        header_block(USTAR, b"l", 0o777, b'2', 6, &[(LINKNAME, b"target")]),
+        b"target",
+    )]);
+    let tmp = TmpDir::new("tar-symlink-data");
     block_on(async {
         let repo = Repo::create(
             &tmp.path().join("repo"),
@@ -452,15 +621,57 @@ fn import_rejects_a_pathname_that_is_not_utf8() {
         .unwrap();
         let txn = repo.transaction().await.unwrap();
         let err = repo
-            .import_tar(
-                &txn,
-                TarImportOptions::new(),
-                Cursor::new(invalid_pathname_tar()),
-            )
+            .import_tar(&txn, TarImportOptions::new(), Cursor::new(built))
             .await
             .unwrap_err();
-        assert!(matches!(err, ostrya::Error::TarPathname), "got {err:?}");
+        assert!(matches!(err, ostrya::Error::Io(_)), "got {err:?}");
         txn.abort().await.unwrap();
+    });
+}
+
+/// A PAX extended header holds two records for one xattr:
+/// `SCHILY.xattr.user.a=1` and then `SCHILY.xattr.user.a=2`. The import keeps
+/// the last record. The file object carries one xattr `user.a` with the value
+/// `2`. The `ostree` command stores both values, so the port writes a
+/// different file object. This is a recorded divergence.
+#[test]
+fn import_keeps_the_last_pax_record_of_an_xattr() {
+    let pax = pax_body(&[
+        (b"SCHILY.xattr.user.a", b"1"),
+        (b"SCHILY.xattr.user.a", b"2"),
+    ]);
+    let body = b"xattr\n";
+    let built = raw_tar(&[
+        (
+            header_block(USTAR, b"./PaxHeaders/f", 0o644, b'x', pax.len(), &[]),
+            &pax,
+        ),
+        (
+            header_block(USTAR, b"f", 0o644, b'0', body.len(), &[]),
+            body,
+        ),
+    ]);
+    let tmp = TmpDir::new("tar-xattr-twice");
+    block_on(async {
+        let repo = Repo::create(
+            &tmp.path().join("repo"),
+            CreateOptions::new(RepoMode::Archive),
+        )
+        .await
+        .unwrap();
+        let txn = repo.transaction().await.unwrap();
+        let mut mtree = repo
+            .import_tar(&txn, TarImportOptions::new(), Cursor::new(built))
+            .await
+            .unwrap();
+        let root = txn.write_mtree(&mut mtree).await.unwrap();
+        txn.commit().await.unwrap();
+
+        let tree = repo.load_dirtree(root.dirtree_checksum()).await.unwrap();
+        let file = tree.files.iter().find(|(n, _)| n == "f").unwrap().1;
+        let file = repo.load_file(&file).await.unwrap();
+        let xattrs: Vec<(&[u8], &[u8])> = file.xattrs.iter().collect();
+        assert_eq!(xattrs, [(b"user.a\0".as_slice(), b"2".as_slice())]);
     });
 }
 
@@ -468,12 +679,23 @@ fn import_rejects_a_pathname_that_is_not_utf8() {
 /// byte `0xFF` in its name. [`TarWriter`] takes each pathname as text, so this
 /// function writes the two header blocks directly.
 fn invalid_pathname_tar() -> Vec<u8> {
+    raw_tar(&[(
+        header_block(USTAR, b"./b\xFFd.txt", 0o644, b'0', 6, &[]),
+        b"hello\n",
+    )])
+}
+
+/// Returns an archive with a `./` root member and then each member of
+/// `members`. A member is a header block and its data. The function pads the
+/// data of each member to a full block.
+fn raw_tar(members: &[([u8; 512], &[u8])]) -> Vec<u8> {
     let mut out: Vec<u8> = Vec::new();
-    out.extend_from_slice(&ustar_header(b"./", 0o755, b'5', 0));
-    let body = b"hello\n";
-    out.extend_from_slice(&ustar_header(b"./b\xFFd.txt", 0o644, b'0', body.len()));
-    out.extend_from_slice(body);
-    out.resize(out.len().next_multiple_of(512), 0);
+    out.extend_from_slice(&header_block(USTAR, b"./", 0o755, b'5', 0, &[]));
+    for (header, data) in members {
+        out.extend_from_slice(header);
+        out.extend_from_slice(data);
+        out.resize(out.len().next_multiple_of(512), 0);
+    }
     // Two zero blocks end the stream. Then the function pads the archive to the
     // size of a tar record.
     out.resize(out.len() + 1024, 0);
@@ -481,9 +703,27 @@ fn invalid_pathname_tar() -> Vec<u8> {
     out
 }
 
-/// Returns one 512-byte ustar header block. The function takes the name as
-/// bytes, so the name can hold bytes that are not valid UTF-8.
-fn ustar_header(name: &[u8], mode: u32, typeflag: u8, size: usize) -> [u8; 512] {
+/// The magic and version fields of a POSIX ustar header, at offset 257.
+const USTAR: &[u8; 8] = b"ustar\x0000";
+/// The magic and version fields of an old GNU header, at offset 257.
+const GNU: &[u8; 8] = b"ustar  \0";
+/// The offset of the link target field in a header block.
+const LINKNAME: usize = 157;
+/// The offset of the user name field in a header block.
+const UNAME: usize = 265;
+
+/// Returns one 512-byte header block with the magic and version `magic`. The
+/// function takes the name as bytes, so the name can hold bytes that are not
+/// valid UTF-8. Each item of `fields` is an offset and the bytes that the
+/// function writes there.
+fn header_block(
+    magic: &[u8; 8],
+    name: &[u8],
+    mode: u32,
+    typeflag: u8,
+    size: usize,
+    fields: &[(usize, &[u8])],
+) -> [u8; 512] {
     let mut h = [0u8; 512];
     let put = |h: &mut [u8; 512], at: usize, bytes: &[u8]| {
         h[at..at + bytes.len()].copy_from_slice(bytes);
@@ -498,11 +738,34 @@ fn ustar_header(name: &[u8], mode: u32, typeflag: u8, size: usize) -> [u8; 512] 
     // the field after the sum.
     put(&mut h, 148, b"        ");
     h[156] = typeflag;
-    put(&mut h, 257, b"ustar\0");
-    put(&mut h, 263, b"00");
+    put(&mut h, 257, magic);
+    for (at, bytes) in fields {
+        put(&mut h, *at, bytes);
+    }
     let sum: u32 = h.iter().map(|b| u32::from(*b)).sum();
     put(&mut h, 148, format!("{sum:06o}\0 ").as_bytes());
     h
+}
+
+/// Returns the data of a PAX extended header with one record for each item of
+/// `records`. A record is `<len> key=value\n`. The length counts the whole
+/// record, with its own digits.
+fn pax_body(records: &[(&[u8], &[u8])]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (key, value) in records {
+        // The space, the `=`, and the newline.
+        let rest = key.len() + value.len() + 3;
+        let mut len = rest;
+        while rest + len.to_string().len() != len {
+            len = rest + len.to_string().len();
+        }
+        out.extend_from_slice(format!("{len} ").as_bytes());
+        out.extend_from_slice(key);
+        out.push(b'=');
+        out.extend_from_slice(value);
+        out.push(b'\n');
+    }
+    out
 }
 
 /// Builds a one-member archive from a metadata-only entry.

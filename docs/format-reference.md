@@ -4930,6 +4930,24 @@ The pull writes `refs/mirrors/ID/REF`. In a repository with
 `[core] collection-id=ID`, it writes `refs/heads/REF`. It writes no ref under
 `refs/remotes/`.
 
+The library call `Repo::pull_local` with `PullOptions::collection_id` pulls
+collection refs from a local repository. It reads `refs/mirrors/ID/REF` of
+the source alone, also when `ID` is the `[core] collection-id` of the source.
+Each written ref names the commit that the pull read from the source. Unless
+the caller sets `no_ref_writes`, the pull writes the refs at the place above,
+and delta discovery reads the `from` commit of a delta at the same place. The
+pull refuses a tip commit whose `ostree.collection-binding` is absent, is not
+a string, or is not `ID`. It checks the `ostree.ref-binding` as each pull
+does, and `PullFlags::DISABLE_VERIFY_BINDINGS` skips that check alone. A
+local pull makes no timestamp check. The pull makes each check before it
+writes an object, a `.commitpartial` marker, or a ref. With ref writes, the
+remote name of the call selects only the `[remote "NAME"]` section whose
+verification keys apply, and the pull writes no ref under `refs/remotes/`.
+With `no_ref_writes`, the pull writes no ref and reads no
+`ostree.collection-binding`. The remote name then also selects the place
+where delta discovery reads the `from` commit of a delta:
+`refs/remotes/REMOTE/REF`, or `refs/heads/REF` with no remote name.
+
 ## Summaries of auth items
 
 The port writes the root summary ("Summary -- `(a(s(taya{sv}))a{sv})`") and

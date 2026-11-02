@@ -584,11 +584,7 @@ impl Repo {
         });
         end_sessions(unselected).await;
 
-        let place = if self.config().collection_id() == Some(collection_id) {
-            RefPlace::Heads
-        } else {
-            RefPlace::Collection(collection_id)
-        };
+        let place = RefPlace::of_collection(self, collection_id);
         let candidate_names: Vec<&str> = candidates.iter().map(|c| c.name).collect();
         let mut stats = PullStats::default();
         for (index, candidate) in candidates.into_iter().enumerate() {

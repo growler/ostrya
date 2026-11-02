@@ -58,8 +58,7 @@ for it.
   refuses a `metalink=` or `mirrorlist=` URL.
 - `Repo::pull` over HTTP refuses `collection_id`. `Repo::pull_collection`
   pulls collection refs.
-- `Repo::pull_local` refuses a subpath. It refuses `collection_id` unless
-  `no_ref_writes` is set.
+- `Repo::pull_local` refuses a subpath.
 - The HTTP pull of the port reads a 403 for an optional file as an error,
   for example for `summary.sig`, a `.commitmeta` object, or the superblock
   of a static delta. So the HTTP pull of the port stops at the first absent

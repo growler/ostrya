@@ -287,8 +287,12 @@ impl PullFlags {
     /// Without this flag, the pull checks that the `ostree.ref-binding` list of
     /// each pulled commit names the ref that the pull reads. A commit with no
     /// binding key passes. A commit with a list that does not name the ref
-    /// fails the pull with [`Error::Pull`]. [`Repo::pull_collection`] refuses
-    /// this flag, because it always checks the bindings. To pull a tip with no
+    /// fails the pull with [`Error::Pull`]. The flag does not skip the
+    /// collection-binding check of a local pull with
+    /// [`collection_id`](PullOptions::collection_id) and without
+    /// [`no_ref_writes`](PullOptions::no_ref_writes).
+    /// [`Repo::pull_collection`] refuses this flag, because it always checks
+    /// the bindings. To pull a tip with no
     /// collection binding, set
     /// [`CollectionPullOptions::allow_unbound`](crate::CollectionPullOptions::allow_unbound).
     pub const DISABLE_VERIFY_BINDINGS: PullFlags = PullFlags(1 << 3);
@@ -308,8 +312,11 @@ impl PullFlags {
     ///
     /// [`Repo::pull_local`] ignores this flag. It writes the pulled refs under
     /// the prefix that [`remote`](PullOptions::remote) names, or as local refs
-    /// if that is `None`. An empty [`refs`](PullOptions::refs) list takes each
-    /// ref of the source under `refs/heads`.
+    /// if that is `None`. With [`collection_id`](PullOptions::collection_id)
+    /// and without [`no_ref_writes`](PullOptions::no_ref_writes), it writes
+    /// the refs of the collection. An empty
+    /// [`refs`](PullOptions::refs) list takes each ref of the source under
+    /// `refs/heads`.
     pub const MIRROR: PullFlags = PullFlags(1 << 5);
 
     /// Returns the empty flag set.
@@ -561,7 +568,9 @@ pub struct PullOptions {
     /// If the value is `None`, a local pull and [`Repo::pull_with_session`]
     /// write local refs under `refs/heads/`. [`Repo::pull`] then writes the
     /// refs under the name of the remote. A pull from a remote writes local
-    /// refs under [`MIRROR`](PullFlags::MIRROR), whatever the value. Under
+    /// refs under [`MIRROR`](PullFlags::MIRROR), whatever the value. A local
+    /// pull with [`collection_id`](PullOptions::collection_id) writes the refs
+    /// of the collection, whatever the value. Under
     /// [`no_ref_writes`](PullOptions::no_ref_writes) the pull writes no ref,
     /// and the name still selects the ref that the pull reads.
     ///
@@ -614,18 +623,46 @@ pub struct PullOptions {
     /// of the collection ref. A path that names a directory, or that goes
     /// through a file, fails the same way.
     ///
-    /// The ref-binding check and delta discovery read the name alone, as
-    /// without the option. The pull does not read `ostree.collection-binding`.
+    /// The pull reads the collection ref of the source alone. It does not read
+    /// a `refs/heads` ref of a source whose `[core] collection-id` is the id,
+    /// so a name that such a source holds under `refs/heads` alone fails with
+    /// [`Error::RefNotFound`].
     ///
-    /// The id needs [`no_ref_writes`](PullOptions::no_ref_writes) and at least
-    /// one name in [`refs`](PullOptions::refs). Without them the local pull
-    /// fails with [`Error::Unsupported`]. If the ref store refuses the id or a
-    /// name, or if a name holds `:`, the pull fails with
-    /// [`Error::InvalidRefspec`], which carries `<id>:<name>`.
+    /// Without [`no_ref_writes`](PullOptions::no_ref_writes), the pull writes
+    /// each ref to `refs/mirrors/<id>/<name>`. If the id is the
+    /// `[core] collection-id` of this repository, the pull writes
+    /// `refs/heads/<name>` in its place. Each ref names the commit that the
+    /// pull read from the source. Delta discovery reads the `from` commit of a
+    /// delta at the same place. [`remote`](PullOptions::remote) selects only
+    /// the `[remote "NAME"]` section whose verification keys apply, and the
+    /// pull writes no `refs/remotes` ref.
     ///
-    /// Delta discovery reads the name as a refspec, where a `:` changes what
-    /// the name refers to. The local pull makes these checks in this order,
-    /// before it reads the source. [`Repo::pull`],
+    /// Without `no_ref_writes`, the pull also checks the
+    /// `ostree.collection-binding` of each tip commit. The pull fails with
+    /// [`Error::Pull`] if the key is absent, if its value is not a string, or
+    /// if it states another collection id. The pull makes this check before it
+    /// writes an object, a marker, or a ref.
+    /// [`DISABLE_VERIFY_BINDINGS`](PullFlags::DISABLE_VERIFY_BINDINGS) skips
+    /// the ref-binding check alone, and the collection-binding check stays on.
+    /// The ref-binding check reads the name alone, as without the option.
+    ///
+    /// With `no_ref_writes`, the pull reads no `ostree.collection-binding`.
+    /// The ref-binding check reads the name alone, as without the option.
+    /// Delta discovery reads the `from` commit of a delta at
+    /// `refs/remotes/<remote>/<name>`, or at `refs/heads/<name>` if `remote`
+    /// is `None`, as without the option.
+    ///
+    /// The id needs at least one name in [`refs`](PullOptions::refs). Without
+    /// a name the local pull fails with [`Error::Unsupported`]. If the ref
+    /// store refuses the id or a name, or if a name holds `:`, the pull fails
+    /// with [`Error::InvalidRefspec`], which carries `<id>:<name>`. The local
+    /// pull makes these checks in this order, before it reads the source.
+    ///
+    /// The pull refuses a `:` with and without `no_ref_writes`. If delta
+    /// discovery reads the ref under `refs/remotes` or `refs/heads`, it reads
+    /// the name as a refspec, where a `:` changes what the name refers to.
+    /// This occurs with `no_ref_writes`, and with ref writes if the id is the
+    /// `[core] collection-id` of this repository. [`Repo::pull`],
     /// [`Repo::pull_with_session`], and [`Repo::pull_collection`] refuse an id
     /// with [`Error::Unsupported`] before they send a request.
     /// [`Repo::pull_collection`] pulls the collection refs of a remote.
@@ -1240,7 +1277,9 @@ impl Repo {
     ///
     /// With [`collection_id`](PullOptions::collection_id), each name in
     /// [`refs`](PullOptions::refs) is the collection ref
-    /// `refs/mirrors/<id>/<name>` of `src`, read as a ref name alone.
+    /// `refs/mirrors/<id>/<name>` of `src`, read as a ref name alone. Without
+    /// `no_ref_writes`, the pull writes the refs of the collection and checks
+    /// the collection binding of each tip, as `collection_id` states.
     /// [`verify`](PullOptions::verify) selects the signature policy, as
     /// [`PullVerify`] states. The module [`pull`](self) states the rules of
     /// the `.commitpartial` markers.
@@ -1579,11 +1618,12 @@ impl Repo {
     /// the signatures of the superblock, by the rules of [`PullVerify`], and
     /// its inline parts. For each commit of a chain, the target included, it
     /// also checks the signatures of the commit, and the ref binding of each
-    /// requested ref that names the commit. Then it checks the format of
-    /// field 2 of the commit, as "Dependencies" states. The walk of the commit
-    /// chains does not check the signatures or the ref binding of that commit
-    /// again. A local pull makes no timestamp check. So a target that the
-    /// policy or its ref binding refuses costs the reads of the superblocks,
+    /// requested ref that names the commit. It checks the collection binding
+    /// of the commit too, if the pull makes that check. Then it checks the
+    /// format of field 2 of the commit, as "Dependencies" states. The walk of
+    /// the commit chains does not check the signatures or the bindings of that
+    /// commit again. A local pull makes no timestamp check. So a target that
+    /// the policy or its bindings refuse costs the reads of the superblocks,
     /// and the pull applies no part. The pull reports this refusal before a
     /// defect that the walk of the commit chains finds. A target with no chain
     /// gets its checks in the walk of the commit chains, also before the
@@ -1623,7 +1663,6 @@ impl Repo {
     ///
     /// - [`Error::Unsupported`] if [`subpaths`](PullOptions::subpaths) is not
     ///   empty, or if [`collection_id`](PullOptions::collection_id) is set and
-    ///   [`no_ref_writes`](PullOptions::no_ref_writes) is not set or
     ///   [`refs`](PullOptions::refs) is empty. The pull makes these checks
     ///   before it reads `src`. Also if the pull requires static deltas or
     ///   applies a [`static_deltas`](PullOptions::static_deltas) list, and
@@ -1683,6 +1722,11 @@ impl Repo {
     /// - [`Error::Pull`] if a superblock of the list produces another commit,
     ///   or from another commit, than its entry of the list.
     /// - [`Error::Pull`] if the ref binding of a commit does not name its ref.
+    ///   Also, with [`collection_id`](PullOptions::collection_id) and without
+    ///   [`no_ref_writes`](PullOptions::no_ref_writes), if the
+    ///   `ostree.collection-binding` of a tip commit is absent, is not a
+    ///   string, or states another collection id, before the pull writes an
+    ///   object.
     /// - [`Error::Pull`] if an object fails the
     ///   [`BAREUSERONLY_FILES`](PullFlags::BAREUSERONLY_FILES) check or the
     ///   check of a `bare-user-only` destination.
@@ -1725,7 +1769,22 @@ impl Repo {
     /// - [`Error::Io`] for an I/O failure of the file system. Also for a held
     ///   dirtree that the pull cannot read, that is not a regular file, or that
     ///   is larger than [`MAX_METADATA_SIZE`](crate::MAX_METADATA_SIZE).
-    pub async fn pull_local(&self, src: &Repo, mut opts: PullOptions) -> Result<PullStats> {
+    pub async fn pull_local(&self, src: &Repo, opts: PullOptions) -> Result<PullStats> {
+        let checks = LocalChecks {
+            collection_binding: (opts.collection_id.is_some() && !opts.no_ref_writes)
+                .then_some(false),
+        };
+        self.pull_local_with(src, opts, checks).await
+    }
+
+    /// Pulls from the local repository `src` as [`Repo::pull_local`] does,
+    /// with the checks `checks`.
+    pub(crate) async fn pull_local_with(
+        &self,
+        src: &Repo,
+        mut opts: PullOptions,
+        checks: LocalChecks,
+    ) -> Result<PullStats> {
         let started = Instant::now();
         // A local pull copies whole trees. The `ostree pull-local` command
         // takes no subpath either.
@@ -1831,7 +1890,23 @@ impl Repo {
 
         let targets = resolve_targets(src, &opts, collection_relpaths).await?;
         let flags = opts.flags;
-        let verify_bindings = !flags.contains(PullFlags::DISABLE_VERIFY_BINDINGS);
+        // A pull with the collection-binding check reads and writes the refs
+        // of the collection. Each other local pull reads and writes the refs
+        // at the place that `remote` names.
+        let collection = match (checks.collection_binding, opts.collection_id.as_deref()) {
+            (Some(allow_unbound), Some(id)) => Some((id, allow_unbound)),
+            _ => None,
+        };
+        let place = match collection {
+            Some((id, _)) => RefPlace::of_collection(self, id),
+            None => RefPlace::of_remote(opts.remote.as_deref()),
+        };
+        // A local pull makes no timestamp check.
+        let tip_checks = TipChecks {
+            collection: collection.map(|(id, _)| id),
+            allow_unbound: collection.is_some_and(|(_, allow_unbound)| allow_unbound),
+            ..TipChecks::new(flags, TimestampBase::Off, place)
+        };
 
         // The pull finds the deltas before the transaction opens, so a refusal
         // writes no object, no ref, and no marker. With a list, discovery also
@@ -1845,12 +1920,7 @@ impl Repo {
                 advert.as_ref(),
                 &targets,
                 &opts,
-                // A local pull makes no timestamp check.
-                TipChecks::new(
-                    flags,
-                    TimestampBase::Off,
-                    RefPlace::of_remote(opts.remote.as_deref()),
-                ),
+                tip_checks,
                 edges,
                 &verification,
                 related,
@@ -1924,10 +1994,10 @@ impl Repo {
         let mut seen: HashMap<Checksum, i32> = HashMap::new();
         for (ref_name, tip) in &targets {
             let loaded = load_commit(src, tip).await?;
-            // Discovery made the binding check of each ref that names a
+            // Discovery made the binding checks of each ref that names a
             // commit of a chain.
-            if verify_bindings && !deltas.checked(tip) {
-                check_ref_binding(tip, &loaded.commit, ref_name)?;
+            if !deltas.checked(tip) {
+                check_tip_refs(self, tip_checks, tip, &loaded.commit, &[ref_name.as_str()]).await?;
             }
             collect_chain(
                 src,
@@ -1973,7 +2043,6 @@ impl Repo {
                     appended,
                 );
                 drop(deps);
-                let place = RefPlace::of_remote(opts.remote.as_deref());
                 let (lookups, known) = dependency::lookups(self, &targets, place, named).await?;
                 delta::discover_dependencies(
                     self,
@@ -2196,7 +2265,6 @@ impl Repo {
                     .await?;
             }
             if !opts.no_ref_writes {
-                let place = RefPlace::of_remote(opts.remote.as_deref());
                 for (ref_name, tip) in &targets {
                     place.queue(&txn, ref_name, tip);
                 }
@@ -2644,6 +2712,16 @@ impl<'a> RefPlace<'a> {
         match remote {
             Some(remote) => RefPlace::Remote(remote),
             None => RefPlace::Heads,
+        }
+    }
+
+    /// Returns the refs of the collection `id` in `repo`: the local refs if
+    /// `id` is the `[core] collection-id` of `repo`, else the collection refs.
+    pub(crate) fn of_collection(repo: &Repo, id: &'a str) -> RefPlace<'a> {
+        if repo.config().collection_id() == Some(id) {
+            RefPlace::Heads
+        } else {
+            RefPlace::Collection(id)
         }
     }
 
@@ -3485,14 +3563,27 @@ async fn load_dirtree_from(sources: &[&Repo], checksum: &Checksum) -> Result<Opt
     Ok(None)
 }
 
+/// The checks of a local pull that [`PullOptions`] does not state.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct LocalChecks {
+    /// The collection-binding check of each tip, against
+    /// [`collection_id`](PullOptions::collection_id).
+    ///
+    /// `Some(allow_unbound)` turns on the check, and `allow_unbound` lets a
+    /// tip with no `ostree.collection-binding` key pass. With the check, the
+    /// pull reads and writes the refs of the collection:
+    /// `refs/mirrors/<id>/<name>`, or `refs/heads/<name>` if the id is the
+    /// `[core] collection-id` of the destination. `None`, or a pull with no
+    /// collection id, makes no collection-binding check.
+    pub(crate) collection_binding: Option<bool>,
+}
+
 /// Checks the collection options of a local pull.
 ///
-/// The function refuses a local pull of collection refs that writes refs,
-/// because no rule names the ref of such a pull. It refuses a pull that names
-/// no ref, because an empty list reads `refs/heads` and no collection ref. It
-/// then refuses each name that gives no collection ref path, and each name
-/// that holds `:`. Delta discovery reads the name as a refspec, where a `:`
-/// changes what the name refers to.
+/// The function refuses a pull that names no ref, because an empty list reads
+/// `refs/heads` and no collection ref. It then refuses each name that gives no
+/// collection ref path, and each name that holds `:`. Delta discovery reads
+/// the name as a refspec, where a `:` changes what the name refers to.
 ///
 /// The checks read nothing. The result holds the path of the collection ref of
 /// each name, in order, and is `None` without a collection id.
@@ -3500,11 +3591,6 @@ fn check_local_collection(opts: &PullOptions) -> Result<Option<Vec<String>>> {
     let Some(id) = &opts.collection_id else {
         return Ok(None);
     };
-    if !opts.no_ref_writes {
-        return Err(Error::Unsupported(
-            "a local pull with a collection id needs no_ref_writes".into(),
-        ));
-    }
     if opts.refs.is_empty() {
         return Err(Error::Unsupported(
             "a local pull with a collection id needs at least one ref name".into(),

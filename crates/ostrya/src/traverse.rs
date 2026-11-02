@@ -113,7 +113,10 @@ pub(crate) struct ListedRef {
     pub(crate) name: String,
     /// `true` if that name addresses the file that the listing read, by the
     /// rule of [`listed_name_addresses_it`](crate::refs::listed_name_addresses_it).
-    /// A name that fails the ref-name rule gives `false`.
+    /// A name that fails the ref-name rule gives `false`. A mirror ref always
+    /// gives `false`, because no refspec maps below `refs/mirrors`. Prune
+    /// reads this for a local ref and a remote ref alone, and it classifies a
+    /// mirror ref by its collection id and its name.
     pub(crate) addressable: bool,
     /// The commit that the ref resolves to.
     pub(crate) checksum: Checksum,
@@ -606,8 +609,9 @@ impl Repo {
     /// Each ref also tells if its name addresses the file that the listing
     /// read. A caller that reads or unlinks a ref by its name needs this check.
     /// Prune reads the names to find the branch that a depth applies to. It
-    /// reads the [`RefSpace`] and the addressability to find the refs that its
-    /// classifier sees.
+    /// reads the [`RefSpace`], the addressability of a local or a remote ref,
+    /// and the path of a mirror ref to find the refs that its classifier
+    /// sees.
     pub(crate) async fn list_all_refs(&self) -> Result<Vec<ListedRef>> {
         let repo = self.clone();
         ostrya_rt::unblock(move || {
@@ -1435,7 +1439,8 @@ fn collect_named_refs(
                 RefSpace::Heads | RefSpace::Mirrors => entry.path.to_owned(),
             };
             // A mirror entry always gives `false`, because no refspec maps to
-            // a path below `refs/mirrors`.
+            // a path below `refs/mirrors`. Prune does not read this value for
+            // a mirror ref: it checks the collection id and the name itself.
             let addressable = crate::refs::listed_name_addresses_it(&name, top, entry.path);
             out.push(ListedRef {
                 space,

@@ -1947,12 +1947,13 @@ and `traverse_parent` reads the metadata of each commit. These stay for a
 later version.
 
 The result is `BucketPruneReport`: the `PruneStats` of the local prune,
-whose `deleted_refs` is always empty and whose `warnings` hold the
-defective field 2 entries, and the deleted deltas, the deleted
-markers, the aborted uploads, and the holder of a broken lock. With
-`no_prune`, the lists name what a run deletes. A `PruneStats` alone was
-rejected, because the command prints the deltas, the markers, and the
-uploads, and the holder of a broken lock needs a place on success.
+whose `deleted_refs` and `deleted_collection_refs` are always empty and
+whose `warnings` hold the defective field 2 entries, and the deleted
+deltas, the deleted markers, the aborted uploads, and the holder of a
+broken lock. With `no_prune`, the lists name what a run deletes. A
+`PruneStats` alone was rejected, because the command prints the deltas, the
+markers, and the uploads, and the holder of a broken lock needs a place on
+success.
 
 When the roots are not on the refs alone, each commit of the listing is a
 root, so each root, the ref targets and the commits of the summary
@@ -2635,6 +2636,73 @@ the rules.
   downstream roots on that key, the downstream prune deletes the commits
   that the key kept, and no call reports it.
 
+## The weak refs of a prune
+
+`PruneOptions::weak_ref_filter` holds one callback for the refs of each
+space. The callback gets a `RefLocation` and the commit of the ref, and
+returns `true` for a strong ref:
+
+- `RefLocation::Local` for a ref under `refs/heads`, with its name.
+- `RefLocation::Remote` for a ref under `refs/remotes`, with the remote and
+  the name.
+- `RefLocation::Collection` for a ref under `refs/mirrors`, with the
+  collection id and the name. A ref of the `[core] collection-id` of the
+  repository is a `Collection` ref too.
+
+The rules of the classification:
+
+- A local ref or a remote ref gets a location when its listed name maps back
+  to the file that the listing read. A mirror ref gets a location when the
+  part of its path before the first `/` passes `is_collection_id` and is at
+  most 255 bytes, and the rest passes the ref-name rule. Each other ref is
+  strong and never reaches the callback. The classification reads no config
+  key and no other file: the ref listing of the run already reads
+  `refs/mirrors`.
+- A weak collection ref follows the rule of each weak ref. It survives when
+  the walk reaches its commit over a `parent` edge, a dependency in field 2,
+  or a build source in `ostrya.related`. A strong ref on the same commit
+  keeps it too. The bound of a mirror ref comes from its listed name,
+  `ID/NAME`.
+- `PruneStats::deleted_collection_refs` names each deleted collection ref
+  as a `CollectionRef`. It is sorted with `sort_by` on
+  `(collection_id, ref_name)`, in byte order. `CollectionRef` has no `Ord`:
+  the prune is the one caller that sorts the type. `deleted_refs` names the
+  deleted local and remote refs alone. Under `no_prune`, both lists name
+  what a run deletes, and the run deletes nothing.
+- One helper deletes the weak refs of each space.
+  `delete_matching_refs_blocking` takes a key and a closure that gives the
+  path of each key. One blocking hop and one set of `fsync` calls cover the
+  refs under `refs/heads`, `refs/remotes`, and `refs/mirrors`, with one
+  compare-and-delete guard.
+- An emptied `refs/mirrors/ID/` directory stays, as an emptied directory
+  under `refs/heads` does.
+- `RefLocation` has `#[non_exhaustive]`, so a later ref space adds a
+  variant. `PruneOptions` and `PruneStats` have no `#[non_exhaustive]`. With
+  the attribute, no other crate can use `..PruneOptions::default()`, and the
+  `ostrya` command uses it. A new field in either struct takes a minor
+  version before 1.0.
+
+These alternatives were rejected:
+
+- A flat string with a prefix for each space, for example `mirrors:ID/NAME`.
+  Each callback must parse the string again to find the space, the id, and
+  the name. A substring test still matches refs of more than one space. A
+  remote ref `REMOTE:NAME` in such a string carries two `:` separators.
+- A second filter field for the collection refs. A caller that applies one
+  rule to each space then writes the rule two times. The enum gives the same
+  split in one callback, and the wildcard arm of a `match` states the verdict
+  for each other space.
+- A mirror ref of the own collection id as a `Local` ref. `Local(NAME)`
+  names `refs/heads/NAME`, and the mirror ref is a different file. Both
+  files can exist and name two commits, so the callback gets one location
+  for two refs. The classification also reads the config to know the own
+  id. After the run deletes such a mirror ref, a read of the collection ref
+  gives the `refs/heads` ref of the same name, by the rule of
+  `Repo::resolve_collection_ref`.
+- The collection refs in `deleted_refs`. The list holds refspecs, and no
+  refspec maps below `refs/mirrors`. The form `ID:NAME` reads as the refspec
+  of a remote named `ID`.
+
 ## The pull scheduler
 
 `crates/ostrya/src/pull/drive.rs` is a poll core of the port.
@@ -2662,6 +2730,9 @@ when the port owns its set of members and expects the set to grow.
 - `ostrya::Error` has the attribute. Its variants are the error vocabulary of
   the port, and a new failure mode adds a variant.
 - `TrustRoots` has the attribute. The port owns the set of trust settings.
+- `ostrya::RefLocation` has the attribute. The port owns the set of ref
+  spaces that the weak-ref filter of a prune classifies ("The weak refs of a
+  prune").
 - `ostrya_fetch::UploadMethod` and `ostrya_fetch::SignPayload` have the
   attribute. The fetcher owns the set of upload methods and the set of body
   forms that a signer gets.

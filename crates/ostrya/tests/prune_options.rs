@@ -21,8 +21,8 @@ use std::path::Path;
 use common::TmpDir;
 use ostrya::{
     Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, DeltaOptions,
-    Error, MutableTree, ObjectName, ObjectType, PruneOptions, PruneStats, Repo, RepoMode,
-    static_delta_relative_dir,
+    Error, MutableTree, ObjectName, ObjectType, PruneOptions, PruneStats, RefLocation, Repo,
+    RepoMode, static_delta_relative_dir,
 };
 use ostrya_rt::block_on;
 
@@ -1083,4 +1083,5 @@ fn prune_options_is_send_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<PruneOptions>();
     assert_send_sync::<PruneStats>();
+    assert_send_sync::<RefLocation<'static>>();
 }

@@ -2362,9 +2362,10 @@ pub(crate) fn refspec_to_relpath(refspec: &str) -> Result<String> {
 /// `<top>/<path>`. `top` is the directory of `refs/` that the listing walked,
 /// and `path` is the path of the ref file below it.
 ///
-/// Prune classifies a ref only where this returns `true`. So each ref that
-/// the classifier sees reads and deletes through the file that the listing
-/// read. A name that the mapping refuses gives `false`.
+/// Prune classifies a ref below `refs/heads` or `refs/remotes` only where
+/// this returns `true`. So each such ref that the classifier sees reads and
+/// deletes through the file that the listing read. A name that the mapping
+/// refuses gives `false`.
 ///
 /// The name alone decides this for a ref below `refs/heads`. There, a `:` in
 /// the name sends the mapping to `refs/remotes` and so to a different file.
@@ -2379,7 +2380,9 @@ pub(crate) fn refspec_to_relpath(refspec: &str) -> Result<String> {
 /// gives for a file below `refs/remotes` addresses that file alone.
 ///
 /// No refspec maps to a path below `refs/mirrors`, so a mirror ref always
-/// gives `false`.
+/// gives `false`. Prune classifies a mirror ref by its own rule: the path
+/// must split into a valid collection id and a valid ref name, which
+/// [`collection_ref_to_relpath`] maps back to the same file.
 ///
 /// The body mirrors [`refspec_to_relpath`] branch for branch and allocates
 /// nothing, because prune calls it once for each ref in the repository.
@@ -2750,9 +2753,11 @@ pub(crate) fn put_alias_blocking(
 /// Removes each ref that still names the checksum that the caller recorded
 /// for it, relative to `repo_fd`, in one blocking pass.
 ///
-/// The call maps each name to its path with the refspec rule of the
-/// asynchronous writes. So the read and the unlink address the same file as
-/// the rest of the library.
+/// The call maps each key to its path with `relpath`. The caller passes the
+/// path rule of the asynchronous writes, for example [`refspec_to_relpath`]
+/// for a refspec or [`collection_ref_to_relpath`] for a collection ref. So
+/// the read and the unlink address the same file as the rest of the library.
+/// One pass can hold keys of more than one space under `refs/`.
 ///
 /// Each read comes immediately before its own unlink. The call leaves a ref
 /// that now names a different commit where it is. This covers a repository
@@ -2774,17 +2779,18 @@ pub(crate) fn put_alias_blocking(
 /// membership test reads the borrowed path, so a parent that the set already
 /// holds costs no allocation.
 ///
-/// Returns the names that it removed, in the order that it got them.
-pub(crate) fn delete_matching_refs_blocking(
+/// Returns the keys that it removed, in the order that it got them.
+pub(crate) fn delete_matching_refs_blocking<K>(
     repo_fd: BorrowedFd<'_>,
-    refs: Vec<(String, Checksum)>,
+    refs: Vec<(K, Checksum)>,
+    relpath: impl Fn(&K) -> Result<String>,
     fsync: bool,
-) -> Result<Vec<String>> {
+) -> Result<Vec<K>> {
     let mut removed = Vec::with_capacity(refs.len());
     let mut parents: Vec<String> = Vec::new();
     let mut held: HashSet<String> = HashSet::new();
-    for (name, target) in refs {
-        let relpath = refspec_to_relpath(&name)?;
+    for (key, target) in refs {
+        let relpath = relpath(&key)?;
         if let Some(bytes) = read_ref_file(repo_fd, &relpath)?
             && parse_ref_content(&bytes)? != target
         {
@@ -2803,7 +2809,7 @@ pub(crate) fn delete_matching_refs_blocking(
             Err(Errno::NOENT) => {}
             Err(e) => return Err(Error::Io(e.into())),
         }
-        removed.push(name);
+        removed.push(key);
     }
     for parent in &parents {
         sync_dir_present(repo_fd, parent)?;
@@ -2811,9 +2817,9 @@ pub(crate) fn delete_matching_refs_blocking(
     Ok(removed)
 }
 
-/// Returns the directory that holds the ref at `relpath`. A refspec always
-/// maps below `refs/`, so the path has a parent. For a bare name, the result
-/// is the repository root.
+/// Returns the directory that holds the ref at `relpath`. A refspec and a
+/// collection ref always map below `refs/`, so the path has a parent. For a
+/// bare name, the result is the repository root.
 fn ref_parent(relpath: &str) -> &str {
     relpath.rsplit_once('/').map_or(".", |(dir, _)| dir)
 }

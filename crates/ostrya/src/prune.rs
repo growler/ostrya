@@ -13,6 +13,7 @@
 //! - [`PruneStats`] holds the counts of a run, the refs that it deleted, and
 //!   the warnings of the defective related values that it read.
 //! - [`WeakRefFilter`] marks refs weak, so that a run can delete them.
+//!   [`RefLocation`] names each ref that it classifies.
 
 use std::collections::{BTreeSet, HashMap, HashSet};
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
@@ -24,26 +25,61 @@ use rustix::io::Errno;
 
 use crate::error::{Error, Result};
 use crate::lock::LockKind;
+use crate::refs::CollectionRef;
 use crate::related::RelatedWarning;
 use crate::repo::Repo;
 use crate::tombstone::write_tombstone;
 use crate::traverse::{ListedRef, ParentBound, RefSpace, WeakBounds};
 
+/// The location of a ref that a [`WeakRefFilter`] classifies.
+///
+/// Each variant holds the parts of the ref path below its directory in
+/// `refs/`. [`PruneOptions::weak_ref_filter`] states which refs get a
+/// location. Each other ref is strong and never reaches the filter.
+#[non_exhaustive]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RefLocation<'a> {
+    /// A local ref, at `refs/heads/NAME`. The value is `NAME`, which can
+    /// contain `/`.
+    Local(&'a str),
+    /// A remote ref, at `refs/remotes/REMOTE/NAME`. Its refspec is
+    /// `REMOTE:NAME`.
+    Remote {
+        /// The name of the remote.
+        remote: &'a str,
+        /// The ref name below the directory of the remote. It can contain
+        /// `/`.
+        name: &'a str,
+    },
+    /// A collection ref, at `refs/mirrors/ID/NAME`.
+    ///
+    /// The collection id can be the `[core] collection-id` of the
+    /// repository. A ref of that id is a `Collection` ref too.
+    Collection {
+        /// The collection id.
+        collection_id: &'a str,
+        /// The ref name below the directory of the collection id. It can
+        /// contain `/`.
+        name: &'a str,
+    },
+}
+
 /// The callback of a [`WeakRefFilter`]: a verdict on one ref.
 ///
-/// The arguments are the name of the ref and the commit that it resolves to.
-/// If the callback returns `true`, the ref is strong: it roots the walk under
-/// the bound of its name. If the callback returns `false`, the ref is weak and
-/// roots nothing. A weak ref survives if the walk reaches its commit over some
-/// other edge. Otherwise the run deletes it.
-pub type WeakRefFilterFn = Arc<dyn Fn(&str, &Checksum) -> bool + Send + Sync>;
+/// The arguments are the location of the ref and the commit that it resolves
+/// to. If the callback returns `true`, the ref is strong: it roots the walk
+/// under the bound of its name. If the callback returns `false`, the ref is
+/// weak and roots nothing. A weak ref survives if the walk reaches its commit
+/// over some other edge. Otherwise the run deletes it.
+pub type WeakRefFilterFn = Arc<dyn Fn(RefLocation<'_>, &Checksum) -> bool + Send + Sync>;
 
 /// The ref classifier of a prune, unset by default.
 ///
 /// An unset filter marks every ref strong, so a prune with no filter deletes no
-/// ref. A ref whose name fails the ref-name rule is never offered to the
-/// filter and is always strong. [`PruneOptions::weak_ref_filter`] states how a
-/// run uses the verdicts.
+/// ref. The filter gets the [`RefLocation`] of each ref that it classifies. A
+/// ref with no valid location is never offered to the filter and is always
+/// strong. [`PruneOptions::weak_ref_filter`] states which refs the filter
+/// classifies and how a run uses the verdicts.
 ///
 /// The callback is in an [`Arc`], so a caller can share one classifier across
 /// more than one [`PruneOptions`]. A classifier that keeps state must supply
@@ -71,9 +107,32 @@ pub struct WeakRefFilter(Option<WeakRefFilterFn>);
 
 impl WeakRefFilter {
     /// Creates a filter that calls `f` for each ref that it classifies.
+    ///
+    /// # Examples
+    ///
+    /// A filter that marks each ref of the collection `org.example.Cache`
+    /// weak. Each other ref stays strong. [`RefLocation`] is
+    /// `#[non_exhaustive]`, so the match needs a wildcard arm.
+    ///
+    /// ```
+    /// use ostrya::{PruneOptions, RefLocation, WeakRefFilter};
+    ///
+    /// let filter = WeakRefFilter::new(|location, _| match location {
+    ///     RefLocation::Collection { collection_id, .. } => {
+    ///         collection_id != "org.example.Cache"
+    ///     }
+    ///     _ => true,
+    /// });
+    /// let opts = PruneOptions {
+    ///     refs_only: true,
+    ///     weak_ref_filter: filter,
+    ///     ..PruneOptions::default()
+    /// };
+    /// # let _ = opts;
+    /// ```
     pub fn new<F>(f: F) -> WeakRefFilter
     where
-        F: Fn(&str, &Checksum) -> bool + Send + Sync + 'static,
+        F: Fn(RefLocation<'_>, &Checksum) -> bool + Send + Sync + 'static,
     {
         WeakRefFilter(Some(Arc::new(f)))
     }
@@ -92,9 +151,9 @@ impl WeakRefFilter {
 
     /// Returns `true` if the ref is strong. An unset filter returns `true` for
     /// each ref.
-    pub(crate) fn is_strong(&self, name: &str, target: &Checksum) -> bool {
+    pub(crate) fn is_strong(&self, location: RefLocation<'_>, target: &Checksum) -> bool {
         match &self.0 {
-            Some(f) => f(name, target),
+            Some(f) => f(location, target),
             None => true,
         }
     }
@@ -256,34 +315,37 @@ pub struct PruneOptions {
     /// `refs_only` is `false`, the prune fails with [`Error::InvalidFormat`]
     /// before the run reads anything. This field is an ostrya extension.
     ///
-    /// The filter sees these names:
+    /// The filter gets one [`RefLocation`] for each ref that it classifies:
     ///
-    /// - For a ref under `refs/heads`, its path in that directory.
-    /// - For a ref under `refs/remotes`, its `<remote>:<name>` refspec.
+    /// - [`RefLocation::Local`] for a ref under `refs/heads`, with its path in
+    ///   that directory. The path must pass the ref-name rule and hold no `:`.
+    /// - [`RefLocation::Remote`] for a ref under `refs/remotes`, with the
+    ///   remote and the name of its `<remote>:<name>` refspec. The refspec
+    ///   must pass the ref-name rule, and the first `/` of the path in
+    ///   `refs/remotes` must be the first `:` of the refspec.
+    /// - [`RefLocation::Collection`] for a ref under `refs/mirrors`. The part
+    ///   of the path before its first `/` is the collection id, and the rest
+    ///   is the name. The id must pass
+    ///   [`is_collection_id`](crate::is_collection_id) and be at most 255
+    ///   bytes, and the name must pass the ref-name rule. A ref of the
+    ///   `[core] collection-id` of the repository is a `Collection` ref too.
     ///
-    /// A ref under `refs/mirrors` is strong and never reaches the filter. A ref
-    /// whose listed name maps to a different file through the refspec rule is
-    /// also strong, and the filter never sees it:
+    /// Each other ref is strong, and the filter never sees it. Examples are a
+    /// ref whose name fails the ref-name rule, a file directly under
+    /// `refs/mirrors`, and a remote ref whose refspec maps to a different
+    /// file. The run reads no config key to classify a ref.
     ///
-    /// - A local name maps to its own file if the name holds no `:`.
-    /// - A remote refspec maps to its own file if the first `/` of the path
-    ///   in `refs/remotes` is the first `:` of the name.
-    ///
-    /// A classifier that tests a prefix of the name keeps its meaning if the
-    /// prefix holds a `/` before any `:`. Such a prefix matches only a local
-    /// name. A prefix that is a bare segment also matches a remote refspec, and
-    /// so does a substring test. For example, the prefix `pool` matches
-    /// `poolcache:main`, the refspec of a ref of the remote `poolcache`.
-    ///
-    /// A ref whose name fails the ref-name rule is never offered to the filter
-    /// and is always strong. Only an out-of-band write can put such a name on
-    /// disk, because each write path of the library refuses it.
+    /// A repository can hold a directory of `refs/mirrors/` whose name fails
+    /// the collection id rule above. A ref under that directory is strong,
+    /// so a prune never deletes it. Remove such a ref by hand.
     ///
     /// A strong ref roots the walk under the bound that
     /// [`retain_branch_depth`](PruneOptions::retain_branch_depth),
     /// [`only_branch`](PruneOptions::only_branch), and
-    /// [`depth`](PruneOptions::depth) give its name. A weak ref roots nothing.
-    /// It survives if the walk reaches its commit over some other edge:
+    /// [`depth`](PruneOptions::depth) give its name. The name of a collection
+    /// ref there is its path under `refs/mirrors`, `ID/NAME`. A weak ref roots
+    /// nothing. It survives if the walk reaches its commit over some other
+    /// edge:
     ///
     /// - An arrival over a `parent` edge gives the commit the bound of the name
     ///   of the weak ref. That bound replaces the bound that the edge left. The
@@ -291,8 +353,17 @@ pub struct PruneOptions {
     /// - An arrival over another edge carries a bound of its own. The commit
     ///   expands under that bound and under the bound of the weak ref.
     ///
-    /// The run deletes each weak ref that the walk did not reach and names it
-    /// in [`PruneStats::deleted_refs`].
+    /// The run deletes each weak ref that the walk did not reach. It names a
+    /// deleted local or remote ref in [`PruneStats::deleted_refs`] and a
+    /// deleted collection ref in [`PruneStats::deleted_collection_refs`]. The
+    /// run leaves an emptied directory under `refs/` in place, for example
+    /// `refs/mirrors/ID/`.
+    ///
+    /// A collection ref of the `[core] collection-id` of the repository can
+    /// have a local ref of the same name under `refs/heads`. After the run
+    /// deletes the collection ref, a read of that collection ref, for example
+    /// with [`Repo::resolve_collection_ref`](crate::Repo::resolve_collection_ref),
+    /// gives the commit of the local ref.
     ///
     /// The branch selection has nothing to select for a weak ref, because a
     /// weak ref roots nothing. The filter also classifies a weak ref outside an
@@ -428,7 +499,13 @@ pub struct PruneStats {
     /// If [`no_prune`](PruneOptions::no_prune) is set, it is the number of
     /// bytes that the run frees without `no_prune`.
     pub freed_bytes: u64,
-    /// The weak refs that the run deleted, sorted by name in byte order.
+    /// The weak local and remote refs that the run deleted, sorted by name in
+    /// byte order.
+    ///
+    /// The list names a local ref by its path under `refs/heads` and a remote
+    /// ref by its `<remote>:<name>` refspec. A deleted collection ref is in
+    /// [`deleted_collection_refs`](PruneStats::deleted_collection_refs) and
+    /// never in this list.
     ///
     /// If [`no_prune`](PruneOptions::no_prune) is set, the list names the refs
     /// that the run deletes without `no_prune`, and the run removes no ref. The
@@ -443,6 +520,23 @@ pub struct PruneStats {
     /// If the run fails part way through the deletions, the refs that it
     /// already removed stay removed. The caller gets the error and no list.
     pub deleted_refs: Vec<String>,
+    /// The weak collection refs that the run deleted, sorted by collection id
+    /// and then by ref name, each in byte order.
+    ///
+    /// Each entry is a ref under `refs/mirrors` that
+    /// [`weak_ref_filter`](PruneOptions::weak_ref_filter) got as a
+    /// [`RefLocation::Collection`], so its
+    /// [`collection_id`](CollectionRef::collection_id) is always `Some`. A
+    /// collection ref is never in [`deleted_refs`](PruneStats::deleted_refs).
+    ///
+    /// The list follows the rules of
+    /// [`deleted_refs`](PruneStats::deleted_refs). If
+    /// [`no_prune`](PruneOptions::no_prune) is set, it names the refs that
+    /// the run deletes without `no_prune`, and the run removes no ref. It does
+    /// not name a ref that the compare-and-delete guard skipped. A
+    /// [`static_deltas_only`](PruneOptions::static_deltas_only) run gives an
+    /// empty list.
+    pub deleted_collection_refs: Vec<CollectionRef>,
     /// The defective related values that the walk read, as
     /// [`Repo::prune`], "Related commits", states.
     ///
@@ -454,6 +548,75 @@ pub struct PruneStats {
     /// [`static_deltas_only`](PruneOptions::static_deltas_only) run walks
     /// nothing, so its list is empty.
     pub warnings: Vec<RelatedWarning>,
+}
+
+/// A weak ref that a run can delete, with the path rule of its space.
+enum WeakRef {
+    /// A local ref or a remote ref, by its refspec.
+    Refspec(String),
+    /// A collection ref under `refs/mirrors`.
+    Collection(CollectionRef),
+}
+
+impl WeakRef {
+    /// Creates the weak ref of a listed ref that [`ref_location`] gave a
+    /// location.
+    ///
+    /// The listing names a mirror ref by its path `ID/NAME`, and the first
+    /// `/` of that path ends the collection id. The listing names each other
+    /// ref by its refspec.
+    fn new(space: RefSpace, name: String) -> WeakRef {
+        match (space, name.find('/')) {
+            (RefSpace::Mirrors, Some(slash)) => {
+                let mut collection_id = name;
+                let ref_name = collection_id.split_off(slash + 1);
+                collection_id.truncate(slash);
+                WeakRef::Collection(CollectionRef::new(collection_id, ref_name))
+            }
+            _ => WeakRef::Refspec(name),
+        }
+    }
+
+    /// Returns the path of the ref under the repository, by the rule of the
+    /// ref writes.
+    fn relpath(&self) -> Result<String> {
+        match self {
+            WeakRef::Refspec(refspec) => crate::refs::refspec_to_relpath(refspec),
+            WeakRef::Collection(cref) => crate::refs::collection_ref_to_relpath(cref),
+        }
+    }
+}
+
+/// Returns the location under which the classifier of a run sees a listed
+/// ref, or `None` if the ref is always strong.
+///
+/// - A ref in `refs/heads` is [`RefLocation::Local`] if its listed name
+///   addresses the file that the listing read.
+/// - A ref in `refs/remotes` is [`RefLocation::Remote`] on the same
+///   condition. Its listed name is its `<remote>:<name>` refspec.
+/// - A ref in `refs/mirrors` is [`RefLocation::Collection`] if the part of
+///   its path before the first `/` is a valid collection id of at most
+///   [`MAX_COLLECTION_ID_LEN`](crate::refs::MAX_COLLECTION_ID_LEN) bytes and
+///   the rest is a valid ref name. The listing gives a mirror ref no
+///   addressability, so the call does not read it.
+fn ref_location(space: RefSpace, name: &str, addressable: bool) -> Option<RefLocation<'_>> {
+    match space {
+        RefSpace::Heads => addressable.then_some(RefLocation::Local(name)),
+        RefSpace::Remotes => {
+            let (remote, name) = name.split_once(':').filter(|_| addressable)?;
+            Some(RefLocation::Remote { remote, name })
+        }
+        RefSpace::Mirrors => {
+            let (collection_id, name) = name.split_once('/')?;
+            let valid = collection_id.len() <= crate::refs::MAX_COLLECTION_ID_LEN
+                && ostrya_core::is_collection_id(collection_id)
+                && ostrya_core::is_ref_name(name);
+            valid.then_some(RefLocation::Collection {
+                collection_id,
+                name,
+            })
+        }
+    }
 }
 
 /// The settings that the blocking half of a prune applies to each object that
@@ -751,6 +914,7 @@ impl Repo {
                 freed_bytes: 0,
                 // A delta-only run reads no ref, so it deletes none.
                 deleted_refs: Vec::new(),
+                deleted_collection_refs: Vec::new(),
                 // A delta-only run walks nothing, so it reads no related value.
                 warnings: Vec::new(),
             });
@@ -784,16 +948,15 @@ impl Repo {
             self.resolve_rev(value, false).await?;
         }
         // Classify the ref space in one pass, so the strong roots and the weak
-        // targets cannot disagree. A ref is weak if all three hold:
+        // targets cannot disagree. A ref is weak if both hold:
         //
-        // - it is in `refs/heads` or `refs/remotes`.
-        // - its listed name addresses the file that it was listed from.
-        // - the classifier returns false for it.
+        // - `ref_location` gives it a location. A ref in `refs/heads` or
+        //   `refs/remotes` gets one if its listed name addresses the file that
+        //   it was listed from. A ref in `refs/mirrors` gets one if its path
+        //   splits into a valid collection id and a valid ref name.
+        // - the classifier returns false for that location.
         //
-        // Every other ref is strong. A ref in `refs/mirrors` is always strong
-        // and never reaches the classifier. The space test states this, and
-        // the addressability test holds it a second time, because no refspec
-        // maps to a path in `refs/mirrors`.
+        // Every other ref is strong and never reaches the classifier.
         //
         // A weak target stays out of `ref_targets`: the walk needs a seed for
         // every checksum that set names, and a weak ref supplies none. The weak
@@ -809,7 +972,7 @@ impl Repo {
         let filtering = opts.weak_ref_filter.is_set();
         let mut roots: Vec<(Checksum, ParentBound)> = Vec::new();
         let mut ref_targets: HashSet<Checksum> = HashSet::new();
-        let mut weak_refs: Vec<(String, Checksum)> = Vec::new();
+        let mut weak_refs: Vec<(WeakRef, Checksum)> = Vec::new();
         let mut weak_roots: HashMap<Checksum, WeakBounds> = HashMap::new();
         for ListedRef {
             space,
@@ -820,12 +983,11 @@ impl Repo {
         {
             let bound = opts.ref_bound(&name);
             let weak = filtering
-                && matches!(space, RefSpace::Heads | RefSpace::Remotes)
-                && addressable
-                && !opts.weak_ref_filter.is_strong(&name, &checksum);
+                && ref_location(space, &name, addressable)
+                    .is_some_and(|location| !opts.weak_ref_filter.is_strong(location, &checksum));
             if weak {
                 weak_roots.entry(checksum).or_default().add(bound);
-                weak_refs.push((name, checksum));
+                weak_refs.push((WeakRef::new(space, name), checksum));
                 continue;
             }
             // The bound of a ref belongs to the commit that it names, whatever
@@ -921,12 +1083,14 @@ impl Repo {
         //
         // The pass unlinks ref files alone and takes no lock of its own, so it
         // cannot deadlock against the hold of the run. An emptied parent
-        // directory in `refs/heads` stays in place, because an rmdir walk races
-        // a writer that creates a sibling ref.
+        // directory under `refs/` stays in place, because an rmdir walk races
+        // a writer that creates a sibling ref. This includes an emptied
+        // `refs/mirrors/ID/`.
         //
         // The whole pass runs in one blocking hop, as the object sweep does.
-        // The pass reads each name immediately before its unlink, and it calls
-        // `fsync` once at the end on the directories that held a removed ref.
+        // One hop covers the refs of each space. The pass reads each ref
+        // immediately before its unlink, and it calls `fsync` once at the end
+        // on the directories that held a removed ref.
         // The doomed list is the weak list less the refs that the walk reached,
         // in the order of the listing. So the code narrows the weak list in
         // place.
@@ -935,17 +1099,32 @@ impl Repo {
             .retain(|(_, target)| !keep.contains(&ObjectName::new(*target, ObjectType::Commit)));
         // A dry run reports what the walk decided and touches nothing, so it
         // reads no ref a second time.
-        let mut deleted_refs: Vec<String> = if opts.no_prune {
-            doomed_refs.into_iter().map(|(name, _)| name).collect()
+        let removed: Vec<WeakRef> = if opts.no_prune {
+            doomed_refs.into_iter().map(|(weak, _)| weak).collect()
         } else {
             let repo = self.clone();
             let fsync = sweep.fsync;
             ostrya_rt::unblock(move || {
-                crate::refs::delete_matching_refs_blocking(repo.repo_fd(), doomed_refs, fsync)
+                crate::refs::delete_matching_refs_blocking(
+                    repo.repo_fd(),
+                    doomed_refs,
+                    WeakRef::relpath,
+                    fsync,
+                )
             })
             .await?
         };
+        let mut deleted_refs: Vec<String> = Vec::new();
+        let mut deleted_collection_refs: Vec<CollectionRef> = Vec::new();
+        for weak in removed {
+            match weak {
+                WeakRef::Refspec(refspec) => deleted_refs.push(refspec),
+                WeakRef::Collection(cref) => deleted_collection_refs.push(cref),
+            }
+        }
         deleted_refs.sort();
+        deleted_collection_refs
+            .sort_by(|a, b| (&a.collection_id, &a.ref_name).cmp(&(&b.collection_id, &b.ref_name)));
 
         // The walk succeeded, so no data that the prune reads can refuse it
         // now. Remove the named commit, then sweep what it orphaned. A dry run
@@ -1000,6 +1179,7 @@ impl Repo {
             pruned_objects,
             freed_bytes,
             deleted_refs,
+            deleted_collection_refs,
             warnings,
         })
     }

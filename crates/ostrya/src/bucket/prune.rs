@@ -52,11 +52,12 @@ pub struct BucketPruneReport {
     ///
     /// The sizes come from the listing of the objects. A delete of a key
     /// that holds no object counts too.
-    /// [`deleted_refs`](PruneStats::deleted_refs) is always empty, because
-    /// the run deletes no ref. [`warnings`](PruneStats::warnings) holds one
-    /// warning for each defective field 2 entry that the walk read. It holds
-    /// no warning about `ostrya.related`, because the run reads no detached
-    /// metadata.
+    /// [`deleted_refs`](PruneStats::deleted_refs) and
+    /// [`deleted_collection_refs`](PruneStats::deleted_collection_refs) are
+    /// always empty, because the run deletes no ref.
+    /// [`warnings`](PruneStats::warnings) holds one warning for each
+    /// defective field 2 entry that the walk read. It holds no warning about
+    /// `ostrya.related`, because the run reads no detached metadata.
     pub stats: PruneStats,
     /// The name of each static delta whose keys the run deleted, sorted.
     ///
@@ -688,6 +689,7 @@ fn plan(
             pruned_objects: 0,
             freed_bytes: 0,
             deleted_refs: Vec::new(),
+            deleted_collection_refs: Vec::new(),
             warnings: Vec::new(),
         },
     };

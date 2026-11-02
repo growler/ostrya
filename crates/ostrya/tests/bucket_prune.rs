@@ -1441,6 +1441,7 @@ fn a_time_bound_keeps_the_commit_of_each_ref_at_any_age() {
                 pruned_objects: objects.len() - kept.len(),
                 freed_bytes: freed as u64,
                 deleted_refs: Vec::new(),
+                deleted_collection_refs: Vec::new(),
                 warnings: Vec::new(),
             }
         );

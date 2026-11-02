@@ -14,9 +14,9 @@ use std::path::Path;
 
 use common::{TmpDir, dependency_warning, store_with_field2};
 use ostrya::{
-    Checksum, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions, DictBuilder,
-    Error, MutableTree, ObjectType, PruneOptions, RelatedField, RelatedWarning, Repo, RepoMode,
-    RepoTree, Transaction, Type, Value, WeakRefFilter,
+    Checksum, CollectionRef, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions,
+    DictBuilder, Error, MutableTree, ObjectType, PruneOptions, RefLocation, RelatedField,
+    RelatedWarning, Repo, RepoMode, RepoTree, Transaction, Type, Value, WeakRefFilter,
 };
 use ostrya_rt::block_on;
 
@@ -282,7 +282,12 @@ fn a_weak_ref_named_by_a_build_source_of_a_strong_commit_survives() {
             .unwrap();
 
         let opts = PruneOptions {
-            weak_ref_filter: WeakRefFilter::new(|name, _| !name.starts_with("cache/")),
+            weak_ref_filter: WeakRefFilter::new(|location, _| {
+                !matches!(
+                    location,
+                    RefLocation::Local(name) if name.starts_with("cache/")
+                )
+            }),
             ..refs_only()
         };
         let stats = repo.prune(&opts).await.unwrap();
@@ -296,6 +301,100 @@ fn a_weak_ref_named_by_a_build_source_of_a_strong_commit_survives() {
         assert!(
             !holds(&repo, &other).await,
             "the commit of the other weak ref is pruned"
+        );
+    });
+}
+
+/// Returns the options of a refs-only prune that marks each collection ref
+/// weak and each other ref strong.
+fn collection_refs_are_weak() -> PruneOptions {
+    PruneOptions {
+        weak_ref_filter: WeakRefFilter::new(|location, _| {
+            !matches!(location, RefLocation::Collection { .. })
+        }),
+        ..refs_only()
+    }
+}
+
+/// Sets the collection ref `org.example.Cache`, `name` to `commit` and
+/// returns it.
+async fn set_cache_ref(repo: &Repo, name: &str, commit: &Checksum) -> CollectionRef {
+    let cref = CollectionRef::new("org.example.Cache", name);
+    repo.set_collection_ref_immediate(&cref, Some(commit))
+        .await
+        .unwrap();
+    cref
+}
+
+#[test]
+fn a_weak_collection_ref_named_by_a_dependency_of_a_strong_commit_survives() {
+    let tmp = TmpDir::new("prune-related-weak-collection-dep");
+    block_on(async {
+        let repo = repo_with_trees(tmp.path(), &["dep", "other", "head"]).await;
+        let dep = commit(&repo, tmp.path(), "dep", None, &[], None).await;
+        let other = commit(&repo, tmp.path(), "other", None, &[], None).await;
+        commit(
+            &repo,
+            tmp.path(),
+            "head",
+            None,
+            &[("boot/dep", dep)],
+            Some("main"),
+        )
+        .await;
+        let kept = set_cache_ref(&repo, "dep", &dep).await;
+        let dropped = set_cache_ref(&repo, "other", &other).await;
+
+        let stats = repo.prune(&collection_refs_are_weak()).await.unwrap();
+        assert!(stats.deleted_refs.is_empty(), "{:?}", stats.deleted_refs);
+        assert_eq!(stats.deleted_collection_refs, vec![dropped.clone()]);
+        assert!(holds(&repo, &dep).await, "the dependency survives");
+        assert_eq!(
+            repo.resolve_collection_ref(&kept, true).await.unwrap(),
+            Some(dep),
+            "the weak collection ref of the dependency survives"
+        );
+        assert!(
+            !holds(&repo, &other).await,
+            "the commit of the other weak collection ref is pruned"
+        );
+        assert_eq!(
+            repo.resolve_collection_ref(&dropped, true).await.unwrap(),
+            None
+        );
+    });
+}
+
+#[test]
+fn a_weak_collection_ref_named_by_a_build_source_of_a_strong_commit_survives() {
+    let tmp = TmpDir::new("prune-related-weak-collection-src");
+    block_on(async {
+        let repo = repo_with_trees(tmp.path(), &["src", "other", "head"]).await;
+        let src = commit(&repo, tmp.path(), "src", None, &[], None).await;
+        let other = commit(&repo, tmp.path(), "other", None, &[], None).await;
+        let head = commit(&repo, tmp.path(), "head", None, &[], Some("main")).await;
+        repo.add_detached_related(&head, "layer/src", &src)
+            .await
+            .unwrap();
+        let kept = set_cache_ref(&repo, "src", &src).await;
+        let dropped = set_cache_ref(&repo, "other", &other).await;
+
+        let stats = repo.prune(&collection_refs_are_weak()).await.unwrap();
+        assert!(stats.deleted_refs.is_empty(), "{:?}", stats.deleted_refs);
+        assert_eq!(stats.deleted_collection_refs, vec![dropped.clone()]);
+        assert!(holds(&repo, &src).await, "the build source survives");
+        assert_eq!(
+            repo.resolve_collection_ref(&kept, true).await.unwrap(),
+            Some(src),
+            "the weak collection ref of the build source survives"
+        );
+        assert!(
+            !holds(&repo, &other).await,
+            "the commit of the other weak collection ref is pruned"
+        );
+        assert_eq!(
+            repo.resolve_collection_ref(&dropped, true).await.unwrap(),
+            None
         );
     });
 }

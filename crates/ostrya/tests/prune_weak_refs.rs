@@ -1,12 +1,13 @@
 //! Prune with a weak-ref classifier.
 //!
-//! `PruneOptions::weak_ref_filter` sorts the refs under `refs/heads` and
-//! `refs/remotes` into strong refs and weak refs. A strong ref roots the walk.
-//! A weak ref roots nothing.
+//! `PruneOptions::weak_ref_filter` sorts the refs under `refs/heads`,
+//! `refs/remotes`, and `refs/mirrors` into strong refs and weak refs. A strong
+//! ref roots the walk. A weak ref roots nothing.
 //!
 //! If the walk reaches the commit of a weak ref over another edge, the weak ref
 //! survives. If not, the run unlinks the weak ref. A ref under `refs/mirrors`
-//! is strong and never reaches the classifier.
+//! reaches the classifier as a collection ref if its path splits into a valid
+//! collection id and a valid ref name. Each other mirror ref is strong.
 //!
 //! Rule B: if the walk reaches the commit of a weak ref, the walk restarts at
 //! that commit under the own bound of the weak ref.
@@ -23,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use common::TmpDir;
 use ostrya::{
     Checksum, CollectionRef, CommitModifier, CommitModifierFlags, CommitOptions, CreateOptions,
-    Error, MutableTree, ObjectType, PruneOptions, Repo, RepoMode, WeakRefFilter,
+    Error, MutableTree, ObjectType, PruneOptions, RefLocation, Repo, RepoMode, WeakRefFilter,
 };
 use ostrya_rt::block_on;
 
@@ -118,21 +119,41 @@ fn weak_options(filter: WeakRefFilter) -> PruneOptions {
     }
 }
 
-/// Returns a classifier that answers weak for each ref whose name starts with
-/// `pool/`.
-fn pool_is_weak() -> WeakRefFilter {
-    WeakRefFilter::new(|name: &str, _: &Checksum| !name.starts_with("pool/"))
-}
-
-/// Returns a classifier that answers weak for each name that contains `pool`.
-/// The rule applies to local names and to remote refspecs.
-fn any_pool_is_weak() -> WeakRefFilter {
-    WeakRefFilter::new(|name: &str, _: &Checksum| !name.contains("pool"))
-}
-
-/// Returns a classifier that records each ref name it gets, and the record.
+/// Returns the label of a ref location:
 ///
-/// `strong` gives the verdict for each name. The record proves which refs
+/// - the name of a local ref;
+/// - the `<remote>:<name>` refspec of a remote ref;
+/// - `<collection id>::<name>` for a collection ref.
+fn label(location: RefLocation<'_>) -> String {
+    match location {
+        RefLocation::Local(name) => name.to_owned(),
+        RefLocation::Remote { remote, name } => format!("{remote}:{name}"),
+        RefLocation::Collection {
+            collection_id,
+            name,
+        } => format!("{collection_id}::{name}"),
+        other => format!("{other:?}"),
+    }
+}
+
+/// Returns a classifier that answers weak for each ref whose label starts with
+/// `pool/`. Only a local ref has such a label.
+fn pool_is_weak() -> WeakRefFilter {
+    WeakRefFilter::new(|location: RefLocation<'_>, _: &Checksum| {
+        !label(location).starts_with("pool/")
+    })
+}
+
+/// Returns a classifier that answers weak for each label that contains `pool`.
+/// The rule applies to local, remote, and collection refs.
+fn any_pool_is_weak() -> WeakRefFilter {
+    WeakRefFilter::new(|location: RefLocation<'_>, _: &Checksum| !label(location).contains("pool"))
+}
+
+/// Returns a classifier that records the label of each ref location it gets,
+/// and the record.
+///
+/// `strong` gives the verdict for each label. The record proves which refs
 /// reached the classifier and which refs did not.
 fn recording_filter<F>(strong: F) -> (WeakRefFilter, Arc<Mutex<Vec<String>>>)
 where
@@ -140,21 +161,22 @@ where
 {
     let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
     let record = Arc::clone(&seen);
-    let filter = WeakRefFilter::new(move |name: &str, _: &Checksum| {
-        record.lock().unwrap().push(name.to_owned());
-        strong(name)
+    let filter = WeakRefFilter::new(move |location: RefLocation<'_>, _: &Checksum| {
+        let name = label(location);
+        let verdict = strong(&name);
+        record.lock().unwrap().push(name);
+        verdict
     });
     (filter, seen)
 }
 
-/// Returns the names that a recording classifier got.
+/// Returns the labels that a recording classifier got.
 fn recorded(seen: &Arc<Mutex<Vec<String>>>) -> Vec<String> {
     seen.lock().unwrap().clone()
 }
 
-/// Returns a recording classifier that answers weak for each name that
-/// contains `pool`. The rule applies to local names, remote refspecs, and
-/// mirror paths.
+/// Returns a recording classifier that answers weak for each label that
+/// contains `pool`. The rule applies to local, remote, and collection refs.
 fn recording_pool_is_weak() -> (WeakRefFilter, Arc<Mutex<Vec<String>>>) {
     recording_filter(|name: &str| !name.contains("pool"))
 }
@@ -364,10 +386,12 @@ fn a_classifier_without_refs_only_is_refused() {
         let counter = Arc::clone(&calls);
         let opts = PruneOptions {
             refs_only: false,
-            ..weak_options(WeakRefFilter::new(move |_: &str, _: &Checksum| {
-                counter.fetch_add(1, Ordering::SeqCst);
-                false
-            }))
+            ..weak_options(WeakRefFilter::new(
+                move |_: RefLocation<'_>, _: &Checksum| {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    false
+                },
+            ))
         };
         let err = repo
             .prune(&opts)
@@ -453,7 +477,9 @@ fn the_deleted_ref_list_is_sorted() {
             commit(&repo, tmp.path(), tree, None, Some(branch)).await;
         }
 
-        let filter = WeakRefFilter::new(|name: &str, _: &Checksum| name == "main");
+        let filter = WeakRefFilter::new(|location: RefLocation<'_>, _: &Checksum| {
+            location == RefLocation::Local("main")
+        });
         let stats = repo.prune(&weak_options(filter)).await.unwrap();
 
         let mut expected: Vec<String> = weak.iter().map(|n| (*n).to_owned()).collect();
@@ -499,8 +525,8 @@ fn a_ref_that_moved_under_the_classifier_is_not_unlinked() {
         // that it captured. A `Repo` method in the closure re-enters the
         // runtime. The new target is a commit that the run keeps, so the
         // repository stays consistent after the test.
-        let filter = WeakRefFilter::new(move |name: &str, _: &Checksum| {
-            if name == "pool/a" {
+        let filter = WeakRefFilter::new(move |location: RefLocation<'_>, _: &Checksum| {
+            if location == RefLocation::Local("pool/a") {
                 counter.fetch_add(1, Ordering::SeqCst);
                 std::fs::write(
                     repo_path.join("refs/heads/pool/a"),
@@ -728,62 +754,405 @@ fn a_weak_remote_ref_is_classified_and_deleted() {
     });
 }
 
-/// A ref under `refs/mirrors` never reaches the classifier. The ref roots the
-/// walk, so its commit and the objects under the commit survive.
+/// Returns a classifier that answers weak for each collection ref of
+/// `collection_id`. Each other ref is strong.
+fn collection_is_weak(collection_id: &'static str) -> WeakRefFilter {
+    WeakRefFilter::new(move |location: RefLocation<'_>, _: &Checksum| {
+        !matches!(
+            location,
+            RefLocation::Collection { collection_id: id, .. } if id == collection_id
+        )
+    })
+}
+
+/// Sets the collection ref `collection_id`, `name` to `commit` and returns it.
+async fn set_collection_ref(
+    repo: &Repo,
+    collection_id: &str,
+    name: &str,
+    commit: &Checksum,
+) -> CollectionRef {
+    let cref = CollectionRef::new(collection_id, name);
+    repo.set_collection_ref_immediate(&cref, Some(commit))
+        .await
+        .unwrap();
+    cref
+}
+
+/// Returns the commit that a collection ref names, or `None` if the
+/// repository has no such ref.
+async fn collection_tip(repo: &Repo, cref: &CollectionRef) -> Option<Checksum> {
+    repo.resolve_collection_ref(cref, true).await.unwrap()
+}
+
+/// A weak collection ref whose commit no strong root reaches is deleted, and
+/// its commit is swept. The run names the ref in `deleted_collection_refs`
+/// alone. The emptied directory of the collection id stays.
 #[test]
-fn a_mirror_ref_is_never_classified_and_never_deleted() {
-    let tmp = TmpDir::new("weak-refs-mirror");
+fn an_unreached_weak_collection_ref_is_deleted_and_its_objects_swept() {
+    let tmp = TmpDir::new("weak-refs-collection-unreached");
     block_on(async {
-        let repo = repo_with_trees(tmp.path(), &["head", "a", "m"]).await;
-        commit(&repo, tmp.path(), "head", None, Some("main")).await;
-        let orphan = commit(&repo, tmp.path(), "a", None, Some("pool/a")).await;
-        let mirrored = commit(&repo, tmp.path(), "m", None, None).await;
-        let mirrored_root = commit_root(&repo, &mirrored).await;
-        let cref = CollectionRef::new("org.example.Coll", "pool/m");
-        repo.set_collection_ref_immediate(&cref, Some(&mirrored))
+        let repo = repo_with_trees(tmp.path(), &["head", "cached"]).await;
+        let head = commit(&repo, tmp.path(), "head", None, Some("main")).await;
+        let cached = commit(&repo, tmp.path(), "cached", None, None).await;
+        let cached_root = commit_root(&repo, &cached).await;
+        let cref = set_collection_ref(&repo, "org.example.Cache", "pool/c", &cached).await;
+
+        let stats = repo
+            .prune(&weak_options(collection_is_weak("org.example.Cache")))
             .await
             .unwrap();
 
-        let (filter, seen) = recording_pool_is_weak();
-        // The test reads the record before the result of the run, so a failure
-        // reports the names that the classifier saw.
-        let result = repo.prune(&weak_options(filter)).await;
+        assert_eq!(
+            stats.deleted_collection_refs,
+            vec![cref.clone()],
+            "the run names the collection ref it deleted"
+        );
+        assert!(
+            stats.deleted_refs.is_empty(),
+            "and names no ref in deleted_refs: {:?}",
+            stats.deleted_refs
+        );
+        assert_eq!(collection_tip(&repo, &cref).await, None, "the ref is gone");
+        let dir = tmp.path().join("repo/refs/mirrors/org.example.Cache");
+        assert!(!dir.join("pool/c").exists(), "and so is its file");
+        assert!(dir.is_dir(), "the directory of the collection id stays");
+        assert!(!holds(&repo, &cached).await, "its commit is swept");
+        assert!(
+            !holds_tree(&repo, &cached_root).await,
+            "and so is the tree only it reached"
+        );
+        assert!(holds(&repo, &head).await, "the strong ref's commit stands");
+    });
+}
+
+/// A weak collection ref whose commit a strong branch reaches through a
+/// `parent` edge survives with its commit.
+///
+/// A second weak ref of the same collection names a commit that nothing
+/// reaches, and the run deletes it. So the run classified the refs of the
+/// collection weak, and the `parent` edge alone keeps the first ref.
+#[test]
+fn a_weak_collection_ref_reached_through_a_parent_survives() {
+    let tmp = TmpDir::new("weak-refs-collection-parent");
+    block_on(async {
+        let repo = repo_with_trees(tmp.path(), &["base", "head", "orphan"]).await;
+        let base = commit(&repo, tmp.path(), "base", None, None).await;
+        let head = commit(&repo, tmp.path(), "head", Some(base), Some("main")).await;
+        let orphan = commit(&repo, tmp.path(), "orphan", None, None).await;
+        let cref = set_collection_ref(&repo, "org.example.Cache", "base", &base).await;
+        let unreached = set_collection_ref(&repo, "org.example.Cache", "orphan", &orphan).await;
+
+        let (filter, seen) =
+            recording_filter(|name: &str| !name.starts_with("org.example.Cache::"));
+        let stats = repo.prune(&weak_options(filter)).await.unwrap();
 
         let names = recorded(&seen);
         assert!(
-            names.iter().any(|n| n == "main"),
-            "the classifier saw the strong local ref: {names:?}"
+            names.iter().any(|n| n == "org.example.Cache::base"),
+            "the classifier saw the kept ref: {names:?}"
+        );
+        assert_eq!(
+            stats.deleted_collection_refs,
+            vec![unreached.clone()],
+            "the run deleted the unreached weak ref alone"
+        );
+        assert_eq!(collection_tip(&repo, &unreached).await, None);
+        assert!(!holds(&repo, &orphan).await, "its commit is swept");
+        assert_eq!(
+            collection_tip(&repo, &cref).await,
+            Some(base),
+            "the weak collection ref still names its commit"
+        );
+        assert!(holds(&repo, &base).await, "the parent commit survives");
+        assert!(holds(&repo, &head).await, "and so does the branch head");
+    });
+}
+
+/// With no classifier, each collection ref is strong. The ref roots the walk,
+/// so its commit and the objects under the commit survive.
+#[test]
+fn with_no_filter_each_collection_ref_is_strong() {
+    let tmp = TmpDir::new("weak-refs-collection-no-filter");
+    block_on(async {
+        let repo = repo_with_trees(tmp.path(), &["head", "m", "loose"]).await;
+        commit(&repo, tmp.path(), "head", None, Some("main")).await;
+        let mirrored = commit(&repo, tmp.path(), "m", None, None).await;
+        let mirrored_root = commit_root(&repo, &mirrored).await;
+        let cref = set_collection_ref(&repo, "org.example.Coll", "pool/m", &mirrored).await;
+        let loose = commit(&repo, tmp.path(), "loose", None, None).await;
+
+        let opts = PruneOptions {
+            refs_only: true,
+            ..PruneOptions::new()
+        };
+        let stats = repo.prune(&opts).await.unwrap();
+
+        assert!(stats.deleted_refs.is_empty(), "{:?}", stats.deleted_refs);
+        assert!(
+            stats.deleted_collection_refs.is_empty(),
+            "{:?}",
+            stats.deleted_collection_refs
         );
         assert!(
-            names.iter().any(|n| n == "pool/a"),
-            "and the weak local ref: {names:?}"
+            !holds(&repo, &loose).await,
+            "the run swept the loose commit"
         );
-        assert!(
-            !names.iter().any(|n| n.contains("org.example.Coll")),
-            "the classifier never saw the mirror ref: {names:?}"
-        );
-        let stats = result.unwrap();
         assert_eq!(
-            stats.deleted_refs,
-            vec!["pool/a".to_owned()],
-            "the run deleted the weak local ref alone"
-        );
-        assert!(!holds(&repo, &orphan).await, "and swept its commit");
-        let mirror_path = tmp.path().join("repo/refs/mirrors/org.example.Coll/pool/m");
-        assert!(mirror_path.exists(), "the mirror ref file stands");
-        assert_eq!(
-            repo.list_mirror_refs().await.unwrap(),
-            vec![("org.example.Coll".to_owned(), "pool/m".to_owned(), mirrored)],
-            "and it still lists"
+            collection_tip(&repo, &cref).await,
+            Some(mirrored),
+            "the collection ref stands"
         );
         assert!(
             holds(&repo, &mirrored).await,
-            "the mirror ref roots its commit"
+            "the collection ref roots its commit"
         );
         assert!(
             holds_tree(&repo, &mirrored_root).await,
             "and the tree under it"
         );
+    });
+}
+
+/// A classifier that marks the refs of one collection weak leaves the refs of
+/// another collection strong, also under the same ref name.
+#[test]
+fn a_filter_on_one_collection_leaves_another_collection_strong() {
+    let tmp = TmpDir::new("weak-refs-collection-other");
+    block_on(async {
+        let repo = repo_with_trees(tmp.path(), &["head", "cache", "keep"]).await;
+        commit(&repo, tmp.path(), "head", None, Some("main")).await;
+        let cached = commit(&repo, tmp.path(), "cache", None, None).await;
+        let kept = commit(&repo, tmp.path(), "keep", None, None).await;
+        let weak = set_collection_ref(&repo, "org.example.Cache", "app/main", &cached).await;
+        let strong = set_collection_ref(&repo, "org.example.Keep", "app/main", &kept).await;
+
+        let (filter, seen) =
+            recording_filter(|name: &str| !name.starts_with("org.example.Cache::"));
+        let stats = repo.prune(&weak_options(filter)).await.unwrap();
+
+        let names = recorded(&seen);
+        for name in ["org.example.Cache::app/main", "org.example.Keep::app/main"] {
+            assert!(
+                names.iter().any(|n| n == name),
+                "the classifier saw {name}: {names:?}"
+            );
+        }
+        assert_eq!(stats.deleted_collection_refs, vec![weak.clone()]);
+        assert_eq!(collection_tip(&repo, &weak).await, None);
+        assert!(
+            !holds(&repo, &cached).await,
+            "the weak ref's commit is swept"
+        );
+        assert_eq!(
+            collection_tip(&repo, &strong).await,
+            Some(kept),
+            "the ref of the other collection stands"
+        );
+        assert!(holds(&repo, &kept).await, "and roots its commit");
+    });
+}
+
+/// A file under `refs/mirrors` whose path does not split into a valid
+/// collection id and a valid ref name never reaches the classifier. The run
+/// does not change it, and its commit stands. A valid mirror ref in the same
+/// run is classified and deleted.
+///
+/// `a` has one element, `1org.x` has an element that starts with a digit,
+/// `-bad` is not a valid ref name component, and `stray` has no ref name.
+#[test]
+fn a_mirror_ref_outside_the_name_rule_is_never_classified() {
+    let tmp = TmpDir::new("weak-refs-collection-invalid");
+    block_on(async {
+        let repo = repo_with_trees(tmp.path(), &["head", "valid", "invalid"]).await;
+        commit(&repo, tmp.path(), "head", None, Some("main")).await;
+        let valid = commit(&repo, tmp.path(), "valid", None, None).await;
+        let cref = set_collection_ref(&repo, "org.example.Cache", "pool/ok", &valid).await;
+        let invalid = commit(&repo, tmp.path(), "invalid", None, None).await;
+        let invalid_root = commit_root(&repo, &invalid).await;
+
+        // No write path of the library accepts these paths, so the test writes
+        // the files with blocking `std::fs`.
+        let body = format!("{}\n", invalid.to_hex());
+        let mirrors = tmp.path().join("repo/refs/mirrors");
+        let paths = [
+            mirrors.join("a/pool/x"),
+            mirrors.join("1org.x/pool/y"),
+            mirrors.join("org.example.Cache/-bad"),
+            mirrors.join("stray"),
+        ];
+        for path in &paths {
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, &body).unwrap();
+        }
+
+        let (filter, seen) = recording_filter(|name: &str| name == "main");
+        let stats = repo.prune(&weak_options(filter)).await.unwrap();
+
+        let mut names = recorded(&seen);
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["main".to_owned(), "org.example.Cache::pool/ok".to_owned()],
+            "only the valid refs reached the classifier"
+        );
+        assert_eq!(stats.deleted_collection_refs, vec![cref.clone()]);
+        assert!(stats.deleted_refs.is_empty(), "{:?}", stats.deleted_refs);
+        assert_eq!(collection_tip(&repo, &cref).await, None);
+        assert!(
+            !holds(&repo, &valid).await,
+            "the valid ref's commit is swept"
+        );
+        for path in &paths {
+            assert_eq!(
+                std::fs::read_to_string(path).unwrap(),
+                body,
+                "{} stands with the content it was written with",
+                path.display()
+            );
+        }
+        assert!(
+            holds(&repo, &invalid).await,
+            "the invalid refs rooted their commit"
+        );
+        assert!(
+            holds_tree(&repo, &invalid_root).await,
+            "and the tree under it"
+        );
+    });
+}
+
+/// A dry run lists the weak collection refs that a run deletes and deletes
+/// nothing.
+#[test]
+fn a_dry_run_lists_weak_collection_refs_and_deletes_nothing() {
+    let tmp = TmpDir::new("weak-refs-collection-no-prune");
+    block_on(async {
+        let repo = repo_with_trees(tmp.path(), &["head", "cached"]).await;
+        commit(&repo, tmp.path(), "head", None, Some("main")).await;
+        let cached = commit(&repo, tmp.path(), "cached", None, None).await;
+        let cref = set_collection_ref(&repo, "org.example.Cache", "pool/c", &cached).await;
+
+        let opts = PruneOptions {
+            no_prune: true,
+            ..weak_options(collection_is_weak("org.example.Cache"))
+        };
+        let stats = repo.prune(&opts).await.unwrap();
+
+        assert_eq!(
+            stats.deleted_collection_refs,
+            vec![cref.clone()],
+            "the dry run names the ref the run would delete"
+        );
+        assert!(stats.deleted_refs.is_empty(), "{:?}", stats.deleted_refs);
+        assert_eq!(
+            collection_tip(&repo, &cref).await,
+            Some(cached),
+            "the ref still names its commit"
+        );
+        assert!(holds(&repo, &cached).await, "the commit stands");
+    });
+}
+
+/// The deleted collection refs are sorted by collection id and then by ref
+/// name. `org.ex` sorts before `org.ex.sub`, though the path `org.ex.sub/a`
+/// sorts before the path `org.ex/x` in byte order.
+#[test]
+fn the_deleted_collection_ref_list_is_sorted_by_id_then_name() {
+    let tmp = TmpDir::new("weak-refs-collection-sorted");
+    let refs = [
+        ("org.zeta.C", "b"),
+        ("org.zeta.C", "a/z"),
+        ("org.ex.sub", "a"),
+        ("org.ex", "x"),
+        ("org.alpha.C", "pool/9"),
+        ("org.alpha.C", "pool/0"),
+    ];
+    block_on(async {
+        let mut names = vec!["head".to_owned()];
+        names.extend((0..refs.len()).map(|i| format!("t{i}")));
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        let repo = repo_with_trees(tmp.path(), &names).await;
+        commit(&repo, tmp.path(), "head", None, Some("main")).await;
+        for (i, (collection_id, name)) in refs.iter().enumerate() {
+            let target = commit(&repo, tmp.path(), &format!("t{i}"), None, None).await;
+            set_collection_ref(&repo, collection_id, name, &target).await;
+        }
+
+        let filter = WeakRefFilter::new(|location: RefLocation<'_>, _: &Checksum| {
+            !matches!(location, RefLocation::Collection { .. })
+        });
+        let stats = repo.prune(&weak_options(filter)).await.unwrap();
+
+        let expected: Vec<CollectionRef> = [
+            ("org.alpha.C", "pool/0"),
+            ("org.alpha.C", "pool/9"),
+            ("org.ex", "x"),
+            ("org.ex.sub", "a"),
+            ("org.zeta.C", "a/z"),
+            ("org.zeta.C", "b"),
+        ]
+        .iter()
+        .map(|(collection_id, name)| CollectionRef::new(*collection_id, *name))
+        .collect();
+        assert_eq!(stats.deleted_collection_refs, expected);
+    });
+}
+
+/// A mirror ref of the `[core] collection-id` of the repository reaches the
+/// classifier as a collection ref. After the run deletes it, the local ref of
+/// the same name stays, and a read of the collection ref gives the commit of
+/// the local ref.
+#[test]
+fn an_own_id_mirror_ref_is_classified_as_a_collection_ref() {
+    let tmp = TmpDir::new("weak-refs-collection-own-id");
+    block_on(async {
+        for name in ["local", "mirror"] {
+            write_tree(tmp.path(), name);
+        }
+        let repo = Repo::create(
+            &tmp.path().join("repo"),
+            CreateOptions {
+                collection_id: Some("org.example.Own".to_owned()),
+                ..CreateOptions::new(RepoMode::Archive)
+            },
+        )
+        .await
+        .unwrap();
+        let local = commit(&repo, tmp.path(), "local", None, Some("app")).await;
+        let mirrored = commit(&repo, tmp.path(), "mirror", None, None).await;
+        let cref = set_collection_ref(&repo, "org.example.Own", "app", &mirrored).await;
+        assert_eq!(
+            collection_tip(&repo, &cref).await,
+            Some(mirrored),
+            "the mirror ref wins before the run"
+        );
+
+        let (filter, seen) = recording_filter(|name: &str| !name.contains("::"));
+        let stats = repo.prune(&weak_options(filter)).await.unwrap();
+
+        let mut names = recorded(&seen);
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["app".to_owned(), "org.example.Own::app".to_owned()],
+            "the classifier saw the local ref and the collection ref"
+        );
+        assert_eq!(stats.deleted_collection_refs, vec![cref.clone()]);
+        assert!(stats.deleted_refs.is_empty(), "{:?}", stats.deleted_refs);
+        assert!(
+            !tmp.path()
+                .join("repo/refs/mirrors/org.example.Own/app")
+                .exists(),
+            "the mirror ref file is gone"
+        );
+        assert_eq!(tip(&repo, "app").await, Some(local), "the local ref stays");
+        assert_eq!(
+            collection_tip(&repo, &cref).await,
+            Some(local),
+            "a read of the collection ref gives the local ref"
+        );
+        assert!(!holds(&repo, &mirrored).await, "the mirror commit is swept");
     });
 }
 
@@ -1045,7 +1414,8 @@ fn a_ref_directory_gone_before_the_unlink_does_not_fail_the_run() {
         // unlink then finds no file, and the directory that held the file is
         // also gone.
         let dir = tmp.path().join("repo/refs/heads/pool");
-        let filter = WeakRefFilter::new(move |name: &str, _: &Checksum| {
+        let filter = WeakRefFilter::new(move |location: RefLocation<'_>, _: &Checksum| {
+            let name = label(location);
             if name == "pool/doomed" {
                 std::fs::remove_file(dir.join("doomed")).unwrap();
                 std::fs::remove_dir(&dir).unwrap();

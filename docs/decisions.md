@@ -2571,16 +2571,25 @@ the rules.
   reads field 2 from the read of its object walk, and classifies each entry
   against the state after its own findings: a dependency that the run
   deletes is absent, and a dependency whose tree the run finds incomplete is
-  partial. Under `mark_partial`, the run marks the commit of an absent or a
-  partial dependency as partial, so a later pull fetches the commit again
-  with its dependencies. A pull cannot repair a defective entry, so it gets
-  no marker. The marks of this check do not change the other findings of
-  the run. The bucket fsck gives the same findings as `dependency` findings,
-  reads a dependency as partial if the bucket holds its partial-commit
-  marker, and writes no key for them in a repair. A run with the repair
-  classifies each entry against the markers and the commit objects after
-  the repair, as the local run does, so its findings describe the bucket
-  that the run leaves. A run with no lock reads
+  partial. Under `mark_partial` and `mark_dependencies`, the run marks the
+  commit of an absent or a partial dependency as partial, so a later pull
+  fetches the commit again with its dependencies. A pull cannot repair a
+  defective entry, so it gets no marker. `mark_dependencies` is a separate
+  switch, because a caller can accept a commit whose dependencies are
+  absent and still need the marks of absent objects. A pull walks the tree
+  of a commit only when the commit is marked partial. One enum in place of
+  `mark_partial` was rejected: it removes the field `mark_partial`, so it
+  breaks each caller that sets the field, also a caller that starts from
+  `..FsckOptions::new()`. The field `mark_dependencies` breaks only a caller
+  that builds the struct with a full literal. Public marker functions were
+  rejected: the marks are on disk before `Repo::fsck` returns, so a caller
+  cannot filter the findings first. The marks of this check do not change
+  the other findings of the run. The bucket fsck gives the same findings as
+  `dependency` findings, reads a dependency as partial if the bucket holds
+  its partial-commit marker, and writes no key for them in a repair. A run
+  with the repair classifies each entry against the markers and the commit
+  objects after the repair, as the local run does, so its findings describe
+  the bucket that the run leaves. A run with no lock reads
   each absent dependency again, as it reads a missing object again. The
   tool reports no finding for field 2 and exits 0, so the exit status of
   `ostrya fsck` over such a repository is a divergence. To pass a commit

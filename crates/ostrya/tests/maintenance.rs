@@ -1803,6 +1803,83 @@ fn fsck_reports_an_absent_dependency_without_a_marker() {
     });
 }
 
+/// With `mark_dependencies` off, the run reports an absent dependency and
+/// writes no marker. A second run gives the same finding.
+#[test]
+fn fsck_without_dependency_marks_reports_an_absent_dependency_and_marks_nothing() {
+    let tmp = TmpDir::new("maint-fsck-dep-nodepmark");
+    block_on(async {
+        let (repo, tip, dep) = build_dependency_repo(tmp.path()).await;
+        remove_object(&repo, ObjectName::new(dep, ObjectType::Commit));
+        let opts = FsckOptions {
+            mark_dependencies: false,
+            ..FsckOptions::new()
+        };
+        let finding = dependency_finding(
+            tip,
+            "boot/uki",
+            Some(dep),
+            ostrya::FsckDependencyErrorKind::Absent,
+        );
+
+        for _ in 0..2 {
+            let report = repo.fsck(&opts).await.unwrap();
+            assert_eq!(report.dependency_errors, std::slice::from_ref(&finding));
+            assert!(report.errors.is_empty(), "{:?}", report.errors);
+            assert!(report.marked_partial.is_empty());
+            assert!(!report.is_ok());
+            assert_eq!(
+                repo.commit_state(&tip).await.unwrap(),
+                ostrya::CommitState::Normal
+            );
+        }
+    });
+}
+
+/// With `mark_dependencies` off, an absent object still marks the commit
+/// that reaches it, and the dependency finding stays.
+#[test]
+fn fsck_without_dependency_marks_still_marks_the_commit_of_an_absent_object() {
+    let tmp = TmpDir::new("maint-fsck-dep-objmark");
+    block_on(async {
+        let (repo, tip, dep) = build_dependency_repo(tmp.path()).await;
+        let shared: HashSet<ObjectName> = repo.traverse_commit(&dep, 0).await.unwrap();
+        let file = repo
+            .traverse_commit(&tip, 0)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|name| name.ty == ObjectType::File && !shared.contains(name))
+            .expect("a file of the tip alone");
+        remove_object(&repo, file);
+        remove_object(&repo, ObjectName::new(dep, ObjectType::Commit));
+
+        let report = repo
+            .fsck(&FsckOptions {
+                mark_dependencies: false,
+                ..FsckOptions::new()
+            })
+            .await
+            .unwrap();
+        assert_eq!(report.errors.len(), 1, "{:?}", report.errors);
+        assert_eq!(report.errors[0].in_commits, [tip]);
+        assert_eq!(
+            report.dependency_errors,
+            [dependency_finding(
+                tip,
+                "boot/uki",
+                Some(dep),
+                ostrya::FsckDependencyErrorKind::Absent,
+            )]
+        );
+        assert_eq!(report.marked_partial, [tip]);
+        assert_eq!(
+            repo.commit_state(&tip).await.unwrap(),
+            ostrya::CommitState::Partial
+        );
+    });
+}
+
 /// A dependency with a marker, and a dependency whose tree misses a file,
 /// are each partial in the same run.
 #[test]

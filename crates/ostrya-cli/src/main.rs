@@ -321,8 +321,9 @@ enum Command {
     /// After the walk, the command checks the dependencies in field 2 of each
     /// commit that it verified. It writes one line on standard error for each
     /// dependency that is absent, partial, or defective, and exits 1. It marks
-    /// a commit with an absent or a partial dependency as partial, unless
-    /// --no-mark-partial is given, so a later pull fetches the dependency.
+    /// a commit with an absent or a partial dependency as partial, so a later
+    /// pull fetches the dependency. --no-mark-partial and
+    /// --no-mark-dependencies each stop these marks.
     ///
     /// After the walk, the command checks each composefs image object against
     /// the key `ostree.composefs.digest.v0` of its commit. A faulty image is
@@ -2531,14 +2532,24 @@ struct PruneArgs {
 
 #[derive(Args)]
 struct FsckArgs {
-    /// If a referenced object is missing, do not mark the commit partial.
+    /// Do not mark a commit partial for a missing object or a dependency.
     ///
     /// Without this option, the command writes the marker
     /// `state/<commit>.commitpartial` for each commit that reaches a missing
     /// object, or an object that --delete removed, and for each commit with
-    /// an absent or a partial dependency.
+    /// an absent or a partial dependency. This option stops all of these
+    /// marks.
     #[arg(long)]
     no_mark_partial: bool,
+    /// Do not mark a commit partial for an absent or a partial dependency.
+    ///
+    /// The command still reports each dependency that is absent, partial,
+    /// or defective, and exits 1. It still marks each commit that reaches a
+    /// missing object, or an object that --delete removed. A later run
+    /// verifies again each commit that the run did not mark, and gives the
+    /// same finding. --no-mark-partial also stops these marks.
+    #[arg(long)]
+    no_mark_dependencies: bool,
     /// Delete each commit whose parent commit is missing, and add a tombstone.
     ///
     /// This step comes after the object walk. It writes a `.tombstone-commit`
@@ -13953,6 +13964,7 @@ async fn fsck(repo: Repo, args: FsckArgs) -> Result<()> {
     use std::io::Write;
     let opts = FsckOptions {
         mark_partial: !args.no_mark_partial,
+        mark_dependencies: !args.no_mark_dependencies,
         delete: args.delete,
         all: args.all,
         add_tombstones: args.add_tombstones,

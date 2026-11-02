@@ -2477,13 +2477,13 @@ No harness repository sets the key (`harness.md`, "Constraints"), so every
 matrix cell reads the tool's own behavior.
 
 `fsck` accepts `--repo`, `--add-tombstones`, `-q/--quiet`, `-a/--all`,
-`--delete`, `--verify-bindings`, `--verify-back-refs`, and the port extension
-`--no-mark-partial`. Nothing is missing. The phase, finding, and summary text
-the command writes, the two binding checks, and the exit statuses are in
-`cli-behavior.md`, "CLI output formats", `fsck`, together with the
-progress line the tool writes and the port does not. A symlink under `refs/`
-that names a directory ends an `fsck` run with exit 1 in both implementations,
-in different words ("P1", `refs`).
+`--delete`, `--verify-bindings`, `--verify-back-refs`, and the port extensions
+`--no-mark-partial` and `--no-mark-dependencies`. Nothing is missing. The phase,
+finding, and summary text the command writes, the two binding checks, and the
+exit statuses are in `cli-behavior.md`, "CLI output formats", `fsck`, together
+with the progress line the tool writes and the port does not. A symlink under
+`refs/` that names a directory ends an `fsck` run with exit 1 in both
+implementations, in different words ("P1", `refs`).
 
 The port's object walk runs to its end whatever the switches carry, so one run
 reports every fault it reaches and marks every commit an absent object leaves
@@ -2586,13 +2586,13 @@ Nine divergences stand at `fsck`:
   `export --no-xattrs` and the four `prune` flags;
 - a dependency in field 2 that is absent, partial, or defective. The tool
   reports no finding for an entry of field 2 and exits 0 (`cli-behavior.md`,
-  "CLI output formats", `fsck`, "Related commits in fsck"). The port writes
-  one line for each such entry on standard error, marks the commit that names
-  an absent or a partial dependency as partial unless `--no-mark-partial` is
-  given, and exits 1 with `error: Repository corruption encountered`. A
-  defective entry gets no marker. `../format-reference.md`, "Dependencies in
-  the fsck", states the rules. Over a repository whose dependencies are
-  complete, the two agree.
+  "CLI output formats", `fsck`, "Related commits in fsck"). The port writes one
+  line for each such entry on standard error, marks the commit that names an
+  absent or a partial dependency as partial unless `--no-mark-partial` or
+  `--no-mark-dependencies` is given, and exits 1 with
+  `error: Repository corruption encountered`. A defective entry gets no marker.
+  `../format-reference.md`, "Dependencies in the fsck", states the rules. Over a
+  repository whose dependencies are complete, the two agree.
 
 `fsck --add-tombstones` deletes a commit object and leaves a branch ref
 standing over it, so repeated runs walk a broken branch backwards one commit

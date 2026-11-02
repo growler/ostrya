@@ -8206,6 +8206,89 @@ fn fsck_reports_a_dependency_error() {
     assert!(!other.join("state").read_dir().unwrap().any(|_| true));
 }
 
+/// `ostrya fsck --no-mark-dependencies` prints the finding of an absent
+/// dependency, exits 1, and writes no marker. A run with
+/// `--no-mark-partial` and `--no-mark-dependencies` does the same. A run with
+/// no option then writes the marker.
+#[test]
+fn fsck_no_mark_dependencies_reports_and_writes_no_marker() {
+    let tmp = TmpDir::new("fsck-no-mark-dependencies");
+    let base = tmp.path();
+    let repo = build_dest(base, "repo");
+    let repo_s = repo.to_str().unwrap().to_owned();
+    let dep = ex_ostrya_commit(&repo, base, "uki", None);
+    let related = format!("--related=boot/uki={dep}");
+    let tip = ostrya(
+        &[
+            "commit",
+            "--repo",
+            &repo_s,
+            "--canonical-permissions",
+            "-b",
+            BRANCH,
+            &related,
+            ex_ostrya_tree(base, "main").to_str().unwrap(),
+        ],
+        None,
+        &[("SOURCE_DATE_EPOCH", "1700000100")],
+    )
+    .ok()
+    .stdout_trimmed();
+    let dep_hex = dep.to_hex();
+    std::fs::remove_file(repo.join(format!(
+        "objects/{}/{}.commit",
+        &dep_hex[..2],
+        &dep_hex[2..]
+    )))
+    .unwrap();
+    let finding = format!(
+        "related commits in field 2 of commit {tip}: dependency boot/uki names commit {dep}, \
+         which the repository does not hold\n"
+    );
+    let marker = repo.join(format!("state/{tip}.commitpartial"));
+
+    let run = ostrya(
+        &["fsck", "--repo", &repo_s, "--no-mark-dependencies"],
+        None,
+        &[],
+    );
+    assert_eq!(run.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8(run.stderr).unwrap(),
+        format!("{finding}error: Repository corruption encountered\n")
+    );
+    assert!(!marker.exists());
+
+    let run = ostrya(
+        &[
+            "fsck",
+            "--repo",
+            &repo_s,
+            "--no-mark-partial",
+            "--no-mark-dependencies",
+        ],
+        None,
+        &[],
+    );
+    assert_eq!(run.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8(run.stderr).unwrap(),
+        format!("{finding}error: Repository corruption encountered\n")
+    );
+    assert!(!marker.exists());
+
+    let run = ostrya(&["fsck", "--repo", &repo_s], None, &[]);
+    assert_eq!(run.status.code(), Some(1));
+    assert_eq!(
+        String::from_utf8(run.stderr).unwrap(),
+        format!(
+            "{finding}Marking commit as partial: {tip}\nerror: Repository corruption \
+             encountered\n"
+        )
+    );
+    assert!(marker.is_file());
+}
+
 #[test]
 fn pull_timestamp_check_refuses_an_older_tip() {
     let tmp = TmpDir::new("pull-timestamp");

@@ -40,13 +40,29 @@ pub struct FsckOptions {
     /// is an ostrya extension, which the `ostrya fsck` command spells
     /// `--no-mark-partial`.
     ///
-    /// The switch also marks each commit that has an
+    /// If [`mark_dependencies`](FsckOptions::mark_dependencies) is also
+    /// `true`, the switch marks each commit that has an
     /// [`Absent`](FsckDependencyErrorKind::Absent) or a
     /// [`Partial`](FsckDependencyErrorKind::Partial) dependency, so a later
     /// pull of the commit fetches its dependencies. A
     /// [`Defective`](FsckDependencyErrorKind::Defective) entry marks no
     /// commit, because a pull cannot repair it.
     pub mark_partial: bool,
+    /// The switch that marks each commit that has an
+    /// [`Absent`](FsckDependencyErrorKind::Absent) or a
+    /// [`Partial`](FsckDependencyErrorKind::Partial) dependency as partial.
+    ///
+    /// The switch has an effect only if
+    /// [`mark_partial`](FsckOptions::mark_partial) is `true`. The default is
+    /// `true`. The value `false` is an ostrya extension, which the
+    /// `ostrya fsck` command spells `--no-mark-dependencies`.
+    ///
+    /// With the value `false`, the run reports each finding in
+    /// [`FsckReport::dependency_errors`] and marks no commit for a
+    /// dependency. The marks for absent and deleted objects do not change.
+    /// A later run verifies again each commit that the run did not mark, and
+    /// gives the same finding.
+    pub mark_dependencies: bool,
     /// The switch that unlinks each object whose checksum differs from its name.
     ///
     /// The option of the `ostree fsck` command is `--delete`.
@@ -110,6 +126,7 @@ impl Default for FsckOptions {
     fn default() -> Self {
         FsckOptions {
             mark_partial: true,
+            mark_dependencies: true,
             delete: false,
             all: false,
             add_tombstones: false,
@@ -122,8 +139,9 @@ impl Default for FsckOptions {
 impl FsckOptions {
     /// Creates the default options.
     ///
-    /// [`mark_partial`](FsckOptions::mark_partial) is `true`, and each other
-    /// field is `false`.
+    /// [`mark_partial`](FsckOptions::mark_partial) and
+    /// [`mark_dependencies`](FsckOptions::mark_dependencies) are `true`, and
+    /// each other field is `false`.
     pub fn new() -> FsckOptions {
         FsckOptions::default()
     }
@@ -622,7 +640,8 @@ impl Repo {
     ///      object as partial: it writes the `state/<commit>.commitpartial`
     ///      marker of the commit.
     ///
-    /// [`mark_partial`](FsckOptions::mark_partial) and
+    /// [`mark_partial`](FsckOptions::mark_partial),
+    /// [`mark_dependencies`](FsckOptions::mark_dependencies), and
     /// [`delete`](FsckOptions::delete) state the actions on a finding.
     ///
     /// # Dependencies
@@ -648,9 +667,10 @@ impl Repo {
     /// that no rule applies to gives no finding. A checksum that field 2
     /// names under two names gives two findings. Two entries with one name,
     /// and names that are not sorted, give no finding. If
-    /// [`mark_partial`](FsckOptions::mark_partial) is set, the run marks each
-    /// commit with an `Absent` or a `Partial` finding as partial. Such a mark
-    /// does not change the other findings of the run.
+    /// [`mark_partial`](FsckOptions::mark_partial) and
+    /// [`mark_dependencies`](FsckOptions::mark_dependencies) are set, the run
+    /// marks each commit with an `Absent` or a `Partial` finding as partial.
+    /// Such a mark does not change the other findings of the run.
     ///
     /// A run that ends early does not reach this check.
     ///
@@ -1245,8 +1265,8 @@ impl Repo {
     }
 
     /// Checks the dependencies of each verified commit that the run did not
-    /// delete, and under `mark_partial` marks each commit with an absent or a
-    /// partial dependency as partial.
+    /// delete, and under `mark_partial` and `mark_dependencies` marks each
+    /// commit with an absent or a partial dependency as partial.
     ///
     /// `all` is the commit listing of the start of the run. `dependencies`
     /// holds each verified commit whose field 2 is not empty, with its
@@ -1284,7 +1304,7 @@ impl Repo {
                 nested,
             ));
         }
-        if opts.mark_partial {
+        if opts.mark_partial && opts.mark_dependencies {
             let mut marked = HashSet::new();
             for finding in &findings {
                 let commit = finding.commit;

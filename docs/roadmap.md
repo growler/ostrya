@@ -171,7 +171,7 @@ work on a local repository are not carried for it:
 - Tombstone commits. `ostrya remote prune` refuses a bucket `config` that
   sets `[core] tombstone-commits=true`.
 - These options of `fsck`: `--add-tombstones`, `--all`, `--verify-bindings`,
-  `--verify-back-refs`, and `--no-mark-partial`.
+  `--verify-back-refs`, `--no-mark-partial`, and `--no-mark-dependencies`.
 - `push --onto`, and tags.
 - A signed tree push to a bucket repository. `BucketRepo::push_tree` and
   `ostrya push-tree` to an `s3://` address sign no commit. A user pulls the

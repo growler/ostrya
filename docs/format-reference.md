@@ -3410,14 +3410,18 @@ commit C: dependency N names commit D, which the repository does not hold`,
 `..., which is partial`, `..., which has dependencies of its own`, or the
 defect of the entry.
 
-With the default `mark_partial`, the run writes the marker
-`state/<commit>.commitpartial` of each commit with an `Absent` or a
+With the default `mark_partial` and `mark_dependencies`, the run writes the
+marker `state/<commit>.commitpartial` of each commit with an `Absent` or a
 `Partial` finding. A later pull of that commit fetches it again with its
 dependencies. A `Defective` finding gets no marker, because a pull cannot
-repair it. A marker of this check does not change the other findings of the
-run. `ostrya fsck` writes each finding on standard error and exits 1. A run
-that ends early does not reach this check. The check runs before the
-tombstone step of `--add-tombstones`.
+repair it. With `mark_dependencies` false, or with
+`ostrya fsck --no-mark-dependencies`, the run reports each finding and writes
+no marker for it. The markers for absent and deleted objects do not change.
+With `mark_partial` false, the run writes neither kind of marker. A marker of
+this check does not change the other findings of the run. `ostrya fsck` writes
+each finding on standard error and exits 1. A run that ends early does not
+reach this check. The check runs before the tombstone step of
+`--add-tombstones`.
 
 The fsck of a bucket repository makes the same findings as `dependency`
 findings ("The fsck of a bucket repository").

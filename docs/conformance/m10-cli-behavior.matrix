@@ -10651,6 +10651,19 @@ note: `--no-mark-partial` is a port extension the tool has no counterpart for,
 
 family: M10
 subcommand: fsck
+cell: fsck/no-mark-dependencies-extension
+setup: repo-with-commit
+outcome: full
+severity: interop
+evidence: ostrya_cli::cli::fsck_no_mark_dependencies_reports_and_writes_no_marker
+spec: cli-surface.md#p2----options-missing-from-commands-that-exist
+note: `--no-mark-dependencies` is a port extension the tool has no counterpart
+ for, so the cited test states the port's own claim and compares nothing. The
+ run writes each dependency finding and exits 1, and writes no marker for a
+ dependency.
+
+family: M10
+subcommand: fsck
 cell: fsck/missing-continues-the-walk
 setup: repo-with-commit
 outcome: full

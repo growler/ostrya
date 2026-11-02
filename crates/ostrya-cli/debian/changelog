@@ -1,3 +1,9 @@
+ostrya (0.7.0) unstable; urgency=medium
+
+  * Add fsck --no-mark-dependencies.
+
+ -- Alexey Naidyonov <alexey.naidyonov@gmail.com>  Mon, 02 Nov 2026 08:03:29 +0100
+
 ostrya (0.6.0) unstable; urgency=medium
 
   * Push, push-tree, and pull with a bucket repository in an S3 bucket.
